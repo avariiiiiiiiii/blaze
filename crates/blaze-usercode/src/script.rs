@@ -107,8 +107,8 @@ pub fn keyed(prepared: &Prepared, traced: &mut Traced) {
 pub fn cargo_rule(unit: &Unit, inherited: &[(OsString, OsString)], exit: &Exit) -> CargoRule {
     let cx = output::Context::of(unit, inherited);
     let dir = &unit.package.manifest_dir;
-    match output::parse(&exit.stdout, &cx) {
-        Ok(parsed) => CargoRule::of(blaze_build_script::watched(&parsed, dir)),
+    match blaze_build_script::watched_in(&exit.stdout, &cx, dir) {
+        Ok(watched) => CargoRule::of(watched),
         Err(_) => CargoRule::package(dir),
     }
 }

@@ -11,7 +11,7 @@ use std::ops::Range;
 
 use either::Either;
 use hir_expand::{
-    ExpandTo, InFile, MacroCallId,
+    ExpandTo, MacroCallId,
     attrs::{Attr, AttrId},
     builtin::BuiltinDeriveExpander,
     mod_path::ModPath,
@@ -116,9 +116,16 @@ pub(crate) struct DeferredDerive {
 /// A derive helper in scope for an item: its name, the derive macro, and the derive's call.
 pub(crate) type DeriveHelper = (Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>);
 
+/// The `macro_rules!` a module starts with: its parent's textual scope where it is declared,
+/// every definition of each name in definition order.
+pub(crate) type Inherited = Box<[(Name, Box<[MacroId]>)]>;
+
 /// One mutation. Ops naming a `module` change that module's state; the rest are crate-level
 /// (the root's extern prelude, `macro_use` prelude, proc-macro tables) or side tables.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Clone`: a log is built once and read in place ([`DeclOp::clone_root_op`] copies the
+/// few ops another module's log re-states).
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DeclOp {
     // A module comes to exist.
     /// The module's own row: first op of its round-0 log, or, for one an expansion declares,
@@ -128,7 +135,12 @@ pub(crate) enum DeclOp {
         origin: ModuleOrigin,
         visibility: Visibility,
         parent: Option<ModuleId>,
+        inherited: Inherited,
     },
+    /// The round-0 subtree of `child` (declared by the op before) defines, in the crate root,
+    /// the ops of [`super::queries::subtree_macro_exports`] of `key`, at this point of the
+    /// root's order. Only the root's unit reads it.
+    Splice { child: ModuleId, key: super::queries::DeclKey },
     /// `parent` has the child `child` named `name` (`children_mut().insert`). Replacing one wakes
     /// every import, as a path can read whether a module is its parent's test harness.
     PushChild { parent: ModuleId, name: Name, child: ModuleId },
@@ -175,27 +187,17 @@ pub(crate) enum DeclOp {
     Macro(MacroOp),
 
     // Crate-level, made by the root's collection only.
+    /// The std prelude `inject_prelude` found (the `#[prelude_import]` one is the unit's).
+    Prelude { module: ModuleId, import: Option<UseId> },
     ExternPrelude { name: Name, root: ModuleId, extern_crate: Option<ExternCrateId> },
     UnresolvedExternCrate { name: Name },
     MacroUsePrelude { name: Name, mac: MacroId, extern_crate: Option<ExternCrateId> },
     ExportedDerive { mac: MacroId, helpers: Box<[Name]> },
     ProcMacroFn { func: FunctionId, mac: ProcMacroId },
 
-    // Side tables of the def map and of the macro steps.
+    // The def map's own tables. The per-item ones (derive helpers, skipped and active
+    // attributes, deferred derives) are a module's `SideTables`, carried by its macro steps.
     Diagnostic(DefDiagnostic),
-    /// Extends the helpers in scope for `item`.
-    DeriveHelpers { item: AstId<ast::Item>, helpers: Box<[DeriveHelper]> },
-    /// The helpers at `range` of `item`'s list belong to `imp` now (a deferred builtin derive
-    /// was collected).
-    DeriveHelpersToImpl { item: AstId<ast::Item>, range: Range<usize>, imp: BuiltinDeriveImplId },
-    /// Attributes of `item` up to and including `attr` are not collected again.
-    SkipAttr { item: InFile<ModItemId>, attr: AttrId },
-    /// `attr` of `item` was expanded; later attribute macros of `item` censor it.
-    PrevActiveAttr { item: AstId<ast::Item>, attr: AttrId },
-    DeferDerive { item: AstId<ast::Item>, derive: DeferredDerive },
-    /// The builtin derives deferred for `item` are taken: collected, or dropped for an
-    /// attribute macro after them.
-    TakeDeferredDerives { item: AstId<ast::Item> },
     /// A macro with compilation-local state ran.
     SessionMacros,
 }
@@ -222,19 +224,34 @@ impl DeclOp {
             DeclOp::PushChild { parent, .. } => Some(*parent),
             DeclOp::Import(it) => Some(it.module),
             DeclOp::Macro(it) => Some(it.module),
-            DeclOp::ExternPrelude { .. }
+            DeclOp::Splice { .. }
+            | DeclOp::Prelude { .. }
+            | DeclOp::ExternPrelude { .. }
             | DeclOp::UnresolvedExternCrate { .. }
             | DeclOp::MacroUsePrelude { .. }
             | DeclOp::ExportedDerive { .. }
             | DeclOp::ProcMacroFn { .. }
             | DeclOp::Diagnostic(_)
-            | DeclOp::DeriveHelpers { .. }
-            | DeclOp::DeriveHelpersToImpl { .. }
-            | DeclOp::SkipAttr { .. }
-            | DeclOp::PrevActiveAttr { .. }
-            | DeclOp::DeferDerive { .. }
-            | DeclOp::TakeDeferredDerives { .. }
             | DeclOp::SessionMacros => None,
+        }
+    }
+
+    /// A copy of a scope op of `root` (what a module's `#[macro_export]` or proc macro does
+    /// to the crate root), `None` for any other op.
+    pub(crate) fn clone_root_op(&self, root: ModuleId) -> Option<DeclOp> {
+        match self {
+            &DeclOp::Declare { module, def } if module == root => {
+                Some(DeclOp::Declare { module, def })
+            }
+            DeclOp::Update { module, resolutions, vis, import } if *module == root => {
+                Some(DeclOp::Update {
+                    module: *module,
+                    resolutions: resolutions.clone(),
+                    vis: *vis,
+                    import: *import,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -246,25 +263,20 @@ impl DeclOp {
             self,
             DeclOp::Macro(_)
                 | DeclOp::SetModDir { .. }
+                | DeclOp::Splice { .. }
                 | DeclOp::ExternPrelude { .. }
                 | DeclOp::UnresolvedExternCrate { .. }
                 | DeclOp::MacroUsePrelude { .. }
                 | DeclOp::ExportedDerive { .. }
                 | DeclOp::ProcMacroFn { .. }
                 | DeclOp::Diagnostic(_)
-                | DeclOp::DeriveHelpers { .. }
-                | DeclOp::DeriveHelpersToImpl { .. }
-                | DeclOp::SkipAttr { .. }
-                | DeclOp::PrevActiveAttr { .. }
-                | DeclOp::DeferDerive { .. }
-                | DeclOp::TakeDeferredDerives { .. }
                 | DeclOp::SessionMacros
         )
     }
 }
 
 /// The ops of one collection, in the order they were made.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpLog {
     pub(crate) ops: Vec<DeclOp>,
 }

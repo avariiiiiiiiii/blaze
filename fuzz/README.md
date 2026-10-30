@@ -2,7 +2,8 @@
 
 Coverage-guided fuzz targets for every parser in blaze that reads bytes nobody vouches for: the
 store's packs and the remote protocol, the agent API's CBOR, the linker's object files and
-archives, the VFS journal, and wasm proc macros. The engine is blaze's own (`src/`), so no
+archives, the VFS journal, wasm proc macros, what a proc-macro server and a build script send
+back, and what the front end and codegen persist in the store. The engine is blaze's own (`src/`), so no
 libFuzzer and no rustc are involved.
 
 ## Running a target
@@ -14,7 +15,8 @@ crate of the build:
 export RUSTFLAGS="-Zsanitizer=address -Csanitizer-coverage-level=3 \
   -Zsanitizer-coverage=inline-8bit-counters,pc-table,trace-cmp -Cdebug-assertions"
 blaze build --release -p blaze-fuzzer --bin cas_pack
-target/release/cas_pack fuzz                  # for the target's budget
+target/release/cas_pack fuzz                  # for the target's budget, on one core
+target/release/cas_pack fuzz --jobs "$(nproc)" # on every core
 target/release/cas_pack fuzz --seconds 60 --seed 1
 ```
 
@@ -23,10 +25,11 @@ run without coverage instead. Every target binary takes these commands:
 
 | command | what it does |
 |---|---|
-| `fuzz [--seconds N] [--runs N] [--seed N] [--max-len N] [--timeout-ms N] [--no-value-profile] [--out DIR]` | fuzzes until the budget (the target's `budget`, or `--seconds`) or `--runs` is spent, or an input fails |
-| `run FILE...` | runs each input once, catching nothing: a failure ends the process as it would anywhere |
+| `fuzz [--jobs N] [--seconds N] [--runs N] [--seed N] [--max-len N] [--timeout-ms N] [--no-value-profile] [--out DIR]` | fuzzes until the budget (the target's `budget`, or `--seconds`) or `--runs` is spent, or an input fails; with `--jobs N`, in N processes seeded `seed`, `seed + 1`, ..., which read each other's kept inputs every second and all stop at the first failure, ending with its exit code |
+| `run [--timeout-ms N] FILE...` | runs each input once, catching nothing: a failure ends the process as it would anywhere, and an input running past the timeout (10 s by default) ends it with exit code 3 |
 | `minimize FILE [--seconds N] [--timeout-ms N]` | finds the smallest input that still fails the same way (a failure, or a timeout) |
 | `seeds` | runs the seed corpus and its deterministic changes, as the `#[test]` does |
+| `serve [--timeout-ms N]` | what `minimize` runs: inputs as a little-endian `u32` length and the bytes on stdin, one byte back per input (0 passed, 1 panicked), exit code 3 on a timeout |
 
 What a run keeps goes to `fuzz/out/<target>/` (ignored by git): `corpus/` (inputs that reached
 something new, read again by the next run), `crash-<hash>.hex`, `timeout-<hash>.hex` (an input
@@ -44,7 +47,8 @@ check; `ASAN_OPTIONS` overrides these.
 whitespace ignored (what `crates/blaze-fuzz`'s `inputs` reads). Each target also builds valid
 inputs through the writer side of its API (`Target::seeds`). Every target's `#[test]`, run in
 the merge gate without coverage by `blaze test -p blaze-fuzzer`, feeds `check` the corpus files,
-the built seeds and 20000 deterministic changes of them (`BLAZE_FUZZ_RUNS` changes the count).
+the built seeds and 20000 deterministic changes of them (`BLAZE_FUZZ_RUNS` changes the count),
+spread over every core, so `check` must allow calls on several threads at once.
 To keep an input a fuzz run found, copy it from `fuzz/out/<target>/` into the target's corpus.
 
 ## The engine
@@ -66,8 +70,15 @@ To keep an input a fuzz run found, copy it from `fuzz/out/<target>/` into the ta
   first to reach, newer inputs weighted more.
 - **Failures**: a panic, or an AddressSanitizer report (`__asan_on_error`), writes the input
   being run; a watchdog writes one that runs past the timeout and ends the process. `minimize`
-  runs each try in a child process (`<target> run`), cutting chunks of halving size and then
-  zeroing bytes while the failure stays the same.
+  runs the tries in a child process (`<target> serve`), one after another over a pipe, with a
+  new child after each failing try, cutting chunks of halving size and then zeroing bytes while
+  the failure stays the same.
+- **Speed**: the bounds and the arithmetic are in
+  `docs/v2/plan/lanes/safety/speed-of-light.md` ("The fuzzer"). The engine's work per run is
+  two reads of the counters a cache line at a time, one before it (zeroing the lines that hold
+  a count) and one after (the features);
+  the drain and the run are `__sanitizer_*` functions, which SanitizerCoverage leaves
+  uninstrumented. The comparison callbacks spend no locked instruction.
 
 ## Targets
 
@@ -105,6 +116,11 @@ Each target's file (`targets/<target>.rs`) begins with the invariants it checks.
 | `usercode_script_verify` | `blaze_build_script::verify` of a run's output against the elided one | `Ok` exactly when they are equal, else the error naming the first differing line; bounded |
 | `usercode_trace_record`, `usercode_trace_report` | the sandbox trace's lines (`trace::parse`) and reports (`trace::decode`) | agree with a model of the grammar; round trip; reading in pieces equals reading whole; bounded |
 | `usercode_index_shape`, `usercode_run_value` | `index::Shape::decode`, `run::Value::decode` | decode then encode is the identity; bounded |
+| `proc_macro_message` | `proc-macro-api`'s warm protocol: one postcard `BidirectionalMessage` from the server, in a COBS frame | never panics; bounded (serde's cautious preallocation of a map's buckets on top of `allowed(len)`); a message read writes as one frame that reads back to the same message |
+| `proc_macro_frames` | a stream of the warm protocol's COBS frames and the legacy protocol's lines, noise included | the stream reads as each frame read alone, and the same in pieces of any size; bounded |
+| `proc_macro_legacy` | the legacy protocol's newline-delimited JSON answers | bounded; read alike in pieces; each answer writes as one line that reads back the same |
+| `proc_macro_flat_tree` | a `FlatTree` and its span table, as the client resolves them (`deserialize_span_data_index_map`, `to_subtree_resolved`) | never panics; bounded by the input's length times a token tree's size; a tree read encodes and reads back the same |
+| `proc_macro_tt_wire` | `tt::TopSubtree::read_wire`, the token-tree wire | never panics; bounded; a tree read writes back to exactly the words it took and equals `from_serialized` of its trees; every strict prefix is `Truncated` |
 | `codegen_asm` | `hir_ty_codegen::Assembled::from_bytes`, assembled code kept in the store | `None`, or `to_bytes` is the input; at most `4 * len + 1 KiB` allocated at once |
 | `hir_item_tree`, `hir_expr_store`, `hir_body`, `hir_store_source_map`, `hir_body_source_map` | `Persist::read` then `decode()` of the persisted item tree, expression store, body and their source maps | `Err`, or a value written back the same (for column edits of a valid buffer, exactly the input); decoded syntax contexts are compared and dropped, never given to a database; bounded |
 

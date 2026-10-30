@@ -246,10 +246,31 @@ enum KeySource<'a> {
     Bytes(&'a [u8]),
 }
 
-/// A run's value, written once; copied once into the thread's value segment by the store.
+/// A run's value, written once into a buffer of this thread's (see [`BUFFERS`]); copied once
+/// into the thread's value segment by the store.
 struct Computed {
     bytes: Vec<u8>,
     fingerprint: Fingerprint,
+}
+
+/// How many value buffers a thread keeps, and the largest it keeps: runs nest, each holding
+/// one buffer until its value is copied, and one huge value should not stay pinned.
+const BUFFERS_KEPT: usize = 8;
+const BUFFER_KEPT_BYTES: usize = 1 << 20;
+
+impl Drop for Computed {
+    fn drop(&mut self) {
+        let bytes = std::mem::take(&mut self.bytes);
+        if (1..=BUFFER_KEPT_BYTES).contains(&bytes.capacity()) {
+            // A thread being torn down has no buffers left to keep it in; the buffer is freed.
+            let _ = BUFFERS.try_with(|buffers| {
+                let mut buffers = buffers.borrow_mut();
+                if buffers.len() < BUFFERS_KEPT {
+                    buffers.push(bytes);
+                }
+            });
+        }
+    }
 }
 
 /// Runs one kind's query: `None` when its key's bytes don't decode (a key of another schema,
@@ -271,7 +292,10 @@ fn run_query<Q: Query>(cx: &mut Cx<'_>, source: KeySource<'_>) -> Result<Option<
         },
     };
     let value = Q::execute(cx, key)?;
-    let bytes = write_value(&value);
+    let buffer = BUFFERS.with(|buffers| buffers.borrow_mut().pop()).unwrap_or_default();
+    let mut out = Writer::with_buffer(<Q::Value as Persist>::SCHEMA, buffer);
+    let root = value.write(&mut out);
+    let bytes = out.finish(root);
     let fingerprint = Q::fingerprint(&value, &bytes);
     Ok(Some(Computed { bytes, fingerprint }))
 }
@@ -301,6 +325,9 @@ thread_local! {
     /// the thread pumps while that query waits is a task above it, free to ask the database.
     static INSIDE: Cell<Option<usize>> = const { Cell::new(None) };
     static STACKS: RefCell<Stacks> = const { RefCell::new(Stacks { keys: Vec::new(), edges: Vec::new() }) };
+    /// Value buffers a run writes into and gives back once the store copied its value, so a
+    /// run allocates nothing for its value once they have grown.
+    static BUFFERS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
 fn inside_a_query() -> bool {
@@ -551,18 +578,87 @@ impl Config {
 /// What a view resolved: every key's memo, every input it read, and why each key it ran
 /// again did.
 ///
-/// A result is 40 bytes of row (the key and the memo's ID) and at most 16 of places; finding
-/// one is a shard's table load, about 1.5 place loads and one row read, with no hash computed.
+/// A result is one 64-byte line of row (the key, the memo's ID and its fingerprint) and at
+/// most 16 bytes of places; finding one is a shard's table load, about 1.5 place loads and one
+/// row read, with no hash computed. Verifying an edge to a key the view resolved reads that
+/// line alone, never the memo's.
 struct ViewState {
     id: ViewId,
     view: View,
     config: Arc<[u8]>,
-    results: Map<MemoId>,
+    results: Map<Resolved>,
     inputs: Map<InputValue>,
     reruns: Map<Rerun>,
 }
 
-const _: () = assert!(size_of::<table::Entry<MemoId>>() == 40);
+/// A set of memo IDs as a bit each, sized by the IDs handed out: marking or testing one is a
+/// shift and a word, with no hash. 1 bit a memo of the store.
+struct Marks(Vec<u64>);
+
+impl Marks {
+    fn new(end: u32) -> Marks {
+        Marks(vec![0; (end as usize).div_ceil(64)])
+    }
+
+    /// Marks `memo`; `false` when it was marked already.
+    fn insert(&mut self, memo: MemoId) -> bool {
+        let (word, bit) = (memo as usize / 64, memo % 64);
+        if word >= self.0.len() {
+            self.0.resize(word + 1, 0);
+        }
+        let was = self.0[word] >> bit & 1;
+        self.0[word] |= 1 << bit;
+        was == 0
+    }
+
+    fn contains(&self, memo: MemoId) -> bool {
+        self.0.get(memo as usize / 64).is_some_and(|word| word >> (memo % 64) & 1 != 0)
+    }
+
+    /// The marked IDs, in order.
+    fn iter(&self) -> impl Iterator<Item = MemoId> + '_ {
+        self.0.iter().enumerate().flat_map(|(at, &word)| {
+            let mut bits = word;
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    at as u32 * 64 + bit
+                })
+            })
+        })
+    }
+}
+
+/// How many edges ahead [`Database::verify`] starts a lookup: about the misses a core keeps in
+/// flight (20) over the two each lookup takes.
+const AHEAD: usize = 8;
+
+/// From how many memos [`Database::verify`] prefetches: 2^16 memos are about 8 MB of memo and
+/// result lines, past a core's L2, so lookups start to miss.
+const PREFETCH_FROM: u32 = 1 << 16;
+
+/// A key's memo in a view, with the memo's fingerprint beside it.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Resolved {
+    memo: MemoId,
+    /// [`Fingerprint`], as two words so the entry is 8-byte aligned.
+    fingerprint: [u64; 2],
+}
+
+impl Resolved {
+    fn new(store: &Store, task: &Guard, memo: MemoId) -> Resolved {
+        let Fingerprint(fingerprint) = store.fingerprint(task, memo);
+        Resolved { memo, fingerprint: [fingerprint as u64, (fingerprint >> 64) as u64] }
+    }
+
+    fn fingerprint(&self) -> Fingerprint {
+        Fingerprint(u128::from(self.fingerprint[0]) | u128::from(self.fingerprint[1]) << 64)
+    }
+}
+
+const _: () = assert!(size_of::<table::Entry<Resolved>>() == 64);
 const _: () = assert!(size_of::<table::Entry<u64>>() == 48);
 
 impl ViewState {
@@ -570,10 +666,10 @@ impl ViewState {
         ViewState { id, view, config, results: Map::new(), inputs: Map::new(), reruns: Map::new() }
     }
 
-    fn collect(&self) {
-        self.results.collect();
-        self.inputs.collect();
-        self.reruns.collect();
+    fn sweep(&self) {
+        self.results.sweep();
+        self.inputs.sweep();
+        self.reruns.sweep();
     }
 
     fn reclaim(&mut self) {
@@ -860,12 +956,13 @@ impl Database {
         // Before the views are walked: a memo unlinked earlier is checked against what they
         // hold now (see `memo`'s comment).
         let dying = self.store.to_check();
-        let mut reached: FxSet<MemoId> = FxSet::default();
-        let mut hot: FxSet<MemoId> = FxSet::default();
+        let mut reached = Marks::new(self.store.end());
+        let mut hot = Marks::new(self.store.end());
         let mut inputs_kept: FxSet<QueryKey> = FxSet::default();
         let mut work: Vec<MemoId> = Vec::new();
         self.views.for_each(&task, |state| {
-            state.results.for_each(&task, |_, &memo| {
+            state.results.for_each(&task, |_, resolved| {
+                let memo = resolved.memo;
                 hot.insert(memo);
                 work.push(memo);
             });
@@ -873,7 +970,7 @@ impl Database {
                 inputs_kept.insert(*key);
             });
         });
-        self.store.checked(dying, |memo| hot.contains(&memo));
+        self.store.checked(dying, |memo| hot.contains(memo));
         for key in kept {
             if is_input(key.kind) {
                 inputs_kept.insert(*key);
@@ -914,7 +1011,7 @@ impl Database {
                     }
                     return Edit::Keep;
                 }
-                let live: Vec<MemoId> = memos.iter().copied().filter(|memo| reached.contains(memo)).collect();
+                let live: Vec<MemoId> = memos.iter().copied().filter(|&memo| reached.contains(memo)).collect();
                 if live.len() == memos.len() {
                     Edit::Keep
                 } else if !live.is_empty() {
@@ -943,8 +1040,7 @@ impl Database {
         if self.config.dir.is_some() {
             let mut cold: Vec<(QueryKey, Fingerprint, MemoId)> = reached
                 .iter()
-                .copied()
-                .filter(|memo| !hot.contains(memo) && self.store.stored(&task, *memo) == Stored::Memory)
+                .filter(|&memo| !hot.contains(memo) && self.store.stored(&task, memo) == Stored::Memory)
                 .map(|memo| (self.store.key(&task, memo), self.store.fingerprint(&task, memo), memo))
                 .collect();
             cold.sort_unstable();
@@ -966,11 +1062,11 @@ impl Database {
     /// tables' rows first, as a slot's row holds spans of the store's segments.
     fn collect_retired(&self, task: &Guard) {
         self.limbo.lock().collect();
-        self.slots.collect();
-        self.inputs.collect();
-        self.born.collect();
-        self.views.for_each(task, ViewState::collect);
-        self.store.collect();
+        self.slots.sweep();
+        self.inputs.sweep();
+        self.born.sweep();
+        self.views.for_each(task, ViewState::sweep);
+        self.store.sweep();
     }
 
     /// Writes the whole database as one image, through effects.
@@ -1004,7 +1100,14 @@ impl Database {
                 let task = blaze_reclaim::enter();
                 for entry in entries {
                     let bytes = mapping.bytes().get(entry.at..entry.at + entry.len);
-                    let Some(bytes) = bytes.filter(|bytes| value_id(bytes) == entry.id) else {
+                    // The value still in memory is compared byte for byte (a `memcmp`, not a
+                    // second hash); one swapped out since is checked by its content ID.
+                    let wrote = self.store.in_memory(&task, entry.memo).filter(|(word, _)| *word == entry.word);
+                    let holds = |bytes: &&[u8]| match wrote {
+                        Some((_, wrote)) => *bytes == wrote,
+                        None => value_id(bytes) == entry.id,
+                    };
+                    let Some(bytes) = bytes.filter(holds) else {
                         panic!(
                             "the database's cold pack {file} does not hold at byte {} the value it wrote",
                             entry.at
@@ -1066,12 +1169,12 @@ impl Database {
                 old.reruns.for_each(&task, |key, rerun| {
                     fresh.reruns.insert(&task, *key, rerun.clone());
                 });
-                old.results.for_each(&task, |key, &memo| {
+                old.results.for_each(&task, |key, resolved| {
                     let same = new.slot(&task, key).and_then(|slot| {
-                        slot.memos().iter().copied().find(|&it| new.store.same(&task, it, &self.store, memo))
+                        slot.memos().iter().copied().find(|&it| new.store.same(&task, it, &self.store, resolved.memo))
                     });
                     if let Some(same) = same {
-                        fresh.results.insert(&task, *key, same);
+                        fresh.results.insert(&task, *key, Resolved { memo: same, ..*resolved });
                     }
                 });
                 Box::new(fresh)
@@ -1101,17 +1204,17 @@ impl Database {
         self.slots.reclaim();
         self.inputs.reclaim();
         self.born.reclaim();
-        let mut held: FxSet<MemoId> = FxSet::default();
+        let mut held = Marks::new(self.store.end());
         {
             let task = blaze_reclaim::enter();
             self.views.for_each(&task, |state| {
-                state.results.for_each(&task, |_, &memo| {
-                    held.insert(memo);
+                state.results.for_each(&task, |_, resolved| {
+                    held.insert(resolved.memo);
                 });
             });
         }
         self.views.values_mut().for_each(ViewState::reclaim);
-        self.store.reclaim(|memo| held.contains(&memo));
+        self.store.reclaim(|memo| held.contains(memo));
     }
 
     /// Drops the values of `key`'s memos from memory, keeping their fingerprints and edges: a
@@ -1175,8 +1278,8 @@ impl Database {
         run: Run,
         key: &Q::Key,
     ) -> Result<MemoId, Cancelled> {
-        if let Some(&memo) = state.results.get(task, &query) {
-            return Ok(memo);
+        if let Some(resolved) = state.results.get(task, &query) {
+            return Ok(resolved.memo);
         }
         self.learn_key::<Q>(task, query, key);
         Ok(self
@@ -1316,6 +1419,9 @@ impl Database {
         if is_input(key.kind) {
             return Ok(self.input_value(task, state, key).map(|value| value.fingerprint));
         }
+        if let Some(resolved) = state.results.get(task, &key) {
+            return Ok(Some(resolved.fingerprint()));
+        }
         Ok(self.resolve(task, state, key, run, None)?.map(|memo| self.store.fingerprint(task, memo)))
     }
 
@@ -1330,8 +1436,8 @@ impl Database {
         run: Run,
         typed: Option<&(dyn Any + Send + Sync)>,
     ) -> Result<Option<MemoId>, Cancelled> {
-        if let Some(&memo) = state.results.get(task, &key) {
-            return Ok(Some(memo));
+        if let Some(resolved) = state.results.get(task, &key) {
+            return Ok(Some(resolved.memo));
         }
         let Some(info) = self.kinds.get(&key.kind) else { return Ok(None) };
         loop {
@@ -1343,8 +1449,8 @@ impl Database {
             if let Some(found) = ran {
                 return Ok(found);
             }
-            if let Some(&memo) = state.results.get(task, &key) {
-                return Ok(Some(memo));
+            if let Some(resolved) = state.results.get(task, &key) {
+                return Ok(Some(resolved.memo));
             }
         }
     }
@@ -1367,8 +1473,8 @@ impl Database {
         run: Run,
         typed: Option<&(dyn Any + Send + Sync)>,
     ) -> Result<Option<MemoId>, Cancelled> {
-        if let Some(&memo) = state.results.get(task, &key) {
-            return Ok(Some(memo));
+        if let Some(resolved) = state.results.get(task, &key) {
+            return Ok(Some(resolved.memo));
         }
         let _frame = Frame::push(key);
         let slot = self.slot(task, &key);
@@ -1378,7 +1484,7 @@ impl Database {
                 continue;
             }
             let change = match self.verify(task, state, memo, run)? {
-                Verdict::Valid => return Ok(Some(*state.results.insert(task, key, memo))),
+                Verdict::Valid => return Ok(Some(self.resolved(task, state, key, memo))),
                 Verdict::Changed(changed) => Some(changed),
                 Verdict::Unknown => None,
             };
@@ -1397,13 +1503,40 @@ impl Database {
         drop(recording);
         let memo = self.add_memo(task, key, made);
         state.reruns.insert(task, key, Rerun { previous });
-        Ok(Some(*state.results.insert(task, key, memo)))
+        Ok(Some(self.resolved(task, state, key, memo)))
+    }
+
+    /// Records `memo` as `key`'s in the view, and says which memo the view has for it (a
+    /// racing run's, if it recorded first).
+    fn resolved(&self, task: &Guard, state: &ViewState, key: QueryKey, memo: MemoId) -> MemoId {
+        state.results.insert(task, key, Resolved::new(&self.store, task, memo)).memo
     }
 
     /// Whether every edge of `memo`, in order, still holds in the view: one sequential walk of
-    /// its range of the edge segment, each edge's key and fingerprint read in place.
+    /// its range of the edge segment, each edge's key and fingerprint read in place. As it
+    /// checks one edge it prefetches the place of the edge `AHEAD` on and the row of the edge
+    /// `AHEAD / 2` on, so their misses overlap; it still stops at the first edge that changed.
+    /// A database small enough to stay in cache (`PREFETCH_FROM`) skips the prefetches.
     fn verify(&self, task: &Guard, state: &ViewState, memo: MemoId, run: Run) -> Result<Verdict, Cancelled> {
-        for edge in self.store.edges(task, memo) {
+        let edges = self.store.edges(task, memo);
+        let far = self.store.end() >= PREFETCH_FROM;
+        for (at, edge) in edges.iter().enumerate() {
+            if far && let Some(ahead) = edges.get(at + AHEAD) {
+                let read = ahead.read();
+                if is_input(read.kind) {
+                    state.inputs.prefetch_place(task, &read);
+                } else {
+                    state.results.prefetch_place(task, &read);
+                }
+            }
+            if far && let Some(ahead) = edges.get(at + AHEAD / 2) {
+                let read = ahead.read();
+                if is_input(read.kind) {
+                    state.inputs.prefetch_entry(task, &read);
+                } else {
+                    state.results.prefetch_entry(task, &read);
+                }
+            }
             let read = edge.read();
             match self.fingerprint_in(task, state, read, run)? {
                 Some(now) if now == edge.saw() => {}
@@ -1473,7 +1606,7 @@ impl Database {
         if is_input(key.kind) {
             state.inputs.get(task, &key).map(|value| value.fingerprint)
         } else {
-            state.results.get(task, &key).map(|&memo| self.store.fingerprint(task, memo))
+            state.results.get(task, &key).map(Resolved::fingerprint)
         }
     }
 
@@ -1517,43 +1650,45 @@ impl Database {
         io.pending.insert(tag, Pending::ColdWrite { file, entries });
     }
 
-    fn image_entries<'g>(&'g self, task: &'g Guard) -> Vec<image::Entry<'g>> {
-        let mut keys: FxSet<QueryKey> = FxSet::default();
-        self.slots.for_each(task, |key, _| {
-            keys.insert(*key);
-        });
+    fn image_entries<'g>(&'g self, task: &'g Guard) -> image::Entries<'g> {
+        // alloc: once per image, as are the lists below: one for every key, one for every
+        // memo, and one sort buffer reused across keys.
+        let mut keys: Vec<QueryKey> = Vec::new();
+        self.slots.for_each(task, |key, _| keys.push(*key));
         if let Some(image) = &self.image {
             keys.extend(image.keys());
         }
-        let mut keys: Vec<QueryKey> = keys.into_iter().collect();
         keys.sort_unstable();
-        keys.into_iter()
-            .filter_map(|key| {
-                let slot = self.slot(task, &key)?;
-                if slot.memos().is_empty() {
-                    return None;
+        keys.dedup();
+        // Reading a key's memos in from the image may add codes, so a code past the snapshot
+        // takes a new one.
+        let mut codes = self.store.codes();
+        let mut entries = image::Entries { keys: Vec::with_capacity(keys.len()), memos: Vec::with_capacity(keys.len()) };
+        let mut sorting: Vec<(Fingerprint, ContentId, SchemaHash, &[EdgeRecord], MemoId)> = Vec::new(); // alloc: see above
+        for key in keys {
+            let Some(slot) = self.slot(task, &key) else { continue };
+            if slot.memos().is_empty() {
+                continue;
+            }
+            sorting.clear();
+            for &memo in slot.memos() {
+                let hot = self.store.hot(task, memo);
+                if hot.code() as usize >= codes.len() {
+                    codes = self.store.codes();
                 }
-                let mut memos: Vec<(Fingerprint, ContentId, SchemaHash, &[EdgeRecord], MemoId)> = slot
-                    .memos()
-                    .iter()
-                    .map(|&memo| {
-                        let hot = self.store.hot(task, memo);
-                        let (schema, producer) = self.store.parts(hot.code());
-                        (hot.fingerprint(), producer, schema, self.store.edges(task, memo), memo)
-                    })
-                    .collect();
-                memos.sort_by(|a, b| {
-                    (a.0, a.1, a.2, a.3.len())
-                        .cmp(&(b.0, b.1, b.2, b.3.len()))
-                        .then_with(|| a.3.iter().map(EdgeRecord::order).cmp(b.3.iter().map(EdgeRecord::order)))
-                });
-                Some(image::Entry {
-                    key,
-                    memos: memos.into_iter().map(|(.., memo)| memo).collect(),
-                    key_bytes: slot.key(),
-                })
-            })
-            .collect()
+                let (schema, producer) = codes[hot.code() as usize];
+                sorting.push((hot.fingerprint(), producer, schema, self.store.edges(task, memo), memo));
+            }
+            sorting.sort_by(|a, b| {
+                (a.0, a.1, a.2, a.3.len())
+                    .cmp(&(b.0, b.1, b.2, b.3.len()))
+                    .then_with(|| a.3.iter().map(EdgeRecord::order).cmp(b.3.iter().map(EdgeRecord::order)))
+            });
+            let start = entries.memos.len();
+            entries.memos.extend(sorting.iter().map(|&(.., memo)| memo));
+            entries.keys.push(image::Entry { key, memos: start..entries.memos.len(), key_bytes: slot.key() });
+        }
+        entries
     }
 
     fn image_inputs(&self, task: &Guard) -> Vec<(QueryKey, Input)> {

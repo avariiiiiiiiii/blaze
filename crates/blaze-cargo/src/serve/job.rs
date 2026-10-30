@@ -58,7 +58,10 @@ use super::{
     heads::Heads,
     mounts::Mounts,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds},
-    work::{Compiled, Failed, Front, FrontEnd, Goal, JobInput, Reader, Readers, Runs, Selection, Source, Steps, Writer},
+    work::{
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Reader, Readers, Runs, Selection, Source, Steps,
+        Writer,
+    },
 };
 
 /// How many tags one run of user code uses ([`Runs`]).
@@ -71,7 +74,8 @@ pub enum Value {
     Fetched(Arc<[Fetch]>, u32, Result<Source, ApiError>),
     Planned(Result<Planned, ApiError>),
     Lowered(Result<FrontEnd, ApiError>),
-    Compiled(usize, Result<Compiled, ApiError>),
+    /// A unit's compile, and the images it relinked, given back to the loop.
+    Compiled(usize, Result<Compiled, ApiError>, Vec<Image>),
     Answer(Result<Response, ApiError>),
     /// `blaze test --ub`: the tests selected, and one's result.
     Selected(Result<Vec<String>, ApiError>),
@@ -318,9 +322,11 @@ struct Fetching {
 struct Build {
     input: JobInput,
     front: Arc<dyn Front>,
-    /// The front end's database, written only here, on the loop: each task that reads it is
-    /// posted with a reader made from it then.
+    /// The front end, written only here, on the loop: each task that reads it is posted with
+    /// a reader made from it then, and a write waits for those readers to end.
     writer: Box<dyn Writer>,
+    /// Reading tasks the plane asked to post while a write waited, posted once it is applied.
+    held: Vec<(Posting, bool)>,
     /// Unit `at` is node `first + at`.
     first: NodeId,
     /// Each unit's package, by its place in the plan's packages; `u32::MAX` for none.
@@ -405,6 +411,9 @@ pub struct Jobs {
     /// The store's last put: its tickets are made in order, so all before it are durable once
     /// it is.
     put: Option<blaze_cas::Ticket>,
+    /// Every image kept linked, by the path cargo writes it at, for the daemon's life: each is
+    /// moved into the compile that relinks it and back once it ends ([`Image`]).
+    images: FxHashMap<String, Box<dyn Kept>>,
     /// A job ran a query or a unit since the image was written.
     pub cold: bool,
     /// A job finished since the last collection.
@@ -440,6 +449,7 @@ impl Jobs {
             runs: VecDeque::new(),
             runs_from: 0,
             put: None,
+            images: FxHashMap::default(),
             cold: false,
             ended: false,
         }
@@ -607,24 +617,79 @@ impl Jobs {
     }
 
     /// A task of a batch that reads posted with readers of its job's front ends as they stand
-    /// now, after every write the loop made before it.
+    /// now, after every write the loop applied before it. While a write of its job waits for
+    /// the readers before it, the task is held and posted once the write is applied
+    /// ([`Jobs::apply_writes`]). A compile is given the images kept at its outputs.
     fn post(&mut self, w: &mut World<'_>, task: Posting, again: bool) {
-        let job = self.job_of(task.id).and_then(|id| self.jobs.get(&id));
-        let readers = job.and_then(|job| match &job.stage {
-            Stage::Units(build) => Some(Readers { this: Some(build.writer.reader()), from: None }),
-            Stage::Answer(_) => {
-                let this = job.ready.last()?.writer.as_ref()?.reader();
-                let from = match job.work {
-                    Work::Reach { .. } => Some(job.ready.first()?.writer.as_ref()?.reader()),
-                    _ => None,
+        let id = self.job_of(task.id);
+        let job = id.and_then(|id| self.jobs.get_mut(&id));
+        let readers = match job {
+            Some(Job { stage: Stage::Units(build), .. }) => {
+                let Some(this) = build.writer.reader() else {
+                    build.held.push((task, again));
+                    return;
                 };
-                Some(Readers { this: Some(this), from })
+                let images = match task.kind == kinds::COMPILE {
+                    true => take_images(&mut self.images, &build.input.units, task.arg as usize),
+                    false => Vec::new(),
+                };
+                Some(Readers { this: Some(this), from: None, images })
             }
+            Some(job) if matches!(job.stage, Stage::Answer(_)) => match job.work {
+                Work::Tables => job.ready.last_mut().and_then(|it| it.writer.take()).map(|writer| Readers {
+                    writer: Some(writer),
+                    ..Readers::default()
+                }),
+                _ => (|| {
+                    let this = job.ready.last()?.writer.as_ref()?.reader()?;
+                    let from = match job.work {
+                        Work::Reach { .. } => Some(job.ready.first()?.writer.as_ref()?.reader()?),
+                        _ => None,
+                    };
+                    Some(Readers { this: Some(this), from, ..Readers::default() })
+                })(),
+            },
             _ => None,
-        });
+        };
         match readers {
             Some(readers) => w.plane.post(task, again, readers),
             None => w.plane.refuse(w.now, task, "its job has no front end to read now".to_owned()),
+        }
+    }
+
+    /// Each job's waiting writes applied where no reader of its front end is left, and the
+    /// tasks held for them posted with readers of what they made. Asking a job whose readers
+    /// still run costs one load of its reference count. Called as the loop winds up each
+    /// step: a reader is dropped as its task's work returns, before the plane hears the task
+    /// ended, so the step that hears the last one applies the write. The daemon calls it
+    /// once a turn as well, for a reader that outlives its task.
+    pub fn apply_writes(&mut self, w: &mut World<'_>) {
+        let order = self.sorted();
+        let mut posts = Vec::new();
+        for id in &order {
+            let job = self.jobs.get_mut(id).expect("a job in the order");
+            let Stage::Units(build) = &mut job.stage else { continue };
+            if !build.writer.waiting() && build.held.is_empty() {
+                continue;
+            }
+            match build.writer.apply() {
+                Ok(true) => posts.append(&mut build.held),
+                Ok(false) => {}
+                Err(error) => {
+                    let held = std::mem::take(&mut build.held);
+                    for (task, _) in held {
+                        w.plane.refuse(w.now, task, format!("applying a build script's run or a proc macro: {}", error.what));
+                    }
+                    if !job.cancelled.load(Ordering::Acquire) {
+                        job.over.get_or_insert((false, Some(error)));
+                    }
+                    self.end(w, *id, false, None);
+                }
+            }
+        }
+        self.order = order;
+        for (task, again) in posts {
+            self.post(w, task, again);
         }
     }
 
@@ -667,7 +732,10 @@ impl Jobs {
             Value::Fetched(fetches, at, Err(error)) => {
                 self.fetch_failed.insert(fetches[at as usize].at.clone(), error);
             }
-            Value::Compiled(unit, result) => self.compiled(w, node, unit, result),
+            Value::Compiled(unit, result, images) => {
+                self.images.extend(images.into_iter().map(|Image { path, kept }| (path, kept)));
+                self.compiled(w, node, unit, result);
+            }
             Value::Evaluated(result) => {
                 let Some(id) = self.job_of(node) else { return };
                 let Some(job) = self.jobs.get_mut(&id) else { return };
@@ -911,7 +979,7 @@ impl Jobs {
                 let changes = changes.clone();
                 let reach = move |_: u32, readers: Readers| {
                     let from_reader = readers.from.expect("a reach is posted with a reader of the view it reaches from");
-                    to.reach(this(Readers { this: readers.this, from: None }), from.as_ref(), from_reader, &changes)
+                    to.reach(this(Readers { from: None, ..readers }), from.as_ref(), from_reader, &changes)
                 };
                 Some(task(&cancelled, reach, |_, it| Value::Answer(it.map(Response::Reached))))
             }
@@ -921,7 +989,12 @@ impl Jobs {
             }
             Work::Tables => {
                 let front = ready.front.clone().expect("lowered");
-                Some(task(&cancelled, move |_, readers| front.tables(this(readers)), |_, it| Value::Answer(it.map(Response::Tables))))
+                let images: Vec<(&'static str, u64, u64)> = self.images.values().flat_map(|it| it.tables()).collect();
+                let tables = move |_: u32, readers: Readers| {
+                    let writer = readers.writer.expect("the tables' task is posted with its job's writer");
+                    front.tables(writer, &images)
+                };
+                Some(task(&cancelled, tables, |_, it| Value::Answer(it.map(Response::Tables))))
             }
             Work::Trace(_) => {
                 let (db, queries, root) = (ready.input.db.clone(), ready.input.queries, w.steps.plan_key());
@@ -974,22 +1047,25 @@ impl Jobs {
         }
         let work: plane::Work<Value> = {
             let (front, cancelled) = (front.clone(), cancelled.clone());
-            Arc::new(move |arg, readers| {
+            Arc::new(move |arg, readers: Readers| {
                 let at = arg as usize;
-                match front.compile(this(readers), at) {
+                let Readers { this: reader, mut images, .. } = readers;
+                let reader = reader.expect("a task that reads is posted with its reader");
+                match front.compile(reader, at, &mut images) {
                     Ok(compiled) => {
                         let outcome = match compiled.ok {
                             true => Outcome::Built,
                             false => Outcome::Failed { why: "it did not compile".to_owned() },
                         };
-                        Some(Did { outcome, value: Value::Compiled(at, Ok(compiled)) })
+                        Some(Did { outcome, value: Value::Compiled(at, Ok(compiled), images) })
                     }
-                    Err(Failed::Error(error)) => {
-                        Some(Did { outcome: Outcome::Failed { why: error.what.clone() }, value: Value::Compiled(at, Err(error)) })
-                    }
+                    Err(Failed::Error(error)) => Some(Did {
+                        outcome: Outcome::Failed { why: error.what.clone() },
+                        value: Value::Compiled(at, Err(error), images),
+                    }),
                     Err(Failed::Again) if cancelled.load(Ordering::Acquire) => Some(Did {
                         outcome: Outcome::Failed { why: "cancelled".to_owned() },
-                        value: Value::Compiled(at, Err(ApiError::new("cancelled", None))),
+                        value: Value::Compiled(at, Err(ApiError::new("cancelled", None)), images),
                     }),
                     Err(Failed::Again) => None,
                 }
@@ -1024,6 +1100,7 @@ impl Jobs {
             input,
             front,
             writer,
+            held: Vec::new(),
             first,
             package_of,
             reported,
@@ -1167,10 +1244,13 @@ impl Jobs {
         }
     }
 
-    fn compiled(&mut self, w: &mut World<'_>, node: NodeId, _unit: usize, result: Result<Compiled, ApiError>) {
+    /// A unit's compile on the loop: its diagnostics said, its puts and outputs stored and
+    /// placed, and a proc macro's load asked of the writer, so the units after it, posted only
+    /// once it is applied, expand with it.
+    fn compiled(&mut self, w: &mut World<'_>, node: NodeId, unit: usize, result: Result<Compiled, ApiError>) {
         let Some(id) = self.job_of(node) else { return };
         let Some(job) = self.jobs.get_mut(&id) else { return };
-        let compiled = match result {
+        let mut compiled = match result {
             Ok(compiled) => compiled,
             Err(error) => {
                 if !job.cancelled.load(Ordering::Acquire) {
@@ -1179,6 +1259,11 @@ impl Jobs {
                 return;
             }
         };
+        if let (Some(macros), Stage::Units(build)) = (compiled.macros.take(), &mut job.stage)
+            && let Err(error) = build.writer.macros(unit, macros)
+        {
+            job.over.get_or_insert((false, Some(error)));
+        }
         for diagnostic in compiled.diagnostics {
             w.said.push(Said::Report(id, Response::Diagnostic(diagnostic)));
         }
@@ -1311,7 +1396,7 @@ impl Jobs {
         let ok = ok && job.over.is_none();
         let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { unreachable!("checked above") };
-        let Build { input, front, writer, artifacts, evaluation, .. } = *build;
+        let Build { input, front, artifacts, evaluation, .. } = *build;
         let profile = input.units.finished.clone();
         if !runs {
             let ok = ok && evaluation.is_none_or(|it| !it.failed);
@@ -1323,7 +1408,7 @@ impl Jobs {
         let tags = self.run_tags(id, None);
         let started = match &self.jobs[&id].work {
             Work::Test { filter, all, args, ub, .. } => {
-                front.tests(writer.reader(), &artifacts, Selection { filter, args, all: *all, ub: *ub }, tags)
+                front.tests(&artifacts, Selection { filter, args, all: *all, ub: *ub }, tags)
             }
             Work::Run { bin, args, .. } => front.run(&artifacts, bin.as_deref(), args, tags),
             _ => unreachable!("checked above"),
@@ -1375,6 +1460,7 @@ impl Jobs {
         if matches!(job.stage, Stage::Snapshot { .. }) {
             job.stage = Stage::Over;
         }
+        refuse_held(w, &mut job.stage);
         let mut ended = Vec::new();
         match &mut job.stage {
             Stage::Units(build) => {
@@ -1424,6 +1510,7 @@ impl Jobs {
             Some((was, _)) => *was = *was && ok,
             None => job.over = Some((ok, error)),
         }
+        refuse_held(w, &mut job.stage);
         if !matches!(job.stage, Stage::Runs(..)) {
             job.stage = Stage::Over;
         }
@@ -1441,6 +1528,7 @@ impl Jobs {
     /// Finishes every job that is over and has nothing left: its tasks, its placements and its
     /// runs; and a snapshot once all it waits for is durable.
     fn wind_up(&mut self, w: &mut World<'_>) {
+        self.apply_writes(w);
         let mut over = Vec::new();
         let order = self.sorted();
         for id in &order {
@@ -1495,6 +1583,24 @@ impl Jobs {
         w.vfs.flush(w.effects);
         Stage::Snapshot { ticket, heads, store: self.put }
     }
+}
+
+/// The reading tasks a job held for a write ended unposted: the job is over or cancelled.
+fn refuse_held(w: &mut World<'_>, stage: &mut Stage) {
+    if let Stage::Units(build) = stage {
+        for (task, _) in build.held.drain(..) {
+            w.plane.refuse(w.now, task, "cancelled".to_owned());
+        }
+    }
+}
+
+/// The images kept at unit `unit`'s outputs, moved out of `images` for its compile.
+fn take_images(images: &mut FxHashMap<String, Box<dyn Kept>>, units: &blaze_units::query::Units, unit: usize) -> Vec<Image> {
+    if images.is_empty() {
+        return Vec::new();
+    }
+    let Some(plan) = units.plans.get(unit) else { return Vec::new() };
+    plan.outputs.iter().filter_map(|path| images.remove_entry(path.as_str())).map(|(path, kept)| Image { path, kept }).collect()
 }
 
 fn script_ended(w: &mut World<'_>, node: NodeId, ok: bool) {

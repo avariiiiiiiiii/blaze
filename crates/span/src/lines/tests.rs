@@ -327,3 +327,42 @@ fn the_index_costs_an_eighth_of_the_text() {
     let index = LineIndex::new(&text);
     assert_eq!(index.heap_bytes(), (1 << 20) / 8 + ((1 << 20) / 512 + 1) * 4);
 }
+
+/// Building an index allocates its two buffers, the bitmap and the rank table, each once at its
+/// exact length.
+#[test]
+fn an_index_is_two_allocations() {
+    for text in ["a", "fn main() {}\n", "é\tx\r\n".repeat(700).as_str()] {
+        // Feature detection is read once first, so only the build is measured.
+        let _ = Kernel::best();
+        let (_, used) = blaze_alloc_count::measure(|| LineIndex::new(text));
+        assert_eq!(used.allocations, 2, "{} bytes: the bitmap and the rank table", text.len());
+    }
+}
+
+/// Every lookup, and every column of a place, allocates nothing.
+#[test]
+fn lookups_allocate_nothing() {
+    let text = "fn main() {\n\tlet é = '\u{4e00}';\r\n}\n".repeat(60);
+    let index = LineIndex::new(&text);
+    let places: Vec<TextSize> = (0..=text.len())
+        .filter(|&at| text.is_char_boundary(at))
+        .map(|at| TextSize::new(at as u32))
+        .collect();
+    blaze_alloc_count::assert_at_most(0, "line index lookups", || {
+        for &at in &places {
+            let place = index.place(at).expect("in the text");
+            std::hint::black_box((
+                place.line(),
+                place.char_column(&text),
+                place.display_column(&text),
+                place.byte_column(&text),
+                index.line(at),
+                index.row(at),
+            ));
+        }
+        for line in 0..index.line_count() {
+            std::hint::black_box((index.line_start(line), index.line_end(line)));
+        }
+    });
+}

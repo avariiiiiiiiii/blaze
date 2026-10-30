@@ -87,10 +87,13 @@ where
                 let span = span_map.span_for(path_range);
                 let input = meta.expr().and_then(|value| {
                     if let ast::Expr::Literal(value) = value {
-                        Some(Box::new(AttrInput::Literal(token_to_literal(
-                            value.token().text(),
-                            span_map.span_for(value.syntax().text_range()),
-                        ))))
+                        Some(
+                            AttrInput::Literal(token_to_literal(
+                                value.token().text(),
+                                span_map.span_for(value.syntax().text_range()),
+                            ))
+                            .into(),
+                        )
                     } else {
                         None
                     }
@@ -108,7 +111,7 @@ where
                     span,
                     DocCommentDesugarMode::ProcMacro,
                 );
-                let input = Some(Box::new(AttrInput::TokenTree(tt)));
+                let input = Some(AttrInput::TokenTree(tt).into());
                 (span, input)
             }
             ast::Meta::PathMeta(_) => {

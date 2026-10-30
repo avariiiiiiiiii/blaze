@@ -53,16 +53,29 @@ const TABLES: usize = 21;
 /// The most directories: what the chunks hold, and what a tag range of 2^32 numbers in fours.
 const MOST: u32 = (FIRST * ((1 << CHUNKS) - 1)) as u32;
 
-/// A directory watched: its path, as it was wanted, and its two generations.
+/// A directory watched: its two generations, the directory wanted later that covers it, and
+/// its path, as it was wanted. `since` and `changed` lead a 16-byte-aligned struct, so a check's
+/// two loads are always on one cache line.
+#[repr(C, align(16))]
 pub struct Dir {
-    path: Box<Path>,
     since: AtomicU64,
     changed: AtomicU64,
+    /// The number plus one of a directory above it wanted after it, which covers it; 0 for none.
+    subsumed_by: AtomicU32,
+    path: Box<Path>,
 }
+
+#[cfg(all(not(blaze_check), target_pointer_width = "64"))]
+const _: () = assert!(size_of::<Dir>() == 48);
 
 impl Dir {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The number of a directory above it wanted after it, whose watch covers it.
+    pub fn subsumed_by(&self) -> Option<u32> {
+        self.subsumed_by.load(Ordering::Acquire).checked_sub(1)
     }
 
     /// The generation it has been watched without a break since, or [`UNCONFIRMED`].
@@ -110,11 +123,68 @@ fn chunk_of(raw: u32) -> (usize, usize) {
     (chunk, raw as usize - FIRST * ((1 << chunk) - 1))
 }
 
+/// Marks the end of a part in a key's hash: the parts are hashed in turn, so one pass over a
+/// path gives the tag of every directory above it.
+const PART: u8 = 0xff;
+
 /// Where a key's probe starts and the half of its hash a place keeps.
 fn tag(key: &[u8]) -> u32 {
+    let mut last = 0;
+    prefixes(key, |_, tag| {
+        last = tag;
+        true
+    });
+    last
+}
+
+/// Calls `each(end, tag)` for each directory at or above `bytes`, shortest first: `bytes[..end]`
+/// and its [`tag`], in one pass over the bytes. Stops when `each` says false.
+fn prefixes(bytes: &[u8], mut each: impl FnMut(usize, u32) -> bool) {
     let mut hasher = FxHasher::default();
-    hasher.write(key);
-    (hasher.finish() >> 32) as u32
+    let mut start = 0;
+    for at in 0..=bytes.len() {
+        if at < bytes.len() && !is_separator(bytes[at]) {
+            continue;
+        }
+        hasher.write(&bytes[start..at]);
+        hasher.write_u8(PART);
+        start = at + 1;
+        // The part before the first separator of an absolute path is the file system's root.
+        if at > 0 && !each(at, (hasher.finish() >> 32) as u32) {
+            return;
+        }
+    }
+}
+
+/// `path`'s bytes without trailing separators, as [`Dirs::want`] keys a directory.
+fn trimmed(path: &Path) -> &[u8] {
+    let mut bytes = path.as_os_str().as_encoded_bytes();
+    while bytes.len() > 1 && is_separator(bytes[bytes.len() - 1]) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+/// The directory that covers a path, found once: a check of it is three loads on two lines, no
+/// hash and no walk ([`Cover::unchanged_since`]). A directory found stays the same one for the
+/// table's life, so a cover kept with an answer is good for as long as the answer is.
+#[derive(Clone, Copy)]
+pub struct Cover<'d> {
+    dirs: &'d Dirs,
+    dir: &'d Dir,
+}
+
+impl<'d> Cover<'d> {
+    /// [`Dirs::unchanged_since`] of every path under this directory.
+    pub fn unchanged_since(self, generation: u64) -> bool {
+        self.dirs.hot.settled.load(Ordering::Acquire)
+            && self.dir.since.load(Ordering::Acquire) <= generation
+            && self.dir.changed.load(Ordering::Acquire) <= generation
+    }
+
+    pub fn dir(self) -> &'d Dir {
+        self.dir
+    }
 }
 
 fn entry(tag: u32, raw: u32) -> u64 {
@@ -155,52 +225,83 @@ impl Dirs {
         if !self.hot.settled.load(Ordering::Acquire) {
             return false;
         }
-        let mut bytes = path.as_os_str().as_encoded_bytes();
-        while bytes.len() > 1 && is_separator(bytes[bytes.len() - 1]) {
-            bytes = &bytes[..bytes.len() - 1];
-        }
-        loop {
-            if let Some(dir) = self.find(bytes, tag(bytes))
-                && dir.since.load(Ordering::Acquire) <= generation
-                && dir.changed.load(Ordering::Acquire) <= generation
+        let bytes = trimmed(path);
+        let mut vouched = false;
+        prefixes(bytes, |end, tag| {
+            vouched = self.find(&bytes[..end], tag).is_some_and(|dir| {
+                dir.since.load(Ordering::Acquire) <= generation
+                    && dir.changed.load(Ordering::Acquire) <= generation
+            });
+            !vouched
+        });
+        vouched
+    }
+
+    /// The directory to keep with an answer about `path`, so its later checks are
+    /// [`Cover::unchanged_since`]: of the directories at or above it, the first confirmed one
+    /// not covered by another, else the first not covered. `None` when none is wanted: each
+    /// check of it looks at the disk. Cold: once per answer made, as `path` is stat'ed.
+    pub fn cover(&self, path: &Path) -> Option<Cover<'_>> {
+        let bytes = trimmed(path);
+        let (mut confirmed, mut wanted) = (None, None);
+        prefixes(bytes, |end, tag| {
+            if let Some(dir) = self.find(&bytes[..end], tag)
+                && dir.subsumed_by().is_none()
             {
-                return true;
+                wanted = wanted.or(Some(dir));
+                if dir.since() < UNCONFIRMED {
+                    confirmed = Some(dir);
+                }
             }
-            // The file system's root is never watched: the walk ends below it.
-            match bytes.iter().rposition(|&it| is_separator(it)) {
-                Some(at) if at > 0 => bytes = &bytes[..at],
-                _ => return false,
-            }
-        }
+            confirmed.is_none()
+        });
+        confirmed.or(wanted).map(|dir| Cover { dirs: self, dir })
+    }
+
+    /// Whether `key` or a directory above it is wanted.
+    fn covered(&self, key: &[u8]) -> bool {
+        let mut found = false;
+        prefixes(key, |end, tag| {
+            found = self.find(&key[..end], tag).is_some();
+            !found
+        });
+        found
     }
 
     /// Adds `dir` to watch, if it is not there already: the driver watches it from its next
     /// [`Outside::start`] or round. The file system's root is not watched (a watch of every
     /// file on the machine would hear every write): a path that only it covers is looked at
     /// on the disk at each check. `dir` is canonical, as [`Dirs::unchanged_since`] asks.
+    ///
+    /// A watch hears everything under its directory, so a directory under one wanted already
+    /// is not added, and one wanted above directories already there covers them: the driver
+    /// ends their watches. A round then costs one flush per directory not under another (the
+    /// toolchain, the SDK, `/usr/include`), not one per directory a trace named.
     pub fn want(&self, dir: &Path) {
         let dir = dir.components().as_path();
         if dir.parent().is_none() {
             return;
         }
         let key = dir.as_os_str().as_encoded_bytes();
-        let tag = tag(key);
-        if self.find(key, tag).is_some() {
+        if self.covered(key) {
             return;
         }
         let _adding = self.adding.lock().unwrap_or_else(PoisonError::into_inner);
-        if self.find(key, tag).is_some() {
+        if self.covered(key) {
             return;
         }
+        let tag = tag(key);
         let raw = self.len.load(Ordering::Relaxed);
         assert!(raw < MOST, "more than {MOST} directories watched outside every view");
         let (chunk, at) = chunk_of(raw);
-        let slots =
-            self.slots[chunk].get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
+        let slots = self.slots[chunk]
+            // alloc: a chunk of slots, once per doubling of the directories, under the adding lock.
+            .get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
         let dir = Dir {
-            path: dir.to_path_buf().into_boxed_path(),
             since: AtomicU64::new(UNCONFIRMED),
             changed: AtomicU64::new(0),
+            subsumed_by: AtomicU32::new(0),
+            path: dir.to_path_buf().into_boxed_path(),
         };
         if slots[at].set(dir).is_err() {
             unreachable!("directory {raw} added twice");
@@ -217,6 +318,14 @@ impl Dirs {
         }
         table[place].store(entry(tag, raw), Ordering::Release);
         self.len.store(raw + 1, Ordering::Release);
+        for below in 0..raw {
+            let other = self.dir(below);
+            let bytes = other.path.as_os_str().as_encoded_bytes();
+            if bytes.len() > key.len() && bytes.starts_with(key) && is_separator(bytes[key.len()])
+            {
+                _ = other.subsumed_by.compare_exchange(0, raw + 1, Ordering::AcqRel, Ordering::Acquire);
+            }
+        }
     }
 
     /// How many directories are wanted.
@@ -240,6 +349,7 @@ impl Dirs {
 
     /// The table in use, made if there is none yet: for the writer only.
     fn table(&self, level: usize) -> &[AtomicU64] {
+        // alloc: an index table, once per doubling, by the writer only.
         self.tables[level].get_or_init(|| (0..TABLE << level).map(|_| AtomicU64::new(0)).collect())
     }
 
@@ -318,6 +428,11 @@ pub fn unchanged_since(path: &Path, generation: u64) -> bool {
     DIRS.unchanged_since(path, generation)
 }
 
+/// [`Dirs::cover`] of the process's table.
+pub fn cover(path: &Path) -> Option<Cover<'static>> {
+    DIRS.cover(path)
+}
+
 /// [`Dirs::want`] of the process's table.
 pub fn want(dir: &Path) {
     DIRS.want(dir)
@@ -356,6 +471,8 @@ struct Watch {
     confirmed: bool,
     /// Its watch is to be made again once nothing of it is in flight.
     restart: bool,
+    /// A directory above it, which this driver watches, covers it: it is not watched again.
+    retired: bool,
     /// The round before which a failed watch or stat is not asked again, and the next wait.
     retry: u64,
     backoff: u64,
@@ -380,6 +497,7 @@ impl<'d> Outside<'d> {
     /// that every directory is nameable). One drives a table at a time.
     pub fn new(dirs: &'d Dirs, root: impl Into<PathBuf>, tags: u64) -> Outside<'d> {
         assert!(!dirs.driven.swap(true, Ordering::AcqRel), "another Outside drives this table");
+        // alloc: setup, once per daemon; empty until a directory is wanted.
         Outside { dirs, root: root.into(), tags, watches: Vec::new(), round: 0, left: 0 }
     }
 
@@ -393,13 +511,11 @@ impl<'d> Outside<'d> {
         self.left == 0
     }
 
-    /// Watches each directory wanted since the last call.
+    /// Watches each directory wanted since the last call that no directory above it covers.
     pub fn start(&mut self, effects: &mut Vec<Effect>) {
-        let len = self.dirs.len() as usize;
+        let (first, len) = (self.watches.len(), self.dirs.len() as usize);
         while self.watches.len() < len {
-            let at = self.watches.len();
-            let file = self.name(self.dirs.dir(at as u32).path());
-            let named = file.is_some();
+            let file = self.name(self.dirs.dir(self.watches.len() as u32).path());
             self.watches.push(Watch {
                 file,
                 state: State::Idle,
@@ -408,13 +524,37 @@ impl<'d> Outside<'d> {
                 due: false,
                 confirmed: false,
                 restart: false,
+                retired: false,
                 retry: 0,
                 backoff: 1,
             });
-            if named {
+        }
+        // A directory that covers one added with it comes after it: all are in first.
+        for at in first..len {
+            if !self.retire(at, effects) && self.watches[at].file.is_some() {
                 self.watch(at, effects);
             }
         }
+    }
+
+    /// Retires the directory `at` if one above it that this driver can watch covers it, ending
+    /// its watch once nothing of it is in flight. Whether it is retired.
+    fn retire(&mut self, at: usize, effects: &mut Vec<Effect>) -> bool {
+        if self.watches[at].retired {
+            return true;
+        }
+        let dirs = self.dirs;
+        let dir = dirs.dir(at as u32);
+        let Some(by) = dir.subsumed_by() else { return false };
+        if self.watches.get(by as usize).is_none_or(|it| it.file.is_none()) {
+            return false;
+        }
+        let watch = &mut self.watches[at];
+        watch.retired = true;
+        watch.restart = false;
+        unconfirm(dir, watch);
+        self.tend(at, effects);
+        true
     }
 
     /// A round: watches what is wanted and asks again what may now succeed, then flushes every
@@ -428,8 +568,11 @@ impl<'d> Outside<'d> {
         self.dirs.settle(false);
         let round = self.round;
         for at in 0..self.watches.len() {
+            self.watches[at].due = false;
+            if self.retire(at, effects) {
+                continue;
+            }
             let watch = &mut self.watches[at];
-            watch.due = false;
             if watch.file.is_none() || watch.restart {
                 continue;
             }
@@ -464,7 +607,10 @@ impl<'d> Outside<'d> {
         match (kind, completion.done) {
             (WATCH, Done::Changed { files, lost }) => {
                 dir.changed.fetch_max(dirs.bump(), Ordering::AcqRel);
-                if lost || watch.file.as_ref().is_some_and(|it| files.contains(it)) {
+                let replaced = lost || watch.file.as_ref().is_some_and(|it| files.contains(it));
+                if watch.retired {
+                    // Its end is asked already; the directory above it hears the rest.
+                } else if replaced {
                     // Replaced or moved, or may have been (what was dropped may be its own
                     // end): its watch may hear nothing more of what is at its name.
                     unconfirm(dir, watch);
@@ -493,7 +639,8 @@ impl<'d> Outside<'d> {
                         if meta.dir
                             && watch.state == State::Watching
                             && !watch.confirmed
-                            && !watch.restart =>
+                            && !watch.restart
+                            && !watch.retired =>
                     {
                         dir.since.store(dirs.bump(), Ordering::Release);
                         watch.confirmed = true;
@@ -533,10 +680,18 @@ impl<'d> Outside<'d> {
         self.tend(at, effects);
     }
 
-    /// Moves a watch to be made again on, once nothing of it is in flight.
+    /// Moves a watch to be made again on, or a retired one to its end, once nothing of it is in
+    /// flight.
     fn tend(&mut self, at: usize, effects: &mut Vec<Effect>) {
         let watch = &mut self.watches[at];
-        if !watch.restart || watch.stat || watch.flush.is_some() {
+        if !(watch.restart || watch.retired) || watch.stat || watch.flush.is_some() {
+            return;
+        }
+        if watch.retired {
+            if watch.state == State::Watching {
+                watch.state = State::Ending;
+                effects.push(Effect::Unwatch { tag: self.tag(at, WATCH) });
+            }
             return;
         }
         match watch.state {
@@ -556,6 +711,7 @@ impl<'d> Outside<'d> {
     fn watch(&mut self, at: usize, effects: &mut Vec<Effect>) {
         let tag = self.tag(at, WATCH);
         let watch = &mut self.watches[at];
+        // clone: the effect owns its name; once per watch made, never per round or check.
         let file = watch.file.clone().expect("a directory the driver names");
         watch.state = State::Watching;
         watch.confirmed = false;
@@ -567,6 +723,7 @@ impl<'d> Outside<'d> {
         let tag = self.tag(at, STAT);
         let watch = &mut self.watches[at];
         watch.stat = true;
+        // clone: the effect owns its name; once per watch made or directory not yet there.
         let file = watch.file.clone().expect("a directory the driver names");
         effects.push(Effect::Stat { file, tag });
     }

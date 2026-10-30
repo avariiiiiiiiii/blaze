@@ -831,3 +831,53 @@ fn literals_display_as_they_did() {
         assert_eq!(lit.to_string(), old_literal_display(&lit), "{lit:?}");
     }
 }
+
+/// Walking a built tree allocates nothing, writing it allocates nothing when the buffer has room,
+/// and reading one allocates its columns and the checks' buffers only, however big it is.
+#[test]
+fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
+    let small = lex(0, "fn f() {}");
+    // With a literal longer than `NARROW_LIMIT`, so that a wide span is written and read too.
+    let text = "fn f(a: u32) -> u32 { (a + 1) * [2][0] }\n".repeat(2000);
+    let big = lex(0, &format!("{text} const S: &str = \"{}\";", "x".repeat(0x1_0000)));
+    assert!(!big.wide.is_empty());
+    for tree in [&small, &big] {
+        let view = tree.token_trees();
+        view.for_each_token(|_, _| ());
+        let walked = blaze_alloc_count::assert_at_most(0, "walking a tree's tokens", || {
+            let mut tokens = 0;
+            view.for_each_token(|_, _| tokens += 1);
+            tokens
+        });
+        assert!(walked >= view.len());
+        blaze_alloc_count::assert_at_most(0, "a tree's token trees", || {
+            view.iter_flat_tokens().count()
+        });
+
+        let mut bytes = Vec::new();
+        tree.write_wire(&mut bytes);
+        let written = bytes.len();
+        bytes.clear();
+        blaze_alloc_count::assert_at_most(0, "writing a tree into a buffer with room", || {
+            tree.write_wire(&mut bytes)
+        });
+        assert_eq!(bytes.len(), written);
+
+        let parts = wire::parts_of(tree);
+        let mut resolve = |part: WirePart| {
+            parts
+                .iter()
+                .find(|(it, _)| *it == part)
+                .map(|&(_, it)| it)
+                .ok_or_else(|| "a part the tree didn't have".to_owned())
+        };
+        // Nodes, spans, wide spans, parts and symbols, the nodes' check's stack of open subtrees,
+        // and the set of parts the canonical check makes when there are more than it scans.
+        let (read, _) = blaze_alloc_count::assert_at_most(7, "reading a tree", || {
+            TopSubtree::read_wire(&bytes, &mut resolve)
+        })
+        .expect("a tree's own bytes");
+        assert!(read == *tree);
+    }
+}
+

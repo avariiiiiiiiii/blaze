@@ -491,7 +491,6 @@ impl Loaded {
         step("texts", &mut steps);
         change.set_crate_graph(crate_graph);
         change.set_proc_macros(proc_macros);
-        db.trigger_cancellation();
         let ids = change.apply(db).expect("the crate graph is set");
         self.crates = members.into_iter().map(|it| it.iter().map(|id| ids[id]).collect()).collect();
         step("apply", &mut steps);

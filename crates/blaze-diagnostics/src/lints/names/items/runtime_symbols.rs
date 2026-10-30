@@ -19,7 +19,7 @@ use hir_ty::next_solver::{
     Binder, DbInterner, FnSig, ParamEnv, Region, Ty, TyKind, TypingMode,
     infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
 };
-use intern::sym;
+use intern::{Symbol, sym};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     Interner as _,
@@ -38,9 +38,10 @@ use crate::{
 };
 
 /// The runtime symbols this crate's items could redefine: each symbol a crate of its graph
-/// declares canonical, with the foreign function that declares it.
+/// declares canonical, with the foreign function that declares it. Keyed by interned symbol:
+/// one FxHash of a pointer per lookup.
 pub(super) struct Canonical {
-    symbols: FxHashMap<String, FunctionId>,
+    symbols: FxHashMap<Symbol, FunctionId>,
 }
 
 impl Canonical {
@@ -88,26 +89,26 @@ fn is_canonical(cx: &Cx<'_, '_>, f: hir::Function) -> bool {
 }
 
 /// The symbol of a foreign item: its `#[link_name]`, else its name.
-fn foreign_symbol(cx: &Cx<'_, '_>, owner: AttrDefId, name: &hir::Name) -> String {
+fn foreign_symbol(cx: &Cx<'_, '_>, owner: AttrDefId, name: &hir::Name) -> Symbol {
     match AttrFlags::link_name(cx.db, owner) {
-        Some(it) => it.as_str().to_owned(),
-        None => name.as_str().to_owned(),
+        Some(it) => it,
+        None => name.symbol().clone(),
     }
 }
 
 /// rustc's `symbol_name_from_attrs` of a function or a static defined here: its
 /// `#[export_name]`, else its name when it is `#[no_mangle]`; else it is mangled, and can be no
 /// runtime symbol.
-fn defined_symbol(cx: &Cx<'_, '_>, owner: AttrDefId, name: &hir::Name) -> Option<String> {
+fn defined_symbol(cx: &Cx<'_, '_>, owner: AttrDefId, name: &hir::Name) -> Option<Symbol> {
     if let Some(it) = AttrFlags::export_name(cx.db, owner) {
-        return Some(it.as_str().to_owned());
+        return Some(it);
     }
-    AttrFlags::query(cx.db, owner).contains(AttrFlags::NO_MANGLE).then(|| name.as_str().to_owned())
+    AttrFlags::query(cx.db, owner).contains(AttrFlags::NO_MANGLE).then(|| name.symbol().clone())
 }
 
 /// What of an item is checked: a function or a static, with its symbol.
 struct Candidate {
-    symbol: String,
+    symbol: Symbol,
     def: Def,
 }
 
@@ -119,7 +120,8 @@ enum Def {
 
 /// The function or static of `item` whose symbol rustc checks, if it is one: a function that is
 /// not generic or a static, defined here with a symbol of its own, or declared in an `extern`
-/// block (a static only with a `#[linkage]`, as `std`'s `weak!` declares them).
+/// block (a static only with a `#[linkage]`, as `std`'s `weak!` declares them). A function's
+/// symbol, from its attribute flags, is read before its signature: most have none of their own.
 fn candidate(cx: &Cx<'_, '_>, item: &Item) -> Option<Candidate> {
     let db = cx.db;
     let foreign = match item.container {
@@ -135,11 +137,15 @@ fn candidate(cx: &Cx<'_, '_>, item: &Item) -> Option<Candidate> {
             let symbol = if foreign {
                 foreign_symbol(cx, AttrDefId::FunctionId(id), name)
             } else {
-                let sig = db.callable_item_signature(CallableDefId::FunctionId(id)).skip_binder();
-                if !GenericParams::of(db, GenericDefId::FunctionId(id)).is_empty() || !sig.bound_vars().is_empty() {
+                let symbol = defined_symbol(cx, AttrDefId::FunctionId(id), name)?;
+                if !GenericParams::of(db, GenericDefId::FunctionId(id)).is_empty() {
                     return None;
                 }
-                defined_symbol(cx, AttrDefId::FunctionId(id), name)?
+                let sig = db.callable_item_signature(CallableDefId::FunctionId(id)).skip_binder();
+                if !sig.bound_vars().is_empty() {
+                    return None;
+                }
+                symbol
             };
             Some(Candidate { symbol, def: Def::Fn(def, id) })
         }

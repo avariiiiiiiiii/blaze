@@ -112,8 +112,9 @@ pub(crate) struct Spec {
 }
 
 /// The view's spec, from its command line: as cargo's `Packages::from_flags`,
-/// `CompileFilter::from_raw_arguments` and the commands read it.
-fn view_spec(asked: &Asked, mounts: &[Mount]) -> Result<Spec, LoadError> {
+/// `CompileFilter::from_raw_arguments` and the commands read it. `library` is the view's mount
+/// at `asked.library`, if it has one.
+fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
     let error = |what: &str| LoadError { what: what.to_owned(), at: None };
     let select = match (asked.workspace, asked.exclude.is_empty(), asked.packages.is_empty()) {
         (false, true, true) => Select::Default,
@@ -183,7 +184,7 @@ fn view_spec(asked: &Asked, mounts: &[Mount]) -> Result<Spec, LoadError> {
         target_dir: asked.target_dir.as_deref().map(absolute),
         jobs: asked.jobs,
         rustc_version: crate::stdlib::target::rustc_version().to_owned(),
-        library: mounts.iter().find(|it| it.at == asked.library).cloned(),
+        library,
         library_at: asked.library.clone(),
         build_std,
         build_std_features,
@@ -241,8 +242,8 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
         Ok(read) => read,
         Err(error) => return Ok(Staged::Failed(error)),
     };
-    let (outcome, used) = replay(cx, &read, &spec.workspace.config, &Snapshot::default(), |cx, ctx, ws, files| {
-        resolve::resolved(cx, ctx, ws, &files, spec, |cx, resolved| units::units(cx, ctx, ws, spec, &read, resolved))
+    let (outcome, used) = replay(cx, &read, &spec.workspace.config, &Snapshot::default(), |cx, ctx, ws, files, reads| {
+        resolve::resolved(cx, ctx, ws, &files, reads, spec, |cx, resolved| units::units(cx, ctx, ws, spec, &read, resolved))
     })?;
     if let Some(at) = used.unmounted() {
         return Ok(Staged::Failed(unmounted_error(at)));
@@ -269,8 +270,8 @@ impl Query for Plan {
             Ok(asked) => asked,
             Err(error) => return Ok(Cbor(Planned::Failed(error))),
         };
-        let mounts = cx.get::<files::Mounts>(&())?.get().mounts;
-        let spec = match view_spec(&asked, &mounts) {
+        let library = cx.get::<files::Mounts>(&())?.get(&asked.library);
+        let spec = match view_spec(&asked, library) {
             Ok(spec) => spec,
             Err(error) => return Ok(Cbor(Planned::Failed(error))),
         };

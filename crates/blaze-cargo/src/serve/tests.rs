@@ -33,7 +33,9 @@ use super::{
     Daemon, Options,
     job::Value,
     plane::Inline,
-    work::{Compiled, Failed, Front, FrontEnd, Goal, JobInput, Reader, Runs, Selection, Source, SourceFile, Steps, Writer},
+    work::{
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Reader, Runs, Selection, Source, SourceFile, Steps, Writer,
+    },
 };
 
 const SOCKET: &str = "run/blaze/v2.sock";
@@ -54,6 +56,16 @@ thread_local! {
     static PLANS: Cell<usize> = const { Cell::new(0) };
     /// The configuration of each run of the load.
     static SAW: RefCell<Vec<BuildConfig>> = const { RefCell::new(Vec::new()) };
+    /// How many build scripts' runs were asked of a writer.
+    static ASKED: Cell<usize> = const { Cell::new(0) };
+    /// How many times a writer applied what was asked of it.
+    static APPLIES: Cell<usize> = const { Cell::new(0) };
+    /// Each compile's unit, and the runs applied in the front end it read.
+    static SEEN: RefCell<Vec<(usize, Vec<usize>)>> = const { RefCell::new(Vec::new()) };
+    /// Whether the first unit's compile keeps its reader in [`HOLD`]: a reader still alive,
+    /// as one of a task that is still running.
+    static KEEP: Cell<bool> = const { Cell::new(false) };
+    static HOLD: RefCell<Vec<FakeReader>> = const { RefCell::new(Vec::new()) };
 }
 
 fn needed() -> Vec<Fetch> {
@@ -98,7 +110,11 @@ impl Query for FakePlan {
         if !missing.is_empty() {
             return Ok(Cbor(Planned::Needs(missing)));
         }
-        Ok(Cbor(Planned::Ready(units(&config.invocation.root, manifest))))
+        let wave = manifest.strip_prefix("wave ").and_then(|it| it.trim().parse().ok());
+        Ok(Cbor(Planned::Ready(match wave {
+            Some(scripts) => wave_units(&config.invocation.root, manifest, scripts),
+            None => units(&config.invocation.root, manifest),
+        })))
     }
 }
 
@@ -169,6 +185,24 @@ fn units(root: &str, manifest: String) -> Units {
         ],
         roots: vec![3],
     };
+    of_graph(root, manifest, graph)
+}
+
+/// A wave of `scripts` build scripts' runs (units `1..=scripts`), each on `dep`'s library
+/// (unit 0), all ready at once, and the program on all of them.
+fn wave_units(root: &str, manifest: String, scripts: usize) -> Units {
+    let app = format!("path+file://{root}#app@0.1.0");
+    let dep = "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0".to_owned();
+    let mut units = vec![unit(&dep, "lib", Mode::Build, &[])];
+    units.extend((0..scripts).map(|_| unit(&app, "custom-build", Mode::RunCustomBuild, &[0])));
+    let all: Vec<usize> = (0..=scripts).collect();
+    units.push(unit(&app, "bin", Mode::Build, &all));
+    of_graph(root, manifest, UnitGraph { version: 1, units, roots: vec![scripts + 1] })
+}
+
+fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units {
+    let app = format!("path+file://{root}#app@0.1.0");
+    let dep = "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0".to_owned();
     let plan = UnitPlan {
         checked_as_test: false,
         metadata: "0".into(),
@@ -237,7 +271,8 @@ impl Steps for Fake {
     }
 
     fn lower(&self, job: &JobInput) -> Result<FrontEnd, Failed> {
-        Ok(FrontEnd { front: Arc::new(FakeFront { goal: job.goal }), writer: Box::new(FakeWriter) })
+        let writer = FakeWriter { inputs: Arc::new(FakeInputs::default()), asked: Vec::new() };
+        Ok(FrontEnd { front: Arc::new(FakeFront { goal: job.goal }), writer: Box::new(writer) })
     }
 
     fn register(&self, db: &mut Database) {
@@ -245,7 +280,7 @@ impl Steps for Fake {
     }
 
     fn plan(&self, db: &Database, view: ViewId) -> Result<Planned, Failed> {
-        match db.get::<FakePlan>(view, &()) {
+        match db.pin().get::<FakePlan>(view, &()) {
             Ok(planned) => Ok(planned.get()),
             Err(DbError::Cancelled) => Err(Failed::Again),
             Err(error) => Err(Failed::Error(ApiError::new(error.to_string(), None))),
@@ -261,16 +296,78 @@ struct FakeFront {
     goal: Goal,
 }
 
-/// A front end's database with nothing in it: each reader is of it.
-struct FakeWriter;
+/// A front end's inputs: the build scripts' runs applied to it, in the order applied.
+#[derive(Default)]
+struct FakeInputs {
+    runs: Vec<usize>,
+}
+
+/// The front end written as the real one is: each write asked for waits until no reader of
+/// the inputs is alive.
+struct FakeWriter {
+    inputs: Arc<FakeInputs>,
+    asked: Vec<usize>,
+}
+
+/// A shared reference to the inputs, as the loop posted a task with it.
+struct FakeReader(Arc<FakeInputs>);
 
 impl Writer for FakeWriter {
-    fn reader(&self) -> Reader {
-        Reader::new(FakeWriter)
+    fn reader(&self) -> Option<Reader> {
+        (!self.waiting()).then(|| Reader::new(FakeReader(Arc::clone(&self.inputs))))
     }
 
-    fn ran(&mut self, _: usize, _: &load_cargo::v2::Ran) -> Result<(), ApiError> {
+    fn ran(&mut self, run: usize, _: load_cargo::v2::Ran) -> Result<(), ApiError> {
+        ASKED.with(|it| it.set(it.get() + 1));
+        self.asked.push(run);
         Ok(())
+    }
+
+    fn macros(&mut self, unit: usize, _: load_cargo::v2::ProcMacroLoadResult) -> Result<(), ApiError> {
+        Err(ApiError::new(format!("the fakes build no proc macro, and unit {unit} is not one"), None))
+    }
+
+    fn waiting(&self) -> bool {
+        !self.asked.is_empty()
+    }
+
+    fn apply(&mut self) -> Result<bool, ApiError> {
+        if self.asked.is_empty() {
+            return Ok(true);
+        }
+        let Some(inputs) = Arc::get_mut(&mut self.inputs) else { return Ok(false) };
+        inputs.runs.append(&mut self.asked);
+        APPLIES.with(|it| it.set(it.get() + 1));
+        Ok(true)
+    }
+}
+
+/// A build script's run that is over as it starts, its run asked of the writer.
+struct Script(usize);
+
+impl Runs for Script {
+    fn start(&mut self, _: &Store, writer: Option<&mut dyn Writer>, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
+        let writer = writer.expect("a build script's run is given its job's writer");
+        Some(writer.ran(self.0, load_cargo::v2::Ran::default()).is_ok())
+    }
+
+    fn owns(&self, _: Tag) -> bool {
+        false
+    }
+
+    fn complete(
+        &mut self,
+        _: Completion,
+        _: &mut Store,
+        _: Option<&mut dyn Writer>,
+        _: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
+        unreachable!("it asked for nothing")
+    }
+
+    fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
+        Some(false)
     }
 }
 
@@ -312,30 +409,34 @@ impl Front for FakeFront {
         false
     }
 
-    fn compile(&self, reader: Reader, _: usize) -> Result<Compiled, Failed> {
-        let FakeWriter = reader.take();
+    fn compile(&self, reader: Reader, unit: usize, _: &mut Vec<Image>) -> Result<Compiled, Failed> {
+        let reader: FakeReader = reader.take();
         assert_ne!(self.goal, Goal::Reach, "a reach compiles nothing");
-        Ok(Compiled { diagnostics: Vec::new(), ok: true, puts: Vec::new(), outputs: Vec::new(), artifact: None })
+        SEEN.with(|it| it.borrow_mut().push((unit, reader.0.runs.clone())));
+        if unit == 0 && KEEP.get() {
+            HOLD.with(|it| it.borrow_mut().push(reader));
+        }
+        Ok(Compiled { diagnostics: Vec::new(), ok: true, puts: Vec::new(), outputs: Vec::new(), artifact: None, macros: None })
     }
 
-    fn script(&self, _: usize, _: u64) -> Result<Box<dyn Runs>, ApiError> {
-        Ok(Box::new(Over(Vec::new())))
+    fn script(&self, unit: usize, _: u64) -> Result<Box<dyn Runs>, ApiError> {
+        Ok(Box::new(Script(unit)))
     }
 
-    fn tests(&self, _: Reader, _: &[Artifact], selection: Selection<'_>, _: u64) -> Result<Box<dyn Runs>, ApiError> {
+    fn tests(&self, _: &[Artifact], selection: Selection<'_>, _: u64) -> Result<Box<dyn Runs>, ApiError> {
         assert!(selection.ub.is_none(), "tests under the evaluator are evaluated, not run");
         Ok(Box::new(Over(Vec::new())))
     }
 
     fn ub_tests(&self, reader: Reader, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
-        let FakeWriter = reader.take();
+        let FakeReader(_) = reader.take();
         assert_eq!(self.goal, Goal::Check, "tests under the evaluator only check their units");
         let all = ["a::adds", "a::overflows", "b::reads"];
         Ok(all.iter().filter(|it| selection.filter.iter().all(|filter| it.contains(&**filter))).map(|it| (*it).to_owned()).collect())
     }
 
     fn evaluate(&self, reader: Reader, test: &str, ub: Ub) -> Result<TestResult, Failed> {
-        let FakeWriter = reader.take();
+        let FakeReader(_) = reader.take();
         let (outcome, output) = match test {
             "a::overflows" => (TestOutcome::Failed, format!("undefined behavior\nseed: {}\n", ub.seed.unwrap_or(0)).into_bytes()),
             _ => (TestOutcome::Passed, Vec::new()),
@@ -348,7 +449,7 @@ impl Front for FakeFront {
     }
 
     fn reach(&self, reader: Reader, _: &dyn Front, from: Reader, changes: &[Change]) -> Result<Reach, Failed> {
-        let (FakeWriter, FakeWriter) = (reader.take(), from.take());
+        let (FakeReader(_), FakeReader(_)) = (reader.take(), from.take());
         Ok(Reach { changes: changes.to_vec(), items: Vec::new(), compiled: Vec::new(), tests: Vec::new() })
     }
 
@@ -356,7 +457,7 @@ impl Front for FakeFront {
         Ok(Vec::new())
     }
 
-    fn tables(&self, _: Reader) -> Result<Vec<Table>, Failed> {
+    fn tables(&self, _: Reader, _: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
         Ok(Vec::new())
     }
 }
@@ -694,6 +795,61 @@ fn tests_under_the_evaluator_are_each_evaluated_and_one_failing_fails_the_job() 
     let got = client.wait(&mut daemon, id);
     assert_eq!(results(&got), vec![("b::reads".to_owned(), TestOutcome::Passed)], "{got:#?}");
     assert_eq!(got.last(), Some(&Response::Done { ok: true }));
+}
+
+/// The units each compile saw the runs of, by unit, the runs sorted.
+fn seen() -> Vec<(usize, Vec<usize>)> {
+    SEEN.with(|it| it.borrow().iter().map(|(unit, runs)| (*unit, sorted(runs.clone()))).collect())
+}
+
+fn sorted(mut runs: Vec<usize>) -> Vec<usize> {
+    runs.sort_unstable();
+    runs
+}
+
+#[test]
+fn a_wave_of_build_scripts_waits_for_the_readers_before_it_and_is_one_write() {
+    const SCRIPTS: usize = 5;
+    let mut sim = Sim::new(10, Faults::default());
+    checkout(&mut sim, &format!("wave {SCRIPTS}\n"));
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 10);
+    KEEP.set(true);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    turn_until(&mut daemon, |_| ASKED.get() == SCRIPTS);
+    for _ in 0..500 {
+        daemon.turn();
+    }
+    assert_eq!(APPLIES.get(), 0, "a write waits for the reader posted before it");
+    assert_eq!(seen(), vec![(0, Vec::new())], "no reading task is posted while a write waits");
+
+    HOLD.with(|it| it.borrow_mut().clear());
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    assert_eq!(APPLIES.get(), 1, "the wave's runs are one write");
+    let all: Vec<usize> = (1..=SCRIPTS).collect();
+    assert_eq!(seen(), vec![(0, Vec::new()), (SCRIPTS + 1, all)], "the program reads every run");
+}
+
+#[test]
+fn no_reader_posted_after_a_write_sees_the_inputs_before_it_over_many_seeds() {
+    const SCRIPTS: usize = 3;
+    for seed in 0..32 {
+        SEEN.with(|it| it.borrow_mut().clear());
+        APPLIES.set(0);
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, &format!("wave {SCRIPTS}\n"));
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        let all: Vec<usize> = (1..=SCRIPTS).collect();
+        assert_eq!(seen(), vec![(0, Vec::new()), (SCRIPTS + 1, all)], "seed {seed}");
+        assert!((1..=SCRIPTS).contains(&APPLIES.get()), "seed {seed}: {} writes", APPLIES.get());
+    }
 }
 
 /// What one client asked and how it ended.

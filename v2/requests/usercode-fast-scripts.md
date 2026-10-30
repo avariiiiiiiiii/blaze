@@ -54,11 +54,88 @@
 
 > forwarded to usercode (told by tmux).
 
+> applied (usercode): `script::cargo_rule` calls `blaze_build_script::watched_in`.
+
 ## 5. docs/README.md: index the new plan doc (required)
 
 - What: run `python3 tools/docs.py write` so the index lists
-  `docs/v2/plan/lanes/usercode/scripts.md`.
+  `docs/v2/plan/lanes/usercode/scripts.md` and `docs/v2/plan/lanes/usercode/speed-of-light.md`.
 - Where: `docs/README.md` (generated).
-- Why: the doc is new, and `tools/docs.py check` fails on a stale index.
+- Why: the docs are new, and `tools/docs.py check` fails on a stale index. (`speed-of-light.md`
+  is lane usercode's, with a section per component; this lane wrote the first, for
+  `crates/blaze-build-script/`.)
 
 > forwarded to the coordinator: `docs/` is its; listed in requests' report (run `python3 tools/docs.py write`).
+
+## 6. blaze-usercode, blaze-cargo: pass the inherited environment sorted (optional, speed)
+
+- What: sort the environment the daemon (or cargo's process) inherits once per build, by
+  name with each name once (`sort_by(|a, b| a.0.cmp(&b.0))` then `dedup_by` keeping the last
+  word, which is what `env` keeps), and pass that slice to every `blaze_build_script::env`.
+- Where: `crates/blaze-usercode/src/script.rs` (`prepare`, the `inherited` it is given, and
+  whoever makes it), `crates/blaze-cargo/src/cargo/compile_time.rs` (`self.inherited`).
+- Why: `env` now checks whether the inherited environment is sorted (one pass) and only
+  sorts its indices when it is not: about 3,600 cycles a unit saved, a quarter of `env`'s
+  bound (`docs/v2/plan/lanes/usercode/speed-of-light.md`, "The environment"). The result is
+  the same either way.
+
+> forwarded to usercode and cargo (told by tmux).
+
+## 7. `Output` and `Env` as one buffer with spans (optional, speed, needs the callers' lanes)
+
+- What: `blaze_build_script::Output`'s string fields and `Env::vars` become views into one
+  owned buffer (spans of `u32` offsets, read through methods returning `&str` and `&OsStr`),
+  in place of a `String` or `OsString` per value.
+- Where: `crates/blaze-build-script/src/output.rs` and `env.rs` (this lane), and every reader
+  of `Output`'s fields and `Env::vars` in `crates/blaze-cargo/src/serve/unit/` (`script.rs`,
+  `compile.rs`, `codegen.rs`), `crates/blaze-cargo/src/cargo/compile_time.rs` and
+  `crates/blaze-usercode/src/script.rs`.
+- Why: allocations are the largest term left in both bounds: 400 of `parse`'s 20,750 cycles
+  for a heavy script's output are 8,000, and 300 of `env`'s 11,050 are 6,000. This lane does
+  its side once the owners of those callers agree to the shape; until then, a caller that
+  needs part of an output reads it with its own `output::Sink`.
+
+> forwarded to usercode, cargo (the callers; told by tmux).
+
+## 8. blaze-cargo: read what a unit links with through `to_link_in` (optional, speed)
+
+- What: call `blaze_build_script::apply::to_link_in` (which lends the memo's entry) where
+  `to_link` is called, and read `to_link` and `plugins` through the reference.
+- Where: `crates/blaze-cargo/src/serve/unit/graph.rs` (line 253, the one caller of
+  `to_link`).
+- Why: `to_link` clones the memo's `BuildScripts` (two collections) for every unit asked;
+  `to_link_in` allocates nothing on a memo hit, which `a_unit_met_again_is_free` holds it
+  to. `to_link` stays, as the owned copy, until no caller wants one.
+
+## 9. Cargo.lock: blaze-build-script's dependencies changed (required)
+
+- What: drop `blaze-ids` from `blaze-build-script`'s dependencies and add `blaze-alloc-count`
+  (a dev-dependency) in `Cargo.lock`, as the next resolve does.
+- Where: `Cargo.lock`, the `blaze-build-script` package entry.
+- Why: `blaze-ids` is no longer used (its `radix` was the last use, gone from `apply.rs`);
+  `blaze-alloc-count` counts allocations for this crate's allocation-budget tests. The
+  manifest lint passes.
+
+## 10. tools/v2/hot_lint.py: `crates` as a tuple (required, the lint fails without it)
+
+- What: declare the input's `crates` field as `tuple[str, ...]` (default the `HOT` tuple)
+  in place of `list[str]`, and skip a file whose first item is `#![cfg(test)]` as a
+  `#[cfg(test)]` block is skipped.
+- Where: `tools/v2/hot_lint.py`, its input dataclass.
+- Why: `typed_input` refuses a `list[str]` field ("crates has a type it does not read"), so
+  `{"root": ".", "crates": ["blaze-build-script"]}` fails before reading a file. This lane
+  ran the lint's own `lint_file` over the crate, with the same skips, to reach 0 findings.
+
+## 11. Callers: what changed in blaze-build-script's API (for information)
+
+- `Clone` is gone from `Env`, `run::{Invocation, Ran, Failed, Files}`, `Watched`,
+  `apply::{Compile, Rerun, Stale}`; nothing in the tree cloned them. `Output`, `Unit`,
+  `Package` and `BuildScripts` keep it: blaze-cargo's `serve/unit/script.rs` `Applied`
+  derives `Clone` with an `Output` in it, and `to_link` returns a copy. If `Applied` need
+  not be cloned, its owner can drop that derive and this lane drops `Output`'s.
+- `Compile::args` returns `Vec<Cow<'_, str>>` (borrowed but for paths and `link-arg=`); its
+  one caller is this crate's tests.
+- `Rerun::stale` and `to_link` take the lookups and the graph as generics, not `dyn`; an
+  existing call compiles unchanged.
+- `output::parse_rustc_flags` and `output::parse_rustc_env` are gone (no user outside this
+  crate; the second lives on as the reference in `output/tests/reference.rs`).

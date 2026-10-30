@@ -345,7 +345,7 @@ const CACHE_INLINE: usize = 8;
 /// Generalized types already computed in one generalization, keyed by the source type, the
 /// ambient variance and `in_alias`. A generalization touches few distinct types, so the
 /// first `CACHE_INLINE` entries live in place and nothing is allocated unless it spills.
-struct GeneralizeCache<K, V> {
+pub(in crate::next_solver::infer) struct GeneralizeCache<K, V> {
     inline: ArrayVec<(K, V), CACHE_INLINE>,
     spill: FxHashMap<K, V>,
 }
@@ -358,7 +358,7 @@ impl<K, V> Default for GeneralizeCache<K, V> {
 
 impl<K: Eq + Hash, V: Copy> GeneralizeCache<K, V> {
     #[inline]
-    fn get(&self, key: &K) -> Option<V> {
+    pub(in crate::next_solver::infer) fn get(&self, key: &K) -> Option<V> {
         if let Some((_, v)) = self.inline.iter().find(|(k, _)| k == key) {
             return Some(*v);
         }
@@ -366,7 +366,7 @@ impl<K: Eq + Hash, V: Copy> GeneralizeCache<K, V> {
     }
 
     #[inline]
-    fn insert(&mut self, key: K, value: V) {
+    pub(in crate::next_solver::infer) fn insert(&mut self, key: K, value: V) {
         if let Err(full) = self.inline.try_push((key, value)) {
             let (key, value) = full.element();
             self.spill.insert(key, value);

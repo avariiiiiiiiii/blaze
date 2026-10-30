@@ -47,11 +47,14 @@ fn main() -> ExitCode {
     if exe.file_stem().is_some_and(|it| it != "blaze-build-script") {
         return record(&exe);
     }
+    // alloc: the edge: the harness's command line, once per process.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // alloc: the edge: the harness's command line, once per process.
     let printed = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["run", unit, cargo_env] => ran(unit, cargo_env),
         ["parse", unit, cargo_env, output] => parsed(unit, cargo_env, output),
         _ => Err(Error(
+            // alloc: the edge: the harness's command line, once per process.
             "usage: blaze-build-script run UNIT CARGO_ENV | parse UNIT CARGO_ENV OUTPUT".to_owned(),
         )),
     };
@@ -90,8 +93,11 @@ fn record(exe: &Path) -> ExitCode {
             .map(|(name, value)| {
                 (name.to_string_lossy().into_owned(), value.to_string_lossy().into_owned())
             })
+            // alloc: the edge: the harness's command line, once per process.
             .collect(),
+        // alloc: the edge: the harness's command line, once per process.
         cwd: std::env::current_dir().unwrap_or_default().display().to_string(),
+        // alloc: the edge: the harness's command line, once per process.
         args: std::env::args_os().map(|it| it.to_string_lossy().into_owned()).collect(),
     };
     if let Some(out_dir) = std::env::var_os("OUT_DIR")
@@ -117,13 +123,16 @@ fn record(exe: &Path) -> ExitCode {
 }
 
 fn read<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, Error> {
+    // alloc: the edge: the harness's command line, once per process.
     let text = std::fs::read(path).map_err(|err| Error(format!("{path}: {err}")))?;
+    // alloc: the edge: the harness's command line, once per process.
     serde_json::from_slice(&text).map_err(|err| Error(format!("{path}: {err}")))
 }
 
 fn inputs(unit: &str, cargo_env: &str) -> Result<(Unit, Vec<(OsString, OsString)>), Error> {
     let cargo_env: BTreeMap<String, String> = read(cargo_env)?;
     let cargo_env: Vec<_> =
+        // alloc: the edge: the harness's command line, once per process.
         cargo_env.into_iter().map(|(name, value)| (name.into(), value.into())).collect();
     let unit: Unit = read(unit)?;
     let cargo_env = blaze_build_script::env::cargo_started(&cargo_env, &unit.host);
@@ -131,6 +140,7 @@ fn inputs(unit: &str, cargo_env: &str) -> Result<(Unit, Vec<(OsString, OsString)
 }
 
 fn json(value: &impl serde::Serialize) -> Result<String, Error> {
+    // alloc: the edge: the harness's command line, once per process.
     serde_json::to_string(value).map_err(|err| Error(err.to_string()))
 }
 
@@ -143,10 +153,12 @@ fn ran(unit: &str, cargo_env: &str) -> Result<String, Error> {
         .map(|(name, value)| {
             (name.to_string_lossy().into_owned(), value.to_string_lossy().into_owned())
         })
+        // alloc: the edge: the harness's command line, once per process.
         .collect();
     let mut command = Invocation::of(&unit, env).command();
     let jobserver = match unit.jobserver {
         Some(_) => {
+            // alloc: the edge: the harness's command line, once per process.
             Some(jobserver::Client::new(unit.jobs as usize).map_err(|err| Error(err.to_string()))?)
         }
         None => None,
@@ -156,13 +168,16 @@ fn ran(unit: &str, cargo_env: &str) -> Result<String, Error> {
     }
     let ran = run::run(&unit, command)?;
     let (output, error, log_messages) = match ran.finish(&unit, &Context::of(&unit, &cargo_env)) {
+        // alloc: the edge: the harness's command line, once per process.
         Ok(output) => (Some(output), None, Vec::new()),
         Err(Failed { error, log_messages }) => (None, Some(error.0), log_messages),
     };
     json(&Ran {
         env: shown,
         status: ran.status.code(),
+        // alloc: the edge: the harness's command line, once per process.
         stdout: String::from_utf8_lossy(&ran.stdout).into_owned(),
+        // alloc: the edge: the harness's command line, once per process.
         stderr: String::from_utf8_lossy(&ran.stderr).into_owned(),
         output,
         error,
@@ -173,6 +188,7 @@ fn ran(unit: &str, cargo_env: &str) -> Result<String, Error> {
 fn parsed(unit: &str, cargo_env: &str, output: &str) -> Result<String, Error> {
     let (unit, cargo_env) = inputs(unit, cargo_env)?;
     let printed =
+        // alloc: the edge: the harness's command line, once per process.
         std::fs::read(Path::new(output)).map_err(|err| Error(format!("{output}: {err}")))?;
     let parsed = output::parse(&printed, &Context::of(&unit, &cargo_env));
     json(&match parsed {

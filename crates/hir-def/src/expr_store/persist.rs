@@ -1,11 +1,11 @@
 //! [`ExpressionStore`], [`Body`] and their source maps as [`blaze_format`] buffers
 //! (docs/v2/plan/lanes/format.md section 5), in the encoding of [`crate::hir::persist`].
 //!
-//! A store's expressions and patterns are written as the columns they are in memory
+//! A store's expressions, patterns and statements are written as the columns they are in memory
 //! ([`HirColumns`]): the kind bytes, the data words, `extra` and the list arrays copied as they
-//! are, the statements, arms and record fields as records of words (a field's name a [`Str`]),
-//! and the cold side tables (names, paths, literals, generic args, `offset_of!`, `asm!`) in the
-//! words, as [`Code`] writes them. Type refs are written the same way, as the columns of
+//! are, the arms and record fields as records of words (a field's name a [`Str`]), and the cold
+//! side tables (names, paths, literals, generic args, `offset_of!`, `asm!`, macro definitions)
+//! in the words, as [`Code`] writes them. Type refs are written the same way, as the columns of
 //! [`TypeColumns`]: kinds, data words, `extra` and the list array copied, the side tables
 //! (bounds, paths, references, arrays, fn pointers, type params) in the words. Bindings, labels
 //! and lifetimes are one [`Node`] column per arena, their fields in the same words. Source maps
@@ -54,8 +54,8 @@ use crate::{
     hir::{
         AsmOperand, AsmOptions, AsmPiece, Binding, BindingAnnotation, BindingId, BindingProblems,
         ExprId, ExprOrPatId, ExprOrPatIdPacked, FloatTypeWrapper, InlineAsm, InlineAsmKind,
-        InlineAsmRegOrRegClass, Item, Label, Literal, MatchArm, OffsetOf, PatId,
-        RecordFieldPat, RecordLitField, Statement,
+        InlineAsmRegOrRegClass, Label, Literal, MatchArm, OffsetOf, PatId, RecordFieldPat,
+        RecordLitField,
         columns::{self, Frozen, HirColumns},
         persist::{Code, Column, Node, Placed, Read, Words, WordsRec, syntax_context},
     },
@@ -89,21 +89,6 @@ blaze_format::record! {
 }
 
 blaze_format::record! {
-    /// A [`Statement`]: its kind ([`LET`] to [`MACRO_DEF`]), then its ids, each `Option` as the
-    /// raw id plus one, 0 for `None`. `id` is the pattern of a `let`, the expression of an
-    /// expression statement, or the word a macro definition is written at; a word the kind has
-    /// no use for is 0.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct StatementRec: 1 {
-        pub(crate) kind: u32,
-        pub(crate) id: u32,
-        pub(crate) type_ref: u32,
-        pub(crate) initializer: u32,
-        pub(crate) else_branch: u32,
-    }
-}
-
-blaze_format::record! {
     /// A [`MatchArm`], its guard the raw id plus one, 0 for none.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(crate) struct ArmRec: 1 {
@@ -122,20 +107,12 @@ blaze_format::record! {
     }
 }
 
-/// [`StatementRec::kind`]s.
-const LET: u32 = 0;
-const SUPER_LET: u32 = 1;
-const EXPR: u32 = 2;
-const EXPR_SEMI: u32 = 3;
-const OTHER_ITEM: u32 = 4;
-const MACRO_DEF: u32 = 5;
-
 blaze_format::record! {
     /// The root of an [`ExpressionStore`]'s buffer: [`HirColumns`] and [`TypeColumns`] as they
     /// are in memory, each id a raw `u32`, the side tables in the words from `side` and
     /// `ty_side` on.
     #[derive(Clone, Copy)]
-    pub(crate) struct StoreRoot: 3 {
+    pub(crate) struct StoreRoot: 4 {
         pub(crate) expr_kind: Slice<u8>,
         pub(crate) expr_data: Slice<u32>,
         pub(crate) pat_kind: Slice<u8>,
@@ -143,7 +120,9 @@ blaze_format::record! {
         pub(crate) extra: Slice<u32>,
         pub(crate) expr_lists: Slice<u32>,
         pub(crate) pat_lists: Slice<u32>,
-        pub(crate) statements: Slice<StatementRec>,
+        /// The statement rows, as [`HirColumns`] keeps them: a `let`'s words are in `extra`.
+        pub(crate) stmt_kind: Slice<u8>,
+        pub(crate) stmt_data: Slice<u32>,
         pub(crate) arms: Slice<ArmRec>,
         pub(crate) record_fields: Slice<FieldRec>,
         pub(crate) field_pats: Slice<FieldRec>,
@@ -171,7 +150,7 @@ blaze_format::record! {
         pub(crate) type_hygiene: Slice<IdPair>,
         pub(crate) words: WordsRec,
         /// The word the side tables begin at: names, paths, literals, generic args,
-        /// `offset_of!`s and `asm!`s, each a count and its values.
+        /// `offset_of!`s, `asm!`s and macro definitions, each a count and its values.
         pub(crate) side: u32,
         /// The word the type side tables begin at: bounds, paths, references, arrays, fn
         /// pointers and type params, each a count and its values.
@@ -261,6 +240,12 @@ kinds! {
     LifetimeRefKind {
         Named, Static, Placeholder, Param, Error,
     }
+
+    /// Which [`crate::hir::Statement`] variant a statement row of a buffer is, read in place:
+    /// `Item`'s two split.
+    StatementKind {
+        Let, Expr, MacroDef, Item,
+    }
 }
 
 same_numbers! {
@@ -277,6 +262,9 @@ same_numbers! {
     TypeRefKind = type_ref::TypeRefKind {
         Never, Placeholder, Tuple, Path, RawPtr, Reference, Array, Slice, Fn, ImplTrait, DynTrait,
         TypeParam, PatternType, Error,
+    }
+    StatementKind = columns::StatementKind {
+        Let, Expr, MacroDef, Item,
     }
 }
 
@@ -500,19 +488,6 @@ impl Ids<'_> {
         })
     }
 
-    fn statement(&self, statement: &Statement) -> Checked {
-        match *statement {
-            Statement::Let { pat, type_ref, initializer, else_branch, is_super: _ } => {
-                self.pat(pat)?;
-                self.ty_opt(type_ref)?;
-                self.expr_opt(initializer)?;
-                self.expr_opt(else_branch)
-            }
-            Statement::Expr { expr, has_semi: _ } => self.expr(expr),
-            Statement::Item(_) => Ok(()),
-        }
-    }
-
     fn asm(&self, asm: &InlineAsm) -> Checked {
         asm.operands.iter().try_for_each(|(_, operand)| match operand {
             &AsmOperand::In { reg: _, expr }
@@ -597,6 +572,7 @@ struct SideTables {
     generic_args: Vec<GenericArgs>,
     offset_ofs: Vec<OffsetOf>,
     asms: Vec<InlineAsm>,
+    macro_defs: Vec<MacroDefId>,
 }
 
 impl SideTables {
@@ -610,6 +586,7 @@ impl SideTables {
         w.seq(slice(hir, |c| &c.generic_args[..]).iter());
         w.seq(slice(hir, |c| &c.offset_ofs[..]).iter());
         w.seq(slice(hir, |c| &c.asms[..]).iter());
+        w.seq(slice(hir, |c| &c.macro_defs[..]).iter());
         at
     }
 
@@ -621,17 +598,20 @@ impl SideTables {
             generic_args: r.seq::<GenericArgs, _>()?,
             offset_ofs: r.seq::<OffsetOf, _>()?,
             asms: r.seq::<InlineAsm, _>()?,
+            macro_defs: r.seq::<MacroDefId, _>()?,
         })
     }
 
     fn is_empty(&self) -> bool {
-        let SideTables { names, paths, literals, generic_args, offset_ofs, asms } = self;
+        let SideTables { names, paths, literals, generic_args, offset_ofs, asms, macro_defs } =
+            self;
         names.is_empty()
             && paths.is_empty()
             && literals.is_empty()
             && generic_args.is_empty()
             && offset_ofs.is_empty()
             && asms.is_empty()
+            && macro_defs.is_empty()
     }
 }
 
@@ -727,67 +707,6 @@ fn field_name(field: &FieldRec, buffer: &[u8]) -> Result<Name, FormatError> {
     Ok(Name::new_symbol_root(Symbol::intern(text)))
 }
 
-/// `statement` as a record, a macro definition it holds written in `w`.
-fn statement_rec(statement: &Statement, w: &mut Words) -> StatementRec {
-    let rec = |kind, id| StatementRec { kind, id, type_ref: 0, initializer: 0, else_branch: 0 };
-    match statement {
-        &Statement::Let { pat, type_ref, initializer, else_branch, is_super } => StatementRec {
-            kind: if is_super { SUPER_LET } else { LET },
-            id: raw(pat),
-            type_ref: opt_raw(type_ref),
-            initializer: opt_raw(initializer),
-            else_branch: opt_raw(else_branch),
-        },
-        &Statement::Expr { expr, has_semi } => {
-            rec(if has_semi { EXPR_SEMI } else { EXPR }, raw(expr))
-        }
-        Statement::Item(Item::Other) => rec(OTHER_ITEM, 0),
-        Statement::Item(Item::MacroDef(def)) => {
-            let at = w.at();
-            w.put(&**def);
-            rec(MACRO_DEF, at)
-        }
-    }
-}
-
-/// The statement `rec` is, which is in `buffer`, a macro definition read from `words`.
-fn statement_of(
-    rec: &StatementRec,
-    words: &Read<'_>,
-    buffer: &[u8],
-) -> Result<Statement, FormatError> {
-    let StatementRec { kind, id, type_ref, initializer, else_branch } = *rec;
-    let unused = |words: &[u32]| {
-        let zeros = words.iter().all(|&word| word == 0);
-        ensure(zeros, rec, buffer, "a statement word its kind has no use for that is not 0")
-    };
-    Ok(match kind {
-        LET | SUPER_LET => Statement::Let {
-            pat: idx(id),
-            type_ref: opt_idx(type_ref),
-            initializer: opt_idx(initializer),
-            else_branch: opt_idx(else_branch),
-            is_super: kind == SUPER_LET,
-        },
-        EXPR | EXPR_SEMI => {
-            unused(&[type_ref, initializer, else_branch])?;
-            Statement::Expr { expr: idx(id), has_semi: kind == EXPR_SEMI }
-        }
-        OTHER_ITEM => {
-            unused(&[id, type_ref, initializer, else_branch])?;
-            Statement::Item(Item::Other)
-        }
-        MACRO_DEF => {
-            unused(&[type_ref, initializer, else_branch])?;
-            Statement::Item(Item::MacroDef(Box::new(words.from(id).get()?)))
-        }
-        _ => {
-            let what = "a statement kind out of range";
-            return Err(FormatError::Invalid { at: at_of(rec, buffer), what });
-        }
-    })
-}
-
 /// Each value of `records`, which are in `buffer`, as `of` makes it and `check` accepts it.
 fn decoded<R, T>(
     records: &[R],
@@ -816,7 +735,8 @@ struct StoreColumns {
     extra: Column,
     expr_lists: Column,
     pat_lists: Column,
-    statements: Column,
+    stmt_kind: Column,
+    stmt_data: Column,
     arms: Column,
     record_fields: Column,
     field_pats: Column,
@@ -846,9 +766,6 @@ impl StoreColumns {
         let mut w = Words::new();
         let side = SideTables::put(&mut w, hir);
         let ty_side = TypeSide::put(&mut w, types);
-        let statements: Vec<StatementRec> = (slice(hir, |c| &c.statements[..]).iter())
-            .map(|statement| statement_rec(statement, &mut w))
-            .collect();
         let bindings =
             column(&mut w, expr_only.into_iter().flat_map(|it| it.bindings.values()), put_binding);
         let labels =
@@ -928,7 +845,8 @@ impl StoreColumns {
             extra: Column::push(out, slice(hir, |c| &c.extra[..])),
             expr_lists: Column::push(out, &expr_lists),
             pat_lists: Column::push(out, &pat_lists),
-            statements: Column::push(out, &statements),
+            stmt_kind: Column::push(out, slice(hir, |c| &c.stmt_kind[..])),
+            stmt_data: Column::push(out, slice(hir, |c| &c.stmt_data[..])),
             arms: Column::push(out, &arms),
             record_fields,
             field_pats,
@@ -962,7 +880,8 @@ impl StoreColumns {
             extra: self.extra.slice(field(offset_of!(StoreRoot, extra))),
             expr_lists: self.expr_lists.slice(field(offset_of!(StoreRoot, expr_lists))),
             pat_lists: self.pat_lists.slice(field(offset_of!(StoreRoot, pat_lists))),
-            statements: self.statements.slice(field(offset_of!(StoreRoot, statements))),
+            stmt_kind: self.stmt_kind.slice(field(offset_of!(StoreRoot, stmt_kind))),
+            stmt_data: self.stmt_data.slice(field(offset_of!(StoreRoot, stmt_data))),
             arms: self.arms.slice(field(offset_of!(StoreRoot, arms))),
             record_fields: self.record_fields.slice(field(offset_of!(StoreRoot, record_fields))),
             field_pats: self.field_pats.slice(field(offset_of!(StoreRoot, field_pats))),
@@ -1002,7 +921,8 @@ pub struct ExpressionStoreRef<'a> {
     extra: &'a [u32],
     expr_lists: &'a [u32],
     pat_lists: &'a [u32],
-    statements: &'a [StatementRec],
+    stmt_kind: &'a [u8],
+    stmt_data: &'a [u32],
     arms: &'a [ArmRec],
     record_fields: &'a [FieldRec],
     field_pats: &'a [FieldRec],
@@ -1036,7 +956,8 @@ impl<'a> ExpressionStoreRef<'a> {
             extra: root.extra.follow(buffer)?,
             expr_lists: root.expr_lists.follow(buffer)?,
             pat_lists: root.pat_lists.follow(buffer)?,
-            statements: root.statements.follow(buffer)?,
+            stmt_kind: root.stmt_kind.follow(buffer)?,
+            stmt_data: root.stmt_data.follow(buffer)?,
             arms: root.arms.follow(buffer)?,
             record_fields: root.record_fields.follow(buffer)?,
             field_pats: root.field_pats.follow(buffer)?,
@@ -1067,10 +988,17 @@ impl<'a> ExpressionStoreRef<'a> {
         let words = root.words.words.len;
         let datas = self.expr_data.len() == self.expr_kind.len()
             && self.pat_data.len() == self.pat_kind.len()
+            && self.stmt_data.len() == self.stmt_kind.len()
             && self.ty_data.len() == self.ty_kind.len();
         ensure(datas, root, buffer, "a data column that is not one word for each node")?;
         check_kinds(self.expr_kind, ExprKind::ALL.len(), buffer, "an expression kind out of range")?;
         check_kinds(self.pat_kind, PatKind::ALL.len(), buffer, "a pattern kind out of range")?;
+        check_kinds(
+            self.stmt_kind,
+            StatementKind::ALL.len(),
+            buffer,
+            "a statement kind out of range",
+        )?;
         check_kinds(self.ty_kind, TypeRefKind::ALL.len(), buffer, "a type kind out of range")?;
         check_nodes(self.bindings, 1, words, buffer, "a binding kind out of range")?;
         check_nodes(self.labels, 1, words, buffer, "a label kind out of range")?;
@@ -1089,7 +1017,8 @@ impl<'a> ExpressionStoreRef<'a> {
                 && self.extra.is_empty()
                 && self.expr_lists.is_empty()
                 && self.pat_lists.is_empty()
-                && self.statements.is_empty()
+                && self.stmt_kind.is_empty()
+                && self.stmt_data.is_empty()
                 && self.arms.is_empty()
                 && self.record_fields.is_empty()
                 && self.field_pats.is_empty()
@@ -1199,6 +1128,15 @@ impl<'a> ExpressionStoreRef<'a> {
         PatKind::from_u32(u32::from(*self.pat_kind.get(raw(pat) as usize)?))
     }
 
+    pub fn statements_len(self) -> usize {
+        self.stmt_kind.len()
+    }
+
+    /// Which variant the statement row `at` is, `None` past the rows.
+    pub fn statement_kind(self, at: u32) -> Option<StatementKind> {
+        StatementKind::from_u32(u32::from(*self.stmt_kind.get(at as usize)?))
+    }
+
     pub fn type_kind(self, ty: TypeRefId) -> Option<TypeRefKind> {
         TypeRefKind::from_u32(u32::from(*self.ty_kind.get(raw(ty) as usize)?))
     }
@@ -1275,12 +1213,6 @@ impl<'a> ExpressionStoreRef<'a> {
             ensure(side.is_empty(), self.root, buffer, "side tables in a store without expressions")?;
         }
 
-        let statements: Vec<Statement> = decoded(
-            self.statements,
-            buffer,
-            |rec| statement_of(rec, &words, buffer),
-            |statement| ids.statement(statement),
-        )?;
         let arms: Vec<MatchArm> = decoded(
             self.arms,
             buffer,
@@ -1309,7 +1241,7 @@ impl<'a> ExpressionStoreRef<'a> {
             decoded(self.pat_lists, buffer, |&word| Ok(idx(word)), |&pat| ids.pat(pat))?;
         let type_lists: Vec<Option<TypeRefId>> =
             decoded(self.type_lists, buffer, |&word| Ok(opt_idx(word)), |&ty| ids.ty_opt(ty))?;
-        let SideTables { names, paths, literals, generic_args, offset_ofs, asms } = side;
+        let SideTables { names, paths, literals, generic_args, offset_ofs, asms, macro_defs } = side;
         let columns = HirColumns::<Frozen> {
             expr_kind: self.expr_kind.into(),
             expr_data: self.expr_data.into(),
@@ -1318,7 +1250,8 @@ impl<'a> ExpressionStoreRef<'a> {
             extra: self.extra.into(),
             expr_lists: expr_lists.into(),
             pat_lists: pat_lists.into(),
-            statements: statements.into(),
+            stmt_kind: self.stmt_kind.into(),
+            stmt_data: self.stmt_data.into(),
             arms: arms.into(),
             record_fields: record_fields.into(),
             field_pats: field_pats.into(),
@@ -1329,6 +1262,7 @@ impl<'a> ExpressionStoreRef<'a> {
             generic_args: generic_args.into(),
             offset_ofs: offset_ofs.into(),
             asms: asms.into(),
+            macro_defs: macro_defs.into(),
         };
         (columns.check(bindings.len(), labels.len(), types.len()))
             .map_err(|what| FormatError::Invalid { at: at_of(self.root, buffer), what })?;
@@ -1376,7 +1310,7 @@ impl ExpressionStore {
 impl Persist for ExpressionStore {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ExpressionStore"),
-        Part::U64(3),
+        Part::U64(4),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1448,7 +1382,7 @@ impl Body {
 impl Persist for Body {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("Body"),
-        Part::U64(3),
+        Part::U64(4),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -2692,13 +2626,22 @@ fn f() -> u32 {
         let past = ExpressionStore::read(&past).expect("only a list array changed");
         assert!(past.decode().is_err(), "an expression id past its arena in a list");
 
-        let statement = offset_in(read.statements, &buffer) + offset_of!(StatementRec, kind);
-        let bad = ExpressionStore::read(&with_word(&bytes, statement, 99)).expect("only a statement changed");
-        assert!(bad.decode().is_err(), "a statement kind out of range");
+        assert_eq!(read.statements_len(), 1);
+        assert_eq!(read.statement_kind(0), Some(StatementKind::Let));
+        let mut bad = bytes.clone();
+        bad[offset_in(read.stmt_kind, &buffer)] = StatementKind::ALL.len() as u8;
+        assert!(ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(), "a statement kind out of range");
 
-        let pat = offset_in(read.statements, &buffer) + offset_of!(StatementRec, id);
-        let past = with_word(&bytes, pat, read.pats_len() as u32);
-        let past = ExpressionStore::read(&past).expect("only a statement changed");
+        let data = offset_in(read.stmt_data, &buffer);
+        let past = with_word(&bytes, data, read.extra.len() as u32);
+        let past = ExpressionStore::read(&past).expect("only a statement's data word changed");
+        assert!(past.decode().is_err(), "a `let` whose words begin past `extra`");
+
+        let head = read.stmt_data[0] as usize;
+        let flags = read.extra[head] & ((1 << columns::LET_BITS) - 1);
+        let head_at = offset_in(read.extra, &buffer) + head * size_of::<u32>();
+        let past = with_word(&bytes, head_at, (read.pats_len() as u32) << columns::LET_BITS | flags);
+        let past = ExpressionStore::read(&past).expect("only `extra` changed");
         assert!(past.decode().is_err(), "a pattern id past its arena in a statement");
 
         let root = offset_in(read.expr_roots, &buffer) + offset_of!(ExprRootRec, root);

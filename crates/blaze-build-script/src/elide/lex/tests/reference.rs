@@ -1,6 +1,6 @@
 //! The lexer as it was before one pass over bytes with a class table: a `char` decoded per
-//! step, a string's value built as it was read. Kept as the reference [`super::lex`] is checked
-//! against over seeded sources.
+//! step, a string's value built as it was read. Kept as the reference [`crate::elide::lex`]
+//! is checked against over seeded sources.
 
 #![allow(dead_code)]
 

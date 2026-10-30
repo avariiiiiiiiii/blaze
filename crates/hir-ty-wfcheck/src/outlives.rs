@@ -2,13 +2,13 @@
 //! fields let rustc infer of its parameters (`rustc_hir_analysis::outlives`, RFC 2093) and
 //! what an item knows (its where clauses and the types it may assume well-formed).
 
-use hir_def::{AdtId, ItemContainerId, Lookup as _, VariantId};
+use hir_def::{AdtId, GenericDefId, ItemContainerId, Lookup as _, VariantId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use rustc_type_ir::{
-    ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesClause, RegionKind, TypeFoldable,
-    TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
-    TypeVisitor,
+    ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesClause, RegionKind, TypeFlags,
+    TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
+    TypeVisitableExt as _, TypeVisitor,
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _},
 };
 use salsa::SalsaValue;
@@ -183,10 +183,7 @@ fn adt_needs<'db>(
     out: &mut Vec<Needs<'db>>,
 ) {
     let interner = DbInterner::new_no_crate(db);
-    let clauses = GenericPredicates::query_all(db, adt.into())
-        .iter_instantiated(interner, args.as_slice())
-        .map(|it| it.skip_norm_wip());
-    clause_needs(clauses, out);
+    predicate_needs(db, adt.into(), args.as_slice(), out);
     for predicate in inferred.of(db, adt) {
         let OutlivesClause(arg, region) =
             EarlyBinder::bind(interner, predicate).instantiate(interner, args).skip_norm_wip();
@@ -196,6 +193,29 @@ fn adt_needs<'db>(
             GenericArgKind::Const(_) => continue,
         });
     }
+}
+
+fn is_outlives(clause: &Clause<'_>) -> bool {
+    matches!(
+        clause.kind().skip_binder(),
+        ClauseKind::TypeOutlives(_) | ClauseKind::RegionOutlives(_)
+    )
+}
+
+/// The outlives bounds among the predicates of `def`, with the arguments `args`. Only those are
+/// instantiated: the others, most of them (`T: Sized`, `A: Allocator`), are never folded.
+pub(crate) fn predicate_needs<'db>(
+    db: &'db dyn HirDatabase,
+    def: GenericDefId,
+    args: &[GenericArg<'db>],
+    out: &mut Vec<Needs<'db>>,
+) {
+    let interner = DbInterner::new_no_crate(db);
+    let clauses = GenericPredicates::query_all(db, def)
+        .map_bound(|it| it.filter(is_outlives))
+        .iter_instantiated(interner, args)
+        .map(|it| it.skip_norm_wip());
+    clause_needs(clauses, out);
 }
 
 /// The outlives bounds among `clauses`.
@@ -237,6 +257,17 @@ pub(crate) fn wf<'db>(
     }));
 }
 
+/// What a type needs one of for its well-formedness to need anything that can fail, or that
+/// tells an item something: a type without a parameter, an alias, an inference variable, a
+/// placeholder, an error or a region other than `'static`, a bound one and an erased one
+/// (`u8`, `Vec<String>`, `&'static str`) only needs `'static` to outlive what it does.
+const MAY_NEED: TypeFlags = TypeFlags::HAS_PARAM
+    .union(TypeFlags::HAS_ALIAS)
+    .union(TypeFlags::HAS_INFER)
+    .union(TypeFlags::HAS_PLACEHOLDER)
+    .union(TypeFlags::HAS_ERROR)
+    .union(TypeFlags::HAS_FREE_LOCAL_REGIONS);
+
 fn wf_into<'db>(
     db: &'db dyn HirDatabase,
     inferred: &mut Inferred<'db>,
@@ -244,7 +275,7 @@ fn wf_into<'db>(
     out: &mut Vec<Needs<'db>>,
     depth: usize,
 ) {
-    if depth > 32 {
+    if depth > 32 || !ty.has_type_flags(MAY_NEED) {
         return;
     }
     let args = |inferred: &mut Inferred<'db>, args: GenericArgs<'db>, out: &mut Vec<Needs<'db>>| {
@@ -591,12 +622,13 @@ struct InferredOutlives(Vec<InferredPredicate>);
 )]
 fn inferred_outlives(db: &dyn HirDatabase, adt: AdtId) -> InferredOutlives {
     let mut found = Vec::new();
+    let mut subtypes = Vec::new();
     for variant in variants(db, adt) {
         for (_, field) in db.field_types(variant).iter() {
             let ty = field.ty().instantiate_identity().skip_norm_wip();
-            let mut subtypes = Vec::new();
-            walk(ty, &mut subtypes);
-            for ty in subtypes {
+            subtypes.clear();
+            walk_with(ty, TypeFlags::HAS_RE_PARAM, &mut subtypes);
+            for &ty in &subtypes {
                 required(db, ty, &mut found);
             }
         }
@@ -636,21 +668,23 @@ fn inferred_outlives_cycle_fn(
     value
 }
 
-/// rustc's `insert_required_predicates_to_be_wf`, for one type in a field's.
+/// rustc's `insert_required_predicates_to_be_wf`, for one type in a field's. What it finds
+/// outlives a lifetime parameter, which comes from `ty`'s arguments: a type without one
+/// finds nothing.
 fn required<'db>(
     db: &'db dyn HirDatabase,
     ty: Ty<'db>,
     found: &mut Vec<OutlivesClause<DbInterner<'db>, GenericArg<'db>>>,
 ) {
+    if !ty.has_type_flags(TypeFlags::HAS_RE_PARAM) {
+        return;
+    }
     let interner = DbInterner::new_no_crate(db);
     let mut needs = Vec::new();
     match ty.kind() {
         TyKind::Ref(region, inner, _) => needs.push(Needs::Type(inner, region)),
         TyKind::Adt(def, args) => {
-            let clauses = GenericPredicates::query_all(db, def.def_id().into())
-                .iter_instantiated(interner, args.as_slice())
-                .map(|it| it.skip_norm_wip());
-            clause_needs(clauses, &mut needs);
+            predicate_needs(db, def.def_id().into(), args.as_slice(), &mut needs);
             for predicate in Inferred::default().of(db, def.def_id()) {
                 let OutlivesClause(arg, region) = EarlyBinder::bind(interner, predicate)
                     .instantiate(interner, args)
@@ -667,10 +701,7 @@ fn required<'db>(
                 alias.kind
                 && let ItemContainerId::TraitId(trait_) = item.lookup(db).container =>
         {
-            let clauses = GenericPredicates::query_all(db, trait_.into())
-                .iter_instantiated(interner, alias.args.as_slice())
-                .map(|it| it.skip_norm_wip());
-            clause_needs(clauses, &mut needs);
+            predicate_needs(db, trait_.into(), alias.args.as_slice(), &mut needs);
         }
         _ => (),
     }
@@ -707,10 +738,27 @@ fn walk<'db>(ty: Ty<'db>, out: &mut Vec<Ty<'db>>) {
     ty.visit_with(&mut Walk(out));
 }
 
-pub(crate) fn variants(db: &dyn HirDatabase, adt: AdtId) -> Vec<VariantId> {
+/// The types in `ty`, `ty` too, that have one of `flags`, in `walk`'s order: one without has
+/// none in it either, so it is not entered.
+fn walk_with<'db>(ty: Ty<'db>, flags: TypeFlags, out: &mut Vec<Ty<'db>>) {
+    struct Walk<'a, 'db>(&'a mut Vec<Ty<'db>>, TypeFlags);
+    impl<'db> TypeVisitor<DbInterner<'db>> for Walk<'_, 'db> {
+        type Result = ();
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            if !ty.has_type_flags(self.1) {
+                return;
+            }
+            self.0.push(ty);
+            ty.super_visit_with(self)
+        }
+    }
+    ty.visit_with(&mut Walk(out, flags));
+}
+
+pub(crate) fn variants(db: &dyn HirDatabase, adt: AdtId) -> SmallVec<[VariantId; 4]> {
     match adt {
-        AdtId::StructId(it) => vec![it.into()],
-        AdtId::UnionId(it) => vec![it.into()],
+        AdtId::StructId(it) => smallvec![it.into()],
+        AdtId::UnionId(it) => smallvec![it.into()],
         AdtId::EnumId(it) => {
             it.enum_variants(db).variants.values().map(|&(it, _)| it.into()).collect()
         }

@@ -767,6 +767,7 @@ impl Driver for Sim {
                 }
                 Effect::Flush { watch, tag } => {
                     let done = match self.watches.contains_key(&watch) {
+                        // alloc: an error path.
                         false => Done::Failed(IoError(format!("nothing is watched as {watch:?}"))),
                         true if self.rng.one_in(self.faults.fail_one_in) => self.fail(tag).done,
                         true => Done::Flushed,

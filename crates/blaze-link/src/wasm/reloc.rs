@@ -81,10 +81,12 @@ pub(super) fn kind(r_type: u32) -> Result<Kind, String> {
         TYPE_INDEX_LEB => Ok(Kind::Type),
         FUNCTION_OFFSET_I32 | SECTION_OFFSET_I32 => Ok(Kind::Debug),
         _ => Err(match name(r_type) {
+            // alloc: error path
             Some(name) => format!(
                 "the relocation {name}: position-independent, thread-local (shared memory) and \
                  memory64 code is not linked for wasm32-wasip1 or wasm32-unknown-unknown"
             ),
+            // alloc: error path
             None => format!("an unknown relocation type {r_type}"),
         }),
     }
@@ -95,14 +97,17 @@ pub(super) fn apply(r_type: u32, bytes: &mut [u8], s: u64, addend: i64) -> Resul
     let what = || name(r_type).unwrap_or("an unknown wasm relocation");
     let no_addend = || match addend {
         0 => Ok(()),
+        // alloc: error path
         _ => Err(format!("{}: an addend of {addend} to a function or an index", what())),
     };
     let index = |value: u64| {
+        // alloc: error path
         u32::try_from(value).map_err(|_| format!("{}: the index {value} is past 32 bits", what()))
     };
     let address = || {
         let value = i128::from(s) + i128::from(addend);
         u32::try_from(value)
+            // alloc: error path
             .map_err(|_| format!("{}: the address {value:#x} is outside 32-bit memory", what()))
     };
     match r_type {
@@ -117,6 +122,7 @@ pub(super) fn apply(r_type: u32, bytes: &mut [u8], s: u64, addend: i64) -> Resul
         TABLE_INDEX_SLEB => {
             no_addend()?;
             let slot = i32::try_from(s)
+                // alloc: error path
                 .map_err(|_| format!("{}: the table slot {s} is past 31 bits", what()))?;
             put(bytes, &padded_sleb(slot), what())
         }
@@ -136,16 +142,19 @@ pub(super) fn apply(r_type: u32, bytes: &mut [u8], s: u64, addend: i64) -> Resul
             no_addend()?;
             put(bytes, &index(s)?.to_le_bytes(), what())
         }
+        // alloc: error path
         TYPE_INDEX_LEB => Err(format!(
             "{}: a type index is the writer's to fill from the function's code header, not a \
              relocation of the core's",
             what()
         )),
+        // alloc: error path
         FUNCTION_OFFSET_I32 | SECTION_OFFSET_I32 => Err(format!(
             "{}: an offset into the code or a section, which only debug sections have, and a \
              wasm link drops them",
             what()
         )),
+        // alloc: error path
         _ => Err(kind(r_type).err().unwrap_or_else(|| format!("{}: not applied", what()))),
     }
 }
@@ -154,6 +163,7 @@ fn put(bytes: &mut [u8], value: &[u8], what: &str) -> Result<(), String> {
     let left = bytes.len();
     let place = bytes
         .get_mut(..value.len())
+        // alloc: error path
         .ok_or_else(|| format!("{what}: {} bytes to write and {left} left", value.len()))?;
     place.copy_from_slice(value);
     Ok(())
@@ -222,6 +232,37 @@ mod tests {
         assert!(unknown.contains("99"), "{unknown}");
         let mut short = [0; 3];
         assert!(apply(MEMORY_ADDR_SLEB, &mut short, 0, 0).is_err());
+    }
+
+    #[test]
+    fn applying_allocates_nothing_per_relocation() {
+        // Every applied type, 1000 times each, in place in one image.
+        let types = [
+            (FUNCTION_INDEX_LEB, 0),
+            (FUNCTION_INDEX_I32, 0),
+            (TABLE_INDEX_SLEB, 0),
+            (TABLE_INDEX_I32, 0),
+            (MEMORY_ADDR_LEB, 8),
+            (MEMORY_ADDR_SLEB, -8),
+            (MEMORY_ADDR_I32, 4),
+            (GLOBAL_INDEX_LEB, 0),
+            (GLOBAL_INDEX_I32, 0),
+            (TABLE_NUMBER_LEB, 0),
+        ];
+        let mut image = vec![0; 1000 * types.len() * 5];
+        let applied = blaze_alloc_count::assert_at_most(0, "relocations applied", || {
+            let mut places = image.chunks_exact_mut(5);
+            let mut applied = 0;
+            for at in 0..1000u64 {
+                for &(r_type, addend) in &types {
+                    let place = places.next().expect("a place per relocation");
+                    applied += usize::from(apply(r_type, place, 0x10_0000 + at, addend).is_ok());
+                }
+            }
+            applied
+        });
+        assert_eq!(applied, 1000 * types.len());
+        assert_eq!(image[..5], padded_uleb(0x10_0000));
     }
 
     #[test]

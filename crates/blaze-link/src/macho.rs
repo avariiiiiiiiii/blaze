@@ -65,6 +65,7 @@ fn error(what: impl Into<String>) -> LinkError {
     LinkError { function: None, what: what.into() }
 }
 
+// dyn: `model::writer`'s format dispatch, made once per image; nothing per element goes through it
 pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
     let (cpu, subtype, page) = match output.arch {
         Arch::Aarch64 => (macho::CPU_TYPE_ARM64, macho::CPU_SUBTYPE_ARM64_ALL, 0x4000),
@@ -78,6 +79,7 @@ pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
         ));
     };
     let cache = output.incremental.then(Mutex::default);
+    // alloc: clone: the writer and its copy of the output, once per image
     Ok(Box::new(MachO { output: output.clone(), cpu, subtype, page, platform, cache }))
 }
 
@@ -109,6 +111,7 @@ pub(super) fn core_name(name: &[u8]) -> Result<String, String> {
 /// without an underscore (clang's kept `ltmp0`, `l_` labels) gains its `\x01` on the stack.
 pub(super) fn push_core_name(names: &mut Names, name: &[u8]) -> Result<Name, String> {
     let text = std::str::from_utf8(name)
+        // alloc: error path
         .map_err(|_| format!("the symbol `{}` is not UTF-8", String::from_utf8_lossy(name)))?;
     if let Some(rest) = text.strip_prefix('_') {
         return names.push(rest);
@@ -122,6 +125,7 @@ pub(super) fn push_core_name(names: &mut Names, name: &[u8]) -> Result<Name, Str
                 .expect("`\\x01` and a `str` are UTF-8");
             names.push(marked)
         }
+        // alloc: a name without `_` longer than 255 bytes, which no compiler writes: pushed once
         None => names.push(&format!("\x01{text}")),
     }
 }
@@ -159,6 +163,7 @@ fn macho_order(a: &str, b: &str) -> Ordering {
 /// where each entry's personality field is a cell the loader fixes up, which `__unwind_info`
 /// refers to the personality by.
 pub(super) fn compact_unwind() -> Class {
+    // alloc: `Class::Named` owns its name (model.rs): once per C object's `__compact_unwind`
     Class::Named { name: "__LD,__compact_unwind".to_owned(), write: true, exec: false }
 }
 
@@ -236,7 +241,7 @@ fn zeroed(class: &Class) -> bool {
 }
 
 /// The segment, name and flags of the section a region is in the file.
-fn section_of(class: &Class) -> (Segment, String, u32) {
+fn section_of(class: &Class) -> (Segment, &str, u32) {
     let code = macho::S_REGULAR | macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
     let (segment, _) = place(class);
     let (name, flags) = match class {
@@ -276,10 +281,10 @@ fn section_of(class: &Class) -> (Segment, String, u32) {
                 ("__LD", "__compact_unwind") => "__blaze_unwind",
                 _ => sect,
             };
-            return (segment, sect.to_owned(), flags);
+            return (segment, sect, flags);
         }
     };
-    (segment, name.to_owned(), flags)
+    (segment, name, flags)
 }
 
 /// Where a Mach-O section goes, by its segment, name and flags (`S_*` and `S_ATTR_*`): the
@@ -288,6 +293,7 @@ fn section_of(class: &Class) -> (Segment, String, u32) {
 pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<SectionKind, String> {
     let alloc = |class| Ok(SectionKind::Alloc(class, u32::MAX));
     let named = |segment: &str, section: &str| Class::Named {
+        // alloc: `Class::Named` owns its name (model.rs): once per section outside the standard ones
         name: format!("{segment},{section}"),
         write: segment != "__TEXT",
         exec: false,
@@ -302,6 +308,7 @@ pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<Secti
         return Ok(SectionKind::Dropped);
     }
     if Segment::of(segment).is_none() || segment == "__LD" {
+        // alloc: error path
         return Err(format!(
             "the section `{segment},{section}` is in a segment blaze's Mach-O writer doesn't lay \
              out (it has `__TEXT`, `__DATA_CONST` and `__DATA`)"
@@ -330,12 +337,14 @@ pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<Secti
         | macho::S_LAZY_SYMBOL_POINTERS
         | macho::S_LAZY_DYLIB_SYMBOL_POINTERS
         | macho::S_SYMBOL_STUBS => {
+            // alloc: error path
             return Err(format!(
                 "the section `{segment},{section}` is of symbol stubs or pointers, which only a \
                  linker makes"
             ));
         }
         macho::S_DTRACE_DOF => {
+            // alloc: error path
             return Err(format!("the section `{segment},{section}` holds DTrace probes (DOF)"));
         }
         _ => {}
@@ -423,21 +432,27 @@ impl MachO {
         let magic = bytes.get(..4).map(|it| u32::from_be_bytes([it[0], it[1], it[2], it[3]]));
         let slices: Vec<(u32, u64, u64)> = match magic {
             Some(macho::FAT_MAGIC) => MachOFatFile32::parse(bytes)
+                // alloc: error path
                 .map_err(|it| format!("{name}: {it}"))?
                 .arches()
                 .iter()
                 .map(|it| (it.cputype(), it.offset().into(), it.size().into()))
+                // alloc: once per universal file: its slices
                 .collect(),
             Some(macho::FAT_MAGIC_64) => MachOFatFile64::parse(bytes)
+                // alloc: error path
                 .map_err(|it| format!("{name}: {it}"))?
                 .arches()
                 .iter()
                 .map(|it| (it.cputype(), it.offset(), it.size()))
+                // alloc: once per universal file: its slices
                 .collect(),
             _ => return Ok((0, bytes)),
         };
         let Some(&(_, offset, size)) = slices.iter().find(|it| it.0 == self.cpu) else {
+            // alloc: error path
             let has: Vec<String> = slices.iter().map(|it| format!("{:#x}", it.0)).collect();
+            // alloc: error path
             return Err(format!(
                 "{name} is a universal file without a slice for CPU type {:#x} (it has {})",
                 self.cpu,
@@ -447,6 +462,7 @@ impl MachO {
         let (start, end) = (offset as usize, offset.saturating_add(size) as usize);
         let slice = bytes
             .get(start..end)
+            // alloc: error path
             .ok_or_else(|| format!("{name}: a universal file's slice past its end"))?;
         Ok((start, slice))
     }
@@ -491,6 +507,7 @@ impl Writer for MachO {
         let mut parts = name.split(',').map(str::trim);
         let segment = parts.next().unwrap_or_default();
         let shape = || {
+            // alloc: error path
             format!(
                 "`{name}` is not a Mach-O section: `SEGMENT,section[,type[,attributes]]`, each \
                  name of 1 to 16 bytes"
@@ -503,12 +520,14 @@ impl Writer for MachO {
         let mut flags = match parts.next() {
             None => macho::S_REGULAR,
             Some(kind) => {
+                // alloc: error path
                 section_type(kind).ok_or_else(|| format!("`{name}`: no section type `{kind}`"))?
             }
         };
         if let Some(attributes) = parts.next() {
             for attribute in attributes.split('+').map(str::trim) {
                 flags |= section_attribute(attribute)
+                    // alloc: error path
                     .ok_or_else(|| format!("`{name}`: no section attribute `{attribute}`"))?;
             }
         }
@@ -520,6 +539,7 @@ impl Writer for MachO {
         }
         match classify(segment, section, flags)? {
             SectionKind::Alloc(class, rank) => Ok((class, rank)),
+            // alloc: error path
             _ => Err(format!("`{name}` is not a section a static can be placed in")),
         }
     }
@@ -590,6 +610,7 @@ impl Writer for MachO {
             }
             NativeKind::Shared { .. } => {
                 let text = std::str::from_utf8(bytes).map_err(|_| {
+                    // alloc: error path
                     format!("{name} is neither a Mach-O dynamic library nor a `.tbd` stub")
                 })?;
                 tbd::read(name, text, self.output.arch, self.platform.platform)
@@ -599,6 +620,7 @@ impl Writer for MachO {
     }
 
     fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)> {
+        // alloc: `Writer::synthetic` returns a `Vec`: one entry, once per link
         vec![(Class::Synthetic(UNWIND_INFO), unwind::bound(counts.functions, counts.fdes, counts.unwind))]
     }
 
@@ -611,6 +633,7 @@ impl Writer for MachO {
         addend: i64,
     ) -> Result<(), String> {
         let _ = (bytes, s, addend);
+        // alloc: error path
         Err(format!(
             "a Mach-O relocation of type {r_type} at {p:#x}: every Mach-O relocation is read into \
              one the core applies"
@@ -618,6 +641,7 @@ impl Writer for MachO {
     }
 
     fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
+        // alloc: `Writer::synthesize` returns a `Vec`: one entry, once per link
         Ok(vec![(Class::Synthetic(UNWIND_INFO), unwind::build(placed, self.output.arch)?)])
     }
 
@@ -658,7 +682,8 @@ struct SegmentOut {
 }
 
 struct SectionOut {
-    name: String,
+    /// As the load command holds it: NUL-padded to 16 bytes.
+    name: [u8; 16],
     segment: &'static str,
     addr: u64,
     size: u64,
@@ -687,9 +712,7 @@ impl Out {
         self.0.extend_from_slice(&value.to_le_bytes());
     }
     fn name16(&mut self, name: &str) {
-        let mut field = [0u8; 16];
-        field[..name.len()].copy_from_slice(name.as_bytes());
-        self.0.extend_from_slice(&field);
+        self.0.extend_from_slice(&field16(name));
     }
     fn align(&mut self, to: usize) {
         self.0.resize(self.0.len().next_multiple_of(to), 0);
@@ -715,14 +738,25 @@ fn segment_bound<const SEGMENT: u8, const END: bool, const PAGE: u64>(regions: &
 }
 
 fn u32_of(value: u64, what: &str) -> Result<u32, LinkError> {
+    // alloc: error path
     u32::try_from(value).map_err(|_| error(format!("{what} ({value:#x}) doesn't fit 32 bits")))
 }
 
+/// A segment or section name as a load command holds it; `name` is at most 16 bytes.
+fn field16(name: &str) -> [u8; 16] {
+    let mut field = [0u8; 16];
+    field[..name.len()].copy_from_slice(name.as_bytes());
+    field
+}
+
 /// `__debug_line` for `.debug_line`, at most 16 bytes, as Apple's tools name them.
-fn dwarf_name(name: &str) -> String {
-    let mut out = format!("__{}", name.trim_start_matches('.'));
-    out.truncate(16);
-    out
+fn dwarf_name(name: &str) -> [u8; 16] {
+    let mut field = [0u8; 16];
+    field[..2].copy_from_slice(b"__");
+    let rest = name.trim_start_matches('.').as_bytes();
+    let len = rest.len().min(14);
+    field[2..2 + len].copy_from_slice(&rest[..len]);
+    field
 }
 
 /// What the symbol table and the indirect symbol table say.
@@ -749,7 +783,8 @@ impl MachO {
         let shared = self.shared();
 
         // The segments of the address space, and the sections of the regions in them.
-        let mut segments: Vec<SegmentOut> = Vec::new();
+        // `__PAGEZERO`, the three of `Segment`, `__DWARF` and `__LINKEDIT`.
+        let mut segments: Vec<SegmentOut> = Vec::with_capacity(6);
         if !shared {
             segments.push(SegmentOut {
                 name: "__PAGEZERO",
@@ -759,23 +794,24 @@ impl MachO {
                 filesize: 0,
                 prot: 0,
                 flags: 0,
-                sections: Vec::new(),
+                sections: Vec::new(), // alloc: empty, which doesn't allocate
             });
         }
         let mut has_tlv = false;
         for segment in [Segment::Text, Segment::DataConst, Segment::Data] {
-            let regions: Vec<(usize, &Region)> = (placed.regions.iter().enumerate())
-                .filter(|(_, it)| place(&it.class).0 == segment)
-                .collect();
-            if regions.is_empty() && segment != Segment::Text {
+            let regions =
+                || (placed.regions.iter().enumerate()).filter(move |(_, it)| place(&it.class).0 == segment);
+            let first = regions().next();
+            if first.is_none() && segment != Segment::Text {
                 continue;
             }
-            let vmaddr = match (segment, regions.first()) {
+            let vmaddr = match (segment, first) {
                 (Segment::Text, _) => base,
                 (_, Some((_, first))) => first.addr,
                 (_, None) => unreachable!("only `__TEXT` is kept without regions"),
             };
             if vmaddr % page != 0 {
+                // alloc: error path
                 return Err(error(format!(
                     "the segment {} starts at {vmaddr:#x}, which is not at a page",
                     segment.name()
@@ -787,10 +823,11 @@ impl MachO {
             };
             let (mut vmend, mut filend) = (start, start);
             let mut zero_seen = None;
-            let mut sections = Vec::new();
-            for &(index, region) in &regions {
+            let mut sections = Vec::with_capacity(regions().count());
+            for (index, region) in regions() {
                 let end = region.addr + region.capacity;
                 if region.addr < start {
+                    // alloc: error path
                     return Err(error(format!(
                         "the region of {:?} at {:#x} is before its segment {} (at {start:#x})",
                         region.class,
@@ -801,6 +838,7 @@ impl MachO {
                 if let Some(last) = segments.last().filter(|_| segment != Segment::Text)
                     && region.addr < last.vmaddr + last.vmsize
                 {
+                    // alloc: error path
                     return Err(error(format!(
                         "the region of {:?} at {:#x} overlaps the segment {}",
                         region.class, region.addr, last.name
@@ -809,6 +847,7 @@ impl MachO {
                 if region.size > region.capacity
                     || placed.bytes(index).len() as u64 > region.capacity
                 {
+                    // alloc: error path
                     return Err(error(format!(
                         "the region of {:?} at {:#x} holds more than its capacity",
                         region.class, region.addr
@@ -818,6 +857,7 @@ impl MachO {
                 if zeroed(&region.class) {
                     zero_seen.get_or_insert(region.addr);
                     if !placed.bytes(index).is_empty() {
+                        // alloc: error path
                         return Err(error(format!(
                             "the zeroed region of {:?} at {:#x} has bytes",
                             region.class, region.addr
@@ -825,6 +865,7 @@ impl MachO {
                     }
                 } else {
                     if let Some(zero) = zero_seen {
+                        // alloc: error path
                         return Err(error(format!(
                             "the region of {:?} at {:#x} is behind zeroed data at {zero:#x}: \
                              the file has no bytes there",
@@ -841,7 +882,7 @@ impl MachO {
                 let (_, name, flags) = section_of(&region.class);
                 has_tlv |= flags == macho::S_THREAD_LOCAL_VARIABLES && region.size != 0;
                 sections.push(SectionOut {
-                    name,
+                    name: field16(name),
                     segment: segment.name(),
                     addr: region.addr,
                     size: region.size,
@@ -878,13 +919,12 @@ impl MachO {
             .unwrap_or(0);
 
         // The debug info, in a segment no one runs.
-        let mut dwarf = Vec::new();
-        let debug: Vec<&(&'static str, Vec<u8>)> =
-            placed.debug.iter().filter(|it| !it.1.is_empty()).collect();
-        if !debug.is_empty() {
+        let debug = || placed.debug.iter().filter(|it| !it.1.is_empty());
+        let mut dwarf = Vec::with_capacity(debug().map(|it| it.1.len()).sum());
+        if debug().next().is_some() {
             let (vmaddr, fileoff) = (vm_next, file_next);
-            let mut sections = Vec::new();
-            for (name, bytes) in debug {
+            let mut sections = Vec::with_capacity(debug().count());
+            for (name, bytes) in debug() {
                 sections.push(SectionOut {
                     name: dwarf_name(name),
                     segment: "__DWARF",
@@ -913,18 +953,20 @@ impl MachO {
         }
 
         // Which libraries are loaded, and each one's ordinal.
+        // alloc: two tables per link, each sized once by the libraries
         let mut used = vec![(0usize, 0usize); placed.libraries.len()];
         for import in placed.imports {
             if let Some(library) = import.library {
                 let it = used.get_mut(library as usize).ok_or_else(|| {
+                    // alloc: error path
                     error(format!("the import {} is of no library ({library})", import.name))
                 })?;
                 it.0 += 1;
                 it.1 += usize::from(import.weak);
             }
         }
-        let mut ordinals = vec![0u32; placed.libraries.len()];
-        let mut loaded = Vec::new();
+        let mut ordinals = vec![0u32; placed.libraries.len()]; // alloc: as `used`
+        let mut loaded = Vec::with_capacity(placed.libraries.len());
         for (nth, library) in placed.libraries.iter().enumerate() {
             if library.as_needed && used[nth].0 == 0 {
                 continue;
@@ -933,6 +975,7 @@ impl MachO {
             ordinals[nth] = loaded.len() as u32;
         }
         if loaded.len() > 253 {
+            // alloc: error path
             return Err(error(format!(
                 "{} libraries: a two-level namespace image names at most 253",
                 loaded.len()
@@ -942,6 +985,7 @@ impl MachO {
             let import = placed
                 .imports
                 .get(import as usize)
+                // alloc: error path
                 .ok_or_else(|| error(format!("a bind of no import ({import})")))?;
             Ok(match import.library {
                 Some(library) => i64::from(ordinals[library as usize]),
@@ -950,20 +994,19 @@ impl MachO {
         };
 
         // What the loader fixes up.
-        let spans: Vec<linkedit::Span> = (segments.iter())
-            .filter(|it| it.name != "__DWARF")
-            .map(|it| linkedit::Span {
-                name: it.name,
-                start: it.vmaddr,
-                end: it.vmaddr + it.vmsize,
-                writable: it.prot & macho::VM_PROT_WRITE != 0,
-            })
-            .collect();
+        let mut spans: Vec<linkedit::Span> = Vec::with_capacity(segments.len());
+        spans.extend((segments.iter()).filter(|it| it.name != "__DWARF").map(|it| linkedit::Span {
+            name: it.name,
+            start: it.vmaddr,
+            end: it.vmaddr + it.vmsize,
+            writable: it.prot & macho::VM_PROT_WRITE != 0,
+        }));
         let rebase = linkedit::rebases(placed.rebase, &spans).map_err(error)?;
 
         // The symbol table first: its strings are the names the binds and the trie use.
         let mut sections: Vec<&mut SectionOut> =
-            segments.iter_mut().flat_map(|it| it.sections.iter_mut()).collect();
+            Vec::with_capacity(segments.iter().map(|it| it.sections.len()).sum());
+        sections.extend(segments.iter_mut().flat_map(|it| it.sections.iter_mut()));
         let symbols = self.symbols(placed, &mut sections, &ordinals)?;
         let name_at = |(at, len): (u32, u32)| &symbols.strings[at as usize..(at + len) as usize];
 
@@ -989,6 +1032,7 @@ impl MachO {
                     addend: 0,
                 }),
                 other => {
+                    // alloc: error path
                     return Err(error(format!(
                         "a GOT cell at {:#x} holding {other:?}, which is ELF's and not Mach-O's",
                         cell.addr
@@ -1001,9 +1045,11 @@ impl MachO {
         // What the image gives other images: what the symbol table defines, in its order.
         let mut exports: Vec<(&[u8], u64, u64)> = (symbols.exports.iter())
             .map(|&(name, flags, offset)| (name_at(name), flags, offset))
+            // alloc: one buffer per link, of exactly the exports
             .collect();
         let trie = linkedit::trie(&mut exports).map_err(error)?;
 
+        // alloc: one buffer per link, of exactly the functions
         let starts: Vec<u64> = placed.functions.iter().map(|it| it.addr).collect();
         let function_starts = linkedit::function_starts(base, &starts);
 
@@ -1034,6 +1080,7 @@ impl MachO {
         let code_limit = linkedit_at + linkedit.0.len() as u64;
         let identifier = placed.name;
         if identifier.is_empty() || identifier.contains(['/', '\0']) {
+            // alloc: error path
             return Err(error(format!(
                 "`{identifier}` is not a file name, which the code signature's identifier is"
             )));
@@ -1048,7 +1095,7 @@ impl MachO {
             filesize: linkedit_size,
             prot: macho::VM_PROT_READ,
             flags: 0,
-            sections: Vec::new(),
+            sections: Vec::new(), // alloc: empty, which doesn't allocate
         });
 
         // The load commands.
@@ -1150,6 +1197,7 @@ impl MachO {
             let entry = placed.entry.ok_or_else(|| error("an executable without an entry"))?;
             let text = &segments[1];
             if !(text.vmaddr..text.vmaddr + text.vmsize).contains(&entry) {
+                // alloc: error path
                 return Err(error(format!("the entry {entry:#x} is not in `__TEXT`")));
             }
             count += 1;
@@ -1180,6 +1228,7 @@ impl MachO {
         commands.u32(u32_of(signature_len, "the code signature's length")?);
 
         if (HEADER + commands.0.len()) as u64 > placed.plan.headers {
+            // alloc: error path
             return Err(error(format!(
                 "the load commands take {} bytes, more than the {} the image keeps for them",
                 HEADER + commands.0.len(),
@@ -1235,6 +1284,7 @@ impl MachO {
             sign::signature(&file, identifier, at, len, !shared, cache.as_deref_mut(), &mut signature);
         }
         if signature.len() as u64 != signature_len {
+            // alloc: error path
             return Err(error(format!(
                 "a code signature of {} bytes where {signature_len} were kept for it",
                 signature.len()
@@ -1251,6 +1301,7 @@ impl MachO {
         parts.push((linkedit_at, linkedit.0));
         let mut at = code_limit;
         for piece in signature.chunks(sign::PAGE) {
+            // alloc: `File::parts` own their bytes: one per signature page, so an incremental link writes only the pages that changed
             parts.push((at, piece.to_vec()));
             at += piece.len() as u64;
         }
@@ -1266,7 +1317,7 @@ impl MachO {
         ordinals: &[u32],
     ) -> Result<Symbols, LinkError> {
         let base = placed.plan.base;
-        let mut ranges: Vec<(u64, u64, u8)> = Vec::new();
+        let mut ranges: Vec<(u64, u64, u8)> = Vec::with_capacity(sections.len());
         for (nth, section) in sections.iter().enumerate() {
             if section.segment != "__DWARF" {
                 let ordinal = u8::try_from(nth + 1)
@@ -1280,15 +1331,19 @@ impl MachO {
             (ranges[..at].iter().rev())
                 .find(|it| addr <= it.1)
                 .map(|it| it.2)
+                // alloc: error path
                 .ok_or_else(|| error(format!("the symbol {what} at {addr:#x} is in no section")))
         };
 
         let exported: rustc_hash::FxHashSet<&str> =
+            // alloc: one set per link, sized once by the exports
             placed.exports.iter().map(|it| it.name.as_str()).collect();
-        let mut locals: Vec<(u64, &str)> = (placed.functions.iter())
-            .filter_map(|it| Some((it.addr, it.name.as_deref()?)))
-            .filter(|it| !exported.contains(it.1))
-            .collect();
+        let mut locals: Vec<(u64, &str)> = Vec::with_capacity(placed.functions.len());
+        locals.extend(
+            (placed.functions.iter())
+                .filter_map(|it| Some((it.addr, it.name.as_deref()?)))
+                .filter(|it| !exported.contains(it.1)),
+        );
         if !locals.is_sorted() {
             locals.sort_unstable();
         }
@@ -1303,6 +1358,7 @@ impl MachO {
                 _ => u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_REGULAR),
             };
             if export.addr < base {
+                // alloc: error path
                 return Err(error(format!(
                     "the export {} at {:#x} is before the image",
                     export.name, export.addr
@@ -1319,6 +1375,7 @@ impl MachO {
         });
 
         let mut undefined: Vec<(&str, u32)> =
+            // alloc: one buffer per link, of exactly the imports
             (placed.imports.iter().enumerate()).map(|(nth, it)| (it.name.as_str(), nth as u32)).collect();
         undefined.sort_unstable_by(|a, b| macho_order(a.0, b.0).then(a.1.cmp(&b.1)));
 
@@ -1356,8 +1413,9 @@ impl MachO {
             exports.push((at, flags, addr - base));
         }
         let first_undefined = (locals.len() + defined.len()) as u32;
+        // alloc: two tables per link, each sized once by the imports
         let mut index_of = vec![0u32; placed.imports.len()];
-        let mut import_names = vec![(0u32, 0u32); placed.imports.len()];
+        let mut import_names = vec![(0u32, 0u32); placed.imports.len()]; // alloc: as `index_of`
         for (nth, &(name, index)) in undefined.iter().enumerate() {
             let import = &placed.imports[index as usize];
             let library = match import.library {
@@ -1371,6 +1429,7 @@ impl MachO {
         strings.align(8);
 
         // The GOT's cells by address, walked alongside each `__got` section's cells.
+        // alloc: one buffer per link, of exactly the GOT's cells
         let mut got: Vec<(u64, &Holds)> = placed.got.iter().map(|it| (it.addr, &it.holds)).collect();
         if !got.is_sorted_by_key(|it| it.0) {
             radix::sort_by_key(&mut got, |it| it.0);
@@ -1382,6 +1441,7 @@ impl MachO {
                 continue;
             }
             if section.size % 8 != 0 {
+                // alloc: error path
                 return Err(error(format!(
                     "the `__got` at {:#x} is {} bytes, not of whole cells",
                     section.addr, section.size

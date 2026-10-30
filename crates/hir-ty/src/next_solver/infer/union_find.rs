@@ -61,9 +61,13 @@ pub(crate) struct UnionFind<K, V> {
 impl<K, V> Default for UnionFind<K, V> {
     fn default() -> Self {
         UnionFind {
+            // alloc: empty `Vec`s do not allocate.
             parent: Vec::new(),
+            // alloc: empty `Vec`s do not allocate.
             rank: Vec::new(),
+            // alloc: empty `Vec`s do not allocate.
             value: Vec::new(),
+            // alloc: empty `Vec`s do not allocate.
             undo: Vec::new(),
             floor: 0,
             key: PhantomData,
@@ -74,9 +78,13 @@ impl<K, V> Default for UnionFind<K, V> {
 impl<K, V: Copy> Clone for UnionFind<K, V> {
     fn clone(&self) -> Self {
         UnionFind {
+            // clone: only `InferCtxt::fork` copies a table.
             parent: self.parent.clone(),
+            // clone: only `InferCtxt::fork` copies a table.
             rank: self.rank.clone(),
+            // clone: only `InferCtxt::fork` copies a table.
             value: self.value.clone(),
+            // clone: only `InferCtxt::fork` copies a table.
             undo: self.undo.clone(),
             floor: self.floor,
             key: PhantomData,
@@ -141,6 +149,19 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
     pub(crate) fn try_probe_value(&self, key: K) -> Option<&V> {
         let at = key.index();
         (self.parent[at as usize] == at).then(|| &self.value[at as usize])
+    }
+
+    /// The root of every set whose value satisfies `keep`, in index order: one pass over the
+    /// columns, as a root is its own parent.
+    pub(crate) fn roots_where(&self, keep: impl Fn(V) -> bool) -> Vec<K> {
+        self.parent
+            .iter()
+            .zip(&self.value)
+            .enumerate()
+            .filter(|&(at, (&parent, &value))| parent == at as u32 && keep(value))
+            .map(|(at, _)| K::from_index(at as u32))
+            // alloc: once per body, for fallback.
+            .collect()
     }
 
     /// Merges the sets of `a` and `b`; when their values do not unify, changes nothing.
@@ -403,6 +424,11 @@ mod tests {
             let is_root = root == at;
             assert_eq!(table.try_probe_value(Key(at)).is_some(), is_root, "{at} is a root");
         }
+        let roots: Vec<Key> = (0..model.parent.len() as u32)
+            .filter(|&at| model.find(at) == at)
+            .map(Key)
+            .collect();
+        assert_eq!(table.roots_where(|_| true), roots, "roots");
     }
 
     #[test]

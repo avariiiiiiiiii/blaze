@@ -19,6 +19,8 @@
 //! image is opened; each record is checked when it is first read, so a start reads nothing it
 //! does not use.
 
+use std::ops::Range;
+
 use blaze_core::Mapping;
 use blaze_format::{FormatError, MAGIC, SchemaHash};
 use blaze_ids::{ContentId, Fingerprint};
@@ -48,11 +50,18 @@ pub(crate) fn schema() -> SchemaHash {
     SchemaHash(ContentId::of("blaze v2 db image 1", LAYOUT.as_bytes()))
 }
 
-/// What one key contributes to an image.
+/// What one key contributes to an image: its memos are `memos` of the [`Entries`] it is in.
 pub(crate) struct Entry<'g> {
     pub(crate) key: QueryKey,
-    pub(crate) memos: Vec<MemoId>,
+    pub(crate) memos: Range<usize>,
     pub(crate) key_bytes: Option<&'g [u8]>,
+}
+
+/// Every key of an image, sorted, and all their memos in one list (two allocations for the
+/// whole image, not one a key).
+pub(crate) struct Entries<'g> {
+    pub(crate) keys: Vec<Entry<'g>>,
+    pub(crate) memos: Vec<MemoId>,
 }
 
 fn pad(out: &mut Vec<u8>, to: usize) {
@@ -75,10 +84,11 @@ fn put_key(out: &mut Vec<u8>, key: &QueryKey) {
 }
 
 /// The image of `entries` (sorted by key, each key's memos in a fixed order) and `inputs`.
-pub(crate) fn write(task: &Guard, store: &Store, entries: &[Entry<'_>], inputs: &[(QueryKey, Input)]) -> Vec<u8> {
-    let memo_count: usize = entries.iter().map(|entry| entry.memos.len()).sum();
-    let edge_count: usize =
-        entries.iter().flat_map(|entry| entry.memos.iter()).map(|&memo| store.edges(task, memo).len()).sum();
+pub(crate) fn write(task: &Guard, store: &Store, all: &Entries<'_>, inputs: &[(QueryKey, Input)]) -> Vec<u8> {
+    let entries = &all.keys;
+    let memo_count = all.memos.len();
+    let edge_count: usize = all.memos.iter().map(|&memo| store.edges(task, memo).len()).sum();
+    let codes = store.codes();
     let table_len = (entries.len() * 2).next_power_of_two().max(2);
 
     let memos_at = ROOT_AT + ROOT;
@@ -110,9 +120,9 @@ pub(crate) fn write(task: &Guard, store: &Store, entries: &[Entry<'_>], inputs: 
             }
             table[slot] = index + 1;
         }
-        for &memo in &entry.memos {
+        for &memo in &all.memos[entry.memos.start..entry.memos.end] {
             let hot = store.hot(task, memo);
-            let (schema, producer) = store.parts(hot.code());
+            let (schema, producer) = codes[hot.code() as usize];
             let memo_edges = store.edges(task, memo);
             put_key(&mut memos, &entry.key);
             memos.extend_from_slice(&hot.fingerprint().0.to_le_bytes());

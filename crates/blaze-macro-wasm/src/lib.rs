@@ -1658,9 +1658,7 @@ fn expand<'a>(
         .part("input", &input)
         .part("attrs", attr.as_deref().unwrap_or(b"-"))
         .part("spans", &shapes.bytes);
-    for (name, value) in &env {
-        given.env(name, value);
-    }
+    given.env_keyed(env.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())));
     let run = RunKey { code: *code, given: given.finish() };
     let restore = |trees: Vec<Tree>| {
         let trees = match &root {

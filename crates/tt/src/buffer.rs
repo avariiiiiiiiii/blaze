@@ -14,6 +14,7 @@ pub struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     pub fn new(origin: TokenTreesView<'a>) -> Self {
+        // alloc: one buffer per walk, at its first subtree, as deep as the nesting.
         Self { origin, at: origin.start, subtrees_stack: Vec::new() }
     }
 

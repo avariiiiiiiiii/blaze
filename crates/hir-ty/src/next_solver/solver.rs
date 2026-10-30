@@ -190,7 +190,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                     // FIXME: Properly consider opaques here.
                     && self.known_no_opaque_types_in_storage()
                 {
-                    goal_stalled_on_args_or_nonempty_opaques(thin_vec![TyOrConstInferVar::Ty(vid)])
+                    goal_stalled_on_args_or_nonempty_opaques(thin_vec![TyOrConstInferVar::Ty(vid)]) // alloc: `GoalStalledOn` owns a `ThinVec`
                 } else if trait_pred.polarity() == ClausePolarity::Positive {
                     match interner.as_trait_lang_item(trait_pred.def_id()) {
                         Some(SolverTraitLangItem::Sized | SolverTraitLangItem::MetaSized) => {
@@ -261,7 +261,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                                 TyOrConstInferVar::maybe_from_generic_arg::<Self::Interner>(arg)
                                     .expect("collected an inference variable")
                             })
-                            .collect(),
+                            .collect(), // alloc: `GoalStalledOn` owns a `ThinVec`
                     );
                 }
                 InferCtxtLike::register_ty_outlives(&self.0, outlives.0, outlives.1, span);
@@ -278,7 +278,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                         TyKind::Infer(InferTy::TyVar(b_vid)),
                     ) => {
                         self.sub_unify_ty_vids_raw(a_vid, b_vid);
-                        goal_stalled_on_args(thin_vec![
+                        goal_stalled_on_args(thin_vec![ // alloc: `GoalStalledOn` owns a `ThinVec`
                             TyOrConstInferVar::Ty(a_vid),
                             TyOrConstInferVar::Ty(b_vid),
                         ])
@@ -291,7 +291,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                     return Outcome::NoFastPath;
                 }
                 match self.shallow_resolve_const(ct).ct_vid() {
-                    Some(vid) => goal_stalled_on_args(thin_vec![TyOrConstInferVar::Const(vid)]),
+                    Some(vid) => goal_stalled_on_args(thin_vec![TyOrConstInferVar::Const(vid)]), // alloc: `GoalStalledOn` owns a `ThinVec`
                     None => Outcome::NoFastPath,
                 }
             }
@@ -303,7 +303,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                 if arg.is_trivially_wf(interner) {
                     Outcome::TriviallyHolds
                 } else if arg.is_infer() {
-                    goal_stalled_on_args(thin_vec![
+                    goal_stalled_on_args(thin_vec![ // alloc: `GoalStalledOn` owns a `ThinVec`
                         TyOrConstInferVar::maybe_from_term::<Self::Interner>(arg)
                             .expect("an inference variable"),
                     ])
@@ -392,8 +392,8 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         } else {
             let allocation = AllocationData {
                 ty,
-                memory: allocation.memory.clone(),
-                memory_map: allocation.memory_map.clone(),
+                memory: allocation.memory.clone(), // clone: only when normalizing changed the type
+                memory_map: allocation.memory_map.clone(), // clone: only when normalizing changed the type
             };
             Const::new_from_allocation(interner, &allocation, env)
         };
@@ -410,12 +410,12 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         arg: <Self::Interner as rustc_type_ir::Interner>::Term,
     ) -> Option<Vec<Goal<'db, Predicate<'db>>>> {
         let interner = self.interner;
-        let Some(ty) = arg.as_type() else { return Some(Vec::new()) };
+        let Some(ty) = arg.as_type() else { return Some(Vec::new()) }; // alloc: empty
         let ty = self.resolve_vars_if_possible(ty);
         if ty.is_ty_var() {
             return None;
         }
-        let mut goals = Vec::new();
+        let mut goals = Vec::new(); // alloc: `SolverDelegate::well_formed_goals` returns a `Vec`
         let free = |part: &Ty<'db>| !part.has_escaping_bound_vars();
         for part in ty.walk().filter_map(|it| it.as_type()).filter(free) {
             match part.kind() {
@@ -442,10 +442,10 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         &self,
     ) -> Vec<(RegionConstraint<'db>, VisibleForLeakCheck)> {
         if !self.interner.regions() {
-            return Vec::new();
+            return Vec::new(); // alloc: empty
         }
         let mut seen = FxHashMap::default();
-        let mut constraints: Vec<(RegionConstraint<'db>, VisibleForLeakCheck)> = Vec::new();
+        let mut constraints: Vec<(RegionConstraint<'db>, VisibleForLeakCheck)> = Vec::new(); // alloc: the trait returns a `Vec`
         for (constraint, visible) in self.0.query_region_constraints() {
             if says_nothing(constraint) {
                 continue;
@@ -612,15 +612,18 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         }
     }
 
+    /// rustc answers with `rustc_transmute`'s layout analysis, which blaze has not ported:
+    /// a `TransmuteFrom` goal stops here rather than holding unproven.
     fn is_transmutable(
         &self,
-        _src: Ty<'db>,
-        _dst: Ty<'db>,
-        _assume: Const<'db>,
+        src: Ty<'db>,
+        dst: Ty<'db>,
+        assume: Const<'db>,
     ) -> Result<Answer<Region<'db>, Ty<'db>>, NoSolution> {
-        // It's better to return some value while not fully implement
-        // then panic in the mean time
-        Ok(Answer::Yes)
+        panic!(
+            "`TransmuteFrom<{src:?}, {assume:?}>` for `{dst:?}`: blaze has no port of \
+             rustc_transmute, so `#![feature(transmutability)]` goals cannot be proven"
+        )
     }
 
     fn obtain_canonicalizer_state(&self) -> CanonicalizerState<Self::Interner> {
@@ -637,7 +640,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         let goal = self.deeply_resolve_ignoring_regions(goal);
         let mut chain = OverflowedGoalChain {
             span,
-            predicates: Vec::new(),
+            predicates: Vec::new(), // alloc: overflow report, error path
             recursion_limit: self.interner.recursion_limit().min(16),
         };
         let _ = self
@@ -646,7 +649,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
             goal: goal.predicate,
             span,
             // The first is `goal` itself.
-            chain: chain.predicates.into_iter().skip(1).collect(),
+            chain: chain.predicates.into_iter().skip(1).collect(), // alloc: overflow report, error path
         });
     }
 }

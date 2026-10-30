@@ -6,14 +6,20 @@
 //! variant a dead associated item of an enum's impl is shadowed by. In an executable, first
 //! what is public but used only through what is public, as `dead_code_pub_in_binary`.
 //!
+//! A dead item is its number and level until its group is linted; names, spans and text are
+//! made only then.
+//!
 //! Follows `compiler/rustc_passes/src/dead.rs` (`check_mod_deathness`, `lint_dead_codes`,
 //! `DeadVisitor`) and `compiler/rustc_passes/src/diagnostics.rs` (`MultipleDeadCodes`,
 //! `ParentInfo`, `IgnoredDerivedImpls`, `ChangeFields`, `EnumVariantSameName`,
 //! `DeadCodePubInBinaryNote`) (MIT or Apache-2.0).
 
+use std::fmt::Write as _;
+
 use blaze_ids::radix;
 use hir::InFile;
-use hir_def::{AdtId, signatures::{StructFlags, StructSignature}};
+use hir_def::signatures::{StructFlags, StructSignature};
+use smallvec::SmallVec;
 use syntax::{
     AstNode, TextRange,
     ast::{self, HasName},
@@ -34,13 +40,16 @@ use crate::{
 /// rustc's `check_mod_deathness` of every module.
 pub(super) fn report(k: &Crate<'_, '_, '_>, liveness: &Liveness) -> Vec<Found> {
     let mut found = Vec::new();
+    let mut dead = Vec::new();
     for module in 0..k.defs.modules.len() {
         if k.executable == Some(true) {
             let pre = &liveness.pre_deferred;
             let unused_pub = |def: DefIdx| k.reach.is_reachable(def) && !pre.contains(def);
-            Report { k, lint: Lint::PubInBinary, live: pre, found: &mut found }.module(module, &unused_pub);
+            Report { k, lint: Lint::PubInBinary, live: pre, found: &mut found, dead: &mut dead }
+                .module(module, unused_pub);
         }
-        Report { k, lint: Lint::DeadCode, live: &liveness.last, found: &mut found }.module(module, &|_| true);
+        Report { k, lint: Lint::DeadCode, live: &liveness.last, found: &mut found, dead: &mut dead }
+            .module(module, |_| true);
     }
     found
 }
@@ -66,9 +75,9 @@ enum ReportOn {
     NamedField,
 }
 
+#[derive(Clone, Copy)]
 struct DeadItem {
     def: DefIdx,
-    name: String,
     level: LevelPlus,
 }
 
@@ -77,27 +86,28 @@ struct Report<'r, 'c, 'a, 'db> {
     lint: Lint,
     live: &'r Live,
     found: &'r mut Vec<Found>,
+    /// The dead items of one group, reused from group to group.
+    dead: &'r mut Vec<DeadItem>,
 }
 
 impl Report<'_, '_, '_, '_> {
     /// rustc's `lint_dead_codes` of the free and foreign items of a module that `keep` keeps.
-    fn module(&mut self, module: usize, keep: &dyn Fn(DefIdx) -> bool) {
+    fn module(&mut self, module: usize, keep: impl Fn(DefIdx) -> bool) {
         let defs = self.k.defs;
         for &item in &defs.modules[module].free {
             if !keep(item) {
                 continue;
             }
             let d = &defs[item];
-            let mut dead_codes = Vec::new();
             if d.kind == (Kind::Impl { of_trait: false }) || (d.kind == Kind::Trait && self.live.contains(item)) {
-                for &child in &d.children {
+                self.dead.clear();
+                for &child in defs.children(item) {
                     if !self.is_live_code(child) {
-                        dead_codes.push(self.dead_item(child));
+                        let dead = self.dead_item(child);
+                        self.dead.push(dead);
                     }
                 }
-            }
-            if !dead_codes.is_empty() {
-                self.warn_multiple(item, "used", dead_codes, ReportOn::NamedField);
+                self.warn_multiple(item, "used", ReportOn::NamedField);
             }
             if !self.live.contains(item) {
                 if !self.live.parent_live(d.parent) {
@@ -107,24 +117,31 @@ impl Report<'_, '_, '_, '_> {
                 continue;
             }
             if matches!(d.kind, Kind::Struct | Kind::Union | Kind::Enum) {
-                let variants: Vec<DefIdx> = match d.kind {
-                    Kind::Enum => d.children.clone(),
-                    _ => vec![item],
+                let variants: &[DefIdx] = match d.kind {
+                    Kind::Enum => defs.children(item),
+                    _ => std::slice::from_ref(&item),
                 };
-                let mut dead_variants = Vec::new();
-                for variant in variants {
+                let mut dead_variants: SmallVec<[DeadItem; 4]> = SmallVec::new();
+                for &variant in variants {
                     if !self.live.contains(variant) {
                         dead_variants.push(self.dead_item(variant));
                         continue;
                     }
-                    let fields = &defs[variant].children;
-                    let positional = fields.first().is_some_and(|&it| is_positional(&defs[it].name));
+                    let fields = defs.children(variant);
+                    let positional = fields.first().is_some_and(|&it| defs[it].is_positional());
                     let report_on = if positional { ReportOn::TupleField } else { ReportOn::NamedField };
-                    let dead_fields =
-                        fields.iter().filter(|&&it| self.should_warn_about_field(it)).map(|&it| self.dead_item(it)).collect();
-                    self.warn_multiple(variant, "read", dead_fields, report_on);
+                    self.dead.clear();
+                    for &field in fields {
+                        if self.should_warn_about_field(field) {
+                            let dead = self.dead_item(field);
+                            self.dead.push(dead);
+                        }
+                    }
+                    self.warn_multiple(variant, "read", report_on);
                 }
-                self.warn_multiple(item, "constructed", dead_variants, ReportOn::NamedField);
+                self.dead.clear();
+                self.dead.extend(dead_variants);
+                self.warn_multiple(item, "constructed", ReportOn::NamedField);
             }
         }
         for &item in &defs.modules[module].foreign {
@@ -135,8 +152,7 @@ impl Report<'_, '_, '_, '_> {
     }
 
     fn dead_item(&self, def: DefIdx) -> DeadItem {
-        let name = self.k.defs[def].name.clone().unwrap_or_default();
-        DeadItem { def, name, level: self.level(def) }
+        DeadItem { def, level: self.level(def) }
     }
 
     /// rustc's `def_lint_level_plus`: `dead_code_pub_in_binary` is set only at the crate's root,
@@ -149,10 +165,8 @@ impl Report<'_, '_, '_, '_> {
     }
 
     fn is_live_code(&self, def: DefIdx) -> bool {
-        match &self.k.defs[def].name {
-            None => true,
-            Some(name) => self.live.contains(def) || name.starts_with('_'),
-        }
+        let d = &self.k.defs[def];
+        d.name.is_none() || self.live.contains(def) || d.is_underscore()
     }
 
     fn check_definition(&mut self, def: DefIdx) {
@@ -175,7 +189,7 @@ impl Report<'_, '_, '_, '_> {
             _ => return,
         };
         let item = self.dead_item(def);
-        self.lint_at_single_level(&[&item], participle, None, ReportOn::NamedField);
+        self.lint_at_single_level(&[item], participle, None, ReportOn::NamedField);
     }
 
     /// Not a field read, of `PhantomData`, nor a positional one of a type with no size (or
@@ -194,26 +208,30 @@ impl Report<'_, '_, '_, '_> {
         {
             return false;
         }
-        if is_positional(&defs[field].name) && field_hir.layout(db).map_or(true, |it| it.size() == 0) {
+        if defs[field].is_positional() && field_hir.layout(db).map_or(true, |it| it.size() == 0) {
             return false;
         }
         true
     }
 
-    fn warn_multiple(&mut self, parent: DefIdx, participle: &str, dead_codes: Vec<DeadItem>, report_on: ReportOn) {
-        let mut dead_codes: Vec<&DeadItem> = dead_codes.iter().filter(|it| !it.name.starts_with('_')).collect();
-        if dead_codes.is_empty() {
-            return;
+    /// The items in `self.dead`, not named with a leading `_`, linted in groups of one level.
+    fn warn_multiple(&mut self, parent: DefIdx, participle: &str, report_on: ReportOn) {
+        let defs = self.k.defs;
+        let mut dead = std::mem::take(self.dead);
+        dead.retain(|it| !defs[it.def].is_underscore());
+        if !dead.is_empty() {
+            radix::sort_by_key(&mut dead[..], |it| it.level.level as u8);
+            for group in dead.chunk_by(|a, b| a.level == b.level) {
+                self.lint_at_single_level(group, participle, Some(parent), report_on);
+            }
         }
-        radix::sort_by_key(&mut dead_codes, |it| it.level.level as u8);
-        for group in dead_codes.chunk_by(|a, b| a.level == b.level) {
-            self.lint_at_single_level(group, participle, Some(parent), report_on);
-        }
+        dead.clear();
+        *self.dead = dead;
     }
 
     fn lint_at_single_level(
         &mut self,
-        dead_codes: &[&DeadItem],
+        dead_codes: &[DeadItem],
         participle: &str,
         parent: Option<DefIdx>,
         report_on: ReportOn,
@@ -232,11 +250,11 @@ impl Report<'_, '_, '_, '_> {
             descr = "associated item";
         }
         let num = dead_codes.len();
-        let names: Vec<&str> = dead_codes.iter().map(|it| it.name.as_str()).collect();
+        let names = || dead_codes.iter().map(|it| name(k, it.def));
         let message = match (num > 6, num) {
             (true, _) => format!("multiple {descr}s are never {participle}"),
-            (false, 1) => format!("{descr} {} is never {participle}", symbol_list(&names)),
-            (false, _) => format!("{descr}s {} are never {participle}", symbol_list(&names)),
+            (false, 1) => format!("{descr} {} is never {participle}", symbol_list(names())),
+            (false, _) => format!("{descr}s {} are never {participle}", symbol_list(names())),
         };
         let mut diag = Diag::lint(self.lint.name(), message, spans[0].clone());
         for span in &spans[1..] {
@@ -252,9 +270,9 @@ impl Report<'_, '_, '_, '_> {
                 let tuple_fields: &[DefIdx] = match parent {
                     Some(parent)
                         if defs[parent].kind == Kind::Struct
-                            && defs[parent].children.first().is_some_and(|&it| is_positional(&defs[it].name)) =>
+                            && defs.children(parent).first().is_some_and(|&it| defs[it].is_positional()) =>
                     {
-                        &defs[parent].children
+                        defs.children(parent)
                     }
                     _ => &[],
                 };
@@ -278,7 +296,7 @@ impl Report<'_, '_, '_, '_> {
             }
             ReportOn::NamedField => {
                 for item in dead_codes {
-                    if let Some(variant) = self.shadowing_variant(item)
+                    if let Some(variant) = self.shadowing_variant(item.def)
                         && let Some(span) = self.def_span(variant)
                     {
                         let dead_descr = defs[item.def].kind.descr();
@@ -286,7 +304,7 @@ impl Report<'_, '_, '_, '_> {
                             span,
                             format!(
                                 "it is impossible to refer to the {dead_descr} `{}` because it is shadowed by this enum variant with the same name",
-                                item.name
+                                name(k, item.def)
                             ),
                         );
                     }
@@ -311,17 +329,16 @@ impl Report<'_, '_, '_, '_> {
             encl = adt;
         }
         if let Some(traits) = self.live.ignored.get(&encl)
-            && let Some(name) = &defs[encl].name
+            && let Some(encl_name) = &defs[encl].name
         {
-            let list: Vec<&str> = traits.to_vec();
-            let note = match list.len() {
+            let encl_name = encl_name.as_str();
+            let list = symbol_list(traits.iter().copied());
+            let note = match traits.len() {
                 1 => format!(
-                    "`{name}` has a derived impl for the trait {}, but this is intentionally ignored during dead code analysis",
-                    symbol_list(&list)
+                    "`{encl_name}` has a derived impl for the trait {list}, but this is intentionally ignored during dead code analysis"
                 ),
                 _ => format!(
-                    "`{name}` has derived impls for the traits {}, but these are intentionally ignored during dead code analysis",
-                    symbol_list(&list)
+                    "`{encl_name}` has derived impls for the traits {list}, but these are intentionally ignored during dead code analysis"
                 ),
             };
             diag.note(note);
@@ -330,21 +347,23 @@ impl Report<'_, '_, '_, '_> {
         self.found.push(Found::lint(diag, Phase::Late, at));
     }
 
-    /// The variant of the enum an inherent impl is of with the name of `item`, an associated
+    /// The variant of the enum an inherent impl is of with the name of `def`, an associated
     /// function or constant of the impl.
-    fn shadowing_variant(&self, item: &DeadItem) -> Option<DefIdx> {
+    fn shadowing_variant(&self, def: DefIdx) -> Option<DefIdx> {
         let defs = self.k.defs;
-        if !matches!(defs[item.def].kind, Kind::AssocFn { .. } | Kind::AssocConst) {
+        if !matches!(defs[def].kind, Kind::AssocFn { .. } | Kind::AssocConst) {
             return None;
         }
-        let Parent::Def(impl_) = defs[item.def].parent else { return None };
+        let Parent::Def(impl_) = defs[def].parent else { return None };
         if defs[impl_].kind != (Kind::Impl { of_trait: false }) {
             return None;
         }
-        let Id::Impl(id) = defs[impl_].id else { return None };
-        let Some(hir::Adt::Enum(enum_)) = hir::Impl::from(id).self_ty(self.k.cx.db).as_adt() else { return None };
-        let enum_ = defs.get(Id::Adt(AdtId::from(hir::Adt::Enum(enum_))))?;
-        defs[enum_].children.iter().copied().find(|&it| defs[it].name.as_deref() == Some(item.name.as_str()))
+        let enum_ = defs.impl_of(impl_)?.self_adt?;
+        if defs[enum_].kind != Kind::Enum {
+            return None;
+        }
+        let name = defs[def].name.as_ref()?;
+        defs.children(enum_).iter().copied().find(|&it| defs[it].name.as_ref() == Some(name))
     }
 
     /// rustc's `def_ident_span`, or its `def_span` where a definition has no name.
@@ -372,20 +391,23 @@ impl Report<'_, '_, '_, '_> {
     }
 }
 
-/// A positional field's name: `0`, `1`.
-fn is_positional(name: &Option<String>) -> bool {
-    name.as_deref().is_some_and(|it| it.starts_with(|c: char| c.is_ascii_digit()))
+/// A definition's name as rustc prints it (none: empty).
+fn name<'k>(k: &'k Crate<'_, '_, '_>, def: DefIdx) -> &'k str {
+    k.defs[def].name.as_ref().map_or("", |it| it.as_str())
 }
 
 /// rustc's `DiagSymbolList`: "`a`", "`a` and `b`", "`a`, `b`, and `c`".
-fn symbol_list(names: &[&str]) -> String {
-    match names {
-        [] => String::new(),
-        [one] => format!("`{one}`"),
-        [a, b] => format!("`{a}` and `{b}`"),
-        [init @ .., last] => {
-            let init: Vec<String> = init.iter().map(|it| format!("`{it}`")).collect();
-            format!("{}, and `{last}`", init.join(", "))
-        }
+fn symbol_list<'s>(names: impl ExactSizeIterator<Item = &'s str>) -> String {
+    let len = names.len();
+    let mut out = String::new();
+    for (at, name) in names.enumerate() {
+        let sep = match (at, len) {
+            (0, _) => "",
+            (1, 2) => " and ",
+            (at, _) if at + 1 == len => ", and ",
+            _ => ", ",
+        };
+        let _ = write!(out, "{sep}`{name}`");
     }
+    out
 }

@@ -722,10 +722,11 @@ impl Recorder {
     /// Whether a connection to the Unix socket at `path`, made whole with its links followed,
     /// is the program's to make: one in the overlays, the writable directories or the
     /// sandbox's empty ones, which only the program's sockets can be in; not one of the
-    /// kernel's views or the machine's `/dev`, which the sandbox sees as they are.
+    /// kernel's views or the machine's `/dev`, which the sandbox sees as they are; or one the
+    /// read set names itself (a test's fork server's socket).
     pub fn may_connect(&self, path: &str) -> bool {
         let seen_as_is = ["/proc", "/sys", "/dev"].iter().any(|it| under(path, it));
-        self.may_write(path) && (!seen_as_is || under(path, "/dev/shm"))
+        (self.may_write(path) && (!seen_as_is || under(path, "/dev/shm"))) || self.readable.iter().any(|it| it == path)
     }
 
     /// The sandbox refused `thread` a write to `path`.
@@ -1092,6 +1093,15 @@ mod tests {
         assert!(hint.contains("--security-opt seccomp=unconfined"), "{hint}");
         assert!(hint.contains("`BLAZE_SANDBOX=off`"), "{hint}");
         _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_the_read_set_names_may_be_connected_to_and_nothing_below_it() {
+        let spec = Spec { readable: vec!["/req/1/s".into()], ..Spec::default() };
+        let recorder = Recorder::new(&spec, &["/tmp"]);
+        assert!(recorder.may_connect("/req/1/s"));
+        assert!(!recorder.may_connect("/req/1/s/x") && !recorder.may_connect("/req/1/t"));
     }
 
     // The paths a sandbox records are a Unix machine's: there is one on Linux and macOS alone.

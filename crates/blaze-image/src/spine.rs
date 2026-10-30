@@ -96,6 +96,19 @@ fn id_at(bytes: &[u8], at: usize) -> ContentId {
     ContentId(bytes[at..at + 32].try_into().expect("32 bytes"))
 }
 
+/// The hash `image`'s spine carries: what `Image::open` of the same bytes gives as
+/// [`crate::Image::hash`], for a writer that names the image it just finished
+/// ([`crate::Builder::finish`]) without opening it. `None` when the bytes are not an image's:
+/// shorter than [`HEADER`], or another magic or layout. It reads the field and checks nothing
+/// else: opening checks it.
+pub fn hash_of(image: &[u8]) -> Option<ContentId> {
+    let header = image.get(..HEADER)?;
+    if header[..8] != MAGIC || header[8..40] != LAYOUT.0.0 {
+        return None;
+    }
+    Some(ContentId(header[HASH_AT..HASH_AT + 32].try_into().expect("32 bytes")))
+}
+
 /// The hash of `spine`, its hash field read as zero.
 pub(crate) fn hash(spine: &[u8]) -> ContentId {
     let mut hasher = Hasher::new(SPINE_DOMAIN);

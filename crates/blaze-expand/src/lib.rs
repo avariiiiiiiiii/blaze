@@ -357,9 +357,7 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
     part_encoded(&mut given, "input", &input);
     part_encoded(&mut given, "attrs", &attrs);
     part_encoded(&mut given, "spans", &shapes);
-    for (name, value) in call.env.iter() {
-        given.env(name, value);
-    }
+    given.env_keyed(call.env.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())));
     (given, spans)
 }
 

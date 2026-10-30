@@ -4,11 +4,12 @@
 //!
 //! - Each thread holds a lane index of its own while it lives ([`lane`]); a [`Segments`] keeps
 //!   one open segment a lane, written only by that lane's thread, so copying in is a bump and
-//!   a copy with no shared write but the segment's hold count.
+//!   a copy with no shared write: the lane counts the holds it hands out and adds them to the
+//!   segment's count once, when it seals it.
 //! - A [`Span`] is bytes in a segment and one hold on it; dropping the span lets go of the
 //!   hold. A span is dropped only once no reader can reach its bytes (its owner's row is past
 //!   its grace, or it was never published).
-//! - A segment is sealed when its lane opens another, and freed by [`Segments::collect`] once
+//! - A segment is sealed when its lane opens another, and freed by [`Segments::sweep`] once
 //!   it is sealed and holds nothing: freeing happens at the database's collection or with
 //!   `&mut`, a segment at a time, never per memo.
 
@@ -19,7 +20,7 @@ use std::{
     ptr::{self, NonNull},
     sync::{
         OnceLock,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
 };
 
@@ -86,6 +87,11 @@ impl<T: Default> Lanes<T> {
         let (chunk, at) = lane_place(lane);
         &self.chunks[chunk].get_or_init(|| (0..LANE_FIRST << chunk).map(|_| T::default()).collect())[at]
     }
+
+    /// Every lane's `T` made so far.
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.chunks.iter_mut().filter_map(OnceLock::get_mut).flat_map(|chunk| chunk.iter_mut())
+    }
 }
 
 /// Segments are allocated at this alignment, the format's ([`blaze_format::ALIGN`]).
@@ -94,20 +100,26 @@ const SEGMENT_ALIGN: usize = blaze_format::ALIGN;
 pub(crate) struct Segment {
     base: NonNull<u8>,
     cap: usize,
-    /// How many spans (and rows that took a span's hold) are in it.
-    holds: AtomicU32,
+    /// How many spans (and rows that took a span's hold) are in it, plus [`OPEN`] while its
+    /// lane copies in: that lane counts its copies in [`Open::taken`] and settles them at
+    /// [`Open::seal`], so a copy does no read-modify-write on a shared line.
+    holds: AtomicI64,
     /// Its lane opened another: no more is copied in.
     sealed: AtomicBool,
 }
 
+/// Added to an open segment's hold count, so it reads as held whatever its lane has copied
+/// in; far above any count of real holds.
+const OPEN: i64 = 1 << 48;
+
 impl Segment {
-    fn new(cap: usize) -> Box<Segment> {
+    fn new(cap: usize, holds: i64, sealed: bool) -> Box<Segment> {
         assert!(cap > 0);
         let layout = Layout::from_size_align(cap, SEGMENT_ALIGN).expect("a segment's layout");
         // SAFETY: `layout` has a nonzero size.
         let base = unsafe { alloc::alloc(layout) };
         let base = NonNull::new(base).unwrap_or_else(|| alloc::handle_alloc_error(layout));
-        Box::new(Segment { base, cap, holds: AtomicU32::new(0), sealed: AtomicBool::new(false) })
+        Box::new(Segment { base, cap, holds: AtomicI64::new(holds), sealed: AtomicBool::new(sealed) })
     }
 }
 
@@ -127,7 +139,7 @@ impl Drop for Segment {
 pub(crate) unsafe fn release(segment: *const Segment) {
     if !segment.is_null() {
         // SAFETY: the caller's hold keeps the segment alive. Release: every read of its bytes
-        // by this hold's owner happens before `Segments::collect` sees no hold and frees it.
+        // by this hold's owner happens before `Segments::sweep` sees no hold and frees it.
         unsafe { (*segment).holds.fetch_sub(1, Ordering::Release) };
     }
 }
@@ -197,6 +209,24 @@ struct Open {
     current: *mut Segment,
     used: usize,
     next_cap: usize,
+    /// Spans copied into `current`, not yet added to its hold count.
+    taken: i64,
+}
+
+impl Open {
+    /// Seals the open segment: its copies' holds go into its count in place of [`OPEN`].
+    fn seal(&mut self) {
+        if self.current.is_null() {
+            return;
+        }
+        // SAFETY: the lane's open segment holds [`OPEN`] until here, so it is not freed.
+        let segment = unsafe { &*self.current };
+        segment.holds.fetch_add(self.taken - OPEN, Ordering::Relaxed);
+        // Release: the settled count happens before a collector that sees the seal reads it.
+        segment.sealed.store(true, Ordering::Release);
+        self.current = ptr::null_mut();
+        self.taken = 0;
+    }
 }
 
 #[repr(align(128))]
@@ -204,7 +234,7 @@ struct OpenCell(UnsafeCell<Open>);
 
 impl Default for OpenCell {
     fn default() -> OpenCell {
-        OpenCell(UnsafeCell::new(Open { current: ptr::null_mut(), used: 0, next_cap: 0 }))
+        OpenCell(UnsafeCell::new(Open { current: ptr::null_mut(), used: 0, next_cap: 0, taken: 0 }))
     }
 }
 
@@ -212,10 +242,10 @@ impl Default for OpenCell {
 /// larger than a quarter of `max` gets a segment of its own, sealed at once.
 ///
 /// Per copy: its bytes, rounded up to `align`. A copy in: a thread-local load, a bump, a
-/// `memcpy` and one relaxed add on the segment's hold count.
+/// `memcpy` and an add to a lane-local count; no atomic read-modify-write.
 pub(crate) struct Segments {
     lanes: Lanes<OpenCell>,
-    /// Every segment made, from `Box::into_raw`, for [`Segments::collect`] and drop.
+    /// Every segment made, from `Box::into_raw`, for [`Segments::sweep`] and drop.
     all: ShortLock<Vec<NonNull<Segment>>>,
     first: usize,
     max: usize,
@@ -234,8 +264,8 @@ impl Segments {
         Segments { lanes: Lanes::new(), all: ShortLock::default(), first, max, align }
     }
 
-    fn make(&self, cap: usize) -> *mut Segment {
-        let segment = Box::into_raw(Segment::new(cap));
+    fn make(&self, cap: usize, holds: i64, sealed: bool) -> *mut Segment {
+        let segment = Box::into_raw(Segment::new(cap, holds, sealed));
         self.all.lock().push(NonNull::new(segment).expect("a box"));
         segment
     }
@@ -249,10 +279,10 @@ impl Segments {
         }
         let len = bytes.len();
         if len > self.max / 4 {
-            let segment = self.make(len.next_multiple_of(SEGMENT_ALIGN));
-            // SAFETY: just made, owned by `all`, and no other thread has its address yet.
+            let segment = self.make(len.next_multiple_of(SEGMENT_ALIGN), 1, true);
+            // SAFETY: just made with the one hold this copy's span takes, owned by `all`.
             let segment = unsafe { &*segment };
-            return Self::put(segment, 0, bytes, true);
+            return Self::put(segment, 0, bytes);
         }
         let cell = self.lanes.get(lane());
         // SAFETY: only this thread holds its lane, and nothing below calls back into a copy.
@@ -263,30 +293,29 @@ impl Segments {
             let at = open.used.next_multiple_of(align);
             if at + len <= segment.cap {
                 open.used = at + len;
-                return Self::put(segment, at, bytes, false);
+                open.taken += 1;
+                return Self::put(segment, at, bytes);
             }
-            segment.sealed.store(true, Ordering::Release);
+            open.seal();
         }
         let cap = open.next_cap.max(self.first);
         open.next_cap = (cap * 2).min(self.max);
-        let segment = self.make(cap);
+        let segment = self.make(cap, OPEN, false);
         open.current = segment;
         open.used = len;
+        open.taken = 1;
         // SAFETY: just made and open in this lane alone.
-        Self::put(unsafe { &*segment }, 0, bytes, false)
+        Self::put(unsafe { &*segment }, 0, bytes)
     }
 
-    fn put(segment: &Segment, at: usize, bytes: &[u8], seal: bool) -> Span {
+    /// Copies `bytes` in at `at`; the caller has counted the span's hold.
+    fn put(segment: &Segment, at: usize, bytes: &[u8]) -> Span {
         debug_assert!(at + bytes.len() <= segment.cap);
         // SAFETY: `at..at + len` is inside the segment, and past what its lane copied in
         // before, so no reader has these bytes.
         let to = unsafe { segment.base.as_ptr().add(at) };
         // SAFETY: as above; `bytes` is another allocation.
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len()) };
-        segment.holds.fetch_add(1, Ordering::Relaxed);
-        if seal {
-            segment.sealed.store(true, Ordering::Release);
-        }
         Span {
             ptr: NonNull::new(to).expect("inside a segment"),
             segment: ptr::from_ref(segment),
@@ -295,7 +324,7 @@ impl Segments {
     }
 
     /// Frees each segment that is sealed and holds nothing.
-    pub(crate) fn collect(&self) {
+    pub(crate) fn sweep(&self) {
         self.all.lock().retain(|segment| {
             // SAFETY: in `all`, so not freed yet.
             let it = unsafe { segment.as_ref() };

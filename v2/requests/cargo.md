@@ -2086,6 +2086,8 @@ Goes with the request of the same name in `v2/requests/db.md` (section 3 there c
 both together. `blaze_vfs::text_of` (new, `crates/blaze-vfs/src/text.rs`) turns the tree's
 `Arc<[u8]>` into the file's `Arc<str>` without a copy.
 
+> forwarded to cargo (told by tmux).
+
 ### 1. `crates/load-cargo/src/v2.rs`, `set_files`
 
 Old:
@@ -2156,3 +2158,166 @@ lock and writes nothing in the user's `$CARGO_HOME` (`serve/fetch/git.rs`, decis
 lock"); child cargo-sync makes `load-cargo` and `serve/` share the front end's database by
 reference (decisions.md, `v2/requests/db-salsa.md`'s load-cargo and blaze-cargo items); child
 cargo-sol writes `docs/v2/plan/lanes/cargo/speed-of-light.md`.
+
+> forwarded to the coordinator: granting the five cargo crates is its decision, not requests' (listed in requests' report).
+
+## frontend-image: one daemon image with symbols, db, VFS and plane history (restore.md items 1–3; to cargo-daemon, 2026-10-29)
+
+`crates/blaze-image` is the daemon's one image file (spine checked at open, 64 KiB groups each
+with a CRC32C checked on first touch, errors naming section and group). The db request
+(`v2/requests/db.md`, "frontend-image: the daemon image on `blaze-image`") moves
+`blaze-query`'s sections onto it. Asked of `crates/blaze-cargo/src/serve/daemon.rs`:
+
+1. **Start** (lines 191–278): map `<state>/db/image` as today, then
+   `let image = Arc::new(blaze_image::Image::open(mapping)?)` (`Image<Mapping>`; an `OpenError`
+   names what is wrong with the spine; the daemon starts empty and says so, as it does for a
+   schema mismatch today). Before anything in the daemon interns a symbol:
+   `intern::restore_symbols(image.clone(), &jobs)` (`jobs: intern::Jobs` runs `job(0..n)` on the plane's pool, `blaze_graph::pool`'s `run_jobs` shape, so the symbol section's CRCs and validation stream at the machine's memory bandwidth rather than one core's; `&intern::serial` only before the pool exists); on `Err(error)` print it and start the database
+   empty (`Database::new`), since every other section names symbol IDs. On `Ok`,
+   `Database::from_image_with(config, image.clone())`.
+2. **The estimates file goes**: drop `estimates_file`, `STAT_ESTIMATES`, `READ_ESTIMATES` and
+   `write_estimates`. The plane's history is the image's `SectionId::PLANE_HISTORY`:
+   `blaze_graph::history::restore(&image)` gives the `Estimates`; on `Err(error)` print it
+   (it names the section and group) and use `Estimates::new(unseen)`. That changes only how
+   work is ordered and admitted.
+3. **Stop** (line 369): one image, one write:
+
+   ```rust
+   let mut builder = blaze_image::Builder::new();
+   let mut live = intern::Live::new();
+   self.db.write_image(&mut builder, &mut live);
+   // the VFS's sections (frontend-journal: VFS_TREE, VFS_BLOBS, VFS_DISKS) and their symbols
+   blaze_graph::history::write(self.plane.predictor(), &mut builder);
+   intern::write_symbols(&live, &mut builder);
+   let bytes = builder.finish().map_err(|error| format!("the daemon image: {error}"))?;
+   self.effects.push(Effect::Write { file: image_file, bytes, tag });
+   ```
+
+   `Effect::Write` is already temp, fsync, rename and directory fsync, so a crash mid-write
+   leaves the old image or none (`blaze-image`'s test `a_torn_write_is_the_old_image_or_refused`).
+4. `crates/blaze-cargo/Cargo.toml`: `blaze-image.workspace = true` (intern and blaze-graph
+   are there already).
+
+> forwarded to cargo (told by tmux).
+
+## frontend-text: amendment to "file text shares the VFS's bytes", section 1: `Bytes` (2026-10-29)
+
+blaze-vfs's `Reader::file` now gives `blaze_vfs::Bytes` (a heap `Arc<[u8]>` or a range of the
+mapped image) inside `Result<Option<..>, Corrupt>`, by frontend-journal-tree. So:
+
+- `files::Loaded::bytes: Arc<[u8]>` -> `blaze_vfs::Bytes`. Where it is filled from
+  `Reader::file`, the `Corrupt` is a `LowerError` naming the path, never skipped. In
+  `v2.rs` (~L463, build-script output), `bytes.as_slice().into()` ->
+  `blaze_vfs::Bytes::from(std::sync::Arc::<[u8]>::from(bytes.as_slice()))`.
+- `set_files`: `view.push(ViewFile { path, id: file.id, bytes: &file.bytes });` is unchanged.
+- `set_files`' match on `base_db::ViewError` gains `| base_db::ViewError::Mapped(path)` in the
+  arm that names `format!("{base}/{path}")` (the variant is new in the db amendment of the same
+  name).
+Status: open
+
+> forwarded to cargo (told by tmux).
+
+## frontend-journal: checkouts resume from the OS's journal (heads.rs, daemon.rs)
+
+Why: restore.md's "Changed files come from the OS's journal". `blaze_vfs::Watcher` now follows
+a checkout through `Effect::Journal` from the cursor saved in the VFS's disk column (FSEvents'
+event ID, NTFS's USN; Linux sweeps stamps), so a warm restart reads only files whose stamp
+moved. Its driver completions are `Done::Journaled` (files and lost subtrees), `Done::Stamped`
+and `Done::Entries` (one directory's names with stamps); `Done::Changed` and `Done::Listed`
+are no longer what a watcher gets (it panics on them), so heads.rs's filter must move to the new
+ones. `Watcher::start` takes `&Vfs` (it reads the saved cursor). `Watched::Lost` has fields.
+All of blaze-vfs is written; this is the whole cargo side.
+
+> forwarded to cargo (told by tmux).
+
+### 1. `crates/blaze-cargo/src/serve/heads.rs`
+
+a. `pub fn arrive(&mut self, arrived: Arrived, effects: &mut Vec<Effect>, out: &mut Vec<Out>) {`
+-> `pub fn arrive(&mut self, vfs: &Vfs, arrived: Arrived, effects: &mut Vec<Effect>, out: &mut Vec<Out>) {`,
+and in it `match self.cookie(head, effects) {` -> `match self.cookie(vfs, head, effects) {`.
+
+b. `fn cookie(&mut self, head: &str, effects: &mut Vec<Effect>) -> Result<(u32, u64), ApiError> {`
+-> `fn cookie(&mut self, vfs: &Vfs, head: &str, effects: &mut Vec<Effect>) -> Result<(u32, u64), ApiError> {`,
+and in it `None => self.watch(head, effects)?,` -> `None => self.watch(vfs, head, effects)?,`.
+
+c. `fn watch(&mut self, head: &str, effects: &mut Vec<Effect>) -> Result<u32, ApiError> {`
+-> `fn watch(&mut self, vfs: &Vfs, head: &str, effects: &mut Vec<Effect>) -> Result<u32, ApiError> {`,
+and in it `watcher.start(effects);` -> `watcher.start(vfs, effects);`.
+
+d. In `fn watched`, old:
+
+```rust
+            Done::Changed { mut files, lost } => {
+                // A directory reported for what changed in it tells every cookie in it.
+                let mut told = false;
+                for file in &files {
+```
+
+new:
+
+```rust
+            Done::Journaled(mut batch) => {
+                // A directory reported for what changed in it, or a subtree whose changes the
+                // journal lost, tells every cookie in it.
+                let mut told = false;
+                for file in &batch.files {
+```
+
+old:
+
+```rust
+                if told || lost {
+                    for cookie in checkout.cookies.values_mut() {
+                        cookie.seen |= told || cookie.written;
+                    }
+                }
+                files.retain(|it| checkout.keeps(it));
+                Done::Changed { files, lost }
+            }
+            Done::Listed(mut listed) => {
+                listed.retain(|(it, _)| checkout.keeps(it));
+                Done::Listed(listed)
+            }
+```
+
+new (a lost subtree under `target/` or `.git` is dropped, or its rescan would take in the
+build's outputs; a listing is filtered so an excluded directory is never descended into):
+
+```rust
+                let lost = batch.lost.iter().any(|(under, _)| within(&checkout.cookie_dir, under.as_str()));
+                if told || lost {
+                    for cookie in checkout.cookies.values_mut() {
+                        cookie.seen |= told || cookie.written;
+                    }
+                }
+                batch.files.retain(|it| checkout.keeps(it));
+                batch.lost.retain(|(it, _)| checkout.keeps(it));
+                Done::Journaled(batch)
+            }
+            Done::Entries(mut entries) => {
+                entries.retain(|(it, _)| checkout.keeps(it));
+                Done::Entries(entries)
+            }
+```
+
+e. `Watched::Committed(_) | Watched::Lost | Watched::Scanned => {}` ->
+`Watched::Committed(_) | Watched::Lost { .. } | Watched::Scanned => {}`.
+
+f. The test `cookies_seen_are_removed_in_number_order`: before `let numbers`, add
+`let vfs = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]).0;` and call
+`heads.cookie(&vfs, "/w", &mut effects)`.
+
+### 2. `crates/blaze-cargo/src/serve/daemon.rs`, `fn arrive`
+
+Old: `self.heads.arrive(arrived, &mut self.effects, &mut out);`
+New: `self.heads.arrive(&self.vfs, arrived, &mut self.effects, &mut out);`
+
+### 3. Not in this request
+
+The VFS's own image sections (tree, blobs, and the disk column with the cursors, `Disks`) are
+written and opened by `frontend-journal-tree`'s `Vfs::write_image` / `Vfs::open`; it sends the
+daemon's start and stop hook for them itself (the image request above already names
+`VFS_TREE, VFS_BLOBS, VFS_DISKS`). Until then the column lives only as long as the daemon, so a
+restart is a stamp sweep of nothing and reads the checkout once, as today.
+
+Answer here with `>` lines.

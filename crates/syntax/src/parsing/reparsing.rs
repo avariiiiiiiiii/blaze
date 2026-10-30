@@ -97,10 +97,16 @@ fn reparse_onto(
 /// prefix and suffix (at character boundaries), which the bytes of `new` at the same start and
 /// `insert` long replace. Compares 64 bytes at a time (`memcmp`) until the texts differ.
 pub(crate) fn edit_between(old: &str, new: &str) -> (TextRange, usize) {
+    // Each compare is one `memcmp`, whose call costs about what comparing 64 bytes does: the
+    // big blocks run at memory bandwidth, the small ones find the difference within one.
+    const BIG: usize = 4096;
     const BLOCK: usize = 64;
     let (a, b) = (old.as_bytes(), new.as_bytes());
     let len = a.len().min(b.len());
     let mut prefix = 0;
+    while prefix + BIG <= len && a[prefix..prefix + BIG] == b[prefix..prefix + BIG] {
+        prefix += BIG;
+    }
     while prefix + BLOCK <= len && a[prefix..prefix + BLOCK] == b[prefix..prefix + BLOCK] {
         prefix += BLOCK;
     }
@@ -115,6 +121,11 @@ pub(crate) fn edit_between(old: &str, new: &str) -> (TextRange, usize) {
     let most = len - prefix;
     let (a_end, b_end) = (a.len(), b.len());
     let mut suffix = 0;
+    while suffix + BIG <= most
+        && a[a_end - suffix - BIG..a_end - suffix] == b[b_end - suffix - BIG..b_end - suffix]
+    {
+        suffix += BIG;
+    }
     while suffix + BLOCK <= most
         && a[a_end - suffix - BLOCK..a_end - suffix] == b[b_end - suffix - BLOCK..b_end - suffix]
     {
@@ -553,6 +564,35 @@ mod tests {
             errors
         };
         assert_eq!(errors(reparsed), errors(parsed));
+        same_hashes(reparsed, parsed);
+    }
+
+    /// The nodes of `parse` large enough that they may keep their subtree hashes: all those
+    /// that do, and more.
+    fn large(parse: &Parse<SourceFile>) -> impl Iterator<Item = u32> + '_ {
+        let tree = parse.tree.as_ref().unwrap().flat();
+        (0..tree.len()).filter(move |&it| {
+            !tree.is_token(it)
+                && (tree.end(it) - it >= 64 || tree.range(it).len() >= TextSize::new(1024))
+        })
+    }
+
+    /// Asks the large nodes of `parse` for their hashes, so the edits of it carry them.
+    fn hash_large(parse: &Parse<SourceFile>) {
+        let tree = parse.tree.as_ref().unwrap().flat();
+        for at in large(parse) {
+            let _ = tree.subtree_hash(at);
+        }
+    }
+
+    /// The large nodes of `reparsed`, the same tree as `parsed`, have the hashes they have in
+    /// `parsed`: those an edit carried, those it made again, and those hashed when asked.
+    fn same_hashes(reparsed: &Parse<SourceFile>, parsed: &Parse<SourceFile>) {
+        let (of, again) = (reparsed.tree.as_ref().unwrap().flat(), parsed.tree.as_ref().unwrap().flat());
+        assert_eq!(of.len(), again.len(), "different trees");
+        for at in large(parsed) {
+            assert_eq!(of.subtree_hash(at), again.subtree_hash(at), "the hash of element {at}");
+        }
     }
 
     #[test] // FIXME: some test here actually test token reparsing
@@ -848,6 +888,8 @@ enum Foo {
             let edits = if text.len() > 20_000 { 2 } else { 6 };
             let full = SourceFile::parse(&text, Edition::CURRENT);
             let outline = SourceFile::parse_outline(text.as_str().into(), Edition::CURRENT);
+            hash_large(&full);
+            hash_large(&outline);
             for _ in 0..edits {
                 let (delete, insert) = random_edit(&mut rng, &text);
                 let mut after = text.clone();
@@ -859,6 +901,7 @@ enum Foo {
                         &format!("{:#?}", parsed.tree().syntax()),
                         &format!("{:#?}", reparsed.tree().syntax()),
                     );
+                    same_hashes(&reparsed, &parsed);
                     let reparsed = outline.reparse(delete, &insert, Edition::CURRENT);
                     let parsed = SourceFile::parse_outline(after.as_str().into(), Edition::CURRENT);
                     check_same(&reparsed, &parsed);
@@ -884,6 +927,8 @@ enum Foo {
             let text = std::fs::read_to_string(file).unwrap();
             let full = SourceFile::parse(&text, Edition::CURRENT);
             let outline = SourceFile::parse_outline(text.as_str().into(), Edition::CURRENT);
+            hash_large(&full);
+            hash_large(&outline);
             for edits in 1..4 {
                 let mut after = text.clone();
                 for _ in 0..edits {
@@ -899,6 +944,7 @@ enum Foo {
                         &format!("{:#?}", reparsed.tree().syntax()),
                     );
                     assert_eq!(reparsed.errors(), parsed.errors());
+                    same_hashes(&reparsed, &parsed);
                     assert!(Arc::ptr_eq(reparsed.tree.as_ref().unwrap().flat().source(), &shared));
                     let reparsed = outline.reparse_to(shared.clone(), Edition::CURRENT);
                     let parsed = SourceFile::parse_outline(shared.clone(), Edition::CURRENT);
@@ -930,6 +976,9 @@ enum Foo {
         let mut all: Vec<(String, String)> =
             cases.iter().map(|&(a, b)| (a.to_owned(), b.to_owned())).collect();
         all.push((format!("{long}a{long}"), format!("{long}bb{long}")));
+        let huge = "y".repeat(9000);
+        all.push((format!("{huge}a{huge}"), format!("{huge}bb{huge}")));
+        all.push((format!("{huge}é{long}"), format!("{huge}è{long}")));
         for (old, new) in &all {
             let (old, new) = (old.as_str(), new.as_str());
             let (delete, insert) = edit_between(old, new);
@@ -955,6 +1004,9 @@ enum Foo {
         }
         assert_eq!(edit_between(&format!("{long}a{long}"), &format!("{long}bb{long}")).0, {
             TextRange::at(TextSize::new(200), TextSize::new(1))
+        });
+        assert_eq!(edit_between(&format!("{huge}a{huge}"), &format!("{huge}bb{huge}")).0, {
+            TextRange::at(TextSize::new(9000), TextSize::new(1))
         });
     }
 

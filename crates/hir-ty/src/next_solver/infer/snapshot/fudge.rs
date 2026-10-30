@@ -32,12 +32,13 @@ fn const_vars_since_snapshot<'db>(
     let range = vars_since_snapshot(table, snapshot_var_len);
 
     (
-        range.clone(),
+        range.start..range.end,
         iter_idx_range(range)
             .map(|index| match table.probe_value(index) {
                 ConstVariableValue::Known { value: _ } => Span::Dummy,
                 ConstVariableValue::Unknown { span, universe: _ } => span,
             })
+            // alloc: only when fudging, one span per variable made in the snapshot.
             .collect(),
     )
 }
@@ -96,7 +97,7 @@ impl<'db> InferCtxt<'db> {
             // going to be popped, so we will have to
             // eliminate any references to them.
             let snapshot_vars = SnapshotVarData::new(self, variable_lengths);
-            Ok((snapshot_vars, self.resolve_vars_if_possible(value)))
+            Ok((snapshot_vars, self.deeply_resolve_ignoring_regions(value)))
         })?;
 
         // At this point, we need to replace any of the now-popped

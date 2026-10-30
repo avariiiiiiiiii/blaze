@@ -472,3 +472,9 @@ pub fn run_until_idle(
 
 #[cfg(test)]
 mod tests;
+
+/// Counts each test thread's allocations, for the allocation-budget tests
+/// (docs/v2/plan/goals/principles.md).
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

@@ -216,7 +216,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, ()> {
         let args = Args {
             name,
-            args: args.iter().map(|it| Ok(it.get(self)?.to_vec())).collect::<Result<'db, _>>()?,
+            args: args
+                .iter()
+                .map(|it| Ok(self.read_scalar(it.interval)?.to_vec()))
+                .collect::<Result<'db, _>>()?,
         };
         let arg = |i| args.arg(i);
         let state = |i| args.state(i);

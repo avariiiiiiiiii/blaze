@@ -38,6 +38,10 @@ pub mod server;
 pub mod session;
 pub mod units;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 pub use intent::{Edit, Edited, EditedItem, How, Target};
 
 use blaze_core::Conn;

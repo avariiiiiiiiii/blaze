@@ -460,7 +460,8 @@ impl Captures {
     }
 }
 
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
+#[cfg(not(feature = "shuttle"))]
 mod tests {
     use super::Captures;
     use crate::Revision;

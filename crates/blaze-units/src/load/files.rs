@@ -24,7 +24,7 @@ use std::rc::Rc;
 use blaze_ids::ContentId;
 use blaze_manifest::files::{FileKind, Files};
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
-use blaze_format::SchemaHash;
+use blaze_format::{FormatError, Persist, SchemaHash, Slice, Writer};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize, Serializer};
@@ -164,37 +164,265 @@ mod outside_bytes {
     }
 }
 
-/// A [`MountTable`] read where its bytes lie: what a file read looks its path up in, with
-/// nothing of the table copied.
-#[derive(Deserialize)]
-struct TableRef<'a> {
-    #[serde(borrow)]
-    mounts: Vec<MountRef<'a>>,
-    #[serde(borrow)]
-    outside: Vec<(&'a str, Raw<'a>)>,
-    #[serde(borrow)]
-    known: Vec<&'a str>,
+/// A mount table as a read looks a path up in it: three columns sorted by path, read by index.
+/// The view's is a [`MountRef`] over the bytes its [`Mounts`] query keeps; a fixed
+/// configuration's is its own `&MountTable`.
+trait Table<'a>: Copy {
+    fn mounts(self) -> usize;
+    /// Mount `at`'s path, as bytes: what a search compares.
+    fn mount_at(self, at: usize) -> &'a [u8];
+    /// Mount `at`: its path, origin and path under the origin's root.
+    fn mount(self, at: usize) -> (&'a str, Origin, &'a str);
+    fn outsides(self) -> usize;
+    fn outside_at(self, at: usize) -> &'a [u8];
+    fn outside(self, at: usize) -> &'a [u8];
+    fn knowns(self) -> usize;
+    fn known(self, at: usize) -> &'a [u8];
 }
 
-#[derive(Deserialize)]
-struct MountRef<'a> {
-    at: &'a str,
-    origin: Origin,
-    under: &'a str,
-}
-
-impl<'a> TableRef<'a> {
-    fn of(table: &'a MountTable) -> TableRef<'a> {
-        TableRef {
-            mounts: table.mounts.iter().map(|it| MountRef { at: &it.at, origin: it.origin, under: &it.under }).collect(),
-            outside: table.outside.iter().map(|(at, bytes)| (at.as_str(), Raw(Cow::Borrowed(bytes.as_slice())))).collect(),
-            known: table.known.iter().map(String::as_str).collect(),
-        }
+impl<'a> Table<'a> for &'a MountTable {
+    fn mounts(self) -> usize {
+        self.mounts.len()
     }
 
-    fn view(bytes: &'a [u8]) -> TableRef<'a> {
-        blaze_protocol::cbor::from_slice(bytes)
-            .unwrap_or_else(|error| panic!("a kept mount table does not decode: {error}"))
+    fn mount_at(self, at: usize) -> &'a [u8] {
+        self.mounts[at].at.as_bytes()
+    }
+
+    fn mount(self, at: usize) -> (&'a str, Origin, &'a str) {
+        let mount = &self.mounts[at];
+        (&mount.at, mount.origin, &mount.under)
+    }
+
+    fn outsides(self) -> usize {
+        self.outside.len()
+    }
+
+    fn outside_at(self, at: usize) -> &'a [u8] {
+        self.outside[at].0.as_bytes()
+    }
+
+    fn outside(self, at: usize) -> &'a [u8] {
+        &self.outside[at].1
+    }
+
+    fn knowns(self) -> usize {
+        self.known.len()
+    }
+
+    fn known(self, at: usize) -> &'a [u8] {
+        self.known[at].as_bytes()
+    }
+}
+
+/// The first of `0..len` for which `before` is false; `before` holds for a prefix of them.
+fn partition(len: usize, before: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, len);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match before(mid) {
+            true => low = mid + 1,
+            false => high = mid,
+        }
+    }
+    low
+}
+
+/// The index of `path` in a sorted column of `len` paths, `at` reading each.
+fn search<'a>(len: usize, path: &[u8], at: impl Fn(usize) -> &'a [u8]) -> Option<usize> {
+    let found = partition(len, |it| at(it) < path);
+    (found < len && at(found) == path).then_some(found)
+}
+
+/// The view's [`MountTable`] as its [`Mounts`] query keeps it, laid out so that a read finds a
+/// path by binary search where the bytes lie: nothing decoded or allocated, whatever the number
+/// of sources and index files mounted. All words are little-endian `u32`s:
+///
+/// - the head: how many mounts, files outside and known directories there are;
+/// - each mount ([`MOUNT`] bytes): its path and the path under its root as (offset, length) of
+///   the texts, its origin's tag (0 the view, 1 a root), a zero word, and the root's 32 bytes
+///   (zeros for the view);
+/// - each file outside: its path and its bytes as (offset, length);
+/// - each known directory: its path as (offset, length);
+/// - the texts and bytes, in that order; offsets count from the first byte of the head.
+pub(crate) struct MountIndex(Vec<u8>);
+
+const HEAD: usize = 12;
+const MOUNT: usize = 56;
+const OUTSIDE: usize = 16;
+const KNOWN: usize = 8;
+
+impl MountIndex {
+    pub(crate) fn of(table: &MountTable) -> MountIndex {
+        fn word(bytes: &mut Vec<u8>, value: usize) {
+            let value = u32::try_from(value).expect("a mount table under 4 GiB");
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let (mounts, outside, known) = (&table.mounts, &table.outside, &table.known);
+        let fixed = HEAD + mounts.len() * MOUNT + outside.len() * OUTSIDE + known.len() * KNOWN;
+        let texts = mounts.iter().map(|it| it.at.len() + it.under.len()).sum::<usize>()
+            + outside.iter().map(|(at, bytes)| at.len() + bytes.len()).sum::<usize>()
+            + known.iter().map(String::len).sum::<usize>();
+        let mut bytes = Vec::with_capacity(fixed + texts);
+        word(&mut bytes, mounts.len());
+        word(&mut bytes, outside.len());
+        word(&mut bytes, known.len());
+        let mut next = fixed;
+        let mut span = |bytes: &mut Vec<u8>, len: usize| {
+            word(bytes, next);
+            word(bytes, len);
+            next += len;
+        };
+        for mount in mounts {
+            span(&mut bytes, mount.at.len());
+            span(&mut bytes, mount.under.len());
+            let (tag, root) = match mount.origin {
+                Origin::View => (0, [0; 32]),
+                Origin::Root(root) => (1, root.0),
+            };
+            word(&mut bytes, tag);
+            word(&mut bytes, 0);
+            bytes.extend_from_slice(&root);
+        }
+        for (at, file) in outside {
+            span(&mut bytes, at.len());
+            span(&mut bytes, file.len());
+        }
+        for dir in known {
+            span(&mut bytes, dir.len());
+        }
+        debug_assert_eq!(bytes.len(), fixed);
+        for mount in mounts {
+            bytes.extend_from_slice(mount.at.as_bytes());
+            bytes.extend_from_slice(mount.under.as_bytes());
+        }
+        for (at, file) in outside {
+            bytes.extend_from_slice(at.as_bytes());
+            bytes.extend_from_slice(file);
+        }
+        for dir in known {
+            bytes.extend_from_slice(dir.as_bytes());
+        }
+        MountIndex(bytes)
+    }
+}
+
+impl Persist for MountIndex {
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo mount index 1");
+    type Ref<'a> = MountRef<'a>;
+
+    fn write(&self, out: &mut Writer) -> u64 {
+        let data = out.push_slice::<u8>(&self.0);
+        let at = out.next::<Slice<u8>>();
+        out.push(&Slice::<u8>::between(at, data, self.0.len()))
+    }
+
+    fn read(buffer: &[u8]) -> Result<MountRef<'_>, FormatError> {
+        let slice = blaze_format::open_as::<Slice<u8>>(buffer, MountIndex::SCHEMA)?;
+        MountRef::new(slice.follow(buffer)?)
+    }
+}
+
+/// A [`MountIndex`] read in place. Its head is checked when it is opened; a span past the end
+/// or a path that is not UTF-8 is a bug of the writer, which only [`MountIndex::of`] is, and
+/// panics naming it, as [`crate::query::CborRef::get`] does.
+#[derive(Clone, Copy)]
+pub(crate) struct MountRef<'a> {
+    bytes: &'a [u8],
+    mounts: usize,
+    outside: usize,
+    known: usize,
+}
+
+impl<'a> MountRef<'a> {
+    fn new(bytes: &'a [u8]) -> Result<MountRef<'a>, FormatError> {
+        let short = FormatError::Invalid { at: 0, what: "a mount index shorter than its head" };
+        let count = |at: usize| bytes.get(at..at + 4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]) as usize);
+        let (Some(mounts), Some(outside), Some(known)) = (count(0), count(4), count(8)) else { return Err(short) };
+        let fixed = HEAD + mounts * MOUNT + outside * OUTSIDE + known * KNOWN;
+        if fixed > bytes.len() {
+            return Err(short);
+        }
+        Ok(MountRef { bytes, mounts, outside, known })
+    }
+
+    fn word(self, at: usize) -> usize {
+        let it = &self.bytes[at..at + 4];
+        u32::from_le_bytes([it[0], it[1], it[2], it[3]]) as usize
+    }
+
+    /// The bytes of the (offset, length) at `at`.
+    fn span(self, at: usize) -> &'a [u8] {
+        let bytes: &'a [u8] = self.bytes;
+        let (start, len) = (self.word(at), self.word(at + 4));
+        bytes.get(start..start + len).unwrap_or_else(|| panic!("a kept mount index names bytes past its end"))
+    }
+
+    fn text(self, at: usize) -> &'a str {
+        std::str::from_utf8(self.span(at)).unwrap_or_else(|_| panic!("a kept mount index has a path that is not UTF-8"))
+    }
+
+    fn mount_record(self, at: usize) -> usize {
+        HEAD + at * MOUNT
+    }
+
+    fn outside_record(self, at: usize) -> usize {
+        HEAD + self.mounts * MOUNT + at * OUTSIDE
+    }
+
+    fn known_record(self, at: usize) -> usize {
+        HEAD + self.mounts * MOUNT + self.outside * OUTSIDE + at * KNOWN
+    }
+
+    /// The mount at `at` exactly, owned.
+    pub(crate) fn get(self, at: &str) -> Option<Mount> {
+        let found = search(self.mounts, at.as_bytes(), |it| self.mount_at(it))?;
+        let (path, origin, under) = self.mount(found);
+        Some(Mount { at: path.to_owned(), origin, under: under.to_owned() })
+    }
+}
+
+impl<'a> Table<'a> for MountRef<'a> {
+    fn mounts(self) -> usize {
+        self.mounts
+    }
+
+    fn mount_at(self, at: usize) -> &'a [u8] {
+        self.span(self.mount_record(at))
+    }
+
+    fn mount(self, at: usize) -> (&'a str, Origin, &'a str) {
+        let record = self.mount_record(at);
+        let origin = match self.word(record + 16) {
+            0 => Origin::View,
+            _ => {
+                let bytes: &'a [u8] = self.bytes;
+                let mut root = [0; 32];
+                root.copy_from_slice(&bytes[record + 24..record + MOUNT]);
+                Origin::Root(ContentId(root))
+            }
+        };
+        (self.text(record), origin, self.text(record + 8))
+    }
+
+    fn outsides(self) -> usize {
+        self.outside
+    }
+
+    fn outside_at(self, at: usize) -> &'a [u8] {
+        self.span(self.outside_record(at))
+    }
+
+    fn outside(self, at: usize) -> &'a [u8] {
+        self.span(self.outside_record(at) + 8)
+    }
+
+    fn knowns(self) -> usize {
+        self.known
+    }
+
+    fn known(self, at: usize) -> &'a [u8] {
+        self.span(self.known_record(at))
     }
 }
 
@@ -205,17 +433,17 @@ pub(crate) struct Mounts;
 impl Query for Mounts {
     const KIND: QueryKind = QueryKind(0x6012);
     const NAME: &'static str = "cargo mounts";
-    const PRODUCER: ContentId = producer("blaze v2 cargo mounts 1");
+    const PRODUCER: ContentId = producer("blaze v2 cargo mounts 2");
     type Key = ();
-    type Value = Cbor<MountTable>;
+    type Value = MountIndex;
 
     fn input(key: &()) -> ContentId {
         key_input("blaze v2 cargo mounts key 1", key)
     }
 
-    fn execute(cx: &mut Cx<'_>, _: &()) -> Result<Cbor<MountTable>, Cancelled> {
+    fn execute(cx: &mut Cx<'_>, _: &()) -> Result<MountIndex, Cancelled> {
         let configured = cx.get::<Invocation>(&())?.get();
-        Ok(Cbor(configured.mounts))
+        Ok(MountIndex::of(&configured.mounts))
     }
 }
 
@@ -234,13 +462,13 @@ impl Query for LoadFile {
     }
 
     fn execute(cx: &mut Cx<'_>, path: &String) -> Result<Cbor<Found<Vec<u8>>>, Cancelled> {
-        let table = cx.get::<Mounts>(&())?.bytes();
-        Ok(Cbor(file_through(cx, &TableRef::view(table), path, true)?))
+        let table = cx.get::<Mounts>(&())?;
+        Ok(Cbor(file_through(cx, table, path, true)?))
     }
 }
 
-fn file_through(cx: &mut Cx<'_>, table: &TableRef<'_>, path: &str, view: bool) -> Result<Found<Vec<u8>>, Cancelled> {
-    Ok(match locate(&table.mounts, path) {
+fn file_through<'a>(cx: &mut Cx<'_>, table: impl Table<'a>, path: &'a str, view: bool) -> Result<Found<Vec<u8>>, Cancelled> {
+    Ok(match locate(table, path) {
         Some((Origin::View, under)) if view => match cx.file(&under)? {
             Some(file) => Found::Here(file.bytes.to_vec()),
             None => Found::Absent,
@@ -250,13 +478,10 @@ fn file_through(cx: &mut Cx<'_>, table: &TableRef<'_>, path: &str, view: bool) -
             Some(file) => Found::Here(file.bytes.to_vec()),
             None => Found::Absent,
         },
-        None => match table.outside.binary_search_by(|(at, _)| (*at).cmp(path)) {
-            Ok(at) => {
-                let (_, Raw(bytes)) = &table.outside[at];
-                Found::Here(bytes.to_vec())
-            }
-            Err(_) if known_file(&table.known, path) => Found::Absent,
-            Err(_) => Found::Unmounted,
+        None => match search(table.outsides(), path.as_bytes(), |at| table.outside_at(at)) {
+            Some(at) => Found::Here(table.outside(at).to_vec()),
+            None if known_file(table, path) => Found::Absent,
+            None => Found::Unmounted,
         },
     })
 }
@@ -276,8 +501,8 @@ impl Query for LoadDir {
     }
 
     fn execute(cx: &mut Cx<'_>, path: &String) -> Result<Cbor<Found<Vec<(String, bool)>>>, Cancelled> {
-        let table = cx.get::<Mounts>(&())?.bytes();
-        Ok(Cbor(dir_through(cx, &TableRef::view(table), path, true)?))
+        let table = cx.get::<Mounts>(&())?;
+        Ok(Cbor(dir_through(cx, table, path, true)?))
     }
 }
 
@@ -291,8 +516,8 @@ fn sorted(names: &[(String, bool)]) -> Found<Names> {
     Found::Here(names)
 }
 
-fn dir_through(cx: &mut Cx<'_>, table: &TableRef<'_>, path: &str, view: bool) -> Result<Found<Names>, Cancelled> {
-    Ok(match locate(&table.mounts, path) {
+fn dir_through<'a>(cx: &mut Cx<'_>, table: impl Table<'a>, path: &'a str, view: bool) -> Result<Found<Names>, Cancelled> {
+    Ok(match locate(table, path) {
         Some((Origin::View, under)) if view => match cx.dir(&under)? {
             Some(names) => sorted(names),
             None => Found::Absent,
@@ -302,28 +527,30 @@ fn dir_through(cx: &mut Cx<'_>, table: &TableRef<'_>, path: &str, view: bool) ->
             Some(names) => sorted(names),
             None => Found::Absent,
         },
-        None if table.known.binary_search(&path).is_ok() => {
+        None if search(table.knowns(), path.as_bytes(), |at| table.known(at)).is_some() => {
             let prefix: Cow<'_, str> = if path == "/" { Cow::Borrowed("/") } else { Cow::Owned(format!("{path}/")) };
+            let prefix = prefix.as_bytes();
             let mut names: FxHashMap<&str, bool> = FxHashMap::default();
-            let first = table.mounts.partition_point(|it| it.at < &*prefix);
-            for mount in table.mounts[first..].iter().take_while(|it| it.at.starts_with(&*prefix)) {
-                let rest = &mount.at[prefix.len()..];
+            let first = partition(table.mounts(), |at| table.mount_at(at) < prefix);
+            for at in (first..table.mounts()).take_while(|&at| table.mount_at(at).starts_with(prefix)) {
+                let (mount_at, origin, mount_under) = table.mount(at);
+                let rest = &mount_at[prefix.len()..];
                 match rest.split_once('/') {
                     Some((dir, _)) => names.insert(dir, true),
                     // A mount of one file (a sparse index's) is a file of the directory.
                     None => {
-                        let dir = match mount.origin {
-                            Origin::View if view => cx.file(mount.under)?.is_none(),
+                        let dir = match origin {
+                            Origin::View if view => cx.file(mount_under)?.is_none(),
                             Origin::View => continue,
-                            Origin::Root(root) => cx.file_at(root, mount.under)?.is_none(),
+                            Origin::Root(root) => cx.file_at(root, mount_under)?.is_none(),
                         };
                         names.insert(rest, dir)
                     }
                 };
             }
-            let first = table.outside.partition_point(|(at, _)| *at < &*prefix);
-            for (at, _) in table.outside[first..].iter().take_while(|(at, _)| at.starts_with(&*prefix)) {
-                let rest = &at[prefix.len()..];
+            let first = partition(table.outsides(), |at| table.outside_at(at) < prefix);
+            for at in (first..table.outsides()).take_while(|&at| table.outside_at(at).starts_with(prefix)) {
+                let Ok(rest) = std::str::from_utf8(&table.outside_at(at)[prefix.len()..]) else { continue };
                 match rest.split_once('/') {
                     Some((dir, _)) => names.insert(dir, true),
                     None => names.insert(rest, false),
@@ -360,7 +587,7 @@ impl Query for FixedFile {
     }
 
     fn execute(cx: &mut Cx<'_>, key: &FixedPath) -> Result<Cbor<Found<Vec<u8>>>, Cancelled> {
-        Ok(Cbor(file_through(cx, &TableRef::of(&key.table), &key.path, false)?))
+        Ok(Cbor(file_through(cx, &key.table, &key.path, false)?))
     }
 }
 
@@ -378,7 +605,7 @@ impl Query for FixedDir {
     }
 
     fn execute(cx: &mut Cx<'_>, key: &FixedPath) -> Result<Cbor<Found<Names>>, Cancelled> {
-        Ok(Cbor(dir_through(cx, &TableRef::of(&key.table), &key.path, false)?))
+        Ok(Cbor(dir_through(cx, &key.table, &key.path, false)?))
     }
 }
 
@@ -396,18 +623,18 @@ pub(crate) fn read_dir(cx: &mut Cx<'_>, path: &str) -> Result<Found<Vec<(String,
 /// sorted by `at`, so the longest is the first of `path` and the directories above it, nearest
 /// first, that one is at: a binary search each, and nothing allocated unless the mount is
 /// under a directory of its root.
-fn locate<'a>(mounts: &[MountRef<'a>], path: &'a str) -> Option<(Origin, Cow<'a, str>)> {
+fn locate<'a>(table: impl Table<'a>, path: &'a str) -> Option<(Origin, Cow<'a, str>)> {
     let mut at = path;
     loop {
-        if let Ok(found) = mounts.binary_search_by(|it| it.at.cmp(at)) {
-            let mount = &mounts[found];
-            let rest = under(mount.at, path)?;
-            let joined = match (mount.under, rest) {
+        if let Some(found) = search(table.mounts(), at.as_bytes(), |it| table.mount_at(it)) {
+            let (mount_at, origin, mount_under) = table.mount(found);
+            let rest = under(mount_at, path)?;
+            let joined = match (mount_under, rest) {
                 ("", rest) => Cow::Borrowed(rest),
                 (under, "") => Cow::Borrowed(under),
                 (under, rest) => Cow::Owned(format!("{under}/{rest}")),
             };
-            return Some((mount.origin, joined));
+            return Some((origin, joined));
         }
         at = match at.rsplit_once('/') {
             Some(("", _)) if at != "/" => "/",
@@ -432,17 +659,15 @@ fn under<'p>(at: &str, path: &'p str) -> Option<&'p str> {
 
 /// Whether `path` is a file of a known directory, or of a known directory's `.cargo`: `known`
 /// is sorted.
-fn known_file(known: &[&str], path: &str) -> bool {
+fn known_file<'a>(table: impl Table<'a>, path: &str) -> bool {
+    let known = |dir: &str| search(table.knowns(), dir.as_bytes(), |at| table.known(at)).is_some();
     let Some((dir, _)) = path.rsplit_once('/') else { return false };
     let dir = if dir.is_empty() { "/" } else { dir };
-    if known.binary_search(&dir).is_ok() {
+    if known(dir) {
         return true;
     }
     match dir.rsplit_once('/') {
-        Some((above, ".cargo")) => {
-            let above = if above.is_empty() { "/" } else { above };
-            known.binary_search(&above).is_ok()
-        }
+        Some((above, ".cargo")) => known(if above.is_empty() { "/" } else { above }),
         _ => false,
     }
 }
@@ -552,16 +777,18 @@ pub(crate) enum Need {
 }
 
 /// A snapshot's paths as sorted columns, each with whether this run used it: a read is a
-/// binary search and a flag, and nothing is copied until the run ends.
+/// binary search and a flag, and nothing is copied until the run ends. What the run added
+/// while it ran ([`Reads`]) sits beside them in `late`, found by one Fx probe.
 struct Column<T> {
     paths: Vec<String>,
     found: Vec<Found<T>>,
     used: Vec<bool>,
+    late: FxHashMap<String, (Found<T>, bool)>,
 }
 
 impl<T> Default for Column<T> {
     fn default() -> Self {
-        Column { paths: Vec::new(), found: Vec::new(), used: Vec::new() }
+        Column { paths: Vec::new(), found: Vec::new(), used: Vec::new(), late: FxHashMap::default() }
     }
 }
 
@@ -569,27 +796,46 @@ impl<T> Column<T> {
     fn of(map: BTreeMap<String, Found<T>>) -> Column<T> {
         let (paths, found): (Vec<String>, Vec<Found<T>>) = map.into_iter().unzip();
         let used = vec![false; paths.len()];
-        Column { paths, found, used }
+        Column { paths, found, used, late: FxHashMap::default() }
     }
 
     fn find(&self, path: &str) -> Option<usize> {
         self.paths.binary_search_by(|it| it.as_str().cmp(path)).ok()
     }
 
-    fn use_at(&mut self, at: usize) -> &Found<T> {
-        self.used[at] = true;
-        &self.found[at]
+    fn has(&self, path: &str) -> bool {
+        self.find(path).is_some() || self.late.contains_key(path)
+    }
+
+    /// `path`'s entry, marked used.
+    fn get(&mut self, path: &str) -> Option<&Found<T>> {
+        if let Some(at) = self.find(path) {
+            self.used[at] = true;
+            return Some(&self.found[at]);
+        }
+        let (found, used) = self.late.get_mut(path)?;
+        *used = true;
+        Some(found)
+    }
+
+    /// `found` at `path`, unless the column has `path` already.
+    fn add(&mut self, path: String, found: Found<T>) {
+        if self.find(&path).is_none() {
+            self.late.entry(path).or_insert((found, false));
+        }
     }
 
     /// Every path, for the next run to start from.
     fn all(self) -> BTreeMap<String, Found<T>> {
-        self.paths.into_iter().zip(self.found).collect()
+        let late = self.late.into_iter().map(|(path, (found, _))| (path, found));
+        self.paths.into_iter().zip(self.found).chain(late).collect()
     }
 
     /// The paths this run used.
     fn used(self) -> BTreeMap<String, Found<T>> {
         let used = self.used;
-        self.paths.into_iter().zip(self.found).zip(used).filter_map(|(it, used)| used.then_some(it)).collect()
+        let late = self.late.into_iter().filter_map(|(path, (found, used))| used.then_some((path, found)));
+        self.paths.into_iter().zip(self.found).zip(used).filter_map(|(it, used)| used.then_some(it)).chain(late).collect()
     }
 }
 
@@ -606,19 +852,29 @@ impl State {
     }
 
     fn file(&mut self, path: &str) -> Option<&Found<Vec<u8>>> {
-        let Some(at) = self.files.find(path) else {
+        if !self.files.has(path) {
             self.missed.insert(Need::File(path.to_owned()));
             return None;
-        };
-        Some(self.files.use_at(at))
+        }
+        self.files.get(path)
     }
 
     fn dir(&mut self, path: &str) -> Option<&Found<Names>> {
-        let Some(at) = self.dirs.find(path) else {
+        if !self.dirs.has(path) {
             self.missed.insert(Need::Dir(path.to_owned()));
             return None;
-        };
-        Some(self.dirs.use_at(at))
+        }
+        self.dirs.get(path)
+    }
+
+    /// What `snapshot` has that this run's does not.
+    fn add(&mut self, snapshot: Snapshot) {
+        for (path, found) in snapshot.files {
+            self.files.add(path, found);
+        }
+        for (path, found) in snapshot.dirs {
+            self.dirs.add(path, found);
+        }
     }
 
     /// What the run missed, each once, in order.
@@ -764,20 +1020,46 @@ impl Fill<'_> {
     }
 }
 
+/// What a step of [`run_over`] reads ahead: a file it knows it will read, put into its snapshot
+/// through the database before blaze-manifest asks for it, so asking does not miss and the step
+/// does not run again for it. A `Cargo.toml` comes with what its own `ManifestQuery` read (its
+/// targets' directories), as a miss of it would.
+pub(crate) struct Reads<'r> {
+    state: Rc<RefCell<State>>,
+    fill: &'r Fill<'r>,
+}
+
+impl Reads<'_> {
+    /// `path`, read now unless the snapshot has it.
+    pub fn file(&self, cx: &mut Cx<'_>, path: &Path) -> Result<(), Cancelled> {
+        let Some(path) = normal_ref(path) else { return Ok(()) };
+        if self.state.borrow().files.has(&path) {
+            return Ok(());
+        }
+        let mut read = Snapshot::default();
+        self.fill.read(cx, &Need::File(path.into_owned()), &mut read)?;
+        self.state.borrow_mut().add(read);
+        Ok(())
+    }
+}
+
 /// Runs `step` over a snapshot that starts as `base`, reading what it misses as `fill` says and
 /// running it again, until a run misses nothing. Returns that run's answer and what it used.
-/// `step` may ask queries itself; its `Files` is a fresh handle on the snapshot each run.
+/// `step` may ask queries itself; its `Files` is a fresh handle on the snapshot each run, and
+/// what it reads ahead through [`Reads`] is never a miss.
 pub(crate) fn run_over<'db, R>(
     cx: &mut Cx<'db>,
     base: Snapshot,
     fill: &Fill<'_>,
-    mut step: impl FnMut(&mut Cx<'db>, Rc<dyn Files>) -> Result<R, Cancelled>,
+    mut step: impl FnMut(&mut Cx<'db>, Rc<dyn Files>, &Reads<'_>) -> Result<R, Cancelled>,
 ) -> Result<(R, Snapshot), Cancelled> {
     let mut snapshot = base;
     loop {
         let state = Rc::new(RefCell::new(State::of(snapshot)));
         let files: Rc<dyn Files> = Rc::new(Snap(state.clone()));
-        let answer = step(cx, files)?;
+        let reads = Reads { state: state.clone(), fill };
+        let answer = step(cx, files, &reads)?;
+        drop(reads);
         let mut state = std::mem::take(&mut *state.borrow_mut());
         let missed = state.take_missed();
         if missed.is_empty() {
@@ -809,39 +1091,60 @@ mod tests {
         ];
         mounts.sort();
         let table = MountTable { mounts, outside: Vec::new(), known: Vec::new() };
-        let table = TableRef::of(&table);
-        let at = |path: &'static str| locate(&table.mounts, path).map(|(origin, under)| (origin, under.into_owned()));
-        assert_eq!(at("/w/Cargo.toml"), Some((Origin::View, "Cargo.toml".to_owned())));
-        assert_eq!(at("/w"), Some((Origin::View, String::new())));
-        assert_eq!(at("/w/vendor/x/src/lib.rs"), Some((lib, "x-1.0/src/lib.rs".to_owned())));
-        assert_eq!(at("/w/vendor/x"), Some((lib, "x-1.0".to_owned())));
-        assert_eq!(at("/w/vendor/xy"), Some((Origin::View, "vendor/xy".to_owned())));
-        assert_eq!(at("/w2/a"), Some((Origin::View, "other/a".to_owned())));
-        assert_eq!(at("/wx/a"), None, "a mount is a directory, not a prefix");
-        assert_eq!(at("/"), None);
+        longest_mounts("the table", &table, lib);
+        let kept = kept(&table);
+        longest_mounts("its index", <MountIndex as Persist>::read(&kept).unwrap(), lib);
 
         let root = MountTable { mounts: vec![mount("/", lib, "r")], outside: Vec::new(), known: Vec::new() };
-        let root = TableRef::of(&root);
-        assert_eq!(locate(&root.mounts, "/a/b").map(|(_, it)| it.into_owned()), Some("r/a/b".to_owned()));
-        assert_eq!(locate(&root.mounts, "/").map(|(_, it)| it.into_owned()), Some("r".to_owned()));
+        assert_eq!(locate(&root, "/a/b").map(|(_, it)| it.into_owned()), Some("r/a/b".to_owned()));
+        assert_eq!(locate(&root, "/").map(|(_, it)| it.into_owned()), Some("r".to_owned()));
     }
 
-    /// A mount table written and read back borrows its strings and bytes; file bytes are one
-    /// byte string.
+    fn longest_mounts<'a>(what: &str, table: impl Table<'a>, lib: Origin) {
+        let at = |path: &'a str| locate(table, path).map(|(origin, under)| (origin, under.into_owned()));
+        assert_eq!(at("/w/Cargo.toml"), Some((Origin::View, "Cargo.toml".to_owned())), "{what}");
+        assert_eq!(at("/w"), Some((Origin::View, String::new())), "{what}");
+        assert_eq!(at("/w/vendor/x/src/lib.rs"), Some((lib, "x-1.0/src/lib.rs".to_owned())), "{what}");
+        assert_eq!(at("/w/vendor/x"), Some((lib, "x-1.0".to_owned())), "{what}");
+        assert_eq!(at("/w/vendor/xy"), Some((Origin::View, "vendor/xy".to_owned())), "{what}");
+        assert_eq!(at("/w2/a"), Some((Origin::View, "other/a".to_owned())), "{what}");
+        assert_eq!(at("/wx/a"), None, "{what}: a mount is a directory, not a prefix");
+        assert_eq!(at("/"), None, "{what}");
+    }
+
+    /// `table` as the database keeps the [`Mounts`] query's value.
+    fn kept(table: &MountTable) -> blaze_format::Aligned {
+        blaze_format::Aligned::copy_from(&blaze_format::to_bytes(&MountIndex::of(table)))
+    }
+
+    /// The index has every mount, file and directory of its table, read where its bytes lie.
     #[test]
     fn a_table_is_read_in_place() {
+        let library = Origin::Root(ContentId([9; 32]));
         let table = MountTable {
-            mounts: vec![mount("/w", Origin::View, "")],
+            mounts: vec![mount("/rustc/0123/library", library, ""), mount("/w", Origin::View, "")],
             outside: vec![("/home/u/.cargo/config.toml".to_owned(), b"[build]\n".to_vec())],
-            known: vec!["/home/u".to_owned()],
+            known: vec!["/".to_owned(), "/home/u".to_owned()],
         };
-        let bytes = blaze_protocol::cbor::to_vec(&table).unwrap();
-        let view = TableRef::view(&bytes);
-        assert_eq!(view.mounts[0].at, "/w");
-        let (_, Raw(bytes)) = &view.outside[0];
-        assert!(matches!(bytes, Cow::Borrowed(b"[build]\n")));
-        assert_eq!(view.known, ["/home/u"]);
-        assert_eq!(blaze_protocol::cbor::from_slice::<MountTable>(&bytes).unwrap(), table);
+        let kept = kept(&table);
+        let index = <MountIndex as Persist>::read(&kept).unwrap();
+        assert_eq!(index.get("/w"), Some(table.mounts[1].clone()));
+        assert_eq!(index.get("/rustc/0123/library"), Some(table.mounts[0].clone()));
+        assert_eq!(index.get("/rustc"), None);
+        assert_eq!((index.mounts(), index.outsides(), index.knowns()), (2, 1, 2));
+        assert_eq!(index.outside_at(0), b"/home/u/.cargo/config.toml");
+        assert_eq!(index.outside(0), b"[build]\n");
+        assert!(kept.as_ptr_range().contains(&index.outside(0).as_ptr()), "the bytes are the kept bytes");
+        assert_eq!(index.known(1), b"/home/u");
+        assert!(known_file(index, "/home/u/.cargo/config"));
+        assert!(!known_file(index, "/etc/x"));
+
+        let empty = MountTable { mounts: Vec::new(), outside: Vec::new(), known: Vec::new() };
+        let kept = self::kept(&empty);
+        let index = <MountIndex as Persist>::read(&kept).unwrap();
+        assert_eq!((index.mounts(), index.outsides(), index.knowns()), (0, 0, 0));
+        assert_eq!(locate(index, "/w/a"), None);
+        assert!(MountRef::new(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_err(), "a head naming a mount it lacks");
 
         let file = Found::Here(vec![7u8; 64]);
         let written = blaze_protocol::cbor::to_vec(&file).unwrap();
@@ -859,14 +1162,35 @@ mod tests {
 
     #[test]
     fn outside_the_mounts_only_known_directories_have_files() {
-        let mut known = vec!["/home/u/.cargo", "/home/u", "/"];
+        let mut known: Vec<String> = ["/home/u/.cargo", "/home/u", "/"].map(str::to_owned).to_vec();
         known.sort();
-        assert!(known_file(&known, "/home/u/.cargo/config.toml"));
-        assert!(known_file(&known, "/home/u/.cargo/config"));
-        assert!(known_file(&known, "/.cargo/config.toml"));
-        assert!(known_file(&known, "/Cargo.toml"));
-        assert!(!known_file(&known, "/etc/passwd/x"));
-        assert!(!known_file(&known, "/home/u/.cargo/registry/src/x/Cargo.toml"));
+        let table = MountTable { mounts: Vec::new(), outside: Vec::new(), known };
+        assert!(known_file(&table, "/home/u/.cargo/config.toml"));
+        assert!(known_file(&table, "/home/u/.cargo/config"));
+        assert!(known_file(&table, "/.cargo/config.toml"));
+        assert!(known_file(&table, "/Cargo.toml"));
+        assert!(!known_file(&table, "/etc/passwd/x"));
+        assert!(!known_file(&table, "/home/u/.cargo/registry/src/x/Cargo.toml"));
+    }
+
+    /// A read of a path through the view's mounts costs a binary search per directory above
+    /// it, in the kept bytes: nothing allocated, however many sources are mounted.
+    #[test]
+    fn a_lookup_allocates_nothing() {
+        let mut mounts: Vec<Mount> = (0..2000)
+            .map(|at| mount(&format!("/c/registry/src/index/pkg-{at:04}-1.0.0"), Origin::Root(ContentId([3; 32])), ""))
+            .collect();
+        mounts.push(mount("/w", Origin::View, ""));
+        mounts.sort();
+        let table = MountTable { mounts, outside: Vec::new(), known: vec!["/".to_owned()] };
+        let kept = kept(&table);
+        let index = <MountIndex as Persist>::read(&kept).unwrap();
+        let path = "/c/registry/src/index/pkg-1234-1.0.0/src/lib.rs";
+        let found = blaze_alloc_count::assert_at_most(0, "a mount lookup", || locate(index, path));
+        assert_eq!(found, Some((Origin::Root(ContentId([3; 32])), Cow::Borrowed("src/lib.rs"))));
+        let found = blaze_alloc_count::assert_at_most(0, "a mount lookup", || locate(index, "/w/Cargo.toml"));
+        assert_eq!(found, Some((Origin::View, Cow::Borrowed("Cargo.toml"))));
+        assert!(blaze_alloc_count::assert_at_most(0, "a known file", || known_file(index, "/Cargo.toml")));
     }
 
     #[test]

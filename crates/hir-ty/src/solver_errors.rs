@@ -5,6 +5,8 @@
 //!
 //! [`NextSolverError`]: crate::next_solver::fulfill::NextSolverError
 
+use hir_def::TraitId;
+use intern::Symbol;
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_type_ir::{
     ClausePolarity, ClosureKind, Interner,
@@ -15,8 +17,8 @@ use rustc_type_ir::{
 use crate::{
     Span,
     next_solver::{
-        ClauseKind, DbInterner, PolyTraitClause, PredicateKind, StoredTraitRef, TraitClause,
-        TyKind,
+        AnyImplId, ClauseKind, DbInterner, PolyTraitClause, PredicateKind, StoredGenericArg,
+        StoredGenericArgs, StoredTraitRef, StoredTy, TraitClause, TyKind,
         infer::{
             InferCtxt,
             errors::{FulfillmentError, FulfillmentErrorCode},
@@ -47,6 +49,96 @@ pub enum SolverDiagnosticKind {
         #[type_visitable(ignore)]
         is_async: bool,
     },
+}
+
+/// Which "type annotations needed" error an undecided type gives: rustc's
+/// `TypeAnnotationNeeded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypeAnnotationNeeded {
+    /// E0282: the type itself is undecided.
+    E0282,
+    /// E0283: a trait bound on it could be met in more than one way.
+    E0283,
+    /// E0284: another goal on it could be.
+    E0284,
+}
+
+/// A goal the solver could neither prove nor refute when inference was done, as rustc's
+/// `maybe_report_ambiguity` reads it, its inference variables made `{unknown}`. A trait is its
+/// id and its arguments, the self type first; an alias is the type or constant it names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
+pub enum AmbiguousGoal {
+    /// `args[0]: Trait<args[1..]>`, or `!Trait` when negative.
+    Trait {
+        #[type_visitable(ignore)]
+        trait_: TraitId,
+        args: StoredGenericArgs,
+        #[type_visitable(ignore)]
+        polarity: ClausePolarity,
+    },
+    /// `args[0]: [const] Trait<args[1..]>` (`maybe_const`) or `const Trait`.
+    HostEffect {
+        #[type_visitable(ignore)]
+        trait_: TraitId,
+        args: StoredGenericArgs,
+        #[type_visitable(ignore)]
+        maybe_const: bool,
+    },
+    /// `alias == term`.
+    Projection { alias: StoredGenericArg, term: StoredGenericArg },
+    /// What `alias` normalizes to, `term` an inference variable.
+    NormalizesTo { alias: StoredGenericArg, term: StoredGenericArg },
+    WellFormed { term: StoredGenericArg },
+    /// `a <: b`.
+    Subtype { a: StoredTy, b: StoredTy },
+    /// `a` coerces to `b`.
+    Coerce { a: StoredTy, b: StoredTy },
+    ConstEvaluatable { ct: StoredGenericArg },
+    ConstArgHasType { ct: StoredGenericArg, ty: StoredTy },
+    ConstEquate { a: StoredGenericArg, b: StoredGenericArg },
+    DynCompatible {
+        #[type_visitable(ignore)]
+        trait_: TraitId,
+    },
+    /// `#[unstable_feature_bound(feature)]` of an impl: rustc gives the feature's error.
+    UnstableFeature {
+        #[type_visitable(ignore)]
+        feature: Symbol,
+    },
+    /// A region or type outlives a region.
+    Outlives,
+    /// rustc's `PredicateKind::Ambiguous`.
+    Ambiguous,
+}
+
+/// An `impl` or where clause that could meet an ambiguous trait goal: rustc's
+/// `CandidateSource`, as `annotate_source_of_ambiguity` lists them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
+pub enum AmbiguityCandidate {
+    Impl(#[type_visitable(ignore)] AnyImplId),
+    /// A where clause of the body's owner, `args[0]: trait_<args[1..]>`.
+    ParamEnv {
+        #[type_visitable(ignore)]
+        trait_: TraitId,
+        args: StoredGenericArgs,
+    },
+}
+
+/// A goal of an ambiguity error and the candidates rustc lists for it: those that could apply
+/// when there are two to nine of them and an argument of the trait is known, else none.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
+pub struct AmbiguityNote {
+    pub goal: AmbiguousGoal,
+    pub candidates: Vec<AmbiguityCandidate>,
+}
+
+/// What an ambiguity error (E0282, E0283, E0284 from a pending goal) reports: the goal, and
+/// the goals ambiguous for the same inference variable at the same place, which rustc merges
+/// into it as notes ("the type must also implement `Tr`", "cannot satisfy `..`").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
+pub struct Ambiguity {
+    pub primary: AmbiguityNote,
+    pub related: Vec<AmbiguityNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]

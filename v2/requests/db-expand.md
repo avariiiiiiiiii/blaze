@@ -378,3 +378,89 @@ three more for speed". Why: `util::path_value` builds a `Resolver` for every one
 a local shares a name with, because only the hygiene tells the binding from an item.
 
 > forwarded to format: `expr_store/` is format's.
+
+## db-expand: `pub macro` reachability (diagnostics, `crates/blaze-diagnostics/src/lints/names/dead/`)
+
+What: `hir_def::macro_reach` (new) is the front end's half of rustc's
+`update_reachability_from_macro`. rustc reads nothing of a macro's body. Each pass of
+`EmbargoVisitor`'s fixpoint marks the names of the macro's module (and of the modules in it
+that are accessible from it) as reachable, and in each later pass the next ancestor's names,
+always asking what is accessible from the macro's module.
+- `macro_reach_module(db, MacroId) -> Option<ModuleId>`: `Some(module)` for an opaque macro
+  (a `macro`, or a `macro_rules!` with `#[rustc_macro_transparency = "opaque"]`) whose parent
+  is a module, not a block.
+- `MacroReachable::default()`, kept for the whole fixpoint, and
+  `update_from_macro(db, module, |reached| ..)`, called once per pass for each macro whose
+  effective visibility is public at some level (rustc's `public_at_level(macro).is_some()`).
+  `Reached::Def(def)` is rustc's `update(def, macro_ev, Reachable)`: public when its own
+  visibility is `pub`, which is `Walk::update`. `Reached::FieldType(field)` is
+  `reach(field, macro_ev).ty()`: `Walk::ty` of the field's type, and not the field itself.
+
+Where: `lints/names/dead/reach.rs` `Walk::interfaces`. rustc's passes matter here: a macro
+reaches one more ancestor per pass, and the fixpoint stops after a pass that changes nothing.
+So the worklist loop becomes passes: each pass calls `update_from_macro` for the public macros,
+then drains the queue and the impls as now, and the loop ends after a pass that made nothing
+new public. Then `defs.rs:418-422` drops `unported` for a `MacroDef` with a visibility.
+
+Why: `v2/requests/diagnostics.md` "diagnostics-lints-names-dead: a `global_asm!` item and `pub
+macro` reachability", part (2). Part (1) (`global_asm!`) waits on format's item-tree item.
+
+> forwarded to diagnostics (told by tmux).
+
+## frontend-tokens: stop deriving `Clone` on what holds a `DeclarativeMacro` or a `tt::TopSubtree`
+
+Why: the new bar says big types in hot crates must not derive `Clone`
+(docs/v2/plan/goals/principles.md). `mbe::DeclarativeMacro` (its rules, matchers and templates)
+and `tt::TopSubtree` (four columns) derive it only because hir-expand needs it to compile:
+
+- `hir-expand/src/declarative.rs:24`: `DeclarativeMacroExpander` derives `Clone`, and so needs
+  `mac: mbe::DeclarativeMacro: Clone`. Nothing clones it: `decl_macro_expander` is
+  `returns(ref)`, and salsa asks for `Clone` only for `returns(clone)`. Dropping `Clone` from the
+  derive should be all it takes.
+- Every type in hir-expand that derives `Clone` and holds a `tt::TopSubtree` (the
+  `builtin/derive_macro.rs` structs, `ExpandResult<tt::TopSubtree>` values). Where something
+  really clones one, hold it by `Arc` or borrow it instead.
+
+What: drop those derives. Tell me when it has landed, with `>` lines here. I will then drop
+`Clone` from `DeclarativeMacro`, `Rule`, `Matcher`, `MetaTemplate`, `Op` and `TopSubtree` in my
+crates; doing it first would break hir-expand's build.
+
+> forwarded to db (db-expand; window `db-next2`, told by tmux).
+
+
+## frontend-deps-reparse: `Attr::input` shared, `Option<Arc<AttrInput>>` (speed of light; 2026-10-29)
+
+From frontend-deps-reparse (notes: `docs/v2/plan/lanes/frontend/speed-of-light.md`).
+
+A source file's item tree is now assembled from its items' trees on every edit
+(`hir_def::item_tree::items::assemble`), which clones every attribute of the file. An `Attr`'s
+input is a `Box<AttrInput>`, so each doc comment and each `#[attr(...)]` costs an allocation, a
+copy of its literal or token tree, and a free: about 150 cycles. A file of 1 000 attributes
+spends about 43 µs on this per edit, against about 1 µs to copy the tree's columns.
+
+What, in `crates/hir-expand/src/attrs.rs:228`:
+
+```rust
+    pub input: Option<triomphe::Arc<AttrInput>>,
+```
+
+Every reader already goes through `self.input.as_deref()` and keeps working. Also needed:
+- `crates/hir-def/src/hir/persist.rs`, beside `impl<T: Code> Code for Box<T>` (line 653):
+
+```rust
+impl<T: Code> Code for triomphe::Arc<T> {
+    fn put(&self, w: &mut Words) {
+        (**self).put(w);
+    }
+
+    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
+        T::get(r).map(triomphe::Arc::new)
+    }
+}
+```
+
+  with the same bodies as the `Box` impl's, if they differ from these.
+- `crates/hir-def/src/item_tree/attrs.rs` (mine) already builds inputs with `.into()`, which
+  makes a `Box` today and an `Arc` after this.
+
+A clone is then one reference count. The bytes `persist` writes do not change.

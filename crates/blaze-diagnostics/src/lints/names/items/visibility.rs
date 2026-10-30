@@ -19,7 +19,7 @@ use hir::{
 };
 use rustc_hash::FxHashSet;
 use syntax::{
-    AstNode, AstPtr, SyntaxNode,
+    AstNode, AstPtr, SyntaxKind, SyntaxNode,
     ast::{self, HasGenericParams, HasTypeBounds},
 };
 
@@ -357,35 +357,44 @@ fn interface_parts(node: &SyntaxNode) -> Vec<SyntaxNode> {
         parts.extend(params.map(|it| it.syntax().clone()));
         parts.extend(clause.map(|it| it.syntax().clone()));
     };
-    if let Some(it) = ast::Fn::cast(node.clone()) {
-        generics(it.generic_param_list(), it.where_clause());
-        parts.extend(it.param_list().map(|it| it.syntax().clone()));
-        parts.extend(it.ret_type().map(|it| it.syntax().clone()));
-    } else if let Some(it) = ast::Struct::cast(node.clone()) {
-        generics(it.generic_param_list(), it.where_clause());
-    } else if let Some(it) = ast::Union::cast(node.clone()) {
-        generics(it.generic_param_list(), it.where_clause());
-    } else if let Some(it) = ast::Enum::cast(node.clone()) {
-        generics(it.generic_param_list(), it.where_clause());
-    } else if let Some(it) = ast::Trait::cast(node.clone()) {
-        generics(it.generic_param_list(), it.where_clause());
-        parts.extend(it.type_bound_list().map(|it| it.syntax().clone()));
-    } else if let Some(it) = ast::TypeAlias::cast(node.clone()) {
-        generics(it.generic_param_list(), it.where_clause());
-        parts.extend(it.type_bound_list().map(|it| it.syntax().clone()));
-        parts.extend(it.ty().map(|it| it.syntax().clone()));
-    } else if let Some(it) = ast::Impl::cast(node.clone()) {
-        generics(it.generic_param_list(), it.where_clause());
-        parts.extend(it.self_ty().map(|it| it.syntax().clone()));
-        parts.extend(it.trait_().map(|it| it.syntax().clone()));
-    } else if let Some(it) = ast::Const::cast(node.clone()) {
-        parts.extend(it.ty().map(|it| it.syntax().clone()));
-    } else if let Some(it) = ast::Static::cast(node.clone()) {
-        parts.extend(it.ty().map(|it| it.syntax().clone()));
-    } else if let Some(it) = ast::RecordField::cast(node.clone()) {
-        parts.extend(it.ty().map(|it| it.syntax().clone()));
-    } else if let Some(it) = ast::TupleField::cast(node.clone()) {
-        parts.extend(it.ty().map(|it| it.syntax().clone()));
+    let node = node.clone();
+    match node.kind() {
+        SyntaxKind::FN => {
+            let Some(it) = ast::Fn::cast(node) else { return parts };
+            generics(it.generic_param_list(), it.where_clause());
+            parts.extend(it.param_list().map(|it| it.syntax().clone()));
+            parts.extend(it.ret_type().map(|it| it.syntax().clone()));
+        }
+        SyntaxKind::STRUCT | SyntaxKind::UNION | SyntaxKind::ENUM => {
+            let Some(it) = ast::Adt::cast(node) else { return parts };
+            generics(it.generic_param_list(), it.where_clause());
+        }
+        SyntaxKind::TRAIT => {
+            let Some(it) = ast::Trait::cast(node) else { return parts };
+            generics(it.generic_param_list(), it.where_clause());
+            parts.extend(it.type_bound_list().map(|it| it.syntax().clone()));
+        }
+        SyntaxKind::TYPE_ALIAS => {
+            let Some(it) = ast::TypeAlias::cast(node) else { return parts };
+            generics(it.generic_param_list(), it.where_clause());
+            parts.extend(it.type_bound_list().map(|it| it.syntax().clone()));
+            parts.extend(it.ty().map(|it| it.syntax().clone()));
+        }
+        SyntaxKind::IMPL => {
+            let Some(it) = ast::Impl::cast(node) else { return parts };
+            generics(it.generic_param_list(), it.where_clause());
+            parts.extend(it.self_ty().map(|it| it.syntax().clone()));
+            parts.extend(it.trait_().map(|it| it.syntax().clone()));
+        }
+        SyntaxKind::CONST => parts.extend(ast::Const::cast(node).and_then(|it| it.ty()).map(|it| it.syntax().clone())),
+        SyntaxKind::STATIC => parts.extend(ast::Static::cast(node).and_then(|it| it.ty()).map(|it| it.syntax().clone())),
+        SyntaxKind::RECORD_FIELD => {
+            parts.extend(ast::RecordField::cast(node).and_then(|it| it.ty()).map(|it| it.syntax().clone()))
+        }
+        SyntaxKind::TUPLE_FIELD => {
+            parts.extend(ast::TupleField::cast(node).and_then(|it| it.ty()).map(|it| it.syntax().clone()))
+        }
+        _ => {}
     }
     parts
 }

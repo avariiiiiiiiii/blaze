@@ -1,12 +1,12 @@
 //! The reading of a script's output before its single borrowed pass: a `strip_prefix` per
 //! syntax, a `String` per value before its key was matched, and a string `match` of the key.
-//! Kept as the reference [`super::parse`] is checked against over seeded outputs.
+//! Kept as the reference [`crate::output::parse`] is checked against over seeded outputs.
 
 use std::path::PathBuf;
 
-use super::{
+use crate::output::{
     Context, DOCS, Descr, Error, LibraryPath, LinkArgTarget, Output, Severity, Whence, directive,
-    key_value, new_syntax_refused, older_than_new_syntax, parse_rustc_env,
+    key_value, new_syntax_refused, older_than_new_syntax,
 };
 
 fn reserved(key: &str) -> bool {
@@ -230,4 +230,15 @@ pub fn parse(input: &[u8], cx: &Context<'_>) -> Result<Output, Error> {
         }
     }
     Ok(out)
+}
+
+/// `rustc-env=NAME=VALUE`.
+fn parse_rustc_env(
+    value: &str,
+    whence: impl std::fmt::Display,
+) -> Result<(String, String), Error> {
+    match value.split_once('=') {
+        Some((name, value)) => Ok((name.to_owned(), value.to_owned())),
+        None => Err(Error(format!("Variable rustc-env has no value in {whence}: {value}"))),
+    }
 }

@@ -86,6 +86,8 @@ hir-def = { path = "crates/hir-def", version = "0.0.0" }
 hir-expand = { path = "crates/hir-expand", version = "0.0.0" }
 hir-ty = { path = "crates/hir-ty", version = "0.0.0" }
 hir-ty-borrowck = { path = "crates/hir-ty-borrowck", version = "0.0.0" }
+hir-ty-matchck = { path = "crates/hir-ty-matchck", version = "0.0.0" }
+hir-ty-unsafeck = { path = "crates/hir-ty-unsafeck", version = "0.0.0" }
 hir-ty-mir = { path = "crates/hir-ty-mir", version = "0.0.0" }
 hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }
 hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }
@@ -113,6 +115,7 @@ blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-ui = { path = "crates/blaze-ui" }
 blaze-web = { path = "crates/blaze-web" }
 # v2 (docs/v2/plan/reference/crates.md)
+blaze-alloc-count = { path = "crates/blaze-alloc-count" }
 blaze-api = { path = "crates/blaze-api" }
 blaze-cas = { path = "crates/blaze-cas" }
 blaze-check = { path = "crates/blaze-check" }
@@ -137,6 +140,7 @@ blaze-stencil = { path = "crates/blaze-stencil" }
 blaze-testsel = { path = "crates/blaze-testsel" }
 blaze-query = { path = "crates/blaze-query" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
+blaze-mem = { path = "crates/blaze-mem" }
 blaze-usercode = { path = "crates/blaze-usercode" }
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 blaze-vfs = { path = "crates/blaze-vfs" }
@@ -210,6 +214,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8"
 # `zdict_builder` trains the store's dictionary per kind; `zstdmt` lets long cold values use workers.
 zstd = { version = "0.13.3", default-features = false, features = ["zdict_builder", "zstdmt"] }
+# `tt`'s proc-macro wire views its columns as bytes with no unsafe code of its own.
+zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }
 # `safe-decode`: a rotted pack decodes to an error, never to an out-of-bounds read.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
 # rustc renders its diagnostics with exactly this version; another lays some snippets out differently.
@@ -218,6 +224,8 @@ object = { version = "0.37", default-features = false, features = ["read_core", 
 gimli = { version = "0.33", default-features = false, features = ["read", "write", "std"] }
 either = "1.15.0"
 expect-test = "1.5.1"
+# Property tests with shrinking (hir-def's name resolution tests); test-only.
+proptest = "1.5"
 indexmap = { version = "2.9.0", features = ["serde"] }
 itertools = "0.15.0"
 libc = "0.2.172"
@@ -300,7 +308,7 @@ unused_dependencies = "allow"
 
 elided_lifetimes_in_paths = "warn"
 explicit_outlives_requirements = "warn"
-unsafe_op_in_unsafe_fn = "warn"
+unsafe_op_in_unsafe_fn = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(bootstrap)',
     "cfg(no_salsa_async_drops)",
@@ -348,6 +356,26 @@ too_many_arguments = "allow"
 type_complexity = "allow"
 wrong_self_convention = "allow"
 
+## deny: allocation, dyn and clones are controlled mechanically
+## (docs/v2/plan/goals/principles.md)
+redundant_clone = "deny"
+clone_on_ref_ptr = "deny"
+implicit_clone = "deny"
+unnecessary_to_owned = "deny"
+inefficient_to_string = "deny"
+format_collect = "deny"
+needless_pass_by_value = "deny"
+large_types_passed_by_value = "deny"
+box_collection = "deny"
+vec_box = "deny"
+rc_buffer = "deny"
+large_enum_variant = "deny"
+
+## deny: every unsafe block says why it is sound, one operation each
+## (docs/v2/plan/design/unsafe.md)
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+
 ## warn at following lints
 # CI raises these to deny
 dbg_macro = "warn"
@@ -355,5 +383,4 @@ todo = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
 
-rc_buffer = "warn"
 str_to_string = "warn"

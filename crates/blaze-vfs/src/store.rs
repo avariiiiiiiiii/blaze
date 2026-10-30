@@ -36,25 +36,117 @@
 //! nothing in memory: it is the image's pages, read when something reads them.
 
 use std::{
+    fmt,
     marker::PhantomData,
     mem::{MaybeUninit, needs_drop, size_of_val},
+    ops::Deref,
     ptr,
     sync::{Arc, OnceLock},
 };
 
 use blaze_core::Mapping;
 use blaze_ids::ContentId;
-use blaze_image::{Corrupt, Image, Section};
+use blaze_image::{Corrupt, Image, Section, Stable};
 use blaze_reclaim::{Guard, Limbo};
 
 use crate::{
     Mode,
-    image::Bytes,
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
     },
 };
+
+/// The daemon's image file as [`Effect::Map`](blaze_core::Effect::Map) mapped it, for
+/// [`Image`] to read in place.
+pub(crate) struct ImageFile(pub(crate) Mapping);
+
+// SAFETY: a `Mapping` is a read-only `mmap` of a file the daemon only ever replaces by renaming
+// another over it, or an `Arc`'d buffer nothing writes (a simulation's, a test's): its
+// `AsRef` gives the same slice on every call and its bytes never change while a clone of it
+// lives (`Mapping`'s contract), and this value holds one.
+unsafe impl Stable for ImageFile {
+    fn bytes(&self) -> &[u8] {
+        self.0.bytes()
+    }
+}
+
+/// A file's bytes, held: the tree's own `Arc` of a file made since the image, or a range of
+/// the mapped image, its page groups checked. Cloning takes one count of either, never a copy.
+#[derive(Clone)]
+pub struct Bytes {
+    /// Borrowed from `owner`, which keeps them at one address, unwritten, for as long as it
+    /// is held: an `Arc`'s allocation, or the image's bytes (`Stable`).
+    bytes: &'static [u8],
+    owner: Owner,
+}
+
+#[derive(Clone)]
+enum Owner {
+    Heap(Arc<[u8]>),
+    Mapped(#[allow(dead_code)] Arc<Mapped>),
+}
+
+impl Bytes {
+    /// `len` bytes at `at` of `mapped`'s blobs section, once each page group they fall in
+    /// matches its CRC32C.
+    fn mapped(mapped: Arc<Mapped>, at: u64, len: u64) -> Result<Bytes, Corrupt> {
+        let bytes: *const [u8] = mapped.read(at, len)?;
+        // SAFETY: the bytes are the image's, which `mapped` holds through its `Arc<Image>`:
+        // `Stable` keeps them at one address, unwritten, for as long as the image lives, and
+        // this value holds `mapped` for as long as it lends them.
+        let bytes = unsafe { &*bytes };
+        Ok(Bytes { bytes, owner: Owner::Mapped(mapped) })
+    }
+
+    /// The file's own `Arc` for a file made since the image; `None` for a range of the image.
+    pub fn shared(&self) -> Option<&Arc<[u8]>> {
+        match &self.owner {
+            Owner::Heap(shared) => Some(shared),
+            Owner::Mapped(_) => None,
+        }
+    }
+}
+
+impl From<Arc<[u8]>> for Bytes {
+    fn from(shared: Arc<[u8]>) -> Bytes {
+        let bytes: *const [u8] = &*shared;
+        // SAFETY: an `Arc`'s allocation never moves and is not written while it is shared;
+        // this value holds a count of it for as long as it lends the bytes.
+        let bytes = unsafe { &*bytes };
+        Bytes { bytes, owner: Owner::Heap(shared) }
+    }
+}
+
+impl Deref for Bytes {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        self.bytes
+    }
+}
+
+impl AsRef<[u8]> for Bytes {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes
+    }
+}
+
+impl PartialEq for Bytes {
+    fn eq(&self, other: &Bytes) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for Bytes {}
+
+impl fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = if self.shared().is_some() { "heap" } else { "image" };
+        write!(f, "Bytes({} bytes, {kind})", self.bytes.len())
+    }
+}
 
 /// Chunk `k` of a column holds `FIRST << k` values from offset `FIRST * (2^k - 1)`, so an
 /// offset's chunk is arithmetic and 25 chunks cover every `u32`.
@@ -430,14 +522,14 @@ impl Names {
 /// its files' bytes are. Shared by every generation that has a node of it, and by every
 /// [`Bytes`] lent from it.
 pub(crate) struct Mapped {
-    pub(crate) image: Arc<Image<Mapping>>,
+    pub(crate) image: Arc<Image<ImageFile>>,
     pub(crate) blobs: Section,
     /// The first group of `blobs` a read found corrupt: what [`crate::Vfs::corrupt`] names.
     corrupt: OnceLock<Corrupt>,
 }
 
 impl Mapped {
-    pub(crate) fn new(image: Arc<Image<Mapping>>, blobs: Section) -> Mapped {
+    pub(crate) fn new(image: Arc<Image<ImageFile>>, blobs: Section) -> Mapped {
         Mapped { image, blobs, corrupt: OnceLock::new() }
     }
 
@@ -549,33 +641,12 @@ impl Base<'_> {
         if self.name_index.iter().any(|&plus_one| plus_one as usize > self.spans.len()) {
             return Err("a name index place naming a name the base does not have");
         }
+        // At most half full, so a probe for an ID or a name the base lacks ends at an empty
+        // place. Where each node and name is placed is the writer's (tested), not checked
+        // here: one misplaced is a lookup that misses, never a read out of bounds.
         let used = |places: &[u32]| places.iter().filter(|&&it| it != 0).count();
         if used(self.index) > nodes || used(self.name_index) > self.spans.len() {
             return Err("an index fuller than its nodes or names");
-        }
-        // At most half full, as checked: every probe meets an empty place, so these loops end.
-        let mask = self.index.len() - 1;
-        for id in self.ids {
-            let mut at = home(id) & mask;
-            loop {
-                match self.index[at] {
-                    0 => return Err("a node its index does not find"),
-                    plus_one if self.ids[plus_one as usize - 1] == *id => break,
-                    _ => at = (at + 1) & mask,
-                }
-            }
-        }
-        let mask = self.name_index.len() - 1;
-        for label in 0..self.spans.len() as u32 {
-            let bytes = name(label);
-            let mut at = name_hash(bytes) as usize & mask;
-            loop {
-                match self.name_index[at] {
-                    0 => return Err("a name its index does not find"),
-                    plus_one if name(plus_one - 1) == bytes => break,
-                    _ => at = (at + 1) & mask,
-                }
-            }
         }
         Ok(())
     }
@@ -765,7 +836,7 @@ impl Table {
         let places = self.base.index;
         let mask = places.len().checked_sub(1)?;
         let mut at = home(id) & mask;
-        loop {
+        for _ in 0..places.len() {
             match places[at] {
                 0 => return None,
                 plus_one if self.base.ids[plus_one as usize - 1] == *id => {
@@ -774,6 +845,7 @@ impl Table {
                 _ => at = (at + 1) & mask,
             }
         }
+        None
     }
 
     fn probe_in(&self, places: &[AtomicU32], id: &ContentId) -> Result<u32, usize> {
@@ -840,9 +912,7 @@ impl Table {
     pub(crate) fn bytes(&self, shape: Shape) -> Result<Bytes, Corrupt> {
         match self.blob_at(shape) {
             BlobAt::Base(&at, &len) | BlobAt::Column(&Blob::Mapped { at, len }) => {
-                let mapped = self.mapped_ref();
-                mapped.read(at, len)?;
-                Ok(Bytes::mapped(mapped.clone(), at, len))
+                Bytes::mapped(self.mapped_ref().clone(), at, len)
             }
             BlobAt::Column(Blob::Heap(bytes)) => Ok(Bytes::from(bytes.clone())),
         }
@@ -1010,12 +1080,8 @@ impl Shared {
 impl Drop for Shared {
     fn drop(&mut self) {
         let table = *self.table.get_mut();
-        if table.is_null() {
-            return;
-        }
         // SAFETY: the last owner: no reader or writer is left, so nobody reads the published
-        // `Box` (the limbo drops the retired tables with it, for the same reason). Only
-        // `Writer::into_table` leaves it null, having taken the `Box`.
+        // `Box` (the limbo drops the retired tables with it, for the same reason).
         drop(unsafe { Box::from_raw(table) });
     }
 }
@@ -1130,16 +1196,6 @@ impl Writer {
         let mut retired = self.shared.retired.lock().unwrap_or_else(PoisonError::into_inner);
         retired.collect();
         retired.len()
-    }
-
-    /// Its table, to publish in another tree's place ([`Writer::replace`]); `None` when a
-    /// reader has a handle on it, which would then read nothing.
-    pub(crate) fn into_table(self) -> Option<Building> {
-        let mut shared = Arc::try_unwrap(self.shared).ok()?;
-        let table = std::mem::replace(shared.table.get_mut(), ptr::null_mut());
-        // SAFETY: `table` is the published `Box`, unlinked above; with the `Arc` unwrapped
-        // nobody else can load it, and `Shared`'s drop skips the null left in its place.
-        Some(Building(*unsafe { Box::from_raw(table) }))
     }
 }
 

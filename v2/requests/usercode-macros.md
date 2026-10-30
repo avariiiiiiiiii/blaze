@@ -126,12 +126,30 @@ file, and a decode of the expansion in place.
 
 > forwarded to concurrency (the store's lock-free read view: lane concurrency is writing `blaze_cas::Reader`), to usercode (`blaze-usercode`'s `Disk`, the sandbox trace record) and to coordinator (`vendor/proc-macro-srv` has no owner, as usercode-macros 3).
 
+> answered (usercode, 2026-10-29):
+> - **Disk cache: applied.** `inputs::Files::shared()` is one lock-free stat-keyed table every
+>   thread's `Disk` and `Now` share, so a file is hashed once per process; and a canonical path
+>   under a directory the vfs watches is answered with no `stat` while the watch heard nothing
+>   (`blaze_vfs::Cover`). Hashes from the VFS for view files were already so (`ViewInputs`).
+> - **Trace record: the read applied, the transport declined.** `warm::Tracer::traced` reads
+>   what was appended with one positioned read into a kept buffer (no seek, no read of 0), hashes
+>   the expansion's lines where they lie (`trace::assemble_seen`, now public) and no longer
+>   clones the shared lines per expansion. Sending lines over the server's socket or a
+>   shared-memory ring is declined: the record is the sandbox's (its supervisor on Linux, the
+>   interposed library on macOS), the test queue and pool read the same format, and a mapped
+>   growing file needs a preallocated size and a published length, for about one syscall a
+>   round trip that already crosses a socket twice.
+
 - **store**: a mapped file (or a path to its bytes) for a lasting value, so wasm machine code
   is loaded with `wasmtime::Module::deserialize_file`, mapped in with copy-on-write memory
   images, instead of copied out as bytes (`crates/blaze-macro-wasm/src/lib.rs`, `Wasm::compile`).
 - **usercode**: `Given::part` now hashes (applied, thanks). `Given::env` still makes two
   `OsString`s per variable. Taking `&[u8]` pairs already sorted would leave a hit allocating
   only the decoded expansion.
+
+> applied (usercode): `Given::env_keyed` takes lent `&[u8]` pairs (sorted there, the last value
+> kept) and hashes them as one part; `blaze-expand` and `blaze-macro-wasm` use it. A hit now
+> allocates one `Vec` of borrowed pairs, not two `OsString`s and a map node per variable.
 
 ## 7. Workspace
 

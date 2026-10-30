@@ -7,6 +7,7 @@ mod db;
 use base_db::{EditionedFileId, SourceDatabase, all_crates};
 use hir_def::{
     AssocItemId, DefWithBodyId, ModuleDefId, expr_store::Body, nameres::crate_def_map,
+    signatures::FunctionSignature,
 };
 use test_fixture::WithFixture;
 use test_utils::extract_annotations;
@@ -17,12 +18,14 @@ use self::db::TestDB;
 
 /// Every body of every crate: functions, consts and statics, in modules, traits and impls.
 fn bodies(db: &TestDB) -> Vec<DefWithBodyId> {
+    fn push(item: AssocItemId, bodies: &mut Vec<DefWithBodyId>) {
+        match item {
+            AssocItemId::FunctionId(it) => bodies.push(it.into()),
+            AssocItemId::ConstId(it) => bodies.push(it.into()),
+            AssocItemId::TypeAliasId(_) => {}
+        }
+    }
     let mut bodies = Vec::new();
-    let mut push = |item: AssocItemId, bodies: &mut Vec<DefWithBodyId>| match item {
-        AssocItemId::FunctionId(it) => bodies.push(it.into()),
-        AssocItemId::ConstId(it) => bodies.push(it.into()),
-        AssocItemId::TypeAliasId(_) => {}
-    };
     for &krate in all_crates(db).iter() {
         let def_map = crate_def_map(db, krate);
         for (_, module) in def_map.modules(db) {
@@ -640,6 +643,64 @@ fn f() {
     );
 }
 
+// tests/ui/unsafe/ranged_ints.rs, ranged_ints2.rs, ranged_ints3.rs, ranged_ints3_match.rs and
+// ranged_ints4.rs, with an autoref, a compound assignment and a deref that ends the place.
+#[test]
+fn layout_constrained_fields() {
+    check(
+        r#"
+//- minicore: cell, option
+use core::cell::UnsafeCell;
+
+#[rustc_layout_scalar_valid_range_start(1)]
+#[repr(transparent)]
+pub(crate) struct NonZero<T>(pub(crate) T);
+
+trait Bump {
+    fn bump(&mut self);
+}
+
+impl Bump for u32 {
+    fn bump(&mut self) {}
+}
+
+fn init() {
+    let _x = NonZero(0);
+           //^^^^^^^^^^ error: InitializingTypeWith
+    let _y = unsafe { NonZero(1) };
+}
+
+fn mutation(mut x: NonZero<u32>, mut p: NonZero<&'static mut u32>) {
+    let _y = &mut x.0;
+           //^^^^^^^^ error: MutationOfLayoutConstrainedField
+    x.0 = 0;
+  //^^^^^^^ error: MutationOfLayoutConstrainedField
+    x.0 += 1;
+  //^^^^^^^^ error: MutationOfLayoutConstrainedField
+    x.0.bump();
+  //^^^ error: MutationOfLayoutConstrainedField
+    let _r = &x.0;
+    let _z = &mut *p.0;
+    let NonZero(&mut ref mut _w) = p;
+    if let Some(NonZero(ref mut y)) = Some(x) {}
+                      //^^^^^^^^^ error: MutationOfLayoutConstrainedField
+}
+
+fn borrow(x: NonZero<UnsafeCell<u32>>, y: NonZero<u32>) {
+    let _y = &x.0;
+           //^^^^ error: BorrowOfLayoutConstrainedField
+    match x {
+        NonZero(ref x) => {}
+              //^^^^^ error: BorrowOfLayoutConstrainedField
+    }
+    match y {
+        NonZero(ref y) => {}
+    }
+}
+"#,
+    );
+}
+
 #[test]
 fn operations_for_an_editor() {
     let (db, file) = TestDB::with_single_file(
@@ -654,10 +715,11 @@ fn f() {
     );
     hir_ty::attach_db(&db, || {
         let text = db.file_text(file.file_id(&db)).text(&db);
-        let def = bodies(&db)
-            .into_iter()
-            .find(|&def| matches!(def, DefWithBodyId::FunctionId(it) if hir_def::signatures::FunctionSignature::of(&db, it).name.as_str() == "f"))
-            .expect("`f` in the fixture");
+        let named_f = |def: &DefWithBodyId| match *def {
+            DefWithBodyId::FunctionId(it) => FunctionSignature::of(&db, it).name.as_str() == "f",
+            _ => false,
+        };
+        let def = bodies(&db).into_iter().find(named_f).expect("`f` in the fixture");
         let (body, source_map) = Body::with_source_map(&db, def);
         let infer = hir_ty::InferenceResult::of(&db, def);
         let mut found = Vec::new();
@@ -665,9 +727,10 @@ fn f() {
             let node = source_map.expr_or_pat_syntax(node).expect("written in the file");
             found.push((text[node.value.text_range()].to_owned(), inside));
         });
-        assert_eq!(
-            found,
-            [("unsf()".to_owned(), InsideUnsafeBlock::No), ("unsf()".to_owned(), InsideUnsafeBlock::Yes)]
-        );
+        let expected = [
+            ("unsf()".to_owned(), InsideUnsafeBlock::No),
+            ("unsf()".to_owned(), InsideUnsafeBlock::Yes),
+        ];
+        assert_eq!(found, expected);
     });
 }

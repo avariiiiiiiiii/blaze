@@ -20,11 +20,17 @@ lines), and blaze-diagnostics' `emit.rs` (memchr).
 
 After:
 
-- **Text is the VFS's bytes.** `blaze_vfs::text_of(Arc<[u8]>) -> Result<Arc<str>, Utf8Error>`
-  (`crates/blaze-vfs/src/text.rs`) checks the bytes are UTF-8 and casts the tree's own `Arc` to
-  `Arc<str>`: the same allocation, its count moved. `Reader::text` and `Vfs::text` read a file
-  that way. base-db's view install (`write_view`) calls it for each file whose content changed,
-  so a text is checked once per content ID and never copied.
+- **Text is the VFS's bytes.** `blaze_vfs::text_of(Bytes) -> Result<Text, Utf8Error>`
+  (`crates/blaze-vfs/src/text.rs`) checks a file's `Bytes` (a heap file's `Arc<[u8]>` or a range
+  of the mapped image) are UTF-8 once. A `Text` is those bytes, lent as `&str`.
+  `Text::shared()` gives a heap file's `Arc<str>`, the same allocation with one more count.
+  `Reader::text` and `Vfs::text` read a file that way. base-db's view install (`write_view`)
+  calls it for each file whose content changed, so a text is checked once per content ID and
+  never copied.
+- **Not yet for image files.** `FileText` and the parse tree hold an `Arc<str>`, which an image
+  range can't be without a copy. Until both hold a `Text` (requested of the coordinator: move
+  `Bytes` and `Text` below `syntax-tree`), base-db refuses an image file with
+  `ViewError::Mapped` rather than copying it.
 - **One line index per text, built on first use.** `span::LineIndex`
   (`crates/span/src/lines.rs`) is made by the base-db query `line_index(db, FileText)`, which
   nothing calls on load: only a diagnostic, `line!`/`column!`, a caller location, a proc macro's

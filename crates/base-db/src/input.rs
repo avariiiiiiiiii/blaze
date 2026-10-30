@@ -561,6 +561,7 @@ pub struct Dependency<Id> {
     pub name: CrateName,
     prelude: bool,
     sysroot: bool,
+    private: bool,
 }
 
 pub type DependencyBuilder = Dependency<CrateBuilderId>;
@@ -568,7 +569,7 @@ pub type BuiltDependency = Dependency<Crate>;
 
 impl DependencyBuilder {
     pub fn new(name: CrateName, crate_id: CrateBuilderId) -> Self {
-        Self { name, crate_id, prelude: true, sysroot: false }
+        Self { name, crate_id, prelude: true, sysroot: false, private: false }
     }
 
     pub fn with_prelude(
@@ -577,20 +578,28 @@ impl DependencyBuilder {
         prelude: bool,
         sysroot: bool,
     ) -> Self {
-        Self { name, crate_id, prelude, sysroot }
+        Self { name, crate_id, prelude, sysroot, private: false }
     }
 }
 
 impl BuiltDependency {
     /// A dependency of a crate added after the graph was built, in the extern prelude.
     pub fn new(name: CrateName, crate_id: Crate) -> Self {
-        Self { name, crate_id, prelude: true, sysroot: false }
+        Self { name, crate_id, prelude: true, sysroot: false, private: false }
     }
 
     /// A dependency of a crate added after the graph was built, saying whether it is in the
     /// extern prelude (not for cargo's `noprelude`) and whether it is a sysroot crate.
     pub fn with_prelude(name: CrateName, crate_id: Crate, prelude: bool, sysroot: bool) -> Self {
-        Self { name, crate_id, prelude, sysroot }
+        Self { name, crate_id, prelude, sysroot, private: false }
+    }
+}
+
+impl<Id> Dependency<Id> {
+    /// The dependency, private (rustc's `--extern priv:name`, which cargo passes for a
+    /// dependency without `public = true` under `-Zpublic-dependency`) or not.
+    pub fn with_private(self, private: bool) -> Self {
+        Self { private, ..self }
     }
 
     /// Whether this dependency is to be added to the depending crate's extern prelude.
@@ -601,6 +610,12 @@ impl BuiltDependency {
     /// Whether this dependency is a sysroot injected one.
     pub fn is_sysroot(&self) -> bool {
         self.sysroot
+    }
+
+    /// Whether this dependency is private (`--extern priv:name`): what
+    /// `exported_private_dependencies` reads.
+    pub fn is_private(&self) -> bool {
+        self.private
     }
 }
 
@@ -647,8 +662,9 @@ impl Crate {
     /// dependency as its crate's content ID, so a crate's ID covers everything it depends on),
     /// its [`ExtraCrateData`], [`CrateWorkspaceData::content`], [`cfg_options_content`] and
     /// [`Env::content`]. [`UniqueCrateData`] adds nothing: its root file is hashed as its
-    /// path, and its disambiguator is the crate's own data and cfg.
-    pub const DOMAIN: &'static str = "blaze v2 crate 2";
+    /// path, and its disambiguator is the crate's own data and cfg. A dependency is its
+    /// crate's ID, its name and a byte each of prelude, sysroot and private.
+    pub const DOMAIN: &'static str = "blaze v2 crate 3";
 
     pub fn data<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db BuiltCrateData {
         self.data_field(db)
@@ -735,7 +751,7 @@ impl Crate {
             hasher
                 .id(&dep.crate_id.content(db))
                 .part(dep.name.as_str().as_bytes())
-                .update(&[dep.prelude as u8, dep.sysroot as u8]);
+                .update(&[dep.prelude as u8, dep.sysroot as u8, dep.private as u8]);
         }
         match &data.origin {
             CrateOrigin::Rustc { name } => hasher.update(&[0]).part(name.as_str().as_bytes()),
@@ -1039,6 +1055,7 @@ impl CrateGraphBuilder {
                     name: dep.name.clone(),
                     prelude: dep.prelude,
                     sysroot: dep.sysroot,
+                    private: dep.private,
                 })
                 .collect::<Vec<_>>();
             let crate_data = BuiltCrateData {

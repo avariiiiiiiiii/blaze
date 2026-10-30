@@ -37,7 +37,7 @@ const BLOCK: usize = 8;
 
 /// The newlines of a text, for its lines and columns. Built in one pass over the text; holds
 /// no copy of it, so a [`Place`]'s columns are asked of the text it was built from.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct LineIndex {
     /// Bit `i % 64` of word `i / 64` is set when byte `i` is `\n`. 1 bit a byte.
     bits: Box<[u64]>,
@@ -72,6 +72,7 @@ impl LineIndex {
         let Ok(len) = u32::try_from(bytes.len()) else {
             panic!("a text of {} bytes: a line index's offsets are 32 bits", bytes.len());
         };
+        // alloc: the index's bitmap, its result, once per text, at its exact length
         let mut bits = vec![0u64; bytes.len().div_ceil(64)].into_boxed_slice();
         simd::fill(kernel, bytes, &mut bits);
         let mut ranks = Vec::with_capacity(bits.len().div_ceil(BLOCK) + 1);

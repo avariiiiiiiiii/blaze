@@ -12,6 +12,8 @@ gave every lane, `{"root": ".", "crates": ["blaze-link"]}`, fails with
 `TypeError: typed_input: crates has a type it does not read: list[str]`. Only `{"root": "."}`
 runs (every hot crate at once).
 
+> forwarded to the coordinator (`tools/`; the same as coordinator.md's hot_lint item), listed in requests' report.
+
 ## 2. `tools/v2/hot_lint.py`: code compiled only for tests or fuzzing counts as hot
 
 What: treat an item under `#[cfg(any(test, feature = "fuzz"))]` or `#[cfg(feature = "fuzz")]`
@@ -26,3 +28,17 @@ build's code. They are the old, allocating readers on purpose. Today they make 7
 `crates/blaze-link/src/macho/tbd/reference.rs` and about 20 in the fuzz-only parts of
 `macho/dylib.rs` and `macho/tbd.rs`. Marking each line `// alloc:` would mean about 100 comments
 that all say "a test model".
+
+> forwarded to the coordinator (`tools/`), listed in requests' report.
+
+## 3. `tools/v2/hot_lint.py`: braces inside strings end a test module early
+
+What: in `in_test_module`, count `{` and `}` only outside string literals, char literals and
+comments.
+
+Where: `in_test_module` in `tools/v2/hot_lint.py` (`opens, closes = line.count("{"), line.count("}")`).
+
+Why: a test module whose strings hold unbalanced braces (YAML and format fixtures) is taken
+to end early, and the tests after that point count as hot code.
+`crates/blaze-link/src/macho/tbd.rs`'s tests module is taken to end at line 2475 of 2560, so
+its `sdk_libsystem` helper makes 5 findings.

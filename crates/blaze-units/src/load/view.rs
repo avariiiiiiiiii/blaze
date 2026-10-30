@@ -77,8 +77,8 @@ pub fn resolve_view<R>(
         Ok(asked) => asked,
         Err(error) => return Ok(Resolving::Failed(error)),
     };
-    let mounts = cx.get::<Mounts>(&())?.get().mounts;
-    let mut spec = match view_spec(&asked, &mounts) {
+    let library = cx.get::<Mounts>(&())?.get(&asked.library);
+    let mut spec = match view_spec(&asked, library) {
         Ok(spec) => spec,
         Err(error) => return Ok(Resolving::Failed(error)),
     };
@@ -104,8 +104,8 @@ pub fn resolve_view<R>(
         Ok(read) => read,
         Err(error) => return Ok(Resolving::Failed(error)),
     };
-    let (outcome, used) = replay(cx, &read, &spec.workspace.config, &Snapshot::default(), |cx, ctx, ws, files| {
-        super::resolve::resolved(cx, ctx, ws, &files, &spec, |_, resolved| {
+    let (outcome, used) = replay(cx, &read, &spec.workspace.config, &Snapshot::default(), |cx, ctx, ws, files, reads| {
+        super::resolve::resolved(cx, ctx, ws, &files, reads, &spec, |_, resolved| {
             let member_summaries: Vec<&Summary> =
                 resolved.member_ids.iter().map(|id| &resolved.reads[id].summary).collect();
             let warnings: Vec<String> = read.warnings.iter().chain(&resolved.warnings).cloned().collect();

@@ -1,0 +1,699 @@
+//! What the evaluator tells its `Machine`: a recorder keeps every hook it is called with, and
+//! the initialized bytes and provenance of memory as the hooks say, so a pointer written and
+//! read back keeps its provenance. Every program also runs with `Plain`, which must give the
+//! same result and output.
+
+use std::{collections::BTreeMap, ops::Range};
+
+use hir_ty::next_solver::{Ty, TyKind};
+use hir_ty_mir::mir::{
+    Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site,
+    TypedCx, run_function,
+};
+use rustc_type_ir::inherent::IntoKind as _;
+use test_fixture::WithFixture;
+
+use crate::{db::TestDB, function};
+
+const INIT: u8 = 1;
+/// A byte of a pointer, which carries the pointer's provenance.
+const POINTER: u8 = 2;
+/// The first byte of a pointer.
+const START: u8 = 4;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Byte {
+    flags: u8,
+    prov: Option<u32>,
+}
+
+/// Per byte: whether it is initialized, and the provenance of the pointer it is part of.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Bytes(Vec<Byte>);
+
+impl Shadow<u32> for Bytes {
+    fn init(len: usize) -> Bytes {
+        Bytes(vec![Byte { flags: INIT, prov: None }; len])
+    }
+
+    fn pointer(size: usize, prov: Option<u32>) -> Bytes {
+        let mut bytes = vec![Byte { flags: INIT | POINTER, prov }; size];
+        if let Some(first) = bytes.first_mut() {
+            first.flags |= START;
+        }
+        Bytes(bytes)
+    }
+
+    fn slice(&self, range: Range<usize>) -> Bytes {
+        Bytes(range.map(|i| self.0.get(i).copied().unwrap_or_default()).collect())
+    }
+
+    fn put(&mut self, at: usize, other: &Bytes) {
+        let end = at + other.0.len();
+        if self.0.len() < end {
+            self.0.resize(end, Byte::default());
+        }
+        self.0[at..end].copy_from_slice(&other.0);
+    }
+
+    fn prov_at(&self, at: usize, size: usize) -> Option<u32> {
+        let (first, rest) = self.0.get(at..at + size)?.split_first()?;
+        let inside = |it: &Byte| it.flags & (POINTER | START) == POINTER && it.prov == first.prov;
+        let whole = first.flags & START != 0 && rest.iter().all(inside);
+        let longer = self.0.get(at + size).is_some_and(inside);
+        match whole && !longer {
+            true => first.prov,
+            false => None,
+        }
+    }
+}
+
+/// The type a typed copy is at, as far as these tests ask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TyClass {
+    Ref,
+    RawPtr,
+    Other,
+}
+
+impl TyClass {
+    fn of(ty: Ty<'_>) -> TyClass {
+        match ty.kind() {
+            TyKind::Ref(..) => TyClass::Ref,
+            TyKind::RawPtr(..) => TyClass::RawPtr,
+            _ => TyClass::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Event {
+    Step,
+    Alloc { addr: u64, size: u64, kind: MemKind, prov: u32 },
+    Free { addr: u64, prov: Option<u32>, kind: MemKind },
+    Read { addr: u64, prov: Option<u32>, size: u64, align: u64, access: Access },
+    Write { addr: u64, prov: Option<u32>, size: u64, align: u64, access: Access },
+    Copy { dst: u64, dst_prov: Option<u32>, src: u64, src_prov: Option<u32>, size: u64 },
+    RequireInit { len: usize, init: bool },
+    AtomicLoad { addr: u64, prov: Option<u32>, size: u64, ord: AtomicOrd },
+    AtomicStore { addr: u64, prov: Option<u32>, ord: AtomicOrd },
+    Fence { ord: AtomicOrd, compiler_only: bool },
+    /// `value`: the first 8 bytes of the value, little-endian (a pointer's address).
+    Typed { addr: u64, prov: Option<u32>, mode: RetagMode, ty: TyClass, value: u64 },
+    Offset { addr: u64, prov: Option<u32>, by: i64 },
+    Expose { addr: u64, prov: Option<u32> },
+    FromExposed { addr: u64, prov: Option<u32> },
+    Call,
+    Protect { addr: u64, prov: Option<u32>, size: u64 },
+    Ret,
+    Spawn { thread: EvalThread },
+    Schedule { running: EvalThread, chosen: EvalThread },
+    Join { thread: EvalThread },
+    Detach { thread: EvalThread },
+    Exit,
+    Yield,
+    ThreadName { thread: EvalThread },
+    Release { object: u64 },
+    Acquire { object: u64 },
+    Finish,
+}
+
+impl Event {
+    /// What the evaluator touches of program memory, as opposed to allocating it, switching
+    /// frames or threads.
+    fn is_memory(&self) -> bool {
+        matches!(
+            self,
+            Event::Read { .. }
+                | Event::Write { .. }
+                | Event::Copy { .. }
+                | Event::RequireInit { .. }
+                | Event::AtomicLoad { .. }
+                | Event::AtomicStore { .. }
+                | Event::Typed { .. }
+                | Event::Offset { .. }
+                | Event::Expose { .. }
+                | Event::FromExposed { .. }
+        )
+    }
+
+    /// The bytes this reads, `(addr, prov, size)`: a `Read`, or the source of a `Copy` (a
+    /// place moved or copied as a whole).
+    fn read(&self) -> Option<(u64, Option<u32>, u64)> {
+        match *self {
+            Event::Read { addr, prov, size, .. } => Some((addr, prov, size)),
+            Event::Copy { src, src_prov, size, .. } => Some((src, src_prov, size)),
+            _ => None,
+        }
+    }
+}
+
+struct Allocation {
+    size: u64,
+    prov: u32,
+    bytes: Bytes,
+}
+
+/// Provenance is a counter `alloc` hands out, from 1.
+#[derive(Default)]
+struct Recorder {
+    events: Vec<Event>,
+    /// By start address; zero-sized allocations aren't kept, as they hold no bytes.
+    memory: BTreeMap<u64, Allocation>,
+    next: u32,
+    exposed: Vec<u32>,
+}
+
+impl Recorder {
+    fn containing(&self, addr: u64) -> Option<(u64, &Allocation)> {
+        let (&start, allocation) = self.memory.range(..=addr).next_back()?;
+        (addr < start + allocation.size).then_some((start, allocation))
+    }
+
+    fn load(&self, addr: u64, size: u64) -> Bytes {
+        match self.containing(addr) {
+            Some((start, allocation)) => {
+                let at = (addr - start) as usize;
+                allocation.bytes.slice(at..at + size as usize)
+            }
+            None => Bytes::init(size as usize),
+        }
+    }
+
+    fn store(&mut self, addr: u64, shadow: &Bytes) {
+        let Some((&start, allocation)) = self.memory.range_mut(..=addr).next_back() else {
+            return;
+        };
+        if addr < start + allocation.size {
+            allocation.bytes.put((addr - start) as usize, shadow);
+            allocation.bytes.0.truncate(allocation.size as usize);
+        }
+    }
+}
+
+fn le_u64(bytes: &[u8]) -> u64 {
+    let mut word = [0; 8];
+    let n = bytes.len().min(8);
+    word[..n].copy_from_slice(&bytes[..n]);
+    u64::from_le_bytes(word)
+}
+
+impl<'db> Machine<'db> for Recorder {
+    type Prov = u32;
+    type Shadow = Bytes;
+
+    fn step(&mut self, _: Site<'db>) {
+        self.events.push(Event::Step);
+    }
+
+    fn alloc(&mut self, addr: u64, size: u64, _: u64, kind: MemKind, zeroed: bool) -> MResult<u32> {
+        self.next += 1;
+        let prov = self.next;
+        self.events.push(Event::Alloc { addr, size, kind, prov });
+        if size != 0 {
+            let bytes = match zeroed {
+                true => Bytes::init(size as usize),
+                false => Bytes(vec![Byte::default(); size as usize]),
+            };
+            self.memory.insert(addr, Allocation { size, prov, bytes });
+        }
+        Ok(prov)
+    }
+
+    fn free(
+        &mut self,
+        ptr: Ptr<u32>,
+        _: Option<u64>,
+        _: Option<u64>,
+        kind: MemKind,
+    ) -> MResult<()> {
+        self.events.push(Event::Free { addr: ptr.addr, prov: ptr.prov, kind });
+        self.memory.remove(&ptr.addr);
+        Ok(())
+    }
+
+    fn root(&mut self, addr: u64) -> Option<u32> {
+        self.containing(addr).map(|(_, allocation)| allocation.prov)
+    }
+
+    fn read(&mut self, ptr: Ptr<u32>, size: u64, align: u64, access: Access) -> MResult<Bytes> {
+        self.events.push(Event::Read { addr: ptr.addr, prov: ptr.prov, size, align, access });
+        Ok(self.load(ptr.addr, size))
+    }
+
+    fn write(
+        &mut self,
+        ptr: Ptr<u32>,
+        size: u64,
+        align: u64,
+        access: Access,
+        shadow: &Bytes,
+    ) -> MResult<()> {
+        self.events.push(Event::Write { addr: ptr.addr, prov: ptr.prov, size, align, access });
+        self.store(ptr.addr, &shadow.slice(0..size as usize));
+        Ok(())
+    }
+
+    fn copy(&mut self, dst: Ptr<u32>, src: Ptr<u32>, size: u64, _: u64, _: bool) -> MResult<()> {
+        self.events.push(Event::Copy {
+            dst: dst.addr,
+            dst_prov: dst.prov,
+            src: src.addr,
+            src_prov: src.prov,
+            size,
+        });
+        let shadow = self.load(src.addr, size);
+        self.store(dst.addr, &shadow);
+        Ok(())
+    }
+
+    fn require_init(&mut self, shadow: &Bytes, range: Range<usize>) -> MResult<()> {
+        let len = range.len();
+        let init = shadow.slice(range).0.iter().all(|it| it.flags & INIT != 0);
+        self.events.push(Event::RequireInit { len, init });
+        Ok(())
+    }
+
+    fn atomic_load(
+        &mut self,
+        ptr: Ptr<u32>,
+        size: u64,
+        ord: AtomicOrd,
+        _: &[u8],
+    ) -> MResult<Option<Vec<u8>>> {
+        self.events.push(Event::AtomicLoad { addr: ptr.addr, prov: ptr.prov, size, ord });
+        Ok(None)
+    }
+
+    fn atomic_store(&mut self, ptr: Ptr<u32>, ord: AtomicOrd, _: &[u8], _: &[u8]) -> MResult<()> {
+        self.events.push(Event::AtomicStore { addr: ptr.addr, prov: ptr.prov, ord });
+        Ok(())
+    }
+
+    fn fence(&mut self, ord: AtomicOrd, compiler_only: bool) -> MResult<()> {
+        self.events.push(Event::Fence { ord, compiler_only });
+        Ok(())
+    }
+
+    fn typed(
+        &mut self,
+        _: &TypedCx<'_, 'db>,
+        place: Ptr<u32>,
+        ty: Ty<'db>,
+        bytes: &[u8],
+        mode: RetagMode,
+    ) -> MResult<()> {
+        self.events.push(Event::Typed {
+            addr: place.addr,
+            prov: place.prov,
+            mode,
+            ty: TyClass::of(ty),
+            value: le_u64(bytes),
+        });
+        Ok(())
+    }
+
+    fn offset(&mut self, ptr: Ptr<u32>, by: i64) -> MResult<()> {
+        self.events.push(Event::Offset { addr: ptr.addr, prov: ptr.prov, by });
+        Ok(())
+    }
+
+    fn expose(&mut self, ptr: Ptr<u32>) -> MResult<()> {
+        self.events.push(Event::Expose { addr: ptr.addr, prov: ptr.prov });
+        if let Some(prov) = ptr.prov {
+            self.exposed.push(prov);
+        }
+        Ok(())
+    }
+
+    fn from_exposed(&mut self, addr: u64) -> Option<u32> {
+        let prov = self.root(addr).filter(|it| self.exposed.contains(it));
+        self.events.push(Event::FromExposed { addr, prov });
+        prov
+    }
+
+    fn call(&mut self) -> MResult<()> {
+        self.events.push(Event::Call);
+        Ok(())
+    }
+
+    fn protect(&mut self, place: Ptr<u32>, size: u64) -> MResult<()> {
+        self.events.push(Event::Protect { addr: place.addr, prov: place.prov, size });
+        Ok(())
+    }
+
+    fn ret(&mut self) -> MResult<()> {
+        self.events.push(Event::Ret);
+        Ok(())
+    }
+
+    fn spawn(&mut self, thread: EvalThread) -> MResult<()> {
+        self.events.push(Event::Spawn { thread });
+        Ok(())
+    }
+
+    fn schedule(&mut self, running: EvalThread, runnable: &[EvalThread]) -> MResult<EvalThread> {
+        let chosen = <Plain as Machine<'db>>::schedule(&mut Plain, running, runnable)?;
+        self.events.push(Event::Schedule { running, chosen });
+        Ok(chosen)
+    }
+
+    fn join(&mut self, thread: EvalThread) -> MResult<()> {
+        self.events.push(Event::Join { thread });
+        Ok(())
+    }
+
+    fn detach(&mut self, thread: EvalThread) -> MResult<()> {
+        self.events.push(Event::Detach { thread });
+        Ok(())
+    }
+
+    fn exit(&mut self) -> MResult<()> {
+        self.events.push(Event::Exit);
+        Ok(())
+    }
+
+    fn yield_now(&mut self) {
+        self.events.push(Event::Yield);
+    }
+
+    fn thread_name(&mut self, thread: EvalThread, _: &[u8]) {
+        self.events.push(Event::ThreadName { thread });
+    }
+
+    fn release(&mut self, object: u64) -> MResult<()> {
+        self.events.push(Event::Release { object });
+        Ok(())
+    }
+
+    fn acquire(&mut self, object: u64) -> MResult<()> {
+        self.events.push(Event::Acquire { object });
+        Ok(())
+    }
+
+    fn finish(&mut self) -> MResult<()> {
+        self.events.push(Event::Finish);
+        Ok(())
+    }
+}
+
+fn fixture(program: &str) -> String {
+    format!("//- minicore: sized, copy\n{program}")
+}
+
+struct Run {
+    events: Vec<Event>,
+    stdout: String,
+    ok: bool,
+}
+
+/// Runs `name` with `Plain` and with the recorder, which must agree on the result and the
+/// output.
+fn run(program: &str, name: &str) -> Run {
+    let (db, _) = TestDB::with_single_file(&fixture(program));
+    hir_ty::attach_db(&db, || {
+        let func = function(&db, name);
+        let (plain, plain_out, _) = run_function(&db, func, Plain);
+        let (recorded, recorded_out, recorder) = run_function(&db, func, Recorder::default());
+        assert_eq!(plain, recorded);
+        assert_eq!(plain_out.stdout(), recorded_out.stdout());
+        assert_eq!(plain_out.stderr(), recorded_out.stderr());
+        Run { events: recorder.events, stdout: plain_out.stdout().into_owned(), ok: plain.is_ok() }
+    })
+}
+
+/// The events of `main`, which must run to its end.
+fn record(program: &str) -> Vec<Event> {
+    let run = run(program, "main");
+    assert!(run.ok, "the program failed: {:#?}", run.events);
+    run.events
+}
+
+/// A pointer an assignment made: the index of its `Typed`, the place it went to, and the
+/// address it points to.
+struct Made {
+    at: usize,
+    place: u64,
+    to: u64,
+}
+
+/// The first assignment of a pointer of type `ty` retagged by `mode`.
+#[track_caller]
+fn made(events: &[Event], ty: TyClass, mode: RetagMode) -> Made {
+    events
+        .iter()
+        .enumerate()
+        .find_map(|(at, event)| match *event {
+            Event::Typed { addr, mode: m, ty: t, value, .. } if t == ty && m == mode => {
+                Some(Made { at, place: addr, to: value })
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no `Typed` of a {ty:?} by {mode:?}: {events:#?}"))
+}
+
+/// The latest stack allocation before event `before` that `addr` is in: its index, start and
+/// root provenance.
+#[track_caller]
+fn stack_root(events: &[Event], before: usize, addr: u64) -> (usize, u64, u32) {
+    events[..before]
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, event)| match *event {
+            Event::Alloc { addr: start, size, kind: MemKind::Stack, prov }
+                if start <= addr && addr < start + size =>
+            {
+                Some((i, start, prov))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no stack allocation holds {addr:#x}: {events:#?}"))
+}
+
+/// Whether some event from `from` reads `size` bytes at `addr` with provenance `prov`.
+fn reads(events: &[Event], from: usize, addr: u64, prov: u32, size: u64) -> bool {
+    events[from..].iter().filter_map(Event::read).any(|it| it == (addr, Some(prov), size))
+}
+
+#[test]
+fn a_read_through_a_reference_carries_the_root_provenance() {
+    let events = record("fn main() { let x = 5u32; let r = &x; let _y = *r; }");
+    let borrow = made(&events, TyClass::Ref, RetagMode::Default);
+    let (alloc, _, x) = stack_root(&events, borrow.at, borrow.to);
+    assert!(
+        events[..alloc].contains(&Event::Step),
+        "`x` is allocated by its StorageLive: {events:#?}"
+    );
+    // The dereference loads `r`, whose bytes kept `x`'s provenance in the shadow.
+    let load = events[borrow.at..]
+        .iter()
+        .position(|it| matches!(*it, Event::Read { addr, size: 8, .. } if addr == borrow.place))
+        .map(|it| borrow.at + it)
+        .unwrap_or_else(|| panic!("`*r` doesn't load `r`: {events:#?}"));
+    assert!(
+        reads(&events, load, borrow.to, x, 4),
+        "`*r` doesn't read `x` with its root: {events:#?}"
+    );
+}
+
+#[test]
+fn casts_between_pointers_and_integers_expose_and_take_provenance() {
+    let events = record(
+        r#"
+fn main() {
+    let x = 5u32;
+    let r = &x;
+    let a = r as *const u32 as usize;
+    let p = a as *const u32;
+    let _y = unsafe { *p };
+}
+"#,
+    );
+    let borrow = made(&events, TyClass::Ref, RetagMode::Default);
+    let (_, _, x) = stack_root(&events, borrow.at, borrow.to);
+    let expose = events
+        .iter()
+        .position(|it| *it == Event::Expose { addr: borrow.to, prov: Some(x) })
+        .unwrap_or_else(|| panic!("no `Expose` of `x`: {events:#?}"));
+    let from = events[expose..]
+        .iter()
+        .position(|it| *it == Event::FromExposed { addr: borrow.to, prov: Some(x) })
+        .map(|it| expose + it)
+        .unwrap_or_else(|| panic!("no `FromExposed` of `x`'s address: {events:#?}"));
+    assert!(
+        reads(&events, from, borrow.to, x, 4),
+        "`*p` doesn't read `x` with its root: {events:#?}"
+    );
+}
+
+#[test]
+fn an_atomic_rmw_is_a_read_a_write_and_a_store_in_a_row() {
+    let events = record(
+        r#"
+#[rustc_intrinsic]
+unsafe fn atomic_xadd_seqcst<T>(dst: *mut T, src: T) -> T;
+
+fn main() {
+    let mut x = 1u32;
+    let p = &raw mut x;
+    let _old = unsafe { atomic_xadd_seqcst(p, 2) };
+}
+"#,
+    );
+    let raw = made(&events, TyClass::RawPtr, RetagMode::Raw);
+    let (_, _, x) = stack_root(&events, raw.at, raw.to);
+    let rmw = Access::Atomic { ord: AtomicOrd::SeqCst, rmw: true, cxchg_failed: false };
+    let read = events
+        .iter()
+        .position(|it| matches!(*it, Event::Read { access, .. } if access == rmw))
+        .unwrap_or_else(|| panic!("no atomic RMW read: {events:#?}"));
+    let addr = raw.to;
+    assert!(
+        matches!(
+            events[read],
+            Event::Read { addr: a, prov: Some(p), size: 4, .. } if a == addr && p == x
+        ),
+        "{events:#?}"
+    );
+    assert!(
+        matches!(
+            events.get(read + 1),
+            Some(&Event::Write { addr: a, prov: Some(p), size: 4, access, .. })
+                if a == addr && p == x && access == rmw
+        ),
+        "the RMW's write doesn't follow its read: {events:#?}"
+    );
+    assert!(
+        matches!(
+            events.get(read + 2),
+            Some(&Event::AtomicStore { addr: a, prov: Some(p), ord: AtomicOrd::SeqCst })
+                if a == addr && p == x
+        ),
+        "the RMW's `atomic_store` doesn't follow its write: {events:#?}"
+    );
+}
+
+#[test]
+fn references_are_retagged_by_how_they_are_made() {
+    let events = record(
+        r#"
+struct S {
+    v: u32,
+}
+
+impl S {
+    fn bump(&mut self) {
+        self.v += 1;
+    }
+}
+
+fn main() {
+    let x = 5u32;
+    let _r = &x;
+    let _p = &raw const x;
+    let mut s = S { v: 0 };
+    s.bump();
+}
+"#,
+    );
+    let shared = made(&events, TyClass::Ref, RetagMode::Default);
+    let raw = made(&events, TyClass::RawPtr, RetagMode::Raw);
+    assert_eq!(shared.to, raw.to, "`&x` and `&raw const x` point to different places");
+    let two_phase = made(&events, TyClass::Ref, RetagMode::TwoPhase);
+    assert!(raw.at < two_phase.at, "{events:#?}");
+}
+
+#[test]
+fn storage_dead_frees_a_block_scoped_local() {
+    let events = record(
+        r#"
+fn main() {
+    let a = 1u32;
+    {
+        let b = 2u32;
+        let _c = &b;
+    }
+    let _d = a + 40;
+}
+"#,
+    );
+    let borrow = made(&events, TyClass::Ref, RetagMode::Default);
+    let (alloc, start, b) = stack_root(&events, borrow.at, borrow.to);
+    assert!(
+        events[..alloc].contains(&Event::Step),
+        "`b` is allocated by its StorageLive: {events:#?}"
+    );
+    let free = events[borrow.at..]
+        .iter()
+        .position(|it| *it == Event::Free { addr: start, prov: Some(b), kind: MemKind::Stack })
+        .map(|it| borrow.at + it)
+        .unwrap_or_else(|| panic!("`b` is never freed: {events:#?}"));
+    let sum = events
+        .iter()
+        .position(|it| matches!(*it, Event::Typed { value, .. } if value as u32 == 41))
+        .unwrap_or_else(|| panic!("no assignment of `a + 40`: {events:#?}"));
+    assert!(free < sum, "`b` is freed at the frame's end, not at its StorageDead: {events:#?}");
+}
+
+#[test]
+fn a_step_comes_before_each_statement_s_memory_events() {
+    let events = record("fn main() { let x = 5u32; let r = &x; let _y = *r; }");
+    let first_step = events.iter().position(|it| *it == Event::Step).expect("no step");
+    let first_memory = events.iter().position(Event::is_memory).expect("no memory event");
+    assert!(first_step < first_memory, "{events:#?}");
+    // One assignment is one statement: its `Typed` ends its statement's memory events.
+    for statement in events.split(|it| *it == Event::Step) {
+        let typed: Vec<usize> = statement
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| matches!(it, Event::Typed { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(typed.len() <= 1, "two typed copies without a step between: {statement:#?}");
+        if let Some(&typed) = typed.first() {
+            assert!(
+                !statement[typed + 1..].iter().any(|it| it.read().is_some()
+                    || matches!(it, Event::Write { .. })),
+                "memory events after an assignment's `Typed` before the next step: {statement:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn plain_and_the_recorder_agree_on_output() {
+    let run = run(
+        r#"
+extern "C" {
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+}
+
+fn main() {
+    let buf = [b'o', b'k', b'\n'];
+    let r = &buf;
+    unsafe { write(1, r as *const [u8; 3] as *const u8, 3) };
+}
+"#,
+        "main",
+    );
+    assert!(run.ok, "{:#?}", run.events);
+    assert_eq!(run.stdout, "ok\n");
+}
+
+#[test]
+fn plain_and_the_recorder_agree_on_a_failure() {
+    let run = run(
+        r#"
+fn divide(a: u32, b: u32) -> u32 {
+    a / b
+}
+
+fn main() {
+    let _q = divide(1, 0);
+}
+"#,
+        "main",
+    );
+    assert!(!run.ok, "dividing by zero passed: {:#?}", run.events);
+}

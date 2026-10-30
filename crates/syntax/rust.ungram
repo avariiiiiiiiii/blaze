@@ -142,8 +142,11 @@ CfgPredicate =
   CfgAtom
 | CfgComposite
 
+// A literal is a predicate only as `version`'s argument; elsewhere it is an error
+// (rustc's `parse_cfg_entry`).
 CfgAtom =
   ('#ident' | 'true' | 'false') ('=' '@string')?
+| Literal
 
 CfgComposite =
   keyword:'#ident' '(' (CfgPredicate (',' CfgPredicate)* ','?) ')'
@@ -209,7 +212,7 @@ MacroDef =
 
 Module =
   AnyAttr* Visibility?
-  'mod' Name
+  'unsafe'? 'mod' Name
   (ItemList | ';')
 
 ItemList =
@@ -568,7 +571,7 @@ TupleExpr =
   AnyAttr* '(' AnyAttr* fields:(Expr (',' Expr)* ','?)? ')'
 
 RecordExpr =
-  Path RecordExprFieldList
+  AnyAttr* Path RecordExprFieldList
 
 RecordExprFieldList =
   '{'
@@ -734,7 +737,7 @@ TypeBoundList =
 
 TypeBound =
   Lifetime
-| ForBinder? ('~' 'const' | '[' 'const' ']' | 'const')? 'async'? '?'? Type
+| ForBinder? ('~' 'const' | '[' 'const' ']' | 'const')? 'async'? ('?' | '!')? Type
 | 'use' UseBoundGenericArgs
 
 UseBoundGenericArgs =
@@ -768,6 +771,11 @@ Pat =
 | DerefPat
 | NotNull
 | CfgPredPat
+| GuardPat
+
+// A sub-pattern with a guard, `(x if cond)` (`guard_patterns`)
+GuardPat =
+  Pat guard:MatchGuard
 
 NotNull =
     '!' 'null'
@@ -796,7 +804,7 @@ RangePat =
   | op:('..' | '..=') end:Pat
 
 RefPat =
-  '&' 'mut'? Pat
+  '&' ('pin' ('const' | 'mut') | 'mut')? Pat
 
 RecordPat =
   Path RecordPatFieldList

@@ -147,6 +147,8 @@ fn isa(unit: &Unit) -> Result<&'static dyn TargetIsa, CodegenError> {
 }
 
 impl Backends<'_> {
+    /// `instance` and whether its references were listed for a unit that MIR-inlines
+    /// ([`HirFrontend::inlines`]), as [`Describe`](blaze_codegen::Describe) listed them.
     pub(super) fn prepared(
         &self,
         db: &dyn HirDatabase,
@@ -154,11 +156,19 @@ impl Backends<'_> {
         hashes: &dyn Hashes,
         unit: &Unit,
         spec: &Spec,
-        instance: &HirInstance,
+        (instance, inlined): (&HirInstance, bool),
         refs: &Refs,
     ) -> Result<(Shape, Prepared), CodegenError> {
         let fail = |what: String| failed(unit, format!("{instance:?}: {what}"));
-        let walked = refs::listed(db, instance).map_err(fail)?;
+        let build = Build::of(spec);
+        if build.inlines && !inlined {
+            return Err(fail(format!(
+                "a unit whose MIR is inlined ({:?}) of references listed for units that inline \
+                 none: what the inlined code calls is not among them",
+                unit.backend
+            )));
+        }
+        let walked = refs::listed(db, instance, inlined).map_err(fail)?;
         if walked.len() != refs.len() {
             return Err(fail(format!(
                 "{} references given for an instance of {}",
@@ -167,7 +177,7 @@ impl Backends<'_> {
             )));
         }
         let mut placer = Placer::listed(walked);
-        let mut code = build::with(Build::of(spec), || built(db, instance, spec.overflow_checks))
+        let mut code = build::with(build, || built(db, instance, spec.overflow_checks))
             .map_err(fail)?
             .map_err(fail)?;
         let krate = compiled_in(db, instance);
@@ -186,21 +196,20 @@ impl Backends<'_> {
         };
         let lines = spec.debuginfo != DebugInfo::None;
         let spans = match (&source, lines) {
-            (Some((owner, spans)), true) => spans
-                .iter()
-                .map(|span| hashes.span(db, *owner, *span))
-                .collect::<Result<_, _>>()
-                .map_err(fail)?,
+            (Some(source), true) => written_spans(db, hashes, source).map_err(fail)?,
             _ => Vec::new(),
         };
         let told = matches!(spec.debuginfo, DebugInfo::Limited | DebugInfo::Full);
-        let (variables, scopes) = match (&source, variables) {
-            (Some((owner, spans)), Some((env, variables))) if told => {
+        let (variables, mut scopes) = match (&source, variables) {
+            (Some(source), Some((env, variables))) if told => {
                 let krate = env.as_ref(db).krate;
-                named(db, hashes, krate, *owner, &variables, spans).map_err(fail)?
+                named(db, hashes, krate, source.owner, &variables, &source.spans).map_err(fail)?
             }
             _ => Default::default(),
         };
+        if let (Some(source), true) = (&source, lines) {
+            inlined_scopes(db, hashes, source, &mut scopes).map_err(fail)?;
+        }
         if let Built::Ir(pending) = &mut code {
             if !lines {
                 pending.func.stencil.srclocs.clear();
@@ -349,6 +358,51 @@ fn assembled(text: &str) -> Result<Built, String> {
     Ok(Built::Assembled(code, Requests::default()))
 }
 
+/// Where each statement the function's line rows are of is written, inlined code's in the
+/// body it was inlined from.
+fn written_spans(
+    db: &dyn HirDatabase,
+    hashes: &dyn Hashes,
+    source: &fragment::Source,
+) -> Result<Vec<SpanRef>, String> {
+    let mut spans = Vec::with_capacity(source.spans.len());
+    for at in 0..source.spans.len() as u32 {
+        let Some(written) = source.written(at, None) else {
+            return Err(format!("statement {at} of the function, which has no place in the source"));
+        };
+        spans.push(hashes.span(db, written.owner, written.span)?);
+    }
+    Ok(spans)
+}
+
+/// Tells `scopes` of the bodies the MIR optimizer inlined into the function: each one's call
+/// site, and which of them each statement is of.
+fn inlined_scopes(
+    db: &dyn HirDatabase,
+    hashes: &dyn Hashes,
+    source: &fragment::Source,
+    scopes: &mut side::Scopes,
+) -> Result<(), String> {
+    if source.inlined.is_empty() {
+        return Ok(());
+    }
+    scopes.inlined.reserve(source.scopes.len());
+    for (index, scope) in source.scopes.iter().enumerate() {
+        let Some(at) = source.call_site(index as u32, None) else {
+            return Err(format!(
+                "the call inlined scope {index} is inlined at, of {:?} within inlined callee \
+                 {:?}, which is no item's body",
+                scope.call_site, scope.parent
+            ));
+        };
+        let call_site = hashes.span(db, at.owner, at.span)?;
+        scopes.inlined.push(side::InlinedScope { parent: scope.parent, call_site });
+    }
+    scopes.inlined_of_span =
+        (0..source.spans.len() as u32).map(|at| source.scope_of(at)).collect();
+    Ok(())
+}
+
 /// The named locals a debugger is told of, and the scopes of the body they are bound in: a
 /// name a macro of the compiler's made up is no name of the source. `spans` are the
 /// statements the function's line rows are of. Their types are of a body monomorphized in
@@ -460,7 +514,7 @@ fn scoped(
         },
         _ => side::SpanScope::Before,
     }));
-    (side::Scopes { parents, of_span }, of_binding)
+    (side::Scopes { parents, of_span, ..Default::default() }, of_binding)
 }
 
 /// Makes every call and every address of blaze's own code and data direct: in v2 the linker
@@ -674,7 +728,8 @@ impl<'db> Prepare for Backends<'db> {
     ) -> Result<(Shape, Prepared), CodegenError> {
         check_spec(unit, spec)?;
         frontend.with(|db, homes| {
-            self.prepared(db, homes, &*frontend.hashes, unit, spec, instance, refs)
+            let inlined = frontend.inlines(db, instance).map_err(|e| failed(unit, e))?;
+            self.prepared(db, homes, &*frontend.hashes, unit, spec, (instance, inlined), refs)
         })
     }
 

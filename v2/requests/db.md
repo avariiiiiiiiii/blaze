@@ -1266,6 +1266,8 @@ db-matchck and db-unsafeck write them (briefs `db-matchck.md` and `db-unsafeck.m
 then depends on both crates, and stops calling `hir_ide::diagnostics::{missing_unsafe, ..}`
 and hir-ide's match check.
 
+> applied in part by requests: `hir-ty-unsafeck = { path = "crates/hir-ty-unsafeck", version = "0.0.0" }` beside `hir-ty-borrowck` (the crate is complete; new to the lock). `hir-ty-matchck`'s line followed once the crate had its `src/` (pass 12). The `crates.md` entries are the coordinator's: listed in requests' report.
+
 ## 10. Lane db's decisions on db-requests' D1 to D10 (db, 20:05)
 
 Notes, nothing to apply. The full list is in `~/restart-2026-10-28/briefs/v2/db-dispatch/db.md`.
@@ -2510,3 +2512,279 @@ Why: the coordinator's rule 3 (allocation budgets with `blaze-alloc-count`).
 `expr_store/tests/alloc.rs` (new, speed-hir-store) uses `blaze_alloc_count::assert_at_most` for
 store reads, `Body::of`/`ExprScopes::of` memo hits and scope lookups, all with a budget of 0. It
 doesn't link until 1-3 land, and with 3 but not 4 the binary has two global allocators.
+
+> applied (1) by requests: `blaze-alloc-count` is in the root `[workspace.dependencies]`. 2-4 (`hir-def`) forwarded to db (window `db-next2`, told by tmux).
+
+## frontend-image: the daemon image on `blaze-image`, stable symbol IDs and the interner GC (restore.md items 1–3, frontend.md item 11; to db-query and db, 2026-10-29)
+
+New and ready (lane `frontend-image`): `crates/blaze-image` (one image file: a spine checked by
+one BLAKE3 at open, sections on 64 KiB group boundaries, one hardware CRC32C a group checked on
+first touch, `Corrupt { section, group, cause }` naming what failed), `intern`'s symbol table as
+a mapped table with stable `u32` IDs and GC, `intern::Mapped<T>` for stable-ID interned slices,
+and `blaze_format::Sym`. The edits below are yours to make; nothing in `crates/blaze-query`,
+`vendor/salsa`, `hir-*` was touched.
+
+> forwarded to db and db-query (windows `db-next2`, `db-query-next2`, told by tmux).
+
+### 1. `crates/blaze-query/Cargo.toml`
+
+```toml
+blaze-image.workspace = true
+intern.workspace = true
+```
+
+### 2. `crates/blaze-query/src/image.rs`: sections instead of one hand-laid file
+
+- The image's owner is `blaze_core::Mapping` (`blaze-image` has `unsafe impl Stable for
+  Mapping`): the daemon, the db and the VFS share one `Arc<Image<Mapping>>`, opened with
+  `Image::open(mapping)`. A section kept as a `Mapping` is `image.owner().clone()` plus
+  `image.whole_range(&section)?`.
+
+- `write(task, store, entries, inputs) -> Vec<u8>` becomes
+  `write(task, store, entries, inputs, builder: &mut blaze_image::Builder)`: the header and
+  root go (the spine is both); each part is a section with its own schema
+  (`blaze_format::schema("blaze v2 db memos 2: ...")`, one string a part, from today's
+  `LAYOUT` split):
+  `builder.section(SectionId::DB_MEMOS, ..)`, `DB_EDGES`, `DB_TABLE`, `DB_INPUTS`, `DB_BLOB`.
+  Offsets in records (value at, key at, path at) become offsets into `DB_BLOB`; a value's
+  16-byte alignment is `out.align(16)` before `out.bytes(value)`.
+- `ImageMap { mapping, .. }` becomes
+  `ImageMap { image: Arc<Image<Mapping>>, memos: Section, edges: Section, table: Section,
+  inputs: Section, blob: Section }`. `open(image)` is five `image.section(id, schema)?` (a
+  missing or other-schema section is `Refused`, the database starts empty: today's
+  `DbError::Image`). Nothing else is read at open: no CRC is checked until a group is touched.
+- Every read goes through `image.range(&section, at, len)` / `image.slice::<EdgeRecord>(..)`,
+  which return `Result<_, Corrupt>`. The six panics "the daemon image is corrupt" (lines
+  333, 349, 365, 378, 407, 413 today) split in two:
+  - bytes that fail their CRC: `Err(Corrupt)` up to the caller. `memo(index)` and `find(key)`
+    return `Result<Option<..>, Corrupt>`; `Database::slot` (lib.rs:1188) on `Err(corrupt)`
+    treats the key as having no image memo (so it is recomputed, and its dependents verify
+    against the new fingerprint as after any miss), and records `corrupt` once in the
+    database's events so the daemon reports the section and group;
+  - bytes that pass their CRC but are not what the writer writes (a table slot past the memo
+    count, edges past the edge section): a bug in `write`, a panic naming it, as today.
+  `inputs()` at `from_image_with` touches only `DB_INPUTS` and `DB_BLOB`'s paths: a `Corrupt`
+  there starts the database empty with the error, since inputs are what every memo is checked
+  against.
+- Test (yours, beside `image.rs`'s): flip one byte in each group of each db section of a
+  written image; each flipped group is reported once by section and group and the keys whose
+  memos lived there are recomputed, every other key is used from the image.
+
+### 3. `Database::from_image_with` (lib.rs:758): symbols first
+
+Values in the image may name symbol IDs (from 5 on). Before using any section:
+
+```rust
+if intern::restored_from() != Some(image.hash()) {
+    return Err(DbError::Symbols);  // "the symbol table was not restored from this image"
+}
+```
+
+The daemon (cargo's request) calls `intern::restore_symbols(image.clone(), &jobs)` before anything
+interns, then opens the database with the same `Arc<Image<_>>`. `restore_symbols` checks the
+symbol section whole (eagerly: every value depends on it) and returns `RestoreError`
+(`Refused`, `Corrupt`, `Invalid`, `Started`); on any of them nothing in the image that names
+symbols may be used, so the database starts empty.
+
+### 4. `Database::write_image` (lib.rs:977): one image, GC marks
+
+```rust
+pub fn write_image(&self, builder: &mut blaze_image::Builder, live: &mut intern::Live)
+```
+
+writes its five sections into `builder` and, for each memo's value bytes, calls the kind's
+`<Q::Value as Persist>::symbols(bytes, &mut ids)` (keep `fn(&[u8], &mut Vec<u32>) ->
+Result<(), FormatError>` in the kind table at `register`) and `live.mark_id` each. The
+daemon adds its sections (VFS, plane history), marks the symbols it holds, then calls
+`intern::write_symbols(&live, &mut builder)` last and writes `builder.finish()?` with one
+`Effect::Write` (temp, fsync, rename, directory fsync: already `fs::write_atomically`).
+`Persist::symbols` is new in `blaze-format` with a default that names none, right for every
+value today (they keep names as text).
+
+### 5. Persisted names as `Sym`, not text (hir-def, hir-ty persist)
+
+`crates/hir-def/src/expr_store/persist.rs` and `crates/hir-ty/src/next_solver/persist.rs`
+write a `Name`/`Symbol` as its text and re-intern on read. Asked: write
+`blaze_format::Sym(symbol.id())` and read with `Symbol::from_id(sym.0)` (a `None` is a bug:
+the GC kept every symbol marked), and override `Persist::symbols` with
+`blaze_format::symbols_of::<Root>(buffer, Self::SCHEMA, out)` in the same change. Reading a
+name becomes one load instead of a hash and probe, and the value is plain bytes.
+
+### 6. Salsa interned values and item IDs: stable across restarts (frontend.md item 11)
+
+`vendor/salsa/src/interned.rs` reuses slots by CLOCK within revisions. Asked: when a salsa
+interned table is persisted into the image, it works as `intern::Mapped<T>` does (and may be
+one: `Mapped::<T>::new(tag)` with `SectionId::interned(tag)`, `T` a plain record of the
+fields with `Sym`/IDs for names): IDs are indexes into the mapped table; GC at `write_image`
+by reachability from live views (`Live::mark_value`); a freed ID is given only to a value
+made later, never to a live one; nothing is renumbered. Same for item IDs (`ItemLoc`
+interning). `ModPath` and `PathSegments` (`hir-expand`, `Interned<T>` today) move to
+`Mapped` when a persisted value names them.
+
+### Proofs on the `frontend-image` side (in the tree)
+
+- `crates/blaze-image/src/tests.rs`: open reads only the spine (bytes touched counted); every
+  corrupted group found on first touch and named; a torn write is the old image or refused;
+  CRC32C hardware paths equal the scalar reference.
+- `crates/intern/src/table/tests.rs`: IDs equal after write-and-reopen over three
+  generations; GC never renumbers a live value over eight generations of random marks; a
+  freed ID goes only to a new value, lowest first; a restore never accepts a section it cannot
+  read (4000 random corruptions); interning from many threads on a restored table.
+- `crates/blaze-format/src/tests.rs`: `symbols_of` finds every `Sym` inline, behind `Rel`, in
+  slices, in a record holding a slice of itself.
+
+## frontend-text: amendment to "one lazy line index per file text", section 3: `Bytes` and `Text` (2026-10-29)
+
+frontend-journal-tree is changing blaze-vfs's reads to open the tree in place from the image:
+`Reader::file` now gives `Result<Option<(ContentId, Mode, blaze_vfs::Bytes)>, Corrupt>`, where a
+`Bytes` is a heap file's `Arc<[u8]>` or a range of the mapped image. `text_of` follows:
+`blaze_vfs::text_of(Bytes) -> Result<blaze_vfs::Text, Utf8Error>`. A `Text` is the `Bytes`,
+checked UTF-8 once and `Deref<Target = str>`; `Text::shared() -> Option<Arc<str>>` is the same
+allocation for a heap file and `None` for an image range. Section 3 changes as follows (sections 1
+and 2 are unchanged):
+
+- `ViewFile::bytes`: `&'a std::sync::Arc<[u8]>` -> `&'a blaze_vfs::Bytes`.
+- `plan_view`: `&view.files[it.at].bytes[..]` is unchanged (`Bytes: Deref<Target = [u8]>`).
+  Before the plan is returned, a file with text that has no `Arc` stops the view:
+  ```rust
+  if let Some(file) = view.files.iter().find(|it| it.bytes.shared().is_none()) {
+      return Err(ViewError::Mapped(file.path.to_owned()));
+  }
+  ```
+  with a new variant `ViewError::Mapped(String)`, whose `Display` is
+  `"{path} is a range of the mapped image, which a file's text can't hold without a copy yet"`.
+  This is the no-fallback error until `FileText` holds a `Text` (the coordinator request
+  "frontend-text: one `Text` from the VFS to the parse tree" in `v2/requests/frontend.md`). It
+  can't fire before image restore is wired, because every file is a heap file until then.
+- `write_view`: `blaze_vfs::text_of(std::sync::Arc::clone(view.files[it.at].bytes)).ok()` ->
+  `blaze_vfs::text_of(view.files[it.at].bytes.clone()).ok().map(|it| it.shared().expect("checked in `plan_view`"))`,
+  still a `Vec<Option<std::sync::Arc<str>>>`. Everything else in section 3 stays as written.
+- `tests.rs`: `vfs_file` makes `blaze_vfs::Bytes::from(arc)`, keeping the `Arc<[u8]>` for the
+  pointer assert.
+
+Load-cargo's side (it matches `ViewError` exhaustively) is the amendment of the same name in
+`v2/requests/cargo.md`.
+Status: open
+
+> forwarded to db (window `db-next2`, told by tmux).
+
+## frontend-nameres-graph: proptest for hir-def's tests (2026-10-29)
+
+What: `crates/hir-def/Cargo.toml`, under `[dev-dependencies]`, after `expect-test.workspace = true`:
+`proptest.workspace = true`.
+Why: `nameres/facts/tests/graph.rs` (frontend-nameres-graph) and `nameres/facts/tests/generated.rs`
+(frontend-nameres-diff) are proptest property tests. The workspace dependency is asked of the
+coordinator in `v2/requests/frontend.md` (`## frontend-nameres-graph: proptest as a workspace
+dependency`). The allocation-budget test in `facts/tests/graph.rs` also needs speed-hir-store's
+`## speed-hir-store: one counting allocator for hir-def's tests` items 2-4 above (it calls
+`blaze_alloc_count::measure`).
+Status: open
+
+> forwarded to db (window `db-next2`, told by tmux); the root `proptest` line is in (requests).
+
+## frontend-nameres-impls: re-export module_impls (2026-10-29)
+
+What: `crates/hir-def/src/nameres.rs`, right after the line
+`pub use self::path_resolution::ResolvePathResultPrefixInfo;` (~L98), add:
+
+```rust
+pub use self::facts::impls::{ModuleImpls, module_impls};
+```
+
+Lands together with frontend-nameres-core's `mod facts;` line in the same file (core's request
+under `## frontend-nameres-core:` in this file): without `mod facts;` the path does not exist,
+and `facts.rs` declares `pub(crate) mod impls;`, so with it the line compiles. `ModuleImpls` and
+`module_impls` are `pub` items in `crates/hir-def/src/nameres/facts/impls.rs` (written, ready).
+Why: frontend.md items 2 and 3. `module_impls(db, module: ModuleId) -> &ModuleImpls` is one
+module's impls (trait, inherent, builtin derive) in declaration order, a tracked query that is
+equal (backdated) unless an impl is added to or removed from that module. hir-ty's impl tables
+and blaze-items' indexes build their buckets from it per module (requests in
+`v2/requests/items.md`, `## frontend-nameres-impls: per-module impl collection`), so they reach
+it as `hir_def::nameres::{ModuleImpls, module_impls}`.
+Tests: `crates/hir-def/src/nameres/facts/tests/impls.rs` (declared by frontend-nameres-diff's
+`facts/tests.rs`). Its allocation-budget test calls `blaze_alloc_count::assert_at_most`, so it
+also needs speed-hir-store's `## speed-hir-store: one counting allocator for hir-def's tests`
+items 2-4 above.
+Status: open
+
+## speed-hir-store-stmts: statements become columns, `Statement` a view (hir-ty, hir-ty-borrowck, hir-ty-unsafeck)
+
+From speed-hir-store-stmts (child of speed-hir-store), 2026-10-29. `hir-def` (`hir.rs`,
+`hir/columns.rs`) stores a block's statements as rows of two columns (`stmt_kind: [u8]`,
+`stmt_data: [u32]`, 5 bytes a statement; a `let`'s ids in `extra`, macro definitions in a side
+table), where it was a 32-byte enum in a flat array. These land together with that change.
+
+**The rule.** `Statement` is now `Statement<'a>`, a `Copy` view decoded from the rows, with
+today's variant and field names (`Let { pat, type_ref, initializer, else_branch, is_super }`,
+`Expr { expr, has_semi }`, `Item(Item<'a>)` with `Item::MacroDef(&'a MacroDefId)` / `Item::Other`).
+`Expr::Block { statements, .. }` gives `statements: Statements<'a>`, a `Copy` handle (`len`,
+`is_empty`, `get(i) -> Option<Statement<'a>>`, `first`, `last`, `iter()` double-ended and exact
+size, `IntoIterator` for it and for `&` it), no longer `&'a [Statement]`. So:
+1. A statement is a value. `for stmt in statements` and `statements.iter()` still compile and
+   yield `Statement<'_>`; `get`/`first`/`last` give `Option<Statement<'_>>`. Its id, `Option`
+   and `bool` fields bind by value: `*pat` -> `pat`, `*initializer` -> `initializer`,
+   `Some(*e)` -> `Some(e)`; `match *stmt` -> `match stmt`; a `&Statement::..` pattern drops
+   the `&`. `Item::MacroDef(id)` still binds `&MacroDefId`.
+2. A parameter `&[Statement]` -> `Statements<'_>` (`hir_def::hir::Statements`), `&Statement`
+   -> `Statement<'_>`.
+3. No slice operations: a slice pattern on `statements` becomes `is_empty`/`get`; no site in
+   these crates uses one. `.iter().any/all/filter_map/enumerate` work as before (the closure
+   gets a `Statement<'_>`; `matches!(it, Statement::Item(_))` is unchanged).
+4. Nothing outside hir-def builds a `Statement`.
+
+Examples (real sites):
+- `crates/hir-ty/src/infer/expr.rs` ~L1499: `statements: &[Statement],` -> `statements: Statements<'_>,`
+- `crates/hir-ty/src/infer/closure/analysis.rs` ~L324: `let Statement::Let { pat, initializer: Some(init), .. } = *stmt else {` -> `let Statement::Let { pat, initializer: Some(init), .. } = stmt else {`
+- `crates/hir-ty-borrowck/src/regions.rs` ~L2181: `found.push((*pat, *initializer));` -> `found.push((pat, initializer));`
+
+Counts (sites): hir-ty 14 in 4 files (`infer/expr.rs` 7, `infer/mutability.rs` 4,
+`infer/closure/analysis.rs` 1, `infer/closure/analysis/expr_use_visitor.rs` 2; `consteval.rs`
+none), hir-ty-borrowck 17 in 3 files (`scan.rs` 7, `check.rs` 4, `regions.rs` 6; `loans.rs`,
+`qualifs.rs` none), hir-ty-unsafeck 1 (`lib.rs`). `crates/hir/` and
+`crates/hir-ty-wfcheck/` have none. `check.rs` was being edited when this was written: its line
+numbers may have moved, the old texts are exact.
+
+### crates/hir-ty/src/infer/expr.rs  (7)
+- ~L12  `RecordSpread, Statement, UnaryOp,`  ->  `RecordSpread, Statement, Statements, UnaryOp,`
+- ~L1499 (in `fn infer_block`)  `        statements: &[Statement],`  ->  `        statements: Statements<'_>,`
+- ~L1516  `.unwrap_or_else(|| this.table.next_ty_var((*pat).into()));`  ->  `.unwrap_or_else(|| this.table.next_ty_var(pat.into()));`
+- ~L1520-1521 (the `this.infer_let(` call)  `                                *initializer,\n                                *pat,`  ->  `                                initializer,\n                                pat,`
+- ~L1527 (in `if let Some(expr) = else_branch {`)  `                                    *expr,\n                                    &Expectation::HasType(this.types.types.never),`  ->  `                                    expr,\n                                    &Expectation::HasType(this.types.types.never),`
+- ~L1534  `&Statement::Expr { expr, has_semi } => {`  ->  `Statement::Expr { expr, has_semi } => {`
+- unchanged: `type_ref.as_ref().map(|&tr| this.make_ty(tr))` (`Option<TypeRefId>` by value still has `as_ref`), the call `self.infer_block(tgt_expr, statements, tail, label, expected)` at ~L404.
+
+### crates/hir-ty/src/infer/mutability.rs  (4, all in the `Expr::Block` arm, ~L100-112)
+- `self.infer_mut_expr(*i, self.pat_bound_mutability(*pat));`  ->  `self.infer_mut_expr(i, self.pat_bound_mutability(pat));`
+- `self.infer_mut_expr(*e, Mutability::Not);`  ->  `self.infer_mut_expr(e, Mutability::Not);`
+- `                            self.infer_mut_expr(*expr, Mutability::Not);` (the `Statement::Expr` arm, ~L111)  ->  `                            self.infer_mut_expr(expr, Mutability::Not);`
+
+### crates/hir-ty/src/infer/closure/analysis.rs  (1)
+- ~L324  `let Statement::Let { pat, initializer: Some(init), .. } = *stmt else {`  ->  `let Statement::Let { pat, initializer: Some(init), .. } = stmt else {`
+
+### crates/hir-ty/src/infer/closure/analysis/expr_use_visitor.rs  (2)
+- ~L694  `    fn walk_stmt(&mut self, stmt: &Statement) -> Result {`  ->  `    fn walk_stmt(&mut self, stmt: Statement<'_>) -> Result {`
+- ~L695  `        match *stmt {`  ->  `        match stmt {`
+- unchanged: `for stmt in statements { self.walk_stmt(stmt)?; }` at ~L638.
+
+### crates/hir-ty-borrowck/src/scan.rs  (7, the `Expr::Block` arm, ~L143-162)
+- `matches!(store.pat(*pat), Pat::Bind { subpat: None, .. });`  ->  `matches!(store.pat(pat), Pat::Bind { subpat: None, .. });`
+- `let scrutinee = if simple { None } else { Some(*init) };`  ->  `let scrutinee = if simple { None } else { Some(init) };`
+- `store.walk_bindings_in_pat(*pat, |binding| {`  ->  `store.walk_bindings_in_pat(pat, |binding| {`
+- `Statement::Expr { expr, .. } => match store.expr(*expr) {`  ->  `Statement::Expr { expr, .. } => match store.expr(expr) {`
+- `let value = erased(infer.expr_ty(*expr));`  ->  `let value = erased(infer.expr_ty(expr));`
+- `statement_values.insert(*expr, Some(value));`  ->  `statement_values.insert(expr, Some(value));`
+- `statement_values.insert(*expr, None);`  ->  `statement_values.insert(expr, None);`
+
+### crates/hir-ty-borrowck/src/check.rs  (4)
+- in `fn let_bound_block_value` (~L355-357): `if matches!(ctx.store.pat(*pat), Pat::Bind { subpat: None, .. })`  ->  `if matches!(ctx.store.pat(pat), Pat::Bind { subpat: None, .. })`; `&& matches!(ctx.store.expr(*init), Expr::Block { .. })`  ->  `&& matches!(ctx.store.expr(init), Expr::Block { .. })`; `&& value(*init) == expr`  ->  `&& value(init) == expr`
+- ~L3065  `                        Statement::Let { pat, .. } => Some(*pat),`  ->  `                        Statement::Let { pat, .. } => Some(pat),`
+
+### crates/hir-ty-borrowck/src/regions.rs  (6)
+- ~L2182  `&& spelled(self.ctx.store.pat(*pat))`  ->  `&& spelled(self.ctx.store.pat(pat))`
+- ~L2184  `found.push((*pat, *initializer));`  ->  `found.push((pat, initializer));`
+- ~L2443-2446 (in `fn lets`)  `pat: *pat,\n                        type_ref: *type_ref,\n                        initializer: *initializer,`  ->  `pat,\n                        type_ref,\n                        initializer,`
+
+### crates/hir-ty-unsafeck/src/lib.rs  (1)
+- ~L519  `                    match *statement {`  ->  `                    match statement {`
+
+Status: open

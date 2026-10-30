@@ -162,13 +162,61 @@ struct Shared {
     cookies: PathBuf,
     /// Each flush whose cookie the stream has not heard of yet.
     flushes: Mutex<Vec<Tag>>,
+    /// `cookies`, kept to name a flush's cookie in without allocating ([`with_cookie`]).
+    writing: Mutex<PathBuf>,
+    /// The callback's buffers, kept for the stream's life: on its queue only, so never
+    /// waited for.
+    heard: Mutex<Heard>,
     send: Box<dyn Fn(Completion) + Send + Sync>,
     stopped: AtomicBool,
     mode: Mode,
 }
 
+/// The callback's buffers, grown once to their most and reused, so a batch that holds a
+/// cookie allocates nothing (docs/v2/plan/design/memory.md: scratch reused per worker).
+struct Heard {
+    /// The cookies a batch named.
+    cookies: Vec<u64>,
+    /// The flushes those cookies tell.
+    told: Vec<Tag>,
+    /// `cookies`, to name a cookie in for its removal.
+    path: PathBuf,
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `n` in decimal in `digits`: a cookie's name, with no allocation.
+fn decimal(mut n: u64, digits: &mut [u8; 20]) -> &[u8] {
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            return &digits[at..];
+        }
+    }
+}
+
+/// `dir` in a buffer with room for a cookie's name after it, for [`with_cookie`].
+fn cookie_buffer(dir: &Path) -> PathBuf {
+    // alloc: setup, once per stream.
+    let mut buffer = PathBuf::with_capacity(dir.as_os_str().len() + 21);
+    buffer.push(dir);
+    buffer
+}
+
+/// Runs `f` on the path of the cookie of the flush `tag`, made in `dir`, the cookies'
+/// directory: its name is pushed and popped again, so a buffer grown once allocates no more.
+/// std names a path this short to the system from the stack.
+fn with_cookie<R>(dir: &mut PathBuf, tag: Tag, f: impl FnOnce(&Path) -> R) -> R {
+    let mut digits = [0; 20];
+    dir.push(std::ffi::OsStr::from_bytes(decimal(tag.0, &mut digits)));
+    let result = f(dir);
+    dir.pop();
+    result
 }
 
 /// Numbers each stream's directory of cookies in the process's.
@@ -179,8 +227,9 @@ static STREAMS: AtomicU64 = AtomicU64::new(0);
 fn cookies() -> io::Result<PathBuf> {
     let number = STREAMS.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir()
+        // alloc: setup, once per stream.
         .join(format!("blaze-fsevents-{}", std::process::id()))
-        .join(number.to_string());
+        .join(number.to_string()); // alloc: setup, once per stream.
     _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     std::fs::canonicalize(&dir)
@@ -349,6 +398,7 @@ impl Stream {
         };
         let path = c_path(&real_dir)?;
         let cookies = cookies().map_err(|error| {
+            // alloc: an error path.
             io::Error::new(error.kind(), format!("making the cookies of a watch: {error}"))
         })?;
         let cookie_path = c_path(&cookies)?;
@@ -357,8 +407,16 @@ impl Stream {
             dir: dir.clone(),
             root,
             real_dir,
+            writing: Mutex::new(cookie_buffer(&cookies)),
+            // alloc: setup, once per stream: the callback's buffers at the size a batch of a
+            // few cookies needs.
+            heard: Mutex::new(Heard {
+                cookies: Vec::with_capacity(4),
+                told: Vec::with_capacity(4),
+                path: cookie_buffer(&cookies),
+            }),
             cookies,
-            flushes: Mutex::new(Vec::new()),
+            flushes: Mutex::new(Vec::with_capacity(4)), // alloc: setup, once per stream.
             send,
             stopped: AtomicBool::new(false),
             mode,
@@ -456,7 +514,7 @@ impl Stream {
         // SAFETY: `shared` lives until this stream is dropped, which `&self` outlives.
         let shared = unsafe { &*self.shared };
         lock(&shared.flushes).push(tag);
-        let written = std::fs::write(shared.cookies.join(tag.0.to_string()), b"");
+        let written = with_cookie(&mut lock(&shared.writing), tag, |it| std::fs::write(it, b""));
         match written {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -539,13 +597,15 @@ extern "C" fn heard(
     let paths = unsafe { std::slice::from_raw_parts(paths.cast::<*const c_char>(), count) };
     // SAFETY: and `count` event IDs.
     let ids = unsafe { std::slice::from_raw_parts(ids, count) };
-    let mut cookies = Vec::new();
+    let mut heard = lock(&shared.heard);
+    let Heard { cookies, told, path } = &mut *heard;
+    cookies.clear();
     match &shared.mode {
-        Mode::Watch => changed(shared, flags, paths, &mut cookies),
-        Mode::Journal(journal) => journaled(shared, journal, flags, paths, ids, &mut cookies),
+        Mode::Watch => changed(shared, flags, paths, cookies),
+        Mode::Journal(journal) => journaled(shared, journal, flags, paths, ids, cookies),
     }
     if !cookies.is_empty() {
-        tell_flushes(shared, &cookies);
+        tell_flushes(shared, cookies, told, path);
     }
 }
 
@@ -661,9 +721,9 @@ fn journaled(
     (shared.send)(Completion { tag: shared.tag, done });
 }
 
-/// Tells each flush whose cookie was heard.
-fn tell_flushes(shared: &Shared, cookies: &[u64]) {
-    let mut told = Vec::new();
+/// Tells each flush whose cookie was heard, through the callback's buffers.
+fn tell_flushes(shared: &Shared, cookies: &[u64], told: &mut Vec<Tag>, path: &mut PathBuf) {
+    told.clear();
     lock(&shared.flushes).retain(|tag| {
         let heard = cookies.contains(&tag.0);
         if heard {
@@ -671,9 +731,9 @@ fn tell_flushes(shared: &Shared, cookies: &[u64]) {
         }
         !heard
     });
-    for tag in told {
+    for &tag in told.iter() {
         // Its removal is heard too, of a flush told already: nothing.
-        _ = std::fs::remove_file(shared.cookies.join(tag.0.to_string()));
+        _ = with_cookie(path, tag, |it| std::fs::remove_file(it));
         (shared.send)(Completion { tag, done: Done::Flushed });
     }
 }

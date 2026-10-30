@@ -332,12 +332,26 @@ fn ascii_integer(r: &mut Random, data: &mut Vec<u8>, limit: usize) -> bool {
         3 => value.wrapping_mul(2),
         _ => r.next() % 1_000_000,
     };
-    let digits = value.to_string();
+    let mut buffer = [0u8; 20];
+    let digits = decimal(value, &mut buffer);
     if data.len() - (end - start) + digits.len() > limit {
         return false;
     }
-    data.splice(start..end, digits.bytes());
+    data.splice(start..end, digits.iter().copied());
     true
+}
+
+/// `value` in decimal, written into the end of `buffer` (a `u64` has at most 20 digits).
+pub(crate) fn decimal(mut value: u64, buffer: &mut [u8; 20]) -> &[u8] {
+    let mut at = buffer.len();
+    loop {
+        at -= 1;
+        buffer[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            return &buffer[at..];
+        }
+    }
 }
 
 /// An integer of 1, 2, 4 or 8 bytes, either byte order, moved by up to 10 or negated.

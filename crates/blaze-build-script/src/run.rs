@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// What runs: the script, where, and with what environment. A sandbox runs the same.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub program: PathBuf,
     pub cwd: PathBuf,
@@ -35,6 +35,7 @@ pub struct Invocation {
 
 impl Invocation {
     pub fn of(unit: &Unit, env: Env) -> Invocation {
+        // clone: setup, once per run: what runs, owned by the run.
         Invocation { program: unit.script.clone(), cwd: unit.package.manifest_dir.clone(), env }
     }
 
@@ -50,7 +51,7 @@ impl Invocation {
 }
 
 /// A finished run, before cargo has judged it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Ran {
     /// When it started, as the file system tells time: the time `output` is given, so that a
     /// file changed while the script ran makes it run again.
@@ -61,7 +62,7 @@ pub struct Ran {
 }
 
 /// Why the build fails, with what the script asked to be shown.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Failed {
     pub error: Error,
     pub log_messages: Vec<(Severity, String)>,
@@ -88,6 +89,7 @@ fn layout(unit: &Unit) -> (PathBuf, &'static str) {
     let around = unit.out_dir.parent().unwrap_or(&unit.out_dir);
     match is_second_layout(&unit.out_dir) {
         true => (around.join("run"), "stdout"),
+        // alloc: setup, once per run: the run's directory.
         false => (around.to_owned(), "output"),
     }
 }
@@ -121,6 +123,7 @@ pub fn run(unit: &Unit, mut command: Command) -> Result<Ran, Error> {
         }
     }
     let output = output.map_err(|err| {
+        // alloc: error path.
         Error(format!(
             "failed to run custom build command for `{}`\n\nCaused by:\n  could not execute \
              process `{}` (never executed)\n\nCaused by:\n  {err}",
@@ -137,6 +140,7 @@ pub fn run(unit: &Unit, mut command: Command) -> Result<Ran, Error> {
 /// writes cargo's files of it as for any other.
 pub fn elided(unit: &Unit, stdout: Vec<u8>) -> Result<Ran, Error> {
     let began = begin(unit)?;
+    // alloc: none: an empty stderr.
     Ok(Ran { began, status: ExitStatus::default(), stdout, stderr: Vec::new() })
 }
 
@@ -144,10 +148,14 @@ pub fn elided(unit: &Unit, stdout: Vec<u8>) -> Result<Ran, Error> {
 /// the modification time of [`invoked`] written in a [`run_dir`] made.
 pub fn begin(unit: &Unit) -> Result<SystemTime, Error> {
     fs::create_dir_all(&unit.out_dir).map_err(|err| {
+        // alloc: error path.
         Error(format!("failed to create script output directory for build command: {err}"))
     })?;
-    let run_dir = run_dir(unit);
-    invocation_time(&run_dir).map_err(|err| Error(format!("{}: {err}", run_dir.display())))
+    let (run_dir, _) = layout(unit);
+    // In cargo's first layout the run's directory holds `OUT_DIR`, so it was just made.
+    let made = unit.out_dir.parent() == Some(run_dir.as_path());
+    // alloc: error path.
+    invocation_time(&run_dir, made).map_err(|err| Error(format!("{}: {err}", run_dir.display())))
 }
 
 /// `paths::set_invocation_time`: the file in `unit`'s [`run_dir`] whose modification time,
@@ -161,12 +169,15 @@ pub fn invoked(unit: &Unit) -> (PathBuf, &'static [u8]) {
 const INVOKED: &str = "invoked.timestamp";
 const INVOKED_TEXT: &[u8] = b"This file has an mtime of when this was started.";
 
-/// `paths::set_invocation_time`: the time a file written now is given.
-fn invocation_time(run_dir: &Path) -> std::io::Result<SystemTime> {
-    fs::create_dir_all(run_dir)?;
-    let timestamp = run_dir.join(INVOKED);
-    fs::write(&timestamp, INVOKED_TEXT)?;
-    fs::metadata(&timestamp)?.modified()
+/// `paths::set_invocation_time`: the time a file written now is given, read from the file
+/// written rather than looked up again by path. `made` when `run_dir` is known to exist.
+fn invocation_time(run_dir: &Path, made: bool) -> std::io::Result<SystemTime> {
+    if !made {
+        fs::create_dir_all(run_dir)?;
+    }
+    let mut timestamp = fs::File::create(run_dir.join(INVOKED))?;
+    timestamp.write_all(INVOKED_TEXT)?;
+    timestamp.metadata()?.modified()
 }
 
 /// What cargo shows of a run when it fails, from what it printed: each line that starts with
@@ -177,7 +188,10 @@ fn invocation_time(run_dir: &Path) -> std::io::Result<SystemTime> {
 /// a replaced sequence never spans a line break.
 pub fn logged(stdout: &[u8]) -> Vec<(Severity, String)> {
     log_lines(stdout)
+        // The check for an error reads `log_lines` alone; this is for when messages are shown.
+        // alloc: the messages shown, made only when they are.
         .map(|(severity, message)| (severity, String::from_utf8_lossy(message).into_owned()))
+        // alloc: as above.
         .collect()
 }
 
@@ -216,6 +230,7 @@ fn log_lines(stdout: &[u8]) -> impl Iterator<Item = (Severity, &[u8])> {
 fn refused(unit: &Unit, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Result<(), Failed> {
     let failed = |error: String| Failed { error: Error(error), log_messages: logged(stdout) };
     if !status.success() {
+        // alloc: error path.
         let mut cause = format!(
             "process didn't exit successfully: `{}` ({})",
             unit.script.display(),
@@ -225,10 +240,13 @@ fn refused(unit: &Unit, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Res
             if let Ok(out) = std::str::from_utf8(out)
                 && !out.trim().is_empty()
             {
+                // alloc: error path.
                 cause.push_str(&format!("\n--- {name}\n{out}"));
             }
         }
+        // alloc: error path.
         let cause = cause.lines().map(|it| format!("  {it}")).collect::<Vec<_>>().join("\n");
+        // alloc: error path.
         let error = format!(
             "failed to run custom build command for `{}`\n\nCaused by:\n{cause}",
             unit.package.descr()
@@ -236,6 +254,7 @@ fn refused(unit: &Unit, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Res
         return Err(failed(error));
     }
     if log_lines(stdout).any(|(severity, _)| severity == Severity::Error) {
+        // alloc: error path.
         return Err(failed("build script logged errors".to_owned()));
     }
     Ok(())
@@ -252,12 +271,13 @@ pub fn judge(
     stderr: &[u8],
 ) -> Result<Output, Failed> {
     refused(unit, status, stdout, stderr)?;
+    // alloc: error path.
     output::parse(stdout, cx).map_err(|error| Failed { error, log_messages: Vec::new() })
 }
 
 /// cargo's files of a run that succeeded, as [`Ran::finish`] writes them, each a path and its
 /// bytes. The file of what was printed has the time the run began as its modification time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Files<'a> {
     /// `output` or `stdout` ([`printed`]).
     pub printed: (PathBuf, &'a [u8]),
@@ -288,7 +308,9 @@ impl Ran {
     pub fn finish(&self, unit: &Unit, cx: &Context<'_>) -> Result<Output, Failed> {
         refused(unit, self.status, &self.stdout, &self.stderr)?;
         self.write(unit)
+            // alloc: error path.
             .map_err(|err| Failed { error: Error(err.to_string()), log_messages: Vec::new() })?;
+        // alloc: error path.
         output::parse(&self.stdout, cx).map_err(|error| Failed { error, log_messages: Vec::new() })
     }
 
@@ -296,9 +318,9 @@ impl Ran {
     fn write(&self, unit: &Unit) -> std::io::Result<()> {
         let files = files(unit, &self.stdout, &self.stderr)?;
         let (printed, stdout) = &files.printed;
-        fs::write(printed, stdout)?;
-        let times = fs::FileTimes::new().set_accessed(self.began).set_modified(self.began);
-        fs::File::options().write(true).open(printed)?.set_times(times)?;
+        let mut file = fs::File::create(printed)?;
+        file.write_all(stdout)?;
+        file.set_times(fs::FileTimes::new().set_accessed(self.began).set_modified(self.began))?;
         fs::write(&files.stderr.0, files.stderr.1)?;
         let mut root_output = fs::File::create(&files.root_output.0)?;
         root_output.write_all(files.root_output.1)
@@ -315,6 +337,7 @@ fn path_bytes(path: &Path) -> std::io::Result<&[u8]> {
     #[cfg(not(unix))]
     {
         path.to_str().map(str::as_bytes).ok_or_else(|| {
+            // alloc: error path.
             std::io::Error::other(format!("invalid non-unicode path: {}", path.display()))
         })
     }
@@ -343,9 +366,11 @@ fn status_to_string(status: ExitStatus) -> String {
                 libc::SIGTRAP => ", SIGTRAP: trace/breakpoint trap",
                 _ => "",
             };
+            // alloc: error path.
             return format!("signal: {signal}{name}");
         }
     }
+    // alloc: error path.
     status.to_string()
 }
 

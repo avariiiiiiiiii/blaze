@@ -16,6 +16,8 @@ mod content;
 mod editioned_file_id;
 mod files;
 mod input;
+mod named;
+mod reparse;
 mod table;
 pub mod target;
 #[cfg(test)]
@@ -41,6 +43,8 @@ pub use crate::{
         DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin, ProcMacroLoadingError,
         ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId, TargetKind, UniqueCrateData,
     },
+    named::NAMED_PATHS_DOMAIN,
+    reparse::Reparse,
     view::{ViewChange, ViewError, ViewFile, ViewRoot},
 };
 pub use blaze_ids::ContentId;
@@ -163,6 +167,12 @@ pub struct FileText {
     #[get(content_field)]
     #[set(set_content_field)]
     content: InputId,
+    /// What [`EditionedFileId::parse`] makes the text's parse from: set with the text, and not
+    /// in the content ID, as the parse is the same whatever it holds.
+    #[returns(ref)]
+    #[get(reparse_field)]
+    #[set(set_reparse_field)]
+    reparse: Reparse,
 }
 
 impl FileText {
@@ -348,11 +358,21 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     /// [`Files::set_view_root`].
     fn set_view_root(&mut self, view: ViewRoot<'_>) -> Result<ViewChange, ViewError>;
 
+    /// The file `path` names, relative to its anchor's directory: in the anchor's source root,
+    /// else in whichever source root names it (a `#[path]` module or an `include!` outside
+    /// its package, as rustc reads any path). Either way it is recorded as a read of the
+    /// source root it is found in (or, found in none, of the set of paths that would name it,
+    /// [`NAMED_PATHS_DOMAIN`]), so an edit there runs the reader again. Nothing is read from
+    /// disk.
     fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
-        // FIXME: this *somehow* should be platform agnostic...
-        let source_root = self.file_source_root(path.anchor);
-        let source_root = self.source_root(source_root.source_root_id(self));
-        source_root.source_root_ref(self).resolve_path(path)
+        let root = self.file_source_root(path.anchor).source_root_id(self);
+        let root = self.source_root(root).source_root_ref(self);
+        if let Some(file) = root.resolve_path(path) {
+            return Some(file);
+        }
+        let mut target = root.path_for_file(&path.anchor)?.clone();
+        target.pop();
+        named::resolve(self, &target.join(path.path)?)
     }
 
     /// The file `path` names relative to `anchor`, when it is not one of the files of the VFS,

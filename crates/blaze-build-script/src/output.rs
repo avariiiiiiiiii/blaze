@@ -332,6 +332,7 @@ fn older_than_new_syntax(package: &Package) -> Option<String> {
         return None;
     }
     let shown =
+        // alloc: error path: the version shown when `cargo::` is refused.
         [Some(major), minor, patch].iter().flatten().map(u64::to_string).collect::<Vec<_>>();
     Some(shown.join("."))
 }
@@ -340,14 +341,18 @@ fn older_than_new_syntax(package: &Package) -> Option<String> {
 /// ([`older_than_new_syntax`]) is refused.
 fn new_syntax_refused(descr: Descr<'_>, msrv: &str, flag: &str) -> Error {
     let suggestion = if has_reserved_prefix(flag) {
+        // alloc: error path.
         format!("Switch to the old `cargo:{flag}` syntax (note the single colon).\n")
     } else if let Some(old) = flag.strip_prefix("metadata=") {
+        // alloc: error path.
         format!(
             "Switch to the old `cargo:{old}` syntax instead of `cargo::{flag}` (note the single colon).\n"
         )
     } else {
+        // alloc: error path (empty, allocates nothing).
         String::new()
     };
+    // alloc: error path.
     Error(format!(
         "the `cargo::` syntax for build script output instructions was added in \
          Rust 1.77.0, but the minimum supported Rust version of `{descr}` is {msrv}.\n\
@@ -364,6 +369,7 @@ fn key_value<'a>(
 ) -> Result<(&'a str, &'a str), Error> {
     match data.split_once('=') {
         Some((key, value)) => Ok((key, value.trim_end())),
+        // alloc: error path.
         None => Err(Error(format!(
             "invalid output in {}: `{line}`\n\
              Expected a line with `{syntax}KEY=VALUE` with an `=` character, \
@@ -379,7 +385,7 @@ struct Descr<'a>(&'a Package);
 
 impl std::fmt::Display for Descr<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.descr())
+        self.0.write_descr(f)
     }
 }
 
@@ -388,7 +394,7 @@ struct Whence<'a>(&'a Package);
 
 impl std::fmt::Display for Whence<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "build script of `{}`", self.0.descr())
+        write!(f, "build script of `{}`", Descr(self.0))
     }
 }
 
@@ -421,6 +427,7 @@ fn piece<'a>(whole: &Cow<'a, str>, part: &str) -> Cow<'a, str> {
             let start = part.as_ptr() as usize - whole.as_ptr() as usize;
             Cow::Borrowed(&whole[start..start + part.len()])
         }
+        // alloc: only when `OUT_DIR` moved, which made the value anew.
         Cow::Owned(_) => Cow::Owned(part.to_owned()),
     }
 }
@@ -440,6 +447,7 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
     let (Some(generated), Some(out_dir_text)) =
         (cx.out_dir_when_generated.to_str(), cx.out_dir.to_str())
     else {
+        // alloc: error path.
         return Err(Error("an `OUT_DIR` that is not UTF-8".to_owned()));
     };
     // A path the output names in the `OUT_DIR` it ran with is moved to the one it has now;
@@ -471,6 +479,7 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
                 }
                 let (key, value) = key_value(package, line, data, "cargo::")?;
                 let Some(key) = Key::of(key.as_bytes()) else {
+                    // alloc: error path.
                     return Err(Error(format!(
                         "invalid output in {}: `{line}`\n\
                          Unknown key: `{key}`.\n\
@@ -502,6 +511,7 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
         let syntax = if old_syntax { "cargo:" } else { "cargo::" };
         let name = key.name();
         let missing_target = |kind: &str| {
+            // alloc: error path.
             Error(format!(
                 "invalid instruction `{syntax}{name}` from {whence}\n\
                  The package {descr} does not have a {kind} target."
@@ -525,6 +535,7 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
                 if !targets.iter().any(|it| it.is_cdylib()) {
                     sink.directive(Directive::Log(
                         Severity::Warning,
+                        // alloc: a warning's text, made only when the warning is.
                         Cow::Owned(format!(
                             "{syntax}{name} was specified in the build script of {descr}, \
                              but that package does not contain a cdylib target\n\
@@ -546,17 +557,20 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
             }
             Key::LinkArgBin => {
                 let Some((bin, arg)) = value.split_once('=') else {
+                    // alloc: error path.
                     return Err(Error(format!(
                         "invalid instruction `{syntax}{name}={value}` from {whence}\n\
                          The instruction should have the form {syntax}{name}=BIN=ARG"
                     )));
                 };
                 if !targets.iter().any(|it| it.is_bin() && it.name == bin) {
+                    // alloc: error path.
                     return Err(Error(format!(
                         "invalid instruction `{syntax}{name}` from {whence}\n\
                          The package {descr} does not have a bin target with the name `{bin}`."
                     )));
                 }
+                // alloc: a `rustc-link-arg-bin`'s bin name, which `LinkArgTarget` owns.
                 Directive::LinkArg(LinkArgTarget::SingleBin(bin.to_owned()), piece(&value, arg))
             }
             Key::LinkArgTests => {
@@ -582,6 +596,7 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
             Key::CheckCfg => Directive::CheckCfg(value),
             Key::Env => {
                 let Some((name, val)) = value.split_once('=') else {
+                    // alloc: error path.
                     return Err(Error(format!(
                         "Variable rustc-env has no value in {whence}: {value}"
                     )));
@@ -597,6 +612,7 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
                             .as_deref()
                             .is_some_and(|it| it.split(',').any(|it| it == name))
                     });
+                    // alloc: error path, or the warning it becomes.
                     let message = format!(
                         "cannot set `RUSTC_BOOTSTRAP={val}` from {whence}.\n\
                          note: crates cannot set `RUSTC_BOOTSTRAP` themselves, as doing so \
@@ -604,6 +620,7 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
                     );
                     if !(cx.nightly_features_allowed || allowed_by_env) {
                         let name = library.as_deref().unwrap_or("1");
+                        // alloc: error path.
                         return Err(Error(format!(
                             "{message}\n\
                              help: If you're sure you want to do this in your project, set the \
@@ -642,6 +659,7 @@ fn each_flag<'v>(
             Some("-l") => true,
             Some("-L") => false,
             _ => {
+                // alloc: error path.
                 return Err(Error(format!(
                     "only `-l` and `-L` flags are allowed in {whence}: `{value}`"
                 )));
@@ -650,36 +668,13 @@ fn each_flag<'v>(
         let mut rest = &flag[2..];
         if rest.is_empty() {
             rest = flags.next().ok_or_else(|| {
+                // alloc: error path.
                 Error(format!("flag in rustc-flags has no value in {whence}: {rest}"))
             })?;
         }
         each(link, rest);
     }
     Ok(())
-}
-
-/// `rustc-flags`: only `-l` and `-L`, with or without a space before the value.
-pub fn parse_rustc_flags(
-    value: &str,
-    whence: impl std::fmt::Display,
-) -> Result<(Vec<PathBuf>, Vec<String>), Error> {
-    let (mut paths, mut links) = (Vec::new(), Vec::new());
-    each_flag(value, whence, |link, rest| match link {
-        true => links.push(rest.to_owned()),
-        false => paths.push(PathBuf::from(rest)),
-    })?;
-    Ok((paths, links))
-}
-
-/// `rustc-env=NAME=VALUE`.
-pub fn parse_rustc_env(
-    value: &str,
-    whence: impl std::fmt::Display,
-) -> Result<(String, String), Error> {
-    match value.split_once('=') {
-        Some((name, value)) => Ok((name.to_owned(), value.to_owned())),
-        None => Err(Error(format!("Variable rustc-env has no value in {whence}: {value}"))),
-    }
 }
 
 /// A `rustc-link-lib` as rustc reads `-l`: `[KIND[:MODIFIERS]=]NAME[:RENAME]`. cargo passes
@@ -713,6 +708,7 @@ impl<'a> LinkLib<'a> {
                 ("-", name) => (false, name),
                 _ => (true, it),
             })
+            // alloc: the edge: `LinkLib` is read for a message, not on a run's path.
             .collect();
         let (name, rename) = match name.split_once(':') {
             Some((name, rename)) => (name, Some(rename)),
@@ -727,7 +723,5 @@ impl<'a> LinkLib<'a> {
     }
 }
 
-#[cfg(test)]
-mod reference;
 #[cfg(test)]
 mod tests;

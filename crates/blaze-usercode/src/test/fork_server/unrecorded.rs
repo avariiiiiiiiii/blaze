@@ -20,9 +20,11 @@ mod exec {
             UNRECORDED
         }
 
-        pub fn map(&self) -> Result<Region, String> {
+        pub fn map(&mut self) -> Result<Region, String> {
             Ok(Region)
         }
+
+        pub fn give(&mut self, _region: Region, _hits: &[u8], _whole: bool) {}
     }
 
     impl Region {

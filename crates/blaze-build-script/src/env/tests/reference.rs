@@ -1,6 +1,6 @@
 //! The environment as it was built before a sorted vector: a hash map of what cargo sets,
 //! applied to a `BTreeMap` of what it inherits, a `format!` per variable. Kept as the
-//! reference [`super::env`] is checked against over seeded units.
+//! reference [`crate::env::env`] is checked against over seeded units.
 
 use std::{
     collections::BTreeMap,
@@ -10,7 +10,7 @@ use std::{
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{HostOs, Version, below, cfg_of};
+use crate::env::{HostOs, Version, below, cfg_of};
 use crate::{Error, unit::Unit};
 
 #[derive(Default)]

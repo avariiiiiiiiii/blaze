@@ -18,6 +18,10 @@ pub mod buffer;
 pub mod iter;
 mod storage;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use std::fmt;
 
 use arrayvec::ArrayString;
@@ -731,41 +735,39 @@ impl Subtree {
 }
 
 pub fn pretty(tkns: TokenTreesView<'_>) -> String {
-    return pretty_impl(tkns.iter());
+    // alloc: the text returned, written in place.
+    let mut out = String::new();
+    pretty_into(tkns.iter(), &mut out);
+    return out;
 
-    fn tokentree_to_text(tkn: TtElement<'_>) -> String {
-        match tkn {
-            TtElement::Leaf(leaf) => {
-                format!("{}", leaf)
-            }
-            TtElement::Subtree(Subtree { delimiter, .. }, subtree_content) => {
-                let content = pretty_impl(subtree_content);
-                let (open, close) = match delimiter.kind {
-                    DelimiterKind::Brace => ("{", "}"),
-                    DelimiterKind::Bracket => ("[", "]"),
-                    DelimiterKind::Parenthesis => ("(", ")"),
-                    DelimiterKind::Invisible => ("", ""),
-                };
-                format!("{open}{content}{close}")
-            }
-        }
-    }
-
-    fn pretty_impl(tkns: TtIter<'_>) -> String {
-        let mut last = String::new();
+    fn pretty_into(tkns: TtIter<'_>, out: &mut String) {
+        use fmt::Write as _;
         let mut last_to_joint = true;
-
         for tkn in tkns {
-            last =
-                [last, tokentree_to_text(tkn.clone())].join(if last_to_joint { "" } else { " " });
+            if !last_to_joint {
+                out.push(' ');
+            }
             last_to_joint = false;
-            if let TtElement::Leaf(Leaf::Punct(Punct { spacing, .. })) = tkn
-                && spacing == Spacing::Joint
-            {
-                last_to_joint = true;
+            match tkn {
+                TtElement::Leaf(leaf) => {
+                    write!(out, "{leaf}").expect("writing to a `String` doesn't fail");
+                    if let Leaf::Punct(Punct { spacing: Spacing::Joint, .. }) = leaf {
+                        last_to_joint = true;
+                    }
+                }
+                TtElement::Subtree(Subtree { delimiter, .. }, content) => {
+                    let (open, close) = match delimiter.kind {
+                        DelimiterKind::Brace => ("{", "}"),
+                        DelimiterKind::Bracket => ("[", "]"),
+                        DelimiterKind::Parenthesis => ("(", ")"),
+                        DelimiterKind::Invisible => ("", ""),
+                    };
+                    out.push_str(open);
+                    pretty_into(content, out);
+                    out.push_str(close);
+                }
             }
         }
-        last
     }
 }
 
@@ -784,18 +786,68 @@ pub fn pretty(tkns: TokenTreesView<'_>) -> String {
 /// said is joint, `Alone` for everything else, whatever the source they are from had. That is
 /// what rustc does with tokens the macro took apart and made again, as syn and quote do; a
 /// stream it hands on whole keeps the spacing of its source there, and is spaced here.
-pub fn stringify(
+pub fn stringify<F: Fn(Span, &str) -> Option<bool> + ?Sized>(
     tkns: TokenTreesView<'_>,
-    source_joined: &dyn Fn(Span, &str) -> Option<bool>,
+    source_joined: &F,
     through_proc_macro: bool,
 ) -> String {
+    // alloc: the text returned, written in place.
     let mut text = String::new();
     let given = |span, text: &str| match through_proc_macro {
         true => Some(false),
         false => source_joined(span, text),
     };
-    write_stringified(tkns.iter(), &given, through_proc_macro, &mut text);
+    // A leaf's text, written again for each one `source_joined` is asked about.
+    let mut leaf_text = ArrayString::<64>::new();
+    // alloc: grows once to the longest leaf over 64 bytes, if there is one.
+    let mut long_text = String::new();
+    let mut scratch = Scratch { short: &mut leaf_text, long: &mut long_text };
+    write_stringified(tkns.iter(), &given, through_proc_macro, &mut text, &mut scratch);
     return text;
+
+    /// Where a leaf's text is written to be asked about, without allocating for a short one.
+    struct Scratch<'s> {
+        short: &'s mut ArrayString<64>,
+        long: &'s mut String,
+    }
+
+    impl Scratch<'_> {
+        fn text_of(&mut self, leaf: &Leaf) -> &str {
+            use fmt::Write as _;
+            self.short.clear();
+            if write!(self.short, "{leaf}").is_ok() {
+                return self.short.as_str();
+            }
+            self.long.clear();
+            write!(self.long, "{leaf}").expect("writing to a `String` doesn't fail");
+            self.long.as_str()
+        }
+    }
+
+    /// The punctuation of the operator being written, up to the longest operator's three
+    /// characters; `None` once longer, when no operator starts with it.
+    #[derive(Default)]
+    struct Operator {
+        chars: ArrayString<3>,
+        overlong: bool,
+    }
+
+    impl Operator {
+        fn push(&mut self, char: char) {
+            if self.chars.try_push(char).is_err() {
+                self.overlong = true;
+            }
+        }
+
+        fn clear(&mut self) {
+            self.chars.clear();
+            self.overlong = false;
+        }
+
+        fn get(&self) -> Option<&str> {
+            (!self.overlong).then_some(self.chars.as_str())
+        }
+    }
 
     /// The operators that are one token to rustc and several here.
     const OPERATORS: &[&str] = &[
@@ -834,12 +886,13 @@ pub fn stringify(
 
     /// Whether rustc's token for `prev` has a spacing other than `Alone`. `operator` is the
     /// part of an operator that ends with `prev`.
-    fn joined(
+    fn joined<F: Fn(Span, &str) -> Option<bool> + ?Sized>(
         prev: &TtElement<'_>,
         next: &TtElement<'_>,
-        operator: &str,
-        source_joined: &dyn Fn(Span, &str) -> Option<bool>,
+        operator: Option<&str>,
+        source_joined: &F,
         through_proc_macro: bool,
+        scratch: &mut Scratch<'_>,
     ) -> bool {
         // A lifetime is one token to rustc.
         if punct(prev) == Some('\'') && matches!(next, TtElement::Leaf(Leaf::Ident(_))) {
@@ -849,9 +902,12 @@ pub fn stringify(
             TtElement::Leaf(Leaf::Punct(it)) if !it.span.ctx.is_root() => {
                 // A token of a macro's body is `Alone` to rustc.
                 return matches!(it.spacing, Spacing::Joint)
-                    && punct(next).is_some_and(|next| {
-                        OPERATORS.iter().any(|it| {
-                            it.strip_prefix(operator).is_some_and(|rest| rest.starts_with(next))
+                    && operator.is_some_and(|operator| {
+                        punct(next).is_some_and(|next| {
+                            OPERATORS.iter().any(|it| {
+                                it.strip_prefix(operator)
+                                    .is_some_and(|rest| rest.starts_with(next))
+                            })
                         })
                     });
             }
@@ -861,7 +917,7 @@ pub fn stringify(
             TtElement::Leaf(Leaf::Punct(it)) if through_proc_macro => {
                 return matches!(it.spacing, Spacing::Joint) && punct(next) != Some('\'');
             }
-            TtElement::Leaf(leaf) => source_joined(*leaf.span(), &leaf.to_string()),
+            TtElement::Leaf(leaf) => source_joined(*leaf.span(), scratch.text_of(leaf)),
             TtElement::Subtree(subtree, _) => {
                 let close = match subtree.delimiter.kind {
                     // What a macro puts around an expression it was passed.
@@ -926,21 +982,25 @@ pub fn stringify(
         }
     }
 
-    fn write_stringified(
+    fn write_stringified<F: Fn(Span, &str) -> Option<bool> + ?Sized>(
         tkns: TtIter<'_>,
-        source_joined: &dyn Fn(Span, &str) -> Option<bool>,
+        source_joined: &F,
         through_proc_macro: bool,
         text: &mut String,
+        scratch: &mut Scratch<'_>,
     ) {
+        use fmt::Write as _;
         let mut tkns = tkns.peekable();
-        let mut operator = String::new();
+        let mut operator = Operator::default();
         while let Some(tkn) = tkns.next() {
             match &tkn {
                 TtElement::Leaf(Leaf::Punct(punct)) => {
                     operator.push(punct.char);
                     text.push(punct.char);
                 }
-                TtElement::Leaf(leaf) => text.push_str(&leaf.to_string()),
+                TtElement::Leaf(leaf) => {
+                    write!(text, "{leaf}").expect("writing to a `String` doesn't fail");
+                }
                 TtElement::Subtree(subtree, content) => {
                     let (open, close) = match subtree.delimiter.kind {
                         // What a macro puts around an expression it was passed, which is not
@@ -948,6 +1008,7 @@ pub fn stringify(
                         DelimiterKind::Parenthesis if expression_parens(subtree) => ("", ""),
                         // rustc puts a space inside a brace where the source had one after
                         // the opening one.
+                        // clone: a cursor, two indices.
                         DelimiterKind::Brace => match content.clone().next() {
                             Some(first)
                                 if !source_joined(subtree.delimiter.open, "{").unwrap_or(
@@ -964,12 +1025,15 @@ pub fn stringify(
                         DelimiterKind::Invisible => ("", ""),
                     };
                     text.push_str(open);
-                    write_stringified(content.clone(), source_joined, through_proc_macro, text);
+                    // clone: a cursor, two indices.
+                    let content = content.clone();
+                    write_stringified(content, source_joined, through_proc_macro, text, scratch);
                     text.push_str(close);
                 }
             }
             let Some(next) = tkns.peek() else { break };
-            let is_joined = joined(&tkn, next, &operator, source_joined, through_proc_macro);
+            let is_joined =
+                joined(&tkn, next, operator.get(), source_joined, through_proc_macro, scratch);
             if !is_joined || punct(&tkn).is_none() {
                 operator.clear();
             }
@@ -993,62 +1057,59 @@ impl TransformTtAction<'_> {
     }
 }
 
-/// This function takes a token tree, and calls `callback` with each token tree in it.
-/// Then it does what the callback says: keeps the tt or replaces it with a (possibly empty)
-/// tts view.
+/// Calls `callback` with each token tree of `tt` in preorder, the top subtree first, and does
+/// what it says: keeps the token tree (visiting a subtree's own after it) or puts a (possibly
+/// empty) view in its place, which is not visited. One pass into a builder.
 pub fn transform_tt<'b>(
     tt: &mut TopSubtree,
     mut callback: impl FnMut(&TokenTree) -> TransformTtAction<'b>,
 ) {
-    let mut tt_vec = tt.as_token_trees().iter_flat_tokens().collect::<Vec<_>>();
+    let top = tt.top_subtree();
+    let replacement = match callback(&TokenTree::Subtree(top)) {
+        TransformTtAction::Keep => None,
+        TransformTtAction::ReplaceWith(replacement) => Some(replacement),
+    };
+    if let Some(replacement) = replacement {
+        // alloc: the whole tree replaced, which no caller asks for but the contract allows.
+        *tt = TopSubtree::from_serialized(replacement.iter_flat_tokens().collect());
+        return;
+    }
+    let mut builder = TopSubtreeBuilder::with_capacity(top.delimiter, tt.token_trees().len());
+    walk(tt.iter(), &mut builder, &mut callback);
+    *tt = builder.build();
 
-    // We need to keep a stack of the currently open subtrees, because we need to update
-    // them if we change the number of items in them.
-    let mut subtrees_stack = Vec::new();
-    let mut i = 0;
-    while i < tt_vec.len() {
-        'pop_finished_subtrees: while let Some(&subtree_idx) = subtrees_stack.last() {
-            let TokenTree::Subtree(subtree) = &tt_vec[subtree_idx] else {
-                unreachable!("non-subtree on subtrees stack");
-            };
-            if i >= subtree_idx + 1 + subtree.usize_len() {
-                subtrees_stack.pop();
-            } else {
-                break 'pop_finished_subtrees;
-            }
-        }
-
-        let current = &tt_vec[i];
-        let action = callback(current);
-        match action {
-            TransformTtAction::Keep => {
-                // This cannot be shared with the replaced case, because then we may push the same subtree
-                // twice, and will update it twice which will lead to errors.
-                if let TokenTree::Subtree(_) = current {
-                    subtrees_stack.push(i);
+    fn walk<'b>(
+        trees: TtIter<'_>,
+        builder: &mut TopSubtreeBuilder,
+        callback: &mut impl FnMut(&TokenTree) -> TransformTtAction<'b>,
+    ) {
+        for tree in trees {
+            match tree {
+                TtElement::Leaf(leaf) => {
+                    let tree = TokenTree::Leaf(leaf);
+                    match callback(&tree) {
+                        TransformTtAction::Keep => {
+                            let TokenTree::Leaf(leaf) = tree else { unreachable!("a leaf") };
+                            builder.push(leaf);
+                        }
+                        TransformTtAction::ReplaceWith(replacement) => {
+                            builder.extend_with_tt(replacement)
+                        }
+                    }
                 }
-
-                i += 1;
-            }
-            TransformTtAction::ReplaceWith(replacement) => {
-                let old_len = 1 + match current {
-                    TokenTree::Leaf(_) => 0,
-                    TokenTree::Subtree(subtree) => subtree.usize_len(),
-                };
-                let len_diff = replacement.len() as i64 - old_len as i64;
-                tt_vec.splice(i..i + old_len, replacement.iter_flat_tokens());
-                // Skip the newly inserted replacement, we don't want to visit it.
-                i += replacement.len();
-
-                for &subtree_idx in &subtrees_stack {
-                    let TokenTree::Subtree(subtree) = &mut tt_vec[subtree_idx] else {
-                        unreachable!("non-subtree on subtrees stack");
-                    };
-                    subtree.len = (i64::from(subtree.len) + len_diff).try_into().unwrap();
+                TtElement::Subtree(subtree, content) => {
+                    match callback(&TokenTree::Subtree(subtree)) {
+                        TransformTtAction::Keep => {
+                            builder.open(subtree.delimiter.kind, subtree.delimiter.open);
+                            walk(content, builder, callback);
+                            builder.close(subtree.delimiter.close);
+                        }
+                        TransformTtAction::ReplaceWith(replacement) => {
+                            builder.extend_with_tt(replacement)
+                        }
+                    }
                 }
             }
         }
     }
-
-    *tt = TopSubtree::from_serialized(tt_vec);
 }

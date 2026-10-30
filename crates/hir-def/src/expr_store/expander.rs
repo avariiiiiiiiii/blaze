@@ -31,6 +31,7 @@ pub(super) struct Expander<'db> {
 
 impl<'db> Expander<'db> {
     pub(super) fn new(
+        // dyn: the salsa database handle, as every hir-def query takes it
         db: &'db dyn SourceDatabase,
         current_file_id: HirFileId,
         def_map: &'db DefMap,
@@ -47,6 +48,7 @@ impl<'db> Expander<'db> {
     /// An expander of what is written in a part of `current_file_id` that is lowered as a tree
     /// of its own, with the maps of that part ([`crate::expr_store::body::BodySyntax`]).
     pub(super) fn within(
+        // dyn: the salsa database handle, as every hir-def query takes it
         db: &'db dyn SourceDatabase,
         current_file_id: HirFileId,
         def_map: &'db DefMap,
@@ -77,6 +79,7 @@ impl<'db> Expander<'db> {
         self.span_map.span_for_range(range).ctx
     }
 
+    // dyn: the salsa database handle, as every hir-def query takes it
     pub(super) fn hygiene_for_range(&self, db: &dyn SourceDatabase, range: TextRange) -> HygieneId {
         match self.span_map {
             SpanMap::ExpansionSpanMap(span_map) => {
@@ -88,6 +91,7 @@ impl<'db> Expander<'db> {
 
     pub(super) fn is_cfg_enabled(
         &self,
+        // dyn: `AttrFlags::is_cfg_enabled_for`'s parameter, once per node with attributes
         owner: &dyn HasAttrs,
         cfg_options: &CfgOptions,
     ) -> Result<(), cfg::CfgExpr> {
@@ -96,6 +100,7 @@ impl<'db> Expander<'db> {
 
     pub(super) fn enter_expand<T: ast::AstNode>(
         &mut self,
+        // dyn: the salsa database handle, as every hir-def query takes it
         db: &'db dyn SourceDatabase,
         macro_call: ast::MacroCall,
         krate: Crate,
@@ -151,6 +156,7 @@ impl<'db> Expander<'db> {
 
     pub(super) fn enter_expand_id<T: ast::AstNode>(
         &mut self,
+        // dyn: the salsa database handle, as every hir-def query takes it
         db: &'db dyn SourceDatabase,
         call_id: MacroCallId,
     ) -> ExpandResult<Option<(Mark<'db>, Option<Parse<T>>)>> {
@@ -183,6 +189,7 @@ impl<'db> Expander<'db> {
 
     fn within_limit<F, T: ast::AstNode>(
         &mut self,
+        // dyn: the salsa database handle, as every hir-def query takes it
         db: &'db dyn SourceDatabase,
         op: F,
     ) -> ExpandResult<Option<(Mark<'db>, Option<Parse<T>>)>>
@@ -215,9 +222,11 @@ impl<'db> Expander<'db> {
 
         let res = call_id.parse_macro_expansion(db);
 
+        // clone: error path
         let err = err.or_else(|| res.err.clone());
         ExpandResult {
             value: {
+                // clone: an `Arc` (the expansion's green tree), once per macro call
                 let parse = res.value.0.clone().cast::<T>();
 
                 self.macro_depth += 1;

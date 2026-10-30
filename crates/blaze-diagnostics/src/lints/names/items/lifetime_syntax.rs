@@ -217,13 +217,17 @@ fn check(cx: &Cx<'_, '_>, item: &Item, f: &ast::Fn, anonymous_in_impl_trait: boo
     };
     // An elided lifetime of the return type is what elision gives it; none when it fails
     // (E0106).
-    outputs.infos.retain_mut(|info| match (&info.res, &target) {
-        (Res::Target, Some(target)) => {
-            info.res = target.clone();
-            true
+    outputs.infos.retain_mut(|info| {
+        if info.res != Res::Target {
+            return true;
         }
-        (Res::Target, None) => false,
-        _ => true,
+        match &target {
+            Some(target) => {
+                info.res = target.clone();
+                true
+            }
+            None => false,
+        }
     });
     let mut groups: Vec<(Res, Vec<Info>, Vec<Info>)> = Vec::new();
     for info in outputs.infos {
@@ -366,12 +370,12 @@ impl Walk<'_, '_, '_> {
     }
 
     /// The lifetimes of `node`, in the order rustc's `walk_unambig_ty` visits them.
-    fn ty(&mut self, node: &SyntaxNode, scope: &Scope, out: &mut Walked) {
-        let mut scope = scope.clone();
-        if ast::Type::can_cast(node.kind()) {
+    fn ty(&mut self, node: &SyntaxNode, mut scope: Scope, out: &mut Walked) {
+        let kind = node.kind();
+        if ast::Type::can_cast(kind) {
             scope.ty = Some(node.text_range());
         }
-        match node.kind() {
+        match kind {
             SyntaxKind::CONST_ARG | SyntaxKind::FOR_BINDER => return,
             SyntaxKind::FN_PTR_TYPE => scope.nested = true,
             // `Fn(..) -> ..`, whose return type is the segment's, not the argument list's.
@@ -381,37 +385,55 @@ impl Walk<'_, '_, '_> {
             SyntaxKind::IMPL_TRAIT_TYPE if !self.output => scope.impl_trait = true,
             _ => {}
         }
-        if let Some(binder) = node.children().find(|it| it.kind() == SyntaxKind::FOR_BINDER) {
-            for param in binder.descendants().filter_map(ast::LifetimeParam::cast) {
+        let mark = self.bound.len();
+        // The nodes of a type that have a `for<..>`.
+        if matches!(kind, SyntaxKind::FOR_TYPE | SyntaxKind::TYPE_BOUND | SyntaxKind::WHERE_PRED)
+            && let Some(binder) = node.children().find(|it| it.kind() == SyntaxKind::FOR_BINDER)
+        {
+            let params = binder.descendants().filter(|it| it.kind() == SyntaxKind::LIFETIME_PARAM);
+            for param in params.filter_map(ast::LifetimeParam::cast) {
                 if let Some(lifetime) = param.lifetime() {
-                    scope.bound.push(lifetime.text().to_string());
+                    self.bound.push(SmolStr::new(lifetime.text()));
                 }
             }
         }
-        if let Some(r) = ast::RefType::cast(node.clone()) {
-            let referent = r.ty().map(|it| it.syntax().text_range().start());
+        self.node(node, kind, &scope, out);
+        self.bound.truncate(mark);
+    }
+
+    /// [`Walk::ty`] of `node`, of the kind `kind`, once its scope is known.
+    fn node(&mut self, node: &SyntaxNode, kind: SyntaxKind, scope: &Scope, out: &mut Walked) {
+        if kind == SyntaxKind::REF_TYPE
+            && let Some(r) = ast::RefType::cast(node.clone())
+        {
+            let inner = r.ty();
+            let referent = inner.as_ref().map(|it| it.syntax().text_range().start());
             let (res, syntax, ident, name) = match r.lifetime() {
                 Some(lifetime) => {
-                    (self.named(&lifetime, &scope), syntax_of(&lifetime), lifetime.syntax().text_range(), lifetime.text().to_string())
+                    (self.named(&lifetime, scope), syntax_of(&lifetime), lifetime.syntax().text_range(), SmolStr::new(lifetime.text()))
                 }
                 None => {
                     let at = r.amp_token().map_or(node.text_range().start(), |it| it.text_range().end());
-                    (self.elided(&scope), Syntax::Implicit, TextRange::empty(at), String::new())
+                    (self.elided(scope), Syntax::Implicit, TextRange::empty(at), SmolStr::default())
                 }
             };
             if let Some(res) = res {
-                if let Some(inner) = r.ty() {
+                if self.refs
+                    && let Some(inner) = &inner
+                {
                     out.refs.push((inner.syntax().clone(), res.clone()));
                 }
                 let info = Info { res, name, syntax, source: Source::Reference, ident, ty: ident, referent };
-                self.push(out, &scope, info);
+                self.push(out, scope, info);
             }
-            if let Some(inner) = r.ty() {
-                self.ty(inner.syntax(), &scope, out);
+            if let Some(inner) = inner {
+                self.ty(inner.syntax(), *scope, out);
             }
             return;
         }
-        if let Some(path) = ast::PathType::cast(node.clone()).and_then(|it| it.path()) {
+        if kind == SyntaxKind::PATH_TYPE
+            && let Some(path) = ast::PathType::cast(node.clone()).and_then(|it| it.path())
+        {
             let hidden = self.hidden(&path);
             if hidden > 0 {
                 let segment = path.segment();
@@ -428,36 +450,37 @@ impl Walk<'_, '_, '_> {
                     }
                 };
                 for _ in 0..hidden {
-                    if let Some(res) = self.elided(&scope) {
+                    if let Some(res) = self.elided(scope) {
                         let source = Source::Path(angle);
-                        let info = Info { res, name: String::new(), syntax: Syntax::Implicit, source, ident, ty: ident, referent: None };
-                        self.push(out, &scope, info);
+                        let name = SmolStr::default();
+                        let info = Info { res, name, syntax: Syntax::Implicit, source, ident, ty: ident, referent: None };
+                        self.push(out, scope, info);
                     }
                 }
             }
         }
-        if let Some(lifetime) = ast::Lifetime::cast(node.clone()) {
+        if kind == SyntaxKind::LIFETIME {
+            let Some(lifetime) = ast::Lifetime::cast(node.clone()) else { return };
             let Some(source) = source_of(node) else { return };
-            if let Some(res) = self.named(&lifetime, &scope) {
-                let (name, syntax, ident) = (lifetime.text().to_string(), syntax_of(&lifetime), node.text_range());
-                self.push(out, &scope, Info { res, name, syntax, source, ident, ty: ident, referent: None });
+            if let Some(res) = self.named(&lifetime, scope) {
+                let (name, syntax, ident) = (SmolStr::new(lifetime.text()), syntax_of(&lifetime), node.text_range());
+                self.push(out, scope, Info { res, name, syntax, source, ident, ty: ident, referent: None });
             }
             return;
         }
         for child in node.children() {
-            if let Some(lifetime) = ast::Lifetime::cast(child.clone())
-                && source_of(&child).is_none()
-            {
+            if child.kind() == SyntaxKind::LIFETIME && source_of(&child).is_none() {
                 // An object lifetime bound or a declaration: elision still counts the former.
-                if node.kind() == SyntaxKind::TYPE_BOUND
-                    && let Some(res) = self.named(&lifetime, &scope)
-                    && self.counts(&scope, &res)
+                if kind == SyntaxKind::TYPE_BOUND
+                    && let Some(lifetime) = ast::Lifetime::cast(child)
+                    && let Some(res) = self.named(&lifetime, scope)
+                    && self.counts(scope, &res)
                 {
                     out.candidates.push(res);
                 }
                 continue;
             }
-            self.ty(&child, &scope, out);
+            self.ty(&child, *scope, out);
         }
     }
 

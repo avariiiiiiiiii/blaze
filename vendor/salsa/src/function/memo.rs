@@ -17,14 +17,15 @@ use crate::zalsa_local::{QueryOriginRef, QueryRevisions};
 use crate::{Cancelled, Event, EventKind, Id, Revision};
 
 impl<C: Configuration> IngredientImpl<C> {
-    /// Inserts the memo for the given key; (atomically) overwrites and returns any previously existing memo
+    /// Inserts the memo for the given key and returns where it lives; (atomically) overwrites any
+    /// previously existing memo, which is retired until the next reclaim.
     pub(super) fn insert_memo_into_table_for(
         &self,
         zalsa: &Zalsa,
         id: Id,
-        memo: NonNull<Memo<C>>,
+        memo: Memo<C>,
         memo_ingredient_index: MemoIngredientIndex,
-    ) -> Option<NonNull<Memo<C>>> {
+    ) -> NonNull<Memo<C>> {
         zalsa
             .memo_table_for::<C::SalsaStruct<'_>>(id)
             .insert(memo_ingredient_index, memo)

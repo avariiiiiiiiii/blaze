@@ -312,6 +312,18 @@ impl ast::Expr {
     }
 }
 
+impl ast::MacroStmts {
+    /// Parses `text` as the statements a macro call in statement position expands to, as
+    /// rustc retries an expansion that is no expression (`failed_to_match_macro`).
+    pub fn parse(text: &str, edition: Edition) -> Parse<ast::MacroStmts> {
+        let _p = tracing::info_span!("MacroStmts::parse").entered();
+        let (tree, errors) =
+            parsing::parse_text_at(text.into(), parser::TopEntryPoint::MacroStmts, edition);
+        assert_eq!(tree.root().kind(), SyntaxKind::MACRO_STMTS);
+        Parse::new(tree, errors)
+    }
+}
+
 #[cfg(not(no_salsa_async_drops))]
 impl<T> Drop for Parse<T> {
     fn drop(&mut self) {

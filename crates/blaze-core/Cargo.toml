@@ -26,3 +26,6 @@ windows-sys.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true

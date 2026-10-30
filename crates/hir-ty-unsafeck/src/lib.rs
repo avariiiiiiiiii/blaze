@@ -21,24 +21,31 @@ use std::mem;
 use base_db::Crate;
 use either::Either;
 use hir_def::{
-    CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId, GenericDefId,
-    HasModule, ItemContainerId, Lookup, TraitId, VariantId,
+    AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId,
+    GenericDefId, HasModule, ItemContainerId, Lookup, TraitId, VariantId,
+    attrs::AttrFlags,
     expr_store::{Body, ExpressionStore, path::Path},
     hir::{
-        Array, AsmOperand, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, InlineAsmKind, Pat,
-        PatId, RecordSpread, Statement, UnaryOp, Unsafe,
+        Array, AsmOperand, BinaryOp, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked,
+        InlineAsmKind, Pat, PatId, RecordSpread, Statement, UnaryOp, Unsafe,
     },
     lang_item::lang_items,
     resolver::{HasResolver, ResolveValueResult, Resolver, ValueNs},
     signatures::{FunctionSignature, StaticFlags, StaticSignature, VariantFields},
-    type_ref::Rawness,
+    type_ref::{self, Rawness},
 };
 use hir_ty::{
-    ExplicitDropMethodUseKind, InferenceDiagnostic, InferenceResult, TargetFeatureIsSafeInTarget,
-    TargetFeatures, Unsafety,
+    Adjust, AutoBorrow, BindingMode, ByRef, ExplicitDropMethodUseKind, InferenceDiagnostic,
+    InferenceResult, OverloadedDeref, TargetFeatureIsSafeInTarget, TargetFeatures, Unsafety,
     db::HirDatabase,
+    drop::is_freeze,
+    infer::AutoBorrowMutability,
     is_fn_unsafe_to_call,
-    next_solver::{CallableIdWrapper, Ty, TyKind, abi::Safety},
+    next_solver::{
+        CallableIdWrapper, DbInterner, Mutability, ParamEnv, Ty, TyKind, TypingMode,
+        abi::Safety,
+        infer::{DbInternerInferExt, InferCtxt},
+    },
     target_feature_is_safe_in_target,
 };
 use rustc_type_ir::inherent::IntoKind;
@@ -64,6 +71,14 @@ pub enum UnsafetyReason {
     InitializingTypeWithUnsafeField,
     /// Calling `Drop::drop` or `Drop::pin_drop` by path where type checking did not refuse it.
     CallDropExplicitly,
+    /// A struct expression of a type with `#[rustc_layout_scalar_valid_range_*]`: rustc's
+    /// `InitializingTypeWith`.
+    InitializingTypeWith,
+    /// Assigning to, or borrowing mutably, a place through a field of a type with
+    /// `#[rustc_layout_scalar_valid_range_*]`, or a `ref mut` binding inside its pattern.
+    MutationOfLayoutConstrainedField,
+    /// Borrowing such a place, or binding it `ref`, where its type is not `Freeze`.
+    BorrowOfLayoutConstrainedField,
 }
 
 /// How rustc reports an [`UnsafeOp`].
@@ -120,6 +135,7 @@ impl UnsafetyCheck {
 
 /// rustc's `check_unsafety` of `def`, with the closures, inline consts and repeat counts in it.
 #[salsa::tracked(returns(ref))]
+// dyn: the database every hir-ty query takes.
 pub fn unsafety_check(db: &dyn HirDatabase, def: DefWithBodyId) -> UnsafetyCheck {
     let body = Body::of(db, def);
     let infer = InferenceResult::of(db, def);
@@ -136,6 +152,7 @@ pub fn unsafety_check(db: &dyn HirDatabase, def: DefWithBodyId) -> UnsafetyCheck
             (Context::Safe, TargetFeatures::default())
         }
     };
+    // alloc: only at the first operation, so none for a body without one.
     let mut ops = Vec::new();
     let mut walker = Walker::new(db, infer, body, owner, context, target_features, &mut ops);
     for param in &body.params {
@@ -164,12 +181,12 @@ pub enum InsideUnsafeBlock {
 /// Every operation that needs `unsafe` in `current` and what it holds, inside a block or not,
 /// starting outside one: what an editor highlights. A repeat count's are not among them.
 pub fn unsafe_operations<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db dyn HirDatabase, // dyn: the database every hir-ty query takes.
     infer: &InferenceResult<'_>,
     def: ExpressionStoreOwnerId,
     body: &ExpressionStore,
     current: ExprId,
-    callback: &mut dyn FnMut(ExprOrPatId, InsideUnsafeBlock),
+    callback: &mut dyn FnMut(ExprOrPatId, InsideUnsafeBlock), // dyn: an editor's, at the edge.
 ) {
     let target_features = match def {
         ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(func))
@@ -227,6 +244,7 @@ impl Sink for Vec<UnsafeOp> {
     }
 }
 
+// dyn: the editor's callback of `unsafe_operations`.
 struct Callback<'c>(&'c mut dyn FnMut(ExprOrPatId, InsideUnsafeBlock));
 
 impl Sink for Callback<'_> {
@@ -244,7 +262,7 @@ impl Sink for Callback<'_> {
 
 /// rustc's `UnsafetyVisitor`.
 struct Walker<'a, 'db, 'i, S> {
-    db: &'db dyn HirDatabase,
+    db: &'db dyn HirDatabase, // dyn: the database every hir-ty query takes.
     infer: &'a InferenceResult<'i>,
     store: &'a ExpressionStore,
     owner: ExpressionStoreOwnerId,
@@ -260,15 +278,22 @@ struct Walker<'a, 'db, 'i, S> {
     /// rustc's `assignment_info`: the place being walked is the left side of a `=`.
     assigning: bool,
     in_union_destructure: bool,
+    /// rustc's `inside_adt`: in a pattern of a type with `#[rustc_layout_scalar_valid_range_*]`,
+    /// not behind a deref.
+    inside_adt: bool,
     /// The fields of the variant last asked about: field accesses run on one struct.
     fields: Option<(VariantId, &'db VariantFields)>,
+    /// The ADT last asked about and whether it has `#[rustc_layout_scalar_valid_range_*]`.
+    layout_constrained: Option<(AdtId, bool)>,
+    /// Made at the first shared borrow of a layout constrained place, to ask `Freeze`.
+    freeze: Option<(InferCtxt<'db>, ParamEnv<'db>)>,
     drop_trait: Option<Option<TraitId>>,
     sink: &'a mut S,
 }
 
 impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
     fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db dyn HirDatabase, // dyn: the database every hir-ty query takes.
         infer: &'a InferenceResult<'i>,
         store: &'a ExpressionStore,
         owner: ExpressionStoreOwnerId,
@@ -295,7 +320,10 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             suggest_unsafe_block: true,
             assigning: false,
             in_union_destructure: false,
+            inside_adt: false,
             fields: None,
+            layout_constrained: None,
+            freeze: None,
             drop_trait: None,
             sink,
         }
@@ -332,12 +360,14 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
     fn walk_inner_body(&mut self, params: &[PatId], body: ExprId) {
         let suggest = self.suggest_unsafe_block;
         let in_union_destructure = mem::replace(&mut self.in_union_destructure, false);
+        let inside_adt = mem::replace(&mut self.inside_adt, false);
         for &param in params {
             self.walk_pat(param);
         }
         self.walk_expr(body);
         self.suggest_unsafe_block = suggest;
         self.in_union_destructure = in_union_destructure;
+        self.inside_adt = inside_adt;
     }
 
     fn walk_exprs(&mut self, exprs: &[ExprId]) {
@@ -352,7 +382,11 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
         let assigning = mem::replace(&mut self.assigning, false)
             && self.infer.expr_adjustment(current).is_none_or(|it| it.is_empty());
         let store = self.store;
-        match store.expr(current) {
+        let expr = store.expr(current);
+        if matches!(expr, Expr::Field { .. } | Expr::Index { .. }) {
+            self.check_adjustment_borrow(current);
+        }
+        match expr {
             Expr::Path(path) => self.check_static(current, path),
             Expr::Field { expr, .. } => {
                 if let Some(Either::Left(field)) = self.infer.field_resolution(current) {
@@ -430,14 +464,38 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
                     self.walk_expr(peeled);
                 }
             },
+            Expr::Ref { expr, rawness: Rawness::Ref, mutability } => {
+                if self.is_layout_constrained_operand(expr) {
+                    let mutability = match mutability {
+                        type_ref::Mutability::Shared => Mutability::Not,
+                        type_ref::Mutability::Mut => Mutability::Mut,
+                    };
+                    self.borrow_of_layout_constrained(current, mutability, self.adjusted_ty(expr));
+                }
+                self.walk_expr(expr);
+            }
             Expr::UnaryOp { expr, op: UnaryOp::Deref } => {
                 if let TyKind::RawPtr(..) = self.adjusted_ty(expr).kind() {
                     self.requires_unsafe(current, UnsafetyReason::RawPtrDeref);
                 }
                 self.walk_expr(expr);
             }
+            // An overloaded one borrows its left side, which its adjustment says.
+            Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::Assignment { op: Some(_) }) } => {
+                if self.infer.method_resolution(current).is_none()
+                    && self.is_layout_constrained_operand(lhs)
+                {
+                    self.requires_unsafe(current, UnsafetyReason::MutationOfLayoutConstrainedField);
+                }
+                self.walk_expr(lhs);
+                self.walk_expr(rhs);
+            }
             Expr::Assignment { target, value } => match store.pat(target) {
                 Pat::Expr(place) => {
+                    if self.is_layout_constrained_operand(place) {
+                        let reason = UnsafetyReason::MutationOfLayoutConstrainedField;
+                        self.requires_unsafe(current, reason);
+                    }
                     self.assigning = true;
                     self.walk_expr(place);
                     self.assigning = false;
@@ -541,7 +599,6 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             | Expr::Yield { .. }
             | Expr::Yeet { .. }
             | Expr::Await { .. }
-            | Expr::Ref { .. }
             | Expr::UnaryOp { .. }
             | Expr::BinaryOp { .. }
             | Expr::Index { .. }
@@ -558,9 +615,9 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
     fn walk_pat(&mut self, current: PatId) {
         let store = self.store;
         let pat = store.pat(current);
+        // Match ergonomics' implicit derefs are deref patterns around this one.
+        let derefs = self.infer.pat_adjustment(current).is_some_and(|it| !it.is_empty());
         if self.in_union_destructure {
-            // Match ergonomics' implicit derefs are deref patterns around this one.
-            let derefs = self.infer.pat_adjustment(current).is_some_and(|it| !it.is_empty());
             match pat {
                 // `Missing`, `Rest` and `Wild` read nothing; `Or` holds patterns walked below.
                 Pat::Missing | Pat::Rest | Pat::Wild | Pat::Or(_) if !derefs => {}
@@ -570,6 +627,8 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
                 }
             }
         }
+        let inside_adt = self.inside_adt;
+        self.inside_adt &= !derefs;
         match pat {
             Pat::Record { args, .. } => {
                 let variant = self.infer.variant_resolution_for_pat(current);
@@ -584,16 +643,27 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
                         }
                     }
                 }
-                let union = matches!(variant, Some(VariantId::UnionId(_)));
                 let outer = self.in_union_destructure;
-                self.in_union_destructure |= union;
+                match variant {
+                    Some(VariantId::UnionId(_)) => self.in_union_destructure = true,
+                    Some(VariantId::StructId(it)) => {
+                        let constrained = self.is_layout_constrained(AdtId::StructId(it));
+                        self.inside_adt |= constrained;
+                    }
+                    Some(VariantId::EnumVariantId(_)) | None => {}
+                }
                 for arg in args {
                     self.walk_pat(arg.pat);
                 }
                 self.in_union_destructure = outer;
             }
             Pat::TupleStruct { args, ellipsis, .. } => {
-                if let Some(variant) = self.infer.variant_resolution_for_pat(current) {
+                let variant = self.infer.variant_resolution_for_pat(current);
+                if let Some(VariantId::StructId(it)) = variant {
+                    let constrained = self.is_layout_constrained(AdtId::StructId(it));
+                    self.inside_adt |= constrained;
+                }
+                if let Some(variant) = variant {
                     let fields = self.variant_fields(variant);
                     if has_unsafe_field(fields) {
                         let count = fields.len();
@@ -617,6 +687,17 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
                     self.walk_pat(arg);
                 }
             }
+            Pat::Bind { id, .. } => {
+                if self.inside_adt {
+                    self.check_ref_binding(current, id);
+                }
+                pat.walk_child_pats(|child| self.walk_pat(child));
+            }
+            // THIR's deref patterns: `box` is one too.
+            Pat::Ref { .. } | Pat::Box { .. } | Pat::Deref { .. } => {
+                self.inside_adt = false;
+                pat.walk_child_pats(|child| self.walk_pat(child));
+            }
             Pat::Missing
             | Pat::Rest
             | Pat::Wild
@@ -626,13 +707,113 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             | Pat::Slice { .. }
             | Pat::Path(_)
             | Pat::Lit(_)
-            | Pat::Bind { .. }
-            | Pat::Ref { .. }
-            | Pat::Box { .. }
-            | Pat::Deref { .. }
             | Pat::NotNull
             | Pat::Expr(_) => pat.walk_child_pats(|child| self.walk_pat(child)),
         }
+        self.inside_adt = inside_adt;
+    }
+
+    /// A `ref` or `ref mut` binding inside a pattern of a layout constrained type.
+    fn check_ref_binding(&mut self, current: PatId, binding: BindingId) {
+        let Some(BindingMode(ByRef::Yes(mutability), _)) = self.infer.binding_mode(current) else {
+            return;
+        };
+        match mutability {
+            Mutability::Mut => {
+                self.requires_unsafe(current, UnsafetyReason::MutationOfLayoutConstrainedField);
+            }
+            Mutability::Not => {
+                if let Some((pointee, _, _)) = self.infer.binding_ty(binding).as_reference()
+                    && !self.is_freeze(pointee)
+                {
+                    self.requires_unsafe(current, UnsafetyReason::BorrowOfLayoutConstrainedField);
+                }
+            }
+        }
+    }
+
+    /// rustc's `ExprKind::Borrow` that an adjustment makes of `current`, a place: an autoref, or
+    /// the borrow an overloaded deref or index takes of its operand.
+    fn check_adjustment_borrow(&mut self, current: ExprId) {
+        let Some(first) = self.infer.expr_adjustment(current).and_then(|it| it.first()) else {
+            return;
+        };
+        let mutability = match first.kind {
+            Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Not))
+            | Adjust::Deref(Some(OverloadedDeref(Mutability::Not))) => Mutability::Not,
+            Adjust::Borrow(AutoBorrow::Ref(AutoBorrowMutability::Mut { .. }))
+            | Adjust::Deref(Some(OverloadedDeref(Mutability::Mut))) => Mutability::Mut,
+            Adjust::NeverToAny
+            | Adjust::Deref(None)
+            | Adjust::Borrow(AutoBorrow::RawPtr(_))
+            | Adjust::Pointer(_) => return,
+        };
+        if self.is_layout_constrained_place(current) {
+            let ty = self.infer.expr_ty(current);
+            self.borrow_of_layout_constrained(current, mutability, ty);
+        }
+    }
+
+    fn borrow_of_layout_constrained(&mut self, node: ExprId, mutability: Mutability, ty: Ty<'db>) {
+        match mutability {
+            Mutability::Mut => {
+                self.requires_unsafe(node, UnsafetyReason::MutationOfLayoutConstrainedField);
+            }
+            Mutability::Not => {
+                if !self.is_freeze(ty) {
+                    self.requires_unsafe(node, UnsafetyReason::BorrowOfLayoutConstrainedField);
+                }
+            }
+        }
+    }
+
+    /// rustc's `LayoutConstrainedPlaceVisitor` from an operand: THIR's adjustments around it are
+    /// a deref or a value, where the place ends.
+    fn is_layout_constrained_operand(&mut self, expr: ExprId) -> bool {
+        self.infer.expr_adjustment(expr).is_none_or(|it| it.is_empty())
+            && self.is_layout_constrained_place(expr)
+    }
+
+    /// Whether the place `expr`, its own adjustments aside, passes through a field of a type with
+    /// `#[rustc_layout_scalar_valid_range_*]` before any deref. A builtin index walks its index
+    /// too, as rustc's visitor does.
+    fn is_layout_constrained_place(&mut self, expr: ExprId) -> bool {
+        match self.store.expr(expr) {
+            Expr::Field { expr: base, .. } => {
+                let constrained = match self.adjusted_ty(base).kind() {
+                    TyKind::Adt(def, _) => self.is_layout_constrained(def.def_id()),
+                    _ => false,
+                };
+                constrained || self.is_layout_constrained_operand(base)
+            }
+            Expr::Index { base, index } if self.infer.method_resolution(expr).is_none() => {
+                self.is_layout_constrained_operand(base)
+                    || self.is_layout_constrained_operand(index)
+            }
+            _ => false,
+        }
+    }
+
+    fn is_layout_constrained(&mut self, adt: AdtId) -> bool {
+        match self.layout_constrained {
+            Some((id, constrained)) if id == adt => constrained,
+            _ => {
+                let range = AttrFlags::rustc_layout_scalar_valid_range(self.db, adt);
+                let constrained = range.start.is_some() || range.end.is_some();
+                self.layout_constrained = Some((adt, constrained));
+                constrained
+            }
+        }
+    }
+
+    fn is_freeze(&mut self, ty: Ty<'db>) -> bool {
+        let (db, krate, owner) = (self.db, self.krate, self.owner);
+        let (infcx, env) = self.freeze.get_or_insert_with(|| {
+            let interner = DbInterner::new_with(db, krate);
+            let env = db.trait_environment(owner.generic_def(db));
+            (interner.infer_ctxt().build(TypingMode::non_body_analysis()), env)
+        });
+        is_freeze(infcx, ty, *env)
     }
 
     /// The places of a destructuring assignment, in order, each the left side of a `=`.
@@ -640,6 +821,9 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
         let store = self.store;
         match store.pat(current) {
             Pat::Expr(place) => {
+                if self.is_layout_constrained_operand(place) {
+                    self.requires_unsafe(place, UnsafetyReason::MutationOfLayoutConstrainedField);
+                }
                 self.assigning = true;
                 self.walk_expr(place);
                 self.assigning = false;
@@ -666,8 +850,9 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             Unsafety::DeprecatedSafe2024 => self.deprecated_safe_call(node),
         }
         if self.is_drop_method(func) {
-            let refused = self.infer.diagnostics().iter().any(|it| {
-                matches!(it, InferenceDiagnostic::ExplicitDropMethodUse { kind } if *kind == drop_use)
+            let refused = self.infer.diagnostics().iter().any(|it| match it {
+                InferenceDiagnostic::ExplicitDropMethodUse { kind } => *kind == drop_use,
+                _ => false,
             });
             if !refused {
                 self.requires_unsafe(node, UnsafetyReason::CallDropExplicitly);
@@ -686,6 +871,14 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
     fn check_adt(&mut self, node: ExprId, variant: VariantId) {
         if has_unsafe_field(self.variant_fields(variant)) {
             self.requires_unsafe(node, UnsafetyReason::InitializingTypeWithUnsafeField);
+        }
+        let adt = match variant {
+            VariantId::StructId(it) => AdtId::StructId(it),
+            VariantId::UnionId(it) => AdtId::UnionId(it),
+            VariantId::EnumVariantId(it) => AdtId::EnumId(it.lookup(self.db).parent),
+        };
+        if self.is_layout_constrained(adt) {
+            self.requires_unsafe(node, UnsafetyReason::InitializingTypeWith);
         }
     }
 

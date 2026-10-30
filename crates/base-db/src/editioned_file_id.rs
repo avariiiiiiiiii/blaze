@@ -22,15 +22,14 @@ impl EditionedFileId {
     /// The file's tree, sharing its text. A file of a library source root (a dependency's) is an
     /// outline, whose `fn` bodies are parsed when first walked into (#1294); every other file is
     /// parsed in full. Decided by the source root, so a file two crates read gets one answer.
+    /// After an edit it is made from the file's last parse, when one is kept (see
+    /// [`Reparse`](crate::Reparse)): the same tree, in the time of the edited item's parse.
     #[salsa::tracked(lru = 128, returns(ref))]
     pub fn parse(self, db: &dyn SourceDatabase) -> syntax::Parse<ast::SourceFile> {
         let _p = tracing::info_span!("parse", ?self).entered();
         let (file_id, edition) = self.unpack(db);
-        let text = db.file_text(file_id).text(db).clone();
-        match self.is_library(db) {
-            true => ast::SourceFile::parse_outline(text, edition),
-            false => ast::SourceFile::parse_shared(text, edition),
-        }
+        let input = db.file_text(file_id);
+        input.reparse_field(db).parse(input.text(db), edition, self.is_library(db))
     }
 
     /// Whether the file is in a library source root: a firewall, so an edit to the root's set

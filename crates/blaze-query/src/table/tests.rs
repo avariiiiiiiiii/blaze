@@ -17,7 +17,7 @@ fn key(n: u64) -> QueryKey {
 fn freed<V: Send + Sync + 'static>(map: &Map<V>) {
     let until = Instant::now() + Duration::from_secs(60);
     loop {
-        map.collect();
+        map.sweep();
         if map.held() == 0 {
             return;
         }
@@ -80,7 +80,7 @@ fn a_replaced_entry_stays_readable_until_its_task_ends() {
     map.insert(&task, key(1), "new".to_owned());
     assert_eq!(old, "old", "a reader keeps what it loaded");
     assert_eq!(map.get(&task, &key(1)).map(String::as_str), Some("new"));
-    map.collect();
+    map.sweep();
     assert_eq!(map.held(), 1, "the old entry waits for this task");
     drop(task);
     freed(&map);
@@ -98,7 +98,7 @@ fn a_retired_row_is_reused_only_after_its_grace() {
     let second = map.row(&task, &key(1)).expect("replaced");
     assert_ne!(first, second, "the old row may still be read");
     map.insert(&task, key(1), 3);
-    map.collect();
+    map.sweep();
     let third = map.row(&task, &key(1)).expect("replaced");
     assert!(third != first && third != second, "rows {first} and {second} wait for this task");
     drop(task);

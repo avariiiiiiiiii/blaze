@@ -14,49 +14,49 @@ use span::{Edition, SyntaxContext};
 use syntax::{SyntaxKind, SyntaxKind::*, T};
 use tt::FlatToken;
 
-pub fn to_parser_input(
+pub fn to_parser_input<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     buffer: tt::TokenTreesView<'_>,
-    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    span_to_edition: &mut F,
 ) -> parser::Input {
     let mut res = parser::Input::with_capacity(buffer.len());
-    convert(buffer, span_to_edition, false, &mut res);
+    convert::<false, F>(buffer, span_to_edition, &mut res);
     res
 }
 
 /// The input of a macro's matcher: the first token of each group without delimiters, which is
 /// a fragment a macro transcribed, is marked as one, so that a matcher parses it whole, as rustc
 /// does. `count` followed by `$n` of `0u8 + 1u8` is no call of `count` to `(0u8 + 1u8)`.
-pub fn to_matcher_input(
+pub fn to_matcher_input<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     buffer: tt::TokenTreesView<'_>,
-    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    span_to_edition: &mut F,
 ) -> parser::Input {
     let mut res = parser::Input::with_capacity(buffer.len());
-    convert(buffer, span_to_edition, true, &mut res);
+    convert::<true, F>(buffer, span_to_edition, &mut res);
     res
 }
 
 /// [`to_parser_input`] into `res`, emptied first, keeping its buffer.
-pub fn to_parser_input_into(
+pub fn to_parser_input_into<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     buffer: tt::TokenTreesView<'_>,
-    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    span_to_edition: &mut F,
     res: &mut parser::Input,
 ) {
-    convert(buffer, span_to_edition, false, res)
+    convert::<false, F>(buffer, span_to_edition, res)
 }
 
 /// [`to_matcher_input`] into `res`, emptied first, keeping its buffer.
-pub fn to_matcher_input_into(
+pub fn to_matcher_input_into<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     buffer: tt::TokenTreesView<'_>,
-    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    span_to_edition: &mut F,
     res: &mut parser::Input,
 ) {
-    convert(buffer, span_to_edition, true, res)
+    convert::<true, F>(buffer, span_to_edition, res)
 }
 
-fn convert(
+/// The conversion, `FRAGMENTS` for a matcher's input: a parser's has no fragment to track.
+fn convert<const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     buffer: tt::TokenTreesView<'_>,
-    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
-    fragments: bool,
+    span_to_edition: &mut F,
     res: &mut parser::Input,
 ) {
     res.clear();
@@ -69,7 +69,8 @@ fn convert(
     let mut lifetime = false;
 
     buffer.for_each_token(|token, ctx| {
-        if let Some(at) = fragment_at
+        if FRAGMENTS
+            && let Some(at) = fragment_at
             && res.len() > at
         {
             res.mark_fragment_start(at);
@@ -97,10 +98,9 @@ fn convert(
                 let edition = editions.of(ctx);
                 if sym == sym::underscore {
                     res.push(T![_], edition);
-                } else if sym.as_str().starts_with('\'') {
-                    res.push(LIFETIME_IDENT, edition);
                 } else if is_raw.yes() {
-                    res.push(IDENT, edition);
+                    let kind = if is_lifetime(sym.as_str()) { LIFETIME_IDENT } else { IDENT };
+                    res.push(kind, edition);
                 } else {
                     match keywords.of(sym, edition) {
                         (kind, EOF) => res.push(kind, edition),
@@ -126,7 +126,7 @@ fn convert(
                 tt::DelimiterKind::Brace => res.push(T!['{'], editions.of(ctx)),
                 tt::DelimiterKind::Bracket => res.push(T!['['], editions.of(ctx)),
                 tt::DelimiterKind::Invisible => {
-                    if fragments && fragment_at.is_none() {
+                    if FRAGMENTS && fragment_at.is_none() {
                         fragment_at = Some(res.len());
                     }
                 }
@@ -140,7 +140,8 @@ fn convert(
         }
     });
     assert!(!lifetime, "Next token must be ident");
-    if let Some(at) = fragment_at
+    if FRAGMENTS
+        && let Some(at) = fragment_at
         && res.len() > at
     {
         res.mark_fragment_start(at);
@@ -167,16 +168,16 @@ const NEAR: usize = 8;
 
 /// Each context's edition, asked of the caller once: the last one, then up to [`NEAR`] in an
 /// array, then a map. Nothing is allocated for a tree of [`NEAR`] contexts or fewer.
-struct Editions<'f> {
-    span_to_edition: &'f mut dyn FnMut(SyntaxContext) -> Edition,
+struct Editions<'f, F: FnMut(SyntaxContext) -> Edition + ?Sized> {
+    span_to_edition: &'f mut F,
     last: (SyntaxContext, Edition),
     near: [(SyntaxContext, Edition); NEAR],
     len: usize,
     far: FxHashMap<SyntaxContext, Edition>,
 }
 
-impl<'f> Editions<'f> {
-    fn new(span_to_edition: &'f mut dyn FnMut(SyntaxContext) -> Edition) -> Self {
+impl<'f, F: FnMut(SyntaxContext) -> Edition + ?Sized> Editions<'f, F> {
+    fn new(span_to_edition: &'f mut F) -> Self {
         let unused = (SyntaxContext::root(Edition::Edition2015), Edition::Edition2015);
         let far = FxHashMap::default();
         Editions { span_to_edition, last: unused, near: [unused; NEAR], len: 0, far }
@@ -222,6 +223,12 @@ const EDITIONS: usize = Edition::LATEST as usize + 1;
 /// a keyword's kind and `EOF`, or `IDENT` and its contextual kind (`IDENT` for none).
 type IdentKinds = [(SyntaxKind, SyntaxKind); EDITIONS];
 
+/// Whether an identifier's text is a lifetime's, which the parser takes as one.
+#[inline]
+fn is_lifetime(text: &str) -> bool {
+    text.starts_with('\'')
+}
+
 /// [`IdentKinds`] for every keyword, found by its symbol: by [`Symbol::declared_index`] (a
 /// pointer subtraction and two loads) for a keyword whose symbol is declared, else through a
 /// map by symbol. Built once from [`SyntaxKind::from_keyword`] and
@@ -242,9 +249,11 @@ static KEYWORDS: LazyLock<Keywords> = LazyLock::new(Keywords::new);
 
 impl Keywords {
     fn new() -> Keywords {
+        // alloc: built once, for the process.
         let mut texts: Vec<&'static str> = SyntaxKind::keyword_texts().collect();
         texts.sort_unstable();
         texts.dedup();
+        // alloc: built once, for the process.
         let mut declared = Vec::new();
         let mut other = FxHashMap::default();
         let mut other_lengths = 0u64;
@@ -273,16 +282,32 @@ impl Keywords {
         Keywords { declared: declared.into(), other, other_lengths, kinds: kinds.into() }
     }
 
+    /// What the parser is given for an identifier that is not raw or `_`: a keyword's kinds,
+    /// `LIFETIME_IDENT` for a lifetime's text, else `IDENT`. Reads the text at most once and
+    /// not at all for a declared keyword.
     #[inline]
     fn of(&self, symbol: Symbol, edition: Edition) -> (SyntaxKind, SyntaxKind) {
         let place = match symbol.declared_index() {
             Some(at) => self.declared.get(usize::from(at)).copied().unwrap_or(0),
-            None if self.other_lengths & 1 << symbol.as_str().len().min(63) == 0 => 0,
-            None => self.other.get(&symbol).copied().unwrap_or(0),
+            None => {
+                let text = symbol.as_str();
+                if self.other_lengths & 1 << text.len().min(63) == 0 {
+                    return Self::not_keyword(text);
+                }
+                self.other.get(&symbol).copied().unwrap_or(0)
+            }
         };
         match place {
-            0 => (IDENT, IDENT),
+            0 => Self::not_keyword(symbol.as_str()),
             place => self.kinds[usize::from(place) - 1][edition as usize],
+        }
+    }
+
+    #[inline]
+    fn not_keyword(text: &str) -> (SyntaxKind, SyntaxKind) {
+        match is_lifetime(text) {
+            true => (LIFETIME_IDENT, EOF),
+            false => (IDENT, IDENT),
         }
     }
 }
@@ -303,12 +328,28 @@ mod tests {
     /// functions give, in every edition, declared symbol or not.
     #[test]
     fn keywords_answer_as_the_text_functions() {
-        let others = ["foo", "Self_", "r", "unionx", "a", "macro_rule", "_x", "xxxxxxxxxxxxxxxxxxxx"];
+        let others = [
+            "foo",
+            "Self_",
+            "r",
+            "unionx",
+            "a",
+            "macro_rule",
+            "_x",
+            "xxxxxxxxxxxxxxxxxxxx",
+            "'a",
+            "'static",
+            "'_",
+            "'abcdefgh",
+        ];
         let texts = SyntaxKind::keyword_texts().chain(others.iter().copied());
         for text in texts {
             let symbol = Symbol::intern(text);
             for edition in Edition::iter() {
-                let expected = ident_kinds(text, edition);
+                let expected = match is_lifetime(text) {
+                    true => (LIFETIME_IDENT, EOF),
+                    false => ident_kinds(text, edition),
+                };
                 assert_eq!(KEYWORDS.of(symbol, edition), expected, "{text} in {edition:?}");
             }
         }

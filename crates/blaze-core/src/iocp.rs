@@ -8,6 +8,10 @@
 //! when one is done. A process's end is posted by a wait of the thread pool's, its job's
 //! messages by the job; timers are the port's wait, ended at the next one due.
 //!
+//! A journal's reads of the volume's USN journal are on the port too ([`usn`]); what each read
+//! names is made on the driver's threads, which ask the volume where files are, and the next
+//! read is asked for once they hand the journal back. Stamps and listings run on the threads.
+//!
 //! The rule every request keeps (see [`Request`]): what the kernel reads or writes for it (its
 //! `OVERLAPPED`, its bytes, the handle it is on) is the request's, and the request is dropped
 //! only once its completion is taken from the port, never before.
@@ -15,8 +19,12 @@
 pub(crate) mod files;
 mod net;
 mod process;
+mod stamp;
 mod sys;
+mod usn;
 mod watch;
+
+pub(crate) use self::stamp::{entries, stamps};
 
 use std::{
     collections::VecDeque,
@@ -48,7 +56,7 @@ use windows_sys::Win32::{
 
 use self::sys::{KEY_EXIT, KEY_IO, KEY_JOB, KEY_WAKE, Port, Slot};
 use crate::{
-    Address, Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Tag,
+    Address, Command, Completion, Confine, Conn, Cursor, Done, Driver, Effect, FileName, IoError, Tag,
     wheel::{self, Wheel},
 };
 
@@ -69,6 +77,8 @@ enum Op {
     /// `bytes` written at `at`, or at the end where `None` (an append).
     Write { handle: Arc<OwnedHandle>, bytes: Vec<u8>, at: Option<u64>, put: usize },
     Watch(watch::Watching),
+    /// A read of the USN journal.
+    Journal(Box<usn::Journal>),
     /// A process's output, `err` its standard error.
     Output { spawn: Tag, err: bool, pipe: OwnedHandle, chunk: Box<[u8]> },
     Input { spawn: Tag, pipe: OwnedHandle, bytes: Vec<u8>, put: usize },
@@ -84,6 +94,7 @@ impl Op {
         match self {
             Op::Read { handle, .. } | Op::Write { handle, .. } => handle.as_raw_handle(),
             Op::Watch(watching) => watching.raw(),
+            Op::Journal(journal) => journal.raw(),
             Op::Output { pipe, .. } | Op::Input { pipe, .. } => pipe.as_raw_handle(),
             Op::Accept(accepting) => net::raw(&accepting.listener.socket) as HANDLE,
             Op::Connect { connecting, .. } => net::raw(&connecting.socket) as HANDLE,
@@ -126,6 +137,7 @@ impl Request {
                 })
             }
             Op::Watch(watching) => watching.read(slot.reset(0)),
+            Op::Journal(journal) => journal.read(slot.reset(0)),
             Op::Output { pipe, chunk, .. } => {
                 let overlapped = slot.reset(0);
                 // SAFETY: as for a read.
@@ -167,12 +179,25 @@ enum Back {
     Done(Completion),
     /// A Unix socket's connect, made with a blocking call (see `net`).
     Connected { tag: Tag, at: Address, made: io::Result<OwnedSocket> },
+    /// A journal opened, or a read of it named: the journal to read on with, unless it ended.
+    Journal { tag: Tag, journal: Option<Box<usn::Journal>>, taken: usn::Taken },
 }
 
 /// What the driver's threads are given.
 enum Work {
     File(Effect),
     Connect { tag: Tag, at: Address },
+    /// A journal to open, its volume to be put on the port.
+    Open { tag: Tag, dir: FileName, since: Cursor },
+    /// What a read of a journal ended with, to be named.
+    Took { tag: Tag, journal: Box<usn::Journal>, result: io::Result<u32> },
+}
+
+/// A journal's watch: whether its read is in flight (its request's id) or its journal is on the
+/// driver's threads, and whether it was asked to end.
+struct Journaling {
+    request: Option<u64>,
+    stopping: bool,
 }
 
 struct Spawned {
@@ -219,6 +244,7 @@ pub struct Iocp {
     /// By ticks since `start`: due, then the order they were asked for.
     timers: Wheel<Tag>,
     watches: FxHashMap<Tag, u64>,
+    journals: FxHashMap<Tag, Journaling>,
     listens: FxHashMap<Tag, u64>,
     spawns: FxHashMap<Tag, Spawned>,
     serials: FxHashMap<u64, Tag>,
@@ -260,6 +286,7 @@ impl Iocp {
             ready: Vec::new(),
             timers: Wheel::new(),
             watches: FxHashMap::default(),
+            journals: FxHashMap::default(),
             listens: FxHashMap::default(),
             spawns: FxHashMap::default(),
             serials: FxHashMap::default(),
@@ -386,7 +413,9 @@ impl Iocp {
             | Effect::Stat { .. }
             | Effect::List { .. }
             | Effect::Mode { .. }
-            | Effect::Map { .. }) => {
+            | Effect::Map { .. }
+            | Effect::Stamp { .. }
+            | Effect::Entries { .. }) => {
                 self.worker(Work::File(effect));
                 Ok(())
             }
@@ -396,8 +425,17 @@ impl Iocp {
                 self.timers.insert(due, tag);
                 Ok(())
             }
+            Effect::Journal { dir, since, tag } => {
+                if self.watches.contains_key(&tag) || self.journals.contains_key(&tag) {
+                    // alloc: an error path.
+                    return Err(io::Error::other(format!("something is watched as {tag:?} already")));
+                }
+                self.journals.insert(tag, Journaling { request: None, stopping: false });
+                self.worker(Work::Open { tag, dir, since });
+                Ok(())
+            }
             Effect::Watch { dir, tag } => {
-                if self.watches.contains_key(&tag) {
+                if self.watches.contains_key(&tag) || self.journals.contains_key(&tag) {
                     return Err(io::Error::other(format!("something is watched as {tag:?} already")));
                 }
                 let watching = watch::Watching::new(&self.root, &dir)?;
@@ -409,6 +447,7 @@ impl Iocp {
             }
             Effect::Flush { watch, .. } => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
+                // alloc: an error path.
                 format!(
                     "flushing the watch {watch:?}: ReadDirectoryChangesW has no barrier that says \
                      every change made before it has been read, so a watch on Windows vouches for nothing"
@@ -647,6 +686,10 @@ impl Iocp {
             let made = result.and_then(|_| connecting.take());
             return self.connected(tag, &at, made);
         }
+        if let Op::Journal(_) = request.op {
+            let Op::Journal(journal) = request.op else { unreachable!("matched above") };
+            return self.journal_read(tag, journal, result);
+        }
         let code = result.as_ref().err().and_then(io::Error::raw_os_error).map(|it| it as u32);
         match &mut request.op {
             Op::Read { bytes, filled, to_end, .. } => {
@@ -784,7 +827,7 @@ impl Iocp {
                 }
                 self.put(request);
             }
-            Op::Connect { .. } => unreachable!("ended above"),
+            Op::Connect { .. } | Op::Journal(_) => unreachable!("ended above"),
             Op::Recv { conn, bytes, .. } => {
                 let conn = *conn;
                 let done = match result {
@@ -893,9 +936,50 @@ impl Iocp {
                     });
                     self.connected(tag, &at, made);
                 }
+                Back::Journal { tag, journal, taken } => self.journaled(tag, journal, taken),
             }
         }
         out.append(&mut self.ready);
+    }
+
+    /// A journal the threads handed back: its batch told, then its next read asked for, or its
+    /// end, or, asked to end meanwhile, its unwatch.
+    fn journaled(&mut self, tag: Tag, journal: Option<Box<usn::Journal>>, taken: usn::Taken) {
+        let Some(journaling) = self.journals.get(&tag) else { return };
+        let stopping = journaling.stopping;
+        if let Some(batch) = taken.batch {
+            self.ready.push(Completion { tag, done: Done::Journaled(batch) });
+        }
+        if let Some(why) = taken.end {
+            self.journals.remove(&tag);
+            return self.fail(tag, why);
+        }
+        if stopping {
+            self.journals.remove(&tag);
+            self.ready.push(Completion { tag, done: Done::Unwatched });
+            return;
+        }
+        let journal = journal.expect("a journal handed back without an end is handed back with it");
+        let request = self.request(tag, Op::Journal(journal));
+        if let Some(journaling) = self.journals.get_mut(&tag) {
+            journaling.request = Some(request.slot.id);
+        }
+        self.put(request);
+    }
+
+    /// A read of the journal `tag` ended: its records to be named on the threads, or, asked to
+    /// end, the journal let go. What it read as it was cancelled is after the last batch's
+    /// cursor, so a watch from that cursor reads it again.
+    fn journal_read(&mut self, tag: Tag, journal: Box<usn::Journal>, result: io::Result<u32>) {
+        let Some(journaling) = self.journals.get_mut(&tag) else { return };
+        journaling.request = None;
+        if journaling.stopping {
+            self.journals.remove(&tag);
+            drop(journal);
+            self.ready.push(Completion { tag, done: Done::Unwatched });
+            return;
+        }
+        self.worker(Work::Took { tag, journal, result });
     }
 }
 
@@ -952,7 +1036,15 @@ impl Driver for Iocp {
                     }
                 }
                 // The end of the watch or listen, in flight since it was asked for, comes with
-                // its request's completion: after every change it heard.
+                // its request's completion: after every change it heard. A journal on the
+                // threads ends as they hand it back.
+                Effect::Unwatch { tag } if self.journals.contains_key(&tag) => {
+                    let journaling = self.journals.get_mut(&tag).expect("looked up above");
+                    journaling.stopping = true;
+                    if let Some(request) = journaling.request.and_then(|id| self.requests.get_mut(&id)) {
+                        request.cancel();
+                    }
+                }
                 Effect::Unwatch { tag } => match self.watches.get(&tag).and_then(|id| self.requests.get_mut(id)) {
                     Some(request) => {
                         if let Op::Watch(watching) = &mut request.op {
@@ -1009,7 +1101,7 @@ impl Driver for Iocp {
         }
         let ended = out[before..]
             .iter()
-            .filter(|it| !matches!(it.done, Done::Changed { .. } | Done::Accepted { .. }))
+            .filter(|it| !matches!(it.done, Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }))
             .count();
         self.in_flight -= ended;
         out.len() - before
@@ -1037,6 +1129,23 @@ fn work_on(root: &Path, queue: &Mutex<Receiver<Work>>, port: &Port, back: &Sende
             Work::Connect { tag, at } => {
                 let made = net::connect_blocking(root, &at);
                 back.send(Back::Connected { tag, at, made })
+            }
+            Work::Open { tag, dir, since } => {
+                let opened = usn::Journal::open(root, &dir, since).and_then(|(journal, first)| {
+                    port.associate(journal.raw())?;
+                    Ok((journal, first))
+                });
+                let (journal, taken) = match opened {
+                    Ok((journal, batch)) => (Some(journal), usn::Taken { batch, end: None }),
+                    // alloc: an error path.
+                    Err(error) => (None, usn::Taken { batch: None, end: Some(error.to_string()) }),
+                };
+                back.send(Back::Journal { tag, journal, taken })
+            }
+            Work::Took { tag, mut journal, result } => {
+                let taken = journal.take(result);
+                let journal = taken.end.is_none().then_some(journal);
+                back.send(Back::Journal { tag, journal, taken })
             }
         };
         if sent.is_err() || port.post(KEY_WAKE, 0, 0).is_err() {
@@ -1076,7 +1185,7 @@ mod tests {
     use std::{collections::BTreeMap, ffi::OsString};
 
     use super::*;
-    use crate::{Confined, Exit, Sandbox, Traced, run_until_idle, threads::Threads};
+    use crate::{Confined, Exit, Journaled, Lost, Names, Sandbox, Stamp, Traced, run_until_idle, threads::Threads};
 
     fn name(it: &str) -> FileName {
         FileName::new(it).unwrap()
@@ -1484,6 +1593,159 @@ mod tests {
         assert!(ended, "the watch never ended; heard {heard:?}");
         assert!(heard.iter().all(|it| it.is_under(&name("src"))), "{heard:?}");
         run(&mut driver, Vec::new());
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The batches of a journal of `dir` from `since` until `enough` says so of them (or 20
+    /// seconds pass), then its unwatch.
+    fn journal(driver: &mut Iocp, dir: &str, since: Cursor, enough: impl Fn(&[Journaled]) -> bool) -> Vec<Journaled> {
+        driver.submit(&mut vec![Effect::Journal { dir: name(dir), since, tag: Tag(7) }]);
+        let mut batches = Vec::new();
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut asked_end = false;
+        loop {
+            driver.poll(&mut out, Duration::from_millis(50));
+            for it in out.drain(..) {
+                assert_eq!(it.tag, Tag(7));
+                match it.done {
+                    Done::Journaled(batch) => batches.push(*batch),
+                    Done::Unwatched => {
+                        assert_eq!(driver.in_flight(), 0);
+                        return batches;
+                    }
+                    other => panic!("{other:?} after {batches:?}"),
+                }
+            }
+            if !asked_end && (enough(&batches) || Instant::now() >= deadline) {
+                asked_end = true;
+                driver.submit(&mut vec![Effect::Unwatch { tag: Tag(7) }]);
+            }
+            assert!(Instant::now() < deadline + Duration::from_secs(10), "the journal never ended: {batches:?}");
+        }
+    }
+
+    fn usn(cursor: Cursor) -> (u64, u64, i64) {
+        match cursor {
+            Cursor::Usn { volume, journal, next } => (volume, journal, next),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_journal_from_its_cursor_hears_what_changed_while_it_was_unwatched() {
+        let root = dir("journal");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut driver = Iocp::new(&root, 2).unwrap();
+        let first = journal(&mut driver, "src", Cursor::None, |it| !it.is_empty());
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].caught_up && first[0].files.is_empty() && first[0].lost.is_empty(), "{first:?}");
+        let saved = first[0].cursor;
+        let (volume, id, at) = usn(saved);
+        std::fs::write(src.join("a.rs"), b"fn a() {}").unwrap();
+        std::fs::rename(src.join("a.rs"), src.join("b.rs")).unwrap();
+        std::fs::write(src.join("gone.rs"), b"").unwrap();
+        std::fs::remove_file(src.join("gone.rs")).unwrap();
+        std::fs::write(root.join("outside.rs"), b"not watched").unwrap();
+        // A directory made, filled and renamed: its file is named where it is now.
+        std::fs::create_dir(src.join("new")).unwrap();
+        std::fs::write(src.join("new/f.rs"), b"fn f() {}").unwrap();
+        std::fs::rename(src.join("new"), src.join("moved")).unwrap();
+        let batches = journal(&mut driver, "src", saved, |it| it.iter().any(|it| it.caught_up));
+        let caught = batches.iter().position(|it| it.caught_up).expect("caught up");
+        assert!(batches[..caught].iter().all(|it| !it.caught_up));
+        let files: Vec<&str> = batches.iter().flat_map(|it| &it.files).map(FileName::as_str).collect();
+        for wanted in ["src/b.rs", "src/moved", "src/moved/f.rs"] {
+            assert!(files.contains(&wanted), "{wanted} in {files:?}");
+        }
+        assert!(files.iter().all(|it| it.starts_with("src")), "{files:?}");
+        // Unprivileged records have no names: a removal or an old name is its directory's.
+        let lost: Vec<_> = batches.iter().flat_map(|it| it.lost.iter().cloned()).collect();
+        assert!(lost.contains(&(name("src"), Lost::Unnamed)), "{lost:?}");
+        assert!(lost.iter().all(|(_, why)| *why == Lost::Unnamed), "{lost:?}");
+        let (volume_now, id_now, next) = usn(batches.last().unwrap().cursor);
+        assert_eq!((volume_now, id_now), (volume, id));
+        assert!(next > at);
+        let cursors: Vec<i64> = batches.iter().map(|it| usn(it.cursor).2).collect();
+        assert!(cursors.windows(2).all(|it| it[0] <= it[1]), "{cursors:?}");
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_cursor_of_another_journal_is_a_reset() {
+        let root = dir("journal-reset");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let mut driver = Iocp::new(&root, 1).unwrap();
+        let first = journal(&mut driver, "src", Cursor::None, |it| !it.is_empty());
+        let (volume, id, next) = usn(first[0].cursor);
+        for since in [
+            Cursor::Usn { volume, journal: id.wrapping_add(1), next },
+            Cursor::Usn { volume: volume ^ 1, journal: id, next },
+            Cursor::Sim { journal: 1, next: 2 },
+        ] {
+            let batches = journal(&mut driver, "src", since, |it| !it.is_empty());
+            assert!(batches[0].caught_up, "{batches:?}");
+            assert_eq!(batches[0].lost, [(name("src"), Lost::Reset)]);
+            let (volume_now, id_now, _) = usn(batches[0].cursor);
+            assert_eq!((volume_now, id_now), (volume, id));
+        }
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stamps_of_a_file_a_directory_a_missing_name_and_links() {
+        let root = dir("stamps");
+        std::fs::create_dir_all(root.join("a/d")).unwrap();
+        std::fs::write(root.join("a/f"), b"hello").unwrap();
+        // A junction needs no privilege; a symbolic link needs developer mode or elevation.
+        let made = std::process::Command::new(system().join("cmd.exe"))
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(root.join("a").join("j"))
+            .arg(root.join("a").join("d"))
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let symlink = std::os::windows::fs::symlink_file(root.join("a").join("f"), root.join("a").join("s")).is_ok();
+        let mut names = Names::default();
+        for it in ["a/f", "a/d", "a/missing", "a/missing/deeper", "a/j", "a/s"] {
+            assert!(names.push_str(it));
+        }
+        let stamps = stamps(&root, &names).unwrap();
+        let (file, dir_, missing, deeper, junction, link) =
+            (stamps[0], stamps[1], stamps[2], stamps[3], stamps[4], stamps[5]);
+        assert!(file.is_file() && file.size == 5 && file.ino != 0 && file.mtime_ns != 0, "{file:?}");
+        assert_eq!(file.mode, 0o100644);
+        assert!(dir_.is_dir() && dir_.mode == 0o040755, "{dir_:?}");
+        assert_eq!((missing, deeper), (Stamp::GONE, Stamp::GONE));
+        assert!(junction.is_link() && junction.mode == 0o120777 && junction.ino != dir_.ino, "{junction:?}");
+        match symlink {
+            true => assert!(link.is_link() && link.ino != file.ino, "{link:?}"),
+            false => assert_eq!(link, Stamp::GONE),
+        }
+        let mut driver = Iocp::new(&root, 2).unwrap();
+        let seen = run(&mut driver, vec![
+            Effect::Stamp { files: names.clone(), tag: Tag(1) },
+            Effect::Entries { dir: name("a"), tag: Tag(2) },
+            Effect::Entries { dir: name("a/missing"), tag: Tag(3) },
+            Effect::Entries { dir: name("a/f"), tag: Tag(4) },
+        ]);
+        assert_eq!(seen[&1], Done::Stamped(stamps.clone()));
+        // The listing's stamps are the ones a handle of each gives.
+        let mut wanted = vec![(name("a/d"), dir_), (name("a/f"), file), (name("a/j"), junction)];
+        if symlink {
+            wanted.push((name("a/s"), link));
+        }
+        assert_eq!(seen[&2], Done::Entries(wanted));
+        assert!(matches!(seen[&3], Done::Failed(_)) && matches!(seen[&4], Done::Failed(_)), "{seen:?}");
+        // A write moves the file's stamp and no other.
+        std::fs::write(root.join("a/f"), b"hello, again").unwrap();
+        let again = super::stamps(&root, &names).unwrap();
+        assert!(again[0].moved(&file) && again[0].ino == file.ino && again[0].size == 12);
+        assert_eq!(&again[1..5], &stamps[1..5]);
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }

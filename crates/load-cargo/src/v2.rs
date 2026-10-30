@@ -18,6 +18,10 @@
 //!   source root, so what it writes there is read by that package's crates and no other's.
 //! - **Build script runs** are applied by [`Lowered::ran`]; a proc macro's built expanders by
 //!   [`Lowered::macros`].
+//!
+//! The database is shared by reference, never cloned (docs/v2/plan/process/decisions.md): a
+//! task reads it through [`Lowered::db`] while it holds a shared reference to the
+//! [`Lowered`], and a write takes `&mut Lowered`, which no reader can hold at the same time.
 
 #![forbid(unsafe_code)]
 
@@ -33,7 +37,7 @@ use base_db::{
     AbsPathBuf, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet, LibraryRoots,
     LocalRoots, SourceDatabase, SourceRoot, SourceRootId, VfsPath, ViewChange, ViewFile, ViewRoot,
 };
-use blaze_ids::radix;
+use blaze_ids::{Hasher, radix};
 use blaze_units::{
     query::{BuildConfig, PackagePlan, Units},
     schema::{Mode, Unit},
@@ -46,7 +50,9 @@ use salsa::{Durability, Setter};
 use triomphe::Arc;
 use vfs::file_set::FileSetConfig;
 
-pub use db::{Db, Snapshot};
+pub use base_db::ProcMacroLoadingError;
+pub use db::Db;
+pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 /// What [`lower`] lowers.
 pub struct Lower<'a> {
@@ -102,17 +108,21 @@ pub struct Ran {
     pub files: Vec<(String, Vec<u8>)>,
 }
 
-/// A build's units in the front end, owned by the daemon's loop: the one writer of its
-/// database, which hands each task it posts a [`Snapshot`] and the shared [`Crates`]. Nothing
-/// in it is locked: the loop alone calls its `&mut self` writes.
+/// A build's units in the front end, owned by the daemon's loop. Tasks read it through a
+/// shared reference ([`Lowered::db`], [`Lowered::crates`], [`Lowered::paths`]); its writes
+/// ([`Lowered::ran`], [`Lowered::macros`]) take `&mut self`, so the loop makes one only once
+/// no task holds a reference. Nothing in it is locked, and its database is never cloned.
 pub struct Lowered {
     db: Db,
     crates: std::sync::Arc<Crates>,
     /// By unit: the runs applied to it, by the run's unit.
     applied: Vec<Vec<(usize, Applied)>>,
-    /// Every file of the front end by its absolute path as cargo names it; a new map after
-    /// each run that adds or takes out files.
+    /// Every file of the front end by its absolute path as cargo names it. A task may hold it
+    /// past its read of the database (the code generator's names); a write changes it in
+    /// place when no task does.
     paths: std::sync::Arc<HashMap<FileId, String>>,
+    /// Each crate's identity worked out since the last write ([`Lowered::identity`]).
+    identities: FxHashMap<Crate, ContentId>,
 }
 
 /// What every task of a build reads and nothing writes once [`lower`] made it: each unit's
@@ -399,6 +409,7 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
         applied: (0..unit_count).map(|_| Vec::new()).collect(),
         crates: std::sync::Arc::new(Crates { units: lowerings, sets: library.len() }),
         paths: std::sync::Arc::new(paths),
+        identities: FxHashMap::default(),
     })
 }
 
@@ -408,24 +419,38 @@ impl Lowered {
         self.crates.krate(unit)
     }
 
-    /// What every task reads: each unit's crate.
-    pub fn crates(&self) -> std::sync::Arc<Crates> {
-        self.crates.clone()
+    /// What every task reads: each unit's crate. Made once by [`lower`] and never written.
+    pub fn crates(&self) -> &std::sync::Arc<Crates> {
+        &self.crates
     }
 
-    /// A handle on the database for one task, made by the loop as it posts the task: a clone,
-    /// with nothing shared to take. A later write ([`Lowered::ran`], [`Lowered::macros`])
-    /// cancels it: its reader gets `salsa::Cancelled` (the task's `Failed::Again`), and the
-    /// write returns once every such handle is dropped. Tasks posted after a write get new
-    /// ones, which read what it wrote.
-    pub fn snapshot(&self) -> Snapshot {
-        self.db.clone()
+    /// The database, for a read through the shared reference a task holds: `&Db` is a
+    /// `hir::db::HirDatabase`, and every query a task asks runs with its own query stack.
+    pub fn db(&self) -> &Db {
+        &self.db
     }
 
-    /// Every file of the front end by its absolute path as cargo names it, as of now: a run
-    /// applied after adds its `OUT_DIR`'s files to the map the next call gives.
-    pub fn paths(&self) -> std::sync::Arc<HashMap<FileId, String>> {
-        self.paths.clone()
+    /// Every file of the front end by its absolute path as cargo names it, with every run
+    /// applied so far.
+    pub fn paths(&self) -> &std::sync::Arc<HashMap<FileId, String>> {
+        &self.paths
+    }
+
+    /// Whether [`Lowered::ran`] would take `ran` as the run of unit `run`: a build script's run
+    /// of this build, its `OUT_DIR` the one cargo names, every cfg as `--cfg` takes it. Asked
+    /// as the run ends, before its write waits for the readers to finish.
+    pub fn check_ran(&self, run: usize, ran: &Ran) -> Result<(), LowerError> {
+        checked(&self.crates, run, ran).map(drop)
+    }
+
+    /// Unit `unit`'s identity in the front end: of its crate (its root file's path, data,
+    /// cfgs, env, edition, target), the files of its source root by path and content (an
+    /// applied run's `OUT_DIR` among them), the process's environment, and each crate it
+    /// depends on by its identity, so the identity of a crate covers everything it is made
+    /// from. None for a unit with no crate. Worked out once per crate between writes.
+    pub fn identity(&mut self, unit: usize) -> Option<ContentId> {
+        let krate = self.crates.krate(unit)?;
+        Some(identity_of(&self.db, krate, &mut self.identities))
     }
 
     /// The run of build script unit `run` applied to every unit that depends on it directly:
@@ -434,39 +459,24 @@ impl Lowered {
     /// root), so `include!` and `env!("OUT_DIR")` read them. Applying a run again replaces
     /// what it applied before, files it no longer left included.
     ///
-    /// Called on the daemon's loop thread while workers read snapshots: salsa cancels every
-    /// snapshot alive (its reader gets `salsa::Cancelled`, which the caller turns into
-    /// `Failed::Again`) and this returns once they are all dropped; a snapshot taken after
-    /// reads the run applied.
+    /// A write: `&mut self` means no task holds a reference to read through, so nothing is
+    /// cancelled or waited for here; tasks that read after it read the run applied.
     pub fn ran(&mut self, run: usize, ran: &Ran) -> Result<(), LowerError> {
         let crates = self.crates.clone();
-        let Some(lowering) = crates.units.get(run) else {
-            return Err(LowerError::new(format!("the build has no unit {run}")));
-        };
-        let Some(out_dir) = &lowering.out_dir else {
-            return Err(LowerError::at("not a build script's run", lowering.what.clone()));
-        };
-        if *out_dir != ran.out_dir {
-            return Err(LowerError::at(
-                format!("the run's `OUT_DIR` is `{}`, and cargo names it `{out_dir}`", ran.out_dir),
-                lowering.what.clone(),
-            ));
-        }
-        let cfgs = ran
-            .cfgs
-            .iter()
-            .map(|it| crates::atom(it).map_err(|what| LowerError::at(what, lowering.what.clone())))
-            .collect::<Result<Vec<_>, _>>()?;
+        let (lowering, cfgs) = checked(&crates, run, ran)?;
+        let out_dir = &ran.out_dir;
         let mut loaded = Vec::with_capacity(ran.files.len());
         for (path, bytes) in &ran.files {
             let id = ContentId::of(blaze_vfs::FILE_DOMAIN, bytes);
             loaded.push(files::Loaded { path: format!("{out_dir}/{path}"), id, bytes: bytes.as_slice().into() });
         }
 
+        self.identities.clear();
         let db = &mut self.db;
         let change = set_files(db, out_dir, &[], lowering.set, crates.sets, &loaded)?;
         if !change.added.is_empty() || !change.removed.is_empty() {
-            let mut map = HashMap::clone(&self.paths);
+            // No task holds the map now, so this edits it in place.
+            let map = std::sync::Arc::make_mut(&mut self.paths);
             for id in &change.removed {
                 map.remove(id);
             }
@@ -476,7 +486,6 @@ impl Lowered {
                     map.insert(*id, path.as_str().to_owned());
                 }
             }
-            self.paths = std::sync::Arc::new(map);
         }
         for &dependent in &lowering.dependents {
             let Some(krate) = crates.units[dependent].krate else { continue };
@@ -503,21 +512,37 @@ impl Lowered {
         Ok(())
     }
 
-    /// The expanders of proc-macro unit `unit` once it is built (or why it has none), for the
-    /// crates depending on it to expand its macros with. Until then they are
-    /// `ProcMacroLoadingError::NotYetBuilt`. A write: snapshots alive are cancelled as by
-    /// [`Lowered::ran`].
-    pub fn macros(&mut self, unit: usize, macros: ProcMacroLoadResult) -> Result<(), LowerError> {
+    /// The front end's tables by owner and name: how many each holds and their bytes, as
+    /// salsa counts them. It takes `&mut self`, as a write does: salsa measures its storage
+    /// only with no reader.
+    pub fn tables(&mut self) -> Vec<(&'static str, u64, u64)> {
+        tables(&mut self.db)
+    }
+
+    /// Whether [`Lowered::macros`] would take expanders for unit `unit`: a proc macro's crate.
+    pub fn check_macros(&self, unit: usize) -> Result<(), LowerError> {
         let Some(lowering) = self.crates.units.get(unit) else {
             return Err(LowerError::new(format!("the build has no unit {unit}")));
         };
-        let (Some(krate), true) = (lowering.krate, lowering.proc_macro) else {
-            return Err(LowerError::at("not a proc macro's crate", lowering.what.clone()));
+        match (lowering.krate, lowering.proc_macro) {
+            (Some(_), true) => Ok(()),
+            _ => Err(LowerError::at("not a proc macro's crate", lowering.what.clone())),
+        }
+    }
+
+    /// The expanders of proc-macro unit `unit` once it is built (or why it has none), for the
+    /// crates depending on it to expand its macros with. Until then they are
+    /// `ProcMacroLoadingError::NotYetBuilt`. A write, as [`Lowered::ran`] is.
+    pub fn macros(&mut self, unit: usize, macros: ProcMacroLoadResult) -> Result<(), LowerError> {
+        self.check_macros(unit)?;
+        let Some(krate) = self.crates.krate(unit) else {
+            unreachable!("checked: a proc macro's unit has a crate")
         };
         let macros = macros.map(|mut macros| {
             macros.sort_unstable_by(|a, b| a.name.cmp_order(&b.name).then_with(|| a.kind.cmp(&b.kind)));
             macros
         });
+        self.identities.clear();
         let db = &mut self.db;
         let all = ProcMacros::get(&*db);
         let mut by_crate = all.by_crate(&*db).clone();
@@ -525,6 +550,75 @@ impl Lowered {
         all.set_by_crate(db).with_durability(Durability::HIGH).to(by_crate);
         Ok(())
     }
+}
+
+/// Unit `run` as a build script's run that `ran` is of, and `ran`'s cfgs parsed.
+fn checked<'a>(crates: &'a Crates, run: usize, ran: &Ran) -> Result<(&'a Lowering, Vec<CfgAtom>), LowerError> {
+    let Some(lowering) = crates.units.get(run) else {
+        return Err(LowerError::new(format!("the build has no unit {run}")));
+    };
+    let Some(out_dir) = &lowering.out_dir else {
+        return Err(LowerError::at("not a build script's run", lowering.what.clone()));
+    };
+    if *out_dir != ran.out_dir {
+        return Err(LowerError::at(
+            format!("the run's `OUT_DIR` is `{}`, and cargo names it `{out_dir}`", ran.out_dir),
+            lowering.what.clone(),
+        ));
+    }
+    let cfgs = ran
+        .cfgs
+        .iter()
+        .map(|it| crates::atom(it).map_err(|what| LowerError::at(what, lowering.what.clone())))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((lowering, cfgs))
+}
+
+const IDENTITY: &str = "blaze v2 cargo unit identity 1";
+
+/// [`Lowered::identity`] of `krate`, each crate of its closure worked out once into `known`,
+/// dependencies first, with a stack of its own rather than the thread's.
+fn identity_of(db: &Db, krate: Crate, known: &mut FxHashMap<Crate, ContentId>) -> ContentId {
+    if let Some(identity) = known.get(&krate) {
+        return *identity;
+    }
+    let process = base_db::ProcessEnv::try_get(db).map(|it| it.content(db)).unwrap_or_default();
+    let mut stack = vec![(krate, false)];
+    while let Some((at, deps_known)) = stack.pop() {
+        if known.contains_key(&at) {
+            continue;
+        }
+        let data = at.data(db);
+        if !deps_known {
+            stack.push((at, true));
+            stack.extend(data.dependencies.iter().filter(|it| !known.contains_key(&it.crate_id)).map(|it| (it.crate_id, false)));
+            continue;
+        }
+        let root = db.file_source_root(data.root_file_id).source_root_id(db);
+        let mut hasher = Hasher::new(IDENTITY);
+        hasher.id(&at.content(db)).id(&db.source_root(root).content(db)).id(&process);
+        hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
+        for dep in &data.dependencies {
+            hasher.id(&known[&dep.crate_id]);
+        }
+        known.insert(at, hasher.finish());
+    }
+    known[&krate]
+}
+
+/// The front end's tables, each of the database's structs and memoized queries by its name,
+/// with how many it holds and their bytes (fields, salsa's metadata and what the fields hold
+/// on the heap), as salsa counts them. salsa measures only with the database exclusive.
+fn tables(db: &mut Db) -> Vec<(&'static str, u64, u64)> {
+    let db: &mut dyn salsa::Database = db;
+    let info = db.memory_usage();
+    let row = |it: &salsa::IngredientInfo| {
+        let bytes = it.size_of_fields() + it.size_of_metadata() + it.heap_size_of_fields().unwrap_or(0);
+        (it.debug_name(), it.count() as u64, bytes as u64)
+    };
+    let mut rows: Vec<_> = info.structs.iter().map(row).collect();
+    rows.extend(info.queries.values().map(row));
+    rows
 }
 
 /// Every file of the source roots `0..=sets` by its absolute path.

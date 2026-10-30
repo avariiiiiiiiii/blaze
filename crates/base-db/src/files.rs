@@ -29,6 +29,8 @@ use vfs::{AbsPath, AbsPathBuf, FileId, VfsPath};
 use crate::{
     Crate, FileSourceRootInput, FileText, IncludedFile, InputId, SourceDatabase, SourceRoot,
     SourceRootId, SourceRootInput, content,
+    named::Named,
+    reparse::Reparse,
     table::{Column, Log, Table, hash_of},
     view::ViewIndex,
 };
@@ -98,6 +100,8 @@ pub(crate) struct Writer {
     pub(crate) next_file: u32,
     /// The index of each view base's paths that [`Files::set_view_root`] keeps.
     pub(crate) views: FxHashMap<VfsPath, ViewIndex>,
+    /// `by_path` as queries read it, across source roots ([`crate::named`]).
+    pub(crate) named: Named,
 }
 
 impl Writer {
@@ -114,12 +118,14 @@ impl Writer {
                 // A path given another file: every view's index of paths is made again.
                 self.by_path.insert(path.clone(), file);
                 self.views.clear();
+                self.named.note(path, file);
             }
             None => {
                 self.by_path.insert(path.clone(), file);
                 for (base, index) in &mut self.views {
                     index.note(base, path, file);
                 }
+                self.named.note(path, file);
             }
         }
     }
@@ -219,7 +225,7 @@ impl Files {
         let appended = self.input_of(&writer, file_id).and_then(|it| it.appended_root_module(&*db));
         let file = ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes());
         let content = FileText::content_of_file(file, appended);
-        self.write_text(&mut writer, db, file_id, Some((text, content)), durability);
+        self.write_text(&mut writer, db, file_id, Some((text, file, content)), durability);
         let mut changed = Vec::new();
         index_file(&mut writer, file_id, content, &mut changed);
         self.write_root_contents(&mut writer, db, &changed);
@@ -235,23 +241,28 @@ impl Files {
         self.text.get(file.index()).or_else(|| writer.parked.get(&file).copied())
     }
 
-    /// Sets the text of `file_id` with its [`FileText::content`] (made with the module the
-    /// input appends, if it has one), or that it has none (`None`), and returns its content ID
-    /// in a source root. The source roots that have the file are left to the caller.
+    /// Sets the text of `file_id` (`file` the blaze-vfs ID of its bytes) with its
+    /// [`FileText::content`] (made with the module the input appends, if it has one), or that
+    /// it has none (`None`), and returns its content ID in a source root. The edit from the
+    /// text it had is found here, for its next parse ([`Reparse::after`]). The source roots
+    /// that have the file are left to the caller.
     pub(crate) fn write_text(
         &self,
         writer: &mut Writer,
         db: &mut dyn SourceDatabase,
         file_id: FileId,
-        text: Option<(&str, ContentId)>,
+        text: Option<(&str, ContentId, ContentId)>,
         durability: Option<Durability>,
     ) -> ContentId {
         let raw = file_id.index();
-        let Some((text, content)) = text else {
+        let Some((text, file, content)) = text else {
             if let Some(input) = self.text.get(raw) {
                 // Nothing reads the text left behind: `file_text` no longer has the file.
                 self.text.set(raw, None);
-                set(input.set_text_field(db), durability, std::sync::Arc::from(""));
+                let empty: std::sync::Arc<str> = std::sync::Arc::from("");
+                let reparse = Reparse::new(&empty, ContentId::of(blaze_vfs::FILE_DOMAIN, b""));
+                set(input.set_reparse_field(db), durability, reparse);
+                set(input.set_text_field(db), durability, empty);
                 set(input.set_content_field(db), durability, InputId(FileText::no_text()));
                 writer.parked.insert(file_id, input);
             }
@@ -261,17 +272,20 @@ impl Files {
             Some(input) => Some(input),
             None => writer.parked.remove(&file_id),
         };
+        let text: std::sync::Arc<str> = std::sync::Arc::from(text);
         match existing {
             Some(input) => {
-                set(input.set_text_field(db), durability, std::sync::Arc::from(text));
+                let reparse = input.reparse_field(&*db).after(&text, file);
+                set(input.set_reparse_field(db), durability, reparse);
+                set(input.set_text_field(db), durability, text);
                 if input.content(&*db) != content {
                     set(input.set_content_field(db), durability, InputId(content));
                 }
                 self.text.set(raw, Some(input));
             }
             None => {
-                let builder =
-                    FileText::builder(std::sync::Arc::from(text), file_id, InputId(content));
+                let reparse = Reparse::new(&text, file);
+                let builder = FileText::builder(text, file_id, InputId(content), reparse);
                 let builder = match durability {
                     Some(durability) => builder.durability(durability),
                     None => builder,
@@ -556,6 +570,7 @@ impl Files {
                 self.source_roots.set(source_root_id.0, Some(input));
             }
         }
+        writer.named.publish(db);
     }
 
     pub fn file_source_root(&self, db: &dyn SourceDatabase, id: FileId) -> FileSourceRootInput {

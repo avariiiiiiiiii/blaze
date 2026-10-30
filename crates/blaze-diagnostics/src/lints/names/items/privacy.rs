@@ -20,7 +20,9 @@
 //! (`Visibility::to_string`) and `compiler/rustc_privacy/src/diagnostics.rs`
 //! (`PrivateInterfacesOrBoundsLint`, `InPublicInterface`) (MIT or Apache-2.0).
 
-use blaze_items::{Fact, ItemId};
+use std::cell::OnceCell;
+
+use blaze_items::Fact;
 use hir::{AsAssocItem as _, AssocItemContainer, HasSource, HasVisibility, InFile, ModuleDef, PathResolution};
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
@@ -189,6 +191,11 @@ impl Levels {
                 _ => None,
             })
             .collect();
+        // Each def's interface is walked once per level it reaches, not once per round: what it
+        // raises depends only on its level. What it names is resolved once.
+        let mut walked: FxHashMap<Def, Vis> = FxHashMap::default();
+        let mut named: FxHashMap<Def, Vec<Def>> = FxHashMap::default();
+        let mut reached: Vec<(Def, Vis)> = Vec::new();
         loop {
             let mut changed = false;
             for &imp in &impls {
@@ -210,10 +217,15 @@ impl Levels {
                     changed |= levels.update(cx, def, ev);
                 }
             }
-            let reached: Vec<(Def, Vis)> = levels.ev.iter().map(|(def, ev)| (*def, *ev)).collect();
-            for (def, ev) in reached {
-                let Some(node) = visibility::interface_node(cx, def) else { continue };
-                for next in visibility::named(cx, &node) {
+            reached.clear();
+            reached.extend(levels.ev.iter().filter(|&(def, ev)| walked.get(def) != Some(ev)).map(|(def, ev)| (*def, *ev)));
+            for &(def, ev) in &reached {
+                walked.insert(def, ev);
+                let nexts = named.entry(def).or_insert_with(|| match visibility::interface_node(cx, def) {
+                    Some(node) => visibility::named(cx, &node),
+                    None => Vec::new(),
+                });
+                for &next in nexts.iter() {
                     if !is_local(cx, next) {
                         continue;
                     }
@@ -240,11 +252,12 @@ impl Levels {
 
     /// Raises `def` to `vis`, and its members with it; whether it changed.
     fn update(&mut self, cx: &Cx<'_, '_>, def: Def, vis: Vis) -> bool {
-        let new = match self.get(def) {
+        let old = self.get(def);
+        let new = match old {
             Some(old) => max(cx, old, vis),
             None => vis,
         };
-        if self.get(def) == Some(new) {
+        if old == Some(new) {
             return false;
         }
         self.ev.insert(def, new);
@@ -329,13 +342,12 @@ pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
     while at < items.len() {
         let module = items[at].module;
         let end = items[at..].iter().position(|it| it.module != module).map_or(items.len(), |it| at + it);
-        let group = &items[at..end];
-        for (index, item) in group.iter().enumerate() {
+        for (index, item) in items.iter().enumerate().take(end).skip(at) {
             if matches!(item.container, Container::Module) {
-                checker.item(item, &group[index + 1..]);
+                checker.item(item, item.held(items, index));
             }
         }
-        for item in group {
+        for item in &items[at..end] {
             if matches!(item.container, Container::Extern(_)) {
                 checker.foreign_item(item);
             }
@@ -346,18 +358,19 @@ pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
 }
 
 /// One `SearchInterfaceForPrivateItemsVisitor`: the item it checks and what it requires.
-struct Check {
+struct Check<'i> {
     item: Def,
     node: InFile<SyntaxNode>,
     kind: &'static str,
-    descr: String,
+    /// rustc's `def_path_str` of `item`, printed when a diagnostic first needs it.
+    descr: OnceCell<String>,
     required: Vis,
     required_ev: Option<Vis>,
     hard_error: bool,
     primary: bool,
     skip_assoc: bool,
     /// The item whose interface it is, for the fact the diagnostic read.
-    fact: Option<(ItemId, String)>,
+    owner: &'i Item,
 }
 
 struct Checker<'c, 'a, 'db> {
@@ -370,22 +383,21 @@ struct Checker<'c, 'a, 'db> {
 
 impl Checker<'_, '_, '_> {
     #[allow(clippy::too_many_arguments)]
-    fn check(
+    fn check<'i>(
         &self,
-        owner: &Item,
+        owner: &'i Item,
         item: Def,
         node: InFile<SyntaxNode>,
         kind: &'static str,
         required: Vis,
         required_ev: Option<Vis>,
-    ) -> Check {
-        let descr = self.descr(item);
-        let fact = super::item_id(self.cx, owner);
-        Check { item, node, kind, descr, required, required_ev, hard_error: false, primary: true, skip_assoc: false, fact }
+    ) -> Check<'i> {
+        let descr = OnceCell::new();
+        Check { item, node, kind, descr, required, required_ev, hard_error: false, primary: true, skip_assoc: false, owner }
     }
 
-    /// `check_item`, with `rest` the items after it in its module (its own items among them).
-    fn item(&mut self, item: &Item, rest: &[Item]) {
+    /// `check_item`, with `held` the items it holds (its own items among them).
+    fn item(&mut self, item: &Item, held: &[Item]) {
         let cx = self.cx;
         let Some(def) = visibility::def(cx, item) else { return };
         let node = item.syntax();
@@ -403,7 +415,7 @@ impl Checker<'_, '_, '_> {
                 self.generics(&mut check, &item.node.value);
                 self.clauses(&mut check, &item.node.value);
                 let own = item.node.with_value(t.clone());
-                for assoc in rest.iter().filter(|it| matches!(&it.container, Container::Trait(c) if *c == own)) {
+                for assoc in held.iter().filter(|it| matches!(&it.container, Container::Trait(c) if *c == own)) {
                     self.assoc_item(assoc, vis, ev, true, None);
                 }
             }
@@ -445,7 +457,7 @@ impl Checker<'_, '_, '_> {
                     self.visit(&check, item.node.with_value(tr.syntax().clone()), false, &mut aliases);
                 }
                 let own = item.node.with_value(imp.clone());
-                for assoc in rest.iter().filter(|it| matches!(&it.container, Container::Impl(c) if *c == own)) {
+                for assoc in held.iter().filter(|it| matches!(&it.container, Container::Impl(c) if *c == own)) {
                     let Some(assoc_def) = visibility::def(cx, assoc) else { continue };
                     let (vis, ev) = match of_trait {
                         false => (
@@ -519,7 +531,7 @@ impl Checker<'_, '_, '_> {
     }
 
     /// `generics()`: the types of const parameters and the defaults of parameters.
-    fn generics(&mut self, check: &mut Check, node: &ast::Item) {
+    fn generics(&mut self, check: &mut Check<'_>, node: &ast::Item) {
         check.primary = true;
         let Some(params) = node.syntax().children().find_map(ast::GenericParamList::cast) else { return };
         let file = check.node.file_id;
@@ -538,7 +550,7 @@ impl Checker<'_, '_, '_> {
 
     /// `clauses()`: a trait's supertraits, the bounds of parameters, the `where` clause, the
     /// bounds of `impl Trait` parameters; each bound's trait before the type it bounds.
-    fn clauses(&mut self, check: &mut Check, node: &ast::Item) {
+    fn clauses(&mut self, check: &mut Check<'_>, node: &ast::Item) {
         check.primary = false;
         let file = check.node.file_id;
         let mut aliases = FxHashSet::default();
@@ -578,7 +590,7 @@ impl Checker<'_, '_, '_> {
     }
 
     /// `ty()`: a function's signature (and its impl's self type), else the item's type.
-    fn ty(&mut self, check: &mut Check, node: &ast::Item, impl_self: Option<InFile<SyntaxNode>>) {
+    fn ty(&mut self, check: &mut Check<'_>, node: &ast::Item, impl_self: Option<InFile<SyntaxNode>>) {
         check.primary = true;
         let file = check.node.file_id;
         let mut aliases = FxHashSet::default();
@@ -620,7 +632,7 @@ impl Checker<'_, '_, '_> {
     }
 
     /// The defs a type (or a bound) names, in the order rustc's skeleton visits them.
-    fn visit(&mut self, check: &Check, node: InFile<SyntaxNode>, skip_impl_trait: bool, aliases: &mut FxHashSet<hir::TypeAlias>) {
+    fn visit(&mut self, check: &Check<'_>, node: InFile<SyntaxNode>, skip_impl_trait: bool, aliases: &mut FxHashSet<hir::TypeAlias>) {
         let cx = self.cx;
         let mut walk = node.value.preorder();
         while let Some(event) = walk.next() {
@@ -658,15 +670,14 @@ impl Checker<'_, '_, '_> {
                     }
                 }
                 Some(PathResolution::Def(def @ ModuleDef::Adt(_))) => {
-                    let descr = match cx.sema.resolve_type(&ast::Type::PathType(ty.clone())) {
+                    let descr = || match cx.sema.resolve_type(&ast::Type::PathType(ty.clone())) {
                         Some(it) => cx.ty(&it),
                         None => cx.def_path(def),
                     };
                     self.def_id(check, Def::Item(def), "type", descr);
                 }
                 Some(PathResolution::Def(ModuleDef::Trait(tr))) => {
-                    let descr = self.trait_descr(tr, &path);
-                    self.def_id(check, Def::Item(ModuleDef::Trait(tr)), "trait", descr);
+                    self.def_id(check, Def::Item(ModuleDef::Trait(tr)), "trait", || trait_descr(cx, tr, &path));
                 }
                 _ => {}
             }
@@ -675,10 +686,10 @@ impl Checker<'_, '_, '_> {
 
     /// `<T as Trait>::Assoc` (or `T::Assoc`): the associated type, its trait, then `T` and the
     /// trait's arguments.
-    fn projection(&mut self, check: &Check, path: InFile<ast::Path>, alias: hir::TypeAlias, aliases: &mut FxHashSet<hir::TypeAlias>) {
+    fn projection(&mut self, check: &Check<'_>, path: InFile<ast::Path>, alias: hir::TypeAlias, aliases: &mut FxHashSet<hir::TypeAlias>) {
         let cx = self.cx;
         let def = ModuleDef::TypeAlias(alias);
-        self.def_id(check, Def::Item(def), "associated type", cx.def_path(def));
+        self.def_id(check, Def::Item(def), "associated type", || cx.def_path(def));
         let Some(AssocItemContainer::Trait(tr)) = alias.as_assoc_item(cx.db).map(|it| it.container(cx.db)) else {
             return;
         };
@@ -688,8 +699,8 @@ impl Checker<'_, '_, '_> {
             Some(ast::Type::PathType(it)) => it.path(),
             _ => None,
         };
-        let descr = match &trait_path {
-            Some(it) => self.trait_descr(tr, it),
+        let descr = || match &trait_path {
+            Some(it) => trait_descr(cx, tr, it),
             None => cx.def_path(ModuleDef::Trait(tr)),
         };
         self.def_id(check, Def::Item(ModuleDef::Trait(tr)), "trait", descr);
@@ -701,40 +712,23 @@ impl Checker<'_, '_, '_> {
         }
     }
 
-    /// `print_only_trait_path`: the trait's path and the arguments written to it.
-    fn trait_descr(&self, tr: hir::Trait, path: &ast::Path) -> String {
-        let cx = self.cx;
-        let mut descr = cx.def_path(ModuleDef::Trait(tr));
-        let Some(args) = path.segment().and_then(|it| it.generic_arg_list()) else { return descr };
-        let printed: Vec<String> = args
-            .generic_args()
-            .map(|arg| match &arg {
-                ast::GenericArg::TypeArg(it) => match it.ty().and_then(|ty| cx.sema.resolve_type(&ty)) {
-                    Some(ty) => cx.ty(&ty),
-                    None => arg.syntax().text().to_string(),
-                },
-                _ => arg.syntax().text().to_string(),
-            })
-            .collect();
-        if !printed.is_empty() {
-            descr.push('<');
-            descr.push_str(&printed.join(", "));
-            descr.push('>');
-        }
-        descr
-    }
-
     /// `check_def_id`: the error or the lint of a def named in the interface of `check.item`.
-    fn def_id(&mut self, check: &Check, def: Def, kind: &str, descr: String) {
+    /// What a lint must print is printed only once it fires.
+    fn def_id(&mut self, check: &Check<'_>, def: Def, kind: &str, descr: impl FnOnce() -> String) {
         let cx = self.cx;
         if !is_local(cx, def) {
             return;
         }
         let vis = nominal(cx, def);
+        let hard_error = check.hard_error && greater(cx, check.required, vis);
+        if !hard_error && !check.required_ev.is_some_and(|ev| greater(cx, ev, vis)) {
+            return;
+        }
         let Some(def_node) = source(cx, def) else { return };
         let item_span = cx.span(check.node.as_ref().map(def_span));
         let vis_span = cx.span(def_node.as_ref().map(def_span));
-        if check.hard_error && greater(cx, check.required, vis) {
+        let descr = descr();
+        if hard_error {
             let vis_descr = match vis {
                 Vis::Public => "public",
                 Vis::In(module) if Some(module) == module_of(cx, def) => "private",
@@ -750,14 +744,12 @@ impl Checker<'_, '_, '_> {
             return;
         }
         let Some(ev) = check.required_ev else { return };
-        if !greater(cx, ev, vis) {
-            return;
-        }
+        let item_descr = check.descr.get_or_init(|| self.descr(check.item));
         let lint = if check.primary { "private_interfaces" } else { "private_bounds" };
-        let message = format!("{kind} `{descr}` is more private than the item `{}`", check.descr);
+        let message = format!("{kind} `{descr}` is more private than the item `{item_descr}`");
         let mut diag = Diag::lint(lint, message, item_span.clone());
         let item_vis = vis_str(cx, ev, check.item);
-        diag.span_label(item_span, format!("{} `{}` is reachable at visibility `{item_vis}`", check.kind, check.descr));
+        diag.span_label(item_span, format!("{} `{item_descr}` is reachable at visibility `{item_vis}`", check.kind));
         let def_vis = vis_str(cx, vis, def);
         diag.span_note(vis_span, format!("but {kind} `{descr}` is only usable at visibility `{def_vis}`"));
         self.fact(check, &mut diag);
@@ -765,9 +757,9 @@ impl Checker<'_, '_, '_> {
         self.push(Found::lint(diag, Phase::Late, at));
     }
 
-    fn fact(&self, check: &Check, diag: &mut Diag) {
-        if let Some((id, name)) = &check.fact {
-            diag.fact(Fact::Signature(self.cx.key(*id)), format!("the interface of `{name}`"));
+    fn fact(&self, check: &Check<'_>, diag: &mut Diag) {
+        if let Some((id, name)) = super::item_id(self.cx, check.owner) {
+            diag.fact(Fact::Signature(self.cx.key(id)), format!("the interface of `{name}`"));
         }
     }
 
@@ -803,6 +795,28 @@ impl Checker<'_, '_, '_> {
             }
         }
     }
+}
+
+/// `print_only_trait_path`: the trait's path and the arguments written to it.
+fn trait_descr(cx: &Cx<'_, '_>, tr: hir::Trait, path: &ast::Path) -> String {
+    let mut descr = cx.def_path(ModuleDef::Trait(tr));
+    let Some(args) = path.segment().and_then(|it| it.generic_arg_list()) else { return descr };
+    let printed: Vec<String> = args
+        .generic_args()
+        .map(|arg| match &arg {
+            ast::GenericArg::TypeArg(it) => match it.ty().and_then(|ty| cx.sema.resolve_type(&ty)) {
+                Some(ty) => cx.ty(&ty),
+                None => arg.syntax().text().to_string(),
+            },
+            _ => arg.syntax().text().to_string(),
+        })
+        .collect();
+    if !printed.is_empty() {
+        descr.push('<');
+        descr.push_str(&printed.join(", "));
+        descr.push('>');
+    }
+    descr
 }
 
 /// rustc's `def_descr` of a walked item, `assoc` when it is an item of a trait or an impl.

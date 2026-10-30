@@ -567,6 +567,4 @@ impl<'a> Lexer<'a> {
 }
 
 #[cfg(test)]
-pub(super) mod reference;
-#[cfg(test)]
-mod tests;
+pub(super) mod tests;

@@ -576,7 +576,7 @@ impl ScriptRun {
             let what = format!("the build script run of unit {} was given no writer to apply it with", self.unit);
             return self.error(what, out);
         };
-        if let Err(error) = writer.ran(self.unit, &ran) {
+        if let Err(error) = writer.ran(self.unit, ran) {
             return self.error(error.what, out);
         }
         let package_id = job.unit(self.unit).map(|it| it.pkg_id.clone()).unwrap_or_default();

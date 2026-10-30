@@ -1,7 +1,10 @@
 //! A mapped image, read in place: [`Image::open`] reads only the spine, and each group is checked
 //! by its CRC32C the first time a read reaches it.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::{
+    ops::Range,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
+};
 
 use blaze_format::{Record, SchemaHash};
 use blaze_ids::ContentId;
@@ -52,6 +55,18 @@ unsafe impl Stable for blaze_format::Aligned {
     }
 }
 
+// SAFETY: a `Mapping` is what `Effect::Map` made (a read-only mmap of a file the store or the
+// daemon only ever replaces by renaming another over it, never writes in place) or owned bytes
+// in an `Arc` with no way to write them; its contract (blaze-core's `Mapping`) is that its
+// bytes stay as they are while any clone lives, and `as_ref` of either returns one slice.
+// The daemon, the db and the VFS all open the mapped image as `Image<Mapping>`, and a section
+// they keep is `(image.owner().clone(), image.whole_range(&section)?)`.
+unsafe impl Stable for blaze_core::Mapping {
+    fn bytes(&self) -> &[u8] {
+        blaze_core::Mapping::bytes(self)
+    }
+}
+
 /// An image, its spine checked. `Sync`: every read takes `&self`, and the only writes are each
 /// group's bits, set once.
 pub struct Image<S: Stable> {
@@ -64,6 +79,13 @@ pub struct Image<S: Stable> {
     bad: Box<[AtomicU64]>,
     pub(crate) touched: Touched,
 }
+
+/// Readers on any thread share one image (`Arc<Image<Mapping>>`).
+const _: fn() = || {
+    fn shared<T: Send + Sync>() {}
+    shared::<Image<blaze_core::Mapping>>();
+    shared::<Image<Vec<u8>>>();
+};
 
 /// What reads of an image's bytes reached, for the tests that count them; nothing outside tests.
 #[derive(Default)]
@@ -191,12 +213,32 @@ impl<S: Stable> Image<S> {
         Ok(&self.slice::<T>(section, at, 1)?[0])
     }
 
+    /// Groups `groups` of `section` checked now (each once ever, as any read checks it), the
+    /// first that fails returned: what a caller that checks a whole section on many workers
+    /// gives each worker, since one core's CRC32C (about 8 bytes a cycle) is a tenth of what the
+    /// machine's memory can stream.
+    pub fn check(&self, section: &Section, groups: Range<u32>) -> Result<(), Corrupt> {
+        groups.take_while(|&group| group < section.groups).try_for_each(|group| self.ensure(section, group))
+    }
+
     /// All of `section`, every group checked: for a section its owner reads whole at start.
+    /// One core checks it; [`Image::check`] spreads a large one over workers first.
     pub fn whole(&self, section: &Section) -> Result<&[u8], Corrupt> {
         self.range(section, 0, section.len)
     }
 
-    /// Every group of every section checked now: each one that fails, in order.
+    /// Where all of `section` is in the owner's bytes, every group checked: for an owner that
+    /// keeps the section as its own mapping and range rather than a borrow of the image.
+    pub fn whole_range(&self, section: &Section) -> Result<Range<usize>, Corrupt> {
+        let bytes = self.whole(section)?;
+        let start = section.at as usize;
+        debug_assert_eq!(bytes.as_ptr(), self.owner.bytes()[start..].as_ptr());
+        Ok(start..start + bytes.len())
+    }
+
+    /// Every group of every section checked now: each one that fails, in order. On this thread:
+    /// for tests and a check by hand. A whole-image check on the daemon's path is
+    /// [`Image::check`] over chunks of groups on its pool.
     pub fn verify(&self) -> Vec<Corrupt> {
         let mut failed = Vec::new();
         for section in &self.spine.sections {

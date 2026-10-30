@@ -65,6 +65,7 @@
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -1110,6 +1111,34 @@ PATH_CALL(mkfifo, CREATE, (const char *p, mode_t m), AT_FDCWD, p, mkfifo(p, m), 
 PATH_CALL(fclonefileat, CREATE, (int s, int d, const char *p, uint32_t f), d, p,
           fclonefileat(s, d, p, f), fclonefileat(s, AT_FDCWD, real, f), 1)
 
+// A thread starts in the scope of the thread that made it, as a process starts in its parent
+// thread's: what a test's own threads read is that test's, not every test's.
+struct started {
+    void *(*start)(void *);
+    void *arg;
+    char test[sizeof test];
+};
+
+static void *in_scope(void *it) {
+    struct started s = *(struct started *)it;
+    free(it);
+    memcpy(test, s.test, sizeof test);
+    return s.start(s.arg);
+}
+
+static int my_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*start)(void *),
+                             void *arg) {
+    if (!alive || !test[0]) return pthread_create(t, a, start, arg);
+    struct started *s = malloc(sizeof *s);
+    if (!s) return EAGAIN;
+    s->start = start;
+    s->arg = arg;
+    memcpy(s->test, test, sizeof test);
+    int r = pthread_create(t, a, in_scope, s);
+    if (r) free(s);
+    return r;
+}
+
 // `access`, which is also the harness's marker: `/.blaze-test/<name>` names the test the
 // thread runs from now on, `/.blaze-test/` none.
 static int my_access(const char *p, int m) {
@@ -1782,3 +1811,4 @@ INTERPOSE(my_sendto, sendto)
 INTERPOSE(my_sendto_nocancel, sendto_nocancel)
 INTERPOSE(my_sendmsg, sendmsg)
 INTERPOSE(my_sendmsg_nocancel, sendmsg_nocancel)
+INTERPOSE(my_pthread_create, pthread_create)

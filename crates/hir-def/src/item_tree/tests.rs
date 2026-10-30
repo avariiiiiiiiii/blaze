@@ -1,4 +1,4 @@
-use base_db::SourceDatabase;
+use base_db::{EditionedFileId, SourceDatabase};
 use blaze_format::Persist;
 use expect_test::{Expect, expect};
 use hir_expand::HirFileId;
@@ -16,6 +16,21 @@ fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     let pretty = item_tree.pretty_print(&db, Edition::CURRENT);
     expect.assert_eq(&pretty);
     crate::item_tree::persist::assert_round_trip(&item_tree);
+    assert_assembled_is_whole(&db, file_id, ra_fixture);
+}
+
+/// The tree of `file` assembled from its items' ([`super::items`]) is the one it lowers to
+/// whole, to the byte: the tree [`crate::file_item_tree`] gives.
+pub(super) fn assert_assembled_is_whole(db: &TestDB, file: EditionedFileId, what: &str) {
+    let krate = db.test_crate();
+    let whole = super::lower_whole(db, file.into(), krate);
+    let assembled = super::items::file_item_tree(db, file, krate);
+    assert_eq!(assembled, whole, "the tree of\n{what}");
+    assert_eq!(blaze_format::to_bytes(&assembled), blaze_format::to_bytes(&whole), "{what}");
+    match crate::file_item_tree(db, file.into(), krate) {
+        tree if whole.is_empty() => assert!(tree.is_empty(), "{what}"),
+        tree => assert_eq!(*tree, whole, "{what}"),
+    }
 }
 
 #[test]
@@ -360,6 +375,9 @@ fn owned_tree(db: &TestDB, file: HirFileId) -> (ItemTree, Vec<u8>) {
     let buffer = blaze_format::Aligned::copy_from(&bytes);
     let owned = ItemTree::read(&buffer).and_then(|read| read.decode()).expect("a tree written");
     assert_eq!(owned, *tree);
+    if let HirFileId::FileId(file) = file {
+        assert_assembled_is_whole(db, file, "a file of the test");
+    }
     (owned, bytes)
 }
 

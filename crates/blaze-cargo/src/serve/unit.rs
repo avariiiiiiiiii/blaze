@@ -17,7 +17,8 @@
 //! - [`say`]: cargo's own lines (`error: ...`, `warning: ...`) as diagnostics.
 //!
 //! The front end is written by the loop alone, through the job's [`UnitWriter`], and read by
-//! each task through the [`UnitReader`] it was posted with; no worker locks to read it.
+//! each task through the [`UnitReader`] it was posted with, a shared reference: no worker
+//! locks to read it, and a write waits for every reader before it (`work`'s docs).
 //!
 //! Nothing here runs rustc or cargo, and nothing user code runs is outside the sandbox but
 //! what `BLAZE_SANDBOX=off` and the manifest's opt-outs take out (docs/cargo.md).
@@ -53,14 +54,14 @@ use blaze_units::{
     query::{Fetch, Units},
     schema::{Mode, Unit},
 };
-use load_cargo::v2::{Crates, Lower, Lowered, Snapshot};
+use load_cargo::v2::{Crates, Db, Lower, Lowered, ProcMacroLoadResult, Ran};
 
 use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, JobInput, Reader, Runs, Selection, Source, SourceFile, Steps,
-        Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Reader, Runs, Selection, Source, SourceFile,
+        Steps, Writer,
     },
 };
 
@@ -71,17 +72,14 @@ pub struct Real {
 }
 
 /// What every job's front shares: the daemon's paths, what was read of the machine's files,
-/// the images kept linked between jobs, the code generator's memo.
+/// the code generator's memo. The images kept linked between jobs are the loop's
+/// ([`Image`]).
 pub(crate) struct Shared {
     pub(crate) state: PathBuf,
     pub(crate) launcher: PathBuf,
     /// The directory of blaze's stand-ins for the tools cargo names to a build script:
     /// `rustc` and `rustdoc`, each blaze's own executable under that name.
     pub(crate) tools: PathBuf,
-    /// Every executable and shared library linked, by the path cargo writes it at, kept so the
-    /// next link of it relinks only what changed. Taken out for a link and put back after, so
-    /// the lock is held for the move only.
-    pub(crate) images: Mutex<rustc_hash::FxHashMap<String, codegen::Linked>>,
     pub(crate) memo: Arc<blaze_codegen::memo::Memo>,
     /// What `-C target-cpu=native` is on this machine; none without LLVM.
     pub(crate) host_cpu: Option<blaze_units::stdlib::target::HostCpu>,
@@ -96,7 +94,6 @@ impl Real {
             state: paths.state.clone(),
             launcher: paths.launcher.clone(),
             tools,
-            images: Mutex::new(rustc_hash::FxHashMap::default()),
             memo: blaze_codegen::driver::shared_memo(),
             host_cpu: hir_ty_codegen::host_cpu().map(|(name, features)| blaze_units::stdlib::target::HostCpu {
                 arch: std::env::consts::ARCH.to_owned(),
@@ -149,7 +146,7 @@ impl Steps for Real {
             return Err(Failed::Again);
         }
         let writer = cancellable(|| -> Result<UnitWriter, Failed> {
-            let lowered = load_cargo::v2::lower(Lower {
+            let mut lowered = load_cargo::v2::lower(Lower {
                 units: &input.units,
                 config: &input.config,
                 files: &input.files,
@@ -157,17 +154,17 @@ impl Steps for Real {
                 host_cpu: self.shared.host_cpu.as_ref(),
             })
             .map_err(|error| Failed::Error(lower_error(error)))?;
-            let job = Arc::new(Job::new(input.clone(), lowered.crates(), self.shared.clone()));
+            let job = Arc::new(Job::new(input.clone(), lowered.crates().clone(), self.shared.clone()));
             let waits = graph::Waits::new(&job.graph);
             for unit in 0..job.graph.len() as u32 {
                 if unit % 64 == 0 && input.cancelled.load(Ordering::Relaxed) {
                     return Err(Failed::Again);
                 }
                 if waits.ready(unit) {
-                    identify(&lowered, &job, unit);
+                    identify(&mut lowered, &job, unit);
                 }
             }
-            Ok(UnitWriter { lowered, job, waits, ready: Vec::new() })
+            Ok(UnitWriter { front: Arc::new(lowered), job, waits, ready: Vec::new(), runs: Vec::new(), macros: Vec::new() })
         })??;
         let front: Arc<dyn Front> = Arc::new(JobFront(writer.job.clone()));
         Ok(FrontEnd { front, writer: Box::new(writer) })
@@ -178,42 +175,83 @@ fn lower_error(error: load_cargo::v2::LowerError) -> ApiError {
     ApiError::new(error.what, error.at)
 }
 
-/// What a task reads the front end through ([`Reader`]): a snapshot of the job's database and
-/// its files by path, as of when the loop posted it.
+/// What a task reads the front end through ([`Reader`]): a shared reference to the job's
+/// lowered front end, as it stood when the loop posted the task. Its database is read by
+/// reference, never cloned.
 pub(crate) struct UnitReader {
-    pub(crate) db: Snapshot,
-    pub(crate) paths: Arc<HashMap<FileId, String>>,
+    front: Arc<Lowered>,
 }
 
-/// The job's front end as only the loop writes it: the database by value, and as each build
-/// script's run is applied, the identities of the units it was the last run in the closure of.
+impl UnitReader {
+    pub(crate) fn db(&self) -> &Db {
+        self.front.db()
+    }
+
+    /// The job's files by path.
+    pub(crate) fn paths(&self) -> &Arc<HashMap<FileId, String>> {
+        self.front.paths()
+    }
+}
+
+/// The job's front end as only the loop writes it: the one reference not lent to a reader,
+/// the writes asked for and not yet applied, and as each build script's run is applied, the
+/// identities of the units it was the last run in the closure of.
 pub(crate) struct UnitWriter {
-    lowered: Lowered,
+    front: Arc<Lowered>,
     job: Arc<Job>,
     waits: graph::Waits,
     /// The units a run made ready, reused from run to run.
     ready: Vec<u32>,
+    /// Build scripts' runs asked for, checked, in the order asked.
+    runs: Vec<(usize, Ran)>,
+    /// Proc macros' loads asked for, checked, in the order asked.
+    macros: Vec<(usize, ProcMacroLoadResult)>,
 }
 
 impl Writer for UnitWriter {
-    fn reader(&self) -> Reader {
-        Reader::new(UnitReader { db: self.lowered.snapshot(), paths: self.lowered.paths() })
+    fn reader(&self) -> Option<Reader> {
+        (!self.waiting()).then(|| Reader::new(UnitReader { front: Arc::clone(&self.front) }))
     }
 
-    fn ran(&mut self, run: usize, ran: &load_cargo::v2::Ran) -> Result<(), ApiError> {
-        self.lowered.ran(run, ran).map_err(lower_error)?;
-        self.ready.clear();
-        self.waits.applied(run as u32, &mut self.ready);
-        for &unit in &self.ready {
-            identify(&self.lowered, &self.job, unit);
-        }
+    fn ran(&mut self, run: usize, ran: Ran) -> Result<(), ApiError> {
+        self.front.check_ran(run, &ran).map_err(lower_error)?;
+        self.runs.push((run, ran));
         Ok(())
+    }
+
+    fn macros(&mut self, unit: usize, macros: ProcMacroLoadResult) -> Result<(), ApiError> {
+        self.front.check_macros(unit).map_err(lower_error)?;
+        self.macros.push((unit, macros));
+        Ok(())
+    }
+
+    fn waiting(&self) -> bool {
+        !self.runs.is_empty() || !self.macros.is_empty()
+    }
+
+    fn apply(&mut self) -> Result<bool, ApiError> {
+        if !self.waiting() {
+            return Ok(true);
+        }
+        let Some(lowered) = Arc::get_mut(&mut self.front) else { return Ok(false) };
+        for (unit, macros) in self.macros.drain(..) {
+            lowered.macros(unit, macros).map_err(lower_error)?;
+        }
+        for (run, ran) in self.runs.drain(..) {
+            lowered.ran(run, &ran).map_err(lower_error)?;
+            self.ready.clear();
+            self.waits.applied(run as u32, &mut self.ready);
+            for &unit in &self.ready {
+                identify(lowered, &self.job, unit);
+            }
+        }
+        Ok(true)
     }
 }
 
 /// Unit `unit`'s identity set from the front end, once every run of its closure is applied:
 /// from then on nothing changes what its crate is made from.
-fn identify(lowered: &Lowered, job: &Job, unit: u32) {
+fn identify(lowered: &mut Lowered, job: &Job, unit: u32) {
     if let Some(slot) = job.identities.get(unit as usize) {
         let _ = slot.set(lowered.identity(unit as usize));
     }
@@ -421,28 +459,19 @@ impl Front for JobFront {
         }
     }
 
-    fn compile(&self, reader: Reader, unit: usize) -> Result<Compiled, Failed> {
+    fn compile(&self, reader: Reader, unit: usize, images: &mut Vec<Image>) -> Result<Compiled, Failed> {
         let reader: UnitReader = reader.take();
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
-        cancellable(|| compile::compile(&self.0, &reader, unit))?
+        cancellable(|| compile::compile(&self.0, &reader, unit, images))?
     }
 
     fn script(&self, unit: usize, tags: u64) -> Result<Box<dyn Runs>, ApiError> {
         script::start(&self.0, unit, tags)
     }
 
-    fn tests(
-        &self,
-        reader: Reader,
-        built: &[Artifact],
-        selection: Selection<'_>,
-        tags: u64,
-    ) -> Result<Box<dyn Runs>, ApiError> {
-        // The tests run their compiled binaries and read nothing of the front end: its snapshot
-        // goes at once, so it holds up no write.
-        drop(reader.take::<UnitReader>());
+    fn tests(&self, built: &[Artifact], selection: Selection<'_>, tags: u64) -> Result<Box<dyn Runs>, ApiError> {
         test::start(&self.0, built, selection, tags)
     }
 
@@ -452,11 +481,11 @@ impl Front for JobFront {
     }
 
     fn evaluate(&self, reader: Reader, test: &str, ub: Ub) -> Result<TestResult, Failed> {
-        let UnitReader { db, .. } = reader.take();
+        let reader: UnitReader = reader.take();
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
-        cancellable(|| test::evaluate(&self.0, &db, test, ub))?
+        cancellable(|| test::evaluate(&self.0, reader.db(), test, ub))?
     }
 
     fn run(
@@ -482,12 +511,12 @@ impl Front for JobFront {
                 None,
             )));
         };
-        let UnitReader { db: after, .. } = reader.take();
-        let UnitReader { db: before, .. } = from_reader.take();
+        let after: UnitReader = reader.take();
+        let before: UnitReader = from_reader.take();
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
-        cancellable(|| reach::reach(&from.0, &before, &self.0, &after, changes))?
+        cancellable(|| reach::reach(&from.0, before.db(), &self.0, after.db(), changes))?
     }
 
     fn codegen_inputs(&self, reader: Reader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
@@ -496,22 +525,28 @@ impl Front for JobFront {
         cancellable(|| compile::codegen_inputs(&self.0))?
     }
 
-    fn tables(&self, reader: Reader) -> Result<Vec<Table>, Failed> {
-        let UnitReader { db, .. } = reader.take();
-        cancellable(|| tables(&self.0, &db))
+    fn tables(&self, reader: Reader, images: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
+        let reader: UnitReader = reader.take();
+        cancellable(|| tables(reader.db(), images))
+    }
+}
+
+impl Kept for codegen::Linked {
+    fn tables(&self) -> Vec<(&'static str, u64, u64)> {
+        codegen::Linked::tables(self)
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+        self
     }
 }
 
 /// The front end's tables (tokens, syntax nodes, HIR expressions, MIR statements, memos and
-/// their edges, each as its owner counts it) and the linker's over every image kept linked
-/// (relocations and the rest), summed by name and sorted by it. An image being relinked as
-/// this runs is out of the map for the link, and not counted.
-fn tables(job: &Job, db: &Snapshot) -> Vec<Table> {
+/// their edges, each as its owner counts it) and the linker's `images` (relocations and the
+/// rest), summed by name and sorted by it.
+fn tables(db: &Db, images: &[(&'static str, u64, u64)]) -> Vec<Table> {
     let mut counted = load_cargo::v2::tables(db);
-    {
-        let images = job.shared.images.lock().unwrap_or_else(|it| it.into_inner());
-        counted.extend(images.values().flat_map(codegen::Linked::tables));
-    }
+    counted.extend_from_slice(images);
     counted.sort_unstable_by_key(|it| it.0);
     let mut tables: Vec<Table> = Vec::new();
     for (name, elements, bytes) in counted {

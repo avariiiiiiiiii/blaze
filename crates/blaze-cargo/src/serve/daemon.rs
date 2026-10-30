@@ -531,6 +531,9 @@ impl<D: Driver> Daemon<D> {
     /// does nothing more.
     fn step_plane(&mut self) {
         let mut happened = std::mem::take(&mut self.spare.happened);
+        let mut said = self.spare.said.pop().unwrap_or_default();
+        self.jobs.apply_writes(&mut world!(self, said));
+        self.said(said);
         loop {
             self.plane.poll(self.driver.now());
             self.plane.happened(&mut happened);

@@ -15,7 +15,7 @@ use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use serde::{Deserialize, Serialize};
 
 use super::config::{ConfigChain, ConfigOf, ConfigRead};
-use super::files::{Fill, Snapshot, run_over};
+use super::files::{Fill, Reads, Snapshot, run_over};
 use super::invocation::Asking;
 use super::{load_error, unmounted_error};
 use crate::query::{Cbor, LoadError, Versioned, key_input, producer};
@@ -62,7 +62,7 @@ impl Query for ManifestQuery {
         };
         let fill = Fill { config: &key.config, own: Some(&key.path), members: false };
         let path = PathBuf::from(&key.path);
-        let (read, used) = run_over(cx, config.snapshot.clone(), &fill, |_, files| {
+        let (read, used) = run_over(cx, config.snapshot.clone(), &fill, |_, files, _| {
             Ok(read_one(&config, files, &path, key.source.as_deref()))
         })?;
         let read = match used.unmounted() {
@@ -154,7 +154,7 @@ impl Query for WorkspaceQuery {
             (None, ConfigOf::Fixed { .. }) => None,
         };
         let fill = Fill { config: &key.config, own: None, members: true };
-        let (found, used) = run_over(cx, config.snapshot.clone(), &fill, |_, files| {
+        let (found, used) = run_over(cx, config.snapshot.clone(), &fill, |_, files, _| {
             Ok(read_workspace(&config, files, manifest_path.as_deref()))
         })?;
         if let Some(at) = used.unmounted() {
@@ -250,12 +250,12 @@ pub(crate) fn replay<'db, R>(
     read: &WorkspaceRead,
     config_of: &ConfigOf,
     extra: &Snapshot,
-    mut then: impl FnMut(&mut Cx<'db>, &Context, &Workspace<'_>, Rc<dyn Files>) -> Result<R, Cancelled>,
+    mut then: impl FnMut(&mut Cx<'db>, &Context, &Workspace<'_>, Rc<dyn Files>, &Reads<'_>) -> Result<R, Cancelled>,
 ) -> Result<(Result<R, LoadError>, Snapshot), Cancelled> {
     let mut base = read.snapshot.clone();
     base.merge(extra.clone());
     let fill = Fill { config: config_of, own: None, members: true };
-    run_over(cx, base, &fill, |cx, files| {
+    run_over(cx, base, &fill, |cx, files, reads| {
         let config = match super::config::build(&read.config, files.clone()) {
             Ok(config) => config,
             Err(error) => return Ok(Err(load_error(&error, None))),
@@ -265,7 +265,7 @@ pub(crate) fn replay<'db, R>(
             Ok(ws) => ws,
             Err(error) => return Ok(Err(load_error(&error, Some(read.current.clone())))),
         };
-        then(cx, &ctx, &ws, files).map(Ok)
+        then(cx, &ctx, &ws, files, reads).map(Ok)
     })
 }
 

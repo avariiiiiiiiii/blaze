@@ -11,10 +11,10 @@
 use std::{cmp::Ordering, fmt, num::NonZeroU32, sync::Arc, sync::OnceLock};
 
 use blaze_format::SchemaHash;
-use blaze_ids::Hasher;
+use blaze_ids::{ContentId, Hasher};
 use blaze_image::{Builder, Image, SectionId, Stable};
 
-use crate::table::{Live, RestoreError, Shape, Table};
+use crate::table::{Jobs, Live, RestoreError, Shape, Table, serial};
 
 pub mod symbols;
 
@@ -102,14 +102,30 @@ pub fn symbols_schema() -> SchemaHash {
 ///
 /// On an error no symbol was restored, so no other section of `image` that names symbols may
 /// be used: every one of them is recomputed from a cold start. The section is checked whole
-/// here, since every value depends on it.
-pub fn restore_symbols<S: Stable>(image: Arc<Image<S>>) -> Result<(), RestoreError> {
+/// here, since every value depends on it, its CRCs and columns split across `jobs` (the
+/// daemon's pool: one core streams a tenth of what the machine's memory can).
+pub fn restore_symbols<S: Stable>(image: Arc<Image<S>>, jobs: Jobs<'_>) -> Result<(), RestoreError> {
     let image: &'static Arc<Image<S>> = Box::leak(Box::new(image));
-    restore_into(&TABLE, image)
+    restore_into(&TABLE, image, jobs)?;
+    RESTORED.set(image.hash()).expect("the symbol table is restored once");
+    Ok(())
 }
 
-fn restore_into<S: Stable>(cell: &OnceLock<Table>, image: &'static Image<S>) -> Result<(), RestoreError> {
-    Table::restore_into(cell, shape(), image, SectionId::SYMBOLS, symbols_schema())
+static RESTORED: OnceLock<ContentId> = OnceLock::new();
+
+/// The hash of the image this process's symbols were restored from, `None` for a fresh table:
+/// what an owner of other sections checks before using them, since their values name symbol
+/// IDs that mean what they meant only in that image's table.
+pub fn restored_from() -> Option<ContentId> {
+    RESTORED.get().copied()
+}
+
+fn restore_into<S: Stable>(
+    cell: &OnceLock<Table>,
+    image: &'static Image<S>,
+    jobs: Jobs<'_>,
+) -> Result<(), RestoreError> {
+    Table::restore_into(cell, shape(), image, SectionId::SYMBOLS, symbols_schema(), jobs)
 }
 
 /// Writes the symbol section into `builder`: every symbol `live` marks at its ID, every other
@@ -493,9 +509,9 @@ mod tests {
         let image = image_of(&Table::new(shape()), &Live::new());
         let cell = OnceLock::new();
         let _ = cell.get_or_init(|| Table::new(shape()));
-        assert_eq!(restore_into(&cell, image), Err(RestoreError::Started { section: SectionId::SYMBOLS }));
+        assert_eq!(restore_into(&cell, image, &serial), Err(RestoreError::Started { section: SectionId::SYMBOLS }));
         let fresh = OnceLock::new();
-        assert_eq!(restore_into(&fresh, image), Ok(()));
+        assert_eq!(restore_into(&fresh, image, &serial), Ok(()));
         assert_eq!(fresh.get().unwrap().find(b"self"), Some(sym::self_.id()));
     }
 
@@ -508,7 +524,7 @@ mod tests {
         let image: &'static Image<Vec<u8>> =
             Box::leak(Box::new(Image::open(builder.finish().unwrap()).unwrap()));
         assert!(matches!(
-            restore_into(&OnceLock::new(), image),
+            restore_into(&OnceLock::new(), image, &serial),
             Err(RestoreError::Refused(blaze_image::Refused::Schema { .. }))
         ));
     }

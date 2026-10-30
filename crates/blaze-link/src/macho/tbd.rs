@@ -31,6 +31,7 @@ mod reference;
 /// Catalyst, 7 iOS simulator, 8 tvOS simulator, 9 watchOS simulator, 11 visionOS,
 /// 12 visionOS simulator).
 pub(super) fn read(name: &str, text: &str, arch: Arch, platform: u32) -> Result<Shared, String> {
+    // alloc: error path
     read_documents(text, arch, platform).map_err(|what| format!("{name}: {what}"))
 }
 
@@ -40,21 +41,30 @@ const MAX_TEXT: usize = 1 << 31;
 
 fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Shared, String> {
     if matches!(arch, Arch::Wasm32) {
+        // alloc: error path
         return Err("a `.tbd` describes a Mach-O library; this output is wasm32".to_owned());
     }
     if text.trim_start().starts_with('{') {
+        // alloc: error path
         return Err("a JSON `.tbd` (version 5) is not read: only versions 1 to 4".to_owned());
     }
     if text.len() >= MAX_TEXT {
+        // alloc: error path
         return Err(format!("{} bytes: a `.tbd` is read up to 2 GiB", text.len()));
     }
     let raw = documents(text)?;
     if raw.is_empty() {
+        // alloc: error path
         return Err("no document".to_owned());
     }
+    // alloc: the tape, once per file; `scratch` stays empty until a scalar is unescaped or wraps
     let mut tape = Tape { nodes: Vec::with_capacity(text.len() / 16), scratch: String::new() };
-    let mut lines = Vec::new();
-    let mut pieces = Vec::new();
+    // A document's logical lines and their pieces are at most its physical lines: sized once
+    // for the longest, and reused by every document.
+    let most = raw.iter().map(|it| it.count).max().unwrap_or(0);
+    let mut lines = Vec::with_capacity(most);
+    let mut pieces = Vec::with_capacity(most);
+    // alloc: once per file, reused by every document
     let mut targets = Vec::new();
     let mut docs = Vec::with_capacity(raw.len());
     for doc in &raw {
@@ -74,11 +84,15 @@ fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Shared, Strin
     stream.fold(0, arch, platform, &mut seen, &mut plan)?;
     let Exports { symbols, names, .. } = decode(view, &plan)?;
     Ok(Shared {
+        // alloc: `Shared::name`, once per file
         name: view.str(docs[0].install_name).to_owned(),
         symbols,
         names,
+        // alloc: empty `Vec`s, which don't allocate
         versions: Vec::new(),
+        // alloc: empty `Vec`s, which don't allocate
         more: Vec::new(),
+        // alloc: `Shared::inputs`: the re-exports outside the file, once per file
         inputs: plan.inputs.iter().map(|it| (*it).to_owned()).collect(),
     })
 }
@@ -161,6 +175,7 @@ impl<'s> Stream<'s, '_> {
             .min_by_key(|(rank, _)| *rank)
             .map(|(_, it)| it)
             .ok_or_else(|| {
+                // alloc: error path
                 format!(
                     "`{}` has no {}-{}; it has {}",
                     self.name(doc),
@@ -173,6 +188,7 @@ impl<'s> Stream<'s, '_> {
 
     /// What the document lists, as written: `targets`, or each of `archs` with the platform.
     fn listed(&self, doc: &Doc) -> String {
+        // alloc: error path: what the document lists, for the message
         let mut out = String::new();
         for (index, node) in self.view.scalars(doc.list, "targets").unwrap_or(0..0).enumerate() {
             if index > 0 {
@@ -198,6 +214,7 @@ impl<'s> Stream<'s, '_> {
         plan: &mut Plan<'s>,
     ) -> Result<Vec<&'s str>, String> {
         let view = self.view;
+        // alloc: empty unless the document re-exports; once per document
         let mut libraries = Vec::new();
         if doc.version == 4 {
             for key in ["exports", "reexports"] {
@@ -262,6 +279,7 @@ impl<'s> Stream<'s, '_> {
                 other => return Err(self.unknown(doc, list, other)),
             };
             let names = view.scalars(value, key)?;
+            // clone: a `Range<u32>`, two integers
             let text: usize = names.clone().map(|it| view.str(it).len()).sum();
             match what {
                 What::Symbols { .. } => {
@@ -287,11 +305,13 @@ impl<'s> Stream<'s, '_> {
         match view.kind(value) {
             Kind::Seq => {
                 if view.children(value).any(|it| view.kind(it) != Kind::Map) {
+                    // alloc: error path
                     return Err(format!("`{}`: an entry of `{key}` is not a mapping", self.name(doc)));
                 }
                 Ok(view.children(value))
             }
             Kind::Text | Kind::Scratch if view.str(value).is_empty() => Ok(Children::empty(view)),
+            // alloc: error path
             _ => Err(format!("`{}`: `{key}` is not a sequence", self.name(doc))),
         }
     }
@@ -309,6 +329,7 @@ impl<'s> Stream<'s, '_> {
         let view = self.view;
         let value = view
             .get(section, selector)
+            // alloc: error path
             .ok_or_else(|| format!("`{}`: a list without `{selector}`", self.name(doc)))?;
         let names = view.scalars(value, selector)?;
         if doc.version == 4 {
@@ -325,6 +346,7 @@ impl<'s> Stream<'s, '_> {
     }
 
     fn unknown(&self, doc: &Doc, list: &str, key: &str) -> String {
+        // alloc: error path
         format!("`{}`: unknown key `{key}` in `{list}`", self.name(doc))
     }
 }
@@ -339,8 +361,10 @@ fn decode(view: View<'_>, plan: &Plan<'_>) -> Result<Exports, String> {
         names: Names::with_capacity(plan.bytes),
         seen: Seen::with_capacity(plan.names),
     };
+    // alloc: one buffer per file, reused for every name that needs a prefix
     let mut key = String::new();
     for list in &plan.lists {
+        // clone: a `Range<u32>`, two integers
         for node in list.names.clone() {
             let name = view.str(node);
             match list.what {
@@ -399,6 +423,7 @@ const EMPTY: u32 = u32::MAX;
 impl Seen {
     fn with_capacity(names: usize) -> Seen {
         let len = (names.max(8) * 2).next_power_of_two();
+        // alloc: one table per file, sized once from the plan's name count
         Seen { slots: vec![EMPTY; len], mask: len - 1 }
     }
 
@@ -468,6 +493,7 @@ impl Doc {
         let map = match view.kind(root) {
             Kind::Map => Some(root),
             Kind::Text | Kind::Scratch if view.str(root).is_empty() => None,
+            // alloc: error path
             _ => return Err(format!("line {first}: a document must be a mapping")),
         };
         let get = |key: &str| map.and_then(|map| view.get(map, key));
@@ -477,24 +503,29 @@ impl Doc {
             Some("!tapi-tbd-v3") => 3,
             Some("!tapi-tbd") => {
                 let version = get("tbd-version")
+                    // alloc: error path
                     .ok_or_else(|| format!("line {first}: `!tapi-tbd` without `tbd-version`"))?;
                 match view.scalar(version, "tbd-version")? {
                     "4" => 4,
                     other => {
+                        // alloc: error path
                         return Err(format!(
                             "line {first}: tbd-version {other} is not read: only versions 1 to 4"
                         ));
                     }
                 }
             }
+            // alloc: error path
             Some(other) => return Err(format!("line {first}: unknown document tag `{other}`")),
         };
         let install_name = get("install-name")
+            // alloc: error path
             .ok_or_else(|| format!("line {first}: a document without `install-name`"))?;
         let name = view.scalar(install_name, "install-name")?;
 
         let start = targets.len() as u32;
         let (list, platform) = if version == 4 {
+            // alloc: error path
             let list = get("targets").ok_or_else(|| format!("`{name}` has no `targets`"))?;
             for node in view.scalars(list, "targets")? {
                 let (arch, platform) = v4_target(view.str(node))?;
@@ -502,7 +533,9 @@ impl Doc {
             }
             (list, list)
         } else {
+            // alloc: error path
             let archs = get("archs").ok_or_else(|| format!("`{name}` has no `archs`"))?;
+            // alloc: error path
             let platform = get("platform").ok_or_else(|| format!("`{name}` has no `platform`"))?;
             let platform_text = view.scalar(platform, "platform")?;
             for node in view.scalars(archs, "archs")? {
@@ -565,6 +598,7 @@ fn platform_name(number: u32) -> String {
     PLATFORMS
         .iter()
         .find(|it| it.1 == number)
+        // alloc: error path: a platform's name, for the message
         .map_or_else(|| format!("platform {number}"), |it| it.0.to_owned())
 }
 
@@ -572,6 +606,7 @@ fn platform_name(number: u32) -> String {
 /// arch and its platform's number.
 fn v4_target(text: &str) -> Result<(&str, u32), String> {
     let (arch, platform) =
+        // alloc: error path
         text.split_once('-').ok_or_else(|| format!("target `{text}` is not `<arch>-<platform>`"))?;
     Ok((arch, PLATFORMS.iter().find(|it| it.0 == platform).map_or(0, |it| it.1)))
 }
@@ -778,6 +813,7 @@ impl<'s> View<'s> {
     fn scalar(&self, value: u32, key: &str) -> Result<&'s str, String> {
         match self.kind(value) {
             Kind::Text | Kind::Scratch => Ok(self.str(value)),
+            // alloc: error path
             Kind::Seq | Kind::Map => Err(format!("`{key}` is not a scalar")),
         }
     }
@@ -794,8 +830,10 @@ impl<'s> View<'s> {
                 let all = self.nodes[items.start as usize..items.end as usize]
                     .iter()
                     .all(|it| matches!(it.kind, Kind::Text | Kind::Scratch));
+                // alloc: error path
                 if all { Ok(items) } else { Err(format!("`{key}` is not a scalar")) }
             }
+            // alloc: error path
             Kind::Map => Err(format!("`{key}` is not a sequence")),
         }
     }
@@ -837,17 +875,19 @@ impl Iterator for Entries<'_> {
     }
 }
 
-/// A document as the stream has it: its tag (`!tapi-tbd-v3`), its lines' bytes, and the
-/// number (from 1) of the first of them.
+/// A document as the stream has it: its tag (`!tapi-tbd-v3`), its lines' bytes, the
+/// number (from 1) of the first of them, and how many there are.
 struct RawDoc<'t> {
     tag: Option<&'t str>,
     lines: Range<usize>,
     number: usize,
+    count: usize,
 }
 
 /// The documents of a stream, split at `---` and `...` lines.
 fn documents(text: &str) -> Result<Vec<RawDoc<'_>>, String> {
     let bytes = text.as_bytes();
+    // alloc: once per file, one entry per document
     let mut docs = Vec::new();
     let mut open: Option<RawDoc<'_>> = None;
     let mut at = 0;
@@ -865,22 +905,30 @@ fn documents(text: &str) -> Result<Vec<RawDoc<'_>>, String> {
         if line == "---" || line.starts_with("--- ") || line.starts_with("---\t") {
             if let Some(mut doc) = open.take() {
                 doc.lines.end = at;
+                doc.count = number - doc.number;
                 docs.push(doc);
             }
             let tag = strip_comment(&line[3..])?.trim();
-            open = Some(RawDoc { tag: (!tag.is_empty()).then_some(tag), lines: next..next, number: number + 1 });
+            open = Some(RawDoc {
+                tag: (!tag.is_empty()).then_some(tag),
+                lines: next..next,
+                number: number + 1,
+                count: 0,
+            });
         } else if line.trim_end() == "..." {
             if let Some(mut doc) = open.take() {
                 doc.lines.end = at;
+                doc.count = number - doc.number;
                 docs.push(doc);
             }
         } else if open.is_none() && !line.starts_with('%') && !strip_comment(line)?.trim().is_empty() {
-            open = Some(RawDoc { tag: None, lines: at..at, number });
+            open = Some(RawDoc { tag: None, lines: at..at, number, count: 0 });
         }
         at = next;
     }
     if let Some(mut doc) = open {
         doc.lines.end = bytes.len();
+        doc.count = number + 1 - doc.number;
         docs.push(doc);
     }
     Ok(docs)
@@ -925,6 +973,7 @@ fn strip_comment(text: &str) -> Result<&str, String> {
         }
     }
     if quote.is_some() {
+        // alloc: error path
         return Err("an unterminated quoted scalar".to_owned());
     }
     Ok(text)
@@ -1009,6 +1058,7 @@ fn logical_lines(
             }
         };
         if quote != 0 {
+            // alloc: error path
             return Err(format!("line {number}: an unterminated quoted scalar"));
         }
         let end = match cut {
@@ -1028,6 +1078,7 @@ fn logical_lines(
             } else {
                 let indent = content.len() - content.trim_start_matches(' ').len();
                 if content.as_bytes().get(indent) == Some(&b'\t') {
+                    // alloc: error path
                     return Err(format!("line {number}: a tab in the indentation"));
                 }
                 let first = pieces.len() as u32;
@@ -1036,6 +1087,7 @@ fn logical_lines(
             }
             depth += delta;
             if depth < 0 {
+                // alloc: error path
                 return Err(format!("line {number}: an unopened `]` or `}}`"));
             }
         }
@@ -1044,6 +1096,7 @@ fn logical_lines(
     }
     if depth > 0 {
         let number = lines.last().map_or(0, |it| it.number);
+        // alloc: error path
         return Err(format!("line {number}: an unclosed `[` or `{{`"));
     }
     Ok(())
@@ -1066,6 +1119,7 @@ fn parse(
     let mut parser = Parser { text, lines, pieces, tape, at: 0, depth: 0 };
     parser.block()?;
     if let Some(line) = parser.lines.get(parser.at) {
+        // alloc: error path
         return Err(format!("line {}: unexpected indentation", line.number));
     }
     Ok(root)
@@ -1126,6 +1180,7 @@ impl Parser<'_> {
         self.depth += 1;
         if self.depth > DEPTH {
             let number = self.lines[self.at].number;
+            // alloc: error path
             return Err(format!("line {number}: collections nested deeper than {DEPTH}"));
         }
         Ok(())
@@ -1150,6 +1205,7 @@ impl Parser<'_> {
         flow.value(false)?;
         flow.skip_spaces();
         if !flow.at_end() {
+            // alloc: error path
             return Err(format!("line {}: unexpected `{}`", line.number, flow.rest()));
         }
         Ok(())
@@ -1196,6 +1252,7 @@ impl Parser<'_> {
                 Some(split) => split,
                 None => self
                     .split_key(line)?
+                    // alloc: error path
                     .ok_or_else(|| format!("line {number}: expected `key: value`"))?,
             };
             self.at += 1;
@@ -1214,6 +1271,7 @@ impl Parser<'_> {
             let mut at = map + 1;
             while at < key {
                 if view.str(at) == name {
+                    // alloc: error path
                     return Err(format!("line {number}: `{name}` given twice"));
                 }
                 at = view.after(at + 1);
@@ -1393,6 +1451,7 @@ impl Flow<'_> {
 
     /// The line from the cursor to its end, for an error.
     fn rest(&self) -> String {
+        // alloc: error path: the rest of the line, for the message
         let mut out = self.text[self.at..self.end()].to_owned();
         for piece in &self.pieces[self.piece + 1..] {
             out.push(' ');
@@ -1402,12 +1461,14 @@ impl Flow<'_> {
     }
 
     fn error(&self, what: &str) -> String {
+        // alloc: error path
         format!("line {}: {what} at `{}`", self.number, self.rest())
     }
 
     fn enter(&mut self) -> Result<(), String> {
         self.depth += 1;
         if self.depth > DEPTH {
+            // alloc: error path
             return Err(format!("line {}: collections nested deeper than {DEPTH}", self.number));
         }
         Ok(())
@@ -2462,5 +2523,36 @@ e:
             }
         }
         same(&text);
+    }
+
+    /// A read's allocations don't grow with its names: the symbols, the arena and the set are
+    /// sized once from the plan, the lines and pieces once from the longest document, and the
+    /// tape from the text. 16 times the symbols may cost a few doublings of the buffers that
+    /// still grow (the tape past one node per 16 bytes, the plan's lists), never one per name.
+    #[test]
+    fn read_allocation_budget() {
+        let text = |count: usize| {
+            let mut out = String::from(
+                "--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64-macos ]\ninstall-name: /usr/lib/libx.dylib\n\
+                 exports:\n  - targets: [ arm64-macos ]\n    symbols: [ ",
+            );
+            for at in 0..count {
+                if at > 0 {
+                    out.push_str(",\n                 ");
+                }
+                out.push_str(&format!("_name{at}"));
+            }
+            out.push_str(" ]\n...\n");
+            out
+        };
+        let read_counting = |count: usize| {
+            let text = text(count);
+            let (shared, used) = blaze_alloc_count::measure(|| read("x.tbd", &text, Arch::Aarch64, 1));
+            assert_eq!(shared.unwrap().symbols.len(), count);
+            used.allocations
+        };
+        let (small, big) = (read_counting(64), read_counting(64 * 16));
+        assert!(small <= 32, "reading 64 names: {small} allocations");
+        assert!(big <= small + 4, "16 times the names: {big} allocations, against {small}");
     }
 }

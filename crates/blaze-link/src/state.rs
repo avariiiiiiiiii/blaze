@@ -1,8 +1,9 @@
 //! An image's state: its pieces, where each is, what every symbol is defined as, and the
-//! bytes of every region. Cloning it is cheap (a pointer per 1024 entries of each column, per
-//! 64 KiB of each list arena, per 16 KiB page of each region), so a stage works on a copy and
-//! the state it started from stays whole: a stage that fails leaves nothing behind, and a
-//! rollback is the state before. A stage copies only the chunks and pages it writes.
+//! bytes of every region. Cloning it is O(1) in the image's size: a reference count per column,
+//! list arena and region, and one allocation (the regions' list, plus a name per
+//! [`Class::Named`] region). So a stage works on a copy and the state it started from stays
+//! whole: a stage that fails leaves nothing behind, and a rollback is the state before. A stage
+//! copies only the tables, chunks and pages it writes ([`crate::cow`]).
 //!
 //! A piece is a row of columns: [`Hot`] (32 bytes: what placement, relocation and the writers
 //! read of every piece), [`What`] (16), [`Sort`] (16), and its lists (fixups, weak targets,
@@ -26,7 +27,7 @@ use crate::model::{Class, Fixup, NativeFile, Region, Special, Sym, Tls};
 pub(crate) use crate::native::Resolved;
 use crate::position::Spans;
 use crate::reloc::GotKind;
-use crate::symbols::{IdNo, NameId, Obj, Symbols};
+use crate::symbols::{IdNo, NameId, Obj, SHARDS, Symbols};
 use crate::{NativeKind, Output};
 
 pub(crate) type PieceId = u32;
@@ -334,10 +335,13 @@ pub(crate) struct Input {
     pub file: Arc<NativeFile>,
 }
 
+/// Every field is `Copy`, an `Arc`, or a copy-on-write container whose clone is a reference
+/// count, except `spaces` (a few dozen regions): see the module's comment for the cost.
 #[derive(Clone)]
 pub(crate) struct State {
     pub generation: u64,
-    pub specials: Vec<Special>,
+    /// Written only by resolution ([`crate::native`]), with `Arc::make_mut`.
+    pub specials: Arc<Vec<Special>>,
     pub spaces: Vec<Space>,
     /// The names Rust code defines (`#[no_mangle]`, `main`), each the symbol it is.
     // BTreeMap: changed by every stage and walked in order by each native resolve.
@@ -375,9 +379,9 @@ pub(crate) struct State {
     syms: CowList<Sym>,
     rebase: CowList<u64>,
     binds: CowList<Bind>,
-    /// Per symbol shard ([`Symbols::split`]).
-    defs: Vec<CowVec<Def>>,
-    cold: Vec<CowVec<SymCold>>,
+    /// Per symbol shard ([`Symbols::split`]): inline, so a clone allocates nothing.
+    defs: [CowVec<Def>; SHARDS],
+    cold: [CowVec<SymCold>; SHARDS],
     ref_items: CowList<PieceId>,
     /// Every name a piece has referred to, in the order first seen.
     seen: CowVec<Sym>,
@@ -385,7 +389,7 @@ pub(crate) struct State {
     functions: CowVec<FunctionInfo>,
     lines: CowList<Line>,
     /// Per id shard ([`Symbols::split_id`]).
-    ids: Vec<CowVec<IdCold>>,
+    ids: [CowVec<IdCold>; SHARDS],
     /// Per slot: the body it runs, and the next slot running the same body.
     cells: CowVec<Sym>,
     slot_next: CowVec<u32>,
@@ -397,7 +401,8 @@ impl State {
     pub fn new() -> State {
         State {
             generation: blaze_live::patch::FIRST_GENERATION,
-            specials: Vec::new(),
+            specials: Arc::default(),
+            // alloc: none (an empty `Vec`), once per image
             spaces: Vec::new(),
             names: Arc::default(),
             wasm_imports: Arc::default(),
@@ -423,15 +428,15 @@ impl State {
             syms: CowList::default(),
             rebase: CowList::default(),
             binds: CowList::default(),
-            defs: vec![CowVec::default(); Symbols::SHARDS],
-            cold: vec![CowVec::default(); Symbols::SHARDS],
+            defs: std::array::from_fn(|_| CowVec::default()),
+            cold: std::array::from_fn(|_| CowVec::default()),
             ref_items: CowList::default(),
             removals: CowVec::default(),
             seen: CowVec::default(),
             classes: Arc::default(),
             functions: CowVec::default(),
             lines: CowList::default(),
-            ids: vec![CowVec::default(); Symbols::SHARDS],
+            ids: std::array::from_fn(|_| CowVec::default()),
             cells: CowVec::default(),
             slot_next: CowVec::default(),
         }
@@ -509,6 +514,36 @@ impl State {
         it.room = room as u32;
     }
 
+    /// Adds `id` to `sym`'s referrers unless it was the last added: while one piece's fixups
+    /// are walked no other piece is added, so that finds every repeat.
+    fn ref_push_once(&mut self, sym: Sym, id: PieceId) {
+        if self.ref_items.get(self.cold(sym).refs).last() != Some(&id) {
+            self.ref_push(sym, id);
+        }
+    }
+
+    /// Adds `id` to the referrer lists of what the fixups in `list` refer to, once each.
+    fn refer(&mut self, id: PieceId, list: ListRef) {
+        for at in 0..list.len() {
+            let fixup = self.fixups.get(list)[at];
+            self.ref_push_once(fixup.target, id);
+            if let Some(minus) = fixup.minus {
+                self.ref_push_once(minus, id);
+            }
+        }
+    }
+
+    /// Takes `id` off the referrer lists of what the fixups in `list` refer to.
+    fn unrefer(&mut self, id: PieceId, list: ListRef) {
+        for at in 0..list.len() {
+            let fixup = self.fixups.get(list)[at];
+            self.ref_remove(fixup.target, id);
+            if let Some(minus) = fixup.minus {
+                self.ref_remove(minus, id);
+            }
+        }
+    }
+
     fn ref_remove(&mut self, sym: Sym, id: PieceId) {
         let cold = self.cold(sym);
         if cold.refs.is_empty() {
@@ -573,10 +608,13 @@ impl State {
         self.hot.iter().enumerate().filter(|(_, it)| it.live()).map(|(id, hot)| PieceRef { id: id as PieceId, hot, state: self })
     }
 
-    /// The symbols a piece's fixups refer to, once each.
+    /// The symbols a piece's fixups refer to, once each: inline up to eight.
     pub fn targets(piece: PieceRef<'_>) -> SmallVec<[Sym; 8]> {
-        let mut out: SmallVec<[Sym; 8]> =
-            piece.fixups().iter().flat_map(|it| std::iter::once(it.target).chain(it.minus)).collect();
+        let mut out: SmallVec<[Sym; 8]> = SmallVec::new();
+        for fixup in piece.fixups() {
+            out.push(fixup.target);
+            out.extend(fixup.minus);
+        }
         radix::sort_copy_by_key(&mut out, |it| it.0);
         out.dedup();
         out
@@ -605,31 +643,32 @@ impl State {
         self.piece_lists.push(lists);
         self.loader.push(Loader::default());
         self.users.push(0);
-        let targets = Self::targets(self.any(id).expect("just added"));
-        for target in targets {
-            self.ref_push(target, id);
-        }
+        self.refer(id, lists.fixups);
         id
+    }
+
+    /// Undefines `sym` when it is defined in piece `id`.
+    fn undefine_in(&mut self, sym: Sym, id: PieceId) {
+        if matches!(self.def(sym), Def::Piece { piece, .. } if piece == id) {
+            self.set_def(sym, Def::None);
+        }
     }
 
     /// Removes a piece, its symbols' definitions and its entries in the referrer lists of
     /// what it referred to. Its columns stay readable through [`State::any`].
     pub fn remove(&mut self, id: PieceId) -> bool {
         let Some(piece) = self.piece(id) else { return false };
-        let syms: SmallVec<[Sym; 8]> = std::iter::once(piece.sym).chain(piece.defines().iter().copied()).collect();
-        let targets = Self::targets(piece);
+        let own = piece.sym;
         let lines = piece.function().map(|it| it.lines);
         let lists = piece.lists();
         let loader = *self.loader.get(id as usize).expect("a piece's loader lists");
         self.hot_mut(id).flags &= !LIVE;
         self.removals.push(id);
-        for target in targets {
-            self.ref_remove(target, id);
-        }
-        for sym in syms {
-            if matches!(self.def(sym), Def::Piece { piece, .. } if piece == id) {
-                self.set_def(sym, Def::None);
-            }
+        self.unrefer(id, lists.fixups);
+        self.undefine_in(own, id);
+        for at in 0..lists.defines.len() {
+            let sym = self.syms.get(lists.defines)[at];
+            self.undefine_in(sym, id);
         }
         self.fixups.free(lists.fixups);
         self.syms.free(lists.weak);
@@ -654,19 +693,12 @@ impl State {
 
     /// Replaces a live piece's fixups, keeping the referrer lists right.
     pub fn set_fixups(&mut self, id: PieceId, fixups: &[Fixup]) {
-        let piece = self.piece(id).expect("a live piece");
-        let old = Self::targets(piece);
-        let list = piece.lists().fixups;
-        for target in old {
-            self.ref_remove(target, id);
-        }
+        let list = self.piece(id).expect("a live piece").lists().fixups;
+        self.unrefer(id, list);
         self.fixups.free(list);
         let list = self.fixups.push(fixups);
         self.piece_lists.get_mut(id as usize).expect("a piece's lists").fixups = list;
-        let new = Self::targets(self.piece(id).expect("a live piece"));
-        for target in new {
-            self.ref_push(target, id);
-        }
+        self.refer(id, list);
     }
 
     pub fn set_defines(&mut self, id: PieceId, defines: &[Sym]) {
@@ -718,6 +750,7 @@ impl State {
     /// Copies every live list into fresh arenas and rebuilds the referrer lists, dropping
     /// what removed pieces left: O(image), done when the garbage outweighs the rest.
     pub fn compact(&mut self) {
+        // clone: O(1), shares every chunk: the old lists are read while fresh ones are built
         let old = self.clone();
         self.fixups = CowList::default();
         self.syms = CowList::default();
@@ -753,9 +786,7 @@ impl State {
             *self.piece_lists.get_mut(id as usize).expect("in range") = lists;
             *self.loader.get_mut(id as usize).expect("in range") = loader;
             if piece.live() {
-                for target in Self::targets(piece) {
-                    self.ref_push(target, id);
-                }
+                self.refer(id, lists.fixups);
                 if let What::Function(function) = piece.what() {
                     let lines = self.lines.push(old.lines(old.function(function)));
                     self.functions.get_mut(function as usize).expect("a function").lines = lines;
@@ -776,6 +807,7 @@ impl State {
         }
         let classes = Arc::make_mut(&mut self.classes);
         let id = u16::try_from(classes.len()).expect("fewer than 2^16 classes");
+        // clone: once per class the image gets (a few dozen for its life)
         classes.push(class.clone());
         ClassId(id)
     }
@@ -841,7 +873,9 @@ impl State {
 
     // Regions.
 
+    /// The regions in one list, for a writer's [`crate::model::Placed::regions`].
     pub fn regions(&self) -> Vec<Region> {
+        // alloc: once per write, a few dozen regions for the writers' slice
         self.spaces.iter().map(|it| it.region.clone()).collect()
     }
 
@@ -852,6 +886,27 @@ impl State {
     /// The bytes a placed piece has now.
     pub fn bytes(&self, id: PieceId) -> Cow<'_, [u8]> {
         self.any(id).map_or(Cow::Borrowed(&[][..]), PieceRef::bytes)
+    }
+
+    /// Where a placed piece's bytes are: its region's bytes, the offset and the length; `None`
+    /// for one with no bytes (zeroed or not placed).
+    fn located(&self, id: PieceId) -> Option<(&CowBytes, usize, usize)> {
+        let hot = self.hot.get(id as usize)?;
+        let space = self.spaces.get(hot.region as usize)?;
+        if space.zero || hot.zero() || hot.size == 0 {
+            return None;
+        }
+        Some((&space.bytes, (hot.addr - space.region.addr) as usize, hot.size as usize))
+    }
+
+    /// Whether piece `id` has the same bytes here and in `other` ([`State::bytes`] of each,
+    /// equal), compared in place without copying either.
+    pub fn same_bytes(&self, other: &State, id: PieceId) -> bool {
+        match (self.located(id), other.located(id)) {
+            (None, None) => true,
+            (Some((a, at, len)), Some((b, other_at, other_len))) => len == other_len && a.same(at, b, other_at, len),
+            (Some(_), None) | (None, Some(_)) => false,
+        }
     }
 
     // The jump table.
@@ -936,4 +991,132 @@ pub(crate) fn zeroed(class: &Class) -> bool {
 /// Whether a format reaches functions by address through stubs (not wasm's indexes).
 pub(crate) fn has_table(output: &Output, indexed_code: bool) -> bool {
     output.incremental && !indexed_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Apply, Prot};
+
+    fn fixup(target: Sym, minus: Option<Sym>) -> Fixup {
+        Fixup { at: 0, apply: Apply::Abs64, target, addend: 0, minus }
+    }
+
+    fn piece(sym: Sym, class: ClassId, fixups: &[Fixup]) -> NewPiece<'_> {
+        NewPiece {
+            sym,
+            class,
+            rank: 0,
+            order: [0; 3],
+            align: 8,
+            size: 16,
+            zero: false,
+            fixups,
+            weak: &[],
+            defines: &[],
+            what: What::Shared,
+        }
+    }
+
+    fn space(class: Class, addr: u64, bytes: Vec<u8>) -> Space {
+        let size = bytes.len() as u64;
+        Space {
+            region: Region { class, addr, capacity: size, size, prot: Prot::R, align: 16 },
+            bytes: CowBytes::from_vec(bytes),
+            zero: false,
+            offset: None,
+        }
+    }
+
+    /// A state of `pieces` pieces over every symbol shard, each referring to up to seven of 64
+    /// symbols, in a code region and a named one.
+    fn image(pieces: u32) -> State {
+        let mut state = State::new();
+        let class = state.class_id(&Class::Text);
+        let fixups: Vec<Fixup> = (0..64).map(|it| fixup(Symbols::join(it % SHARDS, it), None)).collect();
+        for n in 0..pieces {
+            let sym = Symbols::join(n as usize % SHARDS, 100 + n as usize);
+            let id = state.add(&piece(sym, class, &fixups[(n % 57) as usize..(n % 57 + n % 8) as usize]));
+            state.set_def(sym, Def::Piece { piece: id, offset: 0 });
+        }
+        state.spaces.push(space(Class::Text, 0x1000, vec![0x90; 3 * CowBytes::PAGE]));
+        let named = Class::Named { name: "linkme_ITEMS".to_owned(), write: false, exec: false };
+        state.spaces.push(space(named, 0x10000, vec![0; 64]));
+        Arc::make_mut(&mut state.specials).push(Special::Absolute(1));
+        state
+    }
+
+    /// What `Image::stage` pays to stage on a copy, whatever the image's size: the spaces list
+    /// and the one `Class::Named` region's name. Every column, arena and region is shared.
+    #[test]
+    fn a_clone_allocates_the_regions_list_only() {
+        for pieces in [10, 5000] {
+            let state = image(pieces);
+            let (copy, used) = blaze_alloc_count::measure(|| state.clone());
+            assert!(used.allocations <= 2, "{pieces} pieces: {used:?}");
+            assert_eq!(copy.piece_count(), pieces);
+            assert!(Arc::ptr_eq(&copy.specials, &state.specials));
+        }
+    }
+
+    #[test]
+    fn lookups_allocate_nothing() {
+        let state = image(5000);
+        let sym = Symbols::join(7, 107);
+        blaze_alloc_count::assert_at_most(0, "a symbol's definition, home, piece and lists", || {
+            let (piece, _) = state.home(sym).expect("defined");
+            assert_eq!(state.def(sym), Def::Piece { piece, offset: 0 });
+            let piece = state.piece(piece).expect("live");
+            assert_eq!(piece.sym, sym);
+            assert_eq!(piece.fixups().len(), 7);
+            assert!(state.refs(Symbols::join(10, 10)).next().is_some());
+            assert!(state.same_bytes(&state, piece.id));
+        });
+    }
+
+    /// A piece naming a symbol twice (and as the subtracted one) is its referrer once, and
+    /// leaves every list it was in when removed or given other fixups.
+    #[test]
+    fn a_piece_refers_to_each_symbol_once() {
+        let mut state = State::new();
+        let class = state.class_id(&Class::Text);
+        let (a, b, c) = (Symbols::join(1, 0), Symbols::join(2, 0), Symbols::join(3, 0));
+        let first = state.add(&piece(Symbols::join(4, 0), class, &[fixup(a, Some(b)), fixup(b, None), fixup(a, Some(a))]));
+        let second = state.add(&piece(Symbols::join(4, 1), class, &[fixup(a, None)]));
+        let refs = |state: &State, sym: Sym| state.refs(sym).collect::<Vec<_>>();
+        assert_eq!(refs(&state, a), vec![first, second]);
+        assert_eq!(refs(&state, b), vec![first]);
+        state.set_fixups(first, &[fixup(c, None), fixup(c, None)]);
+        assert_eq!(refs(&state, a), vec![second]);
+        assert_eq!(refs(&state, b), Vec::<PieceId>::new());
+        assert_eq!(refs(&state, c), vec![first]);
+        assert_eq!(&*State::targets(state.piece(first).unwrap()), &[c]);
+        state.set_def(Symbols::join(4, 0), Def::Piece { piece: first, offset: 0 });
+        assert!(state.remove(first));
+        assert_eq!(refs(&state, c), Vec::<PieceId>::new());
+        assert_eq!(state.def(Symbols::join(4, 0)), Def::None);
+        state.compact();
+        assert_eq!(refs(&state, a), vec![second]);
+    }
+
+    /// The comparison in place agrees with comparing the copies `State::bytes` gives.
+    #[test]
+    fn same_bytes_is_bytes_compared() {
+        let mut old = image(3);
+        let page = CowBytes::PAGE as u64;
+        let places = [(0, 0x1000), (1, 0x1000 + page - 8), (2, 0x1000 + 2 * page)];
+        for (id, addr) in places {
+            let hot = old.hot_mut(id);
+            hot.region = 0;
+            hot.addr = addr;
+        }
+        let mut new = old.clone();
+        new.spaces[0].bytes.write((page - 4) as usize, &[1, 2]);
+        for id in 0..3 {
+            assert_eq!(new.same_bytes(&old, id), new.bytes(id) == old.bytes(id), "piece {id}");
+        }
+        assert!(new.same_bytes(&old, 0) && !new.same_bytes(&old, 1) && new.same_bytes(&old, 2));
+        new.hot_mut(2).set_zero(true);
+        assert!(!new.same_bytes(&old, 2));
+    }
 }

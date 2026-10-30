@@ -22,6 +22,7 @@ pub mod admission;
 pub mod arena;
 pub mod build;
 pub mod exec;
+pub mod history;
 pub mod machine;
 pub mod plane;
 pub mod pool;

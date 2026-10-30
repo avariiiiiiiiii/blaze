@@ -39,6 +39,10 @@ pub use output::{Output, parse, read};
 pub use unit::Unit;
 pub use watch::{Watched, watched, watched_in};
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 /// What cargo would fail with, in cargo's words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error(pub String);

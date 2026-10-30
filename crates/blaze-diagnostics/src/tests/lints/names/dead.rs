@@ -282,3 +282,36 @@ fn main() {
         ]
     );
 }
+
+/// `r#x = x` assigns the same local: names are compared without `r#`.
+#[test]
+fn self_assignment_raw() {
+    let fixture = r#"
+//- /main.rs crate:main
+fn main() {
+    let mut r#x = 1;
+    r#x = x;
+}
+"#;
+    assert_eq!(dead(fixture), ["dead_code: useless assignment of variable of type `i32` to itself"]);
+}
+
+/// `Self(a, _)` in an impl of a tuple struct reads the fields it binds, as `S(a, _)` does
+/// (rustc's `variant_of_res` of the pattern's type).
+#[test]
+fn self_tuple_struct_pattern() {
+    let fixture = r#"
+//- /main.rs crate:main
+struct S(i32, i32);
+impl S {
+    fn first(&self) -> i32 {
+        let Self(a, _) = *self;
+        a
+    }
+}
+fn main() {
+    S(1, 2).first();
+}
+"#;
+    assert_eq!(dead(fixture), ["dead_code: field `1` is never read"]);
+}

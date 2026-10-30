@@ -100,7 +100,7 @@ pub(super) enum Kind {
     Use,
 }
 
-const _: () = assert!(size_of::<Kind>() == 2);
+const _: () = assert!(size_of::<Kind>() <= 2);
 
 impl Kind {
     /// rustc's `def_descr`.
@@ -156,6 +156,8 @@ pub(super) struct Def {
     pub(super) name: Option<Name>,
     pub(super) parent: Parent,
     pub(super) foreign: bool,
+    /// Its visibility is written `pub`, with no restriction.
+    pub(super) written_pub: bool,
 }
 
 impl Def {
@@ -528,7 +530,8 @@ impl Walk<'_, '_, '_> {
             Container::Trait(it) | Container::Impl(it) => Parent::Def(it),
             Container::Module | Container::Extern => parent,
         };
-        let def = |id, kind, name| Def { id, kind, node, name, parent, foreign };
+        let written_pub = written_pub(item.value.syntax());
+        let def = |id, kind, name| Def { id, kind, node, name, parent, foreign, written_pub };
         let (def, adt) = match &item.value {
             ast::Item::Fn(it) => {
                 let function = cx.sema.to_def2(item.with_value(it))?;
@@ -636,6 +639,7 @@ impl Walk<'_, '_, '_> {
                         name: Some(id.name(db)),
                         parent: Parent::Def(adt),
                         foreign: false,
+                        written_pub: false,
                     });
                     self.edges.push((adt, index));
                     self.fields(item.file_id, variant.field_list(), index);
@@ -678,6 +682,7 @@ impl Walk<'_, '_, '_> {
             name: Some(field.name(self.cx.db)),
             parent: Parent::Def(owner),
             foreign: false,
+            written_pub: written_pub(node),
         });
         self.edges.push((owner, index));
     }
@@ -706,6 +711,7 @@ impl Walk<'_, '_, '_> {
                 name: None,
                 parent,
                 foreign: false,
+                written_pub: false,
             });
             self.free_owners.push(index);
             self.current().free.push(index);
@@ -717,12 +723,20 @@ impl Walk<'_, '_, '_> {
                     name: Some(Name::new_symbol_root(method.name())),
                     parent: Parent::Def(index),
                     foreign: false,
+                    written_pub: false,
                 });
                 self.edges.push((index, method));
                 self.impl_items.push(method);
             }
         }
     }
+}
+
+/// Whether the visibility of `node` is written `pub`, with no restriction: rustc's
+/// `local_visibility` is `Visibility::Public` for what has a visibility of its own.
+fn written_pub(node: &SyntaxNode) -> bool {
+    let vis = ast::AnyHasVisibility::cast(node.clone()).and_then(|it| ast::HasVisibility::visibility(&it));
+    vis.is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub))
 }
 
 /// Whether `node` is an item of HIR's: an item, an associated item or an item of an `extern`

@@ -32,7 +32,7 @@ use hir_ty::{
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::{is_dyn_method, lookup_impl_const},
-    mir::MirOptLevel,
+    mir::{MirOptLevel, MirOptions},
     next_solver::{
         AliasConst, AliasConstKind, AllocationData, Const, ConstKind, FreeConstAliasId,
         GenericArgs, InherentAssocConstId, TraitAssocConstId, Ty, TyKind,
@@ -54,7 +54,7 @@ use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
 
 use crate::{
-    CALLEE_DOMAIN, Class, MirLevels, SHARE_DOMAIN, ShareDef, ShareInstance, ShareKey, Unshared,
+    BodyOptions, CALLEE_DOMAIN, Class, OptionsSet, SHARE_DOMAIN, ShareDef, ShareInstance, ShareKey, Unshared,
     VALUE_DOMAIN, WALK_DOMAIN, classify, drop, fact::Cx, identity,
 };
 
@@ -104,29 +104,40 @@ pub(crate) fn share(
     db: &dyn HirDatabase,
     instance: ShareInstance,
     env: StoredParamEnvAndCrate,
-    levels: MirLevels,
+    options: BodyOptions,
 ) -> Result<ShareKey, Unshared> {
     let cx = Cx::new(db, &env);
     let mut key = Hasher::new(SHARE_DOMAIN);
-    let bodies = bodies(db, instance.def, levels, &mut key)?;
+    let bodies = bodies(db, instance.def, options, &mut key)?;
     // The code generator reads an instance's const arguments itself (a SIMD lane).
     for konst in instance.args.as_ref().iter().filter_map(|arg| arg.konst()) {
         key.id(&value(&cx, konst)?);
     }
-    for (level, generic) in bodies {
-        let mono = monomorphized(db, generic, &instance.args, &env)
-            .map_err(|error| Unshared::NoMir(format!("monomorphized: {error:?}")))?;
-        let mut walk = Walk {
-            cx: &cx,
-            instance: &instance,
-            levels,
-            generic,
-            mono: &mono,
-            out: Vec::with_capacity(1024),
-            derefs: FxHashSet::default(),
+    // Options that give one body (every options without UB checks give a coroutine its
+    // runtime body) walk it once.
+    let mut walked: SmallVec<[(&MirBody<'_>, ContentId); 4]> = SmallVec::new();
+    for (asked, generic) in bodies {
+        let records = match walked.iter().find(|(body, _)| std::ptr::eq(*body, generic)) {
+            Some(&(_, records)) => records,
+            None => {
+                let mono = monomorphized(db, generic, &instance.args, &env)
+                    .map_err(|error| Unshared::NoMir(format!("monomorphized: {error:?}")))?;
+                let mut walk = Walk {
+                    cx: &cx,
+                    instance: &instance,
+                    options,
+                    generic,
+                    mono: &mono,
+                    out: Hasher::new(WALK_DOMAIN),
+                    derefs: FxHashSet::default(),
+                };
+                walk.body()?;
+                let records = walk.out.finish();
+                walked.push((generic, records));
+                records
+            }
         };
-        walk.body()?;
-        key.update(&[level as u8]).id(&ContentId::of(WALK_DOMAIN, &walk.out));
+        key.update(&[OptionsSet::index(asked) as u8]).id(&records);
     }
     Ok(ShareKey(key.finish()))
 }
@@ -136,26 +147,32 @@ fn share_cycle(
     _: salsa::Id,
     _: ShareInstance,
     _: StoredParamEnvAndCrate,
-    _: MirLevels,
+    _: BodyOptions,
 ) -> Result<ShareKey, Unshared> {
     Err(Unshared::Recursive)
 }
 
-type Bodies<'db> = SmallVec<[(MirOptLevel, &'db MirBody<'db>); 3]>;
+type Bodies<'db> = SmallVec<[(MirOptions, &'db MirBody<'db>); 4]>;
 
-/// The generic bodies the code generator may compile `def` from, one per level, with what
-/// names the body hashed into `key`.
+/// Whether `options` ask for nothing beyond the runtime body: the code generator's
+/// `is_runtime`, which compiles the runtime body itself then.
+fn is_runtime(options: MirOptions) -> bool {
+    options.level == MirOptLevel::Off && !options.ub_checks
+}
+
+/// The generic bodies the code generator may compile `def` from, one per options, as its
+/// `compiled_mir_body` picks them, with what names the body hashed into `key`.
 fn bodies<'db>(
     db: &'db dyn HirDatabase,
     def: ShareDef,
-    levels: MirLevels,
+    options: BodyOptions,
     key: &mut Hasher,
 ) -> Result<Bodies<'db>, Unshared> {
     let no_mir = |error| Unshared::NoMir(format!("{error:?}"));
-    let levels_of = |owner: InferBodyId<'db>| {
+    let options_of = |owner: InferBodyId<'db>| {
         let set =
-            if owner.krate(db).data(db).origin.is_lang() { levels.lang } else { levels.other };
-        if set.is_empty() { Err(Unshared::NoLevels) } else { Ok(set) }
+            if owner.krate(db).data(db).origin.is_lang() { options.lang } else { options.other };
+        if set.is_empty() { Err(Unshared::NoOptions) } else { Ok(set) }
     };
     let mut bodies = Bodies::new();
     match def {
@@ -166,40 +183,42 @@ fn bodies<'db>(
             })?;
             key.update(&[tag::DEF_FN]).id(&item_key(db, item).0).id(&code.0);
             let owner = InferBodyId::DefWithBodyId(func.into());
-            for level in levels_of(owner)?.iter() {
-                let body = match level {
-                    MirOptLevel::Off => db.runtime_mir_body(owner),
-                    level => db.optimized_mir_body(owner, level),
+            for asked in options_of(owner)?.iter() {
+                let body = match is_runtime(asked) {
+                    true => db.runtime_mir_body(owner),
+                    false => db.optimized_mir_body(owner, asked),
                 };
-                bodies.push((level, body.map_err(no_mir)?));
+                bodies.push((asked, body.map_err(no_mir)?));
             }
         }
         ShareDef::Closure(id) => {
             let closure = InternedClosureId::from_id(id);
             let code = closure_code(db, closure).map_err(identity::unhashable(db))?;
             key.update(&[tag::DEF_CLOSURE]).id(&code.0);
-            for level in levels_of(closure.loc(db).owner)?.iter() {
-                let body = match level {
-                    MirOptLevel::Off => db.runtime_mir_body_for_closure(closure),
-                    level => db.optimized_mir_body_for_closure(closure, level),
+            for asked in options_of(closure.loc(db).owner)?.iter() {
+                let body = match is_runtime(asked) {
+                    true => db.runtime_mir_body_for_closure(closure),
+                    false => db.optimized_mir_body_for_closure(closure, asked),
                 };
-                bodies.push((level, body.map_err(no_mir)?));
+                bodies.push((asked, body.map_err(no_mir)?));
             }
         }
-        // A coroutine's body is the runtime body at every level.
-        ShareDef::Coroutine(id) => {
+        // A coroutine's body is the runtime body, with the UB checks where they are asked for.
+        ShareDef::Coroutine(id) | ShareDef::CoroutineByMove(id) => {
+            let by_move = matches!(def, ShareDef::CoroutineByMove(_));
             let coroutine = InternedCoroutineId::from_id(id);
             let code = coroutine_code(db, coroutine).map_err(identity::unhashable(db))?;
-            key.update(&[tag::DEF_COROUTINE]).id(&code.0);
-            let body = db.runtime_mir_body_for_coroutine(coroutine).map_err(no_mir)?;
-            bodies.push((MirOptLevel::Off, body));
-        }
-        ShareDef::CoroutineByMove(id) => {
-            let coroutine = InternedCoroutineId::from_id(id);
-            let code = coroutine_code(db, coroutine).map_err(identity::unhashable(db))?;
-            key.update(&[tag::DEF_COROUTINE_BY_MOVE]).id(&code.0);
-            let body = db.runtime_mir_body_for_coroutine_by_move(coroutine).map_err(no_mir)?;
-            bodies.push((MirOptLevel::Off, body));
+            let what = if by_move { tag::DEF_COROUTINE_BY_MOVE } else { tag::DEF_COROUTINE };
+            key.update(&[what]).id(&code.0);
+            for asked in options_of(coroutine.loc(db).owner)?.iter() {
+                let body = match (asked.ub_checks, by_move) {
+                    (false, false) => db.runtime_mir_body_for_coroutine(coroutine),
+                    (false, true) => db.runtime_mir_body_for_coroutine_by_move(coroutine),
+                    (true, false) => db.optimized_mir_body_for_coroutine(coroutine, asked),
+                    (true, true) => db.optimized_mir_body_for_coroutine_by_move(coroutine, asked),
+                };
+                bodies.push((asked, body.map_err(no_mir)?));
+            }
         }
         ShareDef::DropGlue => return Err(Unshared::Shim("drop glue")),
         ShareDef::CallOnceShim => return Err(Unshared::Shim("`FnOnce::call_once` shim")),
@@ -259,10 +278,11 @@ fn allocation_value(allocation: &AllocationData<'_>) -> Result<ContentId, Unshar
 struct Walk<'a, 'db> {
     cx: &'a Cx<'db>,
     instance: &'a ShareInstance,
-    levels: MirLevels,
+    options: BodyOptions,
     generic: &'a MirBody<'db>,
     mono: &'a MirBody<'db>,
-    out: Vec<u8>,
+    /// The records, hashed as they are made.
+    out: Hasher,
     /// The places of the generic body whose `Deref`s are recorded.
     derefs: FxHashSet<&'a StoredPlace>,
 }
@@ -273,8 +293,7 @@ impl<'a, 'db> Walk<'a, 'db> {
     }
 
     fn record(&mut self, tag: u8, id: ContentId) {
-        self.out.push(tag);
-        self.out.extend_from_slice(&id.0);
+        self.out.update(&[tag]).id(&id);
     }
 
     fn body(&mut self) -> Result<(), Unshared> {
@@ -301,8 +320,9 @@ impl<'a, 'db> Walk<'a, 'db> {
     /// Each promoted constant whose body names a parameter, by its value.
     fn promoted(&mut self) -> Result<(), Unshared> {
         let db = self.db();
-        let owner = self.generic.owner;
-        for &(_, expr) in &self.generic.promoted_locals {
+        let body = self.generic;
+        let owner = body.owner;
+        for &(_, expr) in &body.promoted_locals {
             let Ok(generic) = runtime_promoted_mir_body_query(db, owner, expr) else { continue };
             if !mentions_params(generic) {
                 continue;
@@ -823,7 +843,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             h.update(&[tag::CALLEE_SELF]);
             return Ok(h.finish());
         }
-        match share(db, instance, self.cx.stored.clone(), self.levels) {
+        match share(db, instance, self.cx.stored.clone(), self.options) {
             Ok(key) => h.update(&[tag::CALLEE_SHARED]).id(&key.0),
             Err(Unshared::Recursive) => return Err(Unshared::Recursive),
             Err(_) => h.update(&[tag::CALLEE_ARGS]).id(&identity::args(db, args)?),

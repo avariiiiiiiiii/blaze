@@ -266,20 +266,18 @@ impl<'db> Keeper<'_, 'db> {
         {
             debug.row(0, declared);
         }
-        if let Some((owner, _)) = &compiled.source
+        if let Some(source) = &compiled.source
             && let Some((env, variables)) = &compiled.variables
             && self.debug
             && self.variables
         {
+            let owner = &source.owner;
             let places = &compiled.code.slots;
             let db = self.db;
             let len = compiled.code.bytes.len() as u32;
-            let mut rows: Vec<(u32, MirSpan)> = match &compiled.source {
-                Some((_, spans)) => (compiled.code.lines.iter())
-                    .filter_map(|row| Some((row.offset, *spans.get(row.span as usize)?)))
-                    .collect(),
-                None => Vec::new(),
-            };
+            let mut rows: Vec<(u32, MirSpan)> = (compiled.code.lines.iter())
+                .filter_map(|row| Some((row.offset, *source.spans.get(row.span as usize)?)))
+                .collect();
             blaze_ids::radix::sort_copy_by_key(&mut rows, |row| row.0);
             let scopes = describe_scopes(db, *owner, variables, &rows, len, &mut debug);
             describe_variables(

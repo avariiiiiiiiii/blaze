@@ -317,8 +317,10 @@ impl Kqueue {
             // Told through the channel by the stream, after the changes it heard first.
             Effect::Flush { watch, tag } => match self.watches.get(&watch) {
                 Some(stream) => stream.flush(tag).map_err(|error| {
+                    // alloc: an error path.
                     io::Error::new(error.kind(), format!("flushing the watch: {error}"))
                 }),
+                // alloc: an error path.
                 None => Err(io::Error::other(format!("nothing is watched as {watch:?}"))),
             },
             Effect::Spawn { command, tag } => self.spawn(command, tag),

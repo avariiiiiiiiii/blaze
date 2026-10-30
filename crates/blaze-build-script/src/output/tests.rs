@@ -590,3 +590,42 @@ fn a_value_borrows_the_output_unless_its_out_dir_moved() {
     assert_eq!(moved[2], Directive::LinkSearch(Cow::Owned("/new/out/lib".to_owned())));
     assert!(matches!(&moved[5], Directive::LinkSearch(Cow::Owned(it)) if it == "/new/out/x"));
 }
+
+/// [`read`] of every directive that names no moved `OUT_DIR`, no single bin and no message
+/// it makes allocates nothing: each value is borrowed from what was printed.
+#[test]
+fn read_allocates_nothing() {
+    struct Count(usize);
+    impl<'a> Sink<'a> for Count {
+        fn directive(&mut self, _: Directive<'a>) {
+            self.0 += 1;
+        }
+    }
+    let package = foo("0.5.0", None, lib());
+    let cx = Context {
+        package: &package,
+        out_dir_when_generated: Path::new(OUT),
+        out_dir: Path::new(OUT),
+        nightly_features_allowed: false,
+        rustc_bootstrap: None,
+    };
+    let printed = "cargo:rustc-link-lib=static=foo\n\
+                   cargo:rustc-link-search=native=/p/foo/target/debug/build/foo-1/out/lib\n\
+                   cargo:rustc-cfg=has_foo\n\
+                   cargo:rustc-check-cfg=cfg(has_foo)\n\
+                   cargo:rustc-env=FOO=bar\n\
+                   cargo:rustc-flags=-l z -L /usr/lib\n\
+                   cargo:rustc-link-arg=-Wl,-z,now\n\
+                   cargo:warning=hello\r\n\
+                   not a directive\n\
+                   cargo:rerun-if-changed=build.rs\n\
+                   cargo:rerun-if-env-changed=CC\n\
+                   cargo:include=/p/foo/include";
+    let mut count = Count(0);
+    blaze_alloc_count::assert_at_most(0, "reading a script's output", || {
+        super::read(printed.as_bytes(), &cx, &mut count).unwrap()
+    });
+    assert_eq!(count.0, 12);
+}
+
+mod reference;

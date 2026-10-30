@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     fmt,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -7,9 +8,10 @@ use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
 use salsa::Durability;
 use span::{Edition, TextSize};
+use syntax::TextRange;
 use triomphe::Arc;
 use vfs::{
-    AbsPathBuf, FileId, VfsPath,
+    AbsPathBuf, AnchoredPath, FileId, VfsPath,
     file_set::{FileSet, FileSetConfig},
 };
 
@@ -18,8 +20,17 @@ use crate::{
     CrateType, CrateTypes, CrateWorkspaceData, CratesMap, DependencyBuilder, EditionedFileId, Env,
     FileSourceRootInput, FileText, Files, Nonce, SourceDatabase, SourceRoot, SourceRootId,
     SourceRootInput, TargetKind, ViewChange, ViewError, ViewFile, ViewRoot, all_crates_content,
-    cfg_options_content, install_plane_hooks, run_on_pool, set_all_crates_with_durability,
+    cfg_options_content, install_plane_hooks,
+    reparse::{
+        REPARSED, TextEdit, assert_whole, common_prefix, common_prefix_scalar, common_suffix,
+        common_suffix_scalar,
+    },
+    run_on_pool, set_all_crates_with_durability,
+    target::{Arch, TargetData},
 };
+
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 #[salsa::db]
 struct TestDb {

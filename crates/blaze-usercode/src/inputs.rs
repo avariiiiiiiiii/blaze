@@ -6,18 +6,23 @@
 //! The machine's files are the one thing of user code read outside a view: they are hashed
 //! once per change of what `stat` says of them, in one table every check of the process shares
 //! ([`Files`]), and a file that is there and can't be read is an error naming it, never left
-//! out.
+//! out. A path under a directory the vfs watches ([`blaze_vfs::outside`]) is not even
+//! `stat`ed while the watch has heard nothing under it.
 
 use std::{
     borrow::Cow,
     ffi::{OsStr, OsString},
     fmt, io,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering, fence},
+    },
 };
 
 use blaze_ids::{ContentId, Hasher, Interner, Sharded};
 use blaze_query::{Cancelled, Cx};
+use blaze_vfs::outside::{Cover, Dirs};
 
 use crate::trace::{DIRECTORY, Inputs, listing, os_bytes};
 
@@ -91,11 +96,85 @@ impl Stamp {
 /// The hashes of the machine's files, each under its path and what `stat` said of it when it
 /// was hashed. Append-only: a lookup takes no lock and writes nothing shared, a file is hashed
 /// outside any lock, and an edit adds an entry under its new stamp rather than changing one.
-pub struct Files(Sharded<[u8; 32]>);
+///
+/// Each canonical path's last answer is also kept with the watched directory covering it
+/// ([`blaze_vfs::Cover`]) and the generation read before it was looked at: while the watch
+/// has heard nothing under that directory since, the answer is returned with no syscall.
+pub struct Files {
+    stamped: Sharded<[u8; 32]>,
+    vouched: Sharded<Vouched>,
+    dirs: &'static Dirs,
+}
+
+/// A path's last answer, under a sequence lock: written on a miss (rare, and a writer that
+/// finds another writing skips), read with three loads and a compare.
+struct Vouched {
+    /// `None` for a path that isn't canonical, or that no watched directory covers: each of
+    /// its checks looks at the disk.
+    cover: Option<Cover<'static>>,
+    sequence: AtomicU64,
+    generation: AtomicU64,
+    present: AtomicBool,
+    hash: [AtomicU64; 4],
+}
+
+impl Vouched {
+    fn read(&self) -> Option<(u64, Option<[u8; 32]>)> {
+        let sequence = self.sequence.load(Ordering::Acquire);
+        if sequence & 1 == 1 {
+            return None;
+        }
+        let generation = self.generation.load(Ordering::Relaxed);
+        let present = self.present.load(Ordering::Relaxed);
+        let mut hash = [0; 32];
+        for (at, word) in self.hash.iter().enumerate() {
+            hash[at * 8..at * 8 + 8].copy_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
+        }
+        fence(Ordering::Acquire);
+        (self.sequence.load(Ordering::Relaxed) == sequence).then_some((generation, present.then_some(hash)))
+    }
+
+    fn write(&self, generation: u64, answer: Option<[u8; 32]>) {
+        let sequence = self.sequence.load(Ordering::Relaxed);
+        if sequence & 1 == 1
+            || self.sequence.compare_exchange(sequence, sequence + 1, Ordering::Acquire, Ordering::Relaxed).is_err()
+        {
+            return;
+        }
+        fence(Ordering::Release);
+        self.generation.store(generation, Ordering::Relaxed);
+        self.present.store(answer.is_some(), Ordering::Relaxed);
+        let hash = answer.unwrap_or_default();
+        for (at, word) in self.hash.iter().enumerate() {
+            let mut bytes = [0; 8];
+            bytes.copy_from_slice(&hash[at * 8..at * 8 + 8]);
+            word.store(u64::from_le_bytes(bytes), Ordering::Relaxed);
+        }
+        self.sequence.store(sequence + 2, Ordering::Release);
+    }
+}
+
+/// Whether `path` names itself the way the watch hears it: absolute, with no symlink, `.` or
+/// `..` in it. A missing path is canonical when its parent is. Cold: on a miss only.
+fn canonical(path: &Path, answer: Option<[u8; 32]>) -> bool {
+    let same = |found: PathBuf| found.as_os_str() == path.as_os_str();
+    match answer {
+        Some(_) => std::fs::canonicalize(path).is_ok_and(same),
+        None => match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => std::fs::canonicalize(parent).is_ok_and(|it| same(it.join(name))),
+            _ => false,
+        },
+    }
+}
 
 impl Files {
     pub fn new() -> Files {
-        Files(Sharded::new())
+        Files::watched_by(blaze_vfs::outside::dirs())
+    }
+
+    /// A table whose answers are vouched for by `dirs`' watches.
+    pub fn watched_by(dirs: &'static Dirs) -> Files {
+        Files { stamped: Sharded::new(), vouched: Sharded::new(), dirs }
     }
 
     /// The one table of the process.
@@ -104,39 +183,88 @@ impl Files {
         FILES.get_or_init(Files::new)
     }
 
+    fn path_id(path: &Path) -> ContentId {
+        Hasher::new("blaze v2 disk path 1").part(os_bytes(path.as_os_str())).finish()
+    }
+
     fn key(path: &Path, stamp: &Stamp) -> ContentId {
         Hasher::new("blaze v2 disk stamp 1").part(os_bytes(path.as_os_str())).part(&stamp.bytes()).finish()
     }
 
     fn file(&self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
+        let id = Files::path_id(path);
+        let known = self.vouched.find(&id).map(|it| self.vouched.get(it));
+        if let Some(known) = known
+            && let Some(cover) = known.cover
+            && let Some((generation, answer)) = known.read()
+            && cover.unchanged_since(generation)
+        {
+            return Ok(answer);
+        }
+        let generation = self.dirs.generation();
+        let (answer, settled) = self.look(path)?;
+        if settled {
+            match known {
+                Some(known) => known.write(generation, answer),
+                None => self.vouch(id, path, generation, answer),
+            }
+        }
+        Ok(answer)
+    }
+
+    /// Keeps a first answer for `path`, with the directory to vouch for it if it is canonical:
+    /// its parent is watched from the driver's next round.
+    fn vouch(&self, id: ContentId, path: &Path, generation: u64, answer: Option<[u8; 32]>) {
+        let cover = match canonical(path, answer) {
+            true => {
+                if let Some(parent) = path.parent() {
+                    self.dirs.want(parent);
+                }
+                self.dirs.cover(path)
+            }
+            false => None,
+        };
+        let at = self.vouched.intern(id, || Vouched {
+            cover,
+            sequence: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            present: AtomicBool::new(false),
+            hash: Default::default(),
+        });
+        self.vouched.get(at).write(generation, answer);
+    }
+
+    /// What `path` hashes as on the disk now, and whether that held while it was looked at.
+    fn look(&self, path: &Path) -> Result<(Option<[u8; 32]>, bool), Unreadable> {
         let unreadable = |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
-            Err(error) if missing(&error) => return Ok(None),
+            Err(error) if missing(&error) => return Ok((None, true)),
             Err(error) => return Err(unreadable(error)),
         };
         if meta.is_dir() {
-            return Ok(Some(DIRECTORY));
+            return Ok((Some(DIRECTORY), true));
         }
         if !meta.is_file() {
             // A pipe (the jobserver's), a socket or a device: reading it would take what is in
             // it from whoever it is for, or never end. What comes out of one is no file's
             // contents: the sandbox notes a read of the random devices as `T random`.
-            return Ok(Some(SPECIAL));
+            return Ok((Some(SPECIAL), true));
         }
         let stamp = Stamp::of(&meta);
         let key = Files::key(path, &stamp);
-        if let Some(found) = self.0.find(&key) {
-            return Ok(Some(*self.0.get(found)));
+        if let Some(found) = self.stamped.find(&key) {
+            return Ok((Some(*self.stamped.get(found)), true));
         }
         let file = std::fs::File::open(path).map_err(unreadable)?;
         let hash = hash_reader(file).map_err(unreadable)?;
         // A file changed while it was read is hashed again at its next check.
         let after = std::fs::metadata(path).map(|it| Stamp::of(&it)).ok();
-        if after == Some(stamp) {
-            self.0.intern(key, || hash);
+        let settled = after == Some(stamp);
+        if settled {
+            self.stamped.intern(key, || hash);
         }
-        Ok(Some(hash))
+        Ok((Some(hash), settled))
     }
 }
 
@@ -463,12 +591,58 @@ mod tests {
             workers.into_iter().map(|it| it.join().unwrap()).collect()
         });
         assert!(hashes.iter().all(|it| *it == Some(*blake3::hash(b"one").as_bytes())));
-        assert_eq!(files.0.len(), 1);
+        assert_eq!(files.stamped.len(), 1);
         std::fs::write(&path, b"two, longer").unwrap();
         let mut now = Now { files: &files, env: &one };
         assert_eq!(now.file(&path).unwrap(), Some(*blake3::hash(b"two, longer").as_bytes()));
-        assert_eq!(files.0.len(), 2);
+        assert_eq!(files.stamped.len(), 2);
         assert_eq!(now.env(OsStr::new("X")), Some("1".into()));
         _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_canonical_miss_wants_its_parent_and_nothing_is_vouched_before_the_watch_settles() {
+        let made = std::env::temp_dir().join(format!("blaze-files-vouch-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&made);
+        std::fs::create_dir_all(made.join("sub")).unwrap();
+        let dir = std::fs::canonicalize(&made).unwrap();
+        let path = dir.join("a");
+        std::fs::write(&path, b"one").unwrap();
+        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
+        let files = Files::watched_by(dirs);
+        let mut now = Now { files: &files, env: &Env::default() };
+        assert_eq!(now.file(&path).unwrap(), Some(*blake3::hash(b"one").as_bytes()));
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs.dir(0).path(), dir.as_path());
+        std::fs::write(&path, b"two, longer").unwrap();
+        assert_eq!(now.file(&path).unwrap(), Some(*blake3::hash(b"two, longer").as_bytes()));
+        assert_eq!(now.file(&dir.join("gone")).unwrap(), None);
+        assert_eq!(dirs.len(), 1);
+        let roundabout = dir.join("sub").join("..").join("a");
+        assert_eq!(now.file(&roundabout).unwrap(), Some(*blake3::hash(b"two, longer").as_bytes()));
+        let id = Files::path_id(&roundabout);
+        assert!(files.vouched.get(files.vouched.find(&id).unwrap()).cover.is_none());
+        assert_eq!(dirs.len(), 1);
+        _ = std::fs::remove_dir_all(&made);
+    }
+
+    #[test]
+    fn a_vouched_answer_reads_back_as_written() {
+        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
+        let vouched = Vouched {
+            cover: dirs.cover(Path::new("/nowhere/a")),
+            sequence: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            present: AtomicBool::new(false),
+            hash: Default::default(),
+        };
+        vouched.write(7, Some([3; 32]));
+        assert_eq!(vouched.read(), Some((7, Some([3; 32]))));
+        vouched.write(9, None);
+        assert_eq!(vouched.read(), Some((9, None)));
+        vouched.sequence.store(5, Ordering::Relaxed);
+        assert_eq!(vouched.read(), None);
+        vouched.write(11, Some([1; 32]));
+        assert_eq!(vouched.read(), None);
     }
 }

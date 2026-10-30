@@ -53,6 +53,7 @@ use arrayvec::ArrayVec;
 use base_db::{
     CrateDisplayName, CrateOrigin, LangCrateOrigin, SourceDatabase, TargetKind, all_crates,
 };
+use blaze_hashcons::Interned;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, AssocItemLoc, BuiltinDeriveImplId, CallableDefId, ConstId, ConstParamId,
@@ -91,7 +92,10 @@ use hir_ide::{
         InternedCoroutineId,
     },
     direct_super_traits, known_const_to_ast,
-    layout::{Layout as TyLayout, RustcEnumVariantIdx, RustcFieldIdx, TagEncoding},
+    layout::{
+        InternedLayout, Layout as TyLayout, RustcEnumVariantIdx, RustcFieldIdx, TagEncoding,
+        intern_layout,
+    },
     method_resolution::{self, InherentImpls, MethodResolutionContext},
     mir::interpret_mir,
     mir_pretty::{MirBodyPretty as _, MirEvalErrorPretty as _},
@@ -115,7 +119,6 @@ use syntax::{
     ast::{self, HasName as _, HasVisibility as _},
     format_smolstr,
 };
-use triomphe::Arc;
 
 use crate::db::HirDatabase;
 
@@ -208,7 +211,6 @@ pub use {
     hir_ide::{
         CastError, PointerCast, attach_db, attach_db_allow_change, const_macro,
         consteval::ConstEvalError,
-        diagnostics::UnsafetyReason,
         display::{ClosureStyle, DisplayTarget, HirDisplay, HirDisplayError, HirWrite},
         drop::DropGlue,
         dyn_compatibility::{DynCompatibilityViolation, MethodViolationCode},
@@ -335,6 +337,11 @@ impl Crate {
 
     pub fn target_kind(self, db: &dyn HirDatabase) -> TargetKind {
         self.id.data(db).target_kind
+    }
+
+    /// rustc's `--crate-type`s the crate is built as; empty when the build named none.
+    pub fn crate_types(self, db: &dyn HirDatabase) -> base_db::CrateTypes {
+        self.id.data(db).crate_types
     }
 
     pub fn query_external_importables(
@@ -1193,7 +1200,7 @@ impl EnumVariant {
                 {
                     let lookup = self.id.lookup(db);
                     let rustc_enum_variant_idx = RustcEnumVariantIdx(lookup.index(db));
-                    Arc::new(TyLayout::for_variant(&parent_layout.0, rustc_enum_variant_idx))
+                    intern_layout(TyLayout::for_variant(&parent_layout.0, rustc_enum_variant_idx))
                 },
                 db.target_data_layout(parent_enum.krate(db).into()).unwrap(),
             ),
@@ -1292,6 +1299,13 @@ impl Adt {
 
     pub fn as_enum(&self) -> Option<Enum> {
         if let Self::Enum(v) = self { Some(*v) } else { None }
+    }
+
+    /// The generic parameters its variance leaves bivariant and no projection of its where
+    /// clauses constrains, in declaration order: each one rustc's E0392. Empty when a field's
+    /// type has an error.
+    pub fn unused_params(self, db: &dyn HirDatabase) -> Vec<GenericParam> {
+        hir_ide::adt_unused_params(db, self.into()).into_iter().map(GenericParam::from).collect()
     }
 }
 
@@ -1505,8 +1519,9 @@ impl DefWithBody {
         self.id().into_iter().flat_map(move |def_id| {
             let infer = InferenceResult::of(db, def_id);
             let def_id = def_id.generic_def(db);
+            let interner = DbInterner::new_no_crate(db);
 
-            infer.expression_types().map(move |(_, ty)| Type::new(db, def_id, ty))
+            infer.expression_types().map(move |(_, ty)| Type::new_in(interner, def_id, ty))
         })
     }
 
@@ -1515,8 +1530,9 @@ impl DefWithBody {
         self.id().into_iter().flat_map(move |def_id| {
             let infer = InferenceResult::of(db, def_id);
             let def_id = def_id.generic_def(db);
+            let interner = DbInterner::new_no_crate(db);
 
-            infer.pattern_types().map(move |(_, ty)| Type::new(db, def_id, ty))
+            infer.pattern_types().map(move |(_, ty)| Type::new_in(interner, def_id, ty))
         })
     }
 
@@ -1525,8 +1541,9 @@ impl DefWithBody {
         self.id().into_iter().flat_map(move |def_id| {
             let infer = InferenceResult::of(db, def_id);
             let def_id = def_id.generic_def(db);
+            let interner = DbInterner::new_no_crate(db);
 
-            infer.binding_types().map(move |(_, ty)| Type::new(db, def_id, ty))
+            infer.binding_types().map(move |(_, ty)| Type::new_in(interner, def_id, ty))
         })
     }
 }
@@ -3174,6 +3191,24 @@ impl GenericDef {
             .collect()
     }
 
+    /// Every predicate of its own where clauses and parameter bounds, not its parent's (rustc's
+    /// `explicit_predicates_of`), in the order written.
+    pub fn where_predicates(self, db: &dyn HirDatabase) -> Vec<WherePredicate<'_>> {
+        let Some(id) = self.id() else {
+            return Vec::new();
+        };
+        let interner = DbInterner::new_no_crate(db);
+        let owner = TypeOwnerId::GenericDefId(id);
+        GenericPredicates::query_own_explicit(db, id)
+            .iter_identity()
+            .map(|clause| {
+                let clause = rustc_type_ir::set_aliases_to_non_rigid(interner, clause.skip_norm_wip())
+                    .skip_normalization();
+                WherePredicate { clause, owner }
+            })
+            .collect()
+    }
+
     fn id(self) -> Option<GenericDefId> {
         Some(match self {
             GenericDef::Function(it) => match it.id {
@@ -4122,6 +4157,17 @@ impl<'db> TraitRef<'db> {
             .and_then(|arg| arg.ty())
             .map(|ty| Type { owner: self.owner, ty: EarlyBinder::bind_no_rigid_aliases(ty) })
     }
+
+    /// The trait ref as the front end has it, for rustc's printing outside `hir`.
+    pub fn to_next_solver(&self) -> hir_ide::next_solver::TraitRef<'db> {
+        self.trait_ref
+    }
+
+    /// A type of the same owner as the trait ref. `ty` holds no rigid aliases, as
+    /// [`Type::derived_from_next_solver`]'s.
+    pub fn derived_from_next_solver(&self, ty: Ty<'db>) -> Type<'db> {
+        Type { owner: self.owner, ty: EarlyBinder::bind_no_rigid_aliases(ty) }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -4585,8 +4631,13 @@ impl<'db> Eq for Type<'db> {}
 
 impl<'db> Type<'db> {
     fn new(db: &'db dyn HirDatabase, owner: GenericDefId, ty: Ty<'db>) -> Self {
-        let ty = EarlyBinder::bind(DbInterner::new_no_crate(db), ty);
-        Type { owner: TypeOwnerId::GenericDefId(owner), ty }
+        Self::new_in(DbInterner::new_no_crate(db), owner, ty)
+    }
+
+    /// [`Type::new`] with the caller's interner, for loops over many types: making an interner
+    /// costs more than binding a type with no rigid aliases (one flags load).
+    fn new_in(interner: DbInterner<'db>, owner: GenericDefId, ty: Ty<'db>) -> Self {
+        Type { owner: TypeOwnerId::GenericDefId(owner), ty: EarlyBinder::bind(interner, ty) }
     }
 
     fn new_body(db: &'db dyn HirDatabase, owner: ExpressionStoreOwnerId, ty: Ty<'db>) -> Self {
@@ -4934,12 +4985,10 @@ impl<'db> Type<'db> {
             Mutability::Shared => hir_ide::next_solver::Mutability::Not,
             Mutability::Mut => hir_ide::next_solver::Mutability::Mut,
         };
-        self.derived(Ty::new_ref(
+        self.derived_with(
             interner,
-            Region::error(interner),
-            self.ty.skip_binder(),
-            ty_mutability,
-        ))
+            Ty::new_ref(interner, Region::error(interner), self.ty.skip_binder(), ty_mutability),
+        )
     }
 
     pub fn is_slice(&self) -> bool {
@@ -5225,10 +5274,12 @@ impl<'db> Type<'db> {
                 let env = self.param_env(db);
                 let (fn_trait, sig) =
                     hir_ide::callable_sig_from_fn_trait(self.ty.skip_binder(), env, db)?;
+                let erased = interner.instantiate_bound_regions_with_erased(sig);
                 return Some(Callable {
                     ty: self.clone(),
                     sig,
-                    erased: interner.instantiate_bound_regions_with_erased(sig),
+                    erased: rustc_type_ir::set_aliases_to_non_rigid(interner, erased)
+                        .skip_normalization(),
                     callee: Callee::FnImpl(fn_trait),
                     is_bound_method: false,
                 });
@@ -5236,10 +5287,11 @@ impl<'db> Type<'db> {
         };
 
         let sig = self.ty.skip_binder().callable_sig(interner)?;
+        let erased = interner.instantiate_bound_regions_with_erased(sig);
         Some(Callable {
             ty: self.clone(),
             sig,
-            erased: interner.instantiate_bound_regions_with_erased(sig),
+            erased: rustc_type_ir::set_aliases_to_non_rigid(interner, erased).skip_normalization(),
             callee,
             is_bound_method: false,
         })
@@ -5336,7 +5388,32 @@ impl<'db> Type<'db> {
             .map(|(local_id, field)| {
                 let def = Field { parent: variant_id.into(), id: local_id };
                 let ty = field.ty().instantiate(interner, substs).skip_norm_wip();
-                (def, self.derived(ty))
+                (def, self.derived_with(interner, ty))
+            })
+            .collect()
+    }
+
+    /// [`Type::fields`] of `variant` of this enum type, its fields typed with this type's
+    /// arguments. Empty when this is not the enum `variant` belongs to.
+    pub fn variant_fields(
+        &self,
+        db: &'db dyn HirDatabase,
+        variant: EnumVariant,
+    ) -> Vec<(Field, Self)> {
+        let interner = DbInterner::new_no_crate(db);
+        let TyKind::Adt(adt_def, substs) = self.ty.skip_binder().kind() else {
+            return Vec::new();
+        };
+        if adt_def.def_id() != AdtId::EnumId(variant.id.lookup(db).parent) {
+            return Vec::new();
+        }
+        let variant_id = hir_def::VariantId::EnumVariantId(variant.id);
+        db.field_types(variant_id)
+            .iter()
+            .map(|(local_id, field)| {
+                let def = Field { parent: variant_id.into(), id: local_id };
+                let ty = field.ty().instantiate(interner, substs).skip_norm_wip();
+                (def, self.derived_with(interner, ty))
             })
             .collect()
     }
@@ -5354,6 +5431,22 @@ impl<'db> Type<'db> {
             try_const_usize(db, len).map(|it| (self.derived(ty), it as usize))
         } else {
             None
+        }
+    }
+
+    /// The element type of `[T; N]`, whatever `N` is (a parameter, a constant not evaluated).
+    pub fn as_array_element(&self, _db: &'db dyn HirDatabase) -> Option<Self> {
+        match self.ty.skip_binder().kind() {
+            TyKind::Array(ty, _) => Some(self.derived(ty)),
+            _ => None,
+        }
+    }
+
+    /// The `extern { type T; }` this type is.
+    pub fn as_foreign(&self, _db: &'db dyn HirDatabase) -> Option<TypeAlias> {
+        match self.ty.skip_binder().kind() {
+            TyKind::Foreign(def) => Some(TypeAlias { id: def.0 }),
+            _ => None,
         }
     }
 
@@ -5375,7 +5468,8 @@ impl<'db> Type<'db> {
         &self,
         db: &'db dyn HirDatabase,
     ) -> impl Iterator<Item = Type<'db>> + use<'_, 'db> {
-        self.autoderef_(db).map(move |ty| self.derived(ty))
+        let interner = DbInterner::new_no_crate(db);
+        self.autoderef_(db).map(move |ty| self.derived_with(interner, ty))
     }
 
     fn autoderef_(&self, db: &'db dyn HirDatabase) -> impl Iterator<Item = Ty<'db>> {
@@ -5844,7 +5938,7 @@ impl<'db> Type<'db> {
     }
 
     pub fn as_associated_type_parent_trait(&self, db: &'db dyn HirDatabase) -> Option<Trait> {
-        let TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { def_id }, .. }) =
+        let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id }, .. }) =
             self.ty.skip_binder().kind()
         else {
             return None;
@@ -5855,8 +5949,25 @@ impl<'db> Type<'db> {
         }
     }
 
+    /// A type within this one, which holds no rigid aliases as this one holds none.
     fn derived(&self, ty: Ty<'db>) -> Self {
-        Type { owner: self.owner, ty: EarlyBinder::bind(ty) }
+        Type { owner: self.owner, ty: EarlyBinder::bind_no_rigid_aliases(ty) }
+    }
+
+    /// The type as the front end has it, for rustc's printing and checks outside `hir`.
+    pub fn to_next_solver(&self) -> Ty<'db> {
+        self.ty.skip_binder()
+    }
+
+    /// A type of the same owner as `self`. `ty` holds no rigid aliases, as no type `hir` hands
+    /// out does and no type built from them without normalizing.
+    pub fn derived_from_next_solver(&self, ty: Ty<'db>) -> Type<'db> {
+        self.derived(ty)
+    }
+
+    /// A type computed from this one, with this one's generics.
+    fn derived_with(&self, interner: DbInterner<'db>, ty: Ty<'db>) -> Self {
+        Type { owner: self.owner, ty: EarlyBinder::bind(interner, ty) }
     }
 
     /// Visits every type, including generic arguments, in this type. `callback` is called with type
@@ -5864,6 +5975,7 @@ impl<'db> Type<'db> {
     pub fn walk(&self, db: &'db dyn HirDatabase, callback: impl FnMut(Type<'db>)) {
         struct Visitor<'db, F> {
             db: &'db dyn HirDatabase,
+            interner: DbInterner<'db>,
             owner: TypeOwnerId,
             callback: F,
             visited: FxHashSet<Ty<'db>>,
@@ -5879,7 +5991,8 @@ impl<'db> Type<'db> {
                     return;
                 }
 
-                (self.callback)(Type { owner: self.owner, ty: EarlyBinder::bind(ty) });
+                let bound = EarlyBinder::bind(self.interner, ty);
+                (self.callback)(Type { owner: self.owner, ty: bound });
 
                 if let Some(bounds) = ty.impl_trait_bounds(self.db) {
                     bounds.visit_with(self);
@@ -5889,8 +6002,13 @@ impl<'db> Type<'db> {
             }
         }
 
-        let mut visitor =
-            Visitor { db, owner: self.owner, callback, visited: FxHashSet::default() };
+        let mut visitor = Visitor {
+            db,
+            interner: DbInterner::new_no_crate(db),
+            owner: self.owner,
+            callback,
+            visited: FxHashSet::default(),
+        };
         self.ty.skip_binder().visit_with(&mut visitor);
     }
     /// Check if type unifies with another type.
@@ -5989,7 +6107,8 @@ impl InlineAsmOperand {
 pub struct Callable<'db> {
     ty: Type<'db>,
     sig: PolyFnSig<'db>,
-    /// `sig` with its bound regions erased, as `params` and `return_type` give it.
+    /// `sig` with its bound regions erased, as `params` and `return_type` give it. Holds no rigid
+    /// aliases, as [`Type::derived`] needs.
     erased: FnSig<'db>,
     callee: Callee<'db>,
     /// Whether this is a method that was called with method call syntax.
@@ -6085,7 +6204,7 @@ impl<'db> Callable<'db> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Layout<'db>(Arc<TyLayout>, &'db TargetDataLayout);
+pub struct Layout<'db>(Interned<'static, InternedLayout>, &'db TargetDataLayout);
 
 impl<'db> Layout<'db> {
     pub fn size(&self) -> u64 {
@@ -6348,6 +6467,57 @@ impl<'db> TraitClause<'db> {
 
     pub fn trait_ref(&self) -> TraitRef<'db> {
         TraitRef { owner: self.owner, trait_ref: self.inner.trait_ref }
+    }
+
+    /// The clause as the front end has it, for rustc's printing outside `hir`.
+    pub fn to_next_solver(&self) -> hir_ide::next_solver::TraitClause<'db> {
+        self.inner
+    }
+}
+
+/// One predicate of an item's own where clauses and parameter bounds, as rustc's
+/// `explicit_predicates_of` lists them: `T: Trait`, `<T as Trait>::A == U`, `T: 'a`, ...
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WherePredicate<'db> {
+    /// Holds no rigid aliases, like [`TraitRef`]'s.
+    clause: hir_ide::next_solver::Clause<'db>,
+    owner: TypeOwnerId,
+}
+
+impl<'db> WherePredicate<'db> {
+    /// The trait bound it is, with its bounded type as the trait ref's self type.
+    pub fn as_trait(&self) -> Option<TraitClause<'db>> {
+        match self.clause.kind().skip_binder() {
+            ClauseKind::Trait(inner) => Some(TraitClause { inner, owner: self.owner }),
+            _ => None,
+        }
+    }
+
+    /// The types the predicate names, outermost only, in order: the bounded type and the
+    /// bound's arguments, a projection's arguments and its value, an outlived type, a const
+    /// argument's type. A type under `for<'a>` keeps its bound regions.
+    pub fn types(&self) -> Vec<Type<'db>> {
+        struct Outermost<'db> {
+            out: Vec<Ty<'db>>,
+        }
+        impl<'db> TypeVisitor<DbInterner<'db>> for Outermost<'db> {
+            type Result = ();
+            fn visit_ty(&mut self, ty: Ty<'db>) {
+                self.out.push(ty);
+            }
+        }
+        let mut visitor = Outermost { out: Vec::new() };
+        self.clause.visit_with(&mut visitor);
+        visitor
+            .out
+            .into_iter()
+            .map(|ty| Type { owner: self.owner, ty: EarlyBinder::bind_no_rigid_aliases(ty) })
+            .collect()
+    }
+
+    /// The predicate as the front end has it, for rustc's printing outside `hir`.
+    pub fn to_next_solver(&self) -> hir_ide::next_solver::Clause<'db> {
+        self.clause
     }
 }
 

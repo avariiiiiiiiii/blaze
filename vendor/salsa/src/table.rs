@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
-use crate::table::memo::{MemoTableTypes, MemoTableWithTypes, MemoTableWithTypesMut};
+use crate::table::memo::{MemoColumns, MemoTableTypes, MemoTableWithTypes, MemoTableWithTypesMut};
 use crate::zalsa::MemoIngredientIndex;
 use crate::{Id, IngredientIndex, Revision};
 
@@ -136,6 +136,9 @@ struct Page {
     /// The type id of what is stored as entries in data.
     // FIXME: Move this into SlotVTable once const stable
     slot_type_id: TypeId,
+
+    /// `memo_types`' columns, read by memo lookups from this line instead of through the `Arc`.
+    memo_columns: MemoColumns,
 
     memo_types: Arc<MemoTableTypes>,
 }
@@ -349,8 +352,8 @@ impl Table {
         // SAFETY: The caller is required to pass the `current_revision`.
         let memos = unsafe { &*T::memos(slot, current_revision) };
 
-        // SAFETY: The `Page` keeps the correct memo types.
-        unsafe { page.0.memo_types.attach_memos(memos) }
+        // SAFETY: The `Page` keeps the correct memo types, alive and frozen by its `Arc`.
+        unsafe { page.0.attach_memos(memos) }
     }
 
     /// Get the memo table associated with `id`.
@@ -367,8 +370,8 @@ impl Table {
         let page = &self.pages[page.0];
         // SAFETY: We supply a proper slot pointer and the caller is required to pass the `current_revision`.
         let memos = unsafe { &*(page.slot_vtable.memos)(page.get(slot), current_revision) };
-        // SAFETY: The `Page` keeps the correct memo types.
-        unsafe { page.memo_types.attach_memos(memos) }
+        // SAFETY: The `Page` keeps the correct memo types, alive and frozen by its `Arc`.
+        unsafe { page.attach_memos(memos) }
     }
 
     /// Get the memo table without validating or locking its slot.
@@ -382,8 +385,8 @@ impl Table {
         let page = &self.pages[page.0];
         // SAFETY: `Page::get` checks initialization, and the caller prevents reuse and destruction.
         let memos = unsafe { &*(page.slot_vtable.memos_unchecked)(page.get(slot)) };
-        // SAFETY: The `Page` keeps the correct memo types.
-        unsafe { page.memo_types.attach_memos(memos) }
+        // SAFETY: The `Page` keeps the correct memo types, alive and frozen by its `Arc`.
+        unsafe { page.attach_memos(memos) }
     }
 
     /// Get the memo table associated with `id`
@@ -567,6 +570,24 @@ impl<'db, T: Slot> PageView<'db, T> {
 }
 
 impl Page {
+    /// # Safety
+    ///
+    /// `memos` belongs to a slot of this page.
+    #[inline]
+    unsafe fn attach_memos<'a>(&'a self, memos: &'a MemoTable) -> MemoTableWithTypes<'a> {
+        // Checks in debug builds that the row was handed out by these types.
+        #[cfg(debug_assertions)]
+        // SAFETY: Our contract.
+        let _ = unsafe { self.memo_types.attach_memos(memos) };
+        debug_assert!(std::ptr::eq(
+            self.memo_columns.as_ptr(),
+            self.memo_types.columns().as_ptr()
+        ));
+        // SAFETY: `memo_columns` came from `memo_types`, which this page keeps alive; it can't
+        // change while shared (`Arc::get_mut`), and `memos` is of this page (our contract).
+        unsafe { self.memo_columns.attach(memos) }
+    }
+
     #[inline]
     fn new<T: Slot>(ingredient: IngredientIndex, memo_types: Arc<MemoTableTypes>) -> Self {
         #[cfg(not(feature = "shuttle"))]
@@ -588,6 +609,7 @@ impl Page {
 
         Self {
             ingredient,
+            memo_columns: memo_types.columns(),
             memo_types,
             slot_vtable: SlotVTable::of::<T>(),
             slot_type_id: TypeId::of::<T>(),

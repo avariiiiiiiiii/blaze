@@ -98,7 +98,7 @@ fn every_frame_round_trips() {
         let bytes = frame.to_bytes();
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
         assert_eq!(len, bytes.len() - 4, "{frame:?}");
-        assert_eq!(Frame::decode(&bytes[4..]), Ok(frame.clone()));
+        assert_eq!(Frame::decode(&bytes[4..]).as_ref(), Ok(&frame));
         let view = View::decode(&bytes[4..]).unwrap();
         assert_eq!(view.to_frame(), frame);
         if let (View::Hello { tests, .. }, Frame::Hello { tests: names, .. }) = (view, &frame) {
@@ -358,6 +358,19 @@ fn a_region_reads_as_its_bytes_one_by_one() {
         let Ok(Frame::Ended { executed, .. }) = Frame::decode(&out[4..]) else { panic!("{slots}") };
         assert_eq!(executed, Executed::Hits { slots, hits: expected });
     }
+    // Every slot of every count past two groups of four words, alone and with the one after
+    // the last set: the groups, the words after the last group and the masked last word.
+    for slots in 0..=72u32 {
+        for at in 0..slots {
+            let mut bytes = region(slots, &[], slots);
+            bytes[HEADER + at as usize] = 1;
+            if let Some(past) = bytes.get_mut(HEADER + slots as usize) {
+                *past = 1;
+            }
+            assert_eq!(read(&bytes, slots, Ok(()), &mut hits), Ok(slots));
+            assert_eq!(Hits::of_bytes(&hits).unwrap().to_vec(), [at], "{slots} slots");
+        }
+    }
     // Every byte of every value, alone in its word.
     for at in 0..8u32 {
         for value in 1..=255u8 {
@@ -378,6 +391,10 @@ fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
         assert!(opened.starts_with("pub mod fork_server {"));
         assert!(text.contains("pub const SOCKET: &str = \"__BLAZE_FORK_SERVER\";"));
         assert!(text.contains("pub const VERSION: u32 = 2;"));
+        // Both kinds of record take a region back for the next test.
+        assert!(text.contains("pub fn map(&mut self) -> Result<Region, String>"));
+        assert!(text.contains("pub fn give(&mut self, "));
+        assert!(text.contains("exec.give(child.region, &hits, read.is_ok());"));
         assert!(text.contains("pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: ::std::ffi::OsString) -> !"));
         // Nothing of blaze is named in what the tested crate compiles but the runtime's
         // exports, and those only with slots.

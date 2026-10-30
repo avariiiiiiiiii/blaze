@@ -638,9 +638,11 @@ impl Watching {
         let mut tree = crate::watch::Tree::new(root, dir, false)?;
         let (stop, wake) = (eventfd()?, eventfd()?);
         let (stop_fd, wake_fd) = (stop.as_raw_fd(), wake.as_raw_fd());
-        let flushes = Arc::new(std::sync::Mutex::new(Some(Vec::new())));
-        let asked = flushes.clone();
+        // alloc: setup, once per watch.
+        let flushes = Arc::new(std::sync::Mutex::new(Some(Vec::with_capacity(4))));
+        let asked = flushes.clone(); // clone: setup, the one handle the watch's thread keeps.
         let thread = std::thread::Builder::new().name("blaze-watch".into()).spawn(move || {
+            // alloc: setup, the watch's one buffer for its life.
             let mut buffer = vec![0u8; crate::watch::BUFFER];
             let end = watch_thread(&mut tree, &mut buffer, tag, &finished, &asked, [stop_fd, wake_fd]);
             // Flushes asked for and not taken fail before the end, and none is taken after.
@@ -695,7 +697,8 @@ fn watch_thread(
     asked: &std::sync::Mutex<Option<Vec<Tag>>>,
     [stop, wake]: [std::os::fd::RawFd; 2],
 ) -> Option<Done> {
-    let mut taken = Vec::new();
+    // alloc: setup, once per watch, at the size a few flushes at once need.
+    let mut taken = Vec::with_capacity(4);
     loop {
         let mut fds = [
             libc::pollfd { fd: tree.raw(), events: libc::POLLIN, revents: 0 },
@@ -714,14 +717,12 @@ fn watch_thread(
             let mut count = 0u64;
             // SAFETY: eight bytes from an eventfd, which resets it.
             unsafe { libc::read(wake, (&raw mut count).cast(), 8) };
-            taken.extend(
-                asked
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .as_mut()
-                    .map(std::mem::take)
-                    .unwrap_or_default(),
-            );
+            // Drained, not taken: both lists keep their room, so a flush allocates nothing.
+            if let Some(asked) =
+                asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut()
+            {
+                taken.extend(asked.drain(..));
+            }
             let mut gone = false;
             let drained = tree.drain(buffer, |done| {
                 gone |= finished.send(Completion { tag, done }).is_err();
@@ -732,6 +733,7 @@ fn watch_thread(
             for flush in taken.drain(..) {
                 let done = match &drained {
                     Ok(()) => Done::Flushed,
+                    // alloc: an error path.
                     Err(error) => Done::Failed(IoError(format!("flushing the watch: {error}"))),
                 };
                 if finished.send(Completion { tag: flush, done }).is_err() {
@@ -813,8 +815,9 @@ impl Watching {
     fn flush(&self, tag: Tag, finished: &Sender<Completion>) {
         let stream = self.stream.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let failed = match stream.as_ref() {
+            // alloc: an error path.
             Some(stream) => stream.flush(tag).err().map(|error| format!("flushing the watch: {error}")),
-            None => Some("the watch ended before the flush".to_owned()),
+            None => Some("the watch ended before the flush".to_owned()), // alloc: an error path.
         };
         if let Some(why) = failed {
             _ = finished.send(Completion { tag, done: Done::Failed(IoError(why)) });
@@ -867,11 +870,13 @@ impl Watching {
 /// Why a flush of a watch not in flight fails.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn no_watch(watch: Tag) -> String {
+    // alloc: an error path.
     format!("nothing is watched as {watch:?}")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn no_watch(watch: Tag) -> String {
+    // alloc: an error path.
     format!(
         "nothing is watched as {watch:?}: watching files, and so flushing a watch, is built on \
          Linux (inotify, fanotify) and macOS (FSEvents) only"

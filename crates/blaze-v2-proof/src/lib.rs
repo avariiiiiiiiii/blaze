@@ -20,6 +20,7 @@
 //! - [`Rng`] and [`sample`]: the seeded choice of what to check when not everything is.
 //! - [`bytes`]: where two outputs first differ, by SIMD chosen at run time.
 //! - [`columns`]: the exact round trip every column encoding must make.
+//! - [`nameres`]: the cases for name resolution and the impl buckets, per fixture slot.
 //!
 //! A trace of nushell has millions of results and tens of millions of edges, so it is columns
 //! over `u32` indices (docs/v2/plan/design/data.md): keys sorted once, flags as bitsets, edges
@@ -29,6 +30,7 @@
 
 pub mod bytes;
 pub mod columns;
+pub mod nameres;
 
 use std::collections::BTreeMap;
 

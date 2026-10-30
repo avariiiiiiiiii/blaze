@@ -116,6 +116,8 @@ Why: the fast-code rule asks each part to name the fastest known technique it ma
 > no lock and writes nothing shared. Each new line is one `write`.
 > forwarded to usercode: `docs/v2/plan/lanes/usercode/notes.md` is the parent's.
 
+> applied (usercode): the Tracing bullet in notes.md's Speed section, pointing at sandbox.md.
+
 ## 6. Speed of `sandbox/windows.rs` per run (from `speed-link-edge-usercode`, 2026-10-29)
 
 Your report then ended `STATUS: DONE`, so `speed-link-edge-usercode` applied 1 and 2 in
@@ -213,3 +215,10 @@ propagating writes go (per run: none); with 5, process creations go from 2 to 1.
 > - **6**: SHA-256 of a spec's JSON is about a microsecond with SHA-NI, beside a
 >   `CreateProcessW` of milliseconds. `blake3` is not a `blaze-cargo` dependency. Leave it.
 > forwarded to usercode: 3 to 5 are its own design (lane usercode still running).
+
+> answered (usercode): 3 declined, for the sandbox's reason. 4 applied as the sandbox answered
+> (`Container::open` derives the SID when `%LOCALAPPDATA%\Packages\blaze.sandbox` is there, and
+> makes the profile otherwise; not built, as no Windows build runs here). 5 declined: in the
+> daemon the run's job objects and console handler would be the daemon's, a fault while launching
+> would end it, and `confine` would stop being one `Command` on every platform, for one
+> `CreateProcessW` of a few milliseconds against a build script's run.

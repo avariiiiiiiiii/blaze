@@ -390,7 +390,48 @@ const _: () = {
         assert!(PAT_WORDS[i] <= 5);
         i += 1;
     }
+    let mut i = 0;
+    while i < StatementKind::ALL.len() {
+        assert!(StatementKind::ALL[i] as usize == i);
+        i += 1;
+    }
 };
+
+/// The bits of a `let`'s head word below its pattern ([`let_words`]).
+const LET_SUPER: u32 = 1 << 0;
+const LET_TYPE: u32 = 1 << 1;
+const LET_INIT: u32 = 1 << 2;
+const LET_ELSE: u32 = 1 << 3;
+pub(crate) const LET_BITS: u32 = 4;
+
+/// A `let`'s words in `extra`: its head and the ids it has, and how many of the four it uses.
+fn let_words(
+    pat: PatId,
+    type_ref: Option<TypeRefId>,
+    initializer: Option<ExprId>,
+    else_branch: Option<ExprId>,
+    is_super: bool,
+) -> ([u32; LET_WORDS], usize) {
+    let mut words = [0; LET_WORDS];
+    let (mut flags, mut count) = (is_super as u32, 1);
+    let optional =
+        [(LET_TYPE, type_ref.map(raw)), (LET_INIT, initializer.map(raw)), (LET_ELSE, else_branch.map(raw))];
+    for (flag, id) in optional {
+        if let Some(id) = id {
+            flags |= flag;
+            words[count] = id;
+            count += 1;
+        }
+    }
+    words[0] = shl(raw(pat), LET_BITS) | flags;
+    (words, count)
+}
+
+/// The words a `let` whose head is `head` takes in `extra`.
+#[inline]
+fn let_len(head: u32) -> usize {
+    1 + (head & (LET_TYPE | LET_INIT | LET_ELSE)).count_ones() as usize
+}
 
 pub(crate) type Checked<T = ()> = Result<T, &'static str>;
 
@@ -399,7 +440,9 @@ const PAT_ID: &str = "a pattern id past its arena";
 const EXTRA: &str = "a node's words past the extra column";
 const EXPR_LIST: &str = "an expression list past its array";
 const PAT_LIST: &str = "a pattern list past its array";
-const STATEMENTS: &str = "a statement list past its array";
+const STATEMENTS: &str = "a block's statements past the statement rows";
+const STATEMENT_ROW: &str = "a statement row past its columns";
+const MACRO_DEF: &str = "a macro definition index past its table";
 const ARMS: &str = "a match arm list past its array";
 const RECORD_FIELDS: &str = "a record field list past its array";
 const FIELD_PATS: &str = "a field pattern list past its array";
@@ -615,8 +658,78 @@ impl<V: ColumnVec> HirColumns<V> {
     }
 
     #[inline]
+    pub(crate) fn statement_count(&self) -> usize {
+        self.stmt_kind.len()
+    }
+
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
-        self.expr_kind.is_empty() && self.pat_kind.is_empty()
+        self.expr_kind.is_empty() && self.pat_kind.is_empty() && self.stmt_kind.is_empty()
+    }
+
+    /// The statement in row `at`, as [`HirColumns::expr`] decodes an expression.
+    #[inline]
+    pub(crate) fn statement(&self, at: u32) -> Statement<'_> {
+        match self.decode_statement(at) {
+            Ok(statement) => statement,
+            Err(what) => bad_store(what, at),
+        }
+    }
+
+    /// The `len` statement rows from `start` on.
+    #[inline]
+    pub(crate) fn statements(&self, start: u32, len: u32) -> Checked<Statements<'_>> {
+        let fits = start.checked_add(len).is_some_and(|end| end as usize <= self.stmt_kind.len());
+        match fits {
+            true => Ok(Statements { rows: V::rows(self), start, len }),
+            false => Err(STATEMENTS),
+        }
+    }
+
+    /// The statement rows from `start` to the last: what lowering pushed onto its stack since
+    /// a mark.
+    #[inline]
+    pub(crate) fn statements_since(&self, start: u32) -> Statements<'_> {
+        let end = len(self.stmt_kind.len());
+        assert!(start <= end, "statements since a row past the last");
+        Statements { rows: V::rows(self), start, len: end - start }
+    }
+
+    #[inline]
+    fn decode_statement(&self, at: u32) -> Checked<Statement<'_>> {
+        let row = at as usize;
+        let (Some(&kind), Some(&d)) = (self.stmt_kind.get(row), self.stmt_data.get(row)) else {
+            return Err(STATEMENT_ROW);
+        };
+        let kind = *StatementKind::ALL.get(kind as usize).ok_or("a statement kind out of range")?;
+        Ok(match kind {
+            StatementKind::Let => {
+                let extra: &[u32] = &self.extra;
+                let head = *extra.get(d as usize).ok_or(EXTRA)?;
+                let start = d as usize + 1;
+                let words = (start.checked_add(let_len(head) - 1))
+                    .and_then(|end| extra.get(start..end))
+                    .ok_or(EXTRA)?;
+                let mut words = words.iter().copied();
+                let mut next = |flag: u32| if head & flag == 0 { None } else { words.next() };
+                let type_ref = next(LET_TYPE).map(idx);
+                let initializer = next(LET_INIT).map(idx);
+                let else_branch = next(LET_ELSE).map(idx);
+                Statement::Let {
+                    pat: idx(head >> LET_BITS),
+                    type_ref,
+                    initializer,
+                    else_branch,
+                    is_super: head & LET_SUPER != 0,
+                }
+            }
+            StatementKind::Expr => Statement::Expr { expr: idx(d >> 1), has_semi: d & 1 == 1 },
+            StatementKind::MacroDef => {
+                Statement::Item(Item::MacroDef(entry(&self.macro_defs, d, MACRO_DEF)?))
+            }
+            StatementKind::Item if d == 0 => Statement::Item(Item::Other),
+            StatementKind::Item => return Err("an item statement's data word that is not 0"),
+        })
     }
 
     /// The expression `id`. A store is checked when it is made or read ([`HirColumns::check`]),
@@ -683,7 +796,7 @@ impl<V: ColumnVec> HirColumns<V> {
                 let [low, high, start, count, tail, label] = self.node::<6>(d)?;
                 Expr::Block {
                     id: block(low, high)?,
-                    statements: list(&self.statements, start, count, STATEMENTS)?,
+                    statements: self.statements(start, count)?,
                     tail: unopt(tail),
                     label: unopt(label >> 1),
                     unsafe_: if label & 1 == 1 { Unsafe::Yes } else { Unsafe::No },
@@ -973,6 +1086,106 @@ impl HirColumns<Growing> {
         self.pat_kind[at] = kind;
     }
 
+    /// Appends a statement row, as its index.
+    pub(crate) fn push_statement(&mut self, statement: Statement<'_>) -> u32 {
+        let at = len(self.stmt_kind.len());
+        let data = self.encode_statement(statement, None);
+        self.stmt_kind.push(StatementKind::of(&statement) as u8);
+        self.stmt_data.push(data);
+        at
+    }
+
+    /// Replaces the statement in row `at`, as [`HirColumns::set_expr`] replaces a node.
+    pub(crate) fn set_statement(&mut self, at: u32, statement: Statement<'_>) {
+        let row = at as usize;
+        let kind = StatementKind::of(&statement) as u8;
+        let old = (self.stmt_kind[row] == kind).then_some(self.stmt_data[row]);
+        self.stmt_data[row] = self.encode_statement(statement, old);
+        self.stmt_kind[row] = kind;
+    }
+
+    /// The last statement row from `start` on, taken off when it is an expression without a
+    /// `;`: a block's tail, which lowering collected as a statement. Its row has no words in
+    /// `extra` or `macro_defs`, so the two columns are all there is to pop.
+    pub(crate) fn pop_tail_expr(&mut self, start: u32) -> Option<ExprId> {
+        let last = self.stmt_kind.len().checked_sub(1)?;
+        let data = self.stmt_data[last];
+        let tail = last >= start as usize
+            && self.stmt_kind[last] == StatementKind::Expr as u8
+            && data & 1 == 0;
+        if !tail {
+            return None;
+        }
+        self.stmt_kind.pop();
+        self.stmt_data.pop();
+        Some(idx(data >> 1))
+    }
+
+    /// Drops the statement rows from `rows` on, and the `extra` words and macro definitions
+    /// from `words` and `macro_defs` on, which were pushed with them: lowering's stack popped
+    /// back to a mark.
+    pub(crate) fn truncate_statements(&mut self, rows: u32, words: u32, macro_defs: u32) {
+        self.stmt_kind.truncate(rows as usize);
+        self.stmt_data.truncate(rows as usize);
+        self.extra.truncate(words as usize);
+        self.macro_defs.truncate(macro_defs as usize);
+    }
+
+    /// The data word of `statement`, its `let` words or macro definition written over those of
+    /// the row of the same kind whose data word is `old`, or appended.
+    fn encode_statement(&mut self, statement: Statement<'_>, old: Option<u32>) -> u32 {
+        match statement {
+            Statement::Let { pat, type_ref, initializer, else_branch, is_super } => {
+                let (words, count) = let_words(pat, type_ref, initializer, else_branch, is_super);
+                let words = &words[..count];
+                match old {
+                    Some(at) if let_len(self.extra[at as usize]) >= count => {
+                        self.extra[at as usize..][..count].copy_from_slice(words);
+                        at
+                    }
+                    _ => {
+                        let at = len(self.extra.len());
+                        self.extra.extend_from_slice(words);
+                        at
+                    }
+                }
+            }
+            Statement::Expr { expr, has_semi } => shl(raw(expr), 1) | has_semi as u32,
+            Statement::Item(Item::MacroDef(def)) => match old {
+                Some(at) => {
+                    self.macro_defs[at as usize] = *def;
+                    at
+                }
+                None => push_one(&mut self.macro_defs, *def),
+            },
+            Statement::Item(Item::Other) => 0,
+        }
+    }
+
+    /// A block's statements over the rows `old` of the block it replaces when they fit there,
+    /// else appended. `statements` are rows of other columns (lowering's stack), as a block
+    /// can't be given statements borrowed from the columns it is written to.
+    fn put_statements(&mut self, statements: Statements<'_>, old: Option<(u32, u32)>) -> (u32, u32) {
+        let count = len(statements.len());
+        match old {
+            Some((start, old_count)) if count <= old_count => {
+                for (at, statement) in (start..).zip(statements) {
+                    self.set_statement(at, statement);
+                }
+                (start, count)
+            }
+            _ => {
+                let start = len(self.stmt_kind.len());
+                self.stmt_kind.reserve(statements.len());
+                self.stmt_data.reserve(statements.len());
+                for statement in statements {
+                    self.push_statement(statement);
+                }
+                (start, count)
+            }
+        }
+    }
+
     fn node_expr(&mut self, kind: ExprKind, data: u32) -> ExprId {
         let id = idx(len(self.expr_kind.len()));
         self.expr_kind.push(kind as u8);
@@ -1096,7 +1309,8 @@ impl HirColumns<Growing> {
             extra: take_exact(&mut self.extra),
             expr_lists: take_exact(&mut self.expr_lists),
             pat_lists: take_exact(&mut self.pat_lists),
-            statements: take_exact(&mut self.statements),
+            stmt_kind: take_exact(&mut self.stmt_kind),
+            stmt_data: take_exact(&mut self.stmt_data),
             arms: take_exact(&mut self.arms),
             record_fields: take_exact(&mut self.record_fields),
             field_pats: take_exact(&mut self.field_pats),
@@ -1107,6 +1321,7 @@ impl HirColumns<Growing> {
             generic_args: take_exact(&mut self.generic_args),
             offset_ofs: take_exact(&mut self.offset_ofs),
             asms: take_exact(&mut self.asms),
+            macro_defs: take_exact(&mut self.macro_defs),
         }
     }
 
@@ -1120,7 +1335,8 @@ impl HirColumns<Growing> {
             extra,
             expr_lists,
             pat_lists,
-            statements,
+            stmt_kind,
+            stmt_data,
             arms,
             record_fields,
             field_pats,
@@ -1131,6 +1347,7 @@ impl HirColumns<Growing> {
             generic_args,
             offset_ofs,
             asms,
+            macro_defs,
         } = self;
         expr_kind.clear();
         expr_data.clear();
@@ -1139,7 +1356,8 @@ impl HirColumns<Growing> {
         extra.clear();
         expr_lists.clear();
         pat_lists.clear();
-        statements.clear();
+        stmt_kind.clear();
+        stmt_data.clear();
         arms.clear();
         record_fields.clear();
         field_pats.clear();
@@ -1150,6 +1368,7 @@ impl HirColumns<Growing> {
         generic_args.clear();
         offset_ofs.clear();
         asms.clear();
+        macro_defs.clear();
     }
 
     /// The elements the largest columns have room for, for the scratch pool's cap.
@@ -1159,7 +1378,7 @@ impl HirColumns<Growing> {
             + self.extra.capacity()
             + self.expr_lists.capacity()
             + self.pat_lists.capacity()
-            + self.statements.capacity()
+            + self.stmt_kind.capacity()
     }
 
     /// The words of a node, over those at `old` (the data word of the node of the same kind it
@@ -1200,7 +1419,7 @@ impl HirColumns<Growing> {
             Expr::Let { pat, expr } => self.words(old, [raw(pat), raw(expr)]),
             Expr::Block { id, statements, tail, label, unsafe_ } => {
                 let old_statements = self.old_list(old, 2);
-                let (start, count) = put_list(&mut self.statements, statements, old_statements);
+                let (start, count) = self.put_statements(statements, old_statements);
                 let (low, high) = block_words(id);
                 let label = shl(opt(label), 1) | (unsafe_ == Unsafe::Yes) as u32;
                 self.words(old, [low, high, start, count, opt(tail), label])
@@ -1397,19 +1616,8 @@ impl Bounds {
                 self.pat(pat)?;
                 self.expr(expr)
             }
-            Expr::Block { id: _, statements, tail, label, unsafe_: _ } => {
-                for statement in statements {
-                    match *statement {
-                        Statement::Let { pat, type_ref, initializer, else_branch, is_super: _ } => {
-                            self.pat(pat)?;
-                            self.type_opt(type_ref)?;
-                            self.expr_opt(initializer)?;
-                            self.expr_opt(else_branch)?;
-                        }
-                        Statement::Expr { expr, has_semi: _ } => self.expr(expr)?,
-                        Statement::Item(_) => {}
-                    }
-                }
+            // Its statements are rows that `check` has checked already, each once.
+            Expr::Block { id: _, statements: _, tail, label, unsafe_: _ } => {
                 self.expr_opt(tail)?;
                 self.label_opt(label)
             }
@@ -1506,6 +1714,19 @@ impl Bounds {
         }
     }
 
+    fn in_statement(&self, statement: Statement<'_>) -> Checked {
+        match statement {
+            Statement::Let { pat, type_ref, initializer, else_branch, is_super: _ } => {
+                self.pat(pat)?;
+                self.type_opt(type_ref)?;
+                self.expr_opt(initializer)?;
+                self.expr_opt(else_branch)
+            }
+            Statement::Expr { expr, has_semi: _ } => self.expr(expr),
+            Statement::Item(Item::MacroDef(_) | Item::Other) => Ok(()),
+        }
+    }
+
     /// The ids in `pat`'s own fields and lists, as [`Bounds::in_expr`] checks an expression's.
     fn in_pat(&self, pat: Pat<'_>) -> Checked {
         match pat {
@@ -1552,7 +1773,13 @@ impl HirColumns<Frozen> {
         if self.pat_kind.len() != self.pat_data.len() {
             return Err("pattern kind and data columns of different lengths");
         }
-        if u32::try_from(self.expr_count()).is_err() || u32::try_from(self.pat_count()).is_err() {
+        if self.stmt_kind.len() != self.stmt_data.len() {
+            return Err("statement kind and data columns of different lengths");
+        }
+        if u32::try_from(self.expr_count()).is_err()
+            || u32::try_from(self.pat_count()).is_err()
+            || u32::try_from(self.statement_count()).is_err()
+        {
             return Err("more nodes than ids");
         }
         let bounds = Bounds {
@@ -1562,6 +1789,10 @@ impl HirColumns<Frozen> {
             labels,
             type_refs,
         };
+        // Every row before any block: a block's `Statements` decodes its rows without checking.
+        for at in 0..self.statement_count() as u32 {
+            bounds.in_statement(self.decode_statement(at)?)?;
+        }
         for at in 0..self.expr_count() as u32 {
             bounds.in_expr(self.decode_expr(idx(at))?)?;
         }
@@ -1608,12 +1839,39 @@ mod tests {
         Path::BarePath(ModPath::from_segments(PathKind::Plain, [name(text)]))
     }
 
+    fn macro_def(bits: u64) -> MacroDefId {
+        use hir_expand::{AstId, HirFileId, MacroCallId, MacroCallStyles, MacroDefKind};
+        use span::{Edition, ErasedFileAstId, FileAstId};
+
+        let file = HirFileId::MacroFile(MacroCallId::from_id(salsa::Id::from_bits(bits)));
+        let ast_id = FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(bits as u32));
+        MacroDefId {
+            krate: base_db::Crate::from_id(salsa::Id::from_bits(bits)),
+            edition: Edition::Edition2021,
+            kind: MacroDefKind::Declarative(AstId::new(file, ast_id), MacroCallStyles::FN_LIKE),
+            local_inner: false,
+            allow_internal_unsafe: true,
+            edition_panic: false,
+        }
+    }
+
+    /// Rows of statements for a block to be given: lowering's list stack, in the tests.
+    fn rows_of(statements: &[Statement<'_>]) -> HirColumns<Growing> {
+        let mut rows = HirColumns::<Growing>::default();
+        for &statement in statements {
+            rows.push_statement(statement);
+        }
+        rows
+    }
+
     struct Values {
         paths: [Path; 2],
         names: [Name; 2],
         literals: [Literal; 3],
         generic_args: GenericArgs,
-        statements: Vec<Statement>,
+        macro_defs: [MacroDefId; 2],
+        /// A block's statements, one of each kind.
+        statements: HirColumns<Growing>,
         arms: Vec<MatchArm>,
         fields: Vec<RecordLitField>,
         field_pats: Vec<RecordFieldPat>,
@@ -1622,7 +1880,22 @@ mod tests {
     }
 
     fn values() -> Values {
+        let macro_defs = [macro_def(3), macro_def(5)];
+        let statements = rows_of(&[
+            Statement::Let {
+                pat: P0,
+                type_ref: Some(idx(0)),
+                initializer: Some(E0),
+                else_branch: None,
+                is_super: true,
+            },
+            Statement::Expr { expr: E0, has_semi: true },
+            Statement::Item(Item::MacroDef(&macro_defs[0])),
+            Statement::Item(Item::Other),
+        ]);
         Values {
+            macro_defs,
+            statements,
             paths: [path("a"), path("b")],
             names: [name("x"), name("y")],
             literals: [
@@ -1639,17 +1912,6 @@ mod tests {
                 bindings: Box::default(),
                 parenthesized: GenericArgsParentheses::No,
             },
-            statements: vec![
-                Statement::Let {
-                    pat: P0,
-                    type_ref: Some(idx(0)),
-                    initializer: Some(E0),
-                    else_branch: None,
-                    is_super: true,
-                },
-                Statement::Expr { expr: E0, has_semi: true },
-                Statement::Item(Item::Other),
-            ],
             arms: vec![
                 MatchArm { pat: P0, guard: Some(E0), expr: E0 },
                 MatchArm { pat: P0, guard: None, expr: E0 },
@@ -1720,12 +1982,18 @@ mod tests {
             Expr::Let { pat: P0, expr: E0 },
             Expr::Block {
                 id: Some(block_id(3 | (7 << 32))),
-                statements: &v.statements,
+                statements: v.statements.statements_since(0),
                 tail: Some(E0),
                 label: some_label,
                 unsafe_: Unsafe::Yes,
             },
-            Expr::Block { id: None, statements: &[], tail: None, label: None, unsafe_: Unsafe::No },
+            Expr::Block {
+                id: None,
+                statements: Statements::EMPTY,
+                tail: None,
+                label: None,
+                unsafe_: Unsafe::No,
+            },
             Expr::Const(E0),
             Expr::Loop { body: E0, label: some_label, source: LoopSource::ForLoop },
             Expr::Loop { body: E0, label: None, source: LoopSource::Loop },
@@ -1822,13 +2090,29 @@ mod tests {
         ]
     }
 
+    /// The `extra` words of the `let`s among `statements`.
+    fn let_words_of(statements: Statements<'_>) -> usize {
+        let words = |statement: Statement<'_>| match statement {
+            Statement::Let { pat, type_ref, initializer, else_branch, is_super } => {
+                let_words(pat, type_ref, initializer, else_branch, is_super).1
+            }
+            Statement::Expr { .. } | Statement::Item(_) => 0,
+        };
+        statements.iter().map(words).sum()
+    }
+
     fn columns_of<'v>(exprs: &[Expr<'v>], pats: &[Pat<'v>]) -> HirColumns<Growing> {
         let mut columns = HirColumns::<Growing>::default();
         for (at, &expr) in exprs.iter().enumerate() {
             let words = columns.extra.len();
             assert_eq!(columns.push_expr(expr), e(at as u32));
             let kind = ExprKind::of(&expr) as usize;
-            assert_eq!(columns.extra.len() - words, EXPR_WORDS[kind] as usize, "{expr:?}");
+            let statement_words = match expr {
+                Expr::Block { statements, .. } => let_words_of(statements),
+                _ => 0,
+            };
+            let expected = EXPR_WORDS[kind] as usize + statement_words;
+            assert_eq!(columns.extra.len() - words, expected, "{expr:?}");
         }
         for (at, &pat) in pats.iter().enumerate() {
             let words = columns.extra.len();
@@ -1877,24 +2161,24 @@ mod tests {
         let call = columns.push_expr(Expr::Call { callee: E0, args: &[E0, E0] });
         let block = columns.push_expr(Expr::Block {
             id: None,
-            statements: &v.statements,
+            statements: v.statements.statements_since(0),
             tail: None,
             label: None,
             unsafe_: Unsafe::No,
         });
         let path = columns.push_pat(Pat::Path(&v.paths[0]));
         let sizes = |c: &HirColumns<Growing>| {
-            (c.extra.len(), c.expr_lists.len(), c.statements.len(), c.paths.len())
+            (c.extra.len(), c.expr_lists.len(), c.stmt_kind.len(), c.macro_defs.len(), c.paths.len())
         };
         let before = sizes(&columns);
 
         columns.set_expr(call, Expr::Call { callee: E1, args: &[E0] });
         assert_eq!(columns.expr(call), Expr::Call { callee: E1, args: &[E0] });
         let Expr::Block { statements, .. } = columns.expr(block) else { panic!("a block") };
-        let statements = statements.to_vec();
+        let statements = rows_of(&statements.iter().collect::<Vec<_>>());
         let with_tail = Expr::Block {
             id: None,
-            statements: &statements,
+            statements: statements.statements_since(0),
             tail: Some(call),
             label: None,
             unsafe_: Unsafe::Yes,
@@ -2127,7 +2411,7 @@ mod tests {
         let v = values();
         let block = |tail| Expr::Block {
             id: Some(block_id(3)),
-            statements: &v.statements,
+            statements: v.statements.statements_since(0),
             tail,
             label: Some(idx(0)),
             unsafe_: Unsafe::Yes,
@@ -2145,5 +2429,247 @@ mod tests {
     #[should_panic = "a tail given to a non-block"]
     fn a_block_tail_on_a_non_block_panics() {
         columns_of(&[Expr::Missing], &[]).set_block_tail(E0, E0);
+    }
+
+    /// Every variant of [`Statement`], a `let` with each of its optional ids there and not.
+    fn every_statement(v: &Values) -> Vec<Statement<'_>> {
+        let mut statements = Vec::new();
+        for bits in 0..16u32 {
+            let some = |bit: u32| bits & (1 << bit) != 0;
+            statements.push(Statement::Let {
+                pat: P1,
+                type_ref: some(0).then_some(T0),
+                initializer: some(1).then_some(E1),
+                else_branch: some(2).then_some(E0),
+                is_super: some(3),
+            });
+        }
+        statements.extend([
+            Statement::Expr { expr: E1, has_semi: true },
+            Statement::Expr { expr: E0, has_semi: false },
+            Statement::Item(Item::MacroDef(&v.macro_defs[0])),
+            Statement::Item(Item::MacroDef(&v.macro_defs[1])),
+            Statement::Item(Item::Other),
+        ]);
+        statements
+    }
+
+    #[test]
+    fn every_statement_reads_back_as_pushed() {
+        let v = values();
+        let statements = every_statement(&v);
+        let kinds: std::collections::HashSet<_> = statements.iter().map(StatementKind::of).collect();
+        assert_eq!(kinds.len(), StatementKind::ALL.len(), "every statement kind is tested");
+
+        let mut columns = columns_of(&[Expr::Missing, Expr::Missing], &[Pat::Wild, Pat::Wild]);
+        for (at, &statement) in statements.iter().enumerate() {
+            let (words, defs) = (columns.extra.len(), columns.macro_defs.len());
+            assert_eq!(columns.push_statement(statement), at as u32);
+            let (want_words, want_defs) = match statement {
+                Statement::Let { pat, type_ref, initializer, else_branch, is_super } => {
+                    (let_words(pat, type_ref, initializer, else_branch, is_super).1, 0)
+                }
+                Statement::Item(Item::MacroDef(_)) => (0, 1),
+                Statement::Expr { .. } | Statement::Item(Item::Other) => (0, 0),
+            };
+            assert_eq!(columns.extra.len() - words, want_words, "{statement:?}");
+            assert_eq!(columns.macro_defs.len() - defs, want_defs, "{statement:?}");
+            assert!(want_words <= LET_WORDS);
+        }
+        let bare = Statement::Let {
+            pat: P0,
+            type_ref: None,
+            initializer: None,
+            else_branch: None,
+            is_super: false,
+        };
+        assert_eq!(let_words(P0, None, None, None, false).1, 1, "{bare:?} is its head alone");
+        assert_eq!(let_words(P0, None, Some(E0), None, false).1, 2, "`let x = e;` is two words");
+
+        for (at, &statement) in statements.iter().enumerate() {
+            assert_eq!(columns.statement(at as u32), statement);
+        }
+        let all = columns.statements(0, len(statements.len())).unwrap();
+        assert_eq!(all.len(), statements.len());
+        assert_eq!(all.iter().collect::<Vec<_>>(), statements);
+        assert_eq!(all.iter().rev().collect::<Vec<_>>(), statements.iter().rev().copied().collect::<Vec<_>>());
+        assert_eq!(all.first(), statements.first().copied());
+        assert_eq!(all.last(), statements.last().copied());
+        assert_eq!(all.get(statements.len()), None);
+        assert_eq!(all.iter().len(), statements.len());
+        assert_eq!(all, columns.statements_since(0));
+        assert_eq!(columns.statements(1, len(statements.len())), Err(STATEMENTS));
+        assert!(Statements::EMPTY.is_empty() && Statements::EMPTY.iter().next().is_none());
+
+        let frozen = columns.freeze();
+        assert_eq!(frozen.check(0, 0, 1), Ok(()));
+        for (at, &statement) in statements.iter().enumerate() {
+            assert_eq!(frozen.statement(at as u32), statement);
+        }
+        assert_eq!(frozen.check(0, 0, 0), Err("a type id past its arena"));
+    }
+
+    #[test]
+    fn a_statement_set_to_one_that_fits_keeps_its_words() {
+        let v = values();
+        let mut columns = columns_of(&[Expr::Missing, Expr::Missing], &[Pat::Wild, Pat::Wild]);
+        let full = Statement::Let {
+            pat: P0,
+            type_ref: Some(T0),
+            initializer: Some(E0),
+            else_branch: Some(E1),
+            is_super: false,
+        };
+        let let_ = columns.push_statement(full);
+        let expr = columns.push_statement(Statement::Expr { expr: E0, has_semi: false });
+        let def = columns.push_statement(Statement::Item(Item::MacroDef(&v.macro_defs[0])));
+        let other = columns.push_statement(Statement::Item(Item::Other));
+        let sizes = |c: &HirColumns<Growing>| (c.extra.len(), c.stmt_kind.len(), c.macro_defs.len());
+        let before = sizes(&columns);
+
+        let fewer = Statement::Let {
+            pat: P1,
+            type_ref: None,
+            initializer: Some(E1),
+            else_branch: None,
+            is_super: true,
+        };
+        let replacements = [
+            (let_, fewer),
+            (expr, Statement::Expr { expr: E1, has_semi: true }),
+            (def, Statement::Item(Item::MacroDef(&v.macro_defs[1]))),
+            (other, Statement::Item(Item::Other)),
+        ];
+        for (at, statement) in replacements {
+            columns.set_statement(at, statement);
+            assert_eq!(columns.statement(at), statement);
+        }
+        assert_eq!(sizes(&columns), before, "nothing grew");
+        assert_eq!(columns.freeze().check(0, 0, 1), Ok(()));
+    }
+
+    #[test]
+    fn a_statement_set_to_one_that_does_not_fit_appends() {
+        let v = values();
+        let mut columns = columns_of(&[Expr::Missing, Expr::Missing], &[Pat::Wild]);
+        let bare = Statement::Let {
+            pat: P0,
+            type_ref: None,
+            initializer: None,
+            else_branch: None,
+            is_super: false,
+        };
+        let at = columns.push_statement(bare);
+        let words = columns.extra.len();
+
+        let full = Statement::Let {
+            pat: P0,
+            type_ref: Some(T0),
+            initializer: Some(E1),
+            else_branch: Some(E0),
+            is_super: true,
+        };
+        columns.set_statement(at, full);
+        assert_eq!(columns.statement(at), full);
+        assert_eq!(columns.extra.len(), words + LET_WORDS, "a longer `let` is appended");
+
+        let def = Statement::Item(Item::MacroDef(&v.macro_defs[1]));
+        columns.set_statement(at, def);
+        assert_eq!(columns.statement(at), def);
+        assert_eq!(columns.macro_defs.len(), 1, "another kind's entry is appended");
+
+        columns.set_statement(at, Statement::Expr { expr: E1, has_semi: true });
+        assert_eq!(columns.statement(at), Statement::Expr { expr: E1, has_semi: true });
+        columns.set_statement(at, bare);
+        assert_eq!(columns.statement(at), bare);
+        assert_eq!(columns.extra.len(), words + LET_WORDS + 1, "a `let` from an expression appends");
+        assert_eq!(columns.stmt_kind.len(), 1, "rows are set in place");
+
+        let block = columns.push_expr(Expr::Block {
+            id: None,
+            statements: Statements::EMPTY,
+            tail: None,
+            label: None,
+            unsafe_: Unsafe::No,
+        });
+        let rows = rows_of(&[bare, def]);
+        let grown = Expr::Block {
+            id: None,
+            statements: rows.statements_since(0),
+            tail: None,
+            label: None,
+            unsafe_: Unsafe::No,
+        };
+        columns.set_expr(block, grown);
+        assert_eq!(columns.expr(block), grown);
+        assert_eq!(columns.stmt_kind.len(), 3, "a block with more statements gets a new run");
+        assert_eq!(columns.freeze().check(0, 0, 1), Ok(()));
+    }
+
+    #[test]
+    fn check_refuses_a_bad_statement() {
+        let v = values();
+        let columns_with = |statement| {
+            let mut columns = columns_of(&[Expr::Missing], &[Pat::Wild]);
+            columns.push_statement(statement);
+            columns.freeze()
+        };
+        let mut columns = columns_with(Statement::Expr { expr: E0, has_semi: true });
+        columns.stmt_kind[0] = StatementKind::ALL.len() as u8;
+        assert_eq!(columns.check(0, 0, 0), Err("a statement kind out of range"));
+
+        let mut columns = columns_with(Statement::Item(Item::Other));
+        columns.stmt_data[0] = 1;
+        assert_eq!(columns.check(0, 0, 0), Err("an item statement's data word that is not 0"));
+
+        let mut columns = columns_with(Statement::Item(Item::MacroDef(&v.macro_defs[0])));
+        assert_eq!(columns.check(0, 0, 0), Ok(()));
+        columns.stmt_data[0] = 1;
+        assert_eq!(columns.check(0, 0, 0), Err(MACRO_DEF));
+
+        let columns = columns_with(Statement::Expr { expr: E1, has_semi: false });
+        assert_eq!(columns.check(0, 0, 0), Err(EXPR_ID));
+
+        let full = Statement::Let {
+            pat: P0,
+            type_ref: None,
+            initializer: Some(E0),
+            else_branch: Some(E0),
+            is_super: false,
+        };
+        let mut columns = columns_with(full);
+        assert_eq!(columns.check(0, 0, 0), Ok(()));
+        columns.extra[0] = (1 << LET_BITS) | LET_INIT | LET_ELSE;
+        assert_eq!(columns.check(0, 0, 0), Err(PAT_ID));
+        columns.extra[0] = LET_TYPE | LET_INIT | LET_ELSE;
+        assert_eq!(columns.check(0, 0, 0), Err(EXTRA), "a third optional id past the column");
+
+        let mut columns = columns_with(Statement::Expr { expr: E0, has_semi: true });
+        columns.stmt_data = Box::default();
+        assert_eq!(columns.check(0, 0, 0), Err("statement kind and data columns of different lengths"));
+    }
+
+    #[test]
+    fn check_refuses_a_block_run_past_the_rows() {
+        let v = values();
+        let block = Expr::Block {
+            id: None,
+            statements: v.statements.statements_since(0),
+            tail: None,
+            label: None,
+            unsafe_: Unsafe::No,
+        };
+        let mut columns = columns_of(&[Expr::Missing, block], &[Pat::Wild]).freeze();
+        assert_eq!(columns.check(0, 0, 1), Ok(()));
+        let words = columns.expr_data[1] as usize;
+        let rows = columns.stmt_kind.len() as u32;
+        columns.extra[words + 3] = rows + 1;
+        assert_eq!(columns.check(0, 0, 1), Err(STATEMENTS));
+        columns.extra[words + 2] = u32::MAX;
+        columns.extra[words + 3] = 2;
+        assert_eq!(columns.check(0, 0, 1), Err(STATEMENTS), "a start that overflows");
+        columns.extra[words + 2] = 1;
+        columns.extra[words + 3] = rows - 1;
+        assert_eq!(columns.check(0, 0, 1), Ok(()), "a run inside the rows");
     }
 }

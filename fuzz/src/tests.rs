@@ -2,7 +2,7 @@ use crate::{
     Command, Options,
     corpus::{self, Corpus},
     features::{Seen, bucket},
-    mutate::{MUTATIONS, Mutation, Mutator, Random, Recent},
+    mutate::{self, MUTATIONS, Mutation, Mutator, Random, Recent},
     raw::{self, Coverage},
 };
 
@@ -54,7 +54,7 @@ fn seen_counts_new_features_once() {
 }
 
 #[test]
-fn drain_buckets_counters_masks_the_engines_and_clears() {
+fn drain_buckets_counters_and_masks_the_engines() {
     // Counters past one word, so the tail is read too.
     let mut counters = vec![0u8; 19];
     counters[0] = 1;
@@ -62,13 +62,53 @@ fn drain_buckets_counters_masks_the_engines_and_clears() {
     counters[8] = 200;
     counters[9] = 5;
     counters[18] = 2;
+    let before = counters.clone();
     let coverage = Coverage::of(&mut counters, &[9]);
     let mut features = Vec::with_capacity(coverage.total() + raw::VALUE_BITS);
     coverage.drain(&mut features, false);
     features.sort_unstable();
     assert_eq!(features, vec![0 << 3, (3 << 3) | 2, (8 << 3) | 7, (18 << 3) | 1]);
     drop(coverage);
-    assert!(counters.iter().all(|&c| c == 0), "drain clears every counter: {counters:?}");
+    assert_eq!(counters, before, "drain only reads; run clears");
+}
+
+/// The drain reads a cache line at a time; this is the plain walk it must agree with, over
+/// lengths with and without whole lines, words and a tail, and sparse and dense counters.
+#[test]
+fn drain_agrees_with_a_byte_at_a_time() {
+    let mut random = Random::new(11);
+    for len in [0usize, 1, 7, 8, 9, 63, 64, 65, 127, 128, 200, 1000, 4096 + 3] {
+        for density in [0usize, 1, 8, 64] {
+            let mut counters: Vec<u8> = (0..len)
+                .map(|_| if density > 0 && random.below(64) < density { random.next() as u8 } else { 0 })
+                .collect();
+            let ignored: Vec<usize> = (0..len).filter(|_| random.below(16) == 0).collect();
+            let mut want: Vec<u32> = counters
+                .iter()
+                .enumerate()
+                .filter(|&(k, &c)| c != 0 && !ignored.contains(&k))
+                .map(|(k, &c)| ((k as u32) << 3) | bucket(c) as u32)
+                .collect();
+            let coverage = Coverage::of(&mut counters, &ignored);
+            let mut features = Vec::with_capacity(coverage.total() + raw::VALUE_BITS);
+            coverage.drain(&mut features, false);
+            features.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(features, want, "{len} counters, density {density}");
+        }
+    }
+}
+
+#[test]
+fn run_clears_whole_lines_and_the_tail() {
+    for len in [0usize, 5, 64, 70, 130] {
+        let mut random = Random::new(len as u64);
+        let mut counters: Vec<u8> = (0..len).map(|_| if random.below(4) == 0 { 1 } else { 0 }).collect();
+        let coverage = Coverage::of(&mut counters, &[]);
+        assert!(coverage.run(|_| {}, b"", 0));
+        drop(coverage);
+        assert!(counters.iter().all(|&c| c == 0), "{len}: {counters:?}");
+    }
 }
 
 #[test]
@@ -150,6 +190,14 @@ fn recent_operands_replace_what_was_compared() {
 }
 
 #[test]
+fn decimal_digits_match_the_formatter() {
+    let mut buffer = [0u8; 20];
+    for value in [0u64, 1, 9, 10, 99, 100, 12345, u32::MAX as u64, u64::MAX] {
+        assert_eq!(mutate::decimal(value, &mut buffer), value.to_string().as_bytes());
+    }
+}
+
+#[test]
 fn nothing_recent_is_no_mutation() {
     let mut mutator = Mutator::new(5, &[], NoRecent);
     let mut data = b"abc".to_vec();
@@ -209,4 +257,25 @@ fn options_parse() {
     assert!(parse(&["fuzz", "a.hex"]).is_err());
     assert!(parse(&["fuzz", "--seconds"]).is_err());
     assert!(parse(&["fuzz", "--frobnicate"]).is_err());
+    let jobs = parse(&["fuzz", "--jobs", "8"]).unwrap();
+    assert_eq!((jobs.jobs, jobs.worker), (8, None));
+    assert_eq!(parse(&["fuzz", "--worker", "3"]).unwrap().worker, Some(3));
+    assert!(parse(&["fuzz", "--jobs", "0"]).is_err());
+    assert!(matches!(parse(&["serve", "--timeout-ms", "50"]).unwrap().command, Command::Serve));
+    assert!(parse(&["serve", "a.hex"]).is_err());
+}
+
+#[test]
+fn kept_files_appear_whole_and_listings_skip_the_partial() {
+    let dir = std::env::temp_dir().join(format!("blaze-fuzzer-corpus-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = corpus::write(&dir, "", b"input").unwrap();
+    std::fs::write(dir.join(".1234-being-written.hex"), "00").unwrap();
+    let names = corpus::names(&dir).unwrap();
+    assert_eq!(names, vec![corpus::file_name("", b"input")]);
+    assert_eq!(path, dir.join(&names[0]));
+    assert_eq!(corpus::read_dir(&dir).unwrap(), vec![b"input".to_vec()]);
+    assert_eq!(corpus::names(&dir.join("missing")).unwrap(), Vec::<std::ffi::OsString>::new());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -259,9 +259,8 @@ impl Mark<'_, '_, '_, '_> {
     /// An inherent impl's item makes its self type live: an ADT, a foreign type, the principal
     /// trait of a `dyn`.
     fn inherent_self_ty(&mut self, impl_: DefIdx) {
-        if let Some(of) = self.k.defs.impl_of(impl_)
-            && let Some(it) = of.self_adt.or(of.self_dyn)
-        {
+        let named = self.k.defs.impl_of(impl_).and_then(|it| it.self_adt.or(it.self_dyn));
+        if let Some(it) = named {
             self.check_def_id(it);
         }
     }
@@ -579,7 +578,8 @@ impl Mark<'_, '_, '_, '_> {
     /// The fields of `variant` that the subpatterns of a tuple pattern bind (whether each is a
     /// `_`, in order, without the `..` at `rest`), past its `..`.
     fn tuple_fields(&mut self, variant: DefIdx, wildcard: impl Iterator<Item = bool> + Clone, rest: Option<usize>) {
-        let fields = self.k.defs.children(variant);
+        let defs = self.k.defs;
+        let fields = defs.children(variant);
         let bound = wildcard.clone().count() - usize::from(rest.is_some());
         let dotdot = rest.unwrap_or(bound);
         let missing = fields.len().saturating_sub(bound);
@@ -857,7 +857,7 @@ fn same_place(cx: &crate::cx::Cx<'_, '_>, lhs: &ast::Expr, rhs: &ast::Expr) -> b
         (ast::Expr::PathExpr(l), ast::Expr::PathExpr(r)) => {
             let (Some(l), Some(r)) = (l.path(), r.path()) else { return false };
             let same_name = match (l.as_single_name_ref(), r.as_single_name_ref()) {
-                (Some(a), Some(b)) => a.text() == b.text(),
+                (Some(a), Some(b)) => unraw(a.text()) == unraw(b.text()),
                 _ => false,
             };
             let local = |it: &ast::Path| match cx.sema.resolve_path(it)? {
@@ -868,7 +868,7 @@ fn same_place(cx: &crate::cx::Cx<'_, '_>, lhs: &ast::Expr, rhs: &ast::Expr) -> b
         }
         (ast::Expr::FieldExpr(l), ast::Expr::FieldExpr(r)) => {
             let same_name = match (l.name_ref(), r.name_ref()) {
-                (Some(a), Some(b)) => a.text() == b.text(),
+                (Some(a), Some(b)) => unraw(a.text()) == unraw(b.text()),
                 _ => false,
             };
             match (l.expr(), r.expr()) {
@@ -878,6 +878,11 @@ fn same_place(cx: &crate::cx::Cx<'_, '_>, lhs: &ast::Expr, rhs: &ast::Expr) -> b
         }
         _ => false,
     }
+}
+
+/// A name's text as its symbol is: `r#` stripped.
+fn unraw(text: &str) -> &str {
+    text.strip_prefix("r#").unwrap_or(text)
 }
 
 /// Whether `path` is the one segment `Self`.

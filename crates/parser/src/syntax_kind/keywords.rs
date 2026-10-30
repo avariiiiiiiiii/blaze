@@ -1,9 +1,12 @@
-//! Keywords recognized from an identifier's bytes: a length check, then a perfect hash built at
-//! compile time (`blaze_phf`), one compare of the one keyword the bytes can be, and its edition.
-//! No string `match`, which compiles to a compare chain per length.
+//! Keywords recognized from an identifier's bytes, with no string `match` (a compare chain per
+//! length) and no loop over the bytes.
 //!
-//! Cost: about 0.5 KB a table; a lookup of an identifier outside the keywords' lengths is two
-//! compares, else one hash of at most 15 bytes, two loads and one compare.
+//! The strict keywords, which the lexer looks up for every identifier, are at most 8 bytes: the
+//! identifier is read as one 8-byte [`window`] of four 2-byte loads, and a multiplicative
+//! perfect hash found at compile time ([`STRICT_MULTIPLIER`]) gives the one entry it can be,
+//! which one 8-byte compare, the length and the edition decide. About 20 instructions and no
+//! data-dependent branch; 256 bytes of slots and 16 bytes an entry. The contextual keywords
+//! (up to 15 bytes, looked up only by the parser's callers) use `blaze_phf`.
 
 use crate::{
     Edition,
@@ -142,8 +145,89 @@ const CONTEXTUAL_NAMES: [&str; CONTEXTUAL.len()] = names(CONTEXTUAL);
 const STRICT_LENGTHS: (usize, usize) = lengths(&STRICT_NAMES);
 const CONTEXTUAL_LENGTHS: (usize, usize) = lengths(&CONTEXTUAL_NAMES);
 
-blaze_phf::phf_table!(static STRICT_TABLE = &STRICT_NAMES;);
 blaze_phf::phf_table!(static CONTEXTUAL_TABLE = &CONTEXTUAL_NAMES;);
+
+/// An identifier of 2 to 8 bytes as one word: the 2-byte pairs at 0, `min(2, len - 2)`,
+/// `len - 4` (or 0) and `len - 2`. They cover every byte at offsets fixed by the length, so for
+/// one length the window is the bytes.
+#[inline(always)]
+const fn window(bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    let second = if len - 2 < 2 { len - 2 } else { 2 };
+    let third = len.saturating_sub(4);
+    pair(bytes, 0) | pair(bytes, second) << 16 | pair(bytes, third) << 32 | pair(bytes, len - 2) << 48
+}
+
+#[inline(always)]
+const fn pair(bytes: &[u8], at: usize) -> u64 {
+    bytes[at] as u64 | (bytes[at + 1] as u64) << 8
+}
+
+#[inline(always)]
+const fn strict_slot(window: u64, len: usize, multiplier: u64) -> usize {
+    ((window ^ len as u64).wrapping_mul(multiplier) >> 56) as usize
+}
+
+#[derive(Clone, Copy)]
+struct StrictEntry {
+    window: u64,
+    len: u8,
+    kind: SyntaxKind,
+    since: Edition,
+}
+
+/// The first odd multiplier, in a fixed sequence, that sends every strict keyword to a slot of
+/// its own among 256. The sequence is a constant, so the table is the same in every build.
+const STRICT_MULTIPLIER: u64 = {
+    assert!(STRICT_LENGTHS.0 >= 2 && STRICT_LENGTHS.1 <= 8, "a window holds 2 to 8 bytes");
+    assert!(STRICT.len() < 255, "slot 255 is free");
+    let mut multiplier: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut tries = 0;
+    loop {
+        assert!(tries < 100_000, "no perfect multiplier for the strict keywords");
+        let mut taken = [false; 256];
+        let mut i = 0;
+        while i < STRICT.len() {
+            let bytes = STRICT[i].0.as_bytes();
+            let slot = strict_slot(window(bytes), bytes.len(), multiplier);
+            if taken[slot] {
+                break;
+            }
+            taken[slot] = true;
+            i += 1;
+        }
+        if i == STRICT.len() {
+            break multiplier;
+        }
+        multiplier = multiplier.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407) | 1;
+        tries += 1;
+    }
+};
+
+/// Each slot's entry in [`STRICT_ENTRIES`]; an empty slot names the last entry, whose length
+/// (0) no looked-up identifier has.
+static STRICT_SLOTS: [u8; 256] = {
+    let mut slots = [STRICT.len() as u8; 256];
+    let mut i = 0;
+    while i < STRICT.len() {
+        let bytes = STRICT[i].0.as_bytes();
+        slots[strict_slot(window(bytes), bytes.len(), STRICT_MULTIPLIER)] = i as u8;
+        i += 1;
+    }
+    slots
+};
+
+static STRICT_ENTRIES: [StrictEntry; STRICT.len() + 1] = {
+    let mut entries =
+        [StrictEntry { window: 0, len: 0, kind: EOF, since: Edition::Edition2015 }; STRICT.len() + 1];
+    let mut i = 0;
+    while i < STRICT.len() {
+        let (name, kind, since) = STRICT[i];
+        entries[i] = StrictEntry { window: window(name.as_bytes()), len: name.len() as u8, kind, since };
+        i += 1;
+    }
+    entries
+};
 
 /// Every strict, reserved and contextual keyword's text, a text in both lists twice.
 pub(super) fn texts() -> impl Iterator<Item = &'static str> {

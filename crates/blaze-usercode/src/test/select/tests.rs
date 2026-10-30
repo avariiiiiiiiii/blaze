@@ -127,7 +127,7 @@ fn a_new_test_runs_and_an_unchanged_one_is_skipped() {
     // Another worktree at the same code, with the same files: a test with the same name and
     // reach, built into another binary.
     let mut elsewhere = world.clone();
-    let same = Test::of(&crate::Reached { test: "tests::a".into(), binary: ContentId::of("blaze v2 test binary 1", b"other"), reached: vec![code(3), code(1), code(2), code(2)] }, Attrs::default(), false);
+    let same = Test::of(crate::Reached { test: "tests::a".into(), binary: ContentId::of("blaze v2 test binary 1", b"other"), reached: vec![code(3), code(1), code(2), code(2)] }, Attrs::default(), false);
     assert_eq!(decide(&store, given, &same, &mut elsewhere), Decision::Skip { took: Some(Duration::from_millis(40)) });
     // The same test of another package is another test.
     let other = Suite { package: "lexer".into(), ..suite() };
@@ -165,10 +165,10 @@ fn attributes_are_part_of_a_test() {
     let given = suite().given();
     let a = test("tests::a", &[1]);
     pass(&mut store, given, &a, &Traced::default(), 1);
-    let mut panicking = a.clone();
+    let mut panicking = test("tests::a", &[1]);
     panicking.attrs.should_panic = ShouldPanic::WithMessage("boom".into());
     assert_eq!(decide(&store, given, &panicking, &mut world), Decision::Run { why: Why::Attributes, expected: Some(Duration::from_millis(1)) });
-    let mut other = a.clone();
+    let mut other = test("tests::a", &[1]);
     other.attrs.should_panic = ShouldPanic::WithMessage("bang".into());
     assert_ne!(panicking.identity(), other.identity());
     assert_ne!(a.identity(), test("tests::b", &[1]).identity());
@@ -309,7 +309,8 @@ fn a_binary_run_whole_is_one_test_of_all_of_them() {
     let mut store = Mem::default();
     let mut world = World::default();
     let suite = suite();
-    let tests = vec![test("a", &[1, 2]), test("b", &[2, 3])];
+    let made = || vec![test("a", &[1, 2]), test("b", &[2, 3])];
+    let tests = made();
     let given = suite.given_whole(&tests);
     let whole = Test::whole(&tests);
     assert_eq!(whole.reached, vec![code(1), code(2), code(3)]);
@@ -318,13 +319,13 @@ fn a_binary_run_whole_is_one_test_of_all_of_them() {
     pass(&mut store, given, &whole, &Traced::default(), 100);
     assert_eq!(decide(&store, given, &whole, &mut world), Decision::Skip { took: Some(Duration::from_millis(100)) });
     // A test marked ignored makes it another run.
-    let mut marked = tests.clone();
+    let mut marked = made();
     marked[1].attrs.ignore = true;
     assert_ne!(suite.given_whole(&marked), given);
     // The order they are named in does not.
-    let reversed: Vec<Test> = tests.iter().rev().cloned().collect();
+    let reversed: Vec<Test> = made().into_iter().rev().collect();
     assert_eq!(suite.given_whole(&reversed), given);
-    let mut outside = tests.clone();
+    let mut outside = made();
     outside[0].outside = true;
     assert!(Test::whole(&outside).outside);
 }
@@ -358,4 +359,72 @@ fn reasons_read_as_explanations() {
     assert_eq!(Why::NoPass.to_string(), "no pass kept");
     assert_eq!(Why::Outside.to_string(), "outside world");
     assert_eq!(Why::Read(Input::Env("FOO".into())).to_string(), "read $FOO, changed");
+}
+
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// Seeded sets of every size around the radix sort's threshold, with repeats and with hashes
+/// that share their first four bytes (the runs sorted by the whole hash).
+fn seeded_sets() -> Vec<Vec<CodeHash>> {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut sets = Vec::new();
+    for len in (0..200).chain([1_000, 4_096, 10_000]) {
+        let mut set: Vec<CodeHash> = Vec::with_capacity(len);
+        for _ in 0..len {
+            let mut bytes = [0u8; 32];
+            for chunk in bytes.chunks_mut(8) {
+                chunk.copy_from_slice(&xorshift(&mut state).to_le_bytes());
+            }
+            match xorshift(&mut state) % 8 {
+                0 if !set.is_empty() => {
+                    let at = (xorshift(&mut state) % set.len() as u64) as usize;
+                    set.push(set[at]);
+                    continue;
+                }
+                1 if !set.is_empty() => {
+                    let at = (xorshift(&mut state) % set.len() as u64) as usize;
+                    bytes[..4].copy_from_slice(&set[at].0.0[..4]);
+                }
+                2 => bytes[..4].fill(0),
+                _ => {}
+            }
+            set.push(CodeHash(ContentId(bytes)));
+        }
+        sets.push(set);
+    }
+    sets
+}
+
+#[test]
+fn the_reached_set_sorts_as_a_comparison_sort_does() {
+    for hashes in seeded_sets() {
+        let mut expected = hashes.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(sorted(&hashes), expected, "{} hashes", hashes.len());
+    }
+}
+
+/// The identity hashes the set in one update; the bytes are those of a hash at a time, so
+/// every kept key stays.
+#[test]
+fn the_identity_is_the_hash_of_each_reached_hash_in_order() {
+    for reached in seeded_sets() {
+        let test = Test { name: "tests::a".into(), reached, attrs: Attrs::default(), outside: false };
+        let mut set = test.reached.clone();
+        set.sort_unstable();
+        set.dedup();
+        let mut hasher = Hasher::new("blaze v2 test identity 1");
+        hasher.part(test.name.as_bytes()).id(&test.attrs.id());
+        hasher.update(&(set.len() as u64).to_le_bytes());
+        for hash in &set {
+            hasher.id(&hash.0);
+        }
+        assert_eq!(test.identity(), hasher.finish(), "{} hashes", test.reached.len());
+    }
 }

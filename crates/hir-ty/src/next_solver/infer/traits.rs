@@ -56,7 +56,7 @@ impl ObligationCause {
 /// either identifying an `impl` (e.g., `impl Eq for i32`) that
 /// satisfies the obligation, or else finding a bound that is in
 /// scope. The eventual result is usually a `Selection` (defined below).
-#[derive(Clone, Debug, TypeVisitable, TypeFoldable)]
+#[derive(Clone, Copy, Debug, TypeVisitable, TypeFoldable)]
 pub struct Obligation<'db, T> {
     #[type_foldable(identity)]
     #[type_visitable(ignore)]
@@ -247,4 +247,61 @@ fn pred_known_to_hold_modulo_regions<'db>(
     debug!(?result);
 
     result.must_apply_modulo_regions()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hash::{BuildHasher, BuildHasherDefault};
+
+    use rustc_hash::FxHasher;
+
+    use super::{Obligation, ObligationCause};
+    use crate::next_solver::ParamEnv;
+
+    fn obligation(predicate: u32, depth: u32) -> Obligation<'static, u32> {
+        Obligation {
+            cause: ObligationCause::dummy(),
+            param_env: ParamEnv::empty(),
+            predicate,
+            recursion_depth: depth,
+        }
+    }
+
+    #[test]
+    fn eq_and_hash_ignore_cause_and_depth() {
+        let hasher = BuildHasherDefault::<FxHasher>::default();
+        let (a, b) = (obligation(7, 0), obligation(7, 5));
+        assert_eq!(a, b);
+        assert_eq!(hasher.hash_one(a), hasher.hash_one(b));
+        assert_ne!(a, obligation(8, 0));
+    }
+
+    #[test]
+    fn depth_from_parent_takes_the_deeper() {
+        let mut child = obligation(1, 3);
+        child.set_depth_from_parent(1);
+        assert_eq!(child.recursion_depth, 3);
+        child.set_depth_from_parent(9);
+        assert_eq!(child.recursion_depth, 10);
+    }
+
+    /// Fulfillment copies, re-depths, hashes and turns obligations into goals once per nested
+    /// goal; none of that may touch the heap.
+    #[test]
+    fn obligation_hot_path_allocates_nothing() {
+        let hasher = BuildHasherDefault::<FxHasher>::default();
+        // `ParamEnv::empty` initializes the default interned values once.
+        let parent = obligation(1, 4);
+        let mut sum = 0u64;
+        blaze_alloc_count::assert_at_most(0, "copying an obligation into a goal", || {
+            for predicate in 0..1024 {
+                let mut child = parent;
+                child.predicate = predicate;
+                child.set_depth_from_parent(parent.recursion_depth);
+                let goal = child.as_goal();
+                sum = sum.wrapping_add(hasher.hash_one(child)) ^ u64::from(goal.predicate);
+            }
+        });
+        assert_ne!(sum, 0);
+    }
 }

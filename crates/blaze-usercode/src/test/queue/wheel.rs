@@ -47,17 +47,18 @@ pub(super) struct Wheel<T> {
 }
 
 impl<T: Copy> Wheel<T> {
-    pub(super) fn new(now: u64) -> Wheel<T> {
+    /// A wheel at tick `now`, with room for `timers` set at once before its slab grows.
+    pub(super) fn new(now: u64, timers: usize) -> Wheel<T> {
         Wheel {
             now,
             heads: [[NONE; SLOTS]; LEVELS],
             occupied: [0; LEVELS],
-            due: Vec::new(),
-            what: Vec::new(),
-            next: Vec::new(),
-            prev: Vec::new(),
-            generation: Vec::new(),
-            place: Vec::new(),
+            due: Vec::with_capacity(timers),
+            what: Vec::with_capacity(timers),
+            next: Vec::with_capacity(timers),
+            prev: Vec::with_capacity(timers),
+            generation: Vec::with_capacity(timers),
+            place: Vec::with_capacity(timers),
             free: NONE,
             len: 0,
         }
@@ -227,7 +228,7 @@ mod tests {
                 state
             };
             let start = next() % (1 << 40);
-            let mut wheel: Wheel<u64> = Wheel::new(start);
+            let mut wheel: Wheel<u64> = Wheel::new(start, 0);
             let mut now = start;
             let mut set: Vec<(u64, u64, u64)> = Vec::new();
             let mut fired = Vec::new();
@@ -277,7 +278,7 @@ mod tests {
     /// steady stream of timers makes no more than are set at once.
     #[test]
     fn timers_are_reused_and_a_stale_remove_is_nothing() {
-        let mut wheel: Wheel<u32> = Wheel::new(0);
+        let mut wheel: Wheel<u32> = Wheel::new(0, 0);
         let mut fired = Vec::new();
         let mut now = 0;
         for n in 0..10_000u32 {

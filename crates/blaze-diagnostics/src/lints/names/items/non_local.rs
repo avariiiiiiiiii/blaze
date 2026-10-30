@@ -258,7 +258,7 @@ fn impl_(cx: &Cx<'_, '_>, item: &Item, imp: &ast::Impl) -> Vec<Found> {
     let mut paths: Vec<(ast::Path, Option<PathResolution<'_>>)> = Vec::new();
     let roots = std::iter::once(self_ty.syntax().clone()).chain(imp.trait_().map(|it| it.syntax().clone()));
     for root in roots {
-        for path in std::iter::once(root.clone()).chain(root.descendants()).filter_map(ast::Path::cast) {
+        for path in root.descendants().filter(|it| it.kind() == SyntaxKind::PATH).filter_map(ast::Path::cast) {
             if path.syntax().parent().is_some_and(|it| ast::Path::can_cast(it.kind())) {
                 continue;
             }

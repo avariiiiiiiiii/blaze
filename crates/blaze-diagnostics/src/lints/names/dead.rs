@@ -6,6 +6,10 @@
 //! Where the front end can't say what rustc's pass would (a `global_asm!` naming a symbol, a
 //! `pub macro` whose expansion reaches private items), nothing is linted.
 //!
+//! The crate's syntax is walked once (`defs`), numbering every definition; each later part
+//! reads that numbering, and what each asks of a definition (its level, its attributes, what
+//! its impl is of) is computed once.
+//!
 //! Follows `compiler/rustc_passes/src/dead.rs` (`live_symbols_and_ignored_derived_traits`,
 //! `check_mod_deathness`) (MIT or Apache-2.0).
 
@@ -26,7 +30,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
     }
     let levels = level::Levels::new();
     let reach = reach::Reach::of(cx, &defs);
-    let k = seed::Crate { cx, defs: &defs, levels: &levels, reach: &reach, executable: seed::executable(cx) };
+    let k = seed::Crate::new(cx, &defs, &levels, &reach);
     let seeds = seed::seeds(&k);
     let (liveness, mut found) = mark::live(&k, seeds);
     found.extend(report::report(&k, &liveness));

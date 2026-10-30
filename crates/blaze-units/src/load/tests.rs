@@ -354,6 +354,69 @@ fn the_lock_file_pins_a_registry_package_which_is_fetched_then_built() {
     assert!(a_lib.dependencies.iter().any(|it| it.index == serde_at && it.extern_crate_name == "serde"));
 }
 
+/// How many times the load's step ran over the view's workspace, and whether its last run
+/// resolved it.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Debug)]
+struct Counted {
+    rounds: u32,
+    resolved: bool,
+}
+
+impl crate::query::Versioned for Counted {
+    const SCHEMA: blaze_format::SchemaHash = blaze_format::schema("blaze v2 cargo test rounds 1");
+}
+
+/// The view's workspace resolved as [`Plan`] resolves it, counting the step's runs.
+struct Rounds;
+
+impl Query for Rounds {
+    const KIND: blaze_query::QueryKind = blaze_query::QueryKind(0x63f2);
+    const NAME: &'static str = "cargo test rounds";
+    const PRODUCER: ContentId = crate::query::producer("blaze v2 cargo test rounds 1");
+    type Key = ();
+    type Value = crate::query::Cbor<Counted>;
+
+    fn input(key: &()) -> ContentId {
+        crate::query::key_input("blaze v2 cargo test rounds key 1", key)
+    }
+
+    fn execute(cx: &mut blaze_query::Cx<'_>, _: &()) -> Result<crate::query::Cbor<Counted>, blaze_query::Cancelled> {
+        let asked = cx.get::<Asking>(&())?.get().unwrap_or_else(|error| panic!("{}", error.what));
+        let library = cx.get::<super::files::Mounts>(&())?.get(&asked.library);
+        let spec = super::view_spec(&asked, library).unwrap_or_else(|error| panic!("{}", error.what));
+        let read = cx.get::<WorkspaceQuery>(&spec.workspace)?.get().unwrap_or_else(|error| panic!("{}", error.what));
+        let mut rounds = 0;
+        let base = super::files::Snapshot::default();
+        let (outcome, _) = super::manifest::replay(cx, &read, &spec.workspace.config, &base, |cx, ctx, ws, files, reads| {
+            rounds += 1;
+            super::resolve::resolved(cx, ctx, ws, &files, reads, &spec, |_, _| Ok(super::Staged::Done(())))
+        })?;
+        let resolved = matches!(outcome, Ok(super::Staged::Done(())));
+        Ok(crate::query::Cbor(Counted { rounds, resolved }))
+    }
+}
+
+/// The lock file and every package it pins are read ahead of the step that parses them, so a
+/// load runs its resolve once, not once for the lock file and once more for each package.
+#[test]
+fn a_locked_workspace_resolves_in_one_run() {
+    let mut fixture = Fixture::new();
+    fixture.db.register::<Rounds>();
+    let manifest = with_serde();
+    let lock = serde_lock();
+    let files = [
+        ("ws/Cargo.toml", manifest.as_str()),
+        ("ws/Cargo.lock", lock.as_str()),
+        ("ws/src/lib.rs", ""),
+        ("serde/Cargo.toml", SERDE_MANIFEST),
+        ("serde/src/lib.rs", ""),
+    ];
+    let view = fixture.open(&Ask { mounts: vec![mount(&serde_fetch().at, "serde")], ..ask(&files) });
+    let counted = fixture.db.get::<Rounds>(view, &()).expect("counted").get();
+    assert_eq!(counted, Counted { rounds: 1, resolved: true });
+    ready(fixture.plan(view));
+}
+
 #[test]
 fn without_a_lock_file_the_index_is_fetched_first_and_the_lock_written() {
     let fixture = Fixture::new();

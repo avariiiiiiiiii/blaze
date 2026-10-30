@@ -43,6 +43,8 @@ What:
 
 Owner: codegen (`crates/blaze-codegen/`, docs/v2/plan/reference/crates.md).
 
+> forwarded to codegen (window `codegen-next1`, told by tmux).
+
 ## requests-backend-axis 2: cargo: read `codegen-backend` into the policy (`crates/blaze-cargo/src/serve/unit/codegen.rs`)
 
 What: `policy` reads the root unit's `profile.codegen_backend` into
@@ -58,6 +60,8 @@ What: `policy` reads the root unit's `profile.codegen_backend` into
   quiet fallback.
 
 Owner: cargo (`crates/blaze-cargo/` but store's and usercode's paths).
+
+> forwarded to cargo (told by tmux).
 
 ## requests-backend-axis 3: coordinator: the `codegen-backend` gate as cargo has it (`crates/blaze-manifest/src/profiles.rs`)
 
@@ -76,6 +80,8 @@ cargo, the reference, builds.
 
 Owner: coordinator (`blaze-manifest` is one of the cargo crates crates.md leaves to the
 coordinator).
+
+> forwarded to the coordinator: `blaze-manifest` is its (listed in requests' report).
 
 ## When 1 to 3 are applied
 

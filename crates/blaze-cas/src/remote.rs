@@ -283,8 +283,11 @@ fn owed(buffer: &[u8]) -> usize {
 
 fn place(at: &Address) -> String {
     match at {
+        // alloc: `place` names the address in an error only (`fail`, a failed listen).
         Address::Unix(name) => format!("unix:{name}"),
+        // alloc: as above.
         Address::Inherited { fd, at } => format!("unix:{at} (fd {fd})"),
+        // alloc: as above.
         Address::Tcp(addr) => format!("tcp:{addr}"),
     }
 }

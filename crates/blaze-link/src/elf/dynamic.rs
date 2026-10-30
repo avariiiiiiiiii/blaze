@@ -29,7 +29,7 @@ pub(crate) const CHUNK: usize = 4096;
 
 /// The first error in input order, so a failed link names the same place on any core count.
 pub(crate) fn first_error(results: Vec<Result<(), LinkError>>) -> Result<(), LinkError> {
-    results.into_iter().collect()
+    results.into_iter().find_map(Result::err).map_or(Ok(()), Err)
 }
 
 /// Sorts relocations in their derived order: by addend, then stably by the fields before it.
@@ -42,13 +42,17 @@ fn sort_rela(items: &mut [Rela]) {
     radix::sort_copy_by_key(items, |it| radix::pack_64(it.at, radix::pack_32(it.r_type, it.sym)));
 }
 
-/// The synthetic regions of an output, in no particular order ([`super::Elf::order`] sorts).
-fn names(output: &Output) -> Vec<&'static str> {
-    let mut names = vec![BUILD_ID, DYNSYM, DYNSTR, GNU_HASH, VERSYM, VERNEED, RELA_DYN, DYNAMIC, EH_FRAME_HDR];
-    if output.interpreter.is_some() {
-        names.insert(0, INTERP);
+/// Every synthetic region, `.interp` first.
+const SYNTHETIC: [&str; 10] =
+    [INTERP, BUILD_ID, DYNSYM, DYNSTR, GNU_HASH, VERSYM, VERNEED, RELA_DYN, DYNAMIC, EH_FRAME_HDR];
+
+/// The synthetic regions of an output, in no particular order ([`super::Elf::order`] sorts):
+/// `.interp` only with an interpreter.
+fn names(output: &Output) -> &'static [&'static str] {
+    match output.interpreter {
+        Some(_) => &SYNTHETIC,
+        None => &SYNTHETIC[1..],
     }
-    names
 }
 
 fn soname(output: &Output) -> Option<&str> {
@@ -63,8 +67,8 @@ pub(crate) fn sizes(output: &Output, counts: &Counts) -> Vec<(Class, u64)> {
     let symbols = 1 + counts.imports + counts.exports;
     let soname = soname(output).map_or(0, |it| it.len() as u64 + 1);
     names(output)
-        .into_iter()
-        .map(|name| {
+        .iter()
+        .map(|&name| {
             let size = match name {
                 INTERP => output.interpreter.as_ref().map_or(0, |it| it.len() as u64 + 1),
                 BUILD_ID => NOTE_HEADER + 16,
@@ -88,7 +92,7 @@ pub(crate) fn sizes(output: &Output, counts: &Counts) -> Vec<(Class, u64)> {
             };
             (Class::Synthetic(name), size)
         })
-        .collect()
+        .collect() // alloc: once per image, what `Writer::synthetic` returns
 }
 
 const NOTE_HEADER: u64 = 12 + 4;
@@ -192,7 +196,7 @@ pub(crate) fn info(bind: u8, kind: SymbolKind) -> u8 {
 /// Whether every region's section header has an ordinary ELF number, as [`shndx`] needs.
 pub(crate) fn numbered(regions: &[Region]) -> Result<(), LinkError> {
     if regions.len() + 1 >= usize::from(elf::SHN_LORESERVE) {
-        return Err(error(format!("{} regions: more sections than ELF numbers", regions.len())));
+        return Err(error(format!("{} regions: more sections than ELF numbers", regions.len()))); // alloc: error path
     }
     Ok(())
 }
@@ -214,10 +218,10 @@ pub(crate) fn value(placed: &Placed<'_>, name: &str, addr: u64, kind: SymbolKind
     if kind != SymbolKind::Tls {
         return Ok(addr);
     }
-    let tls = placed.tls.ok_or_else(|| error(format!("thread-local `{name}` in an image with no TLS")))?;
+    let tls = placed.tls.ok_or_else(|| error(format!("thread-local `{name}` in an image with no TLS")))?; // alloc: error path
     addr.checked_sub(tls.addr)
         .filter(|&it| it <= tls.size)
-        .ok_or_else(|| error(format!("thread-local `{name}` at {addr:#x} is outside the TLS template")))
+        .ok_or_else(|| error(format!("thread-local `{name}` at {addr:#x} is outside the TLS template"))) // alloc: error path
 }
 
 /// The dynamic relocation types of an architecture.
@@ -297,85 +301,108 @@ impl Tables {
         let imports = placed.imports;
         let exports = placed.exports;
 
-        // `--as-needed`: a library none of whose symbols are imported is left out.
-        let mut used = vec![false; libraries.len()];
+        // `--as-needed`: a library none of whose symbols are imported is left out. By library,
+        // its place among the needed ones in load order, or NOT_NEEDED; an import marks its
+        // library 0 until they are numbered.
+        const NOT_NEEDED: u32 = u32::MAX;
+        // alloc: once per image, 4 bytes per library
+        let mut slot = vec![NOT_NEEDED; libraries.len()];
         for (at, import) in imports.iter().enumerate() {
             let Some(library) = import.library else { continue };
-            let Some(flag) = used.get_mut(library as usize) else {
+            let Some(flag) = slot.get_mut(library as usize) else {
+                // alloc: error path
                 return Err(error(format!("import {at} (`{}`) of library {library}, of no library", import.name)));
             };
-            *flag = true;
+            *flag = 0;
         }
-        let needed: Vec<usize> = (0..libraries.len()).filter(|&it| !libraries[it].as_needed || used[it]).collect();
 
         let string_bytes = libraries.iter().map(|it| it.name.len() + 1).sum::<usize>()
             + soname(output).map_or(0, |it| it.len() + 1)
             + imports.iter().map(|it| it.name.len() + 1 + it.version.as_ref().map_or(0, |it| it.len() + 1)).sum::<usize>()
             + exports.iter().map(|it| it.name.len() + 1).sum::<usize>();
-        let mut strings = Strings::with_capacity(string_bytes, needed.len() + 1 + 2 * imports.len() + exports.len());
-        let needed_names: Vec<u32> = needed.iter().map(|&it| strings.add(&libraries[it].name)).collect();
-        let soname = soname(output).map(|it| strings.add(it));
-
-        // Versions of imports, numbered from 2 by library in load order, then first use: one
-        // probe per import.
-        const NOT_NEEDED: u32 = u32::MAX;
-        let mut slot = vec![NOT_NEEDED; libraries.len()];
-        for (at, &library) in needed.iter().enumerate() {
-            slot[library] = at as u32;
-        }
-        let mut versions: Vec<(usize, Vec<(&str, u16)>)> = needed.iter().map(|&it| (it, Vec::new())).collect();
-        let mut version_index: FxHashMap<(u32, &str), u16> = FxHashMap::default();
-        let mut next = 2u16;
-        let mut version_of = vec![elf::VER_NDX_GLOBAL; imports.len()];
-        for (at, import) in imports.iter().enumerate() {
-            let (Some(library), Some(version)) = (import.library, &import.version) else { continue };
-            let slot = slot[library as usize];
-            if slot == NOT_NEEDED {
+        let mut strings = Strings::with_capacity(string_bytes, libraries.len() + 1 + 2 * imports.len() + exports.len());
+        // By needed library: its name's offset in `.dynstr`.
+        let mut needed_names = Vec::with_capacity(libraries.len());
+        for (at, library) in libraries.iter().enumerate() {
+            if library.as_needed && slot[at] == NOT_NEEDED {
                 continue;
             }
-            version_of[at] = match version_index.entry((slot, version.as_str())) {
-                Entry::Occupied(it) => *it.get(),
-                Entry::Vacant(it) => {
-                    let index = next;
-                    next = next
-                        .checked_add(1)
-                        .filter(|&it| it < elf::VERSYM_HIDDEN)
-                        .ok_or_else(|| error("more symbol versions than ELF numbers".into()))?;
-                    versions[slot as usize].1.push((version.as_str(), index));
-                    *it.insert(index)
-                }
-            };
+            slot[at] = needed_names.len() as u32;
+            needed_names.push(strings.add(&library.name));
         }
-        versions.retain(|(_, list)| !list.is_empty());
+        let soname = soname(output).map(|it| strings.add(it));
+
+        // Versions of imports, numbered from 2 in order of first use, one probe per import;
+        // `.gnu.version` takes each import's as it is found. `needs` holds each version once
+        // with its library's slot, then is sorted stably by slot: each library's versions are
+        // a run of it, in the order they were numbered.
+        let symbols = 1 + imports.len() + exports.len();
+        let symoffset = 1 + imports.len() as u32;
+        let mut versym = Vec::with_capacity(symbols * 2);
+        versym.u16(elf::VER_NDX_LOCAL);
+        let versioned = imports.iter().filter(|it| it.library.is_some() && it.version.is_some()).count();
+        let mut needs: Vec<(u32, &str, u16)> = Vec::with_capacity(versioned);
+        let mut version_index: FxHashMap<(u32, &str), u16> =
+            FxHashMap::with_capacity_and_hasher(versioned, Default::default());
+        let mut next = 2u16;
+        for import in imports {
+            let version = match (import.library, &import.version) {
+                (Some(library), Some(version)) if slot[library as usize] != NOT_NEEDED => {
+                    let slot = slot[library as usize];
+                    match version_index.entry((slot, version.as_str())) {
+                        Entry::Occupied(it) => *it.get(),
+                        Entry::Vacant(it) => {
+                            let index = next;
+                            next = next
+                                .checked_add(1)
+                                .filter(|&it| it < elf::VERSYM_HIDDEN)
+                                .ok_or_else(|| error("more symbol versions than ELF numbers".into()))?;
+                            needs.push((slot, version.as_str(), index));
+                            *it.insert(index)
+                        }
+                    }
+                }
+                _ => elf::VER_NDX_GLOBAL,
+            };
+            versym.u16(version);
+        }
+        versym.resize(symbols * 2, 0);
+        for pair in versym[2 * symoffset as usize..].chunks_exact_mut(2) {
+            pair.copy_from_slice(&elf::VER_NDX_GLOBAL.to_le_bytes());
+        }
+        radix::sort_copy_by_key(&mut needs, |it| it.0);
 
         // `.gnu.hash` as mold builds it: every hash once (in parallel when there are many),
         // then the exports in bucket order by a stable counting sort, the order a stable sort
         // by bucket gives, in two passes.
-        let symoffset = 1 + imports.len() as u32;
         let (buckets, mask_words) = gnu_hash_shape(exports.len() as u64);
-        let hashes: Vec<u32> = if exports.len() >= CHUNK {
-            exports.par_iter().with_min_len(CHUNK).map(|it| gnu_hash(it.name.as_bytes())).collect()
+        let mut hashes = Vec::with_capacity(exports.len());
+        if exports.len() >= CHUNK {
+            hashes.par_extend(exports.par_iter().with_min_len(CHUNK).map(|it| gnu_hash(it.name.as_bytes())));
         } else {
-            exports.iter().map(|it| gnu_hash(it.name.as_bytes())).collect()
-        };
+            hashes.extend(exports.iter().map(|it| gnu_hash(it.name.as_bytes())));
+        }
         let bucket_of = |hash: u32| (hash % buckets as u32) as usize;
-        let mut starts = vec![0u32; buckets as usize + 1];
+        // `ends[b + 1]` counts bucket `b`; summed, `ends[b]` is its start, which placing its
+        // exports advances to its end.
+        // alloc: once per image, 4 bytes per bucket
+        let mut ends = vec![0u32; buckets as usize + 1];
         for &hash in &hashes {
-            starts[bucket_of(hash) + 1] += 1;
+            ends[bucket_of(hash) + 1] += 1;
         }
-        for at in 1..starts.len() {
-            starts[at] += starts[at - 1];
+        for at in 1..ends.len() {
+            ends[at] += ends[at - 1];
         }
+        // alloc: once per image, 4 bytes per export
         let mut order = vec![0u32; exports.len()];
-        let mut fill = starts.clone();
         for (at, &hash) in hashes.iter().enumerate() {
             let bucket = bucket_of(hash);
-            order[fill[bucket] as usize] = at as u32;
-            fill[bucket] += 1;
+            order[ends[bucket] as usize] = at as u32;
+            ends[bucket] += 1;
         }
+        let bucket_start = |bucket: usize| if bucket == 0 { 0 } else { ends[bucket - 1] };
 
         // `.dynsym`: the null symbol, the imports, then the exports in bucket order.
-        let symbols = 1 + imports.len() + exports.len();
         let mut dynsym = Vec::with_capacity(symbols * SYM as usize);
         Sym::default().put(&mut dynsym);
         for import in imports {
@@ -395,25 +422,16 @@ impl Tables {
             .put(&mut dynsym);
         }
 
-        let mut versym = Vec::with_capacity(symbols * 2);
-        versym.u16(elf::VER_NDX_LOCAL);
-        for version in &version_of {
-            versym.u16(*version);
-        }
-        versym.resize(symbols * 2, 0);
-        for pair in versym[2 * symoffset as usize..].chunks_exact_mut(2) {
-            pair.copy_from_slice(&elf::VER_NDX_GLOBAL.to_le_bytes());
-        }
-
-        let mut verneed = Vec::with_capacity(versions.iter().map(|(_, list)| 16 + 16 * list.len()).sum());
-        for (at, (library, list)) in versions.iter().enumerate() {
-            let last = at + 1 == versions.len();
+        let versioned_libraries = needs.chunk_by(|a, b| a.0 == b.0).count();
+        let mut verneed = Vec::with_capacity(16 * (versioned_libraries + needs.len()));
+        for (at, list) in needs.chunk_by(|a, b| a.0 == b.0).enumerate() {
+            let last = at + 1 == versioned_libraries;
             verneed.u16(1);
             verneed.u16(list.len() as u16);
-            verneed.u32(strings.add(&libraries[*library].name));
+            verneed.u32(needed_names[list[0].0 as usize]);
             verneed.u32(16);
             verneed.u32(if last { 0 } else { 16 + 16 * list.len() as u32 });
-            for (at, &(name, index)) in list.iter().enumerate() {
+            for (at, &(_, name, index)) in list.iter().enumerate() {
                 verneed.u32(elf_hash(name.as_bytes()));
                 verneed.u16(0);
                 verneed.u16(index);
@@ -427,25 +445,27 @@ impl Tables {
         gnu_hash.u32(symoffset);
         gnu_hash.u32(mask_words as u32);
         gnu_hash.u32(BLOOM_SHIFT);
-        let mut bloom = vec![0u64; mask_words as usize];
+        // The bloom filter, set in place.
+        let bloom = gnu_hash.len();
+        gnu_hash.resize(bloom + 8 * mask_words as usize, 0);
         for &hash in &hashes {
-            let word = (hash as u64 / 64) % mask_words;
-            bloom[word as usize] |= (1 << (hash % 64)) | (1 << ((hash >> BLOOM_SHIFT) % 64));
-        }
-        for word in bloom {
-            gnu_hash.u64(word);
+            let word = bloom + 8 * ((hash as u64 / 64) % mask_words) as usize;
+            let bits = (1u64 << (hash % 64)) | (1u64 << ((hash >> BLOOM_SHIFT) % 64));
+            let cell: &mut [u8; 8] = (&mut gnu_hash[word..word + 8]).try_into().expect("8 bytes");
+            *cell = (u64::from_le_bytes(*cell) | bits).to_le_bytes();
         }
         for bucket in 0..buckets as usize {
-            let (start, end) = (starts[bucket], starts[bucket + 1]);
+            let (start, end) = (bucket_start(bucket), ends[bucket]);
             gnu_hash.u32(if start == end { 0 } else { symoffset + start });
         }
         for (at, &export) in order.iter().enumerate() {
             let hash = hashes[export as usize];
-            let last = at as u32 + 1 == starts[bucket_of(hash) + 1];
+            let last = at as u32 + 1 == ends[bucket_of(hash)];
             gnu_hash.u32((hash & !1) | last as u32);
         }
 
         let (relocations, relative) = relocations(writer, placed, shared)?;
+        // alloc: the output buffer, `.rela.dyn`'s bytes
         let mut rela = vec![0; relocations.len() * RELA as usize];
         rela.par_chunks_mut(RELA as usize * CHUNK).zip(relocations.par_chunks(CHUNK)).for_each(|(out, chunk)| {
             for (out, it) in out.chunks_exact_mut(RELA as usize).zip(chunk) {
@@ -459,14 +479,14 @@ impl Tables {
             placed
                 .region(&Class::Synthetic(name))
                 .map(|(_, it)| it.addr)
-                .ok_or_else(|| error(format!("the image has no `{name}` region")))
+                .ok_or_else(|| error(format!("the image has no `{name}` region"))) // alloc: error path
         };
-        let mut dynamic = Vec::new();
+        let mut dynamic = Vec::with_capacity(16 * (needed_names.len() + DYNAMIC_FIXED as usize));
         let mut entry = |tag: u32, value: u64| {
             dynamic.u64(u64::from(tag));
             dynamic.u64(value);
         };
-        for name in needed_names {
+        for &name in &needed_names {
             entry(elf::DT_NEEDED, u64::from(name));
         }
         if let Some(soname) = soname {
@@ -510,10 +530,10 @@ impl Tables {
             entry(elf::DT_RELAENT, RELA);
             entry(elf::DT_RELACOUNT, relative as u64);
         }
-        if !versions.is_empty() {
+        if versioned_libraries != 0 {
             entry(elf::DT_VERSYM, address(VERSYM)?);
             entry(elf::DT_VERNEED, address(VERNEED)?);
-            entry(elf::DT_VERNEEDNUM, versions.len() as u64);
+            entry(elf::DT_VERNEEDNUM, versioned_libraries as u64);
         }
         entry(elf::DT_NULL, 0);
 
@@ -551,12 +571,13 @@ impl Tables {
             RELA_DYN => &mut self.rela,
             DYNAMIC => &mut self.dynamic,
             EH_FRAME_HDR => &mut self.eh_frame_hdr,
-            _ => return Vec::new(),
+            _ => unreachable!("a synthetic region `names` doesn't list"),
         })
     }
 
     pub(crate) fn regions(mut self, output: &Output) -> Vec<(Class, Vec<u8>)> {
-        names(output).into_iter().map(|name| (Class::Synthetic(name), self.take(name))).collect()
+        // alloc: once per image, what `Writer::synthesize` returns
+        names(output).iter().map(|&name| (Class::Synthetic(name), self.take(name))).collect()
     }
 }
 
@@ -573,9 +594,10 @@ fn region_at(regions: &[Region], addr: u64) -> Option<usize> {
 /// Whether the loader may write `at`: the region holding it, or an error naming a text
 /// relocation.
 fn writable(regions: &[Region], at: u64, what: &str) -> Result<usize, LinkError> {
-    let region = region_at(regions, at).ok_or_else(|| error(format!("{what} at {at:#x}, in no region of the image")))?;
+    let region = region_at(regions, at).ok_or_else(|| error(format!("{what} at {at:#x}, in no region of the image")))?; // alloc: error path
     let class = &regions[region].class;
     if !Segment::of(class).loader_writes() {
+        // alloc: error path
         return Err(error(format!("{what} at {at:#x} is in {class:?}, which the loader can't write (a text relocation)")));
     }
     Ok(region)
@@ -583,20 +605,22 @@ fn writable(regions: &[Region], at: u64, what: &str) -> Result<usize, LinkError>
 
 /// `.rela.dyn`: `RELATIVE` for every slid address (sorted, first, counted by
 /// `DT_RELACOUNT`), then what binds to imports and thread-locals, by address; and how many
-/// are `RELATIVE`. The slid addresses, most of the table, are read in parallel into a
-/// buffer of their exact size.
+/// are `RELATIVE`. One buffer of room for both: the slid addresses, most of the table, are
+/// read into it in parallel, and the rest pushed after them and sorted in place.
 fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<Rela>, usize), LinkError> {
     let types = types(writer.output.arch);
     let import = |index: u32| -> Result<u32, LinkError> {
         if index as usize >= placed.imports.len() {
-            return Err(error(format!("a dynamic relocation to import {index}, of no import")));
+            return Err(error(format!("a dynamic relocation to import {index}, of no import"))); // alloc: error path
         }
         Ok(1 + index)
     };
     let regions = placed.regions;
     let relative_type = types.relative;
     let other_cells = placed.binds.len() + 2 * placed.got.len();
-    let mut relative = vec![Rela::default(); placed.rebase.len()];
+    let mut relative = Vec::with_capacity(placed.rebase.len() + other_cells);
+    relative.resize(placed.rebase.len(), Rela::default());
+    // alloc: once per image, one result per chunk of slid addresses
     let results: Vec<Result<(), LinkError>> = relative
         .par_chunks_mut(CHUNK)
         .zip(placed.rebase.par_chunks(CHUNK))
@@ -607,7 +631,7 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
                 let value = placed
                     .bytes(region)
                     .get(offset..offset + 8)
-                    .ok_or_else(|| error(format!("a slid address at {at:#x}, outside the bytes of its region")))?;
+                    .ok_or_else(|| error(format!("a slid address at {at:#x}, outside the bytes of its region")))?; // alloc: error path
                 let value = u64::from_le_bytes(value.try_into().expect("8 bytes"));
                 *out = Rela { at, r_type: relative_type, sym: 0, addend: value as i64 };
             }
@@ -617,9 +641,8 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
     first_error(results)?;
     sort_rela(&mut relative);
     let count = relative.len();
-    relative.reserve_exact(other_cells);
 
-    let mut other = Vec::with_capacity(other_cells);
+    let other = &mut relative;
     let writable = |at: u64, what: &str| writable(regions, at, what);
     for bind in placed.binds {
         writable(bind.addr, "a bound address")?;
@@ -634,10 +657,12 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
             // block's offset from the thread pointer to the variable's offset in it.
             &Holds::TpOff(tp) if shared => {
                 let tls = placed.tls.ok_or_else(|| {
+                    // alloc: error path
                     error(format!("the GOT cell at {at:#x} holds a thread pointer offset in an image with no TLS"))
                 })?;
                 let addend = block_offset(writer.output.arch, tls, tp);
                 if addend < 0 || addend as u64 > tls.size {
+                    // alloc: error path
                     return Err(error(format!(
                         "the GOT cell at {at:#x} holds thread pointer offset {tp}, outside the TLS template"
                     )));
@@ -662,8 +687,7 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
             }
         }
     }
-    sort_rela(&mut other);
-    relative.extend(other);
+    sort_rela(&mut relative[count..]);
     Ok((relative, count))
 }
 
@@ -711,7 +735,7 @@ fn gnu_hash_len(n: u64) -> u64 {
 fn rel32(to: u64, from: u64, what: &str) -> Result<u32, LinkError> {
     i32::try_from(to.wrapping_sub(from) as i64)
         .map(|it| it as u32)
-        .map_err(|_| error(format!("{what}: {to:#x} is out of 32-bit reach of {from:#x}")))
+        .map_err(|_| error(format!("{what}: {to:#x} is out of 32-bit reach of {from:#x}"))) // alloc: error path
 }
 
 /// `.eh_frame_hdr`: the binary search table of every FDE in [`Class::EhFrame`] (the
@@ -724,7 +748,7 @@ fn eh_frame_hdr(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
     let hdr = placed
         .region(&Class::Synthetic(EH_FRAME_HDR))
         .map(|(_, it)| it.addr)
-        .ok_or_else(|| error(format!("the image has no `{EH_FRAME_HDR}` region")))?;
+        .ok_or_else(|| error(format!("the image has no `{EH_FRAME_HDR}` region")))?; // alloc: error path
     let mut table = Vec::with_capacity(placed.functions.len());
     let eh_frame = placed.region(&Class::EhFrame);
     if let Some((index, region)) = eh_frame {
@@ -732,7 +756,7 @@ fn eh_frame_hdr(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
         section.set_address_size(8);
         let bases = gimli::BaseAddresses::default().set_eh_frame(region.addr);
         let mut entries = section.entries(&bases);
-        let bad = |it: gimli::Error| error(format!("the image's .eh_frame at {:#x}: {it}", region.addr));
+        let bad = |it: gimli::Error| error(format!("the image's .eh_frame at {:#x}: {it}", region.addr)); // alloc: error path
         let mut cies = FxHashMap::default();
         while let Some(entry) = entries.next().map_err(bad)? {
             match entry {
@@ -742,6 +766,7 @@ fn eh_frame_hdr(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
                 gimli::CieOrFde::Fde(partial) => {
                     let fde = partial
                         .parse(|section, bases, offset| match cies.get(&offset.0) {
+                            // clone: a gimli CIE is plain data borrowing the section, no heap; `parse` takes it by value
                             Some(cie) => Ok(cie.clone()),
                             None => section.cie_from_offset(bases, offset),
                         })

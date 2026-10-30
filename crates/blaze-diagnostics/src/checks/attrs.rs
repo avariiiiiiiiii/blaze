@@ -27,7 +27,7 @@ mod accept;
 pub(in crate::checks) mod args;
 mod cfg;
 mod check;
-mod parsed;
+pub(in crate::checks) mod parsed;
 mod parsers;
 
 use blaze_items::Fact;

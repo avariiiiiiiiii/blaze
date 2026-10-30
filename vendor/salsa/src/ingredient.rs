@@ -129,6 +129,14 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
         _ = (table, relocation);
     }
 
+    /// Drops the memos this struct ingredient's memo columns retired since the last reclaim and
+    /// frees their slots ([`MemoTableTypes::reclaim`]). Only struct ingredients have memo columns.
+    ///
+    /// # Safety
+    ///
+    /// No memo in this ingredient's memo tables is borrowed, and no other thread accesses them.
+    unsafe fn reclaim_memos(&self) {}
+
     fn memo_table_types(&self) -> &Arc<MemoTableTypes>;
 
     fn memo_table_types_mut(&mut self) -> &mut Arc<MemoTableTypes>;

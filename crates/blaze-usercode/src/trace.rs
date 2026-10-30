@@ -316,37 +316,49 @@ pub fn assemble<'l, I: Inputs>(
     scope: Option<&str>,
     inputs: &mut I,
 ) -> Result<Traced, I::Error> {
+    let ours = |line: &&Line| match scope {
+        None => true,
+        Some(scope) => line.scope.is_empty() || line.scope == scope,
+    };
+    assemble_seen(lines.into_iter().filter(ours).map(|line| (line.seen, line.what.as_str())), inputs)
+}
+
+/// [`assemble`] of lines already of one scope, borrowed: each name is owned once, however
+/// many lines name it.
+pub fn assemble_seen<'a, I: Inputs>(
+    lines: impl IntoIterator<Item = (Seen, &'a str)>,
+    inputs: &mut I,
+) -> Result<Traced, I::Error> {
     let mut files = FxHashSet::default();
     let mut dirs = FxHashSet::default();
     let mut env = FxHashSet::default();
     let mut all_env = false;
     let mut untraceable = FxHashSet::default();
-    let ours = |line: &Line| match scope {
-        None => true,
-        Some(scope) => line.scope.is_empty() || line.scope == scope,
-    };
-    for line in lines.into_iter().filter(|it| ours(it)) {
-        match line.seen {
-            Seen::Read | Seen::Looked => _ = files.insert(PathBuf::from(&line.what)),
-            Seen::Listed => _ = dirs.insert(PathBuf::from(&line.what)),
-            Seen::Env if line.what == ALL_ENV => all_env = true,
-            Seen::Env => _ = env.insert(OsString::from(&line.what)),
+    for (seen, what) in lines {
+        match seen {
+            Seen::Read | Seen::Looked => _ = files.insert(what),
+            Seen::Listed => _ = dirs.insert(what),
+            Seen::Env if what == ALL_ENV => all_env = true,
+            Seen::Env => _ = env.insert(what),
             Seen::Untraceable => {
                 // A name this blaze doesn't know is something it can't trace either.
-                untraceable.insert(untraceable_of(&line.what).unwrap_or(Untraceable::Descriptor));
+                untraceable.insert(untraceable_of(what).unwrap_or(Untraceable::Descriptor));
             }
             Seen::Incomplete => _ = untraceable.insert(Untraceable::Descriptor),
             Seen::RefusedWrite | Seen::RefusedNet => {}
         }
     }
     // Each set sorted once here: `inputs` is asked, and `traced` filled, in that order.
-    fn sorted<T: Ord>(set: FxHashSet<T>) -> Vec<T> {
+    fn sorted<T: Ord>(set: impl IntoIterator<Item = T>) -> Vec<T> {
         let mut set: Vec<T> = set.into_iter().collect();
         set.sort_unstable();
         set
     }
-    let (files, dirs, env): (Vec<PathBuf>, Vec<PathBuf>, Vec<OsString>) =
-        (sorted(files), sorted(dirs), sorted(env));
+    let (files, dirs, env): (Vec<PathBuf>, Vec<PathBuf>, Vec<OsString>) = (
+        sorted(files.into_iter().map(PathBuf::from)),
+        sorted(dirs.into_iter().map(PathBuf::from)),
+        sorted(env.into_iter().map(OsString::from)),
+    );
     let mut traced = Traced::default();
     for path in files {
         let hash = inputs.file(&path)?;

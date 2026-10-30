@@ -23,3 +23,21 @@ What, in `File::parser_error` and `File::lexer_error`:
 
 Why: so blaze prints what rustc prints for these programs (the lexer and the grammar give the
 tokens and the tree; the diagnostic shape is the lowering's).
+
+> forwarded to diagnostics (told by tmux).
+
+## format-lexer: a branch-free keyword probe (format-grammar, `crates/parser/src/syntax_kind/keywords.rs`)
+
+What: `SyntaxKind::from_keyword(text, edition)` runs on every identifier the lexer makes (30% of
+tokens). Today it costs about 15 instructions with a length filter and a perfect hash. A probe of
+about 8 would do: build a key from the length and the first two bytes, use it to index the
+table, then one masked 8-byte compare against the stored keyword, then the edition check on the
+entry. Every strict keyword (`keywords::strict`, the only lookup the lexer makes) is at most 8
+bytes long. The contextual table needn't change. It must give the same answer as today for every
+string and edition. A test over all keywords, every edition and a corpus of identifiers would
+show it.
+
+Why: the lexer's speed of light (`docs/v2/plan/lanes/format/speed-of-light.md`, "The lexer",
+item 3). It lowers the lexer's per-token minimum from about 13.5 instructions to about 11.5.
+
+> forwarded to format-grammar (told by tmux).

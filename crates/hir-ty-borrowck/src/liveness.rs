@@ -90,44 +90,12 @@ fn assigned(local: LocalId, projection: &[PlaceElem], effects: &mut Effects<'_>)
     }
 }
 
-/// The values of expression statements (`match x { None => &temp(), Some(it) => it };`),
-/// which lowering reads once the statement's temporaries are dropped, and rustc does not; with,
-/// for a `match`, the type of its value, which tells that read from the read of what it matches
-/// (they have the same span), where the two types differ.
-fn statement_values<'db>(ctx: &Ctx<'_, 'db>) -> FxHashMap<hir_def::hir::ExprId, Option<Ty<'db>>> {
-    let erased = |ty: Ty<'db>| {
-        rustc_type_ir::fold_regions(ctx.infcx.interner, ty, |_, _| {
-            Region::new_erased(ctx.infcx.interner)
-        })
-    };
-    let mut found = FxHashMap::default();
-    for (_, expr) in ctx.store.exprs() {
-        let hir_def::hir::Expr::Block { statements, .. } = expr else { continue };
-        for statement in statements.iter() {
-            let hir_def::hir::Statement::Expr { expr, .. } = statement else { continue };
-            match ctx.store.expr(*expr) {
-                hir_def::hir::Expr::Match { expr: matched, .. } => {
-                    let value = erased(ctx.infer.expr_ty(*expr));
-                    if value != erased(ctx.infer.expr_ty(matched)) {
-                        found.insert(*expr, Some(value));
-                    }
-                }
-                _ => {
-                    found.insert(*expr, None);
-                }
-            }
-        }
-    }
-    found
-}
-
 /// What the point at `location` does to the locals; a drop only where what it drops may be
 /// initialized, which `drops_initialized` says by point.
 fn effects_at<'db>(
     ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,
     location: Location,
-    statement_values: &FxHashMap<hir_def::hir::ExprId, Option<Ty<'db>>>,
     drops_initialized: &BitSet,
     effects: &mut Effects<'_>,
 ) {
@@ -148,7 +116,7 @@ fn effects_at<'db>(
             }
             StatementKind::FakeRead(place)
                 if let hir_ty_mir::mir::MirSpan::ExprId(expr) = statement.span
-                    && let Some(value) = statement_values.get(&expr)
+                    && let Some(value) = ctx.scan.statement_value(expr)
                     && value.is_none_or(|value| {
                         place.projection.is_empty()
                             && rustc_type_ir::fold_regions(
@@ -282,14 +250,13 @@ pub(super) fn region_liveness<'db>(
     let mut values = vec![IntervalSet::default(); count];
     // A drop of what cannot be initialized there does nothing.
     let (drops_initialized, init_at_exit) = maybe_initialized_at_drops(body, cfg, moves);
-    let statement_values = statement_values(ctx);
     let mut facts = Facts::with_capacity(cfg.points * 2);
     for &block in &cfg.order {
         let start = cfg.block_start(block);
         for statement in 0..=body.basic_blocks[block].statements.len() {
             let location = Location { block, statement };
             let effects = &mut Effects { facts: &mut facts, point: start + statement };
-            effects_at(ctx, body, location, &statement_values, &drops_initialized, effects);
+            effects_at(ctx, body, location, &drops_initialized, effects);
         }
     }
     for &(local, location) in &regions.callee_reads {

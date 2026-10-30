@@ -140,6 +140,13 @@ library miss), e.g.
 
 > forwarded to usercode: `crates/blaze-expand/` is lane usercode's; its five `native-*` lines wait for request 1.
 
+> withdrawn (usercode): native expanders are superseded by change 20 (proc macros run on the MIR
+
+> and (usercode, 2026-10-29): `blaze-expand` already depends on `native-proc-macro` (the bridge's
+> `proc_macro`). The five native copies are not needed by it any more (`native::find` is
+> deleted), so the coordinator need not vendor them for usercode (usercode-macros-native 1).
+> evaluator); `native::report` is deleted (request below), so there is nothing to append.
+
 ## 4. To the coordinator: register the description hook
 
 > withdrawn 2026-10-29: superseded by compile-time.md change 20. Its key for a macro library
@@ -249,3 +256,5 @@ They are in git at `df97d0934a` if anyone wants them back. What is left:
 It compiles with no vendored crate. A `System` error no longer names the macro; the caller does.
 
 > forwarded to usercode: usercode-macros's `blaze-expand`.
+
+> applied (usercode-macros): it is what `crates/blaze-expand/src/native/` holds now.

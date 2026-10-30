@@ -15,7 +15,7 @@ use blaze_core::{Completion, Done, Effect, FileName, Tag};
 use blaze_live::patch::message_file;
 
 use crate::state::State;
-use crate::{Image, LinkError};
+use crate::{Image, LinkError, Output};
 
 /// A state the image can go back to: the state before a commit, and the ranges of its file
 /// the commit overwrote (read from `state` when rolling back).
@@ -35,6 +35,18 @@ pub(crate) struct Steps {
     first: u32,
 }
 
+impl Steps {
+    /// Adds a step of `effects`; a step of none is left out.
+    fn step(&mut self, effects: impl IntoIterator<Item = Effect>) {
+        let before = self.effects.len();
+        self.effects.extend(effects);
+        let count = (self.effects.len() - before) as u32;
+        if count != 0 {
+            self.counts.push_back(count);
+        }
+    }
+}
+
 /// A commit or rollback in flight.
 pub(crate) struct Pending {
     steps: Steps,
@@ -44,19 +56,18 @@ pub(crate) struct Pending {
     done: Vec<u64>,
     left: u32,
     failed: Option<LinkError>,
-    /// What the image goes back to if an effect fails before the rename: its state, and
-    /// what becomes of the history.
-    revert: Option<(State, History)>,
+    /// What the image goes back to if an effect fails before the rename.
+    revert: Option<Revert>,
 }
 
-/// What a failed commit or rollback does to the history.
-pub(crate) enum History {
-    /// Drops the undo the commit pushed.
+/// What a failed commit or rollback puts back.
+pub(crate) enum Revert {
+    /// A commit: the state before it is the undo it pushed, the history's last.
     Pop,
-    /// Puts back the undo the rollback took.
-    Push(Undo),
-    /// Leaves it: the first commit pushed nothing.
-    Keep,
+    /// A rollback: the state it left, and the undo it took (whose state the image now has).
+    Push { state: State, full: bool, len: u64, writes: Vec<(u64, u64)> },
+    /// The first commit, which pushed nothing: the state before it.
+    Keep(State),
 }
 
 /// How many commits back a rollback can go.
@@ -68,88 +79,80 @@ pub(crate) struct Writes {
     pub len: u64,
     pub old_len: u64,
     pub writes: Vec<(u64, Vec<u8>)>,
-    /// Message files to remove first, and the encoded one to write last.
-    pub remove: Vec<u64>,
+    /// The message file to remove first (a rollback's: the generation it undoes), and the
+    /// encoded one to write last.
+    pub remove: Option<u64>,
     pub message: Option<(u64, Vec<u8>)>,
 }
 
+/// The image's tags, given out one after another: the high half is the output's.
+struct Tags<'t> {
+    high: u64,
+    low: &'t mut u32,
+}
+
+impl Tags<'_> {
+    fn next(&mut self) -> Tag {
+        *self.low = self.low.wrapping_add(1);
+        Tag(self.high | u64::from(*self.low))
+    }
+}
+
+/// A copy of a file name for an effect.
+fn owned(name: &FileName) -> FileName {
+    // clone: each effect owns its file name (`blaze_core::Effect`), a few per commit
+    name.clone()
+}
+
+fn message_name(output: &Output, generation: u64) -> Option<FileName> {
+    let live = output.live.as_ref()?;
+    // alloc: the message file's name, once per commit; the effect owns it
+    FileName::new(&format!("{}/{}", live.dir.as_str(), message_file(generation)))
+}
+
 impl Image {
-    fn tag(&mut self) -> Tag {
-        self.tags = self.tags.wrapping_add(1);
-        Tag(self.output.tags | u64::from(self.tags))
-    }
-
-    fn message_name(&self, generation: u64) -> Option<FileName> {
-        let live = self.output.live.as_ref()?;
-        FileName::new(&format!("{}/{}", live.dir.as_str(), message_file(generation)))
-    }
-
     pub(crate) fn steps(&mut self, writes: Writes) -> Result<Steps, LinkError> {
-        let to = self.to.clone();
-        let next = self.next.clone();
-        let removes = writes.remove.len();
+        let mut tags = Tags { high: self.output.tags, low: &mut self.tags };
+        let (to, next) = (&self.to, &self.next);
         let mut steps = Steps {
-            effects: VecDeque::with_capacity(writes.writes.len() + removes + 7),
+            effects: VecDeque::with_capacity(writes.writes.len() + 8),
             counts: VecDeque::with_capacity(9),
-            first: self.tags.wrapping_add(1),
+            first: tags.low.wrapping_add(1),
         };
-        let step = |steps: &mut Steps, effects: &mut dyn Iterator<Item = Effect>| {
-            let before = steps.effects.len();
-            steps.effects.extend(effects);
-            let count = (steps.effects.len() - before) as u32;
-            if count != 0 {
-                steps.counts.push_back(count);
-            }
-        };
-        let tag = self.tag();
-        step(&mut steps, &mut std::iter::once(Effect::Remove { file: next.clone(), tag }));
+        steps.step([Effect::Remove { file: owned(next), tag: tags.next() }]);
         if writes.full {
-            let tag = self.tag();
-            step(&mut steps, &mut std::iter::once(Effect::Truncate { file: next.clone(), len: writes.len, tag }));
+            steps.step([Effect::Truncate { file: owned(next), len: writes.len, tag: tags.next() }]);
         } else {
-            let tag = self.tag();
-            step(&mut steps, &mut std::iter::once(Effect::Clone { from: to.clone(), to: next.clone(), tag }));
+            steps.step([Effect::Clone { from: owned(to), to: owned(next), tag: tags.next() }]);
             if writes.len != writes.old_len {
-                let tag = self.tag();
-                step(&mut steps, &mut std::iter::once(Effect::Truncate { file: next.clone(), len: writes.len, tag }));
+                steps.step([Effect::Truncate { file: owned(next), len: writes.len, tag: tags.next() }]);
             }
         }
-        let mut writes_of = writes.writes.into_iter().map(|(at, bytes)| Effect::WriteAt {
-            file: next.clone(),
-            at,
-            bytes,
-            tag: self.tag(),
-        });
-        step(&mut steps, &mut writes_of);
-        drop(writes_of);
-        let tag = self.tag();
-        step(&mut steps, &mut std::iter::once(Effect::Sync { file: next.clone(), tag }));
-        let tag = self.tag();
-        step(&mut steps, &mut std::iter::once(Effect::Mode { file: next.clone(), mode: 0o755, tag }));
-        let tag = self.tag();
-        step(&mut steps, &mut std::iter::once(Effect::Rename { from: next, to, tag }));
-        let mut files = Vec::with_capacity(removes);
-        for generation in writes.remove {
-            files.push(self.message_name(generation).ok_or_else(live_dir_error)?);
+        steps.step(
+            writes.writes.into_iter().map(|(at, bytes)| Effect::WriteAt { file: owned(next), at, bytes, tag: tags.next() }),
+        );
+        steps.step([Effect::Sync { file: owned(next), tag: tags.next() }]);
+        steps.step([Effect::Mode { file: owned(next), mode: 0o755, tag: tags.next() }]);
+        steps.step([Effect::Rename { from: owned(next), to: owned(to), tag: tags.next() }]);
+        if let Some(generation) = writes.remove {
+            let file = message_name(&self.output, generation).ok_or_else(live_dir_error)?;
+            steps.step([Effect::Remove { file, tag: tags.next() }]);
         }
-        let mut removes = files.into_iter().map(|file| Effect::Remove { file, tag: self.tag() });
-        step(&mut steps, &mut removes);
-        drop(removes);
         if let Some((generation, bytes)) = writes.message {
-            let file = self.message_name(generation).ok_or_else(live_dir_error)?;
-            let tag = self.tag();
-            step(&mut steps, &mut std::iter::once(Effect::Write { file, bytes, tag }));
+            let file = message_name(&self.output, generation).ok_or_else(live_dir_error)?;
+            steps.step([Effect::Write { file, bytes, tag: tags.next() }]);
         }
         Ok(steps)
     }
 
-    pub(crate) fn begin(&mut self, steps: Steps, revert: (State, History), effects: &mut Vec<Effect>) {
+    pub(crate) fn begin(&mut self, steps: Steps, revert: Revert, effects: &mut Vec<Effect>) {
         let from = steps.first;
+        let most = steps.counts.iter().copied().max().unwrap_or(0) as usize;
         self.pending = Some(Pending {
             steps,
             from,
             count: 0,
-            done: Vec::new(),
+            done: Vec::with_capacity(most.div_ceil(64)),
             left: 0,
             failed: None,
             revert: Some(revert),
@@ -205,8 +208,10 @@ impl Image {
         match &completion.done {
             Done::Failed(why) => {
                 let what = if pending.revert.is_some() {
+                    // alloc: error path
                     format!("writing {}: {why}", self.to)
                 } else {
+                    // alloc: error path
                     format!("{} is written, but running programs were not told: {why}", self.to)
                 };
                 pending.failed.get_or_insert(LinkError { function: None, what });
@@ -219,15 +224,17 @@ impl Image {
         }
         if let Some(failed) = pending.failed.take() {
             let pending = self.pending.take().expect("in flight");
-            if let Some((state, history)) = pending.revert {
-                self.state = state;
-                match history {
-                    History::Push(undo) => self.remember(undo),
-                    History::Pop => {
-                        self.history.pop_back();
-                    }
-                    History::Keep => {}
+            match pending.revert {
+                Some(Revert::Pop) => {
+                    let undo = self.history.pop_back().expect("the commit pushed its undo");
+                    self.state = undo.state;
                 }
+                Some(Revert::Push { state, full, len, writes }) => {
+                    let undone = std::mem::replace(&mut self.state, state);
+                    self.remember(Undo { state: undone, full, len, writes });
+                }
+                Some(Revert::Keep(state)) => self.state = state,
+                None => {}
             }
             return Some(Err(failed));
         }
@@ -241,5 +248,6 @@ impl Image {
 }
 
 fn live_dir_error() -> LinkError {
+    // alloc: error path
     LinkError { function: None, what: "the live directory names no file under the driver's root".into() }
 }

@@ -1,5 +1,6 @@
-//! The discriminants of an enum: E0370 for one implied past the end of its `repr` type, E0081
-//! for a value assigned twice, E0084 for a `repr` of an enum with no variants.
+//! The discriminants of an enum: E0370 for one implied past the end of its `repr` type, E0732
+//! for explicit discriminants with non-unit variants and no `repr` integer type, E0081 for a
+//! value assigned twice, E0084 for a `repr` of an enum with no variants.
 //!
 //! Follows rustc's `compiler/rustc_hir_analysis/src/collect.rs` (`check_enum_variant_types`,
 //! `EnumDiscriminantOverflowed`) and `check/check.rs` (`check_enum`,
@@ -87,7 +88,14 @@ pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
         }
         return found;
     }
-    let Some((signed, width)) = repr_int(cx, enum_) else { return found };
+    let needs_repr = needs_repr_int(cx, enum_, &variants, &enum_span);
+    let Some((signed, width)) = repr_int(cx, enum_) else {
+        found.extend(needs_repr.map(|mut diag| {
+            diag.fact(fact.clone(), what.clone());
+            Found::new(diag, Phase::Items)
+        }));
+        return found;
+    };
     let mut discrs: Vec<Variant> = Vec::new();
     let mut prev: Option<Discr> = None;
     let mut last_explicit = 0;
@@ -140,6 +148,10 @@ pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
         });
         prev = Some(discr);
     }
+    if let Some(mut diag) = needs_repr {
+        diag.fact(fact.clone(), what.clone());
+        found.push(Found::new(diag, Phase::Items));
+    }
     let mut order: Vec<usize> = (0..discrs.len()).collect();
     let mut i = 0;
     while i < order.len() {
@@ -173,6 +185,54 @@ pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
         i += 1;
     }
     found
+}
+
+/// `check_enum`'s E0732: an enum without a `repr` integer type whose non-unit variant has an
+/// explicit discriminant, or that has an explicit discriminant and a non-unit variant.
+fn needs_repr_int(cx: &Cx<'_, '_>, enum_: hir::Enum, variants: &[hir::EnumVariant], enum_span: &Span) -> Option<Diag> {
+    if enum_.repr(cx.db).is_some_and(|it| it.int.is_some()) {
+        return None;
+    }
+    struct Seen {
+        name: Span,
+        discr: Option<Span>,
+        unit: bool,
+    }
+    let seen: Vec<Seen> = variants
+        .iter()
+        .filter_map(|variant| {
+            let node = variant.source(cx.db)?;
+            let name = match node.value.name() {
+                Some(it) => cx.span(node.with_value(it.syntax().text_range())),
+                None => cx.span(node.as_ref().map(|it| it.syntax().text_range())),
+            };
+            let discr = node.value.const_arg().and_then(|it| it.expr());
+            let discr = discr.map(|it| cx.span(node.with_value(it.syntax().text_range())));
+            Some(Seen { name, discr, unit: variant.kind(cx.db) == hir::StructKind::Unit })
+        })
+        .collect();
+    let non_unit = seen.iter().find(|it| !it.unit);
+    let disr_unit = seen.iter().filter(|it| it.unit).find_map(|it| it.discr.clone());
+    let disr_non_unit = seen.iter().filter(|it| !it.unit).find_map(|it| it.discr.clone());
+    if disr_non_unit.is_none() && !(disr_unit.is_some() && non_unit.is_some()) {
+        return None;
+    }
+    let mut diag = Diag::error(
+        Some("E0732"),
+        "`#[repr(inttype)]` must be specified for enums with explicit discriminants and non-unit variants",
+        enum_span.clone(),
+    );
+    match (disr_non_unit, disr_unit, non_unit) {
+        (Some(at), _, _) => {
+            diag.span_label(at, "explicit discriminant on non-unit variant specified here");
+        }
+        (None, Some(at), Some(non_unit)) => {
+            diag.span_label(at, "explicit discriminant specified here");
+            diag.span_label(non_unit.name.clone(), "non-unit discriminant declared here");
+        }
+        _ => {}
+    }
+    Some(diag)
 }
 
 /// rustc's `report` in `detect_discriminant_duplicate`: where `discrs[index]` gets its value.

@@ -27,7 +27,7 @@
 //! The hot path, a test started and ended, allocates nothing past its result: a test is a
 //! `u32` unit indexing columns, the order is bitsets over ranks, attempts and tags are slabs
 //! reused through free lists, a record's paths and variables are interned once per server and
-//! its lines kept as `u32`s, and every deadline is one timer wheel ([`wheel`]) behind one
+//! its lines kept as `u32`s, and every deadline is one timer wheel (`queue/wheel.rs`) behind one
 //! driver timer at its next expiry.
 //!
 //! The queue asks with tags `tags..tags + 2^32` ([`Config::tags`]). It reads no clock: the
@@ -35,7 +35,7 @@
 //! and every process it started has ended; timers still in flight then are stale and their
 //! completions are dropped.
 
-use std::{borrow::Cow, ffi::OsString, io::Write as _, path::PathBuf, time::Duration};
+use std::{borrow::Cow, ffi::OsString, io::Write as _, path::PathBuf, sync::Arc, time::Duration};
 
 use rustc_hash::FxHashMap;
 
@@ -47,7 +47,7 @@ use blaze_ids::{ContentId, radix};
 use super::wire::{self, End, Executed, Frame, Frames};
 use crate::{
     confine,
-    trace::{self, BadRecord, Inputs, Line, Seen},
+    trace::{self, BadRecord, Inputs, Seen},
 };
 
 mod names;
@@ -80,7 +80,7 @@ pub struct Job {
 }
 
 /// A test binary and the tests of it to run.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Binary {
     /// [`crate::Reached::binary`].
     pub id: ContentId,
@@ -134,7 +134,7 @@ pub enum Outcome {
 }
 
 /// What a test read at run time.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Trace {
     /// The lines of the sandbox's record of its scope and of none, without blaze's own (its
     /// socket, its record, the variables it set for the server).
@@ -150,43 +150,32 @@ impl Trace {
     /// pass by. To be asked as the result comes, before anything else changes the files.
     pub fn traced<I: Inputs>(&self, inputs: &mut I) -> Result<Option<Traced>, I::Error> {
         match self {
-            Trace::Lines(lines) => {
-                let lines: Vec<Line> = lines
-                    .iter()
-                    .map(|(seen, what)| Line { seen, scope: String::new(), what: what.to_owned() })
-                    .collect();
-                trace::assemble(&lines, None, inputs).map(Some)
-            }
-            Trace::Whole(traced) => Ok(Some(traced.clone())),
+            Trace::Lines(lines) => trace::assemble_seen(lines.iter(), inputs).map(Some),
+            Trace::Whole(traced) => Ok(Some(traced.clone())), // clone: a binary run whole, once per binary: the caller owns its trace
             Trace::Unknown(_) => Ok(None),
         }
     }
 }
 
-/// The lines a test of a fork server read, each its kind and what it names, the names in one
-/// buffer: those of every scope first, each kind and name once, then the test's own. Scopes
-/// are left out: every line is of the test or of none, and [`trace::assemble`] reads both.
-#[derive(Clone, PartialEq, Eq, Default, Debug)]
+/// The lines a test of a fork server read, each its kind and what it names: those of every
+/// scope first, each kind and name once, then the test's own. Scopes are left out: every line
+/// is of the test or of none, and [`trace::assemble`] reads both. The lines of every scope are
+/// one buffer shared by every result of the server until a new one comes ([`Lines::common`]),
+/// so a result costs its own lines, not a copy of what every test read.
+#[derive(Default, Debug)]
 pub struct Lines {
+    common: Arc<Run>,
+    own: Run,
+}
+
+/// Lines in one buffer of names: each line's kind and the end of what it names in `text`.
+#[derive(PartialEq, Eq, Default, Debug)]
+struct Run {
     text: String,
-    /// Each line's kind and the end of what it names in `text`.
     lines: Vec<(Seen, u32)>,
 }
 
-impl Lines {
-    pub fn new() -> Lines {
-        Lines::default()
-    }
-
-    /// A line of `seen` naming `what`.
-    ///
-    /// # Panics
-    ///
-    /// Past 4 GiB of names.
-    pub fn push(&mut self, seen: Seen, what: &str) {
-        assert!(self.try_push(seen, what), "the lines of a test are past 4 GiB");
-    }
-
+impl Run {
     /// `false`, and nothing pushed, past 4 GiB of names.
     fn try_push(&mut self, seen: Seen, what: &str) -> bool {
         let Ok(end) = u32::try_from(self.text.len() + what.len()) else { return false };
@@ -195,16 +184,7 @@ impl Lines {
         true
     }
 
-    pub fn len(&self) -> usize {
-        self.lines.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
-    }
-
-    /// Each line, borrowed, in order.
-    pub fn iter(&self) -> impl Iterator<Item = (Seen, &str)> + '_ {
+    fn iter(&self) -> impl Iterator<Item = (Seen, &str)> + '_ {
         let mut start = 0;
         self.lines.iter().map(move |&(seen, end)| {
             let what = &self.text[start..end as usize];
@@ -213,6 +193,53 @@ impl Lines {
         })
     }
 }
+
+impl Lines {
+    pub fn new() -> Lines {
+        Lines::default()
+    }
+
+    /// A line of `seen` naming `what`, after the rest.
+    ///
+    /// # Panics
+    ///
+    /// Past 4 GiB of names.
+    pub fn push(&mut self, seen: Seen, what: &str) {
+        assert!(self.own.try_push(seen, what), "the lines of a test are past 4 GiB");
+    }
+
+    pub fn len(&self) -> usize {
+        self.common.lines.len() + self.own.lines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Each line, borrowed, in order.
+    pub fn iter(&self) -> impl Iterator<Item = (Seen, &str)> + '_ {
+        self.common.iter().chain(self.own.iter())
+    }
+
+    /// Whether `self` and `other` share their lines of every scope, the same buffer: what a
+    /// caller hashing many results of one server can hash once.
+    pub fn common_is(&self, other: &Lines) -> bool {
+        Arc::ptr_eq(&self.common, &other.common)
+    }
+
+    /// How many of the lines, from the first, are of every scope.
+    pub fn common(&self) -> usize {
+        self.common.lines.len()
+    }
+}
+
+impl PartialEq for Lines {
+    fn eq(&self, other: &Lines) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for Lines {}
 
 impl<'a> FromIterator<(Seen, &'a str)> for Lines {
     fn from_iter<T: IntoIterator<Item = (Seen, &'a str)>>(iter: T) -> Lines {
@@ -225,7 +252,7 @@ impl<'a> FromIterator<(Seen, &'a str)> for Lines {
 }
 
 /// A test's result.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Finished {
     /// Its binary, by its place in the queue's binaries.
     pub binary: usize,
@@ -344,6 +371,8 @@ struct Server {
     /// kept only once however often the server repeats it.
     common: Vec<u32>,
     common_kinds: Vec<u8>,
+    /// `common` as the results have it, made when the first result after a change asks.
+    shared: Option<Arc<Run>>,
     /// Frames for the server not yet given to the driver: what one call to the queue says to
     /// a server goes as one send.
     outbox: Vec<u8>,
@@ -400,12 +429,12 @@ struct Bits {
 
 impl Bits {
     fn empty(len: usize) -> Bits {
-        let words = vec![0; len.div_ceil(64)];
+        let words = vec![0; len.div_ceil(64)]; // alloc: setup, once per run
         Bits { low: words.len(), words }
     }
 
     fn full(len: usize) -> Bits {
-        let mut words = vec![u64::MAX; len.div_ceil(64)];
+        let mut words = vec![u64::MAX; len.div_ceil(64)]; // alloc: setup, once per run
         if let Some(last) = words.last_mut()
             && len % 64 != 0
         {
@@ -471,11 +500,11 @@ impl Went {
     /// Lost before it ran, and why.
     fn lost(why: String, output: Vec<u8>) -> Went {
         Went {
-            outcome: Outcome::Failed(Failure::Lost(why.clone())),
+            outcome: Outcome::Failed(Failure::Lost(why.clone())), // clone: error path
             attempts: 1,
             output,
             took: Duration::ZERO,
-            trace: Trace::Unknown(why.clone()),
+            trace: Trace::Unknown(why.clone()), // clone: error path
             executed: Executed::Not(why),
         }
     }
@@ -522,34 +551,44 @@ pub struct Queue {
 impl Queue {
     /// A queue of `binaries`' jobs; asks to start what it can.
     pub fn new(config: Config, binaries: Vec<Binary>, now: Duration, effects: &mut Vec<Effect>) -> Queue {
+        // Every column at the size the run needs, made once: a unit per test (per binary run
+        // whole), and per core an attempt, its two timers and its tags.
+        let count: usize = binaries
+            .iter()
+            .map(|plan| match plan.mode {
+                Mode::Threads { .. } => usize::from(!plan.jobs.is_empty()),
+                Mode::Process => plan.jobs.len(),
+            })
+            .sum();
+        let (cores, bins) = (config.jobs.max(1), binaries.len());
         let mut queue = Queue {
             config,
-            bins: Vec::with_capacity(binaries.len()),
-            unit_bin: Vec::new(),
-            unit_job: Vec::new(),
-            order: Vec::new(),
-            rank: Vec::new(),
+            bins: Vec::with_capacity(bins),
+            unit_bin: Vec::with_capacity(count),
+            unit_job: Vec::with_capacity(count),
+            order: Vec::with_capacity(count),
+            rank: Vec::with_capacity(count),
             pending: Bits::empty(0),
             ready: Bits::empty(0),
-            tries: Vec::new(),
-            tries_output: Vec::new(),
-            attempts: Vec::new(),
-            free_attempts: Vec::new(),
-            tags: Vec::new(),
-            free_tags: Vec::new(),
-            wheel: Wheel::new(tick(now)),
-            fired: Vec::new(),
+            tries: Vec::with_capacity(count),
+            tries_output: Vec::with_capacity(count),
+            attempts: Vec::with_capacity(cores),
+            free_attempts: Vec::with_capacity(cores),
+            tags: Vec::with_capacity(2 * cores + 4 * bins),
+            free_tags: Vec::with_capacity(2 * cores + 4 * bins),
+            wheel: Wheel::new(tick(now), 2 * cores + bins),
+            fired: Vec::with_capacity(cores),
             armed: None,
-            dirty: Vec::new(),
-            quit: Vec::new(),
+            dirty: Vec::with_capacity(bins),
+            quit: Vec::with_capacity(bins),
             busy: 0,
             stopping: false,
             cancelled: false,
             now,
-            results: Vec::new(),
+            results: Vec::with_capacity(cores),
         };
         // Sorted on the longest first: the complement of each unit's expected nanoseconds.
-        let mut keyed: Vec<(u64, u32)> = Vec::new();
+        let mut keyed: Vec<(u64, u32)> = Vec::with_capacity(count);
         for (b, plan) in binaries.into_iter().enumerate() {
             let first = queue.unit_bin.len() as u32;
             let b = u32::try_from(b).expect("at most 2^32 binaries");
@@ -574,16 +613,15 @@ impl Queue {
             queue.bins.push(Bin { plan, left: units as usize, server: None, whole: None, first, units });
         }
         radix::sort_pairs(&mut keyed);
-        let count = keyed.len();
-        queue.order = keyed.iter().map(|it| it.1).collect();
-        queue.rank = vec![0; count];
+        queue.order.extend(keyed.iter().map(|it| it.1));
+        queue.rank.resize(count, 0);
         for (at, &unit) in queue.order.iter().enumerate() {
             queue.rank[unit as usize] = at as u32;
         }
         queue.pending = Bits::full(count);
         queue.ready = Bits::empty(count);
-        queue.tries = vec![0; count];
-        queue.tries_output = vec![Vec::new(); count];
+        queue.tries.resize(count, 0);
+        queue.tries_output.resize_with(count, Vec::new);
         for b in 0..queue.bins.len() {
             if queue.bins[b].left == 0 {
                 continue;
@@ -594,14 +632,14 @@ impl Queue {
                     queue.ready.set(rank);
                 }
                 Mode::Process if !cfg!(unix) => {
-                    let why = format!(
+                    let why = format!( // alloc: error path
                         "{}: this platform has no fork, so no fork server: its package must run its tests as libtest's threads",
                         queue.bins[b].plan.name
                     );
                     let Bin { first, units, .. } = queue.bins[b];
                     for unit in first..first + units {
                         queue.pending.clear(queue.rank[unit as usize]);
-                        queue.finish(unit, Went::lost(why.clone(), Vec::new()));
+                        queue.finish(unit, Went::lost(why.clone(), Vec::new())); // alloc: error path
                     }
                 }
                 Mode::Process => queue.start_server(b, effects),
@@ -616,9 +654,15 @@ impl Queue {
         tag.0.wrapping_sub(self.config.tags) < 1 << 32
     }
 
-    /// The results that came since the last call.
+    /// The results that came since the last call, the queue keeping its buffer of them: what
+    /// a driver loop calls.
+    pub fn drain(&mut self) -> std::vec::Drain<'_, Finished> {
+        self.results.drain(..)
+    }
+
+    /// [`Queue::drain`] as a `Vec` of its own.
     pub fn take(&mut self) -> Vec<Finished> {
-        std::mem::take(&mut self.results)
+        std::mem::take(&mut self.results) // alloc: the results' next buffer; a driver loop calls `drain`
     }
 
     /// The binaries, by the index a [`Finished`] names.
@@ -645,7 +689,7 @@ impl Queue {
             if let Some(whole) = &self.bins[b].whole {
                 effects.push(Effect::Kill { tag: whole.spawn });
             }
-            self.kill_server(b, "the run was cancelled".to_owned(), effects);
+            self.kill_server(b, "the run was cancelled".to_owned(), effects); // alloc: error path
         }
         self.let_go(effects);
         self.flush(effects);
@@ -678,17 +722,17 @@ impl Queue {
                         (why, [exit.stdout, exit.stderr].concat())
                     }
                     Done::Failed(error) => (
-                        format!("{} could not be started in its sandbox: {error}", self.bins[b].plan.program.display()),
-                        Vec::new(),
+                        format!("{} could not be started in its sandbox: {error}", self.bins[b].plan.program.display()), // alloc: error path
+                        Vec::new(), // alloc: error path
                     ),
-                    other => (format!("its spawn completed as {other:?}"), Vec::new()),
+                    other => (format!("its spawn completed as {other:?}"), Vec::new()), // alloc: error path
                 };
                 self.server_ended(b, why, output, effects);
             }
             For::Recv(b) => self.received(b as usize, completion.done, effects),
             For::Send(b) => {
                 if let Done::Failed(error) = completion.done {
-                    self.kill_server(b as usize, format!("sending to its fork server: {error}"), effects);
+                    self.kill_server(b as usize, format!("sending to its fork server: {error}"), effects); // alloc: error path
                 }
             }
             For::Hangup => {}
@@ -735,7 +779,7 @@ impl Queue {
     }
 
     fn file(&self, name: String) -> FileName {
-        FileName::new(&format!("{}/{name}", self.config.dir)).expect("a name under the request's directory")
+        FileName::new(&format!("{}/{name}", self.config.dir)).expect("a name under the request's directory") // alloc: setup, once per server
     }
 
     fn path(&self, file: &FileName) -> PathBuf {
@@ -823,7 +867,7 @@ impl Queue {
                     }
                     let unit = self.attempts[at].unit as usize;
                     let (b, j) = (self.unit_bin[unit] as usize, self.unit_job[unit] as usize);
-                    let why = format!(
+                    let why = format!( // alloc: error path
                         "{} did not end {:?} after it was killed, so its fork server was killed",
                         self.bins[b].plan.jobs[j].name, self.config.kill_grace
                     );
@@ -844,8 +888,8 @@ impl Queue {
     }
 
     fn start_server(&mut self, b: usize, effects: &mut Vec<Effect>) {
-        let socket = self.file(format!("t{b}"));
-        let record = self.file(format!("r{b}"));
+        let socket = self.file(format!("t{b}")); // alloc: setup, once per server
+        let record = self.file(format!("r{b}")); // alloc: setup, once per server
         let socket_path = self.path(&socket).to_string_lossy().into_owned();
         let record_path = self.path(&record).to_string_lossy().into_owned();
         let mut names = Names::new();
@@ -854,42 +898,43 @@ impl Queue {
         let server = Server {
             phase: Phase::Writing,
             socket,
-            record: record.clone(),
+            record: record.clone(), // clone: setup, once per server
             spawn: None,
             listen: None,
             conn: None,
             hung_up: false,
             lost: None,
             frames: Frames::new(),
-            job_index: Vec::new(),
+            job_index: Vec::new(), // alloc: empty, allocates nothing
             scopes: Names::new(),
-            scope_job: Vec::new(),
+            scope_job: Vec::new(), // alloc: empty, allocates nothing
             names,
             ours,
-            running: Vec::new(),
+            running: Vec::with_capacity(self.config.jobs),
             at: 0,
-            partial: Vec::new(),
-            scoped: Vec::new(),
-            common: Vec::new(),
-            common_kinds: Vec::new(),
-            outbox: Vec::new(),
+            partial: Vec::new(), // alloc: empty, allocates nothing
+            scoped: Vec::new(), // alloc: empty, allocates nothing
+            common: Vec::new(), // alloc: empty, allocates nothing
+            common_kinds: Vec::new(), // alloc: empty, allocates nothing
+            shared: None,
+            outbox: Vec::new(), // alloc: empty, allocates nothing
             dirty: false,
             reading: false,
-            waiting: Vec::new(),
-            next: Vec::new(),
+            waiting: Vec::with_capacity(self.config.jobs),
+            next: Vec::with_capacity(self.config.jobs),
             broken: None,
         };
         self.bins[b].server = Some(server);
         let tag = self.tag(For::Write(b as u32));
         // Made empty, with its directory, before the sandbox appends to it.
-        effects.push(Effect::Write { file: record, bytes: Vec::new(), tag });
+        effects.push(Effect::Write { file: record, bytes: Vec::new(), tag }); // alloc: setup, once per server
     }
 
     fn written(&mut self, b: usize, done: Done, effects: &mut Vec<Effect>) {
         if let Done::Failed(error) = done {
-            let why = format!("making the record of its sandbox, {}: {error}", self.server(b).record);
+            let why = format!("making the record of its sandbox, {}: {error}", self.server(b).record); // alloc: setup, once per server: the driver's command owns its parts
             self.server(b).phase = Phase::Ended;
-            self.server_ended(b, why, Vec::new(), effects);
+            self.server_ended(b, why, Vec::new(), effects); // alloc: empty, allocates nothing
             return;
         }
         if self.bins[b].left == 0 {
@@ -899,21 +944,21 @@ impl Queue {
         let plan = &self.bins[b].plan;
         let server = self.bins[b].server.as_ref().expect("a server");
         let [socket_path, record_path, ..] = server.ours.map(|it| server.names.get(it));
-        let mut env = plan.env.clone();
+        let mut env = plan.env.clone(); // clone: setup, once per server: the driver's command owns its parts
         env.push((wire::SOCKET.into(), socket_path.into()));
         env.push((confine::LIVE.into(), record_path.into()));
-        let mut read = plan.read.clone();
+        let mut read = plan.read.clone(); // clone: setup, once per server: the driver's command owns its parts
         read.push(PathBuf::from(socket_path));
         let command = Command {
-            program: plan.program.clone(),
-            args: Vec::new(),
+            program: plan.program.clone(), // clone: setup, once per server: the driver's command owns its parts
+            args: Vec::new(), // alloc: empty, allocates nothing
             env,
-            dir: plan.dir.clone(),
-            stdin: Vec::new(),
-            sandbox: Sandbox::On { read, write: plan.write.clone(), network: plan.network, trace: true },
+            dir: plan.dir.clone(), // clone: setup, once per server: the driver's command owns its parts
+            stdin: Vec::new(), // alloc: empty, allocates nothing
+            sandbox: Sandbox::On { read, write: plan.write.clone(), network: plan.network, trace: true }, // clone: setup, once per server: the driver's command owns its parts
             memory: plan.memory,
         };
-        let at = Address::Unix(server.socket.clone());
+        let at = Address::Unix(server.socket.clone()); // clone: setup, once per server: the driver's command owns its parts
         let listen = self.tag(For::Listen(b as u32));
         let spawn = self.tag(For::Spawn(b as u32));
         let server = self.server(b);
@@ -921,7 +966,7 @@ impl Queue {
         server.listen = Some(listen);
         server.spawn = Some(spawn);
         effects.push(Effect::Listen { at, tag: listen });
-        effects.push(Effect::Spawn { command: Box::new(command), tag: spawn });
+        effects.push(Effect::Spawn { command: Box::new(command), tag: spawn }); // alloc: setup, once per server: the driver's command owns its parts
     }
 
     fn listened(&mut self, b: usize, tag: Tag, done: Done, effects: &mut Vec<Effect>) {
@@ -946,8 +991,8 @@ impl Queue {
                 self.release_tag(tag);
                 self.server(b).listen = None;
                 if self.server(b).conn.is_none() {
-                    let socket = self.server(b).socket.clone();
-                    self.kill_server(b, format!("listening on {socket}: {error}"), effects);
+                    let socket = self.server(b).socket.clone(); // clone: error path
+                    self.kill_server(b, format!("listening on {socket}: {error}"), effects); // alloc: error path
                 }
             }
             _ => {}
@@ -958,7 +1003,7 @@ impl Queue {
         let bytes = match done {
             Done::Read(bytes) => bytes,
             Done::Failed(error) => {
-                self.kill_server(b, format!("reading from its fork server: {error}"), effects);
+                self.kill_server(b, format!("reading from its fork server: {error}"), effects); // alloc: error path
                 return;
             }
             _ => return,
@@ -967,7 +1012,7 @@ impl Queue {
             let server = self.server(b);
             server.hung_up = true;
             if !matches!(server.phase, Phase::Quitting | Phase::Ended) {
-                self.kill_server(b, "its fork server closed its socket".to_owned(), effects);
+                self.kill_server(b, "its fork server closed its socket".to_owned(), effects); // alloc: error path
             }
             return;
         }
@@ -977,12 +1022,12 @@ impl Queue {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(why) => {
-                    self.kill_server(b, format!("its fork server broke the protocol: {why}"), effects);
+                    self.kill_server(b, format!("its fork server broke the protocol: {why}"), effects); // alloc: error path
                     return;
                 }
             };
             if let Err(why) = self.frame(b, frame, effects) {
-                self.kill_server(b, format!("its fork server broke the protocol: {why}"), effects);
+                self.kill_server(b, format!("its fork server broke the protocol: {why}"), effects); // alloc: error path
                 return;
             }
         }
@@ -1000,17 +1045,17 @@ impl Queue {
         match frame {
             Frame::Hello { version, tests, .. } => {
                 if self.server(b).phase != Phase::Starting {
-                    return Err("a second hello".to_owned());
+                    return Err("a second hello".to_owned()); // alloc: error path
                 }
                 if version != wire::VERSION {
-                    return Err(format!("its version is {version}, and blaze speaks {}", wire::VERSION));
+                    return Err(format!("its version is {version}, and blaze speaks {}", wire::VERSION)); // alloc: error path
                 }
                 let bin = &mut self.bins[b];
                 let jobs: FxHashMap<&str, u32> =
-                    bin.plan.jobs.iter().enumerate().map(|(j, it)| (it.name.as_str(), j as u32)).collect();
+                    bin.plan.jobs.iter().enumerate().map(|(j, it)| (it.name.as_str(), j as u32)).collect(); // alloc: setup, once per server: the hello
                 let server = bin.server.as_mut().expect("a server");
-                server.job_index = vec![NO_TEST; bin.plan.jobs.len()];
-                server.scoped = vec![Vec::new(); bin.plan.jobs.len()];
+                server.job_index = vec![NO_TEST; bin.plan.jobs.len()]; // alloc: setup, once per server: the hello
+                server.scoped = vec![Vec::new(); bin.plan.jobs.len()]; // alloc: setup, once per server: the hello
                 for (at, name) in tests.iter().enumerate() {
                     let Some(&j) = jobs.get(name.as_str()) else { continue };
                     server.job_index[j as usize] = at as u32;
@@ -1028,8 +1073,8 @@ impl Queue {
                         continue;
                     }
                     self.pending.clear(rank);
-                    let why = format!("{} has no test named {}", self.bins[b].plan.name, self.bins[b].plan.jobs[j].name);
-                    self.finish(unit, Went::lost(why, Vec::new()));
+                    let why = format!("{} has no test named {}", self.bins[b].plan.name, self.bins[b].plan.jobs[j].name); // alloc: error path
+                    self.finish(unit, Went::lost(why, Vec::new())); // alloc: empty, allocates nothing
                 }
                 self.maybe_quit(b, effects);
                 Ok(())
@@ -1041,7 +1086,7 @@ impl Queue {
                         let attempt = &self.attempts[at];
                         attempt.running && self.unit_bin[attempt.unit as usize] as usize == b
                     })
-                    .ok_or_else(|| format!("an end of {id}, which it does not run"))?;
+                    .ok_or_else(|| format!("an end of {id}, which it does not run"))?; // alloc: error path
                 let server = self.server(b);
                 if let Some(place) = server.running.iter().position(|it| *it == id) {
                     server.running.remove(place);
@@ -1087,15 +1132,15 @@ impl Queue {
                 }
                 Ok(())
             }
-            other => Err(format!("it sent {other:?}, which only blaze sends")),
+            other => Err(format!("it sent {other:?}, which only blaze sends")), // alloc: error path
         }
     }
 
     fn start_read(&mut self, b: usize, effects: &mut Vec<Effect>) {
-        if let Some(why) = self.server(b).broken.clone() {
+        if let Some(why) = self.server(b).broken.clone() { // clone: error path
             let mut waiting = std::mem::take(&mut self.server(b).waiting);
             for ended in waiting.drain(..) {
-                self.attempt_ended(b, ended, Trace::Unknown(why.clone()), effects);
+                self.attempt_ended(b, ended, Trace::Unknown(why.clone()), effects); // clone: error path
             }
             self.server(b).waiting = waiting;
             return;
@@ -1103,7 +1148,7 @@ impl Queue {
         let tag = self.tag(For::Read(b as u32));
         let server = self.server(b);
         server.reading = true;
-        effects.push(Effect::Read { file: server.record.clone(), at: server.at, len: CHUNK, tag });
+        effects.push(Effect::Read { file: server.record.clone(), at: server.at, len: CHUNK, tag }); // clone: the edge: the driver's read owns its file name
     }
 
     fn read(&mut self, b: usize, done: Done, effects: &mut Vec<Effect>) {
@@ -1120,7 +1165,7 @@ impl Queue {
                 if let Some(end) = server.partial.iter().rposition(|it| *it == b'\n') {
                     let partial = std::mem::take(&mut server.partial);
                     if let Err(why) = take_lines(server, &partial[..=end]) {
-                        server.broken = Some(format!("the sandbox's record {}: {why}", server.record));
+                        server.broken = Some(format!("the sandbox's record {}: {why}", server.record)); // alloc: error path
                     }
                     server.partial = partial;
                     server.partial.drain(..=end);
@@ -1131,16 +1176,16 @@ impl Queue {
                 }
             }
             Done::Failed(error) => {
-                server.broken = Some(format!("reading the sandbox's record {}: {error}", server.record));
+                server.broken = Some(format!("reading the sandbox's record {}: {error}", server.record)); // alloc: error path
             }
             _ => {}
         }
-        let broken = self.server(b).broken.clone();
+        let broken = self.server(b).broken.clone(); // clone: error path
         let mut waiting = std::mem::take(&mut self.server(b).waiting);
         for ended in waiting.drain(..) {
             let Some(at) = self.attempt(ended.id) else { continue };
             let trace = match &broken {
-                Some(why) => Trace::Unknown(why.clone()),
+                Some(why) => Trace::Unknown(why.clone()), // clone: error path
                 None => self.lines(b, self.attempts[at].unit),
             };
             self.attempt_ended(b, ended, trace, effects);
@@ -1153,21 +1198,25 @@ impl Queue {
         }
     }
 
-    /// The lines of the record a unit of `b` read: those of every scope, then its own, which
-    /// are let go (only its last attempt's result asks).
+    /// The lines of the record a unit of `b` read: those of every scope (shared with the
+    /// server's other results), then its own, which are let go (only its last attempt's result
+    /// asks).
     fn lines(&mut self, b: usize, unit: u32) -> Trace {
+        const PAST: &str = "the lines the test read are past 4 GiB";
         let j = self.unit_job[unit as usize] as usize;
         let server = self.server(b);
-        let own = server.scoped.get_mut(j).map(std::mem::take).unwrap_or_default();
-        let packed = || server.common.iter().chain(&own).map(|&it| unpack(it));
-        let text: usize = packed().map(|(id, _)| server.names.get(id).len()).sum();
-        let mut lines = Lines { text: String::with_capacity(text), lines: Vec::with_capacity(server.common.len() + own.len()) };
-        for (id, seen) in packed() {
-            if !lines.try_push(seen, server.names.get(id)) {
-                return Trace::Unknown("the lines the test read are past 4 GiB".to_owned());
+        let common = match server.shared.as_ref().map(Arc::clone) {
+            Some(common) => common,
+            None => {
+                let Some(common) = run(&server.names, &server.common) else { return Trace::Unknown(PAST.to_owned()) }; // alloc: error path
+                let common = Arc::new(common); // alloc: once per new line of every scope, not per test
+                server.shared = Some(Arc::clone(&common));
+                common
             }
-        }
-        Trace::Lines(lines)
+        };
+        let own = server.scoped.get_mut(j).map(std::mem::take).unwrap_or_default();
+        let Some(own) = run(&server.names, &own) else { return Trace::Unknown(PAST.to_owned()) }; // alloc: error path
+        Trace::Lines(Lines { common, own })
     }
 
     /// How a run, in attempt slot `at`, of a test that ended as `end` went.
@@ -1180,7 +1229,7 @@ impl Queue {
             (End::Exited(0), false) => Outcome::Passed,
             (End::Exited(code), false) => Outcome::Failed(Failure::Code(*code)),
             (End::Signaled(signal), false) => Outcome::Failed(Failure::Signal(*signal)),
-            (End::NotStarted(why), false) => Outcome::Failed(Failure::Lost(why.clone())),
+            (End::NotStarted(why), false) => Outcome::Failed(Failure::Lost(why.clone())), // clone: error path
         }
     }
 
@@ -1215,7 +1264,7 @@ impl Queue {
         };
         self.results.push(Finished {
             binary: b,
-            test: (j != WHOLE).then(|| self.bins[b].plan.jobs[j as usize].name.clone()),
+            test: (j != WHOLE).then(|| self.bins[b].plan.jobs[j as usize].name.clone()), // clone: the edge: a result owns its test's name
             outcome: went.outcome,
             attempts,
             output: went.output,
@@ -1251,8 +1300,8 @@ impl Queue {
                     attempts: done + 1,
                     output,
                     took: Duration::ZERO,
-                    trace: Trace::Unknown(STOPPED.to_owned()),
-                    executed: Executed::Not(STOPPED.to_owned()),
+                    trace: Trace::Unknown(STOPPED.to_owned()), // alloc: error path
+                    executed: Executed::Not(STOPPED.to_owned()), // alloc: error path
                 },
             );
         }
@@ -1272,7 +1321,7 @@ impl Queue {
             Phase::Starting if server.lost.is_none() => {
                 if let Some(spawn) = server.spawn {
                     effects.push(Effect::Kill { tag: spawn });
-                    self.server(b).lost = Some("nothing was left for it to run".to_owned());
+                    self.server(b).lost = Some("nothing was left for it to run".to_owned()); // alloc: once per server, at its end
                 }
             }
             Phase::Starting => {}
@@ -1343,13 +1392,13 @@ impl Queue {
         if server.phase == Phase::Ended {
             return;
         }
-        server.lost.get_or_insert(why.clone());
+        server.lost.get_or_insert(why.clone()); // clone: error path
         match server.spawn {
             Some(spawn) => effects.push(Effect::Kill { tag: spawn }),
             // Its record is still being made: nothing was started.
             None => {
                 server.phase = Phase::Ended;
-                self.server_ended(b, why, Vec::new(), effects);
+                self.server_ended(b, why, Vec::new(), effects); // alloc: error path
             }
         }
     }
@@ -1375,7 +1424,7 @@ impl Queue {
         let running = std::mem::take(&mut self.server(b).running);
         let why = match was {
             Phase::Quitting if running.is_empty() => return,
-            _ => format!("{}: {why}", self.bins[b].plan.name),
+            _ => format!("{}: {why}", self.bins[b].plan.name), // alloc: error path
         };
         for id in running {
             self.busy -= 1;
@@ -1384,7 +1433,7 @@ impl Queue {
             self.free_attempt(at);
             let outcome = match self.cancelled {
                 true => Outcome::NotRun,
-                false => Outcome::Failed(Failure::Lost(why.clone())),
+                false => Outcome::Failed(Failure::Lost(why.clone())), // clone: error path
             };
             self.tries[unit as usize] = 0;
             let earlier = std::mem::take(&mut self.tries_output[unit as usize]);
@@ -1394,10 +1443,10 @@ impl Queue {
                 Went {
                     outcome,
                     attempts: number,
-                    output: [earlier, output.clone()].concat(),
+                    output: [earlier, output.clone()].concat(), // alloc: error path
                     took,
-                    trace: Trace::Unknown(why.clone()),
-                    executed: Executed::Not(why.clone()),
+                    trace: Trace::Unknown(why.clone()), // clone: error path
+                    executed: Executed::Not(why.clone()), // clone: error path
                 },
             );
         }
@@ -1407,7 +1456,7 @@ impl Queue {
             self.ready.clear(rank);
             self.tries[unit as usize] = 0;
             let earlier = std::mem::take(&mut self.tries_output[unit as usize]);
-            self.finish(unit, Went::lost(why.clone(), [earlier, output.clone()].concat()));
+            self.finish(unit, Went::lost(why.clone(), [earlier, output.clone()].concat())); // alloc: error path
         }
     }
 
@@ -1415,7 +1464,7 @@ impl Queue {
     fn pending_of(&self, b: usize) -> Vec<u32> {
         let Bin { first, units, .. } = self.bins[b];
         let mut ranks: Vec<u32> =
-            (first..first + units).map(|unit| self.rank[unit as usize]).filter(|&rank| self.pending.has(rank)).collect();
+            (first..first + units).map(|unit| self.rank[unit as usize]).filter(|&rank| self.pending.has(rank)).collect(); // alloc: error path
         radix::sort(&mut ranks);
         ranks
     }
@@ -1455,20 +1504,20 @@ impl Queue {
         let plan = &self.bins[b].plan;
         let Mode::Threads { args: given, timeout } = &plan.mode else { unreachable!("a binary run whole is in threads mode") };
         let slots = self.config.jobs.max(1).saturating_sub(self.busy).min(plan.jobs.len()).max(1);
-        let mut args: Vec<OsString> = plan.jobs.iter().map(|it| OsString::from(&it.name)).collect();
+        let mut args: Vec<OsString> = plan.jobs.iter().map(|it| OsString::from(&it.name)).collect(); // alloc: setup, once per binary run whole: the driver's command owns its parts
         args.push("--exact".into());
-        args.push(format!("--test-threads={slots}").into());
+        args.push(format!("--test-threads={slots}").into()); // alloc: setup, once per binary run whole: the driver's command owns its parts
         if plan.jobs.iter().any(|it| it.ignore) {
             args.push("--include-ignored".into());
         }
         args.extend(given.iter().cloned());
         let command = Command {
-            program: plan.program.clone(),
+            program: plan.program.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
             args,
-            env: plan.env.clone(),
-            dir: plan.dir.clone(),
-            stdin: Vec::new(),
-            sandbox: Sandbox::On { read: plan.read.clone(), write: plan.write.clone(), network: plan.network, trace: true },
+            env: plan.env.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
+            dir: plan.dir.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
+            stdin: Vec::new(), // alloc: empty, allocates nothing
+            sandbox: Sandbox::On { read: plan.read.clone(), write: plan.write.clone(), network: plan.network, trace: true }, // clone: setup, once per binary run whole: the driver's command owns its parts
             memory: plan.memory,
         };
         let timeout = *timeout;
@@ -1476,7 +1525,7 @@ impl Queue {
         let deadline = self.wheel.insert(due_tick(self.now, timeout), Due::Whole(b as u32));
         self.busy += slots;
         self.bins[b].whole = Some(Whole { spawn, started: self.now, slots, timed_out: false, deadline });
-        effects.push(Effect::Spawn { command: Box::new(command), tag: spawn });
+        effects.push(Effect::Spawn { command: Box::new(command), tag: spawn }); // alloc: setup, once per binary run whole: the driver's command owns its parts
     }
 
     fn whole_ended(&mut self, b: usize, done: Done) {
@@ -1499,21 +1548,21 @@ impl Queue {
                 };
                 let trace = match exit.traced {
                     Some(traced) => Trace::Whole(traced),
-                    None => Trace::Unknown("its sandbox kept no record of what it read".to_owned()),
+                    None => Trace::Unknown("its sandbox kept no record of what it read".to_owned()), // alloc: once per binary run whole
                 };
                 (outcome, [exit.stdout, exit.stderr].concat(), trace)
             }
             Done::Failed(error) => {
-                let why = format!("{} could not be started in its sandbox: {error}", self.bins[b].plan.program.display());
-                (Outcome::Failed(Failure::Lost(why.clone())), Vec::new(), Trace::Unknown(why))
+                let why = format!("{} could not be started in its sandbox: {error}", self.bins[b].plan.program.display()); // alloc: once per binary run whole
+                (Outcome::Failed(Failure::Lost(why.clone())), Vec::new(), Trace::Unknown(why)) // alloc: once per binary run whole
             }
             other => {
-                let why = format!("its spawn completed as {other:?}");
-                (Outcome::Failed(Failure::Lost(why.clone())), Vec::new(), Trace::Unknown(why))
+                let why = format!("its spawn completed as {other:?}"); // alloc: once per binary run whole
+                (Outcome::Failed(Failure::Lost(why.clone())), Vec::new(), Trace::Unknown(why)) // alloc: once per binary run whole
             }
         };
         let outcome = if self.cancelled && outcome != Outcome::Passed { Outcome::NotRun } else { outcome };
-        let executed = Executed::Not(WHOLE_UNRECORDED.to_owned());
+        let executed = Executed::Not(WHOLE_UNRECORDED.to_owned()); // alloc: once per binary run whole
         let unit = self.bins[b].first;
         self.finish(unit, Went { outcome, attempts: 1, output, took, trace, executed });
     }
@@ -1532,6 +1581,20 @@ fn tick(now: Duration) -> u64 {
 /// The first tick at or past `now + after`: a timer never fires early.
 fn due_tick(now: Duration, after: Duration) -> u64 {
     u64::try_from(now.saturating_add(after).as_nanos().div_ceil(TICK)).unwrap_or(u64::MAX)
+}
+
+/// `packed` lines ([`pack`]) as a [`Run`], what they name looked up in `names`, in one
+/// allocation of each buffer; `None` past 4 GiB of names.
+fn run(names: &Names, packed: &[u32]) -> Option<Run> {
+    let text: usize = packed.iter().map(|&it| names.get(unpack(it).0).len()).sum();
+    let mut run = Run { text: String::with_capacity(text), lines: Vec::with_capacity(packed.len()) };
+    for &it in packed {
+        let (id, seen) = unpack(it);
+        if !run.try_push(seen, names.get(id)) {
+            return None;
+        }
+    }
+    Some(run)
 }
 
 /// Each kind of [`Seen`] by its number, as [`pack`] keeps it.
@@ -1566,7 +1629,7 @@ fn ours(server: &Server, seen: Seen, id: u32) -> bool {
     }
 }
 
-/// A line of the record without its line break, borrowed: the parts [`Line::parse`] reads,
+/// A line of the record without its line break, borrowed: the parts [`trace::Line::parse`] reads,
 /// its kind by its first byte.
 fn record_line(text: &str) -> Option<(Seen, &str, &str)> {
     let bytes = text.as_bytes();
@@ -1598,10 +1661,10 @@ fn take_lines(server: &mut Server, text: &[u8]) -> Result<(), String> {
         let Some(piece) = piece.strip_suffix(b"\n") else { break };
         let piece = match std::str::from_utf8(piece) {
             Ok(it) => Cow::Borrowed(it),
-            Err(_) => Cow::Owned(String::from_utf8_lossy(piece).into_owned()),
+            Err(_) => Cow::Owned(String::from_utf8_lossy(piece).into_owned()), // alloc: error path
         };
         let Some((seen, scope, what)) = record_line(&piece) else {
-            return Err(BadRecord { line: number + 1, text: piece.chars().take(200).collect() }.to_string());
+            return Err(BadRecord { line: number + 1, text: piece.chars().take(200).collect() }.to_string()); // alloc: error path
         };
         let job = match scope.is_empty() {
             true => None,
@@ -1614,7 +1677,7 @@ fn take_lines(server: &mut Server, text: &[u8]) -> Result<(), String> {
         let id = server
             .names
             .intern(what)
-            .ok_or_else(|| format!("it names more than {} paths and variables, or 4 GiB of them", names::MOST))?;
+            .ok_or_else(|| format!("it names more than {} paths and variables, or 4 GiB of them", names::MOST))?; // alloc: error path
         if ours(server, seen, id) {
             continue;
         }
@@ -1631,6 +1694,7 @@ fn take_lines(server: &mut Server, text: &[u8]) -> Result<(), String> {
                 }
                 server.common_kinds[at] |= bit;
                 server.common.push(pack(id, seen));
+                server.shared = None;
             }
         }
     }
@@ -1640,9 +1704,9 @@ fn take_lines(server: &mut Server, text: &[u8]) -> Result<(), String> {
 /// How a server's process ended, for the tests it loses.
 fn ended(exit: &Exit) -> String {
     match (exit.code, exit.signal) {
-        (Some(code), _) => format!("its fork server exited with code {code}"),
-        (None, Some(signal)) => format!("its fork server was ended by signal {signal}"),
-        (None, None) => "its fork server ended".to_owned(),
+        (Some(code), _) => format!("its fork server exited with code {code}"), // alloc: once per server, at its end
+        (None, Some(signal)) => format!("its fork server was ended by signal {signal}"), // alloc: once per server, at its end
+        (None, None) => "its fork server ended".to_owned(), // alloc: once per server, at its end
     }
 }
 

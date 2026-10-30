@@ -176,3 +176,27 @@ fn watched_in_the_output_as_from_the_parsed_output() {
     }
     assert!(ok > 100, "{ok} read");
 }
+
+/// [`watched_in`] allocates the values it keeps and a fixed number of buffers: the two lists
+/// the pass keeps, the two of the result, and the one path each is made whole in, grown at
+/// most four times.
+#[test]
+fn watched_in_allocates_what_it_keeps() {
+    let package = crate::unit::Package::default();
+    let cx = output::Context {
+        package: &package,
+        out_dir_when_generated: Path::new("/p/out"),
+        out_dir: Path::new("/p/out"),
+        nightly_features_allowed: false,
+        rustc_bootstrap: None,
+    };
+    let stdout = "cargo:rerun-if-changed=build.rs\ncargo:rustc-cfg=x\n\
+                  cargo:rerun-if-changed=src/a.rs\ncargo:rerun-if-env-changed=CC\n\
+                  cargo:rerun-if-changed=src/b.rs\ncargo:rerun-if-changed=build.rs\n\
+                  cargo:rerun-if-env-changed=CFLAGS\ncargo:rerun-if-env-changed=CC\n";
+    let watched = blaze_alloc_count::assert_at_most(3 + 2 + 8, "watched_in", || {
+        watched_in(stdout.as_bytes(), &cx, Path::new("/p/foo")).unwrap()
+    });
+    assert_eq!(watched.paths.len(), 3);
+    assert_eq!(watched.env, ["CC", "CFLAGS"]);
+}

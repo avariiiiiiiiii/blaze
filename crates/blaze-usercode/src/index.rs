@@ -199,7 +199,7 @@ pub(crate) fn find_held<'s, I: Inputs>(
     search(|key| Ok(store.get(key)?.map(|entry| entry.bytes)), run, inputs)
 }
 
-fn search<'s, I: Inputs>(
+pub(crate) fn search<'s, I: Inputs>(
     get: impl Fn(&Key) -> Result<Option<&'s [u8]>, Corrupt>,
     run: &RunKey,
     inputs: &mut I,

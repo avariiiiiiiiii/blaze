@@ -11,6 +11,9 @@ use expect_test::expect_file;
 
 use crate::{Edition, LexedStr, TopEntryPoint};
 
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 #[rustfmt::skip]
 #[path = "../test_data/generated/runner.rs"]
 mod runner;
@@ -55,6 +58,56 @@ fn lex(text: &str, edition: Edition) -> String {
         writeln!(res, "{kind:?} {text:?}{error}").unwrap();
     }
     res
+}
+
+/// The parser's own sources, as real Rust text.
+fn sources() -> Vec<String> {
+    let mut dirs = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    let mut out = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|it| it == "rs") {
+                out.push(fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+    assert!(out.len() > 50, "the parser's sources are found");
+    out
+}
+
+/// Lexing allocates its three columns once each (the byte classes, the tokens and the
+/// checkpoints) and nothing per token, when the text has no frontmatter, no lexer error and no
+/// more tokens than the columns are sized for (one per 3 bytes); nine in ten real files fit.
+#[test]
+fn lexing_allocates_its_three_columns_once() {
+    let texts = sources();
+    let mut fit = 0;
+    for text in &texts {
+        let lexed = LexedStr::new(Edition::CURRENT, text);
+        if lexed.errors().next().is_some() || lexed.len() + 1 > text.len() / 3 {
+            continue;
+        }
+        fit += 1;
+        blaze_alloc_count::assert_at_most(3, "lexing a source file", || {
+            LexedStr::new(Edition::CURRENT, text)
+        });
+    }
+    assert!(fit * 10 >= texts.len() * 9, "{fit} of {} files fit the columns", texts.len());
+}
+
+/// A text denser than the columns are sized for grows them by doubling, not per token: a
+/// megabyte of `;` is a million tokens in columns sized for a third of that, so two doublings
+/// of each.
+#[test]
+fn a_dense_text_grows_the_columns_by_doubling() {
+    let text = ";".repeat(1 << 20);
+    let lexed = blaze_alloc_count::assert_at_most(7, "lexing a megabyte of `;`", || {
+        LexedStr::new(Edition::CURRENT, &text)
+    });
+    assert_eq!(lexed.len(), 1 << 20);
 }
 
 #[test]

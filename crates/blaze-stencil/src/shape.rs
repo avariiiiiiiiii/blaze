@@ -3,8 +3,9 @@
 //! definition read by the generator (`build.rs` includes this file with `#[path]`), the
 //! patcher's selection and the tests; it uses nothing but `std`.
 //!
-//! [`each`] lists the whole set in one deterministic order; [`Shape::key`] packs a shape in
-//! 28 bits, which the library's perfect index maps to its stencil.
+//! [`each`] lists the whole set in one deterministic order, [`each_on`] the part one
+//! instruction set has; [`Shape::key`] packs a shape in 28 bits, which the library's perfect
+//! index maps to its stencil.
 
 use std::fmt;
 
@@ -89,6 +90,11 @@ impl Ty {
         matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128)
     }
 
+    /// An integer an immediate can be: up to 64 bits.
+    pub const fn is_narrow_int(self) -> bool {
+        matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64)
+    }
+
     pub const fn is_float(self) -> bool {
         matches!(self, Ty::F16 | Ty::F32 | Ty::F64 | Ty::F128)
     }
@@ -112,6 +118,35 @@ impl Ty {
 
     pub const fn lanes(self) -> u8 {
         if self.is_vector() { 16 / self.lane().bytes() } else { 1 }
+    }
+
+    /// The integer vector of the same lanes (a float vector's compare mask), or the type.
+    pub const fn int_lanes(self) -> Ty {
+        match self {
+            Ty::F32x4 => Ty::I32x4,
+            Ty::F64x2 => Ty::I64x2,
+            it => it,
+        }
+    }
+
+    /// The integer vector of lanes twice as wide and half as many, if any.
+    pub const fn wider(self) -> Option<Ty> {
+        match self {
+            Ty::I8x16 => Some(Ty::I16x8),
+            Ty::I16x8 => Some(Ty::I32x4),
+            Ty::I32x4 => Some(Ty::I64x2),
+            _ => None,
+        }
+    }
+
+    /// The integer vector of lanes half as wide and twice as many, if any.
+    pub const fn narrower(self) -> Option<Ty> {
+        match self {
+            Ty::I16x8 => Some(Ty::I8x16),
+            Ty::I32x4 => Some(Ty::I16x8),
+            Ty::I64x2 => Some(Ty::I32x4),
+            _ => None,
+        }
     }
 
     /// Cranelift's name of the type, for errors and the generator's symbol names.
@@ -141,11 +176,19 @@ impl Ty {
 pub struct TySet(pub u16);
 
 impl TySet {
+    pub const NONE: TySet = TySet(0);
     pub const INTS: TySet = TySet::of(&[Ty::I8, Ty::I16, Ty::I32, Ty::I64]);
     pub const INTS_WIDE: TySet = TySet::of(&[Ty::I8, Ty::I16, Ty::I32, Ty::I64, Ty::I128]);
     pub const FLOATS: TySet = TySet::of(&[Ty::F32, Ty::F64]);
     pub const INT_VECTORS: TySet = TySet::of(&[Ty::I8x16, Ty::I16x8, Ty::I32x4, Ty::I64x2]);
     pub const FLOAT_VECTORS: TySet = TySet::of(&[Ty::F32x4, Ty::F64x2]);
+    pub const VECTORS: TySet = TySet::INT_VECTORS.union(TySet::FLOAT_VECTORS);
+    /// `f32`, `f64` and their vectors: what float arithmetic is of.
+    pub const FLOAT_MATH: TySet = TySet::FLOATS.union(TySet::FLOAT_VECTORS);
+    /// The integers, `i128` and the integer vectors: what integer arithmetic is of.
+    pub const INT_MATH: TySet = TySet::INTS_WIDE.union(TySet::INT_VECTORS);
+    /// What the bitwise ops take: every type but `f16` and `f128`.
+    pub const BITS: TySet = TySet::INT_MATH.union(TySet::FLOAT_MATH);
     pub const ALL: TySet = TySet((1 << Ty::ALL.len()) - 1);
 
     pub const fn of(tys: &[Ty]) -> TySet {
@@ -193,6 +236,8 @@ pub enum Src {
 }
 
 impl Src {
+    pub const ALL: [Src; 4] = [Src::None, Src::Slot, Src::Acc, Src::Imm];
+
     pub const fn from_u8(it: u8) -> Option<Src> {
         match it {
             0 => Some(Src::None),
@@ -218,6 +263,8 @@ pub enum Dst {
 }
 
 impl Dst {
+    pub const ALL: [Dst; 4] = [Dst::None, Dst::Slot, Dst::Acc, Dst::Both];
+
     pub const fn from_u8(it: u8) -> Option<Dst> {
         match it {
             0 => Some(Dst::None),
@@ -247,6 +294,33 @@ pub enum IntCc {
 
 impl IntCc {
     pub const COUNT: u8 = 10;
+    pub const ALL: [IntCc; 10] = [
+        IntCc::Equal,
+        IntCc::NotEqual,
+        IntCc::SignedLessThan,
+        IntCc::SignedGreaterThanOrEqual,
+        IntCc::SignedGreaterThan,
+        IntCc::SignedLessThanOrEqual,
+        IntCc::UnsignedLessThan,
+        IntCc::UnsignedGreaterThanOrEqual,
+        IntCc::UnsignedGreaterThan,
+        IntCc::UnsignedLessThanOrEqual,
+    ];
+
+    pub const fn from_u8(it: u8) -> Option<IntCc> {
+        if it < IntCc::COUNT { Some(IntCc::ALL[it as usize]) } else { None }
+    }
+
+    /// Whether it compares as signed integers.
+    pub const fn signed(self) -> bool {
+        matches!(
+            self,
+            IntCc::SignedLessThan
+                | IntCc::SignedGreaterThanOrEqual
+                | IntCc::SignedGreaterThan
+                | IntCc::SignedLessThanOrEqual
+        )
+    }
 }
 
 /// A float condition, in the order of Cranelift's `FloatCC`.
@@ -271,6 +345,26 @@ pub enum FloatCc {
 
 impl FloatCc {
     pub const COUNT: u8 = 14;
+    pub const ALL: [FloatCc; 14] = [
+        FloatCc::Ordered,
+        FloatCc::Unordered,
+        FloatCc::Equal,
+        FloatCc::NotEqual,
+        FloatCc::OrderedNotEqual,
+        FloatCc::UnorderedOrEqual,
+        FloatCc::LessThan,
+        FloatCc::LessThanOrEqual,
+        FloatCc::GreaterThan,
+        FloatCc::GreaterThanOrEqual,
+        FloatCc::UnorderedOrLessThan,
+        FloatCc::UnorderedOrLessThanOrEqual,
+        FloatCc::UnorderedOrGreaterThan,
+        FloatCc::UnorderedOrGreaterThanOrEqual,
+    ];
+
+    pub const fn from_u8(it: u8) -> Option<FloatCc> {
+        if it < FloatCc::COUNT { Some(FloatCc::ALL[it as usize]) } else { None }
+    }
 }
 
 /// An atomic read-modify-write, in the order of Cranelift's `AtomicRmwOp`.
@@ -292,6 +386,35 @@ pub enum RmwOp {
 
 impl RmwOp {
     pub const COUNT: u8 = 11;
+    pub const ALL: [RmwOp; 11] = [
+        RmwOp::Add,
+        RmwOp::Sub,
+        RmwOp::And,
+        RmwOp::Nand,
+        RmwOp::Or,
+        RmwOp::Xor,
+        RmwOp::Xchg,
+        RmwOp::Umin,
+        RmwOp::Umax,
+        RmwOp::Smin,
+        RmwOp::Smax,
+    ];
+
+    pub const fn from_u8(it: u8) -> Option<RmwOp> {
+        if it < RmwOp::COUNT { Some(RmwOp::ALL[it as usize]) } else { None }
+    }
+}
+
+/// The instruction set a library is of: which part of the set has stencils
+/// ([`Op::on`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Isa {
+    X86_64,
+    Aarch64,
+}
+
+impl Isa {
+    pub const ALL: [Isa; 2] = [Isa::X86_64, Isa::Aarch64];
 }
 
 /// The operation of a stencil: Cranelift's opcodes that a stencil implements, with the
@@ -299,6 +422,10 @@ impl RmwOp {
 /// into [`Op::Select`], `stack_load`/`stack_store`/`stack_addr` kept as frame-relative ops,
 /// and the fusions [`Op::BrIcmp`] and [`Op::SelectIcmp`]. Opcodes not here are the glue's
 /// (`arch::Glue`) or refused with an error naming them (`patch/select.rs`).
+///
+/// Operand types are [`Shape::arg`]'s and result types [`Shape::result`]'s. The amount of a
+/// shift or rotate (operand 1) is read as its low 8 bits, so any integer type of amount takes
+/// the same stencil (its type is given as `i8`): Cranelift masks it below the width anyway.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 #[repr(u8)]
 pub enum Op {
@@ -306,7 +433,7 @@ pub enum Op {
     /// A slot or accumulator to a slot or accumulator: block arguments, `iconcat`'s halves.
     Copy,
     /// `iconst` into a slot or accumulator (one no shape takes as an [`Src::Imm`]): `aux` 0
-    /// when the value fits 32 bits sign-extended, 1 for an `Imm0` hole of all 64.
+    /// when the value fits 32 bits sign-extended, 1 for an `Imm0` hole of all 64 (`i64` only).
     Iconst,
     /// `f16const`, `f32const`, `f64const`: the bits as `Imm0`, `aux` as for [`Op::Iconst`].
     Fconst,
@@ -334,13 +461,14 @@ pub enum Op {
     Umin,
     Smax,
     Umax,
-    // Arithmetic with an overflow or carry result (result 1, in its slot).
+    // Arithmetic with an overflow or carry result (result 1, an `i8` in its slot).
     UaddOverflow,
     SaddOverflow,
     UsubOverflow,
     SsubOverflow,
     UmulOverflow,
     SmulOverflow,
+    /// Operand 2 is the `i8` carry in, from its slot.
     UaddOverflowCin,
     SaddOverflowCin,
     UsubOverflowBin,
@@ -367,6 +495,7 @@ pub enum Op {
     Bswap,
     Popcnt,
     Bitselect,
+    /// `aux` is the operand's [`Ty`]; `ty` the result's.
     Bmask,
     // Comparisons and selects.
     /// `aux` is the [`IntCc`].
@@ -375,8 +504,9 @@ pub enum Op {
     Fcmp,
     /// `select c, x, y`: `aux` is the condition's [`Ty`].
     Select,
-    /// `select (icmp cc a b), x, y`: `aux` is the [`IntCc`] in its low 4 bits and the
-    /// compared [`Ty`] in its high 4.
+    /// `select (icmp cc a b), a, b` (the `min`/`max` idiom of any condition): operands `a`
+    /// and `b`; `aux` is the [`IntCc`] in its low 4 bits and `ty` (the compared type) in its
+    /// high 4.
     SelectIcmp,
     // Floats.
     Fadd,
@@ -411,11 +541,13 @@ pub enum Op {
     FcvtFromSint,
     /// `i128` to its two `i64` halves (results 0 and 1).
     Isplit,
-    /// Two `i64` halves to an `i128`.
+    /// Two `i64` halves to an `i128` (`ty` is `i128`).
     Iconcat,
+    /// `ty` is the result; the operands are the vectors of lanes twice as wide.
     Snarrow,
     Unarrow,
     Uunarrow,
+    /// `ty` is the result; the operand is the vector of lanes half as wide.
     SwidenLow,
     SwidenHigh,
     UwidenLow,
@@ -430,19 +562,23 @@ pub enum Op {
     Shuffle,
     /// `aux` is the lane.
     Insertlane,
-    /// `aux` is the lane.
+    /// `aux` is the lane; `ty` the vector's.
     Extractlane,
     VanyTrue,
     VallTrue,
-    /// `aux` is the result's [`Ty`].
+    /// `ty` is the vector's; `aux` is the result's [`Ty`].
     VhighBits,
     Blendv,
     X86Pshufb,
     X86Pmulhrsw,
+    /// `ty` is the result `i16x8`; the operands are `i8x16`.
     X86Pmaddubsw,
+    /// `ty` is the result `i32x4`; the operand is `f32x4`.
     X86Cvtt2dq,
     // Memory: the access's offset is the `Offset` hole. `ty` is the value's type; for the
-    // narrow loads and stores, the wide type (`uload8.i32`: `ty` is `i32`).
+    // narrow loads and stores, the wide type (`uload8.i32`: `ty` is `i32`). The address is
+    // an `i64` operand; a store's value is operand 0 and its address operand 1, as in
+    // Cranelift.
     Load,
     Store,
     Uload8,
@@ -464,6 +600,8 @@ pub enum Op {
     StackAddr,
     StackLoad,
     StackStore,
+    /// Atomics are sequentially consistent and have no offset; operands in Cranelift's
+    /// order (`atomic_store x, p`; `atomic_rmw p, x`; `atomic_cas p, e, x`).
     AtomicLoad,
     AtomicStore,
     /// `aux` is the [`RmwOp`].
@@ -488,23 +626,33 @@ impl Op {
     pub const COUNT: u8 = Op::Trapnz as u8 + 1;
 
     pub fn from_u8(it: u8) -> Option<Op> {
-        Op::all().nth(usize::from(it)).filter(|op| *op as u8 == it)
+        INFO.get(usize::from(it)).map(|info| info.op)
     }
 
     /// Every op, in the order of their numbers.
     pub fn all() -> impl Iterator<Item = Op> {
-        (0..Op::COUNT).map(op_of)
+        INFO.iter().map(|info| info.op)
     }
 
     /// What the op takes and gives, and which shapes of it exist.
     pub fn info(self) -> &'static Info {
         &INFO[self as usize]
     }
-}
 
-/// The op numbered `it`, which is below [`Op::COUNT`].
-fn op_of(it: u8) -> Op {
-    INFO[usize::from(it)].op
+    /// Whether `isa`'s library has stencils of it. On x86-64's baseline (SSE2), Cranelift
+    /// lowers `ceil`, `floor`, `trunc`, `nearest` and `fma` to libcalls, and so does the glue;
+    /// the `x86_*` ops and `x86_blendv` are x86-64's alone.
+    pub const fn on(self, isa: Isa) -> bool {
+        match isa {
+            Isa::X86_64 => {
+                !matches!(self, Op::Ceil | Op::Floor | Op::Trunc | Op::Nearest | Op::Fma)
+            }
+            Isa::Aarch64 => !matches!(
+                self,
+                Op::Blendv | Op::X86Pshufb | Op::X86Pmulhrsw | Op::X86Pmaddubsw | Op::X86Cvtt2dq
+            ),
+        }
+    }
 }
 
 /// What `aux` means for an op, and so which values of it exist.
@@ -524,6 +672,8 @@ pub enum Aux {
     Ty(TySet),
     /// An [`RmwOp`].
     Rmw,
+    /// 0 for a 32-bit immediate sign-extended, 1 for one of 64 bits (64-bit types only).
+    Wide,
 }
 
 /// What an op takes and gives, and which shapes of it exist.
@@ -551,14 +701,248 @@ pub struct Info {
     pub branches: bool,
 }
 
-/// One [`Info`] per op, by its number: the generator child (`fastcompile-stencil-gen`) fills
-/// in the table, each row from Cranelift's lowering rules of the opcode on x64 and AArch64
-/// (which types it takes) and the IR builder's use of it.
-static INFO: [Info; Op::Trapnz as usize + 1] = info_table();
+impl Info {
+    /// An op of `args` operands and `results` results of the types `tys`, every operand
+    /// from a slot or an accumulator, result 0 to a slot or an accumulator.
+    const fn new(op: Op, name: &'static str, args: u8, results: u8, tys: TySet) -> Info {
+        Info {
+            op,
+            name,
+            args,
+            results,
+            tys,
+            aux: Aux::None,
+            imm: 0,
+            acc: (1 << args) - 1,
+            dst_acc: results > 0,
+            traps: false,
+            branches: false,
+        }
+    }
 
-const fn info_table() -> [Info; Op::Trapnz as usize + 1] {
-    unimplemented!("fastcompile-stencil-gen: the info of every op")
+    const fn aux(self, aux: Aux) -> Info {
+        Info { aux, ..self }
+    }
+
+    const fn imm(self, imm: u8) -> Info {
+        Info { imm, ..self }
+    }
+
+    const fn acc(self, acc: u8) -> Info {
+        Info { acc, ..self }
+    }
+
+    const fn traps(self) -> Info {
+        Info { traps: true, ..self }
+    }
+
+    const fn branches(self) -> Info {
+        Info { branches: true, ..self }
+    }
 }
+
+const fn unary(op: Op, name: &'static str, tys: TySet) -> Info {
+    Info::new(op, name, 1, 1, tys)
+}
+
+const fn binary(op: Op, name: &'static str, tys: TySet) -> Info {
+    Info::new(op, name, 2, 1, tys)
+}
+
+/// A binary op whose right operand may be an immediate (its `_imm` form).
+const fn binary_imm(op: Op, name: &'static str, tys: TySet) -> Info {
+    binary(op, name, tys).imm(0b10)
+}
+
+const fn conversion(op: Op, name: &'static str, tys: TySet, from: TySet) -> Info {
+    unary(op, name, tys).aux(Aux::Ty(from))
+}
+
+const fn load(op: Op, name: &'static str, tys: TySet) -> Info {
+    unary(op, name, tys)
+}
+
+const fn store(op: Op, name: &'static str, tys: TySet) -> Info {
+    Info::new(op, name, 2, 0, tys).imm(0b01)
+}
+
+const fn ty(ty: Ty) -> TySet {
+    TySet::of(&[ty])
+}
+
+const I8: TySet = ty(Ty::I8);
+const I16_UP: TySet = TySet::of(&[Ty::I16, Ty::I32, Ty::I64]);
+const I32_UP: TySet = TySet::of(&[Ty::I32, Ty::I64]);
+const I16_TO_I128: TySet = TySet::of(&[Ty::I16, Ty::I32, Ty::I64, Ty::I128]);
+const NARROWED: TySet = TySet::of(&[Ty::I8x16, Ty::I16x8, Ty::I32x4]);
+const WIDENED: TySet = TySet::of(&[Ty::I16x8, Ty::I32x4, Ty::I64x2]);
+const SAT_LANES: TySet = TySet::INT_VECTORS;
+const MUL_TYS: TySet = TySet::INTS_WIDE.union(WIDENED);
+const MULHI_TYS: TySet = TySet::INTS.union(ty(Ty::I16x8));
+const FCVT_TO: TySet = TySet::INTS.union(TySet::of(&[Ty::I32x4, Ty::I64x2]));
+const FCVT_FROM: TySet = TySet::INTS.union(TySet::of(&[Ty::I32x4, Ty::I64x2]));
+const FLOAT_SOURCES: TySet = TySet::FLOAT_MATH;
+const BLEND_TYS: TySet = TySet::of(&[Ty::I8x16, Ty::I32x4, Ty::I64x2, Ty::F32x4, Ty::F64x2]);
+
+/// One [`Info`] per op, by its number: each row from Cranelift's lowering rules of the opcode
+/// on x64 and AArch64 (which types it takes) and the IR builder's use of it.
+const TABLE: [Info; Op::Trapnz as usize + 1] = [
+    unary(Op::Copy, "copy", TySet::ALL),
+    Info::new(Op::Iconst, "iconst", 0, 1, TySet::INTS).aux(Aux::Wide),
+    Info::new(Op::Fconst, "fconst", 0, 1, TySet::of(&[Ty::F16, Ty::F32, Ty::F64])).aux(Aux::Wide),
+    Info::new(Op::Vconst, "vconst", 0, 1, TySet::VECTORS.union(ty(Ty::F128))),
+    binary_imm(Op::Iadd, "iadd", TySet::INT_MATH),
+    binary_imm(Op::Isub, "isub", TySet::INT_MATH),
+    unary(Op::Ineg, "ineg", TySet::INT_MATH),
+    unary(Op::Iabs, "iabs", TySet::INTS.union(TySet::INT_VECTORS)),
+    binary_imm(Op::Imul, "imul", MUL_TYS),
+    binary_imm(Op::Umulhi, "umulhi", MULHI_TYS),
+    binary_imm(Op::Smulhi, "smulhi", MULHI_TYS),
+    binary_imm(Op::Udiv, "udiv", TySet::INTS).traps(),
+    binary_imm(Op::Sdiv, "sdiv", TySet::INTS).traps(),
+    binary_imm(Op::Urem, "urem", TySet::INTS).traps(),
+    binary_imm(Op::Srem, "srem", TySet::INTS).traps(),
+    binary(Op::SqmulRoundSat, "sqmul_round_sat", TySet::of(&[Ty::I16x8, Ty::I32x4])),
+    binary(Op::AvgRound, "avg_round", NARROWED),
+    binary(Op::UaddSat, "uadd_sat", SAT_LANES),
+    binary(Op::SaddSat, "sadd_sat", SAT_LANES),
+    binary(Op::UsubSat, "usub_sat", SAT_LANES),
+    binary(Op::SsubSat, "ssub_sat", SAT_LANES),
+    binary_imm(Op::Smin, "smin", TySet::INTS.union(TySet::INT_VECTORS)),
+    binary_imm(Op::Umin, "umin", TySet::INTS.union(TySet::INT_VECTORS)),
+    binary_imm(Op::Smax, "smax", TySet::INTS.union(TySet::INT_VECTORS)),
+    binary_imm(Op::Umax, "umax", TySet::INTS.union(TySet::INT_VECTORS)),
+    Info::new(Op::UaddOverflow, "uadd_overflow", 2, 2, TySet::INTS_WIDE).imm(0b10),
+    Info::new(Op::SaddOverflow, "sadd_overflow", 2, 2, TySet::INTS_WIDE).imm(0b10),
+    Info::new(Op::UsubOverflow, "usub_overflow", 2, 2, TySet::INTS_WIDE).imm(0b10),
+    Info::new(Op::SsubOverflow, "ssub_overflow", 2, 2, TySet::INTS_WIDE).imm(0b10),
+    Info::new(Op::UmulOverflow, "umul_overflow", 2, 2, TySet::INTS).imm(0b10),
+    Info::new(Op::SmulOverflow, "smul_overflow", 2, 2, TySet::INTS).imm(0b10),
+    Info::new(Op::UaddOverflowCin, "uadd_overflow_cin", 3, 2, TySet::INTS).imm(0b010).acc(0b011),
+    Info::new(Op::SaddOverflowCin, "sadd_overflow_cin", 3, 2, TySet::INTS).imm(0b010).acc(0b011),
+    Info::new(Op::UsubOverflowBin, "usub_overflow_bin", 3, 2, TySet::INTS).imm(0b010).acc(0b011),
+    Info::new(Op::SsubOverflowBin, "ssub_overflow_bin", 3, 2, TySet::INTS).imm(0b010).acc(0b011),
+    binary_imm(Op::UaddOverflowTrap, "uadd_overflow_trap", I32_UP).traps(),
+    binary_imm(Op::Band, "band", TySet::BITS),
+    binary_imm(Op::Bor, "bor", TySet::BITS),
+    binary_imm(Op::Bxor, "bxor", TySet::BITS),
+    unary(Op::Bnot, "bnot", TySet::BITS),
+    binary_imm(Op::BandNot, "band_not", TySet::BITS),
+    binary_imm(Op::BorNot, "bor_not", TySet::BITS),
+    binary_imm(Op::BxorNot, "bxor_not", TySet::BITS),
+    binary_imm(Op::Rotl, "rotl", TySet::INTS_WIDE),
+    binary_imm(Op::Rotr, "rotr", TySet::INTS_WIDE),
+    binary_imm(Op::Ishl, "ishl", TySet::INT_MATH),
+    binary_imm(Op::Ushr, "ushr", TySet::INT_MATH),
+    binary_imm(Op::Sshr, "sshr", TySet::INT_MATH),
+    unary(Op::Bitrev, "bitrev", TySet::INTS_WIDE),
+    unary(Op::Clz, "clz", TySet::INTS_WIDE),
+    unary(Op::Cls, "cls", TySet::INTS_WIDE),
+    unary(Op::Ctz, "ctz", TySet::INTS_WIDE),
+    unary(Op::Bswap, "bswap", I16_TO_I128),
+    unary(Op::Popcnt, "popcnt", TySet::INT_MATH),
+    Info::new(Op::Bitselect, "bitselect", 3, 1, TySet::INTS_WIDE.union(TySet::VECTORS)),
+    conversion(Op::Bmask, "bmask", TySet::INTS_WIDE, TySet::INTS_WIDE),
+    binary_imm(Op::Icmp, "icmp", TySet::INT_MATH).aux(Aux::IntCc),
+    binary(Op::Fcmp, "fcmp", TySet::FLOAT_MATH).aux(Aux::FloatCc),
+    Info::new(Op::Select, "select", 3, 1, TySet::ALL).aux(Aux::Ty(TySet::INTS)).imm(0b110),
+    binary_imm(Op::SelectIcmp, "select_icmp", TySet::INTS).aux(Aux::IntCcTy),
+    binary(Op::Fadd, "fadd", TySet::FLOAT_MATH),
+    binary(Op::Fsub, "fsub", TySet::FLOAT_MATH),
+    binary(Op::Fmul, "fmul", TySet::FLOAT_MATH),
+    binary(Op::Fdiv, "fdiv", TySet::FLOAT_MATH),
+    unary(Op::Sqrt, "sqrt", TySet::FLOAT_MATH),
+    Info::new(Op::Fma, "fma", 3, 1, TySet::FLOAT_MATH),
+    unary(Op::Fneg, "fneg", TySet::FLOAT_MATH),
+    unary(Op::Fabs, "fabs", TySet::FLOAT_MATH),
+    binary(Op::Fcopysign, "fcopysign", TySet::FLOAT_MATH),
+    binary(Op::Fmin, "fmin", TySet::FLOAT_MATH),
+    binary(Op::Fmax, "fmax", TySet::FLOAT_MATH),
+    unary(Op::Ceil, "ceil", TySet::FLOAT_MATH),
+    unary(Op::Floor, "floor", TySet::FLOAT_MATH),
+    unary(Op::Trunc, "trunc", TySet::FLOAT_MATH),
+    unary(Op::Nearest, "nearest", TySet::FLOAT_MATH),
+    conversion(Op::Bitcast, "bitcast", TySet::ALL, TySet::ALL),
+    conversion(Op::Ireduce, "ireduce", TySet::INTS, TySet::INTS_WIDE),
+    conversion(Op::Uextend, "uextend", I16_TO_I128, TySet::INTS),
+    conversion(Op::Sextend, "sextend", I16_TO_I128, TySet::INTS),
+    unary(Op::Fpromote, "fpromote", ty(Ty::F64)),
+    unary(Op::Fdemote, "fdemote", ty(Ty::F32)),
+    unary(Op::Fvdemote, "fvdemote", ty(Ty::F32x4)),
+    unary(Op::FvpromoteLow, "fvpromote_low", ty(Ty::F64x2)),
+    conversion(Op::FcvtToUint, "fcvt_to_uint", TySet::INTS, TySet::FLOATS).traps(),
+    conversion(Op::FcvtToSint, "fcvt_to_sint", TySet::INTS, TySet::FLOATS).traps(),
+    conversion(Op::FcvtToUintSat, "fcvt_to_uint_sat", FCVT_TO, FLOAT_SOURCES),
+    conversion(Op::FcvtToSintSat, "fcvt_to_sint_sat", FCVT_TO, FLOAT_SOURCES),
+    conversion(Op::FcvtFromUint, "fcvt_from_uint", TySet::FLOAT_MATH, FCVT_FROM),
+    conversion(Op::FcvtFromSint, "fcvt_from_sint", TySet::FLOAT_MATH, FCVT_FROM),
+    Info::new(Op::Isplit, "isplit", 1, 2, ty(Ty::I128)),
+    binary(Op::Iconcat, "iconcat", ty(Ty::I128)),
+    binary(Op::Snarrow, "snarrow", NARROWED),
+    binary(Op::Unarrow, "unarrow", NARROWED),
+    binary(Op::Uunarrow, "uunarrow", NARROWED),
+    unary(Op::SwidenLow, "swiden_low", WIDENED),
+    unary(Op::SwidenHigh, "swiden_high", WIDENED),
+    unary(Op::UwidenLow, "uwiden_low", WIDENED),
+    unary(Op::UwidenHigh, "uwiden_high", WIDENED),
+    binary(Op::IaddPairwise, "iadd_pairwise", NARROWED),
+    conversion(Op::ScalarToVector, "scalar_to_vector", TySet::VECTORS, TySet::INTS.union(TySet::FLOATS))
+        .imm(0b1),
+    unary(Op::Splat, "splat", TySet::VECTORS).imm(0b1),
+    binary(Op::Swizzle, "swizzle", ty(Ty::I8x16)).acc(0),
+    binary(Op::Shuffle, "shuffle", ty(Ty::I8x16)).acc(0),
+    binary(Op::Insertlane, "insertlane", TySet::VECTORS).aux(Aux::Lane),
+    unary(Op::Extractlane, "extractlane", TySet::VECTORS).aux(Aux::Lane),
+    unary(Op::VanyTrue, "vany_true", TySet::INT_VECTORS),
+    unary(Op::VallTrue, "vall_true", TySet::INT_VECTORS),
+    conversion(Op::VhighBits, "vhigh_bits", TySet::VECTORS, TySet::INTS),
+    Info::new(Op::Blendv, "x86_blendv", 3, 1, BLEND_TYS),
+    binary(Op::X86Pshufb, "x86_pshufb", ty(Ty::I8x16)).acc(0),
+    binary(Op::X86Pmulhrsw, "x86_pmulhrsw", ty(Ty::I16x8)),
+    binary(Op::X86Pmaddubsw, "x86_pmaddubsw", ty(Ty::I16x8)),
+    unary(Op::X86Cvtt2dq, "x86_cvtt2dq", ty(Ty::I32x4)),
+    load(Op::Load, "load", TySet::ALL),
+    store(Op::Store, "store", TySet::ALL),
+    load(Op::Uload8, "uload8", I16_UP),
+    load(Op::Sload8, "sload8", I16_UP),
+    store(Op::Istore8, "istore8", I16_UP),
+    load(Op::Uload16, "uload16", I32_UP),
+    load(Op::Sload16, "sload16", I32_UP),
+    store(Op::Istore16, "istore16", I32_UP),
+    load(Op::Uload32, "uload32", ty(Ty::I64)),
+    load(Op::Sload32, "sload32", ty(Ty::I64)),
+    store(Op::Istore32, "istore32", ty(Ty::I64)),
+    load(Op::Uload8x8, "uload8x8", ty(Ty::I16x8)),
+    load(Op::Sload8x8, "sload8x8", ty(Ty::I16x8)),
+    load(Op::Uload16x4, "uload16x4", ty(Ty::I32x4)),
+    load(Op::Sload16x4, "sload16x4", ty(Ty::I32x4)),
+    load(Op::Uload32x2, "uload32x2", ty(Ty::I64x2)),
+    load(Op::Sload32x2, "sload32x2", ty(Ty::I64x2)),
+    Info::new(Op::StackAddr, "stack_addr", 0, 1, ty(Ty::I64)),
+    Info::new(Op::StackLoad, "stack_load", 0, 1, TySet::ALL),
+    Info::new(Op::StackStore, "stack_store", 1, 0, TySet::ALL).imm(0b1),
+    load(Op::AtomicLoad, "atomic_load", TySet::INTS),
+    store(Op::AtomicStore, "atomic_store", TySet::INTS),
+    Info::new(Op::AtomicRmw, "atomic_rmw", 2, 1, TySet::INTS).aux(Aux::Rmw).imm(0b10).acc(0b10),
+    Info::new(Op::AtomicCas, "atomic_cas", 3, 1, TySet::INTS_WIDE).acc(0),
+    Info::new(Op::Fence, "fence", 0, 0, I8),
+    Info::new(Op::Jump, "jump", 0, 0, I8),
+    Info::new(Op::Brif, "brif", 1, 0, TySet::INTS_WIDE).branches(),
+    binary_imm(Op::BrIcmp, "br_icmp", TySet::INTS_WIDE).aux(Aux::IntCc).branches(),
+    Info::new(Op::Trapz, "trapz", 1, 0, TySet::INTS_WIDE).traps(),
+    Info::new(Op::Trapnz, "trapnz", 1, 0, TySet::INTS_WIDE).traps(),
+];
+
+const _: () = {
+    let mut i = 0;
+    while i < TABLE.len() {
+        assert!(TABLE[i].op as usize == i, "the info table is out of the ops' order");
+        assert!(TABLE[i].args <= 3 && TABLE[i].results <= 2);
+        i += 1;
+    }
+};
+
+static INFO: [Info; Op::Trapnz as usize + 1] = TABLE;
 
 /// One stencil's name: 4 bytes, packed by [`Shape::key`] into 28 bits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -601,17 +985,174 @@ impl Shape {
         })
     }
 
-    /// Whether the shape is one of the set: its op has the type, `aux` is in range, the
-    /// sources and the destination are ones the op's [`Info`] allows for the type, and at
-    /// most one source is an accumulator.
+    /// `aux` as a type, for the ops whose `aux` is one.
+    pub fn aux_ty(self) -> Ty {
+        Ty::from_u8(self.aux & 0xf).unwrap_or(self.ty)
+    }
+
+    /// The type of operand `n`.
+    pub fn arg(self, n: usize) -> Ty {
+        let ty = self.ty;
+        match self.op {
+            Op::Select if n == 0 => self.aux_ty(),
+            Op::Ishl | Op::Ushr | Op::Sshr | Op::Rotl | Op::Rotr if n == 1 => Ty::I8,
+            Op::Bmask
+            | Op::Bitcast
+            | Op::Ireduce
+            | Op::Uextend
+            | Op::Sextend
+            | Op::FcvtToUint
+            | Op::FcvtToSint
+            | Op::FcvtToUintSat
+            | Op::FcvtToSintSat
+            | Op::FcvtFromUint
+            | Op::FcvtFromSint
+            | Op::ScalarToVector => self.aux_ty(),
+            Op::Fpromote => Ty::F32,
+            Op::Fdemote => Ty::F64,
+            Op::Fvdemote => Ty::F64x2,
+            Op::FvpromoteLow => Ty::F32x4,
+            Op::Iconcat => Ty::I64,
+            Op::Snarrow | Op::Unarrow | Op::Uunarrow => ty.wider().unwrap_or(ty),
+            Op::SwidenLow | Op::SwidenHigh | Op::UwidenLow | Op::UwidenHigh => {
+                ty.narrower().unwrap_or(ty)
+            }
+            Op::Splat => ty.lane(),
+            Op::Insertlane if n == 1 => ty.lane(),
+            Op::X86Pmaddubsw => Ty::I8x16,
+            Op::X86Cvtt2dq => Ty::F32x4,
+            Op::Load
+            | Op::Uload8
+            | Op::Sload8
+            | Op::Uload16
+            | Op::Sload16
+            | Op::Uload32
+            | Op::Sload32
+            | Op::Uload8x8
+            | Op::Sload8x8
+            | Op::Uload16x4
+            | Op::Sload16x4
+            | Op::Uload32x2
+            | Op::Sload32x2
+            | Op::AtomicLoad => Ty::I64,
+            Op::Store | Op::Istore8 | Op::Istore16 | Op::Istore32 | Op::AtomicStore if n == 1 => {
+                Ty::I64
+            }
+            Op::AtomicRmw | Op::AtomicCas if n == 0 => Ty::I64,
+            Op::UaddOverflowCin | Op::SaddOverflowCin | Op::UsubOverflowBin | Op::SsubOverflowBin
+                if n == 2 =>
+            {
+                Ty::I8
+            }
+            _ => ty,
+        }
+    }
+
+    /// The type of result `k`.
+    pub fn result(self, k: usize) -> Ty {
+        let ty = self.ty;
+        match self.op {
+            Op::Icmp | Op::Fcmp if ty.is_vector() => ty.int_lanes(),
+            Op::Icmp | Op::Fcmp | Op::VanyTrue | Op::VallTrue => Ty::I8,
+            Op::UaddOverflow
+            | Op::SaddOverflow
+            | Op::UsubOverflow
+            | Op::SsubOverflow
+            | Op::UmulOverflow
+            | Op::SmulOverflow
+            | Op::UaddOverflowCin
+            | Op::SaddOverflowCin
+            | Op::UsubOverflowBin
+            | Op::SsubOverflowBin
+                if k == 1 =>
+            {
+                Ty::I8
+            }
+            Op::Isplit => Ty::I64,
+            Op::Extractlane => ty.lane(),
+            Op::VhighBits => self.aux_ty(),
+            _ => ty,
+        }
+    }
+
+    /// Whether `aux` is one of the op's for the type.
+    fn aux_ok(self) -> bool {
+        let info = self.op.info();
+        let (ty, aux) = (self.ty, self.aux);
+        match info.aux {
+            Aux::None => aux == 0,
+            Aux::IntCc => aux < IntCc::COUNT,
+            Aux::FloatCc => aux < FloatCc::COUNT,
+            Aux::IntCcTy => aux & 0xf < IntCc::COUNT && aux >> 4 == ty as u8,
+            Aux::Lane => aux < ty.lanes(),
+            Aux::Rmw => aux < RmwOp::COUNT,
+            Aux::Wide => aux == 0 || (aux == 1 && ty.bytes() == 8),
+            Aux::Ty(set) => {
+                let Some(src) = Ty::from_u8(aux) else { return false };
+                set.contains(src)
+                    && match self.op {
+                        Op::Bitcast => src.bytes() == ty.bytes() && src != ty,
+                        Op::Ireduce => src.bytes() > ty.bytes(),
+                        Op::Uextend | Op::Sextend => src.bytes() < ty.bytes(),
+                        Op::FcvtToUint
+                        | Op::FcvtToSint
+                        | Op::FcvtToUintSat
+                        | Op::FcvtToSintSat
+                        | Op::FcvtFromUint
+                        | Op::FcvtFromSint => {
+                            src.is_vector() == ty.is_vector() && src.lanes() == ty.lanes()
+                        }
+                        Op::ScalarToVector => src == ty.lane(),
+                        Op::VhighBits => u32::from(src.bytes()) * 8 >= u32::from(ty.lanes()),
+                        _ => true,
+                    }
+            }
+        }
+    }
+
+    /// Whether the shape is one of the set of some instruction set ([`Shape::exists_on`]).
     pub fn exists(self) -> bool {
-        unimplemented!("fastcompile-stencil-gen: the rules of the set, as `each` enumerates it")
+        Isa::ALL.into_iter().any(|isa| self.exists_on(isa))
+    }
+
+    /// Whether the shape is one of `isa`'s set: its op is `isa`'s and has the type, `aux` is
+    /// in range, the sources and the destination are ones the op's [`Info`] allows for the
+    /// types, and at most one source is an accumulator.
+    pub fn exists_on(self, isa: Isa) -> bool {
+        let info = self.op.info();
+        if !self.op.on(isa) || !info.tys.contains(self.ty) || !self.aux_ok() {
+            return false;
+        }
+        let mut accs = 0;
+        for (n, src) in self.srcs.into_iter().enumerate() {
+            let arg = n < usize::from(info.args);
+            let ok = match src {
+                Src::None => !arg,
+                Src::Slot => arg,
+                Src::Acc => arg && info.acc & (1 << n) != 0 && self.arg(n).acc().is_some(),
+                Src::Imm => arg && info.imm & (1 << n) != 0 && self.arg(n).is_narrow_int(),
+            };
+            if !ok {
+                return false;
+            }
+            accs += u8::from(src == Src::Acc);
+        }
+        if accs > 1 {
+            return false;
+        }
+        match self.dst {
+            Dst::None => info.results == 0,
+            Dst::Slot => info.results > 0,
+            Dst::Acc | Dst::Both => {
+                info.results > 0 && info.dst_acc && self.result(0).acc().is_some()
+            }
+        }
     }
 }
 
 impl fmt::Display for Shape {
-    /// The stencil's symbol in the generator's module, and its name in errors:
-    /// `iadd.i64.0.sa.s` (op, type, aux, sources, destination).
+    /// The stencil's name in errors: `iadd.i64.0.sa.s` (op, type, aux, sources,
+    /// destination).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let src = |it: Src| match it {
             Src::None => "",
@@ -638,10 +1179,164 @@ impl fmt::Display for Shape {
     }
 }
 
-/// Calls `f` with every shape of the set, in one order: by op number, then type number,
-/// then `aux`, then sources and destination by their numbers. The generator makes one
-/// stencil for each; [`Shape::exists`] holds exactly for these.
-pub fn each(f: impl FnMut(Shape)) {
-    let _ = f;
-    unimplemented!("fastcompile-stencil-gen: the enumeration of the set")
+/// The `aux` values to try for an op of type `ty`: a superset of the valid ones, in order.
+fn auxes(info: &Info, ty: Ty) -> impl Iterator<Item = u8> {
+    let (start, end) = match info.aux {
+        Aux::None => (0, 1),
+        Aux::IntCc => (0, IntCc::COUNT),
+        Aux::FloatCc => (0, FloatCc::COUNT),
+        Aux::IntCcTy => ((ty as u8) << 4, ((ty as u8) << 4) + IntCc::COUNT),
+        Aux::Lane => (0, ty.lanes()),
+        Aux::Ty(_) => (0, Ty::ALL.len() as u8),
+        Aux::Rmw => (0, RmwOp::COUNT),
+        Aux::Wide => (0, 2),
+    };
+    start..end
+}
+
+/// Calls `f` with every shape of some instruction set's set ([`Shape::exists`]), in one
+/// order: by op number, then type number, then `aux`, then sources and destination by their
+/// numbers.
+pub fn each(mut f: impl FnMut(Shape)) {
+    walk(|shape| {
+        if shape.exists() {
+            f(shape);
+        }
+    });
+}
+
+/// Calls `f` with every shape of `isa`'s set, in [`each`]'s order. The generator makes one
+/// stencil for each; [`Shape::exists_on`] holds exactly for these.
+pub fn each_on(isa: Isa, mut f: impl FnMut(Shape)) {
+    walk(|shape| {
+        if shape.exists_on(isa) {
+            f(shape);
+        }
+    });
+}
+
+/// Every candidate shape, in [`each`]'s order.
+fn walk(mut f: impl FnMut(Shape)) {
+    static SRCS: [Src; 4] = Src::ALL;
+    for op in Op::all() {
+        let info = op.info();
+        let args = usize::from(info.args);
+        for ty in info.tys.iter() {
+            for aux in auxes(info, ty) {
+                let choices =
+                    |n: usize| -> &'static [Src] { if n < args { &SRCS[1..] } else { &SRCS[..1] } };
+                for s0 in choices(0) {
+                    for s1 in choices(1) {
+                        for s2 in choices(2) {
+                            for dst in Dst::ALL {
+                                f(Shape { op, ty, aux, srcs: [*s0, *s1, *s2], dst });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all() -> Vec<Shape> {
+        let mut shapes = Vec::new();
+        each(|shape| shapes.push(shape));
+        shapes
+    }
+
+    #[test]
+    fn the_set_is_in_order_and_has_no_shape_twice() {
+        let shapes = all();
+        assert!(shapes.len() > 1000);
+        for pair in shapes.windows(2) {
+            assert!(pair[0].key() < pair[1].key(), "{} then {}", pair[0], pair[1]);
+        }
+    }
+
+    #[test]
+    fn every_key_round_trips() {
+        for shape in all() {
+            assert_eq!(Shape::from_key(shape.key()), Some(shape), "{shape}");
+            assert!(shape.key() >> 28 == 0);
+        }
+    }
+
+    #[test]
+    fn exists_holds_exactly_for_what_each_lists() {
+        for isa in Isa::ALL {
+            let mut listed = std::collections::HashSet::new();
+            each_on(isa, |shape| {
+                assert!(shape.exists_on(isa), "{shape}");
+                listed.insert(shape.key());
+            });
+            walk(|shape| assert_eq!(shape.exists_on(isa), listed.contains(&shape.key()), "{shape}"));
+        }
+    }
+
+    #[test]
+    fn at_most_one_operand_comes_from_an_accumulator() {
+        each(|shape| assert!(shape.srcs.iter().filter(|it| **it == Src::Acc).count() <= 1));
+    }
+
+    #[test]
+    fn immediates_are_of_integers_up_to_64_bits() {
+        each(|shape| {
+            for (n, src) in shape.srcs.iter().enumerate() {
+                if *src == Src::Imm {
+                    assert!(shape.arg(n).is_narrow_int(), "{shape}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn f16_and_f128_have_only_moves_loads_stores_selects_and_bitcasts() {
+        let allowed = [
+            Op::Copy,
+            Op::Fconst,
+            Op::Vconst,
+            Op::Select,
+            Op::Bitcast,
+            Op::Load,
+            Op::Store,
+            Op::StackLoad,
+            Op::StackStore,
+        ];
+        each(|shape| {
+            if matches!(shape.ty, Ty::F16 | Ty::F128) {
+                assert!(allowed.contains(&shape.op), "{shape}");
+            }
+        });
+    }
+
+    #[test]
+    fn baseline_libcalls_have_no_x86_stencils() {
+        each_on(Isa::X86_64, |shape| {
+            assert!(!matches!(shape.op, Op::Ceil | Op::Floor | Op::Trunc | Op::Nearest | Op::Fma));
+        });
+        each_on(Isa::Aarch64, |shape| assert!(!shape.op.info().name.starts_with("x86_")));
+    }
+
+    #[test]
+    fn a_shape_out_of_the_set_does_not_exist() {
+        let iadd = Shape {
+            op: Op::Iadd,
+            ty: Ty::I64,
+            aux: 0,
+            srcs: [Src::Slot, Src::Imm, Src::None],
+            dst: Dst::Acc,
+        };
+        assert!(iadd.exists());
+        assert!(!Shape { srcs: [Src::Acc, Src::Acc, Src::None], ..iadd }.exists());
+        assert!(!Shape { srcs: [Src::Imm, Src::Slot, Src::None], ..iadd }.exists());
+        assert!(!Shape { srcs: [Src::Slot, Src::Slot, Src::Slot], ..iadd }.exists());
+        assert!(!Shape { aux: 1, ..iadd }.exists());
+        assert!(!Shape { ty: Ty::F16, ..iadd }.exists());
+        assert!(!Shape { ty: Ty::I128, dst: Dst::Acc, srcs: [Src::Slot; 3], ..iadd }.exists());
+    }
 }

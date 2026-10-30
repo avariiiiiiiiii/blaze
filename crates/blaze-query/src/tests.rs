@@ -13,8 +13,8 @@ use blaze_ids::{ContentId, Fingerprint};
 use blaze_vfs::{View, ViewId};
 
 use crate::{
-    Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, MemTree, Query, QueryKey,
-    QueryKind, Stored,
+    Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, Marks, MemTree, Query,
+    QueryKey, QueryKind, Stored,
     table::{Aligned, EdgeRecord},
 };
 
@@ -931,4 +931,17 @@ fn a_key_is_kept_once_and_runs_again_by_its_bytes() {
     let longer = view(&db, &tree, &[("a", "abcd")]);
     assert_eq!(db.pin().get::<Double>(longer, &"a".to_owned()), Ok(8));
     assert_eq!(runs("len"), 2);
+}
+
+/// Collection's marks are a bit a memo: an ID past the end they were made for grows them, and
+/// they list what was marked in order.
+#[test]
+fn marks_are_a_bit_a_memo() {
+    let mut marks = Marks::new(70);
+    assert!(marks.insert(3));
+    assert!(!marks.insert(3), "marked once");
+    assert!(marks.insert(64));
+    assert!(marks.insert(200), "past the end it was made for");
+    assert!(marks.contains(64) && marks.contains(200) && !marks.contains(65) && !marks.contains(1000));
+    assert_eq!(marks.iter().collect::<Vec<_>>(), [3, 64, 200]);
 }

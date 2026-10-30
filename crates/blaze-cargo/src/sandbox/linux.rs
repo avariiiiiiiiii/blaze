@@ -1740,9 +1740,10 @@ impl Watch {
             return process;
         }
         let (process, parent) = ids(thread).unwrap_or((thread, 0));
-        let scope = match process == thread && parent > 0 {
-            true => forker(parent, thread).map(|it| recorder.scope(it)).unwrap_or_default(),
-            false => String::new(),
+        let scope = match (process == thread, parent > 0) {
+            (true, true) => forker(parent, thread).map(|it| recorder.scope(it)).unwrap_or_default(),
+            (true, false) => String::new(),
+            (false, _) => shared_scope(recorder, process, thread),
         };
         recorder.starts(thread, scope);
         self.processes.insert(thread, process);
@@ -1761,7 +1762,38 @@ impl Watch {
                 self.processes.insert(child, child);
             }
         }
+        // The threads it made before this mark start in the scope they were made in.
+        for task in tasks(process).into_iter().filter(|it| *it != thread && !recorder.knows(*it)) {
+            let scope = shared_scope(recorder, process, task);
+            recorder.starts(task, scope);
+            self.processes.insert(task, process);
+        }
     }
+}
+
+/// The threads of `process`, by `/proc`; none when it is gone.
+fn tasks(process: u64) -> Vec<u64> {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{process}/task")) else { return Vec::new() };
+    entries.flatten().filter_map(|it| it.file_name().to_str()?.parse().ok()).collect()
+}
+
+/// The scope a new `thread` of `process` starts in: the one every other thread of it is in,
+/// when each is known and all are in one, so whichever made it was in that one; otherwise
+/// none, which is every scope's.
+fn shared_scope(recorder: &Recorder, process: u64, thread: u64) -> String {
+    let mut shared: Option<String> = None;
+    for other in tasks(process).into_iter().filter(|it| *it != thread) {
+        if !recorder.knows(other) {
+            return String::new();
+        }
+        let scope = recorder.scope(other);
+        match &shared {
+            Some(it) if *it != scope => return String::new(),
+            Some(_) => {}
+            None => shared = Some(scope),
+        }
+    }
+    shared.unwrap_or_default()
 }
 
 /// The process (the thread group) and the parent process of `thread`, by `/proc`.

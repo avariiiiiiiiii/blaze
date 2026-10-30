@@ -272,3 +272,18 @@ fn judged_from_the_bytes_as_finished() {
         }
     }
 }
+
+/// Whether cargo refuses a run that succeeded is read from its bytes without allocating: the
+/// lines it logs are found and borrowed, and messages are made only for a refusal.
+#[test]
+fn a_run_cargo_accepts_is_judged_without_allocating() {
+    use std::os::unix::process::ExitStatusExt;
+    let stdout: &[u8] =
+        b"cargo:rustc-cfg=x\ncargo:warning=one\r\nnoise\ncargo::warning=two\ncargo:error=no";
+    let unit = Unit::default();
+    let (logged, accepted) = blaze_alloc_count::assert_at_most(0, "the check for an error", || {
+        let logged = log_lines(stdout).count();
+        (logged, refused(&unit, ExitStatus::from_raw(0), stdout, b"err\n").is_ok())
+    });
+    assert_eq!((logged, accepted), (2, true));
+}

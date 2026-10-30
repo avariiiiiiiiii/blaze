@@ -18,7 +18,6 @@ use crate::{
 /// branch-free binary search of the ends alone (4 bytes each, 16 to a cache line), then one
 /// load of a 20-byte span; in-order lookups ([`SpanMap::span_at_from`]) are `O(1)` amortized.
 /// Mapping a span down to the text is a binary search of `by_anchor`.
-#[derive(Clone)]
 pub struct SpanMap {
     /// Where each piece of text ends, in order; it begins where the one before ends, or at 0.
     ends: Vec<TextSize>,
@@ -104,6 +103,7 @@ impl Hash for SpanMap {
 impl fmt::Debug for SpanMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpanMap")
+            // alloc: `Debug` output, the edge
             .field("spans", &self.iter().collect::<Vec<_>>())
             .field("matched_arm", &self.matched_arm)
             .field("fragment_starts", &self.fragment_starts)
@@ -125,7 +125,9 @@ impl SpanMap {
             spans: Vec::with_capacity(pieces),
             by_anchor: OnceLock::new(),
             matched_arm: None,
+            // alloc: none; `Vec::new` allocates only when a fragment is pushed
             fragment_starts: Vec::new(),
+            // alloc: as `fragment_starts`
             fragment_ends: Vec::new(),
         }
     }
@@ -236,6 +238,7 @@ impl SpanMap {
             .iter()
             .copied()
             .filter(|it| key(it)[3] >= end)
+            // alloc: the one documented above; IDE token descent only, never a build's path
             .collect::<Vec<u32>>();
         radix::sort(&mut found);
         found.into_iter().map(move |it| self.range_of(it))
@@ -370,6 +373,7 @@ impl fmt::Debug for RealSpanMap {
             .map(|&[ast_id, len]| (ErasedFileAstId::from_raw(ast_id), TextSize::new(len)));
         f.debug_struct("RealSpanMap")
             .field("file_id", &self.file_id)
+            // alloc: `Debug` output, the edge
             .field("anchors", &anchors.collect::<Vec<_>>())
             .field("starts", &self.starts)
             .finish()
@@ -431,7 +435,9 @@ impl RealSpanMap {
                 let next = pairs.get(i + 1).map_or(end, |it| it.0);
                 [ast_id.into_raw(), u32::from(next.checked_sub(start).unwrap_or_default())]
             })
+            // alloc: the map's two columns, its result, once per file at their exact length
             .collect();
+        // alloc: as `anchors`
         let starts = pairs.iter().map(|&(start, _)| u32::from(start)).collect();
         RealSpanMap { file_id, anchors, starts }
     }
@@ -473,6 +479,37 @@ impl RealSpanMap {
             .collect::<Box<[_]>>();
         debug_assert_eq!(pairs.first().map(|it| it.0), Some(TextSize::new(0)));
         RealSpanMap::from_file(self.file_id, pairs, range.len())
+    }
+
+    /// The map of this map's text with each range of `elided` cut out (sorted, disjoint, past
+    /// the text's start and within it): what [`RealSpanMap::from_file`] makes of the text left.
+    /// An anchor that begins in a cut range is dropped; the others move back by the lengths
+    /// cut before them, and each loses from its length what is cut inside its text. A span
+    /// keeps its offset from its anchor where nothing between the two is cut, as when the
+    /// bodies cut are of items that are their own anchors.
+    pub fn without(&self, elided: &[TextRange]) -> RealSpanMap {
+        let end = self.end();
+        debug_assert!(
+            elided.windows(2).all(|it| it[0].end() <= it[1].start())
+                && elided.first().is_none_or(|it| it.start() > TextSize::new(0))
+                && elided.last().is_none_or(|it| it.end() <= end),
+            "ranges cut are sorted, disjoint, past the text's start and within it"
+        );
+        let mut cuts = elided.iter().peekable();
+        let mut cut = 0u32;
+        // alloc: the new map's anchors, its result, once per outline made
+        let mut pairs = Vec::with_capacity(self.starts.len());
+        for (&start, &[ast_id, _]) in self.starts.iter().zip(&self.anchors) {
+            while let Some(range) = cuts.next_if(|it| u32::from(it.end()) <= start) {
+                cut += u32::from(range.len());
+            }
+            if cuts.peek().is_some_and(|it| u32::from(it.start()) <= start) {
+                continue;
+            }
+            pairs.push((TextSize::new(start - cut), ErasedFileAstId::from_raw(ast_id)));
+        }
+        let total = elided.iter().fold(0, |total, it| total + u32::from(it.len()));
+        RealSpanMap::from_file(self.file_id, pairs.into_boxed_slice(), end - TextSize::new(total))
     }
 
     #[cfg(feature = "salsa")]
@@ -580,6 +617,70 @@ mod tests {
     fn map(first: u32) -> RealSpanMap {
         let pairs = [(at(0), ROOT_ERASED_FILE_AST_ID), (at(first), id(1)), (at(first + 15), id(2))];
         RealSpanMap::from_file(file(), Box::new(pairs), at(first + 30))
+    }
+
+    fn of(pairs: &[(u32, u32)], end: u32) -> RealSpanMap {
+        let pairs = pairs.iter().map(|&(start, raw)| (at(start), id(raw))).collect::<Box<[_]>>();
+        RealSpanMap::from_file(file(), pairs, at(end))
+    }
+
+    /// Anchors before a cut stay; those after move back by it; one in a cut is dropped; the
+    /// anchor holding a cut loses its length. With nothing cut, the map is the same.
+    #[test]
+    fn a_map_without_ranges_is_the_map_of_the_text_left() {
+        let map = map(10);
+        let root = ROOT_ERASED_FILE_AST_ID.into_raw();
+        assert_eq!(map.without(&[]), map);
+        assert_eq!(map.without(&[range(12, 20)]), of(&[(0, root), (10, 1), (17, 2)], 32));
+        assert_eq!(map.without(&[range(20, 30)]), of(&[(0, root), (10, 1)], 30));
+        assert_eq!(
+            map.without(&[range(2, 5), range(12, 20)]),
+            of(&[(0, root), (7, 1), (14, 2)], 29)
+        );
+        // A cut that ends where an anchor begins keeps it, moved to where the cut began.
+        assert_eq!(map.without(&[range(5, 10)]), of(&[(0, root), (5, 1), (20, 2)], 35));
+        // A cut that begins where an anchor begins drops it.
+        assert_eq!(map.without(&[range(25, 27)]), of(&[(0, root), (10, 1)], 38));
+        let cut = map.without(&[range(12, 20)]);
+        assert_eq!(cut.anchor_at(at(16)), (at(10), id(1)));
+        assert_eq!(cut.anchor_at(at(17)), (at(17), id(2)));
+        assert_eq!(cut.end(), at(32));
+    }
+
+    /// Against a model: cutting the ranges from the pairs' text and placing each anchor by
+    /// what is left before it.
+    #[test]
+    fn without_agrees_with_cutting_the_pairs() {
+        let mut state = 5;
+        for n in [1usize, 2, 3, 17, 100] {
+            let (pairs, end) = anchors(&mut state, n, 4);
+            let map = RealSpanMap::from_file(file(), pairs.clone(), at(end));
+            let mut elided = Vec::new();
+            let mut from = 1;
+            while from < end {
+                let start = from + (next(&mut state) % 12) as u32;
+                let stop = start + (next(&mut state) % 9) as u32;
+                if stop > end {
+                    break;
+                }
+                elided.push(range(start, stop));
+                from = stop + (next(&mut state) % 4) as u32;
+            }
+            let removed_before = |offset: u32| {
+                elided
+                    .iter()
+                    .filter(|it| u32::from(it.end()) <= offset)
+                    .fold(0, |cut, it| cut + u32::from(it.len()))
+            };
+            let kept = pairs
+                .iter()
+                .filter(|(start, _)| !elided.iter().any(|it| it.start() <= *start && *start < it.end()))
+                .map(|&(start, ast_id)| (start - at(removed_before(u32::from(start))), ast_id))
+                .collect::<Box<[_]>>();
+            let want = RealSpanMap::from_file(file(), kept, at(end - removed_before(end)));
+            assert_eq!(map.without(&elided), want, "{n} anchors, cut {elided:?}");
+            assert_eq!(map.without(&elided).starts, want.starts);
+        }
     }
 
     #[test]
@@ -816,6 +917,32 @@ mod tests {
             self.0.extend(other.0.iter().map(|&(offset, span)| (offset + other_range.start(), span)));
             self.0.sort_unstable_by_key(|&(offset, _)| offset);
         }
+    }
+
+    /// Looking up a file's spans, an expansion's spans and the ranges of a span allocates
+    /// nothing, once the expansion's index by anchor is made (on its first downward lookup).
+    #[cfg(feature = "salsa")]
+    #[test]
+    fn lookups_allocate_nothing() {
+        let mut state = 11;
+        let (pairs, end) = anchors(&mut state, 300, 1 << 20);
+        let real = RealSpanMap::from_file(file(), pairs, at(end));
+        let (expansion, _) = spans(&mut state, 500);
+        let last = expansion.iter().last().map_or(0, |(end, _)| u32::from(end));
+        let _ = expansion.ranges_with_span_exact(expansion.span_at(at(0))).count();
+        blaze_alloc_count::assert_at_most(0, "span map lookups", || {
+            let mut hint = 0;
+            for offset in 0..end {
+                let range = range(offset, offset + 1);
+                std::hint::black_box((real.span_for_range_from(range, &mut hint), real.span_for_range(range)));
+            }
+            let mut hint = 0;
+            for offset in 0..last {
+                let span = expansion.span_at_from(at(offset), &mut hint);
+                std::hint::black_box(expansion.span_at(at(offset)));
+                std::hint::black_box(expansion.ranges_with_span_exact(span).count());
+            }
+        });
     }
 
     /// A map of `n` spans over pieces of 1 to 4 bytes, with the same as [`Pairs`].

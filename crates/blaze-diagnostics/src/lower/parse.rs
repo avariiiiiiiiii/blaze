@@ -15,9 +15,9 @@
 //! the parser's own words, always an error (`v2/requests/diagnostics.md`).
 
 use blaze_ids::radix;
+use hir::{HirFileId, InFile};
 use rustc_hash::FxHashSet;
-use span::FileId;
-use syntax::{AstNode, Edition, LexedStr, SyntaxError, SyntaxKind, TextRange, TextSize, ast};
+use syntax::{AstNode, Edition, LexedStr, SyntaxError, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 
 use crate::{
     cx::Cx,
@@ -51,7 +51,9 @@ pub(crate) fn parsed(cx: &Cx<'_, '_>) -> Parsed {
             continue;
         }
         let (file_id, edition) = file.unpack(db);
-        match lower_file(cx, file_id, edition, parse.tree(), errors, &mut found) {
+        let text = cx.file_text(file_id);
+        let tree = parse.tree().syntax().clone();
+        match lower_file(cx, file.into(), text, edition, tree, errors, &mut found) {
             Outcome::Parsed => {}
             Outcome::GaveUp if !module.is_crate_root(db) => emptied.push(module),
             Outcome::GaveUp | Outcome::Fatal => return Parsed { found, fatal: true },
@@ -76,24 +78,65 @@ struct Tok {
     range: TextRange,
 }
 
+/// A tree as rustc's parser reads it: a file's, or a macro expansion's (`file` its expansion,
+/// `text` the tree's text).
 struct File<'a, 'c, 'db> {
     cx: &'a Cx<'c, 'db>,
-    file: FileId,
-    text: &'db str,
+    file: HirFileId,
+    text: &'a str,
     edition: Edition,
-    tree: ast::SourceFile,
+    tree: SyntaxNode,
     toks: Vec<Tok>,
+}
+
+/// A parse error of a macro's expansion `root` (of `file`, called at `site`), the parser's `msg`
+/// at `pos`, as rustc's parser gives it, with what `rustc_expand`'s `failed_to_match_macro`
+/// makes of an error at the expansion's end: "macro expansion ends with an incomplete
+/// expression", at the end of its last token, or at the call for an empty expansion. Its tokens
+/// are the tree's: an expansion has no text to lex again.
+pub(crate) fn expansion_error(
+    cx: &Cx<'_, '_>,
+    file: HirFileId,
+    root: &SyntaxNode,
+    site: Span,
+    msg: &str,
+    pos: TextSize,
+) -> Diag {
+    let text = root.to_string(); // alloc: error path, once per expansion that does not parse
+    let toks = root
+        .descendants_with_tokens()
+        .filter_map(|it| it.into_token())
+        .filter(|it| !is_trivia(it.kind()))
+        .map(|it| Tok { kind: it.kind(), range: it.text_range() })
+        .collect();
+    let f = File { cx, file, text: &text, edition: file.edition(cx.db), tree: root.clone(), toks };
+    let (mut diag, _) = f.parser_error(msg, pos);
+    let (prev, token) = f.around(pos);
+    if token.is_none()
+        && let Some(expected) = diag.message.strip_suffix(", found `<eof>`").map(str::to_owned)
+    {
+        diag.message = format!("macro expansion ends with an incomplete expression: {expected}");
+        let at = prev.map_or(site, |it| f.at(it.range).shrink_to_hi());
+        let old = std::mem::take(&mut diag.span.primary);
+        for (span, _) in &mut diag.span.labels {
+            if old.contains(span) {
+                *span = at.clone();
+            }
+        }
+        diag.span.primary = vec![at];
+    }
+    diag
 }
 
 fn lower_file(
     cx: &Cx<'_, '_>,
-    file: FileId,
+    file: HirFileId,
+    text: &str,
     edition: Edition,
-    tree: ast::SourceFile,
+    tree: SyntaxNode,
     errors: Vec<SyntaxError>,
     found: &mut Vec<Found>,
 ) -> Outcome {
-    let text = cx.file_text(file);
     let lexed = LexedStr::new(edition, text);
     let toks = tokens(&lexed, text);
     let f = File { cx, file, text, edition, tree, toks };
@@ -179,7 +222,7 @@ impl File<'_, '_, '_> {
         match message.as_str() {
             "Unnecessary visibility qualifier" => None,
             "At least one trait is required for an object type" => {
-                let node = self.tree.syntax().covering_element(range);
+                let node = self.tree.covering_element(range);
                 match node.kind() {
                     SyntaxKind::DYN_TRAIT_TYPE => Some(Found::new(
                         Diag::error(Some("E0224"), "at least one trait is required for an object type", at),
@@ -275,14 +318,14 @@ fn is_reserved(name: &str, edition: Edition) -> bool {
 
 impl<'a, 'c, 'db> File<'a, 'c, 'db> {
     fn at(&self, range: TextRange) -> Span {
-        self.cx.span_in_file(self.file, range)
+        self.cx.span(InFile::new(self.file, range))
     }
 
     fn eof(&self) -> TextRange {
         TextRange::empty(TextSize::of(self.text))
     }
 
-    fn src(&self, tok: Tok) -> &'db str {
+    fn src(&self, tok: Tok) -> &'a str {
         &self.text[tok.range]
     }
 
@@ -577,11 +620,18 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
                 diag.span_label(span, "expected expression");
                 (diag, false)
             }
-            "expected a type" => {
+            "expected a type" | "expected type" => {
                 let span = self.at(self.range_of(token));
                 let message = format!("expected type, found {}", self.describe(token));
                 let mut diag = Diag::error(None, message, span.clone());
                 diag.span_label(span, "expected type");
+                (diag, false)
+            }
+            "expected pattern" => {
+                let span = self.at(self.range_of(token));
+                let message = format!("expected pattern, found {}", self.describe(token));
+                let mut diag = Diag::error(None, message, span.clone());
+                diag.span_label(span, "expected pattern");
                 (diag, false)
             }
             _ => {
@@ -736,7 +786,7 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
     /// Where an error node of blaze's parser that ends at `pos` starts (a path it read where an
     /// item was expected), as the token and the one before it: rustc reports at the path.
     fn start_of_error_node(&self, pos: TextSize) -> Option<(Option<Tok>, Option<Tok>)> {
-        let token = self.tree.syntax().token_at_offset(pos).left_biased()?;
+        let token = self.tree.token_at_offset(pos).left_biased()?;
         let node = token
             .parent_ancestors()
             .take_while(|it| it.text_range().end() == pos)
@@ -747,7 +797,7 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
 
     /// rustc's `ItemKind::descr` of the item that ends at `end`, "braced struct" for a struct.
     fn item_ending_at(&self, end: TextSize) -> Option<&'static str> {
-        let token = self.tree.syntax().token_at_offset(end).left_biased()?;
+        let token = self.tree.token_at_offset(end).left_biased()?;
         let item = token
             .parent_ancestors()
             .filter_map(ast::Item::cast)

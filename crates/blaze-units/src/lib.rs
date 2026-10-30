@@ -18,6 +18,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 mod graph;
 mod order;
 #[cfg(feature = "query")]

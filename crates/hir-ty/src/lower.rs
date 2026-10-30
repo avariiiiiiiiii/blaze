@@ -3881,10 +3881,9 @@ pub fn with_elided_regions<'db>(
     let mut folder = BottomUpFolder {
         interner,
         ty_op: |ty: Ty<'db>| match ty.kind() {
-            TyKind::Alias(alias)
-                if let crate::next_solver::SolverDefId::InternedOpaqueTyId(opaque) =
-                    alias.kind.def_id()
-                    && let ImplTraitId::ReturnTypeImplTrait(owner, _) = opaque.loc(db)
+            TyKind::Alias(is_rigid, alias)
+                if let AliasTyKind::Opaque { def_id: opaque } = alias.kind
+                    && let ImplTraitId::ReturnTypeImplTrait(owner, _) = opaque.0.loc(db)
                     && owner == function
                     && let Some(own) = alias.args.len().checked_sub(regions.len()) =>
             {
@@ -3898,6 +3897,7 @@ pub fn with_elided_regions<'db>(
                 });
                 Ty::new_alias(
                     interner,
+                    is_rigid,
                     AliasTy::new_from_args(interner, alias.kind, GenericArgs::new_from_iter(args)),
                 )
             }
@@ -4092,7 +4092,7 @@ fn type_for_adt<'db>(db: &'db dyn HirDatabase, adt: AdtId) -> EarlyBinder<'db, T
     let interner = DbInterner::new_no_crate(db);
     let args = GenericArgs::identity_for_item(interner, adt.into());
     let ty = Ty::new_adt(interner, adt, args);
-    EarlyBinder::bind(ty)
+    EarlyBinder::bind(interner, ty)
 }
 
 fn ctor_signature(
@@ -4149,7 +4149,7 @@ pub(crate) fn associated_type_by_name_including_super_traits_allow_ambiguity<'db
     let interner = DbInterner::new_no_crate(db);
     Some((
         assoc_type,
-        EarlyBinder::bind(trait_args).instantiate(interner, trait_ref.args).skip_norm_wip(),
+        EarlyBinder::bind(interner, trait_args).instantiate(interner, trait_ref.args).skip_norm_wip(),
     ))
 }
 

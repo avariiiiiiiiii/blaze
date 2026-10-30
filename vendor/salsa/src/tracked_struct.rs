@@ -844,8 +844,8 @@ where
 
         let mut table_guard = TableDropGuard(table);
 
-        // SAFETY: We have `&mut MemoTable`, so no more references to these memos exist and we are good
-        // to drop them.
+        // SAFETY: We have `&mut MemoTable`, so nobody else reaches these memos through the slot;
+        // retired memos stay valid until the next reclaim, so outstanding borrows remain sound.
         unsafe {
             table_guard.0.take_memos(|memo_ingredient_index, memo| {
                 let ingredient_index =
@@ -1045,6 +1045,11 @@ where
 
     fn jar_kind(&self) -> JarKind {
         JarKind::Struct
+    }
+
+    unsafe fn reclaim_memos(&self) {
+        // SAFETY: Our caller's contract.
+        unsafe { self.memo_table_types.reclaim() };
     }
 
     fn memo_table_types(&self) -> &Arc<MemoTableTypes> {

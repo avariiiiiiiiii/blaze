@@ -172,7 +172,11 @@ fn source_range(
             }
         }
         MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
-        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
+        // Code inlined into the body is written in another's, which `fragment::Source`
+        // resolves the span to before asking where it is.
+        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown | MirSpan::Inlined(_) => {
+            return None;
+        }
     };
     if let MirSpan::ExprEnd(_) = span {
         // The brace that closes a block, which is where rustc has a scope left.

@@ -184,3 +184,55 @@ Two facts for the port:
   The port must not need them again.
 
 > applied: noted, nothing to apply.
+
+## From db-ty-next1
+
+Corrected 19:40 (lane db): solver-sync owns its 18 `next_solver` files. db-ty keeps
+`infer/`, `solver.rs`, `fulfill.rs`, `normalize.rs`, `structural_normalize.rs`,
+`obligation_ctxt.rs`, `inspect.rs`, `format_proof_tree.rs` and `interner/tls_cache.rs`.
+
+These are db-ty-next1's dispatch tasks (`~/restart-2026-10-28/briefs/v2/db-dispatch/db-ty-next1.md`).
+Items 1, 2 and 5 are in your files (`interner.rs`, `def_id.rs`, `generic_arg.rs`). Items 3 and
+4 are in db-ty's files and listed only for completeness. All but item 5 are already in the
+tree; keep them through the port.
+
+1. **`DbInterner::conjure` and `unsafe impl Send/Sync for DbInterner`** (`interner.rs`, was
+   :404-416): done 19:10.
+   - Both are deleted, and the impls are replaced by a `const` assert that the auto traits give
+     `Send + Sync`.
+   - `hir`'s callers take `db`.
+   - `def_id.rs:53`, `SolverDefId`'s `Debug`, runs
+     `crate::with_attached_db(|db| self.fmt_with_names(db, f))`.
+   - `generic_arg.rs:611`/`:617` no longer call it.
+
+   Why: the unsafe.md audit, item `interner.rs:411`: it stretched the attached database's
+   borrow to any `'db`. Keep both deleted.
+2. **`DepNodeIndex = Option<salsa::Reads>`** (`interner.rs` ~1161): done. The block that goes
+   with it stays as it is: `Tracked`, `get_tracked`, `with_cached_task`, `cache_scope` and
+   `with_global_cache`. It builds once db-salsa-reads adds `capture_reads`, `replay_reads` and
+   `unshareable_reads` (request 13).
+3. **`solver.rs:41`**: done. The SAFETY comment names the `repr(transparent)` invariant, and
+   the transmute names its types (`&'a InferCtxt<'db>` to `&'a SolverContext<'db>`). Keep it
+   true.
+4. **`tls_cache.rs`, the remaining locks** (dispatch task 15, lock audit 7): done in the
+   rewrite.
+   - No lock is taken on a lookup. The query cache is the vendor's lock-free `GlobalCache`, and
+     the shared one is lock-free reads behind a `blaze_reclaim` guard.
+   - The one `Mutex` left is `limbo`, taken only when a generation is replaced.
+   - `Solved::new` hands out numbers from per-worker blocks.
+
+   Keep the file whole (request 3 says no change).
+5. **Open: the coroutine-witness read** (dispatch task 8; `interner.rs` ~2408
+   `coroutine_hidden_types`, today an empty `CoroutineWitnessTypes` under `FIXME`).
+   - What: read `db.coroutine_witnesses(def)` (`&[StoredTy]`, rustc's
+     `CoroutineLayout::field_tys`), instantiated, with regions erased into bound regions as
+     rustc's `coroutine_hidden_types` does. Port rustc 16d1ffac's
+     `rustc_ty_utils`/`rustc_middle` rule.
+   - Why: today a future's auto traits ignore what it holds across `.await`, so `Send` is
+     proven for futures rustc rejects (AGENTS.md compiler correctness).
+   - When: after `coroutine_witnesses` is declared in `crates/hir-ty/src/db.rs` (db-ty-next1,
+     which lands it with the coordinator's `impl_hir_database!` and codegen's computation in
+     hir-ty-mir). I'll tmux `solver-sync` when the declaration is in.
+   - Test: an `async fn` holding an `Rc` across `.await` is not `Send`; without the hold it is.
+
+> forwarded to solver-sync (its inbox; told by tmux).

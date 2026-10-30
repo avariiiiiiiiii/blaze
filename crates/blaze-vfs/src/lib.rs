@@ -48,7 +48,7 @@ use crate::{
     tree::{NodeId, Tree},
 };
 pub use crate::{
-    outside::{Outside, generation, unchanged_since, want},
+    outside::{Cover, Outside, cover, generation, unchanged_since, want},
     reader::{Pinned, Reader},
     section::Section,
     text::text_of,
@@ -456,6 +456,12 @@ pub struct Recovered {
     /// them.
     pub heads_dropped: usize,
 }
+
+/// Counts each test thread's allocations, for the allocation-budget tests
+/// (docs/v2/plan/goals/principles.md).
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 #[cfg(test)]
 mod tests;

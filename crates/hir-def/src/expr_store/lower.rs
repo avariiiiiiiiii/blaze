@@ -54,7 +54,7 @@ use crate::{
         Array, Binding, BindingAnnotation, BindingId, BindingProblems, CaptureBy, ClosureKind,
         CoroutineKind, CoroutineSource, Expr, ExprId, Item, Label, LabelId, Literal, LoopSource,
         MatchArm, Movability, OffsetOf, Pat, PatId, RecordFieldPat, RecordLitField, RecordSpread,
-        Statement, Unsafe, generics::GenericParams,
+        Statement, Statements, Unsafe, generics::GenericParams,
     },
     item_scope::BuiltinShadowMode,
     lang_item::{LangItemTarget, LangItems},
@@ -1412,7 +1412,7 @@ impl<'db> ExprCollector<'db> {
         source: CoroutineSource,
         capture_by: CaptureBy,
         id: Option<BlockId>,
-        statements: &[Statement],
+        statements: Statements<'_>,
         tail: Option<ExprId>,
     ) -> Expr<'static> {
         let block = self.alloc_expr_desugared(Expr::Block {
@@ -2609,22 +2609,26 @@ impl<'db> ExprCollector<'db> {
                 self.add_definition_to_binding(binding, pat);
                 let tail_expr = self.store.alloc_path_expr(Path::from(name));
                 let tail_expr = self.map_expr_desugared(tail_expr, ptr);
-                self.alloc_expr_desugared_with_ptr(
-                    Expr::Block {
-                        id: None,
-                        statements: &[Statement::Let {
-                            pat,
-                            type_ref: Some(type_ref),
-                            initializer: Some(expr_id),
-                            else_branch: None,
-                            is_super: false,
-                        }],
-                        tail: Some(tail_expr),
-                        label: None,
-                        unsafe_: Unsafe::No,
-                    },
-                    ptr,
-                )
+                let statements = self.store.list_mark();
+                self.store.push_list_statement(Statement::Let {
+                    pat,
+                    type_ref: Some(type_ref),
+                    initializer: Some(expr_id),
+                    else_branch: None,
+                    is_super: false,
+                });
+                self.with_lists(statements, |this, lists| {
+                    this.alloc_expr_desugared_with_ptr(
+                        Expr::Block {
+                            id: None,
+                            statements: lists.statements_since(statements),
+                            tail: Some(tail_expr),
+                            label: None,
+                            unsafe_: Unsafe::No,
+                        },
+                        ptr,
+                    )
+                })
             }
             None => expr_id,
         }
@@ -2751,7 +2755,7 @@ impl<'db> ExprCollector<'db> {
         let loop_inner = self.alloc_expr_desugared_with_ptr(
             Expr::Block {
                 id: None,
-                statements: &[],
+                statements: Statements::EMPTY,
                 tail: Some(loop_inner),
                 label: None,
                 unsafe_: Unsafe::No,
@@ -3134,7 +3138,7 @@ impl<'db> ExprCollector<'db> {
             return;
         };
         let macro_id = macro_id.definition(self.db);
-        self.store.push_list_statement(Statement::Item(Item::MacroDef(Box::new(macro_id))));
+        self.store.push_list_statement(Statement::Item(Item::MacroDef(&macro_id)));
         self.label_ribs.push(LabelRib::new(RibKind::MacroDef(Box::new(macro_id))));
     }
 
@@ -3154,7 +3158,7 @@ impl<'db> ExprCollector<'db> {
         mk_block: impl for<'s> FnOnce(
             &mut Self,
             Option<BlockId>,
-            &'s [Statement],
+            Statements<'s>,
             Option<ExprId>,
         ) -> Expr<'s>,
     ) -> ExprId {
@@ -3205,14 +3209,7 @@ impl<'db> ExprCollector<'db> {
             ast::Expr::MacroExpr(mac) => self.collect_macro_as_stmt(mac, true),
             expr => self.maybe_collect_expr(expr),
         });
-        let tail = tail.or_else(|| {
-            let stmt = self.store.pop_list_statement(statements)?;
-            if let Statement::Expr { expr, has_semi: false } = stmt {
-                return Some(expr);
-            }
-            self.store.push_list_statement(stmt);
-            None
-        });
+        let tail = tail.or_else(|| self.store.pop_list_tail_expr(statements));
 
         let written_in = block
             .stmt_list()

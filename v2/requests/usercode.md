@@ -232,6 +232,14 @@ Off the hot path, so nothing to change (hits read, one line per group):
 
 > forwarded to usercode: findings 1-10 are in lane usercode's crates (`blaze-expand`, `blaze-macro-wasm`, `proc-macro-api`, `blaze-usercode`, the sandbox); finding 9's database callback is in `crates/load-cargo/` (cargo's). Lane usercode is still running.
 
+> applied (usercode, 2026-10-29), checked against the code: 1 `Expansions.store` is a lock-free
+> `blaze_cas::Reader`, read under `blaze_cas::enter()`; 2 and 3 are gone, each check makes a
+> `Now` over the shared `Files`; 4 keeps through `Reader`; 5 and 6 are `Seat`, whose lock guards
+> only the queue's tickets and is never held across a call; 7 is gone; 8 is a `OnceLock`; 9 is
+> `Parked`, taken for a request and given back, never held across a call; 10 counts per thread
+> (`thread_local!`), summed by `report()`. The Windows `JOB` is `JOBS`, one per live run, so an
+> interrupt reaches every run.
+
 ## From speed-link-edge-usercode (2026-10-29): `trace::assemble` over any lines
 
 Where: `crates/blaze-usercode/src/trace.rs`, `pub fn assemble`. What: take
@@ -723,3 +731,101 @@ Asked:
 
 Why: item 4 is one token format from the lexer to the proc macro. A proc-macro call then costs
 a copy of the columns each way, not a token tree per token, a hash per span and JSON.
+
+> forwarded to usercode (told by tmux).
+
+## From safety-fuzz-procmacro (2026-10-29): the client crashes on a proc-macro server's token trees
+
+Found by reading `crates/proc-macro-api` while writing the fuzz targets `fuzz/targets/proc_macro_*`
+(section 7). The server is user code in a sandbox; everything below is reachable from the bytes it
+sends, and each one crashes or misleads the client (rust-analyzer's process, or the daemon).
+
+1. **`FlatTree::to_subtree_resolved` and `deserialize_span_data_index_map` panic on bad input.**
+   `legacy_protocol/msg/flat.rs` indexes, slices, `unwrap`s and asserts on the server's numbers.
+   Every input below is in `fuzz/corpus/proc_macro_flat_tree/` and crashes
+   `proc_macro_flat_tree`. The format is one byte that picks the version (`4 + byte % 4`, `03` is
+   7), then the postcard `ExpandMacroResponse` tree and span table (the bytes inside
+   `Response::ExpandMacro(Ok(..))` before `tracked_env_vars`).
+
+   | Input | Panic |
+   |---|---|
+   | `bug-no-group`: `03 00 00 00 00 00 00 00` | `res[0]` with no subtree |
+   | `bug-an-empty-span-table`: `03 05 00 00 00 00 00 00 00 00 00 00 00` | `table[0]` |
+   | `bug-a-span-table-of-four`: `03 05 00 00 00 00 00 00 00 00 00 00 04 00 00 00 00` | `assert!(remainder.is_empty())` |
+   | `bug-a-group-of-four-numbers`: `03 04 00 00 00 00 00 00 00 00 00 05 00 00 00 00 00` | same, for the subtree column |
+   | `bug-a-span-ending-before-it-starts`: `03 05 00 00 00 00 00 00 00 00 00 00 05 00 00 05 01 00` | `TextRange::new` start > end |
+   | `bug-a-file-id-with-the-reserved-bit`: `03 05 00 00 00 00 00 00 00 00 00 00 05 80 80 80 80 08 00 00 00 00` | `EditionedFileId::from_raw` |
+   | `bug-a-file-id-of-edition-127`: `03 05 00 00 00 00 00 00 00 00 00 00 05 80 80 80 fc 07 00 00 00 00` | `EditionedFileId::from_raw` |
+   | `bug-context-u32-max`: `03 05 00 00 00 00 00 00 00 00 00 00 05 00 00 00 00 ff ff ff ff 0f` | `SyntaxContext::from_u32` |
+   | `bug-delimiter-kind-4`: `03 05 00 00 04 00 00 00 00 00 00 00 05 00 00 00 00 00` | bad delimiter kind |
+   | `bug-a-group-range-past-the-end`: `03 05 00 00 00 00 09 00 00 00 00 00 05 00 00 00 00 00` | slice past `token_tree` |
+   | `bug-a-group-range-reversed`: `03 05 00 00 00 01 00 00 03 00 40 01 00 01 02 00 05 00 00 00 00 00` | reversed slice |
+   | `bug-a-group-in-itself`: `03 05 00 00 00 00 01 00 00 00 01 00 00 05 00 00 00 00 00` | `res[idx].take().unwrap()` |
+   | `bug-a-literal-past-the-end`: `03 05 00 00 00 00 01 00 00 00 01 15 00 05 00 00 00 00 00` | literal index |
+   | `bug-an-ident-text-past-the-end`: `03 05 00 00 00 00 01 00 00 03 00 03 00 01 03 00 05 00 00 00 00 00` | `text` index |
+   | `bug-punct-spacing-2`: `03 05 00 00 00 00 01 00 03 00 40 02 00 01 02 00 05 00 00 00 00 00` | bad spacing |
+   | `bug-punct-a-surrogate`: `03 05 00 00 00 00 01 00 03 00 80 b0 03 00 00 01 02 00 05 00 00 00 00 00` | `char::from_u32(..).unwrap()` |
+   | `bug-literal-kind-11`: `03 05 00 00 00 00 01 04 00 00 0b ff ff ff ff 0f 00 00 01 01 01 01 61 05 00 00 00 00 00` | `unreachable!` on literal kind |
+
+   Asked: change both in place to return errors, which the client turns into
+   `ServerError` (a panic in `to_subtree_resolved` is outside `run_conversation`'s
+   `catch_unwind`, which wraps only the callback):
+
+   ```rust
+   pub fn deserialize_span_data_index_map(map: &[u32]) -> Result<SpanDataIndexMap, String>;
+   impl FlatTree {
+       pub fn to_subtree_resolved(
+           self,
+           version: u32,
+           span_data_table: &SpanDataIndexMap,
+       ) -> Result<tt::TopSubtree, String>;
+   }
+   ```
+
+   The reader should check what the writer guarantees: subtree ranges consecutive and disjoint
+   in the writer's breadth-first order, each subtree referenced once and only by an earlier one,
+   every index in bounds, and kinds, spacing and chars valid. Or, better, drop `FlatTree` for
+   `TopSubtree::read_wire` (frontend-tokens above), which already checks all of this; the target
+   `proc_macro_tt_wire` fuzzes it. When the signatures change, `decode` in
+   `fuzz/targets/proc_macro_flat_tree.rs` needs `.ok()?` on both calls; tell safety-fuzz.
+
+2. **Quadratic work from overlapping ranges.** Subtrees whose ranges overlap, or that nobody
+   references, are all built (`bug-two-groups-of-one-range`:
+   `03 0a 00 00 00 00 01 00 00 00 00 01 00 03 00 40 01 00 01 02 00 05 00 00 00 00 00`), so work
+   and memory grow as subtrees times token trees: about 8 GB from 64 KiB of input. The checks in
+   item 1 stop it.
+
+3. **Silent fallbacks (no-fallback).** A span id past the table resolves to `table[0]`
+   (`bug-a-span-id-past-the-table`:
+   `03 05 00 00 00 00 01 00 03 07 40 01 00 01 02 00 05 00 00 00 00 00`), and a table naming one
+   span twice collapses in the `IndexSet` and shifts every later id
+   (`bug-a-span-table-with-a-span-twice`:
+   `03 05 00 00 00 00 01 00 03 02 40 01 00 01 02 00 0f 00 00 00 01 00 00 00 00 01 00 00 00 02 03 00`).
+   Both should be errors.
+
+4. **Frames of any length.** `transport::postcard::read` (`read_until(0)`) and
+   `transport::json::read` (`read_line`) buffer a frame until its end, however long, so a server
+   that never sends a 0 or a newline grows the client's buffer without bound. Asked: a longest
+   frame (like `test::wire::LONGEST`), past which reading fails with an error naming the length.
+
+5. **A public entry for the warm link's framing.** `warm::LinkReader` is `pub(crate)`, so the
+   targets read through `Message::read` on a `BufRead`, as the cold path does. To fuzz the warm
+   path exactly: `pub fn new(link: Arc<dyn Link>) -> LinkReader` on a `pub struct LinkReader`.
+
+6. **Minor.** `json::read` pops the last char of a final line with no newline
+   (`fuzz/corpus/proc_macro_legacy/api-version-check-with-no-newline.hex`), and both JSON and
+   postcard ignore bytes after a message inside its frame; reading should refuse both.
+
+7. **Note for whoever owns `load-cargo`.** `answer()` builds `TextRange`, `EditionedFileId` and
+   `SyntaxContext` from the server's numbers with the panicking constructors. `catch_unwind` in
+   `run_conversation` catches these, but they should be errors too.
+
+8. **`#[derive(PartialEq, Eq)]` on the wire's messages (speed of light).** This covers every
+   type in `bidirectional_protocol/msg.rs` and `legacy_protocol/msg.rs`, and `FlatTree`. With
+   no `PartialEq`, the fuzz targets compare two messages by writing both, and by `Debug` when
+   hash tables come out in another order. That holds `proc_macro_message`, `proc_macro_frames`
+   and `proc_macro_legacy` at 83 to 84% of their bounds
+   (`docs/v2/plan/lanes/safety/speed-of-light.md`). The derived `HashMap` and `HashSet`
+   equality ignores order, so the `Debug` path goes away too.
+
+> forwarded to usercode (`crates/proc-macro-api/` is its; told by tmux).

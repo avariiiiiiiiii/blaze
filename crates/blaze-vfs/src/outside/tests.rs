@@ -327,6 +327,95 @@ fn a_directory_is_wanted_once_and_found_past_growth() {
     assert!(dirs.find(b"/tc", super::tag(b"/tc")).is_some());
 }
 
+#[test]
+fn a_directory_under_one_wanted_is_covered_by_it() {
+    let dirs = Dirs::new();
+    dirs.want(path("/tc"));
+    dirs.want(path("/tc/lib"));
+    dirs.want(path("/tc/lib/deep"));
+    assert_eq!(dirs.len(), 1);
+    dirs.want(path("/tcx"));
+    assert_eq!(dirs.len(), 2, "a sibling with the same start is not under it");
+}
+
+#[test]
+fn a_directory_wanted_above_others_retires_their_watches() {
+    let dirs = Dirs::new();
+    let mut sim = Sim::new(6, Faults::default());
+    sim.change(&name("sdk/include/a.h"), b"int a;");
+    sim.change(&name("sdk/lib/b.h"), b"int b;");
+    dirs.want(path("/sdk/include"));
+    dirs.want(path("/sdk/lib"));
+    let mut outside = Outside::new(&dirs, "/", TAGS);
+    let mut effects = Vec::new();
+    round(&mut sim, &mut outside, &mut effects);
+    assert!(dirs.dir(0).since() < UNCONFIRMED && dirs.dir(1).since() < UNCONFIRMED);
+
+    dirs.want(path("/sdk"));
+    assert_eq!((dirs.dir(0).subsumed_by(), dirs.dir(1).subsumed_by()), (Some(2), Some(2)));
+    outside.flush(&mut effects);
+    let unwatched: Vec<Tag> = effects
+        .iter()
+        .filter_map(|it| match it {
+            Effect::Unwatch { tag } => Some(*tag),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unwatched, vec![outside.tag(0, WATCH), outside.tag(1, WATCH)]);
+    assert!(effects.contains(&Effect::Watch { dir: name("sdk"), tag: outside.tag(2, WATCH) }));
+    let flushes = effects.iter().filter(|it| matches!(it, Effect::Flush { .. })).count();
+    assert_eq!(flushes, 0, "retired watches are not flushed, and the new one is not confirmed yet");
+    pump(&mut sim, &mut outside, &mut effects);
+    // One watch, one flush per round from now on.
+    outside.flush(&mut effects);
+    assert_eq!(effects, vec![Effect::Flush { watch: outside.tag(2, WATCH), tag: outside.tag(2, FLUSH) }]);
+    pump(&mut sim, &mut outside, &mut effects);
+    assert!(outside.flushed());
+    assert_eq!((dirs.dir(0).since(), dirs.dir(1).since()), (UNCONFIRMED, UNCONFIRMED));
+    let generation = dirs.generation();
+    assert!(dirs.unchanged_since(path("/sdk/include/a.h"), generation));
+    assert!(dirs.unchanged_since(path("/sdk/lib/b.h"), generation));
+    sim.change(&name("sdk/lib/b.h"), b"int c;");
+    round(&mut sim, &mut outside, &mut effects);
+    assert!(!dirs.unchanged_since(path("/sdk/lib/b.h"), generation));
+}
+
+#[test]
+fn a_cover_answers_as_the_path_does_without_a_walk() {
+    let dirs = Dirs::new();
+    assert!(dirs.cover(path("/tc/lib/a.h")).is_none(), "nothing wanted");
+    let (mut sim, mut outside, mut effects) = confirmed(&dirs);
+    let cover = dirs.cover(path("/tc/lib/a.h")).expect("under /tc");
+    assert_eq!(cover.dir().path(), Path::new("/tc"));
+    assert!(dirs.cover(path("/other/a.h")).is_none());
+    let generation = dirs.generation();
+    assert!(cover.unchanged_since(generation));
+    outside.flush(&mut effects);
+    assert!(!cover.unchanged_since(generation), "a round is out");
+    pump(&mut sim, &mut outside, &mut effects);
+    assert!(cover.unchanged_since(generation));
+    sim.change(&name("tc/lib/a.h"), b"int b;");
+    round(&mut sim, &mut outside, &mut effects);
+    assert!(!cover.unchanged_since(generation));
+    assert_eq!(cover.unchanged_since(generation), dirs.unchanged_since(path("/tc/lib/a.h"), generation));
+    assert!(cover.unchanged_since(dirs.generation()));
+}
+
+#[test]
+fn a_tag_is_the_same_whole_or_found_as_a_prefix() {
+    let path = b"/usr/include/c++/v1/vector";
+    let mut found = Vec::new();
+    super::prefixes(path, |end, tag| {
+        found.push((end, tag));
+        true
+    });
+    let ends: Vec<usize> = found.iter().map(|it| it.0).collect();
+    assert_eq!(ends, vec![4, 12, 16, 19, 26]);
+    for (end, tag) in found {
+        assert_eq!(tag, super::tag(&path[..end]), "{}", String::from_utf8_lossy(&path[..end]));
+    }
+}
+
 #[cfg(not(blaze_check))] // many threads, long loops
 #[test]
 fn reads_race_with_wants_and_find_every_published_directory() {
@@ -381,6 +470,53 @@ fn model_a_check_sees_a_directory_whole_and_vouches_only_after_it_is_confirmed()
         dirs.settle(true);
         reader.join().unwrap();
     });
+}
+
+#[cfg(not(blaze_check))] // the model's atomics keep state of their own
+#[test]
+fn checks_wants_and_rounds_allocate_nothing() {
+    use blaze_alloc_count::assert_at_most;
+
+    let dirs = Dirs::new();
+    let (mut sim, mut outside, mut effects) = confirmed(&dirs);
+    let header = path("/tc/lib/deep/er/a.h");
+    let generation = assert_at_most(0, "generation", || dirs.generation());
+    let cover = assert_at_most(0, "a cover found", || dirs.cover(header)).expect("under /tc");
+    assert!(assert_at_most(0, "a check through a cover", || cover.unchanged_since(generation)));
+    assert!(assert_at_most(0, "a check by path", || dirs.unchanged_since(header, generation)));
+    assert!(!assert_at_most(0, "a check of a path nothing covers", || {
+        dirs.unchanged_since(path("/elsewhere/include/b.h"), generation)
+    }));
+    assert_at_most(0, "a want of a directory wanted", || dirs.want(path("/tc")));
+    assert_at_most(0, "a want of a directory covered", || dirs.want(path("/tc/lib/deep")));
+
+    // A round of confirmed watches, into a buffer kept from the last, and its flushes heard.
+    effects.reserve(8);
+    let mut done = Vec::with_capacity(8);
+    for _ in 0..3 {
+        assert_at_most(0, "a round asked", || outside.flush(&mut effects));
+        assert_eq!(effects.len(), 1);
+        while !outside.flushed() {
+            sim.submit(&mut effects);
+            sim.poll(&mut done, Duration::ZERO);
+            for completion in done.drain(..) {
+                assert_at_most(0, "a flush heard", || outside.complete(completion, &mut effects));
+            }
+        }
+    }
+
+    // A change heard, once the driver made its report.
+    sim.change(&name("tc/lib/a.h"), b"int b;");
+    let mut heard = false;
+    while !heard {
+        sim.submit(&mut effects);
+        assert!(sim.poll(&mut done, Duration::ZERO) > 0, "the change was never told");
+        for completion in done.drain(..) {
+            heard |= matches!(completion.done, Done::Changed { .. });
+            assert_at_most(0, "a change heard", || outside.complete(completion, &mut effects));
+        }
+    }
+    assert!(!cover.unchanged_since(generation));
 }
 
 #[test]

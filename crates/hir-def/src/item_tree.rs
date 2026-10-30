@@ -41,9 +41,12 @@
 //! and every list's items come before the item holding it. Names and paths are `u32` ids into
 //! the tree's tables ([`NameId`], [`PathId`]); visibilities ([`RawVisibilityId`]) and attributes
 //! (keyed by item, in [`ItemTree::attrs`]) sit in side tables. [`persist`] writes the columns as
-//! they are.
+//! they are. Names, paths and visibilities are deduplicated within each top-level item, not
+//! across them, so a source file's tree is its items' trees concatenated: it is assembled from
+//! them, each lowered on its own ([`items`]).
 
 mod attrs;
+mod items;
 mod lower;
 pub mod persist;
 mod pretty;
@@ -213,6 +216,8 @@ pub fn file_item_tree(db: &dyn SourceDatabase, file_id: HirFileId, krate: Crate)
     }
 }
 
+/// A source file's tree is assembled from its items' ([`items`]), so an edit lowers only the
+/// items it touches; a macro file's is lowered whole, as each expansion is made anew.
 #[salsa::tracked(returns(ref))]
 fn file_item_tree_query(
     db: &dyn SourceDatabase,
@@ -220,10 +225,19 @@ fn file_item_tree_query(
     krate: Crate,
 ) -> Option<Box<ItemTree>> {
     let _p = tracing::info_span!("file_item_tree_query", ?file_id).entered();
+    let item_tree = match file_id {
+        HirFileId::FileId(file) => items::file_item_tree(db, file, krate),
+        HirFileId::MacroFile(_) => lower_whole(db, file_id, krate),
+    };
+    if item_tree.is_empty() { None } else { Some(Box::new(item_tree)) }
+}
 
+/// The tree of `file_id` lowered in one pass. A source file's assembled from its items is this
+/// tree, to the byte.
+pub(crate) fn lower_whole(db: &dyn SourceDatabase, file_id: HirFileId, krate: Crate) -> ItemTree {
     let mut ctx = lower::Ctx::new(db, file_id, krate);
     let syntax = file_id.parse_or_expand(db);
-    let item_tree = match_ast! {
+    match_ast! {
         match syntax {
             ast::SourceFile(file) => {
                 let root_file_id = krate.root_file_id(db);
@@ -249,8 +263,7 @@ fn file_item_tree_query(
                 panic!("cannot create item tree for file {file_id:?} from {syntax:?} {syntax}");
             },
         }
-    };
-    if item_tree.is_empty() { None } else { Some(Box::new(item_tree)) }
+    }
 }
 
 #[salsa::tracked(returns(ref))]

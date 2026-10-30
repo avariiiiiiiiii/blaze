@@ -987,6 +987,8 @@ per-file query is `base_db::line_index(db, FileText) -> &LineIndex` (request in
 hir-ty-mir and hir-ty-codegen each scan texts into `Vec`s of line starts, and blaze-engine uses
 ide-db's `line_index` (going away with ide-db). Land after the db request.
 
+> forwarded to codegen (told by tmux).
+
 ### 1. `crates/hir-ty-mir/src/mir/location.rs`
 
 Old (from `/// File, line and column of where a range of a file begins.` to the end of
@@ -1127,4 +1129,71 @@ once, ~0.13 bytes per byte of text, instead of a `Vec<u32>` per query per text.
 and new places differ only where the old was not rustc's (at the `\n` of a `\r\n`, at the end
 of a text ending in `\n`, in a text with nothing after its byte order mark), none of which a
 call or a statement can be at.
+Status: open
+
+## speed-hir-store-stmts: statements become columns, `Statement` a view (hir-ty-mir)
+
+From speed-hir-store-stmts (child of speed-hir-store), 2026-10-29. For `codegen-mir` (owner of
+`crates/hir-ty-mir/`). `hir-def` stores a block's statements as rows of two columns (5 bytes a
+statement, a `let`'s ids in `extra`), where it was a 32-byte enum in a flat array. These land
+together with that change.
+
+**Written against the text after "## speed-hir-store: hir-ty-mir onto the HIR column views"
+above is applied** (not yet applied when this was written). That section's notes "keep `*pat` /
+`*else_branch` / `*initializer` / `*expr`: a `Statement` field" are reversed by this one: apply
+that section first, then this.
+
+**The rule.** `Statement` is now `Statement<'a>`, a `Copy` view decoded from the rows, with
+today's variant and field names. `Expr::Block { statements, .. }` gives `statements:
+Statements<'a>`, a `Copy` handle (`len`, `is_empty`, `get(i) -> Option<Statement<'a>>`, `first`,
+`last`, `iter()` double-ended and exact size, `IntoIterator` for it and for `&` it), no longer
+`&'a [Statement]`. So:
+1. A statement is a value: `for statement in statements` and `statements.iter()` still compile
+   and yield `Statement<'_>`. Its id, `Option` and `bool` fields bind by value: `*pat` ->
+   `pat`, `*initializer` -> `initializer`, `*is_super` -> `is_super`; a `&Statement::..`
+   pattern drops the `&`. `Item::MacroDef(id)` still binds `&MacroDefId`.
+2. A parameter `&[Statement]` -> `Statements<'_>` (`hir_def::hir::Statements`).
+3. No slice operations on `statements` (`.iter().any/all` work as before).
+`MirLowerCtx::store` is `&'a ExpressionStore`, so `Statements<'a>` borrows from behind a shared
+reference as the slice did; the `Expr::Block` arm's `lower_block_to_place(statements, ..)` calls
+(~L1030, ~L1038, inside and outside `lower_loop`'s closure) are unchanged.
+
+Examples (real sites):
+- ~L3436 `        statements: &[hir_def::hir::Statement],`  ->  `        statements: hir_def::hir::Statements<'_>,`
+- ~L3591 `&hir_def::hir::Statement::Expr { expr, has_semi: _ } => {`  ->  `hir_def::hir::Statement::Expr { expr, has_semi: _ } => {`
+- ~L3459 `self.extend_temporaries(*initializer, *pat, scope);`  ->  `self.extend_temporaries(initializer, pat, scope);`
+
+Counts: 29 sites, all in `crates/hir-ty-mir/src/mir/lower.rs`, in `fn is_super_let_block` and
+`fn lower_block_to_place`. No other file of `crates/hir-ty-mir/` or `crates/hir-ty-codegen/`
+reads a HIR statement (`location.rs`, `type_name.rs`, `places.rs` match `Expr::Block` only for
+its `id`/`tail`).
+
+### crates/hir-ty-mir/src/mir/lower.rs  (29)
+In `fn is_super_let_block` (~L3415-3432):
+- `    fn is_super_let_block(&self, statements: &[hir_def::hir::Statement]) -> bool {`  ->  `    fn is_super_let_block(&self, statements: hir_def::hir::Statements<'_>) -> bool {`
+- `                    *is_super\n                        || matches!(self.store.pat(*pat), Pat::Bind { id, subpat: None } if self.store[id].name.is_generated())`  ->  `                    is_super\n                        || matches!(self.store.pat(pat), Pat::Bind { id, subpat: None } if self.store[id].name.is_generated())`
+- `hir_def::hir::Statement::Expr { expr, .. } => literal(*expr),`  ->  `hir_def::hir::Statement::Expr { expr, .. } => literal(expr),`
+- unchanged: `statements.iter().any(|it| matches!(it, hir_def::hir::Statement::Let { .. }))` and `statements.iter().all(|statement| match statement {`.
+
+In `fn lower_block_to_place` (~L3434-3640): the parameter, then every `*` on a statement
+field. Within this function every `*pat`, `*initializer`, `*expr_id`, `*else_branch` and
+`*is_super` is one (the tail half after the loop has none), so they can be done as token
+replacements scoped to the function. One by one:
+- ~L3436  `        statements: &[hir_def::hir::Statement],`  ->  `        statements: hir_def::hir::Statements<'_>,`
+- the `super let` loop (~L3452-3474): `self.extend_temporaries(*initializer, *pat, scope);`  ->  `self.extend_temporaries(initializer, pat, scope);`; `self.declare_bindings(*pat);` (this and the one at ~L3485, the only two)  ->  `self.declare_bindings(pat);`; `self.lower_expr_as_place(current, *initializer, true)?`  ->  `self.lower_expr_as_place(current, initializer, true)?`; `self.resolver.update_to_inner_scope(self.db, self.store_owner, *initializer);`  ->  `self.resolver.update_to_inner_scope(self.db, self.store_owner, initializer);`; `let matched = self.pattern_match(c, None, init_place, *pat);`  ->  `let matched = self.pattern_match(c, None, init_place, pat);`
+- the `Statement::Let` arm (~L3481-3590). `initializer` and `else_branch` are `Option<ExprId>` by value now, so `Some(expr_id)` binds `ExprId`, not `&ExprId`:
+  - `(initializer, else_branch, *is_super, self.store.pat(*pat))`  ->  `(initializer, else_branch, is_super, self.store.pat(pat))`
+  - `self.extend_temporaries(*expr_id, *pat, self.drop_scopes.len() - 1);` (both, ~L3503 and ~L3538)  ->  `self.extend_temporaries(expr_id, pat, self.drop_scopes.len() - 1);`
+  - `let Some(c) = self.lower_expr_to_place(*expr_id, local.into(), current)?`  ->  `let Some(c) = self.lower_expr_to_place(expr_id, local.into(), current)?`
+  - `self.push_fake_read(c, local.into(), MirSpan::PatId(*pat));`  ->  `self.push_fake_read(c, local.into(), MirSpan::PatId(pat));`
+  - `self.lower_expr_as_place(current, *expr_id, true)?`  ->  `self.lower_expr_as_place(current, expr_id, true)?`
+  - `self.push_fake_read(current, init_place, MirSpan::PatId(*pat));`  ->  `self.push_fake_read(current, init_place, MirSpan::PatId(pat));`
+  - in `self.resolver.update_to_inner_scope(` (~L3554-3558): `                            *expr_id,`  ->  `                            expr_id,`
+  - `self.super_let = enclosing.filter(|_| *is_super);`  ->  `self.super_let = enclosing.filter(|_| is_super);`
+  - `.pattern_match_linked(current, init_place, *pat)`  ->  `.pattern_match_linked(current, init_place, pat)`; `None => self.pattern_match(current, None, init_place, *pat),`  ->  `None => self.pattern_match(current, None, init_place, pat),`
+  - `self.lower_let_else(else_block, *else_branch, declared, span)?;`  ->  `self.lower_let_else(else_block, else_branch, declared, span)?;`
+  - `self.store.walk_bindings_in_pat(*pat, |b| {`  ->  `self.store.walk_bindings_in_pat(pat, |b| {`
+- ~L3591  `&hir_def::hir::Statement::Expr { expr, has_semi: _ } => {`  ->  `hir_def::hir::Statement::Expr { expr, has_semi: _ } => {`
+- unchanged: `for statement in statements {` (~L3452), `for statement in statements.iter() {` (~L3479), `self.is_super_let_block(statements)` (~L3443), `hir_def::hir::Statement::Item(_) => (),`, the column-view section's `self.store[id].mode`, `binding_ty(id)`, `let binding = id;` (`id` from the `Pat::Bind` view).
+
 Status: open

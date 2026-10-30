@@ -5,7 +5,6 @@
 //! invariant one. A loan is in scope until the first point it is not live at.
 
 use blaze_ids::radix;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{Variance, inherent::IntoKind};
 
 use hir_ty::{
@@ -15,6 +14,7 @@ use hir_ty::{
 
 use super::{
     Ctx,
+    bitset::BitSet,
     cfg::{Cfg, Location, index},
     intervals::IntervalSet,
     loans::Loans,
@@ -60,16 +60,21 @@ pub(super) fn live_loans<'db>(
             }
         }
     }
-    let universal: FxHashSet<Rv> = regions.universals.iter().map(|&(rv, _)| rv).collect();
-    let direction = |rv: Rv| {
-        if universal.contains(&rv) {
-            Direction::Forward
-        } else {
-            // rustc falls back to both ways for a region it has no variance of.
-            directions.get(rv).copied().flatten().unwrap_or(Direction::Both)
+    // Indexed by region, read on every step of every loan's walk: a universal region flows
+    // forwards and is live everywhere; rustc falls back to both ways for a region it has no
+    // variance of.
+    let mut universal = BitSet::new(count);
+    for &(rv, _) in &regions.universals {
+        if rv < count {
+            universal.insert(rv);
         }
-    };
-    // The points each region is live at; a universal region is live everywhere.
+    }
+    let direction: Vec<Direction> = (0..count)
+        .map(|rv| match universal.contains(rv) {
+            true => Direction::Forward,
+            false => directions.get(rv).copied().flatten().unwrap_or(Direction::Both),
+        })
+        .collect();
     let all = {
         let mut all = IntervalSet::default();
         if cfg.points > 0 {
@@ -78,8 +83,10 @@ pub(super) fn live_loans<'db>(
         all
     };
     let empty = IntervalSet::default();
-    let live_at =
-        |rv: Rv| if universal.contains(&rv) { &all } else { liveness.get(rv).unwrap_or(&empty) };
+    let live_at = |rv: Rv| match universal.contains(rv) {
+        true => &all,
+        false => liveness.get(rv).unwrap_or(&empty),
+    };
     // The edges out of each region: those that hold at one point, sorted by point, and those
     // that hold everywhere, each sub once.
     let constraints = &regions.outlives;
@@ -140,7 +147,7 @@ pub(super) fn live_loans<'db>(
             let block = cfg.location(start).block;
             let (first, last) = (cfg.point(Location { block, statement: 0 }), last_of(block));
             let region_live = live_at(region);
-            let direction = direction(region);
+            let direction = direction[region];
             for (start, end) in visited[region].insert_new(start, end) {
                 for &sub in logical.of(region) {
                     stack.push((sub as Rv, start, end));

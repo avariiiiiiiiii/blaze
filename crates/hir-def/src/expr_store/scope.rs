@@ -14,7 +14,7 @@ use crate::{
     BlockId, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, VariantId,
     expr_store::{Body, ExpressionStore, HygieneId, StoreVisitor, StoreVisitorExt, body::Param},
     hir::{
-        Binding, BindingId, Expr, ExprId, Item, LabelId, Pat, PatId, Statement,
+        Binding, BindingId, Expr, ExprId, Item, LabelId, Pat, PatId, Statement, Statements,
         generics::GenericParams,
     },
     signatures::VariantFields,
@@ -416,7 +416,7 @@ impl<S: ScopeSink> ExprScopeVisitor<'_, S> {
         &mut self,
         expr: ExprId,
         id: Option<BlockId>,
-        statements: &[Statement],
+        statements: Statements<'_>,
         tail: Option<ExprId>,
         label: Option<LabelId>,
     ) {
@@ -436,15 +436,15 @@ impl<S: ScopeSink> ExprScopeVisitor<'_, S> {
             for stmt in statements {
                 match stmt {
                     Statement::Let { pat, initializer, else_branch, type_ref, .. } => {
-                        this.on_type_opt(*type_ref);
-                        this.on_expr_opt(*initializer);
-                        this.on_expr_opt(*else_branch);
+                        this.on_type_opt(type_ref);
+                        this.on_expr_opt(initializer);
+                        this.on_expr_opt(else_branch);
                         this.scope = this.new_scope(this.scope, NewScope::Plain);
-                        this.on_pat(*pat);
+                        this.on_pat(pat);
                     }
-                    Statement::Expr { expr, has_semi: _ } => this.on_expr(*expr),
+                    Statement::Expr { expr, has_semi: _ } => this.on_expr(expr),
                     Statement::Item(Item::MacroDef(macro_id)) => {
-                        let macro_def = NewScope::MacroDef(**macro_id);
+                        let macro_def = NewScope::MacroDef(*macro_id);
                         this.scope = this.new_scope(this.scope, macro_def);
                         this.const_scope = this.new_scope(this.const_scope, macro_def);
                     }

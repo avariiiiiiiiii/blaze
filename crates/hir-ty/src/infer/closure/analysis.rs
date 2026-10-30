@@ -955,7 +955,7 @@ impl<'db> InferenceContext<'db> {
                 normalized
             }
             Err(errors) => {
-                self.table.trait_errors.extend(errors);
+                self.table.record_trait_errors(errors);
                 place
             }
         }

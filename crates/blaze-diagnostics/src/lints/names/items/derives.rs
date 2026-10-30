@@ -12,13 +12,13 @@
 
 use blaze_items::Fact;
 use hir::{Adt, Field};
-use hir_def::lang_item::lang_items;
 use syntax::{
     AstNode,
     ast::{self, HasGenericParams},
 };
 
 use super::{
+    Krate,
     visibility::{Def, Effective},
     walk::{self, Item},
 };
@@ -49,13 +49,23 @@ fn fields(cx: &Cx<'_, '_>, adt: Adt) -> Vec<Field> {
     }
 }
 
-pub(super) fn copy(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<Found> {
+/// Its tests are all required, so they run cheapest first: the attributes, the fields' types,
+/// then the impls, the trait queries and the layout.
+pub(super) fn copy(cx: &Cx<'_, '_>, item: &Item, effective: &Effective, krate: &Krate) -> Vec<Found> {
     let Some((adt, false)) = adt(cx, item) else { return Vec::new() };
     if !effective.is_reachable(Def::Item(adt.into())) {
         return Vec::new();
     }
+    let non_exhaustive = walk::attr(cx, &item.node.value, "non_exhaustive").is_some()
+        || item.own::<ast::Variant>().any(|it| walk::attr(cx, &it.value, "non_exhaustive").is_some());
+    if non_exhaustive {
+        return Vec::new();
+    }
     let db = cx.db;
-    let lang = lang_items(db, cx.krate.into());
+    let fields = fields(cx, adt);
+    if fields.iter().any(|it| it.ty(db).is_raw_ptr()) {
+        return Vec::new();
+    }
     let ty = adt.ty(db);
     let impls = hir::Impl::all_for_type(db, ty.clone());
     let impl_of = |trait_: Option<hir_def::TraitId>, negative: bool| {
@@ -65,16 +75,7 @@ pub(super) fn copy(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<F
             })
         })
     };
-    if impl_of(lang.Drop, false) {
-        return Vec::new();
-    }
-    let fields = fields(cx, adt);
-    if fields.iter().any(|it| it.ty(db).is_raw_ptr()) || ty.is_copy(db) || impl_of(lang.Copy, true) {
-        return Vec::new();
-    }
-    let non_exhaustive = walk::attr(cx, &item.node.value, "non_exhaustive").is_some()
-        || item.own::<ast::Variant>().any(|it| walk::attr(cx, &it.value, "non_exhaustive").is_some());
-    if non_exhaustive || ty.clone().impls_iterator(db) {
+    if impl_of(krate.drop, false) || impl_of(krate.copy, true) || ty.is_copy(db) || ty.clone().impls_iterator(db) {
         return Vec::new();
     }
     if ty.layout(db).is_ok_and(|it| it.size() > 256) {
@@ -91,13 +92,13 @@ pub(super) fn copy(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<F
     vec![Found::lint(diag, Phase::Late, item.ptr())]
 }
 
-pub(super) fn debug(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<Found> {
+pub(super) fn debug(cx: &Cx<'_, '_>, item: &Item, effective: &Effective, krate: &Krate) -> Vec<Found> {
+    let Some(debug) = krate.debug else { return Vec::new() };
     let Some((adt, generic)) = adt(cx, item) else { return Vec::new() };
     if !effective.is_reachable(Def::Item(adt.into())) {
         return Vec::new();
     }
     let db = cx.db;
-    let Some(debug) = lang_items(db, cx.krate.into()).Debug else { return Vec::new() };
     let ty = adt.ty(db);
     let own = hir::Impl::all_for_type(db, ty.clone())
         .into_iter()

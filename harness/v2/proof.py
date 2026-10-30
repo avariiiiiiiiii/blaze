@@ -10,6 +10,7 @@ The checks, each a script of this directory run with the same `engine` (v1 now, 
     oracle        oracle.py: the incremental build equals one from scratch after every edit
     corpus        corpus.py: real crates built, run and tested under blaze and rustc
     rejections    rejections.py: rustc's compile-fail tests fail with the same error codes
+    share         share.py: the instance-sharing programs print what Rust guarantees under rustc and blaze
     determinism   determinism.py: two builds on different core counts, byte for byte the same
     tightmemory   tightmemory.py: a build under a tight memory budget finishes, never OOMs
     budgets       budgets.py: the targets of docs/v2/plan/goals/targets.md
@@ -48,11 +49,12 @@ import report  # noqa: E402
 from typed_input import fail, parse  # noqa: E402
 
 SCRIPT = "proof.py"
-type Name = Literal["oracle", "corpus", "rejections", "determinism", "tightmemory", "budgets"]
+type Name = Literal["oracle", "corpus", "rejections", "share", "determinism", "tightmemory", "budgets"]
 SCRIPTS: dict[str, tuple[str, ...]] = {
     "oracle": ("oracle.py", "run"),
     "corpus": ("corpus.py",),
     "rejections": ("rejections.py",),
+    "share": ("share.py",),
     "determinism": ("determinism.py",),
     "tightmemory": ("tightmemory.py",),
     "budgets": ("budgets.py",),

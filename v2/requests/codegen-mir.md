@@ -34,6 +34,7 @@ crates must change to keep building and to lower the new MIR.
   for `at`, or compare with `matches!(level, MirOptLevel::Release)`.)
 
 > forwarded to db (db-ty): `crates/hir-ty/src/mir.rs` is its.
+> applied by db-ty-d-mir: the four `AssertKind`s (with arms in both `for_each_operand*`: `required` then `found`, the operand of `InvalidEnumConstruction`, nothing for the null ones), `CastKind::Transmute`, and `MirOptions` with `MirOptions::at` beside `MirOptLevel`, as written. Tests in `mir.rs`: `the_ub_check_asserts_visit_their_operands_in_order`, `the_interpreter_keeps_lifetime_markers_only_at_release`.
 
 ## 2. hir-ty `src/db.rs` and hir-ide `src/impl_db_macro.rs` (db-ty-db)
 
@@ -55,6 +56,7 @@ Same return types as the runtime coroutine twins. `crates/hir/src/evict.rs` (46â
 four new queries too.
 
 > applied (hir-ide): `impl_hir_database!` passes `options: MirOptions` to the four optimized queries and maps the four coroutine twins to `mir::*_query`, as written here. forwarded to db for `hir-ty/src/db.rs` and `hir/src/evict.rs`.
+> applied by db-ty-d-mir: `hir-ty/src/db.rs`'s four optimized queries take `options: MirOptions`, and the four coroutine twins are declared with the signatures `impl_db_macro.rs:121-204` implements; `hir/src/evict.rs`'s `drop_mir` evicts the four new queries. hir-ty's `every_query_has_a_kind` scans only hir-ty's source (these are hir-ty-mir's), so it needs nothing; `hir/src/tests.rs`'s `dropped_results_keep_cutoff_and_come_back_equal` runs `drop_mir` with them.
 
 ## 3. hir-def `src/lang_item.rs` (beside 611/616) and the symbols
 
@@ -83,6 +85,7 @@ unevaluated constants; the collector already takes associated consts, as for `Ra
 - hir-ty and hir-ty-borrowck: any exhaustive match on either enum.
 
 > applied (items DONE): `blaze-items/src/form.rs` hashes the four new `AssertKind`s with tags 5-8 and their operands; casts hash `CastKind` by `Debug`, so `Transmute` is in already. forwarded to diagnostics (`panics.rs:518`), codegen (`hir-ty-codegen`), db (hir-ty, hir-ty-borrowck).
+> applied by db-ty-d-mir: nothing to change in hir-ty, hir, hir-ty-borrowck or hir-ty-wfcheck: outside `mir.rs` (done) no match on `AssertKind` and `CastKind`'s one (`hir-ty-borrowck/src/regions.rs:4789`) ends in `_ => ()`.
 
 ## 5. Codegen must lower (speed-backend-lower, `crates/hir-ty-codegen/mod.rs`)
 

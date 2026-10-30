@@ -482,3 +482,33 @@ fn lexing_then_parsing_gives_the_files_tree() {
     }
     assert!(parsed > 200, "only {parsed} files parsed back");
 }
+
+/// Converting a tree into an input that was used before allocates nothing: the keywords' table
+/// is built once, the editions of a tree with one context stay inline, and the input keeps its
+/// buffers.
+#[test]
+fn a_reused_input_converts_without_allocating() {
+    let text = r#"
+        macro_rules! m { ($($t:tt)*) => { union U<'a> { r#try: &'a u8, _x: f32 } } }
+        fn f<'a>(r#fn: &'a [u8; 2], s: &str) -> impl Fn() + 'a {
+            let _ = (1.5, 2.0f64, 1., 'c', b"b", r"r", 0x1F_u32, s.len(), async { 1 }.await);
+            move || if let [a, ..] = r#fn { yield_(*a >> 1) } else { loop {} }
+        }
+    "#;
+    let node = ast::SourceFile::parse(text, Edition::CURRENT).syntax_node();
+    let tree = token_tree(&node);
+    let mut edition = |_: span::SyntaxContext| Edition::CURRENT;
+    let mut input = parser::Input::with_capacity(0);
+    crate::to_parser_input_into(tree.token_trees(), &mut edition, &mut input);
+    let tokens = input.len();
+    blaze_alloc_count::assert_at_most(0, "a parser's input into a used one", || {
+        crate::to_parser_input_into(tree.token_trees(), &mut edition, &mut input)
+    });
+    assert_eq!(input.len(), tokens);
+    crate::to_matcher_input_into(tree.token_trees(), &mut edition, &mut input);
+    blaze_alloc_count::assert_at_most(0, "a matcher's input into a used one", || {
+        crate::to_matcher_input_into(tree.token_trees(), &mut edition, &mut input)
+    });
+    assert_eq!(input.len(), tokens);
+}
+

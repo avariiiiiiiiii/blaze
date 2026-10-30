@@ -25,6 +25,7 @@ pub(crate) fn apply(arch: Arch, r_type: u32, bytes: &mut [u8], p: u64, s: u64, a
         }
         (Arch::Aarch64, elf::R_AARCH64_LD_PREL_LO19) => {
             if rel & 3 != 0 {
+                // alloc: error path
                 return Err(format!("R_AARCH64_LD_PREL_LO19 to {rel:#x} from the place: not 4-aligned"));
             }
             int(rel, 21, "R_AARCH64_LD_PREL_LO19")?;
@@ -40,6 +41,7 @@ pub(crate) fn apply(arch: Arch, r_type: u32, bytes: &mut [u8], p: u64, s: u64, a
         (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G2) => smovw(bytes, rel, 2, true, "R_AARCH64_MOVW_PREL_G2"),
         (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G2_NC) => smovw(bytes, rel, 2, false, ""),
         (Arch::Aarch64, elf::R_AARCH64_MOVW_PREL_G3) => smovw(bytes, rel, 3, false, ""),
+        // alloc: error path
         _ => Err(format!("relocation type {r_type} is not one the ELF writer applies for {arch:?}")),
     }
 }
@@ -47,14 +49,14 @@ pub(crate) fn apply(arch: Arch, r_type: u32, bytes: &mut [u8], p: u64, s: u64, a
 /// A value that fits `bits` as a signed or an unsigned number (lld's `checkIntUInt`).
 fn uint_or_int(value: i64, bits: u32, what: &str) -> Result<u64, String> {
     if value < -(1i64 << (bits - 1)) || value >= 1i64 << bits {
-        return Err(format!("{what}: {value:#x} does not fit {bits} bits"));
+        return Err(format!("{what}: {value:#x} does not fit {bits} bits")); // alloc: error path
     }
     Ok(value as u64)
 }
 
 fn int(value: i64, bits: u32, what: &str) -> Result<u64, String> {
     if value < -(1i64 << (bits - 1)) || value >= 1i64 << (bits - 1) {
-        return Err(format!("{what}: {value:#x} does not fit {bits} signed bits"));
+        return Err(format!("{what}: {value:#x} does not fit {bits} signed bits")); // alloc: error path
     }
     Ok(value as u64)
 }
@@ -62,7 +64,7 @@ fn int(value: i64, bits: u32, what: &str) -> Result<u64, String> {
 fn put(bytes: &mut [u8], value: &[u8]) -> Result<(), String> {
     let place = bytes
         .get_mut(..value.len())
-        .ok_or_else(|| format!("a {}-byte relocation at the end of its section", value.len()))?;
+        .ok_or_else(|| format!("a {}-byte relocation at the end of its section", value.len()))?; // alloc: error path
     place.copy_from_slice(value);
     Ok(())
 }

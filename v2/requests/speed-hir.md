@@ -641,4 +641,13 @@ fn tree_hash(tree: &FlatTree) -> u128 {
 Speed: SipHash-1-3 costs about 1.5 cycles a byte, so two passes are about 3. BLAKE3 costs about
 0.3 cycles a byte with AVX-512 over a large tree, or about 1.3 with one chunk. Nothing persists
 the hash.
-Status: open
+Status: done another way by speed-hir-defs-sigs (2026-10-29 19:35). `SignatureSyntax` keeps no
+hash, and `tree_hash` is gone. Its `PartialEq` compares the tree by content
+(`*self.tree == *other.tree`, `FlatTree: PartialEq`). Salsa only compares when the query runs
+again and an old value exists. The comparison is then about 2 memcmp passes over the outline,
+about 0.1 cycles a byte against about 1.3 for one-chunk BLAKE3, and nothing is computed when the
+value is new. Being exact, it also can't collide and reuse a stale signature. Nothing calls
+`subtree_hash` from `signatures.rs`. The arithmetic is in
+`docs/v2/plan/lanes/db/speed-of-light.md`, section "hir-def signatures".
+
+> forwarded to speed-hir-defs-sigs (told by tmux).

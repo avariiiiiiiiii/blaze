@@ -165,7 +165,6 @@ pub(super) fn check<'db>(
         rustc_moves,
         upvar_sources,
         move_errors: Vec::new(),
-        scrutinees: None,
         capture_temps,
         index_spans,
         assigned_local: super::return_slot(),
@@ -177,8 +176,6 @@ pub(super) fn check<'db>(
         dead_reported: FxHashSet::default(),
         reservation_reported: FxHashSet::default(),
         static_muts: static_muts(ctx, body),
-        union_literals: union_literals(ctx),
-        matched: matched(ctx),
         mut_errors: FxHashMap::default(),
         requirements: Vec::new(),
         mut_upvars,
@@ -188,9 +185,8 @@ pub(super) fn check<'db>(
     let walk = crate::timings::start();
     let (guards, guard_at) = guard_borrows(ctx, body);
     let index_borrows = index_borrows(ctx, body);
-    let tested_at = tested_at(ctx);
     let test_span = |span: MirSpan| match span {
-        MirSpan::PatId(pat) => tested_at.get(&pat).map_or(span, |&it| MirSpan::ExprId(it)),
+        MirSpan::PatId(pat) => ctx.scan.tested_at(pat).map_or(span, MirSpan::ExprId),
         _ => span,
     };
     for &block in &cfg.order {
@@ -341,37 +337,6 @@ fn member_choices(
     chosen
 }
 
-/// The `match` expressions, and what they match, whose arms test the value: rustc reads the
-/// matched place on the edge taken when no arm matches, which a match of bindings alone lacks.
-fn matched(ctx: &Ctx<'_, '_>) -> FxHashSet<ExprId> {
-    let mut found = FxHashSet::default();
-    for (expr, it) in ctx.store.exprs() {
-        if let hir_def::hir::Expr::Match { expr: scrutinee, arms } = it
-            && (arms.is_empty() || arms.iter().any(|arm| !irrefutable(ctx, arm.pat)))
-        {
-            found.insert(expr);
-            found.insert(scrutinee);
-        }
-    }
-    found
-}
-
-/// The scrutinee of the `match` each pattern of an arm is in: rustc reads a discriminant and
-/// switches on a value at the scrutinee's span, where rust-analyzer gives the pattern's.
-fn tested_at(ctx: &Ctx<'_, '_>) -> FxHashMap<hir_def::hir::PatId, ExprId> {
-    let mut found = FxHashMap::default();
-    for (_, it) in ctx.store.exprs() {
-        if let hir_def::hir::Expr::Match { expr: scrutinee, arms } = it {
-            for arm in arms.iter() {
-                ctx.store.walk_pats(arm.pat, &mut |pat| {
-                    found.insert(pat, scrutinee);
-                });
-            }
-        }
-    }
-    found
-}
-
 /// Whether `expr` is the value of a block a `let` binds to a variable: `let c = { ..; expr };`.
 fn let_bound_block_value(ctx: &Ctx<'_, '_>, expr: ExprId) -> bool {
     use hir_def::hir::Expr;
@@ -404,39 +369,6 @@ fn switched_literal(ctx: &Ctx<'_, '_>, span: MirSpan) -> bool {
         ctx.store.expr(lit),
         Expr::Literal(Literal::Bool(_) | Literal::Char(_) | Literal::Int(..) | Literal::Uint(..))
     )
-}
-
-fn irrefutable(ctx: &Ctx<'_, '_>, pat: hir_def::hir::PatId) -> bool {
-    let struct_like = || {
-        matches!(
-            ctx.infer.variant_resolution_for_pat(pat),
-            Some(hir_def::VariantId::StructId(_) | hir_def::VariantId::UnionId(_))
-        )
-    };
-    match ctx.store.pat(pat) {
-        Pat::Wild | Pat::Rest | Pat::Bind { subpat: None, .. } => true,
-        Pat::Bind { subpat: Some(inner), .. }
-        | Pat::Ref { pat: inner, .. }
-        | Pat::Box { inner }
-        | Pat::Deref { inner } => irrefutable(ctx, inner),
-        Pat::Tuple { args, .. } => args.iter().all(|&it| irrefutable(ctx, it)),
-        Pat::TupleStruct { args, .. } => {
-            struct_like() && args.iter().all(|&it| irrefutable(ctx, it))
-        }
-        Pat::Record { args, .. } => struct_like() && args.iter().all(|it| irrefutable(ctx, it.pat)),
-        _ => false,
-    }
-}
-
-fn union_literals(ctx: &Ctx<'_, '_>) -> FxHashSet<ExprId> {
-    let mut found = FxHashSet::default();
-    for (expr, it) in ctx.store.exprs() {
-        if let hir_def::hir::Expr::RecordLit { fields, .. } = it {
-            found.insert(expr);
-            found.extend(fields.iter().map(|field| field.expr));
-        }
-    }
-    found
 }
 
 /// An `E0382` of a body, as rustc buffers it with those of the other bodies of the function:
@@ -705,7 +637,6 @@ struct Checker<'a, 'b, 'db> {
     /// In a closure, the place of the closure each local a capture is copied into is.
     upvar_sources: FxHashMap<LocalId, StoredPlace>,
     move_errors: Vec<MoveError>,
-    scrutinees: Option<FxHashMap<BindingId, Option<ExprId>>>,
     /// The temporaries that hold a borrow a closure captures, with the span of the closure.
     capture_temps: FxHashMap<LocalId, MirSpan>,
     /// The index expression each index temporary is evaluated for.
@@ -725,11 +656,6 @@ struct Checker<'a, 'b, 'db> {
     /// The places a two-phase borrow's reservation was reported a conflict of, which its
     /// activation does not report again.
     reservation_reported: FxHashSet<(LocalId, Vec<PlaceElem>)>,
-    /// Record literals and the values of their fields, whose lowering assigns a field of the
-    /// literal where rustc assigns the whole of it (it matters for a union).
-    union_literals: FxHashSet<ExprId>,
-    /// The scrutinees of `match`es and the `match`es.
-    matched: FxHashSet<ExprId>,
     /// For each variable declared without `mut` borrowed mutably, its error and how many
     /// borrows it is about.
     mut_errors: FxHashMap<LocalId, (usize, usize)>,
@@ -857,7 +783,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     fn is_union_literal(&self, place: PlaceRef<'_>, span: MirSpan) -> bool {
         let MirSpan::ExprId(expr) = span else { return false };
         if !matches!(place.projection, [ProjectionElem::Field(_)])
-            || !self.union_literals.contains(&expr)
+            || !self.ctx.scan.is_union_literal(expr)
         {
             return false;
         }
@@ -936,7 +862,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             // moved out of whole is used there, before any arm tests a part of it.
             StatementKind::FakeRead(place) => {
                 if let MirSpan::ExprId(expr) = span
-                    && self.matched.contains(&expr)
+                    && self.ctx.scan.is_matched(expr)
                 {
                     let place = PlaceRef::of(place);
                     self.check_if_full_path_is_moved(location, InitAction::Use, place, span);
@@ -2919,41 +2845,6 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         result
     }
 
-    /// The expression a variable's pattern matches on, for each variable a `match`, a
-    /// `let` with a pattern or an `if let` binds.
-    fn scrutinee_of(&mut self, binding: BindingId) -> Option<Option<ExprId>> {
-        let store = self.ctx.store;
-        let map = self.scrutinees.get_or_insert_with(|| {
-            let mut map = FxHashMap::default();
-            let mut add = |pat, scrutinee: ExprId, is_let: bool| {
-                let simple = is_let && matches!(store.pat(pat), Pat::Bind { subpat: None, .. });
-                store.walk_bindings_in_pat(pat, |binding| {
-                    map.insert(binding, if simple { None } else { Some(scrutinee) });
-                });
-            };
-            for (_, expr) in store.exprs() {
-                match expr {
-                    hir_def::hir::Expr::Match { expr, arms } => {
-                        for arm in arms.iter() {
-                            add(arm.pat, expr, false);
-                        }
-                    }
-                    hir_def::hir::Expr::Let { pat, expr } => add(pat, expr, false),
-                    hir_def::hir::Expr::Block { statements, .. } => {
-                        for statement in statements.iter() {
-                            if let Statement::Let { pat, initializer: Some(init), .. } = statement {
-                                add(*pat, *init, true);
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-            }
-            map
-        });
-        map.get(&binding).copied()
-    }
-
     fn report_move_errors(&mut self) {
         let errors = std::mem::take(&mut self.move_errors);
         let mut reported_groups: FxHashSet<(ExprId, LocalId, Vec<PlaceElem>)> =
@@ -2975,7 +2866,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 && target.projection.as_slice().is_empty()
                 && let Some(&binding) = self.ctx.bindings.get(&target.local)
             {
-                match self.scrutinee_of(binding) {
+                match self.ctx.scan.scrutinee_of(binding) {
                     Some(Some(scrutinee)) => {
                         let len = match error.kind {
                             MoveErrorKind::Borrowed(len)
@@ -3079,34 +2970,18 @@ fn guard_borrows(
     body: &MirBody<'_>,
 ) -> (Vec<Guard>, FxHashMap<MirSpan, u32>) {
     use hir_def::hir::Expr;
-    let mut tested_by = FxHashMap::default();
-    let mut bound_by = FxHashMap::default();
-    let mut matches = Vec::new();
-    let mut arms_of = Vec::new();
-    for (_, expr) in ctx.store.exprs() {
-        let Expr::Match { arms, .. } = expr else { continue };
-        if arms.iter().all(|arm| arm.guard.is_none()) {
-            continue;
-        }
-        let mut guarded = Vec::new();
-        for arm in arms.iter() {
-            ctx.store.walk_pats(arm.pat, &mut |pat| {
-                tested_by.insert(pat, matches.len());
-                if matches!(ctx.store.pat(pat), Pat::Bind { .. }) {
-                    bound_by.insert(pat, (matches.len(), arm.guard.map(|_| arms_of.len())));
-                }
-            });
-            if let Some(guard) = arm.guard {
-                guarded.push((arms_of.len(), guard));
-                arms_of.push((Vec::new(), Vec::new()));
-            }
-        }
-        matches.push((Vec::new(), guarded));
-    }
+    let crate::scan::GuardedMatches { matches, tested_by, bound_by, guards: guarded } =
+        &ctx.scan.guarded;
     let mut out = FxHashMap::default();
-    if matches.is_empty() {
+    if *matches == 0 {
         return (Vec::new(), out);
     }
+    // For each `match`, the places it tests; for each guarded arm, what it binds by value and
+    // the locals of its variables.
+    let mut tested_of: Vec<Vec<(LocalId, Vec<PlaceElem>)>> =
+        (0..*matches).map(|_| Vec::new()).collect();
+    let mut arms_of: Vec<(Vec<(LocalId, Vec<PlaceElem>)>, Vec<LocalId>)> =
+        (0..guarded.len()).map(|_| (Vec::new(), Vec::new())).collect();
     let (mut guards, mut stack, mut pats) = (Vec::new(), Vec::new(), Vec::new());
     let add = |set: &mut Vec<(LocalId, Vec<PlaceElem>)>, local, projection: &[PlaceElem]| {
         if !set.iter().any(|(it, other)| *it == local && other == projection) {
@@ -3136,7 +3011,7 @@ fn guard_borrows(
                     let projection = place.projection.as_slice();
                     for (len, elem) in projection.iter().enumerate() {
                         if let ProjectionElem::Deref = elem {
-                            add(&mut matches[index].0, place.local, &projection[..len]);
+                            add(&mut tested_of[index], place.local, &projection[..len]);
                         }
                     }
                     if let Some(arm) = arm
@@ -3159,7 +3034,7 @@ fn guard_borrows(
                     .collect(),
                 _ => continue,
             };
-            let set = &mut matches[index].0;
+            let set = &mut tested_of[index];
             for place in tested {
                 let projection = place.projection.as_slice();
                 add(set, place.local, projection);
@@ -3171,35 +3046,34 @@ fn guard_borrows(
             }
         }
     }
-    for (tested, guarded) in matches {
-        for (arm, guard) in guarded {
-            let (bound, bindings) = std::mem::take(&mut arms_of[arm]);
-            if tested.is_empty() && bound.is_empty() && bindings.is_empty() {
-                continue;
-            }
-            let it = guards.len() as u32;
-            guards.push(Guard { tested: tested.clone(), bound, bindings });
-            stack.push(guard);
-            while let Some(expr) = stack.pop() {
-                out.insert(MirSpan::ExprId(expr), it);
-                match ctx.store.expr(expr) {
-                    Expr::Match { arms, .. } => pats.extend(arms.iter().map(|arm| arm.pat)),
-                    Expr::Let { pat, .. } => pats.push(pat),
-                    Expr::Block { statements, .. } => {
-                        pats.extend(statements.iter().filter_map(|statement| match statement {
-                            Statement::Let { pat, .. } => Some(*pat),
-                            _ => None,
-                        }))
-                    }
-                    _ => {}
+    for (arm, &(index, guard)) in guarded.iter().enumerate() {
+        let tested = &tested_of[index];
+        let (bound, bindings) = std::mem::take(&mut arms_of[arm]);
+        if tested.is_empty() && bound.is_empty() && bindings.is_empty() {
+            continue;
+        }
+        let it = guards.len() as u32;
+        guards.push(Guard { tested: tested.clone(), bound, bindings });
+        stack.push(guard);
+        while let Some(expr) = stack.pop() {
+            out.insert(MirSpan::ExprId(expr), it);
+            match ctx.store.expr(expr) {
+                Expr::Match { arms, .. } => pats.extend(arms.iter().map(|arm| arm.pat)),
+                Expr::Let { pat, .. } => pats.push(pat),
+                Expr::Block { statements, .. } => {
+                    pats.extend(statements.iter().filter_map(|statement| match statement {
+                        Statement::Let { pat, .. } => Some(*pat),
+                        _ => None,
+                    }))
                 }
-                for pat in pats.drain(..) {
-                    ctx.store.walk_pats(pat, &mut |pat| {
-                        out.insert(MirSpan::PatId(pat), it);
-                    });
-                }
-                ctx.store.walk_child_exprs(expr, |it| stack.push(it));
+                _ => {}
             }
+            for pat in pats.drain(..) {
+                ctx.store.walk_pats(pat, &mut |pat| {
+                    out.insert(MirSpan::PatId(pat), it);
+                });
+            }
+            ctx.store.walk_child_exprs(expr, |it| stack.push(it));
         }
     }
     (guards, out)

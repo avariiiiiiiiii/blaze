@@ -14,14 +14,17 @@ use stdx::never;
 use crate::{
     InferBodyId,
     drop::{DropGlue, has_drop_glue},
-    intrinsic::{AtomicOp, FloatWidth, Intrinsic, SimdOp, intrinsic_of},
+    intrinsic::{
+        AtomicOp, AtomicOrdering, AtomicOrders, FloatWidth, Intrinsic, SimdOp, atomic_orderings,
+        intrinsic_of,
+    },
     mir::MirLowerError,
     mir::eval::{
         Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, Interval,
         IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
         MirEvalError, MirSpan, Mutability, Origin, Result, Ty, TyKind, TypeIdOf, VTableOfBytes,
         VariantId, from_bytes, not_supported, pad16, try_const_usize,
-        machine::{Machine, Shadow},
+        machine::{Access, AtomicOrd, Machine, Shadow},
     },
     mir::location::{source_location_in_file, source_path, track_caller},
     next_solver::Region,
@@ -30,6 +33,9 @@ use crate::{
 mod arch;
 mod reflection;
 mod simd;
+mod thread;
+
+pub(super) use thread::{Process, Resume, TlsData};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvalLangItem {
@@ -427,22 +433,61 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         locals: &Locals<'db>,
         span: MirSpan,
     ) -> Result<'db, ()> {
+        if self.exec_thread_shim(as_str, args, destination, locals, span)? {
+            return Ok(());
+        }
         match as_str {
             "memcmp" => {
                 let [ptr1, ptr2, size] = args else {
                     return Err(MirEvalError::InternalError("memcmp args are not provided".into()));
                 };
-                let addr1 = Address::from_bytes(ptr1.get(self)?)?;
-                let addr2 = Address::from_bytes(ptr2.get(self)?)?;
-                let size = from_bytes!(usize, size.get(self)?);
-                let slice1 = self.read_memory(addr1, size)?;
-                let slice2 = self.read_memory(addr2, size)?;
+                let addr1 = self.read_pointer(ptr1.interval.addr)?;
+                let addr2 = self.read_pointer(ptr2.interval.addr)?;
+                let size = from_bytes!(usize, self.read_scalar(size.interval)?);
+                let slice1 = self.read_scalar(Interval::new(addr1, size))?;
+                let slice2 = self.read_scalar(Interval::new(addr2, size))?;
                 let r: i128 = match slice1.cmp(slice2) {
                     cmp::Ordering::Less => -1,
                     cmp::Ordering::Equal => 0,
                     cmp::Ordering::Greater => 1,
                 };
                 destination.write_from_bytes(self, &r.to_le_bytes()[..destination.size])
+            }
+            "memcpy" | "memmove" => {
+                let [dst, src, size] = args else {
+                    return Err(MirEvalError::InternalError(
+                        format!("{as_str} args are not provided").into(),
+                    ));
+                };
+                let dst = self.read_pointer(dst.interval.addr)?;
+                let src = self.read_pointer(src.interval.addr)?;
+                let size = from_bytes!(usize, self.read_scalar(size.interval)?);
+                self.copy_memory(dst, src, size, 1, as_str == "memmove")?;
+                self.write_pointer(destination.addr, dst)
+            }
+            "memset" => {
+                let [dst, byte, size] = args else {
+                    return Err(MirEvalError::InternalError("memset args are not provided".into()));
+                };
+                let dst = self.read_pointer(dst.interval.addr)?;
+                // The `c_int`'s low byte.
+                let Some(&byte) = self.read_scalar(byte.interval)?.first() else {
+                    return Err(MirEvalError::InternalError("memset byte is of no size".into()));
+                };
+                let size = from_bytes!(usize, self.read_scalar(size.interval)?);
+                self.write_memory_using_ref(dst, size)?.fill(byte);
+                self.write_pointer(destination.addr, dst)
+            }
+            "strlen" => {
+                let [s] = args else {
+                    return Err(MirEvalError::InternalError("strlen args are not provided".into()));
+                };
+                let s = self.read_pointer(s.interval.addr)?;
+                let mut len = 0;
+                while self.read_scalar(Interval::new(s.offset(len), 1))? != [0] {
+                    len += 1;
+                }
+                destination.write_from_bytes(self, &super::word_bytes(len))
             }
             "write" => {
                 let [fd, ptr, len] = args else {
@@ -467,84 +512,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 destination.write_from_interval(self, len.interval)?;
                 Ok(())
             }
-            "pthread_key_create" => {
-                let key = self.thread_local_storage.create_key();
-                let Some(arg0) = args.first() else {
-                    return Err(MirEvalError::InternalError(
-                        "pthread_key_create arg0 is not provided".into(),
-                    ));
-                };
-                let arg0_addr = Address::from_bytes(arg0.get(self)?)?;
-                let key_ty = if let Some((ty, ..)) = arg0.ty.as_reference_or_ptr() {
-                    ty
-                } else {
-                    return Err(MirEvalError::InternalError(
-                        "pthread_key_create arg0 is not a pointer".into(),
-                    ));
-                };
-                let arg0_interval = Interval::new(
-                    arg0_addr,
-                    self.size_of_sized(key_ty, locals, "pthread_key_create key arg")?,
-                );
-                arg0_interval.write_from_bytes(self, &key.to_le_bytes()[0..arg0_interval.size])?;
-                // return 0 as success
-                destination.write_from_bytes(self, &0u64.to_le_bytes()[0..destination.size])?;
-                Ok(())
-            }
-            "pthread_getspecific" => {
-                let Some(arg0) = args.first() else {
-                    return Err(MirEvalError::InternalError(
-                        "pthread_getspecific arg0 is not provided".into(),
-                    ));
-                };
-                let key = from_bytes!(usize, &pad16(arg0.get(self)?, IsSigned::No)[0..8]);
-                let value = self.thread_local_storage.get_key(key)?;
-                destination.write_from_bytes(self, &value.to_le_bytes()[0..destination.size])?;
-                Ok(())
-            }
-            "pthread_setspecific" => {
-                let Some(arg0) = args.first() else {
-                    return Err(MirEvalError::InternalError(
-                        "pthread_setspecific arg0 is not provided".into(),
-                    ));
-                };
-                let key = from_bytes!(usize, &pad16(arg0.get(self)?, IsSigned::No)[0..8]);
-                let Some(arg1) = args.get(1) else {
-                    return Err(MirEvalError::InternalError(
-                        "pthread_setspecific arg1 is not provided".into(),
-                    ));
-                };
-                let value = from_bytes!(u128, pad16(arg1.get(self)?, IsSigned::No));
-                self.thread_local_storage.set_key(key, value)?;
-                // return 0 as success
-                destination.write_from_bytes(self, &0u64.to_le_bytes()[0..destination.size])?;
-                Ok(())
-            }
-            "pthread_key_delete" => {
-                // we ignore this currently
-                // return 0 as success
-                destination.write_from_bytes(self, &0u64.to_le_bytes()[0..destination.size])?;
-                Ok(())
-            }
             "syscall" => {
                 let Some((id, rest)) = args.split_first() else {
                     return Err(MirEvalError::InternalError("syscall arg1 is not provided".into()));
                 };
                 let id = from_bytes!(i64, id.get(self)?);
                 self.exec_syscall(id, rest, destination, locals, span)
-            }
-            "sched_getaffinity" => {
-                let [_pid, _set_size, set] = args else {
-                    return Err(MirEvalError::InternalError(
-                        "sched_getaffinity args are not provided".into(),
-                    ));
-                };
-                let set = Address::from_bytes(set.get(self)?)?;
-                // Only enable core 0 (we are single threaded anyway), which is bitset 0x0000001
-                self.write_memory(set, &[1])?;
-                // return 0 as success
-                self.write_memory_using_ref(destination.addr, destination.size)?.fill(0);
-                Ok(())
             }
             "getenv" => {
                 let [name] = args else {
@@ -618,9 +591,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         span: MirSpan,
     ) -> Result<'db, bool> {
         match intrinsic {
-            Intrinsic::Atomic(op, _) => {
+            Intrinsic::Atomic(op, orders) => {
                 return self
-                    .exec_atomic_intrinsic(op, args, generic_args, destination, locals, span)
+                    .exec_atomic_intrinsic(op, orders, args, generic_args, destination, locals, span)
                     .map(|()| true);
             }
             Intrinsic::Simd(op) => {
@@ -817,11 +790,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::PtrOffsetFromUnsigned | Intrinsic::PtrOffsetFrom => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
-                        "wrapping_sub args are not provided".into(),
+                        "ptr_offset_from args are not provided".into(),
                     ));
                 };
-                let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
-                let rhs = i128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
+                let lhs = self.read_pointer(lhs.interval.addr)?.to_usize() as i128;
+                let rhs = self.read_pointer(rhs.interval.addr)?.to_usize() as i128;
                 let ans = lhs.wrapping_sub(rhs);
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
@@ -921,24 +894,23 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 destination.write_from_bytes(self, &result)
             }
             Intrinsic::Copy | Intrinsic::CopyNonoverlapping => {
-                let [src, dst, offset] = args else {
+                let [src, dst, count] = args else {
                     return Err(MirEvalError::InternalError(
-                        "copy_nonoverlapping args are not provided".into(),
+                        format!("{intrinsic} args are not provided").into(),
                     ));
                 };
-                let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
+                let ty = type_arg(generic_args, intrinsic)?;
+                self.copy_values(dst, src, count, ty, intrinsic == Intrinsic::Copy, locals)
+            }
+            Intrinsic::VolatileCopyMemory | Intrinsic::VolatileCopyNonoverlappingMemory => {
+                let [dst, src, count] = args else {
                     return Err(MirEvalError::InternalError(
-                        "copy_nonoverlapping generic arg is not provided".into(),
+                        format!("{intrinsic} args are not provided").into(),
                     ));
                 };
-                let src = Address::from_bytes(src.get(self)?)?;
-                let dst = Address::from_bytes(dst.get(self)?)?;
-                let offset = from_bytes!(usize, offset.get(self)?);
-                let size = self.size_of_sized(ty, locals, "copy_nonoverlapping ptr type")?;
-                let size = offset * size;
-                let src = Interval { addr: src, size };
-                let dst = Interval { addr: dst, size };
-                dst.write_from_interval(self, src)
+                let ty = type_arg(generic_args, intrinsic)?;
+                let overlapping = intrinsic == Intrinsic::VolatileCopyMemory;
+                self.copy_values(dst, src, count, ty, overlapping, locals)
             }
             Intrinsic::SliceGetUnchecked => {
                 let [slice_ptr, index] = args else {
@@ -981,7 +953,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let [ptr, offset] = args else {
                     return Err(MirEvalError::InternalError("offset args are not provided".into()));
                 };
-                let ty = if intrinsic == Intrinsic::Offset {
+                let (ty, signed) = if intrinsic == Intrinsic::Offset {
                     let Some(ty0) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                         return Err(MirEvalError::InternalError(
                             "offset generic arg is not provided".into(),

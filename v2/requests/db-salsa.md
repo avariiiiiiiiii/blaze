@@ -423,9 +423,11 @@ your current part.
 > Status: done by speed-salsa (10-29): edges are `u32` words in one database-wide array
 > (`src/graph/`), a memo holds an `EdgeSpan`, deep verify runs without a claim
 > (`deep_verify_unclaimed`, `tests/unclaimed_verify.rs`), and `MemoHeader` is 24 bytes (an
-> `AtomicU64` stamp and an 8-byte origin word). Still per memo: its box and the `MemoEntry`
-> pointer per sibling function, which memos as columns (`table/memo.rs`) would remove. Costs are
-> in the notes, "Before and after (10-29)". Not built or run.
+> `AtomicU64` stamp and an 8-byte origin word), and memos are columns (`table/memo.rs`): each
+> function's memos sit in a typed slab with one row pointer per struct slot, a slot's memo table
+> is a 4-byte row number, and replaced or removed memos are dropped at `Zalsa::reclaim_memos`
+> (new revision, `evict_values`). No box per memo, no pointer per sibling function. Costs are in
+> the notes, "Before and after (10-29)". Not built or run.
 
 ## blaze-query: `Database::get` is now `Database::pin().get` (10-29; blaze-cargo, blaze-units, blaze-tree; lane db's doc)
 

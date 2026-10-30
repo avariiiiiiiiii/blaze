@@ -11,7 +11,7 @@
 use blaze_ids::radix;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, GenericDefId, ItemContainerId, Lookup as _,
-    hir::{Pat, Statement},
+    hir::Pat,
     resolver::HasResolver as _,
     signatures::FunctionSignature,
 };
@@ -63,12 +63,12 @@ impl<'db> hir_ty::TyLoweringInferVarsCtx<'db> for InferVars<'_, 'db> {
 }
 
 /// A `let` with a type written out, in the block it is a statement of.
-#[derive(Clone, Copy)]
-struct Annotation {
-    pat: hir_def::hir::PatId,
-    type_ref: hir_def::type_ref::TypeRefId,
-    initializer: Option<hir_def::hir::ExprId>,
-    block: hir_def::hir::ExprId,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct Annotation {
+    pub(super) pat: hir_def::hir::PatId,
+    pub(super) type_ref: hir_def::type_ref::TypeRefId,
+    pub(super) initializer: Option<hir_def::hir::ExprId>,
+    pub(super) block: hir_def::hir::ExprId,
 }
 
 /// Why one region outlives another, as rustc's `ConstraintCategory`; the most interesting
@@ -1910,11 +1910,11 @@ impl<'db> Builder<'_, '_, 'db> {
     /// What a `let` with a type written out requires, as rustc's user type annotations: that
     /// the type is well-formed, and for a `_` pattern that the value has the type.
     fn annotations(&mut self) {
-        let lets = self.lets();
+        let scan = self.ctx.scan;
         self.pattern_paths();
         self.path_arguments();
         self.closure_annotations();
-        for annotation in lets {
+        for &annotation in &scan.lets {
             let (pat, initializer) = (annotation.pat, annotation.initializer);
             // A variable with a type written out has it, lifetimes and all.
             let local = match self.ctx.store.pat(pat) {
@@ -2096,30 +2096,14 @@ impl<'db> Builder<'_, '_, 'db> {
     fn path_arguments(&mut self) {
         use rustc_type_ir::inherent::GenericArg as _;
         let store = self.ctx.store;
-        let mut parent =
-            FxHashMap::with_capacity_and_hasher(store.expr_count(), Default::default());
-        for expr in store.expr_ids() {
-            store.walk_child_exprs(expr, |child| {
-                parent.insert(child, expr);
-            });
-        }
-        // A path in a closure in this body is the closure's, which proves it.
-        let owner = |mut expr| loop {
-            match parent.get(&expr) {
-                Some(&up) if matches!(store.expr(up), hir_def::hir::Expr::Closure { .. }) => {
-                    return Some(up);
-                }
-                Some(&up) => expr = up,
-                None => return None,
-            }
-        };
         let mut found = Vec::new();
         let mut items = Vec::new();
-        for (expr, it) in store.exprs() {
-            let hir_def::hir::Expr::Path(path) = it else { continue };
-            if owner(expr) != self.ctx.closure_expr {
+        // A path in a closure in this body is the closure's, which proves it.
+        for &(expr, closure) in &self.ctx.scan.spelled_paths {
+            if closure != self.ctx.closure_expr {
                 continue;
             }
+            let hir_def::hir::Expr::Path(path) = store.expr(expr) else { continue };
             if spells_generics(path)
                 && let Some(ty) = self.ctx.infer.type_of_expr.get(expr)
                 && let TyKind::FnDef(def, args) = ty.as_ref().kind()
@@ -2167,35 +2151,8 @@ impl<'db> Builder<'_, '_, 'db> {
     /// `Foo<'static>`, as rustc's user type annotation on the pattern. Only for the whole
     /// pattern of a `let` or a `match` arm, matching a variable or what the `let` reads.
     fn pattern_paths(&mut self) {
-        let spelled = |pat: Pat<'_>| match pat {
-            Pat::Record { path, .. } | Pat::TupleStruct { path, .. } | Pat::Path(path) => {
-                spells_generics(path)
-            }
-            _ => false,
-        };
-        let mut found = Vec::new();
-        for (_, expr) in self.ctx.store.exprs() {
-            match expr {
-                hir_def::hir::Expr::Block { statements, .. } => {
-                    for statement in statements.iter() {
-                        if let Statement::Let { pat, type_ref: None, initializer, .. } = statement
-                            && spelled(self.ctx.store.pat(*pat))
-                        {
-                            found.push((*pat, *initializer));
-                        }
-                    }
-                }
-                hir_def::hir::Expr::Match { expr, arms } => {
-                    for arm in arms.iter() {
-                        if spelled(self.ctx.store.pat(arm.pat)) {
-                            found.push((arm.pat, Some(expr)));
-                        }
-                    }
-                }
-                _ => (),
-            }
-        }
-        for (pat, value) in found {
+        let scan = self.ctx.scan;
+        for &(pat, value) in &scan.spelled_patterns {
             let Some(ty) = self.ctx.infer.type_of_pat.get(pat).map(|it| it.as_ref()) else {
                 continue;
             };
@@ -2421,31 +2378,11 @@ impl<'db> Builder<'_, '_, 'db> {
 
     fn annotated_locals(&self) -> FxHashMap<LocalId, Annotation> {
         let mut found = FxHashMap::default();
-        for annotation in self.lets() {
+        for &annotation in &self.ctx.scan.lets {
             if let Pat::Bind { id, subpat: None } = self.ctx.store.pat(annotation.pat)
                 && let Some(&local) = self.body.binding_locals.get(id)
             {
                 found.insert(local, annotation);
-            }
-        }
-        found
-    }
-
-    /// The `let`s with a type written out.
-    fn lets(&self) -> Vec<Annotation> {
-        let mut found = Vec::new();
-        for (block, expr) in self.ctx.store.exprs() {
-            let hir_def::hir::Expr::Block { statements, .. } = expr else { continue };
-            for statement in statements.iter() {
-                if let Statement::Let { pat, type_ref: Some(type_ref), initializer, .. } = statement
-                {
-                    found.push(Annotation {
-                        pat: *pat,
-                        type_ref: *type_ref,
-                        initializer: *initializer,
-                        block,
-                    });
-                }
             }
         }
         found
@@ -6902,7 +6839,7 @@ fn returned_opaque<'db>(
     find(output, ty)
 }
 
-fn spells_generics(path: &hir_def::expr_store::path::Path) -> bool {
+pub(super) fn spells_generics(path: &hir_def::expr_store::path::Path) -> bool {
     path.type_anchor().is_some()
         || path.generic_args().is_some_and(|args| args.iter().any(Option::is_some))
 }

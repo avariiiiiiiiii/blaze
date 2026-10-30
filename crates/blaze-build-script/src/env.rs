@@ -9,9 +9,10 @@
 //! dependencies' variables (`-Z bindeps`) and the host runner (`-Z host-config`).
 //!
 //! Built once per unit: what cargo sets is a list in the order set, names of the fixed set
-//! `&'static str` and every other name and value made at its size in one allocation; it and
-//! what cargo inherits are sorted once, by a precomputed `u64` of a name's first bytes, and
-//! the last word on each name kept. What is inherited is copied only where it is kept.
+//! `&'static str` and every other name and value made at its size in one allocation; it is
+//! sorted once, by a precomputed `u128` of a name's first bytes, the last word on each name
+//! kept, and merged with what cargo inherits, which is sorted only when the caller did not
+//! pass it sorted. What is inherited is copied only where it is kept.
 
 use std::{
     borrow::Cow,
@@ -24,7 +25,7 @@ use std::{
 use crate::{Error, unit::Unit};
 
 /// A script's whole environment, and which of it cargo sets from the unit.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct Env {
     /// Sorted by name, each name once: read in this order into the run's key and the
     /// child's environment.
@@ -151,13 +152,17 @@ impl HostOs {
                     .as_bytes()
                     .split(|it| *it == b':')
                     .map(|it| PathBuf::from(OsStr::from_bytes(it)))
+                    // alloc: setup, once per unit: the library path, split to be joined again.
                     .collect();
             }
             #[cfg(not(unix))]
+            // alloc: setup, once per unit: the library path, split to be joined again.
             return value.to_string_lossy().split(':').map(PathBuf::from).collect();
         }
         let value = value.to_string_lossy();
+        // alloc: setup, once per unit: the library path, split to be joined again.
         let mut paths = Vec::new();
+        // alloc: setup, once per unit: one buffer for each path's text.
         let mut path = String::new();
         let mut quoted = false;
         let mut after_separator = false;
@@ -190,12 +195,14 @@ impl HostOs {
                 joined.push(if self.windows { ";" } else { ":" });
             }
             if self.windows && bytes.contains(&b'"') || !self.windows && bytes.contains(&b':') {
+                // alloc: error path.
                 let mut message = format!(
                     "failed to join paths from `${var}` together\n\n\
                      Check if any of path segments listed below contain an \
                      unterminated quote character or path separator:"
                 );
                 for path in paths {
+                    // alloc: error path.
                     message.push_str(&format!("\n    {path:?}"));
                 }
                 return Err(Error(message));
@@ -253,6 +260,7 @@ fn decimal(mut n: u32) -> String {
             break;
         }
     }
+    // alloc: setup, once per unit: a number made at its length.
     digits[at..].iter().map(|it| char::from(*it)).collect()
 }
 
@@ -343,11 +351,13 @@ fn below(paths: &[PathBuf], root: &Path) -> Vec<PathBuf> {
         .map(|it| dynamic_search_path(it))
         .filter(|it| it.starts_with(root))
         .map(Path::to_owned)
+        // alloc: setup, once per unit: the plugin directories it keeps.
         .collect()
 }
 
 /// Where openssl-probe 0.1.6 looks for certificates, in order, on `host`.
 fn certificate_dirs(host: &str) -> Vec<&'static Path> {
+    // alloc: setup: once per cargo started, the directories openssl-probe looks in.
     let mut dirs = vec![
         "/var/ssl",
         "/usr/share/ssl",
@@ -370,6 +380,7 @@ fn certificate_dirs(host: &str) -> Vec<&'static Path> {
     if host.contains("haiku") {
         dirs.push("/boot/system/data/ssl");
     }
+    // alloc: setup: once per cargo started.
     dirs.into_iter().map(Path::new).collect()
 }
 
@@ -404,6 +415,7 @@ fn cargo_started_in(
     certificate_dirs: &[&Path],
 ) -> Vec<(OsString, OsString)> {
     let os = HostOs::of(host);
+    // alloc: setup: once per cargo started, the environment it begins with.
     let mut env = started_with.to_vec();
     if os.windows || os.macos {
         return env;
@@ -423,12 +435,14 @@ fn cargo_started_in(
         if cert_file.is_none() {
             cert_file = CERTIFICATE_FILES.iter().find_map(|it| {
                 let path = joined(&mut candidate, dir, it);
+                // alloc: setup: once per cargo started, a certificate path found.
                 path.exists().then(|| path.to_owned())
             });
         }
         if cert_dir.is_none() {
             let path = joined(&mut candidate, dir, "certs");
             if path.exists() {
+                // alloc: setup: once per cargo started, a certificate path found.
                 cert_dir = Some(path.to_owned());
             }
         }
@@ -482,9 +496,11 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
     let search = &unit.dylib_search;
     let mut search_path = Vec::with_capacity(search.host_deps.len() + 5);
     if let Some(host_root) = &search.host_root {
+        // alloc: setup, once per unit: the search path it sets.
         search_path.push(host_root.clone());
     }
     search_path.extend(search.host_deps.iter().cloned());
+    // alloc: setup, once per unit: the search path it sets.
     search_path.push(search.sysroot_libdir.clone());
     let dylib_path =
         inherited_var(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
@@ -524,6 +540,7 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
     // `[env]` takes nothing cargo has set, and only what cargo's environment lacks unless forced.
     for it in &unit.config_env {
         if (it.force || inherited_var(&it.name).is_none()) && !cmd.contains(&it.name) {
+            // clone: setup, once per unit: an `[env]` name it sets.
             cmd.set(it.name.clone(), &it.value);
         }
     }
@@ -605,8 +622,10 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
 
 /// A variable cargo sets (or takes away), before it is sorted.
 struct Entry {
-    /// The name's first eight bytes, big-endian: most comparisons of names end here.
-    order: u64,
+    /// The name's first sixteen bytes, big-endian: most comparisons of names end here. Eight
+    /// would tie on most of them (`CARGO_CF`, `CARGO_FE`, `CARGO_PK`); sixteen part all but
+    /// the target's cfgs, at one compare of two words.
+    order: u128,
     name: OsString,
     value: Option<OsString>,
     from_unit: bool,
@@ -617,10 +636,10 @@ struct Entry {
 impl Entry {
     fn new(name: OsString, value: Option<OsString>, from_unit: bool, seq: usize) -> Self {
         let bytes = name.as_encoded_bytes();
-        let mut first = [0u8; 8];
-        let len = bytes.len().min(8);
+        let mut first = [0u8; 16];
+        let len = bytes.len().min(16);
         first[..len].copy_from_slice(&bytes[..len]);
-        Entry { order: u64::from_be_bytes(first), name, value, from_unit, seq: seq as u32 }
+        Entry { order: u128::from_be_bytes(first), name, value, from_unit, seq: seq as u32 }
     }
 }
 
@@ -641,6 +660,7 @@ fn merged(inherited: &[(OsString, OsString)], cmd: Explicit) -> Env {
     own.dedup_by(|later, first| later.name == first.name);
 
     let order: Option<Vec<u32>> = (!inherited.is_sorted_by(|a, b| a.0 < b.0)).then(|| {
+        // alloc: setup, once per unit: the inherited order, when not passed sorted (request 6).
         let mut order: Vec<u32> = (0..inherited.len() as u32).collect();
         order.sort_unstable_by(|a, b| {
             inherited[*a as usize].0.cmp(&inherited[*b as usize].0).then(b.cmp(a))
@@ -671,6 +691,7 @@ fn merged(inherited: &[(OsString, OsString)], cmd: Explicit) -> Env {
         {
             at += 1;
             if next == Ordering::Greater {
+                // alloc: setup, once per unit: an inherited variable copied where it is kept.
                 vars.push((name.clone(), value.clone()));
                 from_unit.push(false);
                 continue;
@@ -702,7 +723,5 @@ impl Version<'_> {
     }
 }
 
-#[cfg(test)]
-mod reference;
 #[cfg(test)]
 mod tests;

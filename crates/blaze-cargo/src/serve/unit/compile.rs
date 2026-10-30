@@ -18,6 +18,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
 use blaze_units::schema::Unit;
 use hir_ty::db::HirDatabase;
+use load_cargo::v2::{ProcMacroLoadResult, ProcMacroLoadingError};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -26,7 +27,7 @@ use super::{
     files::{Mounted, Names},
     say, script,
 };
-use crate::serve::work::{Compiled, Failed, Goal, Output, Put};
+use crate::serve::work::{Compiled, Failed, Goal, Image, Output, Put};
 
 /// What a compiled unit made that later work of the job reads.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
@@ -266,14 +267,12 @@ fn kept(job: &Job, unit: usize) -> Option<Record> {
 }
 
 /// `unit` checked and, unless it is a check, compiled and linked, reading the front end through
-/// `reader`.
-pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize) -> Result<Compiled, Failed> {
+/// `reader` and relinking the kept `images`. A proc macro's compile gives its expanders
+/// ([`Compiled::macros`]).
+pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) -> Result<Compiled, Failed> {
     if let Some(record) = kept(job, unit) {
         let artifact = record.artifact.map(|it| Artifact { fresh: true, ..it });
-        if let Some(slot) = job.made.get(unit) {
-            let _ = slot.set(record.made);
-        }
-        return Ok(Compiled {
+        let mut compiled = Compiled {
             diagnostics: record.diagnostics,
             ok: record.ok,
             puts: Vec::new(),
@@ -283,11 +282,18 @@ pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize) -> Result<Com
                 .map(|(path, key, executable)| Output { path, key, executable })
                 .collect(),
             artifact,
-        });
+            macros: None,
+        };
+        compiled.macros = macros(job, unit, &compiled, &record.made);
+        if let Some(slot) = job.made.get(unit) {
+            let _ = slot.set(record.made);
+        }
+        return Ok(compiled);
     }
-    let made = make(job, reader, unit)?;
+    let made = make(job, reader, unit, images)?;
     let key = record_key(job, unit)?;
     let Made2 { mut compiled, made, natives } = made;
+    compiled.macros = macros(job, unit, &compiled, &made);
     if let Some(key) = key {
         let record = RecordRef {
             ok: compiled.ok,
@@ -313,6 +319,54 @@ struct Made2 {
     compiled: Compiled,
     made: Made,
     natives: Vec<(String, ContentId)>,
+}
+
+/// The expanders of proc-macro unit `unit` from the image it linked, for the crates that use
+/// it ([`crate::serve::work::Writer::macros`]); none for a unit that is no proc macro or did
+/// not build. blaze runs a proc macro only compiled to WebAssembly, in `blaze_macro_wasm`'s
+/// sandbox: an image of any other kind is an error naming it, which each use of its macros
+/// reports.
+fn macros(job: &Job, unit: usize, compiled: &Compiled, made: &Made) -> Option<ProcMacroLoadResult> {
+    if !compiled.ok || !job.crates.is_proc_macro(unit) {
+        return None;
+    }
+    let name = job.unit(unit).map_or("", |it| it.target.name.as_str());
+    let failed = |what: String| Some(Err(ProcMacroLoadingError::ProcMacroSrvError(what.into())));
+    let Some((path, id)) = &made.main else {
+        return failed(format!("proc macro `{name}` linked no image"));
+    };
+    let key = Key(*id);
+    let guard = blaze_cas::enter();
+    let bytes: &[u8] = match compiled.puts.iter().find(|it| it.key == key) {
+        Some(put) => &put.bytes,
+        None => match job.input.store.get(&guard, &key) {
+            Ok(Some(entry)) => entry.bytes,
+            Ok(None) => return failed(format!("proc macro `{name}`: the store has no image {path} under {key:?}")),
+            Err(corrupt) => return failed(format!("proc macro `{name}`: the image {path} in the store: {corrupt}")),
+        },
+    };
+    if !bytes.starts_with(b"\0asm") {
+        return failed(format!(
+            "proc macro `{name}` was linked as a native library ({path}); blaze runs a proc macro only \
+             compiled to WebAssembly, in its sandbox, and never loads one into its own process"
+        ));
+    }
+    let dir = job.shared.state.join("macros");
+    let at = dir.join(format!("{:x}.wasm", id));
+    if !at.exists() {
+        let written = std::fs::create_dir_all(&dir).and_then(|()| {
+            let staged = dir.join(format!("{:x}.wasm.{}", id, std::process::id()));
+            std::fs::write(&staged, bytes)?;
+            std::fs::rename(&staged, &at)
+        });
+        if let Err(error) = written {
+            return failed(format!("proc macro `{name}`: writing its module to {}: {error}", at.display()));
+        }
+    }
+    match at.to_str().map(paths::AbsPathBuf::try_from) {
+        Some(Ok(at)) => Some(blaze_macro_wasm::load(&at)),
+        _ => failed(format!("proc macro `{name}`: {} is no absolute UTF-8 path to load it from", at.display())),
+    }
 }
 
 /// The lint flags of `unit`'s rustc: cargo's `[lints]`, those of its rustflags, its
@@ -363,7 +417,7 @@ pub(crate) fn cargo_hides(message: &str) -> bool {
 
 
 
-fn make(job: &Job, reader: &UnitReader, unit: usize) -> Result<Made2, Failed> {
+fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) -> Result<Made2, Failed> {
     let u = job.unit(unit)?;
     let plan = job.plan(unit)?;
     let package = job.package(u)?;
@@ -373,11 +427,11 @@ fn make(job: &Job, reader: &UnitReader, unit: usize) -> Result<Made2, Failed> {
         ApiError::new(format!("unit {unit} (`{}`) has no crate in the front end", u.target.name), None)
     })?;
     let mounted = &job.mounted;
-    let names = Names::new(&reader.paths, mounted);
+    let names = Names::new(reader.paths(), mounted);
     let lints = CommandLine::parse(&lint_flags(u, plan, local(package.source.as_deref())))
         .map_err(|why| ApiError::new(why, Some(format!("the lint flags of `{}`", u.target.name))))?;
     let options = Options { lints, ..Options::default() };
-    let db: &dyn HirDatabase = &reader.db;
+    let db: &dyn HirDatabase = reader.db();
     let diags = blaze_diagnostics::check_crate(db, hir::Crate::from(krate), &names, &options);
     let mut sources = mounted.sources();
     let style = blaze_diagnostics::emit::Style { ansi: color, ..Default::default() };
@@ -389,7 +443,7 @@ fn make(job: &Job, reader: &UnitReader, unit: usize) -> Result<Made2, Failed> {
     let failed = diagnostics.iter().any(|it| it.level == Level::Error);
     let mut made = Made::default();
     let nothing = |diagnostics: Vec<Diagnostic>, ok: bool, made: Made| Made2 {
-        compiled: Compiled { diagnostics, ok, puts: Vec::new(), outputs: Vec::new(), artifact: None },
+        compiled: Compiled { diagnostics, ok, puts: Vec::new(), outputs: Vec::new(), artifact: None, macros: None },
         made,
         natives: Vec::new(),
     };
@@ -461,7 +515,7 @@ fn make(job: &Job, reader: &UnitReader, unit: usize) -> Result<Made2, Failed> {
                 files.push((path.to_owned(), crate_record(u, identity, &roots), false));
                 continue;
             }
-            match codegen::link(job, unit, path, &makes, &generated) {
+            match codegen::link(job, unit, path, &makes, &generated, images) {
                 Ok((bytes, read)) => {
                     natives.extend(read);
                     files.push((path.to_owned(), bytes, true));
@@ -519,7 +573,7 @@ fn make(job: &Job, reader: &UnitReader, unit: usize) -> Result<Made2, Failed> {
         (Some(path), Some(key)) => Some(artifact::artifact(u, plan, package, path, key.0, false, runs(job, unit))),
         _ => None,
     };
-    Ok(Made2 { compiled: Compiled { diagnostics, ok: true, puts, outputs, artifact }, made, natives })
+    Ok(Made2 { compiled: Compiled { diagnostics, ok: true, puts, outputs, artifact, macros: None }, made, natives })
 }
 
 /// How `unit`'s program is run: its plan's runner, and cargo's variables of it, from the build
@@ -599,8 +653,8 @@ fn ar(members: &[(&str, &[u8])]) -> Vec<u8> {
 
 /// The files of `krate`'s modules, by absolute path, sorted.
 fn crate_files(reader: &UnitReader, krate: base_db::Crate) -> Vec<String> {
-    let db: &dyn HirDatabase = &reader.db;
-    let paths = &reader.paths;
+    let db: &dyn HirDatabase = reader.db();
+    let paths = reader.paths();
     let def_map = hir_def::nameres::crate_def_map(db, krate);
     let mut out = Vec::new();
     for (_, module) in def_map.modules(db) {

@@ -67,9 +67,13 @@ use super::{Budget, IsSigned, MirEvalError, VTableMap, pad16};
 mod hooks;
 pub mod machine;
 mod shim;
+mod threads;
+mod unwind;
 
 use hooks::Hooks;
-use machine::{Access, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site, TypedCx};
+use machine::{
+    Access, EvalThread, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site, TypedCx,
+};
 
 macro_rules! from_bytes {
     // A `usize` of the target, which is as wide as what holds it.
@@ -167,14 +171,58 @@ impl TlsData {
     }
 }
 
+/// Where a call goes on once its callee returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Then {
+    /// At this block of the caller.
+    Block(BasicBlockId),
+    /// Nowhere: the callee returns `!`, and its returning is undefined behavior.
+    Diverges,
+    /// Out of the run of [`Evaluator::interpret_mir`] it is the first frame of, back to the
+    /// evaluator's own code: a constant's evaluation, a shim's callback. Nothing in such a
+    /// run can switch threads.
+    Nested,
+    /// The thread ends (or runs its next exit destructor): the callee is its start function.
+    Thread,
+    /// Unwinding goes on in the caller: the callee is a `Drop` impl the drop glue called while
+    /// a panic unwound.
+    Resume,
+}
+
 struct StackFrame<'db> {
     locals: Locals<'db>,
-    destination: Option<BasicBlockId>,
+    then: Then,
+    /// What of a drop the caller still has to do once this frame returns, before it goes on
+    /// at `then`: the rest of the drop a `Drop` impl's call is a step of, or the closure
+    /// `FnOnce::call_once` consumed.
+    drops: Vec<DropStep<'db>>,
+    /// The block the frame is at while it doesn't run: the one whose terminator called the
+    /// frame above it (where an unwinding goes on, at its cleanup), or where it goes on once
+    /// its thread runs again.
+    at: BasicBlockId,
+    /// A `catch_unwind`'s call of its `try` function: a panic unwinding to it is caught.
+    catch: Option<unwind::Catch>,
     prev_stack_ptr: usize,
     span: (MirSpan, InferBodyId<'db>),
     /// The function called, when it is not a closure or what an evaluation starts from.
     callee: Option<FunctionId>,
 }
+
+impl<'db> StackFrame<'db> {
+    fn new(
+        locals: Locals<'db>,
+        then: Then,
+        prev_stack_ptr: usize,
+        span: (MirSpan, InferBodyId<'db>),
+        callee: Option<FunctionId>,
+    ) -> Self {
+        let at = locals.body.start_block;
+        StackFrame { locals, then, drops: Vec::new(), at, catch: None, prev_stack_ptr, span, callee }
+    }
+}
+
+/// The function a frame runs and the span of its call, for errors.
+type Running<'db> = (Option<FunctionId>, (MirSpan, InferBodyId<'db>));
 
 #[derive(Clone)]
 enum MirOrDynIndex<'db> {
@@ -283,7 +331,38 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     constants: FxHashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
     code_stack: Vec<StackFrame<'db>>,
     /// The `callee` and `span` of the frame being run, which is not on `code_stack`.
-    running: Option<(Option<FunctionId>, (MirSpan, InferBodyId<'db>))>,
+    running: Option<Running<'db>>,
+    /// The body of the frame being run.
+    body_running: Option<&'db MirBody<'db>>,
+    /// Every thread made, by [`EvalThread`]; empty while only the main thread is. The running
+    /// one's state is in the fields of the evaluator (`stack`, `code_stack`, ...).
+    threads: Vec<threads::Thread<'db>>,
+    thread: EvalThread,
+    /// The runs of [`Self::interpret_mir`] in each other (1 in the outermost one); threads
+    /// switch only in the outermost.
+    nesting: u32,
+    /// What the shim of the call being made blocks the running thread on.
+    waiting: Option<threads::Wait>,
+    /// The running thread yielded at the call being made.
+    yielded: bool,
+    /// The running thread's destructors to call when its start function returns.
+    at_exit: Vec<(usize, Address)>,
+    /// The running thread's `#[thread_local]` statics, as [`Self::static_locations`].
+    thread_statics: FxHashMap<StaticId, Address>,
+    /// Every pthread key made.
+    tls_keys: Vec<threads::TlsKey>,
+    /// The virtual clock, in nanoseconds since the run started.
+    clock: u64,
+    /// Waits made so far, which orders a futex's waiters.
+    wait_counter: u64,
+    /// The running thread's panic, while it unwinds.
+    unwinding: Option<unwind::Unwinding<'db>>,
+    /// Where the call being made goes on, for a shim that makes the callee's frame itself.
+    call_then: Then,
+    /// The frame a shim made of the call being made (`drop_in_place`, `const_eval_select`).
+    pending: Option<StackFrame<'db>>,
+    /// The `#[panic_handler]` of the crate graph, once looked for.
+    panic_handler: std::cell::OnceCell<Option<FunctionId>>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
     /// and see it's missing, then we add it to this to reuse.
     static_locations: FxHashMap<StaticId, Address>,
@@ -752,6 +831,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             constants: FxHashMap::default(),
             code_stack: vec![],
             running: None,
+            body_running: None,
+            threads: Vec::new(),
+            thread: 0,
+            nesting: 0,
+            waiting: None,
+            yielded: false,
+            at_exit: Vec::new(),
+            thread_statics: FxHashMap::default(),
+            tls_keys: Vec::new(),
+            clock: 0,
+            wait_counter: 0,
+            unwinding: None,
+            call_then: Then::Nested,
+            pending: None,
+            panic_handler: std::cell::OnceCell::new(),
             vtable_map: VTableMap::default(),
             thread_local_storage: TlsData::default(),
             static_locations: Default::default(),
@@ -804,14 +898,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     fn place_interval(&self, p: &StoredPlace, locals: &Locals<'db>) -> Result<'db, Interval> {
-        let place_addr_and_ty = self.place_addr_and_ty_and_metadata(p, locals)?;
+        let (addr, ty, _) = self.place_addr_and_ty_and_metadata(p, locals)?;
         Ok(Interval {
-            addr: place_addr_and_ty.0,
-            size: self.size_of_sized(
-                place_addr_and_ty.1,
-                locals,
-                "Type of place that we need its interval",
-            )?,
+            addr,
+            size: self.size_of_sized(ty, locals, "Type of place that we need its interval")?,
         })
     }
 
@@ -865,34 +955,31 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         &'b self,
         p: &StoredPlace,
         locals: &'b Locals<'db>,
-    ) -> Result<'db, (Address, Ty<'db>, Option<IntervalOrOwned>)> {
+    ) -> Result<'db, (Address, Ty<'db>, Option<IntervalOrOwned<M::Shadow>>)> {
         let mut addr = locals.ptr[p.local].addr;
         let mut ty = PlaceTy::from_ty(locals.body.locals[p.local].ty.as_ref());
-        let mut metadata: Option<IntervalOrOwned> = None; // locals are always sized
+        let mut metadata: Option<IntervalOrOwned<M::Shadow>> = None; // locals are always sized
+        // Behind a dereference every projection is an inbounds offset of the pointer.
+        let mut behind_deref = false;
         for proj in p.projection.as_slice() {
             let prev_ty = ty;
             ty = self.projected_ty(ty, *proj);
             match proj {
                 ProjectionElem::Deref => {
+                    let size = self.ptr_size();
                     metadata = if self.size_align_of(ty.ty, locals)?.is_none() {
-                        Some(
-                            Interval { addr: addr.offset(self.ptr_size()), size: self.ptr_size() }
-                                .into(),
-                        )
+                        Some(Interval { addr: addr.offset(size).aligned(size), size }.into())
                     } else {
                         None
                     };
-                    let it = from_bytes!(usize, self.read_memory(addr, self.ptr_size())?);
-                    addr = Address::from_usize(it);
+                    addr = self.read_pointer(addr)?;
+                    behind_deref = true;
                 }
                 ProjectionElem::Index(op) => {
-                    let offset = from_bytes!(
-                        usize,
-                        self.read_memory(locals.ptr[*op].addr, self.ptr_size())?
-                    );
+                    let offset = from_bytes!(usize, self.read_scalar(locals.ptr[*op])?);
                     metadata = None; // Result of index is always sized
                     let ty_size = self.size_of_sized(ty.ty, locals, "array inner type")?;
-                    addr = addr.offset(ty_size * offset);
+                    addr = self.project(addr, ty_size * offset, behind_deref)?;
                 }
                 &ProjectionElem::ConstantIndex { from_end, offset, .. } => {
                     let offset = if from_end {
@@ -903,8 +990,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                     not_supported!("indexing array with unknown const from end")
                                 }
                             },
-                            TyKind::Slice(_) => match metadata {
-                                Some(it) => from_bytes!(usize, it.get(self)?) as u64,
+                            TyKind::Slice(_) => match &metadata {
+                                Some(it) => from_bytes!(usize, self.scalar(it)?) as u64,
                                 None => not_supported!("slice place without metadata"),
                             },
                             _ => not_supported!("bad type for const index"),
@@ -915,7 +1002,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     };
                     metadata = None; // Result of index is always sized
                     let ty_size = self.size_of_sized(ty.ty, locals, "array inner type")?;
-                    addr = addr.offset(ty_size * offset);
+                    addr = self.project(addr, ty_size * offset, behind_deref)?;
                 }
                 &ProjectionElem::Subslice { from, to } => {
                     let inner_ty = match ty.ty.kind() {
@@ -924,7 +1011,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     };
                     metadata = match metadata {
                         Some(it) => {
-                            let prev_len = from_bytes!(usize, it.get(self)?) as u64;
+                            let prev_len = from_bytes!(usize, self.scalar(&it)?) as u64;
                             Some(IntervalOrOwned::Owned(
                                 word_bytes((prev_len - from - to) as usize).to_vec(),
                             ))
@@ -932,7 +1019,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         None => None,
                     };
                     let ty_size = self.size_of_sized(inner_ty, locals, "array inner type")?;
-                    addr = addr.offset(ty_size * (from as usize));
+                    addr = self.project(addr, ty_size * (from as usize), behind_deref)?;
                 }
                 ProjectionElem::Field(f) => {
                     let layout = self.layout(prev_ty.ty)?;
@@ -955,7 +1042,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         }
                     };
                     let offset = offset.bytes_usize();
-                    addr = addr.offset(offset);
+                    addr = self.project(addr, offset, behind_deref)?;
                     // Unsized field metadata is equal to the metadata of the struct
                     if self.size_align_of(ty.ty, locals)?.is_some() {
                         metadata = None;
@@ -966,7 +1053,39 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
             }
         }
+        // An unsized place is never accessed whole (its fields and elements are places of
+        // their own), so only a sized one says its alignment.
+        if M::CHECKS
+            && let Some((_, align)) = self.size_align_of(ty.ty, locals)?
+        {
+            addr = addr.aligned(align);
+        }
         Ok((addr, ty.ty, metadata))
+    }
+
+    /// `addr` moved `by` bytes into what it points to: behind a dereference an inbounds
+    /// offset, which the machine checks; within a local otherwise.
+    #[inline(always)]
+    fn project(&self, addr: Address, by: usize, behind_deref: bool) -> Result<'db, Address> {
+        if M::CHECKS && behind_deref && by != 0 {
+            self.machine.offset(self.ptr(addr), by as i64)?;
+        }
+        Ok(addr.offset(by))
+    }
+
+    /// The bytes of a value used as a scalar (a length, an index), which must all be
+    /// initialized.
+    fn scalar<'b>(&'b self, value: &'b IntervalOrOwned<M::Shadow>) -> Result<'db, &'b [u8]> {
+        match value {
+            IntervalOrOwned::Owned(bytes) => Ok(bytes),
+            IntervalOrOwned::Shadowed(bytes, shadow) => {
+                if M::CHECKS {
+                    self.machine.require_init(shadow, 0..bytes.len())?;
+                }
+                Ok(bytes)
+            }
+            IntervalOrOwned::Borrowed(it) => self.read_scalar(*it),
+        }
     }
 
     fn layout(&self, ty: Ty<'db>) -> Result<'db, Arc<Layout>> {
@@ -985,8 +1104,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.layout(Ty::new_adt(self.interner(), adt, subst))
     }
 
+    /// The type of the place `p`, which reads no memory: the machine sees each place's
+    /// pointers read once, where it is evaluated.
     fn place_ty<'b>(&'b self, p: &StoredPlace, locals: &'b Locals<'db>) -> Result<'db, Ty<'db>> {
-        Ok(self.place_addr_and_ty_and_metadata(p, locals)?.1)
+        let mut ty = PlaceTy::from_ty(locals.body.locals[p.local].ty.as_ref());
+        for proj in p.projection.as_slice() {
+            ty = self.projected_ty(ty, *proj);
+        }
+        Ok(ty.ty)
     }
 
     /// Whether arithmetic of the body being evaluated panics when it overflows. A function's
@@ -1029,7 +1154,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn interpret_mir(
         &mut self,
         body: &'db MirBody<'db>,
-        args: impl Iterator<Item = IntervalOrOwned>,
+        args: impl Iterator<Item = IntervalOrOwned<M::Shadow>>,
         called: Option<(FunctionId, MirSpan, InferBodyId<'db>)>,
     ) -> Result<'db, Interval> {
         let depth_limit = self.stack_depth_limit;
@@ -1038,195 +1163,340 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         } else {
             return Err(MirEvalError::StackOverflow);
         }
-        let mut current_block_idx = body.start_block;
         let (mut locals, prev_stack_ptr) = self.create_locals_for_body(body, None)?;
-        self.fill_locals_for_body(body, &mut locals, args)?;
+        self.enter_frame(body, &mut locals, args, false)?;
         let prev_code_stack = mem::take(&mut self.code_stack);
         let prev_running = self.running;
+        let prev_body = self.body_running;
         let (callee, span) = match called {
             Some((callee, span, caller)) => (Some(callee), (span, caller)),
             None => (None, (MirSpan::Unknown, body.owner)),
         };
-        let frame = StackFrame { locals, destination: None, prev_stack_ptr, span, callee };
-        self.code_stack.push(frame);
-        'stack: loop {
-            let Some(mut my_stack_frame) = self.code_stack.pop() else {
+        self.code_stack.push(StackFrame::new(locals, Then::Nested, prev_stack_ptr, span, callee));
+        self.nesting += 1;
+        let result = self.run_stack(body.start_block);
+        self.nesting -= 1;
+        let my_code_stack = mem::replace(&mut self.code_stack, prev_code_stack);
+        self.running = prev_running;
+        self.body_running = prev_body;
+        self.stack_depth_limit = depth_limit;
+        result.map_err(|e| {
+            if mem::take(&mut self.escaped) {
+                return e;
+            }
+            let error_stack = my_code_stack
+                .into_iter()
+                .rev()
+                .filter_map(|frame| {
+                    let f = frame.locals.body.owner.as_function()?;
+                    Some((Either::Left(f), frame.span.0, frame.span.1))
+                })
+                .collect();
+            MirEvalError::InFunction(Box::new(e), error_stack)
+        })
+    }
+
+    /// Runs the frames of [`Self::code_stack`], the top one from `block`, until the bottom
+    /// one, which [`Self::interpret_mir`] made, returns: its return place is the result.
+    fn run_stack(&mut self, mut block: BasicBlockId) -> Result<'db, Interval> {
+        loop {
+            let Some(mut frame) = self.code_stack.pop() else {
                 not_supported!("missing stack frame");
             };
-            let frame_body = my_stack_frame.locals.body;
-            self.running = Some((my_stack_frame.callee, my_stack_frame.span));
-            let e = (|| {
-                let locals = &mut my_stack_frame.locals;
-                let body = locals.body.clone();
-                loop {
-                    let current_block = &body.basic_blocks[current_block_idx];
-                    if let Some(it) = self.steps_left.checked_sub(1) {
-                        self.steps_left = it;
-                    } else {
-                        return Err(MirEvalError::OverBudget {
-                            spent: Budget::Steps(self.budget.steps),
-                            at: None,
-                        });
-                    }
-                    for statement in &current_block.statements {
-                        self.exec_statement(statement, locals)?;
-                    }
-                    let Some(terminator) = current_block.terminator.as_ref() else {
-                        not_supported!("block without terminator");
-                    };
-                    match &terminator.kind {
-                        TerminatorKind::Assert { cond, expected, msg, target, .. } => {
-                            let holds = self.eval_operand(cond, locals)?.get(self)?[0] != 0;
-                            let skipped =
-                                msg.is_optional_overflow_check() && !self.checks_overflow(locals);
-                            if holds != *expected && !skipped {
-                                return Err(MirEvalError::Panic(self.assert_message(msg, locals)?));
-                            }
-                            current_block_idx = *target;
-                        }
-                        TerminatorKind::Goto { target } => {
-                            current_block_idx = *target;
-                        }
-                        TerminatorKind::Call {
-                            func,
-                            args,
-                            destination,
-                            target,
-                            cleanup: _,
-                            from_hir_call: _,
-                            intrinsic,
-                        } => {
-                            let destination_interval = self.place_interval(destination, locals)?;
-                            let fn_ty = self.operand_ty(func, locals)?;
-                            let args = args
-                                .iter()
-                                .map(|it| self.operand_ty_and_eval(it, locals))
-                                .collect::<Result<'db, Vec<_>>>()?;
-                            let stack_frame = match (fn_ty.kind(), *intrinsic) {
-                                (TyKind::FnPtr(..), _) => {
-                                    let bytes = self.eval_operand(func, locals)?;
-                                    self.exec_fn_pointer(
-                                        bytes,
-                                        destination_interval,
-                                        &args,
-                                        locals,
-                                        *target,
-                                        terminator.span,
-                                    )?
-                                }
-                                (TyKind::FnDef(def, generic_args), Some(intrinsic)) => {
-                                    let CallableDefId::FunctionId(def) = def.0 else {
-                                        return Err(MirEvalError::InternalError(
-                                            "an intrinsic call of a constructor".into(),
-                                        ));
-                                    };
-                                    self.exec_intrinsic_fn(
-                                        def,
-                                        intrinsic,
-                                        &args,
-                                        generic_args,
-                                        locals,
-                                        destination_interval,
-                                        *target,
-                                        terminator.span,
-                                    )?
-                                }
-                                (TyKind::FnDef(def, generic_args), None) => self.exec_fn_def(
-                                    def.0,
-                                    generic_args,
-                                    destination_interval,
-                                    &args,
-                                    locals,
-                                    *target,
-                                    terminator.span,
-                                )?,
-                                (it, _) => not_supported!("unknown function type {it:?}"),
-                            };
-                            if let Some(stack_frame) = stack_frame {
-                                if self.limits_frames {
-                                    let Some(it) = self.stack_depth_limit.checked_sub(1) else {
-                                        return Err(MirEvalError::StackOverflow);
-                                    };
-                                    self.stack_depth_limit = it;
-                                }
-                                self.code_stack.push(my_stack_frame);
-                                current_block_idx = stack_frame.locals.body.start_block;
-                                self.code_stack.push(stack_frame);
-                                return Ok(None);
-                            } else {
-                                current_block_idx =
-                                    target.ok_or(MirEvalError::UndefinedBehavior(
-                                        "Diverging function returned".to_owned(),
-                                    ))?;
-                            }
-                        }
-                        TerminatorKind::SwitchInt { discr, targets } => {
-                            let val = u128::from_le_bytes(pad16(
-                                self.eval_operand(discr, locals)?.get(self)?,
-                                IsSigned::No,
-                            ));
-                            current_block_idx = targets.target_for_value(val);
-                        }
-                        TerminatorKind::Return => {
-                            break;
-                        }
-                        TerminatorKind::Unreachable => {
-                            return Err(MirEvalError::UndefinedBehavior(
-                                "unreachable executed".to_owned(),
-                            ));
-                        }
-                        TerminatorKind::Drop { place, target, unwind: _ } => {
-                            self.drop_place(place, locals, terminator.span)?;
-                            current_block_idx = *target;
-                        }
-                        _ => not_supported!("unknown terminator"),
-                    }
-                }
-                Ok(Some(my_stack_frame))
-            })();
-            let my_stack_frame = match e {
-                Ok(None) => continue 'stack,
-                Ok(Some(x)) => x,
-                Err(mut e) => {
-                    if let MirEvalError::OverBudget { at: at @ None, .. } = &mut e {
-                        let block = &frame_body.basic_blocks[current_block_idx];
-                        let span = block.terminator.as_ref().map_or(MirSpan::Unknown, |it| it.span);
-                        *at = Some((frame_body.owner, span));
-                    }
-                    let my_code_stack = mem::replace(&mut self.code_stack, prev_code_stack);
-                    self.running = prev_running;
-                    self.stack_depth_limit = depth_limit;
-                    let mut error_stack = vec![];
-                    for frame in my_code_stack.into_iter().rev() {
-                        if let Some(f) = frame.locals.body.owner.as_function() {
-                            error_stack.push((Either::Left(f), frame.span.0, frame.span.1));
-                        }
-                    }
-                    return Err(MirEvalError::InFunction(Box::new(e), error_stack));
-                }
-            };
-            let return_interval = my_stack_frame.locals.ptr[return_slot()];
-            self.unused_locals_store
-                .borrow_mut()
-                .entry(my_stack_frame.locals.body.owner)
-                .or_default()
-                .push(my_stack_frame.locals);
-            match my_stack_frame.destination {
-                None => {
-                    self.code_stack = prev_code_stack;
-                    self.running = prev_running;
-                    self.stack_depth_limit += 1;
-                    return Ok(return_interval);
-                }
-                Some(bb) => {
+            self.running = Some((frame.callee, frame.span));
+            self.body_running = Some(frame.locals.body);
+            match self.run_frame(&mut frame, &mut block) {
+                Ok(Ran::Called(callee)) => {
                     if self.limits_frames {
-                        self.stack_depth_limit += 1;
+                        let Some(it) = self.stack_depth_limit.checked_sub(1) else {
+                            return Err(MirEvalError::StackOverflow);
+                        };
+                        self.stack_depth_limit = it;
                     }
-                    self.free_stack(my_stack_frame.prev_stack_ptr);
-                    current_block_idx = bb;
+                    frame.at = block;
+                    block = callee.locals.body.start_block;
+                    self.code_stack.push(frame);
+                    self.code_stack.push(callee);
+                }
+                Ok(Ran::Switch(next)) => {
+                    self.code_stack.push(frame);
+                    block = self.switch_thread(next, block)?;
+                }
+                Ok(Ran::Returned) => {
+                    if let Some(result) = self.returned(frame, &mut block)? {
+                        return Ok(result);
+                    }
+                }
+                Ok(Ran::Resume) => {
+                    frame.at = block;
+                    self.unwind_out(frame, &mut block)?;
+                }
+                Err(Raised { mut error, statement }) => {
+                    if let MirEvalError::OverBudget { at: at @ None, .. } = &mut error {
+                        let body = frame.locals.body;
+                        let terminator = body.basic_blocks[block].terminator.as_ref();
+                        *at = Some((body.owner, terminator.map_or(MirSpan::Unknown, |it| it.span)));
+                    }
+                    frame.at = block;
+                    self.raise(frame, &mut block, error, statement)?;
                 }
             }
         }
+    }
+
+    /// Runs `frame` from `block` until it calls, returns, unwinds or its thread gives way;
+    /// `block` is then where it goes on.
+    fn run_frame(
+        &mut self,
+        frame: &mut StackFrame<'db>,
+        block: &mut BasicBlockId,
+    ) -> std::result::Result<Ran<'db>, Raised<'db>> {
+        let body = frame.locals.body;
+        loop {
+            let current_block = &body.basic_blocks[*block];
+            if let Some(it) = self.steps_left.checked_sub(1) {
+                self.steps_left = it;
+            } else {
+                let error =
+                    MirEvalError::OverBudget { spent: Budget::Steps(self.budget.steps), at: None };
+                return Err(Raised { error, statement: None });
+            }
+            for (i, statement) in current_block.statements.iter().enumerate() {
+                self.exec_statement(statement, &mut frame.locals)
+                    .map_err(|error| Raised { error, statement: Some(i) })?;
+            }
+            let raised = |error| Raised { error, statement: None };
+            let Some(terminator) = current_block.terminator.as_ref() else {
+                return Err(raised(MirEvalError::NotSupported("block without terminator".into())));
+            };
+            if M::CHECKS {
+                self.machine.step(Site { owner: body.owner, span: terminator.span });
+            }
+            if let Some(ran) = self.exec_terminator(terminator, frame, block).map_err(raised)? {
+                return Ok(ran);
+            }
+            if let Some(next) = self.pick_at_terminator().map_err(raised)? {
+                return Ok(Ran::Switch(Some(next)));
+            }
+        }
+    }
+
+    /// Runs `terminator` of the block `block` names, which it sets to the block that runs
+    /// next when the frame goes on.
+    fn exec_terminator(
+        &mut self,
+        terminator: &'db Terminator,
+        frame: &mut StackFrame<'db>,
+        block: &mut BasicBlockId,
+    ) -> Result<'db, Option<Ran<'db>>> {
+        let locals = &mut frame.locals;
+        match &terminator.kind {
+            TerminatorKind::Assert { cond, expected, msg, target, .. } => {
+                let cond = self.eval_operand(cond, locals)?;
+                let holds = self.read_scalar(cond)?[0] != 0;
+                let skipped = msg.is_optional_overflow_check() && !self.checks_overflow(locals);
+                if holds != *expected && !skipped {
+                    return Err(MirEvalError::Panic(self.assert_message(msg, locals)?));
+                }
+                *block = *target;
+            }
+            TerminatorKind::Goto { target } => *block = *target,
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                target,
+                cleanup: _,
+                from_hir_call: _,
+                intrinsic,
+            } => {
+                return self.exec_call(
+                    func,
+                    args,
+                    destination,
+                    *target,
+                    *intrinsic,
+                    terminator.span,
+                    locals,
+                    block,
+                );
+            }
+            TerminatorKind::SwitchInt { discr, targets } => {
+                let discr = self.eval_operand(discr, locals)?;
+                let val = u128::from_le_bytes(pad16(self.read_scalar(discr)?, IsSigned::No));
+                *block = targets.target_for_value(val);
+            }
+            TerminatorKind::Return => return Ok(Some(Ran::Returned)),
+            TerminatorKind::Unreachable => {
+                return Err(MirEvalError::UndefinedBehavior("unreachable executed".to_owned()));
+            }
+            TerminatorKind::Drop { place, target, unwind: _ } => {
+                if let Some(callee) =
+                    self.drop_place(place, locals, terminator.span, Then::Block(*target))?
+                {
+                    return Ok(Some(Ran::Called(callee)));
+                }
+                *block = *target;
+            }
+            TerminatorKind::UnwindResume => return Ok(Some(Ran::Resume)),
+            TerminatorKind::Abort => return Err(unwind::abort(self.unwind_reason(locals.body))),
+            _ => not_supported!("unknown terminator"),
+        }
+        Ok(None)
+    }
+
+    /// A `Call` terminator: what it calls runs as a frame of its own, as a shim, or blocks
+    /// the running thread (its shim set [`Self::waiting`]).
+    fn exec_call(
+        &mut self,
+        func: &'db Operand,
+        args: &'db [Operand],
+        destination: &'db StoredPlace,
+        target: Option<BasicBlockId>,
+        intrinsic: Option<Intrinsic>,
+        span: MirSpan,
+        locals: &mut Locals<'db>,
+        block: &mut BasicBlockId,
+    ) -> Result<'db, Option<Ran<'db>>> {
+        let destination_interval = self.place_interval(destination, locals)?;
+        let fn_ty = self.operand_ty(func, locals)?;
+        let args_evaluated =
+            args.iter().map(|it| self.operand_ty_and_eval(it, locals)).collect::<Result<'db, Vec<_>>>()?;
+        if M::CHECKS {
+            self.moved_args.clear();
+            for (operand, arg) in args.iter().zip(&args_evaluated) {
+                if matches!(operand.kind, OperandKind::Move(_)) && arg.interval.size != 0 {
+                    self.moved_args.push(arg.interval);
+                }
+            }
+        }
+        let then = target.map_or(Then::Diverges, Then::Block);
+        self.call_then = then;
+        let callee = match (fn_ty.kind(), intrinsic) {
+            (TyKind::FnPtr(..), _) => {
+                let bytes = self.eval_operand(func, locals)?;
+                self.exec_fn_pointer(bytes, destination_interval, &args_evaluated, locals, then, span)?
+            }
+            (TyKind::FnDef(def, generic_args), Some(intrinsic)) => {
+                let CallableDefId::FunctionId(def) = def.0 else {
+                    return Err(MirEvalError::InternalError(
+                        "an intrinsic call of a constructor".into(),
+                    ));
+                };
+                self.exec_intrinsic_fn(
+                    def,
+                    intrinsic,
+                    &args_evaluated,
+                    generic_args,
+                    locals,
+                    destination_interval,
+                    then,
+                    span,
+                )?
+            }
+            (TyKind::FnDef(def, generic_args), None) => self.exec_fn_def(
+                def.0,
+                generic_args,
+                destination_interval,
+                &args_evaluated,
+                locals,
+                then,
+                span,
+            )?,
+            (it, _) => not_supported!("unknown function type {it:?}"),
+        };
+        self.moved_args.clear();
+        self.call_then = Then::Nested;
+        if let Some(callee) = callee.or_else(|| self.pending.take()) {
+            return Ok(Some(Ran::Called(callee)));
+        }
+        if self.unwinding.is_some() && self.raised_by_shim {
+            self.raised_by_shim = false;
+            return Err(MirEvalError::Panic(String::new()));
+        }
+        let Some(target) = target else {
+            return Err(MirEvalError::UndefinedBehavior("Diverging function returned".to_owned()));
+        };
+        *block = target;
+        if let Some(wait) = self.waiting.take() {
+            if self.block_call(wait, destination_interval)? {
+                return Ok(Some(Ran::Switch(None)));
+            }
+        } else if mem::take(&mut self.yielded) && self.may_switch() {
+            return Ok(Some(Ran::Switch(None)));
+        }
+        Ok(None)
+    }
+
+    /// `frame` returned; `block` is set to where its caller goes on. The result of the run
+    /// when `frame` is the bottom one of [`Self::interpret_mir`].
+    fn returned(
+        &mut self,
+        frame: StackFrame<'db>,
+        block: &mut BasicBlockId,
+    ) -> Result<'db, Option<Interval>> {
+        self.machine.ret()?;
+        let return_interval = frame.locals.ptr[return_slot()];
+        let StackFrame { locals, then, drops, prev_stack_ptr, .. } = frame;
+        self.unused_locals_store.borrow_mut().entry(locals.body.owner).or_default().push(locals);
+        if then == Then::Nested {
+            return Ok(Some(return_interval));
+        }
+        if self.limits_frames {
+            self.stack_depth_limit += 1;
+        }
+        self.free_stack(prev_stack_ptr)?;
+        match then {
+            Then::Block(target) => {
+                *block = target;
+                self.finish_drops(drops, then, block)?;
+            }
+            Then::Diverges => {
+                return Err(MirEvalError::UndefinedBehavior(
+                    "Diverging function returned".to_owned(),
+                ));
+            }
+            Then::Thread => *block = self.thread_returned(return_interval)?,
+            Then::Resume => {
+                if !self.finish_drops(drops, then, block)? {
+                    let Some(caller) = self.code_stack.pop() else {
+                        not_supported!("unwinding with no frame to resume");
+                    };
+                    self.unwind_from(caller, block)?;
+                }
+            }
+            Then::Nested => unreachable!("handled above"),
+        }
+        Ok(None)
+    }
+
+    /// The rest of a drop a frame that returned was a step of, in its caller (the top of
+    /// [`Self::code_stack`]): the next `Drop` impl it calls becomes a frame going on at
+    /// `then`, with `block` set to where it starts. Whether such a frame was made.
+    fn finish_drops(
+        &mut self,
+        drops: Vec<DropStep<'db>>,
+        then: Then,
+        block: &mut BasicBlockId,
+    ) -> Result<'db, bool> {
+        if drops.is_empty() {
+            return Ok(false);
+        }
+        let Some(mut caller) = self.code_stack.pop() else {
+            not_supported!("a drop with no frame to finish it in");
+        };
+        let span = caller.span.0;
+        let callee = self.drop_steps(drops, &caller.locals, span, then)?;
+        let made = callee.is_some();
+        if let Some(callee) = callee {
+            caller.at = *block;
+            *block = callee.locals.body.start_block;
+            self.code_stack.push(caller);
+            self.code_stack.push(callee);
+        } else {
+            self.code_stack.push(caller);
+        }
+        Ok(made)
     }
 
     fn exec_statement(
@@ -1234,20 +1504,55 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         statement: &'db Statement,
         locals: &mut Locals<'db>,
     ) -> Result<'db, ()> {
+        if M::CHECKS {
+            self.machine.step(Site { owner: locals.body.owner, span: statement.span });
+        }
         match &statement.kind {
             StatementKind::Assign(l, r) => {
                 let addr = self.place_addr(l, locals)?;
                 let result = self.eval_rvalue(r, locals)?;
                 self.copy_from_interval_or_owned(addr, result)?;
+                if M::CHECKS {
+                    self.typed_assign(l, addr, r, locals)?;
+                }
             }
             StatementKind::Deinit(_) => not_supported!("de-init statement"),
             StatementKind::InlineAsm(_) => not_supported!("inline assembly"),
-            StatementKind::StorageLive(_)
-            | StatementKind::FakeRead(_)
-            | StatementKind::StorageDead(_)
-            | StatementKind::Nop => (),
+            &StatementKind::StorageLive(local) => self.set_storage(local, locals, true)?,
+            &StatementKind::StorageDead(local) => self.set_storage(local, locals, false)?,
+            StatementKind::FakeRead(_) | StatementKind::Nop => (),
         }
         Ok(())
+    }
+
+    /// The typed copy an `Assign` of `r` to `place` (at `addr`) is: the machine checks the
+    /// value at the place's type and retags what it holds, by the mode of the notes' table
+    /// (`docs/v2/plan/lanes/safety/notes.md`, "Retags without Retag statements").
+    fn typed_assign(
+        &self,
+        place: &StoredPlace,
+        addr: Address,
+        r: &Rvalue,
+        locals: &Locals<'db>,
+    ) -> Result<'db, ()> {
+        let ty = self.place_ty(place, locals)?;
+        let mode = match r {
+            // `&raw` is lowered as a `Ref` to a raw pointer.
+            Rvalue::Ref(..) if matches!(ty.kind(), TyKind::RawPtr(..)) => RetagMode::Raw,
+            Rvalue::Ref(super::BorrowKind::Mut { kind: super::MutBorrowKind::TwoPhasedBorrow }, _) => {
+                RetagMode::TwoPhase
+            }
+            _ => RetagMode::Default,
+        };
+        let size = self.size_of_sized(ty, locals, "the place of an assignment")?;
+        let bytes = self.peek_memory(addr, size)?;
+        let cx = TypedCx {
+            db: self.db,
+            env: self.param_env,
+            target: self.target_data_layout,
+            vtables: &self.vtable_map,
+        };
+        self.machine.typed(&cx, self.ptr(addr), ty, bytes, mode)
     }
 
     /// Gives back the stack above `len`, of the frames that returned: nothing points there
@@ -1431,22 +1736,23 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         &mut self,
         r: &Rvalue,
         locals: &mut Locals<'db>,
-    ) -> Result<'db, IntervalOrOwned> {
+    ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
         use IntervalOrOwned::*;
         Ok(match r {
             Rvalue::Use(it) => Borrowed(self.eval_operand(it, locals)?),
             Rvalue::Ref(_, p) => {
                 let (addr, _, metadata) = self.place_addr_and_ty_and_metadata(p, locals)?;
-                let mut r = addr.to_bytes().to_vec();
-                if let Some(metadata) = metadata {
-                    r.extend(metadata.get(self)?);
-                }
-                Owned(r)
+                self.pointer_value(addr, metadata.as_ref())?
             }
             Rvalue::Len(p) => {
                 let (_, _, metadata) = self.place_addr_and_ty_and_metadata(p, locals)?;
                 match metadata {
-                    Some(m) => m,
+                    Some(m) => {
+                        if M::CHECKS {
+                            self.scalar(&m)?;
+                        }
+                        m
+                    }
                     None => {
                         return Err(MirEvalError::InternalError(
                             "type without metadata is used for Rvalue::Len".into(),
@@ -1455,13 +1761,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
             }
             Rvalue::UnaryOp(op, val) => {
-                let mut c = self.eval_operand(val, locals)?.get(self)?;
+                let mut value = self.eval_operand(val, locals)?;
                 let mut ty = self.operand_ty(val, locals)?;
                 while let TyKind::Ref(_, z, _) = ty.kind() {
                     ty = z;
-                    let size = self.size_of_sized(ty, locals, "operand of unary op")?;
-                    c = self.read_memory(Address::from_bytes(c)?, size)?;
+                    let (size, align) = self.size_align_of_sized(ty, locals, "operand of unary op")?;
+                    value = Interval::new(self.read_pointer(value.addr)?.aligned(align), size);
                 }
+                let c = self.read_scalar(value)?;
                 if let TyKind::Float(f) = ty.kind() {
                     match f {
                         rustc_type_ir::FloatTy::F16 => {
@@ -1506,49 +1813,51 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Rvalue::CheckedBinaryOp(op, lhs, rhs) | Rvalue::BinaryOp(op, lhs, rhs) => 'binary_op: {
                 // In runtime MIR the checks are `Assert`s before the operation, which wraps.
                 let checked = matches!(r, Rvalue::CheckedBinaryOp(..));
-                let lc = self.eval_operand(lhs, locals)?;
-                let rc = self.eval_operand(rhs, locals)?;
-                let mut lc = lc.get(self)?;
-                let mut rc = rc.get(self)?;
+                let mut lv = self.eval_operand(lhs, locals)?;
+                let mut rv = self.eval_operand(rhs, locals)?;
                 let mut ty = self.operand_ty(lhs, locals)?;
                 while let TyKind::Ref(_, z, _) = ty.kind() {
                     ty = z;
                     // A string or byte string pattern: the lengths, then the bytes. Elements
                     // without padding are equal exactly when their bytes are.
                     let element = match ty.kind() {
-                        TyKind::Str => Some(1),
+                        TyKind::Str => Some((1, 1)),
                         TyKind::Slice(element)
                             if matches!(
                                 element.kind(),
                                 TyKind::Int(_) | TyKind::Uint(_) | TyKind::Bool | TyKind::Char
                             ) =>
                         {
-                            Some(self.size_of_sized(element, locals, "element of a slice")?)
+                            Some(self.size_align_of_sized(element, locals, "element of a slice")?)
                         }
                         _ => None,
                     };
-                    let size = if let Some(element) = element {
+                    let size = if let Some((element, element_align)) = element {
                         if *op != BinOp::Eq {
                             return Err(MirEvalError::NotSupported(
                                 "Only eq is builtin for `str` and slices".to_owned(),
                             ));
                         }
-                        let ls = from_bytes!(usize, &lc[self.ptr_size()..self.ptr_size() * 2]);
-                        let rs = from_bytes!(usize, &rc[self.ptr_size()..self.ptr_size() * 2]);
+                        let ps = self.ptr_size();
+                        let ls = from_bytes!(usize, self.read_scalar(lv.slice(ps..ps * 2))?);
+                        let rs = from_bytes!(usize, self.read_scalar(rv.slice(ps..ps * 2))?);
                         if ls != rs {
                             break 'binary_op Owned(vec![0]);
                         }
-                        lc = &lc[..self.ptr_size()];
-                        rc = &rc[..self.ptr_size()];
-                        lc = self.read_memory(Address::from_bytes(lc)?, ls * element)?;
-                        rc = self.read_memory(Address::from_bytes(rc)?, ls * element)?;
+                        let la = self.read_pointer(lv.addr)?.aligned(element_align);
+                        let ra = self.read_pointer(rv.addr)?.aligned(element_align);
+                        let lc = self.read_scalar(Interval::new(la, ls * element))?;
+                        let rc = self.read_scalar(Interval::new(ra, ls * element))?;
                         break 'binary_op Owned(vec![u8::from(lc == rc)]);
                     } else {
-                        self.size_of_sized(ty, locals, "operand of binary op")?
+                        self.size_align_of_sized(ty, locals, "operand of binary op")?
                     };
-                    lc = self.read_memory(Address::from_bytes(lc)?, size)?;
-                    rc = self.read_memory(Address::from_bytes(rc)?, size)?;
+                    let (size, align) = size;
+                    lv = Interval::new(self.read_pointer(lv.addr)?.aligned(align), size);
+                    rv = Interval::new(self.read_pointer(rv.addr)?.aligned(align), size);
                 }
+                let lc = self.read_scalar(lv)?;
+                let rc = self.read_scalar(rv)?;
                 if let TyKind::Float(f) = ty.kind() {
                     match f {
                         rustc_type_ir::FloatTy::F16 => {
@@ -1777,8 +2086,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             Rvalue::Discriminant(p) => {
                 let ty = self.place_ty(p, locals)?;
-                let bytes = self.eval_place(p, locals)?.get(self)?;
-                let result = self.compute_discriminant(ty, bytes)?;
+                let place = self.eval_place(p, locals)?;
+                let result = self.read_discriminant(ty, place)?;
                 Owned(result.to_le_bytes().to_vec())
             }
             Rvalue::Repeat(it, len) => {
@@ -1786,9 +2095,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     Some(it) => it as usize,
                     None => not_supported!("non evaluatable array len in repeat Rvalue"),
                 };
-                let val = self.eval_operand(it, locals)?.get(self)?;
-                let size = len * val.len();
-                Owned(val.iter().copied().cycle().take(size).collect())
+                let value = self.eval_operand(it, locals)?;
+                let (val, shadow) = self.read_shadowed(value.addr, value.size)?;
+                let bytes = val.iter().copied().cycle().take(len * val.len()).collect();
+                if !M::CHECKS {
+                    return Ok(Owned(bytes));
+                }
+                let mut repeated = M::Shadow::default();
+                for i in 0..len {
+                    repeated.put(i * value.size, &shadow);
+                }
+                Shadowed(bytes, repeated)
             }
             Rvalue::CopyForDeref(_) => not_supported!("copy for deref"),
             Rvalue::Aggregate(kind, values) => {
@@ -1798,21 +2115,19 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     .collect::<Result<'db, Vec<_>>>()?;
                 match kind {
                     AggregateKind::Array(_) => {
-                        let mut r = vec![];
-                        for it in values {
-                            let value = it.get(self)?;
-                            r.extend(value);
-                        }
-                        Owned(r)
+                        let size = values.iter().map(|it| it.size).sum();
+                        let mut offset = 0;
+                        let fields = values.iter().map(|&it| {
+                            let at = offset;
+                            offset += it.size;
+                            (at, it)
+                        });
+                        self.construct_shadowed(size, None, fields)?
                     }
                     AggregateKind::Tuple(ty) => {
                         let layout = self.layout(ty.as_ref())?;
-                        Owned(self.construct_with_layout(
-                            layout.size.bytes_usize(),
-                            &layout,
-                            None,
-                            values.iter().map(|&it| it.into()),
-                        )?)
+                        let fields = Self::fields_at(&layout, &values);
+                        self.construct_shadowed(layout.size.bytes_usize(), None, fields)?
                     }
                     AggregateKind::Union(it, f) => {
                         let layout = self.layout_adt((*it).into(), GenericArgs::empty())?;
@@ -1820,29 +2135,19 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             .fields
                             .offset(u32::from(f.local_id.into_raw()) as usize)
                             .bytes_usize();
-                        let op = values[0].get(self)?;
-                        let mut result = vec![0; layout.size.bytes_usize()];
-                        result[offset..offset + op.len()].copy_from_slice(op);
-                        Owned(result)
+                        let fields = iter::once((offset, values[0]));
+                        self.construct_shadowed(layout.size.bytes_usize(), None, fields)?
                     }
                     AggregateKind::Adt(it, subst) => {
                         let (size, variant_layout, tag) =
                             self.layout_of_variant(*it, subst.as_ref(), locals)?;
-                        Owned(self.construct_with_layout(
-                            size,
-                            &variant_layout,
-                            tag,
-                            values.iter().map(|&it| it.into()),
-                        )?)
+                        let fields = Self::fields_at(&variant_layout, &values);
+                        self.construct_shadowed(size, tag, fields)?
                     }
                     AggregateKind::Closure(ty) => {
                         let layout = self.layout(ty.as_ref())?;
-                        Owned(self.construct_with_layout(
-                            layout.size.bytes_usize(),
-                            &layout,
-                            None,
-                            values.iter().map(|&it| it.into()),
-                        )?)
+                        let fields = Self::fields_at(&layout, &values);
+                        self.construct_shadowed(layout.size.bytes_usize(), None, fields)?
                     }
                 }
             }
@@ -1875,26 +2180,48 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     }
                 },
                 CastKind::DynStar => not_supported!("dyn star cast"),
+                // A thin pointer of a wide one: its address and provenance, without the metadata.
+                CastKind::PtrToPtr => {
+                    let value = self.eval_operand(operand, locals)?;
+                    let dest_size =
+                        self.size_of_sized(target_ty.as_ref(), locals, "destination of ptr cast")?;
+                    Borrowed(value.slice(0..dest_size))
+                }
                 CastKind::IntToInt
-                | CastKind::PtrToPtr
                 | CastKind::PointerExposeAddress
                 | CastKind::PointerFromExposedAddress => {
                     let current_ty = self.operand_ty(operand, locals)?;
                     let is_signed = matches!(current_ty.kind(), TyKind::Int(_)).into();
-                    let current = pad16(self.eval_operand(operand, locals)?.get(self)?, is_signed);
+                    let value = self.eval_operand(operand, locals)?;
                     let dest_size = self.size_of_sized(
                         target_ty.as_ref(),
                         locals,
                         "destination of int to int cast",
                     )?;
-                    Owned(current[0..dest_size].to_vec())
+                    let (bytes, shadow) = self.read_shadowed(value.addr, value.size)?;
+                    if M::CHECKS {
+                        self.machine.require_init(&shadow, 0..value.size)?;
+                        if *kind == CastKind::PointerExposeAddress {
+                            let prov = shadow.prov_at(0, value.size);
+                            let addr = u128::from_le_bytes(pad16(bytes, IsSigned::No)) as u64;
+                            self.machine.expose(Ptr { addr, prov })?;
+                        }
+                    }
+                    let bytes = pad16(bytes, is_signed)[0..dest_size].to_vec();
+                    if M::CHECKS && *kind == CastKind::PointerFromExposedAddress {
+                        let addr = u128::from_le_bytes(pad16(&bytes, IsSigned::No)) as u64;
+                        let prov = self.machine.from_exposed(addr);
+                        return Ok(Shadowed(bytes, M::Shadow::pointer(dest_size, prov)));
+                    }
+                    Owned(bytes)
                 }
                 CastKind::FloatToInt => {
                     let ty = self.operand_ty(operand, locals)?;
                     let TyKind::Float(ty) = ty.kind() else {
                         not_supported!("invalid float to int cast");
                     };
-                    let value = self.eval_operand(operand, locals)?.get(self)?;
+                    let value = self.eval_operand(operand, locals)?;
+                    let value = self.read_scalar(value)?;
                     let is_signed = matches!(target_ty.as_ref().kind(), TyKind::Int(_));
                     let dest_size = self.size_of_sized(
                         target_ty.as_ref(),
@@ -1951,7 +2278,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let TyKind::Float(ty) = ty.kind() else {
                         not_supported!("invalid float to int cast");
                     };
-                    let value = self.eval_operand(operand, locals)?.get(self)?;
+                    let value = self.eval_operand(operand, locals)?;
+                    let value = self.read_scalar(value)?;
                     let TyKind::Float(target_ty) = target_ty.as_ref().kind() else {
                         not_supported!("invalid float to float cast");
                     };
@@ -1988,7 +2316,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 CastKind::IntToFloat => {
                     let current_ty = self.operand_ty(operand, locals)?;
                     let is_signed = matches!(current_ty.kind(), TyKind::Int(_)).into();
-                    let value = pad16(self.eval_operand(operand, locals)?.get(self)?, is_signed);
+                    let value = self.eval_operand(operand, locals)?;
+                    let value = pad16(self.read_scalar(value)?, is_signed);
                     let value = i128::from_le_bytes(value);
                     let TyKind::Float(target_ty) = target_ty.as_ref().kind() else {
                         not_supported!("invalid int to float cast");
@@ -2019,13 +2348,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     }
                 }
                 // The pointer keeps the function's id, like the fn pointer it came from.
-                CastKind::FnPtrToPtr => {
-                    Owned(self.eval_operand(operand, locals)?.get(self)?.to_vec())
-                }
-                // The same bytes as the other type, of the same size.
-                CastKind::Transmute => {
-                    Owned(self.eval_operand(operand, locals)?.get(self)?.to_vec())
-                }
+                CastKind::FnPtrToPtr => Borrowed(self.eval_operand(operand, locals)?),
+                // The same bytes as the other type, of the same size, each with its shadow.
+                CastKind::Transmute => Borrowed(self.eval_operand(operand, locals)?),
             },
             Rvalue::ThreadLocalRef(n) | Rvalue::AddressOf(n) | Rvalue::NullaryOp(n) => match *n {},
         })
@@ -2145,7 +2470,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         addr: Interval,
         current_ty: Ty<'db>,
         target_ty: Ty<'db>,
-    ) -> Result<'db, IntervalOrOwned> {
+    ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
         fn for_ptr<'db>(it: TyKind<'db>) -> Option<Ty<'db>> {
             match it {
                 TyKind::RawPtr(ty, _) | TyKind::Ref(_, ty, _) => Some(ty),
@@ -2164,8 +2489,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         target_ty: Ty<'db>,
         current_ty: Ty<'db>,
         addr: Interval,
-    ) -> Result<'db, IntervalOrOwned> {
-        use IntervalOrOwned::*;
+    ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
         Ok(match &target_ty.kind() {
             TyKind::Slice(_) => match &current_ty.kind() {
                 TyKind::Array(_, size) => {
@@ -2175,11 +2499,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         }
                         Some(it) => it as usize,
                     };
-                    let mut r = Vec::with_capacity(16);
-                    let addr = addr.get(self)?;
-                    r.extend(addr.iter().copied());
-                    r.extend(word_bytes(len));
-                    Owned(r)
+                    self.with_metadata(addr, &word_bytes(len))?
                 }
                 t => {
                     not_supported!("slice unsizing from non array type {t:?}")
@@ -2187,11 +2507,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             },
             TyKind::Dynamic(..) => {
                 let vtable = self.vtable_map.id(current_ty);
-                let mut r = Vec::with_capacity(16);
-                let addr = addr.get(self)?;
-                r.extend(addr.iter().copied());
-                r.extend(word_bytes(vtable));
-                Owned(r)
+                self.with_metadata(addr, &word_bytes(vtable))?
             }
             TyKind::Adt(adt_def, target_subst) => match &current_ty.kind() {
                 TyKind::Adt(current_adt_def, current_subst) => {
@@ -2227,6 +2543,23 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             },
             _ => not_supported!("unknown unsized cast"),
         })
+    }
+
+    /// The pointer at `ptr` made wide by `metadata`, keeping what the machine knows of it.
+    fn with_metadata(
+        &self,
+        ptr: Interval,
+        metadata: &[u8],
+    ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
+        let (bytes, mut shadow) = self.read_shadowed(ptr.addr, ptr.size)?;
+        let mut r = Vec::with_capacity(bytes.len() + metadata.len());
+        r.extend_from_slice(bytes);
+        r.extend_from_slice(metadata);
+        if !M::CHECKS {
+            return Ok(IntervalOrOwned::Owned(r));
+        }
+        shadow.put(ptr.size, &M::Shadow::init(metadata.len()));
+        Ok(IntervalOrOwned::Shadowed(r, shadow))
     }
 
     fn layout_of_variant(
@@ -2323,6 +2656,77 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok(result)
     }
 
+    /// The fields `values` of a value of `layout`, each with its offset.
+    fn fields_at<'a>(
+        layout: &'a Layout,
+        values: &'a [Interval],
+    ) -> impl Iterator<Item = (usize, Interval)> + 'a {
+        values.iter().enumerate().map(|(i, &it)| (layout.fields.offset(i).bytes_usize(), it))
+    }
+
+    /// [`Self::construct_with_layout`] of `fields` given with their offsets, with what the
+    /// machine knows of each field's bytes: what no field or tag covers (padding, the rest of
+    /// a union) is uninitialized to it.
+    fn construct_shadowed(
+        &self,
+        size: usize,
+        tag: Option<(usize, usize, i128)>,
+        fields: impl Iterator<Item = (usize, Interval)>,
+    ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
+        let mut result = vec![0; size];
+        let mut shadow = M::Shadow::default();
+        if let Some((offset, tag_size, value)) = tag {
+            match result.get_mut(offset..offset + tag_size) {
+                Some(it) => it.copy_from_slice(&value.to_le_bytes()[0..tag_size]),
+                None => {
+                    return Err(MirEvalError::InternalError(
+                        format!(
+                            "encoded tag ({offset}, {tag_size}, {value}) is out of bounds 0..{size}"
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            if M::CHECKS {
+                shadow.put(offset, &M::Shadow::init(tag_size));
+            }
+        }
+        for (offset, field) in fields {
+            let (bytes, field_shadow) = self.read_shadowed(field.addr, field.size)?;
+            match result.get_mut(offset..offset + bytes.len()) {
+                Some(it) => it.copy_from_slice(bytes),
+                None => {
+                    return Err(MirEvalError::InternalError(
+                        format!("field offset ({offset}) is out of bounds 0..{size}").into(),
+                    ));
+                }
+            }
+            if M::CHECKS {
+                shadow.put(offset, &field_shadow);
+            }
+        }
+        if !M::CHECKS {
+            return Ok(IntervalOrOwned::Owned(result));
+        }
+        // A `put` past the end leaves the bytes it skips uninitialized.
+        shadow.put(size, &M::Shadow::init(0));
+        Ok(IntervalOrOwned::Shadowed(result, shadow))
+    }
+
+    /// The discriminant of the value of `ty` at `place`, whose tag must be initialized.
+    fn read_discriminant(&self, ty: Ty<'db>, place: Interval) -> Result<'db, i128> {
+        let (bytes, shadow) = self.read_shadowed(place.addr, place.size)?;
+        if M::CHECKS {
+            let layout = self.layout(ty)?;
+            if let Variants::Multiple { tag, .. } = &layout.variants {
+                let at = layout.fields.offset(0).bytes_usize();
+                let size = tag.size(self.target_data_layout).bytes_usize();
+                self.machine.require_init(&shadow, at..at + size)?;
+            }
+        }
+        self.compute_discriminant(ty, bytes)
+    }
+
     fn eval_operand(&mut self, it: &Operand, locals: &mut Locals<'db>) -> Result<'db, Interval> {
         Ok(match &it.kind {
             OperandKind::Copy(p) | OperandKind::Move(p) => self.eval_place(p, locals)?,
@@ -2387,7 +2791,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 self.write_memory(at, text.as_bytes())?;
                 let size = self.ptr_size();
                 let addr = self.heap_allocate(2 * size, size)?;
-                self.write_memory(addr, &word_bytes(at.to_usize()))?;
+                self.write_pointer(addr, at)?;
                 self.write_memory(addr.offset(size), &word_bytes(text.len()))?;
                 Some(Interval::new(addr, 2 * size))
             }
@@ -2485,7 +2889,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let bytes_addr = self.heap_allocate(bytes.len(), 1)?;
                     self.write_memory(bytes_addr, &bytes)?;
                     let ref_addr = self.heap_allocate(self.ptr_size() * 2, self.ptr_size())?;
-                    self.write_memory(ref_addr, &bytes_addr.to_bytes())?;
+                    self.write_pointer(ref_addr, bytes_addr)?;
                     let mut len = [0; 16];
                     len[..size_of::<usize>()].copy_from_slice(&bytes.len().to_le_bytes());
                     self.write_memory(ref_addr.offset(self.ptr_size()), &len[..self.ptr_size()])?;
@@ -2513,7 +2917,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         self.copy_from_interval(items_addr.offset(i * item_size), *item)?;
                     }
                     let ref_addr = self.heap_allocate(self.ptr_size() * 2, self.ptr_size())?;
-                    self.write_memory(ref_addr, &items_addr.to_bytes())?;
+                    self.write_pointer(ref_addr, items_addr)?;
                     let mut len = [0; 16];
                     len[..size_of::<usize>()].copy_from_slice(&items.len().to_le_bytes());
                     self.write_memory(ref_addr.offset(self.ptr_size()), &len[..self.ptr_size()])?;
@@ -2523,7 +2927,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 _ => {
                     let inner_addr = self.allocate_valtree_in_heap(inner_ty, valtree, locals)?;
                     let ref_addr = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
-                    self.write_memory(ref_addr, &inner_addr.addr.to_bytes())?;
+                    self.write_pointer(ref_addr, inner_addr.addr)?;
                     Ok(Interval::new(ref_addr, self.ptr_size()))
                 }
             },
@@ -2920,6 +3324,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let shadow = M::Shadow::pointer(bytes.len(), self.ptr(to).prov);
         self.write_shadowed(at.aligned(bytes.len()), &bytes, &shadow)
+    }
+
+    /// Writes at `at` a pointer to `to`, an address in memory the evaluator laid out itself (a
+    /// constant's), which carries the root provenance of the allocation `to` is in.
+    fn write_root_pointer(&mut self, at: Address, to: usize) -> Result<'db, ()> {
+        let to = Address::from_usize(to);
+        if !M::CHECKS {
+            return self.write_memory(at, &to.to_bytes());
+        }
+        let to = self.with_prov(to, self.machine.root(to.to_usize() as u64));
+        self.write_pointer(at, to)
     }
 
     /// A computed pointer value to `to` with `metadata` after it, as a `Ref` makes one.
@@ -3696,17 +4111,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             && let TyKind::Dynamic(..) = t.kind()
         {
             let at = addr.offset(self.ptr_size());
-            let concrete = ty_of_bytes(self.read_memory(at, self.ptr_size())?)?;
+            let concrete = ty_of_bytes(self.peek_memory(at, self.ptr_size())?)?;
             let new_id = self.vtable_map.id(concrete);
-            self.write_memory(at, &word_bytes(new_id))?;
+            self.poke_memory(at, self.ptr_size())?.copy_from_slice(&word_bytes(new_id));
         }
         // A pointer into a static points into this evaluator's copy of it.
         if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind() {
-            let current = from_bytes!(usize, self.read_memory(addr, self.ptr_size())?);
+            let current = from_bytes!(usize, self.peek_memory(addr, self.ptr_size())?);
             if let Some((id, offset)) = source.static_at(current) {
                 let location = self.eval_static(id, locals)?;
-                let start = from_bytes!(usize, self.read_memory(location, self.ptr_size())?);
-                return self.write_memory(addr, &word_bytes(start + offset));
+                let start = from_bytes!(usize, self.peek_memory(location, self.ptr_size())?);
+                return self.write_root_pointer(addr, start + offset);
             }
         }
         match ty.kind() {
@@ -3714,13 +4129,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let size = self.size_align_of(t, locals)?;
                 match size {
                     Some(_) => {
-                        let current = from_bytes!(usize, self.read_memory(addr, my_size)?);
+                        let current = from_bytes!(usize, self.peek_memory(addr, my_size)?);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
-                                self.write_memory(addr, &word_bytes(*it))?;
+                                self.write_root_pointer(addr, *it)?;
                                 *it
                             }
-                            None => current,
+                            None => {
+                                if M::CHECKS {
+                                    self.write_root_pointer(addr, current)?;
+                                }
+                                current
+                            }
                         };
                         self.patch_addresses(
                             patch_map,
@@ -3732,16 +4152,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         )?;
                     }
                     None => {
-                        let bytes = self.read_memory(addr, my_size)?;
+                        let bytes = self.peek_memory(addr, my_size)?;
                         let (current, metadata) = bytes.split_at(my_size / 2);
                         let metadata = metadata.to_vec();
                         let current = from_bytes!(usize, current);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
-                                self.write_memory(addr, &word_bytes(*it))?;
+                                self.write_root_pointer(addr, *it)?;
                                 *it
                             }
-                            None => current,
+                            None => {
+                                if M::CHECKS {
+                                    self.write_root_pointer(addr, current)?;
+                                }
+                                current
+                            }
                         };
                         let patched = Address::from_usize(patched);
                         if let TyKind::Dynamic(..) = t.kind() {
@@ -3777,24 +4202,24 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             // A raw pointer can point anywhere into the allocation that was kept for it.
             TyKind::RawPtr(..) => {
-                let current = from_bytes!(usize, self.read_memory(addr, self.ptr_size())?);
+                let current = from_bytes!(usize, self.peek_memory(addr, self.ptr_size())?);
                 if let Some((start, _)) = source.memory_at(current)
                     && let Some(new_start) = patch_map.get(&start)
                 {
-                    self.write_memory(addr, &word_bytes(new_start + (current - start)))?;
+                    self.write_root_pointer(addr, new_start + (current - start))?;
                 } else if let Ok(fn_ty) = ty_of_bytes(&word_bytes(current))
                     && matches!(fn_ty.kind(), TyKind::FnDef(..) | TyKind::Closure(..))
                 {
                     // A function cast to a raw pointer is still the id the value's own
                     // evaluation gave the function, and this one has another for it.
                     let new_id = self.vtable_map.id(fn_ty);
-                    self.write_memory(addr, &word_bytes(new_id))?;
+                    self.poke_memory(addr, self.ptr_size())?.copy_from_slice(&word_bytes(new_id));
                 }
             }
             TyKind::FnPtr(_, _) => {
-                let ty = ty_of_bytes(self.read_memory(addr, my_size)?)?;
+                let ty = ty_of_bytes(self.peek_memory(addr, my_size)?)?;
                 let new_id = self.vtable_map.id(ty);
-                self.write_memory(addr, &word_bytes(new_id))?;
+                self.poke_memory(addr, my_size)?.copy_from_slice(&word_bytes(new_id));
             }
             TyKind::Adt(id, args) => match id.def_id() {
                 AdtId::StructId(s) => {
@@ -3925,7 +4350,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         destination: Interval,
         args: &[IntervalAndTy<'db>],
         locals: &Locals<'db>,
-        target_bb: Option<BasicBlockId>,
+        then: Then,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         let id = from_bytes!(usize, bytes.get(self)?);
@@ -3933,7 +4358,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         use rustc_type_ir::TyKind;
         match next_ty.kind() {
             TyKind::FnDef(def, generic_args) => {
-                self.exec_fn_def(def.0, generic_args, destination, args, locals, target_bb, span)
+                self.exec_fn_def(def.0, generic_args, destination, args, locals, then, span)
             }
             TyKind::Closure(id, generic_args) => self.exec_closure(
                 id.0,
@@ -3944,6 +4369,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 locals,
                 span,
                 None,
+                then,
             ),
             _ => Err(MirEvalError::InternalError("function pointer to non function".into())),
         }
@@ -3959,6 +4385,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         locals: &Locals<'db>,
         span: MirSpan,
         consumed: Option<Ty<'db>>,
+        then: Then,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         let mir_body = super::optimize::interpreted_closure_body(
             self.db,
@@ -3970,34 +4397,42 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let by_reference =
             mir_body.locals[mir_body.param_locals[0]].ty.as_ref().as_reference().is_some();
         let closure_addr = closure_data.addr;
-        let closure_data = if by_reference {
-            closure_addr.to_bytes().to_vec()
-        } else {
-            closure_data.get(self)?.to_owned()
+        let first = match by_reference {
+            true => self.pointer_value(closure_addr, None)?,
+            false => IntervalOrOwned::Borrowed(closure_data),
         };
-        let arg_bytes = iter::once(Ok(closure_data))
-            .chain(args.iter().map(|it| Ok(it.get(self)?.to_owned())))
-            .collect::<Result<'db, Vec<_>>>()?;
-        let mark = self.stack.len();
-        let interval = self
-            .interpret_mir(mir_body, arg_bytes.into_iter().map(IntervalOrOwned::Owned), None)
-            .map_err(|e| {
-                MirEvalError::InFunction(
-                    Box::new(e),
-                    vec![(Either::Right(closure), span, locals.body.owner)],
-                )
-            })?;
-        destination.write_from_interval(self, interval)?;
+        let arg_values: Vec<IntervalOrOwned<M::Shadow>> = iter::once(first)
+            .chain(args.iter().map(|it| IntervalOrOwned::Borrowed(it.interval)))
+            .collect();
         // A `Fn` or `FnMut` closure called by value through `FnOnce::call_once` is dropped
         // after the call, as rustc's `ClosureOnceShim` does: nothing else owns it then. One
         // whose body takes it by value dropped it itself.
-        if let Some(closure_ty) = consumed
-            && by_reference
-        {
-            self.run_drop_glue_deep(closure_ty, locals, closure_addr, &[], span)?;
+        let dropped = consumed.filter(|_| by_reference);
+        if then == Then::Nested {
+            let mark = self.stack.len();
+            let interval =
+                self.interpret_mir(mir_body, arg_values.into_iter(), None).map_err(|e| {
+                    MirEvalError::InFunction(
+                        Box::new(e),
+                        vec![(Either::Right(closure), span, locals.body.owner)],
+                    )
+                })?;
+            destination.write_from_interval(self, interval)?;
+            if let Some(closure_ty) = dropped {
+                self.run_drop_glue(closure_ty, locals, closure_addr, &[], span, Then::Nested)?;
+            }
+            self.free_stack(mark)?;
+            return Ok(None);
         }
-        self.free_stack(mark);
-        Ok(None)
+        let (mut callee_locals, prev_stack_ptr) =
+            self.create_locals_for_body(mir_body, Some(destination))?;
+        self.enter_frame(mir_body, &mut callee_locals, arg_values.into_iter(), true)?;
+        let mut frame =
+            StackFrame::new(callee_locals, then, prev_stack_ptr, (span, locals.body.owner), None);
+        if let Some(closure_ty) = dropped {
+            frame.drops.push(DropStep::Glue(closure_ty, closure_addr, Vec::new()));
+        }
+        Ok(Some(frame))
     }
 
     fn exec_fn_def(
@@ -4007,7 +4442,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         destination: Interval,
         args: &[IntervalAndTy<'db>],
         locals: &Locals<'db>,
-        target_bb: Option<BasicBlockId>,
+        then: Then,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         match def {
@@ -4019,7 +4454,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         generic_args,
                         locals,
                         destination,
-                        target_bb,
+                        then,
                         span,
                     );
                 }
@@ -4029,7 +4464,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     generic_args,
                     locals,
                     destination,
-                    target_bb,
+                    then,
                     span,
                 )
             }
@@ -4114,7 +4549,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         generic_args: GenericArgs<'db>,
         locals: &Locals<'db>,
         destination: Interval,
-        target_bb: Option<BasicBlockId>,
+        then: Then,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         if self.exec_intrinsic_call(
@@ -4128,7 +4563,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         )? {
             return Ok(None);
         }
-        self.exec_fn_body(def, args, generic_args, locals, destination, target_bb, span)
+        self.exec_fn_body(def, args, generic_args, locals, destination, then, span)
     }
 
     fn exec_fn_with_args(
@@ -4138,7 +4573,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         generic_args: GenericArgs<'db>,
         locals: &Locals<'db>,
         destination: Interval,
-        target_bb: Option<BasicBlockId>,
+        then: Then,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         if self.detect_and_exec_special_function(
@@ -4151,7 +4586,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         )? {
             return Ok(None);
         }
-        self.exec_fn_body(def, args, generic_args, locals, destination, target_bb, span)
+        self.exec_fn_body(def, args, generic_args, locals, destination, then, span)
     }
 
     /// A call of `def` that runs its body: its own, or the method a `dyn` receiver dispatches
@@ -4163,7 +4598,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         generic_args: GenericArgs<'db>,
         locals: &Locals<'db>,
         destination: Interval,
-        target_bb: Option<BasicBlockId>,
+        then: Then,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         if let Some(redirect_def) = self.detect_and_redirect_special_function(def)? {
@@ -4198,7 +4633,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     generics_for_target,
                     locals,
                     destination,
-                    target_bb,
+                    then,
                     span,
                 )
             }
@@ -4209,7 +4644,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 arg_bytes,
                 span,
                 destination,
-                target_bb,
+                then,
             ),
         }
     }
@@ -4219,24 +4654,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         mir_body: &'db MirBody<'db>,
         locals: &Locals<'db>,
         def: FunctionId,
-        arg_bytes: impl Iterator<Item = IntervalOrOwned>,
+        arg_bytes: impl Iterator<Item = IntervalOrOwned<M::Shadow>>,
         span: MirSpan,
         destination: Interval,
-        target_bb: Option<BasicBlockId>,
+        then: Then,
     ) -> Result<'db, Option<StackFrame<'db>>> {
-        if let Some(target_bb) = target_bb {
-            let span = (span, locals.body.owner);
-            let (mut locals, prev_stack_ptr) =
-                self.create_locals_for_body(mir_body, Some(destination))?;
-            self.fill_locals_for_body(mir_body, &mut locals, arg_bytes.into_iter())?;
-            Ok(Some(StackFrame {
-                locals,
-                destination: Some(target_bb),
-                prev_stack_ptr,
-                span,
-                callee: Some(def),
-            }))
-        } else {
+        if then == Then::Nested {
             let mark = self.stack.len();
             let called = Some((def, span, locals.body.owner));
             let result = self.interpret_mir(mir_body, arg_bytes, called).map_err(|e| {
@@ -4246,9 +4669,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 )
             })?;
             destination.write_from_interval(self, result)?;
-            self.free_stack(mark);
-            Ok(None)
+            self.free_stack(mark)?;
+            return Ok(None);
         }
+        let span = (span, locals.body.owner);
+        let (mut locals, prev_stack_ptr) =
+            self.create_locals_for_body(mir_body, Some(destination))?;
+        self.enter_frame(mir_body, &mut locals, arg_bytes, true)?;
+        Ok(Some(StackFrame::new(locals, then, prev_stack_ptr, span, Some(def))))
     }
 
     fn exec_fn_trait(
@@ -4258,7 +4686,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         generic_args: GenericArgs<'db>,
         locals: &Locals<'db>,
         destination: Interval,
-        target_bb: Option<BasicBlockId>,
+        then: Then,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
         let func = args
@@ -4279,10 +4707,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         match func_ty.kind() {
             TyKind::FnDef(def, subst) => {
-                self.exec_fn_def(def.0, subst, destination, &args[1..], locals, target_bb, span)
+                self.exec_fn_def(def.0, subst, destination, &args[1..], locals, then, span)
             }
             TyKind::FnPtr(..) => {
-                self.exec_fn_pointer(func_data, destination, &args[1..], locals, target_bb, span)
+                self.exec_fn_pointer(func_data, destination, &args[1..], locals, then, span)
             }
             TyKind::Closure(closure, subst) => {
                 let consumed = (Some(def) == self.cached_fn_once_trait_func && func_ty == func.ty)
@@ -4296,6 +4724,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     locals,
                     span,
                     consumed,
+                    then,
                 )
             }
             _ => {
@@ -4323,7 +4752,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     generic_args,
                     locals,
                     destination,
-                    target_bb,
+                    then,
                     span,
                 )
             }
@@ -4376,7 +4805,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// Records where the memory of a static is, and gives the address of a pointer to it.
     fn locate_static(&mut self, st: StaticId, memory: Address) -> Result<'db, Address> {
         let addr = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
-        self.write_memory(addr, &memory.to_bytes())?;
+        self.write_pointer(addr, memory)?;
         self.static_locations.insert(st, addr);
         Ok(addr)
     }

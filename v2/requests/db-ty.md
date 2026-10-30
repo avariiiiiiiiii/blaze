@@ -88,6 +88,7 @@ compile until both are added.
   signature path.
 
 > forwarded to db: declare `coroutine_witnesses` in `crates/hir-ty/src/db.rs` (db-ty's).
+> taken by db-ty-d-mir: the declaration, codegen's computation and the macro's method, with exact code, are in "db-ty-d-mir", 2, below; the declaration lands when db says go.
 > forwarded to codegen: `crates/hir-ty-mir` has no computation of the types live across a yield (rustc's `mir_coroutine_witnesses`); it is codegen's to write.
 > pending (requests): once both exist, `impl_hir_database!` in `crates/hir-ide/src/impl_db_macro.rs` implements the method from hir-ty-mir's function. The `impl_holders` finding is for items, forwarded there.
 
@@ -339,6 +340,7 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   `obligation.recursion_depth = obligation.recursion_depth.saturating_add(1)` (a limit of
   `u32::MAX` must not overflow). `obligation_ctxt.rs:58`, `util.rs:819`, `infer/mod.rs:530`
   (`recursion_depth: 0`) need no change.
+  > applied by db-ty-port-solver
 - `crates/hir-ty/src/next_solver/inspect.rs` (db-ty-port-solver), for speed:
   `BestObligation::non_trivial_candidates` (errors.rs, rustc's rule) only needs nested goals whose
   `GoalSource` is `Normalization`, but `instantiate_nested_goals` builds a proof tree for every
@@ -347,11 +349,16 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   that still instantiates every step's canonical state in order (orig_values must advance) but
   calls `instantiate_proof_tree_for_nested_goal` only where `keep(source)`. errors.rs then uses
   it with `|s| s == GoalSource::Normalization`.
+  > applied by db-ty-port-solver (errors.rs's switch to it is db-ty-port-infer-errors')
 - `crates/hir-ty/src/infer/unify.rs` (db-ty-port-ty), for speed: `has_trait_errors` runs
   `into_fulfillment_error` (a proof-tree leaf search, one uncached evaluation per tree level) on
   every pending trait error each time it is called, and `emit_trait_errors` runs it again. Compute
   each `FulfillmentError` once: store `trait_errors` as the converted errors (or memoize the
   `Option<SolverDiagnostic>` per error) so each error's search runs exactly once per body.
+  > applied by db-ty-port-ty: `trait_errors` holds `FulfillmentError`s, converted once in
+  > `InferenceTable::record_trait_errors` when the solver returns them (rustc's
+  > `FromSolverError`, `solve/fulfill.rs:189,370`); every push site, `closure/analysis.rs`'s
+  > included, goes through it. The diagnostic is not memoized: it resolves variables.
 - Root `Cargo.toml` (coordinator decision): the workspace `tracing` has no compile-time level cap,
   so every disabled `#[instrument]` span still costs a callsite check (about 1 to 2 ns) in
   release. Adding `release_max_level_info` (or `_off`) to the workspace `tracing` features makes
@@ -367,3 +374,188 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   on a small type once the variable tables have capacity) needs an `InferCtxt` over a test
   database, and hir-ty has no `TestDB` in v2. Whoever restores hir-ty's test database: tell me
   and I'll add it.
+- `tools/v2/hot_lint.py` (coordinator): `Input.crates` is typed `list[str]`, which `typed_input`
+  doesn't read (it reads `tuple[str, ...]`), so the documented `{"root": ".", "crates": [...]}`
+  fails with `TypeError: typed_input: crates has a type it does not read: list[str]`. Fix:
+  `crates: tuple[str, ...] = HOT`. Until then, run it without `crates` and filter.
+- For db-ty-port-solver (fulfill.rs, obligation_ctxt.rs, inspect.rs): `Obligation<'db, T>` is now
+  `Copy` when `T` is (`PredicateObligation` is 20 bytes of `Copy` fields). Every
+  `obligation.clone()` becomes a plain copy (`*obligation` / `obligation`), which also clears
+  those hot-lint findings and clippy's `clone_on_copy`.
+
+## db-ty-port-solver
+
+- `crates/hir-ty/src/next_solver/infer/mod.rs` (db-ty-port-infer): replace
+  `next_term_var_of_kind(term, span)` with rustc's `next_term_var_of_alias_kind`
+  (`rustc_infer/src/infer/mod.rs` at 16d1ffac, line 989). Its only callers were
+  `normalize.rs` and `structural_normalize.rs`, which now call the new one:
+
+  ```rust
+  pub fn next_term_var_of_alias_kind(&self, alias_term: AliasTerm<'db>, span: Span) -> Term<'db> {
+      match alias_term.kind {
+          AliasTermKind::ProjectionTy { .. }
+          | AliasTermKind::InherentTy { .. }
+          | AliasTermKind::OpaqueTy { .. }
+          | AliasTermKind::FreeTy { .. } => self.next_ty_var(span).into(),
+          AliasTermKind::FreeConst { .. }
+          | AliasTermKind::InherentConstSelf { .. }
+          | AliasTermKind::InherentConstImpl { .. }
+          | AliasTermKind::AnonConst { .. }
+          | AliasTermKind::ProjectionConst { .. } => self.next_const_var(span).into(),
+      }
+  }
+  ```
+
+  Why: `PredicateKind::AliasRelate` is gone; rustc's normalizers register a `ProjectionClause`
+  whose term is a fresh variable of the alias's kind. Both files also call the inherent
+  `InferCtxt::deeply_resolve_ignoring_regions` (infer/mod.rs), which must stay.
+
+> forwarded to db (db-ty; window `db-next2`, told by tmux).
+> forwarded by db-ty-next1 (19:40): `infer/` is solver-sync's now; sent to `solver-sync-infer-core`.
+> applied by db-ty-port-infer: `InferCtxt::next_term_var_of_alias_kind` is in `infer/mod.rs`
+> (rustc's), `next_term_var_of_kind` is gone; `deeply_resolve_ignoring_regions` stays.
+
+## db-ty-port-ty
+
+- `crates/hir-def/src/signatures.rs` and `expr_store/lower.rs` (hir-def's owner, through lane
+  db), for R12 of `v2/requests/solver-sync-callers.md` (superset-of-rust: the nightly's
+  `FnSigKind` carries the `#[splat]` argument, hir-def drops it). Add
+  `pub splatted: Option<u8>` to `FunctionSignature`, set by `lower_function` as rustc's
+  `FnDecl::splatted` (`compiler/rustc_ast/src/ast.rs` at 16d1ffac) and `lower_fn_decl`
+  (`rustc_ast_lowering/src/lib.rs`) do: the index into `params` (the self parameter first,
+  cfg-disabled parameters skipped, the `...` one not counted) of the first parameter with a
+  `#[rustc_splat]` attribute (feature `splat`), ignoring indices `>= u8::MAX`, and `None` when the
+  function is C-variadic. `lower.rs` `callable_item_signature` already passes
+  `data.splatted, data.params.len()` to `FnSigKind::new` and `expect`s it, as rustc's lowering
+  `unwrap`s. rustc's AST validation errors for a splat index past 254 and for splat with `...`
+  are diagnostics' to add (`sym::rustc_splat` needs to be interned; fix-names owns the attribute
+  enum). Until this lands, `lower.rs` does not compile: it is the one site of my part that
+  waits on another file.
+
+> forwarded to db (hir-def and hir-ty; window `db-next2`, told by tmux).
+
+## db-ty-d-mir
+
+### 1. Codegen (`crates/hir-ty-mir/src/mir/lower.rs`): `MirBody::unreachable_after_calls`
+
+`crates/hir-ty/src/mir.rs` now declares `UnreachableAfterCall { call: MirSpan, next: MirSpan,
+descr: &'static str, ty: StoredTy }` and the field `MirBody::unreachable_after_calls:
+Vec<UnreachableAfterCall>` (hashed and shrunk with the rest), as
+`v2/requests/diagnostics.md`, "diagnostics-lints-bodies: what follows a call of an uninhabited
+type", writes them. hir-ty-mir does not compile until its one `MirBody { .. }` literal has it:
+
+- `lower.rs:294` (`let mir = MirBody {`), after `promoted_constants: Vec::new(),`:
+  `unreachable_after_calls: Vec::new(),`
+- Then fill it where lowering gives a call of an uninhabited type no target (`lower_call`'s
+  `is_uninhabited`, `lower.rs` ~1065, ~1100, ~1115), as rustc's `LintAndRemoveUninhabited`
+  (`compiler/rustc_mir_transform/src/lint_and_remove_uninhabited.rs`): only when the type is
+  not `!`, is uninhabited from the body's module, and the function's return type is inhabited;
+  `call` the call's span, `next` the span of the first statement of user code the target would
+  have had (`find_unreachable_code_from`: past the `()` and return-place assignments,
+  `StorageLive`/`StorageDead`, and a `Goto`/`Drop` into a block only it leads to), `descr`
+  `"definition"` when that statement is a `let` (`FakeRead`), else `"expression"`, `ty` the
+  call's type. In the order of the calls' blocks. Test against rustc's
+  `tests/ui/reachable/unreachable-try-pattern.rs` and its `.stderr`, and:
+  `let x: Void = f(); 1` gives one entry with `descr == "expression"`, `let y = 1;` after the
+  call gives `"definition"`, a call returning `!` gives none.
+
+> forwarded to db for codegen.
+
+### 2. Codegen (`crates/hir-ty-mir`) and coordinator (`crates/hir-ide/src/impl_db_macro.rs`): `coroutine_witnesses`
+
+`db-ty` item 7 above and `v2/requests/diagnostics.md`, "coroutine witness types for significant
+drops". Three edits that land together (the macro stops compiling if the trait method comes
+first); db (window `db-next2`) says go, then I add the declaration to `hir-ty/src/db.rs`, beside
+the coroutine MIR queries:
+
+```rust
+    /// The types an `async` block holds across a yield, by which its future implements an
+    /// auto trait: rustc's `mir_coroutine_witnesses` (`CoroutineLayout::field_tys` without
+    /// what `ignore_for_traits` marks). Generic in the parameters of the coroutine's parent,
+    /// with regions erased.
+    fn coroutine_witnesses<'db>(&'db self, def: InternedCoroutineId<'db>) -> &'db [StoredTy];
+```
+
+**a. Codegen, `crates/hir-ty-mir/src/mir/transform.rs`**, after
+`runtime_mir_body_for_coroutine_by_move_query` (and `coroutine_witnesses_query` added to the
+`pub use transform::{..}` list in `crates/hir-ty-mir/src/mir.rs`). The locals are the ones the
+runtime body keeps in the future (`MirBody::locals_held_across_yields`, which already drops the
+receiver, the captures used in place and the promoted constants), so a future's auto traits and
+its layout (`hir-ty/src/layout.rs:579`) see the same fields. Of the by-move body nothing is
+asked: rustc's witnesses are of the coroutine's own body.
+
+```rust
+/// The types an `async` block holds across a yield: rustc's `mir_coroutine_witnesses`, the
+/// `CoroutineLayout::field_tys` its future implements auto traits by, in the order the body
+/// declares the locals. Not what `ignore_for_traits` marks: the temporary made for a place of a
+/// static that is not `#[thread_local]` (another access makes it again) and a fake borrow (only
+/// fake reads read it). Empty for a body MIR lowering refuses, as rustc's for a body with
+/// errors: that body is reported (`BorrowckSkipped`) and nothing is built from it.
+#[salsa::tracked(returns(deref))]
+pub fn coroutine_witnesses_query<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+) -> Box<[StoredTy]> {
+    let Ok(body) = db.runtime_mir_body_for_coroutine(coroutine) else {
+        return Box::default();
+    };
+    let held = body.locals_held_across_yields();
+    let mut ignored: SmallVec<[LocalId; 4]> = SmallVec::new();
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            let StatementKind::Assign(place, value) = &statement.kind else { continue };
+            if !place.projection.is_empty() {
+                continue;
+            }
+            let ignore = match value {
+                Rvalue::Use(Operand { kind: OperandKind::Static(id), .. }) => {
+                    !AttrFlags::query(db, (*id).into()).contains(AttrFlags::THREAD_LOCAL)
+                }
+                Rvalue::Ref(BorrowKind::Shallow, _) => true,
+                _ => false,
+            };
+            if ignore {
+                ignored.push(place.local);
+            }
+        }
+    }
+    held.locals
+        .iter()
+        .filter(|local| !ignored.contains(local))
+        .map(|&local| body.locals[local].ty.clone())
+        .collect()
+}
+```
+
+with `use hir_def::attrs::AttrFlags;`, `use smallvec::SmallVec;` and, from `super`,
+`BorrowKind, LocalId, Operand, OperandKind, Rvalue, StatementKind` (all `hir_ty::mir::*`), and
+`StoredTy` from `crate::next_solver` (or `hir_ty::next_solver`). No `lru`: the result is a few
+types per coroutine, read by every auto-trait goal of its future, and not dropped by
+`hir/src/evict.rs`. hir-ty's kind test does not see it (hir-ty-mir's query).
+
+**b. Coordinator, `crates/hir-ide/src/impl_db_macro.rs`**: `StoredTy` joins the
+`next_solver::{..}` import at the top of the macro (`next_solver::{Allocation, GenericArgs,
+StoredGenericArgs, StoredTy, Ty}`), and after `runtime_mir_body_for_coroutine_by_move`:
+
+```rust
+                fn coroutine_witnesses<'db>(
+                    &'db self,
+                    def: InternedCoroutineId<'db>,
+                ) -> &'db [StoredTy] {
+                    mir::coroutine_witnesses_query(self, def)
+                }
+```
+
+**c. Then solver-sync** (`next_solver/interner.rs`, `coroutine_hidden_types`, in its inbox):
+read `db.coroutine_witnesses(def_id.0)`, each type with its erased regions replaced by fresh
+bound regions, as rustc's `TyCtxt::coroutine_hidden_types`, under the `EarlyBinder` the caller
+instantiates with the coroutine's args. rustc keeps goals on a coroutine of the body being
+type-checked stalled (`TypingMode::Analysis { defining_opaque_types_and_generators }`,
+`check_coroutine_obligations` after borrowck); without that the witness query runs MIR lowering
+of the body being inferred, a cycle.
+
+Test (written, `crates/hir/src/tests.rs`,
+`a_future_is_send_only_when_what_it_holds_across_an_await_is`): an `async` block holding a
+`NotSend(*const u8)` across `.await` is not `Send`; one that moves it out before is.
+
+> waiting for db's go (asked by tmux, window `db-next2`).

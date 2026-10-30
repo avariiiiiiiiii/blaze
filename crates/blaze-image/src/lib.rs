@@ -48,8 +48,20 @@ pub use crate::build::{Builder, SectionWriter, TooLarge};
 pub use crate::crc::crc32c;
 pub use crate::image::{Image, Stable};
 pub use crate::raw::{bytes_of, cast};
+
+/// How a whole-image pass (CRCs at write, a section checked whole at restore) spreads its work:
+/// `jobs(n, job)` runs `job(0)` to `job(n - 1)` on as many workers as it has and returns when
+/// all are done. The daemon passes its pool (`blaze_graph::pool`'s `run_jobs` has this shape);
+/// [`serial`] runs them on the calling thread.
+pub type Jobs<'a> = &'a (dyn Fn(usize, &(dyn Fn(usize) + Sync)) + Sync);
+
+/// [`Jobs`] on the calling thread.
+pub fn serial(n: usize, job: &(dyn Fn(usize) + Sync)) {
+    (0..n).for_each(job);
+}
 pub use crate::spine::{
     DEFAULT_GROUP_SHIFT, HEADER, LAYOUT, MAGIC, MAX_GROUP_SHIFT, MIN_GROUP_SHIFT, SECTION_ENTRY,
+    hash_of,
 };
 
 /// Which section of the image: who owns it and what it holds. The owner of a section is the

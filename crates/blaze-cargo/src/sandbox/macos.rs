@@ -109,10 +109,11 @@ const RESOLVER_SERVICE: &str = "(global-name \"com.apple.dnssd.service\")";
 /// The profile: everything allowed but writing outside the run, the network beyond the
 /// loopback (all of it with `network`, and the resolver's socket), a Unix socket outside the
 /// run's own and writable directories, and every Mach service but [`MACH_SERVICES`]. Paths
-/// come in as parameters (`WRITE0`, `WRITE1`, ... and the live record's `LIVE0`, ...), which
-/// need no quoting. No terminal is written by name: what the program prints goes to the
+/// come in as parameters (`WRITE0`, `WRITE1`, ..., the live record's `LIVE0`, ..., and
+/// `SOCKET0`, ..., each Unix socket the read set names, which it may connect to), which need
+/// no quoting. No terminal is written by name: what the program prints goes to the
 /// descriptors it was given, which no rule checks again.
-fn profile(writes: usize, lives: usize, network: bool) -> String {
+fn profile(writes: usize, lives: usize, sockets: usize, network: bool) -> String {
     let dirs: String = (0..writes).map(|at| format!(" (subpath (param \"WRITE{at}\"))")).collect();
     let files: String = (0..lives).map(|at| format!(" (literal (param \"LIVE{at}\"))")).collect();
     let mut text = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
@@ -144,6 +145,9 @@ fn profile(writes: usize, lives: usize, network: bool) -> String {
         let dir = format!("(subpath (param \"WRITE{at}\"))");
         text.push_str(&format!("(allow network-bind network-inbound (local unix-socket {dir}))\n"));
         text.push_str(&format!("(allow network-outbound (remote unix-socket {dir}))\n"));
+    }
+    for at in 0..sockets {
+        text.push_str(&format!("(allow network-outbound (remote unix-socket (path-literal (param \"SOCKET{at}\"))))\n"));
     }
     text.push_str("(deny mach-lookup)\n(allow mach-lookup");
     for service in MACH_SERVICES.iter().chain(network.then_some(&RESOLVER_SERVICE)) {
@@ -402,7 +406,14 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
         .map_err(|error| format!("{}: {error}", config_path.display()))?;
 
     // Everything the child uses is made before the fork.
-    let profile = c(profile(writes.len(), lives.len(), also.network).as_bytes());
+    // A socket the read set names (a test's fork server's) is one it connects to.
+    let sockets: Vec<String> = spec
+        .readable
+        .iter()
+        .filter(|it| std::fs::metadata(it).is_ok_and(|it| std::os::unix::fs::FileTypeExt::is_socket(&it.file_type())))
+        .flat_map(|it| spellings(it))
+        .collect();
+    let profile = c(profile(writes.len(), lives.len(), sockets.len(), also.network).as_bytes());
     let params: Vec<CString> = writes
         .iter()
         .enumerate()
@@ -412,6 +423,12 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
                 .iter()
                 .enumerate()
                 .flat_map(|(at, it)| [c(format!("LIVE{at}").as_bytes()), c(it.as_bytes())]),
+        )
+        .chain(
+            sockets
+                .iter()
+                .enumerate()
+                .flat_map(|(at, it)| [c(format!("SOCKET{at}").as_bytes()), c(it.as_bytes())]),
         )
         .collect();
     let mut param_ptrs: Vec<*const libc::c_char> = params.iter().map(|it| it.as_ptr()).collect();
@@ -781,14 +798,15 @@ mod tests {
 
     #[test]
     fn the_profile_lets_the_live_record_be_written_and_the_network_through_when_given() {
-        let closed = super::profile(2, 1, false);
+        let closed = super::profile(2, 1, 1, false);
         assert!(closed.contains("(subpath (param \"WRITE1\"))"), "{closed}");
         assert!(closed.contains("(literal (param \"LIVE0\"))"), "{closed}");
+        assert!(closed.contains("(remote unix-socket (path-literal (param \"SOCKET0\")))"), "{closed}");
         assert!(closed.contains("(remote ip \"localhost:*\")"), "{closed}");
         assert!(!closed.contains("\"*:*\"") && !closed.contains("mDNSResponder"), "{closed}");
         assert!(!closed.contains("com.apple.dnssd.service"), "{closed}");
-        let open = super::profile(1, 0, true);
-        assert!(!open.contains("LIVE0"), "{open}");
+        let open = super::profile(1, 0, 0, true);
+        assert!(!open.contains("LIVE0") && !open.contains("SOCKET0"), "{open}");
         assert!(open.contains("(allow network-outbound (remote ip \"*:*\"))"), "{open}");
         assert!(open.contains("/private/var/run/mDNSResponder"), "{open}");
         assert!(open.contains(super::RESOLVER_SERVICE), "{open}");

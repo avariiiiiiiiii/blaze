@@ -390,6 +390,14 @@ pub enum AssertKind {
     OverflowNeg(Operand),
     DivisionByZero(Operand),
     RemainderByZero(Operand),
+    /// rustc's `CheckAlignment`: `found` is the address, `required` its type's alignment.
+    MisalignedPointerDereference { required: Operand, found: Operand },
+    /// rustc's `CheckNull` on a dereference.
+    NullPointerDereference,
+    /// rustc's `CheckNull` on a reference made from a raw pointer.
+    NullReferenceConstructed,
+    /// rustc's `CheckEnums`: the operand is the invalid discriminant or value, as a `u128`.
+    InvalidEnumConstruction(Operand),
 }
 
 impl AssertKind {
@@ -416,9 +424,15 @@ impl AssertKind {
                 f(a);
                 f(b);
             }
+            AssertKind::MisalignedPointerDereference { required, found } => {
+                f(required);
+                f(found);
+            }
             AssertKind::OverflowNeg(a)
             | AssertKind::DivisionByZero(a)
-            | AssertKind::RemainderByZero(a) => f(a),
+            | AssertKind::RemainderByZero(a)
+            | AssertKind::InvalidEnumConstruction(a) => f(a),
+            AssertKind::NullPointerDereference | AssertKind::NullReferenceConstructed => {}
         }
     }
 
@@ -432,9 +446,15 @@ impl AssertKind {
                 f(a);
                 f(b);
             }
+            AssertKind::MisalignedPointerDereference { required, found } => {
+                f(required);
+                f(found);
+            }
             AssertKind::OverflowNeg(a)
             | AssertKind::DivisionByZero(a)
-            | AssertKind::RemainderByZero(a) => f(a),
+            | AssertKind::RemainderByZero(a)
+            | AssertKind::InvalidEnumConstruction(a) => f(a),
+            AssertKind::NullPointerDereference | AssertKind::NullReferenceConstructed => {}
         }
     }
 }
@@ -908,6 +928,8 @@ pub enum CastKind {
     FloatToFloat,
     IntToFloat,
     FnPtrToPtr,
+    /// rustc's `Transmute`: a reinterpretation of the bits between types of the same size.
+    Transmute,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -1339,6 +1361,22 @@ impl TerminatorKind {
     }
 }
 
+/// What `LintAndRemoveUninhabited` lints: a call of a type uninhabited from the body's module
+/// that is not `!`, in a function whose return type is inhabited, and the first statement of
+/// user code its target block would have had (`find_unreachable_code_from`: skipping the `()`
+/// and return-place assignments, `StorageLive`/`StorageDead`, and a `Goto`/`Drop` into a block
+/// only it leads to).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnreachableAfterCall {
+    /// The call (`orig`).
+    pub call: MirSpan,
+    /// What would have come next (`target_loc.span`).
+    pub next: MirSpan,
+    /// "definition" for a `FakeRead` (a `let`), else "expression".
+    pub descr: &'static str,
+    pub ty: StoredTy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
 pub struct MirBody<'db> {
     pub basic_blocks: Arena<BasicBlock>,
@@ -1383,6 +1421,9 @@ pub struct MirBody<'db> {
     /// temporary a constant and the temporary goes, so it is never kept across a yield; the
     /// code generator gives it read-only or static memory.
     pub promoted_constants: Vec<LocalId>,
+    /// In a built body, in the order of the calls' blocks: the calls of an uninhabited type
+    /// lowering gave no target, for the `unreachable_code` lint.
+    pub unreachable_after_calls: Vec<UnreachableAfterCall>,
 }
 
 impl Hash for MirBody<'_> {
@@ -1405,6 +1446,7 @@ impl Hash for MirBody<'_> {
             upvars_in_place,
             panic_unwinds,
             promoted_constants,
+            unreachable_after_calls,
         } = self;
         basic_blocks.hash(state);
         locals.hash(state);
@@ -1423,6 +1465,7 @@ impl Hash for MirBody<'_> {
         upvars_in_place.hash(state);
         panic_unwinds.hash(state);
         promoted_constants.hash(state);
+        unreachable_after_calls.hash(state);
     }
 }
 
@@ -1729,8 +1772,10 @@ impl MirBody<'_> {
             upvars_in_place,
             panic_unwinds,
             promoted_constants,
+            unreachable_after_calls,
         } = self;
         promoted_constants.shrink_to_fit();
+        unreachable_after_calls.shrink_to_fit();
         upvars_in_place.shrink_to_fit();
         panic_unwinds.shrink_to_fit();
         unreached.shrink_to_fit();
@@ -2222,11 +2267,73 @@ impl MirOptLevel {
     }
 }
 
+/// What a MIR body is optimized for: the level, whether rustc's UB checks are inserted
+/// (`sess.ub_checks()` of the crate the body is of), and whether the code generator emits
+/// lifetime markers (rustc removes storage markers only when it doesn't).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub struct MirOptions {
+    pub level: MirOptLevel,
+    pub ub_checks: bool,
+    pub lifetime_markers: bool,
+}
+
+impl MirOptions {
+    /// The interpreter's: no UB checks, markers as rustc keeps them without a code generator.
+    pub fn at(level: MirOptLevel) -> MirOptions {
+        MirOptions { level, ub_checks: false, lifetime_markers: level >= MirOptLevel::Release }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use la_arena::{Idx, RawIdx};
     use rustc_hash::FxHashMap;
 
-    use super::hash_by_key;
+    use super::{
+        AssertKind, LocalId, MirOptLevel, MirOptions, Operand, OperandKind, Place, hash_by_key,
+    };
+
+    fn copy_of(local: u32) -> Operand {
+        let local: LocalId = Idx::from_raw(RawIdx::from(local));
+        Operand { kind: OperandKind::Copy(Place::from(local).store()), span: None }
+    }
+
+    fn locals_visited(kind: &mut AssertKind) -> (Vec<u32>, Vec<u32>) {
+        let local_of = |operand: &Operand| match &operand.kind {
+            OperandKind::Copy(place) => place.local.into_raw().into_u32(),
+            _ => unreachable!("the tests build only copies"),
+        };
+        let mut read = Vec::new();
+        kind.for_each_operand(&mut |operand| read.push(local_of(operand)));
+        let mut written = Vec::new();
+        kind.for_each_operand_mut(&mut |operand| written.push(local_of(&*operand)));
+        (read, written)
+    }
+
+    #[test]
+    fn the_ub_check_asserts_visit_their_operands_in_order() {
+        let mut misaligned =
+            AssertKind::MisalignedPointerDereference { required: copy_of(1), found: copy_of(2) };
+        assert_eq!(locals_visited(&mut misaligned), (vec![1, 2], vec![1, 2]));
+        let mut invalid_enum = AssertKind::InvalidEnumConstruction(copy_of(3));
+        assert_eq!(locals_visited(&mut invalid_enum), (vec![3], vec![3]));
+        for mut null in [AssertKind::NullPointerDereference, AssertKind::NullReferenceConstructed]
+        {
+            assert_eq!(locals_visited(&mut null), (vec![], vec![]));
+        }
+    }
+
+    #[test]
+    fn the_interpreter_keeps_lifetime_markers_only_at_release() {
+        for (level, lifetime_markers) in
+            [(MirOptLevel::Off, false), (MirOptLevel::Debug, false), (MirOptLevel::Release, true)]
+        {
+            assert_eq!(
+                MirOptions::at(level),
+                MirOptions { level, ub_checks: false, lifetime_markers }
+            );
+        }
+    }
 
     fn digest<'a>(entries: impl Iterator<Item = (&'a u32, &'a Vec<u32>)>) -> (u64, u64) {
         let mut hasher = salsa::StableHasher::new();

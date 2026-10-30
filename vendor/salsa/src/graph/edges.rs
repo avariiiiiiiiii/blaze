@@ -174,7 +174,8 @@ impl Edges {
     }
 }
 
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
+#[cfg(not(feature = "shuttle"))]
 mod tests {
     use std::cell::Cell;
 

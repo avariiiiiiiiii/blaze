@@ -172,6 +172,9 @@ pub(super) fn opt_item(
         has_mods = true;
     }
 
+    // rustc's `parse_item_kind` reads `unsafe mod` as a module, which AST validation refuses.
+    let is_unsafe_mod = !has_mods && p.at(T![unsafe]) && p.nth(1) == T![mod];
+
     // test_err unsafe_block_in_mod
     // fn foo(){} unsafe { } fn bar(){}
     if p.at(T![unsafe]) && p.nth(1) != T!['{'] {
@@ -241,6 +244,11 @@ pub(super) fn opt_item(
     // items
     match p.current() {
         T![fn] => fn_(p, m, is_in_trait),
+
+        // test unsafe_mod
+        // unsafe mod m {}
+        // pub unsafe mod n;
+        T![mod] if is_unsafe_mod => mod_item(p, m),
 
         T![const] if p.nth(1) != T!['{'] => consts::konst(p, m),
         T![static] if matches!(p.nth(1), IDENT | T![_] | T![mut]) => consts::static_(p, m),

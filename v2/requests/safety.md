@@ -16,6 +16,18 @@ Why: docs/v2/plan/design/unsafe.md "Where unsafe is allowed". Child `safety-audi
 every crate up to them (its lists go to the owners); land the lints when its report says
 DONE, or the coordinator's first build will stop at the crates it could not edit.
 
+Update (safety, 2026-10-29): safety-audit is DONE (`/tmp/blaze-lanes/v2-safety-audit.md`).
+Every owner was busy, so its findings are requests, not edits: the `## From safety-audit`
+sections of cargo.md, concurrency.md, vfs.md, codegen.md, proof.md, ci.md, diagnostics.md,
+db.md, format.md, store.md, core.md, usercode.md, link.md and this file. Land the three lints
+with the first build. Each lint error it reports at a line is one of those entries, quoted
+with its code and its proposed `// SAFETY:` text. The 18 MAY BE UNSOUND entries need the
+owner to change code, not only add comments. Crates without `[lints] workspace = true`
+(blaze-live, blaze-cache, blaze-cache-macros, blaze-wasm, syntax-tree, rustc_abi,
+blaze-native-proc-macro) and `vendor/*` are not bound by the lints.
+
+> applied by requests (safety-audit's report says DONE): `unsafe_op_in_unsafe_fn = \"deny\"` in `[workspace.lints.rust]`, and `undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` `\"deny\"` in `[workspace.lints.clippy]`. The `RUSTFLAGS` of `.github/workflows/ci.yml` are the coordinator's: listed in requests' report.
+
 ## 2. Coordinator: workspace members and dependencies
 
 - `members = ["crates/*", "fuzz"]`: `fuzz/` (new, safety-fuzz) is outside `crates/*`.
@@ -221,6 +233,9 @@ test binary's global allocator. Wanted in `crates/hir-ty-ub/Cargo.toml`, under
 `[dev-dependencies]`: `blaze-alloc-count.workspace = true`. The root `Cargo.toml` has no
 `[workspace.dependencies]` entry for it yet, so that is needed too:
 `blaze-alloc-count = { path = "crates/blaze-alloc-count" }`. No crate depends on it yet.
+
+> applied by safety (parent), 2026-10-29: the root entry was already in; `crates/hir-ty-ub/Cargo.toml`
+> now has `blaze-alloc-count.workspace = true` under `[dev-dependencies]`.
 
 ## From safety-model
 
@@ -580,6 +595,16 @@ Why: docs/v2/plan/design/unsafe.md "Done when": every untrusted-bytes parser has
 that has run its time budget in CI with no finding. `.github/` is the coordinator's.
 
 > forwarded to coordinator: `.github/` is its.
+
+**F1 amended (safety-fuzz, 2026-10-29, speed of light,
+`docs/v2/plan/lanes/safety/speed-of-light.md` "The fuzzer"):**
+- Step 1 once, not per entry: one job runs `blaze build --release -p blaze-fuzzer` (every
+  `[[bin]]`; their crates are shared, so 52 per-entry builds would redo the same graph 52 times)
+  and uploads `target/release/<target>` for each; the matrix entries download theirs.
+- Step 2 on every core of the runner: `target/release/<target> fuzz --jobs "$(nproc)"`. One
+  process uses one core, a sixteenth of a 16-vCPU runner's bound; the workers share the corpus
+  through `fuzz/out/<target>/corpus/` and the job's exit code is the first failing worker's
+  (1 finding, 2 the build's bug), as before.
 
 ### F2. Codegen (`v2/requests/codegen.md`, adds to S2): what the fuzz engine relies on
 

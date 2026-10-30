@@ -259,7 +259,7 @@ fn key_value(key: &str, value: &str) -> CfgAtom {
 #[test]
 fn every_unit_that_compiles_is_a_crate() {
     let built = lowered(&units()).unwrap();
-    let db = built.lowered.snapshot();
+    let db = built.lowered.db();
     assert!(built.lowered.krate(RUN).is_none());
     for unit in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST] {
         assert!(built.lowered.krate(unit).is_some(), "unit {unit}");
@@ -285,7 +285,7 @@ fn every_unit_that_compiles_is_a_crate() {
 #[test]
 fn deps_are_by_extern_name_in_the_units_order() {
     let built = lowered(&units()).unwrap();
-    let db = built.lowered.snapshot();
+    let db = built.lowered.db();
     let deps = &krate(&built, BIN).data(&db).dependencies;
     let names: Vec<&str> = deps.iter().map(|it| it.name.as_str()).collect();
     assert_eq!(names, ["alpha", "m", "core"]);
@@ -302,7 +302,7 @@ fn deps_are_by_extern_name_in_the_units_order() {
 #[test]
 fn editions_kinds_and_origins_are_cargos() {
     let built = lowered(&units()).unwrap();
-    let db = built.lowered.snapshot();
+    let db = built.lowered.db();
     let data = |unit| krate(&built, unit).data(&db).clone();
     assert_eq!(data(LIB).edition, Edition::Edition2021);
     assert_eq!(data(BIN).edition, Edition::Edition2024);
@@ -324,7 +324,7 @@ fn editions_kinds_and_origins_are_cargos() {
 #[test]
 fn cfgs_are_the_targets_with_the_units() {
     let built = lowered(&units()).unwrap();
-    let db = built.lowered.snapshot();
+    let db = built.lowered.db();
     let lib = krate(&built, LIB).cfg_options(&db).clone();
     assert!(lib.check_atom(&key_value("feature", "fast")));
     assert!(lib.check_atom(&key_value("target_os", "linux")));
@@ -339,7 +339,7 @@ fn cfgs_are_the_targets_with_the_units() {
 #[test]
 fn env_is_the_units() {
     let built = lowered(&units()).unwrap();
-    let db = built.lowered.snapshot();
+    let db = built.lowered.db();
     assert_eq!(krate(&built, LIB).env(&db).get("CARGO_PKG_NAME").as_deref(), Some("a"));
     assert_eq!(krate(&built, BIN).env(&db).get("CARGO_PKG_NAME").as_deref(), Some("b"));
     assert_eq!(krate(&built, BIN).env(&db).get("OUT_DIR"), None);
@@ -348,7 +348,7 @@ fn env_is_the_units() {
 #[test]
 fn files_are_at_cargos_paths_in_their_roots() {
     let built = lowered(&units()).unwrap();
-    let db = built.lowered.snapshot();
+    let db = built.lowered.db();
     let paths = built.lowered.paths();
     let lib_root = krate(&built, LIB).data(&db).root_file_id;
     assert_eq!(paths.get(&lib_root).map(String::as_str), Some("/w/a/src/lib.rs"));
@@ -390,7 +390,7 @@ fn a_run_reaches_the_units_depending_on_it_and_no_other() {
         files: vec![("gen.rs".to_owned(), b"pub fn gen() {}\n".to_vec())],
     };
     built.lowered.ran(RUN, &ran).unwrap();
-    let db = built.lowered.snapshot();
+    let db = built.lowered.db();
     for unit in [LIB, LIB_TEST] {
         let krate = krate(&built, unit);
         assert!(krate.cfg_options(&db).check_atom(&flag("has_gen")), "unit {unit}");
@@ -408,12 +408,11 @@ fn a_run_reaches_the_units_depending_on_it_and_no_other() {
     assert!(root_of(&db, bin).file_for_path(&generated).is_none());
     assert!(root_of(&db, krate(&built, MACRO)).file_for_path(&generated).is_none());
     assert_eq!(built.lowered.paths().get(&file).map(String::as_str), Some(&*format!("{OUT_DIR}/gen.rs")));
-    drop(db);
 
     // Applied again without the file and the cfg, the run leaves neither.
     let again = Ran { cfgs: Vec::new(), files: Vec::new(), ..ran };
     built.lowered.ran(RUN, &again).unwrap();
-    let db = built.lowered.snapshot();
+    let db = built.lowered.db();
     assert!(!krate(&built, LIB).cfg_options(&db).check_atom(&flag("has_gen")));
     assert!(root_of(&db, krate(&built, LIB)).file_for_path(&generated).is_none());
     assert!(!built.lowered.paths().contains_key(&file));
@@ -435,7 +434,7 @@ fn lowering_twice_gives_equal_crates() {
     let units = units();
     let first = lowered(&units).unwrap();
     let second = lowered(&units).unwrap();
-    let (one, two) = (first.lowered.snapshot(), second.lowered.snapshot());
+    let (one, two) = (first.lowered.db(), second.lowered.db());
     for unit in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST] {
         assert_eq!(krate(&first, unit).content(&one), krate(&second, unit).content(&two), "unit {unit}");
     }
@@ -451,6 +450,114 @@ fn cfgs_parse_as_rustc_takes_them() {
     assert_eq!(crates::atom(r#"k="a\"b""#).unwrap(), key_value("k", "a\"b"));
     assert!(crates::atom("k=unquoted").is_err());
     assert!(crates::atom("1x").is_err());
+}
+
+/// Ambiguous for a type that is `Clone`, so naming its item there does not compile.
+trait AmbiguousIfClone<A> {
+    fn not_clone() {}
+}
+impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+#[allow(dead_code)]
+struct IsClone;
+impl<T: ?Sized + Clone> AmbiguousIfClone<IsClone> for T {}
+
+/// The database is one value shared by reference: it is `Sync` and `Send`, and has no `Clone`
+/// to make a handle with.
+const _: fn() = || {
+    fn shared<T: Send + Sync>() {}
+    shared::<Db>();
+    shared::<Lowered>();
+    <Db as AmbiguousIfClone<_>>::not_clone();
+};
+
+#[test]
+fn many_threads_read_the_one_database_by_reference() {
+    let mut built = lowered(&units()).unwrap();
+    let lowered = &built.lowered;
+    let alone: Vec<(usize, bool, Option<String>)> = [LIB, LIB_TEST, BIN, MACRO]
+        .into_iter()
+        .map(|unit| {
+            let krate = lowered.krate(unit).unwrap();
+            (unit, krate.cfg_options(lowered.db()).check_atom(&flag("test")), krate.env(lowered.db()).get("CARGO_PKG_NAME"))
+        })
+        .collect();
+    let read: Vec<Vec<(usize, bool, Option<String>)>> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..8)
+            .map(|at| {
+                scope.spawn(move || {
+                    let db: &Db = lowered.db();
+                    let mut units = [LIB, LIB_TEST, BIN, MACRO];
+                    units.rotate_left(at % 4);
+                    let mut seen: Vec<_> = units
+                        .into_iter()
+                        .map(|unit| {
+                            let krate = lowered.crates().krate(unit).unwrap();
+                            (unit, krate.cfg_options(db).check_atom(&flag("test")), krate.env(db).get("CARGO_PKG_NAME"))
+                        })
+                        .collect();
+                    seen.sort();
+                    seen
+                })
+            })
+            .collect();
+        threads.into_iter().map(|it| it.join().unwrap()).collect()
+    });
+    let mut alone = alone;
+    alone.sort();
+    assert!(read.iter().all(|it| *it == alone), "{read:?} against {alone:?}");
+    // Once no thread holds it, the one writer writes it.
+    let ran = Ran { cfgs: vec!["late".to_owned()], out_dir: OUT_DIR.to_owned(), ..Ran::default() };
+    built.lowered.ran(RUN, &ran).unwrap();
+    assert!(krate(&built, LIB).cfg_options(built.lowered.db()).check_atom(&flag("late")));
+}
+
+#[test]
+fn a_run_is_checked_as_it_would_be_applied() {
+    let built = lowered(&units()).unwrap();
+    let good = Ran { cfgs: vec!["x".to_owned()], out_dir: OUT_DIR.to_owned(), ..Ran::default() };
+    assert!(built.lowered.check_ran(RUN, &good).is_ok());
+    assert!(built.lowered.check_ran(LIB, &good).is_err());
+    let elsewhere = Ran { out_dir: "/w/target/other".to_owned(), ..Ran::default() };
+    assert!(built.lowered.check_ran(RUN, &elsewhere).is_err());
+    let bad = Ran { cfgs: vec!["k=unquoted".to_owned()], out_dir: OUT_DIR.to_owned(), ..Ran::default() };
+    let error = built.lowered.check_ran(RUN, &bad).unwrap_err();
+    assert_eq!(error.at.as_deref(), Some(&*built.lowered.crates().units[RUN].what));
+    assert!(built.lowered.check_macros(MACRO).is_ok() && built.lowered.check_macros(LIB).is_err());
+}
+
+#[test]
+fn a_units_identity_covers_what_it_is_made_from_deeply() {
+    let units = units();
+    let mut first = lowered(&units).unwrap();
+    let mut second = lowered(&units).unwrap();
+    let all = [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST];
+    let before: Vec<_> = all.iter().map(|&unit| first.lowered.identity(unit)).collect();
+    for (at, &unit) in all.iter().enumerate() {
+        assert!(before[at].is_some(), "unit {unit}");
+        assert_eq!(before[at], second.lowered.identity(unit), "unit {unit}: lowered twice");
+    }
+    assert_eq!(first.lowered.identity(RUN), None);
+    assert_ne!(first.lowered.identity(LIB), first.lowered.identity(LIB_TEST));
+
+    // A file the run leaves, and nothing else: the lib's own cfgs and env are as before, so
+    // only the file's content tells its identity apart, and the bin's through the lib's.
+    let ran = |text: &str| Ran {
+        out_dir: OUT_DIR.to_owned(),
+        files: vec![("gen.rs".to_owned(), text.as_bytes().to_vec())],
+        ..Ran::default()
+    };
+    first.lowered.ran(RUN, &ran("pub fn gen() {}\n")).unwrap();
+    let after: Vec<_> = all.iter().map(|&unit| first.lowered.identity(unit)).collect();
+    let changed = |unit| {
+        let at = all.iter().position(|it| *it == unit).unwrap();
+        before[at] != after[at]
+    };
+    assert!(changed(LIB) && changed(LIB_TEST) && changed(BIN));
+    assert!(!changed(CORE) && !changed(MACRO));
+    first.lowered.ran(RUN, &ran("pub fn gen() { loop {} }\n")).unwrap();
+    assert_ne!(first.lowered.identity(LIB), after[2]);
+    first.lowered.ran(RUN, &ran("pub fn gen() {}\n")).unwrap();
+    assert_eq!(first.lowered.identity(LIB), after[2], "the same inputs, the same identity");
 }
 
 #[test]

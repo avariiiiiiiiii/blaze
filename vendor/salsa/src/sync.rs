@@ -79,6 +79,16 @@ pub mod shim {
             }
         }
 
+        pub fn get_mut(&mut self) -> Option<&mut T> {
+            let initialized = *self.0.lock();
+            if initialized {
+                // SAFETY: The value is initialized, and `&mut self` makes this the only access.
+                Some(unsafe { self.1.get_mut().assume_init_mut() })
+            } else {
+                None
+            }
+        }
+
         pub fn get_or_init<F>(&self, f: F) -> &T
         where
             F: FnOnce() -> T,

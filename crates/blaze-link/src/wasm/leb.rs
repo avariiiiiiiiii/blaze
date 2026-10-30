@@ -175,6 +175,21 @@ mod tests {
     }
 
     #[test]
+    fn writes_into_room_allocate_nothing() {
+        let mut out = Vec::with_capacity(64);
+        let mut place = [0; 10];
+        let written = blaze_alloc_count::assert_at_most(0, "LEB128 writes into room", || {
+            uleb(&mut out, 624_485);
+            sleb(&mut out, -123_456);
+            i32_const(&mut out, -2);
+            name(&mut out, "ab");
+            (padded_uleb(5), padded_sleb(-1), uleb_into(&mut place, u64::MAX))
+        });
+        assert_eq!(written, (padded_uleb(5), padded_sleb(-1), 10));
+        assert_eq!(out, [0xe5, 0x8e, 0x26, 0xc0, 0xbb, 0x78, 0x41, 0x7e, 0x0b, 2, b'a', b'b']);
+    }
+
+    #[test]
     fn framing() {
         let mut out = Vec::new();
         custom(&mut out, "ab", &[7]);

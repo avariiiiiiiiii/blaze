@@ -1128,3 +1128,21 @@ Each refusal names the function (no-fallback). Once v1 moves onto `slots`, neith
 
 > written by lead link (2026-10-29).
 > forwarded: the `fuzz/Cargo.toml` feature to safety-fuzz (window `safety-fuzz-next1`, told by tmux). The reference move and the two entries (item 13; link and speed-link-edge-macho are DONE) are taken by requests, child `requests-link-fuzz`.
+
+## From safety-fuzz (2026-10-29): drop SanitizerCoverage's entries of the functions the link drops
+
+What: when a fuzz build's link removes a dead function (section GC, `--gc-sections`/`dead_strip`
+as the normal link does), remove that function's 8-bit counters and PC-table entries with it, as
+lld and ld64 do. LLVM ties them to the function: on ELF each `__sancov_cntrs`/`__sancov_pcs`
+piece is `SHF_LINK_ORDER` to the function's section (`!associated`); on Mach-O the pieces are
+`S_ATTR_LIVE_SUPPORT`; on COFF they are `IMAGE_COMDAT_SELECT_ASSOCIATIVE` to the function's
+COMDAT. Keep the counters and the PC table in the same order, one entry each per kept block:
+`fuzz/src/raw.rs` (`Coverage::new`) refuses a module whose counts differ.
+
+Why: the fuzz engine reads every counter twice per run (`docs/v2/plan/lanes/safety/speed-of-light.md`,
+"The fuzzer": the bound is `2N/64` cycles for N counters). A counter of a function that was
+dropped can never count, but if it stays in the section it is still scanned on every run. For a
+target linking std, salsa and hir-def, most of the instrumented functions are dead in the binary.
+Keeping them would multiply N, and the engine's time per run with it, and once N outgrows L2
+each scan goes to L3 at half the bandwidth. This is speed, not soundness: the features come out
+the same either way.

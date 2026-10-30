@@ -184,7 +184,7 @@ impl Fake {
                 self.queue.complete(answer, self.now, &mut effects);
             }
         }
-        self.results.extend(self.queue.take());
+        self.results.extend(self.queue.drain());
     }
 
     /// The clock moved on by `by`, each timer due by then fired at its time, the earliest
@@ -314,6 +314,8 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
     assert_eq!(result.took, Duration::from_millis(40));
     assert_eq!(result.trace, lines(&[(Seen::Read, "/lib/libc.so"), (Seen::Read, "/ws/b.txt")]));
     assert_eq!(result.executed, unrecorded());
+    let Trace::Lines(b_read) = &result.trace else { panic!("{result:?}") };
+    assert_eq!(b_read.common(), 1);
     // A core is free: a runs.
     let a = fake.run(conn, 0);
     fake.append(0, &[Line::new(Seen::Env, "c", "HOME")]);
@@ -323,9 +325,18 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
     let Trace::Lines(read) = &result.trace else { panic!("{result:?}") };
     let read: Vec<(Seen, &str)> = read.iter().collect();
     assert!(read.contains(&(Seen::Env, "HOME")) && read.contains(&(Seen::Read, "/ws/c.txt")), "{read:?}");
+    // No line of every scope came between b's result and c's: they share one buffer of them.
+    let (Trace::Lines(b_read), Trace::Lines(c_read)) = (&fake.result("b").trace, &fake.result("c").trace) else { panic!() };
+    assert!(c_read.common_is(b_read) && c_read.common() == 1);
     assert!(fake.frames(conn).is_empty());
+    // One comes before a's result: a's has a new buffer of both.
+    fake.append(0, &[Line::new(Seen::Read, "", "/lib/libm.so")]);
     fake.end(conn, a, End::Exited(0), b"");
     assert_eq!(fake.result("a").outcome, Outcome::Passed);
+    let (Trace::Lines(a_read), Trace::Lines(c_read)) = (&fake.result("a").trace, &fake.result("c").trace) else { panic!() };
+    assert!(!a_read.common_is(c_read) && a_read.common() == 2);
+    assert_eq!(a_read.iter().take(2).collect::<Vec<_>>(), [(Seen::Read, "/lib/libc.so"), (Seen::Read, "/lib/libm.so")]);
+    assert_eq!(c_read.iter().take(1).collect::<Vec<_>>(), [(Seen::Read, "/lib/libc.so")]);
     // Nothing is left: the server is told to quit, and the queue is done once it has ended.
     assert_eq!(fake.frames(conn), vec![Frame::Quit]);
     assert!(!fake.queue.finished());
@@ -601,11 +612,14 @@ fn a_line_being_written_waits_for_the_next_read() {
 
 #[test]
 fn a_package_that_opts_out_runs_whole_as_libtest_s_threads() {
-    let mut ignored = job("y", 5);
-    ignored.ignore = true;
-    let mut old = binary("old", vec![job("x", 5), ignored]);
-    old.mode = Mode::Threads { args: vec!["--nocapture".into()], timeout: Duration::from_secs(10) };
-    let mut fake = Fake::new(config(4), vec![old.clone()]);
+    let old = || {
+        let mut ignored = job("y", 5);
+        ignored.ignore = true;
+        let mut old = binary("old", vec![job("x", 5), ignored]);
+        old.mode = Mode::Threads { args: vec!["--nocapture".into()], timeout: Duration::from_secs(10) };
+        old
+    };
+    let mut fake = Fake::new(config(4), vec![old()]);
     assert!(fake.records.is_empty() && fake.listens.is_empty());
     let command = &fake.spawns[0].1;
     let args: Vec<String> = command.args.iter().map(|it| it.to_string_lossy().into_owned()).collect();
@@ -619,7 +633,7 @@ fn a_package_that_opts_out_runs_whole_as_libtest_s_threads() {
     assert_eq!(whole.executed, Executed::Not(WHOLE_UNRECORDED.to_owned()));
     assert!(fake.queue.finished());
 
-    let mut fake = Fake::new(config(4), vec![old]);
+    let mut fake = Fake::new(config(4), vec![old()]);
     fake.advance(Duration::from_millis(9_999));
     assert!(fake.kills.is_empty());
     fake.advance(Duration::from_millis(1));
@@ -699,7 +713,7 @@ fn the_queue_under_a_simulated_driver() {
                 assert!(queue.owns(completion.tag), "seed {seed}");
                 queue.complete(completion, sim.now(), &mut effects);
             }
-            results.extend(queue.take());
+            results.extend(queue.drain());
             for (b, server) in played.iter_mut().enumerate() {
                 let socket = Address::Unix(name(&format!("req/1/t{b}")));
                 let Some(conn) = server.conn.or_else(|| sim.dial(&socket).ok()) else { continue };

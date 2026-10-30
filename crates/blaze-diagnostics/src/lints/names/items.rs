@@ -62,33 +62,44 @@ pub(super) fn before_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
     found
 }
 
+/// The crate's items in the order rustc visits them, walked once for every pass after the abort.
+pub(super) struct Walk {
+    items: Vec<Item>,
+}
+
+impl Walk {
+    pub(super) fn of(cx: &Cx<'_, '_>) -> Walk {
+        Walk { items: walk::items(cx) }
+    }
+}
+
 /// `check_private_in_public`: `private_interfaces` and `private_bounds`.
-pub(super) fn private_in_public(cx: &Cx<'_, '_>) -> Vec<Found> {
-    privacy::lints(cx, &walk::items(cx))
+pub(super) fn private_in_public(cx: &Cx<'_, '_>, walk: &Walk) -> Vec<Found> {
+    privacy::lints(cx, &walk.items)
 }
 
 /// rustc's late module pass over each item, in the order of `BuiltinCombinedLateLintModPass`.
-pub(super) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let items = walk::items(cx);
-    let effective = visibility::Effective::of(cx, &items);
-    let canonical = runtime_symbols::Canonical::of(cx, &items);
+pub(super) fn after_abort(cx: &Cx<'_, '_>, walk: &Walk) -> Vec<Found> {
+    let items = &walk.items;
+    let effective = visibility::Effective::of(cx, items);
+    let canonical = runtime_symbols::Canonical::of(cx, items);
     let krate = Krate::of(cx);
     let mut found = docs::krate(cx);
     found.extend(naming::krate(cx));
     for (index, item) in items.iter().enumerate() {
         found.extend(externs::ctypes_item(cx, item, &krate));
         found.extend(naming::item(cx, item));
-        found.extend(derives::copy(cx, item, &effective));
+        found.extend(derives::copy(cx, item, &effective, &krate));
         found.extend(bounds::type_alias(cx, item, &krate));
         found.extend(mangle::item(cx, item));
         found.extend(publicity::item(cx, item, &effective));
         found.extend(track_caller::item(cx, item, krate.async_fn_track_caller));
         found.extend(bounds::drop(cx, item, &krate));
-        found.extend(derives::debug(cx, item, &effective));
+        found.extend(derives::debug(cx, item, &effective, &krate));
         found.extend(docs::item(cx, item, &effective));
         found.extend(traits::async_fn(cx, item, &effective, &krate));
         found.extend(non_local::item(cx, item));
-        found.extend(runtime_symbols::item(cx, item, item.held(&items, index), &canonical));
+        found.extend(runtime_symbols::item(cx, item, item.held(items, index), &canonical));
         found.extend(externs::ctypes_nested(cx, item));
         found.extend(lifetime_syntax::item(cx, item, krate.anonymous_lifetime_in_impl_trait));
         found.extend(c_void::item(cx, item, &krate));
@@ -106,6 +117,8 @@ pub(super) struct Krate {
     pub(super) aix: bool,
     pub(super) c_void: Option<hir::Enum>,
     pub(super) drop: Option<hir_def::TraitId>,
+    pub(super) copy: Option<hir_def::TraitId>,
+    pub(super) debug: Option<hir_def::TraitId>,
     /// `core::mem::needs_drop` as rustc prints it, found when a `Drop` bound first needs it.
     needs_drop: OnceCell<Option<String>>,
 }
@@ -123,6 +136,8 @@ impl Krate {
             aix: cx.krate.cfg(cx.db).get_cfg_values("target_os").any(|it| it.as_str() == "aix"),
             c_void: lang.CVoid.map(hir::Enum::from),
             drop: lang.Drop,
+            copy: lang.Copy,
+            debug: lang.Debug,
             needs_drop: OnceCell::new(),
         }
     }
@@ -133,8 +148,8 @@ impl Krate {
 }
 
 /// `clashing_extern_declarations`, its own query after the late lint passes.
-pub(super) fn clashing_extern_declarations(cx: &Cx<'_, '_>) -> Vec<Found> {
-    externs::lints(cx, &walk::items(cx))
+pub(super) fn clashing_extern_declarations(cx: &Cx<'_, '_>, walk: &Walk) -> Vec<Found> {
+    externs::lints(cx, &walk.items)
 }
 
 /// rustc's `def_span` of an item, an associated or foreign item, a variant or a field: a

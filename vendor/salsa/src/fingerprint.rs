@@ -162,7 +162,7 @@ impl<const C: usize, const D: usize> Sip<C, D> {
 
     /// The two 64-bit halves of the 128-bit hash, low half first.
     pub fn finish128(&self) -> (u64, u64) {
-        let mut state = self.clone();
+        let mut state = Sip { ..*self };
         let last = ((self.length as u64 & 0xff) << 56) | self.tail;
         state.compress(last);
         state.v2 ^= 0xee;

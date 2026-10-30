@@ -33,13 +33,13 @@ use hir_expand::{
 use hir_ide::{
     InferBodyId, InferenceResult, LoweringMode,
     db::AnonConstId,
-    diagnostics::unsafe_operations,
     infer_query_with_inspect,
     next_solver::{
         AnyImplId, DbInterner,
         format_proof_tree::{ProofTreeData, dump_proof_tree_structured},
     },
 };
+use hir_ty_unsafeck::unsafe_operations;
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1749,7 +1749,7 @@ impl<'db> SemanticsImpl<'db> {
         analyzer.expr_adjustments(expr).map(|it| {
             it.iter()
                 .map(|adjust| {
-                    let target = analyzer.ty(adjust.target.as_ref());
+                    let target = analyzer.ty(self.db, adjust.target.as_ref());
                     let kind = match adjust.kind {
                         hir_ide::Adjust::NeverToAny => Adjust::NeverToAny,
                         hir_ide::Adjust::Deref(Some(hir_ide::OverloadedDeref(m))) => {

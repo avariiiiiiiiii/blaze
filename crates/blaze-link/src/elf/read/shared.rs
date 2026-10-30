@@ -1,15 +1,15 @@
 //! Shared objects (`ET_DYN`): what an image may import from them.
 
 use object::elf;
-use object::read::elf::{Dyn as _, FileHeader as _, SectionHeader as _, Sym as _};
+use object::read::elf::{Dyn as _, FileHeader as _, Sym as _};
 
+use super::strings::Table;
 use super::{ENDIAN, Header};
 use crate::model::{Names, Shared, SharedSymbol};
 
 /// Reads the shared object `data`, whose header [`super::read`] checked.
 pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
     let error = |error: object::read::Error| format!("{name}: {error}");
-    let full = super::full(name);
     let header = Header::parse(data).map_err(error)?;
     let sections = header.sections(ENDIAN, data).map_err(error)?;
     let dynsym = sections.symbols(ENDIAN, data, elf::SHT_DYNSYM).map_err(error)?;
@@ -30,9 +30,12 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
         }
     }
 
-    // The names are `.dynstr`'s: it sizes the arena.
-    let dynstr = sections.section(dynsym.string_section()).map_or(0, |it| it.sh_size(ENDIAN));
-    let mut names = Names::with_capacity(dynstr.min(data.len() as u64) as usize);
+    // The names are `.dynstr`'s, each string pushed once: the arena is at most its size.
+    let mut dynstr = match dynsym.len() {
+        0 => Table::new(name, &[])?,
+        _ => super::table(name, &sections, dynsym.string_section(), data)?,
+    };
+    let mut names = Names::with_capacity(dynstr.size());
     let mut symbols = Vec::with_capacity(dynsym.len());
     let mut versions: Vec<String> = Vec::new();
     // By ELF version index (at most 0x7fff): its slot in `versions` once seen, `None` inside
@@ -47,8 +50,13 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
             elf::STB_WEAK => true,
             _ => continue,
         };
-        let symbol_name =
-            super::utf8(name, "the symbol name", dynsym.symbol_name(ENDIAN, symbol).map_err(error)?)?;
+        // Read for an error only: the name is pushed once the symbol is known to be kept.
+        let symbol_name = || {
+            dynsym.symbol_name(ENDIAN, symbol).map_or_else(
+                |_| format!("at string offset {}", symbol.st_name(ENDIAN)),
+                |it| String::from_utf8_lossy(it).into_owned(),
+            )
+        };
         let version = match &table {
             None => None,
             Some(table) => {
@@ -64,7 +72,7 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
                     Some(slot) => slot,
                     None => {
                         let found = table.version(version).map_err(|error| {
-                            format!("{name}: symbol {symbol_name}: {error}")
+                            format!("{name}: symbol {}: {error}", symbol_name())
                         })?;
                         let slot = match found {
                             None => None,
@@ -90,7 +98,7 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
             }
         };
         symbols.push(SharedSymbol {
-            name: names.push(symbol_name).map_err(full)?,
+            name: dynstr.name(&mut names, name, "the symbol name", symbol.st_name(ENDIAN))?,
             version,
             kind: super::kind(symbol.st_type()),
             weak,

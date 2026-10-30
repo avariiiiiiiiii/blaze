@@ -27,7 +27,7 @@ pub mod select;
 #[allow(dead_code)]
 pub mod wire;
 
-use std::time::Duration;
+use std::{io::Write as _, time::Duration};
 
 pub use queue::{Binary, Config, Failure, Finished, Job, Lines, Mode, Outcome, Queue, Trace};
 pub use select::{
@@ -100,21 +100,19 @@ pub fn report(binary: &str, finished: &Finished) -> Option<Report> {
         Outcome::Failed(_) => Reported::Failed,
         Outcome::NotRun => return None,
     };
-    let mut output = finished.output.clone();
+    let mut output = finished.output.clone(); // clone: the API's report owns its output
     if let Outcome::Failed(failure) = &finished.outcome {
-        let why = match failure {
-            Failure::Code(_) => None,
-            Failure::Signal(signal) => Some(format!("ended by signal {signal}")),
-            Failure::TimedOut(after) => Some(format!("killed after its timeout of {after:?}")),
-            Failure::Lost(why) => Some(why.clone()),
+        // Into the output's own buffer, with no string of its own.
+        _ = match failure {
+            Failure::Code(_) => Ok(()),
+            Failure::Signal(signal) => write!(output, "\n[blaze: ended by signal {signal}]\n"),
+            Failure::TimedOut(after) => write!(output, "\n[blaze: killed after its timeout of {after:?}]\n"),
+            Failure::Lost(why) => write!(output, "\n[blaze: {why}]\n"),
         };
-        if let Some(why) = why {
-            output.extend_from_slice(format!("\n[blaze: {why}]\n").as_bytes());
-        }
     }
     Some(Report {
-        binary: binary.to_owned(),
-        name: finished.test.clone().unwrap_or_default(),
+        binary: binary.to_owned(), // alloc: the API's report owns its names (the edge)
+        name: finished.test.clone().unwrap_or_default(), // clone: the API's report owns its names (the edge)
         outcome,
         output,
         millis: millis(finished.took),
@@ -124,10 +122,10 @@ pub fn report(binary: &str, finished: &Finished) -> Option<Report> {
 /// A test that did not run: ignored, or skipped because its pass is kept.
 pub fn report_unrun(binary: &str, name: &str, outcome: Reported, took: Option<Duration>) -> Report {
     Report {
-        binary: binary.to_owned(),
-        name: name.to_owned(),
+        binary: binary.to_owned(), // alloc: the API's report owns its names (the edge)
+        name: name.to_owned(), // alloc: the API's report owns its names (the edge)
         outcome,
-        output: Vec::new(),
+        output: Vec::new(), // alloc: empty, allocates nothing
         millis: took.map_or(0, millis),
     }
 }

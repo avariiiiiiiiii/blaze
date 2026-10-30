@@ -70,6 +70,7 @@ impl<K: Ord + Copy, V> IdTable<K, V> {
 
     /// The same ids, each value as `f` makes it of the old.
     pub(crate) fn map<W>(&self, mut f: impl FnMut(K, &V) -> W) -> IdTable<K, W> {
+        // alloc: the new table, one exact allocation (the iterator is exact-size)
         IdTable(self.0.iter().map(|(id, value)| (*id, f(*id, value))).collect())
     }
 }
@@ -217,19 +218,6 @@ impl<T, N> Default for BackMap<T, N> {
     }
 }
 
-impl<T, N> Clone for BackMap<T, N> {
-    fn clone(&self) -> Self {
-        BackMap {
-            kinds: self.kinds.clone(),
-            starts: self.starts.clone(),
-            ends: self.ends.clone(),
-            run_starts: self.run_starts.clone(),
-            run_files: self.run_files.clone(),
-            of: PhantomData,
-        }
-    }
-}
-
 impl<T, N> PartialEq for BackMap<T, N> {
     fn eq(&self, other: &Self) -> bool {
         self.kinds == other.kinds
@@ -323,30 +311,54 @@ impl<T, N: AstNode> BackMap<T, N> {
         )
     }
 
-    /// The same map with the pointers into `mv.file` moved. Moving keeps each id in its file, so
-    /// only the runs of `mv.file` are walked and the runs stay as they are.
+    /// The same map with the pointers into `mv.file` moved, each column written once: the runs
+    /// of other files are copied as slices, only those of `mv.file` are walked. Moving keeps each
+    /// id in its file, so the runs stay as they are.
     fn moved(&self, mv: &Move<'_>) -> Self {
-        let mut moved = self.clone();
+        let len = self.len();
+        let (mut kinds, mut starts, mut ends) =
+            (Vec::with_capacity(len), Vec::with_capacity(len), Vec::with_capacity(len));
+        let mut slot = 0;
         for (run, &file) in self.run_files.iter().enumerate() {
+            let end = self.run_starts.get(run + 1).map_or(len, |&next| next as usize);
             if file != mv.file {
+                kinds.extend_from_slice(&self.kinds[slot..end]);
+                starts.extend_from_slice(&self.starts[slot..end]);
+                ends.extend_from_slice(&self.ends[slot..end]);
+                slot = end;
                 continue;
             }
-            let start = self.run_starts[run] as usize;
-            let end = self.run_starts.get(run + 1).map_or(self.len(), |&next| next as usize);
-            for slot in start..end {
-                let kind = self.kinds[slot];
+            for at in slot..end {
+                let kind = self.kinds[at];
                 if kind == NO_SOURCE {
+                    kinds.push(NO_SOURCE);
+                    starts.push(0);
+                    ends.push(0);
                     continue;
                 }
-                let to = (mv.to)(self.ptr(slot, kind).syntax_node_ptr());
+                let to = (mv.to)(self.ptr(at, kind).syntax_node_ptr());
                 let ptr = AstPtr::<N>::try_from_raw(to).expect("moved to another kind");
                 let range = ptr.text_range();
-                moved.kinds[slot] = u16::from(ptr.kind());
-                moved.starts[slot] = range.start().into();
-                moved.ends[slot] = range.end().into();
+                kinds.push(u16::from(ptr.kind()));
+                starts.push(range.start().into());
+                ends.push(range.end().into());
             }
+            slot = end;
         }
-        moved
+        // A map with no syntax has no runs: its slots are all copied here.
+        kinds.extend_from_slice(&self.kinds[slot..]);
+        starts.extend_from_slice(&self.starts[slot..]);
+        ends.extend_from_slice(&self.ends[slot..]);
+        BackMap {
+            kinds: kinds.into_boxed_slice(),
+            starts: starts.into_boxed_slice(),
+            ends: ends.into_boxed_slice(),
+            // clone: the moved map owns its runs, which a move leaves as they are
+            run_starts: self.run_starts.clone(),
+            // clone: as `run_starts`
+            run_files: self.run_files.clone(),
+            of: PhantomData,
+        }
     }
 }
 
@@ -380,6 +392,7 @@ pub(crate) struct BackPushes<T, N: AstNode>(Vec<(Idx<T>, InFile<AstPtr<N>>)>);
 
 impl<T, N: AstNode> Default for BackPushes<T, N> {
     fn default() -> Self {
+        // alloc: none (an empty `Vec`); a pooled builder keeps its room across bodies
         BackPushes(Vec::new())
     }
 }
@@ -492,6 +505,7 @@ impl BindingPats {
             assert!(pushed.is_empty(), "a pattern for a binding of a store without bindings");
             return BindingPats::default();
         }
+        // alloc: the output offsets, one exact allocation
         let mut starts = vec![0u32; bindings + 1];
         for &(binding, _) in pushed.iter() {
             starts[raw(binding) as usize + 1] += 1;
@@ -499,6 +513,7 @@ impl BindingPats {
         for at in 1..starts.len() {
             starts[at] += starts[at - 1];
         }
+        // alloc: the output patterns, one exact allocation
         let mut pats = vec![idx::<Pat<'static>>(0); pushed.len()];
         // Each binding's start is its cursor; once placed, it is where the next one starts.
         for &(binding, pat) in pushed.iter() {
@@ -648,6 +663,7 @@ impl PartialEq for ExpressionStoreSourceMap {
 /// Moves the pointers into `file` of a source map: [`ExpressionStoreSourceMap::moved`].
 pub(crate) struct Move<'a> {
     pub(crate) file: HirFileId,
+    // dyn: one indirect call per pointer moved, beside the tree search each `to` makes
     pub(crate) to: &'a dyn Fn(SyntaxNodePtr) -> SyntaxNodePtr,
 }
 
@@ -665,6 +681,7 @@ impl Move<'_> {
         &self,
         map: &SourceTable<InFile<AstPtr<N>>, V>,
     ) -> SourceTable<InFile<AstPtr<N>>, V> {
+        // alloc: the moved pairs, sorted in place and copied once into the exact table
         let mut moved = map.iter().map(|(&src, &id)| (self.ptr(src), id)).collect::<Vec<_>>();
         SourceTable::from_pushed(&mut moved)
     }
@@ -686,7 +703,9 @@ impl ExpressionStoreSourceMap {
         let lifetime_map_back = self.lifetime_map_back.moved(mv);
         let expr_only = self.expr_only.as_deref().map(|it| {
             let template_map = it.template_map.as_deref().map(|it| FormatTemplate {
+                // clone: the moved map owns its tables; captures hold no pointers to move
                 format_args_to_captures: it.format_args_to_captures.clone(),
+                // clone: as `format_args_to_captures`
                 asm_to_captures: it.asm_to_captures.clone(),
                 implicit_capture_to_source: it.implicit_capture_to_source.map(|_, src| {
                     let (ptr, range) = src.value;
@@ -694,6 +713,7 @@ impl ExpressionStoreSourceMap {
                     InFile::new(src.file_id, (ptr, range))
                 }),
             });
+            // alloc: the moved map's one box, as the map it moves has
             Box::new(ExpressionOnlySourceMap {
                 expr_map: mv.forth(&it.expr_map),
                 expr_map_back: it.expr_map_back.moved(mv),
@@ -701,16 +721,20 @@ impl ExpressionStoreSourceMap {
                 pat_map_back: it.pat_map_back.moved(mv),
                 label_map: mv.forth(&it.label_map),
                 label_map_back: it.label_map_back.moved(mv),
+                // clone: ids only, which a move leaves as they are
                 binding_definitions: it.binding_definitions.clone(),
                 field_map_back: it.field_map_back.map(|_, &src| mv.ptr(src)),
                 pat_field_map_back: it.pat_field_map_back.map(|_, &src| mv.ptr(src)),
                 template_map: template_map.map(Box::new),
                 expansions: mv.forth(&it.expansions),
+                // alloc: diagnostics are rare; empty, this allocates nothing
                 diagnostics: it.diagnostics.iter().map(|it| it.moved(mv)).collect(),
             })
         });
+        // alloc: the forward pairs, sorted in place and copied once into the exact table
         let mut types_map: Vec<_> = types_map_back.iter().map(|(id, src)| (src, id)).collect();
         let mut lifetime_map: Vec<_> =
+            // alloc: as `types_map`
             lifetime_map_back.iter().map(|(id, src)| (src, id)).collect();
         ExpressionStoreSourceMap {
             expr_only,
@@ -726,17 +750,22 @@ impl ExpressionStoreDiagnostics {
     fn moved(&self, mv: &Move<'_>) -> Self {
         use ExpressionStoreDiagnostics::*;
         match self {
+            // clone: error path
             InactiveCode { node, cfg } => InactiveCode { node: mv.raw(*node), cfg: cfg.clone() },
             UnresolvedMacroCall { node, path } => {
+                // clone: error path
                 UnresolvedMacroCall { node: mv.ptr(*node), path: path.clone() }
             }
             UnreachableLabel { node, name } => {
+                // clone: error path
                 UnreachableLabel { node: mv.ptr(*node), name: name.clone() }
             }
             AwaitOutsideOfAsync { node, location } => {
+                // clone: error path
                 AwaitOutsideOfAsync { node: mv.ptr(*node), location: location.clone() }
             }
             UndeclaredLabel { node, name } => {
+                // clone: error path
                 UndeclaredLabel { node: mv.ptr(*node), name: name.clone() }
             }
             PatternArgInExternFn { node } => PatternArgInExternFn { node: mv.ptr(*node) },

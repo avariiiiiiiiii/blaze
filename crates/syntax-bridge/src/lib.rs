@@ -32,6 +32,10 @@ pub use ::parser::TopEntryPoint;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 pub trait SpanMapper {
     fn span_for(&self, range: TextRange) -> Span;
 
@@ -152,6 +156,7 @@ where
     }
     let mut c =
         Converter::new(node, map, Default::default(), Default::default(), span, mode, |_, _| {
+            // alloc: empty, which allocates nothing.
             (true, Vec::new())
         });
     convert_tokens(&mut c, 0)
@@ -203,10 +208,10 @@ const KEEP_INPUT: usize = 1 << 16;
 /// The parser reads the tokens' kinds from one pass over the tree's columns
 /// ([`to_parser_input_into`]) into an input kept per thread, and the tree is built straight
 /// from its events and the tokens: nothing is parsed twice and no text is lexed.
-pub fn token_tree_to_syntax_node(
+pub fn token_tree_to_syntax_node<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     tt: &tt::TopSubtree,
     entry_point: parser::TopEntryPoint,
-    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    span_to_edition: &mut F,
 ) -> (Parse<SyntaxNode>, SpanMap) {
     let buffer = tt.view().strip_invisible();
     let mut parser_input =
@@ -238,6 +243,7 @@ pub(crate) fn parse_tokens(
             }
             parser::Step::Enter { kind } => tree_sink.start_node(kind),
             parser::Step::Exit => tree_sink.finish_node(),
+            // alloc: an error's message.
             parser::Step::Error { msg } => tree_sink.error(msg.to_owned()),
         }
     }
@@ -336,6 +342,7 @@ where
                 builder.open(delim, span);
                 continue;
             }
+            // clone: a leaf is a symbol, a span and a few bits, with nothing to allocate.
             Some(leaf) => leaf.clone(),
             None => match token.kind(conv) {
                 // Desugar doc comments into doc attributes
@@ -888,30 +895,29 @@ where
     }
 
     fn bump(&mut self) -> Option<(Self::Token, TextRange)> {
-        if let Some((punct, offset)) = self.punct_offset.clone()
-            && usize::from(offset) + 1 < punct.text().len()
+        if let Some((punct, offset)) = &mut self.punct_offset
+            && usize::from(*offset) + 1 < punct.text().len()
         {
-            let offset = offset + TextSize::of('.');
-            let range = punct.text_range();
-            self.punct_offset = Some((punct.clone(), offset));
-            let range = TextRange::at(range.start() + offset, TextSize::of('.'));
-            return Some((
-                SynToken::Punct { token: punct, offset: u32::from(offset) as usize },
-                range,
-            ));
+            *offset += TextSize::of('.');
+            let range = TextRange::at(punct.text_range().start() + *offset, TextSize::of('.'));
+            let offset = u32::from(*offset) as usize;
+            // clone: a token handle, for the token returned as well as the one kept.
+            return Some((SynToken::Punct { token: punct.clone(), offset }, range));
         }
 
         if let Some(leaf) = self.current_leaves.pop_front() {
             return Some((SynToken::Leaf(leaf), TextRange::empty(TextSize::new(0))));
         }
 
-        let curr = self.current.clone()?;
+        let curr = self.current.take()?;
         if !self.range.contains_range(curr.text_range()) {
+            self.current = Some(curr);
             return None;
         }
 
         self.current = self.next_token();
         let token = if curr.kind().is_punct() {
+            // clone: a token handle, for the token returned as well as the one kept.
             self.punct_offset = Some((curr.clone(), 0.into()));
             let range = curr.text_range();
             let range = TextRange::at(range.start(), TextSize::of('.'));
@@ -926,17 +932,21 @@ where
     }
 
     fn peek(&self) -> Option<Self::Token> {
-        if let Some((punct, mut offset)) = self.punct_offset.clone() {
-            offset += TextSize::of('.');
+        if let Some((punct, offset)) = &self.punct_offset {
+            let offset = *offset + TextSize::of('.');
             if usize::from(offset) < punct.text().len() {
-                return Some(SynToken::Punct { token: punct, offset: usize::from(offset) });
+                let offset = usize::from(offset);
+                // clone: a token handle, for the token returned.
+                return Some(SynToken::Punct { token: punct.clone(), offset });
             }
         }
 
-        let curr = self.current.clone()?;
+        let curr = self.current.as_ref()?;
         if !self.range.contains_range(curr.text_range()) {
             return None;
         }
+        // clone: a token handle, for the token returned.
+        let curr = curr.clone();
 
         let token = if curr.kind().is_punct() {
             SynToken::Punct { token: curr, offset: 0_usize }
@@ -1166,11 +1176,13 @@ impl<'a> TtTreeSink<'a> {
     /// A sink for the parse of the `tokens` input tokens `cursor` walks.
     fn new(cursor: Cursor<'a>, tokens: usize) -> Self {
         TtTreeSink {
+            // alloc: one buffer per parse, for the text of the token being written.
             buf: String::new(),
             cursor,
             text_pos: 0.into(),
             inner: SyntaxTreeBuilder::default(),
             token_map: SpanMap::with_capacity(tokens),
+            // alloc: one buffer per parse, at its first fragment, as deep as they nest.
             open_fragments: Vec::new(),
             token_end: 0.into(),
         }
@@ -1248,7 +1260,8 @@ impl TtTreeSink<'_> {
                 self.text_pos += TextSize::of(text);
             }
             None => {
-                self.error("illegal float literal".to_owned());
+                // alloc: an error's message.
+        self.error("illegal float literal".to_owned());
                 self.inner.start_node(SyntaxKind::ERROR);
                 self.inner.token(SyntaxKind::FLOAT_NUMBER, text);
                 self.token_map.push(self.text_pos + TextSize::of(text), span);

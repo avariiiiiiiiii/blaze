@@ -385,6 +385,8 @@ pub struct CfgAtom {
 }
 impl CfgAtom {
     #[inline]
+    pub fn literal(&self) -> Option<Literal> { support::child(&self.syntax) }
+    #[inline]
     pub fn eq_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![=]) }
     #[inline]
     pub fn false_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![false]) }
@@ -822,6 +824,15 @@ impl GenericParamList {
     #[inline]
     pub fn r_angle_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![>]) }
 }
+pub struct GuardPat {
+    pub(crate) syntax: SyntaxNode,
+}
+impl GuardPat {
+    #[inline]
+    pub fn guard(&self) -> Option<MatchGuard> { support::child(&self.syntax) }
+    #[inline]
+    pub fn pat(&self) -> Option<Pat> { support::child(&self.syntax) }
+}
 pub struct IdentPat {
     pub(crate) syntax: SyntaxNode,
 }
@@ -1192,6 +1203,8 @@ impl Module {
     pub fn semicolon_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![;]) }
     #[inline]
     pub fn mod_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![mod]) }
+    #[inline]
+    pub fn unsafe_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![unsafe]) }
 }
 pub struct MutRestriction {
     pub(crate) syntax: SyntaxNode,
@@ -1473,6 +1486,7 @@ impl RangePat {}
 pub struct RecordExpr {
     pub(crate) syntax: SyntaxNode,
 }
+impl ast::HasAttrs for RecordExpr {}
 impl RecordExpr {
     #[inline]
     pub fn path(&self) -> Option<Path> { support::child(&self.syntax) }
@@ -1601,7 +1615,11 @@ impl RefPat {
     #[inline]
     pub fn amp_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![&]) }
     #[inline]
+    pub fn const_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![const]) }
+    #[inline]
     pub fn mut_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![mut]) }
+    #[inline]
+    pub fn pin_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![pin]) }
 }
 pub struct RefType {
     pub(crate) syntax: SyntaxNode,
@@ -1967,6 +1985,8 @@ impl TypeBound {
     pub fn use_bound_generic_args(&self) -> Option<UseBoundGenericArgs> {
         support::child(&self.syntax)
     }
+    #[inline]
+    pub fn excl_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![!]) }
     #[inline]
     pub fn l_brack_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T!['[']) }
     #[inline]
@@ -2354,6 +2374,7 @@ pub enum Pat {
     CfgPredPat(CfgPredPat),
     ConstBlockPat(ConstBlockPat),
     DerefPat(DerefPat),
+    GuardPat(GuardPat),
     IdentPat(IdentPat),
     LiteralPat(LiteralPat),
     MacroPat(MacroPat),
@@ -4315,6 +4336,38 @@ impl Clone for GenericParamList {
 impl fmt::Debug for GenericParamList {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GenericParamList").field("syntax", &self.syntax).finish()
+    }
+}
+impl AstNode for GuardPat {
+    #[inline]
+    fn kind() -> SyntaxKind
+    where
+        Self: Sized,
+    {
+        GUARD_PAT
+    }
+    #[inline]
+    fn can_cast(kind: SyntaxKind) -> bool { kind == GUARD_PAT }
+    #[inline]
+    fn cast(syntax: SyntaxNode) -> Option<Self> {
+        if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
+    }
+    #[inline]
+    fn syntax(&self) -> &SyntaxNode { &self.syntax }
+}
+impl hash::Hash for GuardPat {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) { self.syntax.hash(state); }
+}
+impl Eq for GuardPat {}
+impl PartialEq for GuardPat {
+    fn eq(&self, other: &Self) -> bool { self.syntax == other.syntax }
+}
+impl Clone for GuardPat {
+    fn clone(&self) -> Self { Self { syntax: self.syntax.clone() } }
+}
+impl fmt::Debug for GuardPat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GuardPat").field("syntax", &self.syntax).finish()
     }
 }
 impl AstNode for IdentPat {
@@ -8849,6 +8902,10 @@ impl From<DerefPat> for Pat {
     #[inline]
     fn from(node: DerefPat) -> Pat { Pat::DerefPat(node) }
 }
+impl From<GuardPat> for Pat {
+    #[inline]
+    fn from(node: GuardPat) -> Pat { Pat::GuardPat(node) }
+}
 impl From<IdentPat> for Pat {
     #[inline]
     fn from(node: IdentPat) -> Pat { Pat::IdentPat(node) }
@@ -8918,6 +8975,7 @@ impl AstNode for Pat {
                 | CFG_PRED_PAT
                 | CONST_BLOCK_PAT
                 | DEREF_PAT
+                | GUARD_PAT
                 | IDENT_PAT
                 | LITERAL_PAT
                 | MACRO_PAT
@@ -8942,6 +9000,7 @@ impl AstNode for Pat {
             CFG_PRED_PAT => Pat::CfgPredPat(CfgPredPat { syntax }),
             CONST_BLOCK_PAT => Pat::ConstBlockPat(ConstBlockPat { syntax }),
             DEREF_PAT => Pat::DerefPat(DerefPat { syntax }),
+            GUARD_PAT => Pat::GuardPat(GuardPat { syntax }),
             IDENT_PAT => Pat::IdentPat(IdentPat { syntax }),
             LITERAL_PAT => Pat::LiteralPat(LiteralPat { syntax }),
             MACRO_PAT => Pat::MacroPat(MacroPat { syntax }),
@@ -8968,6 +9027,7 @@ impl AstNode for Pat {
             Pat::CfgPredPat(it) => &it.syntax,
             Pat::ConstBlockPat(it) => &it.syntax,
             Pat::DerefPat(it) => &it.syntax,
+            Pat::GuardPat(it) => &it.syntax,
             Pat::IdentPat(it) => &it.syntax,
             Pat::LiteralPat(it) => &it.syntax,
             Pat::MacroPat(it) => &it.syntax,
@@ -9274,6 +9334,7 @@ impl AstNode for AnyHasAttrs {
                 | PATH_EXPR
                 | PREFIX_EXPR
                 | RANGE_EXPR
+                | RECORD_EXPR
                 | RECORD_EXPR_FIELD
                 | RECORD_EXPR_FIELD_LIST
                 | RECORD_FIELD
@@ -9518,6 +9579,10 @@ impl From<PrefixExpr> for AnyHasAttrs {
 impl From<RangeExpr> for AnyHasAttrs {
     #[inline]
     fn from(node: RangeExpr) -> AnyHasAttrs { AnyHasAttrs { syntax: node.syntax } }
+}
+impl From<RecordExpr> for AnyHasAttrs {
+    #[inline]
+    fn from(node: RecordExpr) -> AnyHasAttrs { AnyHasAttrs { syntax: node.syntax } }
 }
 impl From<RecordExprField> for AnyHasAttrs {
     #[inline]
@@ -10466,6 +10531,11 @@ impl std::fmt::Display for GenericArgList {
     }
 }
 impl std::fmt::Display for GenericParamList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.syntax(), f)
+    }
+}
+impl std::fmt::Display for GuardPat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self.syntax(), f)
     }

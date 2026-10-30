@@ -301,3 +301,17 @@ fn tokens_are_read_on_demand() {
     assert!(tokens.next().is_none());
     assert!(Tokens::new("fn\r").is_err() && Tokens::new("\"\u{2067}\"").is_err());
 }
+
+/// Lexing allocates nothing: every token, an escaped string's included, borrows the source.
+#[test]
+fn lexing_allocates_nothing() {
+    let source = "//! Inner.\n/// Outer.\nfn main() { /* a /* nested */ comment */\n\
+                  println!(\"cargo:rustc-env=A={}\\n\\u{e9}\", 'c', '\\n', 0x1f_u8, 1.5e3);\n\
+                  print!(r#\"raw \"quoted\"\"#); let _ = ('a, \"x\" as &str, -3, true); }\n";
+    let tokens = blaze_alloc_count::assert_at_most(0, "lexing a script", || {
+        Tokens::new(source).unwrap().map(|it| it.unwrap()).count()
+    });
+    assert!(tokens > 40, "{tokens}");
+}
+
+pub(in crate::elide) mod reference;

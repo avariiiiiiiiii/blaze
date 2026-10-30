@@ -328,6 +328,7 @@ Besides the sites below:
   `DbInterner::new_no_crate(db)` (R5).
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
 > forwarded to db (told by solver-sync-callers; told again by requests).
+> applied by db-ty-port-ty: `mir_const_alias_kind`, the `#[splat]` index (lower.rs, waiting on hir-def's `FunctionSignature::splatted`, requested in `v2/requests/db-ty.md`), `splatted()` in infer/persist.rs, `TypingMode::Typeck` in infer/opaques.rs, both `TY_TABLE_SCHEMA`s. hir's `Type` item is hir's owner's.
 
 ### `crates/hir-ty-borrowck/src/check.rs`
 
@@ -339,6 +340,7 @@ Besides the sites below:
 - L2125: `regions::opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len())` → `regions::opaque_captures(self.ctx.db, def_id.into(), alias.args.len())`. R8: bind `def_id` in the `AliasTyKind::Opaque { .. }` pattern just above (`Opaque { def_id }`).
 - L2144: `TyKind::Alias(inner) => self.alias_test_holds(it, inner, lower, depth + 1),` → `TyKind::Alias(_, inner) => self.alias_test_holds(it, inner, lower, depth + 1),`
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ### `crates/hir-ty-borrowck/src/lib.rs`
 
@@ -351,6 +353,7 @@ Besides the sites below:
 
   R7: replaces this line and the next (`GeneralConstId::AnonConstId(id) = unevaluated.def.0`).
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ### `crates/hir-ty-borrowck/src/liveness.rs`
 
@@ -370,6 +373,7 @@ Besides the sites below:
 - L886: `for clause in item_bounds.into_iter().chain(ctx.env.caller_bounds().iter()) {` → `for clause in item_bounds.into_iter().chain(ctx.env.caller_bounds()) {`. R13
 - L887: `let ClauseKind::TypeOutlives(OutlivesPredicate(bounded, region)) =` → `let ClauseKind::TypeOutlives(OutlivesClause(bounded, region)) =`
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ### `crates/hir-ty-borrowck/src/polonius.rs`
 
@@ -377,6 +381,7 @@ Besides the sites below:
 - L274: `super::regions::opaque_captures(ctx.db, alias.kind.def_id(), alias.args.len())` → `super::regions::opaque_captures(ctx.db, def_id.into(), alias.args.len())`. R8: bind `def_id` in the `AliasTyKind::Opaque { .. }` pattern just above (`Opaque { def_id }`).
 - L298: `| TyKind::FnDef(_, args) => {` → `| TyKind::FnDef(_, args) => {`. R4: pattern unchanged; read `args` as `args.no_bound_vars().unwrap()` (once, `let args = args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ### `crates/hir-ty-borrowck/src/regions.rs`
 
@@ -491,11 +496,13 @@ Besides the sites below:
 - L6963: `TyKind::Alias(alias)` → `TyKind::Alias(_, alias)`
 - L6995: `TyKind::Adt(_, it) | TyKind::FnDef(_, it) => args(it, out),` → `TyKind::Adt(_, it) | TyKind::FnDef(_, it) => args(it, out),`. R4: pattern unchanged; read `it` as `it.no_bound_vars().unwrap()` (once, `let it = it.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ### `crates/hir-ty-wfcheck/src/lib.rs`
 
 - L410: `&& let TyKind::Alias(_, bounded) = bounded.kind()`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ### `crates/hir-ty-wfcheck/src/outlives.rs`
 
@@ -510,11 +517,13 @@ Besides the sites below:
 - L665: `TyKind::Alias(_, alias)`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.
 - L827: `let TyKind::Alias(_, alias) = ty.kind() else { return true };`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ### `crates/hir-ty/src/autoderef.rs`
 
 - L362: `Ty::new_projection(interner, IsRigid::No, trait_target.into(), [ty]),`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/builtin_derive.rs`
 
@@ -523,6 +532,7 @@ Besides the sites below:
 - L155: `EarlyBinder::bind(` → `EarlyBinder::bind(interner,`. R5
 - L371: `if let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) = t.kind() {`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/consteval.rs`
 
@@ -546,6 +556,7 @@ Besides the sites below:
 
 - L400: `UnevaluatedConst { def: GeneralConstId::AnonConstId(konst).into(), args },` → `(removed: folded into the `Const::new_alias` above)`. R7
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/dyn_compatibility.rs`
 
@@ -557,11 +568,13 @@ Besides the sites below:
 - L488: `EarlyBinder::bind(receiver_ty).instantiate(interner, args).skip_norm_wip()` → `EarlyBinder::bind(interner, receiver_ty).instantiate(interner, args).skip_norm_wip()`. R5
 - L504: `if let rustc_type_ir::TyKind::Alias(AliasTy {` → `if let rustc_type_ir::TyKind::Alias(_, AliasTy {`
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/effects.rs`
 
 - L306: `(None, Some(TyKind::FnDef(def, args))) => match def.0 {` → `(None, Some(TyKind::FnDef(def, args))) => match def.0 {`. R4: pattern unchanged; read `args` as `args.no_bound_vars().unwrap()` (once, `let args = args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/infer.rs`
 
@@ -569,17 +582,20 @@ Besides the sites below:
 - L2293: `&& let ConstKind::Unevaluated(konst) = konst.kind()` → `&& let ConstKind::Alias(_, konst) = konst.kind()`. R7
 - L2586: `let alias = Ty::new_alias(` → `let alias = Ty::new_alias(`. R3: add `IsRigid::No,` after the interner argument on the next line.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/infer/callee.rs`
 
 - L365: `(Some(CallableDefId::FunctionId(func)), TyKind::FnDef(_, fn_generic_args)) => {` → `(Some(CallableDefId::FunctionId(func)), TyKind::FnDef(_, fn_generic_args)) => {`. R4: pattern unchanged; read `fn_generic_args` as `fn_generic_args.no_bound_vars().unwrap()` (once, `let fn_generic_args = fn_generic_args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.
 - L437: `TyKind::FnDef(def_id, args) => {` → `TyKind::FnDef(def_id, args) => {`. R4: pattern unchanged; read `args` as `args.no_bound_vars().unwrap()` (once, `let args = args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/infer/cast.rs`
 
 - top: `(imports)` → `use hir_ty::next_solver::{RegionExt};  // or crate::next_solver inside hir-ty`. R10: this file calls a method that moved to the trait.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/infer/closure.rs`
 
@@ -592,11 +608,13 @@ Besides the sites below:
 - L1077: `TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. }) => def_id` → `TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. }) => def_id`
 - L1101: `predicate: PolyProjectionPredicate<'db>,` → `predicate: PolyProjectionClause<'db>,`
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/infer/coerce.rs`
 
 - top: `(imports)` → `use hir_ty::next_solver::{RegionExt};  // or crate::next_solver inside hir-ty`. R10: this file calls a method that moved to the trait.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/infer/expr.rs`
 
@@ -605,17 +623,20 @@ Besides the sites below:
 - L1782: `if let TyKind::FnDef(def_id, args) = callee_ty.kind() {` → `if let TyKind::FnDef(def_id, args) = callee_ty.kind() {`. R4: pattern unchanged; read `args` as `args.no_bound_vars().unwrap()` (once, `let args = args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.
 - L1882: `Ty::new_fn_def(` → `Ty::new_fn_def(`. R4: the call spans lines; wrap its last argument (the args) in `Binder::dummy(..)`.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/infer/opaques.rs`
 
 - L108: `let ty = EarlyBinder::bind(interner, ty.ty);`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/infer/pat.rs`
 
 - L1309: `let target_ty = Ty::new_projection(interner, IsRigid::No, deref_target.into(), [source_ty]);`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.
 - L1669: `if let Some(len) = len.try_to_target_usize(self.interner()) {` → `if let Some(len) = len.try_to_target_usize(self.interner()) {`. R14: takes the interner now (sty/consts.rs).
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/infer/persist.rs`
 
@@ -628,6 +649,7 @@ Besides the sites below:
 - L2389: `fn_sig_kind: FnSigKind::new(ExternAbi::RustCall, Safety::Safe, false),` → `fn_sig_kind: FnSigKind::new(ExternAbi::RustCall, Safety::Safe, false),`. R12
 - L2467: `fn_sig_kind: FnSigKind::new(ExternAbi::C { unwind: true }, Safety::Unsafe, true),` → `fn_sig_kind: FnSigKind::new(ExternAbi::C { unwind: true }, Safety::Unsafe, true),`. R12
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/infer/unify.rs`
 
@@ -637,6 +659,7 @@ Besides the sites below:
 - L792: `fn fold_predicate(&mut self, p: Predicate<'db>) -> Predicate<'db> {` → `fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, p: P) -> P {`. R9: body unchanged (`has_bound_vars`, `has_type_flags`, `super_fold_with` all work on `P`). Import `rustc_type_ir::PredicateProxy`.
 - L875: `fn fold_predicate(&mut self, predicate: Predicate<'db>) -> Predicate<'db> {` → `fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, predicate: P) -> P {`. R9: body unchanged (`has_bound_vars`, `has_type_flags`, `super_fold_with` all work on `P`). Import `rustc_type_ir::PredicateProxy`.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/lib.rs`
 
@@ -661,6 +684,7 @@ Besides the sites below:
 
 - L814: `let output_projection = Ty::new_alias(` → `let output_projection = Ty::new_alias(`. R3: add `IsRigid::No,` after the interner argument on the next line.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/lower.rs`
 
@@ -706,6 +730,7 @@ Besides the sites below:
 - L4098: `fn_sig_kind: FnSigKind::new(ExternAbi::Rust, Safety::Safe, false),` → `fn_sig_kind: FnSigKind::new(ExternAbi::Rust, Safety::Safe, false),`. R12
 - L4141: `EarlyBinder::bind(trait_args).instantiate(interner, trait_ref.args).skip_norm_wip(),` → `EarlyBinder::bind(interner, trait_args).instantiate(interner, trait_ref.args).skip_norm_wip(),`. R5
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/lower/path.rs`
 
@@ -716,6 +741,7 @@ Besides the sites below:
 - L1046: `ProjectionPredicate {` → `ProjectionClause {`
 - L1066: `Ty::new_alias(` → `Ty::new_alias(`. R3: add `IsRigid::No,` after the interner argument on the next line.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/mir.rs`
 
@@ -729,6 +755,7 @@ Besides the sites below:
 
   R11: say in the SAFETY line which fields it visits; a manual impl that skips a field that holds a type is unsound now.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/solver_errors.rs`
 
@@ -740,11 +767,13 @@ Besides the sites below:
 - L100: `trait_pred: PolyTraitPredicate<'db>,` → `trait_pred: PolyTraitClause<'db>,`
 - L158: `trait_pred: TraitPredicate<'db>,` → `trait_pred: TraitClause<'db>,`
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir-ty/src/variance.rs`
 
 - L257: `TyKind::Alias(_, alias) => {`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-ty
 
 ### `crates/hir/src/diagnostics.rs`
 
@@ -757,12 +786,14 @@ Besides the sites below:
 - L2310: `let trait_predicate = crate::TraitPredicate {` → `let trait_predicate = crate::TraitClause {`
 - L2316: `.map(|trait_predicate| crate::TraitPredicate {` → `.map(|trait_predicate| crate::TraitClause {`
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ### `crates/hir/src/display.rs`
 
 - L36: `LifetimeParam, Macro, Module, SelfParam, Static, Struct, StructKind, Trait, TraitPredicate,` → `LifetimeParam, Macro, Module, SelfParam, Static, Struct, StructKind, Trait, TraitClause,`
 - L901: `impl<'db> HirDisplay<'db> for TraitPredicate<'db> {` → `impl<'db> HirDisplay<'db> for TraitClause<'db> {`
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ### `crates/hir/src/lib.rs`
 
@@ -792,6 +823,7 @@ Besides the sites below:
 - L6313: `rustc_type_ir::PredicatePolarity::Positive => PredicatePolarity::Positive,` → `rustc_type_ir::ClausePolarity::Positive => ClausePolarity::Positive,`
 - L6314: `rustc_type_ir::PredicatePolarity::Negative => PredicatePolarity::Negative,` → `rustc_type_ir::ClausePolarity::Negative => ClausePolarity::Negative,`
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ### `crates/hir/src/source_analyzer.rs`
 
@@ -800,6 +832,7 @@ Besides the sites below:
 - L1452: `TyKind::Alias(AliasTy {` → `TyKind::Alias(_, AliasTy {`
 - L1463: `TyKind::FnDef(fn_id, subst) => {` → `TyKind::FnDef(fn_id, subst) => {`. R4: pattern unchanged; read `subst` as `subst.no_bound_vars().unwrap()` (once, `let subst = subst.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
+> applied by db-ty-port-rest
 
 ## items
 
@@ -1251,8 +1284,18 @@ Window `fastcompile-ident-share-next2`. 2 sites in 1 files.
 ### `crates/hir-ty-share/src/identity.rs`
 
 - L203: `TyKind::FnDef(def, args) => {` → `TyKind::FnDef(def, args) => {`. R4: pattern unchanged; read `args` as `args.no_bound_vars().unwrap()` (once, `let args = args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.
+  > already ported (fastcompile-ident-share, 19:50): L204 is `let args = args.no_bound_vars().unwrap();`, called once, so nothing was applied.
 - L328: `TyKind::Alias(_, alias) => {`. Withdrawn: this line is already ported; my regenerated suggestion was wrong. Nothing to do.
+  > already ported (fastcompile-ident-share, 19:50): L328 is `TyKind::Alias(_, alias)` with two fields, so nothing was applied. L412 is `ConstKind::Alias(..)`, with no `Unevaluated` arm.
 > forwarded to fastcompile-ident-share (told by tmux; regenerated list, check each line against the code first).
+> applied (fastcompile-ident-share, 2026-10-29): nothing left. Each site is ported on disk: `identity.rs` `FnDef` reads `args.no_bound_vars().unwrap()` once (L204), and `TyKind::Alias(_, alias)` (L328). In `walk.rs`, the imports name `AliasConst`, `AliasConstKind`, `FreeConstAliasId`, `InherentAssocConstId` and `TraitAssocConstId`, with no `UnevaluatedConst`. `value()` matches `ConstKind::Alias(_, AliasConst { kind, args, .. })` over the five kinds, with no `StaticId` arm, and `InherentSelf` is an error naming the const (L220-237). Both `FnDef` sites read `no_bound_vars().unwrap()` once (L741, L881). `fact.rs` builds its infcx with `TypingMode::Codegen` (R6). None of R1, R5, R8 (`AliasTyKind::def_id`), R9, R10, R12, R13, R14 or R15 has a site in `crates/hir-ty-share/`. `identity.rs` refuses `ConstKind::Alias` and `TyKind::Alias` as unnormalized rather than hashing them, so R7's `IsRigid` encoding does not arise.
+> to window 190 (from fastcompile-ident-share, 19:45): `identity.rs` already has all three sites on disk.
+>
+> - L204 reads `let args = args.no_bound_vars().unwrap();`.
+> - L328 reads `TyKind::Alias(_, alias)`.
+> - L412 reads `ConstKind::Alias(..)`. There is no `ConstKind::Unevaluated` arm left.
+>
+> Don't apply them a second time: a second `no_bound_vars()` would not compile, because the args are no longer a `Binder`. I am leaving those three arms to you as asked, and not touching them.
 
 ## coordinator
 
@@ -1289,7 +1332,10 @@ Besides the sites below:
 ### fastcompile-ident-share
 
 - `crates/hir-ty-share/src/walk.rs` L36: `next_solver::{AllocationData, Const, ConstKind, GenericArgs, Ty, TyKind, UnevaluatedConst},` → `next_solver::{AliasConst, AliasConstKind, AllocationData, Const, ConstKind, FreeConstAliasId, GenericArgs, InherentAssocConstId, TraitAssocConstId, Ty, TyKind},`. R7.
+  > already ported (fastcompile-ident-share, 19:50): L36-39 import exactly this list, with no `UnevaluatedConst`, so nothing was applied.
 - `crates/hir-ty-share/src/walk.rs` L217: `let ConstKind::Unevaluated(UnevaluatedConst { def, args }) = konst.kind() else {` → `let ConstKind::Alias(_, AliasConst { kind, args, .. }) = konst.kind() else {`. R7. Then the match below becomes `match kind { AliasConstKind::Projection { def_id: TraitAssocConstId(id) } | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) } | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => { let (id, args) = lookup_impl_const(&cx.infcx, cx.env.param_env, id, args); db.const_eval(id, args, Some(cx.env)) } AliasConstKind::Anon { def_id } => db.anon_const_eval(def_id.0, args, Some(cx.env)), AliasConstKind::InherentSelf { .. } => return Err(Unshared::ConstEval(format!("`{konst:?}`: an inherent const in Self form after type check"))) }`. The `StaticId` arm goes, as in hir-ty-codegen's `eval_const`, which this mirrors.
+  > already ported (fastcompile-ident-share, 19:50), so nothing was applied. L220 is `let ConstKind::Alias(_, AliasConst { kind, args, .. }) = konst.kind() else {`. L224-237 is this match: three kinds go through `lookup_impl_const` and `const_eval`, `Anon` goes to `anon_const_eval(def_id.0, ..)`, and `InherentSelf` is the error. There is no `StaticId` arm.
 - `crates/hir-ty-share/src/walk.rs` L867: `TyKind::FnDef(def, fn_args) => match def.0 {` → `TyKind::FnDef(def, fn_args) => match def.0 {`. R4: pattern unchanged; read `fn_args` as `fn_args.no_bound_vars().unwrap()` (once, `let fn_args = fn_args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.
+  > already ported (fastcompile-ident-share, 19:50), so nothing was applied. The site is now L880-881, `TyKind::FnDef(def, fn_args) => { let fn_args = fn_args.no_bound_vars().unwrap(); match def.0 {`. The other `FnDef` site in `callee()`, L740-741, reads `let args = args.no_bound_vars().unwrap();` once.
 
 > forwarded to fastcompile-ident-share (window `fastcompile-ident-share-next2`, told by tmux): `crates/hir-ty-share/` is its.

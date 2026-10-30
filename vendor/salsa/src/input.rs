@@ -346,6 +346,11 @@ impl<C: Configuration> Ingredient for IngredientImpl<C> {
         JarKind::Struct
     }
 
+    unsafe fn reclaim_memos(&self) {
+        // SAFETY: Our caller's contract.
+        unsafe { self.memo_table_types.reclaim() };
+    }
+
     fn memo_table_types(&self) -> &Arc<MemoTableTypes> {
         &self.memo_table_types
     }

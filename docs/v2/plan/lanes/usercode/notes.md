@@ -123,9 +123,15 @@ What each part matches or beats:
   - **What a run is given is hashed once, as it is given** (`Given::part`, `stdin`). A macro's
     tokens are never copied into the key.
   - **Behind the hit**, the kept value is decoded once and moved to the caller, not cloned.
-- **Checking inputs** costs one `stat` per path outside every view and nothing inside one.
+- **Checking inputs** costs nothing inside a view, and three atomic loads for a path outside
+  every view while the vfs watch over it has heard nothing, as watchman and Bazel's
+  `--watchfs` answer from the watcher.
   - View files come from the query database, which the VFS watcher keeps current (watchman's
     model).
+  - `inputs::Files` keeps each canonical outside path's last answer with its
+    `blaze_vfs::Cover` and the generation read before it, under a sequence lock. A miss wants
+    the path's parent watched. A path with a symlink, `.` or `..` in it is `stat`ed at every
+    check, since a watch hears nothing of a link's target.
   - A changed file is hashed once per process, with BLAKE3's SIMD over 64 KiB reads, and never
     under a lock.
   - A path in a view is named for the database without a copy when it is already
@@ -133,9 +139,15 @@ What each part matches or beats:
   - A directory's entries say what they are from the listing (`d_type`), so only a link costs
     a `stat`.
   - A package walk pushes and pops one path buffer.
+- **Tracing** is unprivileged seccomp user notification on Linux, with
+  `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (the kernel runs the call itself once the path is noted, no
+  ptrace stop and no emulation) and `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP` (the supervisor is
+  woken on the held thread's CPU and switched to directly). On macOS it is dyld interposing in the process itself,
+  with no context switch a call. Each new line is one `write`. See
+  [sandbox.md](sandbox.md).
 - **Where it falls short:**
-  - The `stat` per outside path: watchman and Bazel's `--watchfs` answer from the watcher with
-    no syscall. Request 11 asks vfs for that.
+  - Outside paths until the daemon drives `blaze_vfs::Outside`: an unsettled table vouches
+    for nothing, so each check `stat`s, as before.
   - The package walk of a script keyed by its whole package: red-green revalidation makes it
     O(1) when nothing changed. Request 10 asks db for a tree hash query.
 - **Tests** fork from a server per binary, as AFL's fork server does: 0.1 to 0.5 ms a test on

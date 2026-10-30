@@ -4,14 +4,12 @@ pub(crate) use sync::{ClaimGuard, ClaimResult, Reentrancy, SyncGuard, SyncOwner,
 
 use std::any::Any;
 use std::fmt;
-use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 use crate::cycle::{CycleRecoveryStrategy, IterationStamp, ProvisionalStatus};
 use crate::database::RawDatabase;
 use crate::fingerprint::Fingerprint;
-use crate::function::delete::DeletedEntries;
 use crate::graph::Relocation;
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::ingredient::Ingredient;
@@ -29,7 +27,6 @@ use crate::{Cycle, Id, Revision};
 #[cfg(feature = "accumulator")]
 mod accumulated;
 mod backdate;
-mod delete;
 mod diff_outputs;
 mod eviction;
 mod execute;
@@ -276,20 +273,6 @@ pub struct IngredientImpl<C: Configuration> {
 
     sync_table: SyncTable,
 
-    /// When `fetch` and friends executes, they return a reference to the
-    /// value stored in the memo that is extended to live as long as the `&self`
-    /// reference we start with. This means that whenever we remove something
-    /// from `memo_map` with an `&self` reference, there *could* be references to its
-    /// internals still in use. Therefore we push the memo into this queue and
-    /// only *actually* free up memory when a new revision starts (which means
-    /// we have an `&mut` reference to self).
-    ///
-    /// You might think that we could do this only if the memo was verified in the
-    /// current revision: you would be right, but we are being defensive, because
-    /// we don't know that we can trust the database to give us the same runtime
-    /// everytime and so forth.
-    deleted_entries: DeletedEntries<C>,
-
     /// Hashes values the function's `Configuration::fingerprint` does not, set by the first
     /// `evict_values` (which requires `Output: Hash`) and used from then on whenever a value is
     /// dropped or a recomputed value is compared with a dropped one.
@@ -346,7 +329,6 @@ where
             index,
             memo_ingredient_indices,
             eviction: C::Eviction::new(eviction_capacity),
-            deleted_entries: Default::default(),
             view_caster: OnceLock::new(),
             sync_table: SyncTable::new(index),
             value_hasher: None,
@@ -444,7 +426,7 @@ where
                 },
             ),
         }
-        ingredient.deleted_entries.clear();
+        zalsa.reclaim_memos();
         evicted
     }
 
@@ -484,10 +466,10 @@ where
     /// Returns a reference to the memo value that lives as long as self.
     /// This is UNSAFE: the caller is responsible for ensuring that the
     /// memo will not be released so long as the `&self` is valid.
-    /// This is done by (a) ensuring the memo is present in the memo-map
-    /// when this function is called and (b) ensuring that any entries
-    /// removed from the memo-map are added to `deleted_entries`, which is
-    /// only cleared with `&mut self`.
+    /// This is done by (a) ensuring the memo is present in the memo table
+    /// when this function is called and (b) the memo table retiring, not
+    /// dropping, any memo it replaces or removes: retired memos are dropped
+    /// only by `MemoTableTypes::reclaim`, with `&mut Zalsa`.
     unsafe fn extend_memo_lifetime<'this>(
         &'this self,
         memo: &memo::Memo<C>,
@@ -507,22 +489,11 @@ where
             tracked_struct_ids.shrink_to_fit();
         }
 
-        // We convert to a `NonNull` here as soon as possible because we are going to alias
-        // into the `Box`, which is a `noalias` type.
-        // FIXME: Use `Box::into_non_null` once stable
-        let memo = NonNull::from(Box::leak(Box::new(memo)));
-
-        if let Some(old_value) =
-            self.insert_memo_into_table_for(zalsa, id, memo, memo_ingredient_index)
-        {
-            // In case there is a reference to the old memo out there, we have to store it
-            // in the deleted entries. This will get cleared when a new revision starts.
-            //
-            // SAFETY: Once the revision starts, there will be no outstanding borrows to the
-            // memo contents, and so it will be safe to free.
-            unsafe { self.deleted_entries.push(old_value) };
-        }
-        // SAFETY: memo has been inserted into the table
+        // The memo it replaces, if any, is retired: a reader may still borrow it, so it is
+        // dropped at the next reclaim, when a new revision starts.
+        let memo = self.insert_memo_into_table_for(zalsa, id, memo, memo_ingredient_index);
+        // SAFETY: The memo has been inserted into the table, which keeps it until it is
+        // replaced and then until the next reclaim, which needs `&mut Zalsa`.
         unsafe { self.extend_memo_lifetime(memo.as_ref()) }
     }
 
@@ -543,8 +514,8 @@ where
     C: Configuration,
 {
     fn memo<'db>(&'db self, zalsa: &'db Zalsa, input: Id) -> Option<ErasedMemo<'db>> {
-        // SAFETY: `self` is borrowed for `'db`, so `deleted_entries` retains every allocation
-        // observed in this slot for that lifetime.
+        // SAFETY: `self` is borrowed for `'db` from the database, and a memo observed in this
+        // slot is dropped only by a reclaim, which needs `&mut Zalsa`.
         let memo_slot = unsafe {
             MemoSlot::new(
                 zalsa.memo_table_for::<C::SalsaStruct<'_>>(input),
@@ -677,7 +648,6 @@ where
         if let Some(capacity) = self.eviction.capacity() {
             self.evict_least_recently_verified(table, capacity.get());
         }
-        self.deleted_entries.clear();
     }
 
     fn relocate_edges(&mut self, table: &mut Table, relocation: &mut Relocation<'_>) {
@@ -1137,11 +1107,7 @@ mod persistence {
                 // before its memos, but its saved revision may differ from the current runtime.
                 let memo_table = unsafe { zalsa.table().dyn_memos_unchecked(id) };
 
-                memo_table.insert(
-                    memo_ingredient_index,
-                    // FIXME: Use `Box::into_non_null` once stable.
-                    NonNull::from(Box::leak(Box::new(memo))),
-                );
+                memo_table.insert(memo_ingredient_index, memo);
             }
 
             Ok(())

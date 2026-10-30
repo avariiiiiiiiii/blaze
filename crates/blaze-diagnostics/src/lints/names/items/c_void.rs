@@ -28,11 +28,14 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Found> {
     let Some(c_void) = krate.c_void else { return Vec::new() };
     let mut found = Vec::new();
     for node in &item.nodes {
-        if !matches!(node.value.kind(), SyntaxKind::FN | SyntaxKind::CLOSURE_EXPR | SyntaxKind::FN_PTR_TYPE) {
+        let kind = node.value.kind();
+        if !matches!(kind, SyntaxKind::FN | SyntaxKind::CLOSURE_EXPR | SyntaxKind::FN_PTR_TYPE) {
             continue;
         }
         let at = node.as_ref().map(SyntaxNodePtr::new);
-        if let Some(f) = ast::Fn::cast(node.value.clone()) {
+        if kind == SyntaxKind::FN
+            && let Some(f) = ast::Fn::cast(node.value.clone())
+        {
             let extern_ = match item.container {
                 Container::Extern(_) => true,
                 Container::Module => {
@@ -50,7 +53,9 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Found> {
             };
             let Some(ret) = f.ret_type() else { continue };
             check(cx, node.with_value(ret), f.param_list().map(|it| it.syntax().text_range().end()), extern_, c_void, at, &mut found);
-        } else if let Some(closure) = ast::ClosureExpr::cast(node.value.clone()) {
+        } else if kind == SyntaxKind::CLOSURE_EXPR
+            && let Some(closure) = ast::ClosureExpr::cast(node.value.clone())
+        {
             let Some(ret) = closure.ret_type() else { continue };
             check(cx, node.with_value(ret), None, true, c_void, at, &mut found);
         } else if let Some(ptr) = ast::FnPtrType::cast(node.value.clone()) {

@@ -8,18 +8,24 @@
 //! ([`blaze_reclaim::enter`]: thread-local counts inside the task a plane worker already runs,
 //! else a store to the thread's own slot and a fence), then walks the path with acquire loads:
 //! one index probe for the root, one binary search of a name column per component. A file's
-//! bytes are the tree's own [`Arc`], never copied; [`Pinned`] reads them in place, with no
-//! reference count touched, and many reads under one pin.
+//! bytes are the tree's own (its [`Arc`], or its range of the mapped image), never copied;
+//! [`Pinned`] reads them in place, with no reference count touched, and many reads under one
+//! pin. A file of the image is read only once the page groups it is in match their CRC32C:
+//! one that does not is [`Corrupt`], naming the section and group, and its bytes are never
+//! lent.
 //!
 //! [`Vfs`]: crate::Vfs
 //! [`Vfs::collect`]: crate::Vfs::collect
+//! [`Arc`]: std::sync::Arc
 
 use std::sync::Arc;
 
 use blaze_ids::ContentId;
+use blaze_image::Corrupt;
 
 use crate::{
     File, Mode,
+    image::Bytes,
     store::{Shared, Snapshot, mode_of},
 };
 
@@ -38,13 +44,21 @@ impl Reader {
 
     /// The file at `path` under `root`: its content ID, mode and bytes (a symlink's are its
     /// target, not followed); `None` for none, a directory, or a root the tree does not have.
-    /// The bytes are the tree's own [`Arc`], with one count taken so they outlive the pin;
+    /// The bytes are the tree's own, with one count taken so they outlive the pin;
     /// [`Pinned::file`] lends them with none.
-    pub fn file(&self, root: ContentId, path: &str) -> Option<(ContentId, Mode, Arc<[u8]>)> {
+    pub fn file(
+        &self,
+        root: ContentId,
+        path: &str,
+    ) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
         let pinned = self.pin();
-        let (node, mode) = pinned.walk(root, path)?;
-        let (id, bytes) = pinned.blob(node)?;
-        Some((*id, mode, bytes.clone()))
+        let Some((node, mode)) = pinned.walk(root, path) else { return Ok(None) };
+        let table = pinned.snapshot.table();
+        let shape = table.shape(node);
+        if shape.is_dir() {
+            return Ok(None);
+        }
+        Ok(Some((*table.id(node), mode, table.bytes(shape)?)))
     }
 
     /// The names in the directory at `path` (`""` for the root), sorted, each with whether it
@@ -74,10 +88,14 @@ pub struct Pinned<'r> {
 impl Pinned<'_> {
     /// The file at `path` under `root`, its bytes read in place; `None` for none, a
     /// directory, or a root the tree does not have.
-    pub fn file(&self, root: ContentId, path: &str) -> Option<File<'_>> {
-        let (node, mode) = self.walk(root, path)?;
-        let (id, bytes) = self.blob(node)?;
-        Some(File { id: *id, mode, bytes })
+    pub fn file(&self, root: ContentId, path: &str) -> Result<Option<File<'_>>, Corrupt> {
+        let Some((node, mode)) = self.walk(root, path) else { return Ok(None) };
+        let table = self.snapshot.table();
+        let shape = table.shape(node);
+        if shape.is_dir() {
+            return Ok(None);
+        }
+        Ok(Some(File { id: *table.id(node), mode, bytes: table.blob(shape)? }))
     }
 
     /// The names in the directory at `path` (`""` for the root), sorted, each with whether it
@@ -120,12 +138,5 @@ impl Pinned<'_> {
             shape = table.shape(node);
         }
         Some((node, mode))
-    }
-
-    /// A file node's ID and bytes; `None` for a directory.
-    fn blob(&self, node: u32) -> Option<(&ContentId, &Arc<[u8]>)> {
-        let table = self.snapshot.table();
-        let shape = table.shape(node);
-        (!shape.is_dir()).then(|| (table.id(node), table.blob(shape)))
     }
 }

@@ -17,6 +17,7 @@ use std::borrow::Cow;
 
 use blaze_codegen::Arch;
 use blaze_ids::radix;
+use smallvec::SmallVec;
 
 use crate::LinkError;
 use crate::model::{Bind, Class, Function, Placed, Region};
@@ -79,6 +80,7 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
         Arch::Aarch64 => ARM64_MODE_DWARF,
         Arch::X86_64 => X86_64_MODE_DWARF,
         Arch::Wasm32 => {
+            // alloc: error path
             return Err(error("__unwind_info: wasm32 has no compact unwind encoding".into()));
         }
     };
@@ -88,7 +90,7 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
         compact(placed, dwarf_mode, &fdes)?;
     ends.extend(fdes.iter().map(|it| it.end));
     if !covered.is_sorted_by_key(|it| it.addr) {
-        radix::sort_by_key(&mut covered, |it| it.addr);
+        radix::sort_copy_by_key(&mut covered, |it| it.addr);
     }
     if !ends.is_sorted() {
         radix::sort(&mut ends);
@@ -96,13 +98,14 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
     let Rows { rows, lsdas, last } = rows(placed, dwarf_mode, &covered, &fdes, &ends)?;
     let sentinel = offset(base, last, "the end of the last function")?;
     if rows.len() as u64 > u64::from(u32::MAX) / COMPRESSED_ENTRY {
+        // alloc: error path
         return Err(error(format!(
             "__unwind_info: {} entries, past the 32-bit offsets the format has",
             rows.len()
         )));
     }
 
-    let mut encodings = Encodings::new();
+    let mut encodings = Encodings::new(rows.len());
     for row in rows.iter().filter(|it| it.encoding & MODE_MASK != dwarf_mode) {
         encodings.count(row.encoding);
     }
@@ -117,6 +120,7 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
     let len = pages_at + pages.iter().map(Page::len).sum::<u64>();
     let limit = bound(placed.functions.len() as u64, fdes.len() as u64, compact_bytes);
     if len > limit {
+        // alloc: error path
         return Err(error(format!(
             "__unwind_info: {} entries take {len} bytes, past the {limit} sized for {} functions, \
              {} FDEs and {} compact unwind entries",
@@ -127,12 +131,14 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
         )));
     }
     if len > u64::from(u32::MAX) {
+        // alloc: error path
         return Err(error(format!(
             "__unwind_info: {len} bytes, past the 32-bit offsets the format has"
         )));
     }
     let small = |value: u64| value as u32;
 
+    // alloc: the table itself, which the writer returns: once per link, at its exact size
     let mut bytes = vec![0; len as usize];
     let mut out = Out { bytes: &mut bytes, at: 0 };
     for value in [
@@ -146,7 +152,7 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
     ] {
         out.u32(value);
     }
-    for &encoding in &common {
+    for &(_, encoding) in &common {
         out.u32(encoding);
     }
     for &(_, cell) in &personalities {
@@ -269,18 +275,25 @@ fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact
     let binds: Cow<'_, [Bind]> = if placed.binds.is_sorted_by_key(|it| it.addr) {
         Cow::Borrowed(placed.binds)
     } else {
+        // alloc: only for binds out of order, which `Placed` lists in order; once per link
         let mut binds = placed.binds.to_vec();
-        radix::sort_by_key(&mut binds, |it| it.addr);
+        radix::sort_copy_by_key(&mut binds, |it| it.addr);
         Cow::Owned(binds)
     };
-    let mut covered = Vec::new();
-    let mut ends = Vec::with_capacity(fdes.len());
+    let class = super::compact_unwind();
+    // Every entry's start and end, and the FDEs' ends: each column allocated once.
+    let mut entries = 0;
+    for region in placed.regions.iter().filter(|it| it.class == class) {
+        entries += (region.size / COMPACT_ENTRY) as usize;
+    }
+    let mut covered = Vec::with_capacity(entries);
+    let mut ends = Vec::with_capacity(entries + fdes.len());
     let mut personalities: Vec<(Held, u32)> = Vec::with_capacity(PERSONALITY_MAX);
     let mut compact_bytes = 0u64;
-    let class = super::compact_unwind();
     for (index, region) in placed.regions.iter().enumerate().filter(|(_, it)| it.class == class) {
         let bytes = region_bytes(placed, index, region, "__compact_unwind")?;
         if bytes.len() as u64 % COMPACT_ENTRY != 0 {
+            // alloc: error path
             return Err(error(format!(
                 "__compact_unwind at {:#x}: {} bytes, not a whole number of 32-byte entries",
                 region.addr,
@@ -288,8 +301,6 @@ fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact
             )));
         }
         compact_bytes += bytes.len() as u64;
-        covered.reserve(bytes.len() / COMPACT_ENTRY as usize);
-        ends.reserve(bytes.len() / COMPACT_ENTRY as usize);
         for (n, entry) in bytes.chunks_exact(COMPACT_ENTRY as usize).enumerate() {
             let function = u64_at(entry, 0);
             if function == 0 {
@@ -300,6 +311,7 @@ fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact
             let personality = u64_at(entry, 16);
             let lsda = u64_at(entry, 24);
             let end = function.checked_add(length).ok_or_else(|| {
+                // alloc: error path
                 error(format!(
                     "__compact_unwind: {} has length {length:#x}, past the end of the address \
                      space",
@@ -309,6 +321,7 @@ fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact
             let kind = if encoding & MODE_MASK == dwarf_mode {
                 let at = fdes.partition_point(|it| it.addr < function);
                 let Some(fde) = fdes.get(at).filter(|it| it.addr == function) else {
+                    // alloc: error path
                     return Err(error(format!(
                         "__compact_unwind: the entry of {} says DWARF mode ({encoding:#010x}), \
                          but no FDE in __eh_frame starts there",
@@ -330,6 +343,7 @@ fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact
                         Some(index) => index,
                         None => {
                             if personalities.len() == PERSONALITY_MAX {
+                                // alloc: error path
                                 return Err(error(format!(
                                     "__unwind_info: {} has a fourth distinct personality \
                                      (held at {cell:#x}); the format has room for \
@@ -402,14 +416,16 @@ fn rows(
     let starts = if sorted {
         Starts::Placed(placed.functions)
     } else {
-        let mut starts: Vec<u64> = placed.functions.iter().map(|it| it.addr).collect();
+        let mut starts = Vec::with_capacity(placed.functions.len());
+        starts.extend(placed.functions.iter().map(|it| it.addr));
         radix::sort(&mut starts);
         Starts::Sorted(starts)
     };
 
     let mut rows: Vec<Row> =
         Vec::with_capacity(placed.functions.len() + covered.len() + fdes.len() + ends.len());
-    let mut lsdas = Vec::new();
+    // An LSDA is a compact entry's: at most one each.
+    let mut lsdas = Vec::with_capacity(covered.len());
     let (mut c, mut f, mut s, mut e) = (0, 0, 0, 0);
     let mut lsda_last = false;
     loop {
@@ -447,6 +463,7 @@ fn rows(
             Some(Kind::Dwarf { fde }) => {
                 let Some(fde) = u32::try_from(fde).ok().filter(|it| *it <= DWARF_OFFSET_MASK)
                 else {
+                    // alloc: error path
                     return Err(error(format!(
                         "__unwind_info: the FDE of {} is at {fde:#x} in __eh_frame, past the 24 \
                          bits DWARF mode has for it",
@@ -505,9 +522,17 @@ struct Encodings {
     stamp: u32,
 }
 
+/// The fewest and the most slots [`Encodings::new`] starts with: 1 to 64 KiB, which holds 2048
+/// distinct encodings, more than a large image has. Past that it doubles.
+const SLOTS_MIN: usize = 64;
+const SLOTS_MAX: usize = 4096;
+
 impl Encodings {
-    fn new() -> Self {
-        Self { slots: vec![EMPTY; 64], len: 0, shift: 32 - 6, stamp: 0 }
+    /// A table for `rows` second-level entries, which have at most that many distinct encodings.
+    fn new(rows: usize) -> Self {
+        let slots = (2 * rows).next_power_of_two().clamp(SLOTS_MIN, SLOTS_MAX);
+        // alloc: once per link, sized so it seldom grows
+        Self { slots: vec![EMPTY; slots], len: 0, shift: 32 - slots.trailing_zeros(), stamp: 0 }
     }
 
     /// The slot of `encoding`, or the empty one it goes in.
@@ -530,6 +555,7 @@ impl Encodings {
         *slot = Slot { encoding, count: 1, used: true, ..EMPTY };
         self.len += 1;
         if 2 * self.len > self.slots.len() {
+            // alloc: only past `SLOTS_MAX / 2` distinct encodings, doubling
             let grown = vec![EMPTY; 2 * self.slots.len()];
             let old = std::mem::replace(&mut self.slots, grown);
             self.shift -= 1;
@@ -542,24 +568,18 @@ impl Encodings {
 
     /// The common encodings: of those of more than one entry the most frequent, ties by value,
     /// at most 127. One of a single entry is no smaller common than the page's own.
-    fn common(&mut self) -> Vec<u32> {
-        let mut common: Vec<(u32, u32)> = self
-            .slots
-            .iter()
-            .filter(|it| it.used && it.count > 1)
-            .map(|it| (it.count, it.encoding))
-            .collect();
+    /// Each as (its count, the encoding).
+    fn common(&mut self) -> Vec<(u32, u32)> {
+        let mut common: Vec<(u32, u32)> = Vec::with_capacity(self.len);
+        let repeated = self.slots.iter().filter(|it| it.used && it.count > 1);
+        common.extend(repeated.map(|it| (it.count, it.encoding)));
         radix::sort_copy_by_key(&mut common, |&(count, encoding)| radix::pack_32(!count, encoding));
         common.truncate(COMMON_MAX);
+        for (index, &(_, encoding)) in common.iter().enumerate() {
+            let at = self.find(encoding);
+            self.slots[at].common = index as u8;
+        }
         common
-            .into_iter()
-            .enumerate()
-            .map(|(index, (_, encoding))| {
-                let at = self.find(encoding);
-                self.slots[at].common = index as u8;
-                encoding
-            })
-            .collect()
     }
 
     /// `encoding`'s index in the compressed page being laid out, and whether it is new to the
@@ -670,14 +690,18 @@ impl Out<'_> {
 /// to where they are, indirection ignored); an FDE at 0 was of a dead function.
 fn fdes(placed: &Placed<'_>) -> Result<Vec<Fde>, LinkError> {
     let Some((index, region)) = placed.region(&Class::EhFrame) else {
+        // alloc: empty, which allocates nothing
         return Ok(Vec::new());
     };
     let bytes = region_bytes(placed, index, region, "__eh_frame")?;
     let bad = |at: usize, what: &str| {
+        // alloc: error path
         error(format!("__eh_frame at {:#x}: the entry at offset {at:#x}: {what}", region.addr))
     };
+    // An FDE takes at least 10 bytes and the core's take 24 or more: this grows at most twice.
     let mut fdes = Vec::with_capacity(bytes.len() / 32);
-    let mut cies: Vec<(usize, u8)> = Vec::new();
+    // A CIE per distinct one the core made and per native object's: on the stack up to 16.
+    let mut cies: SmallVec<[(usize, u8); 16]> = SmallVec::new();
     let mut at = 0;
     while at < bytes.len() {
         let record = at;
@@ -715,6 +739,7 @@ fn fdes(placed: &Placed<'_>) -> Result<Vec<Fde>, LinkError> {
             continue;
         }
         let end = start.checked_add(len).ok_or_else(|| {
+            // alloc: error path
             error(format!(
                 "__eh_frame at {:#x}: the FDE at offset {record:#x} covers past the end of the \
                  address space",
@@ -724,7 +749,7 @@ fn fdes(placed: &Placed<'_>) -> Result<Vec<Fde>, LinkError> {
         fdes.push(Fde { addr: start, end, offset: record as u64 });
     }
     if !fdes.is_sorted_by_key(|it| it.addr) {
-        radix::sort_by_key(&mut fdes, |it| it.addr);
+        radix::sort_copy_by_key(&mut fdes, |it| it.addr);
     }
     fdes.dedup_by_key(|it| it.addr);
     Ok(fdes)
@@ -895,6 +920,7 @@ fn region_bytes<'p>(
 ) -> Result<&'p [u8], LinkError> {
     let bytes = placed.bytes(index);
     usize::try_from(region.size).ok().and_then(|size| bytes.get(..size)).ok_or_else(|| {
+        // alloc: error path
         error(format!(
             "{name} at {:#x}: {} bytes placed, {} in its contents",
             region.addr,
@@ -907,6 +933,7 @@ fn region_bytes<'p>(
 /// `addr`'s offset from the image's first byte, which every offset in the table is.
 fn offset(base: u64, addr: u64, what: &str) -> Result<u32, LinkError> {
     addr.checked_sub(base).and_then(|it| u32::try_from(it).ok()).ok_or_else(|| {
+        // alloc: error path
         error(format!(
             "__unwind_info: {what} at {addr:#x} is not within 4 GiB above the image's base \
              {base:#x}"
@@ -914,9 +941,12 @@ fn offset(base: u64, addr: u64, what: &str) -> Result<u32, LinkError> {
     })
 }
 
+/// The function at `addr`, for an error: called only to build one.
 fn named(placed: &Placed<'_>, addr: u64) -> String {
     match placed.functions.iter().find(|it| it.addr == addr).and_then(|it| it.name.as_deref()) {
+        // alloc: error path
         Some(name) => format!("`{name}` at {addr:#x}"),
+        // alloc: error path
         None => format!("the function at {addr:#x}"),
     }
 }

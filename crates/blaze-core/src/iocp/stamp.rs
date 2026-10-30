@@ -83,15 +83,12 @@ fn mode(attributes: u32, tag: u32) -> u32 {
     }
 }
 
-/// The root as a verbatim wide path with no NUL and no `\` at its end, which each name is put
-/// after.
-fn prefix(root: &Path) -> io::Result<Vec<u16>> {
-    let mut wide = sys::path(root)?;
+/// A verbatim wide path made the prefix each name is put after: no NUL and no `\` at its end.
+fn trim(wide: &mut Vec<u16>) {
     wide.pop();
     if wide.last() == Some(&u16::from(b'\\')) {
         wide.pop();
     }
-    Ok(wide)
 }
 
 fn open(wide: &[u16], rights: u32, flags: u32) -> io::Result<OwnedHandle> {
@@ -172,11 +169,12 @@ fn stamp_name(prefix: &[u16], name: &str, path: &mut Vec<u16>) -> Stamp {
 /// Every name's stamp, in order, on up to 8 threads at once. Fails only when the root cannot be
 /// opened.
 pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
-    let prefix = prefix(root)?;
-    let mut whole = prefix.clone();
-    whole.push(0);
-    open(&whole, 0, FILE_FLAG_BACKUP_SEMANTICS)
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", root.display())))?;
+    // alloc: an error path.
+    let named = |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", root.display()));
+    let mut prefix = sys::path(root).map_err(named)?;
+    open(&prefix, 0, FILE_FLAG_BACKUP_SEMANTICS).map_err(named)?;
+    trim(&mut prefix);
+    // alloc: the stamps the sweep answers with, once per sweep.
     let mut out = vec![Stamp::GONE; names.len()];
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get().min(8));
     if names.len() <= CHUNK || threads == 1 {
@@ -229,13 +227,22 @@ fn entry(bytes: &[u8]) -> Option<(&[u8], Stamp)> {
 /// What is directly in `dir` (named `name` under the root), each with its stamp, sorted by
 /// name; links and junctions are stamped themselves.
 pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Stamp)>> {
+    thread_local! {
+        // alloc: once per thread, the buffer every listing on it fills.
+        static BUFFER: std::cell::RefCell<Box<[u64]>> = std::cell::RefCell::new(vec![0u64; LISTING / 8].into_boxed_slice());
+    }
+    BUFFER.with_borrow_mut(|buffer| list(dir, name, buffer))
+}
+
+fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(FileName, Stamp)>> {
+    // alloc: an error path.
     let named = |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", dir.display()));
     let wide = sys::path(dir).map_err(named)?;
     let handle = open(&wide, FILE_LIST_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS).map_err(named)?;
-    let mut buffer = vec![0u64; LISTING / 8].into_boxed_slice();
     let mut class = FileIdBothDirectoryRestartInfo;
+    // alloc: the entries the listing answers with, once per listing.
     let mut found = Vec::new();
-    let mut text = String::new();
+    let mut text = String::with_capacity(name.as_str().len() + 256);
     loop {
         // SAFETY: an open directory handle and a buffer of the length given, 8-aligned as the
         // class's entries are.
@@ -273,6 +280,7 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
             }
             if !matches!(&text[start..], "." | "..") {
                 let file = FileName::new(&text).ok_or_else(|| {
+                    // alloc: an error path.
                     named(io::Error::new(io::ErrorKind::InvalidData, format!("{text}: not a name")))
                 })?;
                 found.push((file, stamp));

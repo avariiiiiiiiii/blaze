@@ -24,6 +24,7 @@ use blaze_resolve::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::files::Reads;
 use super::manifest::manifest_source;
 use super::source::{Index, Located, Sources};
 use super::summary::{self, Read};
@@ -71,6 +72,7 @@ pub(crate) fn resolved<'db, R>(
     ctx: &Context,
     ws: &Workspace<'_>,
     files: &Rc<dyn Files>,
+    reads: &Reads<'_>,
     spec: &Spec,
     then: impl FnOnce(&mut Cx<'db>, Resolved<'_>) -> Result<Staged<R>, Cancelled>,
 ) -> Result<Staged<R>, Cancelled> {
@@ -86,6 +88,7 @@ pub(crate) fn resolved<'db, R>(
         Err(error) => return Ok(fail(error)),
     };
     let lock_path = root.join("Cargo.lock");
+    reads.file(cx, &lock_path)?;
     let lock_text = match files.read(&lock_path) {
         Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -110,7 +113,7 @@ pub(crate) fn resolved<'db, R>(
     // The packages the lock file pins, located and read.
     let mut owned: Vec<Package> = path_packages;
     if let Some(lock) = &lock {
-        match locate_all(cx, ctx, &sources, &locked_ids(lock), lock.checksums())? {
+        match locate_all(cx, ctx, reads, &sources, &locked_ids(lock), lock.checksums())? {
             Staged::Done(mut read) => owned.append(&mut read),
             Staged::Needs(fetches) => return Ok(Staged::Needs(fetches)),
             Staged::Failed(error) => return Ok(Staged::Failed(error)),
@@ -226,7 +229,7 @@ pub(crate) fn resolved<'db, R>(
 
     // The registry packages the resolve picked that the lock file does not pin.
     let unread: Vec<PackageId> = locked_ids(&whole).into_iter().filter(|id| !reads.contains_key(id)).collect();
-    match locate_all(cx, ctx, &sources, &unread, whole.checksums())? {
+    match locate_all(cx, ctx, reads, &sources, &unread, whole.checksums())? {
         Staged::Done(picked) => {
             for package in &picked {
                 match read_of(&package.manifest_path, &package.manifest, package.locked_source.as_deref(), Some(&whole)) {
@@ -375,10 +378,12 @@ fn locked_ids(lock: &Resolve) -> Vec<PackageId> {
 }
 
 /// The packages `ids` located where cargo keeps them and read from their manifests; every one
-/// not mounted is a fetch.
+/// not mounted is a fetch. Every manifest is read ahead before the first is parsed, so the
+/// step runs once however many packages there are, never once more for each.
 fn locate_all(
     cx: &mut Cx<'_>,
     ctx: &Context,
+    reads: &Reads<'_>,
     sources: &Sources,
     ids: &[PackageId],
     checksums: &FxHashMap<PackageId, Option<String>>,
@@ -395,6 +400,9 @@ fn locate_all(
     }
     if !needs.is_empty() {
         return Ok(Staged::Needs(needs));
+    }
+    for (_, manifest_path) in &here {
+        reads.file(cx, Path::new(manifest_path))?;
     }
     let mut read = Vec::with_capacity(here.len());
     for (id, manifest_path) in here {

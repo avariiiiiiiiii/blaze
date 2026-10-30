@@ -9,7 +9,7 @@ Part of [usercode](../usercode.md). Code: `crates/blaze-build-script/`. Requests
 `v2/requests/usercode-fast-scripts.md`.
 
 Every part below reads its input once, borrowed, and allocates only what it hands back. Each
-rewrite keeps the code it replaced as a test-only reference (`reference.rs` beside it) and a
+rewrite keeps the code it replaced as a test-only reference (`tests/reference.rs` beside its tests) and a
 seeded test that the two agree on every input: what changed is speed, not what is read.
 Nothing here is measured yet: the comparisons are of technique, and the benchmark to settle
 them is under [What is not done](#what-is-not-done).
@@ -29,7 +29,8 @@ key costs more than one comparison of its own length. Each directive goes to a `
 once per output). `parse` is the sink that keeps an `Output`; `watch::watched_in` keeps the
 `rerun-if-*` values alone and copies nothing else.
 
-This matches the fastest known way for this input. Lines are short and few (tens to
+The bounds, with their arithmetic, are in [speed-of-light.md](speed-of-light.md). This
+matches the fastest known way for this input. Lines are short and few (tens to
 thousands), so memchr's line splitting is the bound, and the dispatch is one jump on length
 plus one compare. What is left is the UTF-8 check of each directive line, which std does in
 SIMD already.
@@ -39,17 +40,19 @@ SIMD already.
 cargo builds the environment in a `ProcessBuilder`'s `BTreeMap` of owned strings: a node
 and a key allocated per variable, and a `format!` per derived value.
 
-blaze presizes one vector for the fixed variables, the unit's and the inherited ones; builds
-each value at its exact length without `format!` (`prefixed`, `decimal`, `concat`); takes the
-fixed names as `&'static str`; borrows inherited variables until they are kept; and sorts once
-at the end, by a big-endian `u64` of each name's first eight bytes, then the name, then the
-order set, keeping the last word per name. `Env::vars` is the sorted vector; lookups
-(`get`, `origin`) are binary searches.
+blaze presizes one vector for what cargo sets; builds each value at its exact length without
+`format!` (`prefixed`, `decimal`, `concat`); takes the fixed names as `&'static str`; sorts
+what cargo sets once, by a big-endian `u128` of each name's first sixteen bytes, then the
+name, then the order set, keeping the last word per name; and merges it with the inherited
+environment, which is sorted only when the caller did not pass it sorted, copying an
+inherited variable only where it is kept. `Env::vars` is the sorted vector; lookups (`get`,
+`origin`) are binary searches.
 
-This is the fastest known shape: one allocation per kept string, one sort of about a hundred
-entries whose comparisons are mostly one integer compare. A reused buffer would only add a
-copy, since every kept string is handed back owned; the one place that joins scratch paths
-(`cargo_started_in`) reuses a `PathBuf`.
+One allocation per kept string, one sort of about a hundred entries whose comparisons are
+mostly one integer compare, and one merge. A reused buffer would only add a copy, since every
+kept string is handed back owned; the one place that joins scratch paths
+(`cargo_started_in`) reuses a `PathBuf`. The bound and the gap left are in
+[speed-of-light.md](speed-of-light.md#the-environment-env).
 
 ## Scripts read rather than run (`elide.rs`, `elide/lex.rs`)
 
@@ -60,9 +63,10 @@ backslashes, structure, whitespace), then walk the set bits.
 
 blaze lexes with a 256-entry byte-class table (built by a `const fn`) and jumps over the
 inside of strings, block comments and raw strings with memchr2 and memchr, so the per-byte
-work is one table load except inside literals, where it is SIMD. Tokens are made on demand
-(`Tokens`), and elision asks for them only as its forms need them: most scripts start with
-`use`, and are refused at their first token, having lexed nothing else. A string token keeps
+work is one table load except inside literals, where it is SIMD. Most scripts start with
+`use`, and are refused at their first bytes (`may_open_main`), before the file is validated,
+normalized or lexed. Past that, tokens are made on demand (`Tokens`), and elision asks for
+them only as its forms need them. A string token keeps
 its text and whether it has escapes; its value is decoded only when the script is printed
 (`Token::push_value`), into a buffer reused for every call, so no token allocates.
 

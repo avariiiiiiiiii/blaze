@@ -25,8 +25,13 @@ reads under are in [../../design/concurrency.md](../../design/concurrency.md).
   shared write, no allocation. `unchanged_since` walks the path's ancestors byte by byte and
   is true when some ancestor has `since <= g` and `changed <= g`, and the last flush round is
   in.
+- **`cover(path)`** finds, once per answer, the watched directory above a path. A check kept
+  with it (`Cover::unchanged_since`) is three loads on two lines, with no hashing and no walk
+  up the path ([speed-of-light-outside.md](speed-of-light-outside.md)).
 - **`want(dir)`** adds a directory, once per directory per process, under a lock (the cold
-  path). The file system's root is never watched.
+  path). The file system's root is never watched. A directory under one already wanted is
+  not added, and one wanted above directories already watched retires their watches, so a
+  round flushes one watch per directory not under another.
 - **`Outside`**, a sans-IO driver written like `Watcher`, with its own tag range. It turns a
   wanted directory into `Effect::Watch` followed at once by `Effect::Stat`. Every driver sets
   the watch up synchronously as it is submitted, so a stat that finds a directory confirms that

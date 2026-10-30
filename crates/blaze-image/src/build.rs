@@ -4,7 +4,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicU32, Ordering::Relaxed},
+};
 
 use blaze_format::{Record, SchemaHash};
 
@@ -85,8 +88,15 @@ impl Builder {
         self.section(id, schema).bytes(bytes);
     }
 
-    /// The image's bytes. The groups' CRCs are computed here, once each.
-    pub fn finish(mut self) -> Result<Vec<u8>, TooLarge> {
+    /// The image's bytes, its CRCs computed on this thread: for small images and tests.
+    pub fn finish(self) -> Result<Vec<u8>, TooLarge> {
+        self.finish_on(&crate::serial)
+    }
+
+    /// The image's bytes. The groups' CRCs are computed here, once each, spread over `jobs`
+    /// (the daemon's pool): one core's CRC32C is about 28 GB/s, a sixteenth of what the machine's
+    /// memory streams, so a 4 GiB image is 9 ms of CRCs on a socket where one core takes 150.
+    pub fn finish_on(mut self, jobs: crate::Jobs<'_>) -> Result<Vec<u8>, TooLarge> {
         let group = self.group();
         let data_end = self.out.len().next_multiple_of(group);
         self.out.resize(data_end, 0);
@@ -97,9 +107,9 @@ impl Builder {
             return Err(TooLarge { spine: spine_len, group });
         }
         let crc_at = data_end;
+        let crcs = crcs_on(jobs, &self.out[group..data_end], group);
         self.out.reserve(tops as usize * group);
-        for at in (group..data_end).step_by(group) {
-            let crc = crc32c(&self.out[at..at + group]);
+        for crc in crcs {
             self.out.extend_from_slice(&crc.to_le_bytes());
         }
         self.out.resize(crc_at + tops as usize * group, 0);
@@ -117,6 +127,23 @@ impl Builder {
         spine::encode(&spine, &mut self.out[..group]);
         Ok(self.out)
     }
+}
+
+/// Groups one job CRCs: 1 MiB at 64 KiB groups, about 37 µs, so handing a job out is a few
+/// percent of it.
+const GROUPS_A_JOB: usize = 16;
+
+/// The CRC32C of each `group`-byte group of `bytes`, the groups spread over `jobs`.
+fn crcs_on(jobs: crate::Jobs<'_>, bytes: &[u8], group: usize) -> Vec<u32> {
+    let count = bytes.len() / group;
+    let crcs: Vec<AtomicU32> = (0..count).map(|_| AtomicU32::new(0)).collect();
+    jobs(count.div_ceil(GROUPS_A_JOB), &|job| {
+        for at in job * GROUPS_A_JOB..((job + 1) * GROUPS_A_JOB).min(count) {
+            crcs[at].store(crc32c(&bytes[at * group..(at + 1) * group]), Relaxed);
+        }
+    });
+    // `jobs` returns after every job finished, which orders their stores before these loads.
+    crcs.into_iter().map(AtomicU32::into_inner).collect()
 }
 
 /// The section a [`Builder`] is writing: it ends when this is dropped.

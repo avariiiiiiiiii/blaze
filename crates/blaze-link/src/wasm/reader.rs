@@ -52,10 +52,12 @@ impl<'a> Reader<'a> {
         loop {
             let byte = self.u8()?;
             if shift >= bits {
+                // alloc: error path
                 return Err(format!("a LEB128 longer than {bits} bits"));
             }
             let low = u64::from(byte & 0x7f);
             if bits - shift < 7 && low >> (bits - shift) != 0 {
+                // alloc: error path
                 return Err(format!("a LEB128 past {bits} bits"));
             }
             value |= low << shift;
@@ -72,6 +74,7 @@ impl<'a> Reader<'a> {
         loop {
             let byte = self.u8()?;
             if shift >= bits {
+                // alloc: error path
                 return Err(format!("a LEB128 longer than {bits} bits"));
             }
             value |= i64::from(byte & 0x7f) << shift;
@@ -83,6 +86,7 @@ impl<'a> Reader<'a> {
                 if bits < 64 {
                     let half = 1i64 << (bits - 1);
                     if value < -half || value >= half {
+                        // alloc: error path
                         return Err(format!("a signed LEB128 past {bits} bits"));
                     }
                 }
@@ -112,6 +116,7 @@ impl<'a> Reader<'a> {
     pub(super) fn count(&mut self) -> Result<usize, String> {
         let count = self.u32()? as usize;
         if count > self.bytes.len() - self.at {
+            // alloc: error path
             return Err(format!("a count of {count} with {} bytes left", self.bytes.len() - self.at));
         }
         Ok(count)
@@ -120,6 +125,7 @@ impl<'a> Reader<'a> {
     pub(super) fn name(&mut self) -> Result<&'a str, String> {
         let len = self.u32()? as usize;
         let bytes = self.bytes(len)?;
+        // alloc: error path
         std::str::from_utf8(bytes).map_err(|_| "a name that is not UTF-8".to_owned())
     }
 
@@ -127,11 +133,13 @@ impl<'a> Reader<'a> {
     pub(super) fn i32_const(&mut self) -> Result<i32, String> {
         match self.u8()? {
             0x41 => {}
+            // alloc: error path
             other => return Err(format!("an offset expression of opcode {other:#04x}")),
         }
         let value = self.i32()?;
         match self.u8()? {
             0x0b => Ok(value),
+            // alloc: error path
             _ => Err("an offset expression longer than a constant".to_owned()),
         }
     }
@@ -153,22 +161,31 @@ impl Section<'_> {
 
 pub(super) const MAGIC: &[u8; 8] = b"\0asm\x01\0\0\0";
 
-/// The sections of a wasm file, in order.
+/// The sections of a wasm file, in order: one exact allocation, the headers walked twice
+/// (the first walk counts and checks them, a few bytes per section).
 pub(super) fn sections(bytes: &[u8]) -> Result<Vec<Section<'_>>, String> {
     if !bytes.starts_with(MAGIC) {
+        // alloc: error path
         return Err("not a wasm file of version 1".to_owned());
     }
-    let mut reader = Reader::new(bytes);
-    reader.bytes(MAGIC.len())?;
-    let mut sections = Vec::new();
+    let mut count = 0;
+    each_section(bytes, |_| count += 1)?;
+    let mut sections = Vec::with_capacity(count);
+    each_section(bytes, |section| sections.push(section))?;
+    Ok(sections)
+}
+
+fn each_section<'a>(bytes: &'a [u8], mut f: impl FnMut(Section<'a>)) -> Result<(), String> {
+    let mut reader = Reader::starting_at(bytes, MAGIC.len());
     while !reader.done() {
         let id = reader.u8()?;
         let len = reader.u32()? as usize;
         let at = reader.at();
+        // alloc: error path
         let contents = reader.bytes(len).map_err(|_| format!("section {id} is truncated"))?;
-        sections.push(Section { id, contents, at });
+        f(Section { id, contents, at });
     }
-    Ok(sections)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -202,6 +219,22 @@ mod tests {
         assert_eq!(reader.name().unwrap(), "hi");
         assert!(reader.count().is_err());
         assert!(Reader::new(&[1, 0xff]).name().is_err());
+    }
+
+    #[test]
+    fn reads_allocate_nothing() {
+        let numbers =
+            [0xe5, 0x8e, 0x26, 0x7f, 0x80, 0x01, 0xc0, 0xbb, 0x78, 0xff, 0xff, 0xff, 0xff, 0x0f];
+        let named = [2, b'h', b'i', 0x41, 0x7f, 0x0b, 1, 0];
+        let (numbers, rest) = blaze_alloc_count::assert_at_most(0, "LEB128 and name reads", || {
+            let mut r = Reader::new(&numbers);
+            let numbers = (r.u32(), r.i32(), r.u64(), r.i64(), r.u32());
+            let mut r = Reader::new(&named);
+            let name = r.name().map(str::len);
+            (numbers, (name, r.i32_const(), r.count(), r.bytes(0).map(<[u8]>::len), r.done()))
+        });
+        assert_eq!(numbers, (Ok(624_485), Ok(-1), Ok(128), Ok(-123_456), Ok(u32::MAX)));
+        assert_eq!(rest, (Ok(2), Ok(-1), Ok(1), Ok(0), false));
     }
 
     #[test]

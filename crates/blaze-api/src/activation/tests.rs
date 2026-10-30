@@ -16,6 +16,16 @@ fn one_socket_for_this_process_named_blaze() {
 }
 
 #[test]
+fn a_valid_activation_is_read_without_allocating() {
+    let fd = blaze_alloc_count::assert_at_most(0, "systemd's variables of a valid activation", || {
+        systemd(listen("4242", "1", Some("blaze")), OWN, SOCKET)
+    });
+    assert_eq!(fd, Ok(FIRST_FD));
+    let one = blaze_alloc_count::assert_at_most(0, "launchd's one descriptor", || launchd(Launchd::Fds(1), SOCKET));
+    assert_eq!(one, Ok(()));
+}
+
+#[test]
 fn another_process_sockets_are_refused() {
     let what = said(systemd(listen("4243", "1", Some("blaze")), OWN, SOCKET));
     assert!(what.contains("LISTEN_PID=4243") && what.contains("(4242)"), "{what}");

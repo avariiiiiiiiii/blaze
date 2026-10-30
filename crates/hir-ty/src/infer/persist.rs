@@ -221,8 +221,18 @@ pub struct InferenceRecordRef<'a> {
     error_ty: u32,
     flags: u32,
     diagnostics: u32,
-    table: &'a [u128],
+    table: TableView<'a>,
     table_root: u64,
+}
+
+/// Where a record's type table is read from.
+#[derive(Debug, Clone, Copy)]
+enum TableView<'a> {
+    /// Its bytes in the buffer [`Persist::read`] was given, at the `u128` alignment they were
+    /// written at, read in place.
+    InPlace(&'a [u8]),
+    /// The words of an [`InferenceRecord`] in memory, copied out by [`table_bytes`].
+    Words(&'a [u128]),
 }
 
 /// The type table's buffer as words, little-endian, to be placed with the columns at `u128`
@@ -235,11 +245,21 @@ fn table_words(bytes: &[u8]) -> Vec<u128> {
         .collect()
 }
 
-/// The type table's buffer as the reader takes it, from [`table_words`]'s words. A copy, not
-/// a view: the table is small next to the types it interns again.
+/// The type table's buffer as the reader takes it, from [`table_words`]'s words: a copy, for
+/// a record that was never written.
 fn table_bytes(words: &[u128]) -> Aligned {
-    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let mut bytes = Vec::with_capacity(words.len() * size_of::<u128>());
+    words.iter().for_each(|word| bytes.extend_from_slice(&word.to_le_bytes()));
     Aligned::copy_from(&bytes)
+}
+
+/// The bytes of `table`, a slice [`Slice::follow`] gave out of `buffer`.
+fn table_in(buffer: &[u8], table: &[u128]) -> &[u8] {
+    if table.is_empty() {
+        return &[];
+    }
+    let start = (table.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize);
+    &buffer[start..][..size_of_val(table)]
 }
 
 fn salsa_id(bits: u64) -> Option<salsa::Id> {
@@ -737,7 +757,7 @@ impl InferenceRecord {
             error_ty: self.error_ty,
             flags: self.flags,
             diagnostics: self.diagnostics,
-            table: &self.table,
+            table: TableView::Words(&self.table),
             table_root: self.table_root,
         }
     }
@@ -818,7 +838,7 @@ impl Persist for InferenceRecord {
             error_ty: root.error_ty,
             flags: root.flags,
             diagnostics: root.diagnostics,
-            table: root.table.follow(buffer)?,
+            table: TableView::InPlace(table_in(buffer, root.table.follow(buffer)?)),
             table_root: root.table_root,
         };
         record.check()?;
@@ -946,8 +966,15 @@ impl<'a> InferenceRecordRef<'a> {
 
     /// The result again, its types read from the record's type table.
     pub fn to_result<'db>(&self, interner: DbInterner<'db>) -> Result<InferenceResult<'db>, FormatError> {
-        let bytes = table_bytes(self.table);
-        let table = TyTableReader::open(interner, &bytes, self.table_root)?;
+        let copy;
+        let bytes: &[u8] = match self.table {
+            TableView::InPlace(bytes) => bytes,
+            TableView::Words(words) => {
+                copy = table_bytes(words);
+                &copy
+            }
+        };
+        let table = TyTableReader::open(interner, bytes, self.table_root)?;
         self.decode(&TableDecode { interner, table, at: self.at })
     }
 

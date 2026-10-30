@@ -127,7 +127,16 @@ impl Target {
 impl Package {
     /// How cargo names the package in messages.
     pub fn descr(&self) -> String {
+        // alloc: a message's text, made when one is.
         self.descr.clone().unwrap_or_else(|| format!("{} v{}", self.name, self.version))
+    }
+
+    /// [`Package::descr`], written into `f` with nothing allocated.
+    pub fn write_descr(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        match &self.descr {
+            Some(descr) => f.write_str(descr),
+            None => write!(f, "{} v{}", self.name, self.version),
+        }
     }
 
     /// The name of the package's library's crate, if it has one.

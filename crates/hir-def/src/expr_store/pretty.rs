@@ -19,7 +19,7 @@ use crate::{
     expr_store::path::{GenericArg, GenericArgs},
     hir::{
         Array, Binding, BindingAnnotation, BindingId, CaptureBy, ClosureKind, CoroutineKind, Expr,
-        ExprId, Literal, Movability, Pat, PatId, RecordSpread, Statement, Unsafe,
+        ExprId, Literal, Movability, Pat, PatId, RecordSpread, Statement, Statements, Unsafe,
         generics::{GenericParams, WherePredicate},
     },
     lang_item::LangItemTarget,
@@ -867,7 +867,7 @@ impl Printer<'_> {
         &mut self,
         label: Option<&str>,
         unsafe_: Unsafe,
-        statements: &[Statement],
+        statements: Statements<'_>,
         tail: Option<ExprId>,
     ) {
         self.whitespace();
@@ -1038,28 +1038,28 @@ impl Printer<'_> {
         }
     }
 
-    fn print_stmt(&mut self, stmt: &Statement) {
+    fn print_stmt(&mut self, stmt: Statement<'_>) {
         match stmt {
             Statement::Let { pat, type_ref, initializer, else_branch, .. } => {
                 w!(self, "let ");
-                self.print_pat(*pat);
+                self.print_pat(pat);
                 if let Some(ty) = type_ref {
                     w!(self, ": ");
-                    self.print_type_ref(*ty);
+                    self.print_type_ref(ty);
                 }
                 if let Some(init) = initializer {
                     w!(self, " = ");
-                    self.print_expr(*init);
+                    self.print_expr(init);
                 }
                 if let Some(els) = else_branch {
                     w!(self, " else ");
-                    self.print_expr(*els);
+                    self.print_expr(els);
                 }
                 wln!(self, ";");
             }
             Statement::Expr { expr, has_semi } => {
-                self.print_expr(*expr);
-                if *has_semi {
+                self.print_expr(expr);
+                if has_semi {
                     w!(self, ";");
                 }
                 wln!(self);

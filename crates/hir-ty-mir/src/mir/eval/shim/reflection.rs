@@ -17,9 +17,16 @@ use crate::next_solver::{
 
 use super::*;
 
-/// Gives the bytes of a field of a value being made, from its name and type.
-type FieldBytes<'a, 'db, M> =
-    &'a mut dyn FnMut(&mut Evaluator<'db, M>, &str, Ty<'db>) -> Result<'db, Vec<u8>>;
+/// A value being made: its bytes, and which of them carry the provenance of a pointer to
+/// memory the evaluator made for it.
+type Made<S> = (Vec<u8>, S);
+
+/// Gives a field of a value being made, from its name and type.
+type FieldBytes<'a, 'db, M> = &'a mut dyn FnMut(
+    &mut Evaluator<'db, M>,
+    &str,
+    Ty<'db>,
+) -> Result<'db, Made<<M as Machine<'db>>::Shadow>>;
 
 impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// Answers the reflection intrinsic `intrinsic`, or says it is not one.
@@ -34,8 +41,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::TypeIdTypeOf => {
                 let [id] = args else { not_supported!("type_id_type_of args") };
                 let ty = self.type_id_of(id)?;
-                let value = self.reflected_type(ty, locals)?;
-                destination.write_from_bytes(self, &value)?;
+                let (value, shadow) = self.reflected_type(ty, locals)?;
+                self.write_shadowed(destination.addr, &value, &shadow)?;
             }
             Intrinsic::TypeIdVtable => {
                 let [id, trait_] = args else { not_supported!("type_id_vtable args") };
@@ -101,7 +108,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::TypeIdVariantName => {
                 let [id, variant] = args else { not_supported!("type_id_variant_name args") };
                 let ty = self.type_id_of(id)?;
-                let variant = from_bytes!(usize, variant.get(self)?);
+                let variant = from_bytes!(usize, self.read_scalar(variant.interval)?);
                 let TyKind::Adt(adt, _) = ty.kind() else {
                     // rustc's `span_bug!`.
                     not_supported!("type_id_variant_name of {ty:?}, which is not an ADT")
@@ -122,7 +129,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     not_supported!("type_id_variant_non_exhaustive args")
                 };
                 let ty = self.type_id_of(id)?;
-                let variant = from_bytes!(usize, variant.get(self)?);
+                let variant = from_bytes!(usize, self.read_scalar(variant.interval)?);
                 let TyKind::Adt(adt, _) = ty.kind() else {
                     // rustc's `span_bug!`.
                     not_supported!("type_id_variant_non_exhaustive of {ty:?}, which is not an ADT")
@@ -151,7 +158,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::TypeIdFields => {
                 let [id, variant] = args else { not_supported!("type_id_fields args") };
                 let ty = self.type_id_of(id)?;
-                let fields = self.reflected_fields(ty, from_bytes!(usize, variant.get(self)?))?;
+                let variant = from_bytes!(usize, self.read_scalar(variant.interval)?);
+                let fields = self.reflected_fields(ty, variant)?;
                 destination.write_from_bytes(self, &word_bytes(fields.len()))?;
             }
             Intrinsic::TypeIdFieldRepresentingType => {
@@ -159,8 +167,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     not_supported!("type_id_field_representing_type args")
                 };
                 let base = self.type_id_of(id)?;
-                let variant = from_bytes!(usize, variant.get(self)?);
-                let field = from_bytes!(usize, field.get(self)?);
+                let variant = from_bytes!(usize, self.read_scalar(variant.interval)?);
+                let field = from_bytes!(usize, self.read_scalar(field.interval)?);
                 let fields = self.reflected_fields(base, variant)?.len();
                 if field >= fields {
                     return Err(MirEvalError::UndefinedBehavior(format!(
@@ -197,8 +205,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::TypeIdGenerics => {
                 let [id] = args else { not_supported!("type_id_generics args") };
                 let ty = self.type_id_of(id)?;
-                let value = self.reflected_generics(ty, locals)?;
-                destination.write_from_bytes(self, &value)?;
+                let (value, shadow) = self.reflected_generics(ty, locals)?;
+                self.write_shadowed(destination.addr, &value, &shadow)?;
             }
             Intrinsic::TypeIdFunctionPtr => {
                 let [id] = args else { not_supported!("type_id_function_ptr args") };
@@ -207,22 +215,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     not_supported!("no `FnPtr` (lang item `FnPtr`) in core")
                 };
                 let fn_ptr = Ty::new_adt(self.interner(), fn_ptr.into(), GenericArgs::empty());
-                let value = match ty.kind() {
-                    TyKind::FnPtr(sig, header) => {
-                        // rustc skips the binder too (its "FIXME: handle lifetime bounds").
-                        let sig = sig.skip_binder();
-                        let inputs: Vec<Ty<'db>> = sig.inputs().iter().copied().collect();
-                        Some(self.reflected_fn_ptr(
-                            fn_ptr,
-                            &inputs,
-                            sig.output(),
-                            header.fn_sig_kind,
-                            locals,
-                        )?)
-                    }
-                    _ => None,
+                let TyKind::FnPtr(sig, header) = ty.kind() else {
+                    self.write_option(destination, fn_ptr, None::<Vec<u8>>, locals)?;
+                    return Ok(true);
                 };
-                self.write_option(destination, fn_ptr, value, locals)?;
+                // rustc skips the binder too (its "FIXME: handle lifetime bounds").
+                let sig = sig.skip_binder();
+                let inputs: Vec<Ty<'db>> = sig.inputs().iter().copied().collect();
+                let value =
+                    self.reflected_fn_ptr(fn_ptr, &inputs, sig.output(), header.fn_sig_kind, locals)?;
+                let (value, shadow) = self.reflected_some(fn_ptr, value, locals)?;
+                self.write_shadowed(destination.addr, &value, &shadow)?;
             }
             _ => return Ok(false),
         }
@@ -233,6 +236,64 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn type_id_bytes(&mut self, ty: Ty<'db>) -> Result<'db, Vec<u8>> {
         let ty = self.type_id_ty(ty)?;
         Ok(self.type_id(TypeIdOf::Ty(ty)).to_vec())
+    }
+
+    /// `bytes` the evaluator computed, which carry no pointer.
+    fn made(bytes: Vec<u8>) -> Made<M::Shadow> {
+        let shadow = M::Shadow::init(bytes.len());
+        (bytes, shadow)
+    }
+
+    /// The `TypeId` of `ty`, as a field of a value being made.
+    fn reflected_type_id(&mut self, ty: Ty<'db>) -> Result<'db, Made<M::Shadow>> {
+        self.type_id_bytes(ty).map(Self::made)
+    }
+
+    /// A value of `size` bytes with `fields` where `layout` puts them, and `tag`, with what
+    /// each field carries.
+    fn reflected_construct(
+        &mut self,
+        size: usize,
+        layout: &Layout,
+        tag: Option<(usize, usize, i128)>,
+        fields: Vec<Made<M::Shadow>>,
+    ) -> Result<'db, Made<M::Shadow>> {
+        let mut shadow = M::Shadow::init(size);
+        if M::CHECKS {
+            for (i, (_, it)) in fields.iter().enumerate() {
+                shadow.put(layout.fields.offset(i).bytes_usize(), it);
+            }
+        }
+        let fields = fields.into_iter().map(|(bytes, _)| IntervalOrOwned::Owned(bytes));
+        let bytes = self.construct_with_layout(size, layout, tag, fields)?;
+        Ok((bytes, shadow))
+    }
+
+    /// `Some(value)` of an `Option<inner>`, as [`Self::write_option`] makes it, with what
+    /// `value` carries.
+    fn reflected_some(
+        &mut self,
+        inner: Ty<'db>,
+        value: Made<M::Shadow>,
+        locals: &Locals<'db>,
+    ) -> Result<'db, Made<M::Shadow>> {
+        let Some(some) = self.lang_items().OptionSome else { not_supported!("no `Option` in core") };
+        let args = GenericArgs::new_from_slice(&[inner.into()]);
+        let (size, layout, tag) = self.layout_of_variant(some.into(), args, locals)?;
+        self.reflected_construct(size, &layout, tag, vec![value])
+    }
+
+    /// A `&'static [_]` or `&'static str` of `len` elements at `addr`, memory the evaluator
+    /// made, carrying the provenance of that allocation.
+    fn reflected_ref(&self, addr: Address, len: usize) -> Made<M::Shadow> {
+        let mut bytes = addr.to_bytes().to_vec();
+        let mut shadow = M::Shadow::pointer(bytes.len(), self.ptr(addr).prov);
+        let at = bytes.len();
+        bytes.extend(word_bytes(len));
+        if M::CHECKS {
+            shadow.put(at, &M::Shadow::init(bytes.len() - at));
+        }
+        (bytes, shadow)
     }
 
     /// `core::any::TypeId`.
@@ -333,13 +394,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         args: GenericArgs<'db>,
         locals: &Locals<'db>,
         field: FieldBytes<'_, 'db, M>,
-    ) -> Result<'db, Vec<u8>> {
+    ) -> Result<'db, Made<M::Shadow>> {
         let mut values = Vec::new();
         for (name, ty) in self.variant_fields(variant, args) {
-            values.push(IntervalOrOwned::Owned(field(self, &name, ty)?));
+            values.push(field(self, &name, ty)?);
         }
         let (size, layout, tag) = self.layout_of_variant(variant, args, locals)?;
-        self.construct_with_layout(size, &layout, tag, values.into_iter())
+        self.reflected_construct(size, &layout, tag, values)
     }
 
     /// A value of the struct `ty`, made field by field as [`Self::reflected_value`] does.
@@ -348,7 +409,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         ty: Ty<'db>,
         locals: &Locals<'db>,
         field: FieldBytes<'_, 'db, M>,
-    ) -> Result<'db, Vec<u8>> {
+    ) -> Result<'db, Made<M::Shadow>> {
         let TyKind::Adt(adt, args) = ty.kind() else {
             not_supported!("{ty:?} in core's `type_info`, which is not a struct there")
         };
@@ -367,7 +428,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         name: &str,
         locals: &Locals<'db>,
         field: FieldBytes<'_, 'db, M>,
-    ) -> Result<'db, Vec<u8>> {
+    ) -> Result<'db, Made<M::Shadow>> {
         let TyKind::Adt(adt, args) = ty.kind() else {
             not_supported!("{ty:?} in core's `type_info`, which is not an enum there")
         };
@@ -392,9 +453,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         name: &str,
         ty: Ty<'db>,
         locals: &Locals<'db>,
-    ) -> Result<'db, Vec<u8>> {
+    ) -> Result<'db, Made<M::Shadow>> {
         match self.size_align_of(ty, locals)? {
-            Some((0, _)) => Ok(Vec::new()),
+            Some((0, _)) => Ok(Self::made(Vec::new())),
             _ => not_supported!("the field `{name}` of {ty:?}, which rustc does not write"),
         }
     }
@@ -405,8 +466,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         &mut self,
         slice_ref: Ty<'db>,
         len: usize,
-        element: &mut dyn FnMut(&mut Self, Ty<'db>, usize) -> Result<'db, Vec<u8>>,
-    ) -> Result<'db, Vec<u8>> {
+        element: &mut dyn FnMut(&mut Self, Ty<'db>, usize) -> Result<'db, Made<M::Shadow>>,
+    ) -> Result<'db, Made<M::Shadow>> {
         let elem = match slice_ref.kind() {
             TyKind::Ref(_, slice, _) => match slice.kind() {
                 TyKind::Slice(elem) => elem,
@@ -416,27 +477,28 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         };
         let layout = self.layout(elem)?;
         let size = layout.size.bytes_usize();
-        let addr = self.heap_allocate(size * len, layout.align.abi.bytes() as usize)?;
+        let align = layout.align.abi.bytes() as usize;
+        let addr = self.heap_allocate(size * len, align)?;
         for i in 0..len {
-            let bytes = element(self, elem, i)?;
-            self.write_memory(addr.offset(i * size), &bytes)?;
+            let (bytes, shadow) = element(self, elem, i)?;
+            self.write_shadowed(addr.offset(i * size).aligned(align), &bytes, &shadow)?;
         }
-        let mut value = addr.to_bytes().to_vec();
-        value.extend(word_bytes(len));
-        Ok(value)
+        Ok(self.reflected_ref(addr, len))
     }
 
     /// A `&'static str` of `text`.
-    fn reflected_str(&mut self, text: &str) -> Result<'db, Vec<u8>> {
+    fn reflected_str(&mut self, text: &str) -> Result<'db, Made<M::Shadow>> {
         let addr = self.heap_allocate(text.len(), 1)?;
         self.write_memory(addr, text.as_bytes())?;
-        let mut value = addr.to_bytes().to_vec();
-        value.extend(word_bytes(text.len()));
-        Ok(value)
+        Ok(self.reflected_ref(addr, text.len()))
     }
 
     /// The `core::mem::type_info::Type` of `ty`, as rustc's `write_type_info` makes it.
-    fn reflected_type(&mut self, ty: Ty<'db>, locals: &Locals<'db>) -> Result<'db, Vec<u8>> {
+    fn reflected_type(
+        &mut self,
+        ty: Ty<'db>,
+        locals: &Locals<'db>,
+    ) -> Result<'db, Made<M::Shadow>> {
         let Some(type_info) = self.lang_items().TypeInfo else {
             not_supported!("no `Type` (lang item `type_info`) in core")
         };
@@ -453,7 +515,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         ty: Ty<'db>,
         kind: Ty<'db>,
         locals: &Locals<'db>,
-    ) -> Result<'db, Vec<u8>> {
+    ) -> Result<'db, Made<M::Shadow>> {
         let variant = match ty.kind() {
             // rustc writes a tuple's fields into the field of `TypeKind::Tuple`, which at the
             // pinned nightly has none, and so ICEs.
@@ -497,7 +559,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         region: Region<'db>,
         dyn_trait: Ty<'db>,
         locals: &Locals<'db>,
-    ) -> Result<'db, Vec<u8>> {
+    ) -> Result<'db, Made<M::Shadow>> {
         let interner = self.interner();
         let is_auto = |it: &Binder<'db, ExistentialPredicate<'db>>| {
             matches!(it.skip_binder(), ExistentialPredicate::AutoTrait(_))
@@ -519,8 +581,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 this.reflected_struct(predicate, locals, &mut |this, name, trait_| match name {
                     "trait_ty" => {
                         this.reflected_struct(trait_, locals, &mut |this, name, _| match name {
-                            "ty" => this.type_id_bytes(trait_ty),
-                            "is_auto" => Ok(vec![is_auto as u8]),
+                            "ty" => this.reflected_type_id(trait_ty),
+                            "is_auto" => Ok(Self::made(vec![is_auto as u8])),
                             other => {
                                 not_supported!("the field `{other}` of `Trait`, not rustc's")
                             }
@@ -539,7 +601,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// The `&'static [Generic]` of `ty`, as rustc's `write_type_id_generics` makes it: an ADT's
     /// generic args, none of a type that has none.
-    fn reflected_generics(&mut self, ty: Ty<'db>, locals: &Locals<'db>) -> Result<'db, Vec<u8>> {
+    fn reflected_generics(
+        &mut self,
+        ty: Ty<'db>,
+        locals: &Locals<'db>,
+    ) -> Result<'db, Made<M::Shadow>> {
         let args: Vec<_> = match ty.kind() {
             TyKind::Adt(_, args) => args.iter().collect(),
             // rustc's are the item's args and, of a closure or coroutine, the synthetic ones
@@ -580,7 +646,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 // `GenericType { ty }` and `Const { ty }`: the type, and the const's type.
                 Some(of) => {
                     this.reflected_struct(payload, locals, &mut |this, name, _| match name {
-                        "ty" => this.type_id_bytes(of),
+                        "ty" => this.reflected_type_id(of),
                         other => not_supported!("the field `{other}` of {payload:?}, not rustc's"),
                     })
                 }
@@ -600,9 +666,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         output: Ty<'db>,
         kind: rustc_type_ir::FnSigKind<crate::next_solver::DbInterner<'db>>,
         locals: &Locals<'db>,
-    ) -> Result<'db, Vec<u8>> {
+    ) -> Result<'db, Made<M::Shadow>> {
         self.reflected_struct(fn_ptr, locals, &mut |this, name, field| match name {
-            "is_unsafe" => Ok(vec![!kind.is_safe() as u8]),
+            "is_unsafe" => Ok(Self::made(vec![!kind.is_safe() as u8])),
             "abi" => match kind.abi() {
                 ExternAbi::C { .. } => {
                     this.reflected_variant(field, "ExternC", locals, &mut |this, name, ty| {
@@ -619,12 +685,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }),
             },
             "inputs" => this.reflected_slice(field, inputs.len(), &mut |this, _, i| {
-                this.type_id_bytes(inputs[i])
+                this.reflected_type_id(inputs[i])
             }),
-            "output" => this.type_id_bytes(output),
-            "variadic" => Ok(vec![kind.c_variadic() as u8]),
-            "is_splatted" => Ok(vec![0]),
-            "splatted_index" => Ok(vec![u8::MAX]),
+            "output" => this.reflected_type_id(output),
+            "variadic" => Ok(Self::made(vec![kind.c_variadic() as u8])),
+            "is_splatted" => Ok(Self::made(vec![0])),
+            "splatted_index" => Ok(Self::made(vec![u8::MAX])),
             other => not_supported!("the field `{other}` of `FnPtr`, which rustc does not write"),
         })
     }

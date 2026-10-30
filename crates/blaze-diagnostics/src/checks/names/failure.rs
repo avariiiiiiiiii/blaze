@@ -6,25 +6,17 @@
 //! (`report_path_resolution_error`, `find_similarly_named_module_or_crate`) and
 //! `compiler/rustc_span/src/source_map.rs` (`span_to_short_string`) (MIT or Apache-2.0).
 
-use hir::{InFile, ItemInNs, ModPath, ModuleDef, Name, PathKind, StructKind};
+use hir::{InFile, ItemInNs, ModPath, ModuleDef, Name, PathKind};
 use span::Edition;
 use syntax::{AstNode, AstToken as _, SyntaxKind, SyntaxNode, TextRange, ast};
 
+pub(super) use crate::lower::unresolved_import::{ROOT, Segment};
 use crate::{
     cx::Cx,
     lints::edit_distance::find_best_match_for_name,
+    lower::unresolved_import::value_descr,
     model::{Applicability, Diag, Span},
 };
-
-/// rustc's name of the crate root segment, `::` first in a path.
-pub(super) const ROOT: &str = "{{root}}";
-
-/// A segment of a path as rustc's resolver has it, with where it is written.
-#[derive(Clone, Debug)]
-pub(super) struct Segment {
-    pub(super) name: String,
-    pub(super) range: TextRange,
-}
 
 /// Where a path is written: its file and a node in its scope.
 pub(super) struct At<'a> {
@@ -153,27 +145,6 @@ fn value(cx: &Cx<'_, '_>, place: &At<'_>, scope: Option<&[Segment]>, name: &str)
         ItemInNs::Values(def) => Some(def),
         _ => None,
     })
-}
-
-/// rustc's `Res::descr` of what a name means as a value.
-fn value_descr(cx: &Cx<'_, '_>, def: ModuleDef) -> &'static str {
-    match def {
-        ModuleDef::Function(_) => "function",
-        ModuleDef::Const(_) => "constant",
-        ModuleDef::Static(_) => "static",
-        ModuleDef::Adt(hir::Adt::Struct(it)) => match it.kind(cx.db) {
-            StructKind::Tuple => "tuple struct",
-            StructKind::Unit => "unit struct",
-            StructKind::Record => "struct",
-        },
-        ModuleDef::EnumVariant(it) => match it.kind(cx.db) {
-            StructKind::Tuple => "tuple variant",
-            StructKind::Unit => "unit variant",
-            StructKind::Record => "struct variant",
-        },
-        ModuleDef::Macro(_) => "macro",
-        _ => "value",
-    }
 }
 
 /// rustc's `span_to_short_string` of where a definition starts: `file:line:col`.

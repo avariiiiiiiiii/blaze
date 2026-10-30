@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use blaze_ids::radix;
 use object::read::archive::{ArchiveFile, ArchiveKind};
 
 use crate::model::{Archive, Member, Name, Names};
@@ -9,48 +10,54 @@ use crate::model::{Archive, Member, Name, Names};
 /// A BSD `ar` archive (as Apple's `libtool`/`ar` write it, `#1/<len>` long names) or a GNU one,
 /// with its `__.SYMDEF`/`__.SYMDEF SORTED`/`__.SYMDEF_64` index (a GNU `/` index too).
 /// `Member::bytes` is the member's data, as a range of `bytes`.
+///
+/// Allocates six buffers, each sized exactly before it is filled (the members, their header
+/// offsets and their ranges, the index, its entries by string offset, and the names), and the
+/// radix sort's three when more than 64 entries' strings are out of offset order: none per
+/// member, entry or name.
 pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
+    // alloc: error path
     let file = ArchiveFile::parse(bytes).map_err(|e| format!("{name}: {e}"))?;
     if file.is_thin() {
+        // alloc: error path
         return Err(format!("{name}: a thin archive, whose members are other files"));
     }
     match file.kind() {
         ArchiveKind::Bsd | ArchiveKind::Bsd64 | ArchiveKind::Gnu | ArchiveKind::Gnu64 => {}
         ArchiveKind::Unknown => {
+            // alloc: error path
             return Err(format!("{name}: an archive without a symbol index (run `ranlib` on it)"));
         }
+        // alloc: error path
         other => return Err(format!("{name}: a {other:?} archive, not a BSD or GNU one")),
     }
 
     let symbols = file
         .symbols()
+        // alloc: error path
         .map_err(|e| format!("{name}: {e}"))?
+        // alloc: error path
         .ok_or_else(|| format!("{name}: an archive without a symbol index (run `ranlib` on it)"))?;
-    // A BSD `__.SYMDEF` names each entry's string by offset, so many entries may name one
-    // string: each distinct string is one `Name`, or the arena grows with the entries times
-    // the string's length. Keyed by where the string is in `bytes`; SipHash, since the
-    // offsets are the file's.
-    let mut by_offset: std::collections::HashMap<usize, Option<Name>> =
-        std::collections::HashMap::with_capacity(symbols.size_hint().0);
-    // Sized from the index's distinct names, read in place once: a core name is at most one
-    // byte longer than its Mach-O one. The members' names, short and few, grow it at most once.
-    let mut index_bytes = 0;
-    for symbol in symbols.clone() {
-        let raw = symbol.map_err(|e| format!("{name}: {e}"))?.name();
-        if by_offset.insert((raw.as_ptr() as usize).wrapping_sub(bytes.as_ptr() as usize), None).is_none() {
-            index_bytes += raw.len() + 1;
-        }
-    }
-    let mut names = Names::with_capacity(index_bytes);
 
-    let mut members = Vec::new();
+    // The members' count and names' length first, a walk of their headers, so the columns and
+    // the arena are allocated once at their size.
+    let (mut count, mut member_bytes) = (0, 0);
+    for member in file.members() {
+        let Ok(member) = member else { break };
+        count += 1;
+        member_bytes += member.name().len();
+    }
+    let mut members = Vec::with_capacity(count);
     // Where each member's header is, in archive order (so sorted): what the index's offsets
     // name, found by binary search without parsing the member again. 8 bytes a member.
-    let mut heads: Vec<u64> = Vec::new();
+    let mut heads: Vec<u64> = Vec::with_capacity(count);
+    let mut ranges = Vec::with_capacity(count);
     for member in file.members() {
+        // alloc: error path
         let member = member.map_err(|e| format!("{name}: {e}"))?;
         let header = member
             .header()
+            // alloc: error path
             .ok_or_else(|| format!("{name}: a member without an `ar` header"))?;
         heads.push((std::ptr::from_ref(header) as usize - bytes.as_ptr() as usize) as u64);
         let (offset, size) = member.file_range();
@@ -58,34 +65,79 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
             .ok()
             .and_then(|start| Some(start..start.checked_add(usize::try_from(size).ok()?)?))
             .filter(|it| it.end <= bytes.len())
+            // alloc: error path
             .ok_or_else(|| format!("{name}: a member past the end of the archive"))?;
         let member_name = std::str::from_utf8(member.name())
+            // alloc: error path
             .map_err(|_| format!("{name}: a member whose name isn't UTF-8: {:?}", member.name()))?;
-        let member_name = names.push(member_name).map_err(|e| format!("{name}: {e}"))?;
-        members.push(Member { name: member_name, bytes: range });
+        ranges.push((member_name, range));
     }
 
-    let mut index = Vec::with_capacity(symbols.size_hint().0);
+    // A BSD `__.SYMDEF` names each entry's string by offset, so many entries may name one
+    // string: each distinct string is one `Name`, or the arena grows with the entries times
+    // the string's length. The entries are sorted by where their string is in `bytes` (16
+    // bytes an entry), and each run of one offset pushes its name once: no hash of the file's
+    // offsets, and the arena sized from the distinct strings before anything is pushed.
+    let entries = symbols.size_hint().0;
+    let mut by_offset: Vec<Entry> = Vec::with_capacity(entries);
+    // Each entry's name until its run names it: an empty name of an empty arena, which
+    // allocates nothing.
+    let unnamed = Names::default().push("").expect("an empty name fits");
+    let mut index: Vec<(Name, u32)> = Vec::with_capacity(entries);
     for symbol in symbols {
+        // alloc: error path
         let symbol = symbol.map_err(|e| format!("{name}: {e}"))?;
         let found = heads.binary_search(&symbol.offset().0).map_err(|_| {
+            // alloc: error path
             let shown = String::from_utf8_lossy(symbol.name());
+            // alloc: error path
             format!("{name}: the index puts {shown} at offset {}, which is no member", symbol.offset().0)
         })?;
         let raw = symbol.name();
-        let slot = by_offset.entry((raw.as_ptr() as usize).wrapping_sub(bytes.as_ptr() as usize)).or_default();
-        let core = match *slot {
-            Some(core) => core,
-            None => {
-                let core = super::push_core_name(&mut names, raw).map_err(|e| format!("{name}: {e}"))?;
-                *slot = Some(core);
-                core
-            }
+        let (Ok(nth), Ok(len)) = (u32::try_from(index.len()), u32::try_from(raw.len())) else {
+            // alloc: error path
+            return Err(format!("{name}: an index of more than 2^32 entries or bytes"));
         };
-        index.push((core, found as u32));
+        let at = (raw.as_ptr() as usize).wrapping_sub(bytes.as_ptr() as usize) as u64;
+        by_offset.push(Entry { at, nth, len });
+        index.push((unnamed, found as u32));
+    }
+    radix::sort_copy_by_key(&mut by_offset, |it| it.at);
+
+    // A core name is at most one byte longer than its Mach-O one.
+    let mut arena = member_bytes;
+    for run in by_offset.chunk_by(|a, b| a.at == b.at) {
+        arena += run[0].len as usize + 1;
+    }
+    let mut names = Names::with_capacity(arena);
+    for (member_name, range) in ranges {
+        // alloc: error path
+        let member_name = names.push(member_name).map_err(|e| format!("{name}: {e}"))?;
+        members.push(Member { name: member_name, bytes: range });
+    }
+    for run in by_offset.chunk_by(|a, b| a.at == b.at) {
+        // The index's strings are slices of `bytes`, which `object` read the index from.
+        let (at, len) = (run[0].at as usize, run[0].len as usize);
+        let core = super::push_core_name(&mut names, &bytes[at..at + len])
+            // alloc: error path
+            .map_err(|e| format!("{name}: {e}"))?;
+        for entry in run {
+            index[entry.nth as usize].0 = core;
+        }
     }
     Ok(Archive { members, index, names })
 }
+
+/// An index entry: where its string is in the archive, its place in the index and its
+/// string's length. 16 bytes.
+#[derive(Clone, Copy)]
+struct Entry {
+    at: u64,
+    nth: u32,
+    len: u32,
+}
+
+const _: () = assert!(size_of::<Entry>() == 16);
 
 #[cfg(test)]
 mod tests {

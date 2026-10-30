@@ -1,7 +1,11 @@
-//! Copy-on-write storage for an image's state, so that a stage's copy costs a pointer per
-//! chunk and copies only what it writes: [`CowVec`] (a column), [`CowList`] (many short lists
-//! in shared chunks, CSR), [`CowBytes`] (a region's bytes, by page); and the dense sets a stage
-//! keeps ([`IdSet`], [`SymSet`]).
+//! Copy-on-write storage for an image's state, so that a stage's copy costs one reference
+//! count per container and copies only what it writes: [`CowVec`] (a column), [`CowList`]
+//! (many short lists in shared chunks, CSR), [`CowBytes`] (a region's bytes, by page); and the
+//! dense sets a stage keeps ([`IdSet`], [`SymSet`]).
+//!
+//! Each container keeps its table of chunks (or pages) behind one `Arc`, and each chunk behind
+//! its own: a clone shares both, the first write after it copies the table (a pointer per
+//! chunk) and the chunk written, and a container never written after the clone costs nothing.
 
 #![forbid(unsafe_code)]
 
@@ -9,27 +13,30 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
+use blaze_ids::radix;
+
 use crate::model::Sym;
 use crate::symbols::Symbols;
 
 const CHUNK: usize = 1024;
 
-/// A column cloned in O(len / 1024): chunks are shared until written.
+/// A column cloned in O(1), with no allocation: the chunk table and the chunks are shared until
+/// written.
 #[derive(Debug)]
 pub(crate) struct CowVec<T> {
-    chunks: Vec<Arc<Vec<T>>>,
+    chunks: Arc<Vec<Arc<Vec<T>>>>,
     len: usize,
 }
 
 impl<T> Clone for CowVec<T> {
     fn clone(&self) -> Self {
-        CowVec { chunks: self.chunks.clone(), len: self.len }
+        CowVec { chunks: Arc::clone(&self.chunks), len: self.len }
     }
 }
 
 impl<T> Default for CowVec<T> {
     fn default() -> Self {
-        CowVec { chunks: Vec::new(), len: 0 }
+        CowVec { chunks: Arc::default(), len: 0 }
     }
 }
 
@@ -55,15 +62,17 @@ impl<T: Clone> CowVec<T> {
         if at >= self.len {
             return None;
         }
-        Some(&mut Arc::make_mut(&mut self.chunks[at / CHUNK])[at % CHUNK])
+        Some(&mut Arc::make_mut(&mut Arc::make_mut(&mut self.chunks)[at / CHUNK])[at % CHUNK])
     }
 
     pub fn push(&mut self, value: T) -> usize {
         let at = self.len;
+        let chunks = Arc::make_mut(&mut self.chunks);
         if at % CHUNK == 0 {
-            self.chunks.push(Arc::new(Vec::with_capacity(CHUNK)));
+            // alloc: one chunk per 1024 elements, kept for the column's life
+            chunks.push(Arc::new(Vec::with_capacity(CHUNK)));
         }
-        Arc::make_mut(self.chunks.last_mut().expect("a chunk was just made")).push(value);
+        Arc::make_mut(chunks.last_mut().expect("a chunk was just made")).push(value);
         self.len += 1;
         at
     }
@@ -110,20 +119,20 @@ impl ListRef {
 /// the state is compacted.
 #[derive(Debug)]
 pub(crate) struct CowList<T> {
-    chunks: Vec<Arc<Vec<T>>>,
+    chunks: Arc<Vec<Arc<Vec<T>>>>,
     live: usize,
     garbage: usize,
 }
 
 impl<T> Clone for CowList<T> {
     fn clone(&self) -> Self {
-        CowList { chunks: self.chunks.clone(), live: self.live, garbage: self.garbage }
+        CowList { chunks: Arc::clone(&self.chunks), live: self.live, garbage: self.garbage }
     }
 }
 
 impl<T> Default for CowList<T> {
     fn default() -> Self {
-        CowList { chunks: Vec::new(), live: 0, garbage: 0 }
+        CowList { chunks: Arc::default(), live: 0, garbage: 0 }
     }
 }
 
@@ -149,7 +158,8 @@ impl<T: Copy> CowList<T> {
             return &mut [];
         }
         let start = list.start as usize;
-        &mut Arc::make_mut(&mut self.chunks[list.chunk as usize])[start..start + list.len as usize]
+        let chunks = Arc::make_mut(&mut self.chunks);
+        &mut Arc::make_mut(&mut chunks[list.chunk as usize])[start..start + list.len as usize]
     }
 
     pub fn push(&mut self, items: &[T]) -> ListRef {
@@ -157,8 +167,8 @@ impl<T: Copy> CowList<T> {
             return ListRef::EMPTY;
         }
         let list = self.room(items.len());
-        let chunk = Arc::make_mut(&mut self.chunks[list.chunk as usize]);
-        chunk.extend_from_slice(items);
+        let chunks = Arc::make_mut(&mut self.chunks);
+        Arc::make_mut(&mut chunks[list.chunk as usize]).extend_from_slice(items);
         self.live += items.len();
         list
     }
@@ -169,7 +179,8 @@ impl<T: Copy> CowList<T> {
             return ListRef::EMPTY;
         }
         let list = self.room(len);
-        let chunk = Arc::make_mut(&mut self.chunks[list.chunk as usize]);
+        let chunks = Arc::make_mut(&mut self.chunks);
+        let chunk = Arc::make_mut(&mut chunks[list.chunk as usize]);
         chunk.resize(chunk.len() + len, fill);
         self.live += len;
         list
@@ -179,7 +190,8 @@ impl<T: Copy> CowList<T> {
     fn room(&mut self, len: usize) -> ListRef {
         let fits = self.chunks.last().is_some_and(|it| it.len() + len <= Self::CHUNK);
         if !fits {
-            self.chunks.push(Arc::new(Vec::with_capacity(len.max(Self::CHUNK))));
+            // alloc: one chunk per 64 KiB of lists (or per longer list), kept for the arena's life
+            Arc::make_mut(&mut self.chunks).push(Arc::new(Vec::with_capacity(len.max(Self::CHUNK))));
         }
         let chunk = self.chunks.len() - 1;
         let start = self.chunks[chunk].len();
@@ -204,7 +216,7 @@ impl<T: Copy> CowList<T> {
 
 /// A set of dense `u32` ids (pieces, slots): a bitset answers membership, and the members are
 /// kept in the order they were first added, so iterating costs the members, not the range.
-#[derive(Clone, Default, Debug)]
+#[derive(Default, Debug)]
 pub(crate) struct IdSet {
     bits: Vec<u64>,
     listed: Vec<u64>,
@@ -262,10 +274,18 @@ impl IdSet {
         self.list.iter().copied().filter(|it| self.contains(*it))
     }
 
+    /// The members in increasing order, in one buffer of exactly their count.
     pub fn sorted(&self) -> Vec<u32> {
-        let mut out: Vec<u32> = self.iter().collect();
-        out.sort_unstable();
+        let mut out = Vec::with_capacity(self.len);
+        self.sorted_into(&mut out);
         out
+    }
+
+    /// The members in increasing order, into `out` (cleared first).
+    pub fn sorted_into(&self, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend(self.iter());
+        radix::sort(out);
     }
 
     pub fn extend(&mut self, ids: impl IntoIterator<Item = u32>) {
@@ -276,7 +296,7 @@ impl IdSet {
 }
 
 /// A set of symbols: an [`IdSet`] per symbol shard.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct SymSet {
     shards: Vec<IdSet>,
     len: usize,
@@ -284,7 +304,9 @@ pub(crate) struct SymSet {
 
 impl Default for SymSet {
     fn default() -> Self {
-        SymSet { shards: vec![IdSet::default(); Symbols::SHARDS], len: 0 }
+        let mut shards = Vec::with_capacity(Symbols::SHARDS);
+        shards.resize_with(Symbols::SHARDS, IdSet::default);
+        SymSet { shards, len: 0 }
     }
 }
 
@@ -338,7 +360,8 @@ type Page = [u8; PAGE];
 /// A region's bytes: the buffer the last full link wrote, and the 16 KiB pages written since,
 /// each shared with the states it came from until written again. A stage that writes one
 /// function copies the page it is in, not the region; reading a range that lies in the
-/// unwritten buffer or in one page borrows it.
+/// unwritten buffer or in one page borrows it. A clone is two reference counts: the page table
+/// is shared too, and copied (a pointer per page) by the first write after the clone.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CowBytes {
     base: Arc<Vec<u8>>,
@@ -347,16 +370,24 @@ pub(crate) struct CowBytes {
     base_len: usize,
     /// One per page of `0..len`: the page as written, or `None` for `base` (zeros past
     /// `base_len`).
-    pages: Vec<Option<Arc<Page>>>,
+    pages: Arc<Vec<Option<Arc<Page>>>>,
     len: usize,
 }
+
+/// What [`CowBytes::same`] compares at a time when neither side can be borrowed.
+const COMPARE: usize = 4096;
 
 impl CowBytes {
     pub const PAGE: usize = PAGE;
 
+    /// Takes the buffer a full link wrote: two allocations (its `Arc` and the page table),
+    /// once per region per full link.
     pub fn from_vec(bytes: Vec<u8>) -> CowBytes {
         let len = bytes.len();
-        CowBytes { base: Arc::new(bytes), base_len: len, pages: vec![None; len.div_ceil(PAGE)], len }
+        let mut pages = Vec::with_capacity(len.div_ceil(PAGE));
+        pages.resize(len.div_ceil(PAGE), None);
+        // alloc: once per region per full link (the buffer's and the page table's `Arc`s)
+        CowBytes { base: Arc::new(bytes), base_len: len, pages: Arc::new(pages), len }
     }
 
     pub fn len(&self) -> usize {
@@ -368,13 +399,36 @@ impl CowBytes {
     }
 
     /// `at..at + len`, borrowed when it is in the unwritten buffer or in one written page.
+    /// Hot paths that can't take a copy use [`CowBytes::slice`], [`CowBytes::copy_to`] or
+    /// [`CowBytes::same`] instead.
     pub fn read(&self, at: usize, len: usize) -> Cow<'_, [u8]> {
         if let Some(it) = self.slice(at, len) {
             return Cow::Borrowed(it);
         }
+        // alloc: only a range across pages written since the full link; the copy is the caller's
         let mut out = vec![0; len];
         self.copy_to(at, &mut out);
         Cow::Owned(out)
+    }
+
+    /// Whether `self[at..at + len]` and `other[other_at..other_at + len]` hold the same bytes,
+    /// compared in place: borrowed when both can be, else through two stack buffers.
+    pub fn same(&self, at: usize, other: &CowBytes, other_at: usize, len: usize) -> bool {
+        if let (Some(a), Some(b)) = (self.slice(at, len), other.slice(other_at, len)) {
+            return std::ptr::eq(a, b) || a == b;
+        }
+        let (mut x, mut y) = ([0u8; COMPARE], [0u8; COMPARE]);
+        let (mut a, mut b, mut left) = (at, other_at, len);
+        while left > 0 {
+            let n = left.min(COMPARE);
+            self.copy_to(a, &mut x[..n]);
+            other.copy_to(b, &mut y[..n]);
+            if x[..n] != y[..n] {
+                return false;
+            }
+            (a, b, left) = (a + n, b + n, left - n);
+        }
+        true
     }
 
     /// `at..at + len` if it can be borrowed (see [`CowBytes::read`]).
@@ -414,8 +468,9 @@ impl CowBytes {
 
     /// Page `index` to write, copied from the buffer (or made) the first time.
     fn page_mut(&mut self, index: usize) -> &mut Page {
-        let slot = &mut self.pages[index];
+        let slot = &mut Arc::make_mut(&mut self.pages)[index];
         if slot.is_none() {
+            // alloc: copy on write, once per page a stage first writes
             let mut page: Arc<Page> = Arc::new([0; PAGE]);
             let start = index * PAGE;
             let have = self.base_len.saturating_sub(start).min(PAGE);
@@ -456,7 +511,7 @@ impl CowBytes {
     pub fn resize(&mut self, len: usize) {
         if len < self.len {
             self.base_len = self.base_len.min(len);
-            self.pages.truncate(len.div_ceil(PAGE));
+            Arc::make_mut(&mut self.pages).truncate(len.div_ceil(PAGE));
             if len % PAGE != 0 {
                 let last = len / PAGE;
                 if self.pages[last].is_some() {
@@ -465,7 +520,9 @@ impl CowBytes {
             }
         }
         self.len = len;
-        self.pages.resize(len.div_ceil(PAGE), None);
+        if self.pages.len() != len.div_ceil(PAGE) {
+            Arc::make_mut(&mut self.pages).resize(len.div_ceil(PAGE), None);
+        }
     }
 
     /// All the bytes: borrowed when no page was written since the buffer.
@@ -473,15 +530,16 @@ impl CowBytes {
         if self.len <= self.base_len && self.pages.iter().all(Option::is_none) {
             return Cow::Borrowed(&self.base[..self.len]);
         }
+        // alloc: the edge: a whole region for the file writer, once per region per write
         let mut out = vec![0; self.len];
         self.copy_to(0, &mut out);
         Cow::Owned(out)
     }
 
-    /// The page-aligned ranges of `self` that may differ from `old`: pages both share are
-    /// skipped without reading them.
-    pub fn changed_since(&self, old: &CowBytes) -> Vec<Range<usize>> {
-        let mut out: Vec<Range<usize>> = Vec::new();
+    /// The page-aligned ranges of `self` that may differ from `old`, into `out` (cleared
+    /// first): pages both share are skipped without reading them.
+    pub fn changed_since(&self, old: &CowBytes, out: &mut Vec<Range<usize>>) {
+        out.clear();
         let same_base = Arc::ptr_eq(&self.base, &old.base);
         for (index, page) in self.pages.iter().enumerate() {
             let (start, end) = (index * PAGE, ((index + 1) * PAGE).min(self.len));
@@ -501,7 +559,6 @@ impl CowBytes {
                 _ => out.push(start..end),
             }
         }
-        out
     }
 }
 
@@ -550,7 +607,7 @@ mod tests {
         assert_eq!(b.get(added), &[1, 2, 3]);
         assert_eq!(b.get(*first)[0], u64::MAX);
         assert_ne!(a.get(*first)[0], u64::MAX);
-        for (at, (x, y)) in a.chunks.iter().zip(&b.chunks).enumerate() {
+        for (at, (x, y)) in a.chunks.iter().zip(b.chunks.iter()).enumerate() {
             assert_eq!(Arc::ptr_eq(x, y), at != first.chunk as usize);
         }
         b.free(*first);
@@ -604,7 +661,13 @@ mod tests {
         assert_eq!(&*b.contiguous(), &reference[..]);
         assert_eq!(&*a.contiguous(), &start[..]);
         assert!(matches!(a.contiguous(), Cow::Borrowed(_)));
-        assert_eq!(b.changed_since(&a), vec![0..2 * PAGE, 3 * PAGE..b.len()]);
+        let mut changed = Vec::new();
+        b.changed_since(&a, &mut changed);
+        assert_eq!(changed, vec![0..2 * PAGE, 3 * PAGE..b.len()]);
+        assert!(b.same(PAGE + 1, &a, PAGE + 1, 20), "an unwritten range is the same");
+        assert!(!b.same(PAGE - 5, &a, PAGE - 5, 10), "a written range differs");
+        assert!(b.same(PAGE - 5, &b.clone(), PAGE - 5, PAGE + 10), "a range across pages, copied in parts");
+        assert!(b.same(0, &a, 0, PAGE - 3));
         b.resize(PAGE + 10);
         reference.truncate(PAGE + 10);
         b.resize(2 * PAGE);
@@ -613,5 +676,39 @@ mod tests {
         b.fill(5, 3, 0xee);
         reference[5..8].fill(0xee);
         assert_eq!(&*b.read(0, 16), &reference[..16]);
+    }
+
+    /// A clone of each container allocates nothing and shares its table until written; a read
+    /// and a comparison in place allocate nothing.
+    #[test]
+    fn clones_and_reads_allocate_nothing() {
+        let mut column = CowVec::default();
+        let mut lists: CowList<u32> = CowList::default();
+        for n in 0..5000u32 {
+            column.push(n);
+            lists.push(&[n, n + 1]);
+        }
+        let mut bytes = CowBytes::from_vec(vec![1; 5 * PAGE]);
+        bytes.write(PAGE + 7, &[2; 3]);
+        let list = ListRef { chunk: 0, start: 2, len: 2 };
+        let (copies, used) = blaze_alloc_count::measure(|| (column.clone(), lists.clone(), bytes.clone()));
+        assert_eq!(used.allocations, 0, "a clone is reference counts");
+        let (mut column2, lists2, bytes2) = copies;
+        assert!(Arc::ptr_eq(&column.chunks, &column2.chunks), "an unwritten clone shares the table");
+        assert!(Arc::ptr_eq(&lists.chunks, &lists2.chunks));
+        assert!(Arc::ptr_eq(&bytes.pages, &bytes2.pages));
+        blaze_alloc_count::assert_at_most(0, "column, list and byte reads", || {
+            assert_eq!(column2.get(4321), Some(&4321));
+            assert_eq!(lists2.get(list), &[1, 2]);
+            assert!(bytes2.slice(PAGE + 7, 3).is_some());
+            assert!(bytes2.same(0, &bytes, 0, 5 * PAGE));
+        });
+        // The first write after the clone copies the table and one chunk, each a new `Arc` and
+        // its buffer: four allocations, whatever the column's length.
+        blaze_alloc_count::assert_at_most(4, "a first write after a clone", || *column2.get_mut(3).unwrap() = 0);
+        blaze_alloc_count::assert_at_most(0, "a second write to the same chunk", || *column2.get_mut(4).unwrap() = 0);
+        assert_eq!(column.get(3), Some(&3));
+        assert!(!Arc::ptr_eq(&column.chunks, &column2.chunks));
+        assert!(Arc::ptr_eq(&column.chunks[1], &column2.chunks[1]));
     }
 }

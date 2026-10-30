@@ -3,8 +3,8 @@
 //! A dropped value keeps its memo: its fingerprint and the edges it read. Verifying it walks those
 //! edges without the value, so a dependent of an unchanged body stays valid, and a read of it
 //! computes it again and backdates by fingerprint, so a later edit cuts off early as if the value
-//! had been kept (salsa's `evict_values` and `evict_values_of`, which need the `lru` these queries
-//! set; docs/v2/plan/lanes/db.md section 7).
+//! had been kept (salsa's `evict_values` and `evict_values_of`, which every query with a `Hash`
+//! output has; docs/v2/plan/lanes/db.md section 7).
 //!
 //! A closure's captures and signature are its body's inference result, dropped with it. Enum
 //! discriminants are not dropped: an `i128` is smaller than the fingerprint kept in its place.

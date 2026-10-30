@@ -17,6 +17,8 @@
 //!     // requires that `a == b`, with `a` considered the "expected" type
 //! ```
 
+use std::cell::Cell;
+
 use rustc_type_ir::{
     FnSig, GenericArgKind, TypeFoldable, TypingMode, Variance,
     error::ExpectedFound,
@@ -56,13 +58,16 @@ impl<'db> InferCtxt<'db> {
         Self {
             interner: self.interner,
             typing_mode: self.typing_mode,
+            // clone: a fork is a copy of the variable tables.
             inner: self.inner.clone(),
-            tainted_by_errors: self.tainted_by_errors.clone(),
-            universe: self.universe.clone(),
+            tainted_by_errors: Cell::new(self.tainted_by_errors.get()),
+            universe: Cell::new(self.universe.get()),
+            // clone: the fork sees the same universes, so it needs their assumptions.
             placeholder_assumptions: self.placeholder_assumptions.clone(),
-            enable_next_solver_overflow_fcw: self.enable_next_solver_overflow_fcw.clone(),
+            enable_next_solver_overflow_fcw: Cell::new(self.enable_next_solver_overflow_fcw.get()),
+            // clone: empty unless a root goal overflowed, and then a handful.
             next_solver_overflows: self.next_solver_overflows.clone(),
-            obligation_inspector: self.obligation_inspector.clone(),
+            obligation_inspector: Cell::new(self.obligation_inspector.get()),
             canonicalizer_state: Default::default(),
         }
     }
@@ -77,13 +82,16 @@ impl<'db> InferCtxt<'db> {
         Self {
             interner: self.interner,
             typing_mode,
+            // clone: a fork is a copy of the variable tables.
             inner: self.inner.clone(),
-            tainted_by_errors: self.tainted_by_errors.clone(),
-            universe: self.universe.clone(),
+            tainted_by_errors: Cell::new(self.tainted_by_errors.get()),
+            universe: Cell::new(self.universe.get()),
+            // clone: the fork sees the same universes, so it needs their assumptions.
             placeholder_assumptions: self.placeholder_assumptions.clone(),
-            enable_next_solver_overflow_fcw: self.enable_next_solver_overflow_fcw.clone(),
+            enable_next_solver_overflow_fcw: Cell::new(self.enable_next_solver_overflow_fcw.get()),
+            // clone: empty unless a root goal overflowed, and then a handful.
             next_solver_overflows: self.next_solver_overflows.clone(),
-            obligation_inspector: self.obligation_inspector.clone(),
+            obligation_inspector: Cell::new(self.obligation_inspector.get()),
             canonicalizer_state: Default::default(),
         }
     }
@@ -178,6 +186,7 @@ impl<'db> InferCtxt<'db> {
             obligations: goals
                 .into_iter()
                 .map(|goal| Obligation::new(self.interner, *cause, goal.param_env, goal.predicate))
+                // alloc: none when the relation made no goals; otherwise the caller owns them.
                 .collect(),
         }
     }

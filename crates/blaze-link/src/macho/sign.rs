@@ -40,8 +40,9 @@ pub(super) fn len(identifier: &str, limit: u64) -> u64 {
 
 /// The file before the signature, as the byte ranges it is made of: zero between them.
 pub(super) struct View<'a> {
-    /// By offset, not overlapping, none empty.
-    parts: Vec<(usize, &'a [u8])>,
+    /// By offset, not overlapping, none empty, each ending at most at `len`: so every offset
+    /// is a `usize`.
+    parts: Vec<(u64, &'a [u8])>,
     len: usize,
 }
 
@@ -56,15 +57,16 @@ impl<'a> View<'a> {
         let mut end = 0;
         for &(at, bytes) in &parts {
             if at < end {
+                // alloc: error path
                 return Err(format!("the file's bytes at {at:#x} overlap those before {end:#x}"));
             }
             end = at + bytes.len() as u64;
         }
-        if end > len {
+        let Some(len) = usize::try_from(len).ok().filter(|_| end <= len) else {
+            // alloc: error path
             return Err(format!("the file's bytes run to {end:#x}, past its {len:#x} signed bytes"));
-        }
-        let parts = parts.into_iter().map(|(at, bytes)| (at as usize, bytes)).collect();
-        Ok(View { parts, len: len as usize })
+        };
+        Ok(View { parts, len })
     }
 
     /// The file of `bytes`.
@@ -81,16 +83,18 @@ impl<'a> View<'a> {
     fn page<'b>(&'b self, nth: usize, buf: &'b mut [u8; PAGE]) -> &'b [u8] {
         let start = nth * PAGE;
         let end = (start + PAGE).min(self.len);
-        let first = self.parts.partition_point(|(at, bytes)| at + bytes.len() <= start);
+        let first = self.parts.partition_point(|&(at, bytes)| at as usize + bytes.len() <= start);
         if let Some(&(at, bytes)) = self.parts.get(first)
-            && at <= start
-            && at + bytes.len() >= end
+            && at as usize <= start
+            && at as usize + bytes.len() >= end
         {
+            let at = at as usize;
             return &bytes[start - at..end - at];
         }
         let buf = &mut buf[..end - start];
         buf.fill(0);
         for &(at, bytes) in &self.parts[first..] {
+            let at = at as usize;
             if at >= end {
                 break;
             }

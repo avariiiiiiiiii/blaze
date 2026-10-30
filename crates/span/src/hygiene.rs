@@ -35,6 +35,9 @@ mod imp {
 
     use crate::{MacroCallId, Transparency};
 
+    // dyn: salsa's database handle, which its interned lookups take: one call per context read
+    type Db = dyn Database;
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     struct SyntaxContextData {
         outer_expn: MacroCallId,
@@ -129,7 +132,7 @@ mod imp {
         }
 
         pub fn new(
-            db: &dyn Database,
+            db: &Db,
             outer_expn: MacroCallId,
             outer_transparency: Transparency,
             edition: Edition,
@@ -157,12 +160,12 @@ mod imp {
         // The bigger issue is that this will cause interning to now create completely separate chains
         // per crate. Though that is likely not a problem as `MacroCallId`s are already crate calling dependent.
         #[inline]
-        pub fn outer_expn(self, db: &dyn Database) -> Option<MacroCallId> {
+        pub fn outer_expn(self, db: &Db) -> Option<MacroCallId> {
             self.id().map(|id| id.data(db).outer_expn)
         }
 
         #[inline]
-        pub fn outer_transparency(self, db: &dyn Database) -> Transparency {
+        pub fn outer_transparency(self, db: &Db) -> Transparency {
             match self.id() {
                 Some(id) => id.data(db).outer_transparency,
                 None => Transparency::Opaque,
@@ -170,7 +173,7 @@ mod imp {
         }
 
         #[inline]
-        pub fn edition(self, db: &dyn Database) -> Edition {
+        pub fn edition(self, db: &Db) -> Edition {
             match self.id() {
                 Some(id) => id.data(db).edition,
                 None => Edition::from_u32(SyntaxContext::MAX_ROOT_ID - self.0.get()),
@@ -178,7 +181,7 @@ mod imp {
         }
 
         #[inline]
-        pub fn parent(self, db: &dyn Database) -> SyntaxContext {
+        pub fn parent(self, db: &Db) -> SyntaxContext {
             match self.id() {
                 Some(id) => id.data(db).parent,
                 None => self,
@@ -187,7 +190,7 @@ mod imp {
 
         /// This context, but with all transparent and semi-opaque expansions filtered away.
         #[inline]
-        pub fn opaque(self, db: &dyn Database) -> SyntaxContext {
+        pub fn opaque(self, db: &Db) -> SyntaxContext {
             match self.id() {
                 Some(id) => id.data(db).opaque(self),
                 None => self,
@@ -196,7 +199,7 @@ mod imp {
 
         /// This context, but with all transparent expansions filtered away.
         #[inline]
-        pub fn opaque_and_semiopaque(self, db: &dyn Database) -> SyntaxContext {
+        pub fn opaque_and_semiopaque(self, db: &Db) -> SyntaxContext {
             match self.id() {
                 Some(id) => id.data(db).opaque_and_semiopaque(self),
                 None => self,
@@ -206,7 +209,7 @@ mod imp {
         #[inline]
         pub fn opaque_and_opaque_and_semiopaque(
             self,
-            db: &dyn Database,
+            db: &Db,
         ) -> (SyntaxContext, SyntaxContext) {
             match self.id() {
                 Some(id) => {
@@ -218,7 +221,7 @@ mod imp {
         }
 
         #[inline]
-        pub fn outer_mark(self, db: &dyn Database) -> (Option<MacroCallId>, Transparency) {
+        pub fn outer_mark(self, db: &Db) -> (Option<MacroCallId>, Transparency) {
             match self.id() {
                 Some(id) => {
                     let data = id.data(db);
@@ -229,22 +232,22 @@ mod imp {
         }
 
         #[inline]
-        pub fn normalize_to_macros_2_0(self, db: &dyn Database) -> SyntaxContext {
+        pub fn normalize_to_macros_2_0(self, db: &Db) -> SyntaxContext {
             self.opaque(db)
         }
 
         #[inline]
-        pub fn normalize_to_macro_rules(self, db: &dyn Database) -> SyntaxContext {
+        pub fn normalize_to_macro_rules(self, db: &Db) -> SyntaxContext {
             self.opaque_and_semiopaque(db)
         }
 
         #[inline]
-        pub fn is_opaque(self, db: &dyn Database) -> bool {
+        pub fn is_opaque(self, db: &Db) -> bool {
             !self.is_root() && self.outer_transparency(db).is_opaque()
         }
 
         #[inline]
-        pub fn remove_mark(&mut self, db: &dyn Database) -> (Option<MacroCallId>, Transparency) {
+        pub fn remove_mark(&mut self, db: &Db) -> (Option<MacroCallId>, Transparency) {
             match self.id() {
                 Some(id) => {
                     let data = id.data(db);
@@ -255,7 +258,8 @@ mod imp {
             }
         }
 
-        pub fn marks(self, db: &dyn Database) -> impl Iterator<Item = (MacroCallId, Transparency)> {
+        pub fn marks(self, db: &Db) -> impl Iterator<Item = (MacroCallId, Transparency)> {
+            // alloc: only for a macros 1.0 call in a macros 2.0 expansion (`apply_mark`)
             let mut marks = self.marks_rev(db).collect::<Vec<_>>();
             marks.reverse();
             marks.into_iter()
@@ -264,7 +268,7 @@ mod imp {
         #[inline]
         pub fn marks_rev(
             self,
-            db: &dyn Database,
+            db: &Db,
         ) -> impl Iterator<Item = (MacroCallId, Transparency)> {
             let data = move |ctx: SyntaxContext| ctx.id().map(|it| it.data(db));
             std::iter::successors(data(self), move |ctx| data(ctx.parent))

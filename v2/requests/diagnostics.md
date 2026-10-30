@@ -645,6 +645,7 @@ above, its type printed through `hir::Type::derived_from_next_solver` (requested
 `diagnostics-bodies`).
 
 > forwarded to codegen (`crates/hir-ty-mir`) and db, both still running.
+> applied by db-ty-d-mir: `UnreachableAfterCall` and `MirBody::unreachable_after_calls` in `crates/hir-ty/src/mir.rs` as written (`Debug, Clone, PartialEq, Eq, Hash`; hashed and shrunk with the body). The constructor (`hir-ty-mir/src/mir/lower.rs:294`) and the fill are codegen's: `v2/requests/db-ty.md`, "db-ty-d-mir", 1.
 
 ## diagnostics-bodies-types: why the types had to agree, and what a bound was needed for (db, `crates/hir-ty`, `crates/hir/src/diagnostics.rs`)
 
@@ -968,6 +969,12 @@ Why: `tests/lints/syntax/early/builtin.rs` (`range-inclusive-pattern-precedence.
 `ellipsis_inclusive_range_patterns` warning.
 
 > forwarded to format: `crates/parser` is lane format's.
+> applied: by format-grammar in `crates/parser/src/grammar/patterns.rs`
+> (`ban_pat_range_if_ambiguous`, called by `ref_pat` and `box_pat`): the parser error "the range
+> pattern here has ambiguous interpretation" at the end of the `RANGE_PAT` under the `REF_PAT` or
+> `BOX_PAT`, for `..=` and `..` (start, end or half open), not `...`; test
+> `inline/err/ambiguous_range_pat`. Its span and the suggestion are lowering's:
+> `v2/requests/format.md` "format-grammar" item 4.
 
 ## diagnostics-bodies-calls: the types of an error as of when it was found
 
@@ -1075,6 +1082,14 @@ and never lints those around a guard pattern
 `lints/syntax/delims.rs` cannot tell them from what the parser makes of them now.
 
 > forwarded to format: `crates/parser`, `crates/syntax` are lane format's.
+> applied: by format-grammar. `RefPat = '&' ('pin' ('const' | 'mut') | 'mut')? Pat`
+> (`RefPat::pin_token`, `const_token`; `pin` is the contextual keyword `PIN_KW`, taken only before
+> `mut`/`const` as rustc's `parse_pin_and_mut`), and `GuardPat = Pat guard:MatchGuard`
+> (`ast::Pat::GuardPat`, kind `GUARD_PAT`), built by `patterns::pattern_top_guard` (rustc's
+> `parse_pat_allow_top_guard`) in tuple and parenthesized, slice, tuple struct and struct field
+> patterns and `builtin#deref`; a `for` loop's pattern is requested of format-lexer. Tests
+> `inline/ok/ref_pat_pin`, `inline/ok/guard_pat`. `ref pin mut x` and `&pin mut T` types are not
+> in this change.
 
 ## diagnostics-lints-syntax-early-macros-asm: `ra-ap-rustc_parse_format` for blaze-diagnostics
 
@@ -1655,6 +1670,10 @@ parsed by `DocParser` (its `invalid_doc_attributes`). The other expressions with
 `HasAttrs`, `IncludeBytesExpr` and `CfgPredExpr`, are not written by users.
 
 > forwarded to format: `crates/syntax/rust.ungram` is lane format's.
+> applied: by format-grammar. `RecordExpr = AnyAttr* Path RecordExprFieldList` in
+> `crates/syntax/rust.ungram`; `impl ast::HasAttrs for RecordExpr` and `RecordExpr` in
+> `AnyHasAttrs` (`can_cast`, `From`) in `crates/syntax/src/ast/generated/nodes.rs`. The parser
+> already puts the outer attributes inside the `RECORD_EXPR` (`expr_bp`'s `extend_to`).
 
 ## diagnostics-items-generics: elision failures of `&T` and `'_` (db, `crates/hir-ty/src/lower.rs`, `crates/hir`)
 
@@ -2213,6 +2232,13 @@ test is `#[ignore]`d in `tests/items/features/attributes.rs` until then.
 
 > for: format (parser grammar of `CfgComposite`).
 > forwarded to format: the attribute parser's grammar is in `crates/parser`.
+> applied: by format-grammar in `crates/parser/src/grammar/attributes.rs` (`cfg_predicate`): a
+> literal is a `CfgAtom` with a `Literal` child (`CfgAtom::literal()`, `CfgAtom = ... | Literal`
+> in `rust.ungram`) anywhere a predicate is, as rustc's `parse_cfg_entry` reads one; `true` and
+> `false` stay bare tokens. No parser error: "expected a valid identifier here" and the version
+> errors are rustc's attribute parser's, requested of diagnostics with un-ignoring
+> `cfg_version_is_gated` (`v2/requests/format.md` "format-grammar" item 6); evaluating
+> `version(..)` is requested of `crates/cfg` (item 7). Test `inline/ok/cfg_literal_pred`.
 
 ## diagnostics-items-features-attrs: call `gate` from `checks/attrs` `lower`
 
@@ -2303,6 +2329,7 @@ known to the front end; until then `dead_code` reports nothing in a crate with e
 `unported` flag in `lints/names/dead/defs.rs`), never a guess.
 
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's (format's hir-def files go on to format).
+> applied by db-expand: (2) `crates/hir-def/src/macro_reach.rs`. rustc reads nothing of the macro's body: `macro_reach_module(db, MacroId)` is the module an opaque, module-level macro makes names reachable in, and `MacroReachable::update_from_macro` is one pass of `EmbargoVisitor`'s fixpoint (it walks a further ancestor each pass). How to call it is in `v2/requests/db-expand.md`, "## db-expand: `pub macro` reachability". (1) waits on format: `global_asm!` is not an item-tree item yet.
 
 ## diagnostics-lints-names-dead: where clauses and foreign types in `hir` (crates/hir `lib.rs`)
 
@@ -2500,6 +2527,18 @@ Why: rustc parses these and refuses them in `rustc_ast_passes`; until the parser
 
 > for: parser (front end).
 > forwarded to format: `crates/parser` is lane format's.
+> applied: by format-grammar. Fn-pointer params (`grammar/params.rs`): a first-position `self`
+> param (`self`, `mut self`, `&'a mut self`, `self: T`) is a `SelfParam`; a param is a pattern
+> when rustc's `is_named_param` says so (`x:`, `&x:`, `&&x:`, `mut x:`, `x` any identifier,
+> keywords and `_` too); `&mut x: T`, which rustc reads as a pattern only in `recover_arg_parse`,
+> is a pattern with the parser error "patterns aren't allowed in function pointer types"
+> (E0642, not E0561; lowering requested). Negative bounds (`grammar/generic_params.rs`):
+> `TypeBound::excl_token()`, and rustc's `PolarityAndModifiers` error for `?`/`!` after
+> `const`/`[const]`/`~const`/`async`. `unsafe mod` (`grammar/items.rs`): a `Module` with
+> `Module::unsafe_token()`. Tests `inline/ok/{fn_pointer_self_param,fn_pointer_param_pat,
+> negative_trait_bound,unsafe_mod}`, `inline/err/{fn_pointer_param_ref_mut_pat,
+> polarity_and_modifiers_trait_bound}`. Lowering the `!` bound in hir-def and the checks are
+> requested (`v2/requests/format.md` "format-grammar" items 2, 4, 5).
 
 ## diagnostics-lints-syntax: `-Z crate-attr` as a file of its own (db, `crates/base-db/src/input.rs`, `crates/hir-def/src/attrs.rs`)
 
@@ -2656,4 +2695,120 @@ so `line_bounds` is unchanged. `norm` already clamps to the text's length, and `
 `min` keeps any other caller in range, so the `expect` cannot fire. The text has had its byte
 order mark and `\r`s taken out, so none of `LineIndex::place`'s rustc rules apply here, and
 `line`/`line_start` don't use them.
+Status: open
+
+> forwarded to diagnostics (told by tmux).
+
+## diagnostics-lints-names-dead: `#[rustc_main]` and `#[rustc_canonical_symbol]` as `AttrFlags` bits (crates/hir-def `attrs.rs`)
+
+What: two bits in `AttrFlags` set by `match_attr_flags` for the one-segment path attributes
+`rustc_main` and `rustc_canonical_symbol`, and `AttrFlags::has_word` mapping those two names to
+their bits, as it already does for `rustc_nounwind`, `rustc_comptime` and `panic_handler`. Why:
+the dead-code pass (`lints/names/dead/seed.rs`) reads every other attribute it needs from the
+memoized `AttrFlags::query` with a bit test. For these two it calls `has_word`, which falls back
+to `has_word_in_source` and scans the item's attributes again: once per free function of the
+crate for `rustc_main` (rustc's `entry_fn`), and once per foreign function for
+`rustc_canonical_symbol` (`has_allow_dead_code_or_lang_attr`). With the bits, both become bit
+tests and nothing changes at the call sites.
+
+> forwarded to db (`hir-def/src/attrs.rs`; window `db-next2`, told by tmux).
+
+## diagnostics-lints-names-dead: the crate's definitions shared by `dead` and `items` (crates/blaze-diagnostics `lints/names.rs`)
+
+What: whether `items::private_in_public`, `items::after_abort` and `dead::lints` should share
+one numbering of the crate's definitions (`dead/defs.rs::Defs`: every item, associated item,
+variant and field with its kind, name, parent and children, in `checks::modules` order) and
+the effective visibilities (`dead/reach.rs::Reach`, rustc's `effective_visibilities` at
+`Reachable`). If so, `names::after_abort` would build them once and pass them to both, which is
+an interface change to their `fn(cx) -> Vec<Found>` signatures. Why: rustc computes
+`effective_visibilities` once per crate, and dead code, `unreachable_pub` and `private_interfaces`
+all read it. Today `dead::lints` walks the crate once and computes its own visibilities, and
+nothing inside it repeats a walk. Whether `items` walks the crate again for the same facts is
+the parent's call.
+
+> forwarded to diagnostics (told by tmux).
+
+## speed-hir-store-stmts: statements become columns, `Statement` a view (blaze-diagnostics)
+
+From speed-hir-store-stmts (child of speed-hir-store), 2026-10-29. `hir-def` stores a block's
+statements as rows of two columns (5 bytes a statement, a `let`'s ids in `extra`), where it was
+a 32-byte enum in a flat array. These land together with that change. This reverses the note in
+"## speed-hir-store: blaze-diagnostics onto the HIR column views" above that `Statement` stays an
+owned type reached through `&` (its `*` on `Statement` fields): `MatchArm`, `RecordLitField` and
+`AsmOperand` still are.
+
+**The rule.** `Statement` is now `Statement<'a>`, a `Copy` view decoded from the rows, with
+today's variant and field names (`Let { pat, type_ref, initializer, else_branch, is_super }`,
+`Expr { expr, has_semi }`, `Item(Item<'a>)`). `Expr::Block { statements, .. }` gives
+`statements: Statements<'a>`, a `Copy` handle (`len`, `is_empty`, `get(i) ->
+Option<Statement<'a>>`, `first`, `last`, `iter()` double-ended and exact size, `IntoIterator`
+for it and for `&` it), no longer `&'a [Statement]`. So:
+1. A statement is a value: `for statement in statements` and `statements.iter().enumerate()`
+   still compile and yield `Statement<'_>`; `get`/`last` give `Option<Statement<'_>>`. Its id,
+   `Option` and `bool` fields bind by value: `*pat` -> `pat`, `*initializer` -> `initializer`,
+   `Some(*e)` -> `Some(e)`; `= *statement` / `*statements.get(i)?` drop the `*`.
+2. A parameter `&Statement` -> `Statement<'_>`; a return `Option<&'db Statement>` ->
+   `Option<Statement<'db>>` (`BodyCx::store()` is `&'db ExpressionStore`, so the view is
+   `'db`).
+3. No slice operations: the one slice pattern (`statements: []`, `calls/desugar.rs`) becomes
+   `is_empty`.
+
+Examples (real sites):
+- `lints/bodies/calls/statements.rs` ~L65: `-> Option<&'db Statement> {`  ->  `-> Option<Statement<'db>> {`
+- `lints/bodies/calls/methods/map_unit_fn.rs` ~L57: `= *statements.get(index)? else { return None };`  ->  `= statements.get(index)? else { return None };`
+- `lints/bodies/calls/desugar.rs` ~L54: `let Expr::Block { statements: [], tail: Some(next), .. } = store.expr(body) else { return None };`  ->  `let Expr::Block { statements, tail: Some(next), .. } = store.expr(body) else { return None };` followed by `if !statements.is_empty() { return None; }`
+
+Counts: 27 sites in 13 files of `crates/blaze-diagnostics/src/lints/bodies*` (below).
+`ide-diagnostics` and the rest of `blaze-diagnostics` (`lower/`, `lints/syntax/`, whose
+`statements()` are `syntax::ast`'s) have none.
+
+### crates/blaze-diagnostics/src/lints/bodies.rs  (8)
+- `fn child_exprs`, the `Expr::Block` arm (~L373-378): `out.extend(*initializer);`  ->  `out.extend(initializer);`; `pat(*p, out);`  ->  `pat(p, out);`; `out.extend(*else_branch);`  ->  `out.extend(else_branch);`; `Statement::Expr { expr, .. } => out.push(*expr),`  ->  `Statement::Expr { expr, .. } => out.push(expr),`
+- the walker's `Expr::Block` arm (~L621-634): `self.expr(*it);` (both, the `initializer` and `else_branch` ones)  ->  `self.expr(it);`; `self.pat(*pat);`  ->  `self.pat(pat);`; `Statement::Expr { expr, .. } => self.expr(*expr),`  ->  `Statement::Expr { expr, .. } => self.expr(expr),`
+- unchanged: `for (index, statement) in statements.iter().enumerate()`, `if let Statement::Item(_) = statement`.
+
+### crates/blaze-diagnostics/src/lints/bodies/reachable.rs  (3)
+- ~L108  `fn statement_node(b: &BodyCx<'_, '_>, statement: &Statement) -> Option<InFile<SyntaxNodePtr>> {`  ->  `fn statement_node(b: &BodyCx<'_, '_>, statement: Statement<'_>) -> Option<InFile<SyntaxNodePtr>> {`
+- ~L110  `Statement::Expr { expr, .. } => (b.expr_node(*expr)?, false),`  ->  `Statement::Expr { expr, .. } => (b.expr_node(expr)?, false),`
+- ~L111  `Statement::Let { pat, .. } => (b.pat_node(*pat)?, true),`  ->  `Statement::Let { pat, .. } => (b.pat_node(pat)?, true),`
+- unchanged: the caller `statement_node(b, statements.get(index as usize)?)?` (~L88).
+
+### crates/blaze-diagnostics/src/lints/bodies/unsafety.rs  (1)
+- ~L154  `                        pats.push(*pat);`  ->  `                        pats.push(pat);`
+
+### crates/blaze-diagnostics/src/lints/bodies/types/pointers.rs  (2)
+- ~L147  `&& let Some(id) = binding(*pat)`  ->  `&& let Some(id) = binding(pat)`
+- ~L149  `self.map.insert(id, *init);`  ->  `self.map.insert(id, init);`
+
+### crates/blaze-diagnostics/src/lints/bodies/types/pointers/dangling.rs  (2)
+- ~L100  `initializer.iter().chain(else_branch).for_each(|it| this.expr(*it));`  ->  `initializer.into_iter().chain(else_branch).for_each(|it| this.expr(it));` (both are `Option<ExprId>` by value now; `iter()` would chain `&ExprId` with `ExprId`)
+- ~L102  `Statement::Expr { expr, .. } => this.expr(*expr),`  ->  `Statement::Expr { expr, .. } => this.expr(expr),`
+
+### crates/blaze-diagnostics/src/lints/bodies/calls/items/invalid_from_utf8.rs  (2)
+- ~L200  `&& let Pat::Bind { id, .. } = store.pat(*pat)`  ->  `&& let Pat::Bind { id, .. } = store.pat(pat)`
+- ~L203  `return *initializer;`  ->  `return initializer;`
+
+### crates/blaze-diagnostics/src/lints/bodies/calls/items/drop_forget_useless.rs  (1)
+- ~L72  `Some(Statement::Expr { expr, has_semi: true }) => Some(*expr),`  ->  `Some(Statement::Expr { expr, has_semi: true }) => Some(expr),`
+
+### crates/blaze-diagnostics/src/lints/bodies/types/casts/static_mut_refs.rs  (1)
+- ~L99  delete the line `        let (pat, init) = (*pat, *init);` (the `let Some(Statement::Let { pat, initializer: Some(init), .. }) = statements.get(index)` above it binds both by value now)
+
+### crates/blaze-diagnostics/src/lints/bodies/liveness/source.rs  (1)
+- ~L75  `let Statement::Let { pat, initializer: Some(init), else_branch, .. } = *statement else {`  ->  `let Statement::Let { pat, initializer: Some(init), else_branch, .. } = statement else {`
+
+### crates/blaze-diagnostics/src/lints/bodies/calls/desugar/if_let_rescope.rs  (1)
+- ~L79  `place(*expr, Parent::Stmt);`  ->  `place(expr, Parent::Stmt);`
+
+### crates/blaze-diagnostics/src/lints/bodies/calls/methods/map_unit_fn.rs  (1)
+- ~L57  `let Statement::Expr { expr, has_semi: true } = *statements.get(index)? else { return None };`  ->  `let Statement::Expr { expr, has_semi: true } = statements.get(index)? else { return None };`
+
+### crates/blaze-diagnostics/src/lints/bodies/calls/statements.rs  (3)
+- ~L65  `fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<&'db Statement> {`  ->  `fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<Statement<'db>> {` (its body `Expr::Block { statements, .. } => statements.get(index),` is unchanged)
+- ~L76  `Statement::Expr { expr, has_semi: true } => Some(*expr),`  ->  `Statement::Expr { expr, has_semi: true } => Some(expr),`
+- ~L193  `Some(Local { pat: *pat, init: *initializer, typed: type_ref.is_some(), assign: None })`  ->  `Some(Local { pat, init: initializer, typed: type_ref.is_some(), assign: None })`
+
+### crates/blaze-diagnostics/src/lints/bodies/calls/desugar.rs  (1)
+- ~L54  `    let Expr::Block { statements: [], tail: Some(next), .. } = store.expr(body) else { return None };`  ->  `    let Expr::Block { statements, tail: Some(next), .. } = store.expr(body) else { return None };\n    if !statements.is_empty() {\n        return None;\n    }`
+
 Status: open

@@ -27,6 +27,7 @@ use hir_ty_codegen::v2::{
 };
 
 use super::{Job, UnitReader, files::Mounted, graph::flag, script};
+use crate::serve::work::Image as KeptImage;
 
 /// What a unit makes, as the linker sees it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -200,7 +201,7 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
     })
 }
 
-/// What a unit's codegen made, reading the task's snapshot.
+/// What a unit's codegen made, reading the task's front end.
 pub(crate) struct Generated<'db> {
     pub(crate) built: Built,
     pub(crate) roots: Roots,
@@ -209,14 +210,14 @@ pub(crate) struct Generated<'db> {
 }
 
 /// The code generator's view of the job's front end, its files named as rustc names them. Every
-/// thread of the build reads the one snapshot of the task's reader: salsa's reads take `&self`,
-/// so none waits on another and none is cloned.
+/// thread of the build reads the one database of the task's reader by reference: salsa's reads
+/// take `&self`, so none waits on another and none is cloned.
 fn frontend<'db>(job: &Job, reader: &'db UnitReader, mounted: &Arc<Mounted>) -> HirFrontend<'db> {
     let names = {
-        let (mounted, paths) = (Arc::clone(mounted), Arc::clone(&reader.paths));
+        let (mounted, paths) = (Arc::clone(mounted), Arc::clone(reader.paths()));
         move |file: base_db::FileId| -> Option<String> { paths.get(&file).map(|path| mounted.name(path)) }
     };
-    HirFrontend::new(Databases::new(&reader.db), Box::new(ItemHashes::new(Box::new(names))), build_time(job))
+    HirFrontend::new(Databases::new(reader.db()), Box::new(ItemHashes::new(Box::new(names))), build_time(job))
 }
 
 /// The tests of test unit `unit` as its harness lists them, compiling nothing: the same
@@ -414,13 +415,15 @@ fn natives(job: &Job, unit: usize, frontend: &HirFrontend<'_>) -> Result<(Vec<Na
 pub(crate) type Read = (String, ContentId);
 
 /// `generated` linked into the image at `path` as `makes` says: the file's bytes, and every
-/// native input the link read off the machine.
+/// native input the link read off the machine. The image kept at `path` is taken out of
+/// `images` and relinked, and what this link made put back; a link that fails puts none.
 pub(crate) fn link(
     job: &Job,
     unit: usize,
     path: &str,
     makes: &Makes,
     generated: &Generated<'_>,
+    images: &mut Vec<KeptImage>,
 ) -> Result<(Vec<u8>, Vec<Read>), String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let built = &generated.built;
@@ -441,9 +444,10 @@ pub(crate) fn link(
     let located = blaze_link::target::locate(&output, &libs, &search).map_err(|it| it.to_string())?;
     let side = generated.frontend.link_inputs(built).map_err(|it| it.what)?;
 
-    let kept = job.shared.images.lock().unwrap_or_else(|it| it.into_inner()).remove(path);
+    let kept = images.iter().position(|it| it.path == path).map(|at| images.swap_remove(at).kept.into_any());
+    let kept = kept.and_then(|it| it.downcast::<Linked>().ok());
     let mut linked = match kept.filter(|it| it.output == output) {
-        Some(it) => it,
+        Some(it) => *it,
         None => {
             let to = blaze_core::FileName::new(path.trim_start_matches('/'))
                 .ok_or_else(|| format!("`{path}` is no file the linker can name"))?;
@@ -534,7 +538,7 @@ pub(crate) fn link(
     linked.statics = statics;
     linked.natives = new_natives;
     linked.names = kept_names;
-    job.shared.images.lock().unwrap_or_else(|it| it.into_inner()).insert(path.to_owned(), linked);
+    images.push(KeptImage { path: path.to_owned(), kept: Box::new(linked) });
     Ok((bytes, read))
 }
 

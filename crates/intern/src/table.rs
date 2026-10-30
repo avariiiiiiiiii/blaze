@@ -331,6 +331,42 @@ impl fmt::Display for RestoreError {
 
 impl std::error::Error for RestoreError {}
 
+pub use blaze_image::{Jobs, serial};
+
+/// Groups one job of a restore checks: 1 MiB at 64 KiB groups, about 37 µs of CRC32C, so
+/// handing a job out is a few percent of it.
+const CHUNK_GROUPS: usize = 16;
+/// Entries of a column one job of a restore validates: about 16k values at about 25
+/// instructions each, near 40 µs, so a million symbols are 64 jobs, enough to fill a socket.
+const CHUNK: usize = 1 << 14;
+
+/// `check` over `0..total` in chunks of `chunk`, run by `jobs`. The error is the first chunk's
+/// that failed, so the same bytes give the same error however many workers ran.
+fn in_chunks<E: Send>(
+    jobs: Jobs<'_>,
+    total: usize,
+    chunk: usize,
+    check: impl Fn(std::ops::Range<usize>) -> Result<(), E> + Sync,
+) -> Result<(), E> {
+    let n = total.div_ceil(chunk);
+    if n <= 1 {
+        return check(0..total);
+    }
+    let failed = std::sync::Mutex::new(None::<(usize, E)>);
+    jobs(n, &|job| {
+        if let Err(error) = check(job * chunk..((job + 1) * chunk).min(total)) {
+            let mut failed = failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if failed.as_ref().is_none_or(|(at, _)| job < *at) {
+                *failed = Some((job, error));
+            }
+        }
+    });
+    match failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+        Some((_, error)) => Err(error),
+        None => Ok(()),
+    }
+}
+
 pub(crate) struct Table {
     shape: Shape,
     /// The first ID not compiled in.
@@ -375,8 +411,10 @@ impl Table {
         shape: Shape,
         image: &'static Image<S>,
         section: &Section,
+        jobs: Jobs<'_>,
     ) -> Result<Table, RestoreError> {
-        image.whole(section)?;
+        let groups = section.groups as usize;
+        in_chunks(jobs, groups, CHUNK_GROUPS, |at| image.check(section, at.start as u32..at.end as u32))?;
         let root = *image.value::<Root>(section, 0)?;
         let invalid = |what| RestoreError::Invalid { section: section.id, what };
         if root.statics != shape.statics || root.first != shape.statics + 1 || root.align as usize != shape.align {
@@ -408,7 +446,7 @@ impl Table {
             fresh: Column::new(),
             shape,
         };
-        table.validate().map_err(invalid)?;
+        table.validate(jobs).map_err(invalid)?;
         Ok(table)
     }
 
@@ -420,21 +458,22 @@ impl Table {
         image: &'static Image<S>,
         id: SectionId,
         schema: SchemaHash,
+        jobs: Jobs<'_>,
     ) -> Result<(), RestoreError> {
         let started = RestoreError::Started { section: id };
         if cell.get().is_some() {
             return Err(started);
         }
         let section = image.section(id, schema)?;
-        let table = Table::restore(shape, image, &section)?;
+        let table = Table::restore(shape, image, &section, jobs)?;
         cell.set(table).map_err(|_| started)
     }
 
     /// The checks that make every read of the restored columns in bounds, in O(IDs + slots)
-    /// with no value hashed. That the index reaches every live value under its own hash is
-    /// the section's CRC's to guard: a slot that does not costs a second ID for that value,
-    /// never a wrong value.
-    fn validate(&self) -> Result<(), &'static str> {
+    /// with no value hashed, each column split into chunks run by `jobs`. That the index
+    /// reaches every live value under its own hash is the section's CRC's to guard: a slot that
+    /// does not costs a second ID for that value, never a wrong value.
+    fn validate(&self, jobs: Jobs<'_>) -> Result<(), &'static str> {
         let base = &self.base;
         let count = (base.end - self.first) as usize;
         let align = self.shape.align;
@@ -444,47 +483,60 @@ impl Table {
         if base.starts[0] != 0 || base.starts[count] as usize != base.bytes.len() {
             return Err("starts that do not span the values");
         }
-        for index in 0..count {
-            let (start, end) = (base.starts[index] as usize, base.starts[index + 1] as usize);
-            if end < start || !start.is_multiple_of(align) || !(end - start).is_multiple_of(self.shape.size) {
-                return Err("a value's bytes out of order or misaligned");
-            }
-            match base.is_live(index) {
-                true if self.shape.text && std::str::from_utf8(&base.bytes[start..end]).is_err() => {
-                    return Err("a value that is not UTF-8");
-                }
-                true => {}
-                false if end != start => return Err("bytes for a free ID"),
-                false => {}
-            }
-        }
         if count % 64 != 0 && base.live[count / 64] >> (count % 64) != 0 {
             return Err("live bits past the last ID");
         }
-        let mut last = None;
-        for &id in base.free {
-            let in_range = id >= self.first && id < base.end;
-            if !in_range || last.is_some_and(|last| last >= id) || base.is_live((id - self.first) as usize) {
-                return Err("a free ID that is live, repeated or out of range");
-            }
-            last = Some(id);
-        }
-        let mut full = 0;
-        for (group, &word) in base.ctrl.iter().enumerate() {
-            for byte in 0..GROUP {
-                let tag = (word >> (byte * 8)) & 0xff;
-                if tag == 0 {
-                    continue;
+        in_chunks(jobs, count, CHUNK, |indices| {
+            for index in indices {
+                let (start, end) = (base.starts[index] as usize, base.starts[index + 1] as usize);
+                if end < start || !start.is_multiple_of(align) || !(end - start).is_multiple_of(self.shape.size) {
+                    return Err("a value's bytes out of order or misaligned");
                 }
-                let id = base.ids[group * GROUP + byte];
-                let known = (1..self.first).contains(&id)
-                    || (id >= self.first && id < base.end && base.is_live((id - self.first) as usize));
-                if tag & 0x80 == 0 || !known {
-                    return Err("an index slot that names no value");
+                match base.is_live(index) {
+                    true if self.shape.text && std::str::from_utf8(&base.bytes[start..end]).is_err() => {
+                        return Err("a value that is not UTF-8");
+                    }
+                    true => {}
+                    false if end != start => return Err("bytes for a free ID"),
+                    false => {}
                 }
-                full += 1;
             }
-        }
+            Ok(())
+        })?;
+        in_chunks(jobs, base.free.len(), CHUNK, |at| {
+            for at in at {
+                let id = base.free[at];
+                let in_range = id >= self.first && id < base.end;
+                let ascending = at == 0 || base.free[at - 1] < id;
+                if !in_range || !ascending || base.is_live((id - self.first) as usize) {
+                    return Err("a free ID that is live, repeated or out of range");
+                }
+            }
+            Ok(())
+        })?;
+        let full = std::sync::atomic::AtomicUsize::new(0);
+        in_chunks(jobs, base.ctrl.len(), CHUNK / GROUP, |groups| {
+            let mut here = 0;
+            for group in groups {
+                let word = base.ctrl[group];
+                for byte in 0..GROUP {
+                    let tag = (word >> (byte * 8)) & 0xff;
+                    if tag == 0 {
+                        continue;
+                    }
+                    let id = base.ids[group * GROUP + byte];
+                    let known = (1..self.first).contains(&id)
+                        || (id >= self.first && id < base.end && base.is_live((id - self.first) as usize));
+                    if tag & 0x80 == 0 || !known {
+                        return Err("an index slot that names no value");
+                    }
+                    here += 1;
+                }
+            }
+            full.fetch_add(here, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })?;
+        let full = full.into_inner();
         if full * 2 > base.ids.len() || (self.first > 1 && full == 0) {
             return Err("an index more than half full, or without the compiled-in values");
         }

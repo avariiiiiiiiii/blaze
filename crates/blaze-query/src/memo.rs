@@ -17,8 +17,9 @@
 //!   memo a view took from a slot just before it was unlinked stays while the view is open.
 
 use std::{
+    cell::UnsafeCell,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
 };
 
 use blaze_format::SchemaHash;
@@ -27,8 +28,8 @@ use blaze_reclaim::{Grace, Guard};
 
 use crate::{
     QueryKey, Stored,
-    segment::{self, Segment, Segments, Span, lane},
-    table::{EDGE_RECORD, EdgeRecord, Free, FxMap, Generations, Ids, Rows, ShortLock},
+    segment::{self, Lanes, Segment, Segments, Span, lane},
+    table::{COLLECT_AT, EDGE_RECORD, EdgeRecord, Free, FxMap, Generations, Ids, Rows, ShortLock},
 };
 
 /// A memo: its row in the store's hot and cold columns.
@@ -47,13 +48,25 @@ fn split(fingerprint: Fingerprint) -> [u64; 2] {
     [fingerprint.0 as u64, (fingerprint.0 >> 64) as u64]
 }
 
-/// What a hit and verification read of a memo. 40 bytes.
-#[repr(C)]
+/// [`MemoHot::seen`] while a writer rewrites the inline copy.
+const LOCKED: u64 = u64::MAX;
+
+/// What a hit and verification read of a memo: one cache line, so a hit on a value in memory
+/// reads this line and the value's bytes, never the value's row.
+///
+/// `bytes` and `len` are a copy of the value row's, kept as a seqlock: `seen` is the value
+/// word they were copied for ([`LOCKED`] while being rewritten). A reader that sees `seen`,
+/// the copy, `seen` again and then `value` all agree uses the copy: the word still names the
+/// row the copy came from, so its bytes stay for the reader's task as the row's do.
+#[repr(C, align(64))]
 pub(crate) struct MemoHot {
     /// [`Fingerprint`], as two words so the row is 8-byte aligned.
     fingerprint: [u64; 2],
-    /// See [`word`]: the only field written after the memo is published.
+    /// See [`word`]: written after the memo is published only by a compare-and-swap.
     value: AtomicU64,
+    seen: AtomicU64,
+    bytes: AtomicPtr<u8>,
+    len: AtomicUsize,
     /// `edge_len` records, in the order they were read.
     edges: NonNull<EdgeRecord>,
     edge_len: u32,
@@ -61,10 +74,10 @@ pub(crate) struct MemoHot {
     code: u32,
 }
 
-const _: () = assert!(size_of::<MemoHot>() == 40);
+const _: () = assert!(size_of::<MemoHot>() == 64);
 
 // SAFETY: `edges` names records that never change once copied in and stay until the memo is
-// freed (its cold row holds their segment, or they are the image's); `value` is atomic.
+// freed (its cold row holds their segment, or they are the image's); the rest is atomic.
 unsafe impl Send for MemoHot {}
 // SAFETY: as above.
 unsafe impl Sync for MemoHot {}
@@ -76,6 +89,19 @@ impl MemoHot {
 
     pub(crate) fn code(&self) -> u32 {
         self.code
+    }
+
+    /// The inline copy of the value's bytes, if it names the value the word names now.
+    fn inline(&self) -> Option<(*const u8, usize)> {
+        let seen = self.seen.load(Ordering::Acquire);
+        let bytes = self.bytes.load(Ordering::Relaxed);
+        let len = self.len.load(Ordering::Relaxed);
+        // Acquire: the copy's loads happen before `seen` is read again, so a rewrite that
+        // began before them shows as a changed `seen`.
+        fence(Ordering::Acquire);
+        let again = self.seen.load(Ordering::Relaxed);
+        let word = self.value.load(Ordering::Acquire);
+        (seen == again && seen == word && word != 0 && seen != LOCKED).then_some((bytes.cast_const(), len))
     }
 }
 
@@ -147,16 +173,21 @@ struct Codes {
     all: Vec<(SchemaHash, ContentId)>,
 }
 
-/// One shard of the store's writers: claiming and readying memo and value rows.
+/// One lane's writer state: claiming and readying memo and value rows.
 #[derive(Default)]
 struct Frees {
     memos: Free,
     values: Free,
 }
 
+/// A lane's [`Frees`], touched only by the thread holding the lane, so a write takes no lock.
 #[repr(align(128))]
 #[derive(Default)]
-struct Writers(ShortLock<Frees>);
+struct Writers(UnsafeCell<Frees>);
+
+// SAFETY: a lane's `Frees` is reached only through `Store::frees` by the thread holding that
+// lane (`lane()`), or through `&mut Store`.
+unsafe impl Sync for Writers {}
 
 /// Memos on their way out; see the module's comment.
 #[derive(Default)]
@@ -180,10 +211,10 @@ fn passed<T>(held: &[(Grace, T)]) -> usize {
 
 /// Every memo of the database and every value of a memo.
 ///
-/// - A memo costs 40 hot bytes, 48 cold bytes and 56 bytes an edge (one range of an edge
-///   segment); a value 64 bytes of row, 4 of generation and its bytes (in a value segment,
-///   at a 16-byte boundary). Reading a memo's fingerprint, edges or value is one row load
-///   by index, and the value one more.
+/// - A memo costs 64 hot bytes (one line), 48 cold bytes and 56 bytes an edge (one range of
+///   an edge segment); a value 64 bytes of row, 4 of generation and its bytes (in a value
+///   segment, at a 16-byte boundary). Reading a memo's fingerprint, edges or value's bytes is
+///   one line loaded by index; its value's row is read only when the inline copy is stale.
 pub(crate) struct Store {
     ids: Ids,
     hot: Rows<MemoHot>,
@@ -191,8 +222,7 @@ pub(crate) struct Store {
     value_ids: Ids,
     values: Rows<ValueRow>,
     generations: Generations,
-    writers: Box<[Writers]>,
-    mask: usize,
+    writers: Lanes<Writers>,
     codes: ShortLock<Codes>,
     dying: ShortLock<Dying>,
     /// Memos a cold write in flight will swap the value of, each with how many: not freed.
@@ -206,7 +236,6 @@ pub(crate) struct Store {
 
 impl Store {
     pub(crate) fn new() -> Store {
-        let count = blaze_ids::shard_count();
         Store {
             ids: Ids::new(),
             hot: Rows::new(),
@@ -214,8 +243,7 @@ impl Store {
             value_ids: Ids::new(),
             values: Rows::new(),
             generations: Generations::new(),
-            writers: (0..count).map(|_| Writers::default()).collect(),
-            mask: count - 1,
+            writers: Lanes::new(),
             codes: ShortLock::default(),
             dying: ShortLock::default(),
             pins: ShortLock::default(),
@@ -225,8 +253,21 @@ impl Store {
         }
     }
 
-    fn writers(&self) -> &ShortLock<Frees> {
-        &self.writers[lane() as usize & self.mask].0
+    /// This thread's lane's writer state, for `f`, which must not call back into it.
+    fn frees<R>(&self, f: impl FnOnce(&mut Frees) -> R) -> R {
+        let cell = self.writers.get(lane());
+        // SAFETY: only this thread holds its lane, and no caller's `f` reaches `frees` again
+        // (they claim, ready and drop rows, and dropping a row only lets go of segment holds).
+        f(unsafe { &mut *cell.0.get() })
+    }
+
+    /// Reclaims this lane's retired value rows past their grace, once enough are waiting.
+    fn tidy(&self, frees: &mut Frees) {
+        if frees.values.retired() >= COLLECT_AT {
+            let values = &self.values;
+            // SAFETY: a retired value row's grace has passed: no task that could reach it is left.
+            frees.values.reclaim(|row| unsafe { values.drop_row(row) });
+        }
     }
 
     /// The number of a schema and producer pair, the same for every memo of it.
@@ -245,6 +286,12 @@ impl Store {
         self.codes.lock().all[code as usize]
     }
 
+    /// Every code's schema and producer, indexed by code: for a pass over many memos, which
+    /// would otherwise take the codes' lock once a memo.
+    pub(crate) fn codes(&self) -> Vec<(SchemaHash, ContentId)> {
+        self.codes.lock().all.clone()
+    }
+
     /// Above every memo ID handed out so far.
     pub(crate) fn end(&self) -> u32 {
         self.ids.end()
@@ -259,28 +306,35 @@ impl Store {
     }
 
     fn add(&self, key: QueryKey, fingerprint: Fingerprint, code: u32, edges: Span, value: Option<(Span, bool, ContentId)>) -> MemoId {
-        let mut frees = self.writers().lock();
-        let value = match value {
-            Some((span, memory, id)) => self.put_value(&mut frees, span, memory, id),
-            None => 0,
-        };
-        let memo = self.ids.claim(&mut frees.memos);
-        let (at, len, segment) = edges.into_raw();
-        // SAFETY: claimed just now and not yet published.
-        unsafe {
-            self.hot.put(
-                memo,
-                MemoHot {
-                    fingerprint: split(fingerprint),
-                    value: AtomicU64::new(value),
-                    edges: at.cast(),
-                    edge_len: u32::try_from(len / EDGE_RECORD).expect("2^32 edges of one memo"),
-                    code,
-                },
-            );
-            self.cold.put(memo, MemoCold { key, edges: segment });
-        }
-        memo
+        self.frees(|frees| {
+            let (value, bytes, value_len) = match value {
+                Some((span, memory, id)) => {
+                    let (bytes, value_len) = (span.bytes().as_ptr().cast_mut(), span.bytes().len());
+                    (self.put_value(frees, span, memory, id), bytes, value_len)
+                }
+                None => (0, ptr::null_mut(), 0),
+            };
+            let memo = self.ids.claim(&mut frees.memos);
+            let (at, len, segment) = edges.into_raw();
+            // SAFETY: claimed just now and not yet published.
+            unsafe {
+                self.hot.put(
+                    memo,
+                    MemoHot {
+                        fingerprint: split(fingerprint),
+                        value: AtomicU64::new(value),
+                        seen: AtomicU64::new(value),
+                        bytes: AtomicPtr::new(bytes),
+                        len: AtomicUsize::new(value_len),
+                        edges: at.cast(),
+                        edge_len: u32::try_from(len / EDGE_RECORD).expect("2^32 edges of one memo"),
+                        code,
+                    },
+                );
+                self.cold.put(memo, MemoCold { key, edges: segment });
+            }
+            memo
+        })
     }
 
     /// A memo a run made: its edges and value copied once into this thread's segments.
@@ -355,9 +409,48 @@ impl Store {
         Some((word, unsafe { self.values.get(row) }))
     }
 
-    /// The memo's value's bytes, while it is in memory or mapped.
+    /// The memo's value's bytes, while it is in memory or mapped: from the hot row's inline
+    /// copy when it is current, else from the value's row.
     pub(crate) fn bytes<'g>(&'g self, task: &'g Guard, memo: MemoId) -> Option<&'g [u8]> {
+        if let Some((bytes, len)) = self.hot(task, memo).inline() {
+            // SAFETY: the copy of the row the word named when this task loaded it (see
+            // `MemoHot`): its bytes stay unchanged until that row is dropped, which is after a
+            // grace begun once the word stops naming it.
+            return Some(unsafe { std::slice::from_raw_parts(bytes, len) });
+        }
         self.value(task, memo).map(|(_, value)| value.bytes())
+    }
+
+    /// Rewrites the hot row's inline copy to the value the word names now, unless another
+    /// writer is at it (which rereads the word when it is done).
+    fn refresh(&self, task: &Guard, memo: MemoId) {
+        let hot = self.hot(task, memo);
+        loop {
+            let seen = hot.seen.load(Ordering::Relaxed);
+            if seen == LOCKED || seen == hot.value.load(Ordering::Acquire) {
+                return;
+            }
+            if hot.seen.compare_exchange(seen, LOCKED, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                continue;
+            }
+            // Release: `LOCKED` is visible before any of the copy's stores.
+            fence(Ordering::Release);
+            let word = hot.value.load(Ordering::Acquire);
+            let (bytes, len) = match value_row(word) {
+                Some(row) => {
+                    // SAFETY: as in `Store::value`: this task loaded the word naming the row.
+                    let value = unsafe { self.values.get(row) };
+                    (value.bytes.as_ptr(), value.len)
+                }
+                None => (ptr::null_mut(), 0),
+            };
+            hot.bytes.store(bytes, Ordering::Relaxed);
+            hot.len.store(len, Ordering::Relaxed);
+            hot.seen.store(word, Ordering::Release);
+            if hot.value.load(Ordering::Acquire) == word {
+                return;
+            }
+        }
     }
 
     /// The value in memory and the word naming it, for a cold write to swap out later.
@@ -382,14 +475,19 @@ impl Store {
             Err(_) => (value_row(now), false),
         };
         if let Some(row) = gone {
-            let mut frees = self.writers().lock();
-            if unlinked {
-                frees.values.retire(Grace::start(), row);
-            } else {
-                // SAFETY: `now` was never published, so no reader has its row.
-                unsafe { self.values.drop_row(row) };
-                frees.values.ready(row);
-            }
+            self.frees(|frees| {
+                if unlinked {
+                    frees.values.retire(Grace::start(), row);
+                    self.tidy(frees);
+                } else {
+                    // SAFETY: `now` was never published, so no reader has its row.
+                    unsafe { self.values.drop_row(row) };
+                    frees.values.ready(row);
+                }
+            });
+        }
+        if swapped.is_ok() {
+            self.refresh(task, memo);
         }
         swapped.is_ok()
     }
@@ -412,7 +510,7 @@ impl Store {
     /// refill's wins.
     pub(crate) fn refill(&self, task: &Guard, memo: MemoId, bytes: &[u8]) {
         let span = self.bytes.copy(bytes, blaze_format::ALIGN);
-        let now = self.put_value(&mut self.writers().lock(), span, true, ContentId::default());
+        let now = self.frees(|frees| self.put_value(frees, span, true, ContentId::default()));
         self.swap_value(task, memo, 0, now);
     }
 
@@ -425,7 +523,7 @@ impl Store {
     pub(crate) unsafe fn to_disk(&self, task: &Guard, memo: MemoId, was: u64, bytes: &[u8], id: ContentId) -> bool {
         // SAFETY: the caller's contract.
         let span = unsafe { Span::mapped(bytes) };
-        let now = self.put_value(&mut self.writers().lock(), span, false, id);
+        let now = self.frees(|frees| self.put_value(frees, span, false, id));
         self.swap_value(task, memo, was, now)
     }
 
@@ -442,18 +540,19 @@ impl Store {
         // SAFETY: the caller's contract: nothing reaches the memo, so its rows and value row
         // are this caller's.
         let word = unsafe { self.hot.get(memo) }.value.load(Ordering::Acquire);
-        let mut frees = self.writers().lock();
-        if let Some(row) = value_row(word) {
-            // SAFETY: the memo's value, reached only through the memo.
-            unsafe { self.values.drop_row(row) };
-            frees.values.ready(row);
-        }
-        // SAFETY: as above.
-        unsafe {
-            self.hot.drop_row(memo);
-            self.cold.drop_row(memo);
-        }
-        frees.memos.ready(memo);
+        self.frees(|frees| {
+            if let Some(row) = value_row(word) {
+                // SAFETY: the memo's value, reached only through the memo.
+                unsafe { self.values.drop_row(row) };
+                frees.values.ready(row);
+            }
+            // SAFETY: as above.
+            unsafe {
+                self.hot.drop_row(memo);
+                self.cold.drop_row(memo);
+            }
+            frees.memos.ready(memo);
+        });
     }
 
     /// A memo made but never published (an equal one was there already): freed at once.
@@ -518,9 +617,10 @@ impl Store {
         }
     }
 
-    /// Frees the checked memos whose grace has passed, the values let go of whose grace has
-    /// passed, and the segments left with nothing in them.
-    pub(crate) fn collect(&self) {
+    /// Frees the checked memos whose grace has passed, the values this lane let go of whose
+    /// grace has passed (each lane reclaims its own as it writes; `reclaim` frees every
+    /// lane's), and the segments left with nothing in them.
+    pub(crate) fn sweep(&self) {
         let ready: Vec<MemoId> = {
             let mut dying = self.dying.lock();
             let done = passed(&dying.checked);
@@ -540,28 +640,24 @@ impl Store {
             }
         }
         let values = &self.values;
-        for writers in self.writers.iter() {
+        self.frees(|frees| {
             // SAFETY: a retired value row's grace has passed: no task that could reach it is left.
-            writers.0.lock().values.reclaim(|row| unsafe { values.drop_row(row) });
-        }
-        self.edges.collect();
-        self.bytes.collect();
-        self.keys.collect();
+            frees.values.reclaim(|row| unsafe { values.drop_row(row) });
+        });
+        self.edges.sweep();
+        self.bytes.sweep();
+        self.keys.sweep();
     }
 
-    /// How many values let go of wait for their grace, after freeing those past it.
+    /// How many values this lane let go of wait for their grace, after freeing those past it.
     #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         let values = &self.values;
-        self.writers
-            .iter()
-            .map(|writers| {
-                let mut frees = writers.0.lock();
-                // SAFETY: as in `Store::collect`.
-                frees.values.reclaim(|row| unsafe { values.drop_row(row) });
-                frees.values.retired()
-            })
-            .sum()
+        self.frees(|frees| {
+            // SAFETY: as in `Store::sweep`.
+            frees.values.reclaim(|row| unsafe { values.drop_row(row) });
+            frees.values.retired()
+        })
     }
 
     /// How many memos let go of are not freed yet.
@@ -603,9 +699,9 @@ impl Store {
             // SAFETY: `&mut` excludes every reader.
             writers.0.get_mut().values.reclaim_all(|row| unsafe { values.drop_row(row) });
         }
-        self.edges.collect();
-        self.bytes.collect();
-        self.keys.collect();
+        self.edges.sweep();
+        self.bytes.sweep();
+        self.keys.sweep();
     }
 
     /// `bytes` as a key's, copied once into this thread's key segment.

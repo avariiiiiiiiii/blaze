@@ -94,10 +94,10 @@ pub(super) fn stable_mark(
         }
     }
     // As [`Mark::of_function`] has them: the variables a debugger is told of are left out.
-    if debug && let Some((owner, spans)) = &compiled.source {
+    if debug && let Some(source) = &compiled.source {
         for row in &compiled.code.lines {
-            let span = spans.get(row.span as usize);
-            let at = span.and_then(|span| row_location(db, *owner, compiled.closure, *span));
+            let written = source.written(row.span, compiled.closure);
+            let at = written.and_then(|it| row_location(db, it.owner, it.closure, it.span));
             place(at).hash(&mut hasher);
         }
     }
@@ -225,11 +225,10 @@ impl Mark {
         debug: bool,
     ) -> Mark {
         let mut hasher = rustc_hash::FxHasher::default();
-        if debug && let Some((owner, spans)) = &compiled.source {
+        if debug && let Some(source) = &compiled.source {
             for row in &compiled.code.lines {
-                let span = spans.get(row.span as usize);
-                span.map(|span| row_location(db, *owner, compiled.closure, *span))
-                    .hash(&mut hasher);
+                let written = source.written(row.span, compiled.closure);
+                written.map(|it| row_location(db, it.owner, it.closure, it.span)).hash(&mut hasher);
             }
         }
         Mark { lines: hasher.finish(), ..Mark::new(db, serial, &compiled.requests) }

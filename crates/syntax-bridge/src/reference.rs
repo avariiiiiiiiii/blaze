@@ -11,6 +11,7 @@ use syntax::{Parse, SyntaxKind, SyntaxKind::*, SyntaxNode, T};
 /// [`crate::to_parser_input`] as it was.
 pub fn to_parser_input(
     buffer: tt::TokenTreesView<'_>,
+    // dyn: a reference for tests, never on a build's path.
     span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
 ) -> parser::Input {
     convert(buffer, span_to_edition, false)
@@ -19,6 +20,7 @@ pub fn to_parser_input(
 /// [`crate::to_matcher_input`] as it was.
 pub fn to_matcher_input(
     buffer: tt::TokenTreesView<'_>,
+    // dyn: a reference for tests, never on a build's path.
     span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
 ) -> parser::Input {
     convert(buffer, span_to_edition, true)
@@ -28,6 +30,7 @@ pub fn to_matcher_input(
 pub fn token_tree_to_syntax_node(
     tt: &tt::TopSubtree,
     entry_point: TopEntryPoint,
+    // dyn: a reference for tests, never on a build's path.
     span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
 ) -> (Parse<SyntaxNode>, SpanMap) {
     let buffer = tt.view().strip_invisible();
@@ -42,6 +45,7 @@ pub fn same_input(a: &parser::Input, b: &parser::Input) -> bool {
 
 fn convert(
     buffer: tt::TokenTreesView<'_>,
+    // dyn: a reference for tests, never on a build's path.
     span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
     fragments: bool,
 ) -> parser::Input {

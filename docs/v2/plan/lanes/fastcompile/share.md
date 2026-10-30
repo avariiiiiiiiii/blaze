@@ -12,13 +12,13 @@ code is `crates/hir-ty-share/`; the boundaries are in [notes.md](notes.md).
 
 ## The key
 
-`hir_ty_share::share_key(db, instance, env, levels) -> Result<ShareKey, Unshared>` is a salsa
+`hir_ty_share::share_key(db, instance, env, options) -> Result<ShareKey, Unshared>` is a salsa
 query. A hit is one lookup. The key is a BLAKE3 hash with no dense id in it: items by their
 `blaze-items` keys, types by content. Two databases give one key for one source.
 
 The key is the body's identity (its item key and code hash, or its closure's or coroutine's
-code), the values of the instance's const arguments, and for each MIR optimization level the
-build may compile the body at, a walk of the body.
+code), the values of the instance's const arguments, and for each `MirOptions` the build may
+compile the body with (level, UB checks, lifetime markers), a walk of that body.
 
 The walk goes over the generic body and its monomorphized body in lockstep. They have one
 shape, because monomorphization only puts the arguments in. Where the generic body names a
@@ -78,7 +78,7 @@ A **callee** is keyed as codegen's walk asks for it (`walk.rs`, after `v2/refs.r
 
 ## Why equal keys mean equal code
 
-Codegen compiles `monomorphized(generic_body_at(level), args)`. Its output for an instance is a
+Codegen compiles `monomorphized(generic_body_with(options), args)`. Its output for an instance is a
 function of the reads codegen makes of that body. The walk records each read that can differ
 between instances of one body:
 
@@ -109,6 +109,17 @@ once the argument's name is blanked.
   for every instance (the Reference, "Statics & generics"). Sharing changes nothing about them,
   and the walk reads nothing for an `OperandKind::Static`. `programs/statics.rs` checks that a
   count goes on across types under rustc. (Request: fix the sentence in compile-time.md.)
+- **`#[track_caller]` locations.**
+  - A call from a shared body to a `#[track_caller]` function passes the location of the call
+    site. Codegen's fragment for that is `Location(owner, span)` (`hir-ty-codegen`
+    `fragment.rs`), and the owner and span are the generic body's, the same in every instance.
+  - Inside a `#[track_caller]` body, `caller_location` is the implicit argument
+    (`CallerLocation::Argument` in `hir-ty-mir` `optimize/inline/spans.rs`), so it depends on
+    the caller, not the instance.
+  - A pointer to a `#[track_caller]` function passes `Declaration(func)`. A `ReifyFnPointer`
+    cast is keyed by full identity anyway.
+  - A callee inlined at an optimized level is part of the body the walk reads, with its spans.
+  - So `CallerLocation` is a Layout intrinsic and no location needs a record.
 - **`TypeId`, `type_name`, vtables, `dyn` calls, closures and coroutines** are read by full
   identity, so they stay per instance.
 - **Debug info and names.** A shared body carries the first instance's debug info. Nothing in
@@ -154,6 +165,93 @@ Deciding before codegen beats folding after:
 Folding after is still a complement. Two *different* generic functions with identical code are
 not one key here, and `--icf=safe` at link time could catch them.
 
+## Speed of light
+
+Nothing here was run: costs are counted from the code and the machine, as in
+[speed-of-light-infer-relate.md](../db/speed-of-light-infer-relate.md), whose machine and unit
+costs this uses. That is an Apple M5 Max performance core at about 4.5 GHz with sustained IPC
+about 3.5.
+
+One share key is sequential. The parallelism comes from many instances at once (the db lane's
+scheduler). The working set is interned handles and a few memo entries, in L1 and L2, so
+memory bandwidth is never the bound. The bound is the critical path of one core over the work
+that can't be skipped.
+
+**The work.** For an instance of a body with options set \(S\):
+
+- \(P_t\) sites where the generic body names a parameter: a type, a constant, a deref, a cast
+  or an aggregate. Each needs its type substituted, then its fact read (a memo hit after the
+  first instance) or its value evaluated.
+- \(P_c\) calls whose callee names a parameter. Each adds a method resolution and the callee's
+  own key, both memo hits.
+- Hashing 33 bytes per record into one BLAKE3 stream.
+- A fixed part: the instance's memo entry, the body's code hash and item key, the body query
+  per options, and the final finalize.
+
+Unit costs:
+
+| step | cost |
+|---|---|
+| a salsa memo hit (fact, callee key, `lookup_impl_method`, a body): FxHash of the key, one shard probe, a revision check | about 30 ns |
+| substitute one site's type: the substitution's flags fast path, one or two rebuilt nodes interned | about 25 ns |
+| BLAKE3 over one 33-byte record (single chunk, about 2.5 cycles per byte) | about 20 ns |
+| `Hasher::new` (the context key is a cached table probe, `blaze-ids`) | about 10 ns |
+
+So the bound per options walked is
+
+\[ T_{\text{share}} \approx 300 + 75\,P_t + 135\,P_c \ \text{ns}, \]
+
+where \(75 = 25 + 30 + 20\) and \(135 = 75 + 2 \cdot 30\). Take a `Vec::push`-sized body: 40
+statements, 25 locals, \(P_t = 12\), \(P_c = 3\). That is
+\(300 + 900 + 405 \approx 1.6\ \mu s\). Compiling that instance with Cranelift takes 50 to
+200 µs, so a shared instance saves 30 to 100 times what its key costs.
+
+**Walks.** \(S\) is the build's options for the body's crate class. A build whose units agree
+has \(|S| = 1\): a debug build gives `other: {Debug, UB checks}`. Options that give one body
+(every options without UB checks give a coroutine its runtime body) are walked once, since
+`share` compares body pointers. So the work is \(|S_{\text{distinct bodies}}| \cdot
+T_{\text{share}}\), and nothing is walked for an options that no unit compiles.
+
+**What the code does today, and the gap.**
+
+- **Matches the bound:**
+  - records stream into one `Hasher`, with no buffer;
+  - facts, callee keys and the whole key are salsa memos, so a repeat costs one hit;
+  - recording depends only on the generic body, so no record is made for a place without a
+    parameter.
+- **Over the bound:** each walk runs `monomorphized` on the whole generic body. For the body
+  above:
+  - cloning the body is about 60 allocations and 10 KB copied, plus a refcount increment per
+    stored type, about 3 µs;
+  - substitution visits all of about 150 types and constants, not just the \(P_t\), about
+    0.45 µs over;
+  - dropping the clone is about 2 µs;
+  - the lockstep walk visits every statement, about 0.4 µs.
+
+  That is about 6 µs over 1.6 µs, so the key runs at about 20% of its speed of light, not 90%.
+  Codegen also monomorphizes the same body again to compile it, so a shared group pays for
+  \(N + 1\) monomorphizations, where it needs one.
+
+**What removes the gap** (request `fastcompile-ident-share 4`):
+
+- Split the walk.
+  - A tracked query `sites(body, options)` lists the generic body's parameter sites in walk
+    order, with derefs deduplicated. It depends on no argument, so it is built once per
+    generic body and options, \(O(B)\), and shared by every instance.
+  - Per instance, the key substitutes each site through `hir-ty-mir`'s substitution of one
+    value (the same `Filler` as `monomorphized`, so equal by construction). Then it reads the
+    fact or value and hashes it.
+  - No clone, no drop and no lockstep pass remain, and the shape checks become unnecessary:
+    the substituted site list is the monomorphized body's, by construction.
+  - A place's type at a deref is the generic place type substituted. Normalization is a
+    function of the type, so this equals projecting the substituted local.
+- After that, the per-instance cost is \(T_{\text{share}}\) plus a loop step of about 3 ns per
+  site, about 97% of the bound. The site list costs about \(10 B\) ns once per body, about
+  0.4 µs, which is below 10% of the bound for any body with two or more instances. A body with
+  one instance never needs a key.
+- Until `hir-ty-mir` gives that substitution, the walk keeps `monomorphized`. Writing a second
+  substitution here would be a parity risk with the one codegen compiles from.
+
 ## The hook (requested of codegen)
 
 `v2/requests/fastcompile.md`, `fastcompile-ident-share 1`:
@@ -162,8 +260,23 @@ not one key here, and `--icf=safe` at link time could catch them.
   place of `args_of`, hashed under its own domain, when the key is `Ok`.
 - An `Err` keeps `args_of`, as now: that is the per-instance path, not a fallback, because both
   give exact code.
-- The levels passed are those the build may compile at (`lang: {Release}`,
-  `other: {Debug, Release}`, plus `Off` under `BLAZE_MIR_OPT=0`).
+- The options passed are every `MirOptions` (level, UB checks, lifetime markers) that
+  `Build::options` gives a unit of the build, for the library's crates (`lang`) and the rest
+  (`other`). A typical debug build gives `lang: {Release}` and `other: {Debug, UB checks}`.
+  The key covers each of them because one `Described` serves every unit.
+
+Why there and not in `blaze-codegen`'s `template.rs` or `dedupe.rs`: both work on compiled
+functions.
+
+- `dedupe.rs` folds functions whose `code_id` agrees after compiling, as ICF does.
+- `template.rs` memoizes a compiled function under its instance with callees named by place
+  (#1291).
+
+Putting the key in either would still compile every copy first. `Described::args` feeds the
+`InstanceKey`, so two instances with one key are one instance before anything is compiled. The
+memo, the store, the template and dedupe then see one function, and none of them needs a second
+dedupe. When the key is `Err`, or when nothing calls `share_key`, `args_of` is unchanged. The
+query is memoized by salsa, so the cost on a hit is one lookup.
 
 ## Left for later
 
@@ -175,6 +288,7 @@ not one key here, and `--icf=safe` at link time could catch them.
   would share `&dyn Trait` coercions of types whose methods share.
 - **`Future::poll` of a coroutine** is keyed by identity, as codegen calls the coroutine's body.
 - **Mutual recursion** is unshared. A fixpoint over the cycle would share it.
-- **The MIR levels.** `hir-ty-codegen` uses `MirOptions`, which is not in `hir-ty` on disk. The
-  key is over `MirOptLevel`s, the interface `HirDatabase::optimized_mir_body` has. If codegen's
-  body also depends on ub-checks or other options, they go into `MirLevels`.
+- **The MIR options.** The key is over `hir-ty`'s `MirOptions` (`{level, ub_checks,
+  lifetime_markers}`), the interface `HirDatabase::optimized_mir_body` has. `hir-ty-codegen`
+  builds one with an `inline` field that `hir-ty` lacks. If inlining becomes an options field,
+  `OptionsSet` gets its bit.

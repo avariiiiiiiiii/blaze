@@ -125,7 +125,7 @@ impl IngredientIndex {
 pub struct MemoIngredientIndex(u32);
 
 impl MemoIngredientIndex {
-    pub(crate) fn from_usize(u: usize) -> Self {
+    pub(crate) const fn from_usize(u: usize) -> Self {
         assert!(u <= u32::MAX as usize);
         MemoIngredientIndex(u as u32)
     }
@@ -466,10 +466,21 @@ impl Zalsa {
             self.ingredients_vec[ingredient.as_u32() as usize]
                 .reset_for_new_revision(self.runtime.table_mut());
         }
+        self.reclaim_memos();
         self.graph.release_outgrown_nodes();
         self.compact_edges_if_worth_it();
 
         new_revision
+    }
+
+    /// Drops the memos retired (replaced or removed) since the last reclaim, in every struct
+    /// ingredient's memo columns, and frees their slots for reuse.
+    pub(crate) fn reclaim_memos(&mut self) {
+        for ingredient in self.ingredients_vec.iter_mut() {
+            // SAFETY: Every access to a memo goes through `&Zalsa`, and a borrowed memo borrows
+            // it; with `&mut self` neither exists.
+            unsafe { ingredient.reclaim_memos() };
+        }
     }
 
     /// Copies the live edge ranges into a new array once dead ones (of replaced or dropped memos)

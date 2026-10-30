@@ -86,8 +86,8 @@ Everything is a `u32` row of a column whose chunks never move (`table::Rows`: ch
 
 | Table | Row | Per element | Lookup |
 | --- | --- | --- | --- |
-| A map on query keys (`table::Map`: slots, inputs, `born`, a view's results, inputs, reruns) | `Entry { key, value }` | the row (40 bytes for a view's result), at most 16 bytes of places, a live bit | shard table pointer, ~1.5 place loads, one row read; no hash computed |
-| Memo, hot (`memo::MemoHot`) | fingerprint, value word, edge range, code | 40 bytes | one indexed load |
+| A map on query keys (`table::Map`: slots, inputs, `born`, a view's results, inputs, reruns) | `Entry { key, value }` | the row (64 bytes, one line, for a view's result: the memo's ID and fingerprint), at most 16 bytes of places, a live byte | shard table pointer (its length in the top bits), ~1.5 place loads, one row read; no hash computed |
+| Memo, hot (`memo::MemoHot`) | fingerprint, value word, a seqlocked copy of the value's address and length, edge range, code | 64 bytes, one line | one indexed load |
 | Memo, cold (`memo::MemoCold`) | key, the edge segment it holds | 48 bytes | one indexed load, writers only |
 | Value (`memo::ValueRow`) | bytes, length, segment, content ID | 64 bytes + 4 of generation + its bytes | one indexed load after the word |
 | Edge (`table::EdgeRecord`, also the image's layout) | kind, input, fingerprint seen | 56 bytes in its memo's range | read in place, sequentially |
@@ -111,12 +111,21 @@ Everything is a `u32` row of a column whose chunks never move (`table::Rows`: ch
   the open views at a later one (a view's results name memos by ID), and freed after a grace
   begun at that check. A memo a cold write will swap is pinned until the pack is mapped.
 - A warm hit (`Pinned::get` or `Cx::get` of a key the view resolved) is: the kind's entry, the
-  view's column slot, one map lookup, the memo's hot row, its value word and value row. It
-  allocates nothing (`tests::a_warm_hit_allocates_nothing` counts with a test allocator):
+  view's column slot, one map lookup and the memo's hot line, which holds a copy of where the
+  value's bytes are; the value's row is read only when that copy is being rewritten or stale.
+  It allocates nothing (`tests::a_warm_hit_allocates_nothing` counts with a test allocator):
   the key's bytes are encoded and an input's path is copied only on a miss.
 - Verifying a memo walks its edge range in order, stopping at the first edge whose fingerprint
   differs. Each edge is one lookup in the view's results (or inputs), made before anything
-  else.
+  else; a result holds its memo's fingerprint, so the memo's line is not read. The lookups 8
+  and 4 edges ahead are prefetched (place, then row), so misses overlap.
+- No atomic read-modify-write on the write path but the publish: each lane's free lists are
+  its own (no lock), a row's generation is a plain store by its claimer, and an open
+  segment's hold count carries a bias that its lane settles with its own count at seal.
+- Collection marks memos in bitsets sized by the store's IDs, not hash sets, and a cold pack
+  is checked against the value still in memory by a `memcmp`, not a second hash.
+- Per-component bounds and how far off each is: [speed-of-light.md](speed-of-light.md),
+  "blaze-query".
 
 ## The benchmark: the fastest known way to do each piece
 
@@ -153,16 +162,16 @@ Nothing has been built or measured yet. These are design comparisons, to be chec
   the place, Click's "prime" state.
 - **Allocation.** The fastest known are bump arenas (rustc's `DroplessArena`, `bumpalo`) and
   mimalloc's per-thread segments and pages with free lists sharded by thread. blaze-query
-  matches a bump arena's alloc path: a thread-local load, a bump, a `memcpy` and one relaxed
-  add on the segment's hold count. Its rows are reused from per-shard free lists claimed 64 at
-  a time, as mimalloc's pages are. Where it falls short of mimalloc: fragmentation. A segment
+  matches a bump arena's alloc path: a thread-local load, a bump, a `memcpy` and a lane-local
+  count. Its rows are reused from per-lane free lists claimed 64 at a time, as mimalloc's
+  pages are. Where it falls short of mimalloc: fragmentation. A segment
   stays while one memo in it lives, and nothing is compacted. To match: a compacting `collect`
   under `&mut` (at `settle`, or when a segment's live fraction drops) that copies live memos'
   edges and values into a fresh segment and rewrites their hot rows.
-- What is still slower than it could be, on the miss path only: `blaze_format::Writer::new`
-  allocates a buffer for every run, which the store then copies into its segment, so a value is
-  written once and copied once. Writing straight into the segment needs a `Writer` over a
-  caller's buffer (`v2/requests/db-query.md`). `QueryKey::task_key` hashes the key for the
+- What is still slower than it could be, on the miss path only: a run writes its value into a
+  buffer its thread reuses (`Writer::with_buffer`, up to 8 buffers of at most 1 MiB kept a
+  thread), and the store then copies it into its segment, so a value is written once and
+  copied once. `QueryKey::task_key` hashes the key for the
   plane's single flight, once per miss. An input's `Tree::file` gives an `Arc` per file per
   view (`v2/requests/vfs.md` item 8).
 

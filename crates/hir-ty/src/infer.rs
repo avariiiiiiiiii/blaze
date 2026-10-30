@@ -366,6 +366,10 @@ pub enum InferenceDiagnostic {
     UnresolvedAssocItem {
         #[type_visitable(ignore)]
         id: ExprOrPatIdPacked,
+        /// The type the item was looked up on.
+        ty: StoredTy,
+        #[type_visitable(ignore)]
+        name: Name,
     },
     UnresolvedIdent {
         #[type_visitable(ignore)]

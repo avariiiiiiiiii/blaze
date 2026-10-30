@@ -26,16 +26,16 @@ use crate::{
 };
 
 /// rustc's name of the crate root segment, `::` or implicit in a 2015 import.
-pub(super) const ROOT: &str = "{{root}}";
+pub(crate) const ROOT: &str = "{{root}}";
 
 /// rustc's upper limit on the labels of one diagnostic of unresolved imports.
 const MAX_LABEL_COUNT: usize = 10;
 
 /// A segment of a path as rustc's resolver has it, with where it is written.
 #[derive(Clone, Debug)]
-pub(super) struct Segment {
-    pub(super) name: String,
-    pub(super) range: TextRange,
+pub(crate) struct Segment {
+    pub(crate) name: String,
+    pub(crate) range: TextRange,
 }
 
 /// An import as rustc's resolver has it: the module it is from and the name it takes.
@@ -751,7 +751,7 @@ fn module_to_string(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<String> {
 }
 
 /// rustc's `Res::descr` of what a name means as a value.
-fn value_descr(cx: &Cx<'_, '_>, def: ModuleDef) -> &'static str {
+pub(crate) fn value_descr(cx: &Cx<'_, '_>, def: ModuleDef) -> &'static str {
     let db = cx.db;
     match def {
         ModuleDef::Function(_) => "function",

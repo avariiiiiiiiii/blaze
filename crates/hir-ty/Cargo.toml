@@ -42,6 +42,7 @@ tracing-tree.workspace = true
 
 # local deps
 blaze-format.workspace = true
+blaze-hashcons.workspace = true
 blaze-ids.workspace = true
 blaze-phf.workspace = true
 blaze-query.workspace = true

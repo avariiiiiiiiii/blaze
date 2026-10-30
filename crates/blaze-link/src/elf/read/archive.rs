@@ -1,12 +1,10 @@
 //! `ar` archives of ELF objects: GNU, GNU 64-bit and BSD.
 
-use std::collections::hash_map::Entry;
-
 use blaze_codegen::Arch;
 use object::read::archive::{ArchiveFile, ArchiveKind};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 
+use super::strings::Table;
 use crate::model::{Archive, Member, Name, Names};
 
 pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, String> {
@@ -28,15 +26,36 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
         kind => return Err(format!("{name}: a {kind:?} archive, not an archive of ELF objects")),
     }
 
-    // In archive order, so by the start of their bytes: a symbol finds its member by binary
-    // search on that start, which is what its header's offset in the symbol table comes to.
-    let mut names = Names::default();
-    let mut members: Vec<Member> = Vec::new();
+    let special = |name: &[u8]| matches!(name, b"/" | b"//" | b"/SYM64/") || name.starts_with(b"__.SYMDEF");
+    // Every name of the index lies in its strings, each before a NUL: they are read as one
+    // string table. Measured first, with the members, so each column is sized once.
+    let symbols = file.symbols().map_err(error)?;
+    let base = bytes.as_ptr().addr();
+    let place = |name_bytes: &[u8]| name_bytes.as_ptr().addr().wrapping_sub(base);
+    let (mut low, mut high, mut entries) = (bytes.len(), 0, 0);
+    for symbol in symbols.clone().into_iter().flatten() {
+        let symbol = symbol.map_err(error)?;
+        low = low.min(place(symbol.name()));
+        high = high.max(place(symbol.name()).saturating_add(symbol.name().len() + 1));
+        entries += 1;
+    }
+    let strings = bytes.get(low..high).unwrap_or_default();
+    let (mut count, mut member_names) = (0, 0);
     for member in file.members() {
         let member = member.map_err(error)?;
-        if matches!(member.name(), b"/" | b"//" | b"/SYM64/")
-            || member.name().starts_with(b"__.SYMDEF")
-        {
+        if !special(member.name()) {
+            count += 1;
+            member_names += member.name().len();
+        }
+    }
+
+    // In archive order, so by the start of their bytes: a symbol finds its member by binary
+    // search on that start, which is what its header's offset in the symbol table comes to.
+    let mut names = Names::with_capacity(member_names.saturating_add(strings.len()).min(limit));
+    let mut members: Vec<Member> = Vec::with_capacity(count);
+    for member in file.members() {
+        let member = member.map_err(error)?;
+        if special(member.name()) {
             continue;
         }
         let member_name = String::from_utf8_lossy(member.name());
@@ -53,34 +72,32 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
         members.push(Member { name: push(&mut names, &member_name, name, limit)?, bytes: range });
     }
 
-    let mut index = Vec::new();
-    match file.symbols().map_err(error)? {
+    let mut index = Vec::with_capacity(entries);
+    match symbols {
         Some(symbols) => {
-            index.reserve(symbols.size_hint().0);
-            // A BSD index names each string by its offset, so many entries may name one: each
-            // string is pushed once, keyed by where it is in the input. A GNU index lists every
-            // name after the one before.
-            let shared = !matches!(file.kind(), ArchiveKind::Gnu | ArchiveKind::Gnu64);
-            let mut pushed: FxHashMap<(usize, usize), Name> = FxHashMap::default();
+            // A BSD index names its strings by offset, so many entries may name one string,
+            // or offsets inside it; each is still pushed once.
+            let mut table = Table::new(name, strings)?;
             // A member's symbols are listed together: its header is parsed once for the run.
             let mut last: Option<(u64, u32)> = None;
             for symbol in symbols {
                 let symbol = symbol.map_err(error)?;
-                let symbol_name = super::utf8(name, "the archive symbol", symbol.name())?;
+                let symbol_name = || String::from_utf8_lossy(symbol.name());
                 let offset = symbol.offset();
                 let member = match last {
                     Some((at, member)) if at == offset.0 => member,
                     _ => {
                         let header = file.member(offset).map_err(|error| {
-                            format!("{name}: archive symbol {symbol_name}: {error}")
+                            format!("{name}: archive symbol {}: {error}", symbol_name())
                         })?;
                         let start = usize::try_from(header.file_range().0).ok();
                         let Some(member) = start
                             .and_then(|start| members.binary_search_by_key(&start, |it| it.bytes.start).ok())
                         else {
                             return Err(format!(
-                                "{name}: archive symbol {symbol_name} names a member at offset {}, \
-                                 which is not a member file",
+                                "{name}: archive symbol {} names a member at offset {}, which is \
+                                 not a member file",
+                                symbol_name(),
                                 offset.0
                             ));
                         };
@@ -88,32 +105,35 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
                         member as u32
                     }
                 };
-                let interned = if shared {
-                    match pushed.entry((symbol_name.as_ptr().addr(), symbol_name.len())) {
-                        Entry::Occupied(it) => *it.get(),
-                        Entry::Vacant(it) => *it.insert(push(&mut names, symbol_name, name, limit)?),
-                    }
-                } else {
-                    push(&mut names, symbol_name, name, limit)?
-                };
+                // Inside `strings`, which were measured from these names: it fits a u32.
+                let string = (place(symbol.name()) - low) as u32;
+                let interned = table.name(&mut names, name, "the archive symbol", string)?;
                 index.push((interned, member));
             }
         }
         None => {
             // What lld does without a symbol table: read every member, in parallel, and keep
-            // member order.
-            let defined: Vec<Result<Vec<&str>, String>> = members
+            // member order. The member is named only in an error ([`in_member`]).
+            // alloc: one column for the archive, in member order.
+            let defined: Vec<Result<(&[u8], Vec<u32>), String>> = members
                 .par_iter()
                 .map(|member| {
-                    let member_name = format!("{name}({})", names.at(member.name));
-                    super::defined(arch, &member_name, &bytes[member.bytes.clone()])
+                    let at = &bytes[member.bytes.start..member.bytes.end];
+                    super::defined(arch, "", at).map_err(in_member(name, &names, member))
                 })
                 .collect();
-            // Names from members' `.strtab`s, which may share tails: not held to `limit`.
-            let full = super::full(name);
+            index.reserve(defined.iter().map(|it| it.as_ref().map_or(0, |(_, offsets)| offsets.len())).sum());
+            // Then the names, in member order, each string of a member's `.strtab` pushed once:
+            // the arena is at most the archive (`limit` holds without a check).
             for (number, found) in defined.into_iter().enumerate() {
-                for symbol in found? {
-                    index.push((names.push(symbol).map_err(full)?, number as u32));
+                let (strtab, offsets) = found?;
+                let member = &members[number];
+                let mut table = Table::new("", strtab).map_err(in_member(name, &names, member))?;
+                for offset in offsets {
+                    let symbol = table
+                        .name(&mut names, "", "the symbol name", offset)
+                        .map_err(in_member(name, &names, member))?;
+                    index.push((symbol, number as u32));
                 }
             }
         }
@@ -121,9 +141,16 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
     Ok(Archive { members, index, names })
 }
 
-/// Pushes `text` into `names`, refusing an arena bigger than the archive (`limit` bytes): a
-/// real archive holds every name it lists, so only names that overlap in the input (suffixes
-/// of one string in a BSD index, a GNU long name several members point at) could make it so.
+/// Names the member in an error the member's reader made with an empty file name (`": why"`):
+/// `archive(member): why`, as when the member is read on its own.
+fn in_member<'a>(name: &'a str, names: &'a Names, member: &'a Member) -> impl FnOnce(String) -> String + 'a {
+    // alloc: an error's message.
+    move |why| format!("{name}({}){why}", names.at(member.name))
+}
+
+/// Pushes the member name `text` into `names`, refusing an arena bigger than the archive
+/// (`limit` bytes): a real archive holds each member's name, so only a GNU long name that many
+/// members point at could make it so.
 fn push(names: &mut Names, text: &str, name: &str, limit: usize) -> Result<Name, String> {
     let pushed = names.push(text).map_err(super::full(name))?;
     if names.bytes() > limit {

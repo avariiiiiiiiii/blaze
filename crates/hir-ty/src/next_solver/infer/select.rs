@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SelectionError<'db> {
     /// The trait is not implemented.
     Unimplemented,
@@ -131,7 +131,7 @@ pub enum OverflowError {
     Canonical,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SignatureMismatchData<'db> {
     pub(crate) found_trait_ref: TraitRef<'db>,
     pub(crate) expected_trait_ref: TraitRef<'db>,
@@ -217,14 +217,19 @@ impl<'db, N> ImplSource<'db, N> {
     where
         F: FnMut(N) -> M,
     {
+        // The `collect`s below map `Vec<N>`'s `IntoIter` into a `Vec<M>`: std collects that in
+        // place when `M` fits `N`'s buffer, and a zero-sized `M` needs no buffer.
         match self {
             ImplSource::UserDefined(i) => ImplSource::UserDefined(ImplSourceUserDefinedData {
                 impl_def_id: i.impl_def_id,
                 args: i.args,
+                // alloc: in place or zero-sized, see above.
                 nested: i.nested.into_iter().map(f).collect(),
             }),
+            // alloc: in place or zero-sized, see above.
             ImplSource::Param(n) => ImplSource::Param(n.into_iter().map(f).collect()),
             ImplSource::Builtin(source, n) => {
+                // alloc: in place or zero-sized, see above.
                 ImplSource::Builtin(source, n.into_iter().map(f).collect())
             }
         }
@@ -388,6 +393,7 @@ fn to_selection<'db>(span: Span, cand: InspectCandidate<'_, 'db>) -> Option<Sele
     }
 
     let nested = match cand.result().expect("expected positive result") {
+        // alloc: an empty `Vec` does not allocate.
         Certainty::Yes => Vec::new(),
         Certainty::Maybe(_) => cand
             .instantiate_nested_goals(span)
@@ -400,6 +406,9 @@ fn to_selection<'db>(span: Span, cand: InspectCandidate<'_, 'db>) -> Option<Sele
                     nested.goal().predicate,
                 )
             })
+            // The selection owns its nested obligations: one exact-size buffer per ambiguous
+            // selection, and `lookup_impl_method`'s memo runs a selection once per key.
+            // alloc: the returned selection owns these; once per memoized key.
             .collect(),
     };
 
@@ -432,4 +441,35 @@ fn to_selection<'db>(span: Span, cand: InspectCandidate<'_, 'db>) -> Option<Sele
             panic!("didn't expect to assemble trait candidate from {:#?}", cand.kind())
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EvaluationResult::*, ImplSource};
+    use rustc_type_ir::solve::BuiltinImplSource;
+
+    #[test]
+    fn evaluation_results_are_ordered_by_strength() {
+        assert!(EvaluatedToOk.must_apply_considering_regions());
+        assert!(EvaluatedToOkModuloRegions.must_apply_modulo_regions());
+        assert!(!EvaluatedToOkModuloOpaqueTypes.must_apply_modulo_regions());
+        assert!(EvaluatedToAmbigStackDependent.may_apply());
+        assert!(!EvaluatedToErr.may_apply());
+        assert!(EvaluatedToAmbigStackDependent.is_stack_dependent());
+        assert_eq!(EvaluatedToOk.max(EvaluatedToAmbig).max(EvaluatedToErr), EvaluatedToErr);
+    }
+
+    /// `find_matching_impl` maps a selection's nested obligations into registrations (`()`);
+    /// mapping to a same-sized or zero-sized value reuses the buffer.
+    #[test]
+    fn impl_source_map_reuses_its_buffer() {
+        let param = ImplSource::<u32>::Param((0..64).collect());
+        let builtin = ImplSource::<u32>::Builtin(BuiltinImplSource::Misc, (0..64).collect());
+        let (param, builtin) =
+            blaze_alloc_count::assert_at_most(0, "ImplSource::map in place", || {
+                (param.map(|n| n + 1), builtin.map(|_| ()))
+            });
+        assert_eq!(param.borrow_nested_obligations(), &(1..65).collect::<Vec<u32>>()[..]);
+        assert_eq!(builtin.nested_obligations().len(), 64);
+    }
 }

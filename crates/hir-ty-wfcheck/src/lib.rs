@@ -236,10 +236,12 @@ impl<'db> Check<'_, 'db> {
         if let Some(trait_ref) = db.impl_trait(impl_) {
             let trait_ref = trait_ref.instantiate_identity().skip_norm_wip();
             let mut found = Vec::new();
-            let clauses = GenericPredicates::query_all(db, trait_ref.def_id.0.into())
-                .iter_instantiated(self.interner(), trait_ref.args.as_slice())
-                .map(|it| it.skip_norm_wip());
-            outlives::clause_needs(clauses, &mut found);
+            outlives::predicate_needs(
+                db,
+                trait_ref.def_id.0.into(),
+                trait_ref.args.as_slice(),
+                &mut found,
+            );
             found.retain(|it| match *it {
                 Needs::Type(ty, region) => {
                     !ty.has_escaping_bound_vars() && !region.has_escaping_bound_vars()
@@ -486,15 +488,15 @@ impl<'db> Check<'_, 'db> {
     /// and of a trait bound the trait's outlives bounds.
     fn where_needs(&mut self, def: GenericDefId) -> Vec<(Needs<'db>, Site)> {
         let db = self.db;
-        let interner = self.interner();
-        let clauses: Vec<Clause<'db>> = GenericPredicates::query_own_explicit(db, def)
+        let clauses = GenericPredicates::query_own_explicit(db, def)
             .iter_identity()
-            .map(|it| it.skip_norm_wip())
-            .collect();
+            .map(|it| it.skip_norm_wip());
         let mut needs = Vec::new();
+        let mut found = Vec::new();
+        let mut tys = Vec::new();
         for clause in clauses {
-            let mut found = Vec::new();
-            let mut tys = Vec::new();
+            found.clear();
+            tys.clear();
             let mut self_ty = None;
             let mut trait_ = None;
             match clause.kind().skip_binder() {
@@ -506,10 +508,12 @@ impl<'db> Check<'_, 'db> {
                         GenericArgKind::Type(ty) => Some(ty),
                         _ => None,
                     }));
-                    let clauses = GenericPredicates::query_all(db, trait_ref.def_id.0.into())
-                        .iter_instantiated(interner, trait_ref.args.as_slice())
-                        .map(|it| it.skip_norm_wip());
-                    outlives::clause_needs(clauses, &mut found);
+                    outlives::predicate_needs(
+                        db,
+                        trait_ref.def_id.0.into(),
+                        trait_ref.args.as_slice(),
+                        &mut found,
+                    );
                 }
                 ClauseKind::Projection(predicate) => {
                     let TermId::TypeAliasId(item) = predicate.def_id().0 else { continue };
@@ -540,7 +544,7 @@ impl<'db> Check<'_, 'db> {
             if tys.iter().any(|ty| ty.references_error()) {
                 continue;
             }
-            for ty in tys {
+            for &ty in &tys {
                 outlives::wf(db, &mut self.inferred, ty, &mut found);
             }
             found.retain(|it| match *it {
@@ -555,7 +559,7 @@ impl<'db> Check<'_, 'db> {
                 continue;
             }
             let Some(site) = self.bound_site(def, self_ty, trait_) else { continue };
-            needs.extend(found.into_iter().map(|it| (it, site)));
+            needs.extend(found.drain(..).map(|it| (it, site)));
         }
         needs
     }

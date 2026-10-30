@@ -32,6 +32,7 @@ pub mod item_tree;
 pub mod builtin_derive;
 pub mod diagnostic_item;
 pub mod lang_item;
+pub mod macro_reach;
 pub mod unstable_features;
 
 pub mod expr_store;

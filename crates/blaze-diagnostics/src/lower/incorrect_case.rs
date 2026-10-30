@@ -28,7 +28,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
     let at = |node: &SyntaxNode| InFile::new(d.file, SyntaxNodePtr::new(node));
     let found = match d.ident_type.to_string().as_str() {
         "Structure" | "Enum" | "Union" | "Trait" | "Type alias" | "Variant" => {
-            if is_upper_camel_case(name) {
+            // rustc's early pass has no `check_foreign_item` for this lint.
+            let foreign = owner.kind() == SyntaxKind::TYPE_ALIAS
+                && owner.parent().is_some_and(|it| it.kind() == SyntaxKind::EXTERN_ITEM_LIST);
+            if foreign || is_upper_camel_case(name) {
                 return Vec::new();
             }
             let (sort, lint_at) = camel_sort(&owner);
@@ -108,7 +111,10 @@ fn assoc_container(item: &SyntaxNode) -> Option<SyntaxNode> {
 /// decide its level.
 fn camel_sort(owner: &SyntaxNode) -> (&'static str, SyntaxNode) {
     match owner.kind() {
-        SyntaxKind::TRAIT => ("trait", owner.clone()),
+        SyntaxKind::TRAIT => match ast::Trait::cast(owner.clone()).and_then(|it| it.eq_token()) {
+            Some(_) => ("trait alias", owner.clone()),
+            None => ("trait", owner.clone()),
+        },
         SyntaxKind::VARIANT => ("variant", owner.clone()),
         SyntaxKind::TYPE_ALIAS => match assoc_container(owner) {
             Some(container) if container.kind() == SyntaxKind::IMPL => ("associated type", container),
@@ -254,13 +260,13 @@ fn not_camel_case(s: &str) -> bool {
     })
 }
 
-fn is_upper_camel_case(name: &str) -> bool {
+pub(crate) fn is_upper_camel_case(name: &str) -> bool {
     let name = name.trim_matches('_');
     let Some(first) = name.chars().next() else { return true };
     !(changes_when_titlecased(first) || not_camel_case(name))
 }
 
-fn to_upper_camel_case(s: &str) -> String {
+pub(crate) fn to_upper_camel_case(s: &str) -> String {
     s.trim_matches('_')
         .split('_')
         .filter(|component| !component.is_empty())

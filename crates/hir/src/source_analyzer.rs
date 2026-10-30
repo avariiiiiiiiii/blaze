@@ -36,10 +36,7 @@ use hir_expand::{
 use hir_ide::{
     Adjustment, InferBodyId, InferenceResult, LifetimeElisionKind, LifetimeLoweringMode,
     ParamEnvAndCrate, TyLoweringContext, TyLoweringInferVarsCtx,
-    diagnostics::{
-        InsideUnsafeBlock, record_literal_missing_fields, record_pattern_missing_fields,
-        unsafe_operations,
-    },
+    diagnostics::{record_literal_missing_fields, record_pattern_missing_fields},
     lang_items::lang_items_for_bin_op,
     method_resolution::{self, CandidateId},
     next_solver::{
@@ -48,6 +45,7 @@ use hir_ide::{
     },
     traits::{WherePredicateEvaluation, structurally_normalize_ty, where_predicate_must_hold},
 };
+use hir_ty_unsafeck::{InsideUnsafeBlock, unsafe_operations};
 use intern::sym;
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
@@ -304,8 +302,8 @@ impl<'db> SourceAnalyzer<'db> {
         })
     }
 
-    pub(crate) fn ty(&self, ty: Ty<'db>) -> Type<'db> {
-        Type { owner: self.type_owner, ty: EarlyBinder::bind(ty) }
+    pub(crate) fn ty(&self, db: &'db dyn HirDatabase, ty: Ty<'db>) -> Type<'db> {
+        Type { owner: self.type_owner, ty: EarlyBinder::bind(DbInterner::new_no_crate(db), ty) }
     }
 
     pub(crate) fn def(
@@ -498,7 +496,7 @@ impl<'db> SourceAnalyzer<'db> {
             }
         }
 
-        Some(self.ty(ty))
+        Some(self.ty(db, ty))
     }
 
     pub(crate) fn expr_is_diverging(
@@ -532,7 +530,7 @@ impl<'db> SourceAnalyzer<'db> {
 
     pub(crate) fn type_of_expr(
         &self,
-        _db: &'db dyn HirDatabase,
+        db: &'db dyn HirDatabase,
         expr: &ast::Expr,
     ) -> Option<(Type<'db>, Option<Type<'db>>)> {
         let expr_id = self.expr_id(expr.clone())?;
@@ -542,13 +540,13 @@ impl<'db> SourceAnalyzer<'db> {
             .and_then(|expr_id| infer.expr_adjustment(expr_id))
             .and_then(|adjusts| adjusts.last().map(|adjust| adjust.target.as_ref()));
         let ty = infer.expr_or_pat_ty(expr_id);
-        let mk_ty = |ty: Ty<'db>| self.ty(ty);
+        let mk_ty = |ty: Ty<'db>| self.ty(db, ty);
         Some((mk_ty(ty), coerced.map(mk_ty)))
     }
 
     pub(crate) fn type_of_pat(
         &self,
-        _db: &'db dyn HirDatabase,
+        db: &'db dyn HirDatabase,
         pat: &ast::Pat,
     ) -> Option<(Type<'db>, Option<Type<'db>>)> {
         let expr_or_pat_id = self.pat_id(pat)?;
@@ -565,25 +563,25 @@ impl<'db> SourceAnalyzer<'db> {
         };
 
         let ty = infer.expr_or_pat_ty(expr_or_pat_id);
-        let mk_ty = |ty: Ty<'db>| self.ty(ty);
+        let mk_ty = |ty: Ty<'db>| self.ty(db, ty);
         Some((mk_ty(ty), coerced.map(mk_ty)))
     }
 
     pub(crate) fn type_of_binding_in_pat(
         &self,
-        _db: &'db dyn HirDatabase,
+        db: &'db dyn HirDatabase,
         pat: &ast::IdentPat,
     ) -> Option<Type<'db>> {
         let binding_id = self.binding_id_of_pat(pat)?;
         let infer = self.infer()?;
         let ty = infer.binding_ty(binding_id);
-        let mk_ty = |ty: Ty<'db>| self.ty(ty);
+        let mk_ty = |ty: Ty<'db>| self.ty(db, ty);
         Some(mk_ty(ty))
     }
 
     pub(crate) fn type_of_self(
         &self,
-        _db: &'db dyn HirDatabase,
+        db: &'db dyn HirDatabase,
         _param: &ast::SelfParam,
     ) -> Option<Type<'db>> {
         let binding = match self.body_or_sig.as_ref()? {
@@ -591,7 +589,7 @@ impl<'db> SourceAnalyzer<'db> {
             BodyOrSig::Body { body, .. } => body.self_param?.formal,
         };
         let ty = self.infer()?.binding_ty(binding);
-        Some(self.ty(ty))
+        Some(self.ty(db, ty))
     }
 
     pub(crate) fn binding_mode_of_pat(
@@ -613,7 +611,7 @@ impl<'db> SourceAnalyzer<'db> {
     }
     pub(crate) fn pattern_adjustments(
         &self,
-        _db: &'db dyn HirDatabase,
+        db: &'db dyn HirDatabase,
         pat: &ast::Pat,
     ) -> Option<SmallVec<[Type<'db>; 1]>> {
         let pat_id = self.pat_id(pat)?;
@@ -622,7 +620,7 @@ impl<'db> SourceAnalyzer<'db> {
             infer
                 .pat_adjustment(pat_id.as_pat()?)?
                 .iter()
-                .map(|adjust| self.ty(adjust.source.as_ref()))
+                .map(|adjust| self.ty(db, adjust.source.as_ref()))
                 .collect(),
         )
     }
@@ -636,7 +634,7 @@ impl<'db> SourceAnalyzer<'db> {
         let (func, args) = self.infer()?.method_resolution(expr_id)?;
         let interner = DbInterner::new_no_crate(db);
         let ty = db.value_ty(func.into())?.instantiate(interner, args).skip_norm_wip();
-        let ty = self.ty(ty);
+        let ty = self.ty(db, ty);
         let mut res = ty.as_callable(db)?;
         res.is_bound_method = true;
         Some(res)
@@ -827,7 +825,7 @@ impl<'db> SourceAnalyzer<'db> {
             .map(Trait::from);
 
         if let Some(into_future_trait) = into_future_trait {
-            let type_ = self.ty(ty);
+            let type_ = self.ty(db, ty);
             if type_.impls_trait(db, into_future_trait, &[]) {
                 let items = into_future_trait.items(db);
                 let into_future_type = items.into_iter().find_map(|item| match item {
@@ -988,7 +986,7 @@ impl<'db> SourceAnalyzer<'db> {
         Some((
             field.into(),
             local,
-            self.ty(field_ty),
+            self.ty(db, field_ty),
             GenericSubstitution::new(adt.into(), subst, self.type_owner),
         ))
     }
@@ -1012,7 +1010,7 @@ impl<'db> SourceAnalyzer<'db> {
             .skip_norm_wip();
         Some((
             field.into(),
-            self.ty(field_ty),
+            self.ty(db, field_ty),
             GenericSubstitution::new(adt.into(), subst, self.type_owner),
         ))
     }
@@ -1033,7 +1031,7 @@ impl<'db> SourceAnalyzer<'db> {
                 .map(|(local_id, field)| {
                     let def = Field { parent: variant_id.into(), id: local_id };
                     let ty = field.ty().instantiate(interner, substs).skip_norm_wip();
-                    (def, self.ty(ty))
+                    (def, self.ty(db, ty))
                 })
                 .collect(),
         )
@@ -1184,7 +1182,9 @@ impl<'db> SourceAnalyzer<'db> {
                                     if let TyKind::FnDef(_fn_def, subs) = func_ty.kind() {
                                         let (fn_, subst) = self
                                             .resolve_impl_method_or_trait_def_with_subst(
-                                                db, f_in_trait, subs,
+                                                db,
+                                                f_in_trait,
+                                                subs.no_bound_vars().unwrap(),
                                             );
                                         let subst = GenericSubstitution::new_from_fn(
                                             fn_,
@@ -1449,11 +1449,10 @@ impl<'db> SourceAnalyzer<'db> {
                             PathResolution::Def(ModuleDef::Adt(adt_id.into())),
                         )
                     }
-                    TyKind::Alias(AliasTy {
-                        kind: AliasTyKind::Projection { def_id },
-                        args,
-                        ..
-                    }) => {
+                    TyKind::Alias(
+                        _,
+                        AliasTy { kind: AliasTyKind::Projection { def_id }, args, .. },
+                    ) => {
                         let assoc_id = def_id.0;
                         (
                             GenericSubstitution::new(assoc_id.into(), args, self.type_owner),
@@ -1466,6 +1465,7 @@ impl<'db> SourceAnalyzer<'db> {
                             CallableDefId::FunctionId(id) => id.into(),
                             CallableDefId::EnumVariantId(_) => return None,
                         };
+                        let subst = subst.no_bound_vars().unwrap();
                         (
                             GenericSubstitution::new(generic_def_id, subst, self.type_owner),
                             PathResolution::Def(ModuleDefId::from(fn_id.0).into()),
@@ -1587,7 +1587,7 @@ impl<'db> SourceAnalyzer<'db> {
             .map(|local_id| {
                 let field = FieldId { parent: variant, local_id };
                 let ty = field_types[local_id].ty().instantiate(interner, substs).skip_norm_wip();
-                (field.into(), self.ty(ty))
+                (field.into(), self.ty(db, ty))
             })
             .collect()
     }

@@ -20,13 +20,13 @@ use std::{borrow::Cow, convert::Infallible, ffi::OsString, fmt, path::PathBuf, t
 
 use blaze_cas::{Corrupt, Key, Kind, Mismatch, Store, Ticket};
 use blaze_core::{Traced, Untraceable};
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::{ContentId, Hasher, radix};
 use blaze_items::CodeHash;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     Given, Reached, RunKey, RunKind,
-    index::{self, Shape},
+    index::{self, FindError, Found, Shape},
     trace::{self, Inputs, Report},
 };
 
@@ -84,7 +84,7 @@ impl Attrs {
 }
 
 /// A test as selection sees it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Test {
     /// The name libtest shows, the path from the crate's root.
     pub name: String,
@@ -101,8 +101,9 @@ pub struct Test {
 pub const WHOLE: &str = "\0the whole binary";
 
 impl Test {
-    pub fn of(reached: &Reached, attrs: Attrs, outside: bool) -> Test {
-        Test { name: reached.test.clone(), reached: reached.reached.clone(), attrs, outside }
+    /// The test of what codegen found it reaches, its set moved, not copied.
+    pub fn of(reached: Reached, attrs: Attrs, outside: bool) -> Test {
+        Test { name: reached.test, reached: reached.reached, attrs, outside }
     }
 
     /// The test, binary-independent: its name, the set of code hashes it reaches and its
@@ -112,8 +113,15 @@ impl Test {
         let mut hasher = Hasher::new("blaze v2 test identity 1");
         hasher.part(self.name.as_bytes()).id(&self.attrs.id());
         hasher.update(&(set.len() as u64).to_le_bytes());
-        for hash in &set {
-            hasher.id(&hash.0);
+        // 16 KiB an update, not 32 bytes: BLAKE3 hashes the whole 1 KiB chunks of one update
+        // side by side, as many as its widest SIMD (16 with AVX-512), and a 32-byte update at
+        // a time it cannot. On the stack, so no buffer of the set's size.
+        let mut block = [0u8; 32 * 512];
+        for group in set.chunks(512) {
+            for (at, hash) in group.iter().enumerate() {
+                block[32 * at..32 * at + 32].copy_from_slice(&hash.0.0);
+            }
+            hasher.update(&block[..32 * group.len()]);
         }
         hasher.finish()
     }
@@ -122,7 +130,7 @@ impl Test {
     /// them reaches and is outside when any is. Which tests they are and their attributes
     /// are in [`Suite::given_whole`].
     pub fn whole(tests: &[Test]) -> Test {
-        let mut reached = Vec::new();
+        let mut reached = Vec::new(); // alloc: empty, allocates nothing
         let mut seen = FxHashSet::default();
         for test in tests {
             for hash in &test.reached {
@@ -132,7 +140,7 @@ impl Test {
             }
         }
         Test {
-            name: WHOLE.to_owned(),
+            name: WHOLE.to_owned(), // alloc: once per binary run whole
             reached,
             attrs: Attrs::default(),
             outside: tests.iter().any(|it| it.outside),
@@ -140,11 +148,46 @@ impl Test {
     }
 }
 
+/// `hashes` sorted, each once.
+///
+/// Code hashes are uniform, so their first four bytes already order all but a few: a radix
+/// sort of each prefix and index, linear where a comparison sort of 32-byte keys is
+/// `n log n` compares, then the rare runs of one prefix by the whole hash.
 fn sorted(hashes: &[CodeHash]) -> Vec<CodeHash> {
-    let mut set = hashes.to_vec();
-    set.sort_unstable();
+    if hashes.len() < SMALL {
+        let mut set = hashes.to_vec(); // alloc: the set's one buffer and its keys' one: identity's budget
+        set.sort_unstable();
+        set.dedup();
+        return set;
+    }
+    let count = u32::try_from(hashes.len()).expect("a test reaches fewer than 2^32 functions");
+    let mut keyed: Vec<(u32, u32)> = (0..count).map(|at| (prefix(&hashes[at as usize]), at)).collect(); // alloc: the set's one buffer and its keys' one: identity's budget
+    radix::sort_pairs(&mut keyed);
+    let mut set: Vec<CodeHash> = Vec::with_capacity(hashes.len());
+    let mut start = 0;
+    while start < keyed.len() {
+        let mut end = start + 1;
+        while end < keyed.len() && keyed[end].0 == keyed[start].0 {
+            end += 1;
+        }
+        let from = set.len();
+        set.extend(keyed[start..end].iter().map(|&(_, at)| hashes[at as usize]));
+        if end - start > 1 {
+            set[from..].sort_unstable();
+        }
+        start = end;
+    }
     set.dedup();
     set
+}
+
+/// Below this many hashes a comparison sort beats a radix sort's passes.
+const SMALL: usize = 64;
+
+/// The first four bytes of `hash`, ordered as the hash is.
+fn prefix(hash: &CodeHash) -> u32 {
+    let bytes = &hash.0.0;
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 /// Which test binary a test is of, without the binary: the same test of another package or
@@ -180,7 +223,7 @@ impl Suite {
     /// their attributes.
     pub fn given_whole(&self, tests: &[Test]) -> ContentId {
         let mut members: Vec<(&str, ContentId)> =
-            tests.iter().map(|it| (it.name.as_str(), it.attrs.id())).collect();
+            tests.iter().map(|it| (it.name.as_str(), it.attrs.id())).collect(); // alloc: once per binary run whole
         members.sort();
         let mut hasher = Hasher::new("blaze v2 test members 1");
         for (name, attrs) in &members {
@@ -217,7 +260,7 @@ pub struct Filter {
 
 impl Default for Filter {
     fn default() -> Filter {
-        Filter { names: Vec::new(), exact: false, skip: Vec::new(), ignored: Ignored::Skip }
+        Filter { names: Vec::new(), exact: false, skip: Vec::new(), ignored: Ignored::Skip } // alloc: empty, allocates nothing
     }
 }
 
@@ -281,19 +324,19 @@ pub enum Why {
 
 impl Why {
     /// The explanation, with a code hash named by `name_of` when it knows the function.
-    pub fn describe(&self, name_of: &dyn Fn(&CodeHash) -> Option<String>) -> String {
-        let named = |hash: &CodeHash| name_of(hash).unwrap_or_else(|| format!("code {}", hash.0));
+    pub fn describe(&self, name_of: &dyn Fn(&CodeHash) -> Option<String>) -> String { // dyn: the edge: an explanation for people
+        let named = |hash: &CodeHash| name_of(hash).unwrap_or_else(|| format!("code {}", hash.0)); // alloc: the edge: an explanation for people
         match self {
-            Why::New => "new".to_owned(),
-            Why::NoPass => "no pass kept".to_owned(),
-            Why::Outside => "outside world".to_owned(),
-            Why::All => "all tests asked for".to_owned(),
-            Why::Changed(hash) => format!("reaches {}, changed", named(hash)),
-            Why::Dropped(hash) => format!("no longer reaches {}", named(hash)),
-            Why::Attributes => "attributes changed".to_owned(),
-            Why::Read(Input::File(path)) => format!("read {}, changed", path.display()),
-            Why::Read(Input::Dir(path)) => format!("listed {}, changed", path.display()),
-            Why::Read(Input::Env(name)) => format!("read ${}, changed", name.to_string_lossy()),
+            Why::New => "new".to_owned(), // alloc: the edge: an explanation for people
+            Why::NoPass => "no pass kept".to_owned(), // alloc: the edge: an explanation for people
+            Why::Outside => "outside world".to_owned(), // alloc: the edge: an explanation for people
+            Why::All => "all tests asked for".to_owned(), // alloc: the edge: an explanation for people
+            Why::Changed(hash) => format!("reaches {}, changed", named(hash)), // alloc: the edge: an explanation for people
+            Why::Dropped(hash) => format!("no longer reaches {}", named(hash)), // alloc: the edge: an explanation for people
+            Why::Attributes => "attributes changed".to_owned(), // alloc: the edge: an explanation for people
+            Why::Read(Input::File(path)) => format!("read {}, changed", path.display()), // alloc: the edge: an explanation for people
+            Why::Read(Input::Dir(path)) => format!("listed {}, changed", path.display()), // alloc: the edge: an explanation for people
+            Why::Read(Input::Env(name)) => format!("read ${}, changed", name.to_string_lossy()), // alloc: the edge: an explanation for people
         }
     }
 }
@@ -380,20 +423,13 @@ fn find<P: Passes + ?Sized, I: Inputs>(
     run: &RunKey,
     inputs: &mut I,
 ) -> Result<bool, SelectError<I::Error>> {
-    let mut n = 0;
-    loop {
-        let key = index::slot(run, n);
-        let Some(bytes) = store.get(&key)? else { return Ok(false) };
-        let shape = Shape::decode(bytes).map_err(|why| SelectError::NotOurs { key, why })?;
-        let traced = shape.values(inputs).map_err(SelectError::Inputs)?;
-        let key = index::result_key(run, &traced);
-        if let Some(bytes) = store.get(&key)? {
-            return match bytes == PASS {
-                true => Ok(true),
-                false => Err(SelectError::NotOurs { key, why: "not a test's pass".to_owned() }),
-            };
-        }
-        n += 1;
+    match index::search(|key| store.get(key), run, inputs) {
+        Ok(Found::Hit { value, .. }) if value == PASS => Ok(true),
+        Ok(Found::Hit { key, .. }) => Err(SelectError::NotOurs { key, why: "not a test's pass".to_owned() }), // alloc: error path
+        Ok(Found::Miss { .. }) => Ok(false),
+        Err(FindError::Corrupt(corrupt)) => Err(corrupt.into()),
+        Err(FindError::NotAShape { key, why }) => Err(SelectError::NotOurs { key, why }),
+        Err(FindError::Inputs(error)) => Err(SelectError::Inputs(error)),
     }
 }
 
@@ -427,24 +463,24 @@ fn explain<P: Passes + ?Sized, I: Inputs>(
 
 /// The first input of `before` whose value `now` does not have.
 fn changed_input(before: &Traced, now: &Traced) -> Option<Input> {
-    let files: FxHashMap<_, _> = now.files.iter().map(|(path, hash)| (path, hash)).collect();
-    let dirs: FxHashMap<_, _> = now.dirs.iter().map(|(path, hash)| (path, hash)).collect();
-    let env: FxHashMap<_, _> = now.env.iter().map(|(name, value)| (name, value)).collect();
+    let files: FxHashMap<_, _> = now.files.iter().map(|(path, hash)| (path, hash)).collect(); // alloc: the edge: an explanation for people, made only when asked
+    let dirs: FxHashMap<_, _> = now.dirs.iter().map(|(path, hash)| (path, hash)).collect(); // alloc: the edge: an explanation for people, made only when asked
+    let env: FxHashMap<_, _> = now.env.iter().map(|(name, value)| (name, value)).collect(); // alloc: the edge: an explanation for people, made only when asked
     for (path, hash) in &before.files {
         if files.get(path) != Some(&hash) {
-            return Some(Input::File(path.clone()));
+            return Some(Input::File(path.clone())); // clone: the edge: an explanation for people, made only when asked
         }
     }
     for (path, hash) in &before.dirs {
         if dirs.get(path) != Some(&hash) {
-            return Some(Input::Dir(path.clone()));
+            return Some(Input::Dir(path.clone())); // clone: the edge: an explanation for people, made only when asked
         }
     }
     for (name, value) in &before.env {
         if env.get(name) != Some(&value) {
             let name = match name == trace::ALL_ENV_NAME {
                 true => OsString::from("*"),
-                false => name.clone(),
+                false => name.clone(), // clone: the edge: an explanation for people, made only when asked
             };
             return Some(Input::Env(name));
         }
@@ -508,11 +544,12 @@ pub fn record<P: Passes + ?Sized>(
     test: &Test,
     ran: &Ran<'_>,
 ) -> Result<Vec<Ticket>, RecordError> {
-    let mut tickets = Vec::new();
+    // A pass, its shape, the reached set and the history entry.
+    let mut tickets = Vec::with_capacity(4);
     let traced: Option<Cow<'_, Traced>> = ran.traced.map(|it| match trace::normal(it) {
         true => Cow::Borrowed(it),
         false => {
-            let mut it = it.clone();
+            let mut it = it.clone(); // clone: only a trace not in normal order, which `trace::normal` says is rare
             trace::normalize(&mut it);
             Cow::Owned(it)
         }
@@ -520,21 +557,25 @@ pub fn record<P: Passes + ?Sized>(
     let kept = ran.passed && !test.outside && traced.as_deref().is_some_and(keepable);
     if kept && let Some(traced) = traced.as_deref() {
         let run = RunKey { code: test.identity(), given };
+        // alloc: the store's `put` owns the bytes it keeps.
         tickets.push(store.put(index::result_key(&run, traced), PASS.to_vec()).map_err(RecordError::Mismatch)?);
-        let shape = Shape::of(traced).encode();
+        let mut shape = Shape::of(traced).encode();
         let mut n = 0;
         loop {
             let at = index::slot(&run, n);
             match store.get(&at)? {
                 Some(bytes) if bytes == shape.as_slice() => break,
                 Some(_) => n += 1,
-                None => match store.put(at, shape.clone()) {
+                None => match store.put(at, std::mem::take(&mut shape)) {
                     Ok(ticket) => {
                         tickets.push(ticket);
                         break;
                     }
-                    // Another kept another shape here first.
-                    Err(_) => n += 1,
+                    // Another kept another shape here first: made again for the next slot.
+                    Err(_) => {
+                        shape = Shape::of(traced).encode();
+                        n += 1;
+                    }
                 },
             }
         }
@@ -546,9 +587,10 @@ pub fn record<P: Passes + ?Sized>(
     }
     let report = match (kept, traced) {
         (true, Some(traced)) => trace::encode(&Report::Ran(Some(traced.into_owned()))),
-        _ => Vec::new(),
+        _ => Vec::new(), // alloc: empty, allocates nothing
     };
-    let entry = Entry { passed: ran.passed, kept, attrs: test.attrs.id(), reached, took: ran.took, traced: &report }.encode();
+    let entry = || Entry { passed: ran.passed, kept, attrs: test.attrs.id(), reached, took: ran.took, traced: &report }.encode();
+    let mut bytes = entry();
     let mut n = last(&*store, given, &test.name)
         .map_err(|error| match error {
             SelectError::Corrupt(it) => RecordError::Corrupt(it),
@@ -559,14 +601,17 @@ pub fn record<P: Passes + ?Sized>(
     loop {
         let at = history_slot(given, &test.name, n);
         match store.get(&at)? {
-            Some(bytes) if bytes == entry.as_slice() => break,
+            Some(held) if held == bytes.as_slice() => break,
             Some(_) => n += 1,
-            None => match store.put(at, entry.clone()) {
+            None => match store.put(at, std::mem::take(&mut bytes)) {
                 Ok(ticket) => {
                     tickets.push(ticket);
                     break;
                 }
-                Err(_) => n += 1,
+                Err(_) => {
+                    bytes = entry();
+                    n += 1;
+                }
             },
         }
     }
@@ -613,14 +658,14 @@ impl<'s> Entry<'s> {
         }
         match trace::decode(self.traced)? {
             Report::Ran(Some(traced)) => Ok(Some(traced)),
-            _ => Err("a test's history holds a report with no record".to_owned()),
+            _ => Err("a test's history holds a report with no record".to_owned()), // alloc: error path
         }
     }
 
     fn decode(bytes: &'s [u8]) -> Result<Entry<'s>, String> {
-        let rest = bytes.strip_prefix(HISTORY).ok_or_else(|| "not a test's history".to_owned())?;
+        let rest = bytes.strip_prefix(HISTORY).ok_or_else(|| "not a test's history".to_owned())?; // alloc: error path
         if rest.len() < 1 + 32 + 32 + 8 + 8 {
-            return Err("a test's history ends early".to_owned());
+            return Err("a test's history ends early".to_owned()); // alloc: error path
         }
         let flags = rest[0];
         let id = |at: usize| ContentId(rest[at..at + 32].try_into().expect("32 bytes"));
@@ -628,7 +673,7 @@ impl<'s> Entry<'s> {
         let len = u64::from_le_bytes(rest[73..81].try_into().expect("8 bytes"));
         let traced = &rest[81..];
         if traced.len() as u64 != len {
-            return Err("a test's history has a record of another length than it says".to_owned());
+            return Err("a test's history has a record of another length than it says".to_owned()); // alloc: error path
         }
         Ok(Entry {
             passed: flags & 1 != 0,
@@ -642,7 +687,8 @@ impl<'s> Entry<'s> {
 }
 
 fn encode_reached(set: &[CodeHash]) -> Vec<u8> {
-    let mut out = REACHED.to_vec();
+    let mut out = Vec::with_capacity(REACHED.len() + 8 + 32 * set.len());
+    out.extend_from_slice(REACHED);
     out.extend_from_slice(&(set.len() as u64).to_le_bytes());
     for hash in set {
         out.extend_from_slice(&hash.0.0);
@@ -652,16 +698,16 @@ fn encode_reached(set: &[CodeHash]) -> Vec<u8> {
 
 /// The sorted set [`encode_reached`] wrote.
 fn decode_reached(bytes: &[u8]) -> Result<Vec<CodeHash>, String> {
-    let rest = bytes.strip_prefix(REACHED).ok_or_else(|| "not a reached set".to_owned())?;
-    let (count, rest) = rest.split_at_checked(8).ok_or_else(|| "a reached set ends early".to_owned())?;
+    let rest = bytes.strip_prefix(REACHED).ok_or_else(|| "not a reached set".to_owned())?; // alloc: the edge: an explanation for people, made only when asked
+    let (count, rest) = rest.split_at_checked(8).ok_or_else(|| "a reached set ends early".to_owned())?; // alloc: the edge: an explanation for people, made only when asked
     let count = u64::from_le_bytes(count.try_into().expect("8 bytes"));
     if rest.len() as u64 != count.saturating_mul(32) {
-        return Err("a reached set holds another number of hashes than it says".to_owned());
+        return Err("a reached set holds another number of hashes than it says".to_owned()); // alloc: the edge: an explanation for people, made only when asked
     }
     Ok(rest
         .chunks_exact(32)
         .map(|it| CodeHash(ContentId(it.try_into().expect("32 bytes"))))
-        .collect())
+        .collect()) // alloc: the edge: an explanation for people, made only when asked
 }
 
 fn history_slot(given: ContentId, name: &str, n: u32) -> Key {

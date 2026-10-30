@@ -22,10 +22,6 @@
 use hir::GenericDef;
 use hir_def::{AdtId, ModuleDefId, ModuleId, item_scope::ItemScope, visibility::Visibility};
 use rustc_hash::{FxHashMap, FxHashSet};
-use syntax::{
-    AstNode,
-    ast::{self, HasVisibility as _, VisibilityKind},
-};
 
 use super::defs::{Bits, DefIdx, Defs, Id, ImplOf, Kind, Parent};
 use crate::cx::Cx;
@@ -39,7 +35,7 @@ impl Reach {
         let mut walk = Walk {
             cx,
             defs,
-            nominal: nominal_pub(cx, defs),
+            nominal: nominal_pub(defs),
             public: Bits::new(defs.len()),
             queue: Vec::new(),
             named: Vec::new(),
@@ -314,7 +310,7 @@ fn module_def_id(def: ModuleDefId) -> Option<Id> {
 /// `local_visibility` is `Visibility::Public`. A variant and its fields have their enum's, a
 /// trait's item its trait's; an impl and a trait impl's items have none of their own
 /// (`max_vis: None`). One pass in definition order: a parent is numbered before its children.
-fn nominal_pub(cx: &Cx<'_, '_>, defs: &Defs) -> Bits {
+fn nominal_pub(defs: &Defs) -> Bits {
     let mut nominal = Bits::new(defs.len());
     for def in defs.all() {
         let d = &defs[def];
@@ -327,11 +323,7 @@ fn nominal_pub(cx: &Cx<'_, '_>, defs: &Defs) -> Bits {
         let public = match (d.kind, parent.map(|it| defs[it].kind)) {
             (Kind::Variant, _) | (Kind::Field, Some(Kind::Variant)) | (_, Some(Kind::Trait)) => inherited,
             (_, Some(Kind::Impl { of_trait: true })) | (Kind::Impl { .. }, _) => true,
-            _ => d.node.is_some_and(|node| {
-                let node = cx.syntax(node);
-                let vis = ast::AnyHasVisibility::cast(node.value).and_then(|it| it.visibility());
-                vis.is_some_and(|it| matches!(it.kind(), VisibilityKind::Pub))
-            }),
+            _ => d.written_pub,
         };
         if public {
             nominal.insert(def);

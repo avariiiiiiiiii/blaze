@@ -129,6 +129,32 @@ impl Given {
     /// tokens, its kind and name, the target. Named twice, the last is kept.
     pub fn part(&mut self, name: &'static str, bytes: &[u8]) -> &mut Given {
         let hash = Hasher::new(Given::PART).update(bytes).finish().0;
+        self.hashed(name, hash)
+    }
+
+    /// Variables the run is given that blaze does not set in its process (a proc macro's,
+    /// passed to its server with each expansion): one part, hashed in name order as they are
+    /// lent, with no copy. Named twice, the last value is kept. [`Given::sets`] and
+    /// [`Given::vars`] don't name them.
+    pub fn env_keyed<'a>(&mut self, vars: impl IntoIterator<Item = (&'a [u8], &'a [u8])>) -> &mut Given {
+        let mut vars: Vec<(&[u8], &[u8])> = vars.into_iter().collect();
+        vars.sort_by(|a, b| a.0.cmp(b.0));
+        vars.dedup_by(|later, first| {
+            let same = later.0 == first.0;
+            if same {
+                *first = *later;
+            }
+            same
+        });
+        let mut hasher = Hasher::new(Given::PART);
+        hasher.update(&(vars.len() as u64).to_le_bytes());
+        for (name, value) in &vars {
+            hasher.part(name).part(value);
+        }
+        self.hashed("env keyed", hasher.finish().0)
+    }
+
+    fn hashed(&mut self, name: &'static str, hash: [u8; 32]) -> &mut Given {
         match self.parts.binary_search_by(|it| it.0.cmp(name)) {
             Ok(at) => self.parts[at].1 = hash,
             Err(at) => self.parts.insert(at, (name, hash)),
@@ -221,5 +247,24 @@ mod tests {
         let mut env_two = Given::new(RunKind::BuildScript);
         env_two.env("B", "2").env("A", "1");
         assert_eq!(env_one.finish(), env_two.finish());
+    }
+
+    #[test]
+    fn keyed_variables_are_one_part_in_name_order_the_last_value_kept() {
+        let keyed = |vars: &[(&str, &str)]| {
+            let mut given = Given::new(RunKind::ProcMacro);
+            given.env_keyed(vars.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())));
+            given.finish()
+        };
+        assert_eq!(keyed(&[("A", "1"), ("B", "2")]), keyed(&[("B", "2"), ("A", "1")]));
+        assert_eq!(keyed(&[("A", "0"), ("B", "2"), ("A", "1")]), keyed(&[("A", "1"), ("B", "2")]));
+        assert_ne!(keyed(&[("AB", "")]), keyed(&[("A", "B")]));
+        assert_ne!(keyed(&[("A", "1")]), keyed(&[]));
+        let mut set = Given::new(RunKind::ProcMacro);
+        set.env("A", "1");
+        assert_ne!(set.finish(), keyed(&[("A", "1")]));
+        let mut passed = Given::new(RunKind::ProcMacro);
+        passed.env_keyed([(b"A".as_slice(), b"1".as_slice())]);
+        assert!(!passed.sets(OsStr::new("A")));
     }
 }

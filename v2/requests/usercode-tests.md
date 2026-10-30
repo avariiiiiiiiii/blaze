@@ -66,3 +66,18 @@ runs as before.
   of the child is that test) would make the scope hold for threads the test spawns too.
 
 > forwarded to usercode: the sandbox is usercode's (`crates/blaze-cargo/src/sandbox*`, usercode-sandbox).
+
+> applied (usercode):
+> - **connect:**
+>   - Linux: `Recorder::may_connect` also allows a path the read set names exactly (not one
+>     below it).
+>   - macOS: each read-set path that is a Unix socket when the run starts gets a Seatbelt
+>     `(allow network-outbound (remote unix-socket (path-literal (param "SOCKETn"))))` in
+>     each of its spellings.
+> - **Scope:** a forked process already started in its forker's scope. Now a new thread does
+>   too.
+>   - Linux: a new thread starts in the scope that every other thread of its process shares,
+>     when all are known and in one. This is checked when the thread is first seen and before
+>     any thread of the process takes a new mark. Otherwise it gets none, which is every
+>     scope's and so sound.
+>   - macOS: an interposed `pthread_create` hands the creator's scope to the new thread.

@@ -29,7 +29,7 @@ use blaze_usercode::{
     },
 };
 use blaze_units::schema::{Mode, Unit};
-use load_cargo::v2::Snapshot;
+use load_cargo::v2::Db;
 
 use super::{Job, UnitReader, compile::TestOf, graph::flag, package_of};
 use crate::serve::work::{Failed, Runs, Selection, Writer};
@@ -206,10 +206,10 @@ pub(crate) fn ub_tests(job: &Job, reader: &UnitReader, selection: Selection<'_>)
     Ok(keys)
 }
 
-/// Test `key` of [`ub_tests`] run in blaze's MIR evaluator under `ub` on `db`, the task's
-/// snapshot, nothing compiled; a bench is refused, naming it (libtest runs one once with a
+/// Test `key` of [`ub_tests`] run in blaze's MIR evaluator under `ub` on `db`, the task.s
+/// shared front end, nothing compiled; a bench is refused, naming it (libtest runs one once with a
 /// `Bencher`, which the evaluator has no part of).
-pub(crate) fn evaluate(job: &Job, db: &Snapshot, key: &str, ub: Ub) -> Result<TestResult, Failed> {
+pub(crate) fn evaluate(job: &Job, db: &Db, key: &str, ub: Ub) -> Result<TestResult, Failed> {
     let selected = job.ub.get();
     let test = selected
         .and_then(|it| it.find(key))

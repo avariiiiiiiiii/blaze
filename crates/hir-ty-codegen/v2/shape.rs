@@ -166,7 +166,10 @@ fn estimate(function: &Function) -> usize {
         }
         Built::Assembled(code, _) => code.bytes.len() + 24 * code.relocs.len(),
     };
-    let scopes = 5 * function.scopes.parents.len() + 5 * function.scopes.of_span.len();
+    let scopes = 5 * function.scopes.parents.len()
+        + 5 * function.scopes.of_span.len()
+        + 41 * function.scopes.inlined.len()
+        + 5 * function.scopes.inlined_of_span.len();
     let inlined = 32 * function.inlined.len();
     256 + code + data + 36 * function.spans.len() + 53 * function.variables.len() + scopes + inlined
 }
@@ -347,6 +350,16 @@ fn scopes(out: &mut Out, scopes: &Scopes) {
                 out.u32(scope);
             }
         }
+    }
+    out.u32(scopes.inlined.len() as u32);
+    for inlined in &scopes.inlined {
+        option(out, inlined.parent);
+        out.raw(&inlined.call_site.anchor.0);
+        out.u32(inlined.call_site.index);
+    }
+    out.u32(scopes.inlined_of_span.len() as u32);
+    for &of in &scopes.inlined_of_span {
+        option(out, of);
     }
 }
 

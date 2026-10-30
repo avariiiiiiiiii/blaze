@@ -11,7 +11,7 @@
 //! |---|---|---|
 //! | `Never`, `Placeholder`, `Error` | 0 | |
 //! | `Tuple(types)` | e | `[start, len]` into `lists` |
-//! | `Path(path)` | `paths` t | |
+//! | `Path(path)` | path id in `paths` | |
 //! | `RawPtr(inner, mutability)` | `inner << 1 \| mutability` | |
 //! | `Reference(ref_type)` | `refs` t | |
 //! | `Array(array)` | `arrays` t | |
@@ -22,15 +22,19 @@
 //! | `PatternType(ty, pat)` | e | `[ty, pat]` |
 //!
 //! `e` is the index in `extra` of the type ref's words, `t` an index into the side table named.
+//! `paths` is the store's [`PathColumns`] (`expr_store/path.rs`), which also hold the names and
+//! `use<..>` arguments the bounds' runs ([`Names`], [`UseArgs`]) point into.
 
 use hir_expand::name::Name;
 use la_arena::Idx;
 use rustc_abi::ExternAbi;
-use thin_vec::ThinVec;
 
 use crate::{
     LifetimeParamId, TypeParamId,
-    expr_store::{ExpressionStore, path::Path},
+    expr_store::{
+        ExpressionStore,
+        path::{Names, Path, PathColumns, PathIdx, UseArgs},
+    },
     hir::{
         ExprId, PatId,
         columns::{Checked, ColumnVec, Frozen, Growing, below, entry, idx, len, list, raw, take_exact},
@@ -154,7 +158,7 @@ pub enum TypeRef<'a> {
     Never,
     Placeholder,
     Tuple(&'a [TypeRefId]),
-    Path(&'a Path),
+    Path(Path<'a>),
     RawPtr(TypeRefId, Mutability),
     Reference(&'a RefType),
     Array(&'a ArrayType),
@@ -181,12 +185,14 @@ pub enum LifetimeRef {
     Error,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// A bound, a plain record: its `for<..>` binder and `use<..>` arguments are runs in its store,
+/// read with [`ExpressionStore::names`] and [`ExpressionStore::use_args`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TypeBound {
     Path(PathId, TraitBoundModifier),
-    ForLifetime(ThinVec<Name>, PathId),
+    ForLifetime(Names, PathId),
     Lifetime(LifetimeRefId),
-    Use(ThinVec<UseArgRef>),
+    Use(UseArgs),
     Error,
 }
 
@@ -211,10 +217,10 @@ impl TypeRef<'static> {
 }
 
 impl TypeBound {
-    pub fn as_path<'a>(&self, map: &'a ExpressionStore) -> Option<(&'a Path, TraitBoundModifier)> {
-        match self {
-            &TypeBound::Path(p, m) => Some((&map[p], m)),
-            &TypeBound::ForLifetime(_, p) => Some((&map[p], TraitBoundModifier::None)),
+    pub fn as_path<'a>(&self, map: &'a ExpressionStore) -> Option<(Path<'a>, TraitBoundModifier)> {
+        match *self {
+            TypeBound::Path(p, m) => Some((map.path(p), m)),
+            TypeBound::ForLifetime(_, p) => Some((map.path(p), TraitBoundModifier::None)),
             TypeBound::Lifetime(_) | TypeBound::Error | TypeBound::Use(_) => None,
         }
     }
@@ -298,7 +304,8 @@ pub(crate) struct TypeColumns<V: ColumnVec = Frozen> {
     pub(crate) lists: V::Of<TypeRefId>,
     /// The bounds of every `ImplTrait` and `DynTrait`.
     pub(crate) bounds: V::Of<TypeBound>,
-    pub(crate) paths: V::Of<Path>,
+    /// The store's paths, of type refs, expressions and patterns alike.
+    pub(crate) paths: PathColumns,
     pub(crate) refs: V::Of<RefType>,
     pub(crate) arrays: V::Of<ArrayType>,
     pub(crate) fns: V::Of<FnType>,
@@ -321,13 +328,13 @@ const _: () = {
 };
 
 // The side tables' elements, on 64-bit. `RefType` would be 12 and `ArrayType` stays 8 once
-// `la_arena::Idx` has a niche (`Option<LifetimeRefId>` is 8 bytes today).
+// `la_arena::Idx` has a niche (`Option<LifetimeRefId>` is 8 bytes today). A path is a word
+// here; its own columns are sized in `expr_store/path.rs`.
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(size_of::<RefType>() == 16);
     assert!(size_of::<ArrayType>() == 8);
     assert!(size_of::<TypeBound>() == 16);
-    assert!(size_of::<Path>() == 24);
 };
 
 const TYPE_ID: &str = "a type id past its arena";
@@ -361,23 +368,29 @@ impl<V: ColumnVec> TypeColumns<V> {
         (0..len(self.len())).map(move |at| (idx(at), self.get(idx(at))))
     }
 
-    /// The path a [`PathId`] names: one load of its kind and one of its data word.
+    /// The path a [`PathId`] names: one load of its kind and one of its data word, then the
+    /// path's own.
     #[inline]
-    pub(crate) fn path(&self, id: PathId) -> &Path {
+    pub(crate) fn path(&self, id: PathId) -> Path<'_> {
         match self.path_of(id) {
-            Ok(path) => path,
+            Ok(path) => self.paths.get(path),
             Err(what) => bad_types(what, raw(id.type_ref())),
         }
     }
 
     #[inline]
-    fn path_of(&self, id: PathId) -> Checked<&Path> {
+    fn path_of(&self, id: PathId) -> Checked<PathIdx> {
         let at = raw(id.type_ref()) as usize;
         match (self.kind.get(at), self.data.get(at)) {
-            (Some(&kind), Some(&d)) if kind == TypeRefKind::Path as u8 => entry(&self.paths, d, PATH),
+            (Some(&kind), Some(&d)) if kind == TypeRefKind::Path as u8 => self.path_idx(d),
             (Some(_), Some(_)) => Err(NOT_A_PATH),
             _ => Err(TYPE_ID),
         }
+    }
+
+    #[inline]
+    fn path_idx(&self, d: u32) -> Checked<PathIdx> {
+        below(d, self.paths.len(), PATH).map(|()| idx(d))
     }
 
     #[inline]
@@ -404,7 +417,7 @@ impl<V: ColumnVec> TypeColumns<V> {
                 let [start, count] = self.pair(d)?;
                 TypeRef::Tuple(list(&self.lists, start, count, LIST)?)
             }
-            TypeRefKind::Path => TypeRef::Path(entry(&self.paths, d, PATH)?),
+            TypeRefKind::Path => TypeRef::Path(self.paths.decode(self.path_idx(d)?)?),
             TypeRefKind::RawPtr => TypeRef::RawPtr(
                 idx(d >> 1),
                 if d & 1 == 1 { Mutability::Mut } else { Mutability::Shared },
@@ -468,7 +481,7 @@ impl TypeColumns<Growing> {
                 let words = append(&mut self.lists, types);
                 self.words(words)
             }
-            TypeRef::Path(path) => push_one(&mut self.paths, path.clone()),
+            TypeRef::Path(path) => raw(self.paths.push_view(path)),
             TypeRef::RawPtr(inner, mutability) => {
                 assert!(raw(inner) >> (u32::BITS - 1) == 0, "a type id too large to share its word");
                 raw(inner) << 1 | mutability as u32
@@ -487,10 +500,11 @@ impl TypeColumns<Growing> {
         self.node(kind, data)
     }
 
-    /// A `Path` type ref, moving `path` into its table where [`TypeColumns::push`] clones it.
-    pub(crate) fn push_path(&mut self, path: Path) -> TypeRefId {
-        let data = push_one(&mut self.paths, path);
-        self.node(TypeRefKind::Path, data)
+    /// A `Path` type ref of the path `path` of these columns, where [`TypeColumns::push`]
+    /// copies a view's rows.
+    pub(crate) fn push_path(&mut self, path: PathIdx) -> TypeRefId {
+        debug_assert!((raw(path) as usize) < self.paths.len(), "a path of other columns");
+        self.node(TypeRefKind::Path, raw(path))
     }
 
     /// A `Fn` type ref, moving `fn_type` into its table.

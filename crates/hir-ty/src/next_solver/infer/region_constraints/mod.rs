@@ -5,9 +5,8 @@ use std::{cmp, fmt, mem};
 
 use rustc_hash::FxHashMap;
 use rustc_index::IndexVec;
-use rustc_type_ir::inherent::IntoKind;
 use rustc_type_ir::solve::VisibleForLeakCheck;
-use rustc_type_ir::{RegionKind, RegionVid, UniverseIndex};
+use rustc_type_ir::{IsRigid, RegionKind, RegionVid, TypeVisitableExt, UniverseIndex};
 use tracing::{debug, instrument};
 
 use self::CombineMapType::*;
@@ -19,12 +18,52 @@ use crate::next_solver::{AliasTy, Binder, DbInterner, ParamTy, PlaceholderType, 
 
 mod leak_check;
 
+impl rustc_type_ir::region_constraint::ConstraintSpan for Span {}
+
+rustc_type_ir::TrivialTypeTraversalImpls! {
+    crate::Span,
+}
+
+/// The region constraint the next solver builds (`-Zassumptions-on-binders` in rustc), each
+/// leaf with the span it came from.
+pub type SolverRegionConstraint<'db> =
+    rustc_type_ir::region_constraint::RegionConstraint<DbInterner<'db>, Span>;
+
+#[derive(Clone, Debug)]
+pub struct SolverRegionConstraintData<'db>(SolverRegionConstraint<'db>);
+
+impl Default for SolverRegionConstraintData<'_> {
+    fn default() -> Self {
+        Self(SolverRegionConstraint::new_true())
+    }
+}
+
+impl<'db> SolverRegionConstraintData<'db> {
+    pub(crate) fn get_constraint(&self) -> SolverRegionConstraint<'db> {
+        // clone: `InferCtxtLike` returns it owned; reached only with assumptions on binders.
+        self.0.clone()
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    pub(crate) fn overwrite(&mut self, constraint: SolverRegionConstraint<'db>) {
+        self.0 = constraint;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RegionConstraintStorage<'db> {
     /// For each `RegionVid`, the corresponding `RegionVariableOrigin`.
     pub(super) var_infos: IndexVec<RegionVid, RegionVariableInfo>,
 
-    pub(super) data: RegionConstraintData<'db>,
+    pub(super) legacy_data: RegionConstraintData<'db>,
+
+    // FIXME(-Zassumptions-on-binders): rustc means to merge `solver_data` and `legacy_data`
+    // into one representation of region constraints.
+    pub(super) solver_data: SolverRegionConstraintData<'db>,
+
+    /// The solver constraint each overwrite in the open snapshots replaced, oldest first, for
+    /// rollback.
+    solver_overwrites: Vec<SolverRegionConstraint<'db>>,
 
     /// For a given pair of regions (R1, R2), maps to a region R3 that
     /// is designated as their LUB (edges R1 <= R3 and R2 <= R3
@@ -41,7 +80,7 @@ pub struct RegionConstraintStorage<'db> {
 
     /// When we add a R1 == R2 constraint, we currently add (a) edges
     /// R1 <= R2 and R2 <= R1 and (b) we unify the two regions in this
-    /// table. You can then call `opportunistic_resolve_var` early
+    /// table. You can then call `shallow_resolve_region_var` early
     /// which will map R1 and R2 to some common region (i.e., either
     /// R1 or R2). This is important when fulfillment, dropck and other such
     /// code is iterating to a fixed point, because otherwise we sometimes
@@ -201,6 +240,7 @@ impl<'db> RegionConstraints<'db> {
         (0..self.len()).map(|index| (self.get(index), self.visible_for_leak_check(index)))
     }
 
+    #[cfg(test)]
     pub fn to_vec(&self) -> Vec<Constraint<'db>> {
         self.iter().collect()
     }
@@ -369,7 +409,7 @@ pub struct VerifyIfEq<'db> {
     pub bound: Region<'db>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TwoRegions<'db> {
     a: Region<'db>,
     b: Region<'db>,
@@ -410,6 +450,7 @@ pub(crate) struct RegionSnapshot {
     regions: u32,
     verifys: u32,
     combinations: u32,
+    solver_overwrites: u32,
     any_unifications: bool,
 }
 
@@ -424,10 +465,11 @@ impl<'db> RegionConstraintStorage<'db> {
         RegionSnapshot {
             unification: self.unification_table.start_snapshot(),
             vars: self.var_infos.len() as u32,
-            constraints: self.data.constraints.len() as u32,
-            regions: self.data.constraints.regions.len() as u32,
-            verifys: self.data.verifys.len() as u32,
+            constraints: self.legacy_data.constraints.len() as u32,
+            regions: self.legacy_data.constraints.regions.len() as u32,
+            verifys: self.legacy_data.verifys.len() as u32,
             combinations: self.combinations.len() as u32,
+            solver_overwrites: self.solver_overwrites.len() as u32,
             any_unifications: self.any_unifications,
         }
     }
@@ -444,9 +486,19 @@ impl<'db> RegionConstraintStorage<'db> {
         self.unification_table.rollback_to(snapshot.unification);
         assert!(self.var_infos.len() >= snapshot.vars as usize, "region variables were lost");
         self.var_infos.truncate(snapshot.vars as usize);
-        self.data.constraints.truncate(snapshot.constraints as usize, snapshot.regions as usize);
-        assert!(self.data.verifys.len() >= snapshot.verifys as usize, "verifys were lost");
-        self.data.verifys.truncate(snapshot.verifys as usize);
+        self.legacy_data
+            .constraints
+            .truncate(snapshot.constraints as usize, snapshot.regions as usize);
+        assert!(self.legacy_data.verifys.len() >= snapshot.verifys as usize, "verifys were lost");
+        self.legacy_data.verifys.truncate(snapshot.verifys as usize);
+        // The first overwrite after the snapshot replaced the constraint the snapshot saw.
+        let overwrites = snapshot.solver_overwrites as usize;
+        assert!(self.solver_overwrites.len() >= overwrites, "solver overwrites were lost");
+        if self.solver_overwrites.len() > overwrites {
+            self.solver_overwrites.truncate(overwrites + 1);
+            let old = self.solver_overwrites.pop().expect("truncated to at least one");
+            self.solver_data.overwrite(old);
+        }
         self.any_unifications = snapshot.any_unifications;
     }
 
@@ -455,6 +507,7 @@ impl<'db> RegionConstraintStorage<'db> {
         self.unification_table.commit(snapshot.unification);
         if outermost {
             self.combinations.clear();
+            self.solver_overwrites.clear();
         }
     }
 }
@@ -465,7 +518,7 @@ impl<'db> RegionConstraintCollector<'db, '_> {
     }
 
     pub fn region_constraint_data(&self) -> &RegionConstraintData<'db> {
-        &self.storage.data
+        &self.storage.legacy_data
     }
 
     /// Takes (and clears) the current set of constraints. Note that
@@ -488,7 +541,10 @@ impl<'db> RegionConstraintCollector<'db, '_> {
         // or updated in some way.
         let RegionConstraintStorage {
             var_infos,
-            data,
+            legacy_data,
+            // FIXME(-Zassumptions-on-binders): rustc does not reset `solver_data` either.
+            solver_data: _,
+            solver_overwrites: _,
             lubs,
             glbs,
             combinations,
@@ -504,7 +560,7 @@ impl<'db> RegionConstraintCollector<'db, '_> {
         glbs.clear();
         combinations.clear();
 
-        let data = mem::take(data);
+        let data = mem::take(legacy_data);
 
         // Clear all unifications and recreate the variables a "now
         // un-unified" state. Note that when we unify `a` and `b`, we
@@ -521,8 +577,41 @@ impl<'db> RegionConstraintCollector<'db, '_> {
         data
     }
 
-    pub fn data(&self) -> &RegionConstraintData<'db> {
-        &self.storage.data
+    pub fn legacy_data(&self) -> &RegionConstraintData<'db> {
+        &self.storage.legacy_data
+    }
+
+    pub fn solver_data(&self) -> &SolverRegionConstraintData<'db> {
+        &self.storage.solver_data
+    }
+
+    pub fn overwrite_solver_constraint(&mut self, constraint: SolverRegionConstraint<'db>) {
+        assert!(
+            !constraint.has_escaping_bound_vars(),
+            "solver region constraint has escaping bound vars, which is indicative of a bug in how constraints are handled: {constraint:?}",
+        );
+        self.replace_solver_constraint(constraint);
+    }
+
+    pub fn register_solver_constraint(&mut self, constraint: SolverRegionConstraint<'db>) {
+        assert!(
+            !constraint.has_escaping_bound_vars(),
+            "solver region constraint has escaping bound vars, which is indicative of a bug in how constraints are handled: {constraint:?}",
+        );
+        let new_constraint = SolverRegionConstraint::build_and(
+            constraint,
+            self.storage.solver_data.get_constraint(),
+        );
+        // FIXME(-Zassumptions-on-binders): as in rustc, each registration rewrites the whole
+        // constraint and keeps the old one for rollback, instead of an incremental change.
+        self.replace_solver_constraint(new_constraint);
+    }
+
+    fn replace_solver_constraint(&mut self, constraint: SolverRegionConstraint<'db>) {
+        let old = mem::replace(&mut self.storage.solver_data.0, constraint);
+        if self.in_snapshot {
+            self.storage.solver_overwrites.push(old);
+        }
     }
 
     pub(super) fn new_region_var(&mut self, universe: UniverseIndex, span: Span) -> RegionVid {
@@ -544,7 +633,7 @@ impl<'db> RegionConstraintCollector<'db, '_> {
     ) {
         // cannot add constraints once regions are resolved
         debug!("RegionConstraintCollector: add_constraint({:?})", constraint);
-        self.storage.data.constraints.push(constraint, visible_for_leak_check);
+        self.storage.legacy_data.constraints.push(constraint, visible_for_leak_check);
     }
 
     pub(super) fn make_eqregion(
@@ -670,7 +759,7 @@ impl<'db> RegionConstraintCollector<'db, '_> {
 
     /// Resolves a region var to its value in the unification table, if it exists.
     /// Otherwise, it is resolved to the root `ReVar` in the table.
-    pub fn opportunistic_resolve_var(
+    pub fn shallow_resolve_region_var(
         &mut self,
         cx: DbInterner<'db>,
         vid: RegionVid,
@@ -683,7 +772,7 @@ impl<'db> RegionConstraintCollector<'db, '_> {
         }
     }
 
-    pub fn probe_value(&mut self, vid: RegionVid) -> Result<Region<'db>, UniverseIndex> {
+    pub fn try_resolve_region_var(&mut self, vid: RegionVid) -> Result<Region<'db>, UniverseIndex> {
         match self.storage.unification_table.probe_value(vid) {
             RegionVariableValue::Known { value, .. } => Ok(value),
             RegionVariableValue::Unknown { universe, .. } => Err(universe),
@@ -713,7 +802,7 @@ impl<'db> RegionConstraintCollector<'db, '_> {
         let b_universe = self.universe(b);
         let c_universe = cmp::max(a_universe, b_universe);
         let c = self.new_region_var(c_universe, origin);
-        self.combine_map(t).insert(vars.clone(), c);
+        self.combine_map(t).insert(vars, c);
         if self.in_snapshot {
             self.storage.combinations.push((t, vars));
         }
@@ -736,7 +825,7 @@ impl<'db> RegionConstraintCollector<'db, '_> {
             | RegionKind::ReEarlyParam(..)
             | RegionKind::ReError(_) => UniverseIndex::ROOT,
             RegionKind::RePlaceholder(placeholder) => placeholder.universe,
-            RegionKind::ReVar(vid) => match self.probe_value(vid) {
+            RegionKind::ReVar(vid) => match self.try_resolve_region_var(vid) {
                 Ok(value) => self.universe(value),
                 Err(universe) => universe,
             },
@@ -748,16 +837,17 @@ impl<'db> RegionConstraintCollector<'db, '_> {
         let range =
             RegionVid::from(value_count)..RegionVid::from(self.storage.unification_table.len());
         (
-            range.clone(),
+            range.start..range.end,
             (range.start.as_usize()..range.end.as_usize())
                 .map(|index| self.storage.var_infos[RegionVid::from_usize(index)].span)
+                // alloc: only when fudging, one span per variable made in the snapshot.
                 .collect(),
         )
     }
 
     /// See `InferCtxt::region_constraints_added_in_snapshot`.
     pub(crate) fn region_constraints_added_in_snapshot(&self, mark: &RegionSnapshot) -> bool {
-        self.storage.data.constraints.len() > mark.constraints as usize
+        self.storage.legacy_data.constraints.len() > mark.constraints as usize
     }
 }
 
@@ -792,7 +882,8 @@ impl<'db> GenericKind<'db> {
         match *self {
             GenericKind::Param(ref p) => (*p).to_ty(interner),
             GenericKind::Placeholder(ref p) => Ty::new_placeholder(interner, *p),
-            GenericKind::Alias(ref p) => (*p).to_ty(interner),
+            // The next solver only records outlives for aliases it could not normalize.
+            GenericKind::Alias(ref p) => (*p).to_ty(interner, IsRigid::Yes),
         }
     }
 }
@@ -824,6 +915,7 @@ impl<'db> VerifyBound<'db> {
         } else if self.cannot_hold() || vb.must_hold() {
             vb
         } else {
+            // alloc: the verify owns its two bounds.
             VerifyBound::AnyBound(vec![self, vb])
         }
     }

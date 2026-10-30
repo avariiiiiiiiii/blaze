@@ -366,6 +366,55 @@ fn implements<'db>(
     goals.iter().map(|&(ty, _)| infcx.type_implements_trait(tr, [ty], ParamEnv::empty())).collect()
 }
 
+const HELD_ACROSS_AWAIT: &str = r#"
+//- minicore: sized, send, future
+struct NotSend(*const u8);
+fn not_send() -> NotSend { loop {} }
+fn consume(_: NotSend) {}
+fn held() {
+    let fut = async {
+        let it = not_send();
+        async {}.await;
+        consume(it);
+    };
+}
+fn moved_before() {
+    let fut = async {
+        consume(not_send());
+        async {}.await;
+    };
+}
+"#;
+
+/// The type inference gave the binding `name` in the body of `def`.
+fn binding_ty<'db>(db: &'db TestDB, def: DefWithBodyId, name: &str) -> Ty<'db> {
+    let body = hir_def::expr_store::Body::of(db, def);
+    let (binding, _) = body
+        .bindings()
+        .find(|(_, it)| it.name.as_str() == name)
+        .unwrap_or_else(|| panic!("no binding `{name}`"));
+    InferenceResult::of(db, InferBodyId::DefWithBodyId(def)).binding_ty(binding)
+}
+
+#[test]
+fn a_future_is_send_only_when_what_it_holds_across_an_await_is() {
+    let db = TestDB::with_files(HELD_ACROSS_AWAIT);
+    crate::attach_db(&db, || {
+        let (_, ModuleDefId::TraitId(send)) = type_item(&db, "Send") else {
+            panic!("`Send` is a trait")
+        };
+        for (name, expected) in [
+            ("held", EvaluationResult::EvaluatedToErr),
+            ("moved_before", EvaluationResult::EvaluatedToOk),
+        ] {
+            let def = function(&db, name);
+            let interner = DbInterner::new_with(&db, hir_def::HasModule::krate(&def, &db));
+            let fut = binding_ty(&db, def, "fut");
+            assert_eq!(implements(interner, send, &[(fut, false)]), [expected], "{name}");
+        }
+    });
+}
+
 #[test]
 fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
     let db = TestDB::with_files(SOLVER);

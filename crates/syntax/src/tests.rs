@@ -26,6 +26,16 @@ fn main() {
 }
 
 #[test]
+fn statements_that_are_no_expression_parse_as_macro_statements() {
+    let text = "let x = 1; x + 1";
+    assert!(!ast::Expr::parse(text, Edition::CURRENT).errors().is_empty());
+    let parse = ast::MacroStmts::parse(text, Edition::CURRENT);
+    assert_eq!(parse.errors(), Vec::<SyntaxError>::new());
+    assert!(parse.tree().statements().next().is_some());
+    assert!(!ast::MacroStmts::parse("let = ;", Edition::CURRENT).errors().is_empty());
+}
+
+#[test]
 fn benchmark_parser() {
     if std::env::var("RUN_SLOW_BENCHES").is_err() {
         return;

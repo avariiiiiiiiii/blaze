@@ -2,6 +2,7 @@
 //! ignored, as `blaze_fuzz::inputs` reads a corpus directory.
 
 use std::{
+    ffi::OsString,
     fmt::Write as _,
     path::{Path, PathBuf},
 };
@@ -34,6 +35,7 @@ impl Corpus {
     }
 
     /// The input added last.
+    #[cfg(test)]
     pub(crate) fn last(&self) -> &[u8] {
         self.inputs.last().map_or(&[], Vec::as_slice)
     }
@@ -83,27 +85,46 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>, String> {
     from_hex(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// The inputs of every file in `dir`, in name order (none when it doesn't exist).
-pub(crate) fn read_dir(dir: &Path) -> Result<Vec<Vec<u8>>, String> {
+/// The names of the files in `dir`, in name order (none when it doesn't exist), but those
+/// starting with `.`, which are being written. One listing, no `stat` per file.
+pub(crate) fn names(dir: &Path) -> Result<Vec<OsString>, String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{}: {e}", dir.display())),
     };
-    let mut files = Vec::new();
+    let mut names = Vec::new();
     for entry in entries {
-        let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
-        if path.is_file() {
-            files.push(path);
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let is_file = entry.file_type().map_err(|e| format!("{}: {e}", entry.path().display()))?.is_file();
+        let name = entry.file_name();
+        if is_file && !name.as_encoded_bytes().starts_with(b".") {
+            names.push(name);
         }
     }
-    files.sort();
-    files.iter().map(|file| read(file)).collect()
+    names.sort();
+    Ok(names)
 }
 
-/// Writes `bytes` to `dir/<prefix><name>.hex`, and says where.
+/// The inputs of every file in `dir`, in name order (none when it doesn't exist).
+pub(crate) fn read_dir(dir: &Path) -> Result<Vec<Vec<u8>>, String> {
+    names(dir)?.iter().map(|name| read(&dir.join(name))).collect()
+}
+
+/// The file name [`write`] gives `bytes`.
+pub(crate) fn file_name(prefix: &str, bytes: &[u8]) -> OsString {
+    OsString::from(format!("{prefix}{}.hex", name(bytes)))
+}
+
+/// Writes `bytes` to `dir/<prefix><name>.hex`, and says where. The file appears whole: it is
+/// written under a `.` name and renamed, so a `--jobs` worker listing `dir` never reads a part.
 pub(crate) fn write(dir: &Path, prefix: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    let path = dir.join(format!("{prefix}{}.hex", name(bytes)));
-    std::fs::write(&path, to_hex(bytes)).map_err(|e| format!("{}: {e}", path.display()))?;
+    let name = file_name(prefix, bytes);
+    let path = dir.join(&name);
+    let mut partial = OsString::from(format!(".{}-", std::process::id()));
+    partial.push(&name);
+    let partial = dir.join(partial);
+    std::fs::write(&partial, to_hex(bytes)).map_err(|e| format!("{}: {e}", partial.display()))?;
+    std::fs::rename(&partial, &path).map_err(|e| format!("{} to {}: {e}", partial.display(), path.display()))?;
     Ok(path)
 }

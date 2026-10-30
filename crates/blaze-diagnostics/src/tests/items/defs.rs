@@ -717,3 +717,51 @@ For more information about this error, try `rustc --explain E0091`.
 "#;
     assert_eq!(ui("unused-type-parameter-span-30236.rs", "2015", source), stderr);
 }
+
+#[test]
+fn explicit_discriminants_with_fields_need_a_repr() {
+    // tests/ui/enum-discriminant/arbitrary_enum_discriminant-no-repr.rs
+    let source = r#"#![crate_type = "lib"]
+
+// Test that if any variant is non-unit,
+// we need a repr.
+enum Enum {
+    //~^ ERROR `#[repr(inttype)]` must be specified
+    Unit = 1,
+    Tuple(),
+    Struct {},
+}
+
+// Test that if any non-unit variant has an explicit
+// discriminant we need a repr.
+enum Enum2 {
+    //~^ ERROR `#[repr(inttype)]` must be specified
+    Tuple() = 2,
+}
+"#;
+    let stderr = r#"error[E0732]: `#[repr(inttype)]` must be specified for enums with explicit discriminants and non-unit variants
+  --> $DIR/arbitrary_enum_discriminant-no-repr.rs:5:1
+   |
+LL | enum Enum {
+   | ^^^^^^^^^
+LL |
+LL |     Unit = 1,
+   |            - explicit discriminant specified here
+LL |     Tuple(),
+   |     ----- non-unit discriminant declared here
+
+error[E0732]: `#[repr(inttype)]` must be specified for enums with explicit discriminants and non-unit variants
+  --> $DIR/arbitrary_enum_discriminant-no-repr.rs:14:1
+   |
+LL | enum Enum2 {
+   | ^^^^^^^^^^
+LL |
+LL |     Tuple() = 2,
+   |               - explicit discriminant on non-unit variant specified here
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `rustc --explain E0732`.
+"#;
+    assert_eq!(ui("arbitrary_enum_discriminant-no-repr.rs", "2015", source), stderr);
+}

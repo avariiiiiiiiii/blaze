@@ -8,8 +8,17 @@ use blaze_ids::radix;
 use object::Endianness;
 use object::macho;
 use object::read::macho::{MachHeader as _, Nlist as _, Section as _, Segment as _, SymbolTable};
+use smallvec::SmallVec;
 
 use crate::model::{Names, Shared, SharedSymbol, SymbolKind};
+
+/// A library's sections, kept inline: system dylibs have a few dozen.
+type SectionList = SmallVec<[Section; 32]>;
+
+/// The trie walk's name buffer and edge stack, kept inline: past these the walk spills to the
+/// heap once and doubles from there.
+const NAME_INLINE: usize = 256;
+const EDGES_INLINE: usize = 64;
 
 type Header = macho::MachHeader64<Endianness>;
 
@@ -20,10 +29,12 @@ const EXPORT_SYMBOL_FLAGS_STATIC_RESOLVER: u64 = 0x20;
 /// A thin Mach-O dynamic library (`MH_DYLIB`, or an `MH_DYLIB_STUB`) for `arch`: its install
 /// name (`LC_ID_DYLIB`) and what it exports.
 pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Shared, String> {
+    // alloc: error path
     read_dylib(bytes, arch).map_err(|what| format!("{name}: {what}"))
 }
 
 fn err(error: object::read::Error) -> String {
+    // alloc: error path
     error.to_string()
 }
 
@@ -52,9 +63,12 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
     match magic {
         macho::MH_MAGIC_64 | macho::MH_CIGAM_64 => {}
         macho::FAT_MAGIC | macho::FAT_CIGAM | macho::FAT_MAGIC_64 | macho::FAT_CIGAM_64 => {
+            // alloc: error path
             return Err("a universal (fat) file: only a thin slice is read here".to_owned());
         }
+        // alloc: error path
         macho::MH_MAGIC | macho::MH_CIGAM => return Err("a 32-bit Mach-O".to_owned()),
+        // alloc: error path
         _ => return Err(format!("not a Mach-O file (magic {magic:#010x})")),
     }
     let header = Header::parse(bytes, 0).map_err(err)?;
@@ -62,22 +76,25 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
     let want = match arch {
         Arch::Aarch64 => macho::CPU_TYPE_ARM64,
         Arch::X86_64 => macho::CPU_TYPE_X86_64,
+        // alloc: error path
         Arch::Wasm32 => return Err("a Mach-O library in a wasm32 link".to_owned()),
     };
     let cpu = header.cputype(endian);
     if cpu != want {
+        // alloc: error path
         return Err(format!("a Mach-O of CPU type {cpu:#x}, not {arch:?} ({want:#x})"));
     }
     let filetype = header.filetype(endian);
     if filetype != macho::MH_DYLIB && filetype != macho::MH_DYLIB_STUB {
+        // alloc: error path
         return Err(format!("not a dynamic library (Mach-O file type {filetype})"));
     }
 
     let mut install_name = None;
-    let mut inputs = Vec::new();
+    let mut inputs = Vec::new(); // alloc: empty unless the library re-exports; `Shared::inputs`
     let mut trie: Option<(&'static str, u32, u32)> = None;
     let mut symtab = None;
-    let mut sections = Vec::new();
+    let mut sections = SectionList::new();
     let mut base = None;
     let mut commands = header.load_commands(endian, bytes, 0).map_err(err)?;
     while let Some(command) = commands.next().map_err(err)? {
@@ -86,10 +103,13 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
                 let dylib: &macho::DylibCommand<Endianness> = command.data().map_err(err)?;
                 let path = command.string(endian, dylib.dylib.name).map_err(err)?;
                 let path = std::str::from_utf8(path)
+                    // alloc: error path
                     .map_err(|_| "a dylib path that is not UTF-8".to_owned())?
+                    // alloc: the install name and re-exports are `Shared`'s `String`s: once per command naming one
                     .to_owned();
                 if command.cmd() == macho::LC_ID_DYLIB {
                     if install_name.replace(path).is_some() {
+                        // alloc: error path
                         return Err("two LC_ID_DYLIB commands".to_owned());
                     }
                 } else if !inputs.contains(&path) {
@@ -138,6 +158,7 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
                 .zip(usize::try_from(size).ok())
                 .and_then(|(offset, size)| bytes.get(offset..offset.checked_add(size)?))
                 .ok_or_else(|| {
+                    // alloc: error path
                     format!("{command}'s export trie ({size} bytes at {offset:#x}) is outside the file")
                 })?;
             let base = base.ok_or("an export trie, but no segment maps the Mach-O header")?;
@@ -145,6 +166,7 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
             // twice its size; past that the arena doubles, a few times per file at most.
             names = Names::with_capacity(data.len() * 2);
             trie_exports(data, base, &sections, &mut names)
+                // alloc: error path
                 .map_err(|what| format!("{command}'s export trie: {what}"))?
         }
         None => {
@@ -156,6 +178,7 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
             symtab_exports(&table, endian, &sections, &mut names)?
         }
     };
+    // alloc: empty `Vec`s, which don't allocate
     Ok(Shared { name, symbols, names, versions: Vec::new(), more: Vec::new(), inputs })
 }
 
@@ -166,6 +189,7 @@ fn set_trie(
     size: u32,
 ) -> Result<(), String> {
     if let Some((other, ..)) = trie.replace((command, offset, size)) {
+        // alloc: error path
         return Err(format!("two export tries ({other} and {command})"));
     }
     Ok(())
@@ -176,9 +200,11 @@ fn uleb(data: &[u8], at: &mut usize) -> Result<u64, String> {
     let mut value = 0u64;
     let mut shift = 0u32;
     loop {
+        // alloc: error path
         let byte = *data.get(*at).ok_or_else(|| format!("a ULEB128 at {start:#x} runs past the end"))?;
         *at += 1;
         if shift > 63 || (shift == 63 && byte & 0x7e != 0) {
+            // alloc: error path
             return Err(format!("a ULEB128 at {start:#x} is too long"));
         }
         value |= u64::from(byte & 0x7f) << shift;
@@ -194,6 +220,7 @@ fn cstring<'a>(data: &'a [u8], at: &mut usize) -> Result<&'a [u8], String> {
     let len = rest
         .iter()
         .position(|&it| it == 0)
+        // alloc: error path
         .ok_or_else(|| format!("a string at {:#x} runs past the end", *at))?;
     *at += len + 1;
     Ok(&rest[..len])
@@ -205,12 +232,13 @@ struct Sections<'a> {
     all: &'a [Section],
     /// The non-empty ones by address, when no two overlap (as every linker writes them):
     /// then at most one holds an address, the one `all`'s first match finds.
-    sorted: Option<Vec<Section>>,
+    sorted: Option<SectionList>,
 }
 
 impl<'a> Sections<'a> {
     fn new(all: &'a [Section]) -> Sections<'a> {
-        let mut sorted: Vec<Section> = all.iter().copied().filter(|it| it.size != 0).collect();
+        let mut sorted = SectionList::new();
+        sorted.extend(all.iter().copied().filter(|it| it.size != 0));
         radix::sort_copy_by_key(&mut sorted, |it| it.addr);
         let disjoint = sorted.windows(2).all(|it| it[0].addr.checked_add(it[0].size).is_some_and(|end| end <= it[1].addr));
         Sections { all, sorted: disjoint.then_some(sorted) }
@@ -258,14 +286,18 @@ fn trie_exports(
             _ => SymbolKind::Data,
         }
     };
-    let mut out = Vec::new();
-    let mut seen = vec![0u64; data.len().div_ceil(64)];
-    let mut name: Vec<u8> = Vec::new();
-    let mut stack: Vec<Edge> = Vec::new();
+    // A node takes at least 4 bytes (its info's size, flags and address, its child count) and
+    // the edge to it at least 2 (an empty label's NUL, its offset): at most one export per 6
+    // bytes of a trie whose nodes don't overlap, so `out` is sized once.
+    let mut out = Vec::with_capacity(data.len() / 6 + 1);
+    let mut seen = vec![0u64; data.len().div_ceil(64)]; // alloc: one bitset per trie, sized exactly
+    let mut name: SmallVec<[u8; NAME_INLINE]> = SmallVec::new();
+    let mut stack: SmallVec<[Edge; EDGES_INLINE]> = SmallVec::new();
     let mut node = 0usize;
     loop {
         let (word, bit) = (node / 64, 1u64 << (node % 64));
         if seen[word] & bit != 0 {
+            // alloc: error path
             return Err(format!("node {node:#x} is reached twice (a cycle)"));
         }
         seen[word] |= bit;
@@ -276,13 +308,16 @@ fn trie_exports(
                 .ok()
                 .and_then(|it| at.checked_add(it))
                 .filter(|&it| it <= data.len())
+                // alloc: error path
                 .ok_or_else(|| format!("node {node:#x}'s export info runs past the end"))?;
             let info = &data[at..end];
             let (kind, weak) = export(info, &classify)
+                // alloc: error path
                 .map_err(|what| format!("node {node:#x}: {what}"))?;
             out.push(SharedSymbol { name: super::push_core_name(names, &name)?, version: None, kind, weak });
             at = end;
         }
+        // alloc: error path
         let count = *data.get(at).ok_or_else(|| format!("node {node:#x} runs past the end"))?;
         at += 1;
         let first = stack.len();
@@ -293,6 +328,7 @@ fn trie_exports(
             let child = usize::try_from(child)
                 .ok()
                 .filter(|&it| it < data.len())
+                // alloc: error path
                 .ok_or_else(|| format!("node {node:#x} has a child at {child:#x}, out of range"))?;
             stack.push(Edge { label: label as u32, len: len as u32, child: child as u32, parent: name.len() as u32 });
         }
@@ -400,7 +436,7 @@ pub(crate) fn trie_differential(trie: &[u8]) -> Result<bool, String> {
 }
 
 /// What a terminal node's export info says: the symbol's kind and whether it is weak.
-fn export(info: &[u8], classify: &dyn Fn(u64) -> SymbolKind) -> Result<(SymbolKind, bool), String> {
+fn export(info: &[u8], classify: &impl Fn(u64) -> SymbolKind) -> Result<(SymbolKind, bool), String> {
     let known = u64::from(
         macho::EXPORT_SYMBOL_FLAGS_KIND_MASK
             | macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
@@ -410,12 +446,14 @@ fn export(info: &[u8], classify: &dyn Fn(u64) -> SymbolKind) -> Result<(SymbolKi
     let mut at = 0;
     let flags = uleb(info, &mut at)?;
     if flags & !known != 0 {
+        // alloc: error path
         return Err(format!("unknown export flags {:#x}", flags & !known));
     }
     let weak = flags & u64::from(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION) != 0;
     let kind = (flags & u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_MASK)) as u32;
     let tls = kind == macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL;
     if kind > macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE {
+        // alloc: error path
         return Err(format!("unknown export kind {kind}"));
     }
     let kind = if flags & u64::from(macho::EXPORT_SYMBOL_FLAGS_REEXPORT) != 0 {
@@ -467,6 +505,7 @@ fn symtab_exports(
                 let section = usize::from(index)
                     .checked_sub(1)
                     .and_then(|it| sections.get(it))
+                    // alloc: error path
                     .ok_or_else(|| format!("a symbol in section {index}, which does not exist"))?;
                 if section.flags & macho::SECTION_TYPE == macho::S_THREAD_LOCAL_VARIABLES {
                     SymbolKind::Tls
@@ -478,6 +517,7 @@ fn symtab_exports(
             }
             macho::N_ABS => SymbolKind::Data,
             macho::N_INDR => SymbolKind::Other,
+            // alloc: error path
             other => return Err(format!("a symbol of unknown type {other:#x}")),
         };
         let name = nlist.name(endian, table.strings()).map_err(err)?;
@@ -1009,5 +1049,50 @@ mod tests {
         assert_eq!(at, max.len());
         let over = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
         assert!(uleb(&over, &mut 0).unwrap_err().contains("too long"));
+    }
+
+    /// Reading a library allocates its install name, its one re-export and their list, the
+    /// name arena, the symbols and the trie's bitset: nothing per export or per section.
+    #[test]
+    fn read_allocation_budget() {
+        let bytes = with_trie(macho::CPU_TYPE_ARM64, &sample_trie());
+        let shared = blaze_alloc_count::assert_at_most(6, "dylib::read of a library with a trie", || {
+            read("libfoo.dylib", &bytes, Arch::Aarch64)
+        })
+        .unwrap();
+        assert_eq!(shared.symbols.len(), 7);
+    }
+
+    /// The walk allocates its symbols and its bitset, once each, whatever the trie's size: a
+    /// name up to `NAME_INLINE` bytes and up to `EDGES_INLINE` pending edges stay on the stack,
+    /// and the names go to the caller's arena, here big enough.
+    #[test]
+    fn trie_walk_allocation_budget() {
+        let sections = test_sections();
+        let mut rng = Rng(0xa11c);
+        let wide = Node {
+            terminal: Vec::new(),
+            children: (0..40).map(|_| (LABELS[rng.below(LABELS.len())], random_node(&mut rng, 3))).collect(),
+        };
+        for trie in [sample_trie(), build_trie(&random_node(&mut rng, 0)), build_trie(&wide)] {
+            let mut sized = Names::default();
+            let expected = trie_exports(&trie, 0, &sections, &mut sized).unwrap().len();
+            let mut names = Names::with_capacity(sized.bytes());
+            let (symbols, used) = blaze_alloc_count::measure(|| trie_exports(&trie, 0, &sections, &mut names));
+            assert_eq!(symbols.unwrap().len(), expected);
+            assert!(used.allocations <= 2, "{} allocations walking a trie of {} bytes", used.allocations, trie.len());
+        }
+    }
+
+    /// Classifying an export's address allocates nothing: the sections are kept inline and
+    /// sorted in place.
+    #[test]
+    fn sections_allocate_nothing() {
+        let all = test_sections();
+        let found = blaze_alloc_count::assert_at_most(0, "Sections::new and Sections::find", || {
+            let sections = Sections::new(&all);
+            (0..0x5000u64).step_by(8).filter(|&addr| sections.find(addr).is_some()).count()
+        });
+        assert!(found > 0);
     }
 }

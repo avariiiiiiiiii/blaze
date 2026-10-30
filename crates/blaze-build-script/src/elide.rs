@@ -45,9 +45,9 @@ pub fn elide(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Option<Vec<u8>>
         return None;
     }
     let source = std::str::from_utf8(source).ok()?;
-    let limit = PRINTED_PER_BYTE * source.len();
+    let len = source.len();
     let source = lex::normalize(source);
-    let printed = printed(Tokens::new(&source).ok()?, limit)?;
+    let printed = printed(Tokens::new(&source).ok()?, len)?;
     directives_only(&printed).then(|| printed.into_bytes())
 }
 
@@ -116,9 +116,12 @@ pub fn verify(elided: &[u8], ran: &[u8]) -> Result<(), Error> {
         let (said, printed) = (elided_lines.next(), ran_lines.next());
         if said != printed {
             let shown = |it: Option<&[u8]>| match it {
+                // alloc: error path.
                 Some(it) => format!("{:?}", String::from_utf8_lossy(it)),
+                // alloc: error path.
                 None => "nothing".to_owned(),
             };
+            // alloc: error path.
             return Err(Error(format!(
                 "the elided build script's output differs from its run's at line {line}: \
                  elision says {}, the run printed {}",
@@ -159,6 +162,9 @@ fn may_open_main(source: &[u8]) -> bool {
 /// input byte) with room for `String`'s doubling, and no real script comes near it.
 const PRINTED_PER_BYTE: usize = 16;
 
+/// The arguments a macro call is read with before they are grown, as many as most calls have.
+const ARGS: usize = 8;
+
 /// What is printed so far, never longer than `limit` bytes.
 struct Printed {
     text: String,
@@ -176,9 +182,9 @@ impl Printed {
     }
 }
 
-/// What the script of `tokens` prints, if it is of the forms read and prints no more than
-/// `limit` bytes.
-fn printed(mut tokens: Tokens<'_>, limit: usize) -> Option<String> {
+/// What the script of `tokens`, whose source is `len` bytes, prints, if it is of the forms read
+/// and prints no more than [`PRINTED_PER_BYTE`] bytes per byte of it.
+fn printed(mut tokens: Tokens<'_>, len: usize) -> Option<String> {
     let mut token = next(&mut tokens)?;
     while token.kind == Kind::InnerDoc {
         token = next(&mut tokens)?;
@@ -194,8 +200,10 @@ fn printed(mut tokens: Tokens<'_>, limit: usize) -> Option<String> {
     if !head_ok {
         return None;
     }
-    let mut out = Printed { text: String::new(), limit };
-    let mut args: Vec<Token<'_>> = Vec::new();
+    // alloc: the printed text, which is the result: a script of directives prints less than it is.
+    let mut out = Printed { text: String::with_capacity(len), limit: PRINTED_PER_BYTE * len };
+    // alloc: setup, once per script read: the arguments of each macro call in turn.
+    let mut args: Vec<Token<'_>> = Vec::with_capacity(ARGS);
     let mut scratch = Scratch::default();
     let mut token = next(&mut tokens)?;
     while !token.is_punct('}') {
@@ -371,7 +379,5 @@ fn write_arg(token: &Token<'_>, out: &mut Printed, scratch: &mut String) -> Opti
     }
 }
 
-#[cfg(test)]
-mod reference;
 #[cfg(test)]
 mod tests;

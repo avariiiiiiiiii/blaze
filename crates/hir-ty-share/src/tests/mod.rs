@@ -16,26 +16,38 @@ use hir_ty::{
     consteval::usize_const,
     db::HirDatabase,
     intrinsic::Intrinsic,
-    mir::MirOptLevel,
+    mir::{MirOptLevel, MirOptions},
     next_solver::{GenericArg, GenericArgs, ParamEnv},
 };
 use hir_ty_mir::mir::{monomorphized, print_mir_body};
 use test_fixture::WithFixture;
 
 use crate::{
-    Class, Levels, MirLevels, ShareDef, ShareInstance, ShareKey, Unshared, classify, share_key,
+    BodyOptions, Class, OptionsSet, ShareDef, ShareInstance, ShareKey, Unshared, classify,
+    share_key,
 };
 use db::TestDB;
 
-const RUNTIME: MirLevels = MirLevels {
-    lang: Levels::of(&[MirOptLevel::Off]),
-    other: Levels::of(&[MirOptLevel::Off]),
+const fn options(level: MirOptLevel, ub_checks: bool) -> MirOptions {
+    MirOptions { level, ub_checks, lifetime_markers: true }
+}
+
+const OFF: MirOptions = options(MirOptLevel::Off, false);
+const DEBUG: MirOptions = options(MirOptLevel::Debug, false);
+const DEBUG_CHECKED: MirOptions = options(MirOptLevel::Debug, true);
+const RELEASE: MirOptions = options(MirOptLevel::Release, false);
+
+const RUNTIME: BodyOptions =
+    BodyOptions { lang: OptionsSet::of(&[OFF]), other: OptionsSet::of(&[OFF]) };
+
+/// What a build of debug units with and without debug assertions and release units asks.
+const EVERY_LEVEL: BodyOptions = BodyOptions {
+    lang: OptionsSet::of(&[RELEASE]),
+    other: OptionsSet::of(&[OFF, DEBUG, DEBUG_CHECKED, RELEASE]),
 };
 
-const EVERY_LEVEL: MirLevels = MirLevels {
-    lang: Levels::of(&[MirOptLevel::Release]),
-    other: Levels::of(&[MirOptLevel::Off, MirOptLevel::Debug, MirOptLevel::Release]),
-};
+const UB_CHECKED: BodyOptions =
+    BodyOptions { lang: OptionsSet::of(&[RELEASE]), other: OptionsSet::of(&[DEBUG_CHECKED]) };
 
 const MINICORE: &str = "sized, copy, clone, drop, size_of, unsize, coerce_unsized, fn";
 
@@ -79,6 +91,7 @@ pub fn tid<T: 'static>() -> u128 { type_id::<T>() }
 pub fn name<T>() -> &'static str { type_name::<T>() }
 pub fn nd<T>() -> bool { needs_drop::<T>() }
 pub fn hold<T>(x: T) { let _held = x; }
+pub fn read<T: Copy>(p: *const T) -> T { unsafe { *p } }
 pub fn counter<T>() -> &'static u32 { static C: u32 = 7; &C }
 
 pub trait K { const V: u32; }
@@ -175,10 +188,15 @@ fn env(db: &TestDB) -> hir_ty::traits::StoredParamEnvAndCrate {
     ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: db.test_crate() }.store()
 }
 
-fn key_at(db: &TestDB, levels: MirLevels, func: &str, args: &[Arg]) -> Result<ShareKey, Unshared> {
+fn key_at(
+    db: &TestDB,
+    options: BodyOptions,
+    func: &str,
+    args: &[Arg],
+) -> Result<ShareKey, Unshared> {
     hir_ty::attach_db(db, || {
         let instance = instance(db, func, args);
-        share_key(db, &instance, &env(db), levels).clone()
+        share_key(db, &instance, &env(db), options).clone()
     })
 }
 
@@ -238,12 +256,32 @@ fn intrinsic_classes() {
 }
 
 #[test]
-fn levels_are_a_set() {
-    let levels = Levels::of(&[MirOptLevel::Release, MirOptLevel::Off]);
-    assert!(levels.contains(MirOptLevel::Off) && levels.contains(MirOptLevel::Release));
-    assert!(!levels.contains(MirOptLevel::Debug));
-    assert_eq!(levels.iter().collect::<Vec<_>>(), [MirOptLevel::Off, MirOptLevel::Release]);
-    assert!(Levels::of(&[]).is_empty());
+fn options_are_a_set() {
+    let set = OptionsSet::of(&[RELEASE, OFF, DEBUG_CHECKED]);
+    assert!(set.contains(OFF) && set.contains(RELEASE) && set.contains(DEBUG_CHECKED));
+    assert!(!set.contains(DEBUG));
+    assert!(!set.contains(MirOptions { lifetime_markers: false, ..OFF }));
+    assert_eq!(set.iter().collect::<Vec<_>>(), [OFF, DEBUG_CHECKED, RELEASE]);
+    assert!(OptionsSet::of(&[]).is_empty() && OptionsSet::EMPTY.is_empty());
+    let every: Vec<MirOptions> = [OFF, DEBUG, DEBUG_CHECKED, RELEASE]
+        .into_iter()
+        .flat_map(|it| [it, MirOptions { lifetime_markers: false, ..it }])
+        .chain([true, false].map(|lifetime_markers| MirOptions {
+            level: MirOptLevel::Release,
+            ub_checks: true,
+            lifetime_markers,
+        }))
+        .chain([true, false].map(|lifetime_markers| MirOptions {
+            level: MirOptLevel::Off,
+            ub_checks: true,
+            lifetime_markers,
+        }))
+        .collect();
+    let all = OptionsSet::of(&every);
+    assert_eq!(all.iter().count(), 12, "each of the twelve options has its own bit");
+    let mut sorted = every.clone();
+    sorted.sort();
+    assert_eq!(all.iter().collect::<Vec<_>>(), sorted, "in `MirOptions`' order");
 }
 
 #[test]
@@ -355,11 +393,25 @@ fn a_shim_is_unshared() {
 #[test]
 fn no_level_is_an_error_and_every_level_is_keyed() {
     let db = fixture();
-    let none = MirLevels { lang: Levels::of(&[]), other: Levels::of(&[]) };
-    assert_eq!(key_at(&db, none, "id", &[Ty("RefP")]), Err(Unshared::NoLevels));
+    let none = BodyOptions { lang: OptionsSet::EMPTY, other: OptionsSet::EMPTY };
+    assert_eq!(key_at(&db, none, "id", &[Ty("RefP")]), Err(Unshared::NoOptions));
     let every = |ty| key_at(&db, EVERY_LEVEL, "outer", &[Ty(ty)]).expect("a key at every level");
     assert_eq!(every("RefP"), every("RefQ"));
-    assert_ne!(every("RefP"), key(&db, "outer", &[Ty("RefP")]), "the levels are in the key");
+    assert_ne!(every("RefP"), key(&db, "outer", &[Ty("RefP")]), "the options are in the key");
+}
+
+/// With UB checks, `CheckAlignment` and `CheckNull` add code at each read through a raw
+/// pointer, `<T as SizedTypeProperties>::ALIGN` and `SIZE` of its pointee: the key reads the
+/// body codegen compiles with those options. The fixture has no panic handler, so the passes
+/// add nothing here (`check_pointers`); this checks the body is the one asked with the
+/// options and that each options is in the key.
+#[test]
+fn a_ub_checked_body_is_keyed_as_compiled() {
+    let db = fixture();
+    let checked = |ty| key_at(&db, UB_CHECKED, "read", &[Ty(ty)]).expect("a UB-checked key");
+    assert_eq!(checked("RefP"), checked("RefQ"), "pointers of one alignment share");
+    assert_ne!(checked("RefP"), checked("U32"), "pointees of two alignments do not");
+    assert_ne!(checked("RefP"), key(&db, "read", &[Ty("RefP")]), "the UB checks are in the key");
 }
 
 /// The property under the key: for each body and each pair of arguments, equal keys mean the

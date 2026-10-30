@@ -12,18 +12,18 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
-    hash::BuildHasher,
     sync::Arc,
 };
 
 use blaze_ids::ContentId;
+use blaze_image::Corrupt;
 use hashbrown::{HashTable, hash_table};
-use rustc_hash::FxBuildHasher;
 
 use crate::{
     Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError,
+    image::Bytes,
     reader::Reader,
-    store::{Building, DIR, Entries, Shape, Table, Writer, mode_byte, mode_of},
+    store::{Building, DIR, Entries, Shape, Table, Writer, mode_byte, mode_of, name_hash},
 };
 
 /// A node of a [`Tree`]. Only meaningful for the tree that made it, and only until it collects.
@@ -44,8 +44,21 @@ pub(crate) const DIR_MODE: u32 = 0o040000;
 /// How many symlinks one path may pass through, as Linux allows.
 const MAX_LINKS: usize = 40;
 
-/// A file's bytes and mode.
-pub(crate) type Blob = (Arc<[u8]>, Mode);
+/// A file a transaction puts at a path, with its mode: one the tree has (the base's, or one
+/// moved), kept as its node so it is never read or hashed again; or new bytes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Blob {
+    Node(NodeId, Mode),
+    New(Arc<[u8]>, Mode),
+}
+
+impl Blob {
+    fn mode(&self) -> Mode {
+        match self {
+            Blob::Node(_, mode) | Blob::New(_, mode) => *mode,
+        }
+    }
+}
 
 /// What a transaction leaves at each path it touched: a new file, or nothing.
 // BTreeMap: range queries for the paths under a directory.
@@ -93,8 +106,8 @@ impl<'a> Dir<'a> {
 /// Every node and name made so far, interned. The one writer of the store readers share.
 pub(crate) struct Tree {
     store: Writer,
-    /// Each name by the hash of its bytes (computed once and kept, so growing never hashes
-    /// again).
+    /// Each name after the base's by its [`name_hash`] (computed once and kept, so growing
+    /// never hashes again); the base's are found by the image's own index.
     name_index: HashTable<(u64, u32)>,
     empty: NodeId,
     /// Tables replaced by collections and not freed yet.
@@ -106,8 +119,14 @@ pub(crate) struct Tree {
 
 impl Tree {
     pub(crate) fn new() -> Tree {
+        Tree::over(Writer::new())
+    }
+
+    /// The tree whose nodes `store` holds, a restored base or nothing: the empty root is
+    /// found by its ID, or made.
+    pub(crate) fn over(store: Writer) -> Tree {
         let mut tree = Tree {
-            store: Writer::new(),
+            store,
             name_index: HashTable::new(),
             empty: NodeId(0),
             retired: 0,
@@ -123,7 +142,7 @@ impl Tree {
         Reader::new(self.store.shared())
     }
 
-    fn table(&self) -> &Table {
+    pub(crate) fn table(&self) -> &Table {
         self.store.table()
     }
 
@@ -166,14 +185,30 @@ impl Tree {
         shape.is_dir().then(|| Dir(self.table().entries(shape)))
     }
 
-    /// A file's bytes; `None` for a directory.
-    pub(crate) fn bytes(&self, node: NodeId) -> Option<&Arc<[u8]>> {
+    /// A file's bytes, read in place; `None` for a directory. A file of the image whose page
+    /// group fails its CRC32C is `Err`, never read.
+    pub(crate) fn bytes(&self, node: NodeId) -> Result<Option<&[u8]>, Corrupt> {
         let shape = self.shape(node);
-        (!shape.is_dir()).then(|| self.table().blob(shape))
+        if shape.is_dir() {
+            return Ok(None);
+        }
+        self.table().blob(shape).map(Some)
+    }
+
+    /// A file's bytes, held for as long as wanted: one count of the file's or the image's.
+    pub(crate) fn owned(&self, node: NodeId) -> Result<Option<Bytes>, Corrupt> {
+        let shape = self.shape(node);
+        if shape.is_dir() {
+            return Ok(None);
+        }
+        self.table().bytes(shape).map(Some)
     }
 
     pub(crate) fn name(&mut self, name: &str) -> NameId {
-        let hash = FxBuildHasher.hash_one(name.as_bytes());
+        let hash = name_hash(name.as_bytes());
+        if let Some(id) = self.store.names().find_base(hash, name.as_bytes()) {
+            return NameId(id);
+        }
         let Tree { store, name_index, .. } = self;
         let same = |&(at, id): &(u64, u32)| at == hash && store.names().get(id) == name.as_bytes();
         match name_index.entry(hash, same, |&(at, _)| at) {
@@ -194,10 +229,44 @@ impl Tree {
         self.store.names().str(name.0)
     }
 
-    /// The node of a file with these bytes.
+    /// The node of a file with these bytes. A node of the image with this ID whose page group
+    /// failed its check is given these bytes ([`Tree::repair`]): writing a file again, as
+    /// the watcher does when it finds one unreadable, mends it.
     pub(crate) fn file(&mut self, bytes: Arc<[u8]>) -> NodeId {
         let id = ContentId::of(FILE_DOMAIN, &bytes);
+        if let Some(node) = self.table().find(&id).map(NodeId) {
+            if self.bytes(node).is_err() {
+                self.repair(node, bytes);
+            }
+            return node;
+        }
         NodeId(self.store.file(id, bytes))
+    }
+
+    /// Publishes the table with every node where it is and `node`'s bytes `bytes` (which hash
+    /// to its ID), in place of its range of the image: as a collection publishes, so readers
+    /// move to it at once. Once per corrupt file, so the copy of the columns is rare.
+    fn repair(&mut self, node: NodeId, bytes: Arc<[u8]>) {
+        let old = self.store.table();
+        let len = old.len();
+        let mut next = Building::after(old, len as usize);
+        let mut columns = Vec::new();
+        for at in 0..len {
+            let (id, shape) = (*old.id(at), old.shape(at));
+            let made = if shape.is_dir() {
+                let from = old.entries(shape);
+                columns.clear();
+                let entry = |k: usize| (from.names[k], from.nodes[k], from.modes[k]);
+                columns.extend((0..from.len()).map(entry));
+                next.dir(id, &columns)
+            } else if at == node.0 {
+                next.file(id, bytes.clone())
+            } else {
+                next.file_of(id, old, shape)
+            };
+            assert_eq!(made, at, "a repair keeps every node's number");
+        }
+        self.retired = self.store.replace(next);
     }
 
     /// The node of a directory with these entries, in any order; names must be distinct.
@@ -268,14 +337,25 @@ impl Tree {
     }
 
     /// The bytes of the file at `path` under `root`.
-    pub(crate) fn read(&self, root: NodeId, path: &str) -> Option<&Arc<[u8]>> {
-        self.bytes(self.lookup(root, path)?)
+    pub(crate) fn read(&self, root: NodeId, path: &str) -> Result<Option<&[u8]>, Corrupt> {
+        match self.lookup(root, path) {
+            Some(node) => self.bytes(node),
+            None => Ok(None),
+        }
     }
 
-    /// The file at `path` under `root`, with its mode.
+    /// The file at `path` under `root`, as its node and mode: nothing of it is read.
     pub(crate) fn blob(&self, root: NodeId, path: &str) -> Option<Blob> {
         let (node, mode) = self.entry(root, path)?;
-        Some((self.bytes(node)?.clone(), mode))
+        (!self.is_dir(node)).then_some(Blob::Node(node, mode))
+    }
+
+    /// A staged file's bytes.
+    fn staged_bytes<'a>(&'a self, blob: &'a Blob) -> Result<&'a [u8], Corrupt> {
+        match blob {
+            Blob::Node(node, _) => Ok(self.bytes(*node)?.expect("a staged node is a file")),
+            Blob::New(bytes, _) => Ok(bytes),
+        }
     }
 
     /// The node at `path` under `root` with every symlink on the way followed, as the system
@@ -318,7 +398,7 @@ impl Tree {
                         let link: Vec<&str> =
                             names.iter().map(String::as_str).chain([name]).collect();
                         let link = link.join("/");
-                        let bytes = self.bytes(child).expect("a symlink is a file");
+                        let bytes = self.bytes(child)?.expect("a symlink is a file");
                         let target = String::from_utf8_lossy(bytes).into_owned();
                         links += 1;
                         let leaves = target.is_empty() || target.starts_with('/');
@@ -454,7 +534,7 @@ impl Tree {
         if !gone && let Some(dir) = self.lookup(base, path).filter(|it| self.is_dir(*it)) {
             for (file, node, mode) in self.files(dir, Mode::Regular, path) {
                 if !pending.contains_key(&file) && !shadowed(pending, &file) {
-                    found.push((file, (self.bytes(node).expect("a file").clone(), mode)));
+                    found.push((file, Blob::Node(node, mode)));
                 }
             }
         }
@@ -497,11 +577,12 @@ impl Tree {
             Op::Write { path, bytes, mode } => {
                 no_file_above(pending, path)?;
                 file_at(pending, path)?;
-                pending.insert(path.clone(), Some((Arc::from(bytes.as_slice()), *mode)));
+                pending.insert(path.clone(), Some(Blob::New(Arc::from(bytes.as_slice()), *mode)));
             }
             Op::Edit { path, at, len, bytes } => {
-                let (old, mode) =
+                let blob =
                     file_at(pending, path)?.ok_or_else(|| OpError::NotFound(path.clone()))?;
+                let (old, mode) = (self.staged_bytes(&blob)?, blob.mode());
                 let size = old.len() as u64;
                 if at.checked_add(*len).is_none_or(|end| end > size) {
                     return Err(OpError::OutOfRange {
@@ -513,7 +594,7 @@ impl Tree {
                 }
                 let (at, end) = (*at as usize, (*at + *len) as usize);
                 let new: Arc<[u8]> = [&old[..at], bytes, &old[end..]].concat().into();
-                pending.insert(path.clone(), Some((new, mode)));
+                pending.insert(path.clone(), Some(Blob::New(new, mode)));
             }
             Op::Delete { path } => match file_at(pending, path) {
                 Ok(Some(_)) => {
@@ -592,7 +673,10 @@ impl Tree {
             };
             let child = match here {
                 Some(here) if !deeper.iter().any(|it| it.1.is_some()) => {
-                    here.clone().map(|(bytes, mode)| (self.file(bytes), mode))
+                    here.clone().map(|blob| match blob {
+                        Blob::Node(node, mode) => (node, mode),
+                        Blob::New(bytes, mode) => (self.file(bytes), mode),
+                    })
                 }
                 // A directory, made of what was there if that was one and nothing replaced it.
                 _ => {
@@ -716,8 +800,8 @@ impl Tree {
             }
         }
         let count = reached.iter().map(|it| it.count_ones() as usize).sum();
-        let mut next = Building::new(count);
         let old = self.store.table();
+        let mut next = Building::after(old, count);
         let mut renumbered: Vec<Option<NodeId>> = vec![None; len];
         let mut columns = Vec::new();
         // Children have smaller numbers than their parents, so they are renumbered first.
@@ -735,7 +819,7 @@ impl Tree {
                 }));
                 next.dir(id, &columns)
             } else {
-                next.file(id, old.blob(shape).clone())
+                next.file_of(id, old, shape)
             };
             renumbered[at as usize] = Some(NodeId(node));
         }

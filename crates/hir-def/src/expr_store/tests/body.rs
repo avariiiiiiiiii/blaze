@@ -1,6 +1,11 @@
 mod block;
 
-use crate::{DefWithBodyId, ModuleDefId, hir::MatchArm, nameres::crate_def_map, test_db::TestDB};
+use crate::{
+    DefWithBodyId, ModuleDefId,
+    hir::{Item, MatchArm, Statement},
+    nameres::crate_def_map,
+    test_db::TestDB,
+};
 use expect_test::{Expect, expect};
 use la_arena::RawIdx;
 use test_fixture::WithFixture;
@@ -77,7 +82,7 @@ fn check_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     expect.assert_eq(&actual);
 }
 
-/// A body that lowers to every kind of expression and of pattern.
+/// A body that lowers to every kind of expression, pattern and statement.
 const EVERY_VARIANT: &str = r#"
 //- minicore: range, fmt
 struct S { a: i32, b: i32 }
@@ -140,6 +145,10 @@ fn main(x: i32, s: S, v: &[i32], r: &mut i32) {
     let box bx = b;
     let builtin # deref(d) = e;
     let Some(o) = opt else { return; };
+    let typed: i32 = 1;
+    super let kept = 1;
+    struct Local;
+    macro_rules! local { () => {} }
     do yeet x;
     become f(x);
     return x
@@ -259,6 +268,8 @@ fn every_variant_pretty_prints() {
                 let Some(o) = opt else {
                     return;
                 };
+                let typed: i32 = 1;
+                let kept = 1;
                 do yeet x;
                 become f(
                     x,
@@ -333,6 +344,25 @@ fn pat_variant(pat: Pat<'_>) -> usize {
 }
 const PAT_VARIANTS: usize = 17;
 
+/// [`expr_variant`] for statements, each optional field of a `let` and `super` apart, as each
+/// is a word of its own in `extra` or a flag.
+fn statement_variants(statement: Statement<'_>) -> impl Iterator<Item = usize> {
+    let variants: [Option<usize>; 5] = match statement {
+        Statement::Let { pat: _, type_ref, initializer, else_branch, is_super } => [
+            Some(0),
+            type_ref.map(|_| 4),
+            initializer.map(|_| 5),
+            else_branch.map(|_| 6),
+            is_super.then_some(7),
+        ],
+        Statement::Expr { expr: _, has_semi } => [Some(1), has_semi.then_some(8), None, None, None],
+        Statement::Item(Item::MacroDef(_)) => [Some(2), None, None, None, None],
+        Statement::Item(Item::Other) => [Some(3), None, None, None, None],
+    };
+    variants.into_iter().flatten()
+}
+const STATEMENT_VARIANTS: usize = 9;
+
 #[test]
 fn every_variant_is_lowered() {
     let (db, def) = lower(EVERY_VARIANT);
@@ -345,6 +375,18 @@ fn every_variant_is_lowered() {
     body.pats().for_each(|(_, pat)| pats[pat_variant(pat)] = true);
     let missing: Vec<_> = (0..PAT_VARIANTS).filter(|&it| !pats[it]).collect();
     assert!(missing.is_empty(), "pattern variants not lowered, by place in `Pat`: {missing:?}");
+    let mut statements = [false; STATEMENT_VARIANTS];
+    let mut expression_without_semi = false;
+    for (_, expr) in body.exprs() {
+        let Expr::Block { statements: block, .. } = expr else { continue };
+        for statement in block {
+            statement_variants(statement).for_each(|it| statements[it] = true);
+            expression_without_semi |= matches!(statement, Statement::Expr { has_semi: false, .. });
+        }
+    }
+    let missing: Vec<_> = (0..STATEMENT_VARIANTS).filter(|&it| !statements[it]).collect();
+    assert!(missing.is_empty(), "statement variants not lowered, by `statement_variants`: {missing:?}");
+    assert!(expression_without_semi, "no expression statement without `;`");
 }
 
 /// `docs/v2/plan/design/data.md`: a HIR expression takes at most 12 bytes of its own columns,
@@ -364,14 +406,20 @@ fn every_variant_fits_the_column_budget() {
     let pat_bytes = columns.pat_kind.len() + 4 * columns.pat_data.len();
     assert!(expr_bytes <= 12 * exprs, "{expr_bytes} bytes for {exprs} expressions");
     assert!(pat_bytes <= 12 * pats, "{pat_bytes} bytes for {pats} patterns");
+    let statements = columns.stmt_kind.len();
+    assert_eq!(columns.stmt_data.len(), statements, "one data word per statement");
+    let statement_bytes = columns.stmt_kind.len() + 4 * columns.stmt_data.len();
+    assert_eq!(statement_bytes, 5 * statements, "{statement_bytes} bytes for {statements} statements");
 
     let per = |n: usize, of: usize| n as f64 / of as f64;
     println!(
-        "{exprs} expressions, {pats} patterns: {:.2} bytes per expression in `expr_kind` and \
-         `expr_data`, {:.2} per pattern; {:.2} words of `extra` per expression ({} words, \
-         shared with the patterns); {:.2} `expr_lists` entries per expression",
+        "{exprs} expressions, {pats} patterns, {statements} statements: {:.2} bytes per \
+         expression in `expr_kind` and `expr_data`, {:.2} per pattern, {:.2} per statement; \
+         {:.2} words of `extra` per expression ({} words, shared with the patterns and the \
+         `let`s); {:.2} `expr_lists` entries per expression",
         per(expr_bytes, exprs),
         per(pat_bytes, pats),
+        per(statement_bytes, statements),
         per(columns.extra.len(), exprs),
         columns.extra.len(),
         per(columns.expr_lists.len(), exprs),

@@ -1,0 +1,32 @@
+[package]
+name = "blaze-mem"
+description = "blaze v2's memory, the way a game engine manages it: frame allocators per worker, request and revision arenas, pools with worker caches, reserved regions that never move, generational handles, and per-subsystem counters (docs/v2/plan/design/memory.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-reclaim.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
+[lints]
+workspace = true

@@ -373,8 +373,14 @@ impl Files {
                 .expect("a source root's content is kept from when it is set")
                 .is_library;
             let durability = if is_library { Durability::HIGH } else { Durability::LOW };
-            let content =
-                self.write_text(writer, db, write.id, text.map(|text| (text, content)), Some(durability));
+            let file = view.files[write.at].file.id;
+            let content = self.write_text(
+                writer,
+                db,
+                write.id,
+                text.map(|text| (text, file, content)),
+                Some(durability),
+            );
             index_file(writer, write.id, content, &mut changed_roots);
             if !write.added {
                 change.set.push(write.id);
@@ -394,6 +400,7 @@ impl Files {
         roots.dedup();
         self.write_root_files(writer, db, &plan, &roots, &mut changed_roots);
         self.write_root_contents(writer, db, &changed_roots);
+        writer.named.publish(db);
 
         for &(_, id) in &plan.removed {
             writer.view_ids.remove(&id);

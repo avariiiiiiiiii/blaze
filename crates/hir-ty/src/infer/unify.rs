@@ -24,6 +24,7 @@ use crate::{
         infer::{
             DbInternerInferExt, InferCtxt, InferOk,
             at::At,
+            errors::FulfillmentError,
             snapshot::CombinedSnapshot,
             traits::{Obligation, ObligationCause, PredicateObligation},
         },
@@ -150,7 +151,8 @@ pub(crate) struct InferenceTable<'db> {
     pub(crate) infer_ctxt: InferCtxt<'db>,
     pub(super) fulfillment_cx: FulfillmentCtxt<'db>,
     pub(super) diverging_type_vars: VarSet,
-    pub(super) trait_errors: Vec<NextSolverError<'db>>,
+    /// Each converted once, when the solver returns it, as rustc's `FromSolverError` does.
+    trait_errors: Vec<FulfillmentError<'db>>,
 }
 
 impl<'db> InferenceTable<'db> {
@@ -379,7 +381,7 @@ impl<'db> InferenceTable<'db> {
             match result {
                 Ok(normalized_ty) => normalized_ty,
                 Err(errors) => {
-                    self.trait_errors.extend(errors);
+                    self.record_trait_errors(errors);
                     Ty::new_error(self.interner(), ErrorGuaranteed)
                 }
             }
@@ -403,7 +405,7 @@ impl<'db> InferenceTable<'db> {
             match result {
                 Ok(normalized_ct) => normalized_ct,
                 Err(errors) => {
-                    self.trait_errors.extend(errors);
+                    self.record_trait_errors(errors);
                     Const::new_error(self.interner(), ErrorGuaranteed)
                 }
             }
@@ -454,7 +456,16 @@ impl<'db> InferenceTable<'db> {
 
     pub(crate) fn select_obligations_where_possible(&mut self) {
         let errors = self.fulfillment_cx.try_evaluate_obligations(&self.infer_ctxt);
-        self.trait_errors.extend(errors);
+        self.record_trait_errors(errors);
+    }
+
+    pub(super) fn record_trait_errors(
+        &mut self,
+        errors: impl IntoIterator<Item = NextSolverError<'db>>,
+    ) {
+        let infcx = &self.infer_ctxt;
+        self.trait_errors
+            .extend(errors.into_iter().map(|error| error.into_fulfillment_error(infcx)));
     }
 
     pub(super) fn register_predicate(&mut self, obligation: PredicateObligation<'db>) {
@@ -543,23 +554,16 @@ impl<'db> InferenceTable<'db> {
 
     /// Whether a trait error that `emit_trait_errors` reports has been found so far.
     pub(super) fn has_trait_errors(&self) -> bool {
-        self.trait_errors.iter().any(|error| {
-            SolverDiagnostic::from_fulfillment_error(
-                &self.infer_ctxt,
-                &error.clone().into_fulfillment_error(&self.infer_ctxt),
-            )
-            .is_some()
-        })
+        self.trait_errors
+            .iter()
+            .any(|error| SolverDiagnostic::from_fulfillment_error(&self.infer_ctxt, error).is_some())
     }
 
     fn emit_trait_errors(&mut self, diagnostics: &mut ThinVec<InferenceDiagnostic>) {
-        diagnostics.extend(std::mem::take(&mut self.trait_errors).into_iter().filter_map(
-            |error| {
-                let error = error.into_fulfillment_error(&self.infer_ctxt);
-                SolverDiagnostic::from_fulfillment_error(&self.infer_ctxt, &error)
-                    .map(InferenceDiagnostic::SolverDiagnostic)
-            },
-        ));
+        diagnostics.extend(std::mem::take(&mut self.trait_errors).iter().filter_map(|error| {
+            SolverDiagnostic::from_fulfillment_error(&self.infer_ctxt, error)
+                .map(InferenceDiagnostic::SolverDiagnostic)
+        }));
     }
 }
 
@@ -813,6 +817,13 @@ pub(super) mod resolve_completely {
     }
 
     impl<'a, 'db> Resolver<'a, 'db> {
+        /// What makes deep normalization do anything to a term its caller has already
+        /// resolved: an alias that may not be rigid, an error (it taints the inference
+        /// context), or a variable left unresolved.
+        const NORMALIZE_FLAGS: TypeFlags = TypeFlags::HAS_NON_RIGID_ALIAS
+            .union(TypeFlags::HAS_ERROR)
+            .union(TypeFlags::HAS_INFER.difference(TypeFlags::HAS_RE_INFER));
+
         pub(super) fn new(
             ctx: &'a mut WriteBackCtxt<'db>,
             should_normalize: bool,
@@ -829,7 +840,12 @@ pub(super) mod resolve_completely {
         where
             T: Into<Term<'db>> + TypeSuperFoldable<DbInterner<'db>> + Copy,
         {
-            let value = if self.should_normalize {
+            // Without any of `NORMALIZE_FLAGS`, deep normalization registers no goal and gives
+            // `value` back, so its fulfillment context and rounds are skipped.
+            let value = if self.should_normalize
+                && (rustc_type_ir::Interner::renormalize_rigid_aliases(self.cx())
+                    || value.has_type_flags(Self::NORMALIZE_FLAGS))
+            {
                 // FIXME: This should not use a dummy span.
                 let cause = ObligationCause::new(Span::Dummy);
                 let at = self.ctx.table.at(&cause);
@@ -842,7 +858,7 @@ pub(super) mod resolve_completely {
                         value
                     }
                     Err(errors) => {
-                        self.ctx.table.trait_errors.extend(errors);
+                        self.ctx.table.record_trait_errors(errors);
                         value
                     }
                 }

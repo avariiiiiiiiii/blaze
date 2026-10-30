@@ -58,14 +58,16 @@ const _: () = assert!(size_of::<Unit<'static>>() <= 72);
 /// The functions `__wasm_call_ctors` calls, in order: the slots in the init array, each a
 /// function's index + 1.
 pub(super) fn init_functions(placed: &Placed<'_>) -> Result<Vec<u32>, String> {
-    let mut functions = Vec::new();
-    for (index, _) in placed.regions.iter().enumerate().filter(|(_, it)| it.class == Class::InitArray)
-    {
-        let bytes = placed.bytes(index);
+    let arrays = || {
+        let regions = placed.regions.iter().enumerate();
+        regions.filter(|(_, it)| it.class == Class::InitArray).map(|(index, _)| placed.bytes(index))
+    };
+    let mut functions = Vec::with_capacity(arrays().map(|it| it.len() / 4).sum());
+    for bytes in arrays() {
         if bytes.len() % 4 != 0 {
+            // alloc: error path
             return Err(format!("an init array of {} bytes, not of 4-byte slots", bytes.len()));
         }
-        functions.reserve(bytes.len() / 4);
         for slot in bytes.chunks_exact(4) {
             let slot = u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
             let function = slot
@@ -91,6 +93,7 @@ fn ctors_body(functions: &[u32]) -> Vec<u8> {
 fn stray(bytes: &[u8], addr: u64, class: &Class) -> Result<(), String> {
     match bytes.iter().position(|&it| it != 0) {
         None => Ok(()),
+        // alloc: error path
         Some(at) => Err(format!(
             "code at {} of the {class:?} region that is no function of the image's",
             addr + at as u64
@@ -101,48 +104,51 @@ fn stray(bytes: &[u8], addr: u64, class: &Class) -> Result<(), String> {
 /// The functions the module defines, by address in the code space, which is their order:
 /// the core numbers them so, after the imports. Headers are read in parallel.
 fn functions<'a>(placed: &'a Placed<'a>) -> Result<Vec<Unit<'a>>, String> {
-    let code: Vec<(usize, &Region)> = placed
-        .regions
-        .iter()
-        .enumerate()
-        .filter(|(_, it)| matches!(it.class, Class::Text | Class::Patch))
-        .collect();
+    let is_code = |it: &&Region| matches!(it.class, Class::Text | Class::Patch);
+    let mut code: Vec<(usize, &Region)> =
+        Vec::with_capacity(placed.regions.iter().filter(is_code).count());
+    code.extend(placed.regions.iter().enumerate().filter(|(_, it)| is_code(it)));
+    let is_ctors = |it: &&Region| it.class == Class::Synthetic(FUNCTIONS);
+    let ctors = placed.regions.iter().filter(is_ctors).count();
+    // Each function's slot made first, filled in parallel: one exact allocation.
+    let mut units: Vec<Unit<'a>> = Vec::with_capacity(placed.functions.len() + ctors);
+    units.resize(placed.functions.len(), Unit { addr: 0, name: None, header: None });
     // `Placed` is not `Sync` (its `symbol` lookup isn't): the closure takes its contents.
     let contents: &'a [&'a [u8]] = placed.contents;
-    let mut units: Vec<Unit<'a>> = placed
-        .functions
-        .par_iter()
-        .map(|function| {
-            let name = function.name.as_deref();
-            let &(index, region) = code
-                .iter()
-                .find(|(_, it)| (it.addr..it.addr + it.size).contains(&function.addr))
-                .ok_or_else(|| {
-                    format!(
-                        "the function {} at {} is in no region of code",
-                        name.unwrap_or("?"),
-                        function.addr
-                    )
-                })?;
-            let bytes = contents[index];
-            let at = (function.addr - region.addr) as usize;
-            let piece = usize::try_from(function.size)
-                .ok()
-                .and_then(|size| bytes.get(at..at.checked_add(size)?))
-                .ok_or_else(|| {
-                    format!("the function at {} reaches past its region's bytes", function.addr)
-                })?;
-            let header = Header::parse(piece)
-                .map_err(|e| format!("the function {}: {e}", name.unwrap_or("?")))?;
-            Ok(Unit { addr: function.addr, name, header: Some(header) })
-        })
-        .collect::<Result<Vec<Unit<'a>>, String>>()?;
-    units.reserve(1);
-    for region in placed.regions.iter().filter(|it| it.class == Class::Synthetic(FUNCTIONS)) {
+    units.par_iter_mut().zip(placed.functions.par_iter()).try_for_each(|(unit, function)| {
+        let name = function.name.as_deref();
+        let &(index, region) = code
+            .iter()
+            .find(|(_, it)| (it.addr..it.addr + it.size).contains(&function.addr))
+            .ok_or_else(|| {
+                // alloc: error path
+                format!(
+                    "the function {} at {} is in no region of code",
+                    name.unwrap_or("?"),
+                    function.addr
+                )
+            })?;
+        let bytes = contents[index];
+        let at = (function.addr - region.addr) as usize;
+        let piece = usize::try_from(function.size)
+            .ok()
+            .and_then(|size| bytes.get(at..at.checked_add(size)?))
+            .ok_or_else(|| {
+                // alloc: error path
+                format!("the function at {} reaches past its region's bytes", function.addr)
+            })?;
+        let header = Header::parse(piece)
+            // alloc: error path
+            .map_err(|e| format!("the function {}: {e}", name.unwrap_or("?")))?;
+        *unit = Unit { addr: function.addr, name, header: Some(header) };
+        Ok::<(), String>(())
+    })?;
+    for region in placed.regions.iter().filter(is_ctors) {
         units.push(Unit { addr: region.addr, name: Some("__wasm_call_ctors"), header: None });
     }
-    radix::sort_by_key(&mut units, |it| it.addr);
+    radix::sort_copy_by_key(&mut units, |it| it.addr);
     if let Some(pair) = units.windows(2).find(|it| it[0].addr == it[1].addr) {
+        // alloc: error path
         return Err(format!("two functions at {} in the code space", pair[0].addr));
     }
     // Every byte of code is some function's: a piece the core did not list would shift every
@@ -251,15 +257,12 @@ struct Imported<'a> {
 
 /// What each import is imported as, as the core says (its type encoded into `arena`).
 fn imports<'a>(placed: &'a Placed<'a>, arena: &'a [u8], spans: &[(usize, usize)]) -> Vec<Imported<'a>> {
-    placed
-        .imports
-        .iter()
-        .zip(spans)
-        .map(|(import, &(start, end))| {
-            let wasm = import.wasm.as_ref().expect("checked when the spans were made");
-            Imported { module: &wasm.module, field: &wasm.field, ty: &arena[start..end] }
-        })
-        .collect()
+    let mut imports = Vec::with_capacity(spans.len());
+    imports.extend(placed.imports.iter().zip(spans).map(|(import, &(start, end))| {
+        let wasm = import.wasm.as_ref().expect("checked when the spans were made");
+        Imported { module: &wasm.module, field: &wasm.field, ty: &arena[start..end] }
+    }));
+    imports
 }
 
 /// Checks that a 5-byte place at `at` is inside a body of `len` bytes.
@@ -276,38 +279,44 @@ fn fits(at: u32, len: usize, name: Option<&str>) -> Result<(), String> {
 /// The producers sections of the objects, one after the other, as one: each field's values
 /// by the first version of each name, the fields in the tool conventions' order.
 fn producers(payloads: &[u8]) -> Result<Vec<u8>, String> {
-    let mut fields: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();
+    // Two flat columns, each sized by what the payloads can hold (a field or a value is at
+    // least 2 bytes): the fields as first met, and each value with its field's place.
+    let mut fields: Vec<&str> = Vec::with_capacity(payloads.len() / 2);
+    let mut values: Vec<(u32, &str, &str)> = Vec::with_capacity(payloads.len() / 2);
     let mut r = Reader::new(payloads);
     while !r.done() {
         for _ in 0..r.count()? {
             let field = r.name()?;
-            let at = match fields.iter().position(|(it, _)| *it == field) {
-                Some(at) => at,
+            let at = match fields.iter().position(|&it| it == field) {
+                Some(at) => at as u32,
                 None => {
-                    fields.push((field, Vec::new()));
-                    fields.len() - 1
+                    fields.push(field);
+                    fields.len() as u32 - 1
                 }
             };
             for _ in 0..r.count()? {
                 let name = r.name()?;
                 let version = r.name()?;
-                let values = &mut fields[at].1;
-                if !values.iter().any(|(it, _)| *it == name) {
-                    values.push((name, version));
+                if !values.iter().any(|&(it, known, _)| it == at && known == name) {
+                    values.push((at, name, version));
                 }
             }
         }
     }
     const ORDER: [&str; 3] = ["language", "processed-by", "sdk"];
-    fields.sort_by_key(|(field, _)| ORDER.iter().position(|it| it == field).unwrap_or(ORDER.len()));
+    let rank = |field: &str| ORDER.iter().position(|&it| it == field).unwrap_or(ORDER.len());
     let mut out = Vec::with_capacity(payloads.len());
     leb::uleb(&mut out, fields.len() as u64);
-    for (field, values) in fields {
-        leb::name(&mut out, field);
-        leb::uleb(&mut out, values.len() as u64);
-        for (name, version) in values {
-            leb::name(&mut out, name);
-            leb::name(&mut out, version);
+    // A stable order by rank, then as first met: a few fields, each walked once per rank.
+    for want in 0..=ORDER.len() {
+        for (at, &field) in fields.iter().enumerate().filter(|&(_, &it)| rank(it) == want) {
+            let of_field = || values.iter().filter(move |it| it.0 == at as u32);
+            leb::name(&mut out, field);
+            leb::uleb(&mut out, of_field().count() as u64);
+            for &(_, name, version) in of_field() {
+                leb::name(&mut out, name);
+                leb::name(&mut out, version);
+            }
         }
     }
     Ok(out)
@@ -316,9 +325,10 @@ fn producers(payloads: &[u8]) -> Result<Vec<u8>, String> {
 /// The target_features sections of the objects as one: every feature one uses, an error when
 /// another disallows it.
 fn target_features(payloads: &[u8]) -> Result<Vec<u8>, String> {
-    // Every object repeats the same few features: collected, then one sort and dedup each.
-    let mut used: Vec<&str> = Vec::new();
-    let mut disallowed: Vec<&str> = Vec::new();
+    // Every object repeats the same few features: collected, then one sort and dedup each. A
+    // feature is at least 2 bytes of the payloads.
+    let mut used: Vec<&str> = Vec::with_capacity(payloads.len() / 2);
+    let mut disallowed: Vec<&str> = Vec::with_capacity(payloads.len() / 2);
     let mut r = Reader::new(payloads);
     while !r.done() {
         for _ in 0..r.count()? {
@@ -420,15 +430,21 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     if count >= u64::from(u32::MAX) {
         return Err(format!("{count} functions, more than a table of 2^32 slots holds"));
     }
-    let index_at = |addr: u64, what: &str| match units.binary_search_by_key(&addr, |it| it.addr) {
-        Ok(at) => Ok(imported + at as u32),
-        Err(_) => Err(format!(
-            "{what} at {addr} of the code space, where no function of the module starts"
-        )),
+    let index_at = |addr: u64| match units.binary_search_by_key(&addr, |it| it.addr) {
+        Ok(at) => Some(imported + at as u32),
+        Err(_) => None,
     };
+    fn nowhere(what: std::fmt::Arguments<'_>, addr: u64) -> String {
+        // alloc: error path
+        format!("{what} at {addr} of the code space, where no function of the module starts")
+    }
 
-    // Imports: the core's types encoded once into one arena, the rest borrowed.
-    let mut arena = Vec::new();
+    // Imports: the core's types encoded once into one arena, the rest borrowed. A type is
+    // 0x60, then two counts of at most 5 bytes and their value types.
+    let encoded = |it: &crate::model::Import| {
+        it.wasm.as_ref().map_or(0, |it| 11 + it.ty.params.len() + it.ty.results.len())
+    };
+    let mut arena = Vec::with_capacity(placed.imports.iter().map(encoded).sum());
     let mut spans = Vec::with_capacity(placed.imports.len());
     for import in placed.imports {
         if import.kind != SymbolKind::Function {
@@ -452,7 +468,10 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         let Some(header) = unit.header else { continue };
         for (name, module, field, ty) in header.imports() {
             let by_name = by_name.get_or_insert_with(|| {
-                placed.imports.iter().map(|it| it.name.as_str()).zip(imports.iter().copied()).collect()
+                let names = placed.imports.iter().map(|it| it.name.as_str());
+                let mut map = FxHashMap::with_capacity_and_hasher(imports.len(), Default::default());
+                map.extend(names.zip(imports.iter().copied()));
+                map
             });
             if let Some(it) = by_name.get(name)
                 && (it.module, it.field, it.ty) != (module, field, ty)
@@ -470,11 +489,19 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
 
     // Types and the columns of the function bodies: one serial pass over the headers.
     let mut types = Types::with_capacity(imports.len() + 64);
-    let import_types: Vec<u32> = imports.iter().map(|it| types.of(it.ty)).collect();
+    let mut import_types: Vec<u32> = Vec::with_capacity(imports.len());
+    import_types.extend(imports.iter().map(|it| types.of(it.ty)));
     let mut function_types = Vec::with_capacity(units.len());
     let mut fixup_starts = Vec::with_capacity(units.len() + 1);
-    let mut fixup_types: Vec<u32> = Vec::new();
-    let mut scratch: Vec<Sig<'_>> = Vec::new();
+    // Sized from the headers' counts first, so neither grows.
+    let (mut most_types, mut all_fixups) = (0, 0);
+    for header in units.iter().filter_map(|it| it.header) {
+        let (types, fixups) = header.counts();
+        most_types = most_types.max(types);
+        all_fixups += fixups;
+    }
+    let mut fixup_types: Vec<u32> = Vec::with_capacity(all_fixups);
+    let mut scratch: Vec<Sig<'_>> = Vec::with_capacity(most_types);
     for unit in &units {
         fixup_starts.push(fixup_types.len());
         let Some(header) = unit.header else {
@@ -499,10 +526,11 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
 
     // `__wasm_call_ctors`: what it calls must be `fn()`.
     let ctors = match units.iter().any(|it| it.header.is_none()) {
-        true => init_functions(placed)?,
-        false => Vec::new(),
+        true => Some(init_functions(placed)?),
+        false => None,
     };
-    for &function in &ctors {
+    let ctors = ctors.as_deref().unwrap_or(&[]);
+    for &function in ctors {
         let ty = match (function as usize).checked_sub(imports.len()) {
             None => imports.get(function as usize).map(|it| it.ty),
             Some(at) => units.get(at).and_then(|it| it.header).map(|it| it.ty()),
@@ -514,7 +542,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
             ));
         }
     }
-    let ctors = ctors_body(&ctors);
+    let ctors = ctors_body(ctors);
     let body_len = |unit: &Unit<'_>| unit.header.map_or(ctors.len(), |it| it.body().len());
 
     // Memory: the stack, the data, then the heap from `__heap_base`.
@@ -526,7 +554,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         return Err(format!("data up to {heap:#x}, past 32-bit memory"));
     }
     let pages = heap.div_ceil(PAGE).max(1);
-    let mut segments: Vec<(&str, u32, &[u8])> = Vec::new();
+    let mut segments: Vec<(&str, u32, &[u8])> = Vec::with_capacity(placed.regions.len());
     for (index, region) in placed.regions.iter().enumerate() {
         if !in_memory(&region.class) {
             continue;
@@ -559,14 +587,17 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     let mut named = FxHashMap::with_capacity_and_hasher(2 + placed.exports.len(), Default::default());
     export(&mut named, &mut exports, "memory", EXPORT_MEMORY, 0, false)?;
     if let OutputKind::Executable { entry } = &wasm.kind {
+        // alloc: error path
         let addr = placed.entry.ok_or_else(|| format!("the entry `{entry}` is not defined"))?;
-        let function = index_at(addr, &format!("the entry `{entry}`"))?;
+        let function =
+            index_at(addr).ok_or_else(|| nowhere(format_args!("the entry `{entry}`"), addr))?;
         export(&mut named, &mut exports, entry, EXPORT_FUNCTION, function, true)?;
     }
     for it in placed.exports {
         match it.kind {
             SymbolKind::Function => {
-                let function = index_at(it.addr, &format!("the export `{}`", it.name))?;
+                let function = index_at(it.addr)
+                    .ok_or_else(|| nowhere(format_args!("the export `{}`", it.name), it.addr))?;
                 export(&mut named, &mut exports, &it.name, EXPORT_FUNCTION, function, true)?;
             }
             SymbolKind::Data | SymbolKind::Other => {
@@ -587,55 +618,53 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         }
     }
 
-    // Custom sections, by name in address order, each a list of borrowed parts.
-    let mut by_addr: Vec<(u64, usize)> = placed
-        .regions
-        .iter()
-        .enumerate()
-        .filter(|(_, it)| matches!(it.class, Class::Named { write: false, exec: false, .. }))
-        .map(|(index, it)| (it.addr, index))
-        .collect();
+    // Custom sections: each name a group, numbered as first met in address order, and its
+    // regions one run of `parts` (a stable sort by group keeps the address order within one).
+    // `producers` and `target_features` are merged, and written last.
+    let is_custom =
+        |it: &&Region| matches!(it.class, Class::Named { write: false, exec: false, .. });
+    let customs = placed.regions.iter().filter(is_custom).count();
+    let mut by_addr: Vec<(u64, usize)> = Vec::with_capacity(customs);
+    let regions = placed.regions.iter().enumerate();
+    by_addr.extend(regions.filter(|(_, it)| is_custom(it)).map(|(index, it)| (it.addr, index)));
     radix::sort_copy_by_key(&mut by_addr, |&(addr, index)| radix::pack_64(addr, index as u64));
-    let mut customs: Vec<(&str, Vec<&[u8]>)> = Vec::with_capacity(by_addr.len());
-    let mut last: Vec<(&str, Vec<&[u8]>)> = Vec::new();
-    let mut custom_at: FxHashMap<&str, (bool, usize)> = FxHashMap::default();
-    for (_, index) in by_addr {
+    let mut groups: Vec<(&str, bool)> = Vec::with_capacity(customs);
+    let mut group_of: FxHashMap<&str, u32> =
+        FxHashMap::with_capacity_and_hasher(customs, Default::default());
+    let mut parts: Vec<(u32, usize)> = Vec::with_capacity(customs);
+    for &(_, index) in &by_addr {
         let Class::Named { name, .. } = &placed.regions[index].class else { continue };
         let name = name.as_str();
-        let bytes = placed.bytes(index);
-        let merged = matches!(name, "producers" | "target_features");
-        match custom_at.entry(name) {
-            Entry::Occupied(it) => {
-                let &(merged, at) = it.get();
-                (if merged { &mut last[at] } else { &mut customs[at] }).1.push(bytes);
-            }
-            Entry::Vacant(it) => {
-                let list = if merged { &mut last } else { &mut customs };
-                it.insert((merged, list.len()));
-                list.push((name, vec![bytes]));
-            }
-        }
+        let group = *group_of.entry(name).or_insert_with(|| {
+            groups.push((name, matches!(name, "producers" | "target_features")));
+            groups.len() as u32 - 1
+        });
+        parts.push((group, index));
     }
-    last.sort_by_key(|(name, _)| *name == "target_features");
+    radix::sort_copy_by_key(&mut parts, |it| it.0);
+    let runs = || parts.chunk_by(|a, b| a.0 == b.0).map(|run| (groups[run[0].0 as usize], run));
 
     // The sizes of the big sections, known before anything is written.
-    let code_bytes: usize = units.iter().map(|it| leb::uleb_len(body_len(it) as u64) + body_len(it)).sum();
-    let segment_headers: Vec<([u8; 16], usize)> = segments
-        .iter()
-        .map(|&(_, addr, bytes)| {
-            let mut header = Vec::with_capacity(16);
-            header.push(0);
-            leb::i32_const(&mut header, addr as i32);
-            leb::uleb(&mut header, bytes.len() as u64);
-            let mut fixed = [0; 16];
-            fixed[..header.len()].copy_from_slice(&header);
-            (fixed, header.len())
-        })
-        .collect();
+    let code_bytes: usize =
+        units.iter().map(|it| leb::uleb_len(body_len(it) as u64) + body_len(it)).sum();
+    // Each segment's header: flags 0, `i32.const addr; end`, the size.
+    let mut segment_headers: Vec<([u8; 16], usize)> = Vec::with_capacity(segments.len());
+    segment_headers.extend(segments.iter().map(|&(_, addr, bytes)| {
+        let mut header = [0; 16];
+        header[1] = 0x41;
+        let mut len = 2 + leb::sleb_into(&mut header[2..], (addr as i32).into());
+        header[len] = 0x0b;
+        len += 1 + leb::uleb_into(&mut header[len + 1..], bytes.len() as u64);
+        (header, len)
+    }));
     let data_bytes: usize =
         segments.iter().zip(&segment_headers).map(|(it, header)| header.1 + it.2.len()).sum();
-    let custom_bytes: usize =
-        customs.iter().map(|(name, parts)| 16 + name.len() + parts.iter().map(|it| it.len()).sum::<usize>()).sum();
+    let part_bytes =
+        |run: &[(u32, usize)]| run.iter().map(|it| placed.bytes(it.1).len()).sum::<usize>();
+    let custom_bytes: usize = runs()
+        .filter(|((_, merged), _)| !merged)
+        .map(|((name, _), run)| 16 + name.len() + part_bytes(run))
+        .sum();
     let names_estimate: usize = units.iter().map(|it| it.name.map_or(0, str::len) + 8).sum::<usize>()
         + placed.imports.iter().map(|it| it.name.len() + 8).sum::<usize>();
 
@@ -666,8 +695,10 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         out.extend_from_slice(ty);
     }
 
+    // One buffer for the small sections' contents, sized for the largest of them.
+    let mut contents =
+        Vec::with_capacity(16 + 64 * imports.len().max(exports.len()) + 8 * globals.len());
     if !imports.is_empty() {
-        let mut contents = Vec::with_capacity(64 * imports.len());
         leb::uleb(&mut contents, imports.len() as u64);
         for (import, &ty) in imports.iter().zip(&import_types) {
             leb::name(&mut contents, import.module);
@@ -685,14 +716,15 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         leb::uleb(&mut out, ty.into());
     }
 
-    let mut table = vec![1, FUNCREF, 1];
-    leb::uleb(&mut table, count + 1);
-    leb::uleb(&mut table, count + 1);
-    leb::section(&mut out, id::TABLE, &table);
-    let mut memory = vec![1, 0];
-    leb::uleb(&mut memory, pages);
-    leb::section(&mut out, id::MEMORY, &memory);
-    let mut contents = Vec::with_capacity(8 * globals.len() + 1);
+    // One table of funcrefs, its minimum and maximum the slots; one memory of `pages`.
+    section(&mut out, id::TABLE, 3 + 2 * leb::uleb_len(count + 1));
+    out.extend([1, FUNCREF, 1]);
+    leb::uleb(&mut out, count + 1);
+    leb::uleb(&mut out, count + 1);
+    section(&mut out, id::MEMORY, 2 + leb::uleb_len(pages));
+    out.extend([1, 0]);
+    leb::uleb(&mut out, pages);
+    contents.clear();
     leb::uleb(&mut contents, globals.len() as u64);
     for &(_, mutable, value) in &globals {
         contents.extend([I32, u8::from(mutable)]);
@@ -771,12 +803,11 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         copy_all(jobs);
     }
 
-    for (name, parts) in &customs {
-        let payload: usize = parts.iter().map(|it| it.len()).sum();
-        section(&mut out, 0, leb::uleb_len(name.len() as u64) + name.len() + payload);
+    for ((name, _), run) in runs().filter(|((_, merged), _)| !merged) {
+        section(&mut out, 0, leb::uleb_len(name.len() as u64) + name.len() + part_bytes(run));
         leb::name(&mut out, name);
-        for part in parts {
-            out.extend_from_slice(part);
+        for &(_, index) in run {
+            out.extend_from_slice(placed.bytes(index));
         }
     }
 
@@ -800,13 +831,23 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     name_map(&mut names, &mut scratch, 9, segment_names);
     leb::custom(&mut out, "name", &names);
 
-    for (name, parts) in last {
-        let payloads = parts.concat();
-        let merged = match name {
-            "producers" => producers(&payloads),
-            _ => target_features(&payloads),
-        };
-        leb::custom(&mut out, name, &merged.map_err(|e| format!("the {name} sections: {e}"))?);
+    // Each merged section's parts one after the other in one reused buffer, `producers` first.
+    let merged = || runs().filter(|((_, merged), _)| *merged);
+    let mut payloads = Vec::with_capacity(merged().map(|(_, run)| part_bytes(run)).max().unwrap_or(0));
+    for want in ["producers", "target_features"] {
+        for ((name, _), run) in merged().filter(|((name, _), _)| *name == want) {
+            payloads.clear();
+            for &(_, index) in run {
+                payloads.extend_from_slice(placed.bytes(index));
+            }
+            let merged = match name {
+                "producers" => producers(&payloads),
+                _ => target_features(&payloads),
+            };
+            // alloc: error path
+            let merged = merged.map_err(|e| format!("the {name} sections: {e}"))?;
+            leb::custom(&mut out, name, &merged);
+        }
     }
     Ok(out)
 }

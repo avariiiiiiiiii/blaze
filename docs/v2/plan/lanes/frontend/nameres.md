@@ -59,6 +59,10 @@ Three constraints decide it.
 | `facts/impls.rs` | per-module impl lists for the impl buckets | |
 | `facts/tests.rs`, `facts/tests/` | differential, property and trace tests | |
 
+Each piece's own notes: [nameres-core.md](nameres-core.md), [nameres-graph.md](nameres-graph.md),
+[nameres-impls.md](nameres-impls.md), [nameres-diff.md](nameres-diff.md),
+[nameres-oracle.md](nameres-oracle.md).
+
 ## 3. Queries (salsa now, blaze-query later; each key is content, never a dense index)
 
 | query | key | value | reruns when |
@@ -144,6 +148,37 @@ Per edit, with `m` modules, `i` imports, `f` the facts an SCC read and `k` round
 Cold, the cost is the old collector's plus `O(k · m)` query records. Hot, adding `fn foo` to `a`
 reruns `module_decls(a)`, the state of `a`'s component at each round, and the components that
 read `a::foo` or glob `a`; adding `use x::Y` to `a` adds the partition run.
+
+### What a unit is
+
+A unit is a `DefMap` in `ModulesSlot::Building` holding every module of the round: the
+component's members as `ScopeSlot::Building`, every other module as `ScopeSlot::Collected` of
+its `fact_handle`. Path resolution (`path_resolution.rs`) is unchanged: it reads a module's name
+through `ModuleData::name_in_scope`, which for a collected slot is the per-name query
+`ModuleScope::name`. So the facts are not a second table beside the resolver: the resolver's own
+reads of upstream modules are the per-name salsa edges, and a negative fact is a `name` memo
+whose value is `PerNs::none()`. A glob reads `ModuleScope::scope` whole. `facts` is a child
+module of `nameres`, so it builds these maps from private fields with no new API.
+
+A block def map is one unit over the block's modules and no inner queries: `block_def_map` is
+already one query per block, and its upstream (the crate's def map, enclosing blocks) is final.
+
+### Speed of light
+
+Per edit, the floor is the work a perfect oracle of the changed facts would do:
+
+- re-reading the edited module's item tree: one pass over its items, `O(items)`;
+- one hash probe per fact a changed module's readers hold (`ModuleScope::name` memo validation:
+  a salsa memo check, ~50 ns, one or two cache misses);
+- re-resolving exactly the imports whose read facts changed, each `O(path segments)` probes.
+
+The design's overhead above that floor is the validation of the queries that did not change:
+`O(m)` per round for the driver's fold over `macro_step`/`fact_handle` (a memo check each, no
+execution) plus `partition` validation. For a crate of 1000 modules and 4 rounds that is ~4000
+memo checks, ~200 µs at 50 ns, against a cold collection of tens of milliseconds; the target is
+that a one-item edit costs under 1 ms of resolver time on such a crate, within 10% of the
+floor plus that validation. The fold is the term to cut if measurement shows it dominates: a
+per-round "modules with macros" list keeps it to modules that have any.
 
 ## 7. State of the art
 

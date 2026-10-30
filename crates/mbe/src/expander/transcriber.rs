@@ -19,6 +19,7 @@ impl<'t> Bindings<'t> {
             Some(binding) => Ok(binding),
             None => Err(ExpandError::new(
                 span,
+                // alloc: an error.
                 ExpandErrorKind::UnresolvedBinding(Box::new(Box::from(name.sym().as_str()))),
             )),
         }
@@ -33,6 +34,7 @@ impl<'t> Bindings<'t> {
         marker: impl Fn(&mut Span),
     ) -> Result<Fragment<'t>, ExpandError> {
         macro_rules! binding_err {
+            // alloc: an error.
             ($($arg:tt)*) => { ExpandError::binding_error(span, format!($($arg)*)) };
         }
 
@@ -58,6 +60,7 @@ impl<'t> Bindings<'t> {
             };
         }
         match b {
+            // clone: bindings hold views only; the matcher makes no owned fragment.
             Binding::Fragment(f) => Ok(self.fragment(f).clone()),
             // emit some reasonable default expansion for missing bindings,
             // this gives better recovery than emitting the `$fragment-name` verbatim
@@ -130,6 +133,7 @@ pub(super) fn transcribe(
     marker: impl Fn(&mut Span) + Copy,
     call_site: Span,
 ) -> ExpandResult<tt::TopSubtree> {
+    // alloc: the repetition stack, once a transcription.
     let mut ctx = ExpandCtx { bindings, nesting: Vec::new(), call_site };
     let mut builder = tt::TopSubtreeBuilder::with_capacity(
         tt::Delimiter::invisible_spanned(ctx.call_site),
@@ -181,11 +185,13 @@ fn expand_subtree(
     'ops: while let Some(op) = ops.next() {
         match op {
             Op::Literal(it) => builder.push(tt::Leaf::from({
+                // clone: a leaf: a symbol, a span and a flag or two, no heap.
                 let mut it = it.clone();
                 marker(&mut it.span);
                 it
             })),
             Op::Ident(it) => builder.push(tt::Leaf::from({
+                // clone: a leaf: a symbol, a span and a flag or two, no heap.
                 let mut it = it.clone();
                 marker(&mut it.span);
                 it
@@ -295,6 +301,7 @@ fn expand_subtree(
                 }));
             }
             Op::Concat { elements, span: concat_span } => {
+                // alloc: the text of a `${concat}` identifier, interned at once.
                 let mut concatenated = String::new();
                 for element in elements {
                     match element {
@@ -583,7 +590,9 @@ fn expand_repeat(
                 leaf
             };
             match sep {
+                // clone: a leaf: a symbol, a span and a flag or two, no heap.
                 Separator::Ident(ident) => builder.push(marked(ident.clone().into())),
+                // clone: a leaf: a symbol, a span and a flag or two, no heap.
                 Separator::Literal(lit) => builder.push(marked(lit.clone().into())),
                 Separator::Puncts(puncts) => {
                     for &punct in puncts {
@@ -592,6 +601,7 @@ fn expand_repeat(
                 }
                 Separator::Lifetime(punct, ident) => {
                     builder.push(marked((*punct).into()));
+                    // clone: a leaf: a symbol, a span and a flag or two, no heap.
                     builder.push(marked(ident.clone().into()));
                 }
             };

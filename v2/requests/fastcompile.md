@@ -1246,6 +1246,8 @@ the server lives.
 
 > forwarded to usercode: its report ends DONE but its window is editing its crate now; told by tmux.
 
+> given to usercode-fast-tests (2026-10-29), the owner of `test/queue.rs`.
+
 ## fastcompile-inproc 4: coordinator: ship `blaze-inproc-run` beside `blaze`
 
 What: the `blaze-inproc-run` binary target of `crates/blaze-inproc` (no features) built and
@@ -1365,7 +1367,7 @@ Why: restore.md, "The daemon starts on demand". Nothing else in blaze-global cha
 
 > forwarded to fastcompile: `crates/blaze-global/` is its.
 
-## fastcompile-stencil 1: codegen: `Backend::Stencil`, the stencil library's id in the settings, and `Target::Counter` (`crates/blaze-codegen/src/{lib.rs,settings.rs,content.rs}`)
+## fastcompile-stencil 1: codegen: `Backend::Stencil`, the stencil library's id in the settings, `Spec::counted`, `Mode::Tiered` and `Target::Counter` (`crates/blaze-codegen/src/{lib.rs,settings.rs,content.rs,plan.rs}`)
 
 What:
 
@@ -1381,10 +1383,28 @@ What:
    daemon. Placed by the linker in writable memory, one pair per instance, never merged.
    `content::target_id` gives it a domain of its own (`"blaze v2 counter 1"` over the
    key).
+4. `Spec` gains `pub counted: bool`: the code counts its calls and back edges into its
+   `Target::Counter` cells (`blaze_stencil::tier`). Hashed after `fold` (one byte), and a
+   line in `every_field_is_in_the_settings`. Stencil code always counts (a `Backend::Stencil`
+   spec with `counted: false` is refused by the backend); Cranelift code counts when set (the
+   tier-1 code of a tiered run, request 2 item 5); LLVM code never does (refused with
+   `true`). The 14 literal `Spec { toolchain, .. }`s in the tree get `counted: false`.
+5. `plan::Mode` gains `Tiered`: a dev or test run the daemon runs in process
+   (`blaze-inproc`, lazily through `blaze-lazy`). `Policy::choose` gives each function whose
+   profile level is opt-level 0 `first: Spec { backend: Backend::Stencil, counted: true, .. }`
+   and `then: None`, patchable: its tier-up is `blaze_stencil::tier`'s, decided by its counts,
+   not by the plan. A target with no stencil library (`toolchain.stencils == None`, wasm) is a
+   `PlanError` naming the target, never Cranelift in its place. Functions at a higher level
+   are chosen as in `Mode::Output`.
 
 Why: the third dev backend (idea 4) needs its own key (a changed stencil set changes every
 stencil unit's key, or stale code is reused), and its tier-up counters (idea 13) need a
-relocation that names one function's cells without a symbol per function.
+relocation that names one function's cells without a symbol per function. Counting
+Cranelift code differs from plain Cranelift code (an add per call and per back edge, and a
+relocation to writable cells), so it is another instance: `counted` in the key, or a counting
+function's code would be reused in `blaze build`'s output. The middle tier counts, as
+HotSpot's tier 3 and V8's baseline tiers do, so a warm function that becomes hot is found by
+the same cells.
 
 > forwarded to codegen (window `codegen-next1`, told by tmux).
 
@@ -1407,7 +1427,10 @@ What:
    - `bytes`, `align`;
    - `relocs`: one `fragment::Reloc` per `code::Reloc`, with `RelocName` mapped one to one
      (`User` by `RelocName::user`, `LibCall`, `Known`, `Own`). `code::Name::Counter` becomes
-     a new `RelocName::Counter`, which `convert.rs` makes `Target::Counter(unit key)`;
+     `RelocName::User { namespace: blaze_stencil::tier::COUNTER_NAMESPACE, index: 0 }`, the
+     name `tier::instrument` gives the cells in Cranelift IR (item 5), so one arm serves both
+     backends: `convert.rs`'s `RelocName::User { namespace: COUNTER_NAMESPACE, index: 0 }`
+     makes `Target::Counter(unit.instance.key())`, with the relocation's addend (0 or 8);
    - `unwind`: `code::Unwind::Dwarf { len, rows }` becomes `FunctionUnwind::from_rows(FrameRows
      { len, rows }, landing_pads)` (each `code::Rule` is the `FrameRule` of the same name),
      and `Windows { len, info }` becomes `from_unwind_info(len, info, pads)`. The landing pads
@@ -1423,24 +1446,50 @@ What:
    compile with Cranelift.
 4. `masked` returns `None` for `Prepared::Stencil` (no folds at tier 0); `summarize` and
    `merge` refuse it as they refuse Cranelift units.
+5. Counting Cranelift code (`spec.counted` on a `Backend::Cranelift` unit, request 1 item 4):
+   `compiled` runs `blaze_stencil::tier::instrument(&mut func)` on the IR before
+   `float_pair::lower` and `crate::emit` (an error is `failed(unit, e)`); `masked` returns
+   `None` for it, as a fold would share one function's cells between many. `check_spec`
+   refuses `counted` with `Backend::Llvm` and its absence with `Backend::Stencil`, naming
+   the unit.
 
 Why: idea 4's backend plugs in where Cranelift's does and returns the same `CompiledFunction`,
-over the same IR, so both dev backends agree on what a program means.
+over the same IR, so both dev backends agree on what a program means. Item 5 is how a warm
+function keeps counting toward LLVM (idea 13): the same two cells and the same back-edge rule
+as tier 0's glue, written into the IR, so the daemon reads one kind of counter for both
+promotions.
 
 > forwarded to codegen (window `codegen-next1`, told by tmux).
 
 ## fastcompile-stencil 3: link: place `Target::Counter` cells (`crates/blaze-link/`)
 
-What: for each function with a `Target::Counter(key)` relocation, 16 zeroed bytes, 8-aligned,
-in one writable region of the image (one cell pair per instance key, never merged). The
-relocation is resolved to the cell's address (with its addend, 0 or 8). The image says where
-each instance's cells are (`Image::counter(key) -> Option<u64>`), and the in-process image
-puts the region in blaze-inproc's code memory object, so the daemon reads the counts in place
-through its own view. A patch of a function keeps its cells (the counts carry over a
-recompile at the same tier) unless the instance key changes.
+What: for each function with a `Target::Counter(key)` relocation, a cell pair: 16 bytes,
+8-aligned, zero when first given out, one per instance key, never merged and never given to
+another key while the image lives. They are in the cells part of the image's code memory
+(`fastcompile-stencil-tier 1`: blaze-inproc maps it shared and writable in the run process,
+and the daemon's view sees the program's adds), not in the image's own data, which the run
+process maps as a private copy (`Access::Copy`; on macOS the daemon would never see a write).
 
-Why: tier-up (idea 13) reads tier 0's counts in place, with no sampler and no channel round
-trip.
+- The relocation is resolved to `base + cells.offset + 16 * pair + addend` (addend 0 or 8) for
+  every kind stencil glue and Cranelift write for a colocated data symbol: `X86PCRel4`,
+  `Aarch64AdrPrelPgHi21`, `Aarch64AddAbsLo12Nc`, `Aarch64Ldst64AbsLo12Nc`. The code memory
+  places the cells part beside the arena, so every function is within their ±2 GB.
+- Both placements resolve it: `Image::stage` of an in-process image, and the lazy placement of
+  one function into the arena (`fastcompile-lazy 3`).
+- `Image::counter(key: &InstanceKey) -> Option<u64>`: the pair's offset in the code memory,
+  for `blaze_stencil::tier::Counters::bind`.
+- Running out of pairs is a `LinkError` saying how many there are; a `Target::Counter` in an
+  image that is not in process (a file `blaze build` writes, a classic live image) is a
+  `LinkError` naming the function: counting code is only for runs the daemon tiers.
+- A tier-up is `Change { added: [new], slots: [(tier-0 key, new key)] }` or the lazy
+  placer's replacement of the slot (`fastcompile-stencil-tier 2`): the new instance has a new
+  key, so it gets new cells, and the old pair stays (a thread may still be in the old code,
+  adding to it).
+
+Why: tier-up (idea 13) reads the counts in place, with no sampler and no channel round trip:
+`blaze_stencil::tier::Counters` reads two words per counting function per round.
+
+> told requests (window `requests-next2`, by tmux): lane link reports DONE and has no window. Needs `Target::Counter` from `fastcompile-stencil 1` first.
 
 ## fastcompile-stencil 4: proof: a backend axis in the corpus differential (`harness/v2/corpus.py`, `engine.py`)
 
@@ -1474,3 +1523,209 @@ What:
 Why: docs/v2/plan/lanes/fastcompile/stencil.md, "Why a build script" and "Tests".
 
 > applied (1): `cranelift-interpreter = "0.136"` and `cranelift-reader = "0.136"` in the root `[workspace.dependencies]` beside `cranelift-frontend`; both new to the lock (lock additions). (2), `LLVM_SYS_231_PREFIX` in the flake and CI, is the coordinator's: listed in requests' report.
+
+## fastcompile-ident-share 1: codegen: the share key in `Described::args` (`crates/hir-ty-codegen/v2/frontend.rs`, `Cargo.toml`)
+
+What:
+
+- `hir-ty-share.workspace = true` in `hir-ty-codegen`'s `[dependencies]`. It depends on
+  `hir-ty`, `hir-ty-mir`, `blaze-items` and `blaze-ids`, none of which depends on codegen.
+- `frontend.rs`, `described()`: for `Kind::Code(instance, env)`, map `instance.def` one to one
+  to `hir_ty_share::ShareDef` (`Fn`, `Closure`, `Coroutine`, `CoroutineByMove`, `DropGlue`,
+  `CallOnceShim`, `VtableShim`, `FnPointerShim`, `ReifyShim { receiver }`, with the same ids)
+  and call
+  `hir_ty_share::share_key(db, &ShareInstance { def, args: instance.args.clone() }, env, options)`.
+  - `Ok(key)`: `args = Hasher::new(SHARED_ARGS_DOMAIN).id(&key.0).finish()`, with
+    `SHARED_ARGS_DOMAIN = "blaze v2 shared args 1"`, so a share key never equals an
+    `args_of` hash.
+  - `Err(_)`: `args_of` as today. This is not a fallback: both give exact code, and `Err` names
+    why the instance is per instance (`Unshared`'s `Display`, worth a `tracing::debug!`).
+  - Every other `Kind` keeps `args_of`.
+- `options: hir_ty_share::BodyOptions { lang, other }`: each an `OptionsSet` of every
+  `hir_ty::mir::MirOptions` that `Build::options(db, written, compiling)` can return, over the
+  build's units, for a `written` crate of the library (`lang`) or not (`other`).
+  - `Described` is one for every unit, as `refs` is walked at `Build::WALK` and
+    `WALK_INLINED`. So the key covers each options a unit may compile the body with, and
+    `instance_body`'s choice of body is mirrored in `hir-ty-share` `walk.rs` `bodies`: the
+    runtime body when `is_runtime`, otherwise `optimized_mir_body*(options)`.
+  - `ub_checks` is the input that matters. `CheckAlignment`, `CheckNull` and `CheckEnums` add
+    `<T as SizedTypeProperties>::ALIGN` and `SIZE` of a pointee and enum checks of the target
+    type.
+  - A typical debug build gives `lang: {Release, no UB checks}` and
+    `other: {Debug, UB checks}`, so one walk each. With `BLAZE_MIR_OPT=0` the level is `Off`.
+  - Over-approximating is sound and costs one walk per extra options. Leaving out an options a
+    unit compiles with is unsound.
+  - (2026-10-29 19:40: this replaces the `MirLevels` of the first version. `hir-ty`'s
+    `optimized_mir_body` now takes `MirOptions`.)
+- `MirOptions` here is `hir-ty`'s `{level, ub_checks, lifetime_markers}`. `hir-ty-codegen`
+  builds one with an `inline` field, which `hir-ty` does not have on disk. If inlining becomes
+  a field of `MirOptions`, `OptionsSet` gets the bit, so tell me.
+- Keep two predicates in step. `hir-ty-share`'s `fact.rs` mirrors `is_plain_data` and
+  `reference_pointee` (`mod.rs`), because a pointer's fact holds what they read: pointee size,
+  alignment, `Freeze`, `Unpin`, plain data. A change to what codegen reads of a pointee for its
+  attributes needs the same change there. The same holds for `v2/hashes.rs`'s spelling and
+  `identity.rs`, and for `v2/refs.rs`'s choice of callee and `walk.rs`.
+- A test in `v2/tests.rs`: two instances with one key (`id::<&A>`, `id::<&B>`) are one
+  `InstanceKey` and one compiled function, and `tid::<&A>`/`tid::<&B>` (`type_id`) are two.
+
+Why: idea 2 (`docs/v2/plan/lanes/fastcompile/share.md`). `Described::args` is "the content ID
+of its type arguments' facts its code reads", which is what the share key is. With it, every
+instance of one body with one key has one `InstanceKey`, so it is compiled, stored, linked and
+cached once. Equal share keys mean equal refs, `built_in` and code (share.md, "Why equal keys
+mean equal code"). A callee is keyed in a caller's share key by the callee's own share key, the
+`args` this request makes, so the two stay consistent only when codegen uses it.
+
+> forwarded to codegen (window `codegen-next1`, told by tmux).
+
+## fastcompile-ident-share 2: proof: run the sharing programs under rustc and blaze (`crates/hir-ty-share/programs/`)
+
+What: a differential case per `crates/hir-ty-share/programs/<name>.rs`, built by the pinned
+nightly's rustc and by blaze with request 1 in. stdout must equal `<name>.stdout` beside it.
+The expected outputs are written from Rust's guarantees, not yet from a rustc run, so check the
+first rustc run against them and tell me any difference. The cases are `TypeId`, `type_name`,
+`needs_drop`, statics in generic functions, associated consts, const generics, drop order,
+`dyn Trait` vtables for different `T`, and function pointers (`fn_pointers.rs` prints only what
+Rust guarantees).
+
+Why: idea 2 must change nothing a program can observe. These are the places where a wrong share
+would show.
+
+> taken by requests (proof is DONE): child `requests-backend-axis`, after stencil 4; the outcome follows.
+> applied by requests (child requests-backend-axis): `harness/v2/share.py` (check `share` of `harness/v2/proof.py`): one case per `crates/hir-ty-share/programs/<name>.rs` with a `<name>.stdout` (read from the directory; a `.rs` without one is an error). Each is built by the pinned rustc (`--crate-type bin -C opt-level=0 -C debuginfo=2 --edition 2024`) and by blaze as a one-file package in its own workspace, and run from an empty directory. It passes only when both exit 0 with stdout equal to `<name>.stdout`. A rustc difference fails naming the program and both texts, and a blaze difference fails naming the program. Selftests (`share.py selftest`) use recorded outputs. Run: `uv run --frozen python harness/v2/share.py '{"engine": {"kind": "v2", "blaze": "…"}, "out": "/tmp/share.json"}'`. Not run yet (no builds before integration), so the first rustc run against the expected outputs is still to come.
+
+## fastcompile-ident-share 3: fastcompile: statics are not per instance (`docs/v2/plan/design/compile-time.md`, idea 2)
+
+What: in idea 2, "Statics, `TypeId`, `type_name` and anything else whose result the program can
+observe as different stay per instance" becomes "`TypeId`, `type_name`, vtables and anything
+else whose result the program can observe as different stay per instance. A static in a
+generic function is already one item for every instance (the Reference, Statics & generics), so
+sharing changes nothing about it."
+
+Why: the sentence is untrue of Rust. Following it would make blaze give each instance its own
+static, which changes programs (`crates/hir-ty-share/programs/statics.rs` counts across types
+under rustc). share.md, "What Rust allows and what stays per instance".
+
+> forwarded to fastcompile (told by tmux): the design doc is its lane's.
+
+## fastcompile-stencil-tier 1: fastcompile-inproc: a cells part of the code memory, shared both ways (`crates/blaze-inproc/src/{lib.rs,load/*.rs,host.rs}`)
+
+What:
+
+1. `CodeMemory::with_cells(name, image, arena, cells: u64) -> Result<CodeMemory, Error>`:
+   as `new` (which becomes `with_cells(.., 0)`), with a third part of `cells` bytes (rounded
+   to the page) after the arena, zero. `CodeMemory::cells() -> CodeRange` says where it is.
+2. Every run process maps that part `Access::Shared` (readable and writable, shared both
+   ways, as the fence's control words are) at `base + image + arena`, on all three loaders
+   (ELF, Mach-O, PE). Nothing of it is executable.
+3. `CodeMemory::cell_view() -> CellView`: `Send + Sync + Clone` (an `Arc` of the daemon's
+   mapping of the part), with `fn load(&self, offset: u64) -> Result<u64, Error>`: one
+   relaxed atomic load of the aligned word at `offset` of the object, an error naming the
+   offset when it is unaligned or not in the cells part. No lock: the tier reader calls it
+   twice per counting function per round while compiles and placements hold `CodeMemory`'s.
+
+Why: tier-up (idea 13; docs/v2/plan/lanes/fastcompile/stencil.md, "Tier-up") reads each
+function's counter cells in place. The image's data is mapped as a private copy, which the
+daemon never sees on macOS, so the cells need memory shared both ways at an address the
+linker knows before any process exists (`fastcompile-stencil 3` resolves `Target::Counter`
+into it). blaze-stencil cannot depend on blaze-inproc (lane notes, dependency order), so the
+daemon side wraps a `CellView` in a type that implements `blaze_stencil::tier::Cells`
+(`fastcompile-stencil-tier 2`).
+
+> told lane fastcompile (window `fastcompile`, by tmux): blaze-inproc's owners report DONE.
+
+> forwarded to fastcompile (fastcompile-inproc's paths; told by tmux).
+
+## fastcompile-stencil-tier 2: fastcompile-lazy: tier-up in the lazy runner (`crates/blaze-lazy/{Cargo.toml,src/runner.rs,src/fetch.rs}`)
+
+What:
+
+1. `blaze-stencil.workspace = true` under the `daemon` feature's dependencies.
+2. `runner::Compiler` gains `fn tier_up(&self, key: InstanceKey, to: blaze_stencil::tier::Tier)
+   -> Result<CompiledFunction, String>`: the instance of `key` compiled at
+   `spec.at(to.backend())` with `counted: to.counts()` (`fastcompile-stencil 1`).
+3. `runner::Placer` gains:
+   - `fn cells(&self, key: &InstanceKey) -> Option<u64>`: where the placed function's counter
+     cells are (`Image::counter`, `fastcompile-stencil 3`);
+   - `fn replace(&mut self, slot: InstanceKey, function: &CompiledFunction) -> Result<u64,
+     String>`: places `function`, publishes it in `slot`'s slot (the code written and
+     published before the one release store of the slot word, as `place` does), retires the
+     code the slot ran behind blaze-inproc's fence, and gives the new address.
+4. `Fetcher::retarget(id, target)`: a published function's target is the new address, so a
+   late ask (a thread that loaded the slot before the store) is answered with code that is
+   not retired.
+5. `Runner::start` of a session whose functions start at `Backend::Stencil` also starts a
+   `blaze_stencil::tier::Runner` (its `Policy` and `Config` given by the daemon) over
+   `plan.len()` functions, `LazyId` as the function index, with:
+   - memory: a newtype over blaze-inproc's `CellView` implementing `tier::Cells`
+     (`fastcompile-stencil-tier 1`);
+   - recompile: a type holding the runner's `Arc<Shared>` implementing `tier::Recompile`:
+     `tier_up(plan.key(id), to)`, then, with the placer's lock, `replace(plan.key(id), &f)`
+     and `cells(&f.key)`; then `fetcher.retarget(id, address)` under the fetcher's lock;
+     gives the cells (`Some` exactly when `to.counts()`);
+   - after each first placement (`compile_and_place`), `tier.bind(id, placer.cells(&key))`;
+   - `Runner::remembered(id, tier)` exposed for the daemon's history (idea 15).
+   `Runner::close` closes the tier runner first and adds its `Closed` (failures by `LazyId`,
+   `stopped`) to its own, so no tier failure goes unreported.
+
+Why: the lazy runner already owns what a tier-up needs (the compiler, the placer, the plan's
+ids and keys, the published targets). `blaze_stencil::tier` decides; this compiles and
+publishes through the slots that exist.
+
+> told lane fastcompile (window `fastcompile`, by tmux): blaze-lazy's owner reports DONE.
+
+> forwarded to fastcompile (fastcompile-lazy's paths; told by tmux).
+
+## fastcompile-stencil-tier 3: cargo: tiered dev and test runs (`crates/blaze-cargo/src/serve/unit/{run.rs,test.rs,codegen.rs}`, the daemon's start)
+
+What:
+
+1. A dev `run` or test the daemon runs in process at opt-level 0 builds with
+   `plan::Mode::Tiered` (`fastcompile-stencil 1` item 5), and its code memory is made with a
+   cells part (`fastcompile-stencil-tier 1`) of `32 * functions` bytes: a pair for tier 0 and
+   one for tier 1 per function.
+2. The lazy runner's tier `Policy` is `Policy::default()` with `highest: Tier::Cranelift`
+   when `toolchain.llvm` is `None`, and `Config::default()`. Its compiler's `tier_up`
+   compiles through codegen's memo and store like any unit.
+3. At the run's end the tiers reached (`Closed::tiers`) are kept by function identity
+   (idea 15, beside blaze-history's records), and the next run of the same test or binary
+   calls `remembered(id, tier)` for each function before it starts. Tier failures and
+   `stopped` are reported as the run's diagnostics, never dropped.
+
+Why: idea 13 applies to processes the daemon runs, and nothing else turns it on.
+
+> told cargo (window `cargo`, by tmux).
+
+> forwarded to cargo (told by tmux).
+
+## fastcompile-ident-share 4: codegen: monomorphize one type or constant (`crates/hir-ty-mir/src/mir/monomorphization.rs`, `mir.rs`)
+
+What:
+
+- Add `pub fn monomorphized_ty<'db>(db, ty: Ty<'db>, subst: &StoredGenericArgs, env:
+  &StoredParamEnvAndCrate) -> Result<Ty<'db>, MirLowerError<'db>>`, with
+  `monomorphized_const` and `monomorphized_args` beside it.
+  - Each runs the same `Filler` that `monomorphized` runs over a body (`Filler::new`, then
+    `try_fold_with`, with `fill_ty`'s error check), on one value.
+  - Re-export them from `mir.rs` beside `monomorphized`.
+  - No new logic: a value inside a body and the same value alone are substituted by one code
+    path, so the two agree by construction.
+
+Why: the speed of light of the share key (`docs/v2/plan/lanes/fastcompile/share.md`, "Speed of
+light").
+
+- Today the key monomorphizes each instance's whole body to read its parameter sites. For a
+  `Vec::push`-sized body that is about 6 µs over a bound of about 1.6 µs, so about 20%.
+- With these functions, `hir-ty-share` lists a body's parameter sites once per generic body and
+  substitutes only those per instance. That reaches about 97% of the bound.
+- `hir-ty-share` must not write its own substitution: it has to match the one codegen compiles
+  from exactly, including how opaque types are revealed and how aliases are normalized.
+
+## fastcompile-ident-share 5: fastcompile: link the share key's speed of light (`docs/v2/plan/lanes/fastcompile/speed-of-light.md`)
+
+What: the lane's `speed-of-light.md`, when written, lists the share key as a component and
+links to `share.md#speed-of-light`, which holds its bound with the arithmetic:
+\(T \approx 300 + 75 P_t + 135 P_c\) ns per options walked. It runs at about 20% of that today
+and about 97% once request 4 is in.
+
+Why: `docs/v2/plan/goals/principles.md` puts each component's bound in the lane's
+`speed-of-light.md`. That file is the lane's, and `share.md` is the only doc this child owns.

@@ -1,28 +1,97 @@
 //! A file's bytes as text, read in place (docs/v2/plan/design/frontend.md item 6,
-//! docs/v2/plan/lanes/frontend/text.md): the front end's `Arc<str>` of a file is the tree's
-//! own allocation, checked to be UTF-8 and cast, never copied. Holding it keeps the bytes
-//! alive as any reader's [`Arc`] does.
+//! docs/v2/plan/lanes/frontend/text.md): a [`Text`] is the file's [`Bytes`] (the tree's own
+//! allocation, or a range of the mapped image), checked to be UTF-8 once and lent as `&str`,
+//! never copied. Holding it keeps the bytes alive as holding the [`Bytes`] does.
 //!
-//! The one unsafe line is the cast of `Arc<[u8]>` to `Arc<str>`; the safe version,
-//! `Arc::<str>::from`, copies the file, which every file the front end reads would pay once
-//! per content.
+//! The unsafe lines are the `&[u8]` to `&str` view of checked bytes, and [`Text::shared`]'s
+//! cast of a heap file's `Arc<[u8]>` to `Arc<str>`; the safe versions check again on every
+//! read or copy the file.
 
-use std::{str::Utf8Error, sync::Arc};
+use std::{fmt, hash, ops::Deref, str::Utf8Error, sync::Arc};
 
 use blaze_ids::ContentId;
+use blaze_image::Corrupt;
 
-use crate::{Mode, Reader, ViewId, Vfs};
+use crate::{Bytes, Mode, Reader, ViewId, Vfs};
 
-/// `bytes` as text: the same allocation, its count moved, nothing copied; or where they stop
-/// being UTF-8.
-pub fn text_of(bytes: Arc<[u8]>) -> Result<Arc<str>, Utf8Error> {
+/// A file's bytes that are UTF-8, lent as `&str`: made only by [`text_of`], which checks them
+/// once. Cloning it takes one count of the file's or the image's bytes.
+#[derive(Clone)]
+pub struct Text {
+    /// UTF-8: checked by [`text_of`], and immutable for as long as a count of them is held.
+    bytes: Bytes,
+}
+
+/// `bytes` as text: the same bytes, nothing copied; or where they stop being UTF-8.
+pub fn text_of(bytes: Bytes) -> Result<Text, Utf8Error> {
     check(&bytes)?;
-    let raw: *const [u8] = Arc::into_raw(bytes);
-    // SAFETY: `raw` is from `Arc::<[u8]>::into_raw`, and `str` has `[u8]`'s layout (size,
-    // alignment and length metadata), which is what `Arc::from_raw` asks of a pointer of
-    // another type. The bytes were checked to be UTF-8 just above, and while two `Arc`s share
-    // them neither can get them mutably, so they stay UTF-8 for as long as this one lives.
-    Ok(unsafe { Arc::from_raw(raw as *const str) })
+    Ok(Text { bytes })
+}
+
+impl Text {
+    pub fn as_str(&self) -> &str {
+        self
+    }
+
+    /// The bytes it is.
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+
+    /// The text as an `Arc<str>` of the same allocation, one count taken, for a heap file;
+    /// `None` for a range of the mapped image, which no `Arc<str>` can hold without a copy.
+    pub fn shared(&self) -> Option<Arc<str>> {
+        let shared = self.bytes.shared()?;
+        assert!(
+            shared.as_ptr() == self.bytes.as_ptr() && shared.len() == self.bytes.len(),
+            "a heap file's `Bytes` are its whole `Arc`"
+        );
+        let raw: *const [u8] = Arc::into_raw(Arc::clone(shared));
+        // SAFETY: `raw` is from `Arc::<[u8]>::into_raw`, and `str` has `[u8]`'s layout (size,
+        // alignment and length metadata), which is what `Arc::from_raw` asks of a pointer of
+        // another type. The `Arc`'s bytes are this text's (asserted just above), which
+        // `text_of` checked to be UTF-8, and while it is shared nothing can get them mutably,
+        // so they stay UTF-8 for as long as the new `Arc` lives.
+        Some(unsafe { Arc::from_raw(raw as *const str) })
+    }
+}
+
+impl Deref for Text {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        // SAFETY: `text_of`, the one way to make a `Text`, checked these bytes are UTF-8, and
+        // `Bytes` lends the same immutable bytes on every deref (a heap file's `Arc` or a range
+        // of the read-only mapped image, either kept alive by the count `self` holds).
+        unsafe { std::str::from_utf8_unchecked(&self.bytes) }
+    }
+}
+
+impl PartialEq for Text {
+    fn eq(&self, other: &Text) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for Text {}
+
+impl hash::Hash for Text {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
+
+impl fmt::Debug for Text {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl fmt::Display for Text {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self)
+    }
 }
 
 /// [`std::str::from_utf8`]'s answer for `bytes`: the ASCII they start with skipped 64 bytes at a
@@ -52,38 +121,40 @@ fn ascii_prefix(bytes: &[u8]) -> usize {
     ascii * 64
 }
 
+/// A file's content ID and mode, and its text or why it has none.
+pub type TextFile = (ContentId, Mode, Result<Text, Utf8Error>);
+
 impl Reader {
-    /// The file at `path` under `root` as text ([`text_of`]): its content ID and mode, and its
-    /// text or why it has none. `None` as for [`Reader::file`].
-    pub fn text(
-        &self,
-        root: ContentId,
-        path: &str,
-    ) -> Option<(ContentId, Mode, Result<Arc<str>, Utf8Error>)> {
-        let (id, mode, bytes) = self.file(root, path)?;
-        Some((id, mode, text_of(bytes)))
+    /// The file at `path` under `root` as text ([`text_of`]). `Ok(None)` and `Err` as for
+    /// [`Reader::file`].
+    pub fn text(&self, root: ContentId, path: &str) -> Result<Option<TextFile>, Corrupt> {
+        Ok(self.file(root, path)?.map(|(id, mode, bytes)| (id, mode, text_of(bytes))))
     }
 }
 
 impl Vfs {
-    /// The file at `path` in `view` as text ([`text_of`]): its content ID, and its text or why
-    /// it has none. `None` as for [`Vfs::read`].
-    pub fn text(&self, view: ViewId, path: &str) -> Option<(ContentId, Result<Arc<str>, Utf8Error>)> {
-        let (node, _) = self.tree.entry(self.open_root(view), path)?;
-        let bytes = self.tree.bytes(node)?;
-        Some((self.tree.id(node), text_of(Arc::clone(bytes))))
+    /// The file at `path` in `view` as text ([`text_of`]): `Ok(None)` for none or a directory,
+    /// `Err` for a file of the image whose page group fails its check.
+    pub fn text(&self, view: ViewId, path: &str) -> Result<Option<TextFile>, Corrupt> {
+        let Some((node, mode)) = self.tree.entry(self.open_root(view), path) else {
+            return Ok(None);
+        };
+        Ok(self.tree.owned(node)?.map(|bytes| (self.tree.id(node), mode, text_of(bytes))))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        hash::{DefaultHasher, Hash, Hasher},
+        sync::Arc,
+    };
 
     use blaze_core::FileName;
     use blaze_ids::ContentId;
 
     use super::{ascii_prefix, check, text_of};
-    use crate::{FILE_DOMAIN, Mode, Op, View, Vfs};
+    use crate::{Bytes, FILE_DOMAIN, Mode, Op, View, Vfs};
 
     /// The check against std's on bytes weighted to where it could differ: long ASCII runs that
     /// cross 64-byte chunks, then a multibyte char, a bad byte, or a char cut by the end.
@@ -111,6 +182,61 @@ mod tests {
         }
     }
 
+    fn heap(bytes: &[u8]) -> (Arc<[u8]>, Bytes) {
+        let shared: Arc<[u8]> = Arc::from(bytes);
+        let bytes = Bytes::from(Arc::clone(&shared));
+        (shared, bytes)
+    }
+
+    /// A file's text, read from bytes, a reader or a view, allocates nothing: it is the tree's
+    /// bytes. So is a heap file's `Arc<str>`.
+    #[test]
+    fn reading_text_allocates_nothing() {
+        let (_, bytes) = heap("fn main() {}\n".repeat(100).as_bytes());
+        let text = blaze_alloc_count::assert_at_most(0, "text_of", || text_of(bytes.clone()));
+        let text = text.expect("UTF-8");
+        let shared = blaze_alloc_count::assert_at_most(0, "Text::shared", || text.shared());
+        assert!(shared.is_some());
+
+        let mut vfs = Vfs::recover(FileName::new("state/journal").unwrap(), 0, &[]).0;
+        let ops = [Op::Write { mode: Mode::Regular, path: "src/lib.rs".into(), bytes: bytes.to_vec() }];
+        let empty = vfs.empty();
+        let root = vfs.commit("main", empty, &ops).unwrap().root;
+        let view = vfs.open(View { root }).unwrap();
+        let reader = vfs.reader();
+        // The first read registers this thread with the reclaimer; reads after it are measured.
+        let _ = reader.text(root, "src/lib.rs");
+        let read = blaze_alloc_count::assert_at_most(0, "Reader::text", || reader.text(root, "src/lib.rs"));
+        assert!(read.unwrap().is_some_and(|(_, _, text)| text.is_ok()));
+        let read = blaze_alloc_count::assert_at_most(0, "Vfs::text", || vfs.text(view, "src/lib.rs"));
+        assert!(read.unwrap().is_some_and(|(_, _, text)| text.is_ok()));
+    }
+
+    /// A heap file's `Arc<str>` is its own `Arc`, one count more; equality, hashing and
+    /// formatting are the `str`'s.
+    #[test]
+    fn a_heap_text_is_shared_as_its_own_arc() {
+        let (shared, bytes) = heap("fn é() {}\n".as_bytes());
+        let text = text_of(bytes).expect("UTF-8");
+        let arc = text.shared().expect("a heap file");
+        assert_eq!(arc.as_ptr(), shared.as_ptr());
+        assert_eq!(&*arc, "fn é() {}\n");
+        assert_eq!(Arc::strong_count(&shared), 3, "the test's, the text's and the `Arc<str>`'s");
+        drop(arc);
+        assert_eq!(Arc::strong_count(&shared), 2);
+
+        let other = text_of(heap(b"fn \xc3\xa9() {}\n").1).unwrap();
+        assert_eq!(text, other);
+        let hash = |it: &dyn Fn(&mut DefaultHasher)| {
+            let mut hasher = DefaultHasher::new();
+            it(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&|h| text.hash(h)), hash(&|h| "fn é() {}\n".hash(h)));
+        assert_eq!(format!("{text}|{text:?}"), "fn é() {}\n|\"fn é() {}\\n\"");
+        assert_eq!(text.as_str(), "fn é() {}\n");
+    }
+
     #[test]
     fn the_ascii_prefix_stops_at_the_chunk_with_a_high_byte() {
         let mut bytes = vec![b'a'; 200];
@@ -124,21 +250,21 @@ mod tests {
 
     #[test]
     fn text_shares_the_bytes() {
-        let bytes: Arc<[u8]> = Arc::from(&b"fn main() {}\n"[..]);
-        let text = text_of(Arc::clone(&bytes)).expect("UTF-8");
+        let (shared, bytes) = heap(b"fn main() {}\n");
+        let text = text_of(bytes).expect("UTF-8");
         assert_eq!(&*text, "fn main() {}\n");
-        assert_eq!(text.as_ptr(), bytes.as_ptr());
-        assert_eq!(Arc::strong_count(&bytes), 2);
+        assert_eq!(text.as_ptr(), shared.as_ptr());
+        assert_eq!(Arc::strong_count(&shared), 2);
         drop(text);
-        assert_eq!(Arc::strong_count(&bytes), 1);
+        assert_eq!(Arc::strong_count(&shared), 1);
     }
 
     #[test]
     fn bytes_that_are_not_utf8_say_where() {
-        let bytes: Arc<[u8]> = Arc::from(&b"ok\xff\xfe"[..]);
-        let error = text_of(Arc::clone(&bytes)).unwrap_err();
+        let (shared, bytes) = heap(b"ok\xff\xfe");
+        let error = text_of(bytes).unwrap_err();
         assert_eq!(error.valid_up_to(), 2);
-        assert_eq!(Arc::strong_count(&bytes), 1, "a refused text drops its count");
+        assert_eq!(Arc::strong_count(&shared), 1, "a refused text drops its count");
     }
 
     #[test]
@@ -152,18 +278,18 @@ mod tests {
         let root = vfs.commit("main", empty, &ops).unwrap().root;
 
         let reader = vfs.reader();
-        let (id, mode, text) = reader.text(root, "src/lib.rs").expect("a file");
+        let (id, mode, text) = reader.text(root, "src/lib.rs").unwrap().expect("a file");
         let text = text.expect("UTF-8");
         assert_eq!((id, mode, &*text), (ContentId::of(FILE_DOMAIN, b"mod a;\n"), Mode::Regular, "mod a;\n"));
-        let (_, _, bytes) = reader.file(root, "src/lib.rs").unwrap();
-        assert_eq!(text.as_ptr(), bytes.as_ptr(), "the tree's allocation, not a copy");
-        assert!(reader.text(root, "data.bin").unwrap().2.is_err());
-        assert!(reader.text(root, "src").is_none());
+        let (_, _, bytes) = reader.file(root, "src/lib.rs").unwrap().expect("a file");
+        assert_eq!(text.as_ptr(), bytes.as_ptr(), "the tree's bytes, not a copy");
+        assert!(reader.text(root, "data.bin").unwrap().expect("a file").2.is_err());
+        assert!(reader.text(root, "src").unwrap().is_none());
 
         let view = vfs.open(View { root }).unwrap();
-        let (id, text) = vfs.text(view, "src/lib.rs").expect("a file");
-        assert_eq!(id, ContentId::of(FILE_DOMAIN, b"mod a;\n"));
+        let (id, mode, text) = vfs.text(view, "src/lib.rs").unwrap().expect("a file");
+        assert_eq!((id, mode), (ContentId::of(FILE_DOMAIN, b"mod a;\n"), Mode::Regular));
         assert_eq!(text.unwrap().as_ptr(), bytes.as_ptr());
-        assert!(vfs.text(view, "missing.rs").is_none());
+        assert!(vfs.text(view, "missing.rs").unwrap().is_none());
     }
 }

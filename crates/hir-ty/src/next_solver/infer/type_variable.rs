@@ -219,7 +219,8 @@ impl<'db> TypeVariableTable<'_, 'db> {
     /// Returns a range of the type variables created during the snapshot.
     pub(crate) fn vars_since_snapshot(&mut self, value_count: usize) -> (Range<TyVid>, Vec<Span>) {
         let range = TyVid::from_usize(value_count)..TyVid::from_usize(self.num_vars());
-        (range.clone(), iter_idx_range(range).map(|index| self.var_span(index)).collect())
+        // alloc: only when fudging, one span per variable made in the snapshot.
+        (range.start..range.end, iter_idx_range(range).map(|index| self.var_span(index)).collect())
     }
 
     /// Returns indices of all root variables that are not yet instantiated.
@@ -230,6 +231,7 @@ impl<'db> TypeVariableTable<'_, 'db> {
                 let (root, value) = self.probe_with_root_vid(vid);
                 root == vid && value.is_unknown()
             })
+            // alloc: once per body, for fallback.
             .collect()
     }
 }

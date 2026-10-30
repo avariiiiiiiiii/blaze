@@ -37,7 +37,7 @@ use hir_ide::{
     ParamEnvAndCrate, PathGenericsSource, PathLoweringDiagnostic, TyLoweringDiagnostic,
     check_orphan_rules,
     db::{AnonConstId, HirDatabase, signature_anon_consts_and_diagnostics},
-    diagnostics::{BodyValidationDiagnostic, UnsafetyReason},
+    diagnostics::BodyValidationDiagnostic,
     display::{DisplayTarget, HirDisplay},
     method_resolution::TraitImpls,
     next_solver::{
@@ -494,18 +494,20 @@ pub struct PrivateField {
     pub field: Field,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnsafeLint {
-    HardError,
-    UnsafeOpInUnsafeFn,
-    DeprecatedSafe2024,
-}
+pub use hir_ty_unsafeck::{UnsafeLint, UnsafetyReason};
 
+/// An operation that needs `unsafe` where it is not: `hir_ty_unsafeck::UnsafeOp` at its syntax.
 #[derive(Debug)]
 pub struct MissingUnsafe {
     pub node: InFile<ExprOrPatPtr>,
     pub lint: UnsafeLint,
     pub reason: UnsafetyReason,
+    /// The first `unsafe_op_in_unsafe_fn` of its function or closure, where rustc notes that an
+    /// unsafe function restricts its caller.
+    pub first: bool,
+    /// In the body of an `unsafe fn`, outside a block: a [`UnsafeLint::DeprecatedSafe2024`]
+    /// there is given only where `unsafe_op_in_unsafe_fn` is not allowed.
+    pub in_unsafe_fn: bool,
 }
 
 #[derive(Debug)]
@@ -1341,19 +1343,16 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         self.collect_expr_store(body, source_map);
         self.emit_inference_errors(def.into(), source_map, type_owner);
 
-        // FIXME: Missing unsafe and body validation should be defined for any `InferBodyId`.
-        let missing_unsafe = hir_ide::diagnostics::missing_unsafe(self.db, def);
-        for (node, reason) in missing_unsafe.unsafe_exprs {
-            match source_map.expr_or_pat_syntax(node) {
+        // FIXME: Body validation should be defined for any `InferBodyId`.
+        for op in hir_ty_unsafeck::unsafety_check(self.db, def).ops() {
+            match source_map.expr_or_pat_syntax(op.node()) {
                 Ok(node) => self.acc.push(
                     MissingUnsafe {
                         node,
-                        lint: if missing_unsafe.fn_is_unsafe {
-                            UnsafeLint::UnsafeOpInUnsafeFn
-                        } else {
-                            UnsafeLint::HardError
-                        },
-                        reason,
+                        lint: op.lint,
+                        reason: op.reason,
+                        first: op.first,
+                        in_unsafe_fn: op.in_unsafe_fn,
                     }
                     .into(),
                 ),
@@ -1361,19 +1360,6 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     // FIXME: Here and elsewhere in this file, the `expr` was
                     // desugared, report or assert that this doesn't happen.
                 }
-            }
-        }
-        for node in missing_unsafe.deprecated_safe_calls {
-            match source_map.expr_syntax(node) {
-                Ok(node) => self.acc.push(
-                    MissingUnsafe {
-                        node,
-                        lint: UnsafeLint::DeprecatedSafe2024,
-                        reason: UnsafetyReason::UnsafeFnCall,
-                    }
-                    .into(),
-                ),
-                Err(SyntheticSyntax) => never!("synthetic DeprecatedSafe2024"),
             }
         }
 

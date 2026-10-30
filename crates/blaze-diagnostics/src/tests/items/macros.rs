@@ -1,5 +1,5 @@
-//! rustc's UI tests of macros: calls of macros that do not exist, `compile_error!`, and
-//! `macro_rules!` definitions rustc refuses.
+//! rustc's UI tests of macros: calls of macros that do not exist, `compile_error!`,
+//! `macro_rules!` definitions rustc refuses, and expansions that do not parse.
 
 use crate::tests::ui;
 
@@ -222,4 +222,29 @@ error: aborting due to 2 previous errors
 
 "#;
     assert_eq!(ui("invalid-fragment-specifier.rs", "2015", source), stderr);
+}
+
+#[test]
+fn an_expansion_that_ends_inside_an_expression_says_so_at_its_last_token() {
+    // tests/ui/parser/issues/issue-68092-unicode-ident-after-incomplete-expr.rs
+    let source = r#"macro_rules! x {
+    ($($c:tt)*) => {
+        $($c)ö*
+    };
+}
+
+fn main() {
+    x!(!); //~ ERROR macro expansion ends with an incomplete expression: expected expression
+}
+"#;
+    let stderr = r#"error: macro expansion ends with an incomplete expression: expected expression
+  --> $DIR/issue-68092-unicode-ident-after-incomplete-expr.rs:8:9
+   |
+LL |     x!(!);
+   |         ^ expected expression
+
+error: aborting due to 1 previous error
+
+"#;
+    assert_eq!(ui("issue-68092-unicode-ident-after-incomplete-expr.rs", "2015", source), stderr);
 }

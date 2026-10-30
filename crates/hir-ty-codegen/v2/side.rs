@@ -1,9 +1,11 @@
 //! What a debugger is told of a function beyond its line rows ([`blaze_codegen::Line`]): its
-//! named locals and where they are while it runs. Kept in the store under
+//! named locals and where they are while it runs, and the code the MIR optimizer inlined
+//! into it and where that was called. Kept in the store under
 //! [`blaze_codegen::CompiledFunction::side`], in postcard, versioned by [`VERSION`].
 
 use std::borrow::Cow;
 
+use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use intern::Symbol;
 use serde_derive::{Deserialize, Serialize};
@@ -11,9 +13,9 @@ use serde_derive::{Deserialize, Serialize};
 use crate::debuginfo::{LineRow, SlotPlaces, VariablePlace};
 
 /// The encoding's version: a change to what is below is a new one.
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 
-const SIDE_DOMAIN: &str = "blaze v2 side 2";
+const SIDE_DOMAIN: &str = "blaze v2 side 3";
 
 /// A named local of a function, as its IR was built: in a stack slot, or at an address the
 /// slot holds. 64 bytes; its name is the body's interned one, a pointer to it.
@@ -42,6 +44,20 @@ pub(crate) struct Scopes {
     pub(crate) parents: Vec<Option<u32>>,
     /// By the statement a line row is of (`LineRow::span`): which scope its code is of.
     pub(crate) of_span: Vec<SpanScope>,
+    /// The bodies the MIR optimizer inlined into the function, each inside the one it was
+    /// inlined into, which comes before it (`MirBody::inlined`'s scopes).
+    pub(crate) inlined: Vec<InlinedScope>,
+    /// By the statement a line row is of: the innermost of `inlined` its code is of, `None`
+    /// for the function's own; empty when nothing is inlined.
+    pub(crate) inlined_of_span: Vec<Option<u32>>,
+}
+
+/// A body inlined into the function at `call_site`, a statement of the body of `parent`, or
+/// of the function's own without one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct InlinedScope {
+    pub(crate) parent: Option<u32>,
+    pub(crate) call_site: SpanRef,
 }
 
 /// A tag and a `u32`, one a statement of the body.
@@ -68,6 +84,17 @@ pub(crate) struct Side<'a> {
     pub(crate) scopes: Vec<Scope>,
     #[serde(borrow)]
     pub(crate) variables: Vec<Told<'a>>,
+    pub(crate) inlined: Vec<Inlined>,
+}
+
+/// Code of a body inlined into the function: the `DW_TAG_inlined_subroutine` it is told as,
+/// whose `DW_AT_call_*` is `call_site`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Inlined {
+    pub(crate) parent: Option<u32>,
+    pub(crate) call_site: SpanRef,
+    /// As [`Scope::ranges`].
+    pub(crate) ranges: Vec<(u32, u32)>,
 }
 
 /// A part of the function its names are looked up in: a block, what follows a `let`.
@@ -125,12 +152,13 @@ pub(crate) fn encode(
             scope: variable.scope,
         })
     }));
-    if told.is_empty() {
+    if told.is_empty() && scopes.inlined.is_empty() {
         return Ok(None);
     }
-    let scopes = ranges(scopes, lines, len)?;
+    let inlined = inlined_ranges(scopes, lines, len)?;
+    let scopes = if told.is_empty() { Vec::new() } else { ranges(scopes, lines, len)? };
     let frame_base = Cow::Borrowed(&slots.frame_base[..]);
-    let side = Side { version: VERSION, frame_base, scopes, variables: told };
+    let side = Side { version: VERSION, frame_base, scopes, variables: told, inlined };
     let bytes = postcard::to_allocvec(&side).map_err(|e| e.to_string())?;
     let id = ContentId::of(SIDE_DOMAIN, &bytes);
     Ok(Some((bytes, id)))
@@ -163,25 +191,58 @@ fn ranges(scopes: &Scopes, lines: &[LineRow], len: u32) -> Result<Vec<Scope>, St
             Some(&SpanScope::In(it)) => scope = Some(it),
             None => return Err(format!("a line row of statement {}, which has no scope", row.span)),
         }
-        let from = row.offset;
-        if from >= to {
-            continue;
-        }
-        let mut at = scope;
-        // Each scope's parent comes before it, so the chain ends within as many steps.
-        for _ in 0..out.len() {
-            let Some(index) = at else { break };
-            let Some(Scope { parent, ranges }) = out.get_mut(index as usize) else {
-                return Err(format!("scope {index} of {}", scopes.parents.len()));
-            };
-            match ranges.last_mut() {
-                Some(last) if last.1 == from => last.1 = to,
-                _ => ranges.push((from, to)),
-            }
-            at = *parent;
-        }
+        let len = out.len();
+        extend(&mut out, |it| (it.parent, &mut it.ranges), scope, (row.offset, to))
+            .map_err(|e| format!("{e} of {len}"))?;
     }
     Ok(out)
+}
+
+/// The code of each of `scopes.inlined`, as [`ranges`] has a scope's: that of each line row
+/// whose statement is of it or of one inlined inside it.
+fn inlined_ranges(scopes: &Scopes, lines: &[LineRow], len: u32) -> Result<Vec<Inlined>, String> {
+    let mut out: Vec<Inlined> = (scopes.inlined.iter())
+        .map(|it| Inlined { parent: it.parent, call_site: it.call_site, ranges: Vec::new() })
+        .collect();
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let ends = lines.iter().skip(1).map(|row| row.offset).chain([len]);
+    for (row, to) in lines.iter().zip(ends) {
+        let Some(&scope) = scopes.inlined_of_span.get(row.span as usize) else {
+            return Err(format!("a line row of statement {}, which is of no body", row.span));
+        };
+        let len = out.len();
+        extend(&mut out, |it| (it.parent, &mut it.ranges), scope, (row.offset, to))
+            .map_err(|e| format!("inlined {e} of {len}"))?;
+    }
+    Ok(out)
+}
+
+/// Adds the code from `from` up to `to` to `scope` and the scopes it is inside of, joining
+/// it to a range it follows.
+fn extend<T>(
+    out: &mut [T],
+    parts: impl Fn(&mut T) -> (Option<u32>, &mut Vec<(u32, u32)>),
+    scope: Option<u32>,
+    (from, to): (u32, u32),
+) -> Result<(), String> {
+    if from >= to {
+        return Ok(());
+    }
+    let mut at = scope;
+    // Each scope's parent comes before it, so the chain ends within as many steps.
+    for _ in 0..out.len() {
+        let Some(index) = at else { break };
+        let Some(it) = out.get_mut(index as usize) else { return Err(format!("scope {index}")) };
+        let (parent, ranges) = parts(it);
+        match ranges.last_mut() {
+            Some(last) if last.1 == from => last.1 = to,
+            _ => ranges.push((from, to)),
+        }
+        at = parent;
+    }
+    Ok(())
 }
 
 /// The table in `bytes`, its names borrowed from them.
@@ -235,6 +296,7 @@ mod tests {
         let scopes = Scopes {
             parents: vec![None, Some(0)],
             of_span: vec![SpanScope::Outside, SpanScope::In(0), SpanScope::In(1), SpanScope::Before],
+            ..Scopes::default()
         };
         let row = |offset, span| LineRow { offset, span };
         let lines = [row(0, 0), row(4, 1), row(8, 2), row(12, 3), row(16, 0)];
@@ -243,5 +305,34 @@ mod tests {
         assert_eq!(ranges[1], Scope { parent: Some(0), ranges: vec![(8, 16)] });
         let unknown = [row(0, 9)];
         assert!(super::ranges(&scopes, &unknown, 4).is_err());
+    }
+
+    /// An inlined body's code is that of its statements' rows and of the bodies inlined into
+    /// it, each told with its call site; a function with no named local still has a table
+    /// for them.
+    #[test]
+    fn inlined_code_is_told_with_its_call_site() {
+        let site = |index| SpanRef { anchor: ContentId::of("test", b"caller"), index };
+        let scopes = Scopes {
+            inlined: vec![
+                InlinedScope { parent: None, call_site: site(1) },
+                InlinedScope { parent: Some(0), call_site: site(2) },
+            ],
+            inlined_of_span: vec![None, Some(0), Some(1)],
+            ..Scopes::default()
+        };
+        let row = |offset, span| LineRow { offset, span };
+        let lines = [row(0, 0), row(4, 1), row(8, 2), row(12, 1), row(16, 0)];
+        let (bytes, _) = encode(&[], &scopes, &SlotPlaces::default(), &lines, 20)
+            .expect("encoded")
+            .expect("a table of the inlined code");
+        let side = decode(&bytes).expect("decoded");
+        assert!(side.variables.is_empty() && side.scopes.is_empty());
+        assert_eq!(side.inlined, [
+            Inlined { parent: None, call_site: site(1), ranges: vec![(4, 16)] },
+            Inlined { parent: Some(0), call_site: site(2), ranges: vec![(8, 12)] },
+        ]);
+        let unknown = [row(0, 9)];
+        assert!(inlined_ranges(&scopes, &unknown, 4).is_err());
     }
 }

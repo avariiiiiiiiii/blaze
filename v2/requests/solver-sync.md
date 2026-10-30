@@ -79,3 +79,4 @@ Why: these files implement or call the solver's traits, so they fail to compile 
 Questions: window `solver-sync`.
 
 > forwarded to db: db-ty-next1 is its child.
+> applied by db-ty-port-solver: items 2 to 5 (`solver.rs`, `fulfill.rs`, `normalize.rs`, `structural_normalize.rs`, `obligation_ctxt.rs`, `inspect.rs`, `format_proof_tree.rs`); `normalize.rs`/`structural_normalize.rs` need `InferCtxt::next_term_var_of_alias_kind` (v2/requests/db-ty.md, db-ty-port-solver).

@@ -44,14 +44,16 @@ pub(crate) const EH_FRAME_HDR: &str = ".eh_frame_hdr";
 /// The `Class::Named` section the loader reads before the program starts, so relro.
 const PREINIT_ARRAY: &str = ".preinit_array";
 
+// dyn: once per link, the format the output names (`model::writer`)
 pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
     if output.format != Format::Elf {
-        return Err(error(format!("the ELF writer was asked for a {:?} image", output.format)));
+        return Err(error(format!("the ELF writer was asked for a {:?} image", output.format))); // alloc: error path
     }
     match output.arch {
         Arch::X86_64 | Arch::Aarch64 => {}
         Arch::Wasm32 => return Err(error("an ELF image for wasm32: wasm is linked as wasm".into())),
     }
+    // clone: once per link, the writer owns its `Output` (the public API's type); alloc: its box
     Ok(Box::new(Elf { output: output.clone() }))
 }
 
@@ -176,7 +178,7 @@ pub(crate) fn section(name: &str, write: bool, exec: bool, tls: bool) -> Result<
         return Err("a section with no name".into());
     }
     if write && exec {
-        return Err(format!("section `{name}` is both writable and executable"));
+        return Err(format!("section `{name}` is both writable and executable")); // alloc: error path
     }
     let under = |prefix: &str| {
         name == prefix || name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.'))

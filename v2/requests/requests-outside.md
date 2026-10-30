@@ -25,9 +25,14 @@ What:
   `generation` is `blaze_vfs::generation()` read before the `stat` that made the answer
   (`None`, `DIRECTORY`, `SPECIAL` or the hash). Append-only, like `Sharded` today; a new answer
   is a new entry under a new generation, never a change to an old one.
-- `Files::file(path)`: if the path's last answer has `blaze_vfs::unchanged_since(path, g)`,
-  return it with no syscall. Otherwise do what it does now, reading the generation first, and
-  record the answer under that generation.
+- `Files::file(path)`: if the path's last answer has `cover.unchanged_since(g)`, return it with
+  no syscall. Otherwise do what it does now, reading the generation first, and record the
+  answer under that generation with `blaze_vfs::cover(path)` (a `Cover<'static>`, 16 bytes,
+  `Copy`; `None` means no directory above it is wanted, so don't vouch). A check through a
+  `Cover` is three loads with no hashing and no ancestor walk
+  (docs/v2/plan/lanes/vfs/speed-of-light-outside.md section 1); `unchanged_since(path, g)` by
+  path hashes the path and is for cold callers only. Call `want` before `cover` on a miss, so
+  the cover is the directory just wanted, or the one above it.
 - Record an answer as one the table may vouch for only when `path` is canonical (no symlink in
   it, no `.` or `..`): `std::fs::canonicalize(path)? == path`, checked on the miss (cold) path
   only. A watch hears nothing of a symlink's target outside it, nor of a symlink above it being
@@ -39,6 +44,15 @@ What:
 
 Why: usercode.md section 11. A C build script's hundreds of header stats on a cache hit
 become two atomic loads per ancestor each.
+
+> forwarded to usercode (told by tmux).
+
+> applied (usercode): `inputs::Files` keeps each path's last answer with `blaze_vfs::cover` and
+> the generation read before its `stat`, under a sequence lock (`Vouched`), and returns it with no
+> syscall while `Cover::unchanged_since`. An answer is vouched for only when the path is canonical
+> (a missing one: its parent is), checked once on its first miss; a miss `want`s the parent. A
+> file that changed while hashed is not recorded. The sysroot, the C compiler's directory and
+> `/usr/include` are wanted through the first header read under each, not by name.
 
 ## 2. cargo: the daemon drives `Outside` and runs one flush round per request
 
@@ -59,3 +73,38 @@ What:
 
 Why: events arrive after the change that made them, so without a round per request a check
 could trust a generation while the request's own edit outside a view is still queued.
+
+> forwarded to cargo (told by tmux).
+
+## 3. coordinator: `blaze-mem` as a workspace dependency
+
+Where: the root `Cargo.toml` `[workspace.dependencies]`:
+`blaze-mem = { path = "crates/blaze-mem" }`.
+
+What and why: docs/v2/plan/design/memory.md puts blaze-vfs's long-lived tables on reserved
+regions tagged `Tag::Vfs`. blaze-vfs (`crates/blaze-vfs/Cargo.toml`, mine for this) can depend
+on it only once it is a workspace dependency, and the manifest lint holds members to
+`workspace = true`.
+
+> applied by requests: `blaze-mem = { path = \"crates/blaze-mem\" }` in the root.
+
+## 4. mem: a column one writer appends to and lock-free readers read
+
+Where: `crates/blaze-mem` (lane mem), e.g. beside `RegionVec`.
+
+What: `RegionVec<T>` pushes through `&mut self` and keeps `len` as a plain `usize`, so a table
+read without a lock while one writer appends can't sit on it. `blaze_vfs::outside::Dirs` is such
+a table (docs/v2/plan/design/concurrency.md: no lock on any read path). It needs a reserved,
+tagged column with:
+- `append(&self, value: T) -> u32`, for one writer at a time (the caller holds its own lock);
+  the value is written, then `len` is published with a release store;
+- `len(&self) -> u32`, an acquire load;
+- `get(&self, at: u32) -> &T` for `at < len()`, a plain indexed load from a base that never
+  moves.
+
+With it, `Dirs` drops its chunked `OnceLock` slots and its copied index tables (today's
+general-purpose allocations, once per doubling) for reserved regions counted under `Tag::Vfs`.
+Until then those stay as they are: cold, once per doubling, justified by `// alloc:` on their
+lines.
+
+> forwarded to mem (told by tmux).

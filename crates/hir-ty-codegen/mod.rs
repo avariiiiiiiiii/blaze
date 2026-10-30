@@ -87,16 +87,18 @@ use self::unwind::{FunctionUnwind, UnwindContext};
 use self::vtable::{Slot, Upcast, VtableLayout};
 pub use hir_ty_mir::mir::location::name_sources;
 use hir_ty_mir::mir::{
-    AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, FrameStorage, LocalId, MirBody,
-    MirEvalError, MirOptLevel, MirOptions, MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem,
-    Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp, interpret_mir,
+    AggregateKind, AssertKind, BasicBlockId, BinOp, CallerLocation, CastKind, FrameStorage,
+    InlinedBody, LocalId, MirBody, MirEvalError, MirOptLevel, MirOptions, MirPhase, MirSpan,
+    Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
+    TerminatorKind, UnOp, caller_location, interpret_mir,
     location::{
         ConcatPart, column_width, concat_parts, line_and_column, located_concats, location_macros,
         location_of, reported_range, source_location_in_file, source_range, track_caller,
         written_call, written_range,
     },
     monomorphized, monomorphized_promoted_mir_body_query,
-    overflow::{body_written_checked, crate_checks_overflow},
+    overflow::crate_checks_overflow,
+    owner_of, source_span, written_checked_at,
 };
 
 mod asm;
@@ -2830,10 +2832,10 @@ fn instance_rows(
 }
 
 fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
-    let Some((owner, spans)) = &compiled.source else { return Vec::new() };
+    let Some(source) = &compiled.source else { return Vec::new() };
     let rows = compiled.code.lines.iter().filter_map(|row| {
-        let span = *spans.get(row.span as usize)?;
-        let (file, line, column) = row_location(db, *owner, compiled.closure, span)?;
+        let at = source.written(row.span, compiled.closure)?;
+        let (file, line, column) = row_location(db, at.owner, at.closure, at.span)?;
         Some((row.offset, file, line, column))
     });
     rows.collect()
@@ -3483,13 +3485,25 @@ pub fn rustc_links_dead_code(links: bool) {
 
 /// What the bodies of `krate` are optimized for: [`mir_opt_level_of`] it, rustc's UB checks
 /// where its `-C debug-assertions` is on (`sess.ub_checks()` of the crate whose MIR it is,
-/// not [`ub_checks_of`], the calling crate's `ub_checks()`), and lifetime markers kept.
+/// not [`ub_checks_of`], the calling crate's `ub_checks()`), lifetime markers kept, and
+/// inlined as rustc's `Inline::is_enabled` says at level 2 ([`rustc_inlines`]).
 fn mir_options_of(db: &dyn HirDatabase, krate: Crate) -> MirOptions {
+    let level = mir_opt_level_of(db, krate);
     MirOptions {
-        level: mir_opt_level_of(db, krate),
+        level,
         ub_checks: debug_assertions(db, krate),
         lifetime_markers: true,
+        inline: rustc_inlines(level, krate.data(db).origin.is_lang(), backend::optimizing()),
     }
+}
+
+/// rustc's `Inline::is_enabled` at `-Zmir-opt-level` `level`: never below 2, and at 2 for
+/// `-Copt-level=2` and 3 (`optimized`), and for the library's crates, whose MIR rustc ships
+/// built at 3. rustc also leaves an incremental build uninlined; blaze's builds are not
+/// rustc's incremental ones, and inlining changes code, never behaviour
+/// ([`v2::build::Build::options`] says the same of a v2 unit).
+fn rustc_inlines(level: MirOptLevel, lang: bool, optimized: bool) -> bool {
+    level == MirOptLevel::Release && (lang || optimized)
 }
 
 /// Whether `options` ask for nothing beyond the runtime body: no passes and no checks.
@@ -4875,7 +4889,7 @@ fn compile_as<'db>(
         }
         None if tier => {
             let named = cg.named_slots().collect();
-            let (source, variables) = described(&mut cg, env, body);
+            let (source, variables) = described(&mut cg, env, body)?;
             let (wants, layouts) = cg.detach();
             let func = std::mem::replace(&mut ctx.func, ir::Function::new());
             spare::keep_context(ctx);
@@ -4892,7 +4906,7 @@ fn compile_as<'db>(
         None => Backend::emit(&mut cg, &mut ctx)?,
     };
     spare::keep_context(ctx);
-    let (source, variables) = described(&mut cg, env, body);
+    let (source, variables) = described(&mut cg, env, body)?;
     let (requests, layouts) = cg.finish();
     // What a build compiled, which a compile at a level above 1 is not part of.
     if !tier {
@@ -4948,7 +4962,7 @@ pub struct Pending {
     func: ir::Function,
     wants: fragment::Wants,
     named: Vec<ir::StackSlot>,
-    source: Option<(DefWithBodyId, Vec<MirSpan>)>,
+    source: Option<fragment::Source>,
     variables: Option<(StoredParamEnvAndCrate, Vec<Variable>)>,
     layouts: Vec<(String, u64, u64)>,
     closure: Option<ExprId>,
@@ -4974,15 +4988,24 @@ impl Pending {
 }
 
 /// What tells the code of a function's lines and variables: the statements of `body` its
-/// instructions were built for, and its locals with a name.
+/// instructions were built for, where each is written ([`fragment::Source`]), and its locals
+/// with a name.
 fn described<'db>(
     cg: &mut Recorder<'db>,
     env: ParamEnvAndCrate<'db>,
     body: Option<&'db MirBody<'db>>,
-) -> (Option<(DefWithBodyId, Vec<MirSpan>)>, Option<(StoredParamEnvAndCrate, Vec<Variable>)>) {
-    let source = match body.map(|body| body.owner) {
-        Some(InferBodyId::DefWithBodyId(owner)) => Some((owner, cg.take_spans())),
-        _ => None,
+) -> Result<(Option<fragment::Source>, Option<(StoredParamEnvAndCrate, Vec<Variable>)>)> {
+    let source = match body {
+        Some(body) => match body.owner {
+            InferBodyId::DefWithBodyId(owner) => {
+                let spans = cg.take_spans();
+                let source = fragment::Source::of(cg.db, owner, body, spans)
+                    .map_err(CodegenError::Unsupported)?;
+                Some(source)
+            }
+            InferBodyId::AnonConstId(_) => None,
+        },
+        None => None,
     };
     let variables = std::mem::take(&mut cg.named)
         .into_iter()
@@ -4994,7 +5017,7 @@ fn described<'db>(
             pointer,
         })
         .collect::<Vec<_>>();
-    (source, Some((env.store(), variables)).filter(|it| !it.1.is_empty()))
+    Ok((source, Some((env.store(), variables)).filter(|it| !it.1.is_empty())))
 }
 
 /// Whether the crate has `panic = "abort"`. The standard library's crates are compiled
@@ -8449,6 +8472,63 @@ fn returned_local(body: &MirBody<'_>) -> LocalId {
 fn return_slot() -> LocalId {
     LocalId::from_raw(la_arena::RawIdx::from(0))
 }
+
+/// A local of a body that holds a promoted constant: `expr` of the expression store of
+/// `owner`, evaluated with the arguments of `callee` of the body's inlined callees, or with the
+/// instance's own for `None`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Promoted<'db> {
+    pub(crate) local: LocalId,
+    pub(crate) owner: InferBodyId<'db>,
+    pub(crate) expr: ExprId,
+    pub(crate) callee: Option<u32>,
+}
+
+impl Promoted<'_> {
+    /// The arguments the constant is evaluated with: of the callee it was inlined from, or
+    /// `own`, the instance's.
+    pub(crate) fn args(
+        &self,
+        body: &MirBody<'_>,
+        own: Option<&StoredGenericArgs>,
+    ) -> Option<StoredGenericArgs> {
+        match self.callee {
+            Some(callee) => Some(body.inlined.callees[callee as usize].args.clone()),
+            None => own.cloned(),
+        }
+    }
+}
+
+/// The promoted constants of `body`: its own (`MirBody::promoted_locals`) and those of the
+/// bodies inlined into it (`Inlined::promoted`).
+pub(crate) fn promoted_constants<'a, 'db>(
+    db: &'db dyn HirDatabase,
+    body: &'a MirBody<'db>,
+) -> impl Iterator<Item = Promoted<'db>> + 'a {
+    let own = body.promoted_locals.iter().map(|&(local, expr)| Promoted {
+        local,
+        owner: body.owner,
+        expr,
+        callee: None,
+    });
+    let inlined = body.inlined.promoted.iter().map(move |it| Promoted {
+        local: it.local,
+        owner: owner_of(db, body.inlined.callees[it.callee as usize].body),
+        expr: it.expr,
+        callee: Some(it.callee),
+    });
+    own.chain(inlined)
+}
+
+/// The locals of `body` that hold a promoted constant, its own and its inlined callees'.
+fn promoted_locals<'a>(body: &'a MirBody<'_>) -> impl Iterator<Item = LocalId> + 'a {
+    let own = body.promoted_locals.iter().map(|it| it.0);
+    own.chain(body.inlined.promoted.iter().map(|it| it.local))
+}
+
+fn is_promoted(body: &MirBody<'_>, local: LocalId) -> bool {
+    promoted_locals(body).any(|it| it == local)
+}
 /// Field accesses can be unaligned (packed structs, chunked copies).
 const MEM: MemFlagsData = MemFlagsData::new().with_notrap();
 
@@ -9851,19 +9931,19 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn promoted_constant(
         &mut self,
         body: &'db MirBody<'db>,
-        expr: ExprId,
+        promoted: Promoted<'db>,
         layout: &Layout,
         plain: bool,
     ) -> Option<Value> {
         let db = self.cg.db;
-        if layout.size.bytes() == 0 || self.mentions_location(body, expr) {
+        if layout.size.bytes() == 0 || self.mentions_location(promoted.owner, promoted.expr) {
             return None;
         }
         let constant = monomorphized_promoted_mir_body_query(
             db,
-            body.owner,
-            expr,
-            self.args.clone()?,
+            promoted.owner,
+            promoted.expr,
+            promoted.args(body, self.args.as_ref())?,
             self.env.store(),
         )
         .ok()?;
@@ -10326,7 +10406,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.held_at.push((local, offset.bytes() as u32));
                 continue;
             }
-            let promoted = body.promoted_locals.iter().find(|it| it.0 == local);
+            let promoted = promoted_constants(self.cg.db, body).find(|it| it.local == local);
             // A slot of its own, which it may share with locals whose storage it never
             // overlaps: see `overlap`.
             if promoted.is_none()
@@ -10344,9 +10424,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 shareable.push((local, slot));
                 continue;
             }
-            let addr = if let Some(&(_, expr)) = promoted {
+            let addr = if let Some(promoted) = promoted {
                 let plain = self.is_plain(data.ty.as_ref());
-                match self.promoted_constant(body, expr, &layout, plain) {
+                match self.promoted_constant(body, promoted, &layout, plain) {
                     Some(addr) => {
                         self.constant_locals.push(local);
                         addr
@@ -10979,8 +11059,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             OperandKind::Constant { konst, ty } => {
                 let ty = ty.as_ref();
-                if let Some(MirSpan::ExprId(expr)) = operand.span()
-                    && let Some(addr) = self.builtin_location(expr, ty)?
+                if let Some((owner, expr)) = self.written_expr(operand.span())
+                    && let Some(addr) = self.builtin_location(owner, expr, ty)?
                 {
                     return Ok((addr, ty));
                 }
@@ -11004,8 +11084,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             OperandKind::Allocation { allocation } => {
                 let allocation = allocation.as_ref();
                 let ty = allocation.ty;
-                if let Some(MirSpan::ExprId(expr)) = operand.span()
-                    && let Some(addr) = self.builtin_location(expr, ty)?
+                if let Some((owner, expr)) = self.written_expr(operand.span())
+                    && let Some(addr) = self.builtin_location(owner, expr, ty)?
                 {
                     return Ok((addr, ty));
                 }
@@ -12045,8 +12125,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if !matches!(ty.kind(), TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_)) {
             return None;
         }
-        if let Some(MirSpan::ExprId(expr)) = operand.span()
-            && self.body.is_some_and(|body| self.location_macro(body, expr).is_some())
+        if let Some((owner, expr)) = self.written_expr(operand.span())
+            && self.location_macro(owner, expr).is_some()
         {
             return None;
         }
@@ -13029,10 +13109,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.ins().select(ordered, converted, zero)
     }
 
-    /// Whether arithmetic of the body being compiled panics when it overflows.
+    /// Whether arithmetic of the statement being compiled panics when it overflows: as the
+    /// body its span is written in says (an inlined callee's crate decides for its code).
     fn checks_overflow(&self) -> Result<bool> {
         let Some(body) = self.body else { return Ok(false) };
-        if !body_written_checked(self.cg.db, body) {
+        if !written_checked_at(self.cg.db, body, self.span) {
             return Ok(false);
         }
         Ok(self.cg.checked)
@@ -13086,38 +13167,47 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
-    /// Whether `expr` is what `line!()`, `column!()` or `file!()` expanded to, and the
-    /// expansion it is in.
+    /// The expression `span` of the body being compiled is, and the body whose expression
+    /// store it is of: of an inlined callee for its code ([`source_span`]).
+    fn written_expr(&self, span: Option<MirSpan>) -> Option<(InferBodyId<'db>, ExprId)> {
+        match source_span(self.cg.db, self.body?, span?) {
+            (owner, MirSpan::ExprId(expr)) => Some((owner, expr)),
+            _ => None,
+        }
+    }
+
+    /// Whether `expr` of the body of `owner` is what `line!()`, `column!()` or `file!()`
+    /// expanded to, and the expansion it is in.
     fn location_macro(
         &self,
-        body: &MirBody<'db>,
+        owner: InferBodyId<'db>,
         expr: ExprId,
     ) -> Option<(BuiltinFnLikeExpander, HirFileId)> {
-        let InferBodyId::DefWithBodyId(owner) = body.owner else { return None };
+        let InferBodyId::DefWithBodyId(owner) = owner else { return None };
         location_macros(self.cg.db, owner).get(&expr).copied()
     }
 
-    /// Whether a promoted expression takes its value from where it is in the source.
-    fn mentions_location(&self, body: &MirBody<'db>, expr: ExprId) -> bool {
-        let InferBodyId::DefWithBodyId(owner) = body.owner else { return false };
-        if self.location_macro(body, expr).is_some()
-            || located_concats(self.cg.db, owner).contains_key(&expr)
+    /// Whether a promoted expression of the body of `owner` takes its value from where it is
+    /// in the source.
+    fn mentions_location(&self, owner: InferBodyId<'db>, expr: ExprId) -> bool {
+        let InferBodyId::DefWithBodyId(def) = owner else { return false };
+        if self.location_macro(owner, expr).is_some()
+            || located_concats(self.cg.db, def).contains_key(&expr)
         {
             return true;
         }
         let mut found = false;
-        Body::of(self.cg.db, owner)
-            .walk_child_exprs(expr, |child| found |= self.mentions_location(body, child));
+        Body::of(self.cg.db, def)
+            .walk_child_exprs(expr, |child| found |= self.mentions_location(owner, child));
         found
     }
 
     /// The `&str` of a literal that a `concat!` with `line!()`, `column!()` or `file!()`
-    /// among its arguments expanded to: the expansion has their placeholders in it.
-    fn located_concat(&mut self, expr: ExprId) -> Result<Option<Value>> {
+    /// among its arguments expanded to, in the body of `owner`: the expansion has their
+    /// placeholders in it.
+    fn located_concat(&mut self, owner: InferBodyId<'db>, expr: ExprId) -> Result<Option<Value>> {
         let db = self.cg.db;
-        let Some(InferBodyId::DefWithBodyId(owner)) = self.body.map(|it| it.owner) else {
-            return Ok(None);
-        };
+        let InferBodyId::DefWithBodyId(owner) = owner else { return Ok(None) };
         let Some(call) = located_concats(db, owner)
             .get(&expr)
             .and_then(|file_id| file_id.macro_file())
@@ -13152,13 +13242,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// The value of a literal that `line!()`, `column!()` or `file!()` expanded to.
     /// rust-analyzer expands them to placeholders, since a real value would make every body
     /// below an edit change.
-    fn builtin_location(&mut self, expr: ExprId, ty: Ty<'db>) -> Result<Option<Value>> {
+    fn builtin_location(
+        &mut self,
+        owner: InferBodyId<'db>,
+        expr: ExprId,
+        ty: Ty<'db>,
+    ) -> Result<Option<Value>> {
         let db = self.cg.db;
-        if let Some(text) = self.located_concat(expr)? {
+        if let Some(text) = self.located_concat(owner, expr)? {
             return Ok(Some(text));
         }
-        let Some((expander, file_id)) = self.body.and_then(|it| self.location_macro(it, expr))
-        else {
+        let Some((expander, file_id)) = self.location_macro(owner, expr) else {
             return Ok(None);
         };
         let Some(site) = written_call(db, file_id) else { return Ok(None) };
@@ -13308,16 +13402,34 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         self.builder.set_srcloc(loc);
     }
 
-    /// A `core::panic::Location` (`{ file: &str, line: u32, col: u32 }`) for `#[track_caller]`.
+    /// A `core::panic::Location` (`{ file: &str, line: u32, col: u32 }`) for `#[track_caller]`:
+    /// where the statement being compiled is written, out through each `#[track_caller]` body
+    /// inlined around it to the call it was inlined at (rustc's `caller_location_span`), or
+    /// the location the caller passes where the function and every body inlined around the
+    /// statement are `#[track_caller]`. A shim passes on what it was given.
     fn caller_location(&mut self) -> Result<Value> {
-        if let Some(location) = self.location {
-            return Ok(location);
-        }
-        let at = match self.body.map(|body| body.owner) {
-            Some(InferBodyId::DefWithBodyId(owner)) => Some((owner, self.span)),
-            _ => None,
+        let Some(body) = self.body else {
+            match self.location {
+                Some(location) => return Ok(location),
+                None => unsupported!("a `Location` in a shim that was given none"),
+            }
         };
-        let location = self.cg.location(at);
+        let (owner, span) = match caller_location(self.cg.db, body, self.span, self.tracked) {
+            CallerLocation::Argument => match self.location {
+                Some(location) => return Ok(location),
+                None => unsupported!(
+                    "the caller's `Location` at {:?} of {:?}, which the function is not given",
+                    self.span,
+                    body.owner
+                ),
+            },
+            CallerLocation::At(InferBodyId::DefWithBodyId(owner), span) => (owner, span),
+            CallerLocation::At(owner, span) => unsupported!(
+                "a `Location` at {span:?} of {owner:?}, which is no item's body: it has no \
+                 place in the source"
+            ),
+        };
+        let location = self.cg.location(Some((owner, span)));
         let location = self.cg.declare_data_in_func(location, self.builder.func);
         Ok(self.builder.ins().symbol_value(ptr(), location))
     }
@@ -19510,7 +19622,7 @@ fn register_locals(body: &MirBody<'_>, forwarded: &FxHashMap<LocalId, LocalId>) 
         .values()
         .chain(&body.param_locals)
         .copied()
-        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain(promoted_locals(body))
         .chain([returned_local(body)])
         .chain(forwarded.iter().flat_map(|(&temp, &to)| [temp, to]))
         .collect();
@@ -19539,7 +19651,7 @@ fn unmentioned_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
             !mentioned.contains(local)
                 && !body.param_locals.contains(local)
                 && *local != returned_local(body)
-                && !body.promoted_locals.iter().any(|it| it.0 == *local)
+                && !is_promoted(body, *local)
                 && !body.upvars_in_place.iter().any(|it| it.0 == *local)
         })
         .collect()
@@ -19619,7 +19731,7 @@ fn returned_in_place(
         && body.locals[local].ty == body.locals[slot].ty
         && !body.param_locals.contains(&local)
         && !body.upvars_in_place.iter().any(|it| it.0 == local)
-        && !body.promoted_locals.iter().any(|it| it.0 == local);
+        && !is_promoted(body, local);
     eligible.then_some(local)
 }
 
@@ -19717,7 +19829,7 @@ fn moved_arguments(
         .values()
         .chain(&body.param_locals)
         .copied()
-        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain(promoted_locals(body))
         .chain(body.upvars_in_place.iter().map(|it| it.0))
         .chain([slot])
         .chain(forwarded.values().copied())
@@ -19727,7 +19839,7 @@ fn moved_arguments(
             && !forwarded.contains_key(&temp)
             && !forwarded.contains_key(&from)
             && from != slot
-            && !body.promoted_locals.iter().any(|it| it.0 == from)
+            && !is_promoted(body, from)
             && mentions[&temp] - dropped_or_read(temp) == 2
             && body.locals[temp].ty == body.locals[from].ty
     });
@@ -19808,14 +19920,14 @@ fn forwarded_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, LocalId> {
         .values()
         .chain(&body.param_locals)
         .copied()
-        .chain(body.promoted_locals.iter().map(|it| it.0))
+        .chain(promoted_locals(body))
         .chain([returned_local(body)])
         .collect();
     forwarded.retain(|&temp, to| {
         !bound.contains(&temp)
             && mentions[&temp] - dropped_or_read(temp) == 2
             && body.locals[temp].ty == body.locals[*to].ty
-            && !body.promoted_locals.iter().any(|it| it.0 == *to)
+            && !is_promoted(body, *to)
             && *to != returned_local(body)
     });
     forwarded
@@ -20386,5 +20498,20 @@ mod tests {
         assert_eq!(super::rustc_mir_opt_level(false, false), Debug);
         assert_eq!(super::rustc_mir_opt_level(true, false), Release);
         assert_eq!(super::rustc_mir_opt_level(false, true), Release);
+    }
+
+    /// MIR is inlined where rustc's `Inline` runs at level 2: the library's crates always,
+    /// another crate only at -O2 and -O3, and never at level 1 or below.
+    #[test]
+    fn mir_is_inlined_where_rustcs_is() {
+        use super::rustc_inlines;
+        use hir_ty_mir::mir::MirOptLevel::{Debug, Off, Release};
+        assert!(rustc_inlines(Release, true, false));
+        assert!(rustc_inlines(Release, false, true));
+        assert!(!rustc_inlines(Release, false, false));
+        for level in [Off, Debug] {
+            assert!(!rustc_inlines(level, true, true));
+            assert!(!rustc_inlines(level, false, true));
+        }
     }
 }

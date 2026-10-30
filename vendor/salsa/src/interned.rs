@@ -154,7 +154,7 @@ unsafe impl<C: Configuration> Sync for Value<C> {}
 
 /// Struct storing the interned fields.
 ///
-/// 24 bytes plus the fields and the memo table on 64-bit targets (`_static_assertions`).
+/// 24 bytes plus the fields on 64-bit targets, the memo row included (`_static_assertions`).
 pub struct Value<C>
 where
     C: Configuration,
@@ -1028,8 +1028,8 @@ where
 
             let mut table_guard = TableDropGuard(table);
 
-            // SAFETY: We have `&mut MemoTable`, so no more references to these memos exist and we are good
-            // to drop them.
+            // SAFETY: We have `&mut MemoTable`, so nobody else reaches these memos through the slot;
+            // retired memos stay valid until the next reclaim, so outstanding borrows remain sound.
             unsafe {
                 table_guard.0.take_memos(|memo_ingredient_index, memo| {
                     let ingredient_index =
@@ -1328,6 +1328,11 @@ where
 
     fn reset_for_new_revision(&mut self, _table: &mut crate::table::Table) {
         self.shards.free_outgrown();
+    }
+
+    unsafe fn reclaim_memos(&self) {
+        // SAFETY: Our caller's contract.
+        unsafe { self.memo_table_types.reclaim() };
     }
 
     fn memo_table_types(&self) -> &Arc<MemoTableTypes> {
@@ -2066,13 +2071,11 @@ mod _static_assertions {
     use std::mem;
 
     use super::{Configuration, Member, Value};
-    use crate::table::memo::MemoTable;
     use crate::{Id, plumbing};
 
-    // A value is its fields and memo table, the ID, `last_interned_at`, and the shard and
-    // durability (padded with one-byte fields to a word): 24 bytes besides the fields and memos.
-    const _: [(); mem::size_of::<Value<DummyConfiguration>>()] =
-        [(); mem::size_of::<MemoTable>() + 3 * mem::size_of::<usize>()];
+    // A value is its fields, the ID, `last_interned_at`, and one word holding the shard, the
+    // durability and the 4-byte memo row: 24 bytes besides the fields.
+    const _: [(); mem::size_of::<Value<DummyConfiguration>>()] = [(); 3 * mem::size_of::<usize>()];
 
     // A reusable value's entry in its shard's sweep list.
     const _: [(); mem::size_of::<Member>()] = [(); 16];

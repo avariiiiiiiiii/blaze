@@ -1,0 +1,407 @@
+//! The front end's one database, [`Db`]: every query of every front-end crate takes `&Db`.
+//!
+//! The type is declared here, in the lowest front-end crate, so that each crate above can name
+//! it: `hir-expand`, `hir-def`, `hir-ty` and the rest declare their queries as salsa tracked
+//! functions over `&Db`, and a call to one is a static call whose memo hit inlines into the
+//! caller (docs/v2/plan/lanes/frontend/db.md). salsa registers each crate's ingredients by
+//! type when the storage is made, so this crate names none of them. A query whose code lives
+//! above the crate that declares it is declared where its key and value types are, and its
+//! body is a provider the crate above installs (rustc's `Providers`); its memo hit is static
+//! all the same.
+//!
+//! There is one `Db` per lowered build and no handle on it: every task reads it through `&Db`,
+//! each with its own query stack, and nothing clones it. A write takes `&mut Db`, so it happens
+//! only once no reader holds `&Db`.
+
+use std::{cell::Cell, fmt, panic, sync::Mutex};
+
+use salsa::Durability;
+use span::{FileId, TextSize};
+use triomphe::Arc;
+use vfs::AnchoredPath;
+
+use crate::{
+    Crate, CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, IncludedFile,
+    LibraryRoots, LocalRoots, Nonce, SourceRoot, SourceRootId, SourceRootInput, ViewChange,
+    ViewError, ViewRoot, set_all_crates_with_durability,
+};
+
+/// The front end's database. See the module.
+#[salsa::db]
+pub struct Db {
+    storage: salsa::Storage<Db>,
+    files: Arc<Files>,
+    crates_map: Arc<CratesMap>,
+    nonce: Nonce,
+    run: Run,
+    /// The events salsa reports, kept only while [`Db::log`] runs; `None` but in a database
+    /// made by [`Db::for_tests`].
+    log: Option<std::sync::Arc<EventLog>>,
+}
+
+/// Where [`Db::run_all`] runs its tasks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Run {
+    /// As plane tasks on the process's one worker pool (`blaze_graph::exec::shared`).
+    Pool,
+    /// On the calling thread, in the order [`RunOrder`] says.
+    Here,
+}
+
+/// The order a database made by [`Db::for_tests`] runs a batch of [`Db::run_all`] in. It has
+/// no plane: the tasks run on the calling thread, and tests vary the order to show that no
+/// result depends on it, as none may on the plane's scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunOrder {
+    InOrder,
+    Reversed,
+    /// Every `n`th task from the first, then every `n`th from the second, and so on.
+    Strided(usize),
+    /// None of them: each result is computed by the query that reads it, as it reads it.
+    LeftToReaders,
+}
+
+thread_local! {
+    static RUN_ORDER: Cell<RunOrder> = const { Cell::new(RunOrder::InOrder) };
+}
+
+/// Has the test databases of this thread run their batches in `order` from now on, and
+/// returns the order they ran them in until now.
+pub fn set_run_order(order: RunOrder) -> RunOrder {
+    RUN_ORDER.replace(order)
+}
+
+type EventLog = Mutex<Option<Vec<salsa::Event>>>;
+
+#[cfg(test)]
+mod tests;
+
+impl Db {
+    /// The database of a build: no crate, no source root, and its batches run as plane tasks
+    /// of the process's pool. What the crates above need set before a query runs (proc-macro
+    /// inputs, attribute expansion) they set on it, as `load-cargo` does.
+    pub fn new() -> Db {
+        Db::with(Run::Pool, None)
+    }
+
+    /// A database for tests: its batches run on the calling thread in this thread's
+    /// [`RunOrder`], it keeps salsa's events while [`Db::log`] runs, and it has empty library
+    /// and local roots and an empty crate graph, as a fixture expects to find them.
+    pub fn for_tests() -> Db {
+        let log = std::sync::Arc::new(EventLog::default());
+        let mut db = Db::with(Run::Here, Some(log));
+        _ = LibraryRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&db);
+        _ = LocalRoots::builder(Default::default()).durability(Durability::MEDIUM).new(&db);
+        CrateGraphBuilder::default().set_in_db(&mut db);
+        db
+    }
+
+    fn with(run: Run, log: Option<std::sync::Arc<EventLog>>) -> Db {
+        let callback = log.clone().map(|log| {
+            Box::new(move |event: salsa::Event| {
+                if let Some(events) = &mut *log.lock().unwrap_or_else(|it| it.into_inner()) {
+                    events.push(event);
+                }
+            }) as Box<dyn Fn(salsa::Event) + Send + Sync> // dyn: salsa's event hook, set once at setup
+        });
+        let mut db = Db {
+            storage: salsa::Storage::new(callback),
+            files: Default::default(),
+            crates_map: Default::default(),
+            nonce: Nonce::new(),
+            run,
+            log,
+        };
+        set_all_crates_with_durability(&mut db, std::iter::empty(), Durability::HIGH);
+        db
+    }
+
+    /// The files, source roots and what was read from outside them.
+    #[inline]
+    pub fn files(&self) -> &Files {
+        &self.files
+    }
+
+    /// Text of the file.
+    #[inline]
+    pub fn file_text(&self, file_id: FileId) -> FileText {
+        self.files.file_text(file_id)
+    }
+
+    /// Whether [`Db::file_text`] has the file: one that is not UTF-8 has no text.
+    #[inline]
+    pub fn has_file_text(&self, file_id: FileId) -> bool {
+        self.files.has_file_text(file_id)
+    }
+
+    pub fn set_file_text(&mut self, file_id: FileId, text: &str) {
+        let files = Arc::clone(&self.files);
+        files.set_file_text(self, file_id, text);
+    }
+
+    pub fn set_file_text_with_durability(
+        &mut self,
+        file_id: FileId,
+        text: &str,
+        durability: Durability,
+    ) {
+        let files = Arc::clone(&self.files);
+        files.set_file_text_with_durability(self, file_id, text, durability);
+    }
+
+    /// Contents of the source root.
+    #[inline]
+    pub fn source_root(&self, id: SourceRootId) -> SourceRootInput {
+        self.files.source_root(id)
+    }
+
+    /// Source root of the file.
+    #[inline]
+    pub fn file_source_root(&self, id: FileId) -> FileSourceRootInput {
+        self.files.file_source_root(self, id)
+    }
+
+    pub fn set_file_source_root_with_durability(
+        &mut self,
+        id: FileId,
+        source_root_id: SourceRootId,
+        durability: Durability,
+    ) {
+        let files = Arc::clone(&self.files);
+        files.set_file_source_root_with_durability(self, id, source_root_id, durability);
+    }
+
+    pub fn set_source_root_with_durability(
+        &mut self,
+        source_root_id: SourceRootId,
+        source_root: Arc<SourceRoot>,
+        durability: Durability,
+    ) {
+        let files = Arc::clone(&self.files);
+        files.set_source_root_with_durability(self, source_root_id, source_root, durability);
+    }
+
+    /// See [`Files::set_appended_root_module`].
+    pub fn set_appended_root_module(
+        &mut self,
+        file_id: FileId,
+        module: Option<&'static str>,
+        durability: Durability,
+    ) {
+        let files = Arc::clone(&self.files);
+        files.set_appended_root_module(self, file_id, module, durability);
+    }
+
+    /// Sets the inputs of one view's files, writing only those that changed: see
+    /// [`Files::set_view_root`].
+    pub fn set_view_root(&mut self, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
+        let files = Arc::clone(&self.files);
+        files.set_view_root(self, view)
+    }
+
+    /// The file of the VFS that `path` names relative to its anchor.
+    pub fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
+        let source_root = self.file_source_root(path.anchor);
+        let source_root = self.source_root(source_root.source_root_id(self));
+        source_root.source_root_ref(self).resolve_path(path)
+    }
+
+    /// The file `path` names relative to its anchor, when it is not one of the files of the
+    /// VFS, as `krate` reads it (`include_bytes!`, `include_str!`): `None` when the anchor has
+    /// no path on disk to be relative to.
+    pub fn included_file(&self, krate: Crate, path: AnchoredPath<'_>) -> Option<IncludedFile> {
+        let root = self.source_root(self.file_source_root(path.anchor).source_root_id(self));
+        let root = root.source_root_ref(self);
+        let anchor = root.path_for_file(&path.anchor)?.as_path()?;
+        let durability = if root.is_library { Durability::HIGH } else { Durability::LOW };
+        let path = anchor.parent()?.absolutize(path.path);
+        Some(self.files.included_file(self, krate, &path, durability))
+    }
+
+    /// Notes that `include!` or a module declaration in `krate` names a file
+    /// [`Db::resolve_path`] has nothing for: one that is not source by its extension, or one
+    /// outside its package, which the VFS does not load until it is asked to. An anchor with no
+    /// path on disk has no file next to it to load, so nothing is noted.
+    pub fn include_source(&self, path: AnchoredPath<'_>, krate: Crate) {
+        let root_id = self.file_source_root(path.anchor).source_root_id(self);
+        let root = self.source_root(root_id);
+        let root = root.source_root_ref(self);
+        if let Some(anchor) = root.path_for_file(&path.anchor).and_then(|it| it.as_path())
+            && let Some(parent) = anchor.parent()
+        {
+            self.files.include_source(&parent.absolutize(path.path), root_id, krate);
+        }
+    }
+
+    /// Notes that `env!` or `option_env!` asked for the variable `key` in `krate`.
+    #[inline]
+    pub fn env_is_read(&self, krate: Crate, key: &str) {
+        self.files.env_is_read(krate, key);
+    }
+
+    /// Notes that `env!` in `krate` found the variable `key` unset, which rustc turns the
+    /// crate down for.
+    #[inline]
+    pub fn env_is_unset(&self, krate: Crate, key: &str) {
+        self.files.env_is_unset(krate, key);
+    }
+
+    #[doc(hidden)]
+    pub fn crates_map(&self) -> Arc<CratesMap> {
+        Arc::clone(&self.crates_map)
+    }
+
+    /// Runs `task(db, i)` for every `i` in `0..count`, and returns once each has run: the
+    /// tasks of a round of macro expansion, or the def maps of a crate's dependencies. Each
+    /// task asks queries and nothing else, so neither the order nor the threads they run on
+    /// changes a result, and the caller reads what they computed afterwards in its own order.
+    ///
+    /// A build's database runs them as plane tasks on the one worker pool, each reading this
+    /// database by reference, and the calling thread pump-waits for them
+    /// (docs/v2/plan/lanes/db.md, "One database, shared by every thread"): no handle per
+    /// thread, no thread of its own. A test database runs them here, in [`RunOrder`].
+    pub fn run_all<F: Fn(&Db, usize) + Sync>(&self, count: usize, task: F) {
+        if count == 0 {
+            return;
+        }
+        match self.run {
+            Run::Pool => run_on_pool(self, blaze_graph::exec::shared(), count, &task),
+            Run::Here => match RUN_ORDER.get() {
+                RunOrder::InOrder => (0..count).for_each(|at| task(self, at)),
+                RunOrder::Reversed => (0..count).rev().for_each(|at| task(self, at)),
+                RunOrder::Strided(stride) => {
+                    let stride = stride.max(1);
+                    (0..stride)
+                        .flat_map(|first| (first..count).step_by(stride))
+                        .for_each(|at| task(self, at));
+                }
+                RunOrder::LeftToReaders => {}
+            },
+        }
+    }
+
+    /// This database's nonce and the revision it is at: what tells a cached answer of another
+    /// database or revision apart.
+    #[inline]
+    pub fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
+        (self.nonce, salsa::plumbing::ZalsaDatabase::zalsa(self).current_revision())
+    }
+
+    /// The line and column of `offset` in `file`, both from 0, as rustc counts them (columns
+    /// in chars): what a proc macro's `Span::line` and `Span::column` answer, less 1. `Err`
+    /// past the text's end, and in a text with nothing after its byte order mark, where rustc
+    /// says line 0.
+    pub fn line_column(&self, file: FileId, offset: TextSize) -> Result<(u32, u32), ()> {
+        let text = self.file_text(file);
+        let place = crate::line_index(self, text).place(offset).ok_or(())?;
+        let column = place.char_column(text.text(self)).ok_or(())?;
+        Ok((place.line().checked_sub(1).ok_or(())?, column - 1))
+    }
+
+    /// The events of `f`, in the order they happened. Batches of [`Db::run_all`] are left to
+    /// the queries that read their results, so the order is the one a test expects of the
+    /// work alone.
+    ///
+    /// # Panics
+    ///
+    /// On a database not made by [`Db::for_tests`]: a build's keeps no events.
+    pub fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
+        let log = self.log.as_ref().expect("`Db::log` on a database not made by `Db::for_tests`");
+        *log.lock().unwrap_or_else(|it| it.into_inner()) = Some(Vec::new());
+        let order = set_run_order(RunOrder::LeftToReaders);
+        f();
+        set_run_order(order);
+        log.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default()
+    }
+
+    /// The names of the queries `f` executed, as salsa names them, in order.
+    pub fn log_executed(&self, f: impl FnOnce()) -> Vec<String> {
+        self.log(f)
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                salsa::EventKind::WillExecute { database_key } => Some(
+                    salsa::Database::ingredient_debug_name(self, database_key.ingredient_index())
+                        .into_owned(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl Default for Db {
+    fn default() -> Db {
+        Db::new()
+    }
+}
+
+impl fmt::Debug for Db {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("base_db::Db").field("run", &self.run).finish_non_exhaustive()
+    }
+}
+
+#[salsa::db]
+impl salsa::Database for Db {
+    /// The plane task this thread runs, from the pool's pump: a thread runs several tasks at
+    /// once, one above the other, and each has its own query stack.
+    #[inline]
+    fn task_depth() -> u32 {
+        u32::try_from(blaze_graph::pump::depth()).expect("a thread runs more than `u32::MAX` tasks")
+    }
+}
+
+impl panic::RefUnwindSafe for Db {}
+
+/// [`Db::run_all`] on `pool`: each task is a job near this thread's group, reading `db` by
+/// reference, and the calling thread pump-waits for the batch ([`Pool::scope`]).
+///
+/// A task that unwinds with [`salsa::Cancelled::WouldWaitOnItself`] asked for a query that a
+/// task below it on its thread runs, which can't end before it does; it runs again in another
+/// round, once every task of this one has ended. A job's completion can't reach its scope, so
+/// the round is the way back. The first other panic, salsa's other cancellations included,
+/// goes on from here once its round is over, and nothing is run again after it.
+///
+/// [`Pool::scope`]: blaze_graph::pool::Pool::scope
+pub fn run_on_pool<F: Fn(&Db, usize) + Sync>(
+    db: &Db,
+    pool: &blaze_graph::pool::Pool,
+    count: usize,
+    task: &F,
+) {
+    let near = blaze_graph::pool::group();
+    let panicked = Mutex::new(None);
+    let again = Mutex::new(Vec::new()); // alloc: setup of one batch, not per task
+    let mut round: Vec<usize> = (0..count).collect(); // alloc: setup of one batch, not per task
+    while !round.is_empty() {
+        pool.scope(|scope| {
+            for &at in &round {
+                let (panicked, again) = (&panicked, &again);
+                scope.submit(
+                    near,
+                    move || task(db, at),
+                    move |ran| {
+                        let Err(panic) = ran else { return };
+                        let waited_on_itself = matches!(
+                            panic.downcast_ref::<salsa::Cancelled>(),
+                            Some(salsa::Cancelled::WouldWaitOnItself)
+                        );
+                        if waited_on_itself {
+                            again.lock().unwrap_or_else(|it| it.into_inner()).push(at);
+                        } else {
+                            let mut first = panicked.lock().unwrap_or_else(|it| it.into_inner());
+                            first.get_or_insert(panic);
+                        }
+                    },
+                );
+            }
+        });
+        round = std::mem::take(&mut *again.lock().unwrap_or_else(|it| it.into_inner()));
+        if panicked.lock().unwrap_or_else(|it| it.into_inner()).is_some() {
+            break;
+        }
+    }
+    if let Some(panic) = panicked.into_inner().unwrap_or_else(|it| it.into_inner()) {
+        panic::resume_unwind(panic);
+    }
+}

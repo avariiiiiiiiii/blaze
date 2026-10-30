@@ -148,7 +148,12 @@ impl Hashes for ItemHashes {
         owner: DefWithBodyId,
         span: MirSpan,
     ) -> Result<SpanRef, String> {
-        let (table, index) = table_of(span);
+        let Ok((table, index)) = table_of(span) else {
+            return Err(format!(
+                "{span:?} of the body of {owner:?}, a span of code inlined into it, which is of \
+                 the body it was inlined from: its place is the inlined span's"
+            ));
+        };
         Ok(SpanRef { anchor: anchors(db, owner).0[table], index })
     }
 
@@ -166,16 +171,18 @@ impl Hashes for ItemHashes {
     }
 }
 
-/// Which table of its owner's a span is in, and its index there.
-fn table_of(span: MirSpan) -> (usize, u32) {
-    match span {
+/// Which table of its owner's a span is in, and its index there; for a span of code inlined
+/// into the owner's body, which is of another's, its index in `Inlined::spans`.
+fn table_of(span: MirSpan) -> Result<(usize, u32), u32> {
+    Ok(match span {
         MirSpan::ExprId(it) => (EXPRS, it.into_raw().into_u32()),
         MirSpan::ExprEnd(it) => (EXPR_ENDS, it.into_raw().into_u32()),
         MirSpan::PatId(it) => (PATS, it.into_raw().into_u32()),
         MirSpan::BindingId(it) => (BINDINGS, it.into_raw().into_u32()),
         MirSpan::SelfParam => (SELF_PARAM, 0),
         MirSpan::Unknown => (UNKNOWN, 0),
-    }
+        MirSpan::Inlined(at) => return Err(at),
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -212,23 +219,39 @@ fn with_spans(
         out.extend_from_slice(&part.0);
     }
     out.extend_from_slice(&names(db, body).0);
-    let mut push = |span: Option<MirSpan>| match span {
-        Some(span) => {
-            let (table, index) = table_of(span);
+    let push = |out: &mut Vec<u8>, span: Option<MirSpan>| match span.map(table_of) {
+        Some(Ok((table, index))) => {
             out.push(table as u8);
             out.extend_from_slice(&index.to_le_bytes());
+        }
+        Some(Err(at)) => {
+            out.push(0xfe);
+            out.extend_from_slice(&at.to_le_bytes());
         }
         None => out.push(0xff),
     };
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
-            push(Some(statement.span));
-            statement.kind.for_each_operand(&mut |it| push(it.span));
+            push(&mut out, Some(statement.span));
+            statement.kind.for_each_operand(&mut |it| push(&mut out, it.span));
         }
         if let Some(terminator) = &block.terminator {
-            push(Some(terminator.span));
-            terminator.kind.for_each_operand(&mut |it| push(it.span));
+            push(&mut out, Some(terminator.span));
+            terminator.kind.for_each_operand(&mut |it| push(&mut out, it.span));
         }
+    }
+    // The spans of inlined code, each of the body of its scope's callee, and where each
+    // scope was inlined at.
+    let inlined = &body.inlined;
+    out.extend_from_slice(&(inlined.spans.len() as u32).to_le_bytes());
+    for span in &inlined.spans {
+        out.extend_from_slice(&span.scope.to_le_bytes());
+        push(&mut out, Some(span.span));
+    }
+    out.extend_from_slice(&(inlined.scopes.len() as u32).to_le_bytes());
+    for scope in &inlined.scopes {
+        out.extend_from_slice(&scope.callee.to_le_bytes());
+        push(&mut out, Some(scope.call_site));
     }
     ContentId::of(CODE_DOMAIN, &out)
 }

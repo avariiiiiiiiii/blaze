@@ -123,6 +123,23 @@ SLOTS: tuple[Slot, ...] = (
     Slot("leak", "auto-trait", (v("arc", HELD="std::sync::Arc::new(5u32)"),
                                 v("rc", rejects=True, HELD="std::rc::Rc::new(5u32)")),
          about="an impl Trait's hidden type stops being Send (auto traits leak)"),
+    # Name resolution per module and the impl buckets (docs/v2/plan/design/frontend.md items 1-3):
+    # `blaze-v2-proof`'s `nameres` cases hold each edit of these, and of `shadow` and `specific`, to
+    # what the facts say it changes.
+    Slot("nameres-item", "item", (v("none", A_EXTRA=""), v("fn", A_EXTRA="pub fn gamma() -> u32 {\n    3\n}"),
+                                  v("use", A_EXTRA="pub use crate::b::beta as gamma;")),
+         about="an item or a use added to a module another module imports one name of"),
+    Slot("nameres-glob", "glob", (v("absent", GLOB_SPARE=""), v("present", GLOB_SPARE="pub fn spare() -> u32 {\n    5\n}")),
+         about="a name nothing reads added to a module another one globs"),
+    Slot("nameres-negative", "glob", (v("prelude drop", GLOB_DROP=""),
+                                      v("glob drop", GLOB_DROP="pub fn drop(s: String) -> usize {\n    s.len()\n}")),
+         about="a name a glob makes visible over the prelude's: the negative fact flips"),
+    Slot("nameres-bucket", "impl", (v("u8, u16", BUCKET_IMPL=""),
+                                    v("and u32", BUCKET_IMPL="impl Weight for u32 {\n    fn weight(self) -> u32 {\n        self * 3\n    }\n}")),
+         about="an impl added for a self type no goal asks about"),
+    Slot("nameres-inherent", "impl", (v("trait only", INHERENT_IMPL=""),
+                                      v("inherent", INHERENT_IMPL="impl Probe {\n    pub fn name(&self) -> &'static str {\n        \"inherent\"\n    }\n}")),
+         about="an inherent method added that a call now resolves to over a trait's"),
     # Layout.
     Slot("pair", "layout", (v("a,b", PAIR_FIELDS="pub a: u8,\npub b: u8,"), v("b,a", PAIR_FIELDS="pub b: u8,\npub a: u8,")),
          about="field order of a struct whose PartialOrd and Debug are derived"),
@@ -334,6 +351,8 @@ BASE_A = """pub fn alpha() -> u32 {
 }
 @@
 @TRIPLE_A@
+@@
+@A_EXTRA@
 """
 
 BASE_B = """pub fn beta() -> u32 {
@@ -360,6 +379,38 @@ impl<T> Fallback for &T {
 }
 @@
 @SPECIFIC_IMPL@
+@@
+pub trait Weight {
+    fn weight(self) -> u32;
+}
+@@
+impl Weight for u8 {
+    fn weight(self) -> u32 {
+        u32::from(self)
+    }
+}
+@@
+impl Weight for u16 {
+    fn weight(self) -> u32 {
+        u32::from(self) * 2
+    }
+}
+@@
+@BUCKET_IMPL@
+@@
+pub struct Probe;
+@@
+pub trait Named {
+    fn name(&self) -> &'static str;
+}
+@@
+impl Named for Probe {
+    fn name(&self) -> &'static str {
+        "trait"
+    }
+}
+@@
+@INHERENT_IMPL@
 """
 
 BASE_SHAPES = """#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
@@ -419,6 +470,10 @@ mod helpers {
     pub fn pick() -> u32 {
         1
     }
+
+    @GLOB_SPARE@
+
+    @GLOB_DROP@
 }
 @@
 mod chooser {
@@ -429,9 +484,15 @@ mod chooser {
     pub fn chosen() -> u32 {
         pick()
     }
+
+    pub fn released() -> String {
+        format!("{:?}", drop(String::from("held")))
+    }
 }
 @@
 pub use chooser::chosen;
+@@
+pub use chooser::released;
 @@
 pub fn fold<T: Into<u64> + Copy>(xs: &[T]) -> u64 {
     @FOLD@
@@ -539,7 +600,7 @@ oracle_base = { path = "../base"@APP_FEATURES@ }
 oracle_mid = { path = "../mid" }
 """
 
-APP_MAIN = """use oracle_base::probe::{Fallback, Specific};
+APP_MAIN = """use oracle_base::probe::{Fallback, Named, Specific, Weight};
 use oracle_mid::Shape;
 use std::panic::{self, Location};
 @@
@@ -576,6 +637,8 @@ fn main() {
     let n = 7;
     println!("inferred width: {}", oracle_base::Width::width_of(n));
     println!("which: {}", (&oracle_base::probe::Marker).which());
+    println!("weight: {} {}", oracle_base::probe::Weight::weight(5u8), 7u16.weight());
+    println!("named: {}", oracle_base::probe::Probe.name());
     println!("flavor: {} {} {}", oracle_base::flavor(), oracle_base::FANCY, oracle_base::EXTRA);
     println!("script: {}", oracle_base::SCRIPT_VALUE);
     println!("source env: {:?}", option_env!("ORACLE_SOURCE_ENV"));
@@ -592,6 +655,7 @@ fn main() {
     println!("gadget: {} {}", std::any::type_name_of_val(&gadget), gadget.id);
     println!("module: {} {}", oracle_mid::@MODNAME@::path(), oracle_mid::where_am_i());
     println!("chosen: {}", oracle_mid::chosen());
+    println!("released: {}", oracle_mid::released());
     println!("fold: {} {}", oracle_mid::fold(&[1u8, 2, 3]), oracle_mid::fold(&[70000u32, 9]));
     for shape in oracle_mid::shapes() {
         println!("shape: {} {}", shape.area(), shape.label());
@@ -843,6 +907,13 @@ REGRESSIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "resolution": (("specific", "present"), ("inference", "and i32"), ("shadow", "local"), ("vtable", "three methods"),
                    ("specific", "absent"), ("vtable", "two methods"), ("combine", "u32,u32,u8->u64"),
                    ("combine", "u32,u32->u128"), ("leak", "rc"), ("leak", "arc")),
+    # docs/v2/plan/design/frontend.md items 1-3: each step is held to the `nameres` case of its slot
+    # (crates/blaze-v2-proof/src/nameres.rs), each slot edited there and back.
+    "nameres": (("nameres-item", "fn"), ("nameres-item", "use"), ("nameres-glob", "present"),
+                ("nameres-negative", "glob drop"), ("shadow", "local"), ("nameres-bucket", "and u32"),
+                ("specific", "present"), ("nameres-inherent", "inherent"), ("nameres-negative", "prelude drop"),
+                ("nameres-item", "none"), ("nameres-bucket", "u8, u16"), ("nameres-inherent", "trait only"),
+                ("specific", "absent"), ("shadow", "glob"), ("nameres-glob", "absent")),
     "features": (("default-features", "none"), ("app-features", "extra"), ("cfg", "off"), ("default-features", "fancy"),
                  ("cfg", "on"), ("app-features", "default")),
 }

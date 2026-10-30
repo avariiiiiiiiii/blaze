@@ -22,12 +22,15 @@ pub enum PrettifyWsKind {
 #[deprecated = "use `hir_expand::prettify_macro_expansion()` instead"]
 pub fn prettify_macro_expansion(
     syn: SyntaxNode,
+    // dyn: asked once a `$crate`, in text made for a person to read.
     dollar_crate_replacement: &mut dyn FnMut(&SyntaxToken, &SyntaxFactory) -> Option<SyntaxToken>,
     inspect_mods: impl FnOnce(&[(Position, PrettifyWsKind)]),
 ) -> SyntaxNode {
     let mut indent = 0;
     let mut last: Option<SyntaxKind> = None;
+    // alloc: the edits, once an expansion shown to a person.
     let mut mods = Vec::new();
+    // alloc: the edits, once an expansion shown to a person.
     let mut dollar_crate_replacements = Vec::new();
     let (editor, syn) = SyntaxEditor::new(syn);
 
@@ -35,12 +38,16 @@ pub fn prettify_macro_expansion(
     let after = Position::after;
 
     let do_indent = |pos: fn(_) -> Position, token: &SyntaxToken, indent| {
+        // clone: a token handle for the edit's position, in text made for a person to read.
         (pos(token.clone()), PrettifyWsKind::Indent(indent))
     };
-    let do_ws =
-        |pos: fn(_) -> Position, token: &SyntaxToken| (pos(token.clone()), PrettifyWsKind::Space);
-    let do_nl =
-        |pos: fn(_) -> Position, token: &SyntaxToken| (pos(token.clone()), PrettifyWsKind::Newline);
+    // clone: a token handle for the edit's position, in text made for a person to read.
+    let do_ws = |pos: fn(_) -> Position, token: &SyntaxToken| {
+        (pos(token.clone()), PrettifyWsKind::Space) // clone: as above.
+    };
+    let do_nl = |pos: fn(_) -> Position, token: &SyntaxToken| {
+        (pos(token.clone()), PrettifyWsKind::Newline) // clone: as above.
+    };
 
     for event in syn.preorder_with_tokens() {
         let token = match event {
@@ -56,6 +63,7 @@ pub fn prettify_macro_expansion(
                     _ => false,
                 };
                 if (!is_last_child && is_non_last_newline) || is_always_newline {
+                    // clone: a node handle for the edit's position, as above.
                     mods.push((Position::after(node.clone()), PrettifyWsKind::Indent(indent)));
                     if node.parent().is_some() {
                         mods.push((Position::after(node), PrettifyWsKind::Newline));
@@ -69,6 +77,7 @@ pub fn prettify_macro_expansion(
             && token.text() == "$crate"
             && let Some(replacement) = dollar_crate_replacement(&token, editor.make())
         {
+            // clone: a token handle for the edit, as above.
             dollar_crate_replacements.push((token.clone(), replacement));
         }
         let tok = &token;
@@ -181,6 +190,7 @@ pub fn prettify_macro_expansion(
         editor.delete(it);
     }
 
+    // clone: the new root's handle, out of the edit it belongs to.
     editor.finish().new_root().clone()
 }
 

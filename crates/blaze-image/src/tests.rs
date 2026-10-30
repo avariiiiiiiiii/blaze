@@ -368,3 +368,66 @@ fn ids_name_their_sections() {
     assert_eq!(SectionId(7).name(), "a section this blaze does not know");
     assert!(SectionId::SYMBOLS.to_string().contains("0x200"));
 }
+
+/// What the VFS keeps: a section as the shared mapping and a range of it, checked whole, the
+/// same bytes `whole` gives; a corrupt group anywhere in it refuses the range.
+#[test]
+fn a_whole_section_is_a_checked_range_of_the_shared_bytes() {
+    use blaze_core::Mapping;
+    let contents = contents();
+    let file = build(12, &contents);
+    let mapping = Mapping(Arc::new(file.clone()));
+    let image = Arc::new(Image::open(mapping.clone()).unwrap());
+    assert!(Arc::ptr_eq(&image.owner().0, &mapping.0));
+    for (id, bytes) in &contents {
+        let section = image.section(*id, schema_a()).unwrap();
+        let range = image.whole_range(&section).unwrap();
+        let kept: (Mapping, std::ops::Range<usize>) = (image.owner().clone(), range.clone());
+        assert_eq!(&kept.0.bytes()[kept.1], &bytes[..]);
+        assert_eq!(range.start as u64, section.at);
+        assert!((0..section.groups).all(|group| image.is_checked(&section, group)));
+    }
+
+    let mut corrupt = file;
+    let section = open(corrupt.clone()).section(A, schema_a()).unwrap();
+    corrupt[section.at as usize + 2 * 4096 + 5] ^= 1;
+    let image = Image::open(Mapping(Arc::new(corrupt))).unwrap();
+    let failed = image.whole_range(&image.section(A, schema_a()).unwrap()).unwrap_err();
+    assert_eq!((failed.section, failed.group), (A, 2));
+}
+
+/// CRCs computed on many workers give the image one core gives, byte for byte.
+#[test]
+fn an_image_finished_on_workers_is_the_serial_one() {
+    let four = |n: usize, job: &(dyn Fn(usize) + Sync)| {
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                scope.spawn(move || (worker..n).rev().step_by(4).for_each(job));
+            }
+        });
+    };
+    let sections = [(A, noise(70 * 4096 + 9, 7)), (C, noise(33 * 4096, 8)), (D, noise(5, 9))];
+    let mut serial = Builder::with_group_shift(12);
+    let mut parallel = Builder::with_group_shift(12);
+    for (id, bytes) in &sections {
+        serial.add(*id, schema_a(), bytes);
+        parallel.add(*id, schema_a(), bytes);
+    }
+    let parallel = parallel.finish_on(&four).unwrap();
+    assert_eq!(parallel, serial.finish().unwrap());
+    assert!(open(parallel).verify().is_empty());
+}
+
+/// A writer names the image it finished as a reader of it will: `hash_of` of the bytes is the
+/// opened image's `hash`. Bytes that are not an image's have none.
+#[test]
+fn a_finished_image_is_named_by_its_hash() {
+    let bytes = build(12, &contents());
+    let named = hash_of(&bytes).unwrap();
+    assert_eq!(named, open(bytes.clone()).hash());
+    assert_ne!(Some(named), hash_of(&build(12, &contents()[..2])));
+    assert_eq!(hash_of(&bytes[..HEADER - 1]), None);
+    let mut other = bytes;
+    other[0] ^= 1;
+    assert_eq!(hash_of(&other), None);
+}

@@ -49,7 +49,6 @@ impl FulfillmentError<'_> {
     }
 }
 
-#[derive(Clone)]
 pub enum FulfillmentErrorCode<'db> {
     /// Inherently impossible to fulfill; this trait is implemented if and only
     /// if it is already implemented.
@@ -89,7 +88,6 @@ impl<'db> fmt::Debug for FulfillmentErrorCode<'db> {
     }
 }
 
-#[derive(Clone)]
 pub struct MismatchedProjectionTypes<'db> {
     pub err: TypeError<'db>,
 }
@@ -226,6 +224,7 @@ fn fulfillment_error_for_stalled<'db>(
     let (obligation, parent_trait_obligations) = if refine_obligation {
         find_best_leaf_obligation(infcx, &root_obligation, true)
     } else {
+        // alloc: error path; an empty `Vec` does not allocate.
         (root_obligation, Vec::new())
     };
 
@@ -251,7 +250,7 @@ fn find_best_leaf_obligation<'db>(
     obligation: &PredicateObligation<'db>,
     consider_ambiguities: bool,
 ) -> (PredicateObligation<'db>, Vec<Predicate<'db>>) {
-    let obligation = infcx.deeply_resolve_ignoring_regions(obligation.clone());
+    let obligation = infcx.deeply_resolve_ignoring_regions(*obligation);
     // FIXME: we use a probe here as the `BestObligation` visitor does not
     // check whether it uses candidates which get shadowed by where-bounds.
     //
@@ -260,8 +259,9 @@ fn find_best_leaf_obligation<'db>(
     let (obligation, parent_trait_obligations) = infcx
         .fudge_inference_if_ok(|| {
             let mut visitor = BestObligation {
-                obligation: obligation.clone(),
+                obligation,
                 consider_ambiguities,
+                // alloc: error path; at most `max_depth` pushes, one per derived level.
                 parent_trait_obligations: Vec::new(),
             };
             infcx
@@ -277,6 +277,7 @@ fn find_best_leaf_obligation<'db>(
         .map(|(cause, obligation, parent_trait_obligations)| {
             (PredicateObligation { cause, ..obligation }, parent_trait_obligations)
         })
+        // alloc: error path; an empty `Vec` does not allocate.
         .unwrap_or((obligation, Vec::new()));
     let parent_trait_obligations =
         deeply_normalize_for_diagnostics(infcx, obligation.param_env, parent_trait_obligations);
@@ -313,7 +314,7 @@ impl<'db> BestObligation<'db> {
 
     fn break_with_current_obligation(&mut self) -> <Self as ProofTreeVisitor<'db>>::Result {
         ControlFlow::Break((
-            self.obligation.clone(),
+            self.obligation,
             std::mem::take(&mut self.parent_trait_obligations),
         ))
     }

@@ -24,3 +24,31 @@ so no caller changes. If `docs/v2/plan/reference/crates.md` ever lists the trait
 should show the new signature.
 
 > applied: nothing to change; `docs/v2/plan/reference/crates.md` lists no `Query` methods.
+
+## 3. Root `Cargo.toml`: `blaze-mem` as a workspace dependency (owner of the root manifest)
+
+- What: `blaze-mem = { path = "crates/blaze-mem" }` under `[workspace.dependencies]`, beside
+  `blaze-reclaim` (line ~140).
+- Why: blaze-query's columns (`table::Rows`: memo rows, value rows, every map's entries) find a
+  row through a dependent load of its chunk's base. Over `blaze_mem::Region` (reserved once,
+  committed as it grows, never moved) a row's address is base + index × size, which takes two
+  dependent L1 loads off every warm hit: from ≈ 1.6× to ≈ 1.2× the hot hit's bound
+  (`docs/v2/plan/lanes/db/speed-of-light.md`, "blaze-query", "Warm hit"). Once it exists,
+  blaze-query adds `blaze-mem.workspace = true` and moves `Rows` onto regions tagged
+  `Tag::Query`.
+
+> applied by requests: `blaze-mem = { path = \"crates/blaze-mem\" }` beside `blaze-reclaim`; new to the lock.
+
+## 4. blaze-graph: run a batch of closures as plane tasks and wait for them, from outside a task (owner of `crates/blaze-graph`)
+
+- What: something like `blaze_graph::scope(|spawn| { spawn(job); ... })`, which runs each job as
+  a plane task and returns once all of them have finished. The caller is a thread that is not in
+  a task (the daemon calling `Database::collect`).
+- Why: `collect`'s marking is one thread walking every reachable memo, about 1.1 s at
+  nushell's scale against 6 ms on all cores
+  (`docs/v2/plan/lanes/db/speed-of-light.md`, "blaze-query", "Collection"). The marks are
+  already a bitset by memo ID, so parallel marking is a `fetch_or` on the shared words, with
+  the roots split across jobs. The database must not start threads of its own, so it needs the
+  plane's.
+
+> applied (core is DONE; nothing new needed): `blaze_graph::pool::Pool::scope(|scope| { scope.submit(None, job, done); .. })` (`pool.rs:417`) is it: jobs that borrow what outlives the call, run on the pool's workers, the call returning once every one has run (a job's panic goes to its `done`). From a thread that is not a worker it parks; on a worker it pumps. The database takes the daemon's `&Pool` (as `ide-db`'s `run_on_pool` does) and starts no threads.

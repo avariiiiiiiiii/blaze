@@ -182,14 +182,17 @@ impl MatcherBuilder {
             match op {
                 Op::Literal(it) => {
                     self.locs.push(Loc::Literal(self.literals.len() as u32));
+                    // clone: a leaf: a symbol, a span and a flag or two, no heap. Built once per rule, when the macro is defined.
                     self.literals.push(it.clone());
                 }
                 Op::Ident(it) => {
                     self.locs.push(Loc::Ident(self.idents.len() as u32));
+                    // clone: a leaf: a symbol, a span and a flag or two, no heap. Built once per rule, when the macro is defined.
                     self.idents.push(it.clone());
                 }
                 Op::Punct(it) => {
                     self.locs.push(Loc::Punct(self.puncts.len() as u32));
+                    // clone: a glued punct, inline. Built once per rule, when the macro is defined.
                     self.puncts.push((**it).clone());
                 }
                 Op::Var { binder, kind, .. } => {
@@ -214,6 +217,7 @@ impl MatcherBuilder {
                     let vars_len = self.rep_vars.len() as u32 - vars_start;
                     let separator = match separator {
                         Some(separator) => {
+                            // clone: a separator leaf. Built once per rule, when the macro is defined.
                             self.separators.push((**separator).clone());
                             (self.separators.len() - 1) as u32
                         }
@@ -513,6 +517,7 @@ impl<'t> Arena<'t> {
                     out.push_node(Binding::Fragment(fragment))
                 }
                 EntryKind::Fragment(fragment) => {
+                    // clone: bindings hold views only; the matcher makes no owned fragment.
                     let fragment = out.push_fragment(self.fragments[fragment as usize].clone());
                     out.push_node(Binding::Fragment(fragment))
                 }
@@ -700,6 +705,7 @@ fn match_loop_inner<'t>(
 
                 // Check if we need a separator.
                 if rep.separator != NONE && !item.sep_matched {
+                    // clone: a cursor, one view.
                     let mut fork = src.clone();
                     if expect_separator(&mut fork, &matcher.separators[rep.separator as usize]) {
                         // The dot stays at the end; the next step starts the next iteration.
@@ -741,6 +747,7 @@ fn match_loop_inner<'t>(
             }
             Loc::Var { binder, kind } => {
                 if let Some(kind) = kind {
+                    // clone: a cursor, one view.
                     let mut fork = src.clone();
                     let match_res = match_meta_var(db, kind, &mut fork, delim_span);
                     match match_res.err {
@@ -786,6 +793,7 @@ fn match_loop_inner<'t>(
                     res.add_err_with(|| {
                         ExpandError::binding_error(
                             token_span(&token, delim_span),
+                            // alloc: an error.
                             format!("expected literal: `{lhs}`"),
                         )
                     });
@@ -809,6 +817,7 @@ fn match_loop_inner<'t>(
                     res.add_err_with(|| {
                         ExpandError::binding_error(
                             token_span(&token, delim_span),
+                            // alloc: an error.
                             format!("expected ident: `{lhs}`"),
                         )
                     });
@@ -819,6 +828,7 @@ fn match_loop_inner<'t>(
             Loc::Punct(lhs) => {
                 let lhs = &matcher.puncts[lhs as usize];
                 let glued = glued.get_or_insert_with(|| {
+                    // clone: a cursor, one view.
                     let mut fork = src.clone();
                     fork.expect_glued_punct().map(|rhs| (rhs, fork))
                 });
@@ -827,6 +837,7 @@ fn match_loop_inner<'t>(
                         if lhs.iter().map(|it| it.char).eq(rhs.iter().map(|it| it.char)) {
                             // The fork is the same for every position matching here.
                             if glued_meta == NONE {
+                                // clone: a cursor, one view.
                                 glued_meta = a.push_meta(fork.clone(), NONE);
                             }
                             item.meta = glued_meta;
@@ -847,6 +858,7 @@ fn match_loop_inner<'t>(
                                 let lhs = lhs.iter().map(|it| it.char).collect::<String>();
                                 ExpandError::binding_error(
                                     rhs[0].span,
+                                    // alloc: an error.
                                     format!("expected punct: `{lhs}`"),
                                 )
                             }
@@ -954,6 +966,7 @@ fn match_loop<'t>(
                 // We've matched a possibly "glued" punct or a separator. The match must be the
                 // same for all items. We already bumped, so no need to call `.next()` like in
                 // the other branch.
+                // clone: a cursor, one view.
                 src = a.metas[meta as usize].iter.clone();
                 for item in &mut a.next_items {
                     item.meta = NONE;
@@ -961,6 +974,7 @@ fn match_loop<'t>(
             } else {
                 match src.next() {
                     Some(TtElement::Subtree(_, subtree_iter)) => {
+                        // clone: a cursor, one view.
                         a.stack.push(src.clone());
                         src = subtree_iter;
                     }
@@ -984,6 +998,7 @@ fn match_loop<'t>(
             let Loc::Var { binder, .. } = matcher.locs[item.dot as usize] else { unreachable!() };
             let meta = std::mem::replace(&mut item.meta, NONE);
             let Meta { iter, fragment } = &a.metas[meta as usize];
+            // clone: a cursor, one view.
             let (iter, fragment) = (iter.clone(), *fragment);
             let entry =
                 if fragment != NONE { EntryKind::Fragment(fragment) } else { EntryKind::Optional };
@@ -1108,6 +1123,7 @@ fn is_fragment(tree: tt::TokenTreesView<'_>) -> bool {
 
 /// A literal, which may be one that an earlier expansion took as an expression.
 fn expect_literal(input: &mut TtIter<'_>) -> Result<(), ()> {
+    // clone: a cursor, one view.
     let mut fork = input.clone();
     if let Ok((subtree, mut inner)) = fork.expect_subtree()
         && subtree.delimiter.kind == tt::DelimiterKind::Invisible
@@ -1123,6 +1139,7 @@ fn expect_literal(input: &mut TtIter<'_>) -> Result<(), ()> {
 }
 
 fn expect_separator(iter: &mut TtIter<'_>, separator: &Separator) -> bool {
+    // clone: a cursor, one view.
     let mut fork = iter.clone();
     let ok = match separator {
         Separator::Ident(lhs) => match fork.expect_ident_or_underscore() {

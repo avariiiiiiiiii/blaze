@@ -31,7 +31,7 @@ fn until(store: &Store, what: &str, mut done: impl FnMut(&Store) -> bool) {
     loop {
         let check = store.to_check();
         store.checked(check, |_| false);
-        store.collect();
+        store.sweep();
         if done(store) {
             return;
         }
@@ -73,6 +73,33 @@ fn a_value_locations_generation_refuses_a_stale_swap() {
     assert_eq!(store.stored(&task, memo), Stored::Disk(ContentId([2; 32])));
     assert_eq!(store.bytes(&task, memo), Some(ON_DISK));
     assert!(!store.evict(&task, memo), "a mapped value is not in memory");
+}
+
+/// A hit reads a value's bytes from the memo's own line: the copy there follows every swap of
+/// the value's word, and is never used once the word names another value.
+#[test]
+fn a_memos_line_holds_where_its_current_value_is() {
+    let store = Store::new();
+    let code = store.code(SCHEMA, ContentId([1; 32]));
+    let memo = store.make(key(1), Fingerprint(8), code, &[], b"made");
+    let task = blaze_reclaim::enter();
+    let inline = |store: &Store| {
+        store.hot(&task, memo).inline().map(|(bytes, len)| {
+            // SAFETY: the copy names the value the word names, which this task holds.
+            unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec()
+        })
+    };
+    assert_eq!(inline(&store).as_deref(), Some(&b"made"[..]), "set when the memo is made");
+    assert!(store.evict(&task, memo));
+    assert_eq!(inline(&store), None, "no value, no copy");
+    assert_eq!(store.bytes(&task, memo), None);
+    store.refill(&task, memo, b"again");
+    assert_eq!(inline(&store).as_deref(), Some(&b"again"[..]), "rewritten by the refill's swap");
+    let (word, _) = store.in_memory(&task, memo).expect("refilled");
+    // SAFETY: a static outlives the store.
+    assert!(unsafe { store.to_disk(&task, memo, word, ON_DISK, ContentId([2; 32])) });
+    assert_eq!(inline(&store).as_deref(), Some(ON_DISK), "and by the cold write's");
+    assert_eq!(store.bytes(&task, memo), Some(ON_DISK));
 }
 
 /// Each task's edges are copied once, with its memo, into its thread's edge segment: one

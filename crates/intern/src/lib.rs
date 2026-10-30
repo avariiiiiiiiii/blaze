@@ -1,6 +1,9 @@
 //! Global interning in sharded, append-only arenas (docs/v2/plan/lanes/format.md section 5, "IDs, two
-//! kinds"): an interned value is stored once, never moves and is never freed, and its handle is
-//! a `Copy` pointer compared by address.
+//! kinds"): an interned value is stored once, never moves and is never freed while the process
+//! runs. An [`Interned`]'s handle is a `Copy` pointer compared by address. A [`Symbol`]'s and a
+//! [`Mapped`] value's is a `u32` ID that means the same in every process restoring one image
+//! (docs/v2/plan/design/restore.md): written into it, opened in place, and freed only by its GC
+//! ([`Live`]), which never renumbers a value still named.
 
 mod arena;
 mod intern;
@@ -17,6 +20,7 @@ pub use self::intern_slice::{
 };
 pub use self::mapped::{Id, Mapped};
 pub use self::symbol::{
-    KnownNames, Symbol, order_key, restore_symbols, symbols as sym, symbols_schema, write_symbols,
+    KnownNames, Symbol, order_key, restore_symbols, restored_from, symbols as sym, symbols_schema,
+    write_symbols,
 };
-pub use self::table::{Live, RestoreError};
+pub use self::table::{Jobs, Live, RestoreError, serial};

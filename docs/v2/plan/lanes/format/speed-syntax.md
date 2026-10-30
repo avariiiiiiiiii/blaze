@@ -25,9 +25,11 @@ character of whitespace. On top of that, every literal heap-allocated an error s
 error went through a `Vec<String>` per token.
 
 **After**:
-- `scan::Classes` makes three bitmaps of the text in one pass, 64 bytes per step, on
-  AVX-512BW, AVX2 or NEON, chosen at run time: ASCII identifier bytes, ASCII whitespace and
-  `\n`. They cost 24 bytes per 64 of text, for the lexing only.
+- `scan::Classes` makes bitmaps of the text in one pass, 64 bytes per step, on AVX-512BW,
+  AVX2 or NEON, chosen at run time: ASCII identifier bytes, ASCII whitespace, `\n`, and `"`
+  or `\`. The whitespace bitmap is then replaced by token starts. They cost 32 bytes per 64
+  of text, for the lexing only (format-lexer's section of
+  [speed-of-light.md](speed-of-light.md) has the token loop over them).
 - `scan::token` lexes from them every token that the bytes alone decide:
   - a whitespace or identifier run is one `trailing_zeros` per 64 bytes;
   - a line comment's end is the next newline bit;

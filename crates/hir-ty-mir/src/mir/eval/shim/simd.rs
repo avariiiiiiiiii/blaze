@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    ops::{Add, Div, Mul, Rem, Sub},
+    ops::{Add, Div, Mul, Range, Rem, Sub},
 };
 
 use crate::consteval::try_const_usize;
@@ -51,6 +51,24 @@ impl Lane {
 
     fn read(self, bytes: &[u8]) -> u128 {
         self.extend(u128::from_le_bytes(pad16(bytes, IsSigned::No)))
+    }
+}
+
+/// The lanes of a vector of any lane type, moved as they are: their bytes, `size` each, and
+/// which of them are initialized and carry a pointer's provenance.
+struct Lanes<S> {
+    size: usize,
+    bytes: Vec<u8>,
+    shadow: S,
+}
+
+impl<S> Lanes<S> {
+    fn len(&self) -> usize {
+        self.bytes.len() / self.size
+    }
+
+    fn range(&self, index: usize) -> Range<usize> {
+        index * self.size..(index + 1) * self.size
     }
 }
 
@@ -412,11 +430,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok((len, self.simd_lane(lane)?))
     }
 
+    /// The lanes of a vector the intrinsic computes with, which must be initialized.
     fn read_lanes(&self, arg: &IntervalAndTy<'db>) -> Result<'db, (Lane, Vec<u128>)> {
         let (len, lane) = self.simd_lanes(arg.ty)?;
-        let Some(bytes) = arg.get(self)?.get(..len * lane.size()) else {
+        if arg.interval.size < len * lane.size() {
             return Err(MirEvalError::InternalError("simd vector smaller than its lanes".into()));
-        };
+        }
+        let bytes = self.read_scalar(arg.interval.slice(0..len * lane.size()))?;
         Ok((lane, bytes.chunks(lane.size()).map(|it| lane.read(it)).collect()))
     }
 
@@ -431,19 +451,67 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         destination.write_from_bytes(self, &bytes)
     }
 
-    /// The lanes of a vector of any lane type, as their bytes.
+    /// The lanes of a vector of any lane type, with what each carries.
     fn lanes_of(
         &self,
         arg: &IntervalAndTy<'db>,
         locals: &Locals<'db>,
-    ) -> Result<'db, Vec<Vec<u8>>> {
+    ) -> Result<'db, Lanes<M::Shadow>> {
         let (len, lane) = self.detect_simd_ty(arg.ty)?;
         let size = self.size_of_sized(lane, locals, "a lane of a simd vector")?;
-        let bytes = arg.get(self)?;
-        let (true, Some(bytes)) = (size != 0, bytes.get(..len * size)) else {
+        if size == 0 || arg.interval.size < len * size {
             return Err(MirEvalError::InternalError("simd vector smaller than its lanes".into()));
-        };
-        Ok(bytes.chunks(size).map(<[u8]>::to_vec).collect())
+        }
+        let (bytes, shadow) = self.read_shadowed(arg.interval.addr, len * size)?;
+        Ok(Lanes { size, bytes: bytes.to_vec(), shadow })
+    }
+
+    /// Lane `index` of `from` put at the end of `bytes`, and what it carries over `shadow`.
+    fn push_lane(
+        &self,
+        bytes: &mut Vec<u8>,
+        shadow: &mut M::Shadow,
+        from: &Lanes<M::Shadow>,
+        index: usize,
+    ) {
+        let range = from.range(index);
+        if M::CHECKS {
+            shadow.put(bytes.len(), &from.shadow.slice(range.clone()));
+        }
+        bytes.extend_from_slice(&from.bytes[range]);
+    }
+
+    /// The pointer in lane `index` of `vector`, a vector of thin pointers, with its provenance.
+    fn pointer_lane(&self, vector: &IntervalAndTy<'db>, index: usize) -> Result<'db, Address> {
+        let size = self.ptr_size();
+        if vector.interval.size < (index + 1) * size {
+            return Err(MirEvalError::InternalError("simd vector smaller than its lanes".into()));
+        }
+        self.read_pointer(vector.interval.addr.offset(index * size))
+    }
+
+    /// The number of lanes of `vector`, of thin pointers or of `usize`, which fill it and
+    /// `destination`.
+    fn check_pointer_lanes(
+        &self,
+        op: SimdOp,
+        vector: &IntervalAndTy<'db>,
+        destination: Interval,
+    ) -> Result<'db, usize> {
+        let (len, _) = self.detect_simd_ty(vector.ty)?;
+        let size = len * self.ptr_size();
+        if vector.interval.size != size || destination.size != size {
+            return Err(MirEvalError::InternalError(
+                format!(
+                    "{} of a vector of {} bytes to one of {}, of {len} lanes of pointers",
+                    Intrinsic::Simd(op),
+                    vector.interval.size,
+                    destination.size
+                )
+                .into(),
+            ));
+        }
+        Ok(len)
     }
 
     /// The lanes of a mask, each of which must be all zeros (false) or all ones (true).
@@ -479,11 +547,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             },
             _ => self.detect_simd_ty(index.ty)?.0,
         };
-        let Some(bytes) = index.get(self)?.get(..len * 4) else {
+        if index.interval.size < len * 4 {
             return Err(MirEvalError::InternalError(
                 "simd_shuffle index smaller than its len".into(),
             ));
-        };
+        }
+        let bytes = self.read_scalar(index.interval.slice(0..len * 4))?;
         Ok(bytes
             .chunks_exact(4)
             .map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]))
@@ -500,19 +569,25 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         locals: &Locals<'db>,
     ) -> Result<'db, ()> {
         let mut lanes = self.lanes_of(left, locals)?;
-        lanes.extend(self.lanes_of(right, locals)?);
-        let mut result = vec![];
+        let right = self.lanes_of(right, locals)?;
+        check_lanes(op, lanes.len(), right.len())?;
+        if M::CHECKS {
+            lanes.shadow.put(lanes.bytes.len(), &right.shadow);
+        }
+        lanes.bytes.extend_from_slice(&right.bytes);
+        let mut result = Vec::with_capacity(indices.len() * lanes.size);
+        let mut shadow = M::Shadow::default();
         for &index in indices {
-            let Some(lane) = lanes.get(index as usize) else {
+            if index as usize >= lanes.len() {
                 return Err(MirEvalError::UndefinedBehavior(format!(
                     "`{}` index {index} is out of bounds of two vectors of {} lanes",
                     Intrinsic::Simd(op),
                     lanes.len() / 2
                 )));
-            };
-            result.extend_from_slice(lane);
+            }
+            self.push_lane(&mut result, &mut shadow, &lanes, index as usize);
         }
-        destination.write_from_bytes(self, &result)
+        self.write_shadowed(destination.addr, &result, &shadow)
     }
 
     /// Fails unless `ptr` is aligned as the `SimdAlign` argument of a masked load or store asks.
@@ -531,7 +606,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             ));
         };
         let align = self.allocate_const_in_heap(locals, align)?;
-        let align = match align.get(self)? {
+        let align = match self.peek_memory(align.addr, align.size)? {
             // `SimdAlign::Unaligned`, `Element` and `Vector`.
             [0] => return Ok(()),
             [1] => {
@@ -569,10 +644,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "simd bit op args are not provided".into(),
                     ));
                 };
-                let result = left
-                    .get(self)?
+                let result = self
+                    .read_scalar(left.interval)?
                     .iter()
-                    .zip(right.get(self)?)
+                    .zip(self.read_scalar(right.interval)?)
                     .map(|(&it, &y)| match op {
                         SimdOp::And => it & y,
                         SimdOp::Or => it | y,
@@ -701,23 +776,56 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     .collect::<Result<'_, Vec<_>>>()?;
                 self.write_lanes(destination, to, &result)
             }
-            SimdOp::CastPtr | SimdOp::ExposeProvenance | SimdOp::WithExposedProvenance => {
+            SimdOp::CastPtr => {
                 let [vector] = args else {
                     return Err(simd_args(op));
                 };
-                let bytes = vector.get(self)?.to_vec();
-                if bytes.len() != destination.size {
+                if vector.interval.size != destination.size {
                     return Err(MirEvalError::InternalError(
                         format!(
                             "{} of a vector of {} bytes to one of {}",
                             Intrinsic::Simd(op),
-                            bytes.len(),
+                            vector.interval.size,
                             destination.size
                         )
                         .into(),
                     ));
                 }
-                destination.write_from_bytes(self, &bytes)
+                let (bytes, shadow) = self.read_shadowed(vector.interval.addr, destination.size)?;
+                let bytes = bytes.to_vec();
+                self.write_shadowed(destination.addr, &bytes, &shadow)
+            }
+            SimdOp::ExposeProvenance => {
+                let [vector] = args else {
+                    return Err(simd_args(op));
+                };
+                let len = self.check_pointer_lanes(op, vector, destination)?;
+                let mut result = Vec::with_capacity(destination.size);
+                for i in 0..len {
+                    let ptr = self.pointer_lane(vector, i)?;
+                    if M::CHECKS {
+                        self.machine.expose(self.ptr(ptr))?;
+                    }
+                    result.extend_from_slice(&ptr.to_bytes());
+                }
+                destination.write_from_bytes(self, &result)
+            }
+            SimdOp::WithExposedProvenance => {
+                let [vector] = args else {
+                    return Err(simd_args(op));
+                };
+                let len = self.check_pointer_lanes(op, vector, destination)?;
+                let size = self.ptr_size();
+                let bytes = self.read_scalar(vector.interval)?.to_vec();
+                let mut shadow = M::Shadow::default();
+                if M::CHECKS {
+                    for i in 0..len {
+                        let addr = Address::from_bytes(&bytes[i * size..(i + 1) * size])?;
+                        let prov = self.machine.from_exposed(addr.to_usize() as u64);
+                        shadow.put(i * size, &M::Shadow::pointer(size, prov));
+                    }
+                }
+                self.write_shadowed(destination.addr, &bytes, &shadow)
             }
             SimdOp::Select => {
                 let [mask, yes, no] = args else {
@@ -727,12 +835,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let (yes, no) = (self.lanes_of(yes, locals)?, self.lanes_of(no, locals)?);
                 check_lanes(op, mask.len(), yes.len())?;
                 check_lanes(op, mask.len(), no.len())?;
-                let result = mask
-                    .iter()
-                    .zip(yes.iter().zip(&no))
-                    .flat_map(|(&mask, (yes, no))| (if mask { yes } else { no }).iter().copied())
-                    .collect::<Vec<_>>();
-                destination.write_from_bytes(self, &result)
+                let mut result = Vec::with_capacity(yes.bytes.len());
+                let mut shadow = M::Shadow::default();
+                for (i, &mask) in mask.iter().enumerate() {
+                    self.push_lane(&mut result, &mut shadow, if mask { &yes } else { &no }, i);
+                }
+                self.write_shadowed(destination.addr, &result, &shadow)
             }
             SimdOp::SelectBitmask => {
                 let [mask, yes, no] = args else {
@@ -740,25 +848,23 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 // An unsigned integer or an array of `u8`, which on a little-endian target are
                 // the same bits.
-                let mask = mask.get(self)?;
-                if mask.len() > 16 {
+                if mask.interval.size > 16 {
                     not_supported!("`simd_select_bitmask` with a mask of more than 128 bits");
                 }
+                let mask = self.read_scalar(mask.interval)?;
                 let mask = u128::from_le_bytes(pad16(mask, IsSigned::No));
                 let (yes, no) = (self.lanes_of(yes, locals)?, self.lanes_of(no, locals)?);
                 check_lanes(op, yes.len(), no.len())?;
                 if yes.len() > 128 {
                     not_supported!("`simd_select_bitmask` of more than 128 lanes");
                 }
-                let result = yes
-                    .iter()
-                    .zip(&no)
-                    .enumerate()
-                    .flat_map(|(i, (yes, no))| {
-                        (if (mask >> i) & 1 == 1 { yes } else { no }).iter().copied()
-                    })
-                    .collect::<Vec<_>>();
-                destination.write_from_bytes(self, &result)
+                let mut result = Vec::with_capacity(yes.bytes.len());
+                let mut shadow = M::Shadow::default();
+                for i in 0..yes.len() {
+                    let from = if (mask >> i) & 1 == 1 { &yes } else { &no };
+                    self.push_lane(&mut result, &mut shadow, from, i);
+                }
+                self.write_shadowed(destination.addr, &result, &shadow)
             }
             SimdOp::Bitmask => {
                 let [vector] = args else {
@@ -782,22 +888,38 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     _ => return Err(simd_args(op)),
                 };
                 let mut lanes = self.lanes_of(vector, locals)?;
-                let index = from_bytes!(u32, index.get(self)?) as usize;
+                let index = from_bytes!(u32, self.read_scalar(index.interval)?) as usize;
                 let len = lanes.len();
-                let Some(lane) = lanes.get_mut(index) else {
+                if index >= len {
                     return Err(MirEvalError::UndefinedBehavior(format!(
                         "`{}` index {index} is out of bounds of a vector of {len} lanes",
                         Intrinsic::Simd(op)
                     )));
-                };
+                }
+                let range = lanes.range(index);
                 match value {
                     None => {
-                        let lane = lane.clone();
-                        destination.write_from_bytes(self, &lane)
+                        let shadow = lanes.shadow.slice(range.clone());
+                        self.write_shadowed(destination.addr, &lanes.bytes[range], &shadow)
                     }
                     Some(value) => {
-                        *lane = value.get(self)?.to_vec();
-                        destination.write_from_bytes(self, &lanes.concat())
+                        if value.interval.size != lanes.size {
+                            return Err(MirEvalError::InternalError(
+                                format!(
+                                    "{} of a value of {} bytes into lanes of {}",
+                                    Intrinsic::Simd(op),
+                                    value.interval.size,
+                                    lanes.size
+                                )
+                                .into(),
+                            ));
+                        }
+                        let (bytes, shadow) = self.read_shadowed(value.interval.addr, lanes.size)?;
+                        lanes.bytes[range.clone()].copy_from_slice(bytes);
+                        if M::CHECKS {
+                            lanes.shadow.put(range.start, &shadow);
+                        }
+                        self.write_shadowed(destination.addr, &lanes.bytes, &lanes.shadow)
                     }
                 }
             }
@@ -826,7 +948,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let mut values = values.into_iter();
                 let mut result = match init {
-                    Some(init) => lane.read(init.get(self)?),
+                    Some(init) => lane.read(self.read_scalar(init.interval)?),
                     None => values.next().ok_or_else(|| {
                         MirEvalError::InternalError(
                             format!("{} of a vector with no lanes", Intrinsic::Simd(op)).into(),
@@ -863,36 +985,53 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "simd_splat args are not provided".into(),
                     ));
                 };
-                let value = value.get(self)?;
-                if value.is_empty() {
+                let size = value.interval.size;
+                if size == 0 {
                     return Ok(());
                 }
-                let result = value.repeat(destination.size / value.len());
-                destination.write_from_bytes(self, &result)
+                let (value, lane) = self.read_shadowed(value.interval.addr, size)?;
+                let len = destination.size / size;
+                let result = value.repeat(len);
+                let mut shadow = M::Shadow::default();
+                if M::CHECKS {
+                    for i in 0..len {
+                        shadow.put(i * size, &lane);
+                    }
+                }
+                self.write_shadowed(destination.addr, &result, &shadow)
             }
             SimdOp::Gather | SimdOp::Scatter => {
                 let [values, ptrs, mask] = args else {
                     return Err(simd_args(op));
                 };
                 let mut lanes = self.lanes_of(values, locals)?;
-                let (_, ptrs) = self.read_lanes(ptrs)?;
                 let mask = self.read_mask(mask, op)?;
-                check_lanes(op, lanes.len(), ptrs.len())?;
+                check_lanes(op, lanes.len(), self.detect_simd_ty(ptrs.ty)?.0)?;
                 check_lanes(op, lanes.len(), mask.len())?;
+                // Each lane is accessed as by `ptr::read` and `ptr::write`: aligned to its type.
+                let (_, lane_ty) = self.detect_simd_ty(values.ty)?;
+                let (_, align) =
+                    self.size_align_of_sized(lane_ty, locals, "a lane of a simd vector")?;
                 let gather = op == SimdOp::Gather;
-                for ((lane, &ptr), &enabled) in lanes.iter_mut().zip(&ptrs).zip(&mask) {
+                for (i, &enabled) in mask.iter().enumerate() {
                     if !enabled {
                         continue;
                     }
-                    let addr = Address::from_usize(ptr as usize);
+                    let addr = self.pointer_lane(ptrs, i)?.aligned(align);
+                    let range = lanes.range(i);
                     if gather {
-                        *lane = self.read_memory(addr, lane.len())?.to_vec();
+                        let (bytes, shadow) = self.read_shadowed(addr, lanes.size)?;
+                        lanes.bytes[range.clone()].copy_from_slice(bytes);
+                        if M::CHECKS {
+                            lanes.shadow.put(range.start, &shadow);
+                        }
                     } else {
-                        self.write_memory(addr, lane)?;
+                        let shadow = lanes.shadow.slice(range.clone());
+                        self.write_shadowed(addr, &lanes.bytes[range], &shadow)?;
                     }
                 }
                 if gather {
-                    destination.write_from_bytes(self, &lanes.concat())?;
+                    self.write_shadowed(destination.addr, &lanes.bytes, &lanes.shadow)?;
                 }
                 Ok(())
             }
@@ -901,24 +1040,33 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     return Err(simd_args(op));
                 };
                 let mask = self.read_mask(mask, op)?;
-                let base = Address::from_bytes(ptr.get(self)?)?;
+                let base = self.read_pointer(ptr.interval.addr)?;
                 let mut lanes = self.lanes_of(values, locals)?;
                 check_lanes(op, lanes.len(), mask.len())?;
                 self.check_simd_align(op, base, values.ty, generic_args, locals)?;
                 let load = op == SimdOp::MaskedLoad;
-                for (i, (lane, &enabled)) in lanes.iter_mut().zip(&mask).enumerate() {
+                for (i, &enabled) in mask.iter().enumerate() {
                     if !enabled {
                         continue;
                     }
-                    let addr = base.offset(i * lane.len());
+                    // The `SimdAlign` argument is checked of the base, which is all the
+                    // intrinsic asks: each lane is accessed unaligned, as rustc's evaluation
+                    // does.
+                    let range = lanes.range(i);
+                    let addr = base.offset(range.start).aligned(1);
                     if load {
-                        *lane = self.read_memory(addr, lane.len())?.to_vec();
+                        let (bytes, shadow) = self.read_shadowed(addr, lanes.size)?;
+                        lanes.bytes[range.clone()].copy_from_slice(bytes);
+                        if M::CHECKS {
+                            lanes.shadow.put(range.start, &shadow);
+                        }
                     } else {
-                        self.write_memory(addr, lane)?;
+                        let shadow = lanes.shadow.slice(range.clone());
+                        self.write_shadowed(addr, &lanes.bytes[range], &shadow)?;
                     }
                 }
                 if load {
-                    destination.write_from_bytes(self, &lanes.concat())?;
+                    self.write_shadowed(destination.addr, &lanes.bytes, &lanes.shadow)?;
                 }
                 Ok(())
             }
@@ -926,7 +1074,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let [ptrs, offsets] = args else {
                     return Err(simd_args(op));
                 };
-                let (lane, values) = self.read_lanes(ptrs)?;
+                let (len, lane) = self.simd_lanes(ptrs.ty)?;
+                let width = len * lane.size();
+                if ptrs.interval.size < width {
+                    return Err(MirEvalError::InternalError(
+                        "simd vector smaller than its lanes".into(),
+                    ));
+                }
+                let (bytes, provs) = self.read_shadowed(ptrs.interval.addr, width)?;
+                if M::CHECKS {
+                    self.machine.require_init(&provs, 0..width)?;
+                }
+                let values = bytes.chunks(lane.size()).map(|it| lane.read(it)).collect::<Vec<_>>();
                 let (_, counts) = self.read_lanes(offsets)?;
                 check_lanes(op, values.len(), counts.len())?;
                 let (_, ptr_ty) = self.detect_simd_ty(ptrs.ty)?;
@@ -947,7 +1106,19 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         ptr.wrapping_add(count.wrapping_mul(size as i128) as u128)
                     })
                     .collect::<Vec<_>>();
-                self.write_lanes(destination, lane, &result)
+                if !M::CHECKS {
+                    return self.write_lanes(destination, lane, &result);
+                }
+                // Each pointer keeps its provenance, as `wrapping_offset` does.
+                let bytes: Vec<u8> =
+                    result.iter().flat_map(|it| it.to_le_bytes()[..lane.size()].to_vec()).collect();
+                let mut shadow = M::Shadow::default();
+                for i in 0..result.len() {
+                    let at = i * lane.size();
+                    let prov = provs.prov_at(at, lane.size());
+                    shadow.put(at, &M::Shadow::pointer(lane.size(), prov));
+                }
+                self.write_shadowed(destination.addr, &bytes, &shadow)
             }
         }
     }

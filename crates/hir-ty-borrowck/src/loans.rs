@@ -62,6 +62,9 @@ const ACTIVATED_AT: u8 = 2;
 /// The kind of the facts of [`Loans::scopes`]: the loans that go out of scope as a point
 /// starts.
 const ENDS_AT: u8 = 0;
+/// The kind of the facts of [`Loans::kills`]: the loans the statement or terminator at a point
+/// ends, by overwriting what holds them or ending the storage of what they borrow.
+const KILLED_AT: u8 = 0;
 
 pub(super) struct Loans {
     pub(super) loans: Vec<Loan>,
@@ -70,6 +73,9 @@ pub(super) struct Loans {
     /// Each list in the order the loans were made, or for activations, found.
     index: Relation,
     scopes: Relation,
+    /// What each point kills, found once with [`places_conflict`] for the entry sets and the
+    /// walk, which replay it.
+    kills: Relation,
     /// The borrows of a promoted copy, which make no loan and read nothing.
     pub(super) promoted: FxHashSet<Location>,
 }
@@ -523,6 +529,7 @@ impl Loans {
             projections: Vec::new(),
             index: Relation::default(),
             scopes: Relation::default(),
+            kills: Relation::default(),
             promoted: promoted_borrows(ctx, body),
         };
         let mut facts = Facts::default();
@@ -622,7 +629,75 @@ impl Loans {
             }
         }
         loans.index = facts.freeze(&[cfg.points, body.locals.len(), cfg.points]);
+        loans.kills = loans.find_kills(ctx, body, cfg);
         loans
+    }
+
+    /// The loans each reachable point kills, in the order it kills them.
+    fn find_kills<'db>(&self, ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, cfg: &Cfg) -> Relation {
+        let mut facts = Facts::default();
+        if self.loans.is_empty() {
+            return facts.freeze(&[cfg.points]);
+        }
+        for &block in &cfg.order {
+            let data = &body.basic_blocks[block];
+            for statement in 0..=data.statements.len() {
+                let point = cfg.point(Location { block, statement });
+                self.killed_by(ctx, body, block, statement, &mut |id| {
+                    facts.push(KILLED_AT, point, id)
+                });
+            }
+        }
+        facts.freeze(&[cfg.points])
+    }
+
+    /// Calls `kill` with each loan the statement or terminator at `statement` of `block`
+    /// ends.
+    fn killed_by<'db>(
+        &self,
+        ctx: &Ctx<'_, 'db>,
+        body: &MirBody<'db>,
+        block: BasicBlockId,
+        statement: usize,
+        kill: &mut impl FnMut(usize),
+    ) {
+        let data = &body.basic_blocks[block];
+        if let Some(statement) = data.statements.get(statement) {
+            match &statement.kind {
+                StatementKind::Assign(place, _) => {
+                    self.kill_on_place(ctx, body, place.local, place.projection.as_slice(), kill)
+                }
+                StatementKind::StorageDead(local) => {
+                    for &id in self.of_local(*local) {
+                        kill(id as usize);
+                    }
+                }
+                StatementKind::InlineAsm(asm) => {
+                    for operand in &asm.operands {
+                        if let hir_ty_mir::mir::AsmOperand::Reg { output: Some(output), .. } =
+                            operand
+                        {
+                            self.kill_on_place(
+                                ctx,
+                                body,
+                                output.local,
+                                output.projection.as_slice(),
+                                kill,
+                            );
+                        }
+                    }
+                }
+                _ => (),
+            }
+        } else if let Some(terminator) = &data.terminator {
+            match &terminator.kind {
+                TerminatorKind::Call { destination: place, .. }
+                | TerminatorKind::DropAndReplace { place, .. } => {
+                    self.kill_on_place(ctx, body, place.local, place.projection.as_slice(), kill)
+                }
+                _ => (),
+            }
+        }
     }
 
     /// The projection of the place `id` borrows.
@@ -690,12 +765,7 @@ impl Loans {
     }
 
     /// The loans in scope at the start of each block, a row per block: rustc's `Borrows`.
-    pub(super) fn entry_sets<'db>(
-        &self,
-        ctx: &Ctx<'_, 'db>,
-        body: &MirBody<'db>,
-        cfg: &Cfg,
-    ) -> BitMatrix {
+    pub(super) fn entry_sets(&self, body: &MirBody<'_>, cfg: &Cfg) -> BitMatrix {
         let blocks = body.basic_blocks.len();
         let count = self.loans.len();
         if count == 0 {
@@ -708,7 +778,7 @@ impl Loans {
             for statement in 0..=data.statements.len() {
                 let location = Location { block, statement };
                 self.before(cfg, location, &mut row);
-                self.after(ctx, body, cfg, location, &mut row);
+                self.after(cfg, location, &mut row);
             }
         }
         forward(cfg, &transfer, body.start_block, &BitSet::new(count), |_, _, _| ())
@@ -721,54 +791,15 @@ impl Loans {
         }
     }
 
-    /// What the statement or terminator at `location` does to the loans in scope.
-    pub(super) fn after<'db>(
-        &self,
-        ctx: &Ctx<'_, 'db>,
-        body: &MirBody<'db>,
-        cfg: &Cfg,
-        location: Location,
-        state: &mut impl Transfer,
-    ) {
-        let data = &body.basic_blocks[location.block];
-        if let Some(statement) = data.statements.get(location.statement) {
-            match &statement.kind {
-                StatementKind::Assign(place, _) => {
-                    self.kill_on_place(ctx, body, place.local, place.projection.as_slice(), state);
-                    if let Some(id) = self.made_at(cfg.point(location)) {
-                        state.gen_(id);
-                    }
-                }
-                StatementKind::StorageDead(local) => {
-                    for &id in self.of_local(*local) {
-                        state.kill(id as usize);
-                    }
-                }
-                StatementKind::InlineAsm(asm) => {
-                    for operand in &asm.operands {
-                        if let hir_ty_mir::mir::AsmOperand::Reg { output: Some(output), .. } =
-                            operand
-                        {
-                            self.kill_on_place(
-                                ctx,
-                                body,
-                                output.local,
-                                output.projection.as_slice(),
-                                state,
-                            );
-                        }
-                    }
-                }
-                _ => (),
-            }
-        } else if let Some(terminator) = &data.terminator {
-            match &terminator.kind {
-                TerminatorKind::Call { destination: place, .. }
-                | TerminatorKind::DropAndReplace { place, .. } => {
-                    self.kill_on_place(ctx, body, place.local, place.projection.as_slice(), state)
-                }
-                _ => (),
-            }
+    /// What the statement or terminator at `location` does to the loans in scope: the kills
+    /// [`Self::find_kills`] found, then the loan it makes.
+    pub(super) fn after(&self, cfg: &Cfg, location: Location, state: &mut impl Transfer) {
+        let point = cfg.point(location);
+        for &id in self.kills.get(KILLED_AT, point) {
+            state.kill(id as usize);
+        }
+        if let Some(id) = self.made_at(point) {
+            state.gen_(id);
         }
     }
 
@@ -779,7 +810,7 @@ impl Loans {
         body: &MirBody<'db>,
         local: LocalId,
         projection: &[PlaceElem],
-        state: &mut impl Transfer,
+        kill: &mut impl FnMut(usize),
     ) {
         for &id in self.of_local(local) {
             let id = id as usize;
@@ -795,7 +826,7 @@ impl Loans {
                     Bias::NoOverlap,
                 )
             {
-                state.kill(id);
+                kill(id);
             }
         }
     }
@@ -868,9 +899,12 @@ pub(super) fn places_conflict<'db>(
         return false;
     }
     let borrow = loans.projection(id);
+    // Each prefix's type from the one before, as `multi_projection_ty` folds them.
+    let mut base_ty = ctx.place_ty(body, local, &[]);
     for (index, &elem) in borrow.iter().enumerate() {
-        let base = &borrow[..index];
-        let base_ty = ctx.place_ty(body, local, base);
+        if index > 0 {
+            base_ty = ctx.project(base_ty, &borrow[index - 1]);
+        }
         if let Some(&access) = projection.get(index) {
             match projection_conflict(ctx, base_ty, elem, access, bias) {
                 Overlap::Arbitrary => return true,

@@ -343,12 +343,15 @@ class Kept:
 
     def __init__(self, root: str, kind: str):
         self.dir = Path(root).expanduser() / kind if root else None
-        self.domain = f"blaze v2 proof {kind} 1"
+        self.domain = f"blaze v2 proof {kind} 2"
 
     def key(self, *parts: str) -> str:
+        # Each part by its length then its bytes: a part may hold any byte, NUL too.
         h = hashlib.sha256(self.domain.encode())
         for part in parts:
-            h.update(b"\0" + part.encode())
+            data = part.encode()
+            h.update(len(data).to_bytes(8, "little"))
+            h.update(data)
         return h.hexdigest()
 
     def path(self, key: str) -> Path | None:

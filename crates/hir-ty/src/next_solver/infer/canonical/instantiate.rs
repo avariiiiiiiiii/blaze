@@ -10,8 +10,8 @@ use std::{fmt::Debug, iter};
 
 use crate::next_solver::{
     BoundConst, BoundRegion, BoundTy, Canonical, CanonicalVarKind, CanonicalVarValues, Clauses,
-    Const, ConstKind, DbInterner, GenericArg, ParamEnv, Predicate, Region, RegionKind, Ty, TyKind,
-    fold::FnMutDelegate,
+    Const, ConstKind, DbInterner, GenericArg, ParamEnv, Region, RegionKind, Ty, TyKind,
+    fold::BoundVarReplacerDelegate,
     infer::{
         InferCtxt, InferOk, InferResult,
         canonical::{QueryRegionConstraints, QueryResponse, canonicalizer::OriginalQueryValues},
@@ -22,8 +22,8 @@ use crate::next_solver::{
 use rustc_hash::FxHashMap;
 use rustc_index::{Idx as _, IndexVec};
 use rustc_type_ir::{
-    BoundVar, BoundVarIndexKind, GenericArgKind, TypeFlags, TypeFoldable, TypeFolder,
-    TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
+    BoundVar, BoundVarIndexKind, GenericArgKind, IsRigid, PredicateProxy, TypeFlags, TypeFoldable,
+    TypeFolder, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
     inherent::{GenericArg as _, IntoKind},
     solve::VisibleForLeakCheck,
 };
@@ -52,6 +52,7 @@ impl<'db, V> CanonicalExt<'db, V> for Canonical<'db, V> {
     where
         V: TypeFoldable<DbInterner<'db>>,
     {
+        // clone: borrowed from `&self`; for interned values this is a copy.
         self.instantiate_projected(tcx, var_values, |value| value.clone())
     }
 
@@ -90,27 +91,40 @@ where
     if var_values.var_values.is_empty() {
         value
     } else {
-        let delegate = FnMutDelegate {
-            regions: &mut |br: BoundRegion<'db>| match var_values[br.var].kind() {
-                GenericArgKind::Lifetime(l) => l,
-                r => panic!("{br:?} is a region but value is {r:?}"),
-            },
-            types: &mut |bound_ty: BoundTy<'db>| match var_values[bound_ty.var].kind() {
-                GenericArgKind::Type(ty) => ty,
-                r => panic!("{bound_ty:?} is a type but value is {r:?}"),
-            },
-            consts: &mut |bound_ct: BoundConst<'db>| match var_values[bound_ct.var].kind() {
-                GenericArgKind::Const(ct) => ct,
-                c => panic!("{bound_ct:?} is a const but value is {c:?}"),
-            },
-        };
-
-        let value = tcx.replace_escaping_bound_vars_uncached(value, delegate);
+        let value = tcx.replace_escaping_bound_vars_uncached(value, ToVarValues { var_values });
         value.fold_with(&mut CanonicalInstantiator {
             tcx,
             var_values: var_values.var_values.as_slice(),
             cache: Default::default(),
         })
+    }
+}
+
+/// Replaces each escaping bound var with its value in `var_values`.
+struct ToVarValues<'a, 'db> {
+    var_values: &'a CanonicalVarValues<'db>,
+}
+
+impl<'db> BoundVarReplacerDelegate<DbInterner<'db>> for ToVarValues<'_, 'db> {
+    fn replace_region(&mut self, br: BoundRegion<'db>) -> Region<'db> {
+        match self.var_values[br.var].kind() {
+            GenericArgKind::Lifetime(l) => l,
+            r => panic!("{br:?} is a region but value is {r:?}"),
+        }
+    }
+
+    fn replace_ty(&mut self, bound_ty: BoundTy<'db>) -> Ty<'db> {
+        match self.var_values[bound_ty.var].kind() {
+            GenericArgKind::Type(ty) => ty,
+            r => panic!("{bound_ty:?} is a type but value is {r:?}"),
+        }
+    }
+
+    fn replace_const(&mut self, bound_ct: BoundConst<'db>) -> Const<'db> {
+        match self.var_values[bound_ct.var].kind() {
+            GenericArgKind::Const(ct) => ct,
+            c => panic!("{bound_ct:?} is a const but value is {c:?}"),
+        }
     }
 }
 
@@ -168,7 +182,7 @@ impl<'db, 'a> TypeFolder<DbInterner<'db>> for CanonicalInstantiator<'db, 'a> {
         }
     }
 
-    fn fold_predicate(&mut self, p: Predicate<'db>) -> Predicate<'db> {
+    fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, p: P) -> P {
         if p.has_type_flags(TypeFlags::HAS_CANONICAL_BOUND) { p.super_fold_with(self) } else { p }
     }
 
@@ -214,6 +228,7 @@ impl<'db> InferCtxt<'db> {
             .opaque_type_storage
             .opaque_types_added_since(prev_entries)
             .map(|(k, v)| (k, v.ty))
+            // alloc: the response owns them; none when the query added no opaque types.
             .collect();
 
         self.canonicalize_response(QueryResponse {
@@ -259,6 +274,7 @@ impl<'db> InferCtxt<'db> {
 
         let user_result: R =
             query_response
+                // clone: borrowed from the response; for interned values this is a copy.
                 .instantiate_projected(self.interner, &result_args, |q_r| q_r.value.clone());
 
         Ok(InferOk { value: user_result, obligations })
@@ -333,6 +349,7 @@ impl<'db> InferCtxt<'db> {
         // For each new universe created in the query result that did
         // not appear in the original query, create a local
         // superuniverse.
+        // clone: inline up to 4 universes.
         let mut universe_map = original_values.universe_map.clone();
         let num_universes_in_query = original_values.universe_map.len();
         let num_universes_in_response = query_response.max_universe.as_usize() + 1;
@@ -438,7 +455,7 @@ impl<'db> InferCtxt<'db> {
             // the generic args of the opaque with the generic params of its hidden type version.
             obligations.extend(
                 self.at(cause, param_env)
-                    .eq(Ty::new_opaque(self.interner, a.def_id.0, a.args), b)?
+                    .eq(Ty::new_opaque(self.interner, IsRigid::No, a.def_id.0, a.args), b)?
                     .obligations,
             );
         }

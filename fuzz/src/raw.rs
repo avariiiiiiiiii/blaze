@@ -6,9 +6,11 @@
 //! and no bounds check, even unoptimized: trace-cmp turns each of those into a call of a
 //! callback, and one in a callback would call it again without end. They write through masked
 //! indices with the atomic intrinsics, never the `Atomic*` methods (whose `match` on the
-//! ordering is a `switch` in an unoptimized build). Their counters, and those of [`run`] and
-//! [`Coverage::drain`], count the engine rather than the target: [`Coverage::new`] finds them
-//! in the PC table and masks them out.
+//! ordering is a `switch` in an unoptimized build). Their counters, and those of
+//! [`Coverage::run`] and [`Coverage::drain`], count the engine rather than the target:
+//! [`Coverage::new`] finds them in the PC table and masks them out. The callbacks run on every
+//! comparison the target makes, so they spend no locked instruction: a bit or a slot two
+//! threads write at once may lose one write, as in libFuzzer.
 //!
 //! The counters are SanitizerCoverage's plain bytes, which instrumented code on every thread
 //! increments without atomics, as the instrumentation defines them. The engine reads and clears
@@ -102,13 +104,17 @@ fn register<T>(table: &[AtomicPtr<T>; 2 * MODULES], count: &AtomicUsize, start: 
 const VALUE_MASK: u64 = VALUE_BITS as u64 - 1;
 const TORC_MASK: u64 = TORC as u64 - 1;
 
+/// A load and a store, not a locked `or`: this runs on every comparison the target makes, and
+/// a bit another thread sets between the two may be lost, as in libFuzzer's map.
 #[inline(always)]
 fn value(at: u64) {
     let bit = at & VALUE_MASK;
-    let word = VALUES.as_ptr().wrapping_add(bit.wrapping_shr(6) as usize);
+    let word = VALUES.as_ptr().wrapping_add(bit.wrapping_shr(6) as usize).cast::<u64>().cast_mut();
     // SAFETY: `bit` is masked below `VALUE_BITS`, so `word` is one of `VALUES`' words, which
-    // are `AtomicU64`s: an atomic or through a pointer to one is what `fetch_or` does.
-    unsafe { intrinsics::atomic_or::<u64, u64, { Relaxed }>(word.cast::<u64>().cast_mut(), 1u64.wrapping_shl(bit as u32)) };
+    // are `AtomicU64`s, loaded and stored atomically.
+    let old = unsafe { intrinsics::atomic_load::<u64, { Relaxed }>(word) };
+    // SAFETY: as above.
+    unsafe { intrinsics::atomic_store::<u64, { Relaxed }>(word, old | 1u64.wrapping_shl(bit as u32)) };
 }
 
 /// libFuzzer's `HandleCmp`: the Hamming distance and the distance's leading zeros of the
@@ -122,8 +128,11 @@ fn distance(pc: u64, a: u64, b: u64) {
 
 #[inline(always)]
 fn recent(a: u64, b: u64, width: u64) {
-    // SAFETY: `RECENT_NEXT` is an `AtomicU64`; this is its `fetch_add`.
-    let n = unsafe { intrinsics::atomic_xadd::<u64, u64, { Relaxed }>(RECENT_NEXT.as_ptr(), 1) };
+    // SAFETY: `RECENT_NEXT` is an `AtomicU64`, loaded and stored atomically; two threads that
+    // take the same slot at once overwrite one comparison, as in libFuzzer's table.
+    let n = unsafe { intrinsics::atomic_load::<u64, { Relaxed }>(RECENT_NEXT.as_ptr()) };
+    // SAFETY: as above.
+    unsafe { intrinsics::atomic_store::<u64, { Relaxed }>(RECENT_NEXT.as_ptr(), n.wrapping_add(1)) };
     let slot = RECENT.as_ptr().wrapping_add((n & TORC_MASK).wrapping_mul(3) as usize).cast::<u64>().cast_mut();
     // SAFETY: the slot index is masked below `TORC`, so `slot` and the two words after it are
     // `RECENT`'s `AtomicU64`s, stored to atomically.
@@ -279,7 +288,7 @@ pub(crate) fn asan() -> bool {
 
 /// The engine's callbacks that run while a target does: their counters count comparisons,
 /// not code the input reached.
-fn engine_functions() -> [usize; 16] {
+fn engine_functions() -> [usize; 18] {
     [
         __sanitizer_cov_trace_cmp1 as usize,
         __sanitizer_cov_trace_cmp2 as usize,
@@ -295,7 +304,9 @@ fn engine_functions() -> [usize; 16] {
         __sanitizer_cov_trace_pc_indir as usize,
         __sanitizer_cov_trace_switch as usize,
         __sanitizer_weak_hook_memcmp as usize,
-        run as usize,
+        __sanitizer_blaze_fuzzer_run as usize,
+        __sanitizer_blaze_fuzzer_drain as usize,
+        Coverage::run as usize,
         Coverage::drain as usize,
     ]
 }
@@ -395,43 +406,106 @@ impl<'a> Coverage<'a> {
     }
 
     /// Pushes the feature of each counter the run reached (its global index times 8 plus its
-    /// AFL bucket), then of each value-profile bit set (after every counter's), and clears
-    /// both. `features` must have room for [`Self::total`] plus [`VALUE_BITS`] more, so that
-    /// nothing here allocates while the counters fill.
-    #[inline(never)]
+    /// AFL bucket), and with `values` of each value-profile bit set (after every counter's).
+    /// It leaves them set: [`Self::run`] clears them, since the engine's own code between two
+    /// runs reaches counters too. `features` must have room for [`Self::total`] plus
+    /// [`VALUE_BITS`] more, so that nothing here allocates while the counters fill.
     pub(crate) fn drain(&self, features: &mut Vec<u32>, values: bool) {
-        debug_assert!(features.capacity() - features.len() >= self.total + VALUE_BITS);
-        for module in &self.modules {
-            for (w, &ignored) in module.ignored.iter().enumerate() {
-                let at = module.start.wrapping_add(8 * w);
-                let count = (module.len - 8 * w).min(8);
-                let mut bytes = [0u8; 8];
-                // SAFETY: `at..at + count` is inside the module's registered counters (`count`
-                // stops at its end), which live as long as the program; between runs, as the
-                // module doc says, only the watchdog's masked counters can change under it.
-                unsafe { ptr::copy_nonoverlapping(at, bytes.as_mut_ptr(), count) };
-                let word = u64::from_le_bytes(bytes);
-                if word == 0 {
-                    continue;
-                }
-                // SAFETY: the same `count` counters, written as they were read above.
-                unsafe { ptr::write_bytes(at, 0, count) };
-                let mut rest = word & !ignored;
-                while rest != 0 {
-                    let byte = rest.trailing_zeros() / 8;
-                    let counter = (rest >> (8 * byte)) as u8;
-                    rest &= !(0xff << (8 * byte));
-                    let index = module.first + 8 * w + byte as usize;
-                    features.push(((index as u32) << 3) | crate::features::bucket(counter) as u32);
-                }
-            }
+        __sanitizer_blaze_fuzzer_drain(self, features, values);
+    }
+
+    /// Clears every counter and the value profile, then runs `check(data)`; false when it
+    /// panicked. While it runs, [`current`] gives `data` to a crash report.
+    pub(crate) fn run(&self, check: fn(&[u8]), data: &[u8], now: u64) -> bool {
+        __sanitizer_blaze_fuzzer_run(self, check, data, now)
+    }
+}
+
+/// How many counter words [`__sanitizer_blaze_fuzzer_drain`] tests for zero at once: a cache
+/// line, which the compiler reads in vector loads.
+const CHUNK_WORDS: usize = 8;
+
+/// The features of counter word `w` of `module`, which reads `word`.
+#[inline(always)]
+fn push_word(features: &mut Vec<u32>, module: &Module, w: usize, word: u64) {
+    let mut rest = word & !module.ignored[w];
+    while rest != 0 {
+        let byte = rest.trailing_zeros() / 8;
+        let counter = (rest >> (8 * byte)) as u8;
+        rest &= !(0xff << (8 * byte));
+        let index = module.first + 8 * w + byte as usize;
+        features.push(((index as u32) << 3) | crate::features::bucket(counter) as u32);
+    }
+}
+
+// SanitizerCoverage instruments no function named `__sanitizer_*` (LLVM's
+// `SanitizerCoverage.cpp`, and blaze's backend by the same rule), so the drain and the run
+// count nothing, call no comparison callback while they read what the callbacks wrote, and
+// spend no instrumentation on the scan, which is the engine's whole cost per run.
+
+/// Counter word `w` of the counters at `start`.
+///
+/// # Safety
+///
+/// Bytes `8w..8w + 8` from `start` are registered counters.
+#[inline(always)]
+unsafe fn counter_word(start: *const u8, w: usize) -> u64 {
+    // SAFETY: the caller's; read unaligned since the section need not be 8-aligned. The
+    // counters live as long as the program, and between runs, as the module doc says, only
+    // the watchdog's masked counters can change under the read.
+    unsafe { start.add(8 * w).cast::<u64>().read_unaligned() }
+}
+
+/// [`Coverage::drain`]: the value profile is read out first, so that what anything here
+/// traces (a helper the optimizer kept out of line) lands after it was read; then the
+/// counters are read a cache line at a time, and a line of zeros, most of them, costs two
+/// vector loads and a test.
+#[unsafe(no_mangle)]
+#[sanitize(address = "off")]
+#[inline(never)]
+fn __sanitizer_blaze_fuzzer_drain(coverage: &Coverage<'_>, features: &mut Vec<u32>, values: bool) {
+    let mut snapshot = [0u64; VALUE_WORDS];
+    if values {
+        for (slot, word) in snapshot.iter_mut().zip(&VALUES) {
+            *slot = word.load(Ordering::Relaxed);
         }
-        let base = (self.total as u32) << 3;
-        for (w, word) in VALUES.iter().enumerate() {
-            let mut bits = word.swap(0, Ordering::Relaxed);
-            if !values {
-                continue;
+    }
+    debug_assert!(features.capacity() - features.len() >= coverage.total + VALUE_BITS);
+    for module in &coverage.modules {
+        let words = module.len / 8;
+        let lines = words / CHUNK_WORDS * CHUNK_WORDS;
+        let start = module.start.cast_const();
+        let mut w = 0;
+        while w < lines {
+            let mut any = 0;
+            for i in 0..CHUNK_WORDS {
+                // SAFETY: `w + i < words`, inside the module's counters.
+                any |= unsafe { counter_word(start, w + i) };
             }
+            if any != 0 {
+                for i in 0..CHUNK_WORDS {
+                    // SAFETY: as above.
+                    push_word(features, module, w + i, unsafe { counter_word(start, w + i) });
+                }
+            }
+            w += CHUNK_WORDS;
+        }
+        for w in lines..words {
+            // SAFETY: `w < words`.
+            push_word(features, module, w, unsafe { counter_word(start, w) });
+        }
+        let tail = module.len - 8 * words;
+        if tail > 0 {
+            let mut bytes = [0u8; 8];
+            // SAFETY: the module's last `tail < 8` counters, as `counter_word` reads them.
+            unsafe { ptr::copy_nonoverlapping(start.add(8 * words), bytes.as_mut_ptr(), tail) };
+            push_word(features, module, words, u64::from_le_bytes(bytes));
+        }
+    }
+    if values {
+        let base = (coverage.total as u32) << 3;
+        for (w, &word) in snapshot.iter().enumerate() {
+            let mut bits = word;
             while bits != 0 {
                 let bit = bits.trailing_zeros();
                 bits &= bits - 1;
@@ -439,21 +513,45 @@ impl<'a> Coverage<'a> {
             }
         }
     }
-
-    /// Clears every counter and the value profile, then runs `check(data)`; false when it
-    /// panicked. While it runs, [`current`] gives `data` to a crash report.
-    pub(crate) fn run(&self, check: fn(&[u8]), data: &[u8], now: u64) -> bool {
-        run(self, check, data, now)
-    }
 }
 
-#[inline(never)]
-fn run(coverage: &Coverage<'_>, check: fn(&[u8]), data: &[u8], now: u64) -> bool {
-    for module in &coverage.modules {
-        // SAFETY: the module's registered counters, alive for the program, cleared between
-        // runs as the module doc says.
-        unsafe { ptr::write_bytes(module.start, 0, module.len) };
+/// Zeroes the module's counters a cache line at a time, writing only the lines that hold a
+/// count: the last run's and what the engine reached since. A `memset` would store every
+/// byte at half the load bandwidth and dirty every line, which costs a write-back per run
+/// once the counters outgrow L2.
+#[inline(always)]
+fn clear(module: &Module) {
+    let words = module.len / 8;
+    let lines = words / CHUNK_WORDS * CHUNK_WORDS;
+    let start = module.start;
+    let mut w = 0;
+    while w < lines {
+        let mut any = 0;
+        for i in 0..CHUNK_WORDS {
+            // SAFETY: `w + i < words`, inside the module's counters.
+            any |= unsafe { counter_word(start.cast_const(), w + i) };
+        }
+        if any != 0 {
+            // SAFETY: the line just read, inside the counters; cleared between runs as the
+            // module doc says.
+            unsafe { ptr::write_bytes(start.add(8 * w), 0, 8 * CHUNK_WORDS) };
+        }
+        w += CHUNK_WORDS;
     }
+    // SAFETY: the counters past the last whole line, fewer than 64.
+    unsafe { ptr::write_bytes(start.add(8 * lines), 0, module.len - 8 * lines) };
+}
+
+/// [`Coverage::run`]. Nothing between the clears and the call of `check` is traced.
+#[unsafe(no_mangle)]
+#[sanitize(address = "off")]
+#[inline(never)]
+fn __sanitizer_blaze_fuzzer_run(coverage: &Coverage<'_>, check: fn(&[u8]), data: &[u8], now: u64) -> bool {
+    for module in &coverage.modules {
+        clear(module);
+    }
+    // Atomic stores, not a `memset`: the watchdog's comparisons can trace into them at any
+    // time. 1 Ki plain stores on x86-64 and AArch64.
     for word in &VALUES {
         word.store(0, Ordering::Relaxed);
     }

@@ -388,11 +388,19 @@ impl Container {
         let name = literal(PROFILE);
         let shown = literal("blaze sandbox");
         let mut sid: PSID = null_mut();
-        // SAFETY: `name` and `shown` end in NUL (`literal`) and live in this frame for the call,
-        // which only reads them; a null list of 0 capabilities is read as none; `sid` is a live
-        // PSID for it to set, freed by `Container`'s drop.
-        let made = unsafe {
-            CreateAppContainerProfile(name.as_ptr(), shown.as_ptr(), shown.as_ptr(), null(), 0, &mut sid)
+        // The folder CreateAppContainerProfile makes: while it is there the profile is, and the
+        // SID is derived with no registry write. Without it, or without `LOCALAPPDATA` to find
+        // it by, the profile is made (or found) as on a first run, never assumed.
+        let made_already = std::env::var_os("LOCALAPPDATA")
+            .is_some_and(|local| Path::new(&local).join("Packages").join(PROFILE).is_dir());
+        let made = match made_already {
+            true => PROFILE_EXISTS,
+            // SAFETY: `name` and `shown` end in NUL (`literal`) and live in this frame for the
+            // call, which only reads them; a null list of 0 capabilities is read as none; `sid`
+            // is a live PSID for it to set, freed by `Container`'s drop.
+            false => unsafe {
+                CreateAppContainerProfile(name.as_ptr(), shown.as_ptr(), shown.as_ptr(), null(), 0, &mut sid)
+            },
         };
         if made == PROFILE_EXISTS {
             // SAFETY: `name` ends in NUL (`literal`) and lives in this frame; `sid`, still null

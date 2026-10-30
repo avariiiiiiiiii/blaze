@@ -452,7 +452,8 @@ impl<S> Locked<'_, S> {
     }
 }
 
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
+#[cfg(not(feature = "shuttle"))]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;

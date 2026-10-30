@@ -1,6 +1,10 @@
 //! The tables of `__LINKEDIT` dyld reads (`<mach-o/loader.h>`): the opcodes that say which
 //! addresses it slides (rebase) and which it binds to a symbol of a library, the trie of what
 //! the image exports, and the starts of its functions.
+//!
+//! Each table is appended to one buffer, the `__LINKEDIT` being written, and padded to 8 bytes
+//! from where it started: [`capacity`] sizes that buffer for all four, so encoding them grows
+//! it never. Each returns how many bytes it appended, 0 for a table with nothing in it.
 
 #![forbid(unsafe_code)]
 
@@ -58,11 +62,41 @@ fn uleb_len(value: u64) -> u64 {
     u64::from((64 - value.leading_zeros()).max(1).div_ceil(7))
 }
 
+/// The most bytes the four tables take together: `rebases` pointers to slide, `binds`,
+/// `exports` and `functions` starts. Each bound holds for the worst case of its encoding
+/// (a ULEB of an address is at most 10 bytes), plus 8 bytes of padding each.
+pub(super) fn capacity<N: AsRef<[u8]>>(
+    rebases: usize,
+    binds: &[Bind<'_>],
+    exports: &[(N, u64, u64)],
+    functions: usize,
+) -> usize {
+    // A run's opcodes: a segment and offset (1 + 10), a count (1 + 10); and the type and DONE.
+    let rebase = 22 * rebases + 2;
+    // Per bind: the ordinal (1 + 10), the symbol (2 + its name), the addend (1 + 10), the
+    // address (1 + 10) and DO_BIND; the type and DONE.
+    let bind = binds.iter().map(|it| 36 + it.name.len()).sum::<usize>() + 2;
+    // At most two nodes and two edges an export: a node's info length, flags and address (at
+    // most 1 + 10 + 10) and its edge count; an edge's label (at most its export's name), NUL
+    // and child offset (5, as the trie is under 4 GiB).
+    let trie = exports.iter().map(|it| 2 * 22 + 2 * (it.0.as_ref().len() + 6)).sum::<usize>();
+    let starts = 10 * functions + 1;
+    rebase + bind + trie + starts + 4 * 8
+}
+
+/// Pads the table started at `start` of `out` to 8 bytes and says its length.
+fn finish(out: &mut Vec<u8>, start: usize) -> usize {
+    let len = (out.len() - start).next_multiple_of(8);
+    out.resize(start + len, 0);
+    len
+}
+
 /// `values` in ascending order: borrowed when they already are, as the core lists them.
 fn sorted(values: &[u64]) -> Cow<'_, [u64]> {
     if values.is_sorted() {
         return Cow::Borrowed(values);
     }
+    // alloc: only for addresses out of order, which `Placed` lists in order; once per link
     let mut values = values.to_vec();
     radix::sort(&mut values);
     Cow::Owned(values)
@@ -72,8 +106,10 @@ fn sorted(values: &[u64]) -> Cow<'_, [u64]> {
 fn segment_of(spans: &[Span], addr: u64, what: &str) -> Result<usize, String> {
     let nth = (spans.iter())
         .position(|it| (it.start..it.end).contains(&addr))
+        // alloc: error path
         .ok_or_else(|| format!("{what} at {addr:#x} is in no segment"))?;
     if !spans[nth].writable {
+        // alloc: error path
         return Err(format!(
             "{what} at {addr:#x} is in {}, which the loader can't write: a pointer there would \
              need a text relocation",
@@ -81,22 +117,25 @@ fn segment_of(spans: &[Span], addr: u64, what: &str) -> Result<usize, String> {
         ));
     }
     if nth > 15 {
+        // alloc: error path
         return Err(format!("{what} at {addr:#x} is in segment {nth}, past the 16 opcodes name"));
     }
     Ok(nth)
 }
 
-/// The rebase opcodes of `addrs`, each a pointer dyld adds the slide to.
-pub(super) fn rebases(addrs: &[u64], spans: &[Span]) -> Result<Vec<u8>, String> {
+/// Appends the rebase opcodes of `addrs`, each a pointer dyld adds the slide to.
+pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Result<usize, String> {
     let addrs = sorted(addrs);
     if let Some(twice) = addrs.windows(2).find(|it| it[0] == it[1]) {
+        // alloc: error path
         return Err(format!("the address {:#x} is to be slid twice", twice[0]));
     }
     if addrs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(0);
     }
+    let start = out.len();
     // Runs of adjacent pointers take 2 to 3 bytes each; scattered ones about 3.
-    let mut out = Vec::with_capacity(addrs.len() * 3 + 16);
+    out.reserve(addrs.len() * 3 + 16);
     out.push(macho::REBASE_OPCODE_SET_TYPE_IMM | macho::REBASE_TYPE_POINTER);
     // Where dyld's cursor is: its segment and address.
     let mut cursor: Option<(usize, u64)> = None;
@@ -112,42 +151,45 @@ pub(super) fn rebases(addrs: &[u64], spans: &[Span]) -> Result<Vec<u8>, String> 
             Some((at, address)) if at == segment && first >= address => {
                 if first > address {
                     out.push(macho::REBASE_OPCODE_ADD_ADDR_ULEB);
-                    uleb(&mut out, first - address);
+                    uleb(out, first - address);
                 }
             }
             _ => {
                 out.push(macho::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment as u8);
-                uleb(&mut out, first - spans[segment].start);
+                uleb(out, first - spans[segment].start);
             }
         }
         if run < 16 {
             out.push(macho::REBASE_OPCODE_DO_REBASE_IMM_TIMES | run as u8);
         } else {
             out.push(macho::REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
-            uleb(&mut out, run as u64);
+            uleb(out, run as u64);
         }
         cursor = Some((segment, first + run as u64 * 8));
         rest = &rest[run..];
     }
     out.push(macho::REBASE_OPCODE_DONE);
-    out.resize(out.len().next_multiple_of(8), 0);
-    Ok(out)
+    Ok(finish(out, start))
 }
 
-/// The bind opcodes of `binds`, sorted here by symbol so each symbol is named once.
-pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span]) -> Result<Vec<u8>, String> {
+/// Appends the bind opcodes of `binds`, sorted here by symbol so each symbol is named once.
+pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span], out: &mut Vec<u8>) -> Result<usize, String> {
     if binds.is_empty() {
-        return Ok(Vec::new());
+        return Ok(0);
     }
     radix::sort_by_key(binds, |it| it.addr);
     if let Some(twice) = binds.windows(2).find(|it| it[0].addr == it[1].addr) {
+        // alloc: error path
         return Err(format!("the address {:#x} is to be bound twice", twice[0].addr));
     }
-    binds.sort_by(|a, b| {
-        (a.ordinal, a.name, a.weak, a.addend).cmp(&(b.ordinal, b.name, b.weak, b.addend))
+    // The addresses are distinct, so with the address last this is a total order: the same
+    // as a stable sort by symbol of the binds in address order, without its buffer.
+    binds.sort_unstable_by(|a, b| {
+        (a.ordinal, a.name, a.weak, a.addend, a.addr).cmp(&(b.ordinal, b.name, b.weak, b.addend, b.addr))
     });
+    let start = out.len();
     // Each bind's address and opcode take about 3 bytes; each symbol its name and 2.
-    let mut out = Vec::with_capacity(binds.len() * 4 + 16);
+    out.reserve(binds.len() * 4 + 16);
     out.push(macho::BIND_OPCODE_SET_TYPE_IMM | macho::BIND_TYPE_POINTER);
     let (mut ordinal, mut symbol, mut addend) = (None, None::<(&[u8], bool)>, 0i64);
     let mut cursor: Option<(usize, u64)> = None;
@@ -161,14 +203,16 @@ pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span]) -> Result<Vec<u8>, S
                 1..=15 => out.push(macho::BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | bind.ordinal as u8),
                 16.. => {
                     out.push(macho::BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
-                    uleb(&mut out, bind.ordinal as u64);
+                    uleb(out, bind.ordinal as u64);
                 }
+                // alloc: error path
                 other => return Err(format!("a bind to the library ordinal {other}")),
             }
             ordinal = Some(bind.ordinal);
         }
         if symbol != Some((bind.name, bind.weak)) {
             if bind.name.is_empty() || bind.name.contains(&0) {
+                // alloc: error path
                 return Err(format!("a bind at {:#x} to a symbol of no name", bind.addr));
             }
             let flags = if bind.weak { macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT } else { 0 };
@@ -179,7 +223,7 @@ pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span]) -> Result<Vec<u8>, S
         }
         if addend != bind.addend {
             out.push(macho::BIND_OPCODE_SET_ADDEND_SLEB);
-            sleb(&mut out, bind.addend);
+            sleb(out, bind.addend);
             addend = bind.addend;
         }
         let segment = segment_of(spans, bind.addr, "a pointer to bind")?;
@@ -187,20 +231,19 @@ pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span]) -> Result<Vec<u8>, S
             Some((at, address)) if at == segment && bind.addr >= address => {
                 if bind.addr > address {
                     out.push(macho::BIND_OPCODE_ADD_ADDR_ULEB);
-                    uleb(&mut out, bind.addr - address);
+                    uleb(out, bind.addr - address);
                 }
             }
             _ => {
                 out.push(macho::BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment as u8);
-                uleb(&mut out, bind.addr - spans[segment].start);
+                uleb(out, bind.addr - spans[segment].start);
             }
         }
         out.push(macho::BIND_OPCODE_DO_BIND);
         cursor = Some((segment, bind.addr + 8));
     }
     out.push(macho::BIND_OPCODE_DONE);
-    out.resize(out.len().next_multiple_of(8), 0);
-    Ok(out)
+    Ok(finish(out, start))
 }
 
 /// A node of the export trie: 16 bytes; its edges a CSR range of [`Edge`]s.
@@ -225,16 +268,18 @@ struct Edge {
 
 const _: () = assert!(size_of::<Node>() == 16 && size_of::<Edge>() == 16);
 
-/// The export trie of `exports` (Mach-O name, `EXPORT_SYMBOL_FLAGS_*`, address from the
+/// Appends the export trie of `exports` (Mach-O name, `EXPORT_SYMBOL_FLAGS_*`, address from the
 /// image's start), as dyld and `dlsym` walk it and ld64 writes it: nodes depth first, edges by
 /// label, each offset a ULEB settled when no node moves.
 ///
 /// Built from the names in order in one pass: a node's names are a range of them sharing its
 /// prefix, its edges the runs of one next byte, each edge's label the run's common prefix (that
-/// of its first and last name). 32 bytes per node and edge, nothing allocated per either.
-pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)]) -> Result<Vec<u8>, String> {
+/// of its first and last name). Every node but the root ends a name or has two edges, so there
+/// are at most `2n` nodes and edges for `n` names: four scratch columns sized so once (nodes,
+/// edges, the work stack and the depth-first order), nothing allocated per node or edge.
+pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)], out: &mut Vec<u8>) -> Result<usize, String> {
     if exports.is_empty() {
-        return Ok(Vec::new());
+        return Ok(0);
     }
     if !exports.is_sorted() {
         exports.sort_unstable();
@@ -242,28 +287,38 @@ pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)]) -> Resul
     let name = |nth: usize| exports[nth].0.as_ref();
     for nth in 0..exports.len() {
         if name(nth).is_empty() || name(nth).contains(&0) {
+            // alloc: error path
             return Err("an export of no name".to_owned());
         }
         if nth > 0 && name(nth - 1) == name(nth) {
+            // alloc: error path
             return Err(format!("`{}` is exported twice", String::from_utf8_lossy(name(nth))));
         }
     }
-    if exports.len() >= u32::MAX as usize {
-        return Err(format!("{} exports: an export trie names fewer than 2^32", exports.len()));
+    if exports.len() >= (u32::MAX / 2) as usize {
+        // alloc: error path
+        return Err(format!("{} exports: an export trie names fewer than 2^31", exports.len()));
     }
 
+    let most = 2 * exports.len();
     let empty = Node { terminal: u32::MAX, edges: 0, count: 0, offset: 0 };
-    let mut nodes = Vec::with_capacity(exports.len() * 2);
-    let mut edges: Vec<Edge> = Vec::with_capacity(exports.len() * 2);
+    let mut nodes = Vec::with_capacity(most);
+    let mut edges: Vec<Edge> = Vec::with_capacity(most);
+    // A node, the range of names under it, and its prefix's length. A node's children are
+    // pushed last edge first, so the nodes are popped depth first with edges by label: the
+    // order they are written in.
+    let mut work: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(most);
+    let mut order: Vec<u32> = Vec::with_capacity(most);
     nodes.push(empty);
-    // A node, the range of names under it, and its prefix's length.
-    let mut work = vec![(0usize, 0usize, exports.len(), 0usize)];
+    work.push((0, 0, exports.len(), 0));
     while let Some((node, mut lo, hi, depth)) = work.pop() {
+        order.push(node as u32);
         if name(lo).len() == depth {
             nodes[node].terminal = lo as u32;
             lo += 1;
         }
         nodes[node].edges = edges.len() as u32;
+        let children = work.len();
         while lo < hi {
             let byte = name(lo)[depth];
             let end = lo + exports[lo..hi].partition_point(|it| it.0.as_ref()[depth] == byte);
@@ -280,8 +335,10 @@ pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)]) -> Resul
             work.push((child, lo, end, common));
             lo = end;
         }
+        work[children..].reverse();
         nodes[node].count = edges.len() as u32 - nodes[node].edges;
         if nodes[node].count > 255 {
+            // alloc: error path
             return Err("an export trie node of more than 255 edges".to_owned());
         }
     }
@@ -296,18 +353,12 @@ pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)]) -> Resul
     let label = |edge: &Edge| &exports[edge.export as usize].0.as_ref()[edge.from as usize..edge.to as usize];
     let edges_of = |node: &Node| &edges[node.edges as usize..(node.edges + node.count) as usize];
 
-    // Each node before its children, depth first.
-    let mut order = Vec::with_capacity(nodes.len());
-    let mut stack = vec![0u32];
-    while let Some(node) = stack.pop() {
-        order.push(node);
-        stack.extend(edges_of(&nodes[node as usize]).iter().rev().map(|it| it.child));
-    }
     let mut len;
     loop {
         len = 0u64;
         let mut moved = false;
         for &node in &order {
+            // alloc: error path
             let offset = u32::try_from(len).map_err(|_| "an export trie past 4 GiB".to_owned())?;
             moved |= nodes[node as usize].offset != offset;
             nodes[node as usize].offset = offset;
@@ -324,45 +375,46 @@ pub(super) fn trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)]) -> Resul
         }
     }
 
-    let mut out = Vec::with_capacity((len as usize).next_multiple_of(8));
+    let start = out.len();
+    out.reserve((len as usize).next_multiple_of(8));
     for &node in &order {
         let node = &nodes[node as usize];
-        debug_assert_eq!(out.len() as u64, u64::from(node.offset));
-        uleb(&mut out, info_len(node));
+        debug_assert_eq!((out.len() - start) as u64, u64::from(node.offset));
+        uleb(out, info_len(node));
         if node.terminal != u32::MAX {
             let (_, flags, addr) = &exports[node.terminal as usize];
-            uleb(&mut out, *flags);
-            uleb(&mut out, *addr);
+            uleb(out, *flags);
+            uleb(out, *addr);
         }
         out.push(node.count as u8);
         for edge in edges_of(node) {
             out.extend_from_slice(label(edge));
             out.push(0);
-            uleb(&mut out, u64::from(nodes[edge.child as usize].offset));
+            uleb(out, u64::from(nodes[edge.child as usize].offset));
         }
     }
-    out.resize(out.len().next_multiple_of(8), 0);
-    Ok(out)
+    Ok(finish(out, start))
 }
 
-/// `LC_FUNCTION_STARTS`: the functions' addresses as ULEB distances, the first from `text`.
-pub(super) fn function_starts(text: u64, addrs: &[u64]) -> Vec<u8> {
+/// Appends `LC_FUNCTION_STARTS`: the functions' addresses as ULEB distances, the first from
+/// `text`.
+pub(super) fn function_starts(text: u64, addrs: &[u64], out: &mut Vec<u8>) -> usize {
     let addrs = sorted(addrs);
+    let start = out.len();
     // Most functions are less than 16 KiB apart: two bytes each.
-    let mut out = Vec::with_capacity(addrs.len() * 2 + 8);
+    out.reserve(addrs.len() * 2 + 8);
     let mut last = text;
     // A distance of 0 ends the list: the headers are at `text`, never a function.
     for &addr in addrs.iter().filter(|it| **it > text) {
         if addr == last {
             continue;
         }
-        uleb(&mut out, addr - last);
+        uleb(out, addr - last);
         last = addr;
     }
-    if out.is_empty() {
-        return out;
+    if out.len() == start {
+        return 0;
     }
     out.push(0);
-    out.resize(out.len().next_multiple_of(8), 0);
-    out
+    finish(out, start)
 }

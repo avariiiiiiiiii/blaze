@@ -108,7 +108,9 @@ impl<'a, 'db> LeakCheck<'a, 'db> {
             outer_universe,
             mini_graph,
             rcc,
+            // alloc: per leak check past a binder, sized to its region graph.
             scc_placeholders: vec![None; num_sccs],
+            // alloc: per leak check past a binder, sized to its region graph.
             scc_universes: vec![dummy_scc_universe; num_sccs],
         }
     }
@@ -290,7 +292,7 @@ impl<'db> MiniGraph<'db> {
         only_consider_snapshot: Option<&CombinedSnapshot>,
     ) -> Self {
         let mut nodes = FxIndexMap::default();
-        let mut edges = Vec::with_capacity(region_constraints.data().constraints.len());
+        let mut edges = Vec::with_capacity(region_constraints.legacy_data().constraints.len());
 
         // Note that if `R2: R1`, we get a callback `r1, r2`, so `target` is first parameter.
         Self::iterate_region_constraints(
@@ -314,7 +316,7 @@ impl<'db> MiniGraph<'db> {
         only_consider_snapshot: Option<&CombinedSnapshot>,
         mut each_edge: impl FnMut(Region<'db>, Region<'db>),
     ) {
-        let data = region_constraints.data();
+        let data = region_constraints.legacy_data();
         let start = match only_consider_snapshot {
             Some(snapshot) => {
                 let mark = &snapshot.undo_snapshot.region_constraints;
@@ -368,6 +370,7 @@ impl Sccs {
             input: &[(u32, u32)],
             key: fn(&(u32, u32)) -> u32,
         ) -> (Vec<(u32, u32)>, Vec<u32>) {
+            // alloc: per leak check past a binder, sized to its region graph.
             let mut starts = vec![0u32; num_nodes + 1];
             for edge in input {
                 starts[key(edge) as usize + 1] += 1;
@@ -375,7 +378,9 @@ impl Sccs {
             for at in 0..num_nodes {
                 starts[at + 1] += starts[at];
             }
+            // alloc: per leak check past a binder, sized to its region graph.
             let mut output = vec![(0u32, 0u32); input.len()];
+            // alloc: per leak check past a binder, sized to its region graph.
             let mut next = starts.clone();
             for edge in input {
                 let slot = &mut next[key(edge) as usize];
@@ -388,21 +393,27 @@ impl Sccs {
         drop(edges);
         let (sorted, starts) = counting_pass(num_nodes, &by_target, |edge| edge.0);
         drop(by_target);
+        // alloc: per leak check past a binder, sized to its region graph.
         let targets: Vec<u32> = sorted.iter().map(|&(_, target)| target).collect();
         drop(sorted);
 
         const UNVISITED: u32 = u32::MAX;
+        // alloc: per leak check past a binder, sized to its region graph.
         let mut index_of = vec![UNVISITED; num_nodes];
+        // alloc: per leak check past a binder, sized to its region graph.
         let mut low = vec![0u32; num_nodes];
         // A node is on the Tarjan stack exactly when it is visited and has no SCC yet.
+        // alloc: per leak check past a binder, sized to its region graph.
         let mut scc_of = vec![UNVISITED; num_nodes];
         let mut stack: Vec<u32> = Vec::with_capacity(num_nodes);
         // The DFS: each frame is a node and the position of the next successor to visit.
+        // alloc: per leak check past a binder, sized to its region graph.
         let mut frames: Vec<(u32, u32)> = Vec::new();
         let mut next_index = 0u32;
         let mut num_sccs = 0u32;
         // The members of SCC `s` are `members[member_starts[s]..member_starts[s + 1]]`.
         let mut members: Vec<u32> = Vec::with_capacity(num_nodes);
+        // alloc: per leak check past a binder, sized to its region graph.
         let mut member_starts: Vec<u32> = vec![0];
 
         for root in 0..num_nodes as u32 {

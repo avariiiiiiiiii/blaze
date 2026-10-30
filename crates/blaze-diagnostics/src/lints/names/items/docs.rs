@@ -49,11 +49,13 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<F
     if matches!(node, ast::Item::Impl(_) | ast::Item::Use(_) | ast::Item::ExternCrate(_)) {
         return found;
     }
-    if let Container::Impl(imp) = &item.container {
-        if imp.value.trait_().is_some() || hidden_self_ty(cx, imp) {
-            return found;
-        }
+    if let Container::Impl(imp) = &item.container
+        && imp.value.trait_().is_some()
+    {
+        return found;
     }
+    // Asked last: only an exported item with no docs of its own needs it.
+    let hidden_impl = || matches!(&item.container, Container::Impl(imp) if hidden_self_ty(cx, imp));
     let Some(desc) = describe(item) else { return found };
     let exported = match node {
         ast::Item::MacroRules(it) => walk::attr(cx, it, "macro_export").is_some(),
@@ -64,7 +66,7 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<F
         ast::Item::Module(it) => it.item_list().map(|it| it.syntax().clone()),
         _ => None,
     };
-    if exported && !has_doc(cx, node, inner.as_ref()) {
+    if exported && !has_doc(cx, node, inner.as_ref()) && !hidden_impl() {
         found.push(lint(cx, item.syntax(), desc));
     }
     if !matches!(node, ast::Item::Struct(_) | ast::Item::Union(_) | ast::Item::Enum(_)) {

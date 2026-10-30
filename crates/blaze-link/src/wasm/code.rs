@@ -34,11 +34,13 @@ pub(super) const NOTHING: Sig<'static> = &[0x60, 0, 0];
 pub(super) fn signature<'a>(r: &mut Reader<'a>, bytes: &'a [u8]) -> Result<Sig<'a>, String> {
     let start = r.at();
     if r.u8()? != 0x60 {
+        // alloc: error path
         return Err("a type that is not a function type".to_owned());
     }
     for _ in 0..2 {
         let count = r.count()?;
         if let Some(&byte) = r.bytes(count)?.iter().find(|&&it| ValType::from_byte(it).is_none()) {
+            // alloc: error path
             return Err(format!("the value type {byte:#04x}"));
         }
     }
@@ -111,6 +113,7 @@ impl<'a> Header<'a> {
     /// Reads where the parts of `code`'s header are, checking every one of them.
     pub(super) fn parse(code: &'a [u8]) -> Result<Header<'a>, String> {
         if u32::try_from(code.len()).is_err() {
+            // alloc: error path
             return Err("a function of 4 GiB or more".to_owned());
         }
         let mut r = Reader::new(code);
@@ -151,9 +154,11 @@ impl<'a> Header<'a> {
             1 => {
                 r.name()?;
             }
+            // alloc: error path
             tag => return Err(format!("a code header's export tag {tag}")),
         }
         if !r.done() {
+            // alloc: error path
             return Err("a code header longer than what it holds".to_owned());
         }
         let body = end as u32;
@@ -177,6 +182,12 @@ impl<'a> Header<'a> {
     /// The locals and instructions, as the code section has them after the size.
     pub(super) fn body(&self) -> &'a [u8] {
         &self.code[self.body as usize..]
+    }
+
+    /// How many types its `call_indirect`s name, and how many places in the body take one.
+    pub(super) fn counts(&self) -> (usize, usize) {
+        let types = self.reader(self.types).count().expect(CHECKED);
+        (types, self.reader(self.type_fixups).count().expect(CHECKED))
     }
 
     /// The types its `call_indirect`s name, in order, into `out` (cleared first).

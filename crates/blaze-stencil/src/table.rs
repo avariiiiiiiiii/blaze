@@ -4,6 +4,9 @@
 
 pub mod format;
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::OnceLock;
 
 pub use format::{Hole, HoleKind, Stencil, Variant};
@@ -31,6 +34,15 @@ impl Variant {
             (arch, cpu) => Err(Error::new(format!("no stencil library for {arch:?} at {cpu:?}"))),
         }
     }
+
+    /// The library's bytes as built into blaze.
+    pub fn bytes(self) -> &'static [u8] {
+        match self {
+            Variant::X86_64 => X86_64,
+            Variant::Aarch64 => AARCH64,
+            Variant::Aarch64Lse => AARCH64_LSE,
+        }
+    }
 }
 
 impl Library {
@@ -39,13 +51,8 @@ impl Library {
     pub fn get(variant: Variant) -> Result<&'static Library, Error> {
         static LIBRARIES: [OnceLock<Result<Library, String>>; 3] =
             [OnceLock::new(), OnceLock::new(), OnceLock::new()];
-        let bytes = match variant {
-            Variant::X86_64 => X86_64,
-            Variant::Aarch64 => AARCH64,
-            Variant::Aarch64Lse => AARCH64_LSE,
-        };
         let checked = LIBRARIES[variant as usize].get_or_init(|| {
-            let reader = format::Reader::new(bytes).map_err(|e| e.to_string())?;
+            let reader = format::Reader::new(variant.bytes()).map_err(|e| e.to_string())?;
             if reader.variant() != variant {
                 return Err(format!("the {:?} library says it is {:?}", variant, reader.variant()));
             }
@@ -72,7 +79,14 @@ impl Library {
         &self.reader
     }
 
+    /// Every rodata entry, [`format::ENTRY`] bytes each.
     pub fn rodata(&self) -> &'static [u8] {
         self.reader.rodata()
+    }
+
+    /// The rodata entry a `Rodata` hole names ([`Hole::rodata`]).
+    #[inline]
+    pub fn entry(&self, entry: u32) -> &'static [u8] {
+        self.reader.entry(entry)
     }
 }

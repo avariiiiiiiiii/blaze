@@ -24,7 +24,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     ffi::OsString,
     fs::File,
-    io::{self, BufRead, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, Read, Write},
     path::PathBuf,
     sync::{
         Arc, OnceLock,
@@ -475,8 +475,9 @@ impl Tracer {
     }
 
     /// What the expansion of `scope` read, once its server answered it: it saw the
-    /// environment `seen` and this server's own variables. Only the lines of `scope` and the
-    /// new lines of no scope are made into [`Line`]s; the rest are skipped where they lie.
+    /// environment `seen` and this server's own variables. The lines of `scope` are hashed
+    /// where they lie in the buffer; only the new lines of no scope are owned, kept as
+    /// [`Line`]s for every later expansion; the rest are skipped.
     pub(crate) fn traced(&mut self, scope: &str, seen: Vec<(OsString, OsString)>) -> Result<Traced, String> {
         let live = self.live.display();
         let unreadable = |error: io::Error| format!("the sandbox's live record {live} can't be read: {error}");
@@ -484,41 +485,64 @@ impl Tracer {
             Some(file) => file,
             None => self.file.insert(File::open(&self.live).map_err(unreadable)?),
         };
-        file.seek(SeekFrom::Start(self.read)).map_err(unreadable)?;
-        self.bytes.clear();
-        file.read_to_end(&mut self.bytes).map_err(unreadable)?;
-        let whole = self.bytes.iter().rposition(|it| *it == b'\n').map_or(0, |at| at + 1);
+        let filled = appended(file, self.read, &mut self.bytes).map_err(unreadable)?;
+        let whole = self.bytes[..filled].iter().rposition(|it| *it == b'\n').map_or(0, |at| at + 1);
         let text = std::str::from_utf8(&self.bytes[..whole])
             .map_err(|error| format!("the sandbox's live record {live} is not text: {error}"))?;
-        let mut lines = Vec::new();
+        let mut mine = Vec::new();
         for (number, line) in text.split_terminator('\n').enumerate() {
             let bad = || format!("the sandbox's live record {live}: line {} is not a record line", number + 1);
             let mut parts = line.splitn(3, '\t');
             let seen_as = parts.next().and_then(Seen::of).ok_or_else(bad)?;
             let (of, what) = (parts.next().ok_or_else(bad)?, parts.next().ok_or_else(bad)?);
             if of.is_empty() {
-                let line = Line { seen: seen_as, scope: String::new(), what: what.to_owned() };
-                if !plumbing(&line) {
-                    self.common.insert(line);
+                if !plumbing(seen_as, what) {
+                    self.common.insert(Line { seen: seen_as, scope: String::new(), what: what.to_owned() });
                 }
             } else if of == scope {
-                lines.push(Line { seen: seen_as, scope: of.to_owned(), what: what.to_owned() });
+                mine.push((seen_as, what));
             }
         }
         self.read += whole as u64;
-        lines.extend(self.common.iter().cloned());
         let mut env = seen;
         env.retain(|it| !self.own.iter().any(|own| own.0 == it.0));
         env.extend(self.own.iter().cloned());
         self.disk.set_env(env);
-        trace::assemble(&lines, Some(scope), &mut self.disk).map_err(|error| error.to_string())
+        let common = self.common.iter().map(|line| (line.seen, line.what.as_str()));
+        trace::assemble_seen(mine.into_iter().chain(common), &mut self.disk).map_err(|error| error.to_string())
+    }
+}
+
+/// Reads what `file` holds from `at` on into `bytes`, which is kept as long as its longest
+/// read and never cleared, and says how much was read: one positioned read when the record grew
+/// by less than the buffer. A short read of a regular file is its end, so no read of 0 follows.
+fn appended(file: &File, at: u64, bytes: &mut Vec<u8>) -> io::Result<usize> {
+    if bytes.is_empty() {
+        bytes.resize(1 << 16, 0);
+    }
+    let mut filled = 0;
+    loop {
+        #[cfg(unix)]
+        let read = std::os::unix::fs::FileExt::read_at(file, &mut bytes[filled..], at + filled as u64);
+        #[cfg(windows)]
+        let read = std::os::windows::fs::FileExt::seek_read(file, &mut bytes[filled..], at + filled as u64);
+        match read {
+            Ok(0) => return Ok(filled),
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+        if filled < bytes.len() {
+            return Ok(filled);
+        }
+        bytes.resize(bytes.len() * 2, 0);
     }
 }
 
 /// A line of no scope that is the server finding its socket and record before it serves: what
 /// a server does with them is the same whatever their values, which differ per server.
-fn plumbing(line: &Line) -> bool {
-    line.seen == Seen::Env && (line.what == SOCKET || line.what == LIVE)
+fn plumbing(seen: Seen, what: &str) -> bool {
+    seen == Seen::Env && (what == SOCKET || what == LIVE)
 }
 
 /// One warm server a client is made of.

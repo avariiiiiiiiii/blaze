@@ -31,9 +31,10 @@ pub(crate) fn before_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
 /// failed, in `misc_checking_3`'s order: private types in public interfaces, deathness, the
 /// late lint passes, then the extern declarations that clash.
 pub(crate) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let mut found = items::private_in_public(cx);
+    let walk = items::Walk::of(cx);
+    let mut found = items::private_in_public(cx, &walk);
     found.extend(dead::lints(cx));
-    found.extend(items::after_abort(cx));
-    found.extend(items::clashing_extern_declarations(cx));
+    found.extend(items::after_abort(cx, &walk));
+    found.extend(items::clashing_extern_declarations(cx, &walk));
     found
 }

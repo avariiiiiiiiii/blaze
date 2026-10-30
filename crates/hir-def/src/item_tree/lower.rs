@@ -281,9 +281,10 @@ impl TreeBuilder {
 enum Ids<'a> {
     /// The map of the whole file.
     File(&'a AstIdMap),
-    /// One item's ids ([`super::items::ItemSyntax`]): `[start, end, kind, id]` per node, its
-    /// range from `start`, ordered by where the nodes start.
-    Item { ids: &'a [[u32; 4]], start: TextSize },
+    /// One item's ids ([`super::items::ItemSyntax`]): `[start, kind, id]` per node, its start
+    /// from `start`, ordered by it. No two of an item's nodes that have ids start at the same
+    /// offset with the same kind.
+    Item { ids: &'a [[u32; 3]], start: TextSize },
 }
 
 impl Ids<'_> {
@@ -292,13 +293,13 @@ impl Ids<'_> {
             Ids::File(map) => map.ast_id(node),
             Ids::Item { ids, start } => {
                 let node = node.syntax();
-                let range = node.text_range() - start;
-                let key = [u32::from(range.start()), u32::from(range.end()), node.kind() as u32];
-                let from = ids.partition_point(|it| it[0] < key[0]);
+                let at = u32::from(node.text_range().start() - start);
+                let kind = node.kind() as u32;
+                let from = ids.partition_point(|it| it[0] < at);
                 let Some(&[.., raw]) =
-                    ids[from..].iter().take_while(|it| it[0] == key[0]).find(|it| it[..3] == key)
+                    ids[from..].iter().take_while(|it| it[0] == at).find(|it| it[1] == kind)
                 else {
-                    panic!("no ast id for the {:?} at {range:?} of the item", node.kind())
+                    panic!("no ast id for the {:?} at {at} of the item", node.kind())
                 };
                 FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(raw))
             }
@@ -359,7 +360,7 @@ impl<'db> Ctx<'db> {
     pub(super) fn for_item(
         db: &'db dyn SourceDatabase,
         krate: Crate,
-        ids: &'db [[u32; 4]],
+        ids: &'db [[u32; 3]],
         spans: &'db RealSpanMap,
         start: TextSize,
     ) -> Self {

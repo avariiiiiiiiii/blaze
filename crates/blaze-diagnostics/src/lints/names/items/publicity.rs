@@ -32,17 +32,21 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<F
         Container::Impl(imp) if imp.value.trait_().is_none() => false,
         Container::Impl(_) | Container::Trait(_) => return Vec::new(),
     };
-    let restricted = visibility::restricted_to(cx, item);
-    let reachable = match node {
-        ast::Item::Use(_) | ast::Item::ExternCrate(_) => item.in_body.is_none() && restricted.is_none(),
+    // Where its modules restrict it: a `use`'s reachability, else read only for a lint.
+    let (reachable, restricted) = match node {
+        ast::Item::Use(_) | ast::Item::ExternCrate(_) => {
+            let restricted = visibility::restricted_to(cx, item);
+            (item.in_body.is_none() && restricted.is_none(), Some(restricted))
+        }
         _ => match visibility::def(cx, item) {
-            Some(def) => effective.is_reachable(def),
+            Some(def) => (effective.is_reachable(def), None),
             None => return Vec::new(),
         },
     };
     if reachable {
         return Vec::new();
     }
+    let restricted = restricted.unwrap_or_else(|| visibility::restricted_to(cx, item));
     let grandparent = item.module.parent(cx.db);
     let new_vis = match restricted {
         Some(it) if item.in_body.is_none() && Some(it) == grandparent && !it.is_crate_root(cx.db) => "pub(super)",

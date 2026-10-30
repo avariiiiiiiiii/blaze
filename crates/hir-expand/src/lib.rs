@@ -126,6 +126,10 @@ impl ExpandError {
     pub fn builtin_derive(span: Span, msg: impl Into<Box<str>>) -> Self {
         Self::new(span, ExpandErrorKind::BuiltinDerive(msg.into()))
     }
+    /// An error of a builtin macro or derive in rustc's words, at `span`.
+    pub fn builtin(span: Span, error: BuiltinError) -> Self {
+        Self::new(span, ExpandErrorKind::Builtin(Box::new(error)))
+    }
     pub fn kind(&self) -> &ExpandErrorKind {
         &self.inner.0
     }
@@ -153,6 +157,66 @@ pub enum ExpandErrorKind {
     BuiltinDerive(Box<str>),
     DefaultNoVariant,
     ProcMacroPanic(Box<str>),
+    /// An error a builtin macro or derive gives as `rustc_builtin_macros` gives it.
+    Builtin(Box<BuiltinError>),
+}
+
+/// An error of a builtin macro or derive as `rustc_builtin_macros` words it: the message, its
+/// error code, the primary spans it has besides the error's own, and the notes and helps under
+/// it, in rustc's order.
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub struct BuiltinError {
+    pub message: Box<str>,
+    /// The number of the code: 802 for E0802.
+    pub code: Option<u16>,
+    pub also_at: Box<[Span]>,
+    pub children: Box<[(BuiltinChild, Box<str>)]>,
+}
+
+/// What a line under a [`BuiltinError`] is.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum BuiltinChild {
+    Note,
+    Help,
+}
+
+impl BuiltinError {
+    pub fn new(message: impl Into<Box<str>>) -> Self {
+        BuiltinError {
+            message: message.into(),
+            code: None,
+            also_at: Box::default(),
+            children: Box::default(),
+        }
+    }
+
+    pub fn code(self, code: u16) -> Self {
+        BuiltinError { code: Some(code), ..self }
+    }
+
+    pub fn note(self, text: impl Into<Box<str>>) -> Self {
+        self.child(BuiltinChild::Note, text.into())
+    }
+
+    pub fn help(self, text: impl Into<Box<str>>) -> Self {
+        self.child(BuiltinChild::Help, text.into())
+    }
+
+    /// The primary spans after the error's own.
+    pub fn also_at(self, spans: impl Into<Box<[Span]>>) -> Self {
+        BuiltinError { also_at: spans.into(), ..self }
+    }
+
+    pub fn at(self, span: Span) -> ExpandError {
+        ExpandError::builtin(span, self)
+    }
+
+    fn child(self, kind: BuiltinChild, text: Box<str>) -> Self {
+        // alloc: an error's few lines, on the error path
+        let mut children = self.children.into_vec();
+        children.push((kind, text));
+        BuiltinError { children: children.into_boxed_slice(), ..self }
+    }
 }
 
 pub struct RenderedExpandError {
@@ -171,6 +235,8 @@ impl RenderedExpandError {
     const GENERAL_KIND: &str = "macro-error";
     const DISABLED: &str = "proc-macro-disabled";
     const ATTR_EXP_DISABLED: &str = "attribute-expansion-disabled";
+    /// An [`ExpandErrorKind::Builtin`]: the message is rustc's own.
+    pub const BUILTIN: &str = "builtin-macro-error";
 }
 
 impl ExpandErrorKind {
@@ -236,6 +302,11 @@ impl ExpandErrorKind {
                 message: format!("proc-macro panicked: {e}"),
                 error: true,
                 kind: RenderedExpandError::GENERAL_KIND,
+            },
+            ExpandErrorKind::Builtin(e) => RenderedExpandError {
+                message: (*e.message).to_owned(),
+                error: true,
+                kind: RenderedExpandError::BUILTIN,
             },
         }
     }

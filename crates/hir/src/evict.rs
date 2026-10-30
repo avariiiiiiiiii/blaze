@@ -2,7 +2,7 @@
 //! every compiled body was 15% of a cold build's live heap; #734).
 //!
 //! Each value dropped keeps its memo, its fingerprint and the edges it read (salsa's
-//! `evict_value` and `evict_values`): a dependent verifies against it without the value, and a
+//! `evict_values`, which every query with a `Hash` output has): a dependent verifies against it without the value, and a
 //! read computes it again and backdates by fingerprint, so a later edit cuts off early as if it
 //! had been kept. What is dropped:
 //!
@@ -45,6 +45,8 @@ pub fn drop_mir(db: &mut dyn HirDatabase) {
 
     mir::optimized_mir_body_query::evict_values(db);
     mir::optimized_mir_body_for_closure_query::evict_values(db);
+    mir::optimized_mir_body_for_coroutine_query::evict_values(db);
+    mir::optimized_mir_body_for_coroutine_by_move_query::evict_values(db);
 
     mir::monomorphized_mir_body_query::evict_values(db);
     mir::monomorphized_mir_body_for_closure_query::evict_values(db);
@@ -59,4 +61,6 @@ pub fn drop_mir(db: &mut dyn HirDatabase) {
 
     mir::monomorphized_optimized_mir_body_query::evict_values(db);
     mir::monomorphized_optimized_mir_body_for_closure_query::evict_values(db);
+    mir::monomorphized_optimized_mir_body_for_coroutine_query::evict_values(db);
+    mir::monomorphized_optimized_mir_body_for_coroutine_by_move_query::evict_values(db);
 }

@@ -36,6 +36,13 @@ impl Names {
         ok
     }
 
+    /// Adds `name`, which the caller holds as a [`FileName`]'s text already (a name of a column
+    /// that was checked as it was opened): not checked again.
+    pub fn push_checked(&mut self, name: &str) {
+        debug_assert!(FileName::new(name).is_some() && !name.as_bytes().contains(&0), "{name:?}");
+        self.push_unchecked(name);
+    }
+
     /// `dir`, a `/`, then `rest`, if that is a name.
     pub fn push_joined(&mut self, dir: &str, rest: &str) -> bool {
         let start = self.bytes.len();

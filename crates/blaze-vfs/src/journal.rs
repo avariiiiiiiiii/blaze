@@ -24,6 +24,14 @@
 //! - **Compaction**: after a collection, the next flush replaces the whole file, in one
 //!   [`Effect::Write`], with the nodes the heads reach and one record per head. Nothing is
 //!   appended while it is in flight; a failed one is made again from the state then.
+//! - **An image** (docs/v2/plan/design/restore.md): once the daemon's image holding the tree is
+//!   durable ([`Journal::durable`]), the next flush rewrites the file to start with a base
+//!   record naming it (the hash of its tree and its node count), then only what the image does
+//!   not hold. A start maps the image and reads only that tail. The image records the base the
+//!   file started from when it was written, so a crash after the image's rename and before the
+//!   rewrite loads the image and the old file whole over it: every record of the old file is
+//!   of a node the image has or one the file makes, because an image is written only while no
+//!   node of the file's base was dropped since the file was last rewritten (`settled`).
 
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
 use blaze_ids::{ContentId, Hasher};
@@ -45,10 +53,13 @@ const HEAD: u8 = 3;
 const REMOVE: u8 = 4;
 /// The sequence a rewrite was made at, so the numbers of removals it drops are not given again.
 const SEQUENCE: u8 = 5;
+/// The image the file starts from: the hash of its tree and its node count. Only first.
+const BASE: u8 = 6;
+const BASE_PAYLOAD: usize = 32 + 8;
 
 /// Sequence numbers are below this: one more per head move from 0 never reaches it, so a
 /// record at or above it is forged, and the next number never overflows.
-const SEQUENCES: u64 = 1 << 63;
+pub(crate) const SEQUENCES: u64 = 1 << 63;
 
 const APPEND: u64 = 0;
 const SYNC: u64 = 1;
@@ -72,9 +83,9 @@ enum Flight {
     Rewriting(Vec<Ticket>),
 }
 
-/// By node, one bit: whether a record of it is in the file, or will be before any record made
-/// now.
-#[derive(Default)]
+/// By node, one bit: whether a record of it is in the file (or the image it starts from), or
+/// will be before any record made now.
+#[derive(Clone, Default)]
 struct Written(Vec<u64>);
 
 impl Written {
@@ -100,6 +111,45 @@ impl Written {
     fn grow(&mut self, len: usize) {
         self.0.resize(len.div_ceil(64), 0);
     }
+
+    /// The same bits by each node's number after a collection, and whether a node with its
+    /// bit set was dropped.
+    fn renumbered(&self, renumbered: &[Option<NodeId>], len: usize) -> (Written, bool) {
+        let mut out = Written::new(len, false);
+        let mut dropped = false;
+        for (old, new) in renumbered.iter().enumerate() {
+            if self.get(NodeId(old as u32)) {
+                match new {
+                    Some(new) => out.set(*new),
+                    None => dropped = true,
+                }
+            }
+        }
+        (out, dropped)
+    }
+}
+
+/// An image of the tree the file starts from, or will: its name, its node count, and which
+/// nodes of the tree are in it (renumbered by collections).
+struct FileBase {
+    name: ContentId,
+    nodes: u64,
+    of: Written,
+}
+
+/// The tree read in place from an image, for [`Journal::restore`] to load the file over.
+pub(crate) struct FromImage {
+    pub(crate) tree: Tree,
+    /// The hash of the image's tree and its node count, as a base record names them.
+    pub(crate) name: ContentId,
+    pub(crate) nodes: u64,
+    /// Each head, its root and its sequence, as the image holds them.
+    pub(crate) heads: Vec<(Box<str>, ContentId, u64)>,
+    pub(crate) sequence: u64,
+    /// The file does not start from this image but from the one it was written over (or
+    /// none): the rewrite naming it did not happen, so the whole file is loaded over it and
+    /// the next flush rewrites it.
+    pub(crate) resumed: bool,
 }
 
 pub(crate) struct Journal {
@@ -119,6 +169,19 @@ pub(crate) struct Journal {
     /// Something was appended since the file was last rewritten.
     dirty: bool,
     next_ticket: u64,
+    /// The image the file starts with: its nodes are never recorded.
+    base: Option<FileBase>,
+    /// The image [`Journal::stage`] was told of, not yet durable.
+    staged: Option<FileBase>,
+    /// A durable image the next rewrite starts the file with.
+    next: Option<FileBase>,
+    /// The image the rewrite in flight starts the file with.
+    switching: Option<FileBase>,
+    /// No node of the file's base was dropped since the file was last rewritten, so every
+    /// node the file names is the tree's or the file's own.
+    settled: bool,
+    /// The rewrite in flight leaves the file settled.
+    rewrite_settles: bool,
 }
 
 /// What [`Journal::recover`] rebuilt.
@@ -130,13 +193,42 @@ pub(crate) struct Loaded {
 }
 
 impl Journal {
-    /// The journal whose file holds `bytes`, and the tree and heads it holds.
+    /// The journal whose file holds `bytes`, and the tree and heads it holds. A file that
+    /// starts from an image loads only the records that name no node of it (none past the
+    /// first that does), and is rewritten as what loaded.
     pub(crate) fn recover(file: FileName, tags: u64, bytes: &[u8]) -> Loaded {
-        let mut tree = Tree::new();
+        Journal::load(file, tags, bytes, None)
+    }
+
+    /// The journal whose file holds `bytes`, loaded over `image`: its heads, then the file's
+    /// records after its base record.
+    pub(crate) fn restore(file: FileName, tags: u64, bytes: &[u8], image: FromImage) -> Loaded {
+        Journal::load(file, tags, bytes, Some(image))
+    }
+
+    fn load(file: FileName, tags: u64, bytes: &[u8], image: Option<FromImage>) -> Loaded {
         let mut found = Recovered::default();
         let mut moves: FxHashMap<Box<str>, Vec<(u64, Option<ContentId>)>> = FxHashMap::default();
         let mut sequence = 0;
+        let (mut tree, from) = match image {
+            Some(FromImage { tree, name, nodes, heads, sequence: at, resumed }) => {
+                for (head, root, at) in heads {
+                    moves.entry(head).or_default().push((at, Some(root)));
+                }
+                sequence = at;
+                let of = Written::new(tree.table().base_len() as usize, true);
+                (tree, Some((FileBase { name, nodes, of }, resumed)))
+            }
+            None => (Tree::new(), None),
+        };
         let mut valid = 0;
+        let mut lost_base = false;
+        if base_of(bytes).is_some() {
+            let (_, _, len) = record(bytes).expect("a base record is a record");
+            valid = len;
+            found.records += 1;
+            lost_base = from.is_none();
+        }
         while let Some((kind, payload, len)) = record(&bytes[valid..]) {
             if load(&mut tree, kind, payload, &mut moves, &mut sequence).is_none() {
                 break;
@@ -154,11 +246,26 @@ impl Journal {
             open: Batch::default(),
             flight: Flight::Idle,
             cut: (valid < bytes.len()).then_some(valid as u64),
-            // Set below if a head is dropped.
-            compact: false,
+            // Without the image it starts from, the file is rewritten as what loaded; set
+            // below too if a head is dropped.
+            compact: lost_base,
             dirty: !bytes.is_empty(),
             next_ticket: 0,
+            base: None,
+            staged: None,
+            next: None,
+            switching: None,
+            settled: true,
+            rewrite_settles: false,
         };
+        match from {
+            Some((image, true)) => {
+                journal.next = Some(image);
+                journal.compact = true;
+            }
+            Some((image, false)) => journal.base = Some(image),
+            None => {}
+        }
         let mut heads = FxHashMap::default();
         let mut names: Vec<Box<str>> = moves.keys().cloned().collect();
         names.sort_unstable();
@@ -219,6 +326,37 @@ impl Journal {
         self.sequence
     }
 
+    /// Whether an image of the tree written now can become the file's base: no image is on
+    /// its way to being one, and the file names only nodes the tree has or the file makes, so
+    /// it loads whole over that image if the rewrite naming it never happens.
+    pub(crate) fn can_stage(&self) -> bool {
+        self.next.is_none() && self.switching.is_none() && self.settled
+    }
+
+    /// The image the file starts from, which an image written now records.
+    pub(crate) fn based_on(&self) -> Option<ContentId> {
+        self.base.as_ref().map(|it| it.name)
+    }
+
+    /// An image named `name` holding the tree's first `nodes` nodes (all of them now) is being
+    /// written, in place of one written before and not yet durable. Only when
+    /// [`Journal::can_stage`].
+    pub(crate) fn stage(&mut self, name: ContentId, nodes: u64) {
+        assert!(self.can_stage(), "an image staged while the journal's base is changing");
+        self.staged = Some(FileBase { name, nodes, of: Written::new(nodes as usize, true) });
+    }
+
+    /// The image named `name` is durable: the next flush rewrites the file to start from it.
+    /// `false` for an image not the one last staged, which nothing then uses.
+    pub(crate) fn durable(&mut self, name: ContentId) -> bool {
+        if self.staged.as_ref().is_none_or(|it| it.name != name) {
+            return false;
+        }
+        self.next = self.staged.take();
+        self.compact = true;
+        true
+    }
+
     /// Starts the next effect if none is in flight: a rewrite if one was asked for, else the cut
     /// recovery asked for, else an append of what was recorded since the last.
     pub(crate) fn flush(
@@ -235,10 +373,24 @@ impl Journal {
             // The rewrite replaces the whole file, the torn tail with it.
             self.cut = None;
             self.dirty = false;
-            self.written = Written::new(tree.len(), false);
+            let target = self.next.take();
+            let mut bytes = Vec::new();
+            self.written = match target.as_ref().or(self.base.as_ref()) {
+                Some(base) => {
+                    frame(&mut bytes, BASE, |out| {
+                        out.extend_from_slice(&base.name.0);
+                        out.extend_from_slice(&base.nodes.to_le_bytes());
+                    });
+                    let mut written = base.of.clone();
+                    written.grow(tree.len());
+                    written
+                }
+                None => Written::new(tree.len(), false),
+            };
+            self.rewrite_settles = true;
+            self.switching = target;
             let mut names: Vec<&Box<str>> = heads.keys().collect();
             names.sort_unstable();
-            let mut bytes = Vec::new();
             for name in &names {
                 write_node(tree, &mut self.written, &mut bytes, heads[*name]);
             }
@@ -297,7 +449,13 @@ impl Journal {
                 self.flight = Flight::Syncing(Vec::new());
             }
             (CUT, Done::Failed(_), Flight::Cutting) => {}
-            (REWRITE, Done::Written, Flight::Rewriting(tickets)) => durable = tickets,
+            (REWRITE, Done::Written, Flight::Rewriting(tickets)) => {
+                if let Some(base) = self.switching.take() {
+                    self.base = Some(base);
+                }
+                self.settled = self.rewrite_settles;
+                durable = tickets;
+            }
             // A failed rewrite left the file as it was. A failed append may have left part of
             // its batch, and after a failed sync the kernel may have dropped the pages it could
             // not write, so a second sync could succeed without them. Either way the next
@@ -311,6 +469,10 @@ impl Journal {
                 let later = std::mem::take(&mut self.open).tickets;
                 self.open.tickets = tickets;
                 self.open.tickets.extend(later);
+                // A rewrite that failed starting from a new image is made again from it.
+                if let Some(base) = self.switching.take() {
+                    self.next = Some(base);
+                }
                 self.compact = true;
             }
             (offset, done, _) => {
@@ -322,18 +484,25 @@ impl Journal {
     }
 
     /// Follows a collection: each node's new number, and a rewrite asked for if the file holds
-    /// anything the heads may no longer reach.
+    /// anything the heads may no longer reach. A node of the file's base dropped leaves the
+    /// file naming a node the tree no longer has, so no image is written until it is
+    /// rewritten.
     pub(crate) fn collected(&mut self, renumbered: &[Option<NodeId>], len: usize) {
-        let mut written = Written::new(len, false);
-        for (old, new) in renumbered.iter().enumerate() {
-            if let Some(new) = new
-                && self.written.get(NodeId(old as u32))
-            {
-                written.set(*new);
-            }
+        self.written = self.written.renumbered(renumbered, len).0;
+        let mut lost = false;
+        for base in [&mut self.base, &mut self.switching].into_iter().flatten() {
+            let (of, dropped) = base.of.renumbered(renumbered, len);
+            base.of = of;
+            lost |= dropped;
         }
-        self.written = written;
-        self.compact |= self.dirty;
+        for image in [&mut self.staged, &mut self.next].into_iter().flatten() {
+            image.of = image.of.renumbered(renumbered, len).0;
+        }
+        if lost {
+            self.settled = false;
+            self.rewrite_settles = false;
+        }
+        self.compact |= self.dirty || lost;
     }
 }
 
@@ -352,7 +521,12 @@ fn write_node(tree: &Tree, written: &mut Written, out: &mut Vec<u8>, node: NodeI
         if written.get(node) {
             continue;
         }
-        if let Some(bytes) = tree.bytes(node) {
+        // A file of the image is in the base the file starts from, so its bit is set: no
+        // record reads the image's bytes.
+        let bytes = tree.bytes(node).unwrap_or_else(|corrupt| {
+            panic!("the journal records a file of the image, which its base holds: {corrupt}")
+        });
+        if let Some(bytes) = bytes {
             out.reserve(HEADER + bytes.len() + CHECKSUM);
             frame(out, FILE, |out| out.extend_from_slice(bytes));
         } else if !children_done {
@@ -415,6 +589,20 @@ pub(crate) fn framed(kind: u8, payload: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 pub(crate) const KINDS: (u8, u8, u8, u8, u8) = (FILE, DIR, HEAD, REMOVE, SEQUENCE);
+
+#[cfg(test)]
+pub(crate) const BASE_KIND: u8 = BASE;
+
+/// The image a journal's file starts from, if its first record is a base record: the hash of
+/// the image's tree and its node count.
+pub(crate) fn base_of(bytes: &[u8]) -> Option<(ContentId, u64)> {
+    let (kind, payload, _) = record(bytes)?;
+    if kind != BASE || payload.len() != BASE_PAYLOAD {
+        return None;
+    }
+    let name = ContentId(payload[..32].try_into().expect("32 bytes"));
+    Some((name, u64::from_le_bytes(payload[32..].try_into().expect("8 bytes"))))
+}
 
 /// The record at the start of `bytes`, its payload and its whole length, if it is a whole record
 /// with a good checksum.

@@ -20,15 +20,14 @@
 #[allow(clippy::disallowed_types)]
 use std::sync::{Mutex, MutexGuard};
 use std::{
-    cell::UnsafeCell,
+    alloc::{self, Layout},
     collections::VecDeque,
     hash::BuildHasherDefault,
     marker::PhantomData,
-    mem::MaybeUninit,
-    ptr,
+    ptr::{self, NonNull},
     sync::{
         OnceLock, PoisonError,
-        atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -88,18 +87,74 @@ fn chunk_of(row: u32) -> (usize, usize) {
     (chunk, row as usize - ROW_FIRST * ((1 << chunk) - 1))
 }
 
+/// Asks the core to start loading the line at `at` into L1. A hint only: it reads nothing a
+/// load can see, never faults, and on other targets does nothing.
+#[inline(always)]
+pub(crate) fn prefetch<T>(at: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `prefetcht0` touches no register but its address and no memory, and never
+    // faults, whatever the address.
+    unsafe {
+        std::arch::asm!("prefetcht0 [{at}]", at = in(reg) at, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above, for `prfm`.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{at}]", at = in(reg) at, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = at;
+}
+
+/// A row of a multiple of 64 bytes starts a cache line, so reading it touches one line a 64.
+fn row_align<T>() -> usize {
+    if size_of::<T>() % 64 == 0 { align_of::<T>().max(64) } else { align_of::<T>() }
+}
+
+fn chunk_layout<T>(len: usize) -> Layout {
+    Layout::from_size_align(size_of::<T>() * len, row_align::<T>()).expect("a chunk's layout")
+}
+
 struct Chunk<T> {
-    rows: Box<[UnsafeCell<MaybeUninit<T>>]>,
-    /// One bit a row, set while it holds a value: what [`Rows`]' drop drops.
-    live: Box<[AtomicU64]>,
+    rows: NonNull<T>,
+    len: usize,
+    /// One flag a row, set while it holds a value: what [`Rows`]' drop drops. Written only by
+    /// the row's owner, with a plain store.
+    live: Box<[AtomicBool]>,
+}
+
+impl<T> Chunk<T> {
+    fn new(len: usize) -> Chunk<T> {
+        let layout = chunk_layout::<T>(len);
+        assert!(layout.size() > 0, "rows of a zero-sized type");
+        // SAFETY: `layout` has a nonzero size.
+        let rows = NonNull::new(unsafe { alloc::alloc(layout) }.cast::<T>())
+            .unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        Chunk { rows, len, live: (0..len).map(|_| AtomicBool::new(false)).collect() }
+    }
+
+    fn row(&self, at: usize) -> *mut T {
+        debug_assert!(at < self.len);
+        // SAFETY: `at` is below the chunk's length, so inside its allocation.
+        unsafe { self.rows.as_ptr().add(at) }
+    }
+}
+
+impl<T> Drop for Chunk<T> {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `Chunk::new` with this layout; its values were dropped by
+        // `Rows`' drop, which runs first.
+        unsafe { alloc::dealloc(self.rows.as_ptr().cast(), chunk_layout::<T>(self.len)) };
+    }
 }
 
 /// Rows of `T` by `u32` index, in chunks that never move. Which rows hold a value is the
 /// owner's to know ([`Ids`], [`Free`]); a row is written once by the one thread that claimed
 /// it, read by any thread it was published to, and dropped once no thread can reach it.
 ///
-/// Per row: `size_of::<T>()` bytes and one live bit. A read: one acquire load of the chunk
-/// and the row itself.
+/// Per row: `size_of::<T>()` bytes (line-aligned when a multiple of 64) and one byte of live
+/// flag. A read: one load of the chunk's base (27 bases, always in L1) and the row itself.
+/// Writing one: a plain store of the row and of its flag, no read-modify-write.
 pub(crate) struct Rows<T> {
     chunks: [OnceLock<Chunk<T>>; ROW_CHUNKS],
 }
@@ -118,13 +173,13 @@ impl<T> Rows<T> {
     }
 
     fn chunk(&self, chunk: usize) -> &Chunk<T> {
-        self.chunks[chunk].get_or_init(|| {
-            let len = ROW_FIRST << chunk;
-            Chunk {
-                rows: (0..len).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect(),
-                live: (0..len / 64).map(|_| AtomicU64::new(0)).collect(),
-            }
-        })
+        self.chunks[chunk].get_or_init(|| Chunk::new(ROW_FIRST << chunk))
+    }
+
+    /// Where `row` is, without reading it, if its chunk was made: for [`prefetch`].
+    fn address(&self, row: u32) -> Option<*const T> {
+        let (chunk, at) = chunk_of(row);
+        self.chunks[chunk].get().map(|chunk| chunk.row(at).cast_const())
     }
 
     fn made(&self, row: u32) -> (&Chunk<T>, usize) {
@@ -143,8 +198,8 @@ impl<T> Rows<T> {
         let (chunk, at) = chunk_of(row);
         let chunk = self.chunk(chunk);
         // SAFETY: the caller owns the row, which holds no value.
-        unsafe { (*chunk.rows[at].get()).write(value) };
-        chunk.live[at / 64].fetch_or(1 << (at % 64), Ordering::Relaxed);
+        unsafe { chunk.row(at).write(value) };
+        chunk.live[at].store(true, Ordering::Relaxed);
     }
 
     /// The value at `row`.
@@ -158,7 +213,7 @@ impl<T> Rows<T> {
     pub(crate) unsafe fn get(&self, row: u32) -> &T {
         let (chunk, at) = self.made(row);
         // SAFETY: the caller's contract: the row holds a published value that outlives this.
-        unsafe { (*chunk.rows[at].get()).assume_init_ref() }
+        unsafe { &*chunk.row(at) }
     }
 
     /// Drops the value at `row`.
@@ -168,23 +223,20 @@ impl<T> Rows<T> {
     /// `row` holds a value that no thread can reach any more.
     pub(crate) unsafe fn drop_row(&self, row: u32) {
         let (chunk, at) = self.made(row);
-        chunk.live[at / 64].fetch_and(!(1 << (at % 64)), Ordering::Relaxed);
+        chunk.live[at].store(false, Ordering::Relaxed);
         // SAFETY: the caller's contract: nothing reads the value any more.
-        unsafe { (*chunk.rows[at].get()).assume_init_drop() };
+        unsafe { ptr::drop_in_place(chunk.row(at)) };
     }
 }
 
 impl<T> Drop for Rows<T> {
     fn drop(&mut self) {
         for chunk in self.chunks.iter_mut().filter_map(OnceLock::get_mut) {
-            for (word_at, word) in chunk.live.iter_mut().enumerate() {
-                let mut bits = *word.get_mut();
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    // SAFETY: a live bit is set by `put` and cleared by `drop_row`, so the row
+            for at in 0..chunk.len {
+                if *chunk.live[at].get_mut() {
+                    // SAFETY: a live flag is set by `put` and cleared by `drop_row`, so the row
                     // holds a value; `&mut` excludes every reader.
-                    unsafe { chunk.rows[word_at * 64 + bit].get_mut().assume_init_drop() };
+                    unsafe { ptr::drop_in_place(chunk.row(at)) };
                 }
             }
         }
@@ -203,11 +255,14 @@ impl Generations {
         Generations { chunks: std::array::from_fn(|_| OnceLock::new()) }
     }
 
-    /// The row's next generation: call it once each time the row is claimed.
+    /// The row's next generation: called once each time the row is claimed, by its claimer,
+    /// which alone writes it (so a load and a store, no read-modify-write).
     pub(crate) fn bump(&self, row: u32) -> u32 {
         let (chunk, at) = chunk_of(row);
         let words = self.chunks[chunk].get_or_init(|| (0..ROW_FIRST << chunk).map(|_| AtomicU32::new(0)).collect());
-        words[at].fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+        let next = words[at].load(Ordering::Relaxed).wrapping_add(1);
+        words[at].store(next, Ordering::Relaxed);
+        next
     }
 }
 
@@ -305,7 +360,7 @@ impl Free {
 }
 
 /// How many rows a shard has retired before a write reclaims those past their grace.
-const COLLECT_AT: usize = 16;
+pub(crate) const COLLECT_AT: usize = 16;
 const FIRST_TABLE: usize = 16;
 
 /// One key and its value, never changed once published.
@@ -339,18 +394,46 @@ fn tag(key: &QueryKey) -> u32 {
     u32::from_le_bytes([input[8], input[9], input[10], input[11]]) ^ u32::from(key.kind.0).wrapping_mul(0x9e37_79b9)
 }
 
-/// 8 bytes a place, at most half full with live entries and tombs: a find is one acquire load
+/// A shard's table is its places alone, 8 bytes each, at most half full with live entries and
+/// tombs; the top bits of the pointer published in the shard are log2 of its length, so a find
+/// goes from that one load straight to the place (no header to load first): one acquire load
 /// a place probed (about 1.5 at that load) and one row read on a tag match.
-struct Table {
-    mask: usize,
-    places: Box<[AtomicU64]>,
+const LEN_SHIFT: u32 = usize::BITS - 6;
+
+const _: () = assert!(usize::BITS == 64, "a table's length is kept in its pointer's top bits");
+
+fn new_table(len: usize) -> *mut AtomicU64 {
+    debug_assert!(len.is_power_of_two());
+    let places: Box<[AtomicU64]> = (0..len).map(|_| AtomicU64::new(EMPTY)).collect();
+    let raw = Box::into_raw(places).cast::<AtomicU64>();
+    assert!(raw.addr() >> LEN_SHIFT == 0, "a table mapped above 2^58");
+    raw.map_addr(|addr| addr | (len.trailing_zeros() as usize) << LEN_SHIFT)
 }
 
-impl Table {
-    fn new(len: usize) -> Box<Table> {
-        debug_assert!(len.is_power_of_two());
-        Box::new(Table { mask: len - 1, places: (0..len).map(|_| AtomicU64::new(EMPTY)).collect() })
-    }
+fn untag(table: *mut AtomicU64) -> (*mut AtomicU64, usize) {
+    (table.map_addr(|addr| addr & ((1 << LEN_SHIFT) - 1)), 1 << (table.addr() >> LEN_SHIFT))
+}
+
+/// The places of a table [`new_table`] made.
+///
+/// # Safety
+///
+/// `table` is not freed while `'a` lives.
+unsafe fn places<'a>(table: *mut AtomicU64) -> &'a [AtomicU64] {
+    let (at, len) = untag(table);
+    // SAFETY: `new_table` allocated `len` places at `at`; alive by the caller's contract.
+    unsafe { std::slice::from_raw_parts(at, len) }
+}
+
+/// The table back as the box [`new_table`] made it from.
+///
+/// # Safety
+///
+/// `table` came from [`new_table`], is unlinked, and is taken back once.
+unsafe fn table_box(table: *mut AtomicU64) -> Box<[AtomicU64]> {
+    let (at, len) = untag(table);
+    // SAFETY: the box `new_table` leaked, of `len` places at `at`.
+    unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(at, len)) }
 }
 
 /// A shard's writer state, under its lock.
@@ -368,8 +451,8 @@ struct Writer {
 #[repr(align(128))]
 struct Shard {
     writer: ShortLock<Writer>,
-    /// Null until the first insert.
-    table: AtomicPtr<Table>,
+    /// Null until the first insert; see [`new_table`].
+    table: AtomicPtr<AtomicU64>,
 }
 
 /// What [`Map::edit_all`] does to one entry.
@@ -409,11 +492,11 @@ impl<V: Send + Sync + 'static> Map<V> {
         &self.shards[u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize & self.mask]
     }
 
-    fn table<'g>(shard: &'g Shard, _task: &'g Guard) -> Option<&'g Table> {
+    fn table<'g>(shard: &'g Shard, _task: &'g Guard) -> Option<&'g [AtomicU64]> {
         let table = shard.table.load(Ordering::Acquire);
         // SAFETY: a table published in a shard is freed only after a newer one replaced it and
         // a grace passed, or by `&mut`: `_task` keeps this thread in the task that loaded it.
-        (!table.is_null()).then(|| unsafe { &*table })
+        (!table.is_null()).then(|| unsafe { places(table) })
     }
 
     /// The entry a place names.
@@ -429,11 +512,12 @@ impl<V: Send + Sync + 'static> Map<V> {
     }
 
     /// Where `key` is: its place's index and word, and its entry.
-    fn find<'g>(&'g self, table: &'g Table, key: &QueryKey) -> Option<(usize, u64, &'g Entry<V>)> {
+    fn find<'g>(&'g self, table: &'g [AtomicU64], key: &QueryKey) -> Option<(usize, u64, &'g Entry<V>)> {
         let tag = tag(key);
-        let mut at = tag as usize & table.mask;
+        let mask = table.len() - 1;
+        let mut at = tag as usize & mask;
         loop {
-            let place = table.places[at].load(Ordering::Acquire);
+            let place = table[at].load(Ordering::Acquire);
             if place == EMPTY {
                 return None;
             }
@@ -445,17 +529,18 @@ impl<V: Send + Sync + 'static> Map<V> {
                     return Some((at, place, entry));
                 }
             }
-            at = (at + 1) & table.mask;
+            at = (at + 1) & mask;
         }
     }
 
     /// Where `key` is, or the first place it may be put: a tomb or an empty one.
-    fn place_for(&self, table: &Table, key: &QueryKey) -> Result<(usize, u64), usize> {
+    fn place_for(&self, table: &[AtomicU64], key: &QueryKey) -> Result<(usize, u64), usize> {
         let tag = tag(key);
-        let mut at = tag as usize & table.mask;
+        let mask = table.len() - 1;
+        let mut at = tag as usize & mask;
         let mut free = None;
         loop {
-            let place = table.places[at].load(Ordering::Relaxed);
+            let place = table[at].load(Ordering::Relaxed);
             if place == EMPTY {
                 return Err(free.unwrap_or(at));
             }
@@ -467,7 +552,7 @@ impl<V: Send + Sync + 'static> Map<V> {
                     return Ok((at, place));
                 }
             }
-            at = (at + 1) & table.mask;
+            at = (at + 1) & mask;
         }
     }
 
@@ -480,40 +565,58 @@ impl<V: Send + Sync + 'static> Map<V> {
         self.get_entry(task, key).map(|(_, entry)| &entry.value)
     }
 
+    /// Starts loading the line of `key`'s first place, for a lookup of it soon: a hint.
+    pub(crate) fn prefetch_place(&self, task: &Guard, key: &QueryKey) {
+        if let Some(table) = Self::table(self.shard(key), task) {
+            prefetch(&table[tag(key) as usize & (table.len() - 1)]);
+        }
+    }
+
+    /// Starts loading the row `key`'s first place names: a hint, for once the place's line
+    /// is in (see [`Map::prefetch_place`]).
+    pub(crate) fn prefetch_entry(&self, task: &Guard, key: &QueryKey) {
+        let Some(table) = Self::table(self.shard(key), task) else { return };
+        let place = table[tag(key) as usize & (table.len() - 1)].load(Ordering::Relaxed);
+        if let Some(at) = row_of(place).and_then(|row| self.rows.address(row)) {
+            prefetch(at);
+        }
+    }
+
     /// The shard's table, with a place for one more entry.
-    fn room<'s>(shard: &'s Shard, writer: &mut Writer) -> &'s Table {
+    fn room<'s>(shard: &'s Shard, writer: &mut Writer) -> &'s [AtomicU64] {
         let current = shard.table.load(Ordering::Acquire);
         if current.is_null() {
-            let table = Box::into_raw(Table::new(FIRST_TABLE));
+            let table = new_table(FIRST_TABLE);
             shard.table.store(table, Ordering::Release);
             // SAFETY: just published; freed only through the shard's limbo or by `&mut`.
-            return unsafe { &*table };
+            return unsafe { places(table) };
         }
         // SAFETY: the current table, which only this lock's holder replaces.
-        let old = unsafe { &*current };
-        if (writer.used + 1) * 2 <= old.places.len() {
+        let old = unsafe { places(current) };
+        if (writer.used + 1) * 2 <= old.len() {
             return old;
         }
-        let new = Table::new(((writer.live + 1) * 4).next_power_of_two().max(FIRST_TABLE));
-        for place in old.places.iter() {
+        let table = new_table(((writer.live + 1) * 4).next_power_of_two().max(FIRST_TABLE));
+        // SAFETY: made just now and not yet published.
+        let new = unsafe { places(table) };
+        let mask = new.len() - 1;
+        for place in old {
             let place = place.load(Ordering::Relaxed);
             if row_of(place).is_none() {
                 continue;
             }
-            let mut at = (place >> 32) as usize & new.mask;
-            while new.places[at].load(Ordering::Relaxed) != EMPTY {
-                at = (at + 1) & new.mask;
+            let mut at = (place >> 32) as usize & mask;
+            while new[at].load(Ordering::Relaxed) != EMPTY {
+                at = (at + 1) & mask;
             }
-            new.places[at].store(place, Ordering::Relaxed);
+            new[at].store(place, Ordering::Relaxed);
         }
-        let new = Box::into_raw(new);
-        shard.table.store(new, Ordering::Release);
+        shard.table.store(table, Ordering::Release);
         writer.used = writer.live;
-        // SAFETY: `current` is unlinked; its rows are named by `new` too, and a table owns
-        // only its places.
-        writer.tables.hold(Grace::start(), unsafe { Box::from_raw(current) });
-        // SAFETY: just published, as above.
-        unsafe { &*new }
+        // SAFETY: `current` is unlinked; its rows are named by the new table too, and a table
+        // owns only its places.
+        writer.tables.hold(Grace::start(), unsafe { table_box(current) });
+        new
     }
 
     /// Frees the shard's retired rows whose grace has passed, once enough are waiting.
@@ -534,17 +637,17 @@ impl<V: Send + Sync + 'static> Map<V> {
         let new = place(tag(&key), row);
         match self.place_for(table, &key) {
             Ok((at, old)) => {
-                table.places[at].store(new, Ordering::Release);
+                table[at].store(new, Ordering::Release);
                 if let Some(old) = row_of(old) {
                     writer.free.retire(Grace::start(), old);
                 }
             }
             Err(at) => {
-                if table.places[at].load(Ordering::Relaxed) == EMPTY {
+                if table[at].load(Ordering::Relaxed) == EMPTY {
                     writer.used += 1;
                 }
                 writer.live += 1;
-                table.places[at].store(new, Ordering::Release);
+                table[at].store(new, Ordering::Release);
             }
         }
         self.tidy(writer);
@@ -602,7 +705,7 @@ impl<V: Send + Sync + 'static> Map<V> {
     pub(crate) fn for_each<'g>(&'g self, task: &'g Guard, mut f: impl FnMut(&'g QueryKey, &'g V)) {
         for shard in self.shards.iter() {
             let Some(table) = Self::table(shard, task) else { continue };
-            for place in table.places.iter() {
+            for place in table.iter() {
                 // SAFETY: loaded from a table of this map in the caller's task.
                 if let Some(entry) = unsafe { self.entry_at(place.load(Ordering::Acquire)) } {
                     f(&entry.key, &entry.value);
@@ -623,7 +726,7 @@ impl<V: Send + Sync + 'static> Map<V> {
         for shard in self.shards.iter() {
             let Some(table) = Self::table(shard, task) else { continue };
             let mut edits = Vec::new();
-            for place in table.places.iter() {
+            for place in table.iter() {
                 let place = place.load(Ordering::Acquire);
                 // SAFETY: loaded from a table of this map in the caller's task.
                 let Some(seen) = (unsafe { self.entry_at(place) }) else { continue };
@@ -639,8 +742,9 @@ impl<V: Send + Sync + 'static> Map<V> {
             let mut gone = Vec::new();
             for (seen, key, edit) in edits {
                 let current = shard.table.load(Ordering::Acquire);
-                // SAFETY: a table exists: `seen` was in one, and tables are only ever replaced.
-                let current = unsafe { &*current };
+                // SAFETY: a table exists (`seen` was in one, and tables are only ever replaced),
+                // and only this lock's holder unlinks it.
+                let current = unsafe { places(current) };
                 let Some((at, now, old)) = self.find(current, &key) else { continue };
                 if now != seen {
                     continue;
@@ -649,7 +753,7 @@ impl<V: Send + Sync + 'static> Map<V> {
                 match edit {
                     Edit::Keep => continue,
                     Edit::Remove => {
-                        current.places[at].store(u64::from(TOMB), Ordering::Release);
+                        current[at].store(u64::from(TOMB), Ordering::Release);
                         writer.live -= 1;
                         applied(&old.value, None);
                     }
@@ -657,7 +761,7 @@ impl<V: Send + Sync + 'static> Map<V> {
                         let row = self.ids.claim(&mut writer.free);
                         // SAFETY: claimed just now, under the lock, and not yet published.
                         unsafe { self.rows.put(row, Entry { key, value }) };
-                        current.places[at].store(place(tag(&key), row), Ordering::Release);
+                        current[at].store(place(tag(&key), row), Ordering::Release);
                         // SAFETY: published just now under the lock; retired only by a later
                         // writer, after which this lock's holder would have to see it again.
                         applied(&old.value, Some(&unsafe { self.rows.get(row) }.value));
@@ -684,7 +788,7 @@ impl<V: Send + Sync + 'static> Map<V> {
     }
 
     /// Frees what each shard retired whose grace has passed.
-    pub(crate) fn collect(&self) {
+    pub(crate) fn sweep(&self) {
         for shard in self.shards.iter() {
             let mut writer = shard.writer.lock();
             let rows = &self.rows;
@@ -741,7 +845,7 @@ impl<V> Drop for Map<V> {
             if !table.is_null() {
                 // SAFETY: the current table, owned by the map; `&mut` excludes every reader.
                 // The rows it names are dropped with `rows`.
-                drop(unsafe { Box::from_raw(table) });
+                drop(unsafe { table_box(table) });
             }
         }
     }

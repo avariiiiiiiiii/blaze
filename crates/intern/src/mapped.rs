@@ -14,7 +14,7 @@ use blaze_format::{Record, SchemaHash};
 use blaze_ids::Hasher;
 use blaze_image::{Builder, Image, SectionId, Stable, bytes_of, cast};
 
-use crate::table::{LAYOUT, Live, MAX_ALIGN, ROOT, RestoreError, Shape, Table};
+use crate::table::{Jobs, LAYOUT, Live, MAX_ALIGN, ROOT, RestoreError, Shape, Table};
 
 /// The interner of one kind of value: a `static`, its section [`SectionId::interned`]`(tag)`.
 pub struct Mapped<T> {
@@ -126,9 +126,9 @@ impl<T: Record> Mapped<T> {
     /// Makes the values of `image`'s section this interner's, read in place. Must run before
     /// any value is interned; the image stays mapped until the process exits. On an error no
     /// value was restored, so no section naming these IDs may be used.
-    pub fn restore<S: Stable>(&'static self, image: Arc<Image<S>>) -> Result<(), RestoreError> {
+    pub fn restore<S: Stable>(&'static self, image: Arc<Image<S>>, jobs: Jobs<'_>) -> Result<(), RestoreError> {
         let image: &'static Arc<Image<S>> = Box::leak(Box::new(image));
-        Table::restore_into(&self.table, Self::shape(), image, self.section(), self.schema())
+        Table::restore_into(&self.table, Self::shape(), image, self.section(), self.schema(), jobs)
     }
 
     /// Writes the section into `builder`: every value `live` marks at its ID, every other ID
@@ -148,5 +148,69 @@ impl Live {
     #[inline]
     pub fn mark_value<T>(&mut self, id: Id<T>) {
         self.mark_id(id.id());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image_of<T: Record>(mapped: &'static Mapped<T>, live: &Live) -> Arc<Image<Vec<u8>>> {
+        let mut builder = Builder::new();
+        mapped.write(live, &mut builder);
+        Arc::new(Image::open(builder.finish().unwrap()).unwrap())
+    }
+
+    #[test]
+    fn values_keep_their_ids_across_an_image() {
+        static PATHS: Mapped<u32> = Mapped::new(1);
+        static RESTORED: Mapped<u32> = Mapped::new(1);
+        let values: Vec<Vec<u32>> = (0..500u32).map(|n| (0..n % 7).map(|k| n * 31 + k).collect()).collect();
+        let ids: Vec<Id<u32>> = values.iter().map(|it| PATHS.intern(it)).collect();
+        for (value, &id) in values.iter().zip(&ids) {
+            assert_eq!(PATHS.get(id), &value[..]);
+            assert_eq!(PATHS.intern(value), id);
+        }
+        let mut live = Live::new();
+        ids.iter().step_by(3).for_each(|&id| live.mark_value(id));
+        RESTORED.restore(image_of(&PATHS, &live), &crate::serial).unwrap();
+        for (value, &id) in values.iter().zip(&ids) {
+            match live.contains(id.id()) {
+                true => {
+                    assert_eq!(RESTORED.get(RESTORED.from_id(id.id()).unwrap()), &value[..]);
+                    assert_eq!(RESTORED.find(value), Some(id));
+                }
+                false => assert_eq!(RESTORED.from_id(id.id()), None),
+            }
+        }
+        let new = RESTORED.intern(&[u32::MAX; 3]);
+        assert!(!live.contains(new.id()), "a new value never takes a live ID");
+        assert_eq!(RESTORED.restore(image_of(&PATHS, &live), &crate::serial), Err(RestoreError::Started { section: RESTORED.section() }));
+    }
+
+    #[test]
+    fn values_are_read_aligned() {
+        static WIDE: Mapped<u128> = Mapped::new(2);
+        static RESTORED: Mapped<u128> = Mapped::new(2);
+        let ids: Vec<Id<u128>> = (0..64u128).map(|n| WIDE.intern(&[n << 100, n])).collect();
+        let mut live = Live::new();
+        ids.iter().for_each(|&id| live.mark_value(id));
+        RESTORED.restore(image_of(&WIDE, &live), &crate::serial).unwrap();
+        for (n, &id) in ids.iter().enumerate() {
+            let value = RESTORED.get(id);
+            assert!((value.as_ptr() as usize).is_multiple_of(align_of::<u128>()));
+            assert_eq!(value, &[(n as u128) << 100, n as u128]);
+            assert!((WIDE.get(id).as_ptr() as usize).is_multiple_of(align_of::<u128>()));
+        }
+    }
+
+    #[test]
+    fn a_section_of_another_type_is_refused() {
+        static WORDS: Mapped<u32> = Mapped::new(3);
+        static SIGNED: Mapped<i32> = Mapped::new(3);
+        WORDS.intern(&[1, 2, 3]);
+        let refused = SIGNED.restore(image_of(&WORDS, &Live::new()), &crate::serial);
+        assert!(matches!(refused, Err(RestoreError::Refused(blaze_image::Refused::Schema { .. }))));
+        assert_eq!(SIGNED.section(), SectionId::interned(3));
     }
 }

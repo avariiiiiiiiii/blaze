@@ -86,24 +86,30 @@ impl<'a> LexedStr<'a> {
 
         let bytes = text.as_bytes();
         let classes = FAST.then(|| scan::Classes::new(bytes));
-        // Lex from scratch at every token because some of `rustc_lexer`'s tokens are split as
-        // rustc splits them in older editions: `GuardedStrPrefix` before 2024, a C string and a
-        // raw lifetime before 2021.
+        let mut cursor = classes.as_ref().map(|it| scan::Cursor::new(it, conv.offset));
+        // Lex from scratch at every token `rustc_lexer` lexes, because some of its tokens are
+        // split as rustc splits them in older editions: `GuardedStrPrefix` before 2024, a C
+        // string and a raw lifetime before 2021.
         while conv.offset < text.len() {
-            let fast = match &classes {
-                Some(classes) => scan::token(bytes, conv.offset, classes),
-                None => None,
-            };
-            let (kind, len) = fast.unwrap_or_else(|| {
-                let token =
-                    rustc_lexer::tokenize(&text[conv.offset..], rustc_lexer::FrontmatterAllowed::No)
-                        .next()
-                        .expect("a token where text is left");
-                (token.kind, token.len as usize)
-            });
-            let token_text = &text[conv.offset..][..len];
-
-            conv.extend_token(&kind, token_text);
+            let at = conv.offset;
+            if let Some(cursor) = &mut cursor
+                && let Some((kind, len)) = scan::token(text, at, cursor)
+            {
+                let kind = match kind {
+                    IDENT => ident_kind(&text[at..at + len], edition),
+                    kind => kind,
+                };
+                conv.push(kind, len);
+                continue;
+            }
+            let rest = &text[at..];
+            let token = rustc_lexer::tokenize(rest, rustc_lexer::FrontmatterAllowed::No)
+                .next()
+                .expect("a token where text is left");
+            conv.extend_token(&token.kind, &rest[..token.len as usize]);
+            if let Some(cursor) = &mut cursor {
+                cursor.seek(conv.offset);
+            }
         }
 
         conv.finalize_with_eof()
@@ -237,7 +243,9 @@ impl<'a> Converter<'a> {
                 text,
                 tokens: Vec::with_capacity(text.len() / 3),
                 checkpoints: Vec::with_capacity(text.len() / 3 / CHECKPOINT + 1),
+                // alloc: none until a token is 4 MiB or longer.
                 long: Vec::new(),
+                // alloc: none until the first error.
                 error: Vec::new(),
             },
             offset: 0,
@@ -300,10 +308,7 @@ impl<'a> Converter<'a> {
 
                 rustc_lexer::TokenKind::Whitespace => WHITESPACE,
 
-                rustc_lexer::TokenKind::Ident if token_text == "_" => UNDERSCORE,
-                rustc_lexer::TokenKind::Ident => {
-                    SyntaxKind::from_keyword(token_text, self.edition).unwrap_or(IDENT)
-                }
+                rustc_lexer::TokenKind::Ident => ident_kind(token_text, self.edition),
                 rustc_lexer::TokenKind::InvalidIdent => {
                     self.error("Ident contains invalid characters");
                     IDENT
@@ -312,6 +317,7 @@ impl<'a> Converter<'a> {
                 rustc_lexer::TokenKind::RawIdent => {
                     let name = &token_text[2..];
                     if !can_be_raw(name) {
+                        // alloc: the error path.
                         self.error(format!("`{name}` cannot be a raw identifier"));
                     }
                     IDENT
@@ -359,6 +365,7 @@ impl<'a> Converter<'a> {
                 }
                 rustc_lexer::TokenKind::UnknownPrefixLifetime => {
                     if self.edition.at_least_2021() {
+                        // alloc: the error path.
                         self.error(format!("prefix `{token_text}` is unknown"));
                     }
                     LIFETIME_IDENT
@@ -375,6 +382,7 @@ impl<'a> Converter<'a> {
                     }
                     let name = &token_text[3..];
                     if !can_be_raw(name) {
+                        // alloc: the error path.
                         self.error(format!("`{name}` cannot be a raw lifetime"));
                     }
                     LIFETIME_IDENT
@@ -412,13 +420,10 @@ impl<'a> Converter<'a> {
                 // The prefix is the identifier it spells, keyword or not, in every edition.
                 rustc_lexer::TokenKind::UnknownPrefix => {
                     if self.edition.at_least_2021() {
+                        // alloc: the error path.
                         self.error(format!("prefix `{token_text}` is unknown"));
                     }
-                    if token_text == "_" {
-                        UNDERSCORE
-                    } else {
-                        SyntaxKind::from_keyword(token_text, self.edition).unwrap_or(IDENT)
-                    }
+                    ident_kind(token_text, self.edition)
                 }
                 rustc_lexer::TokenKind::Eof => EOF,
             }
@@ -431,6 +436,7 @@ impl<'a> Converter<'a> {
         const INVALID_RAW: &str = "Invalid raw string literal";
         let source: &'a str = self.res.text;
         let no_end_quote = |this: &mut Self, c: char, kind: &str| {
+            // alloc: the error path (an unterminated literal).
             this.error(format!("Missing trailing `{c}` symbol to terminate the {kind} literal"));
         };
 
@@ -535,6 +541,12 @@ impl<'a> Converter<'a> {
 
         self.push(syntax_kind, len);
     }
+}
+
+/// The kind of an identifier's text: `_`, a keyword of `edition`, or `IDENT`.
+#[inline]
+fn ident_kind(text: &str, edition: Edition) -> SyntaxKind {
+    if text == "_" { UNDERSCORE } else { SyntaxKind::from_keyword(text, edition).unwrap_or(IDENT) }
 }
 
 /// rustc's `Symbol::can_be_raw`: not `_` and not a path segment keyword.

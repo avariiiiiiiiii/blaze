@@ -49,6 +49,8 @@ pub(super) struct Disk {
     log: Vec<Entry>,
     /// The watches that are journals, with their directories (also in the sim's `watches`).
     pub(super) journals: FxHashMap<Tag, FileName>,
+    /// The name a rename just made: its touch moves its change time only, as a rename does.
+    renamed_to: Option<FileName>,
 }
 
 fn parent(name: &FileName) -> Option<FileName> {
@@ -86,7 +88,12 @@ impl Disk {
     pub(super) fn touched(&mut self, file: &FileName, files: &FxHashMap<FileName, SimFile>) -> Cursor {
         let there = files.contains_key(file);
         let now = self.tick();
+        let renamed = self.renamed_to.as_ref() == Some(file);
+        if renamed {
+            self.renamed_to = None;
+        }
         match (there, self.inodes.get_mut(file)) {
+            (true, Some(inode)) if renamed => inode.ctime = now,
             (true, Some(inode)) => (inode.mtime, inode.ctime) = (now, now),
             (true, None) => {
                 let inode = self.new_inode();
@@ -144,11 +151,13 @@ impl Disk {
         }
     }
 
-    /// `from` is renamed `to`, keeping its inode; called before the two are told as changed.
+    /// `from` is renamed `to`, keeping its inode and mtime; called before the two are told as
+    /// changed, `from` first.
     pub(super) fn renamed(&mut self, from: &FileName, to: &FileName) {
         if let Some(inode) = self.inodes.remove(from) {
             self.inodes.insert(to.clone(), inode);
             self.entered(to);
+            self.renamed_to = Some(to.clone());
         }
     }
 
@@ -376,9 +385,11 @@ mod tests {
         let moded = stamp(&mut sim, "src/a/one.rs");
         assert_eq!(moded.mtime_ns, written.mtime_ns);
         assert!(moded.ctime_ns > written.ctime_ns && moded.executable());
-        // A new name moves its directory; a rename keeps the inode.
+        // A new name moves its directory; a rename keeps the inode and mtime, not the ctime.
         sim.rename(&name("src/a/one.rs"), &name("src/a/two.rs"));
-        assert_eq!(stamp(&mut sim, "src/a/two.rs").ino, file.ino);
+        let renamed = stamp(&mut sim, "src/a/two.rs");
+        assert_eq!((renamed.ino, renamed.size, renamed.mtime_ns), (file.ino, 3, moded.mtime_ns));
+        assert!(renamed.ctime_ns > moded.ctime_ns);
         assert!(stamp(&mut sim, "src/a").mtime_ns > dir.mtime_ns);
         // A directory left empty goes, and its parent moves.
         sim.delete(&name("src/a/two.rs"));

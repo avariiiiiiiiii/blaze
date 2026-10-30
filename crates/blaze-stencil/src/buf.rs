@@ -24,6 +24,8 @@ pub struct Fixup {
     pub addend: i64,
 }
 
+const UNBOUND: u32 = u32::MAX;
+
 #[derive(Default)]
 pub struct Buf {
     bytes: Vec<u8>,
@@ -40,19 +42,24 @@ impl Buf {
 
     /// Empties it for the next function, keeping every allocation.
     pub fn clear(&mut self) {
-        unimplemented!("fastcompile-stencil-patch")
+        self.bytes.clear();
+        self.labels.clear();
+        self.fixups.clear();
+        self.relocs.clear();
     }
 
     /// Room for `bytes` more bytes, `labels` labels and `fixups` fixups: one reservation per
     /// function, from the sizes the patcher adds up.
     pub fn reserve(&mut self, bytes: usize, labels: usize, fixups: usize) {
-        let _ = (bytes, labels, fixups);
-        unimplemented!("fastcompile-stencil-patch")
+        self.bytes.reserve(bytes);
+        self.labels.reserve(labels);
+        self.fixups.reserve(fixups);
     }
 
     /// The offset the next byte is written at.
+    #[inline]
     pub fn len(&self) -> u32 {
-        unimplemented!("fastcompile-stencil-patch")
+        self.bytes.len() as u32
     }
 
     pub fn is_empty(&self) -> bool {
@@ -60,18 +67,18 @@ impl Buf {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        unimplemented!("fastcompile-stencil-patch")
+        &self.bytes
     }
 
     /// The bytes from `at`, for patching what was just copied.
+    #[inline]
     pub fn bytes_mut(&mut self, at: u32) -> &mut [u8] {
-        let _ = at;
-        unimplemented!("fastcompile-stencil-patch")
+        &mut self.bytes[at as usize..]
     }
 
+    #[inline]
     pub fn put(&mut self, bytes: &[u8]) {
-        let _ = bytes;
-        unimplemented!("fastcompile-stencil-patch")
+        self.bytes.extend_from_slice(bytes);
     }
 
     pub fn put1(&mut self, it: u8) {
@@ -93,62 +100,110 @@ impl Buf {
     /// Pads to a multiple of `align` (a power of two) with `fill` repeated: `nop`s (x86-64
     /// `0x90`; AArch64 `d503201f`) in code, so a padded gap is never executed as anything else.
     pub fn align(&mut self, align: u32, fill: &[u8]) {
-        let _ = (align, fill);
-        unimplemented!("fastcompile-stencil-patch")
+        debug_assert!(align.is_power_of_two() && !fill.is_empty());
+        let pad = (align - self.len() % align) % align;
+        self.pad(pad, fill);
+    }
+
+    /// Writes `count` bytes of `fill` repeated (the last copy cut short).
+    pub fn pad(&mut self, count: u32, fill: &[u8]) {
+        let mut left = count as usize;
+        while left > 0 {
+            let n = left.min(fill.len());
+            self.bytes.extend_from_slice(&fill[..n]);
+            left -= n;
+        }
     }
 
     /// A new unbound label.
+    #[inline]
     pub fn label(&mut self) -> Label {
-        unimplemented!("fastcompile-stencil-patch")
+        let label = Label(self.labels.len() as u32);
+        self.labels.push(UNBOUND);
+        label
     }
 
     /// Binds `label` to the current offset. A label is bound once.
+    #[inline]
     pub fn bind(&mut self, label: Label) {
-        let _ = label;
-        unimplemented!("fastcompile-stencil-patch")
+        debug_assert_eq!(self.labels[label.0 as usize], UNBOUND, "{label:?} bound twice");
+        self.labels[label.0 as usize] = self.len();
     }
 
+    #[inline]
     pub fn offset(&self, label: Label) -> Option<u32> {
-        let _ = label;
-        unimplemented!("fastcompile-stencil-patch")
+        match self.labels.get(label.0 as usize) {
+            Some(&UNBOUND) | None => None,
+            Some(&at) => Some(at),
+        }
     }
 
     /// Writes the field of `form` at `at` with `label`'s place plus `addend` when the label
     /// is bound ([`Buf::resolve`]); PC-relative forms take `S + A - P`.
+    #[inline]
     pub fn fixup(&mut self, at: u32, form: Form, label: Label, addend: i64) {
-        let _ = (at, form, label, addend);
-        unimplemented!("fastcompile-stencil-patch")
+        self.fixups.push(Fixup { at, form, label, addend });
     }
 
     /// Writes the field of `form` at `at` with `value` now: a hole's immediate or offset.
+    #[inline]
     pub fn patch(&mut self, at: u32, form: Form, value: i64) -> Result<(), enc::Overflow> {
-        let _ = (at, form, value);
-        unimplemented!("fastcompile-stencil-patch")
+        enc::write(form, &mut self.bytes, at as usize, value)
     }
 
     /// A relocation for the linker.
+    #[inline]
     pub fn reloc(&mut self, at: u32, kind: binemit::Reloc, name: Name, addend: i64) {
-        let _ = (at, kind, name, addend);
-        unimplemented!("fastcompile-stencil-patch")
+        self.relocs.push(Reloc { at, kind, name, addend });
     }
 
     /// Writes every fixup, now that every label it names is bound. An unbound label or a
     /// value that does not fit its field is an error naming the form and the offset.
     pub fn resolve(&mut self) -> Result<(), Error> {
-        unimplemented!("fastcompile-stencil-patch")
+        for fixup in &self.fixups {
+            let target = match self.labels.get(fixup.label.0 as usize) {
+                Some(&UNBOUND) | None => {
+                    return Err(Error::new(format!(
+                        "the {:?} field at {:#x} names {:?}, which is never placed",
+                        fixup.form, fixup.at, fixup.label
+                    )));
+                }
+                Some(&target) => target,
+            };
+            let mut value = i64::from(target) + fixup.addend;
+            if fixup.form.pc_relative() {
+                value -= i64::from(fixup.at);
+            }
+            enc::write(fixup.form, &mut self.bytes, fixup.at as usize, value).map_err(|e| {
+                Error::new(format!("the field at {:#x} to {:?}: {e}", fixup.at, fixup.label))
+            })?;
+        }
+        self.fixups.clear();
+        Ok(())
     }
 
     /// The bytes and relocations (sorted by offset), moved out; the buffer keeps its
     /// labels' and fixups' allocations for the next function. The caller gives the next
     /// function's buffer back its byte allocation by [`Buf::recycle`].
     pub fn take(&mut self) -> (Vec<u8>, Vec<Reloc>) {
-        unimplemented!("fastcompile-stencil-patch")
+        if !self.relocs.is_sorted_by_key(|it| it.at) {
+            self.relocs.sort_by_key(|it| it.at);
+        }
+        self.labels.clear();
+        self.fixups.clear();
+        (std::mem::take(&mut self.bytes), std::mem::take(&mut self.relocs))
     }
 
     /// Gives the buffer an allocation to write the next function into (one a consumer of a
     /// [`crate::Code`] is done with), so a steady stream of compiles allocates nothing.
-    pub fn recycle(&mut self, bytes: Vec<u8>, relocs: Vec<Reloc>) {
-        let _ = (bytes, relocs);
-        unimplemented!("fastcompile-stencil-patch")
+    pub fn recycle(&mut self, mut bytes: Vec<u8>, mut relocs: Vec<Reloc>) {
+        if self.bytes.is_empty() && bytes.capacity() > self.bytes.capacity() {
+            bytes.clear();
+            self.bytes = bytes;
+        }
+        if self.relocs.is_empty() && relocs.capacity() > self.relocs.capacity() {
+            relocs.clear();
+            self.relocs = relocs;
+        }
     }
 }

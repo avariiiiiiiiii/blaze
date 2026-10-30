@@ -31,7 +31,7 @@ use crate::{
     hir::{
         Array, AsmOperand, Binding, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked,
         InlineAsm, Label, LabelId, Literal, MatchArm, OffsetOf, Pat, PatId, RecordFieldPat,
-        RecordLitField, RecordSpread, Statement,
+        RecordLitField, RecordSpread, Statement, Statements,
         columns::{self, Frozen, Growing, HirColumns},
     },
     nameres::{DefMap, block_def_map},
@@ -304,7 +304,10 @@ pub struct Lists {
     pats: Vec<PatId>,
     types: Vec<TypeRefId>,
     opt_types: Vec<Option<TypeRefId>>,
-    statements: Vec<Statement>,
+    /// Statement rows, as a store keeps them: only the statement columns, their `extra` words
+    /// and macro definitions are used. A [`Statement`] view borrows its macro definition, so
+    /// the stack keeps rows that own it.
+    statements: HirColumns<Growing>,
     arms: Vec<MatchArm>,
     record_fields: Vec<RecordLitField>,
     field_pats: Vec<RecordFieldPat>,
@@ -320,6 +323,8 @@ pub struct ListMark {
     types: u32,
     opt_types: u32,
     statements: u32,
+    statement_words: u32,
+    macro_defs: u32,
     arms: u32,
     record_fields: u32,
     field_pats: u32,
@@ -363,8 +368,8 @@ impl Lists {
     }
 
     #[inline]
-    pub(crate) fn statements_since(&self, mark: ListMark) -> &[Statement] {
-        &self.statements[mark.statements as usize..]
+    pub(crate) fn statements_since(&self, mark: ListMark) -> Statements<'_> {
+        self.statements.statements_since(mark.statements)
     }
 
     #[inline]
@@ -394,7 +399,9 @@ impl Lists {
             pats: columns::len(self.pats.len()),
             types: columns::len(self.types.len()),
             opt_types: columns::len(self.opt_types.len()),
-            statements: columns::len(self.statements.len()),
+            statements: columns::len(self.statements.statement_count()),
+            statement_words: columns::len(self.statements.extra.len()),
+            macro_defs: columns::len(self.statements.macro_defs.len()),
             arms: columns::len(self.arms.len()),
             record_fields: columns::len(self.record_fields.len()),
             field_pats: columns::len(self.field_pats.len()),
@@ -407,7 +414,7 @@ impl Lists {
         self.pats.truncate(mark.pats as usize);
         self.types.truncate(mark.types as usize);
         self.opt_types.truncate(mark.opt_types as usize);
-        self.statements.truncate(mark.statements as usize);
+        self.statements.truncate_statements(mark.statements, mark.statement_words, mark.macro_defs);
         self.arms.truncate(mark.arms as usize);
         self.record_fields.truncate(mark.record_fields as usize);
         self.field_pats.truncate(mark.field_pats as usize);
@@ -456,7 +463,7 @@ impl Lists {
             (pats.is_empty(), "pats"),
             (types.is_empty(), "types"),
             (opt_types.is_empty(), "opt_types"),
-            (statements.is_empty(), "statements"),
+            (statements.statement_count() == 0, "statements"),
             (arms.is_empty(), "arms"),
             (record_fields.is_empty(), "record_fields"),
             (field_pats.is_empty(), "field_pats"),
@@ -472,6 +479,8 @@ impl Lists {
             + self.types.capacity()
             + self.opt_types.capacity()
             + self.statements.capacity()
+            + self.statements.stmt_data.capacity()
+            + self.statements.macro_defs.capacity()
             + self.arms.capacity()
             + self.record_fields.capacity()
             + self.field_pats.capacity()
@@ -706,9 +715,11 @@ impl ExpressionStoreBuilder {
         self.lists.opt_types.push(type_ref);
     }
 
+    /// Pushes a statement as a row of the stack: its ids and words copied, its macro definition
+    /// copied into the stack's table.
     #[inline]
-    pub(crate) fn push_list_statement(&mut self, statement: Statement) {
-        self.lists.statements.push(statement);
+    pub(crate) fn push_list_statement(&mut self, statement: Statement<'_>) {
+        self.lists.statements.push_statement(statement);
     }
 
     #[inline]
@@ -764,14 +775,12 @@ impl ExpressionStoreBuilder {
         self.lists = lists;
     }
 
-    /// The last statement pushed since `mark`, taken off the stack; `None` when there is none
-    /// above `mark`.
+    /// The last statement pushed since `mark`, taken off the stack when it is an expression
+    /// without a `;`: the tail of the block the statements are of. `None`, and the stack left
+    /// as it is, otherwise.
     #[inline]
-    pub(crate) fn pop_list_statement(&mut self, mark: ListMark) -> Option<Statement> {
-        match self.lists.statements.len() > mark.statements as usize {
-            true => self.lists.statements.pop(),
-            false => None,
-        }
+    pub(crate) fn pop_list_tail_expr(&mut self, mark: ListMark) -> Option<ExprId> {
+        self.lists.statements.pop_tail_expr(mark.statements)
     }
 
     /// The bounds pushed since `mark`, moved off the stack.
@@ -1336,13 +1345,13 @@ impl ExpressionStore {
                 for stmt in statements {
                     match stmt {
                         Statement::Let { initializer, else_branch, pat, type_ref, is_super: _ } => {
-                            visitor.on_expr_opt(*initializer);
-                            visitor.on_expr_opt(*else_branch);
-                            visitor.on_pat(*pat);
-                            visitor.on_type_opt(*type_ref);
+                            visitor.on_expr_opt(initializer);
+                            visitor.on_expr_opt(else_branch);
+                            visitor.on_pat(pat);
+                            visitor.on_type_opt(type_ref);
                         }
                         Statement::Expr { expr: expression, has_semi: _ } => {
-                            visitor.on_expr(*expression)
+                            visitor.on_expr(expression)
                         }
                         Statement::Item(_) => (),
                     }
@@ -1904,6 +1913,75 @@ mod scratch_tests {
         assert!(matches!(tuple.1, TypeRef::Tuple(types) if types.len() == 2));
         let tuple_src = src(0, false, SyntaxKind::TUPLE_TYPE, 6, 9);
         assert_eq!(fresh_map.types_map.get(&tuple_src), Some(&tuple.0));
+    }
+
+    #[test]
+    fn the_statement_stack_nests_and_pops_back_to_a_mark() {
+        use crate::hir::{Item, Unsafe};
+
+        empty_pool();
+        let mut builder = ExpressionStoreBuilder::new();
+        builder.inference_roots = Some(SmallVec::new());
+        let missing = builder.alloc_expr(Expr::Missing);
+        let wild = builder.alloc_pat(Pat::Wild);
+        let first = Statement::Let {
+            pat: wild,
+            type_ref: None,
+            initializer: Some(missing),
+            else_branch: None,
+            is_super: false,
+        };
+        let inner_let = Statement::Let {
+            pat: wild,
+            type_ref: None,
+            initializer: None,
+            else_branch: Some(missing),
+            is_super: true,
+        };
+        let outer = builder.list_mark();
+        builder.push_list_statement(first);
+        builder.push_list_statement(Statement::Item(Item::Other));
+        let inner = builder.list_mark();
+        builder.push_list_statement(inner_let);
+        builder.push_list_statement(Statement::Expr { expr: missing, has_semi: false });
+        assert_eq!(builder.pop_list_tail_expr(inner), Some(missing));
+        assert_eq!(builder.pop_list_tail_expr(inner), None, "a `let` is not a tail");
+        let lists = builder.take_lists();
+        assert_eq!(lists.statements_since(inner).iter().collect::<Vec<_>>(), [inner_let]);
+        let inner_block = builder.alloc_expr(Expr::Block {
+            id: None,
+            statements: lists.statements_since(inner),
+            tail: Some(missing),
+            label: None,
+            unsafe_: Unsafe::No,
+        });
+        builder.put_lists(lists, inner);
+        assert_eq!(builder.pop_list_tail_expr(inner), None, "nothing above the mark");
+        let tail_stmt = Statement::Expr { expr: inner_block, has_semi: true };
+        builder.push_list_statement(tail_stmt);
+        let lists = builder.take_lists();
+        let outer_block = builder.alloc_expr(Expr::Block {
+            id: None,
+            statements: lists.statements_since(outer),
+            tail: None,
+            label: None,
+            unsafe_: Unsafe::No,
+        });
+        builder.put_lists(lists, outer);
+        assert_eq!(builder.lists.stacked(), None);
+        assert!(builder.lists.statements.extra.is_empty(), "the `let` words went with their rows");
+
+        let (store, _) = builder.finish();
+        let Expr::Block { statements, .. } = store.expr(outer_block) else { panic!("a block") };
+        assert_eq!(
+            statements.iter().collect::<Vec<_>>(),
+            [first, Statement::Item(Item::Other), tail_stmt]
+        );
+        let Expr::Block { statements, tail, .. } = store.expr(inner_block) else { panic!("a block") };
+        assert_eq!((statements.iter().collect::<Vec<_>>(), tail), (vec![inner_let], Some(missing)));
+        let columns = store.hir_columns().unwrap();
+        assert_eq!(columns.statement_count(), 4, "each block's run, and no stack rows");
+        assert_eq!(columns.check(0, 0, 0), Ok(()));
     }
 
     #[test]

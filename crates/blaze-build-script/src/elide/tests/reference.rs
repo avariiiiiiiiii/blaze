@@ -1,6 +1,6 @@
 //! Elision as it was before tokens were read on demand: the whole source lexed into a list
 //! first, a `Vec` of values and one of flags per macro call, a `String` per character or
-//! number argument. Kept as the reference [`super::elide`] is checked against over seeded
+//! number argument. Kept as the reference [`crate::elide::elide`] is checked against over seeded
 //! scripts.
 
 use std::{
@@ -9,9 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{
+use crate::elide::{
     directives_only,
-    lex::reference::{self as lex, Kind, Token},
+    lex::tests::reference::{self as lex, Kind, Token},
 };
 
 pub fn elide(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Option<Vec<u8>> {

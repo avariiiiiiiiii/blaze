@@ -118,6 +118,12 @@ fn sockaddr(root: &Path, at: &Address) -> io::Result<SockAddr> {
             }
             (size_of::<SOCKADDR_UN>(), AF_UNIX)
         }
+        Address::Inherited { fd, at } => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("the socket {at} passed as fd {fd}: socket activation is systemd's and launchd's, and Windows has neither"),
+            ));
+        }
         Address::Tcp(SocketAddr::V4(address)) => {
             // SAFETY: as above.
             let in4 = unsafe { &mut *(&raw mut storage).cast::<SOCKADDR_IN>() };
@@ -209,6 +215,7 @@ pub(super) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
             Some(path)
         }
         Address::Tcp(_) => None,
+        Address::Inherited { .. } => None,
     };
     let socket = stream(address.family)?;
     // SAFETY: an open socket and an address of the length given.

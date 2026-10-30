@@ -105,13 +105,13 @@ impl<'a> EndView<'a> {
         match self {
             EndView::Exited(code) => End::Exited(code),
             EndView::Signaled(signal) => End::Signaled(signal),
-            EndView::NotStarted(why) => End::NotStarted(why.to_owned()),
+            EndView::NotStarted(why) => End::NotStarted(why.to_owned()), // alloc: the owned frame: what a result keeps
         }
     }
 }
 
 /// What a test's child executed.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Executed {
     /// Its whole record: the slots it called, strictly increasing, each below `slots`.
     Hits { slots: u32, hits: Vec<u32> },
@@ -167,8 +167,8 @@ impl<'a> Hits<'a> {
 impl<'a> ExecView<'a> {
     pub fn to_executed(self) -> Executed {
         match self {
-            ExecView::Hits { slots, hits } => Executed::Hits { slots, hits: hits.to_vec() },
-            ExecView::Not(why) => Executed::Not(why.to_owned()),
+            ExecView::Hits { slots, hits } => Executed::Hits { slots, hits: hits.to_vec() }, // alloc: the owned frame: what a result keeps
+            ExecView::Not(why) => Executed::Not(why.to_owned()), // alloc: the owned frame: what a result keeps
         }
     }
 }
@@ -198,43 +198,64 @@ pub fn read_region(
 ) -> Result<u32, String> {
     hits.clear();
     if let Err(why) = ended {
-        return Err(format!("its execution record is not whole: {}", why));
+        return Err(format!("its execution record is not whole: {}", why)); // alloc: error path
     }
     if head[..8] != MAGIC {
-        return Err("its execution record does not start with blaze's magic".to_owned());
+        return Err("its execution record does not start with blaze's magic".to_owned()); // alloc: error path
     }
     let slots = u32::from_le_bytes([head[8], head[9], head[10], head[11]]);
     let armed = u32::from_le_bytes([head[12], head[13], head[14], head[15]]);
     if armed != slots {
-        return Err(format!("the runtime armed {} of its {} slots", armed, slots));
+        return Err(format!("the runtime armed {} of its {} slots", armed, slots)); // alloc: error path
     }
     if slots > mapped {
-        return Err(format!("its execution record holds fewer than its {} slots", slots));
+        return Err(format!("its execution record holds fewer than its {} slots", slots)); // alloc: error path
     }
     let words = (slots as usize).div_ceil(8);
     let tail = slots % 8;
-    for n in 0..words {
+    // Four words a step, a group of zeros skipped in one compare: the loads of a group are
+    // independent, so the step costs about one cycle a word and the scan runs near the
+    // bandwidth of the cache the child left the region in. The last word, which may hold
+    // bytes past the slots, is read alone and masked.
+    let unmasked = if tail == 0 { words } else { words - 1 };
+    let mut n = 0;
+    while n + 4 <= unmasked {
+        let group = [word(n), word(n + 1), word(n + 2), word(n + 3)];
+        if group[0] | group[1] | group[2] | group[3] != 0 {
+            for (k, value) in group.iter().enumerate() {
+                push_set(hits, n + k, *value);
+            }
+        }
+        n += 4;
+    }
+    while n < words {
         let mut value = word(n);
         if n + 1 == words && tail != 0 {
             value &= (1u64 << (8 * tail)) - 1;
         }
-        if value == 0 {
-            continue;
-        }
-        // The high bit of each byte that is not zero: the low seven bits plus 0x7f carry into
-        // it, and no byte carries into the next.
-        let mut set = (((value & LOW) + LOW) | value) & HIGH;
-        let base = (n * 8) as u32;
-        while set != 0 {
-            hits.extend_from_slice(&(base + set.trailing_zeros() / 8).to_le_bytes());
-            set &= set - 1;
-        }
+        push_set(hits, n, value);
+        n += 1;
     }
     Ok(slots)
 }
 
+/// The slots of word `n` whose bytes are not zero, as the wire has them.
+fn push_set(hits: &mut Vec<u8>, n: usize, value: u64) {
+    if value == 0 {
+        return;
+    }
+    // The high bit of each byte that is not zero: the low seven bits plus 0x7f carry into it,
+    // and no byte carries into the next.
+    let mut set = (((value & LOW) + LOW) | value) & HIGH;
+    let base = (n * 8) as u32;
+    while set != 0 {
+        hits.extend_from_slice(&(base + set.trailing_zeros() / 8).to_le_bytes());
+        set &= set - 1;
+    }
+}
+
 /// A frame. [`View`] is the same read in place.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Frame {
     Hello { version: u32, pid: u32, tests: Vec<String> },
     Ended { id: u64, end: End, output: Vec<u8>, executed: Executed },
@@ -392,7 +413,7 @@ impl Frame {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::new(); // alloc: empty, allocates nothing
         self.encode(&mut out);
         out
     }
@@ -424,19 +445,19 @@ impl<'a> View<'a> {
                     0 => EndView::Exited(at.u32()? as i32),
                     1 => EndView::Signaled(at.u32()? as i32),
                     2 => EndView::NotStarted(at.string()?),
-                    other => return Err(format!("no end is of kind {}", other)),
+                    other => return Err(format!("no end is of kind {}", other)), // alloc: error path
                 };
                 let output = at.bytes()?;
                 let executed = match at.u8()? {
                     0 => {
                         let slots = at.u32()?;
                         let count = at.u32()? as usize;
-                        let bytes = at.take(count.checked_mul(4).ok_or_else(|| "a frame ends early".to_owned())?)?;
+                        let bytes = at.take(count.checked_mul(4).ok_or_else(|| "a frame ends early".to_owned())?)?; // alloc: error path
                         let hits = Hits(bytes);
                         let mut last: Option<u32> = None;
                         for hit in hits.iter() {
                             if hit >= slots || last.is_some_and(|it| it >= hit) {
-                                return Err(format!(
+                                return Err(format!( // alloc: error path
                                     "an execution record names slot {} out of order or past its {} slots",
                                     hit, slots
                                 ));
@@ -446,7 +467,7 @@ impl<'a> View<'a> {
                         ExecView::Hits { slots, hits }
                     }
                     1 => ExecView::Not(at.string()?),
-                    other => return Err(format!("no execution record is of kind {}", other)),
+                    other => return Err(format!("no execution record is of kind {}", other)), // alloc: error path
                 };
                 View::Ended { id, end, output, executed }
             }
@@ -456,11 +477,11 @@ impl<'a> View<'a> {
             }
             KILL => View::Kill { id: at.u64()? },
             QUIT => View::Quit,
-            other => return Err(format!("no frame is of kind {}", other)),
+            other => return Err(format!("no frame is of kind {}", other)), // alloc: error path
         };
         match at.at == body.len() {
             true => Ok(frame),
-            false => Err(format!("a frame has {} bytes after its end", body.len() - at.at)),
+            false => Err(format!("a frame has {} bytes after its end", body.len() - at.at)), // alloc: error path
         }
     }
 
@@ -472,7 +493,7 @@ impl<'a> View<'a> {
                 Frame::Hello { version, pid, tests: names }
             }
             View::Ended { id, end, output, executed } => {
-                Frame::Ended { id, end: end.to_end(), output: output.to_vec(), executed: executed.to_executed() }
+                Frame::Ended { id, end: end.to_end(), output: output.to_vec(), executed: executed.to_executed() } // alloc: the owned frame: what a result keeps
             }
             View::Run { id, index } => Frame::Run { id, index },
             View::Kill { id } => Frame::Kill { id },
@@ -489,7 +510,7 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
         if self.bytes.len() - self.at < len {
-            return Err("a frame ends early".to_owned());
+            return Err("a frame ends early".to_owned()); // alloc: error path
         }
         let taken = &self.bytes[self.at..self.at + len];
         self.at += len;
@@ -519,7 +540,7 @@ impl<'a> Cursor<'a> {
         let bytes = self.bytes()?;
         match ::std::str::from_utf8(bytes) {
             Ok(text) => Ok(text),
-            Err(_) => Err("a string of a frame is not UTF-8".to_owned()),
+            Err(_) => Err("a string of a frame is not UTF-8".to_owned()), // alloc: error path
         }
     }
 }
@@ -537,7 +558,7 @@ pub struct Frames {
 
 impl Frames {
     pub fn new() -> Frames {
-        Frames { buffer: Vec::new(), start: 0 }
+        Frames { buffer: Vec::new(), start: 0 } // alloc: empty, allocates nothing
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -576,7 +597,7 @@ impl Frames {
         }
         let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
         if len > LONGEST {
-            return Err(format!("a frame of {} bytes, past the most of {}", len, LONGEST));
+            return Err(format!("a frame of {} bytes, past the most of {}", len, LONGEST)); // alloc: error path
         }
         let len = len as usize;
         if rest.len() < 4 + len {

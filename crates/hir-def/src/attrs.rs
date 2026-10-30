@@ -874,7 +874,7 @@ fn collect_attrs_in<BreakValue>(
 /// The value of the `#[name = value]` attribute of `owner`, with the macros in it expanded:
 /// rustc expands the expression of a key-value attribute before it reads it
 /// (`rustc_expand::expand::InvocationCollector::visit_attribute` walks into `AttrArgs::Eq`).
-fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<Symbol> {
+pub(crate) fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<Symbol> {
     let (source, outer_mod_decl, extra_crate_attrs, krate) = attrs_source(db, owner);
     let value =
         collect_attrs_in(db, &source, outer_mod_decl, extra_crate_attrs, krate, |attr| match attr {

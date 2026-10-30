@@ -81,6 +81,7 @@ impl MetaTemplate {
         mut src: TtIter<'_>,
         mode: Mode,
     ) -> Result<Self, ParseError> {
+        // alloc: the template, once per rule, when the macro is defined.
         let mut res = Vec::new();
         while let Some(first) = src.peek() {
             let op = next_op(edition, first, &mut src, mode)?;
@@ -233,6 +234,7 @@ fn next_op(
                     return Ok(Op::Punct({
                         let mut res = ArrayVec::new();
                         res.push(p);
+                        // alloc: the template, once per rule, when the macro is defined.
                         Box::new(res)
                     }));
                 }
@@ -291,6 +293,7 @@ fn next_op(
                         Mode::Template => Op::Punct({
                             let mut res = ArrayVec::new();
                             res.push(punct);
+                            // alloc: the template, once per rule, when the macro is defined.
                             Box::new(res)
                         }),
                     },
@@ -303,17 +306,20 @@ fn next_op(
 
         TtElement::Leaf(tt::Leaf::Literal(it)) => {
             src.next().expect("first token already peeked");
+            // clone: the template, once per rule, when the macro is defined.
             Op::Literal(it.clone())
         }
 
         TtElement::Leaf(tt::Leaf::Ident(it)) => {
             src.next().expect("first token already peeked");
+            // clone: the template, once per rule, when the macro is defined.
             Op::Ident(it.clone())
         }
 
         TtElement::Leaf(tt::Leaf::Punct(_)) => {
             // There's at least one punct so this shouldn't fail.
             let puncts = src.expect_glued_punct().unwrap();
+            // alloc: the template, once per rule, when the macro is defined.
             Op::Punct(Box::new(puncts))
         }
 
@@ -389,10 +395,12 @@ fn parse_repeat(src: &mut TtIter<'_>) -> Result<(Option<Separator>, RepeatKind),
         match tt {
             tt::Leaf::Ident(ident) => match separator {
                 Separator::Puncts(puncts) if puncts.is_empty() => {
+                    // clone: the template, once per rule, when the macro is defined.
                     separator = Separator::Ident(ident.clone());
                 }
                 Separator::Puncts(puncts) => match puncts.as_slice() {
                     [tt::Punct { char: '\'', .. }] => {
+                        // clone: the template, once per rule, when the macro is defined.
                         separator = Separator::Lifetime(puncts[0], ident.clone());
                     }
                     _ => return Err(ParseError::InvalidRepeat),
@@ -400,6 +408,7 @@ fn parse_repeat(src: &mut TtIter<'_>) -> Result<(Option<Separator>, RepeatKind),
                 _ => return Err(ParseError::InvalidRepeat),
             },
             tt::Leaf::Literal(_) if has_sep => return Err(ParseError::InvalidRepeat),
+            // clone: the template, once per rule, when the macro is defined.
             tt::Leaf::Literal(lit) => separator = Separator::Literal(lit.clone()),
             tt::Leaf::Punct(punct) => {
                 let repeat_kind = match punct.char {
@@ -449,13 +458,16 @@ fn parse_metavar_expr(src: &mut TtIter<'_>) -> Result<Op, ()> {
             Op::Count { name: MetaVar::new(ident.sym, ident.span), depth, binder: NO_BINDER }
         }
         s if sym::concat == *s => {
+            // alloc: the template, once per rule, when the macro is defined.
             let mut elements = Vec::new();
             while let Some(next) = args_iter.peek() {
                 let element = if let TtElement::Leaf(tt::Leaf::Literal(lit)) = next {
                     args_iter.next().expect("already peeked");
+                    // clone: the template, once per rule, when the macro is defined.
                     ConcatMetaVarExprElem::Literal(lit.clone())
                 } else {
                     let is_var = try_eat_dollar(&mut args_iter);
+                    // clone: the template, once per rule, when the macro is defined.
                     let ident = args_iter.expect_ident_or_underscore()?.clone();
 
                     if is_var {

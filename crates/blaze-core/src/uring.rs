@@ -136,9 +136,11 @@ const STATX_STAMP: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0080 | 0x0100 | 0x0200;
 /// `statx`'s flag to answer from what the kernel has, never asking a network file system's
 /// server first.
 const AT_STATX_DONT_SYNC: i32 = 0x4000;
-/// Names a stamper claims at once: enough to make the claim's atomic add nothing beside them
-/// (512 `statx`es are ~300 µs), few enough that the last chunk leaves no core idle for long.
-const STAMP_CHUNK: usize = 512;
+/// Names a stamper claims at once: enough to make the claim's atomic add and the reopen of a
+/// chunk's first directory a percent or two of them (64 `statx`es are ~30 µs), few enough that
+/// the cores' last chunks end within ~30 µs of each other, under 5% of 100 000 names' sweep on
+/// 64 cores (docs/v2/plan/lanes/frontend/journal/linux.md, "Speed of light").
+const STAMP_CHUNK: usize = 64;
 
 /// Requests the ring holds at once, enough to keep an NVMe queue full; more wait in the
 /// driver until there is room.
@@ -367,8 +369,10 @@ fn register<T>(ring: RawFd, opcode: libc::c_uint, arg: *const T, nr: libc::c_uin
     Err(match error.raw_os_error() {
         Some(libc::EINVAL | libc::EOPNOTSUPP) => io::Error::new(
             io::ErrorKind::Unsupported,
+            // alloc: the error of a setup that failed.
             format!("io_uring {what}: {error}: Linux {since} or later has it, and this is Linux {}", crate::cgroup::kernel()),
         ),
+        // alloc: the error of a setup that failed.
         _ => io::Error::new(error.kind(), format!("io_uring {what}: {error}")),
     })
 }
@@ -413,6 +417,7 @@ impl Table {
         }
         let size = u32::try_from(limit.rlim_cur).unwrap_or(u32::MAX).min(TABLE) & !1;
         if size < 2 {
+            // alloc: the error of a setup that failed.
             return Err(io::Error::other(format!("RLIMIT_NOFILE is {}: no table of files fits", limit.rlim_cur)));
         }
         let fd = ring.as_raw_fd();
@@ -422,6 +427,7 @@ impl Table {
         let ours = size / 2;
         let range = FileIndexRange { off: ours, len: size - ours, resv: 0 };
         register(fd, REGISTER_FILE_ALLOC_RANGE, &raw const range, 0, "a range of the file table for direct accepts", "6.0")?;
+        // alloc: clone: setup, once per driver; `ring` is a reference count.
         Ok(Rc::new(Table { ring: ring.clone(), free: RefCell::new((0..ours).rev().collect()), ours }))
     }
 
@@ -443,11 +449,13 @@ impl Table {
             self.free.borrow_mut().push(slot);
             return Err(error);
         }
+        // alloc: clone: one per file opened, kept in `files`; `self` is a reference count.
         Ok(Rc::new(Fixed { fd: Some(fd), slot, table: self.clone() }))
     }
 
     /// The connection an accept put in slot `slot` of the kernel's half.
     fn accepted(self: &Rc<Table>, slot: u32) -> Rc<Fixed> {
+        // alloc: clone: one per connection accepted, for its life; `self` is a reference count.
         Rc::new(Fixed { fd: None, slot: Some(slot), table: self.clone() })
     }
 }
@@ -506,13 +514,14 @@ impl Registered {
                 iov_base: unsafe { map.at.add(n * DIRECT_PIECE) }.cast(),
                 iov_len: DIRECT_PIECE,
             })
-            .collect();
+            .collect(); // alloc: setup, once per driver.
         let buffers = RsrcRegister { nr: DIRECT_BUFFERS.into(), flags: 0, resv2: 0, data: iovecs.as_ptr() as u64, tags: 0 };
         let nr = size_of::<RsrcRegister>() as libc::c_uint;
         register(ring, REGISTER_BUFFERS2, &raw const buffers, nr, "registered buffers", "5.13").map_err(|error| {
             match error.raw_os_error() {
                 Some(libc::ENOMEM) => io::Error::new(
                     error.kind(),
+                    // alloc: the error of a setup that failed.
                     format!(
                         "{error}: pinning {} MiB of buffers needs RLIMIT_MEMLOCK of that much (ulimit -l) or CAP_IPC_LOCK",
                         DIRECT_BUFFERS as usize * DIRECT_PIECE >> 20
@@ -521,7 +530,7 @@ impl Registered {
                 _ => error,
             }
         })?;
-        Ok(Registered { map, free: (0..DIRECT_BUFFERS).rev().collect() })
+        Ok(Registered { map, free: (0..DIRECT_BUFFERS).rev().collect() }) // alloc: setup, once per driver.
     }
 
     fn at(&self, index: u16) -> *mut u8 {
@@ -703,6 +712,7 @@ impl Ring {
             if error.raw_os_error() == Some(libc::EINVAL) {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
+                    // alloc: the error of a setup that failed.
                     format!(
                         "io_uring_setup with IORING_SETUP_SQPOLL and IORING_SETUP_SINGLE_ISSUER: \
                          {error}: Linux 6.0 or later has them, and this is Linux {}",
@@ -713,7 +723,7 @@ impl Ring {
             return Err(error);
         }
         // SAFETY: the call returned a file descriptor of its own.
-        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }); // alloc: setup, once per driver.
         let wanted = [
             (FEAT_SINGLE_MMAP, "IORING_FEAT_SINGLE_MMAP", "5.4"),
             (FEAT_NODROP, "IORING_FEAT_NODROP", "5.5"),
@@ -723,6 +733,7 @@ impl Ring {
         if let Some((_, name, since)) = wanted.iter().find(|(bit, ..)| params.features & bit == 0) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
+                // alloc: the error of a setup that failed.
                 format!("io_uring without {name}: Linux {since} or later has it, and this is Linux {}", crate::cgroup::kernel()),
             ));
         }
@@ -758,7 +769,7 @@ impl Ring {
             cq_mask,
             cqes: rings.at(cq.cqes),
             unsubmitted: 0,
-            _maps: vec![rings, sqes],
+            _maps: vec![rings, sqes], // alloc: setup, once per driver.
             fd,
         })
     }
@@ -1001,7 +1012,8 @@ enum Op {
     /// its completion; in flight while any such work is.
     Wake {
         fd: RawFd,
-        count: Box<[u8; 8]>,
+        /// [`Offload::count`], held while the kernel may write into it.
+        count: Rc<UnsafeCell<[u8; 8]>>,
     },
 }
 
@@ -1061,6 +1073,9 @@ struct Offload {
     out: usize,
     /// The request reading `wake`, while there is one.
     reading: Option<u64>,
+    /// What each read of `wake` reads into, never read itself: one for the driver's life, so
+    /// a wait allocates nothing. Kept alive past the driver by a request the kernel keeps.
+    count: Rc<UnsafeCell<[u8; 8]>>,
 }
 
 impl Offload {
@@ -1072,8 +1087,10 @@ impl Offload {
         }
         let (sender, receiver) = mpsc::channel();
         // SAFETY: the call returned a descriptor of its own.
-        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) });
-        Ok(Offload { sender, receiver, wake, out: 0, reading: None })
+        let wake = Arc::new(unsafe { OwnedFd::from_raw_fd(fd) }); // alloc: setup, once per driver.
+        // alloc: setup, once per driver.
+        let count = Rc::new(UnsafeCell::new([0; 8]));
+        Ok(Offload { sender, receiver, wake, out: 0, reading: None, count })
     }
 }
 
@@ -1115,13 +1132,16 @@ impl Spawning {
     /// [`crate::Exit`] its [`crate::process::Finish`] says.
     fn end(self) -> Done {
         let Spawning { pid, pidfd, finish, stdout, stderr, failed, .. } = self;
-        let program = finish.command.program.display().to_string();
+        // alloc: the error of a spawn that failed.
+        let failed = failed.map(|why| format!("{}: {why}", finish.command.program.display()));
         // Reaps it, and removes what was made for it even where it failed whatever it says.
         let exited = finish.exited(pid, stdout, stderr);
         drop(pidfd);
         match (exited, failed) {
-            (_, Some(why)) => Done::Failed(IoError(format!("{program}: {why}"))),
+            (_, Some(why)) => Done::Failed(IoError(why)),
+            // alloc: `Done::Exited`'s own box, one per spawn.
             (Ok(exit), None) => Done::Exited(Box::new(exit)),
+            // alloc: the error of a spawn that failed.
             (Err(error), None) => Done::Failed(IoError(error.to_string())),
         }
     }
@@ -1175,6 +1195,7 @@ unsafe impl Send for Job {}
 
 impl Job {
     fn new(tag: Tag, root: OwnedFd, names: Names, offload: &Offload) -> Job {
+        // alloc: the sweep's result, one per sweep, handed to its asker.
         let mut out = vec![Stamp::UNKNOWN; names.len()];
         let base = out.as_mut_ptr();
         Job {
@@ -1186,7 +1207,7 @@ impl Job {
             finished: AtomicUsize::new(0),
             out: UnsafeCell::new(out),
             base,
-            sender: offload.sender.clone(),
+            sender: offload.sender.clone(), // clone: a channel's handle, one per sweep.
             wake: Arc::clone(&offload.wake),
         }
     }
@@ -1225,51 +1246,102 @@ impl Job {
 /// (docs/v2/plan/lanes/frontend/journal/linux.md, "Speed of light"). A job reaches stamper 0,
 /// and stamper `i` hands it on to `2i + 1` and `2i + 2` before it starts, as far as the job has
 /// chunks for: every core is at work after log2 of them wake-ups, none from the ring's thread
-/// but the first.
+/// but the first. [`Effect::Entries`]' listings go to one stamper each, in turn, where a thread
+/// of their own would cost as much to start as a listing of a hundred names.
 struct Stampers {
-    inboxes: Arc<[crossbeam_channel::Sender<Option<Arc<Job>>>]>,
+    inboxes: Arc<[crossbeam_channel::Sender<ToStamp>]>,
+    /// The stamper the next listing goes to.
+    next: std::cell::Cell<usize>,
+}
+
+/// What a stamper is sent.
+enum ToStamp {
+    Sweep(Arc<Job>),
+    /// A listing, for the stamper it is sent to alone.
+    List(List),
+    End,
+}
+
+/// An [`Effect::Entries`] on a stamper.
+struct List {
+    tag: Tag,
+    root: Arc<Path>,
+    dir: FileName,
+    sender: mpsc::Sender<Completion>,
+    wake: Arc<OwnedFd>,
+}
+
+impl List {
+    fn run(self) {
+        let done = match crate::fs::entries(&self.root.join(self.dir.as_str()), &self.dir) {
+            Ok(entries) => Done::Entries(entries),
+            // alloc: the error of a listing that failed.
+            Err(error) => Done::Failed(IoError(error.to_string())),
+        };
+        if self.sender.send(Completion { tag: self.tag, done }).is_ok() {
+            wake_ring(&self.wake);
+        }
+    }
 }
 
 impl Stampers {
     fn new() -> io::Result<Stampers> {
         let count = std::thread::available_parallelism().map_or(1, |it| it.get());
-        let (senders, receivers): (Vec<_>, Vec<_>) = (0..count).map(|_| crossbeam_channel::unbounded()).unzip();
-        let stampers = Stampers { inboxes: senders.into() };
+        let (senders, receivers): (Vec<crossbeam_channel::Sender<ToStamp>>, Vec<crossbeam_channel::Receiver<ToStamp>>) =
+            (0..count).map(|_| crossbeam_channel::unbounded()).unzip();
+        let stampers = Stampers { inboxes: senders.into(), next: std::cell::Cell::new(0) };
         for (me, inbox) in receivers.into_iter().enumerate() {
             let inboxes = Arc::clone(&stampers.inboxes);
             // Dropping `stampers` on a failure ends those already started.
             std::thread::Builder::new()
-                .name(format!("blaze-stamp-{me}"))
+                .name(format!("blaze-stamp-{me}")) // alloc: setup, once per stamper.
                 .spawn(move || stamper(me, &inbox, &inboxes))?;
         }
         Ok(stampers)
     }
 
     fn start(&self, job: Arc<Job>) {
-        _ = self.inboxes[0].send(Some(job));
+        _ = self.inboxes[0].send(ToStamp::Sweep(job));
+    }
+
+    fn list(&self, list: List) {
+        let at = self.next.get();
+        self.next.set((at + 1) % self.inboxes.len());
+        _ = self.inboxes[at].send(ToStamp::List(list));
     }
 }
 
 impl Drop for Stampers {
-    /// Each stamper ends once it has passed the end on, after the jobs before it.
+    /// Each stamper ends once it has passed the end on, after the work sent before it.
     fn drop(&mut self) {
-        _ = self.inboxes[0].send(None);
+        _ = self.inboxes[0].send(ToStamp::End);
     }
 }
 
-fn stamper(me: usize, inbox: &crossbeam_channel::Receiver<Option<Arc<Job>>>, inboxes: &[crossbeam_channel::Sender<Option<Arc<Job>>>]) {
-    let mut parent = Vec::new();
-    while let Ok(job) = inbox.recv() {
-        let wanted = job.as_ref().map_or(usize::MAX, |it| it.chunks);
+fn stamper(me: usize, inbox: &crossbeam_channel::Receiver<ToStamp>, inboxes: &[crossbeam_channel::Sender<ToStamp>]) {
+    // alloc: one buffer per stamper, reused for every directory of every job.
+    let mut parent = Vec::with_capacity(libc::PATH_MAX as usize);
+    while let Ok(work) = inbox.recv() {
+        let wanted = match &work {
+            ToStamp::Sweep(job) => job.chunks,
+            ToStamp::List(_) => 0,
+            ToStamp::End => usize::MAX,
+        };
         for next in [2 * me + 1, 2 * me + 2] {
             if next < wanted
                 && let Some(it) = inboxes.get(next)
             {
-                _ = it.send(job.clone());
+                _ = it.send(match &work {
+                    ToStamp::Sweep(job) => ToStamp::Sweep(Arc::clone(job)),
+                    _ => ToStamp::End,
+                });
             }
         }
-        let Some(job) = job else { return };
-        job.run(&mut parent);
+        match work {
+            ToStamp::Sweep(job) => job.run(&mut parent),
+            ToStamp::List(list) => list.run(),
+            ToStamp::End => return,
+        }
     }
 }
 
@@ -1362,7 +1434,8 @@ fn wake_ring(wake: &OwnedFd) {
 
 pub struct Uring {
     start: Instant,
-    root: PathBuf,
+    /// Shared with the work done off the ring, so handing it out is a count, not a copy.
+    root: Arc<Path>,
     ring: Ring,
     table: Rc<Table>,
     registered: Registered,
@@ -1395,6 +1468,7 @@ pub struct Uring {
     next_conn: u64,
     /// By ticks since `start`; a wait of the ring ends at the next one due.
     timers: Wheel<Tag>,
+    // dyn: the embedder's sandbox, called once per spawn, which makes a process anyway.
     confine: Option<Arc<dyn Confine>>,
     /// Requests the kernel may still hold after the ring failed: kept, never freed, so it
     /// writes into nothing else.
@@ -1414,7 +1488,7 @@ impl Uring {
         let provided = std::mem::ManuallyDrop::new(Provided::new(ring.fd.as_raw_fd())?);
         Ok(Uring {
             start: Instant::now(),
-            root: root.into(),
+            root: Arc::from(root.into()),
             ring,
             table,
             registered,
@@ -1426,8 +1500,8 @@ impl Uring {
             for_buffers: VecDeque::new(),
             refused: rustc_hash::FxHashSet::default(),
             direct_writes: 0,
-            ready: Vec::new(),
-            posted: Vec::new(),
+            ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
+            posted: Vec::new(), // alloc: empty, nothing allocated; reused after.
             watches: FxHashMap::default(),
             listens: FxHashMap::default(),
             spawns: FxHashMap::default(),
@@ -1435,7 +1509,7 @@ impl Uring {
             next_conn: 0,
             timers: Wheel::new(),
             confine: None,
-            abandoned: Vec::new(),
+            abandoned: Vec::new(), // alloc: empty, nothing allocated.
             stampers: None,
             offload: Offload::new()?,
             in_flight: 0,
@@ -1444,6 +1518,7 @@ impl Uring {
 
     /// The driver, making the sandbox of each spawn whose [`crate::Sandbox`] is on with
     /// `confine`.
+    // dyn: the embedder's sandbox, set once.
     pub fn confined(mut self, confine: Arc<dyn Confine>) -> Uring {
         self.confine = Some(confine);
         self
@@ -1479,7 +1554,7 @@ impl Uring {
     /// (each request in flight keeps its own until it ends) to make room.
     fn file(&mut self, name: &FileName, make: bool) -> io::Result<Rc<Fixed>> {
         if let Some(file) = self.files.get(name) {
-            return Ok(file.clone());
+            return Ok(Rc::clone(file));
         }
         let path = self.root.join(name.as_str());
         if make && let Some(parent) = path.parent() {
@@ -1490,7 +1565,8 @@ impl Uring {
             self.files.clear();
         }
         let file = self.table.install(fd)?;
-        self.files.insert(name.clone(), file.clone());
+        // clone: the name once per file opened, as the key it is kept under.
+        self.files.insert(name.clone(), Rc::clone(&file));
         Ok(file)
     }
 
@@ -1744,8 +1820,8 @@ impl Uring {
                 opcode: OP_READ,
                 fd: *fd,
                 off: u64::MAX,
-                addr: count.as_ptr() as u64,
-                len: count.len() as u32,
+                addr: count.get() as u64,
+                len: 8,
                 user_data,
                 ..Sqe::default()
             },
@@ -1800,10 +1876,12 @@ impl Uring {
         tag: Tag,
         work: impl FnOnce(&Path) -> io::Result<Done> + Send + 'static,
     ) -> io::Result<()> {
-        let root = self.root.clone();
+        let root = Arc::clone(&self.root);
+        // clone: a channel's handle, for the thread to answer on.
         let sender = self.offload.sender.clone();
         let wake = Arc::clone(&self.offload.wake);
         std::thread::Builder::new().name("blaze-uring-off".into()).spawn(move || {
+            // alloc: the error of work that failed.
             let done = work(&root).unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
             // A driver dropped meanwhile takes nothing.
             // The descriptor is kept open by this thread's `Arc`.
@@ -1821,103 +1899,53 @@ impl Uring {
         self.offload.out += 1;
         if self.offload.reading.is_none() {
             let fd = self.offload.wake.as_raw_fd();
-            let id = self.start(tag, Op::Wake { fd, count: Box::new([0; 8]) });
+            let count = Rc::clone(&self.offload.count);
+            let id = self.start(tag, Op::Wake { fd, count });
             self.offload.reading = Some(id);
         }
+    }
+
+    /// The [`Stampers`], started for the first sweep or listing.
+    fn make_stampers(&mut self) -> io::Result<()> {
+        if self.stampers.is_none() {
+            self.stampers = Some(Stampers::new()?);
+        }
+        Ok(())
+    }
+
+    /// Starts the listing of [`Effect::Entries`] `tag` of `dir` on a stamper.
+    fn list(&mut self, tag: Tag, dir: FileName) -> io::Result<()> {
+        self.make_stampers()?;
+        let list = List {
+            tag,
+            root: Arc::clone(&self.root),
+            dir,
+            // clone: a channel's handle, one per listing.
+            sender: self.offload.sender.clone(),
+            wake: Arc::clone(&self.offload.wake),
+        };
+        self.offloaded(tag);
+        self.stampers.as_ref().expect("made above").list(list);
+        Ok(())
     }
 
     /// Starts the sweep of [`Effect::Stamp`] `tag` over `names` on the [`Stampers`], made for
     /// the first. Fails only where the root cannot be opened or the stampers cannot start.
     fn sweep(&mut self, tag: Tag, names: Names) -> io::Result<()> {
         let root = open_dir(&self.root)
+            // alloc: the error of a sweep that failed.
             .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", self.root.display())))?;
         if names.is_empty() {
+            // alloc: empty, nothing allocated.
             self.ready.push(Completion { tag, done: Done::Stamped(Vec::new()) });
             return Ok(());
         }
-        if self.stampers.is_none() {
-            self.stampers = Some(Stampers::new()?);
-        }
+        self.make_stampers()?;
+        // alloc: one per sweep, shared by the stampers.
         let job = Arc::new(Job::new(tag, root, names, &self.offload));
         self.offloaded(tag);
         self.stampers.as_ref().expect("made above").start(job);
         Ok(())
-    }
-
-    /// Writes the names of the sweeps waiting to the ring, in order, as long as it has room and
-    /// a `statx` buffer is free: as many requests at once as the submission ring holds, each
-    /// fill published with one store, for one enter at most. Requests waiting for room go
-    /// first.
-    fn feed_sweeps(&mut self) {
-        if !self.waiting.is_empty() {
-            return;
-        }
-        let sweeps = &mut self.sweeps;
-        let Some(buffers) = &sweeps.buffers else { return };
-        while let Some(&slot) = sweeps.queue.front() {
-            let Some(sweep) = sweeps.slots[slot as usize].as_mut() else {
-                sweeps.queue.pop_front();
-                continue;
-            };
-            let left = sweep.names.len() - sweep.asked as usize;
-            let n = left.min(sweeps.free_buffers.len());
-            let first = sweep.asked;
-            let free = &mut sweeps.free_buffers;
-            let (names, dir) = (&sweep.names, sweep.dir.as_raw_fd());
-            // SAFETY of the kernel's reads and writes: a name's bytes and its sweep's directory
-            // stay until every completion of the sweep is in (see `Sweep`), and a buffer is this
-            // request's alone until its completion is reaped.
-            let written = self.ring.push_each(n, |k| {
-                let buffer = free.pop().expect("a free buffer for each request written");
-                let index = first + k as u32;
-                Sqe {
-                    opcode: OP_STATX,
-                    fd: dir,
-                    addr: names.with_nul(index as usize).as_ptr() as u64,
-                    len: STATX_STAMP,
-                    off: Sweeps::buffer(buffers, buffer) as u64,
-                    op_flags: (libc::AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC) as u32,
-                    user_data: STAMP | u64::from(slot) << 48 | u64::from(buffer) << 32 | u64::from(index),
-                    ..Sqe::default()
-                }
-            });
-            sweep.asked += written as u32;
-            if sweep.asked as usize == sweep.names.len() {
-                sweeps.queue.pop_front();
-                continue;
-            }
-            // Out of room in the ring or of buffers: the next reap frees both.
-            return;
-        }
-    }
-
-    /// The completion `res` of a sweep's request whose `user_data` is `user_data`: its name's
-    /// stamp, and the sweep's completion once it is the last.
-    fn stamped(&mut self, user_data: u64, res: i32) {
-        let slot = ((user_data >> 48) & u64::from(SWEEPS)) as usize;
-        let buffer = (user_data >> 32) as u16;
-        let index = user_data as u32 as usize;
-        if self.sweeps.failed.is_some() {
-            return;
-        }
-        let Some(buffers) = &self.sweeps.buffers else { return };
-        let at = Sweeps::buffer(buffers, buffer);
-        let stamp = match res {
-            // SAFETY: the kernel wrote this request's buffer, a `Statx` in the mapping, before
-            // it posted the completion reaped (the acquire of the completion ring's tail), and
-            // writes it no more; nothing else holds it until it is free again below.
-            0 => unsafe { &*at }.stamp(),
-            _ => stamp_of_error(res),
-        };
-        self.sweeps.free_buffers.push(buffer);
-        let Some(sweep) = self.sweeps.slots.get_mut(slot).and_then(Option::as_mut) else { return };
-        sweep.out[index] = stamp;
-        sweep.told += 1;
-        if sweep.told as usize == sweep.names.len() {
-            let sweep = self.sweeps.slots[slot].take().expect("in flight");
-            self.sweeps.free.push(slot as u32);
-            self.ready.push(Completion { tag: sweep.tag, done: Done::Stamped(sweep.out) });
-        }
     }
 
     /// The completions the threads off the ring have sent.
@@ -1954,8 +1982,11 @@ impl Uring {
     /// The ring takes no more requests: every effect in flight fails. What the kernel may
     /// still hold of them is kept in `abandoned`, never freed.
     fn fail_unsubmitted(&mut self, error: io::Error) {
+        // alloc: clone: the error path, once, when the ring dies.
         let why = format!("the ring failed: {error}");
+        // clone: the error path, once per effect in flight.
         let failed = |tag| Completion { tag, done: Done::Failed(IoError(why.clone())) };
+        // alloc: the error path, once.
         let pending: Vec<Pending> = self.pending.drain().map(|(_, it)| it).collect();
         for mut pending in pending {
             if let Op::Watch { flushes, .. } = &mut pending.op {
@@ -1976,15 +2007,17 @@ impl Uring {
         }
         // Timers need no ring, but end with it as everything in flight does.
         self.timers.drain(|_, tag| self.ready.push(failed(tag)));
+        // alloc: the error path, once.
         let mut spawns: Vec<(Tag, Spawning)> = self.spawns.drain().collect();
         radix::sort_by_key(&mut spawns, |it| it.0.0);
         for (tag, mut spawn) in spawns {
             if !spawn.exited {
                 _ = kill(spawn.pidfd.as_raw_fd());
             }
-            spawn.failed = Some(why.clone());
+            spawn.failed = Some(why.clone()); // clone: the error path.
             self.ready.push(Completion { tag, done: spawn.end() });
         }
+        // alloc: the error path, once.
         let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
         radix::sort_copy_by_key(&mut conns, |it| it.0);
         for conn in conns {
@@ -1996,13 +2029,6 @@ impl Uring {
             conn.receiving = None;
         }
         self.conns.retain(|_, conn| !conn.hung);
-        self.sweeps.failed = Some(why.clone());
-        self.sweeps.queue.clear();
-        self.sweeps.free.clear();
-        for sweep in self.sweeps.slots.iter_mut().filter_map(Option::take) {
-            self.ready.push(failed(sweep.tag));
-            self.abandoned_sweeps.push(sweep);
-        }
         self.watches.clear();
         self.listens.clear();
         self.offload.reading = None;
@@ -2015,12 +2041,6 @@ impl Uring {
     /// rest of it asked for. With [`CQE_F_MORE`] in `flags` the kernel still holds the
     /// request (a multishot one), so it is kept and not asked again.
     fn completed(&mut self, user_data: u64, res: i32, flags: u32) {
-        if user_data & STAMP != 0 {
-            if user_data != NOBODY {
-                self.stamped(user_data, res);
-            }
-            return;
-        }
         let (id, link) = (user_data >> 2, (user_data & 3) as usize);
         let Some(mut pending) = self.pending.remove(&id) else { return };
         let tag = pending.tag;
@@ -2075,6 +2095,7 @@ impl Uring {
 
     /// What the result `res` of link `link` of a request of the effect `tag` means for it.
     fn step(&mut self, tag: Tag, op: &mut Op, link: usize, res: i32, flags: u32) -> Step {
+        // alloc: called only for a request that failed.
         let error = |res: i32| io::Error::from_raw_os_error(-res).to_string();
         let failed = |res: i32| Some(Done::Failed(IoError(error(res))));
         let more = flags & CQE_F_MORE != 0;
@@ -2126,7 +2147,7 @@ impl Uring {
                     *put += wrote as usize;
                     return Step::Again;
                 }
-                let file = file.clone();
+                let file = Rc::clone(file);
                 self.forget(&file);
                 let wrote = if wrote == 0 && *put < bytes.len() { -libc::EIO } else { wrote };
                 match [wrote, synced, renamed].into_iter().find(|it| *it < 0) {
@@ -2176,7 +2197,7 @@ impl Uring {
             }
             Op::Exit { .. } => {
                 if res < 0 {
-                    self.spoil(tag, format!("waiting for its exit: {}", error(res)));
+                    self.spoil(tag, format!("waiting for its exit: {}", error(res))); // alloc: an error.
                 } else if let Some(spawn) = self.spawns.get_mut(&tag) {
                     spawn.exited = true;
                 }
@@ -2192,7 +2213,7 @@ impl Uring {
                 }
                 if res < 0 {
                     let pipe = if *stderr { "stderr" } else { "stdout" };
-                    self.spoil(tag, format!("reading its {pipe}: {}", error(res)));
+                    self.spoil(tag, format!("reading its {pipe}: {}", error(res))); // alloc: an error.
                 }
                 Step::Ends(None)
             }
@@ -2203,7 +2224,7 @@ impl Uring {
                 }
                 if res < 0 || (res == 0 && *put < bytes.len()) {
                     let why = if res < 0 { error(res) } else { error(-libc::EIO) };
-                    self.spoil(tag, format!("writing its input: {why}"));
+                    self.spoil(tag, format!("writing its input: {why}")); // alloc: an error.
                     return Step::Ends(None);
                 }
                 *put += res as usize;
@@ -2236,6 +2257,7 @@ impl Uring {
                 }
                 if res == -libc::ENFILE {
                     self.listens.remove(&tag);
+                    // alloc: an error.
                     let why = format!(
                         "{}: every one of the {} slots the ring's table of files keeps for \
                          accepted connections is in use",
@@ -2344,7 +2366,6 @@ impl Uring {
         }
         self.posted = posted;
         self.flush_waiting();
-        self.feed_sweeps();
         self.submit_ring();
     }
 
@@ -2385,6 +2406,7 @@ impl Uring {
     /// in the ring reads nothing, so the descriptor is drained now.
     fn flush(&mut self, watch: Tag, tag: Tag) -> io::Result<()> {
         let Some(&id) = self.watches.get(&watch) else {
+            // alloc: an error path.
             return Err(io::Error::other(format!("nothing is watched as {watch:?}")));
         };
         let waiting = self.waiting.contains(&id);
@@ -2415,23 +2437,25 @@ impl Uring {
     }
 
     fn spawn(&mut self, tag: Tag, command: Box<Command>) -> io::Result<()> {
-        let crate::process::Started { pid, pidfd, stdin, stdout, stderr, finish } =
+        let crate::process::Started { pid, pidfd, stdin, stdout, stderr, mut finish } =
             crate::process::start(&self.root, command, self.confine.as_ref())?;
-        let input = finish.command.stdin.clone();
+        let input = std::mem::take(&mut finish.command.stdin);
         let exit = pidfd.as_raw_fd();
         let parts = 3 + usize::from(stdin.is_some());
         self.spawns.insert(tag, Spawning {
             pid,
             pidfd,
             finish,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
+            stdout: Vec::new(), // alloc: empty until the process writes; the spawn's own output.
+            stderr: Vec::new(), // alloc: empty until the process writes; the spawn's own output.
             parts,
             exited: false,
             failed: None,
         });
         self.start(tag, Op::Exit { pidfd: exit });
+        // alloc: a pipe's buffer, two per spawn, beside the process the spawn makes.
         self.start(tag, Op::Output { fd: stdout, buffer: vec![0; PIPE], stderr: false });
+        // alloc: as above.
         self.start(tag, Op::Output { fd: stderr, buffer: vec![0; PIPE], stderr: true });
         if let Some(fd) = stdin {
             self.start(tag, Op::Input { fd, bytes: input, put: 0 });
@@ -2464,7 +2488,7 @@ impl Uring {
             return;
         }
         if let Err(error) = kill(spawn.pidfd.as_raw_fd()) {
-            self.spoil(tag, format!("killing it: {error}"));
+            self.spoil(tag, format!("killing it: {error}")); // alloc: an error.
         }
     }
 
@@ -2488,7 +2512,7 @@ impl Uring {
     fn use_conn(&mut self, conn: Conn) -> io::Result<Rc<Fixed>> {
         let connection = self.conns.get_mut(&conn).filter(|it| !it.hung).ok_or_else(|| gone(conn))?;
         connection.users += 1;
-        Ok(connection.socket.clone())
+        Ok(Rc::clone(&connection.socket))
     }
 
     fn release(&mut self, conn: Conn) {
@@ -2514,7 +2538,7 @@ impl Uring {
         let Some(connection) = self.conns.get_mut(&conn) else { return };
         while let Some(&(tag, most)) = connection.recvs.front() {
             let done = match &connection.ended {
-                _ if most == 0 => Done::Read(Vec::new()),
+                _ if most == 0 => Done::Read(Vec::new()), // alloc: empty, nothing allocated.
                 _ if !connection.inbox.is_empty() => {
                     let n = most.min(connection.inbox.len());
                     let (front, back) = connection.inbox.as_slices();
@@ -2525,8 +2549,8 @@ impl Uring {
                     connection.inbox.drain(..n);
                     Done::Read(bytes)
                 }
-                Some(Ok(())) => Done::Read(Vec::new()),
-                Some(Err(why)) => Done::Failed(IoError(why.clone())),
+                Some(Ok(())) => Done::Read(Vec::new()), // alloc: empty, nothing allocated.
+                Some(Err(why)) => Done::Failed(IoError(why.clone())), // clone: an error.
                 None => break,
             };
             connection.recvs.pop_front();
@@ -2541,7 +2565,7 @@ impl Uring {
             return;
         }
         connection.users += 1;
-        let socket = connection.socket.clone();
+        let socket = Rc::clone(&connection.socket);
         let id = self.start(NOBODYS, Op::Recv { conn, socket });
         if let Some(connection) = self.conns.get_mut(&conn) {
             connection.receiving = Some(id);
@@ -2555,10 +2579,10 @@ impl Uring {
         connection.hung = true;
         connection.inbox = VecDeque::new();
         connection.users += 1;
-        let socket = connection.socket.clone();
+        let socket = Rc::clone(&connection.socket);
         let receiving = connection.receiving;
         for (tag, _) in std::mem::take(&mut connection.recvs) {
-            self.ready.push(Completion { tag, done: Done::Read(Vec::new()) });
+            self.ready.push(Completion { tag, done: Done::Read(Vec::new()) }); // alloc: empty.
         }
         if let Some(id) = receiving {
             self.start(NOBODYS, Op::Cancel { target: data(id, 0) });
@@ -2604,9 +2628,9 @@ impl Drop for Uring {
             self.pending.remove(&id);
         }
         let mut owed: FxHashMap<u64, usize> =
-            self.pending.iter().map(|(&id, it)| (id, it.op.owed())).collect();
+            self.pending.iter().map(|(&id, it)| (id, it.op.owed())).collect(); // alloc: drop, once.
         let deadline = Instant::now() + LETTING_GO;
-        let mut posted = Vec::new();
+        let mut posted = Vec::new(); // alloc: the driver's drop, once.
         let cancel = Sqe {
             opcode: OP_ASYNC_CANCEL,
             fd: -1,
@@ -2614,21 +2638,13 @@ impl Drop for Uring {
             user_data: NOBODY,
             ..Sqe::default()
         };
-        // Sweeps' requests the kernel holds; after a failure of the ring, whatever it held then.
-        let mut stamping = self.sweeps.in_flight();
         let mut alive = true;
-        while alive && (!self.pending.is_empty() || stamping > 0) && !self.ring.push(&[cancel]) {
+        while alive && !self.pending.is_empty() && !self.ring.push(&[cancel]) {
             alive = Instant::now() < deadline && self.ring.enter(None).is_ok();
             self.ring.reap(|user_data, res, flags| posted.push((user_data, res, flags)));
         }
         while alive {
             for (user_data, res, flags) in posted.drain(..) {
-                if user_data & STAMP != 0 {
-                    if user_data != NOBODY && self.sweeps.failed.is_none() {
-                        stamping = stamping.saturating_sub(1);
-                    }
-                    continue;
-                }
                 let id = user_data >> 2;
                 match self.pending.get(&id).map(|it| &it.op) {
                     // A connection the accept made after it was cancelled, let go here.
@@ -2649,8 +2665,7 @@ impl Drop for Uring {
                 }
             }
             let left = deadline.saturating_duration_since(Instant::now());
-            let lent = self.pending.values().any(|it| !matches!(it.op, Op::Cancel { .. }))
-                || (stamping > 0 && self.sweeps.failed.is_none());
+            let lent = self.pending.values().any(|it| !matches!(it.op, Op::Cancel { .. }));
             if !lent || left.is_zero() {
                 break;
             }
@@ -2668,12 +2683,6 @@ impl Drop for Uring {
         }
         std::mem::forget(std::mem::take(&mut self.pending));
         std::mem::forget(std::mem::take(&mut self.abandoned));
-        std::mem::forget(std::mem::take(&mut self.abandoned_sweeps));
-        // A sweep's names, directory and buffers stay where the kernel may still read or write
-        // them.
-        if stamping > 0 || self.sweeps.failed.is_some() {
-            std::mem::forget(std::mem::take(&mut self.sweeps));
-        }
     }
 }
 
@@ -2703,7 +2712,7 @@ fn kill(pidfd: RawFd) -> io::Result<()> {
 fn gone(conn: Conn) -> io::Error {
     io::Error::new(
         io::ErrorKind::NotConnected,
-        format!("{conn:?}: no such connection (never made, or hung up)"),
+        format!("{conn:?}: no such connection (never made, or hung up)"), // alloc: an error.
     )
 }
 
@@ -2725,6 +2734,7 @@ fn flushed(
     for tag in flushes.drain(..) {
         let done = match &drained {
             Ok(()) => Done::Flushed,
+            // alloc: an error path.
             Err(error) => Done::Failed(IoError(format!("flushing the watch: {error}"))),
         };
         ready.push(Completion { tag, done });
@@ -2869,14 +2879,14 @@ impl Driver for Uring {
                 Effect::Unwatch { .. } => {
                     match self.watches.get(&tag).copied() {
                         Some(id) => self.stop(id),
-                        None => self.refuse(tag, format!("nothing is watched as {tag:?}")),
+                        None => self.refuse(tag, format!("nothing is watched as {tag:?}")), // alloc: an error.
                     }
                     continue;
                 }
                 Effect::Unlisten { .. } => {
                     match self.listens.get(&tag).copied() {
                         Some(id) => self.stop(id),
-                        None => self.refuse(tag, format!("nothing is listened on as {tag:?}")),
+                        None => self.refuse(tag, format!("nothing is listened on as {tag:?}")), // alloc: an error.
                     }
                     continue;
                 }
@@ -2887,7 +2897,7 @@ impl Driver for Uring {
                 _ => {}
             }
             self.in_flight += 1;
-            let root = self.root.clone();
+            let root = Arc::clone(&self.root);
             let at = |file: &FileName| root.join(file.as_str());
             let started = match effect {
                 Effect::Write { file, bytes, .. } => {
@@ -2904,6 +2914,7 @@ impl Driver for Uring {
                                 bytes,
                                 put: 0,
                                 temporary,
+                                // alloc: the names the kernel reads while the write is in flight.
                                 names: Box::new([from, to]),
                                 file,
                                 chain: Chain::default(),
@@ -2937,7 +2948,9 @@ impl Driver for Uring {
                     self.forget(&to);
                     let (from, to) = (at(&from), at(&to));
                     crate::fs::make_parent(&to).and_then(|()| {
+                        // alloc: the names the kernel reads while the rename is in flight.
                         let names = Box::new([c_path(&from)?, c_path(&to)?]);
+                        // alloc: the directories it syncs, held while it is in flight.
                         let mut dirs = vec![open_dir_of(&to)?];
                         if from.parent() != to.parent() {
                             dirs.push(open_dir_of(&from)?);
@@ -2955,8 +2968,8 @@ impl Driver for Uring {
                 }
                 Effect::Watch { dir, .. } => {
                     crate::watch::Tree::new(&self.root, &dir, true).map(|tree| {
-                        let buffer = vec![0; crate::watch::BUFFER];
-                        let op = Op::Watch { tree, buffer, stopping: false, flushes: Vec::new(), journal: None };
+                        let buffer = vec![0; crate::watch::BUFFER]; // alloc: setup, once per watch.
+                        let op = Op::Watch { tree, buffer, stopping: false, flushes: Vec::new(), journal: None }; // alloc: setup, once per watch; empty until a flush.
                         let id = self.start(tag, op);
                         self.watches.insert(tag, id);
                         None
@@ -2967,25 +2980,22 @@ impl Driver for Uring {
                 Effect::Journal { dir, since, .. } => {
                     crate::watch::Tree::new(&self.root, &dir, true).map(|tree| {
                         self.ready.push(Completion { tag, done: crate::journal::first_on_linux(&dir, &since) });
-                        let buffer = vec![0; crate::watch::BUFFER];
-                        let op = Op::Watch { tree, buffer, stopping: false, flushes: Vec::new(), journal: Some(dir) };
+                        let buffer = vec![0; crate::watch::BUFFER]; // alloc: setup, once per journal.
+                        let op = Op::Watch { tree, buffer, stopping: false, flushes: Vec::new(), journal: Some(dir) }; // alloc: setup, once per watch; empty until a flush.
                         let id = self.start(tag, op);
                         self.watches.insert(tag, id);
                         None
                     })
                 }
                 Effect::Stamp { files, .. } => self.sweep(tag, files).map(|()| None),
-                Effect::Entries { dir, .. } => self
-                    .off_ring_with(tag, move |root| {
-                        Ok(Done::Entries(crate::fs::entries(&root.join(dir.as_str()), &dir)?))
-                    })
-                    .map(|()| None),
+                Effect::Entries { dir, .. } => self.list(tag, dir).map(|()| None),
                 Effect::Flush { watch, .. } => self.flush(watch, tag).map(|()| None),
                 Effect::Unwatch { .. } | Effect::Unlisten { .. } | Effect::Kill { .. } => {
                     unreachable!("taken above")
                 }
                 Effect::ReadAll { file, .. } => match self.file(&file, false) {
                     Ok(file) => size_of_file(file.fd()).map(|size| {
+                        // alloc: the read's result, handed to its asker.
                         let bytes = vec![0; size as usize];
                         match size {
                             0 => Some(Done::Read(bytes)),
@@ -2996,11 +3006,12 @@ impl Driver for Uring {
                         }
                     }),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        Ok(Some(Done::Read(Vec::new())))
+                        Ok(Some(Done::Read(Vec::new()))) // alloc: empty, nothing allocated.
                     }
                     Err(error) => Err(error),
                 },
                 Effect::Read { file, at, len, .. } => self.file(&file, false).map(|file| {
+                    // alloc: the read's result, handed to its asker.
                     self.start(tag, Op::Read { file, at, bytes: vec![0; len], got: 0 });
                     None
                 }),
@@ -3042,6 +3053,7 @@ impl Driver for Uring {
                 Effect::Connect { at: address, .. } => crate::net::sockaddr(&self.root, &address)
                     .and_then(|address| {
                         let socket = connect_socket(&self.table, address.domain)?;
+                        // alloc: the address the kernel reads while the connect is in flight.
                         let op = Op::Connect { socket: Some(socket), at: Box::new(address) };
                         self.start(tag, op);
                         Ok(None)
@@ -3064,11 +3076,10 @@ impl Driver for Uring {
                 Ok(Some(done)) => self.ready.push(Completion { tag, done }),
                 Err(error) => self
                     .ready
-                    .push(Completion { tag, done: Done::Failed(IoError(error.to_string())) }),
+                    .push(Completion { tag, done: Done::Failed(IoError(error.to_string())) }), // alloc: an error.
             }
         }
         self.flush_waiting();
-        self.feed_sweeps();
         self.submit_ring();
     }
 
@@ -3805,9 +3816,12 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// `files` files of 8 bytes in directories of 100 under `src`, one of them executable, and
-    /// a symlink to one and one to nothing; the names to stamp of it: every file, directories,
-    /// the links, and names with nothing there (one under a file).
+    /// `files` files of 8 bytes in directories of 100 under `src`, one of them executable; a
+    /// file at the top; a symlink to a file, one to nothing and one to a directory; a directory
+    /// that can be searched and not read, with a file in it. The names to stamp of it: every
+    /// file (one through the directory's link), directories, the links, and names with nothing
+    /// there (under a file, under a dangling link, through the directory's link). Undone by
+    /// [`unsweep`].
     fn sweep_tree(root: &Path, files: usize) -> Names {
         let mut names = Names::default();
         for n in 0..files {
@@ -3820,23 +3834,40 @@ mod tests {
         }
         std::os::unix::fs::symlink("d0/f0.rs", root.join("src/link")).unwrap();
         std::os::unix::fs::symlink("nowhere", root.join("src/dangling")).unwrap();
+        std::os::unix::fs::symlink("d0", root.join("src/via")).unwrap();
         crate::fs::set_mode(&root.join("src/d0/f1.rs"), 0o755).unwrap();
-        for name in GONE.iter().chain(&["src", "src/d0", "src/link", "src/dangling"]) {
+        std::fs::write(root.join("top.rs"), b"top").unwrap();
+        std::fs::create_dir_all(root.join("src/sealed")).unwrap();
+        std::fs::write(root.join("src/sealed/inside.rs"), b"in").unwrap();
+        crate::fs::set_mode(&root.join("src/sealed"), 0o111).unwrap();
+        let others = ["src", "src/d0", "src/link", "src/dangling", "src/via", "src/via/f0.rs", "top.rs", "src/sealed", "src/sealed/inside.rs"];
+        for name in GONE.iter().chain(&others) {
             assert!(names.push_str(name));
         }
         names
     }
 
-    const GONE: [&str; 3] = ["src/missing", "src/d0/f0.rs/under-a-file", "gone/deep/name"];
+    /// Files of [`sweep_tree`]'s besides the `files` in `src/d*`.
+    const OTHER_FILES: usize = 3;
 
-    /// The ring's sweep of more names than the submission ring holds gives, name by name, the
-    /// stamps of the reference sweep's `fstatat`s: files, directories, links not followed, the
-    /// mode's bits, and names with nothing there gone.
+    /// Removes what [`sweep_tree`] made.
+    fn unsweep(root: &Path) {
+        crate::fs::set_mode(&root.join("src/sealed"), 0o755).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    const GONE: [&str; 5] =
+        ["src/missing", "src/d0/f0.rs/under-a-file", "gone/deep/name", "src/dangling/name", "src/via/missing"];
+
+    /// The stampers' sweep, over many chunks and directories, gives name by name the stamps of
+    /// the reference sweep's `fstatat`s of whole names: files, directories, links not followed
+    /// (but followed as a directory on the way), the mode's bits, a directory searched and not
+    /// read, and names with nothing there gone.
     #[test]
     fn a_sweep_stamps_as_the_reference_does() {
         let root = dir("uring-stamp");
         let names = sweep_tree(&root, 10_000);
-        assert!(names.len() > ENTRIES as usize);
+        assert!(names.len() > 8 * STAMP_CHUNK);
         let reference = crate::fs::stamps(&root, &names).unwrap();
         let mut driver = Uring::new(&root).unwrap();
         let mut effects = vec![Effect::Stamp { files: names.clone(), tag: Tag(1) }];
@@ -3848,20 +3879,65 @@ mod tests {
             assert_eq!(ours, theirs, "{}", names.get(at));
         }
         let of = |name: &str| stamps[names.iter().position(|it| it == name).expect("stamped")];
-        assert_eq!(stamps.iter().filter(|it| it.is_file()).count(), 10_000);
+        assert_eq!(stamps.iter().filter(|it| it.is_file()).count(), 10_000 + OTHER_FILES);
         assert!(stamps.iter().all(|it| !it.is_unknown()));
-        assert!(of("src").is_dir() && of("src/d0").is_dir());
-        assert!(of("src/link").is_link() && of("src/dangling").is_link());
+        assert!(of("src").is_dir() && of("src/d0").is_dir() && of("src/sealed").is_dir());
+        assert!(of("src/link").is_link() && of("src/dangling").is_link() && of("src/via").is_link());
+        assert_eq!(of("src/via/f0.rs"), of("src/d0/f0.rs"));
         assert!(of("src/d0/f1.rs").executable() && !of("src/d0/f0.rs").executable());
-        assert_eq!(of("src/d0/f3.rs").size, 8);
+        assert_eq!((of("src/d0/f3.rs").size, of("top.rs").size, of("src/sealed/inside.rs").size), (8, 3, 2));
         for gone in GONE {
             assert_eq!(of(gone), Stamp::GONE, "{gone}");
         }
-        assert_eq!(driver.sweeps.in_flight(), 0);
-        assert!(driver.sweeps.slots.iter().all(Option::is_none));
         assert_eq!(driver.in_flight(), 0);
         drop(driver);
-        std::fs::remove_dir_all(root).unwrap();
+        unsweep(&root);
+    }
+
+    /// The allocation budget of sweeps and listings: nothing per name on a stamper; on the
+    /// ring's thread, the root's name to open, the job and its result per sweep (a restart's,
+    /// not the warm loop's), however many names, and for either at most one block of a
+    /// stamper's channel now and then. The wake's read allocates nothing.
+    #[test]
+    fn a_sweep_allocates_per_sweep_not_per_name() {
+        let root = dir("uring-stamp-alloc");
+        let names = sweep_tree(&root, 2_000);
+        let fd = open_dir(&root).unwrap();
+        let mut parent = Vec::with_capacity(libc::PATH_MAX as usize);
+        let mut stamps = vec![Stamp::UNKNOWN; names.len()];
+        blaze_alloc_count::assert_at_most(0, "stamp_names", || {
+            stamp_names(fd.as_raw_fd(), &names, 0..names.len(), &mut parent, |at, stamp| stamps[at] = stamp);
+        });
+        assert!(stamps.iter().all(|it| !it.is_unknown()));
+        let mut driver = Uring::new(&root).unwrap();
+        for round in 0..3 {
+            let mut effects = Vec::with_capacity(1);
+            effects.push(Effect::Stamp { files: names.clone(), tag: Tag(round) });
+            // The first starts the stampers.
+            match round {
+                0 => driver.submit(&mut effects),
+                _ => blaze_alloc_count::assert_at_most(4, "submitting a sweep", || driver.submit(&mut effects)),
+            }
+            let mut seen = 0;
+            run_until_idle(&mut driver, &mut Vec::new(), |done, _| {
+                assert!(matches!(done.done, Done::Stamped(_)), "{done:?}");
+                seen += 1;
+            });
+            assert_eq!(seen, 1);
+        }
+        for round in 0..3 {
+            let mut effects = Vec::with_capacity(1);
+            effects.push(Effect::Entries { dir: FileName::new("src/d0").unwrap(), tag: Tag(10 + round) });
+            blaze_alloc_count::assert_at_most(1, "submitting a listing", || driver.submit(&mut effects));
+            let mut seen = 0;
+            run_until_idle(&mut driver, &mut Vec::new(), |done, _| {
+                assert!(matches!(done.done, Done::Entries(_)), "{done:?}");
+                seen += 1;
+            });
+            assert_eq!(seen, 1);
+        }
+        drop(driver);
+        unsweep(&root);
     }
 
     /// Two sweeps in flight at once, with an empty one, an append, a timer and a listing of
@@ -3889,9 +3965,8 @@ mod tests {
             Effect::Entries { dir: FileName::new("src/missing").unwrap(), tag: Tag(7) },
         ];
         driver.submit(&mut effects);
-        assert_eq!(driver.sweeps.slots.iter().filter(|it| it.is_some()).count(), 2);
-        assert!(driver.sweeps.in_flight() > 0);
-        assert!(driver.sweeps.in_flight() <= driver.ring.sq_entries as usize);
+        assert_eq!(driver.in_flight(), 7);
+        assert_eq!(driver.offload.out, 4, "two sweeps and two listings off the ring");
         let mut seen = BTreeMap::new();
         run_until_idle(&mut driver, &mut Vec::new(), |done, _| _ = seen.insert(done.tag.0, done.done));
         assert!(seen[&1] == Done::Stamped(reference.clone()), "the first sweep");
@@ -3903,7 +3978,6 @@ mod tests {
         assert_eq!(seen[&5], Done::Fired);
         assert_eq!(seen[&6], Done::Entries(entries));
         assert!(matches!(&seen[&7], Done::Failed(_)), "{:?}", seen[&7]);
-        assert_eq!(driver.sweeps.in_flight(), 0);
         assert_eq!(driver.in_flight(), 0);
         drop(driver);
 
@@ -3914,11 +3988,13 @@ mod tests {
         run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
         let [Done::Failed(why)] = &seen[..] else { panic!("{seen:?}") };
         assert!(why.0.contains(&*nowhere.to_string_lossy()), "{why}");
-        std::fs::remove_dir_all(root).unwrap();
+        unsweep(&root);
     }
 
-    /// docs/v2/plan/design/restore.md's budget: a warm sweep of 100 000 tracked names in 50 ms,
-    /// beside the reference sweep's time on threads for the same names.
+    /// docs/v2/plan/design/restore.md's budget, a warm sweep of 100 000 tracked names in 50 ms,
+    /// and the speed of light (docs/v2/plan/lanes/frontend/journal/linux.md): the kernel's own
+    /// work for every name, measured as one thread's plain `statx` calls of them, over the
+    /// cores. The sweep comes within 10% of it; the reference sweep's time is printed beside.
     #[test]
     #[ignore = "a benchmark: makes 100 000 files and times sweeps of them"]
     fn a_sweep_of_100k_names_is_within_the_restart_budget() {
@@ -3943,10 +4019,25 @@ mod tests {
         let began = Instant::now();
         crate::fs::stamps(&root, &names).unwrap();
         let threads = began.elapsed();
-        eprintln!("100 000 names: the ring {best:?}, the reference on threads {threads:?}");
+        let dir = open_dir(&root).unwrap();
+        let mut one = Duration::MAX;
+        for _ in 0..3 {
+            let began = Instant::now();
+            for at in 0..names.len() {
+                std::hint::black_box(statx_at(dir.as_raw_fd(), names.with_nul(at)));
+            }
+            one = one.min(began.elapsed());
+        }
+        let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let light = one / cores as u32;
+        eprintln!(
+            "100 000 names: the stampers {best:?}, the speed of light {light:?} ({one:?} on one \
+             core of {cores}), the reference on threads {threads:?}"
+        );
         assert!(best < Duration::from_millis(50), "{best:?}");
+        assert!(best.as_secs_f64() * 0.9 <= light.as_secs_f64(), "{best:?} against {light:?}");
         drop(driver);
-        std::fs::remove_dir_all(root).unwrap();
+        unsweep(&root);
     }
 
     /// A journal on Linux first says the changes since a saved cursor are lost (and nothing is

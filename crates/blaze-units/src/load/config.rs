@@ -113,7 +113,7 @@ impl Query for ConfigChain {
         let fill = Fill { config: key, own: None, members: false };
         let mut read =
             ConfigRead { cwd, env, command, cli, unstable, snapshot: Snapshot::default(), warnings: Vec::new() };
-        let (loaded, used) = run_over(cx, Snapshot::default(), &fill, |_, files| {
+        let (loaded, used) = run_over(cx, Snapshot::default(), &fill, |_, files, _| {
             Ok(build(&read, files).map(|config| config.take_warnings()))
         })?;
         if let Some(path) = used.unmounted() {

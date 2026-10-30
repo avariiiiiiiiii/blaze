@@ -57,7 +57,7 @@ pub struct Did<T> {
 
 /// The thread tasks of one batch of nodes: called with a task's `arg` and the readers the loop
 /// posted it with, it says what the task came to, or `None` when it gave way (a cycle of waits,
-/// a cancel, memory, a write of what it read), to be posted again whole. One per batch, never
+/// a cancel, memory), to be posted again whole. One per batch, never
 /// one per node.
 pub type Work<T> = Arc<dyn Fn(u32, Readers) -> Option<Did<T>> + Send + Sync>;
 
@@ -275,8 +275,8 @@ impl<T: Send + 'static> Runner<T> for Threads<T> {
 
 /// The simulation's: tasks run on the loop's thread when it takes them, a seeded part of what
 /// is posted each time in a seeded order, so a run is a function of its seed. The readers of
-/// tasks it holds queued are alive while the loop writes, so it is for fronts whose writes
-/// don't wait on their readers (the simulation's fakes).
+/// the tasks it holds queued stay alive until they run, so a write the loop asks for meanwhile
+/// waits for them as it would for a worker's.
 pub struct Inline<T> {
     rng: Rng,
     queue: VecDeque<Posted<T>>,

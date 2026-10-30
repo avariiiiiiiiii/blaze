@@ -77,11 +77,12 @@ the driver's API (`blaze_core::Done::Read(Vec<u8>)`), not this module's.
 ## What each test executed
 
 What we do: a server built with jump-table slots asks the runtime how many slots it has once,
-and before each fork maps a region shared with the child: a 16-byte header (`blzexec1`, the
+and before each fork hands the child a region shared with it: a 16-byte header (`blzexec1`, the
 slot count, the slots armed) and a byte per slot. The child's runtime arms it, then each slot's
 first call sets its byte. Once the child has exited, the server reads the region by the rules
-of `blaze_testsel::record::Record::of_region` and sends the slots set. The read is eight bytes
-a step: a zero word is skipped in one compare (most of a binary never runs in one test), and
+of `blaze_testsel::record::Record::of_region` and sends the slots set. The read is four words
+a step: a group of zero words is skipped in one compare (most of a binary never runs in one
+test), and
 in a word that is not zero the set bytes are found by `((w & 0x7f..) + 0x7f..) | w) & 0x80..`
 and a count of trailing zeros per hit, the last word masked to the slots it holds. A test of
 a binary without slots says so ("built without jump-table slots"); one that did not exit, or
@@ -100,10 +101,14 @@ The fastest known way:
   region that is mostly zero, portable, and safe code (the module is compiled into every test
   crate, in every edition).
 
-Where we fall short: the region is mapped and unmapped per test (two syscalls and a page
-fault per page touched). A pool of regions reused across children (cleared with one `memset`
-of what was set) would save the syscalls; the cost is a free list in the server and the
-clear, against `mmap`'s.
+A region read is kept for the next test: the server clears the bytes the read found (all of
+them after a record that was not whole) and writes the header again, so a steady stream of
+tests makes no `mmap` or `munmap` and allocates no page; the server maps only as many
+regions as tests run at once. A process a test left running may still set a byte in a region
+another test now has; the runtime only sets bytes, so that test's record may hold a slot it
+did not call and never lacks one it did: selection reruns more, never less.
+
+Where we fall short: the bound and the gaps are in `speed-of-light-tests.md`.
 
 ## One queue over every binary (`test/queue.rs`)
 

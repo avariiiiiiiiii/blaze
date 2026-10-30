@@ -35,6 +35,10 @@ mod write;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use std::collections::VecDeque;
 use std::fmt;
 
@@ -42,13 +46,15 @@ use blaze_codegen::{CompiledFunction, InstanceKey, Static, Target};
 use blaze_core::{Effect, FileName};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
+use bumpalo::Bump;
+use bumpalo::collections::Vec as BumpVec;
 use rustc_hash::FxHashMap;
 
 pub use output::{Debug, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
 pub use position::{COLUMN, LINE, Position, SpanTable};
 
-use commit::{History, Pending, Undo, Writes};
-use model::{NativeFile, Plan, Writer};
+use commit::{Pending, Revert, Undo, Writes};
+use model::{Formats, NativeFile, Plan, Writer};
 use stage::{Contents, Stage};
 use state::{State, has_table};
 use symbols::{Obj, SymKey, Symbols};
@@ -121,7 +127,8 @@ pub struct Image {
     next: FileName,
     name: String,
     output: Output,
-    writer: Box<dyn Writer>,
+    /// The format's writer, dispatched by a tag `match` ([`Formats`]).
+    writer: Formats,
     plan: Plan,
     symbols: Symbols,
     objects: FxHashMap<Obj, native::Read>,
@@ -131,6 +138,11 @@ pub struct Image {
     tags: u32,
     /// The last generation given out: generations are never reused.
     generations: u64,
+    /// Each stage's scratch, reset when the next begins: a stage like the last one finds its
+    /// room already there.
+    arena: Bump,
+    /// Bytes reused for keys written out to be hashed, across stages.
+    scratch: Vec<u8>,
 }
 
 impl Image {
@@ -138,6 +150,7 @@ impl Image {
     pub fn new(to: FileName, output: Output) -> Result<Image, LinkError> {
         let fail = |what: String| LinkError { function: None, what };
         if output.tags & 0xffff_ffff != 0 {
+            // alloc: error path
             return Err(fail(format!("the effect tags {:#x} have low bits set: they are the image's", output.tags)));
         }
         if output.live.is_some() && !output.incremental {
@@ -146,10 +159,14 @@ impl Image {
         let writer = model::writer(&output)?;
         let plan = writer.plan();
         if output.live.is_some() && plan.indexed_code {
+            // alloc: error path
             return Err(fail(format!("live patching of {:?} images", output.format)));
         }
+        // alloc: once per image, the name its next file is written at
         let next = FileName::new(&format!("{}.blaze-next", to.as_str()))
+            // alloc: error path
             .ok_or_else(|| fail(format!("{to}: no name beside it to write the next image at")))?;
+        // alloc: once per image, its file name for the writer
         let name = to.as_str().rsplit('/').next().unwrap_or(to.as_str()).to_owned();
         Ok(Image {
             to,
@@ -161,10 +178,12 @@ impl Image {
             symbols: Symbols::default(),
             objects: FxHashMap::default(),
             state: State::new(),
-            history: VecDeque::new(),
+            history: VecDeque::with_capacity(commit::HISTORY + 1),
             pending: None,
             tags: 0,
             generations: blaze_live::patch::FIRST_GENERATION,
+            arena: Bump::new(),
+            scratch: Vec::with_capacity(64),
         })
     }
 
@@ -177,16 +196,18 @@ impl Image {
         }
         let full = !self.state.laid_out || !self.output.incremental;
         let table = has_table(&self.output, self.plan.indexed_code);
+        // clone: O(1), every column chunk and page shared until written (state.rs)
         let mut new = self.state.clone();
         new.generation = self.generations + 1;
         if new.wants_compaction() {
             new.compact();
         }
-        let arena = bumpalo::Bump::new();
+        self.arena.reset();
+        let arena = &self.arena;
         let contents = Contents::new(new.piece_count());
         let mut stage = Stage {
             output: &self.output,
-            writer: &*self.writer,
+            writer: &self.writer,
             plan: &self.plan,
             symbols: &mut self.symbols,
             objects: &mut self.objects,
@@ -194,22 +215,22 @@ impl Image {
             old: &self.state,
             new,
             name: &self.name,
-            arena: &arena,
+            arena,
             contents,
             fresh: Default::default(),
             write: Default::default(),
             changed: Default::default(),
             dirty_cells: Default::default(),
-            removed: Vec::new(),
-            emptied: Vec::new(),
-            touched: Vec::new(),
-            counted: Vec::new(),
+            removed: BumpVec::new_in(arena),
+            emptied: BumpVec::new_in(arena),
+            touched: BumpVec::new_in(arena),
+            counted: BumpVec::new_in(arena),
             full,
             table,
             functions: 0,
             statics: 0,
-            owned: Vec::new(),
-            scratch: Vec::new(),
+            owned: BumpVec::new_in(arena),
+            scratch: &mut self.scratch,
             spans_changed: false,
         };
         stage.inputs(&change)?;
@@ -245,7 +266,7 @@ impl Image {
                 len: finished.len,
                 old_len: finished.old_len,
                 writes: finished.writes,
-                remove: Vec::new(),
+                remove: None,
                 message: if self.state.laid_out { message } else { None },
             },
             undo: finished.undo,
@@ -261,6 +282,7 @@ impl Image {
         if staged.base != self.state.generation {
             return Err(LinkError {
                 function: None,
+                // alloc: error path
                 what: format!(
                     "staged on generation {}, and the image is at {}: stage it again",
                     staged.base, self.state.generation
@@ -271,14 +293,14 @@ impl Image {
         let steps = self.steps(staged.writes)?;
         self.generations = self.generations.max(staged.state.generation);
         let before = std::mem::replace(&mut self.state, staged.state);
-        let history = if before.laid_out {
+        let revert = if before.laid_out {
             let len = before.file_len;
-            self.remember(Undo { state: before.clone(), full, len, writes: staged.undo });
-            History::Pop
+            self.remember(Undo { state: before, full, len, writes: staged.undo });
+            Revert::Pop
         } else {
-            History::Keep
+            Revert::Keep(before)
         };
-        self.begin(steps, (before, history), effects);
+        self.begin(steps, revert, effects);
         Ok(())
     }
 
@@ -304,13 +326,13 @@ impl Image {
             len: undo.len,
             old_len: self.state.file_len,
             writes: file::restore(&undo.state, undo.full, &undo.writes),
-            remove: if message.is_some() { vec![to] } else { Vec::new() },
+            remove: message.is_some().then_some(to),
             message,
         };
         let steps = self.steps(writes)?;
-        let undo = self.history.pop_back().expect("looked at above");
-        let current = std::mem::replace(&mut self.state, undo.state.clone());
-        self.begin(steps, (current, History::Push(undo)), effects);
+        let Undo { state, full, len, writes } = self.history.pop_back().expect("looked at above");
+        let current = std::mem::replace(&mut self.state, state);
+        self.begin(steps, Revert::Push { state: current, full, len, writes }, effects);
         Ok(())
     }
 
@@ -336,14 +358,16 @@ pub fn script_inputs(output: &Output, native: &Native<'_>) -> Result<Vec<String>
     let writer = model::writer(output)?;
     let file = writer
         .read(native.name, native.bytes, &native.kind)
+        // alloc: error path
         .map_err(|what| LinkError { function: None, what: format!("{}: {what}", native.name) })?;
-    let mut out = Vec::new();
-    if let NativeFile::Shared(shared) = file {
-        let mut all = vec![shared];
-        while let Some(it) = all.pop() {
-            out.extend(it.inputs);
-            all.extend(it.more);
-        }
+    // alloc: none, an empty `Vec` holds no buffer
+    let NativeFile::Shared(shared) = file else { return Ok(Vec::new()) };
+    let mut out = Vec::with_capacity(shared.inputs.len());
+    let mut all = smallvec::SmallVec::<[model::Shared; 2]>::new();
+    all.push(shared);
+    while let Some(it) = all.pop() {
+        out.extend(it.inputs);
+        all.extend(it.more);
     }
     Ok(out)
 }
@@ -394,12 +418,15 @@ pub fn fuzz_trie_differential(trie: &[u8]) -> Result<bool, String> {
 /// them.
 pub fn default_libraries(output: &Output, natives: &[Native<'_>]) -> Result<Vec<String>, LinkError> {
     let writer = model::writer(output)?;
+    // alloc: the public API's list, made once per link's natives (setup)
     let mut out: Vec<String> = Vec::new();
     let mut none = false;
+    // alloc: once per call, beside the list it is subtracted from
     let mut left_out: Vec<String> = Vec::new();
     for native in natives.iter().filter(|it| matches!(it.kind, NativeKind::Object)) {
         let file = writer
             .read(native.name, native.bytes, &native.kind)
+            // alloc: error path
             .map_err(|what| LinkError { function: None, what: format!("{}: {what}", native.name) })?;
         let NativeFile::Object(object) = file else { continue };
         for library in object.libraries {
@@ -416,16 +443,19 @@ pub fn default_libraries(output: &Output, natives: &[Native<'_>]) -> Result<Vec<
         }
     }
     if none {
-        return Ok(Vec::new());
+        out.clear();
+        return Ok(out);
     }
     out.retain(|it| !left_out.iter().any(|gone| gone.eq_ignore_ascii_case(it)));
     Ok(out)
 }
 
-/// What an image is across its generations: its first full link's pieces and inputs.
+/// What an image is across its generations: its first full link's pieces and inputs. Once
+/// per image.
 fn lineage(stage: &Stage<'_>, to: &FileName) -> [u8; 16] {
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut keys: Vec<(u32, u32)> = Vec::with_capacity(stage.new.piece_count() as usize);
+    let pieces = stage.new.piece_count() as usize;
+    let mut bytes: Vec<u8> = Vec::with_capacity(pieces * 40);
+    let mut keys: Vec<(u32, u32)> = Vec::with_capacity(pieces);
     for piece in stage.new.live_pieces() {
         let start = bytes.len();
         stage.symbols.write_key(piece.sym, &mut bytes);
@@ -434,6 +464,7 @@ fn lineage(stage: &Stage<'_>, to: &FileName) -> [u8; 16] {
     let key = |it: &(u32, u32)| &bytes[it.0 as usize..(it.0 + it.1) as usize];
     keys.sort_unstable_by(|a, b| key(a).cmp(key(b)));
     let mut hasher = Hasher::new("blaze v2 link lineage 2");
+    // alloc: once per image, at its first full link
     hasher.part(to.as_str().as_bytes()).part(format!("{:?}", stage.output).as_bytes());
     for it in &keys {
         hasher.part(key(it));

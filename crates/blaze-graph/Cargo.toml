@@ -14,6 +14,8 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-format.workspace = true
+blaze-image.workspace = true
 blaze-radix.workspace = true
 blaze-protocol.workspace = true
 blaze-reclaim.workspace = true

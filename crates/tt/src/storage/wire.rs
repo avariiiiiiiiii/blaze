@@ -16,8 +16,8 @@ use intern::Symbol;
 use span::{SpanAnchor, SyntaxContext, TextRange, TextSize};
 
 use super::{
-    CompressedSpanPart, Encoder, IDENT, LITERAL, NARROW_LIMIT, Node, PUNCT, PackedSpan, SUBTREE,
-    TopSubtree, WIDE, WideSpan,
+    CompressedSpanPart, IDENT, LITERAL, NARROW_LIMIT, Node, PUNCT, PackedSpan, SUBTREE,
+    SYMBOL_WINDOW, TopSubtree, WIDE, WideSpan, has_duplicates,
 };
 
 /// The first word, naming the layout; a change to it changes this.
@@ -34,6 +34,10 @@ pub struct WirePart {
 }
 
 impl WirePart {
+    fn words(self) -> [u32; 3] {
+        [self.file_id, self.ast_id, self.ctx]
+    }
+
     fn of(part: CompressedSpanPart) -> WirePart {
         WirePart {
             file_id: part.anchor.file_id.as_u32(),
@@ -83,8 +87,10 @@ fn malformed<T>(what: &'static str, at: usize) -> Result<T, WireError> {
 }
 
 impl TopSubtree {
-    /// Appends the tree's columns to `out`, as [`TopSubtree::read_wire`] reads them.
+    /// Appends the tree's columns to `out`, as [`TopSubtree::read_wire`] reads them: one
+    /// allocation, each column written as rows of fixed size.
     pub fn write_wire(&self, out: &mut Vec<u8>) {
+        let len = |it: usize| u32::try_from(it).expect("a token tree column fits in u32");
         let symbol_bytes: usize = self.symbols.iter().map(|it| it.as_str().len()).sum();
         let words = HEADER_WORDS
             + 2 * self.nodes.len()
@@ -93,54 +99,41 @@ impl TopSubtree {
             + 3 * self.parts.len()
             + self.symbols.len()
             + 10;
-        out.reserve(4 * words + symbol_bytes.next_multiple_of(4));
-        let mut word = |it: u32| out.extend_from_slice(&it.to_le_bytes());
-        let len = |it: usize| u32::try_from(it).expect("a token tree column fits in u32");
-        word(MAGIC);
-        word(len(self.nodes.len()));
-        word(len(self.wide.len()));
-        word(len(self.parts.len()));
-        word(len(self.symbols.len()));
-        word(len(symbol_bytes));
-        for node in &self.nodes {
-            word(node.head);
-            word(node.data);
-        }
-        for span in &self.spans {
-            word(span.start);
-            word(span.len_part);
-        }
-        for wide in &self.wide {
-            word(wide.start);
-            word(wide.len);
-            word(wide.part);
-        }
-        let mut part = |part: WirePart| {
-            word(part.file_id);
-            word(part.ast_id);
-            word(part.ctx);
-        };
-        for &it in &self.parts {
-            part(WirePart::of(it));
-        }
+        let base = out.len();
+        out.resize(base + 4 * words + symbol_bytes.next_multiple_of(4), 0);
+        let mut put = Put(&mut out[base..]);
+        put.rows(
+            [[
+                MAGIC,
+                len(self.nodes.len()),
+                len(self.wide.len()),
+                len(self.parts.len()),
+                len(self.symbols.len()),
+                len(symbol_bytes),
+            ]]
+            .into_iter(),
+        );
+        put.rows(self.nodes.iter().map(|it| [it.head, it.data]));
+        put.rows(self.spans.iter().map(|it| [it.start, it.len_part]));
+        put.rows(self.wide.iter().map(|it| [it.start, it.len, it.part]));
+        put.rows(self.parts.iter().map(|&it| WirePart::of(it).words()));
         let mut end = 0;
+        put.rows(self.symbols.iter().map(|it| {
+            end += it.as_str().len();
+            [end as u32]
+        }));
+        put.rows([self.top_open, self.top_close].iter().map(|span| {
+            let [file_id, ast_id, ctx] = WirePart::of(CompressedSpanPart::from_span(span)).words();
+            [span.range.start().into(), span.range.len().into(), file_id, ast_id, ctx]
+        }));
+        let mut text = put.0;
         for symbol in &self.symbols {
-            end += symbol.as_str().len();
-            word(len(end));
+            let bytes = symbol.as_str().as_bytes();
+            let (head, rest) = std::mem::take(&mut text).split_at_mut(bytes.len());
+            head.copy_from_slice(bytes);
+            text = rest;
         }
-        for span in [self.top_open, self.top_close] {
-            let part = WirePart::of(CompressedSpanPart::from_span(&span));
-            for it in [span.range.start().into(), span.range.len().into()] {
-                word(it);
-            }
-            for it in [part.file_id, part.ast_id, part.ctx] {
-                word(it);
-            }
-        }
-        for symbol in &self.symbols {
-            out.extend_from_slice(symbol.as_str().as_bytes());
-        }
-        out.resize(out.len().next_multiple_of(4), 0);
+        debug_assert!(text.len() < 4 && text.iter().all(|&it| it == 0), "the padding is left");
     }
 
     /// Reads a tree [`TopSubtree::write_wire`] wrote at the start of `bytes`, and how many bytes
@@ -148,78 +141,70 @@ impl TopSubtree {
     /// or refuses it: the ids are the writer's, and only the reader knows which it may use.
     pub fn read_wire(
         bytes: &[u8],
-        part: &mut dyn FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
+        part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
     ) -> Result<(TopSubtree, usize), WireError> {
         let mut words = Words { bytes, at: 0 };
-        let magic = words.one()?;
+        let [magic, nodes_len, wide_len, parts_len, symbols_len, symbol_bytes] =
+            words.rows::<6>(1)?.next().expect("one header row is read");
         if magic != MAGIC {
             return Err(WireError::Magic(magic));
         }
         let [nodes_len, wide_len, parts_len, symbols_len, symbol_bytes] =
-            words.take::<5>()?.map(|it| it as usize);
+            [nodes_len, wide_len, parts_len, symbols_len, symbol_bytes].map(|it| it as usize);
         if nodes_len == 0 {
             return malformed("a tree without its top subtree", 0);
         }
-        words.ensure(2 * nodes_len)?;
-        let mut nodes = Vec::with_capacity(nodes_len);
-        for _ in 0..nodes_len {
-            let [head, data] = words.take()?;
-            nodes.push(Node { head, data });
-        }
+        // Each column's bytes are taken whole before it is allocated, so the allocation is at
+        // most the bytes given.
+        let nodes: Vec<Node> = words
+            .rows::<2>(nodes_len)?
+            .map(|[head, data]| Node { head, data })
+            .collect(); // alloc: a column of the tree, its exact size.
         let subtrees = check_nodes(&nodes, symbols_len)?;
-        let spans_len = nodes_len + subtrees;
-        words.ensure(2 * spans_len)?;
-        let mut spans = Vec::with_capacity(spans_len);
-        for _ in 0..spans_len {
-            let [start, len_part] = words.take()?;
-            spans.push(PackedSpan { start, len_part });
-        }
-        words.ensure(3 * wide_len)?;
-        let mut wide = Vec::with_capacity(wide_len);
-        for at in 0..wide_len {
-            let [start, len, part] = words.take()?;
-            if part as usize >= parts_len {
+        let spans: Vec<PackedSpan> = words
+            .rows::<2>(nodes_len + subtrees)?
+            .map(|[start, len_part]| PackedSpan { start, len_part })
+            .collect(); // alloc: a column of the tree, its exact size.
+        let wide: Vec<WideSpan> = words
+            .rows::<3>(wide_len)?
+            .map(|[start, len, part]| WideSpan { start, len, part })
+            .collect(); // alloc: a column of the tree, its exact size.
+        for (at, it) in wide.iter().enumerate() {
+            if it.part as usize >= parts_len {
                 return malformed("a wide span's part past the parts", at);
             }
-            if start.checked_add(len).is_none() {
+            if it.start.checked_add(it.len).is_none() {
                 return malformed("a wide span ending past 4 GiB", at);
             }
-            wide.push(WideSpan { start, len, part });
         }
         check_spans(&spans, wide_len, parts_len)?;
-        words.ensure(3 * parts_len)?;
         let mut parts = Vec::with_capacity(parts_len);
-        for at in 0..parts_len {
-            let [file_id, ast_id, ctx] = words.take()?;
+        for (at, [file_id, ast_id, ctx]) in words.rows::<3>(parts_len)?.enumerate() {
             parts.push(resolve(part, WirePart { file_id, ast_id, ctx }, at)?);
         }
-        words.ensure(symbols_len)?;
-        let mut ends = Vec::with_capacity(symbols_len);
+        // Read twice from the bytes, checked now and used once the text is read.
+        let mut ends = Words { bytes, at: words.at };
         let mut last = 0;
-        for at in 0..symbols_len {
-            let end = words.one()? as usize;
+        for (at, [end]) in words.rows::<1>(symbols_len)?.enumerate() {
+            let end = end as usize;
             if end < last || end > symbol_bytes {
                 return malformed("a symbol ending before the last or past the symbols' bytes", at);
             }
-            ends.push(end);
             last = end;
         }
         if last != symbol_bytes {
             return malformed("symbols' bytes past the last symbol", symbols_len);
         }
         let mut top = [None; 2];
-        for (at, slot) in top.iter_mut().enumerate() {
-            let [start, len, file_id, ast_id, ctx] = words.take()?;
+        for (at, [start, len, file_id, ast_id, ctx]) in words.rows::<5>(2)?.enumerate() {
             let Some(end) = start.checked_add(len) else {
                 return malformed("a top span ending past 4 GiB", at);
             };
             let resolved = resolve(part, WirePart { file_id, ast_id, ctx }, parts_len + at)?;
             let range = TextRange::new(TextSize::new(start), TextSize::new(end));
-            *slot = Some(resolved.recombine(range));
+            top[at] = Some(resolved.recombine(range));
         }
-        let [Some(top_open), Some(top_close)] = top else {
-            unreachable!("both top spans are read above")
-        };
+        let [Some(top_open), Some(top_close)] = top else { unreachable!("two top spans are read") };
         let text = words.bytes(symbol_bytes)?;
         let text = std::str::from_utf8(text).map_err(|e| WireError::Malformed {
             what: "symbols that are not UTF-8",
@@ -227,7 +212,8 @@ impl TopSubtree {
         })?;
         let mut symbols = Vec::with_capacity(symbols_len);
         let mut from = 0;
-        for (at, &end) in ends.iter().enumerate() {
+        for (at, [end]) in ends.rows::<1>(symbols_len)?.enumerate() {
+            let end = end as usize;
             let Some(symbol) = text.get(from..end) else {
                 return malformed("a symbol ending inside a char", at);
             };
@@ -251,7 +237,7 @@ impl TopSubtree {
 }
 
 fn resolve(
-    part: &mut dyn FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
+    part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
     wire: WirePart,
     at: usize,
 ) -> Result<CompressedSpanPart, WireError> {
@@ -273,6 +259,7 @@ fn check_nodes(nodes: &[Node], symbols: usize) -> Result<usize, WireError> {
         return malformed("a top subtree not holding the whole tree", 0);
     }
     // Where each open subtree ends, the innermost last.
+    // alloc: one buffer per tree read, as deep as its nesting.
     let mut ends: Vec<usize> = vec![nodes.len()];
     let mut ordinal = 0;
     for (at, &node) in nodes.iter().enumerate().skip(1) {
@@ -360,42 +347,105 @@ fn check_literals(tree: &TopSubtree) -> Result<(), WireError> {
     Ok(())
 }
 
-/// Encodes the tree's spans and symbols again in the order the builder does and checks each
-/// lands where it is, and that no table holds more: then the columns are the builder's.
+/// Checks the columns are the builder's for these token trees, from indices alone, in the
+/// order the builder encodes (each node's span, then a subtree's closing one): each span uses a
+/// part already used or the next one, the parts are distinct, a span is wide exactly when it
+/// doesn't pack and the wide ones are in order, and each ident or literal has the index the
+/// builder's window gives its symbol. No span is unpacked and no part compared but once.
 fn check_canonical(tree: &TopSubtree) -> Result<(), WireError> {
+    let not = |what, at| Err(WireError::NotCanonical { what, at });
     let len = tree.nodes.len();
-    let mut encoder = Encoder::new(tree.symbols.len());
+    let mut order = Order { parts: 0, wide: 0 };
+    let mut symbols = 0;
     for (at, &node) in tree.nodes.iter().enumerate().skip(1) {
-        let span = tree.spans[at];
-        if encoder.span(&tree.unpack(span)) != span {
-            return Err(WireError::NotCanonical { what: "a span", at });
-        }
+        order.span(tree, tree.spans[at], at)?;
         match node.tag() {
             SUBTREE => {
                 let at = len + node.ordinal() as usize - 1;
-                let close = tree.spans[at];
-                if encoder.span(&tree.unpack(close)) != close {
-                    return Err(WireError::NotCanonical { what: "a closing span", at });
-                }
+                order.span(tree, tree.spans[at], at)?;
             }
             PUNCT => {}
             _ => {
-                if encoder.symbols.index(tree.symbols[node.data as usize]) != node.data {
-                    return Err(WireError::NotCanonical { what: "a symbol", at });
+                let index = node.data as usize;
+                let from = symbols.saturating_sub(SYMBOL_WINDOW);
+                let symbol = tree.symbols[index];
+                if index == symbols {
+                    if tree.symbols[from..symbols].contains(&symbol) {
+                        return not("a symbol again in its window", at);
+                    }
+                    symbols += 1;
+                } else if !(from..symbols).contains(&index)
+                    || tree.symbols[index + 1..symbols].contains(&symbol)
+                {
+                    return not("a symbol's index other than its latest in the window", at);
                 }
             }
         }
     }
-    if encoder.parts.list.len() != tree.parts.len() {
-        return Err(WireError::NotCanonical { what: "a part no span uses", at: tree.parts.len() });
+    if order.parts != tree.parts.len() {
+        return not("a part no span uses", order.parts);
     }
-    if encoder.wide[..] != tree.wide[..] {
-        return Err(WireError::NotCanonical { what: "the wide spans", at: 0 });
+    if order.wide != tree.wide.len() {
+        return not("a wide span no span uses", order.wide);
     }
-    if encoder.symbols.list.len() != tree.symbols.len() {
-        return Err(WireError::NotCanonical { what: "a symbol no node uses", at: tree.symbols.len() });
+    if symbols != tree.symbols.len() {
+        return not("a symbol no node uses", symbols);
+    }
+    if has_duplicates(&tree.parts) {
+        return not("a part twice", 0);
     }
     Ok(())
+}
+
+/// How many parts and wide spans the spans checked so far use.
+struct Order {
+    parts: usize,
+    wide: usize,
+}
+
+impl Order {
+    #[inline]
+    fn span(&mut self, tree: &TopSubtree, span: PackedSpan, at: usize) -> Result<(), WireError> {
+        let not = |what| Err(WireError::NotCanonical { what, at });
+        let part = if span.len_part == WIDE {
+            if span.start as usize != self.wide {
+                return not("a wide span out of order");
+            }
+            self.wide += 1;
+            let wide = tree.wide[span.start as usize];
+            if wide.len < NARROW_LIMIT && wide.part < NARROW_LIMIT {
+                return not("a wide span that packs");
+            }
+            wide.part
+        } else {
+            span.len_part >> 16
+        };
+        match part as usize {
+            part if part < self.parts => Ok(()),
+            part if part == self.parts => {
+                self.parts += 1;
+                Ok(())
+            }
+            _ => not("a part used before the ones before it"),
+        }
+    }
+}
+
+/// Where [`TopSubtree::write_wire`] writes next: the rest of its buffer.
+struct Put<'a>(&'a mut [u8]);
+
+impl Put<'_> {
+    /// Writes `rows` of `N` words.
+    #[inline]
+    fn rows<const N: usize>(&mut self, rows: impl ExactSizeIterator<Item = [u32; N]>) {
+        let (head, rest) = std::mem::take(&mut self.0).split_at_mut(4 * N * rows.len());
+        for (out, row) in head.chunks_exact_mut(4 * N).zip(rows) {
+            for (out, word) in out.chunks_exact_mut(4).zip(row) {
+                out.copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        self.0 = rest;
+    }
 }
 
 /// A cursor over the bytes' words.
@@ -405,15 +455,6 @@ struct Words<'a> {
 }
 
 impl<'a> Words<'a> {
-    /// Fails unless `words` more words follow, before a column that long is allocated.
-    fn ensure(&self, words: usize) -> Result<(), WireError> {
-        let needed = words.saturating_mul(4);
-        match self.bytes.len() - self.at >= needed {
-            true => Ok(()),
-            false => Err(WireError::Truncated { at: self.at, needed }),
-        }
-    }
-
     fn bytes(&mut self, len: usize) -> Result<&'a [u8], WireError> {
         match self.bytes.get(self.at..).and_then(|it| it.get(..len)) {
             Some(it) => {
@@ -424,15 +465,17 @@ impl<'a> Words<'a> {
         }
     }
 
-    fn take<const N: usize>(&mut self) -> Result<[u32; N], WireError> {
-        let bytes = self.bytes(4 * N)?;
-        Ok(std::array::from_fn(|i| {
-            u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().expect("four bytes"))
+    /// The next `count` rows of `N` words, taken whole first.
+    fn rows<const N: usize>(
+        &mut self,
+        count: usize,
+    ) -> Result<impl ExactSizeIterator<Item = [u32; N]> + use<'a, N>, WireError> {
+        let bytes = self.bytes(count.saturating_mul(4 * N))?;
+        Ok(bytes.chunks_exact(4 * N).map(|row| {
+            std::array::from_fn(|i| {
+                u32::from_le_bytes(row[4 * i..4 * i + 4].try_into().expect("four bytes"))
+            })
         }))
-    }
-
-    fn one(&mut self) -> Result<u32, WireError> {
-        self.take::<1>().map(|[it]| it)
     }
 
     /// Skips the zeros up to the next word.

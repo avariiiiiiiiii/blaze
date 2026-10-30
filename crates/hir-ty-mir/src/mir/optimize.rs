@@ -478,6 +478,38 @@ fn successors(kind: &TerminatorKind) -> SmallVec<[BasicBlockId; 4]> {
     out
 }
 
+/// rustc's `fn_can_unwind` where panics unwind: whether a panic may unwind out of `func`
+/// rather than abort.
+pub(crate) fn fn_can_unwind(db: &dyn HirDatabase, func: hir_def::FunctionId) -> bool {
+    !hir_def::attrs::AttrFlags::query(db, func.into())
+        .contains(hir_def::attrs::AttrFlags::RUSTC_NOUNWIND)
+        && abi_can_unwind(hir_def::signatures::FunctionSignature::of(db, func).abi)
+}
+
+/// Whether a function of `abi` may unwind: every Rust ABI, and the others' `-unwind` forms.
+pub(crate) fn abi_can_unwind(abi: rustc_abi::ExternAbi) -> bool {
+    use rustc_abi::ExternAbi;
+    match abi {
+        ExternAbi::Rust
+        | ExternAbi::RustCall
+        | ExternAbi::RustCold
+        | ExternAbi::RustInvalid
+        | ExternAbi::RustPreserveNone
+        | ExternAbi::RustTail => true,
+        ExternAbi::C { unwind }
+        | ExternAbi::System { unwind }
+        | ExternAbi::Aapcs { unwind }
+        | ExternAbi::Cdecl { unwind }
+        | ExternAbi::Stdcall { unwind }
+        | ExternAbi::Fastcall { unwind }
+        | ExternAbi::Thiscall { unwind }
+        | ExternAbi::Vectorcall { unwind }
+        | ExternAbi::SysV64 { unwind }
+        | ExternAbi::Win64 { unwind } => unwind,
+        _ => false,
+    }
+}
+
 fn block_index(block: BasicBlockId) -> usize {
     block.into_raw().into_u32() as usize
 }

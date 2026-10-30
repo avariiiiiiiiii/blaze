@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// What a change to reruns a script, as cargo's rule has it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Watched {
     /// Whole paths, in the order printed and each once: a file, or a directory meaning
     /// everything below it (links followed). cargo reruns a script for a path that is
@@ -83,7 +83,9 @@ fn watched_of<P: AsRef<Path>, E: AsRef<str>>(
     package_dir: &Path,
 ) -> Watched {
     if printed.is_empty() && names.is_empty() {
+        // alloc: the result: the package directory alone.
         let paths = vec![package_dir.to_owned()];
+        // alloc: none: an empty list.
         return Watched { paths, whole_package: true, env: Vec::new() };
     }
     let mut paths: Vec<PathBuf> = Vec::with_capacity(printed.len());
@@ -94,6 +96,7 @@ fn watched_of<P: AsRef<Path>, E: AsRef<str>>(
         whole.push(package_dir);
         whole.push(path);
         if seen.first(&paths, whole.as_path()) {
+            // clone: the result: a path met for the first time.
             paths.push(whole.clone());
         }
     }
@@ -102,6 +105,7 @@ fn watched_of<P: AsRef<Path>, E: AsRef<str>>(
     for name in names {
         let name = name.as_ref();
         if seen.first(&env, name) {
+            // alloc: the result: a name met for the first time.
             env.push(name.to_owned());
         }
     }

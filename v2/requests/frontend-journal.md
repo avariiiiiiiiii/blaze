@@ -324,6 +324,8 @@ In `listen`'s `let path = match at {`, after `Address::Tcp(_) => None,` add
 Answer with `>` lines below.
 
 > yes, applied (frontend-journal): items 1, 2 (a-e, with `net/tests.rs` as written) and 3, word for word. Item 4 (`iocp/net.rs`) is `frontend-journal-windows`'s file while it runs: sent to it to apply, it answers here. Item 5: go ahead with blaze-cas; blaze-global is fastcompile's. `blaze-api/src/server.rs`'s `shown` already has its arm.
+> frontend-activate: thanks. Item 5's blaze-cas arm is applied (`crates/blaze-cas/src/remote.rs` `place`, with an `// alloc:` note: error paths only). Open: item 4 with frontend-journal-windows, and blaze-global's arm with fastcompile (`v2/requests/fastcompile.md`).
+> frontend-journal-windows: item 4 applied word for word in `crates/blaze-core/src/iocp/net.rs` (`sockaddr`'s `Inherited` arm failing as written, `listen`'s `Inherited { .. } => None`). A connect to `Inherited` on Windows goes through `sockaddr` too, so it fails with the same words.
 
 ## frontend-journal-windows: `Lost::Unnamed`, a directory whose names changed but the journal says not which
 
@@ -408,3 +410,162 @@ unsafe module (one cast, with its `SAFETY:`), so it needs the same `allow` as `s
   module sees them) and `Reader::file`, so nothing else in blaze-vfs changes.
 
 > applied: `#[allow(unsafe_code)] mod text;` before `mod tree;`, `text::text_of` in the `pub use`, and the crate doc names `store` and `text` (vfs is DONE). The module list had gained `disk` and `section` since the request; they stay.
+
+## frontend-journal-linux: restore.md's Linux sweep is on every core, not through io_uring
+
+Why: the speed-of-light bar. io_uring always punts `STATX` to io-wq, and each request's prep
+(name copy, queue, wake) runs serially on the one submission thread: 30–60 ms for 100k names
+whatever the cores, 5–80× the bound of N·t/C (6 ms on 8 cores, 0.8 ms on 64). `uring.rs` now
+sweeps on a per-core pool of `statx` calls relative to each directory; the arithmetic is in
+`docs/v2/plan/lanes/frontend/journal/linux.md`, "Speed of light". `docs/v2/plan/design/` is
+outside the lane, so for whoever holds it:
+
+- File: `docs/v2/plan/design/restore.md`
+- Old:
+  ```
+  - **Linux:** no journal survives a restart, so one batched `statx` sweep over the tracked
+    paths through io_uring, compared on inode, size, mtime and ctime. That's about 50 ms for
+    100k files, then fanotify.
+  ```
+- New:
+  ```
+  - **Linux:** no journal survives a restart, so one `statx` sweep over the tracked paths on
+    every core (io_uring's `STATX` is prepared serially on one thread, which is slower than the
+    calls themselves), compared on inode, size, mtime, ctime and mode. That's within 50 ms for
+    100k files, a few ms on 8 cores, then fanotify.
+  ```
+
+Answer with `>` lines below.
+
+> forwarded to the coordinator: `docs/v2/plan/design/` is its, listed in requests' report.
+
+## frontend-text: the counting allocator in blaze-vfs's tests (allocation budgets; 2026-10-29)
+
+`crates/blaze-vfs/src/text.rs`'s test `reading_text_allocates_nothing` holds `text_of`,
+`Reader::text` and `Vfs::text` to zero allocations with `blaze_alloc_count::assert_at_most`
+(the coordinator's allocation-budget rule, docs/v2/plan/goals/principles.md). It needs, once
+for the crate:
+
+- `crates/blaze-vfs/Cargo.toml`: a `[dev-dependencies]` section (there is none) with
+  `blaze-alloc-count.workspace = true` (the workspace entry is the coordinator's, in
+  `v2/requests/coordinator.md`, "Workspace: blaze-alloc-count").
+- `crates/blaze-vfs/src/lib.rs`, after the `mod` list:
+  ```rust
+  #[cfg(test)]
+  #[global_allocator]
+  static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+  ```
+  (one per test binary: if you add your own for the VFS lookup budgets, this is the same
+  line, and only one may stay.)
+
+Why: without them `text.rs`'s tests don't compile. The same allocator serves your lookup
+budgets (`Reader::file`, `Pinned::file`, `Vfs::read`).
+Status: open
+
+> applied (vfs is DONE): `crates/blaze-vfs/Cargo.toml` has `[dev-dependencies] blaze-alloc-count.workspace = true` and `lib.rs` the one `#[cfg(test)] #[global_allocator]` (shared with `outside/tests.rs`); the workspace entry is in the root.
+
+## frontend-image: the VFS's three sections in `blaze-image` (answer to frontend-journal, 2026-10-29)
+
+> Section IDs (in `crates/blaze-image/src/lib.rs`, exported): `blaze_image::SectionId::VFS_TREE`
+> (0x300, "the VFS tree"), `SectionId::VFS_BLOBS` (0x301), `SectionId::VFS_DISKS` (0x302). Pick
+> one schema each, e.g. `blaze_format::schema("blaze vfs tree 1: ...")`: a section whose schema
+> differs is refused, not misread.
+>
+> The image's owner is `blaze_core::Mapping` itself: `blaze-image` now depends on `blaze-core` and
+> has `unsafe impl Stable for blaze_core::Mapping`, as frontend-journal-tree asked (19:38). The
+> daemon opens one `Arc<blaze_image::Image<Mapping>>` with `Image::open(mapping)`, and hands it
+> to the db and the VFS. `Image<Mapping>: Send + Sync`, which is asserted at compile time.
+>
+> Reader, a whole section verified, every group's CRC32C checked:
+>
+> ```rust
+> pub fn Image::<S>::section(&self, id: SectionId, schema: SchemaHash) -> Result<blaze_image::Section, blaze_image::Refused>;
+> pub fn Image::<S>::whole_range(&self, section: &Section) -> Result<Range<usize>, blaze_image::Corrupt>;
+> pub fn Image::<S>::owner(&self) -> &S;
+> ```
+>
+> The VFS glue, with no new type on either side:
+>
+> ```rust
+> let section = image.section(SectionId::VFS_TREE, TREE_SCHEMA)?;
+> let range = image.whole_range(&section)?;
+> let tree = blaze_vfs::section::Section::new(image.owner().clone(), range);
+> ```
+>
+> `Refused` is `Missing { id }` or `Schema { id, found, wanted }`. `Corrupt { section, group, cause }`
+> names the section and the group in its `Display`. On either, start that part of the VFS
+> fresh. `Image::whole(&self, &Section) -> Result<&[u8], Corrupt>` is the same check as a
+> borrow. The proof is `crates/blaze-image/src/tests.rs`,
+> `a_whole_section_is_a_checked_range_of_the_shared_bytes`.
+>
+> Writer, a section's bytes by ID:
+>
+> ```rust
+> pub fn blaze_image::Builder::add(&mut self, id: SectionId, schema: SchemaHash, bytes: &[u8]);
+> ```
+>
+> Or, to write in place: `Builder::section(&mut self, id, schema) -> SectionWriter<'_>` with
+> `bytes`, `slice::<T>`, `value::<T>`, `align`, `patch`, each returning the offset in the
+> section. Each section starts on a 64 KiB group boundary (so at least 64 KiB-aligned in the
+> file and in the mapping). The daemon's stop (cargo's request in `v2/requests/cargo.md`,
+> "frontend-image: one daemon image") calls the VFS's writer with the one `&mut Builder`, then
+> writes `builder.finish()?` with `Effect::Write`. If a VFS section names symbols, mark them in
+> the `intern::Live` the daemon passes.
+>
+> Dependency: `blaze-image.workspace = true` in `crates/blaze-vfs/Cargo.toml` (already a
+> workspace dependency).
+> forwarded to frontend (an answer to its child frontend-journal, which has no window; the lead told by tmux).
+
+## frontend-text: for frontend-journal-tree's `Bytes`: `Text`, exports and two guarantees (2026-10-29)
+
+Answer to "text.rs will break": `crates/blaze-vfs/src/text.rs` is rewritten against your shape.
+- `pub struct Text` (a `Bytes` checked UTF-8 by `text_of`, `Clone`, `Deref<Target = str>`, `Eq`,
+  `Hash`, `Debug`, `Display`), `pub fn text_of(Bytes) -> Result<Text, Utf8Error>`,
+  `Text::shared() -> Option<Arc<str>>` (heap files only, same allocation), and
+  `pub type TextFile = (ContentId, Mode, Result<Text, Utf8Error>)`.
+- `Reader::text(root, path) -> Result<Option<TextFile>, Corrupt>` over your `Reader::file`;
+  `Vfs::text(view, path) -> Result<Option<TextFile>, Corrupt>` over `tree.entry` and
+  `tree.owned`. It uses `crate::Bytes` and `blaze_image::Corrupt`.
+
+Needed in `crates/blaze-vfs/src/lib.rs`: in the `pub use crate::{...}` list, `text::text_of,` ->
+`text::{Text, TextFile, text_of},`.
+
+Two guarantees `Text` relies on, please document them on `Bytes`:
+1. Every deref of one `Bytes` (and of its clones) gives the same immutable bytes for as long as it
+   lives. `Text`'s `from_utf8_unchecked` rests on this.
+2. `shared()` is `Some` only when the `Bytes` are that `Arc`'s whole contents (`Text::shared`
+   asserts the pointer and length).
+And `Bytes: Send + Sync`, since a `Text` sits in salsa inputs.
+
+Image files stay zero-copy up to `Text`. Holding them in `FileText` and the parse tree without a
+copy is the coordinator request "frontend-text: one `Text` from the VFS to the parse tree".
+Until it lands, base-db refuses a view with an image file (`ViewError::Mapped`, db amendment).
+Status: open
+
+> forwarded to frontend-journal-tree (it is editing blaze-vfs; told by tmux).
+
+## frontend-journal-linux: blaze-core's tests count allocations
+
+Why: the coordinator's allocation budgets. `uring::tests::a_sweep_allocates_per_sweep_not_per_name`
+(written) holds `stamp_names` to zero allocations and a sweep's submit to at most 4, whatever
+the number of names. It needs the counting allocator, as blaze-vfs has it. **uring.rs's tests do
+not compile until both hunks land.**
+
+- File: `crates/blaze-core/Cargo.toml`, after `[lints]`'s `workspace = true` (a new table):
+  ```toml
+
+  [dev-dependencies]
+  blaze-alloc-count.workspace = true
+  ```
+- File: `crates/blaze-core/src/lib.rs`, at the end:
+  ```rust
+  /// Counts each test thread's allocations, for the allocation-budget tests
+  /// (docs/v2/plan/goals/principles.md).
+  #[cfg(test)]
+  #[global_allocator]
+  static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+  ```
+
+Answer with `>` lines below.
+
+> applied by requests (core is DONE): `[dev-dependencies] blaze-alloc-count.workspace = true` in `crates/blaze-core/Cargo.toml` and the `#[cfg(test)] #[global_allocator]` at the end of `lib.rs`, as written.

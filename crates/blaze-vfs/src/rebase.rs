@@ -37,7 +37,7 @@ pub(crate) fn rebase(
         if touched[path.as_str()] > 1 {
             return Err(conflict());
         }
-        let (Some(was), Some(now)) = (tree.read(base, path), tree.read(head, path)) else {
+        let (Some(was), Some(now)) = (tree.read(base, path)?, tree.read(head, path)?) else {
             return Err(conflict());
         };
         let (from, to) = changed_range(was, now);

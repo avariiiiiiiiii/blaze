@@ -28,7 +28,7 @@ use crate::{
 pub(super) const KEY_DOMAIN: &str = "blaze v2 dependency signature key 1";
 
 /// One record of the part: a signature query and the item it is asked of.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Item {
     Struct(StructId),
     Union(UnionId),

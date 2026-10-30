@@ -523,13 +523,183 @@ pub struct CompiledFunction {
     pub(super) code: Code,
     /// The body the function was compiled from and the statements of it that
     /// [`Code::lines`] index. Looked up when stitching, like a [`DataRequest::Location`].
-    pub(super) source: Option<(DefWithBodyId, Vec<MirSpan>)>,
+    pub(super) source: Option<Source>,
     /// The closure or `async` block of that body the code is of, when it is of one.
     pub(super) closure: Option<ExprId>,
     /// The named locals of the body a debugger can be told of, whose types are of `.0`.
     pub(super) variables: Option<(StoredParamEnvAndCrate, Vec<Variable>)>,
     /// Size and alignment of every type laid out, collected when `BLAZE_LAYOUTS` is set.
     pub(super) layouts: Vec<(String, u64, u64)>,
+}
+
+/// The body a function was compiled from, and where each statement its line rows index
+/// ([`LineRow::span`]) is written: in the body, or in a body the MIR optimizer inlined into it
+/// (`MirBody::inlined`), whose statements keep that body's spans.
+#[derive(PartialEq, Hash, Debug)]
+pub(super) struct Source {
+    pub(super) owner: DefWithBodyId,
+    /// Each statement as of the body: one of inlined code is at the call that the outermost
+    /// body inlined around it was inlined at, so what reads the body's scopes reads only its
+    /// own spans.
+    pub(super) spans: Vec<MirSpan>,
+    /// The statements of inlined code, by their index in `spans`, in its order.
+    pub(super) inlined: Vec<InlinedRow>,
+    /// rustc's inlined `SourceScope`s, as `Inlined::scopes` of the body.
+    pub(super) scopes: Vec<InlinedScope>,
+    /// The body each inlined callee (`Inlined::callees`) is written in, and its closure when
+    /// it is one; `None` for one that is no item's, whose code has no place in the source.
+    pub(super) callees: Vec<Option<(DefWithBodyId, Option<ExprId>)>>,
+}
+
+/// A statement of inlined code: `span` of the body of the callee of `scopes[scope]`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct InlinedRow {
+    pub(super) at: u32,
+    pub(super) scope: u32,
+    pub(super) span: MirSpan,
+}
+
+/// The code of `callees[callee]` inlined at `call_site` (rustc's `inlined_at`): a span of the
+/// body of the callee of `parent`, or of the function's own body without one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct InlinedScope {
+    pub(super) callee: u32,
+    pub(super) parent: Option<u32>,
+    pub(super) call_site: MirSpan,
+}
+
+/// Where a span is written: of the body of `owner`, of its closure `closure` when it is one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct Written {
+    pub(super) owner: DefWithBodyId,
+    pub(super) closure: Option<ExprId>,
+    pub(super) span: MirSpan,
+}
+
+impl Source {
+    /// The statements `spans` of `body` were built for, `spans` being as the IR builder
+    /// recorded them (`MirSpan::Inlined` for inlined code). A statement of inlined code whose
+    /// body or call has no place in the source is an error naming it.
+    pub(super) fn of(
+        db: &dyn HirDatabase,
+        owner: DefWithBodyId,
+        body: &hir_ty::mir::MirBody<'_>,
+        spans: Vec<MirSpan>,
+    ) -> std::result::Result<Source, String> {
+        let table = &body.inlined;
+        if !spans.iter().any(|it| matches!(it, MirSpan::Inlined(_))) {
+            return Source::resolved(owner, &table.spans, &table.scopes, Vec::new(), spans);
+        }
+        let callees = table
+            .callees
+            .iter()
+            .map(|callee| {
+                let closure = match callee.body {
+                    hir_ty::mir::InlinedBody::Fn(_) => None,
+                    hir_ty::mir::InlinedBody::Closure(closure) => Some(closure.loc(db).expr),
+                };
+                match hir_ty_mir::mir::owner_of(db, callee.body) {
+                    hir_ty::InferBodyId::DefWithBodyId(owner) => Some((owner, closure)),
+                    hir_ty::InferBodyId::AnonConstId(_) => None,
+                }
+            })
+            .collect();
+        Source::resolved(owner, &table.spans, &table.scopes, callees, spans)
+            .map_err(|what| format!("{what} ({:?})", table.callees))
+    }
+
+    /// [`Source::of`] over the tables of `MirBody::inlined`, with where each callee is
+    /// written.
+    pub(super) fn resolved(
+        owner: DefWithBodyId,
+        table_spans: &[hir_ty::mir::InlinedSpan],
+        table_scopes: &[hir_ty::mir::InlinedScope],
+        callees: Vec<Option<(DefWithBodyId, Option<ExprId>)>>,
+        mut spans: Vec<MirSpan>,
+    ) -> std::result::Result<Source, String> {
+        let mut source =
+            Source { owner, spans: Vec::new(), inlined: Vec::new(), scopes: Vec::new(), callees };
+        if !spans.iter().any(|it| matches!(it, MirSpan::Inlined(_))) {
+            source.spans = spans;
+            return Ok(source);
+        }
+        source.scopes = table_scopes
+            .iter()
+            .map(|scope| {
+                let (parent, call_site) = match scope.call_site {
+                    MirSpan::Inlined(at) => {
+                        let at = table_spans[at as usize];
+                        (Some(at.scope), at.span)
+                    }
+                    span => (None, span),
+                };
+                InlinedScope { callee: scope.callee, parent, call_site }
+            })
+            .collect();
+        for (at, span) in spans.iter_mut().enumerate() {
+            let MirSpan::Inlined(n) = *span else { continue };
+            let inlined = table_spans[n as usize];
+            source.inlined.push(InlinedRow { at: at as u32, scope: inlined.scope, span: inlined.span });
+            let mut scope = inlined.scope;
+            // Each scope's parent was made before it, so the chain ends within as many steps.
+            for _ in 0..=source.scopes.len() {
+                let InlinedScope { callee, parent, call_site } = source.scopes[scope as usize];
+                if source.callees.get(callee as usize).copied().flatten().is_none() {
+                    return Err(format!(
+                        "statement {at} is of inlined callee {callee}, inlined at \
+                         {call_site:?}, which is of no item's body: its lines have no place in \
+                         the source"
+                    ));
+                }
+                match parent {
+                    Some(parent) => scope = parent,
+                    None => {
+                        *span = call_site;
+                        break;
+                    }
+                }
+            }
+            if matches!(span, MirSpan::Inlined(_)) {
+                return Err(format!("statement {at} is of an inlined scope that is its own parent"));
+            }
+        }
+        source.spans = spans;
+        Ok(source)
+    }
+
+    /// Where statement `at` is written; `closure` is the function's own closure, when it is
+    /// one. `None` for no statement.
+    pub(super) fn written(&self, at: u32, closure: Option<ExprId>) -> Option<Written> {
+        if let Ok(found) = self.inlined.binary_search_by_key(&at, |it| it.at) {
+            let row = self.inlined[found];
+            return self.of_scope(row.scope, row.span);
+        }
+        Some(Written { owner: self.owner, closure, span: *self.spans.get(at as usize)? })
+    }
+
+    /// Where `scope` is inlined at: a span of its parent's callee, or of the function's own
+    /// body (of its closure `closure`). `None` where the parent's callee is no item's, which
+    /// [`Source::of`] refused for every scope a statement is of.
+    pub(super) fn call_site(&self, scope: u32, closure: Option<ExprId>) -> Option<Written> {
+        let InlinedScope { parent, call_site, .. } = *self.scopes.get(scope as usize)?;
+        match parent {
+            Some(parent) => self.of_scope(parent, call_site),
+            None => Some(Written { owner: self.owner, closure, span: call_site }),
+        }
+    }
+
+    /// The innermost inlined scope statement `at` is of, `None` for the body's own code.
+    pub(super) fn scope_of(&self, at: u32) -> Option<u32> {
+        let found = self.inlined.binary_search_by_key(&at, |it| it.at).ok()?;
+        Some(self.inlined[found].scope)
+    }
+
+    /// `span` of the body of the callee of `scope`.
+    fn of_scope(&self, scope: u32, span: MirSpan) -> Option<Written> {
+        let callee = self.scopes.get(scope as usize)?.callee;
+        let (owner, closure) = (*self.callees.get(callee as usize)?)?;
+        Some(Written { owner, closure, span })
+    }
 }
 
 /// A local written with a name that is kept in one slot of the frame for as long as the

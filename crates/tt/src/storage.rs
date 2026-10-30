@@ -16,7 +16,7 @@
 //! the columns are a function of the token trees alone: two trees are equal, and hash equal,
 //! exactly when their token trees are, whichever builder calls made them.
 
-use std::{assert_matches, cell::Cell, sync::LazyLock};
+use std::{cell::Cell, sync::LazyLock};
 
 use intern::Symbol;
 use rustc_hash::FxHashMap;
@@ -230,6 +230,7 @@ const SCAN: usize = 8;
 
 impl<T: Copy + Eq + std::hash::Hash> Table<T> {
     fn new() -> Self {
+        // alloc: the tree's parts column, allocated at its first part.
         Table { list: Vec::new(), map: FxHashMap::default() }
     }
 
@@ -293,6 +294,7 @@ impl Encoder {
         Encoder {
             parts: Table::new(),
             last_part: None,
+            // alloc: the tree's wide spans, allocated only for one too wide to pack.
             wide: Vec::new(),
             symbols: Symbols { list: Vec::with_capacity(symbols) },
         }
@@ -411,12 +413,20 @@ impl TopSubtree {
         self.top_close = span.close;
     }
 
-    /// **Warning**: This is very expensive, this rebuilds the whole tree. Avoid using this if you can.
+    /// Puts `leaf` in place of the leaf at `idx` (the top subtree being 0). Rebuilds the tree,
+    /// in one pass with no buffer but its own: avoid it in a loop.
     pub fn set_token(&mut self, idx: usize, leaf: Leaf) {
-        let mut tts = self.as_token_trees().iter_flat_tokens().collect::<Vec<_>>();
-        assert_matches!(tts[idx], TokenTree::Leaf(_), "cannot change a subtree to a leaf");
-        tts[idx] = leaf.into();
-        *self = TopSubtree::from_serialized(tts);
+        assert!(idx > 0 && !self.is_subtree(idx as u32), "cannot change a subtree to a leaf");
+        let mut builder =
+            TopSubtreeBuilder::with_capacity(self.top_subtree().delimiter, self.nodes.len() - 1);
+        let mut leaf = Some(leaf);
+        for (at, tt) in (1..).zip(self.token_trees().iter_flat_tokens()) {
+            match at == idx {
+                true => builder.push(leaf.take().expect("one token tree is at `idx`")),
+                false => builder.push_token_tree(tt),
+            }
+        }
+        *self = builder.build();
     }
 
     pub fn token_trees(&self) -> TokenTreesView<'_> {
@@ -436,7 +446,7 @@ impl TopSubtree {
         // Two parts made one would leave the table with a part twice, which a tree built from
         // the same token trees doesn't have.
         if has_duplicates(&self.parts) {
-            *self = TopSubtree::from_serialized(self.as_token_trees().iter_flat_tokens().collect());
+            *self = TopSubtree::from_token_trees(self.top_subtree().delimiter, self.token_trees());
         }
     }
 
@@ -546,8 +556,10 @@ impl TopSubtree {
 }
 
 thread_local! {
-    /// The subtrees a [`TopSubtree::for_each_token`] walk is in, kept for the next walk.
-    static OPEN: Cell<Vec<u32>> = const { Cell::new(Vec::new()) };
+    /// The subtrees a [`TopSubtree::for_each_token`] walk is in, each as the index of the node
+    /// after it and its own, kept for the next walk.
+    // alloc: one buffer per thread, grown to the deepest nesting walked.
+    static OPEN: Cell<Vec<(u32, u32)>> = const { Cell::new(Vec::new()) };
 }
 
 impl TopSubtree {
@@ -559,15 +571,6 @@ impl TopSubtree {
             len_part => len_part >> 16,
         };
         self.parts[part as usize].ctx
-    }
-
-    /// The context of a leaf's span, or of a subtree's opening one.
-    #[inline]
-    fn first_ctx_at(&self, at: u32) -> SyntaxContext {
-        match at {
-            0 => self.top_open.ctx,
-            _ => self.ctx_of(self.spans[at as usize]),
-        }
     }
 
     /// The context of the closing span of the subtree at `at`.
@@ -601,18 +604,26 @@ impl TopSubtree {
         use crate::FlatToken;
         let mut open = OPEN.take();
         open.clear();
-        for at in start..end {
-            while let Some(&subtree) = open.last()
-                && subtree + 1 + self.nodes[subtree as usize].data == at
+        let mut from = start as usize;
+        if start == 0 && end > 0 {
+            let top = self.nodes[0];
+            open.push((1 + top.data, 0));
+            f(FlatToken::Open(top.delimiter_kind()), self.top_open.ctx);
+            from = 1;
+        }
+        let end = end as usize;
+        let columns = self.nodes[from..end].iter().zip(&self.spans[from..end]);
+        for (at, (&node, &span)) in (from as u32..).zip(columns) {
+            while let Some(&(after, subtree)) = open.last()
+                && after == at
             {
                 open.pop();
                 let (close, ctx) = self.close_token(subtree);
                 f(close, ctx);
             }
-            let node = self.nodes[at as usize];
             let token = match node.tag() {
                 SUBTREE => {
-                    open.push(at);
+                    open.push((at + 1 + node.data, at));
                     FlatToken::Open(node.delimiter_kind())
                 }
                 PUNCT => FlatToken::Punct {
@@ -628,9 +639,9 @@ impl TopSubtree {
                     suffix_len: node.suffix_len(),
                 },
             };
-            f(token, self.first_ctx_at(at));
+            f(token, self.ctx_of(span));
         }
-        while let Some(subtree) = open.pop() {
+        while let Some((_, subtree)) = open.pop() {
             let (close, ctx) = self.close_token(subtree);
             f(close, ctx);
         }
@@ -684,7 +695,7 @@ impl Scratch {
 }
 
 /// Records token trees as they come; [`Self::build`] packs them into a [`TopSubtree`] in one pass.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TopSubtreeBuilder {
     /// The token trees, the top subtree first. An ident's or literal's `data` is its symbol's
     /// index in `symbols`; a subtree's ordinal is its closing span's index in `closes`.
@@ -852,6 +863,7 @@ impl TopSubtreeBuilder {
         let len = nodes.len() - first + 1;
         let subtrees = nodes[first..].iter().filter(|it| it.tag() == SUBTREE).count();
         let mut out_nodes = Vec::with_capacity(len);
+        // alloc: the tree's span column, its exact size.
         let mut out_spans = vec![PackedSpan::UNUSED; len + subtrees];
         let mut encoder = Encoder::new(symbols.len().min(len));
         out_nodes.push(Node::subtree(top.kind, 0, (len - 1) as u32));

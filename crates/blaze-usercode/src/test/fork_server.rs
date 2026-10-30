@@ -7,8 +7,8 @@
 // `::std` and `::core`.
 //
 // What happens once per binary happens before the first test: the names of the hello, the
-// child-exit queue, the slot count. A test costs one socket pair, one mapping (with slots),
-// one fork and one frame; the buffers of the loop are kept across tests.
+// child-exit queue, the slot count. A test costs one socket pair, one fork and one frame; the
+// buffers of the loop and the execution records (with slots) are kept across tests.
 
 /// Serves `tests` to blaze over the socket at `socket` (the value of [`SOCKET`]), then exits:
 /// what the harness's `main` calls when the variable is set.
@@ -112,7 +112,7 @@ mod unix {
             // A wrong number would run another syscall, which is why `PIDFD_OPEN` is pinned.
             let fd = unsafe { syscall(PIDFD_OPEN, pid as ::core::ffi::c_long, 0 as ::core::ffi::c_long) };
             if fd < 0 {
-                return Err(format!("pidfd_open: {}", ::std::io::Error::last_os_error()));
+                return Err(format!("pidfd_open: {}", ::std::io::Error::last_os_error())); // alloc: error path
             }
             // SAFETY: `fd` is >= 0, so `pidfd_open` just made it, and no other owner of it
             // exists; were there one, the two would close it twice.
@@ -165,7 +165,7 @@ mod unix {
             // SAFETY: `kqueue` takes no arguments and touches no memory of ours.
             let fd = unsafe { kqueue() };
             if fd < 0 {
-                return Err(format!("kqueue: {}", ::std::io::Error::last_os_error()));
+                return Err(format!("kqueue: {}", ::std::io::Error::last_os_error())); // alloc: error path
             }
             // SAFETY: `fd` is >= 0, so `kqueue` just made it, and no other owner of it
             // exists; were there one, the two would close it twice.
@@ -193,7 +193,7 @@ mod unix {
                 if error.raw_os_error() == Some(ESRCH) {
                     return Ok((None, true));
                 }
-                return Err(format!("kevent: {}", error));
+                return Err(format!("kevent: {}", error)); // alloc: error path
             }
             Ok((None, false))
         }
@@ -231,11 +231,11 @@ mod unix {
         use super::{Int, OwnedFd};
 
         pub fn queue() -> Result<Option<OwnedFd>, String> {
-            Err("blaze's fork server waits on a pidfd (Linux) or a kqueue (Apple), and this system has neither it knows; the package must run its tests as libtest's threads".to_owned())
+            Err("blaze's fork server waits on a pidfd (Linux) or a kqueue (Apple), and this system has neither it knows; the package must run its tests as libtest's threads".to_owned()) // alloc: error path
         }
 
         pub fn watch(_queue: &Option<OwnedFd>, _pid: Int) -> Result<(Option<OwnedFd>, bool), String> {
-            Err("no way to wait on a child here".to_owned())
+            Err("no way to wait on a child here".to_owned()) // alloc: error path
         }
 
         pub fn clear(_queue: &Option<OwnedFd>) {}
@@ -250,24 +250,24 @@ mod unix {
             ::std::env::remove_var(SOCKET);
         }
         let queue = exits::queue()?;
-        let exec = Exec::open();
+        let mut exec = Exec::open();
         // A child ended before its end could be watched: the next poll doesn't wait.
         let mut now = false;
         let mut stream = connect(socket)?;
-        let names: Vec<String> = tests.iter().map(|it| it.desc.name.as_slice().to_owned()).collect();
+        let names: Vec<String> = tests.iter().map(|it| it.desc.name.as_slice().to_owned()).collect(); // alloc: setup, once per server
         send(&mut stream, &Frame::Hello { version: VERSION, pid: ::std::process::id(), tests: names })?;
         let mut frames = Frames::new();
-        let mut children: Vec<Child> = Vec::new();
+        let mut children: Vec<Child> = Vec::new(); // alloc: empty, allocates nothing
         let mut quitting = false;
-        let mut buffer = vec![0u8; 1 << 16];
+        let mut buffer = vec![0u8; 1 << 16]; // alloc: setup, once per server
         // Kept across turns of the loop, so a turn allocates nothing: what is polled, which
         // children's outputs those are, the frames to send (one write a turn), the output
         // buffers of children that ended, for the next ones, and the hits of the last.
-        let mut watched: Vec<usize> = Vec::new();
-        let mut fds: Vec<PollFd> = Vec::new();
-        let mut out: Vec<u8> = Vec::new();
-        let mut spare: Vec<Vec<u8>> = Vec::new();
-        let mut hits: Vec<u8> = Vec::new();
+        let mut watched: Vec<usize> = Vec::new(); // alloc: empty, allocates nothing
+        let mut fds: Vec<PollFd> = Vec::new(); // alloc: empty, allocates nothing
+        let mut out: Vec<u8> = Vec::new(); // alloc: empty, allocates nothing
+        let mut spare: Vec<Vec<u8>> = Vec::new(); // alloc: empty, allocates nothing
+        let mut hits: Vec<u8> = Vec::new(); // alloc: empty, allocates nothing
         loop {
             if quitting && children.is_empty() {
                 return Ok(());
@@ -297,7 +297,7 @@ mod unix {
                     continue;
                 }
                 kill_all(&mut children);
-                return Err(format!("poll: {}", error));
+                return Err(format!("poll: {}", error)); // alloc: error path
             }
             if fds[0].revents != 0 {
                 match stream.read(&mut buffer) {
@@ -310,7 +310,7 @@ mod unix {
                     Err(ref error) if error.kind() == ::std::io::ErrorKind::Interrupted => {}
                     Err(error) => {
                         kill_all(&mut children);
-                        return Err(format!("reading the socket: {}", error));
+                        return Err(format!("reading the socket: {}", error)); // alloc: error path
                     }
                 }
                 loop {
@@ -323,7 +323,7 @@ mod unix {
                         }
                     };
                     match frame {
-                        View::Run { id, index } => match start(tests, &exec, id, index, &stream, &children, spare.pop().unwrap_or_default()) {
+                        View::Run { id, index } => match start(tests, &mut exec, id, index, &stream, &children, spare.pop().unwrap_or_default()) {
                             Ok(mut child) => {
                                 match exits::watch(&queue, child.pid) {
                                     Ok((exit, ended)) => {
@@ -348,7 +348,7 @@ mod unix {
                         View::Quit => quitting = true,
                         other => {
                             kill_all(&mut children);
-                            return Err(format!("blaze sent {:?}, which only a server sends", other));
+                            return Err(format!("blaze sent {:?}, which only a server sends", other)); // alloc: error path
                         }
                     }
                 }
@@ -376,8 +376,8 @@ mod unix {
                 // left behind that writes later is not waited for.
                 drain(&mut child);
                 if child.cut {
-                    let note = format!("\n[blaze: the output was cut at {} bytes]\n", LONGEST_OUTPUT);
-                    child.bytes.extend_from_slice(note.as_bytes());
+                    // Written into the output's own buffer: a `Vec` takes it whole.
+                    let _ = write!(child.bytes, "\n[blaze: the output was cut at {} bytes]\n", LONGEST_OUTPUT);
                 }
                 let end = end_of(status);
                 let read = child.region.read(&end, &mut hits);
@@ -386,6 +386,7 @@ mod unix {
                     Err(why) => ExecView::Not(&**why),
                 };
                 encode_ended(&mut out, child.id, end.view(), &child.bytes, executed);
+                exec.give(child.region, &hits, read.is_ok());
                 // A buffer that held a long output is let go rather than kept at that size.
                 if child.bytes.capacity() <= KEPT {
                     child.bytes.clear();
@@ -396,7 +397,7 @@ mod unix {
             if !out.is_empty() {
                 if let Err(error) = stream.write_all(&out) {
                     kill_all(&mut children);
-                    return Err(format!("writing to the socket: {}", error));
+                    return Err(format!("writing to the socket: {}", error)); // alloc: error path
                 }
                 out.clear();
                 if out.capacity() > KEPT {
@@ -423,18 +424,18 @@ mod unix {
                     tries += 1;
                     ::std::thread::sleep(::std::time::Duration::from_millis(25));
                 }
-                Err(error) => return Err(format!("connecting to {:?}: {}", socket, error)),
+                Err(error) => return Err(format!("connecting to {:?}: {}", socket, error)), // alloc: error path
             }
         }
     }
 
     fn send(stream: &mut UnixStream, frame: &Frame) -> Result<(), String> {
-        stream.write_all(&frame.to_bytes()).map_err(|error| format!("writing to the socket: {}", error))
+        stream.write_all(&frame.to_bytes()).map_err(|error| format!("writing to the socket: {}", error)) // alloc: the hello, once per server
     }
 
     fn start(
         tests: &'static [&'static test::TestDescAndFn],
-        exec: &Exec,
+        exec: &mut Exec,
         id: u64,
         index: u32,
         stream: &UnixStream,
@@ -443,19 +444,19 @@ mod unix {
     ) -> Result<Child, String> {
         let test: &'static test::TestDescAndFn = match tests.get(index as usize) {
             Some(test) => *test,
-            None => return Err(format!("the binary has {} tests, and no test {}", tests.len(), index)),
+            None => return Err(format!("the binary has {} tests, and no test {}", tests.len(), index)), // alloc: error path
         };
         let (ours, theirs) =
-            UnixStream::pair().map_err(|error| format!("a socket pair for the test's output: {}", error))?;
-        // Mapped before the fork, so the child shares it; unmapped by its drop when the fork
-        // fails or the server is done reading it.
+            UnixStream::pair().map_err(|error| format!("a socket pair for the test's output: {}", error))?; // alloc: error path
+        // Mapped before the fork, so the child shares it; given back once the server has read
+        // it, unmapped by its drop when the fork fails.
         let region = exec.map()?;
         // SAFETY: the server has one thread (see `serve`), so the child is a whole copy of it
         // and no lock is left held by a thread that isn't there. The child only closes and
         // copies descriptors, arms its record, then runs the test and leaves by `_exit`.
         let pid = unsafe { fork() };
         if pid < 0 {
-            return Err(format!("fork: {}", ::std::io::Error::last_os_error()));
+            return Err(format!("fork: {}", ::std::io::Error::last_os_error())); // alloc: error path
         }
         if pid == 0 {
             // The child closes the server's descriptors under the owners that hold them: it
@@ -501,7 +502,7 @@ mod unix {
         // just forked, not yet reaped, so it can't name another process.
         unsafe { setpgid(pid, pid) };
         drop(theirs);
-        ours.set_nonblocking(true).map_err(|error| format!("the test's output socket: {}", error))?;
+        ours.set_nonblocking(true).map_err(|error| format!("the test's output socket: {}", error))?; // alloc: error path
         Ok(Child { id: id, pid: pid, output: ours, bytes: bytes, cut: false, open: true, status: None, exit: None, region: region })
     }
 
@@ -674,16 +675,16 @@ mod unix {
         };
         if cfg!(panic = "abort") {
             // No unwinding to catch: the first panic is judged where it happens.
-            let judged = panics.clone();
+            let judged = panics.clone(); // clone: in the test's child, after its fork: libtest's own hook and thread, nothing of the server's
             let default = ::std::panic::take_hook();
-            ::std::panic::set_hook(Box::new(move |info| {
+            ::std::panic::set_hook(Box::new(move |info| { // alloc: in the test's child, after its fork: libtest's own hook and thread, nothing of the server's
                 default(info);
                 let code = judge(Ran::Panicked(payload_str(info.payload())), &judged);
                 let _ = ::std::io::stderr().flush();
                 exit_now(code);
             }));
         }
-        let thread = ::std::thread::Builder::new().name(name.to_owned()).spawn(move || match body {
+        let thread = ::std::thread::Builder::new().name(name.to_owned()).spawn(move || match body { // alloc: in the test's child, after its fork: libtest's own hook and thread, nothing of the server's
             Body::Test(f) => f(),
             Body::Bench(f) => test::bench::run_once(f),
         });

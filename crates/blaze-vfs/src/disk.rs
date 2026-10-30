@@ -9,6 +9,7 @@
 //! and the next image merges both into one sorted column again.
 
 use blaze_core::{Cursor, FileName, Names, Stamp};
+use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
 
 use crate::section::Section;
@@ -61,6 +62,9 @@ impl Base {
 pub(crate) struct Disk {
     pub(crate) dir: FileName,
     pub(crate) cursor: Cursor,
+    /// The head's root when the column last held all of it: a rescan takes from the head only
+    /// what changed since (its diff), not every file. `None`: the head is looked at whole.
+    pub(crate) root: Option<ContentId>,
     base: Option<Base>,
     /// Paths changed since `base`, by name under the driver's root: [`Stamp::GONE`] for one gone.
     over: FxHashMap<Box<str>, Stamp>,
@@ -68,7 +72,7 @@ pub(crate) struct Disk {
 
 impl Disk {
     pub(crate) fn new(dir: FileName) -> Disk {
-        Disk { dir, cursor: Cursor::None, base: None, over: FxHashMap::default() }
+        Disk { dir, cursor: Cursor::None, root: None, base: None, over: FxHashMap::default() }
     }
 
     /// What `name` was when last seen; `None` for a name not seen or gone.
@@ -146,12 +150,50 @@ impl Disk {
         }
     }
 
-    /// Every name seen at or under `name` into `names`, and its stamp into `stamps`.
+    /// Calls `f` with every name seen directly in `dir` and its stamp, in no set order. The
+    /// column's subtree of each child is skipped by a search, not walked.
+    pub(crate) fn children(&self, dir: &str, mut f: impl FnMut(&str, Stamp)) {
+        let direct = |it: &str| {
+            it.strip_prefix(dir)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+        };
+        for (it, stamp) in &self.over {
+            if direct(it) && !stamp.is_gone() {
+                f(it, *stamp);
+            }
+        }
+        let Some(base) = &self.base else { return };
+        let prefix = format!("{dir}/");
+        let mut skip = String::with_capacity(prefix.len() + 32);
+        let mut at = base.find(&prefix).unwrap_or_else(|it| it);
+        while at < base.count {
+            let it = base.name(at);
+            let Some(rest) = it.strip_prefix(prefix.as_str()) else { break };
+            match rest.find('/') {
+                None => {
+                    if !self.over.contains_key(it) {
+                        f(it, base.stamp(at));
+                    }
+                    at += 1;
+                }
+                // Everything under `prefix + child + "/"` sorts before `prefix + child + "0"`.
+                Some(slash) => {
+                    skip.clear();
+                    skip.push_str(&it[..prefix.len() + slash]);
+                    skip.push('0');
+                    at = base.find(&skip).unwrap_or_else(|it| it);
+                }
+            }
+        }
+    }
+
+    /// Every name seen at or under `name` into `names`, in name order, and its stamp into
+    /// `stamps`. Every name the column holds was checked as it was opened or set.
     pub(crate) fn sweep(&self, name: &str, names: &mut Names, stamps: &mut Vec<Stamp>) {
         self.under(name, |it, stamp| {
-            if names.push_str(it) {
-                stamps.push(stamp);
-            }
+            names.push_checked(it);
+            stamps.push(stamp);
         });
     }
 }
@@ -182,8 +224,8 @@ impl Disks {
     }
 
     /// The image's bytes of every disk: `MAGIC`, a count, then per disk (heads in name order)
-    /// its head, its directory, its cursor, its count of names, its names' length, each name's
-    /// end, each stamp, the names.
+    /// its head, its directory, its cursor, its root (a byte saying whether, then 32), its count
+    /// of names, its names' length, each name's end, each stamp, the names.
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&MAGIC);
         let mut heads: Vec<&Box<str>> = self.by_head.keys().collect();
@@ -195,6 +237,8 @@ impl Disks {
             put(out, head.as_bytes());
             put(out, disk.dir.as_str().as_bytes());
             disk.cursor.encode(out);
+            out.push(u8::from(disk.root.is_some()));
+            out.extend_from_slice(&disk.root.unwrap_or_default().0);
             (ends.clear(), stamps.clear(), names.clear());
             let mut count = 0u32;
             disk.under(disk.dir.as_str(), |name, stamp| {
@@ -237,6 +281,12 @@ impl Disks {
             let dir = FileName::new(text(&mut at)?).ok_or_else(|| bad("a directory that is no name"))?;
             let cursor = bytes.get(at..).and_then(Cursor::decode).ok_or_else(|| bad("a bad cursor"))?;
             at += Cursor::BYTES;
+            let root = match bytes.get(at..at + 33).ok_or_else(|| bad("cut short"))? {
+                [0, ..] => None,
+                [1, id @ ..] => Some(ContentId(id.try_into().expect("32 bytes"))),
+                _ => return Err(bad("a bad root")),
+            };
+            at += 33;
             let count = word(&mut at)?;
             let names_len = word(&mut at)?;
             let (ends, stamps) = (at, at + count * 4);
@@ -262,7 +312,7 @@ impl Disks {
                 last = stop;
             }
             at = end;
-            let disk = Disk { dir, cursor, base: Some(base), over: FxHashMap::default() };
+            let disk = Disk { dir, cursor, root, base: Some(base), over: FxHashMap::default() };
             disks.by_head.insert(head.into(), disk);
         }
         Ok(disks)
@@ -300,12 +350,16 @@ mod tests {
         let mut disks = Disks::default();
         let disk = disks.of("main", &name("w"));
         disk.cursor = Cursor::Sim { journal: 1, next: 9 };
+        disk.root = Some(ContentId([7; 32]));
         for (n, it) in ["w/a", "w/a/x.rs", "w/a-b", "w/b.rs", "w/z/y"].into_iter().enumerate() {
             disk.set(it, stamp(n as u64 + 1));
         }
+        disks.of("other", &name("o")).set("o/f", stamp(9));
         let mut disks = reopen(&disks);
+        assert_eq!(disks.by_head["other"].root, None);
         let disk = disks.by_head.get_mut("main").unwrap();
         assert_eq!(disk.cursor, Cursor::Sim { journal: 1, next: 9 });
+        assert_eq!(disk.root, Some(ContentId([7; 32])));
         assert_eq!(disk.get("w/b.rs"), Some(stamp(4)));
         assert_eq!(all(disk, "w/a"), [("w/a".into(), 1), ("w/a/x.rs".into(), 2)]);
         disk.set("w/a/n.rs", stamp(7));
@@ -317,6 +371,41 @@ mod tests {
         assert_eq!(names, want.map(|(it, n)| (it.to_owned(), n)));
         let disks = reopen(&disks);
         assert_eq!(all(&disks.by_head["main"], "w"), want.map(|(it, n)| (it.to_owned(), n)));
+    }
+
+    #[test]
+    fn children_are_the_names_directly_in_a_directory() {
+        let mut disks = Disks::default();
+        let disk = disks.of("main", &name("w"));
+        let names = ["w/a", "w/a/x/deep.rs", "w/a/y.rs", "w/a-b", "w/a.c", "w/a0", "w/b/c", "w/z"];
+        for (n, it) in names.into_iter().enumerate() {
+            disk.set(it, stamp(n as u64 + 1));
+        }
+        let children = |disk: &Disk, dir: &str| {
+            let mut out = Vec::new();
+            disk.children(dir, |it, stamp| out.push((it.to_owned(), stamp.ino)));
+            out.sort_unstable();
+            out
+        };
+        let want = |names: &[(&str, u64)]| -> Vec<(String, u64)> {
+            names.iter().map(|&(it, n)| (it.to_owned(), n)).collect()
+        };
+        let reopened = reopen(&disks);
+        for disk in [&disks.by_head["main"], &reopened.by_head["main"]] {
+            assert_eq!(children(disk, "w/a"), want(&[("w/a/y.rs", 3)]));
+            assert_eq!(
+                children(disk, "w"),
+                want(&[("w/a", 1), ("w/a-b", 4), ("w/a.c", 5), ("w/a0", 6), ("w/z", 8)])
+            );
+        }
+        // What changed since the column is merged: a new name, and one gone.
+        let mut disk = reopen(&disks).by_head.remove("main").unwrap();
+        disk.set("w/new", stamp(9));
+        disk.remove_under("w/a0");
+        assert_eq!(
+            children(&disk, "w"),
+            want(&[("w/a", 1), ("w/a-b", 4), ("w/a.c", 5), ("w/new", 9), ("w/z", 8)])
+        );
     }
 
     #[test]

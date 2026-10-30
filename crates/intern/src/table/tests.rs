@@ -62,7 +62,7 @@ fn image_of(section: &[u8]) -> &'static Image<Vec<u8>> {
 
 fn reopen(table: &Table, live: &Live) -> Result<Table, RestoreError> {
     let image = image_of(&section_bytes(table, live));
-    Table::restore(shape(), image, &image.section(ID, SCHEMA).unwrap())
+    Table::restore(shape(), image, &image.section(ID, SCHEMA).unwrap(), &serial)
 }
 
 fn everything(table: &Table) -> Live {
@@ -241,7 +241,7 @@ fn a_corrupt_table_is_dropped_whole() {
     // The last byte of the section's values, far from its root.
     file[(section.at + section.len - 1) as usize] ^= 0x20;
     let image: &'static Image<Vec<u8>> = Box::leak(Box::new(Image::open(file).unwrap()));
-    match Table::restore(shape(), image, &section) {
+    match Table::restore(shape(), image, &section, &serial) {
         Err(RestoreError::Corrupt(corrupt)) => assert_eq!(corrupt.section, ID),
         other => panic!("expected a corrupt section, got {:?}", other.map(|_| ())),
     }
@@ -252,7 +252,7 @@ fn another_shape_is_refused() {
     let section = section_bytes(&Table::new(shape()), &Live::new());
     let image = image_of(&section);
     let other = Shape { statics: 2, ..shape() };
-    let refused = Table::restore(other, image, &image.section(ID, SCHEMA).unwrap());
+    let refused = Table::restore(other, image, &image.section(ID, SCHEMA).unwrap(), &serial);
     assert!(matches!(refused, Err(RestoreError::Invalid { section: ID, .. })));
 }
 
@@ -279,7 +279,7 @@ fn a_restore_never_accepts_a_table_it_cannot_read() {
             bytes[at] ^= 1 << rng.below(8);
         }
         let image = image_of(&bytes);
-        match Table::restore(shape(), image, &image.section(ID, SCHEMA).unwrap()) {
+        match Table::restore(shape(), image, &image.section(ID, SCHEMA).unwrap(), &serial) {
             Ok(restored) => {
                 accepted += 1;
                 for id in 0..restored.end() + 2 {
@@ -334,4 +334,47 @@ fn value_hash_is_deterministic_and_spreads() {
     assert!(starts.iter().all(|&n| n < 60), "{:?}", starts.iter().max());
     assert_ne!(value_hash(b""), value_hash(b"\0"));
     assert_ne!(value_hash(b"ab"), value_hash(b"ba"));
+}
+
+/// Four workers taking every fourth job, in no fixed order.
+fn four_threads(n: usize, job: &(dyn Fn(usize) + Sync)) {
+    std::thread::scope(|scope| {
+        for worker in 0..4 {
+            scope.spawn(move || (worker..n).rev().step_by(4).for_each(job));
+        }
+    });
+}
+
+/// A restore split across workers gives the table and the error one core gives: the first
+/// corrupt group, wherever the workers were.
+#[test]
+fn a_parallel_restore_is_the_serial_one() {
+    let table = Table::new(shape());
+    (0..200_000u32).for_each(|n| _ = table.intern(format!("symbol number {n}").as_bytes()));
+    let mut builder = Builder::new();
+    table.write(&everything(&table), &mut builder.section(ID, SCHEMA));
+    let file = builder.finish().unwrap();
+    let image: &'static Image<Vec<u8>> = Box::leak(Box::new(Image::open(file.clone()).unwrap()));
+    let section = image.section(ID, SCHEMA).unwrap();
+    assert!(section.groups as usize > 4 * CHUNK_GROUPS, "{} groups", section.groups);
+    let parallel = Table::restore(shape(), image, &section, &four_threads).unwrap();
+    for id in (parallel.first..parallel.end()).step_by(997) {
+        assert_eq!(parallel.get(id), table.get(id));
+    }
+
+    let mut corrupt = file;
+    let group_len = image.group_len() as usize;
+    for group in [3, section.groups as usize - 2] {
+        corrupt[section.at as usize + group * group_len + 17] ^= 0x40;
+    }
+    let serial_error = {
+        let image: &'static Image<Vec<u8>> = Box::leak(Box::new(Image::open(corrupt.clone()).unwrap()));
+        Table::restore(shape(), image, &section, &serial).err().unwrap()
+    };
+    for _ in 0..8 {
+        let image: &'static Image<Vec<u8>> = Box::leak(Box::new(Image::open(corrupt.clone()).unwrap()));
+        let error = Table::restore(shape(), image, &section, &four_threads).err().unwrap();
+        assert_eq!(error, serial_error);
+    }
+    assert!(matches!(serial_error, RestoreError::Corrupt(Corrupt { group: 3, .. })), "{serial_error}");
 }

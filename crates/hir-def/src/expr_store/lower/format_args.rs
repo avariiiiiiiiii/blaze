@@ -13,7 +13,7 @@ use crate::{
     builtin_type::{BuiltinInt, BuiltinUint},
     expr_store::{HygieneId, lower::ExprCollector, path::Path},
     hir::{
-        Array, BindingAnnotation, Expr, ExprId, Literal, Pat, Statement, Unsafe,
+        Array, BindingAnnotation, Expr, ExprId, Literal, Pat, Statement, Statements, Unsafe,
         format_args::{
             self, FormatAlignment, FormatArgPosition, FormatArgs, FormatArgsPiece, FormatArgument,
             FormatArgumentKind, FormatArgumentsCollector, FormatCount, FormatDebugHex,
@@ -390,7 +390,7 @@ impl<'db> ExprCollector<'db> {
         let call = self.alloc_expr(
             Expr::Block {
                 id: None,
-                statements: &[],
+                statements: Statements::EMPTY,
                 tail: Some(call),
                 label: None,
                 unsafe_: Unsafe::Yes,

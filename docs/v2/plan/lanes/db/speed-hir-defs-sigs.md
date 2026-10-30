@@ -28,7 +28,7 @@ Now each signature is lowered from a `SignatureSyntax`, as bodies are from `Body
 its text starting at the item. The part no signature reads is replaced by an empty node of its
 kind: the body of a fn, const or static; the item list of an impl or trait; the variant list of
 an enum. It also holds the tree's span map (`RealSpanMap::within`) and ast id map
-(`AstIdMap::relative_without`, from frontend-text), and it compares by a hash of the tree. So it
+(`AstIdMap::relative_without`, from frontend-text), and it compares by the tree's content. So it
 backdates whenever the item's outline text is unchanged, wherever the item moved.
 
 - `X::relative(db, id)` lowers from it with those maps (`ExprCollector::with_maps`, from
@@ -37,7 +37,8 @@ backdates whenever the item's outline text is unchanged, wherever the item moved
 - `X::with_source_map` (`lru = 1024`) moves `relative`'s source map to the file. A pointer at or
   after the empty node moves on by the length left out, the empty node becomes what it replaced,
   and the item gets its file range. This re-runs on every edit of the file, but it only
-  rewrites pointers.
+  rewrites pointers. It reads the item's file range off its ast id pointer, with no walk of the
+  tree to the node.
 - `variants_syntax(db, EnumId)` is the whole enum, with nothing left out. `EnumVariants::of`
   and the `VariantFields` of an enum's variants read it. A struct's or union's `VariantFields`
   reads its `signature_syntax`.
@@ -141,3 +142,12 @@ rustc. This was diagnostics' request 6 (`v2/requests/diagnostics.md`).
     and source map).
 - The `signatures_lower_no_body` test in `nameres/demand_tests.rs` (db-expand-split) still holds:
   no signature query reads a body. `HAS_BODY` and `explicit_discriminant` are read off the syntax.
+
+## Speed of light
+
+The bounds, the arithmetic and the gaps are in
+[speed-of-light.md](speed-of-light.md#hir-def-signatures-signaturesrs-speed-hir-defs-sigs).
+Applied: the tree is compared by content instead of two SipHash passes (≈ 285 ns per item per
+edit), and the source map's move reads the item's range off its ast id. The next change is
+`file_outline`, one query per file that backdates on every body edit. It waits on frontend-text's
+list forms of `clone_subtree_without`, `AstIdMap::relative_without` and `RealSpanMap::without`.

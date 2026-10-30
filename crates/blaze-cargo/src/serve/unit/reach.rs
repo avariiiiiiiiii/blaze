@@ -14,7 +14,7 @@
 use blaze_api::{FactRead, Reach, ReachedItem};
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
 use hir_ty::db::HirDatabase;
-use load_cargo::v2::Snapshot;
+use load_cargo::v2::Db;
 use rustc_hash::FxHashSet;
 
 use super::Job;
@@ -54,9 +54,9 @@ fn path(db: &dyn HirDatabase, key: ItemKey) -> Option<String> {
 /// reaches.
 pub(crate) fn reach(
     from: &Job,
-    before: &Snapshot,
+    before: &Db,
     to: &Job,
-    after: &Snapshot,
+    after: &Db,
     changes: &[blaze_vfs::Change],
 ) -> Result<Reach, Failed> {
     let old_db: &dyn HirDatabase = before;

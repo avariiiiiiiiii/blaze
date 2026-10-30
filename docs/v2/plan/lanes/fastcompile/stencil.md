@@ -274,14 +274,22 @@ fine for a heuristic, and an aligned 8-byte store never tears. HotSpot's and V8'
 counters are racy the same way. Release and `blaze build` outputs never contain stencil code,
 so they never count.
 
-`tier::Tiering` is a deterministic state machine over per-function columns (tier, counts at
-the last decision, decayed rate). Fed snapshots of the cells, it answers which functions to
-recompile and at which backend. A function moves to Cranelift past `Policy::warm`
-(calls + back edges × `back_edge_weight`), and from Cranelift to LLVM past `Policy::hot`,
-which LLVM-tier counting measures as the existing `blaze_live_counters` path does. The
+Cranelift code of a tiered run counts the same way: `tier::instrument` adds the same two
+adds to its IR before Cranelift compiles it, against a user name in `tier::COUNTER_NAMESPACE`
+that codegen resolves to the unit's `Target::Counter` (request 2), so one mechanism measures
+both promotions. Whether a unit counts is in its settings (`Spec::counted`), so counting and
+plain Cranelift code are different instances. LLVM code, the last tier, does not count.
+
+`tier::Tiering` is a deterministic state machine over one 16-byte entry per function (tier,
+flags, the weighted count at the last snapshot, a decayed rate). Fed snapshots of the cells
+(`tier::Counters`, `tier::Driver`), it answers which functions to recompile and at which
+tier, at most one in flight per function, tiers only rising, and a failed tier never asked
+for again in the run. A function moves to Cranelift past `Policy::warm` (4,096 calls plus
+back edges × `back_edge_weight`) and to LLVM past `Policy::hot` (65,536, counted in
+Cranelift's code); `tier.rs` argues both from compile costs by the ski-rental rule. The
 daemon's `tier::Recompile` compiles the unit at `spec.at(backend)` and publishes the new code
-through blaze-lazy's placer and blaze-link's slot store. The old code is retired behind
-blaze-inproc's fence. Hot counts are kept by function identity in `blaze-history`, so the
+through blaze-lazy's placer and blaze-link's slot store, driven by `tier::Runner`. The old
+code is retired behind blaze-inproc's fence. Hot counts are kept by function identity in `blaze-history`, so the
 next run starts hot functions at their last tier (idea 15).
 
 ## Why a build script

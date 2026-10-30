@@ -638,6 +638,12 @@ fn on_demand_elision_says_what_the_whole_list_said() {
         "use std::env;\n",
         "#![allow(x)]\n",
         "\u{feff}",
+        " \t\n\x0b\x0c",
+        "\u{200e}",
+        "\u{a0}",
+        "\u{feff}  /* lead */ ",
+        "extern crate x;\n",
+        "#!/usr/bin/env run\n",
     ];
     let mains =
         ["fn main() {", "fn main(){\n", "pub fn main() {", "fn main() -> () {", "fn main ( ) {"];
@@ -722,3 +728,45 @@ fn a_placeholder_reused_past_the_bound_is_run() {
     assert_eq!(elided(&script(15)).map(|it| it.len()), Some(45_015));
     assert_eq!(elided(&script(17)), None);
 }
+
+/// The first bytes refuse what cannot open `fn main`, and leave the rest to the lexer: a byte
+/// order mark and ASCII white space are passed over, a byte not ASCII may be white space.
+#[test]
+fn refused_at_the_first_byte() {
+    for opens in ["", "fn main() {}", "  //! d", "\u{feff}\n/* c */", "\u{200e}fn", "f"] {
+        assert!(may_open_main(opens.as_bytes()), "{opens:?}");
+    }
+    for refused in ["use std;", " \t#![x]", "\u{feff}pub fn main() {}", "r#fn", "\r\nmod a;"] {
+        assert!(!may_open_main(refused.as_bytes()), "{refused:?}");
+    }
+}
+
+/// A script refused at its first byte costs nothing, and one read costs what it prints and
+/// the arguments it is read with, presized: the printed text, the arguments of a call, and
+/// which arguments a placeholder used.
+#[test]
+fn what_elision_allocates() {
+    let root = Path::new("/p/foo/build.rs");
+    let refused = BTreeMap::from([(
+        root.to_owned(),
+        b"use std::env;\nfn main() { println!(\"cargo:rustc-cfg=x\"); }\n".to_vec(),
+    )]);
+    let none = blaze_alloc_count::assert_at_most(0, "a script refused at its first byte", || {
+        elide(root, &refused)
+    });
+    assert_eq!(none, None);
+    let read = BTreeMap::from([(
+        root.to_owned(),
+        b"// Generated.\nfn main() {\n    println!(\"cargo:rustc-cfg=has_foo\");\n    \
+          println!(\"cargo:rustc-check-cfg=cfg(has_foo)\");\n    \
+          println!(\"cargo:rustc-env=LEVEL={}\", 3);\n}\n"
+            .to_vec(),
+    )]);
+    let printed = blaze_alloc_count::assert_at_most(3, "a script read", || elide(root, &read));
+    assert_eq!(
+        String::from_utf8(printed.unwrap()).unwrap(),
+        "cargo:rustc-cfg=has_foo\ncargo:rustc-check-cfg=cfg(has_foo)\ncargo:rustc-env=LEVEL=3\n"
+    );
+}
+
+mod reference;

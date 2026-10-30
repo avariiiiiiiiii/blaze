@@ -32,6 +32,7 @@ mod polonius;
 mod qualifs;
 mod regions;
 mod relation;
+mod scan;
 pub mod timings;
 
 use std::sync::LazyLock;
@@ -301,9 +302,12 @@ fn check_owner<'db>(
     // the error's place as rustc has it and where the error is, by the moves it is about.
     let mut move_errors: FxHashMap<Vec<usize>, (usize, (LocalId, Vec<PlaceElem>), usize)> =
         FxHashMap::default();
+    let scan = timings::phase(timings::Phase::Setup, || {
+        scan::Scan::new(store, infer, DbInterner::new_with(db, owner.krate(db)))
+    });
     for (body, closure, inline_const) in bodies.into_iter().rev() {
         let mut ctx = timings::phase(timings::Phase::Setup, || {
-            Ctx::new(db, owner, store, infer, body, closure, mode)
+            Ctx::new(db, owner, store, infer, &scan, body, closure, mode)
         });
         ctx.inline_const = inline_const.is_some();
         if closure.is_none() && inline_const.is_none() && drops_in_const(&ctx, def, body) {
@@ -525,35 +529,13 @@ pub(crate) struct Ctx<'a, 'db> {
     pub(crate) closure_expr: Option<ExprId>,
     /// This is the body of a `const { .. }` block, whose type's lifetimes are its function's.
     pub(crate) inline_const: bool,
-    /// For each expression in a `match` arm's guard, the variables the arm's pattern binds:
-    /// rustc binds them by reference in the guard, so it cannot move out of them.
-    pub(crate) guard_bindings: FxHashMap<ExprId, Vec<BindingId>>,
+    /// What the checks read of `store`, found in one pass for every body of the owner.
+    pub(crate) scan: &'a scan::Scan<'db>,
     /// A where clause of a call does not hold, rustc's E0277, which rust-analyzer does not
     /// report: rustc does not borrow check a body whose type check fails.
     pub(crate) tainted: std::cell::Cell<bool>,
     copy: std::cell::RefCell<FxHashMap<Ty<'db>, bool>>,
     glue: std::cell::RefCell<FxHashMap<Ty<'db>, hir_ty::drop::DropGlue>>,
-}
-
-fn guard_bindings(store: &ExpressionStore) -> FxHashMap<ExprId, Vec<BindingId>> {
-    let mut out: FxHashMap<ExprId, Vec<BindingId>> = FxHashMap::default();
-    for (_, expr) in store.exprs() {
-        let hir_def::hir::Expr::Match { arms, .. } = expr else { continue };
-        for arm in arms.iter() {
-            let Some(guard) = arm.guard else { continue };
-            let mut bindings = Vec::new();
-            store.walk_bindings_in_pat(arm.pat, |it| bindings.push(it));
-            if bindings.is_empty() {
-                continue;
-            }
-            let mut stack = vec![guard];
-            while let Some(expr) = stack.pop() {
-                out.entry(expr).or_default().extend(bindings.iter().copied());
-                store.walk_child_exprs(expr, |it| stack.push(it));
-            }
-        }
-    }
-    out
 }
 
 /// A capture of a closure, in its body.
@@ -574,6 +556,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
         owner: InferBodyId<'db>,
         store: &'a ExpressionStore,
         infer: &'a InferenceResult<'db>,
+        scan: &'a scan::Scan<'db>,
         body: &MirBody<'db>,
         closure: Option<ExprId>,
         mode: Mode,
@@ -626,7 +609,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
             closure_local,
             closure_expr: closure,
             inline_const: false,
-            guard_bindings: guard_bindings(store),
+            scan,
             tainted: std::cell::Cell::new(false),
             copy: Default::default(),
             glue: Default::default(),
@@ -656,7 +639,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
         let MirSpan::ExprId(expr) = span else { return false };
         let Some(binding) = self.bindings.get(&local) else { return false };
         !projection.iter().any(|it| matches!(it, hir_ty_mir::mir::ProjectionElem::Deref))
-            && self.guard_bindings.get(&expr).is_some_and(|it| it.contains(binding))
+            && self.scan.guard_bindings(expr).contains(binding)
     }
 
     pub(crate) fn place_ty(

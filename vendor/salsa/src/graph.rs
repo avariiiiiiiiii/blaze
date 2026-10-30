@@ -180,7 +180,7 @@ impl Relocation<'_> {
 /// `len` zeroed words for a page of the node or edge columns, from a zeroed allocation: the part
 /// of a page that is never written is never touched, so it stays out of the resident set.
 #[cfg(not(feature = "shuttle"))]
-fn zeroed_u32s(len: usize) -> Box<[AtomicU32]> {
+pub(crate) fn zeroed_u32s(len: usize) -> Box<[AtomicU32]> {
     // SAFETY: all-zero bits are an `AtomicU32` of 0.
     unsafe { zeroed(len) }
 }
@@ -198,7 +198,7 @@ fn zeroed_u64s(len: usize) -> Box<[AtomicU64]> {
 ///
 /// All-zero bits must be a valid `T`.
 #[cfg(not(feature = "shuttle"))]
-unsafe fn zeroed<T>(len: usize) -> Box<[T]> {
+pub(crate) unsafe fn zeroed<T>(len: usize) -> Box<[T]> {
     let layout = std::alloc::Layout::array::<T>(len).expect("salsa: a graph page fits in memory");
     if layout.size() == 0 {
         return Vec::new().into_boxed_slice();
@@ -216,7 +216,7 @@ unsafe fn zeroed<T>(len: usize) -> Box<[T]> {
 
 /// `len` zeroed words; shuttle's atomics are not plain words, so they are made one by one.
 #[cfg(feature = "shuttle")]
-fn zeroed_u32s(len: usize) -> Box<[AtomicU32]> {
+pub(crate) fn zeroed_u32s(len: usize) -> Box<[AtomicU32]> {
     (0..len).map(|_| AtomicU32::new(0)).collect()
 }
 
@@ -226,7 +226,8 @@ fn zeroed_u64s(len: usize) -> Box<[AtomicU64]> {
     (0..len).map(|_| AtomicU64::new(0)).collect()
 }
 
-#[cfg(all(test, not(feature = "shuttle")))]
+#[cfg(test)]
+#[cfg(not(feature = "shuttle"))]
 mod tests {
     use super::{EdgeSpan, Graph, TaskGraph};
     use crate::Id;

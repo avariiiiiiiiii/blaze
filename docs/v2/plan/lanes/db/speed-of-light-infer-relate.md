@@ -72,6 +72,10 @@ How the code reaches 90% of this:
   root lookup are two union-find finds, which hit L1 after path compression. Setting up the
   generalizer costs a few stores.
 
+- **Memory:** the spill past 8 entries is the one general-purpose allocation left in these
+  files. [memory.md](../../design/memory.md) puts it in the worker's frame allocator, which
+  `blaze-mem` will provide; this lane asked the `mem` lane for it.
+
 That leaves the code's overhead at about 10% of \(T_{\text{gen}}\), from the cache scan.
 
 What stands in the way, outside these files:

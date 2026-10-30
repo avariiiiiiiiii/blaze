@@ -26,11 +26,16 @@ mod raw;
 mod tests;
 
 use std::{
+    collections::HashSet,
+    ffi::OsString,
+    io::{Read as _, Write as _},
+    num::NonZero,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -51,7 +56,8 @@ pub struct Target {
     /// The binary's name and its corpus directory, `fuzz/corpus/<name>/`.
     pub name: &'static str,
     /// Runs one input; panics when an invariant fails. Must return on any bytes, join every
-    /// thread it starts, and keep no state between calls that changes what it checks.
+    /// thread it starts, keep no state between calls that changes what it checks, and allow
+    /// calls on several threads at once (the plain test runs on every core).
     pub check: fn(&[u8]),
     /// Valid inputs built through the writer side of the API.
     pub seeds: fn() -> Vec<Vec<u8>>,
@@ -77,24 +83,52 @@ impl Target {
 }
 
 /// The plain `#[test]` of a target: its corpus files, `seeds()`, and blaze_fuzz's
-/// deterministic changes of both (20000 unless `BLAZE_FUZZ_RUNS` says), each through `check`.
+/// deterministic changes of both (20000 unless `BLAZE_FUZZ_RUNS` says), each through `check`,
+/// on every core (`check` may run on several threads at once). The first failure stops the
+/// rest.
 pub fn seeds(target: &Target) {
-    for input in blaze_fuzz::inputs(target.corpus(), (target.seeds)()) {
-        (target.check)(&input);
+    let inputs: Vec<Vec<u8>> = blaze_fuzz::inputs(target.corpus(), (target.seeds)()).collect();
+    let threads = std::thread::available_parallelism().map_or(1, NonZero::get).min(inputs.len()).max(1);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let _stop = StopOnPanic(&next, inputs.len());
+                while let Some(input) = inputs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    (target.check)(input);
+                }
+            });
+        }
+    });
+}
+
+/// Moves the shared index past the end when its thread panics, so the others stop.
+struct StopOnPanic<'a>(&'a AtomicUsize, usize);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(self.1, Ordering::Relaxed);
+        }
     }
 }
 
-const USAGE: &str = "usage: <target> fuzz [--seconds N] [--runs N] [--seed N] [--max-len N] [--timeout-ms N] [--no-value-profile] [--out DIR]
-       <target> run FILE...
+const USAGE: &str = "usage: <target> fuzz [--jobs N] [--seconds N] [--runs N] [--seed N] [--max-len N] [--timeout-ms N] [--no-value-profile] [--out DIR]
+       <target> run [--timeout-ms N] FILE...
        <target> minimize FILE [--seconds N] [--timeout-ms N] [--out DIR]
        <target> seeds
-FILE is an input in hexadecimal, as in fuzz/corpus/<target>/.";
+       <target> serve [--timeout-ms N]
+FILE is an input in hexadecimal, as in fuzz/corpus/<target>/. `serve` is what `minimize` runs.";
+
+/// The exit code of `run` and `serve` when an input ran past `--timeout-ms`.
+pub(crate) const TIMED_OUT: i32 = 3;
 
 enum Command {
     Fuzz,
     Run(Vec<PathBuf>),
     Minimize(PathBuf),
     Seeds,
+    Serve,
 }
 
 struct Options {
@@ -106,6 +140,10 @@ struct Options {
     timeout: Duration,
     value_profile: bool,
     out: Option<PathBuf>,
+    /// Worker processes for `fuzz`, one per core given (the counters are a process's).
+    jobs: usize,
+    /// This process is worker `n` of a `--jobs` run: it reads what the others keep.
+    worker: Option<usize>,
 }
 
 impl Options {
@@ -121,6 +159,8 @@ impl Options {
             timeout: Duration::from_secs(10),
             value_profile: true,
             out: None,
+            jobs: 1,
+            worker: None,
         };
         let mut files = Vec::new();
         while let Some(arg) = args.next() {
@@ -134,14 +174,20 @@ impl Options {
                 "--timeout-ms" => options.timeout = Duration::from_millis(number(&arg, value(&arg)?)?),
                 "--no-value-profile" => options.value_profile = false,
                 "--out" => options.out = Some(PathBuf::from(value(&arg)?)),
+                "--jobs" => match number(&arg, value(&arg)?)? {
+                    0 => return Err("--jobs 0: at least one".to_owned()),
+                    n => options.jobs = n as usize,
+                },
+                "--worker" => options.worker = Some(number(&arg, value(&arg)?)? as usize),
                 flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
                 _ => files.push(PathBuf::from(arg)),
             }
         }
         options.command = match command.as_str() {
-            "fuzz" | "seeds" if !files.is_empty() => return Err(format!("`{command}` takes no files")),
+            "fuzz" | "seeds" | "serve" if !files.is_empty() => return Err(format!("`{command}` takes no files")),
             "fuzz" => Command::Fuzz,
             "seeds" => Command::Seeds,
+            "serve" => Command::Serve,
             "run" if files.is_empty() => return Err("`run` needs a file".to_owned()),
             "run" => Command::Run(files),
             "minimize" if files.len() == 1 => Command::Minimize(files.remove(0)),
@@ -164,8 +210,10 @@ pub fn main(target: &Target) -> ExitCode {
     };
     let out = options.out.clone().unwrap_or_else(|| target.out());
     let done = match &options.command {
+        Command::Fuzz if options.jobs > 1 => jobs(&options, &out),
         Command::Fuzz => fuzz(target, &options, &out),
-        Command::Run(files) => run(target, files),
+        Command::Run(files) => run(target, files, options.timeout),
+        Command::Serve => serve(target, options.timeout),
         Command::Minimize(file) => minimize::minimize(
             file,
             &out,
@@ -185,14 +233,137 @@ pub fn main(target: &Target) -> ExitCode {
 }
 
 /// Each file once, through `check`, with nothing caught: a failure ends the process as it
-/// would anywhere (what `minimize` watches for).
-fn run(target: &Target, files: &[PathBuf]) -> Result<ExitCode, String> {
+/// would anywhere, and an input that runs past `timeout` ends it with [`TIMED_OUT`].
+fn run(target: &Target, files: &[PathBuf], timeout: Duration) -> Result<ExitCode, String> {
+    timer(timeout)?;
     for file in files {
         let input = corpus::read(file)?;
-        (target.check)(&input);
+        timed(|| (target.check)(&input));
         eprintln!("{}: {} passes ({} bytes)", target.name, file.display(), input.len());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// What `minimize` runs, so that a try costs a pipe's round trip rather than a process: each
+/// input is its length (`u32`, little-endian) and its bytes on stdin, and each gets one byte
+/// on stdout, 0 when it passed and 1 when `check` panicked. It ends at the end of stdin. A
+/// failure that ends the process (an AddressSanitizer report, [`TIMED_OUT`]) ends it as in
+/// `run`.
+fn serve(target: &Target, timeout: Duration) -> Result<ExitCode, String> {
+    timer(timeout)?;
+    let (mut stdin, mut stdout) = (std::io::stdin().lock(), std::io::stdout().lock());
+    let mut input = Vec::new();
+    loop {
+        let mut len = [0u8; 4];
+        match stdin.read_exact(&mut len) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(ExitCode::SUCCESS),
+            Err(e) => return Err(format!("stdin: {e}")),
+        }
+        input.resize(u32::from_le_bytes(len) as usize, 0);
+        stdin.read_exact(&mut input).map_err(|e| format!("stdin: {e}"))?;
+        let passed = timed(|| catch_unwind(AssertUnwindSafe(|| (target.check)(&input))).is_ok());
+        stdout.write_all(&[u8::from(!passed)]).and_then(|()| stdout.flush()).map_err(|e| format!("stdout: {e}"))?;
+    }
+}
+
+/// The millisecond the input `run` or `serve` is running started at, plus one; 0 between.
+static RUNNING_SINCE: AtomicU64 = AtomicU64::new(0);
+
+fn timed<T>(f: impl FnOnce() -> T) -> T {
+    RUNNING_SINCE.store(now_ms() + 1, Ordering::Release);
+    let it = f();
+    RUNNING_SINCE.store(0, Ordering::Release);
+    it
+}
+
+/// For `run` and `serve`: a thread that ends the process with [`TIMED_OUT`] when an input
+/// runs past `timeout`.
+fn timer(timeout: Duration) -> Result<(), String> {
+    let limit = timeout.as_millis() as u64;
+    now_ms();
+    std::thread::Builder::new()
+        .name("timer".to_owned())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis((limit / 4).clamp(10, 1000)));
+                let since = RUNNING_SINCE.load(Ordering::Acquire);
+                if since != 0 && now_ms().saturating_sub(since - 1) > limit {
+                    eprintln!("blaze-fuzzer: an input ran past {limit} ms");
+                    std::process::exit(TIMED_OUT);
+                }
+            }
+        })
+        .map(drop)
+        .map_err(|e| format!("the timer: {e}"))
+}
+
+/// `fuzz --jobs N`: N processes of this binary's `fuzz`, worker `k` seeded `seed + k`, which
+/// share what they keep through `out/corpus/`. It ends when they all have, or at the first
+/// that fails, stopping the rest, with that one's exit code.
+fn jobs(options: &Options, out: &Path) -> Result<ExitCode, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?;
+    let seed = options.seed.unwrap_or_else(clock_seed);
+    let mut workers = Vec::with_capacity(options.jobs);
+    for worker in 0..options.jobs {
+        let mut command = std::process::Command::new(&exe);
+        command.arg("fuzz").args(["--worker", &worker.to_string()]);
+        command.args(["--seed", &seed.wrapping_add(worker as u64).to_string()]);
+        command.args(["--timeout-ms", &options.timeout.as_millis().to_string()]);
+        command.arg("--out").arg(out);
+        if let Some(seconds) = options.seconds {
+            command.args(["--seconds", &seconds.to_string()]);
+        }
+        if let Some(runs) = options.runs {
+            command.args(["--runs", &runs.to_string()]);
+        }
+        if let Some(max_len) = options.max_len {
+            command.args(["--max-len", &max_len.to_string()]);
+        }
+        if !options.value_profile {
+            command.arg("--no-value-profile");
+        }
+        match command.spawn() {
+            Ok(child) => workers.push(child),
+            Err(e) => {
+                stop(&mut workers);
+                return Err(format!("worker {worker}: {e}"));
+            }
+        }
+    }
+    loop {
+        let mut running = 0;
+        for worker in 0..workers.len() {
+            match workers[worker].try_wait() {
+                Ok(None) => running += 1,
+                Ok(Some(status)) if status.success() => {}
+                Ok(Some(status)) => {
+                    stop(&mut workers);
+                    eprintln!("blaze-fuzzer: worker {worker} ended with {status}");
+                    return Ok(status.code().map_or(ExitCode::FAILURE, |code| ExitCode::from(code as u8)));
+                }
+                Err(e) => {
+                    stop(&mut workers);
+                    return Err(format!("worker {worker}: {e}"));
+                }
+            }
+        }
+        if running == 0 {
+            return Ok(ExitCode::SUCCESS);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn stop(workers: &mut [std::process::Child]) {
+    for worker in workers {
+        _ = worker.kill();
+        _ = worker.wait();
+    }
+}
+
+fn clock_seed() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |it| it.as_nanos() as u64)
 }
 
 /// What ended a run.
@@ -283,9 +454,7 @@ fn fuzz(target: &Target, options: &Options, out: &Path) -> Result<ExitCode, Stri
         .spawn(move || watchdog(timeout))
         .map_err(|e| format!("the watchdog: {e}"))?;
 
-    let seed = options.seed.unwrap_or_else(|| {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |it| it.as_nanos() as u64)
-    });
+    let seed = options.seed.unwrap_or_else(clock_seed);
     let budget = Duration::from_secs(options.seconds.unwrap_or(target.budget.as_secs()));
     let deadline = Instant::now() + budget;
     let runs = options.runs.unwrap_or(u64::MAX);
@@ -298,27 +467,28 @@ fn fuzz(target: &Target, options: &Options, out: &Path) -> Result<ExitCode, Stri
         value_profile: options.value_profile,
         runs: 0,
         started: Instant::now(),
+        worker: options.worker,
+        kept,
+        known: HashSet::new(),
     };
     eprintln!(
         "{}: seed {seed}, {} counters, {budget:?}, out {}",
-        target.name,
+        fuzzer.name(),
         coverage.total(),
         out.display()
     );
 
-    // The empty input, the corpus files, the seeds built in code, and what earlier runs kept.
+    // What earlier runs (and other workers) kept, then the empty input, the corpus files and
+    // the seeds built in code, which are kept too when they reach something new.
+    if let Some(failed) = fuzzer.sync()? {
+        return Ok(failed);
+    }
     let mut initial = vec![Vec::new()];
     initial.extend(corpus::read_dir(&target.corpus())?);
     initial.extend((target.seeds)());
-    let built = initial.len();
-    initial.extend(corpus::read_dir(&kept)?);
-    for (i, input) in initial.into_iter().enumerate() {
-        match fuzzer.try_input(input)? {
-            Tried::Failed => return Ok(fuzzer.failed()),
-            Tried::Kept(input) if i < built => {
-                corpus::write(&kept, "", input)?;
-            }
-            Tried::Kept(_) | Tried::Dropped(_) => {}
+    for input in initial {
+        if let Tried::Failed = fuzzer.try_input(input, now_ms())? {
+            return Ok(fuzzer.failed());
         }
     }
     if fuzzer.corpus.len() == 0 {
@@ -331,27 +501,43 @@ fn fuzz(target: &Target, options: &Options, out: &Path) -> Result<ExitCode, Stri
     let mut data = Vec::with_capacity(max_len);
     let mut next_status = 1u64;
     let mut last_status = Instant::now();
-    while fuzzer.runs < runs && Instant::now() < deadline {
+    let mut last_sync = last_status;
+    while fuzzer.runs < runs {
+        // The one clock read of a run: the deadline, the watchdog's start and the pulses.
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
         data.clear();
         data.extend_from_slice(fuzzer.corpus.pick(&mut mutator.random));
         let other = fuzzer.corpus.pick(&mut mutator.random);
         mutator.mutate(&mut data, other, max_len);
-        match fuzzer.try_input(std::mem::take(&mut data))? {
+        match fuzzer.try_input(std::mem::take(&mut data), ms_at(now))? {
             Tried::Failed => return Ok(fuzzer.failed()),
-            Tried::Kept(input) => {
-                corpus::write(&kept, "", input)?;
-                data = Vec::with_capacity(max_len);
-            }
+            Tried::Kept => data = Vec::with_capacity(max_len),
             Tried::Dropped(input) => data = input,
         }
-        if fuzzer.runs >= next_status || last_status.elapsed() > Duration::from_secs(10) {
+        if fuzzer.worker.is_some() && now - last_sync > SYNC {
+            if let Some(failed) = fuzzer.sync()? {
+                return Ok(failed);
+            }
+            last_sync = now;
+        }
+        if fuzzer.runs >= next_status || now - last_status > Duration::from_secs(10) {
             fuzzer.status("pulse");
             next_status = fuzzer.runs.saturating_mul(2);
-            last_status = Instant::now();
+            last_status = now;
         }
     }
     fuzzer.status("done");
     Ok(ExitCode::SUCCESS)
+}
+
+/// How often a `--jobs` worker reads what the others kept (libFuzzer's `-reload` default).
+const SYNC: Duration = Duration::from_secs(1);
+
+fn ms_at(now: Instant) -> u64 {
+    now.saturating_duration_since(*EPOCH.get_or_init(Instant::now)).as_millis() as u64
 }
 
 struct Fuzzer<'a> {
@@ -363,20 +549,26 @@ struct Fuzzer<'a> {
     value_profile: bool,
     runs: u64,
     started: Instant,
+    worker: Option<usize>,
+    /// `out/corpus/`, what this run and others keep.
+    kept: PathBuf,
+    /// The names in `kept` this process has read or written.
+    known: HashSet<OsString>,
 }
 
-enum Tried<'c> {
+enum Tried {
     Failed,
-    /// It reached something new: the corpus has it now.
-    Kept(&'c [u8]),
+    /// It reached something new: the corpus has it now, and `kept` its file.
+    Kept,
     /// Nothing new: the buffer back, to reuse.
     Dropped(Vec<u8>),
 }
 
 impl Fuzzer<'_> {
-    fn try_input(&mut self, input: Vec<u8>) -> Result<Tried<'_>, String> {
+    /// Runs `input`, started at millisecond `now`.
+    fn try_input(&mut self, input: Vec<u8>, now: u64) -> Result<Tried, String> {
         self.features.clear();
-        let passed = self.coverage.run(self.target.check, &input, now_ms());
+        let passed = self.coverage.run(self.target.check, &input, now);
         self.coverage.drain(&mut self.features, self.value_profile);
         self.runs += 1;
         if !passed {
@@ -388,20 +580,49 @@ impl Fuzzer<'_> {
         if new == 0 {
             return Ok(Tried::Dropped(input));
         }
+        let name = corpus::file_name("", &input);
+        if !self.known.contains(&name) {
+            corpus::write(&self.kept, "", &input)?;
+            self.known.insert(name);
+        }
         self.corpus.add(input, new);
-        Ok(Tried::Kept(self.corpus.last()))
+        Ok(Tried::Kept)
+    }
+
+    /// Runs each input in `kept` this process has not seen: at the start, and every [`SYNC`]
+    /// in a `--jobs` worker. One directory listing; only new files are read.
+    fn sync(&mut self) -> Result<Option<ExitCode>, String> {
+        for name in corpus::names(&self.kept)? {
+            if self.known.contains(&name) {
+                continue;
+            }
+            let input = corpus::read(&self.kept.join(&name))?;
+            self.known.insert(name);
+            if let Tried::Failed = self.try_input(input, now_ms())? {
+                return Ok(Some(self.failed()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn name(&self) -> String {
+        match self.worker {
+            Some(worker) => format!("{}[{worker}]", self.target.name),
+            None => self.target.name.to_owned(),
+        }
     }
 
     fn failed(&self) -> ExitCode {
         // `try_input` wrote the input out; an AddressSanitizer report never returns here.
-        eprintln!("{}: failed after {} runs", self.target.name, self.runs);
+        eprintln!("{}: failed after {} runs", self.name(), self.runs);
         ExitCode::FAILURE
     }
 
     fn status(&self, what: &str) {
         let seconds = self.started.elapsed().as_secs_f64().max(1e-3);
         eprintln!(
-            "#{} {what} features: {} corpus: {} ({} bytes) exec/s: {:.0}",
+            "{} #{} {what} features: {} corpus: {} ({} bytes) exec/s: {:.0}",
+            self.name(),
             self.runs,
             self.seen.count(),
             self.corpus.len(),

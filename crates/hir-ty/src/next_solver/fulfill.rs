@@ -27,7 +27,7 @@ struct Pending<'db> {
     cause: Vec<ObligationCause>,
     param_env: Vec<ParamEnv<'db>>,
     predicate: Vec<Predicate<'db>>,
-    recursion_depth: Vec<usize>,
+    recursion_depth: Vec<u32>,
     stalled_on: Vec<StalledOn<'db>>,
 }
 
@@ -165,9 +165,9 @@ impl<'db> FulfillmentCtxt<'db> {
         _infcx: &InferCtxt<'db>,
     ) -> Vec<NextSolverError<'db>> {
         if self.pending.is_empty() {
-            return Vec::new();
+            return Vec::new(); // alloc: empty
         }
-        let errors = self.pending.obligations().map(NextSolverError::Ambiguity).collect();
+        let errors = self.pending.obligations().map(NextSolverError::Ambiguity).collect(); // alloc: error path
         self.pending.clear();
         errors
     }
@@ -182,7 +182,7 @@ impl<'db> FulfillmentCtxt<'db> {
         assert_eq!(self.usable_in_snapshot, infcx.num_open_snapshots());
         let delegate = <&SolverContext<'db>>::from(infcx);
         let recursion_limit = infcx.interner.recursion_limit();
-        let mut errors = Vec::new();
+        let mut errors = Vec::new(); // alloc: empty unless a goal fails
         let mut overflowed = false;
         loop {
             let mut any_changed = false;
@@ -208,7 +208,7 @@ impl<'db> FulfillmentCtxt<'db> {
                 let GoalEvaluation { goal, certainty, has_changed, stalled_on } = match result {
                     Ok(result) => result,
                     Err(NoSolution) => {
-                        errors.push(NextSolverError::TrueError(obligation.clone()));
+                        errors.push(NextSolverError::TrueError(obligation.clone())); // clone: error path, four `Copy` fields
                         return false;
                     }
                 };
@@ -218,10 +218,10 @@ impl<'db> FulfillmentCtxt<'db> {
                 // constrained by evaluating the goal.
                 obligation.predicate = goal.predicate;
                 if has_changed == HasChanged::Yes {
-                    if obligation.recursion_depth > recursion_limit {
+                    if obligation.recursion_depth as usize > recursion_limit {
                         // We limit the total count of inference progress to avoid hangs, and
                         // don't try to recover from this, as rustc doesn't.
-                        errors.push(NextSolverError::Overflow(obligation.clone()));
+                        errors.push(NextSolverError::Overflow(obligation.clone())); // clone: error path, four `Copy` fields
                         overflowed = true;
                         return false;
                     }
@@ -231,7 +231,8 @@ impl<'db> FulfillmentCtxt<'db> {
                     // to the fact that we only process root obligations, but it is a good
                     // approximation and should only result in fulfillment overflow in
                     // pathological cases.
-                    obligation.recursion_depth += 1;
+                    // A recursion limit of `u32::MAX` must not overflow the count.
+                    obligation.recursion_depth = obligation.recursion_depth.saturating_add(1);
                     any_changed = true;
                 }
 
@@ -266,7 +267,7 @@ impl<'db> FulfillmentCtxt<'db> {
     }
 
     pub(crate) fn pending_obligations(&self) -> PredicateObligations<'db> {
-        self.pending.obligations().collect()
+        self.pending.obligations().collect() // alloc: the caller takes the pending set, once
     }
 
     /// The pending obligations the solver found stalled on a coroutine the typeck root
@@ -297,7 +298,7 @@ impl<'db> FulfillmentCtxt<'db> {
                 matches!(it.stalled_maybe_info.stalled_on_coroutines, StalledOnCoroutines::Yes)
             });
             if on_coroutines {
-                stalled.push(obligation.clone());
+                stalled.push(obligation.clone()); // clone: four `Copy` fields, row dropped next
             }
             !on_coroutines
         });

@@ -4,8 +4,10 @@
 //! tests call.
 
 mod db;
+mod machine;
 mod source_names;
 mod storage;
+mod threads;
 mod ub_checks;
 
 use hir_def::{

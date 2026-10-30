@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 
 use arrayvec::ArrayVec;
 use base_db::{Crate, SourceDatabase, target::TargetLoadError};
+use blaze_hashcons::Interned;
 use either::Either;
 use hir_def::{
     AdtId, BuiltinDeriveImplId, CallableDefId, ConstId, ConstParamId, EnumVariantId,
@@ -20,19 +21,18 @@ use hir_def::{
 use salsa::SalsaValue;
 use span::Edition;
 use stdx::impl_from;
-use triomphe::Arc;
 
 use crate::{
     GenericDefaultsRef, GenericPredicates, ImplTraitId, InferBodyId, TyDefId,
     TyLoweringDiagnostic, TyLoweringResult, ValueTyDefId,
     consteval::ConstEvalError,
     dyn_compatibility::DynCompatibilityViolation,
-    layout::{Layout, LayoutError},
+    layout::{InternedLayout, LayoutError},
     lower::{
         ConstParamTypes, FieldTypes, GenericDefaults, Lowered, SelfAndAssocBounds,
         TrackedStructToken, WithDefinedOpaques,
     },
-    mir::{MirBody, MirEvalError, MirLowerError},
+    mir::{MirBody, MirEvalError, MirLowerError, MirOptions},
     next_solver::{
         Allocation, Clause, EarlyBinder, GenericArgs, ParamEnv, PolyFnSig, StoredEarlyBinder,
         StoredGenericArgs, StoredPolyFnSig, StoredTraitRef, StoredTy, TraitRef, Ty, VariancesOf,
@@ -122,24 +122,38 @@ pub trait HirDatabase: SourceDatabase + 'static {
         def: InternedCoroutineId<'db>,
     ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
-    /// The runtime body after rustc's MIR optimizations at `level`
-    /// (`crate::mir::MirOptLevel`). A coroutine body is the runtime body.
+    /// The runtime body after rustc's MIR optimizations as `options` says
+    /// ([`MirOptions`]): its level, its UB checks and whether lifetime markers are kept.
     fn optimized_mir_body<'db>(
         &'db self,
         def: InferBodyId<'db>,
-        level: crate::mir::MirOptLevel,
+        options: MirOptions,
     ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn optimized_mir_body_for_closure<'db>(
         &'db self,
         def: InternedClosureId<'db>,
-        level: crate::mir::MirOptLevel,
+        options: MirOptions,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
+
+    /// The runtime body of a coroutine with the UB checks `options` asks for inserted; a
+    /// coroutine is not optimized further.
+    fn optimized_mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        options: MirOptions,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
+
+    fn optimized_mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        options: MirOptions,
     ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     fn monomorphized_optimized_mir_body<'db>(
         &'db self,
         def: InferBodyId<'db>,
-        level: crate::mir::MirOptLevel,
+        options: MirOptions,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
     ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
@@ -147,7 +161,23 @@ pub trait HirDatabase: SourceDatabase + 'static {
     fn monomorphized_optimized_mir_body_for_closure<'db>(
         &'db self,
         def: InternedClosureId<'db>,
-        level: crate::mir::MirOptLevel,
+        options: MirOptions,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
+
+    fn monomorphized_optimized_mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        options: MirOptions,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
+
+    fn monomorphized_optimized_mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        options: MirOptions,
         subst: StoredGenericArgs,
         env: StoredParamEnvAndCrate,
     ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
@@ -261,7 +291,7 @@ pub trait HirDatabase: SourceDatabase + 'static {
         def: AdtId,
         args: StoredGenericArgs,
         trait_env: StoredParamEnvAndCrate,
-    ) -> Result<Arc<Layout>, LayoutError> {
+    ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
         let db = self.as_dyn();
         crate::layout::layout_of_adt_query(db, def, args, trait_env)
     }
@@ -270,7 +300,7 @@ pub trait HirDatabase: SourceDatabase + 'static {
         &self,
         ty: StoredTy,
         env: StoredParamEnvAndCrate,
-    ) -> Result<Arc<Layout>, LayoutError> {
+    ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
         let db = self.as_dyn();
         crate::layout::layout_of_ty_query(db, ty, env)
     }

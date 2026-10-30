@@ -13,12 +13,16 @@
 //! by the next salsa version. If not, we will likely have to adapt and go with the rustc approach
 //! while installing firewall per item queries to prevent invalidation issues.
 
+mod unused;
+
+pub use unused::adt_unused_params;
+
 use hir_def::{
     AdtId, GenericDefId, GenericParamId, VariantId,
     signatures::{StructFlags, StructSignature},
 };
 use rustc_ast_ir::Mutability;
-use rustc_type_ir::{Variance, inherent::IntoKind};
+use rustc_type_ir::{TypeFlags, TypeVisitableExt as _, Variance, inherent::IntoKind};
 use stdx::never;
 
 use crate::{
@@ -214,6 +218,12 @@ impl<'db> Context<'db> {
     /// in a context with the generics defined in `generics` and
     /// ambient variance `variance`
     fn add_constraints_from_ty(&mut self, ty: Ty<'db>, variance: Variance) {
+        // Only a type parameter and an early-bound lifetime are constrained: a type with
+        // neither in it (`u8`, `Vec<String>`) adds nothing, and its ADTs' variances need not
+        // be read.
+        if !ty.has_type_flags(TypeFlags::HAS_TY_PARAM.union(TypeFlags::HAS_RE_PARAM)) {
+            return;
+        }
         tracing::debug!("add_constraints_from_ty(ty={:?}, variance={:?})", ty, variance);
         match ty.kind() {
             TyKind::Int(_)

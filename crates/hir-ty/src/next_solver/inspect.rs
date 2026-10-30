@@ -119,17 +119,36 @@ impl<'a, 'db> InspectCandidate<'a, 'db> {
     ///
     /// See [`Self::instantiate_impl_args`] if you need the impl args too.
     pub(crate) fn instantiate_nested_goals(&self, span: Span) -> Vec<InspectGoal<'a, 'db>> {
+        self.instantiate_nested_goals_from(span, |_| true)
+    }
+
+    /// [`Self::instantiate_nested_goals`], building a proof tree only for the nested goals
+    /// whose source `keep` accepts. Every step is still instantiated in order, as each one
+    /// extends `orig_values` for the steps after it.
+    pub(crate) fn instantiate_nested_goals_from(
+        &self,
+        span: Span,
+        keep: impl Fn(GoalSource) -> bool,
+    ) -> Vec<InspectGoal<'a, 'db>> {
         let infcx = self.goal.infcx;
         let prev_universe = self.goal.prev_universe;
-        let mut orig_values = self.goal.orig_values.clone();
+        let mut orig_values = self.goal.orig_values.clone(); // clone: instantiating advances it
 
-        let mut instantiated_goals = vec![];
+        let mut instantiated_goals = Vec::with_capacity(self.steps.len());
         for step in &self.steps {
             match **step {
-                inspect::ProbeStep::AddGoal(source, goal) => instantiated_goals.push((
-                    source,
-                    instantiate_canonical_state(infcx, span, prev_universe, &mut orig_values, goal),
-                )),
+                inspect::ProbeStep::AddGoal(source, goal) => {
+                    let goal = instantiate_canonical_state(
+                        infcx,
+                        span,
+                        prev_universe,
+                        &mut orig_values,
+                        goal,
+                    );
+                    if keep(source) {
+                        instantiated_goals.push((source, goal));
+                    }
+                }
                 inspect::ProbeStep::RecordImplArgs { .. } => {}
                 inspect::ProbeStep::MakeCanonicalResponse { .. }
                 | inspect::ProbeStep::NestedProbe(_) => unreachable!(),
@@ -147,7 +166,7 @@ impl<'a, 'db> InspectCandidate<'a, 'db> {
         instantiated_goals
             .into_iter()
             .map(|(source, goal)| self.instantiate_proof_tree_for_nested_goal(source, goal, span))
-            .collect()
+            .collect() // alloc: proof trees are built for diagnostics and overflow reports only
     }
 
     /// Instantiate the args of an impl if this candidate came from a
@@ -156,7 +175,7 @@ impl<'a, 'db> InspectCandidate<'a, 'db> {
     pub(crate) fn instantiate_impl_args(&self, span: Span) -> GenericArgs<'db> {
         let infcx = self.goal.infcx;
         let prev_universe = self.goal.prev_universe;
-        let mut orig_values = self.goal.orig_values.clone();
+        let mut orig_values = self.goal.orig_values.clone(); // clone: instantiating advances it
 
         for step in &self.steps {
             match **step {
@@ -311,7 +330,7 @@ impl<'a, 'db> InspectGoal<'a, 'db> {
                     candidates.push(InspectCandidate {
                         goal: self,
                         kind: probe.kind,
-                        steps: steps.clone(),
+                        steps: steps.clone(), // clone: each candidate owns its step prefix
                         final_state: probe.final_state,
                         shallow_certainty,
                         result,
@@ -322,8 +341,8 @@ impl<'a, 'db> InspectGoal<'a, 'db> {
     }
 
     pub(crate) fn candidates(&'a self) -> Vec<InspectCandidate<'a, 'db>> {
-        let mut candidates = vec![];
-        let mut nested_goals = vec![];
+        let mut candidates = Vec::new(); // alloc: proof-tree inspection, diagnostics only
+        let mut nested_goals = Vec::new(); // alloc: proof-tree inspection, diagnostics only
         self.candidates_recur(&mut candidates, &mut nested_goals, &self.final_revision);
         candidates
     }

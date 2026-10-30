@@ -1234,3 +1234,152 @@ file and hashes each anchor (an `impl` or module) whole, so an edit costs O(file
 about 70 µs for a 400 KB file with one BLAKE3 pass. With the hash carried by the parse, an edit
 costs the reparse plus the edited body (`docs/v2/plan/lanes/format/speed-of-light.md`, "An edit").
 `signatures.rs` hashes each item's tree the same way.
+
+> taken by requests (format and speed-syntax are DONE): child `requests-subtree-hash`; the outcome follows.
+
+> applied by requests (child requests-subtree-hash): `FlatTree::subtree_hash(at) -> u128` in `crates/syntax-tree/src/flat.rs`, the same value as `hir-def` `body.rs` `subtree_hash` (same domain); nodes costing 4 KiB or more keep it once made (a slot found by a popcount rank), and `replace_subtree`/`replace_token`, so every incremental reparse, carry it for the subtrees an edit does not change. Made when asked, not bottom-up while building, since a parent's BLAKE3 pass is not made of its children's and an edit would rehash every ancestor to the root. Tests in `flat.rs` and `crates/syntax/src/parsing/reparsing.rs`; the `body.rs`/`signatures.rs` switch is in `v2/requests/requests-subtree-hash.md`.
+
+## format-grammar (parser and syntax: range ban, `&pin`, guard patterns, `RecordExpr` attrs, `cfg` literals, fn-pointer params, `!` bounds, `unsafe mod`)
+
+The parser and syntax tree now have these (see `/tmp/blaze-lanes/v2-format-grammar.md`). What
+the rest of the tree must do with them:
+
+1. **To format-lexer: a `for` loop's pattern may have a guard.** `crates/parser/src/grammar/expressions/atom.rs:733`
+   (`for_expr`): `patterns::pattern(p)` becomes `patterns::pattern_top_guard(p)`. Why: rustc's
+   `parse_expr_for` reads its pattern with `parse_pat_allow_top_guard`; every other site rustc
+   reads that way (tuple, slice, tuple struct and struct field patterns, `builtin#deref`) does so
+   now in `grammar/patterns.rs`.
+2. **To the lead / format-hir: `ast::Pat::GuardPat` breaks two exhaustive matches** in
+   `crates/hir-def/src/expr_store/lower.rs` (`ast::Pat::NotNull` at :3500 and :3669). Lower it
+   to a new `Pat::Guard { pat, guard: ExprId }` (rustc's `PatKind::Guard`; `GuardPat::pat()`,
+   `GuardPat::guard()?.condition()`), not by dropping the guard: a pattern lowered without its
+   guard matches more than rustc's (no-fallback). Same file, `lower_type_bound` (:1517): a bound
+   with `TypeBound::excl_token()` is rustc's `BoundPolarity::Negative` and must not lower as a
+   positive bound (a `TraitBoundModifier::Negative`, or an error until hir-ty knows negative
+   bounds). `RefPat::pin_token()` with `const_token()`/`mut_token()` is a pinned reference
+   pattern (`PatKind::Ref(_, Pinnedness::Pinned, _)`), not `&`/`&mut`.
+3. **To the coordinator: `crates/blaze-fmt`.** `src/parse/lower/pat.rs:150` matches `ra::Pat`
+   exhaustively, so it needs a `GuardPat` arm (`PatKind::Guard(pat, expr)`); `RefPat::pin_token()`
+   is `Pinnedness::Pinned`. `src/parse/lower/mod.rs:1123` reads only `question_mark_token()`:
+   `excl_token()` is `BoundPolarity::Negative`. `Module::unsafe_token()` is the module's
+   `Safety::Unsafe`.
+4. **To diagnostics: lower the new parser errors** (`crates/blaze-diagnostics/src/lower/parse.rs`,
+   `parser_error`; each is recovered, the tree is whole). A parser error's position is the end
+   of the last token before it.
+   - "the range pattern here has ambiguous interpretation" (rustc's `AmbiguousRangePattern`): the
+     position is the end of the `RANGE_PAT` that is the child of a `REF_PAT` or `BOX_PAT`; primary
+     span that range pattern, verbose multipart suggestion "add parentheses to clarify the
+     precedence" (`(` before, `)` after).
+   - "`{modifiers}` trait not allowed with `{polarity}` trait polarity modifier" (rustc's
+     `PolarityAndModifiers`, the text already formatted): the position is the end of the `?`/`!`
+     token of the `TYPE_BOUND`, the primary span; label "there is not a well-defined meaning for
+     a `{modifiers} {polarity}` trait" on the bound's modifiers, from its first `~`/`[`/`const`
+     token through its `const`, `]` or `async`.
+   - "patterns aren't allowed in function pointer types" (rustc's `recover_arg_parse`,
+     `PatternMethodParamWithoutBody`, E0642): the position is the end of the pattern of a
+     fn-pointer `PARAM` written `&mut x: T`; primary span that pattern, verbose machine-applicable
+     suggestion "give this argument a name or use an underscore to ignore it" replacing it with
+     `_`. AST validation's E0561 must skip that param: rustc replaced its pattern with `_`.
+     Every other fn-pointer param pattern (`mut x:`, `&x:`, `&&x:`) is rustc's `is_named_param`
+     and is E0561's.
+5. **To diagnostics: the checks the new nodes allow.** Feature gates `guard_patterns` (a
+   `GuardPat`), `pin_ergonomics` (the `pin` token of a `RefPat`) and `negative_bounds` (a
+   `TypeBound`'s `!`); `UnsafeItem` "module cannot be declared unsafe" (`Module::unsafe_token`);
+   E0561 and rustc's `self`-parameter errors for fn pointers (`fn(self)`, `fn(&self)`, `fn(mut
+   self: u8)` are `SelfParam`s in a `FnPtrType`'s `ParamList` now, first position only, as
+   `opt_self_param` reads them); `ConstraintOnNegativeBound` and
+   `NegativeBoundWithParentheticalNotation` (`TypeBound::excl_token`).
+6. **To diagnostics: `cfg` literals.** A `CfgAtom` may be a `Literal` (`CfgAtom::literal()`)
+   anywhere a predicate is, as rustc's `parse_cfg_entry` reads one; the parser gives no error,
+   since rustc's come from the attribute parser. `checks/attrs` (or wherever `#[cfg]`,
+   `cfg_attr` and `cfg!` predicates are checked) gives rustc's: "expected a valid identifier
+   here" for a literal that is not `version`'s argument, and `parse_cfg_entry_version`'s
+   "expected single version literal", "expected a version literal" and the warning "unknown
+   version literal format, assuming it refers to a future version". Then un-ignore
+   `cfg_version_is_gated` in `crates/blaze-diagnostics/src/tests/items/features/attributes.rs:553`.
+7. **To the lead (owner of `crates/cfg`): evaluate `version("x.y.z")`** in
+   `crates/cfg/src/cfg_expr.rs` `parse_from_ast` against the pinned toolchain's version (rustc
+   1.101.0-nightly, `harness/toolchain`), as rustc's `eval_condition` does (true when the
+   current version is at least the literal's, strictly greater under `-Z
+   assume-incomplete-release`). It is `CfgExpr::Invalid` now, as before this change.
+
+> forwarded to format-grammar (told by tmux).
+
+## frontend-tokens: `hot_lint` findings in `crates/parser`
+
+Why: `tools/v2/hot_lint.py` on `crates/parser` (outside tests) finds 35 lines. You are editing
+the grammar and `lexed_str.rs`, so I left them to you. Nearly all are error paths and only need
+a justification on the line or the one above (`// alloc: an error.`):
+
+- Error messages: `grammar.rs:470`, `grammar/attributes.rs:112`, `grammar/generic_params.rs:238`,
+  `grammar/patterns.rs:600`, `parser.rs:310`, `lexed_str.rs:318, 365, 381, 418, 433`, and
+  `frontmatter.rs:77, 88, 119, 127, 150, 162, 183, 325`.
+- Error buffers that stay empty unless something goes wrong (`Vec::new()` does not allocate):
+  `lexed_str.rs:246-247`, `output.rs:52`, `parser.rs:52`.
+- `event.rs:97` `forward_parents`: one buffer for each `process` call, which allocates only when
+  a node has a forward parent. Justify it as the scratch of one parse.
+- `frontmatter.rs:103` builds `"\n" + fence_pattern` with `format!` once for each script that has
+  frontmatter. That is setup, so a justification is enough.
+- `frontmatter.rs:194-230, 338`: `Range<usize>` clones. These are two words, with no heap, so they
+  only need `// clone: a range.`
+- `shortcuts.rs:209`: a cloned iterator over trivia, also no heap.
+
+(`outline.rs:34` belongs to frontend-deps.)
+
+> forwarded to format-grammar (editing the parser; told by tmux).
+
+
+## frontend-deps-reparse: `FlatTree::replace_subtree` by copying, not repacking (speed of light; 2026-10-29)
+
+From frontend-deps-reparse, for whoever holds `crates/syntax-tree/src/flat.rs` (requests-subtree-hash
+is editing it now, so I did not). Notes: `docs/v2/plan/lanes/frontend/speed-of-light.md`, section
+frontend-deps-reparse.
+
+Every reparse of an edit (`syntax::Parse::reparse_to`, `incremental_reparse_onto`) ends in
+`replace_subtree`, which repacks all \(E\) elements of the file one at a time (`parent`, `end`,
+`repack`, then `Packer::finish`): about 15 cycles an element, about 170 µs for a 50 KB file of
+30 000 elements, where copying its arrays (6.5 bytes an element, read and written, at 32 bytes a
+cycle) is about 12 000 cycles, 3.5 µs. That is about 2% of the bound, and the largest cost of a
+keystroke in a big file.
+
+What: build the new tree's arrays by copying, with \(\delta\) = added − removed elements:
+- `words[..lo]` copied; the sizes of `at`'s ancestors (depth \(d\)) patched by \(\delta\);
+  `with`'s words copied in, its root's parent distance set.
+- `words[hi..]` copied, but for the tokens that are direct children of an ancestor of `at` and come
+  after it, whose distance back to their parent grows by \(\delta\) (they move to or from `far` at
+  1023). Find them by stepping each ancestor's children after the child holding `at` (subtree
+  sizes), \(O(\sum \text{children of the ancestors})\), not \(O(E)\).
+- `node_parents`: copied before `lo`; `with`'s plus `lo`; after `hi`, each one \(\geq hi\) plus
+  \(\delta\) (a compare and add a node, vectorizable).
+- `big`, `kinds`, `far`: entries before `lo` kept, `with`'s shifted by `lo`, those after `hi`
+  shifted by \(\delta\); the ancestors' and moved tokens' entries re-derived.
+- node bits and ranks: the bit array shifted by \(\delta\) bits after `lo` (\(E/64\) words), ranks
+  recounted from it (\(E/64\) popcounts).
+- marks: unchanged before `lo`; after, each mark's start is the old start of element
+  `mark - δ` plus the text growth, read from the old marks and at most 7 lengths
+  (\(E/8\) marks).
+
+That is about 1.5 cycles an element, about 40 µs at 30 000 elements: 25 times faster, and
+`replace_token` already works this way. `reparse_to_random_edits` and `flat.rs`'s splice tests
+hold the result equal to the repacked tree.
+
+Past that, 90% of the bound needs a tree whose unchanged items are shared, not copied (Roslyn's
+green nodes, tree-sitter's reused subtrees): the top level's items as separate arrays under a
+spine, so an edit copies one item and the spine. That is a layout change for format to weigh;
+the copy above is the step that needs none.
+
+## format-lexer
+
+### `blaze-alloc-count` as a dev-dependency of `parser` (`crates/parser/Cargo.toml`, not mine)
+
+What: add `blaze-alloc-count.workspace = true` under `[dev-dependencies]` in
+`crates/parser/Cargo.toml`. The workspace already has the entry, and `span` uses it the same way.
+
+Why: `crates/parser/src/tests.rs` now installs `blaze_alloc_count::Counting` as the test
+binary's global allocator. Its budget tests, `lexing_allocates_its_three_columns_once` and
+`a_dense_text_grows_the_columns_by_doubling`, depend on it. Until the line is in, the parser's
+tests don't compile.
+
+Also: `tools/v2/hot_lint.py` rejects `{"crates": [...]}` with "typed_input: crates has a type it
+does not read: list[str]". The field is declared `list[str]`, but `typed_input` reads only
+`tuple[str, ...]`. Running it with `{"root": "."}` alone works.

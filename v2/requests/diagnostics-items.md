@@ -42,3 +42,44 @@ port it, so a matcher rustc refuses is accepted by blaze (superset-of-rust: acce
 rejects is a bug). One port of the sets, not two.
 
 > forwarded to diagnostics: between its own children.
+
+## 4. Still open, needed to compile: rustc's pretty printer at `crate::lints::syntax::pretty` (parent `diagnostics`, owner of `lints/syntax*`: `diagnostics-lints-syntax-early`)
+
+What: the request `diagnostics-items-ast: rustc's pretty printer reachable as
+`crate::lints::syntax::pretty`` in `v2/requests/diagnostics-items-ast.md` (forwarded, not yet
+applied as of 2026-10-29 19:50): `pub(crate) mod validation;` in `lints/syntax/early.rs`,
+`pub(crate) mod pretty;` in `lints/syntax/early/validation.rs`, `pub(crate) use
+early::validation::pretty;` in `lints/syntax.rs`, and `pretty.rs`'s `ty`, `bounds`,
+`generic_arg`, `expr` as `pub(crate)` free functions beside `where_predicate` and `ident`.
+Why: `checks/ast_validation/{items,generics}.rs` import `crate::lints::syntax::pretty`; without
+it the crate does not compile. (`Walk::place` and `pub(crate) mod syntax;` are applied.)
+
+> forwarded to diagnostics (its `lints/syntax*`; told by tmux).
+
+## 5. An expansion parsed again as statements (format: `crates/syntax`; or the parent: `crates/blaze-diagnostics/Cargo.toml`)
+
+What: a way to parse a text as macro statements and get its errors: either
+`syntax::parse_macro_stmts(text: &str, edition: Edition) -> Vec<SyntaxError>` (beside
+`ast::Expr::parse`, `TopEntryPoint::MacroStmts`), or `parser.workspace = true` in
+`blaze-diagnostics`' `Cargo.toml` so `lower/parse.rs` calls `TopEntryPoint::MacroStmts.parse`
+itself. Why: rustc's `failed_to_match_macro` (`rustc_expand/src/mbe/diagnostics.rs`) retries an
+expression expansion that does not parse as statements and, when that parses, adds "the macro
+call doesn't expand to an expression, but it can expand to a statement" and the help "add `;`"
+/ "surround the macro invocation with `{}`" (`macros/issue-34421-mac-expr-bad-stmt-good-add-semi`,
+`macros/issue-109237`, `macros/macro-in-expression-context-2`). `lower::parse::expansion_error`
+gives the rest of that function (the rewrite to "macro expansion ends with an incomplete
+expression"); without the retry those three tests miss the note and help.
+
+> applied by requests (format is DONE), the first option: `ast::MacroStmts::parse(text, edition) -> Parse<ast::MacroStmts>` in `crates/syntax/src/lib.rs` beside `ast::Expr::parse` (`TopEntryPoint::MacroStmts`); its `errors()` are the retry's. Test `statements_that_are_no_expression_parse_as_macro_statements` (`syntax/src/tests.rs`). blaze-diagnostics needs no `parser` dependency.
+
+## 6. `unresolved_ident`'s `typo` and `import_candidates` shared (parent `diagnostics`: `lower/unresolved_ident.rs`)
+
+What: the second half of `diagnostics-items-defs: one port of rustc's late path errors` in
+`v2/requests/diagnostics.md`. The first half is done (`checks/names/failure.rs` now uses
+`lower::unresolved_import`'s `Segment`, `ROOT` and `value_descr`; the rest of `failure::diag`
+is the signature-scope half of `report_path_resolution_error`, which `unresolved_import`'s
+import `Resolver` cannot give). Make `typo` and `import_candidates` of `lower/unresolved_ident.rs`
+`pub(crate)`, taking the namespace and the `PathSource` expectation, so
+`checks/names/paths.rs` drops its copies.
+
+> forwarded to diagnostics (told by tmux).

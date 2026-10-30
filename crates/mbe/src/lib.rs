@@ -84,9 +84,11 @@ pub enum ExpandErrorKind {
 
 impl ExpandError {
     fn new(span: Span, kind: ExpandErrorKind) -> ExpandError {
+        // alloc: an error.
         ExpandError { inner: Arc::new((span, kind)) }
     }
     fn binding_error(span: Span, e: impl Into<Box<str>>) -> ExpandError {
+        // alloc: an error.
         ExpandError { inner: Arc::new((span, ExpandErrorKind::BindingError(Box::new(e.into())))) }
     }
 }
@@ -153,6 +155,7 @@ struct Rule {
 
 impl DeclarativeMacro {
     pub fn from_err(err: ParseError) -> DeclarativeMacro {
+        // alloc: an error.
         DeclarativeMacro { rules: Box::default(), err: Some(Box::new(err)) }
     }
 
@@ -165,6 +168,7 @@ impl DeclarativeMacro {
         // matching against `$($lhs:tt => $rhs:tt);*` pattern, but implementing
         // manually seems easier.
         let mut src = tt.iter();
+        // alloc: the rules, once per rule, when the macro is defined.
         let mut rules = Vec::new();
         let mut err = None;
 
@@ -172,6 +176,7 @@ impl DeclarativeMacro {
             let rule = match Rule::parse(ctx_edition, &mut src) {
                 Ok(it) => it,
                 Err(e) => {
+                    // alloc: an error.
                     err = Some(Box::new(e));
                     break;
                 }
@@ -179,6 +184,7 @@ impl DeclarativeMacro {
             rules.push(rule);
             if let Err(()) = src.expect_char(';') {
                 if !src.is_empty() {
+                    // alloc: an error.
                     err = Some(Box::new(ParseError::expected("expected `;`")));
                 }
                 break;
@@ -187,6 +193,7 @@ impl DeclarativeMacro {
 
         for Rule { lhs, .. } in &rules {
             if let Err(e) = validate(lhs) {
+                // alloc: an error.
                 err = Some(Box::new(e));
                 break;
             }
@@ -201,6 +208,7 @@ impl DeclarativeMacro {
         body: &tt::TopSubtree,
         ctx_edition: impl Copy + Fn(SyntaxContext) -> Edition,
     ) -> DeclarativeMacro {
+        // alloc: the rules, once per rule, when the macro is defined.
         let mut rules = Vec::new();
         let mut err = None;
 
@@ -221,6 +229,7 @@ impl DeclarativeMacro {
 
             match rule {
                 Ok(rule) => rules.push(rule),
+                // alloc: an error.
                 Err(e) => err = Some(Box::new(e)),
             }
         } else {
@@ -232,6 +241,7 @@ impl DeclarativeMacro {
                 let rule = match Rule::parse(ctx_edition, &mut src) {
                     Ok(it) => it,
                     Err(e) => {
+                        // alloc: an error.
                         err = Some(Box::new(e));
                         break;
                     }
@@ -239,6 +249,7 @@ impl DeclarativeMacro {
                 rules.push(rule);
                 if let Err(()) = src.expect_any_char(&[';', ',']) {
                     if !src.is_empty() {
+                        // alloc: an error.
                         err = Some(Box::new(ParseError::expected(
                             "expected `;` or `,` to delimit rules",
                         )));
@@ -250,6 +261,7 @@ impl DeclarativeMacro {
 
         for Rule { lhs, .. } in &rules {
             if let Err(e) = validate(lhs) {
+                // alloc: an error.
                 err = Some(Box::new(e));
                 break;
             }
@@ -390,6 +402,7 @@ impl<T, E> ValueResult<T, E> {
     where
         E: Clone,
     {
+        // clone: an error's `Arc`, only when there is one.
         ValueResult { value: &self.value, err: self.err.clone() }
     }
 
@@ -426,6 +439,7 @@ pub fn expect_fragment<'t>(
     let mut parser_input =
         MATCHER_INPUT.take().unwrap_or_else(|| parser::Input::with_capacity(4 * window_trees));
     let tree_traversal = loop {
+        // clone: a cursor, one view.
         let mut fork = tt_iter.clone();
         let savepoint = fork.savepoint();
         let mut taken = 0;
@@ -472,6 +486,7 @@ pub fn expect_fragment<'t>(
     let err = if error || !cursor.is_root() {
         Some(ExpandError::binding_error(
             buffer.cursor().token_tree().map_or(delim_span.close, |tt| tt.first_span()),
+            // alloc: an error.
             format!("expected {entry_point:?}"),
         ))
     } else {

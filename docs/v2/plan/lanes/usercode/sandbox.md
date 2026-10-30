@@ -138,3 +138,11 @@ On Linux, namespaces and overlayfs give the run its own view, and Landlock confi
 where namespaces can't be made. Bazel's Linux sandbox does the same with namespaces and bind
 mounts, and declares its inputs instead of tracing them. Making a sandbox costs a fork, the
 mounts and the filter, once per run. Neither Bazel nor BuildXL is cheaper here.
+
+## A test's threads and the fork server's socket
+
+A test's own threads read for that test. On macOS they take the creating thread's scope
+(through an interposed `pthread_create`). On Linux they take the one scope their process's
+other threads share, or none when those differ or aren't known yet. A test may connect to
+the Unix socket its read set names (the fork server's), and to no other socket outside its
+own and writable directories.

@@ -609,8 +609,11 @@ fn the_sorted_environment_is_the_one_built_before() {
 #[test]
 fn names_and_numbers_are_made_as_format_made_them() {
     for name in ["foo", "other-feature", "\u{fc}n\u{ef}-x", "\u{df}", "a.b-c", "", "-"] {
-        let old: String =
-            name.chars().flat_map(char::to_uppercase).map(|c| if c == '-' { '_' } else { c }).collect();
+        let old: String = name
+            .chars()
+            .flat_map(char::to_uppercase)
+            .map(|c| if c == '-' { '_' } else { c })
+            .collect();
         assert_eq!(envify(name), old);
         assert_eq!(prefixed("CARGO_FEATURE_", name), format!("CARGO_FEATURE_{old}"));
     }
@@ -618,3 +621,19 @@ fn names_and_numbers_are_made_as_format_made_them() {
         assert_eq!(decimal(n), n.to_string());
     }
 }
+
+
+/// Reading a script's environment allocates nothing, for a name it has or not.
+#[test]
+fn lookups_allocate_nothing() {
+    let env = env(&bar(), &os(&[("PATH", "/bin"), ("HOME", "/home/me")])).unwrap();
+    let found = blaze_alloc_count::assert_at_most(0, "environment lookups", || {
+        ["TARGET", "PATH", "CARGO_CFG_UNIX", "NOT_SET", "OUT_DIR"]
+            .into_iter()
+            .filter(|name| env.get(name).is_some() && env.origin(OsStr::new(name)).is_some())
+            .count()
+    });
+    assert_eq!(found, 4);
+}
+
+mod reference;

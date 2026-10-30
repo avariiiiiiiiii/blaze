@@ -354,6 +354,19 @@ impl<'t, 'a> Parser<'t, 'a> {
         at
     }
 
+    /// An attribute (`#[..]`, `#![..]`), skipped.
+    pub(super) fn eat_attr(&mut self) -> bool {
+        if !self.peek().is_some_and(|it| it.kind == SyntaxKind::POUND) {
+            return false;
+        }
+        let bang = usize::from(self.nth(1).is_some_and(|it| it.kind == SyntaxKind::BANG));
+        if !self.nth(1 + bang).is_some_and(|it| it.kind == SyntaxKind::L_BRACK) {
+            return false;
+        }
+        self.at += 1 + bang;
+        self.skip_delimited()
+    }
+
     /// A delimited token tree (`{ .. }`, `( .. )`, `[ .. ]`), skipped.
     pub(super) fn skip_delimited(&mut self) -> bool {
         let open = |kind| matches!(kind, SyntaxKind::L_CURLY | SyntaxKind::L_PAREN | SyntaxKind::L_BRACK);

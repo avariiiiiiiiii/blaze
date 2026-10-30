@@ -38,7 +38,7 @@ use rustc_hash::FxHashMap;
 pub use self::valid::ValueError;
 use self::valid::{Fail, Plans};
 use crate::{
-    borrows::Borrows,
+    borrows::{self, Borrows, NewPermission, PtrKind},
     ids::{AccessKind, AllocId, AtomicOrd, Prov, SiteId, Span, ThreadId},
     memory::{AlignMsg, Bytes, Kind, MemError, Memory},
     race::{self, Races},
@@ -329,6 +329,38 @@ impl<'db> Checker<'db> {
     /// The allocation and offset of `size` bytes an atomic access already checked.
     fn locate(&mut self, ptr: Ptr<Prov>, size: u64) -> MResult<Option<(AllocId, u64)>> {
         self.mem.access(ptr.addr, ptr.prov, size, 1, AccessKind::Read).map_err(|e| self.fail(e.into()))
+    }
+
+    /// An in-place argument or the return place of a call, after `call`: retagged with a strong
+    /// protector, as `&mut` on function entry, then written uninitialized through the new tag.
+    /// Returns the place with its new provenance, which the callee uses.
+    // Miri: machine.rs, `protect_in_place_function_argument`; tree_borrows/mod.rs,
+    // `tb_protect_place` (every permission `ReservedFrz`, strongly protected: what
+    // `NewPermission::new` gives a protected `&mut` to a `Freeze` and `Unpin` pointee).
+    pub fn protect(&mut self, place: Ptr<Prov>, size: u64) -> MResult<Ptr<Prov>> {
+        let Some((alloc, off)) = self.locate(place, size)? else { return Ok(place) };
+        let prov = place.prov.expect("memory names an allocation only for a pointer with provenance");
+        let span = Span::new(off, size);
+        let perm = NewPermission::new(PtrKind::Mut, borrows::RetagMode::FnEntry, true, true, &[]);
+        let tag = match self.borrows.retag(alloc, prov, perm, span, self.at) {
+            Ok(Some(tag)) => tag,
+            Ok(None) => return Ok(place),
+            Err(e) => return Err(self.fail(e.into())),
+        };
+        for i in 0..self.borrows.retag_accesses().len() {
+            let (span, access) = self.borrows.retag_accesses()[i];
+            let race = match access {
+                AccessKind::Read => self.races.read(alloc, span, None, self.at),
+                AccessKind::Write => self.races.write(alloc, span, None, self.at),
+            };
+            if let Err(e) = race {
+                return Err(self.fail(e.into()));
+            }
+        }
+        let new = Prov::Concrete { alloc, tag };
+        self.plain_access(alloc, new, span, AccessKind::Write)?;
+        self.mem.uninit(alloc, span);
+        Ok(Ptr { addr: place.addr, prov: Some(new) })
     }
 
     fn record(column: &mut Vec<SiteId>, alloc: AllocId, at: SiteId) {

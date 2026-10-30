@@ -297,6 +297,23 @@ fn encoded(value: &impl serde::Serialize) -> Vec<u8> {
     postcard::to_allocvec(value).expect("a flat tree and a list of numbers encode")
 }
 
+thread_local! {
+    /// The buffer a call's parts are encoded into before [`Given::part`] takes them: one per
+    /// thread, grown to the largest call, so a key allocates no encoding.
+    static ENCODING: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn part_encoded(given: &mut Given, name: &'static str, value: &impl serde::Serialize) {
+    ENCODING.with_borrow_mut(|buffer| {
+        buffer.clear();
+        let mut written = postcard::to_extend(value, std::mem::take(buffer))
+            .expect("a flat tree and a list of numbers encode");
+        given.part(name, &written);
+        written.clear();
+        *buffer = written;
+    });
+}
+
 /// What `call` gives the macro, for its [`RunKey::given`] with the toolchain `toolchain`, and
 /// the anchors and contexts its output is written against. A wasm macro's caller adds what
 /// else it gives a module.
@@ -316,10 +333,10 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
         .part("kind", &[kind_byte(call.kind)])
         .part("abi", &CURRENT_API_VERSION.to_le_bytes())
         .id("toolchain", toolchain)
-        .part("input", &encoded(&input))
-        .part("attrs", &encoded(&attrs))
-        .part("spans", &encoded(&shapes))
         .part("dir", call.current_dir.as_bytes());
+    part_encoded(&mut given, "input", &input);
+    part_encoded(&mut given, "attrs", &attrs);
+    part_encoded(&mut given, "spans", &shapes);
     for (name, value) in call.env.iter() {
         given.env(name, value);
     }

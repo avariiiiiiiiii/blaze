@@ -384,11 +384,13 @@ fn package_id_specs(
         }
         Packages::Packages(opt_in) => {
             unread(opt_in)?;
-            let mut specs: Vec<PackageIdSpec> =
-                opt_in.iter().map(|it| PackageIdSpec::parse(it)).collect::<Result<_>>()?;
-            specs.sort_by_key(|it| it.to_string());
-            specs.dedup_by_key(|it| it.to_string());
-            specs
+            let mut specs: Vec<(String, PackageIdSpec)> = opt_in
+                .iter()
+                .map(|it| PackageIdSpec::parse(it).map(|spec| (spec.to_string(), spec)))
+                .collect::<Result<_>>()?;
+            specs.sort_by(|a, b| a.0.cmp(&b.0));
+            specs.dedup_by(|a, b| a.0 == b.0);
+            specs.into_iter().map(|(_, spec)| spec).collect()
         }
         Packages::Default => {
             let named = |name: &str| member_ids.iter().find(|id| id.name().as_str() == name);

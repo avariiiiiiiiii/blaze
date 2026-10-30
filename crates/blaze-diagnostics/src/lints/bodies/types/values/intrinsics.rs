@@ -34,10 +34,13 @@ impl LatePass for EnumIntrinsicsNonEnums {
         }
         let Expr::Path(_) = store.expr(callee) else { return };
         let Some(name) = util::path_item(b, callee) else { return };
-        let discriminant = match name.as_str() {
-            "mem_discriminant" => true,
-            "mem_variant_count" => false,
-            _ => return,
+        let items = util::items();
+        let discriminant = if name == items.mem_discriminant {
+            true
+        } else if name == items.mem_variant_count {
+            false
+        } else {
+            return;
         };
         let TyKind::FnDef(_, fn_args) = util::ty(b, callee).kind() else { return };
         let ty_param = fn_args.type_at(0);

@@ -9,7 +9,6 @@
 //! the sandbox's launcher leaves for the driver that ran it.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fmt,
     path::{Path, PathBuf},
@@ -17,6 +16,7 @@ use std::{
 
 use blaze_core::{Traced, Untraceable};
 use blaze_ids::Hasher;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// What a line says was seen.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -301,11 +301,11 @@ pub fn assemble<'l, I: Inputs>(
     scope: Option<&str>,
     inputs: &mut I,
 ) -> Result<Traced, I::Error> {
-    let mut files = BTreeSet::new();
-    let mut dirs = BTreeSet::new();
-    let mut env = BTreeSet::new();
+    let mut files = FxHashSet::default();
+    let mut dirs = FxHashSet::default();
+    let mut env = FxHashSet::default();
     let mut all_env = false;
-    let mut untraceable = BTreeSet::new();
+    let mut untraceable = FxHashSet::default();
     let ours = |line: &Line| match scope {
         None => true,
         Some(scope) => line.scope.is_empty() || line.scope == scope,
@@ -324,6 +324,14 @@ pub fn assemble<'l, I: Inputs>(
             Seen::RefusedWrite | Seen::RefusedNet => {}
         }
     }
+    // Each set sorted once here: `inputs` is asked, and `traced` filled, in that order.
+    fn sorted<T: Ord>(set: FxHashSet<T>) -> Vec<T> {
+        let mut set: Vec<T> = set.into_iter().collect();
+        set.sort_unstable();
+        set
+    }
+    let (files, dirs, env): (Vec<PathBuf>, Vec<PathBuf>, Vec<OsString>) =
+        (sorted(files), sorted(dirs), sorted(env));
     let mut traced = Traced::default();
     for path in files {
         let hash = inputs.file(&path)?;
@@ -340,7 +348,7 @@ pub fn assemble<'l, I: Inputs>(
         }
     }
     traced.files.sort();
-    let mut values: BTreeMap<OsString, Option<OsString>> = BTreeMap::new();
+    let mut values: FxHashMap<OsString, Option<OsString>> = FxHashMap::default();
     if all_env {
         let all = inputs.env_all();
         values.insert(ALL_ENV_NAME.into(), Some(names_hash(&all).into()));
@@ -353,7 +361,8 @@ pub fn assemble<'l, I: Inputs>(
         values.entry(name).or_insert(value);
     }
     traced.env = values.into_iter().collect();
-    traced.untraceable = untraceable.into_iter().collect();
+    traced.env.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    traced.untraceable = sorted(untraceable);
     Ok(traced)
 }
 
@@ -601,6 +610,8 @@ pub fn decode(bytes: &[u8]) -> Result<Report, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     struct Fixed {
@@ -735,6 +746,78 @@ mod tests {
         assert_eq!(traced.env[0].0, ALL_ENV_NAME);
         assert_eq!(traced.env[0].1.as_deref(), Some(OsStr::new(&names_hash(&inputs.env))));
         assert_eq!(traced.untraceable, vec![Untraceable::Clock, Untraceable::Descriptor]);
+    }
+
+    /// [`Fixed`], noting what it was asked in the order it was asked.
+    struct Asked(Fixed, Vec<String>);
+
+    impl Inputs for Asked {
+        type Error = String;
+        fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
+            self.1.push(format!("file {}", path.display()));
+            self.0.file(path)
+        }
+        fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
+            self.1.push(format!("dir {}", path.display()));
+            self.0.dir(path)
+        }
+        fn env(&mut self, name: &OsStr) -> Option<OsString> {
+            self.1.push(format!("env {}", name.display()));
+            self.0.env(name)
+        }
+        fn env_all(&mut self) -> Vec<(OsString, OsString)> {
+            self.1.push("env_all".into());
+            self.0.env_all()
+        }
+        fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
+            self.0.names(path)
+        }
+    }
+
+    #[test]
+    fn inputs_are_asked_in_sorted_order_whatever_order_the_lines_came_in() {
+        let mut lines: Vec<Line> = [
+            (Seen::Read, "/ws/z"),
+            (Seen::Read, "/usr/bin/cc"),
+            (Seen::Looked, "/ws/a.txt"),
+            (Seen::Read, "/ws/a.txt"),
+            (Seen::Listed, "/ws/data"),
+            (Seen::Listed, "/ws/b"),
+            (Seen::Env, "ZED"),
+            (Seen::Env, "CC"),
+            (Seen::Env, "CC"),
+            (Seen::Untraceable, "random"),
+            (Seen::Untraceable, "clock"),
+            (Seen::Untraceable, "random"),
+        ]
+        .into_iter()
+        .map(|(seen, what)| Line::new(seen, "", what))
+        .collect();
+        let mut first = Asked(fixed(), Vec::new());
+        let traced = assemble(&lines, None, &mut first).unwrap();
+        assert_eq!(
+            first.1,
+            [
+                "file /usr/bin/cc",
+                "file /ws/a.txt",
+                "file /ws/z",
+                "dir /ws/b",
+                "dir /ws/data",
+                "env CC",
+                "env ZED",
+            ]
+        );
+        let paths: Vec<&Path> = traced.files.iter().map(|it| it.0.as_path()).collect();
+        assert_eq!(paths, [Path::new("/usr/bin/cc"), Path::new("/ws/a.txt"), Path::new("/ws/b"), Path::new("/ws/z")]);
+        assert_eq!(traced.env, vec![("CC".into(), Some("cc".into())), ("ZED".into(), None)]);
+        assert_eq!(traced.untraceable, vec![Untraceable::Clock, Untraceable::Random]);
+        for turn in 1..lines.len() {
+            lines.rotate_left(turn);
+            lines.reverse();
+            let mut again = Asked(fixed(), Vec::new());
+            assert_eq!(assemble(&lines, None, &mut again).unwrap(), traced);
+            assert_eq!(again.1, first.1);
+        }
     }
 
     #[test]

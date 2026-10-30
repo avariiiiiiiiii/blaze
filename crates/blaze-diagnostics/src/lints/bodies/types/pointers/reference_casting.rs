@@ -13,7 +13,6 @@ use hir_def::{
     hir::{BinaryOp, BindingId, Expr, ExprId, Pat, UnaryOp},
 };
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
-use intern::Symbol;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     Interner as _, Mutability,
@@ -117,10 +116,11 @@ fn borrow_or_assign(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<(ExprId, Pattern
     }
     let Expr::Call { callee, args } = store.expr(expr) else { return None };
     let [pointer, _] = args else { return None };
-    match callee_item(b, callee).as_ref().map(Symbol::as_str) {
-        Some("ptr_write" | "ptr_write_volatile" | "ptr_write_unaligned") => Some((*pointer, PatternKind::Assign)),
-        _ => None,
-    }
+    let items = util::items();
+    let name = callee_item(b, callee)?;
+    [items.ptr_write, items.ptr_write_volatile, items.ptr_write_unaligned]
+        .contains(&name)
+        .then_some((*pointer, PatternKind::Assign))
 }
 
 fn is_invalid_cast_from_ref_to_mut_ptr(b: &BodyCx<'_, '_>, orig: ExprId, peel: &mut impl FnMut() -> ExprId) -> bool {

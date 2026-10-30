@@ -155,6 +155,8 @@ pub(crate) struct Stage<'a> {
     pub owned: Vec<(Class, ClassId, u32)>,
     /// Bytes reused for keys written out to be hashed.
     pub scratch: Vec<u8>,
+    /// Whether [`Stage::spans`] replaced any span table.
+    pub spans_changed: bool,
 }
 
 pub(crate) fn error(function: Option<InstanceKey>, what: impl Into<String>) -> LinkError {
@@ -540,7 +542,7 @@ impl<'a> Stage<'a> {
             rest = after;
         }
         let table = self.table;
-        parts.into_par_iter().zip(todo.par_iter()).for_each(|(out, function)| function_keys(function, table, out));
+        parts.into_par_iter().zip(todo.par_iter()).for_each(|(out, function)| function_keys(*function, table, out));
         let syms = self.symbols.intern_wide(&keys);
         let mut at = 0;
         for (function, count) in todo.iter().zip(counts) {
@@ -754,8 +756,8 @@ impl<'a> Stage<'a> {
             self.add_data(data, data_sym, &relocs, None)?;
         }
         let (bytes, relocs, size, zero): (&'a [u8], &'a [Reloc], u64, bool) = match &it.init {
-            Init::Bytes { bytes, relocs } => (bytes, relocs, bytes.len() as u64, false),
-            Init::Zeroed { size } => (&[], &[], *size, true),
+            Init::Bytes { bytes, relocs } => (&bytes[..], &relocs[..], bytes.len() as u64, false),
+            Init::Zeroed { size } => (&[][..], &[][..], *size, true),
         };
         let syms = self.reloc_syms(relocs);
         let (fixups, weak) = self.fixups(relocs, &syms, None, false)?;
@@ -829,6 +831,7 @@ impl<'a> Stage<'a> {
             let spans = Spans::new(bytes).map_err(|it| error(None, format!("the span table of {anchor:?}: {it}")))?;
             let len = before.max(spans.len());
             self.new.set_span_table(id, spans);
+            self.spans_changed = true;
             changed.push((id, len));
         }
         for (anchor, len) in changed {
@@ -906,7 +909,7 @@ impl<'a> Stage<'a> {
         }
         wanted.sort_unstable_by_key(|it| it.0);
         wanted.dedup_by_key(|it| it.0);
-        let (class, _) = (self.new.class_id(&Class::RelRo), ());
+        let class = self.new.class_id(&Class::RelRo);
         for (sym, anchor, index) in wanted {
             if self.new.home(sym).is_some() {
                 continue;
@@ -1210,7 +1213,7 @@ impl<'a> Stage<'a> {
             let Some(slot_sym) = self.new.slot_syms.get(*slot as usize).copied() else { continue };
             if let Some(caller) = self.new.refs(slot_sym).find_map(|it| self.new.piece(it)) {
                 return Err(error(
-                    function_of(&self.new, caller),
+                    function_of(caller),
                     format!(
                         "{} is removed with nothing put in its slot, and {} still calls it",
                         self.symbols.describe(slot_sym),
@@ -1227,7 +1230,7 @@ impl<'a> Stage<'a> {
                 }
                 if let Some(user) = self.new.refs(sym).find_map(|it| self.new.piece(it)) {
                     return Err(error(
-                        function_of(&self.new, user),
+                        function_of(user),
                         format!(
                             "{} is removed, and {} still refers to it",
                             self.symbols.describe(sym),
@@ -1241,8 +1244,7 @@ impl<'a> Stage<'a> {
     }
 }
 
-pub(crate) fn function_of(state: &State, piece: PieceRef<'_>) -> Option<InstanceKey> {
-    let _ = state;
+pub(crate) fn function_of(piece: PieceRef<'_>) -> Option<InstanceKey> {
     piece.function().map(|it| it.key)
 }
 

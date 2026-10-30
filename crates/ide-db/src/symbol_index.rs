@@ -726,7 +726,7 @@ pub(self) use crate::Trait as IsThisJustATrait;
             .into_iter()
             .map(|module_id| {
                 let mut symbols = SymbolCollector::new_module(&db, module_id, false);
-                symbols.sort_by_key(|it| it.name.as_str().to_owned());
+                symbols.sort_by(|a, b| a.name.cmp_order(&b.name));
                 (module_id, symbols)
             })
             .collect();
@@ -753,7 +753,7 @@ struct Duplicate;
             .into_iter()
             .map(|module_id| {
                 let mut symbols = SymbolCollector::new_module(&db, module_id, false);
-                symbols.sort_by_key(|it| it.name.as_str().to_owned());
+                symbols.sort_by(|a, b| a.name.cmp_order(&b.name));
                 (module_id, symbols)
             })
             .collect();

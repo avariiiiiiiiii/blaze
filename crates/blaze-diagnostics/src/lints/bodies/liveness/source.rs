@@ -284,7 +284,7 @@ pub(super) fn string_literals(b: &BodyCx<'_, '_>, root: ExprId) -> Vec<(Span, St
             found.push((span, value.as_str().to_owned()));
         }
     });
-    found.sort_by_key(|(span, _)| (span.file.clone(), span.lo));
+    found.sort_by(|(a, _), (b, _)| (&a.file, a.lo).cmp(&(&b.file, b.lo)));
     found
 }
 

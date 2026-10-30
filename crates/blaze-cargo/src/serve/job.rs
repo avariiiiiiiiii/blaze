@@ -39,9 +39,10 @@ use blaze_api::{
 use blaze_cas::{Placed, Store};
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
 use blaze_graph::{
-    Key, Outcome, Pool, RequestId, RequestStats, Spec,
+    Key, Outcome, Pool, RequestId, RequestStats,
     admission::TaskKind,
     machine::NodeId,
+    plane::NodeRef,
 };
 use blaze_ids::{ContentId, Hasher};
 use blaze_protocol::events::NodeKind;
@@ -56,7 +57,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::{
     heads::Heads,
     mounts::Mounts,
-    plane::{self, Did, Happened, Node, Plane, Task, kinds},
+    plane::{self, Did, Fresh, Happened, Plane, Task, kinds},
     work::{Compiled, Failed, Front, Goal, JobInput, Runs, Selection, Source, Steps},
 };
 
@@ -166,8 +167,16 @@ fn named(a: &str, b: &str) -> String {
     name
 }
 
-fn spec(id: NodeId, kind: NodeKind, name: String, deps: Vec<NodeId>, pool: Pool, key: Option<Key>) -> Spec {
-    Spec { id, kind, name, deps, pool, cost: 1, key, memory: 0 }
+/// A node of cost 1, its memory to be predicted from its kind.
+fn node<'a>(kind: NodeKind, name: &'a str, deps: &'a [NodeId], pool: Pool, key: Option<Key>) -> NodeRef<'a> {
+    NodeRef { kind, name, deps, pool, cost: 1, key, memory: 0 }
+}
+
+/// A batch of one thread task of kind `task`, with no deps.
+fn lone(plane: &mut Plane<Value>, kind: NodeKind, name: &str, pool: Pool, key: Option<Key>, task: TaskKind) -> Fresh {
+    let mut fresh = plane.fresh(1, name.len(), 0);
+    plane.push(&mut fresh, node(kind, name, &[], pool, key), one(task));
+    fresh
 }
 
 /// What a job's work asks of cargo: its command.
@@ -524,12 +533,12 @@ impl Jobs {
     fn prepare(&mut self, w: &mut World<'_>, id: JobId) {
         if self.library.is_none() {
             let job = self.jobs.get_mut(&id).expect("a job being prepared");
-            let node = w.plane.reserve(1);
             let steps = w.steps.clone();
             let work = task(&job.cancelled, move |_| Ok(steps.library()?), |_, it| Value::Library(it));
-            let spec = spec(node, NodeKind::Std, "the standard library's source".into(), Vec::new(), Pool::Io, Some(library_key()));
-            job.stage = Stage::Library(node);
-            self.add(w, id, node, vec![Node { spec, task: one(kinds::LIBRARY) }], Some(work));
+            let name = "the standard library's source";
+            let fresh = lone(w.plane, NodeKind::Std, name, Pool::Io, Some(library_key()), kinds::LIBRARY);
+            job.stage = Stage::Library(fresh.first());
+            self.add(w, id, fresh, Some(work));
             return;
         }
         let job = self.jobs.get(&id).expect("a job being prepared");
@@ -566,24 +575,24 @@ impl Jobs {
 
     fn plan(&mut self, w: &mut World<'_>, id: JobId, prep: Prep) {
         let job = self.jobs.get_mut(&id).expect("a job planning");
-        let node = w.plane.reserve(1);
         let (steps, db, queries) = (w.steps.clone(), w.db.clone(), prep.queries);
         let work = task(&job.cancelled, move |_| steps.plan(&db, queries), |_, it| Value::Planned(it));
-        let spec = spec(node, NodeKind::Manifest, named("the plan of ", &prep.root_dir), Vec::new(), Pool::Work, None);
-        job.stage = Stage::Plan(node, prep);
-        self.add(w, id, node, vec![Node { spec, task: one(kinds::PLAN) }], Some(work));
+        let name = named("the plan of ", &prep.root_dir);
+        let fresh = lone(w.plane, NodeKind::Manifest, &name, Pool::Work, None, kinds::PLAN);
+        job.stage = Stage::Plan(fresh.first(), prep);
+        self.add(w, id, fresh, Some(work));
     }
 
-    /// A batch of the job's nodes, with the ids reserved from `first`.
-    fn add(&mut self, w: &mut World<'_>, id: JobId, first: NodeId, nodes: Vec<Node>, work: Option<plane::Work<Value>>) {
+    /// A batch of the job's nodes.
+    fn add(&mut self, w: &mut World<'_>, id: JobId, fresh: Fresh, work: Option<plane::Work<Value>>) {
         let job = self.jobs.get_mut(&id).expect("a job adding nodes");
         let request = job.request.expect("a job that builds has a request");
-        let count = u32::try_from(nodes.len()).expect("a batch of under 2^32 nodes");
+        let (first, count) = (fresh.first(), fresh.count());
         if count > 0 {
             job.batches.push(first);
             self.nodes.insert(first.0, (count, id));
         }
-        if let Err(error) = w.plane.add(w.now, request, first, nodes, work) {
+        if let Err(error) = w.plane.add(w.now, request, fresh, work) {
             self.end(w, id, false, Some(ApiError::new(format!("the plane refused the job's tasks: {error}"), None)));
         }
     }
@@ -779,17 +788,19 @@ impl Jobs {
                     return;
                 }
                 let count = u32::try_from(wanted.len()).expect("under 2^32 fetches");
-                let first = w.plane.reserve(count);
                 let fetches: Arc<[Fetch]> = wanted.into();
-                let nodes = (0..count)
-                    .map(|at| {
-                        let fetch = &fetches[at as usize];
-                        let id = NodeId(first.0 + at);
-                        let name = named("fetch ", &fetch.what);
-                        let spec = spec(id, NodeKind::Fetch, name, Vec::new(), Pool::Io, Some(fetch_key(fetch)));
-                        Node { spec, task: Task::Thread { kind: kinds::FETCH, arg: at } }
-                    })
-                    .collect();
+                const FETCH: &str = "fetch ";
+                let names = fetches.iter().map(|it| FETCH.len() + it.what.len()).sum();
+                let mut fresh = w.plane.fresh(count, names, 0);
+                let mut name = String::new();
+                for (at, fetch) in (0u32..).zip(fetches.iter()) {
+                    name.clear();
+                    name.push_str(FETCH);
+                    name.push_str(&fetch.what);
+                    let task = Task::Thread { kind: kinds::FETCH, arg: at };
+                    w.plane.push(&mut fresh, node(NodeKind::Fetch, &name, &[], Pool::Io, Some(fetch_key(fetch))), task);
+                }
+                let first = fresh.first();
                 let work = {
                     let (steps, asked, told) = (w.steps.clone(), fetches.clone(), fetches.clone());
                     task(
@@ -799,7 +810,7 @@ impl Jobs {
                     )
                 };
                 job.stage = Stage::Fetch(Fetching { first, fetches, left: count, prep });
-                self.add(w, id, first, nodes, Some(work));
+                self.add(w, id, fresh, Some(work));
             }
             Planned::Ready(mut units) => {
                 let job = self.jobs.get_mut(&id).expect("a job planning");
@@ -839,12 +850,12 @@ impl Jobs {
                     self.next(w, id);
                     return;
                 }
-                let node = w.plane.reserve(1);
                 let (steps, lowering) = (w.steps.clone(), input.clone());
                 let work = task(&job.cancelled, move |_| steps.lower(&lowering), |_, it| Value::Lowered(it));
-                let spec = spec(node, NodeKind::Names, named("lowering ", &prep.root_dir), Vec::new(), Pool::Work, None);
-                job.stage = Stage::Lower(node, input);
-                self.add(w, id, node, vec![Node { spec, task: one(kinds::LOWER) }], Some(work));
+                let name = named("lowering ", &prep.root_dir);
+                let fresh = lone(w.plane, NodeKind::Names, &name, Pool::Work, None, kinds::LOWER);
+                job.stage = Stage::Lower(fresh.first(), input);
+                self.add(w, id, fresh, Some(work));
             }
         }
     }
@@ -892,10 +903,9 @@ impl Jobs {
             Work::Snapshot => unreachable!("a snapshot has no view"),
         };
         if let Some(work) = answer {
-            let node = w.plane.reserve(1);
-            let spec = spec(node, NodeKind::Bodies, "the job's answer".into(), Vec::new(), Pool::Work, None);
-            job.stage = Stage::Answer(node);
-            self.add(w, id, node, vec![Node { spec, task: one(kinds::WALK) }], Some(work));
+            let fresh = lone(w.plane, NodeKind::Bodies, "the job's answer", Pool::Work, None, kinds::WALK);
+            job.stage = Stage::Answer(fresh.first());
+            self.add(w, id, fresh, Some(work));
             self.close(w, id);
             return;
         }
@@ -904,21 +914,26 @@ impl Jobs {
         let input = ready.input;
         let units = &input.units;
         let count = u32::try_from(units.graph.units.len()).expect("under 2^32 units");
-        let first = w.plane.reserve(count);
         let check = input.goal == Goal::Check;
         let kind = if check { NodeKind::Bodies } else { NodeKind::Codegen };
-        let mut nodes = Vec::with_capacity(units.graph.units.len());
+        let (names, all_deps) = units.graph.units.iter().fold((0, 0), |(names, deps), unit| {
+            (names + unit.pkg_id.len() + 1 + unit.target.name.len(), deps + unit.dependencies.len())
+        });
+        let mut nodes = w.plane.fresh(count, names, all_deps);
+        let first = nodes.first();
+        let (mut name, mut deps) = (String::new(), Vec::new());
         for (at, unit) in (0u32..).zip(&units.graph.units) {
-            let deps = unit.dependencies.iter().map(|dep| NodeId(first.0 + dep.index as u32)).collect();
-            let mut name = String::with_capacity(unit.pkg_id.len() + 1 + unit.target.name.len());
+            deps.clear();
+            deps.extend(unit.dependencies.iter().map(|dep| NodeId(first.0 + dep.index as u32)));
+            name.clear();
             name.push_str(&unit.pkg_id);
             name.push(' ');
             name.push_str(&unit.target.name);
-            let id = NodeId(first.0 + at);
-            nodes.push(match unit.mode {
-                UnitMode::RunCustomBuild => Node { spec: spec(id, NodeKind::ScriptRun, name, deps, Pool::Work, None), task: Task::Loop },
-                _ => Node { spec: spec(id, kind, name, deps, Pool::Work, None), task: Task::Thread { kind: kinds::COMPILE, arg: at } },
-            });
+            let (kind, task) = match unit.mode {
+                UnitMode::RunCustomBuild => (NodeKind::ScriptRun, Task::Loop),
+                _ => (kind, Task::Thread { kind: kinds::COMPILE, arg: at }),
+            };
+            w.plane.push(&mut nodes, node(kind, &name, &deps, Pool::Work, None), task);
         }
         let work: plane::Work<Value> = {
             let (front, cancelled) = (front.clone(), cancelled.clone());
@@ -951,13 +966,15 @@ impl Jobs {
         let reported = vec![0; units.packages.len().div_ceil(64)];
         let select = match &job.work {
             Work::Test { filter, args, all, ub: Some(ub), .. } => {
-                let node = w.plane.reserve(1);
                 let (front, filter, args, all, ub) = (front.clone(), filter.clone(), args.clone(), *all, *ub);
                 let selection = move |_| front.ub_tests(Selection { filter: &filter, args: &args, all, ub: Some(ub) });
                 let work = task(&cancelled, selection, |_, it| Value::Selected(it));
-                let deps = (0..count).map(|at| NodeId(first.0 + at)).collect();
-                let spec = spec(node, NodeKind::Bodies, "the tests to evaluate".into(), deps, Pool::Work, None);
-                Some((Evaluation { ub, select: node, failed: false }, Node { spec, task: one(kinds::UB_TESTS) }, work))
+                deps.clear();
+                deps.extend((0..count).map(|at| NodeId(first.0 + at)));
+                let name = "the tests to evaluate";
+                let mut fresh = w.plane.fresh(1, name.len(), deps.len());
+                let select = w.plane.push(&mut fresh, node(NodeKind::Bodies, name, &deps, Pool::Work, None), one(kinds::UB_TESTS));
+                Some((Evaluation { ub, select, failed: false }, fresh, work))
             }
             _ => None,
         };
@@ -975,12 +992,9 @@ impl Jobs {
             artifacts: Vec::new(),
             evaluation,
         }));
-        self.add(w, id, first, nodes, Some(work));
+        self.add(w, id, nodes, Some(work));
         match select {
-            Some((node, work)) => {
-                let first = node.spec.id;
-                self.add(w, id, first, vec![node], Some(work));
-            }
+            Some((fresh, work)) => self.add(w, id, fresh, Some(work)),
             None => self.close(w, id),
         }
     }
@@ -992,17 +1006,20 @@ impl Jobs {
         let Stage::Units(build) = &job.stage else { return };
         let Some(evaluation) = &build.evaluation else { return };
         let count = u32::try_from(tests.len()).expect("under 2^32 tests");
-        let first = w.plane.reserve(count);
-        let nodes = (0..count)
-            .zip(&tests)
-            .map(|(at, test)| {
-                let spec = spec(NodeId(first.0 + at), NodeKind::Bodies, named("test ", test), Vec::new(), Pool::Work, None);
-                Node { spec, task: Task::Thread { kind: kinds::EVALUATE, arg: at } }
-            })
-            .collect();
+        const TEST: &str = "test ";
+        let names = tests.iter().map(|it| TEST.len() + it.len()).sum();
+        let mut fresh = w.plane.fresh(count, names, 0);
+        let mut name = String::new();
+        for (at, test) in (0u32..).zip(&tests) {
+            name.clear();
+            name.push_str(TEST);
+            name.push_str(test);
+            let task = Task::Thread { kind: kinds::EVALUATE, arg: at };
+            w.plane.push(&mut fresh, node(NodeKind::Bodies, &name, &[], Pool::Work, None), task);
+        }
         let (front, tests, ub): (_, Arc<[String]>, _) = (build.front.clone(), tests.into(), evaluation.ub);
         let work = task(&job.cancelled, move |at| front.evaluate(&tests[at as usize], ub), |_, it| Value::Evaluated(it));
-        self.add(w, id, first, nodes, Some(work));
+        self.add(w, id, fresh, Some(work));
         self.close(w, id);
     }
 

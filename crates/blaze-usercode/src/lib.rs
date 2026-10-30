@@ -87,8 +87,10 @@ impl RunKey {
 pub struct Given {
     kind: RunKind,
     args: Vec<OsString>,
+    // BTreeMap: hashed in order into the cache key `RunKey::given`, and `vars` hands it out in order.
     env: BTreeMap<OsString, OsString>,
     stdin: Vec<u8>,
+    // BTreeMap: hashed in order into the cache key `RunKey::given`.
     parts: BTreeMap<&'static str, Vec<u8>>,
 }
 

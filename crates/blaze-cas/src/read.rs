@@ -114,15 +114,16 @@ impl Shared {
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        // SAFETY: each is a leaked box (or null, for `orphans`) that only this drop frees; no
-        // reader is left, since each holds `self`.
-        unsafe {
-            drop(Box::from_raw(*self.view.get_mut()));
-            drop(Box::from_raw(*self.owned.get_mut()));
-            let orphans = *self.orphans.get_mut();
-            if !orphans.is_null() {
-                drop(Box::from_raw(orphans));
-            }
+        // SAFETY: `view` is a leaked box that only this drop frees; no reader is left, since
+        // each holds `self`.
+        drop(unsafe { Box::from_raw(*self.view.get_mut()) });
+        // SAFETY: as above, for `owned`.
+        drop(unsafe { Box::from_raw(*self.owned.get_mut()) });
+        let orphans = *self.orphans.get_mut();
+        if !orphans.is_null() {
+            // SAFETY: a leaked box (not null, checked) that `orphan` set once and only this drop
+            // frees.
+            drop(unsafe { Box::from_raw(orphans) });
         }
     }
 }
@@ -536,8 +537,10 @@ impl<'a> Look<'a> {
                 // after the spot is unlinked, and `self.held` outlives what this returns.
                 let chunk = unsafe { seg.chunk.get::<'a>() };
                 let at = seg.offset;
-                let bytes = chunk
-                    .bytes(at, RECORD_HEADER + seg.stored)
+                // SAFETY: `seg` is the place of a published spot, and these are the header and
+                // payload of the record it names, which the writer wrote before it published the
+                // spot (`Own::claim`, or `Own::keep` for the store's own) and never writes again.
+                let bytes = unsafe { chunk.bytes(at, RECORD_HEADER + seg.stored) }
                     .ok_or_else(|| corrupt(format!("its record at {at} is outside its segment")))?;
                 let (header, payload) = bytes.split_at(RECORD_HEADER as usize);
                 let header =

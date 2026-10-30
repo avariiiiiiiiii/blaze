@@ -1,0 +1,771 @@
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+
+use blaze_manifest::Config;
+use blaze_manifest::manifest::{Context, EitherManifest, Manifest, read_manifest};
+use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
+use blaze_resolve::{InternedString, PackageId, SourceId};
+use cargo_util_schemas::manifest::TomlManifest;
+use rustc_hash::FxHashMap;
+
+use super::hash::{self, CrateType, StableHasher, TargetKind};
+use super::outputs::{self, CompileFiles, Layout};
+use super::{PlanInput, env, finished, flags, plan};
+use crate::query::UnitPlan;
+use crate::schema::{self, DebugInfo, Mode, Strip, Stripped, Unit, UnitDep};
+use crate::stdlib::target::{self as platform, CfgArgs};
+use crate::{Intent, Package};
+
+const HOST: &str = "x86_64-unknown-linux-gnu";
+const TARGET: &str = "aarch64-unknown-linux-gnu";
+const H: &str = "0123456789abcdef";
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|it| (*it).to_owned()).collect()
+}
+
+fn get<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    env.iter().find(|(it, _)| it == name).map(|(_, value)| value.as_str())
+}
+
+// `util::StableHasher` is rustc's `StableSipHasher128`, as `blaze_source::short_hash` uses it,
+// whose value for crates.io is the `-25cdd57fae9f0462` of cargo's registry directories.
+#[test]
+fn the_hasher_is_cargos() {
+    let mut hasher = StableHasher::new();
+    SourceId::crates_io().hash(&mut hasher);
+    let hex = hash::short_hex(Hasher::finish(&hasher));
+    assert_eq!(hex, "25cdd57fae9f0462");
+    assert_eq!(hex, blaze_source::short_hash(&SourceId::crates_io()));
+}
+
+// `target_short_hash`: `short_hash(&(METADATA_VERSION, pkg.package_id().stable_hash(ws_root)))`,
+// a path package under the workspace by its relative path (`SourceId::stable_hash`).
+#[test]
+fn target_short_hash_by_hand() {
+    let source = SourceId::for_path(Path::new("/w/pm")).unwrap();
+    let id = PackageId::new(InternedString::new("pm"), semver::Version::new(0, 1, 0), source);
+    let mut hasher = StableHasher::new();
+    2u8.hash(&mut hasher);
+    "pm".hash(&mut hasher);
+    semver::Version::new(0, 1, 0).hash(&mut hasher);
+    source.kind().hash(&mut hasher);
+    "pm".hash(&mut hasher);
+    assert_eq!(hash::target_short_hash(id, Path::new("/w")).unwrap(), hash::short_hex(Hasher::finish(&hasher)));
+}
+
+// `CompileKind::fingerprint_hash`: 0 for the host, else the target's name hashed.
+#[test]
+fn kind_hashes() {
+    assert_eq!(hash::kind_fingerprint_hash(None).unwrap(), 0);
+    let mut hasher = StableHasher::new();
+    TARGET.hash(&mut hasher);
+    assert_eq!(hash::kind_fingerprint_hash(Some(TARGET)).unwrap(), Hasher::finish(&hasher));
+    assert!(hash::kind_fingerprint_hash(Some("my-target.json")).is_err());
+}
+
+/// What `Profile::comparable` hashes of the dev profile (`opt-level = 0`, `lto = false`,
+/// `debug = 2`, debug assertions and overflow checks, unwind, no strip).
+fn dev_profile_by_hand(into: &mut StableHasher, debuginfo: isize) {
+    "0".hash(into); // opt_level
+    1isize.hash(into); // Lto::Bool
+    false.hash(into);
+    Option::<&str>::None.hash(into); // codegen_backend
+    Option::<u32>::None.hash(into); // codegen_units
+    debuginfo.hash(into); // TomlDebugInfo
+    Option::<&str>::None.hash(into); // split_debuginfo
+    true.hash(into); // debug_assertions
+    true.hash(into); // overflow_checks
+    false.hash(into); // rpath
+    false.hash(into); // incremental
+    0isize.hash(into); // PanicStrategy::Unwind
+    0isize.hash(into); // StripInner::None
+    Vec::<String>::new().hash(into); // rustflags
+    0isize.hash(into); // TomlTrimPaths::None
+}
+
+/// `compute_metadata` of serde's library, a registry package with no dependencies, built for
+/// `target` (none: the host) with `lto::generate`'s `OnlyObject`.
+fn serde_metadata_by_hand(target: Option<&str>) -> (String, String) {
+    let mut shared = StableHasher::new();
+    2u8.hash(&mut shared); // METADATA_VERSION
+    "serde".hash(&mut shared);
+    semver::Version::new(1, 0, 219).hash(&mut shared);
+    SourceId::crates_io().kind().hash(&mut shared);
+    "https://github.com/rust-lang/crates.io-index".hash(&mut shared);
+    strings(&["default", "std"]).hash(&mut shared); // features
+    dev_profile_by_hand(&mut shared, 4); // Full
+    1isize.hash(&mut shared); // CompileMode::Build
+    4isize.hash(&mut shared); // Lto::OnlyObject
+    hash::kind_fingerprint_hash(target).unwrap().hash(&mut shared);
+    "serde".hash(&mut shared); // target name
+    0isize.hash(&mut shared); // TargetKind::Lib
+    1usize.hash(&mut shared);
+    1isize.hash(&mut shared); // CrateType::Lib
+    // hash_rustc_version of a nightly: the channel, and the host for a host unit.
+    1isize.hash(&mut shared);
+    "nightly".hash(&mut shared);
+    if target.is_none() {
+        HOST.hash(&mut shared);
+    }
+    false.hash(&mut shared); // is_std
+
+    let mut c_metadata = shared.clone();
+    0usize.hash(&mut c_metadata); // no dependencies
+    let mut unit_id = shared;
+    0usize.hash(&mut unit_id); // no dependencies
+    0usize.hash(&mut unit_id); // no `cargo rustc` arguments
+    0usize.hash(&mut unit_id); // no rustflags
+    (format!("{:016x}", Hasher::finish(&c_metadata)), format!("-{:016x}", Hasher::finish(&unit_id)))
+}
+
+#[test]
+fn finished_texts() {
+    assert_eq!(finished("dev", "0", true), "`dev` profile [unoptimized + debuginfo]");
+    assert_eq!(finished("release", "3", false), "`release` profile [optimized]");
+    assert_eq!(finished("bench", "3", true), "`bench` profile [optimized + debuginfo]");
+}
+
+#[test]
+fn check_cfg_strings() {
+    assert_eq!(flags::check_cfg_of([].into_iter()), ["cfg(docsrs,test)", "cfg(feature, values())"]);
+    assert_eq!(
+        flags::check_cfg_of(["default", "foo-bar"].into_iter()),
+        ["cfg(docsrs,test)", "cfg(feature, values(\"default\", \"foo-bar\"))"]
+    );
+}
+
+// `features_args` between the profile's and the kind's `--cfg`s.
+#[test]
+fn cfgs_in_cargos_order() {
+    let cfgs = flags::cfgs(&strings(&["--cfg", "p"]), &strings(&["a"]), &strings(&["--cfg=k", "-Cx"]));
+    assert_eq!(cfgs, ["p", "feature=\"a\"", "k"]);
+}
+
+// `lints_to_rustflags`: by priority, then by name backwards; `[lints.cargo]` is cargo's own.
+#[test]
+fn lints_order() {
+    let toml: TomlManifest = toml::from_str(
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n\
+         [lints.rust]\nunsafe_code = \"forbid\"\nunused = { level = \"allow\", priority = -1 }\n\
+         unexpected_cfgs = { level = \"warn\", check-cfg = ['cfg(has_foo)'] }\n\n\
+         [lints.clippy]\nall = { level = \"warn\", priority = -1 }\npedantic = \"deny\"\n\n\
+         [lints.cargo]\nunused_optional_dependency = \"warn\"\n",
+    )
+    .unwrap();
+    let (lints, check_cfg) = flags::lints_of("a", &toml).unwrap();
+    assert_eq!(
+        lints,
+        [
+            "--allow=unused",
+            "--warn=clippy::all",
+            "--forbid=unsafe_code",
+            "--warn=unexpected_cfgs",
+            "--deny=clippy::pedantic",
+        ]
+    );
+    assert_eq!(check_cfg, ["cfg(has_foo)"]);
+}
+
+/// A configuration seen from `cwd` with `env` and `--config` arguments `cli`.
+fn config(cwd: &Path, env: &[(&str, &str)], cli: &[&str]) -> Config {
+    let mut vars = vec![("CARGO_HOME".to_owned(), cwd.join("cargo-home").display().to_string())];
+    vars.extend(env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())));
+    Config::load(cwd, vars, &strings(cli)).unwrap()
+}
+
+// `extra_args`: `CARGO_ENCODED_RUSTFLAGS` over `RUSTFLAGS` over the config; the host's units of
+// a build with `--target` get none, `target-applies-to-host` and `[host]` being unstable.
+#[test]
+fn rustflags_precedence() {
+    let dir = Scratch::new("rustflags");
+    let cli = ["build.rustflags=['-Cconfig']", "target-applies-to-host=true"];
+    let rustflags = |env: &[(&str, &str)], target: Option<&str>, kind: Option<&str>| {
+        flags::kind_info(&config(&dir.0, env, &cli), HOST, target, kind).unwrap().rustflags
+    };
+    assert_eq!(rustflags(&[], None, None), ["-Cconfig"]);
+    assert_eq!(rustflags(&[("RUSTFLAGS", "-Cenv  -Cmore")], None, None), ["-Cenv", "-Cmore"]);
+    let both = [("RUSTFLAGS", "-Cenv"), ("CARGO_ENCODED_RUSTFLAGS", "-Ca b\x1f-Cc")];
+    assert_eq!(rustflags(&both, None, None), ["-Ca b", "-Cc"]);
+    assert_eq!(rustflags(&[], Some(TARGET), Some(TARGET)), ["-Cconfig"]);
+    assert!(rustflags(&[], Some(TARGET), None).is_empty());
+    assert!(rustflags(&[("RUSTFLAGS", "-Cenv")], Some(TARGET), None).is_empty());
+}
+
+// A `[target.'cfg(..)']` rustflag that only matches with a cfg the rustflags give: cargo's
+// second turn of `TargetInfo::new`.
+#[test]
+fn rustflags_of_target_cfg() {
+    let dir = Scratch::new("target-cfg");
+    let cli = ["build.rustflags=['--cfg=blaze']", "target.'cfg(blaze)'.rustflags=['-Cmatched']"];
+    let info = flags::kind_info(&config(&dir.0, &[], &cli), HOST, None, None).unwrap();
+    assert_eq!(info.rustflags, ["-Cmatched"]);
+    assert!(!info.cfg_lines.iter().any(|it| it == "blaze"));
+}
+
+// `custom_build.rs`'s `build_work`: features as `CARGO_FEATURE_*`, the target's cfgs as
+// `CARGO_CFG_*` with the features first under `feature`, `[env]` under what cargo sets.
+#[test]
+fn build_script_env() {
+    let cfg_lines = platform::target_cfg(HOST, &CfgArgs { proc_macro: true, ..CfgArgs::default() }).unwrap();
+    let package = vec![("CARGO_PKG_NAME".to_owned(), "app".to_owned())];
+    let features = strings(&["default", "foo-bar"]);
+    let rustflags = strings(&["-Ca", "-Cb"]);
+    let config_env = vec![
+        ("FROM_ENV".to_owned(), "1".to_owned()),
+        ("RUSTFLAGS".to_owned(), "-Cgone".to_owned()),
+        ("TARGET".to_owned(), "not-this".to_owned()),
+    ];
+    let env = env::run_env(
+        env::RunEnv {
+            package: &package,
+            out_dir: "/w/target/debug/build/app/h/out",
+            jobs: Some(4),
+            target: HOST,
+            host: HOST,
+            debug: false,
+            opt_level: "0",
+            profile: "debug",
+            linker: None,
+            links: Some("z"),
+            features: &features,
+            debug_assertions: true,
+            cfg_lines: &cfg_lines,
+            rustflags: &rustflags,
+        },
+        &config_env,
+    );
+    assert!(env.windows(2).all(|it| it[0].0 < it[1].0), "{env:?}");
+    for (name, value) in [
+        ("CARGO_FEATURE_DEFAULT", "1"),
+        ("CARGO_FEATURE_FOO_BAR", "1"),
+        ("CARGO_CFG_TARGET_OS", "linux"),
+        ("CARGO_CFG_TARGET_ARCH", "x86_64"),
+        ("CARGO_CFG_UNIX", ""),
+        ("CARGO_CFG_FEATURE", "default,foo-bar"),
+        ("CARGO_CFG_DEBUG_ASSERTIONS", ""),
+        ("CARGO_ENCODED_RUSTFLAGS", "-Ca\x1f-Cb"),
+        ("CARGO_MANIFEST_LINKS", "z"),
+        ("CARGO_PKG_NAME", "app"),
+        ("DEBUG", "false"),
+        ("FROM_ENV", "1"),
+        ("HOST", HOST),
+        ("NUM_JOBS", "4"),
+        ("OPT_LEVEL", "0"),
+        ("OUT_DIR", "/w/target/debug/build/app/h/out"),
+        ("PROFILE", "debug"),
+        ("TARGET", HOST),
+    ] {
+        assert_eq!(get(&env, name), Some(value), "{name}");
+    }
+    assert_eq!(get(&env, "RUSTFLAGS"), None);
+    assert_eq!(get(&env, "RUSTC_LINKER"), None);
+}
+
+/// A compile unit's files in a build directory at `/w/build` and a target directory at
+/// `/w/target`, its package directory `app/0123456789abcdef`.
+fn files(triple: &str, mode: hash::CompileMode, kind: &TargetKind, name: &str, extra: Option<&str>, is_root: bool) -> Vec<String> {
+    let target = (triple != HOST).then_some(triple);
+    let layout = Layout::new(Path::new("/w/target"), Path::new("/w/build"), target, "debug");
+    let host_layout = Layout::new(Path::new("/w/target"), Path::new("/w/build"), None, "debug");
+    let crate_name = name.replace('-', "_");
+    outputs::compile_outputs(&CompileFiles {
+        mode,
+        kind,
+        name,
+        crate_name: &crate_name,
+        bin_name: None,
+        package: "app",
+        triple,
+        extra,
+        pkg_dir: &format!("app/{H}"),
+        layout: &layout,
+        host_layout: &host_layout,
+        new_layout: true,
+        artifact_dir: true,
+        stop_rlib_uplift: true,
+        is_root,
+    })
+    .unwrap()
+}
+
+#[test]
+fn outputs_on_linux() {
+    let out = format!("/w/build/debug/build/app/{H}/out");
+    let lib = TargetKind::Lib(vec![CrateType::Lib]);
+    assert_eq!(
+        files(HOST, hash::CompileMode::Build, &lib, "app", Some(H), true),
+        [format!("{out}/libapp-{H}.rlib"), format!("{out}/libapp-{H}.rmeta"), format!("{out}/app-{H}.d")]
+    );
+    assert_eq!(
+        files(HOST, hash::CompileMode::Build, &TargetKind::Bin, "my-app", None, true),
+        [
+            format!("{out}/my_app"),
+            "/w/target/debug/my-app".to_owned(),
+            format!("{out}/my_app.dwp"),
+            "/w/target/debug/my-app.dwp".to_owned(),
+            format!("{out}/my_app.d"),
+            "/w/target/debug/my-app.d".to_owned(),
+        ]
+    );
+    assert_eq!(
+        files(HOST, hash::CompileMode::Test, &TargetKind::Test, "it", Some(H), true),
+        [format!("{out}/it-{H}"), format!("{out}/it-{H}.dwp"), format!("{out}/it-{H}.d")]
+    );
+    assert_eq!(
+        files(HOST, hash::CompileMode::Build, &TargetKind::ExampleBin, "ex", None, true),
+        [
+            format!("{out}/ex"),
+            "/w/target/debug/examples/ex".to_owned(),
+            format!("{out}/ex.dwp"),
+            "/w/target/debug/examples/ex.dwp".to_owned(),
+            format!("{out}/ex.d"),
+            "/w/target/debug/examples/ex.d".to_owned(),
+        ]
+    );
+    assert_eq!(
+        files(HOST, hash::CompileMode::Build, &TargetKind::CustomBuild, "build-script-build", None, false),
+        [format!("{out}/build_script_build"), format!("{out}/build_script_build.dwp"), format!("{out}/build_script_build.d")]
+    );
+    assert_eq!(
+        files(HOST, hash::CompileMode::Check { test: false }, &lib, "app", Some(H), true),
+        [format!("{out}/libapp-{H}.rmeta"), format!("{out}/app-{H}.d")]
+    );
+    // A unit for `--target` under the target's directories.
+    let target_out = format!("/w/build/{TARGET}/debug/build/app/{H}/out");
+    assert_eq!(
+        files(TARGET, hash::CompileMode::Build, &TargetKind::Bin, "app", None, true)[..2],
+        [format!("{target_out}/app"), format!("/w/target/{TARGET}/debug/app")]
+    );
+    let (run_out, run) = outputs::run_files(&Layout::new(Path::new("/w/target"), Path::new("/w/build"), None, "debug"), true, "app/h");
+    assert_eq!(run_out, "/w/build/debug/build/app/h/out");
+    assert_eq!(
+        run,
+        ["/w/build/debug/build/app/h/run/stdout", "/w/build/debug/build/app/h/run/stderr", "/w/build/debug/build/app/h/run/root-output"]
+    );
+}
+
+// The layout `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT=1` keeps.
+#[test]
+fn outputs_in_the_old_layout() {
+    let layout = Layout::new(Path::new("/w/target"), Path::new("/w/target"), None, "debug");
+    let lib = TargetKind::Lib(vec![CrateType::Lib]);
+    let it = CompileFiles {
+        mode: hash::CompileMode::Build,
+        kind: &lib,
+        name: "app",
+        crate_name: "app",
+        bin_name: None,
+        package: "app",
+        triple: HOST,
+        extra: Some(H),
+        pkg_dir: &format!("app-{H}"),
+        layout: &layout,
+        host_layout: &layout,
+        new_layout: false,
+        artifact_dir: true,
+        stop_rlib_uplift: true,
+        is_root: true,
+    };
+    assert_eq!(
+        outputs::compile_outputs(&it).unwrap(),
+        [
+            format!("/w/target/debug/deps/libapp-{H}.rlib"),
+            format!("/w/target/debug/deps/libapp-{H}.rmeta"),
+            format!("/w/target/debug/deps/app-{H}.d"),
+        ]
+    );
+    let script = CompileFiles { kind: &TargetKind::CustomBuild, name: "build-script-build", crate_name: "build_script_build", extra: Some(H), ..it };
+    assert_eq!(
+        outputs::compile_outputs(&script).unwrap()[..2],
+        [format!("/w/target/debug/build/app-{H}/build_script_build-{H}"), format!("/w/target/debug/build/app-{H}/build-script-build")]
+    );
+    let (run_out, run) = outputs::run_files(&layout, false, "app-h");
+    assert_eq!(run_out, "/w/target/debug/build/app-h/out");
+    assert_eq!(run[0], "/w/target/debug/build/app-h/output");
+}
+
+#[test]
+fn uplifted_on_macos() {
+    let mac = "aarch64-apple-darwin";
+    let out = format!("/w/build/{mac}/debug/build/app/{H}/out");
+    assert_eq!(
+        files(mac, hash::CompileMode::Build, &TargetKind::Bin, "my-app", None, true),
+        [
+            format!("{out}/my_app"),
+            format!("/w/target/{mac}/debug/my-app"),
+            format!("{out}/my_app.dSYM"),
+            format!("/w/target/{mac}/debug/my-app.dSYM"),
+            format!("{out}/my_app.d"),
+            format!("/w/target/{mac}/debug/my-app.d"),
+        ]
+    );
+    // A dylib is uplifted though no root; no `.d` beside it then.
+    let dylib = TargetKind::Lib(vec![CrateType::Dylib]);
+    assert_eq!(
+        files(mac, hash::CompileMode::Build, &dylib, "foo", None, false),
+        [
+            format!("{out}/libfoo.dylib"),
+            format!("/w/target/{mac}/debug/libfoo.dylib"),
+            format!("{out}/libfoo.dylib.dSYM"),
+            format!("/w/target/{mac}/debug/libfoo.dylib.dSYM"),
+            format!("{out}/foo.d"),
+        ]
+    );
+}
+
+#[test]
+fn uplifted_on_windows() {
+    let msvc = "x86_64-pc-windows-msvc";
+    let out = format!("/w/build/{msvc}/debug/build/app/{H}/out");
+    let dest = format!("/w/target/{msvc}/debug");
+    // The `.pdb`'s copy has the crate's name, the `.exe`'s the bin's.
+    assert_eq!(
+        files(msvc, hash::CompileMode::Build, &TargetKind::Bin, "my-app", None, true),
+        [
+            format!("{out}/my_app.exe"),
+            format!("{dest}/my-app.exe"),
+            format!("{out}/my_app.pdb"),
+            format!("{dest}/my_app.pdb"),
+            format!("{out}/my_app.d"),
+            format!("{dest}/my-app.d"),
+        ]
+    );
+    let dylib = TargetKind::Lib(vec![CrateType::Dylib]);
+    assert_eq!(
+        files(msvc, hash::CompileMode::Build, &dylib, "foo", None, false),
+        [
+            format!("{out}/foo.dll"),
+            format!("{dest}/foo.dll"),
+            format!("{out}/foo.dll.lib"),
+            format!("{dest}/foo.dll.lib"),
+            format!("{out}/foo.dll.exp"),
+            format!("{dest}/foo.dll.exp"),
+            format!("{out}/foo.pdb"),
+            format!("{dest}/foo.pdb"),
+            format!("{out}/foo.d"),
+        ]
+    );
+    let gnu = "x86_64-pc-windows-gnu";
+    let gnu_out = format!("/w/build/{gnu}/debug/build/app/{H}/out");
+    assert_eq!(
+        files(gnu, hash::CompileMode::Build, &dylib, "foo", None, false)[..4],
+        [
+            format!("{gnu_out}/foo.dll"),
+            format!("/w/target/{gnu}/debug/foo.dll"),
+            format!("{gnu_out}/libfoo.dll.a"),
+            format!("/w/target/{gnu}/debug/libfoo.dll.a"),
+        ]
+    );
+}
+
+/// A directory of the test's own under the system's temporary one, removed after.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!("blaze-plan-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dir.canonicalize().unwrap())
+    }
+
+    fn write(&self, path: &str, contents: &str) -> PathBuf {
+        let path = self.0.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn manifest(path: &Path, source: blaze_manifest::source::SourceId, config: Config) -> Manifest {
+    match read_manifest(path, source, &Context::new(config)).unwrap() {
+        EitherManifest::Real(it) => *it,
+        EitherManifest::Virtual(_) => panic!("`{}` has no package", path.display()),
+    }
+}
+
+fn dev(debuginfo: u8) -> schema::Profile {
+    schema::Profile {
+        name: "dev".to_owned(),
+        opt_level: "0".to_owned(),
+        lto: "false".to_owned(),
+        codegen_backend: None,
+        codegen_units: None,
+        debuginfo: DebugInfo::Level(debuginfo),
+        split_debuginfo: None,
+        debug_assertions: true,
+        overflow_checks: true,
+        rpath: false,
+        incremental: false,
+        panic: "unwind".to_owned(),
+        strip: Strip::Deferred(Stripped::None),
+        rustflags: Vec::new(),
+        trim_paths: None,
+        hint_mostly_unused: None,
+    }
+}
+
+fn unit(pkg: &str, kind: &[&str], crate_types: &[&str], name: &str, platform: Option<&str>, mode: Mode, features: &[&str], deps: &[usize]) -> Unit {
+    Unit {
+        pkg_id: pkg.to_owned(),
+        target: schema::Target {
+            kind: strings(kind),
+            crate_types: strings(crate_types),
+            name: name.to_owned(),
+            src_path: PathBuf::from(format!("/src/{name}.rs")),
+            edition: "2021".to_owned(),
+            required_features: None,
+            doc: false,
+            doctest: false,
+            test: true,
+        },
+        profile: dev(if kind == ["custom-build"] { 0 } else { 2 }),
+        platform: platform.map(str::to_owned),
+        mode,
+        checked_as_test: false,
+        features: strings(features),
+        is_std: false,
+        dependencies: deps
+            .iter()
+            .map(|&index| UnitDep { index, extern_crate_name: format!("dep{index}"), public: None, noprelude: None, nounused: None })
+            .collect(),
+    }
+}
+
+/// The units of `cargo build --all-targets`-like build of the workspace's one package `app`
+/// (a library, a bin `app`, a test `it`, a build script, features `default` and `foo-bar`),
+/// depending on serde from crates.io and the path proc macro `pm`, for `target` (none: the
+/// host).
+fn app_units(target: Option<&str>) -> Vec<Unit> {
+    let features = ["default", "foo-bar"];
+    vec![
+        unit("serde", &["lib"], &["lib"], "serde", target, Mode::Build, &["default", "std"], &[]),
+        unit("pm", &["proc-macro"], &["proc-macro"], "pm", None, Mode::Build, &[], &[]),
+        unit("app", &["custom-build"], &["bin"], "build-script-build", None, Mode::Build, &features, &[]),
+        unit("app", &["custom-build"], &["bin"], "build-script-build", target, Mode::RunCustomBuild, &features, &[2]),
+        unit("app", &["lib"], &["lib"], "app", target, Mode::Build, &features, &[0, 1, 3]),
+        unit("app", &["bin"], &["bin"], "app", target, Mode::Build, &features, &[4, 0, 3]),
+        unit("app", &["test"], &["bin"], "it", target, Mode::Test, &features, &[4, 3]),
+    ]
+}
+
+const APP: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n\
+                   [features]\ndefault = [\"foo-bar\"]\nfoo-bar = []\n\n\
+                   [dependencies]\nserde = \"1\"\npm = { path = \"pm\" }\n\n\
+                   [lints.rust]\nunsafe_code = \"forbid\"\nunexpected_cfgs = { level = \"warn\", check-cfg = ['cfg(has_foo)'] }\n";
+const PM: &str = "[package]\nname = \"pm\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n";
+const SERDE: &str = "[package]\nname = \"serde\"\nversion = \"1.0.219\"\nedition = \"2018\"\n\n[features]\ndefault = [\"std\"]\nstd = []\n";
+
+/// Each unit's plan of [`app_units`] for `target`.
+fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
+    let dir = Scratch::new(&format!("app-{}", target.unwrap_or("host")));
+    let ws = dir.0.join("w");
+    let app_path = dir.write("w/Cargo.toml", APP);
+    for file in ["w/build.rs", "w/src/lib.rs", "w/src/main.rs", "w/tests/it.rs"] {
+        dir.write(file, "");
+    }
+    let pm_path = dir.write("w/pm/Cargo.toml", PM);
+    dir.write("w/pm/src/lib.rs", "");
+    let serde_path = dir.write("registry/serde-1.0.219/Cargo.toml", SERDE);
+    dir.write("registry/serde-1.0.219/src/lib.rs", "");
+
+    let config = || config(&ws, &[], &["env.FROM_CONFIG='1'"]);
+    let crates_io = blaze_manifest::source::SourceId::for_registry(&"https://github.com/rust-lang/crates.io-index".parse().unwrap());
+    let app = manifest(&app_path, blaze_manifest::source::SourceId::for_manifest_path(&app_path).unwrap(), config());
+    let pm = manifest(&pm_path, blaze_manifest::source::SourceId::for_manifest_path(&pm_path).unwrap(), config());
+    let serde = manifest(&serde_path, crates_io, config());
+
+    let path_id = |name: &str, at: &Path| {
+        PackageId::new(InternedString::new(name), semver::Version::new(0, 1, 0), SourceId::for_path(at).unwrap())
+    };
+    let ids = [
+        ("app", path_id("app", &ws), &app, app_path.as_path(), true),
+        ("pm", path_id("pm", &ws.join("pm")), &pm, pm_path.as_path(), false),
+        (
+            "serde",
+            PackageId::new(InternedString::new("serde"), semver::Version::new(1, 0, 219), SourceId::crates_io()),
+            &serde,
+            serde_path.as_path(),
+            false,
+        ),
+    ];
+    let packages: FxHashMap<String, (PackageId, Package<'_>)> = ids
+        .iter()
+        .map(|(key, id, manifest, _, is_member)| ((*key).to_owned(), (*id, Package { manifest, is_member: *is_member })))
+        .collect();
+    let manifests: FxHashMap<PackageId, (&Path, &Manifest)> =
+        ids.iter().map(|(_, id, manifest, path, _)| (*id, (*path, *manifest))).collect();
+
+    let units = app_units(target);
+    let std_plans = vec![None; units.len()];
+    let config = config();
+    let base_profile = BaseProfile { root: ProfileRoot::Debug, ..BaseProfile::default() };
+    let target_dir = ws.join("target");
+    let input = PlanInput {
+        units: &units,
+        std_plans: &std_plans,
+        packages: &packages,
+        manifests: &manifests,
+        roots: &[4, 5, 6],
+        config: &config,
+        intent: Intent::Build,
+        build_std: false,
+        ws_root: &ws,
+        ws_manifest: &app_path,
+        sysroot: None,
+        target_dir: &target_dir,
+        build_dir: &target_dir,
+        host: HOST,
+        target,
+        requested_profile: "dev",
+        profile_dir: "debug",
+        base_profile: &base_profile,
+        jobs: Some(4),
+    };
+    let planned = plan(&input).unwrap();
+    (ws, planned.plans, planned.finished)
+}
+
+/// The hex of a plan's `-C extra-filename`.
+fn extra(plan: &UnitPlan) -> &str {
+    plan.extra_filename.strip_prefix('-').unwrap()
+}
+
+#[test]
+fn plans_of_a_workspace() {
+    let (ws, plans, finished) = plan_app(None);
+    let t = ws.join("target").display().to_string();
+    let build = format!("{t}/debug/build");
+    assert_eq!(finished, "`dev` profile [unoptimized + debuginfo]");
+
+    let serde = &plans[0];
+    assert_eq!((serde.metadata.clone(), serde.extra_filename.clone()), serde_metadata_by_hand(None));
+    let hex = extra(serde);
+    assert_eq!(
+        serde.outputs,
+        [
+            format!("{build}/serde/{hex}/out/libserde-{hex}.rlib"),
+            format!("{build}/serde/{hex}/out/libserde-{hex}.rmeta"),
+            format!("{build}/serde/{hex}/out/serde-{hex}.d"),
+        ]
+    );
+    assert!(serde.lints.is_empty(), "a registry package's lints are capped");
+    assert_eq!(serde.check_cfg, ["cfg(docsrs,test)", "cfg(feature, values(\"default\", \"std\"))"]);
+    assert_eq!(serde.cfgs, ["feature=\"default\"", "feature=\"std\""]);
+    assert_eq!(get(&serde.env, "CARGO_PKG_NAME"), Some("serde"));
+    assert_eq!(get(&serde.env, "CARGO_PRIMARY_PACKAGE"), None);
+    assert_eq!(get(&serde.env, "FROM_CONFIG"), Some("1"));
+
+    let pm = &plans[1];
+    let hex = extra(pm);
+    assert_eq!(
+        pm.outputs,
+        [
+            format!("{build}/pm/{hex}/out/libpm-{hex}.so"),
+            format!("{build}/pm/{hex}/out/libpm-{hex}.so.dwp"),
+            format!("{build}/pm/{hex}/out/pm-{hex}.d"),
+        ]
+    );
+
+    let script = &plans[2];
+    assert_eq!(script.extra_filename, "");
+    assert_eq!(script.metadata.len(), 16);
+    let script_dir = script.outputs[0].strip_suffix("/out/build_script_build").unwrap();
+    assert!(script_dir.starts_with(&format!("{build}/app/")), "{script_dir}");
+
+    let run = &plans[3];
+    let out_dir = run.out_dir.clone().unwrap();
+    let run_dir = out_dir.strip_suffix("/out").unwrap();
+    assert!(run_dir.starts_with(&format!("{build}/app/")) && run_dir != script_dir, "{run_dir}");
+    assert_eq!(run.outputs, [format!("{run_dir}/run/stdout"), format!("{run_dir}/run/stderr"), format!("{run_dir}/run/root-output")]);
+    for (name, value) in [
+        ("CARGO_FEATURE_FOO_BAR", "1"),
+        ("CARGO_CFG_TARGET_OS", "linux"),
+        ("CARGO_MANIFEST_DIR", ws.display().to_string().as_str()),
+        ("DEBUG", "false"),
+        ("HOST", HOST),
+        ("TARGET", HOST),
+        ("NUM_JOBS", "4"),
+        ("PROFILE", "debug"),
+        ("OUT_DIR", out_dir.as_str()),
+    ] {
+        assert_eq!(get(&run.env, name), Some(value), "{name}");
+    }
+    assert!(run.rustflags.is_empty() && run.cfgs.is_empty());
+
+    let lib = &plans[4];
+    let hex = extra(lib);
+    assert_eq!(lib.outputs[0], format!("{build}/app/{hex}/out/libapp-{hex}.rlib"));
+    assert_eq!(get(&lib.env, "OUT_DIR"), Some(out_dir.as_str()));
+    assert_eq!(get(&lib.env, "CARGO_PRIMARY_PACKAGE"), Some("1"));
+    assert_eq!(get(&lib.env, "CARGO_CRATE_NAME"), Some("app"));
+    assert_eq!(get(&lib.env, "CARGO_BIN_NAME"), None);
+    assert_eq!(lib.lints, ["--forbid=unsafe_code", "--warn=unexpected_cfgs"]);
+    assert_eq!(lib.check_cfg[2], "cfg(has_foo)");
+    assert_eq!(lib.cfgs, ["feature=\"default\"", "feature=\"foo-bar\""]);
+    assert_ne!(lib.metadata, plans[5].metadata);
+
+    let bin = &plans[5];
+    assert_eq!(bin.extra_filename, "");
+    let bin_dir = bin.outputs[0].strip_suffix("/out/app").unwrap();
+    assert!(bin_dir.starts_with(&format!("{build}/app/")));
+    assert_eq!(bin.outputs[1], format!("{t}/debug/app"));
+    assert_eq!(bin.outputs.last().unwrap(), &format!("{t}/debug/app.d"));
+    assert_eq!(get(&bin.env, "CARGO_BIN_NAME"), Some("app"));
+
+    let test = &plans[6];
+    let hex = extra(test);
+    assert_eq!(
+        test.outputs,
+        [
+            format!("{build}/app/{hex}/out/it-{hex}"),
+            format!("{build}/app/{hex}/out/it-{hex}.dwp"),
+            format!("{build}/app/{hex}/out/it-{hex}.d"),
+        ]
+    );
+    assert_eq!(get(&test.env, "CARGO_BIN_EXE_app"), Some(format!("{t}/debug/app").as_str()));
+    assert_eq!(get(&test.env, "CARGO_TARGET_TMPDIR"), Some(format!("{t}/tmp").as_str()));
+}
+
+#[test]
+fn plans_for_a_target() {
+    let (ws, plans, _) = plan_app(Some(TARGET));
+    let t = ws.join("target").display().to_string();
+    let serde = &plans[0];
+    assert_eq!((serde.metadata.clone(), serde.extra_filename.clone()), serde_metadata_by_hand(Some(TARGET)));
+    let hex = extra(serde);
+    assert_eq!(serde.outputs[0], format!("{t}/{TARGET}/debug/build/serde/{hex}/out/libserde-{hex}.rlib"));
+    // The proc macro and the build script are the host's.
+    assert!(plans[1].outputs[0].starts_with(&format!("{t}/debug/build/pm/")));
+    assert!(plans[2].outputs[0].starts_with(&format!("{t}/debug/build/app/")));
+    let run = &plans[3];
+    assert!(run.out_dir.as_deref().unwrap().starts_with(&format!("{t}/{TARGET}/debug/build/app/")));
+    assert_eq!(get(&run.env, "TARGET"), Some(TARGET));
+    assert_eq!(get(&run.env, "HOST"), Some(HOST));
+    assert_eq!(get(&run.env, "CARGO_CFG_TARGET_ARCH"), Some("aarch64"));
+    assert_eq!(plans[5].outputs[1], format!("{t}/{TARGET}/debug/app"));
+    assert_eq!(get(&plans[6].env, "CARGO_TARGET_TMPDIR"), Some(format!("{t}/{TARGET}/tmp").as_str()));
+    assert_eq!(get(&plans[6].env, "CARGO_BIN_EXE_app"), Some(format!("{t}/{TARGET}/debug/app").as_str()));
+}
+
+// What can't be planned as cargo plans it is an error naming it, never a guess.
+#[test]
+fn refusals() {
+    let mut unit = unit("app", &["lib"], &["lib"], "app", None, Mode::Doc, &[], &[]);
+    assert!(hash::CompileMode::of(&unit).unwrap_err().what.contains("rustdoc"));
+    unit.profile.trim_paths = Some(serde_json::json!("all"));
+    assert_eq!(hash::HashedProfile::of(&unit.profile).unwrap().trim_paths, hash::TrimPaths::All);
+    unit.profile.panic = "sideways".to_owned();
+    assert!(hash::HashedProfile::of(&unit.profile).is_err());
+    assert!(hash::Meta::read("0123", "-0123456789abcdef", "std").is_err());
+    assert!(hash::Meta::read(H, "", "std").is_err());
+    let meta = hash::Meta::read(H, &format!("-{H}"), "std").unwrap();
+    assert_eq!((meta.metadata(), meta.extra_filename()), (H.to_owned(), format!("-{H}")));
+}

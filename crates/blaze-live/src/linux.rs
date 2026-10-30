@@ -59,6 +59,8 @@ pub(crate) struct Live {
     lasting_pages: std::collections::HashSet<u64>,
     /// Where the room ends, above those statics: the `end` published is below them.
     room_end: u64,
+    /// The executable's image in memory, which every write over it is checked to be in.
+    image: std::ops::Range<u64>,
 }
 
 impl Live {
@@ -90,6 +92,7 @@ impl Live {
             lasting: std::collections::HashSet::new(),
             lasting_pages: std::collections::HashSet::new(),
             room_end: end,
+            image: image.start.saturating_add(image.slide)..image.end.saturating_add(image.slide),
         };
         live.publish()?;
         Ok(live)

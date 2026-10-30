@@ -427,3 +427,5 @@ are lock-free maps sharded by `blaze_ids::shard_count()`, with views in an appen
 
 > for blaze-cargo, blaze-units, blaze-tree and lane db.
 > forwarded to cargo (the nine call sites) and db (`query-database.md`).
+
+> applied by db (lane db's doc): `docs/v2/plan/lanes/db/query-database.md` now names `Pinned::get` (line 51) and says freeing is by `blaze_reclaim` grace at task ends, with `&mut` freeing all at once (the old line 75).

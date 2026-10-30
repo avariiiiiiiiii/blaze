@@ -70,7 +70,7 @@ plan/
 | [ci](plan/lanes/ci.md) | the agent API and the VM as CI |
 | [proof](plan/lanes/proof.md) | the oracle, the rustc differential corpus, budgets |
 | [cargo](plan/lanes/cargo.md) | workspace load, unit graph, CLI, std |
-| [diagnostics](plan/lanes/diagnostics.md) | rustc-exact errors and warnings |
+| [diagnostics](plan/lanes/diagnostics.md) | rustc's errors and warnings (same codes, lints, spans; our own text) |
 
 ## Where the old section numbers went
 

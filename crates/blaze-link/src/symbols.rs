@@ -658,6 +658,20 @@ impl Symbols {
         Sym(join(shard, at as u32))
     }
 
+    /// A symbol's index in a dense column of every symbol: its place in its shard times the
+    /// shard count, plus its shard. It never changes as symbols are added, and shards fill
+    /// evenly, so a column of [`Symbols::dense_len`] is within a few percent of the count.
+    #[inline]
+    pub fn dense(sym: Sym) -> usize {
+        let (shard, at) = split(sym.0);
+        at * SHARDS + shard
+    }
+
+    /// The length a column indexed by [`Symbols::dense`] needs.
+    pub fn dense_len(&self) -> usize {
+        self.keys.iter().map(|it| it.keys.len()).max().unwrap_or(0) * SHARDS
+    }
+
     /// Of an interned id, the same.
     #[inline]
     pub fn split_id(id: IdNo) -> (usize, usize) {

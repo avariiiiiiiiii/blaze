@@ -37,6 +37,7 @@ pub mod threads;
 pub mod uring;
 #[cfg(target_os = "linux")]
 mod watch;
+pub mod wheel;
 
 use std::{fmt, time::Duration};
 

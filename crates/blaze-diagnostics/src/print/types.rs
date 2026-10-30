@@ -700,7 +700,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 .collect()
         };
         projections.retain(|it| !supers.contains(&erase(self, *it)));
-        projections.sort_by_cached_key(|it| term_name(self.cx, it.def_id.0).as_str().to_owned());
+        projections.sort_by_cached_key(|it| term_name(self.cx, it.def_id.0));
 
         if own.is_empty() && projections.is_empty() {
             return;

@@ -49,13 +49,15 @@ opaque types per opaque (`rustc_hir_analysis::collect::type_of::opaque`). An ali
 
 ## What is left
 
-`specialized_ancestor` still walks every impl of the trait in the crate and its dependencies.
-The fast reject makes each step cheap, but it does not skip the walk. rustc's graph groups
-children by simplified self type, so one lookup reaches the candidates. Doing that here takes
-a per-crate query for the blanket impls of one trait, next to `in_crate_for_trait_and_self_ty`,
-in `method_resolution.rs` (the parent's file). The candidates for a specializing impl would
-then be the blanket impls plus the impls for its simplified self type, crate by crate, in the
-order `in_crate_for_trait` gives them. A tracked "parents of this impl" query would also save
+Done since by the parent (speed-types-probe): `specialized_ancestor` walked every impl of the
+trait in the crate and its dependencies. rustc's graph groups children by simplified self
+type, so one lookup reaches the candidates. Now its candidates are
+`TraitImpls::blanket_in_crate_and_deps` followed by `in_crate_and_deps_for_trait_and_self_ty`
+for its simplified self type (or the blanket impls alone when it has none): every impl it can
+specialize is at least as general, so one of those. The blanket impls of every crate now come
+before the rows, where before it went crate by crate; the closest ancestor is the one that
+specializes every other, so the same one is picked whenever one is (two impls that specialize
+each other are overlapping impls, a coherence error). A tracked "parents of this impl" query would also save
 the walk, but it would add a salsa cycle through the solver, which calls
 `fetch_eligible_assoc_item`, which calls `specialized_ancestor`. The cycle answers of
 `specializes_query` would then no longer be the only ones, so it was not done.

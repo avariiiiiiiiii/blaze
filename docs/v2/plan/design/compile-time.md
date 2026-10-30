@@ -174,6 +174,14 @@ hooks.
     affinity on hybrid Intel), and background tiers and prefetching at the lowest, so the
     operating system places them on the right cores.
 
+24. **Dev builds carry the least for the linker.**
+    - **Symbols:** symbols nobody links by name get short hash-based names. The demangled
+      names go in the debug side table, for backtraces, debuggers and profilers.
+    - **Debug info:** split and compressed (DWARF 5 `.dwo` and compressed sections, or the
+      Mach-O and PDB equivalents), so the linker never copies it.
+    - Release builds, exported and `#[no_mangle]` symbols, and dynamic-library interfaces keep
+      rustc's v0 mangling.
+
 ## Make blaze itself faster
 
 11. **Scheduling from history.** Each task's past duration and peak memory, by query kind and

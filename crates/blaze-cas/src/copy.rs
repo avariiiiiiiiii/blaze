@@ -36,37 +36,43 @@ fn split(to: *mut u8, len: usize, width: usize) -> (usize, usize) {
 fn avx512(dst: &mut Vec<u8>, src: &[u8]) {
     assert!(is_x86_feature_detected!("avx512f"));
     dst.reserve(src.len());
-    // SAFETY: the CPU has AVX-512F, asserted above. `reserve` left room for `src.len()` bytes
-    // after the length, which `x86::avx512` writes all of, and `src` is borrowed shared while
-    // `dst` is borrowed mutably, so they don't overlap.
-    unsafe {
-        x86::avx512(dst.as_mut_ptr().add(dst.len()), src);
-        dst.set_len(dst.len() + src.len());
-    }
+    // SAFETY: `dst.len() <= dst.capacity()`, so the offset is inside (or one past) `dst`'s
+    // allocation.
+    let end = unsafe { dst.as_mut_ptr().add(dst.len()) };
+    // SAFETY: the CPU has AVX-512F, asserted above; `reserve` left room for `src.len()` bytes at
+    // `end`, and `src` is borrowed shared while `dst` is borrowed mutably, so they don't overlap.
+    unsafe { x86::avx512(end, src) };
+    // SAFETY: `x86::avx512` wrote all `src.len()` bytes after the old length, and `reserve` made
+    // the capacity at least the new length.
+    unsafe { dst.set_len(dst.len() + src.len()) };
 }
 
 #[cfg(target_arch = "x86_64")]
 fn sse2(dst: &mut Vec<u8>, src: &[u8]) {
     dst.reserve(src.len());
-    // SAFETY: `reserve` left room for `src.len()` bytes after the length, which `x86::sse2`
-    // writes all of, and `src` is borrowed shared while `dst` is borrowed mutably, so they
-    // don't overlap.
-    unsafe {
-        x86::sse2(dst.as_mut_ptr().add(dst.len()), src);
-        dst.set_len(dst.len() + src.len());
-    }
+    // SAFETY: `dst.len() <= dst.capacity()`, so the offset is inside (or one past) `dst`'s
+    // allocation.
+    let end = unsafe { dst.as_mut_ptr().add(dst.len()) };
+    // SAFETY: `reserve` left room for `src.len()` bytes at `end`, and `src` is borrowed shared
+    // while `dst` is borrowed mutably, so they don't overlap.
+    unsafe { x86::sse2(end, src) };
+    // SAFETY: `x86::sse2` wrote all `src.len()` bytes after the old length, and `reserve` made
+    // the capacity at least the new length.
+    unsafe { dst.set_len(dst.len() + src.len()) };
 }
 
 #[cfg(target_arch = "aarch64")]
 fn stnp(dst: &mut Vec<u8>, src: &[u8]) {
     dst.reserve(src.len());
-    // SAFETY: `reserve` left room for `src.len()` bytes after the length, which `arm::stnp`
-    // writes all of, and `src` is borrowed shared while `dst` is borrowed mutably, so they
-    // don't overlap.
-    unsafe {
-        arm::stnp(dst.as_mut_ptr().add(dst.len()), src);
-        dst.set_len(dst.len() + src.len());
-    }
+    // SAFETY: `dst.len() <= dst.capacity()`, so the offset is inside (or one past) `dst`'s
+    // allocation.
+    let end = unsafe { dst.as_mut_ptr().add(dst.len()) };
+    // SAFETY: `reserve` left room for `src.len()` bytes at `end`, and `src` is borrowed shared
+    // while `dst` is borrowed mutably, so they don't overlap.
+    unsafe { arm::stnp(end, src) };
+    // SAFETY: `arm::stnp` wrote all `src.len()` bytes after the old length, and `reserve` made
+    // the capacity at least the new length.
+    unsafe { dst.set_len(dst.len() + src.len()) };
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -88,20 +94,29 @@ mod x86 {
     pub(super) unsafe fn avx512(to: *mut u8, from: &[u8]) {
         let (head, body) = split(to, from.len(), 64);
         let src = from.as_ptr();
-        // SAFETY: every offset is below `from.len()`, for which both pointers are valid (the
-        // caller's contract), and each store is at `to + head + 64k`, 64-byte aligned by
-        // `split`. The non-temporal stores are fenced before anything else touches `to`.
-        unsafe {
-            ptr::copy_nonoverlapping(src, to, head);
-            let mut at = head;
-            while at < head + body {
-                let v = _mm512_loadu_si512(src.add(at).cast());
-                _mm512_stream_si512(to.add(at).cast(), v);
-                at += 64;
-            }
-            _mm_sfence();
-            ptr::copy_nonoverlapping(src.add(at), to.add(at), from.len() - at);
+        // SAFETY: `head <= from.len()` (`split`); `src` is valid for reads and `to` for writes of
+        // `from.len()` bytes, and they don't overlap (the caller's contract).
+        unsafe { ptr::copy_nonoverlapping(src, to, head) };
+        let mut at = head;
+        while at < head + body {
+            // SAFETY: `body` is a multiple of 64 and `at` moves by 64 from `head`, so
+            // `at + 64 <= head + body <= from.len()`, and `at` is inside `from`.
+            let from_at = unsafe { src.add(at) };
+            // SAFETY: the 64 bytes at `from_at` are inside `from`; the load takes any alignment.
+            let v = unsafe { _mm512_loadu_si512(from_at.cast()) };
+            // SAFETY: `at < from.len()`, for which `to` is valid (the caller's contract).
+            let to_at = unsafe { to.add(at) };
+            // SAFETY: `to_at` is 64-byte aligned (`split` aligned `to + head`, and `at` moves by
+            // 64) and has 64 writable bytes (`at + 64 <= from.len()`).
+            unsafe { _mm512_stream_si512(to_at.cast(), v) };
+            at += 64;
         }
+        _mm_sfence();
+        // SAFETY: `at <= from.len()`, so both offsets are inside (or one past) their buffers.
+        let (from_at, to_at) = (unsafe { src.add(at) }, unsafe { to.add(at) });
+        // SAFETY: the `from.len() - at` bytes from each are in `from` and `to` (the caller's
+        // contract), which don't overlap; the non-temporal stores were fenced above.
+        unsafe { ptr::copy_nonoverlapping(from_at, to_at, from.len() - at) };
     }
 
     /// Copies `from` to `to`, the 16-byte-aligned middle with non-temporal stores.
@@ -112,21 +127,31 @@ mod x86 {
     pub(super) unsafe fn sse2(to: *mut u8, from: &[u8]) {
         let (head, body) = split(to, from.len(), 16);
         let src = from.as_ptr();
-        // SAFETY: SSE2 is baseline on x86_64. Every offset is below `from.len()`, for which
-        // both pointers are valid (the caller's contract), and each store is at
-        // `to + head + 16k`, 16-byte aligned by `split`. The non-temporal stores are fenced
-        // before anything else touches `to`.
-        unsafe {
-            ptr::copy_nonoverlapping(src, to, head);
-            let mut at = head;
-            while at < head + body {
-                let v = _mm_loadu_si128(src.add(at).cast());
-                _mm_stream_si128(to.add(at).cast(), v);
-                at += 16;
-            }
-            _mm_sfence();
-            ptr::copy_nonoverlapping(src.add(at), to.add(at), from.len() - at);
+        // SAFETY: `head <= from.len()` (`split`); `src` is valid for reads and `to` for writes of
+        // `from.len()` bytes, and they don't overlap (the caller's contract).
+        unsafe { ptr::copy_nonoverlapping(src, to, head) };
+        let mut at = head;
+        while at < head + body {
+            // SAFETY: `body` is a multiple of 16 and `at` moves by 16 from `head`, so
+            // `at + 16 <= head + body <= from.len()`, and `at` is inside `from`.
+            let from_at = unsafe { src.add(at) };
+            // SAFETY: SSE2 is baseline on x86_64; the 16 bytes at `from_at` are inside `from`,
+            // and the load takes any alignment.
+            let v = unsafe { _mm_loadu_si128(from_at.cast()) };
+            // SAFETY: `at < from.len()`, for which `to` is valid (the caller's contract).
+            let to_at = unsafe { to.add(at) };
+            // SAFETY: SSE2 is baseline on x86_64; `to_at` is 16-byte aligned (`split` aligned
+            // `to + head`, and `at` moves by 16) and has 16 writable bytes
+            // (`at + 16 <= from.len()`).
+            unsafe { _mm_stream_si128(to_at.cast(), v) };
+            at += 16;
         }
+        _mm_sfence();
+        // SAFETY: `at <= from.len()`, so both offsets are inside (or one past) their buffers.
+        let (from_at, to_at) = (unsafe { src.add(at) }, unsafe { to.add(at) });
+        // SAFETY: the `from.len() - at` bytes from each are in `from` and `to` (the caller's
+        // contract), which don't overlap; the non-temporal stores were fenced above.
+        unsafe { ptr::copy_nonoverlapping(from_at, to_at, from.len() - at) };
     }
 }
 
@@ -147,30 +172,39 @@ mod arm {
     pub(super) unsafe fn stnp(to: *mut u8, from: &[u8]) {
         let (head, body) = split(to, from.len(), 64);
         let src = from.as_ptr();
-        // SAFETY: NEON is baseline on aarch64. Every offset is below `from.len()`, for which
-        // both pointers are valid (the caller's contract): each `asm!` reads and writes the 64
-        // bytes at `at`, and `at + 64 <= head + body <= from.len()`.
-        unsafe {
-            ptr::copy_nonoverlapping(src, to, head);
-            let mut at = head;
-            while at < head + body {
+        // SAFETY: `head <= from.len()` (`split`); `src` is valid for reads and `to` for writes of
+        // `from.len()` bytes, and they don't overlap (the caller's contract).
+        unsafe { ptr::copy_nonoverlapping(src, to, head) };
+        let mut at = head;
+        while at < head + body {
+            // SAFETY: `body` is a multiple of 64 and `at` moves by 64 from `head`, so
+            // `at + 64 <= head + body <= from.len()`, and `at` is inside both buffers.
+            let (from_at, to_at) = (unsafe { src.add(at) }, unsafe { to.add(at) });
+            // SAFETY: NEON is baseline on aarch64; the asm reads the 64 bytes at `from_at`, in
+            // `from`, and writes the 64 at `to_at`, in `to` (the caller's contract), which don't
+            // overlap.
+            unsafe {
                 asm!(
                     "ldp {a:q}, {b:q}, [{src}]",
                     "ldp {c:q}, {d:q}, [{src}, #32]",
                     "stnp {a:q}, {b:q}, [{dst}]",
                     "stnp {c:q}, {d:q}, [{dst}, #32]",
-                    src = in(reg) src.add(at),
-                    dst = in(reg) to.add(at),
+                    src = in(reg) s,
+                    dst = in(reg) d,
                     a = out(vreg) _,
                     b = out(vreg) _,
                     c = out(vreg) _,
                     d = out(vreg) _,
                     options(nostack, preserves_flags),
-                );
-                at += 64;
-            }
-            ptr::copy_nonoverlapping(src.add(at), to.add(at), from.len() - at);
+                )
+            };
+            at += 64;
         }
+        // SAFETY: `at <= from.len()`, so both offsets are inside (or one past) their buffers.
+        let (from_at, to_at) = (unsafe { src.add(at) }, unsafe { to.add(at) });
+        // SAFETY: the `from.len() - at` bytes from each are in `from` and `to` (the caller's
+        // contract), which don't overlap.
+        unsafe { ptr::copy_nonoverlapping(from_at, to_at, from.len() - at) };
     }
 }
 

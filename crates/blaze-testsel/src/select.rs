@@ -585,4 +585,4 @@ fn end<P: Passes + ?Sized>(store: &P, given: ContentId, name: &str) -> Result<Op
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

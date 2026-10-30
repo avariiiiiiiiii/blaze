@@ -37,7 +37,10 @@ pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
     let mut warnings: Vec<(ExprId, Option<ExprId>)> = visitor.warnings;
     let blocks: Vec<_> = warnings.iter().map(|&(block, _)| (block, Block::of(b, block))).collect();
     let block_of = |id: ExprId| blocks.iter().find(|(it, _)| *it == id).and_then(|(_, it)| it.clone());
-    warnings.sort_by_key(|&(block, _)| block_of(block).map(|it| (it.span.file.clone(), it.span.lo, it.span.hi)));
+    let span_of = |id: ExprId| {
+        blocks.iter().find(|(it, _)| *it == id).and_then(|(_, it)| it.as_ref()).map(|it| (&it.span.file, it.span.lo, it.span.hi))
+    };
+    warnings.sort_by(|&(a, _), &(b, _)| span_of(a).cmp(&span_of(b)));
     let mut found = Vec::new();
     for (block, enclosing) in warnings {
         let Some(at) = block_of(block) else { continue };

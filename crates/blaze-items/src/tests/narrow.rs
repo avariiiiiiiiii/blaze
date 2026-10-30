@@ -654,3 +654,47 @@ fn removing_the_trait_method_reruns_the_lookup() {
     let warm = db.executed(|| infer(&db, caller));
     assert!(ran(&warm, "::for_body"), "{warm:#?}");
 }
+
+const SPECIALIZED_CHAIN: &str = r#"//- /dep.rs crate:dep
+#![feature(specialization)]
+pub trait Tr { type A; }
+impl<T> Tr for T { default type A = u16; }
+pub struct Other<T>(T);
+impl<T> Tr for Other<T> { default type A = u32; }
+//- /main.rs crate:main deps:dep
+#![feature(specialization)]
+use dep::Tr;
+pub struct W<T>(T);
+impl<T> Tr for W<T> { default type A = u8; }
+impl Tr for W<u8> {}
+pub fn closest(x: <W<u8> as Tr>::A) -> u8 { x }
+pub fn blanket(x: <W<u8> as Tr>::A) -> u16 { x }
+"#;
+
+/// The impl a specializing impl takes an item from is among the blanket impls and the impls
+/// for its own simplified self type: `impl Tr for W<u8>` takes `A` from `impl<T> Tr for W<T>`,
+/// the closest, not from the blanket impl of another crate it also specializes.
+#[test]
+fn a_specializing_impl_takes_the_item_of_its_closest_ancestor_of_its_self_type() {
+    let (db, _) = TestDB::with_many_files(SPECIALIZED_CHAIN);
+    let main = crate_named(&db, "main");
+    let mismatches = |name: &str| {
+        let function = crate_def_map(&db, main)
+            .modules(&db)
+            .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
+            .find_map(|def| match def {
+                ModuleDefId::FunctionId(it)
+                    if FunctionSignature::of(&db, it).name.as_str() == name =>
+                {
+                    Some(it)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no function `{name}`"));
+        hir_ty::attach_db(&db, || {
+            InferenceResult::of(&db, DefWithBodyId::from(function)).has_type_mismatches()
+        })
+    };
+    assert!(!mismatches("closest"), "`<W<u8> as Tr>::A` is `u8`");
+    assert!(mismatches("blanket"), "`<W<u8> as Tr>::A` is no `u16`");
+}

@@ -15,14 +15,13 @@
 //! The store never replaces a value, so the chain only grows; its end is found by doubling
 //! and halving, a few gets however long it is.
 
-use std::{
-    collections::BTreeMap, convert::Infallible, ffi::OsString, fmt, path::PathBuf, time::Duration,
-};
+use std::{convert::Infallible, ffi::OsString, fmt, path::PathBuf, time::Duration};
 
 use blaze_cas::{Corrupt, Key, Kind, Mismatch, Store, Ticket};
 use blaze_core::{Traced, Untraceable};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     Given, Reached, RunKey, RunKind,
@@ -123,7 +122,7 @@ impl Test {
     /// are in [`Suite::given_whole`].
     pub fn whole(tests: &[Test]) -> Test {
         let mut reached = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = FxHashSet::default();
         for test in tests {
             for hash in &test.reached {
                 if seen.insert(*hash) {
@@ -424,9 +423,9 @@ fn explain<P: Passes + ?Sized, I: Inputs>(
 
 /// The first input of `before` whose value `now` does not have.
 fn changed_input(before: &Traced, now: &Traced) -> Option<Input> {
-    let files: BTreeMap<_, _> = now.files.iter().map(|(path, hash)| (path, hash)).collect();
-    let dirs: BTreeMap<_, _> = now.dirs.iter().map(|(path, hash)| (path, hash)).collect();
-    let env: BTreeMap<_, _> = now.env.iter().map(|(name, value)| (name, value)).collect();
+    let files: FxHashMap<_, _> = now.files.iter().map(|(path, hash)| (path, hash)).collect();
+    let dirs: FxHashMap<_, _> = now.dirs.iter().map(|(path, hash)| (path, hash)).collect();
+    let env: FxHashMap<_, _> = now.env.iter().map(|(name, value)| (name, value)).collect();
     for (path, hash) in &before.files {
         if files.get(path) != Some(&hash) {
             return Some(Input::File(path.clone()));

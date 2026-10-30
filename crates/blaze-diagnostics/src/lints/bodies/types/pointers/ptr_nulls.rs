@@ -53,19 +53,31 @@ impl LatePass for PtrNullChecks {
                     return;
                 }
                 let Some(name) = callee_item(b, callee) else { return };
-                if matches!(name.as_str(), "ptr_const_is_null" | "ptr_is_null")
+                let items = util::items();
+                if (name == items.ptr_const_is_null || name == items.ptr_is_null)
                     && let [arg] = args
                     && let Some(useless) = useless_check(b, *arg)
                 {
                     emit_useless(b, expr, useless, out);
                     return;
                 }
-                let (arg_indices, are_zsts_allowed): (&[usize], bool) = match name.as_str() {
-                    "ptr_read" | "ptr_read_unaligned" | "ptr_replace" | "ptr_write" | "ptr_write_bytes"
-                    | "ptr_write_unaligned" => (&[0], true),
-                    "slice_from_raw_parts" | "slice_from_raw_parts_mut" => (&[0], false),
-                    "ptr_copy" | "ptr_copy_nonoverlapping" | "ptr_swap" | "ptr_swap_nonoverlapping" => (&[0, 1], true),
-                    _ => return,
+                let first: [Symbol; 6] = [
+                    items.ptr_read,
+                    items.ptr_read_unaligned,
+                    items.ptr_replace,
+                    items.ptr_write,
+                    items.ptr_write_bytes,
+                    items.ptr_write_unaligned,
+                ];
+                let both = [items.ptr_copy, items.ptr_copy_nonoverlapping, items.ptr_swap, items.ptr_swap_nonoverlapping];
+                let (arg_indices, are_zsts_allowed): (&[usize], bool) = if first.contains(&name) {
+                    (&[0], true)
+                } else if name == items.slice_from_raw_parts || name == items.slice_from_raw_parts_mut {
+                    (&[0], false)
+                } else if both.contains(&name) {
+                    (&[0, 1], true)
+                } else {
+                    return;
                 };
                 let inits = self.inits.of(b);
                 for &index in arg_indices {
@@ -97,7 +109,7 @@ impl LatePass for PtrNullChecks {
             }
             Expr::MethodCall { receiver, args: &[], .. } => {
                 if matches!(util::ty_adjusted(b, receiver).kind(), TyKind::RawPtr(..))
-                    && matches!(method_item(b, expr).as_ref().map(Symbol::as_str), Some("ptr_const_is_null" | "ptr_is_null"))
+                    && method_item(b, expr).is_some_and(|it| it == util::items().ptr_const_is_null || it == util::items().ptr_is_null)
                     && let Some(useless) = useless_check(b, receiver)
                 {
                     emit_useless(b, expr, useless, out);
@@ -114,7 +126,7 @@ impl LatePass for PtrNullChecks {
                 let is_null = match store.expr(to_check) {
                     Expr::Cast { expr: inner, .. } => is_zero(b, inner),
                     Expr::Call { callee, args } => {
-                        args.is_empty() && matches!(callee_item(b, callee).as_ref().map(Symbol::as_str), Some("ptr_null" | "ptr_null_mut"))
+                        args.is_empty() && callee_item(b, callee).is_some_and(|it| it == util::items().ptr_null || it == util::items().ptr_null_mut)
                     }
                     _ => false,
                 };
@@ -183,7 +195,7 @@ fn useless_check(b: &BodyCx<'_, '_>, mut e: ExprId) -> Option<Useless> {
                 expr
             }
             Expr::MethodCall { receiver, args, .. }
-                if args.is_empty() && matches!(method_item(b, e).as_ref().map(Symbol::as_str), Some("ptr_cast" | "ptr_cast_mut")) =>
+                if args.is_empty() && method_item(b, e).is_some_and(|it| it == util::items().ptr_cast || it == util::items().ptr_cast_mut) =>
             {
                 had_at_least_one_cast = true;
                 receiver
@@ -209,7 +221,7 @@ fn is_null_ptr(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: E
     let expr = peel_casts(b, inits, expr);
     let is_null = match b.store().expr(expr) {
         Expr::Call { callee, args } if args.is_empty() => {
-            matches!(callee_item(b, callee).as_ref().map(Symbol::as_str), Some("ptr_null" | "ptr_null_mut"))
+            callee_item(b, callee).is_some_and(|it| it == util::items().ptr_null || it == util::items().ptr_null_mut)
         }
         Expr::Call { .. } => false,
         _ => is_zero(b, expr),

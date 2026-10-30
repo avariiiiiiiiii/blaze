@@ -21,6 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use blaze_codegen::{CompiledFunction, InstanceKey};
+use blaze_inproc::frame::Kind;
 use blaze_items::{CodeHash, ItemKey};
 
 use crate::{
@@ -42,8 +43,9 @@ pub trait Placer: Send + 'static {
 
 /// The run processes' channels.
 pub trait Answers: Send + Sync + 'static {
-    /// Sends one frame to `client`.
-    fn send(&self, client: u32, frame: &[u8]);
+    /// Sends `body` to `client` as a blaze-inproc frame of `kind`, answering the frame of
+    /// sequence number `seq`.
+    fn send(&self, client: u32, seq: u32, kind: Kind, body: &[u8]);
     /// The run called `function` (its instance and item; none for an id the session doesn't
     /// have), which can't be compiled: stop it with `why`.
     fn stop(&self, function: Option<(InstanceKey, ItemKey)>, why: &str);
@@ -120,22 +122,31 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         });
         let mut threads = Vec::with_capacity(workers as usize);
         for n in 0..workers {
-            let shared = Arc::clone(&shared);
-            let thread = std::thread::Builder::new()
-                .name(format!("blaze-lazy-{n}"))
-                .spawn(move || shared.work())
-                .map_err(|it| format!("starting a lazy compile thread: {it}"))?;
-            threads.push(thread);
+            let worker = Arc::clone(&shared);
+            let spawned =
+                std::thread::Builder::new().name(format!("blaze-lazy-{n}")).spawn(move || worker.work());
+            match spawned {
+                Ok(thread) => threads.push(thread),
+                Err(error) => {
+                    drop(Runner { shared, threads });
+                    return Err(format!("starting a lazy compile thread: {error}"));
+                }
+            }
         }
         Ok(Runner { shared, threads })
     }
 
-    /// A frame from `client`'s run process. A frame that is not an ask is an error of the
-    /// channel, for the daemon to stop the run with.
-    pub fn frame(&self, client: u32, bytes: &[u8]) -> Result<(), WireError> {
-        match Frame::decode(bytes)? {
+    /// A blaze-inproc frame of `kind` and sequence number `seq` from `client`'s run process,
+    /// with body `bytes`. A frame that is not an ask is an error of the channel, for the
+    /// daemon to stop the run with.
+    pub fn frame(&self, client: u32, kind: Kind, seq: u32, bytes: &[u8]) -> Result<(), WireError> {
+        let frame = Frame::decode(bytes)?;
+        if wire::channel_kind(&frame) != kind {
+            return Err(WireError::Kind(u32::from(kind.0)));
+        }
+        match frame {
             Frame::Ask { request, lazy } => {
-                self.shared.ask(Waiter { client, request }, lazy);
+                self.shared.ask(Waiter { client, seq, request }, lazy);
                 Ok(())
             }
             Frame::Ready { .. } | Frame::Failed { .. } => Err(WireError::Unasked),
@@ -203,7 +214,7 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
         let mut state = lock(&self.state);
         if let Some(target) = state.fetcher.target(LazyId(lazy)) {
             drop(state);
-            self.answers.send(to.client, &wire::ready(to.request, lazy, target));
+            self.answers.send(to.client, to.seq, wire::READY_KIND, &wire::ready(to.request, lazy, target));
             return;
         }
         let mut actions = Vec::new();
@@ -282,15 +293,12 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
             match action {
                 Action::Answer { to, lazy, outcome } => {
                     frame.clear();
-                    match outcome {
-                        Outcome::Ready(target) => {
-                            Frame::Ready { request: to.request, lazy: *lazy, target: *target }.encode(frame)
-                        }
-                        Outcome::Failed(why) => {
-                            Frame::Failed { request: to.request, lazy: *lazy, why }.encode(frame)
-                        }
-                    }
-                    self.answers.send(to.client, frame);
+                    let answer = match outcome {
+                        Outcome::Ready(target) => Frame::Ready { request: to.request, lazy: *lazy, target: *target },
+                        Outcome::Failed(why) => Frame::Failed { request: to.request, lazy: *lazy, why: &**why },
+                    };
+                    answer.encode(frame);
+                    self.answers.send(to.client, to.seq, wire::channel_kind(&answer), frame);
                 }
                 Action::Stop { lazy, why } => {
                     let function = (*lazy < plan.len()).then(|| (plan.key(LazyId(*lazy)), plan.item(LazyId(*lazy))));

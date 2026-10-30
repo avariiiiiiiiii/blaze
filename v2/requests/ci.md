@@ -183,3 +183,5 @@ length or read past the input. One thing to decide, not a crash:
   only, plus `#[serde(deny_unknown_fields)]` on the API's types. `api_envelope` checks
   re-encoding only up to this (decode, encode, decode gives the same value), and its corpus
   holds these inputs (`status-by-field-index.hex`, `status-with-an-unknown-field.hex`).
+
+> applied (ci DONE): both decoders (`cbor/de.rs`, `cbor/reference/de.rs`) take a field or variant only as text, refusing its index or its name as bytes ("a field or variant not named as text"), with test `a_field_is_named_only_as_text`. refused for the rest: unknown fields and a missing `Option` stay accepted, since stores read with this decoder (`blaze-query`, `blaze-units`, `blaze-cargo`) lean on `#[serde(default)]` and nothing hashes or records client bytes; an encoded envelope is canonical either way.

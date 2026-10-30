@@ -116,9 +116,10 @@ For more information about this error, try `rustc --explain E0554`.
 
 #[test]
 fn a_bootstrap_naming_the_crate_or_anything_but_minus_one_keeps_nightly() {
-    // tests/ui/bootstrap/rustc_bootstrap.rs, revisions cheat, cheat_single_crate,
-    // cheat_multi_crate, invalid_zero and invalid_junk: check-pass
-    for value in ["1", "main", "x,main,z", "0", "*"] {
+    // tests/ui/bootstrap/rustc_bootstrap.rs, revisions cheat, cheat_single_crate, invalid_zero
+    // and invalid_junk: check-pass (a fixture's `env:` takes no `,` in a value: the list of
+    // crates is `nightly_build`'s unit test)
+    for value in ["1", "main", "0", "*"] {
         let fixture = format!(
             "//- /rustc_bootstrap.rs crate:main edition:2015 env:RUSTC_BOOTSTRAP={value}
 #![crate_type = \"lib\"]

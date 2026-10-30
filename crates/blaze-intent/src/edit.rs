@@ -182,6 +182,22 @@ fn expect(node: SyntaxNode, kinds: &[Kind], path: &str) -> Result<SyntaxNode, St
     }
 }
 
+/// The top item of the base tree `root` that starts at `offset`.
+pub fn item_at(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxNode> {
+    let token = root.token_at_offset(offset).right_biased()?;
+    token.parent_ancestors().find(|it| path::is_top(it) && it.text_range().start() == offset)
+}
+
+/// The path an item touched is named by: in the base file, or as the edits left it when they
+/// added it; empty for the file's own module.
+pub fn path_at(file: &Working, at: &At) -> String {
+    match at {
+        At::Item(offset) => path::of(&item_at(&file.base, *offset).expect("a touched item starts there")),
+        At::File => String::new(),
+        At::Added(path) => path.clone(),
+    }
+}
+
 /// Where a top item of the file as edited so far was in the base file.
 pub fn base_of(file: &Working, item: &SyntaxNode) -> Result<At, String> {
     file.to_base(item.text_range().start()).map(At::Item).ok_or_else(|| {

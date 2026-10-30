@@ -63,6 +63,9 @@ pub(crate) struct Chunk {
 // release after the bytes were written), and those are never written again. The bytes are
 // freed only with the chunk.
 unsafe impl Send for Chunk {}
+// SAFETY: as for `Send`: through `&Chunk` other threads read only bytes a published place names
+// or that were published, never written again, and the atomics; the writer writes only through
+// `unsafe fn write` and `zero`, whose callers write past what was kept.
 unsafe impl Sync for Chunk {}
 
 impl Chunk {
@@ -77,34 +80,55 @@ impl Chunk {
         self.cap as u64
     }
 
-    /// The bytes at `at`; `None` past the chunk. Callers read only what a place names or what
-    /// was published.
-    pub(crate) fn bytes(&self, at: u64, len: u64) -> Option<&[u8]> {
+    /// The bytes at `at`; `None` past the chunk.
+    ///
+    /// # Safety
+    ///
+    /// The range is one a published place names, or below what the chunk published: the
+    /// writer may be writing any other bytes of it.
+    pub(crate) unsafe fn bytes(&self, at: u64, len: u64) -> Option<&[u8]> {
         let end = at.checked_add(len)?;
         if end > self.cap as u64 {
             return None;
         }
-        // SAFETY: inside the allocation; bytes a place names or that were published are not
-        // written again.
-        Some(unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().add(at as usize), len as usize) })
+        // SAFETY: `at + len <= cap` (checked above), so `at` is inside the allocation of `cap`
+        // bytes.
+        let start = unsafe { self.bytes.as_ptr().add(at as usize) };
+        // SAFETY: the `len` bytes from `start` are inside the allocation, which lives as long as
+        // the chunk; bytes a place names or that were published are not written again (the
+        // caller's contract).
+        Some(unsafe { std::slice::from_raw_parts(start, len as usize) })
     }
 
     /// Writes `data` at `at`.
     ///
-    /// SAFETY: only the segment's writer calls it, at or past what it has kept, where no place
-    /// points and nothing was published.
+    /// # Safety
+    ///
+    /// Only the segment's writer calls it, at or past what it has kept, where no place points
+    /// and nothing was published.
     unsafe fn write(&self, at: usize, data: &[u8]) {
         assert!(at + data.len() <= self.cap, "a write past its chunk");
-        // SAFETY: inside the allocation, and no one else reads or writes there (the caller's
-        // contract).
-        unsafe { ptr::copy_nonoverlapping(data.as_ptr(), self.bytes.as_ptr().add(at), data.len()) }
+        let from = data.as_ptr();
+        // SAFETY: `at + data.len() <= cap` (asserted above), so `at` is inside the allocation.
+        let to = unsafe { self.bytes.as_ptr().add(at) };
+        // SAFETY: `to` has `data.len()` writable bytes in the allocation, which `data` (the
+        // caller's own buffer) does not overlap, and no one else reads or writes them (the
+        // caller's contract).
+        unsafe { ptr::copy_nonoverlapping(from, to, data.len()) }
     }
 
-    /// SAFETY: as `write`.
+    /// Writes `len` zeros at `at`.
+    ///
+    /// # Safety
+    ///
+    /// As `write`.
     unsafe fn zero(&self, at: usize, len: usize) {
         assert!(at + len <= self.cap, "a write past its chunk");
-        // SAFETY: as in `write`.
-        unsafe { ptr::write_bytes(self.bytes.as_ptr().add(at), 0, len) }
+        // SAFETY: `at + len <= cap` (asserted above), so `at` is inside the allocation.
+        let to = unsafe { self.bytes.as_ptr().add(at) };
+        // SAFETY: `to` has `len` writable bytes in the allocation, and no one else reads or
+        // writes them (the caller's contract, as in `write`).
+        unsafe { ptr::write_bytes(to, 0, len) }
     }
 
     /// Bytes of it its writer has published, and how many puts ended in it.
@@ -141,11 +165,17 @@ pub(crate) struct ChunkRef(NonNull<Chunk>);
 // SAFETY: a chunk is `Sync`; a reference is dereferenced only while its chunk is alive (see
 // `ChunkRef::get`).
 unsafe impl Send for ChunkRef {}
+// SAFETY: a `ChunkRef` is an address: sharing it shares nothing until `ChunkRef::get`, whose
+// caller promises the chunk is alive, and `Chunk` is `Sync`.
 unsafe impl Sync for ChunkRef {}
 
 impl ChunkRef {
-    /// SAFETY: the chunk must live for `'a`: it is the writer's tail, or not yet unlinked by the
-    /// store, or named by a spot the caller found under a `Held` of `'a` (a chunk is freed only
+    /// The chunk it names.
+    ///
+    /// # Safety
+    ///
+    /// The chunk must live for `'a`: it is the writer's tail, or not yet unlinked by the store,
+    /// or named by a spot the caller found under a `Held` of `'a` (a chunk is freed only
     /// through the store's limbo, after every spot into it was unlinked).
     pub(crate) unsafe fn get<'a>(self) -> &'a Chunk {
         // SAFETY: alive, by the caller's contract.
@@ -415,14 +445,16 @@ impl Own {
         frame[4] = copy;
         let body = at + FRAME as usize;
         let end = body + RECORD_HEADER as usize + payload.len();
-        // SAFETY: this is the segment's one writer, and `at` is past what it has kept, so no
-        // place points there and nothing there was published.
-        unsafe {
-            tail.write(at, &frame);
-            tail.write(body, &header.encode());
-            tail.write(body + RECORD_HEADER as usize, payload);
-            tail.zero(end, at + span as usize - end);
-        }
+        // SAFETY: this is the segment's one writer (`&mut self`), and `at` is past what it has
+        // kept, so no place points into `at..at + span` and nothing there was published; `roll`
+        // left room for `span` bytes.
+        unsafe { tail.write(at, &frame) };
+        // SAFETY: as above, for the header after the frame.
+        unsafe { tail.write(body, &header.encode()) };
+        // SAFETY: as above, for the payload after the header.
+        unsafe { tail.write(body + RECORD_HEADER as usize, payload) };
+        // SAFETY: as above, for the zeros up to `at + span`.
+        unsafe { tail.zero(end, at + span as usize - end) };
         let seg = Seg {
             chunk: self.tail,
             segment: self.segment.number,

@@ -384,6 +384,8 @@ impl fmt::Display for FeatureValue {
     }
 }
 
+// BTreeMap: built once per package, read in order (`features_enabling_dependency_sorted`,
+// `blaze-tree`, the index) many times.
 pub type FeatureMap = BTreeMap<InternedString, Vec<FeatureValue>>;
 
 #[cfg(test)]

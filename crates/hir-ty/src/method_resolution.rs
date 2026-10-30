@@ -192,7 +192,7 @@ impl<'db> InferenceContext<'db> {
     ) -> R {
         let traits_in_scope = self.get_traits_in_scope();
         let traits_in_scope = match &traits_in_scope {
-            Either::Left(it) => it,
+            Either::Left(it) => std::borrow::Borrow::<FxHashSet<TraitId>>::borrow(it),
             Either::Right(it) => *it,
         };
         let ctx = MethodResolutionContext {

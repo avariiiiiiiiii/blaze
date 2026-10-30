@@ -130,9 +130,9 @@ impl Pool {
         Pool {
             config,
             next: 0,
-            servers: BTreeMap::new(),
+            servers: FxHashMap::default(),
             asked: HashMap::new(),
-            idle: BTreeMap::new(),
+            idle: FxHashMap::default(),
             count: 0,
         }
     }
@@ -236,7 +236,8 @@ impl Pool {
 
     /// Stops every process: the daemon is ending.
     pub fn stop_all(&mut self, effects: &mut Vec<Effect>) {
-        let servers: Vec<Server> = self.servers.keys().copied().collect();
+        let mut servers: Vec<Server> = self.servers.keys().copied().collect();
+        servers.sort_unstable();
         for server in servers {
             self.stop(server, effects);
         }

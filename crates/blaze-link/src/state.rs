@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 
 use crate::cow::{CowBytes, CowList, CowVec, ListRef};
 use crate::model::{Class, Fixup, Import, Library, NativeFile, Region, Special, Sym, Tls};
-use crate::position::SpanTable;
+use crate::position::Spans;
 use crate::reloc::GotKind;
 use crate::symbols::{IdNo, NameId, Obj, Symbols};
 use crate::{NativeKind, Output};
@@ -179,7 +179,7 @@ const COLD: SymCold = SymCold { refs: ListRef::EMPTY, room: 0, slot: u32::MAX, s
 #[derive(Clone, Debug)]
 struct IdCold {
     debug_name: Option<NameId>,
-    spans: Option<Arc<SpanTable>>,
+    spans: Option<Spans>,
 }
 
 const _: () = assert!(size_of::<Def>() == 16);
@@ -249,7 +249,7 @@ impl<'s> PieceRef<'s> {
     }
 
     fn lists(self) -> Lists {
-        *self.state.lists.get(self.id as usize).expect("a piece's lists")
+        *self.state.piece_lists.get(self.id as usize).expect("a piece's lists")
     }
 
     pub fn fixups(self) -> &'s [Fixup] {
@@ -350,6 +350,8 @@ pub(crate) struct State {
     pub tls: Option<Tls>,
     pub file_len: u64,
     pub parts: Arc<Vec<(u64, Vec<u8>)>>,
+    /// The writer's loader, GOT and function lists, kept sorted across links.
+    pub lists: Arc<crate::write::Lists>,
     /// What the image is across its generations: its first full link's.
     pub lineage: [u8; 16],
     pub laid_out: bool,
@@ -357,7 +359,7 @@ pub(crate) struct State {
     hot: CowVec<Hot>,
     what: CowVec<What>,
     sort: CowVec<Sort>,
-    lists: CowVec<Lists>,
+    piece_lists: CowVec<Lists>,
     loader: CowVec<Loader>,
     /// Of each [`What::Shared`] piece, the fixups to it.
     users: CowVec<u32>,
@@ -402,7 +404,8 @@ impl State {
             hot: CowVec::default(),
             what: CowVec::default(),
             sort: CowVec::default(),
-            lists: CowVec::default(),
+            piece_lists: CowVec::default(),
+            lists: Arc::default(),
             loader: CowVec::default(),
             users: CowVec::default(),
             fixups: CowList::default(),
@@ -588,7 +591,7 @@ impl State {
             weak: self.syms.push(piece.weak),
             defines: self.syms.push(piece.defines),
         };
-        self.lists.push(lists);
+        self.piece_lists.push(lists);
         self.loader.push(Loader::default());
         self.users.push(0);
         let targets = Self::targets(self.any(id).expect("just added"));
@@ -629,7 +632,7 @@ impl State {
         }
         self.fixups.free(list);
         let list = self.fixups.push(fixups);
-        self.lists.get_mut(id as usize).expect("a piece's lists").fixups = list;
+        self.piece_lists.get_mut(id as usize).expect("a piece's lists").fixups = list;
         let new = Self::targets(self.piece(id).expect("a live piece"));
         for target in new {
             self.ref_push(target, id);
@@ -637,17 +640,17 @@ impl State {
     }
 
     pub fn set_defines(&mut self, id: PieceId, defines: &[Sym]) {
-        let old = self.lists.get(id as usize).expect("a piece's lists").defines;
+        let old = self.piece_lists.get(id as usize).expect("a piece's lists").defines;
         self.syms.free(old);
         let list = self.syms.push(defines);
-        self.lists.get_mut(id as usize).expect("a piece's lists").defines = list;
+        self.piece_lists.get_mut(id as usize).expect("a piece's lists").defines = list;
     }
 
     pub fn set_weak(&mut self, id: PieceId, weak: &[Sym]) {
-        let old = self.lists.get(id as usize).expect("a piece's lists").weak;
+        let old = self.piece_lists.get(id as usize).expect("a piece's lists").weak;
         self.syms.free(old);
         let list = self.syms.push(weak);
-        self.lists.get_mut(id as usize).expect("a piece's lists").weak = list;
+        self.piece_lists.get_mut(id as usize).expect("a piece's lists").weak = list;
     }
 
     /// What a piece's write left for the loader.
@@ -715,7 +718,7 @@ impl State {
             } else {
                 (Lists::default(), Loader::default())
             };
-            *self.lists.get_mut(id as usize).expect("in range") = lists;
+            *self.piece_lists.get_mut(id as usize).expect("in range") = lists;
             *self.loader.get_mut(id as usize).expect("in range") = loader;
             if piece.live() {
                 for target in Self::targets(piece) {
@@ -796,12 +799,12 @@ impl State {
         }
     }
 
-    pub fn span_table(&self, anchor: IdNo) -> Option<&SpanTable> {
-        self.id_cold(anchor)?.spans.as_deref()
+    pub fn span_table(&self, anchor: IdNo) -> Option<&Spans> {
+        self.id_cold(anchor)?.spans.as_ref()
     }
 
-    pub fn set_span_table(&mut self, anchor: IdNo, table: SpanTable) {
-        self.id_cold_mut(anchor).spans = Some(Arc::new(table));
+    pub fn set_span_table(&mut self, anchor: IdNo, table: Spans) {
+        self.id_cold_mut(anchor).spans = Some(table);
     }
 
     // Regions.

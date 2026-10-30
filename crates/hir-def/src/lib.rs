@@ -652,7 +652,7 @@ impl<'db> BlockIdLt<'db> {
 
     /// # Safety
     ///
-    /// The caller must ensure that the `ModuleId` is not leaked outside of query computations.
+    /// The caller must ensure that the `BlockId` is not leaked outside of query computations.
     pub unsafe fn to_static(self) -> BlockId {
         // SAFETY: `BlockIdLt<'db>` and `BlockId` are one type up to the lifetime: a salsa
         // id with no data behind the lifetime, so the bits are the same. That the id is not

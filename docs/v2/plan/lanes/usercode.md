@@ -35,7 +35,8 @@ Part of the [v2 plan](../../plan.md). Section numbers refer to the plan as first
   directives are evaluated without compiling or running them, checked against running them.
   **#804**: build scripts are compiled by the daemon, not by fresh processes reloading the
   sysroot (2 s each). (`v2-usercode`)
-- **#1297 native expanders** for the macros every graph uses (serde_derive, thiserror,
+- *(Superseded by change 20 in `plan/design/compile-time.md`: proc macros run as their own
+  code on our compiler, so no hand-written expanders.)* **#1297 native expanders** for the macros every graph uses (serde_derive, thiserror,
   bitflags, tokio): used only when the macro's source matches the verified copy byte for byte,
   otherwise the normal expansion runs (an exact-match cache, not a fallback); a verify mode runs
   both and compares tokens and spans. (`v2-usercode`)

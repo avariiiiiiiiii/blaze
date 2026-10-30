@@ -121,9 +121,11 @@ needs anything from safety-audit. `blaze-usercode` as a whole is the lead's (its
    locals (so `FnEntry` retags protect in the new frame), and `ret` *before* the return value is
    copied into the caller's destination (`before_stack_pop`: protectors end first).
 4. In-place arguments and the return place (Miri `protect_in_place_function_argument`):
-   `fn protect(&mut self, place: Ptr<Self::Prov>, size: u64) -> MResult<()>` for every
-   `Operand::Move` argument and the return place, after `call`; the checker retags it with a
-   strong protector and makes it uninitialized. `Checker::protect` implements it.
+   `fn protect(&mut self, place: Ptr<Self::Prov>, size: u64) -> MResult<Ptr<Self::Prov>>` for
+   every `Operand::Move` argument and the return place, after `call`; the checker retags it
+   with a strong protector, writes it uninitialized through the new tag, and returns the place
+   with that tag, which the callee's local must use (Plain: `Ok(place)`).
+   `Checker::protect` implements it.
 5. `cmpxchg`: the evaluator compares itself first, then on success `read` and `write` with
    `Access::Atomic { ord: success, rmw: true }`; on failure one `read` with
    `Access::Atomic { ord: failure, rmw: false }` and no write.
@@ -133,6 +135,36 @@ needs anything from safety-audit. `blaze-usercode` as a whole is the lead's (its
 7. Atomic orderings of the suffix intrinsics (`atomic_load_acquire`) and of the const-generic
    ones (`atomic_load::<T, {AtomicOrdering::Acquire}>`) both map to `AtomicOrd`; the tests use
    the suffix form, as minicore has no `AtomicOrdering`.
+8. `MemKind::Global` says nothing of mutability: constants, promoted temporaries, vtables and
+   string literals are read-only, statics (outside a `static mut` or `UnsafeCell`) too, and a
+   write to them is UB (`WriteToReadOnly`). Either `alloc(.., kind, zeroed, mutable: bool)` or
+   `fn freeze(&mut self, ptr)` after the evaluator writes the initial bytes; `check` then calls
+   `Memory::set_immutable`. Until then every global is writable under the checker.
+9. Threads' entry functions: `call` when a spawned thread's function starts and `ret` when it
+   returns, on that thread, like any frame (Tree Borrows protects its arguments).
+
+### C5. To safety-tb: per-thread frames
+
+`Borrows::push_frame`/`pop_frame` keep one stack; two threads' frames interleave. Wanted:
+`push_frame(thread: ThreadId)` and `pop_frame(thread: ThreadId, site)` (Miri keeps
+`FrameState` per frame of each thread's stack). Until then `Checker::ret` stops the run as
+unsupported when the frame it pops was pushed by another thread, rather than end the wrong
+protectors.
+
+### C6. To safety-race: the names `check` calls
+
+`check.rs` is written against these (from the brief); `race.rs` had not landed when it was:
+`Races::new(&Config)`, with `race::Config { seed, preemption_rate, weak_memory }` all `Copy`
+fields (`check` builds `race::Config { seed, ..config.race }`); `spawn() -> ThreadId`;
+`exit()`; `join(ThreadId) -> Result<(), RaceError>`; `schedule(running: ThreadId, &[ThreadId])
+-> Result<ThreadId, Deadlock>`; `new_alloc(AllocId, u64, Option<ThreadId>)`;
+`free(AllocId, u64, SiteId) -> Result<(), RaceError>`; `read`, `write` and `rmw(AllocId, Span,
+Option<AtomicOrd>, SiteId) -> Result<(), RaceError>`; `load_value(AllocId, Span, AtomicOrd,
+&[u8]) -> Option<Vec<u8>>`; `store_value(AllocId, Span, AtomicOrd, &[u8])`; `fence(AtomicOrd)`,
+`release(u64)`, `acquire(u64)` returning `()`. Also wanted: a retag's implicit accesses as
+their own calls (`retag_read`/`retag_write`, same arguments as `read` with no ordering), so a
+race report says "retag read" (`Action::RetagRead`); until then `check` reports them as plain
+reads and writes.
 
 ### C4. Forward to db-ty (hir-def lang items)
 

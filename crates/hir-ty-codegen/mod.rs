@@ -6778,7 +6778,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             };
             ids.datas.push(id);
         }
-        let code = entry.code.code();
+        let code = entry.code.code()?;
         let relocs: Vec<_> = code.relocs.iter().map(|it| ids.reloc(it, id)).collect();
         self.define_code(id, &code, &relocs)?;
         if let (Some(debug), Some(of), Some(entries)) = (&self.debug, &entry.debug, &self.entries) {

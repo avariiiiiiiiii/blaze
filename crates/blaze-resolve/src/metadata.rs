@@ -2,9 +2,8 @@
 //! 1.99.0 (5f94df4789) writes them (`src/ops/cargo_metadata.rs`). cargo's unstable artifact
 //! dependencies (`-Zbindeps`) and the fields they add are not ported.
 
-use std::collections::BTreeMap;
-
 use cargo_platform::Platform;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::Serialize;
 
 use crate::dependency::DepKind;
@@ -66,18 +65,20 @@ pub fn resolve_graph(
     packages: &dyn MetadataPackages,
     requested_kinds: &[CompileKind],
 ) -> CargoResult<MetadataResolve> {
-    let mut node_map = BTreeMap::new();
+    let mut node_map = FxHashMap::with_capacity_and_hasher(resolve.len(), FxBuildHasher);
     for &member in members {
         build_resolve_graph_r(&mut node_map, member, resolve, packages, requested_kinds)?;
     }
+    let mut nodes: Vec<_> = node_map.into_iter().collect();
+    nodes.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     Ok(MetadataResolve {
-        nodes: node_map.into_values().collect(),
+        nodes: nodes.into_iter().map(|(_, node)| node).collect(),
         root: root.map(|id| id.to_spec()),
     })
 }
 
 fn build_resolve_graph_r(
-    node_map: &mut BTreeMap<PackageId, MetadataResolveNode>,
+    node_map: &mut FxHashMap<PackageId, MetadataResolveNode>,
     pkg_id: PackageId,
     resolve: &Resolve,
     packages: &dyn MetadataPackages,

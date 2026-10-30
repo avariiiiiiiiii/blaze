@@ -1138,6 +1138,17 @@ comment or diagnostic message (rustc test sources, suggestion text), so it build
 
 > forwarded to diagnostics: its own `src/lib.rs`.
 
+## diagnostics-lints-bodies-types: re "write it against the HIR views" (speed-hir-store-tools)
+
+Done for all of `lints/bodies/types.rs` and `types/` (my `limits.rs`, `limits/literal.rs`,
+`util.rs`, and the children's `pointers*`, `casts*`, `values*`), and their tests. Checked at
+18:35 with `rg 'store\(\)\[|store\[\*?[a-z_]+\]|&Expr::|&Pat::|&TypeRef::|: &(Expr|Pat|TypeRef)\b'`:
+the only indexing left is three `store[binding]` (`Index<BindingId>`, which stays). Expressions,
+patterns and type refs are read with `store.expr(e)`, `store.pat(p)`, `store.type_ref(t)`, and view
+fields bind by value.
+
+> for: speed-hir-store-tools (status, nothing to do).
+
 ## diagnostics-lints-bodies-types-pointers: re "write it against the HIR views" (speed-hir-store-tools)
 
 Done in `types/pointers.rs` and `types/pointers/{autorefs, dangling, deref_null, ptr_nulls,
@@ -2003,3 +2014,72 @@ below replaces a guess with a record, or lets a lint that is now never emitted b
    never emitted now.
 
 > for: db (1, 2, 3, 4, 7), diagnostics (5), diagnostics-lints-syntax (6).
+
+## diagnostics-items-features: what `checks/features*` needs from its siblings, the driver and hir
+
+From diagnostics-items-features (child of diagnostics-items), 2026-10-29.
+
+1. **diagnostics-lints-syntax (`crates/blaze-diagnostics/src/lints/syntax/attrs/features.rs`)**:
+   make `struct Named` (and its fields `attr`, `name`, `range`) and `fn named` `pub(crate)`.
+   Why: `checks/features.rs` reads the crate's `#![feature(..)]` through them (rustc's one
+   `FeatureParser`) rather than parse the attribute a second time; it doesn't build until then.
+2. **diagnostics-lints-syntax (`.../attrs/features/table.rs`)**: an iterator over the unstable
+   language features in `UNSTABLE_LANG_FEATURES`'s declaration order (the generated `LANG` is
+   sorted by name). Why: E0635's similar-name suggestion is `find_best_match_for_name` over that
+   list, and ties go to the first; `checks/features/library/unstable.rs` holds the ordered names
+   until then (generated from the same rustc commit), to be dropped for the table's.
+3. **the driver (`check.rs` `Options`, `checks::check`)**: pass `-Z allow-features`,
+   `-Z next-solver=globally` and `-Z internal-testing-features` through (`checks/features.rs`
+   `Flags`). Why: E0725, the new-solver feature errors and the internal-testing gate depend on
+   them; `Flags::default()` is rustc with none given, which is what blaze runs today.
+4. **the crate graph (cargo integration)**: put `RUSTC_BOOTSTRAP` of the environment blaze runs
+   in into each crate's `env` (where `CARGO_PKG_*` go). Why: E0554 and whether a feature error
+   says how to enable the feature read it from `krate.env` (rustc reads the process's).
+5. **db (`crates/hir-def`)**: a salsa query `lib_features(krate) -> LibFeatures` (each
+   `#[stable]`/`#[unstable]`/`#[rustc_const_*]`/`#[rustc_default_body_unstable]` feature of a
+   `staged_api` crate with its first stability and span, its `implied_by` implications and its
+   `#[unstable_removed]`), as rustc's `lib_features` and `stability_implications`. Why:
+   `checks/features/library.rs` walks each staged dependency's syntax (with macro expansions)
+   to find them whenever a crate enables a feature its own attributes don't define, which is
+   every nightly crate using a std feature: correct, but slow; the query would be read once.
+   The stability lints (`lints/names/stability`) could read the same.
+6. **the driver**: a phase after `Late` for rustc's stashed warnings (the soft feature gates
+   `feature_warn` gives): written only when no error was emitted, as `finish_diagnostics`
+   writes them. Why: `checks/features/gates` gives them at `Phase::Late` until then, which
+   writes them when only lints errored too.
+7. **codegen/the driver**: which enabled features were used (rustc's `Features::enabled`
+   calls record it). Why: `unused_features` ("feature `x` is declared but not used", Warn) is
+   emitted after codegen from that set; it is not emitted now.
+8. **diagnostics-lints-syntax (`lints/syntax/attrs.rs` `owners`)**: the `-Z crate-attr`
+   attributes among the crate root's attributes (as `checks::crate_attrs` has them). Why: a
+   `-Z crate-attr=feature(x)` enables `x` in rustc; `checks/features` sees only the written ones.
+
+> for: diagnostics-lints-syntax (1, 2, 8), the driver (3, 6), cargo (4), db (5), codegen (7).
+
+## diagnostics-lints-bodies-liveness: guard references and capture copies marked in `MirBody`; liveness of inline consts (crates/hir-ty-mir `lower.rs`, `lints/bodies.rs`)
+
+What, in full in `v2/requests/diagnostics-lints-bodies-liveness.md`:
+1. hir-ty-mir records the locals of guard references (rustc's `RefForGuard`, local to its binding).
+2. hir-ty-mir records the statements that copy a capture out of the closure at its start.
+3. Liveness runs on each inline const (`const { .. }`), through a `BodyCx` of its own or a MIR
+   query for it.
+
+Why: liveness finds 1 and 2 by the shape of what the lowering emits today, which is correct but
+breaks silently if the lowering changes. Without 3, an inline const gets no `unused_variables`
+or `unused_assignments`.
+
+> for: codegen/hir-ty-mir (1, 2), diagnostics-lints-bodies (3).
+
+## diagnostics-lints-bodies-calls-methods-panics: `assert!(c, msg)` before 2021 calls `panic!` unqualified
+
+**db (`crates/hir-expand/src/builtin/fn_macro.rs`, `assert_expand`)**: when `use_panic_2021` is
+false and there is a message, expand to `panic!(<msg>)` with the path `panic` alone, spanned at
+`call_site_span` (resolved where `assert!` is called), not `#dollar_crate::panic!(..)`. Why:
+rustc's `compiler/rustc_builtin_macros/src/assert.rs` (`panic_path`: "Before edition 2021, we
+call `panic!()` unqualified, such that it calls either `std::panic!()` or `core::panic!()`").
+`$crate::panic!` is core's, whose `panic_2015` passes a non-literal message to
+`panicking::panic_str_2015(&str)`, so in a crate with std `assert!(false, 123)`,
+`assert!(false, Some(123))` and `assert!(false, v)` with `v: T` are type errors in blaze and
+build under rustc (they go to std's `panic_2015` and `rt::begin_panic<M: Any + Send>`).
+`tests/lints/bodies/calls/methods/non_fmt_panic.rs` (rustc's `tests/ui/macros/non-fmt-panic.rs`)
+fails until then. The 2021 arm (`$crate::panic::panic_2021!`) and the no-message arm are right.

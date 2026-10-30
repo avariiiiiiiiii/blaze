@@ -50,10 +50,12 @@ enum State {
     Failed,
 }
 
-/// Who waits for an answer: a client (a run process's connection) and its request id.
+/// Who waits for an answer: a client (a run process's connection), the channel's sequence
+/// number of the frame that asked (the answer's), and the asker's request id.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Waiter {
     pub client: u32,
+    pub seq: u32,
     pub request: u64,
 }
 

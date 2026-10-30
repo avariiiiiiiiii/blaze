@@ -19,7 +19,6 @@ use hir_def::{
     src::HasSource,
 };
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
-use intern::Symbol;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use syntax::{AstNode, ast};
@@ -210,7 +209,8 @@ fn owns_allocation<'db>(b: &BodyCx<'_, 'db>, ty: Ty<'db>) -> bool {
         return true;
     }
     let name = util::diagnostic_item(b.db(), AttrDefId::AdtId(adt));
-    matches!(name.as_ref().map(Symbol::as_str), Some("cstring_type" | "Vec" | "Cell" | "SyncUnsafeCell"))
+    let items = util::items();
+    name.is_some_and(|it| [items.cstring_type, items.Vec, items.Cell, items.SyncUnsafeCell].contains(&it))
 }
 
 /// What a function or closure returning a raw pointer is linted with: rustc's

@@ -60,8 +60,8 @@ Order:
   crate graph built through the same pipeline (no-rustc F, #86), its results in the shared base
   layer. Owns `crates/blaze-cargo/` but store's and usercode's paths, `crates/load-cargo/`,
   `crates/project-model/`, `crates/blaze-units/`, `crates/blaze-tree/`, `library/`.
-- **`diagnostics`**: compile errors and warnings as rustc prints them (codes, spans, notes,
-  suggestions, `--message-format=json`), computed in the compiler from the queries that found
+- **`diagnostics`**: compile errors and warnings as rustc finds them (the same codes,
+  lints and primary spans, in our own text, with cargo's `--message-format=json` schema), computed in the compiler from the queries that found
   them, with the facts they read (for the agent API). What builds need from `ide-diagnostics`
   moves here; the IDE crates are then removed. Owns `crates/blaze-diagnostics/` (new) and
   `crates/ide-diagnostics/` until it is removed.

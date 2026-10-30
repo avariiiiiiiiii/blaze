@@ -100,6 +100,9 @@ lands.
 >
 > landed (2026-10-29): `persist.rs` now uses `from_checked_parts`; `assemble!` and its
 > `MaybeUninit` are gone.
+>
+> 2026-10-29: `vendor/` passed to solver-sync for the nightly-2026-10-27 rebase; asked to keep
+> this patch in `PATCHES.md` (`v2/requests/solver-sync-inbox.md`). Request 3 also went there.
 
 ## 3. Lane db (optional): flags of `GenericArgs` tested in blocks
 

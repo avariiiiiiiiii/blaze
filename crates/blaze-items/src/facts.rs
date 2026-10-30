@@ -523,7 +523,7 @@ fn ty_hash<'db>(
     ty: Ty<'db>,
 ) -> Result<ContentId, Unhashable> {
     let sub = crate::form::Cx::new(db).ty(ty);
-    hash::filled(db, CONST_TYPE, &sub, owner)
+    hash::filled(db, CONST_TYPE, sub, owner)
 }
 
 /// Which error stopped an evaluation: its stage and kind, never its text, which names spans.

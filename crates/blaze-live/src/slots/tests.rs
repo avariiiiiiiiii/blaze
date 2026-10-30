@@ -65,7 +65,9 @@ impl Memory for Fake {
     }
 
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
-        // SAFETY: as for code.
+        // SAFETY: every data write the tests make is to a buffer of their `Program`, which
+        // outlives the switch; the switch checks only that it misses the code region, the
+        // cell, the loader's table and lasting memory, so the tests keep to the buffers.
         unsafe { writes.put_in_place() };
         Ok(())
     }
@@ -248,17 +250,23 @@ fn patches_switch_the_table_and_roll_back() {
     assert_eq!(program.calls(), (1, 2));
     assert_eq!(program.cell.load(Ordering::Relaxed), image_table);
 
-    // Code over a generation rolled back drops it, and the one applied on it.
+    // Code rolled back stays: a thread can be in it still.
     let mut third = patch(3, 0, vec![(1, unslid(address(one)))]);
     third.code = vec![(unslid(program.code_at(0)), vec![0x90; 8])];
-    applied(&mut switch, third);
-    assert_eq!(switch.kept(), vec![0, 3]);
-    assert_eq!(program.calls(), (1, 1));
-    let (outcome, _) = switch.handle(Message::RollBack { id: ID, to: 2 });
+    let (outcome, _) = switch.handle(Message::Patch(third.clone()));
     assert!(
-        matches!(&outcome, Outcome::Declined { generation: 2, why } if why.contains("not kept")),
+        matches!(&outcome, Outcome::Declined { why, .. }
+            if why.contains("generation 1's code") && why.contains("can be running")),
         "{outcome}"
     );
+    assert_eq!(program.code[0], address(one));
+    third.code = vec![(unslid(program.code_at(128)), vec![0x90; 8])];
+    applied(&mut switch, third);
+    assert_eq!(switch.kept(), vec![0, 1, 2, 3]);
+    assert_eq!(program.calls(), (1, 1));
+    switch.handle(Message::RollBack { id: ID, to: 2 });
+    assert_eq!(program.calls(), (2, 2));
+    switch.handle(Message::RollBack { id: ID, to: 3 });
 
     let restart = Message::Restart { id: ID, generation: 3, why: "a layout changed".into() };
     let (outcome, answer) = switch.handle(restart);
@@ -342,6 +350,17 @@ fn a_bad_patch_is_declined_before_anything_is_written() {
             "unwind entries reach",
         ),
         (with(&|it| it.windows = vec![(region, region, region)]), "a RUNTIME_FUNCTION"),
+        (
+            with(&|it| {
+                it.code = vec![(region, vec![0, 0, 0, 0, 0, 0, 4, 0])];
+                it.windows = vec![(region, region + 4, region + 4)];
+            }),
+            "runs past the patch's writes (12 bytes)",
+        ),
+        (
+            with(&|it| it.data = vec![(unslid(program.table.as_ptr() as u64), vec![0; 8])]),
+            "the loader's jump table",
+        ),
     ];
     for (bad, says) in cases {
         let (outcome, answer) = switch.handle(Message::Patch(bad));
@@ -446,6 +465,42 @@ fn a_panic_elsewhere_is_resumed() {
     assert!(answers.is_empty());
     assert_eq!(switch.current(), 1);
     assert_eq!(switch.guard(|| 7, &mut |_| {}), Ok(7));
+}
+
+#[test]
+fn registered_unwind_entries_are_never_written_again() {
+    let program = Program::new();
+    let mut switch = program.switch(false);
+    // An FDE of 16 bytes, then the zero length ending its run, in the data.
+    let mut entries = vec![0u8; 20];
+    entries[..4].copy_from_slice(&12u32.to_le_bytes());
+    let mut first = patch(1, 0, vec![(0, unslid(address(two)))]);
+    first.data = vec![(unslid(program.data_at(0)), entries)];
+    first.frames = vec![(unslid(program.data_at(0)), 16)];
+    applied(&mut switch, first);
+    assert_eq!(switch.memory.frames, vec![program.data_at(0)]);
+
+    for (at, len) in [(0, 8), (12, 8), (16, 4), (18, 8)] {
+        let mut over = patch(2, 1, vec![]);
+        over.data = vec![(unslid(program.data_at(at)), vec![1; len])];
+        let (outcome, _) = switch.handle(Message::Patch(over));
+        assert!(
+            matches!(&outcome, Outcome::Declined { why, .. }
+                if why.contains("generation 1's unwind entries")),
+            "{at}: {outcome}"
+        );
+    }
+    let mut after = patch(2, 1, vec![]);
+    after.data = vec![(unslid(program.data_at(20)), vec![1; 4])];
+    applied(&mut switch, after);
+
+    // Rolled back, the generation's entries stay registered, and stay as they are.
+    switch.roll_back(0).expect("generation 0 is kept");
+    let mut over = patch(3, 0, vec![]);
+    over.data = vec![(unslid(program.data_at(0)), vec![0; 20])];
+    let (outcome, _) = switch.handle(Message::Patch(over));
+    assert!(matches!(outcome, Outcome::Declined { .. }), "{outcome}");
+    assert_eq!(program.data[0], 12);
 }
 
 /// The pool's tables, brought from one generation to another by undoing and redoing cells,

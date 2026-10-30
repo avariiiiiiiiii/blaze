@@ -70,10 +70,19 @@ pub(crate) fn walk(
     instance: &HirInstance,
     _: &mut Homes,
 ) -> Result<Vec<Ref>, String> {
-    if let Kind::Allocator(forward) = &instance.0 {
-        return Ok(super::allocator::walk(forward));
+    listed(db, instance).map(Cow::into_owned)
+}
+
+/// [`walk`], borrowed from the database's memo where it has one: what `prepare` places the
+/// IR's requests by, with nothing copied.
+pub(crate) fn listed<'db>(
+    db: &'db dyn HirDatabase,
+    instance: &HirInstance,
+) -> Result<Cow<'db, [Ref]>, String> {
+    match &instance.0 {
+        Kind::Allocator(forward) => Ok(Cow::Owned(super::allocator::walk(forward))),
+        _ => walked(db, instance).map(Cow::Borrowed),
     }
-    walked(db, instance).map(<[Ref]>::to_vec)
 }
 
 /// Everything the IR of `instance` can request, each once, in the order of its MIR, walked once

@@ -1295,7 +1295,7 @@ impl Builder<'_> {
             }
             out.push(self.impl_doc(imp, Members::WithProvided));
         }
-        out.sort_by_key(|it| it.trait_name.clone());
+        out.sort_by(|a, b| a.trait_name.cmp(&b.trait_name));
         out
     }
 

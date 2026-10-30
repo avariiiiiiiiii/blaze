@@ -3,6 +3,7 @@
 //! The concrete implementation DB is defined by ide.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![forbid(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;

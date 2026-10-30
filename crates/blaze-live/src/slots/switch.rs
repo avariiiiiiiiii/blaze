@@ -648,7 +648,8 @@ impl<M: Memory> Switch<M> {
                 ));
             }
         }
-        frames::<M>(patch, message, &s.code, &s.data, slide, &mut s.fdes, &mut s.starts, &mut s.ends)?;
+        let (fdes, starts, ends) = (&mut s.fdes, &mut s.starts, &mut s.ends);
+        frames::<M>(patch, message, &s.code, &s.data, slide, fdes, starts, ends)?;
         if patch.windows().len() != 0 && !M::SEH {
             return Err("RUNTIME_FUNCTIONs, which this platform's unwinder doesn't take".to_owned());
         }

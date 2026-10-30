@@ -48,8 +48,8 @@ Design notes for [the db lane](../db.md), as written on 2026-10-29. The code is
   its request is reposted. `blaze_query::Cancelled` is the plane's `Cancelled`.
 - A key asked again on its own run's stack is a query cycle and panics naming the chain.
 - A job pumped under a waiting query is a task of its own and may ask the database. Only a
-  query's own code may not: `Database::get` from inside `Query::execute` panics (ask through
-  `Cx::get`, which records the edge).
+  query's own code may not: `Pinned::get` (from `Database::pin()`) inside `Query::execute`
+  panics (ask through `Cx::get`, which records the edge).
 
 ## Keys by bytes
 
@@ -71,8 +71,12 @@ again.
 - `evict(key)` drops values kept elsewhere (compiled code once it is in the store): the
   fingerprint and edges stay, so cutoff still works, and a value asked for again is made again
   and must have its fingerprint, or the query is named as not deterministic.
-- Nothing a reader may hold is freed while the database is shared: a buffer, memo or view let go
-  of is retired, and retired things are dropped by `&mut Database` (`reclaim`, `settle`).
+- Nothing a reader may hold is freed under it. Every reference the database hands out borrows a
+  task's `blaze_reclaim::Guard`: `Cx` carries its task's guard, and outside a query
+  `Database::pin()` gives a `Pinned` that holds one. A buffer, entry, memo or view let go of goes
+  to a `blaze_reclaim::Limbo` and is freed once every task that could have loaded it has ended.
+  `collect` sweeps the limbos, and `&mut Database` (`reclaim`, `settle`) frees everything at
+  once.
 
 ## The daemon image and the settle swap
 

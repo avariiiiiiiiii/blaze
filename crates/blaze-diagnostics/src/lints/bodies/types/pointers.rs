@@ -187,19 +187,19 @@ pub(super) fn peel_casts(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, ExprId
             Expr::Cast { expr, .. } => expr,
             Expr::MethodCall { receiver, args, .. }
                 if args.is_empty()
-                    && matches!(
-                        method_item(b, e).as_ref().map(Symbol::as_str),
-                        Some("ptr_cast" | "const_ptr_cast" | "ptr_cast_mut" | "ptr_cast_const")
-                    ) =>
+                    && method_item(b, e).is_some_and(|it| {
+                        let items = util::items();
+                        [items.ptr_cast, items.const_ptr_cast, items.ptr_cast_mut, items.ptr_cast_const].contains(&it)
+                    }) =>
             {
                 receiver
             }
             Expr::Call { callee, args }
                 if args.len() == 1
-                    && matches!(
-                        callee_item(b, callee).as_ref().map(Symbol::as_str),
-                        Some("ptr_from_ref" | "unsafe_cell_raw_get" | "transmute")
-                    ) =>
+                    && callee_item(b, callee).is_some_and(|it| {
+                        let items = util::items();
+                        [items.ptr_from_ref, items.unsafe_cell_raw_get, items.transmute].contains(&it)
+                    }) =>
             {
                 args[0]
             }

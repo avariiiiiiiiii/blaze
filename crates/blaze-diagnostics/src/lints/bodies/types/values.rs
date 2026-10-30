@@ -40,7 +40,7 @@ pub(super) fn passes() -> Vec<Box<dyn LatePass>> {
 
 /// rustc's `is_intrinsic(def, sym::transmute)`: `def` is the intrinsic `transmute`.
 fn is_transmute(db: &dyn HirDatabase, def: FunctionId) -> bool {
-    FunctionSignature::is_intrinsic(db, def) && FunctionSignature::of(db, def).name.as_str() == "transmute"
+    FunctionSignature::is_intrinsic(db, def) && *FunctionSignature::of(db, def).name.symbol() == util::items().transmute
 }
 
 /// `ty` with its free regions erased, as rustc's type checking results have them.

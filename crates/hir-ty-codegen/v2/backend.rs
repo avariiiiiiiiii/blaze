@@ -150,7 +150,7 @@ impl Backends<'_> {
         refs: &Refs,
     ) -> Result<(Shape, Prepared), CodegenError> {
         let fail = |what: String| failed(unit, format!("{instance:?}: {what}"));
-        let walked = refs::walk(db, instance, homes).map_err(fail)?;
+        let walked = refs::listed(db, instance).map_err(fail)?;
         if walked.len() != refs.len() {
             return Err(fail(format!(
                 "{} references given for an instance of {}",
@@ -307,7 +307,7 @@ fn named(
     let mut named = Vec::with_capacity(variables.len());
     for variable in variables {
         named.push(side::Variable {
-            name: body[variable.binding].name.as_str().to_owned(),
+            name: *body[variable.binding].name.symbol(),
             param: variable.param,
             ty: hashes.ty(db, variable.ty.as_ref())?,
             slot: variable.slot,
@@ -332,11 +332,22 @@ fn scoped(
     let scopes = ExprScopes::of(db, owner);
     let body = Body::of(db, owner);
     let outermost = scopes.scope_chain(scopes.scope_for(body.root_expr())).last();
-    let mut bound = FxHashMap::default();
+    // The scope of each binding told of, and of no other: the walk stops once all are found.
+    let mut wanted: SmallVec<[BindingId; 16]> = variables.iter().map(|it| it.binding).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut bound = FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
     let mut seen = FxHashSet::default();
-    for (_, &scope) in scopes.scope_by_expr().iter() {
+    'scopes: for (_, &scope) in scopes.scope_by_expr().iter() {
         for scope in scopes.scope_chain(Some(scope)).take_while(|&it| seen.insert(it)) {
-            bound.extend(scopes.entries(scope).iter().map(|entry| (entry.binding(), scope)));
+            for entry in scopes.entries(scope) {
+                if wanted.binary_search(&entry.binding()).is_ok() {
+                    bound.insert(entry.binding(), scope);
+                    if bound.len() == wanted.len() {
+                        break 'scopes;
+                    }
+                }
+            }
         }
     }
     let mut told: FxHashMap<ScopeId, u32> = FxHashMap::default();
@@ -364,10 +375,12 @@ fn scoped(
         return (side::Scopes::default(), of_binding);
     }
     let mut tried = FxHashMap::default();
-    for (expr, it) in body.exprs() {
-        if let hir_def::hir::Expr::Match { arms, .. } = it {
-            for arm in arms.iter() {
-                body.walk_pats(arm.pat, &mut |pat| drop(tried.insert(pat, expr)));
+    if spans.iter().any(|it| matches!(it, MirSpan::PatId(_))) {
+        for (expr, it) in body.exprs() {
+            if let hir_def::hir::Expr::Match { arms, .. } = it {
+                for arm in arms.iter() {
+                    body.walk_pats(arm.pat, &mut |pat| drop(tried.insert(pat, expr)));
+                }
             }
         }
     }
@@ -377,9 +390,8 @@ fn scoped(
             None => side::SpanScope::Outside,
         }
     };
-    let of_span = spans
-        .iter()
-        .map(|span| match *span {
+    let mut of_span = Vec::with_capacity(spans.len());
+    of_span.extend(spans.iter().map(|span| match *span {
             MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => innermost(scopes.scope_for(expr)),
             MirSpan::PatId(pat) => match tried.get(&pat) {
                 Some(&of) => innermost(scopes.scope_for(of)),

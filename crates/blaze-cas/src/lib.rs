@@ -1577,16 +1577,19 @@ impl Store {
 
     /// Copies the record at `at` of a segment's chunk into its pack; gives its length there.
     fn drain_record(&mut self, number: usize, at_chunk: ChunkRef, chunk: &Chunk, at: u64, batch: &mut Batch) -> u64 {
-        let frame = chunk.bytes(at, FRAME).expect("a published record is in its chunk");
+        // SAFETY: `drain` passes an `at` below what the chunk published, and a writer publishes
+        // only past whole records (`Own::end_put`, `Own::keep`, `Own::roll` publish after `at`
+        // moved past the record), so the record at `at` is all below what was published.
+        let frame = unsafe { chunk.bytes(at, FRAME) }.expect("a published record is in its chunk");
         let unit = u32::from_le_bytes(*frame.first_chunk().expect("a frame is 16 bytes"));
         let copy = frame[4] == COPY;
-        let header = chunk
-            .bytes(at + FRAME, RECORD_HEADER)
+        // SAFETY: as above, for the header after the frame.
+        let header = unsafe { chunk.bytes(at + FRAME, RECORD_HEADER) }
             .map(RecordHeader::decode)
             .expect("a published record is in its chunk")
             .expect("a writer writes whole records");
-        let payload = chunk
-            .bytes(at + FRAME + RECORD_HEADER, header.stored)
+        // SAFETY: as above, for the payload after the header, whose length that header gives.
+        let payload = unsafe { chunk.bytes(at + FRAME + RECORD_HEADER, header.stored) }
             .expect("a published record is in its chunk");
         assert!(unit as usize <= self.tiers[0].units.len(), "a put into unit {unit}, which this store did not give");
         let loc = if header.form == Form::External && header.stored > 0 {

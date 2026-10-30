@@ -34,6 +34,13 @@ branch-free lexing, the scheduler against work-stealing runtimes, and incrementa
 against Unison and rustc's red-green graph, finer than both. Where we don't beat it, the notes
 say why and what it would take.
 
+**Behavior, not bytes.** blaze must match rustc in what programs do and which programs
+compile: semantics, layout (`size_of` is observable), trait selection, panics, overflow, and
+which errors and warnings a program gets. It need not match rustc's bytes anywhere: not the
+machine code, symbol names in dev builds, debug-info layout, file formats, or diagnostic
+wording. Where matching rustc's bytes would cost speed, take the fastest way that keeps the
+behavior.
+
 **Deterministic**: the same inputs give the same bytes, whatever the scheduling, the core count
 or the machine. The invalidation oracle (section 11) depends on it.
 

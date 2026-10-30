@@ -69,5 +69,5 @@ less than all three: it neither runs the macro nor crosses a process.
   - a store read view without a lock;
   - the trace record streamed over the server's socket instead of read from a file;
   - a reused thread pool in the vendored server;
-  - per-call allocations in key building. The input and attribute trees are encoded into a
-    buffer; that buffer should be reused, and the encoding hashed as it is written.
+  - a `Given` that hashes as it is built. The tree encoding already goes into one reused
+    buffer per thread, but `Given` still copies every part and variable before hashing them.

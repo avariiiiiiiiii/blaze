@@ -562,3 +562,16 @@ fn an_offence_is_named_where_the_checker_names_it() {
         Err(Error::NotDeterministic { at: 2, what })
     );
 }
+
+/// A field is named as text, as it is written: not by its index, nor as bytes, so a value read
+/// back is from the one item that encodes it.
+#[test]
+fn a_field_is_named_only_as_text() {
+    let refused = Err(Error::NotDeterministic { at: 1, what: "a field or variant not named as text" });
+    for bytes in [&[0xa1, 0x00, 0x07][..], &[0xa1, 0x42, b'i', b'd', 0x07]] {
+        assert_eq!(from_slice::<Typed>(bytes), refused, "{bytes:02x?}");
+        assert_eq!(reference::from_slice::<Typed>(bytes), refused, "{bytes:02x?}");
+    }
+    let named = Typed { id: Some(7), kind: None, body: None };
+    assert_eq!(from_slice::<Typed>(&[0xa1, 0x62, b'i', b'd', 0x07]), Ok(named));
+}

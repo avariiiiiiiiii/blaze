@@ -17,7 +17,6 @@ use hir_ty::{
     consteval::try_const_usize,
     next_solver::{EarlyBinder, GenericArgs, Ty, TyKind},
 };
-use intern::Symbol;
 use rustc_abi::BackendRepr;
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::AstNode as _;
@@ -115,24 +114,32 @@ fn dangerous_init(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Init> {
         // `mem::zeroed()` and `mem::uninitialized()` take no argument, `transmute` one.
         Expr::Call { callee, args } if args.len() <= 1 => {
             let Expr::Path(_) = store.expr(callee) else { return None };
-            match util::path_item(b, callee)?.as_str() {
-                "mem_zeroed" => Some(Init::Zeroed),
-                "mem_uninitialized" => Some(Init::Uninit),
-                "transmute" if args.first().is_some_and(|&it| is_zero(b, it)) => Some(Init::Zeroed),
-                _ => None,
+            let (name, items) = (util::path_item(b, callee)?, util::items());
+            if name == items.mem_zeroed {
+                Some(Init::Zeroed)
+            } else if name == items.mem_uninitialized {
+                Some(Init::Uninit)
+            } else if name == items.transmute && args.first().is_some_and(|&it| is_zero(b, it)) {
+                Some(Init::Zeroed)
+            } else {
+                None
             }
         }
         Expr::MethodCall { receiver, args: &[], .. } => {
             let Expr::Call { callee, args: &[] } = store.expr(receiver) else { return None };
             let Expr::Path(_) = store.expr(callee) else { return None };
             let def = util::method_fn(b, expr)?;
-            if util::fn_item(b.db(), def).as_ref().map(Symbol::as_str) != Some("assume_init") {
+            let items = util::items();
+            if util::fn_item(b.db(), def) != Some(items.assume_init) {
                 return None;
             }
-            match util::path_item(b, callee)?.as_str() {
-                "maybe_uninit_zeroed" => Some(Init::Zeroed),
-                "maybe_uninit_uninit" => Some(Init::Uninit),
-                _ => None,
+            let name = util::path_item(b, callee)?;
+            if name == items.maybe_uninit_zeroed {
+                Some(Init::Zeroed)
+            } else if name == items.maybe_uninit_uninit {
+                Some(Init::Uninit)
+            } else {
+                None
             }
         }
         _ => None,

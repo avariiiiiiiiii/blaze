@@ -3,11 +3,12 @@
 //! cargo's cache of an index file (`index/cache.rs`), which blaze reads and writes in cargo's
 //! format, so that the two share `$CARGO_HOME/registry/index`.
 
-use std::{collections::BTreeMap, fmt, ops::Range, str::FromStr};
+use std::{fmt, ops::Range, str::FromStr};
 
 use anyhow::{Context, bail};
 use cargo_platform::Platform;
 use semver::{Version, VersionReq};
+use rustc_hash::FxHashMap;
 use serde::de::{self, Deserializer};
 use serde_derive::Deserialize;
 
@@ -25,8 +26,9 @@ pub struct IndexEntry {
     pub name: String,
     pub version: Version,
     pub deps: Vec<IndexDependency>,
-    /// `features` with `features2` added, as cargo adds them.
-    pub features: BTreeMap<String, Vec<String>>,
+    /// `features` with `features2` added, as cargo adds them. Unordered: the summary made of
+    /// the entry sorts them.
+    pub features: FxHashMap<String, Vec<String>>,
     /// The sha256 of the `.crate` file, in hex.
     pub checksum: String,
     pub links: Option<String>,
@@ -154,8 +156,8 @@ struct IndexPackage {
     vers: Version,
     deps: Vec<RegistryDependency>,
     #[serde(default)]
-    features: BTreeMap<String, Vec<String>>,
-    features2: Option<BTreeMap<String, Vec<String>>>,
+    features: FxHashMap<String, Vec<String>>,
+    features2: Option<FxHashMap<String, Vec<String>>>,
     cksum: String,
     yanked: Option<bool>,
     links: Option<String>,
@@ -277,7 +279,7 @@ pub fn parse_line(line: &[u8]) -> anyhow::Result<IndexLine> {
                 name,
                 version: vers,
                 deps: Vec::new(),
-                features: BTreeMap::new(),
+                features: FxHashMap::default(),
                 checksum: String::new(),
                 links: None,
                 rust_version,
@@ -535,6 +537,7 @@ mod tests {
         assert_eq!(read, Status::Candidate);
         assert_eq!(entry.features["f"], ["b2/x", "dep:b2"]);
         assert_eq!(entry.features["g"], Vec::<String>::new());
+        assert_eq!(entry.features.len(), 2);
         assert_eq!(entry.rust_version.unwrap().to_string(), "1.70");
         let dep = &entry.deps[0];
         assert_eq!((dep.name_in_toml.as_str(), dep.package.as_str()), ("b2", "b"));

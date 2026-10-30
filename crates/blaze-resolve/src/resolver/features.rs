@@ -76,6 +76,7 @@ pub enum CompileKind {
 /// The actual discrimination happens with the [`FeaturesFor`] type.
 pub type PackageFeaturesKey = (PackageId, FeaturesFor);
 /// Map of activated features.
+// BTreeSet: grown while resolving and read in order by every `activated_features` call.
 pub type ActivateMap = HashMap<PackageFeaturesKey, BTreeSet<InternedString>>;
 
 /// Set of all activated features for all packages in the resolve graph.

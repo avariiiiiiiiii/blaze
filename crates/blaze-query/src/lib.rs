@@ -1378,7 +1378,7 @@ impl Database {
                 memos.sort_by(|a, b| {
                     (a.fingerprint, a.producer, a.schema, a.edges.len())
                         .cmp(&(b.fingerprint, b.producer, b.schema, b.edges.len()))
-                        .then_with(|| a.edges.to_vec().iter().map(edge_order).cmp(b.edges.to_vec().iter().map(edge_order)))
+                        .then_with(|| a.edges.iter().map(|it| edge_order(&it)).cmp(b.edges.iter().map(|it| edge_order(&it))))
                 });
                 Some(image::Entry { key, memos, key_bytes: slot.key.clone() })
             })

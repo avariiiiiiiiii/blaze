@@ -220,7 +220,7 @@ fn archive(dir: &Path, unit: &str, outputs: &[String]) -> anyhow::Result<Vec<u8>
         let mut entries: Vec<std::ffi::OsString> = std::fs::read_dir(&at)?
             .map(|it| Ok(it?.file_name()))
             .collect::<std::io::Result<_>>()?;
-        entries.sort_by_key(|it| (it == FINGERPRINT, it.clone()));
+        entries.sort_by(|a, b| (a == FINGERPRINT, a).cmp(&(b == FINGERPRINT, b)));
         for name in entries {
             let (from, to) = (at.join(&name), Path::new("build").join(unit).join(&name));
             match from.symlink_metadata()?.is_dir() {

@@ -237,7 +237,7 @@ impl Backend {
             super::overlap::share(&mut context.func, &frame, &mut recorder.named);
         }
         let pairs = super::float_pair::lower(&mut context.func);
-        let mut code = super::emit(context)?;
+        let mut code = super::emit_cached(context)?;
         if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
             code.slots =
                 SlotPlaces::of_frame(recorder.isa, frame, &context.func, recorder.named_slots());

@@ -16,7 +16,8 @@
 //! error naming the unit, never a reason to compile again.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
+    hash::Hash,
     sync::Arc,
 };
 
@@ -24,6 +25,7 @@ use blaze_cas::{Key, Kind};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     CodegenError, CompiledFunction, Instance, InstanceKey, Static, Target, Unit,
@@ -163,6 +165,76 @@ struct StaticNode<B: Prepare> {
 
 type StaticId = (ItemKey, ContentId);
 
+/// A walk's nodes in key order, sorted once when the walk ends, each found by one hash of its
+/// key: per entry its key, its value and a 4-byte slot of `at`.
+struct Sorted<K, V> {
+    keys: Vec<K>,
+    values: Vec<V>,
+    at: FxHashMap<K, u32>,
+}
+
+impl<K, V> Default for Sorted<K, V> {
+    fn default() -> Self {
+        Sorted { keys: Vec::new(), values: Vec::new(), at: FxHashMap::default() }
+    }
+}
+
+impl<K: Copy + Ord + Hash, V> Sorted<K, V> {
+    /// The entries of `map` by key. Each value moves twice whatever its size: only the
+    /// permutation is sorted.
+    fn of(map: FxHashMap<K, V>) -> Self {
+        let mut entries: Vec<Option<(K, V)>> = map.into_iter().map(Some).collect();
+        assert!(entries.len() <= u32::MAX as usize, "more than 2^32 nodes");
+        let mut order: Vec<u32> = (0..entries.len() as u32).collect();
+        // Keys are unique: an unstable sort is the order.
+        order.sort_unstable_by_key(|&at| entries[at as usize].as_ref().expect("not taken yet").0);
+        let mut sorted = Sorted {
+            keys: Vec::with_capacity(entries.len()),
+            values: Vec::with_capacity(entries.len()),
+            at: FxHashMap::with_capacity_and_hasher(entries.len(), Default::default()),
+        };
+        for at in order {
+            let (key, value) = entries[at as usize].take().expect("each entry once");
+            sorted.at.insert(key, sorted.keys.len() as u32);
+            sorted.keys.push(key);
+            sorted.values.push(value);
+        }
+        sorted
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        self.at.get(key).map(|&at| &self.values[at as usize])
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.keys.iter().zip(&self.values)
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        self.keys.iter().zip(&mut self.values)
+    }
+
+    fn values(&self) -> std::slice::Iter<'_, V> {
+        self.values.iter()
+    }
+
+    fn values_mut(&mut self) -> std::slice::IterMut<'_, V> {
+        self.values.iter_mut()
+    }
+}
+
+impl<K: Copy + Ord + Hash, V> std::ops::Index<&K> for Sorted<K, V> {
+    type Output = V;
+
+    fn index(&self, key: &K) -> &V {
+        self.get(key).expect("a node of the walk")
+    }
+}
+
 /// One compile of a release phase: `name` is the key callers' places and summaries name it
 /// by, `unit` what is compiled (another key for a function tiered up).
 struct Job<'n, B: Prepare> {
@@ -174,7 +246,7 @@ struct Job<'n, B: Prepare> {
 
 /// A body `function` built in that none of `keys` is: code its store key does not hold.
 fn unkept_inline<B: Prepare>(
-    nodes: &BTreeMap<InstanceKey, FnNode<B>>,
+    nodes: &Sorted<InstanceKey, FnNode<B>>,
     function: &CompiledFunction,
     keys: impl IntoIterator<Item = InstanceKey>,
 ) -> Option<blaze_items::CodeHash> {
@@ -291,9 +363,9 @@ pub struct Build<'a, B: Prepare> {
     frontend: &'a B::Frontend,
     policy: &'a Policy,
     memo: &'a Memo,
-    nodes: BTreeMap<InstanceKey, FnNode<B>>,
+    nodes: Sorted<InstanceKey, FnNode<B>>,
     /// Functions the last run's statics refer to.
-    static_callees: BTreeSet<InstanceKey>,
+    static_callees: FxHashSet<InstanceKey>,
 }
 
 /// The function a target names, if it names one.
@@ -306,7 +378,7 @@ fn callee(target: &Target) -> Option<InstanceKey> {
 
 impl<'a, B: Prepare> Build<'a, B> {
     pub fn new(backend: &'a B, frontend: &'a B::Frontend, policy: &'a Policy, memo: &'a Memo) -> Self {
-        Build { backend, frontend, policy, memo, nodes: BTreeMap::new(), static_callees: BTreeSet::new() }
+        Build { backend, frontend, policy, memo, nodes: Sorted::default(), static_callees: FxHashSet::default() }
     }
 
     fn node(
@@ -357,9 +429,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         &self,
         roots: &[(FrontInstance<B>, Origin)],
         errors: &mut Vec<CodegenError>,
-    ) -> (BTreeMap<InstanceKey, FnNode<B>>, BTreeMap<StaticId, StaticNode<B>>, Vec<InstanceKey>) {
-        let mut nodes: BTreeMap<InstanceKey, FnNode<B>> = BTreeMap::new();
-        let mut statics: BTreeMap<StaticId, StaticNode<B>> = BTreeMap::new();
+    ) -> (Sorted<InstanceKey, FnNode<B>>, Sorted<StaticId, StaticNode<B>>, Vec<InstanceKey>) {
+        let mut nodes: FxHashMap<InstanceKey, FnNode<B>> = FxHashMap::default();
+        let mut statics: FxHashMap<StaticId, StaticNode<B>> = FxHashMap::default();
         let mut asked: HashMap<(FrontInstance<B>, Origin), InstanceKey> = HashMap::new();
         let mut static_asked: HashMap<FrontStatic<B>, StaticId> = HashMap::new();
         let mut queued: HashSet<(FrontInstance<B>, Origin)> = HashSet::new();
@@ -433,6 +505,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             level = next;
             static_level = next_statics;
         }
+        let (mut nodes, mut statics) = (Sorted::of(nodes), Sorted::of(statics));
 
         let through_slot: HashMap<InstanceKey, bool> =
             nodes.iter().map(|(key, node)| (*key, node.patchable || node.then.is_some())).collect();
@@ -461,8 +534,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             node.refs = resolve(&node.described.refs, &node.described.origin).unwrap_or_default();
         }
         // What each builds in directly, then at any depth.
-        let mut direct: BTreeMap<InstanceKey, Vec<InstanceKey>> = BTreeMap::new();
-        for (key, node) in &nodes {
+        let mut direct: FxHashMap<InstanceKey, Vec<InstanceKey>> =
+            FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
+        for (key, node) in nodes.iter() {
             if node.refs.is_empty() && !node.described.refs.is_empty() {
                 continue;
             }
@@ -484,15 +558,17 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
             direct.insert(*key, callees);
         }
+        let (mut seen, mut queue) = (FxHashSet::default(), Vec::new());
         for (key, node) in nodes.iter_mut() {
-            let mut seen = BTreeSet::new();
-            let mut queue: Vec<InstanceKey> = direct.get(key).cloned().unwrap_or_default();
+            seen.clear();
+            queue.extend(direct.get(key).into_iter().flatten().copied());
             while let Some(it) = queue.pop() {
                 if it != *key && seen.insert(it) {
                     queue.extend(direct.get(&it).into_iter().flatten().copied());
                 }
             }
-            node.built_in = seen.into_iter().collect();
+            node.built_in = seen.iter().copied().collect();
+            node.built_in.sort_unstable();
         }
         for node in statics.values_mut() {
             node.refs = resolve(&node.described.refs, &node.described.origin).unwrap_or_default();
@@ -504,7 +580,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// Builds the IR of each of `keys`, on all cores.
     fn prepare_all(
         &self,
-        nodes: &BTreeMap<InstanceKey, FnNode<B>>,
+        nodes: &Sorted<InstanceKey, FnNode<B>>,
         keys: &[InstanceKey],
     ) -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
         keys.par_iter()
@@ -608,7 +684,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         Ok(TieredUp { replaced, puts, stats })
     }
 
-    fn dev(&self, nodes: &BTreeMap<InstanceKey, FnNode<B>>, store: &dyn Lookup, out: &mut Out) {
+    fn dev(&self, nodes: &Sorted<InstanceKey, FnNode<B>>, store: &dyn Lookup, out: &mut Out) {
         let dev: Vec<InstanceKey> = nodes
             .iter()
             .filter(|(_, node)| node.spec.backend == crate::Backend::Cranelift)
@@ -617,14 +693,15 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)> = HashMap::new();
 
         // Folding: every candidate's masked shape, from the store or from its IR.
-        let mut masked: BTreeMap<InstanceKey, Option<Masked>> = BTreeMap::new();
+        // Each dev key at most once, from the store or from its IR; sorted by key below.
+        let mut masked: Vec<(InstanceKey, Option<Masked>)> = Vec::new();
         let mut unmasked = Vec::new();
         for key in dev.iter().filter(|key| nodes[*key].spec.fold) {
             let unit = &nodes[key].unit;
             let read = out.read(store, &keys::masked(&nodes[key].stored()), unit, |it| blob::decode_masked(it).map_err(|e| e.to_string()));
             match read {
                 Read::Hit(it) => {
-                    masked.insert(*key, it);
+                    masked.push((*key, it));
                 }
                 Read::Miss => unmasked.push(*key),
                 Read::Failed => {}
@@ -635,12 +712,13 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Ok((shape, made)) => {
                     let it = self.backend.masked(&nodes[&key].unit, &made, &nodes[&key].refs);
                     out.put(keys::masked(&nodes[&key].stored()), Kind::Query, blob::encode_masked(it.as_ref()));
-                    masked.insert(key, it);
+                    masked.push((key, it));
                     prepared.insert(key, (shape, made));
                 }
                 Err(why) => out.errors.push(why),
             }
         }
+        masked.sort_unstable_by_key(|it| it.0);
         let mut candidates = Vec::new();
         for (key, it) in &masked {
             let (node, Some(it)) = (&nodes[key], it) else { continue };
@@ -761,7 +839,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// Each group's body and thunks, from the store or merged from the members' IR.
     fn folded(
         &self,
-        nodes: &BTreeMap<InstanceKey, FnNode<B>>,
+        nodes: &Sorted<InstanceKey, FnNode<B>>,
         groups: &[Group],
         mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)>,
         store: &dyn Lookup,
@@ -867,7 +945,7 @@ impl<'a, B: Prepare> Build<'a, B> {
 
     fn release(
         &self,
-        nodes: &BTreeMap<InstanceKey, FnNode<B>>,
+        nodes: &Sorted<InstanceKey, FnNode<B>>,
         jobs: &[Job<'_, B>],
         store: &dyn Lookup,
         out: &mut Out,
@@ -888,7 +966,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         };
 
         // Every summary: stored, else from the IR, which is kept for the compile.
-        let mut summaries: BTreeMap<InstanceKey, Summary> = BTreeMap::new();
+        // Sorted by key once, in `imports::decide`.
+        let mut summaries: FxHashMap<InstanceKey, Summary> =
+            FxHashMap::with_capacity_and_hasher(jobs.len(), Default::default());
         let mut prepared: HashMap<InstanceKey, B::Prepared> = HashMap::new();
         let mut exports: HashMap<InstanceKey, B::Export> = HashMap::new();
         let mut unsummarized = Vec::new();
@@ -935,7 +1015,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         for (name, summary) in &mut summaries {
             summary.key = *name;
         }
-        let outside: BTreeSet<InstanceKey> = jobs
+        let outside: FxHashSet<InstanceKey> = jobs
             .iter()
             .filter(|job| job.node.external())
             .map(|job| job.name)
@@ -1049,7 +1129,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
     }
 
-    fn statics(&self, statics: &BTreeMap<StaticId, StaticNode<B>>, store: &dyn Lookup, out: &mut Out) {
+    fn statics(&self, statics: &Sorted<StaticId, StaticNode<B>>, store: &dyn Lookup, out: &mut Out) {
         let unit_of = |node: &StaticNode<B>| Unit {
             instance: Instance {
                 code: blaze_items::CodeHash(node.described.value),
@@ -1061,7 +1141,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             item: node.described.item,
         };
         let mut missing = Vec::new();
-        for (id, node) in statics {
+        for (id, node) in statics.iter() {
             let key = keys::static_value(&definition(&node.described), &node.spec.settings());
             let unit = unit_of(node);
             match out.read(store, &key, &unit, |it| blob::decode_static(it).map_err(|e| e.to_string())) {

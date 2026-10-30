@@ -529,7 +529,7 @@ pub(crate) fn similar_candidate(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>) -> Opti
             None::<()>
         });
     }
-    found.sort_by(|a, b| a.name(cx.db).map(|it| it.as_str().to_owned()).cmp(&b.name(cx.db).map(|it| it.as_str().to_owned())));
+    found.sort_by(|a, b| a.name(cx.db).cmp(&b.name(cx.db)));
     let names: Vec<String> = found.iter().filter_map(|it| Some(it.name(cx.db)?.as_str().to_owned())).collect();
     let best = find_best_match_for_name_with_substrings(&names, lookup, None)?;
     found.into_iter().find(|it| it.name(cx.db).is_some_and(|name| name.as_str() == best))

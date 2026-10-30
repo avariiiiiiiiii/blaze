@@ -207,6 +207,16 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
         }
     }
 
+    /// A field or a variant, named only as text: serde's derives also take its index or its
+    /// name as bytes, which would give one value more than one item.
+    fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        if self.peek()? >> 5 != TEXT {
+            return Err(self.offence("a field or variant not named as text"));
+        }
+        let (_, _, n) = self.head()?;
+        visitor.visit_borrowed_str(self.text(n)?)
+    }
+
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         self.pass()?;
         visitor.visit_unit()
@@ -214,7 +224,7 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
 
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
-        unit unit_struct seq tuple tuple_struct map struct identifier
+        unit unit_struct seq tuple tuple_struct map struct
     }
 }
 

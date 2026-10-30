@@ -23,22 +23,35 @@
 //!
 //! Release builds and `blaze build` outputs are compiled whole: [`mode::allow`] refuses lazy
 //! compilation for them, naming the profile or the output.
+//!
+//! The run process links this crate without its `daemon` feature: [`hook`], what the
+//! resolver calls, and [`wire`], the frames it sends.
 
 #![deny(unsafe_code)]
 
+#[cfg(feature = "daemon")]
 pub mod fetch;
+pub mod hook;
+#[cfg(feature = "daemon")]
 pub mod mode;
+#[cfg(feature = "daemon")]
 pub mod plan;
+#[cfg(feature = "daemon")]
 pub mod runner;
+#[cfg(feature = "daemon")]
 pub mod session;
+#[cfg(feature = "daemon")]
 pub mod stub;
 pub mod wire;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "daemon"))]
 mod tests;
 
+#[cfg(feature = "daemon")]
 pub use mode::{Purpose, Refused, allow};
+#[cfg(feature = "daemon")]
 pub use plan::Plan;
+#[cfg(feature = "daemon")]
 pub use session::Session;
 
 /// A lazy function's index among its session's lazy functions: what its entry hands the

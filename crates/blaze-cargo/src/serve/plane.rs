@@ -85,7 +85,7 @@ impl Fresh {
         self.nodes.first()
     }
 
-    pub fn len(&self) -> u32 {
+    pub fn count(&self) -> u32 {
         self.count
     }
 }
@@ -297,7 +297,7 @@ impl<T: Send + 'static> Runner<T> for Inline<T> {
     }
 }
 
-/// Nodes added together, ids `first..first + tasks.len()` (reserved at once, [`Plane::reserve`]):
+/// Nodes added together, ids `first..first + tasks.len()` (reserved at once, [`Plane::fresh`]):
 /// each one's task by offset, 12 bytes a node, and the one work their thread tasks share. Let
 /// go once every node of it settled.
 struct Batch<T> {
@@ -311,6 +311,7 @@ pub struct Plane<T> {
     estimates: Estimates,
     runner: Box<dyn Runner<T>>,
     /// By first id: a node's batch is the last one starting at or below it, O(log batches).
+    // BTreeMap: range queries by node id.
     batches: BTreeMap<u32, Batch<T>>,
     next_node: u32,
     next_request: u32,

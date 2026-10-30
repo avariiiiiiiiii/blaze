@@ -8,8 +8,6 @@
 //! thread of its own, since each may wait on a peer for as long as the peer likes.
 
 use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
     fs::{File, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
@@ -23,7 +21,10 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use crate::{Completion, Confine, Done, Driver, Effect, IoError, Tag, fs};
+use crate::{
+    Completion, Confine, Done, Driver, Effect, IoError, Tag, fs,
+    wheel::{self, Wheel},
+};
 
 pub struct Threads {
     start: Instant,
@@ -32,7 +33,8 @@ pub struct Threads {
     done: Receiver<Completion>,
     finished: Sender<Completion>,
     workers: Vec<JoinHandle<()>>,
-    timers: BinaryHeap<Reverse<(Instant, Tag)>>,
+    /// By ticks since `start`.
+    timers: Wheel<Tag>,
     watches: FxHashMap<Tag, Watching>,
     confine: Option<Arc<dyn Confine>>,
     #[cfg(unix)]
@@ -65,7 +67,7 @@ impl Threads {
             done,
             finished,
             workers,
-            timers: BinaryHeap::new(),
+            timers: Wheel::new(),
             watches: FxHashMap::default(),
             confine: None,
             #[cfg(unix)]
@@ -90,17 +92,12 @@ impl Threads {
     }
 
     fn fire_timers(&mut self, out: &mut Vec<Completion>) -> usize {
-        let now = Instant::now();
-        let mut fired = 0;
-        while let Some(Reverse((at, tag))) = self.timers.peek().copied() {
-            if at > now {
-                break;
-            }
-            self.timers.pop();
-            self.in_flight -= 1;
+        let before = self.timers.len();
+        self.timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
             out.push(Completion { tag, done: Done::Fired });
-            fired += 1;
-        }
+        });
+        let fired = before - self.timers.len();
+        self.in_flight -= fired;
         fired
     }
 
@@ -715,7 +712,8 @@ impl Driver for Threads {
             match effect {
                 Effect::Timer { after, tag } => {
                     self.in_flight += 1;
-                    self.timers.push(Reverse((Instant::now() + after, tag)))
+                    let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
+                    self.timers.insert(due, tag);
                 }
                 Effect::Watch { dir, tag } => {
                     match Watching::start(&self.root, &dir, tag, self.finished.clone()) {
@@ -814,10 +812,9 @@ impl Driver for Threads {
         let before = out.len();
         self.fire_timers(out);
         if out.len() == before {
-            let until_timer = self
-                .timers
-                .peek()
-                .map(|Reverse((at, _))| at.saturating_duration_since(Instant::now()));
+            let now = wheel::ticks(self.start.elapsed());
+            let until_timer =
+                self.timers.next_deadline().map(|at| Duration::from_nanos(at.saturating_sub(now)));
             let wait = until_timer.map_or(wait, |it| it.min(wait));
             match self.done.recv_timeout(wait) {
                 Ok(completion) => self.took(completion, out),

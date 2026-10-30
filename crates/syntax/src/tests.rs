@@ -250,7 +250,7 @@ fn k() { #[a] }
 
 fn sorted_errors(errors: Vec<SyntaxError>) -> Vec<(crate::TextRange, String)> {
     let mut errors: Vec<_> = errors.into_iter().map(|it| (it.range(), it.to_string())).collect();
-    errors.sort_by_key(|(range, message)| (range.start(), range.end(), message.clone()));
+    errors.sort_by(|(a, x), (b, y)| (a.start(), a.end(), x).cmp(&(b.start(), b.end(), y)));
     errors
 }
 

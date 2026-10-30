@@ -64,6 +64,8 @@ use rustc_hash::FxHashMap;
 
 use super::{Also, Bind, MARK, Recorder, Spec, View, tidy, tidy_into};
 
+mod raw;
+
 /// The library a traced run's processes load (`LD_PRELOAD`), built from `linux_interpose.c` by
 /// `build.rs`: it tells the supervisor what its filter can't see, the variables read by name
 /// and the realtime clock read through the vDSO, and says it loaded, so that a program it is
@@ -459,14 +461,16 @@ fn unique() -> u64 {
 /// Whether this user may make a user namespace and map itself in it, which a sandbox in
 /// namespaces needs, tried in a process of its own; why not when it may not.
 fn namespaces() -> Result<(), String> {
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let (uid, gid) = (raw::uid(), raw::gid());
     let maps = [
         (c"/proc/self/setgroups", "deny".to_owned()),
         (c"/proc/self/uid_map", format!("{uid} {uid} 1")),
         (c"/proc/self/gid_map", format!("{gid} {gid} 1")),
     ];
-    // SAFETY: the child only makes system calls and exits.
-    let child = unsafe { libc::fork() };
+    // SAFETY: the sandbox runs in `blaze sandbox`'s process, which is one thread
+    // (`super::command` runs before anything else in it, and nothing here starts a thread).
+    // The child only writes three files and exits.
+    let child = unsafe { raw::fork() };
     if child < 0 {
         return Err(os("fork"));
     }
@@ -475,22 +479,22 @@ fn namespaces() -> Result<(), String> {
         // error in the low six.
         let failed = |step: i32| {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(1);
-            unsafe { libc::_exit((step << 6) | (errno & 63).max(1)) }
+            raw::exit((step << 6) | (errno & 63).max(1))
         };
-        if unsafe { libc::unshare(libc::CLONE_NEWUSER) } < 0 {
+        if raw::unshare(libc::CLONE_NEWUSER) < 0 {
             failed(0);
         }
         for (step, (file, text)) in (1..).zip(&maps) {
-            let fd = unsafe { libc::open(file.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-            if fd < 0 || unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) } < 0 {
+            let fd = raw::open(file, libc::O_WRONLY | libc::O_CLOEXEC);
+            if fd.as_ref().is_none_or(|fd| raw::write(fd.as_fd(), text.as_bytes()) < 0) {
                 failed(step);
             }
-            unsafe { libc::close(fd) };
+            drop(fd);
         }
-        unsafe { libc::_exit(0) };
+        raw::exit(0);
     }
     let mut status = 0;
-    while unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
+    while raw::wait(child, &mut status, 0) < 0 {
         if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(os("waitpid"));
         }
@@ -531,19 +535,9 @@ fn run_in(
             .collect(),
         Some(given) => environment(given, tmp.as_ref(), interposer)?,
     };
-    let mut sockets = [0; 2];
-    // SAFETY: two descriptors are written into `sockets`.
-    if unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
-            0,
-            sockets.as_mut_ptr(),
-        )
-    } < 0
-    {
+    let Some(sockets) = raw::stream_pair() else {
         return Err(os("socketpair"));
-    }
+    };
     let recorded = program.is_some() && (spec.record.is_some() || also.live.is_some());
     let confining = scratch.is_some();
     let filter = program
@@ -560,12 +554,14 @@ fn run_in(
     if interposer.is_some() {
         recorder.interposed();
     }
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let (uid, gid) = (raw::uid(), raw::gid());
     // Before the fork, so that no signal ends this process before it passes them on; the
     // sandbox's processes that run no program keep the handlers, and pass nothing on.
     super::pass_signals_to(0);
-    // SAFETY: the process is one thread; the child only makes system calls and exits.
-    let first = unsafe { libc::fork() };
+    // SAFETY: the sandbox runs in `blaze sandbox`'s process, which is one thread
+    // (`super::command` runs before anything else in it; the signal handlers above start
+    // none). The child makes the sandbox and forks again, as one thread too.
+    let first = unsafe { raw::fork() };
     if first < 0 {
         return Err(os("fork"));
     }
@@ -573,11 +569,11 @@ fn run_in(
         // A session of its own, with no controlling terminal: nothing of the sandbox can push
         // input into the caller's (`TIOCSTI`), which only a terminal's own session may. And
         // gone with the supervisor, which a signal that can't be passed on ends.
-        unsafe {
-            libc::setsid();
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-        }
-        unsafe { libc::close(sockets[0]) };
+        raw::setsid();
+        raw::die_with_parent();
+        // SAFETY: `sockets[0]` is the supervisor's end, owned by no `OwnedFd`; this child's
+        // copy of it is never used, and the supervisor keeps its own.
+        unsafe { raw::close(sockets[0]) };
         let made = Made {
             argv: &argv,
             env: &env,
@@ -597,12 +593,16 @@ fn run_in(
                 super::COULD_NOT
             }
         };
-        unsafe { libc::_exit(code) };
+        raw::exit(code);
     }
     super::pass_signals_to(first);
-    unsafe { libc::close(sockets[1]) };
+    // SAFETY: `sockets[1]` is the child's end, owned by no `OwnedFd` and not used in the
+    // supervisor after; the child has its own copy.
+    unsafe { raw::close(sockets[1]) };
     let listener = received(sockets[0]);
-    unsafe { libc::close(sockets[0]) };
+    // SAFETY: `sockets[0]` is owned by no `OwnedFd` and not used after; the descriptor
+    // `received` gave is a new one, not it.
+    unsafe { raw::close(sockets[0]) };
     let around = match (&spec.view, confining) {
         (Some(_), _) => Around::View,
         (None, true) => Around::Confined(first),
@@ -611,10 +611,12 @@ fn run_in(
     let mut watch = Watch { around, network: also.network, processes: FxHashMap::default() };
     if let Some(listener) = listener {
         supervise(listener, first, &mut recorder, &mut watch);
-        unsafe { libc::close(listener) };
+        // SAFETY: `listener` came from `received` and is held by nothing else; `supervise`
+        // has returned, and it is not used after.
+        unsafe { raw::close(listener) };
     }
     let mut status = 0;
-    while unsafe { libc::waitpid(first, &mut status, 0) } < 0 {
+    while raw::wait(first, &mut status, 0) < 0 {
         if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(os("waitpid"));
         }

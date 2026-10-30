@@ -202,13 +202,14 @@ impl Memory for Os {
     }
 
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
+        let base = self.base;
         let mut run: Option<(Range<u64>, Region)> = None;
         for span in writes.spans {
             regions(&span.range(), |piece, region| {
-                if region.allocation != self.base {
+                if region.allocation != base {
                     return Err(format!(
-                        "a write at {:#x}..{:#x}, outside the image at {:#x}",
-                        piece.start, piece.end, self.base
+                        "a write at {:#x}..{:#x}, outside the image at {base:#x}",
+                        piece.start, piece.end
                     ));
                 }
                 let protect = region.protect & 0xff;

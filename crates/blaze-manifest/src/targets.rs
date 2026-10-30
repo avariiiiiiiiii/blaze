@@ -991,7 +991,7 @@ https://github.com/rust-lang/cargo/issues/5330",
             targets
         }
     };
-    toml_targets.sort_unstable_by_key(|t| t.name.clone());
+    toml_targets.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     toml_targets
 }
 

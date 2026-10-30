@@ -27,16 +27,12 @@
 #[cfg(test)]
 mod tests;
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
-    ops::Range,
-};
+use std::{collections::BTreeMap, fmt::Write as _, ops::Range};
 
 use blaze_api::{Diagnostic, Level, Mismatch, Request, Response, TestOutcome, TestResult, ViewRef};
 use blaze_ids::ContentId;
 use blaze_vfs::View;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -90,6 +86,7 @@ impl Settings {
 #[serde(deny_unknown_fields)]
 pub struct State {
     /// By ref: `branch/<b>`, `pr/<n>`.
+    // BTreeMap: serialized with serde as a map into the state file.
     pub checkouts: BTreeMap<String, Held>,
     pub snapshots: Vec<Kept>,
 }
@@ -251,14 +248,14 @@ pub struct Service {
     jobs: FxHashMap<JobId, Job>,
     runs: FxHashMap<RunId, Run>,
     /// Each branch's and pull request's newest job.
-    latest: BTreeMap<String, JobId>,
+    latest: FxHashMap<String, JobId>,
     /// The job whose checkout of a ref is in flight.
-    checking_out: BTreeMap<String, JobId>,
+    checking_out: FxHashMap<String, JobId>,
     train: Train,
     release_running: Option<JobId>,
     release_waiting: Option<JobId>,
     snapshotting: bool,
-    removing: BTreeSet<String>,
+    removing: FxHashSet<String>,
     next_job: u64,
     next_run: u64,
 }
@@ -276,13 +273,13 @@ impl Service {
             now: 0,
             jobs: FxHashMap::default(),
             runs: FxHashMap::default(),
-            latest: BTreeMap::new(),
-            checking_out: BTreeMap::new(),
+            latest: FxHashMap::default(),
+            checking_out: FxHashMap::default(),
             train: Train::default(),
             release_running: None,
             release_waiting: None,
             snapshotting: false,
-            removing: BTreeSet::new(),
+            removing: FxHashSet::default(),
             next_job: 0,
             next_run: 0,
         }

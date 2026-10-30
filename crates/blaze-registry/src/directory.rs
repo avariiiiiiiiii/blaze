@@ -26,6 +26,7 @@ pub struct Vendored {
     /// The sha256 of the `.crate` file it was unpacked from, which a registry's lock entry
     /// names; none for a package vendored from git.
     pub checksum: Option<String>,
+    // BTreeMap: `verify` reports the first changed file in path order, the same on every run.
     files: BTreeMap<String, String>,
 }
 

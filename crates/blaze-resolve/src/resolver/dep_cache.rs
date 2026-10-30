@@ -419,6 +419,7 @@ struct Requirements<'a> {
     ///
     /// The resolver will activate all of these dependencies, with the given
     /// features enabled.
+    // BTreeSet: each becomes a `FeaturesSet`, part of the `DepsCache` key.
     deps: HashMap<InternedString, BTreeSet<InternedString>>,
     /// The set of features enabled on this package which is later used when
     /// compiling to instruct the code what features were enabled.

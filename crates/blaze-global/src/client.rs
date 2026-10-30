@@ -189,22 +189,23 @@ impl<C: Channels> Client<C> {
     /// Asks `store` to fetch `public` through the cache: `None` when it has the value or is
     /// fetching it. The store's completion is among what [`Client::complete`] returns.
     pub fn fetch(&mut self, store: &mut Store, public: &Public, effects: &mut Vec<Effect>) -> Option<Tag> {
-        self.fetch_many(store, std::iter::once(public), effects).pop()
+        self.fetch_many(store, std::iter::once(public), effects).pop().map(|(_, tag)| tag)
     }
 
     /// [`Client::fetch`] of each of `publics`, asked together so they go in as few requests
-    /// as their batches take. The tags of those the store asked for.
+    /// as their batches take. The keys the store asked for, with their tags.
     pub fn fetch_many<'p>(
         &mut self,
         store: &mut Store,
         publics: impl IntoIterator<Item = &'p Public>,
         effects: &mut Vec<Effect>,
-    ) -> Vec<Tag> {
+    ) -> Vec<(Key, Tag)> {
         self.batching = true;
         let mut tags = Vec::new();
         for public in publics {
-            self.allowed = Some(public.key());
-            tags.extend(store.fetch(&public.key(), self, effects));
+            let key = public.key();
+            self.allowed = Some(key);
+            tags.extend(store.fetch(&key, self, effects).map(|tag| (key, tag)));
         }
         self.allowed = None;
         self.batching = false;

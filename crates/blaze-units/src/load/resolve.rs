@@ -455,11 +455,13 @@ fn selected(
             if let Some(it) = names.iter().find(|it| pattern(it)) {
                 anyhow::bail!("blaze does not read package patterns in `--package` yet (`{it}`)");
             }
-            let mut specs: Vec<PackageIdSpec> =
-                names.iter().map(|name| PackageIdSpec::parse(name)).collect::<anyhow::Result<_>>()?;
-            specs.sort_by_key(|it| it.to_string());
-            specs.dedup_by_key(|it| it.to_string());
-            specs
+            let mut specs: Vec<(String, PackageIdSpec)> = names
+                .iter()
+                .map(|name| PackageIdSpec::parse(name).map(|spec| (spec.to_string(), spec)))
+                .collect::<anyhow::Result<_>>()?;
+            specs.sort_by(|a, b| a.0.cmp(&b.0));
+            specs.dedup_by(|a, b| a.0 == b.0);
+            specs.into_iter().map(|(_, spec)| spec).collect()
         }
         Select::Default => {
             let named = |name: &str| member_ids.iter().find(|id| id.name().as_str() == name).copied();

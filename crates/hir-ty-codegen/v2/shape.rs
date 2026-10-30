@@ -312,7 +312,7 @@ fn reloc_kind(kind: cranelift_codegen::binemit::Reloc) -> u8 {
 fn variables(out: &mut Out, variables: &[Variable]) {
     out.u32(variables.len() as u32);
     for variable in variables {
-        out.bytes(variable.name.as_bytes());
+        out.bytes(variable.name.as_str().as_bytes());
         out.u8(u8::from(variable.param));
         out.raw(&variable.ty.0);
         out.u32(variable.slot);

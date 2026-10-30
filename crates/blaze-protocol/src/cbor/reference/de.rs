@@ -136,9 +136,20 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
         }
     }
 
+    /// A field or a variant, named only as text.
+    fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        if self.peek()? >> 5 != TEXT {
+            return Err(self.offence("a field or variant not named as text"));
+        }
+        let (_, _, n) = self.head()?;
+        let name = self.take(n)?;
+        let name = std::str::from_utf8(name).map_err(|_| self.offence("text not UTF-8"))?;
+        visitor.visit_borrowed_str(name)
+    }
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
-        unit unit_struct seq tuple tuple_struct map struct identifier ignored_any
+        unit unit_struct seq tuple tuple_struct map struct ignored_any
     }
 }
 

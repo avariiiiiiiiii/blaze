@@ -516,11 +516,18 @@ fn the_mount_table_survives_a_restart() {
     let mut client = dial(&mut daemon);
     let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
-    let before: Vec<_> = daemon.mounts().all().cloned().collect();
+    let sorted = |daemon: &Daemon<Sim>| {
+        let mut all: Vec<_> = daemon.mounts().all().cloned().collect();
+        all.sort_by(|a, b| a.at.cmp(&b.at));
+        all
+    };
+    let before = sorted(&daemon);
     assert_eq!(before.len(), 3);
+    let roots = daemon.mounts().roots();
 
     let mut daemon = restart(daemon, &steps, 4);
-    assert_eq!(daemon.mounts().all().cloned().collect::<Vec<_>>(), before);
+    assert_eq!(sorted(&daemon), before);
+    assert_eq!(daemon.mounts().roots(), roots);
     let mut client = dial(&mut daemon);
     let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     let got = client.wait(&mut daemon, id);

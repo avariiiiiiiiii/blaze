@@ -4,11 +4,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
-
 use blaze_ids::ContentId;
 use blaze_units::query::{Mount, Origin};
 use blaze_vfs::{CommitError, Op, OpError, Ticket, Vfs};
+use rustc_hash::FxHashMap;
 
 use crate::serve::work::Source;
 
@@ -28,13 +27,13 @@ fn parse(head: &str) -> Option<(String, String)> {
 /// Every source mounted, by `at`.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct Mounts {
-    by_at: BTreeMap<String, Mount>,
+    by_at: FxHashMap<String, Mount>,
 }
 
 impl Mounts {
     /// The mounts a VFS recovered from its journal kept.
     pub fn recover(vfs: &Vfs) -> Mounts {
-        let mut by_at = BTreeMap::new();
+        let mut by_at = FxHashMap::default();
         for (head, root) in vfs.heads() {
             if let Some((at, under)) = parse(head) {
                 by_at.insert(at.clone(), Mount { at, origin: Origin::Root(root), under });
@@ -51,20 +50,24 @@ impl Mounts {
         self.by_at.contains_key(at)
     }
 
-    /// Every mount, sorted by `at`.
+    /// Every mount, in no order: sort by `at` where the order shows.
     pub fn all(&self) -> impl Iterator<Item = &Mount> {
         self.by_at.values()
     }
 
-    /// The roots the mounts hold, for a collection to keep.
+    /// The roots the mounts hold, sorted by `at`, for a collection to keep: the collection
+    /// renumbers the tree in the order it is given.
     pub fn roots(&self) -> Vec<ContentId> {
-        self.by_at
+        let mut held: Vec<(&str, ContentId)> = self
+            .by_at
             .values()
             .filter_map(|it| match it.origin {
-                Origin::Root(root) => Some(root),
+                Origin::Root(root) => Some((it.at.as_str(), root)),
                 Origin::View => None,
             })
-            .collect()
+            .collect();
+        held.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        held.into_iter().map(|(_, root)| root).collect()
     }
 
     /// `source` put into the VFS as a root of its own and mounted at `at`, durably once the
@@ -140,5 +143,23 @@ mod tests {
         let (one, _) = mounts.mount(&mut vfs, "/a", &files).unwrap();
         let (two, _) = mounts.mount(&mut vfs, "/b", &files).unwrap();
         assert_eq!(one.origin, two.origin);
+    }
+
+    #[test]
+    fn the_roots_are_in_order_of_where_they_are_mounted() {
+        let (mut vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]);
+        let mut mounts = Mounts::default();
+        let ats = ["/m", "/a", "/z", "/c", "/b", "/y"];
+        let mut want = Vec::new();
+        for (n, at) in ats.iter().enumerate() {
+            let body = format!("pub fn f{n}() {{}}\n");
+            let (mount, _) = mounts.mount(&mut vfs, at, &source(&[("src/lib.rs", body.as_bytes())], "")).unwrap();
+            let Origin::Root(root) = mount.origin else { panic!("a mount of a source is a root") };
+            want.push((*at, root));
+        }
+        want.sort_by(|a, b| a.0.cmp(b.0));
+        let want: Vec<ContentId> = want.into_iter().map(|(_, root)| root).collect();
+        assert_eq!(mounts.roots(), want);
+        assert_eq!(Mounts::recover(&vfs).roots(), want);
     }
 }

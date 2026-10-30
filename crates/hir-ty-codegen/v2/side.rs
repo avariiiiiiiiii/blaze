@@ -2,7 +2,10 @@
 //! named locals and where they are while it runs. Kept in the store under
 //! [`blaze_codegen::CompiledFunction::side`], in postcard, versioned by [`VERSION`].
 
+use std::borrow::Cow;
+
 use blaze_ids::ContentId;
+use intern::Symbol;
 use serde_derive::{Deserialize, Serialize};
 
 use crate::debuginfo::{LineRow, SlotPlaces, VariablePlace};
@@ -13,10 +16,10 @@ pub(crate) const VERSION: u32 = 2;
 const SIDE_DOMAIN: &str = "blaze v2 side 2";
 
 /// A named local of a function, as its IR was built: in a stack slot, or at an address the
-/// slot holds.
+/// slot holds. 64 bytes; its name is the body's interned one, a pointer to it.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Variable {
-    pub(crate) name: String,
+    pub(crate) name: Symbol,
     pub(crate) param: bool,
     /// Its type by content ([`super::Hashes::ty`]).
     pub(crate) ty: ContentId,
@@ -27,6 +30,9 @@ pub(crate) struct Variable {
     /// function, as a parameter's is.
     pub(crate) scope: Option<u32>,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<Variable>() == 64);
 
 /// The scopes of a function's body its named locals are bound in, as the body says them:
 /// which code each is of is known once the code is, from its line rows.
@@ -48,13 +54,17 @@ pub(crate) enum SpanScope {
     In(u32),
 }
 
+/// The table as written, borrowing what it tells of, and as read, borrowing the names from
+/// the stored bytes.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct Side {
+pub(crate) struct Side<'a> {
     pub(crate) version: u32,
     /// The DWARF expression of what [`Place::Frame`] and `DW_OP_fbreg` count from.
-    pub(crate) frame_base: Vec<u8>,
+    #[serde(borrow)]
+    pub(crate) frame_base: Cow<'a, [u8]>,
     pub(crate) scopes: Vec<Scope>,
-    pub(crate) variables: Vec<Told>,
+    #[serde(borrow)]
+    pub(crate) variables: Vec<Told<'a>>,
 }
 
 /// A part of the function its names are looked up in: a block, what follows a `let`.
@@ -67,8 +77,8 @@ pub(crate) struct Scope {
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct Told {
-    pub(crate) name: String,
+pub(crate) struct Told<'a> {
+    pub(crate) name: &'a str,
     pub(crate) param: bool,
     pub(crate) ty: ContentId,
     pub(crate) place: Place,
@@ -93,32 +103,30 @@ pub(crate) fn encode(
     lines: &[LineRow],
     len: u32,
 ) -> Result<Option<(Vec<u8>, ContentId)>, String> {
-    let told: Vec<Told> = variables
-        .iter()
-        .filter_map(|variable| {
-            let place = slots.of(variable.slot)?;
-            let place = match variable.pointer {
-                Some(offset) => place.pointee(offset),
-                None => place.clone(),
-            };
-            let place = match place {
-                VariablePlace::Frame(offset) => Place::Frame(offset),
-                VariablePlace::Ranges(ranges) => Place::Ranges(ranges),
-            };
-            Some(Told {
-                name: variable.name.clone(),
-                param: variable.param,
-                ty: variable.ty,
-                place,
-                scope: variable.scope,
-            })
+    let mut told = Vec::with_capacity(variables.len());
+    told.extend(variables.iter().filter_map(|variable| {
+        let place = slots.of(variable.slot)?;
+        let place = match variable.pointer {
+            Some(offset) => place.pointee(offset),
+            None => place.clone(),
+        };
+        let place = match place {
+            VariablePlace::Frame(offset) => Place::Frame(offset),
+            VariablePlace::Ranges(ranges) => Place::Ranges(ranges),
+        };
+        Some(Told {
+            name: variable.name.as_str(),
+            param: variable.param,
+            ty: variable.ty,
+            place,
+            scope: variable.scope,
         })
-        .collect();
+    }));
     if told.is_empty() {
         return Ok(None);
     }
     let scopes = ranges(scopes, lines, len)?;
-    let frame_base = slots.frame_base.clone();
+    let frame_base = Cow::Borrowed(&slots.frame_base[..]);
     let side = Side { version: VERSION, frame_base, scopes, variables: told };
     let bytes = postcard::to_allocvec(&side).map_err(|e| e.to_string())?;
     let id = ContentId::of(SIDE_DOMAIN, &bytes);
@@ -173,8 +181,9 @@ fn ranges(scopes: &Scopes, lines: &[LineRow], len: u32) -> Result<Vec<Scope>, St
     Ok(out)
 }
 
-pub(crate) fn decode(bytes: &[u8]) -> Result<Side, String> {
-    let side: Side = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;
+/// The table in `bytes`, its names borrowed from them.
+pub(crate) fn decode(bytes: &[u8]) -> Result<Side<'_>, String> {
+    let side: Side<'_> = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;
     if side.version != VERSION {
         return Err(format!("a side table of version {}, not {VERSION}", side.version));
     }
@@ -193,7 +202,7 @@ mod tests {
         };
         let ty = ContentId::of("test", b"u32");
         let variable = |name: &str, slot, pointer| Variable {
-            name: name.to_owned(),
+            name: Symbol::intern(name),
             param: false,
             ty,
             slot,
@@ -204,7 +213,7 @@ mod tests {
         let encoded = || encode(&variables, &Scopes::default(), &slots, &[], 16);
         let (bytes, id) = encoded().expect("encoded").expect("variables");
         let side = decode(&bytes).expect("decoded");
-        let names: Vec<_> = side.variables.iter().map(|it| it.name.as_str()).collect();
+        let names: Vec<_> = side.variables.iter().map(|it| it.name).collect();
         assert_eq!(names, ["a", "b"]);
         assert_eq!(side.variables[0].place, Place::Frame(-16));
         assert!(matches!(side.variables[1].place, Place::Ranges(_)));

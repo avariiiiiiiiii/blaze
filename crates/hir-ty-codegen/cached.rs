@@ -158,14 +158,12 @@ impl From<&Code> for CachedCode {
             relocs: code
                 .relocs
                 .iter()
-                .map(|it| CachedReloc {
-                    offset: it.offset,
-                    kind: it.kind,
-                    name: it.name.clone(),
-                    addend: it.addend,
+                .map(|it| {
+                    let it = it.module(super::fragment::unstitched());
+                    CachedReloc { offset: it.offset, kind: it.kind, name: it.name, addend: it.addend }
                 })
                 .collect(),
-            elf_types: code.elf_types.clone(),
+            elf_types: code.relocs.iter().filter_map(|it| Some((it.offset, it.elf_type?))).collect(),
             unwind: code.unwind.clone(),
             lines: code.lines.clone(),
             slots: code.slots.clone(),
@@ -194,26 +192,28 @@ impl CachedCode {
         &self.signature
     }
 
-    pub(super) fn code(&self) -> Code {
-        Code {
+    /// The code, or why a relocation of it can't be kept: an ELF type at an offset where no
+    /// relocation is.
+    pub(super) fn code(&self) -> Result<Code, super::fragment::RelocError> {
+        let mut relocs = super::fragment::Relocs::with_capacity(self.relocs.len());
+        let mut typed = self.elf_types.iter().peekable();
+        for it in &self.relocs {
+            let reloc =
+                ModuleReloc { offset: it.offset, kind: it.kind, name: it.name.clone(), addend: it.addend };
+            relocs.push_module(&reloc, typed.next_if(|typed| typed.0 == it.offset).map(|it| it.1))?;
+        }
+        if let Some(&(offset, _)) = typed.next() {
+            return Err(super::fragment::RelocError::Unmatched(offset));
+        }
+        Ok(Code {
             signature: self.signature.clone(),
             bytes: self.bytes.clone(),
             align: self.align,
-            relocs: self
-                .relocs
-                .iter()
-                .map(|it| ModuleReloc {
-                    offset: it.offset,
-                    kind: it.kind,
-                    name: it.name.clone(),
-                    addend: it.addend,
-                })
-                .collect(),
-            elf_types: self.elf_types.clone(),
+            relocs,
             unwind: self.unwind.clone(),
             lines: self.lines.clone(),
             slots: self.slots.clone(),
-        }
+        })
     }
 }
 
@@ -346,8 +346,8 @@ impl StoredCode {
             .into_iter()
             .map(|it| recorder.define_const(it).ok())
             .collect::<Option<_>>()?;
-        let mut code = self.code.code();
-        for reloc in &mut code.relocs {
+        let mut cached = self.code;
+        for reloc in &mut cached.relocs {
             reloc.name = match reloc.name {
                 ModuleRelocTarget::User { namespace: Self::IMPORTS, index } => {
                     ModuleRelocTarget::user(0, imports.get(index as usize)?.as_u32())
@@ -358,7 +358,7 @@ impl StoredCode {
                 ref other => other.clone(),
             };
         }
-        Some(code)
+        cached.code().ok()
     }
 
     /// Whether the code and the blobs refer only to what is kept with them and to what a
@@ -1244,7 +1244,7 @@ mod tests {
             }
             ids.datas.push(DataId::from_u32(at as u32));
         }
-        for reloc in &entry.code.code().relocs {
+        for reloc in entry.code.code().unwrap().relocs.iter() {
             ids.reloc(reloc, FuncId::from_u32(0));
         }
     }

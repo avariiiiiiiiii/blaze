@@ -357,6 +357,7 @@ impl ConflictReason {
 /// If resolving a dependency fails then this represents an incompatibility,
 /// that dependency will never be resolve while all of these packages are active.
 /// This is useless if the packages can't be simultaneously activated for other reasons.
+// BTreeMap: the conflict trie is keyed by these keys in order, and errors list them in order.
 pub(super) type ConflictMap = BTreeMap<PackageId, ConflictReason>;
 
 pub(super) struct RcVecIter<T> {

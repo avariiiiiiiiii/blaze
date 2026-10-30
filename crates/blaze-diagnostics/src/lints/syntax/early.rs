@@ -39,7 +39,7 @@ use crate::{
 pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
     let mut emitted = lexer::lints(cx, walk);
     emitted.extend(builtin::lints(cx, walk));
-    emitted.extend(labels::lints(cx, walk));
+    emitted.extend(labels::unused(cx));
     emitted.extend(macros::lints(cx, walk));
     emitted.extend(validation::lints(cx, walk));
     emitted
@@ -61,9 +61,10 @@ pub(crate) fn range_from_expansion(cx: &Cx<'_, '_>, range: InFile<TextRange>) ->
 }
 
 /// rustc's `span.allows_unsafe()`: the span is of the expansion of a macro defined with
-/// `#[allow_internal_unsafe]`.
+/// `#[allow_internal_unsafe]`. A file's own text is of no expansion: no span map is read.
 pub(crate) fn allows_unsafe(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> bool {
-    ctxt(cx, file, range)
+    file.macro_file().is_some()
+        && ctxt(cx, file, range)
         .outer_expn(cx.db)
         .is_some_and(|call| hir_expand::MacroCallId::from(call).loc(cx.db).def.allow_internal_unsafe)
 }

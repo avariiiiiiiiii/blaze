@@ -1072,6 +1072,11 @@ still holds the old `Rc`, `make_mut` copies once. The results are the same set a
 
 This is the only caller (`rg get_traits_in_scope crates/`). Status: open
 
+> method_resolution.rs edit: done by speed-types-probe, as
+> `Either::Left(it) => std::borrow::Borrow::<FxHashSet<TraitId>>::borrow(it),`, which compiles
+> with `get_traits_in_scope` returning either `FxHashSet` (today) or `Rc<FxHashSet>` (after the
+> infer.rs edits), so the infer.rs part can land on its own. The infer.rs part is still open.
+
 ## speed-hir-store: id-only scans of a store (from speed-hir-store)
 
 With expressions as columns, `store.exprs()` decodes every node. `ExpressionStore` now also has

@@ -47,6 +47,7 @@ import sys
 import tarfile
 import time
 import tomllib
+import typing
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -74,6 +75,7 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 NAME = r"[A-Za-z0-9_.-]+"
 RELEASE = re.compile(rf"https://github\.com/({NAME}/{NAME})/releases/download/({NAME})")
+BOLT_TOOLS = ("llvm-bolt", "merge-fdata", "perf2bolt")
 GATE = (("uv", "run", "--frozen", "python", "harness/ci.py", "run", '{"part": "fast"}'),)
 
 
@@ -236,30 +238,31 @@ def is_elf(target: str) -> bool:
 
 def check_build(build: Build) -> None:
     if build.bolt == "none" and is_elf(build.target):
-        raise typed_input.InputError(f"field bolt is none, and {build.target} is ELF: its binaries go through BOLT")
+        wrong(f"field bolt is none, and {build.target} is ELF: its binaries go through BOLT")
     if build.bolt != "none" and not is_elf(build.target):
-        raise typed_input.InputError(f"field bolt is {build.bolt}, and BOLT rewrites ELF only, not {build.target}")
+        wrong(f"field bolt is {build.bolt}, and BOLT rewrites ELF only, not {build.target}")
     if not build.bolt_bins and build.bolt != "none":
-        raise typed_input.InputError("field bolt_bins is empty, and BOLT needs a binary")
+        wrong("field bolt_bins is empty, and BOLT needs a binary")
     if build.min_count < 1:
-        raise typed_input.InputError("field min_count is at least 1")
+        wrong("field min_count is at least 1")
     if not build.gate:
-        raise typed_input.InputError("field gate is empty: the optimised binary passes a gate before it is published")
+        wrong("field gate is empty: the optimised binary passes a gate before it is published")
 
 
 def parse_training(text: str) -> Training:
     training = of(Training, typed_input.read(text), "the training")
     names = [p.name for p in training.projects]
     if len(set(names)) != len(names):
-        raise typed_input.InputError(f"the projects' names repeat: {names}")
+        wrong(f"the projects' names repeat: {names}")
     for i, project in enumerate(training.projects):
         where = f"projects[{i}]"
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", project.name):
-            raise typed_input.InputError(f"{where}.name is lowercase letters, digits, - and _, not {project.name!r}")
-        if project.source == "git" and not (project.repo.startswith("https://") and COMMIT.fullmatch(project.rev)):
-            raise typed_input.InputError(f"{where} is a git project: repo is an https URL and rev a full commit")
+            wrong(f"{where}.name is lowercase letters, digits, - and _, not {project.name!r}")
+        pinned = project.repo.startswith("https://") and COMMIT.fullmatch(project.rev)
+        if project.source == "git" and not pinned:
+            wrong(f"{where} is a git project: repo is an https URL and rev a full commit")
         if project.source == "self" and (project.repo or project.rev):
-            raise typed_input.InputError(f"{where} is this repository: it has no repo or rev")
+            wrong(f"{where} is this repository: it has no repo or rev")
         check_turns(where, project.edit, project.turns)
     if training.corpus is not None:
         check_turns("corpus", training.corpus.edit, training.corpus.turns)
@@ -268,12 +271,12 @@ def parse_training(text: str) -> Training:
 
 def check_turns(where: str, edit: str, turns: tuple[Turn, ...]) -> None:
     if not turns:
-        raise typed_input.InputError(f"{where}.turns is empty")
+        wrong(f"{where}.turns is empty")
     if Path(edit).is_absolute() or ".." in Path(edit).parts or not edit:
-        raise typed_input.InputError(f"{where}.edit is a path inside the project, not {edit!r}")
+        wrong(f"{where}.edit is a path inside the project, not {edit!r}")
     for i, turn in enumerate(turns):
         if not turn.args:
-            raise typed_input.InputError(f"{where}.turns[{i}].args is empty")
+            wrong(f"{where}.turns[{i}].args is empty")
 
 
 # Profiles and their bookkeeping.
@@ -350,32 +353,42 @@ def load_pins(text: str) -> Pins:
     """tools/pgo/profiles.json, refusing a field it does not have."""
     value = json.loads(text)
     if not isinstance(value, dict):
-        raise typed_input.InputError("profiles.json is a JSON object")
-    if sorted(value) != ["release", "targets", "toolchain"]:
-        raise typed_input.InputError(f"profiles.json has the fields release, targets, toolchain, not {sorted(value)}")
-    toolchain, release, targets = value["toolchain"], value["release"], value["targets"]
+        wrong("profiles.json is a JSON object")
+    fields = typing.cast(dict[str, object], value)
+    if sorted(fields) != ["release", "targets", "toolchain"]:
+        wrong(f"profiles.json has the fields release, targets, toolchain, not {sorted(fields)}")
+    toolchain, release, targets = fields["toolchain"], fields["release"], fields["targets"]
     if not isinstance(toolchain, str) or not isinstance(release, str) or not isinstance(targets, dict):
-        raise typed_input.InputError("profiles.json: toolchain and release are strings, targets an object")
+        wrong("profiles.json: toolchain and release are strings, targets an object")
     if RELEASE.fullmatch(release) is None:
-        raise typed_input.InputError(f"profiles.json: release is a GitHub release download URL, not {release!r}")
-    pins = tuple((t, read_pin(t, targets[t])) for t in sorted(targets))
+        wrong(f"profiles.json: release is a GitHub release download URL, not {release!r}")
+    by_target = typing.cast(dict[str, object], targets)
+    pins = tuple((t, read_pin(t, by_target[t])) for t in sorted(by_target))
     return Pins(toolchain, release, pins)
 
 
 def read_pin(target: str, value: object) -> Pin:
     pin = of(Pin, value, f"targets.{target}")
-    assets = [pin.name, *(a.name for a in (pin.bolt, pin.binaries) if a is not None)]
-    for digest in [pin.sha256, *(a.sha256 for a in (pin.bolt, pin.binaries) if a is not None)]:
-        if not SHA256.fullmatch(digest):
-            raise typed_input.InputError(f"targets.{target}: {digest!r} is not a sha256")
-    for name in assets:
-        if "/" in name or "\\" in name or name in ("", ".", ".."):
-            raise typed_input.InputError(f"targets.{target}: {name!r} is not a file name")
+    for asset in files_of(pin):
+        if not SHA256.fullmatch(asset.sha256):
+            wrong(f"targets.{target}: {asset.sha256!r} is not a sha256")
+        if "/" in asset.name or "\\" in asset.name or asset.name in ("", ".", ".."):
+            wrong(f"targets.{target}: {asset.name!r} is not a file name")
     if not COMMIT.fullmatch(pin.commit):
-        raise typed_input.InputError(f"targets.{target}.commit is a full commit, not {pin.commit!r}")
+        wrong(f"targets.{target}.commit is a full commit, not {pin.commit!r}")
     if pin.builder == "blaze" and (pin.llvm is None or pin.binaries is None):
-        raise typed_input.InputError(f"targets.{target} is blaze's: it names its llvm and binaries")
+        wrong(f"targets.{target} is blaze's: it names its llvm and binaries")
     return pin
+
+
+def files_of(pin: Pin) -> list[Asset]:
+    """The files a pin names: the profile, the BOLT profile and the binaries."""
+    assets = [Asset(pin.name, pin.sha256)]
+    if pin.bolt is not None:
+        assets.append(Asset(pin.bolt.name, pin.bolt.sha256))
+    if pin.binaries is not None:
+        assets.append(pin.binaries)
+    return assets
 
 
 def pin_json(pin: Pin) -> dict[str, Any]:
@@ -384,7 +397,8 @@ def pin_json(pin: Pin) -> dict[str, Any]:
 
 def dump_pins(pins: Pins) -> str:
     targets = {t: pin_json(p) for t, p in pins.targets}
-    return json.dumps({"toolchain": pins.toolchain, "release": pins.release, "targets": targets}, indent=2) + "\n"
+    top = {"toolchain": pins.toolchain, "release": pins.release, "targets": targets}
+    return json.dumps(top, indent=2) + "\n"
 
 
 def merge_pins(pins: Pins, toolchain: str, entries: list[tuple[str, Pin]]) -> Pins:
@@ -464,9 +478,12 @@ def unpack(data: bytes, top: str, dest: Path) -> None:
 
 # The steps.
 
+type Env = dict[str, str]
 
-def run(step: str, cmd: list[str], *, secs: float, cwd: Path = ROOT, env: dict[str, str] | None = None) -> str:
-    """`cmd`'s output, or Failed naming the step, the command, its exit and its output's tail."""
+
+def run(step: str, cmd: list[str], *, secs: float, cwd: Path = ROOT, env: Env | None = None) -> str:
+    """`cmd`'s output, or Failed naming the step, the command, its exit and its output's tail. An
+    `env` of None is this process's."""
     print(f"== {step}: {shlex.join(cmd)}", flush=True)
     try:
         done = subprocess.run(
@@ -500,14 +517,24 @@ class Llvm:
     def tool(self, name: str) -> Path:
         path = self.prefix / "bin" / name
         if not path.is_file():
-            raise Failed(f"the pinned LLVM at {self.prefix} has no {name}: .github/scripts/llvm.py builds it")
+            raise Failed(f"the pinned LLVM at {self.prefix} has no {name} (.github/scripts/llvm.py)")
         return path
+
+
+@dataclass(frozen=True)
+class Tree:
+    """A project's pristine sources, trained on by `turns`."""
+
+    name: str
+    path: Path
+    edit: str
+    turns: tuple[Turn, ...]
 
 
 def fetch_llvm(target: str, work: Path) -> Llvm:
     prefix = work / "llvm"
-    env = dict(os.environ)
-    run("fetch the pinned LLVM", [sys.executable, str(LLVM_PY), "fetch", "--target", target, "--dir", str(prefix)], cwd=ROOT, env=env, secs=1800)
+    cmd = [sys.executable, str(LLVM_PY), "fetch", "--target", target, "--dir", str(prefix)]
+    run("fetch the pinned LLVM", cmd, secs=1800)
     commit = json.loads(LLVM_PIN.read_text())["commit"]
     return Llvm(prefix, commit)
 
@@ -523,8 +550,8 @@ def build_blaze(build: Build, llvm: Llvm, stage: str, flags: list[str], work: Pa
         BLAZE_HOME=str(work / f"home-build-{stage}"),
     )
     env.pop("RUSTFLAGS", None)
-    cmd = [build.builder, "build", "--profile", PROFILE, "--target", build.target, "-p", PACKAGE, "--features", "llvm"]
-    run(f"build blaze ({stage})", cmd, cwd=ROOT, env=env, secs=build.build_secs)
+    cmd = [build.builder, "build", "--profile", PROFILE, "--target", build.target, "-p", PACKAGE]
+    run(f"build blaze ({stage})", [*cmd, "--features", "llvm"], env=env, secs=build.build_secs)
     stop(Path(build.builder), env)
     built = target_dir / build.target / PROFILE
     bins = sorted(p.stem for p in (ENGINE / "src" / "bin").glob("*.rs"))
@@ -544,7 +571,7 @@ def exe(target: str, name: str) -> str:
 
 
 def stop(blaze: Path, env: dict[str, str]) -> None:
-    run("stop the daemon", [str(blaze), "stop"], cwd=ROOT, env=env, secs=120)
+    run("stop the daemon", [str(blaze), "stop"], env=env, secs=120)
 
 
 def wait_exit(bins: Path) -> None:
@@ -560,12 +587,11 @@ def wait_exit(bins: Path) -> None:
         time.sleep(1)
 
 
-def prepare(training: Training, work: Path) -> list[tuple[str, Path, str, tuple[Turn, ...]]]:
-    """Each project's pristine sources under `work/sources`: (name, dir, edit file, turns)."""
+def prepare(training: Training, work: Path) -> list[Tree]:
+    """Each project's pristine sources, under `work/sources`."""
     sources = work / "sources"
     sources.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    out: list[tuple[str, Path, str, tuple[Turn, ...]]] = []
+    out: list[Tree] = []
     for project in training.projects:
         dest = sources / project.name
         if not dest.is_dir():
@@ -574,71 +600,83 @@ def prepare(training: Training, work: Path) -> list[tuple[str, Path, str, tuple[
             part.mkdir()
             if project.source == "self":
                 tar_path = sources / "self.tar"
-                run("archive blaze", ["git", "archive", "--format=tar", "-o", str(tar_path), "HEAD"], cwd=ROOT, env=env, secs=600)
+                run("archive blaze", ["git", "archive", "-o", str(tar_path), "HEAD"], secs=600)
                 with tarfile.open(tar_path) as tar:
                     tar.extractall(part, filter="data")
                 tar_path.unlink()
             else:
-                git = ["git", "-C", str(part)]
-                run(f"fetch {project.name}", ["git", "init", "-q", str(part)], cwd=ROOT, env=env, secs=60)
-                run(f"fetch {project.name}", [*git, "fetch", "-q", "--depth", "1", project.repo, project.rev], cwd=ROOT, env=env, secs=1800)
-                run(f"fetch {project.name}", [*git, "checkout", "-q", "FETCH_HEAD"], cwd=ROOT, env=env, secs=600)
-                got = run(f"fetch {project.name}", [*git, "rev-parse", "HEAD"], cwd=ROOT, env=env, secs=60).strip()
-                if got != project.rev:
-                    raise Failed(f"fetch {project.name}: {project.repo} gave {got}, not {project.rev}")
+                fetch(project, part)
             part.rename(dest)
-        out.append((project.name, dest, project.edit, project.turns))
+        out.append(Tree(project.name, dest, project.edit, project.turns))
     if training.corpus is not None:
         out += prepare_corpus(training.corpus, sources / "corpus")
-    for name, dest, edit, _ in out:
-        if not (dest / edit).is_file():
-            raise Failed(f"{name} has no edit file {edit}")
+    for tree in out:
+        if not (tree.path / tree.edit).is_file():
+            raise Failed(f"{tree.name} has no edit file {tree.edit}")
     return out
 
 
-def prepare_corpus(corpus: Corpus, sources: Path) -> list[tuple[str, Path, str, tuple[Turn, ...]]]:
+def fetch(project: Project, dest: Path) -> None:
+    """`project.repo` at `project.rev`, checked out into the empty `dest`."""
+    step = f"fetch {project.name}"
+    git = ["git", "-C", str(dest)]
+    run(step, ["git", "init", "-q", str(dest)], secs=60)
+    run(step, [*git, "fetch", "-q", "--depth", "1", project.repo, project.rev], secs=1800)
+    run(step, [*git, "checkout", "-q", "FETCH_HEAD"], secs=600)
+    got = run(step, [*git, "rev-parse", "HEAD"], secs=60).strip()
+    if got != project.rev:
+        raise Failed(f"{step}: {project.repo} gave {got}, not {project.rev}")
+
+
+def prepare_corpus(corpus: Corpus, sources: Path) -> list[Tree]:
     listed = of(CorpusFile, typed_input.read(str(ROOT / corpus.path)), corpus.path)
     by_name = {c.name: c for c in listed.crates}
     if missing := sorted(set(corpus.crates) - set(by_name)):
         raise Failed(f"{corpus.path} has no crates {missing}")
     chosen = [by_name[n] for n in corpus.crates] if corpus.crates else list(listed.crates)
     sources.mkdir(parents=True, exist_ok=True)
-    out: list[tuple[str, Path, str, tuple[Turn, ...]]] = []
+    out: list[Tree] = []
     for crate in chosen:
         top = f"{crate.name}-{crate.version}"
         dest = sources / top
         if not dest.is_dir():
-            cksum = listed_cksum(download(INDEX + index_path(crate.name)).decode(), crate.name, crate.version)
+            index = download(INDEX + index_path(crate.name)).decode()
+            cksum = listed_cksum(index, crate.name, crate.version)
             data = download(DOWNLOAD.format(name=crate.name, version=crate.version))
             got = hashlib.sha256(data).hexdigest()
             if got != cksum:
                 raise Failed(f"{top}.crate: its sha256 is {got}, and the index lists {cksum}")
             unpack(data, top, dest)
-        out.append((f"corpus/{top}", dest, corpus.edit, corpus.turns))
+        out.append(Tree(f"corpus/{top}", dest, corpus.edit, corpus.turns))
     return out
 
 
-def train(build: Build, projects: list[tuple[str, Path, str, tuple[Turn, ...]]], bins: Path, stage: str, work: Path, extra: dict[str, str]) -> None:
-    """Every turn of every project run by the blaze in `bins`, on a fresh copy of the sources and
-    a fresh BLAZE_HOME; then its daemon stopped and gone."""
+def on_path(bins: Path, env: dict[str, str]) -> str:
+    return f"{bins}{os.pathsep}{env.get('PATH', '')}"
+
+
+def train(build: Build, trees: list[Tree], bins: Path, stage: str, work: Path, extra: dict[str, str]) -> None:
+    """Every turn of every tree run by the blaze in `bins`, on a fresh copy of the sources and a
+    fresh BLAZE_HOME; then its daemon stopped and gone."""
     root = work / f"train-{stage}"
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
     env = dict(os.environ)
     env.update(extra)
-    env.update(BLAZE_HOME=str(root / "home"), PATH=f"{bins}{os.pathsep}{env.get('PATH', '')}")
+    env.update(BLAZE_HOME=str(root / "home"), PATH=on_path(bins, env))
     blaze = bins / exe(build.target, "blaze")
     try:
-        for name, pristine, edit, turns in projects:
-            tree = root / name
-            shutil.copytree(pristine, tree, symlinks=True)
+        for tree in trees:
+            copy = root / tree.name
+            shutil.copytree(tree.path, copy, symlinks=True)
             edits = 0
-            for i, turn in enumerate(turns):
+            for i, turn in enumerate(tree.turns):
                 if turn.edit:
                     edits += 1
-                    with (tree / edit).open("a") as f:
+                    with (copy / tree.edit).open("a") as f:
                         f.write(edit_text(edits))
-                run(f"train {stage}: {name} turn {i}", [str(blaze), *turn.args], cwd=tree, env=env, secs=build.turn_secs)
+                step = f"train {stage}: {tree.name} turn {i}"
+                run(step, [str(blaze), *turn.args], cwd=copy, env=env, secs=build.turn_secs)
     except Failed:
         try:
             stop(blaze, env)
@@ -653,18 +691,16 @@ def merge_profdata(llvm: Llvm, raw: Path, out: Path, min_count: int) -> int:
     raws = sorted(str(p) for p in raw.glob("*.profraw"))
     if not raws:
         raise Failed(f"training wrote no raw profile into {raw}")
-    env = dict(os.environ)
     profdata = str(llvm.tool("llvm-profdata"))
-    run("merge the profiles", [profdata, "merge", "-o", str(out), *raws], cwd=ROOT, env=env, secs=1800)
-    count = profile_count(run("count the profile", [profdata, "show", str(out)], cwd=ROOT, env=env, secs=600))
+    run("merge the profiles", [profdata, "merge", "-o", str(out), *raws], secs=1800)
+    count = profile_count(run("count the profile", [profdata, "show", str(out)], secs=600))
     if count < min_count:
         raise Failed(f"the profile has {count} counts, under the {min_count} a trained blaze makes")
     return count
 
 
-def bolt(build: Build, llvm: Llvm, projects: list[tuple[str, Path, str, tuple[Turn, ...]]], bins: Path, work: Path) -> tuple[Path, Path]:
+def bolt(build: Build, llvm: Llvm, trees: list[Tree], bins: Path, work: Path) -> tuple[Path, Path]:
     """The binaries of `bins` with `bolt_bins` optimised by BOLT, and the merged BOLT profile."""
-    env = dict(os.environ)
     data = work / "bolt"
     shutil.rmtree(data, ignore_errors=True)
     data.mkdir()
@@ -678,51 +714,58 @@ def bolt(build: Build, llvm: Llvm, projects: list[tuple[str, Path, str, tuple[Tu
         shutil.rmtree(trained, ignore_errors=True)
         shutil.copytree(bins, trained)
         for name in names:
-            cmd = [str(llvm.tool("llvm-bolt")), str(bins / name), "-instrument", "-o", str(trained / name),
-                   f"--instrumentation-file={data / name}.fdata", "--instrumentation-file-append-pid"]
-            run(f"instrument {name} for BOLT", cmd, cwd=ROOT, env=env, secs=3600)
-        train(build, projects, trained, "bolt", work, {})
-        fdatas = sorted(str(p) for p in data.glob("*.fdata"))
-        if not fdatas:
+            out = [f"--instrumentation-file={data / name}.fdata", "--instrumentation-file-append-pid"]
+            cmd = [str(llvm.tool("llvm-bolt")), str(bins / name), "-instrument", "-o", str(trained / name)]
+            run(f"instrument {name} for BOLT", [*cmd, *out], secs=3600)
+        train(build, trees, trained, "bolt", work, {})
+        parts = sorted(str(p) for p in data.glob("*.fdata"))
+        if not parts:
             raise Failed(f"BOLT training wrote no profile into {data}")
-        out = run("merge the BOLT profiles", [str(llvm.tool("merge-fdata")), *fdatas], cwd=ROOT, env=env, secs=1800)
-        merged.write_text(out)
     else:
-        perf_data = work / "perf.data"
-        record = subprocess.Popen(["perf", "record", "-a", "-e", "cycles:u", "-j", "any,u", "-o", str(perf_data)], cwd=ROOT)
-        try:
-            train(build, projects, bins, "bolt", work, {})
-        finally:
-            record.send_signal(signal.SIGINT)
-            try:
-                code = record.wait(timeout=600)
-            except subprocess.TimeoutExpired:
-                raise Failed("perf record did not stop within 600s of SIGINT") from None
-        if code != 0:
-            raise Failed(f"perf record exited {code}: a VM without branch stacks trains BOLT with bolt: instrument")
-        parts: list[str] = []
-        for name in names:
-            part = data / f"{name}.fdata"
-            run(f"read perf for {name}", [str(llvm.tool("perf2bolt")), "-p", str(perf_data), "-o", str(part), str(bins / name)], cwd=ROOT, env=env, secs=3600)
-            parts.append(str(part))
-        merged.write_text(run("merge the BOLT profiles", [str(llvm.tool("merge-fdata")), *parts], cwd=ROOT, env=env, secs=1800))
+        parts = perf_profiles(build, llvm, trees, bins, work, names, data)
+    merged.write_text(run("merge the BOLT profiles", [str(llvm.tool("merge-fdata")), *parts], secs=1800))
     optimised = work / "bin-bolt"
     shutil.rmtree(optimised, ignore_errors=True)
     shutil.copytree(bins, optimised)
+    layout = ["-reorder-blocks=ext-tsp", "-reorder-functions=cdsort", "-split-functions", "-split-all-cold"]
+    layout += ["-split-eh", "-icf=1", "-use-gnu-stack", "-dyno-stats"]
     for name in names:
-        cmd = [str(llvm.tool("llvm-bolt")), str(bins / name), "-o", str(optimised / name), f"-data={merged}",
-               "-reorder-blocks=ext-tsp", "-reorder-functions=cdsort", "-split-functions", "-split-all-cold",
-               "-split-eh", "-icf=1", "-use-gnu-stack", "-dyno-stats"]
-        run(f"optimise {name} with BOLT", cmd, cwd=ROOT, env=env, secs=3600)
+        cmd = [str(llvm.tool("llvm-bolt")), str(bins / name), "-o", str(optimised / name), f"-data={merged}"]
+        run(f"optimise {name} with BOLT", [*cmd, *layout], secs=3600)
     return optimised, merged
+
+
+def perf_profiles(
+    build: Build, llvm: Llvm, trees: list[Tree], bins: Path, work: Path, names: list[str], data: Path
+) -> list[str]:
+    """BOLT profiles of `names` from `perf record` with branch stacks over a training run."""
+    perf_data = work / "perf.data"
+    record = subprocess.Popen(["perf", "record", "-a", "-e", "cycles:u", "-j", "any,u", "-o", str(perf_data)])
+    try:
+        train(build, trees, bins, "bolt", work, {})
+    finally:
+        record.send_signal(signal.SIGINT)
+        try:
+            code = record.wait(timeout=600)
+        except subprocess.TimeoutExpired:
+            raise Failed("perf record did not stop within 600s of SIGINT") from None
+    if code != 0:
+        raise Failed(f"perf record exited {code}: without branch stacks, train BOLT with bolt: instrument")
+    parts: list[str] = []
+    for name in names:
+        part = data / f"{name}.fdata"
+        cmd = [str(llvm.tool("perf2bolt")), "-p", str(perf_data), "-o", str(part), str(bins / name)]
+        run(f"read perf for {name}", cmd, secs=3600)
+        parts.append(str(part))
+    return parts
 
 
 def gate(build: Build, bins: Path) -> None:
     env = dict(os.environ)
-    env.update(BLAZE_BIN=str(bins / exe(build.target, "blaze-engine")), PATH=f"{bins}{os.pathsep}{env.get('PATH', '')}")
-    run("the optimised blaze runs", [str(bins / exe(build.target, "blaze")), "--version"], cwd=ROOT, env=env, secs=60)
+    env.update(BLAZE_BIN=str(bins / exe(build.target, "blaze-engine")), PATH=on_path(bins, env))
+    run("the optimised blaze runs", [str(bins / exe(build.target, "blaze")), "--version"], env=env, secs=60)
     for i, cmd in enumerate(build.gate):
-        run(f"gate {i}", list(cmd), cwd=ROOT, env=env, secs=build.build_secs)
+        run(f"gate {i}", list(cmd), env=env, secs=build.build_secs)
 
 
 def do_build(build: Build) -> None:
@@ -733,31 +776,31 @@ def do_build(build: Build) -> None:
     work.mkdir(parents=True, exist_ok=True)
     training = parse_training(str(ROOT / build.training))
     toolchain = TOOLCHAIN.read_text().strip()
-    commit = run("the commit", ["git", "rev-parse", "HEAD"], cwd=ROOT, env=dict(os.environ), secs=60).strip()
+    commit = run("the commit", ["git", "rev-parse", "HEAD"], secs=60).strip()
     llvm = fetch_llvm(build.target, work)
-    for tool in ("llvm-profdata", *(("llvm-bolt", "merge-fdata", "perf2bolt") if build.bolt != "none" else ())):
+    for tool in ("llvm-profdata", *(BOLT_TOOLS if build.bolt != "none" else ())):
         llvm.tool(tool)
-    projects = prepare(training, work)
+    trees = prepare(training, work)
 
     raw = work / "raw"
     shutil.rmtree(raw, ignore_errors=True)
     raw.mkdir()
     instrumented = build_blaze(build, llvm, "generate", stage_flags(build.target, "generate", raw), work)
-    train(build, projects, instrumented, "pgo", work, {"LLVM_PROFILE_FILE": str(raw / "%p-%m.profraw")})
+    train(build, trees, instrumented, "pgo", work, {"LLVM_PROFILE_FILE": str(raw / "%p-%m.profraw")})
     merged = work / "blaze.profdata"
     count = merge_profdata(llvm, raw, merged, build.min_count)
 
     optimised = build_blaze(build, llvm, "use", stage_flags(build.target, "use", merged), work)
+    bolt_pin: Bolt | None = None
     bolt_data: Path | None = None
     if build.bolt != "none":
-        optimised, bolt_data = bolt(build, llvm, projects, optimised, work)
+        optimised, bolt_data = bolt(build, llvm, trees, optimised, work)
     gate(build, optimised)
 
     out.mkdir(parents=True, exist_ok=True)
     stem = f"blaze-{toolchain}-{build.target}"
     shutil.copy2(merged, out / "profile")
     profile = named(out / "profile", stem, ".profdata")
-    bolt_pin: Bolt | None = None
     if bolt_data is not None and build.bolt != "none":
         shutil.copy2(bolt_data, out / "bolt")
         asset = named(out / "bolt", stem, ".fdata")
@@ -765,7 +808,8 @@ def do_build(build: Build) -> None:
     pack(sorted(optimised.iterdir()), f"blaze-pgo-{build.target}", out / "binaries")
     archive = named(out / "binaries", f"blaze-pgo-{toolchain}-{build.target}", ".tar.xz")
     pin = Pin(profile.name, profile.sha256, commit, count, None, "blaze", llvm.commit, bolt_pin, archive)
-    (out / f"{build.target}.json").write_text(json.dumps({"target": build.target, "toolchain": toolchain, "pin": pin_json(pin)}, indent=2) + "\n")
+    entry = {"target": build.target, "toolchain": toolchain, "pin": pin_json(pin)}
+    (out / f"{build.target}.json").write_text(json.dumps(entry, indent=2) + "\n")
     print(f"{build.target}: {profile.name}, {count} counts, binaries {archive.name}", flush=True)
 
 
@@ -784,19 +828,11 @@ def read_output(path: Path) -> tuple[str, str, Pin]:
     if pin.builder != "blaze":
         raise Failed(f"{path}: a build's pin is blaze's")
     for asset in files_of(pin):
-        got = sha256_of(path.parent / asset.name) if (path.parent / asset.name).is_file() else "nothing"
+        file = path.parent / asset.name
+        got = sha256_of(file) if file.is_file() else "nothing"
         if got != asset.sha256:
-            raise Failed(f"{path.parent / asset.name}: its sha256 is {got}, and {path.name} names {asset.sha256}")
+            raise Failed(f"{file}: its sha256 is {got}, and {path.name} names {asset.sha256}")
     return target, toolchain, pin
-
-
-def files_of(pin: Pin) -> list[Asset]:
-    assets = [Asset(pin.name, pin.sha256)]
-    if pin.bolt is not None:
-        assets.append(Asset(pin.bolt.name, pin.bolt.sha256))
-    if pin.binaries is not None:
-        assets.append(pin.binaries)
-    return assets
 
 
 def do_publish(publish: Publish) -> None:

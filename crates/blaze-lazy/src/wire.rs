@@ -2,16 +2,22 @@
 //! process and the daemon: fixed-layout little-endian, each one whole message.
 //!
 //! - `Ask { request, lazy }`, from the run process: the code of lazy function `lazy`. A
-//!   request id is the asker's, unique among its asks; asking again with the same id (after
-//!   a lost message) is the same ask.
+//!   request id is the asker's, unique among its asks, and echoed in the answer; asking
+//!   again with the same id (after a lost message) is the same ask.
 //! - `Ready { request, lazy, target }`, from the daemon: the function's code is published in
 //!   its slot at `target`, and was before this was sent.
 //! - `Failed { request, lazy, why }`: it can't be compiled, and why; the run stops.
+//!
+//! Each travels as the body of a blaze-inproc frame of the kind [`channel_kind`] gives, in
+//! the range blaze-inproc keeps for this crate (`frame::kinds::LAZY`); the channel's own
+//! sequence number pairs an answer with its ask on the wire.
 //!
 //! Decoding checks every length and refuses unknown kinds, bytes left over and a reason that
 //! isn't UTF-8 or is longer than [`MOST_WHY`]: bytes from the other process never panic it.
 
 use std::fmt;
+
+use blaze_inproc::frame::{Kind, kinds};
 
 /// The longest reason a `Failed` frame carries.
 pub const MOST_WHY: usize = 64 << 10;
@@ -24,6 +30,20 @@ const FAILED: u32 = 0x4c5a_0003;
 pub const ASK_LEN: usize = 16;
 pub const READY_LEN: usize = 24;
 pub const FAILED_LEN: usize = 24;
+
+/// The blaze-inproc kinds the frames travel as.
+pub const ASK_KIND: Kind = Kind(kinds::LAZY.start);
+pub const READY_KIND: Kind = Kind(kinds::LAZY.start + 1);
+pub const FAILED_KIND: Kind = Kind(kinds::LAZY.start + 2);
+
+/// The blaze-inproc kind `frame` travels as.
+pub fn channel_kind(frame: &Frame<'_>) -> Kind {
+    match frame {
+        Frame::Ask { .. } => ASK_KIND,
+        Frame::Ready { .. } => READY_KIND,
+        Frame::Failed { .. } => FAILED_KIND,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Frame<'a> {
@@ -127,6 +147,15 @@ impl Frame<'_> {
             }
         }
     }
+}
+
+/// An `Ask` frame, on the stack: the hook allocates nothing for it.
+pub fn ask(request: u64, lazy: u32) -> [u8; ASK_LEN] {
+    let mut out = [0; ASK_LEN];
+    out[0..4].copy_from_slice(&ASK.to_le_bytes());
+    out[4..8].copy_from_slice(&lazy.to_le_bytes());
+    out[8..16].copy_from_slice(&request.to_le_bytes());
+    out
 }
 
 /// A `Ready` frame, on the stack: an ask of a published function allocates nothing.

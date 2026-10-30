@@ -604,6 +604,8 @@ fn components(start: &[u32], edges: &[u32]) -> (Vec<u32>, Vec<u32>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use blaze_ids::ContentId;
 
     use super::*;
@@ -642,11 +644,11 @@ mod tests {
         }
     }
 
-    fn build(summaries: Vec<Summary>) -> BTreeMap<InstanceKey, Summary> {
+    fn build(summaries: Vec<Summary>) -> FxHashMap<InstanceKey, Summary> {
         summaries.into_iter().map(|it| (it.key, it)).collect()
     }
 
-    fn decided(summaries: Vec<Summary>) -> BTreeMap<InstanceKey, Imports> {
+    fn decided(summaries: Vec<Summary>) -> FxHashMap<InstanceKey, Imports> {
         decide(&build(summaries), &Limits::default()).unwrap()
     }
 
@@ -773,7 +775,7 @@ mod tests {
         caller.calls = vec![Call { callee: key(2), count: 1, args: vec![int(4)] }];
         let mut summaries = build(vec![caller, callee]);
         assert_eq!(decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants, vec![(0, int(4))]);
-        close(&mut summaries, &BTreeSet::from([key(2)]));
+        close(&mut summaries, &FxHashSet::from_iter([key(2)]));
         assert!(summaries[&key(2)].external && !summaries[&key(1)].external);
         assert_eq!(decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants, vec![]);
     }
@@ -895,16 +897,40 @@ mod tests {
         }
         let forward = decided(summaries.clone());
         summaries.reverse();
-        let mut map = BTreeMap::new();
+        let mut map = FxHashMap::default();
         for it in summaries.iter().cloned() {
             map.insert(it.key, it);
         }
         let backward = decide(&map, &Limits::default()).unwrap();
+        // Another capacity, so another iteration order of the same keys.
+        let mut wide = FxHashMap::with_capacity_and_hasher(4_096, Default::default());
+        wide.extend(summaries.iter().map(|it| (it.key, it.clone())));
+        let widened = decide(&wide, &Limits::default()).unwrap();
         assert_eq!(forward, backward);
+        assert_eq!(forward, widened);
         assert_eq!(forward.len(), 39);
         for (key, imports) in &forward {
             assert_eq!(imports.blob_key(*key), backward[key].blob_key(*key));
         }
+    }
+
+    #[test]
+    fn the_first_inconsistency_in_key_order_is_the_error_whatever_the_map() {
+        let mut summaries = Vec::new();
+        for n in (1..30u8).rev() {
+            let mut it = function(n, 1, &[]);
+            it.params = 1;
+            if n % 7 == 0 {
+                it.unused = vec![3];
+            }
+            summaries.push(it);
+        }
+        let mut map = FxHashMap::with_capacity_and_hasher(1_024, Default::default());
+        map.extend(summaries.into_iter().map(|it| (it.key, it)));
+        assert_eq!(
+            decide(&map, &Limits::default()),
+            Err(ImportError::Unused { function: key(7), param: 3, params: 1 })
+        );
     }
 
     #[test]
@@ -934,7 +960,7 @@ mod tests {
 
     #[test]
     fn nothing_to_decide() {
-        assert_eq!(decide(&BTreeMap::new(), &Limits::default()), Ok(BTreeMap::new()));
+        assert_eq!(decide(&FxHashMap::default(), &Limits::default()), Ok(FxHashMap::default()));
     }
 
     /// A seeded xorshift: the same cases on every run.
@@ -1036,7 +1062,9 @@ mod tests {
         let mut decided = 0;
         for case in 0..2_000 {
             let (summaries, limits) = random(&mut seeded);
-            let new = decide(&summaries, &limits);
+            let hashed: FxHashMap<InstanceKey, Summary> =
+                summaries.iter().map(|(key, it)| (*key, it.clone())).collect();
+            let new = decide(&hashed, &limits).map(|it| it.into_iter().collect::<BTreeMap<_, _>>());
             let old = model::decide(&summaries, &limits);
             assert_eq!(new, old, "case {case}");
             decided += usize::from(new.is_ok());

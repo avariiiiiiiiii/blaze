@@ -18,8 +18,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
-
 use blaze_api::{ApiError, Arrived, Reply, Request, RequestRef, Response, ViewRef};
 use blaze_core::{Completion, Conn, Done, Effect, FileName, Tag};
 use blaze_ids::ContentId;
@@ -55,8 +53,9 @@ struct Checkout {
     cookie_dir: String,
     /// `<dir>/target/.blaze-cookie-<pid>-`: a cookie's path is this and its number.
     cookie_prefix: String,
-    /// Cookies written or being written and not seen yet, by number.
-    cookies: BTreeMap<u64, Cookie>,
+    /// Cookies written or being written and not seen yet, by number. Walked in number order
+    /// only where the walk makes effects ([`Heads::sweep`]).
+    cookies: FxHashMap<u64, Cookie>,
 }
 
 struct Cookie {
@@ -273,7 +272,7 @@ impl Heads {
             below: format!("{dir}/"),
             cookie_dir,
             cookie_prefix,
-            cookies: BTreeMap::new(),
+            cookies: FxHashMap::default(),
         };
         self.checkouts.push(Some(Box::new(checkout)));
         self.slots.insert(head.to_owned(), slot);
@@ -416,6 +415,7 @@ impl Heads {
                     .filter(|(number, cookie)| cookie.seen && !held.iter().any(|it| it.waits.contains(&(slot, **number))))
                     .map(|(number, _)| *number),
             );
+            swept.sort_unstable();
             for number in swept.drain(..) {
                 let cookie = checkout.cookies.remove(&number).expect("a cookie just found");
                 let tag = Tag(tags + (number % (1 << 31)) * 2 + 1);
@@ -513,5 +513,28 @@ mod tests {
         assert!(named(&Request::Status).is_empty());
         let diff = Request::Diff { from: head("/w"), to: head("/w") };
         assert_eq!(named(&diff), vec!["/w"]);
+    }
+
+    #[test]
+    fn cookies_seen_are_removed_in_number_order() {
+        let mut heads = Heads::new(0, 1 << 32, 1 << 40);
+        let mut effects = Vec::new();
+        let numbers: Vec<u64> = (0..40).map(|_| heads.cookie("/w", &mut effects).unwrap().1).collect();
+        let checkout = heads.checkouts[0].as_deref_mut().unwrap();
+        for (number, cookie) in &mut checkout.cookies {
+            cookie.seen = number % 3 != 1;
+        }
+        effects.clear();
+        heads.sweep(&mut effects);
+        let removed: Vec<u64> = effects
+            .iter()
+            .filter_map(|it| match it {
+                Effect::Remove { tag, .. } => Some((tag.0 - 1) / 2),
+                _ => None,
+            })
+            .collect();
+        let want: Vec<u64> = numbers.into_iter().filter(|it| it % 3 != 1).collect();
+        assert_eq!(removed, want);
+        assert_eq!(heads.checkouts[0].as_deref().unwrap().cookies.len(), 13);
     }
 }

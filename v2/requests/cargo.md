@@ -1264,3 +1264,5 @@ Asked (each call is written and waits on the lane named):
   `relocation`.
 
 > forwarded to cargo (cargo-daemon, cargo-daemon-lower), codegen (`Roots::tests` `function`, `Built::inputs`), safety (`hir-ty-ub` `check.rs`), link (`Image::tables`). Usercode's `index::find(&Reader, &Guard, ..)` is applied (section 16).
+
+> applied (cargo-daemon): `serve/plane.rs` adds every batch as one `PlaneInput::AddNodes`. `Plane::fresh(count, name_bytes, deps)` reserves the ids and sizes the columns; `Plane::push(&mut Fresh, NodeRef, Task)` raises a thread task's memory to its kind's estimate. `serve/job.rs` sizes each batch exactly (names and deps summed first) and builds names and deps in one scratch `String` and `Vec` a batch, so planning a build of n units makes O(1) allocations, not 2n. `Spec` and `plane::Node` are gone from `serve`.

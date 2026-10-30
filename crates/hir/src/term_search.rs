@@ -174,8 +174,13 @@ impl<'db> LookupTable<'db> {
     /// Note that the types have to be the same, unification is not enough as unification is not
     /// transitive. For example `Vec<i32>` and `FxHashSet<i32>` both unify with `Iterator<Item = i32>`,
     /// but they clearly do not unify themselves.
-    fn insert(&mut self, ty: Type<'db>, exprs: impl Iterator<Item = Expr<'db>>) {
-        let ty = ty.instantiate_with_errors();
+    fn insert(
+        &mut self,
+        db: &'db dyn HirDatabase,
+        ty: Type<'db>,
+        exprs: impl Iterator<Item = Expr<'db>>,
+    ) {
+        let ty = ty.instantiate_with_errors(db);
         match self.data.get_mut(&ty) {
             Some(it) => {
                 it.extend_with_threshold(self.many_threshold, exprs);

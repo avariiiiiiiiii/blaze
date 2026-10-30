@@ -21,7 +21,7 @@
 
 use std::{cell::RefCell, io::Cursor, mem::offset_of};
 
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, radix};
 use zstd::zstd_safe::{self, CCtx, CDict, DCtx, DDict};
 
 use crate::{FormatError, Slice, Writer, record};
@@ -638,35 +638,6 @@ impl Bytes<'_> {
     }
 }
 
-/// Integers sorted by LSD radix sort on bytes (passes whose byte is the same for every value
-/// skipped), a comparison sort below 256 values.
-fn radix_sort(values: &mut Vec<u32>) {
-    if values.len() < 256 {
-        values.sort_unstable();
-        return;
-    }
-    let mut scratch = vec![0u32; values.len()];
-    for shift in [0, 8, 16, 24] {
-        let mut counts = [0usize; 256];
-        for &value in values.iter() {
-            counts[(value >> shift) as usize & 0xff] += 1;
-        }
-        if counts.contains(&values.len()) {
-            continue;
-        }
-        let mut at = 0;
-        for count in &mut counts {
-            (*count, at) = (at, at + *count);
-        }
-        for &value in values.iter() {
-            let digit = (value >> shift) as usize & 0xff;
-            scratch[counts[digit]] = value;
-            counts[digit] += 1;
-        }
-        std::mem::swap(values, &mut scratch);
-    }
-}
-
 /// What every codec's size depends on, from one pass over a column (and one radix sort, for
 /// the dictionary).
 struct Shape {
@@ -722,7 +693,7 @@ impl Shape {
             false => (0, 0),
         };
         let mut distinct = values.to_vec();
-        radix_sort(&mut distinct);
+        radix::sort(&mut distinct);
         distinct.dedup();
         let (least_gap, most_gap) = steps(&distinct);
         Shape {
@@ -816,7 +787,7 @@ fn encode_with(values: &[u32], codec: Codec, distinct: &[u32]) -> Option<Vec<u8>
 #[cfg(test)]
 fn encode_raw(values: &[u32], codec: Codec) -> Option<Vec<u8>> {
     let mut distinct = values.to_vec();
-    radix_sort(&mut distinct);
+    radix::sort(&mut distinct);
     distinct.dedup();
     encode_with(values, codec, &distinct)
 }
@@ -992,6 +963,9 @@ fn decompress(bytes: &[u8], dictionary: Option<&ColdDictionary>) -> Result<Vec<u
 }
 
 const _: () = assert!(size_of::<HotColumn>() == 24 && size_of::<WarmColumn>() == 20);
+
+mod buffer;
+pub use buffer::{BufferColumns, columns_of};
 
 #[cfg(test)]
 mod tests;

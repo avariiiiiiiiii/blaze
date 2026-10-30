@@ -5,7 +5,47 @@
 
 use std::{panic::Location, sync::atomic::AtomicU64 as Id};
 
-use crate::rt::{self, At, Object, memory};
+use crate::rt::{
+    self, At, Object,
+    memory::{self, Bytes},
+};
+
+#[track_caller]
+fn bytes(ptr: *const u8, len: usize, kind: Bytes) {
+    let at = Location::caller();
+    let checked = rt::with(|rt| {
+        rt.note(at, "tracked bytes");
+        rt.bytes_access(ptr.addr(), len, at, kind)
+    });
+    if let Some(Err(found)) = checked {
+        rt::stop(found);
+    }
+}
+
+/// A tracked non-atomic read of the `len` raw bytes at `ptr` (a buffer no `UnsafeCell` holds):
+/// in a model, the last write of each byte must happen before it, and none of them may be
+/// freed. Outside a model, nothing. A crate's `std` twin is an `#[inline(always)]` no-op.
+#[track_caller]
+pub fn read(ptr: *const u8, len: usize) {
+    bytes(ptr, len, Bytes::Read);
+}
+
+/// A tracked non-atomic write of the `len` raw bytes at `ptr`: in a model, every earlier read
+/// and write of each byte must happen before it. A write over freed bytes starts a new
+/// allocation there.
+#[track_caller]
+pub fn write(ptr: *const u8, len: usize) {
+    bytes(ptr, len, Bytes::Write);
+}
+
+/// The `len` raw bytes at `ptr` are freed: checked as a write (every read of them must happen
+/// before the free: a reader still holding them is a use after reclaim), then a later read is a
+/// use after free and a later free a double free. Every tracked buffer's free must say so here,
+/// or a new allocation at its address inherits its shadow.
+#[track_caller]
+pub fn free(ptr: *const u8, len: usize) {
+    bytes(ptr, len, Bytes::Free);
+}
 
 /// `std::cell::UnsafeCell`, reached through [`UnsafeCell::with`] and [`UnsafeCell::with_mut`]
 /// so the model sees each access. A crate's `std` twin of it (its `sync.rs`) has the same two

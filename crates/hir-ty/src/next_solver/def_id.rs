@@ -16,7 +16,7 @@ use stdx::impl_from;
 use crate::{
     InferBodyId,
     db::{
-        AnonConstId, GeneralConstId, InternedClosureId, InternedCoroutineClosureId,
+        AnonConstId, GeneralConstId, HirDatabase, InternedClosureId, InternedCoroutineClosureId,
         InternedCoroutineId, InternedOpaqueTyId,
     },
 };
@@ -50,10 +50,16 @@ pub enum SolverDefId<'db> {
 
 impl std::fmt::Debug for SolverDefId<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // SAFETY: the interner and its database are used only in this call, inside the
-        // attachment that is on the stack now.
-        let interner = unsafe { DbInterner::conjure() };
-        let db = interner.db;
+        crate::with_attached_db(|db| self.fmt_with_names(db, f))
+    }
+}
+
+impl SolverDefId<'_> {
+    fn fmt_with_names(
+        &self,
+        db: &dyn HirDatabase,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
         match *self {
             SolverDefId::AdtId(AdtId::StructId(id)) => {
                 f.debug_tuple("AdtId").field(&StructSignature::of(db, id).name.as_str()).finish()
@@ -460,6 +466,7 @@ declare_id_wrapper_with_lt!(CoroutineIdWrapper, InternedCoroutineId);
 declare_id_wrapper_with_lt!(CoroutineClosureIdWrapper, InternedCoroutineClosureId);
 declare_id_wrapper!(AdtIdWrapper, AdtId);
 declare_id_wrapper_with_lt!(OpaqueTyIdWrapper, InternedOpaqueTyId, OpaqueTyIdWrapper<'db>);
+declare_id_wrapper_with_lt!(AnonConstIdWrapper, AnonConstId);
 
 macro_rules! declare_ty_const_pair {
     ( $ty_id_name:ident, $const_id_name:ident, $term_id_name:ident ) => {
@@ -513,12 +520,6 @@ macro_rules! declare_ty_const_pair {
                 }
             }
         }
-
-        impl<'db> From<$const_id_name> for GeneralConstIdWrapper<'db> {
-            fn from(value: $const_id_name) -> Self {
-                GeneralConstIdWrapper(GeneralConstId::ConstId(value.0))
-            }
-        }
     };
 }
 
@@ -540,57 +541,6 @@ impl<'db> From<TermId> for SolverDefId<'db> {
             TermId::TypeAliasId(id) => id.into(),
             TermId::ConstId(id) => id.into(),
         }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GeneralConstIdWrapper<'db>(pub GeneralConstId<'db>);
-
-impl std::fmt::Debug for GeneralConstIdWrapper<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.0, f)
-    }
-}
-impl<'db> From<GeneralConstIdWrapper<'db>> for GeneralConstId<'db> {
-    #[inline]
-    fn from(value: GeneralConstIdWrapper<'db>) -> GeneralConstId<'db> {
-        value.0
-    }
-}
-impl<'db> From<GeneralConstId<'db>> for GeneralConstIdWrapper<'db> {
-    #[inline]
-    fn from(value: GeneralConstId<'db>) -> GeneralConstIdWrapper<'db> {
-        Self(value)
-    }
-}
-impl<'db> From<GeneralConstIdWrapper<'db>> for SolverDefId<'db> {
-    #[inline]
-    fn from(value: GeneralConstIdWrapper<'db>) -> SolverDefId<'db> {
-        match value.0 {
-            GeneralConstId::ConstId(id) => SolverDefId::ConstId(id),
-            GeneralConstId::StaticId(id) => SolverDefId::StaticId(id),
-            GeneralConstId::AnonConstId(id) => SolverDefId::AnonConstId(id),
-        }
-    }
-}
-impl<'db> TryFrom<SolverDefId<'db>> for GeneralConstIdWrapper<'db> {
-    type Error = ();
-    #[inline]
-    fn try_from(value: SolverDefId<'db>) -> Result<Self, Self::Error> {
-        match value {
-            SolverDefId::ConstId(it) => Ok(Self(it.into())),
-            SolverDefId::StaticId(it) => Ok(Self(it.into())),
-            SolverDefId::AnonConstId(it) => Ok(Self(it.into())),
-            _ => Err(()),
-        }
-    }
-}
-impl<'db> inherent::DefId<DbInterner<'db>> for GeneralConstIdWrapper<'db> {
-    fn as_local(self) -> Option<SolverDefId<'db>> {
-        Some(self.into())
-    }
-    fn is_local(self) -> bool {
-        true
     }
 }
 

@@ -5,29 +5,31 @@ use std::mem::offset_of;
 use base_db::Crate;
 use blaze_format::{FormatError, Record, Slice, Writer};
 use hir_def::{
-    ConstId, EnumVariantId, ExpressionStoreOwnerId, HasModule, StaticId,
+    ConstId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId, StaticId,
     attrs::AttrFlags,
     expr_store::{Body, ExpressionStore, HygieneId, path::Path},
     hir::{Expr, ExprId, Literal},
     resolver::{Resolver, ValueNs},
+    signatures::ImplSignature,
 };
 use hir_expand::Lookup;
 use rustc_abi::Size;
 use rustc_apfloat::Float;
 use rustc_ast_ir::Mutability;
-use rustc_type_ir::inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _};
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 use salsa::SalsaValue;
 
 use crate::{
     ComplexMemoryMap, MemoryMap, ParamEnvAndCrate, Span, StaticMemory,
-    db::{AnonConstId, AnonConstLoc, GeneralConstId, HirDatabase},
+    db::{AnonConstId, AnonConstLoc, HirDatabase},
     generics::Generics,
     lower::LoweringMode,
     mir::{IsSigned, MirEvalError, MirLowerError, pad16},
     next_solver::{
-        Allocation, AllocationData, Const, ConstKind, Consts, DbInterner, DefaultAny, GenericArgs,
-        ParamConst, ScalarInt, StoredAllocation, StoredEarlyBinder, StoredGenericArgs, Ty, TyKind,
-        UnevaluatedConst, ValTreeKind, default_types,
+        AliasConst, AliasConstKind, Allocation, AllocationData, AnonConstIdWrapper, Const, ConstExt,
+        ConstKind, Consts, DbInterner, DefaultAny, FreeConstAliasId, GenericArgs,
+        InherentAssocConstId, IsRigid, ParamConst, ScalarInt, StoredAllocation, StoredEarlyBinder,
+        StoredGenericArgs, TraitAssocConstId, Ty, TyKind, ValTreeKind, default_types,
         persist::{TyTableReader, TyTableWriter},
     },
     traits::StoredParamEnvAndCrate,
@@ -208,20 +210,45 @@ pub fn allocation_as_usize(ec: Allocation<'_>) -> u128 {
     u128::from_le_bytes(pad16(&ec.memory, IsSigned::No))
 }
 
+/// The alias kind of a MIR constant naming `konst` with its own (impl-form) args. A const in a
+/// trait impl has none: MIR names the trait's const (a projection) and `lookup_impl_const`
+/// resolves it at eval time, so meeting one here is a bug.
+pub fn mir_const_alias_kind<'db>(
+    db: &'db dyn HirDatabase,
+    konst: ConstId,
+) -> AliasConstKind<'db> {
+    match konst.lookup(db).container {
+        ItemContainerId::TraitId(_) => {
+            AliasConstKind::Projection { def_id: TraitAssocConstId(konst) }
+        }
+        ItemContainerId::ImplId(impl_) if ImplSignature::of(db, impl_).target_trait.is_none() => {
+            AliasConstKind::InherentImpl { def_id: InherentAssocConstId(konst) }
+        }
+        ItemContainerId::ImplId(_) => panic!("{konst:?} is a trait impl's const: name the trait's"),
+        ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => {
+            AliasConstKind::Free { def_id: FreeConstAliasId(konst) }
+        }
+    }
+}
+
 /// The value of `unevaluated`, read from the cached result by reference: an array length asks
 /// this on every check, and one that fails to evaluate clones no error.
 fn evaluated<'db>(
     db: &'db dyn HirDatabase,
-    unevaluated: UnevaluatedConst<'db>,
+    unevaluated: AliasConst<'db>,
 ) -> Option<Allocation<'db>> {
-    let result = match unevaluated.def.0 {
-        GeneralConstId::ConstId(id) => {
+    let result = match unevaluated.kind {
+        AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
+        | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
+        | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => {
             let _request = trace_const(db, id, false);
             const_eval_query(db, id, unevaluated.args.store(), None)
         }
-        GeneralConstId::StaticId(id) => const_eval_static_query(db, id),
-        GeneralConstId::AnonConstId(id) => {
-            anon_const_eval_query(db, id, unevaluated.args.store(), None)
+        AliasConstKind::Anon { def_id } => {
+            anon_const_eval_query(db, def_id.0, unevaluated.args.store(), None)
+        }
+        AliasConstKind::InherentSelf { .. } => {
+            panic!("the inherent const {unevaluated:?} is in Self form after type check")
         }
     };
     result.as_ref().ok().map(|it| it.as_ref())
@@ -233,7 +260,7 @@ pub fn try_const_usize<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Option<u
         ConstKind::Infer(_) => None,
         ConstKind::Bound(_, _) => None,
         ConstKind::Placeholder(_) => None,
-        ConstKind::Unevaluated(unevaluated) => evaluated(db, unevaluated).map(allocation_as_usize),
+        ConstKind::Alias(_, unevaluated) => evaluated(db, unevaluated).map(allocation_as_usize),
         ConstKind::Value(val) => {
             if val.ty == default_types().types.usize {
                 Some(val.value.inner().to_leaf().to_uint_unchecked())
@@ -256,7 +283,7 @@ pub fn try_const_isize<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Option<i
         ConstKind::Infer(_) => None,
         ConstKind::Bound(_, _) => None,
         ConstKind::Placeholder(_) => None,
-        ConstKind::Unevaluated(unevaluated) => evaluated(db, unevaluated).map(allocation_as_isize),
+        ConstKind::Alias(_, unevaluated) => evaluated(db, unevaluated).map(allocation_as_isize),
         ConstKind::Value(val) => {
             if val.ty == default_types().types.isize {
                 Some(val.value.inner().to_leaf().to_int_unchecked())
@@ -297,8 +324,7 @@ pub(crate) fn path_to_const<'a, 'db>(
         .ok_or(CreateConstError::DoesNotResolve)?;
     let no_generics = |def| crate::generics::generics(db, def).has_no_params();
     let konst = match resolution {
-        ValueNs::ConstId(id) if no_generics(id.into()) => GeneralConstId::ConstId(id),
-        ValueNs::StaticId(id) => GeneralConstId::StaticId(id),
+        ValueNs::ConstId(id) if no_generics(id.into()) => id,
         ValueNs::ConstId(_) => return Err(CreateConstError::ConstHasGenerics),
         ValueNs::GenericParam(param) => {
             let index = generics().type_or_const_param_idx(param.into());
@@ -307,9 +333,9 @@ pub(crate) fn path_to_const<'a, 'db>(
             }
             return Ok(Const::new_param(interner, ParamConst { id: param, index }));
         }
-        // These are not valid as consts.
+        // These are not valid as consts; a static is a place, not a const argument.
         // FIXME: Report an error?
-        ValueNs::ImplSelf(_) | ValueNs::LocalBinding(_) => {
+        ValueNs::ImplSelf(_) | ValueNs::LocalBinding(_) | ValueNs::StaticId(_) => {
             return Err(CreateConstError::ResolveToNonConst);
         }
         // A function or a constructor is a value, but only an anon const can hold it.
@@ -318,7 +344,8 @@ pub(crate) fn path_to_const<'a, 'db>(
         }
     };
     let args = GenericArgs::empty();
-    Ok(Const::new_unevaluated(interner, UnevaluatedConst { def: konst.into(), args }))
+    let alias = AliasConst::new(interner, mir_const_alias_kind(db, konst), args);
+    Ok(Const::new_alias(interner, IsRigid::No, alias))
 }
 
 /// `forbid_params_after` and `allow_anon_const_using_generic_params` fill a similar role, but are not the same.
@@ -344,14 +371,14 @@ pub(crate) fn create_anon_const<'a, 'db>(
     forbid_params_after: Option<u32>,
     allow_anon_const_using_generic_params: bool,
 ) -> Result<Const<'db>, CreateConstError<'db>> {
-    let mut expr = &store[expr_id];
+    let mut expr = store.expr(expr_id);
     if let Expr::Block { statements, tail: Some(tail), .. } = expr
         && statements.is_empty()
     {
         // rustc unwraps *one* layer of blocks, so we do too (this impacts whether the const can use generic parameters.
         // Anon consts sometimes cannot while bare paths can). mGCA allows arbitrarily many blocks, but we don't implement
         // it yet.
-        expr = &store[*tail];
+        expr = store.expr(tail);
     }
     match expr {
         Expr::Literal(literal)
@@ -385,7 +412,7 @@ pub(crate) fn create_anon_const<'a, 'db>(
                 AnonConstLoc {
                     owner,
                     expr: expr_id,
-                    ty: StoredEarlyBinder::bind(expected_ty.store()),
+                    ty: StoredEarlyBinder::bind(interner, expected_ty.store()),
                     allow_using_generic_params: allow_anon_const_using_generic_params,
                 },
                 token,
@@ -395,10 +422,8 @@ pub(crate) fn create_anon_const<'a, 'db>(
             } else {
                 GenericArgs::empty()
             };
-            Ok(Const::new_unevaluated(
-                interner,
-                UnevaluatedConst { def: GeneralConstId::AnonConstId(konst).into(), args },
-            ))
+            let kind = AliasConstKind::Anon { def_id: AnonConstIdWrapper(konst) };
+            Ok(Const::new_alias(interner, IsRigid::No, AliasConst::new(interner, kind, args)))
         }
     }
 }
@@ -411,7 +436,7 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
     let def = variant_id.into();
     let body = Body::of(db, def);
     let loc = variant_id.lookup(db);
-    if matches!(body[body.root_expr()], Expr::Missing) {
+    if matches!(body.expr(body.root_expr()), Expr::Missing) {
         let prev_idx = loc.index(db).checked_sub(1);
         let value = match prev_idx {
             Some(prev_idx) => {
@@ -811,8 +836,8 @@ fn write_memory_map<'db>(
             );
             columns.vtable = Placed::push_each(
                 out,
-                crate::vtable_types(&map.vtable).count(),
-                crate::vtable_types(&map.vtable).map(&mut *ty),
+                map.vtable.tys().len(),
+                map.vtable.tys().map(&mut *ty),
             );
             columns.type_ids = Placed::push_each(
                 out,

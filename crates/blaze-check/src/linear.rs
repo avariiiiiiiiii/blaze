@@ -1,12 +1,16 @@
 //! Linearizability against a sequential model: a [`History`] records each operation's call and
-//! return in the order a model execution ran them, and [`History::check`] looks for one order of
-//! the operations that keeps every call-before-return order of the run and gives each operation
-//! the result it had when applied to the [`Spec`] in that order (Wing and Gong's search, with
-//! Lowe's memo of (operations done, model state) pairs as porcupine and lincheck keep, so a state
-//! reached twice is searched once).
+//! return, and [`History::check`] looks for one order of the operations that puts each after
+//! every operation that returned before it was called and gives each operation the result it
+//! had when applied to the [`Spec`] in that order (Wing and Gong's search, with Lowe's memo of
+//! (operations done, model state) pairs as porcupine and lincheck keep, so a state reached twice
+//! is searched once).
 //!
-//! The history's own bookkeeping is `std`'s, invisible to the model: it adds no schedule point,
-//! and on the model's one OS thread its counter is the run's real-time order.
+//! In a model "returned before it was called" is happens-before, not execution order: under C11
+//! an acquire load run after another thread's store may still read an older value, so a lookup
+//! run after an insert returned, on a thread that never synchronized with it, may miss it (the
+//! happens-before linearizability of Batty, Dodds and Gotsman's "Library abstraction for C/C++
+//! concurrency"). Outside a model it is the order the calls ran in. The history's own
+//! bookkeeping is `std`'s, invisible to the model: it adds no schedule point.
 
 use std::{
     collections::HashSet,
@@ -21,7 +25,7 @@ use std::{
 
 use rustc_hash::FxBuildHasher;
 
-use crate::rt;
+use crate::{clock::Clock, rt};
 
 /// A sequential model of a structure: its state, and what each operation does to it.
 pub trait Spec: Clone + Eq + Hash {
@@ -38,8 +42,22 @@ struct Event<S: Spec> {
     thread: u8,
     op: S::Op,
     ret: S::Ret,
+    /// Its call and return in the order the run made them, for the listing and outside a model.
     call: u32,
     done: u32,
+    /// In a model: what the thread had seen of each thread at the call, and its own clock at
+    /// the return.
+    clocks: Option<(Clock, u32)>,
+}
+
+impl<S: Spec> Event<S> {
+    /// `self` returned before `later` was called.
+    fn precedes(&self, later: &Event<S>) -> bool {
+        match (self.clocks, later.clocks) {
+            (Some((_, returned)), Some((seen, _))) => seen.get(self.thread as usize) >= returned,
+            _ => self.done < later.call,
+        }
+    }
 }
 
 /// The operations of one execution, each with its thread, result, call and return.
@@ -64,11 +82,21 @@ impl<S: Spec> History<S> {
     where
         S::Ret: Clone,
     {
-        let thread = rt::current().map_or(0, |(thread, _)| thread as u8);
+        let seen = rt::with(|rt| (rt.current(), rt.threads[rt.current()].clock));
         let call = self.clock.fetch_add(1, Relaxed);
         let ret = run(&op);
         let done = self.clock.fetch_add(1, Relaxed);
-        let event = Event { thread, op, ret: ret.clone(), call, done };
+        // A tick, so what the thread releases from here on carries the return and nothing it
+        // released before does.
+        let returned = rt::with(|rt| {
+            let thread = rt.tick();
+            rt.threads[thread].clock.get(thread)
+        });
+        let (thread, clocks) = match (seen, returned) {
+            (Some((thread, seen)), Some(returned)) => (thread as u8, Some((seen, returned))),
+            _ => (0, None),
+        };
+        let event = Event { thread, op, ret: ret.clone(), call, done, clocks };
         self.events.lock().unwrap_or_else(PoisonError::into_inner).push(event);
         ret
     }
@@ -84,11 +112,18 @@ impl<S: Spec> History<S> {
             events.len()
         );
         events.sort_unstable_by_key(|it| it.call);
+        let before: Vec<u64> = events
+            .iter()
+            .map(|later| {
+                events.iter().enumerate().filter(|(_, it)| it.precedes(later)).fold(0u64, |set, (at, _)| set | 1 << at)
+            })
+            .collect();
         let mut memo = HashSet::with_hasher(FxBuildHasher);
-        if !linearizable(&events, 0, init, &mut memo) {
+        if !linearizable(&events, &before, 0, init, &mut memo) {
             panic!(
-                "blaze-check: not linearizable: no order of these operations, each placed between \
-                 its call and its return, gives these results on the sequential model (at {}):\n{}",
+                "blaze-check: not linearizable: no order of these operations, each placed after \
+                 every one whose return happens before its call, gives these results on the \
+                 sequential model (at {}):\n{}",
                 Location::caller(),
                 Listing(&events)
             );
@@ -102,9 +137,11 @@ impl<S: Spec> History<S> {
     }
 }
 
-/// Whether the operations not in `done` can follow in some order allowed by the run.
+/// Whether the operations not in `done` can follow in some order allowed by the run: `before`
+/// holds, per operation, the set of operations that must come before it.
 fn linearizable<S: Spec>(
     events: &[Event<S>],
+    before: &[u64],
     done: u64,
     state: S,
     memo: &mut HashSet<(u64, S), FxBuildHasher>,
@@ -113,17 +150,8 @@ fn linearizable<S: Spec>(
     if done == all {
         return true;
     }
-    // An operation may go next if it was called before every pending one returned.
-    let first_return = (0..events.len())
-        .filter(|&at| done & (1 << at) == 0)
-        .map(|at| events[at].done)
-        .min()
-        .unwrap_or(u32::MAX);
     for (at, event) in events.iter().enumerate() {
-        if event.call > first_return {
-            break;
-        }
-        if done & (1 << at) != 0 {
+        if done & (1 << at) != 0 || before[at] & !done != 0 {
             continue;
         }
         let mut next = state.clone();
@@ -131,7 +159,7 @@ fn linearizable<S: Spec>(
             continue;
         }
         let done = done | (1 << at);
-        if memo.insert((done, next.clone())) && linearizable(events, done, next, memo) {
+        if memo.insert((done, next.clone())) && linearizable(events, before, done, next, memo) {
             return true;
         }
     }

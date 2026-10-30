@@ -18,7 +18,7 @@ use crate::{
     db::HirDatabase,
     infer::InferenceContext,
     next_solver::{
-        Canonical, DbInterner, ParamEnv, TraitRef, Ty, TyKind, TypingMode,
+        Canonical, DbInterner, IsRigid, ParamEnv, TraitRef, Ty, TyKind, TypingMode,
         infer::{
             DbInternerInferExt, InferCtxt,
             traits::{Obligation, ObligationCause, PredicateObligations},
@@ -359,7 +359,7 @@ where
         let (normalized_ty, obligations) = structurally_normalize_ty(
             self.infcx(),
             self.param_env(),
-            Ty::new_projection(interner, trait_target.into(), [ty]),
+            Ty::new_projection(interner, IsRigid::No, trait_target.into(), [ty]),
             self.span,
         )?;
         debug!("overloaded_deref_ty({:?}) = ({:?}, {:?})", ty, normalized_ty, obligations);

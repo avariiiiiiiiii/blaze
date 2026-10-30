@@ -123,7 +123,7 @@ fn ignored<'db>(
 /// `const` block; a tuple struct's or variant's constructor is not one, nor is a
 /// `#[rustc_promotable]` function such as `size_of`.
 fn is_call(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
-    match ctx.store[expr] {
+    match ctx.store.expr(expr) {
         Expr::MethodCall { .. } => true,
         Expr::Call { callee, .. } => !matches!(
             ctx.infer.expr_ty(callee).kind(),
@@ -182,28 +182,28 @@ fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Loca
     };
     let mut stack: Vec<_> = root.into_iter().collect();
     while let Some(expr) = stack.pop() {
-        match &ctx.store[expr] {
-            Expr::Const(inner) => stack.push(*inner),
+        match ctx.store.expr(expr) {
+            Expr::Const(inner) => stack.push(inner),
             Expr::Ref { expr: inner, .. } => {
                 refs.insert(expr);
-                stack.push(*inner);
+                stack.push(inner);
             }
             Expr::Array(Array::ElementList { elements }) => stack.extend(elements.iter().copied()),
             Expr::Tuple { exprs } => stack.extend(exprs.iter().copied()),
             Expr::RecordLit { fields, .. } => stack.extend(fields.iter().map(|it| it.expr)),
             Expr::Call { callee, args }
-                if ctx.infer.variant_resolution_for_expr(*callee).is_some()
-                    || matches!(&ctx.store[*callee], Expr::Path(path) if path.is_self_type())
+                if ctx.infer.variant_resolution_for_expr(callee).is_some()
+                    || matches!(ctx.store.expr(callee), Expr::Path(path) if path.is_self_type())
                         && matches!(
-                            ctx.infer.expr_ty(*callee).kind(),
+                            ctx.infer.expr_ty(callee).kind(),
                             TyKind::FnDef(def, _)
                                 if !matches!(def.0, hir_def::CallableDefId::FunctionId(_))
                         ) =>
             {
                 stack.extend(args.iter().copied())
             }
-            Expr::Block { tail: Some(tail), .. } => stack.push(*tail),
-            Expr::Cast { expr, .. } => stack.push(*expr),
+            Expr::Block { tail: Some(tail), .. } => stack.push(tail),
+            Expr::Cast { expr, .. } => stack.push(expr),
             _ => (),
         }
     }
@@ -246,9 +246,9 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
         for statement in &block.statements {
             if let StatementKind::Assign(_, Rvalue::Ref(_, place)) = &statement.kind
                 && let MirSpan::ExprId(expr) = statement.span
-                && let Expr::Ref { expr: inner, mutability, .. } = ctx.store[expr]
+                && let Expr::Ref { expr: inner, mutability, .. } = ctx.store.expr(expr)
                 && (mutability.is_shared()
-                    || matches!(&ctx.store[inner], Expr::Array(Array::ElementList { elements }) if elements.is_empty()))
+                    || matches!(ctx.store.expr(inner), Expr::Array(Array::ElementList { elements }) if elements.is_empty()))
                 && place.projection.is_empty()
                 && const_promotable(ctx, body, inner, 0)
                 && (certain.contains(&id) || !calls(inner))
@@ -384,7 +384,7 @@ fn const_promotable(
     let all = |exprs: Vec<hir_def::hir::ExprId>| {
         exprs.into_iter().all(|it| const_promotable(ctx, body, it, depth + 1))
     };
-    match &ctx.store[expr] {
+    match ctx.store.expr(expr) {
         Expr::Literal(_) => true,
         Expr::Path(path) => {
             let owner = body.owner;
@@ -409,17 +409,17 @@ fn const_promotable(
         }
         Expr::Array(Array::ElementList { elements }) => all(elements.to_vec()),
         Expr::Array(Array::Repeat { initializer, .. }) => {
-            const_promotable(ctx, body, *initializer, depth + 1)
+            const_promotable(ctx, body, initializer, depth + 1)
         }
         Expr::Tuple { exprs } => all(exprs.to_vec()),
         Expr::RecordLit { fields, spread: hir_def::hir::RecordSpread::None, .. } => {
             all(fields.iter().map(|it| it.expr).collect())
         }
         Expr::Ref { expr, .. } | Expr::Cast { expr, .. } => {
-            const_promotable(ctx, body, *expr, depth + 1)
+            const_promotable(ctx, body, expr, depth + 1)
         }
         Expr::Call { callee, args } => {
-            let callable = match ctx.infer.expr_ty(*callee).kind() {
+            let callable = match ctx.infer.expr_ty(callee).kind() {
                 TyKind::FnDef(def, _) => match def.0 {
                     hir_def::CallableDefId::StructId(_)
                     | hir_def::CallableDefId::EnumVariantId(_) => true,
@@ -440,16 +440,16 @@ fn const_promotable(
             let callable = ctx.infer.method_resolution(expr).is_some_and(|(func, _)| {
                 hir_def::signatures::FunctionSignature::of(ctx.db, func).is_const()
             });
-            let dropped = std::iter::once(receiver)
+            let dropped = std::iter::once(&receiver)
                 .chain(args.iter())
                 .any(|&it| ctx.drop_glue(ctx.infer.expr_ty(it)) != hir_ty::drop::DropGlue::None);
-            callable && !dropped && all(std::iter::once(*receiver).chain(args.to_vec()).collect())
+            callable && !dropped && all(std::iter::once(receiver).chain(args.to_vec()).collect())
         }
         // A block of items and a tail is its tail in MIR, where rustc promotes.
         Expr::Block { statements, tail: Some(tail), .. }
             if statements.iter().all(|it| matches!(it, hir_def::hir::Statement::Item(_))) =>
         {
-            const_promotable(ctx, body, *tail, depth + 1)
+            const_promotable(ctx, body, tail, depth + 1)
         }
         _ => false,
     }

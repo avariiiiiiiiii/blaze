@@ -1500,6 +1500,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     let above = self.immediate(self.context.i64_type(), -i64::from(ARRIVAL), true);
                     self.set(inst, Operand::Pointer(self.offset(arrival, above)?));
                 }
+                // `core::intrinsics::return_address`, as rustc lowers it.
+                Opcode::GetReturnAddress => {
+                    let own = self.context.i32_type().const_zero();
+                    let address = self.intrinsic("llvm.returnaddress", &[], &[own.into()])?;
+                    self.set(inst, Operand::Pointer(address.into_pointer_value()));
+                }
                 _ => return Err(Unhandled::Opcode(opcode)),
             },
             _ => return Err(Unhandled::Opcode(opcode)),

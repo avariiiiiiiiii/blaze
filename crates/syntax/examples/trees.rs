@@ -25,12 +25,14 @@ static HELD: AtomicIsize = AtomicIsize::new(0);
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         HELD.fetch_add(layout.size() as isize, Ordering::Relaxed);
-        // SAFETY: as the system allocator's own.
+        // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (a non-zero-sized
+        // `layout`), which is `System`'s too.
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         HELD.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-        // SAFETY: as the system allocator's own.
+        // SAFETY: `ptr` came from `alloc` above with `layout`, which is `System.alloc`'s, so it
+        // is `System`'s to free with that layout.
         unsafe { System.dealloc(ptr, layout) }
     }
 }

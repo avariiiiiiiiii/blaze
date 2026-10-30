@@ -38,7 +38,7 @@ use super::{Accepted, Finalize, GroupId, limit, no_args};
 use crate::{
     checks::attrs::{
         accept::Accept,
-        args::{ArgParser, MetaItemOrLit, NameValue},
+        args::{self, ArgParser, MetaItemOrLit, NameValue},
         parsed::{Parsed, ParsedAttr, ProcMacroKind},
     },
     cx::Cx,
@@ -46,7 +46,7 @@ use crate::{
         Args, Attr, AttrKind, Target,
         table::{self, Template},
     },
-    model::{Applicability, Diag, SuggestionStyle},
+    model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
 pub(crate) const PATHS: &[&[&str]] = &[
@@ -803,7 +803,7 @@ fn bad_delim(cx: &Cx<'_, '_>, attr: &Attr, tt: &ast::TokenTree, errors: &mut Vec
 }
 
 /// `SuffixedLiteralInAttribute`.
-fn suffixed(span: crate::model::Span) -> Diag {
+fn suffixed(span: Span) -> Diag {
     let mut diag = Diag::error(None, "suffixed literals are not allowed in attributes", span);
     diag.help("instead of using a suffixed literal (`1u8`, `1.0f32`, etc.), use an unsuffixed version (`1`, `1.0`, etc.)");
     diag
@@ -905,7 +905,7 @@ struct MetaParser<'p, 'c, 'db> {
 }
 
 impl<'p> MetaParser<'p, '_, '_> {
-    fn span(&self, range: TextRange) -> crate::model::Span {
+    fn span(&self, range: TextRange) -> Span {
         self.cx.span(self.attr.in_file(range))
     }
 
@@ -1263,7 +1263,7 @@ fn check_lit(cx: &Cx<'_, '_>, attr: &Attr, token: &SyntaxToken, errors: &mut Vec
             }
         }
         SyntaxKind::STRING | SyntaxKind::BYTE_STRING | SyntaxKind::C_STRING | SyntaxKind::CHAR | SyntaxKind::BYTE => {
-            let Some(suffix) = suffix_of(text) else {
+            let Some(suffix) = args::suffix(text) else {
                 return if kind == SyntaxKind::STRING { Lit::Str } else { Lit::Other };
             };
             let what = match kind {
@@ -1282,19 +1282,8 @@ fn check_lit(cx: &Cx<'_, '_>, attr: &Attr, token: &SyntaxToken, errors: &mut Vec
     }
 }
 
-/// The suffix written after a string's or char's closing quote (and a raw string's `#`s).
-fn suffix_of(text: &str) -> Option<&str> {
-    let close = text.rfind(['"', '\''])?;
-    let mut rest = &text[close + 1..];
-    if let Some(raw) = text.trim_start_matches(['b', 'c']).strip_prefix('r') {
-        let hashes = raw.len() - raw.trim_start_matches('#').len();
-        rest = &rest[hashes.min(rest.len())..];
-    }
-    (!rest.is_empty()).then_some(rest)
-}
-
 /// `IntLiteralTooLarge`.
-fn int_too_large(span: crate::model::Span, radix: u32) -> Diag {
+fn int_too_large(span: Span, radix: u32) -> Diag {
     let max = u128::MAX;
     let limit = match radix {
         2 => format!("{max:#b}"),
@@ -1308,7 +1297,7 @@ fn int_too_large(span: crate::model::Span, radix: u32) -> Diag {
 }
 
 /// `InvalidIntLiteralWidth`, `InvalidNumLiteralBasePrefix` or `InvalidNumLiteralSuffix`.
-fn invalid_int_suffix(span: crate::model::Span, symbol: &str, suffix: &str) -> Diag {
+fn invalid_int_suffix(span: Span, symbol: &str, suffix: &str) -> Diag {
     let looks_like_width =
         suffix.len() > 1 && suffix.starts_with(['i', 'u']) && suffix[1..].chars().all(|it| it.is_ascii_digit());
     if looks_like_width {
@@ -1329,7 +1318,7 @@ fn invalid_int_suffix(span: crate::model::Span, symbol: &str, suffix: &str) -> D
 }
 
 /// `InvalidFloatLiteralWidth` or `InvalidFloatLiteralSuffix`.
-fn invalid_float_suffix(span: crate::model::Span, suffix: &str) -> Diag {
+fn invalid_float_suffix(span: Span, suffix: &str) -> Diag {
     if suffix.len() > 1 && suffix.starts_with('f') && suffix[1..].chars().all(|it| it.is_ascii_digit()) {
         let mut diag = Diag::error(None, format!("invalid width `{}` for float literal", &suffix[1..]), span);
         diag.help("valid widths are 32 and 64");
@@ -1381,15 +1370,6 @@ mod tests {
         assert!(!is_glued("==", "="));
         assert!(!is_glued("-", "-"));
         assert!(!is_glued(",", ","));
-    }
-
-    #[test]
-    fn a_suffix_after_a_raw_strings_hashes_is_its_suffix() {
-        assert_eq!(suffix_of(r#""a"suf"#), Some("suf"));
-        assert_eq!(suffix_of(r#""a""#), None);
-        assert_eq!(suffix_of(r##"r#"a"#"##), None);
-        assert_eq!(suffix_of(r##"br#"a"#x"##), Some("x"));
-        assert_eq!(suffix_of("'c'"), None);
     }
 
     #[test]

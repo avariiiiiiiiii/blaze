@@ -570,7 +570,7 @@ impl<'a> Stage<'a> {
         let mut fixups = BumpVec::with_capacity_in(relocs.len(), self.arena);
         let mut weak = BumpVec::new_in(self.arena);
         for (reloc, sym) in relocs.iter().zip(syms) {
-            let apply = reloc::of_kind(reloc.kind, self.arch(), in_code).map_err(|it| error(function, it))?;
+            let apply = reloc::of_kind(reloc.kind, self.output.format, self.arch(), in_code).map_err(|it| error(function, it))?;
             if matches!(reloc.target, Target::Weak(_)) {
                 weak.push(*sym);
             }
@@ -1116,14 +1116,7 @@ impl<'a> Stage<'a> {
     /// What a GOT cell of a fixup holds the address of: a thread-local static's TLV
     /// descriptor for the TLV kinds, else the target.
     pub fn got_target(&self, fixup: &Fixup) -> Sym {
-        if matches!(fixup.apply, Apply::TlvPage21 | Apply::TlvLo12 | Apply::TlvRel32) {
-            if let SymKey::Static(item, instance) = self.symbols.key(fixup.target) {
-                if let Some(tlv) = self.symbols.find(SymKey::Tlv(item, instance)) {
-                    return tlv;
-                }
-            }
-        }
-        fixup.target
+        crate::write::got_target(&self.symbols, fixup)
     }
 
     fn imported(&self, sym: Sym) -> bool {

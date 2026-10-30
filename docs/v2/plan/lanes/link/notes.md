@@ -107,7 +107,10 @@ static, a changed layout, new imports) is a `Restart` naming why. ELF frames are
 4-byte zero inside the patch's writes (libgcc and libunwind read a run of FDEs to a terminator).
 New code never reuses old code space: a running program may still be in it, and a rollback
 returns to it. A panic under the runtime's guard rolls the newest generation with a frame in
-its code back to its base and answers `RolledBack`; `Image::roll_back` follows.
+its code back to its base and answers `RolledBack`; `Image::roll_back` follows. A speculative
+patch commits while its borrow check (`Pending::finish`) runs beside it. On a refusal, the caller
+completes any commit in flight and rolls back each commit made since the patch, one
+`roll_back` per commit.
 
 ## Start and stop sections
 
@@ -160,11 +163,99 @@ its executable synthetic regions (`__wasm_call_ctors`), are a code space of thei
 apart from memory. A function's index is the number of imports (all wasm imports are
 functions) plus its rank by code address; `FUNCTION_INDEX_*` get the index, `TABLE_INDEX_*` the
 index + 1 (its slot), 0 for a weak undefined function; a call by index to an undefined one is an
-error. An undefined name that some input says the wasm import of (`Symbol::import` of a native
+error. An undefined name that some input says the wasm import of (`Object::imports` of a native
 object, `Code::imports` of a codegen function, `Static::imports`) and that is not weak becomes a
 function import (rustc's `--allow-undefined`); any other undefined name is an error.
 `Placed::functions` lists native code pieces too. No jump table, no GOT, no DWARF, no live
 patching (a live wasm output is an error).
+
+## Resolution: cost
+
+What resolving the native inputs and the names costs (`native.rs`, against the reader contract
+in `model.rs`), read off the code; nothing was measured.
+
+**The reader contract.** A reader borrows: a section's bytes are `Data::Input(range)` into the
+input (or a member's slice of its archive), a name is `Name { at, len }` into one `Names` arena
+per file, and relocations are one CSR column (`Object::fixups`, each section a `Range<u32>`
+of it), as are COMDAT groups (`Object::grouped`). A reader makes bytes (`Data::Bytes`) only
+where the format has none to borrow, such as wasm function bodies. `check_file` checks every index and
+range once, when the file is read, so nothing after it checks bounds against the bytes.
+
+**Once per object** (when its input is added, or its member is first pulled), in parallel
+over the objects of a round. A same-bytes result whatever the core count comes from batching in input order:
+
+- read and check: linear in its symbols, sections and fixups; `.eh_frame` split into records;
+- interning: one `intern_wide` batch for every symbol, section and frame record of the round,
+  and one `names_all` batch for named sections' names (both deterministic, see "Interning");
+- columns (`Parsed`): a `Sym` per symbol, section and frame record (4 bytes each); per section
+  the symbols its fixups refer to and the symbols it defines (CSR, 4 bytes an entry, each list
+  deduplicated); the group of each section (4 bytes); per frame record its section, range,
+  CIE and described function (24 bytes) and its fixups (CSR); the root sections; the named
+  sections sorted by name.
+- an archive's index (`Table`: open addressing over 64-bit hashes, the first member to define
+  a name keeps it, so lookup order is link-line order) is built once, in parallel over the
+  archives, and kept with the image in `Stage::objects` like the parsed objects.
+
+An object is never read, interned or indexed again while its input stays on the line: a
+stage that changes the natives reads only the inputs it adds. Removing an input drops its cached objects.
+
+**A stage with no native change.** Rust's references are counted, not walked: `Refs` keeps,
+per name (by `Symbols::dense`), how many of Rust's pieces refer to it strongly and weakly, and
+per counted piece the names it referred to. A stage counts the pieces made since the last
+resolution (their fixups) and uncounts the ones in the state's removal log since then
+(`State::removed_since`). That is linear in what the change made and removed, never in the
+image. Only names whose class (none, weak only, strong) changed go on, and each is checked
+against what it resolved to (`settled`):
+
+- nothing, for nearly all edits (a body changes, a name stays referred to): the stage keeps
+  the resolution, sharing every column by `Arc`;
+- grow, for a name Rust newly refers to: it is resolved against the kept graph (one hash
+  lookup per name), and what it newly reaches is marked from that name alone. The bitsets are
+  copy-on-write by chunk, so a mark costs the chunks it writes. Then only the new sections and
+  frame records are made. The cost is the name plus what it reaches, plus a copy of the
+  import list when it adds an import;
+- rebuild, when that is not enough: the last reference to something native went (its sections
+  may be collected), a weak-only reference became strong, or a gained name needs an archive
+  member, an alias, a section-keeping special or a library not yet needed.
+
+**A rebuild** builds the graph again from the cached columns, with no reading and no
+interning. Registration, which applies groups, directives and strengths in link order, costs
+O(globals of the loaded objects). Marking costs O(kept sections + their references), and
+assigning definitions costs O(globals). It then diffs the new graph against the kept one by object. Only
+sections, frame records and commons that came or went are made or removed, and only objects whose
+sections changed or whose globals' winners changed have their symbols defined again. Exports
+(the shared libraries' names, one `Table`) are kept when the libraries are the same `Arc`s,
+and the import and library lists keep their `Arc` when they come out equal. The writer
+compares those to decide whether to bind again.
+
+**Ahead and behind.** mold and wild resolve symbols in parallel: every file inserts its
+definitions into one concurrent map (mold), or prehashed names are bucketed and resolved per
+bucket (wild). mold also marks `--gc-sections` liveness in parallel with atomic flags. Both
+redo all of it, and the archive member fetch, on every link. lld resolves archives lazily:
+an archive's symbols are lazy entries in the one symbol table, and a reference fetches the
+member, so no archive is rescanned. Here an archive is a cached hash index, members are pulled
+in rounds, and a round's reads run in parallel. Ahead: an edit that changes no native input and
+no name's class costs what it made, not a link, and a gained name costs what it reaches. A
+native change costs reading the new inputs plus a rebuild from columns, not reading everything
+again. Behind:
+
+- registration and marking in a rebuild are serial, where mold and wild do both in parallel. Marking could
+  run as a parallel frontier over the CSR columns, and registration could resolve per name
+  shard and then apply strengths in load order;
+- a rebuild re-marks from every root, even when one root went;
+- each native input's bytes are copied once into the state (`Input::bytes`, an `Arc<[u8]>`)
+  rather than mapped;
+- bytes a reader makes (wasm function bodies) are copied into the stage arena each time
+  their section is made;
+- `NativeFixup` is 40 bytes;
+- there is no benchmark against mold, wild or lld on the same inputs.
+
+**Rules this keeps that the code makes precise.** The "first" COMDAT group of a name is first
+in load order: the link line, then each pull round with its members sorted by input and member.
+A frame record's own fixups (an FDE's personality, LSDA and function pointers) are references:
+they keep what they name and resolve it. Native wasm imports are `Object::imports`, keyed by
+symbol (formerly `Symbol::import`). The same name imported two different ways, by two objects
+or by an object and Rust, is an error naming both.
 
 ## State and stages: cost
 
@@ -226,13 +317,15 @@ symbol folded into a tag).
 
 **What is still O(image) per incremental link.** Some of it is mine:
 
-- the jump table's cells piece, written whole by the writer: 8 bytes × capacity;
+- the cells piece's rebase list, rebuilt from `filled_cells()` (O(slots)) when a cell was set
+  or emptied; the cells themselves are written 8 bytes per dirty slot;
 - `State::compact` when it runs, amortised over the garbage it drops.
 
 The rest is outside these files:
 
-- native resolution (being made incremental by `link-core-resolve`);
-- the writer's sorted `State::lists` if it is spliced through `Arc::make_mut`;
+- a native rebuild, when a stage changes native inputs or a name's class ("Resolution: cost");
+- the writer's lists (rebase, binds, GOT, functions, debug), spliced in one linear merge when
+  they change ("Placement and writing: cost");
 - the format writers' synthesis of headers and tables.
 
 **Ahead and behind.** Neither mold nor wild patches an image in place: both relink from the

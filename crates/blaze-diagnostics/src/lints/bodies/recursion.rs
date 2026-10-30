@@ -24,14 +24,13 @@ use hir_ty::{
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     TypeVisitableExt as _,
     inherent::{GenericArgs as _, IntoKind as _, SliceLike as _},
 };
 use syntax::{AstNode as _, ast};
 
-use super::BodyCx;
+use super::{BodyCx, bits::Bits};
 use crate::{
     cx::signature_range,
     lower::{Found, Phase},
@@ -42,6 +41,10 @@ use crate::{
 pub(super) fn calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
     let Some(func) = function(b) else { return Vec::new() };
     let Some(mir) = b.mir() else { return Vec::new() };
+    let params = mir.param_locals.len();
+    if !has_terminator(mir, |it| matches!(it, TerminatorKind::Call { args, .. } if args.len() == params)) {
+        return Vec::new();
+    }
     let types = Types::new(b, func);
     let trait_args = types.trait_args();
     lint(b, search(mir, |terminator| types.calls_itself(mir, terminator, &trait_args)))
@@ -54,16 +57,27 @@ pub(super) fn drops(b: &BodyCx<'_, '_>) -> Vec<Found> {
         return Vec::new();
     }
     let Some(func) = function(b) else { return Vec::new() };
+    let ItemContainerId::ImplId(_) = func.lookup(b.db()).container else { return Vec::new() };
+    let Some(mir) = b.runtime_mir() else { return Vec::new() };
+    if !has_terminator(mir, |it| matches!(it, TerminatorKind::Drop { .. })) {
+        return Vec::new();
+    }
     let types = Types::new(b, func);
     let Some(drop_for) = types.drop_for() else { return Vec::new() };
-    let Some(mir) = b.runtime_mir() else { return Vec::new() };
     lint(b, search(mir, |terminator| types.drops(mir, terminator, drop_for)))
 }
 
-/// A function or method whose body type checked: rustc builds no MIR of one that did not.
+/// Whether a block of `mir` ends in a terminator `kind` holds of: the one pass over the
+/// blocks that lets a body with no candidate skip building an inference context.
+fn has_terminator(mir: &MirBody<'_>, kind: impl Fn(&TerminatorKind) -> bool) -> bool {
+    mir.basic_blocks.iter().any(|(_, block)| block.terminator.as_ref().is_some_and(|it| kind(&it.kind)))
+}
+
+/// A function or method whose body type and match checked: rustc builds an error MIR of one
+/// that did not.
 fn function(b: &BodyCx<'_, '_>) -> Option<FunctionId> {
     match b.owner {
-        DefWithBodyId::FunctionId(it) if !b.tainted => Some(it),
+        DefWithBodyId::FunctionId(it) if !b.mir_tainted => Some(it),
         _ => None,
     }
 }
@@ -89,34 +103,48 @@ fn lint(b: &BodyCx<'_, '_>, calls: Option<Vec<MirSpan>>) -> Vec<Found> {
 
 /// rustc's `Search` from the start block: `None` when a way through returns or loops back (its
 /// `NonRecursive`), else the spans of the recursive terminators it reached.
+///
+/// rustc's `TriColorDepthFirstSearch` with a byte of colour per block, and `recursive` (an impl
+/// lookup) asked once per block where rustc asks it in both `node_examined` and
+/// `node_settled`: three bitsets over the block indices and one stack sized to the block
+/// count, nothing allocated per block or edge.
 fn search(mir: &MirBody<'_>, recursive: impl Fn(&Terminator) -> bool) -> Option<Vec<MirSpan>> {
-    let mut visited: FxHashSet<BasicBlockId> = FxHashSet::default();
-    let mut settled: FxHashSet<BasicBlockId> = FxHashSet::default();
-    let mut stack = vec![(mir.start_block, false)];
+    let blocks = mir.basic_blocks.len();
+    let (mut visited, mut settled, mut is_recursive) = (Bits::new(blocks), Bits::new(blocks), Bits::new(blocks));
+    let mut stack: Vec<(BasicBlockId, bool)> = Vec::with_capacity(blocks);
+    stack.push((mir.start_block, false));
     let mut calls = Vec::new();
     while let Some((block, settle)) = stack.pop() {
+        let index = u32::from(block.into_raw()) as usize;
         let terminator = mir.basic_blocks[block].terminator.as_ref()?;
         if settle {
-            settled.insert(block);
-            if recursive(terminator) {
+            settled.insert(index);
+            if is_recursive.contains(index) {
                 calls.push(terminator.span);
             }
             continue;
         }
-        let first = visited.insert(block);
-        if !first && !settled.contains(&block) {
-            return None;
-        }
-        let is_recursive = recursive(terminator);
-        if returns(terminator, is_recursive) {
-            return None;
-        }
+        let first = visited.insert(index);
         if !first {
+            if !settled.contains(index) {
+                return None;
+            }
             continue;
         }
+        let recursed = recursive(terminator);
+        if returns(terminator, recursed) {
+            return None;
+        }
         stack.push((block, true));
-        if !is_recursive {
-            stack.extend(successors(&terminator.kind).into_iter().map(|it| (it, false)));
+        if recursed {
+            is_recursive.insert(index);
+            continue;
+        }
+        // rustc's `ignore_edge`: every successor but an unwind edge next to another one and the
+        // imaginary edge of a `FalseEdge` (which `successors` leaves out).
+        match &terminator.kind {
+            TerminatorKind::Call { target: None, cleanup: Some(cleanup), .. } => stack.push((*cleanup, false)),
+            kind => stack.extend(kind.successors().into_iter().map(|it| (it, false))),
         }
     }
     Some(calls)
@@ -134,15 +162,6 @@ fn returns(terminator: &Terminator, recursive: bool) -> bool {
         | TerminatorKind::Yield { .. } => true,
         TerminatorKind::Call { target: None, cleanup: None, .. } => !recursive,
         _ => false,
-    }
-}
-
-/// The edges rustc's `Search` follows (`ignore_edge`): every successor but an unwind edge next
-/// to another one and the imaginary edge of a `FalseEdge`.
-fn successors(kind: &TerminatorKind) -> Vec<BasicBlockId> {
-    match kind {
-        TerminatorKind::Call { target: None, cleanup: Some(cleanup), .. } => vec![*cleanup],
-        _ => kind.successors().into_vec(),
     }
 }
 

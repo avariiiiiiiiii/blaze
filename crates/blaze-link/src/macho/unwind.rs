@@ -974,6 +974,7 @@ mod tests {
             live: None,
             tags: 0,
             stack: None,
+            windows_subsystem: false,
         }
     }
 

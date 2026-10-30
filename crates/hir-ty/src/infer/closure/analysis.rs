@@ -209,14 +209,14 @@ impl<'db> InferenceContext<'db> {
     fn analyze_closures_in_expr(&mut self, expr: ExprId, upvars: &'db FxHashMap<ExprId, Upvars>) {
         self.store.walk_child_exprs(expr, |expr| self.analyze_closures_in_expr(expr, upvars));
 
-        match &self.store[expr] {
+        match self.store.expr(expr) {
             Expr::Closure { args, body, closure_kind, capture_by, .. } => {
                 self.analyze_closure(
                     expr,
                     args,
-                    *body,
-                    *capture_by,
-                    *closure_kind,
+                    body,
+                    capture_by,
+                    closure_kind,
                     upvars.get(&expr).map(|upvars| upvars.as_ref()).unwrap_or_default(),
                 );
             }
@@ -289,7 +289,8 @@ impl<'db> InferenceContext<'db> {
                 closure_kind
             && let parent_hir_id = ExpressionStore::closure_for_coroutine(closure_expr_id)
             && let parent_ty = self.result.expr_ty(parent_hir_id)
-            && let Expr::Closure { capture_by: CaptureBy::Value, .. } = self.store[parent_hir_id]
+            && let Expr::Closure { capture_by: CaptureBy::Value, .. } =
+                self.store.expr(parent_hir_id)
         {
             // (1.) Closure signature inference forced this closure to `FnOnce`.
             if let Some(ClosureKind::FnOnce) = self.infcx().closure_kind(parent_ty) {
@@ -316,18 +317,18 @@ impl<'db> InferenceContext<'db> {
             ..
         } = closure_kind
         {
-            let Expr::Block { statements, .. } = &self.store[body] else {
+            let Expr::Block { statements, .. } = self.store.expr(body) else {
                 panic!();
             };
             for stmt in statements {
                 let Statement::Let { pat, initializer: Some(init), .. } = *stmt else {
                     panic!();
                 };
-                let Pat::Bind { .. } = self.store[pat] else {
+                let Pat::Bind { .. } = self.store.pat(pat) else {
                     // Complex pattern, skip the non-upvar local.
                     continue;
                 };
-                let Expr::Path(path) = &self.store[init] else {
+                let Expr::Path(path) = self.store.expr(init) else {
                     panic!();
                 };
                 let update_guard =
@@ -552,7 +553,7 @@ impl<'db> InferenceContext<'db> {
 
         // The statements of this block move the arguments in. Arguments are not what the
         // closure captured, so only the body as written says whether it consumes that.
-        let Expr::Block { tail: Some(body), .. } = self.store[body] else {
+        let Expr::Block { tail: Some(body), .. } = self.store.expr(body) else {
             return false;
         };
         let _ = euv::ExprUseVisitor::new(self, coroutine_def_id, upvars, &mut delegate)

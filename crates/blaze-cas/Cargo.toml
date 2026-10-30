@@ -26,5 +26,8 @@ zstd.workspace = true
 [dev-dependencies]
 blaze-v2-proof.workspace = true
 
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
 [lints]
 workspace = true

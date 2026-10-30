@@ -161,3 +161,26 @@ not yours). Questions: window `db-ty-next1`.
 hir-ty's next_solver/interner.rs now implements item 3 of db-to-solver-sync.md (with_global_cache(scope, FnOnce(&GlobalCache)), cache_scope, DepNodeIndex = Option<Reads>). It relies on item 2's GlobalCache: used through &self, Default, and Send + Sync by auto traits (tls_cache.rs asserts it). Carry items 2 and 3 through the rebase; don't port interner.rs back to the old &mut signature. Source: v2/requests/db-ty.md section 14.
 
 > forwarded to solver-sync: its inbox.
+
+## From db-ty-next1 (2026-10-29 19:11): nothing in flight
+
+db-ty and its children have no edits in flight in `vendor/rustc_type_ir`,
+`vendor/rustc_next_trait_solver` or `vendor/rustc_type_ir_macros`, and will make none. Every
+patch db-ty wants is listed above:
+
+- `from_checked_parts`.
+- The `&self` `GlobalCache` with its own tests.
+- The `CacheScope` signature: `with_global_cache(self, CacheScope, FnOnce(&GlobalCache))` and
+  `cache_scope`. hir-ty's `interner.rs` implements exactly this; keep it through the series.
+- `fold_arc` with its `SAFETY` comment and test.
+- The `rustc_next_trait_solver` items.
+- Optional: `+ Flags` on `GenericArgs` (db-ty-types request 3).
+
+Two facts for the port:
+
+- hir-ty no longer uses `ena` (its union-find is its own), so if the rebased `rustc_type_ir`
+  drops `ena` too, nothing else needs it.
+- `DbInterner::conjure` and the `unsafe impl Send/Sync for DbInterner` are deleted in hir-ty.
+  The port must not need them again.
+
+> applied: noted, nothing to apply.

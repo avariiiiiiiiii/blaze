@@ -269,6 +269,17 @@
 //! that asks for a query a task below it on its thread runs unwinds with
 //! [`Cancelled::WouldWaitOnItself`]; a task that asks for one another thread runs waits for it.
 //!
+//! # Sharing a result across queries
+//!
+//! [`capture_reads`] runs a closure in a frame of the active query and returns, besides the
+//! closure's result, the [`Reads`] it made (rustc's `with_cached_task`). Those reads are the
+//! query's as they happen. [`replay_reads`] makes another query depend on them as if it had made
+//! them (rustc's `get_tracked`), so a result computed once, such as a solved trait goal, can be
+//! reused by every query of the revision and still rerun each of them when what it read changes.
+//! A capture that read a provisional value, created a tracked struct, wrote an output,
+//! accumulated, made an untracked read or saw [`unshareable_reads`] is `None` and must not be
+//! shared. Frames nest, and a `Reads` is valid only in the revision it was captured in.
+//!
 //! [`Deref`]: std::ops::Deref
 //! [`Hash`]: std::hash::Hash
 //! [`'db` database lifetime]: https://salsa-rs.github.io/salsa/plumbing/db_lifetime.html
@@ -292,6 +303,7 @@ mod accumulator;
 mod active_query;
 mod attach;
 mod cancelled;
+mod capture;
 mod cycle;
 mod database;
 mod database_impl;
@@ -336,6 +348,7 @@ pub use self::database::{IngredientInfo, PageInfo};
 pub use self::accumulator::Accumulator;
 pub use self::active_query::Backtrace;
 pub use self::cancelled::Cancelled;
+pub use self::capture::{Reads, capture_reads, replay_reads, unshareable_reads};
 
 pub use self::cycle::Cycle;
 pub use self::database::Database;

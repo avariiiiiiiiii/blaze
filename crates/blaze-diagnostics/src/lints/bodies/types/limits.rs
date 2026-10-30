@@ -23,7 +23,7 @@ use syntax::{AstNode as _, ast};
 
 use super::util::{self, Solver};
 use crate::{
-    lints::bodies::{BodyCx, LatePass},
+    lints::bodies::{BodyCx, Hooks, LatePass},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -201,6 +201,10 @@ fn peel_refs(mut ty: Ty<'_>) -> (Ty<'_>, usize) {
 impl LatePass for TypeLimits {
     fn name(&self) -> &'static str {
         "TypeLimits"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::BODY | Hooks::EXPR | Hooks::PAT
     }
 
     fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {

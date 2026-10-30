@@ -43,8 +43,8 @@ use hir_ty::{
     TyDefId,
     closure_analysis::{CapturedPlace, PlaceBase, ProjectionKind, UpvarCapture},
     db::{
-        ClosureKey, GeneralConstId, HirDatabase, InternedClosure, InternedClosureId,
-        InternedCoroutineId, InternedOpaqueTyId,
+        ClosureKey, HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId,
+        InternedOpaqueTyId,
     },
     intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::loaded_crates,
@@ -54,9 +54,9 @@ use hir_ty::{
         is_by_move_coroutine,
     },
     next_solver::{
-        Allocation, Binder, BoundRegion, Clause, Const, ConstKind, DbInterner, FnSig, GenericArgs,
-        ImplTraitIdx, OpaqueTyIdWrapper, Pattern, Region, StoredTy, Term, TermId, TraitRef, Ty,
-        TyKind, ValTree,
+        AliasConstKind, Allocation, Binder, BoundRegion, Clause, Const, ConstKind, DbInterner,
+        FnSig, GenericArgs, ImplTraitIdx, OpaqueTyIdWrapper, Pattern, Region, StoredTy, Term,
+        TermId, TraitRef, Ty, TyKind, ValTree,
     },
     rpit_hidden_types,
     traits::{ParamEnvAndCrate, implements_traits_unique},
@@ -66,7 +66,7 @@ use rustc_abi::ReprOptions;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::{
     AliasTermKind, AliasTyKind, BoundRegionKind, BoundTyKind, BoundVarIndexKind, ClauseKind,
-    ExistentialPredicate, GenericArgKind, InferConst, InferTy, Interner as _, OutlivesPredicate,
+    ExistentialPredicate, GenericArgKind, InferConst, InferTy, Interner as _, OutlivesClause,
     PatternKind, RegionKind, TermKind, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
@@ -80,7 +80,7 @@ use crate::{
     key::{self, generic_def_item, item_key},
 };
 
-const DOMAIN: &str = "blaze v2 form 1";
+const DOMAIN: &str = "blaze v2 form 2";
 const SPANS_DOMAIN: &str = "blaze v2 form spans 1";
 
 /// Why a form is not of a program rustc accepts.
@@ -836,6 +836,9 @@ impl<'db> Cx<'db> {
         for feature in &features {
             f.str(feature.as_str());
         }
+        // Inherited from the impl, module and crate, so it changes with no change to the
+        // function's own attributes.
+        f.u8(hir_def::attrs::disabled_sanitizers(db, func));
         f.bool(flags.contains(AttrFlags::RUSTC_NOUNWIND));
         let linked = flags.intersects(AttrFlags::NO_MANGLE | AttrFlags::LINKED_BY_NAME)
             || matches!(loc.container, ItemContainerId::ExternBlockId(_));
@@ -1346,6 +1349,7 @@ impl<'db> Cx<'db> {
                 self.ty_in(f, pointee);
             }
             TyKind::FnDef(def, args) => {
+                let args = args.no_bound_vars().unwrap();
                 f.u8(13);
                 self.callable(f, def.0);
                 self.args(f, args);
@@ -1440,8 +1444,9 @@ impl<'db> Cx<'db> {
                     self.ty_in(f, ty);
                 }
             }
-            TyKind::Alias(alias) => {
+            TyKind::Alias(is_rigid, alias) => {
                 f.u8(23);
+                f.u8(is_rigid as u8);
                 match alias.kind {
                     AliasTyKind::Projection { def_id } => {
                         f.u8(0);
@@ -1775,10 +1780,11 @@ impl<'db> Cx<'db> {
                 f.u32(placeholder.universe.as_u32());
                 f.u32(placeholder.bound.var.as_u32());
             }
-            ConstKind::Unevaluated(unevaluated) => {
+            ConstKind::Alias(is_rigid, alias) => {
                 f.u8(5);
-                self.general_const(f, unevaluated.def.0);
-                self.args(f, unevaluated.args);
+                f.u8(is_rigid as u8);
+                self.alias_const(f, alias.kind);
+                self.args(f, alias.args);
             }
             ConstKind::Value(value) => {
                 f.u8(6);
@@ -1790,20 +1796,29 @@ impl<'db> Cx<'db> {
         }
     }
 
-    fn general_const(&self, f: &mut Form, def: GeneralConstId<'db>) {
-        match def {
-            GeneralConstId::ConstId(it) => {
+    fn alias_const(&self, f: &mut Form, kind: AliasConstKind<'db>) {
+        match kind {
+            AliasConstKind::Projection { def_id } => {
                 f.u8(0);
-                f.item(ItemId::Const(it));
+                f.item(ItemId::Const(def_id.0));
             }
-            GeneralConstId::StaticId(it) => {
+            // The two forms of an inherent const take different args.
+            AliasConstKind::InherentSelf { def_id } => {
                 f.u8(1);
-                f.item(ItemId::Static(it));
+                f.item(ItemId::Const(def_id.0));
+            }
+            AliasConstKind::InherentImpl { def_id } => {
+                f.u8(2);
+                f.item(ItemId::Const(def_id.0));
+            }
+            AliasConstKind::Free { def_id } => {
+                f.u8(3);
+                f.item(ItemId::Const(def_id.0));
             }
             // Written where it is used, it is as much a part of it as a closure is.
-            GeneralConstId::AnonConstId(it) => {
-                f.u8(2);
-                self.code_in(f, InferBodyId::AnonConstId(it));
+            AliasConstKind::Anon { def_id } => {
+                f.u8(4);
+                self.code_in(f, InferBodyId::AnonConstId(def_id.0));
             }
         }
     }
@@ -1958,7 +1973,7 @@ impl<'db> Cx<'db> {
                     }
                 }
             }
-            TyKind::Alias(alias) => match alias.kind {
+            TyKind::Alias(_, alias) => match alias.kind {
                 AliasTyKind::Projection { def_id } => {
                     found.push(Named::Item(ItemId::Alias(def_id.0)))
                 }
@@ -2017,12 +2032,12 @@ impl<'db> Cx<'db> {
                 self.trait_ref(f, it.trait_ref);
                 f.debug(&it.polarity);
             }
-            ClauseKind::RegionOutlives(OutlivesPredicate(a, b)) => {
+            ClauseKind::RegionOutlives(OutlivesClause(a, b)) => {
                 f.u8(1);
                 self.region(f, a);
                 self.region(f, b);
             }
-            ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) => {
+            ClauseKind::TypeOutlives(OutlivesClause(ty, region)) => {
                 f.u8(2);
                 self.ty_in(f, ty);
                 self.region(f, region);
@@ -2046,9 +2061,9 @@ impl<'db> Cx<'db> {
                         f.u8(3);
                         f.item(ItemId::Alias(def_id.0));
                     }
-                    AliasTermKind::UnevaluatedConst { def_id } => {
+                    AliasTermKind::AnonConst { def_id } => {
                         f.u8(4);
-                        self.general_const(f, def_id.0);
+                        self.code_in(f, InferBodyId::AnonConstId(def_id.0));
                     }
                     AliasTermKind::ProjectionConst { def_id } => {
                         f.u8(5);
@@ -2058,8 +2073,12 @@ impl<'db> Cx<'db> {
                         f.u8(6);
                         f.item(ItemId::Const(def_id.0));
                     }
-                    AliasTermKind::InherentConst { def_id } => {
+                    AliasTermKind::InherentConstSelf { def_id } => {
                         f.u8(7);
+                        f.item(ItemId::Const(def_id.0));
+                    }
+                    AliasTermKind::InherentConstImpl { def_id } => {
+                        f.u8(8);
                         f.item(ItemId::Const(def_id.0));
                     }
                 }
@@ -2488,7 +2507,7 @@ impl<'db> Cx<'db> {
             | TyKind::CoroutineWitness(..)
             | TyKind::Never
             | TyKind::Tuple(_)
-            | TyKind::Alias(_)
+            | TyKind::Alias(_, _)
             | TyKind::Param(_)
             | TyKind::Bound(..)
             | TyKind::Placeholder(_)

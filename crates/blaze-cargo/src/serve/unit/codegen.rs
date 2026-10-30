@@ -6,11 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use blaze_codegen::{
     InstanceKey, NativeLib, NativeLibKind, Target,
@@ -26,12 +22,11 @@ use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_link::{Change, Image, Native, Output};
 use blaze_units::schema::{self, Mode, Unit};
-use hir_ty::db::HirDatabase;
 use hir_ty_codegen::v2::{
     Backends, BuildTime, Databases, HirFrontend, HirInstance, ItemHashes, RootKind, Roots,
 };
 
-use super::{Job, files::Mounted, graph::flag, script};
+use super::{Job, UnitReader, files::Mounted, graph::flag, script};
 
 /// What a unit makes, as the linker sees it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -135,7 +130,7 @@ fn build_time(job: &Job) -> BuildTime {
         let mut crates = rustc_hash::FxHashSet::default();
         for at in 0..job.graph.len() as u32 {
             if job.graph.build_time(at)
-                && let Some(krate) = job.lowered.krate(at as usize)
+                && let Some(krate) = job.crates.krate(at as usize)
             {
                 crates.insert(krate);
             }
@@ -205,38 +200,34 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
     })
 }
 
-/// What a unit's codegen made.
-pub(crate) struct Generated {
+/// What a unit's codegen made, reading the task's snapshot.
+pub(crate) struct Generated<'db> {
     pub(crate) built: Built,
     pub(crate) roots: Roots,
-    pub(crate) frontend: HirFrontend,
+    pub(crate) frontend: HirFrontend<'db>,
     pub(crate) policy: Policy,
 }
 
-/// The code generator's view of the job's front end, its files named as rustc names them.
-fn frontend(job: &Job, mounted: &Arc<Mounted>) -> HirFrontend {
-    let snapshot = Mutex::new(job.lowered.snapshot());
-    let databases = Databases::new(move || {
-        let snapshot = snapshot.lock().unwrap_or_else(|it| it.into_inner());
-        Box::new(snapshot.clone()) as Box<dyn HirDatabase + Send>
-    });
+/// The code generator's view of the job's front end, its files named as rustc names them. Every
+/// thread of the build reads the one snapshot of the task's reader: salsa's reads take `&self`,
+/// so none waits on another and none is cloned.
+fn frontend<'db>(job: &Job, reader: &'db UnitReader, mounted: &Arc<Mounted>) -> HirFrontend<'db> {
     let names = {
-        let mounted = Arc::clone(mounted);
-        let paths = job.lowered.paths();
+        let (mounted, paths) = (Arc::clone(mounted), Arc::clone(&reader.paths));
         move |file: base_db::FileId| -> Option<String> { paths.get(&file).map(|path| mounted.name(path)) }
     };
-    HirFrontend::new(databases, Box::new(ItemHashes::new(Box::new(names))), build_time(job))
+    HirFrontend::new(Databases::new(&reader.db), Box::new(ItemHashes::new(Box::new(names))), build_time(job))
 }
 
 /// The tests of test unit `unit` as its harness lists them, compiling nothing: the same
 /// listing, names and attributes as the test binary's ([`generate`]).
-pub(crate) fn test_roots(job: &Job, unit: usize) -> Result<Roots, String> {
+pub(crate) fn test_roots(job: &Job, reader: &UnitReader, unit: usize) -> Result<Roots, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let krate = job
-        .lowered
+        .crates
         .krate(unit)
         .ok_or_else(|| format!("unit {unit} (`{}`) has no crate in the front end", u.target.name))?;
-    frontend(job, &job.mounted).roots(krate, RootKind::Test).map_err(|it| it.what)
+    frontend(job, reader, &job.mounted).roots(krate, RootKind::Test).map_err(|it| it.what)
 }
 
 /// The store as a build reads it: with no lock, under the build's guard.
@@ -256,20 +247,21 @@ impl blaze_codegen::driver::Lookup for Reading<'_> {
 
 /// `unit`'s functions compiled from its roots: `Err` with the code generator's errors, each
 /// naming the function it could not compile.
-pub(crate) fn generate(
+pub(crate) fn generate<'db>(
     job: &Job,
+    reader: &'db UnitReader,
     unit: usize,
     makes: &Makes,
     mounted: &Arc<Mounted>,
-) -> Result<Result<Generated, Vec<String>>, String> {
+) -> Result<Result<Generated<'db>, Vec<String>>, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let krate = job
-        .lowered
+        .crates
         .krate(unit)
         .ok_or_else(|| format!("unit {unit} (`{}`) has no crate in the front end", u.target.name))?;
     let toolchain = toolchain(job, unit)?;
     let policy = policy(job, unit, toolchain)?;
-    let frontend = frontend(job, mounted);
+    let frontend = frontend(job, reader, mounted);
     let roots = match frontend.roots(krate, root_kind(u, makes)) {
         Ok(it) => it,
         Err(error) => return Ok(Err(vec![error.what])),
@@ -391,7 +383,7 @@ fn given(job: &Job, unit: u32) -> Result<Compile, String> {
 /// look for them, the unit's `-L`s.
 ///
 /// [`Graph::linked_in`]: super::graph::Graph::linked_in
-fn natives(job: &Job, unit: usize, frontend: &HirFrontend) -> Result<(Vec<NativeLib>, Vec<PathBuf>), String> {
+fn natives(job: &Job, unit: usize, frontend: &HirFrontend<'_>) -> Result<(Vec<NativeLib>, Vec<PathBuf>), String> {
     let unit = unit as u32;
     let mine = given(job, unit)?;
     let mut libs = Vec::new();
@@ -408,7 +400,7 @@ fn natives(job: &Job, unit: usize, frontend: &HirFrontend) -> Result<(Vec<Native
         for lib in &compile.libs {
             libs.push(link_lib(lib)?);
         }
-        if let Some(krate) = job.lowered.krate(at as usize) {
+        if let Some(krate) = job.crates.krate(at as usize) {
             libs.extend(frontend.linked(krate).map_err(|it| it.what)?);
         }
     }
@@ -428,7 +420,7 @@ pub(crate) fn link(
     unit: usize,
     path: &str,
     makes: &Makes,
-    generated: &Generated,
+    generated: &Generated<'_>,
 ) -> Result<(Vec<u8>, Vec<Read>), String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let built = &generated.built;

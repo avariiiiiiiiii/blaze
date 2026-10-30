@@ -25,6 +25,13 @@ memory (bounded: the store's limbo is collected only by the store's owner).
   by compare-and-swap and never moves, so a lookup is acquire loads and key compares. Only the
   store replaces a published value (`replace`), retiring the old one to its limbo. Each row
   has flag bits in words beside the slots, set with one relaxed `fetch_or` only when not set.
+- A key lands in one level at most. An insert walks the levels oldest first. In a level at half
+  full, it seals the empty slot that ends the key's run (a fixed address, never dereferenced)
+  and moves on. Every inserter of a key meets that same slot, so one compare-and-swap decides
+  for all of them. Before this, two racing inserts could land a key in two levels. The delta
+  then kept a second spot that the commit never moved to its pack, and it pointed into a freed
+  chunk; the model test `model_table_racing_inserts_of_a_key_across_a_new_level_keep_one`
+  found it.
 - `Shared` holds the `View` (packs, mapped index tables, delta tables, external files,
   dictionaries) behind one pointer the store swaps; a reader loads it once per lookup.
 - A value made whole (decompressed or joined from chunks) goes once into the `Owned` table and
@@ -56,6 +63,13 @@ Under the sim driver: a task's reads stay whole and equal through random interle
 puts, flushes and single completions across index swaps, and are freed once the guard drops
 (16 seeds); and threaded writers and readers keep going through commits, settles and index
 swaps, after which every value is durable, correct and survives a reopen.
+
+Under `cfg(blaze_check)` (`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-cas -p
+blaze-reclaim --release model_`), each crate's `src/sync.rs` swaps std's atomics, `OnceLock` and
+`thread_local!` for blaze-check's, and a segment chunk's bytes are tracked exactly, so `model.rs`
+checks the table, the flag bits, the chunks and reclaim under every interleaving to the bound.
+`enter`'s epoch store is `Release`: the model found that a relaxed one leaves a thread's
+previous task unordered before a writer that reads it.
 
 ## The lock ban
 

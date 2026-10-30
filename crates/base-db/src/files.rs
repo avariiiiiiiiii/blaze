@@ -251,7 +251,7 @@ impl Files {
             if let Some(input) = self.text.get(raw) {
                 // Nothing reads the text left behind: `file_text` no longer has the file.
                 self.text.set(raw, None);
-                set(input.set_text_field(db), durability, Arc::from(""));
+                set(input.set_text_field(db), durability, std::sync::Arc::from(""));
                 set(input.set_content_field(db), durability, InputId(FileText::no_text()));
                 writer.parked.insert(file_id, input);
             }
@@ -263,14 +263,15 @@ impl Files {
         };
         match existing {
             Some(input) => {
-                set(input.set_text_field(db), durability, Arc::from(text));
+                set(input.set_text_field(db), durability, std::sync::Arc::from(text));
                 if input.content(&*db) != content {
                     set(input.set_content_field(db), durability, InputId(content));
                 }
                 self.text.set(raw, Some(input));
             }
             None => {
-                let builder = FileText::builder(Arc::from(text), file_id, InputId(content));
+                let builder =
+                    FileText::builder(std::sync::Arc::from(text), file_id, InputId(content));
                 let builder = match durability {
                     Some(durability) => builder.durability(durability),
                     None => builder,

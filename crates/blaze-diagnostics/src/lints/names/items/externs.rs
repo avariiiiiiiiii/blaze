@@ -21,6 +21,7 @@ use std::str::FromStr;
 
 use blaze_items::{Fact, ItemId};
 use hir::{InFile, ModuleDef};
+use intern::sym;
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, EnumId, FunctionId, GenericDefId, HasModule as _, Lookup, VariantId,
     attrs::AttrFlags, item_tree::FieldsShape, nameres::crate_def_map, signatures::FunctionSignature,
@@ -265,7 +266,7 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
                     return true;
                 }
                 let lang = AttrFlags::lang_item(self.cx.db, AttrDefId::AdtId(adt));
-                if lang.is_some_and(|it| matches!(it.as_str(), "unsafe_cell" | "unsafe_pinned")) {
+                if lang.is_some_and(|it| it == sym::unsafe_cell || it == sym::unsafe_pinned) {
                     return false;
                 }
                 self.variants(adt)

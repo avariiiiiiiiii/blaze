@@ -10,6 +10,8 @@
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/lanes/items.md
 //!   section 6.2).
 
+#![forbid(unsafe_code)]
+
 use std::{fmt, hash, marker::PhantomData};
 
 use blake3::hazmat::{self, ContextKey, HasherExt};
@@ -22,7 +24,7 @@ use crate::sync::{
 
 mod many;
 pub mod names;
-pub mod radix;
+pub use blaze_radix as radix;
 mod sync;
 
 /// The BLAKE3 hash of what something is. Two things with one content ID are the same thing.
@@ -51,8 +53,9 @@ impl ContentId {
     ///
     /// An input of at most one BLAKE3 chunk (1 KiB) is hashed as one chunk: its blocks
     /// before the last go through `hash_many` beside the other inputs with as many (AVX-512
-    /// hashes 16 at once, NEON 4), and its last block is one compression as the root. A
-    /// longer input goes through the hasher, which uses SIMD within it.
+    /// hashes 16 at once, NEON 4), and its last block, whatever its length, is compressed
+    /// beside seven other inputs' last blocks. A longer input goes through the hasher, which
+    /// uses SIMD within it.
     pub fn of_many(domain: &'static str, inputs: &[&[u8]]) -> Vec<ContentId> {
         many::of_many(context_key(domain), inputs)
     }
@@ -115,8 +118,9 @@ const DOMAIN_SLOTS: usize = 1024;
 
 /// The context key of each domain name hashed so far, open-addressed by the name's text: a
 /// slot once set never changes, so a lookup is acquire loads and compares.
-static DOMAIN_KEYS: [OnceLock<(&'static str, ContextKey)>; DOMAIN_SLOTS] =
-    [const { OnceLock::new() }; DOMAIN_SLOTS];
+static DOMAIN_KEYS: DomainKeys = [const { OnceLock::new() }; DOMAIN_SLOTS];
+
+type DomainKeys = [OnceLock<(&'static str, ContextKey)>; DOMAIN_SLOTS];
 
 /// FNV-1a: domain names are a few dozen bytes, hashed once per [`Hasher::new`].
 fn name_hash(name: &str) -> usize {
@@ -127,9 +131,14 @@ fn name_hash(name: &str) -> usize {
 
 /// `blake3::hazmat::hash_derive_key_context(domain)`, derived once per name.
 fn context_key(domain: &'static str) -> &'static ContextKey {
+    context_key_in(&DOMAIN_KEYS, domain)
+}
+
+/// [`context_key`] in the table `slots`, which a model test makes fresh for each execution.
+fn context_key_in<'a>(slots: &'a DomainKeys, domain: &'static str) -> &'a ContextKey {
     let mut at = name_hash(domain) & (DOMAIN_SLOTS - 1);
     for _ in 0..DOMAIN_SLOTS {
-        let slot = &DOMAIN_KEYS[at];
+        let slot = &slots[at];
         let (name, key) = match slot.get() {
             Some(entry) => entry,
             None => slot.get_or_init(|| (domain, hazmat::hash_derive_key_context(domain))),
@@ -726,5 +735,278 @@ mod tests {
                 assert_eq!(interner.find(&id(n)), Some(idx));
             }
         }
+    }
+}
+
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-ids --release
+/// model_`): racing interns and lock-free finds on a [`Sharded`] interner (in one shard with
+/// colliding tags, in two shards claiming blocks, across a table growth) against a set: an
+/// intern keeps its value exactly when the ID was not there, a find sees every intern that
+/// returned before it, an index reads back its value and ID and is below `end`, and every value
+/// made is dropped once. And a [`Domain`]'s key derived by two threads at once.
+#[cfg(all(test, blaze_check))]
+mod model {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    };
+
+    use blaze_check::{
+        linear::{History, Spec},
+        thread,
+    };
+
+    use super::*;
+
+    /// An ID in shard `shard` (bits 0..32) whose tag, and so probe start, is `tag` (bits
+    /// 64..96), told apart from the others by `key`.
+    fn id(shard: u32, tag: u32, key: u8) -> ContentId {
+        let mut bytes = [0; 32];
+        bytes[..4].copy_from_slice(&shard.to_le_bytes());
+        bytes[8..12].copy_from_slice(&tag.to_le_bytes());
+        bytes[31] = key;
+        ContentId(bytes)
+    }
+
+    /// A value that says when it is dropped. One the interner keeps is dropped only with the
+    /// interner, so a value dropped by the time `intern` returns lost the race.
+    struct Counted {
+        key: u8,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            assert!(!self.dropped.swap(true, Relaxed), "a value dropped twice");
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        Intern(u8),
+        Find(u8),
+    }
+
+    /// The sequential interner: bit `k` is set when key `k` is in it.
+    #[derive(Clone, PartialEq, Eq, Hash, Default)]
+    struct Set(u16);
+
+    impl Spec for Set {
+        type Op = Op;
+        /// `Intern`: whether its value is the one kept. `Find`: whether it found the key.
+        type Ret = bool;
+
+        fn apply(&mut self, op: &Op) -> bool {
+            match *op {
+                Op::Intern(key) => {
+                    let new = self.0 & (1 << key) == 0;
+                    self.0 |= 1 << key;
+                    new
+                }
+                Op::Find(key) => self.0 & (1 << key) != 0,
+            }
+        }
+    }
+
+    /// One execution's interner, the ID of each key, and every value it made.
+    struct Model {
+        interner: Sharded<Counted>,
+        ids: Vec<ContentId>,
+        made: std::sync::Mutex<Vec<Arc<AtomicBool>>>,
+        history: History<Set>,
+    }
+
+    impl Model {
+        /// Key `k` is `id(shard, tag, k)` for the `k`th of `keys`.
+        fn new(keys: impl IntoIterator<Item = (u32, u32)>) -> Arc<Model> {
+            let ids = keys.into_iter().zip(0..).map(|((shard, tag), key)| id(shard, tag, key)).collect();
+            Arc::new(Model {
+                interner: Sharded::new(),
+                ids,
+                made: std::sync::Mutex::new(Vec::new()),
+                history: History::new(),
+            })
+        }
+
+        /// Runs `op` as one operation of the history: the index it interned or found.
+        fn run(&self, op: Op) -> Option<Idx<Counted>> {
+            let mut at = None;
+            self.history.record(op, |&op| match op {
+                Op::Intern(key) => {
+                    let mut made = None;
+                    let idx = self.interner.intern(self.ids[key as usize], || {
+                        let dropped = Arc::new(AtomicBool::new(false));
+                        made = Some(dropped.clone());
+                        Counted { key, dropped }
+                    });
+                    self.reads_back(key, idx);
+                    at = Some(idx);
+                    let Some(made) = made else { return false };
+                    let kept = !made.load(Relaxed);
+                    self.made.lock().unwrap_or_else(PoisonError::into_inner).push(made);
+                    kept
+                }
+                Op::Find(key) => {
+                    at = self.interner.find(&self.ids[key as usize]);
+                    if let Some(idx) = at {
+                        self.reads_back(key, idx);
+                    }
+                    at.is_some()
+                }
+            });
+            at
+        }
+
+        fn reads_back(&self, key: u8, idx: Idx<Counted>) {
+            assert_eq!(self.interner.get(idx).key, key, "an index reads back its value");
+            assert_eq!(self.interner.content(idx), self.ids[key as usize], "an index reads back its ID");
+            assert!((idx.raw() as usize) < self.interner.end(), "an index is below `end`");
+        }
+
+        /// Checks the history, then drops the interner: every value made is dropped once.
+        fn finish(model: Arc<Model>) {
+            model.history.check(Set::default());
+            let Ok(model) = Arc::try_unwrap(model) else { panic!("a model thread outlived its join") };
+            let made = model.made.into_inner().unwrap_or_else(PoisonError::into_inner);
+            drop(model.interner);
+            assert!(made.iter().all(|it| it.load(Relaxed)), "every value made is dropped once");
+        }
+    }
+
+    /// Two keys of one shard and one tag: a probe for either compares the other's ID, read from
+    /// a slot only its published entry orders, and both take indices from the shard's one block.
+    #[test]
+    fn model_one_shard_colliding_tags() {
+        blaze_check::model(|| {
+            let model = Model::new([(0, 5), (0, 5)]);
+            let other = {
+                let model = model.clone();
+                thread::spawn(move || [Op::Intern(0), Op::Intern(1)].map(|op| model.run(op)))
+            };
+            let one = model.run(Op::Intern(1));
+            let zero = model.run(Op::Find(0));
+            let [zero_at, one_at] = other.join().unwrap();
+            assert_eq!(one, one_at, "one index for key 1");
+            if zero.is_some() {
+                assert_eq!(zero, zero_at, "key 0 found at its index");
+            }
+            assert_ne!(zero_at, one_at, "two keys, two indices");
+            assert!([zero_at, one_at].iter().flatten().all(|idx| idx.raw() < BLOCK), "one block");
+            assert_eq!(model.interner.len(), 2);
+            Model::finish(model);
+        });
+    }
+
+    /// Keys of two shards: each shard claims its own block from the shared counter, and their
+    /// indices fall in two chunks, each made by whichever thread needs it first.
+    #[test]
+    fn model_two_shards_claim_their_own_blocks() {
+        blaze_check::model(|| {
+            let model = Model::new([(0, 1), (1, 1)]);
+            let other = {
+                let model = model.clone();
+                thread::spawn(move || [Op::Intern(0), Op::Find(1)].map(|op| model.run(op)))
+            };
+            let one = model.run(Op::Intern(1)).expect("an intern's index");
+            let zero = model.run(Op::Find(0));
+            let [zero_at, one_found] = other.join().unwrap();
+            let zero_at = zero_at.expect("an intern's index");
+            if let Some(zero) = zero {
+                assert_eq!(zero, zero_at, "key 0 found at its index");
+            }
+            if let Some(found) = one_found {
+                assert_eq!(found, one, "key 1 found at its index");
+            }
+            assert_ne!(zero_at.raw() / BLOCK, one.raw() / BLOCK, "a block per shard");
+            assert_eq!(model.interner.end(), 2 * BLOCK as usize);
+            assert_eq!(model.interner.len(), 2);
+            Model::finish(model);
+        });
+    }
+
+    /// Eight keys fill a shard's first table to half, so whichever of 8 and 9 goes in first
+    /// grows it, while the other thread finds a key from before the growth and races the insert.
+    #[test]
+    fn model_growth_keeps_every_index() {
+        blaze_check::model(|| {
+            let model = Model::new((0..10).map(|tag| (0, tag)));
+            let before: Vec<Option<Idx<Counted>>> = (0..8).map(|key| model.run(Op::Intern(key))).collect();
+            let other = {
+                let model = model.clone();
+                thread::spawn(move || [Op::Intern(8), Op::Intern(9)].map(|op| model.run(op)))
+            };
+            let zero = model.run(Op::Find(0));
+            let nine = model.run(Op::Intern(9));
+            let eight = model.run(Op::Find(8));
+            let [eight_at, nine_at] = other.join().unwrap();
+            assert_eq!(zero, before[0], "a key from before the growth is found at its index");
+            assert_eq!(nine, nine_at, "one index for key 9");
+            if eight.is_some() {
+                assert_eq!(eight, eight_at, "key 8 found at its index");
+            }
+            let all: Vec<Option<Idx<Counted>>> = before.iter().copied().chain([eight_at, nine_at]).collect();
+            for (key, &idx) in all.iter().enumerate() {
+                assert_eq!(model.interner.find(&model.ids[key]), idx, "key {key} kept across the growth");
+            }
+            assert_eq!(model.interner.len(), 10);
+            Model::finish(model);
+        });
+    }
+
+    /// A domain's key, which every hash of it uses: the same however its first two uses race.
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct Derived(ContentId);
+
+    impl Spec for Derived {
+        type Op = ();
+        type Ret = ContentId;
+
+        fn apply(&mut self, (): &()) -> ContentId {
+            self.0
+        }
+    }
+
+    #[test]
+    fn model_a_domain_key_is_derived_once() {
+        const NAME: &str = "blaze v2 model 1";
+        blaze_check::model(|| {
+            let mut expected = blake3::Hasher::new_derive_key(NAME);
+            expected.update(b"x");
+            let expected = ContentId(*expected.finalize().as_bytes());
+            let domain = Arc::new(Domain::new(NAME));
+            let history = Arc::new(History::<Derived>::new());
+            let other = {
+                let (domain, history) = (domain.clone(), history.clone());
+                thread::spawn(move || history.record((), |()| ContentId::of_domain(&domain, b"x")))
+            };
+            history.record((), |()| ContentId::of_domain(&domain, b"x"));
+            other.join().unwrap();
+            history.check(Derived(expected));
+        });
+    }
+
+    /// Two domains whose names probe from one slot, derived at once: one sets the slot, the
+    /// other reads it, sees another name and sets the next, and each gets its own key.
+    #[test]
+    fn model_colliding_domains_keep_their_own_keys() {
+        let first = "blaze v2 model a 1";
+        let home = name_hash(first) & (DOMAIN_SLOTS - 1);
+        let second: &'static str = (0..)
+            .map(|n| &*Box::leak(format!("blaze v2 model b {n}").into_boxed_str()))
+            .find(|name| name_hash(name) & (DOMAIN_SLOTS - 1) == home)
+            .expect("a name of the same home slot");
+        blaze_check::model(move || {
+            let slots: Arc<DomainKeys> = Arc::new([const { OnceLock::new() }; DOMAIN_SLOTS]);
+            let other = {
+                let slots = slots.clone();
+                thread::spawn(move || *context_key_in(&slots, second))
+            };
+            let one = *context_key_in(&slots, first);
+            let two = other.join().unwrap();
+            assert_eq!(one, hazmat::hash_derive_key_context(first));
+            assert_eq!(two, hazmat::hash_derive_key_context(second));
+            assert_eq!(*context_key_in(&slots, first), one, "found again in its slot");
+            assert_eq!(*context_key_in(&slots, second), two, "found again in its slot");
+        });
     }
 }

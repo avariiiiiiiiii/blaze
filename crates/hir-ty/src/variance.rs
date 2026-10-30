@@ -254,7 +254,7 @@ impl<'db> Context<'db> {
             TyKind::Adt(def, args) => {
                 self.add_constraints_from_args(def.def_id().into(), args, variance);
             }
-            TyKind::Alias(alias) => {
+            TyKind::Alias(_, alias) => {
                 // FIXME: Probably not correct wrt. opaques.
                 self.add_constraints_from_invariant_args(alias.args);
             }
@@ -359,7 +359,7 @@ impl<'db> Context<'db> {
     /// in a context with ambient variance `variance`
     fn add_constraints_from_const(&mut self, c: Const<'db>) {
         match c.kind() {
-            ConstKind::Unevaluated(c) => self.add_constraints_from_invariant_args(c.args),
+            ConstKind::Alias(_, c) => self.add_constraints_from_invariant_args(c.args),
             _ => {}
         }
     }

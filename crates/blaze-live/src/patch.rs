@@ -172,9 +172,8 @@ pub struct PatchRef<'a> {
 impl PatchRef<'_> {
     /// The size of its message.
     pub fn encoded_len(&self) -> usize {
-        let writes = |writes: &[(u64, &[u8])]| -> usize {
-            writes.iter().map(|it| 16 + it.1.len()).sum()
-        };
+        let writes =
+            |writes: &[(u64, &[u8])]| -> usize { writes.iter().map(|it| 16 + it.1.len()).sum() };
         HEADER
             + 16
             + 8
@@ -754,6 +753,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn descriptor_round_trips_and_is_its_layout() {
         let descriptor = descriptor();
         let bytes = descriptor.encode();

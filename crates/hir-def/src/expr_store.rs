@@ -44,8 +44,10 @@ use crate::{
 
 use self::source_map::{
     BackPushes, BindingPats, ExpressionOnlySourceMap, FormatTemplate, FreezeScratch, IdTable,
-    Move, PendingTemplate, SourceTable,
+    PendingTemplate, SourceTable,
 };
+
+pub(crate) use self::source_map::Move;
 
 pub use self::body::{Body, BodySourceMap};
 pub use self::lower::{
@@ -258,6 +260,11 @@ pub struct ExpressionStoreBuilder {
 
     /// What `finish` builds the back maps in, empty until then.
     freeze: FreezeScratch,
+
+    /// Whether lowering records the source map. Without it lowering pushes to none of the maps
+    /// above, and `finish` gives an empty source map: the store is the same either way, as
+    /// lowering reads the maps only to fill them.
+    record: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -638,7 +645,13 @@ impl ExpressionStoreBuilder {
             expansions,
             diagnostics: Vec::new(),
             freeze,
+            record: true,
         }
+    }
+
+    /// Lowers without recording the source map (see `record`).
+    pub(crate) fn skip_source_map(&mut self) {
+        self.record = false;
     }
 
     #[inline]
@@ -926,6 +939,7 @@ impl ExpressionStoreBuilder {
             expansions,
             diagnostics,
             freeze,
+            record,
         } = self;
         debug_assert_eq!(lists.stacked(), None, "lowering left a list on this stack");
         let mut scratch = Scratch {
@@ -948,39 +962,73 @@ impl ExpressionStoreBuilder {
         };
         let columns = scratch.columns.freeze_into();
         let types = scratch.types.freeze_into();
-        // Each back map is dense over its arena, so a source map can be checked on its own.
-        let freeze = &mut scratch.freeze;
-        let expr_map_back = scratch.expr_map_back.freeze(columns.expr_count(), freeze);
-        let pat_map_back = scratch.pat_map_back.freeze(columns.pat_count(), freeze);
-        let label_map_back = scratch.label_map_back.freeze(labels.len(), freeze);
-        let types_map_back = scratch.types_map_back.freeze(types.len(), freeze);
-        let lifetime_map_back = scratch.lifetime_map_back.freeze(lifetimes.len(), freeze);
-        let binding_definitions =
-            BindingPats::from_pushed(&mut scratch.binding_definitions, bindings.len());
-        let expr_map = SourceTable::from_pushed(&mut scratch.expr_map);
-        let pat_map = SourceTable::from_pushed(&mut scratch.pat_map);
-        let label_map = SourceTable::from_pushed(&mut scratch.label_map);
-        let types_map = SourceTable::from_pushed(&mut scratch.types_map);
-        let lifetime_map = SourceTable::from_pushed(&mut scratch.lifetime_map);
-        let expansions = SourceTable::from_pushed(&mut scratch.expansions);
+        let has_exprs = !columns.is_empty() || !labels.is_empty() || !bindings.is_empty();
+        let source_map = match record {
+            false => ExpressionStoreSourceMap::default(),
+            true => {
+                // Each back map is dense over its arena, so a source map can be checked on its
+                // own.
+                let freeze = &mut scratch.freeze;
+                let expr_map_back = scratch.expr_map_back.freeze(columns.expr_count(), freeze);
+                let pat_map_back = scratch.pat_map_back.freeze(columns.pat_count(), freeze);
+                let label_map_back = scratch.label_map_back.freeze(labels.len(), freeze);
+                let types_map_back = scratch.types_map_back.freeze(types.len(), freeze);
+                let lifetime_map_back = scratch.lifetime_map_back.freeze(lifetimes.len(), freeze);
+                let binding_definitions =
+                    BindingPats::from_pushed(&mut scratch.binding_definitions, bindings.len());
+                let expr_map = SourceTable::from_pushed(&mut scratch.expr_map);
+                let pat_map = SourceTable::from_pushed(&mut scratch.pat_map);
+                let label_map = SourceTable::from_pushed(&mut scratch.label_map);
+                let types_map = SourceTable::from_pushed(&mut scratch.types_map);
+                let lifetime_map = SourceTable::from_pushed(&mut scratch.lifetime_map);
+                let expansions = SourceTable::from_pushed(&mut scratch.expansions);
+                let field_map_back = IdTable::from_pushed(field_map_back);
+                let pat_field_map_back = IdTable::from_pushed(pat_field_map_back);
+                let template_map = template_map.map(|template| {
+                    let FormatTemplate {
+                        format_args_to_captures,
+                        asm_to_captures,
+                        implicit_capture_to_source,
+                    } = *template;
+                    Box::new(FormatTemplate {
+                        format_args_to_captures: IdTable::from_pushed(format_args_to_captures),
+                        asm_to_captures: IdTable::from_pushed(asm_to_captures),
+                        implicit_capture_to_source: IdTable::from_pushed(
+                            implicit_capture_to_source,
+                        ),
+                    })
+                });
+                let expr_only = (has_exprs || !expansions.is_empty() || !diagnostics.is_empty())
+                    .then(|| {
+                        Box::new(ExpressionOnlySourceMap {
+                            expr_map,
+                            expr_map_back,
+                            pat_map,
+                            pat_map_back,
+                            label_map,
+                            label_map_back,
+                            binding_definitions,
+                            field_map_back,
+                            pat_field_map_back,
+                            template_map,
+                            expansions,
+                            diagnostics: ThinVec::from_iter(diagnostics),
+                        })
+                    });
+                ExpressionStoreSourceMap {
+                    expr_only,
+                    types_map_back,
+                    types_map,
+                    lifetime_map_back,
+                    lifetime_map,
+                }
+            }
+        };
         scratch.give();
 
         labels.shrink_to_fit();
         bindings.shrink_to_fit();
         lifetimes.shrink_to_fit();
-        let field_map_back = IdTable::from_pushed(field_map_back);
-        let pat_field_map_back = IdTable::from_pushed(pat_field_map_back);
-        let template_map = template_map.map(|template| {
-            let FormatTemplate { format_args_to_captures, asm_to_captures, implicit_capture_to_source } =
-                *template;
-            Box::new(FormatTemplate {
-                format_args_to_captures: IdTable::from_pushed(format_args_to_captures),
-                asm_to_captures: IdTable::from_pushed(asm_to_captures),
-                implicit_capture_to_source: IdTable::from_pushed(implicit_capture_to_source),
-            })
-        });
-
-        let has_exprs = !columns.is_empty() || !labels.is_empty() || !bindings.is_empty();
 
         let store = {
             let expr_only = if has_exprs {
@@ -1021,34 +1069,6 @@ impl ExpressionStoreBuilder {
             };
             let type_hygiene = (!type_hygiene.is_empty()).then(|| type_hygiene.into_boxed_slice());
             ExpressionStore { expr_only, types, lifetimes, type_hygiene }
-        };
-
-        let source_map = {
-            let expr_only = if has_exprs || !expansions.is_empty() || !diagnostics.is_empty() {
-                Some(Box::new(ExpressionOnlySourceMap {
-                    expr_map,
-                    expr_map_back,
-                    pat_map,
-                    pat_map_back,
-                    label_map,
-                    label_map_back,
-                    binding_definitions,
-                    field_map_back,
-                    pat_field_map_back,
-                    template_map,
-                    expansions,
-                    diagnostics: ThinVec::from_iter(diagnostics),
-                }))
-            } else {
-                None
-            };
-            ExpressionStoreSourceMap {
-                expr_only,
-                types_map_back,
-                types_map,
-                lifetime_map_back,
-                lifetime_map,
-            }
         };
 
         (store, source_map)

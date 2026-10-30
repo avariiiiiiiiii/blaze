@@ -1,4 +1,5 @@
 use base_db::target::TargetData;
+use blaze_hashcons::Interned;
 use either::Either;
 use hir_def::{
     DefWithBodyId, HasModule,
@@ -12,12 +13,11 @@ use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::GenericArgs as _;
 use syntax::ToSmolStr;
 use test_fixture::WithFixture;
-use triomphe::Arc;
 
 use crate::{
     InferenceResult, ParamEnvAndCrate,
     db::HirDatabase,
-    layout::{Layout, LayoutError},
+    layout::{InternedLayout, LayoutError},
     next_solver::{DbInterner, GenericArgs},
     setup_tracing,
     test_db::TestDB,
@@ -38,7 +38,7 @@ fn current_machine_target_data() -> TargetData {
 fn eval_goal(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     minicore: &str,
-) -> Result<Arc<Layout>, LayoutError> {
+) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     let _tracing = setup_tracing();
     let target_data = current_machine_target_data();
     let target_data_layout = target_data.data_layout;
@@ -109,7 +109,7 @@ fn eval_goal(
 fn eval_expr(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     minicore: &str,
-) -> Result<Arc<Layout>, LayoutError> {
+) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     let _tracing = setup_tracing();
     let target_data = current_machine_target_data();
     let target_data_layout = target_data.data_layout;

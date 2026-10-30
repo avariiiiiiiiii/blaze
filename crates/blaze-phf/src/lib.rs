@@ -16,7 +16,7 @@
 //!
 //! ```
 //! const KEYWORDS: &[&str] = &["fn", "let", "match"];
-//! blaze_phf::phf_table!(static TABLE = KEYWORDS);
+//! blaze_phf::phf_table!(static TABLE = KEYWORDS;);
 //! assert_eq!(TABLE.get("let"), Some(1));
 //! assert_eq!(TABLE.get("lot"), None);
 //! ```
@@ -268,7 +268,7 @@ impl<const SLOTS: usize, const BUCKETS: usize> Phf<SLOTS, BUCKETS> {
 /// constant expression) of type `&'static [&'static str]`.
 #[macro_export]
 macro_rules! phf_table {
-    ($(#[$attr:meta])* $vis:vis static $name:ident = $keys:expr;) => {
+    ($(#[$attr:meta])* $vis:vis static $name:ident = $keys:expr $(;)?) => {
         $(#[$attr])*
         $vis static $name: $crate::Phf<
             { $crate::slots($keys.len()) },
@@ -287,11 +287,11 @@ mod tests {
         "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super",
         "trait", "true", "try", "type", "unsafe", "use", "where", "while", "yield", "gen",
     ];
-    crate::phf_table!(static TABLE = KEYWORDS);
+    crate::phf_table!(static TABLE = KEYWORDS;);
     const EMPTY_KEYS: &[&str] = &[];
-    crate::phf_table!(static NONE = EMPTY_KEYS);
+    crate::phf_table!(static NONE = EMPTY_KEYS;);
     const ONE_KEY: &[&str] = &[""];
-    crate::phf_table!(static ONE = ONE_KEY);
+    crate::phf_table!(static ONE = ONE_KEY;);
 
     /// Every key lands on its own slot, and nothing else is found.
     fn check<const S: usize, const B: usize>(table: &Phf<S, B>, others: &[&str]) {

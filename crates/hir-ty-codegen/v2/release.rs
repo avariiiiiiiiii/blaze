@@ -237,8 +237,10 @@ pub(crate) fn emit(
     for (callee, params) in &decided.dead {
         given.dead.extend(by_key(places, refs, *callee).into_iter().map(|it| (it, params.clone())));
     }
-    let code = llvm::compile(&mut pending.wants, &own, &pending.func.signature, &linked, &given, optimization)
-        .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))?;
+    let signature = &pending.func.signature;
+    let (code, covered) =
+        llvm::compile(&mut pending.wants, &own, signature, &linked, &given, optimization, &spec.sanitize)
+            .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))?;
     placed_since(unit, &pending.wants, places, refs)?;
     let code = crate::backend::pad(code).map_err(|why| failed(unit, why))?;
     let Built::Ir(pending) = &function.code else {
@@ -248,7 +250,16 @@ pub(crate) fn emit(
     inlined.sort_unstable();
     inlined.dedup();
     emitted.function.inlined = inlined;
+    emitted.function.coverage = coverage(spec, covered);
     Ok(emitted)
+}
+
+/// What SanitizerCoverage made for a function, as its compiled function has it: `None` where
+/// the build has no SanitizerCoverage.
+#[cfg(feature = "llvm")]
+fn coverage(spec: &Spec, covered: crate::llvm::sanitize::Covered) -> Option<blaze_codegen::Covered> {
+    let crate::llvm::sanitize::Covered { arrays: [counters, flags, guards], pcs } = covered;
+    spec.sanitize.coverage.is_on().then_some(blaze_codegen::Covered { counters, flags, guards, pcs })
 }
 
 /// `code` against `refs`, by `function`'s places, as the Cranelift backend converts its own
@@ -328,8 +339,18 @@ fn prelinked(
         matches!(target, Some(Target::Function(_) | Target::Direct(_)))
     };
     let debug = spec.debuginfo != DebugInfo::None;
-    llvm::prelink(&pending.wants, &pending.func, &pending.named, function.hint, debug, optimization, &instances)
-        .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))
+    llvm::prelink(
+        &pending.wants,
+        &pending.func,
+        &pending.named,
+        function.hint,
+        debug,
+        optimization,
+        &instances,
+        &spec.sanitize,
+        function.unsanitized,
+    )
+    .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))
 }
 
 /// What the function request `request` is in the build: the instance's key of a function
@@ -673,6 +694,7 @@ mod tests {
             debuginfo: DebugInfo::None,
             fold: false,
             policy: ContentId::default(),
+            sanitize: blaze_codegen::settings::Sanitize::default(),
         };
         assert_eq!(optimization(&unit(), &spec(3)).unwrap().passes, Passes::Aggressive);
         assert_eq!(optimization(&unit(), &spec(2)).unwrap().passes, Passes::Default);

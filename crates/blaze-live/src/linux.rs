@@ -1,7 +1,14 @@
 //! Patches the memory of an ELF program on Linux x86-64.
+//!
+//! A patch's code and data are mapped in the room behind the image and written before
+//! anything reaches them; its jumps and statics are written over the image with every other
+//! thread stopped ([`stop`], `crate::apply`).
+
+#![allow(unsafe_code)]
+
+mod stop;
 
 use std::{
-    collections::HashMap,
     ffi::c_void,
     os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
@@ -11,6 +18,7 @@ use std::{
 
 use crate::{
     Outcome,
+    apply::{self, Broke, Failed, Overwrites, Plan, Step},
     format::{self, Body, Code, Patch, Process},
 };
 
@@ -50,8 +58,8 @@ pub(crate) struct Live {
     slide: u64,
     process: Process,
     patches: Receiver<(Patch, Instant)>,
-    originals: HashMap<u64, Vec<u8>>,
-    written: HashMap<u64, usize>,
+    overwrites: Overwrites,
+    threads: stop::Threads,
     sequence: u64,
     /// The statics new since the executable that a patch gave a first value, by address, and
     /// the pages of the room they are in.
@@ -75,6 +83,7 @@ impl Live {
             .mode(0o700)
             .create(&dir)
             .map_err(|it| format!("{}: {it}", dir.display()))?;
+        let threads = stop::Threads::new()?;
         let (next, end) = reserve(&image)?;
         let started = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -86,8 +95,8 @@ impl Live {
             id: image.id,
             slide: image.slide,
             process,
-            originals: HashMap::new(),
-            written: HashMap::new(),
+            overwrites: Overwrites::default(),
+            threads,
             sequence: 0,
             lasting: std::collections::HashSet::new(),
             lasting_pages: std::collections::HashSet::new(),
@@ -149,45 +158,58 @@ impl Live {
                         took: start.elapsed(),
                         waited,
                     },
-                    Err(why) => Outcome::Declined(why),
+                    Err(Failed::Declined(why)) => Outcome::Declined(why),
+                    Err(Failed::Restart(why)) => Outcome::Restart(why),
                 }
             }
         })
     }
 
-    fn apply(&mut self, code: &Code) -> Result<(), String> {
+    fn apply(&mut self, code: &Code) -> Result<(), Failed> {
+        // Every write over the executable is checked, and planned, before anything is mapped.
+        apply::in_image(&code.writes, self.slide, &self.image)?;
+        let plan = self.overwrites.plan(code, self.slide)?;
+        let protections = protections(&plan)?;
+        let mapped = code.base.checked_add(self.slide).ok_or("a patch past the end of memory")?;
+        // From here the room up to `end` is used, whatever becomes of the patch: jumps or the
+        // unwinder may reach what is mapped there.
+        let end = apply::claim(&mut self.process, code, PAGE)?;
+        let len = end - code.base;
+        let applied = (if len == 0 { Ok(()) } else { self.map(code, mapped, len) })
+            .and_then(|()| self.first_values(code, end))
+            .map_err(Failed::from)
+            .and_then(|()| self.redirect(&plan, &protections));
+        let published = self.publish().map_err(Failed::from);
+        applied.and(published)
+    }
+
+    /// Writes the patch's jumps and statics, and puts back what the last patch wrote and this
+    /// one does not, with every other thread stopped and none inside the bytes written.
+    fn redirect(&mut self, plan: &Plan, protections: &[i32]) -> Result<(), Failed> {
+        let read = |address: u64, into: &mut [u8]| {
+            // SAFETY: the bytes are a step's, in one readable mapping of the executable's image
+            // (`apply::in_image`, `protections`), mapped as long as the process runs; every
+            // other thread is stopped, so nothing writes them meanwhile, and `into` is the
+            // originals' own buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(address as *const u8, into.as_mut_ptr(), into.len())
+            }
+        };
+        let write = |n: usize, step: &Step| put(step, protections[n]);
+        apply::write_stopped(&mut self.threads, &mut self.overwrites, plan, false, read, write)
+    }
+
+    /// Maps the patch's code and data, `len` bytes at `mapped` in the room `apply` claimed,
+    /// and writes them.
+    fn map(&self, code: &Code, mapped: u64, len: u64) -> Result<(), String> {
         let text_len = code.text.len() as u64;
         let data_len = code.data.len() as u64;
-        let len = (text_len + data_len).next_multiple_of(PAGE);
-        let end = code.base.checked_add(len).ok_or("patch address overflow")?;
-        if code.base < self.process.next || end > self.process.end {
-            return Err(format!(
-                "laid out at {:#x}, where this program has no room: build again",
-                code.base
-            ));
-        }
-        if !(code.base.is_multiple_of(PAGE) && text_len.is_multiple_of(PAGE)) {
-            return Err("a patch whose code is not whole pages".to_owned());
-        }
-        let mapped = code.base.checked_add(self.slide).ok_or("patch address overflow")?;
-        // Every write over the executable is checked before anything is mapped or written.
-        for write in &code.writes {
-            let address = write.address.checked_add(self.slide).ok_or("patch address overflow")?;
-            let range = address..address.saturating_add(write.bytes.len() as u64);
-            if range.start < self.image.start || range.end > self.image.end {
-                return Err(format!(
-                    "a write at {:#x}..{:#x}, outside the executable at {:#x}..{:#x}",
-                    range.start, range.end, self.image.start, self.image.end
-                ));
-            }
-        }
         // SAFETY: MAP_FIXED maps fresh read-write pages over `len` bytes at the page-aligned
-        // `mapped` (`code.base` whole pages, checked), all inside the room `reserve` set aside
-        // (`process.next..process.end`, checked above): nothing below `next` (earlier
-        // patches' code, which threads may run) or above `end` (statics of `first_values`)
-        // is replaced, and no thread jumps here before the writes below. The room is never
-        // unmapped, so the patch lives as long as the process; a failed apply moves `next`
-        // past it all the same (below), so no later patch maps over it.
+        // `mapped` (`code.base` whole pages), all inside the room `reserve` set aside and above
+        // every earlier patch (`apply::claim` checked `process.next..process.end` and moved
+        // `next` past it): nothing below (earlier patches' code, which threads may run) or above
+        // (statics of `first_values`) is replaced, and no thread jumps here before
+        // `redirect`. The room is never unmapped, and no later patch is laid out here.
         let result = unsafe {
             mmap(
                 mapped as *mut c_void,
@@ -204,28 +226,14 @@ impl Live {
                 std::io::Error::last_os_error()
             ));
         }
-        let applied = self.fill(code, mapped, end);
-        // From the mapping on, jumps or the unwinder may reach this memory, done or not: the
-        // room up to `end` is used either way.
-        self.process.next = end;
-        let published = self.publish();
-        applied.and(published)
-    }
-
-    /// Writes a mapped patch's code and data, its statics' first values and its jumps.
-    fn fill(&mut self, code: &Code, mapped: u64, end: u64) -> Result<(), String> {
-        let text_len = code.text.len() as u64;
-        let data_len = code.data.len() as u64;
-        let len = (text_len + data_len).next_multiple_of(PAGE);
-        // SAFETY: `mapped..mapped + len` was mapped read-write by `apply` (checked to be at
-        // `mapped`), page-aligned so any `u8` alignment holds, and nothing else refers to it
-        // yet: no jump reaches it before the writes below; the slice is not written after the
-        // text is made read-and-run.
+        // SAFETY: `mapped..mapped + len` was just mapped read-write, page-aligned so any `u8`
+        // alignment holds, and nothing else refers to it yet: no jump reaches it before
+        // `redirect`; the slice is not written after the text is made read-and-run.
         let memory = unsafe { std::slice::from_raw_parts_mut(mapped as *mut u8, len as usize) };
         memory[..code.text.len()].copy_from_slice(&code.text);
         memory[code.text.len()..code.text.len() + code.data.len()].copy_from_slice(&code.data);
         for &pointer in &code.pointers {
-            slide_at(memory, pointer as usize, self.slide)?;
+            apply::slide_at(memory, pointer, self.slide)?;
         }
         if text_len != 0
             // SAFETY: `text_len` bytes (whole pages, checked) at the page-aligned start of the
@@ -252,47 +260,7 @@ impl Live {
         {
             return Err(format!("making patch data writable: {}", std::io::Error::last_os_error()));
         }
-        register_frames(&memory[..code.text.len()], code.frames)?;
-        self.first_values(code, end)?;
-
-        let kept: std::collections::HashSet<u64> =
-            code.writes.iter().map(|it| it.address).collect();
-        let undone: Vec<u64> =
-            self.written.keys().copied().filter(|it| !kept.contains(it)).collect();
-        for address in undone {
-            let original = self.originals[&address].clone();
-            self.write(address, &original)?;
-            self.written.remove(&address);
-        }
-        for write in &code.writes {
-            let mut bytes = write.bytes.clone();
-            for &pointer in &write.pointers {
-                slide_at(&mut bytes, pointer as usize, self.slide)?;
-            }
-            let address = write.address + self.slide;
-            let original = self.originals.entry(address).or_default();
-            if original.len() < bytes.len() {
-                let start = original.len();
-                // SAFETY: `address..address + bytes.len()` is in the executable's image
-                // (`apply` checked it against `image`), mapped readable as long as the process
-                // runs; only this thread writes code there. A static another thread writes
-                // meanwhile races this read (the rule `Live::poll` gives the program).
-                let more = unsafe {
-                    std::slice::from_raw_parts(
-                        (address + start as u64) as *const u8,
-                        bytes.len() - start,
-                    )
-                };
-                original.extend_from_slice(more);
-            }
-            let last = self.written.get(&address).copied().unwrap_or(0);
-            if last > bytes.len() {
-                bytes.extend_from_slice(&original[bytes.len()..last]);
-            }
-            self.write(address, &bytes)?;
-            self.written.insert(address, write.bytes.len());
-        }
-        Ok(())
+        register_frames(&memory[..code.text.len()], code.frames)
     }
 
     /// Writes the first value of each static new since the executable that the patch refers
@@ -338,7 +306,7 @@ impl Live {
             }
             let mut bytes = value.bytes.clone();
             for &pointer in &value.pointers {
-                slide_at(&mut bytes, pointer as usize, self.slide)?;
+                apply::slide_at(&mut bytes, pointer, self.slide)?;
             }
             // SAFETY: `address..last` is in pages mapped read-write just above (or by an earlier
             // patch, in `lasting_pages`); `lasting` says no first value was written here, so no
@@ -351,40 +319,6 @@ impl Live {
         // A daemon started again knows none of them, and places what it has below.
         if let Some(&low) = self.lasting_pages.iter().min() {
             self.process.end = self.process.end.min(low - self.slide);
-        }
-        Ok(())
-    }
-
-    fn write(&self, address: u64, bytes: &[u8]) -> Result<(), String> {
-        let page = address & !(PAGE - 1);
-        let end = (address + bytes.len() as u64).next_multiple_of(PAGE);
-        let len = end - page;
-        let old = protection_at(address).unwrap_or(PROT_READ | PROT_EXEC);
-        // SAFETY: `page..end` covers `address..address + bytes.len()`, which `apply` checked
-        // is in the executable's image, mapped as long as the process runs. Adding write keeps
-        // read and run, so threads running these pages go on; `old` is put back below.
-        if unsafe {
-            mprotect(page as *mut c_void, len as usize, PROT_READ | PROT_WRITE | PROT_EXEC)
-        } != 0
-        {
-            return Err(format!(
-                "making {address:#x} writable: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: the bytes are in the image (checked by `apply`) and writable (just above);
-        // `bytes` is the caller's own buffer, so they cannot overlap. NOT upheld: a jump is
-        // written over a function's first bytes while other threads may be running them, and
-        // a static while they may read it; v1 relies on x86-64 writes of at most 8 aligned
-        // bytes appearing whole, which the Rust memory model does not promise (the jump-table
-        // design in `slots` never writes over code a thread can be in).
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
-        // SAFETY: the same pages as the first `mprotect`, given back the protection they had.
-        if unsafe { mprotect(page as *mut c_void, len as usize, old) } != 0 {
-            return Err(format!(
-                "restoring protection at {address:#x}: {}",
-                std::io::Error::last_os_error()
-            ));
         }
         Ok(())
     }
@@ -629,70 +563,94 @@ fn watch(dir: &Path, id: [u8; 16]) -> Receiver<(Patch, Instant)> {
     receive
 }
 
-fn slide_at(bytes: &mut [u8], at: usize, slide: u64) -> Result<(), String> {
-    let field = bytes.get_mut(at..at + 8).ok_or("an address past the end of the patch")?;
-    let value =
-        u64::from_le_bytes(field.try_into().map_err(|_| "an address shorter than 8 bytes")?);
-    field.copy_from_slice(&value.wrapping_add(slide).to_le_bytes());
-    Ok(())
-}
-
-fn protection_at(address: u64) -> Result<i32, String> {
+/// The protection of the mapping each step of `plan` is in, from one read of
+/// /proc/self/maps before the threads are stopped: each step checked to be in one readable
+/// mapping, so its pages, made writable for it, are given back one protection.
+fn protections(plan: &Plan) -> Result<Vec<i32>, String> {
     let maps = std::fs::read_to_string("/proc/self/maps")
         .map_err(|it| format!("reading process maps: {it}"))?;
+    let mut mapped = Vec::new();
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
-        let Some(range) = fields.next() else { continue };
+        let (Some(range), Some(perms)) = (fields.next(), fields.next()) else { continue };
         let Some((start, end)) = range.split_once('-') else { continue };
-        let start =
-            u64::from_str_radix(start, 16).map_err(|_| "invalid process map start".to_owned())?;
-        let end = u64::from_str_radix(end, 16).map_err(|_| "invalid process map end".to_owned())?;
-        if (start..end).contains(&address) {
-            let perms = fields.next().unwrap_or("").as_bytes();
-            return Ok((if perms.first() == Some(&b'r') { PROT_READ } else { 0 })
-                | (if perms.get(1) == Some(&b'w') { PROT_WRITE } else { 0 })
-                | (if perms.get(2) == Some(&b'x') { PROT_EXEC } else { 0 }));
-        }
+        let (Ok(start), Ok(end)) = (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
+        else {
+            return Err(format!("/proc/self/maps has a line {line:?}"));
+        };
+        let perms = perms.as_bytes();
+        let protection = (if perms.first() == Some(&b'r') { PROT_READ } else { 0 })
+            | (if perms.get(1) == Some(&b'w') { PROT_WRITE } else { 0 })
+            | (if perms.get(2) == Some(&b'x') { PROT_EXEC } else { 0 });
+        mapped.push((start, end, protection));
     }
-    Err(format!("nothing is mapped at {address:#x}"))
+    mapped.sort_unstable();
+    plan.steps
+        .iter()
+        .map(|step| {
+            let end = step.address + step.bytes.len() as u64;
+            let at = mapped.partition_point(|it| it.1 <= step.address);
+            match mapped.get(at) {
+                Some(&(start, until, protection))
+                    if start <= step.address && end <= until && protection & PROT_READ != 0 =>
+                {
+                    Ok(protection)
+                }
+                _ => Err(format!(
+                    "a write at {:#x}..{end:#x}, in no one readable mapping of the executable",
+                    step.address
+                )),
+            }
+        })
+        .collect()
+}
+
+/// Writes `step` over the image, whose pages have `protection`: made writable for the write
+/// if they are not, then given it back. Called with every other thread stopped; it allocates
+/// nothing.
+fn put(step: &Step, protection: i32) -> Result<(), Broke> {
+    let page = step.address & !(PAGE - 1);
+    let len = ((step.address + step.bytes.len() as u64).next_multiple_of(PAGE) - page) as usize;
+    let broke = |what, written| Broke {
+        what,
+        at: step.address,
+        code: i64::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(0)),
+        written,
+    };
+    let writable = protection & PROT_WRITE != 0;
+    // SAFETY: the pages cover the step, in one readable mapping of the executable's image
+    // (`protections`), mapped as long as the process runs. Adding write keeps read and run.
+    if !writable && unsafe { mprotect(page as *mut c_void, len, protection | PROT_WRITE) } != 0 {
+        return Err(broke("making the executable writable", false));
+    }
+    // SAFETY: the bytes are the image's and writable now; every other thread is stopped and
+    // none inside them (`apply::write_stopped`), so nothing runs, reads or writes them while
+    // they are written, and a thread let go fetches them after `cpuid` (`stop`). `bytes` is
+    // the plan's own buffer.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            step.bytes.as_ptr(),
+            step.address as *mut u8,
+            step.bytes.len(),
+        )
+    };
+    // SAFETY: the same pages, given back the protection their mapping has.
+    if !writable && unsafe { mprotect(page as *mut c_void, len, protection) } != 0 {
+        return Err(broke("protecting the executable again", true));
+    }
+    Ok(())
 }
 
 /// Registers the patch's `.eh_frame` with the unwinder: libgcc's `__register_frame` (and LLVM's
 /// libunwind on ELF) takes the start of a run of CIEs and FDEs ending in a zero length, so the
 /// run is registered once, after its end is found in `text`: in the section, or in the four
 /// bytes right after it.
-fn register_frames(text: &[u8], (start, len): (u64, u64)) -> Result<(), String> {
-    if len == 0 {
-        return Ok(());
-    }
-    let start = usize::try_from(start).map_err(|_| "unwind tables past the end of the patch")?;
-    let end = usize::try_from(len)
-        .ok()
-        .and_then(|len| start.checked_add(len))
-        .filter(|&end| end <= text.len())
-        .ok_or("unwind tables past the end of the patch")?;
-    let mut at = start;
-    loop {
-        let length = text
-            .get(at..at + 4)
-            .filter(|_| at <= end)
-            .ok_or("unwind entries with no zero length ending them in the patch")?;
-        let length = u32::from_le_bytes(length.try_into().map_err(|_| "short unwind length")?);
-        if length == 0 {
-            break;
-        }
-        if length == u32::MAX {
-            return Err("64-bit unwind entries, which the patch format has none of".to_owned());
-        }
-        at = (at + 4)
-            .checked_add(length as usize)
-            .filter(|&next| next <= end)
-            .ok_or("unwind entry ends past the patch")?;
-    }
+fn register_frames(text: &[u8], frames: (u64, u64)) -> Result<(), String> {
+    let Some(start) = apply::frame_run(text, frames)? else { return Ok(()) };
     // SAFETY: `text[start..]` is a run of CIEs and FDEs ending in a zero length inside the
-    // patch's text (checked above), which is mapped read-and-run and never written or unmapped
-    // for the rest of the process (`apply` moves `next` past it even when it fails); the
-    // unwinder reads it from now on.
+    // patch's text (`apply::frame_run`), which is mapped read-and-run and never written or
+    // unmapped for the rest of the process (`apply::claim` moved `next` past it before it was
+    // mapped); the unwinder reads it from now on.
     unsafe { __register_frame(text[start..].as_ptr()) };
     Ok(())
 }

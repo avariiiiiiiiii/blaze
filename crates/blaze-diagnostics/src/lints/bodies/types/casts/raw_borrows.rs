@@ -16,7 +16,7 @@ use hir_def::{
 
 use super::{ancestor_in_same_ctxt, can_be_used_for_suggestions, cast_ty_span, expr_span};
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util::path_value},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util::path_value},
     lower::{Found, Phase},
     model::{Applicability, Diag, SuggestionStyle},
 };
@@ -29,6 +29,10 @@ pub(super) struct RawBorrowsViaReferences;
 impl LatePass for RawBorrowsViaReferences {
     fn name(&self) -> &'static str {
         "RawBorrowsViaReferences"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

@@ -8,7 +8,7 @@ mod db;
 use blaze_codegen::{
     Backend,
     backend::FrontRef,
-    settings::{DebugInfo, Panic, Relocation, Spec, Toolchain},
+    settings::{DebugInfo, Panic, Relocation, Sanitize, Spec, Toolchain},
 };
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -157,6 +157,7 @@ fn spec() -> Spec {
         debuginfo: DebugInfo::None,
         fold: false,
         policy: ContentId::default(),
+        sanitize: Sanitize::default(),
     }
 }
 

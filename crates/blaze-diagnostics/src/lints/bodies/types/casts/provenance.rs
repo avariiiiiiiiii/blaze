@@ -15,7 +15,7 @@ use syntax::SyntaxKind;
 
 use super::{can_be_used_for_suggestions, cast_ty_span, expr_span, ty_text};
 use crate::{
-    lints::bodies::{BodyCx, LatePass},
+    lints::bodies::{BodyCx, Hooks, LatePass},
     lower::{Found, Phase},
     model::{Applicability, Diag, SuggestionStyle},
 };
@@ -27,6 +27,10 @@ pub(super) struct ImplicitProvenanceCasts;
 impl LatePass for ImplicitProvenanceCasts {
     fn name(&self) -> &'static str {
         "ImplicitProvenanceCasts"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

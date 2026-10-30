@@ -32,8 +32,8 @@ pub(super) fn fn_ptr(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
     let abi = ty.abi();
     let inputs = fns::inputs(v, ty.param_list().as_ref());
     fns::check_decl(v, node, &inputs, false, Splat::of(abi.as_ref()), out);
-    fns::patterns(&inputs, false, |range, _| {
-        let diag = Diag::error(Some("E0561"), "patterns aren't allowed in function pointer types", v.span(range));
+    fns::patterns(v, &inputs, false, |span, _| {
+        let diag = Diag::error(Some("E0561"), "patterns aren't allowed in function pointer types", span);
         v.emit(out, node, diag);
     });
     if let Some(name) = abi.as_ref().and_then(fns::abi_of) {

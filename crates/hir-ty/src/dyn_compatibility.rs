@@ -11,7 +11,7 @@ use hir_def::{
 };
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
-    AliasTyKind, ClauseKind, PredicatePolarity, TypeSuperVisitable as _, TypeVisitable as _,
+    AliasTyKind, ClausePolarity, ClauseKind, TypeSuperVisitable as _, TypeVisitable as _,
     Upcast, elaborate, inherent::IntoKind,
 };
 use smallvec::SmallVec;
@@ -22,7 +22,7 @@ use crate::{
     lower::GenericPredicates,
     next_solver::{
         AliasTy, Binder, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv, ParamTy,
-        SolverDefId, TraitPredicate, TraitRef, Ty, TypingMode, Unnormalized,
+        SolverDefId, TraitClause, TraitRef, Ty, TypingMode, Unnormalized,
         infer::{
             DbInternerInferExt,
             traits::{Obligation, ObligationCause},
@@ -242,6 +242,7 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
                 rustc_type_ir::TyKind::Param(param) if param.index == 0 => ControlFlow::Break(()),
                 rustc_type_ir::TyKind::Param(_) => ControlFlow::Continue(()),
                 rustc_type_ir::TyKind::Alias(
+                    _,
                     proj @ AliasTy { kind: AliasTyKind::Projection { .. }, .. },
                 ) => match self.allow_self_projection {
                     AllowSelfProjections::Yes => {
@@ -375,9 +376,9 @@ where
         }
 
         // Allow `impl AutoTrait` predicates
-        if let ClauseKind::Trait(TraitPredicate {
+        if let ClauseKind::Trait(TraitClause {
             trait_ref: pred_trait_ref,
-            polarity: PredicatePolarity::Positive,
+            polarity: ClausePolarity::Positive,
         }) = pred
             && let trait_data = TraitSignature::of(db, pred_trait_ref.def_id.0)
             && trait_data.flags.contains(TraitFlags::AUTO)
@@ -485,7 +486,7 @@ fn receiver_for_self_ty<'db>(
             if index == 0 { self_ty.into() } else { mk_param(interner, index, kind) }
         });
 
-    EarlyBinder::bind(receiver_ty).instantiate(interner, args).skip_norm_wip()
+    EarlyBinder::bind(interner, receiver_ty).instantiate(interner, args).skip_norm_wip()
 }
 
 fn contains_illegal_impl_trait_in_trait<'db>(
@@ -501,10 +502,10 @@ fn contains_illegal_impl_trait_in_trait<'db>(
             &mut self,
             ty: <DbInterner<'db> as rustc_type_ir::Interner>::Ty,
         ) -> Self::Result {
-            if let rustc_type_ir::TyKind::Alias(AliasTy {
-                kind: AliasTyKind::Opaque { def_id },
-                ..
-            }) = ty.kind()
+            if let rustc_type_ir::TyKind::Alias(
+                _,
+                AliasTy { kind: AliasTyKind::Opaque { def_id }, .. },
+            ) = ty.kind()
             {
                 self.0.insert(def_id.0);
             }

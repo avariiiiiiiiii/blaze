@@ -75,9 +75,12 @@ aren't generic and belong to their crate.
 ## The prelink and the image
 
 `prelink.rs`, `image.rs`, `table.rs`. blaze-link links the image as a shared output
-(`OutputKind::Shared`, never incremental, never live) at the fixed base `0x2000_0000_0000`. That
-is 32 TiB, inside every 47-bit user address space and far from where every loader puts
-executables, libraries, stacks and heaps. It goes through a hook (`Prelink`,
+(`OutputKind::Shared`, never incremental, never live) at the fixed base `0x40_0000_0000`, the
+start of `prelink::IMAGES`. That window starts where blaze-inproc's `BASES` ends, so it never
+collides with other code memory a run maps. It ends at `0x80_0000_0000`, the top of a 39-bit
+address space (the smallest AArch64 Linux configures), and stays away from where loaders put
+executables, libraries, stacks and heaps. The workspace image is made at a base just past the
+dependency image, so calls between them stay within reach. It goes through a hook (`Prelink`,
 `fastcompile-premap 1`) whose stage runs in parallel, as any full link does. What comes back is
 checked against what was asked:
 
@@ -222,7 +225,7 @@ failed image fails again for its key: no whole link takes its place. Tested:
 ## Limits, each an error naming it
 
 - AArch64 `BL` reaches ±128 MiB. A workspace call into the image across more than that needs
-  the workspace image placed within reach (it is placed right after the image) or a veneer from
+  the workspace image placed within reach (it is made at a base right after the image) or a veneer from
   blaze-link. Without either, blaze-link's range check fails the link; nothing is silently
   redirected.
 - A TpOff reference from the image to a library's thread-local is refused (above).

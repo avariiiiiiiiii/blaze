@@ -56,4 +56,11 @@ impl SyntaxKind {
     pub fn is_delimiter(self) -> bool {
         self.is_l_delimiter() || self.is_r_delimiter()
     }
+
+    /// The text of every identifier [`SyntaxKind::from_keyword`] or
+    /// [`SyntaxKind::from_contextual_keyword`] gives a kind for in some edition: for tables
+    /// that recognize keywords by something other than their text.
+    pub fn keyword_texts() -> impl Iterator<Item = &'static str> {
+        keywords::texts()
+    }
 }

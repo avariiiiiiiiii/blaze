@@ -111,11 +111,33 @@ What each part matches or beats:
 
 - **Keys** are Shake's constructive traces (*Build systems à la carte*), stored content-addressed
   as Bazel's action cache is, but keyed by what was read rather than what was declared. A shape
-  chain makes finding cost one get per distinct set of reads, not per result kept.
-- **Checking inputs** costs one `stat` per path outside every view and nothing inside one: view
-  files come from the query database, which the VFS watcher keeps current (watchman's model). A
-  changed file is hashed once per process, with BLAKE3's SIMD over 64 KiB reads, and never under
-  a lock.
+  chain makes finding cost one get per distinct set of reads, not per result kept. Bazel's
+  action cache checks a digest of declared inputs. We check the actual reads, and as cheaply:
+  - **A hit allocates nothing.** `index::find` reads the shape in place, from bytes borrowed
+    from the store's guard; on Unix a stored name is the path's bytes, with no `PathBuf`.
+  - **Each input is hashed into the result key as it is asked** (`trace::Keyer`). No `Traced`
+    is built and none is encoded.
+  - **The whole environment is merged in order**, from the sorted `Env` that `Inputs::env_all`
+    lends. Its names hash is made on the stack.
+  - **A shape whose directory is gone stops at that directory**, with no further `stat`s.
+  - **What a run is given is hashed once, as it is given** (`Given::part`, `stdin`). A macro's
+    tokens are never copied into the key.
+  - **Behind the hit**, the kept value is decoded once and moved to the caller, not cloned.
+- **Checking inputs** costs one `stat` per path outside every view and nothing inside one.
+  - View files come from the query database, which the VFS watcher keeps current (watchman's
+    model).
+  - A changed file is hashed once per process, with BLAKE3's SIMD over 64 KiB reads, and never
+    under a lock.
+  - A path in a view is named for the database without a copy when it is already
+    `/`-separated.
+  - A directory's entries say what they are from the listing (`d_type`), so only a link costs
+    a `stat`.
+  - A package walk pushes and pops one path buffer.
+- **Where it falls short:**
+  - The `stat` per outside path: watchman and Bazel's `--watchfs` answer from the watcher with
+    no syscall. Request 11 asks vfs for that.
+  - The package walk of a script keyed by its whole package: red-green revalidation makes it
+    O(1) when nothing changed. Request 10 asks db for a tree hash query.
 - **Tests** fork from a server per binary, as AFL's fork server does: 0.1 to 0.5 ms a test on
   Linux, against the few milliseconds of spawning one process per test as nextest does. One
   global queue runs the longest first across every binary.

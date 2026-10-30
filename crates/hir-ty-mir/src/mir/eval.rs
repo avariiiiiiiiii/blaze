@@ -64,8 +64,12 @@ use super::{
 };
 use super::{Budget, IsSigned, MirEvalError, VTableMap, pad16};
 
+mod hooks;
 pub mod machine;
 mod shim;
+
+use hooks::Hooks;
+use machine::{Access, Machine, MemKind, Plain, Ptr, RetagMode, Shadow, Site, TypedCx};
 
 macro_rules! from_bytes {
     // A `usize` of the target, which is as wide as what holds it.
@@ -179,11 +183,14 @@ enum MirOrDynIndex<'db> {
 }
 
 /// A stack or heap allocation: where it starts, its size, and what its start is a multiple of.
+/// A local of the stack is `tracked` while the machine has it allocated: from the frame's
+/// start or its `StorageLive` to its `StorageDead` or the frame's end.
 #[derive(Debug, Clone, Copy)]
 struct Allocated {
     start: usize,
     size: usize,
     align: usize,
+    tracked: bool,
 }
 
 /// What made a block of the evaluation's heap, which says who may free it and whether the
@@ -199,6 +206,16 @@ enum Origin {
     /// `const_allocate`, freed by `const_deallocate`. A constant's value may point to it once
     /// `const_make_global` has made it global.
     ConstHeap { global: bool },
+}
+
+impl Origin {
+    fn kind(self) -> MemKind {
+        match self {
+            Origin::Evaluator => MemKind::Global,
+            Origin::Allocator => MemKind::Rust,
+            Origin::ConstHeap { .. } => MemKind::ConstHeap,
+        }
+    }
 }
 
 /// A block of the heap: the size and alignment it was asked for, the bytes it takes, of a
@@ -226,7 +243,22 @@ fn size_class(size: usize) -> usize {
     size.max(8).checked_next_power_of_two().unwrap_or(usize::MAX)
 }
 
-pub struct Evaluator<'db> {
+/// The provenances the machine gave the evaluation's pointers, each once, by [`ProvId`].
+struct Provs<P> {
+    list: Vec<P>,
+    index: FxHashMap<P, u32>,
+}
+
+impl<P> Default for Provs<P> {
+    fn default() -> Self {
+        Provs { list: Vec::new(), index: FxHashMap::default() }
+    }
+}
+
+pub struct Evaluator<'db, M: Machine<'db> = Plain> {
+    /// The checker of undefined behavior the run reports to; [`Plain`] for none.
+    machine: Hooks<M>,
+    provs: RefCell<Provs<M::Prov>>,
     db: &'db dyn HirDatabase,
     param_env: ParamEnvAndCrate<'db>,
     target_data_layout: &'db TargetDataLayout,
@@ -315,14 +347,40 @@ enum TypeIdOf<'db> {
     Field { base: Ty<'db>, variant: usize, field: usize },
 }
 
+/// Which memory of the evaluation an address is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Address {
+enum Space {
+    Stack,
+    Heap,
+    Invalid,
+}
+
+/// The index of a pointer's provenance in [`Evaluator::provs`], one past it; 0 for none
+/// (an integer, or any pointer when the machine checks nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+struct ProvId(u32);
+
+/// An address: the memory it is in and the offset there, the provenance of the pointer it
+/// was read from, and the alignment (log2) an access through it needs, which a place has
+/// from its type and an untyped access doesn't (0). The last two fill what would be padding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Address {
+    offset: usize,
+    prov: ProvId,
+    space: Space,
+    align: u8,
+}
+
+const _: () = assert!(size_of::<Address>() == 16);
+
+/// An address, to match on.
+enum At {
     Stack(usize),
     Heap(usize),
     Invalid(usize),
 }
 
-use Address::*;
+use At::*;
 
 #[derive(Debug, Clone, Copy)]
 struct Interval {
@@ -341,17 +399,21 @@ impl Interval {
         Self { addr, size }
     }
 
-    fn get<'b, 'db>(&self, memory: &'b Evaluator<'db>) -> Result<'db, &'b [u8]> {
+    fn get<'b, 'db, M: Machine<'db>>(&self, memory: &'b Evaluator<'db, M>) -> Result<'db, &'b [u8]> {
         memory.read_memory(self.addr, self.size)
     }
 
-    fn write_from_bytes<'db>(&self, memory: &mut Evaluator<'db>, bytes: &[u8]) -> Result<'db, ()> {
+    fn write_from_bytes<'db, M: Machine<'db>>(
+        &self,
+        memory: &mut Evaluator<'db, M>,
+        bytes: &[u8],
+    ) -> Result<'db, ()> {
         memory.write_memory(self.addr, bytes)
     }
 
-    fn write_from_interval<'db>(
+    fn write_from_interval<'db, M: Machine<'db>>(
         &self,
-        memory: &mut Evaluator<'db>,
+        memory: &mut Evaluator<'db, M>,
         interval: Interval,
     ) -> Result<'db, ()> {
         memory.copy_from_interval(self.addr, interval)
@@ -363,14 +425,14 @@ impl Interval {
 }
 
 impl<'db> IntervalAndTy<'db> {
-    fn get<'b>(&self, memory: &'b Evaluator<'db>) -> Result<'db, &'b [u8]> {
+    fn get<'b, M: Machine<'db>>(&self, memory: &'b Evaluator<'db, M>) -> Result<'db, &'b [u8]> {
         memory.read_memory(self.interval.addr, self.interval.size)
     }
 
-    fn new(
+    fn new<M: Machine<'db>>(
         addr: Address,
         ty: Ty<'db>,
-        evaluator: &Evaluator<'db>,
+        evaluator: &Evaluator<'db, M>,
         locals: &Locals<'db>,
     ) -> Result<'db, IntervalAndTy<'db>> {
         let size = evaluator.size_of_sized(ty, locals, "type of interval")?;
@@ -378,21 +440,27 @@ impl<'db> IntervalAndTy<'db> {
     }
 }
 
-enum IntervalOrOwned {
+/// A value: in memory, or computed. `Owned` bytes are all initialized and carry no
+/// provenance; `Shadowed` ones say which are and what they carry.
+enum IntervalOrOwned<S = ()> {
     Owned(Vec<u8>),
+    Shadowed(Vec<u8>, S),
     Borrowed(Interval),
 }
 
-impl From<Interval> for IntervalOrOwned {
-    fn from(it: Interval) -> IntervalOrOwned {
+impl<S> From<Interval> for IntervalOrOwned<S> {
+    fn from(it: Interval) -> IntervalOrOwned<S> {
         IntervalOrOwned::Borrowed(it)
     }
 }
 
-impl IntervalOrOwned {
-    fn get<'b, 'db>(&'b self, memory: &'b Evaluator<'db>) -> Result<'db, &'b [u8]> {
+impl<S> IntervalOrOwned<S> {
+    fn get<'b, 'db, M: Machine<'db>>(
+        &'b self,
+        memory: &'b Evaluator<'db, M>,
+    ) -> Result<'db, &'b [u8]> {
         Ok(match self {
-            IntervalOrOwned::Owned(o) => o,
+            IntervalOrOwned::Owned(o) | IntervalOrOwned::Shadowed(o, _) => o,
             IntervalOrOwned::Borrowed(b) => b.get(memory)?,
         })
     }
@@ -426,24 +494,48 @@ fn word_bytes(value: usize) -> smallvec::SmallVec<[u8; 8]> {
 }
 
 impl Address {
+    fn of(space: Space, offset: usize) -> Address {
+        Address { offset, prov: ProvId(0), space, align: 0 }
+    }
+
+    fn stack(offset: usize) -> Address {
+        Address::of(Space::Stack, offset)
+    }
+
+    fn heap(offset: usize) -> Address {
+        Address::of(Space::Heap, offset)
+    }
+
+    fn invalid(addr: usize) -> Address {
+        Address::of(Space::Invalid, addr)
+    }
+
+    fn at(&self) -> At {
+        match self.space {
+            Space::Stack => Stack(self.offset),
+            Space::Heap => Heap(self.offset),
+            Space::Invalid => Invalid(self.offset),
+        }
+    }
+
     fn from_bytes<'db>(it: &[u8]) -> Result<'db, Self> {
         Ok(Address::from_usize(from_bytes!(usize, it)))
     }
 
     fn from_usize(it: usize) -> Self {
         if it > stack_offset() {
-            Stack(it - stack_offset())
+            Address::stack(it - stack_offset())
         } else if it > heap_offset() {
-            Heap(it - heap_offset())
+            Address::heap(it - heap_offset())
         } else {
-            Invalid(it)
+            Address::invalid(it)
         }
     }
 
     /// Whether this is a number made into a pointer to `size` bytes, none: no memory is
     /// behind it, and the number is the whole of its value.
     fn is_of_nothing(&self, size: usize) -> bool {
-        size == 0 && matches!(self, Invalid(_))
+        size == 0 && self.space == Space::Invalid
     }
 
     fn to_bytes(&self) -> smallvec::SmallVec<[u8; 8]> {
@@ -451,23 +543,30 @@ impl Address {
     }
 
     fn to_usize(&self) -> usize {
-        match self {
-            Stack(it) => *it + stack_offset(),
-            Heap(it) => *it + heap_offset(),
-            Invalid(it) => *it,
+        match self.space {
+            Space::Stack => self.offset + stack_offset(),
+            Space::Heap => self.offset + heap_offset(),
+            Space::Invalid => self.offset,
         }
     }
 
+    /// The address `f` moves this to, of the same provenance; what an access there needs is
+    /// for its own type to say.
     fn map(&self, f: impl FnOnce(usize) -> usize) -> Address {
-        match self {
-            Stack(it) => Stack(f(*it)),
-            Heap(it) => Heap(f(*it)),
-            Invalid(it) => Invalid(f(*it)),
-        }
+        Address { offset: f(self.offset), align: 0, ..*self }
     }
 
     fn offset(&self, offset: usize) -> Address {
         self.map(|it| it + offset)
+    }
+
+    /// This address, accessed as a value of alignment `align`.
+    fn aligned(self, align: usize) -> Address {
+        Address { align: align.trailing_zeros() as u8, ..self }
+    }
+
+    fn align(&self) -> u64 {
+        1 << self.align
     }
 }
 
@@ -520,7 +619,48 @@ pub fn interpret_mir<'db>(
     }
 }
 
-impl<'db> Evaluator<'db> {
+/// Runs `func`, a function of no arguments and no generics (a `#[test]`), with `machine`
+/// watching, and asks it to `finish` once the main thread returns.
+pub fn run_function<'db, M: Machine<'db>>(
+    db: &'db dyn HirDatabase,
+    func: FunctionId,
+    machine: M,
+) -> (Result<'db, ()>, MirOutput, M) {
+    let env = ParamEnvAndCrate {
+        param_env: db.trait_environment(func.into()),
+        krate: func.module(db).krate(db),
+    };
+    let body = match db.monomorphized_runtime_mir_body(
+        func.into(),
+        GenericArgs::empty().store(),
+        env.store(),
+    ) {
+        Ok(body) => body,
+        Err(e) => {
+            let output = MirOutput { stdout: Vec::new(), stderr: Vec::new() };
+            return (Err(MirEvalError::MirLowerError(func, e)), output, machine);
+        }
+    };
+    let mut evaluator =
+        match Evaluator::with_machine(db, body.owner, false, Some(env), machine) {
+            Ok(it) => it,
+            Err((e, machine)) => {
+                let output = MirOutput { stdout: Vec::new(), stderr: Vec::new() };
+                return (Err(e), output, machine);
+            }
+        };
+    let called = Some((func, MirSpan::Unknown, body.owner));
+    let result = evaluator
+        .interpret_mir(body, iter::empty(), called)
+        .and_then(|_| evaluator.machine.finish());
+    let output = MirOutput {
+        stdout: mem::take(&mut evaluator.stdout),
+        stderr: mem::take(&mut evaluator.stderr),
+    };
+    (result, output, evaluator.machine.into_inner())
+}
+
+impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// Runs a body without arguments and takes its result out of the evaluator's memory.
     fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
         let interval = self.interpret_mir(body, None.into_iter(), None)?;
@@ -562,11 +702,25 @@ impl<'db> Evaluator<'db> {
         assert_placeholder_ty_is_unused: bool,
         trait_env: Option<ParamEnvAndCrate<'db>>,
     ) -> Result<'db, Evaluator<'db>> {
+        Evaluator::with_machine(db, owner, assert_placeholder_ty_is_unused, trait_env, Plain)
+            .map_err(|(e, Plain)| e)
+    }
+}
+
+impl<'db, M: Machine<'db>> Evaluator<'db, M> {
+    /// An evaluator that reports to `machine`, or gives it back with the error.
+    pub fn with_machine(
+        db: &'db dyn HirDatabase,
+        owner: InferBodyId<'db>,
+        assert_placeholder_ty_is_unused: bool,
+        trait_env: Option<ParamEnvAndCrate<'db>>,
+        machine: M,
+    ) -> std::result::Result<Evaluator<'db, M>, (MirEvalError<'db>, M)> {
         let module = owner.module(db);
         let crate_id = module.krate(db);
         let target_data_layout = match db.target_data_layout(crate_id) {
             Ok(target_data_layout) => target_data_layout,
-            Err(e) => return Err(MirEvalError::TargetDataLayoutNotAvailable(e)),
+            Err(e) => return Err((MirEvalError::TargetDataLayoutNotAvailable(e), machine)),
         };
         let cached_ptr_size = target_data_layout.pointer_size().bytes_usize();
         // Impls are looked up from the crate the body is evaluated for: the ones its generic
@@ -583,6 +737,8 @@ impl<'db> Evaluator<'db> {
             100
         };
         Ok(Evaluator {
+            machine: Hooks::new(machine),
+            provs: RefCell::default(),
             target_data_layout,
             stack: vec![0],
             heap: vec![0],
@@ -1085,15 +1241,71 @@ impl<'db> Evaluator<'db> {
     /// Gives back the stack above `len`, of the frames that returned: nothing points there
     /// any more but what a dangling pointer would, as the temporaries whose borrows outlive
     /// a call are in the heap ([`Self::promoted`]).
-    fn free_stack(&mut self, len: usize) {
-        self.truncate_stack(len);
+    fn free_stack(&mut self, len: usize) -> Result<'db, ()> {
+        self.truncate_stack(len)
     }
 
-    fn truncate_stack(&mut self, len: usize) {
-        self.stack.truncate(len);
-        let end = Stack(len).to_usize();
+    fn truncate_stack(&mut self, len: usize) -> Result<'db, ()> {
+        let end = Address::stack(len).to_usize();
         let kept = self.stack_allocations.partition_point(|it| it.start < end);
+        if M::CHECKS {
+            for allocated in self.stack_allocations[kept..].iter().filter(|it| it.tracked) {
+                let addr = allocated.start as u64;
+                let ptr = Ptr { addr, prov: self.machine.root(addr) };
+                let (size, align) = (Some(allocated.size as u64), Some(allocated.align as u64));
+                self.machine.free(ptr, size, align, MemKind::Stack)?;
+            }
+        }
+        self.stack.truncate(len);
         self.stack_allocations.truncate(kept);
+        Ok(())
+    }
+
+    /// `StorageLive` (`live`) or `StorageDead` of `local`: the machine allocates it anew, or
+    /// frees it.
+    fn set_storage(&mut self, local: LocalId, locals: &mut Locals<'db>, live: bool) -> Result<'db, ()> {
+        let interval = locals.ptr[local];
+        if !M::CHECKS || interval.size == 0 || interval.addr.space != Space::Stack {
+            return Ok(());
+        }
+        let start = interval.addr.to_usize();
+        let i = self.stack_allocations.partition_point(|it| it.start < start);
+        let Some(allocated) = self.stack_allocations.get(i).filter(|it| it.start == start).copied()
+        else {
+            return Ok(());
+        };
+        let (size, align) = (allocated.size as u64, allocated.align as u64);
+        if allocated.tracked {
+            let ptr = self.ptr(interval.addr);
+            self.machine.free(ptr, Some(size), Some(align), MemKind::Stack)?;
+        }
+        let prov = match live {
+            true => Some(self.machine.alloc(start as u64, size, align, MemKind::Stack, false)?),
+            false => None,
+        };
+        self.stack_allocations[i].tracked = live;
+        locals.ptr.insert(local, Interval { addr: self.with_prov(interval.addr, prov), ..interval });
+        Ok(())
+    }
+
+    /// The locals of `body` with storage statements, which are live only from a `StorageLive`.
+    fn storage_marked(&self, body: &'db MirBody<'db>) -> Arc<FxHashSet<LocalId>> {
+        let key = std::ptr::from_ref(body) as usize;
+        if let Some(it) = self.storage_marked.borrow().get(&key) {
+            return it.clone();
+        }
+        let marked: FxHashSet<LocalId> = body
+            .basic_blocks
+            .iter()
+            .flat_map(|(_, block)| &block.statements)
+            .filter_map(|it| match it.kind {
+                StatementKind::StorageLive(local) => Some(local),
+                _ => None,
+            })
+            .collect();
+        let marked = Arc::new(marked);
+        self.storage_marked.borrow_mut().insert(key, marked.clone());
+        marked
     }
 
     fn fill_locals_for_body(
@@ -1153,7 +1365,7 @@ impl<'db> Evaluator<'db> {
                 if size == 0 {
                     // Nothing is stored, so the address only has to be aligned. It is the
                     // alignment itself, which is what rustc gives a constant of no size.
-                    locals.ptr.insert(id, Interval { addr: Invalid(align), size });
+                    locals.ptr.insert(id, Interval { addr: Address::invalid(align), size });
                     continue;
                 }
                 if body.promoted_locals.iter().any(|&(it, _)| it == id) {
@@ -1174,11 +1386,13 @@ impl<'db> Evaluator<'db> {
                 }
                 let my_ptr = stack_ptr;
                 stack_ptr += size;
-                locals.ptr.insert(id, Interval { addr: Stack(my_ptr), size });
+                let addr = Address::stack(my_ptr).aligned(align);
+                locals.ptr.insert(id, Interval { addr, size });
                 self.stack_allocations.push(Allocated {
-                    start: Stack(my_ptr).to_usize(),
+                    start: addr.to_usize(),
                     size,
                     align,
+                    tracked: false,
                 });
             }
             stack_ptr - self.stack.len()
@@ -1186,6 +1400,18 @@ impl<'db> Evaluator<'db> {
         let prev_stack_pointer = self.stack.len();
         self.check_memory(stack_size)?;
         self.stack.extend(std::iter::repeat_n(0, stack_size));
+        if M::CHECKS {
+            // Arguments, the return place and locals without storage statements are live for
+            // the whole frame.
+            let marked = self.storage_marked(body);
+            let ids: Vec<LocalId> = locals.ptr.iter().map(|(id, _)| id).collect();
+            for id in ids {
+                let in_frame = locals.ptr[id].addr.to_usize() >= Address::stack(prev_stack_pointer).to_usize();
+                if !marked.contains(&id) && in_frame {
+                    self.set_storage(id, &mut locals, true)?;
+                }
+            }
+        }
         Ok((locals, prev_stack_pointer))
     }
 
@@ -2501,11 +2727,80 @@ impl<'db> Evaluator<'db> {
         ))
     }
 
+    /// `addr` as the machine sees it: its address and its provenance.
+    #[inline(always)]
+    fn ptr(&self, addr: Address) -> Ptr<M::Prov> {
+        let prov = match (M::CHECKS, addr.prov.0) {
+            (false, _) | (_, 0) => None,
+            (true, id) => self.provs.borrow().list.get(id as usize - 1).copied(),
+        };
+        Ptr { addr: addr.to_usize() as u64, prov }
+    }
+
+    /// `addr` with the provenance `prov`.
+    #[inline(always)]
+    fn with_prov(&self, addr: Address, prov: Option<M::Prov>) -> Address {
+        let Some(prov) = prov.filter(|_| M::CHECKS) else {
+            return Address { prov: ProvId(0), ..addr };
+        };
+        let mut provs = self.provs.borrow_mut();
+        let Provs { list, index } = &mut *provs;
+        let id = *index.entry(prov).or_insert_with(|| {
+            list.push(prov);
+            list.len() as u32
+        });
+        Address { prov: ProvId(id), ..addr }
+    }
+
+    /// The bytes of program memory at `addr` as the program reads them, which the machine
+    /// sees: an untyped read unless `addr` says the alignment of its type.
     fn read_memory(&self, addr: Address, size: usize) -> Result<'db, &[u8]> {
+        if M::CHECKS && size != 0 {
+            self.machine.read(self.ptr(addr), size as u64, addr.align(), Access::Plain)?;
+        }
+        self.peek_memory(addr, size)
+    }
+
+    /// [`Self::read_memory`], with which of the bytes are initialized and what they carry.
+    fn read_shadowed(&self, addr: Address, size: usize) -> Result<'db, (&[u8], M::Shadow)> {
+        let shadow = match M::CHECKS && size != 0 {
+            true => self.machine.read(self.ptr(addr), size as u64, addr.align(), Access::Plain)?,
+            false => M::Shadow::default(),
+        };
+        Ok((self.peek_memory(addr, size)?, shadow))
+    }
+
+    /// The bytes of a scalar the program uses (a number, a condition, an address), which must
+    /// all be initialized.
+    fn read_scalar(&self, interval: Interval) -> Result<'db, &[u8]> {
+        if !M::CHECKS {
+            return interval.get(self);
+        }
+        let (bytes, shadow) = self.read_shadowed(interval.addr, interval.size)?;
+        self.machine.require_init(&shadow, 0..interval.size)?;
+        Ok(bytes)
+    }
+
+    /// The pointer stored at `addr`, with the provenance the machine says it carries.
+    fn read_pointer(&self, addr: Address) -> Result<'db, Address> {
+        let size = self.ptr_size();
+        let addr = addr.aligned(size);
+        if !M::CHECKS {
+            return Address::from_bytes(self.peek_memory(addr, size)?);
+        }
+        let (bytes, shadow) = self.read_shadowed(addr, size)?;
+        self.machine.require_init(&shadow, 0..size)?;
+        let pointer = Address::from_bytes(bytes)?;
+        Ok(self.with_prov(pointer, shadow.prov_at(0, size)))
+    }
+
+    /// The bytes of memory at `addr`, read by the evaluator for itself (a constant's value
+    /// once evaluated, a vtable): the machine doesn't see these.
+    fn peek_memory(&self, addr: Address, size: usize) -> Result<'db, &[u8]> {
         if size == 0 {
             return Ok(&[]);
         }
-        let (mem, pos) = match addr {
+        let (mem, pos) = match addr.at() {
             Stack(it) => (&self.stack, it),
             Heap(it) => {
                 self.check_static_is_evaluated(it, size)?;
@@ -2549,14 +2844,29 @@ impl<'db> Evaluator<'db> {
         )))
     }
 
+    /// Program memory at `addr` that the program writes computed bytes to, which the machine
+    /// sees as initialized and carrying no provenance.
     fn write_memory_using_ref(&mut self, addr: Address, size: usize) -> Result<'db, &mut [u8]> {
         if size == 0 {
             return Ok(&mut []);
         }
-        if let Heap(pos) = addr {
+        if M::CHECKS {
+            let shadow = M::Shadow::init(size);
+            let ptr = self.ptr(addr);
+            self.machine.write(ptr, size as u64, addr.align(), Access::Plain, &shadow)?;
+        }
+        self.poke_memory(addr, size)
+    }
+
+    /// The bytes of memory at `addr` for the evaluator to write itself, unseen by the machine.
+    fn poke_memory(&mut self, addr: Address, size: usize) -> Result<'db, &mut [u8]> {
+        if size == 0 {
+            return Ok(&mut []);
+        }
+        if let Heap(pos) = addr.at() {
             self.check_static_write(pos, size)?;
         }
-        let (mem, pos) = match addr {
+        let (mem, pos) = match addr.at() {
             Stack(it) => (&mut self.stack, it),
             Heap(it) => (&mut self.heap, it),
             Invalid(it) => {
@@ -2577,31 +2887,100 @@ impl<'db> Evaluator<'db> {
         Ok(())
     }
 
+    /// Writes `r`, of which `shadow` says what is initialized and what carries provenance.
+    fn write_shadowed(&mut self, addr: Address, r: &[u8], shadow: &M::Shadow) -> Result<'db, ()> {
+        if r.is_empty() {
+            return Ok(());
+        }
+        if M::CHECKS {
+            let ptr = self.ptr(addr);
+            self.machine.write(ptr, r.len() as u64, addr.align(), Access::Plain, shadow)?;
+        }
+        self.poke_memory(addr, r.len())?.copy_from_slice(r);
+        Ok(())
+    }
+
+    /// Writes at `at` a pointer to `to`, which carries `to`'s provenance.
+    fn write_pointer(&mut self, at: Address, to: Address) -> Result<'db, ()> {
+        let bytes = to.to_bytes();
+        if !M::CHECKS {
+            return self.write_memory(at, &bytes);
+        }
+        let shadow = M::Shadow::pointer(bytes.len(), self.ptr(to).prov);
+        self.write_shadowed(at.aligned(bytes.len()), &bytes, &shadow)
+    }
+
+    /// A computed pointer value to `to` with `metadata` after it, as a `Ref` makes one.
+    fn pointer_value(
+        &self,
+        to: Address,
+        metadata: Option<&IntervalOrOwned<M::Shadow>>,
+    ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
+        let mut bytes = to.to_bytes().to_vec();
+        let Some(metadata) = metadata else {
+            return Ok(match M::CHECKS {
+                true => {
+                    let shadow = M::Shadow::pointer(bytes.len(), self.ptr(to).prov);
+                    IntervalOrOwned::Shadowed(bytes, shadow)
+                }
+                false => IntervalOrOwned::Owned(bytes),
+            });
+        };
+        if !M::CHECKS {
+            bytes.extend(metadata.get(self)?);
+            return Ok(IntervalOrOwned::Owned(bytes));
+        }
+        let mut shadow = M::Shadow::pointer(bytes.len(), self.ptr(to).prov);
+        let at = bytes.len();
+        let (meta, meta_shadow) = self.value_shadowed(metadata)?;
+        bytes.extend(meta);
+        shadow.put(at, &meta_shadow);
+        Ok(IntervalOrOwned::Shadowed(bytes, shadow))
+    }
+
+    /// The bytes of a value and what the machine knows of them.
+    fn value_shadowed<'b>(
+        &'b self,
+        value: &'b IntervalOrOwned<M::Shadow>,
+    ) -> Result<'db, (&'b [u8], M::Shadow)> {
+        Ok(match value {
+            IntervalOrOwned::Owned(bytes) => (bytes, M::Shadow::init(bytes.len())),
+            IntervalOrOwned::Shadowed(bytes, shadow) => (bytes, shadow.clone()),
+            IntervalOrOwned::Borrowed(it) => self.read_shadowed(it.addr, it.size)?,
+        })
+    }
+
     fn copy_from_interval_or_owned(
         &mut self,
         addr: Address,
-        r: IntervalOrOwned,
+        r: IntervalOrOwned<M::Shadow>,
     ) -> Result<'db, ()> {
         match r {
             IntervalOrOwned::Borrowed(r) => self.copy_from_interval(addr, r),
             IntervalOrOwned::Owned(r) => self.write_memory(addr, &r),
+            IntervalOrOwned::Shadowed(r, shadow) => self.write_shadowed(addr, &r, &shadow),
         }
     }
 
+    /// Copies the bytes of `r` to `addr`, which the machine sees as one copy of what they are.
     fn copy_from_interval(&mut self, addr: Address, r: Interval) -> Result<'db, ()> {
         if r.size == 0 {
             return Ok(());
         }
+        if M::CHECKS {
+            let align = addr.align().max(r.addr.align());
+            self.machine.copy(self.ptr(addr), self.ptr(r.addr), r.size as u64, align, true)?;
+        }
 
         let oob = || MirEvalError::UndefinedBehavior("out of bounds memory write".to_owned());
 
-        if let Heap(src) = r.addr {
+        if let Heap(src) = r.addr.at() {
             self.check_static_is_evaluated(src, r.size)?;
         }
-        if let Heap(dst) = addr {
+        if let Heap(dst) = addr.at() {
             self.check_static_write(dst, r.size)?;
         }
-        match (addr, r.addr) {
+        match (addr.at(), r.addr.at()) {
             (Stack(dst), Stack(src)) => {
                 if self.stack.len() < src + r.size || self.stack.len() < dst + r.size {
                     return Err(oob());
@@ -2718,7 +3097,7 @@ impl<'db> Evaluator<'db> {
 
     /// The allocation `addr` is in.
     fn allocation_at(&self, addr: usize) -> Option<Allocated> {
-        match Address::from_usize(addr) {
+        match Address::from_usize(addr).at() {
             Stack(_) => {
                 let i = self.stack_allocations.partition_point(|it| it.start <= addr);
                 let &allocation = self.stack_allocations.get(i.checked_sub(1)?)?;
@@ -2726,8 +3105,8 @@ impl<'db> Evaluator<'db> {
             }
             Heap(offset) => {
                 let (start, block) = self.heap_block_at(offset)?;
-                let start = Heap(start).to_usize();
-                Some(Allocated { start, size: block.size, align: block.align })
+                let start = Address::heap(start).to_usize();
+                Some(Allocated { start, size: block.size, align: block.align, tracked: false })
             }
             Invalid(_) => None,
         }
@@ -2764,18 +3143,25 @@ impl<'db> Evaluator<'db> {
 
     /// Memory of the evaluator's own ([`Origin::Evaluator`]), zeroed.
     fn heap_allocate(&mut self, size: usize, align: usize) -> Result<'db, Address> {
-        self.allocate(size, align, Origin::Evaluator)
+        self.allocate(size, align, Origin::Evaluator, true)
     }
 
     /// A zeroed block of the heap: a freed one of its size class and alignment when there is
     /// one, else one at the end.
-    fn allocate(&mut self, size: usize, align: usize, origin: Origin) -> Result<'db, Address> {
+    /// The machine is told of it, as `zeroed` (initialized) or not.
+    fn allocate(
+        &mut self,
+        size: usize,
+        align: usize,
+        origin: Origin,
+        zeroed: bool,
+    ) -> Result<'db, Address> {
         if !align.is_power_of_two() || align > 10000 {
             return Err(MirEvalError::UndefinedBehavior(format!("Alignment {align} is invalid")));
         }
         if size == 0 {
             // As a local of no size: aligned, of no block, so not where the next block starts.
-            return Ok(Invalid(align));
+            return Ok(Address::invalid(align));
         }
         let class = size_class(size);
         let pos = match self.free_blocks.get_mut(&(class, align)).and_then(Vec::pop) {
@@ -2791,13 +3177,19 @@ impl<'db> Evaluator<'db> {
             }
         };
         self.heap_blocks.insert(pos, HeapBlock { size, align, class, origin });
-        Ok(Heap(pos))
+        let addr = Address::heap(pos);
+        if !M::CHECKS {
+            return Ok(addr);
+        }
+        let start = addr.to_usize() as u64;
+        let prov = self.machine.alloc(start, size as u64, align as u64, origin.kind(), zeroed)?;
+        Ok(self.with_prov(addr, Some(prov)))
     }
 
     /// Frees the block `addr` starts, which `origin` made; `what` names the call, for its
     /// error. As rustc's evaluation, freeing anything else is undefined behavior.
     fn deallocate(&mut self, addr: Address, origin: Origin, what: &str) -> Result<'db, ()> {
-        let block = match addr {
+        let block = match addr.at() {
             Heap(pos) => self.heap_blocks.get(&pos).copied().map(|it| (pos, it)),
             _ => None,
         };
@@ -2806,6 +3198,10 @@ impl<'db> Evaluator<'db> {
                 "`{what}` of a pointer that is not the start of memory allocated by it"
             )));
         };
+        if M::CHECKS {
+            let (size, align) = (Some(block.size as u64), Some(block.align as u64));
+            self.machine.free(self.ptr(addr), size, align, origin.kind())?;
+        }
         self.heap_blocks.remove(&pos);
         self.free_blocks.entry((block.class, block.align)).or_default().push(pos);
         Ok(())
@@ -2814,7 +3210,7 @@ impl<'db> Evaluator<'db> {
     /// `__rust_realloc`: the block grows or shrinks in place while it fits its size class,
     /// else its bytes move to a new block and it is freed.
     fn reallocate(&mut self, addr: Address, new_size: usize) -> Result<'db, Address> {
-        let block = match addr {
+        let block = match addr.at() {
             Heap(pos) => self.heap_blocks.get(&pos).copied().map(|it| (pos, it)),
             _ => None,
         };
@@ -2824,14 +3220,16 @@ impl<'db> Evaluator<'db> {
                     .to_owned(),
             ));
         };
-        if new_size != 0 && new_size <= block.class {
+        // The machine sees a reallocation as rustc's evaluation does: a new block, the bytes
+        // that fit copied to it, the old one freed.
+        if !M::CHECKS && new_size != 0 && new_size <= block.class {
             if new_size > block.size {
                 self.heap[pos + block.size..pos + new_size].fill(0);
             }
             self.heap_blocks.insert(pos, HeapBlock { size: new_size, ..block });
             return Ok(addr);
         }
-        let new = self.allocate(new_size, block.align, Origin::Allocator)?;
+        let new = self.allocate(new_size, block.align, Origin::Allocator, false)?;
         let kept = block.size.min(new_size);
         Interval { addr: new, size: kept }
             .write_from_interval(self, Interval { addr, size: kept })?;
@@ -2842,7 +3240,7 @@ impl<'db> Evaluator<'db> {
     /// `const_make_global`: the `const_allocate` block `addr` starts may be in the value of
     /// a constant from now on, and is immutable.
     fn make_global(&mut self, addr: Address) -> Result<'db, ()> {
-        let block = match addr {
+        let block = match addr.at() {
             Heap(pos) => self.heap_blocks.get_mut(&pos),
             _ => None,
         };
@@ -2864,7 +3262,7 @@ impl<'db> Evaluator<'db> {
     /// latter alike ("encountered `const_allocate` pointer in final value that was not made
     /// global"), and has no `Box` or `Vec` that allocates in a constant.
     fn may_be_in_value(&self, addr: usize) -> Result<'db, ()> {
-        let Heap(offset) = Address::from_usize(addr) else { return Ok(()) };
+        let Heap(offset) = Address::from_usize(addr).at() else { return Ok(()) };
         match self.heap_block_at(offset) {
             Some((_, HeapBlock { origin: Origin::Allocator, .. })) => {
                 Err(MirEvalError::HeapInValue { of_const_allocate: false })
@@ -2971,8 +3369,8 @@ impl<'db> Evaluator<'db> {
         ty: Ty<'db>,
         locals: &Locals<'db>,
     ) -> Result<'db, ComplexMemoryMap<'db>> {
-        fn rec<'db>(
-            this: &Evaluator<'db>,
+        fn rec<'db, M: Machine<'db>>(
+            this: &Evaluator<'db, M>,
             bytes: &[u8],
             ty: Ty<'db>,
             locals: &Locals<'db>,
@@ -3219,8 +3617,8 @@ impl<'db> Evaluator<'db> {
         /// say, and what every word of it that is in another allocation or a static points
         /// to: the reader of the map takes each such word to be a pointer, as it is in a
         /// `NonNull<()>` to a value with a `&str` in it (std's `io::Error` of a message).
-        fn behind_raw<'db>(
-            this: &Evaluator<'db>,
+        fn behind_raw<'db, M: Machine<'db>>(
+            this: &Evaluator<'db, M>,
             addr: usize,
             mm: &mut ComplexMemoryMap<'db>,
             stack_depth_limit: usize,
@@ -3239,7 +3637,7 @@ impl<'db> Evaluator<'db> {
                 return Ok(());
             }
             this.may_be_in_value(addr)?;
-            let Some(Allocated { start, size, align }) = this.allocation_at(addr) else {
+            let Some(Allocated { start, size, align, .. }) = this.allocation_at(addr) else {
                 return Ok(());
             };
             if mm.memory.get(&start).is_some_and(|it| it.len() >= size) {
@@ -3934,7 +4332,7 @@ impl<'db> Evaluator<'db> {
         };
         let result = if let Some((size, align)) = unevaluated {
             let addr = self.heap_allocate(size, align)?;
-            if let Heap(start) = addr {
+            if let Heap(start) = addr.at() {
                 self.unevaluated_statics.push((start, size, st));
             }
             Interval::new(addr, size)
@@ -4205,7 +4603,7 @@ impl<'db> Evaluator<'db> {
                 drop_impl,
                 iter::once(IntervalOrOwned::Owned(addr.to_bytes().to_vec())),
                 span,
-                Interval { addr: Address::Invalid(0), size: 0 },
+                Interval { addr: Address::invalid(0), size: 0 },
                 None,
             )?;
         }
@@ -4321,14 +4719,14 @@ pub fn render_const_using_debug_impl<'db>(
         from_bytes!(usize, message_string[ptr_size..2 * ptr_size]),
         from_bytes!(usize, message_string[2 * ptr_size..3 * ptr_size]),
     ];
-    let Some(addr) = words.into_iter().map(Address::from_usize).find(|it| matches!(it, Heap(_)))
+    let Some(addr) = words.into_iter().map(Address::from_usize).find(|it| matches!(it.at(), Heap(_)))
     else {
         // No heap buffer means the formatted string is empty.
         return Ok(String::new());
     };
     let size = words
         .into_iter()
-        .filter(|&it| !matches!(Address::from_usize(it), Heap(_)))
+        .filter(|&it| !matches!(Address::from_usize(it).at(), Heap(_)))
         .min()
         .unwrap_or(0);
     Ok(std::string::String::from_utf8_lossy(evaluator.read_memory(addr, size)?).into_owned())

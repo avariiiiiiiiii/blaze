@@ -67,8 +67,15 @@ fn check_(
     if render_debug {
         format_to!(expect_res, "{:#?}\n\n", res.value.0);
     }
-    let (node, _) =
+    let (node, map) =
         syntax_bridge::token_tree_to_syntax_node(&res.value.0, parse, &mut |_| def_edition);
+    let (old_node, old_map) = syntax_bridge::reference::token_tree_to_syntax_node(
+        &res.value.0,
+        parse,
+        &mut |_| def_edition,
+    );
+    assert_eq!(node.debug_dump(), old_node.debug_dump(), "the tree the old conversion parses");
+    assert!(map == old_map, "the span map of the tree the old conversion parses");
     format_to!(
         expect_res,
         "{}",

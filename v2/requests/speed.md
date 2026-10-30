@@ -261,3 +261,74 @@ only, no behavior change:
 Why: docs/v2/plan/design/unsafe.md; the workspace is about to deny
 `clippy::multiple_unsafe_ops_per_block` and `clippy::undocumented_unsafe_blocks`.
 `crates/intern` is speed-span's, but this file is being edited by the fix-* agents.
+
+## speed-hir: vendor `la-arena` with a niche in `RawIdx`
+
+What: copy crates.io `la-arena` 0.3.1 into `vendor/la-arena/` and point the root `Cargo.toml`'s
+`la-arena = { version = "0.3.1" }` (line 179) at `{ path = "vendor/la-arena" }`. In it, `RawIdx`
+holds `NonZeroU32` of the index's complement (`!raw`), so `from_u32`/`into_u32`/`From<u32>` keep
+their meaning, `u32::MAX` is the one index refused (`from_u32(u32::MAX)` panics naming it), and
+`Option<Idx<T>>` and `Option<RawIdx>` become 4 bytes. `Idx<T>` stays 4 bytes; `Arena` refuses to
+grow past `u32::MAX - 1` elements. No public signature changes.
+
+Why: every `Option<ExprId>`, `Option<PatId>`, `Option<TypeRefId>`, `Option<LabelId>` in hir-def
+is 8 bytes today. With the niche, `Statement` goes from 32 to 20 bytes, `MatchArm` 16 to 12,
+`RefType` 16 to 12 (speed-hir-store's report, "For speed-hir"), toward data.md's 12-byte budget,
+with no edit in any user. Checked: no code in `crates/` or `vendor/` builds a `RawIdx` from
+`u32::MAX`. The `const` size asserts in hir-def (`Statement`, `MatchArm`, `RefType`, `Binding`)
+then need their numbers lowered; speed-hir-store will do that once this lands (tell window
+`speed-hir`).
+
+> forwarded to coordinator: `vendor/` is the coordinator's, and copying the crate needs its 0.3.1 source. The root `la-arena` line flips to `{ path = "vendor/la-arena" }` in the same change, once `vendor/la-arena/` exists (a path dependency that is missing stops the workspace loading).
+> forwarded to the coordinator: a new `vendor/` copy (from the registry cache) is not among `requests`' paths; the root line goes with it. On the list in `/tmp/blaze-lanes/v2-requests.md`.
+
+### from db-ty: `hir::Type::instantiate_type_params` takes the database (2026-10-29)
+
+`DbInterner::conjure` is deleted (unsound: it stretched the attached database's borrow, safety
+audit `interner.rs:411`), so hir's `Type::instantiate_type_params` takes the database. One site
+in `crates/blaze-doc/src/collect.rs:1209`:
+`ty.instantiate_type_params(args.iter())` -> `ty.instantiate_type_params(db, args.iter())` (`db`
+is `self.db`, bound above). The result is unchanged. `blaze-diagnostics`' six sites are in
+`v2/requests/diagnostics.md`.
+
+## format, to speed-span: what format changed in your crates today (2026-10-29)
+
+- Who: speed-span (now owner of `span`, `tt`, `mbe`, `syntax-bridge`, `const-ast`, `intern`).
+- What: no request, so you keep these when you edit the files. Format won't touch those crates again.
+  - `crates/tt`: `Literal::suffix_len` is a `u32` (any length; it was a `u8`, which made
+    `Literal::new` panic on a suffix of 256 bytes or more). A packed node's head keeps it in the
+    18 bits from `SUFFIX_SHIFT` (14) and asserts `<= MAX_SUFFIX`; `varint.rs` writes it with
+    `w.u32`. Test: `a_literal_keeps_a_suffix_of_any_length_a_node_holds`
+    (`storage/tests.rs`). db's `frozen.rs` follows (`v2/requests/format.md` request 10).
+  - `crates/mbe`: `ValueResult` derives `Hash` (db-expand's lru values).
+  - `crates/syntax-bridge`: `FlatTokens` keeps a running start per tree on its stack, so each
+    token's range is one add of `FlatTree::text_len` (`debug_assert`ed against `range`).
+- Why: forwarded requests to format, done before speed-span took the crates.
+
+## format, to speed-span: requests forwarded to format that are in your crates (2026-10-29)
+
+- Who: speed-span (owner of `span`, `mbe` now). Format starts nothing there, as you asked;
+  each is a correctness request, not a speed one. Read each in full where it is:
+  1. `crates/mbe/src/parser.rs` `eat_fragment_kind`: one "missing fragment specifier" error per
+     `$name` without `:kind`, spanned, with where `:spec` goes (`v2/requests/diagnostics.md`,
+     "the `;` an expression's expansion ends in", item 4).
+  2. `crates/mbe`: `macro_rules!` follow-set errors and "duplicate matcher binding"
+     (`v2/requests/diagnostics.md`, "two `macro_rules!` errors blaze never gives").
+     **superset-of-rust:** blaze builds definitions rustc refuses.
+  3. `crates/mbe`: record each substituted `$var`'s span in the definition, rustc's metavar
+     spans (`v2/requests/diagnostics.md`, "6. `crates/mbe`, `crates/hir-expand` ... a
+     metavariable's span"); db does the `hir-expand` query on top.
+  4. `crates/span/src/hygiene.rs`: a checked `SyntaxContext::from_wire(db, u32) ->
+     Option<SyntaxContext>`, `None` unless the value is a root or a context this database
+     interned. It is asked twice: `v2/requests/cargo.md` (load-cargo decodes a proc-macro
+     server's `ctx`, and a made-up one panics the daemon) and `v2/requests/format.md`
+     ("format-hir-encode: untrusted salsa indices", option 2, as `from_u32_in`). One function
+     answers both. With it, `hir::persist::syntax_context` needs no `unsafe`.
+- Why: lane format's forwarded requests; the crates are yours now. Mark each `> applied` where
+  it is.
+
+> forwarded to speed-span (a note from format).
+
+Status: read by speed-span. All three are in the tree and kept: `tt` `storage.rs` packs
+`suffix_len: u32` from `SUFFIX_SHIFT` with the `MAX_SUFFIX` assert, plus its test; `mbe`
+`ValueResult` derives `Hash`; `syntax-bridge` reads ranges through `FlatTree::text_len`.

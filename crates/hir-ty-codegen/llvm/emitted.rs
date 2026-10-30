@@ -25,7 +25,10 @@ use object::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{Symbol, Unhandled};
+use super::{
+    Symbol, Unhandled,
+    sanitize::{self, Covered},
+};
 use crate::{
     ConstBlob,
     debuginfo::{LineRow, SlotPlaces, VariablePlace},
@@ -54,6 +57,8 @@ pub(super) struct Emitted<'data, 'file> {
     relocs: Vec<ModuleReloc>,
     /// See [`Reloc::elf_type`](crate::fragment::Reloc::elf_type).
     elf_types: Vec<(u32, u32)>,
+    /// Whether the code may count itself in SanitizerCoverage's arrays ([`read_covered`]).
+    covered: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -62,6 +67,8 @@ enum Placement {
     Inline(u64),
     /// A data object of its own: constants that hold addresses, which code cannot.
     Blob(DataId),
+    /// The function's SanitizerCoverage array of this index ([`sanitize::SECTIONS`]).
+    Coverage(u32),
 }
 
 /// The code of each of `functions`, by its name in the object and its signature. What is wrong
@@ -71,6 +78,28 @@ pub(super) fn read(
     functions: &[(&str, Signature)],
     recorder: &mut Wants,
 ) -> Result<Vec<Result<Code, Unhandled>>, Unhandled> {
+    let read = read_all(object, functions, recorder, false)?;
+    Ok(read.into_iter().map(|it| it.map(|(code, _)| code)).collect())
+}
+
+/// The code of the one function of an object LLVM instrumented with SanitizerCoverage, and
+/// its arrays and PC table: what it refers to of the arrays are relocations in
+/// [`sanitize::COVERAGE`].
+pub(super) fn read_covered(
+    object: &[u8],
+    function: (&str, Signature),
+    recorder: &mut Wants,
+) -> Result<(Code, Covered), Unhandled> {
+    let mut read = read_all(object, std::slice::from_ref(&function), recorder, true)?;
+    read.pop().ok_or(Unhandled::Shape("an object without the function"))?
+}
+
+fn read_all(
+    object: &[u8],
+    functions: &[(&str, Signature)],
+    recorder: &mut Wants,
+    covered: bool,
+) -> Result<Vec<Result<(Code, Covered), Unhandled>>, Unhandled> {
     let file = object::File::parse(object)?;
     let mut found: Vec<Option<(SectionIndex, u64)>> = vec![None; functions.len()];
     for symbol in file.symbols() {
@@ -111,7 +140,7 @@ pub(super) fn read(
             }
             Some((text, _)) => {
                 let name = functions[at].0;
-                Emitted::code(&file, text, &texts, &shared, name, signature.clone(), recorder)
+                Emitted::code(&file, text, &texts, &shared, name, signature.clone(), recorder, covered)
             }
         };
         codes.push(code);
@@ -136,7 +165,11 @@ impl<'data, 'file> Emitted<'data, 'file> {
         name: &'file str,
         signature: Signature,
         recorder: &mut Wants,
-    ) -> Result<Code, Unhandled> {
+        covered: bool,
+    ) -> Result<(Code, Covered), Unhandled> {
+        if !covered && Self::has_coverage(file) {
+            return Err(Unhandled::Shape("SanitizerCoverage in an object read without it"));
+        }
         let mut emitted = Emitted {
             file,
             text,
@@ -150,6 +183,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             align: 1,
             relocs: Vec::new(),
             elf_types: Vec::new(),
+            covered,
         };
         let unwind = match (emitted.file.format(), emitted.file.architecture()) {
             (BinaryFormat::MachO, _) => {
@@ -175,9 +209,121 @@ impl<'data, 'file> Emitted<'data, 'file> {
         };
         let lines = emitted.lines()?;
         let slots = emitted.slots().unwrap_or_default();
+        let coverage = match covered {
+            true => emitted.coverage()?,
+            false => Covered::default(),
+        };
         let Emitted { bytes, align, relocs, elf_types, .. } = emitted;
         let relocs = Relocs::of_module(&relocs, &elf_types).map_err(|e| Unhandled::Llvm(e.to_string()))?;
-        Ok(Code { signature, bytes, align, relocs, unwind, lines, slots })
+        Ok((Code { signature, bytes, align, relocs, unwind, lines, slots }, coverage))
+    }
+
+    /// Whether `file` has a section of SanitizerCoverage's.
+    fn has_coverage(file: &object::File<'_>) -> bool {
+        file.sections().any(|section| {
+            section.name().is_ok_and(|name| {
+                sanitize::SECTIONS.contains(&name)
+                    || name == sanitize::PCS
+                    || name == sanitize::CONTROL_FLOW
+            })
+        })
+    }
+
+    /// Which of the function's SanitizerCoverage arrays `section` is, if it is one of them
+    /// and the object is read with them.
+    fn array(&self, section: &object::Section<'data, '_>) -> Result<Option<u32>, Unhandled> {
+        if !self.covered {
+            return Ok(None);
+        }
+        let name = section.name()?;
+        Ok(sanitize::SECTIONS.iter().position(|it| *it == name).map(|it| it as u32))
+    }
+
+    /// The one section named `name`, if there is one.
+    fn only(&self, name: &str) -> Result<Option<object::Section<'data, 'file>>, Unhandled> {
+        let mut named = self.file.sections().filter(|it| it.name().is_ok_and(|it| it == name));
+        let first = named.next();
+        if named.next().is_some() {
+            return Err(Unhandled::Shape("two SanitizerCoverage sections of one kind"));
+        }
+        Ok(first)
+    }
+
+    /// How long each of the function's SanitizerCoverage arrays is, which start zeroed, and
+    /// where each block they count is in the code, from the PC table.
+    fn coverage(&self) -> Result<Covered, Unhandled> {
+        if self.only(sanitize::CONTROL_FLOW)?.is_some() {
+            return Err(Unhandled::Shape("SanitizerCoverage's control flow, which is not read"));
+        }
+        let mut covered = Covered::default();
+        for (at, name) in sanitize::SECTIONS.iter().enumerate() {
+            let Some(section) = self.only(name)? else { continue };
+            if section.relocations().next().is_some() || section.data()?.iter().any(|it| *it != 0) {
+                return Err(Unhandled::Shape("a SanitizerCoverage array that does not start zeroed"));
+            }
+            covered.arrays[at] = u32::try_from(section.size())
+                .map_err(|_| Unhandled::Shape("a SanitizerCoverage array of 4 GiB"))?;
+        }
+        if let Some(section) = self.only(sanitize::PCS)? {
+            covered.pcs = self.pcs(&section)?;
+            let [counters, flags, guards] = covered.arrays;
+            let blocks = covered.pcs.len();
+            if [counters, flags, guards / 4].into_iter().any(|it| it != 0 && it as usize != blocks) {
+                return Err(Unhandled::Shape("a PC table of other blocks than are counted"));
+            }
+        }
+        Ok(covered)
+    }
+
+    /// The PC table of SanitizerCoverage: a pair of words for each block, the address of the
+    /// block in the code and its flags (1 for the function's entry, as LLVM's
+    /// `SanitizerCoveragePass` writes them).
+    fn pcs(&self, section: &object::Section<'data, '_>) -> Result<Vec<(u32, u64)>, Unhandled> {
+        const MALFORMED: Unhandled = Unhandled::Shape("a SanitizerCoverage PC table that is not read");
+        let word = if self.file.is_64() { 8 } else { 4 };
+        let data = section.data()?;
+        if data.len() % (2 * word) != 0 {
+            return Err(MALFORMED);
+        }
+        let read = |at: usize| -> Result<u64, Unhandled> {
+            let bytes = data.get(at..at + word).ok_or(MALFORMED)?;
+            let mut wide = [0u8; 8];
+            wide[..word].copy_from_slice(bytes);
+            Ok(u64::from_le_bytes(wide))
+        };
+        let text = self.file.section_by_index(self.text)?;
+        let mut pcs: Vec<Option<u32>> = vec![None; data.len() / (2 * word)];
+        for (offset, relocation) in section.relocations() {
+            let offset = offset as usize;
+            if offset % (2 * word) != 0 || relocation.kind() != object::RelocationKind::Absolute {
+                return Err(MALFORMED);
+            }
+            let base = match relocation.target() {
+                RelocationTarget::Symbol(symbol) => {
+                    let symbol = self.file.symbol_by_index(symbol)?;
+                    if symbol.section() != SymbolSection::Section(self.text) {
+                        return Err(Unhandled::Shape("a PC table entry outside the function"));
+                    }
+                    symbol.address()
+                }
+                RelocationTarget::Section(index) if index == self.text => 0,
+                _ => return Err(Unhandled::Shape("a PC table entry outside the function")),
+            };
+            // Mach-O and ELF's REL keep what is added in the word itself.
+            let held = if relocation.has_implicit_addend() { read(offset)? } else { 0 };
+            let address = base
+                .wrapping_add(held)
+                .wrapping_add_signed(relocation.addend())
+                .wrapping_sub(text.address());
+            let at = u32::try_from(address).ok().filter(|it| *it < self.code).ok_or(MALFORMED)?;
+            pcs[offset / (2 * word)] = Some(at);
+        }
+        let mut table = Vec::with_capacity(pcs.len());
+        for (entry, at) in pcs.into_iter().enumerate() {
+            let at = at.ok_or(MALFORMED)?;
+            table.push((at, read(entry * 2 * word + word)?));
+        }
+        Ok(table)
     }
 
     /// Where LLVM kept the stack slots `lower` told it of as variables, which are named by
@@ -395,6 +541,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 return Err(Unhandled::Shape("code that refers into another function"));
             }
             let section = self.file.section_by_index(index)?;
+            if let Some(array) = self.array(&section)? {
+                self.placed.insert(index, Placement::Coverage(array));
+                continue;
+            }
             let addresses =
                 section.relocations().any(|(_, relocation)| Self::is_address(&relocation));
             // What more than one function uses is had once, as a data object.
@@ -554,6 +704,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     (Some(Placement::Blob(id)), _) => {
                         (ModuleRelocTarget::user(1, id.as_u32()), addend + symbol.address() as i64)
                     }
+                    (Some(Placement::Coverage(array)), _) => (
+                        ModuleRelocTarget::user(sanitize::COVERAGE, array),
+                        addend + symbol.address() as i64,
+                    ),
                     (_, Destination::Named(name)) => (Self::target(name, recorder)?, addend),
                     (_, Destination::Section(_)) => {
                         return Err(Unhandled::Shape("code that holds an address of itself"));
@@ -635,6 +789,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 return Err(Unhandled::Shape("code that refers into another function"));
             }
             let section = self.file.section_by_index(index)?;
+            if let Some(array) = self.array(&section)? {
+                self.placed.insert(index, Placement::Coverage(array));
+                continue;
+            }
             let blob = match self.file.format() {
                 BinaryFormat::MachO => self.blob_macho(&section)?,
                 _ => self.blob_elf(&section)?,
@@ -759,6 +917,14 @@ impl<'data, 'file> Emitted<'data, 'file> {
                             symbol.address() - self.file.section_by_index(target)?.address();
                         (
                             ModuleRelocTarget::user(1, id.as_u32()),
+                            relocation.addend() + within as i64,
+                        )
+                    }
+                    Placement::Coverage(array) => {
+                        let within =
+                            symbol.address() - self.file.section_by_index(target)?.address();
+                        (
+                            ModuleRelocTarget::user(sanitize::COVERAGE, array),
                             relocation.addend() + within as i64,
                         )
                     }

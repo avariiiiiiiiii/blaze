@@ -11,6 +11,8 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+#[cfg(unix)]
+use crate::{Names, Stamp};
 use crate::{FileName, Meta};
 
 static TEMPORARY: AtomicU64 = AtomicU64::new(0);
@@ -315,6 +317,112 @@ impl Drop for Mapped {
         // SAFETY: the mapping `map` made, unmapped once.
         unsafe { libc::munmap(self.at.cast_mut().cast(), self.len) };
     }
+}
+
+/// The [`Stamp`] of a `stat` of a name, not followed through a symlink.
+#[cfg(unix)]
+pub(crate) fn stamp_of(stat: &libc::stat) -> Stamp {
+    let ns = |s: i64, n: i64| (s as u64).wrapping_mul(1_000_000_000).wrapping_add(n as u64);
+    Stamp {
+        ino: stat.st_ino as u64,
+        size: stat.st_size as u64,
+        mtime_ns: ns(stat.st_mtime as i64, stat.st_mtime_nsec as i64),
+        ctime_ns: ns(stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+        #[allow(clippy::useless_conversion, reason = "st_mode is u16 on macOS, u32 on Linux")]
+        mode: u32::from(stat.st_mode),
+    }
+}
+
+/// The root's directory, opened once for a batch of `fstatat`s relative to it.
+#[cfg(unix)]
+fn open_dir(root: &Path) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::{fd::FromRawFd as _, unix::ffi::OsStrExt as _};
+    let path = std::ffi::CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))?;
+    // SAFETY: a NUL-terminated path; the result is a descriptor of its own or -1.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(error.kind(), format!("{}: {error}", root.display())));
+    }
+    // SAFETY: the call returned a descriptor of its own.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+/// One name's stamp, relative to the directory `dir`.
+#[cfg(unix)]
+fn stamp_at(dir: std::os::fd::RawFd, name: &std::ffi::CStr) -> Stamp {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: an open directory, a NUL-terminated relative name and room for one `stat`.
+    let failed =
+        unsafe { libc::fstatat(dir, name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0;
+    if failed {
+        return match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR) => Stamp::GONE,
+            _ => Stamp::UNKNOWN,
+        };
+    }
+    // SAFETY: the call succeeded, so it filled the `stat`.
+    stamp_of(unsafe { &stat.assume_init() })
+}
+
+/// How many names one thread of a sweep stamps.
+#[cfg(unix)]
+const SWEEP_CHUNK: usize = 2048;
+
+/// Every name's stamp, in order: [`crate::Effect::Stamp`] where the system has no batched
+/// stat, as `fstatat`s relative to the root on up to 8 threads at once. Fails only when the
+/// root cannot be opened.
+#[cfg(unix)]
+pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
+    use std::os::fd::AsRawFd as _;
+    let dir = open_dir(root)?;
+    let dir = dir.as_raw_fd();
+    let mut out = vec![Stamp::GONE; names.len()];
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get().min(8));
+    if names.len() <= SWEEP_CHUNK || threads == 1 {
+        for (at, stamp) in out.iter_mut().enumerate() {
+            *stamp = stamp_at(dir, names.c_str(at));
+        }
+        return Ok(out);
+    }
+    let each = names.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (n, stamps) in out.chunks_mut(each).enumerate() {
+            scope.spawn(move || {
+                for (at, stamp) in stamps.iter_mut().enumerate() {
+                    *stamp = stamp_at(dir, names.c_str(n * each + at));
+                }
+            });
+        }
+    });
+    Ok(out)
+}
+
+/// What is directly in `dir` (named `name` under the root), each with its stamp, sorted by
+/// name; symbolic links are stamped themselves.
+#[cfg(unix)]
+pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Stamp)>> {
+    use std::os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _};
+    let fd = open_dir(dir)?;
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())))?
+    {
+        let entry = entry?;
+        let file = entry.file_name();
+        let Some(file) = file.to_str().and_then(|it| FileName::new(&format!("{name}/{it}"))) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: a name that is not UTF-8", entry.path().display()),
+            ));
+        };
+        let leaf = std::ffi::CString::new(entry.file_name().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "a name with a NUL"))?;
+        found.push((file, stamp_at(fd.as_raw_fd(), &leaf)));
+    }
+    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]

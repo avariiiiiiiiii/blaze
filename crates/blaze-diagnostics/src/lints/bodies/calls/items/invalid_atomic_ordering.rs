@@ -21,7 +21,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use super::FnItems;
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::Diag,
 };
@@ -51,6 +51,10 @@ enum Ordering {
 impl LatePass for InvalidAtomicOrdering {
     fn name(&self) -> &'static str {
         "InvalidAtomicOrdering"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

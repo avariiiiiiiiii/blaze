@@ -299,7 +299,7 @@ pub fn is_impossible_associated_item(
         .skip_binder()
         .filter(|clause| clause.visit_with(&mut OwnParam(parent)).is_continue())
     {
-        let clause = EarlyBinder::bind(clause).instantiate(interner, args).skip_norm_wip();
+        let clause = EarlyBinder::bind(interner, clause).instantiate(interner, args).skip_norm_wip();
         // Coherence answers a trait goal only a crate upstream of `krate` could implement
         // (`io::Error: Ord`) as ambiguous, since that crate may add the impl; rust-analyzer's
         // solver takes every crate as local, so the goal is left out here instead.

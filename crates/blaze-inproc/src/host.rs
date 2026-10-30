@@ -159,21 +159,16 @@ impl Host {
         let mut args = Vec::with_capacity(launch.args.len() + 1);
         args.push(launch.argv0.clone());
         args.extend(launch.args.iter().cloned());
-        let sandbox = match &launch.sandbox {
-            Sandbox::Off => Sandbox::Off,
-            Sandbox::On { read, write, network, trace } => {
-                let mut read = read.clone();
-                read.push(self.loader.clone());
-                // Connecting to a Unix socket is a write of the socket alone: the program gets
-                // neither the directory nor the other runs' sockets in it. A named pipe is not
-                // a path the sandbox's file rules cover.
-                let mut write = write.clone();
-                if cfg!(unix) {
-                    write.push(PathBuf::from(&self.address));
-                }
-                Sandbox::On { read, write, network: *network, trace: *trace }
+        let mut sandbox = launch.sandbox.clone();
+        if let Sandbox::On { read, write, .. } = &mut sandbox {
+            read.push(self.loader.clone());
+            // Connecting to a Unix socket is a write of the socket alone: the program gets
+            // neither the directory nor the other runs' sockets in it. A named pipe is not a
+            // path the sandbox's file rules cover.
+            if cfg!(unix) {
+                write.push(PathBuf::from(&self.address));
             }
-        };
+        }
         let command = Command {
             program: self.loader.clone(),
             args,
@@ -240,13 +235,33 @@ const START: Duration = Duration::from_secs(60);
 /// A program placed in a code memory, which any number of processes run: what the daemon's
 /// dev `run` and test paths hold where they held an executable's path. Each
 /// [`Program::command`] is a launch, spawned as the command it gives; a thread of its own waits
-/// for the loader, attaches the process to the memory and hands the session on (to
-/// `blaze-lazy`'s runner, which serves the process's requests on its channel).
+/// for the loader, attaches the process to the memory and hands the session on (to whoever
+/// serves the process's requests on its channel: `blaze-lazy`'s runner).
 pub struct Program {
     host: Arc<Host>,
     memory: Arc<Mutex<CodeMemory>>,
     format: Format,
     sessions: mpsc::Sender<Result<Session, Error>>,
+    starts: Arc<Mutex<Starts>>,
+}
+
+/// One [`Program::command`]'s process, for [`Program::exited`]: the spawn's completion names
+/// no process ID.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Started(u64);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Start {
+    Waiting,
+    Attached(u32),
+    /// Ended before its loader finished the handshake.
+    Ended,
+}
+
+#[derive(Default)]
+struct Starts {
+    next: u64,
+    starts: HashMap<u64, Start>,
 }
 
 impl Program {
@@ -256,7 +271,7 @@ impl Program {
         format: Format,
         sessions: mpsc::Sender<Result<Session, Error>>,
     ) -> Program {
-        Program { host, memory, format, sessions }
+        Program { host, memory, format, sessions, starts: Arc::default() }
     }
 
     pub fn memory(&self) -> &Arc<Mutex<CodeMemory>> {
@@ -267,7 +282,7 @@ impl Program {
     /// path becomes the program's `argv[0]`, and its arguments, environment, directory, stdin,
     /// sandbox and memory limit stay. `forks` says the process forks children that run the
     /// program (a fork server): see [`CodeMemory::attach_forking`].
-    pub fn command(&self, command: Command, forks: bool) -> Result<Command, Error> {
+    pub fn command(&self, command: Command, forks: bool) -> Result<(Command, Started), Error> {
         let (command, pending) = {
             let memory = lock(&self.memory);
             let launch = Launch {
@@ -284,30 +299,87 @@ impl Program {
             };
             self.host.launch(&launch)?
         };
+        let started = {
+            let mut starts = lock_starts(&self.starts);
+            starts.next += 1;
+            let id = starts.next;
+            starts.starts.insert(id, Start::Waiting);
+            Started(id)
+        };
         let memory = self.memory.clone();
+        let starts = self.starts.clone();
         let sessions = self.sessions.clone();
         std::thread::Builder::new()
             .name("blaze-inproc start".to_owned())
             .spawn(move || {
                 let session = pending.wait(START).and_then(|session| {
-                    let mut memory = lock(&memory);
-                    match forks {
-                        true => memory.attach_forking(session.pid, session.base)?,
-                        false => memory.attach(session.pid, session.base)?,
+                    let mut starts = lock_starts(&starts);
+                    match starts.starts.get(&started.0) {
+                        Some(Start::Waiting) => {}
+                        _ => {
+                            starts.starts.remove(&started.0);
+                            return Err(Error::new(format!(
+                                "process {} ended while its loader started the program",
+                                session.pid
+                            )));
+                        }
                     }
-                    Ok(session)
+                    let mut memory = lock(&memory);
+                    let attached = match forks {
+                        true => memory.attach_forking(session.pid, session.base),
+                        false => memory.attach(session.pid, session.base),
+                    };
+                    match attached {
+                        Ok(()) => {
+                            starts.starts.insert(started.0, Start::Attached(session.pid));
+                            Ok(session)
+                        }
+                        Err(error) => {
+                            starts.starts.remove(&started.0);
+                            Err(error)
+                        }
+                    }
                 });
+                if session.is_err() {
+                    let mut starts = lock_starts(&starts);
+                    match starts.starts.get(&started.0) {
+                        Some(Start::Waiting) => {
+                            starts.starts.insert(started.0, Start::Ended);
+                        }
+                        Some(Start::Ended) => {
+                            starts.starts.remove(&started.0);
+                        }
+                        _ => {}
+                    }
+                }
                 let _ = sessions.send(session);
             })
             .map_err(|it| Error::new(format!("starting the thread that waits for a loader: {it}")))?;
-        Ok(command)
+        Ok((command, started))
     }
 
-    /// The process `pid` this program's commands started exited, and every child it forked
-    /// too: its threads hold no fence any more.
-    pub fn exited(&self, pid: u32) {
-        lock(&self.memory).exited(pid);
+    /// The process of `started` exited, and every child it forked too: its threads hold no
+    /// fence any more.
+    pub fn exited(&self, started: Started) {
+        let mut starts = lock_starts(&self.starts);
+        match starts.starts.get(&started.0).copied() {
+            Some(Start::Attached(pid)) => {
+                starts.starts.remove(&started.0);
+                lock(&self.memory).exited(pid);
+            }
+            Some(Start::Waiting) => {
+                starts.starts.insert(started.0, Start::Ended);
+            }
+            Some(Start::Ended) => {
+                starts.starts.remove(&started.0);
+            }
+            None => {}
+        }
     }
+}
+
+fn lock_starts(starts: &Mutex<Starts>) -> std::sync::MutexGuard<'_, Starts> {
+    starts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn lock(memory: &Mutex<CodeMemory>) -> std::sync::MutexGuard<'_, CodeMemory> {

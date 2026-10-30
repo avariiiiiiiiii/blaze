@@ -14,7 +14,8 @@ use blaze_vfs::{View, ViewId};
 
 use crate::{
     Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, MemTree, Query, QueryKey,
-    QueryKind, Stored, table::Aligned,
+    QueryKind, Stored,
+    table::{Aligned, EdgeRecord},
 };
 
 #[derive(Clone, Copy)]
@@ -791,7 +792,143 @@ fn edges_round_trip_through_their_record() {
         read: QueryKey { kind: QueryKind(0x1234), input: ContentId([0xab; 32]) },
         saw: Fingerprint(0x0123_4567_89ab_cdef_0011_2233_4455_6677),
     };
+    let record = EdgeRecord::new(edge.read, edge.saw);
+    assert_eq!(record.edge(), edge);
     let bytes = crate::image::encode_edge(&edge);
     assert_eq!(bytes.len(), crate::table::EDGE_RECORD);
-    assert_eq!(crate::table::decode_edge(&bytes), edge);
+    assert_eq!(EdgeRecord::as_bytes(&[record]), bytes.as_slice(), "the image's layout, read in place");
+    let aligned = Aligned::copy(&bytes);
+    // SAFETY: `Aligned` is at a 16-byte boundary.
+    let read = unsafe { EdgeRecord::from_bytes(aligned.bytes()) };
+    assert_eq!(read.iter().map(EdgeRecord::edge).collect::<Vec<_>>(), vec![edge]);
+}
+
+/// Counts this thread's allocations while [`allocations`] runs its closure; other threads'
+/// are not counted.
+mod counting {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    pub(super) struct Counting;
+
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn note() {
+        _ = ON.try_with(|on| {
+            if on.get() {
+                _ = COUNT.try_with(|count| count.set(count.get() + 1));
+            }
+        });
+    }
+
+    // SAFETY: every call is passed to `System` as it came; counting touches only `const`
+    // thread-locals, which neither allocate nor run a destructor.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            note();
+            // SAFETY: the caller's contract, passed on.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            note();
+            // SAFETY: the caller's contract, passed on.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            note();
+            // SAFETY: the caller's contract, passed on.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: the caller's contract, passed on.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    /// How many times `f` allocated (or grew an allocation) on this thread.
+    pub(super) fn allocations(f: impl FnOnce()) -> usize {
+        COUNT.with(|count| count.set(0));
+        ON.with(|on| on.set(true));
+        f();
+        ON.with(|on| on.set(false));
+        COUNT.with(Cell::get)
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: counting::Counting = counting::Counting;
+
+static WARM_CX: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// [`Double`] asked twice: the second time is a warm hit inside a query, its allocations
+/// counted into [`WARM_CX`].
+struct AskTwice;
+
+impl Query for AskTwice {
+    const KIND: QueryKind = QueryKind(0x2f0c);
+    const NAME: &'static str = "ask twice";
+    const PRODUCER: ContentId = ContentId([14; 32]);
+    type Key = String;
+    type Value = Num;
+    fn input(key: &String) -> ContentId {
+        key_id(key)
+    }
+    fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
+        let first = cx.get::<Double>(key)?;
+        let mut second = None;
+        WARM_CX.store(counting::allocations(|| second = Some(cx.get::<Double>(key))), Ordering::SeqCst);
+        Ok(Num(first + second.expect("asked")?))
+    }
+}
+
+/// A hit on a key the view resolved, from outside a query and from inside one, allocates
+/// nothing: no key bytes, no run, no edge buffer, no clone of the value.
+#[test]
+fn a_warm_hit_allocates_nothing() {
+    let (mut db, tree) = setup();
+    db.register::<AskTwice>();
+    let one = view(&db, &tree, &[("a", "abc")]);
+    let name = "a".to_owned();
+    let pinned = db.pin();
+    assert_eq!(pinned.get::<Double>(one, &name), Ok(6));
+    let mut got = None;
+    let count = counting::allocations(|| got = Some(pinned.get::<Double>(one, &name)));
+    assert_eq!(got, Some(Ok(6)));
+    assert_eq!(count, 0, "a warm Pinned::get allocated");
+    drop(pinned);
+
+    assert_eq!(db.pin().get::<AskTwice>(one, &name), Ok(12));
+    assert_eq!(WARM_CX.load(Ordering::SeqCst), 0, "a warm Cx::get allocated");
+}
+
+/// The key bytes of a key asked once stay beside its memos, so another view can verify an
+/// edge on it with no caller naming it again; a key asked again is not encoded again.
+#[test]
+fn a_key_is_kept_once_and_runs_again_by_its_bytes() {
+    let (db, tree) = setup();
+    let one = view(&db, &tree, &[("a", "abc")]);
+    double(&db, one, "a");
+    let task = blaze_reclaim::enter();
+    let slot = db.slot(&task, &key::<Len>("a")).expect("len(a) ran");
+    let kept = slot.key().expect("its key's bytes").as_ptr();
+    drop(task);
+    double(&db, one, "a");
+    let task = blaze_reclaim::enter();
+    let again = db.slot(&task, &key::<Len>("a")).and_then(|slot| slot.key()).expect("still kept");
+    assert_eq!(again.as_ptr(), kept, "not encoded and swapped in again");
+    drop(task);
+
+    // Another view: double(a) verifies its edge on len(a), whose memo no longer holds, so
+    // len runs again from its kept bytes alone.
+    let longer = view(&db, &tree, &[("a", "abcd")]);
+    assert_eq!(db.pin().get::<Double>(longer, &"a".to_owned()), Ok(8));
+    assert_eq!(runs("len"), 2);
 }

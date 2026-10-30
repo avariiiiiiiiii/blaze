@@ -55,6 +55,7 @@ use crate::{
 };
 
 pub mod docs;
+pub mod stability;
 
 pub use self::docs::{Docs, IsInnerDoc};
 
@@ -221,6 +222,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                         attr_flags.insert(AttrFlags::IS_DERIVE_OR_BUILTIN_MACRO)
                     }
                     Some(Word::unstable) => attr_flags.insert(AttrFlags::IS_UNSTABLE),
+                    Some(Word::stable) => attr_flags.insert(AttrFlags::IS_STABLE),
                     Some(
                         Word::rustc_layout_scalar_valid_range_start
                         | Word::rustc_layout_scalar_valid_range_end,
@@ -557,6 +559,7 @@ name_set! {
     rustc_skip_during_method_dispatch,
     rustc_std_internal_symbol,
     skip,
+    stable,
     target_feature,
     thread_local,
     track_caller,
@@ -671,6 +674,8 @@ bitflags::bitflags! {
         const RUSTC_COMPTIME = 1 << 70;
         /// `#[panic_handler]`, one segment: `has_word(.., "panic_handler")`.
         const PANIC_HANDLER = 1 << 71;
+        /// `#[stable(..)]`: [`stability::stability`].
+        const IS_STABLE = 1 << 72;
     }
 }
 
@@ -849,6 +854,18 @@ fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<
             },
             _ => ControlFlow::Continue(()),
         })?;
+    attr_value(db, owner, krate, source.with_value(value))
+}
+
+/// The string a key-value attribute's value is, with the macros in it expanded by the
+/// resolver of `owner`.
+fn attr_value(
+    db: &dyn SourceDatabase,
+    owner: AttrDefId,
+    krate: Crate,
+    value: InFile<ast::Expr>,
+) -> Option<Symbol> {
+    let InFile { file_id, value } = value;
     // A string literal, the usual value, reads as `expand_attr_value` reads it, with no
     // resolver or span map built for it.
     let mut literal = value.clone();
@@ -862,7 +879,7 @@ fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<
         },
         ast::Expr::MacroExpr(_) => {
             let resolver = resolver_for_attr_def_id(db, owner);
-            let value = docs::expand_attr_value(db, krate, resolver, source.with_value(value))?;
+            let value = docs::expand_attr_value(db, krate, resolver, InFile::new(file_id, value))?;
             Some(Symbol::intern(&value))
         }
         _ => None,

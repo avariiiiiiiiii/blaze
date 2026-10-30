@@ -40,7 +40,9 @@ impl ConfigOf {
         }
         known.sort();
         known.dedup();
-        MountTable { mounts: mounts.to_vec(), outside: Vec::new(), known }
+        let mut mounts = mounts.to_vec();
+        mounts.sort();
+        MountTable { mounts, outside: Vec::new(), known }
     }
 
     pub fn read_file(&self, cx: &mut Cx<'_>, path: &str) -> Result<Found<Vec<u8>>, Cancelled> {
@@ -78,7 +80,7 @@ pub(crate) struct ConfigRead {
 }
 
 impl Versioned for Result<ConfigRead, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo config read 2");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo config read 3");
 }
 
 pub(crate) struct ConfigChain;
@@ -108,7 +110,7 @@ impl Query for ConfigChain {
             },
             ConfigOf::Fixed { cwd, env, .. } => (cwd.clone(), env.clone(), "build".to_owned(), Vec::new(), Vec::new()),
         };
-        let fill = Fill { config: key, own: None };
+        let fill = Fill { config: key, own: None, members: false };
         let mut read =
             ConfigRead { cwd, env, command, cli, unstable, snapshot: Snapshot::default(), warnings: Vec::new() };
         let (loaded, used) = run_over(cx, Snapshot::default(), &fill, |_, files| {

@@ -6,7 +6,7 @@ use hir_def::{AdtId, ItemContainerId, Lookup as _, VariantId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use rustc_type_ir::{
-    ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesPredicate, RegionKind, TypeFoldable,
+    ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesClause, RegionKind, TypeFoldable,
     TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
     TypeVisitor,
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _},
@@ -18,7 +18,7 @@ use hir_ty::{
     db::HirDatabase,
     next_solver::{
         AliasTy, Clause, DbInterner, GenericArg, GenericArgKind, GenericArgs, ParamEnv, Region,
-        SolverDefId, StoredRegion, StoredTy, Ty, TyKind, infer::InferCtxt,
+        RegionExt as _, StoredRegion, StoredTy, TraitAssocTyId, Ty, TyKind, infer::InferCtxt,
     },
 };
 
@@ -50,7 +50,7 @@ pub(crate) fn components<'db>(ty: Ty<'db>) -> Components<'db> {
         fn visit_ty(&mut self, ty: Ty<'db>) {
             match ty.kind() {
                 TyKind::Param(_) => self.0.push(Component::Param(ty)),
-                TyKind::Alias(_) if !ty.has_escaping_bound_vars() => {
+                TyKind::Alias(_, _) if !ty.has_escaping_bound_vars() => {
                     self.0.push(Component::Alias(ty))
                 }
                 TyKind::Bound(..) | TyKind::Placeholder(_) | TyKind::Infer(_) => (),
@@ -74,7 +74,7 @@ pub(crate) fn opaques<'db>(ty: Ty<'db>, out: &mut Vec<AliasTy<'db>>) {
     impl<'db> TypeVisitor<DbInterner<'db>> for Find<'_, 'db> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
-            if let TyKind::Alias(alias) = ty.kind()
+            if let TyKind::Alias(_, alias) = ty.kind()
                 && let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
             {
                 self.0.push(alias);
@@ -111,14 +111,14 @@ pub(crate) fn outlived_as<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Ty<'db>
                 TyKind::CoroutineClosure(_, args) => {
                     args.as_coroutine_closure().tupled_upvars_ty().fold_with(self)
                 }
-                TyKind::Alias(alias)
-                    if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
-                        && !rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+                TyKind::Alias(_, alias)
+                    if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
+                        && !rustc_type_ir::Interner::item_bounds(interner, def_id.into())
                             .iter_instantiated(interner, alias.args.as_slice())
                             .any(|clause| {
                                 matches!(
                                     clause.kind().skip_binder(),
-                                    ClauseKind::TypeOutlives(OutlivesPredicate(bounded, _))
+                                    ClauseKind::TypeOutlives(OutlivesClause(bounded, _))
                                         if bounded == ty
                                 )
                             }) =>
@@ -188,8 +188,8 @@ fn adt_needs<'db>(
         .map(|it| it.skip_norm_wip());
     clause_needs(clauses, out);
     for predicate in inferred.of(db, adt) {
-        let OutlivesPredicate(arg, region) =
-            EarlyBinder::bind(predicate).instantiate(interner, args).skip_norm_wip();
+        let OutlivesClause(arg, region) =
+            EarlyBinder::bind(interner, predicate).instantiate(interner, args).skip_norm_wip();
         out.push(match arg.kind() {
             GenericArgKind::Type(ty) => Needs::Type(ty, region),
             GenericArgKind::Lifetime(longer) => Needs::Region(longer, region),
@@ -205,10 +205,10 @@ pub(crate) fn clause_needs<'db>(
 ) {
     for clause in clauses {
         match clause.kind().skip_binder() {
-            ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) => {
+            ClauseKind::TypeOutlives(OutlivesClause(ty, region)) => {
                 out.push(Needs::Type(ty, region))
             }
-            ClauseKind::RegionOutlives(OutlivesPredicate(longer, shorter)) => {
+            ClauseKind::RegionOutlives(OutlivesClause(longer, shorter)) => {
                 out.push(Needs::Region(longer, shorter))
             }
             _ => (),
@@ -290,7 +290,7 @@ fn wf_into<'db>(
         TyKind::Array(inner, _) | TyKind::Slice(inner) | TyKind::RawPtr(inner, _) => {
             wf_into(db, inferred, inner, out, depth + 1)
         }
-        TyKind::Alias(alias) => args(inferred, alias.args, out),
+        TyKind::Alias(_, alias) => args(inferred, alias.args, out),
         _ => (),
     }
 }
@@ -313,7 +313,7 @@ pub(crate) fn projection_needs<'db>(
     let predicates = aliases
         .into_iter()
         .filter_map(|it| match it.kind() {
-            TyKind::Alias(alias)
+            TyKind::Alias(_, alias)
                 if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. })
                     && !it.has_escaping_bound_vars()
                     && !it.references_error() =>
@@ -348,7 +348,7 @@ pub(crate) fn trait_needs<'db>(
             continue;
         }
         match it.kind() {
-            TyKind::Alias(alias)
+            TyKind::Alias(_, alias)
                 if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
             {
                 predicates.push(trait_predicate(interner, alias));
@@ -378,9 +378,9 @@ fn trait_predicate<'db>(
     alias: AliasTy<'db>,
 ) -> hir_ty::next_solver::Predicate<'db> {
     use rustc_type_ir::Upcast as _;
-    rustc_type_ir::TraitPredicate {
+    rustc_type_ir::TraitClause {
         trait_ref: alias.trait_ref(interner),
-        polarity: rustc_type_ir::PredicatePolarity::Positive,
+        polarity: rustc_type_ir::ClausePolarity::Positive,
     }
     .upcast(interner)
 }
@@ -553,14 +553,14 @@ impl<'db> Inferred<'db> {
         &self,
         db: &'db dyn HirDatabase,
         adt: AdtId,
-    ) -> impl Iterator<Item = OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>> + use<'db>
+    ) -> impl Iterator<Item = OutlivesClause<DbInterner<'db>, GenericArg<'db>>> + use<'db>
     {
         inferred_outlives(db, adt).0.iter().map(|it| {
             let arg: GenericArg<'db> = match &it.arg {
                 InferredArg::Type(ty) => ty.as_ref().into(),
                 InferredArg::Region(region) => region.as_ref().into(),
             };
-            OutlivesPredicate(arg, it.region.as_ref())
+            OutlivesClause(arg, it.region.as_ref())
         })
     }
 }
@@ -606,7 +606,7 @@ fn inferred_outlives(db: &dyn HirDatabase, adt: AdtId) -> InferredOutlives {
     InferredOutlives(
         found
             .into_iter()
-            .filter_map(|OutlivesPredicate(arg, region)| {
+            .filter_map(|OutlivesClause(arg, region)| {
                 let arg = match arg.kind() {
                     GenericArgKind::Type(ty) => InferredArg::Type(ty.store()),
                     GenericArgKind::Lifetime(region) => InferredArg::Region(region.store()),
@@ -640,7 +640,7 @@ fn inferred_outlives_cycle_fn(
 fn required<'db>(
     db: &'db dyn HirDatabase,
     ty: Ty<'db>,
-    found: &mut Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>>,
+    found: &mut Vec<OutlivesClause<DbInterner<'db>, GenericArg<'db>>>,
 ) {
     let interner = DbInterner::new_no_crate(db);
     let mut needs = Vec::new();
@@ -652,8 +652,9 @@ fn required<'db>(
                 .map(|it| it.skip_norm_wip());
             clause_needs(clauses, &mut needs);
             for predicate in Inferred::default().of(db, def.def_id()) {
-                let OutlivesPredicate(arg, region) =
-                    EarlyBinder::bind(predicate).instantiate(interner, args).skip_norm_wip();
+                let OutlivesClause(arg, region) = EarlyBinder::bind(interner, predicate)
+                    .instantiate(interner, args)
+                    .skip_norm_wip();
                 match arg.kind() {
                     GenericArgKind::Type(ty) => needs.push(Needs::Type(ty, region)),
                     GenericArgKind::Lifetime(longer) => needs.push(Needs::Region(longer, region)),
@@ -661,9 +662,9 @@ fn required<'db>(
                 }
             }
         }
-        TyKind::Alias(alias)
-            if let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
-                && let SolverDefId::TypeAliasId(item) = alias.kind.def_id()
+        TyKind::Alias(_, alias)
+            if let rustc_type_ir::AliasTyKind::Projection { def_id: TraitAssocTyId(item) } =
+                alias.kind
                 && let ItemContainerId::TraitId(trait_) = item.lookup(db).container =>
         {
             let clauses = GenericPredicates::query_all(db, trait_.into())
@@ -682,11 +683,11 @@ fn required<'db>(
                         Component::Param(ty) | Component::Alias(ty) => ty.into(),
                         Component::Region(_) => continue,
                     };
-                    found.push(OutlivesPredicate(arg, region));
+                    found.push(OutlivesClause(arg, region));
                 }
             }
             Needs::Region(longer, shorter) if is_free(longer) && is_free(shorter) => {
-                found.push(OutlivesPredicate(longer.into(), shorter));
+                found.push(OutlivesClause(longer.into(), shorter));
             }
             _ => (),
         }
@@ -823,9 +824,9 @@ impl<'db> Known<'db> {
         region: Region<'db>,
         depth: usize,
     ) -> bool {
-        let TyKind::Alias(alias) = ty.kind() else { return true };
+        let TyKind::Alias(_, alias) = ty.kind() else { return true };
+        let rustc_type_ir::AliasTyKind::Projection { def_id } = alias.kind else { return true };
         if depth > 8
-            || !matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. })
             || ty.has_non_region_infer()
             || ty.references_error()
             || self
@@ -837,10 +838,10 @@ impl<'db> Known<'db> {
         }
         let interner = DbInterner::new_no_crate(db);
         let declared: Vec<Region<'db>> =
-            rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+            rustc_type_ir::Interner::item_bounds(interner, def_id.into())
                 .iter_instantiated(interner, alias.args.as_slice())
                 .filter_map(|clause| match clause.kind().skip_binder() {
-                    ClauseKind::TypeOutlives(OutlivesPredicate(bounded, bound))
+                    ClauseKind::TypeOutlives(OutlivesClause(bounded, bound))
                         if bounded == ty && !bound.has_escaping_bound_vars() =>
                     {
                         Some(bound)

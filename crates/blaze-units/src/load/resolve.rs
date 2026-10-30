@@ -22,7 +22,7 @@ use blaze_resolve::{
     Dependency, IndexSummary, MemRegistry, PackageId, PackageIdSpec, PartialVersion, QueryKind, Registry, Resolve,
     ResolveVersion, RustVersion, SourceId, Summary,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::manifest::manifest_source;
 use super::source::{Index, Located, Sources};
@@ -345,19 +345,17 @@ fn path_packages(
     replace: &[(PackageIdSpec, Dependency)],
     ctx: &Context,
 ) -> anyhow::Result<Vec<Package>> {
-    let members: Vec<PathBuf> = ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
+    let mut seen: FxHashSet<PathBuf> = ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
     let mut queue = summary::patch_paths(root);
     queue.extend(summary::replace_paths(replace));
     for (path, m) in ws.members() {
         queue.extend(summary::path_dependencies(&serde_json::to_value(export_package(path, m))?));
     }
-    let mut seen: Vec<PathBuf> = members;
     let mut read = Vec::new();
     while let Some(dir) = queue.pop() {
-        if seen.contains(&dir) {
+        if !seen.insert(dir.clone()) {
             continue;
         }
-        seen.push(dir.clone());
         let manifest_path = dir.join("Cargo.toml");
         let source = blaze_manifest::source::SourceId::for_path(&dir)?;
         let EitherManifest::Real(manifest) = read_manifest(&manifest_path, source, ctx)? else {

@@ -1116,7 +1116,10 @@ impl<'a> Stage<'a> {
             affected.extend(self.fresh.iter());
             affected.extend(self.removed.iter().copied());
             let ids: Vec<PieceId> = affected.iter().collect();
-            let imports = !Arc::ptr_eq(&self.old.resolved, &self.new.resolved) || self.old.tls != self.new.tls;
+            let (old_resolved, new_resolved) = (&self.old.resolved, &self.new.resolved);
+            let imports = !Arc::ptr_eq(&old_resolved.imports, &new_resolved.imports)
+                || !Arc::ptr_eq(&old_resolved.libraries, &new_resolved.libraries)
+                || self.old.tls != self.new.tls;
             let batch = entries.collect(&ids, Want { loader: true, got: !imports, functions: true })?;
             let (binds, got) = if imports {
                 let every: Vec<PieceId> = (0..self.new.piece_count()).collect();

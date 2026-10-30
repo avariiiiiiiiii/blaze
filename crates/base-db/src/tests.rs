@@ -1,4 +1,7 @@
-use std::fmt;
+use std::{
+    fmt,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
@@ -12,10 +15,10 @@ use vfs::{
 
 use crate::{
     BuiltDependency, ContentId, Crate, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin,
-    CrateWorkspaceData, CratesMap, DependencyBuilder, Env, FileSourceRootInput, FileText, Files,
-    Nonce, SourceDatabase, SourceRoot, SourceRootId, SourceRootInput, TargetKind, ViewChange,
-    ViewError, ViewFile, ViewRoot, all_crates_content, cfg_options_content,
-    set_all_crates_with_durability,
+    CrateType, CrateTypes, CrateWorkspaceData, CratesMap, DependencyBuilder, EditionedFileId, Env,
+    FileSourceRootInput, FileText, Files, Nonce, SourceDatabase, SourceRoot, SourceRootId,
+    SourceRootInput, TargetKind, ViewChange, ViewError, ViewFile, ViewRoot, all_crates_content,
+    cfg_options_content, install_plane_hooks, run_on_pool, set_all_crates_with_durability,
 };
 
 #[salsa::db]
@@ -243,6 +246,37 @@ fn a_file_text_edit_changes_its_id_and_its_source_roots() {
 }
 
 #[test]
+fn a_files_parse_shares_its_text() {
+    let mut db = TestDb::new();
+    let files = load(&mut db, 0, FILES);
+    let parse = EditionedFileId::new(&db, files[1], Edition::Edition2021).parse(&db);
+    let root = parse.syntax_node();
+    let tree = root.flat_tree().expect("a parsed file is a flat tree");
+    assert!(std::sync::Arc::ptr_eq(tree.source(), db.file_text(files[1]).text(&db)));
+}
+
+/// #1294: a dependency's file is an outline, whose `fn` bodies stay unparsed until reached.
+#[test]
+fn a_library_files_parse_leaves_bodies_unparsed() {
+    let mut db = TestDb::new();
+    let files = load(&mut db, 0, &[("/a/lib.rs", "fn f() { let x = 1 + 1; }")]);
+    let body_is_lazy = |db: &TestDb| {
+        let parse = EditionedFileId::new(db, files[0], Edition::Edition2021).parse(db);
+        let root = parse.syntax_node();
+        let function = root.children().next().expect("the `fn`");
+        let body = function.children().find(|it| it.kind() == syntax::SyntaxKind::BLOCK_EXPR);
+        body.expect("its body").is_lazy()
+    };
+    assert!(!body_is_lazy(&db));
+
+    let mut set = FileSet::default();
+    set.insert(files[0], VfsPath::new_virtual_path("/a/lib.rs".to_owned()));
+    let root = Arc::new(SourceRoot::new_library(set));
+    db.set_source_root_with_durability(SourceRootId(0), root, Durability::HIGH);
+    assert!(body_is_lazy(&db));
+}
+
+#[test]
 fn the_order_of_cfg_atoms_does_not_change_a_crates_id() {
     let atoms = [flag("unix"), key_value("feature", "a"), key_value("feature", "b"), flag("test")];
     let mut reversed = atoms.clone();
@@ -286,6 +320,25 @@ fn a_dependencys_change_changes_its_dependents_ids() {
 
     b.set_env(&mut db, Env::default());
     assert_eq!(ids(&db), before);
+}
+
+#[test]
+fn a_crates_types_read_back_and_are_in_its_id() {
+    let mut db = TestDb::new();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let a = graph.set_in_db(&mut db)[&a];
+    assert_eq!(a.data(&db).crate_types, CrateTypes::of(&[CrateType::Lib]));
+    let as_lib = a.content(&db);
+
+    let mut data = a.data(&db).clone();
+    data.crate_types = CrateTypes::of(&[CrateType::Cdylib, CrateType::Rlib]);
+    a.set_data(&mut db, data);
+    let types = a.data(&db).crate_types;
+    assert_eq!(types.iter().collect::<Vec<_>>(), [CrateType::Rlib, CrateType::Cdylib]);
+    assert!(!types.contains(CrateType::Lib));
+    assert_ne!(a.content(&db), as_lib);
 }
 
 #[test]
@@ -736,4 +789,41 @@ fn a_view_set_over_others_is_the_view_set_alone() {
         );
         before = whole;
     }
+}
+
+fn two_workers() -> blaze_graph::pool::Pool {
+    blaze_graph::pool::Pool::new(&blaze_graph::topology::Topology::flat(2), false).unwrap()
+}
+
+#[test]
+fn a_task_that_waited_on_itself_runs_again() {
+    install_plane_hooks();
+    install_plane_hooks();
+    let db = TestDb::new();
+    let pool = two_workers();
+    let runs: Vec<AtomicUsize> = (0..8).map(|_| AtomicUsize::new(0)).collect();
+    run_on_pool(&db, &pool, runs.len(), &|_: &dyn SourceDatabase, at: usize| {
+        if runs[at].fetch_add(1, Ordering::Relaxed) == 0 && at % 3 == 0 {
+            std::panic::resume_unwind(Box::new(salsa::Cancelled::WouldWaitOnItself));
+        }
+    });
+    let runs: Vec<usize> = runs.iter().map(|it| it.load(Ordering::Relaxed)).collect();
+    assert_eq!(runs, [2, 1, 1, 2, 1, 1, 2, 1]);
+}
+
+#[test]
+fn any_other_panic_of_a_task_reaches_the_caller() {
+    let db = TestDb::new();
+    let pool = two_workers();
+    let ran = AtomicUsize::new(0);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_on_pool(&db, &pool, 4, &|_: &dyn SourceDatabase, at: usize| {
+            ran.fetch_add(1, Ordering::Relaxed);
+            if at == 2 {
+                std::panic::resume_unwind(Box::new("task 2 failed"));
+            }
+        });
+    }));
+    assert_eq!(caught.unwrap_err().downcast_ref::<&str>(), Some(&"task 2 failed"));
+    assert_eq!(ran.load(Ordering::Relaxed), 4);
 }

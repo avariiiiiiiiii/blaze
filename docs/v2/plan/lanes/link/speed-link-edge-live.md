@@ -130,6 +130,10 @@ Linux. There are `const` size asserts on `Span` (24 bytes).
 
 ## Safety audit
 
+[speed-link-edge-live-safety](speed-link-edge-live-safety.md) has since fixed what this section
+leaves as "NOT upheld". v1 now writes jumps and statics with every other thread stopped, and
+`slots` writes data by atomic stores. Read that doc for the current state.
+
 The `safety-audit` lane's findings on blaze-live are in `v2/requests/link.md`, under "## From
 safety-audit". The answer, and what the linker owes, is item 12 there. Every proposed comment
 and split is applied, in the v1 modules too, since blaze-engine, blaze-cargo, the demos and the

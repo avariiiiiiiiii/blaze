@@ -29,9 +29,10 @@ use blaze_usercode::{
     },
 };
 use blaze_units::schema::{Mode, Unit};
+use load_cargo::v2::Snapshot;
 
-use super::{Job, compile::TestOf, graph::flag, package_of};
-use crate::serve::work::{Failed, Runs, Selection};
+use super::{Job, UnitReader, compile::TestOf, graph::flag, package_of};
+use crate::serve::work::{Failed, Runs, Selection, Writer};
 
 /// How long one test may run: libtest sets no limit, so a day, past which it is surely hung.
 const TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -144,7 +145,7 @@ struct UbTest {
 /// the build's order, each unit's by name as libtest sorts them. Its harness's listing
 /// ([`super::codegen::test_roots`]) gives the same names and attributes as a compiled test
 /// binary's.
-pub(crate) fn ub_tests(job: &Job, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
+pub(crate) fn ub_tests(job: &Job, reader: &UnitReader, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
     if !selection.all {
         return Err(ApiError::new(
             "`blaze test --ub` runs every test it selects: which tests a change reached is known from \
@@ -168,7 +169,7 @@ pub(crate) fn ub_tests(job: &Job, selection: Selection<'_>) -> Result<Vec<String
         let binary = u32::try_from(binaries.len()).expect("under 2^32 units");
         binaries.push(super::artifact::executable(unit, job.plan(at)?).unwrap_or_else(|| unit.target.name.clone()));
         let target = target_name(unit);
-        let roots = super::codegen::test_roots(job, at).map_err(|what| ApiError::new(what, Some(unit.target.name.clone())))?;
+        let roots = super::codegen::test_roots(job, reader, at).map_err(|what| ApiError::new(what, Some(unit.target.name.clone())))?;
         let first = tests.len();
         tests.reserve(roots.tests.len());
         for listed in &roots.tests {
@@ -205,10 +206,10 @@ pub(crate) fn ub_tests(job: &Job, selection: Selection<'_>) -> Result<Vec<String
     Ok(keys)
 }
 
-/// Test `key` of [`ub_tests`] run in blaze's MIR evaluator under `ub`, nothing compiled; a
-/// bench is refused, naming it (libtest runs one once with a `Bencher`, which the evaluator
-/// has no part of).
-pub(crate) fn evaluate(job: &Job, key: &str, ub: Ub) -> Result<TestResult, Failed> {
+/// Test `key` of [`ub_tests`] run in blaze's MIR evaluator under `ub` on `db`, the task's
+/// snapshot, nothing compiled; a bench is refused, naming it (libtest runs one once with a
+/// `Bencher`, which the evaluator has no part of).
+pub(crate) fn evaluate(job: &Job, db: &Snapshot, key: &str, ub: Ub) -> Result<TestResult, Failed> {
     let selected = job.ub.get();
     let test = selected
         .and_then(|it| it.find(key))
@@ -229,18 +230,28 @@ pub(crate) fn evaluate(job: &Job, key: &str, ub: Ub) -> Result<TestResult, Faile
         return Ok(result(TestOutcome::Failed, what.to_owned(), 0));
     }
     let began = Instant::now();
-    let db = job.lowered.snapshot();
-    let config = hir_ty_ub::Config { seed: ub.seed, schedules: ub.schedules, ..hir_ty_ub::Config::default() };
-    let outcome = hir_ty_ub::run_test(&db, test.function, &config);
+    let outcome = hir_ty_ub::run_test(db, test.function, &ub_config(ub));
     let millis = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
     let ran = match &outcome {
-        hir_ty_ub::Outcome::Passed => Ran::Returned,
+        hir_ty_ub::Outcome::Passed { .. } => Ran::Returned,
         hir_ty_ub::Outcome::Failed { message, .. } => Ran::Panicked(message),
         hir_ty_ub::Outcome::Ub { report, seed, .. } => Ran::Ub { report, seed: *seed },
-        hir_ty_ub::Outcome::Unsupported { what, .. } => Ran::Unsupported(what),
+        hir_ty_ub::Outcome::Unsupported { what } => Ran::Unsupported(what),
+        hir_ty_ub::Outcome::Error { message, seed } => Ran::Stopped { message, seed: *seed },
     };
     let (outcome, output) = judged(ran, &test.should_panic);
     Ok(result(outcome, output, millis))
+}
+
+/// `blaze test --ub`'s settings as the checker takes them: what the request leaves out is the
+/// checker's default.
+pub(crate) fn ub_config(ub: Ub) -> hir_ty_ub::Config {
+    let default = hir_ty_ub::Config::default();
+    hir_ty_ub::Config {
+        seed: ub.seed.unwrap_or(default.seed),
+        schedules: ub.schedules.unwrap_or(default.schedules),
+        ..default
+    }
 }
 
 /// How a test ended in the evaluator.
@@ -253,6 +264,9 @@ pub(crate) enum Ran<'a> {
     Ub { report: &'a str, seed: u64 },
     /// What the evaluator can't run.
     Unsupported(&'a str),
+    /// The evaluator stopped with an error of its own (no layout, a MIR lowering error, a stack
+    /// overflow, undefined behavior it found itself), on the schedule of `seed`.
+    Stopped { message: &'a str, seed: u64 },
 }
 
 /// Whether a test that ran as `ran` passed, as libtest's `calc_result` judges it with its
@@ -277,6 +291,9 @@ pub(crate) fn judged(ran: Ran<'_>, expects: &ShouldPanic) -> (TestOutcome, Strin
         (Ran::Ub { report, seed }, _) => (TestOutcome::Failed, format!("{report}\nseed: {seed}\n")),
         (Ran::Unsupported(what), _) => {
             (TestOutcome::Failed, format!("blaze's MIR evaluator can't run this test: {what}\n"))
+        }
+        (Ran::Stopped { message, seed }, _) => {
+            (TestOutcome::Failed, format!("blaze's MIR evaluator stopped: {message}\nseed: {seed}\n"))
         }
     }
 }
@@ -458,7 +475,13 @@ impl TestRun {
 }
 
 impl Runs for TestRun {
-    fn start(&mut self, store: &Store, effects: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
+    fn start(
+        &mut self,
+        store: &Store,
+        _writer: Option<&mut dyn Writer>,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
         let mut binaries = Vec::with_capacity(self.suites.len());
         for suite in &mut self.suites {
             let Some(mut binary) = suite.binary.take() else { continue };
@@ -523,6 +546,7 @@ impl Runs for TestRun {
         &mut self,
         completion: Completion,
         store: &mut Store,
+        _writer: Option<&mut dyn Writer>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {

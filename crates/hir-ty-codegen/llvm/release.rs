@@ -8,7 +8,10 @@
 //! a parameter the summary calls unused is passed `poison` by the callers, and is unused in
 //! the code only because it is the same IR.
 
-use blaze_codegen::summary::{Arg, Attrs};
+use blaze_codegen::{
+    settings::{Sanitize, Sanitizers},
+    summary::{Arg, Attrs},
+};
 use cranelift_codegen::ir;
 use inkwell::{
     GlobalVisibility,
@@ -28,7 +31,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::{
     INNER, Machine, Machinery, OWN, REBASED, Symbol, Unhandled, agree_calls, attribute_kind, emitted, link,
     lower::{Debug, Defined, Lowering},
-    mark_hint, rebase, retold_bytes, told_constants, wrap,
+    mark_hint, rebase, retold_bytes,
+    sanitize::{self, Covered},
+    told_constants, wrap,
 };
 use crate::{
     DataIdentity,
@@ -124,7 +129,8 @@ fn run(module: &Module<'_>, passes: &str, machine: &Machinery, vectorize: bool) 
 /// Lowers `func` alone into a module, runs the pre-link pipeline of `optimization` on it,
 /// and reads what its summary says. `instances` says which of the function requests of
 /// `wants` are functions of the build (the others are outside symbols). `debug` asks for its
-/// line table and variables.
+/// line table and variables. The function has the attributes of the sanitizers of `sanitize`
+/// that `unsanitized` leaves on ([`sanitize::mark`]).
 pub(crate) fn prelink(
     wants: &Wants,
     func: &ir::Function,
@@ -133,6 +139,8 @@ pub(crate) fn prelink(
     debug: bool,
     optimization: Optimization,
     instances: &dyn Fn(u32) -> bool,
+    sanitize: &Sanitize,
+    unsanitized: Sanitizers,
 ) -> Result<Prelinked, Unhandled> {
     let tally = Tally::global();
     Machine::with(optimization, |context, machine| {
@@ -158,6 +166,7 @@ pub(crate) fn prelink(
         let function = tally.time(Phase::Lower, || {
             let function = Lowering::add(context, &module, &own)?;
             mark_hint(context, function, hint);
+            sanitize::mark(context, function, sanitize, unsanitized);
             Lowering::define(
                 context,
                 &module,
@@ -554,7 +563,9 @@ fn optimistic<'ctx>(
 /// Compiles the function of `own`, a module [`prelink`] made, with `imports` linked in as
 /// bodies only available externally and what `given` says applied, through the post-link
 /// pipeline of `optimization`. `wants` has the function's requests and, after them, those
-/// of the imports (`Import::funcs`, `Import::datas`); `signature` is the function's.
+/// of the imports (`Import::funcs`, `Import::datas`); `signature` is the function's. The
+/// code is instrumented for `sanitize` once optimized, and what SanitizerCoverage made for
+/// it comes with it.
 pub(crate) fn compile(
     wants: &mut Wants,
     own: &[u8],
@@ -562,7 +573,8 @@ pub(crate) fn compile(
     imports: &[Import],
     given: &Given,
     optimization: Optimization,
-) -> Result<Code, Unhandled> {
+    sanitize: &Sanitize,
+) -> Result<(Code, Covered), Unhandled> {
     let tally = Tally::global();
     // Where a parameter is the only way to its memory, as `compiled` wraps it.
     let wrapped = optimization.pipeline().is_some()
@@ -602,6 +614,7 @@ pub(crate) fn compile(
         if !imports.is_empty() {
             run(&module, "elim-avail-extern", machine, false)?;
         }
+        sanitize::instrument(&module, machine, sanitize)?;
         retold_bytes(context, &module, &readonly);
         if module.get_function(INNER).is_some() {
             return Err(Unhandled::Shape("a body not built into the function that calls it"));
@@ -609,9 +622,13 @@ pub(crate) fn compile(
         let object = tally
             .time(Phase::Emit, || machine.write_to_memory_buffer(&module, FileType::Object))
             .map_err(llvm)?;
-        let read = [(OWN, signature.clone())];
-        let mut codes = tally.time(Phase::Read, || emitted::read(object.as_slice(), &read, wants))?;
-        codes.pop().ok_or(Unhandled::Shape("an object without the function"))?
+        let own = (OWN, signature.clone());
+        if sanitize.coverage.is_on() {
+            return tally.time(Phase::Read, || emitted::read_covered(object.as_slice(), own, wants));
+        }
+        let mut codes = tally.time(Phase::Read, || emitted::read(object.as_slice(), &[own], wants))?;
+        let code = codes.pop().ok_or(Unhandled::Shape("an object without the function"))??;
+        Ok((code, Covered::default()))
     })
 }
 

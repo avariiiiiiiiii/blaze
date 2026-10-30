@@ -36,6 +36,10 @@ pub struct Threads {
     /// By ticks since `start`.
     timers: Wheel<Tag>,
     watches: FxHashMap<Tag, Watching>,
+    /// The watches that are an [`Effect::Journal`] on a system with no journal (Linux), by
+    /// tag, with their directory: their changes are told as [`Done::Journaled`].
+    #[cfg(target_os = "linux")]
+    journals: FxHashMap<Tag, crate::FileName>,
     confine: Option<Arc<dyn Confine>>,
     #[cfg(unix)]
     world: Arc<world::World>,
@@ -68,6 +72,8 @@ impl Threads {
             workers,
             timers: Wheel::new(),
             watches: FxHashMap::default(),
+            #[cfg(target_os = "linux")]
+            journals: FxHashMap::default(),
             confine: None,
             #[cfg(unix)]
             world: Arc::default(),
@@ -103,13 +109,23 @@ impl Threads {
     /// Takes a completion off the threads' channel, counting it out of what is in flight unless
     /// a watch or a listen goes on after it.
     fn took(&mut self, completion: Completion, out: &mut Vec<Completion>) {
+        #[cfg(target_os = "linux")]
+        let completion = match self.journals.get(&completion.tag) {
+            Some(dir) => Completion {
+                tag: completion.tag,
+                done: crate::journal::live(dir, completion.done),
+            },
+            None => completion,
+        };
         match completion.done {
-            Done::Changed { .. } | Done::Accepted { .. } => {}
+            Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. } => {}
             // A watch or a listen ends with its end or a failure.
             _ => {
                 if let Some(watching) = self.watches.remove(&completion.tag) {
                     watching.join();
                 }
+                #[cfg(target_os = "linux")]
+                self.journals.remove(&completion.tag);
                 #[cfg(unix)]
                 if let Some(listening) = self.listens.remove(&completion.tag) {
                     listening.join();
@@ -232,6 +248,14 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Linked)
         }
         Effect::Stat { file, .. } => Ok(Done::Stat(fs::stat(&at(&file))?)),
+        #[cfg(unix)]
+        Effect::Stamp { files, .. } => Ok(Done::Stamped(fs::stamps(root, &files)?)),
+        #[cfg(unix)]
+        Effect::Entries { dir, .. } => Ok(Done::Entries(fs::entries(&at(&dir), &dir)?)),
+        #[cfg(windows)]
+        Effect::Stamp { files, .. } => Ok(Done::Stamped(crate::iocp::stamps(root, &files)?)),
+        #[cfg(windows)]
+        Effect::Entries { dir, .. } => Ok(Done::Entries(crate::iocp::entries(&at(&dir), &dir)?)),
         Effect::List { dir, .. } => Ok(Done::Listed(fs::list(&at(&dir), &dir)?)),
         Effect::Remove { file, .. } => {
             fs::remove(&at(&file))?;
@@ -240,7 +264,9 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
         Effect::Map { file, .. } => Ok(Done::Mapped(fs::map(&at(&file))?)),
         Effect::Timer { .. }
         | Effect::Watch { .. }
+        | Effect::Journal { .. }
         | Effect::Unwatch { .. }
+        | Effect::Flush { .. }
         | Effect::Spawn { .. }
         | Effect::Kill { .. }
         | Effect::Listen { .. }
@@ -576,11 +602,28 @@ mod world {
     }
 }
 
-/// A watch's thread, and how to stop it.
+/// A watch's thread, and how to stop it or ask it for a flush.
 #[cfg(target_os = "linux")]
 struct Watching {
     stop: std::os::fd::OwnedFd,
+    /// Written once flushes are added to `flushes`.
+    wake: std::os::fd::OwnedFd,
+    /// The flushes asked for and not yet taken by the thread; `None` once the thread has
+    /// ended, so a flush asked after fails rather than waiting for nothing.
+    flushes: Arc<std::sync::Mutex<Option<Vec<Tag>>>>,
     thread: JoinHandle<()>,
+}
+
+#[cfg(target_os = "linux")]
+fn eventfd() -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd as _;
+    // SAFETY: no pointers; a descriptor of its own or -1.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the call returned a descriptor of its own.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(target_os = "linux")]
@@ -591,51 +634,26 @@ impl Watching {
         tag: Tag,
         finished: Sender<Completion>,
     ) -> io::Result<Watching> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        use std::os::fd::AsRawFd as _;
         let mut tree = crate::watch::Tree::new(root, dir, false)?;
-        // SAFETY: no pointers; a descriptor of its own or -1.
-        let stop = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-        if stop < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the call returned a descriptor of its own.
-        let stop = unsafe { OwnedFd::from_raw_fd(stop) };
-        let stop_fd = stop.as_raw_fd();
+        let (stop, wake) = (eventfd()?, eventfd()?);
+        let (stop_fd, wake_fd) = (stop.as_raw_fd(), wake.as_raw_fd());
+        let flushes = Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+        let asked = flushes.clone();
         let thread = std::thread::Builder::new().name("blaze-watch".into()).spawn(move || {
             let mut buffer = vec![0u8; crate::watch::BUFFER];
-            loop {
-                let mut fds = [
-                    libc::pollfd { fd: tree.raw(), events: libc::POLLIN, revents: 0 },
-                    libc::pollfd { fd: stop_fd, events: libc::POLLIN, revents: 0 },
-                ];
-                // SAFETY: two pollfds of open descriptors.
-                let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-                if ready < 0 {
-                    if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    let why = io::Error::last_os_error().to_string();
-                    _ = finished.send(Completion { tag, done: Done::Failed(IoError(why)) });
-                    return;
-                }
-                if fds[1].revents != 0 {
-                    _ = finished.send(Completion { tag, done: Done::Unwatched });
-                    return;
-                }
-                if fds[0].revents != 0 {
-                    // SAFETY: the buffer has room for what is read.
-                    let n =
-                        unsafe { libc::read(tree.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
-                    if n > 0 {
-                        let done = tree.take(&buffer[..n as usize]);
-                        if finished.send(Completion { tag, done }).is_err() {
-                            return;
-                        }
-                    }
-                }
+            let end = watch_thread(&mut tree, &mut buffer, tag, &finished, &asked, [stop_fd, wake_fd]);
+            // Flushes asked for and not taken fail before the end, and none is taken after.
+            let left = asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            for flush in left.into_iter().flatten() {
+                let why = IoError("the watch ended before the flush".into());
+                _ = finished.send(Completion { tag: flush, done: Done::Failed(why) });
+            }
+            if let Some(done) = end {
+                _ = finished.send(Completion { tag, done });
             }
         })?;
-        Ok(Watching { stop, thread })
+        Ok(Watching { stop, wake, flushes, thread })
     }
 
     fn stop(&self) {
@@ -645,8 +663,96 @@ impl Watching {
         unsafe { libc::write(self.stop.as_raw_fd(), (&raw const one).cast(), 8) };
     }
 
+    /// Asks the thread for a flush `tag`, which it answers through `finished`.
+    fn flush(&self, tag: Tag, finished: &Sender<Completion>) {
+        use std::os::fd::AsRawFd as _;
+        let mut flushes = self.flushes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(flushes) = flushes.as_mut() else {
+            let why = IoError("the watch ended before the flush".into());
+            _ = finished.send(Completion { tag, done: Done::Failed(why) });
+            return;
+        };
+        flushes.push(tag);
+        let one: u64 = 1;
+        // SAFETY: eight bytes to an eventfd.
+        unsafe { libc::write(self.wake.as_raw_fd(), (&raw const one).cast(), 8) };
+    }
+
     fn join(self) {
         _ = self.thread.join();
+    }
+}
+
+/// A watch's thread: reads its events until it is stopped, answering each flush once it has
+/// read every event queued when the flush was taken. What ends the watch, or `None` once the
+/// driver is gone.
+#[cfg(target_os = "linux")]
+fn watch_thread(
+    tree: &mut crate::watch::Tree,
+    buffer: &mut [u8],
+    tag: Tag,
+    finished: &Sender<Completion>,
+    asked: &std::sync::Mutex<Option<Vec<Tag>>>,
+    [stop, wake]: [std::os::fd::RawFd; 2],
+) -> Option<Done> {
+    let mut taken = Vec::new();
+    loop {
+        let mut fds = [
+            libc::pollfd { fd: tree.raw(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: stop, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+        ];
+        // SAFETY: three pollfds of open descriptors.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
+        if ready < 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Some(Done::Failed(IoError(io::Error::last_os_error().to_string())));
+        }
+        if fds[2].revents != 0 {
+            let mut count = 0u64;
+            // SAFETY: eight bytes from an eventfd, which resets it.
+            unsafe { libc::read(wake, (&raw mut count).cast(), 8) };
+            taken.extend(
+                asked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                    .map(std::mem::take)
+                    .unwrap_or_default(),
+            );
+            let mut gone = false;
+            let drained = tree.drain(buffer, |done| {
+                gone |= finished.send(Completion { tag, done }).is_err();
+            });
+            if gone {
+                return None;
+            }
+            for flush in taken.drain(..) {
+                let done = match &drained {
+                    Ok(()) => Done::Flushed,
+                    Err(error) => Done::Failed(IoError(format!("flushing the watch: {error}"))),
+                };
+                if finished.send(Completion { tag: flush, done }).is_err() {
+                    return None;
+                }
+            }
+            continue;
+        }
+        if fds[1].revents != 0 {
+            return Some(Done::Unwatched);
+        }
+        if fds[0].revents != 0 {
+            // SAFETY: the buffer has room for what is read.
+            let n = unsafe { libc::read(tree.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if n > 0 {
+                let done = tree.take(&buffer[..n as usize]);
+                if finished.send(Completion { tag, done }).is_err() {
+                    return None;
+                }
+            }
+        }
     }
 }
 
@@ -676,11 +782,42 @@ impl Watching {
         Ok(Watching { stream: std::sync::Mutex::new(Some(stream)), tag, finished })
     }
 
+    /// An [`Effect::Journal`]: FSEvents' stream from the event `since` names.
+    fn journal(
+        root: &Path,
+        dir: &crate::FileName,
+        since: crate::Cursor,
+        tag: Tag,
+        finished: Sender<Completion>,
+    ) -> io::Result<Watching> {
+        let send = finished.clone();
+        let stream = crate::fsevents::Stream::journal(
+            root,
+            dir,
+            since,
+            tag,
+            Box::new(move |completion| _ = send.send(completion)),
+        )?;
+        Ok(Watching { stream: std::sync::Mutex::new(Some(stream)), tag, finished })
+    }
+
     fn stop(&self) {
         let stream = self.stream.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(stream) = stream {
             stream.stop();
             _ = self.finished.send(Completion { tag: self.tag, done: Done::Unwatched });
+        }
+    }
+
+    /// Asks the stream for a flush `tag`, which it answers through `finished`.
+    fn flush(&self, tag: Tag, finished: &Sender<Completion>) {
+        let stream = self.stream.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let failed = match stream.as_ref() {
+            Some(stream) => stream.flush(tag).err().map(|error| format!("flushing the watch: {error}")),
+            None => Some("the watch ended before the flush".to_owned()),
+        };
+        if let Some(why) = failed {
+            _ = finished.send(Completion { tag, done: Done::Failed(IoError(why)) });
         }
     }
 
@@ -704,9 +841,41 @@ impl Watching {
         ))
     }
 
+    fn journal(
+        _: &Path,
+        _: &crate::FileName,
+        _: crate::Cursor,
+        _: Tag,
+        _: Sender<Completion>,
+    ) -> io::Result<Watching> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the threads driver reads journals of changes on Linux and macOS only; on Windows the \
+             USN journal is read by the IOCP driver",
+        ))
+    }
+
     fn stop(&self) {}
 
+    fn flush(&self, _: Tag, _: &Sender<Completion>) {
+        unreachable!("no watch starts here")
+    }
+
     fn join(self) {}
+}
+
+/// Why a flush of a watch not in flight fails.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn no_watch(watch: Tag) -> String {
+    format!("nothing is watched as {watch:?}")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn no_watch(watch: Tag) -> String {
+    format!(
+        "nothing is watched as {watch:?}: watching files, and so flushing a watch, is built on \
+         Linux (inotify, fanotify) and macOS (FSEvents) only"
+    )
 }
 
 impl Driver for Threads {
@@ -727,12 +896,42 @@ impl Driver for Threads {
                         Err(error) => self.tell(tag, Done::Failed(IoError(error.to_string()))),
                     }
                 }
+                #[cfg(target_os = "linux")]
+                Effect::Journal { dir, since, tag } => {
+                    match Watching::start(&self.root, &dir, tag, self.finished.clone()) {
+                        Ok(watching) => {
+                            self.in_flight += 1;
+                            self.watches.insert(tag, watching);
+                            let first = crate::journal::first_on_linux(&dir, &since);
+                            self.journals.insert(tag, dir);
+                            _ = self.finished.send(Completion { tag, done: first });
+                        }
+                        Err(error) => self.tell(tag, Done::Failed(IoError(error.to_string()))),
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                Effect::Journal { dir, since, tag } => {
+                    match Watching::journal(&self.root, &dir, since, tag, self.finished.clone()) {
+                        Ok(watching) => {
+                            self.in_flight += 1;
+                            self.watches.insert(tag, watching);
+                        }
+                        Err(error) => self.tell(tag, Done::Failed(IoError(error.to_string()))),
+                    }
+                }
                 Effect::Unwatch { tag } => match self.watches.get(&tag) {
                     Some(watching) => watching.stop(),
                     None => self.tell(
                         tag,
                         Done::Failed(IoError(format!("nothing is watched as {tag:?}"))),
                     ),
+                },
+                Effect::Flush { watch, tag } => match self.watches.get(&watch) {
+                    Some(watching) => {
+                        self.in_flight += 1;
+                        watching.flush(tag, &self.finished);
+                    }
+                    None => self.tell(tag, Done::Failed(IoError(no_watch(watch)))),
                 },
                 #[cfg(unix)]
                 Effect::Spawn { command, tag } => {

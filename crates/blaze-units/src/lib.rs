@@ -24,6 +24,7 @@ mod order;
 pub mod load;
 #[cfg(feature = "query")]
 pub mod query;
+mod read;
 pub mod schema;
 #[cfg(feature = "query")]
 pub mod stdlib;
@@ -34,6 +35,7 @@ use blaze_resolve::resolver::ResolvedFeatures;
 use blaze_resolve::{Cfg, PackageId, Platform, Resolve};
 use rustc_hash::FxHashMap;
 
+pub use read::Read;
 pub use schema::UnitGraph;
 
 /// What the user asked cargo to do (cargo's `UserIntent`, less `doc` and `doctest`).

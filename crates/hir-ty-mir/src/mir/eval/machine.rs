@@ -112,6 +112,10 @@ pub trait Machine<'db> {
     type Prov: Copy + Eq + std::hash::Hash + std::fmt::Debug;
     type Shadow: Shadow<Self::Prov>;
 
+    /// Whether the machine looks at anything: `false` only for [`Plain`], whose evaluator
+    /// then skips what only the hooks need (provenance, per-local allocations, typed copies).
+    const CHECKS: bool = true;
+
     /// Where the evaluator is: called before each statement and each terminator.
     fn step(&mut self, at: Site<'db>);
 
@@ -153,7 +157,8 @@ pub trait Machine<'db> {
     /// used as a scalar (arithmetic, a comparison, a `SwitchInt`, a cast, an address).
     fn require_init(&mut self, shadow: &Self::Shadow, range: Range<usize>) -> MResult<()>;
     /// An atomic load's value under weak memory: the bytes it reads, when the store it reads
-    /// from is not the latest (`None`: the bytes in memory). Called after `read`.
+    /// from is not the latest (`None`: the bytes in memory). Called right after its `read`,
+    /// with no other hook between them, `step` and `schedule` included.
     fn atomic_load(
         &mut self,
         ptr: Ptr<Self::Prov>,
@@ -162,7 +167,8 @@ pub trait Machine<'db> {
         latest: &[u8],
     ) -> MResult<Option<Vec<u8>>>;
     /// An atomic store's bytes, and the bytes they replace, for later loads under weak
-    /// memory. Called after `write`.
+    /// memory. Called right after its `write`, with no other hook between them, `step` and
+    /// `schedule` included.
     fn atomic_store(
         &mut self,
         ptr: Ptr<Self::Prov>,
@@ -244,6 +250,8 @@ impl<P> Shadow<P> for () {
 impl<'db> Machine<'db> for Plain {
     type Prov = ();
     type Shadow = ();
+
+    const CHECKS: bool = false;
 
     #[inline(always)]
     fn step(&mut self, _: Site<'db>) {}

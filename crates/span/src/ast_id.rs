@@ -40,7 +40,7 @@ use std::{
 use blaze_ids::radix;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use syntax::{
-    AstNode, AstPtr, FlatTree, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange,
+    AstNode, AstPtr, FlatTree, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
     ast::{self, HasName},
     match_ast,
 };
@@ -1253,17 +1253,50 @@ impl AstIdMap {
     /// map made keeps it, with its slots, to be walked in `relative` when asked about, so
     /// lowering one body of an item parses no other.
     pub fn relative_to(&self, node: &SyntaxNode, relative: &SyntaxNode) -> AstIdMap {
+        self.relative(node, relative, None)
+    }
+
+    /// [`AstIdMap::relative_to`] for a `relative` that is `node` with the node `elided` (a node
+    /// under `node`, in this map's tree) replaced by an empty node of its kind: nothing in
+    /// `elided` has an id or a body in the map made, and what follows it is moved back by its
+    /// length. What an item's signature is lowered from, its body left out, so that the map
+    /// stays the same while the body changes.
+    pub fn relative_without(
+        &self,
+        node: &SyntaxNode,
+        relative: &SyntaxNode,
+        elided: SyntaxNodePtr,
+    ) -> AstIdMap {
+        self.relative(node, relative, Some(elided))
+    }
+
+    fn relative(
+        &self,
+        node: &SyntaxNode,
+        relative: &SyntaxNode,
+        elided: Option<SyntaxNodePtr>,
+    ) -> AstIdMap {
         let (node, relative) = (node.to_flat(), relative.to_flat());
         let (tree, at) = node.flat().expect("a flat tree");
         let (tree, at) = expanded(tree, at);
         let (relative_tree, relative_at) = relative.flat().expect("a flat tree");
         let (start, relative_range) = (tree.range(at).start(), relative_tree.range(relative_at));
+        let elided_range = elided.map(|it| it.text_range());
+        let removed = elided_range.map_or(TextSize::new(0), |it| it.len());
         debug_assert!(
             tree.kind(at) == relative_tree.kind(relative_at)
-                && tree.range(at).len() == relative_range.len(),
+                && tree.range(at).len() - removed == relative_range.len(),
             "not the same node"
         );
-        let moved = |range: TextRange| range - start + relative_range.start();
+        // Each end is moved on its own: a node holding the elided one keeps its start and
+        // loses the elided length from its end.
+        let shift = |offset: TextSize| match elided_range {
+            Some(elided) if offset >= elided.end() => offset - removed,
+            _ => offset,
+        };
+        let moved = |range: TextRange| {
+            TextRange::new(shift(range.start()), shift(range.end())) - start + relative_range.start()
+        };
         // Under a node in a body, everything is that body's.
         let in_body = self.bodies.holding(tree.range(at)).is_some();
         let mut entries = Vec::new();
@@ -1277,6 +1310,10 @@ impl AstIdMap {
             }
             let kind = kind_of(tree, it);
             let range = tree.range(it);
+            if elided.is_some_and(|ptr| ptr.kind() == kind && ptr.text_range() == range) {
+                it = tree.end(it);
+                continue;
+            }
             if !in_body && is_body(tree, it, kind) {
                 let body = self
                     .bodies
@@ -1402,7 +1439,8 @@ mod tests {
 
     use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
     use syntax::{
-        AstNode, AstPtr, Edition, SourceFile, SyntaxKind, SyntaxNode, SyntaxNodePtr, WalkEvent,
+        AstNode, AstPtr, Edition, FlatTreeBuilder, SourceFile, SyntaxKind, SyntaxNode,
+        SyntaxNodePtr, WalkEvent,
         ast::{self, HasName},
     };
 
@@ -1738,6 +1776,84 @@ fn foo() {
             }
             assert!(parsed(&file).is_empty(), "the file's bodies are walked in the relative trees");
         }
+    }
+
+    /// `anchor` as a tree of its own with `elided` under it replaced by an empty node of its
+    /// kind, as hir-def's `SignatureSyntax` makes one.
+    fn without(anchor: &SyntaxNode, elided: &SyntaxNode) -> SyntaxNode {
+        let base = anchor.text_range().start();
+        let whole = anchor.clone_subtree();
+        let (whole_tree, _) = whole.flat().expect("a cloned subtree is flat");
+        let range = elided.text_range() - base;
+        let in_whole = SyntaxNodePtr::from_parts(elided.kind(), range).to_node(&whole);
+        let (_, at) = in_whole.flat().expect("a node of a flat tree");
+        let source = whole_tree.source();
+        let text =
+            [&source[..usize::from(range.start())], &source[usize::from(range.end())..]].concat();
+        let mut empty = FlatTreeBuilder::new();
+        empty.start_node(whole_tree.kind(at));
+        empty.finish_node();
+        let tree = whole_tree.replace_subtree(at, &empty.finish(), text.into());
+        SyntaxNode::new_flat_root(Arc::new(tree))
+    }
+
+    /// With the node of `elided_kind` under the first node of `kind` left out, the map has only
+    /// that node, with its id in the file, at its range in the tree without it, and no body.
+    fn only_the_item_without(text: &str, kind: SyntaxKind, elided_kind: SyntaxKind) {
+        let text: Arc<str> = text.into();
+        for file in [outline_of(&text), full_of(&text)] {
+            let map = AstIdMap::from_source(&file);
+            let anchor = file.descendants().find(|it| it.kind() == kind).expect("the item");
+            let elided = anchor
+                .children()
+                .find(|it| it.kind() == elided_kind)
+                .expect("the node to leave out");
+            let relative = without(&anchor, &elided);
+            let relative_map =
+                map.relative_without(&anchor, &relative, SyntaxNodePtr::new(&elided));
+            assert_eq!(relative_map.root(), SyntaxNodePtr::new(&relative));
+            assert_eq!(ids(&relative_map).len(), 1, "{kind:?} alone");
+            assert_eq!(relative_map.bodies.len(), 0);
+            assert_eq!(
+                relative_map.try_erased_ast_id(SyntaxNodePtr::new(&relative)),
+                Some(map.erased_ast_id(SyntaxNodePtr::new(&anchor)))
+            );
+        }
+    }
+
+    #[test]
+    fn relative_without_a_fn_body() {
+        only_the_item_without("fn f() { struct A; }\nstruct B;\n", SyntaxKind::FN, SyntaxKind::BLOCK_EXPR);
+    }
+
+    #[test]
+    fn relative_without_an_impls_items() {
+        only_the_item_without(
+            "struct S;\nimpl T for S { fn a() {} fn b() { x!(); } }\n",
+            SyntaxKind::IMPL,
+            SyntaxKind::ASSOC_ITEM_LIST,
+        );
+    }
+
+    /// What follows the elided node in the item (the `;`) moves back, and the item's end with it.
+    #[test]
+    fn relative_without_a_const_body() {
+        only_the_item_without(
+            "const C: u8 = { struct D; 1 };\n",
+            SyntaxKind::CONST,
+            SyntaxKind::BLOCK_EXPR,
+        );
+    }
+
+    /// With nothing left out, it is the map `relative_to` makes.
+    #[test]
+    fn relative_to_is_relative_without_nothing() {
+        let text: Arc<str> = "struct A;\nimpl T for A {\n    fn c() { m!(); fn d() { n!() } }\n}\n".into();
+        let file = full_of(&text);
+        let map = AstIdMap::from_source(&file);
+        let anchor = file.children().find(|it| it.kind() == SyntaxKind::IMPL).expect("the impl");
+        let relative = anchor.clone_subtree();
+        assert_eq!(ids(&map.relative_to(&anchor, &relative)), ids(&map.relative(&anchor, &relative, None)));
     }
 
     /// splitmix64: the seeded inputs of the tests below.

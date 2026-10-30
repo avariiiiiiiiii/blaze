@@ -60,14 +60,19 @@ pub struct CommandLine {
     pub check_cfg: CheckCfg,
     /// Each `--cfg` value as given, in order.
     pub cfg: Vec<String>,
+    /// Whether rustc makes code (`OutputTypes::should_codegen`): an `--emit` kind other than
+    /// `metadata` and `dep-info`, or no `--emit` (rustc links). `cargo check` gives
+    /// `--emit=dep-info,metadata`; [`Default`] is that, not rustc's default.
+    pub codegen: bool,
 }
 
 impl CommandLine {
     /// The lint flags among rustc's arguments `args`: `-A x`, `-Ax`, `--allow x`,
     /// `--allow=x` and so on, `--cap-lints`, `--check-cfg` and `--cfg`. The other arguments
-    /// are not lint flags and are passed by.
+    /// are not lint flags and are passed by. `--emit` is read for [`CommandLine::codegen`].
     pub fn parse(args: &[String]) -> Result<CommandLine, String> {
         let mut flags = CommandLine::default();
+        let mut emit = Vec::new();
         let mut args = args.iter();
         let levels = [
             ("--allow", Level::Allow),
@@ -108,6 +113,17 @@ impl CommandLine {
                 flags.cfg.push(cfg);
                 continue;
             }
+            if let Some(list) = value("--emit")? {
+                for kind in list.split(',') {
+                    let kind = kind.split_once('=').map_or(kind, |(kind, _)| kind);
+                    if !EMIT_KINDS.contains(&kind) {
+                        let expected: Vec<String> = EMIT_KINDS.iter().map(|it| format!("`{it}`")).collect();
+                        return Err(format!("unknown emission type: `{kind}` - expected one of: {}", expected.join(", ")));
+                    }
+                    emit.push(kind.to_owned());
+                }
+                continue;
+            }
             let mut found = None;
             for (flag, level) in levels {
                 if let Some(name) = value(flag)? {
@@ -121,9 +137,13 @@ impl CommandLine {
             }
             flags.opts.push((name.replace('-', "_"), level));
         }
+        flags.codegen = emit.is_empty() || emit.iter().any(|it| it != "metadata" && it != "dep-info");
         Ok(flags)
     }
 }
+
+/// rustc's `--emit` kinds, in its order (`OutputType`'s shorthands).
+const EMIT_KINDS: [&str; 9] = ["asm", "llvm-bc", "dep-info", "link", "llvm-ir", "metadata", "mir", "obj", "thin-link-bitcode"];
 
 /// A lint's level where it is: rustc's `LevelSpec`, as 12 bytes. What rustc keeps in it of
 /// where the level came from is in [`Shared::sources`].
@@ -494,5 +514,25 @@ fn main() {}
         let plain = "//- /main.rs crate:main edition:2021\nfn main() {}\n";
         assert_eq!(levels_of_fns(plain, &[], lint), named(&[("main", Level::Allow)]));
         assert_eq!(levels_of_fns(plain, &["-F", "unsafe-op-in-unsafe-fn"], lint), named(&[("main", Level::Forbid)]));
+    }
+
+    #[test]
+    fn emit_says_whether_rustc_makes_code() {
+        let codegen = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|&it| it.to_owned()).collect();
+            CommandLine::parse(&args).map(|it| it.codegen)
+        };
+        assert_eq!(codegen(&[]), Ok(true));
+        assert_eq!(codegen(&["--emit=dep-info,metadata"]), Ok(false));
+        assert_eq!(codegen(&["--emit", "metadata=out/lib.rmeta"]), Ok(false));
+        assert_eq!(codegen(&["--emit=metadata", "--emit=link"]), Ok(true));
+        assert_eq!(codegen(&["--emit=mir"]), Ok(true));
+        assert_eq!(
+            codegen(&["--emit=rlib"]),
+            Err("unknown emission type: `rlib` - expected one of: `asm`, `llvm-bc`, `dep-info`, `link`, \
+                 `llvm-ir`, `metadata`, `mir`, `obj`, `thin-link-bitcode`"
+                .to_owned())
+        );
+        assert!(!CommandLine::default().codegen);
     }
 }

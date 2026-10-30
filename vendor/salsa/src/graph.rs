@@ -55,7 +55,20 @@ impl Graph {
         task: &TaskGraph,
         edges: impl ExactSizeIterator<Item = QueryEdge>,
     ) -> EdgeSpan {
-        let len = u32::try_from(edges.len())
+        self.record_with_tail(task, edges, &[])
+    }
+
+    /// Writes `edges` and then the raw words `tail` into one range and returns it: a memo's edges
+    /// (no tail), or a capture frame's reads, whose tail holds their fingerprints
+    /// ([`crate::capture`]).
+    pub(crate) fn record_with_tail(
+        &self,
+        task: &TaskGraph,
+        edges: impl ExactSizeIterator<Item = QueryEdge>,
+        tail: &[u32],
+    ) -> EdgeSpan {
+        let edge_count = edges.len();
+        let len = u32::try_from(edge_count + tail.len())
             .ok()
             .filter(|&len| len < OUTPUT)
             .expect("salsa: a query recorded 2^31 edges or more");
@@ -64,14 +77,21 @@ impl Graph {
         }
         let start = self.edges.reserve_for_task(&task.chunk, len);
         let span = EdgeSpan { start, len };
-        let words = self.edges.slice(span);
+        let (edge_words, tail_words) = self.edges.slice(span).split_at(edge_count);
         let mut written = 0;
-        for (word, edge) in words.iter().zip(edges) {
-            // Relaxed: the memo these edges belong to is published with `Release` after them.
+        // Relaxed: the memo (or the `Reads`) these words belong to is published with `Release`
+        // after them.
+        for (word, edge) in edge_words.iter().zip(edges) {
             word.store(self.encode(task, edge), Ordering::Relaxed);
             written += 1;
         }
-        assert_eq!(written, len, "salsa: an `ExactSizeIterator` of edges gave a wrong length");
+        assert_eq!(
+            written, edge_count,
+            "salsa: an `ExactSizeIterator` of edges gave a wrong length"
+        );
+        for (word, &value) in tail_words.iter().zip(tail) {
+            word.store(value, Ordering::Relaxed);
+        }
         span
     }
 

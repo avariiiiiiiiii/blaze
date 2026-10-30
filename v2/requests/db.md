@@ -296,6 +296,8 @@ Files that import the HIR types and need no change: `display.rs` (only `TypeRef`
 - ~L2212 (in `fn record_pattern_matched_fields`)  `    pat: &Pat,`  ->  `    pat: Pat<'_>,`
 - ~L2215  `Pat::Record { path: _, args, ellipsis } => (args, *ellipsis),`  ->  `Pat::Record { path: _, args, ellipsis } => (args, ellipsis),`
 
+> applied by db-ty-cols-hir: all 30 sites as written (`semantics.rs` has 5, `source_analyzer.rs` 12, `lib.rs` 8, `diagnostics.rs` 3, `source_to_def.rs` 2), nothing done differently; `hir-ide`'s two functions already took the views. 0 sites found beyond the list (every remaining index in `crates/hir/src/` is a `BindingId`, `LabelId` or `PathId`).
+
 ## From speed-hir-nameres: `UnconfiguredCode` keeps no `CfgOptions` (2026-10-29)
 
 `hir_def::nameres::diagnostics::DefDiagnosticKind::UnconfiguredCode` lost its `opts: CfgOptions`
@@ -313,6 +315,8 @@ the `base_db::Crate` whose def map's diagnostics these are). The clone now happe
 `InactiveCode` diagnostic is emitted, not once per disabled item at collection.
 
 > forwarded to db: `hir-def`'s nameres and `hir` are lane db's.
+
+> applied by db-ty-cols-hir: checked, already in `crates/hir/src/diagnostics.rs` (`UnconfiguredCode { ast_id, cfg }`, `opts: self.krate.cfg_options(self.db).clone()`). `collect_enum`'s `InactiveCode` keeps `diag.opts.clone()`: `InactiveEnumVariantCode` in `hir-def/src/signatures.rs` still has `opts`.
 
 ## speed-hir-store: hir onto the HIR column views, type refs (from speed-hir-store-tools)
 
@@ -344,6 +348,8 @@ imports it and reads it through `hir_def` already.
 
 ### crates/hir/src/semantics.rs  (1 site)
 - ~L1729  `let path = match &analyze.store()?.types[ty] {`  ->  `let path = match analyze.store()?.type_ref(ty) {` (this read the store's `types` arena field directly, which the columns remove; `path` is `&'db Path`, as before)
+
+> applied by db-ty-cols-hir: all 10 sites as written (`hir-def` now has `ExpressionStore::type_ref`), nothing done differently. 0 sites found beyond the list.
 
 ## From speed-runtime-vfs: `crates/blaze-query/src/tree.rs`, two copies the reader no longer needs (2026-10-29)
 
@@ -411,6 +417,8 @@ Design and the mapping onto `MemoData`/`Edge`: `docs/v2/plan/lanes/db/speed-sals
 134 sites in 14 files (expressions, patterns and type refs). The rule: `v2/requests/format.md`, "## format-hir: expressions and patterns become columns"; for type refs (`store[t]` -> `store.type_ref(t)`), the addendum of `~/restart-2026-10-28/briefs/v2/speed-hir-store-consumers.md`. Both have landed in `crates/hir-def/src/{hir.rs,hir/type_ref.rs,expr_store.rs}`: `Index<ExprId>`, `Index<PatId>` and `Index<TypeRefId>` are gone, `Index<BindingId|LabelId|LifetimeRefId|PathId>` stay. `InferenceContext::store` and `TyLoweringContext::store` are `&'db ExpressionStore`, so every view borrows the store, not `self`: no borrow conflict changes anywhere below. `mir.rs` is speed-types' file now (its brief); its one edit is here.
 
 > forwarded to db: every file is db's (none of items' hir-ty files).
+
+> applied by db-ty-cols-ty: `db.rs`, `lower.rs`, `lower/path.rs`, `generics.rs`, `consteval.rs`, `next_solver/interner.rs` and `effects.rs`, exactly as listed. 0 sites found beyond the list in db-ty-cols-ty's files (every `store[..]` left indexes a `LifetimeRefId` or `PathId`); none in items' files (`method_resolution*`, `traits.rs`, `specialization.rs`, `opaques.rs`, `layout*`, `drop.rs`).
 
 ### crates/hir-ty/src/db.rs  (4 sites)
 - ~L547, ~L581, ~L615 (all three occurrences, in `InternedClosureId::new`, `InternedCoroutineId::new`, `InternedCoroutineClosureId::new`)  `let expr = &store[loc.expr];`  ->  `let expr = store.expr(loc.expr);`
@@ -689,6 +697,8 @@ Unchanged in `expr.rs`, checked: `Expr::Block { statements, .. }` (now `&[Statem
 ### crates/hir-ty/src/infer.rs  (1 site)
 - ~L2419  `while let Expr::Block { tail: Some(tail), label: None, .. } = self.store[expr] {`  ->  `while let Expr::Block { tail: Some(tail), label: None, .. } = self.store.expr(expr) {`
 
+> applied by db-ty-cols-infer: every edit of the `infer.rs`, `infer/expr.rs`, `infer/closure/analysis.rs`, `infer/closure/analysis/expr_use_visitor.rs`, `infer/pat.rs` and `infer/mutability.rs` subsections, as written. One difference: `analysis.rs` ~L292 now wraps after `=` (it ran to 102 columns). 0 sites beyond the list: the sweep of `infer.rs` and `infer/` finds only `BindingId` indexes left (`expr.rs` ~L211, `pat.rs` ~L890, `mutability.rs` ~L228, `analysis.rs` ~L1031), and no other `infer/` file matches on `Expr`/`Pat` or takes `&Expr`/`&Pat`.
+
 
 Files that import the HIR types but need no change: `infer/{op,place_op,coerce,cast,callee,diagnostics,autoderef,fallback,columns,opaques,path,unify}.rs`, `infer/closure.rs`; lane items' files (`method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs`, `layout.rs`, `layout/`, `drop.rs`) have no site.
 
@@ -813,6 +823,8 @@ Unchanged on purpose: L389/L390/L2955/L3195 keep `*pat`/`*init` (bound from `&St
 
 Files that need no change: `names.rs` (only `BindingId` indexing), `cfg.rs`, `constraints.rs`, `dataflow.rs`, `gate.rs`, `inference.rs`, `intervals.rs`, `moves.rs`, `polonius.rs`, `relation.rs`, `timings.rs`, `bitset.rs`.
 
+> applied by db-ty-cols-borrowck: every site as listed, nothing done differently; 0 sites found beyond the list (the final `rg` of the crate finds only `BindingId`, `LifetimeRefId` and `PathId` indexes left).
+
 Status: open
 
 ## speed-hir-store: hir-ty-wfcheck onto the HIR column views (from speed-hir-store-ty)
@@ -820,6 +832,8 @@ Status: open
 1 site in 1 file, a type ref (rule: addendum of `~/restart-2026-10-28/briefs/v2/speed-hir-store-consumers.md`, landed: `Index<TypeRefId>` is gone).
 
 > forwarded to db.
+
+> applied by db-ty-cols-ty: as listed. 0 sites found beyond the list.
 
 ### crates/hir-ty-wfcheck/src/lib.rs  (1 site, 2 edits, type ref; the where-clause `position` search)
 - ~L576  `let on_target = match (&store[*target], param) {`  ->  `let on_target = match (store.type_ref(*target), param) {`
@@ -868,6 +882,8 @@ references the code already made). Line numbers are as of 2026-10-29 18:40.
   // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. `id` is `self.id` or a module containing it, read from `db`'s def maps, and `Module` holds it as `'static` as every `hir` handle does, used only with the database it came from. A `Module` kept past the revision that removed its module would name a freed salsa slot.
   ```
 - `crates/hir/src/check.rs:128`, `:162`: ok.
+  > applied by db-ty (18:55): a SAFETY above the line. It adds that salsa interned ids are never
+  > freed now, so the `'static` id names the same module for the database's life.
 
 ### hir-def (db's files)
 
@@ -924,6 +940,36 @@ items below for `interner.rs:2754`, `:2786`, `:2800`, `:2814`, `:2828`, `:2844`,
 The new `mod table` passes: `Erase`'s `# Safety`, the `erase!` and test `erase_static!` impls'
 comments, and every block. The items for `:266`, `:403`, `:404`, `:411` and `solver.rs:42`
 still stand.
+
+> applied by db-ty (18:55):
+> - `:266`: the SAFETY there already says it (a row number that borrows nothing, never freed,
+>   valid in every revision).
+> - `:403`/`:404`: both impls deleted, replaced by a `const` assertion that the auto traits give
+>   `Send + Sync`.
+> - `:411` `conjure`: now an `unsafe fn` with `# Safety` (the interner must not outlive the
+>   attachment on the stack). `infer.rs` takes the path context's interner instead. hir's six
+>   callers and `def_id.rs`'s `Debug` have SAFETY comments; deleting it needs hir's public
+>   `Type` API to take a database.
+> - `solver.rs:42`: the SAFETY now names the layout invariant, and the transmute names its types.
+>
+> applied by db-ty-next1 (19:10), `:411` finished: `DbInterner::conjure` is deleted.
+> - Its callers in `generic_arg.rs` were already gone, and `infer.rs` takes the path context's
+>   interner.
+> - hir's `Type::instantiate_with_errors`, `instantiate`, `instantiate_type_params`, `unknown`
+>   and `new_unit` take `db` and use `DbInterner::new_no_crate(db)`, the same interner
+>   `conjure` made. Every caller in `crates/hir/` passes it, including term_search and its
+>   `LookupTable::insert`.
+> - `Callable` erases its signature's bound regions once, in `as_callable`, into a field, so
+>   `erased_sig` is gone.
+> - `SolverDefId`'s `Debug` runs inside `with_attached_db` and borrows the database only for
+>   the closure.
+> - The `with` SAFETY comment no longer mentions `conjure`.
+> - Callers outside db's paths: six in `blaze-diagnostics` (`v2/requests/diagnostics.md`) and
+>   one in `blaze-doc` (`v2/requests/speed.md`).
+> - solver-sync-interner-next1, which holds `interner.rs`/`def_id.rs` for its port, was told.
+>
+> The crate-root items are already done: hir-ty-wfcheck has `#![forbid(unsafe_code)]` (18:55)
+> and hir-ty-borrowck had it already. hir and hir-ty keep `unsafe` modules, so they get none.
 
 - `crates/hir-ty/src/next_solver/interner.rs:266` `unsafe impl salsa::SalsaValue for $stored_name` (in `impl_stored_interned!`): its comment says only that it is safe. Proposed: `` // SAFETY: a `$stored_name` is a row index (a `NonZeroU32`) into a process-wide table that is never freed or rewritten, so one kept from an older revision names the same value in every newer one, and it holds no `'db` reference (what `SalsaValue`'s `# Safety` forbids). `$name` is not stored: its `'db` marks where it is meant to be used. ``
 - `crates/hir-ty/src/next_solver/interner.rs:403`, `:404` `unsafe impl Send`/`Sync for DbInterner<'_>`: no SAFETY, only `// FIXME: very wrong` (rust-lang/rust#144808). Every field is already `Send + Sync`: `&'db dyn HirDatabase` (blaze's `salsa::Database: Send + Sync`, `vendor/salsa/src/database.rs:38`), `Option<&'db LangItems>` (ids), `Option<Crate>`, `u32`, `tls_cache::Solved` (a `u64`) and `bool`. So the impls assert only what the compiler derives. Preferred: delete both impls and the FIXME (no behavior change, and the build then proves it). Otherwise: `` // SAFETY: every field is `Send` and `Sync` (`&dyn HirDatabase` because `salsa::Database: Send + Sync`; the rest are ids and integers), so this only states what the auto trait would derive. A field that is not would make an interner moved to another thread a data race. `` and `` // SAFETY: as for `Send`: every field is `Sync`. ``
@@ -1031,6 +1077,7 @@ still stand.
 ### hir-ty-wfcheck
 
 - `crates/hir-ty-wfcheck/src/lib.rs:12` crate: no `unsafe` anywhere (`lib.rs`, `outlives.rs`, `persist.rs`). Add `#![forbid(unsafe_code)]` after the `//!` docs, before `extern crate rustc_type_ir;`.
+  > applied by db-ty.
 
 ### hir-ty-borrowck
 
@@ -1095,12 +1142,14 @@ still holds the old `Rc`, `make_mut` copies once. The results are the same set a
 - ~L195 in `with_method_resolution`  `Either::Left(it) => it,`  ->  `Either::Left(it) => &**it,`
   (`it` is `&Rc<FxHashSet<TraitId>>`; both arms must be `&FxHashSet<TraitId>`.)
 
-This is the only caller (`rg get_traits_in_scope crates/`). Status: open
+This is the only caller (`rg get_traits_in_scope crates/`). Status: applied (both halves; see below)
 
 > method_resolution.rs edit: done by speed-types-probe, as
 > `Either::Left(it) => std::borrow::Borrow::<FxHashSet<TraitId>>::borrow(it),`, which compiles
 > with `get_traits_in_scope` returning either `FxHashSet` (today) or `Rc<FxHashSet>` (after the
 > infer.rs edits), so the infer.rs part can land on its own. The infer.rs part is still open.
+
+> infer.rs part applied by db-ty (18:55), as written.
 
 ## speed-hir-store: id-only scans of a store (from speed-hir-store)
 
@@ -1116,6 +1165,13 @@ With expressions as columns, `store.exprs()` decodes every node. `ExpressionStor
 Found by speed-hir-store-ty.
 
 > forwarded to db: `crates/hir-ty-borrowck/` is lane db's.
+
+> partly applied by db-ty (18:55):
+> - `synthesized` and `path_arguments` use `expr_ids()`, and the `parent` map is preallocated
+>   with `expr_count()`.
+> - Open: fusing the seven whole-store scans into one pass per body. That is a refactor of
+>   seven functions across `check.rs`, `liveness.rs` and `lib.rs`, left for the next borrowck
+>   pass.
 
 ## speed-hir-store: `ExpressionStoreDiagnostics::InactiveCode` loses `opts` (from speed-hir-store)
 
@@ -1143,6 +1199,8 @@ From speed-hir-defs-sigs' finding. Other matches on the variant use `..` (`hir-t
 
 > forwarded to db: `crates/hir/src/diagnostics.rs` is lane db's; hir-ide and ide-db match no `InactiveCode`.
 
+> applied by db-ty (18:55).
+
 ## speed-hir-store: `Path::BarePath` holds a `ModPath`, not an `Interned<ModPath>` (from speed-hir-store)
 
 `hir_expand::mod_path::ModPath` is now a 16-byte `Copy` value with interned segments
@@ -1161,6 +1219,8 @@ and its import at ~L43, `use intern::{Interned, Symbol, sym};` -> `use intern::{
 at ~L2912) bind `&ModPath` and need no edit.
 
 > forwarded to db: `crates/hir/src/semantics.rs` is lane db's; hir-ide builds no `Interned<ModPath>`.
+
+> applied by db-ty (18:55), the `Interned` import with it.
 
 ## 8. Answer to codegen's request 3 (run codegen as a query): declined as written (db, 19:55)
 
@@ -1211,8 +1271,12 @@ and hir-ide's match check.
 Notes, nothing to apply. The full list is in `~/restart-2026-10-28/briefs/v2/db-dispatch/db.md`.
 - D1: already done. `hir-ty`'s interner implements `with_global_cache(scope, f)` and
   `cache_scope`.
-- `crates/hir-ty/src/next_solver/` belongs wholly to solver-sync from 20:00 (its request 3,
-  granted). db-ty-next1 sends its `next_solver` tasks to `solver-sync-inbox.md`.
+- `crates/hir-ty/src/next_solver/`: solver-sync keeps the 18 files db-ty-types handed it.
+  db-ty-next1 took solver-sync's request 3 at 19:15, so its children db-ty-port-infer and
+  db-ty-port-solver own `infer/`, `solver.rs`, `fulfill.rs`, `normalize.rs`,
+  `structural_normalize.rs`, `obligation_ctxt.rs`, `inspect.rs`, `format_proof_tree.rs` and
+  `tls_cache.rs`. db-ty-next1's dispatch tasks in solver-sync's files (`interner.rs`,
+  `def_id.rs`, `generic_arg.rs`) go to `solver-sync-inbox.md`.
 - D2: db-ty-next1 edits the four lines in `method_resolution.rs`, `probe.rs` and `confirm.rs`,
   after a tmux to speed-types-probe-next1, which holds the file.
 - D3: request 9.
@@ -1226,10 +1290,12 @@ Notes, nothing to apply. The full list is in `~/restart-2026-10-28/briefs/v2/db-
   dependency), and nothing moves.
 - D8: the previous `Parse` goes in a per-file slot in base-db, written only by `parse`, and the
   edit is the common prefix and suffix computed in `Files::set_text`. This adds no salsa API. A
-  reparse must equal a full parse: debug builds parse both and assert they are equal, and
-  format-parse's tests check it. Owner: db-expand-next1, or the next db-expand.
+  reparse must equal a full parse: a property test over random edits checks it, with
+  format-parse's tests. Owner: db-expand (dispatch task 24).
 - D9: `crates/hir-ty/src/mir.rs` and `mir/` stay lane db's (db-ty-next1 tasks 4 to 7).
 - D10: forwarded to diagnostics (request 12).
+
+> applied: noted, nothing to apply (D3 is request 9, D5 request 11, D10 in request 12).
 
 ## 11. core (`crates/blaze-graph/`): `pump::wait_until` (db, 20:05)
 
@@ -1242,6 +1308,8 @@ detection moves onto the plane's one wait graph (`pump.rs` `waits()`), and
 `Mutex<DependencyGraph>` (`vendor/salsa/src/runtime.rs:35`) goes. That is the speed lane's
 change in `vendor/salsa` (speed-salsa-next2), once `wait_until` exists.
 
+> applied: `pub fn blaze_graph::pump::wait_until(ended: &dyn Fn() -> bool)` in `crates/blaze-graph/src/pump.rs` (core is DONE): the old private `wait`'s loop (pump below `PUMP_DEPTH` every 16th turn, spin `SPINS`, `pool::park`); `wait` now calls it. Whoever makes `ended` true must `Thread::unpark` the waiter. Test `wait_until_pumps_on_a_worker_and_parks_elsewhere`.
+
 ## 12. Forwards from db-requests (db, 20:05)
 
 The items under "Not lane db: to forward" in
@@ -1251,3 +1319,1021 @@ line and the db task it lands with. Please route each to its lane's request file
 diagnostics, D10: once db-expand's `record_use` query exists,
 `blaze-diagnostics/src/lints/names/imports/used.rs` reads it instead of resolving every path
 again.
+
+> forwarded to format, codegen, cargo, diagnostics (with D10), solver-sync and safety: each told by tmux, pointing at its list in `db-dispatch/db.md`. core's `wait_until` is applied (request 11). The coordinator's items are `requests'` and held until their inputs exist: `ide-db` `run_all` onto `base_db::run_on_pool` and `install_plane_hooks()` (neither exists yet), `coroutine_witnesses` in `impl_hir_database!` (not declared in `hir-ty/src/db.rs` yet), request 9's entries (no crates yet), `Opened::queries` (`Database::open` still mints its own `ViewId`), the `== 4` asserts (after salsa's 4-byte ids). minicore's `#[must_use]` is in `crates/test-utils/`, the coordinator's.
+
+## From safety-model: model tests for blaze-query
+
+From `safety-model-db` (child of `safety-model`, lane safety; report
+`/tmp/blaze-lanes/v2-safety-model-db.md`). For `db-query`, who owns `crates/blaze-query/` and is
+still at work, so none of this is written in the crate. Design:
+`docs/v2/plan/lanes/safety/model.md` ("The switch", "Model tests"). It is written against
+`table.rs` and `lib.rs` as of 2026-10-29 20:xx (`Map<V>`, `Column<T>`, `ValueCell`,
+`Database::generation` and `born`, `INSIDE`). `db-query`'s plan (`Map<V, X>`, `Rows<T>`,
+`segment.rs`, `memo.rs`) replaces some of these. Apply what still names real code; for a
+structure that has been rewritten, keep the test's shape (threads, operations, sequential
+model, direct asserts) and point it at the new type. A normal build changes in nothing: same
+types, same sizes, no new dependency.
+
+> forwarded to db (db-query).
+
+### 0. A finding first: `add_memo` can lower a key's `born` (`lib.rs:1062`)
+
+`collect` keeps a key whole when `born[key] > started`, its promise being "a key given a memo
+since one started is kept by it whole" (`lib.rs:589`). `add_memo` stores the generation it
+loaded with a plain `born.insert`, so a giver that loaded the generation *before* the bump can
+overwrite a stamp that another giver of the same key set *after* it:
+
+1. giver B loads `generation` = 0;
+2. `collect` bumps it (`started` = 0);
+3. giver A loads 1, stores `born[k]` = 1, and publishes its memo in `k`'s slot;
+4. B stores `born[k]` = 0;
+5. `collect`'s `edit_all` reads the slot with A's memo, finds `born[k]` = 0, not young, and,
+   since no view reaches the memo yet, removes it.
+
+A's memo was given after the collection began, and the collection drops it. No result is
+wrong (a query is deterministic, and the view that asked keeps its `Arc`), but other views run
+the query again and the image misses the memo. The model test
+`model_collect_keeps_a_memo_given_after_it_bumped_the_generation` (section 5) finds this
+schedule (two preemptions). The fix is to let `born` only grow:
+
+`crates/blaze-query/src/lib.rs`, in `Database::add_memo`, before:
+
+```rust
+        self.born.insert(task, memo.key, self.generation.load(Ordering::SeqCst));
+```
+
+after:
+
+```rust
+        let now = self.generation.load(Ordering::SeqCst);
+        self.born.update(task, memo.key, |born| born.is_none_or(|born| *born < now).then_some(now));
+```
+
+With it the test passes: A's update happens before A's slot publish, which `collect`'s
+`edit_all` acquires, so the scan that sees A's memo sees `born[k]` >= 1. A scan that saw the
+slot before A published it finds the entry changed under the lock and leaves it, or removes it
+first and A's `update` then adds the memo back.
+
+Nothing else in the crate's lock-free code looked wrong. `Map`'s growth copies with relaxed
+stores and publishes the table with one release store after them. `update` and `edit_all`
+compare entry pointers that cannot be reused while the caller's task holds them. `Column`
+publishes with release and reads with acquire. `ValueCell` swaps by AcqRel CAS. The model tests
+below check each of these.
+
+### 1. New file `crates/blaze-query/src/sync.rs`
+
+```rust
+//! The synchronization types the tables and the database use: `std`'s, or under
+//! `--cfg blaze_check` the model checker's, which have `std`'s API
+//! (docs/v2/plan/lanes/safety/model.md "The switch"). A normal build sees `std`'s alone.
+
+#[cfg(not(blaze_check))]
+#[allow(clippy::disallowed_types)]
+pub(crate) use std::{
+    sync::{Mutex, MutexGuard, OnceLock, atomic},
+    thread_local,
+};
+
+#[cfg(blaze_check)]
+pub(crate) use blaze_check::{
+    sync::{Mutex, MutexGuard, OnceLock, atomic},
+    thread_local,
+};
+```
+
+`Arc` stays `std`'s, as model.md says. No `UnsafeCell` twin: the crate keeps no value in a
+cell; values behind an `AtomicPtr` are checked through the atomics and the model tests'
+tracked payloads.
+
+### 2. `crates/blaze-query/Cargo.toml`
+
+Add after `[dependencies]` (before `[lints]`):
+
+```toml
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+```
+
+The workspace dependency exists (root `Cargo.toml:114`, safety's M1 1); `cfg(blaze_check)` is
+in the root `check-cfg` (M1 2). No cycle: `blaze-check` depends only on `blaze-core`,
+`rustc-hash`, `libc` and `windows-sys`.
+
+### 3. `crates/blaze-query/src/lib.rs`: the switch
+
+Before:
+
+```rust
+mod image;
+mod table;
+pub mod tree;
+```
+
+After:
+
+```rust
+mod image;
+mod sync;
+mod table;
+pub mod tree;
+```
+
+Before:
+
+```rust
+use std::{
+    any::{Any, TypeId},
+    cell::{Cell, RefCell},
+    fmt,
+    rc::Rc,
+    sync::{Arc, atomic::AtomicU64, atomic::Ordering},
+};
+```
+
+After:
+
+```rust
+use std::{
+    any::{Any, TypeId},
+    cell::{Cell, RefCell},
+    fmt,
+    rc::Rc,
+    sync::Arc,
+};
+```
+
+Before:
+
+```rust
+use crate::{
+    image::ImageMap,
+    table::{
+```
+
+After:
+
+```rust
+use crate::{
+    image::ImageMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        thread_local,
+    },
+    table::{
+```
+
+The `thread_local!` of `INSIDE` (`lib.rs:270`) stays as written: the import shadows the
+prelude's macro, and `blaze_check::thread_local!` takes the same `const { }` form. Under a model
+each model thread gets its own `INSIDE`; with `std`'s, every model thread would share the one
+OS thread's, and `inside_a_query` would answer for another thread.
+
+### 4. `crates/blaze-query/src/table.rs`: the switch
+
+Before:
+
+```rust
+#[allow(clippy::disallowed_types)]
+use std::sync::{Mutex, MutexGuard};
+use std::{
+    hash::BuildHasherDefault,
+    marker::PhantomData,
+    ptr,
+    sync::{
+        Arc, OnceLock, PoisonError,
+        atomic::{AtomicPtr, AtomicU32, Ordering},
+    },
+};
+```
+
+After:
+
+```rust
+use std::{
+    hash::BuildHasherDefault,
+    marker::PhantomData,
+    ptr,
+    sync::{Arc, PoisonError},
+};
+```
+
+Before:
+
+```rust
+use crate::{Edge, QueryKey, QueryKind, Stored};
+```
+
+After:
+
+```rust
+#[allow(clippy::disallowed_types)]
+use crate::sync::{Mutex, MutexGuard};
+use crate::{
+    Edge, QueryKey, QueryKind, Stored,
+    sync::{
+        OnceLock,
+        atomic::{AtomicPtr, AtomicU32, Ordering},
+    },
+};
+```
+
+Nothing else in `table.rs` changes. `ShortLock::lock`'s `unwrap_or_else(PoisonError::into_inner)`
+works on the shim (its `LockResult` is `std`'s). `OnceLock::get_mut` as a path,
+`std::array::from_fn(|_| OnceLock::new())`, `get`, `get_or_init`, `AtomicPtr::get_mut`, `swap`
+and `compare_exchange` all have the shim's inherent methods. `image.rs` and `tree.rs` have no
+synchronization.
+
+### 5. `crates/blaze-query/src/table/tests.rs`
+
+The four threaded tests stay compiled but are ignored in a model build (they spawn 4 to 12
+threads and loop thousands of times; `cfg_attr(.., ignore)` rather than `cfg(not(..))` keeps
+`AtomicBool` and `freed` used). Add above each of `#[test] fn
+readers_see_every_published_entry_whole_while_tables_grow`, `#[test] fn
+get_or_insert_keeps_the_first_value`, `#[test] fn an_update_sees_the_entry_it_replaces` and
+`#[test] fn a_column_publishes_takes_and_restores_by_index`:
+
+```rust
+#[cfg_attr(blaze_check, ignore = "many threads, long loops: slow under the model checker's shims")]
+```
+
+Append at the end of the file:
+
+```rust
+/// Model tests (docs/v2/plan/lanes/safety/model.md): each structure from two or three threads
+/// under every interleaving and every value its loads may read. What a lock, a
+/// read-modify-write or a join orders is checked against a sequential model; what a lone
+/// acquire load sees is asserted directly, since it may be older than a store that came
+/// earlier in the run when nothing orders the two.
+#[cfg(blaze_check)]
+mod model {
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        },
+    };
+
+    use blaze_check::{
+        cell::UnsafeCell,
+        linear::{History, Spec},
+        sync::atomic::AtomicU32,
+        thread,
+    };
+    use blaze_core::Mapping;
+    use blaze_format::SchemaHash;
+    use blaze_ids::{ContentId, Fingerprint};
+
+    use crate::{
+        QueryKey, QueryKind, Stored,
+        table::{Aligned, COLUMN_FIRST, Column, Edges, Map, MemoData, Value, ValueCell},
+    };
+
+    /// Entries that fill a shard's first table: the next insert into the shard grows it.
+    const FULL: u8 = 8;
+
+    /// Keys of one shard (their first four bytes pick it), each with a home of its own.
+    fn key(n: u8) -> QueryKey {
+        let mut input = [0; 32];
+        input[8] = n;
+        QueryKey { kind: QueryKind(1), input: ContentId(input) }
+    }
+
+    #[derive(Default)]
+    struct Counts {
+        made: AtomicUsize,
+        dropped: AtomicUsize,
+    }
+
+    impl Counts {
+        fn balanced(&self) {
+            assert_eq!(
+                self.made.load(Relaxed),
+                self.dropped.load(Relaxed),
+                "every value made is dropped, once"
+            );
+        }
+    }
+
+    /// A value the model tracks: the thread that makes it writes it, and each read is checked
+    /// against that write, so a read the structure's release and acquire don't order after it is
+    /// a data race.
+    struct Tracked {
+        value: UnsafeCell<u64>,
+        counts: Arc<Counts>,
+    }
+
+    // SAFETY: `value` is written once, in `Tracked::new` before the value is shared, and only read
+    // after; the model reports any read that write does not happen before.
+    unsafe impl Sync for Tracked {}
+
+    impl Tracked {
+        fn new(counts: &Arc<Counts>, value: u64) -> Tracked {
+            counts.made.fetch_add(1, Relaxed);
+            let tracked = Tracked { value: UnsafeCell::new(0), counts: counts.clone() };
+            // SAFETY: not shared yet: this is the only access.
+            tracked.value.with_mut(|it| unsafe { *it = value });
+            tracked
+        }
+
+        fn get(&self) -> u64 {
+            // SAFETY: written only by `new`, before the value was published.
+            self.value.with(|it| unsafe { *it })
+        }
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.counts.dropped.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// A map's sequential model.
+    #[derive(Clone, PartialEq, Eq, Hash, Default)]
+    struct Entries(BTreeMap<u8, u64>);
+
+    #[derive(Clone, Copy, Debug)]
+    enum MapOp {
+        Insert(u8, u64),
+        GetOrInsert(u8, u64),
+        /// Adds to the value (to 0 when there is none); gives the value it replaced.
+        Add(u8, u64),
+        Get(u8),
+    }
+
+    impl Spec for Entries {
+        type Op = MapOp;
+        type Ret = Option<u64>;
+
+        fn apply(&mut self, op: &MapOp) -> Option<u64> {
+            match *op {
+                MapOp::Insert(n, value) => {
+                    self.0.insert(n, value);
+                    Some(value)
+                }
+                MapOp::GetOrInsert(n, value) => Some(*self.0.entry(n).or_insert(value)),
+                MapOp::Add(n, value) => {
+                    let old = self.0.get(&n).copied();
+                    self.0.insert(n, old.unwrap_or(0) + value);
+                    old
+                }
+                MapOp::Get(n) => self.0.get(&n).copied(),
+            }
+        }
+    }
+
+    struct Writers {
+        map: Map<Tracked>,
+        history: History<Entries>,
+        counts: Arc<Counts>,
+    }
+
+    impl Writers {
+        fn run(&self, op: MapOp) {
+            let task = blaze_reclaim::enter();
+            let (map, counts) = (&self.map, &self.counts);
+            self.history.record(op, |op| match *op {
+                MapOp::Insert(n, value) => Some(map.insert(&task, key(n), Tracked::new(counts, value)).get()),
+                MapOp::GetOrInsert(n, value) => {
+                    Some(map.get_or_insert_with(&task, key(n), || Tracked::new(counts, value)).get())
+                }
+                MapOp::Add(n, value) => {
+                    let mut replaced = None;
+                    map.update(&task, key(n), |old| {
+                        replaced = old.map(Tracked::get);
+                        Some(Tracked::new(counts, replaced.unwrap_or(0) + value))
+                    });
+                    replaced
+                }
+                MapOp::Get(n) => map.get(&task, &key(n)).map(Tracked::get),
+            });
+        }
+    }
+
+    /// Writers of one shard while its table grows: inserts, a racing `get_or_insert_with` (one
+    /// value wins, the other is dropped) and an `update` that must see the entry it replaces,
+    /// against a map. Each decision is made under the shard's lock, so the history is ordered
+    /// by it; the reads after the joins are ordered by them.
+    #[test]
+    fn model_map_writers_linearize_while_a_shard_grows() {
+        blaze_check::model(|| {
+            let counts = Arc::new(Counts::default());
+            let writers =
+                Arc::new(Writers { map: Map::new(), history: History::new(), counts: counts.clone() });
+            let mut init = Entries::default();
+            {
+                let task = blaze_reclaim::enter();
+                for n in 0..FULL {
+                    writers.map.insert(&task, key(n), Tracked::new(&counts, 100 + u64::from(n)));
+                    init.0.insert(n, 100 + u64::from(n));
+                }
+            }
+            let spawn = |ops: [MapOp; 2]| {
+                let writers = writers.clone();
+                thread::spawn(move || {
+                    for op in ops {
+                        writers.run(op);
+                    }
+                })
+            };
+            let one = spawn([MapOp::Insert(FULL, 1), MapOp::GetOrInsert(FULL + 1, 2)]);
+            let two = spawn([MapOp::Add(FULL, 10), MapOp::GetOrInsert(FULL + 1, 3)]);
+            writers.run(MapOp::Insert(0, 4));
+            one.join().expect("a writer");
+            two.join().expect("a writer");
+            for n in [0, FULL, FULL + 1] {
+                writers.run(MapOp::Get(n));
+            }
+            writers.history.check(init);
+            drop(writers);
+            counts.balanced();
+        });
+    }
+
+    /// A reader of one shard while a writer grows its table and another thread removes an entry:
+    /// an entry nobody touches is found in every table (the copy is published only once
+    /// complete), every entry found is read whole (the tracked payload), and after the joins the
+    /// map holds exactly what was inserted and kept.
+    #[test]
+    fn model_map_readers_see_entries_whole_while_a_shard_grows_and_loses_one() {
+        blaze_check::model(|| {
+            let counts = Arc::new(Counts::default());
+            let map = Arc::new(Map::<Tracked>::new());
+            {
+                let task = blaze_reclaim::enter();
+                for n in 0..FULL {
+                    map.insert(&task, key(n), Tracked::new(&counts, u64::from(n)));
+                }
+            }
+            let writer = {
+                let (map, counts) = (map.clone(), counts.clone());
+                thread::spawn(move || {
+                    let task = blaze_reclaim::enter();
+                    for n in [FULL, FULL + 1] {
+                        map.insert(&task, key(n), Tracked::new(&counts, u64::from(n)));
+                    }
+                })
+            };
+            let reader = {
+                let map = map.clone();
+                thread::spawn(move || {
+                    let task = blaze_reclaim::enter();
+                    assert_eq!(
+                        map.get(&task, &key(0)).map(Tracked::get),
+                        Some(0),
+                        "an entry no writer touches is in every table"
+                    );
+                    for n in [1, FULL, FULL + 1] {
+                        let found = map.get(&task, &key(n)).map(Tracked::get);
+                        assert!(found.is_none_or(|it| it == u64::from(n)), "key {n} read as {found:?}");
+                    }
+                })
+            };
+            {
+                let task = blaze_reclaim::enter();
+                map.retain(&task, |key, _| key.input.0[8] != 1);
+            }
+            writer.join().expect("the writer");
+            reader.join().expect("the reader");
+            let task = blaze_reclaim::enter();
+            for n in 0..FULL + 2 {
+                let want = (n != 1).then_some(u64::from(n));
+                assert_eq!(map.get(&task, &key(n)).map(Tracked::get), want, "key {n}");
+            }
+            let mut live = 0;
+            map.for_each(&task, |_, _| live += 1);
+            assert_eq!(live, usize::from(FULL) + 1, "each entry once, the removed one gone");
+            drop(task);
+            drop(map);
+            counts.balanced();
+        });
+    }
+
+    /// A column's sequential model: its values by index, a taken one `None`.
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct Values(Vec<Option<u64>>);
+
+    #[derive(Clone, Copy, Debug)]
+    enum ColumnOp {
+        Push(u64),
+        Get(u32),
+        Take(u32),
+    }
+
+    impl Spec for Values {
+        type Op = ColumnOp;
+        type Ret = Option<u64>;
+
+        fn apply(&mut self, op: &ColumnOp) -> Option<u64> {
+            match *op {
+                ColumnOp::Push(value) => {
+                    self.0.push(Some(value));
+                    Some(self.0.len() as u64 - 1)
+                }
+                ColumnOp::Get(index) => self.0.get(index as usize).copied().flatten(),
+                ColumnOp::Take(index) => self.0.get_mut(index as usize).and_then(Option::take),
+            }
+        }
+    }
+
+    /// Values a first chunk holds but one: the next pushes straddle a chunk no thread has made.
+    const PUSHED: u32 = COLUMN_FIRST as u32 - 1;
+
+    fn push(column: &Column<Tracked>, history: &History<Values>, counts: &Arc<Counts>, value: u64) -> u32 {
+        let index = history
+            .record(ColumnOp::Push(value), |_| Some(u64::from(column.push(|_| Tracked::new(counts, value)))));
+        u32::try_from(index.expect("a push gives its index")).expect("a u32 index")
+    }
+
+    fn get(column: &Column<Tracked>, history: &History<Values>, index: u32) {
+        let task = blaze_reclaim::enter();
+        history.record(ColumnOp::Get(index), |_| column.get(&task, index).map(Tracked::get));
+    }
+
+    /// Three pushes, two of them into a chunk they race to make, each read back by its own
+    /// thread or taken, against a vector: indices are dense and distinct and each value is
+    /// read whole. A value handed to another thread with a relaxed store is read as nothing or
+    /// whole: only the column's release and acquire order it.
+    #[test]
+    fn model_column_pushes_publish_whole_values_into_a_new_chunk() {
+        blaze_check::model(|| {
+            let counts = Arc::new(Counts::default());
+            let column = Arc::new(Column::<Tracked>::new());
+            let history = Arc::new(History::<Values>::new());
+            let mut init = Values(Vec::new());
+            for n in 0..u64::from(PUSHED) {
+                column.push(|_| Tracked::new(&counts, n));
+                init.0.push(Some(n));
+            }
+            let handed = Arc::new(AtomicU32::new(u32::MAX));
+            let getter = {
+                let (column, history, counts, handed) =
+                    (column.clone(), history.clone(), counts.clone(), handed.clone());
+                thread::spawn(move || {
+                    let index = push(&column, &history, &counts, 1000);
+                    handed.store(index, Relaxed);
+                    get(&column, &history, index);
+                    index
+                })
+            };
+            let taker = {
+                let (column, history, counts) = (column.clone(), history.clone(), counts.clone());
+                thread::spawn(move || {
+                    let index = push(&column, &history, &counts, 2000);
+                    let mut taken = None;
+                    history.record(ColumnOp::Take(index), |_| {
+                        taken = column.take(index);
+                        taken.as_deref().map(Tracked::get)
+                    });
+                    // Held, as the database's limbo holds it, until no reader can have it.
+                    (index, taken)
+                })
+            };
+            let mine = push(&column, &history, &counts, 3000);
+            let index = handed.load(Relaxed);
+            if index != u32::MAX {
+                let task = blaze_reclaim::enter();
+                let found = column.get(&task, index).map(Tracked::get);
+                assert!(found.is_none_or(|it| it == 1000), "index {index} read as {found:?}");
+            }
+            let theirs = getter.join().expect("the getter");
+            let (taken_at, taken) = taker.join().expect("the taker");
+            for index in [theirs, taken_at, mine] {
+                get(&column, &history, index);
+            }
+            history.check(init);
+            drop(taken);
+            drop(column);
+            counts.balanced();
+        });
+    }
+
+    /// Where a memo's value is: a buffer by its version, a mapped file, or nowhere.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum Held {
+        Memory(u8),
+        Disk,
+        Evicted,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CellOp {
+        Evict,
+        Refill(u8),
+        /// Moves the buffer of this version to disk, if it is still the cell's.
+        ToDisk(u8),
+        Look,
+    }
+
+    impl Spec for Held {
+        type Op = CellOp;
+        type Ret = Option<Held>;
+
+        fn apply(&mut self, op: &CellOp) -> Option<Held> {
+            match *op {
+                CellOp::Evict => matches!(self, Held::Memory(_)).then(|| std::mem::replace(self, Held::Evicted)),
+                CellOp::Refill(version) => {
+                    if *self == Held::Evicted {
+                        *self = Held::Memory(version);
+                    }
+                    None
+                }
+                CellOp::ToDisk(version) => {
+                    (*self == Held::Memory(version)).then(|| std::mem::replace(self, Held::Disk))
+                }
+                CellOp::Look => Some(*self),
+            }
+        }
+    }
+
+    const DISK: ContentId = ContentId([9; 32]);
+
+    /// Where `value` is, checking it is read whole.
+    fn where_is(value: &Value) -> Held {
+        match value {
+            Value::Memory(buffer) => {
+                let bytes = buffer.bytes();
+                assert!(bytes.len() == 2 && bytes[0] == b'm', "a buffer read whole: {bytes:?}");
+                Held::Memory(bytes[1] - b'0')
+            }
+            Value::Mapped { .. } => {
+                assert_eq!(value.bytes(), b"dk", "a mapped value read whole");
+                Held::Disk
+            }
+        }
+    }
+
+    /// A value the cell let go of, kept as the database's limbo keeps it.
+    fn keep(old: Arc<Value>, gone: &mut Vec<Arc<Value>>) -> Held {
+        let held = where_is(&old);
+        gone.push(old);
+        held
+    }
+
+    struct MemoCell {
+        memo: MemoData,
+        history: History<Held>,
+    }
+
+    impl MemoCell {
+        fn evict(&self, gone: &mut Vec<Arc<Value>>) {
+            let task = blaze_reclaim::enter();
+            self.history.record(CellOp::Evict, |_| self.memo.evict(&task).map(|old| keep(old, gone)));
+        }
+
+        fn refill(&self, version: u8) {
+            self.history.record(CellOp::Refill(version), |_| {
+                self.memo.refill(Aligned::copy(&[b'm', b'0' + version]));
+                None
+            });
+        }
+
+        /// A cold write: the buffer this thread sees (a lone load, outside the history), then the
+        /// swap that moves it to disk if the cell still holds that buffer.
+        fn to_disk(&self, gone: &mut Vec<Arc<Value>>) {
+            let task = blaze_reclaim::enter();
+            let Some(was) = self.memo.value.memory(&task) else { return };
+            let Held::Memory(version) = where_is(&was) else {
+                panic!("`ValueCell::memory` gave a mapped value")
+            };
+            let mapping = Mapping(Arc::new(Aligned::copy(b"dk")));
+            self.history.record(CellOp::ToDisk(version), |_| {
+                self.memo.to_disk(&was, mapping, 0, 2, DISK).map(|old| keep(old, gone))
+            });
+        }
+
+        fn look(&self) {
+            let task = blaze_reclaim::enter();
+            self.history.record(CellOp::Look, |_| {
+                let held = self.memo.value.load(&task).map_or(Held::Evicted, where_is);
+                let stored = match held {
+                    Held::Memory(_) => Stored::Memory,
+                    Held::Disk => Stored::Disk(DISK),
+                    Held::Evicted => Stored::Evicted,
+                };
+                assert_eq!(self.memo.stored(&task), stored);
+                assert_eq!(self.memo.bytes(&task).is_some(), held != Held::Evicted);
+                Some(held)
+            });
+        }
+    }
+
+    /// An eviction, a refill and two cold writes on one memo's value, against where the value
+    /// is: each swap is a compare-and-swap, so each decision is made on the latest value. Every
+    /// value let go of is let go of once: after the cell is dropped, each is held by its one
+    /// keeper alone.
+    #[test]
+    fn model_value_cell_evicts_refills_and_moves_to_disk_whole() {
+        blaze_check::model(|| {
+            let cell = Arc::new(MemoCell {
+                memo: MemoData {
+                    key: key(0),
+                    fingerprint: Fingerprint(7),
+                    schema: SchemaHash(ContentId([0x57; 32])),
+                    producer: ContentId([1; 32]),
+                    edges: Edges::Owned(Box::default()),
+                    value: ValueCell::new(Some(Value::Memory(Aligned::copy(b"m0")))),
+                },
+                history: History::<Held>::new(),
+            });
+            let evicter = {
+                let cell = cell.clone();
+                thread::spawn(move || {
+                    let mut gone = Vec::new();
+                    cell.evict(&mut gone);
+                    gone
+                })
+            };
+            let refiller = {
+                let cell = cell.clone();
+                thread::spawn(move || {
+                    let mut gone = Vec::new();
+                    cell.refill(1);
+                    cell.to_disk(&mut gone);
+                    gone
+                })
+            };
+            let mut gone = Vec::new();
+            cell.to_disk(&mut gone);
+            gone.extend(evicter.join().expect("the evicter"));
+            gone.extend(refiller.join().expect("the refiller"));
+            cell.look();
+            cell.history.check(Held::Memory(0));
+            drop(cell);
+            for value in &gone {
+                assert_eq!(Arc::strong_count(value), 1, "the cell gave up its count of a value once");
+            }
+        });
+    }
+}
+```
+
+### 6. `crates/blaze-query/src/tests.rs`
+
+Append at the end of the file:
+
+```rust
+/// Model tests of the database's own lock-free state (docs/v2/plan/lanes/safety/model.md): the
+/// collection generation and the thread-local that marks a query running.
+#[cfg(blaze_check)]
+mod model {
+    use std::sync::{Arc, atomic::Ordering};
+
+    use blaze_check::{Builder, thread};
+    use blaze_format::SchemaHash;
+    use blaze_ids::{ContentId, Fingerprint};
+
+    use crate::{
+        Database, Inside, QueryKey, QueryKind, inside_a_query,
+        table::{Edges, MemoData, ValueCell},
+    };
+
+    const KEY: QueryKey = QueryKey { kind: QueryKind(0x2f00), input: ContentId([3; 32]) };
+
+    fn memo(fingerprint: u128) -> Arc<MemoData> {
+        Arc::new(MemoData {
+            key: KEY,
+            fingerprint: Fingerprint(fingerprint),
+            schema: SchemaHash(ContentId([0x57; 32])),
+            producer: ContentId([1; 32]),
+            edges: Edges::Owned(Box::default()),
+            value: ValueCell::new(None),
+        })
+    }
+
+    /// `Database::add_memo` from two threads racing `Database::collect`: a memo given by a thread
+    /// that saw the collection's bump of the generation is young to it and kept; one given
+    /// before may go (no view reaches it). A key keeps only memos given, each once.
+    #[test]
+    fn model_collect_keeps_a_memo_given_after_it_bumped_the_generation() {
+        let mut builder = Builder::new();
+        // `collect` loads or locks each shard of each table a few times: each is a branch.
+        builder.max_branches = builder.max_branches.max(32 * blaze_ids::shard_count() + 10_000);
+        builder.check(|| {
+            let db = Arc::new(Database::empty());
+            let give = |fingerprint: u128| {
+                let db = db.clone();
+                thread::spawn(move || {
+                    let task = blaze_reclaim::enter();
+                    let saw_bump = db.generation.load(Ordering::SeqCst) > 0;
+                    db.add_memo(&task, &memo(fingerprint));
+                    saw_bump
+                })
+            };
+            let givers = [give(1), give(2)];
+            db.collect(&[], &mut Vec::new());
+            let saw = givers.map(|giver| giver.join().expect("a giver"));
+            let task = blaze_reclaim::enter();
+            let kept: Vec<u128> = db
+                .slot(&task, &KEY)
+                .map_or_else(Vec::new, |slot| slot.memos.iter().map(|it| it.fingerprint.0).collect());
+            assert!(kept.iter().all(|it| *it == 1 || *it == 2), "only memos given are kept: {kept:?}");
+            for (fingerprint, saw_bump) in [1, 2].into_iter().zip(saw) {
+                let count = kept.iter().filter(|it| **it == fingerprint).count();
+                assert!(count <= 1, "memo {fingerprint} is kept {count} times: {kept:?}");
+                assert!(
+                    !saw_bump || count == 1,
+                    "memo {fingerprint}, given after the collection bumped the generation, was dropped: \
+                     {kept:?}"
+                );
+            }
+        });
+    }
+
+    /// `INSIDE` is each thread's own: one thread's running query is never another's, at any
+    /// interleaving of their marks.
+    #[test]
+    fn model_inside_a_query_is_per_thread() {
+        blaze_check::model(|| {
+            let other = thread::spawn(|| {
+                assert!(!inside_a_query(), "another thread's query is not this one's");
+                thread::yield_now();
+                let inside = Inside::enter();
+                thread::yield_now();
+                assert!(inside_a_query());
+                drop(inside);
+                assert!(!inside_a_query());
+            });
+            let inside = Inside::enter();
+            thread::yield_now();
+            assert!(inside_a_query(), "this thread's mark is its own");
+            drop(inside);
+            thread::yield_now();
+            assert!(!inside_a_query());
+            other.join().expect("the other thread");
+        });
+    }
+}
+```
+
+Run: `RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-query --release model_`. The tests
+use only `std` and blaze-check's API as it is in `crates/blaze-check/src` today (`model`,
+`Builder::max_branches`, `thread::spawn`/`yield_now`, `cell::UnsafeCell::with`/`with_mut`,
+`linear::{History, Spec}`, `sync::atomic::AtomicU32`); blaze-check has no `thread::scope`
+yet, so each test shares through `Arc`. `blaze-reclaim` has no switch yet (safety-model-store's
+crate): its `std` thread-local is then shared by the model's threads on one OS thread, which
+only delays frees, and `Limbo::collect` never runs in these tests (`COLLECT_AT` is 16). They
+pass with or without it.
+
+## From speed-backend-sanitize (2026-10-29): `#[sanitize(.. = "off")]` for codegen (`crates/hir-def/src/attrs.rs`)
+
+What: a query giving a function's effective set of sanitizers turned off, as rustc's
+`sanitizer_settings_for` (`compiler/rustc_codegen_ssa/src/codegen_attrs.rs` at the pinned
+nightly) computes it:
+
+```rust
+/// The sanitizers `#[sanitize(address = "off", ..)]` turns off for `def`, from its own
+/// attribute and those of its parents (impl, module, crate), the nearest winning:
+/// `blaze_codegen::settings::Sanitizers` bits ADDRESS, THREAD, MEMORY.
+pub fn disabled_sanitizers(db: &dyn DefDatabase, def: FunctionId) -> u8;
+```
+
+Rules (rustc's): start from the parent's set (the crate root has none); each `key = "off"` of
+this item's `#[sanitize(..)]` sets the bit, each `key = "on"` clears it; the keys are `address`
+and `kernel_address` (ADDRESS), `thread`, `memory`; the attribute is accepted on fns, closures,
+methods, impls, modules, the crate and statics, under feature `sanitize`. `#[no_sanitize]` is
+gone from the pinned nightly; refuse it as rustc does. Other keys (`cfi`, `kcfi`, `hwaddress`,
+`memtag`, `shadow_call_stack`, `safestack`, `realtime`) are parsed and kept out of this set,
+since blaze does not instrument them.
+Why: S2 of `v2/requests/codegen.md`: every function but those turned off gets
+`sanitize_address`/`sanitize_thread`/`sanitize_memory`; the fuzz engine's callbacks are
+`#[sanitize(address = "off")]` (`fuzz/src/raw.rs`). The adapter reads this into
+`Function::unsanitized` (codegen.md "From speed-backend-sanitize" Z3.2) and items hashes it
+(`v2/requests/items.md`, same date).
+
+> written by speed-backend-sanitize (2026-10-29); told db by tmux.
+> forwarded to db.
+
+## frontend: what frontend.md items 7-12 still need in db's paths (lane frontend, 2026-10-29 19:10)
+
+Lane `frontend` checks each item of `docs/v2/plan/design/frontend.md`. These are db's (items 9,
+10, 12 with core; 11; 8 with everyone; 7's signatures). Each is what the code shows today;
+answer with `>` lines (applied / planned by whom / declined and why).
+
+1. **Item 9, cancellation by unwinding.** `vendor/salsa/src/cancelled.rs:33-38`,
+   `zalsa.rs:311-314`, `function/fetch.rs:21` still unwind with `salsa::Cancelled`, and the v2
+   daemon relies on it (`crates/load-cargo/src/v2/db.rs:17-23`: a write sets the flag, readers
+   unwind, the worker maps it to `Failed::Again`). The doc: the plane stops scheduling a
+   cancelled request's tasks, and a running task sees the flag at its next query call and
+   returns. Asked: the cancellation check at a query call returns (`Err(Cancelled)` up the
+   query stack, as `blaze_query::Cx::get` does, `crates/blaze-query/src/lib.rs:346-357`) rather
+   than `panic::resume_unwind`; the hir queries propagate it; no `catch_unwind` on the build's
+   path.
+2. **Item 10, per-worker handles.** `load-cargo/src/v2/db.rs:15-35` (`Db: Clone`, `Snapshot`
+   per worker, boxed into `hir_ty_codegen::v2::Databases`). Your Done when says "no salsa
+   per-thread handles". Asked: the query stack per task (not per handle), so workers share
+   `&Db`; then cargo-daemon drops `snapshot` and codegen's `Databases` takes `&dyn HirDatabase`
+   (frontend sent both their parts: `v2/requests/cargo.md`, `v2/requests/codegen.md`).
+3. **Item 12, LRU on the build's path.** `#[salsa::tracked(lru = ..)]` on
+   `expr_store/body.rs:111,161` and `attrs.rs:1686` (and others): an evicted memo must keep
+   its fingerprint and edges so a re-execution that gives the same fingerprint still cuts off
+   (the salsa fork has edge fingerprints, `zalsa_local.rs:538-603`,
+   `function/maybe_changed_after.rs:320-322`: please confirm eviction keeps them for every
+   `lru` query, with a test that evicts and edits elsewhere and counts dependents that rerun:
+   zero).
+4. **Item 11, interned values never freed.** `vendor/salsa/src/interned.rs:99-115` reuses slots
+   by CLOCK within revisions; nothing collects by reachability from live views
+   (`blaze_query::Database::collect`, `lib.rs:761-798`, covers its own memos only). Asked: salsa
+   interned values collected with the image's GC by reachability from live views, keeping IDs
+   stable for live values (no renumbering; restore.md: IDs are indexes into mapped tables).
+   `frontend-image` does `crates/intern` and the image's interner section and will send you the
+   API.
+5. **Item 8, `Arc` per node.** hir-def/hir-ty/hir-expand/base-db still hold `triomphe::Arc` per
+   value (e.g. `Body::of -> Arc<Body>`, `signatures.rs`, `base-db/src/lib.rs:50`). Asked:
+   values returned by reference from their memo (`returns(ref)`), not `Arc` clones, on the
+   build's hot paths; list in your report which remain and why.
+6. **Item 7, signatures' source maps.** `*Signature::of` goes through `with_source_map`
+   (`crates/hir-def/src/signatures.rs:206-243`), so every signature lowering builds a map.
+   Asked: `of` lowers without the map; `with_source_map` lowers with it on demand; same
+   signature (test over every signature fixture). The body side is asked of
+   speed-hir-store-srcmap (`v2/requests/speed-hir.md`).
+7. **Items 1, 5, 6, 14 and 4**: `frontend-nameres`, `-deps`, `-text`, `-tokens` will send exact
+   hook edits for `nameres`, `base-db`'s parse and `FileText`, and `hir-expand`'s expansion,
+   under `## frontend-<part>:` headings here.
+
+> forwarded to db.
+
+## frontend-deps: declare `hir_def::deps` (dependency images, frontend.md item 5; 2026-10-29)
+
+`crates/hir-def/src/deps.rs` and `deps/{key,image,serve,tests}.rs` are new (lane
+`frontend-deps`): a dependency crate's def map, lang items and signatures kept as one image keyed
+by every input, served from the store or global cache (`deps::serve`) and written on a miss
+(`deps::store`). `deps/signatures.rs` comes from `frontend-deps-sigs`, which sends its own hooks
+into `signatures.rs`. Nothing calls the module until cargo's driver does (request in
+`v2/requests/cargo.md`). The module needs declaring:
+
+- File: `crates/hir-def/src/lib.rs`
+- Old:
+  ```rust
+  pub mod nameres;
+
+  pub mod src;
+  ```
+- New:
+  ```rust
+  pub mod nameres;
+
+  pub mod deps;
+
+  pub mod src;
+  ```
+- Why: without it the module is not compiled. It reads `nameres::frozen`'s pub API only
+  (`encode`, `encode_lang_items`, `set`, `set_lang_items`, `unreadable`, `ENCODING`, `Mode`,
+  `Frozen`), so no other db file changes.
+
+Already done, thanks: `EditionedFileId::parse` parses library source roots as an outline
+(`crates/base-db/src/editioned_file_id.rs:25-34`), which item 5 needed.
+
+> forwarded to db (window `db-next2`, told by tmux): `crates/hir-def/` is its.
+
+## frontend-deps-reparse: parse a file from its previous parse (frontend.md item 14; 2026-10-29)
+
+`EditionedFileId::parse` parses the whole text on every edit; it never sees the previous tree.
+`syntax::SourceFile::parse_file` (new, `crates/syntax/src/lib.rs`, lane `frontend-deps-reparse`)
+keeps the last parse of each recently parsed file (128 direct-mapped slots,
+`crates/syntax/src/parsing/kept.rs`) and makes the next parse of that file with
+`Parse::reparse_to(text, edition)`: the bytes between the longest common prefix and suffix of the
+previous tree's text and the new text are the edit, and only the smallest token, lazy body, block or
+top-level item holding it is parsed again and spliced (`parsing/reparsing.rs`), sharing the new
+`FileText` `Arc<str>`. The edit is computed from the two texts, so nothing about the edit has to be
+stored in base-db or trusted: several VFS edits between two parses are one covering edit, and a slot
+another file took is a whole parse. This is not a fallback: the reparse and a whole parse give the
+same tree (`reparse_random_edits`, `reparse_to_random_edits` and `kept::tests` compare them, in full
+and as outlines), so which one runs changes the time only. The outline/full choice stays the query's
+(`is_library`); a kept parse of the other kind is not used.
+
+- File: `crates/base-db/src/editioned_file_id.rs`
+- Old:
+  ```rust
+    /// The file's tree, sharing its text. A file of a library source root (a dependency's) is an
+    /// outline, whose `fn` bodies are parsed when first walked into (#1294); every other file is
+    /// parsed in full. Decided by the source root, so a file two crates read gets one answer.
+    #[salsa::tracked(lru = 128, returns(ref))]
+    pub fn parse(self, db: &dyn SourceDatabase) -> syntax::Parse<ast::SourceFile> {
+        let _p = tracing::info_span!("parse", ?self).entered();
+        let (file_id, edition) = self.unpack(db);
+        let text = db.file_text(file_id).text(db).clone();
+        match self.is_library(db) {
+            true => ast::SourceFile::parse_outline(text, edition),
+            false => ast::SourceFile::parse_shared(text, edition),
+        }
+    }
+  ```
+- New:
+  ```rust
+    /// The file's tree, sharing its text. A file of a library source root (a dependency's) is an
+    /// outline, whose `fn` bodies are parsed when first walked into (#1294); every other file is
+    /// parsed in full. Decided by the source root, so a file two crates read gets one answer.
+    /// After an edit, only what the edit touches is parsed again, from the file's last parse
+    /// ([`ast::SourceFile::parse_file`]); the tree is the one a whole parse makes.
+    #[salsa::tracked(lru = 128, returns(ref))]
+    pub fn parse(self, db: &dyn SourceDatabase) -> syntax::Parse<ast::SourceFile> {
+        let _p = tracing::info_span!("parse", ?self).entered();
+        let (file_id, edition) = self.unpack(db);
+        let text = db.file_text(file_id).text(db).clone();
+        let key = self.span_file_id(db).as_u32();
+        ast::SourceFile::parse_file(key, text, edition, self.is_library(db))
+    }
+  ```
+- Why: frontend.md item 14 ("v2 reparses only the items an edit touches"). The per-item item
+  tree (`crates/hir-def/src/item_tree/`, same lane) then re-lowers only the items whose syntax
+  changed. No new dependency: base-db already depends on `syntax`.

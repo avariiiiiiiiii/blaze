@@ -2901,9 +2901,10 @@ impl ModCollector<'_, '_> {
                     let impl_id =
                         ImplLoc { container: module_id, id: InFile::new(self.file_id(), ast_id) }
                             .intern(db);
+                    let is_reservation = attrs.by_key(sym::rustc_reservation_impl).exists();
                     self.def_collector.def_map.modules.building()[self.module_id]
                         .scope_mut()
-                        .define_impl(impl_id, imp.is_trait_impl)
+                        .define_impl(impl_id, imp.is_trait_impl, is_reservation)
                 }
                 ModItemKind::Function(ast_id, it) => {
                     let fn_id =

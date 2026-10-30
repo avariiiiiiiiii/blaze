@@ -20,7 +20,7 @@ use syntax::{AstNode as _, SyntaxNode, TextRange, ast};
 use crate::{
     cx::def_range,
     lints::bodies::{
-        BodyCx, LatePass,
+        BodyCx, Hooks, LatePass,
         types::util::{self, diagnostic_item, fn_item, from_expansion},
     },
     lower::{Found, Phase},
@@ -44,6 +44,10 @@ enum Noop {
 impl LatePass for NoopMethodCall {
     fn name(&self) -> &'static str {
         "NoopMethodCall"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

@@ -96,15 +96,23 @@ impl Compile {
 
     /// rustc's arguments, in cargo's order.
     pub fn args(&self) -> Vec<String> {
-        let mut args = Vec::new();
+        let count = self.search.len()
+            + self.libs.len()
+            + self.link_args.len()
+            + self.cfgs.len()
+            + self.check_cfgs.len();
+        let mut args = Vec::with_capacity(2 * count);
         for path in &self.search {
-            args.extend(["-L".to_owned(), path.display().to_string()]);
+            args.extend(["-L".to_owned(), path.to_string_lossy().into_owned()]);
         }
         for lib in &self.libs {
             args.extend(["-l".to_owned(), lib.clone()]);
         }
         for arg in &self.link_args {
-            args.extend(["-C".to_owned(), format!("link-arg={arg}")]);
+            let mut link_arg = String::with_capacity("link-arg=".len() + arg.len());
+            link_arg.push_str("link-arg=");
+            link_arg.push_str(arg);
+            args.extend(["-C".to_owned(), link_arg]);
         }
         for cfg in &self.cfgs {
             args.extend(["--cfg".to_owned(), cfg.clone()]);
@@ -153,29 +161,50 @@ where
         return it.clone();
     }
     let node = graph(&unit);
+    fill(unit.clone(), node, graph, memo);
+    memo[&unit].clone()
+}
+
+/// Puts what [`BuildScripts`] `unit`, whose node is `node`, has in `memo`, with those of every
+/// dependency it receives scripts from. Each dependency's node is made once per edge, and one
+/// that is neither for the host nor linked gives nothing, so is not followed.
+fn fill<U, R>(
+    unit: U,
+    node: GraphUnit<U, R>,
+    graph: &dyn Fn(&U) -> GraphUnit<U, R>,
+    memo: &mut FxHashMap<U, BuildScripts<R>>,
+) where
+    U: Clone + Eq + Hash,
+    R: Clone + Eq + Hash + Ord,
+{
     let mut seen = FxHashSet::default();
     let mut scripts = BuildScripts { to_link: Vec::new(), plugins: BTreeSet::new() };
-    let mut add = |scripts: &mut BuildScripts<R>, run: &R| {
+    for run in &node.own_runs {
         if seen.insert(run.clone()) {
             scripts.to_link.push(run.clone());
         }
-    };
-    for run in &node.own_runs {
-        add(&mut scripts, run);
     }
-    for dep in node.deps {
-        let of_dep = to_link(dep.clone(), graph, memo);
-        let dep_node = graph(&dep);
-        if dep_node.for_host {
+    for dep in &node.deps {
+        let dep_node = graph(dep);
+        let (for_host, linkable) = (dep_node.for_host, dep_node.linkable);
+        if !for_host && !linkable {
+            continue;
+        }
+        if !memo.contains_key(dep) {
+            fill(dep.clone(), dep_node, graph, memo);
+        }
+        let of_dep = &memo[dep];
+        if for_host {
             scripts.plugins.extend(of_dep.to_link.iter().cloned());
-        } else if dep_node.linkable {
+        } else {
             for run in &of_dep.to_link {
-                add(&mut scripts, run);
+                if seen.insert(run.clone()) {
+                    scripts.to_link.push(run.clone());
+                }
             }
         }
     }
-    memo.insert(unit, scripts.clone());
-    scripts
+    memo.insert(unit, scripts);
 }
 
 impl Dependency {
@@ -236,8 +265,11 @@ impl Rerun {
         now: &dyn Fn(&str) -> Option<String>,
     ) -> Option<Option<Stale>> {
         let Rerun::Watched { files, env } = self else { return None };
+        let mut path = PathBuf::new();
         for file in files {
-            let path = package_dir.join(file);
+            path.as_mut_os_string().clear();
+            path.push(package_dir);
+            path.push(file);
             match newest(&path) {
                 None => return Some(Some(Stale::Missing(path))),
                 Some(it) if it > ran => return Some(Some(Stale::Newer(path))),
@@ -256,7 +288,8 @@ impl Rerun {
 
 /// The newest time of the file at `path`, or of the directory there and everything below
 /// it, as cargo's `mtime_recursive` takes it: links followed, a link's own time and its
-/// target's, what cannot be read left out.
+/// target's, what cannot be read left out. An entry's own time is read from its directory
+/// (`fstatat` on Unix), and its path made only for a link or a directory.
 fn newest(path: &Path) -> Option<SystemTime> {
     let meta = std::fs::metadata(path).ok()?;
     let mut newest = meta.modified().ok()?;
@@ -268,17 +301,21 @@ fn newest(path: &Path) -> Option<SystemTime> {
     while let Some(dir) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(link) = std::fs::symlink_metadata(&path) else { continue };
+            let Ok(link) = entry.metadata() else { continue };
             if let Ok(it) = link.modified() {
                 newest = newest.max(it);
             }
-            let target = match link.file_type().is_symlink() {
+            let is_link = link.file_type().is_symlink();
+            if !is_link && !link.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let target = match is_link {
                 true => std::fs::metadata(&path).ok(),
                 false => Some(link),
             };
             let Some(target) = target else { continue };
-            if let Ok(it) = target.modified() {
+            if is_link && let Ok(it) = target.modified() {
                 newest = newest.max(it);
             }
             if target.is_dir() && std::fs::canonicalize(&path).is_ok_and(|it| visited.insert(it)) {

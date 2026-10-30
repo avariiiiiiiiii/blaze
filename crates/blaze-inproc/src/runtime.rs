@@ -87,6 +87,21 @@ pub fn quiesce() {
 struct Local {
     slot: Cell<Option<usize>>,
     reported: Cell<u64>,
+    /// `sys::thread_id()`, read once (a system call on Linux); 0 before.
+    tid: Cell<u64>,
+}
+
+impl Local {
+    fn tid(&self) -> u64 {
+        match self.tid.get() {
+            0 => {
+                let tid = sys::thread_id();
+                self.tid.set(tid);
+                tid
+            }
+            tid => tid,
+        }
+    }
 }
 
 impl Drop for Local {
@@ -107,7 +122,7 @@ impl Drop for Local {
 }
 
 thread_local! {
-    static LOCAL: Local = const { Local { slot: Cell::new(None), reported: Cell::new(0) } };
+    static LOCAL: Local = const { Local { slot: Cell::new(None), reported: Cell::new(0), tid: Cell::new(0) } };
 }
 
 impl Attached {
@@ -124,16 +139,22 @@ impl Attached {
         self.len == 0
     }
 
+    /// What the daemon last announced ([`crate::CodeMemory::announce`]): one load.
+    pub fn announced(&self) -> u64 {
+        Thread::announced(&self.control)
+    }
+
     /// A quiescent point of the calling thread: it is in no code it could leave and return
     /// to except what its stack shows. While the epoch has not changed since the thread last
-    /// reported, one atomic load.
+    /// reported, one atomic load of the epoch and two of the thread's own slot.
     pub fn quiesce(&self) {
         let epoch = Thread::epoch(&self.control);
         let _ = LOCAL.try_with(|local| {
+            let tid = local.tid();
             if let Some(index) = local.slot.get()
                 && local.reported.get() == epoch
             {
-                if Thread::holds(&self.control, index, self.pid, sys::thread_id()) {
+                if Thread::holds(&self.control, index, self.pid, tid) {
                     return;
                 }
                 local.slot.set(None);
@@ -142,7 +163,6 @@ impl Attached {
             let mut frames = [0u64; MOST_FRAMES];
             let walked = sys::backtrace(&mut frames).map(|len| &frames[..len]);
             let seen = Thread::seen(&self.control, epoch, walked);
-            let tid = sys::thread_id();
             match local.slot.get() {
                 Some(index) if Thread::holds(&self.control, index, self.pid, tid) => {
                     Thread::report(&self.control, index, seen);

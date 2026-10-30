@@ -542,6 +542,99 @@ impl TopSubtree {
     }
 }
 
+thread_local! {
+    /// The subtrees a [`TopSubtree::for_each_token`] walk is in, kept for the next walk.
+    static OPEN: Cell<Vec<u32>> = const { Cell::new(Vec::new()) };
+}
+
+impl TopSubtree {
+    /// The context of a packed span: its part's, with no range unpacked.
+    #[inline]
+    fn ctx_of(&self, span: PackedSpan) -> SyntaxContext {
+        let part = match span.len_part {
+            WIDE => self.wide[span.start as usize].part,
+            len_part => len_part >> 16,
+        };
+        self.parts[part as usize].ctx
+    }
+
+    /// The context of a leaf's span, or of a subtree's opening one.
+    #[inline]
+    fn first_ctx_at(&self, at: u32) -> SyntaxContext {
+        match at {
+            0 => self.top_open.ctx,
+            _ => self.ctx_of(self.spans[at as usize]),
+        }
+    }
+
+    /// The context of the closing span of the subtree at `at`.
+    #[inline]
+    fn close_ctx_at(&self, at: u32) -> SyntaxContext {
+        match at {
+            0 => self.top_close.ctx,
+            _ => {
+                let ordinal = self.nodes[at as usize].ordinal() as usize;
+                self.ctx_of(self.spans[self.nodes.len() + ordinal - 1])
+            }
+        }
+    }
+
+    #[inline]
+    fn close_token(&self, subtree: u32) -> (crate::FlatToken, SyntaxContext) {
+        let kind = self.nodes[subtree as usize].delimiter_kind();
+        (crate::FlatToken::Close(kind), self.close_ctx_at(subtree))
+    }
+
+    /// Calls `f` with each token of the token trees `start..end` in order, a subtree being its
+    /// opening delimiter, its token trees and its closing delimiter, with the context of each.
+    /// Reads the columns: no span's range and no leaf is unpacked, and nothing is allocated
+    /// but the stack of open subtrees, kept per thread.
+    pub(crate) fn for_each_token(
+        &self,
+        start: u32,
+        end: u32,
+        mut f: impl FnMut(crate::FlatToken, SyntaxContext),
+    ) {
+        use crate::FlatToken;
+        let mut open = OPEN.take();
+        open.clear();
+        for at in start..end {
+            while let Some(&subtree) = open.last()
+                && subtree + 1 + self.nodes[subtree as usize].data == at
+            {
+                open.pop();
+                let (close, ctx) = self.close_token(subtree);
+                f(close, ctx);
+            }
+            let node = self.nodes[at as usize];
+            let token = match node.tag() {
+                SUBTREE => {
+                    open.push(at);
+                    FlatToken::Open(node.delimiter_kind())
+                }
+                PUNCT => FlatToken::Punct {
+                    char: char::from_u32(node.data).expect("a punct's node holds a char"),
+                    spacing: node.spacing(),
+                },
+                IDENT => {
+                    FlatToken::Ident { sym: self.symbols[node.data as usize], is_raw: node.is_raw() }
+                }
+                _ => FlatToken::Literal {
+                    sym: self.symbols[node.data as usize],
+                    kind: node.lit_kind(),
+                    suffix_len: node.suffix_len(),
+                },
+            };
+            f(token, self.first_ctx_at(at));
+        }
+        while let Some(subtree) = open.pop() {
+            let (close, ctx) = self.close_token(subtree);
+            f(close, ctx);
+        }
+        OPEN.set(open);
+    }
+}
+
 fn has_duplicates(parts: &[CompressedSpanPart]) -> bool {
     if parts.len() <= SCAN {
         return parts.iter().enumerate().any(|(at, part)| parts[..at].contains(part));

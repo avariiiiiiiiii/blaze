@@ -1678,7 +1678,7 @@ impl<'db> SemanticsImpl<'db> {
             expr_id: ExprId,
             acc: &mut Vec<InFile<ast::ReturnExpr>>,
         ) {
-            match &body[expr_id] {
+            match body.expr(expr_id) {
                 Expr::Closure { .. } | Expr::Const(_) => return,
                 Expr::Return { .. } => {
                     if let Ok(source) = source_map.expr_syntax(expr_id)
@@ -1726,7 +1726,7 @@ impl<'db> SemanticsImpl<'db> {
         let parent_ty = path.syntax().parent().and_then(ast::Type::cast)?;
         let analyze = self.analyze(path.syntax())?;
         let ty = analyze.store_sm()?.node_type(InFile::new(analyze.file_id, &parent_ty))?;
-        let path = match &analyze.store()?.types[ty] {
+        let path = match analyze.store()?.type_ref(ty) {
             hir_def::type_ref::TypeRef::Path(path) => path,
             _ => return None,
         };
@@ -2437,7 +2437,7 @@ impl<'db> SemanticsImpl<'db> {
             if let Some(parent) = ast::Expr::cast(parent.clone())
                 && let Some(ExprOrPatId::ExprId(expr_id)) =
                     source_map.node_expr(InFile { file_id, value: &parent })
-                && let Expr::Block { unsafe_: Unsafe::Yes, .. } = body[expr_id]
+                && let Expr::Block { unsafe_: Unsafe::Yes, .. } = body.expr(expr_id)
             {
                 break true;
             }
@@ -2524,7 +2524,7 @@ impl<'db> SemanticsImpl<'db> {
         let mut add_to_locals_used = |id, parent_expr| {
             let path = match id {
                 ExprOrPatId::ExprId(expr_id) => {
-                    if let Expr::Path(path) = &store[expr_id] {
+                    if let Expr::Path(path) = store.expr(expr_id) {
                         Some(path)
                     } else {
                         None
@@ -2551,7 +2551,7 @@ impl<'db> SemanticsImpl<'db> {
         };
 
         while let Some(expr_id) = exprs.pop() {
-            if let Expr::Assignment { target, .. } = store[expr_id] {
+            if let Expr::Assignment { target, .. } = store.expr(expr_id) {
                 store.walk_pats(target, &mut |id| {
                     add_to_locals_used(ExprOrPatId::PatId(id), expr_id)
                 });
@@ -2938,7 +2938,7 @@ impl RenameConflictsVisitor<'_> {
     }
 
     fn rename_conflicts(&mut self, expr: ExprId) {
-        match &self.body[expr] {
+        match self.body.expr(expr) {
             Expr::Path(path) => {
                 let guard = self.resolver.update_to_inner_scope(self.db, self.owner, expr);
                 self.resolve_path(expr.into(), path);

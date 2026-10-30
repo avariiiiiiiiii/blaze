@@ -87,7 +87,7 @@ pub fn is_rust_whitespace(c: char) -> bool {
 /// [`TopEntryPoint::parse`] makes a guarantee that
 ///   * all input is consumed
 ///   * the result is a valid tree (there's one root node)
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopEntryPoint {
     SourceFile,
     MacroStmts,
@@ -163,7 +163,7 @@ impl TopEntryPoint {
 /// `Option<Output>`. The way MBE work, by the time we *try* to parse `$e:expr`
 /// we already commit to expression. In other words, this API by design can't be
 /// used to implement "rollback and try another alternative" logic.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefixEntryPoint {
     Vis,
     Block,

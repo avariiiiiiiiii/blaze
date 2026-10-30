@@ -17,6 +17,7 @@ doctest = false
 either.workspace = true
 rustc-hash.workspace = true
 salsa.workspace = true
+smallvec.workspace = true
 triomphe.workspace = true
 
 rustc_abi.workspace = true

@@ -14,7 +14,7 @@ use blaze_units::schema::Mode;
 use rustc_hash::FxHashMap;
 
 use super::{Job, package_of};
-use crate::serve::work::Runs;
+use crate::serve::work::{Runs, Writer};
 
 /// The environment `artifact`'s program runs in: the job's, cargo's variables of it over it,
 /// and the job's dynamic library search path after cargo's directories, as
@@ -162,7 +162,13 @@ pub(crate) fn start(
 }
 
 impl Runs for Program {
-    fn start(&mut self, _store: &Store, effects: &mut Vec<Effect>, _out: &mut Vec<Response>) -> Option<bool> {
+    fn start(
+        &mut self,
+        _store: &Store,
+        _writer: Option<&mut dyn Writer>,
+        effects: &mut Vec<Effect>,
+        _out: &mut Vec<Response>,
+    ) -> Option<bool> {
         let command = self.command.take()?;
         effects.push(Effect::Spawn { command: Box::new(command), tag: self.tag });
         self.running = true;
@@ -177,6 +183,7 @@ impl Runs for Program {
         &mut self,
         completion: Completion,
         _store: &mut Store,
+        _writer: Option<&mut dyn Writer>,
         _effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {

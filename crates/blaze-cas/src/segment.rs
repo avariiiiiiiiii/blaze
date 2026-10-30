@@ -14,10 +14,7 @@
 
 use std::{
     ptr::{self, NonNull},
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicPtr, AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 use blaze_ids::ContentId;
@@ -29,6 +26,11 @@ use crate::{
     flags::Flag,
     read::{Look, Place, Seg, Shared, Spot},
     table::Held,
+};
+use crate::sync::{
+    OnceLock,
+    atomic::{AtomicPtr, AtomicU64, Ordering},
+    track,
 };
 
 /// A chunk's length, unless a record needs more.
@@ -72,6 +74,7 @@ impl Chunk {
     fn new(cap: usize, start: u64) -> ChunkRef {
         let bytes: Box<[u8]> = vec![0; cap].into_boxed_slice();
         let bytes = NonNull::new(Box::into_raw(bytes).cast::<u8>()).expect("a box is not null");
+        track::write(bytes.as_ptr(), cap);
         let chunk = Chunk { bytes, cap, published: AtomicU64::new(0), next: AtomicPtr::new(ptr::null_mut()), start };
         ChunkRef(NonNull::from(Box::leak(Box::new(chunk))))
     }
@@ -94,6 +97,7 @@ impl Chunk {
         // SAFETY: `at + len <= cap` (checked above), so `at` is inside the allocation of `cap`
         // bytes.
         let start = unsafe { self.bytes.as_ptr().add(at as usize) };
+        track::read(start, len as usize);
         // SAFETY: the `len` bytes from `start` are inside the allocation, which lives as long as
         // the chunk; bytes a place names or that were published are not written again (the
         // caller's contract).
@@ -111,6 +115,7 @@ impl Chunk {
         let from = data.as_ptr();
         // SAFETY: `at + data.len() <= cap` (asserted above), so `at` is inside the allocation.
         let to = unsafe { self.bytes.as_ptr().add(at) };
+        track::write(to, data.len());
         // SAFETY: `to` has `data.len()` writable bytes in the allocation, which `data` (the
         // caller's own buffer) does not overlap, and no one else reads or writes them (the
         // caller's contract).
@@ -126,6 +131,7 @@ impl Chunk {
         assert!(at + len <= self.cap, "a write past its chunk");
         // SAFETY: `at + len <= cap` (asserted above), so `at` is inside the allocation.
         let to = unsafe { self.bytes.as_ptr().add(at) };
+        track::write(to, len);
         // SAFETY: `to` has `len` writable bytes in the allocation, and no one else reads or
         // writes them (the caller's contract, as in `write`).
         unsafe { ptr::write_bytes(to, 0, len) }
@@ -153,6 +159,7 @@ impl Chunk {
 
 impl Drop for Chunk {
     fn drop(&mut self) {
+        track::free(self.bytes.as_ptr(), self.cap);
         // SAFETY: made from a boxed slice of `cap` bytes in `Chunk::new`, freed only here.
         drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(self.bytes.as_ptr(), self.cap)) });
     }

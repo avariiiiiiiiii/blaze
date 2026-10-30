@@ -246,7 +246,7 @@ fn write_function<'db>(f: &mut HirFormatter<'_, 'db>, func_id: FunctionId) -> Re
     let ret_type = if !data.is_async() && !data.is_gen() {
         data.ret_type
     } else if let Some(ret_type) = data.ret_type {
-        match &data.store[ret_type] {
+        match data.store.type_ref(ret_type) {
             TypeRef::ImplTrait(bounds) => match &bounds[0] {
                 &TypeBound::Path(path, _) => Some(
                     *data.store[path]
@@ -270,7 +270,7 @@ fn write_function<'db>(f: &mut HirFormatter<'_, 'db>, func_id: FunctionId) -> Re
     };
 
     if let Some(ret_type) = ret_type {
-        match &data.store[ret_type] {
+        match data.store.type_ref(ret_type) {
             TypeRef::Tuple(tup) if tup.is_empty() => {}
             _ => {
                 f.write_str(" -> ")?;
@@ -324,9 +324,9 @@ impl<'db> HirDisplay<'db> for SelfParam {
         let data = FunctionSignature::of(f.db, func);
         let param = *data.params.first().unwrap();
         let owner = ExpressionStoreOwnerId::Body(func.into());
-        match &data.store[param] {
+        match data.store.type_ref(param) {
             TypeRef::Path(p) if p.is_self_type() => f.write_str("self"),
-            TypeRef::Reference(ref_) if matches!(&data.store[ref_.ty], TypeRef::Path(p) if p.is_self_type()) =>
+            TypeRef::Reference(ref_) if matches!(data.store.type_ref(ref_.ty), TypeRef::Path(p) if p.is_self_type()) =>
             {
                 f.write_char('&')?;
                 if let Some(lifetime) = &ref_.lifetime {
@@ -791,7 +791,7 @@ fn has_disaplayable_predicates(
         !matches!(
             pred,
             WherePredicate::TypeBound { target, .. }
-            if  matches!(store[*target],
+            if  matches!(store.type_ref(*target),
                 TypeRef::TypeParam(id) if GenericParams::of(db,id.parent())[id.local_id()].name().is_none()
             )
         )
@@ -808,7 +808,7 @@ fn write_where_predicates<'db>(
 
     // unnamed type targets are displayed inline with the argument itself, e.g. `f: impl Y`.
     let is_unnamed_type_target = |target: TypeRefId| {
-        matches!(store[target],
+        matches!(store.type_ref(target),
             TypeRef::TypeParam(id) if GenericParams::of(f.db,id.parent())[id.local_id()].name().is_none()
         )
     };

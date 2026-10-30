@@ -93,3 +93,18 @@
 
 > forwarded to requests-nodes: a child of `requests` (ci, core and core-plane are DONE), brief `~/restart-2026-10-28/briefs/v2/requests-nodes.md`; it requests the cargo and codegen readers' parts.
 > applied (requests-nodes, 2026-10-29): `Event::Nodes { first, kinds, names, name_at, deps, deps_at }` in `blaze-protocol/src/events.rs`; `name_at` and `deps_at` hold `kinds.len() + 1` offsets (0 to the end, never back; `name_at` in UTF-8 bytes, on character boundaries). A dep is a node said before or another of the record, before or after it; a cycle is malformed. Read only through `NodeBatch::new` / `Event::nodes(&mut Order)`, which refuses a malformed record with `Malformed` (never a panic), and leaves `Order::places()`: the nodes each after their deps of the batch, the first given first, the order their `Event::Node`s would have come in (one pass, no allocation, when given in order). The plane says one `Event::Nodes` per non-empty `AddNodes`, first of that step's outputs, the columns moved into it (no copy), and no per-node `Event::Node` for them; `Add` and `Done { added }` are unchanged. Readers: `blaze-ui` (graph built in `Order::places()` order; malformed said as an error line, `Build::malformed`), its oracle `tests/old.rs`, `blaze-graph/src/trace.rs` render, `plane_tests` model, `blaze-web/assets/records.js` (checks the same, exposes `event.nodes`). Tests: protocol (pinned CBOR bytes, expansion, every refusal, 4000 random columns against a plain order search), plane (reference says the record too, simulation sends `AddNodes` half the time for runs of ids, columns vs specs compares with node records read apart, one batch through `blaze_protocol::cbor` and refused malformed), blaze-ui (one record draws the same graph and tree as a record a node, in or out of order; random records include batches against the oracle), `test.mjs`. `Event` is not in `blaze-api`'s schema: no `SCHEMA` bump. Engine's crate graph and cargo's parts requested in `v2/requests/codegen.md` and `v2/requests/cargo.md` ("From requests-nodes").
+
+## 7. `pump`'s `DIR` leaks a chunk per model-checker run (core, core-pool)
+
+- What: `crates/blaze-graph/src/pump.rs:124` `static DIR: [AtomicPtr<Stack>; CHUNKS]`. Under
+  `blaze_check`, statics restart null in every execution, so `claim` leaks a fresh 24.6 KB
+  chunk each time. safety-model-graph suggests `DIR: [OnceLock<Box<[Stack]>>; CHUNKS]` (from
+  `crate::sync`), which the checker resets with the execution and a normal build reads as
+  cheaply as today.
+- Where: `pump.rs` (core-pool's; its report is DONE).
+- Why: from safety-model-graph (`/tmp/blaze-lanes/v2-safety-model-graph.md`, finding 1). A
+  normal build is unaffected: there each chunk is leaked once, for the life of the process,
+  by design.
+
+> applied (core is DONE): `DIR` is `[OnceLock<Box<[Stack]>>; CHUNKS]` from `crate::sync`; `claim` fills a chunk with `get_or_init` under `FREE`, `stack` is `DIR.get(i / CHUNK)?.get()?.get(i % CHUNK)`, so its two `unsafe` blocks and the `AtomicPtr`/`ptr` imports go. A normal build still makes each chunk once per process.
+> applied: already in `pump.rs`: `DIR` is `[OnceLock<Box<[Stack]>>; CHUNKS]` (with `claim` calling `get_or_init`).

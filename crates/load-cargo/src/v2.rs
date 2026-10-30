@@ -27,11 +27,7 @@ mod files;
 #[cfg(test)]
 mod tests;
 
-use std::{
-    collections::HashMap,
-    fmt,
-    sync::{Mutex, MutexGuard, PoisonError},
-};
+use std::{collections::HashMap, fmt};
 
 use base_db::{
     AbsPathBuf, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet, LibraryRoots,
@@ -106,17 +102,40 @@ pub struct Ran {
     pub files: Vec<(String, Vec<u8>)>,
 }
 
-/// A build's units in the front end: its database, and each unit's crate.
+/// A build's units in the front end, owned by the daemon's loop: the one writer of its
+/// database, which hands each task it posts a [`Snapshot`] and the shared [`Crates`]. Nothing
+/// in it is locked: the loop alone calls its `&mut self` writes.
 pub struct Lowered {
-    db: Mutex<Db>,
+    db: Db,
+    crates: std::sync::Arc<Crates>,
+    /// By unit: the runs applied to it, by the run's unit.
+    applied: Vec<Vec<(usize, Applied)>>,
+    /// Every file of the front end by its absolute path as cargo names it; a new map after
+    /// each run that adds or takes out files.
+    paths: std::sync::Arc<HashMap<FileId, String>>,
+}
+
+/// What every task of a build reads and nothing writes once [`lower`] made it: each unit's
+/// crate.
+pub struct Crates {
     units: Vec<Lowering>,
     /// How many source roots of packages there are: `SourceRootId(0..sets)`, then the one of
     /// files of no package.
     sets: usize,
-    /// By unit: the runs applied to it, by the run's unit.
-    applied: Mutex<Vec<Vec<(usize, Applied)>>>,
-    /// Every file of the front end by its absolute path as cargo names it.
-    paths: Mutex<std::sync::Arc<HashMap<FileId, String>>>,
+}
+
+impl Crates {
+    /// The front end's crate of unit `unit` (an index of `units.graph.units`); none for a
+    /// `RunCustomBuild` unit.
+    pub fn krate(&self, unit: usize) -> Option<Crate> {
+        self.units.get(unit)?.krate
+    }
+
+    /// Whether unit `unit`'s crate is a proc macro's dylib, whose expanders
+    /// [`Lowered::macros`] sets once it is built.
+    pub fn is_proc_macro(&self, unit: usize) -> bool {
+        self.units.get(unit).is_some_and(|it| it.proc_macro)
+    }
 }
 
 /// One unit as lowered.
@@ -376,31 +395,37 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
 
     let paths = paths_of(&db, library.len());
     Ok(Lowered {
-        db: Mutex::new(db),
-        applied: Mutex::new((0..unit_count).map(|_| Vec::new()).collect()),
-        units: lowerings,
-        sets: library.len(),
-        paths: Mutex::new(std::sync::Arc::new(paths)),
+        db,
+        applied: (0..unit_count).map(|_| Vec::new()).collect(),
+        crates: std::sync::Arc::new(Crates { units: lowerings, sets: library.len() }),
+        paths: std::sync::Arc::new(paths),
     })
 }
 
 impl Lowered {
-    /// The front end's crate of unit `unit` (an index of `units.graph.units`); none for a
-    /// `RunCustomBuild` unit.
+    /// [`Crates::krate`].
     pub fn krate(&self, unit: usize) -> Option<Crate> {
-        self.units.get(unit)?.krate
+        self.crates.krate(unit)
     }
 
-    /// A database for a worker to read the front end with while other workers read theirs:
-    /// see [`Snapshot`] for what a write does to it. Waits while a write is going on.
+    /// What every task reads: each unit's crate.
+    pub fn crates(&self) -> std::sync::Arc<Crates> {
+        self.crates.clone()
+    }
+
+    /// A handle on the database for one task, made by the loop as it posts the task: a clone,
+    /// with nothing shared to take. A later write ([`Lowered::ran`], [`Lowered::macros`])
+    /// cancels it: its reader gets `salsa::Cancelled` (the task's `Failed::Again`), and the
+    /// write returns once every such handle is dropped. Tasks posted after a write get new
+    /// ones, which read what it wrote.
     pub fn snapshot(&self) -> Snapshot {
-        self.db().clone()
+        self.db.clone()
     }
 
     /// Every file of the front end by its absolute path as cargo names it, as of now: a run
     /// applied after adds its `OUT_DIR`'s files to the map the next call gives.
     pub fn paths(&self) -> std::sync::Arc<HashMap<FileId, String>> {
-        self.paths.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.paths.clone()
     }
 
     /// The run of build script unit `run` applied to every unit that depends on it directly:
@@ -413,8 +438,9 @@ impl Lowered {
     /// snapshot alive (its reader gets `salsa::Cancelled`, which the caller turns into
     /// `Failed::Again`) and this returns once they are all dropped; a snapshot taken after
     /// reads the run applied.
-    pub fn ran(&self, run: usize, ran: &Ran) -> Result<(), LowerError> {
-        let Some(lowering) = self.units.get(run) else {
+    pub fn ran(&mut self, run: usize, ran: &Ran) -> Result<(), LowerError> {
+        let crates = self.crates.clone();
+        let Some(lowering) = crates.units.get(run) else {
             return Err(LowerError::new(format!("the build has no unit {run}")));
         };
         let Some(out_dir) = &lowering.out_dir else {
@@ -437,11 +463,10 @@ impl Lowered {
             loaded.push(files::Loaded { path: format!("{out_dir}/{path}"), id, bytes: bytes.as_slice().into() });
         }
 
-        let mut db = self.db();
-        let change = set_files(&mut db, out_dir, &[], lowering.set, self.sets, &loaded)?;
+        let db = &mut self.db;
+        let change = set_files(db, out_dir, &[], lowering.set, crates.sets, &loaded)?;
         if !change.added.is_empty() || !change.removed.is_empty() {
-            let mut paths = self.paths.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut map = HashMap::clone(&paths);
+            let mut map = HashMap::clone(&self.paths);
             for id in &change.removed {
                 map.remove(id);
             }
@@ -451,17 +476,16 @@ impl Lowered {
                     map.insert(*id, path.as_str().to_owned());
                 }
             }
-            *paths = std::sync::Arc::new(map);
+            self.paths = std::sync::Arc::new(map);
         }
-        let mut applied = self.applied.lock().unwrap_or_else(PoisonError::into_inner);
         for &dependent in &lowering.dependents {
-            let Some(krate) = self.units[dependent].krate else { continue };
-            let runs = &mut applied[dependent];
+            let Some(krate) = crates.units[dependent].krate else { continue };
+            let runs = &mut self.applied[dependent];
             runs.retain(|(it, _)| *it != run);
             let applying = Applied { cfgs: cfgs.clone(), env: ran.env.clone(), out_dir: out_dir.clone() };
             runs.push((run, applying));
             radix::sort_by_key(runs, |(it, _)| *it as u64);
-            let base = &self.units[dependent];
+            let base = &crates.units[dependent];
             let mut cfg = base.cfg.clone();
             let mut env: Env = base.env.iter().cloned().collect();
             for (_, applying) in runs.iter() {
@@ -470,10 +494,10 @@ impl Lowered {
                 env.set("OUT_DIR", applying.out_dir.clone());
             }
             if *krate.cfg_options(&*db) != cfg {
-                krate.set_cfg_options(&mut *db, cfg);
+                krate.set_cfg_options(db, cfg);
             }
             if *krate.env(&*db) != env {
-                krate.set_env(&mut *db, env);
+                krate.set_env(db, env);
             }
         }
         Ok(())
@@ -483,8 +507,8 @@ impl Lowered {
     /// crates depending on it to expand its macros with. Until then they are
     /// `ProcMacroLoadingError::NotYetBuilt`. A write: snapshots alive are cancelled as by
     /// [`Lowered::ran`].
-    pub fn macros(&self, unit: usize, macros: ProcMacroLoadResult) -> Result<(), LowerError> {
-        let Some(lowering) = self.units.get(unit) else {
+    pub fn macros(&mut self, unit: usize, macros: ProcMacroLoadResult) -> Result<(), LowerError> {
+        let Some(lowering) = self.crates.units.get(unit) else {
             return Err(LowerError::new(format!("the build has no unit {unit}")));
         };
         let (Some(krate), true) = (lowering.krate, lowering.proc_macro) else {
@@ -494,16 +518,12 @@ impl Lowered {
             macros.sort_unstable_by(|a, b| a.name.cmp_order(&b.name).then_with(|| a.kind.cmp(&b.kind)));
             macros
         });
-        let mut db = self.db();
+        let db = &mut self.db;
         let all = ProcMacros::get(&*db);
         let mut by_crate = all.by_crate(&*db).clone();
         by_crate.insert(krate, Arc::new(CrateProcMacros::new(macros)));
-        all.set_by_crate(&mut *db).with_durability(Durability::HIGH).to(by_crate);
+        all.set_by_crate(db).with_durability(Durability::HIGH).to(by_crate);
         Ok(())
-    }
-
-    fn db(&self) -> MutexGuard<'_, Db> {
-        self.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

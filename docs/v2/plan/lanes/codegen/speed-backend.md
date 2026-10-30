@@ -45,6 +45,16 @@ part names the tests and measurements the coordinator's first build should run.
   On the plane (concurrency.md, "no thread waits on another's work") those become plane tasks;
   that is the lead's change, not this pass's.
 
+## Unsafe ([unsafe.md](../../design/unsafe.md))
+
+Unsafe in these paths is LLVM's C API (`llvm.rs`, `llvm/`), one per-thread counter list
+(`backend.rs`), salsa's `to_static` (`fncache/dispatch.rs`) and the layout list `lent.rs`, the one
+that buys speed: lending `&Layout` instead of cloning an `Arc` per lookup removes a shared
+refcount write from every layout read. Every block is one operation with its `// SAFETY:`; every
+other module forbids `unsafe_code`. `lent.rs` keeps a safe reference version in its test.
+Sanitizers for the code blaze emits (ASan, TSan, MSan, SanitizerCoverage) are in the LLVM back end
+(`llvm/sanitize.rs`; see [speed-backend-llvm.md](speed-backend-llvm.md), "Sanitizers").
+
 v1-only files (`cached.rs`, `patch.rs`, `units.rs`, `stable.rs`, `later.rs`, `flight.rs`,
 `counted.rs`, `watch.rs`) were left alone as crates.md replaces them with `blaze-engine`,
 except where the new `Relocs` rows required `cached.rs` to follow (same bytes in the store).

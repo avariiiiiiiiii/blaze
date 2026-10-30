@@ -71,6 +71,12 @@ use crate::{
 };
 
 type R<T = ()> = Result<T, String>;
+
+/// The version of what this module writes, for the key frozen bytes are stored under: it
+/// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
+/// bytes of another version are never read.
+pub const ENCODING: &str = "blaze frozen def map 8";
+
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {
@@ -1411,6 +1417,8 @@ impl Enc<'_> {
             unresolved,
             declarations,
             impls,
+            trait_impl,
+            reservation_impl,
             builtin_derive_impls,
             extern_blocks,
             unnamed_consts,
@@ -1460,9 +1468,10 @@ impl Enc<'_> {
             self.def(it)?;
         }
         self.usize(impls.len())?;
-        for &(it, trait_impl) in impls {
+        for (at, &it) in impls.iter().enumerate() {
             self.impl_id(it)?;
-            self.bool(trait_impl);
+            self.bool(trait_impl.get(at));
+            self.bool(reservation_impl.get(at));
         }
         self.usize(builtin_derive_impls.len())?;
         for &it in builtin_derive_impls {
@@ -1727,6 +1736,7 @@ impl Enc<'_> {
             macro_use_prelude,
             derive_helpers_in_scope,
             diagnostics,
+            diagnostics_by_module: _,
             data,
             session_macros,
         } = it;
@@ -2684,9 +2694,13 @@ impl Dec<'_> {
         }
         self.fill(&mut scope.unresolved, ThinVec::reserve_exact, Self::name)?;
         self.fill(&mut scope.declarations, ThinVec::reserve_exact, Self::def)?;
-        self.fill(&mut scope.impls, ThinVec::reserve_exact, |dec| {
-            Ok((dec.impl_id()?, dec.bool()?))
-        })?;
+        let (n, room) = self.len_and_room()?;
+        scope.impls.reserve_exact(room);
+        for at in 0..n {
+            scope.impls.push(self.impl_id()?);
+            scope.trait_impl.push(at, self.bool()?);
+            scope.reservation_impl.push(at, self.bool()?);
+        }
         self.fill(
             &mut scope.builtin_derive_impls,
             ThinVec::reserve_exact,

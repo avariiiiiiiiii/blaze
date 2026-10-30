@@ -15,7 +15,7 @@ use rustc_type_ir::Mutability;
 
 use super::{fn_def_span, has_attr, source_callsite, span, type_info};
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag},
 };
@@ -25,6 +25,10 @@ pub(super) struct ImplicitAutorefs;
 impl LatePass for ImplicitAutorefs {
     fn name(&self) -> &'static str {
         "ImplicitAutorefs"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

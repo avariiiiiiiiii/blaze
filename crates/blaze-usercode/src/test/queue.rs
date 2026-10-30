@@ -2,15 +2,15 @@
 //! request, running children from every binary on all cores.
 //!
 //! - **A process per test, from a fork server.** Each binary starts once, in its sandbox
-//!   (tracing what it reads), as a fork server ([`super::FORK_SERVER`]): blaze writes an empty
+//!   (tracing what it reads), as a fork server ([`super::fork_server`]): blaze writes an empty
 //!   record for its sandbox, listens on a Unix socket of its own (`Effect::Listen`), and
 //!   spawns the binary with the socket's path in [`wire::SOCKET`] and the record's in
 //!   [`confine::LIVE`]. The server connects and says hello with its tests; for each test the
 //!   queue sends a run, the server forks a child that marks its scope and runs the one test,
-//!   and answers how it ended with its output ([`wire`]). The lines the sandbox appended to
-//!   the record under the test's scope (and under none) are what the test read
-//!   ([`Trace::Lines`]); the record is read after each answer, so every line of the child is
-//!   in it.
+//!   and answers how it ended with its output and what it executed ([`wire`]). The lines the
+//!   sandbox appended to the record under the test's scope (and under none) are what the test
+//!   read ([`Trace::Lines`]); the record is read after each answer, so every line of the child
+//!   is in it.
 //! - **Critical first.** Every test of every binary is in one order, the longest expected
 //!   first ([`Job::expected`], from the durations kept with the passes), and the next test
 //!   whose server is ready runs whenever a core is free ([`Config::jobs`]).
@@ -24,32 +24,37 @@
 //!   result is per binary ([`Finished::test`] is `None`), and what it read is the whole
 //!   process's ([`Trace::Whole`]).
 //!
+//! The hot path, a test started and ended, allocates nothing past its result: a test is a
+//! `u32` unit indexing columns, the order is bitsets over ranks, attempts and tags are slabs
+//! reused through free lists, a record's paths and variables are interned once per server and
+//! its lines kept as `u32`s, and every deadline is one timer wheel ([`wheel`]) behind one
+//! driver timer at its next expiry.
+//!
 //! The queue asks with tags `tags..tags + 2^32` ([`Config::tags`]). It reads no clock: the
 //! driver's `now` comes with each call. It is [`Queue::finished`] once every test has a result
 //! and every process it started has ended; timers still in flight then are stale and their
 //! completions are dropped.
 
-use std::{
-    borrow::Cow,
-    cmp::Reverse,
-    collections::{BTreeSet, HashMap},
-    ffi::OsString,
-    path::PathBuf,
-    time::Duration,
-};
+use std::{borrow::Cow, ffi::OsString, io::Write as _, path::PathBuf, time::Duration};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use blaze_core::{
     Address, Command, Completion, Conn, Done, Effect, Exit, FileName, Sandbox, Tag, Traced,
 };
 use blaze_ids::{ContentId, radix};
 
-use super::wire::{self, End, Frame, Frames};
+use super::wire::{self, End, Executed, Frame, Frames};
 use crate::{
     confine,
     trace::{self, BadRecord, Inputs, Line, Seen},
 };
+
+mod names;
+mod wheel;
+
+use names::Names;
+use wheel::{UNSET, Wheel};
 
 /// How a binary's tests run.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -133,7 +138,7 @@ pub enum Outcome {
 pub enum Trace {
     /// The lines of the sandbox's record of its scope and of none, without blaze's own (its
     /// socket, its record, the variables it set for the server).
-    Lines(Vec<Line>),
+    Lines(Lines),
     /// What a binary run whole read, from its sandbox.
     Whole(Traced),
     /// Not known, and why: no pass can be kept.
@@ -145,10 +150,77 @@ impl Trace {
     /// pass by. To be asked as the result comes, before anything else changes the files.
     pub fn traced<I: Inputs>(&self, inputs: &mut I) -> Result<Option<Traced>, I::Error> {
         match self {
-            Trace::Lines(lines) => trace::assemble(lines, None, inputs).map(Some),
+            Trace::Lines(lines) => {
+                let lines: Vec<Line> = lines
+                    .iter()
+                    .map(|(seen, what)| Line { seen, scope: String::new(), what: what.to_owned() })
+                    .collect();
+                trace::assemble(&lines, None, inputs).map(Some)
+            }
             Trace::Whole(traced) => Ok(Some(traced.clone())),
             Trace::Unknown(_) => Ok(None),
         }
+    }
+}
+
+/// The lines a test of a fork server read, each its kind and what it names, the names in one
+/// buffer: those of every scope first, each kind and name once, then the test's own. Scopes
+/// are left out: every line is of the test or of none, and [`trace::assemble`] reads both.
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+pub struct Lines {
+    text: String,
+    /// Each line's kind and the end of what it names in `text`.
+    lines: Vec<(Seen, u32)>,
+}
+
+impl Lines {
+    pub fn new() -> Lines {
+        Lines::default()
+    }
+
+    /// A line of `seen` naming `what`.
+    ///
+    /// # Panics
+    ///
+    /// Past 4 GiB of names.
+    pub fn push(&mut self, seen: Seen, what: &str) {
+        assert!(self.try_push(seen, what), "the lines of a test are past 4 GiB");
+    }
+
+    /// `false`, and nothing pushed, past 4 GiB of names.
+    fn try_push(&mut self, seen: Seen, what: &str) -> bool {
+        let Ok(end) = u32::try_from(self.text.len() + what.len()) else { return false };
+        self.text.push_str(what);
+        self.lines.push((seen, end));
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Each line, borrowed, in order.
+    pub fn iter(&self) -> impl Iterator<Item = (Seen, &str)> + '_ {
+        let mut start = 0;
+        self.lines.iter().map(move |&(seen, end)| {
+            let what = &self.text[start..end as usize];
+            start = end as usize;
+            (seen, what)
+        })
+    }
+}
+
+impl<'a> FromIterator<(Seen, &'a str)> for Lines {
+    fn from_iter<T: IntoIterator<Item = (Seen, &'a str)>>(iter: T) -> Lines {
+        let mut lines = Lines::new();
+        for (seen, what) in iter {
+            lines.push(seen, what);
+        }
+        lines
     }
 }
 
@@ -167,30 +239,52 @@ pub struct Finished {
     /// How long its last attempt took, by the driver's clock.
     pub took: Duration,
     pub trace: Trace,
+    /// The jump-table slots its last attempt executed, as its fork server read them, or why
+    /// they are not known.
+    pub executed: Executed,
 }
 
 /// The size of each read of a record.
 const CHUNK: usize = 1 << 20;
-/// The job of a binary run whole, in the order.
-const WHOLE: usize = usize::MAX;
+/// The job of a unit that is a binary run whole.
+const WHOLE: u32 = u32::MAX;
 /// The least a receive from a fork server asks for; more when a longer frame is coming.
 const RECV: usize = 1 << 16;
 /// A job its server's hello did not name.
 const NO_TEST: u32 = u32::MAX;
+/// What a binary run whole executed: no fork server, so no region.
+const WHOLE_UNRECORDED: &str = "run whole as libtest's threads";
+/// Said of every test a stop leaves unstarted.
+const STOPPED: &str = "not run: an earlier failure or a cancel stopped the run";
+/// The wheel's tick, in nanoseconds.
+const TICK: u128 = 1_000_000;
 
+/// What a tag of the queue is for, by its slot in the tag slab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum For {
-    Write(usize),
-    Listen(usize),
-    Spawn(usize),
-    Recv(usize),
-    Send(usize),
+    /// A slot not in use.
+    Free,
+    Write(u32),
+    Listen(u32),
+    Spawn(u32),
+    Recv(u32),
+    Send(u32),
     Hangup,
-    Read(usize),
+    Read(u32),
+    /// The driver timer at the wheel's next expiry.
+    Tick,
+    Whole(u32),
+}
+
+/// What a timer of the wheel is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Due {
+    /// An attempt past its timeout, by its id.
     Deadline(u64),
+    /// An attempt not ended within the kill grace.
     Grace(u64),
-    Whole(usize),
-    WholeDeadline(usize),
+    /// A binary run whole past its timeout.
+    Whole(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -210,6 +304,7 @@ struct Ended {
     id: u64,
     end: End,
     output: Vec<u8>,
+    executed: Executed,
     at: Duration,
 }
 
@@ -217,9 +312,6 @@ struct Server {
     phase: Phase,
     socket: FileName,
     record: FileName,
-    /// The absolute paths of the socket and the record, as the record names them.
-    socket_path: String,
-    record_path: String,
     spawn: Option<Tag>,
     listen: Option<Tag>,
     conn: Option<Conn>,
@@ -230,25 +322,31 @@ struct Server {
     /// Each job's index in the server's hello, [`NO_TEST`] for one it did not name: what a
     /// run is sent with, by direct index.
     job_index: Vec<u32>,
-    /// The job each test name of the hello is, for the scope of a record's line: one hash of
-    /// the borrowed scope per line, nothing allocated for it.
-    by_scope: HashMap<String, u32>,
-    /// Sorted by id where it is drained, so the tests a lost server takes end in that order.
-    running: FxHashSet<u64>,
+    /// The hello's names that are jobs', and the job each is, by its ID: a record line's
+    /// scope is one hash of the borrowed text.
+    scopes: Names,
+    scope_job: Vec<u32>,
+    /// What the record's lines name, interned.
+    names: Names,
+    /// The IDs in `names` of its socket's and its record's paths (as the record names them)
+    /// and of the two variables blaze set for it: the lines that are blaze's own.
+    ours: [u32; 4],
+    /// The tests it runs now, by id, in the order they started: those a lost server takes
+    /// end in that order.
+    running: Vec<u64>,
     /// How far the record has been read, and a last line not yet whole.
     at: u64,
     partial: Vec<u8>,
-    /// The lines of each job's scope, by job, taken by its last attempt's result.
-    scoped: Vec<Vec<Line>>,
-    /// The lines of every scope, each once (in the order first seen), with the kinds of
-    /// [`Seen`] each `what` has among them as bits: a line every test is given is kept, and
-    /// so cloned into each result, only once however often the server repeats it.
-    common: Vec<Line>,
-    common_seen: HashMap<String, u16>,
-    /// Frames for the server not yet given to the driver, and the timers that go after them:
-    /// what one call to the queue says to a server goes as one send.
+    /// Each job's lines ([`pack`]), by job, taken by its last attempt's result.
+    scoped: Vec<Vec<u32>>,
+    /// The lines of every scope ([`pack`]), each once in the order first seen, and the kinds
+    /// of [`Seen`] each name has among them as bits, by name: a line every test is given is
+    /// kept only once however often the server repeats it.
+    common: Vec<u32>,
+    common_kinds: Vec<u8>,
+    /// Frames for the server not yet given to the driver: what one call to the queue says to
+    /// a server goes as one send.
     outbox: Vec<u8>,
-    timers: Vec<Effect>,
     dirty: bool,
     reading: bool,
     waiting: Vec<Ended>,
@@ -257,12 +355,20 @@ struct Server {
     broken: Option<String>,
 }
 
+/// One run of a test, in the attempt slab: its id is its generation and its slot.
+#[derive(Clone, Copy)]
 struct Attempt {
-    binary: usize,
-    job: usize,
+    unit: u32,
     number: u32,
-    started: Duration,
+    generation: u32,
+    live: bool,
+    /// Sent to its server, and not yet said to have ended.
+    running: bool,
     timed_out: bool,
+    started: Duration,
+    /// Its timers in the wheel, or [`UNSET`].
+    deadline: u64,
+    grace: u64,
 }
 
 struct Whole {
@@ -270,41 +376,142 @@ struct Whole {
     started: Duration,
     slots: usize,
     timed_out: bool,
+    deadline: u64,
 }
 
 struct Bin {
     plan: Binary,
-    /// Jobs (one for a binary run whole) without a final result.
+    /// Units without a final result.
     left: usize,
     server: Option<Server>,
     whole: Option<Whole>,
+    /// Its units: `first..first + units`.
+    first: u32,
+    units: u32,
 }
 
-/// The earlier attempts of a retried test.
-#[derive(Default)]
-struct Tries {
-    done: u32,
+/// A set of `u32` positions as bits, with the lowest word that may have one, so the first is
+/// found by a scan that only moves forward until a lower bit is set again.
+#[derive(Clone, Debug)]
+struct Bits {
+    words: Vec<u64>,
+    low: usize,
+}
+
+impl Bits {
+    fn empty(len: usize) -> Bits {
+        let words = vec![0; len.div_ceil(64)];
+        Bits { low: words.len(), words }
+    }
+
+    fn full(len: usize) -> Bits {
+        let mut words = vec![u64::MAX; len.div_ceil(64)];
+        if let Some(last) = words.last_mut()
+            && len % 64 != 0
+        {
+            *last = (1 << (len % 64)) - 1;
+        }
+        Bits { words, low: 0 }
+    }
+
+    fn has(&self, at: u32) -> bool {
+        self.words[at as usize / 64] & (1 << (at % 64)) != 0
+    }
+
+    fn set(&mut self, at: u32) {
+        let word = at as usize / 64;
+        self.words[word] |= 1 << (at % 64);
+        self.low = self.low.min(word);
+    }
+
+    fn clear(&mut self, at: u32) {
+        self.words[at as usize / 64] &= !(1 << (at % 64));
+    }
+
+    fn clear_all(&mut self) {
+        self.words.fill(0);
+        self.low = self.words.len();
+    }
+
+    fn first(&mut self) -> Option<u32> {
+        while self.low < self.words.len() {
+            let word = self.words[self.low];
+            if word != 0 {
+                return Some((self.low * 64) as u32 + word.trailing_zeros());
+            }
+            self.low += 1;
+        }
+        None
+    }
+
+    /// The positions set, in order.
+    fn ones(&self) -> impl Iterator<Item = u32> + '_ {
+        self.words.iter().enumerate().flat_map(|(at, &word)| {
+            let mut left = word;
+            std::iter::from_fn(move || {
+                let bit = (left != 0).then(|| left.trailing_zeros())?;
+                left &= left - 1;
+                Some((at * 64) as u32 + bit)
+            })
+        })
+    }
+}
+
+/// How a unit's last attempt went, for its result.
+struct Went {
+    outcome: Outcome,
+    attempts: u32,
     output: Vec<u8>,
+    took: Duration,
+    trace: Trace,
+    executed: Executed,
+}
+
+impl Went {
+    /// Lost before it ran, and why.
+    fn lost(why: String, output: Vec<u8>) -> Went {
+        Went {
+            outcome: Outcome::Failed(Failure::Lost(why.clone())),
+            attempts: 1,
+            output,
+            took: Duration::ZERO,
+            trace: Trace::Unknown(why.clone()),
+            executed: Executed::Not(why),
+        }
+    }
 }
 
 pub struct Queue {
     config: Config,
     bins: Vec<Bin>,
-    /// Not started: the longest expected first, then by binary and job.
-    // BTreeSet: iterated in order and removed from while it changes.
-    pending: BTreeSet<(Reverse<Duration>, usize, usize)>,
-    /// What of `pending` can start now (its server said hello, or it is a binary run
-    /// whole), in the same order: the next test is its first, with no scan past those of
-    /// servers still starting.
-    // BTreeSet: a priority queue (`pop_first`).
-    ready: BTreeSet<(Reverse<Duration>, usize, usize)>,
-    /// Servers with frames or timers in `outbox` and `timers`.
-    dirty: Vec<usize>,
-    attempts: FxHashMap<u64, Attempt>,
-    tries: HashMap<(usize, usize), Tries>,
-    tags: FxHashMap<Tag, For>,
-    next_tag: u64,
-    next_id: u64,
+    /// Each unit's binary and job ([`WHOLE`] for a binary run whole): a unit is a job of a
+    /// binary run as a process per test, or a binary run whole, numbered binary by binary.
+    unit_bin: Vec<u32>,
+    unit_job: Vec<u32>,
+    /// Every unit in the order they start, the longest expected first and then by unit, and
+    /// each unit's place in it: `order[rank[unit]] == unit`.
+    order: Vec<u32>,
+    rank: Vec<u32>,
+    /// By rank: not started yet; and of those, what can start now (its server said hello, or
+    /// it is a binary run whole).
+    pending: Bits,
+    ready: Bits,
+    /// By unit, cold: how many earlier attempts it had (retries), and their output.
+    tries: Vec<u32>,
+    tries_output: Vec<Vec<u8>>,
+    attempts: Vec<Attempt>,
+    free_attempts: Vec<u32>,
+    /// What each tag is for, by `tag - tags`, and the slots free.
+    tags: Vec<For>,
+    free_tags: Vec<u32>,
+    wheel: Wheel<Due>,
+    fired: Vec<Due>,
+    /// The driver timer at the wheel's next expiry, and the tick it is for.
+    armed: Option<(Tag, u64)>,
+    /// Servers with frames in their outbox.
+    dirty: Vec<u32>,
+    /// Binaries left with nothing to run, to let go.
+    quit: Vec<u32>,
     busy: usize,
     stopping: bool,
     cancelled: bool,
@@ -317,51 +524,87 @@ impl Queue {
     pub fn new(config: Config, binaries: Vec<Binary>, now: Duration, effects: &mut Vec<Effect>) -> Queue {
         let mut queue = Queue {
             config,
-            bins: Vec::new(),
-            pending: BTreeSet::new(),
-            ready: BTreeSet::new(),
+            bins: Vec::with_capacity(binaries.len()),
+            unit_bin: Vec::new(),
+            unit_job: Vec::new(),
+            order: Vec::new(),
+            rank: Vec::new(),
+            pending: Bits::empty(0),
+            ready: Bits::empty(0),
+            tries: Vec::new(),
+            tries_output: Vec::new(),
+            attempts: Vec::new(),
+            free_attempts: Vec::new(),
+            tags: Vec::new(),
+            free_tags: Vec::new(),
+            wheel: Wheel::new(tick(now)),
+            fired: Vec::new(),
+            armed: None,
             dirty: Vec::new(),
-            attempts: FxHashMap::default(),
-            tries: HashMap::new(),
-            tags: FxHashMap::default(),
-            next_tag: 0,
-            next_id: 0,
+            quit: Vec::new(),
             busy: 0,
             stopping: false,
             cancelled: false,
             now,
             results: Vec::new(),
         };
+        // Sorted on the longest first: the complement of each unit's expected nanoseconds.
+        let mut keyed: Vec<(u64, u32)> = Vec::new();
         for (b, plan) in binaries.into_iter().enumerate() {
-            let left = match plan.mode {
-                Mode::Process => plan.jobs.len(),
-                Mode::Threads { .. } => usize::from(!plan.jobs.is_empty()),
-            };
-            queue.bins.push(Bin { plan, left, server: None, whole: None });
-            if left == 0 {
+            let first = queue.unit_bin.len() as u32;
+            let b = u32::try_from(b).expect("at most 2^32 binaries");
+            match plan.mode {
+                Mode::Threads { .. } if !plan.jobs.is_empty() => {
+                    let expected: Duration = plan.jobs.iter().map(|it| it.expected).sum();
+                    keyed.push((!nanos(expected), queue.unit_bin.len() as u32));
+                    queue.unit_bin.push(b);
+                    queue.unit_job.push(WHOLE);
+                }
+                Mode::Threads { .. } => {}
+                Mode::Process => {
+                    for (j, job) in plan.jobs.iter().enumerate() {
+                        keyed.push((!nanos(job.expected), queue.unit_bin.len() as u32));
+                        queue.unit_bin.push(b);
+                        queue.unit_job.push(j as u32);
+                    }
+                }
+            }
+            assert!(queue.unit_bin.len() < WHOLE as usize, "at most 2^32 - 1 tests");
+            let units = queue.unit_bin.len() as u32 - first;
+            queue.bins.push(Bin { plan, left: units as usize, server: None, whole: None, first, units });
+        }
+        radix::sort_pairs(&mut keyed);
+        let count = keyed.len();
+        queue.order = keyed.iter().map(|it| it.1).collect();
+        queue.rank = vec![0; count];
+        for (at, &unit) in queue.order.iter().enumerate() {
+            queue.rank[unit as usize] = at as u32;
+        }
+        queue.pending = Bits::full(count);
+        queue.ready = Bits::empty(count);
+        queue.tries = vec![0; count];
+        queue.tries_output = vec![Vec::new(); count];
+        for b in 0..queue.bins.len() {
+            if queue.bins[b].left == 0 {
                 continue;
             }
             match queue.bins[b].plan.mode {
                 Mode::Threads { .. } => {
-                    let expected = queue.bins[b].plan.jobs.iter().map(|it| it.expected).sum();
-                    queue.pending.insert((Reverse(expected), b, WHOLE));
-                    queue.ready.insert((Reverse(expected), b, WHOLE));
+                    let rank = queue.rank[queue.bins[b].first as usize];
+                    queue.ready.set(rank);
                 }
                 Mode::Process if !cfg!(unix) => {
                     let why = format!(
                         "{}: this platform has no fork, so no fork server: its package must run its tests as libtest's threads",
                         queue.bins[b].plan.name
                     );
-                    for j in 0..queue.bins[b].plan.jobs.len() {
-                        queue.finish(b, Some(j), Outcome::Failed(Failure::Lost(why.clone())), Vec::new(), Duration::ZERO, Trace::Unknown(why.clone()));
+                    let Bin { first, units, .. } = queue.bins[b];
+                    for unit in first..first + units {
+                        queue.pending.clear(queue.rank[unit as usize]);
+                        queue.finish(unit, Went::lost(why.clone(), Vec::new()));
                     }
                 }
-                Mode::Process => {
-                    for (j, job) in queue.bins[b].plan.jobs.iter().enumerate() {
-                        queue.pending.insert((Reverse(job.expected), b, j));
-                    }
-                    queue.start_server(b, effects);
-                }
+                Mode::Process => queue.start_server(b, effects),
             }
         }
         queue.schedule(effects);
@@ -404,6 +647,7 @@ impl Queue {
             }
             self.kill_server(b, "the run was cancelled".to_owned(), effects);
         }
+        self.let_go(effects);
         self.flush(effects);
     }
 
@@ -416,14 +660,16 @@ impl Queue {
     fn completed(&mut self, completion: Completion, now: Duration, effects: &mut Vec<Effect>) {
         self.now = now;
         let tag = completion.tag;
-        let Some(&purpose) = self.tags.get(&tag) else { return };
+        let Some(purpose) = self.purpose(tag) else { return };
         if !matches!(purpose, For::Listen(_)) {
-            self.tags.remove(&tag);
+            self.release_tag(tag);
         }
         match purpose {
-            For::Write(b) => self.written(b, completion.done, effects),
-            For::Listen(b) => self.listened(b, tag, completion.done, effects),
+            For::Free => {}
+            For::Write(b) => self.written(b as usize, completion.done, effects),
+            For::Listen(b) => self.listened(b as usize, tag, completion.done, effects),
             For::Spawn(b) => {
+                let b = b as usize;
                 let server = self.server(b);
                 server.spawn = None;
                 let (why, output) = match completion.done {
@@ -439,55 +685,49 @@ impl Queue {
                 };
                 self.server_ended(b, why, output, effects);
             }
-            For::Recv(b) => self.received(b, completion.done, effects),
+            For::Recv(b) => self.received(b as usize, completion.done, effects),
             For::Send(b) => {
                 if let Done::Failed(error) = completion.done {
-                    self.kill_server(b, format!("sending to its fork server: {error}"), effects);
+                    self.kill_server(b as usize, format!("sending to its fork server: {error}"), effects);
                 }
             }
             For::Hangup => {}
-            For::Read(b) => self.read(b, completion.done, effects),
-            For::Deadline(id) => {
-                let Some(attempt) = self.attempts.get_mut(&id) else { return };
-                let b = attempt.binary;
-                let running = self.bins[b].server.as_ref().is_some_and(|it| it.running.contains(&id));
-                if !running || attempt.timed_out {
-                    return;
-                }
-                attempt.timed_out = true;
-                self.send(b, &Frame::Kill { id });
-                let grace = self.tag(For::Grace(id));
-                self.timer(b, self.config.kill_grace, grace);
-            }
-            For::Grace(id) => {
-                let Some(attempt) = self.attempts.get(&id) else { return };
-                let (b, j) = (attempt.binary, attempt.job);
-                if self.bins[b].server.as_ref().is_some_and(|it| it.running.contains(&id)) {
-                    let why = format!(
-                        "{} did not end {:?} after it was killed, so its fork server was killed",
-                        self.bins[b].plan.jobs[j].name, self.config.kill_grace
-                    );
-                    self.kill_server(b, why, effects);
+            For::Read(b) => self.read(b as usize, completion.done, effects),
+            For::Tick => {
+                if self.armed.is_some_and(|it| it.0 == tag) {
+                    self.armed = None;
                 }
             }
-            For::Whole(b) => self.whole_ended(b, completion.done),
-            For::WholeDeadline(b) => {
-                if let Some(whole) = &mut self.bins[b].whole
-                    && !whole.timed_out
-                {
-                    whole.timed_out = true;
-                    effects.push(Effect::Kill { tag: whole.spawn });
-                }
-            }
+            For::Whole(b) => self.whole_ended(b as usize, completion.done),
         }
+        self.expire(effects);
         self.schedule(effects);
     }
 
     fn tag(&mut self, purpose: For) -> Tag {
-        let tag = Tag(self.config.tags.wrapping_add(self.next_tag));
-        self.next_tag += 1;
-        self.tags.insert(tag, purpose);
-        tag
+        let at = match self.free_tags.pop() {
+            Some(at) => {
+                self.tags[at as usize] = purpose;
+                at
+            }
+            None => {
+                let at = u32::try_from(self.tags.len()).expect("at most 2^32 tags in flight");
+                self.tags.push(purpose);
+                at
+            }
+        };
+        Tag(self.config.tags.wrapping_add(u64::from(at)))
+    }
+
+    fn purpose(&self, tag: Tag) -> Option<For> {
+        let at = usize::try_from(tag.0.wrapping_sub(self.config.tags)).ok()?;
+        self.tags.get(at).copied().filter(|it| *it != For::Free)
+    }
+
+    fn release_tag(&mut self, tag: Tag) {
+        let at = tag.0.wrapping_sub(self.config.tags) as u32;
+        self.tags[at as usize] = For::Free;
+        self.free_tags.push(at);
     }
 
     fn server(&mut self, b: usize) -> &mut Server {
@@ -502,13 +742,117 @@ impl Queue {
         self.config.root.join(file.as_str())
     }
 
+    /// The slot of the live attempt `id`, if it is one.
+    fn attempt(&self, id: u64) -> Option<usize> {
+        let at = id as u32 as usize;
+        let attempt = self.attempts.get(at)?;
+        (attempt.live && attempt.generation == (id >> 32) as u32).then_some(at)
+    }
+
+    /// A new attempt of `unit`, by its id.
+    fn new_attempt(&mut self, unit: u32, number: u32) -> u64 {
+        let at = match self.free_attempts.pop() {
+            Some(at) => at,
+            None => {
+                let at = u32::try_from(self.attempts.len()).expect("at most 2^32 tests at once");
+                self.attempts.push(Attempt {
+                    unit,
+                    number,
+                    generation: 0,
+                    live: false,
+                    running: false,
+                    timed_out: false,
+                    started: self.now,
+                    deadline: UNSET,
+                    grace: UNSET,
+                });
+                at
+            }
+        };
+        let attempt = &mut self.attempts[at as usize];
+        *attempt = Attempt {
+            unit,
+            number,
+            generation: attempt.generation,
+            live: true,
+            running: false,
+            timed_out: false,
+            started: self.now,
+            deadline: UNSET,
+            grace: UNSET,
+        };
+        (u64::from(attempt.generation) << 32) | u64::from(at)
+    }
+
+    /// The attempt in slot `at` let go, with its timers.
+    fn free_attempt(&mut self, at: usize) {
+        let attempt = &mut self.attempts[at];
+        attempt.live = false;
+        attempt.generation = attempt.generation.wrapping_add(1);
+        let timers = [attempt.deadline, attempt.grace];
+        for timer in timers {
+            self.wheel.remove(timer);
+        }
+        self.free_attempts.push(at as u32);
+    }
+
+    /// The timers due by now, acted on.
+    fn expire(&mut self, effects: &mut Vec<Effect>) {
+        let mut fired = std::mem::take(&mut self.fired);
+        self.wheel.advance(tick(self.now), &mut fired);
+        for due in fired.drain(..) {
+            match due {
+                Due::Deadline(id) => {
+                    let Some(at) = self.attempt(id) else { continue };
+                    let attempt = &mut self.attempts[at];
+                    attempt.deadline = UNSET;
+                    if !attempt.running || attempt.timed_out {
+                        continue;
+                    }
+                    attempt.timed_out = true;
+                    let b = self.unit_bin[attempt.unit as usize] as usize;
+                    self.send(b, &Frame::Kill { id });
+                    let grace = self.wheel.insert(due_tick(self.now, self.config.kill_grace), Due::Grace(id));
+                    self.attempts[at].grace = grace;
+                }
+                Due::Grace(id) => {
+                    let Some(at) = self.attempt(id) else { continue };
+                    self.attempts[at].grace = UNSET;
+                    if !self.attempts[at].running {
+                        continue;
+                    }
+                    let unit = self.attempts[at].unit as usize;
+                    let (b, j) = (self.unit_bin[unit] as usize, self.unit_job[unit] as usize);
+                    let why = format!(
+                        "{} did not end {:?} after it was killed, so its fork server was killed",
+                        self.bins[b].plan.jobs[j].name, self.config.kill_grace
+                    );
+                    self.kill_server(b, why, effects);
+                }
+                Due::Whole(b) => {
+                    if let Some(whole) = &mut self.bins[b as usize].whole
+                        && !whole.timed_out
+                    {
+                        whole.deadline = UNSET;
+                        whole.timed_out = true;
+                        effects.push(Effect::Kill { tag: whole.spawn });
+                    }
+                }
+            }
+        }
+        self.fired = fired;
+    }
+
     fn start_server(&mut self, b: usize, effects: &mut Vec<Effect>) {
         let socket = self.file(format!("t{b}"));
         let record = self.file(format!("r{b}"));
+        let socket_path = self.path(&socket).to_string_lossy().into_owned();
+        let record_path = self.path(&record).to_string_lossy().into_owned();
+        let mut names = Names::new();
+        let ours = [socket_path.as_str(), record_path.as_str(), wire::SOCKET, confine::LIVE]
+            .map(|it| names.intern(it).expect("an empty table has room for four names"));
         let server = Server {
             phase: Phase::Writing,
-            socket_path: self.path(&socket).to_string_lossy().into_owned(),
-            record_path: self.path(&record).to_string_lossy().into_owned(),
             socket,
             record: record.clone(),
             spawn: None,
@@ -518,15 +862,17 @@ impl Queue {
             lost: None,
             frames: Frames::new(),
             job_index: Vec::new(),
-            by_scope: HashMap::new(),
-            running: FxHashSet::default(),
+            scopes: Names::new(),
+            scope_job: Vec::new(),
+            names,
+            ours,
+            running: Vec::new(),
             at: 0,
             partial: Vec::new(),
             scoped: Vec::new(),
             common: Vec::new(),
-            common_seen: HashMap::new(),
+            common_kinds: Vec::new(),
             outbox: Vec::new(),
-            timers: Vec::new(),
             dirty: false,
             reading: false,
             waiting: Vec::new(),
@@ -534,7 +880,7 @@ impl Queue {
             broken: None,
         };
         self.bins[b].server = Some(server);
-        let tag = self.tag(For::Write(b));
+        let tag = self.tag(For::Write(b as u32));
         // Made empty, with its directory, before the sandbox appends to it.
         effects.push(Effect::Write { file: record, bytes: Vec::new(), tag });
     }
@@ -552,11 +898,12 @@ impl Queue {
         }
         let plan = &self.bins[b].plan;
         let server = self.bins[b].server.as_ref().expect("a server");
+        let [socket_path, record_path, ..] = server.ours.map(|it| server.names.get(it));
         let mut env = plan.env.clone();
-        env.push((wire::SOCKET.into(), server.socket_path.clone().into()));
-        env.push((confine::LIVE.into(), server.record_path.clone().into()));
+        env.push((wire::SOCKET.into(), socket_path.into()));
+        env.push((confine::LIVE.into(), record_path.into()));
         let mut read = plan.read.clone();
-        read.push(PathBuf::from(&server.socket_path));
+        read.push(PathBuf::from(socket_path));
         let command = Command {
             program: plan.program.clone(),
             args: Vec::new(),
@@ -567,8 +914,8 @@ impl Queue {
             memory: plan.memory,
         };
         let at = Address::Unix(server.socket.clone());
-        let listen = self.tag(For::Listen(b));
-        let spawn = self.tag(For::Spawn(b));
+        let listen = self.tag(For::Listen(b as u32));
+        let spawn = self.tag(For::Spawn(b as u32));
         let server = self.server(b);
         server.phase = Phase::Starting;
         server.listen = Some(listen);
@@ -587,16 +934,16 @@ impl Queue {
                     return;
                 }
                 server.conn = Some(conn);
-                let recv = self.tag(For::Recv(b));
+                let recv = self.tag(For::Recv(b as u32));
                 effects.push(Effect::Recv { conn, most: RECV, tag: recv });
                 effects.push(Effect::Unlisten { tag });
             }
             Done::Unlistened => {
-                self.tags.remove(&tag);
+                self.release_tag(tag);
                 self.server(b).listen = None;
             }
             Done::Failed(error) => {
-                self.tags.remove(&tag);
+                self.release_tag(tag);
                 self.server(b).listen = None;
                 if self.server(b).conn.is_none() {
                     let socket = self.server(b).socket.clone();
@@ -644,7 +991,7 @@ impl Queue {
             && server.phase != Phase::Ended
         {
             let most = server.frames.needed().max(RECV);
-            let recv = self.tag(For::Recv(b));
+            let recv = self.tag(For::Recv(b as u32));
             effects.push(Effect::Recv { conn, most, tag: recv });
         }
     }
@@ -659,56 +1006,69 @@ impl Queue {
                     return Err(format!("its version is {version}, and blaze speaks {}", wire::VERSION));
                 }
                 let bin = &mut self.bins[b];
-                let jobs: HashMap<&str, u32> =
+                let jobs: FxHashMap<&str, u32> =
                     bin.plan.jobs.iter().enumerate().map(|(j, it)| (it.name.as_str(), j as u32)).collect();
                 let server = bin.server.as_mut().expect("a server");
                 server.job_index = vec![NO_TEST; bin.plan.jobs.len()];
                 server.scoped = vec![Vec::new(); bin.plan.jobs.len()];
-                for (at, name) in tests.into_iter().enumerate() {
-                    if let Some(&j) = jobs.get(name.as_str()) {
-                        server.job_index[j as usize] = at as u32;
-                        server.by_scope.insert(name, j);
+                for (at, name) in tests.iter().enumerate() {
+                    let Some(&j) = jobs.get(name.as_str()) else { continue };
+                    server.job_index[j as usize] = at as u32;
+                    let id = server.scopes.intern(name).ok_or("it named more tests than blaze holds")?;
+                    if id as usize == server.scope_job.len() {
+                        server.scope_job.push(j);
                     }
                 }
                 server.phase = Phase::Ready;
-                let mut missing = Vec::new();
-                for entry in self.pending.iter().filter(|it| it.1 == b) {
-                    match self.bins[b].server.as_ref().expect("a server").job_index[entry.2] {
-                        NO_TEST => missing.push(*entry),
-                        _ => _ = self.ready.insert(*entry),
+                for rank in self.pending_of(b) {
+                    let unit = self.order[rank as usize];
+                    let j = self.unit_job[unit as usize] as usize;
+                    if self.server(b).job_index[j] != NO_TEST {
+                        self.ready.set(rank);
+                        continue;
                     }
-                }
-                for entry in missing {
-                    self.pending.remove(&entry);
-                    let why = format!("{} has no test named {}", self.bins[b].plan.name, self.bins[b].plan.jobs[entry.2].name);
-                    self.finish(b, Some(entry.2), Outcome::Failed(Failure::Lost(why.clone())), Vec::new(), Duration::ZERO, Trace::Unknown(why));
+                    self.pending.clear(rank);
+                    let why = format!("{} has no test named {}", self.bins[b].plan.name, self.bins[b].plan.jobs[j].name);
+                    self.finish(unit, Went::lost(why, Vec::new()));
                 }
                 self.maybe_quit(b, effects);
                 Ok(())
             }
-            Frame::Ended { id, end, output } => {
+            Frame::Ended { id, end, output, executed } => {
+                let at = self
+                    .attempt(id)
+                    .filter(|&at| {
+                        let attempt = &self.attempts[at];
+                        attempt.running && self.unit_bin[attempt.unit as usize] as usize == b
+                    })
+                    .ok_or_else(|| format!("an end of {id}, which it does not run"))?;
                 let server = self.server(b);
-                if !server.running.remove(&id) {
-                    return Err(format!("an end of {id}, which it does not run"));
+                if let Some(place) = server.running.iter().position(|it| *it == id) {
+                    server.running.remove(place);
                 }
                 self.busy -= 1;
-                let attempt = self.attempts.get(&id).expect("a test the server runs is an attempt");
-                let j = attempt.job;
-                let outcome = self.outcome(attempt, &end);
+                let attempt = &mut self.attempts[at];
+                attempt.running = false;
+                let timers = [std::mem::replace(&mut attempt.deadline, UNSET), std::mem::replace(&mut attempt.grace, UNSET)];
+                for timer in timers {
+                    self.wheel.remove(timer);
+                }
+                let Attempt { unit, number, .. } = self.attempts[at];
+                let outcome = self.outcome(at, &end);
                 if outcome != Outcome::Passed {
                     // Decided before a core is given to another test: a retry keeps its place in
                     // the order, and fail-fast starts nothing more.
-                    if attempt.number <= self.bins[b].plan.jobs[j].retries && !self.stopping {
-                        let number = attempt.number;
-                        self.attempts.remove(&id);
-                        let tries = self.tries.entry((b, j)).or_default();
-                        tries.done = number;
-                        tries.output.extend_from_slice(format!("--- attempt {number} ---\n").as_bytes());
-                        tries.output.extend_from_slice(&output);
-                        let entry = (Reverse(self.bins[b].plan.jobs[j].expected), b, j);
-                        self.pending.insert(entry);
+                    let j = self.unit_job[unit as usize] as usize;
+                    if number <= self.bins[b].plan.jobs[j].retries && !self.stopping {
+                        self.free_attempt(at);
+                        self.tries[unit as usize] = number;
+                        let tries = &mut self.tries_output[unit as usize];
+                        _ = writeln!(tries, "--- attempt {number} ---");
+                        tries.extend_from_slice(&output);
+                        let rank = self.rank[unit as usize];
+                        self.pending.set(rank);
                         if self.server(b).phase == Phase::Ready {
-                            self.ready.insert(entry);
+                            self.ready.set(rank);
                         }
                         return Ok(());
                     }
@@ -716,7 +1076,7 @@ impl Queue {
                         self.stop();
                     }
                 }
-                let ended = Ended { id, end, output, at: self.now };
+                let ended = Ended { id, end, output, executed, at: self.now };
                 let server = self.server(b);
                 match server.reading {
                     true => server.next.push(ended),
@@ -733,12 +1093,14 @@ impl Queue {
 
     fn start_read(&mut self, b: usize, effects: &mut Vec<Effect>) {
         if let Some(why) = self.server(b).broken.clone() {
-            for ended in std::mem::take(&mut self.server(b).waiting) {
+            let mut waiting = std::mem::take(&mut self.server(b).waiting);
+            for ended in waiting.drain(..) {
                 self.attempt_ended(b, ended, Trace::Unknown(why.clone()), effects);
             }
+            self.server(b).waiting = waiting;
             return;
         }
-        let tag = self.tag(For::Read(b));
+        let tag = self.tag(For::Read(b as u32));
         let server = self.server(b);
         server.reading = true;
         effects.push(Effect::Read { file: server.record.clone(), at: server.at, len: CHUNK, tag });
@@ -757,8 +1119,8 @@ impl Queue {
                 }
                 if let Some(end) = server.partial.iter().rposition(|it| *it == b'\n') {
                     let partial = std::mem::take(&mut server.partial);
-                    if let Err(bad) = take_lines(server, &partial[..=end]) {
-                        server.broken = Some(format!("the sandbox's record {}: {bad}", server.record));
+                    if let Err(why) = take_lines(server, &partial[..=end]) {
+                        server.broken = Some(format!("the sandbox's record {}: {why}", server.record));
                     }
                     server.partial = partial;
                     server.partial.drain(..=end);
@@ -774,36 +1136,45 @@ impl Queue {
             _ => {}
         }
         let broken = self.server(b).broken.clone();
-        let waiting = std::mem::take(&mut self.server(b).waiting);
-        for ended in waiting {
-            let Some(j) = self.attempts.get(&ended.id).map(|it| it.job) else { continue };
+        let mut waiting = std::mem::take(&mut self.server(b).waiting);
+        for ended in waiting.drain(..) {
+            let Some(at) = self.attempt(ended.id) else { continue };
             let trace = match &broken {
                 Some(why) => Trace::Unknown(why.clone()),
-                None => Trace::Lines(self.lines(b, j)),
+                None => self.lines(b, self.attempts[at].unit),
             };
             self.attempt_ended(b, ended, trace, effects);
         }
         let server = self.server(b);
+        server.waiting = waiting;
         if !server.next.is_empty() {
-            server.waiting = std::mem::take(&mut server.next);
+            std::mem::swap(&mut server.waiting, &mut server.next);
             self.start_read(b, effects);
         }
     }
 
-    /// The lines of the record a test of `b` read: those of every scope, then its own, which
-    /// are moved out (only its last attempt's result asks).
-    fn lines(&mut self, b: usize, j: usize) -> Vec<Line> {
+    /// The lines of the record a unit of `b` read: those of every scope, then its own, which
+    /// are let go (only its last attempt's result asks).
+    fn lines(&mut self, b: usize, unit: u32) -> Trace {
+        let j = self.unit_job[unit as usize] as usize;
         let server = self.server(b);
         let own = server.scoped.get_mut(j).map(std::mem::take).unwrap_or_default();
-        let mut lines = Vec::with_capacity(server.common.len() + own.len());
-        lines.extend_from_slice(&server.common);
-        lines.extend(own);
-        lines
+        let packed = || server.common.iter().chain(&own).map(|&it| unpack(it));
+        let text: usize = packed().map(|(id, _)| server.names.get(id).len()).sum();
+        let mut lines = Lines { text: String::with_capacity(text), lines: Vec::with_capacity(server.common.len() + own.len()) };
+        for (id, seen) in packed() {
+            if !lines.try_push(seen, server.names.get(id)) {
+                return Trace::Unknown("the lines the test read are past 4 GiB".to_owned());
+            }
+        }
+        Trace::Lines(lines)
     }
 
-    /// How a run of a test that ended as `end` went.
-    fn outcome(&self, attempt: &Attempt, end: &End) -> Outcome {
-        let timeout = self.bins[attempt.binary].plan.jobs[attempt.job].timeout;
+    /// How a run, in attempt slot `at`, of a test that ended as `end` went.
+    fn outcome(&self, at: usize, end: &End) -> Outcome {
+        let attempt = &self.attempts[at];
+        let unit = attempt.unit as usize;
+        let timeout = self.bins[self.unit_bin[unit] as usize].plan.jobs[self.unit_job[unit] as usize].timeout;
         match (end, attempt.timed_out) {
             (_, true) => Outcome::Failed(Failure::TimedOut(timeout)),
             (End::Exited(0), false) => Outcome::Passed,
@@ -815,52 +1186,47 @@ impl Queue {
 
     /// A test whose run ended and is not run again, once what it read is known.
     fn attempt_ended(&mut self, b: usize, ended: Ended, trace: Trace, effects: &mut Vec<Effect>) {
-        let Some(attempt) = self.attempts.remove(&ended.id) else { return };
-        let j = attempt.job;
-        let outcome = self.outcome(&attempt, &ended.end);
-        let took = ended.at.saturating_sub(attempt.started);
-        let output = match self.tries.remove(&(b, j)) {
-            Some(mut tries) => {
-                tries.output.extend_from_slice(format!("--- attempt {} ---\n", attempt.number).as_bytes());
-                tries.output.extend_from_slice(&ended.output);
-                tries.output
+        let Some(at) = self.attempt(ended.id) else { return };
+        let Attempt { unit, number, started, .. } = self.attempts[at];
+        let outcome = self.outcome(at, &ended.end);
+        self.free_attempt(at);
+        let took = ended.at.saturating_sub(started);
+        let output = match self.tries[unit as usize] {
+            0 => ended.output,
+            _ => {
+                self.tries[unit as usize] = 0;
+                let mut output = std::mem::take(&mut self.tries_output[unit as usize]);
+                _ = writeln!(output, "--- attempt {number} ---");
+                output.extend_from_slice(&ended.output);
+                output
             }
-            None => ended.output,
         };
         let outcome = if self.cancelled && outcome != Outcome::Passed { Outcome::NotRun } else { outcome };
-        self.finish_attempts(b, Some(j), outcome, attempt.number, output, took, trace);
+        self.finish(unit, Went { outcome, attempts: number, output, took, trace, executed: ended.executed });
         self.maybe_quit(b, effects);
     }
 
-    fn finish(&mut self, b: usize, job: Option<usize>, outcome: Outcome, output: Vec<u8>, took: Duration, trace: Trace) {
-        self.finish_attempts(b, job, outcome, 1, output, took, trace);
-    }
-
-    fn finish_attempts(
-        &mut self,
-        b: usize,
-        job: Option<usize>,
-        outcome: Outcome,
-        attempts: u32,
-        output: Vec<u8>,
-        took: Duration,
-        trace: Trace,
-    ) {
-        let failed = matches!(outcome, Outcome::Failed(_));
-        let attempts = match outcome {
-            Outcome::NotRun => attempts.saturating_sub(1),
-            _ => attempts,
+    fn finish(&mut self, unit: u32, went: Went) {
+        let (b, j) = (self.unit_bin[unit as usize] as usize, self.unit_job[unit as usize]);
+        let failed = matches!(went.outcome, Outcome::Failed(_));
+        let attempts = match went.outcome {
+            Outcome::NotRun => went.attempts.saturating_sub(1),
+            _ => went.attempts,
         };
         self.results.push(Finished {
             binary: b,
-            test: job.map(|j| self.bins[b].plan.jobs[j].name.clone()),
-            outcome,
+            test: (j != WHOLE).then(|| self.bins[b].plan.jobs[j as usize].name.clone()),
+            outcome: went.outcome,
             attempts,
-            output,
-            took,
-            trace,
+            output: went.output,
+            took: went.took,
+            trace: went.trace,
+            executed: went.executed,
         });
         self.bins[b].left -= 1;
+        if self.bins[b].left == 0 {
+            self.quit.push(b as u32);
+        }
         if failed && self.config.fail_fast {
             self.stop();
         }
@@ -872,12 +1238,23 @@ impl Queue {
             return;
         }
         self.stopping = true;
-        self.ready.clear();
-        for (_, b, j) in std::mem::take(&mut self.pending) {
-            let job = (j != WHOLE).then_some(j);
-            let tries = self.tries.remove(&(b, j)).unwrap_or_default();
-            let why = "not run: an earlier failure or a cancel stopped the run".to_owned();
-            self.finish_attempts(b, job, Outcome::NotRun, tries.done + 1, tries.output, Duration::ZERO, Trace::Unknown(why));
+        self.ready.clear_all();
+        let pending = std::mem::replace(&mut self.pending, Bits::empty(self.order.len()));
+        for rank in pending.ones() {
+            let unit = self.order[rank as usize];
+            let done = std::mem::take(&mut self.tries[unit as usize]);
+            let output = std::mem::take(&mut self.tries_output[unit as usize]);
+            self.finish(
+                unit,
+                Went {
+                    outcome: Outcome::NotRun,
+                    attempts: done + 1,
+                    output,
+                    took: Duration::ZERO,
+                    trace: Trace::Unknown(STOPPED.to_owned()),
+                    executed: Executed::Not(STOPPED.to_owned()),
+                },
+            );
         }
     }
 
@@ -903,6 +1280,17 @@ impl Queue {
         }
     }
 
+    /// The binaries left with nothing to run, let go.
+    fn let_go(&mut self, effects: &mut Vec<Effect>) {
+        let mut quit = std::mem::take(&mut self.quit);
+        for &b in &quit {
+            self.maybe_quit(b as usize, effects);
+        }
+        quit.clear();
+        quit.append(&mut self.quit);
+        std::mem::swap(&mut self.quit, &mut quit);
+    }
+
     /// `frame` to the server, in its outbox until the call ends ([`Queue::flush`]).
     fn send(&mut self, b: usize, frame: &Frame) {
         let server = self.server(b);
@@ -910,43 +1298,43 @@ impl Queue {
             return;
         }
         frame.encode(&mut server.outbox);
-        self.dirty(b);
-    }
-
-    /// A timer that goes to the driver after the frames sent to `b` so far.
-    fn timer(&mut self, b: usize, after: Duration, tag: Tag) {
-        self.server(b).timers.push(Effect::Timer { after, tag });
-        self.dirty(b);
-    }
-
-    fn dirty(&mut self, b: usize) {
-        let server = self.server(b);
         if !server.dirty {
             server.dirty = true;
-            self.dirty.push(b);
+            self.dirty.push(b as u32);
         }
     }
 
-    /// What this call said to each server, as one send of all its frames, then its timers.
+    /// What this call said to each server, as one send of all its frames; then the driver
+    /// timer moved earlier if the wheel's next expiry is.
     fn flush(&mut self, effects: &mut Vec<Effect>) {
-        for b in std::mem::take(&mut self.dirty) {
-            self.flush_server(b, effects);
+        let mut dirty = std::mem::take(&mut self.dirty);
+        for &b in &dirty {
+            self.flush_server(b as usize, effects);
         }
+        dirty.clear();
+        self.dirty = dirty;
+        let Some(next) = self.wheel.next() else { return };
+        if self.armed.is_some_and(|it| it.1 <= next) {
+            return;
+        }
+        let tag = self.tag(For::Tick);
+        let after = Duration::from_millis(next).saturating_sub(self.now);
+        effects.push(Effect::Timer { after, tag });
+        self.armed = Some((tag, next));
     }
 
     fn flush_server(&mut self, b: usize, effects: &mut Vec<Effect>) {
         let Some(server) = self.bins[b].server.as_mut() else { return };
         server.dirty = false;
-        let bytes = std::mem::take(&mut server.outbox);
-        let timers = std::mem::take(&mut server.timers);
         let conn = server.conn.filter(|_| !server.hung_up);
-        if let Some(conn) = conn
-            && !bytes.is_empty()
-        {
-            let tag = self.tag(For::Send(b));
-            effects.push(Effect::Send { conn, bytes, tag });
+        match conn {
+            Some(conn) if !server.outbox.is_empty() => {
+                let bytes = std::mem::take(&mut server.outbox);
+                let tag = self.tag(For::Send(b as u32));
+                effects.push(Effect::Send { conn, bytes, tag });
+            }
+            _ => server.outbox.clear(),
         }
-        effects.extend(timers);
     }
 
     /// Kills the server, so its tests are lost with `why` once its spawn ends.
@@ -984,61 +1372,83 @@ impl Queue {
         if let Some(listen) = self.server(b).listen {
             effects.push(Effect::Unlisten { tag: listen });
         }
-        let mut running: Vec<u64> = std::mem::take(&mut self.server(b).running).into_iter().collect();
-        radix::sort(&mut running);
+        let running = std::mem::take(&mut self.server(b).running);
         let why = match was {
             Phase::Quitting if running.is_empty() => return,
             _ => format!("{}: {why}", self.bins[b].plan.name),
         };
         for id in running {
             self.busy -= 1;
-            let Some(attempt) = self.attempts.remove(&id) else { continue };
+            let Some(at) = self.attempt(id) else { continue };
+            let Attempt { unit, number, started, .. } = self.attempts[at];
+            self.free_attempt(at);
             let outcome = match self.cancelled {
                 true => Outcome::NotRun,
                 false => Outcome::Failed(Failure::Lost(why.clone())),
             };
-            let output = [self.tries.remove(&(b, attempt.job)).map(|it| it.output).unwrap_or_default(), output.clone()].concat();
-            let took = self.now.saturating_sub(attempt.started);
-            self.finish_attempts(b, Some(attempt.job), outcome, attempt.number, output, took, Trace::Unknown(why.clone()));
+            self.tries[unit as usize] = 0;
+            let earlier = std::mem::take(&mut self.tries_output[unit as usize]);
+            let took = self.now.saturating_sub(started);
+            self.finish(
+                unit,
+                Went {
+                    outcome,
+                    attempts: number,
+                    output: [earlier, output.clone()].concat(),
+                    took,
+                    trace: Trace::Unknown(why.clone()),
+                    executed: Executed::Not(why.clone()),
+                },
+            );
         }
-        let left: Vec<(Reverse<Duration>, usize, usize)> = self.pending.iter().filter(|it| it.1 == b).copied().collect();
-        for entry in left {
-            self.pending.remove(&entry);
-            self.ready.remove(&entry);
-            let earlier = self.tries.remove(&(b, entry.2)).map(|it| it.output).unwrap_or_default();
-            self.finish(b, Some(entry.2), Outcome::Failed(Failure::Lost(why.clone())), [earlier, output.clone()].concat(), Duration::ZERO, Trace::Unknown(why.clone()));
+        for rank in self.pending_of(b) {
+            let unit = self.order[rank as usize];
+            self.pending.clear(rank);
+            self.ready.clear(rank);
+            self.tries[unit as usize] = 0;
+            let earlier = std::mem::take(&mut self.tries_output[unit as usize]);
+            self.finish(unit, Went::lost(why.clone(), [earlier, output.clone()].concat()));
         }
+    }
+
+    /// The ranks of `b`'s units not started, in order.
+    fn pending_of(&self, b: usize) -> Vec<u32> {
+        let Bin { first, units, .. } = self.bins[b];
+        let mut ranks: Vec<u32> =
+            (first..first + units).map(|unit| self.rank[unit as usize]).filter(|&rank| self.pending.has(rank)).collect();
+        radix::sort(&mut ranks);
+        ranks
     }
 
     /// Starts the first tests in the order whose servers are ready, while cores are free.
     /// Servers with nothing left to run are let go.
     fn schedule(&mut self, effects: &mut Vec<Effect>) {
         while !self.stopping && self.busy < self.config.jobs.max(1) {
-            let Some(entry) = self.ready.pop_first() else { break };
-            self.pending.remove(&entry);
-            let (_, b, j) = entry;
-            match j {
-                WHOLE => self.start_whole(b, effects),
-                _ => self.start_job(b, j),
+            let Some(rank) = self.ready.first() else { break };
+            self.ready.clear(rank);
+            self.pending.clear(rank);
+            let unit = self.order[rank as usize];
+            match self.unit_job[unit as usize] {
+                WHOLE => self.start_whole(self.unit_bin[unit as usize] as usize, effects),
+                _ => self.start_job(unit),
             }
         }
-        for b in 0..self.bins.len() {
-            self.maybe_quit(b, effects);
-        }
+        self.let_go(effects);
     }
 
-    fn start_job(&mut self, b: usize, j: usize) {
-        let id = self.next_id;
-        self.next_id += 1;
-        let number = self.tries.get(&(b, j)).map_or(1, |it| it.done + 1);
+    fn start_job(&mut self, unit: u32) {
+        let (b, j) = (self.unit_bin[unit as usize] as usize, self.unit_job[unit as usize] as usize);
+        let number = self.tries[unit as usize] + 1;
         let timeout = self.bins[b].plan.jobs[j].timeout;
         let index = self.server(b).job_index[j];
-        self.attempts.insert(id, Attempt { binary: b, job: j, number, started: self.now, timed_out: false });
-        self.server(b).running.insert(id);
+        let id = self.new_attempt(unit, number);
+        self.server(b).running.push(id);
         self.busy += 1;
         self.send(b, &Frame::Run { id, index });
-        let deadline = self.tag(For::Deadline(id));
-        self.timer(b, timeout, deadline);
+        let deadline = self.wheel.insert(due_tick(self.now, timeout), Due::Deadline(id));
+        let attempt = &mut self.attempts[id as u32 as usize];
+        attempt.running = true;
+        attempt.deadline = deadline;
     }
 
     fn start_whole(&mut self, b: usize, effects: &mut Vec<Effect>) {
@@ -1062,16 +1472,16 @@ impl Queue {
             memory: plan.memory,
         };
         let timeout = *timeout;
-        let spawn = self.tag(For::Whole(b));
-        let deadline = self.tag(For::WholeDeadline(b));
+        let spawn = self.tag(For::Whole(b as u32));
+        let deadline = self.wheel.insert(due_tick(self.now, timeout), Due::Whole(b as u32));
         self.busy += slots;
-        self.bins[b].whole = Some(Whole { spawn, started: self.now, slots, timed_out: false });
+        self.bins[b].whole = Some(Whole { spawn, started: self.now, slots, timed_out: false, deadline });
         effects.push(Effect::Spawn { command: Box::new(command), tag: spawn });
-        effects.push(Effect::Timer { after: timeout, tag: deadline });
     }
 
     fn whole_ended(&mut self, b: usize, done: Done) {
         let Some(whole) = self.bins[b].whole.take() else { return };
+        self.wheel.remove(whole.deadline);
         self.busy -= whole.slots;
         let took = self.now.saturating_sub(whole.started);
         let timeout = match &self.bins[b].plan.mode {
@@ -1103,32 +1513,87 @@ impl Queue {
             }
         };
         let outcome = if self.cancelled && outcome != Outcome::Passed { Outcome::NotRun } else { outcome };
-        self.finish(b, None, outcome, output, took, trace);
+        let executed = Executed::Not(WHOLE_UNRECORDED.to_owned());
+        let unit = self.bins[b].first;
+        self.finish(unit, Went { outcome, attempts: 1, output, took, trace, executed });
     }
+}
+
+/// `duration` in nanoseconds, saturating.
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The wheel's tick `now` is in.
+fn tick(now: Duration) -> u64 {
+    u64::try_from(now.as_nanos() / TICK).unwrap_or(u64::MAX)
+}
+
+/// The first tick at or past `now + after`: a timer never fires early.
+fn due_tick(now: Duration, after: Duration) -> u64 {
+    u64::try_from(now.saturating_add(after).as_nanos().div_ceil(TICK)).unwrap_or(u64::MAX)
+}
+
+/// Each kind of [`Seen`] by its number, as [`pack`] keeps it.
+const SEEN: [Seen; 8] = [
+    Seen::Read,
+    Seen::Looked,
+    Seen::Listed,
+    Seen::Env,
+    Seen::Untraceable,
+    Seen::RefusedWrite,
+    Seen::RefusedNet,
+    Seen::Incomplete,
+];
+
+/// A line as a `u32`: the ID of what it names (at most [`names::MOST`]) and its kind.
+fn pack(id: u32, seen: Seen) -> u32 {
+    (id << 3) | seen as u32
+}
+
+fn unpack(packed: u32) -> (u32, Seen) {
+    (packed >> 3, SEEN[(packed & 7) as usize])
 }
 
 /// Whether a line of the record is of blaze's own doing, not the tests': its socket, its
 /// record, the variables it set for the server.
-fn ours(server: &Server, seen: Seen, what: &str) -> bool {
+fn ours(server: &Server, seen: Seen, id: u32) -> bool {
+    let [socket, record, socket_var, live_var] = server.ours;
     match seen {
-        Seen::Env => what == wire::SOCKET || what == confine::LIVE,
-        Seen::Read | Seen::Looked | Seen::Listed => what == server.socket_path || what == server.record_path,
+        Seen::Env => id == socket_var || id == live_var,
+        Seen::Read | Seen::Looked | Seen::Listed => id == socket || id == record,
         _ => false,
     }
 }
 
-/// A line of the record without its line break, borrowed: the parts [`Line::parse`] reads.
+/// A line of the record without its line break, borrowed: the parts [`Line::parse`] reads,
+/// its kind by its first byte.
 fn record_line(text: &str) -> Option<(Seen, &str, &str)> {
-    let mut parts = text.splitn(3, '\t');
-    let seen = Seen::of(parts.next()?)?;
-    Some((seen, parts.next()?, parts.next()?))
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b'\t' {
+        return None;
+    }
+    let seen = match bytes[0] {
+        b'R' => Seen::Read,
+        b'L' => Seen::Looked,
+        b'D' => Seen::Listed,
+        b'E' => Seen::Env,
+        b'T' => Seen::Untraceable,
+        b'W' => Seen::RefusedWrite,
+        b'N' => Seen::RefusedNet,
+        b'X' => Seen::Incomplete,
+        _ => return None,
+    };
+    let rest = &text[2..];
+    let tab = rest.find('\t')?;
+    Some((seen, &rest[..tab], &rest[tab + 1..]))
 }
 
 /// The whole lines of `text` (which ends with a line break) into the server's lines, as
 /// [`trace::parse`] of its lossy text reads them, but in place: each line is read borrowed,
-/// and only one that is kept is made a [`Line`]. A line not UTF-8 is read lossily alone,
-/// which is the same: a replaced sequence never spans a line break.
-fn take_lines(server: &mut Server, text: &[u8]) -> Result<(), BadRecord> {
+/// and what it names interned. A line not UTF-8 is read lossily alone, which is the same: a
+/// replaced sequence never spans a line break.
+fn take_lines(server: &mut Server, text: &[u8]) -> Result<(), String> {
     for (number, piece) in text.split_inclusive(|it| *it == b'\n').enumerate() {
         let Some(piece) = piece.strip_suffix(b"\n") else { break };
         let piece = match std::str::from_utf8(piece) {
@@ -1136,24 +1601,37 @@ fn take_lines(server: &mut Server, text: &[u8]) -> Result<(), BadRecord> {
             Err(_) => Cow::Owned(String::from_utf8_lossy(piece).into_owned()),
         };
         let Some((seen, scope, what)) = record_line(&piece) else {
-            return Err(BadRecord { line: number + 1, text: piece.chars().take(200).collect() });
+            return Err(BadRecord { line: number + 1, text: piece.chars().take(200).collect() }.to_string());
         };
-        if ours(server, seen, what) {
+        let job = match scope.is_empty() {
+            true => None,
+            false => match server.scopes.find(scope) {
+                Some(id) => Some(server.scope_job[id as usize]),
+                // A scope no job of this server has is no test's to be given.
+                None => continue,
+            },
+        };
+        let id = server
+            .names
+            .intern(what)
+            .ok_or_else(|| format!("it names more than {} paths and variables, or 4 GiB of them", names::MOST))?;
+        if ours(server, seen, id) {
             continue;
         }
-        if scope.is_empty() {
-            let bit = 1u16 << seen as u16;
-            match server.common_seen.get_mut(what) {
-                Some(kinds) if *kinds & bit != 0 => continue,
-                Some(kinds) => *kinds |= bit,
-                None => _ = server.common_seen.insert(what.to_owned(), bit),
+        match job {
+            Some(j) => server.scoped[j as usize].push(pack(id, seen)),
+            None => {
+                let at = id as usize;
+                if at >= server.common_kinds.len() {
+                    server.common_kinds.resize(at + 1, 0);
+                }
+                let bit = 1 << seen as u8;
+                if server.common_kinds[at] & bit != 0 {
+                    continue;
+                }
+                server.common_kinds[at] |= bit;
+                server.common.push(pack(id, seen));
             }
-            server.common.push(Line { seen, scope: String::new(), what: what.to_owned() });
-            continue;
-        }
-        // A scope no job of this server has is no test's to be given.
-        if let Some(&j) = server.by_scope.get(scope) {
-            server.scoped[j as usize].push(Line { seen, scope: scope.to_owned(), what: what.to_owned() });
         }
     }
     Ok(())

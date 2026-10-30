@@ -13,5 +13,8 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
 [lints]
 workspace = true

@@ -366,7 +366,7 @@ fn cast_lane<'db>(
     })
 }
 
-impl<'db> Evaluator<'db> {
+impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// The number of lanes of a vector type and the type of a lane.
     fn detect_simd_ty(&self, ty: Ty<'db>) -> Result<'db, (usize, Ty<'db>)> {
         let TyKind::Adt(adt_def, subst) = ty.kind() else {

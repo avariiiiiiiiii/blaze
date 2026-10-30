@@ -103,6 +103,9 @@ struct Web {
     nodes: FxHashMap<LLVMValueRef, Node>,
     /// In an order that has an operand before what is made of it, `phi`s aside.
     order: Vec<LLVMValueRef>,
+    /// The `phi`s, in the order [`Web::add`] met them: what is built for them is built in this
+    /// order, never in `nodes`' (by address, so another each run).
+    phis: Vec<LLVMValueRef>,
     addresses: usize,
     /// The type of every integer of the web: the one `inttoptr` takes.
     int: LLVMTypeRef,
@@ -126,7 +129,13 @@ impl Web {
         let root = unsafe { LLVMGetOperand(inttoptr, 0) };
         // SAFETY: `root` is a live value of the module being rewritten; this only reads it.
         let int = unsafe { LLVMTypeOf(root) };
-        let mut web = Web { nodes: FxHashMap::default(), order: Vec::new(), addresses: 0, int };
+        let mut web = Web {
+            nodes: FxHashMap::default(),
+            order: Vec::new(),
+            phis: Vec::new(),
+            addresses: 0,
+            int,
+        };
         // SAFETY: the values are live values of the module and the types of its context, as
         // `Web::add`'s `# Safety` asks.
         if unsafe { web.add(root, pointer) }.is_none() || web.addresses == 0 {
@@ -171,6 +180,7 @@ impl Web {
             Node::Address(_) => self.addresses += 1,
             Node::Null => {}
             Node::Phi => {
+                self.phis.push(value);
                 // SAFETY: `value` is a live `phi` of the module (its opcode matched); this only
                 // reads it.
                 for at in 0..unsafe { LLVMCountIncoming(value) } {
@@ -410,13 +420,8 @@ impl Web {
         inttoptr: LLVMValueRef,
     ) {
         let mut pointers: FxHashMap<LLVMValueRef, LLVMValueRef> = FxHashMap::default();
-        let phis: Vec<LLVMValueRef> = self
-            .nodes
-            .iter()
-            .filter(|(_, node)| matches!(node, Node::Phi))
-            .map(|(&value, _)| value)
-            .collect();
-        for &phi in &phis {
+        let phis = &self.phis;
+        for &phi in phis {
             // SAFETY: `builder` was made in the module's context and is disposed of only at
             // the end of `rebase`; the position `phi` is a live instruction of the module.
             unsafe { LLVMPositionBuilderBefore(builder, phi) };
@@ -492,7 +497,7 @@ impl Web {
             };
             pointers.insert(value, built);
         }
-        for &phi in &phis {
+        for &phi in phis {
             // SAFETY: `phi` is a live `phi` of the module; this only reads it.
             for at in 0..unsafe { LLVMCountIncoming(phi) } {
                 // SAFETY: `phi` is a live `phi` of the module and `at` is below its count of
@@ -514,8 +519,10 @@ impl Web {
         // already took the instruction after it, so nothing reads it again.
         unsafe { LLVMInstructionEraseFromParent(inttoptr) };
         // What still takes an integer of the web takes the pointer's: the integers then
-        // have no use left but each other, and go.
-        for (&value, node) in &self.nodes {
+        // have no use left but each other, and go. In a fixed order: two `phi`s of one block
+        // both put their `ptrtoint` before its first other instruction.
+        for &value in phis.iter().chain(&self.order) {
+            let node = &self.nodes[&value];
             // SAFETY: `value` is a live value of the module being rewritten; this only reads
             // it.
             if unsafe { LLVMIsAInstruction(value) }.is_null() || matches!(node, Node::Address(_)) {
@@ -652,6 +659,53 @@ exit:
         assert!(text.contains("[ %p, %entry ]"), "{text}");
         let gep = defined(&text, &format!("getelementptr i8, ptr {phi}, i64 %step"));
         assert!(text.contains(&format!("ret ptr {gep}")), "{text}");
+    }
+
+    /// Two `phi`s of one block, both still read as integers, each get their `ptrtoint` at the
+    /// block's first other instruction: in the order the web met them, the same every run
+    /// whatever addresses LLVM gave the values (each run in a fresh context, others alive).
+    #[test]
+    fn two_phis_of_one_block_rebase_to_the_same_ir_every_time() {
+        const IR: &str = r#"
+define ptr @two(ptr %p, ptr %r, i1 %c, i64 %n, i64 %step, ptr %out) {
+entry:
+  %a = ptrtoint ptr %p to i64
+  %b = ptrtoint ptr %r to i64
+  br label %loop
+
+loop:
+  %i = phi i64 [ %a, %entry ], [ %i1, %loop ]
+  %j = phi i64 [ %b, %entry ], [ %j1, %loop ]
+  %k = phi i64 [ 0, %entry ], [ %k1, %loop ]
+  %x = xor i64 %i, %j
+  store i64 %x, ptr %out
+  %i1 = add i64 %i, %step
+  %j1 = add i64 %j, %step
+  %k1 = add i64 %k, 1
+  %done = icmp eq i64 %k1, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  %d = select i1 %c, i64 %i1, i64 %j1
+  %q = inttoptr i64 %d to ptr
+  ret ptr %q
+}
+"#;
+        let mut kept = Vec::new();
+        let mut first: Option<String> = None;
+        for _ in 0..8 {
+            let context = Context::create();
+            let module = parsed(&context, IR);
+            assert!(rebase(&module));
+            module.verify().unwrap();
+            let text = printed(&module);
+            assert!(!text.contains("inttoptr"), "{text}");
+            match &first {
+                Some(first) => assert_eq!(*first, text),
+                None => first = Some(text),
+            }
+            kept.push(Context::create());
+        }
     }
 
     #[test]

@@ -66,7 +66,7 @@ use syntax::{
 };
 
 use self::scalar::{Kind, Output, Scalar};
-use super::BodyCx;
+use super::{BodyCx, bits::Bits};
 use crate::{
     cx::def_range,
     lower::{Found, Phase},
@@ -77,7 +77,7 @@ use crate::{
 /// it is in, in the order they are written. None of a body rustc builds no runtime MIR of
 /// before it aborts, or whose type checking or borrow checking failed.
 pub(super) fn lints<'db>(b: &BodyCx<'_, 'db>) -> Vec<Found> {
-    if b.tainted || !b.elaborated || borrowck_failed(b) {
+    if b.mir_tainted || !b.elaborated || borrowck_failed(b) {
         return Vec::new();
     }
     let db = b.db();
@@ -293,33 +293,6 @@ enum Use {
     Read,
     /// A borrow, a drop or a `yield`'s resume argument: what the propagation cannot follow.
     Escape,
-}
-
-/// A set of small indices, a bit each.
-#[derive(Default)]
-struct Bits(Vec<u64>);
-
-impl Bits {
-    fn reset(&mut self, len: usize) {
-        self.0.clear();
-        self.0.resize(len.div_ceil(64), 0);
-    }
-
-    /// Adds `at`; whether it was not there.
-    fn insert(&mut self, at: usize) -> bool {
-        let (word, bit) = (at / 64, 1u64 << (at % 64));
-        let added = (self.0[word] & bit) == 0;
-        self.0[word] |= bit;
-        added
-    }
-
-    fn remove(&mut self, at: usize) {
-        self.0[at / 64] &= !(1u64 << (at % 64));
-    }
-
-    fn contains(&self, at: usize) -> bool {
-        (self.0[at / 64] & (1u64 << (at % 64))) != 0
-    }
 }
 
 /// What the bodies of one owner share: its trait environment and what answers in it.

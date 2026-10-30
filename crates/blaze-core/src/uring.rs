@@ -44,11 +44,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_ids::radix;
+use blaze_radix as radix;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Tag,
+    Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names, Stamp, Tag,
     wheel::{self, Wheel},
 };
 
@@ -58,6 +58,7 @@ const OP_POLL_ADD: u8 = 6;
 const OP_ACCEPT: u8 = 13;
 const OP_ASYNC_CANCEL: u8 = 14;
 const OP_CONNECT: u8 = 16;
+const OP_STATX: u8 = 21;
 const OP_READ: u8 = 22;
 const OP_WRITE: u8 = 23;
 const OP_SEND: u8 = 26;
@@ -130,6 +131,19 @@ const RECV_GROUP: u16 = 0;
 const INBOX: usize = 4 << 20;
 /// `statx`'s mask bit of the alignment a write that bypasses the cache needs (Linux 6.1).
 const STATX_DIOALIGN: u32 = 0x2000;
+/// What a [`Stamp`] is made of, as `statx`'s mask asks for it (`linux/stat.h`; `libc` has these
+/// only for some C libraries).
+const STATX_STAMP: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0080 | 0x0100 | 0x0200;
+/// `statx`'s flag to answer from what the kernel has, never asking a network file system's
+/// server first.
+const AT_STATX_DONT_SYNC: i32 = 0x4000;
+
+/// In a `user_data`: the request is a name of a sweep ([`Effect::Stamp`]), its sweep's slot in
+/// bits 48 to 62, its `statx` buffer in bits 32 to 47 and the name's index in the low 32. Every
+/// other request's `user_data` is [`data`] of an id below 2^61, or [`NOBODY`].
+const STAMP: u64 = 1 << 63;
+/// Sweeps in flight at once: their slots fit in 15 bits, short of the one [`NOBODY`] has.
+const SWEEPS: u32 = (1 << 15) - 1;
 
 /// Requests the ring holds at once, enough to keep an NVMe queue full; more wait in the
 /// driver until there is room.
@@ -281,6 +295,68 @@ const _: () = assert!(size_of::<RsrcUpdate2>() == 32);
 const _: () = assert!(size_of::<BufReg>() == 40);
 const _: () = assert!(size_of::<FileIndexRange>() == 16);
 const _: () = assert!(size_of::<ProvidedBuf>() == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct StatxTime {
+    sec: i64,
+    nsec: u32,
+    _pad: i32,
+}
+
+/// `struct statx` of `linux/stat.h`, the same on every architecture and C library, with only
+/// what a [`Stamp`] reads named.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Statx {
+    mask: u32,
+    /// `stx_blksize`, `stx_attributes`, `stx_nlink`, `stx_uid` and `stx_gid`.
+    _head: [u32; 6],
+    mode: u16,
+    _pad: u16,
+    ino: u64,
+    size: u64,
+    /// `stx_blocks` and `stx_attributes_mask`.
+    _counts: [u64; 2],
+    /// `stx_atime` and `stx_btime`.
+    _times: [StatxTime; 2],
+    ctime: StatxTime,
+    mtime: StatxTime,
+    _rest: [u64; 16],
+}
+
+const _: () = assert!(size_of::<Statx>() == 256);
+const _: () = assert!(std::mem::offset_of!(Statx, mode) == 28);
+const _: () = assert!(std::mem::offset_of!(Statx, ino) == 32);
+const _: () = assert!(std::mem::offset_of!(Statx, ctime) == 96);
+const _: () = assert!(std::mem::offset_of!(Statx, mtime) == 112);
+
+impl Statx {
+    /// The stamp [`crate::fs::stamp_of`] makes of a `stat` of the same file; unknown where the
+    /// file system did not fill in all of it.
+    fn stamp(&self) -> Stamp {
+        if self.mask & STATX_STAMP != STATX_STAMP {
+            return Stamp::UNKNOWN;
+        }
+        let ns = |t: &StatxTime| (t.sec as u64).wrapping_mul(1_000_000_000).wrapping_add(u64::from(t.nsec));
+        Stamp {
+            ino: self.ino,
+            size: self.size,
+            mtime_ns: ns(&self.mtime),
+            ctime_ns: ns(&self.ctime),
+            mode: u32::from(self.mode),
+        }
+    }
+}
+
+/// A name's stamp where its `statx` failed with `-res`: gone where nothing is there, unknown
+/// otherwise, as [`crate::fs::stamps`] has it.
+fn stamp_of_error(res: i32) -> Stamp {
+    match -res {
+        libc::ENOENT | libc::ENOTDIR => Stamp::GONE,
+        _ => Stamp::UNKNOWN,
+    }
+}
 
 /// `io_uring_register(2)` of `opcode` with `arg`, or an error naming what was asked and the
 /// kernel that has it, where this one refuses it as unknown.
@@ -716,6 +792,34 @@ impl Ring {
         true
     }
 
+    /// Writes up to `n` requests to the ring, `make(k)` the `k`th, as many as it has room for,
+    /// published to the kernel with one store of the tail. How many it wrote; `make` is called
+    /// for each of those and no other.
+    fn push_each(&mut self, n: usize, mut make: impl FnMut(usize) -> Sqe) -> usize {
+        // SAFETY: `sq_head` points at the kernel's `AtomicU32` in `rings`, mapped while `self`
+        // lives; the kernel moves it, so only atomic loads.
+        let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
+        // SAFETY: `sq_tail` as above; only this thread writes it.
+        let tail = unsafe { (*self.sq_tail).load(Ordering::Relaxed) };
+        let n = n.min(self.sq_entries as usize - tail.wrapping_sub(head) as usize);
+        for k in 0..n {
+            let at = tail.wrapping_add(k as u32) & self.sq_mask;
+            // SAFETY: `at` is masked by `sq_mask`, so below `sq_entries`, the length of the SQE
+            // array.
+            let slot = unsafe { self.sqes.add(at as usize) };
+            let sqe = make(k);
+            // SAFETY: slots from `tail` are not the kernel's until the tail store below moves
+            // past them; if it read one early it would see a torn request.
+            unsafe { slot.write(sqe) };
+        }
+        if n > 0 {
+            // SAFETY: as above; the release publishes the entries with the tail.
+            unsafe { (*self.sq_tail).store(tail.wrapping_add(n as u32), Ordering::Release) };
+            self.unsubmitted += n as u32;
+        }
+        n
+    }
+
     /// The submission ring's flags, read after every write of it is visible to the kernel's
     /// thread (the full fence pairs with the one the thread makes before it sleeps).
     fn flags(&self) -> u32 {
@@ -867,6 +971,12 @@ enum Op {
         tree: crate::watch::Tree,
         buffer: Vec<u8>,
         stopping: bool,
+        /// Flushes waiting for this read, cancelled for them, to complete: the descriptor is
+        /// drained then, while the ring's kernel thread holds no read of it.
+        flushes: Vec<Tag>,
+        /// The watched directory of an [`Effect::Journal`], whose batches are told as
+        /// [`Done::Journaled`]; `None` for an [`Effect::Watch`].
+        journal: Option<FileName>,
     },
     /// Stops the request whose `user_data` is `target`; its own completion is nobody's.
     Cancel {
@@ -1067,6 +1177,56 @@ struct Connection {
     ended: Option<Result<(), String>>,
 }
 
+/// An [`Effect::Stamp`] in flight: one `statx` request per name, relative to the root's
+/// directory opened for it. The names and the directory are not let go while the kernel may
+/// still be given a request of them: a request reads its name's bytes, and resolves it against
+/// the descriptor's number when it runs.
+struct Sweep {
+    tag: Tag,
+    names: Names,
+    dir: OwnedFd,
+    /// One per name, each written as its completion comes in.
+    out: Vec<Stamp>,
+    /// Names asked of the ring, from the first.
+    asked: u32,
+    /// Names whose completion is in.
+    told: u32,
+}
+
+/// The sweeps in flight and the `statx` buffers their requests are lent, one per request the
+/// submission ring holds: thousands of names in flight together, in a MiB however many there
+/// are.
+#[derive(Default)]
+struct Sweeps {
+    /// By the slot a request's `user_data` names.
+    slots: Vec<Option<Sweep>>,
+    free: Vec<u32>,
+    /// Sweeps with names not yet asked, in the order they were submitted.
+    queue: VecDeque<u32>,
+    /// `Statx`es, mapped once for the first sweep: the kernel writes a request's buffer until
+    /// its completion is reaped, so no Rust reference covers them. Never unmapped while one
+    /// may still be written (see `Drop for Uring`).
+    buffers: Option<Map>,
+    free_buffers: Vec<u16>,
+    /// Buffers mapped.
+    mapped: usize,
+    /// Why the ring failed, after which a completion of a sweep's may be of buffers let go:
+    /// none is taken, and no sweep starts.
+    failed: Option<String>,
+}
+
+impl Sweeps {
+    /// Requests of sweeps the kernel holds.
+    fn in_flight(&self) -> usize {
+        self.mapped - self.free_buffers.len()
+    }
+
+    /// Buffer `buffer`.
+    fn buffer(buffers: &Map, buffer: u16) -> *mut Statx {
+        buffers.at(u32::from(buffer) * size_of::<Statx>() as u32)
+    }
+}
+
 pub struct Uring {
     start: Instant,
     root: PathBuf,
@@ -1106,6 +1266,9 @@ pub struct Uring {
     /// Requests the kernel may still hold after the ring failed: kept, never freed, so it
     /// writes into nothing else.
     abandoned: Vec<Pending>,
+    sweeps: Sweeps,
+    /// Sweeps the kernel may still hold after the ring failed, never freed.
+    abandoned_sweeps: Vec<Sweep>,
     offload: Offload,
     in_flight: usize,
 }
@@ -1141,6 +1304,8 @@ impl Uring {
             timers: Wheel::new(),
             confine: None,
             abandoned: Vec::new(),
+            sweeps: Sweeps::default(),
+            abandoned_sweeps: Vec::new(),
             offload: Offload::new()?,
             in_flight: 0,
         })
@@ -1494,12 +1659,21 @@ impl Uring {
     /// in at a poll once the thread wakes the ring.
     fn off_ring(&mut self, effect: Effect) -> io::Result<()> {
         let tag = effect.tag();
+        self.off_ring_with(tag, move |root| crate::threads::run(root, effect))
+    }
+
+    /// `work`, given the root, done on a thread of its own for the effect `tag`, as
+    /// [`Uring::off_ring`] does an effect.
+    fn off_ring_with(
+        &mut self,
+        tag: Tag,
+        work: impl FnOnce(&Path) -> io::Result<Done> + Send + 'static,
+    ) -> io::Result<()> {
         let root = self.root.clone();
         let sender = self.offload.sender.clone();
         let wake = Arc::clone(&self.offload.wake);
         std::thread::Builder::new().name("blaze-uring-off".into()).spawn(move || {
-            let done = crate::threads::run(&root, effect)
-                .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
+            let done = work(&root).unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
             // A driver dropped meanwhile takes nothing.
             if sender.send(Completion { tag, done }).is_ok() {
                 let one = 1u64.to_ne_bytes();
@@ -1515,6 +1689,120 @@ impl Uring {
             self.offload.reading = Some(id);
         }
         Ok(())
+    }
+
+    /// Starts the sweep of [`Effect::Stamp`] `tag` over `names`: its requests are written to the
+    /// ring by [`Uring::feed_sweeps`], after every sweep before it. Fails only where the root
+    /// cannot be opened or no slot is left.
+    fn sweep(&mut self, tag: Tag, names: Names) -> io::Result<()> {
+        if let Some(why) = &self.sweeps.failed {
+            return Err(io::Error::other(format!("no sweep runs on this ring since it failed: {why}")));
+        }
+        let dir = open_dir(&self.root)
+            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", self.root.display())))?;
+        if names.is_empty() {
+            self.ready.push(Completion { tag, done: Done::Stamped(Vec::new()) });
+            return Ok(());
+        }
+        if u32::try_from(names.len()).is_err() {
+            return Err(io::Error::other(format!("a sweep of {} names: at most 2^32 at once", names.len())));
+        }
+        if self.sweeps.buffers.is_none() {
+            let lent = self.ring.sq_entries.min(u32::from(u16::MAX)) as usize;
+            self.sweeps.buffers = Some(anonymous(lent * size_of::<Statx>())?);
+            self.sweeps.free_buffers = (0..lent as u16).rev().collect();
+            self.sweeps.mapped = lent;
+        }
+        let slot = match self.sweeps.free.pop() {
+            Some(slot) => slot,
+            None if (self.sweeps.slots.len() as u32) < SWEEPS => {
+                self.sweeps.slots.push(None);
+                self.sweeps.slots.len() as u32 - 1
+            }
+            None => {
+                return Err(io::Error::other(format!("{SWEEPS} sweeps are in flight already: no slot left for another")));
+            }
+        };
+        let out = vec![Stamp::UNKNOWN; names.len()];
+        self.sweeps.slots[slot as usize] = Some(Sweep { tag, names, dir, out, asked: 0, told: 0 });
+        self.sweeps.queue.push_back(slot);
+        Ok(())
+    }
+
+    /// Writes the names of the sweeps waiting to the ring, in order, as long as it has room and
+    /// a `statx` buffer is free: as many requests at once as the submission ring holds, each
+    /// fill published with one store, for one enter at most. Requests waiting for room go
+    /// first.
+    fn feed_sweeps(&mut self) {
+        if !self.waiting.is_empty() {
+            return;
+        }
+        let sweeps = &mut self.sweeps;
+        let Some(buffers) = &sweeps.buffers else { return };
+        while let Some(&slot) = sweeps.queue.front() {
+            let Some(sweep) = sweeps.slots[slot as usize].as_mut() else {
+                sweeps.queue.pop_front();
+                continue;
+            };
+            let left = sweep.names.len() - sweep.asked as usize;
+            let n = left.min(sweeps.free_buffers.len());
+            let first = sweep.asked;
+            let free = &mut sweeps.free_buffers;
+            let (names, dir) = (&sweep.names, sweep.dir.as_raw_fd());
+            // SAFETY of the kernel's reads and writes: a name's bytes and its sweep's directory
+            // stay until every completion of the sweep is in (see `Sweep`), and a buffer is this
+            // request's alone until its completion is reaped.
+            let written = self.ring.push_each(n, |k| {
+                let buffer = free.pop().expect("a free buffer for each request written");
+                let index = first + k as u32;
+                Sqe {
+                    opcode: OP_STATX,
+                    fd: dir,
+                    addr: names.with_nul(index as usize).as_ptr() as u64,
+                    len: STATX_STAMP,
+                    off: Sweeps::buffer(buffers, buffer) as u64,
+                    op_flags: (libc::AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC) as u32,
+                    user_data: STAMP | u64::from(slot) << 48 | u64::from(buffer) << 32 | u64::from(index),
+                    ..Sqe::default()
+                }
+            });
+            sweep.asked += written as u32;
+            if sweep.asked as usize == sweep.names.len() {
+                sweeps.queue.pop_front();
+                continue;
+            }
+            // Out of room in the ring or of buffers: the next reap frees both.
+            return;
+        }
+    }
+
+    /// The completion `res` of a sweep's request whose `user_data` is `user_data`: its name's
+    /// stamp, and the sweep's completion once it is the last.
+    fn stamped(&mut self, user_data: u64, res: i32) {
+        let slot = ((user_data >> 48) & u64::from(SWEEPS)) as usize;
+        let buffer = (user_data >> 32) as u16;
+        let index = user_data as u32 as usize;
+        if self.sweeps.failed.is_some() {
+            return;
+        }
+        let Some(buffers) = &self.sweeps.buffers else { return };
+        let at = Sweeps::buffer(buffers, buffer);
+        let stamp = match res {
+            // SAFETY: the kernel wrote this request's buffer, a `Statx` in the mapping, before
+            // it posted the completion reaped (the acquire of the completion ring's tail), and
+            // writes it no more; nothing else holds it until it is free again below.
+            0 => unsafe { &*at }.stamp(),
+            _ => stamp_of_error(res),
+        };
+        self.sweeps.free_buffers.push(buffer);
+        let Some(sweep) = self.sweeps.slots.get_mut(slot).and_then(Option::as_mut) else { return };
+        sweep.out[index] = stamp;
+        sweep.told += 1;
+        if sweep.told as usize == sweep.names.len() {
+            let sweep = self.sweeps.slots[slot].take().expect("in flight");
+            self.sweeps.free.push(slot as u32);
+            self.ready.push(Completion { tag: sweep.tag, done: Done::Stamped(sweep.out) });
+        }
     }
 
     /// The completions the threads off the ring have sent.
@@ -1554,7 +1842,10 @@ impl Uring {
         let why = format!("the ring failed: {error}");
         let failed = |tag| Completion { tag, done: Done::Failed(IoError(why.clone())) };
         let pending: Vec<Pending> = self.pending.drain().map(|(_, it)| it).collect();
-        for pending in pending {
+        for mut pending in pending {
+            if let Op::Watch { flushes, .. } = &mut pending.op {
+                self.ready.extend(flushes.drain(..).map(failed));
+            }
             match pending.op {
                 // A spawn fails once, below; work off the ring still completes through its
                 // thread; a receive's effects fail with their connection's, below.
@@ -1590,6 +1881,13 @@ impl Uring {
             conn.receiving = None;
         }
         self.conns.retain(|_, conn| !conn.hung);
+        self.sweeps.failed = Some(why.clone());
+        self.sweeps.queue.clear();
+        self.sweeps.free.clear();
+        for sweep in self.sweeps.slots.iter_mut().filter_map(Option::take) {
+            self.ready.push(failed(sweep.tag));
+            self.abandoned_sweeps.push(sweep);
+        }
         self.watches.clear();
         self.listens.clear();
         self.offload.reading = None;
@@ -1602,6 +1900,12 @@ impl Uring {
     /// rest of it asked for. With [`CQE_F_MORE`] in `flags` the kernel still holds the
     /// request (a multishot one), so it is kept and not asked again.
     fn completed(&mut self, user_data: u64, res: i32, flags: u32) {
+        if user_data & STAMP != 0 {
+            if user_data != NOBODY {
+                self.stamped(user_data, res);
+            }
+            return;
+        }
         let (id, link) = (user_data >> 2, (user_data & 3) as usize);
         let Some(mut pending) = self.pending.remove(&id) else { return };
         let tag = pending.tag;
@@ -1728,22 +2032,31 @@ impl Uring {
                     None => Step::Ends(Some(Done::Renamed)),
                 }
             }
-            Op::Watch { stopping, .. } if res == -libc::ECANCELED || (res < 0 && *stopping) => {
+            // Cancelled for a flush, or by a flush's cancel that came after the read it was for.
+            Op::Watch { tree, buffer, stopping: false, flushes, journal } if res == -libc::ECANCELED => {
+                flushed(&mut self.ready, tag, tree, buffer, flushes, journal.as_ref());
+                Step::Again
+            }
+            Op::Watch { stopping, flushes, .. } if res == -libc::ECANCELED || (res < 0 && *stopping) => {
                 self.watches.remove(&tag);
+                unflushed(&mut self.ready, flushes);
                 Step::Ends(Some(Done::Unwatched))
             }
-            Op::Watch { tree, buffer, stopping } if res > 0 => {
-                let done = tree.take(&buffer[..res as usize]);
+            Op::Watch { tree, buffer, stopping, flushes, journal } if res > 0 => {
+                let done = told(journal.as_ref(), tree.take(&buffer[..res as usize]));
+                self.ready.push(Completion { tag, done });
                 if !*stopping {
-                    return Step::Goes(done);
+                    flushed(&mut self.ready, tag, tree, buffer, flushes, journal.as_ref());
+                    return Step::Again;
                 }
                 // The read was done before the cancel reached it: this change, then the end.
                 self.watches.remove(&tag);
-                self.ready.push(Completion { tag, done });
+                unflushed(&mut self.ready, flushes);
                 Step::Ends(Some(Done::Unwatched))
             }
-            Op::Watch { .. } => {
+            Op::Watch { flushes, .. } => {
                 self.watches.remove(&tag);
+                unflushed(&mut self.ready, flushes);
                 Step::Ends(failed(if res < 0 { res } else { -libc::EIO }))
             }
             Op::Exit { .. } => {
@@ -1916,6 +2229,7 @@ impl Uring {
         }
         self.posted = posted;
         self.flush_waiting();
+        self.feed_sweeps();
         self.submit_ring();
     }
 
@@ -1937,8 +2251,9 @@ impl Uring {
         self.waiting.remove(at);
         let pending = self.pending.remove(&id).expect("in flight");
         let done = match pending.op {
-            Op::Watch { .. } => {
+            Op::Watch { mut flushes, .. } => {
                 self.watches.remove(&tag);
+                unflushed(&mut self.ready, &mut flushes);
                 Done::Unwatched
             }
             _ => {
@@ -1947,6 +2262,35 @@ impl Uring {
             }
         };
         self.ready.push(Completion { tag, done });
+    }
+
+    /// Asks the watch `watch` for the flush `tag`. Its read, run by the ring's kernel thread,
+    /// would race a read of the descriptor here, so a read in the kernel is cancelled and the
+    /// flush answered once its completion is in ([`flushed`]); a read still waiting for room
+    /// in the ring reads nothing, so the descriptor is drained now.
+    fn flush(&mut self, watch: Tag, tag: Tag) -> io::Result<()> {
+        let Some(&id) = self.watches.get(&watch) else {
+            return Err(io::Error::other(format!("nothing is watched as {watch:?}")));
+        };
+        let waiting = self.waiting.contains(&id);
+        let Some(Pending { op: Op::Watch { tree, buffer, stopping, flushes, journal }, .. }) =
+            self.pending.get_mut(&id)
+        else {
+            unreachable!("a watch's request")
+        };
+        if *stopping {
+            return Err(io::Error::other("the watch ended before the flush"));
+        }
+        if waiting {
+            flushes.push(tag);
+            flushed(&mut self.ready, watch, tree, buffer, flushes, journal.as_ref());
+            return Ok(());
+        }
+        flushes.push(tag);
+        if flushes.len() == 1 {
+            self.start(watch, Op::Cancel { target: data(id, 0) });
+        }
+        Ok(())
     }
 
     /// An effect that fails as it is submitted, with no request of its own to end.
@@ -2155,13 +2499,21 @@ impl Drop for Uring {
             user_data: NOBODY,
             ..Sqe::default()
         };
+        // Sweeps' requests the kernel holds; after a failure of the ring, whatever it held then.
+        let mut stamping = self.sweeps.in_flight();
         let mut alive = true;
-        while alive && !self.pending.is_empty() && !self.ring.push(&[cancel]) {
+        while alive && (!self.pending.is_empty() || stamping > 0) && !self.ring.push(&[cancel]) {
             alive = Instant::now() < deadline && self.ring.enter(None).is_ok();
             self.ring.reap(|user_data, res, flags| posted.push((user_data, res, flags)));
         }
         while alive {
             for (user_data, res, flags) in posted.drain(..) {
+                if user_data & STAMP != 0 {
+                    if user_data != NOBODY && self.sweeps.failed.is_none() {
+                        stamping = stamping.saturating_sub(1);
+                    }
+                    continue;
+                }
                 let id = user_data >> 2;
                 match self.pending.get(&id).map(|it| &it.op) {
                     // A connection the accept made after it was cancelled, let go here.
@@ -2182,7 +2534,8 @@ impl Drop for Uring {
                 }
             }
             let left = deadline.saturating_duration_since(Instant::now());
-            let lent = self.pending.values().any(|it| !matches!(it.op, Op::Cancel { .. }));
+            let lent = self.pending.values().any(|it| !matches!(it.op, Op::Cancel { .. }))
+                || (stamping > 0 && self.sweeps.failed.is_none());
             if !lent || left.is_zero() {
                 break;
             }
@@ -2200,6 +2553,12 @@ impl Drop for Uring {
         }
         std::mem::forget(std::mem::take(&mut self.pending));
         std::mem::forget(std::mem::take(&mut self.abandoned));
+        std::mem::forget(std::mem::take(&mut self.abandoned_sweeps));
+        // A sweep's names, directory and buffers stay where the kernel may still read or write
+        // them.
+        if stamping > 0 || self.sweeps.failed.is_some() {
+            std::mem::forget(std::mem::take(&mut self.sweeps));
+        }
     }
 }
 
@@ -2231,6 +2590,47 @@ fn gone(conn: Conn) -> io::Error {
         io::ErrorKind::NotConnected,
         format!("{conn:?}: no such connection (never made, or hung up)"),
     )
+}
+
+/// Answers the flushes of the watch `watch`, whose read has completed and is not yet asked
+/// again, so nothing else reads its descriptor: what is still queued on it is told first.
+fn flushed(
+    ready: &mut Vec<Completion>,
+    watch: Tag,
+    tree: &mut crate::watch::Tree,
+    buffer: &mut [u8],
+    flushes: &mut Vec<Tag>,
+    journal: Option<&FileName>,
+) {
+    if flushes.is_empty() {
+        return;
+    }
+    let drained =
+        tree.drain(buffer, |done| ready.push(Completion { tag: watch, done: told(journal, done) }));
+    for tag in flushes.drain(..) {
+        let done = match &drained {
+            Ok(()) => Done::Flushed,
+            Err(error) => Done::Failed(IoError(format!("flushing the watch: {error}"))),
+        };
+        ready.push(Completion { tag, done });
+    }
+}
+
+/// What a watch's read says, as its effect tells it: for a journal, as the batch of a journal
+/// on a system that keeps none.
+fn told(journal: Option<&FileName>, done: Done) -> Done {
+    match journal {
+        Some(dir) => crate::journal::live(dir, done),
+        None => done,
+    }
+}
+
+/// Fails the flushes of a watch that ended first.
+fn unflushed(ready: &mut Vec<Completion>, flushes: &mut Vec<Tag>) {
+    for tag in flushes.drain(..) {
+        let why = IoError("the watch ended before the flush".into());
+        ready.push(Completion { tag, done: Done::Failed(why) });
+    }
 }
 
 fn c_path(path: &Path) -> io::Result<CString> {
@@ -2275,6 +2675,11 @@ fn open_dir_of(path: &Path) -> io::Result<OwnedFd> {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
+    open_dir(dir)
+}
+
+/// The directory `dir`, opened to be synced or for calls relative to it.
+fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
     let dir = c_path(dir)?;
     // SAFETY: a NUL-terminated path; the descriptor returned is this driver's.
     let fd = unsafe { libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
@@ -2436,11 +2841,31 @@ impl Driver for Uring {
                 Effect::Watch { dir, .. } => {
                     crate::watch::Tree::new(&self.root, &dir, true).map(|tree| {
                         let buffer = vec![0; crate::watch::BUFFER];
-                        let id = self.start(tag, Op::Watch { tree, buffer, stopping: false });
+                        let op = Op::Watch { tree, buffer, stopping: false, flushes: Vec::new(), journal: None };
+                        let id = self.start(tag, op);
                         self.watches.insert(tag, id);
                         None
                     })
                 }
+                // Linux keeps no journal across a restart: the first batch says what of the
+                // cursor is lost, and the watch is live from its start.
+                Effect::Journal { dir, since, .. } => {
+                    crate::watch::Tree::new(&self.root, &dir, true).map(|tree| {
+                        self.ready.push(Completion { tag, done: crate::journal::first_on_linux(&dir, &since) });
+                        let buffer = vec![0; crate::watch::BUFFER];
+                        let op = Op::Watch { tree, buffer, stopping: false, flushes: Vec::new(), journal: Some(dir) };
+                        let id = self.start(tag, op);
+                        self.watches.insert(tag, id);
+                        None
+                    })
+                }
+                Effect::Stamp { files, .. } => self.sweep(tag, files).map(|()| None),
+                Effect::Entries { dir, .. } => self
+                    .off_ring_with(tag, move |root| {
+                        Ok(Done::Entries(crate::fs::entries(&root.join(dir.as_str()), &dir)?))
+                    })
+                    .map(|()| None),
+                Effect::Flush { watch, .. } => self.flush(watch, tag).map(|()| None),
                 Effect::Unwatch { .. } | Effect::Unlisten { .. } | Effect::Kill { .. } => {
                     unreachable!("taken above")
                 }
@@ -2528,6 +2953,7 @@ impl Driver for Uring {
             }
         }
         self.flush_waiting();
+        self.feed_sweeps();
         self.submit_ring();
     }
 
@@ -2556,10 +2982,10 @@ impl Driver for Uring {
                 }
             }
         }
-        // A watch goes on after a change, and a listen after an accept.
+        // A watch or a journal goes on after a change, and a listen after an accept.
         let ended = out[before..]
             .iter()
-            .filter(|it| !matches!(it.done, Done::Changed { .. } | Done::Accepted { .. }))
+            .filter(|it| !matches!(it.done, Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }))
             .count();
         self.in_flight -= ended;
         out.len() - before

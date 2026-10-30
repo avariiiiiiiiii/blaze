@@ -80,7 +80,12 @@ fn budget(bytes: u64) -> Option<Budget> {
 }
 
 fn open(plane: &mut Plane, request: u32, weight: u32, keep_going: bool) {
-    let input = PlaneInput::Open { at_ns: 0, request: RequestId(request), weight, keep_going };
+    open_as(plane, request, weight, keep_going, false);
+}
+
+fn open_as(plane: &mut Plane, request: u32, weight: u32, keep_going: bool, idle: bool) {
+    let request = RequestId(request);
+    let input = PlaneInput::Open { at_ns: 0, request, weight, keep_going, idle };
     assert!(plane.step(input).unwrap().is_empty());
 }
 
@@ -167,6 +172,7 @@ fn as_machine(outputs: Vec<PlaneOutput>) -> Vec<Output> {
                 assert_eq!(request, RequestId(0));
                 Output::Finished { ok }
             }
+            PlaneOutput::Yield { id } => panic!("{id} asked to give way: no request is idle"),
         })
         .collect()
 }
@@ -196,6 +202,7 @@ fn one_request(config: Config) -> Plane {
         request: RequestId(0),
         weight: 1,
         keep_going: config.keep_going,
+        idle: false,
     };
     assert!(plane.step(input).unwrap().is_empty());
     plane
@@ -492,7 +499,13 @@ fn nodes_as_columns_say_what_nodes_as_specs_say() {
         };
         for request in 1..=2 {
             let id = RequestId(request);
-            let open = PlaneInput::Open { at_ns: 0, request: id, weight: request, keep_going: true };
+            let open = PlaneInput::Open {
+                at_ns: 0,
+                request: id,
+                weight: request,
+                keep_going: true,
+                idle: false,
+            };
             both(open.clone(), open).unwrap();
         }
         let mut next = 1u32;
@@ -918,6 +931,7 @@ fn fair_share_keeps_each_request_to_its_weight_within_one_task() {
 struct Planned {
     weight: u32,
     keep_going: bool,
+    idle: bool,
     opened: bool,
     closed: bool,
     batches: u32,
@@ -942,7 +956,11 @@ struct Model {
     db: Db,
     finished: FxHashMap<u32, bool>,
     cancelled: FxHashSet<u32>,
-    /// How many `Run`s each request was said.
+    /// The requests idle now.
+    idle: FxHashSet<u32>,
+    /// The running tasks asked to give way, by the node they run as.
+    yielding: FxHashSet<u32>,
+    /// How many `Run`s each request was said, less those that gave way.
     ran: FxHashMap<u32, u64>,
     outputs: Vec<PlaneOutput>,
 }
@@ -1106,8 +1124,27 @@ impl Model {
                             }
                         }
                     }
+                    // With no budget, an idle request's task starts only while no request not
+                    // idle has a task ready in its pool.
+                    if self.budget.is_none() && self.idle.contains(&self.request_of[&id.0]) {
+                        for (other, state) in &self.states {
+                            let theirs = self.request_of[other];
+                            assert!(
+                                *state != NodeState::Ready
+                                    || self.idle.contains(&theirs)
+                                    || self.specs[other].pool != spec.pool,
+                                "seed {seed}: idle #{id} starts while #{other} is ready"
+                            );
+                        }
+                    }
                     self.running.push(id.0);
                     *self.ran.entry(self.request_of[&id.0]).or_default() += 1;
+                }
+                PlaneOutput::Yield { id } => {
+                    assert!(self.running.contains(&id.0), "seed {seed}: #{id} yields, not running");
+                    let r = self.request_of[&id.0];
+                    assert!(self.idle.contains(&r), "seed {seed}: #{id} of request {r} yields");
+                    assert!(self.yielding.insert(id.0), "seed {seed}: #{id} asked twice");
                 }
                 PlaneOutput::Finished { request, ok } => {
                     let r = request.0;
@@ -1146,11 +1183,25 @@ impl Model {
     /// database before the plane is told: the value, and a failure too if `keep_failure`.
     fn finish(&mut self, id: u32, outcome: &Outcome, keep_failure: bool) -> Option<(Key, Outcome)> {
         self.running.retain(|&it| it != id);
+        self.yielding.remove(&id);
         let spec = &self.specs[&id];
         self.granted -= spec.memory;
         let key = spec.key?;
         self.running_keys.remove(&key);
         (keep_failure || !matches!(outcome, Outcome::Failed { .. })).then(|| (key, outcome.clone()))
+    }
+
+    /// A running task gave way: it holds nothing, runs no key, and was no start.
+    fn yielded(&mut self, id: u32) {
+        self.running.retain(|&it| it != id);
+        self.yielding.remove(&id);
+        let spec = &self.specs[&id];
+        self.granted -= spec.memory;
+        if let Some(key) = spec.key {
+            self.running_keys.remove(&key);
+        }
+        let r = self.request_of[&id];
+        *self.ran.get_mut(&r).expect("a start of its request") -= 1;
     }
 }
 
@@ -1247,8 +1298,10 @@ fn shuffle<T>(random: &mut SplitMix, items: &mut [T]) {
 }
 
 /// One random run of many requests, checked after every step. With `release`, each request
-/// is released as it is opened.
-fn simulate(seed: u64, release: bool) -> Simulated {
+/// is released as it is opened; with `idle`, some are opened idle, some of those promoted,
+/// and a task asked to give way mostly does. Without, the run is that of before idle
+/// requests were.
+fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
     let mut random = SplitMix(seed);
     let budget = (!random.one_in(3)).then(|| 100 + random.below(900));
     let starve_after = random.below(5) as u32;
@@ -1274,6 +1327,7 @@ fn simulate(seed: u64, release: bool) -> Simulated {
         .map(|_| Planned {
             weight: 1 + random.below(4) as u32,
             keep_going: !random.one_in(3),
+            idle: idle && random.one_in(3),
             opened: false,
             closed: false,
             batches: 1 + random.below(4) as u32,
@@ -1346,6 +1400,14 @@ fn simulate(seed: u64, release: bool) -> Simulated {
                 kept[random.below(kept.len() as u64) as usize]
             };
             driver.act(Act::Drop(dropped), next_id)
+        } else if idle
+            && (45..48).contains(&roll)
+            && live.iter().any(|r| model.idle.contains(r))
+        {
+            let idle: Vec<u32> = live.iter().copied().filter(|r| model.idle.contains(r)).collect();
+            let r = idle[random.below(idle.len() as u64) as usize];
+            model.idle.remove(&r);
+            driver.act(Act::Step(PlaneInput::Promote { at_ns: at, request: RequestId(r) }), next_id)
         } else if roll < 45 || model.running.is_empty() {
             let unopened = planned.iter().position(|it| !it.opened);
             let unclosed: Vec<usize> =
@@ -1361,7 +1423,11 @@ fn simulate(seed: u64, release: bool) -> Simulated {
                     request,
                     weight: it.weight,
                     keep_going: it.keep_going,
+                    idle: it.idle,
                 };
+                if it.idle {
+                    model.idle.insert(r as u32);
+                }
                 let outputs = driver.act(Act::Step(open), next_id);
                 if release {
                     assert!(driver.act(Act::Release(request), next_id).is_empty());
@@ -1397,33 +1463,38 @@ fn simulate(seed: u64, release: bool) -> Simulated {
             }
         } else {
             let id = model.running[random.below(model.running.len() as u64) as usize];
-            let outcome = match random.below(10) {
-                0 => Outcome::Failed { why: "boom".to_owned() },
-                1 => Outcome::Cached { remote: random.one_in(2) },
-                _ => Outcome::Built,
-            };
-            let r = model.request_of[&id];
-            let added = if random.one_in(4) {
-                let count = 1 + random.below(3);
-                new_nodes(&mut random, &model, &mut next_id, r, count)
+            if model.yielding.contains(&id) && !random.one_in(4) {
+                model.yielded(id);
+                driver.act(Act::Step(PlaneInput::Yielded { at_ns: at, id: NodeId(id) }), next_id)
             } else {
-                Vec::new()
-            };
-            model.register(r, &added);
-            let keep_failure = random.one_in(2);
-            if let Some((key, outcome)) = model.finish(id, &outcome, keep_failure) {
-                assert!(driver.act(Act::Put(key, outcome), next_id).is_empty());
+                let outcome = match random.below(10) {
+                    0 => Outcome::Failed { why: "boom".to_owned() },
+                    1 => Outcome::Cached { remote: random.one_in(2) },
+                    _ => Outcome::Built,
+                };
+                let r = model.request_of[&id];
+                let added = if random.one_in(4) {
+                    let count = 1 + random.below(3);
+                    new_nodes(&mut random, &model, &mut next_id, r, count)
+                } else {
+                    Vec::new()
+                };
+                model.register(r, &added);
+                let keep_failure = random.one_in(2);
+                if let Some((key, outcome)) = model.finish(id, &outcome, keep_failure) {
+                    assert!(driver.act(Act::Put(key, outcome), next_id).is_empty());
+                }
+                let group = (!random.one_in(3)).then(|| random.below(4) as u32);
+                let input = PlaneInput::Done {
+                    at_ns: at,
+                    id: NodeId(id),
+                    outcome,
+                    added,
+                    group,
+                    peak: random.below(1 << 20),
+                };
+                driver.act(Act::Step(input), next_id)
             }
-            let group = (!random.one_in(3)).then(|| random.below(4) as u32);
-            let input = PlaneInput::Done {
-                at_ns: at,
-                id: NodeId(id),
-                outcome,
-                added,
-                group,
-                peak: random.below(1 << 20),
-            };
-            driver.act(Act::Step(input), next_id)
         };
         model.take(&driver.plane, outputs, holding);
     }
@@ -1443,29 +1514,40 @@ fn simulate(seed: u64, release: bool) -> Simulated {
 /// the budget; a held task starts before any other with memory; a failure for memory names its
 /// node; the critical path goes first within a request, as priorities kept as nodes are added
 /// match those counted again from the whole graph; every request ends, ok exactly when nothing
-/// of it failed and it was not cancelled.
+/// of it failed and it was not cancelled; with no budget an idle request's task starts only
+/// while no other has one ready in its pool, and only an idle request's running task is asked
+/// to give way, once.
 #[test]
 fn random_requests_keep_the_rules() {
     let mut steps = 0;
     let mut critical = [0u64; 2];
+    let mut yields = 0;
     for seed in 0..600u64 {
-        let run = simulate(seed, false);
-        steps += run.steps;
-        for output in &run.outputs {
-            if let PlaneOutput::Run { critical: it, .. } = output {
-                critical[usize::from(*it)] += 1;
+        for idle in [false, true] {
+            let run = simulate(seed, false, idle);
+            steps += run.steps;
+            for output in &run.outputs {
+                match output {
+                    PlaneOutput::Run { critical: it, .. } => critical[usize::from(*it)] += 1,
+                    PlaneOutput::Yield { .. } => {
+                        assert!(idle, "seed {seed}: a yield with no idle request");
+                        yields += 1;
+                    }
+                    _ => {}
+                }
             }
         }
     }
-    assert!(steps > 5_000, "{steps} steps");
+    assert!(steps > 10_000, "{steps} steps");
     assert!(critical.iter().all(|&it| it > 100), "runs off and on the critical path: {critical:?}");
+    assert!(yields > 20, "{yields} yields");
 }
 
 #[test]
 fn the_same_seed_gives_the_same_outputs() {
     for seed in 0..60u64 {
-        let a = simulate(seed, false);
-        let b = simulate(seed, false);
+        let a = simulate(seed, false, true);
+        let b = simulate(seed, false, true);
         assert_eq!(a.outputs, b.outputs, "seed {seed} after {} steps", a.steps);
     }
 }
@@ -1475,9 +1557,11 @@ fn the_same_seed_gives_the_same_outputs() {
 #[test]
 fn releasing_requests_changes_no_output() {
     for seed in 0..300u64 {
-        let kept = simulate(seed, false);
-        let released = simulate(seed, true);
-        assert_eq!(kept.outputs, released.outputs, "seed {seed} after {} steps", kept.steps);
+        for idle in [false, true] {
+            let kept = simulate(seed, false, idle);
+            let released = simulate(seed, true, idle);
+            assert_eq!(kept.outputs, released.outputs, "seed {seed} after {} steps", kept.steps);
+        }
     }
 }
 
@@ -1522,15 +1606,21 @@ fn replay(seed: u64, simulated: &Simulated) {
 /// buffer changes nothing.
 #[test]
 fn the_plane_says_what_the_reference_says() {
-    let mut acts = 0;
+    let (mut acts, mut yielded) = (0, 0);
     for seed in 0..300u64 {
-        for release in [false, true] {
-            let simulated = simulate(seed, release);
+        for (release, idle) in [(false, false), (true, false), (false, true), (true, true)] {
+            let simulated = simulate(seed, release, idle);
             acts += simulated.acts.len();
+            yielded += simulated
+                .acts
+                .iter()
+                .filter(|(act, ..)| matches!(act, Act::Step(PlaneInput::Yielded { .. })))
+                .count();
             replay(seed, &simulated);
         }
     }
-    assert!(acts > 10_000, "{acts} acts");
+    assert!(acts > 20_000, "{acts} acts");
+    assert!(yielded > 20, "{yielded} tasks gave way");
 }
 
 /// Batches given in any order, keyed or not, with deps on nodes before them or of the same
@@ -1593,8 +1683,8 @@ fn batches_in_any_order_and_refused_ones_match_the_reference() {
         };
         let request = RequestId(0);
         let keep_going = random.one_in(2);
-        both(&mut plane, &mut model, PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going })
-            .unwrap();
+        let open = PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going, idle: false };
+        both(&mut plane, &mut model, open).unwrap();
         let (mut known, mut running, mut next, mut at) = (Vec::new(), Vec::new(), 0u32, 0u64);
         for _ in 0..12 {
             let (nodes, fresh) = batch(&mut random, &known, &mut next);
@@ -1672,7 +1762,7 @@ fn a_long_lived_plane_says_to_each_request_what_a_fresh_one_says() {
             assert_eq!(got, want, "round {round}");
             got
         };
-        let open = PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going: true };
+        let open = PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going: true, idle: false };
         both(open, &mut fresh);
         let mut running = runs(&both(PlaneInput::Add { at_ns: 0, request, nodes }, &mut fresh));
         both(PlaneInput::Close { at_ns: 0, request }, &mut fresh);
@@ -1700,4 +1790,208 @@ fn a_long_lived_plane_says_to_each_request_what_a_fresh_one_says() {
     assert!(nodes <= 40, "{nodes} node slots");
     assert!(tasks <= 40, "{tasks} task slots");
     assert_eq!(requests, 1);
+}
+
+fn yields(outputs: &[PlaneOutput]) -> Vec<u32> {
+    outputs
+        .iter()
+        .filter_map(|it| match it {
+            PlaneOutput::Yield { id } => Some(id.0),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An idle request starts nothing while a request not idle has a task ready, however far
+/// behind its virtual time and heavy its weight; on threads no other request can use, it
+/// starts.
+#[test]
+fn an_idle_request_runs_only_on_what_no_other_can_use() {
+    let mut plane = Plane::new(config(1, 1)).unwrap();
+    open(&mut plane, 1, 1, true);
+    open_as(&mut plane, 2, 16, true, true);
+    assert_eq!(runs(&add(&mut plane, 1, (1..4).map(|id| work(id, &[], 1)).collect())), [1]);
+    assert!(runs(&add(&mut plane, 2, (10..13).map(|id| work(id, &[], 1)).collect())).is_empty());
+    assert_eq!(runs(&built(&mut plane, 1)), [2]);
+    assert_eq!(runs(&built(&mut plane, 2)), [3]);
+    assert_eq!(runs(&built(&mut plane, 3)), [10]);
+    assert_eq!(plane.state(NodeId(11)), Some(&NodeState::Ready));
+
+    let mut plane = Plane::new(config(1, 3)).unwrap();
+    open(&mut plane, 1, 1, true);
+    open_as(&mut plane, 2, 1, true, true);
+    assert_eq!(runs(&add(&mut plane, 1, vec![work(1, &[], 1)])), [1]);
+    let out = add(&mut plane, 2, (10..13).map(|id| work(id, &[], 1)).collect());
+    assert_eq!(runs(&out), [10, 11]);
+
+    // With a budget, it starts while the task not idle that is ready does not fit.
+    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+    open(&mut plane, 1, 1, true);
+    open_as(&mut plane, 2, 1, true, true);
+    let ahead = vec![node(1, &[], Pool::Work, 1, None, 6), node(2, &[], Pool::Work, 1, None, 6)];
+    assert_eq!(runs(&add(&mut plane, 1, ahead)), [1]);
+    let out = add(&mut plane, 2, vec![node(10, &[], Pool::Work, 1, None, 3)]);
+    assert_eq!(runs(&out), [10]);
+    assert!(yields(&out).is_empty(), "giving way would not let 2 fit");
+    assert_eq!(runs(&built(&mut plane, 1)), [2]);
+}
+
+/// A promoted request takes its share from the plane's virtual time on, as a request that
+/// comes back with work ready does; a second promote, and one of a request finished or not
+/// known, do nothing.
+#[test]
+fn a_promoted_request_takes_its_share() {
+    let mut plane = Plane::new(config(1, 1)).unwrap();
+    open(&mut plane, 1, 1, true);
+    open_as(&mut plane, 2, 1, true, true);
+    let mut running = runs(&add(&mut plane, 1, (0..20).map(|id| work(id, &[], 1)).collect()));
+    running.extend(runs(&add(&mut plane, 2, (100..120).map(|id| work(id, &[], 1)).collect())));
+    let mut order = String::new();
+    let mut step = |plane: &mut Plane, running: &mut Vec<u32>| {
+        let id = running.pop().unwrap();
+        order.push(if id < 100 { 'a' } else { 'b' });
+        running.extend(runs(&built(plane, id)));
+    };
+    for _ in 0..3 {
+        step(&mut plane, &mut running);
+    }
+    let promote = PlaneInput::Promote { at_ns: 0, request: RequestId(2) };
+    assert!(plane.step(promote.clone()).unwrap().is_empty(), "the thread is taken");
+    for _ in 0..6 {
+        step(&mut plane, &mut running);
+    }
+    assert_eq!(order, "aaaababab");
+    assert!(plane.step(promote).unwrap().is_empty());
+    let unknown = PlaneInput::Promote { at_ns: 0, request: RequestId(99) };
+    assert!(plane.step(unknown).unwrap().is_empty());
+    open_as(&mut plane, 3, 1, true, true);
+    assert_eq!(finished(&close(&mut plane, 3)), [(3, true)]);
+    let over = PlaneInput::Promote { at_ns: 0, request: RequestId(3) };
+    assert!(plane.step(over).unwrap().is_empty());
+}
+
+/// A task not idle that waits only for the thread or the memory of running idle tasks has
+/// the newest of them asked to give way, once, and as few as it takes; given way, the idle
+/// task's node is ready again and the thread is the other's. One that ends before it gives
+/// way frees what it held as ever.
+#[test]
+fn a_yield_frees_the_thread_for_the_foreground() {
+    let mut plane = Plane::new(config(1, 1)).unwrap();
+    open_as(&mut plane, 2, 1, true, true);
+    assert_eq!(runs(&add(&mut plane, 2, vec![work(10, &[], 1), work(11, &[], 1)])), [10]);
+    open(&mut plane, 1, 1, true);
+    let out = add(&mut plane, 1, vec![work(1, &[], 1)]);
+    assert!(runs(&out).is_empty());
+    assert_eq!(yields(&out), [10]);
+    let held = plane.step(PlaneInput::Held { at_ns: 0, bytes: 0 }).unwrap();
+    assert!(yields(&held).is_empty(), "asked once");
+    let not_running = PlaneInput::Yielded { at_ns: 1, id: NodeId(11) };
+    assert_eq!(plane.step(not_running), Err(Error::NotRunning(NodeId(11))));
+    let out = plane.step(PlaneInput::Yielded { at_ns: 1, id: NodeId(10) }).unwrap();
+    assert_eq!(moves(&out)[0], (10, NodeState::Ready));
+    assert_eq!(runs(&out), [1]);
+    assert_eq!(plane.stats(RequestId(2)).unwrap().ran, 0);
+    assert_eq!(runs(&built(&mut plane, 1)), [10]);
+
+    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+    open_as(&mut plane, 2, 1, true, true);
+    let idle = vec![node(10, &[], Pool::Work, 1, None, 4), node(11, &[], Pool::Work, 1, None, 4)];
+    assert_eq!(runs(&add(&mut plane, 2, idle)), [10, 11]);
+    open(&mut plane, 1, 1, true);
+    let out = add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1, None, 5)]);
+    assert_eq!(yields(&out), [11], "one frees the thread and enough memory");
+    let out = built(&mut plane, 11);
+    assert_eq!(runs(&out), [1]);
+    assert_eq!(plane.granted(), 9);
+}
+
+/// A node of a request not idle that joins an idle request's task not started makes it ready
+/// at its own priority, in its own request, which starts it; one that joins an idle task
+/// running keeps it from giving way.
+#[test]
+fn a_foreground_node_joining_an_idle_task_runs_it_as_its_own() {
+    let mut plane = Plane::new(config(1, 1)).unwrap();
+    open(&mut plane, 1, 1, true);
+    open_as(&mut plane, 2, 1, true, true);
+    assert_eq!(runs(&add(&mut plane, 1, vec![work(1, &[], 1)])), [1]);
+    assert!(runs(&add(&mut plane, 2, vec![keyed(10, &[], 1, 5)])).is_empty());
+    let out = add(&mut plane, 1, vec![keyed(2, &[], 1, 5)]);
+    assert_eq!(moves(&out), [(2, NodeState::Ready)]);
+    assert_eq!(runs(&built(&mut plane, 1)), [2]);
+    assert_eq!(plane.state(NodeId(10)), Some(&NodeState::Running));
+    assert_eq!(plane.stats(RequestId(1)).unwrap().ran, 2);
+
+    let mut plane = Plane::new(config(1, 1)).unwrap();
+    open_as(&mut plane, 2, 1, true, true);
+    open(&mut plane, 1, 1, true);
+    assert_eq!(runs(&add(&mut plane, 2, vec![keyed(10, &[], 1, 5)])), [10]);
+    let out = add(&mut plane, 1, vec![keyed(2, &[], 1, 5), work(3, &[], 1)]);
+    assert!(yields(&out).is_empty(), "the running task is wanted");
+    assert_eq!(plane.state(NodeId(2)), Some(&NodeState::Running));
+}
+
+/// What a plane says of request 0: its records, its runs and its end.
+fn foreground(outputs: &[PlaneOutput]) -> Vec<PlaneOutput> {
+    outputs
+        .iter()
+        .filter(|it| match it {
+            PlaneOutput::Said { request, .. } | PlaneOutput::Finished { request, .. } => {
+                *request == RequestId(0)
+            }
+            PlaneOutput::Run { id, .. } => id.0 < BUSY,
+            PlaneOutput::Yield { .. } => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// The first id of the busy idle request's nodes.
+const BUSY: u32 = 1 << 30;
+
+/// Beside an idle request with work for every thread, the build of `traces/cold-small` says
+/// what it says alone, at the same times, so finishes in the same virtual time: an idle task
+/// in its way gives way as soon as asked.
+#[test]
+fn a_busy_idle_request_does_not_delay_the_foreground() {
+    let trace = Trace::read(include_str!("../traces/cold-small.jsonl")).unwrap();
+    let mut alone = one_request(trace.config);
+    let mut beside = one_request(trace.config);
+    open_as(&mut beside, 1, 4, true, true);
+    let busy = (0..64u32)
+        .map(|at| node(BUSY + at, &[], if at % 3 == 0 { Pool::Io } else { Pool::Work }, 1, None, 0))
+        .collect();
+    let first = add(&mut beside, 1, busy);
+    assert_eq!(runs(&first).len(), trace.config.io + trace.config.work, "every thread is busy");
+    let (mut mine, mut theirs, mut gave_way) = (Vec::new(), Vec::new(), 0);
+    for input in &trace.inputs {
+        let input = as_plane(input.clone());
+        let at_ns = input.at_ns();
+        mine.extend(alone.step(input.clone()).unwrap());
+        let mut out = beside.step(input).unwrap();
+        let mut asked: Vec<u32> = Vec::new();
+        loop {
+            asked.extend(yields(&out));
+            theirs.extend(out);
+            let Some(id) = asked.pop() else { break };
+            gave_way += 1;
+            out = beside.step(PlaneInput::Yielded { at_ns, id: NodeId(id) }).unwrap();
+        }
+    }
+    assert_eq!(finished(&mine), [(0, true)]);
+    assert_eq!(finished(&foreground(&theirs)), [(0, true)]);
+    assert!(gave_way > 0, "the idle request was in the way");
+    // The same records at the same times; within one time, a task may start in the step that
+    // freed its thread or in the one after, as its thread was the foreground's or given way.
+    let said = |outputs: &[PlaneOutput]| {
+        let mut said: Vec<String> = foreground(outputs)
+            .iter()
+            .map(|it| match it {
+                PlaneOutput::Said { record, .. } => format!("{} {:?}", record.at_ns, record.event),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        said.sort();
+        said
+    };
+    assert_eq!(said(&theirs), said(&mine));
 }

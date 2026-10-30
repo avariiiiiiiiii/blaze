@@ -1600,6 +1600,8 @@ fn reaches_fma(db: &dyn HirDatabase, func: FunctionId) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use hir_ty::intrinsic::AtomicOrders;
+
     use super::*;
 
     #[test]
@@ -1636,7 +1638,7 @@ mod tests {
             Intrinsic::Simd(SimdOp::ExtractDyn),
             Intrinsic::Sqrt,
             Intrinsic::Transmute,
-            Intrinsic::Atomic(AtomicOp::Load),
+            Intrinsic::Atomic(AtomicOp::Load, AtomicOrders::Generic),
         ] {
             assert_eq!(intrinsic_step(other), Some(Step::Unknown), "{other}");
             assert_eq!(fused(other), None, "{other}");

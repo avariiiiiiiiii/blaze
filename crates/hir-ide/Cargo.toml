@@ -22,7 +22,7 @@ rustc-hash.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
 typed-arena = "2.0.2"
-rustc_apfloat = "0.2.3"
+rustc_apfloat.workspace = true
 salsa.workspace = true
 
 rustc_abi.workspace = true
@@ -50,6 +50,7 @@ expect-test = "1.5.1"
 project-model.workspace = true
 
 # local deps
+blaze-hashcons.workspace = true
 test-utils.workspace = true
 test-fixture.workspace = true
 

@@ -577,6 +577,9 @@ language_item_table! { LangItems =>
     CoroutineReturn,         sym::coroutine_return,    TypeAliasId;
     CoroutineYield,          sym::coroutine_yield,     TypeAliasId;
     Unpin,                   sym::unpin,               TraitId;
+    UnsafeUnpin,             sym::unsafe_unpin,        TraitId;
+    GlobalAlloc,             sym::global_alloc_ty,     StructId;
+    MaybeDangling,           sym::maybe_dangling,      StructId;
     Pin,                     sym::pin,                 StructId;
 
     PartialEq,               sym::eq,                  TraitId;
@@ -602,6 +605,8 @@ language_item_table! { LangItems =>
     PanicImpl,               sym::panic_impl,          FunctionId;
     PanicCannotUnwind,       sym::panic_cannot_unwind, FunctionId;
     PanicNullPointerDereference, sym::panic_null_pointer_dereference, FunctionId;
+    PanicNullReferenceConstructed, sym::panic_null_reference_constructed, FunctionId;
+    PanicInvalidEnumConstruction, sym::panic_invalid_enum_construction, FunctionId;
     /// libstd panic entry point. Necessary for const eval to be able to catch it
     BeginPanic,              sym::begin_panic,         FunctionId;
 
@@ -715,6 +720,9 @@ language_item_table! { LangItems =>
     FieldType,               sym::field_type,          TypeAliasId;
 
     RangeMin,                sym::RangeMin,            ConstId;
+    /// `SizedTypeProperties::SIZE` and `::ALIGN`.
+    SizeOf,                  sym::mem_size_const,      ConstId;
+    AlignOf,                 sym::mem_align_const,     ConstId;
     RangeMax,                sym::RangeMax,            ConstId;
     RangeSub,                sym::RangeSub,            FunctionId;
 
@@ -796,9 +804,14 @@ language_item_table! { LangItems =>
 mod tests {
     use intern::{Symbol, sym};
     use salsa::plumbing::FromId;
+    use test_fixture::WithFixture;
 
-    use super::{LangItemEnum, LangItems};
-    use crate::{StructId, TraitId};
+    use super::{LangItemEnum, LangItems, crate_lang_items};
+    use crate::{
+        ConstId, FunctionId, StructId, TraitId,
+        signatures::{ConstSignature, FunctionSignature, StructSignature, TraitSignature},
+        test_db::TestDB,
+    };
 
     #[test]
     fn symbol_table_matches_compares() {
@@ -855,5 +868,59 @@ mod tests {
         expected.Sized = Some(trait_);
         expected.PhantomData = Some(struct_);
         assert_eq!(items, expected);
+    }
+
+    /// The lang items of rustc's UB checks, `SizedTypeProperties`' consts and the UB checker's
+    /// three types, as the pinned nightly's `library/` declares them.
+    #[test]
+    fn check_and_layout_lang_items_are_found() {
+        let db = TestDB::with_files(
+            r#"
+#![feature(lang_items)]
+#[lang = "panic_null_reference_constructed"]
+fn null_reference() -> ! { loop {} }
+#[lang = "panic_invalid_enum_construction"]
+fn invalid_enum(source: u128) -> ! { loop {} }
+pub trait SizedTypeProperties: Sized {
+    #[lang = "mem_size_const"]
+    const SIZE: usize = 0;
+    #[lang = "mem_align_const"]
+    const ALIGN: usize = 1;
+}
+#[lang = "unsafe_unpin"]
+pub unsafe auto trait UnsafeUnpin {}
+#[lang = "global_alloc_ty"]
+pub struct Global;
+#[lang = "maybe_dangling"]
+pub struct MaybeDangling<P: ?Sized>(P);
+"#,
+        );
+        let items = crate_lang_items(&db, db.fetch_test_crate()).unwrap();
+        let function =
+            |id: Option<FunctionId>| FunctionSignature::of(&db, id.unwrap()).name.clone();
+        let constant = |id: Option<ConstId>| ConstSignature::of(&db, id.unwrap()).name.clone();
+        let structure = |id: Option<StructId>| StructSignature::of(&db, id.unwrap()).name.clone();
+        let names = [
+            function(items.PanicNullReferenceConstructed),
+            function(items.PanicInvalidEnumConstruction),
+            constant(items.SizeOf).unwrap(),
+            constant(items.AlignOf).unwrap(),
+            TraitSignature::of(&db, items.UnsafeUnpin.unwrap()).name.clone(),
+            structure(items.GlobalAlloc),
+            structure(items.MaybeDangling),
+        ];
+        let names: Vec<&str> = names.iter().map(|it| it.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "null_reference",
+                "invalid_enum",
+                "SIZE",
+                "ALIGN",
+                "UnsafeUnpin",
+                "Global",
+                "MaybeDangling"
+            ]
+        );
     }
 }

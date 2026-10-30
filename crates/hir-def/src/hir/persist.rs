@@ -12,7 +12,13 @@
 //! written as its dense index, which means something only to the database that made it: these
 //! buffers are one run's state, the daemon's image of what it let go of ("IDs, two kinds":
 //! a dense index may be kept in the image), never a key, a hash or the bytes of an output.
+//!
+//! Inside [`relocating`], each such id is written instead as its place in a [`Relocation`]
+//! table, one word, and read back through the table: the table's ids are what the writer
+//! encodes portably (`crate::deps::signatures` writes them as `nameres::frozen` does), so the
+//! words mean the same in another process. Outside, the bytes are exactly the ones above.
 
+use std::cell::RefCell;
 use std::mem::{offset_of, size_of};
 
 use blaze_format::{FormatError, Slice, Str, Writer};
@@ -32,22 +38,180 @@ use thin_vec::ThinVec;
 use crate::hir::ExprOrPatIdPacked;
 
 /// `Code` for salsa's ids, as their bits: the database that wrote them is the one reading.
+/// Inside [`relocating`], as their place in the table, by the [`Relocate::KIND`] of their type.
 macro_rules! salsa_ids {
     ($($ty:ty),* $(,)?) => {$(
         impl $crate::hir::persist::Code for $ty {
             fn put(&self, w: &mut $crate::hir::persist::Words) {
-                w.u64(::salsa::plumbing::AsId::as_id(self).as_bits());
+                w.salsa_id(
+                    <$ty as $crate::hir::persist::Relocate>::KIND,
+                    ::salsa::plumbing::AsId::as_id(self),
+                );
             }
 
             fn get(
                 r: &mut $crate::hir::persist::Read<'_>,
             ) -> Result<Self, ::blaze_format::FormatError> {
-                Ok(<$ty as ::salsa::plumbing::FromId>::from_id(r.salsa_id()?))
+                let kind = <$ty as $crate::hir::persist::Relocate>::KIND;
+                Ok(<$ty as ::salsa::plumbing::FromId>::from_id(r.salsa_id_of(kind)?))
             }
         }
     )*};
 }
 pub(crate) use salsa_ids;
+
+/// What an id in a [`Relocation`] table is: which salsa type, or a syntax context, or a span's
+/// file. An entry is read back only as the kind it was written as.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Kind {
+    Crate,
+    File,
+    MacroCall,
+    Block,
+    Function,
+    Struct,
+    Union,
+    Enum,
+    Const,
+    Static,
+    Trait,
+    TypeAlias,
+    Impl,
+    EnumVariant,
+    Macro2,
+    MacroRules,
+    ProcMacro,
+    /// A [`SyntaxContext`], as `into_u32` gives it.
+    Context,
+    /// A [`span::EditionedFileId`], as `as_u32` gives it.
+    SpanFile,
+}
+
+/// A salsa id type [`salsa_ids`] writes, by the kind its table entries are.
+pub(crate) trait Relocate {
+    const KIND: Kind;
+}
+
+macro_rules! relocate {
+    ($($ty:ty => $kind:ident),* $(,)?) => {$(
+        impl Relocate for $ty {
+            const KIND: Kind = Kind::$kind;
+        }
+    )*};
+}
+
+relocate! {
+    base_db::Crate => Crate,
+    base_db::EditionedFileId => File,
+    MacroCallId => MacroCall,
+    crate::BlockId => Block,
+    crate::FunctionId => Function,
+    crate::StructId => Struct,
+    crate::UnionId => Union,
+    crate::EnumId => Enum,
+    crate::ConstId => Const,
+    crate::StaticId => Static,
+    crate::TraitId => Trait,
+    crate::TypeAliasId => TypeAlias,
+    crate::ImplId => Impl,
+    crate::EnumVariantId => EnumVariant,
+    crate::Macro2Id => Macro2,
+    crate::MacroRulesId => MacroRules,
+    crate::ProcMacroId => ProcMacro,
+}
+
+/// The ids a buffer names, each once, in the order first written: an id is written as its
+/// index here. Written, it is filled by [`Relocation::index`]; read, it is made whole by
+/// [`Relocation::of`] from the ids the writer's table names, made again in this database.
+#[derive(Default, Debug)]
+pub(crate) struct Relocation {
+    entries: Vec<(Kind, u64)>,
+    indexes: FxHashMap<(Kind, u64), u32>,
+}
+
+impl Relocation {
+    pub(crate) fn new() -> Relocation {
+        Relocation::default()
+    }
+
+    /// The table of a buffer being read: entry `i` is the id index `i` names.
+    pub(crate) fn of(entries: Vec<(Kind, u64)>) -> Relocation {
+        Relocation { entries, indexes: FxHashMap::default() }
+    }
+
+    /// The index of the id of `kind` whose bits are `bits`, added when it is new.
+    pub(crate) fn index(&mut self, kind: Kind, bits: u64) -> u32 {
+        debug_assert_eq!(self.entries.len(), self.indexes.len(), "a table made to be read");
+        let next = self.entries.len();
+        *self.indexes.entry((kind, bits)).or_insert_with(|| {
+            self.entries.push((kind, bits));
+            u32::try_from(next).expect("more than 2^32 ids in one relocation table")
+        })
+    }
+
+    /// The bits of the id `index` names, `None` when there is none or it is of another kind.
+    pub(crate) fn get(&self, kind: Kind, index: u32) -> Option<u64> {
+        let &(found, bits) = self.entries.get(index as usize)?;
+        (found == kind).then_some(bits)
+    }
+
+    pub(crate) fn entries(&self) -> &[(Kind, u64)] {
+        &self.entries
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+thread_local! {
+    /// The table of the [`relocating`] scope this thread is in, if any. Taken and put back
+    /// around each id written or read, never held across anything else.
+    static RELOCATION: RefCell<Option<Relocation>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` with every id a [`Words`] writes or a [`Read`] reads going through `table`: what is
+/// written in `f` adds to it, what is read in `f` is looked up in it. `table` holds what was
+/// added when `f` returns or unwinds. Scopes do not nest; `f` must not call into the database,
+/// whose own buffers are never relocated.
+pub(crate) fn relocating<T>(table: &mut Relocation, f: impl FnOnce() -> T) -> T {
+    struct Scope<'t>(&'t mut Relocation);
+
+    impl Drop for Scope<'_> {
+        fn drop(&mut self) {
+            if let Some(table) = RELOCATION.with(|slot| slot.borrow_mut().take()) {
+                *self.0 = table;
+            }
+        }
+    }
+
+    RELOCATION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none(), "relocating scopes do not nest");
+        *slot = Some(std::mem::take(table));
+    });
+    let _scope = Scope(table);
+    f()
+}
+
+/// The index of an id written in a [`relocating`] scope, `None` outside one.
+fn relocated(kind: Kind, bits: u64) -> Option<u32> {
+    RELOCATION.with(|slot| slot.borrow_mut().as_mut().map(|table| table.index(kind, bits)))
+}
+
+/// Whether ids are read through a table: `Some` of what `index` names in it, `Some(None)`
+/// when it names nothing of `kind`, `None` outside a [`relocating`] scope.
+fn unrelocated(kind: Kind, index: u32) -> Option<Option<u64>> {
+    RELOCATION.with(|slot| slot.borrow().as_ref().map(|table| table.get(kind, index)))
+}
+
+fn in_scope() -> bool {
+    RELOCATION.with(|slot| slot.borrow().is_some())
+}
 
 blaze_format::record! {
     /// One element of an arena: which of its type's variants it is, and the word its fields
@@ -138,6 +302,15 @@ impl Words {
 
     pub(crate) fn put<T: Code>(&mut self, value: &T) {
         value.put(self);
+    }
+
+    /// An id salsa made: its bits, or inside [`relocating`] its index in the table.
+    pub(crate) fn salsa_id(&mut self, kind: Kind, id: salsa::Id) {
+        let bits = id.as_bits();
+        match relocated(kind, bits) {
+            Some(index) => self.u32(index),
+            None => self.u64(bits),
+        }
     }
 
     /// A count, then each of `values`.
@@ -314,12 +487,35 @@ impl<'a> Read<'a> {
         (0..len).map(|_| T::get(self)).collect()
     }
 
-    /// The id of something salsa made, as [`salsa_ids`] wrote it.
+    /// The id of something salsa made, as [`salsa_ids`] wrote it outside [`relocating`].
     pub(crate) fn salsa_id(&mut self) -> Result<salsa::Id, FormatError> {
         let bits = self.u64()?;
         match bits as u32 {
             0 => Err(self.invalid("a salsa id of index 0")),
             _ => Ok(salsa::Id::from_bits(bits)),
+        }
+    }
+
+    /// The id of something salsa made of `kind`, as [`Words::salsa_id`] wrote it: inside
+    /// [`relocating`], looked up in the table.
+    pub(crate) fn salsa_id_of(&mut self, kind: Kind) -> Result<salsa::Id, FormatError> {
+        if !in_scope() {
+            return self.salsa_id();
+        }
+        let bits = self.relocated(kind)?;
+        match bits as u32 {
+            0 => Err(self.invalid("a relocated salsa id of index 0")),
+            _ => Ok(salsa::Id::from_bits(bits)),
+        }
+    }
+
+    /// The bits of the id of `kind` the next word names in the [`relocating`] table.
+    fn relocated(&mut self, kind: Kind) -> Result<u64, FormatError> {
+        let index = self.u32()?;
+        match unrelocated(kind, index) {
+            Some(Some(bits)) => Ok(bits),
+            Some(None) => Err(self.invalid("an id the relocation table has not, or of another kind")),
+            None => Err(self.invalid("a relocated id read outside a relocation")),
         }
     }
 }
@@ -607,8 +803,10 @@ pub(crate) fn syntax_context(raw: u32) -> Option<SyntaxContext> {
         return None;
     }
     // SAFETY: `from_u32` needs a context of this database. `raw` is what `into_u32` gave in
-    // the database that wrote the buffer, which is the one reading it (the module's docs):
-    // bytes from outside this process reach a `read` only through
+    // the database that wrote the buffer, which is the one reading it (the module's docs), or,
+    // inside `relocating`, what `into_u32` gave of a context the reader's table holds, which
+    // the reader made in this database from the table's portable encoding before reading
+    // (`crate::deps::signatures`). Bytes from outside this process reach a `read` only through
     // `blaze_format::read_verified`, which checks their content hash first, so a corrupted
     // buffer is refused before any context is decoded. `u32::MAX`, which `from_u32` would turn
     // into an overflow, is refused above.
@@ -617,11 +815,15 @@ pub(crate) fn syntax_context(raw: u32) -> Option<SyntaxContext> {
 
 impl Code for SyntaxContext {
     fn put(&self, w: &mut Words) {
-        w.u32(self.into_u32());
+        let raw = self.into_u32();
+        w.u32(relocated(Kind::Context, u64::from(raw)).unwrap_or(raw));
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        let raw = r.u32()?;
+        let raw = match in_scope() {
+            true => r.relocated(Kind::Context)? as u32,
+            false => r.u32()?,
+        };
         syntax_context(raw).ok_or_else(|| r.invalid("a syntax context of u32::MAX"))
     }
 }
@@ -673,11 +875,15 @@ impl<N> Code for FileAstId<N> {
 
 impl Code for span::EditionedFileId {
     fn put(&self, w: &mut Words) {
-        w.u32(self.as_u32());
+        let raw = self.as_u32();
+        w.u32(relocated(Kind::SpanFile, u64::from(raw)).unwrap_or(raw));
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        let raw = r.u32()?;
+        let raw = match in_scope() {
+            true => r.relocated(Kind::SpanFile)? as u32,
+            false => r.u32()?,
+        };
         let edition = (raw & Self::EDITION_MASK) >> Self::FILE_ID_BITS;
         match raw & Self::RESERVED_MASK == 0 && edition <= Edition::LATEST as u32 {
             true => Ok(Self::from_raw(raw)),
@@ -908,5 +1114,105 @@ mod tests {
         let buffer = blaze_format::Aligned::copy_from(&out.finish(root));
         let root = blaze_format::open::<Root>(&buffer).unwrap();
         assert!(Read::new(&root.words, &buffer).get::<Vec<u32>>().is_err());
+    }
+
+    fn crate_of(bits: u64) -> base_db::Crate {
+        <base_db::Crate as salsa::plumbing::FromId>::from_id(salsa::Id::from_bits(bits))
+    }
+
+    fn call_of(bits: u64) -> MacroCallId {
+        <MacroCallId as salsa::plumbing::FromId>::from_id(salsa::Id::from_bits(bits))
+    }
+
+    /// The words `value` is written as, in a scope of `table` when there is one.
+    fn words_of<T: Code>(value: &T, table: Option<&mut Relocation>) -> Vec<u32> {
+        let mut w = Words::new();
+        match table {
+            Some(table) => relocating(table, || value.put(&mut w)),
+            None => value.put(&mut w),
+        }
+        w.words
+    }
+
+    /// `words` read as a `T` in a scope of `table`.
+    fn read_back<T: Code>(words: &[u32], table: &mut Relocation) -> Result<T, FormatError> {
+        let mut w = Words::new();
+        words.iter().for_each(|&word| w.u32(word));
+        let mut out = Writer::new(SCHEMA);
+        let placed = w.place(&mut out);
+        let at = out.next::<Root>();
+        let root = out.push(&Root { words: placed.rec(at + offset_of!(Root, words) as u64), first: 0 });
+        let buffer = blaze_format::Aligned::copy_from(&out.finish(root));
+        let root = blaze_format::open::<Root>(&buffer).unwrap();
+        relocating(table, || Read::new(&root.words, &buffer).get::<T>())
+    }
+
+    #[test]
+    fn ids_outside_a_relocation_are_their_bits() {
+        let bits = 5 | (3 << 32);
+        assert_eq!(words_of(&crate_of(bits), None), [5, 3]);
+        let context = SyntaxContext::root(Edition::Edition2021);
+        assert_eq!(words_of(&context, None), [context.into_u32()]);
+        let file = span::EditionedFileId::new(span::FileId::from_raw(9), Edition::Edition2018);
+        assert_eq!(words_of(&file, None), [file.as_u32()]);
+    }
+
+    #[test]
+    fn ids_in_a_relocation_are_their_index_once_each() {
+        let mut table = Relocation::new();
+        let value = (crate_of(7), (call_of(7), (crate_of(9), crate_of(7))));
+        let words = words_of(&value, Some(&mut table));
+        assert_eq!(words, [0, 1, 2, 0], "one index per distinct id and kind");
+        let bits = |it: base_db::Crate| salsa::plumbing::AsId::as_id(&it).as_bits();
+        assert_eq!(
+            table.entries(),
+            [(Kind::Crate, bits(crate_of(7))), (Kind::MacroCall, 7), (Kind::Crate, 9)]
+        );
+        let mut reading = Relocation::of(table.entries().to_vec());
+        let back: (base_db::Crate, (MacroCallId, (base_db::Crate, base_db::Crate))) =
+            read_back(&words, &mut reading).expect("words just written");
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn contexts_and_span_files_relocate() {
+        let mut table = Relocation::new();
+        let context = SyntaxContext::root(Edition::Edition2024);
+        let file = span::EditionedFileId::new(span::FileId::from_raw(4), Edition::Edition2015);
+        let words = words_of(&(context, (file, context)), Some(&mut table));
+        assert_eq!(words, [0, 1, 0]);
+        let mut reading = Relocation::of(table.entries().to_vec());
+        let back: (SyntaxContext, (span::EditionedFileId, SyntaxContext)) =
+            read_back(&words, &mut reading).unwrap();
+        assert_eq!(back, (context, (file, context)));
+    }
+
+    #[test]
+    fn an_index_of_another_kind_or_past_the_table_is_refused() {
+        let mut reading = Relocation::of(vec![(Kind::MacroCall, 7)]);
+        assert!(read_back::<base_db::Crate>(&[0], &mut reading).is_err(), "another kind");
+        assert!(read_back::<MacroCallId>(&[1], &mut reading).is_err(), "past the table");
+        assert_eq!(read_back::<MacroCallId>(&[0], &mut reading).unwrap(), call_of(7));
+    }
+
+    #[test]
+    fn a_relocation_keeps_what_was_added_when_its_scope_unwinds() {
+        let mut table = Relocation::new();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            relocating(&mut table, || {
+                Words::new().put(&crate_of(11));
+                panic!("in the scope");
+            })
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(table.len(), 1);
+        assert!(!in_scope(), "the scope ended with the unwind");
+    }
+
+    #[test]
+    #[should_panic(expected = "relocating scopes do not nest")]
+    fn relocating_scopes_do_not_nest() {
+        let (mut outer, mut inner) = (Relocation::new(), Relocation::new());
+        relocating(&mut outer, || relocating(&mut inner, || ()));
     }
 }

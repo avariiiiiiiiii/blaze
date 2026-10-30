@@ -26,6 +26,7 @@ pub mod machine;
 pub mod plane;
 pub mod pool;
 pub mod pump;
+mod sync;
 pub mod topology;
 pub mod trace;
 

@@ -127,7 +127,7 @@ impl Versioned for Found<Vec<u8>> {
 }
 
 impl Versioned for Found<Names> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo found dir 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo found dir 2");
 }
 
 /// Where every directory cargo names is, and what the client sent of the rest. `mounts` and
@@ -251,7 +251,10 @@ fn file_through(cx: &mut Cx<'_>, table: &TableRef<'_>, path: &str, view: bool) -
             None => Found::Absent,
         },
         None => match table.outside.binary_search_by(|(at, _)| (*at).cmp(path)) {
-            Ok(at) => Found::Here(table.outside[at].1.0.to_vec()),
+            Ok(at) => {
+                let (_, Raw(bytes)) = &table.outside[at];
+                Found::Here(bytes.to_vec())
+            }
             Err(_) if known_file(&table.known, path) => Found::Absent,
             Err(_) => Found::Unmounted,
         },
@@ -306,7 +309,7 @@ fn dir_through(cx: &mut Cx<'_>, table: &TableRef<'_>, path: &str, view: bool) ->
             for mount in table.mounts[first..].iter().take_while(|it| it.at.starts_with(&*prefix)) {
                 let rest = &mount.at[prefix.len()..];
                 match rest.split_once('/') {
-                    Some((first, _)) => names.insert(first, true),
+                    Some((dir, _)) => names.insert(dir, true),
                     // A mount of one file (a sparse index's) is a file of the directory.
                     None => {
                         let dir = match mount.origin {
@@ -357,7 +360,7 @@ impl Query for FixedFile {
     }
 
     fn execute(cx: &mut Cx<'_>, key: &FixedPath) -> Result<Cbor<Found<Vec<u8>>>, Cancelled> {
-        Ok(Cbor(file_through(cx, &key.table, &key.path, false)?))
+        Ok(Cbor(file_through(cx, &TableRef::of(&key.table), &key.path, false)?))
     }
 }
 
@@ -375,7 +378,7 @@ impl Query for FixedDir {
     }
 
     fn execute(cx: &mut Cx<'_>, key: &FixedPath) -> Result<Cbor<Found<Names>>, Cancelled> {
-        Ok(Cbor(dir_through(cx, &key.table, &key.path, false)?))
+        Ok(Cbor(dir_through(cx, &TableRef::of(&key.table), &key.path, false)?))
     }
 }
 
@@ -389,19 +392,30 @@ pub(crate) fn read_dir(cx: &mut Cx<'_>, path: &str) -> Result<Found<Vec<(String,
     Ok(cx.get::<LoadDir>(&path.to_owned())?.get())
 }
 
-/// `path`'s longest mount: its origin and the path under the origin's root.
-pub(crate) fn locate(mounts: &[Mount], path: &str) -> Option<(Origin, String)> {
-    let mount = mounts
-        .iter()
-        .filter(|it| under(&it.at, path).is_some())
-        .max_by_key(|it| it.at.len())?;
-    let rest = under(&mount.at, path)?;
-    let joined = match (mount.under.as_str(), rest) {
-        ("", rest) => rest.to_owned(),
-        (under, "") => under.to_owned(),
-        (under, rest) => format!("{under}/{rest}"),
-    };
-    Some((mount.origin, joined))
+/// `path`'s longest mount: its origin and the path under the origin's root. The mounts are
+/// sorted by `at`, so the longest is the first of `path` and the directories above it, nearest
+/// first, that one is at: a binary search each, and nothing allocated unless the mount is
+/// under a directory of its root.
+fn locate<'a>(mounts: &[MountRef<'a>], path: &'a str) -> Option<(Origin, Cow<'a, str>)> {
+    let mut at = path;
+    loop {
+        if let Ok(found) = mounts.binary_search_by(|it| it.at.cmp(at)) {
+            let mount = &mounts[found];
+            let rest = under(mount.at, path)?;
+            let joined = match (mount.under, rest) {
+                ("", rest) => Cow::Borrowed(rest),
+                (under, "") => Cow::Borrowed(under),
+                (under, rest) => Cow::Owned(format!("{under}/{rest}")),
+            };
+            return Some((mount.origin, joined));
+        }
+        at = match at.rsplit_once('/') {
+            Some(("", _)) if at != "/" => "/",
+            Some((above, _)) if !above.is_empty() => above,
+            _ if !at.is_empty() => "",
+            _ => return None,
+        };
+    }
 }
 
 /// What is left of `path` under `at`: "" for `at` itself.
@@ -416,16 +430,18 @@ fn under<'p>(at: &str, path: &'p str) -> Option<&'p str> {
     rest.strip_prefix('/')
 }
 
-fn known_file(known: &[String], path: &str) -> bool {
+/// Whether `path` is a file of a known directory, or of a known directory's `.cargo`: `known`
+/// is sorted.
+fn known_file(known: &[&str], path: &str) -> bool {
     let Some((dir, _)) = path.rsplit_once('/') else { return false };
     let dir = if dir.is_empty() { "/" } else { dir };
-    if known.iter().any(|it| it == dir) {
+    if known.binary_search(&dir).is_ok() {
         return true;
     }
     match dir.rsplit_once('/') {
         Some((above, ".cargo")) => {
             let above = if above.is_empty() { "/" } else { above };
-            known.iter().any(|it| it == above)
+            known.binary_search(&above).is_ok()
         }
         _ => false,
     }
@@ -453,6 +469,16 @@ pub(crate) fn normal(path: &Path) -> Option<String> {
     Some(format!("/{}", parts.join("/")))
 }
 
+/// [`normal`], borrowing a path that already is normal: the paths blaze-manifest asks for are.
+fn normal_ref(path: &Path) -> Option<Cow<'_, str>> {
+    if let Some(text) = path.to_str()
+        && (text == "/" || (text.starts_with('/') && text[1..].split('/').all(|it| !matches!(it, "" | "." | ".."))))
+    {
+        return Some(Cow::Borrowed(text));
+    }
+    normal(path).map(Cow::Owned)
+}
+
 /// The directories above `path`, nearest first, `/` last.
 pub(crate) fn ancestors(path: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -478,12 +504,12 @@ pub(crate) struct Snapshot {
 
 impl Snapshot {
     /// Adds what `other` has that this does not.
-    pub fn merge(&mut self, other: &Snapshot) {
-        for (path, found) in &other.files {
-            self.files.entry(path.clone()).or_insert_with(|| found.clone());
+    pub fn merge(&mut self, other: Snapshot) {
+        for (path, found) in other.files {
+            self.files.entry(path).or_insert(found);
         }
-        for (path, found) in &other.dirs {
-            self.dirs.entry(path.clone()).or_insert_with(|| found.clone());
+        for (path, found) in other.dirs {
+            self.dirs.entry(path).or_insert(found);
         }
     }
 
@@ -525,38 +551,74 @@ pub(crate) enum Need {
     Dir(String),
 }
 
+/// A snapshot's paths as sorted columns, each with whether this run used it: a read is a
+/// binary search and a flag, and nothing is copied until the run ends.
+struct Column<T> {
+    paths: Vec<String>,
+    found: Vec<Found<T>>,
+    used: Vec<bool>,
+}
+
+impl<T> Default for Column<T> {
+    fn default() -> Self {
+        Column { paths: Vec::new(), found: Vec::new(), used: Vec::new() }
+    }
+}
+
+impl<T> Column<T> {
+    fn of(map: BTreeMap<String, Found<T>>) -> Column<T> {
+        let (paths, found): (Vec<String>, Vec<Found<T>>) = map.into_iter().unzip();
+        let used = vec![false; paths.len()];
+        Column { paths, found, used }
+    }
+
+    fn find(&self, path: &str) -> Option<usize> {
+        self.paths.binary_search_by(|it| it.as_str().cmp(path)).ok()
+    }
+
+    fn use_at(&mut self, at: usize) -> &Found<T> {
+        self.used[at] = true;
+        &self.found[at]
+    }
+
+    /// Every path, for the next run to start from.
+    fn all(self) -> BTreeMap<String, Found<T>> {
+        self.paths.into_iter().zip(self.found).collect()
+    }
+
+    /// The paths this run used.
+    fn used(self) -> BTreeMap<String, Found<T>> {
+        let used = self.used;
+        self.paths.into_iter().zip(self.found).zip(used).filter_map(|(it, used)| used.then_some(it)).collect()
+    }
+}
+
 #[derive(Default)]
 struct State {
-    snapshot: Snapshot,
-    used: Snapshot,
+    files: Column<Vec<u8>>,
+    dirs: Column<Names>,
     missed: FxHashSet<Need>,
 }
 
 impl State {
-    fn file(&mut self, path: &str) -> Option<Found<Vec<u8>>> {
-        match self.snapshot.files.get(path) {
-            Some(found) => {
-                self.used.files.insert(path.to_owned(), found.clone());
-                Some(found.clone())
-            }
-            None => {
-                self.missed.insert(Need::File(path.to_owned()));
-                None
-            }
-        }
+    fn of(snapshot: Snapshot) -> State {
+        State { files: Column::of(snapshot.files), dirs: Column::of(snapshot.dirs), missed: FxHashSet::default() }
     }
 
-    fn dir(&mut self, path: &str) -> Option<Found<Vec<(String, bool)>>> {
-        match self.snapshot.dirs.get(path) {
-            Some(found) => {
-                self.used.dirs.insert(path.to_owned(), found.clone());
-                Some(found.clone())
-            }
-            None => {
-                self.missed.insert(Need::Dir(path.to_owned()));
-                None
-            }
-        }
+    fn file(&mut self, path: &str) -> Option<&Found<Vec<u8>>> {
+        let Some(at) = self.files.find(path) else {
+            self.missed.insert(Need::File(path.to_owned()));
+            return None;
+        };
+        Some(self.files.use_at(at))
+    }
+
+    fn dir(&mut self, path: &str) -> Option<&Found<Names>> {
+        let Some(at) = self.dirs.find(path) else {
+            self.missed.insert(Need::Dir(path.to_owned()));
+            return None;
+        };
+        Some(self.dirs.use_at(at))
     }
 
     /// What the run missed, each once, in order.
@@ -580,9 +642,9 @@ fn unmounted(path: &str) -> std::io::Error {
 
 impl Files for Snap {
     fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-        let Some(path) = normal(path) else { return Err(not_found()) };
+        let Some(path) = normal_ref(path) else { return Err(not_found()) };
         match self.0.borrow_mut().file(&path) {
-            Some(Found::Here(bytes)) => Ok(bytes),
+            Some(Found::Here(bytes)) => Ok(bytes.clone()),
             Some(Found::Unmounted) => Err(unmounted(&path)),
             Some(Found::Absent) | None => Err(not_found()),
         }
@@ -590,17 +652,15 @@ impl Files for Snap {
 
     /// From the parent directory's names, so an edit to a file's contents is never read by
     /// asking whether it is there; a path its parent's names don't answer for (a mount's own
-    /// directory) is asked of itself.
+    /// directory) is asked of itself. A listing is sorted by name.
     fn kind(&self, path: &Path) -> Option<FileKind> {
-        let path = normal(path)?;
+        let path = normal_ref(path)?;
         let mut state = self.0.borrow_mut();
         if let Some((parent, name)) = path.rsplit_once('/') {
             let parent = if parent.is_empty() { "/" } else { parent };
             if let Found::Here(names) = state.dir(parent)? {
-                return names.iter().find(|(it, _)| it == name).map(|(_, dir)| match dir {
-                    true => FileKind::Dir,
-                    false => FileKind::File,
-                });
+                let at = names.binary_search_by(|(it, _)| it.as_str().cmp(name)).ok()?;
+                return Some(if names[at].1 { FileKind::Dir } else { FileKind::File });
             }
         }
         if let Found::Here(_) = state.dir(&path)? {
@@ -613,9 +673,9 @@ impl Files for Snap {
     }
 
     fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool)>> {
-        let Some(path) = normal(path) else { return Err(not_found()) };
+        let Some(path) = normal_ref(path) else { return Err(not_found()) };
         match self.0.borrow_mut().dir(&path) {
-            Some(Found::Here(names)) => Ok(names),
+            Some(Found::Here(names)) => Ok(names.clone()),
             Some(Found::Unmounted) => Err(unmounted(&path)),
             Some(Found::Absent) | None => Err(not_found()),
         }
@@ -629,20 +689,27 @@ pub(crate) struct Fill<'k> {
     /// The manifest the step reads itself, as a file; every other `Cargo.toml` it reads is
     /// taken from its own [`super::manifest::ManifestQuery`].
     pub own: Option<&'k str>,
+    /// Whether the step finds a workspace's members, so a missed manifest's neighbours are
+    /// read with it ([`Fill::beside`]).
+    pub members: bool,
 }
 
 impl Fill<'_> {
+    fn of_its_own(&self, path: &str) -> bool {
+        path.ends_with("/Cargo.toml") && self.own != Some(path)
+    }
+
     fn read(&self, cx: &mut Cx<'_>, need: &Need, into: &mut Snapshot) -> Result<(), Cancelled> {
         match need {
             Need::File(path) => {
-                if path.ends_with("/Cargo.toml") && self.own != Some(path.as_str()) {
+                if self.of_its_own(path) {
                     let key = super::manifest::ManifestKey {
                         path: path.clone(),
                         config: self.config.clone(),
                         source: None,
                     };
                     let read = cx.get::<super::manifest::ManifestQuery>(&key)?.get();
-                    into.merge(&read.snapshot);
+                    into.merge(read.snapshot);
                 }
                 if !into.files.contains_key(path) {
                     let found = self.config.read_file(cx, path)?;
@@ -653,6 +720,45 @@ impl Fill<'_> {
                 let found = self.config.read_dir(cx, path)?;
                 into.dirs.insert(path.clone(), found);
             }
+        }
+        Ok(())
+    }
+
+    /// The manifests beside each manifest `missed` names, read in the same round: the
+    /// `Cargo.toml` of every other directory in its directory's parent. blaze-manifest stops at
+    /// the first workspace member it cannot read, so without these a workspace of N members
+    /// would take N runs; with them it takes as many as its members are deep. A manifest read
+    /// this way that the next run does not use is left out of what it keeps.
+    fn beside(&self, cx: &mut Cx<'_>, missed: &[Need], into: &mut Snapshot) -> Result<(), Cancelled> {
+        if !self.members {
+            return Ok(());
+        }
+        let mut more: Vec<Need> = Vec::new();
+        for need in missed {
+            let Need::File(path) = need else { continue };
+            if !self.of_its_own(path) {
+                continue;
+            }
+            let Some((dir, _)) = path.rsplit_once('/') else { continue };
+            let Some((above, _)) = dir.rsplit_once('/') else { continue };
+            let above = if above.is_empty() { "/" } else { above };
+            if !into.dirs.contains_key(above) {
+                let found = self.config.read_dir(cx, above)?;
+                into.dirs.insert(above.to_owned(), found);
+            }
+            let Some(Found::Here(names)) = into.dirs.get(above) else { continue };
+            let base = if above == "/" { "" } else { above };
+            for (name, _) in names.iter().filter(|(name, dir)| *dir && !name.starts_with('.')) {
+                let manifest = format!("{base}/{name}/Cargo.toml");
+                if !into.files.contains_key(&manifest) {
+                    more.push(Need::File(manifest));
+                }
+            }
+        }
+        more.sort_unstable();
+        more.dedup();
+        for need in &more {
+            self.read(cx, need, into)?;
         }
         Ok(())
     }
@@ -667,25 +773,21 @@ pub(crate) fn run_over<'db, R>(
     fill: &Fill<'_>,
     mut step: impl FnMut(&mut Cx<'db>, Rc<dyn Files>) -> Result<R, Cancelled>,
 ) -> Result<(R, Snapshot), Cancelled> {
-    let state = Rc::new(RefCell::new(State { snapshot: base, ..State::default() }));
+    let mut snapshot = base;
     loop {
-        {
-            let mut it = state.borrow_mut();
-            it.used = Snapshot::default();
-            it.missed.clear();
-        }
+        let state = Rc::new(RefCell::new(State::of(snapshot)));
         let files: Rc<dyn Files> = Rc::new(Snap(state.clone()));
         let answer = step(cx, files)?;
-        let missed = state.borrow_mut().take_missed();
+        let mut state = std::mem::take(&mut *state.borrow_mut());
+        let missed = state.take_missed();
         if missed.is_empty() {
-            let used = std::mem::take(&mut state.borrow_mut().used);
-            return Ok((answer, used));
+            return Ok((answer, Snapshot { files: state.files.used(), dirs: state.dirs.used() }));
         }
-        let mut snapshot = std::mem::take(&mut state.borrow_mut().snapshot);
+        snapshot = Snapshot { files: state.files.all(), dirs: state.dirs.all() };
         for need in &missed {
             fill.read(cx, need, &mut snapshot)?;
         }
-        state.borrow_mut().snapshot = snapshot;
+        fill.beside(cx, &missed, &mut snapshot)?;
     }
 }
 
@@ -700,18 +802,51 @@ mod tests {
     #[test]
     fn the_longest_mount_is_a_paths() {
         let lib = Origin::Root(ContentId([1; 32]));
-        let mounts = vec![
+        let mut mounts = vec![
+            mount("/w2", Origin::View, "other"),
             mount("/w", Origin::View, ""),
             mount("/w/vendor/x", lib, "x-1.0"),
-            mount("/w2", Origin::View, "other"),
         ];
-        assert_eq!(locate(&mounts, "/w/Cargo.toml"), Some((Origin::View, "Cargo.toml".to_owned())));
-        assert_eq!(locate(&mounts, "/w"), Some((Origin::View, String::new())));
-        assert_eq!(locate(&mounts, "/w/vendor/x/src/lib.rs"), Some((lib, "x-1.0/src/lib.rs".to_owned())));
-        assert_eq!(locate(&mounts, "/w/vendor/x"), Some((lib, "x-1.0".to_owned())));
-        assert_eq!(locate(&mounts, "/w2/a"), Some((Origin::View, "other/a".to_owned())));
-        assert_eq!(locate(&mounts, "/wx/a"), None, "a mount is a directory, not a prefix");
-        assert_eq!(locate(&mounts, "/"), None);
+        mounts.sort();
+        let table = MountTable { mounts, outside: Vec::new(), known: Vec::new() };
+        let table = TableRef::of(&table);
+        let at = |path: &'static str| locate(&table.mounts, path).map(|(origin, under)| (origin, under.into_owned()));
+        assert_eq!(at("/w/Cargo.toml"), Some((Origin::View, "Cargo.toml".to_owned())));
+        assert_eq!(at("/w"), Some((Origin::View, String::new())));
+        assert_eq!(at("/w/vendor/x/src/lib.rs"), Some((lib, "x-1.0/src/lib.rs".to_owned())));
+        assert_eq!(at("/w/vendor/x"), Some((lib, "x-1.0".to_owned())));
+        assert_eq!(at("/w/vendor/xy"), Some((Origin::View, "vendor/xy".to_owned())));
+        assert_eq!(at("/w2/a"), Some((Origin::View, "other/a".to_owned())));
+        assert_eq!(at("/wx/a"), None, "a mount is a directory, not a prefix");
+        assert_eq!(at("/"), None);
+
+        let root = MountTable { mounts: vec![mount("/", lib, "r")], outside: Vec::new(), known: Vec::new() };
+        let root = TableRef::of(&root);
+        assert_eq!(locate(&root.mounts, "/a/b").map(|(_, it)| it.into_owned()), Some("r/a/b".to_owned()));
+        assert_eq!(locate(&root.mounts, "/").map(|(_, it)| it.into_owned()), Some("r".to_owned()));
+    }
+
+    /// A mount table written and read back borrows its strings and bytes; file bytes are one
+    /// byte string.
+    #[test]
+    fn a_table_is_read_in_place() {
+        let table = MountTable {
+            mounts: vec![mount("/w", Origin::View, "")],
+            outside: vec![("/home/u/.cargo/config.toml".to_owned(), b"[build]\n".to_vec())],
+            known: vec!["/home/u".to_owned()],
+        };
+        let bytes = blaze_protocol::cbor::to_vec(&table).unwrap();
+        let view = TableRef::view(&bytes);
+        assert_eq!(view.mounts[0].at, "/w");
+        let (_, Raw(bytes)) = &view.outside[0];
+        assert!(matches!(bytes, Cow::Borrowed(b"[build]\n")));
+        assert_eq!(view.known, ["/home/u"]);
+        assert_eq!(blaze_protocol::cbor::from_slice::<MountTable>(&bytes).unwrap(), table);
+
+        let file = Found::Here(vec![7u8; 64]);
+        let written = blaze_protocol::cbor::to_vec(&file).unwrap();
+        assert!(written.len() < 64 + 16, "{} bytes", written.len());
+        assert_eq!(blaze_protocol::cbor::from_slice::<Found<Vec<u8>>>(&written).unwrap(), file);
     }
 
     #[test]
@@ -724,7 +859,8 @@ mod tests {
 
     #[test]
     fn outside_the_mounts_only_known_directories_have_files() {
-        let known = vec!["/home/u/.cargo".to_owned(), "/home/u".to_owned(), "/".to_owned()];
+        let mut known = vec!["/home/u/.cargo", "/home/u", "/"];
+        known.sort();
         assert!(known_file(&known, "/home/u/.cargo/config.toml"));
         assert!(known_file(&known, "/home/u/.cargo/config"));
         assert!(known_file(&known, "/.cargo/config.toml"));
@@ -735,11 +871,13 @@ mod tests {
 
     #[test]
     fn what_a_run_missed_is_read_once_each_in_order() {
-        let mut state = State::default();
-        state.snapshot.files.insert("/w/a".to_owned(), Found::Absent);
+        let mut snapshot = Snapshot::default();
+        snapshot.files.insert("/w/a".to_owned(), Found::Absent);
+        snapshot.files.insert("/w/z".to_owned(), Found::Absent);
+        let mut state = State::of(snapshot);
         assert_eq!(state.file("/w/c"), None);
         assert_eq!(state.dir("/w"), None);
-        assert_eq!(state.file("/w/a"), Some(Found::Absent));
+        assert_eq!(state.file("/w/a"), Some(&Found::Absent));
         assert_eq!(state.file("/w/b"), None);
         assert_eq!(state.file("/w/c"), None);
         assert_eq!(state.dir("/v"), None);
@@ -751,7 +889,16 @@ mod tests {
         ];
         assert_eq!(state.take_missed(), want);
         assert!(state.take_missed().is_empty());
-        assert_eq!(state.used.files.keys().collect::<Vec<_>>(), ["/w/a"]);
+        assert_eq!(state.files.used().keys().collect::<Vec<_>>(), ["/w/a"]);
+    }
+
+    #[test]
+    fn already_normal_paths_are_borrowed() {
+        assert!(matches!(normal_ref(Path::new("/w/a/Cargo.toml")), Some(Cow::Borrowed("/w/a/Cargo.toml"))));
+        assert!(matches!(normal_ref(Path::new("/")), Some(Cow::Borrowed("/"))));
+        assert_eq!(normal_ref(Path::new("/w/./a/../b")).as_deref(), Some("/w/b"));
+        assert_eq!(normal_ref(Path::new("/w/a/")).as_deref(), Some("/w/a"));
+        assert_eq!(normal_ref(Path::new("w")), None);
     }
 
     #[test]

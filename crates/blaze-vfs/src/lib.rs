@@ -19,9 +19,11 @@
 
 #![deny(unsafe_code)]
 
+mod disk;
 mod journal;
 mod reader;
 mod rebase;
+mod section;
 #[allow(unsafe_code)]
 mod store;
 mod sync;
@@ -41,6 +43,7 @@ use crate::{
 };
 pub use crate::{
     reader::{Pinned, Reader},
+    section::Section,
     watch::{Watched, Watcher},
 };
 
@@ -235,6 +238,8 @@ pub struct Vfs {
     /// By view: its root while it is open. A closed view's number is not given out again.
     views: Vec<Option<NodeId>>,
     journal: Journal,
+    /// What each head's watcher last saw of the disk: saved in the image with the tree.
+    disks: disk::Disks,
 }
 
 impl Vfs {
@@ -242,7 +247,7 @@ impl Vfs {
     /// Tags it asks with are `tags..tags + 2^32`.
     pub fn recover(journal: FileName, tags: u64, bytes: &[u8]) -> (Vfs, Recovered) {
         let Loaded { tree, heads, journal, found } = Journal::recover(journal, tags, bytes);
-        (Vfs { tree, heads, views: Vec::new(), journal }, found)
+        (Vfs { tree, heads, views: Vec::new(), journal, disks: disk::Disks::default() }, found)
     }
 
     /// A handle that reads any root this tree has, from any thread, without the `Vfs` and

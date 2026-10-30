@@ -371,11 +371,10 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             config.push_str(&format!("W\t{it}\n"));
         }
     }
-    // What is seen as it is and is no input: the devices, the program (outside the overlays,
-    // whose paths the library answers itself).
-    let outside = |it: &&PathBuf| !spec.overlays.iter().any(|overlay| it.starts_with(overlay));
-    let programs = spec.not_inputs.iter().filter(outside).map(PathBuf::as_path);
-    for it in std::iter::once(Path::new("/dev")).chain(programs).flat_map(spellings) {
+    // What is seen as it is and is no input: the devices. The program is named in the record
+    // as any path: it is no input of the run's own process alone, which `Recorder` keeps
+    // to the unscoped lines.
+    for it in spellings(Path::new("/dev")) {
         config.push_str(&format!("Q\t{it}\n"));
     }
     if recording {

@@ -71,7 +71,7 @@ fn one(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr], attr: &ParsedAttr) 
         Parsed::NonExhaustive => non_exhaustive(fx, attr.attr),
         Parsed::MayDangle => may_dangle(fx, attr.attr),
         Parsed::RustcLegacyConstGenerics(indices) => legacy_const_generics(fx, attr.attr, indices),
-        Parsed::Doc(it) => doc::check_doc(fx, it, attr.attr),
+        Parsed::Doc(it) => doc::check_doc(fx, it),
         Parsed::RustcMustImplementOneOf(names) => must_implement_one_of(fx, attr.attr, names),
         Parsed::Linkage(_) => linkage(fx, attr.attr),
         Parsed::Other(_)
@@ -83,7 +83,12 @@ fn one(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr], attr: &ParsedAttr) 
         | Parsed::NoMangle
         | Parsed::ProcMacro(_)
         | Parsed::RustcPassIndirectlyInNonRusticAbis
-        | Parsed::MacroExport => {}
+        | Parsed::MacroExport
+        | Parsed::Stability(_)
+        | Parsed::ConstStability(_)
+        | Parsed::BodyStability(_)
+        | Parsed::RustcConstStableIndirect
+        | Parsed::Deprecated(_) => {}
     }
 }
 

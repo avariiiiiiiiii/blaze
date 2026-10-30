@@ -43,7 +43,7 @@ use syntax::{AstNode as _, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
 use crate::{
     cx::item_range,
     lints::bodies::{
-        BodyCx, LatePass,
+        BodyCx, Hooks, LatePass,
         types::util::{Solver, diagnostic_item, from_expansion, path_item, path_value},
     },
     lower::{Found, Phase, break_outside_of_loop::ancestors},
@@ -139,6 +139,10 @@ impl LatePass for PathStatements {
         "PathStatements"
     }
 
+    fn hooks(&self) -> Hooks {
+        Hooks::STMT
+    }
+
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         let Some(expr) = semi_expr(b, block, index) else { return };
         let Expr::Path(_) = b.store().expr(expr) else { return };
@@ -217,6 +221,10 @@ struct LetUnderscore;
 impl LatePass for LetUnderscore {
     fn name(&self) -> &'static str {
         "LetUnderscore"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR | Hooks::LOCAL
     }
 
     fn check_local(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
@@ -328,6 +336,10 @@ struct UnusedResults;
 impl LatePass for UnusedResults {
     fn name(&self) -> &'static str {
         "UnusedResults"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::STMT
     }
 
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
@@ -486,6 +498,10 @@ impl LatePass for UnitBindings {
         "UnitBindings"
     }
 
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR | Hooks::LOCAL
+    }
+
     fn check_local(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         if let Some(local) = Local::of_stmt(b, block, index) {
             unit_binding(b, &local, out);
@@ -527,6 +543,10 @@ struct NonShorthandFieldPatterns;
 impl LatePass for NonShorthandFieldPatterns {
     fn name(&self) -> &'static str {
         "NonShorthandFieldPatterns"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::PAT
     }
 
     fn check_pat(&mut self, b: &BodyCx<'_, '_>, pat: PatId, out: &mut Vec<Found>) {
@@ -582,6 +602,10 @@ struct UnusedAllocation;
 impl LatePass for UnusedAllocation {
     fn name(&self) -> &'static str {
         "UnusedAllocation"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

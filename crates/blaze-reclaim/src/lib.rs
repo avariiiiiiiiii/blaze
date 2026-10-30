@@ -17,12 +17,14 @@
 //! prefetch together), written only by its thread: entering and leaving a task writes no line
 //! another core writes.
 
-use std::{
-    cell::Cell,
-    marker::PhantomData,
-    ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering, fence},
+use std::{cell::Cell, marker::PhantomData, ptr};
+
+use crate::sync::{
+    atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering, fence},
+    thread_local,
 };
+
+mod sync;
 
 /// Advanced by every [`Grace::start`]. A task that began at an epoch after a grace's started
 /// after the values of that grace were unlinked, so it cannot reach them.
@@ -157,7 +159,9 @@ pub fn enter() -> Guard {
                 }
             };
             // Acquire: an epoch after a grace's start comes with everything unlinked before it.
-            slot.since.store(EPOCH.load(Ordering::Acquire), Ordering::Relaxed);
+            // Release: this store replaces the `OUT` the thread's last task ended with, so a
+            // writer that reads it must still be ordered after that task's reads.
+            slot.since.store(EPOCH.load(Ordering::Acquire), Ordering::Release);
             // Against `Grace::start`'s fence: either the writer's scan sees this slot, or the
             // loads this task does next see what the writer unlinked.
             fence(Ordering::SeqCst);
@@ -251,5 +255,7 @@ impl Limbo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, blaze_check))]
+mod model;
+#[cfg(all(test, not(blaze_check)))]
 mod tests;

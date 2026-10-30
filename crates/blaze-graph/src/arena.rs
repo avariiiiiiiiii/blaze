@@ -18,15 +18,22 @@ use std::{
     path::Path,
     ptr::NonNull,
     sync::{
-        Arc, Condvar, MutexGuard, PoisonError,
+        Arc, PoisonError,
         atomic::{AtomicI64, Ordering},
     },
-    thread::ThreadId,
 };
 
 use rustc_hash::FxHashMap;
 
-use crate::{Budget, Cancelled, admission::Arena, pump::Lock};
+use crate::{
+    Budget, Cancelled,
+    admission::Arena,
+    pump::Lock,
+    sync::{
+        Condvar, MutexGuard,
+        thread::{self, ThreadId},
+    },
+};
 
 /// How far a thread's count may move before it is added to [`HELD`] (Linux's
 /// `percpu_counter`): an allocation then costs a few thread-local adds and no atomic, and
@@ -708,7 +715,7 @@ impl Cap {
             "a reserve of {bytes} bytes, more than the daemon's cap of {} on its arenas",
             shared.limit
         );
-        let me = std::thread::current().id();
+        let me = thread::current().id();
         let mut state = shared.lock();
         let mut waiting: Option<u64> = None;
         loop {
@@ -1702,5 +1709,113 @@ mod tests {
         assert!(budget.from.contains("a margin of 0.00 GB"), "{}", budget.from);
         #[cfg(target_os = "linux")]
         assert!(budget.from.contains("others use in cgroup") || budget.from.contains("less a"));
+    }
+}
+
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-graph --release
+/// model_`): a [`Cap`]'s total against the bytes held. [`HELD`] and the counts beside it are not
+/// modelled: they are the allocator's, which the checker itself goes through.
+#[cfg(all(test, blaze_check))]
+mod model {
+    use std::sync::Arc;
+
+    use blaze_check::{
+        linear::{History, Spec},
+        model,
+    };
+
+    use super::{Cap, Grant};
+    use crate::{Cancelled, sync::thread};
+
+    const LIMIT: u64 = 100;
+
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        Reserve(u64),
+        Release(u64),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Ret {
+        Granted,
+        Cancelled,
+        Released,
+    }
+
+    /// The sequential cap: the bytes held. A reserve is granted when it fits; one that does not
+    /// fit when it ends was cancelled.
+    #[derive(Clone, PartialEq, Eq, Hash, Default)]
+    struct Held(u64);
+
+    impl Spec for Held {
+        type Op = Op;
+        type Ret = Ret;
+
+        fn apply(&mut self, op: &Op) -> Ret {
+            match *op {
+                Op::Reserve(bytes) if self.0 + bytes <= LIMIT => {
+                    self.0 += bytes;
+                    Ret::Granted
+                }
+                Op::Reserve(_) => Ret::Cancelled,
+                Op::Release(bytes) => {
+                    self.0 -= bytes;
+                    Ret::Released
+                }
+            }
+        }
+    }
+
+    fn reserve(history: &History<Held>, cap: &Cap, bytes: u64) -> Option<Grant> {
+        let mut grant = None;
+        history.record(Op::Reserve(bytes), |_| match cap.reserve(bytes) {
+            Ok(it) => {
+                grant = Some(it);
+                Ret::Granted
+            }
+            Err(Cancelled) => Ret::Cancelled,
+        });
+        grant
+    }
+
+    fn release(history: &History<Held>, grant: Grant) {
+        history.record(Op::Release(grant.bytes()), |_| {
+            drop(grant);
+            Ret::Released
+        });
+    }
+
+    /// Reserves `first`, then `then` while holding it, and gives both back: whether `then` was
+    /// cancelled. A first reserve holds nothing while it waits, so it is never the one cancelled.
+    fn hold_then_ask(history: &History<Held>, cap: &Cap, first: u64, then: u64) -> bool {
+        let first = reserve(history, cap, first).expect("a thread holding nothing is not cancelled");
+        let then = reserve(history, cap, then);
+        let cancelled = then.is_none();
+        if let Some(then) = then {
+            release(history, then);
+        }
+        release(history, first);
+        cancelled
+    }
+
+    /// Two threads each hold some of a cap of 100 and ask for more (50 then 40, 30 then 30).
+    /// When both wait with their first grants held, nothing can be given back: the newer wait
+    /// is cancelled, its bytes go back, and the other's fits. Each grant fit when given, each
+    /// cancel did not, at most one is cancelled, nothing deadlocks, and all is given back.
+    #[test]
+    fn model_a_full_cap_cancels_one_of_two_stuck_holders() {
+        model(|| {
+            let cap = Cap::new(LIMIT, LIMIT, Box::new(|_| {}));
+            let history = Arc::new(History::<Held>::new());
+            let other = {
+                let (cap, history) = (cap.clone(), history.clone());
+                thread::spawn(move || hold_then_ask(&history, &cap, 30, 30))
+            };
+            let mine = hold_then_ask(&history, &cap, 50, 40);
+            let theirs = other.join().unwrap();
+            history.check(Held::default());
+            assert!(!(mine && theirs), "both stuck holders were cancelled");
+            assert_eq!((cap.held(), cap.waiting()), (0, 0));
+        });
     }
 }

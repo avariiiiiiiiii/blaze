@@ -12,6 +12,8 @@ mod ast_id;
 // The one unsafe module: a `SyntaxContext` is a salsa id, made with `salsa::Id::from_index`.
 #[allow(unsafe_code)]
 mod hygiene;
+// Its `simd` module is the other unsafe one: the newline bitmap's vector loads.
+mod lines;
 mod map;
 
 pub use self::{
@@ -20,6 +22,7 @@ pub use self::{
         NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, ROOT_ERASED_FILE_AST_ID,
     },
     hygiene::{SyntaxContext, Transparency},
+    lines::{Kernel, LineIndex, Place, char_width, display_width},
     map::{RealSpanMap, SpanMap},
 };
 

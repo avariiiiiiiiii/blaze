@@ -389,7 +389,12 @@ pub struct Recorder {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pending: FxHashMap<u64, (String, String)>,
     reads: bool,
+    /// What is no input of the run's own process: the program it is, read again by a test
+    /// that runs it, is an input of that test ([`Recorder::input`]).
     not_inputs: FxHashSet<String>,
+    /// What is the sandbox's and no input of any line: the interposer.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    ours: Vec<String>,
     /// Where writes are the program's: the overlays, the writable directories and the
     /// sandbox's own.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -438,6 +443,7 @@ impl Recorder {
             pending: FxHashMap::default(),
             reads: spec.record_reads,
             not_inputs: spec.not_inputs.iter().map(|it| tidy(it)).collect(),
+            ours: Vec::new(),
             written,
             readable,
             overlays,
@@ -457,6 +463,12 @@ impl Recorder {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn interposed(&mut self) {
         self.interposed = true;
+    }
+
+    /// Takes `path` as the sandbox's own file, which no line names.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn ours(&mut self, path: &Path) {
+        self.ours.push(tidy(path));
     }
 
     /// `scope` (empty when it is not known) saw `what`, as `seen` says: for a sandbox that
@@ -481,7 +493,7 @@ impl Recorder {
         if !self.noted.insert(noted) {
             return;
         }
-        if matches!(seen, Seen::Read | Seen::Looked | Seen::Listed) && !self.input(what) {
+        if matches!(seen, Seen::Read | Seen::Looked | Seen::Listed) && !self.input(scope, what) {
             return;
         }
         let written = match (unwritable(self.names.get(scope)), unwritable(what)) {
@@ -546,10 +558,12 @@ impl Recorder {
         }
     }
 
-    /// Whether `path`, made whole, is an input: not one of `not_inputs`, and not the sandbox's
-    /// own but where an overlay is.
-    fn input(&self, path: &str) -> bool {
-        !self.not_inputs.contains(path)
+    /// Whether `path`, made whole, is an input of the line in `scope`: not the sandbox's own
+    /// file, not one of `not_inputs` in the run's own process's (unscoped) lines, and not in
+    /// the sandbox's own directories but where an overlay is.
+    fn input(&self, scope: u32, path: &str) -> bool {
+        !self.ours.iter().any(|it| it == path)
+            && (scope != NO_SCOPE || !self.not_inputs.contains(path))
             && (self.overlays.iter().any(|it| under(path, it))
                 || !self.own.iter().any(|it| under(path, it)))
     }
@@ -1092,6 +1106,8 @@ mod tests {
         };
         let mut recorder = Recorder::new(&spec, &["/proc", "/tmp"]);
         recorder.read(1, "/etc/hosts");
+        recorder.read(1, "/bin/t");
+        recorder.read(1, "/ws/target/t");
         assert!(recorder.marked(7, 1, b"/.blaze-test/tests::a"));
         recorder.read(7, "/ws/data.txt");
         recorder.read(7, "/ws/data.txt");
@@ -1118,14 +1134,15 @@ mod tests {
         let text = std::fs::read_to_string(&file).unwrap();
         assert_eq!(
             text,
-            "R\t\t/etc/hosts\nR\t\t/etc/passwd\nR\t\t/ws/src\nR\ttests::a\t/ws/data.txt\n\
-             W\ttests::a\t/home/u/.config/x\nN\t\t1.2.3.4:443\n\
-             X\t\ta path or a name with a tab or a line break in it\n"
+            "R\t\t/etc/hosts\nR\t\t/etc/passwd\nR\t\t/ws/src\nR\ttests::a\t/bin/t\n\
+             R\ttests::a\t/ws/data.txt\nW\ttests::a\t/home/u/.config/x\nN\t\t1.2.3.4:443\n\
+             X\t\ta path or a name with a tab or a line break in it\n",
+            "the program is no input of the run's own process, but is of a test that reads it"
         );
         let lines = read_record(&file).unwrap();
-        assert_eq!(lines.len(), 7);
+        assert_eq!(lines.len(), 8);
         assert_eq!(
-            lines[3],
+            lines[4],
             Line { reached: Reached::Read, test: "tests::a".into(), what: "/ws/data.txt".into() }
         );
         _ = std::fs::remove_dir_all(&dir);

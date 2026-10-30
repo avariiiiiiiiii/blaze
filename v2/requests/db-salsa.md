@@ -146,6 +146,10 @@ With it, the pumped job has its own query stack, and asking a key the task below
 once with `salsa::Cancelled::WouldWaitOnItself` instead of deadlocking.
 
 > forwarded to db: lane db's paths.
+> applied by db-expand: `base_db::install_plane_hooks()` (`crates/base-db/src/lib.rs`, behind a
+> `Once`; base-db gains `blaze-graph.workspace = true`) calls `salsa::set_task_depth(blaze_graph::pump::depth)`.
+> It also calls `salsa::set_wait` once that and `pump::wait_until`'s hook land. What waits: cargo's
+> `Db::new` and the coordinator's `RootDatabase::new` call it (asked in `v2/requests/db-expand.md`).
 
 ## Repost a task that unwinds with `Cancelled::WouldWaitOnItself` (lane db, base-db `run_all`; core-pool)
 
@@ -160,6 +164,16 @@ Why: the plane's rule for a wait that can't be served (crates/blaze-graph/src/pu
 at once ... and is posted again"); salsa now gives way the same way.
 
 > forwarded to db: lane db's paths (`base-db` `run_all`).
+> applied by db-expand: `base_db::run_on_pool(db, pool, count, task)` (`crates/base-db/src/lib.rs`)
+> is the body both pool databases had, except that a task unwinding with `WouldWaitOnItself` runs
+> again. A job's `done` can't reach its `Scope` (the scope's borrow is shorter than `'env`), so
+> the reposted tasks run as another round once every task of this one has ended. Any other
+> panic is resumed after its round, and nothing more is run. Tests
+> `a_task_that_waited_on_itself_runs_again` and `any_other_panic_of_a_task_reaches_the_caller`
+> (`base-db/src/tests.rs`, a real two-worker `Pool`). The test databases that run in order stay
+> as they are. What waits: `load-cargo/src/v2/db.rs:147` and `ide-db/src/lib.rs` `run_all` become
+> `base_db::run_on_pool(self, blaze_graph::exec::shared(), count, task)` (asked in
+> `v2/requests/db-expand.md`).
 
 # From speed-salsa (to db-salsa, the owner of `vendor/salsa*`)
 

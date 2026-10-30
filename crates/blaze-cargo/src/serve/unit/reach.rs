@@ -14,6 +14,7 @@
 use blaze_api::{FactRead, Reach, ReachedItem};
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
 use hir_ty::db::HirDatabase;
+use load_cargo::v2::Snapshot;
 use rustc_hash::FxHashSet;
 
 use super::Job;
@@ -49,11 +50,17 @@ fn path(db: &dyn HirDatabase, key: ItemKey) -> Option<String> {
     }
 }
 
-pub(crate) fn reach(from: &Job, to: &Job, changes: &[blaze_vfs::Change]) -> Result<Reach, Failed> {
-    let before = from.lowered.snapshot();
-    let after = to.lowered.snapshot();
-    let old_db: &dyn HirDatabase = &before;
-    let new_db: &dyn HirDatabase = &after;
+/// What the change from `from`'s view, read through `before`, to `to`'s, read through `after`,
+/// reaches.
+pub(crate) fn reach(
+    from: &Job,
+    before: &Snapshot,
+    to: &Job,
+    after: &Snapshot,
+    changes: &[blaze_vfs::Change],
+) -> Result<Reach, Failed> {
+    let old_db: &dyn HirDatabase = before;
+    let new_db: &dyn HirDatabase = after;
     let mut items = Vec::new();
     let mut compiled = Vec::new();
     let mut changed_code: FxHashSet<CodeHash> = FxHashSet::default();
@@ -63,12 +70,12 @@ pub(crate) fn reach(from: &Job, to: &Job, changes: &[blaze_vfs::Change]) -> Resu
         if !package.is_member || unit.is_std {
             continue;
         }
-        let Some(new_krate) = to.lowered.krate(at) else { continue };
+        let Some(new_krate) = to.crates.krate(at) else { continue };
         // A member crate's unit, by what it is in every view: its package, target and mode.
         let old_krate = from
             .graph
             .find(&from.units().graph.units, &unit.pkg_id, &unit.target.name, &unit.target.kind, unit.mode)
-            .and_then(|it| from.lowered.krate(it as usize));
+            .and_then(|it| from.crates.krate(it as usize));
         if to.cancelled() {
             return Err(Failed::Again);
         }

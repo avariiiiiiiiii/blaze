@@ -211,22 +211,29 @@ fn now_ms() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
-/// Writes the input being run to `out/<crash|timeout>-<hash>.hex`, once per process, and says
-/// how to replay and minimize it. Called from the panic hook, AddressSanitizer's error hook and
-/// the watchdog.
+/// Writes the input being run out, from AddressSanitizer's error hook or the watchdog, which
+/// end the process.
 pub(crate) fn dump(finding: Finding) {
+    if let Some(input) = raw::current() {
+        report(finding, &input);
+    }
+}
+
+/// Writes `input` to `out/<crash|timeout>-<hash>.hex`, once per process, and says how to
+/// replay and minimize it.
+fn report(finding: Finding, input: &[u8]) {
+    let Some(out) = OUT.get() else {
+        return;
+    };
     if DUMPED.swap(true, Ordering::AcqRel) {
         return;
     }
-    let (Some(out), Some(input)) = (OUT.get(), raw::current()) else {
-        return;
-    };
     let prefix = match finding {
         Finding::Crash => "crash-",
         Finding::Timeout => "timeout-",
     };
     let name = NAME.get().copied().unwrap_or("<target>");
-    match corpus::write(out, prefix, &input) {
+    match corpus::write(out, prefix, input) {
         Ok(path) => eprintln!(
             "blaze-fuzzer: {finding:?} on {} bytes, written to {}\n  replay:   {name} run {}\n  minimize: {name} minimize {}",
             input.len(),
@@ -270,11 +277,6 @@ fn fuzz(target: &Target, options: &Options, out: &Path) -> Result<ExitCode, Stri
     _ = OUT.set(out.to_owned());
     _ = NAME.set(target.name);
     now_ms();
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        hook(info);
-        dump(Finding::Crash);
-    }));
     let timeout = options.timeout.as_millis() as u64;
     std::thread::Builder::new()
         .name("watchdog".to_owned())
@@ -378,6 +380,8 @@ impl Fuzzer<'_> {
         self.coverage.drain(&mut self.features, self.value_profile);
         self.runs += 1;
         if !passed {
+            // A panic that left `check`; one the code under test caught itself is no finding.
+            report(Finding::Crash, &input);
             return Ok(Tried::Failed);
         }
         let new = self.seen.merge(&self.features);
@@ -389,7 +393,7 @@ impl Fuzzer<'_> {
     }
 
     fn failed(&self) -> ExitCode {
-        // The panic hook wrote the input out; an AddressSanitizer report never returns here.
+        // `try_input` wrote the input out; an AddressSanitizer report never returns here.
         eprintln!("{}: failed after {} runs", self.target.name, self.runs);
         ExitCode::FAILURE
     }

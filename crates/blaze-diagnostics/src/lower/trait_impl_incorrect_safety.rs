@@ -1,13 +1,14 @@
-//! E0198, E0199, E0200 and E0569: an impl whose `unsafe` does not match its trait (hir's
-//! `TraitImplIncorrectSafety`, which joins the four): an `unsafe` negative impl, an `unsafe`
-//! impl of a safe trait, a safe impl of an `unsafe` trait, and a safe `Drop` impl with a
-//! `#[may_dangle]` parameter.
+//! E0199, E0200 and E0569: an impl whose `unsafe` does not match its trait (hir's
+//! `TraitImplIncorrectSafety`): an `unsafe` impl of a safe trait, a safe impl of an `unsafe`
+//! trait, and a safe `Drop` impl with a `#[may_dangle]` parameter. hir joins two of rustc's
+//! AST validation errors to these, which `checks::ast_validation` gives as its walk comes to
+//! the impl: E0198 (an `unsafe` negative impl) and E0197 (an `unsafe` inherent impl).
 //!
-//! Follows rustc's `compiler/rustc_hir_analysis/src/coherence/unsafety.rs` (`check_item`) and,
-//! for E0198, `compiler/rustc_ast_passes/src/ast_validation.rs` with its struct
-//! `UnsafeNegativeImpl` in `compiler/rustc_ast_passes/src/diagnostics.rs` (MIT or Apache-2.0).
+//! Follows rustc's `compiler/rustc_hir_analysis/src/coherence/unsafety.rs` (`check_item`)
+//! (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
+use hir::InFile;
 
 use crate::{
     cx::Cx,
@@ -22,13 +23,15 @@ const INVARIANTS: &str = "enforces invariants that the compiler can't check. Rev
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplIncorrectSafety) -> Vec<Found> {
     let Some(at) = ImplAt::of_ptr(cx, d.file_id, d.impl_) else {
+        if validations(&cx.node(InFile::new(d.file_id, d.impl_)).value, d) {
+            return Vec::new();
+        }
         return unresolved(cx, d.file_id, d.impl_, "an impl safety error");
     };
-    let db = cx.db;
-    let negative = at.impl_.is_negative(db);
-    if d.should_be_safe && negative {
-        return unsafe_negative(cx, &at);
+    if validations(&at.node.value, d) {
+        return Vec::new();
     }
+    let db = cx.db;
     let Some(trait_ref) = at.impl_.trait_ref(db) else {
         return unresolved(cx, d.file_id, d.impl_, "an impl safety error");
     };
@@ -78,18 +81,9 @@ fn add_unsafe(diag: &mut Diag, span: &crate::model::Span) {
     );
 }
 
-/// E0198, which rustc's AST validation gives: from the `!` to the end of the trait's path.
-fn unsafe_negative(cx: &Cx<'_, '_>, at: &ImplAt) -> Vec<Found> {
-    let node = &at.node.value;
-    let (Some(excl), Some(unsafe_)) = (node.excl_token(), node.unsafe_token()) else {
-        return unresolved(cx, at.node.file_id, syntax::AstPtr::new(node), "an unsafe negative impl error");
-    };
-    let negative = cx.span(at.node.with_value(excl.text_range()));
-    let path_end = at.trait_path().map_or(negative.hi, |path| at.span_of(cx, &path).hi);
-    let span = negative.with_hi(path_end.max(negative.hi));
-    let mut diag = Diag::error(Some("E0198"), "negative impls cannot be unsafe", span);
-    diag.span_label(negative, "negative because of this");
-    diag.span_label(cx.span(at.node.with_value(unsafe_.text_range())), "unsafe because of this");
-    diag.fact(at.coherence(cx), "the header of the impl");
-    vec![Found::new(diag, Phase::Resolve)]
+/// Whether `d` of the impl `node` is one of AST validation's errors: an inherent impl (E0197
+/// of an `unsafe` one; hir has no other safety error of it) or an `unsafe` negative impl
+/// (E0198).
+fn validations(node: &syntax::ast::Impl, d: &hir::TraitImplIncorrectSafety) -> bool {
+    node.trait_().is_none() || d.should_be_safe && node.unsafe_token().is_some() && node.excl_token().is_some()
 }

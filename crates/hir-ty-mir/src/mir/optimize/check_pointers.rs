@@ -565,7 +565,7 @@ fn null_check<'db>(
 #[cfg(test)]
 mod tests {
     use super::{Lowered, lowered};
-    use crate::intrinsic::{AtomicOp, Intrinsic, SimdOp};
+    use crate::intrinsic::{AtomicOp, AtomicOrders, Intrinsic, SimdOp};
 
     #[test]
     fn what_lower_intrinsics_makes_of_each_intrinsic() {
@@ -585,7 +585,7 @@ mod tests {
             Intrinsic::Copy,
             Intrinsic::SizeOf,
             Intrinsic::VolatileLoad,
-            Intrinsic::Atomic(AtomicOp::Load),
+            Intrinsic::Atomic(AtomicOp::Load, AtomicOrders::Generic),
             Intrinsic::Simd(SimdOp::Add),
         ] {
             assert_eq!(lowered(kept), None, "{kept}");

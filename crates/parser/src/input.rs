@@ -4,44 +4,66 @@ use edition::Edition;
 
 use crate::SyntaxKind;
 
-#[allow(non_camel_case_types)]
-type bits = u64;
-
 /// Input for the parser -- a sequence of tokens.
 ///
 /// As of now, parser doesn't have access to the *text* of the tokens, and makes
 /// decisions based solely on their classification. Unlike `LexerToken`, the
 /// `Tokens` doesn't include whitespace and comments. Main input to the parser.
 ///
-/// Struct of arrays internally, but this shouldn't really matter.
+/// One `u32` word a token, the lexer's word family ([`crate::LexedStr`], the flat tree): the
+/// kind in the low [`KIND_BITS`] bits, then the contextual kind, the edition, whether the token
+/// is joint to the next and whether it starts a fragment a macro transcribed. 4 bytes a token
+/// against the 5.25 of five columns, and every question about a token is one load.
 pub struct Input {
-    kind: Vec<SyntaxKind>,
-    joint: Vec<bits>,
-    /// The tokens that start a fragment a macro transcribed, one whole to what follows it.
-    fragment: Vec<bits>,
-    contextual_kind: Vec<SyntaxKind>,
-    edition: Vec<Edition>,
+    words: Vec<u32>,
+}
+
+const KIND_BITS: u32 = 10;
+const KIND_MASK: u32 = (1 << KIND_BITS) - 1;
+const CONTEXTUAL_SHIFT: u32 = KIND_BITS;
+const EDITION_SHIFT: u32 = 2 * KIND_BITS;
+const EDITION_MASK: u32 = 0b111;
+const JOINT: u32 = 1 << (EDITION_SHIFT + 3);
+const FRAGMENT: u32 = JOINT << 1;
+
+const _: () = assert!((SyntaxKind::__LAST as u32) <= KIND_MASK, "a kind fits in KIND_BITS");
+const _: () = assert!((Edition::LATEST as u32) <= EDITION_MASK, "an edition fits in 3 bits");
+
+/// The word of a token of `kind` and `contextual_kind` in `edition`, neither joint nor a
+/// fragment's start.
+#[inline]
+const fn word(kind: SyntaxKind, contextual_kind: SyntaxKind, edition: Edition) -> u32 {
+    kind as u16 as u32
+        | (contextual_kind as u16 as u32) << CONTEXTUAL_SHIFT
+        | (edition as u32) << EDITION_SHIFT
 }
 
 /// `pub` impl used by callers to create `Tokens`.
 impl Input {
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            kind: Vec::with_capacity(capacity),
-            joint: Vec::with_capacity(capacity.div_ceil(bits::BITS as usize)),
-            fragment: Vec::with_capacity(capacity.div_ceil(bits::BITS as usize)),
-            contextual_kind: Vec::with_capacity(capacity),
-            edition: Vec::with_capacity(capacity),
-        }
+        Self { words: Vec::with_capacity(capacity) }
     }
+
+    /// Empties the input, keeping its buffer for the next one.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.words.clear();
+    }
+
+    /// Makes room for `additional` more tokens.
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.words.reserve(additional);
+    }
+
     #[inline]
     pub fn push(&mut self, kind: SyntaxKind, edition: Edition) {
-        self.push_impl(kind, SyntaxKind::EOF, edition)
+        self.words.push(word(kind, SyntaxKind::EOF, edition));
     }
     #[inline]
     pub fn push_ident(&mut self, contextual_kind: SyntaxKind, edition: Edition) {
-        self.push_impl(SyntaxKind::IDENT, contextual_kind, edition)
+        self.words.push(word(SyntaxKind::IDENT, contextual_kind, edition));
     }
     /// Sets jointness for the last token we've pushed.
     ///
@@ -61,59 +83,114 @@ impl Input {
     /// ```
     #[inline]
     pub fn was_joint(&mut self) {
-        let n = self.len() - 1;
-        let (idx, b_idx) = self.bit_index(n);
-        self.joint[idx] |= 1 << b_idx;
+        let last = self.words.last_mut().expect("`was_joint` after a token");
+        *last |= JOINT;
     }
     /// Marks token `n` as the first of a fragment that a macro transcribed (an `$e:expr`): as
     /// to rustc, the fragment is one operand, which nothing before it takes as its operator,
     /// call or index.
     #[inline]
     pub fn mark_fragment_start(&mut self, n: usize) {
-        let (idx, b_idx) = self.bit_index(n);
-        self.fragment[idx] |= 1 << b_idx;
-    }
-    #[inline]
-    fn push_impl(&mut self, kind: SyntaxKind, contextual_kind: SyntaxKind, edition: Edition) {
-        let idx = self.len();
-        if idx.is_multiple_of(bits::BITS as usize) {
-            self.joint.push(0);
-            self.fragment.push(0);
-        }
-        self.kind.push(kind);
-        self.contextual_kind.push(contextual_kind);
-        self.edition.push(edition);
+        self.words[n] |= FRAGMENT;
     }
 }
 
 /// pub(crate) impl used by the parser to consume `Tokens`.
 impl Input {
+    #[inline]
     pub(crate) fn kind(&self, idx: usize) -> SyntaxKind {
-        self.kind.get(idx).copied().unwrap_or(SyntaxKind::EOF)
+        match self.words.get(idx) {
+            Some(&word) => SyntaxKind::from((word & KIND_MASK) as u16),
+            None => SyntaxKind::EOF,
+        }
     }
+    #[inline]
     pub(crate) fn contextual_kind(&self, idx: usize) -> SyntaxKind {
-        self.contextual_kind.get(idx).copied().unwrap_or(SyntaxKind::EOF)
+        match self.words.get(idx) {
+            Some(&word) => SyntaxKind::from(((word >> CONTEXTUAL_SHIFT) & KIND_MASK) as u16),
+            None => SyntaxKind::EOF,
+        }
     }
+    #[inline]
     pub(crate) fn edition(&self, idx: usize) -> Edition {
-        self.edition[idx]
+        Edition::from_u32((self.words[idx] >> EDITION_SHIFT) & EDITION_MASK)
     }
+    #[inline]
     pub(crate) fn is_joint(&self, n: usize) -> bool {
-        let (idx, b_idx) = self.bit_index(n);
-        self.joint[idx] & (1 << b_idx) != 0
+        self.words.get(n).is_some_and(|&word| word & JOINT != 0)
     }
+    #[inline]
     pub(crate) fn is_fragment_start(&self, n: usize) -> bool {
-        let (idx, b_idx) = self.bit_index(n);
-        self.fragment.get(idx).is_some_and(|it| it & (1 << b_idx) != 0)
+        self.words.get(n).is_some_and(|&word| word & FRAGMENT != 0)
     }
 }
 
 impl Input {
-    fn bit_index(&self, n: usize) -> (usize, usize) {
-        let idx = n / (bits::BITS as usize);
-        let b_idx = n % (bits::BITS as usize);
-        (idx, b_idx)
-    }
+    #[inline]
     pub fn len(&self) -> usize {
-        self.kind.len()
+        self.words.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// Token `i` as the parser sees it: its kind, contextual kind, edition, whether it is
+    /// joint and whether it starts a fragment. For comparing inputs made two ways.
+    pub fn token(&self, i: usize) -> (SyntaxKind, SyntaxKind, Edition, bool, bool) {
+        (
+            self.kind(i),
+            self.contextual_kind(i),
+            self.edition(i),
+            self.is_joint(i),
+            self.is_fragment_start(i),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every field reads back what was written, for every kind, edition and flag, and no
+    /// field disturbs another.
+    #[test]
+    fn words_read_back_their_fields() {
+        let mut input = Input::with_capacity(0);
+        let mut expected = Vec::new();
+        for raw in 0..=(SyntaxKind::__LAST as u16) {
+            let kind = SyntaxKind::from(raw);
+            for edition in Edition::iter() {
+                let contextual = SyntaxKind::from(SyntaxKind::__LAST as u16 - raw);
+                let i = input.len();
+                let ident = raw % 3 == 0;
+                if ident {
+                    input.push_ident(contextual, edition);
+                } else {
+                    input.push(kind, edition);
+                }
+                let joint = raw % 2 == 0;
+                if joint {
+                    input.was_joint();
+                }
+                let fragment = raw % 5 == 0;
+                if fragment {
+                    input.mark_fragment_start(i);
+                }
+                expected.push(match ident {
+                    true => (SyntaxKind::IDENT, contextual, edition, joint, fragment),
+                    false => (kind, SyntaxKind::EOF, edition, joint, fragment),
+                });
+            }
+        }
+        for (i, expected) in expected.iter().enumerate() {
+            assert_eq!(input.token(i), *expected, "token {i}");
+        }
+        assert_eq!(input.kind(input.len()), SyntaxKind::EOF);
+        assert_eq!(input.contextual_kind(input.len() + 7), SyntaxKind::EOF);
+        assert!(!input.is_joint(input.len()) && !input.is_fragment_start(input.len()));
+        input.clear();
+        assert!(input.is_empty());
     }
 }

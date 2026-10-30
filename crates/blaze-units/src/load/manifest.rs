@@ -39,7 +39,7 @@ pub(crate) struct ManifestRead {
 }
 
 impl Versioned for ManifestRead {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo manifest read 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo manifest read 2");
 }
 
 pub(crate) struct ManifestQuery;
@@ -60,7 +60,7 @@ impl Query for ManifestQuery {
             Ok(config) => config,
             Err(error) => return Ok(Cbor(ManifestRead { snapshot: Snapshot::default(), read: Err(error) })),
         };
-        let fill = Fill { config: &key.config, own: Some(&key.path) };
+        let fill = Fill { config: &key.config, own: Some(&key.path), members: false };
         let path = PathBuf::from(&key.path);
         let (read, used) = run_over(cx, config.snapshot.clone(), &fill, |_, files| {
             Ok(read_one(&config, files, &path, key.source.as_deref()))
@@ -121,7 +121,7 @@ pub(crate) struct WorkspaceRead {
 }
 
 impl Versioned for Result<WorkspaceRead, LoadError> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo workspace read 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo workspace read 2");
 }
 
 pub(crate) struct WorkspaceQuery;
@@ -153,7 +153,7 @@ impl Query for WorkspaceQuery {
             },
             (None, ConfigOf::Fixed { .. }) => None,
         };
-        let fill = Fill { config: &key.config, own: None };
+        let fill = Fill { config: &key.config, own: None, members: true };
         let (found, used) = run_over(cx, config.snapshot.clone(), &fill, |_, files| {
             Ok(read_workspace(&config, files, manifest_path.as_deref()))
         })?;
@@ -253,8 +253,8 @@ pub(crate) fn replay<'db, R>(
     mut then: impl FnMut(&mut Cx<'db>, &Context, &Workspace<'_>, Rc<dyn Files>) -> Result<R, Cancelled>,
 ) -> Result<(Result<R, LoadError>, Snapshot), Cancelled> {
     let mut base = read.snapshot.clone();
-    base.merge(extra);
-    let fill = Fill { config: config_of, own: None };
+    base.merge(extra.clone());
+    let fill = Fill { config: config_of, own: None, members: true };
     run_over(cx, base, &fill, |cx, files| {
         let config = match super::config::build(&read.config, files.clone()) {
             Ok(config) => config,

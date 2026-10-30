@@ -5,10 +5,9 @@
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
-use blaze_resolve::PackageId;
 use blaze_units::load::{ResolveAsk, Resolving, ViewResolved, load_error, platform_cfg, resolve_view};
 use blaze_units::query::{Cbor, Fetch, LoadError, Versioned, key_input, producer};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{DepKind, DisplayDepth, EdgeKind, Input, Kinds, Options, Packages, Platformed, Prefix, Target};
@@ -160,23 +159,6 @@ fn print_view(view: &ViewResolved<'_>, opts: &Options) -> Result<(String, Vec<St
         host: platformed(view.host, targets.first().map(String::as_str))?,
         targets: targets.iter().map(|it| platformed(it, Some(it))).collect::<Result<_, _>>()?,
     };
-    let packages: FxHashMap<PackageId, blaze_metadata::Read> = view
-        .reads
-        .iter()
-        .map(|(id, it)| {
-            let read = blaze_metadata::Read {
-                summary: it.summary.clone(),
-                lib: it.lib,
-                proc_macro_lib: it.proc_macro_lib,
-                any_proc_macro: it.any_proc_macro,
-                build_script: it.build_script,
-                bins: it.bins.clone(),
-                license: it.license.clone(),
-                repository: it.repository.clone(),
-            };
-            (*id, read)
-        })
-        .collect();
     let input = Input {
         resolve: view.resolve,
         members: view.members,
@@ -185,7 +167,7 @@ fn print_view(view: &ViewResolved<'_>, opts: &Options) -> Result<(String, Vec<St
         cli_features: view.cli_features,
         behavior: view.behavior,
         unification: view.unification,
-        packages: &packages,
+        packages: view.reads,
     };
     let mut out = String::new();
     let mut warnings = view.warnings.to_vec();

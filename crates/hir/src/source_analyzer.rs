@@ -434,7 +434,7 @@ impl<'db> SourceAnalyzer<'db> {
 
     fn binding_id_of_pat(&self, pat: &ast::IdentPat) -> Option<BindingId> {
         let pat_id = self.pat_id(&pat.clone().into())?;
-        if let Pat::Bind { id, .. } = self.store()?[pat_id.as_pat()?] { Some(id) } else { None }
+        if let Pat::Bind { id, .. } = self.store()?.pat(pat_id.as_pat()?) { Some(id) } else { None }
     }
 
     pub(crate) fn expr_adjustments(&self, expr: &ast::Expr) -> Option<&[Adjustment]> {
@@ -522,7 +522,7 @@ impl<'db> SourceAnalyzer<'db> {
         if infer.type_of_expr_or_pat(expr_id).is_some_and(|ty| ty.is_never()) {
             true
         } else if let ExprOrPatId::ExprId(expr_id) = expr_id
-            && let Expr::Block { tail: Some(tail), .. } = store[expr_id]
+            && let Expr::Block { tail: Some(tail), .. } = store.expr(expr_id)
         {
             self.expr_id_is_diverging(store, infer, tail.into())
         } else {
@@ -704,7 +704,7 @@ impl<'db> SourceAnalyzer<'db> {
         _db: &'db dyn HirDatabase,
     ) -> Option<GenericSubstitution<'db>> {
         let body = self.store()?;
-        if let Expr::Field { expr: object_expr, name: _ } = body[field_expr] {
+        if let Expr::Field { expr: object_expr, name: _ } = body.expr(field_expr) {
             let (adt, subst) = infer.type_of_expr_with_adjust(object_expr)?.as_adt()?;
             return Some(GenericSubstitution::new(adt.into(), subst, self.type_owner));
         }
@@ -1048,11 +1048,11 @@ impl<'db> SourceAnalyzer<'db> {
         let store = self.store()?;
 
         let path = match expr_or_pat_id {
-            ExprOrPatId::ExprId(idx) => match &store[idx] {
+            ExprOrPatId::ExprId(idx) => match store.expr(idx) {
                 Expr::Path(path) => path,
                 _ => return None,
             },
-            ExprOrPatId::PatId(idx) => match &store[idx] {
+            ExprOrPatId::PatId(idx) => match store.pat(idx) {
                 Pat::Path(path) => path,
                 _ => return None,
             },
@@ -1516,7 +1516,7 @@ impl<'db> SourceAnalyzer<'db> {
         let expr_id = self.expr_id(literal.clone().into())?.as_expr()?;
         let substs = infer.expr_ty(expr_id).as_adt()?.1;
         let (variant, missing_fields) =
-            record_literal_missing_fields(db, infer, expr_id, &body[expr_id])?;
+            record_literal_missing_fields(db, infer, expr_id, body.expr(expr_id))?;
         let res = self.missing_fields(db, substs, variant, missing_fields);
         Some(res)
     }
@@ -1532,7 +1532,7 @@ impl<'db> SourceAnalyzer<'db> {
         let expr_id = self.expr_id(literal.clone().into())?.as_expr()?;
         let substs = infer.expr_ty(expr_id).as_adt()?.1;
         let (variant, matched_fields) =
-            record_literal_matched_fields(db, infer, expr_id, &body[expr_id])?;
+            record_literal_matched_fields(db, infer, expr_id, body.expr(expr_id))?;
 
         let res = self.missing_fields(db, substs, variant, matched_fields);
         Some(res)
@@ -1550,7 +1550,7 @@ impl<'db> SourceAnalyzer<'db> {
         let substs = infer.pat_ty(pat_id).as_adt()?.1;
 
         let (variant, missing_fields) =
-            record_pattern_missing_fields(db, infer, pat_id, &body[pat_id])?;
+            record_pattern_missing_fields(db, infer, pat_id, body.pat(pat_id))?;
         let res = self.missing_fields(db, substs, variant, missing_fields);
         Some(res)
     }
@@ -1567,7 +1567,7 @@ impl<'db> SourceAnalyzer<'db> {
         let substs = infer.pat_ty(pat_id).as_adt()?.1;
 
         let (variant, matched_fields) =
-            record_pattern_matched_fields(db, infer, pat_id, &body[pat_id])?;
+            record_pattern_matched_fields(db, infer, pat_id, body.pat(pat_id))?;
         let res = self.missing_fields(db, substs, variant, matched_fields);
         Some(res)
     }
@@ -2177,7 +2177,7 @@ fn record_literal_matched_fields(
     db: &dyn HirDatabase,
     infer: &InferenceResult<'_>,
     id: ExprId,
-    expr: &Expr,
+    expr: Expr<'_>,
 ) -> Option<(VariantId, Vec<LocalFieldId>)> {
     let (fields, _spread) = match expr {
         Expr::RecordLit { fields, spread, .. } => (fields, spread),
@@ -2209,10 +2209,10 @@ fn record_pattern_matched_fields(
     db: &dyn HirDatabase,
     infer: &InferenceResult<'_>,
     id: PatId,
-    pat: &Pat,
+    pat: Pat<'_>,
 ) -> Option<(VariantId, Vec<LocalFieldId>)> {
     let (fields, _ellipsis) = match pat {
-        Pat::Record { path: _, args, ellipsis } => (args, *ellipsis),
+        Pat::Record { path: _, args, ellipsis } => (args, ellipsis),
         _ => return None,
     };
 

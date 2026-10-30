@@ -14,6 +14,10 @@
 //! Cost: a pass reads and writes each element once, plus a prefix sum of 256 or 2048 counters
 //! per chunk; the scratch is one buffer the size of the input (for [`sort_by_key`], of
 //! `(key, u32)` pairs, then one swap per misplaced item).
+//!
+//! A leaf crate with no dependencies: `blaze-core`, which the model checker `blaze-check`
+//! depends on, uses it, so it can depend on nothing that takes `blaze-check`
+//! (docs/v2/plan/lanes/safety/model.md). `blaze-ids` re-exports it as `blaze_ids::radix`.
 
 use std::{
     ops::Range,

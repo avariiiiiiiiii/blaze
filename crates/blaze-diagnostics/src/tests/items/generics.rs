@@ -1,8 +1,9 @@
 //! rustc's UI tests of the errors of generic arguments and placeholders in signatures: counts
 //! (E0107), order (E0747), arguments on segments that take none (E0109), elided lifetimes in
 //! paths (E0726), `Self` in defaults (E0735), `_` in item signatures (E0121), return type
-//! notation out of place, patterns in foreign functions (E0130) and items without bodies. Each
-//! test's file is the UI test's source byte for byte.
+//! notation out of place. Each test's file is the UI test's source byte for byte. Patterns in
+//! foreign functions (E0130) and items without bodies are AST validation's
+//! (`tests/items/ast_validation.rs`).
 
 use crate::tests::{items::ui_core, ui};
 
@@ -498,102 +499,4 @@ error: aborting due to 2 previous errors
 
 "#;
     assert_eq!(ui_core("bare-path.rs", "2015", "send, sized", source), stderr);
-}
-
-#[test]
-fn a_pattern_in_a_foreign_function() {
-    // tests/ui/error-codes/E0130.rs
-    let source = r#"extern "C" {
-    fn foo((a, b): (u32, u32));
-//~^ ERROR E0130
-}
-
-fn main() {}
-"#;
-    let stderr = r#"error[E0130]: patterns aren't allowed in foreign function declarations
-  --> $DIR/E0130.rs:2:12
-   |
-LL |     fn foo((a, b): (u32, u32));
-   |            ^^^^^^ pattern not allowed in foreign function
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0130`.
-"#;
-    assert_eq!(ui("E0130.rs", "2015", source), stderr);
-}
-
-#[test]
-fn free_statics_without_bodies() {
-    // tests/ui/parser/item-free-static-no-body-semantic-fail.rs
-    let source = r#"// Semantically, a free `static` item cannot omit its body.
-
-fn main() {}
-
-static A: u8; //~ ERROR free static item without body
-static B; //~ ERROR free static item without body
-//~^ ERROR missing type for `static` item
-
-static mut C: u8; //~ ERROR free static item without body
-static mut D; //~ ERROR free static item without body
-//~^ ERROR missing type for `static mut` item
-"#;
-    let stderr = r#"error: free static item without body
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:5:1
-   |
-LL | static A: u8;
-   | ^^^^^^^^^^^^-
-   |             |
-   |             help: provide a definition for the static: `= <expr>;`
-
-error: free static item without body
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:6:1
-   |
-LL | static B;
-   | ^^^^^^^^-
-   |         |
-   |         help: provide a definition for the static: `= <expr>;`
-
-error: free static item without body
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:9:1
-   |
-LL | static mut C: u8;
-   | ^^^^^^^^^^^^^^^^-
-   |                 |
-   |                 help: provide a definition for the static: `= <expr>;`
-
-error: free static item without body
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:10:1
-   |
-LL | static mut D;
-   | ^^^^^^^^^^^^-
-   |             |
-   |             help: provide a definition for the static: `= <expr>;`
-
-error: missing type for `static` item
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:6:9
-   |
-LL | static B;
-   |         ^
-   |
-help: provide a type for the item
-   |
-LL | static B: <type>;
-   |         ++++++++
-
-error: missing type for `static mut` item
-  --> $DIR/item-free-static-no-body-semantic-fail.rs:10:13
-   |
-LL | static mut D;
-   |             ^
-   |
-help: provide a type for the item
-   |
-LL | static mut D: <type>;
-   |             ++++++++
-
-error: aborting due to 6 previous errors
-
-"#;
-    assert_eq!(ui("item-free-static-no-body-semantic-fail.rs", "2015", source), stderr);
 }

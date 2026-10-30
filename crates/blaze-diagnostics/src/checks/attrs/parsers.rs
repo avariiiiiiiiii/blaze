@@ -39,7 +39,7 @@ use super::{
 };
 use crate::{
     cx::Cx,
-    lints::syntax::attrs::{Attr, Owner, Target},
+    lints::syntax::attrs::{Attr, Owner, Target, table::index},
     model::{Diag, Span},
 };
 
@@ -81,21 +81,40 @@ pub(crate) enum Module {
 }
 
 pub(crate) fn module(path: &[&str]) -> Option<Module> {
-    let is = |paths: &[&[&str]]| paths.contains(&path);
-    if is(codegen::PATHS) {
-        Some(Module::Codegen)
-    } else if is(stability::PATHS) {
-        Some(Module::Stability)
-    } else if is(internal::PATHS) {
-        Some(Module::Internal)
-    } else if is(misc::PATHS) {
-        Some(Module::Misc)
-    } else if is(doc::PATHS) {
-        Some(Module::Doc)
-    } else {
-        None
-    }
+    MODULES[index::of(path)?]
 }
+
+/// Each module's paths, in the order a path is looked for in them.
+const TAKES: [(&[&[&str]], Module); 5] = [
+    (codegen::PATHS, Module::Codegen),
+    (stability::PATHS, Module::Stability),
+    (internal::PATHS, Module::Internal),
+    (misc::PATHS, Module::Misc),
+    (doc::PATHS, Module::Doc),
+];
+
+/// The module of each builtin parser, by its number: the first of [`TAKES`] with its path.
+static MODULES: [Option<Module>; index::COUNT] = {
+    let mut out = [None; index::COUNT];
+    let mut at = 0;
+    while at < index::COUNT {
+        let mut module = 0;
+        while module < TAKES.len() && out[at].is_none() {
+            let (paths, takes) = TAKES[module];
+            let mut i = 0;
+            while i < paths.len() {
+                if index::same_path(paths[i], index::path(at)) {
+                    out[at] = Some(takes);
+                    break;
+                }
+                i += 1;
+            }
+            module += 1;
+        }
+        at += 1;
+    }
+    out
+};
 
 /// The parser of the attribute `cx.attr`, whose path is `cx.builtin.path`, given its arguments.
 pub(crate) fn accept(node: &mut Node, module: Module, cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Accepted {
@@ -192,7 +211,7 @@ impl<'a, 'c, 'db> Finalize<'a, 'c, 'db> {
     /// rustc's `feature_err(..).emit()` of `feature` at `span`, unless the crate enables it.
     pub(crate) fn gate(&mut self, feature: &str, span: Span, explain: impl Into<String>) {
         if !self.feature(feature) {
-            let diag = self.session.feature_err(self.cx, feature, span, explain);
+            let diag = self.session.feature_err(feature, span, explain);
             self.emit_err(diag);
         }
     }
@@ -279,6 +298,25 @@ mod tests {
             for path in paths {
                 assert!(table::builtin(path).is_some(), "{path:?} is not a builtin parser's path");
             }
+        }
+    }
+
+    fn by_scan(path: &[&str]) -> Option<super::Module> {
+        super::TAKES.iter().find(|(paths, _)| paths.contains(&path)).map(|(_, module)| *module)
+    }
+
+    #[test]
+    fn modules_are_as_by_a_scan() {
+        let mut paths: Vec<Vec<&str>> = table::builtins().iter().map(|it| it.path.to_vec()).collect();
+        for (module_paths, _) in super::TAKES {
+            paths.extend(module_paths.iter().map(|it| it.to_vec()));
+        }
+        paths.extend([vec![], vec!["diagnostic"], vec!["no_such_attribute"], vec!["inline", "x"], vec!["Inline"]]);
+        for path in &paths {
+            assert_eq!(super::module(path), by_scan(path), "{path:?}");
+        }
+        for builtin in table::builtins() {
+            assert!(super::module(builtin.path).is_some(), "{:?}", builtin.path);
         }
     }
 }

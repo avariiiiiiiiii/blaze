@@ -26,6 +26,21 @@ checklist every agent writes to is in
 [Fast code, line by line](#fast-code-line-by-line) below. Code that is correct but slow isn't
 finished.
 
+**Within 10% of the theoretical maximum, everywhere.** Every component has a speed of light,
+the bound physics and the work itself set. Each part of v2 is designed to come within 10% of
+it. Typical bounds:
+- **memory-bound work:** bytes touched divided by memory bandwidth;
+- **compute-bound work:** instructions needed divided by instructions per cycle times cores;
+- **I/O:** bytes divided by device bandwidth, with syscalls batched to the minimum;
+- **a build:** the larger of total work divided by cores and the critical path;
+- **an edit:** recomputing only what changed, plus the fixed latency of each stage.
+
+Each lane writes its components' bounds, with the arithmetic, in its notes
+(`docs/v2/plan/lanes/<lane>/speed-of-light.md`), and how its design reaches 90% of each. Where
+it can't, the notes say what stands in the way and what would remove it. `proof`'s budgets
+measure every component against its bound once things compile, and a component more than 10%
+off its bound is a bug.
+
 **State of the art in every part.** Each component matches or beats the fastest known way to do
 its job, and its lane names that benchmark in its notes. For example: the linker against mold
 and wild, hashing against BLAKE3's SIMD paths, the store against content-addressed stores with

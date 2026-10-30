@@ -486,6 +486,7 @@ impl Gen {
             11 if self.plain => Response::Done { ok: self.yes() },
             11 => Response::Why(self.why()),
             12 => Response::Status(Status {
+                pid: self.u32(),
                 views: self.u32(),
                 requests: self.many(depth, Gen::wide),
                 budget_bytes: self.wide(),

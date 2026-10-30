@@ -8,13 +8,13 @@ use blaze_codegen::{
     Arch, Backend, CodegenError, CompiledFunction, Compile, Static, Unit,
     backend::{Emitted, FrontRef, Import, Prepare, Shape},
     fold::{Group, Masked, Merged},
-    settings::{DebugInfo, Relocation, Spec},
+    settings::{DebugInfo, Relocation, Sanitizers, Spec},
     summary::{Imports, Summary},
     template::Refs,
 };
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
-use blaze_items::{CodeHash, ItemKey};
+use blaze_items::{CodeHash, ItemId, ItemKey};
 use cranelift_codegen::{ir, isa::TargetIsa};
 use hir_def::{
     DefWithBodyId, HasModule,
@@ -105,6 +105,13 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
             "target features {:?}: the IR builder's Cranelift has the target's baseline only",
             toolchain.features
         )));
+    }
+    if spec.backend == Backend::Cranelift && !spec.sanitize.is_empty() {
+        return Err(fail(
+            "-Zsanitizer and SanitizerCoverage are instrumented by the LLVM back end \
+             (Backend::Llvm), which this unit is not compiled by"
+                .to_owned(),
+        ));
     }
     if toolchain.frame_pointers != crate::backend::frame_pointers() {
         return Err(fail(format!(
@@ -211,6 +218,7 @@ impl Backends<'_> {
             scopes,
             inlined,
             hint: hint(db, instance),
+            unsanitized: unsanitized(db, spec, instance).map_err(fail)?,
             release: Default::default(),
             foldable: foldable(db, instance),
         };
@@ -248,6 +256,42 @@ fn hint(db: &dyn HirDatabase, instance: &HirInstance) -> Hint {
     } else {
         Hint::None
     }
+}
+
+/// Which of `spec`'s sanitizers are off for the instance. As rustc's `codegen_instance_attrs`,
+/// a shim has the `#[sanitize]` of the item it is of ([`super::frontend::item_of`]), a
+/// closure its function's; the C `main` and the allocator shim are no item and have none
+/// off. SanitizerCoverage is off for a `__sanitizer_*` symbol, which its pass skips by name
+/// in rustc's build and which here it would otherwise trace.
+fn unsanitized(
+    db: &dyn HirDatabase,
+    spec: &Spec,
+    instance: &HirInstance,
+) -> Result<Sanitizers, String> {
+    let sanitize = &spec.sanitize;
+    if sanitize.is_empty() {
+        return Ok(Sanitizers::NONE);
+    }
+    let off = match &instance.0 {
+        Kind::Code(..) => match super::frontend::item_of(db, &instance.0)? {
+            ItemId::Function(func) => hir_def::attrs::disabled_sanitizers(db, func),
+            other => {
+                return Err(format!(
+                    "the `#[sanitize]` of {other:?}, which is no function: db's \
+                     `disabled_sanitizers` takes a function"
+                ));
+            }
+        },
+        Kind::Start(_) | Kind::Allocator(_) | Kind::Asm(_) => 0,
+    };
+    let mut unsanitized = Sanitizers(off & sanitize.sanitizers.0);
+    let callback = || {
+        super::frontend::symbol_of(db, &instance.0).is_some_and(|it| it.starts_with("__sanitizer_"))
+    };
+    if sanitize.coverage.is_on() && callback() {
+        unsanitized = unsanitized.union(Sanitizers::COVERAGE);
+    }
+    Ok(unsanitized)
 }
 
 /// Whether a fold may give the instance another's code: its address is no symbol's, and it

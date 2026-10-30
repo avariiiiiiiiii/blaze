@@ -407,6 +407,13 @@ impl Iocp {
                 self.put(request);
                 Ok(())
             }
+            Effect::Flush { watch, .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "flushing the watch {watch:?}: ReadDirectoryChangesW has no barrier that says \
+                     every change made before it has been read, so a watch on Windows vouches for nothing"
+                ),
+            )),
             Effect::Spawn { command, tag } => self.spawn(command, tag),
             Effect::Listen { at, tag } => self.listen(at, tag),
             Effect::Connect { at, tag } => self.connect(at, tag),
@@ -1477,6 +1484,16 @@ mod tests {
         assert!(ended, "the watch never ended; heard {heard:?}");
         assert!(heard.iter().all(|it| it.is_under(&name("src"))), "{heard:?}");
         run(&mut driver, Vec::new());
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_flush_fails_naming_why() {
+        let root = dir("flush");
+        let mut driver = Iocp::new(&root, 1).unwrap();
+        let seen = run(&mut driver, vec![Effect::Flush { watch: Tag(7), tag: Tag(8) }]);
+        assert!(matches!(&seen[&8], Done::Failed(why) if why.0.contains("no barrier")), "{seen:?}");
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }

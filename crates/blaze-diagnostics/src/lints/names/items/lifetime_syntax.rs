@@ -467,10 +467,7 @@ fn source_of(lifetime: &SyntaxNode) -> Option<Source> {
 }
 
 fn syntax_of(lifetime: &ast::Lifetime) -> Syntax {
-    match lifetime.text() == "'_" {
-        true => Syntax::ExplicitAnonymous,
-        false => Syntax::ExplicitBound,
-    }
+    if lifetime.text() == "'_" { Syntax::ExplicitAnonymous } else { Syntax::ExplicitBound }
 }
 
 /// rustc's `emit_mismatch_diagnostic` of one group.

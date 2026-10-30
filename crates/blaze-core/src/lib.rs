@@ -26,6 +26,7 @@ mod fs;
 mod fsevents;
 #[cfg(windows)]
 pub mod iocp;
+mod journal;
 #[cfg(target_os = "macos")]
 pub mod kqueue;
 #[cfg(unix)]
@@ -41,6 +42,8 @@ mod watch;
 pub mod wheel;
 
 use std::{fmt, time::Duration};
+
+pub use crate::journal::{Cursor, Journaled, Lost, Names, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stamp};
 
 /// Makes the sandbox of a process: given to a driver by whoever owns the platform's sandbox
 /// (`blaze-usercode`), so the driver starts what it says in place of the program. A driver
@@ -146,9 +149,35 @@ pub enum Effect {
     /// Completes with [`Done::Changed`] each time files under `dir` change, until an
     /// [`Effect::Unwatch`] of the same tag, which ends it with [`Done::Unwatched`], or a
     /// [`Done::Failed`], which ends it too. It is in flight until it ends; an unwatch has no
-    /// completion of its own but the watch's end.
+    /// completion of its own but the watch's end. A change that names `dir` itself says the
+    /// directory may have been replaced or moved (inotify, which watches an inode, says so of
+    /// an overflow too): a watcher that must hear of every later change watches again.
     Watch { dir: FileName, tag: Tag },
+    /// A watch of `dir` that starts where `since` left the system's journal of changes
+    /// (docs/v2/plan/design/restore.md): it completes with [`Done::Journaled`] for the changes
+    /// made since then, one with `caught_up` once they are all told, then for each change
+    /// made after, until an [`Effect::Unwatch`] of the same tag ends it with
+    /// [`Done::Unwatched`] or a [`Done::Failed`] does. [`Cursor::None`] starts now, its first
+    /// batch naming where the journal is. Changes it cannot name are a
+    /// [`Lost`] subtree, never left out: the cursor saved from a batch is never past a change
+    /// not in it or an earlier one.
+    Journal { dir: FileName, since: Cursor, tag: Tag },
     Unwatch { tag: Tag },
+    /// Each file's [`Stamp`], in order, as one batch the driver runs as many at once as it
+    /// can (io_uring: `IORING_OP_STATX`, thousands in flight). A symlink is stamped itself, not
+    /// followed; a name that is not there is [`Stamp::GONE`]. Completes with
+    /// [`Done::Stamped`]; it fails only as a whole, never for one name.
+    Stamp { files: Names, tag: Tag },
+    /// What is directly in `dir`, each name with its [`Stamp`], sorted by name; completes with
+    /// [`Done::Entries`]. A `dir` that is not there, or not a directory, fails.
+    Entries { dir: FileName, tag: Tag },
+    /// Completes with [`Done::Flushed`] once every change the system had queued for the watch
+    /// `watch` when this was asked has been told as that watch's [`Done::Changed`], before
+    /// this completion: what a watcher reads after it has seen every change made before the
+    /// flush. A change the system made after may be told before it or after. Fails for a
+    /// watch not in flight, and where watches have no barrier (naming why); a watch that ends
+    /// first fails it.
+    Flush { watch: Tag, tag: Tag },
     /// Completes once `after` has passed.
     Timer { after: Duration, tag: Tag },
     /// The whole file mapped read-only into memory, shared with every other mapping of it
@@ -200,7 +229,11 @@ impl Effect {
             | Effect::Stat { tag, .. }
             | Effect::Remove { tag, .. }
             | Effect::Watch { tag, .. }
+            | Effect::Journal { tag, .. }
             | Effect::Unwatch { tag }
+            | Effect::Stamp { tag, .. }
+            | Effect::Entries { tag, .. }
+            | Effect::Flush { tag, .. }
             | Effect::Timer { tag, .. }
             | Effect::Map { tag, .. }
             | Effect::Spawn { tag, .. }
@@ -356,7 +389,15 @@ pub enum Done {
     /// the system dropped changes (its queue overflowed), so whoever watches must look at the
     /// whole directory again: the names are not all of them.
     Changed { files: Vec<FileName>, lost: bool },
+    /// What an [`Effect::Journal`] heard.
+    Journaled(Box<Journaled>),
+    /// Of an [`Effect::Stamp`]: one per name, in its order.
+    Stamped(Vec<Stamp>),
+    /// Of an [`Effect::Entries`]: each name under the root, sorted.
+    Entries(Vec<(FileName, Stamp)>),
     Unwatched,
+    /// Of an [`Effect::Flush`]: the watch's changes queued when it was asked are all told.
+    Flushed,
     Fired,
     Mapped(Mapping),
     Exited(Box<Exit>),

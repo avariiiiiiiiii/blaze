@@ -1,8 +1,10 @@
 //! Compute the binary representation of a type
 
-use std::{cell::OnceCell, fmt};
+use std::{cell::OnceCell, fmt, ops::Deref, sync::LazyLock};
 
 use base_db::Crate;
+use blaze_hashcons::{Consed, HashCons, Interned};
+use blaze_ids::{Domain, Hasher};
 use hir_def::{
     AdtId, EnumId, EnumVariantId, LocalFieldId, StructId, VariantId,
     attrs::AttrFlags,
@@ -22,7 +24,6 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
-use triomphe::Arc;
 
 use crate::{
     ParamEnvAndCrate,
@@ -77,6 +78,49 @@ impl rustc_index::Idx for RustcFieldIdx {
 pub type Layout = LayoutData<RustcFieldIdx, RustcEnumVariantIdx>;
 pub type TagEncoding = hir_def::layout::TagEncoding<RustcEnumVariantIdx>;
 pub type Variants = hir_def::layout::Variants<RustcFieldIdx, RustcEnumVariantIdx>;
+
+/// A layout as the layout queries return it: hash-consed in [`LAYOUTS`], as rustc interns
+/// `Layout<'tcx>`, so equal layouts are kept once, a read is a pointer copy, equality is a
+/// pointer compare and the fingerprint salsa backdates by is computed once. A newtype because
+/// [`Layout`] is `rustc_abi`'s.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InternedLayout(pub Layout);
+
+impl Deref for InternedLayout {
+    type Target = Layout;
+
+    fn deref(&self) -> &Layout {
+        &self.0
+    }
+}
+
+impl AsRef<Layout> for InternedLayout {
+    fn as_ref(&self) -> &Layout {
+        &self.0
+    }
+}
+
+static LAYOUT_DOMAIN: Domain = Domain::new("blaze v2 layout 1");
+
+impl Consed for InternedLayout {
+    fn domain() -> &'static Domain {
+        &LAYOUT_DOMAIN
+    }
+
+    /// `LayoutData`'s `Hash` is derived, as its `Eq` is, and writes no address.
+    fn hash_content(&self, hasher: &mut Hasher) {
+        blaze_hashcons::hash_std(&self.0, hasher)
+    }
+}
+
+/// Every layout of the process, never freed, as `crates/intern`'s tables are: a handle stays
+/// valid in every revision and every database.
+static LAYOUTS: LazyLock<HashCons<InternedLayout>> = LazyLock::new(HashCons::new);
+
+/// The one handle of `layout`.
+pub fn intern_layout(layout: Layout) -> Interned<'static, InternedLayout> {
+    LAYOUTS.intern(InternedLayout(layout))
+}
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum LayoutError {
@@ -177,7 +221,7 @@ fn layout_of_simd_ty<'db>(
     args: &GenericArgs<'db>,
     env: ParamEnvAndCrate<'db>,
     dl: &TargetDataLayout,
-) -> Result<Arc<Layout>, LayoutError> {
+) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     // Supported SIMD vectors are homogeneous ADTs with exactly one array field:
     //
     // * #[repr(simd)] struct S([T; 4])
@@ -197,7 +241,7 @@ fn layout_of_simd_ty<'db>(
     let e_ly = db.layout_of_ty(e_ty.store(), env.store())?;
 
     let cx = LayoutCx::new(dl);
-    Ok(Arc::new(cx.calc.layout_of_simd_type(e_ly, e_len, repr_packed)?))
+    Ok(intern_layout(cx.calc.layout_of_simd_type(e_ly.get(), e_len, repr_packed)?))
 }
 
 /// A `#[rustc_scalable_vector(N)] struct S(T)` or a `#[rustc_scalable_vector] struct Sx2(S, S)` of
@@ -209,7 +253,7 @@ fn layout_of_scalable_vector_ty<'db>(
     args: &GenericArgs<'db>,
     env: ParamEnvAndCrate<'db>,
     dl: &TargetDataLayout,
-) -> Result<Arc<Layout>, LayoutError> {
+) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     let interner = DbInterner::new_no_crate(db);
     let only_field = |id: StructId| -> Result<Vec<Ty<'db>>, LayoutError> {
         let fields = db.field_types(id.into());
@@ -242,8 +286,8 @@ fn layout_of_scalable_vector_ty<'db>(
     };
     let element = db.layout_of_ty(element.store(), env.store())?;
     let cx = LayoutCx::new(dl);
-    Ok(Arc::new(cx.calc.layout_of_scalable_vector_type(
-        element,
+    Ok(intern_layout(cx.calc.layout_of_scalable_vector_type(
+        element.get(),
         u64::from(count),
         number_of_vectors,
     )?))
@@ -255,16 +299,16 @@ pub(crate) fn field_layout<'db>(
     db: &'db dyn HirDatabase,
     ty: StoredTy,
     env: StoredParamEnvAndCrate,
-) -> Result<Arc<Layout>, LayoutError> {
-    let layout = db.layout_of_ty(ty, env)?;
+) -> Result<&'static Layout, LayoutError> {
+    let layout = db.layout_of_ty(ty, env)?.get();
     if let BackendRepr::SimdScalableVector { .. } = layout.backend_repr {
         return Err(LayoutError::ScalableVectorField);
     }
-    Ok(layout)
+    Ok(&layout.0)
 }
 
 /// Whether `deeply_normalize` can change `ty`: its folder gives back as it is any type without
-/// an alias or a `ConstKind::Unevaluated` in it, which is what `HAS_ALIAS` flags.
+/// an alias or a `ConstKind::Alias` in it, which is what `HAS_ALIAS` flags.
 fn needs_normalizing(ty: Ty<'_>) -> bool {
     ty.has_aliases()
 }
@@ -313,17 +357,16 @@ fn univariant<'db>(
 ) -> Result<Layout, LayoutError> {
     let fields = tys
         .map(|ty| field_layout(db, ty.store(), trait_env.clone()))
-        .collect::<Result<SmallVec<[Arc<Layout>; FIELDS_INLINE]>, _>>()?;
+        .collect::<Result<SmallVec<[&Layout; FIELDS_INLINE]>, _>>()?;
     univariant_of(cx, &fields, kind)
 }
 
 fn univariant_of(
     cx: &LayoutCx<'_>,
-    fields: &[Arc<Layout>],
+    fields: &[&Layout],
     kind: StructKind,
 ) -> Result<Layout, LayoutError> {
-    let refs: SmallVec<[&Layout; FIELDS_INLINE]> = fields.iter().map(|it| &**it).collect();
-    let fields: SmallVec<[&&Layout; FIELDS_INLINE]> = refs.iter().collect();
+    let fields: SmallVec<[&&Layout; FIELDS_INLINE]> = fields.iter().collect();
     Ok(cx.calc.layout_of_univariant(
         IndexSlice::<RustcFieldIdx, _>::from_raw(&fields),
         &ReprOptions::default(),
@@ -336,7 +379,7 @@ pub fn layout_of_ty_query(
     db: &dyn HirDatabase,
     ty: StoredTy,
     trait_env: StoredParamEnvAndCrate,
-) -> Result<Arc<Layout>, LayoutError> {
+) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     let krate = trait_env.krate;
     let Ok(target) = db.target_data_layout(krate) else {
         return Err(LayoutError::TargetLayoutNotAvailable);
@@ -442,11 +485,11 @@ pub fn layout_of_ty_query(
         TyKind::Array(element, count) => {
             let count = try_const_usize(db, count).ok_or(LayoutError::HasErrorConst)? as u64;
             let element = field_layout(db, element.store(), trait_env)?;
-            cx.calc.layout_of_array_like::<_, _, ()>(&element, Some(count))?
+            cx.calc.layout_of_array_like::<_, _, ()>(element, Some(count))?
         }
         TyKind::Slice(element) => {
             let element = field_layout(db, element.store(), trait_env)?;
-            cx.calc.layout_of_array_like::<_, _, ()>(&element, None)?
+            cx.calc.layout_of_array_like::<_, _, ()>(element, None)?
         }
         TyKind::Str => {
             let element = scalar_unit(dl, Primitive::Int(Integer::I8, false));
@@ -490,7 +533,7 @@ pub fn layout_of_ty_query(
                 }
                 _ => {
                     // pointee is sized
-                    return Ok(Arc::new(Layout::scalar(dl, data_ptr)));
+                    return Ok(intern_layout(Layout::scalar(dl, data_ptr)));
                 }
             };
 
@@ -551,8 +594,7 @@ pub fn layout_of_ty_query(
                     Ok(layout)
                 })
                 .collect::<Result<Vec<_>, LayoutError>>()?;
-            let prefix: SmallVec<[&Layout; FIELDS_INLINE]> = upvars.iter().map(|it| &**it).collect();
-            let prefix = prefix.iter().collect::<IndexVec<RustcFieldIdx, _>>();
+            let prefix = upvars.iter().collect::<IndexVec<RustcFieldIdx, _>>();
             let locals = locals.iter().collect::<SmallVec<[&Layout; FIELDS_INLINE]>>();
             let locals = locals.iter().collect::<SmallVec<[&&Layout; FIELDS_INLINE]>>();
             let locals = IndexSlice::<usize, _>::from_raw(&locals);
@@ -577,7 +619,7 @@ pub fn layout_of_ty_query(
         }
 
         TyKind::Pat(ty, pat) => {
-            let mut layout = (*db.layout_of_ty(ty.store(), trait_env.clone())?).clone();
+            let mut layout = db.layout_of_ty(ty.store(), trait_env.clone())?.0.clone();
             match pat.kind() {
                 PatternKind::Range { start, end } => {
                     if let BackendRepr::Scalar(scalar) = &mut layout.backend_repr {
@@ -727,7 +769,7 @@ pub fn layout_of_ty_query(
             return Err(LayoutError::HasPlaceholder);
         }
     };
-    Ok(Arc::new(result))
+    Ok(intern_layout(result))
 }
 
 fn layout_of_ty_cycle_result(
@@ -735,7 +777,7 @@ fn layout_of_ty_cycle_result(
     _: salsa::Id,
     _: StoredTy,
     _: StoredParamEnvAndCrate,
-) -> Result<Arc<Layout>, LayoutError> {
+) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     Err(LayoutError::RecursiveTypeWithoutIndirection)
 }
 
@@ -744,7 +786,7 @@ fn extract_const_value<'db>(ct: Const<'db>) -> Result<ValueConst<'db>, LayoutErr
         ConstKind::Value(cv) => Ok(cv),
         ConstKind::Param(_)
         | ConstKind::Expr(_)
-        | ConstKind::Unevaluated(_)
+        | ConstKind::Alias(..)
         | ConstKind::Infer(_)
         | ConstKind::Bound(..)
         | ConstKind::Placeholder(_) => {
@@ -863,12 +905,10 @@ mod tests {
     use salsa::plumbing::FromId;
 
     use super::*;
-    use crate::{
-        db::GeneralConstId,
-        next_solver::{
-            AliasTyKind, ClosureIdWrapper, GeneralConstIdWrapper, Mutability, Region, RegionKind,
-            ScalarInt, TraitAssocTyId, Tys, UnevaluatedConst, ValTreeKind,
-        },
+    use crate::next_solver::{
+        AliasConst, AliasConstKind, AliasTyKind, ClosureIdWrapper, ConstExt, FreeConstAliasId,
+        IsRigid, Mutability, Region, RegionExt, RegionKind, ScalarInt, TraitAssocTyId, Tys,
+        ValTree, ValTreeKind,
     };
 
     /// A deterministic stream of choices: xorshift64.
@@ -886,7 +926,7 @@ mod tests {
     /// Field layouts of every shape the calculator treats apart: niches (`bool`, `char`, a
     /// reference), plain integers, a zero-sized and an uninhabited field, an array, a wide
     /// pointer.
-    pub(super) fn sized_fields(dl: &TargetDataLayout) -> Vec<Arc<Layout>> {
+    pub(super) fn sized_fields(dl: &TargetDataLayout) -> Vec<Layout> {
         let cx = LayoutCx::new(dl);
         let int = |i: Integer| Layout::scalar(dl, scalar_unit(dl, Primitive::Int(i, false)));
         let mut ptr = scalar_unit(dl, Primitive::Pointer(AddressSpace::ZERO));
@@ -920,25 +960,22 @@ mod tests {
             array,
             LayoutData::scalar_pair(dl, ptr, usize),
         ]
-        .into_iter()
-        .map(Arc::new)
-        .collect()
+        .into()
     }
 
     /// `[u8]`: a field that can only be last.
-    pub(super) fn unsized_field(dl: &TargetDataLayout) -> Arc<Layout> {
+    pub(super) fn unsized_field(dl: &TargetDataLayout) -> Layout {
         let u8 = Layout::scalar(dl, scalar_unit(dl, Primitive::Int(Integer::I8, false)));
-        Arc::new(LayoutCx::new(dl).calc.layout_of_array_like::<_, _, ()>(&u8, None).unwrap())
+        LayoutCx::new(dl).calc.layout_of_array_like::<_, _, ()>(&u8, None).unwrap()
     }
 
     /// What `layout_of_ty` did before: three heap buffers.
     fn univariant_with_vecs(
         cx: &LayoutCx<'_>,
-        fields: &[Arc<Layout>],
+        fields: &[&Layout],
         kind: StructKind,
     ) -> Result<Layout, LayoutError> {
         let fields = fields.to_vec();
-        let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
         let fields = fields.iter().collect::<IndexVec<_, _>>();
         Ok(cx.calc.layout_of_univariant(&fields, &ReprOptions::default(), kind)?)
     }
@@ -953,7 +990,7 @@ mod tests {
         for case in 0..400 {
             // Up to twelve fields, past the eight kept on the stack.
             let len = seed.below(13);
-            let mut fields: Vec<_> = (0..len).map(|_| pool[seed.below(pool.len())].clone()).collect();
+            let mut fields: Vec<&Layout> = (0..len).map(|_| &pool[seed.below(pool.len())]).collect();
             let kinds: &[StructKind] = match case % 3 {
                 // A closure: every field free to move.
                 0 => &[StructKind::AlwaysSized],
@@ -961,7 +998,7 @@ mod tests {
                 1 => &[StructKind::MaybeUnsized, StructKind::AlwaysSized],
                 // A tuple with an unsized tail.
                 _ => {
-                    fields.push(tail.clone());
+                    fields.push(&tail);
                     &[StructKind::MaybeUnsized]
                 }
             };
@@ -971,6 +1008,27 @@ mod tests {
                     univariant_with_vecs(&cx, &fields, kind),
                     "case {case}, {len} fields",
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_layouts_are_one_handle() {
+        let dl = TargetDataLayout::default();
+        let mut pool = sized_fields(&dl);
+        pool.push(unsized_field(&dl));
+        let handles: Vec<_> = pool.iter().map(|it| intern_layout(it.clone())).collect();
+        for (a, layout) in pool.iter().enumerate() {
+            let again = intern_layout(layout.clone());
+            assert_eq!(again, handles[a], "layout {a}");
+            assert_eq!(again.0, *layout, "layout {a}");
+            assert_eq!(
+                again.content(),
+                blaze_hashcons::content_of(&InternedLayout(layout.clone())),
+                "layout {a}",
+            );
+            for (b, other) in pool.iter().enumerate() {
+                assert_eq!(handles[a] == handles[b], layout == other, "layouts {a} and {b}");
             }
         }
     }
@@ -990,7 +1048,7 @@ mod tests {
         }
 
         fn visit_const(&mut self, ct: Const<'db>) -> ControlFlow<()> {
-            if let ConstKind::Unevaluated(..) = ct.kind() {
+            if let ConstKind::Alias(..) = ct.kind() {
                 return ControlFlow::Break(());
             }
             ct.super_visit_with(self)
@@ -1024,15 +1082,21 @@ mod tests {
     /// `<_ as Trait>::Assoc` over `args`.
     fn projection<'db>(args: GenericArgs<'db>) -> Ty<'db> {
         let alias: TypeAliasId = id(5);
-        ty(TyKind::Alias(rustc_type_ir::AliasTy::from_checked_parts(
-            AliasTyKind::Projection { def_id: TraitAssocTyId(alias) },
-            args,
-        )))
+        ty(TyKind::Alias(
+            IsRigid::No,
+            rustc_type_ir::AliasTy::from_checked_parts(
+                AliasTyKind::Projection { def_id: TraitAssocTyId(alias) },
+                args,
+            ),
+        ))
     }
 
     fn unevaluated<'db>(args: GenericArgs<'db>) -> Const<'db> {
-        let def = GeneralConstIdWrapper(GeneralConstId::ConstId(id::<ConstId>(6)));
-        Const::new_without_interner(ConstKind::Unevaluated(UnevaluatedConst { def, args }))
+        let kind = AliasConstKind::Free { def_id: FreeConstAliasId(id::<ConstId>(6)) };
+        Const::new_without_interner(ConstKind::Alias(
+            IsRigid::No,
+            AliasConst::from_checked_parts(kind, args),
+        ))
     }
 
     #[test]
@@ -1040,7 +1104,7 @@ mod tests {
         let u8 = ty(TyKind::Uint(UintTy::U8));
         let seven = Const::new_without_interner(ConstKind::Value(ValueConst::new(
             u8,
-            ValTreeKind::Leaf(ScalarInt::from(7u8)),
+            ValTree::new(ValTreeKind::Leaf(ScalarInt::from(7u8))),
         )));
 
         let assoc = projection(args(&[u8]));

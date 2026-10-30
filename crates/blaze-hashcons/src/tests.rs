@@ -513,6 +513,48 @@ fn a_pack_refuses_what_it_was_not_written_with() {
     assert_eq!(fresh.lookup(&content_of(&leaf(1, "The one name to change"))), None, "interned before it was checked");
 }
 
+#[derive(Hash, PartialEq, Eq, Debug)]
+enum Shape {
+    Scalar { size: usize, align: u32 },
+    Many(Vec<Shape>),
+}
+
+impl Consed for Shape {
+    fn domain() -> &'static Domain {
+        static DOMAIN: Domain = Domain::new("blaze v2 hashcons test shape 1");
+        &DOMAIN
+    }
+
+    fn hash_content(&self, hasher: &mut Hasher) {
+        crate::hash_std(self, hasher);
+    }
+}
+
+#[test]
+fn hash_std_writes_fixed_width_little_endian() {
+    let mut fed = Hasher::new("blaze v2 hashcons test std 1");
+    crate::hash_std(&(7usize, -2isize, "ab", 3u16), &mut fed);
+    let mut expected = Hasher::new("blaze v2 hashcons test std 1");
+    expected
+        .update(&7u64.to_le_bytes())
+        .update(&(-2i64).to_le_bytes())
+        .update(b"ab")
+        .update(&[0xff])
+        .update(&3u16.to_le_bytes());
+    assert_eq!(fed.finish(), expected.finish());
+}
+
+#[test]
+fn a_derived_hash_is_content() {
+    let cons = HashCons::<Shape>::new();
+    let shape = || Shape::Many(vec![Shape::Scalar { size: 4, align: 4 }, Shape::Scalar { size: 8, align: 8 }]);
+    let a = cons.intern(shape());
+    assert_eq!(cons.intern(shape()), a);
+    assert_ne!(cons.intern(Shape::Scalar { size: 4, align: 4 }), a);
+    assert_ne!(content_of(&Shape::Many(vec![])), content_of(&Shape::Many(vec![Shape::Many(vec![])])));
+    assert_eq!(cons.len(), 2);
+}
+
 #[test]
 fn sorted_is_in_content_order() {
     let cons = HashCons::<Leaf>::new();

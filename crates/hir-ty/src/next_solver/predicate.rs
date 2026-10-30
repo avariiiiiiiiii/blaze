@@ -15,7 +15,8 @@ use smallvec::SmallVec;
 
 use crate::next_solver::{
     GenericArg, TraitIdWrapper, default_types, impl_foldable_for_interned_slice,
-    impl_stored_interned_slice, interned_slice, interner::table, persist,
+    impl_foldable_for_stored_type, impl_stored_interned_slice, interned_slice, interner::table,
+    persist,
 };
 
 use super::{Binder, BoundVarKinds, DbInterner, Region, Ty};
@@ -279,6 +280,7 @@ impl ClausesStorage {
 }
 
 impl_stored_interned_slice!(Clauses, StoredClauses);
+impl_foldable_for_stored_type!(StoredClauses);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]

@@ -10,9 +10,13 @@
 //! ends, and [`Sim::dial`] is a peer from outside (an agent's client, a webhook) that the test
 //! plays with [`Sim::peer_send`], [`Sim::peer_received`] and [`Sim::peer_hangup`].
 
+mod journal;
+
 use std::{path::PathBuf, time::Duration};
 
-use blaze_ids::radix;
+use blaze_radix as radix;
+
+pub use self::journal::Journal;
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -203,6 +207,8 @@ pub struct Sim {
     /// What was ready at the last poll, kept for the next's.
     ready: Vec<Pending>,
     watches: FxHashMap<Tag, FileName>,
+    /// Inodes, change times and the journal of changes, which a crash keeps.
+    disk: journal::Disk,
     /// Changes and ends of watches, accepts and ends of listens, and what sockets did, each
     /// ready at its time.
     told: Vec<(Duration, Completion)>,
@@ -227,6 +233,7 @@ impl Sim {
             spawning: FxHashMap::default(),
             ready: Vec::new(),
             watches: FxHashMap::default(),
+            disk: journal::Disk::default(),
             told: Vec::new(),
             programs: FxHashMap::default(),
             runs: FxHashMap::default(),
@@ -308,6 +315,7 @@ impl Sim {
         self.pending.drain(|_, _| {});
         self.spawning.clear();
         self.watches.clear();
+        self.disk.journals.clear();
         self.told.clear();
         self.runs.clear();
         self.listens.clear();
@@ -401,10 +409,12 @@ impl Sim {
 
     /// Tells the watches of `file` it changed.
     fn changed(&mut self, file: &FileName) {
+        self.disk.touched(file, &self.files);
+        self.tell_journals();
         let mut watching: Vec<Tag> = self
             .watches
             .iter()
-            .filter(|(_, dir)| file.is_under(dir))
+            .filter(|(tag, dir)| file.is_under(dir) && !self.disk.journals.contains_key(tag))
             .map(|(&tag, _)| tag)
             .collect();
         // By tag, so the seed's numbers go to the same watches whatever the table's order.
@@ -419,6 +429,69 @@ impl Sim {
         }
     }
 
+    /// Tells each journal watch the change its journal just recorded, if under its directory;
+    /// one in `lose_change_one_in` is told as dropped.
+    fn tell_journals(&mut self) {
+        let mut journals: Vec<(Tag, FileName)> =
+            self.disk.journals.iter().map(|(tag, dir)| (*tag, dir.clone())).collect();
+        journals.sort_unstable_by_key(|it| it.0);
+        for (tag, dir) in journals {
+            let dropped = self.rng.one_in(self.faults.lose_change_one_in);
+            if let Some(batch) = self.disk.live(&dir, dropped) {
+                self.tell(tag, Done::Journaled(Box::new(batch)));
+            }
+        }
+    }
+
+    /// Which system's journal of changes the simulation plays from now on.
+    pub fn set_journal(&mut self, journal: Journal) {
+        self.disk.kind = journal;
+    }
+
+    /// The journal of changes made again, with a new ID: a cursor into the old one is
+    /// [`crate::Lost::Reset`].
+    pub fn reset_journal(&mut self) {
+        self.disk.reset();
+    }
+
+    /// The journal of changes keeps nothing from before now: a cursor before now is
+    /// [`crate::Lost::Truncated`].
+    pub fn truncate_journal(&mut self) {
+        self.disk.truncate();
+    }
+
+    /// The system loses the changes under `dir`, as FSEvents' `MustScanSubDirs` says: journal
+    /// watches of it, and journals read from before now, are told so.
+    pub fn lose_changes(&mut self, dir: &FileName, why: crate::Lost) {
+        self.disk.lose(dir, why);
+        self.tell_journals();
+    }
+
+    /// What `name` is on the simulated disk now.
+    pub fn stamp(&mut self, name: &FileName) -> crate::Stamp {
+        self.disk.stamp(name, &self.files)
+    }
+
+    /// The file's permission bits set by something outside the state machine: its change time
+    /// moves, its bytes and mtime do not.
+    pub fn chmod(&mut self, file: &FileName, mode: u32) {
+        if let Some(sim) = self.files.get_mut(file) {
+            sim.mode = mode;
+            self.disk.attributes(file);
+            self.tell_journals();
+        }
+    }
+
+    /// `from` renamed over `to` by something outside the state machine.
+    pub fn rename(&mut self, from: &FileName, to: &FileName) {
+        if let Some(sim) = self.files.remove(from) {
+            self.files.insert(to.clone(), sim);
+            self.disk.renamed(from, to);
+            self.changed(from);
+            self.changed(to);
+        }
+    }
+
     fn fail(&mut self, tag: Tag) -> Completion {
         Completion { tag, done: Done::Failed(IoError("injected by the simulation".into())) }
     }
@@ -430,6 +503,20 @@ impl Sim {
             .told
             .iter()
             .filter(|(_, it)| it.tag == tag)
+            .map(|(at, _)| *at)
+            .max()
+            .map_or(at, |last| last.max(at));
+        self.told.push((at, Completion { tag, done }));
+    }
+
+    /// `done` of `tag`, ready after a delay, and after everything told of `tag` or of `after`
+    /// before: a watch's end or flush after the watch's changes.
+    fn tell_after(&mut self, after: Tag, tag: Tag, done: Done) {
+        let at = self.now + self.delay();
+        let at = self
+            .told
+            .iter()
+            .filter(|(_, it)| it.tag == after || it.tag == tag)
             .map(|(at, _)| *at)
             .max()
             .map_or(at, |last| last.max(at));
@@ -557,6 +644,7 @@ impl Sim {
             Effect::Rename { from, to, .. } => match self.files.remove(&from) {
                 Some(sim) => {
                     self.files.insert(to.clone(), sim);
+                    self.disk.renamed(&from, &to);
                     self.changed(&from);
                     self.changed(&to);
                     Done::Renamed
@@ -566,6 +654,8 @@ impl Sim {
             Effect::Mode { file, mode, .. } => match self.files.get_mut(&file) {
                 Some(sim) => {
                     sim.mode = mode;
+                    self.disk.attributes(&file);
+                    self.tell_journals();
                     Done::Moded
                 }
                 None => Done::Failed(IoError(format!("{file}: no such file"))),
@@ -603,6 +693,19 @@ impl Sim {
                 None => None,
             }),
             Effect::List { dir, .. } => self.list(&dir),
+            Effect::Stamp { files, .. } => Done::Stamped(
+                files
+                    .iter()
+                    .map(|name| {
+                        let name = FileName::new(name).expect("a Names entry is a name");
+                        self.disk.stamp(&name, &self.files)
+                    })
+                    .collect(),
+            ),
+            Effect::Entries { dir, .. } => match self.disk.entries(&dir, &self.files) {
+                Some(entries) => Done::Entries(entries),
+                None => Done::Failed(IoError(format!("{dir}: no such directory"))),
+            },
             Effect::Remove { file, .. } => {
                 if self.files.remove(&file).is_some() {
                     self.changed(&file);
@@ -618,7 +721,9 @@ impl Sim {
                 None => unreachable!("a spawn in flight has its run"),
             },
             Effect::Watch { .. }
+            | Effect::Journal { .. }
             | Effect::Unwatch { .. }
+            | Effect::Flush { .. }
             | Effect::Kill { .. }
             | Effect::Listen { .. }
             | Effect::Unlisten { .. }
@@ -641,21 +746,33 @@ impl Driver for Sim {
                     self.watches.insert(tag, dir);
                     continue;
                 }
+                Effect::Journal { dir, since, tag } => {
+                    let parts = 1 + self.rng.below(3);
+                    for batch in self.disk.history(&dir, &since, parts) {
+                        self.tell(tag, Done::Journaled(Box::new(batch)));
+                    }
+                    self.disk.journals.insert(tag, dir.clone());
+                    self.watches.insert(tag, dir);
+                    continue;
+                }
                 Effect::Unwatch { tag } => {
+                    self.disk.journals.remove(&tag);
                     let done = match self.watches.remove(&tag) {
                         Some(_) => Done::Unwatched,
                         None => Done::Failed(IoError(format!("nothing is watched as {tag:?}"))),
                     };
-                    let at = self.now + self.delay();
                     // A change told before the end is heard before it.
-                    let at = self
-                        .told
-                        .iter()
-                        .filter(|(_, it)| it.tag == tag)
-                        .map(|(at, _)| *at)
-                        .max()
-                        .map_or(at, |last| last.max(at));
-                    self.told.push((at, Completion { tag, done }));
+                    self.tell_after(tag, tag, done);
+                    continue;
+                }
+                Effect::Flush { watch, tag } => {
+                    let done = match self.watches.contains_key(&watch) {
+                        false => Done::Failed(IoError(format!("nothing is watched as {watch:?}"))),
+                        true if self.rng.one_in(self.faults.fail_one_in) => self.fail(tag).done,
+                        true => Done::Flushed,
+                    };
+                    // Every change of the watch told by now is heard first.
+                    self.tell_after(watch, tag, done);
                     continue;
                 }
                 Effect::Kill { tag } => {
@@ -830,7 +947,7 @@ impl Driver for Sim {
 
     fn in_flight(&self) -> usize {
         let ending = self.told.iter().filter(|(_, it)| {
-            !matches!(it.done, Done::Changed { .. } | Done::Accepted { .. })
+            !matches!(it.done, Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. })
         });
         self.pending.len()
             + self.watches.len()
@@ -1019,6 +1136,39 @@ mod tests {
             if !lost {
                 assert!(heard.contains(&name("src/lib.rs")), "seed {seed}: {heard:?}");
             }
+        }
+    }
+
+    #[test]
+    fn a_flush_is_told_after_every_change_made_before_it() {
+        for seed in 0..500 {
+            let mut sim = Sim::new(seed, Faults::default());
+            let mut effects = vec![Effect::Watch { dir: name("src"), tag: Tag(9) }];
+            sim.submit(&mut effects);
+            sim.change(&name("src/a"), b"1");
+            sim.change(&name("src/b"), b"2");
+            effects.push(Effect::Flush { watch: Tag(9), tag: Tag(10) });
+            effects.push(Effect::Flush { watch: Tag(8), tag: Tag(11) });
+            effects.push(Effect::Unwatch { tag: Tag(9) });
+            let (mut heard, mut at_flush, mut refused, mut ended) = (Vec::new(), None, false, false);
+            run_until_idle(&mut sim, &mut effects, |done, _| match (done.tag.0, done.done) {
+                (9, Done::Changed { files, .. }) => {
+                    assert!(!ended, "seed {seed}: a change after the end");
+                    heard.extend(files);
+                }
+                (9, Done::Unwatched) => ended = true,
+                (10, Done::Flushed) => {
+                    assert!(!ended, "seed {seed}: the flush after the end");
+                    let mut seen = heard.clone();
+                    seen.sort();
+                    at_flush = Some(seen);
+                }
+                (11, Done::Failed(_)) => refused = true,
+                other => panic!("seed {seed}: {other:?}"),
+            });
+            assert_eq!(at_flush, Some(vec![name("src/a"), name("src/b")]), "seed {seed}");
+            assert!(refused && ended, "seed {seed}");
+            assert_eq!(sim.in_flight(), 0);
         }
     }
 

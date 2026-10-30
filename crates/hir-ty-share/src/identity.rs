@@ -201,6 +201,7 @@ impl<'db> Spell<'db> {
                 self.ty(pointee)?;
             }
             TyKind::FnDef(def, args) => {
+                let args = args.no_bound_vars().unwrap();
                 self.u8(13);
                 match def.0 {
                     CallableDefId::FunctionId(it) => {
@@ -324,7 +325,7 @@ impl<'db> Spell<'db> {
                     BoundTyKind::Param(_) => 1,
                 });
             }
-            TyKind::Alias(alias) => {
+            TyKind::Alias(_, alias) => {
                 let what = match alias.kind {
                     AliasTyKind::Projection { .. } => "a projection",
                     AliasTyKind::Inherent { .. } => "an inherent associated type",
@@ -408,7 +409,7 @@ impl<'db> Spell<'db> {
                 self.bound_index(index);
                 self.u32(bound.var.as_u32());
             }
-            ConstKind::Unevaluated(_) => {
+            ConstKind::Alias(..) => {
                 return Err(no_content(format!("the constant `{konst:?}` is not evaluated")));
             }
             ConstKind::Expr(_) => {

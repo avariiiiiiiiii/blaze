@@ -192,6 +192,7 @@ impl ExprCollector<'_> {
             operands.push(op);
         }
 
+        let record = self.store.record;
         let mut mappings = vec![];
         let mut curarg = 0;
         let mut template = Some(Vec::new());
@@ -223,7 +224,9 @@ impl ExprCollector<'_> {
                     Some((idx, it.clone(), self.expand_macros_to_string(it)?))
                 })
                 .for_each(|(idx, expr, (s, is_direct_literal))| {
-                    mappings.resize_with(idx + 1, Vec::default);
+                    if record {
+                        mappings.resize_with(idx + 1, Vec::default);
+                    }
                     let Ok(text) = s.value() else {
                         comment_only = false;
                         template = None;
@@ -235,7 +238,7 @@ impl ExprCollector<'_> {
                             .strip_prefix("/*")
                             .and_then(|it| it.strip_suffix("*/"))
                             .is_some_and(|it| !it.contains("*/"));
-                    let mappings = &mut mappings[idx];
+                    let mut mappings = mappings.get_mut(idx);
                     let template_snippet = match expr {
                         ast::Expr::Literal(literal) => match literal.kind() {
                             ast::LiteralKind::String(s) => Some(s.text().to_owned()),
@@ -321,7 +324,8 @@ impl ExprCollector<'_> {
                                     }),
                                     _ => template = None,
                                 }
-                                if let Some(operand_idx) = operand_idx
+                                if let Some(mappings) = &mut mappings
+                                    && let Some(operand_idx) = operand_idx
                                     && let Some(position_span) = to_span(arg.position_span)
                                 {
                                     mappings.push((position_span, operand_idx));
@@ -352,11 +356,13 @@ impl ExprCollector<'_> {
             clobber_abi: !clobber_abis.is_empty(),
         });
         let idx = self.map_expr(idx, syntax_ptr);
-        self.store
-            .template_map
-            .get_or_insert_with(Default::default)
-            .asm_to_captures
-            .push((idx, mappings));
+        if record {
+            self.store
+                .template_map
+                .get_or_insert_with(Default::default)
+                .asm_to_captures
+                .push((idx, mappings));
+        }
         idx
     }
 }

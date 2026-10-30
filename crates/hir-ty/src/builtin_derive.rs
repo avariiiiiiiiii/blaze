@@ -129,7 +129,7 @@ pub fn impl_trait<'db>(
                 loc.adt,
                 GenericArgs::identity_for_item(interner, loc.adt.into()),
             );
-            EarlyBinder::bind(TraitRef::new_from_args(
+            EarlyBinder::bind(interner, TraitRef::new_from_args(
                 interner,
                 trait_id.into(),
                 trait_args(loc.trait_, self_ty),
@@ -144,7 +144,7 @@ pub fn impl_trait<'db>(
                 coerce_pointee_params(interner, loc, generic_params, trait_id)
             else {
                 // Malformed derive.
-                return EarlyBinder::bind(TraitRef::new(
+                return EarlyBinder::bind(interner, TraitRef::new(
                     interner,
                     trait_id.into(),
                     [self_ty, self_ty],
@@ -152,7 +152,10 @@ pub fn impl_trait<'db>(
             };
             let changed_args = replace_pointee(interner, pointee_param_idx, new_param_ty, args);
             let changed_self_ty = Ty::new_adt(interner, loc.adt, changed_args);
-            EarlyBinder::bind(TraitRef::new(interner, trait_id.into(), [self_ty, changed_self_ty]))
+            EarlyBinder::bind(
+                interner,
+                TraitRef::new(interner, trait_id.into(), [self_ty, changed_self_ty]),
+            )
         }
     }
 }
@@ -163,7 +166,7 @@ pub fn impl_super_outlives<'db>(
     _id: BuiltinDeriveImplId,
 ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
     // Currently no builtin-derived traits have super outlive bounds.
-    EarlyBinder::bind(&[])
+    EarlyBinder::bind_iter(&[])
 }
 
 #[salsa::tracked(returns(ref))]
@@ -204,6 +207,7 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
             else {
                 // Malformed derive.
                 return GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
+                    interner,
                     Clauses::empty().store(),
                 ));
             };
@@ -226,6 +230,7 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
                     .upcast(interner)
             });
             GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
+                interner,
                 Clauses::new_from_iter(
                     adt_predicates
                         .explicit_predicates()
@@ -243,7 +248,7 @@ pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPr
 fn explicit_own_predicates<'db>(
     predicates: EarlyBinder<'db, impl Iterator<Item = Clause<'db>>>,
 ) -> GenericPredicates {
-    GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
+    GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind_no_rigid_aliases(
         Clauses::new_from_iter(predicates.skip_binder()).store(),
     ))
 }
@@ -335,6 +340,7 @@ fn simple_trait_predicates<'db>(
         }
     }
     GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
+        interner,
         Clauses::new_from_iter(
             adt_predicates
                 .explicit_predicates()
@@ -365,7 +371,7 @@ fn extend_assoc_type_bounds<'db>(
         type Result = ();
 
         fn visit_ty(&mut self, t: Ty<'db>) -> Self::Result {
-            if let TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) = t.kind() {
+            if let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) = t.kind() {
                 self.assoc_type_bounds.push(
                     TraitRef::new_from_args(
                         self.interner,

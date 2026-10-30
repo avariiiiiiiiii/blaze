@@ -394,6 +394,11 @@ Changes, in order:
    capture's edges to the active query, deduplicated by its index set. Neither takes a lock;
    the arena is per-worker segments published at task end (concurrency.md, "Dependencies are
    recorded per task").
+
+   > applied by db-salsa-reads: `vendor/salsa/src/capture.rs`. `Reads` (32 bytes, `Copy`) is a
+   > range of S5's one edge array (the frame's edges, then its fingerprints), plus durability,
+   > `changed_at` and revision, rather than a second arena; `replay_reads` in another revision
+   > panics naming both. Report: `/tmp/blaze-lanes/v2-db-salsa-reads.md`.
 2. **db-ty-types, `interner.rs`:** `type DepNodeIndex = Option<salsa::Reads>`;
    `with_cached_task` calls `capture_reads`; `Tracked<T>` holds `(T, Option<Reads>)`;
    `get_tracked` calls `replay_reads` when `Some`.

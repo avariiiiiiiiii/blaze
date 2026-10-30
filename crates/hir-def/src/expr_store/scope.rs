@@ -6,6 +6,7 @@
 use std::{cell::Cell, mem};
 
 use base_db::SourceDatabase;
+use blaze_ids::radix;
 use hir_expand::{MacroDefId, name::Name};
 use la_arena::{Idx, RawIdx};
 
@@ -297,7 +298,7 @@ impl Building {
         // Stable, so each scope keeps its entries in the order they were added; a body with no
         // scope made inside another's entries is already grouped and skips the sort.
         if !self.scope_entries.is_sorted_by_key(|&(scope, _)| scope) {
-            self.scope_entries.sort_by_key(|&(scope, _)| scope);
+            radix::sort_by_key(&mut self.scope_entries, |&(scope, _)| scope);
         }
         let mut entries: Box<[[u32; 2]]> = vec![[0, 0]; self.parent.len()].into_boxed_slice();
         for (at, &(scope, _)) in self.scope_entries.iter().enumerate() {

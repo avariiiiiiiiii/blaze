@@ -44,7 +44,7 @@ use crate::{
     expr_store::{
         Body, BodySourceMap, ExprPtr, ExprRoot, ExpressionStore, ExpressionStoreBuilder,
         ExpressionStoreDiagnostics, ExpressionStoreSourceMap, HygieneId, LabelPtr, LifetimePtr,
-        ListMark, Lists, MissingBodyItemKind, PatPtr, StoreVisitor, TypePtr,
+        ListMark, Lists, MissingBodyItemKind, PatPtr, SelfParamPtr, StoreVisitor, TypePtr,
         body::Param,
         expander::Expander,
         lower::generics::ImplTraitLowerFn,
@@ -70,6 +70,18 @@ use crate::{
 
 pub use self::path::hir_segment_to_ast_segment;
 
+/// Which of a body's two lowerings [`lower_body`] is.
+#[derive(Clone, Copy)]
+pub(super) enum BodyLowering<'a> {
+    /// The body alone, as [`Body::of`] keeps it: no source map, and the body's blocks are made
+    /// here.
+    Body,
+    /// The body again, with its source map. A `BlockId` is a tracked struct of the query that
+    /// makes it, so the blocks are not made again but taken from the first lowering's
+    /// `block_scopes`, in the order they are made: the two lowerings agree on every id.
+    SourceMap { blocks: &'a [BlockId] },
+}
+
 pub(super) fn lower_body(
     db: &dyn SourceDatabase,
     owner: DefWithBodyId,
@@ -81,6 +93,7 @@ pub(super) fn lower_body(
     is_async_fn: bool,
     is_gen_fn: bool,
     maps: Option<(&RealSpanMap, &AstIdMap)>,
+    lowering: BodyLowering<'_>,
 ) -> (Body, BodySourceMap) {
     // We cannot leave the root span map empty and let any identifier from it be treated as root,
     // because when inside nested macros `SyntaxContextId`s from the outer macro will be interleaved
@@ -93,6 +106,10 @@ pub(super) fn lower_body(
     let mut params = vec![];
     let mut collector =
         ExprCollector::with_maps(db, module, current_file_id, LoweringMode::Analysis, maps);
+    match lowering {
+        BodyLowering::Body => collector.store.skip_source_map(),
+        BodyLowering::SourceMap { blocks } => collector.given_blocks = Some(blocks.iter()),
+    }
 
     let skip_body = AttrFlags::query(
         db,
@@ -133,11 +150,7 @@ pub(super) fn lower_body(
 
             collector.missing_expr()
         });
-        let (store, source_map) = collector.store.finish();
-        return (
-            Body { store, params: params.into_boxed_slice(), self_param },
-            BodySourceMap { self_param: source_map_self_param, store: source_map },
-        );
+        return collector.finish_body(params, self_param, source_map_self_param);
     }
     validate_required_body(db, owner, current_file_id, syntax_node, body.as_ref(), &mut collector);
     collector.with_expr_root(|collector| {
@@ -205,11 +218,7 @@ pub(super) fn lower_body(
         )
     });
 
-    let (store, source_map) = collector.store.finish();
-    (
-        Body { store, params: params.into_boxed_slice(), self_param },
-        BodySourceMap { self_param: source_map_self_param, store: source_map },
-    )
+    collector.finish_body(params, self_param, source_map_self_param)
 }
 
 fn validate_required_body(
@@ -250,9 +259,10 @@ pub(crate) fn lower_type_ref(
     db: &dyn SourceDatabase,
     module: ModuleId,
     type_ref: InFile<Option<ast::Type>>,
+    maps: Option<(&RealSpanMap, &AstIdMap)>,
 ) -> (ExpressionStore, ExpressionStoreSourceMap, TypeRefId) {
     let mut expr_collector =
-        ExprCollector::new(db, module, type_ref.file_id, LoweringMode::Analysis);
+        ExprCollector::with_maps(db, module, type_ref.file_id, LoweringMode::Analysis, maps);
     let type_ref =
         expr_collector.lower_type_ref_opt(type_ref.value, &mut ExprCollector::impl_trait_allocator);
     let (store, source_map) = expr_collector.store.finish();
@@ -268,7 +278,22 @@ pub fn lower_generic_params(
     where_clause: Option<ast::WhereClause>,
     mode: LoweringMode,
 ) -> (ExpressionStore, GenericParams, ExpressionStoreSourceMap) {
-    let mut expr_collector = ExprCollector::new(db, module, file_id, mode);
+    lower_generic_params_within(db, module, def, file_id, param_list, where_clause, mode, None)
+}
+
+/// [`lower_generic_params`] of a part of `file_id` lowered as a tree of its own, with `maps`
+/// that part's maps ([`ExprCollector::with_maps`]).
+pub(crate) fn lower_generic_params_within(
+    db: &dyn SourceDatabase,
+    module: ModuleId,
+    def: GenericDefId,
+    file_id: HirFileId,
+    param_list: Option<ast::GenericParamList>,
+    where_clause: Option<ast::WhereClause>,
+    mode: LoweringMode,
+    maps: Option<(&RealSpanMap, &AstIdMap)>,
+) -> (ExpressionStore, GenericParams, ExpressionStoreSourceMap) {
+    let mut expr_collector = ExprCollector::with_maps(db, module, file_id, mode, maps);
     let mut collector = generics::GenericParamsCollector::new(def);
     collector.lower(&mut expr_collector, param_list, where_clause);
     let params = collector.finish();
@@ -281,9 +306,10 @@ pub(crate) fn lower_impl(
     module: ModuleId,
     impl_syntax: InFile<ast::Impl>,
     impl_id: ImplId,
+    maps: Option<(&RealSpanMap, &AstIdMap)>,
 ) -> (ExpressionStore, ExpressionStoreSourceMap, TypeRefId, Option<TraitRef>, GenericParams) {
     let mut expr_collector =
-        ExprCollector::new(db, module, impl_syntax.file_id, LoweringMode::Analysis);
+        ExprCollector::with_maps(db, module, impl_syntax.file_id, LoweringMode::Analysis, maps);
     let self_ty =
         expr_collector.lower_type_ref_opt_disallow_impl_trait(impl_syntax.value.self_ty());
     let trait_ = impl_syntax.value.trait_().and_then(|it| match &it {
@@ -310,9 +336,10 @@ pub(crate) fn lower_trait(
     module: ModuleId,
     trait_syntax: InFile<ast::Trait>,
     trait_id: TraitId,
+    maps: Option<(&RealSpanMap, &AstIdMap)>,
 ) -> (ExpressionStore, ExpressionStoreSourceMap, GenericParams) {
     let mut expr_collector =
-        ExprCollector::new(db, module, trait_syntax.file_id, LoweringMode::Analysis);
+        ExprCollector::with_maps(db, module, trait_syntax.file_id, LoweringMode::Analysis, maps);
     let mut collector = generics::GenericParamsCollector::with_self_param(
         &mut expr_collector,
         trait_id.into(),
@@ -333,10 +360,16 @@ pub(crate) fn lower_type_alias(
     container: ItemContainerId,
     alias: InFile<ast::TypeAlias>,
     type_alias_id: TypeAliasId,
+    maps: Option<(&RealSpanMap, &AstIdMap)>,
 ) -> (ExpressionStore, ExpressionStoreSourceMap, GenericParams, Box<[TypeBound]>, Option<TypeRefId>)
 {
-    let mut expr_collector =
-        ExprCollector::new(db, container.module(db), alias.file_id, LoweringMode::Analysis);
+    let mut expr_collector = ExprCollector::with_maps(
+        db,
+        container.module(db),
+        alias.file_id,
+        LoweringMode::Analysis,
+        maps,
+    );
     let bounds_mark = expr_collector
         .type_bounds_from_ast(alias.value.type_bound_list(), &mut ExprCollector::impl_trait_allocator);
     let bounds: Box<[TypeBound]> = expr_collector.store.drain_bounds(bounds_mark).collect();
@@ -375,6 +408,7 @@ pub(crate) fn lower_function(
     module: ModuleId,
     fn_: InFile<ast::Fn>,
     function_id: FunctionId,
+    maps: Option<(&RealSpanMap, &AstIdMap)>,
 ) -> (
     ExpressionStore,
     ExpressionStoreSourceMap,
@@ -384,7 +418,8 @@ pub(crate) fn lower_function(
     bool,
     bool,
 ) {
-    let mut expr_collector = ExprCollector::new(db, module, fn_.file_id, LoweringMode::Analysis);
+    let mut expr_collector =
+        ExprCollector::with_maps(db, module, fn_.file_id, LoweringMode::Analysis, maps);
     let mut collector = generics::GenericParamsCollector::new(function_id.into());
     collector.lower(&mut expr_collector, fn_.value.generic_param_list(), fn_.value.where_clause());
     let params_mark = expr_collector.store.list_mark();
@@ -543,6 +578,8 @@ pub struct ExprCollector<'db> {
     fn_params: Vec<(Option<Name>, TypeRefId)>,
     /// A coroutine closure's parameters while its body is desugared.
     closure_params: Vec<Param<PatId>>,
+    /// The blocks of the body's first lowering not yet taken ([`BodyLowering::SourceMap`]).
+    given_blocks: Option<std::slice::Iter<'db, BlockId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -723,7 +760,7 @@ impl<'db> ExprCollector<'db> {
 
     /// With `maps`, what is collected is a part of `current_file_id` lowered as a tree of its
     /// own, and these are the maps of that part ([`Expander::within`]).
-    fn with_maps(
+    pub(crate) fn with_maps(
         db: &'db dyn SourceDatabase,
         module: ModuleId,
         current_file_id: HirFileId,
@@ -765,9 +802,28 @@ impl<'db> ExprCollector<'db> {
             assoc_bindings: Vec::new(),
             fn_params: Vec::new(),
             closure_params: Vec::new(),
+            given_blocks: None,
         };
         result.store.inference_roots = Some(SmallVec::new());
         result
+    }
+
+    /// The lowered body, and its source map when it was recorded.
+    fn finish_body(
+        self,
+        params: Vec<Param<PatId>>,
+        self_param: Option<Param<BindingId>>,
+        self_param_source: Option<InFile<SelfParamPtr>>,
+    ) -> (Body, BodySourceMap) {
+        if let Some(rest) = &self.given_blocks {
+            assert_eq!(rest.len(), 0, "the body made fewer blocks than its first lowering");
+        }
+        let record = self.store.record;
+        let (store, store_map) = self.store.finish();
+        (
+            Body { store, params: params.into_boxed_slice(), self_param },
+            BodySourceMap { self_param: self_param_source.filter(|_| record), store: store_map },
+        )
     }
 
     fn generate_new_name(&mut self) -> Name {
@@ -954,7 +1010,9 @@ impl<'db> ExprCollector<'db> {
                     let id = self.collect_macro_call(mcall, macro_ptr, true, |this, expansion| {
                         this.lower_type_ref_opt(expansion, impl_trait_lower_fn)
                     });
-                    self.store.types_map.push((src, id));
+                    if self.store.record {
+                        self.store.types_map.push((src, id));
+                    }
                     id
                 }
                 None => self.alloc_type_ref(TypeRef::Error, ptr),
@@ -1004,9 +1062,11 @@ impl<'db> ExprCollector<'db> {
                 self.store.type_hygiene.push((id, hygiene));
             }
         }
-        let ptr = self.expander.in_file(node);
-        self.store.types_map_back.insert(id, ptr);
-        self.store.types_map.push((ptr, id));
+        if self.store.record {
+            let ptr = self.expander.in_file(node);
+            self.store.types_map_back.insert(id, ptr);
+            self.store.types_map.push((ptr, id));
+        }
         id
     }
 
@@ -1020,9 +1080,11 @@ impl<'db> ExprCollector<'db> {
         }
 
         let id = self.store.lifetimes.alloc(lifetime_ref);
-        let ptr = self.expander.in_file(node);
-        self.store.lifetime_map_back.insert(id, ptr);
-        self.store.lifetime_map.push((ptr, id));
+        if self.store.record {
+            let ptr = self.expander.in_file(node);
+            self.store.lifetime_map_back.insert(id, ptr);
+            self.store.lifetime_map.push((ptr, id));
+        }
         id
     }
 
@@ -1745,8 +1807,10 @@ impl<'db> ExprCollector<'db> {
                     None => self.missing_expr(),
                 };
                 // make the paren expr point to the inner expression as well for IDE resolution
-                let src = self.expander.in_file(syntax_ptr);
-                self.store.expr_map.push((src, inner.into()));
+                if self.store.record {
+                    let src = self.expander.in_file(syntax_ptr);
+                    self.store.expr_map.push((src, inner.into()));
+                }
                 inner
             }
             ast::Expr::ReturnExpr(e) => {
@@ -1788,8 +1852,10 @@ impl<'db> ExprCollector<'db> {
                             Some(e) => self.collect_expr(e),
                             None => self.missing_expr(),
                         };
-                        let src = self.expander.in_file(AstPtr::new(&field));
-                        self.store.field_map_back.push((expr, src));
+                        if self.store.record {
+                            let src = self.expander.in_file(AstPtr::new(&field));
+                            self.store.field_map_back.push((expr, src));
+                        }
                         self.store.push_list_record_field(RecordLitField { name, expr });
                     }
                     let spread_expr = nfl.spread().map(|s| self.collect_expr(s));
@@ -2056,8 +2122,10 @@ impl<'db> ExprCollector<'db> {
                     Some(Some(id)) => {
                         // Make the macro-call point to its expanded expression so we can query
                         // semantics on syntax pointers to the macro
-                        let src = self.expander.in_file(syntax_ptr);
-                        self.store.expr_map.push((src, id.into()));
+                        if self.store.record {
+                            let src = self.expander.in_file(syntax_ptr);
+                            self.store.expr_map.push((src, id.into()));
+                        }
                         id
                     }
                     // Macro expanded into a disabled cfg (yes, there is such thing, see the weird_cfgs test).
@@ -2245,7 +2313,9 @@ impl<'db> ExprCollector<'db> {
             let expr = self.collect_expr(expr);
             // Do not use `alloc_pat_from_expr()` here, it will override the entry in `expr_map`.
             let id = self.store.alloc_pat(Pat::Expr(expr));
-            self.store.pat_map_back.insert(id, src);
+            if self.store.record {
+                self.store.pat_map_back.insert(id, src);
+            }
             id
         })
     }
@@ -2343,7 +2413,9 @@ impl<'db> ExprCollector<'db> {
                 let id = self.collect_macro_call(e, macro_ptr, true, |this, expansion| {
                     this.collect_expr_as_pat_opt(expansion)
                 });
-                self.store.expr_map.push((src, id.into()));
+                if self.store.record {
+                    self.store.expr_map.push((src, id.into()));
+                }
                 id
             }
             ast::Expr::RecordExpr(e) => {
@@ -2371,8 +2443,10 @@ impl<'db> ExprCollector<'db> {
                     let pat = self.collect_expr_as_pat(field_expr);
                     let Some(name) = f.field_name() else { continue };
                     let name = name.as_name();
-                    let src = self.expander.in_file(AstPtr::new(&f).wrap_left());
-                    self.store.pat_field_map_back.push((pat, src));
+                    if self.store.record {
+                        let src = self.expander.in_file(AstPtr::new(&f).wrap_left());
+                        self.store.pat_field_map_back.push((pat, src));
+                    }
                     self.store.push_list_field_pat(RecordFieldPat { name, pat });
                 }
                 let id = self.with_lists(mark, |this, lists| {
@@ -2418,7 +2492,9 @@ impl<'db> ExprCollector<'db> {
                                 None => Either::Left(this.missing_pat()),
                             },
                         );
-                        if let Either::Left(pat) = pat {
+                        if let Either::Left(pat) = pat
+                            && this.store.record
+                        {
                             let src = this.expander.in_file(AstPtr::new(&expr).wrap_left());
                             this.store.pat_map_back.insert(pat, src);
                         }
@@ -2878,7 +2954,9 @@ impl<'db> ExprCollector<'db> {
                     self.krate,
                     resolver,
                     &mut |ptr, call| {
-                        self.store.expansions.push((ptr.map(|(it, _)| it), call));
+                        if self.store.record {
+                            self.store.expansions.push((ptr.map(|(it, _)| it), call));
+                        }
                     },
                 )
             }
@@ -2902,7 +2980,9 @@ impl<'db> ExprCollector<'db> {
             Some((mark, expansion)) => {
                 // Keep collecting even with expansion errors so we can provide completions and
                 // other services in incomplete macro expressions.
-                if let Some(macro_file) = self.expander.current_file_id().macro_file() {
+                if let Some(macro_file) = self.expander.current_file_id().macro_file()
+                    && self.store.record
+                {
                     self.store.expansions.push((macro_call_ptr, macro_file));
                 }
 
@@ -2966,8 +3046,10 @@ impl<'db> ExprCollector<'db> {
         expansion.inspect(|&tail| {
             // Make the macro-call point to its expanded expression so we can query
             // semantics on syntax pointers to the macro
-            let src = self.expander.in_file(syntax_ptr);
-            self.store.expr_map.push((src, tail.into()));
+            if self.store.record {
+                let src = self.expander.in_file(syntax_ptr);
+                self.store.expr_map.push((src, tail.into()));
+            }
         })
     }
 
@@ -3080,11 +3162,23 @@ impl<'db> ExprCollector<'db> {
             let token = self.lowering_mode.allow_tracked_structs()?;
             let file_local_id = self.expander.ast_id_map().ast_id_for_block(&block)?;
             let ast_id = self.expander.in_file(file_local_id);
+            if let Some(given) = &mut self.given_blocks {
+                let block =
+                    *given.next().expect("the body made more blocks than its first lowering");
+                assert_eq!(
+                    block.ast_id(self.db),
+                    ast_id,
+                    "the body's blocks are not in the order of its first lowering"
+                );
+                return Some(block);
+            }
             // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
             // `token` exists only in `LoweringMode::Analysis` (`allow_tracked_structs`), which runs
             // inside the lowering queries (`Body::of`, the signature queries); the id goes only
             // into `store.block_scopes` and the block's `Expr::Block`, both part of that query's
-            // result, which salsa invalidates with it. IDE lowering gets no token and makes no id.
+            // result, which salsa invalidates with it, and into the source-map lowering of the
+            // same body (`given_blocks`), whose queries read `Body::of` and so are invalidated
+            // with it too. IDE lowering gets no token and makes no id.
             // A leaked id would name a freed salsa slot in a later revision.
             Some(unsafe { BlockIdLt::new(self.db, ast_id, self.module, token).to_static() })
         })();
@@ -3356,8 +3450,10 @@ impl<'db> ExprCollector<'db> {
                     let pat = self.collect_pat(ast_pat, binding_list);
                     let Some(name) = f.field_name() else { continue };
                     let name = name.as_name();
-                    let src = self.expander.in_file(AstPtr::new(&f).wrap_right());
-                    self.store.pat_field_map_back.push((pat, src));
+                    if self.store.record {
+                        let src = self.expander.in_file(AstPtr::new(&f).wrap_right());
+                        self.store.pat_field_map_back.push((pat, src));
+                    }
                     self.store.push_list_field_pat(RecordFieldPat { name, pat });
                 }
 
@@ -3475,7 +3571,9 @@ impl<'db> ExprCollector<'db> {
                         None => this.missing_pat(),
                     }
                 });
-                self.store.pat_map.push((src, pat.into()));
+                if self.store.record {
+                    self.store.pat_map.push((src, pat.into()));
+                }
                 pat
             }
             None => self.missing_pat(),
@@ -3545,7 +3643,9 @@ impl<'db> ExprCollector<'db> {
                                 Either::Left(this.missing_pat())
                             }
                         });
-                    if let Some(pat) = pat.left() {
+                    if let Some(pat) = pat.left()
+                        && self.store.record
+                    {
                         self.store.pat_map.push((src, pat.into()));
                     }
                     pat
@@ -3684,7 +3784,9 @@ impl<'db> ExprCollector<'db> {
     }
 
     fn add_definition_to_binding(&mut self, binding_id: BindingId, pat_id: PatId) {
-        self.store.binding_definitions.push((binding_id, pat_id));
+        if self.store.record {
+            self.store.binding_definitions.push((binding_id, pat_id));
+        }
     }
 
     // region: labels
@@ -3928,9 +4030,11 @@ impl<'db> ExprCollector<'db> {
     }
     /// The source maps of an expression just allocated for `ptr`.
     fn map_expr(&mut self, id: ExprId, ptr: ExprPtr) -> ExprId {
-        let src = self.expander.in_file(ptr);
-        self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_left));
-        self.store.expr_map.push((src, id.into()));
+        if self.store.record {
+            let src = self.expander.in_file(ptr);
+            self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_left));
+            self.store.expr_map.push((src, id.into()));
+        }
         id
     }
     // FIXME: desugared exprs don't have ptr, that's wrong and should be fixed.
@@ -3944,10 +4048,12 @@ impl<'db> ExprCollector<'db> {
     }
     /// The back map of a desugared expression just allocated for `ptr`.
     fn map_expr_desugared(&mut self, id: ExprId, ptr: ExprPtr) -> ExprId {
-        let src = self.expander.in_file(ptr);
-        self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_left));
-        // We intentionally don't fill this as it could overwrite a non-desugared entry
-        // self.store.expr_map.push((src, id));
+        if self.store.record {
+            let src = self.expander.in_file(ptr);
+            self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_left));
+            // We intentionally don't fill this as it could overwrite a non-desugared entry
+            // self.store.expr_map.push((src, id));
+        }
         id
     }
     fn missing_expr(&mut self) -> ExprId {
@@ -3971,17 +4077,21 @@ impl<'db> ExprCollector<'db> {
     }
     /// The source maps of a pattern just allocated for the expression `ptr`.
     fn map_pat_from_expr(&mut self, id: PatId, ptr: ExprPtr) -> PatId {
-        let src = self.expander.in_file(ptr);
-        self.store.expr_map.push((src, id.into()));
-        self.store.pat_map_back.insert(id, src.map(AstPtr::wrap_left));
+        if self.store.record {
+            let src = self.expander.in_file(ptr);
+            self.store.expr_map.push((src, id.into()));
+            self.store.pat_map_back.insert(id, src.map(AstPtr::wrap_left));
+        }
         id
     }
 
     /// The source maps of an expression just allocated for the pattern `ptr`.
     fn map_expr_from_pat(&mut self, id: ExprId, ptr: PatPtr) -> ExprId {
-        let src = self.expander.in_file(ptr);
-        self.store.pat_map.push((src, id.into()));
-        self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_right));
+        if self.store.record {
+            let src = self.expander.in_file(ptr);
+            self.store.pat_map.push((src, id.into()));
+            self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_right));
+        }
         id
     }
 
@@ -3991,9 +4101,11 @@ impl<'db> ExprCollector<'db> {
     }
     /// The source maps of a pattern just allocated for `ptr`.
     fn map_pat(&mut self, id: PatId, ptr: PatPtr) -> PatId {
-        let src = self.expander.in_file(ptr);
-        self.store.pat_map_back.insert(id, src.map(AstPtr::wrap_right));
-        self.store.pat_map.push((src, id.into()));
+        if self.store.record {
+            let src = self.expander.in_file(ptr);
+            self.store.pat_map_back.insert(id, src.map(AstPtr::wrap_right));
+            self.store.pat_map.push((src, id.into()));
+        }
         id
     }
     // FIXME: desugared pats don't have ptr, that's wrong and should be fixed somehow.
@@ -4009,10 +4121,12 @@ impl<'db> ExprCollector<'db> {
     }
 
     fn alloc_label_desugared(&mut self, label: Label, ptr: LabelPtr) -> LabelId {
-        let src = self.expander.in_file(ptr);
         let id = self.store.labels.alloc(label);
-        self.store.label_map_back.insert(id, src);
-        self.store.label_map.push((src, id));
+        if self.store.record {
+            let src = self.expander.in_file(ptr);
+            self.store.label_map_back.insert(id, src);
+            self.store.label_map.push((src, id));
+        }
         id
     }
 

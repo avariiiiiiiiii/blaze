@@ -101,6 +101,58 @@ thread in reverse, and checks equal content IDs, fingerprints and pack bytes.
   the settle swap the image's values are made again by content (`load_pack`), so a long-lived
   daemon's interners don't grow without bound across generations.
 
+## Which values to hash-cons
+
+Interning a value pays where equal copies are common, where it is compared or hashed again
+and again, or where its content ID is wanted anyway; it costs one BLAKE3 of the value and a
+probe at every make. By that measure, as of 2026-10-29:
+
+| Value | Where | Owner | Request |
+| --- | --- | --- | --- |
+| every blaze-query memo of a `SHARE` kind, as bytes | `crates/blaze-query` | db | 3 |
+| `Masked` (a function's masked IR) | `crates/blaze-codegen/src/fold.rs` | codegen | 4 |
+| codegen's `TEMPLATE`, `RELEASE`, `MASKED`, `FOLDED`, `STATIC` values | `crates/blaze-codegen/src/query.rs` | codegen | 4 (by 3) |
+| `Layout` (`layout_of_ty_query`, `layout_of_adt_query`) | `crates/hir-ty/src/layout.rs` | items | 5 (applied; callers in `v2/requests/items.md`) |
+
+- **Memo bytes** (request 3) are the general case: one copy of equal values whichever view or
+  key made them, keyed by the schema and fingerprint each memo has anyway, so it needs no
+  interner of this crate. It is where idea 2's shared generic code lands: two instances whose
+  templates are equal keep one buffer.
+- **`Masked`** (request 4): `fold::groups` BLAKE3s every candidate's masked IR on every build.
+  Interned in the daemon's one `HashCons<Masked>`, with the same domain and feed as today so
+  every content ID is unchanged, a shape is hashed once per distinct shape ever seen.
+- **`Layout`** (request 5): rustc's own interned value. Each read clones an `Arc<Layout>`
+  today, a shared counter write on the read path; interned, a read is a pointer copy and
+  equality a pointer compare. `hash_std` feeds `rustc_abi`'s derived `Hash` with `usize` fixed
+  at 64 bits, so a foreign type needs no hand-written `hash_content`.
+
+Not hash-consed, and why:
+
+- `ItemTree` (`file_item_tree_query`), `Body`: one per file or body, rarely equal to another,
+  and salsa's cutoff already compares them only when they are made again. Interning would hash
+  every one for no sharing.
+- `InferenceResult<'db>`, `MirBody`: they borrow the database (`'db`) or hold interned
+  `crates/intern` types whose `Hash` writes addresses, so a content ID would be neither
+  `'static` nor deterministic. Their equal parts are already interned by `crates/intern`.
+- Macro expansions (`parse_macro_expansion`): keyed by the call, and equal expansions of
+  different calls carry different spans.
+- Signatures (`::of -> Arc<Self>`): small, one per item; an `Arc` clone per read is the same
+  cost as `Layout`'s but there are few reads per item. Worth measuring after request 5 lands.
+- `blaze-units`' plans and manifests: one per workspace; request 3's `SHARE` gives what-if views
+  one copy if cargo wants it.
+
+## The one-copy hook in blaze-query (request 3)
+
+A memo's value is `Arc<Value>` in a `ValueCell`; today `resolve_held` makes a new one for every
+execution. With `Query::SHARE`, the database keeps `values: Map<Arc<Value>>` keyed by the
+value's kind, schema and fingerprint: an execution whose bytes are already kept publishes the
+kept `Arc` (after a byte compare: a mismatch is a non-deterministic `Persist` or a collision,
+and stops naming the query), so every view and key holding that value holds one buffer.
+`collect` drops an entry no cell holds any more. The cold packs and the settle image write
+each distinct value once, for every kind, so memos with equal values map the same bytes after
+a swap. Nothing about a value's fingerprint, cutoff or bytes changes, so the hook can't change
+what any query answers.
+
 ## The state of the art, and how this compares
 
 - **rustc's interners** (`CtxtInterners`, `InternedSet` over a `ShardedHashMap`, values in a
@@ -156,3 +208,6 @@ thread in reverse, and checks equal content IDs, fingerprints and pack bytes.
   content isn't its entry's (before interning it).
 - Determinism: 8 threads in shuffled orders against one thread in reverse give the same content
   IDs, fingerprints and pack bytes.
+- `hash_std`: writes integers little-endian at fixed width (`usize` as 64 bits) and `str` as
+  std does, checked byte for byte against a hand feed; a derived-`Hash` enum interns as its
+  value.

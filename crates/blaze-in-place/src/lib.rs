@@ -26,12 +26,12 @@ pub fn unwritten(path: &Path) -> std::io::Result<File> {
 
 /// Copies the file at `from` to `to` as [`std::fs::copy`] does, but for the runs of it the
 /// filesystem keeps no blocks of, which stay so in the copy: a spliced executable has many,
-/// and a filesystem that shares no blocks writes the rest in full.
+/// and a filesystem that shares no blocks writes the rest in full. On Linux a filesystem that
+/// can't report holes or copy ranges is an error, never a copy in full.
 pub fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
-    if copy_holes(from, to).is_ok() {
-        return Ok(());
-    }
+    return copy_holes(from, to);
+    #[cfg(not(target_os = "linux"))]
     std::fs::copy(from, to).map(drop)
 }
 
@@ -47,7 +47,8 @@ fn copy_holes(from: &Path, to: &Path) -> std::io::Result<()> {
     let end = i64::try_from(metadata.len()).map_err(std::io::Error::other)?;
     let mut at = 0;
     while at < end {
-        // SAFETY: `lseek` and `copy_file_range` on descriptors this function holds open.
+        // SAFETY: `fd` is `source`'s descriptor, open until this function returns; `lseek`
+        // reads no memory of ours.
         let data = unsafe { libc::lseek(fd, at, libc::SEEK_DATA) };
         if data < 0 {
             let error = std::io::Error::last_os_error();
@@ -56,6 +57,7 @@ fn copy_holes(from: &Path, to: &Path) -> std::io::Result<()> {
             }
             return Err(error);
         }
+        // SAFETY: as above, `fd` is open until this function returns.
         let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
         if hole < 0 {
             return Err(std::io::Error::last_os_error());
@@ -63,6 +65,9 @@ fn copy_holes(from: &Path, to: &Path) -> std::io::Result<()> {
         let (mut source, mut target) = (data, data);
         while source < hole {
             let len = usize::try_from(hole - source).unwrap_or(usize::MAX).min(1 << 30);
+            // SAFETY: `fd` and `out` are the two files' descriptors, open until this function
+            // returns; `source` and `target` here are local offsets the call updates through
+            // `&mut`, and it reads or writes no other memory of ours.
             let copied =
                 unsafe { libc::copy_file_range(fd, &mut source, out, &mut target, len, 0) };
             match copied {

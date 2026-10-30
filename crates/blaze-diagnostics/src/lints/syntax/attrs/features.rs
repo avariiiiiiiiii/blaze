@@ -31,10 +31,10 @@ use crate::{
 const HAS_MIN_FEATURES: &[&str] = &["specialization"];
 
 /// A feature `#[feature(..)]` names: its name and where it is written in the attribute's file.
-struct Named<'a> {
-    attr: &'a Attr,
-    name: String,
-    range: TextRange,
+pub(crate) struct Named<'a> {
+    pub(crate) attr: &'a Attr,
+    pub(crate) name: String,
+    pub(crate) range: TextRange,
 }
 
 /// The feature lints of the crate.
@@ -102,7 +102,7 @@ fn unstable(cx: &Cx<'_, '_>, owner: &Owner, emitted: &mut Vec<Emitted>) {
 
 /// The features `owner`'s `#[feature(..)]`s name, in order: rustc's `FeatureParser` combines
 /// them into one list.
-fn named(owner: &Owner) -> impl Iterator<Item = Named<'_>> {
+pub(crate) fn named(owner: &Owner) -> impl Iterator<Item = Named<'_>> {
     owner.attrs.iter().filter(|it| is_feature(it)).flat_map(|attr| {
         let Args::List(list) = attr.args() else { return Vec::new() };
         features(&list).into_iter().map(|(name, range)| Named { attr, name, range }).collect()

@@ -7,7 +7,8 @@
 //! `check_defaultness`, `check_item_safety`, `check_type_no_bounds`,
 //! `check_type_alias_where_clause_location`, `check_foreign_*`, `check_trait_fn_not_const`,
 //! `check_impl_fn_not_const`, `check_async_fn_in_const_trait_or_impl`, `check_item_named`,
-//! `check_nomangle_item_asciionly`, `check_mod_file_item_asciionly`, `deny_*`) and
+//! `check_nomangle_item_asciionly`, `check_mod_file_item_asciionly`, `ending_semi_or_hi`,
+//! `deny_*`) and
 //! `diagnostics.rs`, and `compiler/rustc_parse/src/parser/item.rs` (`parse_item_impl`) and its
 //! `diagnostics.rs` (`TraitImplModifierInInherentImpl`) (MIT or Apache-2.0).
 
@@ -301,12 +302,15 @@ fn trait_fn_const(
     v.emit(out, node, diag);
 }
 
-/// An impl: the parser's errors of an inherent impl's modifiers, then `visit_item`'s
-/// visibility check.
+/// An impl: of a trait, `visit_item`'s visibility check and E0198; inherent, the parser's
+/// errors of its modifiers, then the visibility check.
 pub(super) fn impl_(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
     let Some(impl_) = ast::Impl::cast(node.clone()) else { return };
-    if impl_.trait_().is_some() {
+    if let Some(trait_) = impl_.trait_() {
         visibility(v, node, impl_.visibility(), VisNote::TraitImpl, out);
+        if let (Some(unsafe_), Some(excl)) = (impl_.unsafe_token(), impl_.excl_token()) {
+            unsafe_negative(v, node, &unsafe_, &excl, &trait_, out);
+        }
         return;
     }
     if let Some(self_ty) = impl_.self_ty() {
@@ -326,6 +330,41 @@ pub(super) fn impl_(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
         }
     }
     visibility(v, node, impl_.visibility(), VisNote::IndividualImplItems, out);
+}
+
+/// E0198 `UnsafeNegativeImpl`: from the `!` to the end of the trait's path.
+fn unsafe_negative(
+    v: &V<'_, '_, '_, '_>,
+    node: &SyntaxNode,
+    unsafe_: &SyntaxToken,
+    excl: &SyntaxToken,
+    trait_: &ast::Type,
+    out: &mut Out,
+) {
+    let path = match trait_ {
+        ast::Type::PathType(it) => it.path().map(|it| it.syntax().text_range()),
+        _ => None,
+    };
+    let negative = excl.text_range();
+    let end = path.unwrap_or(trait_.syntax().text_range()).end().max(negative.end());
+    let span = v.span(TextRange::new(negative.start(), end));
+    let mut diag = Diag::error(Some("E0198"), "negative impls cannot be unsafe", span);
+    diag.span_label(v.span(negative), "negative because of this");
+    diag.span_label(v.span(unsafe_.text_range()), "unsafe because of this");
+    v.emit(out, node, diag);
+}
+
+/// `ConstWithoutBody`, `StaticWithoutBody`, `TyAliasWithoutBody`, `AssocConstWithoutBody` and
+/// `AssocTypeWithoutBody`: `message`, with the placeholder definition `code` of the `what`.
+fn without_body(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, message: &str, what: &str, code: &str, out: &mut Out) {
+    let mut diag = Diag::error(None, message, v.span(item_range(node)));
+    diag.suggestion(
+        v.span(ending_semi_or_hi(node)),
+        format!("provide a definition for the {what}"),
+        code,
+        Applicability::HasPlaceholders,
+    );
+    v.emit(out, node, diag);
 }
 
 /// A trait or a trait alias: `#[no_mangle]`, then what an auto trait cannot have.
@@ -510,7 +549,7 @@ pub(super) fn union_(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
     v.emit(out, node, Diag::error(None, "unions cannot have zero fields", v.span(item_range(node))));
 }
 
-/// A `const` item (hir's `MissingBody` gives one without a body), free or associated.
+/// A `const` item, free or associated: one without a body is refused but in a trait.
 pub(super) fn const_(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
     let Some(item) = ast::Const::cast(node.clone()) else { return };
     let ctxt = v.ctxt(node);
@@ -518,9 +557,16 @@ pub(super) fn const_(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
         Ctxt::Free | Ctxt::Foreign(_) => {
             no_mangle(v, node, out);
             defaultness(v, node, item.default_token(), out);
+            if matches!(ctxt, Ctxt::Free) && item.body().is_none() {
+                without_body(v, node, "free constant item without body", "constant", " = <expr>;", out);
+            }
         }
         Ctxt::Trait(_) | Ctxt::TraitImpl(_) | Ctxt::Impl(_) => {
             assoc(v, node, item.default_token(), &ctxt, out);
+            if !matches!(ctxt, Ctxt::Trait(_)) && item.body().is_none() {
+                let message = "associated constant in `impl` without body";
+                without_body(v, node, message, "constant", " = <expr>;", out);
+            }
             assoc_vis(v, node, &ctxt, out);
             if let Some(underscore) = item.underscore_token() {
                 let span = v.span(underscore.text_range());
@@ -532,19 +578,29 @@ pub(super) fn const_(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
     }
 }
 
-/// A `static` (hir's `MissingBody` gives one without a body): its safety, or in an `extern`
-/// block what a foreign static cannot have.
+/// A `static`: its safety and its body, or in an `extern` block what a foreign static cannot
+/// have. rustc's parser makes one in a trait or impl a `const` (with its error
+/// `AssociatedStaticItemNotAllowed`), checked as one.
 pub(super) fn static_(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
     let Some(item) = ast::Static::cast(node.clone()) else { return };
-    match v.ctxt(node) {
+    let ctxt = v.ctxt(node);
+    match &ctxt {
         Ctxt::Foreign(block) => {
-            safety_in_extern(v, node, item.safe_token().or(item.unsafe_token()), &block, out);
+            safety_in_extern(v, node, item.safe_token().or(item.unsafe_token()), block, out);
             if let (Some(name), Some(body)) = (item.name(), item.body()) {
-                body_in_extern(v, node, &name, body.syntax().text_range(), &block, "static", out);
+                body_in_extern(v, node, &name, body.syntax().text_range(), block, "static", out);
             }
-            ascii_in_extern(v, node, item.name(), &block, out);
+            ascii_in_extern(v, node, item.name(), block, out);
         }
-        _ => {
+        Ctxt::Trait(_) | Ctxt::TraitImpl(_) | Ctxt::Impl(_) => {
+            assoc(v, node, None, &ctxt, out);
+            if !matches!(ctxt, Ctxt::Trait(_)) && item.body().is_none() {
+                let message = "associated constant in `impl` without body";
+                without_body(v, node, message, "constant", " = <expr>;", out);
+            }
+            assoc_vis(v, node, &ctxt, out);
+        }
+        Ctxt::Free => {
             no_mangle(v, node, out);
             safe_outside_extern(v, node, item.safe_token(), out);
             if item.unsafe_token().is_some() {
@@ -555,11 +611,15 @@ pub(super) fn static_(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
                 );
                 v.emit(out, node, diag);
             }
+            if item.body().is_none() {
+                without_body(v, node, "free static item without body", "static", " = <expr>;", out);
+            }
         }
     }
 }
 
-/// A type alias (hir's `MissingBody` gives one without a type), free, associated or foreign.
+/// A type alias, free, associated or foreign: one without a type is refused but in a trait
+/// or an `extern` block.
 pub(super) fn type_alias(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
     let Some(alias) = ast::TypeAlias::cast(node.clone()) else { return };
     let ctxt = v.ctxt(node);
@@ -567,6 +627,9 @@ pub(super) fn type_alias(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out
         Ctxt::Free => {
             no_mangle(v, node, out);
             defaultness(v, node, alias.default_token(), out);
+            if alias.ty().is_none() {
+                without_body(v, node, "free type alias without body", "type", " = <type>;", out);
+            }
             no_bounds(v, node, alias.type_bound_list(), "this context", out);
             where_clause_location(v, node, &alias, out);
         }
@@ -574,6 +637,10 @@ pub(super) fn type_alias(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out
         Ctxt::Trait(_) | Ctxt::TraitImpl(_) | Ctxt::Impl(_) => {
             assoc(v, node, alias.default_token(), &ctxt, out);
             if matches!(ctxt, Ctxt::TraitImpl(_) | Ctxt::Impl(_)) {
+                if alias.ty().is_none() {
+                    let message = "associated type in `impl` without body";
+                    without_body(v, node, message, "type", " = <type>;", out);
+                }
                 no_bounds(v, node, alias.type_bound_list(), "`impl`s", out);
             }
             assoc_vis(v, node, &ctxt, out);

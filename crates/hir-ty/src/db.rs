@@ -543,7 +543,7 @@ impl<'db> InternedClosureId<'db> {
     pub fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
         if cfg!(debug_assertions) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
-            let expr = &store[loc.expr];
+            let expr = store.expr(loc.expr);
             assert!(
                 matches!(
                     expr,
@@ -577,7 +577,7 @@ impl<'db> InternedCoroutineId<'db> {
     pub fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
         if cfg!(debug_assertions) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
-            let expr = &store[loc.expr];
+            let expr = store.expr(loc.expr);
             assert!(
                 matches!(
                     expr,
@@ -611,7 +611,7 @@ impl<'db> InternedCoroutineClosureId<'db> {
     pub fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
         if cfg!(debug_assertions) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
-            let expr = &store[loc.expr];
+            let expr = store.expr(loc.expr);
             assert!(
                 matches!(
                     expr,
@@ -726,7 +726,7 @@ impl<'db> AnonConstId<'db> {
         let loc = self.loc(db);
         matches!(loc.owner, ExpressionStoreOwnerId::Body(_))
             && matches!(
-                hir_def::expr_store::ExpressionStore::of(db, loc.owner)[loc.expr],
+                hir_def::expr_store::ExpressionStore::of(db, loc.owner).expr(loc.expr),
                 hir_def::hir::Expr::Const(_)
             )
     }

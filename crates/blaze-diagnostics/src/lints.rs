@@ -19,7 +19,7 @@ pub mod edit_distance;
 mod levels;
 mod names;
 pub mod registry;
-mod syntax;
+pub(crate) mod syntax;
 
 pub(crate) use levels::level_at;
 pub use levels::{CommandLine, Level};
@@ -46,7 +46,7 @@ use crate::{
 pub fn early(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
     let mut found = syntax::lints(cx, cmd);
     found.extend(names::before_abort(cx));
-    found.extend(bodies::before_abort(cx));
+    found.extend(bodies::before_abort(cx, cmd.codegen));
     found
 }
 

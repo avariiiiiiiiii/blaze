@@ -20,7 +20,8 @@ fn ui_fixture(fixture: &str) -> String {
     normalized(&stderr)
 }
 
-/// A `core` and a `std` of what the FFI tests use: `Option`, `ptr::null_mut`, `unreachable!`, and
+/// A `core` and a `std` of what the FFI tests use: `Option`, `ptr::null_mut`, the
+/// `unreachable` and `todo` macros (as loops: no test runs them), and
 /// `ffi` with `c_void` and the runtime's functions declared `#[rustc_canonical_symbol]` as
 /// `library/core/src/ffi/mod.rs` declares them.
 const FFI_STD: &str = r#"//- /core.rs crate:core edition:2021 library
@@ -93,13 +94,19 @@ macro_rules! unreachable {
         loop {}
     };
 }
+#[macro_export]
+macro_rules! todo {
+    () => {
+        loop {}
+    };
+}
 pub mod prelude {
     pub mod rust_2015 {
-        pub use crate::unreachable;
+        pub use crate::{todo, unreachable};
         pub use core::option::Option::{self, None, Some};
     }
     pub mod rust_2021 {
-        pub use crate::unreachable;
+        pub use crate::{todo, unreachable};
         pub use core::option::Option::{self, None, Some};
     }
 }
@@ -305,4 +312,172 @@ fn main() {}
     let messages = checked(&fixture).messages();
     let extern_ = "declarations returning `c_void` are not compatible with C functions returning `void`";
     assert_eq!(messages, [extern_, extern_], "{messages:?}");
+}
+
+#[test]
+fn mismatched_lifetime_syntaxes_missing_lifetime_kind() {
+    ui_test(
+        "missing-lifetime-kind.rs",
+        include_str!("items/missing-lifetime-kind.rs"),
+        include_str!("items/missing-lifetime-kind.stderr"),
+    );
+}
+
+/// `&'static self` gives the return type's elided lifetime, and the suggestion names it.
+#[test]
+fn mismatched_lifetime_syntaxes_example_from_issue48686() {
+    ui_test(
+        "example-from-issue48686.rs",
+        include_str!("items/example-from-issue48686.rs"),
+        include_str!("items/example-from-issue48686.stderr"),
+    );
+}
+
+/// No lint where the lifetimes agree, where the return type's lifetimes are a `fn` pointer's
+/// own, or where `dyn Trait + '_` is the only other syntax; `impl Trait + '_` and a provided
+/// trait method are (twice, as rustc's `check_trait_item` and `check_fn` both lint it, which
+/// only `-Z deduplicate-diagnostics=no` shows).
+#[test]
+fn mismatched_lifetime_syntaxes_scopes() {
+    let source = r#"
+#![allow(dead_code)]
+trait Tr {}
+struct S<'a>(&'a u8);
+fn agree(x: &u8) -> &u8 { x }
+fn named<'a>(x: &'a u8) -> S<'a> { S(x) }
+fn fn_ptr(_: &u8) -> fn(S) -> S { loop {} }
+fn object<'a>(_: &'a u8) -> Box<dyn Tr + '_> { loop {} }
+fn outlives<'a>(x: &'a u8) -> impl Tr + '_ { x }
+impl Tr for &u8 {}
+struct Box<T: ?Sized>(T);
+trait Provided {
+    fn get<'a>(&self, x: &'a u8) -> S<'a> { S(x) }
+    fn mixed<'a>(&'a self) -> S { loop {} }
+}
+fn main() {}
+"#;
+    let fixture = format!("{FFI_STD}//- /main.rs crate:main edition:2021 deps:core,std\n{source}");
+    let messages = checked(&fixture).messages();
+    let named = "hiding a lifetime that's named elsewhere is confusing";
+    let eliding = "eliding a lifetime that's named elsewhere is confusing";
+    assert_eq!(messages, [eliding, named], "{messages:?}");
+    let options = compiletest(Mode::Other, &Options::default());
+    let kept = checked_with(&fixture, "$DIR/", &options).messages();
+    assert_eq!(kept, [eliding, named, named], "{kept:?}");
+}
+
+/// `tests/ui/async-await/track-caller/panic-track-caller.rs`'s `nofeat` revision, of a free
+/// `async fn`: the attribute, the function, and the feature's notes.
+#[test]
+fn ungated_async_fn_track_caller() {
+    let source = r#"#[track_caller]
+async fn bar_track_caller() {}
+
+fn main() {}
+"#;
+    let expected = r#"warning: `#[track_caller]` on async functions is a no-op
+  --> $DIR/track-caller.rs:1:1
+   |
+LL | #[track_caller]
+   | ^^^^^^^^^^^^^^^
+LL | async fn bar_track_caller() {}
+   | ------------------------------ this function will not propagate the caller location
+   |
+   = note: see issue #110011 <https://github.com/rust-lang/rust/issues/110011> for more information
+   = help: add `#![feature(async_fn_track_caller)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+   = note: `#[warn(ungated_async_fn_track_caller)]` on by default
+
+warning: 1 warning emitted
+
+"#;
+    assert_eq!(ui("track-caller.rs", "2021", source), expected);
+}
+
+/// Methods are linted too; a function that is not `async`, a required trait method and a
+/// crate with the feature are not.
+#[test]
+fn ungated_async_fn_track_caller_of_methods_and_with_the_feature() {
+    let source = r#"
+#![allow(dead_code)]
+struct Foo;
+impl Foo {
+    #[track_caller]
+    async fn bar_assoc() {}
+}
+trait Tr {
+    #[track_caller]
+    async fn required();
+}
+#[track_caller]
+fn not_async() {}
+fn main() {}
+"#;
+    let fixture = format!("//- /main.rs crate:main edition:2021\n{source}");
+    let messages = checked(&fixture).messages();
+    assert_eq!(messages, ["`#[track_caller]` on async functions is a no-op"], "{messages:?}");
+    let gated = format!("//- /main.rs crate:main edition:2021\n#![feature(async_fn_track_caller)]\n{source}");
+    let messages = checked(&gated).messages();
+    assert!(!messages.iter().any(|it| it.contains("no-op")), "{messages:?}");
+}
+
+#[test]
+fn non_local_definitions_consts() {
+    assert_eq!(ui("consts.rs", "2021", include_str!("items/consts.rs")), include_str!("items/consts.stderr"));
+}
+
+#[test]
+fn non_local_definitions_inside_macro_rules() {
+    let source = include_str!("items/inside-macro_rules.rs");
+    assert_eq!(ui("inside-macro_rules.rs", "2021", source), include_str!("items/inside-macro_rules.stderr"));
+}
+
+/// The `check-pass` tests without a `.stderr`: modules and anonymous constants are transparent.
+#[test]
+fn non_local_definitions_transparent_modules_and_const_anons() {
+    let tests = [
+        ("module_as_local.rs", include_str!("items/module_as_local.rs")),
+        ("convoluted-locals-131474.rs", include_str!("items/convoluted-locals-131474.rs")),
+        ("convoluted-locals-131474-with-mods.rs", include_str!("items/convoluted-locals-131474-with-mods.rs")),
+        ("convoluted-locals-132427.rs", include_str!("items/convoluted-locals-132427.rs")),
+    ];
+    for (name, source) in tests {
+        assert_eq!(ui(name, "2015", source), "", "{name}");
+    }
+}
+
+/// A `#[macro_export]` `macro_rules!` in a function, in a method (up 2 bodies) and in a
+/// `const _`, which is ignored at the top level.
+#[test]
+fn non_local_definitions_macro_rules() {
+    let source = r#"
+const _: () = {
+    #[macro_export]
+    macro_rules! ignored { () => {} }
+};
+fn main() {
+    #[macro_export]
+    macro_rules! m { () => {} }
+    struct InsideMain;
+    impl InsideMain {
+        fn bar() {
+            #[macro_export]
+            macro_rules! m2 { () => {} }
+        }
+    }
+}
+"#;
+    let fixture = format!("//- /main.rs crate:main edition:2021\n{source}");
+    let checked = checked(&fixture);
+    let messages = checked.messages();
+    let message = "non-local `macro_rules!` definition, `#[macro_export]` macro should be written at top level module";
+    assert_eq!(messages, [message, message], "{messages:?}");
+    let helps: Vec<&str> = checked.diags.iter().flat_map(|it| &it.children).map(|it| it.message.as_str()).filter(|it| it.starts_with("remove")).collect();
+    assert_eq!(
+        helps,
+        [
+            "remove the `#[macro_export]` or move this `macro_rules!` outside the of the current function `main`",
+            "remove the `#[macro_export]` or move this `macro_rules!` outside the of the current associated function `bar` and up 2 bodies",
+        ]
+    );
 }

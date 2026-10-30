@@ -329,8 +329,10 @@ fn crate_impl_self_tys_cycle<'db>(
     _: salsa::Id,
     krate: Crate,
 ) -> CrateImplSelfTys<'db> {
-    let error = Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed).store();
-    Batch::filled(module_impls(db, krate), || StoredEarlyBinder::bind(error.clone()))
+    let error = StoredEarlyBinder::bind_no_rigid_aliases(
+        Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed).store(),
+    );
+    Batch::filled(module_impls(db, krate), || error.clone())
 }
 
 /// Reads the crate's self types: a trait's arguments may name `Self`.
@@ -370,7 +372,7 @@ fn crate_impl_predicates_cycle<'db>(
     _: salsa::Id,
     krate: Crate,
 ) -> CrateImplPredicates<'db> {
-    let empty = StoredEarlyBinder::bind(Clauses::empty().store());
+    let empty = StoredEarlyBinder::bind_no_rigid_aliases(Clauses::empty().store());
     Batch::filled(module_impls(db, krate), || {
         GenericPredicates::from_explicit_own_predicates(empty.clone())
     })

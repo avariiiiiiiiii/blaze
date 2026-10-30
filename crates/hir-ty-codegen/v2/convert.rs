@@ -132,6 +132,7 @@ pub(crate) fn function(
         relocs,
         data: own.data,
         inlined: Vec::new(),
+        coverage: None,
         side,
         unwind,
         lines,
@@ -330,6 +331,11 @@ fn reloc_target(
         RelocName::User { namespace: fragment::INLINED, .. } => {
             Err("a relocation at a reference of a body built in".to_owned())
         }
+        #[cfg(feature = "llvm")]
+        RelocName::User { namespace: crate::llvm::sanitize::COVERAGE, index } => match index {
+            0..3 => Ok(Target::Coverage(index)),
+            _ => Err(format!("a relocation at SanitizerCoverage array {index}, of 3")),
+        },
         RelocName::User { namespace, .. } => {
             Err(format!("a relocation in the unknown namespace {namespace}"))
         }

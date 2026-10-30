@@ -36,7 +36,8 @@ pub use crate::{
     files::Files,
     input::{
         BuiltCrateData, BuiltDependency, Crate, CrateBuilder, CrateBuilderId, CrateDataBuilder,
-        CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CratesIdMap, CratesMap,
+        CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateType, CrateTypes,
+        CratesIdMap, CratesMap,
         DependencyBuilder, Env, ExtraCrateData, LangCrateOrigin, ProcMacroLoadingError,
         ProcMacroPaths, ReleaseChannel, SourceRoot, SourceRootId, TargetKind, UniqueCrateData,
     },
@@ -148,7 +149,7 @@ pub struct FileText {
     #[returns(ref)]
     #[get(text_field)]
     #[set(set_text_field)]
-    text: Arc<str>,
+    text: std::sync::Arc<str>,
     pub file_id: vfs::FileId,
     /// The module a crate root's text ends with that the compiler wrote, not the file on disk:
     /// blaze's test harness or list of proc macros. rustc injects its own after it applies
@@ -201,7 +202,11 @@ impl FileText {
         files::no_text()
     }
 
-    pub fn text<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db Arc<str> {
+    /// The text, which the file's parse tree shares ([`EditionedFileId::parse`]).
+    pub fn text<'db, Db: ?Sized + salsa::Database>(
+        self,
+        db: &'db Db,
+    ) -> &'db std::sync::Arc<str> {
         self.text_field(db)
     }
 
@@ -385,6 +390,69 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision);
 
     fn line_column(&self, file: FileId, offset: TextSize) -> Result<(u32, u32), ()>;
+}
+
+/// Tells salsa which plane task a thread runs, from the pool's pump
+/// ([`blaze_graph::pump::depth`]), so a task that would wait on one below it on its own thread
+/// unwinds with [`salsa::Cancelled::WouldWaitOnItself`] (which [`run_on_pool`] runs again)
+/// instead of waiting forever. For each database whose [`SourceDatabase::run_all`] is
+/// [`run_on_pool`]; once per process, so a second call does nothing.
+pub fn install_plane_hooks() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| salsa::set_task_depth(blaze_graph::pump::depth));
+}
+
+/// [`SourceDatabase::run_all`] on `pool`: each task is a job near this thread's group, reading
+/// `db` by reference, and the calling thread pump-waits for the batch ([`Pool::scope`]).
+///
+/// A task that unwinds with [`salsa::Cancelled::WouldWaitOnItself`] asked for a query that a
+/// task below it on its thread runs, which can't end before it does; it runs again in another
+/// round, once every task of this one has ended. A job's completion can't reach its scope, so
+/// the round is the way back. The first other panic, salsa's other cancellations included,
+/// goes on from here once its round is over, and nothing is run again after it.
+///
+/// [`Pool::scope`]: blaze_graph::pool::Pool::scope
+pub fn run_on_pool(
+    db: &dyn SourceDatabase,
+    pool: &blaze_graph::pool::Pool,
+    count: usize,
+    task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync),
+) {
+    let near = blaze_graph::pool::group();
+    let panicked = std::sync::Mutex::new(None);
+    let again = std::sync::Mutex::new(Vec::new());
+    let mut round: Vec<usize> = (0..count).collect();
+    while !round.is_empty() {
+        pool.scope(|scope| {
+            for &at in &round {
+                let (panicked, again) = (&panicked, &again);
+                scope.submit(
+                    near,
+                    move || task(db, at),
+                    move |ran| {
+                        let Err(panic) = ran else { return };
+                        let waited_on_itself = matches!(
+                            panic.downcast_ref::<salsa::Cancelled>(),
+                            Some(salsa::Cancelled::WouldWaitOnItself)
+                        );
+                        if waited_on_itself {
+                            again.lock().unwrap_or_else(|it| it.into_inner()).push(at);
+                        } else {
+                            let mut first = panicked.lock().unwrap_or_else(|it| it.into_inner());
+                            first.get_or_insert(panic);
+                        }
+                    },
+                );
+            }
+        });
+        round = std::mem::take(&mut *again.lock().unwrap_or_else(|it| it.into_inner()));
+        if panicked.lock().unwrap_or_else(|it| it.into_inner()).is_some() {
+            break;
+        }
+    }
+    if let Some(panic) = panicked.into_inner().unwrap_or_else(|it| it.into_inner()) {
+        panic::resume_unwind(panic);
+    }
 }
 
 static NEXT_NONCE: AtomicUsize = AtomicUsize::new(0);

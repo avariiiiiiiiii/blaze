@@ -69,6 +69,7 @@ carry `#[lang = "mem_size_const"]`/`"mem_align_const"`; rustc's checks read them
 unevaluated constants; the collector already takes associated consts, as for `RangeMin`.)
 
 > forwarded to db (`hir-def/src/lang_item.rs`; `intern`'s `sym` is format's, db asks it or adds the four symbols with the lang items).
+> applied by db-expand: `PanicNullReferenceConstructed`, `PanicInvalidEnumConstruction` (`FunctionId`), `SizeOf` (`sym::mem_size_const`) and `AlignOf` (`sym::mem_align_const`, `ConstId`) in `hir-def/src/lang_item.rs`, names checked in nightly-2026-10-25's `library/core`. Test `check_and_layout_lang_items_are_found`. The frozen encoding's version moves to `hir_def::nameres::frozen::ENCODING` (now 8, since the lang item list is in the bytes). What waits: format's four symbols in `intern/src/symbol/symbols.rs` (hir-def doesn't compile without them), and codegen's `blaze-engine/src/frozen.rs` key hashing `ENCODING` (asked in `v2/requests/db-expand.md`).
 
 ## 4. Other exhaustive matches on `AssertKind`/`CastKind` outside hir-ty-mir
 

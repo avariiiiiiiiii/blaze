@@ -99,6 +99,14 @@ Each target's file (`targets/<target>.rs`) begins with the invariants it checks.
 | `macro_wasm_host` | a fixed guest that calls every host and WASI import with pointers, lengths and numbers from the input | the host never panics and never reads or writes outside the guest's memory (every guest pointer and length is checked); bounded |
 | `macro_wasm_wire` | a fixed guest that outputs the input, decoded as the token-tree wire | never panics; bounded; at most two trees per 15 bytes |
 | `macro_wasm_lex` | `blaze_macro_wasm::tokens`, the host's lexer for `ts_from_str` | never panics; bounded; at most 2 trees per byte, plus one |
+| `usercode_wire` | blaze-usercode's fork-server frames (`test::wire::Frames`, `Frame::decode`), what a test binary writes | pushed whole, a byte at a time, as `needed` asks and in the input's pieces, `pop` gives a plain walk's frames to the first error; a length past `LONGEST` is an error, never an allocation; decode is canonical; bounded |
+| `usercode_script_output` | `blaze_build_script::output::parse`, a build script's stdout | reads as its directives alone, by cargo's rule, and as its lines one at a time; kept texts are one line and never name a moved `OUT_DIR`; bounded |
+| `usercode_script_elide` | `blaze_build_script::elide`, a build script's source and its lexer | the lexer's tokens are the source's own text in order; what is elided verifies against itself and refuses anything appended; bounded |
+| `usercode_script_verify` | `blaze_build_script::verify` of a run's output against the elided one | `Ok` exactly when they are equal, else the error naming the first differing line; bounded |
+| `usercode_trace_record`, `usercode_trace_report` | the sandbox trace's lines (`trace::parse`) and reports (`trace::decode`) | agree with a model of the grammar; round trip; reading in pieces equals reading whole; bounded |
+| `usercode_index_shape`, `usercode_run_value` | `index::Shape::decode`, `run::Value::decode` | decode then encode is the identity; bounded |
+| `codegen_asm` | `hir_ty_codegen::Assembled::from_bytes`, assembled code kept in the store | `None`, or `to_bytes` is the input; at most `4 * len + 1 KiB` allocated at once |
+| `hir_item_tree`, `hir_expr_store`, `hir_body`, `hir_store_source_map`, `hir_body_source_map` | `Persist::read` then `decode()` of the persisted item tree, expression store, body and their source maps | `Err`, or a value written back the same (for column edits of a valid buffer, exactly the input); decoded syntax contexts are compared and dropped, never given to a database; bounded |
 
 Several seed corpora hold inputs that show a bug their owner has not fixed yet (each listed in
 the owner's `v2/requests/<owner>.md`); those targets' `#[test]`s fail until it is fixed.

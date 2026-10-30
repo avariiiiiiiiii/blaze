@@ -621,3 +621,82 @@ fn flags_that_leave_elision_true() {
         assert!(!flags_allow(&refused), "{refused:?}");
     }
 }
+
+/// Elision reading tokens on demand against elision over the whole token list
+/// ([`reference::elide`]), over seeded scripts of every form it reads and the forms around
+/// them: a head with docs, comments, attributes or another signature; statements of each
+/// macro form, delimiter and argument kind, escapes in the format string, unused and missing
+/// arguments; a tail with nothing, a comment, or another item. The same bytes, or `None`.
+#[test]
+fn on_demand_elision_says_what_the_whole_list_said() {
+    let heads = [
+        "",
+        "//! Inner.\n",
+        "//! Inner.\n/// Outer.\n",
+        "/// Outer.\n//! Inner after outer.\n",
+        "// Plain.\n/* block */\n",
+        "use std::env;\n",
+        "#![allow(x)]\n",
+        "\u{feff}",
+    ];
+    let mains = ["fn main() {", "fn main(){\n", "pub fn main() {", "fn main() -> () {", "fn main ( ) {"];
+    let statements = [
+        "\n    println!(\"cargo:rustc-cfg=a\");",
+        "\n    print!(\"cargo:x={}\\n\", 1);",
+        "\n    println![\"cargo:{}={}\", \"k\", 'v'];",
+        "\n    println!{\"cargo:{0}{0}\", true}",
+        "\n    println!{\"cargo:x\"};",
+        "\n    println!(\"cargo:{{x}}\");",
+        "\n    println!(\"cargo:{}\", 2147483647);",
+        "\n    println!(\"cargo:{}\", 2147483648);",
+        "\n    println!(\"cargo:\\u{7b}\");",
+        "\n    println!(\"cargo:\\x41\\n{}\", \"\\u{e9}\\\"\");",
+        "\n    println!(\"not cargo\");",
+        "\n    println!(r#\"cargo:raw={}\"#, r\"r\");",
+        "\n    println!(\"cargo:{}\", x);",
+        "\n    println!(\"cargo:{1}\", \"a\", \"b\");",
+        "\n    println!(\"cargo:{1}{0}\", \"a\", \"b\",);",
+        "\n    println!(\"cargo:a\",);",
+        "\n    println!(\"cargo:a\\\n        b\");",
+        "\n    println!(\"cargo:{:?}\", 1);",
+        "\n    println!(\"cargo:{}\", \"{\");",
+        "\n    print!(\"cargo:x\");",
+        "\n    println!(\"cargo:x\")",
+        "\n    ;",
+        "\n    std::env::var(\"X\");",
+        "\n    println!(\"cargo:{}\", 0x1);",
+        "\n    println!(\"cargo:{}\", '\\n');",
+        "\n    println!(\"cargo:{} {}\", 1);",
+        "\n    println!(\"cargo:{01}\", 1, 2);",
+        "\n    // A comment.\n    println!(\"cargo:c\");",
+    ];
+    let tails = ["\n}\n", "}", "\n}\nfn other() {}\n", "\n} // End.\n", "\n}}\n", "\n"];
+    let mut state = 0x3c6e_f372_fe94_f82bu64;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let root = Path::new("/p/foo/build.rs");
+    let (mut read, mut refused) = (0, 0);
+    for _ in 0..60_000 {
+        let mut source = String::from(heads[next(heads.len())]);
+        source.push_str(mains[next(mains.len())]);
+        for _ in 0..next(5) {
+            source.push_str(statements[next(statements.len())]);
+        }
+        source.push_str(tails[next(tails.len())]);
+        if next(8) == 0 {
+            source = source.replace('\n', "\r\n");
+        }
+        let files = BTreeMap::from([(root.to_owned(), source.clone().into_bytes())]);
+        let new = elide(root, &files);
+        assert_eq!(new, reference::elide(root, &files), "{source:?}");
+        match new {
+            Some(_) => read += 1,
+            None => refused += 1,
+        }
+    }
+    assert!(read > 1_000 && refused > 1_000, "{read} read, {refused} refused");
+}

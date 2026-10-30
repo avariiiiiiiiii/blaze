@@ -4,14 +4,12 @@
 //! `DEP_<links>_<KEY>` of the runs it depends on), its result kept in the store by what it read
 //! ([`blaze_usercode::run`]), a script that provably prints only constants not run at all
 //! ([`blaze_usercode::script::inert`]), and what it printed applied as cargo applies it: its
-//! cfgs and env to its package's units through the front end ([`Lowered::ran`]), its link
+//! cfgs and env to its package's units through the job's writer ([`Writer::ran`]), its link
 //! libraries and search paths to what links them, its metadata to its dependents' scripts.
 //!
 //! A run outside the sandbox is one `BLAZE_SANDBOX=off` or the workspace's
 //! `unsandboxed-build-scripts` (a member's `build-script = false`) takes out: it runs every
 //! time, and nothing of it is kept.
-//!
-//! [`Lowered::ran`]: load_cargo::v2::Lowered::ran
 
 #![forbid(unsafe_code)]
 
@@ -40,7 +38,7 @@ use blaze_usercode::{
 };
 
 use super::{Job, package_of, say};
-use crate::serve::work::Runs;
+use crate::serve::work::{Runs, Writer};
 
 /// What a build script's run told cargo, for what depends on it.
 #[derive(Clone, Debug)]
@@ -541,8 +539,15 @@ impl ScriptRun {
         Some(false)
     }
 
-    /// The run's end: judged, its warnings said, what it printed applied.
-    fn finish(&mut self, start: &Start, value: &Value, began: SystemTime, out: &mut Vec<Response>) -> Option<bool> {
+    /// The run's end: judged, its warnings said, what it printed applied through `writer`.
+    fn finish(
+        &mut self,
+        start: &Start,
+        value: &Value,
+        began: SystemTime,
+        writer: Option<&mut dyn Writer>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
         let job = self.job.clone();
         let link_dirs: Vec<PathBuf> = job.units().link_dirs.iter().map(PathBuf::from).collect();
         // What a run outside the sandbox prints is not checked: it could do anything anyway.
@@ -567,7 +572,11 @@ impl ScriptRun {
             Err(what) => return self.error(what, out),
         };
         let ran = load_cargo::v2::Ran { cfgs: output.cfgs.clone(), env: output.env.clone(), out_dir: out_dir.clone(), files };
-        if let Err(error) = job.lowered.ran(self.unit, &ran) {
+        let Some(writer) = writer else {
+            let what = format!("the build script run of unit {} was given no writer to apply it with", self.unit);
+            return self.error(what, out);
+        };
+        if let Err(error) = writer.ran(self.unit, &ran) {
             return self.error(error.what, out);
         }
         let package_id = job.unit(self.unit).map(|it| it.pkg_id.clone()).unwrap_or_default();
@@ -583,7 +592,13 @@ impl ScriptRun {
 }
 
 impl Runs for ScriptRun {
-    fn start(&mut self, store: &Store, effects: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
+    fn start(
+        &mut self,
+        store: &Store,
+        writer: Option<&mut dyn Writer>,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
         let State::Ready(mut start) = std::mem::replace(&mut self.state, State::Done) else { return None };
         // cargo's start of a run: `OUT_DIR` made, and the time it began.
         let stdout = match &start.how {
@@ -597,7 +612,7 @@ impl Runs for ScriptRun {
         match &start.how {
             How::Inert(value) => {
                 let value = value.clone();
-                self.finish(&start, &value, began, out)
+                self.finish(&start, &value, began, writer, out)
             }
             How::Outside(command) => {
                 effects.push(Effect::Spawn { command: Box::new(command.clone()), tag: self.tag });
@@ -607,7 +622,7 @@ impl Runs for ScriptRun {
             How::Sandboxed(prepared) => {
                 let begun = Run::begin(prepared.spec.clone(), store, &mut start.disk, self.tag, effects);
                 match begun {
-                    Ok(Begun::Reused(value)) => self.finish(&start, &value, began, out),
+                    Ok(Begun::Reused(value)) => self.finish(&start, &value, began, writer, out),
                     Ok(Begun::Running(run)) => {
                         self.state = State::Running { start, run: Some(run), began, cancelled: false };
                         None
@@ -629,6 +644,7 @@ impl Runs for ScriptRun {
         &mut self,
         completion: Completion,
         store: &mut Store,
+        writer: Option<&mut dyn Writer>,
         _effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -673,7 +689,7 @@ impl Runs for ScriptRun {
                 other => return self.error(format!("the build script's spawn ended as {other:?}"), out),
             },
         };
-        self.finish(&start, &value, began, out)
+        self.finish(&start, &value, began, writer, out)
     }
 
     fn cancel(&mut self, effects: &mut Vec<Effect>) -> Option<bool> {

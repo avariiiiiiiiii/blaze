@@ -414,7 +414,6 @@ fn run_as(
                 Some(view) => view.binds.push(Bind::read(&dir, &dir)),
                 None => with.readable.push(dir),
             }
-            with.not_inputs.push(file.clone());
             &with
         }
         None => spec,
@@ -554,8 +553,9 @@ fn run_in(
     if let Some(live) = also.live {
         recorder.live(&live.path)?;
     }
-    if interposer.is_some() {
+    if let Some(file) = interposer {
         recorder.interposed();
+        recorder.ours(file);
     }
     let (uid, gid) = (raw::uid(), raw::gid());
     // Before the fork, so that no signal ends this process before it passes them on; the

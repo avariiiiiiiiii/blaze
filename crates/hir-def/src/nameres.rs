@@ -238,9 +238,46 @@ pub struct DefMap {
 
     /// The diagnostics that need to be emitted for this crate.
     diagnostics: Vec<DefDiagnostic>,
+    /// `diagnostics` grouped by module, made once collection is done ([`Self::hand_over_scopes`]).
+    diagnostics_by_module: DiagnosticsByModule,
 
     /// The crate data that is shared between a crate's def map and all its block def maps.
     data: Arc<DefMapCrateData>,
+}
+
+/// A def map's diagnostics by module: the indices of the diagnostics in module order (stable,
+/// so each module's are in push order), and each module that has any with where its run of
+/// indices begins, sorted by module.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DiagnosticsByModule {
+    order: Box<[u32]>,
+    modules: Box<[(ModuleId, u32)]>,
+}
+
+impl DiagnosticsByModule {
+    fn of(diagnostics: &[DefDiagnostic]) -> DiagnosticsByModule {
+        let len = u32::try_from(diagnostics.len()).expect("a def map has 2^32 diagnostics");
+        let mut order: Vec<u32> = (0..len).collect();
+        order.sort_by_key(|&at| diagnostics[at as usize].in_module);
+        let mut modules: Vec<(ModuleId, u32)> = Vec::new();
+        for (start, &at) in (0u32..).zip(&order) {
+            let module = diagnostics[at as usize].in_module;
+            if modules.last().is_none_or(|&(last, _)| last != module) {
+                modules.push((module, start));
+            }
+        }
+        DiagnosticsByModule { order: order.into(), modules: modules.into() }
+    }
+
+    /// The indices of `module`'s diagnostics, in push order.
+    fn of_module(&self, module: ModuleId) -> &[u32] {
+        let Ok(at) = self.modules.binary_search_by_key(&module, |&(it, _)| it) else {
+            return &[];
+        };
+        let start = self.modules[at].1 as usize;
+        let end = self.modules.get(at + 1).map_or(self.order.len(), |&(_, it)| it as usize);
+        &self.order[start..end]
+    }
 }
 
 /// Data that belongs to a crate which is shared between a crate's def map and all its block def maps.
@@ -623,6 +660,7 @@ impl DefMap {
             derive_helpers_in_scope: FxHashMap::default(),
             session_macros: false,
             diagnostics: Vec::new(),
+            diagnostics_by_module: DiagnosticsByModule::default(),
             data: crate_data,
         }
     }
@@ -631,6 +669,7 @@ impl DefMap {
         let Self {
             macro_use_prelude,
             diagnostics,
+            diagnostics_by_module: _,
             modules,
             derive_helpers_in_scope,
             root: _,
@@ -656,6 +695,7 @@ impl DefMap {
     /// Hands the scope of every module to the database. Called once, when collection is done.
     fn hand_over_scopes(&mut self, db: &dyn SourceDatabase) {
         let ModulesSlot::Building(modules) = &mut self.modules else { return };
+        self.diagnostics_by_module = DiagnosticsByModule::of(&self.diagnostics);
         for (id, module) in modules.iter_mut() {
             if let ScopeSlot::Building(building) = &mut module.scope {
                 let BuildingScope { scope, children } = std::mem::take(&mut **building);
@@ -818,6 +858,18 @@ impl DefMap {
     /// Get a reference to the def map's diagnostics.
     pub fn diagnostics(&self) -> &[DefDiagnostic] {
         self.diagnostics.as_slice()
+    }
+
+    /// The diagnostics of `module` ([`DefDiagnostic::in_module`]), in the order of
+    /// [`Self::diagnostics`]: a binary search, not a scan of them all.
+    pub fn diagnostics_of(
+        &self,
+        module: ModuleId,
+    ) -> impl ExactSizeIterator<Item = &DefDiagnostic> + '_ {
+        self.diagnostics_by_module
+            .of_module(module)
+            .iter()
+            .map(|&at| &self.diagnostics[at as usize])
     }
 
     pub fn recursion_limit(&self) -> u32 {

@@ -30,6 +30,7 @@ mod check;
 mod parsed;
 mod parsers;
 
+use blaze_items::Fact;
 use hir::InFile;
 use syntax::{TextRange, TextSize};
 
@@ -76,25 +77,36 @@ pub(crate) fn parsed(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec
     found
 }
 
-/// The errors `check_mod_attrs` gives of `owners`' parsed attributes.
+/// The errors `check_mod_attrs` gives of `owners`' parsed attributes, then those of the
+/// stability pass, which reads what each definition inherits from its parents.
 pub(crate) fn checked(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<Found> {
     let session = Session::of(cx, owners);
     let mut found = Vec::new();
+    let mut all = Vec::with_capacity(owners.len());
     for owner in owners {
         if owner.target == Target::MacroCall {
+            all.push(Vec::new());
             continue;
         }
         let parsed = lower(cx, &session, owner, false, &mut Vec::new());
         let mut errors = Vec::new();
         check::check(cx, &session, owner, &parsed, &mut errors);
         push(cx, owner, Phase::Items, errors, &mut found);
+        all.push(parsed);
+    }
+    for (at, diag) in parsers::stability::crate_checks(cx, &session, owners, &all) {
+        push(cx, &owners[at], Phase::Items, vec![diag], &mut found);
     }
     found
 }
 
+/// Pushes `owner`'s errors. Besides its source, each reads the `#![feature]`s of the crate
+/// root, which the gates, the parsers and their targets look at.
 fn push(cx: &Cx<'_, '_>, owner: &Owner, phase: Phase, errors: Vec<Diag>, found: &mut Vec<Found>) {
+    let root = cx.module_key(cx.krate.root_module(cx.db));
     for mut diag in errors {
         source_fact(cx, &mut diag, owner.at());
+        diag.fact(Fact::Signature(root), "the `#![feature]`s of the crate root");
         found.push(Found::new(diag, phase));
     }
 }

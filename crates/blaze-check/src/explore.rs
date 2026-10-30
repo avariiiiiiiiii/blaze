@@ -2,7 +2,13 @@
 //! along the path the last one left, until every branch is taken (or the random runs are done),
 //! and stops at the first finding with the seed and the schedule that replay it.
 
-use std::{any::Any, env, rc::Rc, str::FromStr};
+use std::{
+    any::Any,
+    env,
+    rc::Rc,
+    str::FromStr,
+    sync::{Mutex, PoisonError},
+};
 
 use crate::{
     clock::MAX_THREADS,
@@ -40,6 +46,11 @@ pub struct Builder {
     pub replay: Option<String>,
 }
 
+/// One model at a time in a process: a shim names its object in the running execution by
+/// storing that execution's epoch in itself, so two models on two OS threads (libtest's default)
+/// touching one `static` would keep renaming it under each other.
+static MODELS: Mutex<()> = Mutex::new(());
+
 impl Default for Builder {
     fn default() -> Builder {
         Builder::new()
@@ -73,6 +84,7 @@ impl Builder {
             !coro::inside() && rt::explorer(|rt| rt.is_none()),
             "blaze-check: `model` called inside a model"
         );
+        let _one = MODELS.lock().unwrap_or_else(PoisonError::into_inner);
         let f = Rc::new(f);
         let _host = coro::Host::new();
         let mut threads: Vec<Coroutine> = Vec::with_capacity(self.max_threads);

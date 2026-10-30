@@ -8,16 +8,16 @@
 //! - the root: ten `u64`s naming the sections (memos, edges, table, inputs, blob: where and how
 //!   many);
 //! - memos, [`MEMO_RECORD`] bytes each, sorted by key, a key's memos in a row;
-//! - edges, [`EDGE_RECORD`] bytes each, a memo's in the order they were read;
+//! - edges, [`EDGE_RECORD`] bytes each ([`EdgeRecord`]'s layout, so read in place), a memo's
+//!   in the order they were read;
 //! - an open-addressed table of `u64`s, a power of two of them: 1 + the index of a key's first
 //!   memo, 0 for empty, probed linearly from the key's slot;
 //! - inputs, [`INPUT_RECORD`] bytes each: an input key and the path it names;
 //! - the blob: values (each at a 16-byte boundary, read in place), keys' bytes, paths.
 //!
-//! The header, root and section bounds are checked when the image is opened; each record is
-//! checked when it is first read, so a start reads nothing it does not use.
-
-use std::sync::Arc;
+//! The header, root, section bounds and the edge section's alignment are checked when the
+//! image is opened; each record is checked when it is first read, so a start reads nothing it
+//! does not use.
 
 use blaze_core::Mapping;
 use blaze_format::{FormatError, MAGIC, SchemaHash};
@@ -26,7 +26,8 @@ use blaze_reclaim::Guard;
 
 use crate::{
     Input, QueryKey, QueryKind, kinds,
-    table::{EDGE_RECORD, Edges, MemoData, Value, ValueCell},
+    memo::{MemoId, Store},
+    table::{EDGE_RECORD, EdgeRecord},
 };
 
 pub(crate) const MEMO_RECORD: usize = 192;
@@ -48,10 +49,10 @@ pub(crate) fn schema() -> SchemaHash {
 }
 
 /// What one key contributes to an image.
-pub(crate) struct Entry {
+pub(crate) struct Entry<'g> {
     pub(crate) key: QueryKey,
-    pub(crate) memos: Vec<Arc<MemoData>>,
-    pub(crate) key_bytes: Option<Arc<[u8]>>,
+    pub(crate) memos: Vec<MemoId>,
+    pub(crate) key_bytes: Option<&'g [u8]>,
 }
 
 fn pad(out: &mut Vec<u8>, to: usize) {
@@ -74,10 +75,10 @@ fn put_key(out: &mut Vec<u8>, key: &QueryKey) {
 }
 
 /// The image of `entries` (sorted by key, each key's memos in a fixed order) and `inputs`.
-pub(crate) fn write(task: &Guard, entries: &[Entry], inputs: &[(QueryKey, Input)]) -> Vec<u8> {
+pub(crate) fn write(task: &Guard, store: &Store, entries: &[Entry<'_>], inputs: &[(QueryKey, Input)]) -> Vec<u8> {
     let memo_count: usize = entries.iter().map(|entry| entry.memos.len()).sum();
     let edge_count: usize =
-        entries.iter().flat_map(|entry| entry.memos.iter()).map(|memo| memo.edges.len()).sum();
+        entries.iter().flat_map(|entry| entry.memos.iter()).map(|&memo| store.edges(task, memo).len()).sum();
     let table_len = (entries.len() * 2).next_power_of_two().max(2);
 
     let memos_at = ROOT_AT + ROOT;
@@ -93,7 +94,7 @@ pub(crate) fn write(task: &Guard, entries: &[Entry], inputs: &[(QueryKey, Input)
     let mut first_edge = 0u32;
     let mut index = 0u64;
     for entry in entries {
-        let (key_at, key_len) = match &entry.key_bytes {
+        let (key_at, key_len) = match entry.key_bytes {
             Some(bytes) => {
                 let at = blob_at + blob.len();
                 blob.extend_from_slice(bytes);
@@ -109,12 +110,15 @@ pub(crate) fn write(task: &Guard, entries: &[Entry], inputs: &[(QueryKey, Input)
             }
             table[slot] = index + 1;
         }
-        for memo in &entry.memos {
-            put_key(&mut memos, &memo.key);
-            memos.extend_from_slice(&memo.fingerprint.0.to_le_bytes());
-            memos.extend_from_slice(&memo.schema.0.0);
-            memos.extend_from_slice(&memo.producer.0);
-            let (value_id, value_at, value_len) = match memo.bytes(task) {
+        for &memo in &entry.memos {
+            let hot = store.hot(task, memo);
+            let (schema, producer) = store.parts(hot.code());
+            let memo_edges = store.edges(task, memo);
+            put_key(&mut memos, &entry.key);
+            memos.extend_from_slice(&hot.fingerprint().0.to_le_bytes());
+            memos.extend_from_slice(&schema.0.0);
+            memos.extend_from_slice(&producer.0);
+            let (value_id, value_at, value_len) = match store.bytes(task, memo) {
                 Some(bytes) => {
                     pad(&mut blob, 16);
                     let at = blob_at + blob.len();
@@ -125,16 +129,13 @@ pub(crate) fn write(task: &Guard, entries: &[Entry], inputs: &[(QueryKey, Input)
             };
             memos.extend_from_slice(&value_id.0);
             memos.extend_from_slice(&first_edge.to_le_bytes());
-            memos.extend_from_slice(&(memo.edges.len() as u32).to_le_bytes());
+            memos.extend_from_slice(&(memo_edges.len() as u32).to_le_bytes());
             memos.extend_from_slice(&value_at.to_le_bytes());
             memos.extend_from_slice(&value_len.to_le_bytes());
             memos.extend_from_slice(&key_at.to_le_bytes());
             memos.extend_from_slice(&key_len.to_le_bytes());
-            for edge in memo.edges.iter() {
-                put_key(&mut edges, &edge.read);
-                edges.extend_from_slice(&edge.saw.0.to_le_bytes());
-            }
-            first_edge += memo.edges.len() as u32;
+            edges.extend_from_slice(EdgeRecord::as_bytes(memo_edges));
+            first_edge += memo_edges.len() as u32;
             index += 1;
         }
     }
@@ -223,6 +224,16 @@ fn size(word: u64, at: usize) -> Result<usize, FormatError> {
     usize::try_from(word).map_err(|_| FormatError::OutOfBounds { at: at as u64 })
 }
 
+/// One memo of the image, read in place: its edges and value stay in the mapping.
+pub(crate) struct ImageMemo<'a> {
+    pub(crate) key: QueryKey,
+    pub(crate) fingerprint: Fingerprint,
+    pub(crate) schema: SchemaHash,
+    pub(crate) producer: ContentId,
+    pub(crate) edges: &'a [EdgeRecord],
+    pub(crate) value: Option<(&'a [u8], ContentId)>,
+}
+
 impl ImageMap {
     pub(crate) fn open(mapping: Mapping) -> Result<ImageMap, FormatError> {
         let bytes = mapping.bytes();
@@ -263,6 +274,9 @@ impl ImageMap {
         within(blob_at, blob_len, 1, 8)?;
         if !table_len.is_power_of_two() || table_at % 8 != 0 || blob_at % 16 != 0 {
             return Err(FormatError::Invalid { at: ROOT_AT as u64, what: "a section misaligned" });
+        }
+        if (bytes.as_ptr().addr() + edges_at) % align_of::<EdgeRecord>() != 0 {
+            return Err(FormatError::Invalid { at: (ROOT_AT + 16) as u64, what: "the edges are not at an 8-byte boundary" });
         }
         Ok(ImageMap {
             mapping,
@@ -321,12 +335,11 @@ impl ImageMap {
     }
 
     /// Every key with memos in the image.
-    pub(crate) fn keys(&self) -> Vec<QueryKey> {
+    pub(crate) fn keys(&self) -> impl Iterator<Item = QueryKey> + '_ {
         (0..self.table_len)
             .map(|slot| self.table(slot))
             .filter(|first| *first != 0)
             .map(|first| self.memo_key(self.checked_memo(first - 1)))
-            .collect()
     }
 
     fn blob_range(&self, at: u64, len: u64, what: &str) -> (usize, usize) {
@@ -336,8 +349,8 @@ impl ImageMap {
         ok.unwrap_or_else(|| panic!("the daemon image is corrupt: {what} at {at}+{len} leaves the blob"))
     }
 
-    /// The memo at `index`, read in place: its edges and value stay in the mapping.
-    pub(crate) fn memo(&self, index: usize) -> MemoData {
+    /// The memo at `index`, read in place.
+    pub(crate) fn memo(&self, index: usize) -> ImageMemo<'_> {
         let bytes = self.bytes();
         let at = self.memos_at + index * MEMO_RECORD;
         let record = &bytes[at..at + MEMO_RECORD];
@@ -351,6 +364,10 @@ impl ImageMap {
         if first_edge.checked_add(edge_len).is_none_or(|end| end > self.edge_count) {
             panic!("the daemon image is corrupt: memo {index}'s edges leave the edge section");
         }
+        let from = self.edges_at + first_edge * EDGE_RECORD;
+        // SAFETY: inside the edge section, whose bounds and 8-byte alignment `open` checked; any
+        // bytes are a valid record.
+        let edges = unsafe { EdgeRecord::from_bytes(&bytes[from..from + edge_len * EDGE_RECORD]) };
         let value_at = u64::from_le_bytes(record[160..168].try_into().expect("8"));
         let value_len = u64::from_le_bytes(record[168..176].try_into().expect("8"));
         let value = if value_len == EVICTED {
@@ -360,24 +377,13 @@ impl ImageMap {
             if at % 16 != 0 {
                 panic!("the daemon image is corrupt: memo {index}'s value is misaligned");
             }
-            Some(Value::Mapped { mapping: self.mapping.clone(), at, len, id: value_id })
+            Some((&bytes[at..at + len], value_id))
         };
-        MemoData {
-            key,
-            fingerprint,
-            schema,
-            producer,
-            edges: Edges::Mapped {
-                image: self.mapping.clone(),
-                at: self.edges_at + first_edge * EDGE_RECORD,
-                len: edge_len,
-            },
-            value: ValueCell::new(value),
-        }
+        ImageMemo { key, fingerprint, schema, producer, edges, value }
     }
 
     /// The bytes of the key of the memo at `index`, if it was kept.
-    pub(crate) fn key_bytes(&self, index: usize) -> Option<Arc<[u8]>> {
+    pub(crate) fn key_bytes(&self, index: usize) -> Option<&[u8]> {
         let record = &self.bytes()[self.memos_at + index * MEMO_RECORD..][..MEMO_RECORD];
         let at = u64::from_le_bytes(record[176..184].try_into().expect("8"));
         let len = u64::from_le_bytes(record[184..192].try_into().expect("8"));
@@ -385,7 +391,7 @@ impl ImageMap {
             return None;
         }
         let (at, len) = self.blob_range(at, len, "a key");
-        Some(Arc::from(&self.bytes()[at..at + len]))
+        Some(&self.bytes()[at..at + len])
     }
 
     pub(crate) fn inputs(&self) -> Vec<(QueryKey, Input)> {

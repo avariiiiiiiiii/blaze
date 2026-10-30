@@ -127,6 +127,7 @@ fn fields_round_trip() {
 fn kind_ranges_are_apart() {
     assert!(kinds::INPROC.end <= kinds::LAZY.start);
     assert!(kinds::LAZY.end <= kinds::PREMAP.start);
+    assert!(kinds::PREMAP.end <= kinds::LIVE.start);
     for kind in [kinds::HELLO, kinds::GRANT, kinds::MAP, kinds::MAPPED, kinds::STARTED, kinds::FAILED, kinds::REFUSED] {
         assert!(kinds::INPROC.contains(&kind.0));
     }
@@ -668,5 +669,70 @@ mod linux {
         hello[0] ^= 1;
         wrong.send(kinds::HELLO, 0, &hello).unwrap();
         assert!(stale.wait(Duration::from_millis(300)).is_err());
+    }
+
+    /// Plays the loader of `command` in this process: hello, the grant, STARTED at the base.
+    #[cfg(feature = "host")]
+    fn play_loader(command: &blaze_core::Command) -> Channel {
+        use crate::load::{HOST_VAR, VERSION, unhex};
+
+        let var = command.env.iter().find(|(name, _)| name == HOST_VAR).unwrap().1.to_str().unwrap().to_owned();
+        let (address, token) = var.split_once('\t').unwrap();
+        let mut channel = Channel::new(sys::connect(address).unwrap());
+        let mut hello = Vec::new();
+        Writer::new(&mut hello).raw(&unhex(token).unwrap()).u32(std::process::id()).u32(VERSION).u64(sys::page()).i64(0).u64(0).u64(64);
+        channel.send(kinds::HELLO, 0, &hello).unwrap();
+        let grant = {
+            let frame = channel.recv().unwrap();
+            assert_eq!(frame.kind, kinds::GRANT);
+            read_grant(frame.body).unwrap()
+        };
+        let _granted = sys::recv_objects(&mut channel, grant.objects.len()).unwrap();
+        let mut started = Vec::new();
+        Writer::new(&mut started).u64(grant.base).u64(sys::thread_id());
+        channel.send(kinds::STARTED, 0, &started).unwrap();
+        channel
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_program_attaches_its_processes_until_they_exit_and_never_one_that_ended_first() {
+        use std::sync::{Arc, Mutex, mpsc};
+
+        use blaze_core::{Command, Sandbox};
+
+        use crate::host::{Host, Program};
+
+        let dir = temp_dir();
+        let host = Arc::new(Host::new(&dir, PathBuf::from("/blaze/libexec/blaze-inproc-run"), TlsReserve::default()).unwrap());
+        let memory = Arc::new(Mutex::new(CodeMemory::new("program", 1, 1).unwrap()));
+        let (sessions, got) = mpsc::channel();
+        let program = Program::new(host, memory.clone(), Format::Elf, sessions);
+        let command = || Command {
+            program: PathBuf::from("prog"),
+            args: Vec::new(),
+            env: Vec::new(),
+            dir: dir.clone(),
+            stdin: Vec::new(),
+            sandbox: Sandbox::Off,
+            memory: None,
+        };
+        let pid = std::process::id();
+
+        let (spawned, started) = program.command(command(), false).unwrap();
+        let _channel = play_loader(&spawned);
+        let session = got.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(session.pid, pid);
+        assert!(memory.lock().unwrap().processes.iter().any(|it| it.pid == pid && !it.forks));
+        program.exited(started);
+        assert!(memory.lock().unwrap().processes.is_empty());
+        program.exited(started);
+
+        let (spawned, started) = program.command(command(), true).unwrap();
+        program.exited(started);
+        let _channel = play_loader(&spawned);
+        let ended = got.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(ended.is_err_and(|it| it.what.contains("ended while")));
+        assert!(memory.lock().unwrap().processes.is_empty());
     }
 }

@@ -1594,7 +1594,7 @@ impl Function {
                 // because it has not `CallableDefId`.
                 // FIXME: This does not account for replacing `Self`. Do we really need that?
                 let Some(trait_method) = method.trait_method(db, impl_) else {
-                    return Type::unknown();
+                    return Type::unknown(db);
                 };
                 Function::from(trait_method).ty(db)
             }
@@ -1615,7 +1615,7 @@ impl Function {
                 // because it has not `CallableDefId`.
                 // FIXME: This does not account for replacing `Self`. Do we really need that?
                 let Some(trait_method) = method.trait_method(db, impl_) else {
-                    return Type::unknown();
+                    return Type::unknown(db);
                 };
                 Function::from(trait_method).fn_ptr_type(db)
             }
@@ -2003,12 +2003,12 @@ impl<'db> Param<'db> {
                         binding_id: self_param.user_written,
                     })
                 } else if let Pat::Bind { id, .. } =
-                    &body[body.params[self.idx - body.self_param.is_some() as usize].user_written]
+                    body.pat(body.params[self.idx - body.self_param.is_some() as usize].user_written)
                 {
                     Some(Local {
                         parent: parent.into(),
                         parent_infer: parent.into(),
-                        binding_id: *id,
+                        binding_id: id,
                     })
                 } else {
                     None
@@ -2020,13 +2020,13 @@ impl<'db> Param<'db> {
                 let body_owner = c.owner.expression_store_owner(db);
                 let store = ExpressionStore::of(db, body_owner);
 
-                if let Expr::Closure { args, .. } = &store[c.expr]
-                    && let Pat::Bind { id, .. } = &store[args[self.idx]]
+                if let Expr::Closure { args, .. } = store.expr(c.expr)
+                    && let Pat::Bind { id, .. } = store.pat(args[self.idx])
                 {
                     return Some(Local {
                         parent: body_owner,
                         parent_infer: body_infer_owner,
-                        binding_id: *id,
+                        binding_id: id,
                     });
                 }
                 None
@@ -2053,7 +2053,7 @@ impl SelfParam {
                 func_data
                     .params
                     .first()
-                    .map(|&param| match &func_data.store[param] {
+                    .map(|&param| match func_data.store.type_ref(param) {
                         TypeRef::Reference(ref_) => match ref_.mutability {
                             hir_def::type_ref::Mutability::Shared => Access::Shared,
                             hir_def::type_ref::Mutability::Mut => Access::Exclusive,
@@ -4404,9 +4404,9 @@ pub struct CaptureUsages<'db> {
 impl CaptureUsages<'_> {
     fn is_ref(store: &ExpressionStore, id: ExprOrPatId) -> bool {
         match id {
-            ExprOrPatId::ExprId(expr) => matches!(store[expr], Expr::Ref { .. }),
+            ExprOrPatId::ExprId(expr) => matches!(store.expr(expr), Expr::Ref { .. }),
             // FIXME: Figure out if this is correct wrt. match ergonomics.
-            ExprOrPatId::PatId(pat) => match store[pat] {
+            ExprOrPatId::PatId(pat) => match store.pat(pat) {
                 Pat::Bind { id: binding, .. } => matches!(
                     store[binding].mode,
                     BindingAnnotation::Ref | BindingAnnotation::RefMut
@@ -4610,7 +4610,7 @@ impl<'db> Type<'db> {
     fn from_value_def(db: &'db dyn HirDatabase, def: impl Into<ValueTyDefId>) -> Self {
         let def = def.into();
         let Some(ty) = db.value_ty(def) else {
-            return Type::unknown();
+            return Type::unknown(db);
         };
         let def = match def {
             ValueTyDefId::ConstId(it) => GenericDefId::ConstId(it),
@@ -4628,11 +4628,9 @@ impl<'db> Type<'db> {
     }
 
     /// Replace any generic parameters with error types.
-    pub fn instantiate_with_errors(&self) -> Self {
-        // SAFETY: the interner stays in this call, inside the attachment on the stack now; the
-        // `Type` returned holds interned values only.
-        let interner = unsafe { DbInterner::conjure() };
-        let krate = self.krate(interner.db());
+    pub fn instantiate_with_errors(&self, db: &'db dyn HirDatabase) -> Self {
+        let interner = DbInterner::new_no_crate(db);
+        let krate = self.krate(db);
         let args = match self.owner {
             TypeOwnerId::GenericDefId(def) => GenericArgs::error_for_item(interner, def.into()),
             TypeOwnerId::BuiltinDeriveImplId(def) => {
@@ -4644,9 +4642,12 @@ impl<'db> Type<'db> {
     }
 
     // FIXME: Find some way with const params, maybe even lifetimes?
-    pub fn instantiate(&self, args: impl IntoIterator<Item: Borrow<Type<'db>>>) -> Type<'db> {
-        // SAFETY: as in `instantiate_with_errors`.
-        let interner = unsafe { DbInterner::conjure() };
+    pub fn instantiate(
+        &self,
+        db: &'db dyn HirDatabase,
+        args: impl IntoIterator<Item: Borrow<Type<'db>>>,
+    ) -> Type<'db> {
+        let interner = DbInterner::new_no_crate(db);
         let (args, owner) = match self.owner {
             TypeOwnerId::GenericDefId(def) => generic_args_from_tys(interner, def.into(), args),
             TypeOwnerId::BuiltinDeriveImplId(def) => {
@@ -4663,11 +4664,11 @@ impl<'db> Type<'db> {
     /// trait goals on the result are solved as in the type's own crate and environment.
     pub fn instantiate_type_params(
         &self,
+        db: &'db dyn HirDatabase,
         args: impl IntoIterator<Item: Borrow<Type<'db>>>,
     ) -> Type<'db> {
         let TypeOwnerId::GenericDefId(def) = self.owner else { return self.clone() };
-        // SAFETY: as in `instantiate_with_errors`.
-        let interner = unsafe { DbInterner::conjure() };
+        let interner = DbInterner::new_no_crate(db);
         let mut args = args.into_iter();
         let args = GenericArgs::for_item(interner, def.into(), |index, id, _, _| match id {
             GenericParamId::TypeParamId(_) => match args.next() {
@@ -4728,7 +4729,7 @@ impl<'db> Type<'db> {
         db: &'db dyn HirDatabase,
         rebase_into: &Type<'db>,
     ) -> Type<'db> {
-        self.try_rebase_into(db, rebase_into).unwrap_or_else(|| self.instantiate_with_errors())
+        self.try_rebase_into(db, rebase_into).unwrap_or_else(|| self.instantiate_with_errors(db))
     }
 
     pub fn try_rebase_into_owner(
@@ -4749,16 +4750,12 @@ impl<'db> Type<'db> {
         db: &'db dyn HirDatabase,
         new_owner: GenericDef,
     ) -> Self {
-        self.try_rebase_into_owner(db, new_owner).unwrap_or_else(|| self.instantiate_with_errors())
+        self.try_rebase_into_owner(db, new_owner).unwrap_or_else(|| self.instantiate_with_errors(db))
     }
 
-    pub fn unknown() -> Self {
-        // SAFETY: as in `instantiate_with_errors`.
-        let interner = unsafe { DbInterner::conjure() };
-        Type::no_params(
-            Self::builtin_type_crate(interner.db()),
-            Ty::new_error(interner, ErrorGuaranteed),
-        )
+    pub fn unknown(db: &'db dyn HirDatabase) -> Self {
+        let interner = DbInterner::new_no_crate(db);
+        Type::no_params(Self::builtin_type_crate(db), Ty::new_error(interner, ErrorGuaranteed))
     }
 
     pub fn new_slice(db: &'db dyn HirDatabase, ty: Self) -> Self {
@@ -4790,10 +4787,8 @@ impl<'db> Type<'db> {
         Type { owner, ty }
     }
 
-    pub fn new_unit() -> Self {
-        // SAFETY: as in `instantiate_with_errors`.
-        let interner = unsafe { DbInterner::conjure() };
-        Type::no_params(Self::builtin_type_crate(interner.db()), Ty::new_unit(interner))
+    pub fn new_unit(db: &'db dyn HirDatabase) -> Self {
+        Type::no_params(Self::builtin_type_crate(db), Ty::new_unit(DbInterner::new_no_crate(db)))
     }
 
     pub fn is_unit(&self) -> bool {
@@ -5212,6 +5207,7 @@ impl<'db> Type<'db> {
                 return Some(Callable {
                     ty: self.clone(),
                     sig,
+                    erased: interner.instantiate_bound_regions_with_erased(sig),
                     callee: Callee::FnImpl(fn_trait),
                     is_bound_method: false,
                 });
@@ -5219,7 +5215,13 @@ impl<'db> Type<'db> {
         };
 
         let sig = self.ty.skip_binder().callable_sig(interner)?;
-        Some(Callable { ty: self.clone(), sig, callee, is_bound_method: false })
+        Some(Callable {
+            ty: self.clone(),
+            sig,
+            erased: interner.instantiate_bound_regions_with_erased(sig),
+            callee,
+            is_bound_method: false,
+        })
     }
 
     pub fn is_closure(&self) -> bool {
@@ -5954,7 +5956,7 @@ impl InlineAsmOperand {
 
     pub fn name(&self, db: &dyn HirDatabase) -> Option<Name> {
         let body = ExpressionStore::of(db, self.owner);
-        match &body[self.expr] {
+        match body.expr(self.expr) {
             hir_def::hir::Expr::InlineAsm(e) => e.operands.get(self.index)?.0.clone(),
             _ => None,
         }
@@ -5966,6 +5968,8 @@ impl InlineAsmOperand {
 pub struct Callable<'db> {
     ty: Type<'db>,
     sig: PolyFnSig<'db>,
+    /// `sig` with its bound regions erased, as `params` and `return_type` give it.
+    erased: FnSig<'db>,
     callee: Callee<'db>,
     /// Whether this is a method that was called with method call syntax.
     is_bound_method: bool,
@@ -5991,12 +5995,6 @@ pub enum CallableKind<'db> {
 }
 
 impl<'db> Callable<'db> {
-    fn erased_sig(&self) -> FnSig<'db> {
-        // SAFETY: the interner stays in this call, inside the attachment on the stack now; the
-        // signature returned holds interned values only.
-        unsafe { DbInterner::conjure() }.instantiate_bound_regions_with_erased(self.sig)
-    }
-
     pub fn kind(&self) -> CallableKind<'db> {
         match self.callee {
             Callee::Def(CallableDefId::FunctionId(it)) => CallableKind::Function(it.into()),
@@ -6037,14 +6035,14 @@ impl<'db> Callable<'db> {
             return None;
         }
         let func = self.as_function()?;
-        Some((func.self_param(db)?, self.ty.derived(self.erased_sig().inputs()[0])))
+        Some((func.self_param(db)?, self.ty.derived(self.erased.inputs()[0])))
     }
     pub fn n_params(&self) -> usize {
         self.sig.skip_binder().inputs_and_output.inputs().len()
             - if self.is_bound_method { 1 } else { 0 }
     }
     pub fn params(&self) -> Vec<Param<'db>> {
-        self.erased_sig()
+        self.erased
             .inputs()
             .iter()
             .enumerate()
@@ -6054,7 +6052,7 @@ impl<'db> Callable<'db> {
             .collect()
     }
     pub fn return_type(&self) -> Type<'db> {
-        self.ty.derived(self.erased_sig().output())
+        self.ty.derived(self.erased.output())
     }
     pub fn sig(&self) -> impl Eq {
         &self.sig

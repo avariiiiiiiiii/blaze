@@ -104,7 +104,7 @@ fn statement_values<'db>(ctx: &Ctx<'_, 'db>) -> FxHashMap<hir_def::hir::ExprId, 
         let hir_def::hir::Expr::Block { statements, .. } = expr else { continue };
         for statement in statements.iter() {
             let hir_def::hir::Statement::Expr { expr, .. } = statement else { continue };
-            match ctx.store[*expr] {
+            match ctx.store.expr(*expr) {
                 hir_def::hir::Expr::Match { expr: matched, .. } => {
                     let value = erased(ctx.infer.expr_ty(*expr));
                     if value != erased(ctx.infer.expr_ty(matched)) {

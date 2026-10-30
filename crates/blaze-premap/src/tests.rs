@@ -22,7 +22,7 @@ use crate::store::Shelf;
 use crate::table::{self, Def, Kind, Strength, SymbolId, TableView};
 use crate::PremapError;
 
-const BASE: u64 = 0x2000_0000_0000;
+const BASE: u64 = prelink::IMAGES.start;
 
 fn id(n: u64) -> ContentId {
     ContentId::of("blaze v2 premap test 1", &n.to_le_bytes())

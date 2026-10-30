@@ -704,6 +704,82 @@ fn a_racy_counter_is_not_linearizable() {
     assert!(report.contains("not linearizable"), "{report}");
 }
 
+/// A register and its sequential model.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+struct Register(u32);
+
+#[derive(Debug)]
+enum RegisterOp {
+    Set(u32),
+    Get,
+}
+
+impl Spec for Register {
+    type Op = RegisterOp;
+    type Ret = Option<u32>;
+
+    fn apply(&mut self, op: &RegisterOp) -> Option<u32> {
+        match *op {
+            RegisterOp::Set(value) => {
+                self.0 = value;
+                None
+            }
+            RegisterOp::Get => Some(self.0),
+        }
+    }
+}
+
+/// A relaxed register: a get run after a set returned, on a thread that never synchronized with
+/// it, may read the old value (both orders of the two are allowed), so no execution is reported.
+#[test]
+fn a_history_orders_operations_by_happens_before_not_by_execution() {
+    let reads = outcomes(builder(), || {
+        let x = Arc::new(AtomicU32::new(0));
+        let history = Arc::new(History::<Register>::new());
+        let other = {
+            let (x, history) = (x.clone(), history.clone());
+            thread::spawn(move || {
+                history.record(RegisterOp::Set(1), |_| {
+                    x.store(1, Relaxed);
+                    None
+                })
+            })
+        };
+        let read = history.record(RegisterOp::Get, |_| Some(x.load(Relaxed)));
+        other.join().unwrap();
+        history.check(Register::default());
+        read
+    });
+    assert_eq!(reads, BTreeSet::from([Some(0), Some(1)]));
+}
+
+/// A set ordered before a get through a release and an acquire outside both operations must be
+/// seen by it: a register whose set writes elsewhere is a finding.
+#[test]
+fn a_history_orders_operations_across_threads_through_synchronization() {
+    let report = finding(builder(), || {
+        let (x, lost) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let done = Arc::new(AtomicBool::new(false));
+        let history = Arc::new(History::<Register>::new());
+        let other = {
+            let (lost, done, history) = (lost.clone(), done.clone(), history.clone());
+            thread::spawn(move || {
+                history.record(RegisterOp::Set(1), |_| {
+                    lost.store(1, Relaxed);
+                    None
+                });
+                done.store(true, Release);
+            })
+        };
+        if done.load(Acquire) {
+            history.record(RegisterOp::Get, |_| Some(x.load(Relaxed)));
+        }
+        other.join().unwrap();
+        history.check(Register::default());
+    });
+    assert!(report.contains("not linearizable"), "{report}");
+}
+
 #[test]
 fn a_history_outside_a_model_checks_too() {
     let history = History::<Counter>::new();
@@ -718,6 +794,95 @@ fn a_history_outside_a_model_checks_too() {
     history.clear();
     history.record((), |()| 5);
     assert!(catch_unwind(AssertUnwindSafe(|| history.check(Counter::default()))).is_err());
+}
+
+/// A buffer's address for the tracked-bytes tests: only its address matters, and it lives
+/// across the model's executions.
+fn buffer() -> *const u8 {
+    static BUFFER: [u8; 64] = [0; 64];
+    BUFFER.as_ptr()
+}
+
+#[test]
+fn tracked_bytes_published_with_release_acquire_do_not_race() {
+    builder().check(|| {
+        let published = Arc::new(AtomicUsize::new(0));
+        let writer = {
+            let published = published.clone();
+            thread::spawn(move || {
+                crate::cell::write(buffer(), 16);
+                published.store(16, Release);
+                crate::cell::write(buffer().wrapping_add(16), 16);
+                published.store(32, Release);
+            })
+        };
+        let len = published.load(Acquire);
+        crate::cell::read(buffer(), len);
+        writer.join().unwrap();
+    });
+}
+
+#[test]
+fn tracked_bytes_read_past_what_was_published_race() {
+    let report = finding(builder(), || {
+        let published = Arc::new(AtomicUsize::new(0));
+        let writer = {
+            let published = published.clone();
+            thread::spawn(move || {
+                crate::cell::write(buffer(), 10);
+                published.store(10, Release);
+                crate::cell::write(buffer().wrapping_add(10), 6);
+            })
+        };
+        if published.load(Acquire) == 10 {
+            crate::cell::read(buffer(), 11);
+        }
+        writer.join().unwrap();
+    });
+    assert!(report.contains("data race on the bytes"), "{report}");
+}
+
+#[test]
+fn tracked_bytes_are_exact_to_the_byte() {
+    builder().check(|| {
+        crate::cell::write(buffer(), 13);
+        let writer = thread::spawn(|| crate::cell::write(buffer().wrapping_add(13), 3));
+        crate::cell::read(buffer(), 13);
+        writer.join().unwrap();
+    });
+}
+
+#[test]
+fn a_free_not_ordered_after_a_read_is_a_use_after_reclaim() {
+    let report = finding(builder(), || {
+        crate::cell::write(buffer(), 8);
+        let reader = thread::spawn(|| crate::cell::read(buffer(), 8));
+        crate::cell::free(buffer(), 8);
+        reader.join().unwrap();
+    });
+    assert!(report.contains("data race") || report.contains("use after free"), "{report}");
+}
+
+#[test]
+fn freed_bytes_can_not_be_read_but_can_be_allocated_again() {
+    builder().check(|| {
+        crate::cell::write(buffer(), 8);
+        crate::cell::free(buffer(), 8);
+        crate::cell::write(buffer(), 4);
+        crate::cell::read(buffer(), 4);
+    });
+    let report = finding(builder(), || {
+        crate::cell::write(buffer(), 8);
+        crate::cell::free(buffer(), 8);
+        crate::cell::read(buffer().wrapping_add(4), 2);
+    });
+    assert!(report.contains("use after free"), "{report}");
+    let report = finding(builder(), || {
+        crate::cell::write(buffer(), 8);
+        crate::cell::free(buffer(), 8);
+        crate::cell::free(buffer(), 8);
+    });
+    assert!(report.contains("double free"), "{report}");
 }
 
 #[test]

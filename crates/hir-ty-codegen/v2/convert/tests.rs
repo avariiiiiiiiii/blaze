@@ -188,6 +188,22 @@ fn what_v2_has_no_target_for_is_an_error() {
     assert!(convert(loading(&[0]), &writable).is_err());
 }
 
+/// A relocation at one of the function's SanitizerCoverage arrays is at its own array, with
+/// its addend into it; there are three.
+#[cfg(feature = "llvm")]
+#[test]
+fn a_coverage_relocation_is_at_the_functions_own_array() {
+    let namespace = crate::llvm::sanitize::COVERAGE;
+    let at = |array| reloc(1 + 8 * array, binemit::Reloc::X86PCRel4, namespace, array);
+    let compiled = convert(code((0..3).map(at).collect(), Vec::new()), &requests()).expect("converted");
+    let targets: Vec<_> = compiled.relocs.iter().map(|it| (it.target.clone(), it.addend)).collect();
+    let own = |array| (Target::Coverage(array), -4);
+    assert_eq!(targets, vec![own(0), own(1), own(2)]);
+    assert_eq!(compiled.coverage, None);
+    let past = reloc(1, binemit::Reloc::X86PCRel4, namespace, 3);
+    assert!(convert(code(vec![past], Vec::new()), &requests()).is_err());
+}
+
 #[test]
 fn relocation_kinds() {
     use binemit::Reloc as R;

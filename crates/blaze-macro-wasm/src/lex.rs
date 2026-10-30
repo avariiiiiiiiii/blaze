@@ -63,8 +63,32 @@ fn punct(char: char, joint: bool, span: Span) -> Tree {
     Tree::Leaf(Leaf::Punct(tt::Punct { char, spacing, span }))
 }
 
-/// A literal of the lexer's `kind`, `text` its whole text.
-fn literal(text: &str, span: Span, kind: LiteralKind, suffix_start: u32) -> tt::Literal {
+/// The most bytes a literal's suffix may have: `tt::Literal` keeps its length in a `u8`.
+pub(crate) const SUFFIX_MOST: usize = u8::MAX as usize;
+
+/// A literal of the lexer's `kind`, `text` its whole text, or why it is none, as rustc's lexer
+/// refuses it: unterminated, or of a suffix too long to be kept.
+fn literal(
+    text: &str,
+    span: Span,
+    kind: LiteralKind,
+    suffix_start: u32,
+) -> Result<tt::Literal, String> {
+    let unterminated = || Err(format!("unterminated literal: `{text}`"));
+    let terminated = match kind {
+        LiteralKind::Char { terminated }
+        | LiteralKind::Byte { terminated }
+        | LiteralKind::Str { terminated }
+        | LiteralKind::ByteStr { terminated }
+        | LiteralKind::CStr { terminated } => terminated,
+        LiteralKind::RawStr { n_hashes }
+        | LiteralKind::RawByteStr { n_hashes }
+        | LiteralKind::RawCStr { n_hashes } => n_hashes.is_some(),
+        LiteralKind::Int { .. } | LiteralKind::Float { .. } => true,
+    };
+    if !terminated {
+        return unterminated();
+    }
     let (kind, start_offset, end_offset) = match kind {
         LiteralKind::Int { .. } => (LitKind::Integer, 0, 0),
         LiteralKind::Float { .. } => (LitKind::Float, 0, 0),
@@ -86,10 +110,17 @@ fn literal(text: &str, span: Span, kind: LiteralKind, suffix_start: u32) -> tt::
             (LitKind::CStrRaw(n), 3 + n as usize, 1 + n as usize)
         }
     };
-    let (lit, suffix) = text.split_at(suffix_start as usize);
-    let lit = &lit[start_offset..lit.len() - end_offset];
+    let Some((lit, suffix)) = text.split_at_checked(suffix_start as usize) else {
+        return unterminated();
+    };
+    let lit = lit.len().checked_sub(end_offset).and_then(|end| lit.get(start_offset..end));
+    let Some(lit) = lit else { return unterminated() };
     let suffix = if suffix == "_" { "" } else { suffix };
-    tt::Literal::new(lit, span, kind, suffix)
+    if suffix.len() > SUFFIX_MOST {
+        let len = suffix.len();
+        return Err(format!("a literal's suffix of {len} bytes is over the {SUFFIX_MOST} kept"));
+    }
+    Ok(tt::Literal::new(lit, span, kind, suffix))
 }
 
 /// A doc comment as the attribute it stands for.
@@ -180,7 +211,7 @@ pub(crate) fn stream(s: &str, span: Span) -> Result<Vec<Tree>, String> {
                 stream.push(ident(&s[range.clone()], span, IdentIsRaw::Yes))
             }
             TokenKind::Literal { kind, suffix_start } => {
-                let it = literal(text, span, kind, suffix_start);
+                let it = literal(text, span, kind, suffix_start)?;
                 stream.push(Tree::Leaf(Leaf::Literal(it)))
             }
             TokenKind::RawLifetime | TokenKind::Lifetime { .. } => {
@@ -223,7 +254,7 @@ pub(crate) fn literal_from_str(s: &str, span: Span) -> Option<tt::Literal> {
     if minus == 1 && !matches!(kind, LiteralKind::Int { .. } | LiteralKind::Float { .. }) {
         return None;
     }
-    let it = literal(&s[minus..], span, kind, suffix_start);
+    let it = literal(&s[minus..], span, kind, suffix_start).ok()?;
     if minus == 0 {
         return Some(it);
     }

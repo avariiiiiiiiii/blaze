@@ -834,7 +834,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 region: Region<'db>,
             ) -> Option<Ty<'db>> {
                 let store = self.ctx.ctx.store;
-                let TypeRef::DynTrait(bounds) = &store[type_ref] else { return None };
+                let TypeRef::DynTrait(bounds) = store.type_ref(type_ref) else { return None };
                 let region = self.ctx.ctx.object_default(region);
                 Some(self.ctx.ctx.lower_dyn_trait(bounds, region))
             }
@@ -1025,7 +1025,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                             self.ctx.lifetime_elision
                         };
                     self.with_lifetime_elision(lifetime_elision, |this| {
-                        match (&this.ctx.store[type_ref], this.ctx.impl_trait_mode.mode) {
+                        match (this.ctx.store.type_ref(type_ref), this.ctx.impl_trait_mode.mode) {
                             (TypeRef::ImplTrait(_), ImplTraitLoweringMode::Disallowed) => (),
                             (
                                 _,
@@ -1527,7 +1527,7 @@ fn type_looks_like_const(
     // when lowering to HIR it resolves the path, and if it doesn't resolve to the type namespace
     // it is lowered as a const. Our behavior could deviate from rustc when the value is resolvable
     // in both the type and value namespaces, but I believe we only allow more code.
-    let type_ref = &store[type_ref];
+    let type_ref = store.type_ref(type_ref);
     match type_ref {
         TypeRef::Path(path) => Some(TypeLikeConst::Path(path)),
         TypeRef::Placeholder => Some(TypeLikeConst::Infer),

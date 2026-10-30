@@ -66,7 +66,6 @@ use hir_expand::{mod_path::ModPath, name::Name};
 use indexmap::IndexSet;
 use la_arena::ArenaMap;
 use macros::{TypeFoldable, TypeVisitable};
-use rustc_abi::TargetDataLayout;
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
@@ -84,7 +83,7 @@ use crate::{
     TargetFeatures, ValueTyDefId,
     closure_analysis::PlaceBase,
     consteval::{create_anon_const, path_to_const},
-    db::{AnonConstId, GeneralConstId, HirDatabase, InternedOpaqueTyId},
+    db::{AnonConstId, HirDatabase, InternedOpaqueTyId},
     generics::Generics,
     infer::{
         callee::DeferredCallResolution,
@@ -111,8 +110,9 @@ use crate::{
     },
     method_resolution::CandidateId,
     next_solver::{
-        AliasTy, Const, ConstKind, DbInterner, ErrorGuaranteed, GenericArgs, Region, StoredFnSig,
-        StoredGenericArg, StoredGenericArgs, StoredTy, StoredTys, Term, Ty, TyKind, Tys,
+        AliasConstKind, AliasTy, AnonConstIdWrapper, Const, ConstKind, DbInterner, ErrorGuaranteed,
+        GenericArgs, IsRigid, Region, RegionExt, StoredFnSig, StoredGenericArg, StoredGenericArgs,
+        StoredTy, StoredTys, Term, Ty, TyKind, Tys,
         abi::Safety,
         infer::{InferCtxt, ObligationInspector, traits::ObligationCause},
     },
@@ -1644,7 +1644,6 @@ pub(crate) struct InferenceContext<'db> {
     /// and resolve the path via its methods. This will ensure proper error reporting.
     pub(crate) resolver: Resolver<'db>,
     target_features: OnceCell<(TargetFeatures<'db>, TargetFeatureIsSafeInTarget)>,
-    data_layout: OnceCell<&'db TargetDataLayout>,
     pub(crate) edition: Edition,
     allow_using_generic_params: bool,
     generics: OnceCell<Generics<'db>>,
@@ -1745,7 +1744,6 @@ impl<'db> InferenceContext<'db> {
             return_ty: types.types.error, // set in collect_* calls
             types,
             target_features: OnceCell::new(),
-            data_layout: OnceCell::new(),
             lang_items: table.interner().lang_items(),
             features: resolver.top_level_def_map().features(),
             edition: resolver.krate().data(db).edition,
@@ -1890,10 +1888,6 @@ impl<'db> InferenceContext<'db> {
             (target_features, target_feature_is_safe)
         });
         (target_features, *target_feature_is_safe)
-    }
-
-    fn data_layout(&self) -> &'db TargetDataLayout {
-        self.data_layout.get_or_init(|| self.db.target_data_layout_or_default(self.krate()))
     }
 
     /// How should a deref pattern find the place for its inner pattern to match on?
@@ -2297,8 +2291,8 @@ impl<'db> InferenceContext<'db> {
         );
 
         if let Ok(konst) = konst
-            && let ConstKind::Unevaluated(konst) = konst.kind()
-            && let GeneralConstId::AnonConstId(konst) = konst.def.0
+            && let ConstKind::Alias(_, konst) = konst.kind()
+            && let AliasConstKind::Anon { def_id: AnonConstIdWrapper(konst) } = konst.kind
         {
             self.defined_anon_consts.borrow_mut().push(konst);
         } else {
@@ -2422,7 +2416,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     pub(crate) fn innermost_tail_expr(&self, mut expr: ExprId) -> ExprId {
-        while let Expr::Block { tail: Some(tail), label: None, .. } = self.store[expr] {
+        while let Expr::Block { tail: Some(tail), label: None, .. } = self.store.expr(expr) {
             expr = tail;
         }
         expr
@@ -2592,6 +2586,7 @@ impl<'db> InferenceContext<'db> {
                 );
                 let alias = Ty::new_alias(
                     interner,
+                    IsRigid::No,
                     AliasTy::new_from_args(
                         interner,
                         AliasTyKind::Projection { def_id: assoc_type.into() },

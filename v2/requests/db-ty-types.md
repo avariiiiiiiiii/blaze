@@ -171,6 +171,17 @@ needs no database. Once the list above is empty, I delete `conjure`.
 > - Deleting `conjure` needs hir's `Type::unknown`, `new_unit`, `instantiate*` and
 >   `Callable::erased_sig` to take a database, a public API change for the IDE crates. That is
 >   left to the coordinator.
+>
+> applied by db-ty-next1 (2026-10-29 19:10), done as one change with the safety audit's
+> `interner.rs:411` item:
+> - `conjure` is deleted.
+> - hir's `Type::instantiate_with_errors`, `instantiate`, `instantiate_type_params`, `unknown`
+>   and `new_unit` take `db`, and all of hir's callers pass it.
+> - `Callable` erases its signature once, in `as_callable`.
+> - `SolverDefId`'s `Debug` runs in `with_attached_db`.
+> - `rg conjure crates/hir crates/hir-ty` finds nothing.
+> - The seven callers outside db's paths are requested in `v2/requests/diagnostics.md` and
+>   `v2/requests/speed.md` (`blaze-doc`).
 
 ## Applied requests of others
 

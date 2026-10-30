@@ -66,6 +66,15 @@ impl Fingerprint {
         u128::from(a) | u128::from(b) << 32 | u128::from(c) << 64 | u128::from(d) << 96
     }
 
+    /// The four words, as an edge array holds them (`crate::capture`).
+    pub(crate) fn words(self) -> [u32; 4] {
+        self.0
+    }
+
+    pub(crate) fn from_words(words: [u32; 4]) -> Self {
+        Self(words)
+    }
+
     fn from_u128(bits: u128) -> Self {
         Self([
             bits as u32,

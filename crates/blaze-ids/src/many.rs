@@ -1,8 +1,9 @@
 //! [`ContentId::of_many`]: many short inputs hashed a SIMD lane each.
 //!
-//! It drives `blake3::platform`, which blake3 marks unstable: `of_many_is_of_for_each`
-//! holds it to the hasher at every length and grouping, so a blake3 that changes it fails
-//! there and not in an ID.
+//! Full blocks go through `blake3::platform`'s `hash_many`; each input's last block, of any
+//! length, through [`compress_lanes`], eight at a time. `blake3::platform` is unstable, and
+//! `compress_lanes` is ours: `of_many_is_of_for_each` holds both to the hasher at every length
+//! and grouping, so a change in either fails there and not in an ID.
 
 use blake3::{
     BLOCK_LEN, CHUNK_LEN, IncrementCounter,
@@ -63,14 +64,105 @@ pub(crate) fn of_many(key: &ContextKey, inputs: &[&[u8]]) -> Vec<ContentId> {
             leading_blocks(platform, &words, inputs, members, group, &mut cvs);
         }
         let first = if group == 0 { CHUNK_START } else { 0 };
-        for (&at, cv) in members.iter().zip(&mut cvs) {
-            let input = inputs[at as usize];
-            let last = &input[group * BLOCK_LEN..];
-            let mut block = [0; BLOCK_LEN];
-            block[..last.len()].copy_from_slice(last);
-            let flags = DERIVE_KEY_MATERIAL | first | CHUNK_END | ROOT;
-            platform.compress_in_place(cv, &block, last.len() as u8, 0, flags);
-            out[at as usize] = ContentId(platform::le_bytes_from_words_32(cv));
+        let flags = u32::from(DERIVE_KEY_MATERIAL | first | CHUNK_END | ROOT);
+        for (batch, batch_cvs) in members.chunks(LANES).zip(cvs.chunks(LANES)) {
+            let mut cv = [[0; LANES]; 8];
+            let mut message = [[0; LANES]; 16];
+            let mut block_len = [0; LANES];
+            for (lane, (&at, words)) in batch.iter().zip(batch_cvs).enumerate() {
+                let last = &inputs[at as usize][group * BLOCK_LEN..];
+                block_len[lane] = last.len() as u32;
+                for (word, &value) in words.iter().enumerate() {
+                    cv[word][lane] = value;
+                }
+                let mut block = [0; BLOCK_LEN];
+                block[..last.len()].copy_from_slice(last);
+                for (word, bytes) in block.chunks_exact(4).enumerate() {
+                    message[word][lane] = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                }
+            }
+            let root = compress_lanes(&cv, &message, block_len, flags);
+            for (lane, &at) in batch.iter().enumerate() {
+                let mut id = [0; 32];
+                for (word, bytes) in id.chunks_exact_mut(4).enumerate() {
+                    bytes.copy_from_slice(&root[word][lane].to_le_bytes());
+                }
+                out[at as usize] = ContentId(id);
+            }
+        }
+    }
+    out
+}
+
+/// Last blocks compressed together, a lane each: one AVX2 register of `u32`s, two NEON ones.
+const LANES: usize = 8;
+
+type Lanes = [u32; LANES];
+
+const IV: [u32; 4] = [0x6A09_E667, 0xBB67_AE85, 0x3C6E_F372, 0xA54F_F53A];
+const SCHEDULE: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+
+#[inline(always)]
+fn add(a: Lanes, b: Lanes) -> Lanes {
+    let mut out = a;
+    for lane in 0..LANES {
+        out[lane] = out[lane].wrapping_add(b[lane]);
+    }
+    out
+}
+
+#[inline(always)]
+fn xor_rotate(a: Lanes, b: Lanes, by: u32) -> Lanes {
+    let mut out = a;
+    for lane in 0..LANES {
+        out[lane] = (out[lane] ^ b[lane]).rotate_right(by);
+    }
+    out
+}
+
+#[inline(always)]
+fn g(v: &mut [Lanes; 16], [a, b, c, d]: [usize; 4], x: Lanes, y: Lanes) {
+    v[a] = add(add(v[a], v[b]), x);
+    v[d] = xor_rotate(v[d], v[a], 16);
+    v[c] = add(v[c], v[d]);
+    v[b] = xor_rotate(v[b], v[c], 12);
+    v[a] = add(add(v[a], v[b]), y);
+    v[d] = xor_rotate(v[d], v[a], 8);
+    v[c] = add(v[c], v[d]);
+    v[b] = xor_rotate(v[b], v[c], 7);
+}
+
+/// BLAKE3's compression of one block of chunk 0 in each of [`LANES`] lanes, each with its own
+/// block length: what `hash_many` can't do, since it gives every lane full blocks. Transposed
+/// (`message[w]` is word `w` of every lane), so each step is one instruction over the lanes
+/// once LLVM vectorizes the loops; safe code, so no SIMD of our own to prove. Gives the
+/// chaining value, the first 32 bytes of the output when `flags` has `ROOT`.
+fn compress_lanes(cv: &[Lanes; 8], message: &[Lanes; 16], block_len: Lanes, flags: u32) -> [Lanes; 8] {
+    let mut v = [[0; LANES]; 16];
+    v[..8].copy_from_slice(cv);
+    for (word, iv) in IV.iter().enumerate() {
+        v[8 + word] = [*iv; LANES];
+    }
+    v[14] = block_len;
+    v[15] = [flags; LANES];
+    let mut m = *message;
+    for round in 0..7 {
+        g(&mut v, [0, 4, 8, 12], m[0], m[1]);
+        g(&mut v, [1, 5, 9, 13], m[2], m[3]);
+        g(&mut v, [2, 6, 10, 14], m[4], m[5]);
+        g(&mut v, [3, 7, 11, 15], m[6], m[7]);
+        g(&mut v, [0, 5, 10, 15], m[8], m[9]);
+        g(&mut v, [1, 6, 11, 12], m[10], m[11]);
+        g(&mut v, [2, 7, 8, 13], m[12], m[13]);
+        g(&mut v, [3, 4, 9, 14], m[14], m[15]);
+        if round < 6 {
+            m = SCHEDULE.map(|word| m[word]);
+        }
+    }
+    let mut out = [[0; LANES]; 8];
+    for (word, lanes) in out.iter_mut().enumerate() {
+        for lane in 0..LANES {
+            lanes[lane] = v[word][lane] ^ v[word + 8][lane];
         }
     }
     out

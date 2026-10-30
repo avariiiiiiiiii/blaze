@@ -27,6 +27,8 @@ pub mod kinds {
     pub const LAZY: Range<u16> = 0x0100..0x0200;
     /// `blaze-premap`'s.
     pub const PREMAP: Range<u16> = 0x0200..0x0300;
+    /// `blaze-live`'s: patches for a program the loader started.
+    pub const LIVE: Range<u16> = 0x0300..0x0400;
 
     /// The loader's first frame, to the daemon ([`crate::load`]).
     pub const HELLO: Kind = Kind(0x01);

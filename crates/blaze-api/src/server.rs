@@ -20,6 +20,11 @@
 //! under way still lacks, at most as much as has come of it; and one send, later replies
 //! queueing behind it. A peer that lets more than 64 MiB queue (it stopped reading) is hung up
 //! on.
+//!
+//! The Unix socket is made at its name ([`Unix::Bind`]), or is the one systemd or launchd
+//! passed a daemon they socket-activated ([`Unix::Passed`], [`crate::activation`]): the driver
+//! listens on a copy of it once it is a listening Unix socket bound at the name, and fails the
+//! listen naming it otherwise. Nothing is made in its place.
 
 use std::{fmt, net::SocketAddr};
 
@@ -60,9 +65,20 @@ impl fmt::Debug for Http {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Where the Unix socket is listened on.
+#[derive(Debug)]
+pub enum Unix {
+    /// A socket made at the name, mode 0600.
+    Bind(FileName),
+    /// The socket a service manager passed, which must be bound at `at`. It is kept open
+    /// while the server lives.
+    #[cfg(unix)]
+    Passed { socket: crate::activation::Passed, at: FileName },
+}
+
+#[derive(Debug)]
 pub struct Config {
-    pub unix: Option<FileName>,
+    pub unix: Option<Unix>,
     pub http: Option<Http>,
     /// The tags it uses are `tags..tags + 2^32`.
     pub tags: u64,
@@ -85,6 +101,9 @@ pub struct Server {
     writer: cbor::Writer,
     /// An HTTP chunk's content, put together before its size is known.
     line: Vec<u8>,
+    /// What [`Unix::Passed`] passed, open until the server is dropped.
+    #[cfg(unix)]
+    passed: Option<crate::activation::Passed>,
 }
 
 impl fmt::Debug for Server {
@@ -167,12 +186,20 @@ impl Server {
             told: Vec::new(),
             writer: cbor::Writer::new(),
             line: Vec::new(),
+            #[cfg(unix)]
+            passed: None,
         };
         if config.unix.is_none() && config.http.is_none() {
             server.fail("the API server was given no address to listen on".to_owned());
         }
-        if let Some(name) = config.unix {
-            server.listen(Side::Unix, Address::Unix(name), effects);
+        match config.unix {
+            Some(Unix::Bind(name)) => server.listen(Side::Unix, Address::Unix(name), effects),
+            #[cfg(unix)]
+            Some(Unix::Passed { socket, at }) => {
+                server.listen(Side::Unix, Address::Inherited { fd: socket.fd(), at }, effects);
+                server.passed = Some(socket);
+            }
+            None => {}
         }
         if let Some(Http { at, token }) = config.http {
             match token.is_empty() {
@@ -626,6 +653,7 @@ fn media_is(header: Option<&str>, kinds: &[&str]) -> bool {
 fn shown(at: &Address) -> String {
     match at {
         Address::Unix(name) => format!("the socket {name}"),
+        Address::Inherited { fd, at } => format!("the socket {at} passed as fd {fd}"),
         Address::Tcp(at) => at.to_string(),
     }
 }

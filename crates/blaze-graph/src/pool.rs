@@ -37,18 +37,21 @@ use std::{
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     ptr::{self, NonNull},
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence},
-    },
-    thread::{self, JoinHandle, Thread},
+    sync::Arc,
 };
 
-use blaze_ids::radix;
+use blaze_radix as radix;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 
 use crate::{
     pump::{Lock, PUMP_DEPTH, SPINS, depth, run_task},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence},
+        hint,
+        thread::{self, JoinHandle, Thread},
+        thread_local,
+    },
     topology::{Cpu, Topology},
 };
 
@@ -437,7 +440,7 @@ fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
         }
         if idle < SPINS {
             idle += 1;
-            std::hint::spin_loop();
+            hint::spin_loop();
             continue;
         }
         park(&|| pending.finished.load(Ordering::Acquire), pump);
@@ -823,7 +826,7 @@ impl Local {
             }
             if round + 1 < rounds {
                 for _ in 0..32 {
-                    std::hint::spin_loop();
+                    hint::spin_loop();
                 }
             }
         }
@@ -888,7 +891,7 @@ fn work(local: &Local) {
             if !shared.any_work() {
                 break;
             }
-            std::hint::spin_loop();
+            hint::spin_loop();
             continue;
         }
         searching = local.sleep(&|| shared.stop.load(Ordering::SeqCst));
@@ -953,7 +956,7 @@ fn bind_to(cpu: &Cpu) -> io::Result<()> {
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(blaze_check)))]
 #[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests {
     use std::{
@@ -1450,7 +1453,7 @@ mod tests {
     /// called on one of its workers. Either way it sorts as the standard stable sort.
     #[test]
     fn a_large_radix_sort_runs_on_the_pool() {
-        use blaze_ids::radix;
+        use blaze_radix as radix;
         fn input() -> (Vec<(u64, u32)>, Vec<(u64, u32)>) {
             let mut rng = Rng(11);
             let pairs: Vec<(u64, u32)> =
@@ -1489,5 +1492,201 @@ mod tests {
         for _ in 0..pool.workers() {
             assert!(rx.recv_timeout(LONG).unwrap().is_some());
         }
+    }
+}
+
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-graph --release
+/// model_`), against a bag of jobs (each runs once, after it was given, and none is left):
+/// pools built by hand, without `Pool::new`'s start-up channel and binding, which the checker
+/// does not see, their workers model threads in the real [`work`] loop. The queues themselves
+/// are crossbeam's, atomic to the checker; what is checked is this module's slots, counts and
+/// parking around them.
+#[cfg(all(test, blaze_check))]
+mod model {
+    use std::{cell::Cell, ptr, sync::Arc};
+
+    use blaze_check::{
+        linear::{History, Spec},
+        model,
+    };
+    use crossbeam_deque::{Injector, Worker};
+
+    use super::{Group, Idle, Job, Local, Pool, Shared, Slot, scope_in, searching, sleeping, work};
+    use crate::{
+        pump::Lock,
+        sync::{
+            OnceLock,
+            atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+            thread::{self, JoinHandle},
+        },
+        topology::Topology,
+    };
+
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        Give(u8),
+        Ran(u8),
+        /// Once every job should have run.
+        Drained,
+    }
+
+    /// The sequential pool: bit `j` is set while job `j` is given and has not run.
+    #[derive(Clone, PartialEq, Eq, Hash, Default)]
+    struct Bag(u8);
+
+    impl Spec for Bag {
+        type Op = Op;
+        /// `Give`: true. `Ran`: whether the job was given and had not run. `Drained`: whether
+        /// none is left.
+        type Ret = bool;
+
+        fn apply(&mut self, op: &Op) -> bool {
+            match *op {
+                Op::Give(job) => {
+                    self.0 |= 1 << job;
+                    true
+                }
+                Op::Ran(job) => {
+                    let given = self.0 & (1 << job) != 0;
+                    self.0 &= !(1 << job);
+                    given
+                }
+                Op::Drained => self.0 == 0,
+            }
+        }
+    }
+
+    /// A pool of `workers` in one group, with no thread yet: its shared part and each
+    /// worker's deque, by index.
+    fn shared(workers: usize) -> (Arc<Shared>, Vec<Worker<Job>>) {
+        let deques: Vec<Worker<Job>> = (0..workers).map(|_| Worker::new_fifo()).collect();
+        let slots = deques
+            .iter()
+            .map(|deque| Slot {
+                stealer: deque.stealer(),
+                next: AtomicPtr::new(ptr::null_mut()),
+                sleeping: AtomicBool::new(false),
+                group: 0,
+                thread: OnceLock::new(),
+            })
+            .collect();
+        let group = Group {
+            injector: Injector::new(),
+            workers: (0..workers as u32).collect(),
+            order: Topology::flat(workers).steal_order(0).into_boxed_slice(),
+            fast: true,
+            sleepers: AtomicU32::new(0),
+        };
+        let shared = Arc::new(Shared {
+            groups: vec![group].into_boxed_slice(),
+            slots,
+            idle: Idle(AtomicU64::new(0)),
+            stop: AtomicBool::new(false),
+            mixed: false,
+            stray: Lock::new(None),
+            critical: AtomicUsize::new(0),
+        });
+        (shared, deques)
+    }
+
+    fn local(shared: &Arc<Shared>, index: usize, deque: Worker<Job>) -> Local {
+        Local {
+            shared: shared.clone(),
+            index,
+            group: 0,
+            node: 0,
+            deque,
+            lifo: Cell::new(0),
+            seed: Cell::new((index as u32).wrapping_mul(0x9E37_79B9) | 1),
+        }
+    }
+
+    /// Worker `index` of `shared` as a model thread, started as `Pool::new` starts one.
+    fn start(shared: &Arc<Shared>, index: usize, deque: Worker<Job>) -> JoinHandle<()> {
+        let shared = shared.clone();
+        thread::spawn(move || {
+            _ = shared.slots[index].thread.set(thread::current());
+            work(&local(&shared, index, deque));
+        })
+    }
+
+    fn job(history: &Arc<History<Bag>>, id: u8) -> Job {
+        let history = history.clone();
+        Job::boxed(move || {
+            history.record(Op::Ran(id), |_| true);
+        })
+    }
+
+    /// One worker, and a client that gives two jobs in a scope and waits for them while the
+    /// worker searches, goes to sleep or sleeps: a job given as the worker says it sleeps still
+    /// wakes it (a lost wake-up leaves both parked, a deadlock), each job runs once, and the
+    /// dropped pool leaves no worker counted as searching or asleep.
+    #[test]
+    fn model_a_job_given_as_the_worker_sleeps_wakes_it() {
+        model(|| {
+            let (shared, mut deques) = shared(1);
+            let worker = start(&shared, 0, deques.pop().expect("one deque"));
+            let history = Arc::new(History::<Bag>::new());
+            scope_in(&shared, |scope| {
+                for id in 0..2 {
+                    let ran = history.clone();
+                    history.record(Op::Give(id), |_| {
+                        let run = move || {
+                            ran.record(Op::Ran(id), |_| true);
+                        };
+                        scope.submit(None, run, |it| it.unwrap());
+                        true
+                    });
+                }
+            });
+            history.record(Op::Drained, |_| true);
+            history.check(Bag::default());
+            let pool = Pool { shared: shared.clone(), threads: vec![worker], topology: Topology::flat(1) };
+            drop(pool);
+            let word = shared.idle.0.load(Ordering::SeqCst);
+            assert_eq!((searching(word), sleeping(word)), (0, 0), "a stopped worker is counted");
+            assert_eq!(shared.groups[0].sleepers.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    /// A worker gives itself two jobs to run next (the first goes behind, to its deque) and
+    /// takes its own twice, while another steals: from the deque, or from the LIFO slot when the
+    /// deque is empty. Each job runs once, by whoever took it, and none is left.
+    #[test]
+    fn model_a_lifo_slot_and_its_deque_hand_each_job_out_once() {
+        model(|| {
+            let (shared, mut deques) = shared(2);
+            let history = Arc::new(History::<Bag>::new());
+            let thief = {
+                let (shared, deque) = (shared.clone(), deques.pop().expect("two deques"));
+                thread::spawn(move || {
+                    let thief = local(&shared, 1, deque);
+                    let mut took = thief.steal();
+                    while let Some(job) = took {
+                        job.run();
+                        took = thief.next();
+                    }
+                })
+            };
+            let owner = local(&shared, 0, deques.pop().expect("two deques"));
+            for id in 0..2 {
+                history.record(Op::Give(id), |_| {
+                    owner.push_next(job(&history, id));
+                    true
+                });
+            }
+            for _ in 0..2 {
+                if let Some(job) = owner.next() {
+                    job.run();
+                }
+            }
+            thief.join().unwrap();
+            while let Some(job) = owner.next() {
+                job.run();
+            }
+            history.record(Op::Drained, |_| true);
+            history.check(Bag::default());
+            assert!(!shared.any_work(), "a job is left in a queue");
+        });
     }
 }

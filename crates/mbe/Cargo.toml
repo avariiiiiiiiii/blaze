@@ -33,6 +33,7 @@ syntax-bridge.workspace = true
 test-utils.workspace = true
 expect-test.workspace = true
 syntax.workspace = true
+syntax-bridge = { workspace = true, features = ["reference"] }
 
 [features]
 in-rust-tree = ["parser/in-rust-tree", "tt/in-rust-tree"]

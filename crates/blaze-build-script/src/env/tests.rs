@@ -2,6 +2,10 @@
 //! and `build_script_env.rs` in rust-lang/cargo at 5f94df478, MIT or Apache-2.0), ported to
 //! the description they are run from. Each names the test it comes from.
 
+use std::collections::BTreeMap;
+
+use rustc_hash::FxHashSet;
+
 use super::*;
 use crate::unit::{ConfigEnv, Dependency, DylibSearch, Package, Profile, Target, Tools};
 
@@ -168,7 +172,7 @@ fn metadata_of_dependencies() {
     assert_eq!(var(&env, "CARGO_MANIFEST_LINKS"), Some("a.b-c"));
     assert_eq!(var(&env, "DEP_FOO_FOO"), Some("bar"));
     assert_eq!(var(&env, "DEP_FOO_BAR_BAZ"), Some("baz"));
-    assert!(!env.vars.keys().any(|it| it.to_str().unwrap().contains("_X")));
+    assert!(!env.vars.iter().any(|(it, _)| it.to_str().unwrap().contains("_X")));
     assert_eq!(envify("a.b-c"), "A.B_C");
 }
 
@@ -310,11 +314,15 @@ fn set_from_the_unit_or_passed_through() {
     let set: BTreeMap<_, _> = env.set_from_unit().map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
     let mut whole = set.clone();
     whole.extend(env.passed_through().map(|(n, v)| (n.to_owned(), v.to_owned())));
-    assert_eq!(whole, env.vars, "the two make the whole environment");
-    assert_eq!(set.len(), env.from_unit.len(), "every name set from the unit is in the environment");
+    assert_eq!(whole.into_iter().collect::<Vec<_>>(), env.vars, "the two make the whole environment");
+    assert_eq!(
+        set.len(),
+        env.from_unit.iter().filter(|it| **it).count(),
+        "every name set from the unit is in the environment"
+    );
     let in_order: Vec<&OsStr> = env.set_from_unit().map(|(name, _)| name).collect();
     assert!(in_order.windows(2).all(|it| it[0] < it[1]), "set from the unit in name order");
-    assert!(in_order.iter().all(|name| env.from_unit.contains(*name)));
+    assert!(in_order.iter().all(|name| env.origin(name) == Some(Origin::Unit)));
 
     // The same unit from another shell: what is set from the unit is the same.
     let other = super::env(&unit, &os(&[("PATH", "/nix/bin:/bin"), ("HOME", "/home/me")])).unwrap();
@@ -464,5 +472,136 @@ fn certificates_libgit2_finds() {
             cargo_started_in(&os(&[("PATH", "/bin")]), host, &dirs),
             os(&[("PATH", "/bin")])
         );
+    }
+}
+
+/// The environment sorted once against the one built before it ([`reference::env`]: a hash
+/// map applied to a `BTreeMap`), over seeded units: features and cfgs named again, emptied
+/// and not ASCII, `[env]` over what cargo sets and inherits, wrappers set and taken away,
+/// dependencies' metadata, each host's dynamic library path, and an inherited environment
+/// with a name twice. The same variables in the same order, the same set from the unit.
+#[test]
+fn the_sorted_environment_is_the_one_built_before() {
+    let names = [
+        "PATH",
+        "HOME",
+        "TARGET",
+        "RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "LD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "CC",
+        "CARGO_PKG_NAME",
+        "CARGO_FEATURE_FOO",
+        "CARGO_CFG_UNIX",
+        "A",
+        "AB",
+        "ABCDEFGH",
+        "ABCDEFGHI",
+        "ABCDEFGH_",
+        "FOO",
+    ];
+    let values = ["", "/bin", "/opt/lib:/x", "x", "\u{e9}t\u{e9}"];
+    let features = ["foo", "other-feature", "\u{fc}n\u{ef}", "a-b-c", "FOO", "\u{df}"];
+    let cfgs = [
+        "unix",
+        "debug_assertions",
+        "target_os=\"linux\"",
+        "target_feature=\"sse\"",
+        "target_feature=\"sse2\"",
+        "panic = \"unwind\"",
+        "my_cfg",
+        "my_cfg=\"a\"",
+        "feature=\"x\"",
+        "feature",
+        "debug_assertions=\"x\"",
+        "my-cfg=\"\u{e9}\"",
+    ];
+    let hosts = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"];
+    let mut state = 0x6a09_e667_f3bc_c908u64;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    for _ in 0..4_000 {
+        let mut unit = bar();
+        unit.host = hosts[next(hosts.len())].into();
+        unit.features = (0..next(4)).map(|_| features[next(features.len())].to_owned()).collect();
+        unit.target_cfgs = (0..next(14)).map(|_| cfgs[next(cfgs.len())].to_owned()).collect();
+        unit.profile.debug_assertions = next(2) == 0;
+        unit.profile.debuginfo = next(2) == 0;
+        unit.profile.release = next(2) == 0;
+        unit.jobs = [0, 1, 8, 10, u32::MAX][next(5)];
+        unit.jobserver = (next(2) == 0).then(|| "fifo:/tmp/j".to_owned());
+        unit.workspace_member = next(2) == 0;
+        unit.tools.rustc_wrapper = (next(2) == 0).then(|| "/wrap".into());
+        unit.tools.rustc_workspace_wrapper = (next(2) == 0).then(|| "/ww".into());
+        unit.tools.linker = (next(3) == 0).then(|| "/ld".into());
+        unit.package.links = (next(2) == 0).then(|| "a.b-c".to_owned());
+        unit.package.description = (next(2) == 0).then(|| "d".to_owned());
+        unit.package.authors = (0..next(3)).map(|it| format!("a{it}")).collect();
+        unit.package.version = ["0.5.0", "1.2.3-pre+b", "7"][next(3)].to_owned();
+        unit.rustflags = (0..next(3)).map(|it| format!("-C{it}")).collect();
+        unit.dependencies = (0..next(3))
+            .map(|it| Dependency {
+                name: format!("d{it}"),
+                links: [None, Some("foo"), Some("a.b-c")][next(3)].map(str::to_owned),
+                metadata: (0..next(3))
+                    .map(|_| {
+                        let key = ["root", "bar-baz", "\u{e9}"][next(3)].to_owned();
+                        (key, values[next(values.len())].to_owned())
+                    })
+                    .collect(),
+            })
+            .collect();
+        unit.config_env = (0..next(4))
+            .map(|_| ConfigEnv {
+                name: names[next(names.len())].into(),
+                value: values[next(values.len())].into(),
+                force: next(2) == 0,
+            })
+            .collect();
+        if next(3) == 0 {
+            unit.dylib_search.host_root = None;
+        }
+        unit.dylib_search.plugin_search = (0..next(3))
+            .map(|it| match it {
+                0 => "native=/p/foo/target/debug/build/dep-1/out".into(),
+                1 => "/usr/lib".into(),
+                _ => "/p/foo/target/debug/x".into(),
+            })
+            .collect();
+        let inherited: Vec<(OsString, OsString)> = (0..next(9))
+            .map(|_| (names[next(names.len())].into(), values[next(values.len())].into()))
+            .collect();
+        match (env(&unit, &inherited), reference::env(&unit, &inherited)) {
+            (Ok(new), Ok((vars, from_unit))) => {
+                assert_eq!(new.vars, vars.into_iter().collect::<Vec<_>>(), "{unit:?} {inherited:?}");
+                let set: FxHashSet<OsString> =
+                    new.set_from_unit().map(|(name, _)| name.to_owned()).collect();
+                assert_eq!(set, from_unit, "{unit:?} {inherited:?}");
+                assert_eq!(new.from_unit.len(), new.vars.len());
+            }
+            (Err(new), Err(old)) => assert_eq!(new, old),
+            (new, old) => panic!("{new:?} against {old:?}"),
+        }
+    }
+}
+
+/// The variables cargo makes from names against `format!` and the old `envify`, and the
+/// decimal of a count against `to_string`.
+#[test]
+fn names_and_numbers_are_made_as_format_made_them() {
+    for name in ["foo", "other-feature", "\u{fc}n\u{ef}-x", "\u{df}", "a.b-c", "", "-"] {
+        let old: String =
+            name.chars().flat_map(char::to_uppercase).map(|c| if c == '-' { '_' } else { c }).collect();
+        assert_eq!(envify(name), old);
+        assert_eq!(prefixed("CARGO_FEATURE_", name), format!("CARGO_FEATURE_{old}"));
+    }
+    for n in [0, 1, 9, 10, 99, 100, 4_294_967_295, 1_000_000_007 % u32::MAX] {
+        assert_eq!(decimal(n), n.to_string());
     }
 }

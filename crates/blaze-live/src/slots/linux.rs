@@ -123,7 +123,8 @@ impl Os {
             cell = protection;
             Ok(())
         })?;
-        let base = image_base(at).ok_or_else(|| format!("no image has the table cell at {at:#x}"))?;
+        let base =
+            image_base(at).ok_or_else(|| format!("no image has the table cell at {at:#x}"))?;
         Ok(Os { page, cell, code, alias, maps, base })
     }
 
@@ -133,7 +134,12 @@ impl Os {
 
     /// Writes what `writes` has within `pages`, of mappings with `protection`, which isn't
     /// writable: made writable for the write, then given it back.
-    fn protected(&self, writes: &Writes<'_>, pages: &Range<u64>, protection: i32) -> Result<(), String> {
+    fn protected(
+        &self,
+        writes: &Writes<'_>,
+        pages: &Range<u64>,
+        protection: i32,
+    ) -> Result<(), String> {
         let (start, len) = (pages.start as *mut c_void, (pages.end - pages.start) as usize);
         // SAFETY: the pages are of the image's mappings with `protection` (read at start);
         // adding write access changes no byte and keeps them readable and, if they were,
@@ -167,7 +173,8 @@ impl Os {
 /// address it is mapped read and write at.
 fn map_twice(code: &Range<u64>) -> Result<u64, String> {
     let len = (code.end - code.start) as usize;
-    let error = |what: &str| format!("{what} for the patch code: {}", std::io::Error::last_os_error());
+    let error =
+        |what: &str| format!("{what} for the patch code: {}", std::io::Error::last_os_error());
     // SAFETY: the name ends in a zero.
     let fd = unsafe { memfd_create(c"blaze-live-code".as_ptr(), MFD_CLOEXEC) };
     if fd < 0 {
@@ -179,9 +186,8 @@ fn map_twice(code: &Range<u64>) -> Result<u64, String> {
             return Err(error("sizing a memory file"));
         }
         // SAFETY: a new shared mapping of the file, anywhere.
-        let alias = unsafe {
-            mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
-        };
+        let alias =
+            unsafe { mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) };
         if alias == MAP_FAILED {
             return Err(error("mapping a memory file"));
         }
@@ -395,7 +401,8 @@ impl Maps {
 pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
     let path = CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| format!("{}: a directory with a zero byte", dir.display()))?;
-    let error = |what: &str| format!("{what} {}: {}", dir.display(), std::io::Error::last_os_error());
+    let error =
+        |what: &str| format!("{what} {}: {}", dir.display(), std::io::Error::last_os_error());
     // SAFETY: it takes no pointer.
     let fd = unsafe { inotify_init1(IN_NONBLOCK | IN_CLOEXEC) };
     if fd < 0 {
@@ -538,14 +545,18 @@ mod tests {
 
     #[test]
     fn maps_are_found_by_binary_search_in_pieces() {
-        let maps = Maps(vec![(0x1000, 0x3000, PROT_READ), (0x3000, 0x4000, PROT_READ | PROT_WRITE)]);
+        let maps =
+            Maps(vec![(0x1000, 0x3000, PROT_READ), (0x3000, 0x4000, PROT_READ | PROT_WRITE)]);
         let mut pieces = Vec::new();
         maps.each(&(0x2ff8..0x3008), |piece, protection| {
             pieces.push((piece, protection));
             Ok(())
         })
         .expect("mapped");
-        assert_eq!(pieces, vec![(0x2ff8..0x3000, PROT_READ), (0x3000..0x3008, PROT_READ | PROT_WRITE)]);
+        assert_eq!(
+            pieces,
+            vec![(0x2ff8..0x3000, PROT_READ), (0x3000..0x3008, PROT_READ | PROT_WRITE)]
+        );
         assert!(maps.each(&(0x3ff8..0x4008), |_, _| Ok(())).unwrap_err().contains("0x4000"));
         assert!(maps.each(&(0x800..0x1008), |_, _| Ok(())).unwrap_err().contains("0x800"));
         let mine = Maps::read().expect("this process's maps");

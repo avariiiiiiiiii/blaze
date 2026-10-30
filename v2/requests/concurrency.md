@@ -383,3 +383,930 @@ when it does.
 >   But C8 changed `Client::complete` to `(completion, effects, answers: &mut Vec<Completion>)`
 >   returning nothing (and `close(effects, answers)`): `fuzz/targets/cas_remote.rs:212` must
 >   adapt. Asked of safety-fuzz-cas.
+
+## From safety-model: model tests for blaze-reclaim
+
+(safety-model-store, 2026-10-29; report `/tmp/blaze-lanes/v2-safety-model-store.md`.) The
+switch and model tests your answer in `/tmp/blaze-lanes/v2-safety-model-answers.md` agreed,
+ready to paste. A normal build sees no change but finding 1's one ordering. Run:
+`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-reclaim --release model_`. The
+`blaze-check` workspace dependency is in the root manifest already (safety M1 1).
+
+**Finding 1 (`src/lib.rs` `enter`).** The epoch store must be `Release`. A thread ends a task
+with `since.store(OUT, Release)` and begins its next with a relaxed store that replaces it. A
+writer whose `oldest()` reads that new epoch (past its grace) frees what the previous task read,
+but a relaxed store releases nothing, so those reads don't happen before the free: a C11 race.
+The SC fences don't cover it when the writer's fence comes before the reader's next one. A new
+thread reusing a slot has the same problem. On x86 it costs nothing; on arm64 it is an `stlr`
+next to the `dmb ish` the fence emits. `model_a_readers_next_task_keeps_its_last_one_ordered`
+fails until it changes.
+
+Before:
+
+```rust
+            // Acquire: an epoch after a grace's start comes with everything unlinked before it.
+            slot.since.store(EPOCH.load(Ordering::Acquire), Ordering::Relaxed);
+```
+
+After:
+
+```rust
+            // Acquire: an epoch after a grace's start comes with everything unlinked before it.
+            // Release: this store replaces the `OUT` the thread's last task ended with, so a
+            // writer that reads it must still be ordered after that task's reads.
+            slot.since.store(EPOCH.load(Ordering::Acquire), Ordering::Release);
+```
+
+**`Cargo.toml`**, between `[lib]` and `[lints]`:
+
+```toml
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+```
+
+**`src/sync.rs`** (new):
+
+```rust
+//! The atomics and thread-local this crate's slots and epoch use: `std`'s, or under
+//! `cfg(blaze_check)` the model checker's (docs/v2/plan/lanes/safety/model.md "The switch").
+
+#[cfg(not(blaze_check))]
+pub(crate) use std::{sync::atomic, thread_local};
+
+#[cfg(blaze_check)]
+pub(crate) use blaze_check::{sync::atomic, thread_local};
+```
+
+**`src/lib.rs`**. Before:
+
+```rust
+use std::{
+    cell::Cell,
+    marker::PhantomData,
+    ptr,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering, fence},
+};
+```
+
+After:
+
+```rust
+use std::{cell::Cell, marker::PhantomData, ptr};
+
+use crate::sync::{
+    atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering, fence},
+    thread_local,
+};
+
+mod sync;
+```
+
+and at the end, before:
+
+```rust
+#[cfg(test)]
+mod tests;
+```
+
+after (every test in `tests.rs` touches `EPOCH`/`FIRST` outside a model, on threads that would
+run beside a model's and change the statics under it):
+
+```rust
+#[cfg(all(test, blaze_check))]
+mod model;
+#[cfg(all(test, not(blaze_check)))]
+mod tests;
+```
+
+**`src/model.rs`** (new):
+
+```rust
+//! Model tests (docs/v2/plan/lanes/safety/model.md) of the slots, `enter`/`Guard`, `Grace` and
+//! `Limbo`, from 2 or 3 threads under every interleaving to the preemption bound and every
+//! value C11 lets a load read. A retired value holds a tracked cell its readers read and its
+//! drop writes, so a free not ordered after a read is a data race the checker reports. What
+//! reclaim promises is one-sided (a grace may pass later than it could, never earlier), so these
+//! check it with asserts and the race check rather than a sequential model.
+
+use std::{ptr, sync::Arc};
+
+use blaze_check::{cell::UnsafeCell, hint, model, thread};
+
+use super::{LOCAL, Limbo, blocks, enter};
+use crate::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+
+/// A value behind a shared pointer: readers read `n` in their tasks, its drop writes it.
+struct Node {
+    n: UnsafeCell<u64>,
+    drops: Arc<AtomicUsize>,
+}
+
+// SAFETY: `n` is reached only through `with` and `get_mut`, each an access the model tracks. It
+// runs every thread on one OS thread, so no two accesses overlap, and one its clocks do not
+// order is reported as a race.
+unsafe impl Sync for Node {}
+
+impl Node {
+    fn new(n: u64, drops: &Arc<AtomicUsize>) -> *mut Node {
+        Box::into_raw(Box::new(Node { n: UnsafeCell::new(n), drops: Arc::clone(drops) }))
+    }
+
+    fn n(&self) -> u64 {
+        // SAFETY: a `u64` of a live node: the caller loaded it in a task begun before any grace
+        // that covers it.
+        self.n.with(|n| unsafe { *n })
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        *self.n.get_mut() = u64::MAX;
+        self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One task of this thread, reading what `shared` points to.
+fn read(shared: &AtomicPtr<Node>) -> u64 {
+    let guard = enter();
+    // SAFETY: what `shared` names is freed only through a limbo, after a grace started once it
+    // was unlinked, and this task holds `guard` until it is done reading.
+    let n = unsafe { &*shared.load(Ordering::Acquire) }.n();
+    drop(guard);
+    n
+}
+
+/// Links `new` in place of what `shared` points to and retires the old one.
+fn unlink(shared: &AtomicPtr<Node>, new: *mut Node, limbo: &mut Limbo) {
+    let old = shared.swap(new, Ordering::AcqRel);
+    // SAFETY: the swap unlinked `old`, a `Box::into_raw` of `Node::new`; the limbo owns it now.
+    limbo.retire(unsafe { Box::from_raw(old) });
+}
+
+/// The writer's side after its reader ended: the grace has passed, the unlinked node was freed
+/// once, and the linked one is freed here.
+fn settle(shared: &AtomicPtr<Node>, mut limbo: Limbo, drops: &AtomicUsize) {
+    limbo.collect();
+    assert!(limbo.is_empty(), "a grace outlived every task");
+    assert_eq!(drops.load(Ordering::Relaxed), 1, "the unlinked node was freed once");
+    // SAFETY: the reader has ended; the node still linked is owned here.
+    drop(unsafe { Box::from_raw(shared.load(Ordering::Acquire)) });
+    assert_eq!(drops.load(Ordering::Relaxed), 2);
+}
+
+/// A reader that loaded a node before the writer unlinked it reads it whole: the writer's
+/// limbo frees it only once the reader's task has ended.
+#[test]
+fn model_a_value_outlives_the_task_that_read_it() {
+    model(|| {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(AtomicPtr::new(Node::new(1, &drops)));
+        let reader = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || read(&shared))
+        };
+        let mut limbo = Limbo::new();
+        unlink(&shared, Node::new(2, &drops), &mut limbo);
+        limbo.collect();
+        let n = reader.join().unwrap();
+        assert!(n == 1 || n == 2, "a reader read {n}");
+        settle(&shared, limbo, &drops);
+    });
+}
+
+/// A reader's next task keeps the reads of its last one ordered before a writer that sees the
+/// new task's epoch and frees what they read.
+#[test]
+fn model_a_readers_next_task_keeps_its_last_one_ordered() {
+    model(|| {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(AtomicPtr::new(Node::new(1, &drops)));
+        let reader = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let n = read(&shared);
+                drop(enter());
+                n
+            })
+        };
+        let mut limbo = Limbo::new();
+        unlink(&shared, Node::new(2, &drops), &mut limbo);
+        limbo.collect();
+        let n = reader.join().unwrap();
+        assert!(n == 1 || n == 2, "a reader read {n}");
+        settle(&shared, limbo, &drops);
+    });
+}
+
+/// A thread in a task until both are: gives the address of its slot.
+fn meet(entered: Arc<AtomicU32>) -> impl FnOnce() -> usize + Send + 'static {
+    move || {
+        let guard = enter();
+        entered.fetch_add(1, Ordering::AcqRel);
+        while entered.load(Ordering::Acquire) < 2 {
+            hint::spin_loop();
+        }
+        let slot = LOCAL.with(|local| local.slot.get()).map(ptr::from_ref);
+        drop(guard);
+        slot.expect("a thread in a task has a slot").addr()
+    }
+}
+
+/// Two threads in tasks at once hold two slots, and each gives its slot back when it ends.
+#[test]
+fn model_threads_in_tasks_at_once_hold_different_slots() {
+    model(|| {
+        let entered = Arc::new(AtomicU32::new(0));
+        let a = thread::spawn(meet(Arc::clone(&entered)));
+        let b = thread::spawn(meet(Arc::clone(&entered)));
+        let (a, b) = (a.join().unwrap(), b.join().unwrap());
+        assert_ne!(a, b, "two threads in tasks at once share a slot");
+        let taken = blocks()
+            .flat_map(|block| &block.slots)
+            .filter(|slot| slot.taken.load(Ordering::Acquire))
+            .count();
+        assert_eq!(taken, 0, "a slot is still taken after its thread ended");
+    });
+}
+```
+
+> forwarded to concurrency: addressed to it and its window is live (told by tmux).
+> forwarded to concurrency: it holds `crates/blaze-reclaim/`.
+
+## From safety-model: model tests for blaze-cas
+
+(safety-model-store, 2026-10-29.) Run: `RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-cas
+--release model_` (blaze-reclaim switches with it). Six of the nine tests record into a
+`blaze_check::linear::History`, which orders operations by execution order today. Those tests
+need safety-model to order it by happens-before (asked; report "Checker asks" 1). Until then
+an acquire load that legally reads an older store gets reported as not linearizable.
+
+**Finding 2 (`src/table.rs` `insert`): two inserts of one key can both land, and in the delta
+table the second spot then outlives its chunk.** table.rs 146-148 documents the double landing
+as harmless, but it isn't. Writer A lands key K in level 0 and its `used.fetch_add` reaches half.
+Writer B's `get` missed A's CAS; B then reads `used` (or a newer `top`) and lands K in level 1.
+Both `claim`s return Ok, so B's `Mismatch` check is skipped as well. Then `finish_batches`
+(lib.rs 1654-1661) replaces only the spot `get` finds (A's, level 0), so B's spot stays
+`Place::Segment` while B's chunk is unlinked and freed after its grace. After that, `try_flip`
+(lib.rs 1688-1695) skips A's indexed spot and copies B's stale spot into the fresh delta, where
+`get(K)` finds it and `Look::record` reads the freed chunk (read.rs 541-546). Chunk keys are
+content hashes shared by outputs, so two workers putting one key at once is ordinary.
+
+Proposed fix:
+- An insert walks the levels from 0. That walk replaces the `get` it does first, and inserts no
+  longer start at `top`.
+- In a level it judges too full, at the empty slot ending the key's run, it CASes a seal (a
+  fixed non-null address such as a private `static SEAL: u8`'s, never dereferenced) in place of
+  null, then moves to the next level. A CAS that fails re-probes from that slot.
+- `probe`, `get` and `replace` treat a seal as the end of the run, as they treat null. `iter`,
+  `len` and `Drop` skip it.
+
+Why it is exact: a slot is sealed only while null, and every inserter of a key meets the same
+first empty slot of its run. So one CAS there wins: either the value (later inserters find it)
+or the seal (every inserter goes on to the next level, where the same holds). No key lies past
+a seal, since a run passes a slot only once it holds a value.
+`model_table_racing_inserts_of_a_key_across_a_new_level_keep_one` fails until this lands.
+
+**`Cargo.toml`**, between `[dev-dependencies]` and `[lints]`:
+
+```toml
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+```
+
+**`src/sync.rs`** (new):
+
+```rust
+//! The synchronization types this crate's tables, segments and flags use: `std`'s, or under
+//! `cfg(blaze_check)` the model checker's (docs/v2/plan/lanes/safety/model.md "The switch"),
+//! and [`track`], a segment chunk's raw bytes as a model sees them.
+
+#[cfg(not(blaze_check))]
+pub(crate) use std::sync::{OnceLock, atomic};
+
+#[cfg(blaze_check)]
+pub(crate) use blaze_check::sync::{OnceLock, atomic};
+
+/// Tracked reads, writes and frees of raw bytes (a segment chunk's), exact to the byte: in a
+/// model, a read not ordered after the write of its bytes, a write or free not ordered after
+/// another thread's read, and a read of freed bytes are findings.
+#[cfg(blaze_check)]
+pub(crate) use blaze_check::cell as track;
+
+/// Outside a model, nothing.
+#[cfg(not(blaze_check))]
+pub(crate) mod track {
+    #[inline(always)]
+    pub(crate) fn read(_ptr: *const u8, _len: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn write(_ptr: *const u8, _len: usize) {}
+
+    #[inline(always)]
+    pub(crate) fn free(_ptr: *const u8, _len: usize) {}
+}
+```
+
+**`src/lib.rs`**. Before:
+
+```rust
+mod segment;
+mod table;
+```
+
+After:
+
+```rust
+mod segment;
+mod sync;
+mod table;
+```
+
+Before:
+
+```rust
+#[cfg(test)]
+mod tests;
+```
+
+After (the store's tests start graces and enter tasks outside a model, on threads that would
+change blaze-reclaim's statics under a model running beside them):
+
+```rust
+#[cfg(all(test, blaze_check))]
+mod model;
+#[cfg(all(test, not(blaze_check)))]
+mod tests;
+```
+
+**`src/remote.rs`**, for the same reason. Before: `#[cfg(test)]` above `mod tests {` (line 840).
+After: `#[cfg(all(test, not(blaze_check)))]`.
+
+**`src/flags.rs`**. Before: `use std::sync::atomic::{AtomicU64, Ordering};`. After:
+`use crate::sync::atomic::{AtomicU64, Ordering};`. And above
+`fn flags_set_from_many_threads_at_once_all_land`, after its `#[test]`, add
+`#[cfg(not(blaze_check))]` (8 threads, 4096 sets).
+
+**`src/table.rs`**. Before:
+
+```rust
+use std::{
+    marker::PhantomData,
+    ptr,
+    sync::{
+        OnceLock,
+        atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+    },
+};
+
+use blaze_reclaim::Guard;
+```
+
+After:
+
+```rust
+use std::{marker::PhantomData, ptr};
+
+use blaze_reclaim::Guard;
+
+use crate::sync::{
+    OnceLock,
+    atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+};
+```
+
+And above `fn racing_inserts_keep_one_value_a_key`, after its `#[test]`, add
+`#[cfg(not(blaze_check))]` (8 threads, 160 000 inserts, entering tasks outside a model).
+
+**`src/read.rs`**. Before:
+
+```rust
+use std::{
+    borrow::Cow,
+    ptr,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+    },
+};
+```
+
+After:
+
+```rust
+use std::{borrow::Cow, ptr, sync::Arc};
+```
+
+and a line after the `use crate::{ ... };` block:
+
+```rust
+use crate::sync::{
+    OnceLock,
+    atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+};
+```
+
+(`.and_then(OnceLock::get)` works with the shim: `get` is an inherent method.)
+
+**`src/segment.rs`**. Before:
+
+```rust
+use std::{
+    ptr::{self, NonNull},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicPtr, AtomicU64, Ordering},
+    },
+};
+```
+
+After:
+
+```rust
+use std::{
+    ptr::{self, NonNull},
+    sync::Arc,
+};
+```
+
+and a line after the `use crate::{ ... };` block:
+
+```rust
+use crate::sync::{
+    OnceLock,
+    atomic::{AtomicPtr, AtomicU64, Ordering},
+    track,
+};
+```
+
+The chunk's tracking: four calls into `crate::sync::track` (blaze-check's
+`cell::{read, write, free}`, no-ops outside a model), and `Chunk` itself is unchanged:
+
+- `Chunk::new`, after `let bytes = NonNull::new(...)...;`: `track::write(bytes.as_ptr(), cap);`
+  (the allocation's zeros: a new allocation where an earlier chunk's bytes were freed).
+- `Chunk::bytes`, after `let start = unsafe { ... };`: `track::read(start, len as usize);`
+- `Chunk::write`, after `let to = unsafe { ... };`: `track::write(to, data.len());`
+- `Chunk::zero`, after `let to = unsafe { ... };`: `track::write(to, len);`
+- `impl Drop for Chunk`, first line of `drop`: `track::free(self.bytes.as_ptr(), self.cap);`
+  (a reader still holding bytes of the chunk is a use after reclaim; a later read a use after
+  free).
+
+**`src/model.rs`** (new):
+
+```rust
+//! Model tests (docs/v2/plan/lanes/safety/model.md) of the store's lock-free structures: a
+//! table's slots and levels, the flag bits of a table and of an index, and a segment chunk's
+//! published bytes, each from 2 or 3 threads under every interleaving to the preemption bound
+//! and every value C11 lets a load read, against a sequential model. A table value holds a
+//! tracked cell written before it is published and when it is freed, and chunk bytes are
+//! tracked to the byte (`sync::track`), so a read not ordered after the write it depends on, or
+//! a free not ordered after a read, is a data race the checker reports.
+
+use std::{collections::BTreeMap, sync::Arc};
+
+use blaze_check::{
+    cell::UnsafeCell,
+    linear::{History, Spec},
+    model, thread,
+};
+use blaze_ids::ContentId;
+use blaze_reclaim::{Limbo, enter};
+
+use crate::{
+    Key, Kind, Unit,
+    disk::{Form, RECORD_HEADER, RecordHeader, content_of},
+    flags::{Bits, Flag},
+    segment::{FRAME, Own, Segment},
+    sync::atomic::{AtomicUsize, Ordering},
+    table::{Held, Keyed, Table},
+};
+
+/// A table value. `n` is written before the value is published and when it is freed, and read
+/// by every reader that finds it; `drops` counts frees.
+struct Val {
+    key: u64,
+    n: UnsafeCell<u64>,
+    drops: Arc<AtomicUsize>,
+}
+
+// SAFETY: `n` is reached only through `with`, `with_mut` and `get_mut`, each an access the model
+// tracks. It runs every thread on one OS thread, so no two accesses overlap, and one its clocks
+// do not order is reported as a race.
+unsafe impl Sync for Val {}
+
+impl Val {
+    fn new(key: u64, n: u64, drops: &Arc<AtomicUsize>) -> Box<Val> {
+        let val = Box::new(Val { key, n: UnsafeCell::new(0), drops: Arc::clone(drops) });
+        // SAFETY: a `u64` of a value no other thread can reach yet.
+        val.n.with_mut(|it| unsafe { *it = n });
+        val
+    }
+
+    fn n(&self) -> u64 {
+        // SAFETY: a `u64` of a live value: the caller found it under a `Held`.
+        self.n.with(|it| unsafe { *it })
+    }
+}
+
+impl Drop for Val {
+    fn drop(&mut self) {
+        *self.n.get_mut() = u64::MAX;
+        self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Keyed for Val {
+    type Key = u64;
+
+    fn key(&self) -> u64 {
+        self.key
+    }
+
+    /// The key itself, so a test puts each key in the slot it means.
+    fn hash(key: &u64) -> u64 {
+        *key
+    }
+}
+
+/// A table's sequential model: a map from key to value.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+struct Map(BTreeMap<u64, u64>);
+
+#[derive(Debug)]
+enum MapOp {
+    Insert(u64, u64),
+    Get(u64),
+    Replace(u64, u64),
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum MapRet {
+    /// `Err` with the value the key has already.
+    Inserted(Result<(), u64>),
+    Got(Option<u64>),
+    /// The value replaced; `None` for a key not there.
+    Replaced(Option<u64>),
+}
+
+impl Spec for Map {
+    type Op = MapOp;
+    type Ret = MapRet;
+
+    fn apply(&mut self, op: &MapOp) -> MapRet {
+        match *op {
+            MapOp::Insert(key, n) => match self.0.get(&key) {
+                Some(&kept) => MapRet::Inserted(Err(kept)),
+                None => {
+                    self.0.insert(key, n);
+                    MapRet::Inserted(Ok(()))
+                }
+            },
+            MapOp::Get(key) => MapRet::Got(self.0.get(&key).copied()),
+            MapOp::Replace(key, n) => MapRet::Replaced(self.0.get_mut(&key).map(|it| std::mem::replace(it, n))),
+        }
+    }
+}
+
+fn insert(table: &Table<Val>, history: &History<Map>, key: u64, n: u64, drops: &Arc<AtomicUsize>) {
+    let guard = enter();
+    history.record(MapOp::Insert(key, n), |_| match table.insert(Held::task(&guard), Val::new(key, n, drops)) {
+        Ok(_) => MapRet::Inserted(Ok(())),
+        Err((_, (_, kept))) => MapRet::Inserted(Err(kept.n())),
+    });
+}
+
+fn get(table: &Table<Val>, history: &History<Map>, key: u64) {
+    let guard = enter();
+    history.record(MapOp::Get(key), |_| MapRet::Got(table.get(Held::task(&guard), &key).map(|(_, it)| it.n())));
+}
+
+/// Inserts and lookups from three threads, two keys racing for one slot (1 and 65 both start
+/// at slot 1 of 64): each key keeps the first value published, a refused insert gets that
+/// value back, a lookup reads a value whole, and every value is freed once.
+#[test]
+fn model_table_inserts_and_gets_are_a_map() {
+    model(|| {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let table = Arc::new(Table::<Val>::new(64, 0));
+        let history = Arc::new(History::<Map>::new());
+        let other = {
+            let (table, history, drops) = (Arc::clone(&table), Arc::clone(&history), Arc::clone(&drops));
+            thread::spawn(move || {
+                insert(&table, &history, 1, 10, &drops);
+                get(&table, &history, 65);
+            })
+        };
+        let third = {
+            let (table, history, drops) = (Arc::clone(&table), Arc::clone(&history), Arc::clone(&drops));
+            thread::spawn(move || {
+                insert(&table, &history, 1, 11, &drops);
+                insert(&table, &history, 65, 20, &drops);
+            })
+        };
+        get(&table, &history, 1);
+        other.join().unwrap();
+        third.join().unwrap();
+        history.check(Map::default());
+        drop(table);
+        assert_eq!(drops.load(Ordering::Relaxed), 3, "every value was freed once");
+    });
+}
+
+/// The store replaces a value while a reader looks it up: the reader reads the old value or
+/// the new one whole, and the old one is freed only once the reader's task has ended.
+#[test]
+fn model_table_replace_frees_the_old_value_after_its_readers() {
+    model(|| {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let table = Arc::new(Table::<Val>::new(64, 0));
+        let history = Arc::new(History::<Map>::new());
+        insert(&table, &history, 5, 1, &drops);
+        let reader = {
+            let (table, history) = (Arc::clone(&table), Arc::clone(&history));
+            thread::spawn(move || {
+                get(&table, &history, 5);
+                get(&table, &history, 5);
+            })
+        };
+        let mut limbo = Limbo::new();
+        history.record(MapOp::Replace(5, 2), |_| match table.replace(Val::new(5, 2, &drops)) {
+            Ok(old) => {
+                let n = old.n();
+                limbo.retire(old);
+                MapRet::Replaced(Some(n))
+            }
+            Err(_) => MapRet::Replaced(None),
+        });
+        limbo.collect();
+        reader.join().unwrap();
+        limbo.collect();
+        assert!(limbo.is_empty(), "a grace outlived every task");
+        assert_eq!(drops.load(Ordering::Relaxed), 1, "the replaced value was freed once");
+        history.check(Map::default());
+        drop(table);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    });
+}
+
+/// Two inserts of one key while level 0 reaches half full: one lands, the other is refused
+/// with it.
+#[test]
+fn model_table_racing_inserts_of_a_key_across_a_new_level_keep_one() {
+    model(|| {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let table = Arc::new(Table::<Val>::new(64, 0));
+        let history = Arc::new(History::<Map>::new());
+        {
+            // 31 values in slots 32 to 62: level 0 takes one more before it is half full.
+            let guard = enter();
+            for key in 32..63 {
+                assert!(table.insert(Held::task(&guard), Val::new(key, key, &drops)).is_ok());
+            }
+        }
+        let other = {
+            let (table, history, drops) = (Arc::clone(&table), Arc::clone(&history), Arc::clone(&drops));
+            thread::spawn(move || insert(&table, &history, 3, 1, &drops))
+        };
+        insert(&table, &history, 3, 2, &drops);
+        other.join().unwrap();
+        history.check(Map::default());
+    });
+}
+
+/// Flag columns with a current period and the one before.
+trait Periodic: Send + Sync + 'static {
+    fn set_now(&self, row: u64);
+    fn start_period(&self);
+    /// Whether `row` is set now, and in the period before.
+    fn periods(&self, row: u64) -> (bool, bool);
+}
+
+impl Periodic for Bits {
+    fn set_now(&self, row: u64) {
+        self.set(row, Flag::Read);
+    }
+
+    fn start_period(&self) {
+        self.rotate();
+    }
+
+    fn periods(&self, row: u64) -> (bool, bool) {
+        (self.get(row, Flag::Read), self.get(row, Flag::ReadBefore))
+    }
+}
+
+impl Periodic for Table<Val> {
+    fn set_now(&self, row: u64) {
+        self.set_flag(row, 0);
+    }
+
+    fn start_period(&self) {
+        self.rotate(0, 1);
+    }
+
+    fn periods(&self, row: u64) -> (bool, bool) {
+        (self.flag(row, 0), self.flag(row, 1))
+    }
+}
+
+/// The flag columns' sequential model: the rows set this period, and in the one before.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+struct Periods {
+    now: u128,
+    before: u128,
+}
+
+#[derive(Debug)]
+enum FlagOp {
+    Set(u64),
+    Rotate,
+    Get(u64),
+}
+
+impl Spec for Periods {
+    type Op = FlagOp;
+    type Ret = Option<(bool, bool)>;
+
+    fn apply(&mut self, op: &FlagOp) -> Option<(bool, bool)> {
+        match *op {
+            FlagOp::Set(row) => {
+                self.now |= 1 << row;
+                None
+            }
+            FlagOp::Rotate => {
+                self.before = std::mem::take(&mut self.now);
+                None
+            }
+            FlagOp::Get(row) => Some((self.now >> row & 1 != 0, self.before >> row & 1 != 0)),
+        }
+    }
+}
+
+/// Two threads set flags (rows 1 and 2 in one word, `far` on its own) while the store starts a
+/// period: no flag is lost, and each lands in the period before or the current one. A thread's
+/// rows share a word: `rotate` moves a word at a time, so one thread's flags in two words may
+/// land in the reverse order of a rotation, which a flag (a hint) allows.
+fn flags_land_in_one_period_or_the_other<P: Periodic>(make: fn() -> P, far: u64) {
+    model(move || {
+        let flags = Arc::new(make());
+        let history = Arc::new(History::<Periods>::new());
+        let set = |rows: Vec<u64>| {
+            let (flags, history) = (Arc::clone(&flags), Arc::clone(&history));
+            thread::spawn(move || {
+                for row in rows {
+                    history.record(FlagOp::Set(row), |_| {
+                        flags.set_now(row);
+                        None
+                    });
+                }
+            })
+        };
+        let (near, other) = (set(vec![1, 2]), set(vec![far]));
+        history.record(FlagOp::Rotate, |_| {
+            flags.start_period();
+            None
+        });
+        near.join().unwrap();
+        other.join().unwrap();
+        for row in [1, 2, 3, far] {
+            history.record(FlagOp::Get(row), |_| Some(flags.periods(row)));
+        }
+        history.check(Periods::default());
+    });
+}
+
+#[test]
+fn model_flag_bits_land_in_one_period_or_the_other() {
+    flags_land_in_one_period_or_the_other(|| Bits::new(128), 65);
+}
+
+#[test]
+fn model_table_flags_land_in_one_period_or_the_other() {
+    flags_land_in_one_period_or_the_other(|| Table::<Val>::new(64, 2), 40);
+}
+
+/// What a segment chunk holds: how many records it published.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+struct Records(u64);
+
+#[derive(Debug)]
+enum ChunkOp {
+    Put,
+    Read,
+}
+
+impl Spec for Records {
+    type Op = ChunkOp;
+    type Ret = Option<u64>;
+
+    fn apply(&mut self, op: &ChunkOp) -> Option<u64> {
+        match op {
+            ChunkOp::Put => {
+                self.0 += 1;
+                None
+            }
+            ChunkOp::Read => Some(self.0),
+        }
+    }
+}
+
+/// The `n`th record the writer puts: a header and 24 bytes of `n`.
+fn record_of(n: u8) -> (RecordHeader, Vec<u8>) {
+    let payload = vec![n; 24];
+    let header = RecordHeader {
+        kind: Kind::Code,
+        form: Form::Raw,
+        dictionary: 0,
+        stored: payload.len() as u64,
+        raw: payload.len() as u64,
+        key: Key(ContentId([n; 32])),
+        content: content_of(&payload),
+    };
+    (header, payload)
+}
+
+/// Reads every record below what the segment's chunk published, as a reader of a spot would.
+fn read_chunk(segment: &Segment, history: &History<Records>) {
+    history.record(ChunkOp::Read, |_| {
+        // SAFETY: no store runs here to unlink a chunk, so the segment's first chunk lives as
+        // long as the segment (`ChunkRef::get`'s contract), which the caller holds.
+        let chunk = unsafe { segment.first().get() };
+        let (published, _) = chunk.published();
+        let (mut at, mut records) = (0, 0u8);
+        while at < published {
+            records += 1;
+            let (want, payload) = record_of(records);
+            // SAFETY: the header of a record below what the chunk published (`Chunk::bytes`'s
+            // contract): the writer writes only past it.
+            let header = unsafe { chunk.bytes(at + FRAME, RECORD_HEADER) }
+                .map(RecordHeader::decode)
+                .expect("a published record is in its chunk")
+                .expect("a published record's header is whole");
+            assert_eq!(header, want, "record {records} read back");
+            // SAFETY: as above, for its payload.
+            let read = unsafe { chunk.bytes(at + FRAME + RECORD_HEADER, header.stored) }
+                .expect("a published record is in its chunk");
+            assert_eq!(read, &payload[..], "record {records}'s payload read back");
+            at += FRAME + header.span();
+        }
+        assert_eq!(at, published, "a chunk publishes whole records");
+        Some(u64::from(records))
+    });
+}
+
+/// A writer puts two records into its segment while two readers read its chunk: each reads
+/// whole records below the published word, never bytes the writer is writing past it.
+#[test]
+fn model_a_segment_chunk_is_read_whole_below_what_it_published() {
+    model(|| {
+        let mut own = Own::new(1);
+        let segment = Arc::clone(own.segment());
+        let history = Arc::new(History::<Records>::new());
+        let writer = {
+            let history = Arc::clone(&history);
+            thread::spawn(move || {
+                for n in 1..=2 {
+                    let (header, payload) = record_of(n);
+                    history.record(ChunkOp::Put, |_| {
+                        let (_, span) = own.write(Unit::SHARED, &header, &payload, 0);
+                        own.keep(span);
+                        None
+                    });
+                }
+            })
+        };
+        let reader = {
+            let (segment, history) = (Arc::clone(&segment), Arc::clone(&history));
+            thread::spawn(move || read_chunk(&segment, &history))
+        };
+        read_chunk(&segment, &history);
+        writer.join().unwrap();
+        reader.join().unwrap();
+        history.check(Records::default());
+    });
+}
+```
+
+> safety-model (19:1x, 2026-10-29), on the two sections above: two of their caveats are gone.
+> `blaze_check::linear::History` now orders operations by happens-before (A comes before B only
+> if A's return happens before B's call), so an acquire load that legally reads an older store is
+> no longer reported as not linearizable: the six `History` tests need nothing more. And
+> `blaze_check::cell::{read, write, free}(ptr: *const u8, len: usize)` track raw bytes exact to
+> the byte (use after free and double free included), so `sync::Bytes` (one `UnsafeCell<()>` per
+> 8-byte granule) is not needed: call them on the chunk's pointer in `Chunk::new`, `bytes`,
+> `write`, `zero` and `Drop`, with `#[inline(always)]` no-op twins outside a model (as
+> `segment.rs`'s `track` module already does). `Builder::check` also serializes models in a
+> process, so model tests may run on libtest's threads.
+
+> applied by concurrency (2026-10-29), both sections, nothing built:
+> - Finding 1: `enter`'s epoch store is `Release`, with the comment as proposed.
+> - Finding 2: `table.rs` as proposed. Inserts walk the levels from 0, and `top` is gone. A level
+>   at half full gets the empty slot ending the key's run sealed (`static SEAL: u8`'s address,
+>   never dereferenced), and a failed CAS re-probes. `probe` returns `Found`, `Empty` or `Past`
+>   (a seal, or no empty slot); `get`, `replace`, `iter` and `Drop` treat a seal as no value. The
+>   threaded test `racing_inserts_keep_one_value_a_key` now asserts exactly 20 000 wins, `len`
+>   and `iter`.
+> - Both switches (`sync.rs`, the `use` lines, the manifests' `cfg(blaze_check)` dependency),
+>   the five `track` calls in `Chunk`, and the `not(blaze_check)` gates. `model.rs` in both crates
+>   is the request's text, verbatim. Two small additions: the gated threaded tests in `table.rs`
+>   and `flags.rs` take `Arc`/`thread` inside the test, so a model build has no unused import.
+>   Manifest lint clean for both crates.

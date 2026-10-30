@@ -3,12 +3,14 @@ use std::{fmt, mem, ops};
 use thin_vec::ThinVec;
 
 use crate::Revision;
+use crate::capture::{Captures, Reads};
 #[cfg(feature = "accumulator")]
 use crate::accumulator::{
     Accumulator,
     accumulated_map::{AccumulatedMap, AtomicInputAccumulatedValues, InputAccumulatedValues},
 };
 use crate::fingerprint::Fingerprint;
+use crate::graph::Graph;
 use crate::hash::FxIndexSet;
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
@@ -75,6 +77,9 @@ pub(crate) struct ActiveQuery {
 
     /// Provisional cycle results that this query depends on.
     cycle_heads: CycleHeads,
+
+    /// The [`crate::capture_reads`] frames open in this query.
+    captures: Captures,
 }
 
 impl ActiveQuery {
@@ -141,8 +146,8 @@ impl ActiveQuery {
         #[cfg(feature = "accumulator")]
         let record_input = record_input || accumulated_inputs.is_any();
 
-        if record_input {
-            let (edge, inserted) = self.insert_edge(QueryEdge::input(input));
+        let recorded = record_input.then(|| self.insert_edge(QueryEdge::input(input)));
+        if let Some((edge, inserted)) = recorded {
             if inserted && fingerprint.is_value() {
                 self.edge_fingerprints.push(EdgeFingerprint {
                     edge: u32::try_from(edge)
@@ -151,6 +156,17 @@ impl ActiveQuery {
                         .expect("exceeded `u32::MAX - 1` query edges; this should never happen"),
                     fingerprint,
                 });
+            }
+        }
+
+        if self.captures.is_open() {
+            self.captures.read(durability, changed_at, recorded);
+            if !cycle_heads.is_empty() {
+                self.captures.unshareable();
+            }
+            #[cfg(feature = "accumulator")]
+            if accumulated_inputs.is_any() {
+                self.captures.accumulated_inputs();
             }
         }
 
@@ -168,31 +184,97 @@ impl ActiveQuery {
         revision: Revision,
     ) {
         self.durability = self.durability.min(durability);
-        self.add_changed_at(revision);
+        self.changed_at = self.changed_at.max(revision);
 
-        if cfg!(feature = "persistence") || durability != Durability::NEVER_CHANGE {
-            self.insert_edge(QueryEdge::input(input));
+        let recorded = (cfg!(feature = "persistence") || durability != Durability::NEVER_CHANGE)
+            .then(|| self.insert_edge(QueryEdge::input(input)));
+        if self.captures.is_open() {
+            self.captures.read(durability, revision, recorded);
         }
     }
 
     pub(super) fn add_changed_at(&mut self, revision: Revision) {
         self.changed_at = self.changed_at.max(revision);
+        if self.captures.is_open() {
+            self.captures.changed_at(revision);
+        }
     }
 
     pub(super) fn add_untracked_read(&mut self, changed_at: Revision) {
         self.untracked_read = true;
         self.durability = Durability::MIN;
         self.changed_at = changed_at;
+        self.captures.unshareable();
     }
 
     #[cfg(feature = "accumulator")]
     pub(super) fn accumulate(&mut self, index: crate::IngredientIndex, value: impl Accumulator) {
         self.accumulated.accumulate(index, value);
+        self.captures.unshareable();
     }
 
     /// Adds a key to our list of outputs, returning whether it was newly inserted.
     pub(super) fn add_output(&mut self, key: DatabaseKeyIndex) -> bool {
+        self.captures.unshareable();
         self.insert_edge(QueryEdge::output(key)).1
+    }
+
+    /// Adds a capture's reads as if this query made them ([`crate::replay_reads`]); inside a
+    /// capture frame they are the frame's reads too.
+    pub(crate) fn replay(&mut self, graph: &Graph, reads: &Reads) {
+        let (durability, changed_at) = (reads.durability(), reads.changed_at());
+        self.durability = self.durability.min(durability);
+        self.changed_at = self.changed_at.max(changed_at);
+        #[cfg(feature = "accumulator")]
+        if reads.accumulated() {
+            self.accumulated_inputs |= InputAccumulatedValues::Any;
+        }
+        let capturing = self.captures.is_open();
+        if capturing {
+            self.captures.read(durability, changed_at, None);
+            if reads.accumulated() {
+                self.captures.accumulated_inputs();
+            }
+        }
+        for (edge, fingerprint) in reads.edges(graph) {
+            let (position, inserted) = self.insert_edge(edge);
+            if inserted && fingerprint.is_value() {
+                self.edge_fingerprints.push(EdgeFingerprint {
+                    edge: u32::try_from(position)
+                        .ok()
+                        .filter(|&edge| edge != EdgeFingerprint::VALUE)
+                        .expect("exceeded `u32::MAX - 1` query edges; this should never happen"),
+                    fingerprint,
+                });
+            }
+            if capturing {
+                self.captures
+                    .read(Durability::MAX, Revision::start(), Some((position, inserted)));
+            }
+        }
+    }
+
+    /// Opens a capture frame ([`crate::capture_reads`]) in this query.
+    pub(crate) fn open_capture(&mut self) {
+        self.captures.open(self.input_outputs.len());
+    }
+
+    /// Closes the innermost capture frame, returning its reads if they may be shared.
+    pub(crate) fn close_capture(
+        &mut self,
+        zalsa: &Zalsa,
+        zalsa_local: &ZalsaLocal,
+    ) -> Option<Reads> {
+        self.captures.close(
+            zalsa,
+            zalsa_local,
+            &self.input_outputs,
+            &self.edge_fingerprints,
+        )
+    }
+
+    pub(crate) fn captures_mut(&mut self) -> &mut Captures {
+        &mut self.captures
     }
 
     /// Inserts `edge` into `input_outputs` as `insert_full` does, returning its position and
@@ -207,6 +289,7 @@ impl ActiveQuery {
 
     /// True if the given key was output by this query.
     pub(super) fn disambiguate(&mut self, key: IdentityHash) -> Disambiguator {
+        self.captures.unshareable();
         self.disambiguator_map.disambiguate(key)
     }
 
@@ -242,6 +325,7 @@ impl ActiveQuery {
             accumulated: Default::default(),
             #[cfg(feature = "accumulator")]
             accumulated_inputs: Default::default(),
+            captures: Captures::default(),
         }
     }
 
@@ -264,6 +348,7 @@ impl ActiveQuery {
             ref mut accumulated,
             #[cfg(feature = "accumulator")]
             accumulated_inputs,
+            captures: _,
         } = self;
 
         disambiguator_map.clear();
@@ -311,6 +396,7 @@ impl ActiveQuery {
             accumulated,
             #[cfg(feature = "accumulator")]
                 accumulated_inputs: _,
+            captures,
         } = self;
         input_outputs.clear();
         edge_fingerprints.clear();
@@ -319,6 +405,7 @@ impl ActiveQuery {
         *cycle_heads = Default::default();
         #[cfg(feature = "accumulator")]
         accumulated.clear();
+        captures.clear();
     }
 
     fn reset_for(&mut self, new_database_key_index: DatabaseKeyIndex) {
@@ -336,8 +423,13 @@ impl ActiveQuery {
             accumulated,
             #[cfg(feature = "accumulator")]
             accumulated_inputs,
+            captures,
         } = self;
         *database_key_index = new_database_key_index;
+        debug_assert!(
+            !captures.is_open(),
+            "a `capture_reads` frame outlived the query it was opened in"
+        );
         *durability = Durability::MAX;
         *changed_at = Revision::start();
         *untracked_read = false;

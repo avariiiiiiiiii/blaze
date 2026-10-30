@@ -1,20 +1,19 @@
 //! The checks of rustc's AST validation of functions, closures and function pointer types:
 //! `visit_fn`'s (parameters, safety, the signature an ABI allows, `#[track_caller]`,
-//! C-variadics, `const` with `async`, patterns of a function without a body), and
-//! `check_fn_decl`, `check_extern_fn_signature` and `check_decl_no_pat`, which function
-//! pointer types share.
+//! C-variadics, `const` with `async`, patterns of a function without a body or in an `extern`
+//! block), and `check_fn_decl`, `check_extern_fn_signature` and `check_decl_no_pat`, which
+//! function pointer types share.
 //!
-//! E0130 (a pattern in a foreign function) is hir's `PatternArgInExternFn`, lowered in
-//! `crate::lower::pattern_arg_in_extern_fn`, and `patterns_in_fns_without_body` (a `mut x` of
-//! an associated function without a body) the early lints' (`lints::syntax::early::
-//! validation`): neither is given here.
+//! `patterns_in_fns_without_body` (a `mut x` of an associated function without a body) is
+//! the early lints' (`lints::syntax::early::validation`), not given here.
 //!
 //! Follows rustc's `compiler/rustc_ast_passes/src/ast_validation.rs` (`visit_fn`,
 //! `check_fn_decl`, `check_decl_num_args`, `check_decl_cvariadic_pos`,
 //! `check_decl_splatting`, `check_decl_attrs`, `check_decl_self_param`,
 //! `check_extern_fn_signature`, `reject_safe_fn`, `reject_coroutine`, `reject_return`,
 //! `reject_params_or_return`, `check_c_variadic_type`, `check_c_variadic_abi`,
-//! `check_decl_no_pat`, `SplatSemantic`) and `diagnostics.rs`, `compiler/rustc_ast/src/ast.rs`
+//! `check_decl_no_pat`, `SplatSemantic`) and `diagnostics.rs` (`PatternInForeign`,
+//! `PatternInBodiless`), `compiler/rustc_ast/src/ast.rs`
 //! (`FnHeader::span`, `FnSig::header_span`, `safety_span`, `extern_span`, `Param::is_self`),
 //! `compiler/rustc_abi/src/extern_abi.rs` (the ABIs' names, `supports_c_variadic`),
 //! `compiler/rustc_target/src/spec/abi_map.rs` (`canonize_abi`) and
@@ -24,6 +23,7 @@
 use std::borrow::Cow;
 
 use blaze_ids::radix;
+use hir::InFile;
 use syntax::{
     AstNode, AstToken as _, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize,
     ast::{self, HasName as _},
@@ -342,16 +342,22 @@ fn param_attrs(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, inputs: &[Input], out: 
     }
 }
 
-/// `check_decl_no_pat`: each parameter bound by anything but a name or `_`, with whether it
-/// is a `mut` name (`mut x`). A trait's method in Rust 2015 is not checked where rustc's
-/// parser already refused the pattern and put `_` in its place (`recover_arg_parse`).
-pub(super) fn patterns(inputs: &[Input], parser_recovers: bool, mut report: impl FnMut(TextRange, bool)) {
+/// `check_decl_no_pat`: each parameter bound by anything but a name or `_` (a pattern macro
+/// call as it expands), with whether it is a `mut` name (`mut x`). A trait's method in Rust
+/// 2015 is not checked where rustc's parser already refused the pattern and put `_` in its
+/// place (`recover_arg_parse`).
+pub(super) fn patterns(
+    v: &V<'_, '_, '_, '_>,
+    inputs: &[Input],
+    parser_recovers: bool,
+    mut report: impl FnMut(Span, bool),
+) {
     for input in inputs {
         if let Some(it) = ast::SelfParam::cast(input.node.clone()) {
             if it.amp_token().is_none()
                 && let (Some(mut_), Some(name)) = (it.mut_token(), it.name())
             {
-                report(TextRange::new(mut_.text_range().start(), name.syntax().text_range().end()), true);
+                report(v.span(TextRange::new(mut_.text_range().start(), name.syntax().text_range().end())), true);
             }
             continue;
         }
@@ -359,17 +365,34 @@ pub(super) fn patterns(inputs: &[Input], parser_recovers: bool, mut report: impl
         if parser_recovers && !named_param(&pat) {
             continue;
         }
-        let range = pat.syntax().text_range();
-        match &pat {
+        let pat = expanded_pat(v, pat);
+        let span = || v.cx.span(pat.as_ref().map(|it| it.syntax().text_range()));
+        match &pat.value {
             ast::Pat::WildcardPat(_) => {}
             ast::Pat::IdentPat(it) if it.ref_token().is_none() && it.pat().is_none() => {
                 if it.mut_token().is_some() {
-                    report(range, true);
+                    report(span(), true);
                 }
             }
-            _ => report(range, false),
+            _ => report(span(), false),
         }
     }
+}
+
+/// How deep pattern macro calls in a parameter's place are expanded.
+const MACRO_DEPTH: usize = 128;
+
+/// `pat` once the pattern macro calls in its place are expanded, as rustc's validator sees
+/// it, in the file it is written in.
+fn expanded_pat(v: &V<'_, '_, '_, '_>, pat: ast::Pat) -> InFile<ast::Pat> {
+    let mut pat = InFile::new(v.tree.file, pat);
+    for _ in 0..MACRO_DEPTH {
+        let ast::Pat::MacroPat(call) = &pat.value else { break };
+        let Some(root) = call.macro_call().and_then(|it| v.cx.sema.expand_macro_call(&it)) else { break };
+        let Some(next) = ast::Pat::cast(root.value) else { break };
+        pat = InFile::new(root.file_id, next);
+    }
+    pat
 }
 
 /// rustc's `Parser::is_named_param` of a parameter of a trait's method in Rust 2015: a name
@@ -425,13 +448,22 @@ pub(super) fn visit_fn(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, item: &ast::Fn,
     if item.body().is_none() {
         let parser_recovers = matches!(ctxt, Ctxt::Trait(_))
             && !v.edition_at(super::item_range(node).start()).at_least_2018();
-        patterns(&inputs, parser_recovers, |range, mut_ident| {
-            if mut_ident && ctxt.is_assoc() || matches!(ctxt, Ctxt::Foreign(_)) {
+        let foreign = matches!(ctxt, Ctxt::Foreign(_));
+        patterns(v, &inputs, parser_recovers, |span, mut_ident| {
+            if mut_ident && ctxt.is_assoc() {
                 return;
             }
-            let span = v.span(range);
-            let mut diag = Diag::error(Some("E0642"), "patterns aren't allowed in functions without bodies", span.clone());
-            diag.span_label(span, "pattern not allowed in function without body");
+            let diag = if foreign {
+                let message = "patterns aren't allowed in foreign function declarations";
+                let mut diag = Diag::error(Some("E0130"), message, span.clone());
+                diag.span_label(span, "pattern not allowed in foreign function");
+                diag
+            } else {
+                let message = "patterns aren't allowed in functions without bodies";
+                let mut diag = Diag::error(Some("E0642"), message, span.clone());
+                diag.span_label(span, "pattern not allowed in function without body");
+                diag
+            };
             v.emit(out, node, diag);
         });
     }

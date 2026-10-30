@@ -13,6 +13,10 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[features]
+# The entry points and reference readers the fuzz targets call; off in every other build.
+fuzz = []
+
 [dependencies]
 blaze-codegen.workspace = true
 blaze-core.workspace = true

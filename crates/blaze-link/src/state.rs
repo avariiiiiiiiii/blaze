@@ -354,6 +354,10 @@ pub(crate) struct State {
     pub tls: Option<Tls>,
     pub file_len: u64,
     pub parts: Arc<Vec<(u64, Vec<u8>)>>,
+    /// The 8-byte slots the writer encodes in the file ([`crate::model::Writer::encode`]), as
+    /// (file offset, value), sorted by offset. The regions keep the plain values, which the
+    /// next link and live patches read; only the file holds these.
+    pub encoded: Arc<Vec<(u64, u64)>>,
     /// The writer's loader, GOT and function lists, kept sorted across links.
     pub lists: Arc<crate::write::Lists>,
     /// What the image is across its generations: its first full link's.
@@ -405,6 +409,7 @@ impl State {
             tls: None,
             file_len: 0,
             parts: Arc::default(),
+            encoded: Arc::default(),
             lineage: [0; 16],
             laid_out: false,
             hot: CowVec::default(),

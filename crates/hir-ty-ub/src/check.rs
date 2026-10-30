@@ -46,7 +46,7 @@ use crate::{
 };
 
 /// The shadow of a value the evaluator holds outside memory: [`Bytes`].
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug)]
 pub struct Shadow(pub Bytes);
 
 impl eval::Shadow<Prov> for Shadow {

@@ -208,7 +208,18 @@ pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
     spans: &'a Spans,
+    /// How many groups the tree being read is in.
+    depth: u32,
 }
+
+/// The most groups a tree the module wrote may be nested in: its reading, its turning into
+/// rust-analyzer's tree and its drop each recurse once a level, on the expanding thread's
+/// stack, so a deeper one is refused rather than overflowing it.
+pub(crate) const DEPTH_MOST: u32 = 4096;
+
+/// The fewest bytes one tree takes in a stream (a punct: kind, span, char, spacing), which
+/// bounds how many the bytes left can hold.
+const TREE_FEWEST: usize = 10;
 
 /// A stream the module wrote, as trees: what [`Reader`] makes, and what is turned into
 /// rust-analyzer's.
@@ -219,7 +230,7 @@ pub(crate) enum Tree {
 
 impl<'a> Reader<'a> {
     pub(crate) fn new(bytes: &'a [u8], spans: &'a Spans) -> Reader<'a> {
-        Reader { bytes, at: 0, spans }
+        Reader { bytes, at: 0, spans, depth: 0 }
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
@@ -250,7 +261,7 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn stream(&mut self) -> Result<Vec<Tree>, String> {
         let count = self.u32()? as usize;
-        let mut trees = Vec::with_capacity(count.min(1 << 16));
+        let mut trees = Vec::with_capacity(count.min((self.bytes.len() - self.at) / TREE_FEWEST));
         for _ in 0..count {
             trees.push(self.tree()?);
         }
@@ -267,7 +278,13 @@ impl<'a> Reader<'a> {
                     _ => DelimiterKind::Invisible,
                 };
                 let (open, close, entire) = (self.span()?, self.span()?, self.span()?);
-                Tree::Group { kind, open, close, entire, trees: self.stream()? }
+                if self.depth == DEPTH_MOST {
+                    return Err(format!("the module wrote groups nested over {DEPTH_MOST} deep"));
+                }
+                self.depth += 1;
+                let trees = self.stream();
+                self.depth -= 1;
+                Tree::Group { kind, open, close, entire, trees: trees? }
             }
             1 => {
                 let span = self.span()?;
@@ -301,6 +318,13 @@ impl<'a> Reader<'a> {
                     }
                     _ => self.text()?,
                 };
+                if suffix.len() > crate::lex::SUFFIX_MOST {
+                    return Err(format!(
+                        "the module wrote a literal's suffix of {} bytes, over the {} kept",
+                        suffix.len(),
+                        crate::lex::SUFFIX_MOST,
+                    ));
+                }
                 Tree::Leaf(Leaf::Literal(tt::Literal::new(
                     text,
                     span,

@@ -6,8 +6,8 @@ use hir_def::{HasModule, ImplId, TraitId, TypeAliasId};
 use rustc_abi::{Float, HasDataLayout, Integer, IntegerType, Primitive, ReprOptions};
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
-    ConstKind, CoroutineArgs, DebruijnIndex, FloatTy, INNERMOST, IntTy, Interner,
-    PredicatePolarity, RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable,
+    ClausePolarity, ConstKind, CoroutineArgs, DebruijnIndex, FloatTy, INNERMOST, IntTy, Interner,
+    RegionKind, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeSuperVisitable,
     TypeVisitableExt, TypeVisitor, UintTy, UniverseIndex, Upcast,
     elaborate::{self, elaborate},
     inherent::{AdtDef, GenericArg as _, IntoKind, ParamEnv as _, SliceLike, Ty as _},
@@ -551,6 +551,7 @@ impl ItemBounds {
 
         let non_self_bounds_start = self_bounds.len() as u32;
         let bounds = StoredEarlyBinder::bind(
+            interner,
             Clauses::new_from_iter(self_bounds.iter().copied().chain(non_self_bounds)).store(),
         );
 
@@ -574,7 +575,7 @@ pub(crate) fn impl_super_outlives(
             )
         })
     });
-    StoredEarlyBinder::bind(Clauses::new_from_iter(result.skip_binder()).store())
+    StoredEarlyBinder::bind(interner, Clauses::new_from_iter(result.skip_binder()).store())
 }
 
 pub struct ContainsTypeErrors;
@@ -747,7 +748,7 @@ pub fn sizedness_fast_path<'db>(
     // `&T`, accounts for about 60% percentage of the predicates we have to prove. No need to
     // canonicalize and all that for such cases.
     if let PredicateKind::Clause(ClauseKind::Trait(trait_pred)) = predicate.kind().skip_binder()
-        && trait_pred.polarity == PredicatePolarity::Positive
+        && trait_pred.polarity == ClausePolarity::Positive
     {
         let sizedness = match tcx.as_trait_lang_item(trait_pred.def_id()) {
             Some(SolverTraitLangItem::Sized) => SizedTraitKind::Sized,
@@ -768,9 +769,9 @@ pub fn sizedness_fast_path<'db>(
         }
 
         if matches!(trait_pred.self_ty().kind(), TyKind::Param(_) | TyKind::Placeholder(_)) {
-            for clause in param_env.caller_bounds().iter() {
+            for clause in param_env.caller_bounds() {
                 if let ClauseKind::Trait(clause_pred) = clause.kind().skip_binder()
-                    && clause_pred.polarity == PredicatePolarity::Positive
+                    && clause_pred.polarity == ClausePolarity::Positive
                     && clause_pred.self_ty() == trait_pred.self_ty()
                     && (clause_pred.def_id() == trait_pred.def_id()
                         || (sizedness == SizedTraitKind::MetaSized

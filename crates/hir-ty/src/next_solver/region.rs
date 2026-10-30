@@ -252,9 +252,11 @@ impl rustc_type_ir::inherent::ParamLike for EarlyParamRegion {
 }
 
 impl<'db> RegionName<DbInterner<'db>> for EarlyParamRegion {
-    /// An early-bound region is a lifetime parameter its item declares, so it has a name.
-    fn get_name(&self, _interner: DbInterner<'db>) -> Option<Symbol> {
-        Some(Symbol)
+    /// The lifetime parameter's declared name, or `None` for an elided one (`'_`), as rustc's.
+    fn get_name(&self, interner: DbInterner<'db>) -> Option<Symbol> {
+        let params = hir_def::hir::generics::GenericParams::of(interner.db, self.id.parent);
+        let name = *params[self.id.local_id].name.symbol();
+        (name != intern::sym::tick_underscore).then_some(Symbol(name))
     }
 
     fn is_named(&self, interner: DbInterner<'db>) -> bool {

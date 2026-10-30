@@ -13,6 +13,8 @@ use std::ops::ControlFlow;
 use blaze_ids::radix;
 use cfg::CfgExpr;
 use hir::{HirFileId, InFile, ModuleSource};
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use syntax::{
     AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange,
     ast::{self, HasAttrs, HasModuleItem},
@@ -39,6 +41,9 @@ pub(super) struct Item {
     pub(super) module: hir::Module,
     /// The index of the item whose body it is written in, if it is in one.
     pub(super) in_body: Option<usize>,
+    /// One past the index of the last item in it (its associated, foreign and body items and
+    /// theirs): those after it up to `end` are what it holds.
+    pub(super) end: usize,
     /// Its own nodes, in source order (preorder), itself first; in what the macros it calls
     /// expand to, too; without the items in it and what is in them.
     pub(super) nodes: Vec<InFile<SyntaxNode>>,
@@ -54,16 +59,44 @@ impl Item {
         self.node.as_ref().map(|it| it.syntax().clone())
     }
 
-    /// Its own nodes that are `N`.
+    /// Its own nodes that are `N`, each kind tested before it is cast.
     pub(super) fn own<N: AstNode>(&self) -> impl Iterator<Item = InFile<N>> + '_ {
-        self.nodes.iter().filter_map(|it| N::cast(it.value.clone()).map(|n| it.with_value(n)))
+        self.nodes
+            .iter()
+            .filter(|it| N::can_cast(it.value.kind()))
+            .filter_map(|it| N::cast(it.value.clone()).map(|n| it.with_value(n)))
+    }
+
+    /// The items it holds, among `items` (all of the walk's, it at `index`).
+    pub(super) fn held<'i>(&self, items: &'i [Item], index: usize) -> &'i [Item] {
+        &items[index + 1..self.end]
     }
 }
 
-/// Where a module is in the crate as the AST has it: the offsets of the declarations of it and
-/// the modules it is in, from the crate's root.
-pub(super) fn module_order(cx: &Cx<'_, '_>, module: hir::Module) -> Vec<u32> {
-    let mut order = Vec::new();
+/// A key that sorts as the AST has things: the offsets of the declarations of a module and the
+/// modules it is in from the crate's root, then an offset in it. Inline up to three levels.
+pub(super) type Order = SmallVec<[u32; 4]>;
+
+/// Each module's place in the crate as the AST has it (the offsets of the declarations of it
+/// and the modules it is in, from the crate's root), made once per module: one FxHash lookup
+/// per key after that.
+#[derive(Default)]
+pub(super) struct Orders {
+    of: FxHashMap<hir::Module, Order>,
+}
+
+impl Orders {
+    /// The key that sorts what is at `lo` in `module` as the AST has it, each module's items in
+    /// place of its `mod`: rustc's order of `DefIndex`es and of the early lint pass.
+    pub(super) fn key(&mut self, cx: &Cx<'_, '_>, module: hir::Module, lo: u32) -> Order {
+        let mut key = self.of.entry(module).or_insert_with(|| module_order(cx, module)).clone();
+        key.push(lo);
+        key
+    }
+}
+
+fn module_order(cx: &Cx<'_, '_>, module: hir::Module) -> Order {
+    let mut order = Order::new();
     let mut at = Some(module);
     while let Some(module) = at {
         if let Some(range) = module.declaration_source_range(cx.db) {
@@ -73,16 +106,6 @@ pub(super) fn module_order(cx: &Cx<'_, '_>, module: hir::Module) -> Vec<u32> {
     }
     order.reverse();
     order
-}
-
-/// The key that sorts what is at `lo` in the module at `module` (its [`module_order`]) as the
-/// AST has it, each module's items in place of its `mod`: rustc's order of `DefIndex`es and of
-/// the early lint pass.
-pub(super) fn source_order(module: &[u32], lo: u32) -> Vec<u32> {
-    let mut key = Vec::with_capacity(module.len() + 1);
-    key.extend_from_slice(module);
-    key.push(lo);
-    key
 }
 
 /// The fields of a struct, a union or an enum's variants, in the order they are written.
@@ -155,6 +178,7 @@ impl Walk<'_, '_, '_> {
             container: container.clone(),
             module,
             in_body,
+            end: index + 1,
             nodes: vec![item.as_ref().map(|it| it.syntax().clone())],
         });
         let file = item.file_id;
@@ -178,6 +202,7 @@ impl Walk<'_, '_, '_> {
                 _ => self.node(file, &child, index, None, module),
             }
         }
+        self.items[index].end = self.items.len();
     }
 
     /// What a macro call or an attribute macro of an item expands to, in place of it.
@@ -194,7 +219,9 @@ impl Walk<'_, '_, '_> {
     /// `direct` when it is one of the items of an impl, a trait or an `extern` block `owner`
     /// is, else of `owner`'s body.
     fn node(&mut self, file: HirFileId, node: &SyntaxNode, owner: usize, direct: Option<&Container>, module: hir::Module) {
-        if let Some(it) = ast::AnyHasAttrs::cast(node.clone())
+        let kind = node.kind();
+        if ast::AnyHasAttrs::can_cast(kind)
+            && let Some(it) = ast::AnyHasAttrs::cast(node.clone())
             && !enabled(self.cx, &it)
         {
             return;
@@ -207,7 +234,9 @@ impl Walk<'_, '_, '_> {
             }
             return;
         }
-        if let Some(call) = ast::MacroCall::cast(node.clone()) {
+        if kind == SyntaxKind::MACRO_CALL
+            && let Some(call) = ast::MacroCall::cast(node.clone())
+        {
             self.items[owner].nodes.push(InFile::new(file, node.clone()));
             let Some(expansion) = self.expand(InFile::new(file, &call)) else { return };
             match expansion.value.kind() {

@@ -17,7 +17,7 @@ use hir_def::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    ClauseKind, OutlivesPredicate, RegionKind, Variance,
+    ClauseKind, OutlivesClause, RegionKind, Variance,
     inherent::{
         GenericArgs as _, IntoKind, ParamEnv as _, Region as _, SliceLike as _, Term as _, Ty as _,
     },
@@ -31,7 +31,8 @@ use hir_ty::{
         OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
     },
     next_solver::{
-        Clause, ConstKind, GenericArgKind, GenericArgs, Region, StoredRegion, StoredTy, Ty, TyKind,
+        Clause, ConstKind, GenericArgKind, GenericArgs, OpaqueTyIdWrapper, Region, RegionExt as _,
+        StoredRegion, StoredTy, Ty, TyKind,
     },
 };
 use salsa::SalsaValue;
@@ -239,6 +240,20 @@ impl<'db> Regions<'db> {
     }
 }
 
+/// The item an alias of any kind names, whose bounds rustc's `declared_bounds_from_definition`
+/// reads.
+pub(super) fn alias_def_id<'db>(
+    kind: rustc_type_ir::AliasTyKind<hir_ty::next_solver::DbInterner<'db>>,
+) -> hir_ty::next_solver::SolverDefId<'db> {
+    use rustc_type_ir::AliasTyKind;
+    match kind {
+        AliasTyKind::Projection { def_id } => def_id.into(),
+        AliasTyKind::Inherent { def_id } => def_id.into(),
+        AliasTyKind::Opaque { def_id } => def_id.into(),
+        AliasTyKind::Free { def_id } => def_id.into(),
+    }
+}
+
 pub(super) fn rv_of(region: Region<'_>) -> Option<Rv> {
     match region.kind() {
         RegionKind::ReVar(vid) => Some(vid.as_usize()),
@@ -253,10 +268,10 @@ fn projections<'db>(ty: Ty<'db>) -> Vec<(hir_ty::next_solver::SolverDefId<'db>, 
     impl<'db> rustc_type_ir::TypeVisitor<hir_ty::next_solver::DbInterner<'db>> for Find<'db> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
-            if let TyKind::Alias(alias) = ty.kind()
-                && let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
+            if let TyKind::Alias(_, alias) = ty.kind()
+                && let rustc_type_ir::AliasTyKind::Projection { def_id } = alias.kind
             {
-                self.0.push((alias.kind.def_id(), alias.args));
+                self.0.push((def_id.into(), alias.args));
             }
             rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
         }
@@ -266,16 +281,16 @@ fn projections<'db>(ty: Ty<'db>) -> Vec<(hir_ty::next_solver::SolverDefId<'db>, 
     find.0
 }
 
-/// Which arguments of the `impl Trait` `def`, of `len` of them, its hidden type may name: the
+/// Which arguments of the `impl Trait` `opaque`, of `len` of them, its hidden type may name: the
 /// others are bivariant in rustc's `variances_of` the opaque type, and its liveness skips
 /// them. Every one, unless `use<..>` lists them; before edition 2024, outside a trait and its
 /// impls and outside an `async fn`, the type parameters and the lifetimes its bounds name. In
 /// a trait or its impls the trait's or impl's own are always captured, as rustc relates an
 /// `impl Trait` there (a GAT of the trait) invariantly in all of them, whatever `use<..>` says.
 /// `None` where this does not work it out, which counts every argument captured.
-pub(super) fn opaque_captures(
-    db: &dyn hir_ty::db::HirDatabase,
-    def: hir_ty::next_solver::SolverDefId<'_>,
+pub(super) fn opaque_captures<'db>(
+    db: &'db dyn hir_ty::db::HirDatabase,
+    opaque: OpaqueTyIdWrapper<'db>,
     len: usize,
 ) -> Option<Vec<bool>> {
     use hir_def::{
@@ -286,8 +301,7 @@ pub(super) fn opaque_captures(
         },
     };
     use rustc_type_ir::Interner as _;
-    let hir_ty::next_solver::SolverDefId::InternedOpaqueTyId(opaque) = def else { return None };
-    let hir_ty::ImplTraitId::ReturnTypeImplTrait(function, index) = opaque.loc(db) else {
+    let hir_ty::ImplTraitId::ReturnTypeImplTrait(function, index) = opaque.0.loc(db) else {
         return None;
     };
     let params: Vec<_> = hir_ty::generics::generics(db, function.into()).iter(true).collect();
@@ -303,7 +317,7 @@ pub(super) fn opaque_captures(
         _ => false,
     };
     let signature = FunctionSignature::of(db, function);
-    let written = signature.ret_type.and_then(|ret| match &signature.store[ret] {
+    let written = signature.ret_type.and_then(|ret| match signature.store.type_ref(ret) {
         TypeRef::ImplTrait(bounds) if index.into_raw().into_u32() == 0 => Some(bounds),
         _ => None,
     });
@@ -324,11 +338,14 @@ pub(super) fn opaque_captures(
     let mut without_self = hir_ty::next_solver::util::BottomUpFolder {
         interner,
         ty_op: |ty: Ty<'_>| match ty.kind() {
-            TyKind::Alias(alias) if alias.kind.def_id() == def => Ty::new_unit(interner),
-            TyKind::Alias(alias)
-                if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
-                    && let Some(captured) =
-                        opaque_captures(db, alias.kind.def_id(), alias.args.len()) =>
+            TyKind::Alias(_, alias)
+                if alias.kind == rustc_type_ir::AliasTyKind::Opaque { def_id: opaque } =>
+            {
+                Ty::new_unit(interner)
+            }
+            TyKind::Alias(_, alias)
+                if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
+                    && let Some(captured) = opaque_captures(db, def_id, alias.args.len()) =>
             {
                 let named: Vec<Ty<'_>> = alias
                     .args
@@ -353,7 +370,7 @@ pub(super) fn opaque_captures(
         lt_op: |region| region,
         ct_op: |ct| ct,
     };
-    for clause in interner.item_bounds(def).skip_binder() {
+    for clause in interner.item_bounds(opaque.into()).skip_binder() {
         let clause = rustc_type_ir::TypeFoldable::fold_with(clause, &mut without_self);
         rustc_type_ir::fold_regions(interner, clause, |region, _| {
             match region.kind() {
@@ -480,7 +497,7 @@ fn nth_impl_trait<'s>(
             _ => None,
         })
     };
-    match &store[ty] {
+    match store.type_ref(ty) {
         TypeRef::ImplTrait(bounds) => {
             if *index == 0 {
                 return Some(bounds);
@@ -492,7 +509,7 @@ fn nth_impl_trait<'s>(
         TypeRef::Path(path) => in_path(path, index),
         TypeRef::Reference(it) => nth_impl_trait(store, it.ty, index),
         TypeRef::RawPtr(it, _) | TypeRef::Slice(it) | TypeRef::PatternType(it, _) => {
-            nth_impl_trait(store, *it, index)
+            nth_impl_trait(store, it, index)
         }
         TypeRef::Array(it) => nth_impl_trait(store, it.ty, index),
         TypeRef::Tuple(tys) => tys.iter().find_map(|&it| nth_impl_trait(store, it, index)),
@@ -506,7 +523,7 @@ fn has_opaque(ty: Ty<'_>) -> bool {
     impl<'db> rustc_type_ir::TypeVisitor<hir_ty::next_solver::DbInterner<'db>> for Find {
         type Result = std::ops::ControlFlow<()>;
         fn visit_ty(&mut self, ty: Ty<'db>) -> Self::Result {
-            if let TyKind::Alias(alias) = ty.kind()
+            if let TyKind::Alias(_, alias) = ty.kind()
                 && let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
             {
                 return std::ops::ControlFlow::Break(());
@@ -533,7 +550,9 @@ fn hidden_types<'db>(declared: Ty<'db>, actual: Ty<'db>, out: &mut Vec<Ty<'db>>)
         }
     };
     match (declared.kind(), actual.kind()) {
-        (TyKind::Alias(alias), _) if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind => {
+        (TyKind::Alias(_, alias), _)
+            if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind =>
+        {
             out.push(actual)
         }
         (TyKind::Adt(a, declared), TyKind::Adt(b, actual)) if a == b => args(declared, actual, out),
@@ -577,10 +596,10 @@ fn names_captured_lifetime<'db>(db: &dyn hir_ty::db::HirDatabase, ty: Ty<'db>) -
         }
         fn visit_ty(&mut self, ty: Ty<'db>) {
             match ty.kind() {
-                TyKind::Alias(alias)
-                    if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
+                TyKind::Alias(_, alias)
+                    if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
                         && let Some(captured) =
-                            opaque_captures(self.db, alias.kind.def_id(), alias.args.len()) =>
+                            opaque_captures(self.db, def_id, alias.args.len()) =>
                 {
                     for (arg, captured) in alias.args.iter().zip(captured) {
                         if captured {
@@ -605,11 +624,9 @@ fn unbounded_opaque<'db>(
     interner: hir_ty::next_solver::DbInterner<'db>,
     ty: Ty<'db>,
 ) -> bool {
-    let TyKind::Alias(alias) = ty.kind() else { return false };
-    if !matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. }) {
-        return false;
-    }
-    rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+    let TyKind::Alias(_, alias) = ty.kind() else { return false };
+    let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind else { return false };
+    rustc_type_ir::Interner::item_bounds(interner, def_id.into())
         .iter_instantiated(interner, alias.args.as_slice())
         .all(|clause| match clause.kind().skip_binder() {
             ClauseKind::TypeOutlives(_) | ClauseKind::RegionOutlives(_) => false,
@@ -658,11 +675,11 @@ fn member_regions<'db>(
                 TyKind::CoroutineClosure(_, args) => {
                     self.args(args, args.as_coroutine_closure().parent_args().len())
                 }
-                TyKind::Alias(_) if !self.aliases => (),
-                TyKind::Alias(alias)
-                    if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
+                TyKind::Alias(_, _) if !self.aliases => (),
+                TyKind::Alias(_, alias)
+                    if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
                         && let Some(captured) =
-                            opaque_captures(self.db, alias.kind.def_id(), alias.args.len()) =>
+                            opaque_captures(self.db, def_id, alias.args.len()) =>
                 {
                     for (arg, captured) in alias.args.iter().zip(captured) {
                         if captured {
@@ -996,11 +1013,11 @@ impl<'db> Builder<'_, '_, 'db> {
             RegionKind::ReBound(..) => Some(region),
             // In a closure, a late-bound lifetime of the enclosing item is its creator's.
             RegionKind::ReLateParam(late) if self.nested() => {
-                Some(self.parent_late_region(late.bound_region.var.as_u32()))
+                Some(self.parent_late_region(late.kind.var.as_u32()))
             }
             // A late-bound lifetime the body names, the same as in the signature.
             RegionKind::ReLateParam(late) => {
-                let var = late.bound_region.var.as_u32();
+                let var = late.kind.var.as_u32();
                 if let Some(&it) = self.late.get(&var) {
                     return Some(it);
                 }
@@ -1306,7 +1323,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 // The type an `impl Trait` hides is inferred, the lifetimes of its trait objects
                 // too; a trait object the signature writes next to it keeps its default.
                 Some((_, output))
-                    if let TyKind::Alias(alias) = output.kind()
+                    if let TyKind::Alias(_, alias) = output.kind()
                         && let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind =>
                 {
                     rustc_type_ir::TypeFoldable::fold_with(
@@ -1332,9 +1349,11 @@ impl<'db> Builder<'_, '_, 'db> {
             // A lifetime parameter it captures is not a universal region until something names
             // it.
             let captures_parameter = signature.as_ref().is_some_and(|(_, output)| {
-                let TyKind::Alias(alias) = output.kind() else { return false };
-                let Some(captured) =
-                    opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len())
+                let TyKind::Alias(_, alias) = output.kind() else { return false };
+                let Some(captured) = alias
+                    .kind
+                    .try_to_opaque()
+                    .and_then(|opaque| opaque_captures(self.ctx.db, opaque, alias.args.len()))
                 else {
                     return false;
                 };
@@ -1354,16 +1373,16 @@ impl<'db> Builder<'_, '_, 'db> {
                     .walk()
                     .filter_map(|it| rustc_type_ir::inherent::GenericArg::as_type(&it))
                     .filter_map(|ty| match ty.kind() {
-                        TyKind::Alias(alias)
-                            if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind =>
+                        TyKind::Alias(_, alias)
+                            if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind =>
                         {
-                            Some(alias)
+                            Some((def_id, alias))
                         }
                         _ => None,
                     })
-                    .any(|alias| {
+                    .any(|(opaque, alias)| {
                         let Some(captured) =
-                            opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len())
+                            opaque_captures(self.ctx.db, opaque, alias.args.len())
                         else {
                             return true;
                         };
@@ -1409,7 +1428,7 @@ impl<'db> Builder<'_, '_, 'db> {
             // gives it a lifetime of its own is that lifetime an existential region, live
             // where the slot is.
             let ty = match ty.kind() {
-                TyKind::Alias(alias)
+                TyKind::Alias(_, alias)
                     if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. })
                         && self.normalize(ty).is_none() =>
                 {
@@ -1438,11 +1457,11 @@ impl<'db> Builder<'_, '_, 'db> {
             if opaque
                 && !is_async
                 && let Some((_, output)) = &signature
-                && let TyKind::Alias(alias) = output.kind()
-                && let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
+                && let TyKind::Alias(_, alias) = output.kind()
+                && let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
             {
                 let interner = self.interner();
-                let bounds = rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id());
+                let bounds = rustc_type_ir::Interner::item_bounds(interner, def_id.into());
                 let mut hidden = Replace::new(interner, (*output, ty));
                 for clause in bounds.iter_instantiated(interner, alias.args.as_slice()) {
                     let clause = clause.skip_norm_wip();
@@ -1510,9 +1529,9 @@ impl<'db> Builder<'_, '_, 'db> {
                 && !hidden_static
                 && let Some((_, output)) = &signature
                 && let Some((alias, hidden)) = returned_opaque(*output, ty)
-                && let Some(captured) =
-                    opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len())
-                        .or_else(|| variadic.then(|| vec![true; alias.args.len()]))
+                && let rustc_type_ir::AliasTyKind::Opaque { def_id: opaque_id } = alias.kind
+                && let Some(captured) = opaque_captures(self.ctx.db, opaque_id, alias.args.len())
+                    .or_else(|| variadic.then(|| vec![true; alias.args.len()]))
             {
                 let mut choices = vec![self.regions.static_rv];
                 let mut known = true;
@@ -1535,12 +1554,12 @@ impl<'db> Builder<'_, '_, 'db> {
                 // ways not followed here, so its member constraints are left out.
                 let mut outlived = Vec::new();
                 let bounds =
-                    rustc_type_ir::Interner::item_bounds(self.interner(), alias.kind.def_id());
+                    rustc_type_ir::Interner::item_bounds(self.interner(), opaque_id.into());
                 for clause in bounds.iter_instantiated(self.interner(), alias.args.as_slice()) {
                     match clause.kind().skip_binder() {
-                        ClauseKind::TypeOutlives(OutlivesPredicate(bounded, region))
-                            if let TyKind::Alias(bounded) = bounded.kind()
-                                && bounded.kind.def_id() == alias.kind.def_id() =>
+                        ClauseKind::TypeOutlives(OutlivesClause(bounded, region))
+                            if let TyKind::Alias(_, bounded) = bounded.kind()
+                                && bounded.kind == alias.kind =>
                         {
                             // Under the clause's own binder, the signature's is one further out.
                             let binder = rustc_type_ir::INNERMOST.shifted_in(1);
@@ -1817,7 +1836,7 @@ impl<'db> Builder<'_, '_, 'db> {
     /// `object_region_bounds` does before it looks at the reference.
     fn written_object_default(&mut self, index: usize, ty: Ty<'db>) -> Option<Ty<'db>> {
         let closure = self.ctx.closure_expr?;
-        let hir_def::hir::Expr::Closure { arg_types, .. } = &self.ctx.store[closure] else {
+        let hir_def::hir::Expr::Closure { arg_types, .. } = self.ctx.store.expr(closure) else {
             return None;
         };
         let written = self.lower_written((*arg_types.get(index)?)?, MirSpan::ExprId(closure));
@@ -1851,7 +1870,7 @@ impl<'db> Builder<'_, '_, 'db> {
         if !self.ctx.infer.closures_without_expectation.contains(&closure) {
             return None;
         }
-        let hir_def::hir::Expr::Closure { arg_types, .. } = &self.ctx.store[closure] else {
+        let hir_def::hir::Expr::Closure { arg_types, .. } = self.ctx.store.expr(closure) else {
             return None;
         };
         let written = self.lower_written((*arg_types.get(index)?)?, MirSpan::ExprId(closure));
@@ -1898,7 +1917,7 @@ impl<'db> Builder<'_, '_, 'db> {
         for annotation in lets {
             let (pat, initializer) = (annotation.pat, annotation.initializer);
             // A variable with a type written out has it, lifetimes and all.
-            let local = match self.ctx.store[pat] {
+            let local = match self.ctx.store.pat(pat) {
                 Pat::Bind { id, subpat: None } => self.body.binding_locals.get(id).copied(),
                 _ => None,
             };
@@ -1915,10 +1934,10 @@ impl<'db> Builder<'_, '_, 'db> {
             };
             let Some(ty) = ty else { continue };
             self.well_formed(ty, at, 0);
-            if !matches!(self.ctx.store[pat], Pat::Bind { subpat: None, .. }) {
+            if !matches!(self.ctx.store.pat(pat), Pat::Bind { subpat: None, .. }) {
                 self.annotated_bindings(pat, ty, at, true);
             }
-            if !matches!(self.ctx.store[pat], Pat::Bind { .. })
+            if !matches!(self.ctx.store.pat(pat), Pat::Bind { .. })
                 && let Some(initializer) = initializer
             {
                 let value = match self.path_local(initializer) {
@@ -1952,7 +1971,7 @@ impl<'db> Builder<'_, '_, 'db> {
             ret_type,
             closure_kind: hir_def::hir::ClosureKind::Closure,
             ..
-        } = &self.ctx.store[closure]
+        } = self.ctx.store.expr(closure)
         else {
             return;
         };
@@ -1966,7 +1985,7 @@ impl<'db> Builder<'_, '_, 'db> {
             .iter()
             .copied()
             .zip(arg_types.iter().copied())
-            .chain([(super::return_slot(), *ret_type)])
+            .chain([(super::return_slot(), ret_type)])
             .collect();
         for (local, type_ref) in written {
             let Some(type_ref) = type_ref else { continue };
@@ -1994,11 +2013,11 @@ impl<'db> Builder<'_, '_, 'db> {
             return;
         }
         let interner = self.interner();
-        match &self.ctx.store[pat] {
+        match self.ctx.store.pat(pat) {
             Pat::Bind { id, subpat } => {
                 if !top
                     && let Some(hir_ty::BindingMode(by_ref, _)) = self.ctx.infer.binding_mode(pat)
-                    && let Some(&local) = self.body.binding_locals.get(*id)
+                    && let Some(&local) = self.body.binding_locals.get(id)
                 {
                     let local_ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
                     // `ref y` borrows the part, which has the type.
@@ -2012,7 +2031,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         _ => (),
                     }
                 }
-                if let Some(subpat) = *subpat {
+                if let Some(subpat) = subpat {
                     self.annotated_bindings(subpat, ty, at, false);
                 }
             }
@@ -2020,7 +2039,6 @@ impl<'db> Builder<'_, '_, 'db> {
                 if let TyKind::Tuple(tys) = ty.kind()
                     && tys.len() == args.len()
                 {
-                    let args = args.clone();
                     for (pat, ty) in args.iter().zip(tys.iter()) {
                         self.annotated_bindings(*pat, ty, at, false);
                     }
@@ -2028,7 +2046,7 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             Pat::Ref { pat, .. } => {
                 if let TyKind::Ref(_, inner, _) = ty.kind() {
-                    self.annotated_bindings(*pat, inner, at, false);
+                    self.annotated_bindings(pat, inner, at, false);
                 }
             }
             Pat::Record { args, ellipsis: _, .. } => {
@@ -2088,7 +2106,7 @@ impl<'db> Builder<'_, '_, 'db> {
         // A path in a closure in this body is the closure's, which proves it.
         let owner = |mut expr| loop {
             match parent.get(&expr) {
-                Some(&up) if matches!(store[up], hir_def::hir::Expr::Closure { .. }) => {
+                Some(&up) if matches!(store.expr(up), hir_def::hir::Expr::Closure { .. }) => {
                     return Some(up);
                 }
                 Some(&up) => expr = up,
@@ -2106,11 +2124,11 @@ impl<'db> Builder<'_, '_, 'db> {
                 && let Some(ty) = self.ctx.infer.type_of_expr.get(expr)
                 && let TyKind::FnDef(def, args) = ty.as_ref().kind()
             {
-                items.push((expr, def.0, args));
+                items.push((expr, def.0, args.no_bound_vars().unwrap()));
             }
             let positions = self.spelled_positions(expr, path).unwrap_or_default();
             let fn_args = match self.ctx.infer.type_of_expr.get(expr).map(|it| it.as_ref().kind()) {
-                Some(TyKind::FnDef(_, args)) => Some(args),
+                Some(TyKind::FnDef(_, args)) => Some(args.no_bound_vars().unwrap()),
                 _ => None,
             };
             for args in path.generic_args().into_iter().flatten().flatten() {
@@ -2149,7 +2167,7 @@ impl<'db> Builder<'_, '_, 'db> {
     /// `Foo<'static>`, as rustc's user type annotation on the pattern. Only for the whole
     /// pattern of a `let` or a `match` arm, matching a variable or what the `let` reads.
     fn pattern_paths(&mut self) {
-        let spelled = |pat: &Pat| match pat {
+        let spelled = |pat: Pat<'_>| match pat {
             Pat::Record { path, .. } | Pat::TupleStruct { path, .. } | Pat::Path(path) => {
                 spells_generics(path)
             }
@@ -2161,7 +2179,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 hir_def::hir::Expr::Block { statements, .. } => {
                     for statement in statements.iter() {
                         if let Statement::Let { pat, type_ref: None, initializer, .. } = statement
-                            && spelled(&self.ctx.store[*pat])
+                            && spelled(self.ctx.store.pat(*pat))
                         {
                             found.push((*pat, *initializer));
                         }
@@ -2169,8 +2187,8 @@ impl<'db> Builder<'_, '_, 'db> {
                 }
                 hir_def::hir::Expr::Match { expr, arms } => {
                     for arm in arms.iter() {
-                        if spelled(&self.ctx.store[arm.pat]) {
-                            found.push((arm.pat, Some(*expr)));
+                        if spelled(self.ctx.store.pat(arm.pat)) {
+                            found.push((arm.pat, Some(expr)));
                         }
                     }
                 }
@@ -2190,7 +2208,7 @@ impl<'db> Builder<'_, '_, 'db> {
             let Some(value) = value else { continue };
             let ty = self.written(ty);
             let at = At { category: Category::TypeAnnotation, span: MirSpan::PatId(pat) };
-            if let Pat::Path(_) = self.ctx.store[pat]
+            if let Pat::Path(_) = self.ctx.store.pat(pat)
                 && let Some(constant) = self.pattern_constant(pat)
             {
                 // rustc ascribes a constant's type to what it matches contravariantly:
@@ -2198,7 +2216,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 // `&'static str` if `'a: 'static`.
                 let constant = self.regions.local_tys[constant.into_raw().into_u32() as usize];
                 self.relate(constant, value, Variance::Covariant, at);
-            } else if let Pat::Path(_) = self.ctx.store[pat] {
+            } else if let Pat::Path(_) = self.ctx.store.pat(pat) {
                 let common = self.renumber(value);
                 self.relate(value, common, Variance::Covariant, at);
                 self.relate(ty, common, Variance::Covariant, at);
@@ -2255,7 +2273,7 @@ impl<'db> Builder<'_, '_, 'db> {
 
     fn path_binding(&self, expr: hir_def::hir::ExprId) -> Option<hir_def::hir::BindingId> {
         use hir_def::resolver::{HasResolver, ValueNs};
-        let hir_def::hir::Expr::Path(path) = &self.ctx.store[expr] else { return None };
+        let hir_def::hir::Expr::Path(path) = self.ctx.store.expr(expr) else { return None };
         let db = self.ctx.db;
         let owner = self.body.owner;
         let mut resolver = owner.resolver(db);
@@ -2296,7 +2314,7 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             // An associated type is well-formed where its trait is implemented, `<&'a () as
             // Trait>::Ty` with only `impl Trait for &'static ()` that `'a: 'static`.
-            TyKind::Alias(alias) => {
+            TyKind::Alias(_, alias) => {
                 for it in alias.args.types() {
                     self.well_formed(it, at, depth + 1);
                 }
@@ -2321,6 +2339,7 @@ impl<'db> Builder<'_, '_, 'db> {
             // As rustc, a function item is well-formed with its where clauses and its return
             // type, but what names its late-bound lifetimes is not checked.
             TyKind::FnDef(def, args) => {
+                let args = args.no_bound_vars().unwrap();
                 let generic_def: GenericDefId = match def.0 {
                     CallableDefId::FunctionId(it) => it.into(),
                     CallableDefId::StructId(it) => it.into(),
@@ -2381,7 +2400,7 @@ impl<'db> Builder<'_, '_, 'db> {
         args: GenericArgs<'db>,
         span: MirSpan,
     ) {
-        let hir_def::hir::Expr::Path(path) = &self.ctx.store[expr] else { return };
+        let hir_def::hir::Expr::Path(path) = self.ctx.store.expr(expr) else { return };
         if !names_through_type(self.ctx.db, path, container) {
             return;
         }
@@ -2403,7 +2422,7 @@ impl<'db> Builder<'_, '_, 'db> {
     fn annotated_locals(&self) -> FxHashMap<LocalId, Annotation> {
         let mut found = FxHashMap::default();
         for annotation in self.lets() {
-            if let Pat::Bind { id, subpat: None } = self.ctx.store[annotation.pat]
+            if let Pat::Bind { id, subpat: None } = self.ctx.store.pat(annotation.pat)
                 && let Some(&local) = self.body.binding_locals.get(id)
             {
                 found.insert(local, annotation);
@@ -2460,9 +2479,9 @@ impl<'db> Builder<'_, '_, 'db> {
         }
         let interner = self.interner();
         let mut aliases = Vec::new();
-        for clause in self.ctx.env.caller_bounds().iter() {
-            if let ClauseKind::TypeOutlives(OutlivesPredicate(ty, _)) = clause.kind().skip_binder()
-                && let TyKind::Alias(_) = ty.kind()
+        for clause in self.ctx.env.caller_bounds() {
+            if let ClauseKind::TypeOutlives(OutlivesClause(ty, _)) = clause.kind().skip_binder()
+                && let TyKind::Alias(_, _) = ty.kind()
             {
                 aliases.push(ty);
             }
@@ -2567,7 +2586,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     continue;
                 };
                 match it.kind() {
-                    TyKind::Alias(alias)
+                    TyKind::Alias(_, alias)
                         if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
                     {
                         let trait_ref = alias.trait_ref(interner);
@@ -2595,7 +2614,7 @@ impl<'db> Builder<'_, '_, 'db> {
                                     );
                                     tys.extend(predicate.term.as_type());
                                 }
-                                ClauseKind::TypeOutlives(OutlivesPredicate(ty, _)) => tys.push(ty),
+                                ClauseKind::TypeOutlives(OutlivesClause(ty, _)) => tys.push(ty),
                                 _ => (),
                             }
                         }
@@ -2652,7 +2671,7 @@ impl<'db> Builder<'_, '_, 'db> {
         {
             for clause in GenericPredicates::query_all(self.ctx.db, def).skip_binder() {
                 match clause.kind().skip_binder() {
-                    ClauseKind::RegionOutlives(OutlivesPredicate(longer, shorter)) => {
+                    ClauseKind::RegionOutlives(OutlivesClause(longer, shorter)) => {
                         if let (Some(longer), Some(shorter)) = (
                             self.signature_region(longer, rustc_type_ir::INNERMOST),
                             self.signature_region(shorter, rustc_type_ir::INNERMOST),
@@ -2661,7 +2680,7 @@ impl<'db> Builder<'_, '_, 'db> {
                             pairs.push((longer, shorter));
                         }
                     }
-                    ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) => {
+                    ClauseKind::TypeOutlives(OutlivesClause(ty, region)) => {
                         if let Some(region) =
                             self.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
                         {
@@ -2676,10 +2695,10 @@ impl<'db> Builder<'_, '_, 'db> {
         // The bounds the where clauses imply too, as of supertraits: `T: Trait` where
         // `trait Trait: 'static`.
         if self.ctx.closure_local.is_none() {
-            let clauses: Vec<_> = self.ctx.env.caller_bounds().iter().collect();
+            let clauses: Vec<_> = self.ctx.env.caller_bounds().collect();
             for clause in clauses {
                 match clause.kind().skip_binder() {
-                    ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) => {
+                    ClauseKind::TypeOutlives(OutlivesClause(ty, region)) => {
                         if let Some(region) =
                             self.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
                         {
@@ -2687,7 +2706,7 @@ impl<'db> Builder<'_, '_, 'db> {
                             self.regions.type_bounds.push((ty, region));
                         }
                     }
-                    ClauseKind::RegionOutlives(OutlivesPredicate(longer, shorter)) => {
+                    ClauseKind::RegionOutlives(OutlivesClause(longer, shorter)) => {
                         if let (Some(longer), Some(shorter)) = (
                             self.signature_region(longer, rustc_type_ir::INNERMOST),
                             self.signature_region(shorter, rustc_type_ir::INNERMOST),
@@ -2891,7 +2910,7 @@ impl<'db> Builder<'_, '_, 'db> {
             TyKind::Ref(region, inner, _) => {
                 if let Some(shorter) = self.region_rv(region) {
                     let referent = match inner.kind() {
-                        TyKind::Alias(_) => self.normalize(inner).unwrap_or(inner),
+                        TyKind::Alias(_, _) => self.normalize(inner).unwrap_or(inner),
                         _ => inner,
                     };
                     let (components, params) = self.implied_components(referent);
@@ -2924,16 +2943,16 @@ impl<'db> Builder<'_, '_, 'db> {
                     use rustc_type_ir::Upcast as _;
                     let interner = self.interner();
                     for predicate in self.inferred.of(self.ctx.db, adt) {
-                        let OutlivesPredicate(arg, region) =
-                            rustc_type_ir::EarlyBinder::bind(predicate)
+                        let OutlivesClause(arg, region) =
+                            rustc_type_ir::EarlyBinder::bind(interner, predicate)
                                 .instantiate(interner, args)
                                 .skip_norm_wip();
                         clauses.push(match arg.kind() {
                             GenericArgKind::Type(ty) => {
-                                OutlivesPredicate(ty, region).upcast(interner)
+                                OutlivesClause(ty, region).upcast(interner)
                             }
                             GenericArgKind::Lifetime(longer) => {
-                                OutlivesPredicate(longer, region).upcast(interner)
+                                OutlivesClause(longer, region).upcast(interner)
                             }
                             GenericArgKind::Const(_) => continue,
                         });
@@ -2991,7 +3010,7 @@ impl<'db> Builder<'_, '_, 'db> {
             // normalized type does: `<&'a &'b () as Trait>::Type` that `'b: 'a`.
             // And the bounds of its trait, which its trait reference's well-formedness needs:
             // `<T as Trait<A>>::Assoc` that `A: 'static` where `trait Trait<A: 'static>`.
-            TyKind::Alias(alias) => {
+            TyKind::Alias(_, alias) => {
                 if let rustc_type_ir::AliasTyKind::Projection { def_id } = alias.kind {
                     for it in alias.args.types() {
                         self.implied_bounds(it, pairs, seen, depth + 1, in_field);
@@ -3071,7 +3090,7 @@ impl<'db> Builder<'_, '_, 'db> {
         outlives_components(ty, &mut components, &mut params);
         alias_components(ty, &mut params);
         let aliases: Vec<_> =
-            params.iter().filter(|it| matches!(it.kind(), TyKind::Alias(_))).copied().collect();
+            params.iter().filter(|it| matches!(it.kind(), TyKind::Alias(_, _))).copied().collect();
         for alias in aliases {
             if let Some(normalized) = self.normalize(alias)
                 && normalized != alias
@@ -3087,14 +3106,14 @@ impl<'db> Builder<'_, '_, 'db> {
     fn implied_by_clauses(&mut self, clauses: Vec<Clause<'db>>, pairs: &mut Vec<(Rv, Rv)>) {
         for clause in clauses {
             match clause.kind().skip_binder() {
-                ClauseKind::RegionOutlives(OutlivesPredicate(longer, shorter)) => {
+                ClauseKind::RegionOutlives(OutlivesClause(longer, shorter)) => {
                     if let (Some(longer), Some(shorter)) =
                         (self.region_rv(longer), self.region_rv(shorter))
                     {
                         pairs.push((longer, shorter));
                     }
                 }
-                ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) => {
+                ClauseKind::TypeOutlives(OutlivesClause(ty, region)) => {
                     if let Some(shorter) = self.region_rv(region) {
                         let (components, params) = self.implied_components(ty);
                         pairs.extend(components.into_iter().map(|it| (it, shorter)));
@@ -3144,7 +3163,7 @@ impl<'db> Builder<'_, '_, 'db> {
         use hir_def::hir::{ClosureKind, CoroutineSource, Expr};
         if self.ctx.closure_local.is_some()
             || !matches!(
-                self.ctx.store[coroutine],
+                self.ctx.store.expr(coroutine),
                 Expr::Closure {
                     closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Fn, .. },
                     ..
@@ -3198,9 +3217,10 @@ impl<'db> Builder<'_, '_, 'db> {
             .instantiate_identity()
             .skip_norm_wip()
             .skip_binder();
-        let TyKind::Alias(future) = sig.output().kind() else { return None };
+        let TyKind::Alias(_, future) = sig.output().kind() else { return None };
+        let rustc_type_ir::AliasTyKind::Opaque { def_id } = future.kind else { return None };
         interner
-            .item_bounds(future.kind.def_id())
+            .item_bounds(def_id.into())
             .iter_instantiated(interner, future.args.as_slice())
             .find_map(|clause| match clause.kind().skip_binder() {
                 ClauseKind::Projection(projection) => projection.term.as_type(),
@@ -3224,9 +3244,9 @@ impl<'db> Builder<'_, '_, 'db> {
             }))
         };
         match (typed.kind(), declared.kind()) {
-            (kind, TyKind::Alias(alias))
+            (kind, TyKind::Alias(_, alias))
                 if matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. })
-                    && !matches!(kind, TyKind::Alias(_)) =>
+                    && !matches!(kind, TyKind::Alias(_, _)) =>
             {
                 rustc_type_ir::fold_regions(interner, typed, |_, _| self.fresh())
             }
@@ -3261,10 +3281,9 @@ impl<'db> Builder<'_, '_, 'db> {
         use rustc_type_ir::Interner as _;
         let interner = self.interner();
         let Some(inner) = self.async_declared_output(function) else { return };
-        let TyKind::Alias(alias) = inner.kind() else { return };
-        let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind else { return };
-        let Some(captured) = opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len())
-        else {
+        let TyKind::Alias(_, alias) = inner.kind() else { return };
+        let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind else { return };
+        let Some(captured) = opaque_captures(self.ctx.db, def_id, alias.args.len()) else {
             return;
         };
         // What its bounds say it outlives, its hidden type must, as for the `impl Trait` a
@@ -3272,13 +3291,13 @@ impl<'db> Builder<'_, '_, 'db> {
         let binder = rustc_type_ir::INNERMOST.shifted_in(1);
         let mut outlived = Vec::new();
         for clause in interner
-            .item_bounds(alias.kind.def_id())
+            .item_bounds(def_id.into())
             .iter_instantiated(interner, alias.args.as_slice())
         {
             match clause.kind().skip_binder() {
-                ClauseKind::TypeOutlives(OutlivesPredicate(bounded, region))
-                    if let TyKind::Alias(bounded) = bounded.kind()
-                        && bounded.kind.def_id() == alias.kind.def_id() =>
+                ClauseKind::TypeOutlives(OutlivesClause(bounded, region))
+                    if let TyKind::Alias(_, bounded) = bounded.kind()
+                        && bounded.kind == alias.kind =>
                 {
                     // Under its clause's binder too.
                     match self.signature_region(region, binder.shifted_in(1)).and_then(rv_of) {
@@ -3614,7 +3633,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     }
                 }
             }
-            (TyKind::Alias(x), TyKind::Alias(y)) if x.kind == y.kind => {
+            (TyKind::Alias(_, x), TyKind::Alias(_, y)) if x.kind == y.kind => {
                 // Two projections are what they normalize to, as rustc relates them
                 // normalized: `<S as Q>::Item<'w, 's>` and `<S as Q>::Item<'w, 'static>` are
                 // both `&'w S` when the impl's `Item<'w, 's>` is.
@@ -3635,8 +3654,8 @@ impl<'db> Builder<'_, '_, 'db> {
                 // its variances under the ambient one: an argument it does not capture is
                 // bivariant, so a covariant `impl Sized` of `'a` is one of `'b`.
                 let (variances, ambient) = match x.kind {
-                    rustc_type_ir::AliasTyKind::Opaque { .. } => (
-                        opaque_captures(self.ctx.db, x.kind.def_id(), x.args.len()).map(|it| {
+                    rustc_type_ir::AliasTyKind::Opaque { def_id } => (
+                        opaque_captures(self.ctx.db, def_id, x.args.len()).map(|it| {
                             it.into_iter()
                                 .map(|captured| match captured {
                                     true => Variance::Invariant,
@@ -3652,16 +3671,16 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             // A signature's associated type against what it is,
             // `<&'a mut Vec<T> as IntoIterator>::IntoIter` and `IterMut<'_, T>`.
-            (TyKind::Alias(x), _) | (_, TyKind::Alias(x))
+            (TyKind::Alias(_, x), _) | (_, TyKind::Alias(_, x))
                 if matches!(x.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
             {
                 let normalize = |this: &mut Self, ty: Ty<'db>| match ty.kind() {
-                    TyKind::Alias(_) => this.normalize_at(ty, at).filter(|&it| it != ty),
+                    TyKind::Alias(_, _) => this.normalize_at(ty, at).filter(|&it| it != ty),
                     _ => Some(ty),
                 };
                 if let Some(a) = normalize(self, a)
                     && let Some(b) = normalize(self, b)
-                    && !matches!((a.kind(), b.kind()), (TyKind::Alias(_), TyKind::Alias(_)))
+                    && !matches!((a.kind(), b.kind()), (TyKind::Alias(_, _), TyKind::Alias(_, _)))
                 {
                     self.relate(a, b, variance, at);
                 }
@@ -3675,6 +3694,7 @@ impl<'db> Builder<'_, '_, 'db> {
             // (`relate_item_args`), which its signature gives: `foo<'a>() -> PhantomData<&'a ()>`
             // is covariant in `'a`, and a constructor `fn(T) -> S<T>` is invariant in `T`.
             (TyKind::FnDef(def, aa), TyKind::FnDef(_, ab)) => {
+                let (aa, ab) = (aa.no_bound_vars().unwrap(), ab.no_bound_vars().unwrap());
                 let variances = match def.0 {
                     hir_def::CallableDefId::FunctionId(it) => {
                         self.ctx.db.variances_of(GenericDefId::FunctionId(it))
@@ -3752,16 +3772,16 @@ impl<'db> Builder<'_, '_, 'db> {
     /// its arguments, each argument does; else the trait's one bound does, or a type test
     /// that some bound or every argument does.
     fn alias_outlives(&mut self, ty: Ty<'db>, region: Region<'db>, at: At, depth: usize) {
-        let TyKind::Alias(alias) = ty.kind() else { return };
+        let TyKind::Alias(_, alias) = ty.kind() else { return };
         if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty)
             || ty.references_non_lt_error()
         {
             return;
         }
-        let opaque = matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. });
-        if !opaque
+        let opaque = alias.kind.try_to_opaque();
+        if opaque.is_none()
             && let Some(normalized) = self.normalize(ty)
-            && !matches!(normalized.kind(), TyKind::Alias(_) | TyKind::Infer(_))
+            && !matches!(normalized.kind(), TyKind::Alias(_, _) | TyKind::Infer(_))
         {
             self.type_outlives_at(normalized, region, at, depth + 1);
             return;
@@ -3774,10 +3794,10 @@ impl<'db> Builder<'_, '_, 'db> {
         let erased = erase(ty);
         let in_env = self.env_aliases.contains(&erased);
         let from_trait: Vec<Region<'db>> =
-            rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+            rustc_type_ir::Interner::item_bounds(interner, alias_def_id(alias.kind))
                 .iter_instantiated(interner, alias.args)
                 .filter_map(|it| match it.skip_norm_wip().kind().skip_binder() {
-                    ClauseKind::TypeOutlives(OutlivesPredicate(bounded, bound))
+                    ClauseKind::TypeOutlives(OutlivesClause(bounded, bound))
                         if erase(bounded) == erased =>
                     {
                         Some(bound)
@@ -3790,10 +3810,9 @@ impl<'db> Builder<'_, '_, 'db> {
             has_regions |= !matches!(region.kind(), RegionKind::ReBound(..));
             region
         });
-        if !in_env && from_trait.is_empty() && (has_regions || opaque) {
-            let captured = opaque
-                .then(|| opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len()))
-                .flatten();
+        if !in_env && from_trait.is_empty() && (has_regions || opaque.is_some()) {
+            let captured =
+                opaque.and_then(|opaque| opaque_captures(self.ctx.db, opaque, alias.args.len()));
             for (index, arg) in alias.args.iter().enumerate() {
                 if captured.as_ref().is_some_and(|it| !it[index]) {
                     continue;
@@ -3895,7 +3914,7 @@ impl<'db> Builder<'_, '_, 'db> {
     fn callee_expr(&self, func: &Operand, call: MirSpan) -> Option<hir_def::hir::ExprId> {
         match (func.span(), call) {
             (Some(MirSpan::ExprId(expr)), _) => Some(expr),
-            (_, MirSpan::ExprId(call)) => match self.ctx.store[call] {
+            (_, MirSpan::ExprId(call)) => match self.ctx.store.expr(call) {
                 hir_def::hir::Expr::Call { callee, .. } => Some(callee),
                 _ => Some(call),
             },
@@ -3923,15 +3942,16 @@ impl<'db> Builder<'_, '_, 'db> {
             _ => return None,
         };
         let expr = self.callee_expr(func, call)?;
-        match &self.ctx.store[expr] {
+        match self.ctx.store.expr(expr) {
             hir_def::hir::Expr::Path(path) if spells_generics(path) => {
                 let ty = self.written(ty);
                 if let TyKind::FnDef(_, args) = ty.kind() {
-                    self.spelled_projections(expr, path, args);
+                    self.spelled_projections(expr, path, args.no_bound_vars().unwrap());
                 }
                 if let TyKind::FnDef(def, args) = ty.kind()
                     && let CallableDefId::FunctionId(function) = def.0
                 {
+                    let args = args.no_bound_vars().unwrap();
                     let container = function.lookup(self.ctx.db).container;
                     let parent =
                         hir_ty::generics::generics(self.ctx.db, function.into()).len_parent();
@@ -3946,13 +3966,14 @@ impl<'db> Builder<'_, '_, 'db> {
             hir_def::hir::Expr::MethodCall { generic_args: Some(_), .. } => {
                 let TyKind::FnDef(def, args) = ty.kind() else { return None };
                 let CallableDefId::FunctionId(function) = def.0 else { return None };
+                let args = args.no_bound_vars().unwrap();
                 let parent = hir_ty::generics::generics(self.ctx.db, function.into()).len_parent();
                 let args = args.iter().enumerate().map(|(index, arg)| match index < parent {
                     true => self.renumber(arg),
                     false => self.written(arg),
                 });
                 let args = GenericArgs::new_from_iter(args.collect::<Vec<_>>());
-                Some(Ty::new_fn_def(self.interner(), def, args))
+                Some(Ty::new_fn_def(self.interner(), def, rustc_type_ir::Binder::dummy(args)))
             }
             _ => None,
         }
@@ -3990,7 +4011,7 @@ impl<'db> Builder<'_, '_, 'db> {
     fn sized_local(&mut self, local: LocalId, ty: Ty<'db>, span: MirSpan) {
         if local == super::return_slot()
             || self.body.param_locals.contains(&local)
-            || !matches!(ty.kind(), TyKind::Alias(alias) if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }))
+            || !matches!(ty.kind(), TyKind::Alias(_, alias) if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }))
         {
             return;
         }
@@ -4063,7 +4084,7 @@ impl<'db> Builder<'_, '_, 'db> {
         // variables: `ptr as _` relates no lifetime, though `_` is inferred `'static` from
         // where the value goes.
         if let MirSpan::ExprId(expr) = span
-            && let hir_def::hir::Expr::Cast { type_ref, .. } = self.ctx.store[expr]
+            && let hir_def::hir::Expr::Cast { type_ref, .. } = self.ctx.store.expr(expr)
             && matches!(rvalue, Rvalue::Use(_) | Rvalue::Cast(..))
             && let Some(inferred) = self.ctx.infer.type_of_expr.get(expr)
         {
@@ -4157,19 +4178,23 @@ impl<'db> Builder<'_, '_, 'db> {
     /// through a written self type, `<Foo<'a>>::C`, that type equal to the impl's.
     fn constant_ty(&mut self, operand: &Operand, span: MirSpan) -> Option<Ty<'db>> {
         let OperandKind::Constant { konst, .. } = &operand.kind else { return None };
-        let ConstKind::Unevaluated(unevaluated) = konst.as_ref().kind() else { return None };
-        let id = match unevaluated.def.0 {
-            GeneralConstId::ConstId(id) => id,
-            GeneralConstId::AnonConstId(konst) => return self.inline_const_ty(konst, operand),
-            _ => return None,
+        let ConstKind::Alias(_, unevaluated) = konst.as_ref().kind() else { return None };
+        let id = match unevaluated.kind {
+            AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
+            | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
+            | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => id,
+            AliasConstKind::Anon { def_id } => return self.inline_const_ty(def_id.0, operand),
+            AliasConstKind::InherentSelf { def_id } => {
+                panic!("{def_id:?}: a MIR constant names an inherent const in its `Self` form")
+            }
         };
         let span = operand.span().unwrap_or(span);
         let path = match span {
-            MirSpan::ExprId(expr) => match &self.ctx.store[expr] {
+            MirSpan::ExprId(expr) => match self.ctx.store.expr(expr) {
                 hir_def::hir::Expr::Path(path) => Some(path),
                 _ => None,
             },
-            MirSpan::PatId(pat) => match &self.ctx.store[pat] {
+            MirSpan::PatId(pat) => match self.ctx.store.pat(pat) {
                 Pat::Path(path) => Some(path),
                 _ => None,
             },
@@ -4516,7 +4541,7 @@ impl<'db> Builder<'_, '_, 'db> {
         let mut in_projection = Vec::new();
         for arg in lowered.walk() {
             let Some(ty) = arg.as_type() else { continue };
-            if let TyKind::Alias(alias) = ty.kind()
+            if let TyKind::Alias(_, alias) = ty.kind()
                 && let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
             {
                 for arg in ty.walk() {
@@ -4615,7 +4640,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 Ty::new(interner, TyKind::Adt(def, GenericArgs::new_from_iter(args)))
             }
             // An associated type with `_`s in it has them as `projection_holes` inferred.
-            (TyKind::Alias(alias), _)
+            (TyKind::Alias(_, alias), _)
                 if let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
                     && rustc_type_ir::TypeVisitableExt::has_non_region_infer(&lowered) =>
             {
@@ -4988,7 +5013,7 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             Rvalue::Aggregate(AggregateKind::Adt(variant, args), operands) => {
                 let store = self.ctx.store;
-                let spelled = |expr| match &store[expr] {
+                let spelled = |expr| match store.expr(expr) {
                     hir_def::hir::Expr::RecordLit { path, .. } | hir_def::hir::Expr::Path(path) => {
                         spells_generics(path)
                     }
@@ -4997,7 +5022,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 // A constructor called through a variable, `let f = Foo::<&'a u32>; f(x)`, has
                 // the variable's arguments.
                 let through_local = match span {
-                    MirSpan::ExprId(expr) => match store[expr] {
+                    MirSpan::ExprId(expr) => match store.expr(expr) {
                         hir_def::hir::Expr::Call { callee, .. } => {
                             self.callee_local(callee).and_then(|local| {
                                 let ty =
@@ -5029,7 +5054,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     hir_def::VariantId::StructId(it) => AdtId::StructId(it),
                     hir_def::VariantId::UnionId(it) => AdtId::UnionId(it),
                 };
-                let names_self = |expr| match &store[expr] {
+                let names_self = |expr| match store.expr(expr) {
                     hir_def::hir::Expr::RecordLit { path, .. } | hir_def::hir::Expr::Path(path) => {
                         path.is_self_type()
                     }
@@ -5040,7 +5065,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 let self_args = match span {
                     MirSpan::ExprId(expr)
                         if names_self(expr)
-                            || matches!(store[expr],
+                            || matches!(store.expr(expr),
                                 hir_def::hir::Expr::Call { callee, .. } if names_self(callee)) =>
                     {
                         self.impl_self_args(adt_of(*variant))
@@ -5053,7 +5078,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     _ if let Some(args) = through_local => args,
                     MirSpan::ExprId(expr)
                         if spelled(expr)
-                            || matches!(store[expr],
+                            || matches!(store.expr(expr),
                                 hir_def::hir::Expr::Call { callee, .. } if spelled(callee)) =>
                     {
                         annotated = true;
@@ -5070,15 +5095,15 @@ impl<'db> Builder<'_, '_, 'db> {
                     // `Some::<<(u8, _) as Tr>::Ty>(&temp())`: its argument is the annotation
                     // normalized.
                     let callee = match span {
-                        MirSpan::ExprId(expr) => match &store[expr] {
-                            hir_def::hir::Expr::Call { callee, .. } => Some(*callee),
+                        MirSpan::ExprId(expr) => match store.expr(expr) {
+                            hir_def::hir::Expr::Call { callee, .. } => Some(callee),
                             hir_def::hir::Expr::Path(_) => Some(expr),
                             _ => None,
                         },
                         _ => None,
                     };
                     if let Some(callee) = callee
-                        && let hir_def::hir::Expr::Path(path) = &store[callee]
+                        && let hir_def::hir::Expr::Path(path) = store.expr(callee)
                     {
                         self.spelled_projections(callee, path, args);
                     }
@@ -5358,7 +5383,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     (
                         OperandKind::Constant { .. } | OperandKind::Allocation { .. },
                         MirSpan::ExprId(call),
-                    ) => match self.ctx.store[call] {
+                    ) => match self.ctx.store.expr(call) {
                         hir_def::hir::Expr::Call { callee, .. } => self
                             .path_local(callee)
                             .filter(|&it| {
@@ -5381,7 +5406,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     let ty = peel(self.regions.local_tys[it.into_raw().into_u32() as usize]);
                     let copy = self.renumber(ty);
                     let callee = match span {
-                        MirSpan::ExprId(call) => match self.ctx.store[call] {
+                        MirSpan::ExprId(call) => match self.ctx.store.expr(call) {
                             hir_def::hir::Expr::Call { callee, .. } => MirSpan::ExprId(callee),
                             _ => span,
                         },
@@ -5448,7 +5473,7 @@ impl<'db> Builder<'_, '_, 'db> {
                                     impl_self = Some((ty, writes, ret));
                                 }
                                 let returns_self = written.ret_type.is_some_and(|it| {
-                                    matches!(&written.store[it],
+                                    matches!(written.store.type_ref(it),
                                         hir_def::hir::type_ref::TypeRef::Path(path)
                                             if path.is_self_type())
                                 });
@@ -5611,7 +5636,7 @@ impl<'db> Builder<'_, '_, 'db> {
         let loc = id.loc(self.ctx.db);
         loc.owner == self.ctx.owner
             && matches!(
-                &self.ctx.store[loc.expr],
+                self.ctx.store.expr(loc.expr),
                 hir_def::hir::Expr::Closure { arg_types, ret_type: None, .. }
                     if arg_types.iter().all(Option::is_none)
             )
@@ -5772,14 +5797,14 @@ impl<'db> Builder<'_, '_, 'db> {
             && args.regions().next().is_some()
         {
             for predicate in self.inferred.of(self.ctx.db, adt) {
-                let OutlivesPredicate(arg, region) = rustc_type_ir::EarlyBinder::bind(predicate)
+                let OutlivesClause(arg, region) = rustc_type_ir::EarlyBinder::bind(predicate)
                     .instantiate(interner, args)
                     .skip_norm_wip();
                 use rustc_type_ir::Upcast as _;
                 clauses.push(match arg.kind() {
-                    GenericArgKind::Type(ty) => OutlivesPredicate(ty, region).upcast(interner),
+                    GenericArgKind::Type(ty) => OutlivesClause(ty, region).upcast(interner),
                     GenericArgKind::Lifetime(longer) => {
-                        OutlivesPredicate(longer, region).upcast(interner)
+                        OutlivesClause(longer, region).upcast(interner)
                     }
                     GenericArgKind::Const(_) => continue,
                 });
@@ -5799,7 +5824,7 @@ impl<'db> Builder<'_, '_, 'db> {
         };
         for clause in clauses {
             match clause.kind().skip_binder() {
-                ClauseKind::RegionOutlives(OutlivesPredicate(longer, shorter)) => {
+                ClauseKind::RegionOutlives(OutlivesClause(longer, shorter)) => {
                     let shorter = match forall(shorter) {
                         true => self.static_region(),
                         false => shorter,
@@ -5810,7 +5835,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         self.outlives(longer, shorter, at);
                     }
                 }
-                ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) if type_outlives => {
+                ClauseKind::TypeOutlives(OutlivesClause(ty, region)) if type_outlives => {
                     // A region of the type bound by the clause's `for<'a>` is a placeholder,
                     // taken as `'static` as a placeholder in a type is where it is proven:
                     // `for<'a> &'a S: 'a` needs `S: 'static`.
@@ -5910,7 +5935,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         && at.category == Category::Predicate
                         && let MirSpan::ExprId(expr) = at.span
                         && matches!(
-                            self.ctx.store[expr],
+                            self.ctx.store.expr(expr),
                             hir_def::hir::Expr::Call { .. } | hir_def::hir::Expr::MethodCall { .. }
                         )
                     {
@@ -5937,7 +5962,7 @@ impl<'db> Builder<'_, '_, 'db> {
             .iter_instantiated(self.interner(), trait_ref.args.as_slice())
         {
             // `trait Trait<'a>: 'a` of `Trait<'static>` too.
-            if let ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) =
+            if let ClauseKind::TypeOutlives(OutlivesClause(ty, region)) =
                 clause.skip_norm_wip().kind().skip_binder()
                 && ty == trait_ref.self_ty()
                 && !matches!(region.kind(), RegionKind::ReBound(..))
@@ -5986,9 +6011,9 @@ impl<'db> Builder<'_, '_, 'db> {
             let assoc = hir_ty::next_solver::SolverDefId::TypeAliasId(assoc);
             let bounds = rustc_type_ir::Interner::item_bounds(interner, assoc);
             for clause in bounds.iter_instantiated(interner, trait_ref.args.as_slice()) {
-                if let ClauseKind::TypeOutlives(OutlivesPredicate(bounded, region)) =
+                if let ClauseKind::TypeOutlives(OutlivesClause(bounded, region)) =
                     clause.kind().skip_binder()
-                    && let TyKind::Alias(alias) = bounded.kind()
+                    && let TyKind::Alias(_, alias) = bounded.kind()
                     && alias.kind.def_id() == assoc
                     && !matches!(region.kind(), RegionKind::ReBound(..))
                 {
@@ -6020,7 +6045,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 _ => Some(region),
             };
             match clause.skip_norm_wip().kind().skip_binder() {
-                ClauseKind::TypeOutlives(OutlivesPredicate(ty, sub))
+                ClauseKind::TypeOutlives(OutlivesClause(ty, sub))
                     if ty != trait_ref.self_ty()
                         && !rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty) =>
                 {
@@ -6028,7 +6053,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         self.type_outlives(ty, sub, at);
                     }
                 }
-                ClauseKind::RegionOutlives(OutlivesPredicate(longer, shorter)) => {
+                ClauseKind::RegionOutlives(OutlivesClause(longer, shorter)) => {
                     if let Some(longer) = region(self, longer)
                         && let Some(shorter) = region(self, shorter)
                         && let (Some(longer), Some(shorter)) =
@@ -6212,9 +6237,9 @@ impl<'db> Builder<'_, '_, 'db> {
                     (constraints, obligations)
                 };
                 let mut ocx = ObligationCtxt::new(&self.ctx.infcx);
-                let predicate = rustc_type_ir::TraitPredicate {
+                let predicate = rustc_type_ir::TraitClause {
                     trait_ref,
-                    polarity: rustc_type_ir::PredicatePolarity::Positive,
+                    polarity: rustc_type_ir::ClausePolarity::Positive,
                 };
                 ocx.register_obligation(Obligation::new(
                     interner,
@@ -6474,9 +6499,9 @@ fn prove_query(
         interner,
         ObligationCause::dummy(),
         env.param_env,
-        rustc_type_ir::TraitPredicate {
+        rustc_type_ir::TraitClause {
             trait_ref,
-            polarity: rustc_type_ir::PredicatePolarity::Positive,
+            polarity: rustc_type_ir::ClausePolarity::Positive,
         },
     ));
     let errors = ocx.evaluate_obligations_error_on_ambiguity();
@@ -6630,7 +6655,7 @@ fn static_trait(db: &dyn hir_ty::db::HirDatabase, trait_: hir_def::TraitId) -> b
     hir_ty::utils::all_super_traits(db, trait_).iter().any(|&it| {
         GenericPredicates::query_all(db, it.into()).skip_binder().any(|clause| {
             matches!(clause.kind().skip_binder(),
-                ClauseKind::TypeOutlives(OutlivesPredicate(ty, region))
+                ClauseKind::TypeOutlives(OutlivesClause(ty, region))
                     if matches!(ty.kind(), TyKind::Param(param) if param.index == 0)
                         && matches!(region.kind(), RegionKind::ReStatic))
         })
@@ -6668,10 +6693,10 @@ fn writes_self(
     fn bound(store: &hir_def::expr_store::ExpressionStore, bound: &TypeBound) -> bool {
         bound.as_path(store).is_some_and(|(it, _)| path(store, it))
     }
-    match &store[ty] {
+    match store.type_ref(ty) {
         TypeRef::Path(it) => path(store, it),
         TypeRef::Tuple(tys) => tys.iter().any(|&it| writes_self(store, it)),
-        TypeRef::RawPtr(it, _) | TypeRef::Slice(it) => writes_self(store, *it),
+        TypeRef::RawPtr(it, _) | TypeRef::Slice(it) => writes_self(store, it),
         TypeRef::Reference(it) => writes_self(store, it.ty),
         TypeRef::Array(it) => writes_self(store, it.ty),
         TypeRef::Fn(it) => it.params.iter().any(|&(_, it)| writes_self(store, it)),
@@ -6703,11 +6728,11 @@ fn writes_elided(
                 })
         })
     };
-    match &store[ty] {
+    match store.type_ref(ty) {
         TypeRef::Reference(it) => it.lifetime.is_none_or(lifetime) || writes_elided(store, it.ty),
         TypeRef::Path(it) => path(it),
         TypeRef::Tuple(tys) => tys.iter().any(|&it| writes_elided(store, it)),
-        TypeRef::RawPtr(it, _) | TypeRef::Slice(it) => writes_elided(store, *it),
+        TypeRef::RawPtr(it, _) | TypeRef::Slice(it) => writes_elided(store, it),
         TypeRef::Array(it) => writes_elided(store, it.ty),
         TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
             bounds.iter().any(|bound| match bound {
@@ -6738,14 +6763,14 @@ fn elided_lifetimes(
         resolver::TypeNs,
     };
     let count = |it| elided_lifetimes(db, resolver, store, it);
-    match &store[ty] {
+    match store.type_ref(ty) {
         TypeRef::Reference(it) => {
             let elided =
                 matches!(it.lifetime.map(|it| &store[it]), None | Some(LifetimeRef::Placeholder));
             Some(elided as usize + count(it.ty)?)
         }
         TypeRef::Tuple(tys) => tys.iter().map(|&it| count(it)).sum(),
-        TypeRef::RawPtr(it, _) | TypeRef::Slice(it) => count(*it),
+        TypeRef::RawPtr(it, _) | TypeRef::Slice(it) => count(it),
         TypeRef::Array(it) => count(it.ty),
         TypeRef::Never | TypeRef::TypeParam(_) => Some(0),
         TypeRef::Path(path) => {
@@ -6780,7 +6805,7 @@ fn elided_lifetimes(
 /// Whether a type in `store` writes a trait object's lifetime, `dyn Trait + 'a`.
 fn writes_object_lifetime(store: &hir_def::expr_store::ExpressionStore) -> bool {
     use hir_def::hir::type_ref::{TypeBound, TypeRef};
-    store.types.iter().any(|(_, it)| match it {
+    store.type_refs().any(|(_, it)| match it {
         TypeRef::DynTrait(bounds) => bounds.iter().any(|it| matches!(it, TypeBound::Lifetime(_))),
         _ => false,
     })
@@ -6789,7 +6814,7 @@ fn writes_object_lifetime(store: &hir_def::expr_store::ExpressionStore) -> bool 
 /// Whether a type in `store` writes `dyn Trait + 'static`.
 fn writes_static_object(store: &hir_def::expr_store::ExpressionStore) -> bool {
     use hir_def::hir::type_ref::{LifetimeRef, TypeBound, TypeRef};
-    store.types.iter().any(|(_, it)| {
+    store.type_refs().any(|(_, it)| {
         match it {
         TypeRef::DynTrait(bounds) => bounds.iter().any(|bound| {
             matches!(bound, TypeBound::Lifetime(it) if matches!(store[*it], LifetimeRef::Static))
@@ -6835,7 +6860,7 @@ fn returned_opaque<'db>(
         ty: Ty<'db>,
     ) -> Option<(rustc_type_ir::AliasTy<hir_ty::next_solver::DbInterner<'db>>, Ty<'db>)> {
         match (output.kind(), ty.kind()) {
-            (TyKind::Alias(alias), _)
+            (TyKind::Alias(_, alias), _)
                 if matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. }) =>
             {
                 Some((alias, ty))
@@ -6856,7 +6881,7 @@ fn returned_opaque<'db>(
         .walk()
         .filter_map(|it| rustc_type_ir::inherent::GenericArg::as_type(&it))
         .filter(|ty| {
-            matches!(ty.kind(), TyKind::Alias(alias)
+            matches!(ty.kind(), TyKind::Alias(_, alias)
                 if matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. }))
         })
         .count();
@@ -6961,7 +6986,7 @@ pub(super) fn alias_components<'db>(ty: Ty<'db>, out: &mut Vec<Ty<'db>>) {
         }
     };
     match ty.kind() {
-        TyKind::Alias(alias)
+        TyKind::Alias(_, alias)
             if matches!(
                 alias.kind,
                 rustc_type_ir::AliasTyKind::Projection { .. }

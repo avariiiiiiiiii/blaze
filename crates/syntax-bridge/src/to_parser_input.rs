@@ -1,15 +1,26 @@
-//! Convert macro-by-example tokens which are specific to macro expansion into a
-//! format that works for our parser.
+//! The parser's input from token trees, which are the tokens of a macro's input and output.
+//!
+//! One pass over the trees' columns ([`tt::TokenTreesView::for_each_token`]): no span is
+//! unpacked and no leaf decoded. An identifier's kind comes from a table by its symbol
+//! ([`Keywords`]), not from its text, and each context's edition is asked once a conversion.
+//! A token costs a few loads and one 4-byte word of [`parser::Input`]; a caller parsing many
+//! times (a macro's matcher, once a fragment) reuses one input with the `_into` functions.
 
+use std::sync::LazyLock;
+
+use intern::{Symbol, sym};
 use rustc_hash::FxHashMap;
 use span::{Edition, SyntaxContext};
 use syntax::{SyntaxKind, SyntaxKind::*, T};
+use tt::FlatToken;
 
 pub fn to_parser_input(
     buffer: tt::TokenTreesView<'_>,
     span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
 ) -> parser::Input {
-    convert(buffer, span_to_edition, false)
+    let mut res = parser::Input::with_capacity(buffer.len());
+    convert(buffer, span_to_edition, false, &mut res);
+    res
 }
 
 /// The input of a macro's matcher: the first token of each group without delimiters, which is
@@ -19,141 +30,306 @@ pub fn to_matcher_input(
     buffer: tt::TokenTreesView<'_>,
     span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
 ) -> parser::Input {
-    convert(buffer, span_to_edition, true)
+    let mut res = parser::Input::with_capacity(buffer.len());
+    convert(buffer, span_to_edition, true, &mut res);
+    res
+}
+
+/// [`to_parser_input`] into `res`, emptied first, keeping its buffer.
+pub fn to_parser_input_into(
+    buffer: tt::TokenTreesView<'_>,
+    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    res: &mut parser::Input,
+) {
+    convert(buffer, span_to_edition, false, res)
+}
+
+/// [`to_matcher_input`] into `res`, emptied first, keeping its buffer.
+pub fn to_matcher_input_into(
+    buffer: tt::TokenTreesView<'_>,
+    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    res: &mut parser::Input,
+) {
+    convert(buffer, span_to_edition, true, res)
 }
 
 fn convert(
     buffer: tt::TokenTreesView<'_>,
     span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
     fragments: bool,
-) -> parser::Input {
-    let mut res = parser::Input::with_capacity(buffer.len());
+    res: &mut parser::Input,
+) {
+    res.clear();
+    res.reserve(buffer.len());
+    let keywords = &*KEYWORDS;
+    let mut editions = Editions::new(span_to_edition);
     // Where the fragment that was opened last starts, until its first token is pushed.
-    let mut fragment_at = None;
+    let mut fragment_at: Option<usize> = None;
+    // Whether the last token was the `'` of a lifetime, whose name comes next.
+    let mut lifetime = false;
 
-    let mut current = buffer.cursor();
-    let mut syntax_context_to_edition_cache = FxHashMap::default();
-    let mut last: Option<(SyntaxContext, Edition)> = None;
-    let mut ctx_edition = |ctx: SyntaxContext| {
-        if let Some((last_ctx, edition)) = last
-            && last_ctx == ctx
-        {
-            return edition;
-        }
-        let edition =
-            *syntax_context_to_edition_cache.entry(ctx).or_insert_with(|| span_to_edition(ctx));
-        last = Some((ctx, edition));
-        edition
-    };
-
-    while !current.eof() {
+    buffer.for_each_token(|token, ctx| {
         if let Some(at) = fragment_at
             && res.len() > at
         {
             res.mark_fragment_start(at);
             fragment_at = None;
         }
-        let tt = current.token_tree();
-
-        // Check if it is lifetime
-        if let Some(tt::TokenTree::Leaf(tt::Leaf::Punct(punct))) = tt
-            && punct.char == '\''
-        {
-            current.bump();
-            match current.token_tree() {
-                Some(tt::TokenTree::Leaf(tt::Leaf::Ident(ident))) => {
-                    res.push(LIFETIME_IDENT, ctx_edition(ident.span.ctx));
-                    current.bump();
-                    continue;
-                }
+        if lifetime {
+            lifetime = false;
+            match token {
+                FlatToken::Ident { .. } => res.push(LIFETIME_IDENT, editions.of(ctx)),
                 _ => panic!("Next token must be ident"),
             }
+            return;
         }
-
-        match tt {
-            Some(tt::TokenTree::Leaf(leaf)) => {
-                match leaf {
-                    tt::Leaf::Literal(lit) => {
-                        let kind = match lit.kind {
-                            tt::LitKind::Byte => SyntaxKind::BYTE,
-                            tt::LitKind::Char => SyntaxKind::CHAR,
-                            tt::LitKind::Integer => SyntaxKind::INT_NUMBER,
-                            tt::LitKind::Float => SyntaxKind::FLOAT_NUMBER,
-                            tt::LitKind::Str | tt::LitKind::StrRaw(_) => SyntaxKind::STRING,
-                            tt::LitKind::ByteStr | tt::LitKind::ByteStrRaw(_) => {
-                                SyntaxKind::BYTE_STRING
-                            }
-                            tt::LitKind::CStr | tt::LitKind::CStrRaw(_) => SyntaxKind::C_STRING,
-                            tt::LitKind::Err(_) => SyntaxKind::ERROR,
-                        };
-                        res.push(kind, ctx_edition(lit.span.ctx));
-
-                        if kind == FLOAT_NUMBER && !lit.text().ends_with('.') {
-                            // Tag the token as joint if it is float with a fractional part
-                            // we use this jointness to inform the parser about what token split
-                            // event to emit when we encounter a float literal in a field access
-                            res.was_joint();
-                        }
-                    }
-                    tt::Leaf::Ident(ident) => {
-                        let edition = ctx_edition(ident.span.ctx);
-                        match ident.sym.as_str() {
-                            "_" => res.push(T![_], edition),
-                            i if i.starts_with('\'') => res.push(LIFETIME_IDENT, edition),
-                            _ if ident.is_raw.yes() => res.push(IDENT, edition),
-                            text => match SyntaxKind::from_keyword(text, edition) {
-                                Some(kind) => res.push(kind, edition),
-                                None => {
-                                    let contextual_keyword =
-                                        SyntaxKind::from_contextual_keyword(text, edition)
-                                            .unwrap_or(SyntaxKind::IDENT);
-                                    res.push_ident(contextual_keyword, edition);
-                                }
-                            },
-                        }
-                    }
-                    tt::Leaf::Punct(punct) => {
-                        let kind = SyntaxKind::from_char(punct.char)
-                            .unwrap_or_else(|| panic!("{punct:#?} is not a valid punct"));
-                        res.push(kind, ctx_edition(punct.span.ctx));
-                        if punct.spacing == tt::Spacing::Joint {
-                            res.was_joint();
-                        }
-                    }
-                }
-                current.bump();
-            }
-            Some(tt::TokenTree::Subtree(subtree)) => {
-                if let Some(kind) = match subtree.delimiter.kind {
-                    tt::DelimiterKind::Parenthesis => Some(T!['(']),
-                    tt::DelimiterKind::Brace => Some(T!['{']),
-                    tt::DelimiterKind::Bracket => Some(T!['[']),
-                    tt::DelimiterKind::Invisible => None,
-                } {
-                    res.push(kind, ctx_edition(subtree.delimiter.open.ctx));
-                } else if fragments && fragment_at.is_none() {
-                    fragment_at = Some(res.len());
-                }
-                current.bump();
-            }
-            None => {
-                let subtree = current.end();
-                if let Some(kind) = match subtree.delimiter.kind {
-                    tt::DelimiterKind::Parenthesis => Some(T![')']),
-                    tt::DelimiterKind::Brace => Some(T!['}']),
-                    tt::DelimiterKind::Bracket => Some(T![']']),
-                    tt::DelimiterKind::Invisible => None,
-                } {
-                    res.push(kind, ctx_edition(subtree.delimiter.close.ctx));
+        match token {
+            FlatToken::Punct { char: '\'', .. } => lifetime = true,
+            FlatToken::Punct { char, spacing } => {
+                let kind = SyntaxKind::from_char(char)
+                    .unwrap_or_else(|| panic!("{char:?} is not a valid punct"));
+                res.push(kind, editions.of(ctx));
+                if spacing == tt::Spacing::Joint {
+                    res.was_joint();
                 }
             }
-        };
-    }
+            FlatToken::Ident { sym, is_raw } => {
+                let edition = editions.of(ctx);
+                if sym == sym::underscore {
+                    res.push(T![_], edition);
+                } else if sym.as_str().starts_with('\'') {
+                    res.push(LIFETIME_IDENT, edition);
+                } else if is_raw.yes() {
+                    res.push(IDENT, edition);
+                } else {
+                    match keywords.of(sym, edition) {
+                        (kind, EOF) => res.push(kind, edition),
+                        (_, contextual) => res.push_ident(contextual, edition),
+                    }
+                }
+            }
+            FlatToken::Literal { sym, kind, suffix_len } => {
+                let kind = literal_kind(kind);
+                res.push(kind, editions.of(ctx));
+                if kind == FLOAT_NUMBER {
+                    let text = sym.as_str();
+                    if !text[..text.len() - suffix_len as usize].ends_with('.') {
+                        // Tag the token as joint if it is float with a fractional part
+                        // we use this jointness to inform the parser about what token split
+                        // event to emit when we encounter a float literal in a field access
+                        res.was_joint();
+                    }
+                }
+            }
+            FlatToken::Open(delimiter) => match delimiter {
+                tt::DelimiterKind::Parenthesis => res.push(T!['('], editions.of(ctx)),
+                tt::DelimiterKind::Brace => res.push(T!['{'], editions.of(ctx)),
+                tt::DelimiterKind::Bracket => res.push(T!['['], editions.of(ctx)),
+                tt::DelimiterKind::Invisible => {
+                    if fragments && fragment_at.is_none() {
+                        fragment_at = Some(res.len());
+                    }
+                }
+            },
+            FlatToken::Close(delimiter) => match delimiter {
+                tt::DelimiterKind::Parenthesis => res.push(T![')'], editions.of(ctx)),
+                tt::DelimiterKind::Brace => res.push(T!['}'], editions.of(ctx)),
+                tt::DelimiterKind::Bracket => res.push(T![']'], editions.of(ctx)),
+                tt::DelimiterKind::Invisible => (),
+            },
+        }
+    });
+    assert!(!lifetime, "Next token must be ident");
     if let Some(at) = fragment_at
         && res.len() > at
     {
         res.mark_fragment_start(at);
     }
+}
 
-    res
+#[inline]
+fn literal_kind(kind: tt::LitKind) -> SyntaxKind {
+    match kind {
+        tt::LitKind::Byte => BYTE,
+        tt::LitKind::Char => CHAR,
+        tt::LitKind::Integer => INT_NUMBER,
+        tt::LitKind::Float => FLOAT_NUMBER,
+        tt::LitKind::Str | tt::LitKind::StrRaw(_) => STRING,
+        tt::LitKind::ByteStr | tt::LitKind::ByteStrRaw(_) => BYTE_STRING,
+        tt::LitKind::CStr | tt::LitKind::CStrRaw(_) => C_STRING,
+        tt::LitKind::Err(_) => ERROR,
+    }
+}
+
+/// How many contexts' editions a conversion keeps in place before it keeps them in a map; a
+/// tree has few contexts, one an expansion it went through.
+const NEAR: usize = 8;
+
+/// Each context's edition, asked of the caller once: the last one, then up to [`NEAR`] in an
+/// array, then a map. Nothing is allocated for a tree of [`NEAR`] contexts or fewer.
+struct Editions<'f> {
+    span_to_edition: &'f mut dyn FnMut(SyntaxContext) -> Edition,
+    last: (SyntaxContext, Edition),
+    near: [(SyntaxContext, Edition); NEAR],
+    len: usize,
+    far: FxHashMap<SyntaxContext, Edition>,
+}
+
+impl<'f> Editions<'f> {
+    fn new(span_to_edition: &'f mut dyn FnMut(SyntaxContext) -> Edition) -> Self {
+        let unused = (SyntaxContext::root(Edition::Edition2015), Edition::Edition2015);
+        let far = FxHashMap::default();
+        Editions { span_to_edition, last: unused, near: [unused; NEAR], len: 0, far }
+    }
+
+    #[inline]
+    fn of(&mut self, ctx: SyntaxContext) -> Edition {
+        if self.len > 0 && self.last.0 == ctx {
+            return self.last.1;
+        }
+        self.asked(ctx)
+    }
+
+    fn asked(&mut self, ctx: SyntaxContext) -> Edition {
+        let edition = match self.near[..self.len].iter().find(|it| it.0 == ctx) {
+            Some(&(_, edition)) => edition,
+            None => match self.far.get(&ctx) {
+                Some(&edition) => edition,
+                None => {
+                    let edition = (self.span_to_edition)(ctx);
+                    match self.len < NEAR {
+                        true => {
+                            self.near[self.len] = (ctx, edition);
+                            self.len += 1;
+                        }
+                        false => {
+                            self.far.insert(ctx, edition);
+                        }
+                    }
+                    edition
+                }
+            },
+        };
+        self.last = (ctx, edition);
+        edition
+    }
+}
+
+/// How many editions there are, indexed by their discriminants (`0..`, consecutive).
+const EDITIONS: usize = Edition::LATEST as usize + 1;
+
+/// What the parser is given for an identifier that is not raw, `_` or a lifetime, by edition:
+/// a keyword's kind and `EOF`, or `IDENT` and its contextual kind (`IDENT` for none).
+type IdentKinds = [(SyntaxKind, SyntaxKind); EDITIONS];
+
+/// [`IdentKinds`] for every keyword, found by its symbol: by [`Symbol::declared_index`] (a
+/// pointer subtraction and two loads) for a keyword whose symbol is declared, else through a
+/// map by symbol. Built once from [`SyntaxKind::from_keyword`] and
+/// [`SyntaxKind::from_contextual_keyword`], so it answers as they do for every edition
+/// (`keywords_answer_as_the_text_functions`). About 0.5 KB.
+struct Keywords {
+    /// By declared index: the keyword's place in `kinds` plus one, 0 for none.
+    declared: Box<[u8]>,
+    /// The keywords whose symbols are not declared ones, and their places plus one.
+    other: FxHashMap<Symbol, u8>,
+    kinds: Box<[IdentKinds]>,
+}
+
+static KEYWORDS: LazyLock<Keywords> = LazyLock::new(Keywords::new);
+
+impl Keywords {
+    fn new() -> Keywords {
+        let mut texts: Vec<&'static str> = SyntaxKind::keyword_texts().collect();
+        texts.sort_unstable();
+        texts.dedup();
+        let mut declared = Vec::new();
+        let mut other = FxHashMap::default();
+        let mut kinds = Vec::with_capacity(texts.len());
+        for text in texts {
+            kinds.push(std::array::from_fn(|edition| {
+                ident_kinds(text, Edition::from_u32(edition as u32))
+            }));
+            let place = u8::try_from(kinds.len()).expect("fewer than 256 keywords");
+            let symbol = Symbol::intern(text);
+            match symbol.declared_index() {
+                Some(at) => {
+                    let at = usize::from(at);
+                    if declared.len() <= at {
+                        declared.resize(at + 1, 0);
+                    }
+                    declared[at] = place;
+                }
+                None => {
+                    other.insert(symbol, place);
+                }
+            }
+        }
+        Keywords { declared: declared.into(), other, kinds: kinds.into() }
+    }
+
+    #[inline]
+    fn of(&self, symbol: Symbol, edition: Edition) -> (SyntaxKind, SyntaxKind) {
+        let place = match symbol.declared_index() {
+            Some(at) => self.declared.get(usize::from(at)).copied().unwrap_or(0),
+            None if self.other.is_empty() => 0,
+            None => self.other.get(&symbol).copied().unwrap_or(0),
+        };
+        match place {
+            0 => (IDENT, IDENT),
+            place => self.kinds[usize::from(place) - 1][edition as usize],
+        }
+    }
+}
+
+/// [`IdentKinds`] of `text` in `edition`, from the text.
+fn ident_kinds(text: &str, edition: Edition) -> (SyntaxKind, SyntaxKind) {
+    match SyntaxKind::from_keyword(text, edition) {
+        Some(kind) => (kind, EOF),
+        None => (IDENT, SyntaxKind::from_contextual_keyword(text, edition).unwrap_or(IDENT)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every keyword, and identifiers that are none, get from the table what the text
+    /// functions give, in every edition, declared symbol or not.
+    #[test]
+    fn keywords_answer_as_the_text_functions() {
+        let others = ["foo", "Self_", "r", "unionx", "a", "macro_rule", "_x", "xxxxxxxxxxxxxxxxxxxx"];
+        let texts = SyntaxKind::keyword_texts().chain(others.iter().copied());
+        for text in texts {
+            let symbol = Symbol::intern(text);
+            for edition in Edition::iter() {
+                let expected = ident_kinds(text, edition);
+                assert_eq!(KEYWORDS.of(symbol, edition), expected, "{text} in {edition:?}");
+            }
+        }
+        for text in ["fn", "union", "dyn", "async"] {
+            for edition in Edition::iter() {
+                assert_ne!(KEYWORDS.of(Symbol::intern(text), edition), (IDENT, IDENT), "{text}");
+            }
+        }
+    }
+
+    /// Asking a context's edition goes to the caller once per context.
+    #[test]
+    fn editions_are_asked_once_a_context() {
+        let contexts: Vec<SyntaxContext> = Edition::iter().map(SyntaxContext::root).collect();
+        let mut asked = Vec::new();
+        let mut ask = |ctx: SyntaxContext| {
+            asked.push(ctx);
+            Edition::iter().find(|&it| SyntaxContext::root(it) == ctx).unwrap()
+        };
+        let mut editions = Editions::new(&mut ask);
+        for _ in 0..3 {
+            for (&ctx, edition) in contexts.iter().zip(Edition::iter()) {
+                assert_eq!(editions.of(ctx), edition);
+                assert_eq!(editions.of(ctx), edition);
+            }
+        }
+        drop(editions);
+        assert_eq!(asked, contexts);
+    }
 }

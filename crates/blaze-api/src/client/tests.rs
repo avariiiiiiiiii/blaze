@@ -9,7 +9,7 @@ use super::*;
 use crate::{Status, http::RequestParser};
 
 fn status() -> Status {
-    Status { requests: vec![7], views: 1, memory_bytes: 2, budget_bytes: 3 }
+    Status { pid: 4, requests: vec![7], views: 1, memory_bytes: 2, budget_bytes: 3 }
 }
 
 /// A client over one end of a socket pair, and a thread on the other that reads one request
@@ -170,4 +170,27 @@ fn the_token_is_not_in_debug() {
     let (at, _daemon) = http_daemon(0, None);
     let client = Client::http(at, "hidden-token".to_owned()).unwrap();
     assert!(!format!("{client:?}").contains("hidden-token"));
+}
+
+#[test]
+fn until_hung_up_waits_for_the_end_and_keeps_what_came_first() {
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    let daemon = thread::spawn(move || {
+        theirs.write_all(&frames::encode(&Envelope::new(3, Response::Done { ok: true })).unwrap()).unwrap();
+    });
+    let mut client = Client::over(Link::Unix(ours));
+    client.until_hung_up(std::time::Duration::from_secs(10)).unwrap();
+    daemon.join().unwrap();
+    assert_eq!(client.receive().unwrap(), Envelope::new(3, Response::Done { ok: true }));
+}
+
+#[test]
+fn until_hung_up_gives_up_after_its_patience() {
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let mut client = Client::over(Link::Unix(ours));
+    let error = client.until_hung_up(std::time::Duration::from_millis(20)).unwrap_err();
+    assert!(error.to_string().contains("still holds the connection after 20 ms"), "{error}");
+    let (at, _daemon) = http_daemon(0, None);
+    let mut client = Client::http(at, "tok".to_owned()).unwrap();
+    assert!(matches!(client.until_hung_up(std::time::Duration::from_millis(20)), Err(ClientError::Refused(_))));
 }

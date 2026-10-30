@@ -2015,6 +2015,9 @@ pub enum MirEvalError<'db> {
         of_const_allocate: bool,
     },
     StackOverflow,
+    /// The evaluator's `Machine` (a checker of undefined behavior, `hir-ty-ub`) stopped the
+    /// run; what it found the machine holds. Const eval never gives it: its machine never stops.
+    MachineStop,
     /// FIXME: Fold this into InternalError
     InvalidVTableId(usize),
     /// ?
@@ -2049,6 +2052,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
                  `String` or the like), which the program would free",
             ),
             Self::StackOverflow => write!(f, "stack overflow"),
+            Self::MachineStop => f.write_str("MachineStop"),
             Self::MirLowerError(arg0, arg1) => {
                 f.debug_tuple("MirLowerError").field(arg0).field(arg1).finish()
             }

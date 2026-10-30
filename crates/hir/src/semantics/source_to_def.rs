@@ -399,7 +399,7 @@ impl<'db> SourceToDefCtx<'db, '_> {
         let pat_id = source_map.node_pat(src.as_ref())?;
         // the pattern could resolve to a constant, verify that this is not the case
         let pat_id = pat_id.as_pat()?;
-        if let crate::Pat::Bind { id, .. } = store[pat_id] {
+        if let crate::Pat::Bind { id, .. } = store.pat(pat_id) {
             let parent_infer =
                 semantics.infer_body_for_expr_or_pat(container, store, pat_id.into())?;
             Some(crate::Local { parent: container, parent_infer, binding_id: id })
@@ -437,7 +437,7 @@ impl<'db> SourceToDefCtx<'db, '_> {
         let (store, source_map) = ExpressionStore::with_source_map(self.db, container);
         let break_or_continue =
             source_map.node_expr(src.with_value(&break_or_continue))?.as_expr()?;
-        let (Expr::Break { label, .. } | Expr::Continue { label }) = store[break_or_continue]
+        let (Expr::Break { label, .. } | Expr::Continue { label }) = store.expr(break_or_continue)
         else {
             return None;
         };

@@ -403,6 +403,11 @@ stays), `v2/refs.rs`, `v2/frontend.rs`, `stable.rs` (no expression or pattern lo
 > done by speed-backend-code (2026-10-29): the `type_id.rs` and `places.rs` sites above, as
 > written (unbuilt: that lane runs no build). No other HIR expression or pattern lookups in its
 > files. `fncache/dispatch.rs` and `mod.rs` are left to their owners.
+>
+> done by speed-backend (2026-10-29): `fncache/dispatch.rs` ~L86 as written (`closure_kind` by
+> value, `ClosureKind: Copy + PartialEq`); `mod.rs` ~L3694 was already `store.expr(closure.expr)`.
+> No other `store[expr]`/`body[expr]` lookups left in the crate outside `v2/` (only
+> `Index<BindingId>`, which stays). Unbuilt.
 
 ### speed-hir-store addendum (type refs become views; from speed-hir-store-mir)
 For both sections above (hir-ty-mir and hir-ty-codegen): no `TypeRef` edits. Neither crate reads a
@@ -496,6 +501,20 @@ by the instrumented binary with the same report as rustc's build.
 > taken by speed-backend (2026-10-29), with F2 of `v2/requests/safety.md`: child
 > `speed-backend-sanitize` writes it in `llvm.rs`, `llvm/` and `vendor/llvm-sys/`; what it needs
 > of `blaze-codegen`'s settings, the adapter's `check_spec` and cargo comes as requests.
+
+> done by speed-backend-sanitize (2026-10-29): the LLVM side (attributes at `prelink`, the four
+> passes in clang's order with rustc's options after the post-link pipeline in `compile`,
+> SanitizerCoverage's arrays and PC table read back, `llvm.returnaddress`), not built or run
+> (no builds in this round). rustc has no `-Csanitizer-coverage-level`/`-Zsanitizer-coverage`:
+> its SanitizerCoverage is `-Cpasses=sancov-module` with `-Cllvm-args=-sanitizer-coverage-*`,
+> which is what is taken. Waits on: the lead for `Spec::sanitize`, `CompiledFunction::coverage`
+> and `Target::Coverage` (Z1, Z2 below; `hir-ty-codegen` does not build until they land);
+> codegen-adapter for the Cranelift refusal, `Function::unsanitized`, its shape key and the
+> `COVERAGE` relocations (Z3); db for the `#[sanitize]` query and items for its hash
+> (`db.md`, `items.md`); speed-backend for `return_address` in `mod.rs`; cargo for the flags
+> and `cfg(sanitize)` (`cargo.md`); link for the runtimes, MSan's options, ASan's globals and
+> the coverage sections (`link.md`). The rustc differential (a reported out-of-bounds, race and
+> uninitialized read) waits on all of these and on a VM to run in.
 
 ## 7. cargo: `ItemHashes::new` takes a `Send + Sync` closure
 
@@ -744,3 +763,212 @@ The crate's unsafe is LLVM-C/inkwell FFI plus `backend.rs:527`, `mod.rs:8297`/`8
   batch.
 
 > forwarded to codegen: written by `requests`' child requests-nodes, which told the lane.
+
+## From safety-fuzz-persist (2026-10-29): make `Assembled`'s store format public, for its fuzz target
+
+What: in `crates/hir-ty-codegen/asm.rs`, make `struct Assembled` `pub` (its fields can stay
+`pub(super)`) and `Assembled::from_bytes(&[u8]) -> Option<Assembled>` and
+`Assembled::to_bytes(&self) -> Vec<u8>` `pub`; in `crates/hir-ty-codegen/mod.rs`, add
+`pub use asm::Assembled;` (the module stays private). Nothing else changes.
+
+Why: speed-backend-intrinsics named `from_bytes` a parser of untrusted bytes (it reads the
+store's copy of assembled code; `v2/requests/safety.md`, "From speed-backend-intrinsics"), and
+`fuzz/targets/codegen_asm.rs` feeds it arbitrary bytes and checks `None` or a value whose
+`to_bytes` is the input. Today both are private to `asm.rs`, so the target is written against
+`hir_ty_codegen::Assembled::{from_bytes, to_bytes}` and won't build until this lands.
+
+One correction to the section's claim: `from_bytes` does allocate past the input's length. Each
+21-byte record becomes a 32-byte `Named` in a vector that grows by doubling, so its largest
+allocation is about 3 times the input. The target holds it to `4 * len + 1 KiB`, which is still
+linear and needs no change.
+
+> forwarded to codegen: `crates/hir-ty-codegen/` is its (told by tmux).
+> forwarded to codegen: `crates/hir-ty-codegen/` is its, and it is running.
+
+## From speed-backend-sanitize (2026-10-29): what S2 and F2 need outside `llvm.rs`, `llvm/` and `vendor/llvm-sys/`
+
+The LLVM side is written (`crates/hir-ty-codegen/llvm/sanitize.rs`, `llvm/release.rs`,
+`llvm/emitted.rs`, `vendor/llvm-sys/wrappers/passes.cpp`; design in
+`docs/v2/plan/lanes/codegen/speed-backend-llvm.md` "Sanitizers"). It programs against the items
+below, and `hir-ty-codegen` does not build until the lead adds Z1 and Z2 and the adapter adds
+`Function::unsanitized` (Z3.2).
+
+> forwarded to codegen.
+
+### Z1. lead codegen: the sanitizer set in `Spec` (`crates/blaze-codegen/src/settings.rs`)
+
+What: add these types and `pub sanitize: Sanitize` as the last field of `Spec`, exactly as
+written (names, bit values and methods are what `llvm/sanitize.rs` uses; the coverage bits are
+checked at compile time against `LLVMBlazeCoverage*` of `vendor/llvm-sys`):
+
+```rust
+/// rustc's `-Zsanitizer` (address, thread, memory), `-Zsanitizer-recover`,
+/// `-Zsanitizer-memory-track-origins`, and SanitizerCoverage as rustc gets it
+/// (`-Cpasses=sancov-module` with `-Cllvm-args=-sanitizer-coverage-*`): one for the whole
+/// build, as cargo passes `RUSTFLAGS` to every crate. `Sanitize::default()` is none.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct Sanitize {
+    pub sanitizers: Sanitizers,
+    /// Of `sanitizers`, those that report and go on (`-Zsanitizer-recover`).
+    pub recover: Sanitizers,
+    /// `-Zsanitizer-memory-track-origins`: 0, 1 or 2; 0 without `Sanitizers::MEMORY`.
+    pub track_origins: u8,
+    pub coverage: Coverage,
+}
+
+impl Sanitize {
+    pub const fn is_empty(&self) -> bool {
+        self.sanitizers.is_empty() && !self.coverage.is_on()
+    }
+}
+
+/// A set of sanitizers, as bits.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct Sanitizers(pub u8);
+
+impl Sanitizers {
+    pub const NONE: Sanitizers = Sanitizers(0);
+    pub const ADDRESS: Sanitizers = Sanitizers(1 << 0);
+    pub const THREAD: Sanitizers = Sanitizers(1 << 1);
+    pub const MEMORY: Sanitizers = Sanitizers(1 << 2);
+    /// In a function's set of what is off for it only (`Function::unsanitized`): LLVM's
+    /// SanitizerCoverage skips it, as it skips a function named `__sanitizer_*`. Never in
+    /// `Sanitize::sanitizers` or `recover`.
+    pub const COVERAGE: Sanitizers = Sanitizers(1 << 3);
+
+    pub const fn contains(self, other: Sanitizers) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+    pub const fn union(self, other: Sanitizers) -> Sanitizers {
+        Sanitizers(self.0 | other.0)
+    }
+    pub const fn without(self, other: Sanitizers) -> Sanitizers {
+        Sanitizers(self.0 & !other.0)
+    }
+}
+
+/// SanitizerCoverage: `-sanitizer-coverage-level` (1 the entry block, 2 every block, 3 and
+/// critical edges, 4 and indirect calls) and the `-sanitizer-coverage-*` switches as bits.
+/// Canonical: `Coverage::default()` (level 0, no flags) unless `-Cpasses` names
+/// `sancov-module` and the level is 1 to 4, so two builds without coverage have one key.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct Coverage {
+    pub level: u8,
+    pub flags: u16,
+}
+
+impl Coverage {
+    pub const TRACE_PC: u16 = 1 << 0;
+    pub const TRACE_PC_GUARD: u16 = 1 << 1;
+    pub const INLINE_8BIT_COUNTERS: u16 = 1 << 2;
+    pub const INLINE_BOOL_FLAG: u16 = 1 << 3;
+    pub const PC_TABLE: u16 = 1 << 4;
+    pub const TRACE_CMP: u16 = 1 << 5;
+    pub const TRACE_DIV: u16 = 1 << 6;
+    pub const TRACE_GEP: u16 = 1 << 7;
+    pub const TRACE_LOADS: u16 = 1 << 8;
+    pub const TRACE_STORES: u16 = 1 << 9;
+    pub const NO_PRUNE: u16 = 1 << 10;
+    pub const STACK_DEPTH: u16 = 1 << 11;
+    pub const TRACE_PC_ENTRY_EXIT: u16 = 1 << 12;
+    pub const CONTROL_FLOW: u16 = 1 << 13;
+
+    pub const fn is_on(self) -> bool {
+        matches!(self.level, 1..=4)
+    }
+}
+```
+
+Keys: in `Spec::settings`, destructure `sanitize` with the other fields and, after the bytes of
+`fold`, hash
+`let Sanitize { sanitizers, recover, track_origins, coverage } = sanitize;`
+`hasher.update(&[sanitizers.0, recover.0, *track_origins, coverage.level]);`
+`hasher.update(&coverage.flags.to_le_bytes());`
+and bump `SETTINGS_DOMAIN` to `"blaze v2 codegen settings 2"` (the hashed bytes change).
+`Shape::key` (`backend.rs`) hashes `unit.instance.settings`, so the template key follows, and
+the instance (unit) key has the settings, so both keys change with the set. In
+`every_field_is_in_the_settings` add
+`|it| it.sanitize.sanitizers = Sanitizers::ADDRESS`,
+`|it| it.sanitize.recover = Sanitizers::ADDRESS`, `|it| it.sanitize.track_origins = 2`,
+`|it| it.sanitize.coverage.level = 3`, `|it| it.sanitize.coverage.flags = Coverage::PC_TABLE`.
+Every `Spec { .. }` literal (`rg 'Spec \{' crates`) gets `sanitize: Sanitize::default()`.
+Why: S2 (rustc's flags as data, the same for every function) and keys: a sanitized build's code
+differs from a plain one's, so it must never reuse the other's units or templates.
+
+### Z2. lead codegen: a function's SanitizerCoverage arrays (`crates/blaze-codegen/src/lib.rs`, `template.rs`, `content.rs`)
+
+What:
+1. `CompiledFunction` gains `pub coverage: Option<Covered>` (`None` without SanitizerCoverage;
+   every literal gets `coverage: None`), with
+
+   ```rust
+   /// What LLVM's SanitizerCoverage made for one function: its arrays, which start zeroed and
+   /// which the link gathers with every other function's into one section each, in one order,
+   /// and its PC table.
+   #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+   pub struct Covered {
+       /// Bytes of its 8-bit counters (`__sancov_cntrs`), flags (`__sancov_bools`) and
+       /// guards (`__sancov_guards`, 4 bytes each); 0 for an array it has not.
+       pub counters: u32,
+       pub flags: u32,
+       pub guards: u32,
+       /// Of each block it counts, in the order of its arrays: how far into `code` it starts,
+       /// and its flags (1 for the function's entry), as `__sancov_pcs` has them.
+       pub pcs: Vec<(u32, u64)>,
+   }
+   ```
+2. `Target::Coverage(u32)`: the function's own array 0 (counters), 1 (flags) or 2 (guards),
+   the relocation's addend into it. A function names no other's.
+3. The function's content hash (`content.rs`) and the template's instantiation (`template.rs`
+   carries `coverage` from template to function) include it.
+
+Why: `v2/release.rs` sets `emitted.function.coverage`; the link lays the arrays out and builds
+the PC table (`v2/requests/link.md`, "From speed-backend-sanitize").
+
+### Z3. codegen-adapter (`crates/hir-ty-codegen/v2/backend.rs`, `v2.rs`, `v2/shape.rs`, `v2/convert.rs`)
+
+1. `check_spec`: `if spec.backend == Backend::Cranelift && !spec.sanitize.is_empty()`, fail with
+   `"-Zsanitizer and SanitizerCoverage are instrumented by the LLVM back end (Backend::Llvm), which this unit is not compiled by"`.
+   (no-fallback: never a build without the instrumentation.)
+2. `v2.rs` `Function` gains `pub(crate) unsanitized: blaze_codegen::settings::Sanitizers`;
+   `prepared` sets it from the front end's effective `#[sanitize(.. = "off")]` set (requested of
+   db in `v2/requests/db.md`, "From speed-backend-sanitize"): for `InstanceDef::Fn(func)` that
+   set; a closure's is its enclosing function's (rustc walks `opt_local_parent`); shims and drop
+   glue `Sanitizers::NONE` (rustc's default attrs). Add `Sanitizers::COVERAGE` when the
+   function's symbol (`#[no_mangle]`/`#[export_name]`) starts with `__sanitizer_`, which LLVM's
+   SanitizerCoverage skips by name and blaze's `blaze.own` hides from it; the fuzz engine's
+   `__sanitizer_cov_*` callbacks need it (F2 item 1).
+3. `v2/shape.rs`: hash `function.unsanitized.0` under a new `part::` tag next to `HINT`, so a
+   function with a sanitizer off has another template.
+4. `v2/convert.rs` `reloc_target`: map `RelocName::User { namespace: llvm::sanitize::COVERAGE,
+   index }` (`u32::MAX - 2`) to `Target::Coverage(index)` for `index < 3`, and refuse others; set
+   `coverage: None` in the function it builds (release sets it after).
+Why: S2's attributes per function, its Cranelift refusal, and the keys of the per-function set.
+
+> written by speed-backend-sanitize (2026-10-29); told codegen and codegen-adapter by tmux.
+
+## frontend: MIR reads source maps only where a position is emitted (docs/v2/plan/design/frontend.md item 7)
+
+What: `crates/hir-ty-mir/src/mir/lower.rs:4471`, `mir/location.rs:45,71,342`,
+`mir/type_name.rs:914`, `mir/eval.rs:670`, `mir/const_check.rs:100` read `Body::unmoved_source_map`
+or `with_source_map` on every MIR lowering. Asked: MIR keeps HIR ids (`ExprId`, `PatId`) as its
+span, and turns one into a file position from the source map only when debug info, a
+`#[track_caller]` `Location`, a panic message or a diagnostic is emitted (items.md 6.1: positions
+are side-table references, filled at link time). Lowering a body then never reads its map, so
+the body lowering can skip building it (request to speed-hir-store-srcmap in
+`v2/requests/speed-hir.md`). The positions emitted must be byte-identical to today's: a test
+comparing every `Location` and debug-info line of the MIR fixtures before and after.
+
+> forwarded to codegen: `hir-ty-mir` is its.
+
+## frontend: `hir_ty_codegen::v2::Databases` takes the shared database (frontend.md item 10)
+
+What: `Databases::new` takes `Box<dyn HirDatabase + Send>` per worker (a salsa handle each;
+`crates/load-cargo/src/v2/db.rs:32-35`). Asked: take `&'db dyn HirDatabase` shared by every
+worker (the database is `Sync`, decided), once db answers item 2 of "frontend: what
+frontend.md items 7-12 still need" in `v2/requests/db.md`.
+
+> forwarded to codegen.

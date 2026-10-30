@@ -91,4 +91,5 @@ define_unstable_features! {
     deref_patterns,
     mut_ref,
     type_changing_struct_update,
+    staged_api,
 }

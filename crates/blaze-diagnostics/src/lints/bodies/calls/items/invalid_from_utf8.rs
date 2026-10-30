@@ -17,7 +17,7 @@ use hir_def::{
 
 use super::FnItems;
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::Diag,
 };
@@ -46,6 +46,10 @@ impl Default for InvalidFromUtf8 {
 impl LatePass for InvalidFromUtf8 {
     fn name(&self) -> &'static str {
         "InvalidFromUtf8"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

@@ -282,6 +282,7 @@ mod tests {
     use super::*;
 
     #[derive(PartialEq, Eq, Hash, Debug)]
+    #[cfg_attr(blaze_check, allow(dead_code, reason = "made only by a normal build's threaded test"))]
     struct Name(u32);
     impl_internable!(Name);
 

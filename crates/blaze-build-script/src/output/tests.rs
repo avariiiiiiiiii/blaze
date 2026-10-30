@@ -426,3 +426,160 @@ fn link_lib_specs() {
     assert_eq!((plain.kind, plain.name, plain.rename), (None, "z", None));
     assert_eq!(LinkLib::parse("framework=Security").kind, Some("framework"));
 }
+
+/// [`Key::of`]'s length-then-bytes match against a search of every name, over each name,
+/// each with one byte changed, cut or lengthened, and seeded bytes of every length up to 24.
+#[test]
+fn a_key_is_found_exactly_by_its_name() {
+    let searched = |name: &[u8]| KEYS.iter().position(|it| it.as_bytes() == name);
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    for key in KEYS {
+        let key = key.as_bytes();
+        names.push(key.to_vec());
+        names.push(key[..key.len() - 1].to_vec());
+        names.push([key, b"s"].concat());
+        for at in 0..key.len() {
+            for byte in [b'-', b'a', b'e', b'l', b'u', b'c', key[at] ^ 0x20] {
+                let mut changed = key.to_vec();
+                changed[at] = byte;
+                names.push(changed);
+            }
+        }
+    }
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    for _ in 0..20_000 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let len = (state % 25) as usize;
+        names.push((0..len).map(|at| b"rustc-linkargbe"[(state >> (at % 60)) as usize % 15]).collect());
+    }
+    for name in &names {
+        let found = Key::of(name);
+        assert_eq!(found.map(|it| it as usize), searched(name), "{:?}", String::from_utf8_lossy(name));
+        if let Some(key) = found {
+            assert_eq!(key.name().as_bytes(), name.as_slice());
+        }
+    }
+}
+
+/// The single borrowed pass against the reading it replaced ([`reference::parse`]), over
+/// seeded outputs of directives of every key, of both syntaxes, valid or not, for packages
+/// with and without each kind of target and an old `rust-version`, with the `OUT_DIR`
+/// moved or not: the same [`Output`], or the same error.
+#[test]
+fn the_single_pass_reads_as_the_old_parser() {
+    let prefixes = ["cargo:", "cargo::", "  cargo:", "\u{a0}cargo::", "\tcargo::", "x", "cargo"];
+    let mut keys: Vec<&str> = KEYS.to_vec();
+    keys.extend(["foo", "", "RUSTC", "rustc-link", "warnings"]);
+    let values = [
+        "a",
+        "x=y",
+        "-l z -L native=/old/out/lib",
+        "-lfoo   -L/elsewhere",
+        "-L",
+        "-q x",
+        "/old/out/lib",
+        "native=/old/out/x/old/out",
+        "RUSTC_BOOTSTRAP=1",
+        "FOO=bar=baz",
+        "foo=one",
+        "abc=two",
+        "noeq",
+        " spaced  \t",
+        "\u{e9}t\u{e9}",
+        "",
+        "cfg(foo, values(\"a\"))",
+    ];
+    let ends: [&[u8]; 4] = [b"\n", b"\r\n", b"\xff\n", b"\n\n"];
+    let targets = [
+        lib(),
+        vec![
+            target("foo", "lib", "lib"),
+            target("foo", "bin", "bin"),
+            target("t", "test", "bin"),
+            target("b", "bench", "bin"),
+            target("e", "example", "bin"),
+        ],
+        vec![target("foo", "cdylib", "cdylib")],
+    ];
+    let packages: Vec<Package> = targets
+        .iter()
+        .flat_map(|targets| {
+            [None, Some("1.60"), Some("1.80.0")].map(|msrv| foo("0.1.0", msrv, targets.clone()))
+        })
+        .collect();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let (mut agreed_ok, mut agreed_err) = (0, 0);
+    for _ in 0..40_000 {
+        let mut printed = Vec::new();
+        for _ in 0..1 + next(5) {
+            printed.extend_from_slice(prefixes[next(prefixes.len())].as_bytes());
+            printed.extend_from_slice(keys[next(keys.len())].as_bytes());
+            if next(6) > 0 {
+                printed.push(b'=');
+            }
+            printed.extend_from_slice(values[next(values.len())].as_bytes());
+            printed.extend_from_slice(ends[next(ends.len())]);
+        }
+        let package = &packages[next(packages.len())];
+        let generated = if next(2) == 0 { "/old/out" } else { "/new/out" };
+        let rustc_bootstrap = [None, Some("1"), Some("foo")][next(3)].map(str::to_owned);
+        let cx = Context {
+            package,
+            out_dir_when_generated: Path::new(generated),
+            out_dir: Path::new("/new/out"),
+            nightly_features_allowed: next(2) == 0,
+            rustc_bootstrap,
+        };
+        let (new, old) = (parse(&printed, &cx), reference::parse(&printed, &cx));
+        assert_eq!(new, old, "{:?}", String::from_utf8_lossy(&printed));
+        match new {
+            Ok(_) => agreed_ok += 1,
+            Err(_) => agreed_err += 1,
+        }
+    }
+    assert!(agreed_ok > 1_000 && agreed_err > 1_000, "{agreed_ok} read, {agreed_err} refused");
+}
+
+/// A value is the output's own bytes, borrowed, unless it names the `OUT_DIR` the script ran
+/// with and that moved; the pieces of `rustc-flags`, `rustc-env` and metadata too.
+#[test]
+fn a_value_borrows_the_output_unless_its_out_dir_moved() {
+    let package = foo("0.0.1", None, lib());
+    let printed = b"cargo::rustc-cfg=a\ncargo:rustc-flags=-l z -L /old/out/lib\n\
+                    cargo::rustc-env=K=V\ncargo:k=v\ncargo::rustc-link-search=/old/out/x\n";
+    let read_in = |generated: &str| {
+        let cx = Context {
+            package: &package,
+            out_dir_when_generated: Path::new(generated),
+            out_dir: Path::new("/new/out"),
+            nightly_features_allowed: false,
+            rustc_bootstrap: None,
+        };
+        let mut directives: Vec<Directive<'_>> = Vec::new();
+        read(printed, &cx, &mut directives).unwrap();
+        directives
+    };
+    let borrowed = |it: &Cow<'_, str>| matches!(it, Cow::Borrowed(_));
+    let same = read_in("/new/out");
+    assert_eq!(same.len(), 6);
+    for directive in &same {
+        let all_borrowed = match directive {
+            Directive::Cfg(it) | Directive::LinkLib(it) | Directive::LinkSearch(it) => borrowed(it),
+            Directive::Env(a, b) | Directive::Metadata(a, b) => borrowed(a) && borrowed(b),
+            other => panic!("{other:?}"),
+        };
+        assert!(all_borrowed, "{directive:?}");
+    }
+    let moved = read_in("/old/out");
+    assert_eq!(moved[0], Directive::Cfg(Cow::Borrowed("a")));
+    assert_eq!(moved[2], Directive::LinkSearch(Cow::Owned("/new/out/lib".to_owned())));
+    assert!(matches!(&moved[5], Directive::LinkSearch(Cow::Owned(it)) if it == "/new/out/x"));
+}

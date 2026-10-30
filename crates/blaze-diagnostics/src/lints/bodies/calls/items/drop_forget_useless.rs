@@ -24,7 +24,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use super::FnItems;
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -55,6 +55,10 @@ impl Default for DropForgetUseless {
 impl LatePass for DropForgetUseless {
     fn name(&self) -> &'static str {
         "DropForgetUseless"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::BODY | Hooks::EXPR | Hooks::STMT | Hooks::ARM
     }
 
     fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {

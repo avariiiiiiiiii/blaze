@@ -326,7 +326,8 @@ impl Lasting {
         }
         let at = self.ranges.partition_point(|it| it.0.end <= range.start);
         let (mut merged, mut holds, mut end) = (range, holds, at);
-        while let Some((next, _, other)) = self.ranges.get(end).filter(|it| it.0.start < merged.end) {
+        while let Some((next, _, other)) = self.ranges.get(end).filter(|it| it.0.start < merged.end)
+        {
             merged = merged.start.min(next.start)..merged.end.max(next.end);
             if *other == Holds::Code {
                 holds = Holds::Code;
@@ -406,7 +407,8 @@ impl<M: Memory> Switch<M> {
             return Err(format!("the jump table cell at {cell:#x} holds {table:#x}"));
         }
         let end = layout.slots.checked_mul(8).and_then(|len| table.checked_add(len));
-        let end = end.ok_or_else(|| format!("a jump table at {table:#x} past the end of memory"))?;
+        let end =
+            end.ok_or_else(|| format!("a jump table at {table:#x} past the end of memory"))?;
         memory.in_image(&(table..end))?;
         let log = Log::new(layout.generation);
         Ok(Switch {
@@ -595,10 +597,7 @@ impl<M: Memory> Switch<M> {
         s.rebase.extend(patch.rebase().map(|it| it.wrapping_add(slide)));
         s.rebase.sort_unstable();
         if let Some(pair) = s.rebase.windows(2).find(|it| it[0] == it[1]) {
-            return Err(format!(
-                "the address at {:#x} rebased twice",
-                pair[0].wrapping_sub(slide)
-            ));
+            return Err(format!("the address at {:#x} rebased twice", pair[0].wrapping_sub(slide)));
         }
         for &at in &s.rebase {
             if find(message, &s.code, at, 8).is_none() && find(message, &s.data, at, 8).is_none() {
@@ -915,7 +914,8 @@ fn frames<M: Memory>(
         return Err("DWARF unwind entries, which this platform's unwinder doesn't take".to_owned());
     }
     let linked = |at: u64| at.wrapping_sub(slide);
-    let bytes = |at: u64, len: u64| find(message, code, at, len).or_else(|| find(message, data, at, len));
+    let bytes =
+        |at: u64, len: u64| find(message, code, at, len).or_else(|| find(message, data, at, len));
     let length = |at: u64| -> Result<u32, String> {
         let field = bytes(at, 4).ok_or_else(|| {
             format!("unwind entries reach {:#x}, in none of the patch's writes", linked(at))
@@ -983,7 +983,8 @@ fn find<'m>(message: &'m [u8], spans: &[Span], at: u64, len: u64) -> Option<&'m 
     let span = spans.get(spans.partition_point(|it| it.end() <= at))?;
     let offset = at.checked_sub(span.at)?;
     let end = offset.checked_add(len)?;
-    (end <= span.len as u64).then(|| &message[span.from + offset as usize..span.from + end as usize])
+    (end <= span.len as u64)
+        .then(|| &message[span.from + offset as usize..span.from + end as usize])
 }
 
 /// The length of the UNWIND_INFO whose first 4 bytes are `header`: the fixed part, the unwind

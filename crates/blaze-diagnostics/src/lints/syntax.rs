@@ -28,7 +28,7 @@ mod early;
 
 pub use check_cfg::CheckCfg;
 
-use std::ops::ControlFlow;
+use std::{collections::hash_map::Entry, ops::ControlFlow};
 
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
@@ -37,7 +37,7 @@ use hir::{HirFileId, InFile, MacroCallId};
 use hir_def::AdtId;
 use rustc_hash::FxHashMap;
 use syntax::{
-    AstNode, SyntaxNode, SyntaxNodePtr, TextRange, WalkEvent,
+    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, WalkEvent,
     ast::{self, HasAttrs as _, HasName as _},
 };
 
@@ -184,24 +184,29 @@ impl<'db> Walk<'db> {
 
     /// Adds the tree `root` of `file`, and the trees of what the macros in it expand to.
     fn add(&mut self, cx: &Cx<'_, 'db>, file: HirFileId, root: SyntaxNode, place: Vec<(u32, u32)>) {
-        if self.index.contains_key(&file) {
-            return;
-        }
-        let mut nodes = Vec::new();
+        // The tree's index is taken now: what it expands to is added after it is pushed.
+        match self.index.entry(file) {
+            Entry::Occupied(_) => return,
+            Entry::Vacant(it) => it.insert(self.trees.len()),
+        };
+        // About one node per 16 bytes of Rust source.
+        let mut nodes = Vec::with_capacity(usize::from(root.text_range().len()) / 16);
         let mut off = Vec::new();
         let mut replaced = Vec::new();
         let mut expansions: Vec<((u32, u32), InFile<SyntaxNode>)> = Vec::new();
         let mut events = root.preorder();
         while let Some(event) = events.next() {
             let WalkEvent::Enter(node) = event else { continue };
-            if let Some(owner) = ast::AnyHasAttrs::cast(node.clone())
-                && !self.on(&owner)
+            let kind = node.kind();
+            if ast::AnyHasAttrs::can_cast(kind)
+                && !self.on(&ast::AnyHasAttrs::cast(node.clone()).expect("checked by kind"))
             {
                 off.push(node);
                 events.skip_subtree();
                 continue;
             }
-            if let Some(item) = ast::Item::cast(node.clone())
+            if ast::Item::can_cast(kind)
+                && let Some(item) = ast::Item::cast(node.clone())
                 && item.attrs().next().is_some()
                 && let Some(expanded) = cx.sema.expand_attr_macro(&item)
             {
@@ -210,13 +215,13 @@ impl<'db> Walk<'db> {
                 events.skip_subtree();
                 continue;
             }
-            nodes.push(node.clone());
-            if let Some(call) = ast::MacroCall::cast(node.clone())
+            if kind == SyntaxKind::MACRO_CALL
+                && let Some(call) = ast::MacroCall::cast(node.clone())
                 && let Some(expanded) = cx.sema.expand_macro_call(&call)
             {
                 expansions.push((entered(node.text_range()), expanded));
             }
-            if ast::Adt::can_cast(node.kind())
+            if ast::Adt::can_cast(kind)
                 && let Some(owner) = ast::AnyHasAttrs::cast(node.clone())
             {
                 // What a derive makes comes after the item it is on.
@@ -236,10 +241,10 @@ impl<'db> Walk<'db> {
                     }
                 }
             }
+            nodes.push(node);
         }
         let mut skips: Vec<TextRange> = off.iter().chain(&replaced).map(|it| it.text_range()).collect();
         radix::sort_copy_by_key(&mut skips, |it| radix::pack_32(it.start().into(), it.end().into()));
-        self.index.insert(file, self.trees.len());
         self.trees.push(Tree { file, root, call: file.macro_file(), nodes, off, replaced, skips, place: place.clone() });
         for (at, expanded) in expansions {
             let mut place = place.clone();
@@ -297,7 +302,7 @@ impl<'db> Walk<'db> {
     /// Where rustc's walk comes to `at` in `pass`: as it enters it, or for [`Pass::Post`] as it
     /// leaves it. A node of an expansion the walk does not have is placed at the call it came
     /// from.
-    fn place(&self, cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>, pass: Pass) -> Vec<(u32, u32)> {
+    pub(crate) fn place(&self, cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>, pass: Pass) -> Vec<(u32, u32)> {
         let (mut file, mut range) = (at.file_id, at.value.text_range());
         loop {
             if let Some(tree) = self.tree(file) {
@@ -398,6 +403,8 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
     emitted.extend(early::lints(cx, &walk));
     emitted.extend(delims::lints(cx, &walk));
     emitted.extend(attrs::lints(cx, &walk));
+    // Per emitted diagnostic, not per node: each key is made once, and what it costs scales with
+    // the output.
     let mut keyed: Vec<_> = emitted
         .into_iter()
         .map(|Emitted { found, pass, place }| {

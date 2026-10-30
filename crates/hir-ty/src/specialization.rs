@@ -250,7 +250,7 @@ fn parameters_for<'db>(
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
             match ty.kind() {
-                TyKind::Alias(alias)
+                TyKind::Alias(_, alias)
                     if !self.include_nonconstraining
                         && matches!(
                             alias.kind,
@@ -273,7 +273,7 @@ fn parameters_for<'db>(
         }
         fn visit_const(&mut self, konst: Const<'db>) {
             match konst.kind() {
-                ConstKind::Unevaluated(_) if !self.include_nonconstraining => return,
+                ConstKind::Alias(..) if !self.include_nonconstraining => return,
                 ConstKind::Param(param) => {
                     self.out.insert(Parameter::TypeOrConst(param.id.into()));
                 }

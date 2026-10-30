@@ -187,7 +187,7 @@ fn generic_type_visitable_derive(mut s: synstructure::Structure<'_>) -> proc_mac
         }
     });
 
-    s.bound_impl(
+    let generated = s.unsafe_bound_impl(
         quote!(::rustc_type_ir::GenericTypeVisitable<__V>),
         quote! {
             fn generic_visit_with(
@@ -197,7 +197,13 @@ fn generic_type_visitable_derive(mut s: synstructure::Structure<'_>) -> proc_mac
                 match self { #body_visit }
             }
         },
-    )
+    );
+    // SAFETY (of the generated impl): `body_visit` visits every field of every variant, the
+    // trait's contract, so a crate denying `unsafe_code` may still derive it.
+    quote! {
+        #[allow(unsafe_code)]
+        #generated
+    }
 }
 
 decl_derive!(

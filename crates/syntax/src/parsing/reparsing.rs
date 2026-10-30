@@ -55,23 +55,87 @@ pub(crate) fn incremental_reparse(
         insert,
         &source[usize::from(delete.end())..],
     ]);
-    let edit = Edit {
-        tree,
-        delete,
-        insert,
-        new_source,
-        edition,
-        outline: outline.is_some(),
-    };
+    reparse_onto(tree, delete, insert, &new_source, errors, edition, outline)
+}
+
+/// [`incremental_reparse`] of the edit that makes `tree`'s text `new_source`, whose tree shares
+/// `new_source`: `delete` of the old text replaced by what is at `delete.start()` in the new.
+pub(crate) fn incremental_reparse_onto(
+    tree: &FlatTree,
+    delete: TextRange,
+    new_source: &Arc<str>,
+    errors: impl IntoIterator<Item = SyntaxError>,
+    edition: Edition,
+    outline: Option<Edition>,
+) -> Option<(FlatTree, Vec<SyntaxError>, TextRange)> {
+    if outline.is_some_and(|it| it != edition) {
+        return None;
+    }
+    let start = usize::from(delete.start());
+    let insert_len = (new_source.len() + usize::from(delete.len()))
+        .checked_sub(tree.source().len())
+        .expect("the edit deletes no more than the old text has");
+    let insert = &new_source[start..start + insert_len];
+    reparse_onto(tree, delete, insert, new_source, errors, edition, outline)
+}
+
+fn reparse_onto(
+    tree: &FlatTree,
+    delete: TextRange,
+    insert: &str,
+    new_source: &Arc<str>,
+    errors: impl IntoIterator<Item = SyntaxError>,
+    edition: Edition,
+    outline: Option<Edition>,
+) -> Option<(FlatTree, Vec<SyntaxError>, TextRange)> {
+    let edit = Edit { tree, delete, insert, new_source, edition, outline: outline.is_some() };
     let (tree, new_errors, range) = edit.token().or_else(|| edit.node())?;
     Some((tree, merge_errors(errors, new_errors, range, delete, insert), range))
+}
+
+/// The edit that makes `old` into `new`: the range of `old` between their longest common
+/// prefix and suffix (at character boundaries), which the bytes of `new` at the same start and
+/// `insert` long replace. Compares 64 bytes at a time (`memcmp`) until the texts differ.
+pub(crate) fn edit_between(old: &str, new: &str) -> (TextRange, usize) {
+    const BLOCK: usize = 64;
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let len = a.len().min(b.len());
+    let mut prefix = 0;
+    while prefix + BLOCK <= len && a[prefix..prefix + BLOCK] == b[prefix..prefix + BLOCK] {
+        prefix += BLOCK;
+    }
+    while prefix < len && a[prefix] == b[prefix] {
+        prefix += 1;
+    }
+    // A char that ends at `prefix` in one text ends there in the other: their bytes to it are
+    // the same, and its first byte says how long it is.
+    while !old.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let most = len - prefix;
+    let (a_end, b_end) = (a.len(), b.len());
+    let mut suffix = 0;
+    while suffix + BLOCK <= most
+        && a[a_end - suffix - BLOCK..a_end - suffix] == b[b_end - suffix - BLOCK..b_end - suffix]
+    {
+        suffix += BLOCK;
+    }
+    while suffix < most && a[a_end - suffix - 1] == b[b_end - suffix - 1] {
+        suffix += 1;
+    }
+    while !old.is_char_boundary(a_end - suffix) {
+        suffix -= 1;
+    }
+    let to_offset = |at: usize| TextSize::try_from(at).expect("a text under 4 GiB");
+    let delete = TextRange::new(to_offset(prefix), to_offset(a_end - suffix));
+    (delete, b_end - suffix - prefix)
 }
 
 struct Edit<'a> {
     tree: &'a FlatTree,
     delete: TextRange,
     insert: &'a str,
-    new_source: Arc<str>,
+    new_source: &'a Arc<str>,
     edition: Edition,
     outline: bool,
 }
@@ -804,6 +868,94 @@ enum Foo {
                 }
             }
         }
+    }
+
+    /// Several random edits of real files at once, made into one parse by `reparse_to` from the
+    /// parse before them: the parse of the text after them, in full and as an outline, sharing
+    /// that text.
+    #[test]
+    fn reparse_to_random_edits() {
+        let root = test_utils::project_root().into_std_path_buf();
+        let mut files = Vec::new();
+        collect_rs(&root.join("crates/syntax/src"), &mut files);
+        files.sort();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let full = SourceFile::parse(&text, Edition::CURRENT);
+            let outline = SourceFile::parse_outline(text.as_str().into(), Edition::CURRENT);
+            for edits in 1..4 {
+                let mut after = text.clone();
+                for _ in 0..edits {
+                    let (delete, insert) = random_edit(&mut rng, &after);
+                    after.replace_range(Range::<usize>::from(delete), &insert);
+                }
+                let shared: Arc<str> = after.as_str().into();
+                let check = || {
+                    let reparsed = full.reparse_to(shared.clone(), Edition::CURRENT);
+                    let parsed = SourceFile::parse(&after, Edition::CURRENT);
+                    assert_eq_text!(
+                        &format!("{:#?}", parsed.tree().syntax()),
+                        &format!("{:#?}", reparsed.tree().syntax()),
+                    );
+                    assert_eq!(reparsed.errors(), parsed.errors());
+                    assert!(Arc::ptr_eq(reparsed.tree.as_ref().unwrap().flat().source(), &shared));
+                    let reparsed = outline.reparse_to(shared.clone(), Edition::CURRENT);
+                    let parsed = SourceFile::parse_outline(shared.clone(), Edition::CURRENT);
+                    check_same(&reparsed, &parsed);
+                };
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err() {
+                    panic!("{}: {edits} edits", file.display());
+                }
+            }
+        }
+    }
+
+    /// The edit between two texts is the one that makes the first the second, at character
+    /// boundaries, and covers no byte the two share at either end.
+    #[test]
+    fn edit_between_cuts_the_common_ends() {
+        let long = "x".repeat(200);
+        let cases = [
+            ("abc", "abc"),
+            ("abc", "abXc"),
+            ("abc", "c"),
+            ("", "fn f() {}"),
+            ("fn f() {}", ""),
+            ("aaaa", "aaaaaa"),
+            ("let s = \"é\";", "let s = \"è\";"),
+            ("é", "è"),
+            ("ü", "u"),
+        ];
+        let mut all: Vec<(String, String)> =
+            cases.iter().map(|&(a, b)| (a.to_owned(), b.to_owned())).collect();
+        all.push((format!("{long}a{long}"), format!("{long}bb{long}")));
+        for (old, new) in &all {
+            let (old, new) = (old.as_str(), new.as_str());
+            let (delete, insert) = edit_between(old, new);
+            let start = usize::from(delete.start());
+            let made = format!(
+                "{}{}{}",
+                &old[..start],
+                &new[start..start + insert],
+                &old[usize::from(delete.end())..]
+            );
+            assert_eq!(made, new, "{old:?} to {new:?}");
+            let suffix = old.len() - usize::from(delete.end());
+            assert_eq!(new.len() - suffix - start, insert);
+            // No character both the deleted and the inserted text start (or end) with.
+            let (deleted, inserted) = (&old[delete], &new[start..start + insert]);
+            if let (Some(a), Some(b)) = (deleted.chars().next(), inserted.chars().next()) {
+                assert_ne!(a, b, "{old:?} to {new:?}: a shared start");
+            }
+            if let (Some(a), Some(b)) = (deleted.chars().next_back(), inserted.chars().next_back())
+            {
+                assert_ne!(a, b, "{old:?} to {new:?}: a shared end");
+            }
+        }
+        assert_eq!(edit_between(&format!("{long}a{long}"), &format!("{long}bb{long}")).0, {
+            TextRange::at(TextSize::new(200), TextSize::new(1))
+        });
     }
 
     fn random_edit(rng: &mut Rng, text: &str) -> (TextRange, String) {

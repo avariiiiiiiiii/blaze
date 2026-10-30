@@ -164,7 +164,7 @@ impl<'db> InferenceContext<'db> {
     /// it is matching against. This is used to determine whether we should
     /// perform `NeverToAny` coercions.
     fn pat_guaranteed_to_constitute_read_for_never(&self, pat: PatId) -> bool {
-        match &self.store[pat] {
+        match self.store.pat(pat) {
             // Does not constitute a read.
             Pat::Wild | Pat::Rest => false,
 
@@ -207,7 +207,7 @@ impl<'db> InferenceContext<'db> {
     // FIXME(tschottdorf): this is problematic as the HIR is being scraped, but
     // ref bindings are be implicit after #42640 (default match binding modes). See issue #44848.
     fn contains_explicit_ref_binding(&self, pat: PatId) -> bool {
-        if let Pat::Bind { id, .. } = self.store[pat]
+        if let Pat::Bind { id, .. } = self.store.pat(pat)
             && matches!(self.store[id].mode, BindingAnnotation::Ref | BindingAnnotation::RefMut)
         {
             return true;
@@ -219,7 +219,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     fn is_syntactic_place_expr(&mut self, expr: ExprId) -> bool {
-        match &self.store[expr] {
+        match self.store.expr(expr) {
             // Lang item paths cannot currently be local variables or statics.
             Expr::Path(Path::LangItem(_, _)) => false,
             Expr::Path(Path::Normal(path)) => path.type_anchor.is_none(),
@@ -333,11 +333,11 @@ impl<'db> InferenceContext<'db> {
         expected: &Expectation<'db>,
         is_read: ExprIsRead,
     ) -> Ty<'db> {
-        let expr = &self.store[tgt_expr];
+        let expr = self.store.expr(tgt_expr);
         tracing::trace!(?expr);
         let ty = match expr {
             Expr::Missing => self.err_ty(),
-            &Expr::If { condition, then_branch, else_branch } => {
+            Expr::If { condition, then_branch, else_branch } => {
                 let expected = &expected.adjust_for_branches(&mut self.table, tgt_expr.into());
                 self.infer_expr_coerce_never(
                     condition,
@@ -391,7 +391,7 @@ impl<'db> InferenceContext<'db> {
 
                 coerce.complete(self)
             }
-            &Expr::Let { pat, expr } => {
+            Expr::Let { pat, expr } => {
                 self.infer_let(
                     self.table.next_ty_var(tgt_expr.into()),
                     Some(expr),
@@ -401,15 +401,15 @@ impl<'db> InferenceContext<'db> {
                 self.types.types.bool
             }
             Expr::Block { statements, tail, label, id: _, unsafe_: _ } => {
-                self.infer_block(tgt_expr, statements, *tail, *label, expected)
+                self.infer_block(tgt_expr, statements, tail, label, expected)
             }
             Expr::Const(id) => {
                 self.with_breakable_ctx(BreakableKind::Border, None, None, |this| {
-                    this.infer_expr(*id, expected, ExprIsRead::Yes)
+                    this.infer_expr(id, expected, ExprIsRead::Yes)
                 })
                 .1
             }
-            &Expr::Loop { body, label, source } => {
+            Expr::Loop { body, label, source } => {
                 let coerce = match source {
                     // you can only use break with a value from a normal `loop { }`
                     LoopSource::Loop => {
@@ -435,22 +435,22 @@ impl<'db> InferenceContext<'db> {
             }
             Expr::Closure { body, args, ret_type, arg_types, closure_kind, capture_by: _ } => self
                 .infer_closure(
-                    *body,
+                    body,
                     args,
-                    *ret_type,
+                    ret_type,
                     arg_types,
-                    *closure_kind,
+                    closure_kind,
                     tgt_expr,
                     expected,
                 ),
-            Expr::Call { callee, args, .. } => self.infer_call(tgt_expr, *callee, args, expected),
+            Expr::Call { callee, args, .. } => self.infer_call(tgt_expr, callee, args, expected),
             Expr::MethodCall { receiver, args, method_name, generic_args } => self
                 .infer_method_call(
                     tgt_expr,
-                    *receiver,
+                    receiver,
                     args,
                     method_name,
-                    generic_args.as_deref(),
+                    generic_args,
                     expected,
                 ),
             Expr::Match { expr, arms } => {
@@ -463,7 +463,7 @@ impl<'db> InferenceContext<'db> {
                 let scrutinee_is_read =
                     if scrutinee_is_read { ExprIsRead::Yes } else { ExprIsRead::No };
                 let input_ty = self.demand_scrutinee_type(
-                    *expr,
+                    expr,
                     contains_ref_bindings,
                     arms.is_empty(),
                     scrutinee_is_read,
@@ -484,7 +484,7 @@ impl<'db> InferenceContext<'db> {
                         // We don't coerce to `()` so that if the match expression is a
                         // statement it's branches can have any consistent type.
                         Expectation::HasType(ty) if *ty != self.types.types.unit => *ty,
-                        _ => self.table.next_ty_var((*expr).into()),
+                        _ => self.table.next_ty_var(expr.into()),
                     };
                     let mut coerce = CoerceMany::new(result_ty);
 
@@ -516,7 +516,7 @@ impl<'db> InferenceContext<'db> {
                 }
             }
             Expr::Path(p) => self.infer_expr_path(p, tgt_expr.into(), tgt_expr),
-            &Expr::Continue { label } => {
+            Expr::Continue { label } => {
                 if find_continuable(&self.breakables, label).is_none() {
                     self.push_diagnostic(InferenceDiagnostic::BreakOutsideOfLoop {
                         expr: tgt_expr,
@@ -526,7 +526,7 @@ impl<'db> InferenceContext<'db> {
                 };
                 self.types.types.never
             }
-            &Expr::Break { expr, label } => {
+            Expr::Break { expr, label } => {
                 let breakable_idx = find_breakable(&self.breakables, label);
                 let val_ty = if let Some(expr) = expr {
                     let opt_coerce_to = match breakable_idx {
@@ -583,13 +583,13 @@ impl<'db> InferenceContext<'db> {
                 }
                 self.types.types.never
             }
-            &Expr::Return { expr } => self.infer_expr_return(tgt_expr, expr),
-            &Expr::Become { expr } => self.infer_expr_become(tgt_expr, expr),
+            Expr::Return { expr } => self.infer_expr_return(tgt_expr, expr),
+            Expr::Become { expr } => self.infer_expr_become(tgt_expr, expr),
             Expr::Yield { expr } => {
                 if let Some((resume_ty, yield_ty)) = self.resume_yield_tys {
                     if let Some(expr) = expr {
                         self.infer_expr_coerce(
-                            *expr,
+                            expr,
                             &Expectation::has_type(yield_ty),
                             ExprIsRead::Yes,
                         );
@@ -612,47 +612,47 @@ impl<'db> InferenceContext<'db> {
                 }
             }
             Expr::Yeet { expr } => {
-                if let &Some(expr) = expr {
+                if let Some(expr) = expr {
                     self.infer_expr_no_expect(expr, ExprIsRead::Yes);
                 }
                 self.types.types.never
             }
             Expr::RecordLit { path, fields, spread, .. } => {
-                self.infer_record_expr(tgt_expr, expected, path, fields, *spread)
+                self.infer_record_expr(tgt_expr, expected, path, fields, spread)
             }
-            Expr::Field { expr, name } => self.infer_field_access(tgt_expr, *expr, name, expected),
-            Expr::Await { expr } => self.infer_await_expr(tgt_expr, *expr),
+            Expr::Field { expr, name } => self.infer_field_access(tgt_expr, expr, name, expected),
+            Expr::Await { expr } => self.infer_await_expr(tgt_expr, expr),
             Expr::Cast { expr, type_ref } => {
-                let cast_ty = self.make_ty(*type_ref);
+                let cast_ty = self.make_ty(type_ref);
                 let expr_ty =
-                    self.infer_expr(*expr, &Expectation::Castable(cast_ty), ExprIsRead::Yes);
-                self.deferred_cast_checks.push(CastCheck::new(tgt_expr, *expr, expr_ty, cast_ty));
+                    self.infer_expr(expr, &Expectation::Castable(cast_ty), ExprIsRead::Yes);
+                self.deferred_cast_checks.push(CastCheck::new(tgt_expr, expr, expr_ty, cast_ty));
                 cast_ty
             }
             Expr::Ref { expr, rawness, mutability } => self.infer_ref_expr(
-                *rawness,
-                lower_mutability(*mutability),
-                *expr,
+                rawness,
+                lower_mutability(mutability),
+                expr,
                 expected,
                 tgt_expr,
             ),
-            Expr::UnaryOp { expr, op } => self.infer_unop_expr(*op, *expr, expected, tgt_expr),
+            Expr::UnaryOp { expr, op } => self.infer_unop_expr(op, expr, expected, tgt_expr),
             Expr::BinaryOp { lhs, rhs, op } => match op {
                 Some(BinaryOp::Assignment { op: Some(op) }) => {
-                    self.infer_assign_op_expr(tgt_expr, *op, *lhs, *rhs)
+                    self.infer_assign_op_expr(tgt_expr, op, lhs, rhs)
                 }
-                Some(op) => self.infer_binop_expr(tgt_expr, *op, *lhs, *rhs),
+                Some(op) => self.infer_binop_expr(tgt_expr, op, lhs, rhs),
                 None => self.err_ty(),
             },
-            &Expr::Assignment { target, value } => {
+            Expr::Assignment { target, value } => {
                 // In ordinary (non-destructuring) assignments, the type of
                 // `lhs` must be inferred first so that the ADT fields
                 // instantiations in RHS can be coerced to it. Note that this
                 // cannot happen in destructuring assignments because of how
                 // they are desugared.
-                let lhs_ty = match &self.store[target] {
+                let lhs_ty = match self.store.pat(target) {
                     // LHS of assignment doesn't constitute reads.
-                    &Pat::Expr(expr) => {
+                    Pat::Expr(expr) => {
                         Some(self.infer_expr(expr, &Expectation::none(), ExprIsRead::No))
                     }
                     _ => None,
@@ -684,15 +684,15 @@ impl<'db> InferenceContext<'db> {
                 }
             }
             Expr::Index { base, index } => {
-                let base_t = self.infer_expr_no_expect(*base, ExprIsRead::Yes);
-                let idx_t = self.infer_expr_no_expect(*index, ExprIsRead::Yes);
+                let base_t = self.infer_expr_no_expect(base, ExprIsRead::Yes);
+                let idx_t = self.infer_expr_no_expect(index, ExprIsRead::Yes);
 
-                let base_t = self.structurally_resolve_type((*base).into(), base_t);
-                match self.lookup_indexing(tgt_expr, *base, *index, base_t, idx_t) {
+                let base_t = self.structurally_resolve_type(base.into(), base_t);
+                match self.lookup_indexing(tgt_expr, base, index, base_t, idx_t) {
                     Some((trait_index_ty, trait_element_ty)) => {
                         // two-phase not needed because index_ty is never mutable
                         self.demand_coerce(
-                            *index,
+                            index,
                             idx_t,
                             trait_index_ty,
                             AllowTwoPhase::No,
@@ -734,7 +734,7 @@ impl<'db> InferenceContext<'db> {
                 self.infer_array_elements_expr(elements, expected, tgt_expr)
             }
             Expr::Array(Array::Repeat { initializer, repeat }) => {
-                self.infer_array_repeat_expr(*initializer, *repeat, expected, tgt_expr)
+                self.infer_array_repeat_expr(initializer, repeat, expected, tgt_expr)
             }
             Expr::Literal(lit) => literal_ty(
                 self.interner(),
@@ -2157,7 +2157,7 @@ impl<'db> InferenceContext<'db> {
                 // the return value of an argument-position async block to an argument-position
                 // closure wrapped in a block.
                 // See <https://github.com/rust-lang/rust/issues/112225>.
-                let is_closure = if let Expr::Closure { closure_kind, .. } = self.store[*arg] {
+                let is_closure = if let Expr::Closure { closure_kind, .. } = self.store.expr(*arg) {
                     !matches!(closure_kind, ClosureKind::OldCoroutine(_))
                 } else {
                     false

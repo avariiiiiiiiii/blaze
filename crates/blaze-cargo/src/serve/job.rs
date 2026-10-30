@@ -57,8 +57,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::{
     heads::Heads,
     mounts::Mounts,
-    plane::{self, Did, Fresh, Happened, Plane, Task, kinds},
-    work::{Compiled, Failed, Front, Goal, JobInput, Runs, Selection, Source, Steps},
+    plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds},
+    work::{Compiled, Failed, Front, FrontEnd, Goal, JobInput, Reader, Readers, Runs, Selection, Source, Steps, Writer},
 };
 
 /// How many tags one run of user code uses ([`Runs`]).
@@ -70,7 +70,7 @@ pub enum Value {
     /// The fetch at its place in its batch ([`Fetching::fetches`]).
     Fetched(Arc<[Fetch]>, u32, Result<Source, ApiError>),
     Planned(Result<Planned, ApiError>),
-    Lowered(Result<Arc<dyn Front>, ApiError>),
+    Lowered(Result<FrontEnd, ApiError>),
     Compiled(usize, Result<Compiled, ApiError>),
     Answer(Result<Response, ApiError>),
     /// `blaze test --ub`: the tests selected, and one's result.
@@ -137,11 +137,11 @@ fn fetch_key(fetch: &Fetch) -> Key {
 /// the loop as.
 fn task<R: 'static>(
     cancelled: &Arc<AtomicBool>,
-    step: impl Fn(u32) -> Result<R, Failed> + Send + Sync + 'static,
+    step: impl Fn(u32, Readers) -> Result<R, Failed> + Send + Sync + 'static,
     value: impl Fn(u32, Result<R, ApiError>) -> Value + Send + Sync + 'static,
 ) -> plane::Work<Value> {
     let cancelled = cancelled.clone();
-    Arc::new(move |arg| match step(arg) {
+    Arc::new(move |arg, readers| match step(arg, readers) {
         Ok(it) => Some(Did { outcome: Outcome::Built, value: value(arg, Ok(it)) }),
         Err(Failed::Error(error)) => {
             Some(Did { outcome: Outcome::Failed { why: error.what.clone() }, value: value(arg, Err(error)) })
@@ -152,6 +152,11 @@ fn task<R: 'static>(
         }),
         Err(Failed::Again) => None,
     })
+}
+
+/// The reader of a task's own front end, which a task of a batch that reads is posted with.
+fn this(readers: Readers) -> Reader {
+    readers.this.expect("a task that reads is posted with its reader")
 }
 
 /// One thread task of kind `kind`, the batch's only one.
@@ -284,6 +289,7 @@ struct Prep {
 struct Ready {
     input: JobInput,
     front: Option<Arc<dyn Front>>,
+    writer: Option<Box<dyn Writer>>,
 }
 
 enum Stage {
@@ -312,6 +318,9 @@ struct Fetching {
 struct Build {
     input: JobInput,
     front: Arc<dyn Front>,
+    /// The front end's database, written only here, on the loop: each task that reads it is
+    /// posted with a reader made from it then.
+    writer: Box<dyn Writer>,
     /// Unit `at` is node `first + at`.
     first: NodeId,
     /// Each unit's package, by its place in the plan's packages; `u32::MAX` for none.
@@ -534,11 +543,11 @@ impl Jobs {
         if self.library.is_none() {
             let job = self.jobs.get_mut(&id).expect("a job being prepared");
             let steps = w.steps.clone();
-            let work = task(&job.cancelled, move |_| Ok(steps.library()?), |_, it| Value::Library(it));
+            let work = task(&job.cancelled, move |_, _| Ok(steps.library()?), |_, it| Value::Library(it));
             let name = "the standard library's source";
             let fresh = lone(w.plane, NodeKind::Std, name, Pool::Io, Some(library_key()), kinds::LIBRARY);
             job.stage = Stage::Library(fresh.first());
-            self.add(w, id, fresh, Some(work));
+            self.add(w, id, fresh, Some(work), false);
             return;
         }
         let job = self.jobs.get(&id).expect("a job being prepared");
@@ -576,15 +585,15 @@ impl Jobs {
     fn plan(&mut self, w: &mut World<'_>, id: JobId, prep: Prep) {
         let job = self.jobs.get_mut(&id).expect("a job planning");
         let (steps, db, queries) = (w.steps.clone(), w.db.clone(), prep.queries);
-        let work = task(&job.cancelled, move |_| steps.plan(&db, queries), |_, it| Value::Planned(it));
+        let work = task(&job.cancelled, move |_, _| steps.plan(&db, queries), |_, it| Value::Planned(it));
         let name = named("the plan of ", &prep.root_dir);
         let fresh = lone(w.plane, NodeKind::Manifest, &name, Pool::Work, None, kinds::PLAN);
         job.stage = Stage::Plan(fresh.first(), prep);
-        self.add(w, id, fresh, Some(work));
+        self.add(w, id, fresh, Some(work), false);
     }
 
-    /// A batch of the job's nodes.
-    fn add(&mut self, w: &mut World<'_>, id: JobId, fresh: Fresh, work: Option<plane::Work<Value>>) {
+    /// A batch of the job's nodes; with `reads`, its tasks read the job's front end.
+    fn add(&mut self, w: &mut World<'_>, id: JobId, fresh: Fresh, work: Option<plane::Work<Value>>, reads: bool) {
         let job = self.jobs.get_mut(&id).expect("a job adding nodes");
         let request = job.request.expect("a job that builds has a request");
         let (first, count) = (fresh.first(), fresh.count());
@@ -592,8 +601,30 @@ impl Jobs {
             job.batches.push(first);
             self.nodes.insert(first.0, (count, id));
         }
-        if let Err(error) = w.plane.add(w.now, request, fresh, work) {
+        if let Err(error) = w.plane.add(w.now, request, fresh, work, reads) {
             self.end(w, id, false, Some(ApiError::new(format!("the plane refused the job's tasks: {error}"), None)));
+        }
+    }
+
+    /// A task of a batch that reads posted with readers of its job's front ends as they stand
+    /// now, after every write the loop made before it.
+    fn post(&mut self, w: &mut World<'_>, task: Posting, again: bool) {
+        let job = self.job_of(task.id).and_then(|id| self.jobs.get(&id));
+        let readers = job.and_then(|job| match &job.stage {
+            Stage::Units(build) => Some(Readers { this: Some(build.writer.reader()), from: None }),
+            Stage::Answer(_) => {
+                let this = job.ready.last()?.writer.as_ref()?.reader();
+                let from = match job.work {
+                    Work::Reach { .. } => Some(job.ready.first()?.writer.as_ref()?.reader()),
+                    _ => None,
+                };
+                Some(Readers { this: Some(this), from })
+            }
+            _ => None,
+        });
+        match readers {
+            Some(readers) => w.plane.post(task, again, readers),
+            None => w.plane.refuse(w.now, task, "its job has no front end to read now".to_owned()),
         }
     }
 
@@ -609,6 +640,7 @@ impl Jobs {
             match it {
                 Happened::Did { id, value } => self.did(w, id, value),
                 Happened::Started { id } => self.started_unit(w, id),
+                Happened::Post { task, again } => self.post(w, task, again),
                 Happened::Run { id } => self.run_script(w, id),
                 Happened::Settled { id, ok, why } => self.settled(w, id, ok, why),
                 Happened::Finished { request, ok, stats } => self.plane_finished(w, request, ok, stats),
@@ -723,8 +755,8 @@ impl Jobs {
                 self.plan(w, id, again);
             }
             Stage::Lower(at, input) if at == node => match job.values.remove(&node) {
-                Some(Value::Lowered(Ok(front))) => {
-                    job.ready.push(Ready { input, front: Some(front) });
+                Some(Value::Lowered(Ok(FrontEnd { front, writer }))) => {
+                    job.ready.push(Ready { input, front: Some(front), writer: Some(writer) });
                     self.next(w, id);
                 }
                 Some(Value::Lowered(Err(error))) => self.end(w, id, false, Some(error)),
@@ -805,12 +837,12 @@ impl Jobs {
                     let (steps, asked, told) = (w.steps.clone(), fetches.clone(), fetches.clone());
                     task(
                         &job.cancelled,
-                        move |at| Ok(steps.fetch(&asked[at as usize])?),
+                        move |at, _| Ok(steps.fetch(&asked[at as usize])?),
                         move |at, result| Value::Fetched(told.clone(), at, result),
                     )
                 };
                 job.stage = Stage::Fetch(Fetching { first, fetches, left: count, prep });
-                self.add(w, id, fresh, Some(work));
+                self.add(w, id, fresh, Some(work), false);
             }
             Planned::Ready(mut units) => {
                 let job = self.jobs.get_mut(&id).expect("a job planning");
@@ -846,16 +878,16 @@ impl Jobs {
                     cancelled: job.cancelled.clone(),
                 };
                 if matches!(job.work, Work::Trace(_) | Work::Verify(_)) {
-                    job.ready.push(Ready { input, front: None });
+                    job.ready.push(Ready { input, front: None, writer: None });
                     self.next(w, id);
                     return;
                 }
                 let (steps, lowering) = (w.steps.clone(), input.clone());
-                let work = task(&job.cancelled, move |_| steps.lower(&lowering), |_, it| Value::Lowered(it));
+                let work = task(&job.cancelled, move |_, _| steps.lower(&lowering), |_, it| Value::Lowered(it));
                 let name = named("lowering ", &prep.root_dir);
                 let fresh = lone(w.plane, NodeKind::Names, &name, Pool::Work, None, kinds::LOWER);
                 job.stage = Stage::Lower(fresh.first(), input);
-                self.add(w, id, fresh, Some(work));
+                self.add(w, id, fresh, Some(work), false);
             }
         }
     }
@@ -870,33 +902,37 @@ impl Jobs {
         let job = self.jobs.get_mut(&id).expect("a job going on");
         let cancelled = job.cancelled.clone();
         let ready = job.ready.last().expect("a job has a view");
+        let reads = ready.writer.is_some();
         let answer: Option<plane::Work<Value>> = match &job.work {
             Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } => None,
             Work::Reach { changes, .. } => {
                 let from = job.ready[0].front.clone().expect("a reach lowers both views");
                 let to = ready.front.clone().expect("a reach lowers both views");
                 let changes = changes.clone();
-                let reach = move |_| to.reach(from.as_ref(), &changes);
+                let reach = move |_: u32, readers: Readers| {
+                    let from_reader = readers.from.expect("a reach is posted with a reader of the view it reaches from");
+                    to.reach(this(Readers { this: readers.this, from: None }), from.as_ref(), from_reader, &changes)
+                };
                 Some(task(&cancelled, reach, |_, it| Value::Answer(it.map(Response::Reached))))
             }
             Work::CodegenInputs(_) => {
                 let front = ready.front.clone().expect("lowered");
-                Some(task(&cancelled, move |_| front.codegen_inputs(), |_, it| Value::Answer(it.map(Response::CodegenInputs))))
+                Some(task(&cancelled, move |_, readers| front.codegen_inputs(this(readers)), |_, it| Value::Answer(it.map(Response::CodegenInputs))))
             }
             Work::Tables => {
                 let front = ready.front.clone().expect("lowered");
-                Some(task(&cancelled, move |_| front.tables(), |_, it| Value::Answer(it.map(Response::Tables))))
+                Some(task(&cancelled, move |_, readers| front.tables(this(readers)), |_, it| Value::Answer(it.map(Response::Tables))))
             }
             Work::Trace(_) => {
                 let (db, queries, root) = (ready.input.db.clone(), ready.input.queries, w.steps.plan_key());
-                Some(task(&cancelled, move |_| Ok(trace(&db, queries, root)), |_, it| Value::Answer(it.map(Response::Trace))))
+                Some(task(&cancelled, move |_, _| Ok(trace(&db, queries, root)), |_, it| Value::Answer(it.map(Response::Trace))))
             }
             Work::Verify(_) => {
                 let (steps, input) = (w.steps.clone(), ready.input.clone());
                 let view = job.views[0].view;
                 Some(task(
                     &cancelled,
-                    move |_| verify(steps.as_ref(), &input, view),
+                    move |_, _| verify(steps.as_ref(), &input, view),
                     |_, it| Value::Answer(it.map(|mismatches| Response::Verified { mismatches })),
                 ))
             }
@@ -905,12 +941,13 @@ impl Jobs {
         if let Some(work) = answer {
             let fresh = lone(w.plane, NodeKind::Bodies, "the job's answer", Pool::Work, None, kinds::WALK);
             job.stage = Stage::Answer(fresh.first());
-            self.add(w, id, fresh, Some(work));
+            self.add(w, id, fresh, Some(work), reads);
             self.close(w, id);
             return;
         }
         let ready = job.ready.pop().expect("a job has a view");
         let front = ready.front.expect("a build lowers its view");
+        let writer = ready.writer.expect("a build lowers its view");
         let input = ready.input;
         let units = &input.units;
         let count = u32::try_from(units.graph.units.len()).expect("under 2^32 units");
@@ -937,9 +974,9 @@ impl Jobs {
         }
         let work: plane::Work<Value> = {
             let (front, cancelled) = (front.clone(), cancelled.clone());
-            Arc::new(move |arg| {
+            Arc::new(move |arg, readers| {
                 let at = arg as usize;
-                match front.compile(at) {
+                match front.compile(this(readers), at) {
                     Ok(compiled) => {
                         let outcome = match compiled.ok {
                             true => Outcome::Built,
@@ -967,7 +1004,8 @@ impl Jobs {
         let select = match &job.work {
             Work::Test { filter, args, all, ub: Some(ub), .. } => {
                 let (front, filter, args, all, ub) = (front.clone(), filter.clone(), args.clone(), *all, *ub);
-                let selection = move |_| front.ub_tests(Selection { filter: &filter, args: &args, all, ub: Some(ub) });
+                let selection =
+                    move |_: u32, readers: Readers| front.ub_tests(this(readers), Selection { filter: &filter, args: &args, all, ub: Some(ub) });
                 let work = task(&cancelled, selection, |_, it| Value::Selected(it));
                 deps.clear();
                 deps.extend((0..count).map(|at| NodeId(first.0 + at)));
@@ -985,6 +1023,7 @@ impl Jobs {
         job.stage = Stage::Units(Box::new(Build {
             input,
             front,
+            writer,
             first,
             package_of,
             reported,
@@ -992,9 +1031,9 @@ impl Jobs {
             artifacts: Vec::new(),
             evaluation,
         }));
-        self.add(w, id, nodes, Some(work));
+        self.add(w, id, nodes, Some(work), true);
         match select {
-            Some((fresh, work)) => self.add(w, id, fresh, Some(work)),
+            Some((fresh, work)) => self.add(w, id, fresh, Some(work), true),
             None => self.close(w, id),
         }
     }
@@ -1018,8 +1057,9 @@ impl Jobs {
             w.plane.push(&mut fresh, node(NodeKind::Bodies, &name, &[], Pool::Work, None), task);
         }
         let (front, tests, ub): (_, Arc<[String]>, _) = (build.front.clone(), tests.into(), evaluation.ub);
-        let work = task(&job.cancelled, move |at| front.evaluate(&tests[at as usize], ub), |_, it| Value::Evaluated(it));
-        self.add(w, id, fresh, Some(work));
+        let evaluate = move |at: u32, readers: Readers| front.evaluate(this(readers), &tests[at as usize], ub);
+        let work = task(&job.cancelled, evaluate, |_, it| Value::Evaluated(it));
+        self.add(w, id, fresh, Some(work), true);
         self.close(w, id);
     }
 
@@ -1114,7 +1154,7 @@ impl Jobs {
             }
         };
         let mut out = Vec::new();
-        let ended = runs.start(w.store, w.effects, &mut out);
+        let ended = runs.start(w.store, Some(build.writer.as_mut()), w.effects, &mut out);
         for response in out {
             w.said.push(Said::Report(id, response));
         }
@@ -1221,13 +1261,12 @@ impl Jobs {
         let mut out = Vec::new();
         let ended = match (node, &mut job.stage) {
             (Some(node), Stage::Units(build)) => match build.scripts.get_mut(&node) {
-                Some((_, runs)) => runs.complete(completion, w.store, w.effects, &mut out),
+                Some((_, runs)) => runs.complete(completion, w.store, Some(build.writer.as_mut()), w.effects, &mut out),
                 None => None,
             },
-            (None, Stage::Runs(_, runs)) => runs.complete(completion, w.store, w.effects, &mut out),
+            (None, Stage::Runs(_, runs)) => runs.complete(completion, w.store, None, w.effects, &mut out),
             _ => None,
         };
-        drop(store);
         for response in out {
             w.said.push(Said::Report(id, response));
         }
@@ -1272,7 +1311,7 @@ impl Jobs {
         let ok = ok && job.over.is_none();
         let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { unreachable!("checked above") };
-        let Build { input, front, artifacts, evaluation, .. } = *build;
+        let Build { input, front, writer, artifacts, evaluation, .. } = *build;
         let profile = input.units.finished.clone();
         if !runs {
             let ok = ok && evaluation.is_none_or(|it| !it.failed);
@@ -1284,7 +1323,7 @@ impl Jobs {
         let tags = self.run_tags(id, None);
         let started = match &self.jobs[&id].work {
             Work::Test { filter, all, args, ub, .. } => {
-                front.tests(&artifacts, Selection { filter, args, all: *all, ub: *ub }, tags)
+                front.tests(writer.reader(), &artifacts, Selection { filter, args, all: *all, ub: *ub }, tags)
             }
             Work::Run { bin, args, .. } => front.run(&artifacts, bin.as_deref(), args, tags),
             _ => unreachable!("checked above"),
@@ -1300,7 +1339,7 @@ impl Jobs {
             }
         };
         let mut out = Vec::new();
-        let ended = runs.start(w.store, w.effects, &mut out);
+        let ended = runs.start(w.store, None, w.effects, &mut out);
         for response in out {
             w.said.push(Said::Report(id, response));
         }

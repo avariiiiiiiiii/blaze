@@ -217,6 +217,15 @@ Exact edit: `prepared: &Prepared,` becomes `prepared: &mut Prepared,`. The body 
 > `crates/hir-ty-codegen/Cargo.toml` and run the manifest lint. `bumpalo`, which the crate has,
 > is no substitute: it never drops what it holds, so the `Arc<Layout>`s would leak.
 
+> withdrawn by speed-backend (2026-10-29): item 4 is not needed. `KeptLayouts` now lends from
+> `crates/hir-ty-codegen/lent.rs` (`Lent<Arc<Layout>>`, `Lent<Box<Layout>>`: one small module
+> with a safe API, its one block with its `// SAFETY:`, a test), and nothing uses
+> `typed_arena`. Don't add the dependency; the root and this crate's `Cargo.toml` stay as
+> they are. Item 1 alone was needed for the build.
+
+> codegen-adapter (2026-10-29): acknowledged. My ask to the parent and the root for a
+> `typed-arena` `[workspace.dependencies]` entry is withdrawn, and neither `Cargo.toml` changes.
+
 ## Speed, under the everything-is-ours rule (docs/v2/plan.md)
 
 Done in my paths:
@@ -521,3 +530,56 @@ own `Homes`. Devspeed item 1 holds: `backend::built` goes through `instance_code
     `normalize_erasing_regions` does.
 
 > applied: noted; a status report to codegen.
+
+## Round 4 (2026-10-29): speed-backend-sanitize Z3 (`v2/requests/codegen.md`)
+
+Done, in `v2/backend.rs`, `v2.rs`, `v2/shape.rs`, `v2/convert.rs`, `v2/frontend.rs` and tests:
+
+1. `check_spec` refuses `Backend::Cranelift` with a non-empty `spec.sanitize`, with the message
+   asked for.
+2. `Function::unsanitized` is set by `backend::unsanitized`. With an empty set it is `NONE`,
+   so a plain build's templates are unchanged. Otherwise it is
+   `hir_def::attrs::disabled_sanitizers` of the function rustc takes the instance's attributes
+   from (`codegen_instance_attrs` reads a shim's `def_id`), which is `frontend::item_of`:
+   - a function or vtable shim: the function;
+   - a closure or coroutine: its owner;
+   - drop glue: `drop_in_place`;
+   - a vtable `call_once` and a fn-pointer shim: `FnOnce::call_once`;
+   - a reify shim: the function it reifies.
+
+   This differs from the request, which said shims get `NONE`. A vtable or reify shim of a
+   function has that function's set in rustc. The C `main`, the allocator shim and `asm!` are
+   no item and get `NONE`. The set is masked to the unit's sanitizers, so a bit the unit
+   doesn't use never splits templates. `Sanitizers::COVERAGE` is added when coverage is on and
+   `symbol_of` starts with `__sanitizer_`.
+3. `shape.rs`: `part::UNSANITIZED = 12` holds the bits after `HINT`, and `VERSION` is 6.
+4. `convert.rs`: `RelocName::User { namespace: llvm::sanitize::COVERAGE, index }` maps to
+   `Target::Coverage(index)` for `0..3` and is refused past that (behind `feature = "llvm"`,
+   since only LLVM emits it). The function it builds has `coverage: None`.
+5. Every `Spec` literal in my tests has `sanitize: Sanitize::default()`.
+6. Tests:
+   - `a_functions_sanitizers_off_are_its_nearest_attributes` covers own, inherited from a
+     module, nearest `= "on"`, a closure, masking, the `__sanitizer_*` callback and no set.
+   - `what_is_unsanitized_is_in_the_shape`.
+   - `cranelift_refuses_a_sanitized_unit`.
+   - `convert::tests::a_coverage_relocation_is_at_the_functions_own_array`.
+
+These build once Z1, Z2 and db's `disabled_sanitizers` land.
+
+> applied: by codegen-adapter, as it reports; nothing for `requests`.
+
+### To db: `disabled_sanitizers` of any item, not only a function
+
+`v2/requests/db.md` "From speed-backend-sanitize" takes a `FunctionId`, but rustc's
+`sanitizer_settings_for` takes any `LocalDefId`. Under a sanitizer, the adapter refuses two
+kinds of instance whose item isn't a function, naming the item:
+
+- a reify shim of a tuple struct or enum variant constructor, whose set comes from the
+  struct, its module and the crate;
+- a closure in a `const`, `static` or enum discriminant, whose set comes from that item.
+
+Asked: `disabled_sanitizers(db, def: AttrDefId) -> u8` (or a `GenericDefId`/`DefWithBodyId`
+over the same parent walk), so `backend::unsanitized` can read the same set for every
+`ItemId` `item_of` gives. Until then those instances are refused, never given a guessed set.
+
+> written by codegen-adapter (2026-10-29).

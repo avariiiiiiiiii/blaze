@@ -100,23 +100,39 @@ pub(crate) struct Ctx {
 }
 
 /// The [`Apply`] a codegen relocation is written as, by the kind of target it has and
-/// whether it is in a function's code (`in_code`) or in data.
-pub(crate) fn of_kind(kind: RelocKind, arch: Arch, in_code: bool) -> Result<Apply, String> {
+/// whether it is in a function's code (`in_code`) or in data. A thread-local kind is valid
+/// only on the format and arch whose TLS model it belongs to.
+pub(crate) fn of_kind(kind: RelocKind, format: Format, arch: Arch, in_code: bool) -> Result<Apply, String> {
     if arch == Arch::Wasm32 {
         return crate::wasm::codegen_apply(kind, in_code);
     }
-    Ok(match (kind, arch) {
-        (RelocKind::Abs64, _) => Apply::Abs64,
-        (RelocKind::PcRel32, Arch::X86_64) => Apply::X86Branch32,
-        (RelocKind::GotPcRel32, Arch::X86_64) => Apply::X86GotPcRel32,
-        (RelocKind::Call26, Arch::Aarch64) => Apply::A64Call26,
-        (RelocKind::AdrpPage21, Arch::Aarch64) => Apply::A64Page21,
+    use {Arch::Aarch64 as A64, Arch::X86_64 as X64, Format::*};
+    Ok(match (kind, format, arch) {
+        (RelocKind::Abs64, _, _) => Apply::Abs64,
+        (RelocKind::PcRel32, _, X64) => Apply::X86Branch32,
+        (RelocKind::GotPcRel32, _, X64) => Apply::X86GotPcRel32,
+        (RelocKind::Call26, _, A64) => Apply::A64Call26,
+        (RelocKind::AdrpPage21, _, A64) => Apply::A64Page21,
         // The shift is read from the instruction the field is in: see `a64_lo12_shift`.
-        (RelocKind::PageOffset12, Arch::Aarch64) => Apply::A64Lo12 { shift: u8::MAX },
-        (RelocKind::GotPage21, Arch::Aarch64) => Apply::A64GotPage21,
-        (RelocKind::GotPageOffset12, Arch::Aarch64) => Apply::A64GotLo12,
-        (RelocKind::TlsOffset, _) => Apply::TlsOffset,
-        (kind, arch) => return Err(format!("a {kind:?} relocation in {arch:?} code")),
+        (RelocKind::PageOffset12, _, A64) => Apply::A64Lo12 { shift: u8::MAX },
+        (RelocKind::GotPage21, _, A64) => Apply::A64GotPage21,
+        (RelocKind::GotPageOffset12, _, A64) => Apply::A64GotLo12,
+        (RelocKind::TlsOffset, _, _) => Apply::TlsOffset,
+        (RelocKind::TlsGd32, Elf, X64) => Apply::X86TlsGd32,
+        (RelocKind::TlsGotTpOff32, Elf, X64) => Apply::X86GotTpOff32,
+        (RelocKind::TlvRel32, MachO, X64) => Apply::TlvRel32,
+        (RelocKind::TlvPage21, MachO, A64) => Apply::TlvPage21,
+        (RelocKind::TlvPageOffset12, MachO, A64) => Apply::TlvLo12,
+        (RelocKind::TlsDescPage21, Elf, A64) => Apply::A64TlsDescPage21,
+        (RelocKind::TlsDescLd64Lo12, Elf, A64) => Apply::A64TlsDescLo12,
+        (RelocKind::TlsDescAddLo12, Elf, A64) => Apply::A64TlsDescAdd12,
+        (RelocKind::TlsDescCall, Elf, A64) => Apply::A64TlsDescCall,
+        (RelocKind::TlsIePage21, Elf, A64) => Apply::A64TlsIePage21,
+        (RelocKind::TlsIeLo12, Elf, A64) => Apply::A64TlsIeLo12,
+        (RelocKind::TpHi12, Elf, A64) => Apply::A64TpHi12,
+        (RelocKind::TpLo12, Elf, A64) => Apply::A64TpLo12,
+        (RelocKind::SectionRel32, Pe, _) => Apply::SecRel32,
+        (kind, format, arch) => return Err(format!("a {kind:?} relocation in {format:?} {arch:?} code")),
     })
 }
 
@@ -405,6 +421,36 @@ mod tests {
 
     fn ctx(arch: Arch, s: u64, a: i64, p: u64) -> Ctx {
         Ctx { arch, format: Format::Elf, s, a, p, g: 0, m: 0, base: 0, tls: None }
+    }
+
+    #[test]
+    fn thread_local_kinds_are_valid_only_on_their_format() {
+        use Format::*;
+        let ok = [
+            (RelocKind::TlsGd32, Elf, Arch::X86_64, Apply::X86TlsGd32),
+            (RelocKind::TlsGotTpOff32, Elf, Arch::X86_64, Apply::X86GotTpOff32),
+            (RelocKind::TlvRel32, MachO, Arch::X86_64, Apply::TlvRel32),
+            (RelocKind::TlvPage21, MachO, Arch::Aarch64, Apply::TlvPage21),
+            (RelocKind::TlvPageOffset12, MachO, Arch::Aarch64, Apply::TlvLo12),
+            (RelocKind::TlsDescPage21, Elf, Arch::Aarch64, Apply::A64TlsDescPage21),
+            (RelocKind::TlsDescLd64Lo12, Elf, Arch::Aarch64, Apply::A64TlsDescLo12),
+            (RelocKind::TlsDescAddLo12, Elf, Arch::Aarch64, Apply::A64TlsDescAdd12),
+            (RelocKind::TlsDescCall, Elf, Arch::Aarch64, Apply::A64TlsDescCall),
+            (RelocKind::TlsIePage21, Elf, Arch::Aarch64, Apply::A64TlsIePage21),
+            (RelocKind::TlsIeLo12, Elf, Arch::Aarch64, Apply::A64TlsIeLo12),
+            (RelocKind::TpHi12, Elf, Arch::Aarch64, Apply::A64TpHi12),
+            (RelocKind::TpLo12, Elf, Arch::Aarch64, Apply::A64TpLo12),
+            (RelocKind::SectionRel32, Pe, Arch::X86_64, Apply::SecRel32),
+            (RelocKind::SectionRel32, Pe, Arch::Aarch64, Apply::SecRel32),
+        ];
+        for (kind, format, arch, apply) in ok {
+            assert_eq!(of_kind(kind, format, arch, true), Ok(apply), "{kind:?}");
+            for other in [Elf, MachO, Pe].into_iter().filter(|it| *it != format) {
+                assert!(of_kind(kind, other, arch, true).is_err(), "{kind:?} on {other:?}");
+            }
+        }
+        assert!(of_kind(RelocKind::TlsGd32, Elf, Arch::Aarch64, true).is_err());
+        assert!(of_kind(RelocKind::TlvPage21, MachO, Arch::X86_64, true).is_err());
     }
 
     #[test]

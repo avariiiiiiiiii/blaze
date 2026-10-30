@@ -10,10 +10,10 @@ use rustc_type_ir::inherent::IntoKind;
 
 use crate::{
     mir::{
-        BasicBlock, BasicBlockId, BorrowKind, FieldIndex, InlinedBinding, InlinedScope,
-        InlinedSpan, Local, LocalId, MirBody, MirSpan, MutBorrowKind, Operand, OperandKind,
-        Place, ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, Terminator,
-        TerminatorKind, return_slot, transform::Ctx,
+        BasicBlock, BasicBlockId, BorrowKind, FieldIndex, InlinedBinding, InlinedPromoted,
+        InlinedScope, InlinedSpan, Local, LocalId, MirBody, MirSpan, MutBorrowKind, Operand,
+        OperandKind, Place, ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace,
+        Terminator, TerminatorKind, return_slot, transform::Ctx,
     },
     next_solver::{Region, Ty, TyKind},
 };
@@ -117,6 +117,8 @@ pub(super) fn inline_call<'db>(
                 span,
                 kind: TerminatorKind::Call { args, destination, target, cleanup, .. },
             }) => (span, args, destination, target, cleanup),
+            // The inliner took the call from this terminator; rustc's `inline_call` has a
+            // `bug!` here. The body stays as it was, the call a call.
             other => {
                 body.basic_blocks[site.block].terminator = other;
                 return 0..0;
@@ -149,8 +151,6 @@ pub(super) fn inline_call<'db>(
     } else {
         destination
     };
-    // `_0` may be where a place with projections is wanted, so it is always a local.
-    let destination_local = temps.new_temp(body, destination_ty);
 
     let mut params: Vec<LocalId> = Vec::with_capacity(callee.param_locals.len());
     let mut args = args.into_vec();
@@ -174,6 +174,10 @@ pub(super) fn inline_call<'db>(
             params.push(temps.argument(ctx, body, arg));
         }
     }
+    // `_0` is a place with projections in the callee, so it is a local of the caller: the
+    // destination where that is one no parameter is, else a new one copied into it.
+    let direct = dest.projection.is_empty() && !params.contains(&dest.local);
+    let destination_local = if direct { dest.local } else { temps.new_temp(body, destination_ty) };
 
     // `_0` is the destination, a parameter its argument, any other local a new one of the
     // caller; a new one the callee never marks live or dead is live for the whole call.
@@ -284,13 +288,32 @@ pub(super) fn inline_call<'db>(
     let bindings: Vec<InlinedBinding> = own_bindings.chain(nested_bindings).collect();
     body.inlined.scopes.extend(scopes);
     body.inlined.bindings.extend(bindings);
+    // A promoted constant is of the expression store of the body it was written in, and is
+    // instantiated with that body's arguments: those of its callee.
+    let own_promoted = callee.promoted_locals.iter().map(|&(local, expr)| InlinedPromoted {
+        local: lookup(local),
+        callee: site.callee,
+        expr,
+    });
+    let nested_promoted = callee.inlined.promoted.iter().map(|it| InlinedPromoted {
+        local: lookup(it.local),
+        callee: site.nested[it.callee as usize],
+        expr: it.expr,
+    });
+    let promoted: Vec<InlinedPromoted> = own_promoted.chain(nested_promoted).collect();
+    body.inlined.promoted.extend(promoted);
 
     if let Some(block) = return_block {
         let statements = &mut body.basic_blocks[block].statements;
         statements.reserve(1 + always_live.len() + temps.made.len());
-        let moved =
-            Operand { kind: OperandKind::Move(Place::from(destination_local).store()), span: None };
-        statements.push(Statement { kind: StatementKind::Assign(dest, Rvalue::Use(moved)), span });
+        if !direct {
+            let moved = Operand {
+                kind: OperandKind::Move(Place::from(destination_local).store()),
+                span: None,
+            };
+            statements
+                .push(Statement { kind: StatementKind::Assign(dest, Rvalue::Use(moved)), span });
+        }
         for &local in always_live.iter().rev().chain(temps.made.iter().rev()) {
             statements.push(Statement { kind: StatementKind::StorageDead(local), span });
         }
@@ -300,6 +323,7 @@ pub(super) fn inline_call<'db>(
     caller_block.terminator =
         Some(Terminator { span, kind: TerminatorKind::Goto { target: callee_start } });
 
+    body.promoted_constants.extend(callee.promoted_constants.iter().map(|&it| lookup(it)));
     body.unreached.extend(callee.unreached.iter().map(|&it| map_block(it)));
     body.panic_unwinds.extend(
         callee.panic_unwinds.iter().map(|&(block, at, to)| (map_block(block), at, map_block(to))),

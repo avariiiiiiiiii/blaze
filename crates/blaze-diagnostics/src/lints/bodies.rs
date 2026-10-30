@@ -22,6 +22,7 @@
 //! `compiler/rustc_lint/src/lib.rs` (`BuiltinCombinedLateLintModPass`: the order of the passes)
 //! (MIT or Apache-2.0).
 
+mod bits;
 mod calls;
 mod liveness;
 mod panics;
@@ -33,11 +34,11 @@ mod unsafety;
 
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
-use hir::{InFile, db::HirDatabase};
+use hir::{DefWithBody, InFile, db::HirDatabase};
 use hir_expand::MacroCallKind;
 use hir_def::{
     AdtId, DefWithBodyId, Lookup, ModuleDefId,
-    expr_store::{Body, BodySourceMap, ExpressionStore},
+    expr_store::{Body, BodySourceMap, ExpressionStore, ExpressionStoreDiagnostics},
     hir::{Array, BindingId, Expr, ExprId, Pat, PatId, Statement},
     nameres::demand::every_body,
     signatures::FunctionSignature,
@@ -99,10 +100,13 @@ pub(crate) struct BodyCx<'a, 'db> {
     pub(crate) body: &'db Body,
     pub(crate) source_map: &'db BodySourceMap,
     pub(crate) infer: &'db InferenceResult<'db>,
-    /// rustc's `tainted_by_errors`: type checking the body gave an error, so rustc builds no
-    /// THIR of it and runs none of its MIR lints (match checking, unsafety, liveness, known
-    /// panics).
+    /// rustc's `tainted_by_errors`: type checking the body gave an error, or AST lowering gave
+    /// it an error expression or loop destination, so rustc builds no THIR of it and runs none
+    /// of its MIR lints (match checking, unsafety, liveness, known panics).
     pub(crate) tainted: bool,
+    /// rustc's `mir_built` is `construct_error`'s body, with no lint to give: `tainted`, or
+    /// match checking failed (E0004, E0005), which leaves unsafety checking of the THIR.
+    pub(crate) mir_tainted: bool,
     /// rustc runs `mir_drops_elaborated_and_const_checked` on the body before it aborts, so
     /// its lints (the known-panics lint, a `Drop` impl's `unconditional_recursion`): it makes
     /// code, or the body is in a const context. Set by [`before_abort`].
@@ -123,12 +127,10 @@ impl<'a, 'db> BodyCx<'a, 'db> {
             return None;
         }
         let infer = InferenceResult::of(db, owner);
-        let tainted = infer.diagnostics().iter().any(taints);
-        let mut b = BodyCx { cx, owner, body, source_map, infer, tainted, elaborated: false, exprs: Vec::new() };
-        let mut exprs = Vec::new();
-        b.preorder(body.root_expr(), &mut exprs);
-        b.exprs = exprs;
-        Some(b)
+        let tainted = infer.diagnostics().iter().any(taints) || lowering_failed(db, source_map);
+        let mir_tainted = tainted || DefWithBody::from(owner).match_check_failed(db);
+        let exprs = preorder(&body.store, body.root_expr());
+        Some(BodyCx { cx, owner, body, source_map, infer, tainted, mir_tainted, elaborated: false, exprs })
     }
 
     pub(crate) fn db(&self) -> &'db dyn HirDatabase {
@@ -301,16 +303,22 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         self.code_fact(&mut diag);
         Found::lint(diag, phase, at)
     }
+}
 
-    /// The expressions from `expr` down, in rustc's order ([`Late`]'s).
-    fn preorder(&self, expr: ExprId, out: &mut Vec<ExprId>) {
+/// The expressions from `root` down, in rustc's order ([`Late`]'s): one pass over an explicit
+/// stack, each node's children pushed and then reversed in place, so nothing is allocated per
+/// node and deep bodies need no native stack. Both buffers are sized from the store's count.
+fn preorder(store: &ExpressionStore, root: ExprId) -> Vec<ExprId> {
+    let mut out = Vec::with_capacity(store.expr_count());
+    let mut stack = Vec::with_capacity(64);
+    stack.push(root);
+    while let Some(expr) = stack.pop() {
         out.push(expr);
-        let mut children = Vec::new();
-        child_exprs(self.store(), expr, &mut children);
-        for child in children {
-            stdx::ensure_sufficient_stack(|| self.preorder(child, out));
-        }
+        let start = stack.len();
+        child_exprs(store, expr, &mut stack);
+        stack[start..].reverse();
     }
+    out
 }
 
 /// Whether rustc's type checking of a body taints it for an inference diagnostic: every one
@@ -323,6 +331,29 @@ fn taints(diagnostic: &InferenceDiagnostic) -> bool {
         _ => return true,
     };
     !matches!(path, PathLoweringDiagnostic::ElidedLifetimesInPath { hard_error: false, .. })
+}
+
+/// Whether AST lowering put an error node in the body, which taints its type checking: a
+/// `hir::ExprKind::Err` for `.await` outside `async` (E0728) or for a macro call that did not
+/// resolve or expand (`DummyResult`, `DummyExpander`), and a `break` or `continue` destination
+/// of `LoopIdError::UnresolvedLabel` (E0426, E0767). A `break` outside a loop (E0267, E0268) is
+/// inference's.
+fn lowering_failed(db: &dyn HirDatabase, source_map: &BodySourceMap) -> bool {
+    let errors = source_map.diagnostics().iter().any(|it| {
+        matches!(
+            it,
+            ExpressionStoreDiagnostics::AwaitOutsideOfAsync { .. }
+                | ExpressionStoreDiagnostics::UndeclaredLabel { .. }
+                | ExpressionStoreDiagnostics::UnreachableLabel { .. }
+                | ExpressionStoreDiagnostics::UnresolvedMacroCall { .. }
+        )
+    });
+    errors
+        || source_map.macro_calls().any(|(_, call)| {
+            call.parse_macro_expansion_error(db).is_some_and(|it| {
+                !it.value.is_empty() || it.err.is_some_and(|err| err.render_to_string(db).error)
+            })
+        })
 }
 
 /// The expressions directly in `expr` that are of its body, in the order rustc's HIR visitor
@@ -410,15 +441,18 @@ fn owner_node(db: &dyn HirDatabase, owner: DefWithBodyId) -> InFile<SyntaxNodePt
 }
 
 /// A late lint pass of rustc's, of what it checks in bodies (`rustc_lint::LateLintPass`): each
-/// method is called at each node of each body, before the methods at the nodes in it
-/// (`check_expr_post` after), as `LateContextAndPass` calls them.
+/// method is called at each node of each body, before the methods at the nodes in it, as
+/// `LateContextAndPass` calls them. Passes are boxed once per crate, and only [`Passes`]'
+/// per-hook index lists decide who is called at a node.
 pub(crate) trait LatePass {
     /// rustc's name of the pass (`TypeLimits`), which places it in [`PASS_ORDER`].
     fn name(&self) -> &'static str;
+    /// The methods below the pass has: the walker calls a method only on the passes whose
+    /// hooks have its bit, so a pass costs nothing at the nodes it does not look at.
+    fn hooks(&self) -> Hooks;
     /// The body, before anything in it.
     fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {}
     fn check_expr(&mut self, _b: &BodyCx<'_, '_>, _expr: ExprId, _out: &mut Vec<Found>) {}
-    fn check_expr_post(&mut self, _b: &BodyCx<'_, '_>, _expr: ExprId, _out: &mut Vec<Found>) {}
     /// Statement `index` of the block `block`, before what is in it.
     fn check_stmt(&mut self, _b: &BodyCx<'_, '_>, _block: ExprId, _index: usize, _out: &mut Vec<Found>) {}
     /// The `let` statement `index` of the block `block`, after [`LatePass::check_stmt`] of it.
@@ -426,6 +460,63 @@ pub(crate) trait LatePass {
     /// Arm `index` of the `match` `expr`, before its pattern.
     fn check_arm(&mut self, _b: &BodyCx<'_, '_>, _expr: ExprId, _index: usize, _out: &mut Vec<Found>) {}
     fn check_pat(&mut self, _b: &BodyCx<'_, '_>, _pat: PatId, _out: &mut Vec<Found>) {}
+}
+
+/// Which of [`LatePass`]'s `check_*` methods a pass has, a bit each.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Hooks(u8);
+
+impl Hooks {
+    pub(crate) const BODY: Hooks = Hooks(1 << 0);
+    pub(crate) const EXPR: Hooks = Hooks(1 << 1);
+    pub(crate) const STMT: Hooks = Hooks(1 << 2);
+    pub(crate) const LOCAL: Hooks = Hooks(1 << 3);
+    pub(crate) const ARM: Hooks = Hooks(1 << 4);
+    pub(crate) const PAT: Hooks = Hooks(1 << 5);
+
+    fn has(self, hook: Hooks) -> bool {
+        self.0 & hook.0 != 0
+    }
+}
+
+impl std::ops::BitOr for Hooks {
+    type Output = Hooks;
+
+    fn bitor(self, other: Hooks) -> Hooks {
+        Hooks(self.0 | other.0)
+    }
+}
+
+/// The passes, in [`PASS_ORDER`], and for each hook the indices of those that have it, in the
+/// same order: what [`Late`] calls at a node is one slice of `u8`s, built once per crate.
+/// A pass index is a `u8` (at most 64 passes, asserted).
+struct Passes {
+    all: Vec<Box<dyn LatePass>>,
+    body: Vec<u8>,
+    expr: Vec<u8>,
+    stmt: Vec<u8>,
+    local: Vec<u8>,
+    arm: Vec<u8>,
+    pat: Vec<u8>,
+}
+
+const _: () = assert!(PASS_ORDER.len() <= 64);
+
+impl Passes {
+    fn new(all: Vec<Box<dyn LatePass>>) -> Passes {
+        let with = |hook: Hooks| -> Vec<u8> {
+            (0..all.len()).filter(|&i| all[i].hooks().has(hook)).map(|i| i as u8).collect()
+        };
+        Passes {
+            body: with(Hooks::BODY),
+            expr: with(Hooks::EXPR),
+            stmt: with(Hooks::STMT),
+            local: with(Hooks::LOCAL),
+            arm: with(Hooks::ARM),
+            pat: with(Hooks::PAT),
+            all,
+        }
+    }
 }
 
 /// The late passes of rustc's that look at bodies, in the order `BuiltinCombinedLateLintModPass`
@@ -464,8 +555,8 @@ const PASS_ORDER: &[&str] = &[
     "RawBorrowsViaReferences",
 ];
 
-/// Every late pass of the children, in rustc's order.
-fn late_passes() -> Vec<Box<dyn LatePass>> {
+/// Every late pass of the children, in rustc's order, indexed by hook.
+fn late_passes() -> Passes {
     let mut passes: Vec<Box<dyn LatePass>> = Vec::new();
     passes.extend(types::passes());
     passes.extend(calls::passes());
@@ -477,21 +568,22 @@ fn late_passes() -> Vec<Box<dyn LatePass>> {
             .unwrap_or_else(|| panic!("the late pass `{name}` is not in `PASS_ORDER`"))
     };
     radix::sort_by_key(&mut passes, |it| place(it));
-    passes
+    Passes::new(passes)
 }
 
 /// rustc's `LateContextAndPass` over one body: every pass at each node, in its visitor's order.
 struct Late<'s, 'a, 'db> {
     b: &'s BodyCx<'a, 'db>,
-    passes: &'s mut [Box<dyn LatePass>],
+    passes: &'s mut Passes,
     out: &'s mut Vec<Found>,
 }
 
 impl Late<'_, '_, '_> {
     fn body(&mut self) {
         let b = self.b;
-        for pass in self.passes.iter_mut() {
-            pass.check_body(b, self.out);
+        let Passes { all, body, .. } = &mut *self.passes;
+        for &i in body.iter() {
+            all[usize::from(i)].check_body(b, self.out);
         }
         for param in b.body.params.iter() {
             self.pat(param.user_written);
@@ -501,13 +593,11 @@ impl Late<'_, '_, '_> {
 
     fn expr(&mut self, expr: ExprId) {
         let b = self.b;
-        for pass in self.passes.iter_mut() {
-            pass.check_expr(b, expr, self.out);
+        let Passes { all, expr: on, .. } = &mut *self.passes;
+        for &i in on.iter() {
+            all[usize::from(i)].check_expr(b, expr, self.out);
         }
         stdx::ensure_sufficient_stack(|| self.expr_children(expr));
-        for pass in self.passes.iter_mut() {
-            pass.check_expr_post(b, expr, self.out);
-        }
     }
 
     fn expr_children(&mut self, expr: ExprId) {
@@ -523,13 +613,15 @@ impl Late<'_, '_, '_> {
                     if let Statement::Item(_) = statement {
                         continue;
                     }
-                    for pass in self.passes.iter_mut() {
-                        pass.check_stmt(b, expr, index, self.out);
+                    let Passes { all, stmt, .. } = &mut *self.passes;
+                    for &i in stmt.iter() {
+                        all[usize::from(i)].check_stmt(b, expr, index, self.out);
                     }
                     match statement {
                         Statement::Let { pat, initializer, else_branch, .. } => {
-                            for pass in self.passes.iter_mut() {
-                                pass.check_local(b, expr, index, self.out);
+                            let Passes { all, local, .. } = &mut *self.passes;
+                            for &i in local.iter() {
+                                all[usize::from(i)].check_local(b, expr, index, self.out);
                             }
                             if let Some(it) = initializer {
                                 self.expr(*it);
@@ -550,8 +642,9 @@ impl Late<'_, '_, '_> {
             Expr::Match { expr: scrutinee, arms } => {
                 self.expr(scrutinee);
                 for (index, arm) in arms.iter().enumerate() {
-                    for pass in self.passes.iter_mut() {
-                        pass.check_arm(b, expr, index, self.out);
+                    let Passes { all, arm: on, .. } = &mut *self.passes;
+                    for &i in on.iter() {
+                        all[usize::from(i)].check_arm(b, expr, index, self.out);
                     }
                     self.pat(arm.pat);
                     if let Some(guard) = arm.guard {
@@ -572,19 +665,16 @@ impl Late<'_, '_, '_> {
             }
             Expr::Array(Array::Repeat { initializer, .. }) => self.expr(initializer),
             _ => {
-                let mut children = Vec::new();
-                store.walk_child_exprs_without_pats(expr, |it| children.push(it));
-                for child in children {
-                    self.expr(child);
-                }
+                store.walk_child_exprs_without_pats(expr, |it| self.expr(it));
             }
         }
     }
 
     fn pat(&mut self, pat: PatId) {
         let b = self.b;
-        for pass in self.passes.iter_mut() {
-            pass.check_pat(b, pat, self.out);
+        let Passes { all, pat: on, .. } = &mut *self.passes;
+        for &i in on.iter() {
+            all[usize::from(i)].check_pat(b, pat, self.out);
         }
         let store = b.store();
         match store.pat(pat) {
@@ -598,11 +688,7 @@ impl Late<'_, '_, '_> {
                 }
             }
             _ => {
-                let mut children = Vec::new();
-                store.walk_pats_shallow(pat, |it| children.push(it));
-                for child in children {
-                    self.pat(child);
-                }
+                store.walk_pats_shallow(pat, |it| self.pat(it));
             }
         }
     }

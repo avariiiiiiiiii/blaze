@@ -27,7 +27,7 @@ use smallvec::SmallVec;
 
 use super::{between, can_be_used_for_suggestions, edition, end_point, significant_drop::SignificantDrops};
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Level, Span, SuggestionStyle},
 };
@@ -55,6 +55,10 @@ pub(crate) struct IfLetRescope {
 impl LatePass for IfLetRescope {
     fn name(&self) -> &'static str {
         "IfLetRescope"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::BODY | Hooks::EXPR
     }
 
     fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {

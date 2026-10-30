@@ -4,7 +4,7 @@
 //! script runs it is linked with (cargo's `to_link`) as a second CSR list, and the units built
 //! for build scripts and proc macros as a bitset.
 //!
-//! Cost: 4 bytes per edge, 4 per link edge, 9 per unit, `N/8` bytes per bitset. Every walk
+//! Cost: 8 bytes per edge (each way), 4 per link edge, 13 per unit, `N/8` bytes per bitset. Every walk
 //! (`closure`, `linked_in`) is one pass with a bitset of `N/64` words and no other allocation.
 //! Building it is `O(N + E)` plus cargo's `to_link` once per unit with one shared memo.
 
@@ -55,6 +55,76 @@ impl Bits {
     pub(crate) fn contains(&self, at: u32) -> bool {
         self.0.get(at as usize / 64).is_some_and(|word| word >> (at % 64) & 1 == 1)
     }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+/// For each unit, how many build script runs of its closure are not applied yet: once none
+/// is, what its crate is made from is final. Kept by the writer, which alone applies runs.
+///
+/// Built with one walk up the dependents per run, `O(R · (N + E))`; each run applied costs
+/// the units it reaches, with nothing allocated.
+pub(crate) struct Waits {
+    /// By unit.
+    left: Vec<u32>,
+    /// The units whose closure holds run `r`: `waiting[start[r]..start[r + 1]]`, empty for a
+    /// unit that is no run.
+    start: Vec<u32>,
+    waiting: Vec<u32>,
+    applied: Bits,
+}
+
+impl Waits {
+    pub(crate) fn new(graph: &Graph) -> Waits {
+        let count = graph.len();
+        let mut left = vec![0u32; count];
+        let mut start = Vec::with_capacity(count + 1);
+        let mut waiting = Vec::new();
+        let mut seen = Bits::new(count);
+        let mut pending = Vec::new();
+        start.push(0);
+        for run in 0..count as u32 {
+            if graph.has(run, flag::RUN) {
+                seen.clear();
+                seen.insert(run);
+                pending.push(run);
+                while let Some(at) = pending.pop() {
+                    for &up in graph.dependents(at) {
+                        if seen.insert(up) {
+                            pending.push(up);
+                            waiting.push(up);
+                            left[up as usize] += 1;
+                        }
+                    }
+                }
+            }
+            start.push(waiting.len() as u32);
+        }
+        Waits { left, start, waiting, applied: Bits::new(count) }
+    }
+
+    /// Whether `unit` waits on no run.
+    pub(crate) fn ready(&self, unit: u32) -> bool {
+        self.left.get(unit as usize) == Some(&0)
+    }
+
+    /// Run `run` applied: the units it was the last run left for go into `ready`. A run applied
+    /// again changes nothing.
+    pub(crate) fn applied(&mut self, run: u32, ready: &mut Vec<u32>) {
+        if run as usize >= self.left.len() || !self.applied.insert(run) {
+            return;
+        }
+        let range = self.start[run as usize] as usize..self.start[run as usize + 1] as usize;
+        for &unit in &self.waiting[range] {
+            let left = &mut self.left[unit as usize];
+            *left -= 1;
+            if *left == 0 {
+                ready.push(unit);
+            }
+        }
+    }
 }
 
 pub(crate) struct Graph {
@@ -62,6 +132,9 @@ pub(crate) struct Graph {
     /// packages' ids, as cargo's `build_map` visits them.
     dep_start: Vec<u32>,
     deps: Vec<u32>,
+    /// The units depending on unit `i`: `up[up_start[i]..up_start[i + 1]]`, in unit order.
+    up_start: Vec<u32>,
+    up: Vec<u32>,
     /// The runs of build scripts unit `i` is linked with, in cargo's order:
     /// `links[link_start[i]..link_start[i + 1]]`.
     link_start: Vec<u32>,
@@ -130,9 +203,27 @@ impl Graph {
             deps[from..].sort_by(|a, b| all[*a as usize].pkg_id.cmp(&all[*b as usize].pkg_id));
             dep_start.push(deps.len() as u32);
         }
+        // The dependents, by a counting sort of the edges on their dependency.
+        let mut up_start = vec![0u32; count + 1];
+        for &dep in &deps {
+            up_start[dep as usize + 1] += 1;
+        }
+        for at in 0..count {
+            up_start[at + 1] += up_start[at];
+        }
+        let mut next = up_start.clone();
+        let mut up = vec![0u32; deps.len()];
+        for from in 0..count {
+            for &dep in &deps[dep_start[from] as usize..dep_start[from + 1] as usize] {
+                up[next[dep as usize] as usize] = from as u32;
+                next[dep as usize] += 1;
+            }
+        }
         let mut graph = Graph {
             dep_start,
             deps,
+            up_start,
+            up,
             link_start: Vec::with_capacity(count + 1),
             links: Vec::new(),
             package,
@@ -205,6 +296,13 @@ impl Graph {
     pub(crate) fn deps(&self, at: u32) -> &[u32] {
         let at = at as usize;
         &self.deps[self.dep_start[at] as usize..self.dep_start[at + 1] as usize]
+    }
+
+    /// The units depending on `at` directly.
+    #[inline]
+    pub(crate) fn dependents(&self, at: u32) -> &[u32] {
+        let at = at as usize;
+        &self.up[self.up_start[at] as usize..self.up_start[at + 1] as usize]
     }
 
     /// The build script runs `at` is linked with, in cargo's order.

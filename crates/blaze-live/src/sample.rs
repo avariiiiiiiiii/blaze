@@ -15,6 +15,8 @@
 //! split between them as their time does, and the sampler costs the same however many
 //! threads the program runs.
 
+#![allow(unsafe_code)]
+
 use std::{
     collections::HashMap,
     ops::Range,
@@ -250,6 +252,7 @@ fn counters(used: u64) -> Vec<(u32, u64)> {
         .collect()
 }
 
+#[allow(clippy::print_stderr, reason = "a profile the sampler can't write is said on stderr")]
 fn write(dir: &Path, profile: &Profile) {
     let path = dir.join(format::PROFILE);
     let partial = dir.join(format!("{}.{}", format::PROFILE, profile.pid));

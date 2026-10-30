@@ -1,7 +1,14 @@
 //! Patches the memory of a PE program on Windows x86-64.
+//!
+//! A patch's code and data are committed in the room behind the image and written before
+//! anything reaches them; its jumps and statics are written over the image with every other
+//! thread suspended ([`stop`], `crate::apply`).
+
+#![allow(unsafe_code)]
+
+mod stop;
 
 use std::{
-    collections::HashMap,
     ffi::c_void,
     path::{Path, PathBuf},
     sync::mpsc::{Receiver, TryRecvError},
@@ -10,6 +17,7 @@ use std::{
 
 use crate::{
     Outcome,
+    apply::{self, Broke, Failed, Overwrites, Plan, Step},
     format::{self, Body, Code, Patch, Process},
 };
 
@@ -21,6 +29,9 @@ unsafe extern "system" {
     fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
     fn FlushInstructionCache(process: *mut c_void, address: *const c_void, size: usize) -> i32;
     fn RtlAddFunctionTable(table: *const u8, count: u32, base: u64) -> u8;
+    fn VirtualQuery(address: *const c_void, info: *mut MemoryBasicInformation, len: usize)
+    -> usize;
+    fn GetLastError() -> u32;
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     fn CreateEventW(
@@ -42,8 +53,7 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 const WAIT_TIMEOUT: u32 = 0x102;
 const WAIT_OBJECT_0: u32 = 0;
 const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
-/// A `RUNTIME_FUNCTION`: where a function starts, ends, and has its unwind information.
-const FUNCTION: u64 = 12;
+const PAGE_GUARD: u32 = 0x100;
 const PAGE: u64 = 4096;
 /// What `VirtualAlloc` reserves at: an address it is asked for is rounded down to it.
 const GRANULE: u64 = 64 << 10;
@@ -59,8 +69,8 @@ pub(crate) struct Live {
     loaded: u64,
     process: Process,
     patches: Receiver<(Patch, Instant)>,
-    originals: HashMap<u64, Vec<u8>>,
-    written: HashMap<u64, usize>,
+    overwrites: Overwrites,
+    threads: stop::Threads,
     sequence: u64,
     /// How long the executable's image is from `loaded`: every write over it is checked to be
     /// in it.
@@ -90,8 +100,8 @@ impl Live {
             slide,
             loaded,
             process,
-            originals: HashMap::new(),
-            written: HashMap::new(),
+            overwrites: Overwrites::default(),
+            threads: stop::Threads::new(),
             sequence: 0,
             image_len: image.len,
         };
@@ -150,100 +160,55 @@ impl Live {
                         took: start.elapsed(),
                         waited,
                     },
-                    Err(why) => Outcome::Declined(why),
+                    Err(Failed::Declined(why)) => Outcome::Declined(why),
+                    Err(Failed::Restart(why)) => Outcome::Restart(why),
                 }
             }
         })
     }
 
-    fn apply(&mut self, code: &Code) -> Result<(), String> {
-        let text_len = code.text.len() as u64;
-        let data_len = code.data.len() as u64;
-        let len = (text_len + data_len).next_multiple_of(PAGE);
-        let end = code.base.checked_add(len).ok_or("patch address overflow")?;
-        if code.base < self.process.next || end > self.process.end {
-            return Err(format!(
-                "laid out at {:#x}, where this program has no room: build again",
-                code.base
-            ));
-        }
-        if !(code.base.is_multiple_of(PAGE) && text_len.is_multiple_of(PAGE)) {
-            return Err("a patch whose code is not whole pages".to_owned());
-        }
-        // Every write over the executable is checked before anything is mapped or written.
+    fn apply(&mut self, code: &Code) -> Result<(), Failed> {
+        // Every write over the executable is checked, and planned, before anything is mapped.
         let image = self.loaded..self.loaded.saturating_add(self.image_len);
-        for write in &code.writes {
-            let address = write.address.wrapping_add(self.slide);
-            let range = address..address.saturating_add(write.bytes.len() as u64);
-            if range.start < image.start || range.end > image.end {
-                return Err(format!(
-                    "a write at {:#x}..{:#x}, outside the executable at {:#x}..{:#x}",
-                    range.start, range.end, image.start, image.end
-                ));
-            }
-        }
+        apply::in_image(&code.writes, self.slide, &image)?;
+        let plan = self.overwrites.plan(code, self.slide)?;
+        readable(&plan)?;
+        // From here the room up to `end` is used, whatever becomes of the patch: jumps or the
+        // unwinder may reach what is committed there.
+        let end = apply::claim(&mut self.process, code, PAGE)?;
+        let len = end - code.base;
         // A patch that only puts back what earlier ones wrote has nothing to map.
         let mapped = if len == 0 { Ok(()) } else { self.map(code, len) };
-        // From the commit on, jumps or the unwinder may reach this memory, done or not: the
-        // room up to `end` is used either way.
-        let applied = mapped.and_then(|()| self.redirect(code));
-        self.process.next = end;
-        let published = self.publish();
+        let applied = mapped.map_err(Failed::from).and_then(|()| self.redirect(&plan));
+        let published = self.publish().map_err(Failed::from);
         applied.and(published)
     }
 
     /// Writes the patch's jumps and statics, and puts back what the last patch wrote and this
-    /// one does not.
-    fn redirect(&mut self, code: &Code) -> Result<(), String> {
-        let kept: std::collections::HashSet<u64> =
-            code.writes.iter().map(|it| it.address).collect();
-        let undone: Vec<u64> =
-            self.written.keys().copied().filter(|it| !kept.contains(it)).collect();
-        for address in undone {
-            let original = self.originals[&address].clone();
-            self.write(address, &original)?;
-            self.written.remove(&address);
-        }
-        for write in &code.writes {
-            let mut bytes = write.bytes.clone();
-            for &pointer in &write.pointers {
-                slide_at(&mut bytes, pointer as usize, self.slide)?;
+    /// one does not, with every other thread suspended and none inside the bytes written.
+    fn redirect(&mut self, plan: &Plan) -> Result<(), Failed> {
+        let read = |address: u64, into: &mut [u8]| {
+            // SAFETY: the bytes are a step's, in one committed, readable region of the
+            // executable's image (`apply::in_image`, `readable`), loaded as long as the process
+            // runs; every other thread is suspended, so nothing writes them meanwhile, and
+            // `into` is the originals' own buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(address as *const u8, into.as_mut_ptr(), into.len())
             }
-            let address = write.address.wrapping_add(self.slide);
-            let original = self.originals.entry(address).or_default();
-            if original.len() < bytes.len() {
-                let start = original.len();
-                // SAFETY: `address..address + bytes.len()` is in the executable's image
-                // (`apply` checked it against `loaded..loaded + image_len`), loaded as long as
-                // the process runs; only this thread writes code there. A static another thread
-                // writes meanwhile races this read (the rule `Live::poll` gives the program).
-                let more = unsafe {
-                    std::slice::from_raw_parts(
-                        (address + start as u64) as *const u8,
-                        bytes.len() - start,
-                    )
-                };
-                original.extend_from_slice(more);
-            }
-            let last = self.written.get(&address).copied().unwrap_or(0);
-            if last > bytes.len() {
-                bytes.extend_from_slice(&original[bytes.len()..last]);
-            }
-            self.write(address, &bytes)?;
-            self.written.insert(address, write.bytes.len());
-        }
-        Ok(())
+        };
+        let write = |_: usize, step: &Step| put(step);
+        apply::write_stopped(&mut self.threads, &mut self.overwrites, plan, false, read, write)
     }
 
     /// Maps the code and data of the patch, `len` bytes, where it was laid out.
     fn map(&self, code: &Code, len: u64) -> Result<(), String> {
         let text_len = code.text.len() as u64;
         let mapped = code.base.wrapping_add(self.slide);
-        // SAFETY: commits `len` bytes at the page-aligned `mapped` (checked), in the room
-        // `reserve` reserved, within `process.next..process.end` (checked by `apply`), so no
-        // earlier patch's code a thread may run is in them; the room is never released, and a
-        // failed apply moves `next` past this patch all the same, so it lives unchanged as long
-        // as the process.
+        // SAFETY: commits `len` bytes at the page-aligned `mapped` (`code.base` whole pages),
+        // in the room `reserve` reserved, above every earlier patch (`apply::claim` checked
+        // `process.next..process.end` and moved `next` past it), so no earlier patch's code a
+        // thread may run is in them; the room is never released, and no later patch is laid
+        // out here.
         let result = unsafe {
             VirtualAlloc(mapped as *mut c_void, len as usize, MEM_COMMIT, PAGE_READWRITE)
         };
@@ -260,7 +225,7 @@ impl Live {
         memory[..code.text.len()].copy_from_slice(&code.text);
         memory[code.text.len()..code.text.len() + code.data.len()].copy_from_slice(&code.data);
         for &pointer in &code.pointers {
-            slide_at(memory, pointer as usize, self.slide)?;
+            apply::slide_at(memory, pointer, self.slide)?;
         }
         if text_len != 0 {
             let mut old = 0;
@@ -288,72 +253,31 @@ impl Live {
             // memory.
             unsafe { FlushInstructionCache(process, mapped as *const c_void, text_len as usize) };
         }
-        self.register_functions(mapped, len, code.frames)
+        self.register_functions(mapped, memory, code.frames)
     }
 
-    /// Has the unwinder find the functions of the patch, whose table at `start` of the code is
+    /// Has the unwinder find the functions of the patch, whose table at `code.frames` is
     /// sorted and relative to where the image is loaded: a Rust panic unwinds through them.
+    /// `memory` is the patch, committed at `mapped`.
     fn register_functions(
         &self,
         mapped: u64,
-        patch: u64,
-        (start, len): (u64, u64),
+        memory: &[u8],
+        frames: (u64, u64),
     ) -> Result<(), String> {
-        if len == 0 {
+        let patch = mapped.wrapping_sub(self.loaded);
+        let count = apply::functions(memory, frames, patch)?;
+        if count == 0 {
             return Ok(());
         }
-        if !len.is_multiple_of(FUNCTION) || !start.is_multiple_of(4) {
-            return Err("a table of functions that is not whole entries".to_owned());
-        }
-        if start.checked_add(len).is_none_or(|end| end > patch) {
-            return Err("a table of functions past the end of the patch".to_owned());
-        }
-        let table = (mapped + start) as *const u8;
-        // SAFETY: `len / FUNCTION` RUNTIME_FUNCTIONs at the 4-aligned `mapped + start`, inside
-        // the patch's `patch` bytes (checked above), which are never released or rewritten
-        // (`apply` moves `next` past them even when it fails); their addresses are relative to
-        // `loaded`.
-        if unsafe { RtlAddFunctionTable(table, (len / FUNCTION) as u32, self.loaded) } == 0 {
+        let table = memory[frames.0 as usize..].as_ptr();
+        // SAFETY: `count` RUNTIME_FUNCTIONs at the 4-aligned `table`, inside the patch, each
+        // naming a function and unwind information inside it relative to `loaded`
+        // (`apply::functions`); the patch is never released or rewritten (`apply::claim` moved
+        // `next` past it before it was committed).
+        if unsafe { RtlAddFunctionTable(table, count, self.loaded) } == 0 {
             return Err("the unwinder refused the patch's table of functions".to_owned());
         }
-        Ok(())
-    }
-
-    fn write(&self, address: u64, bytes: &[u8]) -> Result<(), String> {
-        let mut old = 0;
-        // SAFETY: `address..address + bytes.len()` is in the executable's image (checked by
-        // `apply`); PAGE_EXECUTE_READWRITE keeps read and run, so a thread running code on
-        // those pages keeps running; `old` is given back below.
-        let writable = unsafe {
-            VirtualProtect(address as *mut c_void, bytes.len(), PAGE_EXECUTE_READWRITE, &mut old)
-        };
-        if writable == 0 {
-            return Err(format!(
-                "making {address:#x} writable: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: the bytes were made writable above; `bytes` is the caller's buffer, so they
-        // don't overlap, and a byte copy needs no alignment. NOT upheld: a jump is written over
-        // a function's first bytes while other threads may be running them, and a static while
-        // they may use it (the jump-table design in `slots` never writes over code a thread
-        // can be in).
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
-        let mut was = 0;
-        // SAFETY: the same bytes as above, given back the protection `old` that VirtualProtect
-        // said they had; nothing holds a reference into them.
-        if unsafe { VirtualProtect(address as *mut c_void, bytes.len(), old, &mut was) } == 0 {
-            return Err(format!(
-                "restoring protection at {address:#x}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: it takes nothing and returns this process's pseudo-handle, which needs no
-        // closing.
-        let process = unsafe { GetCurrentProcess() };
-        // SAFETY: flushes the instruction cache over the bytes just written; it changes no
-        // memory.
-        unsafe { FlushInstructionCache(process, address as *const c_void, bytes.len()) };
         Ok(())
     }
 
@@ -567,11 +491,92 @@ fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
     Some((meta.modified().ok()?, meta.len()))
 }
 
-fn slide_at(bytes: &mut [u8], at: usize, slide: u64) -> Result<(), String> {
-    let field = bytes.get_mut(at..at + 8).ok_or("an address past the end of the patch")?;
-    let value =
-        u64::from_le_bytes(field.try_into().map_err(|_| "an address shorter than 8 bytes")?);
-    field.copy_from_slice(&value.wrapping_add(slide).to_le_bytes());
+#[repr(C)]
+#[allow(dead_code)]
+struct MemoryBasicInformation {
+    base: *mut c_void,
+    allocation_base: *mut c_void,
+    allocation_protect: u32,
+    partition: u16,
+    size: usize,
+    state: u32,
+    protect: u32,
+    kind: u32,
+}
+
+/// Checks, before the threads are suspended, that each step of `plan` is in one committed,
+/// readable region: its originals are read with the threads suspended.
+fn readable(plan: &Plan) -> Result<(), String> {
+    for step in &plan.steps {
+        let end = step.address + step.bytes.len() as u64;
+        let mut info = MemoryBasicInformation {
+            base: std::ptr::null_mut(),
+            allocation_base: std::ptr::null_mut(),
+            allocation_protect: 0,
+            partition: 0,
+            size: 0,
+            state: 0,
+            protect: 0,
+            kind: 0,
+        };
+        let len = size_of::<MemoryBasicInformation>();
+        // SAFETY: `info` is a whole MEMORY_BASIC_INFORMATION.
+        if unsafe { VirtualQuery(step.address as *const c_void, &mut info, len) } != len {
+            return Err(format!(
+                "querying {:#x}: {}",
+                step.address,
+                std::io::Error::last_os_error()
+            ));
+        }
+        let region = info.base as u64..(info.base as u64).saturating_add(info.size as u64);
+        let protect = info.protect & 0xff;
+        if info.state != MEM_COMMIT
+            || end > region.end
+            || protect == PAGE_NOACCESS
+            || info.protect & PAGE_GUARD != 0
+        {
+            return Err(format!(
+                "a write at {:#x}..{end:#x}, in no one readable region of the executable",
+                step.address
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Writes `step` over the image: made writable for the write, given its protection back,
+/// and the instruction cache flushed over it. Called with every other thread suspended; it
+/// allocates nothing.
+fn put(step: &Step) -> Result<(), Broke> {
+    let (address, len) = (step.address as *mut c_void, step.bytes.len());
+    let broke = |what, written| Broke {
+        what,
+        at: step.address,
+        // SAFETY: it takes nothing.
+        code: i64::from(unsafe { GetLastError() }),
+        written,
+    };
+    let mut old = 0;
+    // SAFETY: the bytes are in one committed region of the executable's image (`readable`);
+    // PAGE_EXECUTE_READWRITE keeps read and run; `old` is given back below.
+    if unsafe { VirtualProtect(address, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+        return Err(broke("making the executable writable", false));
+    }
+    // SAFETY: the bytes were made writable above; every other thread is suspended and none
+    // inside them (`apply::write_stopped`), so nothing runs, reads or writes them meanwhile.
+    // `bytes` is the plan's own buffer.
+    unsafe { std::ptr::copy_nonoverlapping(step.bytes.as_ptr(), address as *mut u8, len) };
+    let mut was = 0;
+    // SAFETY: the same bytes, given back the protection `old` VirtualProtect said they had.
+    if unsafe { VirtualProtect(address, len, old, &mut was) } == 0 {
+        return Err(broke("protecting the executable again", true));
+    }
+    // SAFETY: it takes nothing and returns this process's pseudo-handle, which needs no
+    // closing.
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: flushes the instruction cache over the bytes just written; it changes no
+    // memory.
+    unsafe { FlushInstructionCache(process, address, len) };
     Ok(())
 }
 

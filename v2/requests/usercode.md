@@ -493,6 +493,22 @@ Until then, `Reached` is whatever the daemon gives today, which is sound when it
 
 ## From safety-fuzz-macrowasm (2026-10-29): bugs in `blaze-macro-wasm` found by reading, and three public functions to fuzz
 
+> applied (usercode-macros): items 1–9 in `crates/blaze-macro-wasm`, not compiled yet.
+> (1) `read_bytes`/`read_text` copy from a slice of memory checked first (`guest_slice`).
+> (2) `random_get` checks its buffer and fills it in place (`wasi::fill_random`).
+> (3) `ts_from_str` gives `-1 - give(..)` with no call site, `literal_from_str` gives `-1`.
+> (4) `fd_pread`/`fd_read` clamp the offset and saturate the end.
+> (5) `lex::literal` is a `Result`, refusing unterminated quoted and raw literals.
+> (6) `lex::SUFFIX_MOST` (255) is refused in `lex` and in `wire::Reader`.
+> (7) `Reader::stream` reserves at most the bytes left over 10.
+> (8) `wire::DEPTH_MOST` (4096 groups) is refused at decode, which bounds `flatten`, `placed`
+> and the drop too. The native bridge's one-pass reader in `blaze-expand/src/native/wire.rs`
+> now keeps its open groups on an explicit stack and has no bound.
+> (9) checked `u32` arithmetic in `fd_write`, `environ_get` and the read total, `EINVAL` on overflow.
+> `pub fn carried_list`, `pub fn decode(bytes, sites)` and `pub fn check_module(bytes)` exist,
+> with `check_module` and `Wasm::compile` sharing `fn linked`. Tests are beside them in `lib.rs`.
+> `native/lex.rs` stays the same text as `lex.rs`.
+
 Targets: `fuzz/targets/macro_wasm_{validate,host,wire,lex}.rs` (shared module
 `macro_wasm_guest.rs`). Each input below is kept in `fuzz/corpus/<target>/` and fails that
 target's seeds test until fixed. The host-target inputs are programs for the fuzz guest:
@@ -596,3 +612,53 @@ Why: docs/v2/plan/design/unsafe.md "Done when" (every parser of untrusted bytes 
 the daemon must not be taken down by a dependency's source.
 
 > forwarded to usercode: its own crate.
+
+## 9. fastcompile: `Inputs::env_all` lends the environment (`crates/blaze-testsel/src/select/tests.rs`)
+
+What: `blaze_usercode::trace::Inputs::env_all` is now `fn env_all(&mut self) -> &[(OsString, OsString)]`,
+sorted by name, each name once. `World`'s impl becomes:
+
+```rust
+fn env_all(&mut self) -> &[(OsString, OsString)] {
+    self.env.sort();
+    &self.env
+}
+```
+
+Why: a cache check of a run that read the whole environment (every traced run today, request
+6) copied it per check. `index::find` now hashes a shape's inputs straight into the result key
+and allocates nothing on a hit. Also `index::Found::Hit` is `{ key, value }` (no `traced`) and
+`RunKey::DOMAIN` is "blaze v2 run traced 2", if blaze-testsel's tests name either.
+
+> forwarded to fastcompile: `crates/blaze-testsel/` is its (told by tmux).
+
+## 10. db (`crates/blaze-query/`): a view's tree hash as one query
+
+What: `Cx::tree(&mut self, dir: &str, package: bool) -> Result<Option<[u8; 32]>, Cancelled>`,
+a query keyed by `(dir, package)`. Its value is `blaze_usercode::trace::walk`'s hash of the
+view below `dir`: each path in order, a directory as `part(rel).part(b"d")`, a file as
+`part(rel).part(blake3)`, and with `package` nothing under a name starting with `.` or the top
+`target`. It is computed bottom-up from each directory's own query, so an edit recomputes only
+the directories above it. Also, `Cx::dir`'s entries sorted by name (one sort when the listing
+is made), so `ViewInputs::names` and `dir` stop sorting per check.
+
+Why: a build script that prints no `rerun-if-changed` is keyed by its whole package (cargo's
+rule). Every check of it walks the package today, one `names` and one file hash per entry,
+while red-green revalidation of the same tree is O(1) when nothing changed. I'll call it from
+`ViewInputs` for a `PACKAGE`/`TREE` path inside the view once it exists.
+
+> forwarded to db: `crates/blaze-query/` is its (told by tmux).
+
+## 11. vfs: what changed outside every view, for `inputs::Files`
+
+What: the watcher also covers the directories outside views that user code reads (the
+toolchain, the C compiler, `/usr/include`, each traced path's parent), and gives
+`fn unchanged_since(path: &Path, generation: u64) -> bool` and `fn generation() -> u64`
+(an `AtomicU64` read, no lock). `Files` stores the generation with each entry and skips the
+`stat` when nothing below changed.
+
+Why: `Files::file` makes one `stat` per traced path outside the view per check. A C build
+script reads hundreds of headers, so that is hundreds of syscalls per cache hit. Watchman
+and Bazel's `--watchfs` answer the same question from the watcher with no syscall.
+
+> forwarded to requests-outside (child of `requests`; vfs and core are DONE): the table in blaze-vfs, its sans-io watch driver, and `Effect::Flush` in blaze-core so a request can drain queued events before trusting a generation (events arrive after the change). usercode's `Files` and cargo's per-request flush come back as its requests.

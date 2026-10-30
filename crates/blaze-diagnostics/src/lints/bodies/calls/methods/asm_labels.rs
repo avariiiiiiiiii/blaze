@@ -23,7 +23,7 @@ use syntax::{AstNode, SyntaxNodePtr, TextRange, ast};
 
 use crate::{
     cx::Cx,
-    lints::bodies::{BodyCx, LatePass},
+    lints::bodies::{BodyCx, Hooks, LatePass},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -65,6 +65,10 @@ fn asm_arch(cx: &Cx<'_, '_>) -> Option<Arch> {
 impl LatePass for AsmLabels {
     fn name(&self) -> &'static str {
         "AsmLabels"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

@@ -25,7 +25,7 @@ use syntax::{AstNode, ast};
 
 use super::{Inits, has_attr, layout, peel_casts, span, ty_text};
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -41,6 +41,10 @@ pub(super) struct DanglingPointers {
 impl LatePass for DanglingPointers {
     fn name(&self) -> &'static str {
         "DanglingPointers"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::BODY | Hooks::EXPR
     }
 
     fn check_body(&mut self, b: &BodyCx<'_, '_>, out: &mut Vec<Found>) {

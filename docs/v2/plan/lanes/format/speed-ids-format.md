@@ -23,13 +23,21 @@ NEON and SSE4.1, 8 on AVX2, 16 on AVX-512), which is how BLAKE3 hashes chunks an
   pointer compare before the text compare. No hash of a domain name on the hot path.
 - `ContentId::of_many` groups inputs of at most one chunk (1 KiB, nearly every ID blaze
   makes) by how many blocks come before their last block. Each group's leading blocks go
-  through `blake3::platform::Platform::hash_many` together, and each input's last block is one
-  `compress_in_place` with `CHUNK_END | ROOT`. Longer inputs go through the hasher, which already
-  uses SIMD inside one input. So a batch of short inputs costs about one compression per block
-  per SIMD lane, against one per block for each input on its own.
+  through `blake3::platform::Platform::hash_many` together.
+- Each input's last block goes through `compress_lanes` with `CHUNK_END | ROOT`, eight at a
+  time. That block has its own length, which `hash_many` can't take since it gives every lane
+  full blocks, and for an input of at most 64 bytes it is the whole input.
+  - `compress_lanes` is BLAKE3's compression transposed: word `w` of every lane is one
+    `[u32; 8]`, and each lane has its own block length.
+  - Its add, xor and rotate loops are what LLVM vectorizes (one AVX2 register, two NEON
+    ones). It is safe code, with no intrinsics of our own to prove.
+- Longer inputs go through the hasher, which already uses SIMD inside one input. So a batch of
+  short inputs costs about one compression per block per SIMD lane, against one per block for
+  each input on its own.
 - `blake3::platform` is `#[doc(hidden)]` and unstable. `of_many_is_the_hasher_at_every_length_and_group_size`
-  checks it against `blake3::Hasher` at every length 0..=1100 in groups of 1 to 33. A blake3
-  bump that changes it fails there (or fails to compile), never in an ID. Pinning blake3 to
+  checks it and `compress_lanes` against `blake3::Hasher` at every length 0..=1100 in groups
+  of 1 to 33, which leaves lanes empty and fills them. A blake3 bump that changes it fails
+  there (or fails to compile), never in an ID. Pinning blake3 to
   `=1.8.7` is asked for in `v2/requests/format.md`.
 
 ## The interner (`Sharded`)
@@ -89,11 +97,43 @@ codec choice per column.
 - **Cold**: one pass computes the column's shape (runs, steps, distinct count, gaps). From it,
   each codec's exact size (plain, runs, deltas, dictionary) is computed without encoding, the
   smallest is picked, and only that one is encoded. A test checks each size against the
-  encoding. Distinct values are counted with an LSD radix sort that skips passes on bytes all
-  values share. Then zstd at level 9 runs with a per-kind dictionary prepared once
+  encoding. Distinct values are counted with the workspace's one radix sort (`blaze-radix`,
+  through `blaze_ids::radix`: LSD, skipping digits every value shares, stopping early on
+  sorted input, parallel on large columns). Then zstd at level 9 runs with a per-kind dictionary prepared once
   (`CDict`/`DDict`) and a thread-local `CCtx`/`DCtx`, writing into the output vector after
   the header with no extra copy.
+- **Whole buffers** (`tiers::BufferColumns`, for the store's tiers): the schema's records find
+  every word table reachable from the root (`Record::columns`). A word table is the items of
+  a slice of records whose size is a whole number of `u32` words, at least word-aligned. Each
+  word of a row is cut out as a column of its own and packed on its own: SIMD-BP128 warm,
+  smallest codec then zstd cold. So a slice of `{ start, len }` pairs packs as two columns, and
+  a slice of records holding `Slice`s packs their relative offsets, which fall steadily row by
+  row, as deltas. The rest of the buffer is kept byte for byte, so both forms give back the
+  exact buffer. This is BtrBlocks' and Parquet's approach: a struct split into its fields,
+  each encoded by its own statistics, a general compressor after. Here it is driven by the
+  record schema, not by guessing from the bytes. A table of under 16 rows stays one column,
+  since a column's frame costs more than splitting so few rows saves.
 - Where it falls short of the best: warm blocks have no exceptions, which FastPFor's patched
   frames add for columns with rare outliers. Those columns go cold instead, where the codec
   choice handles them. Adding PFor exceptions is worth it only if a profile of warm reads shows
   outlier-heavy columns.
+
+## Unsafe (docs/v2/plan/design/unsafe.md)
+
+- **`blaze-ids`:** `#![forbid(unsafe_code)]`. Its SIMD is blake3's, plus `compress_lanes`,
+  which is safe code.
+- **`blaze-format`:** every unsafe block is in `raw.rs`, behind safe functions that check
+  before they cast:
+  - `view` checks size and alignment, then `Record::check`;
+  - `view_slice` does the same for each item, or for the bounds alone for a `PLAIN` record;
+  - `in_place` reads a `Rel` or `Slice`, which any bits are, after size and alignment;
+  - `bytes_of` and `blocks_bytes` give a value's bytes.
+  
+  What the safe version would cost: a copy of every record read out of a mapped buffer. The
+  rest of the crate holds only the `Record` contract (`unsafe trait`) and its impls, each with
+  a `SAFETY:` comment. `raw`'s tests are the safe reference: views equal a byte-at-a-time
+  decode, and views of the wrong size or alignment are refused.
+- **`syntax-tree`** (`cursor.rs`, the tree's ownership), **`syntax`** (`raw.rs`) and
+  **`parser`** (`lexed_str/scan.rs` SIMD, `syntax_kind.rs`): each block has its `SAFETY:`
+  comment, and each `unsafe fn` a `# Safety` section.
+- **format's `hir-def` files:** no unsafe code (`hir/columns.rs` forbids it).

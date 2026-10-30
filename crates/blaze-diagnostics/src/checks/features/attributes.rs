@@ -35,7 +35,7 @@ use crate::{
     cx::Cx,
     lints::syntax::{
         Walk,
-        attrs::{Attr, Owner, Target},
+        attrs::{Attr, Owner, Target, table::index},
         source_fact,
     },
     lower::{Found, Phase},
@@ -53,8 +53,7 @@ pub(crate) struct Gate {
 /// The stability of the builtin parser of `path`: `None` when no parser takes it, `Some(None)`
 /// when it is stable.
 pub(crate) fn stability(path: &[&str]) -> Option<Option<Gate>> {
-    let at = table::STABILITY.binary_search_by(|(it, _)| (*it).cmp(path)).ok()?;
-    Some(table::STABILITY[at].1)
+    Some(table::STABILITY[index::of(path)?].1)
 }
 
 /// rustc's `check_attribute_stability` of `attr`: E0658 when its parser is unstable, the
@@ -311,6 +310,22 @@ mod tests {
         assert!(table::STABILITY.windows(2).all(|it| it[0].0 < it[1].0));
         for (path, _) in table::STABILITY {
             assert!(builtins::builtin(path).is_some(), "{path:?} is no builtin parser's path");
+        }
+    }
+
+    #[test]
+    fn the_table_is_by_parser_number() {
+        assert_eq!(table::STABILITY.len(), index::COUNT);
+        for (at, (path, _)) in table::STABILITY.iter().enumerate() {
+            assert_eq!(*path, index::path(at), "the gate numbered {at}");
+        }
+        let by_search = |path: &[&str]| {
+            let at = table::STABILITY.binary_search_by(|(it, _)| (*it).cmp(path)).ok()?;
+            Some(table::STABILITY[at].1)
+        };
+        let misses: [&[&str]; 5] = [&[], &["diagnostic"], &["no_such_attribute"], &["inline", "x"], &["Inline"]];
+        for path in table::STABILITY.iter().map(|(path, _)| *path).chain(misses) {
+            assert_eq!(stability(path), by_search(path), "{path:?}");
         }
     }
 

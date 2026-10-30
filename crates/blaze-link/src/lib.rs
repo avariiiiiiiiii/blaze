@@ -282,8 +282,11 @@ impl Image {
         Ok(())
     }
 
-    /// Back to the image before the last commit: a patch that panicked. Running programs
-    /// switch back to its table.
+    /// Back to the image before the last commit: a patch that panicked, or one whose borrow
+    /// check, run beside it, refused its body. Running programs switch back to its table.
+    /// Each call undoes one more commit, so a refusal that comes in after later commits rolls
+    /// them back too; their changes are then staged again without the refused body. A commit
+    /// in flight must complete first.
     pub fn roll_back(&mut self, effects: &mut Vec<Effect>) -> Result<(), LinkError> {
         if self.pending.is_some() {
             return Err(LinkError { function: None, what: "a commit is in flight".into() });
@@ -347,7 +350,7 @@ pub fn script_inputs(output: &Output, native: &Native<'_>) -> Result<Vec<String>
 
 /// Reads `bytes` as a native input of `format` (for a fuzz target): whether it read. A
 /// reader returns an error, never panics, on any bytes.
-#[doc(hidden)]
+#[cfg(feature = "fuzz")]
 pub fn fuzz_read(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, bytes: &[u8]) -> bool {
     let output = Output {
         format,

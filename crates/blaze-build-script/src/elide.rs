@@ -15,17 +15,19 @@
 //! - every line printed is a cargo directive (`cargo:…`) and the last ends in `\n`.
 //!
 //! Anything else is `None`, and the script is compiled and run as any other. The tokens are
-//! this crate's own ([`lex`]), so elision depends on no front end.
+//! this crate's own ([`lex`]), so elision depends on no front end. They are read one at a
+//! time as the forms ask for them, so most scripts (which start with `use`) are refused at
+//! their first token, and nothing is allocated per token: one buffer holds a macro call's
+//! arguments and one what is printed, each reused.
 
 pub mod lex;
 
 use std::{
-    borrow::Cow,
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
-use self::lex::{Kind, Token};
+use self::lex::{Kind, Token, Tokens};
 use crate::Error;
 
 /// What the script whose root file is `root` prints, when its source proves it: the exact
@@ -40,8 +42,7 @@ use crate::Error;
 pub fn elide(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Option<Vec<u8>> {
     let source = std::str::from_utf8(files.get(root)?).ok()?;
     let source = lex::normalize(source);
-    let tokens = lex::lex(&source).ok()?;
-    let printed = printed(&tokens)?;
+    let printed = printed(Tokens::new(&source).ok()?)?;
     directives_only(&printed).then(|| printed.into_bytes())
 }
 
@@ -130,91 +131,111 @@ fn directives_only(printed: &str) -> bool {
     lines.split('\n').all(|line| line.starts_with("cargo:"))
 }
 
+/// The next token, or none at the end or at a refusal: either leaves the script unread.
+fn next<'a>(tokens: &mut Tokens<'a>) -> Option<Token<'a>> {
+    tokens.next()?.ok()
+}
+
 /// What the script of `tokens` prints, if it is of the forms read.
-fn printed(tokens: &[Token<'_>]) -> Option<String> {
-    let mut at = 0;
-    while tokens.get(at).is_some_and(|it| it.kind == Kind::InnerDoc) {
-        at += 1;
+fn printed(mut tokens: Tokens<'_>) -> Option<String> {
+    let mut token = next(&mut tokens)?;
+    while token.kind == Kind::InnerDoc {
+        token = next(&mut tokens)?;
     }
-    while tokens.get(at).is_some_and(|it| it.kind == Kind::OuterDoc) {
-        at += 1;
+    while token.kind == Kind::OuterDoc {
+        token = next(&mut tokens)?;
     }
-    let head = tokens.get(at..at + 5)?;
-    let head_ok = head[0].is_ident("fn")
-        && head[1].is_ident("main")
-        && head[2].is_punct('(')
-        && head[3].is_punct(')')
-        && head[4].is_punct('{');
+    let head_ok = token.is_ident("fn")
+        && next(&mut tokens)?.is_ident("main")
+        && next(&mut tokens)?.is_punct('(')
+        && next(&mut tokens)?.is_punct(')')
+        && next(&mut tokens)?.is_punct('{');
     if !head_ok {
         return None;
     }
-    at += 5;
     let mut out = String::new();
-    loop {
-        let token = tokens.get(at)?;
-        if token.is_punct('}') {
-            at += 1;
-            break;
-        }
-        let newline = match token {
+    let mut args: Vec<Token<'_>> = Vec::new();
+    let mut scratch = Scratch::default();
+    let mut token = next(&mut tokens)?;
+    while !token.is_punct('}') {
+        let newline = match &token {
             it if it.is_ident("println") => true,
             it if it.is_ident("print") => false,
             _ => return None,
         };
-        if !tokens.get(at + 1)?.is_punct('!') {
+        if !next(&mut tokens)?.is_punct('!') {
             return None;
         }
-        let (open, close) = match tokens.get(at + 2)?.kind {
+        let (open, close) = match next(&mut tokens)?.kind {
             Kind::Punct('(') => ('(', ')'),
             Kind::Punct('[') => ('[', ']'),
             Kind::Punct('{') => ('{', '}'),
             _ => return None,
         };
-        let start = at + 3;
         // Arguments are literals and commas, so the first delimiter after the opening one is
         // its close, or the script is of no form read.
-        let end = start
-            + tokens[start..].iter().position(|it| {
-                matches!(it.kind, Kind::Punct('(' | ')' | '[' | ']' | '{' | '}'))
-            })?;
-        if !tokens[end].is_punct(close) {
+        args.clear();
+        let end = loop {
+            let token = next(&mut tokens)?;
+            if matches!(token.kind, Kind::Punct('(' | ')' | '[' | ']' | '{' | '}')) {
+                break token;
+            }
+            args.push(token);
+        };
+        if !end.is_punct(close) {
             return None;
         }
-        format(&tokens[start..end], newline, &mut out)?;
-        at = end + 1;
+        format(&args, newline, &mut out, &mut scratch)?;
+        token = next(&mut tokens)?;
         // A brace-delimited macro is a statement of its own; a `;` after it would be an empty
         // statement (`redundant_semicolons`). Another needs its `;` unless it ends the block.
         if open != '{' {
-            match tokens.get(at)? {
-                it if it.is_punct(';') => at += 1,
-                it if it.is_punct('}') => {}
-                _ => return None,
+            if token.is_punct(';') {
+                token = next(&mut tokens)?;
+            } else if !token.is_punct('}') {
+                return None;
             }
         }
     }
-    (at == tokens.len()).then_some(out)
+    tokens.next().is_none().then_some(out)
+}
+
+/// What [`format`] reuses from one macro call to the next.
+#[derive(Default)]
+struct Scratch {
+    /// A format string's value, when an escape made it differ from its text.
+    spec: String,
+    /// Which arguments a placeholder used.
+    used: Vec<bool>,
 }
 
 /// What `format_args!` (with `println!`'s newline) makes of `args`, added to `out`. The
-/// format string is copied in runs between its braces, each argument borrowed where the
-/// source has it.
-fn format(args: &[Token<'_>], newline: bool, out: &mut String) -> Option<()> {
-    let (spec, mut rest) = args.split_first()?;
-    let spec: &str = match &spec.kind {
-        Kind::Str { value, escaped_brace: false } => &**value,
-        Kind::RawStr { value } => *value,
+/// format string is copied in runs between its braces, each argument written where the
+/// source has it, with nothing allocated but what `out` and `scratch` grow by.
+fn format(args: &[Token<'_>], newline: bool, out: &mut String, scratch: &mut Scratch) -> Option<()> {
+    let (spec, rest) = args.split_first()?;
+    let spec: &str = match spec.kind {
+        Kind::Str { escaped: false, escaped_brace: false } => &spec.text[1..spec.text.len() - 1],
+        Kind::Str { escaped: true, escaped_brace: false } => {
+            scratch.spec.clear();
+            spec.push_value(&mut scratch.spec)?;
+            &scratch.spec
+        }
+        Kind::RawStr { value } => value,
         _ => return None,
     };
-    let mut values = Vec::new();
-    while let Some((comma, after)) = rest.split_first() {
-        if !comma.is_punct(',') {
-            return None;
-        }
-        let Some((value, after)) = after.split_first() else { break };
-        values.push(display(value)?);
-        rest = after;
+    // `, value` after the format string, a last `,` allowed: the values are every second
+    // token, from the second.
+    if rest.iter().step_by(2).any(|it| !it.is_punct(',')) {
+        return None;
     }
-    let mut used = vec![false; values.len()];
+    if !rest.iter().skip(1).step_by(2).all(displayable) {
+        return None;
+    }
+    let count = rest.len() / 2;
+    let used = &mut scratch.used;
+    used.clear();
+    used.resize(count, false);
     let mut next = 0;
     // Braces are ASCII, so every index below is on a character's boundary.
     let bytes = spec.as_bytes();
@@ -240,7 +261,10 @@ fn format(args: &[Token<'_>], newline: bool, out: &mut String) -> Option<()> {
                 } else {
                     return None;
                 };
-                out.push_str(values.get(index)?);
+                if index >= count {
+                    return None;
+                }
+                write_arg(&rest[1 + 2 * index], out)?;
                 used[index] = true;
                 at = close + 1;
                 copied = at;
@@ -259,20 +283,48 @@ fn format(args: &[Token<'_>], newline: bool, out: &mut String) -> Option<()> {
     Some(())
 }
 
-/// A literal as `Display` shows it: borrowed from the token but for a number or a
-/// character.
-fn display<'t>(token: &'t Token<'_>) -> Option<Cow<'t, str>> {
-    match &token.kind {
-        Kind::Str { value, .. } => Some(Cow::Borrowed(&**value)),
-        Kind::RawStr { value } => Some(Cow::Borrowed(*value)),
-        Kind::Char(c) => Some(Cow::Owned(c.to_string())),
-        Kind::Int(value) if *value <= i32::MAX as u128 => Some(Cow::Owned(value.to_string())),
+/// Whether `token` is a literal [`write_arg`] writes.
+fn displayable(token: &Token<'_>) -> bool {
+    match token.kind {
+        Kind::Str { .. } | Kind::RawStr { .. } | Kind::Char(_) => true,
+        Kind::Int(value) => value <= i32::MAX as u128,
+        Kind::Ident => token.text == "true" || token.text == "false",
+        _ => false,
+    }
+}
+
+/// A literal as `Display` shows it, added to `out`: a string's value, a character, a number
+/// in decimal, `true` or `false`.
+fn write_arg(token: &Token<'_>, out: &mut String) -> Option<()> {
+    match token.kind {
+        Kind::Str { .. } | Kind::RawStr { .. } => token.push_value(out),
+        Kind::Char(c) => {
+            out.push(c);
+            Some(())
+        }
+        Kind::Int(value) if value <= i32::MAX as u128 => {
+            let mut digits = [0u8; 10];
+            let (mut value, mut at) = (value as u32, digits.len());
+            loop {
+                at -= 1;
+                digits[at] = b'0' + (value % 10) as u8;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            out.extend(digits[at..].iter().map(|it| char::from(*it)));
+            Some(())
+        }
         Kind::Ident if token.text == "true" || token.text == "false" => {
-            Some(Cow::Borrowed(token.text))
+            out.push_str(token.text);
+            Some(())
         }
         _ => None,
     }
 }
 
+#[cfg(test)]
+mod reference;
 #[cfg(test)]
 mod tests;

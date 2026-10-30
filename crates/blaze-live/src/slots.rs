@@ -31,7 +31,9 @@ use std::{
     time::SystemTime,
 };
 
-use crate::patch::{ANSWER, Answer, DESCRIPTOR, DESCRIPTOR_MAGIC, Descriptor, Message, message_file};
+use crate::patch::{
+    ANSWER, Answer, DESCRIPTOR, DESCRIPTOR_MAGIC, Descriptor, Message, message_file,
+};
 use os::backtrace;
 use switch::{KEPT, Layout, Switch};
 

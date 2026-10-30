@@ -837,7 +837,7 @@ impl Server {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(blaze_check)))]
 mod tests {
     use std::collections::VecDeque;
 

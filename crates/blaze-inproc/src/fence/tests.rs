@@ -166,6 +166,19 @@ fn a_full_table_waits() {
 }
 
 #[test]
+fn an_announcement_is_one_word_apart_from_the_rest() {
+    let mut fences = Fences::new(words());
+    assert_eq!(Thread::announced(fences.words()), 0);
+    fences.announce(9);
+    assert_eq!(Thread::announced(fences.words()), 9);
+    fences.post(0x1000, 0x2000).unwrap();
+    fences.start();
+    Thread::claim(fences.words(), PID, 1, 2).unwrap();
+    assert_eq!(Thread::announced(fences.words()), 9);
+    assert_eq!(Thread::epoch(fences.words()), 2);
+}
+
+#[test]
 fn processes_are_counted_apart() {
     let fences = Fences::new(words());
     Thread::claim(fences.words(), PID, 1, 2).unwrap();

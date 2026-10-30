@@ -36,8 +36,8 @@ use crate::{
     },
     next_solver::{
         Binder, Canonical, ClauseKind, DbInterner, FnSig, GenericArg, GenericArgs, Goal, ParamEnv,
-        PolyTraitRef, PredefinedOpaques, Predicate, Region, SimplifiedType, TraitRef, Ty, TyKind,
-        Unnormalized,
+        PolyTraitRef, PredefinedOpaques, Predicate, Region, RegionExt, SimplifiedType, TraitRef,
+        Ty, TyKind, Unnormalized,
         infer::{
             BoundRegionConversionTime, InferCtxt, InferOk,
             canonical::{QueryResponse, canonicalizer::OriginalQueryValues},

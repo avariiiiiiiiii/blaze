@@ -9,37 +9,37 @@ use std::hash::Hash;
 use hir_def::{FunctionId, HasModule, nameres::crate_def_map, signatures::FunctionSignature};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::GenericArgs as _;
+use salsa::{AsId, SalsaValue};
 use smallvec::SmallVec;
 
 use crate::{
     db::{HirDatabase, InternedClosureId},
+    intrinsic::Intrinsic,
     mir::{InlinedBody, MirBody, TerminatorKind, transform::Ctx},
     next_solver::{GenericArgs, StoredGenericArgs},
     traits::ParamEnvAndCrate,
 };
 
-use super::{fn_def, instantiate, resolve, spans::owner_of};
+use super::{Attrs, fn_def, instantiate, is_generic, resolve, spans::owner_of};
 
 /// The functions `body` calls by name, each once with its generic arguments, in the order it
 /// first calls them: rustc's `mir_inliner_callees`, of the runtime body. Of
 /// `const_eval_select` it is the function called at runtime.
-fn callees_of(db: &dyn HirDatabase, body: &MirBody<'_>) -> Vec<(FunctionId, StoredGenericArgs)> {
+fn callees_of(body: &MirBody<'_>) -> Vec<(FunctionId, StoredGenericArgs)> {
     let mut seen = FxHashSet::default();
     let mut callees = Vec::new();
     for (_, block) in body.basic_blocks.iter() {
-        let Some(TerminatorKind::Call { func, args, .. }) = block.terminator.as_ref().map(|it| &it.kind)
+        let Some(TerminatorKind::Call { func, args, intrinsic, .. }) =
+            block.terminator.as_ref().map(|it| &it.kind)
         else {
             continue;
         };
-        let Some(mut call) = fn_def(body, func) else { continue };
-        if FunctionSignature::is_intrinsic(db, call.0)
-            && FunctionSignature::of(db, call.0).name.as_str() == "const_eval_select"
-        {
-            match args.get(2).and_then(|it| fn_def(body, it)) {
-                Some(runtime) => call = runtime,
-                None => continue,
-            }
-        }
+        let call = if *intrinsic == Some(Intrinsic::ConstEvalSelect) {
+            args.get(2).and_then(|it| fn_def(body, it))
+        } else {
+            fn_def(body, func)
+        };
+        let Some(call) = call else { continue };
         if seen.insert(call) {
             callees.push((call.0, call.1.store()));
         }
@@ -53,7 +53,7 @@ pub(super) fn inliner_callees_of_fn(
     func: FunctionId,
 ) -> Vec<(FunctionId, StoredGenericArgs)> {
     match db.runtime_mir_body(func.into()) {
-        Ok(body) => callees_of(db, body),
+        Ok(body) => callees_of(body),
         Err(_) => Vec::new(),
     }
 }
@@ -64,7 +64,7 @@ pub(super) fn inliner_callees_of_closure<'db>(
     closure: InternedClosureId<'db>,
 ) -> Vec<(FunctionId, StoredGenericArgs)> {
     match db.runtime_mir_body_for_closure(closure) {
-        Ok(body) => callees_of(db, body),
+        Ok(body) => callees_of(body),
         Err(_) => Vec::new(),
     }
 }
@@ -79,11 +79,57 @@ fn inliner_callees<'db>(
     }
 }
 
+/// What [`walk`] found of the bodies it keeps.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Walked<B> {
+    /// rustc's `mir_callgraph_cyclic`: the bodies a path back to the root goes through.
+    pub(super) cyclic: FxHashSet<B>,
+    /// The bodies the walk followed.
+    pub(super) reached: FxHashSet<B>,
+}
+
+/// [`Walked`] of the bodies of the root's crate, each list sorted by [`key`].
+#[derive(Debug, PartialEq, Eq, SalsaValue)]
+pub(super) struct Callgraph<'db> {
+    cyclic: Vec<InlinedBody<'db>>,
+    reached: Vec<InlinedBody<'db>>,
+}
+
+fn key(body: &InlinedBody<'_>) -> (bool, salsa::Id) {
+    match *body {
+        InlinedBody::Fn(func) => (false, func.as_id()),
+        InlinedBody::Closure(closure) => (true, closure.as_id()),
+    }
+}
+
+impl<'db> Callgraph<'db> {
+    fn new(walked: Walked<InlinedBody<'db>>) -> Self {
+        let sorted = |set: FxHashSet<InlinedBody<'db>>| {
+            let mut list: Vec<_> = set.into_iter().collect();
+            list.sort_unstable_by_key(key);
+            list
+        };
+        Callgraph { cyclic: sorted(walked.cyclic), reached: sorted(walked.reached) }
+    }
+
+    /// `body` may call the root back.
+    pub(super) fn is_cyclic(&self, body: InlinedBody<'db>) -> bool {
+        self.cyclic.binary_search_by_key(&key(&body), key).is_ok()
+    }
+
+    /// The walk followed `body`. A body of the crate the inliner finds called that the walk
+    /// did not follow is one whose call resolves only in the instantiated callee it is in (its
+    /// opaque types revealed): the walk never looked at what it calls.
+    pub(super) fn reached(&self, body: InlinedBody<'db>) -> bool {
+        self.reached.binary_search_by_key(&key(&body), key).is_ok()
+    }
+}
+
 #[salsa::tracked(returns(ref))]
 pub(super) fn callgraph_cyclic_fn<'db>(
     db: &'db dyn HirDatabase,
     root: FunctionId,
-) -> Vec<InlinedBody<'db>> {
+) -> Option<Callgraph<'db>> {
     cyclic(db, InlinedBody::Fn(root))
 }
 
@@ -91,66 +137,75 @@ pub(super) fn callgraph_cyclic_fn<'db>(
 pub(super) fn callgraph_cyclic_closure<'db>(
     db: &'db dyn HirDatabase,
     root: InternedClosureId<'db>,
-) -> Vec<InlinedBody<'db>> {
+) -> Option<Callgraph<'db>> {
     cyclic(db, InlinedBody::Closure(root))
 }
 
-/// The bodies of `root`'s crate that a call of `root`'s body may lead back to `root` through.
+/// The walk of the bodies of `root`'s crate that a call of `root`'s body may lead to; `None`
+/// where it gave up at the recursion limit, as rustc's does, and nothing of the crate may then
+/// be inlined into `root`.
 pub(super) fn callgraph_cyclic<'db>(
     db: &'db dyn HirDatabase,
     root: InlinedBody<'db>,
-) -> &'db [InlinedBody<'db>] {
+) -> Option<&'db Callgraph<'db>> {
     match root {
-        InlinedBody::Fn(func) => callgraph_cyclic_fn(db, func),
-        InlinedBody::Closure(closure) => callgraph_cyclic_closure(db, closure),
+        InlinedBody::Fn(func) => callgraph_cyclic_fn(db, func).as_ref(),
+        InlinedBody::Closure(closure) => callgraph_cyclic_closure(db, closure).as_ref(),
     }
 }
 
-/// Whether the inliner may look into `body`: rustc's `should_recurse`.
-fn has_mir(db: &dyn HirDatabase, body: InlinedBody<'_>) -> bool {
+/// Whether the walk looks into `body` instantiated with `args`: rustc's `should_recurse`,
+/// which follows an instance whose MIR is available. Of a crate other than `krate`, that is
+/// what rustc keeps of it: the MIR of a generic or `#[inline]` function, or a closure's.
+fn has_mir<'db>(
+    db: &'db dyn HirDatabase,
+    krate: base_db::Crate,
+    body: InlinedBody<'db>,
+    args: GenericArgs<'db>,
+) -> bool {
     match body {
         InlinedBody::Fn(func) => {
-            FunctionSignature::of(db, func).has_body() && !FunctionSignature::is_intrinsic(db, func)
+            FunctionSignature::of(db, func).has_body()
+                && !FunctionSignature::is_intrinsic(db, func)
+                && (func.krate(db) == krate || is_generic(args) || Attrs::of_fn(db, func).hinted())
         }
         InlinedBody::Closure(_) => true,
     }
 }
 
-fn cyclic<'db>(db: &'db dyn HirDatabase, root: InlinedBody<'db>) -> Vec<InlinedBody<'db>> {
-    if !has_mir(db, root) {
-        return Vec::new();
-    }
+fn cyclic<'db>(db: &'db dyn HirDatabase, root: InlinedBody<'db>) -> Option<Callgraph<'db>> {
     let owner = owner_of(db, root);
     let krate = owner.krate(db);
     let ctx = Ctx::new(db, owner);
     let env = ParamEnvAndCrate { param_env: ctx.env, krate };
     let identity = GenericArgs::identity_for_item(ctx.infcx.interner, owner.generic_def(db).into());
-    let limit = crate_def_map(db, krate).recursion_limit() as usize / 2;
+    let limit = crate_def_map(db, krate).recursion_limit() as usize / 8;
     let callees = |(body, args): (InlinedBody<'db>, GenericArgs<'db>)| {
         let mut out: SmallVec<[((InlinedBody<'db>, GenericArgs<'db>), bool); 8]> = SmallVec::new();
         for (func, callee_args) in inliner_callees(db, body) {
             let Some(callee_args) = instantiate(&ctx, callee_args.as_ref(), args) else { continue };
             let Some(callee) = resolve(&ctx, env, *func, callee_args) else { continue };
-            out.push((callee, has_mir(db, callee.0)));
+            out.push((callee, has_mir(db, krate, callee.0, callee.1)));
         }
         out
     };
     let local = |body: InlinedBody<'db>| owner_of(db, body).krate(db) == krate;
-    walk((root, identity), root, limit, |node| node.0, callees, local)
+    walk((root, identity), root, limit, |node| node.0, callees, local).map(Callgraph::new)
 }
 
 struct Frame<N> {
     node: N,
     callees: SmallVec<[(N, bool); 8]>,
     next: usize,
-    found: bool,
+    reaches: bool,
 }
 
-/// rustc's `process` from `start`, without recursion: the bodies a path from `start` to
-/// `target` goes through, of those `local` says to keep. A node is an instance, `body_of` its
+/// rustc's `process` from `start`, without recursion. A node is an instance, `body_of` its
 /// body; `callees` gives the instances an instance calls, each with whether it has MIR to
-/// follow. Each instance is followed once, and each body at most `limit` times, past which it
-/// is taken to lead to `target`, as rustc takes it.
+/// follow. Of the bodies `local` says to keep, it gives those of the instances a path from
+/// `start` to `target` goes through, and those followed. Each instance is followed once, one
+/// met again while it is being followed taken not to reach `target`; a body followed more
+/// than `limit` times ends the walk with `None`.
 pub(super) fn walk<N, B, C>(
     start: N,
     target: B,
@@ -158,48 +213,64 @@ pub(super) fn walk<N, B, C>(
     body_of: impl Fn(N) -> B,
     mut callees: impl FnMut(N) -> C,
     mut local: impl FnMut(B) -> bool,
-) -> Vec<B>
+) -> Option<Walked<B>>
 where
     N: Copy + Eq + Hash,
     B: Copy + Eq + Hash,
     C: Into<SmallVec<[(N, bool); 8]>>,
 {
-    let mut seen: FxHashSet<N> = FxHashSet::default();
-    let mut followed: FxHashMap<B, usize> = FxHashMap::default();
-    let mut involved: Vec<B> = Vec::new();
-    let mut kept: FxHashSet<B> = FxHashSet::default();
-    let mut keep = |body: B, involved: &mut Vec<B>| {
-        if local(body) && kept.insert(body) {
-            involved.push(body);
-        }
-    };
-    let mut stack = vec![Frame { node: start, callees: callees(start).into(), next: 0, found: false }];
+    let mut seen: FxHashMap<N, bool> = FxHashMap::default();
+    let mut recursion: FxHashMap<B, usize> = FxHashMap::default();
+    let mut graph = Walked { cyclic: FxHashSet::default(), reached: FxHashSet::default() };
+    let mut stack =
+        vec![Frame { node: start, callees: callees(start).into(), next: 0, reaches: false }];
     while let Some(frame) = stack.last_mut() {
         let Some(&(callee, has_mir)) = frame.callees.get(frame.next) else {
-            let Some(done) = stack.pop() else { break };
-            if done.found && let Some(caller) = stack.last_mut() {
-                keep(body_of(done.node), &mut involved);
-                caller.found = true;
+            let done = stack.pop()?;
+            let Some(caller) = stack.last_mut() else { break };
+            seen.insert(done.node, done.reaches);
+            if done.reaches {
+                let body = body_of(done.node);
+                if local(body) {
+                    graph.cyclic.insert(body);
+                }
+                caller.reaches = true;
             }
             continue;
         };
         frame.next += 1;
         let body = body_of(callee);
         if body == target {
-            frame.found = true;
-        }
-        if !has_mir || !seen.insert(callee) {
+            frame.reaches = true;
+            seen.insert(callee, true);
             continue;
         }
-        let count = followed.entry(body).or_default();
-        if *count <= limit {
-            *count += 1;
-            let callees = callees(callee).into();
-            stack.push(Frame { node: callee, callees, next: 0, found: false });
-        } else {
-            frame.found = true;
-            keep(body, &mut involved);
+        if !has_mir {
+            continue;
+        }
+        match seen.get(&callee) {
+            Some(&reaches) => {
+                if reaches {
+                    frame.reaches = true;
+                    if local(body) {
+                        graph.cyclic.insert(body);
+                    }
+                }
+            }
+            None => {
+                seen.insert(callee, false);
+                let count = recursion.entry(body).or_default();
+                *count += 1;
+                if *count > limit {
+                    return None;
+                }
+                if local(body) {
+                    graph.reached.insert(body);
+                }
+                let callees = callees(callee).into();
+                stack.push(Frame { node: callee, callees, next: 0, reaches: false });
+            }
         }
     }
-    involved
+    Some(graph)
 }

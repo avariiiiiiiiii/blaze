@@ -18,6 +18,13 @@ format-hir) append below with their name.
    `parse`, chosen by the caller that knows the crate, works as well.
 
 > forwarded to db: `crates/base-db/src/editioned_file_id.rs` does not call `parse_outline` yet.
+> applied by db-expand: `EditionedFileId::parse` parses a file of a library source root with
+> `parse_outline` and every other file with `parse_shared`. The choice goes through a tracked
+> firewall `EditionedFileId::is_library`, so a change to a root's file set that keeps the answer
+> re-parses nothing. load-cargo marks only non-path packages and std as library
+> (`load-cargo/src/v2.rs:195`, `library.push(!crates::is_path(package))`), so a workspace
+> member is never an outline. `parse_errors` is unchanged: for an outline, the errors outside
+> unparsed bodies. Test `a_library_files_parse_leaves_bodies_unparsed` (`base-db/src/tests.rs`).
 2. **One text, not two** — `crates/base-db/src/lib.rs:396`, `FileText::text` (lane db):
    make it `std::sync::Arc<str>` instead of `triomphe::Arc<str>`, so `parse_shared` /
    `parse_outline` keep the file's own text in the tree instead of a copy (syntax-tree's
@@ -25,6 +32,15 @@ format-hir) append below with their name.
    Why: docs/v2/plan/lanes/format.md "Syntax": text read from the source, not copied.
 
 > forwarded to db: `FileText::text` (`crates/base-db/src/lib.rs:709`) still returns triomphe's `Arc<str>`.
+> applied by db-expand: `FileText::text` is `std::sync::Arc<str>` (field, getter and the three
+> setters in `base-db/src/files.rs`), `EditionedFileId::parse` calls `parse_shared(text.clone(), ..)`,
+> and `hir_expand::FileRange::file_text` returns `&std::sync::Arc<str>`. Test
+> `a_files_parse_shares_its_text` (`Arc::ptr_eq` of the tree's source and the text). What waits, as
+> each names triomphe's `Arc<str>` for a clone of the text: format's
+> `hir-def/src/expr_store/body.rs:295` (`BodySyntax::text`, filled at `:569`), codegen's
+> `blaze-engine/src/lib.rs:9519,10990` (`as_compiled`) and `blaze-engine/src/content.rs:356`
+> (`FileHashes`, `Arc::ptr_eq`), and the coordinator's `ide-db/src/search.rs:518,846`. Each becomes
+> `std::sync::Arc<str>`; asked in `v2/requests/db-expand.md`.
 3. **Drop the green-tree switch** — `crates/blaze-engine/src/lib.rs:8041` (lane codegen):
    delete `syntax::set_green_trees(std::env::var_os("BLAZE_GREEN_TREES").is_some());`.
    Why: parses make only flat trees now (no-fallback: no second path); `set_green_trees` is
@@ -73,6 +89,87 @@ format-hir) append below with their name.
 - `blaze-ids`: `ContentId::of_many` hashes one-chunk inputs through `hash_many`, with the
   same results. `Sharded`'s table places are tagged `u64`s, and `find` on an empty shard no
   longer allocates. The API is unchanged.
+8. **`Columns` over the format's buffer forms** — `crates/blaze-cas/src/lib.rs` (lane store):
+   `impl Columns for blaze_format::tiers::BufferColumns`, each method the one of the same name,
+   with errors as `to_string()`: `schema()`, `warm(hot)`, `hot_from_warm(warm)`, `cold(hot)`,
+   `hot_from_cold(cold)`. It goes in blaze-cas because blaze-cas depends on blaze-format, and
+   the trait is blaze-cas's. Why: store's "Column codecs belong to the value encoding" and
+   "Whole-value tier encodings" (`v2/requests/store.md`). The column codecs now run in the
+   value encoding, schema by schema, below.
+9. **Register the schemas' forms** — the daemon, right after `Store::open` (lane cargo):
+   `store.encode_columns(Arc::new(...))` for each of `hir_def::item_tree::ItemTree::columns()`,
+   `blaze_format::Spans::columns()`, `hir_def::expr_store::ExpressionStore::columns()`,
+   `Body::columns()`, `ExpressionStoreSourceMap::columns()` and `BodySourceMap::columns()`.
+   Why: until a schema is registered, its values go to whole-value zstd as opaque bytes.
+10. **A literal's suffix is a `u32`** — `crates/hir-def/src/nameres/frozen.rs:968` and `:2293`
+    (lane db): `tt::Literal::suffix_len` is a `u32` now. Write it with `self.u32(suffix_len)`
+    and read it with `self.u32()?`, then bump the frozen encoding's version if it has one. Why:
+    `tt::Literal::new` panicked on a suffix of 256 bytes or more (safety-fuzz-macrowasm,
+    `fuzz/corpus/macro_wasm_lex/suffix-256.hex`), and rustc lexes any length. Until then
+    `frozen.rs` doesn't compile.
+11. **`columns()` for the expression store's schemas** — `crates/hir-def/src/expr_store/persist.rs`
+    and `persist/source_map.rs` (speed-hir-store, which is editing them): beside each `Persist`
+    impl, as `item_tree/persist.rs` has for `ItemTree`,
+    `pub fn columns() -> blaze_format::tiers::BufferColumns { BufferColumns::of::<StoreRoot>(<ExpressionStore as Persist>::SCHEMA) }`,
+    with `BodyRoot` for `Body`, `SourceMapRoot` for `ExpressionStoreSourceMap` and
+    `BodySourceMapRoot` for `BodySourceMap`. Also: `Body` and `BodySourceMap` now implement
+    `Hash` (`expr_store/body.rs`) as the hash of `blaze_format::to_bytes(self)`. That is sound
+    because the encoding round-trips (`persist::assert_round_trip`), so keep it round-tripping.
+    > applied: by format (2026-10-29, 19:10), the four `columns()` beside their `Persist`
+    > impls; speed-hir-store, keep them when you edit those files.
+
+**Forwarded to format, 2026-10-29 evening: where each stands**
+- db-expand, `Hash` on the lru queries' values: `impl<T> Hash for syntax::Parse<T>`
+  (`crates/syntax/src/lib.rs`, by hand, over the tree's content, the errors and the outline's
+  edition: what the derived `PartialEq` compares), with `Hash` derived on `syntax::Tree`
+  (triomphe's `Arc` hashes its content, and `FlatTree`'s hand-written `Hash` matches its
+  `PartialEq`). `Hash` is added to `mbe::ValueResult`'s derive.
+- db-salsa, `crates/hir-def/src/expr_store/body.rs:94` and `:144`: `Body: Hash` and
+  `BodySourceMap: Hash`, as in request 11. Hashing the encoded buffer avoids a `Hash` on every
+  HIR column type, and it runs only when a value is evicted.
+- db-expand, the outline's words for `demand::may_declare_roots`: nothing new is needed.
+  Each lazy body of an outline is `tree.lazy_nodes()` (ascending preorder), its text
+  `&tree.text()[tree.range(at)]`. Lexing that text with `parser::LexedStr::new(edition, text)`
+  gives its identifier tokens without parsing it, at lexer speed. `body_syntax` and `words` in
+  `nameres/demand.rs` (db-expand-split's) can switch to that.
+- store 5 and items, `ContentId::of_many` and the domain keys: done (request 6 and the speed
+  pass above).
+- store, "Column codecs belong to the value encoding" and "Whole-value tier encodings":
+  `blaze_format::tiers::BufferColumns` (`crates/blaze-format/src/tiers/buffer.rs`).
+  - **Finding the columns:** `Record::columns` (written by `record!` for every record) finds
+    each `WordTable` reachable from a buffer's root, guided by the schema. A `WordTable` is a
+    `Slice` of records whose size is a whole number of words, word-aligned or more. Each word
+    of a row is a column of its own, so a slice of records is packed field by field.
+  - **Warm:** each column in SIMD-BP128 frames.
+  - **Cold:** each column in its smallest codec, then zstd with an optional schema dictionary.
+  - Both give back the exact bytes, so the store's compare holds.
+  - **One per persisted schema of format's:** `ItemTree::columns()`, `Spans::columns()`,
+    `ExpressionStore::columns()`, `Body::columns()`, `ExpressionStoreSourceMap::columns()` and
+    `BodySourceMap::columns()`. Requests 8 (the `impl Columns` in blaze-cas, which the orphan
+    rule puts there) and 9 (the daemon registering each) wire them in.
+  - The warm form is not read in place; its readers decode it through `Store::get`. Reading
+    in place would need each schema to hold `tiers::WarmColumn` fields in place of its
+    `Slice`s, which is a new schema version per record, not a re-encoding.
+- format-parse 1 (`OutlineFn`), 3 (an expander returns its errors) and 4 (`replace_token`), and
+  format-tree 1 and 2: done in the tree (`rg OutlineFn crates` finds nothing;
+  `Expand` returns errors and `FlatTree::part_errors` exists; `Edit::token` calls
+  `replace_token`; syntax-bridge's green twin is gone; `expand_lazy` returns its errors).
+- speed-span-tt, an in-order token walk: `FlatTree::text_len` is public, and syntax-bridge's
+  `FlatTokens` keeps a running offset per tree it walks, so each token's range is one add
+  (checked against `range` in debug builds).
+- safety-audit (syntax-tree, syntax): `flat_unbound` has a `# Safety` section and its block a
+  `SAFETY:` comment, `syntax/examples/trees.rs`'s two allocator blocks name their invariant, and
+  `syntax-tree` has `[lints] workspace = true`. `blaze-ids` has `#![forbid(unsafe_code)]`:
+  its one `unsafe` module, the radix sort, moved to `blaze-radix` (fix-radix). `mbe` already
+  forbids it.
+- fix-radix-rest 1 (`v2/requests/fix-radix-rest.md`): `tiers.rs`'s private radix sort is
+  gone. The `Shape` pass and `encode_raw` call `blaze_ids::radix::sort`, which keeps the same
+  ascending `u32` order.
+- safety-fuzz-macrowasm, `tt::Literal::new` and suffixes over 255 bytes: `suffix_len` is a
+  `u32`. A token tree's packed node keeps up to 2^18 - 1 bytes of suffix (the 18 bits left in
+  its head) and panics past that, naming the limit. The item tree's encoding writes a `u32`
+  (schema version 3), and db's `frozen.rs` is request 10.
+  Test: `a_literal_keeps_a_suffix_of_any_length_a_node_holds` (`crates/tt/src/storage/tests.rs`).
 
 ## format-span-intern
 
@@ -370,6 +467,7 @@ Judged off the hot path: `syntax-tree/src/flat.rs:1167` (`PARTS`, tests only). T
 in `hir-def` (`expr_store*`, `hir*`, `item_tree*`) and `syntax`, `span`, `tt` and `mbe` hold no locks.
 
 > forwarded to format: every finding is in lane format's own crates (`intern`, `blaze-ids`, `syntax-tree`, `span`); lane format is still running.
+> applied: both, checked in the tree 2026-10-29 19:15. 1 by speed-span (`intern/src/arena.rs`: `shard_bits()` from `available_parallelism`, `InsertLock`). 2 by format (`blaze-ids/src/lib.rs`): `shard_count()` at startup, `value()` computed before the lock (`intern`, :452), indices claimed `BLOCK` at a time per shard, `len` per shard on 128-byte-aligned shards, `find` with no lock, write or allocation. Under the lock remain only the re-probe, a table doubling (amortised O(1) per insert, smaller with 4× cores shards; readers keep probing the old table meanwhile) and the one-time allocation of a slot chunk.
 
 ## format-hir: expressions and patterns become columns (to lanes db, items, codegen)
 
@@ -467,11 +565,19 @@ From `speed-types` (blaze-items' speed pass). `blaze-items` already calls
 > forwarded to format: `crates/blaze-ids/src/lib.rs` is lane format's; lane format is still running. `blaze-items` (key.rs, index.rs, form.rs) does not build until `of_many` lands.
 
 Status: done by format (lead), in `crates/blaze-ids/src/lib.rs`:
-- `ContentId::of_many(domain: &'static str, inputs: &[&[u8]]) -> Vec<ContentId>`: the domain's
-  context key looked up once, then one `new_from_context_key` hasher per input. Not the
-  `hash_many` SIMD batch: `blake3::platform` is `#[doc(hidden)]`, "undocumented and unstable,
-  for benchmarks only", so any blake3 bump may break or silently change it; the context key
-  (stable `blake3::hazmat`) already removes the derive-key compression, the 25-50% named.
+- `ContentId::of_many(domain: &'static str, inputs: &[&[u8]]) -> Vec<ContentId>`
+  (`crates/blaze-ids/src/many.rs`), from the domain's context key, looked up once:
+  - **Inputs of at most 1 KiB:** grouped by block count. Their full blocks go through
+    `blake3::platform`'s `hash_many` (16 lanes on AVX-512, 8 on AVX2, 4 on NEON).
+  - **Each input's last block, any length:** through `compress_lanes`, eight inputs at a time.
+    It is a transposed BLAKE3 compression with a block length per lane, which `hash_many`
+    can't give. It is safe code that LLVM vectorizes, so items' 40–64-byte inputs are SIMD
+    end to end.
+  - **Longer inputs:** through the hasher.
+  - **Tests:** `of_many_is_the_hasher_at_every_length_and_group_size` holds both to
+    `blake3::Hasher` at every length from 0 to 1100 bytes and in batches of 1 to 33 inputs.
+    So a blake3 bump that changes `platform` (which blake3 marks unstable) fails there, not in
+    an ID.
 - `Hasher::new(domain)` reads the key from a 1024-slot open-addressed table keyed by the name's
   text (not its address: a `const &str` may sit at several addresses), each slot a `OnceLock`
   (a read is acquire loads; more than 1024 names panics, naming the constant).
@@ -635,6 +741,7 @@ comment in `hir::persist::syntax_context` can now name `read_verified` as where 
 is upheld (format-hir told).
 
 > forwarded to format: `crates/blaze-format/` and `crates/span/` are lane format's.
+> 1 is done (above). 2 forwarded by format to speed-span, which owns `crates/span` now (`v2/requests/speed.md`, "requests forwarded to format that are in your crates", 4).
 
 ## speed-span-tt: an in-order token walk of a flat tree (`crates/syntax-tree/src/flat.rs`)
 
@@ -975,3 +1082,143 @@ What: store a longer suffix (a `u16`/`u32` length, or the split kept in the symb
 the callers a fallible constructor.
 
 > forwarded to format: `crates/tt/` is lane format's.
+
+## From safety-model: model tests for blaze-ids
+
+From `safety-model-format` (2026-10-29). Written in the crates (both free): the switch
+(`crates/blaze-ids/src/sync.rs`, `mod sync;` and the `use crate::sync::...` line in `lib.rs`;
+`crates/intern/src/sync.rs` gains `OnceLock`, `intern.rs` and `intern_slice.rs` import it from
+there, `crates/intern/Cargo.toml` gains the `blaze-check` line that speed-span's item 1 in
+`v2/requests/speed.md` asked for), the model tests (`model_*` in `blaze-ids/src/lib.rs`,
+`intern/src/{arena,intern,intern_slice}.rs`) and `#[cfg(not(blaze_check))]` on the tests that
+spawn many threads or loop long. A normal build is unchanged. Item 2 remains (item 1 is done):
+
+> forwarded to format (items 1 and 2 below).
+
+### 1. `crates/blaze-ids/Cargo.toml`: the model build's dependency
+
+Done by safety-model-format: the `[target.'cfg(blaze_check)'.dependencies]` `blaze-check` line is
+in. It waited on a cycle (blaze-core depends on blaze-ids for `radix`, and blaze-check depended
+on blaze-core); safety-model removed blaze-check's blaze-core dependency (its own `rng.rs`), so
+blaze-check depends on nothing in the workspace. Nothing to do.
+
+> unblocked: `blaze-core` and `blaze-graph` now use the leaf `blaze-radix` and no longer depend on `blaze-ids` (fix-radix.md), so the `cfg(blaze_check)` line makes no cycle. format told.
+
+### 2. `crates/blaze-ids/src/lib.rs`: the domain-key table as a parameter, so a model can check it
+
+Why: `DOMAIN_KEYS` is a `static`. Under the checker a `static` once cell set in one execution
+stays set in every later one, so a model only explores the first execution's race between two
+domains that probe the same slot. Taking the table as a parameter lets a model give each
+execution a fresh one; the static path is the same code.
+
+Before (`lib.rs`, `DOMAIN_KEYS` and `context_key`):
+
+```rust
+static DOMAIN_KEYS: [OnceLock<(&'static str, ContextKey)>; DOMAIN_SLOTS] =
+    [const { OnceLock::new() }; DOMAIN_SLOTS];
+```
+
+```rust
+/// `blake3::hazmat::hash_derive_key_context(domain)`, derived once per name.
+fn context_key(domain: &'static str) -> &'static ContextKey {
+    let mut at = name_hash(domain) & (DOMAIN_SLOTS - 1);
+    for _ in 0..DOMAIN_SLOTS {
+        let slot = &DOMAIN_KEYS[at];
+```
+
+After:
+
+```rust
+type DomainKeys = [OnceLock<(&'static str, ContextKey)>; DOMAIN_SLOTS];
+
+static DOMAIN_KEYS: DomainKeys = [const { OnceLock::new() }; DOMAIN_SLOTS];
+```
+
+```rust
+/// `blake3::hazmat::hash_derive_key_context(domain)`, derived once per name.
+fn context_key(domain: &'static str) -> &'static ContextKey {
+    context_key_in(&DOMAIN_KEYS, domain)
+}
+
+/// [`context_key`] in the table `slots`.
+fn context_key_in<'a>(slots: &'a DomainKeys, domain: &'static str) -> &'a ContextKey {
+    let mut at = name_hash(domain) & (DOMAIN_SLOTS - 1);
+    for _ in 0..DOMAIN_SLOTS {
+        let slot = &slots[at];
+```
+
+(the rest of the body unchanged). Then add to `mod model` at the end of `lib.rs`:
+
+```rust
+    /// Two domains whose names probe from one slot, derived at once: one sets the slot, the
+    /// other reads it, sees another name and sets the next, and each gets its own key.
+    #[test]
+    fn model_colliding_domains_keep_their_own_keys() {
+        let first = "blaze v2 model a 1";
+        let home = name_hash(first) & (DOMAIN_SLOTS - 1);
+        let second: &'static str = (0..)
+            .map(|n| &*Box::leak(format!("blaze v2 model b {n}").into_boxed_str()))
+            .find(|name| name_hash(name) & (DOMAIN_SLOTS - 1) == home)
+            .expect("a name of the same home slot");
+        blaze_check::model(move || {
+            let slots: Arc<DomainKeys> = Arc::new([const { OnceLock::new() }; DOMAIN_SLOTS]);
+            let other = {
+                let slots = slots.clone();
+                thread::spawn(move || *context_key_in(&slots, second))
+            };
+            let one = *context_key_in(&slots, first);
+            let two = other.join().unwrap();
+            assert_eq!(one, hazmat::hash_derive_key_context(first));
+            assert_eq!(two, hazmat::hash_derive_key_context(second));
+            assert_eq!(*context_key_in(&slots, first), one, "found again in its slot");
+            assert_eq!(*context_key_in(&slots, second), two, "found again in its slot");
+        });
+    }
+```
+
+> forwarded to format: `crates/blaze-ids/src/lib.rs` is format's.
+> applied: by format (2026-10-29): `type DomainKeys`, `context_key_in(slots, domain)` (the static path calls it), and `model_colliding_domains_keep_their_own_keys` in `mod model`, as written above.
+
+## From safety-fuzz-persist (2026-10-29): seeds for the item tree and expression store fuzz targets, and what "write is the input" covers
+
+Targets: `fuzz/targets/hir_item_tree.rs`, `hir_expr_store.rs`, `hir_body.rs`,
+`hir_store_source_map.rs`, `hir_body_source_map.rs`, each `Persist::read` then `decode()`.
+
+**1. A public seed builder (what).** The fixtures in `item_tree/tests.rs`, `item_tree/persist.rs`'s
+tests, `expr_store/tests/body.rs` (`EVERY_VARIANT`) and `tests/signatures.rs` need `TestDB`, which
+is `cfg(test)`. Nothing public builds a non-empty `ItemTree` or `ExpressionStore` without a
+database: `ExpressionStoreBuilder::new` and its `alloc_*` are `pub(crate)`, and `ItemTree`'s
+fields are private. So the targets' valid buffers are hand-built in `fuzz/targets/hir_shared.rs`
+and `hir_expr_shared.rs`, laid out in your writers' order. Each target has a test that the
+buffers decode and are written back byte for byte. That catches layout drift, but it covers only
+what I wrote by hand: no bindings, labels, lifetimes, statements, record fields, side tables or
+type side tables. Two ways to close it, either is enough:
+- (preferred) a hir-def test that writes each fixture's buffer to
+  `fuzz/corpus/<target>/fixture-<name>.hex` as `00` followed by the buffer in hex, and fails when a
+  file is out of date (with an env var that rewrites them, as `expect-test` does). It uses the
+  real fixtures and widens no API. The corpus directories are mine; I'm fine with your test
+  writing files there.
+- or db-free public builders: `ExpressionStoreBuilder::new`, `alloc_expr`, `alloc_pat`,
+  `alloc_type_ref` and `finish` `pub`, and an `ItemTree` constructor from its columns.
+
+**2. "Read, then decode, gives `Err` or a value whose write is the input" holds only for the
+writer's layouts (a note, not a bug).** Every reader accepts valid buffers it never writes. A
+`Slice` of length 0 follows to `&[]` whatever its offset, but `Column::slice` always writes it as
+offset 0. Words that no table's `from(at)` reaches are kept by the buffer but not by the value.
+Nonzero padding between columns is accepted. A name table entry no word uses, or the names in
+another order, is also accepted. Each decodes to the same value as the canonical buffer, so the
+write differs from the input. The store's content hash (`read_verified`) is what pins down the
+exact bytes, so this isn't a safety problem. Example: take any buffer from
+`blaze_format::to_bytes(&ItemTree::default())` and set the `offset` of its root's first `Slice`
+(the 4 bytes at the root's offset, from header bytes 48..56) to `-4`. It reads and decodes to the
+empty tree, which is written with offset 0. So the targets check the strict invariant only on
+valid buffers edited inside the columns `decode` copies byte for byte. On arbitrary buffers they
+check that the value's write is a fixpoint (it reads back equal and is written again the same).
+To make the strict form hold, `read` would have to refuse non-canonical layouts. Say if you
+want that; until then the targets keep the two checks.
+
+**3. Bounds the targets assert.** `blaze_fuzz::allowed(len)` (1 MiB + 64 times the buffer's
+length) for the largest allocation of `read` plus `decode`. That rests on `Read::len` bounding
+every count by the words left, and on each value being at least one word.
+
+> forwarded to format: `hir-def`'s `item_tree`/`expr_store` are its (told by tmux).

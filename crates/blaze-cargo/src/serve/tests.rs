@@ -33,7 +33,7 @@ use super::{
     Daemon, Options,
     job::Value,
     plane::Inline,
-    work::{Compiled, Failed, Front, Goal, JobInput, Runs, Selection, Source, SourceFile, Steps},
+    work::{Compiled, Failed, Front, FrontEnd, Goal, JobInput, Reader, Runs, Selection, Source, SourceFile, Steps, Writer},
 };
 
 const SOCKET: &str = "run/blaze/v2.sock";
@@ -236,8 +236,8 @@ impl Steps for Fake {
         Ok((LIBRARY.into(), Source { files: vec![file], under: String::new() }))
     }
 
-    fn lower(&self, job: &JobInput) -> Result<Arc<dyn Front>, Failed> {
-        Ok(Arc::new(FakeFront { goal: job.goal }))
+    fn lower(&self, job: &JobInput) -> Result<FrontEnd, Failed> {
+        Ok(FrontEnd { front: Arc::new(FakeFront { goal: job.goal }), writer: Box::new(FakeWriter) })
     }
 
     fn register(&self, db: &mut Database) {
@@ -261,11 +261,24 @@ struct FakeFront {
     goal: Goal,
 }
 
+/// A front end's database with nothing in it: each reader is of it.
+struct FakeWriter;
+
+impl Writer for FakeWriter {
+    fn reader(&self) -> Reader {
+        Reader::new(FakeWriter)
+    }
+
+    fn ran(&mut self, _: usize, _: &load_cargo::v2::Ran) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
 /// User code that is over as it starts.
 struct Over(Vec<Response>);
 
 impl Runs for Over {
-    fn start(&mut self, _: &Store, _: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
+    fn start(&mut self, _: &Store, _: Option<&mut dyn Writer>, _: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
         out.append(&mut self.0);
         Some(true)
     }
@@ -274,7 +287,14 @@ impl Runs for Over {
         false
     }
 
-    fn complete(&mut self, _: Completion, _: &mut Store, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
+    fn complete(
+        &mut self,
+        _: Completion,
+        _: &mut Store,
+        _: Option<&mut dyn Writer>,
+        _: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
         unreachable!("it asked for nothing")
     }
 
@@ -292,7 +312,8 @@ impl Front for FakeFront {
         false
     }
 
-    fn compile(&self, _: usize) -> Result<Compiled, Failed> {
+    fn compile(&self, reader: Reader, _: usize) -> Result<Compiled, Failed> {
+        let FakeWriter = reader.take();
         assert_ne!(self.goal, Goal::Reach, "a reach compiles nothing");
         Ok(Compiled { diagnostics: Vec::new(), ok: true, puts: Vec::new(), outputs: Vec::new(), artifact: None })
     }
@@ -301,18 +322,20 @@ impl Front for FakeFront {
         Ok(Box::new(Over(Vec::new())))
     }
 
-    fn tests(&self, _: &[Artifact], selection: Selection<'_>, _: u64) -> Result<Box<dyn Runs>, ApiError> {
+    fn tests(&self, _: Reader, _: &[Artifact], selection: Selection<'_>, _: u64) -> Result<Box<dyn Runs>, ApiError> {
         assert!(selection.ub.is_none(), "tests under the evaluator are evaluated, not run");
         Ok(Box::new(Over(Vec::new())))
     }
 
-    fn ub_tests(&self, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
+    fn ub_tests(&self, reader: Reader, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
+        let FakeWriter = reader.take();
         assert_eq!(self.goal, Goal::Check, "tests under the evaluator only check their units");
         let all = ["a::adds", "a::overflows", "b::reads"];
         Ok(all.iter().filter(|it| selection.filter.iter().all(|filter| it.contains(&**filter))).map(|it| (*it).to_owned()).collect())
     }
 
-    fn evaluate(&self, test: &str, ub: Ub) -> Result<TestResult, Failed> {
+    fn evaluate(&self, reader: Reader, test: &str, ub: Ub) -> Result<TestResult, Failed> {
+        let FakeWriter = reader.take();
         let (outcome, output) = match test {
             "a::overflows" => (TestOutcome::Failed, format!("undefined behavior\nseed: {}\n", ub.seed.unwrap_or(0)).into_bytes()),
             _ => (TestOutcome::Passed, Vec::new()),
@@ -324,15 +347,16 @@ impl Front for FakeFront {
         Ok(Box::new(Over(vec![Response::Ran { code: Some(0), stdout: b"hi\n".to_vec(), stderr: Vec::new() }])))
     }
 
-    fn reach(&self, _: &dyn Front, changes: &[Change]) -> Result<Reach, Failed> {
+    fn reach(&self, reader: Reader, _: &dyn Front, from: Reader, changes: &[Change]) -> Result<Reach, Failed> {
+        let (FakeWriter, FakeWriter) = (reader.take(), from.take());
         Ok(Reach { changes: changes.to_vec(), items: Vec::new(), compiled: Vec::new(), tests: Vec::new() })
     }
 
-    fn codegen_inputs(&self) -> Result<Vec<(ContentId, ContentId)>, Failed> {
+    fn codegen_inputs(&self, _: Reader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
         Ok(Vec::new())
     }
 
-    fn tables(&self) -> Result<Vec<Table>, Failed> {
+    fn tables(&self, _: Reader) -> Result<Vec<Table>, Failed> {
         Ok(Vec::new())
     }
 }

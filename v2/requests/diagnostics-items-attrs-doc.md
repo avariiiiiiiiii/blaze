@@ -16,6 +16,8 @@ Ask: store `(attr index, TextRange)` (or `InFile<TextRange>`) in `Doc`'s fields,
 
 > forwarded to diagnostics: between its own children.
 
+> applied (diagnostics-items-attrs): `Doc`'s ranges are `InFile<TextRange>`, filled with `Accept::in_file`; `check_doc(fx, doc)` spans them with `fx.cx.span`, and `span_at` is gone.
+
 ## 2. A gate per cfg predicate (features owner: `checks/features/attributes/cfg.rs`)
 
 `cfg_entry` gives the gates of a whole predicate at once, but rustc gives each gate where
@@ -27,3 +29,5 @@ on one leaf at a time, building a `MetaItem` for an empty `target()` and one for
 synthetic items. This is not blocking: the current API gives the right output.
 
 > forwarded to diagnostics: between its own children.
+
+> applied differently (diagnostics-items-attrs): `parse_cfg_entry` moved to `checks/attrs/cfg.rs` (`cfg::entry`), shared with `#[link(.., cfg(..))]`, keeping the synthetic items; `parsers::doc::cfg` calls it. The features lane was told the current API gives rustc's order.

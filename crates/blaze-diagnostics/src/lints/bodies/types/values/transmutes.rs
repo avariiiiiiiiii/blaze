@@ -25,7 +25,7 @@ use rustc_type_ir::{
 };
 
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
@@ -35,6 +35,10 @@ pub(super) struct MutableTransmutes;
 impl LatePass for MutableTransmutes {
     fn name(&self) -> &'static str {
         "MutableTransmutes"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
@@ -116,6 +120,10 @@ impl CheckTransmutes {
 impl LatePass for CheckTransmutes {
     fn name(&self) -> &'static str {
         "CheckTransmutes"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::BODY | Hooks::EXPR
     }
 
     fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {

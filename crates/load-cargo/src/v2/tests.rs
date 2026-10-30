@@ -265,6 +265,14 @@ fn every_unit_that_compiles_is_a_crate() {
         assert!(built.lowered.krate(unit).is_some(), "unit {unit}");
     }
     assert_eq!(base_db::all_crates(&db).len(), 6);
+    // What every task shares answers as the writer does.
+    fn shared<T: Send + Sync>(_: &T) {}
+    let crates = built.lowered.crates();
+    shared(&*crates);
+    for unit in [CORE, RUN, LIB, MACRO, BIN] {
+        assert_eq!(crates.krate(unit), built.lowered.krate(unit));
+    }
+    assert!(crates.is_proc_macro(MACRO) && !crates.is_proc_macro(LIB));
     // The lib and its test are two crates of one root file.
     assert_ne!(krate(&built, LIB), krate(&built, LIB_TEST));
     assert_eq!(krate(&built, LIB).data(&db).root_file_id, krate(&built, LIB_TEST).data(&db).root_file_id);
@@ -374,7 +382,7 @@ fn a_path_under_no_mount_is_refused_naming_it() {
 
 #[test]
 fn a_run_reaches_the_units_depending_on_it_and_no_other() {
-    let built = lowered(&units()).unwrap();
+    let mut built = lowered(&units()).unwrap();
     let ran = Ran {
         cfgs: vec!["has_gen".to_owned(), "gen=\"two\"".to_owned()],
         env: vec![("GEN".to_owned(), "1".to_owned())],
@@ -413,7 +421,7 @@ fn a_run_reaches_the_units_depending_on_it_and_no_other() {
 
 #[test]
 fn a_run_is_refused_for_what_is_no_run() {
-    let built = lowered(&units()).unwrap();
+    let mut built = lowered(&units()).unwrap();
     let ran = Ran { out_dir: OUT_DIR.to_owned(), ..Ran::default() };
     assert!(built.lowered.ran(LIB, &ran).is_err());
     let elsewhere = Ran { out_dir: "/w/target/other".to_owned(), ..Ran::default() };

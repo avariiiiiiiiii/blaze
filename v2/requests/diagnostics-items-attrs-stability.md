@@ -21,6 +21,8 @@ which `parsers::stability::crate_checks` does (request 2).
 
 > forwarded to diagnostics: between its own children.
 
+> applied (diagnostics-items-attrs): the five variants are in `check::one`'s no-op arm.
+
 ## 2. `checks/attrs.rs`: call `parsers::stability::crate_checks` (parent's file)
 
 E0549, `UselessStability`, `CannotStabilizeDeprecated`, `MissingConstErr`,
@@ -61,6 +63,8 @@ checks that ordering.
 
 > forwarded to diagnostics: between its own children.
 
+> applied (diagnostics-items-attrs): `checked` calls `parsers::stability::crate_checks` as written here.
+
 ## 3. Confirm `RustcVersion::CURRENT` of the pinned nightly (coordinator)
 
 `CURRENT` in `parsers/stability.rs` is `(1, 101, 0)` for `nightly-2026-10-27`. I worked it out
@@ -81,3 +85,5 @@ aren't given. `tests/ui/stability-attribute/missing-stability-attr-at-top-level.
 `missing-const-stability.rs` need them.
 
 > forwarded to diagnostics: between its own children.
+
+> open: with diagnostics, for an effective-visibility query; `MissingStabilityAttr` and `MissingConstStabAttr` are not given until then.

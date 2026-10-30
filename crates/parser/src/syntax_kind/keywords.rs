@@ -144,6 +144,11 @@ const CONTEXTUAL_LENGTHS: (usize, usize) = lengths(&CONTEXTUAL_NAMES);
 blaze_phf::phf_table!(static STRICT_TABLE = &STRICT_NAMES;);
 blaze_phf::phf_table!(static CONTEXTUAL_TABLE = &CONTEXTUAL_NAMES;);
 
+/// Every strict, reserved and contextual keyword's text, a text in both lists twice.
+pub(super) fn texts() -> impl Iterator<Item = &'static str> {
+    STRICT_NAMES.into_iter().chain(CONTEXTUAL_NAMES)
+}
+
 /// [`SyntaxKind::from_keyword`].
 #[inline]
 pub(super) fn strict(ident: &str, edition: Edition) -> Option<SyntaxKind> {

@@ -11,7 +11,7 @@
 use std::mem::offset_of;
 
 use blaze_format::{
-    ALIGN, Aligned, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema,
+    ALIGN, Aligned, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as,
     schema_of,
 };
 use hir_def::{
@@ -28,7 +28,7 @@ use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
-use rustc_type_ir::{ClosureKind, PredicatePolarity};
+use rustc_type_ir::{ClausePolarity, ClosureKind};
 use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
 
@@ -67,7 +67,11 @@ use crate::{
 const _: () = assert!(align_of::<u128>() == ALIGN, "the type table is placed as `u128`s");
 
 /// The schema of the type table's own buffer inside an inference record.
-const TY_TABLE_SCHEMA: SchemaHash = schema("hir_ty::infer::persist::TyTable");
+const TY_TABLE_SCHEMA: SchemaHash = schema_of(&[
+    Part::Str("hir_ty::infer::persist::TyTable"),
+    Part::U64(2),
+    Part::Schema(crate::next_solver::persist::TABLE_SCHEMA),
+]);
 
 macro_rules! columns {
     (
@@ -765,7 +769,7 @@ impl Placed {
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(1),
+        Part::U64(2),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -1253,8 +1257,8 @@ impl Sink {
         let words = tys.trait_ref(trait_ref);
         self.words.extend(words);
         self.word(match polarity {
-            PredicatePolarity::Positive => 0,
-            PredicatePolarity::Negative => 1,
+            ClausePolarity::Positive => 0,
+            ClausePolarity::Negative => 1,
         });
     }
 
@@ -1547,7 +1551,7 @@ impl Sink {
     }
 
     /// A closure's data: its captures by root variable in their order, its fake reads, and its
-    /// liberated signature as its types and `FnSigKind`'s flags.
+    /// liberated signature as its types and `FnSigKind`'s flags and splatted argument.
     fn closure<'db>(&mut self, tys: &mut impl TyEncode<'db>, closure: &ClosureData) {
         let ClosureData { min_captures, fake_reads, liberated_sig } = closure;
         self.len(min_captures.len());
@@ -1597,7 +1601,8 @@ impl Sink {
         self.word(
             u32::from(kind.abi().as_packed())
                 | u32::from(kind.is_safe()) << 6
-                | u32::from(kind.c_variadic()) << 7,
+                | u32::from(kind.c_variadic()) << 7
+                | u32::from(kind.splatted().unwrap_or(FnSigKind::NO_SPLATTED_ARG_INDEX)) << 8,
         );
     }
 }
@@ -1786,8 +1791,8 @@ impl Source<'_> {
         let words = [self.word()?, self.word()?, self.word()?];
         let trait_ref = tys.trait_ref(words)?;
         let polarity = match self.word()? {
-            0 => PredicatePolarity::Positive,
-            1 => PredicatePolarity::Negative,
+            0 => ClausePolarity::Positive,
+            1 => ClausePolarity::Negative,
             _ => return Err(self.invalid("a predicate of no polarity")),
         };
         Ok(StoredTraitPredicate { trait_ref, polarity })
@@ -2104,11 +2109,23 @@ impl Source<'_> {
         let inputs_and_output = self.tys(tys)?;
         let flags = self.word()?;
         let abi = flags & 0b11_1111;
-        if flags >> 8 != 0 || abi as usize >= ExternAbi::ALL_VARIANTS.len() {
+        if flags >> 16 != 0 || abi as usize >= ExternAbi::ALL_VARIANTS.len() {
             return Err(self.invalid("a signature of no ABI"));
         }
         let safety = if flags & (1 << 6) != 0 { Safety::Safe } else { Safety::Unsafe };
-        let fn_sig_kind = FnSigKind::new(ExternAbi::from_packed(abi as u8), safety, flags & (1 << 7) != 0);
+        let splatted = (flags >> 8) as u8;
+        let splatted = (splatted != FnSigKind::NO_SPLATTED_ARG_INDEX).then_some(splatted);
+        let Some(inputs_len) = inputs_and_output.as_ref().len().checked_sub(1) else {
+            return Err(self.invalid("a signature with no output"));
+        };
+        let fn_sig_kind = FnSigKind::new(
+            ExternAbi::from_packed(abi as u8),
+            safety,
+            flags & (1 << 7) != 0,
+            splatted,
+            inputs_len,
+        )
+        .map_err(|_| self.invalid("a signature splatting an argument it does not have"))?;
         let liberated_sig =
             StoredFnSig::new(FnSig { inputs_and_output: inputs_and_output.as_ref(), fn_sig_kind });
         Ok(ClosureData { min_captures, fake_reads, liberated_sig })
@@ -2386,7 +2403,8 @@ mod tests {
             ]),
             liberated_sig: StoredFnSig::new(FnSig {
                 inputs_and_output: Tys::new_from_slice(&[types.i32, types.u8, types.bool]),
-                fn_sig_kind: FnSigKind::new(ExternAbi::RustCall, Safety::Safe, false),
+                fn_sig_kind: FnSigKind::new(ExternAbi::RustCall, Safety::Safe, false, Some(1), 2)
+                    .expect("two inputs, so index 1 is in bounds"),
             }),
         }
     }
@@ -2464,7 +2482,8 @@ mod tests {
                 fake_reads: Box::new([]),
                 liberated_sig: StoredFnSig::new(FnSig {
                     inputs_and_output: Tys::new_from_slice(&[types.unit]),
-                    fn_sig_kind: FnSigKind::new(ExternAbi::C { unwind: true }, Safety::Unsafe, true),
+                    fn_sig_kind: FnSigKind::new(ExternAbi::C { unwind: true }, Safety::Unsafe, true, None, 0)
+                        .expect("no splatted argument is always valid"),
                 }),
             })]),
             defined_anon_consts: Box::new([AnonConstId::from_id(id(31)), AnonConstId::from_id(id(32))]),

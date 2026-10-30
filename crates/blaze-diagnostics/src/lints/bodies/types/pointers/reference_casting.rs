@@ -21,7 +21,7 @@ use rustc_type_ir::{
 
 use super::{Inits, LayoutFacts, callee_item, expr_or_init, layout, peel_casts, span, type_info};
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -44,6 +44,10 @@ enum PatternKind {
 impl LatePass for InvalidReferenceCasting {
     fn name(&self) -> &'static str {
         "InvalidReferenceCasting"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

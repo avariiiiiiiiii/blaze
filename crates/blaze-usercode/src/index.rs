@@ -61,7 +61,13 @@ impl Shape {
     pub fn values<I: Inputs>(&self, inputs: &mut I) -> Result<Traced, I::Error> {
         let mut traced = Traced::default();
         for path in &self.files {
-            traced.files.push((path.clone(), inputs.file(path)?));
+            match trace::walked(path) {
+                Some((dir, package)) => match trace::walk(inputs, dir, package)? {
+                    Some(hash) => traced.dirs.push((path.clone(), hash)),
+                    None => traced.files.push((path.clone(), None)),
+                },
+                None => traced.files.push((path.clone(), inputs.file(path)?)),
+            }
         }
         for path in &self.dirs {
             let hash = match trace::walked(path) {
@@ -236,9 +242,18 @@ fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option
     let mut at = At(rest);
     let mut keyer = trace::Keyer::new(run);
     for _ in 0..at.len().map_err(bad)? {
-        let path = at.part().map_err(bad)?;
-        let hash = inputs.file(&trace::path_in(path).map_err(bad)?).map_err(Keyed::Inputs)?;
-        keyer.file(path, hash.as_ref());
+        let bytes = at.part().map_err(bad)?;
+        let path = trace::path_in(bytes).map_err(bad)?;
+        let hash = match trace::walked(&path) {
+            // A walked directory that was not there: one there now is what the run did not
+            // read.
+            Some((dir, package)) => match trace::walk(inputs, dir, package).map_err(Keyed::Inputs)? {
+                Some(_) => return Ok(None),
+                None => None,
+            },
+            None => inputs.file(&path).map_err(Keyed::Inputs)?,
+        };
+        keyer.file(bytes, hash.as_ref());
     }
     for _ in 0..at.len().map_err(bad)? {
         let bytes = at.part().map_err(bad)?;
@@ -268,7 +283,7 @@ fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option
                 keyer.env(trace::os_bytes(set), Some(trace::os_bytes(value)));
             }
             if name == ALL_ENV_NAME.as_bytes() {
-                keyer.env(name, Some(&hex));
+                keyer.env(name, Some(hex.as_slice()));
             } else if let Some((_, value)) = all.next_if(|it| trace::os_bytes(&it.0) == name) {
                 keyer.env(name, Some(trace::os_bytes(value)));
             } else {

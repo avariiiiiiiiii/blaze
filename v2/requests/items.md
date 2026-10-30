@@ -245,6 +245,7 @@ edges. Same impls, same order; faster because it drops one query read per impl, 
 branch, and the edges (docs/v2/plan/design/data.md: flags as bitsets, lists as CSR).
 
 > forwarded to db: `ItemScope` (`hir-def/src/nameres`) is lane db's, not format's. The reader in `method_resolution.rs` `collect_def_map` (now mine) moves to the bitset once it exists.
+> applied by db-expand: `ItemScope::impls` is a `ThinVec<ImplId>` in declaration order, beside two bitsets of its length, `trait_impl` and `reservation_impl` (`item_scope.rs` `Bits`, a `u64` word per 64 impls). `impls()`, `trait_impls()` and `inherent_impls()` keep their signatures and declaration order. New `trait_impls_without_reservation()`. The collector sets the bit from `attrs.by_key(sym::rustc_reservation_impl).exists()` on the cfg-expanded attrs, which agrees with `AttrFlags::RUSTC_RESERVATION_IMPL`. It is compared in `PartialEq`, shrunk, encoded and decoded in `nameres/frozen.rs` (`ENCODING` bumped to 8). I kept one ordered list with bitsets, not the two CSR lists, because three readers rely on declaration order. Test `impls_keep_their_order_and_their_reservation_bit` (`nameres/tests.rs`: a plain, a reserved and two `cfg_attr` impls; the frozen bytes round-trip under `Mode::Verify`). What waits: `method_resolution.rs:1655-1670` uses `trait_impls_without_reservation()` and drops its `AttrFlags::query` per impl.
 
 ## items-hirty: candidate assembly across crates (db, `next_solver`)
 
@@ -646,3 +647,82 @@ fn is_freeze_walks_every_variant() {
 ```
 
 > applied (items): `crates/blaze-items/src/tests/coherence.rs` with the contents above, and `mod coherence;` in `tests/mod.rs` (before `mod db;`, in order).
+
+## speed-backend-sanitize, for lane items: a function's effective `#[sanitize]` set in its form (`crates/blaze-items/src/form.rs`)
+
+What: where the form hashes a function's `AttrFlags` (`form.rs:832`), also hash
+`hir_def::attrs::disabled_sanitizers(db, func)` (requested of db, `v2/requests/db.md`, same
+date) as one byte. It is inherited from the impl, module and crate, so it changes when a
+parent's `#[sanitize(..)]` does, with no change to the function's own attributes.
+Why: the attributes LLVM gets differ with it (S2 of `v2/requests/codegen.md`), so the code hash
+of the function, and with it the unit key, must too.
+
+> written by speed-backend-sanitize (2026-10-29); told items by tmux.
+
+> applied (items): `f.u8(hir_def::attrs::disabled_sanitizers(db, func))` after the target
+> features in `FormCx::function` (`crates/blaze-items/src/form.rs`). It needs db's query
+> (`v2/requests/db.md`, "From speed-backend-sanitize"), which isn't in `hir-def` yet.
+> forwarded to items (told by speed-backend-sanitize).
+
+## items, for db-ty, codegen, safety and requests: the layout queries return interned layouts (fastcompile-ident-hashcons 5)
+
+What items did (`crates/hir-ty/src/layout.rs`, `layout/adt.rs`):
+
+- `pub struct InternedLayout(pub Layout)`, with `Deref<Target = Layout>`, `AsRef<Layout>` and
+  `blaze_hashcons::Consed` (domain `"blaze v2 layout 1"`, content: `Layout`'s derived `Hash`).
+- One `static LAYOUTS: LazyLock<HashCons<InternedLayout>>`, never freed.
+- `pub fn intern_layout(Layout) -> Interned<'static, InternedLayout>`, for code that makes a
+  layout of its own.
+- `layout_of_ty_query` and `layout_of_adt_query` return
+  `Result<Interned<'static, InternedLayout>, LayoutError>` (still `returns(clone)`; a copy is
+  one pointer).
+
+Reads like `layout.size`, `layout.variants` and `&layout` (as `&Layout`) work unchanged
+through the two `Deref`s. Only code that names `Arc<Layout>` changes. With
+`use blaze_hashcons::Interned;` and `use hir_ty::layout::{InternedLayout, intern_layout};`:
+
+1. **db-ty** (`v2/requests/db-ty.md`):
+   - `crates/hir-ty/Cargo.toml`: `blaze-hashcons.workspace = true` under `# local deps`. It is
+     already in the root `[workspace.dependencies]`, and depends only on `blaze-format` and
+     `blaze-ids`.
+   - `crates/hir-ty/src/db.rs`: `fn layout_of_adt` and `fn layout_of_ty` (lines 259-276)
+     return `Result<Interned<'static, InternedLayout>, LayoutError>`. Import `InternedLayout`
+     beside `Layout` at line 30, and drop `Arc` there if nothing else uses it.
+   - `crates/hir/src/lib.rs`:
+     - `pub struct Layout<'db>(Arc<TyLayout>, &'db TargetDataLayout)` (line 6069) holds
+       `Interned<'static, InternedLayout>`;
+     - `Variant::layout` (line 1195) makes `intern_layout(TyLayout::for_variant(&parent_layout.0, ..))`
+       in place of `Arc::new(..)`;
+     - the `.0` reads stay as they are.
+2. **codegen** (`crates/hir-ty-mir/`, `crates/hir-ty-codegen/`):
+   - `hir-ty-mir/src/mir/eval.rs`:
+     - `layout_cache` (line 279) maps to `Interned<'static, InternedLayout>`;
+     - `fn layout` and `fn layout_adt` (lines 813 and 825) return it;
+     - the variant tuple at line 1999 holds it, and line 2037 makes `intern_layout(variant_layout)`.
+   - `hir-ty-mir/src/mir/eval/shim.rs:213`: `layout: Interned<'static, InternedLayout>`.
+   - `hir-ty-mir/src/mir/transform.rs:113`: `layout_of` returns
+     `Option<Interned<'static, InternedLayout>>`.
+   - `hir-ty-codegen/sve.rs:174`: `storage` takes and returns `Interned<'static, InternedLayout>`:
+     `let mut storage = layout.0.clone(); ..; intern_layout(storage)`.
+   - `hir-ty-codegen/mod.rs`:
+     - in `fn layout` (line 8665), `let layout: &'cx Layout = &sve::storage(layout).get().0;`;
+     - `KeptLayouts::asked` (line 8355) and its test (line 19862) go: a `&'static Layout`
+       needs no arena to outlive `build`.
+3. **safety** (`crates/hir-ty-ub/src/check/valid.rs`): `layouts` (line 267) and `fn layout`
+   (line 857) use `Interned<'static, InternedLayout>` in place of `Arc<Layout>`.
+4. **requests** (`crates/hir-ide/src/tests/layout.rs`): `eval_goal` and `eval_expr` (lines 41
+   and 112) return `Result<Interned<'static, InternedLayout>, LayoutError>`.
+
+No other caller names the type: `rg 'Arc<Layout>|Arc<crate::layout::Layout>|Arc<TyLayout>' crates`
+gives the lines above and nothing else.
+
+Why: `v2/requests/fastcompile.md`, fastcompile-ident-hashcons 5.
+- A layout read clones an `Arc` today: a shared counter write on the read path, which
+  `docs/v2/plan/design/concurrency.md` rules out.
+- Interned, a read is a pointer copy and equality is a pointer compare.
+- Equal layouts are kept once, and salsa's fingerprint of the value hashes 16 bytes computed
+  at intern time.
+
+> written by items (2026-10-29).
+> applied (`requests'` part 4): `crates/hir-ide/src/tests/layout.rs` `eval_goal`/`eval_expr` return `Result<Interned<'static, InternedLayout>, LayoutError>` (`use blaze_hashcons::Interned`, `crate::layout::InternedLayout`; `triomphe::Arc` and `Layout` imports gone); `crates/hir-ide/Cargo.toml` dev-dependency `blaze-hashcons.workspace = true`. Parts 1-3 are db's, codegen's and safety's (items wrote them to each).
+> applied (requests' part, item 4): `crates/hir-ide/src/tests/layout.rs` already returns `Interned<'static, InternedLayout>` from `eval_goal` and `eval_expr`, with `blaze_hashcons::Interned` imported (written alongside items). > forwarded to db (1), codegen (2), safety (3).

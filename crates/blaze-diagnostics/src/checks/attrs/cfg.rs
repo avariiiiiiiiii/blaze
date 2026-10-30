@@ -4,12 +4,13 @@
 //! lint of a predicate is `lints::syntax::check_cfg`'s.
 //!
 //! Follows rustc's `compiler/rustc_attr_parsing/src/attributes/cfg.rs` (`parse_cfg_entry`,
-//! `parse_cfg_entry_version`, `parse_cfg_entry_target`, `parse_name_value`) and
-//! `compiler/rustc_attr_parsing/src/attributes/util.rs` (`parse_version`) (MIT or Apache-2.0).
+//! `parse_cfg_entry_version`, `parse_cfg_entry_target`, `parse_name_value`) (MIT or
+//! Apache-2.0).
 
 use super::{
     accept::Accept,
     args::{ArgParser, Ident, LitKind, MetaItem, MetaItemOrLit, MetaList, NameValue, Path},
+    parsers::parse_version,
 };
 use crate::{
     checks::features::attributes,
@@ -82,7 +83,7 @@ fn version(cx: &mut Accept<'_, '_, '_>, item: &MetaItemOrLit, list: &MetaList) -
         cx.emit_err(diag);
         return false;
     };
-    if !is_version(text) {
+    if parse_version(text).is_none() {
         let mut diag =
             Diag::new(Level::Warning, None, "unknown version literal format, assuming it refers to a future version");
         diag.span = MultiSpan::of(cx.span(lit.range));
@@ -142,29 +143,4 @@ fn gates(cx: &mut Accept<'_, '_, '_>, item: &MetaItemOrLit) {
 /// rustc's `Symbol::is_path_segment_keyword`.
 fn is_path_segment_keyword(name: &str) -> bool {
     matches!(name, "{{root}}" | "crate" | "self" | "Self" | "super" | "$crate")
-}
-
-/// Whether `parse_version` reads `text`: `major.minor[.patch]`, without a `-` suffix.
-fn is_version(text: &str) -> bool {
-    if text.contains('-') {
-        return false;
-    }
-    let mut digits = text.splitn(3, '.');
-    let number = |it: &str| it.parse::<u16>().is_ok();
-    digits.next().is_some_and(number) && digits.next().is_some_and(number) && digits.next().is_none_or(number)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_version;
-
-    #[test]
-    fn a_version_is_two_or_three_numbers() {
-        assert!(is_version("1.42"));
-        assert!(is_version("1.42.0"));
-        assert!(!is_version("1"));
-        assert!(!is_version("1.42.0-nightly"));
-        assert!(!is_version("1.42.x"));
-        assert!(!is_version("1.42.0.1"));
-    }
 }

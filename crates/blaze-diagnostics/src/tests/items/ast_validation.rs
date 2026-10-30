@@ -3,7 +3,7 @@
 //! and the rest named at each test), verbatim: each source and the whole `.stderr` rustc
 //! writes for it, the errors of other passes in it included.
 
-use crate::tests::ui;
+use crate::tests::{items::ui_core, ui};
 
 #[test]
 fn an_unsafe_inherent_impl_is_refused() {
@@ -1365,4 +1365,412 @@ error: aborting due to 10 previous errors
 For more information about this error, try `rustc --explain E0425`.
 "###;
     assert_eq!(ui("issue-86053-1.rs", "2015", source), stderr);
+}
+
+#[test]
+fn a_pattern_in_a_foreign_function() {
+    // tests/ui/error-codes/E0130.rs
+    let source = r#"extern "C" {
+    fn foo((a, b): (u32, u32));
+//~^ ERROR E0130
+}
+
+fn main() {}
+"#;
+    let stderr = r#"error[E0130]: patterns aren't allowed in foreign function declarations
+  --> $DIR/E0130.rs:2:12
+   |
+LL |     fn foo((a, b): (u32, u32));
+   |            ^^^^^^ pattern not allowed in foreign function
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0130`.
+"#;
+    assert_eq!(ui("E0130.rs", "2015", source), stderr);
+}
+
+#[test]
+fn literal_unit_struct_and_tuple_patterns_in_foreign_functions() {
+    // tests/ui/extern/foreign-fn-pattern-error-10877.rs
+    let source = r#"//! Regression test for https://github.com/rust-lang/rust/issues/10877
+
+struct Foo {
+    x: isize,
+}
+extern "C" {
+    fn foo(1: ());
+    //~^ ERROR: patterns aren't allowed in foreign function declarations
+    fn bar((): isize);
+    //~^ ERROR: patterns aren't allowed in foreign function declarations
+    fn baz(Foo { x }: isize);
+    //~^ ERROR: patterns aren't allowed in foreign function declarations
+    fn qux((x, y): ());
+    //~^ ERROR: patterns aren't allowed in foreign function declarations
+    fn this_is_actually_ok(a: usize);
+    fn and_so_is_this(_: usize);
+}
+fn main() {}
+"#;
+    let stderr = r#"error[E0130]: patterns aren't allowed in foreign function declarations
+  --> $DIR/foreign-fn-pattern-error-10877.rs:7:12
+   |
+LL |     fn foo(1: ());
+   |            ^ pattern not allowed in foreign function
+
+error[E0130]: patterns aren't allowed in foreign function declarations
+  --> $DIR/foreign-fn-pattern-error-10877.rs:9:12
+   |
+LL |     fn bar((): isize);
+   |            ^^ pattern not allowed in foreign function
+
+error[E0130]: patterns aren't allowed in foreign function declarations
+  --> $DIR/foreign-fn-pattern-error-10877.rs:11:12
+   |
+LL |     fn baz(Foo { x }: isize);
+   |            ^^^^^^^^^ pattern not allowed in foreign function
+
+error[E0130]: patterns aren't allowed in foreign function declarations
+  --> $DIR/foreign-fn-pattern-error-10877.rs:13:12
+   |
+LL |     fn qux((x, y): ());
+   |            ^^^^^^ pattern not allowed in foreign function
+
+error: aborting due to 4 previous errors
+
+For more information about this error, try `rustc --explain E0130`.
+"#;
+    assert_eq!(ui("foreign-fn-pattern-error-10877.rs", "2015", source), stderr);
+}
+
+#[test]
+fn free_statics_without_bodies() {
+    // tests/ui/parser/item-free-static-no-body-semantic-fail.rs
+    let source = r#"// Semantically, a free `static` item cannot omit its body.
+
+fn main() {}
+
+static A: u8; //~ ERROR free static item without body
+static B; //~ ERROR free static item without body
+//~^ ERROR missing type for `static` item
+
+static mut C: u8; //~ ERROR free static item without body
+static mut D; //~ ERROR free static item without body
+//~^ ERROR missing type for `static mut` item
+"#;
+    let stderr = r#"error: free static item without body
+  --> $DIR/item-free-static-no-body-semantic-fail.rs:5:1
+   |
+LL | static A: u8;
+   | ^^^^^^^^^^^^-
+   |             |
+   |             help: provide a definition for the static: `= <expr>;`
+
+error: free static item without body
+  --> $DIR/item-free-static-no-body-semantic-fail.rs:6:1
+   |
+LL | static B;
+   | ^^^^^^^^-
+   |         |
+   |         help: provide a definition for the static: `= <expr>;`
+
+error: free static item without body
+  --> $DIR/item-free-static-no-body-semantic-fail.rs:9:1
+   |
+LL | static mut C: u8;
+   | ^^^^^^^^^^^^^^^^-
+   |                 |
+   |                 help: provide a definition for the static: `= <expr>;`
+
+error: free static item without body
+  --> $DIR/item-free-static-no-body-semantic-fail.rs:10:1
+   |
+LL | static mut D;
+   | ^^^^^^^^^^^^-
+   |             |
+   |             help: provide a definition for the static: `= <expr>;`
+
+error: missing type for `static` item
+  --> $DIR/item-free-static-no-body-semantic-fail.rs:6:9
+   |
+LL | static B;
+   |         ^
+   |
+help: provide a type for the item
+   |
+LL | static B: <type>;
+   |         ++++++++
+
+error: missing type for `static mut` item
+  --> $DIR/item-free-static-no-body-semantic-fail.rs:10:13
+   |
+LL | static mut D;
+   |             ^
+   |
+help: provide a type for the item
+   |
+LL | static mut D: <type>;
+   |             ++++++++
+
+error: aborting due to 6 previous errors
+
+"#;
+    assert_eq!(ui("item-free-static-no-body-semantic-fail.rs", "2015", source), stderr);
+}
+
+#[test]
+fn free_consts_without_bodies() {
+    // tests/ui/parser/item-free-const-no-body-semantic-fail.rs
+    let source = r#"// Semantically, a free `const` item cannot omit its body.
+
+fn main() {}
+
+const A: u8; //~ ERROR free constant item without body
+const B; //~ ERROR free constant item without body
+//~^ ERROR missing type for `const` item
+"#;
+    let stderr = r#"error: free constant item without body
+  --> $DIR/item-free-const-no-body-semantic-fail.rs:5:1
+   |
+LL | const A: u8;
+   | ^^^^^^^^^^^-
+   |            |
+   |            help: provide a definition for the constant: `= <expr>;`
+
+error: free constant item without body
+  --> $DIR/item-free-const-no-body-semantic-fail.rs:6:1
+   |
+LL | const B;
+   | ^^^^^^^-
+   |        |
+   |        help: provide a definition for the constant: `= <expr>;`
+
+error: missing type for `const` item
+  --> $DIR/item-free-const-no-body-semantic-fail.rs:6:8
+   |
+LL | const B;
+   |        ^
+   |
+help: provide a type for the item
+   |
+LL | const B: <type>;
+   |        ++++++++
+
+error: aborting due to 3 previous errors
+
+"#;
+    assert_eq!(ui("item-free-const-no-body-semantic-fail.rs", "2015", source), stderr);
+}
+
+#[test]
+fn an_inherent_associated_const_without_a_body() {
+    // tests/ui/parser/impl-item-const-semantic-fail.rs
+    let source = r#"fn main() {}
+
+struct X;
+
+impl X {
+    const Y: u8; //~ ERROR associated constant in `impl` without body
+}
+"#;
+    let stderr = r#"error: associated constant in `impl` without body
+  --> $DIR/impl-item-const-semantic-fail.rs:6:5
+   |
+LL |     const Y: u8;
+   |     ^^^^^^^^^^^-
+   |                |
+   |                help: provide a definition for the constant: `= <expr>;`
+
+error: aborting due to 1 previous error
+
+"#;
+    assert_eq!(ui("impl-item-const-semantic-fail.rs", "2015", source), stderr);
+}
+
+#[test]
+fn inherent_associated_types_without_bodies_before_their_bounds() {
+    // tests/ui/parser/impl-item-type-no-body-semantic-fail.rs
+    let source = r#"fn main() {}
+
+struct X;
+
+impl X {
+    type Y;
+    //~^ ERROR associated type in `impl` without body
+    //~| ERROR inherent associated types are unstable
+    type Z: Ord;
+    //~^ ERROR associated type in `impl` without body
+    //~| ERROR bounds on `type`s in `impl`s have no effect
+    //~| ERROR inherent associated types are unstable
+    type W: Ord where Self: Eq;
+    //~^ ERROR associated type in `impl` without body
+    //~| ERROR bounds on `type`s in `impl`s have no effect
+    //~| ERROR inherent associated types are unstable
+    //~| ERROR `X: Eq` is not satisfied
+    type W where Self: Eq;
+    //~^ ERROR associated type in `impl` without body
+    //~| ERROR inherent associated types are unstable
+    //~| ERROR duplicate definitions
+    //~| ERROR `X: Eq` is not satisfied
+}
+"#;
+    let stderr = r#"error: associated type in `impl` without body
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:6:5
+   |
+LL |     type Y;
+   |     ^^^^^^-
+   |           |
+   |           help: provide a definition for the type: `= <type>;`
+
+error: associated type in `impl` without body
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:9:5
+   |
+LL |     type Z: Ord;
+   |     ^^^^^^^^^^^-
+   |                |
+   |                help: provide a definition for the type: `= <type>;`
+
+error: bounds on `type`s in `impl`s have no effect
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:9:13
+   |
+LL |     type Z: Ord;
+   |             ^^^
+
+error: associated type in `impl` without body
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:13:5
+   |
+LL |     type W: Ord where Self: Eq;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^-
+   |                               |
+   |                               help: provide a definition for the type: `= <type>;`
+
+error: bounds on `type`s in `impl`s have no effect
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:13:13
+   |
+LL |     type W: Ord where Self: Eq;
+   |             ^^^
+
+error: associated type in `impl` without body
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:18:5
+   |
+LL |     type W where Self: Eq;
+   |     ^^^^^^^^^^^^^^^^^^^^^-
+   |                          |
+   |                          help: provide a definition for the type: `= <type>;`
+
+error[E0658]: inherent associated types are unstable
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:6:5
+   |
+LL |     type Y;
+   |     ^^^^^^^
+   |
+   = note: see issue #8995 <https://github.com/rust-lang/rust/issues/8995> for more information
+   = help: add `#![feature(inherent_associated_types)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0658]: inherent associated types are unstable
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:9:5
+   |
+LL |     type Z: Ord;
+   |     ^^^^^^^^^^^^
+   |
+   = note: see issue #8995 <https://github.com/rust-lang/rust/issues/8995> for more information
+   = help: add `#![feature(inherent_associated_types)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0658]: inherent associated types are unstable
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:13:5
+   |
+LL |     type W: Ord where Self: Eq;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: see issue #8995 <https://github.com/rust-lang/rust/issues/8995> for more information
+   = help: add `#![feature(inherent_associated_types)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0658]: inherent associated types are unstable
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:18:5
+   |
+LL |     type W where Self: Eq;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: see issue #8995 <https://github.com/rust-lang/rust/issues/8995> for more information
+   = help: add `#![feature(inherent_associated_types)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0277]: the trait bound `X: Eq` is not satisfied
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:13:23
+   |
+LL |     type W: Ord where Self: Eq;
+   |                       ^^^^^^^^ the trait `Eq` is not implemented for `X`
+   |
+help: consider annotating `X` with `#[derive(Eq)]`
+   |
+LL + #[derive(Eq)]
+LL | struct X;
+   |
+help: add `#![feature(trivial_bounds)]` to the crate attributes to enable
+   |
+LL + #![feature(trivial_bounds)]
+   |
+
+error[E0277]: the trait bound `X: Eq` is not satisfied
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:18:18
+   |
+LL |     type W where Self: Eq;
+   |                  ^^^^^^^^ the trait `Eq` is not implemented for `X`
+   |
+help: consider annotating `X` with `#[derive(Eq)]`
+   |
+LL + #[derive(Eq)]
+LL | struct X;
+   |
+help: add `#![feature(trivial_bounds)]` to the crate attributes to enable
+   |
+LL + #![feature(trivial_bounds)]
+   |
+
+error[E0592]: duplicate definitions with name `W`
+  --> $DIR/impl-item-type-no-body-semantic-fail.rs:18:5
+   |
+LL |     type W: Ord where Self: Eq;
+   |     ------ other definition for `W`
+...
+LL |     type W where Self: Eq;
+   |     ^^^^^^ duplicate definitions for `W`
+
+error: aborting due to 13 previous errors
+
+Some errors have detailed explanations: E0277, E0592, E0658.
+For more information about an error, try `rustc --explain E0277`.
+"#;
+    assert_eq!(ui_core("impl-item-type-no-body-semantic-fail.rs", "2015", "ord, derive", source), stderr);
+}
+
+#[test]
+fn an_unsafe_negative_impl() {
+    // tests/ui/error-codes/E0198.rs
+    let source = r#"#![feature(negative_impls)]
+
+struct Foo;
+
+unsafe impl !Send for Foo { } //~ ERROR E0198
+
+fn main() {
+}
+"#;
+    let stderr = r#"error[E0198]: negative impls cannot be unsafe
+  --> $DIR/E0198.rs:5:13
+   |
+LL | unsafe impl !Send for Foo { }
+   | ------      -^^^^
+   | |           |
+   | |           negative because of this
+   | unsafe because of this
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0198`.
+"#;
+    assert_eq!(ui_core("E0198.rs", "2015", "send", source), stderr);
 }

@@ -21,7 +21,7 @@ use syntax::{AstNode, ast};
 
 use super::for_loop;
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -39,6 +39,10 @@ pub(crate) struct ShadowedIntoIter {
 impl LatePass for ShadowedIntoIter {
     fn name(&self) -> &'static str {
         "ShadowedIntoIter"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::BODY | Hooks::EXPR
     }
 
     fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {

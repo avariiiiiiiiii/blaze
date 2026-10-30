@@ -51,6 +51,12 @@ pub(crate) fn lang(name: &str) -> Option<Lang> {
     Some(Lang { name, kind, since, issue })
 }
 
+/// rustc's `UNSTABLE_LANG_FEATURES`: the unstable language features in the order `unstable.rs`
+/// declares them, the order `find_best_match_for_name` breaks ties in.
+pub(crate) fn unstable_declared() -> impl ExactSizeIterator<Item = &'static str> {
+    lang::DECLARED.iter().map(|&at| lang::LANG[usize::from(at)].0)
+}
+
 /// Why the removed feature `name` was removed and the pull request that removed it, if it is
 /// one.
 pub(crate) fn removed(name: &str) -> Option<(Option<&'static str>, Option<u32>)> {
@@ -96,6 +102,19 @@ mod tests {
         let removed = lang::LANG.iter().filter(|it| it.1 == Kind::Removed).count();
         assert_eq!(removed, lang::REMOVED.len());
         assert!(lang::REMOVED.iter().all(|it| lang(it.0).is_some_and(|it| it.kind == Kind::Removed)));
+    }
+
+    #[test]
+    fn the_declared_order_has_each_unstable_feature_once() {
+        let unstable = lang::LANG.iter().filter(|it| it.1.is_unstable()).count();
+        let mut seen = vec![false; lang::LANG.len()];
+        for &at in lang::DECLARED {
+            assert!(lang::LANG[usize::from(at)].1.is_unstable() && !seen[usize::from(at)]);
+            seen[usize::from(at)] = true;
+        }
+        assert_eq!(lang::DECLARED.len(), unstable);
+        let declared: Vec<_> = unstable_declared().take(3).collect();
+        assert_eq!(declared, ["abi_unadjusted", "allocator_internals", "allow_internal_unsafe"]);
     }
 
     #[test]

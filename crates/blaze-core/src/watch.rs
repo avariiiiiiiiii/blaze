@@ -25,6 +25,8 @@ const MASK: u32 = libc::IN_CREATE
     | libc::IN_MOVED_FROM
     | libc::IN_MOVED_TO
     | libc::IN_ATTRIB
+    | libc::IN_DELETE_SELF
+    | libc::IN_MOVE_SELF
     | libc::IN_EXCL_UNLINK;
 
 /// The head of an event, before its name.
@@ -67,6 +69,45 @@ impl Tree {
             Kind::Inotify(it) => it.take(bytes),
         }
     }
+
+    /// Reads every event queued on the descriptor until it has none, handing what each read
+    /// says to `each`: a flush's barrier. inotify and fanotify queue an event in the call that
+    /// made the change, so once the descriptor is empty every change made before this began
+    /// has been read. Nothing else may read the descriptor meanwhile; the caller holds every
+    /// other reader off (the threads driver reads it on this thread only; the ring driver
+    /// only once the ring's read of it has completed).
+    pub(crate) fn drain(&mut self, buffer: &mut [u8], mut each: impl FnMut(Done)) -> io::Result<()> {
+        loop {
+            let mut fd = libc::pollfd { fd: self.raw(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: one pollfd of an open descriptor; no wait.
+            let ready = unsafe { libc::poll(&raw mut fd, 1, 0) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if ready == 0 || fd.revents & libc::POLLIN == 0 {
+                return Ok(());
+            }
+            // SAFETY: the buffer has room for what is read.
+            let n = unsafe { libc::read(self.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
+            if n > 0 {
+                each(self.take(&buffer[..n as usize]));
+                continue;
+            }
+            if n == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINTR) => {}
+                Some(libc::EAGAIN) => return Ok(()),
+                _ => return Err(error),
+            }
+        }
+    }
 }
 
 struct Inotify {
@@ -74,6 +115,10 @@ struct Inotify {
     root: PathBuf,
     /// Each directory watched, by its watch, relative to the root ("" for the root).
     dirs: FxHashMap<i32, String>,
+    /// The watched directory. inotify watches an inode, not a name: once it is deleted or
+    /// moved, nothing made at its name again is heard of, so that is told as a change of the
+    /// directory itself, lost (whoever watches watches again).
+    top: FileName,
 }
 
 impl Inotify {
@@ -87,7 +132,8 @@ impl Inotify {
         }
         // SAFETY: the call returned a descriptor of its own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let mut watch = Inotify { fd, root: root.to_owned(), dirs: FxHashMap::default() };
+        let mut watch =
+            Inotify { fd, root: root.to_owned(), dirs: FxHashMap::default(), top: dir.clone() };
         watch.add_tree(dir.as_str(), &mut Vec::new())?;
         Ok(watch)
     }
@@ -143,14 +189,22 @@ impl Inotify {
             let name_bytes = &bytes[at + HEAD..(at + HEAD + len).min(bytes.len())];
             at += HEAD + len;
             if mask & libc::IN_Q_OVERFLOW != 0 {
+                // What was dropped may be the watched directory's own end.
+                files.push(self.top.clone());
                 lost = true;
                 continue;
             }
             if mask & libc::IN_IGNORED != 0 {
-                self.dirs.remove(&wd);
+                if self.dirs.remove(&wd).is_some_and(|it| it == self.top.as_str()) {
+                    files.push(self.top.clone());
+                    lost = true;
+                }
                 continue;
             }
             let Some(dir) = self.dirs.get(&wd) else { continue };
+            if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 && *dir == self.top.as_str() {
+                lost = true;
+            }
             let end = name_bytes.iter().position(|&it| it == 0).unwrap_or(name_bytes.len());
             let name = String::from_utf8_lossy(&name_bytes[..end]);
             rel.clear();

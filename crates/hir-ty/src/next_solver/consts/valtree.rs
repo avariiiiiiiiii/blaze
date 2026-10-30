@@ -15,7 +15,7 @@ use crate::{
     utils::detect_variant_from_bytes,
 };
 
-use super::{DbInterner, Ty};
+use super::{ConstExt, DbInterner, Ty};
 
 pub type ValTreeKind<'db> = rustc_type_ir::ValTreeKind<DbInterner<'db>>;
 
@@ -31,8 +31,8 @@ pub struct ValueConst<'db> {
 }
 
 impl<'db> ValueConst<'db> {
-    pub fn new(ty: Ty<'db>, kind: ValTreeKind<'db>) -> Self {
-        let value = ValTree::new(kind);
+    #[inline]
+    pub fn new(ty: Ty<'db>, value: ValTree<'db>) -> Self {
         ValueConst { ty, value }
     }
 
@@ -315,12 +315,60 @@ pub(super) fn allocation_to_const<'db>(
 }
 
 impl<'db> rustc_type_ir::inherent::ValueConst<DbInterner<'db>> for ValueConst<'db> {
+    #[inline]
+    fn new(ty: Ty<'db>, valtree: ValTree<'db>) -> Self {
+        ValueConst { ty, value: valtree }
+    }
+
     fn ty(self) -> Ty<'db> {
         self.ty
     }
 
     fn valtree(self) -> ValTree<'db> {
         self.value
+    }
+
+    fn try_to_target_usize(self, interner: DbInterner<'db>) -> Option<u64> {
+        let data_layout = interner.db.target_data_layout_or_default(interner.expect_crate());
+        ValueConst::try_to_target_usize(self, data_layout)
+    }
+}
+
+impl fmt::Display for ValueConst<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.ty.kind(), self.value.inner()) {
+            (TyKind::Bool, ValTreeKind::Leaf(leaf)) => match leaf.try_to_bool() {
+                Ok(value) => write!(f, "{value}"),
+                Err(()) => write!(f, "{leaf:?}_bool"),
+            },
+            (TyKind::Char, ValTreeKind::Leaf(leaf)) => match char::try_from(*leaf) {
+                Ok(value) => write!(f, "{value:?}"),
+                Err(_) => write!(f, "{leaf:?}_char"),
+            },
+            (TyKind::Int(int), ValTreeKind::Leaf(leaf)) => {
+                write!(f, "{}_{}", leaf.to_int_unchecked(), int.name_str())
+            }
+            (TyKind::Uint(uint), ValTreeKind::Leaf(leaf)) => {
+                write!(f, "{}_{}", leaf.to_uint_unchecked(), uint.name_str())
+            }
+            (_, valtree) => write!(f, "{valtree:?}: {:?}", self.ty),
+        }
+    }
+}
+
+/// The value a [`ScalarInt`] leaf stands for (`Interner::Scalar`). A value tree's leaf is always
+/// an integer (hir-ty keeps no pointer in a leaf), so the scalar is the integer itself.
+pub type Scalar = ScalarInt;
+
+impl<'db> rustc_type_ir::inherent::ScalarInt<DbInterner<'db>> for ScalarInt {
+    #[inline]
+    fn to_scalar(self) -> Scalar {
+        self
+    }
+
+    #[inline]
+    fn try_from_uint(i: impl Into<u128>, size: Size) -> Option<Self> {
+        ScalarInt::try_from_uint(i, size)
     }
 }
 
@@ -338,7 +386,9 @@ pub struct ValTree<'db> {
 
 const _: () = assert!(size_of::<Option<ValTree<'static>>>() == 4);
 
-impl<'db, V: WorldExposer> GenericTypeVisitable<V> for ValTree<'db> {
+// SAFETY: the handle holds one value, its row's kind, which this visits whenever the visitor
+// asks to go into the row.
+unsafe impl<'db, V: WorldExposer> GenericTypeVisitable<V> for ValTree<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
         if visitor.on_interned(VALTREES.name(), self.index.get()).is_continue() {
             self.inner().generic_visit_with(visitor);
@@ -389,6 +439,12 @@ impl<'db> ValTree<'db> {
 
     pub fn from_scalar_int(_interner: DbInterner<'db>, i: ScalarInt) -> Self {
         ValTree::new(ValTreeKind::Leaf(i))
+    }
+
+    /// The value of a zero-sized type, as rustc's `ValTree::zst`: a branch with no fields.
+    #[inline]
+    pub fn zst() -> Self {
+        ValTree::new(ValTreeKind::Branch(Consts::empty()))
     }
 
     #[inline]

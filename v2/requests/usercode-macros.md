@@ -126,15 +126,12 @@ file, and a decode of the expansion in place.
 
 > forwarded to concurrency (the store's lock-free read view: lane concurrency is writing `blaze_cas::Reader`), to usercode (`blaze-usercode`'s `Disk`, the sandbox trace record) and to coordinator (`vendor/proc-macro-srv` has no owner, as usercode-macros 3).
 
-- **usercode** (`crates/blaze-usercode/src/lib.rs`): a `Given` that hashes as it is built.
-  Today `Given::part` copies each part into a `BTreeMap<&str, Vec<u8>>` and `Given::env` makes
-  two `OsString`s per variable, all only to be hashed by `finish`. So every expansion's key,
-  hit or miss, allocates its input tokens twice and each of its crate's variables. Suggested
-  shape: a `GivenHasher` that takes parts in a fixed order (or names sorted by the caller)
-  and environment entries already sorted by name, as `&[u8]`, and feeds them to BLAKE3
-  directly, giving the same `ContentId` as `Given::finish` for the same content. With it, a
-  hit allocates nothing but the decoded expansion. blaze-expand's `given` would switch the day
-  it exists. It already encodes into one reused buffer per thread.
+- **store**: a mapped file (or a path to its bytes) for a lasting value, so wasm machine code
+  is loaded with `wasmtime::Module::deserialize_file`, mapped in with copy-on-write memory
+  images, instead of copied out as bytes (`crates/blaze-macro-wasm/src/lib.rs`, `Wasm::compile`).
+- **usercode**: `Given::part` now hashes (applied, thanks). `Given::env` still makes two
+  `OsString`s per variable. Taking `&[u8]` pairs already sorted would leave a hit allocating
+  only the decoded expansion.
 
 ## 7. Workspace
 

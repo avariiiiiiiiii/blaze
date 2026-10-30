@@ -11,8 +11,8 @@ fn texts(source: &str) -> Vec<&str> {
     lex(source).unwrap().into_iter().map(|it| it.text).collect()
 }
 
-fn string(value: &str) -> Kind<'_> {
-    Kind::Str { value: value.into(), escaped_brace: false }
+fn strings(source: &str) -> Vec<String> {
+    lex(source).unwrap().iter().map(|it| it.str_value().unwrap().into_owned()).collect()
 }
 
 fn raw(value: &str) -> Kind<'_> {
@@ -53,22 +53,16 @@ fn comments_and_doc_comments() {
 
 #[test]
 fn strings_and_every_escape() {
-    assert_eq!(kinds(r#""plain""#), [string("plain")]);
-    assert_eq!(
-        kinds(r#""\n\r\t\\\0\'\"""#),
-        [string("\n\r\t\\\0'\"")]
-    );
-    assert_eq!(kinds(r#""\x41\x7f\u{42}\u{1F600}\u{10ffff}""#), [string(
-        "A\x7fB\u{1F600}\u{10ffff}"
-    )]);
-    assert_eq!(kinds("\"a\\\n   \t\n  b\""), [string("ab")], "a line continuation skips");
-    assert_eq!(kinds("\"a\\\n\u{a0}b\""), [string("a\u{a0}b")], "but not non-ASCII whitespace");
-    assert_eq!(kinds("\"two\nlines\""), [string("two\nlines")]);
-    assert_eq!(kinds("\"é ünïcode {}\""), [string("é ünïcode {}")]);
-    assert_eq!(kinds(r#""\u{7b}\x7d""#), [Kind::Str {
-        value: "{}".into(),
-        escaped_brace: true
-    }]);
+    assert_eq!(strings(r#""plain""#), ["plain"]);
+    assert_eq!(kinds(r#""plain""#), [Kind::Str { escaped: false, escaped_brace: false }]);
+    assert_eq!(strings(r#""\n\r\t\\\0\'\"""#), ["\n\r\t\\\0'\""]);
+    assert_eq!(strings(r#""\x41\x7f\u{42}\u{1F600}\u{10ffff}""#), ["A\x7fB\u{1F600}\u{10ffff}"]);
+    assert_eq!(strings("\"a\\\n   \t\n  b\""), ["ab"], "a line continuation skips");
+    assert_eq!(strings("\"a\\\n\u{a0}b\""), ["a\u{a0}b"], "but not non-ASCII whitespace");
+    assert_eq!(strings("\"two\nlines\""), ["two\nlines"]);
+    assert_eq!(strings("\"é ünïcode {}\""), ["é ünïcode {}"]);
+    assert_eq!(strings(r#""\u{7b}\x7d""#), ["{}"]);
+    assert_eq!(kinds(r#""\u{7b}\x7d""#), [Kind::Str { escaped: true, escaped_brace: true }]);
     for refused in [
         r#""\x80""#,
         r#""\xg0""#,
@@ -177,14 +171,15 @@ fn text_direction_is_found_as_by_its_characters() {
 #[test]
 fn a_string_borrows_its_value_until_an_escape() {
     let lexed = lex(r#""plain {} é" "a\nb" "x\\y" r"raw""#).unwrap();
-    let values: Vec<(&str, bool)> = lexed
+    let values: Vec<(String, bool)> = lexed
         .iter()
-        .map(|it| match &it.kind {
-            Kind::Str { value, .. } => (&**value, matches!(value, Cow::Borrowed(_))),
-            Kind::RawStr { value } => (*value, true),
-            other => panic!("{other:?}"),
+        .map(|it| {
+            let value = it.str_value().unwrap();
+            let borrowed = matches!(value, Cow::Borrowed(_));
+            (value.into_owned(), borrowed)
         })
         .collect();
+    let values: Vec<(&str, bool)> = values.iter().map(|(it, borrowed)| (it.as_str(), *borrowed)).collect();
     assert_eq!(values, [("plain {} é", true), ("a\nb", false), ("x\\y", false), ("raw", true)]);
 }
 
@@ -219,4 +214,89 @@ fn normalization() {
     assert_eq!(normalize("a\rb"), "a\rb", "a lone carriage return stays, and lex refuses it");
     assert_eq!(normalize("x\u{feff}"), "x\u{feff}", "only a leading mark goes");
     assert!(matches!(normalize("plain"), Cow::Borrowed(_)));
+}
+
+/// A token as the reference lexer gives it, its string's value read from the source.
+fn as_reference<'a>(token: &Token<'a>) -> reference::Token<'a> {
+    let kind = match &token.kind {
+        Kind::Ident => reference::Kind::Ident,
+        Kind::RawIdent => reference::Kind::RawIdent,
+        Kind::Lifetime => reference::Kind::Lifetime,
+        Kind::Str { escaped_brace, .. } => reference::Kind::Str {
+            value: token.str_value().expect("a lexed string has a value"),
+            escaped_brace: *escaped_brace,
+        },
+        Kind::RawStr { value } => reference::Kind::RawStr { value: *value },
+        Kind::Char(c) => reference::Kind::Char(*c),
+        Kind::Int(value) => reference::Kind::Int(*value),
+        Kind::Number => reference::Kind::Number,
+        Kind::Punct(c) => reference::Kind::Punct(*c),
+        Kind::OuterDoc => reference::Kind::OuterDoc,
+        Kind::InnerDoc => reference::Kind::InnerDoc,
+    };
+    reference::Token { kind, text: token.text }
+}
+
+/// The one-pass lexer against the one it replaced ([`reference::lex`]), over seeded sources
+/// of every token form, whole or cut, with the escapes, comment openers, quotes and bytes
+/// past ASCII that end one early: the same tokens with the same values, or the same refusal
+/// at the same byte for the same reason. A string's value pushed is the one given.
+#[test]
+fn the_one_pass_lexer_lexes_as_the_old_one() {
+    let pieces = [
+        "fn", "main", " ", "\n", "\t", "\x0b", "(", ")", "{", "}", "[", "]", "!", ";", ",", "::",
+        "println", "print", "true", "\"a{}b\"", "\"\\n\\x41\\u{7b}\\\"\"", "\"esc\\\n  x\"",
+        "\"", "\\", "\\x", "\\u{", "\\u{e9}", "\\x7", "r\"raw\"", "r#\"a\"b\"#", "r#", "r##\"x\"#",
+        "r", "#", "'a'", "'\\''", "'\\u{e9}'", "'\u{e9}'", "'a", "'", "'\\n", "//", "///",
+        "//!", "////", "/*", "*/", "/**", "/*!", "/**/", "*", "/", "0", "42", "1_000", "0x1f",
+        "1u8", "1e5", "007", "340282366920938463463374607431768211456", "_", "x_1",
+        "\u{e9}", "\u{a0}", "b\"x\"", "\r", "\u{202e}", "\u{2020}", "x\"y", "\"\u{e9}\"",
+        "'\t'", "`", "@",
+    ];
+    let mut state = 0xbb67_ae85_84ca_a73bu64;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let (mut lexed, mut refused) = (0, 0);
+    let mut pushed = String::new();
+    for _ in 0..60_000 {
+        let source: String = (0..1 + next(8)).map(|_| pieces[next(pieces.len())]).collect();
+        let new = lex(&source);
+        let old = reference::lex(&source);
+        let new_as_old = new
+            .as_ref()
+            .map(|tokens| tokens.iter().map(as_reference).collect::<Vec<_>>())
+            .map_err(|it| (it.at, it.why));
+        let old = old.map_err(|it| (it.at, it.why));
+        assert_eq!(new_as_old, old, "{source:?}");
+        match new {
+            Ok(tokens) => {
+                lexed += 1;
+                for token in &tokens {
+                    pushed.clear();
+                    match token.push_value(&mut pushed) {
+                        Some(()) => assert_eq!(Some(pushed.as_str()), token.str_value().as_deref()),
+                        None => assert_eq!(token.str_value(), None),
+                    }
+                }
+            }
+            Err(_) => refused += 1,
+        }
+    }
+    assert!(lexed > 2_000 && refused > 2_000, "{lexed} lexed, {refused} refused");
+}
+
+/// Tokens are read only as far as they are asked for, and after a refusal there are none.
+#[test]
+fn tokens_are_read_on_demand() {
+    let mut tokens = Tokens::new("use std; é \"never read").unwrap();
+    assert_eq!(tokens.next().map(|it| it.map(|it| it.text)), Some(Ok("use")));
+    assert_eq!(tokens.next().map(|it| it.map(|it| it.text)), Some(Ok("std")));
+    assert_eq!(tokens.next().map(|it| it.map(|it| it.text)), Some(Ok(";")));
+    assert!(matches!(tokens.next(), Some(Err(Unlexed { at: 9, .. }))));
+    assert!(tokens.next().is_none());
+    assert!(Tokens::new("fn\r").is_err() && Tokens::new("\"\u{2067}\"").is_err());
 }

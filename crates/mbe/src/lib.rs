@@ -26,10 +26,11 @@ mod differential;
 mod tests;
 
 use span::{Edition, Span, SyntaxContext};
-use syntax_bridge::to_matcher_input;
+use syntax_bridge::to_matcher_input_into;
 use tt::DelimSpan;
 use tt::iter::TtIter;
 
+use std::cell::Cell;
 use std::fmt;
 use std::sync::Arc;
 
@@ -422,6 +423,8 @@ pub fn expect_fragment<'t>(
     // punctuation looks two further). A fragment costs its own length, not the rest of the
     // level's, so `$($e:expr),*` is linear, not quadratic.
     let mut window_trees = FIRST_WINDOW_TREES;
+    let mut parser_input =
+        MATCHER_INPUT.take().unwrap_or_else(|| parser::Input::with_capacity(4 * window_trees));
     let tree_traversal = loop {
         let mut fork = tt_iter.clone();
         let savepoint = fork.savepoint();
@@ -430,13 +433,16 @@ pub fn expect_fragment<'t>(
             taken += 1;
         }
         let whole = fork.is_empty();
-        let parser_input = to_matcher_input(fork.from_savepoint(savepoint), &mut edition);
+        to_matcher_input_into(fork.from_savepoint(savepoint), &mut edition, &mut parser_input);
         let output = entry_point.parse(&parser_input);
         if whole || consumed_input_tokens(&output) + PARSER_LOOKAHEAD <= parser_input.len() {
             break output;
         }
         window_trees *= 2;
     };
+    if parser_input.len() <= KEEP_MATCHER_INPUT {
+        MATCHER_INPUT.set(Some(parser_input));
+    }
     // Over the whole level, so that `flat_advance_to` keeps its end.
     let mut cursor = buffer.cursor();
     let mut error = false;
@@ -481,6 +487,15 @@ pub fn expect_fragment<'t>(
 
     ExpandResult { value: res, err }
 }
+
+thread_local! {
+    /// The input [`expect_fragment`] parses fragments from, kept for the next fragment: a
+    /// matcher parses one a fragment, and none allocates.
+    static MATCHER_INPUT: Cell<Option<::parser::Input>> = const { Cell::new(None) };
+}
+
+/// The most tokens an input kept for the next fragment holds; a larger one is freed.
+const KEEP_MATCHER_INPUT: usize = 1 << 16;
 
 /// How many tokens past its position the `parser` crate's parser may read, plus one.
 const PARSER_LOOKAHEAD: usize = 6;

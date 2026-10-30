@@ -53,6 +53,12 @@ pub const FACT_DOMAIN: &str = "blaze v2 share fact 1";
 pub const IDENTITY_DOMAIN: &str = "blaze v2 share identity 1";
 /// The domain of an ADT's identity: its key, interface, layout and the drop impls it reaches.
 pub const ADT_DOMAIN: &str = "blaze v2 share adt 1";
+/// The domain of the records of one walk of a body.
+pub const WALK_DOMAIN: &str = "blaze v2 share walk 1";
+/// The domain of what a call, or an argument list, is keyed by.
+pub const CALLEE_DOMAIN: &str = "blaze v2 share callee 1";
+/// The domain of an evaluated constant's bytes.
+pub const VALUE_DOMAIN: &str = "blaze v2 share value 1";
 
 /// What an instance runs: the code generator's `InstanceDef`, one for one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,12 +86,53 @@ pub struct ShareInstance {
     pub args: StoredGenericArgs,
 }
 
-/// The MIR optimization level of the bodies the code generator compiles: `lang` for a body
-/// of the library's crates, `other` for the rest. The key is of the body that is compiled.
+/// A set of MIR optimization levels, one bit each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Levels(u8);
+
+impl Levels {
+    pub const fn of(levels: &[MirOptLevel]) -> Levels {
+        let mut bits = 0;
+        let mut at = 0;
+        while at < levels.len() {
+            bits |= Levels::bit(levels[at]);
+            at += 1;
+        }
+        Levels(bits)
+    }
+
+    const fn bit(level: MirOptLevel) -> u8 {
+        match level {
+            MirOptLevel::Off => 1,
+            MirOptLevel::Debug => 2,
+            MirOptLevel::Release => 4,
+        }
+    }
+
+    pub const fn contains(self, level: MirOptLevel) -> bool {
+        self.0 & Levels::bit(level) != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The levels, lowest first.
+    pub fn iter(self) -> impl Iterator<Item = MirOptLevel> {
+        [MirOptLevel::Off, MirOptLevel::Debug, MirOptLevel::Release]
+            .into_iter()
+            .filter(move |&level| self.contains(level))
+    }
+}
+
+/// The MIR optimization levels the code generator may compile a body at: `lang` for a body of
+/// the library's crates, `other` for the rest. One build compiles at one level per body, but
+/// which depends on settings the key must not (a key is reused across builds), so the key is
+/// over the body at every level here: two instances with one key are one at each of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MirLevels {
-    pub lang: MirOptLevel,
-    pub other: MirOptLevel,
+    pub lang: Levels,
+    pub other: Levels,
 }
 
 /// What an instance's code depends on beyond the layouts of its arguments.
@@ -107,6 +154,10 @@ pub enum Unshared {
     Shim(&'static str),
     /// An intrinsic that is not in [`intrinsics`]' table, by its name.
     UnknownIntrinsic(String),
+    /// An intrinsic whose code is made for the one instance ([`Class::PerInstance`]).
+    PerInstance(String),
+    /// No level to key the body at: [`MirLevels`] is empty for its crate.
+    NoLevels,
     /// The body has no MIR, or a part of it the code generator refuses too.
     NoMir(String),
     /// A type has no layout.
@@ -128,6 +179,8 @@ impl fmt::Display for Unshared {
             Unshared::Recursive => f.write_str("it is in a cycle of instances or types"),
             Unshared::Shim(what) => write!(f, "it is a {what}, which is kept per instance"),
             Unshared::UnknownIntrinsic(name) => write!(f, "it calls the unclassified intrinsic `{name}`"),
+            Unshared::PerInstance(name) => write!(f, "it calls `{name}`, whose code is per instance"),
+            Unshared::NoLevels => f.write_str("no MIR optimization level was given for its crate"),
             Unshared::NoMir(what) => write!(f, "its MIR: {what}"),
             Unshared::NoLayout(what) => write!(f, "a layout: {what}"),
             Unshared::NoContent(what) => write!(f, "no content: {what}"),
@@ -146,5 +199,5 @@ pub fn share_key<'db>(
     env: &StoredParamEnvAndCrate,
     levels: MirLevels,
 ) -> &'db Result<ShareKey, Unshared> {
-    walk::share(db, instance.clone(), env.clone(), levels)
+    hir_ty::attach_db(db, || walk::share(db, instance.clone(), env.clone(), levels))
 }

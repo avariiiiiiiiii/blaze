@@ -363,7 +363,7 @@ impl<'db> InferenceContext<'db> {
     ) -> Box<[u32]> {
         let (func, fn_generic_args) = match (callee, callee_ty.kind()) {
             (Some(CallableDefId::FunctionId(func)), TyKind::FnDef(_, fn_generic_args)) => {
-                (func, fn_generic_args)
+                (func, fn_generic_args.no_bound_vars().unwrap())
             }
             _ => return Default::default(),
         };
@@ -435,6 +435,7 @@ impl<'db> InferenceContext<'db> {
     ) -> Ty<'db> {
         let (fn_sig, def_id) = match callee_ty.kind() {
             TyKind::FnDef(def_id, args) => {
+                let args = args.no_bound_vars().unwrap();
                 let fn_sig = self
                     .db
                     .callable_item_signature(def_id.0)

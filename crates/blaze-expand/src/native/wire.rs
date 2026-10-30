@@ -255,9 +255,7 @@ impl<'a> Reader<'a> {
         let delimiter = tt::Delimiter::invisible_spanned(call_site);
         self.flat.push(TokenTree::Subtree(Subtree { delimiter, len: 0 }));
         let count = self.u32()?;
-        for _ in 0..count {
-            self.tree()?;
-        }
+        self.trees(count)?;
         if count == 1 && matches!(self.flat.get(1), Some(TokenTree::Subtree(_))) {
             self.flat.remove(0);
         } else {
@@ -269,7 +267,32 @@ impl<'a> Reader<'a> {
         Ok(TopSubtree::from_serialized(self.flat))
     }
 
-    fn tree(&mut self) -> Result<(), String> {
+    /// Reads `count` trees and the trees of each group among them, with the groups still open
+    /// on a stack of their own rather than the thread's: a module may nest them as deep as it
+    /// likes.
+    fn trees(&mut self, count: u32) -> Result<(), String> {
+        // Each open group's place in `flat` and how many trees are left of the stream it is in.
+        let mut open: Vec<(usize, u32)> = Vec::new();
+        let mut left = count;
+        loop {
+            while left == 0 {
+                let Some((at, rest)) = open.pop() else { return Ok(()) };
+                let len = (self.flat.len() - at - 1) as u32;
+                if let TokenTree::Subtree(subtree) = &mut self.flat[at] {
+                    subtree.len = len;
+                }
+                left = rest;
+            }
+            left -= 1;
+            if let Some(count) = self.tree()? {
+                open.push((self.flat.len() - 1, left));
+                left = count;
+            }
+        }
+    }
+
+    /// Reads one tree; of a group, only its delimiter, giving how many trees it holds.
+    fn tree(&mut self) -> Result<Option<u32>, String> {
         match self.u8()? {
             0 => {
                 let kind = match self.u8()? {
@@ -281,17 +304,9 @@ impl<'a> Reader<'a> {
                 let (open, close) = (self.span()?, self.span()?);
                 // The whole group's, which rust-analyzer's tree does not keep.
                 self.span()?;
-                let at = self.flat.len();
                 let delimiter = tt::Delimiter { open, close, kind };
                 self.flat.push(TokenTree::Subtree(Subtree { delimiter, len: 0 }));
-                let count = self.u32()?;
-                for _ in 0..count {
-                    self.tree()?;
-                }
-                let len = (self.flat.len() - at - 1) as u32;
-                if let TokenTree::Subtree(subtree) = &mut self.flat[at] {
-                    subtree.len = len;
-                }
+                return Ok(Some(self.u32()?));
             }
             1 => {
                 let span = self.span()?;
@@ -318,6 +333,13 @@ impl<'a> Reader<'a> {
                     }
                     Some(_) => self.text()?,
                 };
+                if suffix.len() > super::lex::SUFFIX_MOST {
+                    return Err(format!(
+                        "the module wrote a literal's suffix of {} bytes, over the {} kept",
+                        suffix.len(),
+                        super::lex::SUFFIX_MOST,
+                    ));
+                }
                 // `Literal::i32_suffixed(-1)` is one token to the macro and a minus sign and a
                 // literal to the compiler, as the native server's reader splits it
                 // (`legacy_protocol`, `flat`).
@@ -337,7 +359,7 @@ impl<'a> Reader<'a> {
             }
             other => return Err(format!("the module wrote a tree of kind {other}")),
         }
-        Ok(())
+        Ok(None)
     }
 }
 

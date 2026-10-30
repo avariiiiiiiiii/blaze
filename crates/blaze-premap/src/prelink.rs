@@ -175,15 +175,20 @@ pub struct Prelinked {
     pub thread_vars: Vec<(u64, u64)>,
 }
 
-/// The address every image of an output is placed at: far from where loaders put
-/// executables, libraries and the heap (32 TiB, inside every 47-bit user address space), and
-/// aligned to 64 KiB, a multiple of every target's page.
+/// The addresses dependency images and the workspace images beside them take: just above
+/// where run processes map other code memory ([`blaze_inproc::BASES`]), so never in its way,
+/// and below the top of a 39-bit address space, the smallest AArch64 Linux configures.
+pub const IMAGES: std::ops::Range<u64> = blaze_inproc::BASES.end..0x80_0000_0000;
+
+/// The address every image of an output is placed at: the start of [`IMAGES`], aligned to
+/// 64 KiB, a multiple of every target's page. The workspace image follows it, within reach
+/// of a call.
 pub fn base(format: Format, arch: Arch) -> Result<u64, PremapError> {
     match (format, arch) {
         (Format::Wasm, _) | (_, Arch::Wasm32) => {
             Err(PremapError::new("wasm has no dependency image: code is reached by index, not mapped".to_owned()))
         }
-        _ => Ok(0x2000_0000_0000),
+        _ => Ok(IMAGES.start),
     }
 }
 
@@ -223,8 +228,11 @@ pub fn build(linker: &dyn Prelink, request: &Request<'_>, key: ImageKey) -> Resu
         return Err(PremapError::new("a dependency image is linked whole: its output is neither incremental nor live".to_owned()));
     }
     let page = page(request.output.format, request.output.arch);
-    if request.base % page != 0 {
-        return Err(PremapError::new(format!("the image's base {:#x} is not page-aligned", request.base)));
+    if request.base % page != 0 || !IMAGES.contains(&request.base) {
+        return Err(PremapError::new(format!(
+            "the image's base {:#x} is not page-aligned in {:#x}..{:#x}",
+            request.base, IMAGES.start, IMAGES.end
+        )));
     }
     let linked = linker.prelink(request)?;
     check(request, &linked, page)?;
@@ -266,9 +274,14 @@ fn check(request: &Request<'_>, linked: &Prelinked, page: u64) -> Result<(), Pre
                 segment.size
             ));
         }
-        end = match segment.addr.checked_add(segment.size) {
+        end = match segment.addr.checked_add(segment.size).filter(|end| *end <= IMAGES.end) {
             Some(end) => end,
-            None => return fail(format!("made a segment at {:#x} past the end of the address space", segment.addr)),
+            None => {
+                return fail(format!(
+                    "made a segment at {:#x} reaching past {:#x}, where run processes map images",
+                    segment.addr, IMAGES.end
+                ));
+            }
         };
     }
     let inside = |addr: u64, len: u64, writable: bool| {

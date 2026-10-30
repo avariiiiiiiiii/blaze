@@ -11,11 +11,14 @@
 //! [`Live::poll`] applies what came in since it was last called. Call it where nothing of
 //! the program's is half done, such as between two frames: a function the calling thread is
 //! running when its patch lands finishes as it was, and the next call runs the new code.
-//! Other threads keep running while a patch is applied, and v1 writes its jumps over the
-//! entries of functions they may be in and its statics while they may use them: a program
-//! with other threads must keep them out of the functions and statics a patch changes while
-//! `poll` runs (and [`Live::apply_as_they_come`] gives no such place at all). The jump-table
-//! runtime in [`slots`] never writes over code a thread can be in.
+//! v1 writes its jumps over the entries of functions and its statics with every other
+//! thread of the program stopped, and none strictly inside the bytes it writes (`apply`); a
+//! thread it can't stop, or one that stays inside, makes it refuse the patch. The jump-table
+//! runtime in [`slots`] stops no thread: it never writes over code a thread can be in, and
+//! writes data with atomic stores.
+//!
+//! Unsafe code is only in the modules that reach the kernel and the image's memory (the
+//! platforms', `sample`, and `slots`' platform and image modules); the rest denies it.
 //!
 //! What a patch cannot do, it says, and the program has to be started again: an edit that
 //! changes a type the rest of the program can see writes the whole object again, and a
@@ -30,6 +33,8 @@
 //!
 //! macOS on AArch64, and Linux and Windows on x86-64; elsewhere [`Live::start`] says so.
 
+#![deny(unsafe_code)]
+
 use std::{fmt, path::PathBuf, sync::OnceLock, time::Duration};
 
 /// The setting `BLAZE_<name>`.
@@ -40,6 +45,14 @@ fn setting(name: &str) -> Option<std::ffi::OsString> {
 pub mod format;
 pub mod patch;
 pub mod slots;
+
+#[cfg(any(
+    test,
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+))]
+mod apply;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux;
@@ -162,6 +175,7 @@ impl Live {
 // SAFETY: the `blaze_live_` prefix is this crate's, so no other item of a program exports
 // `blaze_live_counters`; a second one would fail the link or bind the daemon's code to the
 // wrong counters.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn blaze_live_counters() -> *mut u64 {
     COUNTERS.as_ptr() as *mut u64

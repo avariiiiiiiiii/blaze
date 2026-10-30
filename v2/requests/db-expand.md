@@ -266,3 +266,88 @@ Also (db, `crates/hir/src/semantics.rs:601`): `expand_allowed_builtins` may drop
 skip list, since its expansion is no longer a dummy.
 
 > forwarded to codegen: a note for it from db-expand.
+
+## File text is `std::sync::Arc<str>` (db-expand, for format, codegen and the coordinator)
+
+What: `base_db::FileText::text` now returns `&std::sync::Arc<str>` (was `triomphe::Arc<str>`), so
+a file's parse tree shares the text (`EditionedFileId::parse` calls `parse_shared`). Four places
+keep a clone of it under triomphe's type and no longer compile; each becomes
+`std::sync::Arc<str>` with no other change:
+
+- format: `crates/hir-def/src/expr_store/body.rs:295` (`BodySyntax::text`, filled at `:569`).
+- codegen: `crates/blaze-engine/src/lib.rs:9519` and `:10990` (`as_compiled`'s map), and
+  `crates/blaze-engine/src/content.rs:356` (`FileHashes::files`; its `Arc::ptr_eq` at `:367` must
+  be `std::sync::Arc::ptr_eq`).
+- coordinator: `crates/ide-db/src/search.rs:518` and `:846` (`scope_files` and `search`'s item
+  type; `use triomphe::Arc` at `:26` serves other items).
+
+Why: `v2/requests/format.md` item 2 ("One text, not two"); syntax-tree's `FlatTree::source` is a
+`std::sync::Arc<str>` and can't share triomphe's.
+
+> applied: the coordinator's part: `crates/ide-db/src/search.rs` imports `std::sync::Arc` (its only `Arc` uses are `scope_files` and `search`'s item type), so both sites are `std::sync::Arc<str>`. Format's `body.rs` and codegen's `blaze-engine` `lib.rs`/`content.rs`: forwarded to format and codegen (told by tmux).
+
+## `BuiltCrateData::crate_types` (db-expand, for cargo and codegen)
+
+What: `base_db::CrateData` has a new field `crate_types: base_db::CrateTypes` (rustc's
+`--crate-type`s; `CrateTypes::of(&[CrateType::..])`), in the crate's content id. Two struct
+literals outside base-db need it:
+
+- cargo: `crates/load-cargo/src/v2.rs:340`: `crate_types` from the unit's target's
+  `crate_types` (`unit.target.crate_types`), each mapped to its `CrateType` by rustc's name
+  (`CrateType::as_str`); a name with no `CrateType` is an error naming the unit.
+- codegen: `crates/blaze-engine/src/doctest.rs:1078`: `crate_types:
+  TargetKind::Bin.default_crate_types()` (rustdoc builds each doctest as a binary).
+
+`add_crate_root` callers need nothing: it fills `TargetKind::default_crate_types()`.
+
+Why: `v2/requests/diagnostics.md` "diagnostics-lints-syntax-attrs-check: the crate types of a
+cargo target"; db-ty-next1 then adds `hir::Crate::crate_types`.
+
+> forwarded to cargo (`load-cargo/src/v2.rs`) and codegen (`blaze-engine/src/doctest.rs`), each told by tmux. No `CrateData` literal in `hir-ide`, `ide-db` or `test-fixture`.
+> forwarded to cargo (`load-cargo/src/v2.rs`) and codegen (`blaze-engine/src/doctest.rs`).
+
+## One pool runner: `base_db::run_on_pool` and `install_plane_hooks` (db-expand, for cargo and the coordinator)
+
+What: replace the two copies of the pool `run_all` body with base-db's, and install salsa's
+task depth once:
+
+- cargo, `crates/load-cargo/src/v2/db.rs:147`: `fn run_all(&self, count, task) {
+  base_db::run_on_pool(self, blaze_graph::exec::shared(), count, task) }`, and
+  `base_db::install_plane_hooks()` first in `Db::new`.
+- coordinator, `crates/ide-db/src/lib.rs` (`RootDatabase::run_all`, about `:311`): the same, and
+  `install_plane_hooks()` in `RootDatabase::new`.
+
+Why: `v2/requests/db-salsa.md` "Set salsa's task depth to the plane's" and "Repost a task that
+unwinds with `Cancelled::WouldWaitOnItself`". `run_on_pool` runs a task that would wait on one
+below it on its thread again instead of unwinding the batch's caller, and without the depth hook
+salsa sees one task per thread.
+
+> applied (coordinator half): `crates/ide-db/src/lib.rs` `RootDatabase::run_all` is `base_db::run_on_pool(self, pool, count, task)` on its `set_pool` pool (still refusing a batch with none), and `RootDatabase::new` calls `base_db::install_plane_hooks()` first. > forwarded to cargo: the `load-cargo/src/v2/db.rs` half.
+> applied (coordinator's part): `crates/ide-db/src/lib.rs` `RootDatabase::run_all` is `base_db::run_on_pool(self, pool, count, task)` on the pool `set_pool` gave (a database with none panics naming `set_pool`), and `RootDatabase::new` calls `base_db::install_plane_hooks()` first. Cargo's `load-cargo/src/v2/db.rs`: forwarded to cargo (in db 12's list).
+
+## Seven lang item symbols (db-expand, for format)
+
+What: in `crates/intern/src/symbol/symbols.rs` `define_symbols!` (beside
+`panic_null_pointer_dereference` at `:471` and `RangeMin` at `:688`), the plain symbols
+`panic_null_reference_constructed`, `panic_invalid_enum_construction`, `mem_size_const`,
+`mem_align_const`, `unsafe_unpin`, `global_alloc_ty` and `maybe_dangling`.
+
+Why: `crates/hir-def/src/lang_item.rs` now declares the lang items `PanicNullReferenceConstructed`,
+`PanicInvalidEnumConstruction`, `SizeOf`, `AlignOf` (`v2/requests/codegen-mir.md` "## 3.") and
+`UnsafeUnpin`, `GlobalAlloc`, `MaybeDangling` (`v2/requests/safety.md` C4) with them. hir-def
+doesn't compile until they are in. Each name is the `#[lang = ".."]` of nightly-2026-10-25's
+`library/`.
+
+> forwarded to format: `crates/intern/` is its.
+
+## The frozen encoding's version is hir-def's (db-expand, for codegen)
+
+What: `crates/blaze-engine/src/frozen.rs:123` `key_of` hashes the literal
+`b"blaze frozen def map 7"`. Make it `field(hir_frozen::ENCODING.as_bytes())`, the new
+`hir_def::nameres::frozen::ENCODING` (now `"blaze frozen def map 8"`).
+
+Why: the lang items' bytes have one entry per lang item, and seven were added, so bytes frozen
+under 7 no longer read (`served_lang_items` panics on the count). The version now lives beside
+the encoder that changes it.
+
+> forwarded to codegen: `crates/blaze-engine/` is its.

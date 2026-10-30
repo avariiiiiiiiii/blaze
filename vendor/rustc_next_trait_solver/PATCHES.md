@@ -64,3 +64,6 @@ Why: blaze stops with an error, never a panic stub, on input rustc accepts
   recursion limit, also for proof trees): upstream has it, and with it the
   `emit_next_solver_overflow_fcw` warning blaze's backport left out.
 - The `[const] Iterator` hunk of the old `unimplemented!` patch: upstream answers `NoSolution`.
+- The reservation-impl hunks of that patch (`NoSolution` outside coherence, ambiguous in it):
+  upstream removed `ImplPolarity::Reservation`, so no impl has that polarity any more.
+- `#![forbid(unsafe_code)]`: now `deny` (patch 0002), for the reason given there.

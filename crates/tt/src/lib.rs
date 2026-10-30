@@ -26,6 +26,7 @@ use intern::Symbol;
 use stdx::{impl_from, itertools::Itertools as _};
 
 pub use span::Span;
+use span::SyntaxContext;
 pub use text_size::{TextRange, TextSize};
 
 pub use self::iter::{TtElement, TtIter};
@@ -215,6 +216,26 @@ impl<'a> TokenTreesView<'a> {
         let tree = self.tree;
         (self.start..self.end).map(move |at| tree.token_tree_at(at))
     }
+
+    /// Calls `f` with each token of the view in order, as a parser reads them: a subtree is its
+    /// opening delimiter, its token trees and its closing delimiter. Each comes with the
+    /// context of its span (an opening or closing delimiter's own). Read from the columns, with
+    /// no span unpacked: what a pass that needs kinds and contexts only (the parser's input)
+    /// walks.
+    pub fn for_each_token(&self, f: impl FnMut(FlatToken, SyntaxContext)) {
+        self.tree.for_each_token(self.start, self.end, f)
+    }
+}
+
+/// A token as [`TokenTreesView::for_each_token`] gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlatToken {
+    Punct { char: char, spacing: Spacing },
+    Ident { sym: Symbol, is_raw: IdentIsRaw },
+    /// `sym` is the text then the suffix, its last `suffix_len` bytes.
+    Literal { sym: Symbol, kind: LitKind, suffix_len: u32 },
+    Open(DelimiterKind),
+    Close(DelimiterKind),
 }
 
 impl fmt::Debug for TokenTreesView<'_> {

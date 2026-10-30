@@ -350,7 +350,7 @@ fn matched(ctx: &Ctx<'_, '_>) -> FxHashSet<ExprId> {
             && (arms.is_empty() || arms.iter().any(|arm| !irrefutable(ctx, arm.pat)))
         {
             found.insert(expr);
-            found.insert(*scrutinee);
+            found.insert(scrutinee);
         }
     }
     found
@@ -364,7 +364,7 @@ fn tested_at(ctx: &Ctx<'_, '_>) -> FxHashMap<hir_def::hir::PatId, ExprId> {
         if let hir_def::hir::Expr::Match { expr: scrutinee, arms } = it {
             for arm in arms.iter() {
                 ctx.store.walk_pats(arm.pat, &mut |pat| {
-                    found.insert(pat, *scrutinee);
+                    found.insert(pat, scrutinee);
                 });
             }
         }
@@ -376,7 +376,7 @@ fn tested_at(ctx: &Ctx<'_, '_>) -> FxHashMap<hir_def::hir::PatId, ExprId> {
 fn let_bound_block_value(ctx: &Ctx<'_, '_>, expr: ExprId) -> bool {
     use hir_def::hir::Expr;
     let value = |mut at: ExprId| {
-        while let Expr::Block { tail: Some(tail), .. } = ctx.store[at] {
+        while let Expr::Block { tail: Some(tail), .. } = ctx.store.expr(at) {
             at = tail;
         }
         at
@@ -387,8 +387,8 @@ fn let_bound_block_value(ctx: &Ctx<'_, '_>, expr: ExprId) -> bool {
             matches!(
                 statement,
                 Statement::Let { pat, initializer: Some(init), .. }
-                    if matches!(ctx.store[*pat], Pat::Bind { subpat: None, .. })
-                        && matches!(ctx.store[*init], Expr::Block { .. })
+                    if matches!(ctx.store.pat(*pat), Pat::Bind { subpat: None, .. })
+                        && matches!(ctx.store.expr(*init), Expr::Block { .. })
                         && value(*init) == expr
             )
         })
@@ -399,9 +399,9 @@ fn let_bound_block_value(ctx: &Ctx<'_, '_>, expr: ExprId) -> bool {
 fn switched_literal(ctx: &Ctx<'_, '_>, span: MirSpan) -> bool {
     use hir_def::hir::{Expr, Literal};
     let MirSpan::PatId(pat) = span else { return false };
-    let Pat::Lit(lit) = ctx.store[pat] else { return false };
+    let Pat::Lit(lit) = ctx.store.pat(pat) else { return false };
     matches!(
-        ctx.store[lit],
+        ctx.store.expr(lit),
         Expr::Literal(Literal::Bool(_) | Literal::Char(_) | Literal::Int(..) | Literal::Uint(..))
     )
 }
@@ -413,12 +413,12 @@ fn irrefutable(ctx: &Ctx<'_, '_>, pat: hir_def::hir::PatId) -> bool {
             Some(hir_def::VariantId::StructId(_) | hir_def::VariantId::UnionId(_))
         )
     };
-    match &ctx.store[pat] {
+    match ctx.store.pat(pat) {
         Pat::Wild | Pat::Rest | Pat::Bind { subpat: None, .. } => true,
         Pat::Bind { subpat: Some(inner), .. }
         | Pat::Ref { pat: inner, .. }
         | Pat::Box { inner }
-        | Pat::Deref { inner } => irrefutable(ctx, *inner),
+        | Pat::Deref { inner } => irrefutable(ctx, inner),
         Pat::Tuple { args, .. } => args.iter().all(|&it| irrefutable(ctx, it)),
         Pat::TupleStruct { args, .. } => {
             struct_like() && args.iter().all(|&it| irrefutable(ctx, it))
@@ -844,8 +844,8 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     body,
                     closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Closure, .. },
                     ..
-                } = self.ctx.store[expr]
-                    && let Expr::Block { tail: Some(tail), .. } = self.ctx.store[body] =>
+                } = self.ctx.store.expr(expr)
+                    && let Expr::Block { tail: Some(tail), .. } = self.ctx.store.expr(body) =>
             {
                 MirSpan::ExprId(tail)
             }
@@ -915,7 +915,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     // through a field whose type has lifetimes (`*s.pointer += 1`): renumbering
                     // gives the read's and the write's places different field types.
                     let read = match span {
-                        MirSpan::ExprId(expr) => match self.ctx.store[expr] {
+                        MirSpan::ExprId(expr) => match self.ctx.store.expr(expr) {
                             hir_def::hir::Expr::BinaryOp {
                                 lhs,
                                 op: Some(hir_def::hir::BinaryOp::Assignment { op: Some(_) }),
@@ -1079,7 +1079,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     /// Whether `span` is a `&raw const` or `&raw mut`, which lowering builds from a borrow.
     fn is_raw_borrow(&self, span: MirSpan) -> bool {
         matches!(span, MirSpan::ExprId(expr) if matches!(
-            self.ctx.store[expr],
+            self.ctx.store.expr(expr),
             hir_def::hir::Expr::Ref { rawness: hir_def::hir::type_ref::Rawness::RawPtr, .. }
         ))
     }
@@ -1134,7 +1134,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             // 0, where rustc has `NullOp::OffsetOf`, which accesses no place.
             Rvalue::Ref(..)
                 if matches!(span, MirSpan::ExprId(expr)
-                    if matches!(self.ctx.store[expr], hir_def::hir::Expr::OffsetOf(_))) => {}
+                    if matches!(self.ctx.store.expr(expr), hir_def::hir::Expr::OffsetOf(_))) => {}
             Rvalue::Ref(kind, place) => {
                 let place = PlaceRef::of(place);
                 let (access, depth, action) = match kind {
@@ -1553,7 +1553,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             !matches!(
                 it,
                 MirSpan::ExprId(expr) if matches!(
-                    self.ctx.store[*expr],
+                    self.ctx.store.expr(*expr),
                     hir_def::hir::Expr::Closure {
                         closure_kind: hir_def::hir::ClosureKind::CoroutineClosure(_),
                         ..
@@ -1828,7 +1828,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     .store
                     .exprs()
                     .find_map(|(call, it)| {
-                        matches!(it, hir_def::hir::Expr::Call { callee: c, .. } if *c == callee)
+                        matches!(it, hir_def::hir::Expr::Call { callee: c, .. } if c == callee)
                             .then_some(MirSpan::ExprId(call))
                     })
                     .unwrap_or(span),
@@ -2027,7 +2027,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     fn tail(&self, span: MirSpan) -> MirSpan {
         let mut span = span;
         while let MirSpan::ExprId(expr) = span
-            && let hir_def::hir::Expr::Block { tail: Some(tail), .. } = self.ctx.store[expr]
+            && let hir_def::hir::Expr::Block { tail: Some(tail), .. } = self.ctx.store.expr(expr)
         {
             span = MirSpan::ExprId(tail);
         }
@@ -2329,7 +2329,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         // body binds them as its own variables.
         let moves_arguments = match self.ctx.closure_expr {
             Some(expr) => matches!(
-                self.ctx.store[expr],
+                self.ctx.store.expr(expr),
                 hir_def::hir::Expr::Closure {
                     closure_kind: hir_def::hir::ClosureKind::CoroutineClosure(_),
                     ..
@@ -2926,7 +2926,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         let map = self.scrutinees.get_or_insert_with(|| {
             let mut map = FxHashMap::default();
             let mut add = |pat, scrutinee: ExprId, is_let: bool| {
-                let simple = is_let && matches!(store[pat], Pat::Bind { subpat: None, .. });
+                let simple = is_let && matches!(store.pat(pat), Pat::Bind { subpat: None, .. });
                 store.walk_bindings_in_pat(pat, |binding| {
                     map.insert(binding, if simple { None } else { Some(scrutinee) });
                 });
@@ -2935,10 +2935,10 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 match expr {
                     hir_def::hir::Expr::Match { expr, arms } => {
                         for arm in arms.iter() {
-                            add(arm.pat, *expr, false);
+                            add(arm.pat, expr, false);
                         }
                     }
-                    hir_def::hir::Expr::Let { pat, expr } => add(*pat, *expr, false),
+                    hir_def::hir::Expr::Let { pat, expr } => add(pat, expr, false),
                     hir_def::hir::Expr::Block { statements, .. } => {
                         for statement in statements.iter() {
                             if let Statement::Let { pat, initializer: Some(init), .. } = statement {
@@ -3092,7 +3092,7 @@ fn guard_borrows(
         for arm in arms.iter() {
             ctx.store.walk_pats(arm.pat, &mut |pat| {
                 tested_by.insert(pat, matches.len());
-                if matches!(ctx.store[pat], Pat::Bind { .. }) {
+                if matches!(ctx.store.pat(pat), Pat::Bind { .. }) {
                     bound_by.insert(pat, (matches.len(), arm.guard.map(|_| arms_of.len())));
                 }
             });
@@ -3182,9 +3182,9 @@ fn guard_borrows(
             stack.push(guard);
             while let Some(expr) = stack.pop() {
                 out.insert(MirSpan::ExprId(expr), it);
-                match &ctx.store[expr] {
+                match ctx.store.expr(expr) {
                     Expr::Match { arms, .. } => pats.extend(arms.iter().map(|arm| arm.pat)),
-                    Expr::Let { pat, .. } => pats.push(*pat),
+                    Expr::Let { pat, .. } => pats.push(pat),
                     Expr::Block { statements, .. } => {
                         pats.extend(statements.iter().filter_map(|statement| match statement {
                             Statement::Let { pat, .. } => Some(*pat),
@@ -3294,7 +3294,7 @@ fn index_borrows<'db>(
             }
             for &(_, local) in &indexes[n + 1..] {
                 if let Some(&expr) = evaluated_in.get(&local)
-                    && let Expr::Index { index, .. } = ctx.store[expr]
+                    && let Expr::Index { index, .. } = ctx.store.expr(expr)
                 {
                     let set = protected.entry(index).or_default();
                     for it in &fake {

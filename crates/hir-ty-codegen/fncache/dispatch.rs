@@ -83,7 +83,7 @@ fn why_not(db: &dyn HirDatabase, id: StaticId) -> Option<&'static str> {
     while let Some(at) = bodies.pop() {
         let store = Body::of(db, at);
         let coroutine = store.exprs().any(|(_, expr)| {
-            matches!(expr, Expr::Closure { closure_kind, .. } if *closure_kind != ClosureKind::Closure)
+            matches!(expr, Expr::Closure { closure_kind, .. } if closure_kind != ClosureKind::Closure)
         });
         if coroutine {
             return Some("a coroutine can name it");

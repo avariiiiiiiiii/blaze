@@ -163,11 +163,34 @@ fn lower_file(
             return Outcome::GaveUp;
         }
     }
-    for error in validation {
-        let diag = Diag::error(None, error.to_string(), f.at(error.range()));
-        found.push(Found::new(diag, Phase::Resolve));
-    }
+    found.extend(validation.into_iter().filter_map(|error| f.validation_error(error)));
     Outcome::Parsed
+}
+
+impl File<'_, '_, '_> {
+    /// An error of the `syntax` crate's checks of the tree, where rustc gives it: none where
+    /// rustc's AST validation gives it (`checks::ast_validation`: E0449 of a trait impl's item,
+    /// an `impl` type with no trait), E0224 of a `dyn` type with no trait as
+    /// `rustc_hir_analysis` gives it, the rest in the `syntax` crate's words.
+    fn validation_error(&self, error: &SyntaxError) -> Option<Found> {
+        let message = error.to_string();
+        let range = error.range();
+        let at = self.at(range);
+        match message.as_str() {
+            "Unnecessary visibility qualifier" => None,
+            "At least one trait is required for an object type" => {
+                let node = self.tree.syntax().covering_element(range);
+                match node.kind() {
+                    SyntaxKind::DYN_TRAIT_TYPE => Some(Found::new(
+                        Diag::error(Some("E0224"), "at least one trait is required for an object type", at),
+                        Phase::Items,
+                    )),
+                    _ => None,
+                }
+            }
+            _ => Some(Found::new(Diag::error(None, error.to_string(), at), Phase::Resolve)),
+        }
+    }
 }
 
 fn token_range(lexed: &LexedStr<'_>, i: usize) -> TextRange {

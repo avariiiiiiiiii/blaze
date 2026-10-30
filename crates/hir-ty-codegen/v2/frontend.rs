@@ -256,7 +256,7 @@ fn owner_item(db: &dyn HirDatabase, owner: InferBodyId<'_>) -> Result<ItemId, St
 
 /// Which item an instance is of. A shim is of the trait method or lang item rustc names it
 /// by: drop glue is `drop_in_place`, a vtable's `call_once` is `FnOnce::call_once`.
-fn item_of(db: &dyn HirDatabase, kind: &Kind) -> Result<ItemId, String> {
+pub(super) fn item_of(db: &dyn HirDatabase, kind: &Kind) -> Result<ItemId, String> {
     let (instance, env) = match kind {
         Kind::Code(instance, env) => (instance, env),
         Kind::Start(main) => return Ok(ItemId::Function(*main)),

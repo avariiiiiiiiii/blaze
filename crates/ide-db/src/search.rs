@@ -5,7 +5,7 @@
 //! name resolution.
 
 use std::mem;
-use std::{cell::LazyCell, cmp::Reverse};
+use std::{cell::LazyCell, cmp::Reverse, sync::Arc};
 
 use base_db::{SourceDatabase, all_crates};
 use either::Either;
@@ -23,7 +23,6 @@ use syntax::{
     ast::{self, HasName, Rename},
     match_ast,
 };
-use triomphe::Arc;
 
 use crate::{
     RootDatabase,

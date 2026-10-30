@@ -538,8 +538,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 let (from, to) = (self.ty_scalar(arg_tys[0])?, self.ty_scalar(dst_ty)?);
                 self.scalar_cast(from, to)?;
             }
-            (I::Atomic(A::Load), [_]) => self.wide_atomic(dst_ty)?,
-            (I::Atomic(A::Store), [_, _]) => self.wide_atomic(arg_tys[1])?,
+            (I::Atomic(A::Load, _), [_]) => self.wide_atomic(dst_ty)?,
+            (I::Atomic(A::Store, _), [_, _]) => self.wide_atomic(arg_tys[1])?,
             (
                 I::Atomic(
                     A::Xchg
@@ -553,10 +553,11 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     | A::Min
                     | A::Umax
                     | A::Umin,
+                    _,
                 ),
                 [_, _],
             ) => self.wide_atomic(dst_ty)?,
-            (I::Atomic(A::Cxchg | A::CxchgWeak), [_, _, _]) => self.wide_atomic(arg_tys[1])?,
+            (I::Atomic(A::Cxchg | A::CxchgWeak, _), [_, _, _]) => self.wide_atomic(arg_tys[1])?,
             (
                 I::Assume
                 | I::ColdPath
@@ -885,8 +886,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             )
             | (I::SizeOf | I::AlignOf, [])
             | (I::NeedsDrop | I::UbChecks | I::OverflowChecks | I::CallerLocation, [])
+            | (I::ReturnAddress, [])
             | (I::Transmute | I::TransmuteUnchecked | I::BlackBox, [_])
-            | (I::Atomic(A::Fence | A::SingleThreadFence), [])
+            | (I::Atomic(A::Fence | A::SingleThreadFence, _), [])
             | (I::ReadViaCopy | I::VolatileLoad | I::UnalignedVolatileLoad, [_])
             | (I::WriteViaMove | I::VolatileStore | I::UnalignedVolatileStore, [_, _])
             | (I::WriteBoxViaMove, [_, _])

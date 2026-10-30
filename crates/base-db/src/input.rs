@@ -357,6 +357,88 @@ impl TargetKind {
             TargetKind::Other => None,
         }
     }
+
+    /// The crate types cargo passes (`--crate-type`) for a target of this kind that names none
+    /// in its manifest; none for [`TargetKind::Other`], which is no cargo target, so rustc reads
+    /// `#![crate_type]` and else builds a binary.
+    pub fn default_crate_types(self) -> CrateTypes {
+        match self {
+            TargetKind::Lib { is_proc_macro: true } => CrateTypes::of(&[CrateType::ProcMacro]),
+            TargetKind::Lib { is_proc_macro: false } => CrateTypes::of(&[CrateType::Lib]),
+            TargetKind::Bin
+            | TargetKind::Example
+            | TargetKind::Test
+            | TargetKind::Bench
+            | TargetKind::BuildScript => CrateTypes::of(&[CrateType::Bin]),
+            TargetKind::Other => CrateTypes::default(),
+        }
+    }
+}
+
+/// One of rustc's `--crate-type`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum CrateType {
+    Bin,
+    Lib,
+    Rlib,
+    Dylib,
+    Cdylib,
+    Staticlib,
+    ProcMacro,
+}
+
+impl CrateType {
+    pub const ALL: [CrateType; 7] = [
+        CrateType::Bin,
+        CrateType::Lib,
+        CrateType::Rlib,
+        CrateType::Dylib,
+        CrateType::Cdylib,
+        CrateType::Staticlib,
+        CrateType::ProcMacro,
+    ];
+
+    /// rustc's name of it, as `--crate-type` and `#![crate_type]` take it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CrateType::Bin => "bin",
+            CrateType::Lib => "lib",
+            CrateType::Rlib => "rlib",
+            CrateType::Dylib => "dylib",
+            CrateType::Cdylib => "cdylib",
+            CrateType::Staticlib => "staticlib",
+            CrateType::ProcMacro => "proc-macro",
+        }
+    }
+}
+
+/// The crate types a crate is built as, a set: a bit per [`CrateType`], by its number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CrateTypes(u8);
+
+impl CrateTypes {
+    pub fn of(types: &[CrateType]) -> CrateTypes {
+        CrateTypes(types.iter().fold(0, |bits, &it| bits | 1 << it as u8))
+    }
+
+    pub fn contains(self, it: CrateType) -> bool {
+        self.0 & 1 << it as u8 != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The types, in [`CrateType`]'s order.
+    pub fn iter(self) -> impl Iterator<Item = CrateType> {
+        CrateType::ALL.into_iter().filter(move |&it| self.contains(it))
+    }
+
+    /// The set as its bits, for hashing and persisting.
+    pub fn bits(self) -> u8 {
+        self.0
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -421,6 +503,9 @@ pub struct CrateData<Id> {
     /// Extra crate-level attributes, including the surrounding `#![]`.
     pub crate_attrs: Box<[Box<str>]>,
     pub target_kind: TargetKind,
+    /// The crate types it is built as (rustc's `--crate-type`s): cargo's target's
+    /// `crate_types`. Empty when none is given, as for rustc with no `--crate-type`.
+    pub crate_types: CrateTypes,
     /// The working directory to run proc-macros in invoked in the context of this crate.
     /// This is the workspace root of the cargo workspace for workspace members, the crate manifest
     /// dir otherwise.
@@ -563,7 +648,7 @@ impl Crate {
     /// its [`ExtraCrateData`], [`CrateWorkspaceData::content`], [`cfg_options_content`] and
     /// [`Env::content`]. [`UniqueCrateData`] adds nothing: its root file is hashed as its
     /// path, and its disambiguator is the crate's own data and cfg.
-    pub const DOMAIN: &'static str = "blaze v2 crate 1";
+    pub const DOMAIN: &'static str = "blaze v2 crate 2";
 
     pub fn data<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db BuiltCrateData {
         self.data_field(db)
@@ -692,7 +777,9 @@ impl Crate {
             TargetKind::BuildScript => 6,
             TargetKind::Other => 7,
         };
-        hasher.update(&[target_kind]).part(data.proc_macro_cwd.as_str().as_bytes());
+        hasher
+            .update(&[target_kind, data.crate_types.bits()])
+            .part(data.proc_macro_cwd.as_str().as_bytes());
         content::opt(&mut hasher, extra.version.as_deref());
         match &extra.display_name {
             None => hasher.update(&[0]),
@@ -857,6 +944,7 @@ impl CrateGraphBuilder {
                 origin,
                 crate_attrs: crate_attrs.into_boxed_slice(),
                 target_kind,
+                crate_types: target_kind.default_crate_types(),
                 proc_macro_cwd,
             },
             extra: ExtraCrateData { version, display_name, potential_cfg_options },
@@ -957,6 +1045,7 @@ impl CrateGraphBuilder {
                 dependencies,
                 edition: krate.basic.edition,
                 target_kind: krate.basic.target_kind,
+                crate_types: krate.basic.crate_types,
                 origin: krate.basic.origin.clone(),
                 crate_attrs: krate.basic.crate_attrs.clone(),
                 root_file_id: krate.basic.root_file_id,

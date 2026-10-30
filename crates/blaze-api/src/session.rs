@@ -41,6 +41,7 @@ pub struct Daemon<'a> {
     pub db: &'a blaze_query::Database,
     pub builder: &'a mut dyn Builder,
     /// For [`Response::Status`].
+    pub pid: u32,
     pub memory_bytes: u64,
     pub budget_bytes: u64,
 }
@@ -599,6 +600,7 @@ impl Session {
                 let mut requests: Vec<u64> = self.live.keys().map(|it| it.id).collect();
                 radix::sort(&mut requests);
                 let status = Status {
+                    pid: cx.pid,
                     requests,
                     views: self.views(),
                     memory_bytes: cx.memory_bytes,

@@ -5,6 +5,7 @@
 //! Follows rustc's `compiler/rustc_hir/src/attrs/data_structures.rs` (`AttributeKind`,
 //! `InlineAttr`, `OptimizeAttr`, `ReprAttr`, `DocAttribute`) (MIT or Apache-2.0).
 
+use hir::InFile;
 use syntax::TextRange;
 
 /// One parsed attribute of a node: what it is, and which of the node's attributes it is
@@ -122,13 +123,13 @@ pub(crate) enum DocInline {
 /// `DocAttribute`, of one attribute (the checks take the node's together).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Doc {
-    pub(crate) aliases: Vec<(String, TextRange)>,
-    pub(crate) keyword: Option<(String, TextRange)>,
-    pub(crate) attribute: Option<(String, TextRange)>,
-    pub(crate) fake_variadic: Option<TextRange>,
-    pub(crate) search_unbox: Option<TextRange>,
-    pub(crate) inline: Vec<(DocInline, TextRange)>,
-    pub(crate) masked: Option<TextRange>,
+    pub(crate) aliases: Vec<(String, InFile<TextRange>)>,
+    pub(crate) keyword: Option<(String, InFile<TextRange>)>,
+    pub(crate) attribute: Option<(String, InFile<TextRange>)>,
+    pub(crate) fake_variadic: Option<InFile<TextRange>>,
+    pub(crate) search_unbox: Option<InFile<TextRange>>,
+    pub(crate) inline: Vec<(DocInline, InFile<TextRange>)>,
+    pub(crate) masked: Option<InFile<TextRange>>,
 }
 
 /// rustc's `Stability`, `PartialConstStability` and `DefaultBodyStability`, of what the

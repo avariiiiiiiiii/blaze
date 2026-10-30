@@ -15728,7 +15728,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.copy_value(dst, src, if vector { &from } else { &to });
             }
             // Cranelift's atomics are always sequentially consistent, the strongest ordering.
-            (I::Atomic(AtomicOp::Load), [ptr]) => {
+            (I::Atomic(AtomicOp::Load, _), [ptr]) => {
                 let scalar = self.scalar_of(dst_ty)?;
                 let (ptr, _) = self.load_scalar(ptr)?;
                 let value = match self.wide_atomics(scalar.ty)? {
@@ -15741,7 +15741,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 self.builder.ins().store(MEM, value, dst, 0);
             }
-            (I::Atomic(AtomicOp::Store), [ptr, value]) => {
+            (I::Atomic(AtomicOp::Store, _), [ptr, value]) => {
                 let (ptr, _) = self.load_scalar(ptr)?;
                 let (value, ty) = self.load_scalar(value)?;
                 match self.wide_atomics(ty.ty)? {
@@ -15762,6 +15762,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     | AtomicOp::Min
                     | AtomicOp::Umax
                     | AtomicOp::Umin),
+                    _,
                 ),
                 [ptr, value],
             ) => {
@@ -15787,7 +15788,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 };
                 self.builder.ins().store(MEM, old, dst, 0);
             }
-            (I::Atomic(AtomicOp::Cxchg | AtomicOp::CxchgWeak), [ptr, expected, new]) => {
+            (I::Atomic(AtomicOp::Cxchg | AtomicOp::CxchgWeak, _), [ptr, expected, new]) => {
                 let (ptr, _) = self.load_scalar(ptr)?;
                 let (expected, ty) = self.load_scalar(expected)?;
                 let (new, _) = self.load_scalar(new)?;
@@ -15800,7 +15801,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 self.builder.ins().store(MEM, old, dst, layout.fields.offset(0).bytes() as i32);
                 self.builder.ins().store(MEM, swapped, dst, layout.fields.offset(1).bytes() as i32);
             }
-            (I::Atomic(AtomicOp::Fence | AtomicOp::SingleThreadFence), []) => {
+            (I::Atomic(AtomicOp::Fence | AtomicOp::SingleThreadFence, _), []) => {
                 self.builder.ins().fence();
             }
             (I::ReadViaCopy | I::VolatileLoad | I::UnalignedVolatileLoad, [ptr]) => {
@@ -16762,6 +16763,21 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             (I::CallerLocation, []) => {
                 let value = self.caller_location()?;
+                self.builder.ins().store(MEM, value, dst, 0);
+            }
+            // Cranelift finds the return address from the frame record, which only a function
+            // that keeps a frame pointer has.
+            (I::ReturnAddress, []) => {
+                if Target::current().is_wasm() {
+                    unsupported!("`return_address` on WebAssembly, which has no return address");
+                }
+                if !backend::frame_pointers() && !target()?.flags().preserve_frame_pointers() {
+                    unsupported!(
+                        "`return_address` needs frame pointers under Cranelift, and this unit \
+                         keeps none"
+                    );
+                }
+                let value = self.builder.ins().get_return_address(ptr());
                 self.builder.ins().store(MEM, value, dst, 0);
             }
             _ => return Ok(Lowered::Unknown),

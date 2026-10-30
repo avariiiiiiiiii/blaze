@@ -24,7 +24,7 @@ use syntax::AstNode as _;
 use super::inhabited::{Pred, Preds};
 use crate::{
     cx::def_range,
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -62,6 +62,10 @@ impl InitError {
 impl LatePass for InvalidValue {
     fn name(&self) -> &'static str {
         "InvalidValue"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

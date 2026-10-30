@@ -1,8 +1,14 @@
 // blaze's fork server, the harness side of the protocol in `wire.rs`, which comes before this
-// in the same module. Text only: `blaze_usercode::test::FORK_SERVER` puts both in the test
+// in the same module. Text only: `blaze_usercode::test::fork_server` puts both in the test
 // harness blaze writes, as the module `fork_server` beside the harness's `main`, where
-// `super::test` is libtest. Never a module of blaze-usercode. It is compiled in the tested
-// crate's edition, so it names everything from `::std` and `::core`.
+// `super::test` is libtest, followed by the module `exec` of `fork_server/recorded.rs` or
+// `fork_server/unrecorded.rs` (whether the binary has jump-table slots). Never a module of
+// blaze-usercode. It is compiled in the tested crate's edition, so it names everything from
+// `::std` and `::core`.
+//
+// What happens once per binary happens before the first test: the names of the hello, the
+// child-exit queue, the slot count. A test costs one socket pair, one mapping (with slots),
+// one fork and one frame; the buffers of the loop are kept across tests.
 
 /// Serves `tests` to blaze over the socket at `socket` (the value of [`SOCKET`]), then exits:
 /// what the harness's `main` calls when the variable is set.
@@ -28,7 +34,10 @@ pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: ::st
 #[cfg(unix)]
 mod unix {
     use super::super::test;
-    use super::{End, Frame, Frames, LONGEST_OUTPUT, MARK, SOCKET, VERSION, encode_ended};
+    use super::exec::{Exec, Region};
+    use super::{
+        End, EndView, ExecView, Frame, Frames, Hits, LONGEST_OUTPUT, MARK, SOCKET, VERSION, View, encode_ended,
+    };
     use ::std::io::{Read, Write};
     use ::std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
     use ::std::os::unix::net::UnixStream;
@@ -74,6 +83,8 @@ mod unix {
         status: Option<Int>,
         /// Readable once the child has ended, where each child has one (Linux's pidfd).
         exit: Option<OwnedFd>,
+        /// Where it notes what it executed, read once it has ended.
+        region: Region,
     }
 
     // What wakes the server the moment a child ends, so it never waits on a clock: a pidfd
@@ -239,6 +250,7 @@ mod unix {
             ::std::env::remove_var(SOCKET);
         }
         let queue = exits::queue()?;
+        let exec = Exec::open();
         // A child ended before its end could be watched: the next poll doesn't wait.
         let mut now = false;
         let mut stream = connect(socket)?;
@@ -249,12 +261,13 @@ mod unix {
         let mut quitting = false;
         let mut buffer = vec![0u8; 1 << 16];
         // Kept across turns of the loop, so a turn allocates nothing: what is polled, which
-        // children's outputs those are, the frames to send (one write a turn), and the output
-        // buffers of children that ended, for the next ones.
+        // children's outputs those are, the frames to send (one write a turn), the output
+        // buffers of children that ended, for the next ones, and the hits of the last.
         let mut watched: Vec<usize> = Vec::new();
         let mut fds: Vec<PollFd> = Vec::new();
         let mut out: Vec<u8> = Vec::new();
         let mut spare: Vec<Vec<u8>> = Vec::new();
+        let mut hits: Vec<u8> = Vec::new();
         loop {
             if quitting && children.is_empty() {
                 return Ok(());
@@ -301,7 +314,7 @@ mod unix {
                     }
                 }
                 loop {
-                    let frame = match frames.pop() {
+                    let frame = match frames.pop_view() {
                         Ok(Some(frame)) => frame,
                         Ok(None) => break,
                         Err(why) => {
@@ -310,7 +323,7 @@ mod unix {
                         }
                     };
                     match frame {
-                        Frame::Run { id, index } => match start(tests, id, index, &stream, &children, spare.pop().unwrap_or_default()) {
+                        View::Run { id, index } => match start(tests, &exec, id, index, &stream, &children, spare.pop().unwrap_or_default()) {
                             Ok(mut child) => {
                                 match exits::watch(&queue, child.pid) {
                                     Ok((exit, ended)) => {
@@ -325,14 +338,14 @@ mod unix {
                                 }
                                 children.push(child);
                             }
-                            Err(why) => encode_ended(&mut out, id, &End::NotStarted(why), &[]),
+                            Err(why) => encode_ended(&mut out, id, EndView::NotStarted(&why), &[], ExecView::Not(exec.not_run(&why))),
                         },
-                        Frame::Kill { id } => {
+                        View::Kill { id } => {
                             if let Some(child) = children.iter().find(|it| it.id == id && it.status.is_none()) {
                                 kill_group(child.pid);
                             }
                         }
-                        Frame::Quit => quitting = true,
+                        View::Quit => quitting = true,
                         other => {
                             kill_all(&mut children);
                             return Err(format!("blaze sent {:?}, which only a server sends", other));
@@ -366,7 +379,13 @@ mod unix {
                     let note = format!("\n[blaze: the output was cut at {} bytes]\n", LONGEST_OUTPUT);
                     child.bytes.extend_from_slice(note.as_bytes());
                 }
-                encode_ended(&mut out, child.id, &end_of(status), &child.bytes);
+                let end = end_of(status);
+                let read = child.region.read(&end, &mut hits);
+                let executed = match &read {
+                    Ok(slots) => ExecView::Hits { slots: *slots, hits: Hits::of_bytes(&hits).expect("four bytes a hit") },
+                    Err(why) => ExecView::Not(&**why),
+                };
+                encode_ended(&mut out, child.id, end.view(), &child.bytes, executed);
                 // A buffer that held a long output is let go rather than kept at that size.
                 if child.bytes.capacity() <= KEPT {
                     child.bytes.clear();
@@ -415,6 +434,7 @@ mod unix {
 
     fn start(
         tests: &'static [&'static test::TestDescAndFn],
+        exec: &Exec,
         id: u64,
         index: u32,
         stream: &UnixStream,
@@ -427,9 +447,12 @@ mod unix {
         };
         let (ours, theirs) =
             UnixStream::pair().map_err(|error| format!("a socket pair for the test's output: {}", error))?;
+        // Mapped before the fork, so the child shares it; unmapped by its drop when the fork
+        // fails or the server is done reading it.
+        let region = exec.map()?;
         // SAFETY: the server has one thread (see `serve`), so the child is a whole copy of it
         // and no lock is left held by a thread that isn't there. The child only closes and
-        // copies descriptors, then runs the test and leaves by `_exit`.
+        // copies descriptors, arms its record, then runs the test and leaves by `_exit`.
         let pid = unsafe { fork() };
         if pid < 0 {
             return Err(format!("fork: {}", ::std::io::Error::last_os_error()));
@@ -461,6 +484,10 @@ mod unix {
                 // SAFETY: as above, `theirs` is not used in the child after this; 1 and 2 stay.
                 unsafe { close(theirs.as_raw_fd()) };
             }
+            let armed = region.arm();
+            if armed != 0 {
+                eprintln!("blaze's fork server: the runtime did not arm the execution record ({}); what this test executed is not known", armed);
+            }
             let code = run(test);
             let _ = ::std::io::stdout().flush();
             let _ = ::std::io::stderr().flush();
@@ -475,7 +502,7 @@ mod unix {
         unsafe { setpgid(pid, pid) };
         drop(theirs);
         ours.set_nonblocking(true).map_err(|error| format!("the test's output socket: {}", error))?;
-        Ok(Child { id: id, pid: pid, output: ours, bytes: bytes, cut: false, open: true, status: None, exit: None })
+        Ok(Child { id: id, pid: pid, output: ours, bytes: bytes, cut: false, open: true, status: None, exit: None, region: region })
     }
 
     fn drain(child: &mut Child) {

@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use blaze_ids::radix;
+use blaze_radix as radix;
 use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -20,7 +20,7 @@
 //     O\t<index>\t<directory>\t<upper>   an overlay (one line for each way to spell it)
 //     B\t<directory>\t<target>           a directory answered from `target`
 //     W\t<directory>                     a directory written for real
-//     Q\t<path>                          a path that is no input (`/dev`, the program)
+//     Q\t<path>                          a path that is no input (`/dev`)
 //     L                                  record (W, N and X lines, and P and H for X)
 //     R                                  record reads (R L D E T lines) too
 //     V\t<file>                          the live record, where the lines go
@@ -121,7 +121,7 @@ extern int32_t CCRandomGenerateBytes(void *, size_t);
 #define MAX_ROOTS 128
 #define MAX_OVERLAYS 32
 
-// QUIET: seen as it is and no input (`/dev`, the program itself), named in no R line.
+// QUIET: seen as it is and no input (`/dev`), named in no R line.
 enum kind { NONE, OVERLAY, BIND, WRITABLE, SCRATCH, QUIET };
 
 struct root {
@@ -343,6 +343,15 @@ static void tidy(char *path) {
     *out = 0;
 }
 
+// `a` then `b` into `out`, which has room for `PATH_MAX` bytes: -1 when they don't fit.
+static int concat(char *out, const char *a, const char *b) {
+    size_t x = strlen(a), y = strlen(b);
+    if (x + y + 1 > PATH_MAX) return -1;
+    memcpy(out, a, x);
+    memcpy(out + x, b, y + 1);
+    return 0;
+}
+
 static int join(char *out, const char *base, const char *rest) {
     size_t a = strlen(base), b = strlen(rest);
     if (a + b + 2 > PATH_MAX) return -1;
@@ -417,8 +426,7 @@ static void reverse(char *path) {
         struct root *it = &roots[i];
         if ((it->kind == OVERLAY || it->kind == BIND) &&
             under(path, it->target, it->target_len)) {
-            if (snprintf(out, sizeof out, "%s%s", it->path, path + it->target_len) < PATH_MAX)
-                strcpy(path, out);
+            if (concat(out, it->path, path + it->target_len) == 0) strcpy(path, out);
             return;
         }
     }
@@ -676,7 +684,7 @@ static int listing(const char *virt, const char *lower, const char *upper, char 
 static enum answer overlay(struct root *it, const char *virt, const char *rest, enum how how,
                            char *real) {
     char upper[PATH_MAX];
-    if (snprintf(upper, sizeof upper, "%s%s", it->target, rest) >= PATH_MAX) {
+    if (concat(upper, it->target, rest) < 0) {
         errno = ENAMETOOLONG;
         return FAIL;
     }
@@ -761,7 +769,7 @@ static enum answer resolve(int dirfd, const char *path, enum how how, char *real
     if (!it) return PASS;
     switch (it->kind) {
     case BIND:
-        if (snprintf(real, PATH_MAX, "%s%s", it->target, rest) >= PATH_MAX) return PASS;
+        if (concat(real, it->target, rest) < 0) return PASS;
         return USE;
     case OVERLAY: return overlay(it, virt, rest, how, real);
     default: return PASS;
@@ -1272,7 +1280,10 @@ static int removed(int d, const char *p, int dir) {
     }
     const char *rest = virt + root->len;
     char upper[PATH_MAX];
-    snprintf(upper, sizeof upper, "%s%s", root->target, rest);
+    if (concat(upper, root->target, rest) < 0) {
+        errno = ENAMETOOLONG;
+        END(-1);
+    }
     struct stat ust, lst;
     int error;
     if (parents(root, rest) < 0) END(-1);

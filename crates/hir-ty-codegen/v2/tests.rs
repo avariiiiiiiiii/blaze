@@ -6,7 +6,7 @@ mod db;
 use blaze_codegen::{
     Backend, Instance as UnitInstance, Unit,
     backend::{FrontRef, Shape},
-    settings::{DebugInfo, Panic, Relocation, Spec, Toolchain},
+    settings::{Coverage, DebugInfo, Panic, Relocation, Sanitize, Sanitizers, Spec, Toolchain},
     template::Refs,
 };
 use blaze_format::SpanRef;
@@ -131,6 +131,7 @@ fn spec() -> Spec {
         debuginfo: DebugInfo::None,
         fold: false,
         policy: ContentId::default(),
+        sanitize: Sanitize::default(),
     }
 }
 
@@ -174,14 +175,16 @@ fn refs_of(db: &dyn HirDatabase, homes: &mut Homes, instance: &HirInstance) -> V
 }
 
 fn shape(frontend: &HirFrontend, instance: &HirInstance) -> Shape {
-    let spec = spec();
+    prepared(frontend, &spec(), instance).0
+}
+
+fn prepared(frontend: &HirFrontend, spec: &Spec, instance: &HirInstance) -> (Shape, super::Prepared) {
     frontend.with(|db, homes| {
         let refs = refs_of(db, homes, instance);
         let refs: &Refs = &refs;
         Backends::default()
-            .prepared(db, homes, &*frontend.hashes, &unit(&spec), &spec, instance, refs)
+            .prepared(db, homes, &*frontend.hashes, &unit(spec), spec, instance, refs)
             .unwrap_or_else(|e| panic!("{instance:?}: {e}"))
-            .0
     })
 }
 
@@ -423,4 +426,96 @@ fn an_allocator_entry_calls_what_its_walk_lists() {
     });
     // The fixture links no `alloc`: its program has no shim.
     assert!(frontend.allocator_shim(krate).expect("the shim").is_empty());
+}
+
+const SANITIZED: &str = r#"
+//- minicore: sized, fn
+#![feature(sanitize)]
+#[sanitize(address = "off")]
+pub fn quiet() {}
+pub fn loud() {}
+#[sanitize(address = "off", thread = "off")]
+pub mod inside {
+    pub fn inherited() {}
+    #[sanitize(thread = "on")]
+    pub fn nearest() {}
+    pub fn closure() -> u32 { (|| 1)() }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn __sanitizer_cov_trace_pc_guard(_guard: *mut u32) {}
+"#;
+
+fn sanitizing(sanitizers: Sanitizers, coverage: u8) -> Spec {
+    let coverage = Coverage { level: coverage, flags: 0 };
+    Spec { sanitize: Sanitize { sanitizers, coverage, ..Sanitize::default() }, ..spec() }
+}
+
+/// What a function has off of the unit's sanitizers is its nearest `#[sanitize]`, as rustc
+/// reads it; a closure has its function's; a `__sanitizer_*` symbol has SanitizerCoverage
+/// off; and without a set nothing is off.
+#[test]
+fn a_functions_sanitizers_off_are_its_nearest_attributes() {
+    let (db, frontend) = frontend(SANITIZED);
+    let both = Sanitizers::ADDRESS.union(Sanitizers::THREAD);
+    let off = |spec: &Spec, instance: &HirInstance| {
+        prepared(&frontend, spec, instance).1.function().unsanitized
+    };
+    let root = |name| frontend.root(function(&db, name));
+    let address = sanitizing(Sanitizers::ADDRESS, 0);
+    let all = sanitizing(both, 0);
+    assert_eq!(off(&address, &root("quiet")), Sanitizers::ADDRESS);
+    assert_eq!(off(&address, &root("loud")), Sanitizers::NONE);
+    assert_eq!(off(&sanitizing(Sanitizers::THREAD, 0), &root("quiet")), Sanitizers::NONE);
+    assert_eq!(off(&spec(), &root("quiet")), Sanitizers::NONE);
+    assert_eq!(off(&all, &root("inherited")), both);
+    assert_eq!(off(&all, &root("nearest")), Sanitizers::ADDRESS);
+    let closure = frontend.with(|db, homes| {
+        refs::walk(db, &root("closure"), homes)
+            .expect("the walk")
+            .into_iter()
+            .find_map(|it| match it {
+                FrontRef::Function(it) => match &it.0 {
+                    Kind::Code(code, _) if matches!(code.def, InstanceDef::Closure(_)) => Some(it),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the closure")
+    });
+    assert_eq!(off(&all, &closure), both);
+    let callback = root("__sanitizer_cov_trace_pc_guard");
+    assert_eq!(off(&sanitizing(Sanitizers::NONE, 2), &callback), Sanitizers::COVERAGE);
+    assert_eq!(off(&address, &callback), Sanitizers::NONE);
+    assert_eq!(off(&sanitizing(Sanitizers::NONE, 2), &root("loud")), Sanitizers::NONE);
+}
+
+/// A function with a sanitizer off is another template than the same IR with it on.
+#[test]
+fn what_is_unsanitized_is_in_the_shape() {
+    let (db, frontend) = frontend(SANITIZED);
+    let quiet = frontend.root(function(&db, "quiet"));
+    let address = sanitizing(Sanitizers::ADDRESS, 0);
+    let thread = sanitizing(Sanitizers::THREAD, 0);
+    assert_ne!(prepared(&frontend, &address, &quiet).0, prepared(&frontend, &thread, &quiet).0);
+    assert_eq!(prepared(&frontend, &thread, &quiet).0, shape(&frontend, &quiet));
+}
+
+/// Cranelift instruments for no sanitizer, so a unit with a set it would build is refused,
+/// never built without the checks.
+#[test]
+fn cranelift_refuses_a_sanitized_unit() {
+    use blaze_codegen::backend::Prepare as _;
+    let (db, frontend) = frontend(SANITIZED);
+    let loud = frontend.root(function(&db, "loud"));
+    let refs = frontend.with(|db, homes| refs_of(db, homes, &loud));
+    let refs: &Refs = &refs;
+    for spec in [sanitizing(Sanitizers::ADDRESS, 0), sanitizing(Sanitizers::NONE, 1)] {
+        let Err(e) = Backends::default().prepare(&frontend, &unit(&spec), &spec, &loud, refs) else {
+            panic!("a sanitized Cranelift unit was built");
+        };
+        assert!(e.to_string().contains("-Zsanitizer and SanitizerCoverage"), "{e}");
+    }
+    let plain = spec();
+    let built = Backends::default().prepare(&frontend, &unit(&plain), &plain, &loud, refs);
+    built.expect("a plain unit");
 }

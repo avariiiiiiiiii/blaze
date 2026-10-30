@@ -18,10 +18,10 @@ use crate::next_solver::{
 use super::*;
 
 /// Gives the bytes of a field of a value being made, from its name and type.
-type FieldBytes<'a, 'db> =
-    &'a mut dyn FnMut(&mut Evaluator<'db>, &str, Ty<'db>) -> Result<'db, Vec<u8>>;
+type FieldBytes<'a, 'db, M> =
+    &'a mut dyn FnMut(&mut Evaluator<'db, M>, &str, Ty<'db>) -> Result<'db, Vec<u8>>;
 
-impl<'db> Evaluator<'db> {
+impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// Answers the reflection intrinsic `intrinsic`, or says it is not one.
     pub(super) fn exec_reflection_intrinsic(
         &mut self,
@@ -332,7 +332,7 @@ impl<'db> Evaluator<'db> {
         variant: VariantId,
         args: GenericArgs<'db>,
         locals: &Locals<'db>,
-        field: FieldBytes<'_, 'db>,
+        field: FieldBytes<'_, 'db, M>,
     ) -> Result<'db, Vec<u8>> {
         let mut values = Vec::new();
         for (name, ty) in self.variant_fields(variant, args) {
@@ -347,7 +347,7 @@ impl<'db> Evaluator<'db> {
         &mut self,
         ty: Ty<'db>,
         locals: &Locals<'db>,
-        field: FieldBytes<'_, 'db>,
+        field: FieldBytes<'_, 'db, M>,
     ) -> Result<'db, Vec<u8>> {
         let TyKind::Adt(adt, args) = ty.kind() else {
             not_supported!("{ty:?} in core's `type_info`, which is not a struct there")
@@ -366,7 +366,7 @@ impl<'db> Evaluator<'db> {
         ty: Ty<'db>,
         name: &str,
         locals: &Locals<'db>,
-        field: FieldBytes<'_, 'db>,
+        field: FieldBytes<'_, 'db, M>,
     ) -> Result<'db, Vec<u8>> {
         let TyKind::Adt(adt, args) = ty.kind() else {
             not_supported!("{ty:?} in core's `type_info`, which is not an enum there")

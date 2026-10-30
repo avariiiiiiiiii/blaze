@@ -233,15 +233,16 @@ fn now(id: i32) -> u64 {
 }
 
 /// Random bytes, from a hasher the standard library seeds from the system's randomness.
-pub(crate) fn random(len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len + 8);
-    while out.len() < len {
-        let mut hasher = std::hash::RandomState::new().build_hasher();
-        hasher.write_usize(out.len());
-        out.extend_from_slice(&hasher.finish().to_le_bytes());
+/// Fills `out` with random bytes, in place: the keys of one fresh `RandomState`, which the
+/// standard library seeds from the system once per thread and steps per call, hashing the
+/// index of each eight bytes.
+pub(crate) fn fill_random(out: &mut [u8]) {
+    let state = std::hash::RandomState::new();
+    for (index, chunk) in out.chunks_mut(8).enumerate() {
+        let mut hasher = state.build_hasher();
+        hasher.write_usize(index);
+        chunk.copy_from_slice(&hasher.finish().to_le_bytes()[..chunk.len()]);
     }
-    out.truncate(len);
-    out
 }
 
 fn memory(caller: &mut Caller<'_, State>) -> wasmtime::Result<Memory> {
@@ -357,17 +358,30 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         |mut caller: Caller<'_, State>, environ: i32, buf: i32| {
             let memory = memory(&mut caller)?;
             let (mem, state) = memory.data_and_store_mut(&mut caller);
-            let mut at = buf;
+            // Guest pointers are `u32`s: past the top of memory is an error, never a wrap.
+            let (environ, mut at) = (environ as u32, buf as u32);
             for (index, (key, value)) in state.env.iter().enumerate() {
-                let entry = format!("{key}={value}\0");
-                if let Err(e) = put(mem, environ + 4 * index as i32, &at.to_le_bytes()).and(put(
-                    mem,
-                    at,
-                    entry.as_bytes(),
-                )) {
+                let (key, value) = (key.as_encoded_bytes(), value.as_encoded_bytes());
+                let slot = u32::try_from(index).ok().and_then(|it| it.checked_mul(4));
+                let slot = slot.and_then(|it| it.checked_add(environ));
+                let equals = u32::try_from(key.len()).ok().and_then(|it| at.checked_add(it));
+                let value_at = equals.and_then(|it| it.checked_add(1));
+                let nul = value_at.and_then(|it| it.checked_add(u32::try_from(value.len()).ok()?));
+                let next = nul.and_then(|it| it.checked_add(1));
+                let (Some(slot), Some(equals), Some(value_at), Some(nul), Some(next)) =
+                    (slot, equals, value_at, nul, next)
+                else {
+                    return Ok(EINVAL);
+                };
+                let written = put(mem, slot as i32, &at.to_le_bytes())
+                    .and(put(mem, at as i32, key))
+                    .and(put(mem, equals as i32, b"="))
+                    .and(put(mem, value_at as i32, value))
+                    .and(put(mem, nul as i32, b"\0"));
+                if let Err(e) = written {
                     return Ok(e);
                 }
-                at += entry.len() as i32;
+                at = next;
             }
             Ok(SUCCESS)
         },
@@ -397,7 +411,12 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             let memory = memory(&mut caller)?;
             let (mem, state) = memory.data_and_store_mut(&mut caller);
             state.files.traced.untraceable.push(Untraceable::Random);
-            Ok(errno(put(mem, buf, &random(len as u32 as usize))))
+            let start = buf as u32 as usize;
+            let end = start.checked_add(len as u32 as usize);
+            let room = end.and_then(|end| mem.get_mut(start..end));
+            let Some(room) = room else { return Ok(EINVAL) };
+            fill_random(room);
+            Ok(SUCCESS)
         },
     )?;
     linker.func_wrap(MODULE, "sched_yield", || SUCCESS)?;
@@ -422,7 +441,8 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                 let Ok(chunk) = bytes(mem, ptr, len) else { return Ok(EINVAL) };
                 let room = KEPT_OUTPUT.saturating_sub(state.files.output.len());
                 state.files.output.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                total += len as u32;
+                let Some(more) = total.checked_add(len as u32) else { return Ok(EINVAL) };
+                total = more;
             }
             Ok(errno(put(mem, written, &total.to_le_bytes())))
         },
@@ -442,14 +462,15 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             Some(Open::Dir { .. }) => return Err(EISDIR),
             None => return Err(EBADF),
         };
-        let mut from = at.unwrap_or(*pos) as usize;
+        let from = usize::try_from(at.unwrap_or(*pos)).unwrap_or(usize::MAX);
+        let mut from = from.min(bytes.len());
         let mut total = 0u32;
         for (ptr, len) in vecs {
-            let chunk =
-                &bytes[from.min(bytes.len())..(from + len as u32 as usize).min(bytes.len())];
+            let end = from.saturating_add(len as u32 as usize).min(bytes.len());
+            let chunk = &bytes[from..end];
             put(mem, ptr, chunk)?;
-            from += chunk.len();
-            total += chunk.len() as u32;
+            from = end;
+            total = total.checked_add(chunk.len() as u32).ok_or(EINVAL)?;
             if chunk.len() < len as u32 as usize {
                 break;
             }

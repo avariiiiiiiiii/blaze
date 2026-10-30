@@ -13,7 +13,9 @@ use triomphe::Arc;
 use crate::{
     DefWithBodyId, ExpressionStoreOwnerId, HasModule,
     expr_store::{
-        ExpressionStore, ExpressionStoreSourceMap, Move, SelfParamPtr, lower::lower_body, pretty,
+        ExpressionStore, ExpressionStoreSourceMap, Move, SelfParamPtr,
+        lower::{BodyLowering, lower_body},
+        pretty,
     },
     hir::{BindingId, ExprId, PatId},
     src::HasSource,
@@ -106,8 +108,9 @@ impl ops::Deref for BodySourceMap {
 #[salsa::tracked]
 impl Body {
     /// The body with where each part of it is written. For a body written in a file, this is
-    /// [`Body::relative`] with its source map moved to where the body is in the file: the body
-    /// is lowered once, and an edit elsewhere in the file only moves the map.
+    /// [`Body::relative`] with its source map moved to where the body is in the file: the map
+    /// is made once, and an edit elsewhere in the file only moves it. The body is equal to
+    /// [`Body::of`], with the same ids, but lowered again with the map.
     #[salsa::tracked(lru = 512, returns(ref))]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
@@ -115,7 +118,9 @@ impl Body {
     ) -> (Arc<Body>, BodySourceMap) {
         let _p = tracing::info_span!("body_with_source_map_query").entered();
         let Some((body, source_map)) = Self::relative(db, def) else {
-            let (body, source_map) = lower_in_file(db, def);
+            let of = Self::of(db, def);
+            let (body, source_map) = lower_in_file(db, def, of.lowering_with_source_map());
+            assert_eq!(body, *of, "{def:?}: the body lowered with its source map");
             return (Arc::new(body), source_map);
         };
         let syntax = body_syntax(db, def).as_ref().expect("lowered without its syntax");
@@ -145,7 +150,8 @@ impl Body {
             store: source_map.store.moved(&mv),
         };
         if check_relative() {
-            let (whole, in_file) = lower_in_file(db, def);
+            let lowering = Self::of(db, def).lowering_with_source_map();
+            let (whole, in_file) = lower_in_file(db, def, lowering);
             assert_eq!(in_file, source_map, "{def:?}: the source map lowered alone, moved");
             assert_eq!(whole.params.len(), body.params.len());
         }
@@ -157,54 +163,43 @@ impl Body {
     /// when its own text changes. The source map is of the tree of [`BodySyntax::root`]. `None`
     /// when the body is not written in a file, but by a macro. Kept for more bodies than
     /// [`Body::with_source_map`] is: what is lowered again after it is let go of has changed
-    /// to all that reads it.
+    /// to all that reads it. The body is [`Body::of`] lowered again for its map, with the same
+    /// blocks, and checked equal to it.
     #[salsa::tracked(lru = 4096, returns(ref))]
     pub fn relative(
         db: &dyn SourceDatabase,
         def: DefWithBodyId,
     ) -> Option<(Arc<Body>, BodySourceMap)> {
         let _p = tracing::info_span!("body_relative_query").entered();
-        let syntax = body_syntax(db, def).as_ref()?;
-        let node = syntax.item.to_node(&syntax.root(db));
-        let (mut params, mut is_async_fn, mut is_gen_fn) = (None, false, false);
-        let body = match def {
-            DefWithBodyId::FunctionId(_) => {
-                let it = ast::Fn::cast(node.clone())?;
-                params = it.param_list();
-                is_async_fn = it.async_token().is_some();
-                is_gen_fn = it.gen_token().is_some();
-                it.body().map(ast::Expr::from)
-            }
-            DefWithBodyId::ConstId(_) => ast::Const::cast(node.clone())?.body(),
-            DefWithBodyId::StaticId(_) => ast::Static::cast(node.clone())?.body(),
-            DefWithBodyId::VariantId(_) => ast::Variant::cast(node.clone())?.const_arg()?.expr(),
-        };
-        let maps = Some((&*syntax.span_map, &*syntax.ast_id_map));
-        let (body, source_map) = lower_body(
-            db,
-            def,
-            syntax.item,
-            syntax.file_id,
-            def.module(db),
-            params,
-            body,
-            is_async_fn,
-            is_gen_fn,
-            maps,
-        );
+        body_syntax(db, def).as_ref()?;
+        let of = Self::of(db, def);
+        let (body, source_map) = lower_relative(db, def, of.lowering_with_source_map())?;
+        assert_eq!(body, *of, "{def:?}: the body lowered with its source map");
         Some((Arc::new(body), source_map))
     }
 
+    /// The body without its source map: lowered as [`Body::relative`] is, or from its file for
+    /// a body a macro writes, recording no map. Most bodies a build lowers never show where a
+    /// part of them is written, so their maps are built only when read: [`Body::relative`] and
+    /// [`Body::with_source_map`] lower the body again, with the map and this body's blocks.
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, def: DefWithBodyId) -> Arc<Body> {
-        match Self::relative(db, def) {
-            Some((body, _)) => body.clone(),
-            None => Self::with_source_map(db, def).0.clone(),
-        }
+        let _p = tracing::info_span!("body_query").entered();
+        let body = match lower_relative(db, def, BodyLowering::Body) {
+            Some((body, _)) => body,
+            None => lower_in_file(db, def, BodyLowering::Body).0,
+        };
+        Arc::new(body)
     }
 }
 
 impl Body {
+    /// How to lower this body again for its source map: with its blocks.
+    fn lowering_with_source_map(&self) -> BodyLowering<'_> {
+        let blocks = self.store.expr_only.as_ref().map_or(&[][..], |it| &it.block_scopes);
+        BodyLowering::SourceMap { blocks }
+    }
+
     /// Where in its file the anchor of [`body_syntax`] begins, which the source map of
     /// [`Body::relative`] is relative to. `None` for a body a macro writes.
     pub fn anchor_offset(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<TextSize> {
@@ -234,9 +229,51 @@ fn def_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> InFile<SyntaxNode>
     }
 }
 
-/// Lowers the body of `def` from the whole file it is in. What a body written by a macro is
-/// lowered with, and what [`check_relative`] checks the others against.
-fn lower_in_file(db: &dyn SourceDatabase, def: DefWithBodyId) -> (Body, BodySourceMap) {
+/// Lowers the body of `def` from [`body_syntax`], as `lowering` says. `None` when the body is
+/// not written in a file, but by a macro.
+fn lower_relative(
+    db: &dyn SourceDatabase,
+    def: DefWithBodyId,
+    lowering: BodyLowering<'_>,
+) -> Option<(Body, BodySourceMap)> {
+    let syntax = body_syntax(db, def).as_ref()?;
+    let node = syntax.item.to_node(&syntax.root(db));
+    let (mut params, mut is_async_fn, mut is_gen_fn) = (None, false, false);
+    let body = match def {
+        DefWithBodyId::FunctionId(_) => {
+            let it = ast::Fn::cast(node.clone())?;
+            params = it.param_list();
+            is_async_fn = it.async_token().is_some();
+            is_gen_fn = it.gen_token().is_some();
+            it.body().map(ast::Expr::from)
+        }
+        DefWithBodyId::ConstId(_) => ast::Const::cast(node.clone())?.body(),
+        DefWithBodyId::StaticId(_) => ast::Static::cast(node.clone())?.body(),
+        DefWithBodyId::VariantId(_) => ast::Variant::cast(node.clone())?.const_arg()?.expr(),
+    };
+    let maps = Some((&*syntax.span_map, &*syntax.ast_id_map));
+    Some(lower_body(
+        db,
+        def,
+        syntax.item,
+        syntax.file_id,
+        def.module(db),
+        params,
+        body,
+        is_async_fn,
+        is_gen_fn,
+        maps,
+        lowering,
+    ))
+}
+
+/// Lowers the body of `def` from the whole file it is in, as `lowering` says. What a body
+/// written by a macro is lowered with, and what [`check_relative`] checks the others against.
+fn lower_in_file(
+    db: &dyn SourceDatabase,
+    def: DefWithBodyId,
+    lowering: BodyLowering<'_>,
+) -> (Body, BodySourceMap) {
     let mut params = None;
     let mut is_async_fn = false;
     let mut is_gen_fn = false;
@@ -266,7 +303,19 @@ fn lower_in_file(db: &dyn SourceDatabase, def: DefWithBodyId) -> (Body, BodySour
         }
     };
     let module = def.module(db);
-    lower_body(db, def, syntax_node, file_id, module, params, body, is_async_fn, is_gen_fn, None)
+    lower_body(
+        db,
+        def,
+        syntax_node,
+        file_id,
+        module,
+        params,
+        body,
+        is_async_fn,
+        is_gen_fn,
+        None,
+        lowering,
+    )
 }
 
 /// Whether [`Body::with_source_map`] checks the source map of each body lowered alone, moved,

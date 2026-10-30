@@ -62,6 +62,8 @@ const W_EPOCH: usize = 1;
 const W_BIRTHS: usize = 2;
 /// One past the highest table entry in use: what a thread scans.
 const W_HIGH: usize = 3;
+/// What the daemon announces to every run process ([`Fences::announce`]).
+const W_ANNOUNCED: usize = 4;
 
 /// Ranges the table holds at once; more wait in the daemon's limbo for room.
 pub const ENTRIES: usize = 256;
@@ -192,6 +194,11 @@ impl<W: Words> Fences<W> {
         }
     }
 
+    /// Stores `value` where every run process reads it with one load ([`Thread::announced`]).
+    pub fn announce(&self, value: u64) {
+        self.words.word(W_ANNOUNCED).store(value, Ordering::Release);
+    }
+
     /// The count of slot claims so far: read before listing the processes' threads for
     /// [`Fences::oldest`].
     pub fn births(&self) -> u64 {
@@ -267,6 +274,11 @@ impl Thread {
     /// Whether `words` were set up by [`Fences::new`].
     pub fn ready(words: &impl Words) -> bool {
         words.words() >= CONTROL_WORDS && words.word(W_MAGIC).load(Ordering::Acquire) == MAGIC
+    }
+
+    /// What the daemon last announced ([`Fences::announce`]).
+    pub fn announced(words: &impl Words) -> u64 {
+        words.word(W_ANNOUNCED).load(Ordering::Acquire)
     }
 
     /// The epoch now.

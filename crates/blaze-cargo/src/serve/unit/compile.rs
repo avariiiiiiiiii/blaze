@@ -21,7 +21,7 @@ use hir_ty::db::HirDatabase;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Job, artifact, checks_only, graph,
+    Job, UnitReader, artifact, checks_only, graph,
     codegen::{self, Makes},
     files::{Mounted, Names},
     say, script,
@@ -145,20 +145,29 @@ pub(crate) mod header {
 }
 
 /// The key of `unit`'s record: none while the front end can't say what the unit's inputs are.
-/// Worked out once per job and unit.
+/// Worked out once per job and unit, once the writer has set the unit's identity; before
+/// that, none and nothing memoized.
 fn record_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
     if let Some(key) = job.keys.get(unit).and_then(|it| it.get()) {
         return Ok(*key);
     }
-    let key = work_out_key(job, unit)?;
+    let Some(identity) = job.identities.get(unit).and_then(|it| it.get()) else { return Ok(None) };
+    let key = match identity {
+        Some(identity) => Some(work_out_key(job, unit, *identity)?),
+        None => None,
+    };
     if let Some(slot) = job.keys.get(unit) {
         let _ = slot.set(key);
     }
     Ok(key)
 }
 
-fn work_out_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
-    let Some(identity) = job.lowered.identity(unit) else { return Ok(None) };
+/// `unit`'s identity in the front end, once the writer set it.
+fn identity(job: &Job, unit: usize) -> Option<ContentId> {
+    job.identities.get(unit).and_then(|it| it.get()).copied().flatten()
+}
+
+fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiError> {
     let u = job.unit(unit)?;
     let plan = job.plan(unit)?;
     let toolchain = codegen::toolchain(job, unit).map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?;
@@ -180,7 +189,7 @@ fn work_out_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
         hash_cbor(&mut hasher, scratch, &runs.env, "run environment", unit)
     })?;
     hasher.id(&toolchain.id).update(&[goal, u8::from(job.input.color)]);
-    Ok(Some(Key(hasher.finish())))
+    Ok(Key(hasher.finish()))
 }
 
 fn hash_cbor<T: Serialize + ?Sized>(
@@ -256,8 +265,9 @@ fn kept(job: &Job, unit: usize) -> Option<Record> {
     blaze_protocol::cbor::from_slice(&entry.bytes[body..]).ok()
 }
 
-/// `unit` checked and, unless it is a check, compiled and linked.
-pub(crate) fn compile(job: &Job, unit: usize) -> Result<Compiled, Failed> {
+/// `unit` checked and, unless it is a check, compiled and linked, reading the front end through
+/// `reader`.
+pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize) -> Result<Compiled, Failed> {
     if let Some(record) = kept(job, unit) {
         let artifact = record.artifact.map(|it| Artifact { fresh: true, ..it });
         if let Some(slot) = job.made.get(unit) {
@@ -275,7 +285,7 @@ pub(crate) fn compile(job: &Job, unit: usize) -> Result<Compiled, Failed> {
             artifact,
         });
     }
-    let made = make(job, unit)?;
+    let made = make(job, reader, unit)?;
     let key = record_key(job, unit)?;
     let Made2 { mut compiled, made, natives } = made;
     if let Some(key) = key {
@@ -353,22 +363,21 @@ pub(crate) fn cargo_hides(message: &str) -> bool {
 
 
 
-fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
+fn make(job: &Job, reader: &UnitReader, unit: usize) -> Result<Made2, Failed> {
     let u = job.unit(unit)?;
     let plan = job.plan(unit)?;
     let package = job.package(u)?;
     let unit_of = job.unit_of(u)?;
     let color = job.input.color;
-    let krate = job.lowered.krate(unit).ok_or_else(|| {
+    let krate = job.crates.krate(unit).ok_or_else(|| {
         ApiError::new(format!("unit {unit} (`{}`) has no crate in the front end", u.target.name), None)
     })?;
     let mounted = &job.mounted;
-    let names = Names::new(&job.lowered, mounted);
+    let names = Names::new(&reader.paths, mounted);
     let lints = CommandLine::parse(&lint_flags(u, plan, local(package.source.as_deref())))
         .map_err(|why| ApiError::new(why, Some(format!("the lint flags of `{}`", u.target.name))))?;
     let options = Options { lints, ..Options::default() };
-    let snapshot = job.lowered.snapshot();
-    let db: &dyn HirDatabase = &snapshot;
+    let db: &dyn HirDatabase = &reader.db;
     let diags = blaze_diagnostics::check_crate(db, hir::Crate::from(krate), &names, &options);
     let mut sources = mounted.sources();
     let style = blaze_diagnostics::emit::Style { ansi: color, ..Default::default() };
@@ -396,7 +405,7 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
     let mut natives = Vec::new();
     // What each file rustc would write holds: (path, bytes, executable).
     let mut files: Vec<(String, Vec<u8>, bool)> = Vec::new();
-    let identity = job.lowered.identity(unit);
+    let identity = identity(job, unit);
     if u.target.is_custom_build() && script::inert(job, unit).is_some() {
         // A build script that does nothing is not run, so not built: what it prints is known.
         return Ok(nothing(diagnostics, true, made));
@@ -413,7 +422,7 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
                 return Ok(nothing(diagnostics, false, made));
             }
         };
-        let mut generated = match codegen::generate(job, unit, &makes, mounted)
+        let mut generated = match codegen::generate(job, reader, unit, &makes, mounted)
             .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?
         {
             Ok(it) => it,
@@ -466,7 +475,7 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
     }
     // Each file's bytes go into the store once, moved, under their key; a copy cargo makes of
     // one (`target/debug/foo` of `deps/foo-0123`) is the same key.
-    let sources = crate_files(job, krate);
+    let sources = crate_files(reader, krate);
     let mut keyed: Vec<(String, Key, bool)> = Vec::with_capacity(files.len());
     let mut output_keys: Vec<Key> = Vec::with_capacity(plan.outputs.len());
     let mut put_output = |puts: &mut Vec<Put>, bytes: Vec<u8>| {
@@ -589,10 +598,9 @@ fn ar(members: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// The files of `krate`'s modules, by absolute path, sorted.
-fn crate_files(job: &Job, krate: base_db::Crate) -> Vec<String> {
-    let snapshot = job.lowered.snapshot();
-    let db: &dyn HirDatabase = &snapshot;
-    let paths = job.lowered.paths();
+fn crate_files(reader: &UnitReader, krate: base_db::Crate) -> Vec<String> {
+    let db: &dyn HirDatabase = &reader.db;
+    let paths = &reader.paths;
     let def_map = hir_def::nameres::crate_def_map(db, krate);
     let mut out = Vec::new();
     for (_, module) in def_map.modules(db) {

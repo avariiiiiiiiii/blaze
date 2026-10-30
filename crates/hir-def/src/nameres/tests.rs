@@ -1021,3 +1021,94 @@ use some_module::unknown_func;
         "#]],
     )
 }
+
+#[test]
+fn diagnostics_of_a_module_are_its_own_in_push_order() {
+    compute_crate_def_map(
+        r#"
+//- /lib.rs
+mod a;
+mod b;
+mod c;
+use missing::one;
+use a::missing_two;
+//- /a.rs
+use missing::three;
+use crate::missing_four;
+//- /b.rs
+use missing::five;
+//- /c.rs
+"#,
+        |db, def_map| {
+            let mut seen = 0;
+            let mut with_any = 0;
+            for (module, _) in def_map.modules(db) {
+                let filtered: Vec<_> =
+                    def_map.diagnostics().iter().filter(|it| it.in_module == module).collect();
+                let of: Vec<_> = def_map.diagnostics_of(module).collect();
+                assert_eq!(of, filtered);
+                seen += of.len();
+                with_any += usize::from(!of.is_empty());
+            }
+            assert_eq!(seen, def_map.diagnostics().len());
+            assert_eq!(with_any, 3);
+        },
+    );
+}
+
+#[test]
+fn impls_keep_their_order_and_their_reservation_bit() {
+    use crate::{
+        ImplId, Lookup,
+        attrs::AttrFlags,
+        nameres::frozen::{self, Frozen, Mode},
+        src::HasSource,
+    };
+    use syntax::AstNode;
+
+    let mut db = TestDB::with_files(
+        r#"
+trait Tr {}
+struct A;
+struct B;
+struct C;
+struct D;
+impl Tr for A {}
+#[rustc_reservation_impl = "reserved"]
+impl Tr for B {}
+impl B {}
+#[cfg_attr(all(), rustc_reservation_impl = "reserved by cfg_attr")]
+impl Tr for C {}
+#[cfg_attr(any(), rustc_reservation_impl = "not reserved")]
+impl Tr for D {}
+"#,
+    );
+    let krate = db.fetch_test_crate();
+    {
+        let def_map = crate_def_map(&db, krate);
+        let scope = def_map.module(&db, def_map.root).scope(&db);
+        let start = |it: ImplId| it.lookup(&db).source(&db).value.syntax().text_range().start();
+        let impls: Vec<ImplId> = scope.impls().collect();
+        assert_eq!(impls.len(), 5);
+        assert!(impls.windows(2).all(|it| start(it[0]) < start(it[1])), "declaration order");
+
+        let reserved = |it: &ImplId| {
+            AttrFlags::query(&db, (*it).into()).contains(AttrFlags::RUSTC_RESERVATION_IMPL)
+        };
+        let trait_impls: Vec<ImplId> = scope.trait_impls().collect();
+        let expected: Vec<ImplId> =
+            trait_impls.iter().filter(|it| !reserved(it)).copied().collect();
+        assert_eq!(trait_impls.len(), 4);
+        assert_eq!(expected.len(), 2);
+        assert_eq!(scope.trait_impls_without_reservation().collect::<Vec<_>>(), expected);
+        assert_eq!(scope.inherent_impls().count(), 1);
+    }
+
+    let bytes = frozen::encode(&db, krate).unwrap();
+    let frozen = Frozen { bytes: bytes.into(), mode: Mode::Verify };
+    frozen::set(&mut db, [(krate, frozen)].into_iter().collect());
+    let def_map = crate_def_map(&db, krate);
+    let scope = def_map.module(&db, def_map.root).scope(&db);
+    assert_eq!(scope.trait_impls_without_reservation().count(), 2);
+    assert_eq!(frozen::differences(), Vec::<String>::new());
+}

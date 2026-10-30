@@ -205,7 +205,7 @@ mod tests {
             let mut running: Vec<NodeId> = Vec::new();
             // Each set of nodes that ran at once.
             let mut together: Vec<Vec<NodeId>> = Vec::new();
-            let mut outputs = plane.step(PlaneInput::Open { at_ns: at, request, weight: 1, keep_going: false }).unwrap();
+            let mut outputs = plane.step(PlaneInput::Open { at_ns: at, request, weight: 1, keep_going: false, idle: false }).unwrap();
             outputs.extend(plane.step(PlaneInput::Add { at_ns: at, request, nodes: specs }).unwrap());
             outputs.extend(plane.step(PlaneInput::Close { at_ns: at, request }).unwrap());
             loop {
@@ -215,6 +215,7 @@ mod tests {
                         PlaneOutput::Run { id, .. } => running.push(id),
                         PlaneOutput::Finished { ok, .. } => finished = Some(ok),
                         PlaneOutput::Said { .. } => {}
+                        PlaneOutput::Yield { .. } => unreachable!("no request is idle"),
                     }
                 }
                 if let Some(ok) = finished {

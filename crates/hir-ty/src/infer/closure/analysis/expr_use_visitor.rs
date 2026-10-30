@@ -507,7 +507,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     fn walk_expr_here(&mut self, expr: ExprId) -> Result {
         self.walk_adjustment(expr)?;
 
-        match self.cx.store[expr] {
+        match self.cx.store.expr(expr) {
             Expr::Path(_) => {}
 
             Expr::UnaryOp { op: UnaryOp::Deref, expr: base } => {
@@ -526,23 +526,23 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 self.consume_expr(rhs)?;
             }
 
-            Expr::Call { callee, ref args } => {
+            Expr::Call { callee, args } => {
                 // callee(args)
                 self.consume_expr(callee)?;
                 self.consume_exprs(args)?;
             }
 
-            Expr::MethodCall { receiver, ref args, .. } => {
+            Expr::MethodCall { receiver, args, .. } => {
                 // callee.m(args)
                 self.consume_expr(receiver)?;
                 self.consume_exprs(args)?;
             }
 
-            Expr::RecordLit { ref fields, spread, .. } => {
+            Expr::RecordLit { fields, spread, .. } => {
                 self.walk_struct_expr(fields, spread)?;
             }
 
-            Expr::Tuple { ref exprs } => {
+            Expr::Tuple { exprs } => {
                 self.consume_exprs(exprs)?;
             }
 
@@ -562,7 +562,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 self.walk_local(init, pat, None)?;
             }
 
-            Expr::Match { expr: discr, ref arms } => {
+            Expr::Match { expr: discr, arms } => {
                 let discr_place = self.cat_expr(discr)?;
                 self.fake_read_scrutinee(discr_place.clone(), true);
                 self.walk_expr(discr)?;
@@ -572,7 +572,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 }
             }
 
-            Expr::Array(Array::ElementList { elements: ref exprs }) => {
+            Expr::Array(Array::ElementList { elements: exprs }) => {
                 self.consume_exprs(exprs)?;
             }
 
@@ -584,7 +584,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 self.borrow_expr(base, bk)?;
             }
 
-            Expr::InlineAsm(ref asm) => {
+            Expr::InlineAsm(asm) => {
                 for (_, op) in &asm.operands {
                     match *op {
                         AsmOperand::In { expr, .. } => {
@@ -634,7 +634,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 self.consume_expr(rhs)?;
             }
 
-            Expr::Block { ref statements, tail, .. } => {
+            Expr::Block { statements, tail, .. } => {
                 for stmt in statements {
                     self.walk_stmt(stmt)?;
                 }
@@ -902,7 +902,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 }
             };
 
-            debug!("walk_pat: pat.kind={:?}", this.cx.store[pat]);
+            debug!("walk_pat: pat.kind={:?}", this.cx.store.pat(pat));
             let read_discriminant = {
                 let place = place.clone();
                 |this: &mut Self| {
@@ -910,7 +910,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                 }
             };
 
-            match this.cx.store[pat] {
+            match this.cx.store.pat(pat) {
                 Pat::Bind { id, .. } => {
                     debug!("walk_pat: binding place={:?} pat={:?}", place, pat);
                     let bm = this.cx.result.binding_modes[pat];
@@ -947,7 +947,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                     }
                 }
                 Pat::Deref { inner: subpattern } => walk_deref_pat(this, subpattern, place),
-                Pat::Path(ref path) => {
+                Pat::Path(path) => {
                     // A `Path` pattern is just a name like `Foo`. This is either a
                     // named constant or else it refers to an ADT variant
 
@@ -992,9 +992,9 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
                         read_discriminant(this);
                     }
                 }
-                Pat::Slice { prefix: ref lhs, slice: wild, suffix: ref rhs } => {
+                Pat::Slice { prefix: lhs, slice: wild, suffix: rhs } => {
                     // We don't need to test the length if the pattern is `[..]`
-                    if matches!((&**lhs, wild, &**rhs), (&[], Some(_), &[]))
+                    if matches!((lhs, wild, rhs), (&[], Some(_), &[]))
                         // Arrays have a statically known size, so
                         // there is no need to read their length
                         || place.place.ty().strip_references().is_array()
@@ -1198,7 +1198,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 debug!("pat_ty(pat={:?}) found adjustment `{:?}`", pat, first_adjust);
                 return Ok(first_adjust.source.as_ref());
             }
-        } else if let Pat::Ref { pat: subpat, .. } = self.cx.store[pat]
+        } else if let Pat::Ref { pat: subpat, .. } = self.cx.store.pat(pat)
             && self.cx.result.is_skipped_ref_pat(pat)
         {
             return self.pat_ty_adjusted(subpat);
@@ -1214,7 +1214,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
 
         // This code detects whether we are looking at a `ref x`,
         // and if so, figures out what the type *being borrowed* is.
-        match self.cx.store[pat] {
+        match self.cx.store.pat(pat) {
             Pat::Bind { .. } => {
                 let bm = self.cx.result.binding_mode(pat).ok_or(ErrorGuaranteed)?;
 
@@ -1301,7 +1301,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
 
     fn cat_expr_unadjusted(&mut self, expr: ExprId) -> Result<PlaceWithOrigin> {
         let expr_ty = self.expr_ty(expr)?;
-        match self.cx.store[expr] {
+        match self.cx.store.expr(expr) {
             Expr::UnaryOp { expr: e_base, op: UnaryOp::Deref } => {
                 if self.cx.result.method_resolutions.contains_idx(expr) {
                     self.cat_overloaded_place(expr, e_base)
@@ -1341,7 +1341,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 self.cat_overloaded_place(expr, base)
             }
 
-            Expr::Path(ref path) => {
+            Expr::Path(path) => {
                 let resolver_guard =
                     self.cx.resolver.update_to_inner_scope(self.cx.db, self.cx.store_owner, expr);
                 let resolution = self.cx.resolver.resolve_path_in_value_ns_fully(
@@ -1572,8 +1572,8 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
         // that (where the `ref` on `x` is implied).
         op(self, place_with_id.clone(), pat.into())?;
 
-        match self.cx.store[pat] {
-            Pat::Tuple { args: ref subpats, ellipsis: dots_pos } => {
+        match self.cx.store.pat(pat) {
+            Pat::Tuple { args: subpats, ellipsis: dots_pos } => {
                 // (p1, ..., pN)
                 let total_fields = self.total_fields_in_tuple(pat);
 
@@ -1591,7 +1591,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 }
             }
 
-            Pat::TupleStruct { args: ref subpats, ellipsis: dots_pos, .. } => {
+            Pat::TupleStruct { args: subpats, ellipsis: dots_pos, .. } => {
                 // S(p1, ..., pN)
                 let (variant_index, variant) = self.variant_index_for_adt(pat)?;
                 let total_fields = variant.fields(self.cx.db).len();
@@ -1610,7 +1610,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 }
             }
 
-            Pat::Record { args: ref field_pats, .. } => {
+            Pat::Record { args: field_pats, .. } => {
                 // S { f1: p1, ..., fN: pN }
 
                 let (variant_index, variant) = self.variant_index_for_adt(pat)?;
@@ -1633,7 +1633,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 }
             }
 
-            Pat::Or(ref pats) => {
+            Pat::Or(pats) => {
                 for &pat in pats {
                     self.cat_pattern(place_with_id.clone(), pat, op)?;
                 }
@@ -1656,7 +1656,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
                 self.cat_pattern(place, subpat, op)?;
             }
 
-            Pat::Slice { prefix: ref before, slice, suffix: ref after } => {
+            Pat::Slice { prefix: before, slice, suffix: after } => {
                 let Some(element_ty) = self
                     .cx
                     .structurally_resolve_type(pat.into(), place_with_id.place.ty())

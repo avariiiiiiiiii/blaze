@@ -199,8 +199,8 @@ impl<'db> Generics<'db> {
             else {
                 continue;
             };
-            let bounded = match &owner.store[target] {
-                &TypeRef::TypeParam(it) => it == param,
+            let bounded = match owner.store.type_ref(target) {
+                TypeRef::TypeParam(it) => it == param,
                 TypeRef::Path(path) => {
                     path.type_anchor().is_none()
                         && path.segments().len() == 1

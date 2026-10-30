@@ -6,7 +6,7 @@
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
 
-use std::{collections::VecDeque, fmt, hash::Hash};
+use std::{cell::Cell, collections::VecDeque, fmt};
 
 use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -20,8 +20,12 @@ use syntax::{
 use tt::{Punct, buffer::Cursor, token_to_literal};
 
 pub mod prettify_macro_expansion;
+#[cfg(any(test, feature = "reference"))]
+pub mod reference;
 mod to_parser_input;
-pub use to_parser_input::{to_matcher_input, to_parser_input};
+pub use to_parser_input::{
+    to_matcher_input, to_matcher_input_into, to_parser_input, to_parser_input_into,
+};
 // FIXME: we probably should re-think  `token_tree_to_syntax_node` interfaces
 pub use ::parser::TopEntryPoint;
 
@@ -185,20 +189,44 @@ where
 // * AssocItems(SmallVec<[ast::AssocItem; 1]>)
 // * ForeignItems(SmallVec<[ast::ForeignItem; 1]>
 
+thread_local! {
+    /// The parser input [`token_tree_to_syntax_node`] fills, kept for the next expansion.
+    static INPUT: Cell<Option<parser::Input>> = const { Cell::new(None) };
+}
+
+/// The most tokens an input kept for the next expansion holds; a larger one is freed.
+const KEEP_INPUT: usize = 1 << 16;
+
 /// Converts a [`tt::Subtree`] back to a [`SyntaxNode`].
 /// The produced `SpanMap` contains a mapping from the syntax nodes offsets to the subtree's spans.
+///
+/// The parser reads the tokens' kinds from one pass over the tree's columns
+/// ([`to_parser_input_into`]) into an input kept per thread, and the tree is built straight
+/// from its events and the tokens: nothing is parsed twice and no text is lexed.
 pub fn token_tree_to_syntax_node(
     tt: &tt::TopSubtree,
     entry_point: parser::TopEntryPoint,
     span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
-) -> (Parse<SyntaxNode>, SpanMap)
-where
-    SyntaxContext: Copy + fmt::Debug + PartialEq + PartialEq + Eq + Hash,
-{
+) -> (Parse<SyntaxNode>, SpanMap) {
     let buffer = tt.view().strip_invisible();
-    let parser_input = to_parser_input(buffer, span_to_edition);
+    let mut parser_input =
+        INPUT.take().unwrap_or_else(|| parser::Input::with_capacity(buffer.len()));
+    to_parser_input_into(buffer, span_to_edition, &mut parser_input);
+    let parsed = parse_tokens(buffer, entry_point, &parser_input);
+    if parser_input.len() <= KEEP_INPUT {
+        INPUT.set(Some(parser_input));
+    }
+    parsed
+}
+
+/// The tree of the tokens of `buffer`, `parser_input` being their input.
+pub(crate) fn parse_tokens(
+    buffer: tt::TokenTreesView<'_>,
+    entry_point: parser::TopEntryPoint,
+    parser_input: &parser::Input,
+) -> (Parse<SyntaxNode>, SpanMap) {
     // It matters what edition we parse with even when we escape all identifiers correctly.
-    let parser_output = entry_point.parse(&parser_input);
+    let parser_output = entry_point.parse(parser_input);
     let mut tree_sink = TtTreeSink::new(buffer.cursor(), parser_input.len());
     for event in parser_output.iter() {
         match event {
@@ -229,8 +257,8 @@ pub fn parse_to_token_tree(
         return None;
     }
     let len = lexed.len();
-    let mut conv =
-        RawConverter { lexed, anchor, pos: 0, ctx, mode: DocCommentDesugarMode::ProcMacro };
+    let tokens = LexedTokens::new(lexed, text);
+    let mut conv = RawConverter { tokens, anchor, ctx, mode: DocCommentDesugarMode::ProcMacro };
     Some(convert_tokens(&mut conv, len))
 }
 
@@ -245,8 +273,8 @@ pub fn parse_to_token_tree_static_span(
         return None;
     }
     let len = lexed.len();
-    let mut conv =
-        StaticRawConverter { lexed, pos: 0, span, mode: DocCommentDesugarMode::ProcMacro };
+    let tokens = LexedTokens::new(lexed, text);
+    let mut conv = StaticRawConverter { tokens, span, mode: DocCommentDesugarMode::ProcMacro };
     Some(convert_tokens(&mut conv, len))
 }
 
@@ -540,16 +568,14 @@ fn convert_doc_comment(
 
 /// A raw token (straight from lexer) converter
 struct RawConverter<'a> {
-    lexed: parser::LexedStr<'a>,
-    pos: usize,
+    tokens: LexedTokens<'a>,
     anchor: SpanAnchor,
     ctx: SyntaxContext,
     mode: DocCommentDesugarMode,
 }
 /// A raw token (straight from lexer) converter that gives every token the same span.
 struct StaticRawConverter<'a> {
-    lexed: parser::LexedStr<'a>,
-    pos: usize,
+    tokens: LexedTokens<'a>,
     span: Span,
     mode: DocCommentDesugarMode,
 }
@@ -590,65 +616,84 @@ trait TokenConverter: Sized {
     fn call_site(&self) -> Span;
 }
 
-impl SrcToken<RawConverter<'_>> for usize {
-    fn kind(&self, ctx: &RawConverter<'_>) -> SyntaxKind {
-        ctx.lexed.kind(*self)
+/// A token of a lexed text: its kind and its text.
+#[derive(Debug, Clone, Copy)]
+struct RawToken<'t> {
+    kind: SyntaxKind,
+    text: &'t str,
+}
+
+impl<C> SrcToken<C> for RawToken<'_> {
+    fn kind(&self, _: &C) -> SyntaxKind {
+        self.kind
     }
 
-    fn to_char(&self, ctx: &RawConverter<'_>) -> Option<char> {
-        ctx.lexed.text(*self).chars().next()
+    fn to_char(&self, _: &C) -> Option<char> {
+        self.text.chars().next()
     }
 
-    fn to_text<'a>(&'a self, ctx: &'a RawConverter<'_>) -> &'a str {
-        ctx.lexed.text(*self)
+    fn to_text<'a>(&'a self, _: &'a C) -> &'a str {
+        self.text
     }
 }
 
-impl SrcToken<StaticRawConverter<'_>> for usize {
-    fn kind(&self, ctx: &StaticRawConverter<'_>) -> SyntaxKind {
-        ctx.lexed.kind(*self)
+/// The tokens of a lexed text in order, read with a running offset: each token's start and
+/// text are one add and one slice, not a walk from the lexer's last checkpoint.
+struct LexedTokens<'t> {
+    lexed: parser::LexedStr<'t>,
+    text: &'t str,
+    pos: usize,
+    offset: usize,
+}
+
+impl<'t> LexedTokens<'t> {
+    /// The tokens of `lexed`, the lexing of `text`.
+    fn new(lexed: parser::LexedStr<'t>, text: &'t str) -> Self {
+        debug_assert_eq!(lexed.as_str(), text);
+        LexedTokens { lexed, text, pos: 0, offset: 0 }
     }
 
-    fn to_char(&self, ctx: &StaticRawConverter<'_>) -> Option<char> {
-        ctx.lexed.text(*self).chars().next()
+    fn peek(&self) -> Option<RawToken<'t>> {
+        if self.pos == self.lexed.len() {
+            return None;
+        }
+        let len = self.lexed.text_len(self.pos);
+        let text = &self.text[self.offset..self.offset + len];
+        Some(RawToken { kind: self.lexed.kind(self.pos), text })
     }
 
-    fn to_text<'a>(&'a self, ctx: &'a StaticRawConverter<'_>) -> &'a str {
-        ctx.lexed.text(*self)
+    fn bump(&mut self) -> Option<(RawToken<'t>, TextRange)> {
+        let token = self.peek()?;
+        let start = self.offset;
+        self.pos += 1;
+        self.offset += token.text.len();
+        let range = TextRange::new(
+            TextSize::new(u32::try_from(start).ok()?),
+            TextSize::new(u32::try_from(self.offset).ok()?),
+        );
+        Some((token, range))
     }
 }
 
-impl TokenConverter for RawConverter<'_> {
-    type Token = usize;
+impl<'t> TokenConverter for RawConverter<'t> {
+    type Token = RawToken<'t>;
 
     fn convert_doc_comment(
         &self,
-        &token: &usize,
+        token: &RawToken<'t>,
         is_inner: bool,
         span: Span,
         builder: &mut tt::TopSubtreeBuilder,
     ) {
-        let text = self.lexed.text(token);
-        convert_doc_comment(text, is_inner, span, self.mode, builder);
+        convert_doc_comment(token.text, is_inner, span, self.mode, builder);
     }
 
     fn bump(&mut self) -> Option<(Self::Token, TextRange)> {
-        if self.pos == self.lexed.len() {
-            return None;
-        }
-        let token = self.pos;
-        self.pos += 1;
-        let range = self.lexed.text_range(token);
-        let range = TextRange::new(range.start.try_into().ok()?, range.end.try_into().ok()?);
-
-        Some((token, range))
+        self.tokens.bump()
     }
 
     fn peek(&self) -> Option<Self::Token> {
-        if self.pos == self.lexed.len() {
-            return None;
-        }
-        Some(self.pos)
+        self.tokens.peek()
     }
 
     fn span_for(&self, range: TextRange) -> Span {
@@ -660,37 +705,25 @@ impl TokenConverter for RawConverter<'_> {
     }
 }
 
-impl TokenConverter for StaticRawConverter<'_> {
-    type Token = usize;
+impl<'t> TokenConverter for StaticRawConverter<'t> {
+    type Token = RawToken<'t>;
 
     fn convert_doc_comment(
         &self,
-        &token: &usize,
+        token: &RawToken<'t>,
         is_inner: bool,
         span: Span,
         builder: &mut tt::TopSubtreeBuilder,
     ) {
-        let text = self.lexed.text(token);
-        convert_doc_comment(text, is_inner, span, self.mode, builder);
+        convert_doc_comment(token.text, is_inner, span, self.mode, builder);
     }
 
     fn bump(&mut self) -> Option<(Self::Token, TextRange)> {
-        if self.pos == self.lexed.len() {
-            return None;
-        }
-        let token = self.pos;
-        self.pos += 1;
-        let range = self.lexed.text_range(token);
-        let range = TextRange::new(range.start.try_into().ok()?, range.end.try_into().ok()?);
-
-        Some((token, range))
+        self.tokens.bump()
     }
 
     fn peek(&self) -> Option<Self::Token> {
-        if self.pos == self.lexed.len() {
-            return None;
-        }
-        Some(self.pos)
+        self.tokens.peek()
     }
 
     fn span_for(&self, _: TextRange) -> Span {
@@ -955,8 +988,8 @@ impl<'t> FlatTokens<'t> {
     }
 
     fn enter(&mut self, tree: &'t FlatTree, at: u32) {
-        let (tree, at) = match tree.is_lazy(at) {
-            true => (tree.part(at), 0),
+        let (tree, at): (&'t FlatTree, u32) = match tree.is_lazy(at) {
+            true => (&**tree.part(at), 0),
             false => (tree, at),
         };
         let start = u32::from(tree.range(at).start());

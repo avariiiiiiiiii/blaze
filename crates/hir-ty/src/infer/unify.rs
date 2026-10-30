@@ -6,7 +6,8 @@ use base_db::Crate;
 use hir_def::{GenericParamId, TraitId};
 use rustc_type_ir::{
     TyVid, TypeFoldable, TypeVisitableExt,
-    inherent::{Const as _, GenericArg as _, IntoKind, Ty as _},
+    PredicateProxy,
+    inherent::{GenericArg as _, IntoKind, Ty as _},
     solve::Certainty,
 };
 use smallvec::SmallVec;
@@ -257,7 +258,6 @@ impl<'db> InferenceTable<'db> {
             | PredicateKind::Clause(ClauseKind::WellFormed(..))
             | PredicateKind::DynCompatible(..)
             | PredicateKind::NormalizesTo(..)
-            | PredicateKind::AliasRelate(..)
             | PredicateKind::Clause(ClauseKind::ConstEvaluatable(..))
             | PredicateKind::ConstEquate(..)
             | PredicateKind::Clause(ClauseKind::HostEffect(..))
@@ -396,7 +396,7 @@ impl<'db> InferenceTable<'db> {
     ) -> Const<'db> {
         let ct = self.resolve_vars_with_obligations(ct);
 
-        if let ConstKind::Unevaluated(..) = ct.kind() {
+        if let ConstKind::Alias(..) = ct.kind() {
             let result = self
                 .infer_ctxt
                 .at(&ObligationCause::new(sp), self.param_env)
@@ -524,7 +524,7 @@ impl<'db> InferenceTable<'db> {
             .filter_map(|arg| arg.as_type())
             .filter(|ty| ty.has_non_region_infer())
             .filter_map(|ty| match ty.kind() {
-                TyKind::Alias(alias)
+                TyKind::Alias(_, alias)
                     if matches!(alias.kind, crate::next_solver::AliasTyKind::Projection { .. }) =>
                 {
                     Some(alias.trait_ref(interner))
@@ -789,7 +789,7 @@ pub(super) mod resolve_completely {
             }
         }
 
-        fn fold_predicate(&mut self, p: Predicate<'db>) -> Predicate<'db> {
+        fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, p: P) -> P {
             if !p.has_type_flags(Self::TYPE_FLAGS) {
                 return p;
             }
@@ -872,7 +872,7 @@ pub(super) mod resolve_completely {
             self.handle_term(ct, |it| it.outer_exclusive_binder())
         }
 
-        fn fold_predicate(&mut self, predicate: Predicate<'db>) -> Predicate<'db> {
+        fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, predicate: P) -> P {
             assert!(
                 !self.should_normalize,
                 "normalizing predicates in writeback is not generally sound"

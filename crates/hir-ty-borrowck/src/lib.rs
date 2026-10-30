@@ -451,7 +451,7 @@ fn nested_bodies_written<'db>(
     }
     let mut out = Vec::new();
     while let Some(expr) = stack.pop() {
-        match &store[expr] {
+        match store.expr(expr) {
             // The kinds MIR lowering makes a body of.
             Expr::Closure {
                 closure_kind:
@@ -642,7 +642,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
         place: &StoredPlace,
         span: MirSpan,
     ) -> bool {
-        matches!(span, MirSpan::ExprId(expr) if matches!(self.store[expr], hir_def::hir::Expr::Cast { .. }))
+        matches!(span, MirSpan::ExprId(expr) if matches!(self.store.expr(expr), hir_def::hir::Expr::Cast { .. }))
             && !self.is_copy(self.place_ty(body, place.local, place.projection.as_slice()).ty)
     }
 

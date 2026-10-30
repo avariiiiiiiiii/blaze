@@ -7,7 +7,7 @@
 //! atomic words, as many as the table has rows when it is made, and a flag already set is only
 //! loaded, so reading a record again writes no shared cache line.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU64, Ordering};
 
 /// A record's row in its tier's flag columns.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -88,8 +88,6 @@ impl Bits {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread};
-
     use super::*;
 
     #[test]
@@ -113,7 +111,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(blaze_check))]
     fn flags_set_from_many_threads_at_once_all_land() {
+        use std::{sync::Arc, thread};
+
         let bits = Arc::new(Bits::new(64 * 64));
         let threads: Vec<_> = (0..8u64)
             .map(|t| {

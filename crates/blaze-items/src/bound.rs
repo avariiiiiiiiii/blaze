@@ -166,6 +166,7 @@ fn method<'db>(
         OperandKind::Copy(_) | OperandKind::Move(_) | OperandKind::Static(_) => return,
     };
     let TyKind::FnDef(def, args) = ty.kind() else { return };
+    let args = args.no_bound_vars().unwrap();
     let CallableDefId::FunctionId(func) = def.0 else { return };
     if !matches!(func.loc(db).container, ItemContainerId::TraitId(_)) {
         return;

@@ -9,8 +9,10 @@
 //! parse; their `rustc_attrs` gates are `checks::features`'. The lints of `#[doc]` are
 //! `lints::syntax::attrs::doc`'s.
 //!
+//! The predicate of `#[doc(cfg(..))]` is `checks::attrs::cfg`'s.
+//!
 //! Follows rustc's `compiler/rustc_attr_parsing/src/attributes/` `doc.rs`, `cfg.rs`
-//! (`parse_cfg`, `parse_cfg_entry`) and `diagnostic/`, with the texts of
+//! (`parse_cfg`) and `diagnostic/`, with the texts of
 //! `compiler/rustc_attr_parsing/src/session_diagnostics.rs`, and `check_doc_attrs` of
 //! `compiler/rustc_passes/src/check_attr.rs` with the texts of
 //! `compiler/rustc_passes/src/diagnostics.rs` (MIT or Apache-2.0).
@@ -23,19 +25,20 @@ use syntax::{
     ast::{self, HasGenericArgs, HasGenericParams, HasModuleItem, HasName},
 };
 
-use super::{Accepted, Finalize, GroupId, parse_version};
+use super::{Accepted, Finalize, GroupId};
 use crate::{
     checks::{
         attrs::{
             accept::Accept,
-            args::{ArgParser, Ident, MetaItem, MetaItemOrLit, MetaList, NameValue, Path},
+            args::{ArgParser, MetaItem},
+            cfg,
             parsed::{Doc, DocInline, Parsed, ParsedAttr},
         },
-        features::attributes::{cfg_entry, doc_rust_logo},
+        features::attributes::doc_rust_logo,
     },
     cx::Cx,
     lints::syntax::attrs::{Target, table},
-    model::{Diag, Level, MultiSpan, Span},
+    model::Diag,
 };
 
 pub(crate) const PATHS: &[&[&str]] = &[
@@ -126,12 +129,12 @@ fn doc_item(doc: &mut Doc, cx: &mut Accept<'_, '_, '_>, meta: &MetaItem) {
         Some(word @ ("inline" | "no_inline")) => {
             if matches!(args, ArgParser::NoArgs) {
                 let inline = if word == "inline" { DocInline::Inline } else { DocInline::NoInline };
-                doc.inline.push((inline, path));
+                doc.inline.push((inline, cx.in_file(path)));
             }
         }
         Some("masked") => {
             if matches!(args, ArgParser::NoArgs) {
-                doc.masked = Some(path);
+                doc.masked = Some(cx.in_file(path));
             }
         }
         Some("cfg") => cfg(cx, args),
@@ -142,7 +145,7 @@ fn doc_item(doc: &mut Doc, cx: &mut Accept<'_, '_, '_>, meta: &MetaItem) {
                 return;
             }
             let slot = if word == "fake_variadic" { &mut doc.fake_variadic } else { &mut doc.search_unbox };
-            *slot = Some(path);
+            *slot = Some(cx.in_file(path));
         }
         Some("rust_logo") => {
             if matches!(args, ArgParser::NoArgs)
@@ -204,9 +207,10 @@ fn add_alias(doc: &mut Doc, cx: &mut Accept<'_, '_, '_>, alias: String, range: T
         if !not_crate_level(cx, range, "alias") {
             return;
         }
+        let at = cx.in_file(range);
         match doc.aliases.iter_mut().find(|(it, _)| *it == alias) {
-            Some(entry) => entry.1 = range,
-            None => doc.aliases.push((alias, range)),
+            Some(entry) => entry.1 = at,
+            None => doc.aliases.push((alias, at)),
         }
         return;
     };
@@ -221,7 +225,7 @@ fn bad_alias_char(alias: &str) -> Option<char> {
 
 /// rustc's `parse_keyword_and_attribute`; its lints are `lints::syntax::attrs::doc`'s.
 fn keyword_or_attribute(
-    slot: &mut Option<(String, TextRange)>,
+    slot: &mut Option<(String, InFile<TextRange>)>,
     cx: &mut Accept<'_, '_, '_>,
     path: TextRange,
     args: &ArgParser,
@@ -255,7 +259,7 @@ fn keyword_or_attribute(
     if !not_crate_level(cx, path, word) {
         return;
     }
-    *slot = Some((value.to_owned(), path));
+    *slot = Some((value.to_owned(), cx.in_file(path)));
 }
 
 /// rustc's `Symbol::is_reserved` in the latest stable edition, `is_weak`, or `SelfTy`: what
@@ -334,11 +338,6 @@ fn is_keyword(name: &str) -> bool {
     )
 }
 
-/// rustc's `Symbol::is_path_segment_keyword`.
-fn is_path_segment_keyword(name: &str) -> bool {
-    matches!(name, "{{root}}" | "crate" | "self" | "Self" | "super" | "$crate")
-}
-
 /// rustc's `parse_cfg` of `#[doc(cfg(..))]`.
 fn cfg(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) {
     let Some(list) = cx.expect_list(args, cx.attr_range()) else { return };
@@ -363,123 +362,7 @@ fn cfg(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) {
         cx.expected_single_argument(list.range, list.len());
         return;
     };
-    cfg_predicate(cx, single);
-}
-
-/// rustc's `parse_cfg_entry`: the errors of a predicate, with its gates where rustc gives them.
-fn cfg_predicate(cx: &mut Accept<'_, '_, '_>, item: &MetaItemOrLit) {
-    let meta = match item {
-        MetaItemOrLit::Item(meta) => meta,
-        MetaItemOrLit::Lit(lit) => {
-            if !lit.is_bool() {
-                cx.expected_identifier(lit.range);
-            }
-            return;
-        }
-    };
-    let ArgParser::List(list) = &meta.args else {
-        if meta.path.word_sym().is_none_or(is_path_segment_keyword) {
-            cx.expected_identifier(meta.path.range);
-            return;
-        }
-        gates(cx, item);
-        if let Some(nv) = meta.args.as_name_value() {
-            string_value(cx, nv);
-        }
-        return;
-    };
-    match meta.path.word_sym() {
-        Some("not") => match list.as_single() {
-            Some(single) => cfg_predicate(cx, single),
-            None => cx.expected_single_argument(list.range, list.len()),
-        },
-        Some("any" | "all") => {
-            for sub in list.mixed() {
-                cfg_predicate(cx, sub);
-            }
-        }
-        Some("target") => cfg_target(cx, meta, list),
-        Some("version") => cfg_version(cx, item, list),
-        _ => {
-            let mut possibilities = vec!["any", "all", "not", "target"];
-            if cx.feature("cfg_version") {
-                possibilities.push("version");
-            }
-            cx.expected_specific_argument(meta.range(), &possibilities);
-        }
-    }
-}
-
-/// `parse_name_value`'s error: a value that is no string.
-fn string_value(cx: &mut Accept<'_, '_, '_>, nv: &NameValue) {
-    if nv.value_as_str().is_none() {
-        cx.expected_string_literal(nv.value_range(), Some(nv.value_as_lit()));
-    }
-}
-
-/// The gates of the predicate `item` alone (a leaf, an empty `target()` or a `version(..)`).
-fn gates(cx: &mut Accept<'_, '_, '_>, item: &MetaItemOrLit) {
-    if !cx.emits() {
-        return;
-    }
-    for diag in cfg_entry(cx.cx, &cx.session.features, cx.attr.file, item) {
-        cx.emit_err(diag);
-    }
-}
-
-/// rustc's `parse_cfg_entry_target`.
-fn cfg_target(cx: &mut Accept<'_, '_, '_>, meta: &MetaItem, list: &MetaList) {
-    if cx.emits() {
-        let compact = MetaItem {
-            path: meta.path.clone(),
-            args: ArgParser::List(MetaList { items: Vec::new(), range: list.range }),
-        };
-        gates(cx, &MetaItemOrLit::Item(compact));
-    }
-    for sub in list.mixed() {
-        let Some((ident, nv)) = cx.expect_name_value_item(sub, None) else { continue };
-        if is_path_segment_keyword(&ident.name) {
-            cx.expected_identifier(ident.range);
-            return;
-        }
-        if cx.emits() {
-            let leaf = MetaItem {
-                path: Path {
-                    segments: vec![Ident { name: format!("target_{}", ident.name), range: ident.range }],
-                    range: ident.range,
-                },
-                args: ArgParser::NameValue(nv.clone()),
-            };
-            gates(cx, &MetaItemOrLit::Item(leaf));
-        }
-        string_value(cx, nv);
-    }
-}
-
-/// rustc's `parse_cfg_entry_version`.
-fn cfg_version(cx: &mut Accept<'_, '_, '_>, item: &MetaItemOrLit, list: &MetaList) {
-    gates(cx, item);
-    let Some(version) = list.as_single() else {
-        let diag = cx.err(None, "expected single version literal", list.range);
-        cx.emit_err(diag);
-        return;
-    };
-    let Some(lit) = version.as_lit() else {
-        let diag = cx.err(None, "expected a version literal", version.range());
-        cx.emit_err(diag);
-        return;
-    };
-    let Some(text) = lit.str() else {
-        let diag = cx.err(None, "expected a version literal", lit.range);
-        cx.emit_err(diag);
-        return;
-    };
-    if parse_version(text).is_none() {
-        let mut diag =
-            Diag::new(Level::Warning, None, "unknown version literal format, assuming it refers to a future version");
-        diag.span = MultiSpan::of(cx.span(lit.range));
-        cx.emit_err(diag);
-    }
+    cfg::entry(cx, single);
 }
 
 /// rustc's `parse_auto_cfg` and `parse_auto_cfg_values`: their errors, E0565; the rest are
@@ -527,44 +410,33 @@ fn auto_cfg(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) {
     }
 }
 
-/// `check_doc_attrs`: the errors of the node's `#[doc(..)]`, `attr` being its first.
-pub(crate) fn check_doc(fx: &mut Finalize<'_, '_, '_>, doc: &Doc, attr: usize) {
+/// `check_doc_attrs`: the errors of the node's `#[doc(..)]`.
+pub(crate) fn check_doc(fx: &mut Finalize<'_, '_, '_>, doc: &Doc) {
     for (alias, range) in &doc.aliases {
-        check_alias(fx, attr, alias, *range);
+        check_alias(fx, alias, *range);
     }
     if let Some((_, range)) = &doc.keyword {
-        empty_module(fx, attr, *range, "keyword");
+        empty_module(fx, *range, "keyword");
     }
     if let Some((_, range)) = &doc.attribute {
-        empty_module(fx, attr, *range, "attribute");
+        empty_module(fx, *range, "attribute");
     }
     if let Some(range) = doc.fake_variadic {
-        fake_variadic(fx, attr, range);
+        fake_variadic(fx, range);
     }
     if let Some(range) = doc.search_unbox {
-        search_unbox(fx, attr, range);
+        search_unbox(fx, range);
     }
-    inline(fx, attr, &doc.inline);
+    inline(fx, &doc.inline);
 }
 
-/// The span of `range`, in the node's `#[doc]` that has it; in `attr` when none does.
-fn span_at(fx: &Finalize<'_, '_, '_>, attr: usize, range: TextRange) -> Span {
-    let at = fx
-        .owner
-        .attrs
-        .iter()
-        .position(|it| it.meta().is_some() && it.is("doc") && it.range().contains_range(range))
-        .unwrap_or(attr);
-    fx.span(at, range)
-}
-
-fn error(fx: &mut Finalize<'_, '_, '_>, attr: usize, range: TextRange, message: impl Into<String>) {
-    let span = span_at(fx, attr, range);
+fn error(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>, message: impl Into<String>) {
+    let span = fx.cx.span(range);
     fx.emit_err(Diag::error(None, message, span));
 }
 
 /// `check_doc_alias_value`.
-fn check_alias(fx: &mut Finalize<'_, '_, '_>, attr: usize, alias: &str, range: TextRange) {
+fn check_alias(fx: &mut Finalize<'_, '_, '_>, alias: &str, range: InFile<TextRange>) {
     let target = fx.target();
     let location = match target {
         Target::AssocTy if container_is(fx, SyntaxKind::IMPL) => Some("type alias in implementation block"),
@@ -580,11 +452,11 @@ fn check_alias(fx: &mut Finalize<'_, '_, '_>, attr: usize, alias: &str, range: T
         _ => None,
     };
     if let Some(location) = location {
-        error(fx, attr, range, format!("{ALIAS} isn't allowed on {location}"));
+        error(fx, range, format!("{ALIAS} isn't allowed on {location}"));
         return;
     }
     if item_name(&fx.owner.node.value).is_some_and(|it| it == alias) {
-        error(fx, attr, range, format!("`#[doc(alias = \"{alias}\"]` is the same as the item's name"));
+        error(fx, range, format!("`#[doc(alias = \"{alias}\"]` is the same as the item's name"));
     }
 }
 
@@ -647,7 +519,7 @@ fn item_name(node: &SyntaxNode) -> Option<String> {
 
 /// `check_doc_keyword_and_attribute`'s: `#[doc(keyword)]` and `#[doc(attribute)]` are of empty
 /// modules.
-fn empty_module(fx: &mut Finalize<'_, '_, '_>, attr: usize, range: TextRange, name: &str) {
+fn empty_module(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>, name: &str) {
     let node = &fx.owner.node;
     let empty = match node.value.kind() {
         SyntaxKind::MODULE => ast::Module::cast(node.value.clone()).map(|module| {
@@ -666,7 +538,7 @@ fn empty_module(fx: &mut Finalize<'_, '_, '_>, attr: usize, range: TextRange, na
         Some(false) => "should be used on empty modules",
         None => "should be used on modules",
     };
-    error(fx, attr, range, format!("`#[doc({name} = \"...\")]` {message}"));
+    error(fx, range, format!("`#[doc({name} = \"...\")]` {message}"));
 }
 
 /// rustc's `item_kind.is_empty()` of a module: no item, `macro_rules!` included.
@@ -681,7 +553,7 @@ fn module_is_empty(cx: &Cx<'_, '_>, module: hir::Module) -> bool {
 }
 
 /// `check_doc_fake_variadic`.
-fn fake_variadic(fx: &mut Finalize<'_, '_, '_>, attr: usize, range: TextRange) {
+fn fake_variadic(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>) {
     let message = match ast::Impl::cast(fx.owner.node.value.clone()) {
         None => "`#[doc(keyword = \"...\")]` should be used on impl blocks",
         Some(imp) => {
@@ -692,7 +564,7 @@ fn fake_variadic(fx: &mut Finalize<'_, '_, '_>, attr: usize, range: TextRange) {
             "`#[doc(fake_variadic)]` must be used on the first of a set of tuple or fn pointer trait impls with varying arity"
         }
     };
-    error(fx, attr, range, message);
+    error(fx, range, message);
 }
 
 /// The one type argument of a path type's last segment; `Fn(A, B)`'s inputs as a tuple.
@@ -744,7 +616,7 @@ fn variadic_self_ty(ty: ast::Type) -> bool {
 }
 
 /// `check_doc_search_unbox`.
-fn search_unbox(fx: &mut Finalize<'_, '_, '_>, attr: usize, range: TextRange) {
+fn search_unbox(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>) {
     let node = fx.owner.node.value.clone();
     let generic = |list: Option<ast::GenericParamList>| list.is_some_and(|it| it.generic_params().next().is_some());
     let valid = match fx.target() {
@@ -760,16 +632,16 @@ fn search_unbox(fx: &mut Finalize<'_, '_, '_>, attr: usize, range: TextRange) {
         _ => false,
     };
     if !valid {
-        error(fx, attr, range, "`#[doc(search_unbox)]` should be used on generic structs and enums");
+        error(fx, range, "`#[doc(search_unbox)]` should be used on generic structs and enums");
     }
 }
 
 /// `check_doc_inline`'s error: `inline` and `no_inline` on one node.
-fn inline(fx: &mut Finalize<'_, '_, '_>, attr: usize, inline: &[(DocInline, TextRange)]) {
+fn inline(fx: &mut Finalize<'_, '_, '_>, inline: &[(DocInline, InFile<TextRange>)]) {
     let [(first, first_range), rest @ ..] = inline else { return };
     let Some((_, other_range)) = rest.iter().find(|(it, _)| it != first) else { return };
-    let first = span_at(fx, attr, *first_range);
-    let other = span_at(fx, attr, *other_range);
+    let first = fx.cx.span(*first_range);
+    let other = fx.cx.span(*other_range);
     let mut diag = Diag::error(None, "conflicting doc inlining attributes", first.clone());
     diag.primary(other.clone());
     diag.span_label(first, "this attribute...");

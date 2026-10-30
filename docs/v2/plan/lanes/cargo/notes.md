@@ -86,6 +86,22 @@ cargo's refusals stay cargo's, word for word; what blaze has not ported is an er
 (#601: artifact dependencies are read and resolved, and only a build that includes a unit with one
 is refused, naming it).
 
+As written, the resolve, the unit graph and the plans run in one function under `Plan` and
+`Foreign`: the cutoffs are at the file queries, `ManifestQuery`, `WorkspaceQuery`, `ConfigChain`
+and `Asking`, and the tests hold those.
+
+What it measures against: rust-analyzer's salsa project loading and Buck2's DICE, which are
+incremental per file read as this is. It goes finer than both, and than rustc's red-green graph,
+in two ways. A `Cargo.toml` is kept as canonical TOML, so an edit to a comment or the layout stops
+at that file's `ManifestQuery`. A target is found from its directory's listing, never by reading
+it, so an edit to a source file reruns no query of the load. Cold, it reads no more files than
+cargo's `Workspace::new`. The longest mount is a binary search per ancestor (O(depth · log
+mounts)), file bytes are CBOR byte strings, and blaze-manifest runs over a snapshot of sorted path
+columns. blaze-manifest stops at the first member manifest it lacks, so each round fetches every
+sibling's: a workspace takes as many rounds as its members are deep. What is left: a package's
+summary goes through JSON (request 19, with request 1), and the sibling fetch runs one after
+another until `Cx::get_all` (request 20).
+
 ## 5. The standard library
 
 `library/` (rust-lang/rust at `library/UPSTREAM`'s commit) is put into the VFS once as a root and

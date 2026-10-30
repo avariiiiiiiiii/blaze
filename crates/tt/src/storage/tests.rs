@@ -8,7 +8,7 @@ use rustc_hash::FxBuildHasher;
 use span::ErasedFileAstId;
 
 use super::{varint::VarintTree, *};
-use crate::{TtElement, buffer::Cursor, token_to_literal};
+use crate::{FlatToken, TtElement, buffer::Cursor, token_to_literal};
 
 struct Rng(u64);
 
@@ -268,6 +268,48 @@ fn walk_cursor(tree: &TopSubtree) -> Vec<TokenTree> {
     out
 }
 
+/// The tokens of flat token trees as a parser reads them, each with its context, from the
+/// token trees alone.
+fn reference_tokens(tokens: &[TokenTree]) -> Vec<(FlatToken, SyntaxContext)> {
+    fn seq(mut tokens: &[TokenTree], out: &mut Vec<(FlatToken, SyntaxContext)>) {
+        while let Some((first, rest)) = tokens.split_first() {
+            tokens = rest;
+            let token = match first {
+                TokenTree::Leaf(Leaf::Punct(it)) => {
+                    (FlatToken::Punct { char: it.char, spacing: it.spacing }, it.span.ctx)
+                }
+                TokenTree::Leaf(Leaf::Ident(it)) => {
+                    (FlatToken::Ident { sym: it.sym, is_raw: it.is_raw }, it.span.ctx)
+                }
+                TokenTree::Leaf(Leaf::Literal(it)) => {
+                    let sym = it.text_and_suffix;
+                    let (kind, suffix_len) = (it.kind, it.suffix_len);
+                    (FlatToken::Literal { sym, kind, suffix_len }, it.span.ctx)
+                }
+                TokenTree::Subtree(subtree) => {
+                    let (children, after) = rest.split_at(subtree.usize_len());
+                    let delimiter = subtree.delimiter;
+                    out.push((FlatToken::Open(delimiter.kind), delimiter.open.ctx));
+                    seq(children, out);
+                    tokens = after;
+                    (FlatToken::Close(delimiter.kind), delimiter.close.ctx)
+                }
+            };
+            out.push(token);
+        }
+    }
+    let mut out = Vec::new();
+    seq(tokens, &mut out);
+    out
+}
+
+/// The tokens of `view`, through [`TokenTreesView::for_each_token`].
+fn walk_tokens(view: TokenTreesView<'_>) -> Vec<(FlatToken, SyntaxContext)> {
+    let mut out = Vec::new();
+    view.for_each_token(|token, ctx| out.push((token, ctx)));
+    out
+}
+
 /// A tree of `tokens` built with `open`, `push` and `close` like a converter does: through an
 /// invisible top that is skipped, or not; with tokens pushed and then dropped by `restore`, and
 /// leaves in invisible subtrees taken away again, now and then.
@@ -347,6 +389,8 @@ fn check(tokens: &[TokenTree], rng: &mut Rng) -> TopSubtree {
     assert_eq!(inner.len(), tokens.len() - 1);
     assert_eq!(inner.first_span(), tokens.get(1).map(TokenTree::first_span));
     assert_eq!(inner.last_span(), reference_last_span(&tokens[1..]));
+    assert_eq!(walk_tokens(all), reference_tokens(tokens), "the tokens of the whole tree");
+    assert_eq!(walk_tokens(inner), reference_tokens(&tokens[1..]), "the tokens in the top");
     assert!(all.try_into_subtree().is_some());
     assert_eq!(TopSubtree::from_subtree(tree.view()), tree);
     assert_eq!(TopSubtree::from_token_trees(tree.top_subtree().delimiter, inner), tree);

@@ -2,31 +2,8 @@
 //! with their `.stderr`. A test that uses std has the items of std it uses written after its
 //! source, so that the lines and columns are its `.stderr`'s.
 
-use crate::{Options, lints::CommandLine};
-
-/// The lint flags compiletest gives a UI test that is not `//@ run-pass` (`runtest.rs`,
-/// `compile_test_general`).
-fn compiletest() -> Options {
-    let args = [
-        "-A",
-        "unused",
-        "-W",
-        "unused_attributes",
-        "-A",
-        "internal_features",
-        "-A",
-        "incomplete_features",
-        "-A",
-        "unused_parens",
-        "-A",
-        "unused_braces",
-    ];
-    let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() }
-}
-
 fn ui(name: &str, source: &str) -> String {
-    crate::tests::ui_with(name, "2015", source, &compiletest())
+    crate::tests::ui(name, "2015", source)
 }
 
 #[test]

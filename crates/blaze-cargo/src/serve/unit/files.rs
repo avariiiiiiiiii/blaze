@@ -10,7 +10,6 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 use base_db::FileId;
 use blaze_ids::ContentId;
 use blaze_units::query::{Mount, Origin};
-use load_cargo::v2::Lowered;
 
 /// The mounts of a build, to find a path's file in.
 #[derive(Clone)]
@@ -124,13 +123,14 @@ fn join(a: &str, b: &str) -> String {
 /// The names of the front end's files, as rustc gives them: what the diagnostics and the code
 /// generator (`file!()`, a panic's location) print.
 pub(crate) struct Names<'a> {
-    pub(crate) paths: Arc<HashMap<FileId, String>>,
+    pub(crate) paths: &'a HashMap<FileId, String>,
     pub(crate) mounted: &'a Mounted,
 }
 
 impl<'a> Names<'a> {
-    pub(crate) fn new(lowered: &Lowered, mounted: &'a Mounted) -> Names<'a> {
-        Names { paths: lowered.paths(), mounted }
+    /// The names of `paths`, the files of a task's reader.
+    pub(crate) fn new(paths: &'a Arc<HashMap<FileId, String>>, mounted: &'a Mounted) -> Names<'a> {
+        Names { paths, mounted }
     }
 }
 

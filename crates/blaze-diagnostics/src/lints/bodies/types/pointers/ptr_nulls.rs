@@ -19,7 +19,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{Inits, callee_fn, callee_item, has_attr, is_zero, layout, method_item, peel_casts, span, ty_text};
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -41,6 +41,10 @@ enum Useless {
 impl LatePass for PtrNullChecks {
     fn name(&self) -> &'static str {
         "PtrNullChecks"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

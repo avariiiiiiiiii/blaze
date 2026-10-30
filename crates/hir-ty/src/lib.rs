@@ -162,20 +162,12 @@ impl Hash for ComplexMemoryMap<'_> {
         let ComplexMemoryMap { memory, vtable, statics, aligns, type_ids } = self;
         memory.hash(state);
         // `VTableMap`'s ids of types follow from the order of its types.
-        state.write_usize(vtable_types(vtable).count());
-        vtable_types(vtable).for_each(|ty| ty.hash(state));
+        state.write_usize(vtable.tys().len());
+        vtable.tys().for_each(|ty| ty.hash(state));
         statics.hash(state);
         aligns.hash(state);
         type_ids.hash(state);
     }
-}
-
-/// The types of `vtable` in the order of their ids, which run on without a gap from
-/// [`VTableMap::FIRST_ID`].
-pub(crate) fn vtable_types<'a, 'db>(
-    vtable: &'a VTableMap<'db>,
-) -> impl ExactSizeIterator<Item = Ty<'db>> + 'a {
-    vtable.tys()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

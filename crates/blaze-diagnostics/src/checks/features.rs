@@ -52,16 +52,28 @@ use crate::{
     model::{Applicability, Code, Diag, Level, MultiSpan, Span},
 };
 
-/// What rustc says of the crate's features and of what it uses without them, in rustc's order:
-/// [`configured`], [`staged`] and the gates, then [`library`]'s at `misc_checking_1`.
-pub(crate) fn check(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner]) -> Vec<Found> {
-    let flags = Flags::default();
-    let (features, mut found) = configured(cx, owners, &flags);
-    found.extend(attributes::expansion(cx, walk, owners, &features));
-    found.extend(staged(cx, owners, &features, &flags));
-    found.extend(gates::check(cx, walk, &features, &flags));
-    found.extend(library::check(cx, owners, &features));
+/// What rustc says of the crate's features and of what it uses without them, each part called
+/// by `checks::check` at its pass: [`configured`] before expansion, [`expansion`] as expansion
+/// meets macro calls, [`early`] in `early_lint_checks`, [`unused_or_stable`] in
+/// `misc_checking_1`.
+///
+/// The gates of the attributes of macro calls, as expansion gives them.
+pub(crate) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner], features: &Features) -> Vec<Found> {
+    attributes::expansion(cx, walk, owners, features)
+}
+
+/// `feature_gate::check_crate`: the checks of the features themselves ([`staged`]), then the
+/// gates of syntax.
+pub(crate) fn early(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner], features: &Features, flags: &Flags) -> Vec<Found> {
+    let mut found = staged(cx, owners, features, flags);
+    found.extend(gates::check(cx, walk, features, flags));
     found
+}
+
+/// `check_unused_or_stable_features`: E0635, E0557 of a removed library feature,
+/// `stable_features`, `duplicate_features`.
+pub(crate) fn unused_or_stable(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> Vec<Found> {
+    library::check(cx, owners, features)
 }
 
 /// The `-Z` options rustc reads here, as rustc takes them when none is given.

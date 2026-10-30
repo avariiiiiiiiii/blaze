@@ -248,6 +248,12 @@ impl DefWithBody {
     /// per `match`, each arm's `bindings_with_variant_name` as its pattern is lowered, then the
     /// redundant or-pattern alternatives sorted by span, then the redundant arms).
     pub fn match_lints<'db>(self, db: &'db dyn HirDatabase) -> Vec<MatchLint<'db>>;
+
+    /// Whether `check_match` returned `Err` (E0004, E0005, or any other error it gives), from
+    /// the same salsa query as `match_lints`: rustc's `mir_built` is then `construct_error`'s
+    /// body, so the body gets no MIR lint (liveness, `unconditional_recursion`, known panics,
+    /// `LintAndRemoveUninhabited`), though `check_unsafety` still visits its THIR.
+    pub fn match_check_failed(self, db: &dyn HirDatabase) -> bool;
 }
 
 pub enum MatchLint<'db> {
@@ -596,6 +602,7 @@ unsafe in it has no warning for it in its `.stderr` (`tests/ui/consts/issue-1829
    `crates/blaze-diagnostics/src/lower/macro_def_error.rs` to give rustc's text.
 
 > forwarded to db: lane db is still running: 1 to 3 (`crates/hir-expand/`). > forwarded to format: 4 (`crates/mbe/src/parser.rs`).
+> forwarded by format to speed-span, which owns `crates/mbe` now (`v2/requests/speed.md`, "requests forwarded to format that are in your crates", 1).
 
 ## diagnostics-lints-bodies: what follows a call of an uninhabited type (codegen, `crates/hir-ty-mir`; db for the field in `crates/hir-ty/src/mir.rs`)
 
@@ -1266,6 +1273,7 @@ owns `lower/macro_def_error.rs` can take them (make the module `pub(crate)` from
 the definition is refused there.
 
 > forwarded to format: `crates/mbe` is lane format's (and db for any `hir-expand` part).
+> forwarded by format to speed-span, which owns `crates/mbe` now (`v2/requests/speed.md`, "requests forwarded to format that are in your crates", 2).
 
 ## diagnostics-lints-mir-scopes: scope errors the front end doesn't report (`hir-def`, `hir-ty`; front end, `diagnostics`)
 
@@ -1577,6 +1585,14 @@ example a library, so `check_attr.rs` gives neither lint where it doesn't know (
 than rustc on a plain `lib`).
 
 > forwarded to db: `crates/hir/` and `base-db` are lane db's.
+> applied by db-expand (base-db): `CrateData::crate_types: CrateTypes` (a `u8` set of
+> `CrateType { Bin, Lib, Rlib, Dylib, Cdylib, Staticlib, ProcMacro }`), in the crate's content id
+> (`Crate::DOMAIN` is now "blaze v2 crate 2"). `add_crate_root` fills it with
+> `TargetKind::default_crate_types` (what cargo passes for a target naming none; empty for
+> `Other`). Test `a_crates_types_read_back_and_are_in_its_id`. What waits: db-ty-next1's
+> `hir::Crate::crate_types`, and cargo's `load-cargo/src/v2.rs:340` and codegen's
+> `blaze-engine/src/doctest.rs:1078` `BuiltCrateData` literals, which need the field (asked in
+> `v2/requests/db-expand.md`).
 
 ## diagnostics-lints-levels: `CheckCfg` for `CommandLine` (`lints/syntax/check_cfg.rs`, `diagnostics-lints-syntax`)
 
@@ -1842,6 +1858,7 @@ range across both can only say the call site. With the query, `Cx::span` does wh
 `prepare_to_combine` does.
 
 > forwarded to format (`crates/mbe`) and db (`crates/hir-expand`).
+> forwarded by format to speed-span, which owns `crates/mbe` now (`v2/requests/speed.md`, "requests forwarded to format that are in your crates", 3).
 
 ## diagnostics-lints-syntax-early-macros-asm: re "drop the label lints" (diagnostics-lints-bodies-calls-methods-asm)
 
@@ -2062,6 +2079,8 @@ below replaces a guess with a record, or lets a lint that is now never emitted b
 
 > for: db (1, 2, 3, 4, 7), diagnostics (5, 8), diagnostics-lints-syntax (6), diagnostics-lints-levels (8).
 > forwarded to db: `crates/hir-def` `nameres` and `item_scope` are lane db's.
+> applied (6), diagnostics-lints-syntax: `Walk::place(cx, at, pass)` is `pub(crate)`; `Places` in
+> `lints/names/imports.rs` can call it and be removed.
 
 ## diagnostics-items-features: what `checks/features*` needs from its siblings, the driver and hir
 
@@ -2104,6 +2123,11 @@ From diagnostics-items-features (child of diagnostics-items), 2026-10-29.
 
 > for: diagnostics-lints-syntax (1, 2, 8), the driver (3, 6), cargo (4), db (5), codegen (7).
 > forwarded to diagnostics: between its own children (the front-end parts go to db through it).
+> applied (1, 2), diagnostics-lints-syntax: `Named` with its fields and `named` are `pub(crate)`.
+> `features::table::unstable_declared()` gives the unstable language features in `unstable.rs`'s
+> order. It reads `lang::DECLARED`, u16 indexes into `LANG` that `table.py` now generates, at the
+> same rustc commit as `checks/features/library/unstable.rs`'s list. That list can be removed.
+> (8) is waiting on db: see "diagnostics-lints-syntax: `-Z crate-attr` as a file of its own" below.
 
 ## diagnostics-lints-bodies-liveness: guard references and capture copies marked in `MirBody`; liveness of inline consts (crates/hir-ty-mir `lower.rs`, `lints/bodies.rs`)
 
@@ -2425,12 +2449,15 @@ crate's cfg (`target_arch`, `target_os`, ..) gives neither. `checks/attrs/parser
 
 What: make `attributes.rs`' `features_fact` `pub(crate)`. Why: `Session::feature_err` in
 `checks/attrs/accept.rs` records the crate root's `#![feature]`s fact with its own copy of
-`features_fact`, for the gates that have no function in `attributes.rs` (`check_mod_attrs`'
-`naked_functions_rustic_abi`, and those the `stability` and `doc` parsers give through
-`Accept::gate`); with it exposed the copy goes.
+`features_fact`, for the one gate that has no function in `attributes.rs` (`check_mod_attrs`'
+`naked_functions_rustic_abi`, through `Finalize::gate`); with it exposed the copy goes.
 
 > for: diagnostics-items-features-attrs.
 > forwarded to diagnostics: its own `checks/features/`.
+
+> withdrawn (diagnostics-items-attrs): `checks/attrs.rs` `push` now records the crate root's
+> `#![feature]`s fact on every attribute error (the gates, the parsers and their targets read
+> the features), so `Session::feature_err` has no copy and nothing is needed here.
 
 ## diagnostics-items-attrs: done, the three asks of diagnostics-items-features-attrs
 
@@ -2466,3 +2493,73 @@ Why: rustc parses these and refuses them in `rustc_ast_passes`; until the parser
 
 > for: parser (front end).
 > forwarded to format: `crates/parser` is lane format's.
+
+## diagnostics-lints-syntax: `-Z crate-attr` as a file of its own (db, `crates/base-db/src/input.rs`, `crates/hir-def/src/attrs.rs`)
+
+What: give each crate's `-Z crate-attr` attributes a `HirFileId` (a file in the crate's source
+root, named `<crate attribute>` as rustc's `FileName::CliCrateAttr`, one per attribute as rustc
+parses each on its own), in place of `parse_extra_crate_attrs`' detached `SourceFile`.
+Why: `lints/syntax/attrs.rs` `owners` and everything in `checks/attrs` and `checks/features`
+read an attribute's file for its span (`Attr::in_file`), its edition and `from_expansion`, so a
+detached tree can't be one of the crate root's attributes there. With a real file, `owners` adds
+its attributes to the crate's owner after the root's (rustc's order), and `-Z
+crate-attr=feature(x)` enables `x` for `checks/features` (the items-features ask 8 above). Until
+then those attributes are seen only by `checks::crate_attrs`.
+
+> for: db.
+> forwarded to db: `base-db` and `hir-def/src/attrs.rs` are lane db's (told by tmux).
+
+## diagnostics-lints-names-items: an enum layout's tag and variant sizes (crates/hir `Layout`)
+
+What: on `hir::Layout`, whether it is `Variants::Multiple` with `TagEncoding::Direct`, the size
+of its tag, and the size of each variant's layout in declaration order (rustc's
+`variants[i].size`). Why: `variant_size_differences` (allow-by-default, `rustc_lint/src/types.rs`
+`VariantSizeDifferences`) lints the variant that is more than three times the next largest,
+each size less the tag's; `Layout` keeps its `TyLayout` private and only has `enum_tag_size`, so
+`lints/names/items` can't read them. Not written until then.
+
+> for: db (crates/hir).
+> forwarded to db: `crates/hir` is its (told by tmux).
+> forwarded to db: `crates/hir/` is its.
+
+## From db-ty (2026-10-29): `hir::Type::instantiate_type_params` takes the database
+
+`DbInterner::conjure` is deleted (unsound: it stretched the attached database's borrow, safety
+audit item `interner.rs:411`). Its `hir` callers now take the database. In `blaze-diagnostics`,
+`Type::instantiate_type_params(&self, db, args)` is the only one, at six sites in
+`crates/blaze-diagnostics/src/lower/`:
+
+- `missing_match_arms.rs:663`: `field.ty(db).instantiate_type_params(ty.type_arguments())` ->
+  `field.ty(db).instantiate_type_params(db, ty.type_arguments())`
+- `unimplemented_trait.rs:755`: `.instantiate_type_params(args.iter())` ->
+  `.instantiate_type_params(cx.db, args.iter())`
+- `trait_impl_missing_assoc_items.rs:142` and `:174`: `.instantiate_type_params(args.iter())` ->
+  `.instantiate_type_params(db, args.iter())` (`db` is the function's)
+- `mismatched_tuple_struct_pat_arg_count.rs:290`: `.instantiate_type_params(ty.type_arguments())`
+  -> `.instantiate_type_params(cx.db, ty.type_arguments())`
+- `type_mismatch.rs:772`: `.instantiate_type_params(args.iter())` ->
+  `.instantiate_type_params(cx.db, args.iter())`
+
+The result is unchanged: the interner is `DbInterner::new_no_crate(db)`, the same one `conjure`
+made. Also changed, though nothing in this crate calls them: `Type::instantiate(db, args)`,
+`Type::instantiate_with_errors(db)`, `Type::unknown(db)` and `Type::new_unit(db)`.
+
+> forwarded to diagnostics: its sites (told by tmux). `hir-ide`, `ide-db` and `test-fixture` call neither `conjure` nor `instantiate_type_params`.
+
+## diagnostics-lints: whether rustc makes code, in the UI harness (the parent, `diagnostics`, `src/tests.rs`)
+
+`lints::CommandLine` has `codegen: bool` now, read from `--emit` as rustc's
+`OutputTypes::should_codegen` reads it (no `--emit` is rustc's `link`: true). `lints::early`
+passes it to `bodies::before_abort(cx, codegen)`: with it, the known-panics lint and a `Drop`
+impl's `unconditional_recursion` run on every body, not only on those of consts.
+`CommandLine::default()` is `cargo check`'s (false).
+
+- `tests::compiletest(mode, options)` builds its `CommandLine` from compiletest's flags, which
+  have no `--emit`, so every UI test is now `codegen: true`. compiletest passes
+  `--emit=metadata` for a check pass or fail mode (`runtest.rs`, `make_compile_args`): add it
+  for those, and leave it out for `build-*` and `run-*` (so `Mode` needs `Check` and `Build`, or
+  the test's `//@` pass mode).
+- `check.rs`: `blaze check`'s `options.lints` should have `codegen: false`, `blaze build`/`test`/
+  `run`'s true (from cargo's `--emit`, if `CommandLine::parse` is given rustc's arguments).
+
+> forwarded to diagnostics (the parent, `src/tests.rs`).

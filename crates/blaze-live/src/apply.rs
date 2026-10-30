@@ -118,7 +118,8 @@ pub(crate) fn slide_at(bytes: &mut [u8], at: u64, slide: u64) -> Result<(), Stri
         .ok()
         .and_then(|at| bytes.get_mut(at..at.checked_add(8)?))
         .ok_or_else(|| format!("an address at {at:#x}, past the end of the patch"))?;
-    let value = u64::from_le_bytes(field.try_into().map_err(|_| "an address shorter than 8 bytes")?);
+    let value =
+        u64::from_le_bytes(field.try_into().map_err(|_| "an address shorter than 8 bytes")?);
     field.copy_from_slice(&value.wrapping_add(slide).to_le_bytes());
     Ok(())
 }
@@ -130,7 +131,9 @@ fn section(text: &[u8], (start, len): (u64, u64)) -> Result<(usize, usize), Stri
         .zip(usize::try_from(len).ok())
         .and_then(|(start, len)| Some((start, start.checked_add(len)?)))
         .filter(|&(_, end)| end <= text.len())
-        .ok_or_else(|| format!("unwind tables at {start:#x} of {len:#x} bytes, past the end of the patch"))
+        .ok_or_else(|| {
+            format!("unwind tables at {start:#x} of {len:#x} bytes, past the end of the patch")
+        })
 }
 
 /// The length field of the entry at `at` in `text`, and, for one that is not the zero
@@ -209,11 +212,7 @@ pub(crate) fn fdes(text: &[u8], frames: (u64, u64)) -> Result<Vec<usize>, String
 /// patch's code and data, mapped at `patch` from where the image is loaded) has: checked to
 /// be whole entries, 4-aligned, inside `memory`, and each to name a function and unwind
 /// information inside the patch, for the unwinder reads them from where the image is loaded.
-pub(crate) fn functions(
-    memory: &[u8],
-    functions: (u64, u64),
-    patch: u64,
-) -> Result<u32, String> {
+pub(crate) fn functions(memory: &[u8], functions: (u64, u64), patch: u64) -> Result<u32, String> {
     if functions.1 == 0 {
         return Ok(0);
     }
@@ -221,8 +220,10 @@ pub(crate) fn functions(
     if !(end - start).is_multiple_of(FUNCTION) || !start.is_multiple_of(4) {
         return Err(format!("a table of functions at {start:#x} that is not whole entries"));
     }
-    let inside = patch..patch.checked_add(memory.len() as u64).ok_or("a patch past the end of memory")?;
-    let u32_at = |at: usize| u64::from(u32::from_le_bytes(memory[at..at + 4].try_into().expect("4 bytes")));
+    let inside =
+        patch..patch.checked_add(memory.len() as u64).ok_or("a patch past the end of memory")?;
+    let u32_at =
+        |at: usize| u64::from(u32::from_le_bytes(memory[at..at + 4].try_into().expect("4 bytes")));
     for at in (start..end).step_by(FUNCTION) {
         let (begin, until, unwind) = (u32_at(at), u32_at(at + 4), u32_at(at + 8));
         let named = begin < until

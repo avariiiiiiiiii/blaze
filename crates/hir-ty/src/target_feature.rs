@@ -3,14 +3,16 @@
 //! Every name of rustc's per-arch tables below is a [`TargetFeature`], a `u16` index into
 //! [`NAMES`]; a set of them is a [`TargetFeatureSet`], one bit each. Name bytes find their
 //! feature by a perfect hash built by `const fn`, and what each feature implies, transitively,
-//! is a `const`-built bitset per feature. Nothing is interned, hashed or allocated to ask whether
-//! a feature is enabled.
+//! is a `const`-built bitset per entry of each arch's table, found through a `u16` per feature
+//! and arch: a feature implies what its target's table says, as in rustc (`aes` is `neon` on
+//! AArch64 and `sse2` on x86). Nothing is interned, hashed or allocated to ask whether a
+//! feature is enabled.
 
 use std::fmt;
 
 use base_db::Crate;
-use hir_def::FunctionId;
 use hir_def::attrs::AttrFlags;
+use hir_def::{FunctionId, HasModule};
 use intern::Symbol;
 
 use crate::db::HirDatabase;
@@ -66,11 +68,91 @@ impl TargetFeature {
         self.0 as usize
     }
 
-    /// The feature and every feature it implies, transitively.
+    /// The feature and every feature it implies on `arch`, transitively: what rustc's
+    /// `implied_target_features` gives from the target's own table. A feature `arch`'s table
+    /// does not name implies nothing.
     #[inline]
-    pub fn implied(self) -> &'static TargetFeatureSet {
-        &IMPLIED[self.index()]
+    pub fn implied_in(self, arch: TargetArch) -> TargetFeatureSet {
+        match arch.entry_of(self) {
+            Some(entry) => IMPLIED[entry],
+            None => TargetFeatureSet::EMPTY.with(self),
+        }
     }
+}
+
+/// The architecture whose table says what a target feature implies, as rustc's
+/// `Target::rust_target_features` picks one from `target_arch`: one variant per table, in the
+/// order of `TARGET_FEATURE_IMPLICATIONS_RAW`, and `Other` for a target without one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum TargetArch {
+    Arm,
+    AArch64,
+    X86,
+    Hexagon,
+    PowerPC,
+    Mips,
+    Nvptx,
+    RiscV,
+    Wasm,
+    Bpf,
+    Xtensa,
+    Csky,
+    LoongArch,
+    IbmZ,
+    Sparc,
+    M68k,
+    Avr,
+    Other,
+}
+
+const _: () = assert!(TargetArch::Other as usize == TARGET_FEATURE_IMPLICATIONS_RAW.len());
+
+impl TargetArch {
+    /// The arch of a `target_arch` cfg value.
+    pub fn from_target_arch(name: &str) -> Self {
+        match name {
+            "arm" => Self::Arm,
+            "aarch64" | "arm64ec" => Self::AArch64,
+            "x86" | "x86_64" => Self::X86,
+            "hexagon" => Self::Hexagon,
+            "mips" | "mips32r6" | "mips64" | "mips64r6" => Self::Mips,
+            "nvptx64" => Self::Nvptx,
+            "powerpc" | "powerpc64" => Self::PowerPC,
+            "riscv32" | "riscv64" => Self::RiscV,
+            "wasm32" | "wasm64" => Self::Wasm,
+            "bpf" => Self::Bpf,
+            "csky" => Self::Csky,
+            "loongarch32" | "loongarch64" => Self::LoongArch,
+            "s390x" => Self::IbmZ,
+            "sparc" | "sparc64" => Self::Sparc,
+            "m68k" => Self::M68k,
+            "avr" => Self::Avr,
+            "xtensa" => Self::Xtensa,
+            _ => Self::Other,
+        }
+    }
+
+    /// The entry of `feature` in this arch's table, the last when it names it twice (rustc
+    /// reads the table into a map).
+    #[inline]
+    fn entry_of(self, feature: TargetFeature) -> Option<usize> {
+        let table = ENTRY_OF.get(self as usize)?;
+        match table[feature.index()] {
+            NO_ENTRY => None,
+            entry => Some(entry as usize),
+        }
+    }
+}
+
+/// The arch of `krate`'s target, from its `target_arch` cfg: once per crate.
+#[salsa::tracked(returns(copy))]
+pub fn crate_target_arch(db: &dyn HirDatabase, krate: Crate) -> TargetArch {
+    krate
+        .cfg_options(db)
+        .get_cfg_values("target_arch")
+        .next()
+        .map_or(TargetArch::Other, |it| TargetArch::from_target_arch(it.as_str()))
 }
 
 impl fmt::Debug for TargetFeature {
@@ -136,9 +218,9 @@ impl TargetFeatureSet {
         self.0.iter().all(|&word| word == 0)
     }
 
-    /// The set and every feature its features imply, transitively.
-    pub fn implied(&self) -> Self {
-        self.iter().fold(*self, |out, feature| out.union(feature.implied()))
+    /// The set and every feature its features imply on `arch`, transitively.
+    pub fn implied_in(&self, arch: TargetArch) -> Self {
+        self.iter().fold(*self, |out, feature| out.union(&feature.implied_in(arch)))
     }
 
     /// The features, in the order of their names' bytes.
@@ -197,9 +279,14 @@ pub struct TargetFeatures<'db> {
 }
 
 impl<'db> TargetFeatures<'db> {
+    /// The features of `owner`'s attributes and what they imply on its crate's target.
     pub fn from_fn(db: &'db dyn HirDatabase, owner: FunctionId) -> Self {
         let declared = TargetFeatures::from_fn_no_implications(db, owner);
-        Self { known: declared.known.implied(), ..declared }
+        if declared.known.is_empty() {
+            return declared;
+        }
+        let arch = crate_target_arch(db, owner.krate(db));
+        Self { known: declared.known.implied_in(arch), ..declared }
     }
 
     /// The features the attributes name, without those they imply.
@@ -388,25 +475,76 @@ const EDGE_COUNT: usize = {
     count
 };
 
-/// Each implication of every table, a feature and one it implies directly. Some features are in
-/// two archs' tables with different implications (`aes`); this merges them, as rustc would for
-/// neither, since the arch is not known here.
-const EDGES: [[u16; 2]; EDGE_COUNT] = {
-    let mut edges = [[0; 2]; EDGE_COUNT];
+const ARCHES: usize = TARGET_FEATURE_IMPLICATIONS_RAW.len();
+
+/// The entries of every table, one per line of each arch's table, archs in order.
+const ENTRY_COUNT: usize = {
+    let mut count = 0;
+    let mut arch = 0;
+    while arch < ARCHES {
+        count += TARGET_FEATURE_IMPLICATIONS_RAW[arch].len();
+        arch += 1;
+    }
+    count
+};
+
+const _: () = assert!(ENTRY_COUNT < NO_ENTRY as usize);
+
+/// The feature of each entry and the arch of its table.
+const ENTRIES: [(u16, u8); ENTRY_COUNT] = {
+    let mut entries = [(0, 0); ENTRY_COUNT];
     let mut at = 0;
     let mut arch = 0;
-    while arch < TARGET_FEATURE_IMPLICATIONS_RAW.len() {
+    while arch < ARCHES {
         let table = TARGET_FEATURE_IMPLICATIONS_RAW[arch];
         let mut i = 0;
         while i < table.len() {
-            let from = TargetFeature::named(table[i].0).0;
+            entries[at] = (TargetFeature::named(table[i].0).0, arch as u8);
+            at += 1;
+            i += 1;
+        }
+        arch += 1;
+    }
+    entries
+};
+
+/// No entry: the arch's table does not name the feature.
+const NO_ENTRY: u16 = u16::MAX;
+
+/// For each arch, each feature's entry in its table, the later one of a name the table has
+/// twice: 2 bytes a feature, so finding a row is one load.
+const ENTRY_OF_TABLE: [[u16; COUNT]; ARCHES] = {
+    let entries = ENTRIES;
+    let mut table = [[NO_ENTRY; COUNT]; ARCHES];
+    let mut at = 0;
+    while at < ENTRY_COUNT {
+        let (feature, arch) = entries[at];
+        table[arch as usize][feature as usize] = at as u16;
+        at += 1;
+    }
+    table
+};
+static ENTRY_OF: [[u16; COUNT]; ARCHES] = ENTRY_OF_TABLE;
+
+/// Each implication of every table: an entry and a feature it implies directly, in that
+/// entry's arch.
+const EDGES: [(u16, u16); EDGE_COUNT] = {
+    let mut edges = [(0, 0); EDGE_COUNT];
+    let mut at = 0;
+    let mut entry = 0;
+    let mut arch = 0;
+    while arch < ARCHES {
+        let table = TARGET_FEATURE_IMPLICATIONS_RAW[arch];
+        let mut i = 0;
+        while i < table.len() {
             let implied = table[i].2;
             let mut j = 0;
             while j < implied.len() {
-                edges[at] = [from, TargetFeature::named(implied[j]).0];
+                edges[at] = (entry as u16, TargetFeature::named(implied[j]).0);
                 at += 1;
                 j += 1;
             }
+            entry += 1;
             i += 1;
         }
         arch += 1;
@@ -414,23 +552,30 @@ const EDGES: [[u16; 2]; EDGE_COUNT] = {
     edges
 };
 
-/// Each feature and every feature it implies, transitively: rows made the union of the rows
-/// they imply until none grows, which handles a cycle (`e2` implies itself). 72 bytes a feature.
-static IMPLIED: [TargetFeatureSet; COUNT] = {
-    let mut rows = [TargetFeatureSet::EMPTY; COUNT];
-    let mut f = 0;
-    while f < COUNT {
-        rows[f] = rows[f].with(TargetFeature(f as u16));
-        f += 1;
+/// Each entry's feature and every feature it implies in its arch, transitively: rows made the
+/// union of the rows of what they imply until none grows, which handles a cycle (`e2` implies
+/// itself). A feature the table does not name implies only itself. 72 bytes an entry.
+static IMPLIED: [TargetFeatureSet; ENTRY_COUNT] = {
+    // Locals, so that the loop indexes them in place rather than a copy of each table.
+    let (entries, entry_of, edges) = (ENTRIES, ENTRY_OF_TABLE, EDGES);
+    let mut rows = [TargetFeatureSet::EMPTY; ENTRY_COUNT];
+    let mut at = 0;
+    while at < ENTRY_COUNT {
+        rows[at] = rows[at].with(TargetFeature(entries[at].0));
+        at += 1;
     }
     let mut changed = true;
     while changed {
         changed = false;
         let mut e = 0;
         while e < EDGE_COUNT {
-            let [from, to] = EDGES[e];
-            let (from, to) = (from as usize, to as usize);
-            let merged = rows[from].union(&rows[to]);
+            let (from, to) = edges[e];
+            let from = from as usize;
+            let arch = entries[from].1 as usize;
+            let merged = match entry_of[arch][to as usize] {
+                NO_ENTRY => rows[from].with(TargetFeature(to)),
+                to_entry => rows[from].union(&rows[to_entry as usize]),
+            };
             if !merged.same(&rows[from]) {
                 rows[from] = merged;
                 changed = true;

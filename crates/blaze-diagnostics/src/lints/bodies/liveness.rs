@@ -62,7 +62,7 @@ use crate::{
 };
 
 pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
-    if b.tainted || source::skipped(b) {
+    if b.mir_tainted || source::skipped(b) {
         return Vec::new();
     }
     let Some(mir) = b.mir() else { return Vec::new() };

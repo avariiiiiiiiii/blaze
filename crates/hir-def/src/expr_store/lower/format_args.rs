@@ -52,6 +52,7 @@ impl<'db> ExprCollector<'db> {
             },
             _ => None,
         });
+        let record = self.store.record;
         let mut mappings = vec![];
         let (mut fmt, hygiene) = match template.and_then(|template| {
             self.expand_macros_to_string(template.clone()).map(|it| (it, template))
@@ -68,7 +69,7 @@ impl<'db> ExprCollector<'db> {
                     is_direct_literal,
                     |name, range| {
                         let expr_id = self.store.alloc_path_expr(Path::from(name));
-                        if let Some(range) = range {
+                        if record && let Some(range) = range {
                             self.store
                                 .template_map
                                 .get_or_insert_with(Default::default)
@@ -81,7 +82,7 @@ impl<'db> ExprCollector<'db> {
                         expr_id
                     },
                     |name, span| {
-                        if let Some(span) = span {
+                        if record && let Some(span) = span {
                             mappings.push((span, name))
                         }
                     },
@@ -102,11 +103,13 @@ impl<'db> ExprCollector<'db> {
 
         let idx = self.collect_format_args_impl(syntax_ptr, fmt);
 
-        self.store
-            .template_map
-            .get_or_insert_with(Default::default)
-            .format_args_to_captures
-            .push((idx, (hygiene, mappings)));
+        if record {
+            self.store
+                .template_map
+                .get_or_insert_with(Default::default)
+                .format_args_to_captures
+                .push((idx, (hygiene, mappings)));
+        }
         idx
     }
 
@@ -563,7 +566,9 @@ impl<'db> ExprCollector<'db> {
         let new_fn = match new_fn {
             Some(new_fn) => {
                 let new_fn = self.store.alloc_path_expr(new_fn);
-                if let Some(arg_ptr) = arg_ptr {
+                if self.store.record
+                    && let Some(arg_ptr) = arg_ptr
+                {
                     // Trait errors (the argument does not implement the expected fmt trait) will show
                     // on this path, so to not end up with synthetic syntax we insert this mapping. We
                     // don't want to insert the other way's mapping in order to not override the source

@@ -29,6 +29,8 @@ use blaze_graph::{
 use blaze_protocol::events::{Event, NodeState};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
+use super::work::Readers;
+
 /// The kinds of the daemon's own tasks, for their estimates: past every query kind (`u16`).
 pub mod kinds {
     use blaze_graph::admission::TaskKind;
@@ -53,10 +55,11 @@ pub struct Did<T> {
     pub value: T,
 }
 
-/// The thread tasks of one batch of nodes: called with a task's `arg`, it says what the task
-/// came to, or `None` when it gave way (a cycle of waits, a cancel, memory), to be posted again
-/// whole. One per batch, never one per node.
-pub type Work<T> = Arc<dyn Fn(u32) -> Option<Did<T>> + Send + Sync>;
+/// The thread tasks of one batch of nodes: called with a task's `arg` and the readers the loop
+/// posted it with, it says what the task came to, or `None` when it gave way (a cycle of waits,
+/// a cancel, memory, a write of what it read), to be posted again whole. One per batch, never
+/// one per node.
+pub type Work<T> = Arc<dyn Fn(u32, Readers) -> Option<Did<T>> + Send + Sync>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Task {
@@ -96,6 +99,9 @@ pub enum Happened<T> {
     Did { id: NodeId, value: T },
     /// A thread task was posted: it starts.
     Started { id: NodeId },
+    /// A thread task of a batch that reads to post now, `again` when it gave way before:
+    /// the loop makes its readers and gives them to [`Plane::post`].
+    Post { task: Posting, again: bool },
     /// A loop task to start now.
     Run { id: NodeId },
     /// A node settled: done (`why` none) or not (failed, skipped or cancelled, saying why).
@@ -105,19 +111,26 @@ pub enum Happened<T> {
     Finished { request: RequestId, ok: bool, stats: RequestStats },
 }
 
-/// A thread task that ended: its value, or its panic's message.
+/// A thread task that ended, or gave way.
 pub struct Ran<T> {
-    pub id: NodeId,
-    pub kind: TaskKind,
-    pub did: Result<Did<T>, String>,
+    pub task: Posting,
+    pub ended: Ended<T>,
     pub peak: u64,
+}
+
+pub enum Ended<T> {
+    Did(Did<T>),
+    Panicked(String),
+    /// A task of a batch that reads gave way, on the thread group `group`: the loop posts it
+    /// again with new readers. Others are posted again where they ran.
+    GaveWay { group: Option<u32> },
 }
 
 /// Runs thread tasks and hands back how each ended.
 pub trait Runner<T>: Send {
     /// `work` is the batch's, shared: posting costs one reference count, not a closure. A
     /// `critical` task is on its request's critical path: it goes to the fastest cores.
-    fn post(&mut self, task: Posting, work: Work<T>);
+    fn post(&mut self, task: Posting, work: Work<T>, readers: Readers);
     /// Moves the tasks that ended into `out`.
     fn take(&mut self, out: &mut Vec<Ran<T>>);
     /// Whether a task ended and was not taken yet: the loop then polls the driver without
@@ -136,6 +149,8 @@ pub struct Posting {
     pub critical: bool,
     pub kind: TaskKind,
     pub arg: u32,
+    /// Its batch reads the front end: it is posted with readers the loop made.
+    pub reads: bool,
 }
 
 /// The daemon's: work tasks on the process's worker pool, IO tasks on threads of their own.
@@ -149,6 +164,7 @@ pub struct Threads<T> {
 struct IoJob<T> {
     task: Posting,
     work: Work<T>,
+    readers: Readers,
     done: Sender<Ran<T>>,
 }
 
@@ -168,13 +184,17 @@ impl<T: Send + 'static> Threads<T> {
                 .spawn(move || {
                     for job in io_rx {
                         // A task that gave way runs again on this thread: an IO task waits on
-                        // the world, not on another task.
-                        let (did, peak) = loop {
-                            if let (Some(did), peak) = run_measured(&job.work, job.task.arg) {
-                                break (did, peak);
+                        // the world, not on another task. One that reads goes back for new
+                        // readers.
+                        let mut readers = Some(job.readers);
+                        let (ended, peak) = loop {
+                            match run_measured(&job.work, job.task.arg, readers.take().unwrap_or_default()) {
+                                (Some(ended), peak) => break (ended, peak),
+                                (None, peak) if job.task.reads => break (Ended::GaveWay { group: None }, peak),
+                                (None, _) => {}
                             }
                         };
-                        _ = job.done.send(Ran { id: job.task.id, kind: job.task.kind, did, peak });
+                        _ = job.done.send(Ran { task: job.task, ended, peak });
                     }
                 })
                 .unwrap_or_else(|why| panic!("an IO thread of the daemon's plane: {why}"));
@@ -183,13 +203,14 @@ impl<T: Send + 'static> Threads<T> {
     }
 }
 
-/// Runs `work` inside a measure: `None` when it gave way, else its value or its panic.
-fn run_measured<T>(work: &Work<T>, arg: u32) -> (Option<Result<Did<T>, String>>, u64) {
-    let (result, peak) = arena::measure(|| catch_unwind(AssertUnwindSafe(|| work(arg))));
+/// Runs `work` inside a measure: `None` when it gave way (its readers dropped with it), else
+/// its value or its panic.
+fn run_measured<T>(work: &Work<T>, arg: u32, readers: Readers) -> (Option<Ended<T>>, u64) {
+    let (result, peak) = arena::measure(|| catch_unwind(AssertUnwindSafe(|| work(arg, readers))));
     match result {
         Ok(None) => (None, peak),
-        Ok(Some(did)) => (Some(Ok(did)), peak),
-        Err(panic) => (Some(Err(panicked(&*panic))), peak),
+        Ok(Some(did)) => (Some(Ended::Did(did)), peak),
+        Err(panic) => (Some(Ended::Panicked(panicked(&*panic))), peak),
     }
 }
 
@@ -202,16 +223,20 @@ fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
     format!("panicked: {what}")
 }
 
-fn post_work<T: Send + 'static>(task: Posting, work: Work<T>, done: Sender<Ran<T>>) {
+fn post_work<T: Send + 'static>(task: Posting, work: Work<T>, readers: Readers, done: Sender<Ran<T>>) {
     let pool = blaze_graph::exec::shared();
     let again = work.clone();
-    let (id, kind, arg) = (task.id, task.kind, task.arg);
-    let run = move || run_measured(&work, arg);
+    let run = move || run_measured(&work, task.arg, readers);
     let then = move |result: std::thread::Result<_>| match result {
-        Ok((Some(did), peak)) => _ = done.send(Ran { id, kind, did, peak }),
+        Ok((Some(ended), peak)) => _ = done.send(Ran { task, ended, peak }),
+        Ok((None, peak)) if task.reads => {
+            _ = done.send(Ran { task, ended: Ended::GaveWay { group: blaze_graph::pool::group() }, peak });
+        }
         // Gave way: posted again behind what is ready on the group it ran on.
-        Ok((None, _)) => post_work(Posting { near: blaze_graph::pool::group(), ..task }, again, done),
-        Err(panic) => _ = done.send(Ran { id, kind, did: Err(panicked(&*panic)), peak: 0 }),
+        Ok((None, _)) => {
+            post_work(Posting { near: blaze_graph::pool::group(), ..task }, again, Readers::default(), done);
+        }
+        Err(panic) => _ = done.send(Ran { task, ended: Ended::Panicked(panicked(&*panic)), peak: 0 }),
     };
     match task.critical {
         true => pool.submit_critical(task.near, run, then),
@@ -220,12 +245,12 @@ fn post_work<T: Send + 'static>(task: Posting, work: Work<T>, done: Sender<Ran<T
 }
 
 impl<T: Send + 'static> Runner<T> for Threads<T> {
-    fn post(&mut self, task: Posting, work: Work<T>) {
+    fn post(&mut self, task: Posting, work: Work<T>, readers: Readers) {
         self.running += 1;
         match task.pool {
-            Pool::Work => post_work(task, work, self.done_tx.clone()),
+            Pool::Work => post_work(task, work, readers, self.done_tx.clone()),
             Pool::Io => {
-                let job = IoJob { task, work, done: self.done_tx.clone() };
+                let job = IoJob { task, work, readers, done: self.done_tx.clone() };
                 // The IO threads hold the receiver for as long as the process lives.
                 _ = self.io.send(job);
             }
@@ -249,7 +274,9 @@ impl<T: Send + 'static> Runner<T> for Threads<T> {
 }
 
 /// The simulation's: tasks run on the loop's thread when it takes them, a seeded part of what
-/// is posted each time in a seeded order, so a run is a function of its seed.
+/// is posted each time in a seeded order, so a run is a function of its seed. The readers of
+/// tasks it holds queued are alive while the loop writes, so it is for fronts whose writes
+/// don't wait on their readers (the simulation's fakes).
 pub struct Inline<T> {
     rng: Rng,
     queue: VecDeque<Posted<T>>,
@@ -257,7 +284,7 @@ pub struct Inline<T> {
     posted: Vec<Posted<T>>,
 }
 
-type Posted<T> = (Posting, Work<T>);
+type Posted<T> = (Posting, Work<T>, Readers);
 
 impl<T> Inline<T> {
     pub fn new(seed: u64) -> Inline<T> {
@@ -266,8 +293,8 @@ impl<T> Inline<T> {
 }
 
 impl<T: Send + 'static> Runner<T> for Inline<T> {
-    fn post(&mut self, task: Posting, work: Work<T>) {
-        self.queue.push_back((task, work));
+    fn post(&mut self, task: Posting, work: Work<T>, readers: Readers) {
+        self.queue.push_back((task, work, readers));
     }
 
     fn take(&mut self, out: &mut Vec<Ran<T>>) {
@@ -279,10 +306,11 @@ impl<T: Send + 'static> Runner<T> for Inline<T> {
         self.rng.shuffle(&mut posted);
         let now = 1 + self.rng.below(posted.len() as u64) as usize;
         self.queue.extend(posted.drain(now..));
-        for (task, work) in posted.drain(..) {
-            match run_measured(&work, task.arg) {
-                (Some(did), peak) => out.push(Ran { id: task.id, kind: task.kind, did, peak }),
-                (None, _) => self.queue.push_back((task, work)),
+        for (task, work, readers) in posted.drain(..) {
+            match run_measured(&work, task.arg, readers) {
+                (Some(ended), peak) => out.push(Ran { task, ended, peak }),
+                (None, peak) if task.reads => out.push(Ran { task, ended: Ended::GaveWay { group: None }, peak }),
+                (None, _) => self.queue.push_back((task, work, Readers::default())),
             }
         }
         self.posted = posted;
@@ -304,6 +332,7 @@ struct Batch<T> {
     tasks: Vec<Task>,
     live: u32,
     work: Option<Work<T>>,
+    reads: bool,
 }
 
 pub struct Plane<T> {
@@ -417,12 +446,20 @@ impl<T: Send + 'static> Plane<T> {
     }
 
     /// The nodes of `fresh` added to `request`, in one input to the plane, their thread tasks
-    /// run by `work`. An error (a cycle, a dep of another request) adds none of them.
+    /// run by `work`; with `reads`, each posted with readers the loop makes ([`Happened::Post`]).
+    /// An error (a cycle, a dep of another request) adds none of them.
     ///
     /// # Panics
     ///
     /// When `fresh` has fewer nodes than it was made for, or a thread task has no `work`.
-    pub fn add(&mut self, at: Duration, request: RequestId, fresh: Fresh, work: Option<Work<T>>) -> Result<(), Error> {
+    pub fn add(
+        &mut self,
+        at: Duration,
+        request: RequestId,
+        fresh: Fresh,
+        work: Option<Work<T>>,
+        reads: bool,
+    ) -> Result<(), Error> {
         let Fresh { nodes, tasks, count } = fresh;
         assert_eq!(tasks.len() as u32, count, "a batch is added with every node it was made for");
         assert!(
@@ -431,7 +468,7 @@ impl<T: Send + 'static> Plane<T> {
         );
         let first = nodes.first();
         if count > 0 {
-            self.batches.insert(first.0, Batch { tasks, live: count, work });
+            self.batches.insert(first.0, Batch { tasks, live: count, work, reads });
         }
         match self.step(PlaneInput::AddNodes { at_ns: ns(at), request, nodes }) {
             Ok(()) => Ok(()),
@@ -464,19 +501,42 @@ impl<T: Send + 'static> Plane<T> {
         self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of loop task {id}: {error}"));
     }
 
+    /// A thread task of [`Happened::Post`] posted with the readers the loop made for it.
+    pub fn post(&mut self, task: Posting, again: bool, readers: Readers) {
+        let Some((batch, Task::Thread { .. })) = self.task(task.id) else {
+            panic!("the daemon posts node {}, which is no thread task waiting", task.id)
+        };
+        let work = batch.work.clone().expect("checked by add");
+        if !again {
+            self.happened.push(Happened::Started { id: task.id });
+        }
+        self.runner.post(task, work, readers);
+    }
+
+    /// A thread task of [`Happened::Post`] the loop has no readers for: it ends failed.
+    pub fn refuse(&mut self, at: Duration, task: Posting, why: String) {
+        let input = PlaneInput::Done { at_ns: ns(at), id: task.id, outcome: Outcome::Failed { why }, added: Vec::new(), group: None, peak: 0 };
+        self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of task {}: {error}", task.id));
+    }
+
     /// Takes the thread tasks that ended into the plane.
     pub fn poll(&mut self, at: Duration) {
         let mut ran = std::mem::take(&mut self.ran);
         self.runner.take(&mut ran);
-        for Ran { id, kind, did, peak } in ran.drain(..) {
-            self.estimates.observe(kind, peak);
-            let outcome = match did {
-                Ok(Did { outcome, value }) => {
+        for Ran { task, ended, peak } in ran.drain(..) {
+            let id = task.id;
+            let outcome = match ended {
+                Ended::GaveWay { group } => {
+                    self.happened.push(Happened::Post { task: Posting { near: group, ..task }, again: true });
+                    continue;
+                }
+                Ended::Did(Did { outcome, value }) => {
                     self.happened.push(Happened::Did { id, value });
                     outcome
                 }
-                Err(why) => Outcome::Failed { why },
+                Ended::Panicked(why) => Outcome::Failed { why },
             };
+            self.estimates.observe(task.kind, peak);
             let input = PlaneInput::Done { at_ns: ns(at), id, outcome, added: Vec::new(), group: None, peak };
             self.step(input).unwrap_or_else(|error| panic!("the plane refused the end of task {id}: {error}"));
         }
@@ -536,9 +596,14 @@ impl<T: Send + 'static> Plane<T> {
                 }
                 PlaneOutput::Run { id, pool, near, critical } => match self.task(id) {
                     Some((batch, Task::Thread { kind, arg })) => {
-                        let work = batch.work.clone().expect("checked by add");
-                        self.happened.push(Happened::Started { id });
-                        self.runner.post(Posting { id, pool, near, critical, kind, arg }, work);
+                        let task = Posting { id, pool, near, critical, kind, arg, reads: batch.reads };
+                        if batch.reads {
+                            self.happened.push(Happened::Post { task, again: false });
+                        } else {
+                            let work = batch.work.clone().expect("checked by add");
+                            self.happened.push(Happened::Started { id });
+                            self.runner.post(task, work, Readers::default());
+                        }
                     }
                     Some((_, Task::Loop)) => self.happened.push(Happened::Run { id }),
                     Some((_, Task::Gone)) | None => panic!("the plane runs node {id}, which the daemon gave no task"),

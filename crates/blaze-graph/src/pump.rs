@@ -23,17 +23,21 @@ use std::{
     collections::hash_map::Entry,
     hash::{BuildHasherDefault, Hasher},
     num::NonZero,
-    ptr,
-    sync::{
-        Arc, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
-    },
-    thread::{self, Thread},
+    sync::{Arc, PoisonError},
 };
 
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
-use crate::{Cancelled, Key};
+use crate::{
+    Cancelled, Key,
+    sync::{
+        MutexGuard, OnceLock,
+        atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
+        hint,
+        thread::{self, Thread},
+        thread_local,
+    },
+};
 
 /// How many jobs a thread runs above the job at the bottom of its stack, at most. A wait at
 /// this depth parks without pumping; that cannot deadlock, since the cycle check still runs.
@@ -47,12 +51,12 @@ pub(crate) const SPINS: u32 = 64;
 /// work or the database: no guard lives across a query, so none can deadlock or invert a
 /// priority (docs/v2/plan/design/concurrency.md, "No guard lives across a query call").
 #[allow(clippy::disallowed_types)]
-pub(crate) struct Lock<T>(std::sync::Mutex<T>);
+pub(crate) struct Lock<T>(crate::sync::Mutex<T>);
 
 #[allow(clippy::disallowed_types)]
 impl<T> Lock<T> {
     pub(crate) const fn new(value: T) -> Lock<T> {
-        Lock(std::sync::Mutex::new(value))
+        Lock(crate::sync::Mutex::new(value))
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
@@ -98,6 +102,7 @@ struct Stack {
     tasks: [Published; PUMP_DEPTH + 1],
 }
 
+#[cfg(not(blaze_check))]
 const _: () = assert!(size_of::<Stack>() == 384);
 
 impl Stack {
@@ -112,10 +117,12 @@ impl Stack {
 }
 
 /// Stacks come in chunks, published once and never freed or moved, so a check reads any
-/// thread's without a lock: slot `n` is chunk `n / CHUNK`, at `n % CHUNK`.
+/// thread's without a lock: slot `n` is chunk `n / CHUNK`, at `n % CHUNK`. A once cell, not a
+/// pointer: under `blaze_check` a set `static` cell stays set across executions, so a chunk is
+/// made once per process there too.
 const CHUNK: usize = 64;
 const CHUNKS: usize = 1 << 12;
-static DIR: [AtomicPtr<Stack>; CHUNKS] = [const { AtomicPtr::new(ptr::null_mut()) }; CHUNKS];
+static DIR: [OnceLock<Box<[Stack]>>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
 
 struct Free {
     next: u32,
@@ -127,14 +134,7 @@ static FREE: Lock<Free> = Lock::new(Free { next: 1, free: Vec::new() });
 
 fn stack(index: u64) -> Option<&'static Stack> {
     let index = usize::try_from(index).ok()?;
-    let chunk = DIR.get(index / CHUNK)?.load(Ordering::Acquire);
-    (!chunk.is_null()).then(|| {
-        // SAFETY: `index % CHUNK < CHUNK`, and a published chunk is `CHUNK` stacks.
-        let at = unsafe { chunk.add(index % CHUNK) };
-        // SAFETY: a published chunk is leaked, never freed or moved, and its stacks were made
-        // before the release store that published it, which the acquire load above pairs with.
-        unsafe { &*at }
-    })
+    DIR.get(index / CHUNK)?.get()?.get(index % CHUNK)
 }
 
 fn claim() -> (u32, &'static Stack) {
@@ -146,10 +146,7 @@ fn claim() -> (u32, &'static Stack) {
         });
         let at = index as usize / CHUNK;
         assert!(at < CHUNKS, "more than {} threads have a task stack at once", CHUNKS * CHUNK);
-        if DIR[at].load(Ordering::Relaxed).is_null() {
-            let chunk: Box<[Stack]> = (0..CHUNK).map(|_| Stack::new()).collect();
-            DIR[at].store(Box::leak(chunk).as_mut_ptr(), Ordering::Release);
-        }
+        DIR[at].get_or_init(|| (0..CHUNK).map(|_| Stack::new()).collect());
         index
     };
     (index, stack(u64::from(index)).expect("the chunk was just published"))
@@ -507,12 +504,22 @@ impl<V: Clone + Send + Sync + 'static> Drop for Ending<'_, V> {
 /// Waits for `flight` to end, pumping while this thread may: its value, or `None` when it was
 /// cancelled.
 fn wait<V: Clone>(flight: &Flight<V>) -> Option<V> {
+    wait_until(&|| flight.state.load(Ordering::Acquire) != RUNNING);
+    match flight.state.load(Ordering::Acquire) {
+        DONE => flight.value.get().cloned(),
+        _ => None,
+    }
+}
+
+/// Waits until `ended` is true, as a wait for a key does: on a pool's worker it runs that
+/// pool's jobs (below [`PUMP_DEPTH`]), spins a little, then parks; elsewhere it spins, then
+/// parks. Whoever makes `ended` true unparks this thread (`Thread::unpark`); `ended` is read
+/// again after each wake, so a spurious one only loops.
+pub fn wait_until(ended: &dyn Fn() -> bool) {
     let mut idle = 0u32;
     loop {
-        match flight.state.load(Ordering::Acquire) {
-            RUNNING => {}
-            DONE => return flight.value.get().cloned(),
-            _ => return None,
+        if ended() {
+            return;
         }
         let pump = depth() < PUMP_DEPTH;
         if pump && idle % 16 == 0 && crate::pool::run_one() {
@@ -521,10 +528,10 @@ fn wait<V: Clone>(flight: &Flight<V>) -> Option<V> {
         }
         if idle < SPINS {
             idle += 1;
-            std::hint::spin_loop();
+            hint::spin_loop();
             continue;
         }
-        crate::pool::park(&|| flight.state.load(Ordering::Acquire) != RUNNING, pump);
+        crate::pool::park(ended, pump);
     }
 }
 
@@ -548,7 +555,7 @@ fn hex(key: &Key) -> String {
     key.0.iter().take(8).map(|it| format!("{it:02x}")).collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(blaze_check)))]
 mod tests {
     use std::{
         sync::{
@@ -759,6 +766,52 @@ mod tests {
         assert_eq!(flights.running(), 0);
     }
 
+    /// On a worker, `wait_until` runs the pool's jobs while it waits: with one worker, the job
+    /// that ends the wait can only run pumped. On a client's thread it parks until unparked.
+    #[test]
+    fn wait_until_pumps_on_a_worker_and_parks_elsewhere() {
+        let pool = Pool::new(&Topology::flat(1), false).unwrap();
+        let ended = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = unbounded::<&'static str>();
+        {
+            let (ended, tx) = (ended.clone(), tx.clone());
+            pool.submit(
+                None,
+                move || {
+                    ended.store(1, Ordering::SeqCst);
+                    super::wait_until(&|| ended.load(Ordering::SeqCst) == 2);
+                },
+                move |it| {
+                    it.unwrap();
+                    _ = tx.send("waiter");
+                },
+            );
+        }
+        until("the job to wait", || ended.load(Ordering::SeqCst) == 1);
+        {
+            let (ended, tx) = (ended.clone(), tx.clone());
+            pool.submit(None, move || ended.store(2, Ordering::SeqCst), move |it| {
+                it.unwrap();
+                _ = tx.send("ender");
+            });
+        }
+        let mut seen = [rx.recv_timeout(LONG).unwrap(), rx.recv_timeout(LONG).unwrap()];
+        seen.sort_unstable();
+        assert_eq!(seen, ["ender", "waiter"]);
+
+        let flag = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            let waiter = {
+                let flag = flag.clone();
+                scope.spawn(move || super::wait_until(&|| flag.load(Ordering::SeqCst) == 1))
+            };
+            std::thread::sleep(Duration::from_millis(20));
+            flag.store(1, Ordering::SeqCst);
+            waiter.thread().unpark();
+            waiter.join().unwrap();
+        });
+    }
+
     /// One worker, a hundred jobs that each wait for a key a client runs: each pumps the next
     /// until the bound, where the last waits without pumping; once the key is done, every one
     /// ends.
@@ -901,5 +954,225 @@ mod tests {
                 Ok(value)
             })
         }
+    }
+}
+
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-graph --release
+/// model_`), on threads of no pool (a pool's worker would pump; `pool`'s models check that):
+/// a key asked by two threads against the sequential runs of one key, two runs that ask for each
+/// other's keys, and a thread's published stack read while it changes.
+#[cfg(all(test, blaze_check))]
+mod model {
+    use std::sync::Arc;
+
+    use blaze_check::{
+        linear::{History, Spec},
+        model,
+    };
+
+    use super::{DEPTH_SHIFT, Flights, SEQ_MASK, THREAD_SHIFT, current, edges, run_task};
+    use crate::{
+        Cancelled, Key,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            thread,
+        },
+    };
+
+    fn key(n: u8) -> Key {
+        let mut key = [0u8; 32];
+        key[0] = n;
+        Key(key)
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        /// A `get_or_run` whose run, if it runs, gives `mine`, or is cancelled.
+        Get { mine: u32 },
+        /// That run begins.
+        Begin(u32),
+        /// That run ends: with its value when `ok`.
+        End { mine: u32, ok: bool },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Ret {
+        Done,
+        /// A run began while another was under way, or a run ended that was not.
+        Overlap,
+        Got(u32),
+        Cancelled,
+        /// A result no ended run gave this asker.
+        Nothing,
+    }
+
+    /// The sequential key: the run under way, and the last one's run and whether it gave its
+    /// value.
+    #[derive(Clone, PartialEq, Eq, Hash, Default)]
+    struct Runs {
+        running: Option<u32>,
+        last: Option<(u32, bool)>,
+    }
+
+    impl Spec for Runs {
+        type Op = Op;
+        type Ret = Ret;
+
+        fn apply(&mut self, op: &Op) -> Ret {
+            match *op {
+                Op::Begin(_) if self.running.is_some() => Ret::Overlap,
+                Op::Begin(mine) => {
+                    self.running = Some(mine);
+                    Ret::Done
+                }
+                Op::End { mine, ok } if self.running == Some(mine) => {
+                    self.running = None;
+                    self.last = Some((mine, ok));
+                    Ret::Done
+                }
+                Op::End { .. } => Ret::Overlap,
+                // A cancel reaches only the asker whose run it was: the others ask again.
+                Op::Get { mine } => match self.last {
+                    Some((value, true)) => Ret::Got(value),
+                    Some((run, false)) if run == mine => Ret::Cancelled,
+                    _ => Ret::Nothing,
+                },
+            }
+        }
+    }
+
+    /// Asks for `key` as one operation of `history`; its run, if it runs, lets the other thread
+    /// go in its middle.
+    fn ask(
+        history: &History<Runs>,
+        flights: &Flights<u32>,
+        key: Key,
+        mine: u32,
+        ok: bool,
+    ) -> Result<u32, Cancelled> {
+        let mut out = Err(Cancelled);
+        history.record(Op::Get { mine }, |_| {
+            out = flights.get_or_run(key, || {
+                history.record(Op::Begin(mine), |_| Ret::Done);
+                thread::yield_now();
+                history.record(Op::End { mine, ok }, |_| Ret::Done);
+                if ok { Ok(mine) } else { Err(Cancelled) }
+            });
+            match out {
+                Ok(value) => Ret::Got(value),
+                Err(Cancelled) => Ret::Cancelled,
+            }
+        });
+        out
+    }
+
+    /// Two threads ask for one key: one run at a time, and a thread that asked while the other
+    /// ran gets that run's value.
+    #[test]
+    fn model_flights_run_a_key_once_at_a_time() {
+        model(|| {
+            let flights = Arc::new(Flights::<u32>::new());
+            let history = Arc::new(History::<Runs>::new());
+            let other = {
+                let (flights, history) = (flights.clone(), history.clone());
+                thread::spawn(move || ask(&history, &flights, key(1), 2, true))
+            };
+            let mine = ask(&history, &flights, key(1), 1, true);
+            let theirs = other.join().unwrap();
+            history.check(Runs::default());
+            assert!(matches!((mine, theirs), (Ok(1 | 2), Ok(1 | 2))), "{mine:?} {theirs:?}");
+            assert_eq!(flights.running(), 0);
+        });
+    }
+
+    /// This thread's run of the key is cancelled: it says so, and the other, if it waited for
+    /// that run, asks again and runs the key itself.
+    #[test]
+    fn model_a_cancelled_run_is_asked_again() {
+        model(|| {
+            let flights = Arc::new(Flights::<u32>::new());
+            let history = Arc::new(History::<Runs>::new());
+            let other = {
+                let (flights, history) = (flights.clone(), history.clone());
+                thread::spawn(move || ask(&history, &flights, key(1), 2, true))
+            };
+            let mine = ask(&history, &flights, key(1), 1, false);
+            let theirs = other.join().unwrap();
+            history.check(Runs::default());
+            assert!(matches!(mine, Err(Cancelled) | Ok(2)), "{mine:?}");
+            assert_eq!(theirs, Ok(2), "a cancelled run's waiter runs the key itself");
+            assert_eq!(flights.running(), 0);
+        });
+    }
+
+    /// Each of two threads runs its key and asks, inside the run, for the other's. When both
+    /// runs are under way, the second of the two waits would close a cycle: that one gives way,
+    /// its run ends cancelled, the other runs the key given up itself and ends with a value, and
+    /// nothing deadlocks.
+    #[test]
+    fn model_waits_that_would_close_a_cycle_give_way() {
+        /// The run of `mine` is the value of `theirs` plus 10; a run of `theirs` asked here is
+        /// `theirs`.
+        fn cross(flights: &Flights<u32>, mine: u8, theirs: u8) -> Result<u32, Cancelled> {
+            flights.get_or_run(key(mine), || {
+                flights.get_or_run(key(theirs), || Ok(u32::from(theirs))).map(|it| it + 10)
+            })
+        }
+        model(|| {
+            let flights = Arc::new(Flights::<u32>::new());
+            let other = {
+                let flights = flights.clone();
+                thread::spawn(move || cross(&flights, 2, 1))
+            };
+            let mine = cross(&flights, 1, 2);
+            let theirs = other.join().unwrap();
+            // Each value is its own run over its own inner run (12, 11), its own run over the
+            // other's run that ran its inner key alone (21, 22), or the other's inner run (1, 2).
+            assert!(matches!(mine, Ok(12 | 21 | 1) | Err(Cancelled)), "{mine:?}");
+            assert!(matches!(theirs, Ok(11 | 22 | 2) | Err(Cancelled)), "{theirs:?}");
+            if mine.is_err() {
+                assert_eq!(theirs, Ok(11), "the one that went on ran the key given up");
+            }
+            if theirs.is_err() {
+                assert_eq!(mine, Ok(12), "the one that went on ran the key given up");
+            }
+            assert_eq!(flights.running(), 0);
+        });
+    }
+
+    /// A thread runs a task with two jobs above it, one after the other, while another reads
+    /// the task's edges: it waits for nobody, its job above is none or one of the two, and
+    /// once it ended it has no edge at all.
+    #[test]
+    fn model_a_published_stack_is_read_while_it_changes() {
+        /// The id of the `nth` task after `outer` on its thread, one above it.
+        fn above(outer: u64, nth: u64) -> u64 {
+            let slot = outer >> THREAD_SHIFT << THREAD_SHIFT;
+            slot | (1 << DEPTH_SHIFT) | ((outer + nth) & SEQ_MASK)
+        }
+        model(|| {
+            let published = Arc::new(AtomicU64::new(0));
+            let reader = {
+                let published = published.clone();
+                thread::spawn(move || {
+                    let outer = published.load(Ordering::Acquire);
+                    (outer != 0).then(|| (outer, edges(outer)))
+                })
+            };
+            let outer = run_task(|| {
+                let outer = current();
+                published.store(outer, Ordering::Release);
+                for nth in 1..=2 {
+                    run_task(|| assert_eq!(current(), above(outer, nth)));
+                }
+                outer
+            });
+            if let Some((seen, (on, up))) = reader.join().unwrap() {
+                assert_eq!(seen, outer);
+                assert_eq!(on, 0, "the task waits for nobody");
+                assert!(up == 0 || up == above(outer, 1) || up == above(outer, 2), "{up:#x}");
+            }
+            assert_eq!(edges(outer), (0, 0), "an ended task has no edges");
+        });
     }
 }

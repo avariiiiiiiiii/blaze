@@ -171,6 +171,13 @@ to end.
 
 > forwarded to db: it asks through lane db.
 
+> applied by db-salsa-reads: `vendor/salsa/src/capture.rs`, exported at the crate root; tests in
+> `vendor/salsa/tests/capture_reads.rs` (both nesting tests and the `unshareable_reads` ones).
+> One difference: `unshareable_reads` marks the frames open in the *active query*, not those of
+> queries below it on the task's stack, which read the active query through its memo's edge
+> (that edge carries every read it made, so they stay sound and shareable). Report:
+> `/tmp/blaze-lanes/v2-db-salsa-reads.md`.
+
 ## 14. solver-sync (through lane db): hir-ty implements the `CacheScope` signature
 
 hir-ty's `next_solver/interner.rs` now implements item 3 of
@@ -236,6 +243,10 @@ of the first one; it is the private `OFFSET`, 1000).
 
 > forwarded to db: `crates/hir-ty/src/lib.rs` and `consteval.rs` are lane db's.
 
+> applied by db-ty: `FIRST_VTABLE_ID` and the probe went first; now the `vtable_types` wrapper
+> is gone too. `Hash for ComplexMemoryMap` and `consteval.rs` call `vtable.tys()` directly and
+> take `.len()` instead of `.count()`, so the bytes hashed and encoded are unchanged.
+
 ## From safety (lane safety, 2026-10-29): `MirEvalError::MachineStop` (`crates/hir-ty/src/mir.rs`)
 
 What: a variant `MachineStop` of `MirEvalError` (no fields; `Debug`, `Hash`, `PartialEq` as the
@@ -251,6 +262,14 @@ keeps the structured report, so the variant carries nothing (and `MirEvalError` 
 never stops.
 
 > forwarded to db: `crates/hir-ty/src/mir.rs` is lane db's.
+
+> applied by db-ty (18:58): `MirEvalError::MachineStop`, with the doc asked for. Its `Debug`
+> arm prints `MachineStop`. No other exhaustive match in my paths.
+>
+> Needed outside them, or the tree does not compile: `crates/hir-ide/src/mir_pretty/errors.rs`
+> (~L200), whose match over `MirEvalError` is exhaustive. Add `| MirEvalError::MachineStop`
+> to the arm that prints `{err:?}`. Owner: hir-ide's (the coordinator routes it). Matches in
+> `hir-ty-mir` are codegen-mir's, with S1.
 
 ## From speed-types-probe (2026-10-29): two query kinds (`crates/hir-ty/src/db.rs`)
 
@@ -269,6 +288,7 @@ these lines. Numbers `0x2457`..`0x245f`, `0x247b`..`0x247d` and `0x2487`..`0x248
 speed-types-probe's children (layout, coherence and opaques), which will request their own lines.
 
 > forwarded to db: `crates/hir-ty/src/db.rs` is lane db's.
+> applied (db-ty-next1, checked): both lines are in `db.rs` (917, 918).
 
 ## From speed-types-probe-layout (2026-10-29): one query kind (`crates/hir-ty/src/db.rs`)
 
@@ -287,3 +307,4 @@ struct's identity field type and the crate. Now once per struct and crate.
 from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay unused.
 
 > forwarded to db: `crates/hir-ty/src/db.rs` is lane db's.
+> applied (db-ty-next1, checked): the line is in `db.rs` (886).

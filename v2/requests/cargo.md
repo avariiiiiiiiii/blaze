@@ -1208,6 +1208,7 @@ a `ctx` a proc-macro server sends, and a made-up one panics the daemon in `Synta
 With it, `answer` refuses the request, naming the value, instead of panicking.
 
 > forwarded to format (`SyntaxContext::from_wire` in `crates/span/src/hygiene.rs`).
+> forwarded by format to speed-span, which owns `crates/span` now (`v2/requests/speed.md`, "requests forwarded to format that are in your crates", 4).
 
 ## 18. From cargo-daemon-units (2026-10-29; to cargo-daemon, cargo-daemon-lower, codegen, link, usercode, safety)
 
@@ -1337,3 +1338,741 @@ For **cargo-std** (`stdlib/`):
   a node for its `Event::Node`; now a batch is one record with no copy.
 
 > forwarded to cargo: written by `requests`' child requests-nodes, which told the lane.
+
+## 19. From cargo-load (2026-10-29; to lane cargo): the speed pass's three asks
+
+- blaze-metadata (`src/summary.rs`, `src/lib.rs:44`): replace its own `pub struct Read` with
+  `pub use blaze_units::Read;`. The fields are the same; blaze-units now defines `Read` outside
+  its `query` feature (`crates/blaze-units/src/read.rs`), so it builds for wasm as before.
+  blaze-tree's `Tree` query now hands `ViewResolved::reads` to `print_resolved` as they are;
+  before, it copied every package's summary into blaze-metadata's `Read`. Until this lands,
+  `crates/blaze-tree/src/query.rs` does not type-check.
+- blaze-manifest (`src/metadata.rs`, `src/dependency.rs`, `src/targets.rs`): make the fields of
+  `SerializedPackage`, `SerializedDependency` and `SerializedTarget` `pub` (read-only use). The
+  load builds each package's `Summary` from `serde_json::to_value(export_package(..))`, a tree
+  of allocations per package for every resolve. With the fields public it reads them typed, the
+  same values with no JSON in between. Nothing else changes.
+- blaze-query (owner: core): `Cx::get_all::<Q>(&[Q::Key])`, which runs independent queries on
+  the pool and records their edges in order. The load prefetches a workspace's sibling member
+  manifests in one round (`Fill::beside` in `crates/blaze-units/src/load/files.rs`), but today
+  it asks for them one after another.
+
+> for lane cargo: forward the third to core.
+
+- For `docs/v2/plan/lanes/cargo/notes.md` section 4 (the lane's file), the load's state of the art,
+  to put in as the lane sees fit:
+  - **What it measures against.** The load is incremental as rust-analyzer's salsa project
+    loading and Buck2's DICE are: every file read is an edge, and every query cuts off early on
+    an equal value. It goes finer than both, and than rustc's red-green graph, in two ways:
+    - A `Cargo.toml` is kept in its canonical TOML form, so an edit to a comment or the layout
+      cuts off at that file's `ManifestQuery`, and nothing that reads the workspace reruns.
+    - A target is found from its parent directory's listing, never by asking for the file
+      itself, so editing a source file reruns no query of the load at all.
+
+    Cold, it reads no more files than cargo's own `Workspace::new`, and it reads them from the
+    content-addressed tree, not the disk.
+  - **The hot path.** A file read is one query keyed by its path. The mount table is read where
+    its bytes lie (a borrowed CBOR decode, nothing copied), and the longest mount is a binary
+    search for each ancestor, as a kernel's mount hash looks one up: O(depth · log mounts), not a
+    scan. File bytes are stored as CBOR byte strings, not arrays of integers. blaze-manifest reads
+    a snapshot held as sorted path columns with a used bit beside each entry, so a read is a
+    binary search and a flag. Paths that are already normal are borrowed, and a directory lookup
+    is a binary search in the sorted listing.
+  - **Rounds.** blaze-manifest stops at the first member manifest it lacks, so the load fetches
+    every sibling's manifest in the same round. A workspace takes as many runs as its members
+    are deep, not one per member.
+  - **The resolve and the units.** Each lookup from a unit to its package goes through one
+    `FxHashMap` built once per plan, and path packages are walked with a hash set. The two
+    copies left are a package's JSON round trip (the second ask above) and running the sibling
+    prefetch sequentially (the third).
+
+> answered by lane cargo (request 9, `CborBytes`): not written. It would save one encode of a
+> value made once per std key and kept in the image; the second value type it adds to every
+> reader of `StdUnits` costs more than that. `Cbor<T>` stays the load's one value type.
+> answered by lane cargo ("From speed-link-edge-ci-ui", `cargo/client.rs`, `cargo/say.rs`): not
+> applied. Those are v1's client, which request 4 replaces with `crate::cli`; v2's printer
+> (`cli/print.rs`) already writes one buffer per response.
+> answered by lane cargo ("From concurrency: lock audit"): findings 1, 2, 4 and 5 are gone from
+> `serve/`; 3 holds the lock for the move only; 6 and 7 (`load-cargo`'s `Mutex<Db>`) are given to
+> cargo-daemon.
+> answered by lane cargo (request 19): its first two asks go with request 1's grant (blaze-metadata
+> and blaze-manifest are not lane cargo's yet); until then `crates/blaze-tree/src/query.rs` does
+> not type-check. Its third is request 20.
+
+## 20. From lane cargo (to core, `crates/blaze-query/src/lib.rs`): `Cx::get_all`
+
+```rust
+impl<'db> Cx<'db> {
+    /// Each key's value, the independent queries run on the pool; their edges recorded in the
+    /// order of `keys`, as if asked one after another.
+    pub fn get_all<Q: Query>(&mut self, keys: &[Q::Key]) -> Result<Vec<<Q::Value as Persist>::Ref<'db>>, Cancelled>;
+}
+```
+
+Why: the workspace load asks for every sibling member's `Cargo.toml` in one round
+(`Fill::beside`, `crates/blaze-units/src/load/files.rs`), today one after another; a cold load of
+a large workspace (#1450's 238 s) is that many sequential reads. cargo-load's request 19.
+
+> forwarded to db: `crates/blaze-query/` is db's (db-query), not core's.
+
+## frontend: one shared database, no per-worker snapshots (docs/v2/plan/design/frontend.md item 10)
+
+What: `crates/load-cargo/src/v2/db.rs:15-35` gives each worker a cloned `Db` handle
+(`Lowered::snapshot`), and a write cancels readers by unwinding (`salsa::Cancelled` ->
+`Failed::Again`). The decided design (`docs/v2/plan/process/decisions.md`: the database is
+`Sync` and shared by reference; no per-thread handles) needs every worker to read `&Db`. Asked,
+once db answers item 2 of "frontend: what frontend.md items 7-12 still need" in
+`v2/requests/db.md`: drop `Snapshot`/`snapshot` and the `Clone` impl, pass `&Db` to the tasks,
+and map a returned `Err(Cancelled)` (not an unwind) to `Failed::Again`.
+
+> forwarded to cargo: `crates/load-cargo/` is its, after db answers item 2.
+
+## From speed-backend-sanitize (2026-10-29): the sanitizer flags into `Spec::sanitize` (F3 of `v2/requests/safety.md`, item 2 of "From safety" above)
+
+The LLVM back end instruments from `Spec::sanitize` (`blaze_codegen::settings::Sanitize`, its
+shape in `v2/requests/codegen.md` "From speed-backend-sanitize" Z1). Once Z1 lands:
+
+1. **Parse into `Sanitize`**, from `RUSTFLAGS`/`build.rustflags`/`target.<triple>.rustflags`
+   the way the other `-Z`/`-C` flags are taken (`unstable.rs`):
+   - `-Zsanitizer=a,b,..`: `address` → `Sanitizers::ADDRESS`, `thread` → `THREAD`, `memory` →
+     `MEMORY`. Keep refusing, by name, `cfi`, `kcfi`, `hwaddress`, `kernel-address`, `leak`,
+     `memtag`, `safestack`, `shadow-call-stack`, `dataflow`, `realtime` (blaze does not
+     instrument them), and refuse `thread` with `address` or `memory` and `address` with
+     `memory`, as rustc does (`incompatible sanitizers`).
+   - `-Zsanitizer-recover=a,..`: into `recover`; each must be in `sanitizers` and be `address`
+     or `memory` (rustc refuses `thread`).
+   - `-Zsanitizer-memory-track-origins[=N]`: `track_origins` N (0, 1 or 2; no value is 2);
+     0 unless `memory` is on.
+   - SanitizerCoverage as rustc has it (there is no `-Zsanitizer-coverage` or
+     `-Csanitizer-coverage-level` in the pinned nightly; cargo-fuzz passes these): when
+     `-Cpasses` names `sancov-module`, read from `-Cllvm-args` `-sanitizer-coverage-level=N`
+     into `coverage.level` and the switches into `coverage.flags`:
+     `-sanitizer-coverage-trace-pc` TRACE_PC, `-trace-pc-guard` TRACE_PC_GUARD,
+     `-inline-8bit-counters` INLINE_8BIT_COUNTERS, `-inline-bool-flag` INLINE_BOOL_FLAG,
+     `-pc-table` PC_TABLE, `-trace-compares` TRACE_CMP, `-trace-divs` TRACE_DIV,
+     `-trace-geps` TRACE_GEP, `-trace-loads` TRACE_LOADS, `-trace-stores` TRACE_STORES,
+     `-prune-blocks=0` NO_PRUNE, `-stack-depth` STACK_DEPTH, `-trace-pc-entry-exit`
+     TRACE_PC_ENTRY_EXIT, `-control-flow` CONTROL_FLOW (each with the
+     `-sanitizer-coverage` prefix; `=true`/`=1` as set, `=false`/`=0` as unset). Refuse every
+     other `-sanitizer-coverage-*` (`-stack-depth-callback-min`, `-gated-trace-callbacks`,
+     `-drop-ctors`, allow/block lists) and `sancov-module` without a level of 1 to 4. A
+     level outside 1 to 4 without `sancov-module`, or switches without it, leave
+     `Coverage::default()` (LLVM runs nothing then); canonical, so the key is a plain build's.
+2. **Every crate of the build** gets the same `Sanitize`, dependencies and std included
+   (cargo's behavior with `RUSTFLAGS`; F2 item 4), but not build scripts and proc macros, which
+   cargo builds for the host without the target's `RUSTFLAGS` when `--target` is given.
+3. **`cfg(sanitize = "address")`** (and `"thread"`, `"memory"`) for each sanitizer on, in every
+   crate's cfg set, as rustc sets it; `cfg(sanitizer_cfi_*)` stay unset.
+4. **`unstable.rs:237-248`**: `sanitizer`, `sanitizer-recover` and
+   `sanitizer-memory-track-origins` from `Refused(INSTRUMENTS)` to taken (into `Sanitize`), and
+   `docs/support.md`'s row to match; the CFI, KCFI and dataflow flags and `sanitizer-ignorelist`
+   stay refused. Do this only when the link has the runtimes (`v2/requests/link.md`, "From
+   speed-backend-sanitize"): until then a sanitized program can't be linked.
+5. Only the LLVM back end instruments: a Cranelift unit with a non-empty `Sanitize` stops with
+   the adapter's error (codegen.md Z3.1). So `-Zsanitizer` with a profile whose units are
+   Cranelift's (the dev profile) stops; cargo does not switch the back end on its own.
+
+> written by speed-backend-sanitize (2026-10-29); told cargo by tmux.
+> forwarded to cargo.
+
+## 20. From cargo-load (2026-10-29; to lane cargo, for the safety lane): unsafe.md in the load
+
+- blaze-units and blaze-tree have no `unsafe` and say `#![forbid(unsafe_code)]`; nothing to prove
+  under `blaze test --ub`.
+- The load's one zero-copy view, `TableRef` in `crates/blaze-units/src/load/files.rs`, is of
+  a query value the database wrote and keeps (a `Cbor<MountTable>`). It is bytes we wrote, not
+  the disk's or the network's, decoded by the safe CBOR decoder, which checks bounds.
+- The load parses untrusted bytes in safe code: a fetched package's `Cargo.toml`, `Cargo.lock`,
+  sparse-index lines and a registry's `config.json`. A `.crate` is checked by its sha256
+  before it is mounted; index files are taken as served. For `fuzz/` (not cargo-load's), one
+  target to ask the safety lane for: `load_sources`, an arbitrary index file and `config.json`
+  through `crates/blaze-units/src/load/source.rs`'s `Sources::locate`, and an arbitrary
+  `Cargo.toml` through `ManifestQuery` over a one-file view. The aim is no panic, and every
+  failure a `LoadError`.
+
+> answered by cargo-daemon (concurrency lock audit, findings 6 and 7, and `paths`): the loop side is
+> written; no worker locks to read the front end. `serve/work.rs`: `Steps::lower` returns
+> `FrontEnd { front, writer }`; `Writer` (loop-owned database: `reader()`, `ran(&mut self)`) and a
+> per-task `Reader`; every worker `Front` method takes the reader the loop made as it posted the
+> task. `serve/plane.rs`: a batch that reads posts its tasks through `Happened::Post`, so
+> `serve/job.rs` makes their readers from the job's writer at post time. A task that gives way
+> goes back to the loop for new readers, instead of being re-posted on the worker with a stale
+> snapshot. `Runs::start` and `complete` take the job's writer, so a build script applies its run
+> on the loop. `paths` is an `Arc` field of the writer, swapped by `ran` and handed to each
+> task in its reader. Sent to cargo-daemon-lower (`load-cargo/src/v2.rs`: `Lowered` as the writer,
+> `Db` by value, `applied` and `paths` plain fields, read-only `Crates`) and cargo-daemon-units
+> (`serve/unit*` callers); they don't compile against `serve/work.rs` until both land.
+> forwarded to safety: the `fuzz/` target for the load.
+
+## From requests-nodes (2026-10-29; to lane cargo, for cargo-daemon): `idle` and `PlaneOutput::Yield` in `serve/plane.rs` (fastcompile-intent 2)
+
+`PlaneInput::Open` has a new field `idle: bool`, and `PlaneOutput` a new variant
+`Yield { id }` (`crates/blaze-graph/src/plane.rs`). Until `crates/blaze-cargo/src/serve/plane.rs`
+gets both, it doesn't compile:
+
+- its `PlaneInput::Open` (~443): `idle: false`;
+- the match in `outputs` (~580-617):
+  `PlaneOutput::Yield { id } => unreachable!("the plane asks node {id} to give way: the daemon opens no idle request")`.
+
+With no idle request the plane says nothing new. Once the daemon opens idle requests
+(`Builder::speculate`), `Yield` means cancel the task run as `id`. Then step
+`PlaneInput::Yielded { at_ns, id }` once it has stopped: its thread and memory are freed and its
+nodes are ready again. If the task ends first, its `Done` is taken as before.
+
+> forwarded to cargo (told by tmux).
+> forwarded to cargo: `serve/plane.rs` is its.
+
+## frontend-deps: serve dependency images from the store (frontend.md item 5; to cargo-daemon, 2026-10-29)
+
+`hir_def::deps` (new, lane `frontend-deps`; declared once db applies its request in
+`v2/requests/db.md`) keeps each dependency crate's def map, lang items and signatures as one
+`blaze_format` image keyed by every input (crate content ID, the texts of its source root,
+which includes the `OUT_DIR` files `Lowered::ran` adds, process env, its dependencies' keys, and
+a `build` ID naming the blaze). A hit means the crate's files are never parsed for name
+resolution or signatures; only bodies codegen or const eval asks for are parsed, one at a time
+(library roots are outlines). The front end has no store dependency: the driver adapts its store
+to `hir_def::deps::ImageStore`. Asked:
+
+1. **The adapter**, new code in `crates/blaze-cargo/src/serve/` (wherever the loop keeps
+   `work.rs`'s `store: blaze_cas::Reader` and its writer):
+   ```rust
+   struct DepImages<'a> {
+       reader: &'a blaze_cas::Reader,
+       writer: &'a std::sync::Mutex<blaze_cas::Writer>, // or the loop's own put path
+   }
+
+   impl hir_def::deps::ImageStore for DepImages<'_> {
+       fn get(&self, key: &ContentId) -> Result<Option<Arc<blaze_format::Aligned>>, String> {
+           let guard = blaze_cas::enter();
+           match self.reader.get(&guard, &blaze_cas::Key(*key)) {
+               Ok(Some(entry)) => Ok(Some(Arc::new(blaze_format::Aligned::copy_from(entry.bytes)))),
+               Ok(None) => Ok(None),
+               Err(corrupt) => Err(format!("{corrupt:?}")),
+           }
+       }
+
+       fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
+           let guard = blaze_cas::enter();
+           let mut writer = self.writer.lock().unwrap_or_else(|it| it.into_inner());
+           writer.put(&guard, blaze_cas::Key(key), blaze_cas::Kind::Query, image)
+               .map(drop)
+               .map_err(|mismatch| format!("{mismatch:?}"))
+       }
+   }
+   ```
+   (Adjust to the `Reader::get` / `Writer::put` signatures in `blaze-cas/src/segment.rs`;
+   a put of a key with other bytes must stay an error, which `deps::store` reports with the
+   crate's name.)
+2. **Serve** once a build's crate inputs are final, i.e. after the last `Lowered::ran` and
+   `Lowered::macros` of the build and before the first task that reads a def map:
+   `hir_def::deps::serve(&mut lowered.db, &all_crates, build_id, &adapter, Mode::Serve)?`.
+   `build_id` is the content ID of the front end's code (the store's `producer` of hir-def;
+   never a constant, or a fixed name-resolution bug would keep serving old def maps). An `Err`
+   is the build's error (it names the crate and why; never resolve instead). `serve` replaces
+   `nameres::frozen`'s maps, so nothing else in v2 may call `frozen::set`.
+3. **Store** after the build's front-end work, on the loop thread with no snapshot alive:
+   `hir_def::deps::store(&lowered.db, &served, &adapter)?`, and show `Stored::refused`
+   (crate and `Refused` reason: proc-macro items, session macros, a file outside its source
+   root) under `-v`, since each refused crate is resolved from source every build.
+4. **`blaze check`** of the workspace needs nothing: `deps::eligible` is false for workspace
+   members and every crate depending on one.
+5. **Verification runs**: `Mode::Check` resolves every served crate as well and records
+   differences in `hir_def::nameres::frozen::differences()`; the differential harness should
+   run one build per day in that mode and fail on any difference.
+
+> forwarded to cargo-daemon (window `cargo-daemon-next1`, told by tmux).
+
+## From cargo-daemon-units (2026-10-29, cargo-daemon-units-next1): `serve/unit*` on the split front end
+
+`serve/unit*` now follows `serve/work.rs` (`FrontEnd`, `Writer`, per-task `Reader`, `Runs`
+taking the writer). `struct UnitWriter { lowered: Lowered, job, waits, .. }` is the job's
+`Writer`; `Job` keeps `Arc<Crates>`; each worker method reads `UnitReader { db: Snapshot,
+paths }`. Each call below is written against this signature and waits on the lane named.
+
+**To cargo-daemon-lower (`crates/load-cargo/src/v2.rs`; its split is half landed: `Crates`
+exists, `impl Lowered` is still the old one):**
+- `Lowered::crates(&self) -> Arc<Crates>` and `Crates::krate(&self, unit) -> Option<Crate>`
+  (the latter is there).
+- `Lowered::ran(&mut self, run, &Ran) -> Result<(), LowerError>` (called through
+  `&mut self.lowered`; `&self` would compile too), `snapshot(&self)`, `paths(&self)`.
+- Still missing: `Lowered::identity(&self, unit: usize) -> Option<ContentId>`, as asked in the
+  first "From cargo-daemon-units" section. It is now called on the writer only: on the worker
+  that lowers (for every unit with no build-script run in its closure), then on the loop in
+  `Writer::ran` for each unit whose last run that was. The front reads the result from a
+  `OnceLock` per unit, so `Front::fresh` keys records on the loop with no snapshot.
+- Replacing `Lowered::tables()`: `load_cargo::v2::tables(db: &Snapshot) -> Vec<(&'static str,
+  u64, u64)>` (name, elements, bytes), since `Front::tables` reads a task's snapshot.
+- `Snapshot` (`Db`) must be `Sync`: `codegen.rs` hands `Databases::new(&reader.db)` (now
+  `&'db (dyn HirDatabase + Sync)`) to every thread of a build.
+
+**To cargo-daemon (`crates/blaze-cargo/Cargo.toml`), still open:** `blaze-diagnostics`,
+`blaze-items`, `hir`, `hir-def`, `hir-ty`, `hir-ty-ub` (`workspace = true`).
+
+**safety:** nothing to wait on any more. `hir_ty_ub::{run_test, Config, Outcome}` landed, and
+`test.rs` follows it: `Config { seed, schedules, ..default }` from `Ub`'s `Option`s, `Passed {
+.. }`, and `Error { message, seed }` fails as "blaze's MIR evaluator stopped: ..." then
+`seed: N`, never a pass, whatever the test's `#[should_panic]`.
+
+> forwarded to cargo-daemon-lower (`load-cargo/src/v2.rs`) and cargo-daemon (`blaze-cargo/Cargo.toml`), both told by tmux.
+
+## frontend-activate: socket activation of `blaze serve`, and `blaze daemon install|uninstall` (restore.md, "The daemon starts on demand"; to cargo-cli and cargo-daemon, 2026-10-29)
+
+What lands on blaze-api's side (written, `crates/blaze-api/`): `activation` (systemd's
+`LISTEN_*` and launchd's `launch_activate_socket`, parsed, checked and taken: `Passed`, an
+owned fd), `server::Unix::{Bind(FileName), Passed { socket, at }}` (`server::Config::unix`
+is now `Option<Unix>`, and `Config` lost `Clone`), `units` (the launchd plist and the systemd
+`blaze.socket` + `blaze.service`, from one `Unit`; `install`/`uninstall` steps, `run`,
+`installed`, `place_here`, `here`), `Client::until_hung_up`, and `Status.pid` with
+`session::Daemon.pid` (`SCHEMA` 10). blaze-core's side (`Address::Inherited { fd, at }`) is
+asked of frontend-journal in `v2/requests/frontend-journal.md`. Notes:
+`docs/v2/plan/lanes/frontend/activate.md`. Each edit below is complete once both land.
+
+### 1. `crates/blaze-cargo/src/serve.rs`: `--activated`
+
+Old:
+
+```rust
+struct Args {
+    socket: Option<PathBuf>,
+    http: Option<SocketAddr>,
+}
+
+fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
+    let mut parsed = Args { socket: None, http: None };
+```
+
+New:
+
+```rust
+struct Args {
+    socket: Option<PathBuf>,
+    http: Option<SocketAddr>,
+    /// Listen on the socket systemd or launchd passed, never one of its own.
+    activated: bool,
+}
+
+fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
+    let mut parsed = Args { socket: None, http: None, activated: false };
+```
+
+Old:
+
+```rust
+        match flag.as_str() {
+            "--socket" => parsed.socket = Some(PathBuf::from(value()?)),
+```
+
+New:
+
+```rust
+        match flag.as_str() {
+            "--activated" if inline.is_none() => parsed.activated = true,
+            "--socket" => parsed.socket = Some(PathBuf::from(value()?)),
+```
+
+Old: `_ => bail!("blaze serve takes `--socket PATH` and `--http ADDR`, not `{arg}`"),`
+New: `_ => bail!("blaze serve takes `--socket PATH`, `--http ADDR` and `--activated`, not `{arg}`"),`
+
+and `/// `blaze serve [--socket PATH] [--http ADDR]`.` becomes
+`/// `blaze serve [--socket PATH] [--http ADDR] [--activated]`.`
+
+Old:
+
+```rust
+fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
+    let args = parse(args)?;
+```
+
+New:
+
+```rust
+fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
+    let args = parse(args)?;
+    // First, before any thread starts: taking the passed socket reads and clears the
+    // environment.
+    #[cfg(unix)]
+    let activated = match args.activated {
+        true => Some(activated()?),
+        false => None,
+    };
+    #[cfg(not(unix))]
+    if args.activated {
+        bail!("blaze serve --activated: socket activation is systemd's and launchd's, and this system has neither");
+    }
+```
+
+In the `Options { .. }` literal of `serve`, after `color: false,` add:
+
+```rust
+        #[cfg(unix)]
+        activated,
+```
+
+And add, after `fn parse`:
+
+```rust
+/// The socket systemd or launchd passed `blaze serve --activated` (the units of
+/// `blaze daemon install`, [`blaze_api::units`]).
+#[cfg(unix)]
+fn activated() -> anyhow::Result<blaze_api::activation::Passed> {
+    use blaze_api::activation::{Manager, take};
+    let manager = Manager::here().context(
+        "blaze serve --activated: no service manager blaze is socket-activated by runs here (systemd on Linux, launchd on macOS)",
+    )?;
+    // SAFETY: `cli::main` dispatches `serve` before anything else runs, and `serve` calls this
+    // first, before it starts a thread: no other thread touches the environment. Nothing in
+    // the process has opened or owns the descriptors the manager passed (systemd's from 3).
+    Ok(unsafe { take(manager) }?)
+}
+```
+
+(`serve.rs` is outside `cli.rs`'s `#![forbid(unsafe_code)]`; this is the one unsafe call, and
+`blaze_api::activation::take` states the contract.) Only `--activated` takes a passed socket:
+without it the daemon binds as today, and a socket the manager holds at that path makes the
+bind fail ("another process listens on it"), never a second listener.
+
+### 2. `crates/blaze-cargo/src/serve/daemon.rs`
+
+a. Import: `server::{Config as ServerConfig, Http, Server},` becomes
+`server::{Config as ServerConfig, Http, Server, Unix},`.
+
+b. `Options`, after `pub color: bool,`:
+
+```rust
+    /// The socket systemd or launchd passed (`blaze serve --activated`), listened on in place
+    /// of one made at `socket`, where it must be bound. Its file is the manager's.
+    #[cfg(unix)]
+    pub activated: Option<blaze_api::activation::Passed>,
+```
+
+Every other `Options { .. }` literal (`serve/tests.rs:365`) gets `#[cfg(unix)] activated: None,`.
+
+c. `start`: a passed socket is not dialed (that would reach this daemon's own backlog, and
+answer "another blaze serve listens") nor unlinked (its file is the manager's). Old:
+
+```rust
+        let mut effects = vec![
+            Effect::Stat { file: journal.clone(), tag: STAT_JOURNAL },
+            Effect::Stat { file: image.clone(), tag: STAT_IMAGE },
+            Effect::Stat { file: estimates_file.clone(), tag: STAT_ESTIMATES },
+            Effect::Connect { at: Address::Unix(options.socket.clone()), tag: DIAL },
+        ];
+        let store_config = blaze_cas::Config { dir: under(&state, "store"), layers: Vec::new(), tags: STORE };
+        let mut store = Store::open(store_config, &mut effects);
+        let mut read = Read::default();
+```
+
+New:
+
+```rust
+        #[cfg(unix)]
+        let activated = options.activated.is_some();
+        #[cfg(not(unix))]
+        let activated = false;
+        let mut effects = vec![
+            Effect::Stat { file: journal.clone(), tag: STAT_JOURNAL },
+            Effect::Stat { file: image.clone(), tag: STAT_IMAGE },
+            Effect::Stat { file: estimates_file.clone(), tag: STAT_ESTIMATES },
+        ];
+        if !activated {
+            effects.push(Effect::Connect { at: Address::Unix(options.socket.clone()), tag: DIAL });
+        }
+        let store_config = blaze_cas::Config { dir: under(&state, "store"), layers: Vec::new(), tags: STORE };
+        let mut store = Store::open(store_config, &mut effects);
+        let mut read = Read { socket_free: activated, ..Read::default() };
+```
+
+d. The server's Unix side. Old:
+
+```rust
+        let mut listening = socket.clone();
+        if let Some((at, _)) = &options.http {
+            listening.push_str(&format!(" and http://{at}"));
+        }
+        let server_config = ServerConfig {
+            unix: Some(options.socket.clone()),
+```
+
+New:
+
+```rust
+        let mut listening = socket.clone();
+        #[cfg(unix)]
+        let unix = match options.activated {
+            Some(passed) => {
+                listening.push_str(&format!(" (passed by {})", passed.by()));
+                Unix::Passed { socket: passed, at: options.socket.clone() }
+            }
+            None => Unix::Bind(options.socket.clone()),
+        };
+        #[cfg(not(unix))]
+        let unix = Unix::Bind(options.socket.clone());
+        if let Some((at, _)) = &options.http {
+            listening.push_str(&format!(" and http://{at}"));
+        }
+        let server_config = ServerConfig {
+            unix: Some(unix),
+```
+
+A passed socket that is not a listening Unix socket bound at `options.socket` fails the
+server's listen naming it (`Server::failed`), which `turn` already stops the daemon on.
+
+e. `Status.pid`: in `struct Daemon`, after `failed: Option<String>,` add `pid: u32,`; in the
+`Ok(Daemon { .. })` of `start`, after `failed: None,` add `pid: std::process::id(),`; in the
+`cx!` macro, after `builder: &mut $daemon.jobs,` add `pid: $daemon.pid,`.
+
+### 3. `crates/blaze-cargo/src/cli/daemon.rs`: connect without spawning where a unit serves the socket
+
+a. Imports, old:
+
+```rust
+use blaze_api::{
+    Request, Response, Status,
+    client::{Client, ClientError},
+};
+```
+
+New:
+
+```rust
+use blaze_api::{
+    Request, Response, Status,
+    client::{Client, ClientError},
+    units::Installed,
+};
+
+use super::args::DaemonVerb;
+```
+
+b. `connect`, old:
+
+```rust
+#[cfg(unix)]
+pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
+    let socket = crate::serve::socket()?;
+    match Client::unix(&socket) {
+        Ok(client) => return Ok(Some(client)),
+        Err(_) if start == Start::Never => return Ok(None),
+        Err(_) => {}
+    }
+    let log = started()?;
+```
+
+New:
+
+```rust
+/// Where systemd or launchd is socket-activating the daemon, the connect itself starts it
+/// (the manager listens and the request waits in its backlog); the CLI starts `blaze serve`
+/// only where no unit serves the socket, and says so.
+#[cfg(unix)]
+pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
+    let socket = crate::serve::socket()?;
+    let refused = match Client::unix(&socket) {
+        Ok(client) => return Ok(Some(client)),
+        Err(_) if start == Start::Never => return Ok(None),
+        Err(error) => error,
+    };
+    match activation(&socket)? {
+        Installed::Yes => {
+            let place = blaze_api::units::place_here()?;
+            anyhow::bail!(
+                "blaze's daemon is socket-activated for {} ({}) and nothing listens there ({refused}): \
+                 `blaze daemon install` loads its units again",
+                socket.display(),
+                blaze_api::units::main_file(&place).display()
+            );
+        }
+        Installed::Elsewhere(theirs) => eprintln!(
+            "blaze: starting the daemon for {}: the installed units serve {} (`blaze daemon install` with this \
+             environment serves this one)",
+            socket.display(),
+            theirs.display()
+        ),
+        Installed::No => {
+            eprintln!("blaze: starting the daemon (no socket activation is installed: `blaze daemon install` has the system start it on demand)")
+        }
+    }
+    let log = started()?;
+```
+
+and after `connect`:
+
+```rust
+/// Whether a launchd or systemd unit serves `socket`. Units live under `HOME`: without one,
+/// none is installed.
+#[cfg(unix)]
+fn activation(socket: &Path) -> anyhow::Result<Installed> {
+    if blaze_api::activation::Manager::here().is_none() || std::env::var_os("HOME").is_none_or(|it| it.is_empty()) {
+        return Ok(Installed::No);
+    }
+    Ok(blaze_api::units::installed(&blaze_api::units::place_here()?, socket)?)
+}
+```
+
+c. `stop`: with a unit installed the socket answers on (the manager listens, and a connect
+would start the daemon again), so the wait is for the daemon to hang up its connection, which
+it does last, once its image is written. Old (from `drop(client);` to the end of `stop`):
+
+```rust
+    drop(client);
+    for what in said {
+        err.write_all(super::say::error(&what, color).as_bytes())?;
+    }
+    if !ok {
+        return Ok(super::FAILED);
+    }
+    let socket = crate::serve::socket()?;
+```
+
+New:
+
+```rust
+    for what in said {
+        err.write_all(super::say::error(&what, color).as_bytes())?;
+    }
+    if !ok {
+        return Ok(super::FAILED);
+    }
+    let socket = crate::serve::socket()?;
+    #[cfg(unix)]
+    if activation(&socket)? == Installed::Yes {
+        if let Err(error) = client.until_hung_up(PATIENCE) {
+            let what = format!("the daemon at {} was told to stop: {error}", socket.display());
+            err.write_all(super::say::error(&what, color).as_bytes())?;
+            return Ok(super::FAILED);
+        }
+        return Ok(0);
+    }
+    drop(client);
+```
+
+(the rest of `stop`, the wait until the socket no longer answers, stays as it is).
+
+d. `status_lines` says the daemon's process first. Old:
+
+```rust
+    format!(
+        "requests: {requests}\nviews: {}\nmemory: {} of {}\n",
+        status.views,
+```
+
+New:
+
+```rust
+    format!(
+        "pid: {}\nrequests: {requests}\nviews: {}\nmemory: {} of {}\n",
+        status.pid,
+        status.views,
+```
+
+e. `blaze daemon install|uninstall`, added after `status`:
+
+```rust
+/// `blaze daemon install`: a running daemon stopped, then the launchd agent or systemd units
+/// written and loaded ([`blaze_api::units::install`]), so the system listens on the socket and
+/// starts the daemon at the first connection. `blaze daemon uninstall`: the daemon stopped,
+/// the units unloaded and removed.
+#[cfg(unix)]
+pub fn units(verb: DaemonVerb, err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
+    use anyhow::Context as _;
+    use blaze_api::units;
+    let socket = crate::serve::socket()?;
+    let place = units::place_here()?;
+    let steps = match verb {
+        DaemonVerb::Install => {
+            let program = std::env::current_exe().context("finding blaze's own executable")?;
+            let log = crate::serve::state()?.join("serve.log");
+            let (unit, place) = units::here(program, socket.clone(), log)?;
+            units::install(&unit, &place)?
+        }
+        DaemonVerb::Uninstall => match units::installed(&place, &socket)? {
+            Installed::No => {
+                writeln!(err, "no units of blaze's are installed in {}", place.dir.display())?;
+                return Ok(0);
+            }
+            Installed::Yes => units::uninstall(&place, &socket),
+            Installed::Elsewhere(theirs) => units::uninstall(&place, &theirs),
+        },
+    };
+    // A daemon the CLI started holds the socket's path: stopped first, so the manager's socket
+    // is the only one there, and its exit does not remove the manager's file.
+    let stopped = stop(err, color)?;
+    if stopped != 0 {
+        return Ok(stopped);
+    }
+    units::run(&steps)?;
+    match verb {
+        DaemonVerb::Install => writeln!(
+            err,
+            "installed {}: the system starts the daemon at the first connection to {}",
+            units::main_file(&place).display(),
+            socket.display()
+        )?,
+        DaemonVerb::Uninstall => writeln!(err, "uninstalled the units in {}", place.dir.display())?,
+    }
+    Ok(0)
+}
+
+#[cfg(not(unix))]
+pub fn units(_: DaemonVerb, _: &mut dyn std::io::Write, _: bool) -> anyhow::Result<i32> {
+    anyhow::bail!("blaze daemon: socket activation is systemd's and launchd's, and this system has neither")
+}
+```
+
+f. `cli/daemon/tests.rs`, `the_status_for_people`: `Status { pid: 41, requests: ...` and
+`Status { pid: 7, requests: Vec::new(), ...`; the expected texts start with `"pid: 41\n"` and
+`"pid: 7\n"`.
+
+### 4. `crates/blaze-cargo/src/cli/args.rs` and `cli.rs`: the `daemon` command
+
+In `args.rs`, after `pub enum Asked {`'s `Status,`:
+
+```rust
+    /// `blaze daemon install` or `blaze daemon uninstall`: the units that socket-activate it.
+    Daemon(DaemonVerb),
+```
+
+and after `enum Asked`:
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonVerb {
+    Install,
+    Uninstall,
+}
+```
+
+In `parse`, after `Some("status") => return Ok(Asked::Status),`:
+
+```rust
+            Some("daemon") => {
+                return Ok(match words.next().as_deref().and_then(std::ffi::OsStr::to_str) {
+                    Some("install") => Asked::Daemon(DaemonVerb::Install),
+                    Some("uninstall") => Asked::Daemon(DaemonVerb::Uninstall),
+                    Some(other) => Asked::Unknown(format!("daemon {other}")),
+                    None => Asked::Unknown("daemon".to_owned()),
+                });
+            }
+```
+
+and in `args/tests.rs`, next to the stop and status cases:
+
+```rust
+    assert_eq!(parse(os(&["daemon", "install"])), Ok(Asked::Daemon(DaemonVerb::Install)));
+    assert_eq!(parse(os(&["daemon", "uninstall"])), Ok(Asked::Daemon(DaemonVerb::Uninstall)));
+    assert_eq!(parse(os(&["daemon", "start"])), Ok(Asked::Unknown("daemon start".to_owned())));
+```
+
+In `cli.rs`, after `Asked::Status => ...`:
+
+```rust
+        Asked::Daemon(verb) => said(daemon::units(verb, &mut io::stderr().lock(), auto_color())),
+```
+
+`HELP`, after the `status` line: `    daemon      install: the system starts the daemon on demand; uninstall`;
+and the unknown-command help lists `serve, stop, status and daemon`.
+
+### 5. Not changed
+
+v1's daemon (`crates/blaze-cargo/src/cargo/daemon.rs:798-800,1364+`, `cargo/client.rs`) keeps
+its spawn: it is v1's, deleted with v1, and no unit starts it.

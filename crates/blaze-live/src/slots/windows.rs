@@ -117,7 +117,8 @@ pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
         ));
     }
     let at = found as u64;
-    let end = at.checked_add(Descriptor::SIZE as u64).ok_or("a descriptor past the end of memory")?;
+    let end =
+        at.checked_add(Descriptor::SIZE as u64).ok_or("a descriptor past the end of memory")?;
     Ok((at, readable(&(at..end), module as u64)?))
 }
 

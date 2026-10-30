@@ -22,7 +22,7 @@ use crate::{
     fragment::{self, DataRequest, Hint, RelocName, Requests},
 };
 
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 
 /// Where data is in a shape, as the names of its IR have it.
 mod namespace {
@@ -45,6 +45,7 @@ mod part {
     pub(super) const VALUE: u8 = 9;
     pub(super) const SCOPES: u8 = 10;
     pub(super) const INLINED: u8 = 11;
+    pub(super) const UNSANITIZED: u8 = 12;
 }
 
 pub(crate) fn of(function: &Function) -> Result<Shape, String> {
@@ -127,6 +128,8 @@ pub(crate) fn of(function: &Function) -> Result<Shape, String> {
         Hint::Always => 2,
         Hint::Never => 3,
     });
+    out.u8(part::UNSANITIZED);
+    out.u8(function.unsanitized.0);
     Ok(Shape(out.0))
 }
 

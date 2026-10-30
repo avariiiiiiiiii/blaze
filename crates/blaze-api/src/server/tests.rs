@@ -11,7 +11,7 @@ const AUTHORIZATION: &str = "Bearer s3cret-token";
 
 fn config(unix: bool, http: bool) -> Config {
     Config {
-        unix: unix.then(|| FileName::new("run/blaze.sock").unwrap()),
+        unix: unix.then(|| Unix::Bind(FileName::new("run/blaze.sock").unwrap())),
         http: http.then(|| Http {
             at: "127.0.0.1:7878".parse().unwrap(),
             token: "s3cret-token".to_owned(),
@@ -22,7 +22,7 @@ fn config(unix: bool, http: bool) -> Config {
 }
 
 fn status() -> Status {
-    Status { requests: vec![1, 2], views: 3, memory_bytes: 4, budget_bytes: 5 }
+    Status { pid: 6, requests: vec![1, 2], views: 3, memory_bytes: 4, budget_bytes: 5 }
 }
 
 /// The server and a driver played by hand: what it asked for and has not been told of.
@@ -59,7 +59,7 @@ impl Rig {
 
     fn listen(&self, unix: bool) -> Option<Tag> {
         self.in_flight.iter().find_map(|it| match it {
-            Effect::Listen { at: Address::Unix(_), tag } if unix => Some(*tag),
+            Effect::Listen { at: Address::Unix(_) | Address::Inherited { .. }, tag } if unix => Some(*tag),
             Effect::Listen { at: Address::Tcp(_), tag } if !unix => Some(*tag),
             _ => None,
         })
@@ -416,6 +416,39 @@ fn a_listen_that_fails_is_named_and_not_listened_on_again() {
     assert!(failed.contains("run/blaze.sock") && failed.contains("address in use"), "{failed}");
     assert!(rig.listen(true).is_none());
     assert!(rig.listen(false).is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_passed_socket_is_listened_on_as_inherited_and_kept_open() {
+    use std::os::{fd::OwnedFd, unix::net::UnixListener};
+
+    use crate::activation::{Manager, Passed};
+
+    let dir = std::env::temp_dir().join(format!("blaze-server-passed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("blaze.sock");
+    _ = std::fs::remove_file(&path);
+    let socket = Passed::new(OwnedFd::from(UnixListener::bind(&path).unwrap()), Manager::Launchd);
+    let fd = socket.fd();
+    let at = FileName::new("run/blaze.sock").unwrap();
+    let mut rig = Rig::new(Config { unix: Some(Unix::Passed { socket, at: at.clone() }), ..config(false, false) });
+    assert!(rig.server.failed().is_none());
+    assert!(
+        rig.in_flight.iter().any(|it| matches!(it, Effect::Listen { at: Address::Inherited { fd: of, at: name }, .. } if *of == fd && *name == at)),
+        "{:?}",
+        rig.in_flight
+    );
+    assert!(std::os::unix::net::UnixStream::connect(&path).is_ok(), "the passed socket stays open");
+    let conn = rig.accept(true, 1);
+    assert!(rig.receiving(conn).is_some(), "an accepted connection is read as the Unix side's");
+    let tag = rig.listen(true).unwrap();
+    rig.complete(tag, Done::Failed(IoError("not bound at /run/blaze.sock".to_owned())));
+    let failed = rig.server.failed().unwrap();
+    assert!(failed.contains(&format!("the socket run/blaze.sock passed as fd {fd}")), "{failed}");
+    drop(rig);
+    assert!(std::os::unix::net::UnixStream::connect(&path).is_err(), "closed with the server");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

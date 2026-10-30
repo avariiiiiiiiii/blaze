@@ -1,8 +1,9 @@
 //! A [`Driver`] for macOS: one kqueue the polling thread waits on, for processes, sockets and
 //! the end of work done elsewhere; timers are a [`Wheel`] whose next deadline ends the wait,
 //! with no registration in the kernel. File calls block, so they run on threads of the
-//! driver's own; watches are FSEvents streams on dispatch queues of their own. Both hand their
-//! completions back through a channel and wake the kqueue with an `EVFILT_USER` trigger.
+//! driver's own; watches and journals are FSEvents streams on dispatch queues of their own.
+//! Both hand their completions back through a channel and wake the kqueue with an
+//! `EVFILT_USER` trigger.
 //!
 //! Every registration carries an id of the driver's in `udata`, so an event of a descriptor
 //! closed and reused within one batch is told apart from the new one's and dropped. Changes are
@@ -283,10 +284,8 @@ impl Kqueue {
             | Effect::Stat { .. }
             | Effect::List { .. }
             | Effect::Remove { .. }
-            | Effect::List { .. }
-            | Effect::WriteAt { .. }
-            | Effect::Rename { .. }
-            | Effect::Mode { .. }
+            | Effect::Stamp { .. }
+            | Effect::Entries { .. }
             | Effect::Map { .. }) => {
                 let work = self.work.as_ref().expect("the driver is running");
                 work.send(effect).expect("the IO threads are running");
@@ -306,6 +305,22 @@ impl Kqueue {
                 }
                 Ok(())
             }
+            Effect::Journal { dir, since, tag } => {
+                let notify = self.notify.clone();
+                let send = Box::new(move |completion| _ = notify.send(completion));
+                let stream = fsevents::Stream::journal(&self.root, &dir, since, tag, send)?;
+                if let Some(old) = self.watches.insert(tag, stream) {
+                    old.stop();
+                }
+                Ok(())
+            }
+            // Told through the channel by the stream, after the changes it heard first.
+            Effect::Flush { watch, tag } => match self.watches.get(&watch) {
+                Some(stream) => stream.flush(tag).map_err(|error| {
+                    io::Error::new(error.kind(), format!("flushing the watch: {error}"))
+                }),
+                None => Err(io::Error::other(format!("nothing is watched as {watch:?}"))),
+            },
             Effect::Spawn { command, tag } => self.spawn(command, tag),
             Effect::Listen { at, tag } => self.listen(&at, tag),
             Effect::Connect { at, tag } => self.connect(at, tag),
@@ -889,7 +904,9 @@ impl Driver for Kqueue {
         }
         let ended = out[before..]
             .iter()
-            .filter(|it| !matches!(it.done, Done::Changed { .. } | Done::Accepted { .. }))
+            .filter(|it| {
+                !matches!(it.done, Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. })
+            })
             .count();
         self.in_flight -= ended;
         out.len() - before
@@ -911,6 +928,10 @@ fn work_on(root: &Path, queue: &crossbeam_channel::Receiver<Effect>, notify: &No
         let tag = effect.tag();
         let done = match effect {
             Effect::Map { file, .. } => fs::map(&root.join(file.as_str())).map(Done::Mapped),
+            Effect::Stamp { files, .. } => fs::stamps(root, &files).map(Done::Stamped),
+            Effect::Entries { dir, .. } => {
+                fs::entries(&root.join(dir.as_str()), &dir).map(Done::Entries)
+            }
             effect => crate::threads::run(root, effect),
         };
         let done = done.unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
@@ -1357,6 +1378,148 @@ mod tests {
         assert!(ended, "the watch never ended; heard {heard:?}");
         assert!(!heard.contains(&name("outside")), "{heard:?}");
         run(&mut driver, Vec::new());
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_flush_is_told_after_the_changes_made_before_it() {
+        let root = dir("flush");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        run(&mut driver, vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }]);
+        driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
+        for round in 0..20u64 {
+            let file = format!("src/edit-{round}");
+            std::fs::write(root.join(&file), b"edited").unwrap();
+            let flush = Tag(100 + round);
+            driver.submit(&mut vec![Effect::Flush { watch: Tag(7), tag: flush }]);
+            let mut heard = Vec::new();
+            let mut done = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut flushed = false;
+            while !flushed && Instant::now() < deadline {
+                driver.poll(&mut done, Duration::from_millis(50));
+                for it in done.drain(..) {
+                    match it.done {
+                        Done::Changed { files, .. } => heard.extend(files),
+                        Done::Flushed if it.tag == flush => flushed = true,
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+            assert!(flushed, "round {round}: the flush never came");
+            assert!(heard.contains(&name(&file)), "round {round}: {heard:?}");
+        }
+        let mut effects = vec![Effect::Flush { watch: Tag(8), tag: Tag(9) }, Effect::Unwatch { tag: Tag(7) }];
+        let mut refused = false;
+        run_until_idle(&mut driver, &mut effects, |it, _| match (it.tag.0, it.done) {
+            (9, Done::Failed(_)) => refused = true,
+            (7, Done::Changed { .. } | Done::Unwatched) => {}
+            other => panic!("{other:?}"),
+        });
+        assert!(refused);
+        assert_eq!(driver.in_flight(), 0);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Polls the journal `tag` until `until` says of a batch, or the deadline: every batch.
+    fn journal_until(
+        driver: &mut Kqueue,
+        tag: Tag,
+        mut until: impl FnMut(&crate::Journaled) -> bool,
+    ) -> Vec<crate::Journaled> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut batches, mut done) = (Vec::new(), Vec::new());
+        while Instant::now() < deadline {
+            driver.poll(&mut done, Duration::from_millis(50));
+            for it in done.drain(..) {
+                assert_eq!(it.tag, tag);
+                let Done::Journaled(batch) = it.done else { panic!("{:?}", it.done) };
+                let stop = until(&batch);
+                batches.push(*batch);
+                if stop {
+                    return batches;
+                }
+            }
+        }
+        panic!("never came: {batches:?}")
+    }
+
+    /// Ends the journal `tag`: what it told after the unwatch was asked, before its end.
+    fn unwatch(driver: &mut Kqueue, tag: Tag) {
+        let mut effects = vec![Effect::Unwatch { tag }];
+        run_until_idle(driver, &mut effects, |it, _| match it.done {
+            Done::Journaled(_) | Done::Unwatched => assert_eq!(it.tag, tag),
+            other => panic!("{other:?}"),
+        });
+        assert_eq!(driver.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_journal_resumes_from_its_cursor_through_the_driver() {
+        let root = dir("journal");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        run(&mut driver, vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }]);
+        driver.submit(&mut vec![Effect::Journal {
+            dir: name("src"),
+            since: crate::Cursor::None,
+            tag: Tag(7),
+        }]);
+        let batches = journal_until(&mut driver, Tag(7), |it| it.caught_up);
+        assert!(matches!(batches[0].cursor, crate::Cursor::FsEvents { .. }), "{batches:?}");
+        assert!(!batches[0].caught_up && batches[0].lost.is_empty());
+        // A batch does not end it.
+        assert_eq!(driver.in_flight(), 1);
+        let cursor = batches.last().unwrap().cursor;
+        unwatch(&mut driver, Tag(7));
+        std::fs::write(root.join("src/while-down.rs"), b"fn f() {}").unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        driver.submit(&mut vec![Effect::Journal { dir: name("src"), since: cursor, tag: Tag(8) }]);
+        let batches = journal_until(&mut driver, Tag(8), |it| it.caught_up);
+        let told: Vec<_> = batches.iter().flat_map(|it| &it.files).collect();
+        assert!(told.contains(&&name("src/while-down.rs")), "{batches:?}");
+        assert!(batches.iter().all(|it| it.lost.is_empty()), "{batches:?}");
+        assert_eq!(driver.in_flight(), 1);
+        unwatch(&mut driver, Tag(8));
+        // Of another store: lost, the whole directory.
+        let other = crate::Cursor::FsEvents { event: 1, volume: [7; 16] };
+        driver.submit(&mut vec![Effect::Journal { dir: name("src"), since: other, tag: Tag(9) }]);
+        let batches = journal_until(&mut driver, Tag(9), |_| true);
+        assert_eq!(batches[0].lost, [(name("src"), crate::Lost::Reset)]);
+        unwatch(&mut driver, Tag(9));
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stamps_and_entries_are_the_file_systems() {
+        let root = dir("stamps");
+        let mut driver = Kqueue::new(&root, 2).unwrap();
+        run(&mut driver, vec![
+            Effect::Write { file: name("src/lib.rs"), bytes: b"fn f() {}".to_vec(), tag: Tag(1) },
+            Effect::Write { file: name("src/deep/mod.rs"), bytes: Vec::new(), tag: Tag(2) },
+        ]);
+        std::os::unix::fs::symlink("lib.rs", root.join("src/link")).unwrap();
+        let mut names = crate::Names::default();
+        for it in ["src/lib.rs", "src/deep", "src/link", "src/missing", "src/lib.rs/under"] {
+            assert!(names.push_str(it));
+        }
+        let seen = run(&mut driver, vec![
+            Effect::Stamp { files: names.clone(), tag: Tag(3) },
+            Effect::Entries { dir: name("src"), tag: Tag(4) },
+            Effect::Entries { dir: name("missing"), tag: Tag(5) },
+        ]);
+        let stamps = fs::stamps(&root, &names).unwrap();
+        assert_eq!(seen[&3], Done::Stamped(stamps.clone()));
+        assert!(stamps[0].is_file() && stamps[0].size == 9, "{stamps:?}");
+        assert!(stamps[1].is_dir() && stamps[2].is_link(), "{stamps:?}");
+        assert!(stamps[3].is_gone() && stamps[4].is_gone(), "{stamps:?}");
+        let entries = fs::entries(&root.join("src"), &name("src")).unwrap();
+        assert_eq!(seen[&4], Done::Entries(entries.clone()));
+        let named: Vec<_> = entries.iter().map(|(it, _)| it.as_str()).collect();
+        assert_eq!(named, ["src/deep", "src/lib.rs", "src/link"]);
+        assert!(matches!(seen[&5], Done::Failed(_)));
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }

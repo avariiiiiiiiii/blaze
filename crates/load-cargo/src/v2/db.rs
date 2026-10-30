@@ -19,8 +19,8 @@ use triomphe::Arc;
 /// ([`crate::v2::Lowered::ran`], [`crate::v2::Lowered::macros`]) sets salsa's cancellation
 /// flag, so the query its reader is in (or its next one) unwinds with [`salsa::Cancelled`],
 /// which the worker turns into `Failed::Again`; the write goes on once every handle is
-/// dropped. A worker holds one handle at a time, drops it before it waits on anything, and
-/// never asks for another while it holds one.
+/// dropped. The loop makes a task's handle as it posts the task and is the only writer; a
+/// task drops its handle when it ends or before it waits on anything.
 #[salsa::db]
 pub struct Db {
     storage: salsa::Storage<Db>,

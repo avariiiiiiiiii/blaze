@@ -29,7 +29,10 @@ use crate::{
 };
 
 pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
-    if b.tainted {
+    // Only a written `unsafe` block can be unused: a body without one (most) is decided by a
+    // scan of the store's expression tags, before hir's set of unsafe operations is built.
+    let has_block = || b.store().exprs().any(|(_, it)| matches!(it, Expr::Block { unsafe_: Unsafe::Yes, .. }));
+    if b.tainted || !has_block() {
         return Vec::new();
     }
     let mut visitor = Visitor { b, ops: operations(b), context: Context::Safe, warnings: Vec::new() };
@@ -161,11 +164,7 @@ impl Visitor<'_, '_, '_> {
         for pat in pats {
             self.pat(pat);
         }
-        let mut children = Vec::new();
-        store.walk_child_exprs_without_pats(expr, |it| children.push(it));
-        for child in children {
-            stdx::ensure_sufficient_stack(|| self.expr(child));
-        }
+        store.walk_child_exprs_without_pats(expr, |it| stdx::ensure_sufficient_stack(|| self.expr(it)));
     }
 
     fn pat(&mut self, pat: PatId) {
@@ -184,11 +183,7 @@ impl Visitor<'_, '_, '_> {
                 }
             }
             _ => {
-                let mut children = Vec::new();
-                b.store().walk_pats_shallow(pat, |it| children.push(it));
-                for child in children {
-                    self.pat(child);
-                }
+                b.store().walk_pats_shallow(pat, |it| self.pat(it));
             }
         }
     }

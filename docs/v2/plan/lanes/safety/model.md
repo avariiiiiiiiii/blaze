@@ -12,14 +12,14 @@ seed and the schedule, which replay the failing execution exactly.
 
 ## Where it lives
 
-`crates/blaze-check/` (new; agent `safety-model`), a leaf: its only dependencies are
-`blaze-core` (the simulation driver's seeded `Rng`), `libc` on Unix (coroutine stacks) and
-`windows-sys` on Windows (fibers). It cannot be a module of `blaze-graph`, as first planned:
-blaze-graph will depend on `blaze-reclaim` (its pool enters a task per job), so a
-`blaze-reclaim` → `blaze-graph` dependency, even under a `cfg`, is a cycle cargo refuses
-(resolution is platform-independent). `blaze-ids` and `intern` depend on nothing of ours;
-every crate with lock-free code can depend on a leaf. `blaze-core` must stay below every crate
-with model tests (it has none).
+`crates/blaze-check/` (new; agent `safety-model`), a leaf that depends on no workspace crate:
+only `rustc-hash`, `libc` on Unix (coroutine stacks) and `windows-sys` on Windows (fibers).
+Its seeded generator is a copy of `blaze_core::sim::Rng`'s SplitMix64 (a seed means the same in
+both), not a dependency: `blaze-core` now uses `blaze-ids`, which has model tests, so a
+dependency on it would be a cycle. It cannot be a module of `blaze-graph`, as first planned:
+blaze-graph depends on `blaze-reclaim`, so a `blaze-reclaim` → `blaze-graph` dependency, even
+under a `cfg`, is a cycle cargo refuses (resolution is platform-independent). Every crate with
+lock-free code can depend on a leaf; nothing may be added to `blaze-check`'s dependencies.
 
 ## The switch
 
@@ -89,9 +89,19 @@ The `std` API, path for path, so the switch is a `use`:
   are no schedule points: whether two race depends only on the clocks.
 - `linear::{Spec, History}`: `History::record(op, |op| ..)` runs and records one operation of
   the calling model thread; `History::check(init)` panics (a finding, with the schedule) unless
-  some linearization of the run gives every result on the `Spec`.
+  some linearization of the run gives every result on the `Spec`. In a model an operation must
+  come after another only when the other's return happens before its call (the thread's vector
+  clock at the call against the other thread's clock at the return), not when it merely ran
+  later: under C11 an acquire load run after a store on a thread that never synchronized with it
+  may read the older value, and execution order would report a correct structure. This is the
+  happens-before linearizability of Batty, Dodds and Gotsman ("Library abstraction for C/C++
+  concurrency", POPL 2013). Outside a model it is the order the calls ran in.
 
-Outside a model the shims are std's types: a model build runs its other tests too.
+Outside a model the shims are std's types: a model build runs its other tests too. One model
+runs at a time in a process (`Builder::check` holds a process-wide lock): a shim names its
+object in the running execution by storing the execution's epoch in itself, so two models on
+libtest's threads touching one `static` would rename it under each other. Tests outside a model
+that touch a model's statics (a crate's own threaded tests) are `#[cfg(not(blaze_check))]`.
 
 ## Cells
 
@@ -101,6 +111,21 @@ closure on `get()`), so the tracked accesses in model builds are the same lines 
 ones in normal builds. Values a structure owns through a raw pointer (`Box::into_raw` behind an
 `AtomicPtr`) are checked through the atomics that publish them and the sequential model; a
 structure that wants each field access checked keeps the field in an `UnsafeCell`.
+
+Raw buffers no `UnsafeCell` holds (a segment's chunk filled with `copy_nonoverlapping`, read
+below a published length) call `blaze_check::cell::{read, write, free}(ptr, len)` at each
+access and at the free, with `#[inline(always)]` no-op twins in `sync.rs`. The checker keeps
+their shadows as an interval map exact to the byte (a run per span written or read alike, split
+only where accesses differ), so a reader stopping at an arbitrary published byte never races
+falsely with the writer's next byte, as a per-granule shadow would. A free is checked as a write
+(every reader must be ordered before it: use after reclaim is a race), and leaves the bytes
+freed: a read of them is a use after free, a free a double free, a write a new allocation there
+(the allocator ordered it after the free, out of the model's sight). Model tests of
+reclamation give each value such a canary: the reader reads it, the drop frees it.
+
+Every atomic starts each execution from the value it was made with, so a `static` brings in
+nothing an earlier execution, or code outside any model, stored in it; the closure is model
+thread 0, with `thread_local!` values of its own, dropped when it returns.
 
 ## How it works
 
@@ -154,7 +179,8 @@ structure that wants each field access checked keeps the field in an `UnsafeCell
 | `thread_local!` | `loom::thread_local!` | yes | yes, std syntax incl. `const { }` |
 | cells | `UnsafeCell::with`/`with_mut` | none | same as loom |
 | replay | checkpoint file (feature) | seed and schedule | seed and schedule string |
-| linearizability | none (asserts only) | none | `linear::History` against a sequential `Spec` |
+| linearizability | none (asserts only) | none | `linear::History` against a sequential `Spec`, ordered by happens-before |
+| raw buffers, frees | none | none | `cell::{read, write, free}`: races, use after free, double free, exact to the byte |
 | spurious failures | none | none | none for `compare_exchange_weak` and untimed waits; timed waits and `park_timeout` branch |
 
 What none of them (and this) covers: load buffering (a load reading a store later in execution
@@ -167,8 +193,8 @@ does), where loom, whose `new` isn't `const`, checks a first read racing with it
 
 Each lock-free structure gets a test that runs its operations from 2 or 3 threads under
 `model`, records each operation's call and result, and checks the outcome against a sequential
-model of the structure: some order of the operations that keeps every call-before-return order
-of the run (a linearization) gives the same results on the sequential model. The checker is
+model of the structure: some order of the operations that keeps every return-happens-before-call
+order of the run (a linearization) gives the same results on the sequential model. The checker is
 `blaze_check::linear` (Wing and Gong's search with Lowe's memo of (operations done, state)
 pairs, as porcupine and lincheck keep) so each test is the structure, its sequential model and
 a few calls. safety-model's children (`safety-model-{format,db,store,graph}`) write them: in

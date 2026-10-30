@@ -15,7 +15,11 @@ doctest = false
 
 [dependencies]
 blake3.workspace = true
+blaze-radix.workspace = true
 serde = { workspace = true, features = ["derive"] }
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
 
 [lints]
 workspace = true

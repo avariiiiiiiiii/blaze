@@ -806,7 +806,7 @@ impl Reader<'_, '_, '_> {
             SyntaxKind::STRING => {
                 let string = ast::String::cast(token.clone())?;
                 let symbol = string.text_without_quotes().to_owned();
-                match split_suffix(text).1 {
+                match suffix(text) {
                     Some(suffix) => {
                         self.invalid_suffix(range, "string", suffix);
                         (LitKind::Err, symbol, Some(suffix.to_owned()))
@@ -820,7 +820,7 @@ impl Reader<'_, '_, '_> {
             SyntaxKind::BYTE_STRING => {
                 let string = ast::ByteString::cast(token.clone())?;
                 let symbol = string.text_without_quotes().to_owned();
-                match split_suffix(text).1 {
+                match suffix(text) {
                     Some(suffix) => {
                         self.invalid_suffix(range, "byte string", suffix);
                         (LitKind::Err, symbol, Some(suffix.to_owned()))
@@ -834,7 +834,7 @@ impl Reader<'_, '_, '_> {
             SyntaxKind::C_STRING => {
                 let string = ast::CString::cast(token.clone())?;
                 let symbol = string.text_without_quotes().to_owned();
-                match split_suffix(text).1 {
+                match suffix(text) {
                     Some(suffix) => {
                         self.invalid_suffix(range, "C string", suffix);
                         (LitKind::Err, symbol, Some(suffix.to_owned()))
@@ -847,8 +847,7 @@ impl Reader<'_, '_, '_> {
             }
             SyntaxKind::CHAR => {
                 let char = ast::Char::cast(token.clone())?;
-                let (_, suffix) = split_suffix(text);
-                match suffix {
+                match suffix(text) {
                     Some(suffix) => {
                         self.invalid_suffix(range, "char", suffix);
                         (LitKind::Err, text.to_owned(), Some(suffix.to_owned()))
@@ -861,8 +860,7 @@ impl Reader<'_, '_, '_> {
             }
             SyntaxKind::BYTE => {
                 let byte = ast::Byte::cast(token.clone())?;
-                let (_, suffix) = split_suffix(text);
-                match suffix {
+                match suffix(text) {
                     Some(suffix) => {
                         self.invalid_suffix(range, "byte", suffix);
                         (LitKind::Err, text.to_owned(), Some(suffix.to_owned()))
@@ -1062,11 +1060,15 @@ fn is_reserved_keyword(text: &str, edition: Edition) -> bool {
         || (edition >= Edition::Edition2024 && text == "gen")
 }
 
-/// A string or char literal's text and the suffix written after its closing quote.
-fn split_suffix(text: &str) -> (&str, Option<&str>) {
-    let Some(close) = text.rfind(['"', '\'']) else { return (text, None) };
-    let (body, suffix) = text.split_at(close + 1);
-    (body, (!suffix.is_empty()).then_some(suffix))
+/// The suffix written after a string's or char's closing quote (and a raw string's `#`s).
+pub(super) fn suffix(text: &str) -> Option<&str> {
+    let close = text.rfind(['"', '\''])?;
+    let mut rest = &text[close + 1..];
+    if let Some(raw) = text.trim_start_matches(['b', 'c']).strip_prefix('r') {
+        let hashes = raw.len() - raw.trim_start_matches('#').len();
+        rest = &rest[hashes.min(rest.len())..];
+    }
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// rustc's `fix_base_capitalisation`: `0X1F` written for `0x1F`.
@@ -1096,10 +1098,12 @@ mod tests {
     }
 
     #[test]
-    fn a_suffix_after_the_closing_quote_is_split_off() {
-        assert_eq!(split_suffix("\"a\"suf"), ("\"a\"", Some("suf")));
-        assert_eq!(split_suffix("\"a\""), ("\"a\"", None));
-        assert_eq!(split_suffix("'c'"), ("'c'", None));
+    fn a_suffix_after_a_raw_strings_hashes_is_its_suffix() {
+        assert_eq!(suffix(r#""a"suf"#), Some("suf"));
+        assert_eq!(suffix(r#""a""#), None);
+        assert_eq!(suffix(r##"r#"a"#"##), None);
+        assert_eq!(suffix(r##"br#"a"#x"##), Some("x"));
+        assert_eq!(suffix("'c'"), None);
     }
 
     #[test]

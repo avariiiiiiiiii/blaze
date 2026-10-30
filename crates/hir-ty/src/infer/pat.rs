@@ -33,7 +33,7 @@ use crate::{
         expr::ExprIsRead,
     },
     next_solver::{
-        Const, TraitRef, Ty, TyKind, Tys,
+        Const, IsRigid, TraitRef, Ty, TyKind, Tys,
         infer::{
             InferOk,
             traits::{Obligation, ObligationCause},
@@ -303,7 +303,7 @@ impl<'db> InferenceContext<'db> {
     fn infer_pat(&mut self, pat_id: PatId, expected: Ty<'db>, pat_info: PatInfo) {
         // For patterns containing paths, we need the path's resolution to determine whether to
         // implicitly dereference the scrutinee before matching.
-        let pat = &self.store[pat_id];
+        let pat = self.store.pat(pat_id);
         let opt_path_res = match pat {
             Pat::Path(path) => Some(self.resolve_pat_path(pat_id, path)),
             Pat::Record { path, .. } => Some(self.resolve_record_pat(pat_id, path)),
@@ -400,7 +400,7 @@ impl<'db> InferenceContext<'db> {
             expected
         };
 
-        match self.store[pat] {
+        match self.store.pat(pat) {
             // Peel off a `&` or `&mut`from the scrutinee type. See the examples in
             // `tests/ui/rfcs/rfc-2005-default-binding-mode`.
             _ if let AdjustMode::Peel { kind: peel_kind } = adjust_mode
@@ -467,7 +467,7 @@ impl<'db> InferenceContext<'db> {
             Pat::Bind { id: var_id, subpat } => {
                 self.infer_bind_pat(pat, var_id, subpat, expected, pat_info)
             }
-            Pat::TupleStruct { args: ref subpats, ellipsis: ddpos, .. } => match opt_path_res
+            Pat::TupleStruct { args: subpats, ellipsis: ddpos, .. } => match opt_path_res
                 .unwrap()
             {
                 Ok(ResolvedPat { ty, kind: ResolvedPatKind::TupleStruct { variant } }) => self
@@ -481,7 +481,7 @@ impl<'db> InferenceContext<'db> {
                 }
                 Ok(pr) => panic!("tuple struct pattern resolved to {pr:?}"),
             },
-            Pat::Record { args: ref fields, ellipsis: has_rest_pat, .. } => {
+            Pat::Record { args: fields, ellipsis: has_rest_pat, .. } => {
                 match opt_path_res.unwrap() {
                     Ok(ResolvedPat { ty, kind: ResolvedPatKind::Struct { variant } }) => self
                         .infer_record_pat(
@@ -508,13 +508,13 @@ impl<'db> InferenceContext<'db> {
             //     self.check_expr_has_type_or_error(cond, self.tcx.types.bool, |_| {});
             //     expected
             // }
-            Pat::Or(ref pats) => {
+            Pat::Or(pats) => {
                 for &pat in pats {
                     self.infer_pat(pat, expected, pat_info);
                 }
                 expected
             }
-            Pat::Tuple { args: ref elements, ellipsis: ddpos } => {
+            Pat::Tuple { args: elements, ellipsis: ddpos } => {
                 self.infer_tuple_pat(pat, elements, ddpos, expected, pat_info)
             }
             Pat::Box { inner } => self.infer_box_pat(pat, inner, expected, pat_info),
@@ -527,7 +527,7 @@ impl<'db> InferenceContext<'db> {
                 expected,
                 pat_info,
             ),
-            Pat::Slice { prefix: ref before, slice, suffix: ref after } => {
+            Pat::Slice { prefix: before, slice, suffix: after } => {
                 self.infer_slice_pat(pat, before, slice, after, expected, pat_info)
             }
             Pat::Expr(expr) => self.infer_destructuring_assignment_expr(expr, expected),
@@ -608,7 +608,7 @@ impl<'db> InferenceContext<'db> {
     fn calc_adjust_mode(
         &mut self,
         pat_id: PatId,
-        pat: &Pat,
+        pat: Pat<'_>,
         opt_path_res: Option<Result<ResolvedPat<'db>, ()>>,
     ) -> AdjustMode {
         match pat {
@@ -635,7 +635,7 @@ impl<'db> InferenceContext<'db> {
             // All other literals result in non-reference types.
             // As a result, we allow `if let 0 = &&0 {}` but not `if let "foo" = &&"foo" {}` unless
             // `deref_patterns` is enabled.
-            &Pat::Lit(expr) => {
+            Pat::Lit(expr) => {
                 let lit_ty = self.infer_expr_pat_unadjusted(expr);
                 let lit_ty = self.infcx().resolve_vars_if_possible(lit_ty);
                 // If `deref_patterns` is enabled, allow `if let "foo" = &&"foo" {}`.
@@ -749,7 +749,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     fn infer_lit_pat(&mut self, expr: ExprId, expected: Ty<'db>) -> Ty<'db> {
-        let literal = match &self.store[expr] {
+        let literal = match self.store.expr(expr) {
             Expr::Literal(literal) => literal,
             _ => panic!("expected a literal"),
         };
@@ -965,7 +965,7 @@ impl<'db> InferenceContext<'db> {
         pat: PatId,
         inner: PatId,
     ) -> Result<(), ()> {
-        if let Pat::Bind { .. } = self.store[inner]
+        if let Pat::Bind { .. } = self.store.pat(inner)
             && let Some(pointee_ty) = self.shallow_resolve(expected).builtin_deref(true)
             && let TyKind::Dynamic(..) = pointee_ty.kind()
         {
@@ -1306,7 +1306,7 @@ impl<'db> InferenceContext<'db> {
         let interner = self.interner();
         self.table.register_bound(source_ty, deref_pure, ObligationCause::new(pat));
         // The expected type for the deref pat's inner pattern is `<expected as Deref>::Target`.
-        let target_ty = Ty::new_projection(interner, deref_target.into(), [source_ty]);
+        let target_ty = Ty::new_projection(interner, IsRigid::No, deref_target.into(), [source_ty]);
         self.table.try_structurally_resolve_type(pat.into(), target_ty)
     }
 
@@ -1666,7 +1666,7 @@ impl<'db> InferenceContext<'db> {
     ) -> (Option<Ty<'db>>, Ty<'db>) {
         let len = self.table.try_structurally_resolve_const(pat.into(), len);
 
-        if let Some(len) = len.try_to_target_usize(self.data_layout()) {
+        if let Some(len) = len.try_to_target_usize(self.interner()) {
             // Now we know the length...
             if slice.is_none() {
                 // ...and since there is no variable-length pattern,

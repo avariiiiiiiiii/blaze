@@ -213,7 +213,7 @@ pub fn const_call_error<'db>(
         Some(fn_trait) => {
             fn_trait_condition = [Binder::dummy(TraitRef::identity(interner, fn_trait.into()))
                 .to_host_effect_clause(interner, BoundConstness::Maybe)];
-            EarlyBinder::bind(&fn_trait_condition[..])
+            EarlyBinder::bind_iter(&fn_trait_condition[..])
         }
         None if !fn_is_const(db, callee) => return Some(NonConst::Fn(callee)),
         None => crate::lower::const_conditions(db, callee.into()),
@@ -274,14 +274,14 @@ struct Walk<'a, 'db> {
 
 impl Walk<'_, '_> {
     fn expr(&mut self, expr: ExprId) {
-        match &self.body[expr] {
+        match self.body.expr(expr) {
             Expr::Closure { body, .. } => {
                 if closure_expr_is_const(self.db, self.owner, expr) {
-                    self.expr(*body);
+                    self.expr(body);
                 }
                 return;
             }
-            Expr::Call { callee, .. } => self.call(expr, Some(*callee)),
+            Expr::Call { callee, .. } => self.call(expr, Some(callee)),
             Expr::MethodCall { .. }
             | Expr::BinaryOp { .. }
             | Expr::UnaryOp { .. }
@@ -305,6 +305,7 @@ impl Walk<'_, '_> {
                 }
                 (None, Some(TyKind::FnDef(def, args))) => match def.0 {
                     crate::CallableDefId::FunctionId(func) => {
+                        let args = args.no_bound_vars().unwrap();
                         const_call_error(self.db, self.env, self.constness, func, args)
                     }
                     crate::CallableDefId::StructId(_) | crate::CallableDefId::EnumVariantId(_) => {

@@ -135,14 +135,22 @@ fn comments_in_a_body_keep_its_store() {
 
 /// (b) An edit of `second`'s body lowers that body again and nothing else: every other body's
 /// store is the one kept from before (not lowered again), and every signature's store is equal,
-/// so nothing that reads one runs again.
+/// so nothing that reads one runs again. Nothing here reads a source map, so `Body::relative`
+/// doesn't run at all.
 #[test]
 fn an_edit_in_one_body_lowers_only_that_body() {
     let (mut db, file) = TestDB::with_single_file(CODE);
     let (bodies, signatures) = defs(&db);
     assert_eq!((bodies.len(), signatures.len()), (6, 8), "{bodies:?}\n{signatures:?}");
     let edited = function_named(&db, "second");
-    let before: Vec<Arc<Body>> = bodies.iter().map(|&def| relative_body(&db, def)).collect();
+    // `Body::of` lends its body only until the next edit: keep where it was and its bytes.
+    let before: Vec<(*const Body, Vec<u8>)> = bodies
+        .iter()
+        .map(|&def| {
+            let body = Body::of(&db, def);
+            (std::ptr::from_ref(body), blaze_format::to_bytes(body))
+        })
+        .collect();
     for &def in &bodies {
         ExprScopes::body_expr_scopes(&db, def);
     }
@@ -158,19 +166,20 @@ fn an_edit_in_one_body_lowers_only_that_body() {
             signature_store_bytes(&db, def);
         }
     });
-    for query in ["Body::relative_", "Body::of_", "ExprScopes::body_expr_scopes_"] {
+    for query in ["Body::of_", "ExprScopes::body_expr_scopes_"] {
         assert_eq!(count(&log, query), 1, "`{query}` ran for more than the edited body: {log:#?}");
     }
+    assert_eq!(count(&log, "Body::relative_"), 0, "a source map was lowered: {log:#?}");
     assert_eq!(count(&log, "signature_store_bytes"), 0, "a signature's store changed: {log:#?}");
 
-    for (&def, before) in bodies.iter().zip(&before) {
+    for (&def, (at, bytes)) in bodies.iter().zip(&before) {
         let after = Body::of(&db, def);
         if def == edited {
-            assert_ne!(**before, *after, "the edit changed nothing of `second`");
+            assert_ne!(*bytes, blaze_format::to_bytes(after), "the edit changed nothing of `second`");
             continue;
         }
-        assert_eq!(**before, *after, "{def:?}");
-        assert!(std::ptr::eq(&**before, after), "{def:?} was lowered again");
+        assert_eq!(*bytes, blaze_format::to_bytes(after), "{def:?}");
+        assert!(std::ptr::eq(*at, after), "{def:?} was lowered again");
     }
     for (&def, before) in signatures.iter().zip(&signatures_before) {
         assert_eq!(*before, signature_store_bytes(&db, def), "{def:?}");

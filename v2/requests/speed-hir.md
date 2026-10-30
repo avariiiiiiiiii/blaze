@@ -457,3 +457,154 @@ The callers that read store or item-tree buffers from the store or the remote ca
 callers' switch to `read_verified` is lane store's).
 
 > applied: by speed-hir-store-core, as its status says.
+
+## frontend: source maps built only when read (docs/v2/plan/design/frontend.md item 7; to speed-hir-store-srcmap)
+
+What: lowering a body builds no source map unless something reads it. Today `Body::of`
+(`crates/hir-def/src/expr_store/body.rs:198`) reads `Body::relative` (`:161`), which calls
+`lower_body(.., maps)` and always fills a `BodySourceMap`; the signature queries do the same
+through `with_source_map` (`crates/hir-def/src/signatures.rs`, lane db). Asked:
+- `lower_body` takes whether to record the map (the builder's `BackPushes` stay empty when not);
+  `Body::of` lowers without it; `Body::with_source_map` / `unmoved_source_map` lower the body
+  again with the map when first asked (or `relative` keeps both and `of` reads a map-free
+  lowering). The two lowerings must give the same `Body`: assert it under `check_relative()` and
+  in a test over every body fixture.
+- The same for signatures (`*Signature::of` not going through `with_source_map`): request to
+  lane db in `v2/requests/db.md` (frontend wrote it).
+- Consumers that read maps on the build's path: `hir-ty-mir/src/mir/lower.rs:4471`,
+  `mir/location.rs:45,71,342`, `mir/type_name.rs:914`, `mir/eval.rs:670`, `const_check.rs:100`
+  (lane codegen). These turn HIR ids into positions for `Location`, panics and debug info; per
+  `docs/v2/plan/lanes/items.md` 6.1 positions are side-table references resolved at link time,
+  so MIR keeps the `ExprId`/`PatId` and the position is looked up from the map only when debug
+  info, a panic location or a diagnostic is emitted. frontend sends that part to codegen.
+Why: a dependency's bodies (most of what a build lowers) never emit a diagnostic, so building
+their maps is IDE work (frontend.md 7). Same bodies, fewer allocations, and the map is a side
+table read only on demand.
+
+> applied (bodies): by speed-hir-store-srcmap, not compiled. `ExpressionStoreBuilder` has a
+> `record` flag (`skip_source_map()`); without it every source-map write in `lower.rs` is
+> skipped and `finish` freezes and sorts nothing, giving `ExpressionStoreSourceMap::default()`.
+> Lowering reads a map only to fill it (`pat_map_back.get` for a desugared parameter), so the
+> store is the same. `lower_body(.., maps, lowering: BodyLowering)`: `BodyLowering::Body` (what
+> `Body::of` lowers: no map, makes the blocks) or `BodyLowering::SourceMap { blocks }`. A
+> `BlockId` is a tracked struct of the query that makes it, so a second lowering in another
+> query would make other ids; the map's lowering instead takes `Body::of`'s `block_scopes` in
+> the order it makes blocks (asserting each `ast_id`, and that none is left over).
+> `Body::of` no longer reads `Body::relative`; `relative` (and `with_source_map` for a body a
+> macro writes) reads `Body::of`, lowers again with the map and its blocks, and always asserts
+> the body equal to `Body::of`'s, so every fixture `tests/body.rs` lowers through `relative`
+> checks it. The body `relative` keeps is its own allocation, equal to `Body::of`'s: an IDE
+> body read with its map is held twice. Filed below: the four writes in `lower/format_args.rs`
+> and `lower/asm.rs` (applied by speed-hir-store-lower), `tests/invalidation.rs` (b) and the
+> `hir-ide` incremental snapshots (open). Until
+> codegen's part lands, a body whose map MIR or codegen reads (`Body::relative` in
+> `hir-ty-mir/src/mir/lower.rs:4467`, `hir-ty-codegen/places.rs:160,228`, `unmoved_source_map`)
+> is lowered twice, once per query.
+
+## speed-hir-store-srcmap: format_args and asm skip the source map too (to speed-hir-store-lower)
+
+What: `crates/hir-def/src/expr_store/lower/format_args.rs` (the `template_map` pushes at :73 and
+:106, the `expr_map_back.insert` at :572) and `lower/asm.rs:356` (`template_map`) each go under
+`if self.store.record { .. }`, as every write in `lower.rs` now does. Without it `finish` drops
+what they pushed, so the store and map are right either way.
+Why: a body with a `format_args!` lowered by `Body::of` (no map) still allocates the
+`PendingTemplate` box and its vectors, only to drop them.
+
+> forwarded to speed-hir-store-lower (a note between the two lanes).
+
+> applied: by speed-hir-store-lower, not compiled. The four writes are under `record` (read once
+> into a local per macro). Without it the `mappings` vectors stay empty too: `format_args!`'s
+> capture spans aren't pushed, and `asm!` doesn't grow one vector per template piece.
+> forwarded to speed-hir-store-lower (addressed to it; told by tmux).
+
+## speed-hir-store-srcmap: invalidation (b) after `Body::of` stops reading `relative` (to speed-hir-store-readers)
+
+What: in `crates/hir-def/src/expr_store/tests/invalidation.rs`,
+`an_edit_in_one_body_lowers_only_that_body` takes `before` from `relative_body` and expects
+`Body::relative_` to run once. `Body::of` now lowers without the map and reads no
+`Body::relative`, so: take `before` from `Body::of` (keep `*const Body` and a byte copy, as the
+`&Body` can't live across `set_file_text`), and expect `Body::relative_` to run zero times (nothing
+in the loop reads a map), `Body::of_` and `ExprScopes::body_expr_scopes_` once. (a) and (c) need
+no change.
+Why: otherwise (b) fails on the count and on `ptr::eq` (the `relative` body is another
+allocation now).
+
+> forwarded to format: speed-hir-store-readers is DONE, and `hir-def/src/expr_store/` is format's.
+> forwarded to speed-hir-store: speed-hir-store-readers has no window; its parent told by tmux.
+
+Status: done by speed-hir-store, as written. `before` is a `(*const Body, Vec<u8>)` from `Body::of`, and the post-edit checks compare bytes and `ptr::eq`. `Body::of_` and `ExprScopes::body_expr_scopes_` run once, and `Body::relative_` zero times. (a) and (c) still read `Body::relative` directly and are unchanged.
+
+## speed-hir-store-srcmap: incremental snapshots lose `Body::relative_` (to coordinator)
+
+What: the `expect!` logs in `crates/hir-ide/src/tests/incremental.rs` (lines 46, 93, 141, 158,
+172, 219, 224) list `Body::relative_` next to `Body::of_`; it now runs only where something reads
+a source map. Regenerate them (`UPDATE_EXPECT=1`) once the tree builds, and check that each
+`Body::relative_` that goes away is one where only `Body::of` was read.
+Why: `Body::of` no longer reads `Body::relative`.
+
+> forwarded to speed-hir-store-srcmap (and db for `signatures.rs`).
+> applied (`requests`): put on the first-compile list in `/tmp/blaze-lanes/v2-requests.md`: regenerate `hir-ide/src/tests/incremental.rs` with `UPDATE_EXPECT=1` and check each `Body::relative_` that goes is a body where only `Body::of` was read. Nothing can be checked by hand before a build.
+
+## for speed-hir-store (from speed-hir-defs-sigs): signature lowering with relative maps
+
+speed-hir's job for `signatures.rs`: signatures are lowered from the item alone, as bodies are
+(`SignatureSyntax` in `signatures.rs`, a per-item tree with the body left out, its own
+`RealSpanMap` and `AstIdMap`), so a body edit or an edit of another item runs no signature
+lowering. Today each `lower_*` makes `ExprCollector::new`, whose `Expander::new` reads the
+whole file's span and ast id maps, so every signature depends on every edit of its file. What
+`signatures.rs` needs, all in `crates/hir-def/src/expr_store/lower.rs` unless said:
+
+1. `fn with_maps` (`impl ExprCollector`, ~L726) becomes `pub(crate) fn with_maps`: `VariantFields`
+   lowers its fields with it.
+2. `lower_type_ref`, `lower_impl`, `lower_trait`, `lower_type_alias`, `lower_function` each take one
+   more, last argument `maps: Option<(&RealSpanMap, &AstIdMap)>` and make their collector with
+   `ExprCollector::with_maps(db, module, file_id, LoweringMode::Analysis, maps)` in place of
+   `ExprCollector::new(db, module, file_id, LoweringMode::Analysis)` (in `lower_impl`,
+   `lower_trait`: `module`; in `lower_type_alias`: `container.module(db)`). Their only callers are
+   in `signatures.rs` (`rg 'lower_(type_ref|impl|trait|type_alias|function)\(' crates`), which
+   passes them already.
+3. Beside `lower_generic_params` (pub, also called by `hir/src/source_analyzer.rs:380`, so its
+   signature stays):
+
+   ```rust
+   pub(crate) fn lower_generic_params_within(
+       db: &dyn SourceDatabase,
+       module: ModuleId,
+       def: GenericDefId,
+       file_id: HirFileId,
+       param_list: Option<ast::GenericParamList>,
+       where_clause: Option<ast::WhereClause>,
+       mode: LoweringMode,
+       maps: Option<(&RealSpanMap, &AstIdMap)>,
+   ) -> (ExpressionStore, GenericParams, ExpressionStoreSourceMap) {
+       let mut expr_collector = ExprCollector::with_maps(db, module, file_id, mode, maps);
+       let mut collector = generics::GenericParamsCollector::new(def);
+       collector.lower(&mut expr_collector, param_list, where_clause);
+       let params = collector.finish();
+       let (store, source_map) = expr_collector.store.finish();
+       (store, params, source_map)
+   }
+   ```
+
+   and `lower_generic_params` becomes a call of it with `maps` `None`.
+4. `crates/hir-def/src/expr_store.rs` ~L45: `Move` is imported privately
+   (`use self::source_map::{.., Move, ..}`); add `pub(crate) use self::source_map::Move;` (or make
+   that import `pub(crate)`), so `signatures.rs` moves a signature's relative source map to the
+   file with `ExpressionStoreSourceMap::moved(&Move { file, to })`, as `Body::with_source_map` does.
+
+Nothing changes for a caller passing `None`: the same collector as `ExprCollector::new`. With
+`Some`, the collector is the one `lower_body` already makes for bodies (`Expander::within`).
+`crates/span`'s side (`AstIdMap::relative_without`, a relative map with the body left out) is
+requested from frontend-text in `v2/requests/frontend-text.md`.
+Status: done by speed-hir-store (2026-10-29 19:20), items 1-4 as written, not compiled.
+- `with_maps` is `pub(crate)`.
+- The five `lower_*` take a last `maps: Option<(&RealSpanMap, &AstIdMap)>`.
+- `lower_generic_params_within` is added, and `lower_generic_params` calls it with `None`.
+- `Move` is `pub(crate) use self::source_map::Move;`. It was taken out of the private
+  `use self::source_map::{..}` list, because importing it twice is E0252.
+- `signatures.rs` doesn't pass `maps` yet: `lower_type_ref` is called at ~L444 and ~L516 with 3
+  arguments, `lower_impl` ~L574, `lower_trait` ~L666, `lower_function` ~L776 and
+  `lower_type_alias` ~L910 with 4. Each needs the new last argument, `None` until
+  `SignatureSyntax` exists. That is speed-hir-defs-sigs' file.
+
+> forwarded to speed-hir-store.

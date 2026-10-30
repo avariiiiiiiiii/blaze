@@ -129,6 +129,13 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
         self.value[root as usize]
     }
 
+    /// The root of `key`'s set and the set's value, from one walk.
+    #[inline(always)]
+    pub(crate) fn inlined_probe_key_value(&mut self, key: K) -> (K, V) {
+        let root = self.root(key.index());
+        (K::from_index(root), self.value[root as usize])
+    }
+
     /// The value of `key` if it is a root, without following or changing any parent.
     #[inline]
     pub(crate) fn try_probe_value(&self, key: K) -> Option<&V> {
@@ -388,6 +395,11 @@ mod tests {
             let root = model.find(at);
             assert_eq!(table.find(Key(at)), Key(root), "root of {at}");
             assert_eq!(table.probe_value(Key(at)), model.value[root as usize], "value of {at}");
+            assert_eq!(
+                table.inlined_probe_key_value(Key(at)),
+                (Key(root), model.value[root as usize]),
+                "root and value of {at}"
+            );
             let is_root = root == at;
             assert_eq!(table.try_probe_value(Key(at)).is_some(), is_root, "{at} is a root");
         }

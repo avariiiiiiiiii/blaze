@@ -22,8 +22,8 @@ use hir_def::{
     item_tree::FieldsShape,
     lang_item::LangItems,
     signatures::{
-        ConstSignature, EnumSignature, FunctionSignature, StaticSignature, StructSignature,
-        TraitSignature, TypeAliasSignature, UnionSignature, VariantFields,
+        ConstSignature, EnumSignature, FunctionSignature, StructSignature, TraitSignature,
+        TypeAliasSignature, UnionSignature, VariantFields,
     },
     type_ref::{
         ConstRef, LifetimeRef, LifetimeRefId, TraitBoundModifier, TypeBound, TypeRef, TypeRefId,
@@ -42,7 +42,7 @@ use rustc_apfloat::{
 use rustc_ast_ir::FloatTy;
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
-    AliasTyKind, BoundVarIndexKind, CoroutineArgsParts, RegionKind, Upcast,
+    AliasTyKind, BoundVarIndexKind, CoroutineArgsParts, IsRigid, RegionKind, Upcast,
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _, Tys as _},
 };
 use smallvec::SmallVec;
@@ -51,15 +51,15 @@ use stdx::never;
 
 use crate::{
     FieldTypes, GenericPredicates, ImplTraitId, MemoryMap, ParamEnvAndCrate, consteval,
-    db::{GeneralConstId, HirDatabase},
+    db::HirDatabase,
     generics::{ProvenanceSplit, generics},
     layout::Layout,
     mir::{IsSigned, pad16},
     next_solver::{
-        AliasTy, Allocation, Clause, ClauseKind, Const, ConstKind, DbInterner,
-        ExistentialPredicate, FnSig, GenericArg, GenericArgKind, GenericArgs, ParamEnv, PolyFnSig,
-        Region, Term, TermId, TermKind, TraitPredicate, TraitRef, Ty, TyKind, TypingMode,
-        Unnormalized, ValTree,
+        AliasConstKind, AliasTy, Allocation, Clause, ClauseKind, Const, ConstKind, DbInterner,
+        ExistentialPredicate, FnSig, FreeConstAliasId, GenericArg, GenericArgKind, GenericArgs,
+        InherentAssocConstId, ParamEnv, PolyFnSig, Region, Term, TermId, TermKind, TraitAssocConstId,
+        TraitClause, TraitRef, Ty, TyKind, TypingMode, Unnormalized, ValTree,
         abi::Safety,
         infer::{DbInternerInferExt, traits::ObligationCause},
     },
@@ -674,6 +674,7 @@ impl<'db, T: HirDisplay<'db> + Internable> HirDisplay<'db> for Interned<T> {
 
 fn write_projection<'db>(
     f: &mut HirFormatter<'_, 'db>,
+    is_rigid: IsRigid,
     alias: &AliasTy<'db>,
     needs_parens_if_multi: bool,
     def_id: TypeAliasId,
@@ -702,7 +703,7 @@ fn write_projection<'db>(
                         ClauseKind::TypeOutlives(t) => t.0,
                         _ => return false,
                     };
-                    let TyKind::Alias(a) = ty.kind() else {
+                    let TyKind::Alias(_, a) = ty.kind() else {
                         return false;
                     };
                     a == *alias
@@ -712,7 +713,7 @@ fn write_projection<'db>(
                 return write_bounds_like_dyn_trait_with_prefix(
                     f,
                     "impl",
-                    Either::Left(Ty::new_alias(f.interner, *alias)),
+                    Either::Left(Ty::new_alias(f.interner, is_rigid, *alias)),
                     &bounds,
                     SizedByDefault::NotSized,
                     needs_parens_if_multi,
@@ -766,10 +767,12 @@ impl<'db> HirDisplay<'db> for Const<'db> {
                 Ok(())
             }
             ConstKind::Value(value) => render_const_scalar_from_valtree(f, value.ty, value.value),
-            ConstKind::Unevaluated(unev) => {
-                let c = unev.def.0;
-                let generic_def = match c {
-                    GeneralConstId::ConstId(id) => {
+            ConstKind::Alias(_, unev) => {
+                let generic_def = match unev.kind {
+                    AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
+                    | AliasConstKind::InherentSelf { def_id: InherentAssocConstId(id) }
+                    | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
+                    | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => {
                         match &ConstSignature::of(f.db, id).name {
                             Some(name) => {
                                 f.start_location_link(id.into());
@@ -780,14 +783,7 @@ impl<'db> HirDisplay<'db> for Const<'db> {
                         }
                         Some(id.into())
                     }
-                    GeneralConstId::StaticId(id) => {
-                        let name = &StaticSignature::of(f.db, id).name;
-                        f.start_location_link(id.into());
-                        write!(f, "{}", name.display(f.db, f.edition()))?;
-                        f.end_location_link();
-                        Some(id.into())
-                    }
-                    GeneralConstId::AnonConstId(_) => {
+                    AliasConstKind::Anon { .. } => {
                         f.write_str(if f.display_kind.is_source_code() { "_" } else { "{const}" })?;
                         None
                     }
@@ -1350,6 +1346,7 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
             }
             TyKind::FnDef(def, args) => {
                 let def = def.0;
+                let args = args.no_bound_vars().unwrap();
                 let sig =
                     db.callable_item_signature(def).instantiate(interner, args).skip_norm_wip();
 
@@ -1491,16 +1488,17 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
 
                 hir_fmt_generics(f, parameters.as_slice(), Some(def.def_id().into()), None)?;
             }
-            TyKind::Alias(alias_ty @ AliasTy { kind: AliasTyKind::Projection { def_id }, .. }) => {
-                write_projection(f, &alias_ty, trait_bounds_need_parens, def_id.0)?
-            }
+            TyKind::Alias(
+                is_rigid,
+                alias_ty @ AliasTy { kind: AliasTyKind::Projection { def_id }, .. },
+            ) => write_projection(f, is_rigid, &alias_ty, trait_bounds_need_parens, def_id.0)?,
             TyKind::Foreign(alias) => {
                 let type_alias = TypeAliasSignature::of(db, alias.0);
                 f.start_location_link(alias.0.into());
                 write!(f, "{}", type_alias.name.display(f.db, f.edition()))?;
                 f.end_location_link();
             }
-            TyKind::Alias(alias_ty @ AliasTy { kind: AliasTyKind::Opaque { def_id }, .. }) => {
+            TyKind::Alias(_, alias_ty @ AliasTy { kind: AliasTyKind::Opaque { def_id }, .. }) => {
                 let opaque_ty_id = def_id.0;
                 if !f.display_kind.allows_opaque() {
                     return Err(HirDisplayError::DisplaySourceCodeError(
@@ -1730,7 +1728,7 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
 
                 if f.render_region(region) {
                     bounds_to_display
-                        .push(rustc_type_ir::OutlivesPredicate(self_ty, region).upcast(interner));
+                        .push(rustc_type_ir::OutlivesClause(self_ty, region).upcast(interner));
                 }
 
                 write_bounds_like_dyn_trait_with_prefix(
@@ -2299,13 +2297,13 @@ impl<'db> HirDisplay<'db> for TraitRef<'db> {
     }
 }
 
-impl<'db> HirDisplay<'db> for TraitPredicate<'db> {
+impl<'db> HirDisplay<'db> for TraitClause<'db> {
     fn hir_fmt(&self, f: &mut HirFormatter<'_, 'db>) -> Result {
         self.self_ty().hir_fmt(f)?;
         f.write_str(": ")?;
         match self.polarity {
-            rustc_type_ir::PredicatePolarity::Positive => {}
-            rustc_type_ir::PredicatePolarity::Negative => f.write_char('!')?,
+            rustc_type_ir::ClausePolarity::Positive => {}
+            rustc_type_ir::ClausePolarity::Negative => f.write_char('!')?,
         }
         let trait_ = self.def_id().0;
         f.start_location_link(trait_.into());

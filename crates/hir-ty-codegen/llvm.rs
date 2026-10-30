@@ -1008,7 +1008,8 @@ impl Kept {
                 i32::from(slp),
             )
         };
-        Kept::taken(failed)
+        // SAFETY: `failed` is what LLVMBlazeRunPasses just returned, taken nowhere else.
+        unsafe { Kept::taken(failed) }
     }
 
     /// Instruments `module` for `wanted`: SanitizerCoverage, then MemorySanitizer,
@@ -1024,17 +1025,22 @@ impl Kept {
         // `#[repr(C)]` struct of the wrapper's layout, read during the call only.
         let failed =
             unsafe { LLVMBlazeRunSanitizers(self.0.as_ptr(), module.as_mut_ptr(), wanted) };
-        Kept::taken(failed)
+        // SAFETY: `failed` is what LLVMBlazeRunSanitizers just returned, taken nowhere else.
+        unsafe { Kept::taken(failed) }
     }
 
     /// The error a `LLVMBlaze*` call returned, null for none, as an `Unhandled`.
-    fn taken(failed: inkwell::llvm_sys::error::LLVMErrorRef) -> Result<(), Unhandled> {
+    ///
+    /// # Safety
+    ///
+    /// `failed` is null or an error LLVM returned that nothing else owns or takes.
+    unsafe fn taken(failed: inkwell::llvm_sys::error::LLVMErrorRef) -> Result<(), Unhandled> {
         use inkwell::llvm_sys::error::{LLVMDisposeErrorMessage, LLVMGetErrorMessage};
         if failed.is_null() {
             return Ok(());
         }
-        // SAFETY: `failed` is a non-null error a wrapper just returned, owned here and taken
-        // once; LLVMGetErrorMessage consumes it and returns a message this code owns.
+        // SAFETY: `failed` is a non-null error owned here and taken once (the caller's
+        // contract); LLVMGetErrorMessage consumes it and returns a message this code owns.
         let raw = unsafe { LLVMGetErrorMessage(failed) };
         // SAFETY: `raw` is NUL-terminated and live until disposed of below.
         let message = unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned();

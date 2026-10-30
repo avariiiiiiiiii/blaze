@@ -211,7 +211,9 @@ mod tests {
             ];
             let rebase = [base + 6, base + 48, base + 401, base + 731, base + 811, base + 1403];
             let writes = Writes::new(&message, &spans, &rebase, 0x1234_5678_9abc);
-            for range in [base..base + 1500, base + 7..base + 803, base + 50..base + 51, base..base + 3] {
+            for range in
+                [base..base + 1500, base + 7..base + 803, base + 50..base + 51, base..base + 3]
+            {
                 let len = (range.end - range.start) as usize;
                 let mut plain = vec![0xeeu8; len];
                 writes.fill(&range, &mut plain);

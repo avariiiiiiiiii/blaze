@@ -29,7 +29,7 @@ use syntax::{
 use super::{expr_span, from_expansion};
 use crate::{
     lints::bodies::{
-        BodyCx, LatePass,
+        BodyCx, Hooks, LatePass,
         types::util::{Solver, method_fn, path_value},
     },
     lower::{Found, Phase},
@@ -46,6 +46,10 @@ pub(super) struct StaticMutRefs;
 impl LatePass for StaticMutRefs {
     fn name(&self) -> &'static str {
         "StaticMutRefs"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR | Hooks::STMT
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

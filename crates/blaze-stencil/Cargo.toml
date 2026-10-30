@@ -25,6 +25,8 @@ smallvec.workspace = true
 # "Why a build script"): the generator in `gen/` drives it through its C API.
 llvm-sys.workspace = true
 object.workspace = true
+# The library's id: the BLAKE3 hash of its bytes, which stencil units' settings carry.
+blake3.workspace = true
 
 [dev-dependencies]
 cranelift-codegen = { workspace = true, features = ["x86", "arm64"] }

@@ -69,3 +69,108 @@ fn what_the_whole_package_leaves_out() {
     assert!(!skipped(Path::new("."), true), "the package itself");
     assert!(!skipped(Path::new(".git"), false), "watched: more than cargo is only slower");
 }
+
+/// Each value kept once, the first time, as a scan of what is kept has it: past [`SCAN`]
+/// values by hash, with hashes made to collide by a list of the same few values in many
+/// spellings that compare equal as paths.
+#[test]
+fn kept_once_by_hash_as_by_scan() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    for _ in 0..2_000 {
+        let len = next(3 * SCAN as u64) as usize;
+        let names: Vec<String> = (0..len).map(|_| format!("V{}", next(len as u64 / 2 + 1))).collect();
+        let paths: Vec<String> = (0..len)
+            .map(|_| match next(4) {
+                0 => format!("src/{}.rs", next(8)),
+                1 => format!("./src/{}.rs", next(8)),
+                2 => format!("src//{}.rs", next(8)),
+                _ => format!("/abs/{}", next(8)),
+            })
+            .collect();
+        let watched = watched_of(&paths, &names, Path::new("/p/foo"));
+        let (mut want_paths, mut want_env) = (Vec::<PathBuf>::new(), Vec::<String>::new());
+        for path in &paths {
+            let whole = Path::new("/p/foo").join(path);
+            if !want_paths.contains(&whole) {
+                want_paths.push(whole);
+            }
+        }
+        for name in &names {
+            if !want_env.contains(name) {
+                want_env.push(name.clone());
+            }
+        }
+        if len == 0 {
+            assert!(watched.whole_package);
+            continue;
+        }
+        assert_eq!(watched.paths, want_paths, "{paths:?}");
+        assert_eq!(watched.env, want_env, "{names:?}");
+    }
+}
+
+/// What a run's output makes cargo watch, read in the pass that keeps only the `rerun-if-*`
+/// values, as made from the whole [`Output`]: the same, or the same error.
+#[test]
+fn watched_in_the_output_as_from_the_parsed_output() {
+    let package = crate::unit::Package {
+        name: "foo".into(),
+        version: "0.0.1".into(),
+        descr: Some("foo v0.0.1 (/p/foo)".into()),
+        ..crate::unit::Package::default()
+    };
+    let cx = output::Context {
+        package: &package,
+        out_dir_when_generated: Path::new("/old/out"),
+        out_dir: Path::new("/new/out"),
+        nightly_features_allowed: false,
+        rustc_bootstrap: None,
+    };
+    let lines = [
+        "cargo:rerun-if-changed=build.rs",
+        "cargo::rerun-if-changed=src/a.rs",
+        "cargo:rerun-if-changed=/old/out/gen.rs",
+        "cargo:rerun-if-env-changed=CC",
+        "cargo::rerun-if-env-changed=CFLAGS",
+        "cargo:rustc-cfg=x",
+        "cargo::warning=w",
+        "cargo::error=e",
+        "cargo::unknown=v",
+        "cargo:k=v",
+        "not a directive",
+        "  cargo:rerun-if-changed=  spaced  ",
+        "cargo::rerun-if-changed",
+    ];
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let mut ok = 0;
+    for _ in 0..5_000 {
+        let mut stdout = String::new();
+        for _ in 0..next(40) {
+            stdout.push_str(lines[next(lines.len())]);
+            stdout.push('\n');
+        }
+        let made = output::parse(stdout.as_bytes(), &cx).map(|it| watched(&it, Path::new("/p/foo")));
+        let read = watched_in(stdout.as_bytes(), &cx, Path::new("/p/foo"));
+        match (read, made) {
+            (Ok(read), Ok(made)) => {
+                assert_eq!(read, made, "{stdout:?}");
+                ok += 1;
+            }
+            (Err(read), Err(made)) => assert_eq!(read.0, made.0, "{stdout:?}"),
+            (read, made) => panic!("{stdout:?}: {read:?} against {made:?}"),
+        }
+    }
+    assert!(ok > 100, "{ok} read");
+}

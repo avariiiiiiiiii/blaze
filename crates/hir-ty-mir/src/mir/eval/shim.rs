@@ -21,6 +21,7 @@ use crate::{
         IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
         MirEvalError, MirSpan, Mutability, Origin, Result, Ty, TyKind, TypeIdOf, VTableOfBytes,
         VariantId, from_bytes, not_supported, pad16, try_const_usize,
+        machine::{Machine, Shadow},
     },
     mir::location::{source_location_in_file, source_path, track_caller},
     next_solver::Region,
@@ -37,7 +38,7 @@ enum EvalLangItem {
     DropInPlace,
 }
 
-impl<'db> Evaluator<'db> {
+impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     pub(super) fn detect_and_exec_special_function(
         &mut self,
         def: FunctionId,
@@ -258,10 +259,11 @@ impl<'db> Evaluator<'db> {
                         "rustc_allocator args are not provided".into(),
                     ));
                 };
-                let size = from_bytes!(usize, size.get(self)?);
-                let align = from_bytes!(usize, align.get(self)?);
-                let result = self.allocate(size, align, Origin::Allocator)?;
-                destination.write_from_bytes(self, &result.to_bytes())?;
+                let size = from_bytes!(usize, self.read_scalar(size.interval)?);
+                let align = from_bytes!(usize, self.read_scalar(align.interval)?);
+                let zeroed = alloc_fn.contains(AttrFlags::RUSTC_ALLOCATOR_ZEROED);
+                let result = self.allocate(size, align, Origin::Allocator, zeroed)?;
+                self.write_pointer(destination.addr, result)?;
             }
             _ if alloc_fn.contains(AttrFlags::RUSTC_DEALLOCATOR) => {
                 let [ptr, ..] = args else {
@@ -269,7 +271,7 @@ impl<'db> Evaluator<'db> {
                         "rustc_deallocator args are not provided".into(),
                     ));
                 };
-                let ptr = Address::from_bytes(ptr.get(self)?)?;
+                let ptr = self.read_pointer(ptr.interval.addr)?;
                 self.deallocate(ptr, Origin::Allocator, "__rust_dealloc")?;
             }
             _ if alloc_fn.contains(AttrFlags::RUSTC_REALLOCATOR) => {
@@ -278,10 +280,10 @@ impl<'db> Evaluator<'db> {
                         "rustc_allocator args are not provided".into(),
                     ));
                 };
-                let new_size = from_bytes!(usize, new_size.get(self)?);
-                let ptr = Address::from_bytes(ptr.get(self)?)?;
+                let new_size = from_bytes!(usize, self.read_scalar(new_size.interval)?);
+                let ptr = self.read_pointer(ptr.interval.addr)?;
                 let result = self.reallocate(ptr, new_size)?;
-                destination.write_from_bytes(self, &result.to_bytes())?;
+                self.write_pointer(destination.addr, result)?;
             }
             _ => not_supported!("unknown alloc function"),
         }
@@ -1379,11 +1381,11 @@ impl<'db> Evaluator<'db> {
                         "const_allocate args are not provided".into(),
                     ));
                 };
-                let size = from_bytes!(usize, size.get(self)?);
-                let align = from_bytes!(usize, align.get(self)?);
+                let size = from_bytes!(usize, self.read_scalar(size.interval)?);
+                let align = from_bytes!(usize, self.read_scalar(align.interval)?);
                 let origin = Origin::ConstHeap { global: false };
-                let result = self.allocate(size, align, origin)?;
-                destination.write_from_bytes(self, &result.to_bytes())
+                let result = self.allocate(size, align, origin, false)?;
+                self.write_pointer(destination.addr, result)
             }
             Intrinsic::ConstDeallocate => {
                 let [ptr, ..] = args else {
@@ -1391,7 +1393,7 @@ impl<'db> Evaluator<'db> {
                         "const_deallocate args are not provided".into(),
                     ));
                 };
-                let ptr = Address::from_bytes(ptr.get(self)?)?;
+                let ptr = self.read_pointer(ptr.interval.addr)?;
                 let origin = Origin::ConstHeap { global: false };
                 self.deallocate(ptr, origin, "const_deallocate")
             }
@@ -1414,9 +1416,9 @@ impl<'db> Evaluator<'db> {
                 let Some((size, align)) = self.size_align_of(ty, locals)? else {
                     not_supported!("unsized box initialization");
                 };
-                let addr = self.allocate(size, align, Origin::Allocator)?;
-                self.copy_from_interval(addr, args[0].interval)?;
-                destination.write_from_bytes(self, &addr.to_bytes()[..self.ptr_size()])
+                let addr = self.allocate(size, align, Origin::Allocator, false)?;
+                self.copy_from_interval(addr.aligned(align), args[0].interval)?;
+                self.write_pointer(destination.addr, addr)
             }
             Intrinsic::WriteBoxViaMove => {
                 let [boxed, value] = args else {

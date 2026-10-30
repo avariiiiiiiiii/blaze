@@ -67,10 +67,7 @@ pub(super) fn in_image(range: &Range<u64>, base: u64) -> Result<(), String> {
     if image_base(range.start) == Some(base) && image_base(last) == Some(base) {
         Ok(())
     } else {
-        Err(format!(
-            "data at {:#x}..{:#x}, outside the image at {base:#x}",
-            range.start, range.end
-        ))
+        Err(format!("data at {:#x}..{:#x}, outside the image at {base:#x}", range.start, range.end))
     }
 }
 
@@ -100,7 +97,8 @@ pub(super) fn bytes(range: &Range<u64>, base: u64) -> Result<&'static [u8], Stri
 pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
     let at = find()?;
     let base = image_base(at).ok_or_else(|| format!("no image has {DESCRIPTOR} at {at:#x}"))?;
-    let end = at.checked_add(Descriptor::SIZE as u64).ok_or("a descriptor past the end of memory")?;
+    let end =
+        at.checked_add(Descriptor::SIZE as u64).ok_or("a descriptor past the end of memory")?;
     Ok((at, bytes(&(at..end), base)?))
 }
 

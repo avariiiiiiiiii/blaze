@@ -444,6 +444,10 @@ pub(crate) struct Tracer {
     // spelling of one path `trace::assemble` keeps.
     common: BTreeSet<Line>,
     disk: Disk,
+    /// The record, open from the first expansion on, and the buffer its new bytes are read
+    /// into, reused.
+    file: Option<File>,
+    bytes: Vec<u8>,
 }
 
 impl Tracer {
@@ -451,7 +455,16 @@ impl Tracer {
     pub(crate) fn new(live: PathBuf, socket: PathBuf) -> Tracer {
         let own =
             vec![(SOCKET.into(), socket.into_os_string()), (LIVE.into(), live.clone().into_os_string())];
-        Tracer { live, own, read: 0, next: 0, common: BTreeSet::new(), disk: Disk::new(Vec::new()) }
+        Tracer {
+            live,
+            own,
+            read: 0,
+            next: 0,
+            common: BTreeSet::new(),
+            disk: Disk::new(Vec::new()),
+            file: None,
+            bytes: Vec::new(),
+        }
     }
 
     /// The scope of the next expansion of the connection.
@@ -462,43 +475,43 @@ impl Tracer {
     }
 
     /// What the expansion of `scope` read, once its server answered it: it saw the
-    /// environment `seen` and this server's own variables.
+    /// environment `seen` and this server's own variables. Only the lines of `scope` and the
+    /// new lines of no scope are made into [`Line`]s; the rest are skipped where they lie.
     pub(crate) fn traced(&mut self, scope: &str, seen: Vec<(OsString, OsString)>) -> Result<Traced, String> {
+        let live = self.live.display();
+        let unreadable = |error: io::Error| format!("the sandbox's live record {live} can't be read: {error}");
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => self.file.insert(File::open(&self.live).map_err(unreadable)?),
+        };
+        file.seek(SeekFrom::Start(self.read)).map_err(unreadable)?;
+        self.bytes.clear();
+        file.read_to_end(&mut self.bytes).map_err(unreadable)?;
+        let whole = self.bytes.iter().rposition(|it| *it == b'\n').map_or(0, |at| at + 1);
+        let text = std::str::from_utf8(&self.bytes[..whole])
+            .map_err(|error| format!("the sandbox's live record {live} is not text: {error}"))?;
         let mut lines = Vec::new();
-        for line in self.lines()? {
-            if line.scope.is_empty() {
+        for (number, line) in text.split_terminator('\n').enumerate() {
+            let bad = || format!("the sandbox's live record {live}: line {} is not a record line", number + 1);
+            let mut parts = line.splitn(3, '\t');
+            let seen_as = parts.next().and_then(Seen::of).ok_or_else(bad)?;
+            let (of, what) = (parts.next().ok_or_else(bad)?, parts.next().ok_or_else(bad)?);
+            if of.is_empty() {
+                let line = Line { seen: seen_as, scope: String::new(), what: what.to_owned() };
                 if !plumbing(&line) {
                     self.common.insert(line);
                 }
-            } else if line.scope == scope {
-                lines.push(line);
+            } else if of == scope {
+                lines.push(Line { seen: seen_as, scope: of.to_owned(), what: what.to_owned() });
             }
         }
+        self.read += whole as u64;
         lines.extend(self.common.iter().cloned());
         let mut env = seen;
         env.retain(|it| !self.own.iter().any(|own| own.0 == it.0));
         env.extend(self.own.iter().cloned());
         self.disk.set_env(env);
         trace::assemble(&lines, Some(scope), &mut self.disk).map_err(|error| error.to_string())
-    }
-
-    /// The whole lines appended to the record since the last read.
-    fn lines(&mut self) -> Result<Vec<Line>, String> {
-        let unreadable =
-            |error: io::Error| format!("the sandbox's live record {} can't be read: {error}", self.live.display());
-        let mut file = File::open(&self.live).map_err(unreadable)?;
-        file.seek(SeekFrom::Start(self.read)).map_err(unreadable)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(unreadable)?;
-        let whole = bytes.iter().rposition(|it| *it == b'\n').map_or(0, |at| at + 1);
-        let text = std::str::from_utf8(&bytes[..whole]).map_err(|error| {
-            format!("the sandbox's live record {} is not text: {error}", self.live.display())
-        })?;
-        let (lines, used) = trace::parse(text).map_err(|error| {
-            format!("the sandbox's live record {}: {error}", self.live.display())
-        })?;
-        self.read += used as u64;
-        Ok(lines)
     }
 }
 

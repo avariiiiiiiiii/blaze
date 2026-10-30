@@ -28,7 +28,7 @@ pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
 /// uninhabited but not `!`, which type checking does not see (`MirBody::unreachable_after_calls`).
 /// None when the call is in a macro of another crate.
 pub(super) fn after_calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
-    if b.tainted {
+    if b.mir_tainted {
         return Vec::new();
     }
     let Some(mir) = b.mir() else { return Vec::new() };

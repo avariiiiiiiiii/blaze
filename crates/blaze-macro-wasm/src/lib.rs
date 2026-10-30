@@ -157,7 +157,8 @@ pub(crate) struct State {
     spans: Spans,
     sites: [u32; 3],
     files: wasi::Files,
-    env: Vec<(String, String)>,
+    /// The module's environment, sorted by name ([`guest_env`]).
+    env: Vec<(OsString, OsString)>,
     /// What a function that gives text or a stream back put there, for the module's `take`.
     buffer: Vec<u8>,
     output: Option<Vec<u8>>,
@@ -326,15 +327,31 @@ fn memory(caller: &mut Caller<'_, State>) -> wasmtime::Result<Memory> {
     }
 }
 
+/// What a module that parses text outside an expansion (in a static's initializer or its list
+/// export) is told: its tokens would have no call site to be spanned at.
+const NO_CALL: &str =
+    "a token stream can't be parsed outside a macro's expansion: it has no call site";
+
+/// The module's bytes at `ptr..ptr + len`, checked against its memory before anything is
+/// allocated: a length is the module's to choose.
 fn read_bytes(caller: &mut Caller<'_, State>, ptr: u32, len: u32) -> wasmtime::Result<Vec<u8>> {
     let memory = memory(caller)?;
-    let mut bytes = vec![0; len as usize];
-    memory.read(&*caller, ptr as usize, &mut bytes)?;
-    Ok(bytes)
+    Ok(guest_slice(memory.data(&*caller), ptr, len)?.to_vec())
+}
+
+fn guest_slice(data: &[u8], ptr: u32, len: u32) -> wasmtime::Result<&[u8]> {
+    let start = ptr as usize;
+    start
+        .checked_add(len as usize)
+        .and_then(|end| data.get(start..end))
+        .ok_or_else(|| {
+            wasmtime::Error::msg(format!("{len} bytes at {ptr:#x} are outside the module's memory"))
+        })
 }
 
 fn read_text(caller: &mut Caller<'_, State>, ptr: u32, len: u32) -> wasmtime::Result<String> {
-    Ok(String::from_utf8_lossy(&read_bytes(caller, ptr, len)?).into_owned())
+    let memory = memory(caller)?;
+    Ok(String::from_utf8_lossy(guest_slice(memory.data(&*caller), ptr, len)?).into_owned())
 }
 
 fn subspan(span: Span, start: u64, end: u64) -> Option<Span> {
@@ -588,7 +605,9 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         |mut caller: Caller<'_, State>, ptr: u32, len: u32| -> wasmtime::Result<i32> {
             let text = read_text(&mut caller, ptr, len)?;
             let state = caller.data_mut();
-            let call_site = state.span(state.sites[1]).expect("the current call site is numbered");
+            let Some(call_site) = state.span(state.sites[1]) else {
+                return Ok(-1 - state.give(Some(NO_CALL.to_owned())));
+            };
             Ok(match lex::stream(&text, call_site) {
                 Ok(trees) => {
                     let mut writer = Writer { out: Vec::new(), spans: &mut state.spans };
@@ -609,7 +628,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         |mut caller: Caller<'_, State>, ptr: u32, len: u32| -> wasmtime::Result<i32> {
             let text = read_text(&mut caller, ptr, len)?;
             let state = caller.data_mut();
-            let call_site = state.span(state.sites[1]).expect("the current call site is numbered");
+            let Some(call_site) = state.span(state.sites[1]) else { return Ok(-1) };
             Ok(match lex::literal_from_str(&text, call_site) {
                 Some(literal) => {
                     let mut writer = Writer { out: Vec::new(), spans: &mut state.spans };
@@ -751,13 +770,20 @@ impl Wasm {
         let stats = std::env::var_os("BLAZE_STATS").is_some();
         // Machine code is loaded only from the store, which checks what it gives against its
         // checksum: a file anyone can write is never run as code.
-        let kept = store.and_then(|it| it.get_lasting(&key)).and_then(|code| {
+        let kept = store.and_then(|it| it.get_lasting(&key)).map(|code| {
             // SAFETY: `code` is what the store keeps under `key`, checked against its checksum
             // as it was read, and only `serialize` of this module on an engine of
             // `code_key`'s compatibility hash puts under `key`; Wasmtime refuses code of
             // another version, configuration or CPU. Other bytes would run as machine code.
-            unsafe { Module::deserialize(engine(), &code) }.ok()
+            unsafe { Module::deserialize(engine(), &code) }.map_err(|e| {
+                format!(
+                    "{}: the store's machine code of it, under a key of this engine's \
+                     configuration, is refused: {e:#}",
+                    path.display()
+                )
+            })
         });
+        let kept = kept.transpose()?;
         let (module, was_kept) = match kept {
             Some(module) => (module, true),
             None => {
@@ -777,11 +803,7 @@ impl Wasm {
                 (module, store.is_some())
             }
         };
-        let mut linker = Linker::new(engine());
-        wasi::add(&mut linker).map_err(failed)?;
-        add_host(&mut linker).map_err(failed)?;
-        wasi::rest(&mut linker, &module).map_err(failed)?;
-        let pre = linker.instantiate_pre(&module).map_err(failed)?;
+        let pre = linked(&module).map_err(failed)?;
         let identity = match identity {
             Some(identity) => identity,
             None => made_of(path, bytes()?).unwrap_or(digest),
@@ -871,7 +893,7 @@ impl Wasm {
         let root = package_dir(env);
         let mut state = State::empty();
         state.files = wasi::Files::new(root.as_deref());
-        state.env = guest_env(env);
+        state.env = owned_env(&guest_env(env));
         self.instance_with(state, root)
     }
 
@@ -1115,9 +1137,36 @@ pub fn prepare_soon(path: &Path, store: Option<&'static blaze_store::Store>) -> 
     Ok(())
 }
 
+/// `module` linked to the host: WASI preview 1, the proc-macro imports, and an error for each
+/// import it has that neither gives.
+fn linked(module: &Module) -> wasmtime::Result<InstancePre<State>> {
+    let mut linker = Linker::new(engine());
+    wasi::add(&mut linker)?;
+    add_host(&mut linker)?;
+    wasi::rest(&mut linker, module)?;
+    linker.instantiate_pre(module)
+}
+
+/// Whether `bytes` is a module the host can run: compiled by Cranelift and linked as
+/// [`Wasm::at`] links it, but neither run, kept in memory, nor its machine code written.
+pub fn check_module(bytes: &[u8]) -> Result<(), String> {
+    let module = Module::new(engine(), bytes).map_err(|e| format!("{e:#}"))?;
+    linked(&module).map(drop).map_err(|e| format!("{e:#}"))
+}
+
+/// rust-analyzer's tree of `bytes`, a stream as a module writes it, with spans 1, 2 and 3
+/// being `sites` (def site, call site, mixed site) and the stream at the call site.
+pub fn decode(bytes: &[u8], sites: [Span; 3]) -> Result<tt::TopSubtree, String> {
+    let mut spans = Spans::default();
+    for site in sites {
+        spans.push(site);
+    }
+    Ok(wire::top_subtree(Reader::new(bytes, &spans).stream()?, sites[1]))
+}
+
 /// What the module of `bytes` carries in its [`exports::LIST_SECTION`] custom section, read
 /// without compiling it: `None` for a module built before modules carried one.
-fn carried_list(bytes: &[u8]) -> Option<String> {
+pub fn carried_list(bytes: &[u8]) -> Option<String> {
     fn leb(bytes: &[u8], at: &mut usize) -> Option<usize> {
         let mut value = 0usize;
         for shift in (0..35).step_by(7) {
@@ -1255,23 +1304,31 @@ fn package_dir(env: &Env) -> Option<PathBuf> {
 /// What a module is told of its environment: cargo's variables for a crate's compilation
 /// that the crate's env has, each with what it says on every machine, sorted. No other
 /// variable, of the crate's or of the process's.
-fn guest_env(env: &Env) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = env
+fn guest_env(env: &Env) -> Vec<(&str, &str)> {
+    let mut out: Vec<(&str, &str)> = env
         .iter()
         .filter_map(|(name, value)| {
             let value = match name {
-                "CARGO_MANIFEST_DIR" => wasi::PACKAGE.to_owned(),
-                "CARGO_MANIFEST_PATH" => format!("{}/Cargo.toml", wasi::PACKAGE),
-                "OUT_DIR" => wasi::OUT_DIR.to_owned(),
-                "CARGO_CRATE_NAME" | "CARGO_PRIMARY_PACKAGE" | "CARGO_BIN_NAME" => value.to_owned(),
-                _ if name.starts_with("CARGO_PKG_") => value.to_owned(),
+                "CARGO_MANIFEST_DIR" => wasi::PACKAGE,
+                "CARGO_MANIFEST_PATH" => MANIFEST_PATH,
+                "OUT_DIR" => wasi::OUT_DIR,
+                "CARGO_CRATE_NAME" | "CARGO_PRIMARY_PACKAGE" | "CARGO_BIN_NAME" => value,
+                _ if name.starts_with("CARGO_PKG_") => value,
                 _ => return None,
             };
-            Some((name.to_owned(), value))
+            Some((name, value))
         })
         .collect();
-    out.sort();
+    out.sort_unstable();
     out
+}
+
+/// Where a module's manifest is: [`wasi::PACKAGE`]'s `Cargo.toml`.
+const MANIFEST_PATH: &str = "/blaze/package/Cargo.toml";
+
+/// The environment a running module is given, of [`guest_env`]'s.
+fn owned_env(env: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+    env.iter().map(|&(name, value)| (name.into(), value.into())).collect()
 }
 
 /// `trees` with the package's path where the module put [`wasi::PACKAGE`] in a string, as
@@ -1401,7 +1458,10 @@ fn what_it_read(state: &mut State) -> Option<Traced> {
 struct Now<'a> {
     root: Option<&'a Path>,
     machine: inputs::Now<'a>,
-    env: &'a [(String, String)],
+    /// The module's environment, sorted by name ([`guest_env`]), borrowed from the call's.
+    env: &'a [(&'a str, &'a str)],
+    /// The same, owned, made only for a shape that read all of it ([`Inputs::env_all`]).
+    all: Option<Vec<(OsString, OsString)>>,
     shapes: &'a Shapes,
     /// The answers so far, by question as a read set has it ([`Value::read`]).
     answers: &'a FxHashMap<String, String>,
@@ -1450,8 +1510,8 @@ impl Inputs for Now<'_> {
     }
 
     fn env(&mut self, name: &OsStr) -> Option<OsString> {
-        let name = name.to_str()?;
-        if name.starts_with('\0') {
+        if name.as_encoded_bytes().first() == Some(&0) {
+            let name = name.to_str()?;
             if let Some(said) = self.answers.get(name) {
                 return Some(said.into());
             }
@@ -1460,11 +1520,14 @@ impl Inputs for Now<'_> {
             }
             return None;
         }
-        self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone().into())
+        let name = name.to_str()?;
+        let at = self.env.binary_search_by(|it| it.0.cmp(name)).ok()?;
+        Some(self.env[at].1.into())
     }
 
-    fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-        self.env.iter().map(|(name, value)| (name.into(), value.into())).collect()
+    fn env_all(&mut self) -> &[(OsString, OsString)] {
+        let env = self.env;
+        self.all.get_or_insert_with(|| owned_env(env))
     }
 
     fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, Unreadable> {
@@ -1485,7 +1548,7 @@ fn find_answered<T>(
     expansions: &blaze_expand::Expansions,
     run: &RunKey,
     root: Option<&Path>,
-    env: &[(String, String)],
+    env: &[(&str, &str)],
     shapes: &Shapes,
     db: Option<&dyn SourceDatabase>,
     look: impl Fn(Found<'_>) -> T,
@@ -1494,7 +1557,8 @@ fn find_answered<T>(
     let machine = inputs::Now { files: Files::shared(), env: &none };
     let mut answers = FxHashMap::default();
     loop {
-        let mut now = Now { root, machine, env, shapes, answers: &answers, unanswered: Vec::new() };
+        let mut now =
+            Now { root, machine, env, all: None, shapes, answers: &answers, unanswered: Vec::new() };
         let looked = {
             let store = expansions.store.read().unwrap_or_else(|it| it.into_inner());
             index::find(&store, run, &mut now).map(&look)
@@ -1507,6 +1571,36 @@ fn find_answered<T>(
             let said = answer(&read, shapes, db);
             answers.insert(read, said);
         }
+    }
+}
+
+/// A buffer of this thread's, cleared, given back when dropped: a call's tokens are encoded
+/// without allocating once the thread has encoded one as large.
+struct Reused(Vec<u8>);
+
+thread_local! {
+    static BUFFERS: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Reused {
+    fn take() -> Reused {
+        Reused(BUFFERS.with_borrow_mut(Vec::pop).unwrap_or_default())
+    }
+}
+
+impl std::ops::Deref for Reused {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for Reused {
+    fn drop(&mut self) {
+        let mut buffer = std::mem::take(&mut self.0);
+        buffer.clear();
+        // A thread that is ending has no pool left to give it to.
+        _ = BUFFERS.try_with(|it| it.borrow_mut().push(buffer));
     }
 }
 
@@ -1536,17 +1630,24 @@ fn expand<'a>(
     for span in [call.def_site, call.call_site, call.mixed_site] {
         spans.push(span);
     }
-    let mut writer = Writer { out: Vec::new(), spans: &mut spans };
+    let mut input = Reused::take();
+    let mut attr = Reused::take();
+    let mut writer = Writer { out: std::mem::take(&mut input.0), spans: &mut spans };
     writer.top(call.subtree);
-    let input = std::mem::take(&mut writer.out);
-    let attr = call.attrs.map(|it| {
-        writer.top(it);
-        std::mem::take(&mut writer.out)
-    });
+    input.0 = std::mem::take(&mut writer.out);
     // rust-analyzer gives an attribute written without arguments (`#[twice]`) none.
-    let attr = match listed.kind {
-        ProcMacroKind::Attr => Some(attr.unwrap_or_else(|| 0u32.to_le_bytes().to_vec())),
-        _ => attr,
+    let attr = match (call.attrs, listed.kind) {
+        (Some(it), _) => {
+            writer.out = std::mem::take(&mut attr.0);
+            writer.top(it);
+            attr.0 = std::mem::take(&mut writer.out);
+            Some(attr)
+        }
+        (None, ProcMacroKind::Attr) => {
+            attr.0.extend_from_slice(&0u32.to_le_bytes());
+            Some(attr)
+        }
+        (None, _) => None,
     };
     let shapes = Shapes::of(spans.all());
     let mut given = Given::new(RunKind::ProcMacro);
@@ -1581,7 +1682,7 @@ fn expand<'a>(
                 |found| match found {
                     // Read in place, under the guard: a hit copies nothing out of the store.
                     Found::Hit { value, .. } if keeping.mode == Mode::Keep => Err(shapes.read(value)),
-                    Found::Hit { value, .. } => Ok(Some(value.to_vec())),
+                    Found::Hit { value, .. } => Ok(Some(blaze_expand::checked(value))),
                     Found::Miss { .. } => Ok(None),
                 },
             );
@@ -1616,7 +1717,7 @@ fn expand<'a>(
         state.spans = spans;
         state.sites = [1, 2, 3];
         state.files = wasi::Files::new(root.as_deref());
-        state.env = env.clone();
+        state.env = owned_env(&env);
         let mut instance = wasm.instance_with(state, root.clone())?;
         let output = instance.run(index, db, &input, attr.as_deref())?;
         Ok((instance.store.into_data(), output))
@@ -1629,7 +1730,7 @@ fn expand<'a>(
         retained = state.retained;
         let value = shapes.written(&state.spans, &output);
         if let Some(kept) = &found {
-            if value.as_ref() != Some(kept) {
+            if value.as_deref().map(blaze_expand::checked).as_ref() != Some(kept) {
                 return Err(failed(format!(
                     "{}=check: it expanded otherwise than the store kept it, under a key of \
                      every input it read",
@@ -2228,6 +2329,48 @@ mod tests {
     }
 
     #[test]
+    fn text_rustc_refuses_to_lex_is_an_error() {
+        for text in ["r\"", "r#", "br\"", "br#", "cr\"", "cr#", "\"open", "b'x"] {
+            assert!(tokens(text, span(0, 0)).is_err(), "{text}");
+            assert!(lex::literal_from_str(text, span(0, 0)).is_none(), "{text}");
+        }
+        let long = format!("1{}", "a".repeat(lex::SUFFIX_MOST + 1));
+        assert!(tokens(&long, span(0, 0)).is_err());
+        assert!(tokens(&long[..lex::SUFFIX_MOST + 1], span(0, 0)).is_ok());
+    }
+
+    #[test]
+    fn a_stream_is_decoded_without_believing_its_counts_or_depth() {
+        let sites = [span(0, 1), span(1, 2), span(2, 3)];
+        assert!(decode(&u32::MAX.to_le_bytes(), sites).is_err());
+        let nested = |depth: u32| {
+            let mut bytes = 1u32.to_le_bytes().to_vec();
+            for level in 0..depth {
+                bytes.extend([0, 0]);
+                for number in [1u32, 2, 3, u32::from(level + 1 < depth)] {
+                    bytes.extend(number.to_le_bytes());
+                }
+            }
+            bytes
+        };
+        assert!(decode(&nested(64), sites).is_ok());
+        assert!(decode(&nested(wire::DEPTH_MOST + 1), sites).is_err());
+        let mut literal = 1u32.to_le_bytes().to_vec();
+        literal.extend([3, 2, 0, 0, 0, 0, 0]);
+        literal.extend([1, 0, 0, 0, b'1']);
+        literal.extend(((lex::SUFFIX_MOST + 1) as u32).to_le_bytes());
+        literal.extend(std::iter::repeat_n(b'a', lex::SUFFIX_MOST + 1));
+        assert!(decode(&literal, sites).is_err());
+    }
+
+    #[test]
+    fn a_module_that_is_not_one_is_refused_unrun() {
+        assert!(check_module(b"\0asm\x01\0\0\0").is_ok());
+        assert!(check_module(b"not a module").is_err());
+        assert_eq!(carried_list(b"not a module"), None);
+    }
+
+    #[test]
     fn a_module_carries_its_list_in_a_custom_section() {
         let custom = |name: &str, payload: &[u8]| {
             let mut body = vec![name.len() as u8];
@@ -2362,7 +2505,7 @@ mod tests {
     ) -> Now<'a> {
         static NONE: std::sync::LazyLock<inputs::Env> = std::sync::LazyLock::new(inputs::Env::default);
         let machine = inputs::Now { files: Files::shared(), env: &NONE };
-        Now { root, machine, env: &[], shapes, answers, unanswered: Vec::new() }
+        Now { root, machine, env: &[], all: None, shapes, answers, unanswered: Vec::new() }
     }
 
     fn now_of(package: &Path, traced: &Traced) -> Traced {
@@ -2452,7 +2595,10 @@ mod tests {
     fn a_read_of_the_clock_or_randomness_is_not_kept() {
         let traced = Traced { untraceable: vec![Untraceable::Random], ..Traced::default() };
         assert!(index::untraceable(&traced));
-        assert_ne!(wasi::random(16), wasi::random(16));
+        let (mut one, mut two) = ([0u8; 13], [0u8; 13]);
+        wasi::fill_random(&mut one);
+        wasi::fill_random(&mut two);
+        assert_ne!(one, two);
     }
 
     #[test]
@@ -2498,9 +2644,9 @@ mod tests {
         assert_eq!(
             names,
             [
-                ("CARGO_MANIFEST_DIR".to_owned(), wasi::PACKAGE.to_owned()),
-                ("CARGO_PKG_NAME".to_owned(), "pkg".to_owned()),
-                ("OUT_DIR".to_owned(), wasi::OUT_DIR.to_owned()),
+                ("CARGO_MANIFEST_DIR", wasi::PACKAGE),
+                ("CARGO_PKG_NAME", "pkg"),
+                ("OUT_DIR", wasi::OUT_DIR),
             ]
         );
     }

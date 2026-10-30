@@ -18,7 +18,7 @@
 
 use std::fmt;
 
-use blaze_ids::radix;
+use blaze_radix as radix;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 

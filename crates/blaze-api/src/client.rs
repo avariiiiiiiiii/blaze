@@ -220,6 +220,43 @@ impl Client {
         }
     }
 
+    /// Waits for the daemon to hang up this connection, at most `patience`; responses that
+    /// come first are kept for [`Client::receive`]. A daemon that stops hangs up every
+    /// connection last, once its state is durable: where a service manager keeps its socket
+    /// listening, this is how `blaze stop` knows it is gone. Only the Unix socket has it.
+    #[cfg(unix)]
+    pub fn until_hung_up(&mut self, patience: std::time::Duration) -> Result<(), ClientError> {
+        let deadline = std::time::Instant::now() + patience;
+        let waited = || {
+            let said = format!("the daemon still holds the connection after {} ms", patience.as_millis());
+            ClientError::Io(io::Error::new(io::ErrorKind::TimedOut, said))
+        };
+        loop {
+            while let Some(envelope) = self.next_envelope()? {
+                self.kept.push_back(envelope);
+            }
+            let Link::Unix(stream) = &mut self.link else {
+                let said = "a wait for the daemon to hang up is the Unix socket's: HTTP keeps no connection open for it";
+                return Err(ClientError::Refused(ApiError::new(said.to_owned(), None)));
+            };
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(waited());
+            }
+            stream.set_read_timeout(Some(left))?;
+            let most = self.frames.wanted(RECEIVE);
+            match self.frames.fill(stream, most) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
+                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                    return Err(waited());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     /// The next response off the connection.
     fn read(&mut self) -> Result<Envelope<Response>, ClientError> {
         loop {

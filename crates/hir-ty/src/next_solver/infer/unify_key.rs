@@ -4,7 +4,7 @@ use std::cmp;
 
 use rustc_type_ir::{
     ConstVid, FloatVarValue, FloatVid, IntVarValue, IntVid, RegionKind, RegionVid, TyVid,
-    UniverseIndex, inherent::IntoKind,
+    UniverseIndex,
 };
 
 use crate::{

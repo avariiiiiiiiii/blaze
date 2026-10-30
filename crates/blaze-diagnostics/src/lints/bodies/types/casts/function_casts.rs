@@ -11,7 +11,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{cast_ty_span, expr_span};
 use crate::{
-    lints::bodies::{BodyCx, LatePass},
+    lints::bodies::{BodyCx, Hooks, LatePass},
     lower::{Found, Phase},
     model::{Applicability, Diag, SuggestionStyle},
 };
@@ -21,6 +21,10 @@ pub(super) struct FunctionCastsAsInteger;
 impl LatePass for FunctionCastsAsInteger {
     fn name(&self) -> &'static str {
         "FunctionCastsAsInteger"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

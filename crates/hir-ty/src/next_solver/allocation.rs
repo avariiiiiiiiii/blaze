@@ -42,7 +42,9 @@ impl<'db> std::ops::Deref for Allocation<'db> {
     }
 }
 
-impl<'db, V: super::WorldExposer> GenericTypeVisitable<V> for Allocation<'db> {
+// SAFETY: the handle holds one value, its row's data, which this visits whenever the visitor
+// asks to go into the row.
+unsafe impl<'db, V: super::WorldExposer> GenericTypeVisitable<V> for Allocation<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
         if visitor.on_interned(ALLOCATIONS.name(), self.index.get()).is_continue() {
             (**self).generic_visit_with(visitor);

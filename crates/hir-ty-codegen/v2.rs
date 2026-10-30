@@ -143,6 +143,9 @@ pub(crate) struct Function {
     pub(crate) inlined: Vec<CodeHash>,
     /// What its `#[inline]` asks of LLVM; `None` for closures, glue and shims.
     pub(crate) hint: fragment::Hint,
+    /// The sanitizers of the unit's set that are off for it: what its `#[sanitize(.. = "off")]`
+    /// turns off, and SanitizerCoverage for a `__sanitizer_*` symbol. None without a set.
+    pub(crate) unsanitized: blaze_codegen::settings::Sanitizers,
     /// Where [`release::summarize`] leaves what [`release::emit`] takes up.
     pub(crate) release: release::Kept,
     /// Whether a fold may give it another function's code: not where its address is

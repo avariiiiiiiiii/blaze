@@ -19,13 +19,14 @@
 //! Spans are never in a record that is hashed: they sit in a side table ([`Spans`]), and a
 //! record names one by [`SpanRef`].
 
+mod raw;
 mod schema;
 pub mod tiers;
 
 use std::{
     fmt,
     marker::PhantomData,
-    mem::{align_of, offset_of, size_of, size_of_val},
+    mem::{align_of, offset_of, size_of},
     ops::Deref,
 };
 
@@ -57,9 +58,55 @@ pub unsafe trait Record: Copy + 'static {
     /// accepts anything at the right size and alignment, so a [`Slice`] of them is checked by
     /// its bounds alone, in O(1), however long it is.
     const PLAIN: bool = false;
+    /// Whether a [`WordTable`] may be reachable from a value (`true` when it may, `false` only
+    /// when it can't): [`Record::columns`] walks only what may hold one.
+    const COLUMNS: bool = false;
     /// Whether `bytes`, `size_of::<Self>()` of them at an aligned address, are a valid value,
     /// the [`Rel`]s and [`Slice`]s in it within `buffer`.
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError>;
+    /// Pushes each [`WordTable`] reachable from the value at `bytes`, which [`Record::check`]
+    /// accepted. What [`tiers::BufferColumns`] packs, codec by column.
+    fn columns(bytes: &[u8], buffer: &[u8], out: &mut Vec<WordTable>) {
+        let _ = (bytes, buffer, out);
+    }
+}
+
+/// The items of a [`Slice`] as a table of `u32` words: `rows` rows of `stride` words from
+/// byte `at` of the buffer, one row an item. Each word of a row is a column of its own, so a
+/// slice of records is packed field by field (a struct split into columns, as Parquet and
+/// BtrBlocks split one). Words are moved bit for bit, so the bytes come back the same.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct WordTable {
+    pub at: usize,
+    pub rows: usize,
+    pub stride: usize,
+}
+
+/// The words in a `T` when a [`Slice`] of them is a [`WordTable`], 0 when it is not: a `T`
+/// a whole number of `u32` words long and at least as aligned as one, so each item starts on
+/// a word. Its fields' meaning doesn't matter, only their bytes.
+pub const fn row_words<T: Record>() -> usize {
+    match size_of::<T>().is_multiple_of(4) && align_of::<T>() >= 4 {
+        true => size_of::<T>() / 4,
+        false => 0,
+    }
+}
+
+/// The bytes of `value`, a record.
+fn bytes_of<T: Record>(value: &T) -> &[u8] {
+    raw::bytes_of(std::slice::from_ref(value))
+}
+
+/// [`Record::columns`] of the field of type `F` at `offset` in `record`, a checked record.
+pub fn field_columns<F: Record>(
+    record: &[u8],
+    offset: usize,
+    buffer: &[u8],
+    out: &mut Vec<WordTable>,
+) {
+    if F::COLUMNS {
+        F::columns(&record[offset..offset + size_of::<F>()], buffer, out);
+    }
 }
 
 /// Checks the field of type `F` at `offset` in `record`, the bytes of a record in `buffer`:
@@ -130,11 +177,15 @@ unsafe impl<T: Record, const N: usize> Record for [T; N] {
     const SCHEMA: SchemaHash =
         schema_of(&[Part::Str("array"), Part::U64(N as u64), Part::Schema(T::SCHEMA)]);
     const PLAIN: bool = T::PLAIN;
+    const COLUMNS: bool = T::COLUMNS;
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
         if T::PLAIN {
             return fits::<[T; N]>(bytes, buffer);
         }
         (0..N).try_for_each(|i| check_field::<T>(bytes, i * size_of::<T>(), buffer))
+    }
+    fn columns(bytes: &[u8], buffer: &[u8], out: &mut Vec<WordTable>) {
+        (0..N).for_each(|i| field_columns::<T>(bytes, i * size_of::<T>(), buffer, out));
     }
 }
 
@@ -227,11 +278,7 @@ impl<T: Record> Rel<T> {
         }
         let at = position(self, buffer)?;
         let target = target::<T>(at, self.offset, 1, buffer)?;
-        let bytes = &buffer[target..target + size_of::<T>()];
-        T::check(bytes, buffer)?;
-        // SAFETY: `bytes` are in `buffer`, `size_of::<T>()` of them, aligned for `T`, and
-        // `T::check` accepted them, which `Record`'s contract makes a valid `T`.
-        Ok(Some(unsafe { &*bytes.as_ptr().cast::<T>() }))
+        raw::view(&buffer[target..target + size_of::<T>()], buffer).map(Some)
     }
 }
 
@@ -262,15 +309,8 @@ impl<T: Record> Slice<T> {
         }
         let at = position(self, buffer)?;
         let target = target::<T>(at, self.offset, self.len, buffer)?;
-        let size = size_of::<T>();
-        let bytes = &buffer[target..target + size * self.len as usize];
-        if !T::PLAIN {
-            (0..self.len as usize).try_for_each(|i| check_field::<T>(bytes, i * size, buffer))?;
-        }
-        // SAFETY: `bytes` are in `buffer`, `len` `T`s of them, aligned for `T` (the first is,
-        // and a `T`'s size is a multiple of its alignment), and each was accepted by
-        // `T::check` or is a `T::PLAIN` value, which `Record`'s contract makes a valid `T`.
-        Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), self.len as usize) })
+        let len = self.len as usize;
+        raw::view_slice(&buffer[target..target + size_of::<T>() * len], len, buffer)
     }
 }
 
@@ -290,10 +330,14 @@ impl Slice<u8> {
 unsafe impl<T: Record> Record for Rel<T> {
     const SCHEMA: SchemaHash = schema_of(&[Part::Str("Rel"), Part::Schema(T::SCHEMA)]);
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
-        fits::<Rel<T>>(bytes, buffer)?;
-        // SAFETY: `fits` checked size and alignment, and every bit pattern is a `Rel`.
-        let rel = unsafe { &*bytes.as_ptr().cast::<Rel<T>>() };
-        rel.follow(buffer).map(|_| ())
+        raw::in_place::<Rel<T>>(bytes, buffer)?.follow(buffer).map(|_| ())
+    }
+    const COLUMNS: bool = !T::PLAIN;
+    fn columns(bytes: &[u8], buffer: &[u8], out: &mut Vec<WordTable>) {
+        let rel = raw::in_place::<Rel<T>>(bytes, buffer).expect("a checked Rel");
+        if let Some(target) = rel.get(buffer) {
+            T::columns(bytes_of(target), buffer, out);
+        }
     }
 }
 
@@ -302,10 +346,21 @@ unsafe impl<T: Record> Record for Rel<T> {
 unsafe impl<T: Record> Record for Slice<T> {
     const SCHEMA: SchemaHash = schema_of(&[Part::Str("Slice"), Part::Schema(T::SCHEMA)]);
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
-        fits::<Slice<T>>(bytes, buffer)?;
-        // SAFETY: `fits` checked size and alignment, and every bit pattern is a `Slice`.
-        let slice = unsafe { &*bytes.as_ptr().cast::<Slice<T>>() };
-        slice.follow(buffer).map(|_| ())
+        raw::in_place::<Slice<T>>(bytes, buffer)?.follow(buffer).map(|_| ())
+    }
+    // `!T::PLAIN`, not `T::COLUMNS`: a record may hold slices of itself, and `PLAIN` never
+    // refers back to the type.
+    const COLUMNS: bool = row_words::<T>() > 0 || !T::PLAIN;
+    fn columns(bytes: &[u8], buffer: &[u8], out: &mut Vec<WordTable>) {
+        let slice = raw::in_place::<Slice<T>>(bytes, buffer).expect("a checked Slice");
+        let items = slice.get(buffer);
+        if row_words::<T>() > 0 && !items.is_empty() {
+            let at = (items.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize);
+            out.push(WordTable { at, rows: items.len(), stride: row_words::<T>() });
+        }
+        if !T::PLAIN {
+            items.iter().for_each(|item| T::columns(bytes_of(item), buffer, out));
+        }
     }
 }
 
@@ -356,6 +411,23 @@ macro_rules! record {
                 )*
             ]);
             const PLAIN: bool = true $( && <$ty as $crate::Record>::PLAIN )*;
+            const COLUMNS: bool = false $( || <$ty as $crate::Record>::COLUMNS )*;
+
+            fn columns(
+                bytes: &[u8],
+                buffer: &[u8],
+                out: &mut ::std::vec::Vec<$crate::WordTable>,
+            ) {
+                $(
+                    $crate::field_columns::<$ty>(
+                        bytes,
+                        ::core::mem::offset_of!($name, $field),
+                        buffer,
+                        out,
+                    );
+                )*
+                let _ = (bytes, buffer, out);
+            }
 
             fn check(
                 bytes: &[u8],
@@ -454,11 +526,7 @@ pub fn open_as<R: Record>(buffer: &[u8], schema: SchemaHash) -> Result<&R, Forma
     else {
         return Err(FormatError::OutOfBounds { at: root });
     };
-    let bytes = &buffer[root as usize..end as usize];
-    R::check(bytes, buffer)?;
-    // SAFETY: `bytes` are in `buffer`, `size_of::<R>()` of them, aligned for `R` (the buffer is
-    // aligned to `ALIGN`, `root` to `R`), and `R::check` accepted them.
-    Ok(unsafe { &*bytes.as_ptr().cast::<R>() })
+    raw::view(&buffer[root as usize..end as usize], buffer)
 }
 
 /// The domain of a buffer's content ID ([`buffer_id`]).
@@ -539,10 +607,7 @@ impl Writer {
 
     pub fn push_slice<T: Record>(&mut self, values: &[T]) -> u64 {
         let at = self.pad(align_of::<T>());
-        // SAFETY: a `Record` has no padding, so every byte of `values` is initialized.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) };
-        self.bytes.extend_from_slice(bytes);
+        self.bytes.extend_from_slice(raw::bytes_of(values));
         at
     }
 
@@ -612,9 +677,7 @@ impl Deref for Aligned {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        // SAFETY: `blocks` holds at least `len` initialized bytes, `Block` being 16 bytes
-        // without padding.
-        unsafe { std::slice::from_raw_parts(self.blocks.as_ptr().cast::<u8>(), self.len) }
+        raw::blocks_bytes(&self.blocks, self.len)
     }
 }
 
@@ -683,6 +746,12 @@ pub struct Spans {
 impl Spans {
     pub fn new(anchor: ContentId) -> Spans {
         Spans { anchor, spans: Vec::new() }
+    }
+
+    /// The warm and cold forms of span table buffers, starts and lengths each a column: what
+    /// the store's `blaze_cas::Columns` for [`Spans`]' schema is.
+    pub fn columns() -> tiers::BufferColumns {
+        tiers::BufferColumns::of::<SpansRoot>(<Spans as Persist>::SCHEMA)
     }
 
     /// Adds a span `len` bytes long, `start` bytes from the anchor's start.

@@ -35,8 +35,11 @@ mod index;
 mod read;
 pub mod remote;
 mod segment;
+mod sync;
 mod table;
-#[cfg(test)]
+#[cfg(all(test, blaze_check))]
+mod model;
+#[cfg(all(test, not(blaze_check)))]
 mod tests;
 
 use std::{collections::VecDeque, fmt, sync::Arc};

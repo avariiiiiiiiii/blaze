@@ -12,6 +12,11 @@
 //! answers each of them (single flight, [`crate::fetch`]). A thread that loaded the slot
 //! before the daemon stored it misses too, and is answered at once with the published
 //! address.
+//!
+//! The hook must never reach a quiescent point (`blaze_inproc::runtime::quiesce`): between
+//! the answer and the resolver's jump to it, the thread's stack doesn't show the target, and
+//! blaze-inproc's fence frees retired code only after each thread's next quiescent point
+//! (docs/v2/plan/lanes/fastcompile/inproc.md, Fences).
 
 use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -305,9 +305,7 @@ impl SourceDatabase for RootDatabase {
         self.crates_map.clone()
     }
 
-    /// Each task is a job of the worker pool, near this thread's group, reading this database
-    /// by reference; the calling thread pump-waits for the batch (`Pool::scope`). The first
-    /// panic of a task, salsa's cancellation included, goes on from here once the batch is over.
+    /// [`base_db::run_on_pool`] on the pool [`RootDatabase::set_pool`] gave.
     fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
         if count == 0 {
             return;
@@ -318,26 +316,7 @@ impl SourceDatabase for RootDatabase {
                  (RootDatabase::set_pool)"
             );
         };
-        let near = blaze_graph::pool::group();
-        let panicked = std::sync::Mutex::new(None);
-        pool.scope(|scope| {
-            for at in 0..count {
-                let panicked = &panicked;
-                scope.submit(
-                    near,
-                    move || task(self, at),
-                    move |ran| {
-                        if let Err(panic) = ran {
-                            let mut first = panicked.lock().unwrap_or_else(|it| it.into_inner());
-                            first.get_or_insert(panic);
-                        }
-                    },
-                );
-            }
-        });
-        if let Some(panic) = panicked.into_inner().unwrap_or_else(|it| it.into_inner()) {
-            std::panic::resume_unwind(panic);
-        }
+        base_db::run_on_pool(self, pool, count, task);
     }
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
@@ -403,6 +382,7 @@ impl Default for RootDatabase {
 
 impl RootDatabase {
     pub fn new(lru_capacity: Option<u16>) -> RootDatabase {
+        base_db::install_plane_hooks();
         let mut db = RootDatabase {
             storage: ManuallyDrop::new(salsa::Storage::new(executions::callback())),
             files: Default::default(),

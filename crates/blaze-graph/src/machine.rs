@@ -176,6 +176,7 @@ impl Machine {
             request: BUILD,
             weight: 1,
             keep_going: config.keep_going,
+            idle: false,
         })?;
         debug_assert!(opened.is_empty(), "opening a request says nothing");
         Ok(Machine { config, plane, over: false, said: Vec::new() })
@@ -215,6 +216,9 @@ impl Machine {
                     PlaneOutput::Finished { ok, .. } => {
                         self.over = true;
                         Output::Finished { ok }
+                    }
+                    PlaneOutput::Yield { id } => {
+                        unreachable!("node {id} asked to give way: the machine opens no idle request")
                     }
                 })
                 .collect()

@@ -213,6 +213,66 @@ fn watches_hear_a_file_written_under_them() {
     assert!(heard.contains(&name("src/keep")), "{heard:?}");
 }
 
+/// A file written by someone else before a flush is heard of before the flush completes, every
+/// round; a flush of a watch not in flight fails; nothing is left in flight once the watch ends.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn flushes_follow_the_changes_before_them(driver: &mut dyn Driver, root: &std::path::Path) {
+    let mut effects = vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
+    run_until_idle(driver, &mut effects, |_, _| {});
+    driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
+    let mut done = Vec::new();
+    for round in 0..50u64 {
+        let file = format!("src/deep/edit-{round}");
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::write(root.join(&file), b"edited").unwrap();
+        // Two flushes at once: each comes after the change.
+        let (one, two) = (Tag(1000 + 2 * round), Tag(1001 + 2 * round));
+        driver.submit(&mut vec![
+            Effect::Flush { watch: Tag(7), tag: one },
+            Effect::Flush { watch: Tag(7), tag: two },
+        ]);
+        let mut heard = Vec::new();
+        let mut flushed = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while flushed < 2 && std::time::Instant::now() < deadline {
+            driver.poll(&mut done, Duration::from_millis(50));
+            for it in done.drain(..) {
+                match it.done {
+                    Done::Changed { files, .. } => heard.extend(files),
+                    Done::Flushed if it.tag == one || it.tag == two => {
+                        assert!(heard.contains(&name(&file)), "round {round}: flushed first; {heard:?}");
+                        flushed += 1;
+                    }
+                    other => panic!("round {round}: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(flushed, 2, "round {round}: the flushes never came");
+    }
+    let mut effects = vec![Effect::Flush { watch: Tag(8), tag: Tag(9) }, Effect::Unwatch { tag: Tag(7) }];
+    let (mut refused, mut ended) = (false, false);
+    run_until_idle(driver, &mut effects, |it, _| match (it.tag.0, it.done) {
+        (9, Done::Failed(_)) => refused = true,
+        (7, Done::Changed { .. }) => {}
+        (7, Done::Unwatched) => ended = true,
+        other => panic!("{other:?}"),
+    });
+    assert!(refused && ended);
+    assert_eq!(driver.in_flight(), 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn every_watching_driver_tells_a_flush_after_the_changes_before_it() {
+    let root = dir("flush-threads");
+    flushes_follow_the_changes_before_them(&mut Threads::new(&root, 2), &root);
+    #[cfg(target_os = "linux")]
+    {
+        let root = dir("flush-uring");
+        flushes_follow_the_changes_before_them(&mut crate::uring::Uring::new(&root).unwrap(), &root);
+    }
+}
+
 /// A file mapped, a process run with input, and a connection made, used and hung up: what
 /// came of each, by step.
 #[cfg(unix)]

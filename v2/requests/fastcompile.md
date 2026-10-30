@@ -101,6 +101,109 @@ bytes, the same in every run. It is `'static` (the interner is leaked with the d
 `crates/intern`'s are), so `SalsaValue` accepts it directly. Functions that don't opt in are
 unchanged.
 
+> applied: noted, nothing to apply.
+
+## fastcompile-ident-hashcons 3: db: one copy of equal memo values across views and keys (`crates/blaze-query/src/lib.rs`, `table.rs`, `image.rs`)
+
+What:
+
+- `lib.rs`, trait `Query`: `const SHARE: bool = false;` ("equal values of this kind are kept
+  once, whichever view or key made them"), copied into `KindInfo` as `share: bool` by
+  `Database::register`.
+- `lib.rs`, struct `Database`: a field `values: Map<Arc<Value>>`, keyed by
+  `QueryKey { kind, input: Hasher::new("blaze v2 db shared value 1").id(&schema.0).update(&fingerprint.0.to_le_bytes()).finish() }`.
+- `table.rs`: `ValueCell::shared(value: Arc<Value>) -> ValueCell` (publishes the given `Arc`
+  instead of wrapping a new one) and `MemoData::refill_shared(&self, value: Arc<Value>)` (as
+  `refill`, with a given `Arc`).
+- `lib.rs`, fn `resolve_held`, where the new `MemoData` is made: when `info.share`, wrap
+  `computed.bytes` in `Arc<Value::Memory>`, take
+  `self.values.get_or_insert_with(task, shared_key, || ours.clone())`, and if the `Arc` kept is
+  not `ours` compare the two buffers' bytes (a mismatch panics naming the query: one schema and
+  fingerprint with two encodings is a non-deterministic `Persist` or a collision); then
+  `value: ValueCell::shared(kept.clone())`. Otherwise as today.
+- `lib.rs`, fn `value_of` (the refill of an evicted value): the same, through `refill_shared`,
+  for a `share` kind.
+- `lib.rs`, fn `collect`: `self.values.retain(task, |_, value| Arc::strong_count(value) > 1)`,
+  so a value no memo cell holds any more (evicted, moved to a cold pack, collected) is let go
+  of.
+- `lib.rs`, fn `write_cold`: a buffer shared by several memos is written once (an `FxMap` from
+  `Arc::as_ptr` to its `(at, len, id)`), every memo's `ColdEntry` naming that place.
+- `image.rs`, fn `write`: each value's bytes go into the blob once per `value_id` (an `FxMap`
+  from the id it computes already to `(at, len)`), for every kind: memos with equal values map
+  the same bytes after the settle swap.
+
+Why: a key that runs again in a second view (a what-if view or a best-of-N branch whose edit
+changed one of its edges but not its result), and two keys that make equal values (generic
+instances with equal templates, `fastcompile-ident-share`'s idea 2), each keep their own copy
+of the bytes today: `resolve_held` always makes a fresh `Value::Memory(computed.bytes)`, and
+`MemoData::same` only merges memos whose edges are equal too. Keyed by schema and the
+fingerprint the memo has anyway, the shared table costs one 48-byte hash and one probe per
+execution of a `share` kind, a memcmp on a hit, and nothing for other kinds. The image and
+cold-pack deduplication applies to every kind and costs one map probe per value written.
+Which kinds should set `SHARE`: `docs/v2/plan/lanes/fastcompile/hashcons.md`, "Which values".
+
+> forwarded to db: `crates/blaze-query/` is its.
+
+## fastcompile-ident-hashcons 4: codegen: intern `Masked` so a fold run hashes each shape once (`crates/blaze-codegen/src/fold.rs`)
+
+What:
+
+- `impl blaze_hashcons::Consed for Masked`: `domain()` a `static Domain::new("blaze v2 masked 2")`
+  (`MASKED_DOMAIN`, so every content ID stays what `groups` makes today), and `hash_content`
+  feeding exactly what `groups` feeds now: `part(&self.shape)`, `self.size`, the constants'
+  count and their `kind`s.
+- `groups`' `candidates` take `Interned<'_, Masked>` in place of `&Masked`; `Candidate::masked_id`
+  is `masked.content()`; the place-bounds check stays. The caller (`driver.rs`, before
+  `fold::groups`) interns each prepared function's `Masked` in one `HashCons<Masked>` the
+  driver keeps across builds.
+- When codegen registers `TEMPLATE`, `RELEASE`, `MASKED`, `FOLDED` and `STATIC` as `Query`
+  kinds, each sets `const SHARE: bool = true` (request 3).
+
+Why: `groups` today BLAKE3s every candidate's whole masked IR on every call, once per build for
+every function of it, though most functions' masked IR is unchanged between builds. Interned,
+a shape is hashed once per distinct shape the daemon has seen, and grouping compares content
+IDs that are already computed. Equal templates of different instances (the same code for
+different type arguments) are kept once in the query database by request 3.
+
+> forwarded to codegen: `crates/blaze-codegen/` is its.
+
+## fastcompile-ident-hashcons 5: items: layouts interned, not `Arc`ed (`crates/hir-ty/src/layout.rs`, `layout/adt.rs`)
+
+What:
+
+- A newtype `pub struct InternedLayout(pub Layout)` in `layout.rs` (the orphan rule: `Layout` is
+  `rustc_abi`'s) with `impl blaze_hashcons::Consed`: `domain()` a
+  `static Domain::new("blaze v2 layout 1")`, `hash_content` `blaze_hashcons::hash_std(&self.0, hasher)`
+  (`LayoutData`'s derived `Hash` writes no address; `hash_std` fixes `usize` at 64 bits).
+- One `static LAYOUTS: LazyLock<HashCons<InternedLayout>>` in `layout.rs`, never freed, as
+  `crates/intern`'s tables are.
+- `layout_of_ty_query` and `layout_of_adt_query` return
+  `Result<Interned<'static, InternedLayout>, LayoutError>` (still `returns(clone)`, now a pointer
+  copy), interning the layout they compute; `HirDatabase::layout_of_ty` / `layout_of_adt` in
+  `crates/hir-ty/src/db.rs` (db's, the same type change) return it, and their callers read
+  `&*layout` where they read `&*arc` today.
+
+Why: rustc interns layouts (`Layout<'tcx>` is `Interned<'tcx, LayoutData>`) because equal
+layouts are the common case (every 4-byte, 4-aligned scalar struct). Today each `layout_of_*`
+read clones an `Arc<Layout>`, a shared counter write on the read path that
+`docs/v2/plan/design/concurrency.md` rules out; salsa's backdating compares `Arc<Layout>`s by
+value, and so does every consumer asking whether two instances have the same layout
+(`fastcompile-ident-share`'s sharing of generic code, codegen's ABI). Interned, a read is a
+pointer copy, equality is a pointer compare, equal layouts are stored once, and the layout's
+fingerprint (`Interned::fingerprint`) is computed once, for `blaze-items`' `LayoutHash` to read
+instead of hashing the layout again.
+
+> applied (items): `InternedLayout`, `LAYOUTS` and `intern_layout` in `crates/hir-ty/src/layout.rs`.
+> Both queries return `Interned<'static, InternedLayout>`, and field layouts are
+> `&'static Layout`, which removes one buffer per tuple, closure, coroutine and ADT. The test is
+> `layout::tests::equal_layouts_are_one_handle`. `InternedLayout` also derefs to `Layout`, so
+> readers keep `layout.size`. The type change in `db.rs`, the `blaze-hashcons` dependency and
+> the callers that store `Arc<Layout>` are requested from db-ty, codegen, safety and requests
+> (`v2/requests/items.md`, "the layout queries return interned layouts").
+> One correction to the Why: `LayoutHash` doesn't hash computed layouts. It hashes the
+> declarations a layout reads (`blaze-items` `hash.rs`, `Graph::Layout`), before any layout is
+> computed. So the interned fingerprint is salsa's to use, not `LayoutHash`'s.
+
 > db (18:45): confirmed against db-salsa's part 2. While the old value is kept, salsa
 > backdates by `==`; once it is evicted, by the value fingerprint taken at eviction over its
 > `Hash`. `can_backdate` (durability, cycle heads) gates both. Nothing to change in salsa.
@@ -258,6 +361,13 @@ dropped from what it read, so an edit to that code keeps the pass. With this cha
 binary's hash is in the key of exactly those tests.
 
 > forwarded to usercode.
+
+> applied (usercode-sandbox): `Recorder::input` (`crates/blaze-cargo/src/sandbox.rs`) drops a
+> `not_inputs` path only from an unscoped line; a test's own line naming the binary is kept.
+> macOS no longer tells its library the program is a quiet path (`Q`), so the library names
+> it and the `Recorder` decides. The Linux interposer, which was a `not_input`, is the
+> sandbox's own file now (`Recorder::ours`) and no line of any scope names it. The test
+> `a_record_is_its_lines_in_order_once` has both cases. Not built or run.
 
 ## fastcompile-ident-select 4: fastcompile-lazy: the run process's execution log (`crates/blaze-lazy/src/hook.rs` and the stub region)
 
@@ -478,8 +588,12 @@ only codegen sees the type arguments as it makes the instance.
 What: `Launch` already takes `maps: Vec<FixedMap>` (`blaze_premap::map::Memory::maps`). Two
 more things:
 
-- **The program image's place.** Map the program image at a given address (`Launch::at:
-  Option<u64>`), after the dependency image, so workspace calls reach it.
+- **The program image's place.** `CodeMemory::base()` is now chosen at random in `BASES` when
+  the memory is made. A workspace image beside a dependency image needs its base chosen by the
+  caller: `CodeMemory::new_at(name, image, arena, base)`. That base is in
+  `blaze_premap::prelink::IMAGES` (`BASES.end..0x80_0000_0000`), just past the dependency image,
+  so calls between them stay within AArch64 `BL` reach (±128 MiB). A base taken in a process is
+  the error it already is. Calling `new_at` outside `IMAGES` and `BASES` is an error.
 - **A start frame**, carrying `blaze_premap::start::Start`, run by the loader in this order
   before the entry:
   1. load `libraries` in order with every symbol global;
@@ -512,7 +626,7 @@ What: in the dev link (`codegen.rs`, `link()`), for a dev (not release) run:
      again.
    - `Plan::Wait`: wait.
    - `Plan::Link`: link `workspace` with the image's table as the outside source (request 2),
-     and run with `image.memory().maps()`, `Launch::at` and the start frame (request 4). Run
+     and run with `image.memory().maps()`, the workspace image made with `CodeMemory::new_at` past the image's end, and the start frame (request 4). Run
      `next` at idle priority and finish it.
 3. An error from premap fails the run, naming it: never a whole link instead.
 
@@ -681,13 +795,18 @@ What, for an image that `blaze_lazy::Session` describes:
    `Target::Function`: a direct call must not bypass the slot in a lazy image. Function
    pointers, vtables and statics get the slot stub's address, which is what a whole live
    build gives them.
-2. **The stub region.** Write `Stubs::bytes` into the image's code memory, executable, and
+2. **The stub region.** `CodeMemory::base()` is fixed when the memory is made, so the region,
+   the slots and the cell are all laid out before the run process starts. Write
+   `Stubs::bytes` into the image's code memory, executable, and
    store the address of the image's `blaze_lazy::hook::SYMBOL` (`blaze_lazy_resolve`, with
    `_` on Mach-O) in the region's word at `stub::CELL` before the program starts.
 3. **A `blaze_lazy::runner::Placer`.** Place one `CompiledFunction` into the code memory's
    arena (`CodeMemory::reserve`): write it and its data, resolve its relocations (a lazy
    callee not compiled yet resolves to its slot stub, which reaches its entry), and
-   `CodeMemory::publish` the range. Then store the code's address in the function's slot
+   `CodeMemory::publish` the range. A lazy function's `data` goes into the arena or another
+   range the run process maps shared (`Access::Execute` or `Access::Read`), never into one
+   mapped `Access::Copy`. On macOS a `Copy` range is a snapshot taken at map time, so data
+   written there after the run starts would never be seen. Then store the code's address in the function's slot
    with one release store, in every table of blaze-live's pool (`slots/switch.rs`, `POOL`)
    and in the log's base generation, so a later table switch keeps the slot published instead
    of returning it to the entry. The store goes through the same rule as
@@ -891,6 +1010,47 @@ real requests.
 
 > forwarded to requests-nodes: core is DONE and `plane.rs` is that child's now.
 
+> applied (requests-nodes, 2026-10-29), in `crates/blaze-graph/src/plane.rs` and
+> mirrored in `plane_tests/reference.rs`, which the plane is compared with step by step.
+>
+> - **Taking turns.** A request takes its turn by `(idle, vtime, heavier, first opened)`, so an
+>   idle request starts a task only when no other request has one that can start in that pool.
+>   Idle requests share a virtual time of their own, `idle_vclock`. An idle task passed over for
+>   memory counts toward no hold, and a hold whose task no other request wants is dropped.
+> - **`Open { .., idle }`.** The field is `#[serde(default)]`.
+> - **`Promote { at_ns, request }`.** The request takes its turns from the plane's virtual time.
+>   A second promote does nothing, nor does a promote of a finished request (or, once that
+>   request is released, of an unknown id).
+> - **`Yield { id }`.** Said when the task that would start next in a pool waits only for the
+>   threads or memory of running idle tasks. Only tasks no other request has joined are asked,
+>   newest first and as few as it takes, each once, and only when giving way is enough. Until
+>   then, no other idle task starts in that pool.
+> - **Added: `PlaneInput::Yielded { at_ns, id }`.** The executor's answer once a task has given
+>   way. It frees the thread and memory, does not count as a start, and makes each node ready
+>   again in its own request. A node is skipped instead if its request has been cancelled, or
+>   has failed and does not keep going. A task that ends first gets its `Done`, as before.
+> - **Joins.** A non-idle node joining an idle task that hasn't started makes it ready in the
+>   joiner's request, which starts it. An idle task that another request has joined is never
+>   asked to give way.
+> - **Tests** (`plane_tests.rs`):
+>   - `an_idle_request_runs_only_on_what_no_other_can_use` covers both "nothing while the
+>     foreground has a ready task" and "starts on free threads and memory".
+>   - `a_promoted_request_takes_its_share`.
+>   - `a_yield_frees_the_thread_for_the_foreground` covers threads and memory.
+>   - `a_foreground_node_joining_an_idle_task_runs_it_as_its_own`.
+>   - `a_busy_idle_request_does_not_delay_the_foreground`: `traces/cold-small` beside an idle
+>     request with work for every thread says the same records at the same times. Within one
+>     time the order may differ.
+>   - The random simulation opens a third of its requests idle, promotes some and answers
+>     most yields. The model checks the idle rule and that only idle running tasks are asked,
+>     once.
+>   - With idle off, the simulation draws the same random stream as before. The machine-trace
+>     and fair-share tests are unchanged.
+> - **Executor.** `exec.rs` opens no idle request yet; its `Yield` arm is unreachable.
+> - **Other lanes.** Requested `idle: false` and a `Yield` arm in `machine.rs` and `build.rs`
+>   (`requests.md`), `blaze-cargo` `serve/plane.rs` (`cargo.md`) and `blaze-history`'s tests
+>   (below). Nothing was built or run.
+
 ## fastcompile-intent 3: db: the front end takes a tree parsed in place (`crates/base-db/src/editioned_file_id.rs`, `EditionedFileId::parse`)
 
 What:
@@ -947,3 +1107,359 @@ Why: the daemon's half of ideas 9 and 10. The session (request 1) decides what t
 promote and cancel; the daemon runs the work.
 
 > forwarded to cargo.
+
+## fastcompile-inproc 1: link: commit a staged image into a code memory, an in-process image's layout, and patches from the channel (`crates/blaze-link/src/{lib.rs,commit.rs,output.rs,elf.rs,pe.rs,macho.rs}`, `crates/blaze-live/src/lib.rs`, both `Cargo.toml`s)
+
+What:
+
+1. `blaze-inproc.workspace = true` (no features) in `crates/blaze-link/Cargo.toml` and
+   `crates/blaze-live/Cargo.toml`. `blaze-inproc` depends only on `libc`/`windows-sys` (and on
+   `blaze-core` under its `host` feature), so there is no cycle.
+2. `Image::commit_into(&mut self, staged: Staged, memory: &mut blaze_inproc::CodeMemory) ->
+   Result<Option<Vec<u8>>, LinkError>`: the same checks as `commit` (no commit in flight,
+   staged on the current generation); a full write needs `staged.writes.len <=
+   memory.image_len()`, else an error naming both (no file instead); every `(at, bytes)` of
+   `staged.writes.writes` goes in with `memory.write(at, &bytes)` (a file offset is an offset
+   in the memory), then `memory.publish(CodeRange { offset: at, len })` for each; the image's
+   state becomes the staged state at once (synchronous: no effects, no rename, no message
+   file), with history as `commit` keeps it, so `roll_back` has an in-memory twin
+   (`roll_back_into(&mut self, memory)`, the undo writes the same way). It returns the encoded
+   `blaze_live::patch::Message` the file commit would have written (`None` for a first link),
+   which the caller serves to the program (item 4).
+3. An in-process image (`Output.in_process: Option<blaze_inproc::TlsReserve>`, set by cargo
+   for dev runs and tests): ELF `ET_DYN` with each `PT_LOAD` at `p_offset == p_vaddr`,
+   page-aligned (blaze-link's layout already), entered at `main` (`OutputKind::Executable {
+   entry: "main" }`, with no `Scrt1.o`/`crt1.o` among the natives: the loader starts libc's
+   process itself, so `_start` must not run again), no interpreter; the program's
+   thread-locals placed at the loader's reserve: a local-exec offset from the thread pointer
+   is `reserve.bias + offset` (both TLS variants: `bias` is the reserve's address minus the
+   thread pointer), a `PT_TLS` with `p_memsz > reserve.size` or `p_align > reserve.align` is a
+   link error naming both. PE: the image's `.tls` offsets are `reserve.bias + offset` from
+   the start of the loader's TLS block, `AddressOfIndex` is filled by the loader. Mach-O
+   needs nothing here (its thread-locals go through `__thread_vars`, which the loader fills).
+   The children of fastcompile-inproc (ELF, Mach-O, PE loaders) add what they found below
+   this request.
+4. `blaze-live` under blaze's loader (`blaze_inproc::runtime::attach()` is `Ok`): `Live::poll`
+   calls `blaze_inproc::runtime::quiesce()` (the fence's quiescent point), then compares
+   `Attached::announced()` (one load) with the generation it is at; when newer it sends a
+   frame of kind `0x0300` (body: its generation `u64`) with `Attached::request` and applies the
+   answer of kind `0x0301` (body: one encoded `patch::Message`) as it applies a message file;
+   kind `0x0302` answers "none". The kinds are in `blaze_inproc::frame::kinds::LIVE`
+   (`0x0300..0x0400`), which is `blaze-live`'s. The daemon side (cargo, request 2) stores the
+   message `commit_into` returned and calls `CodeMemory::announce(generation)`.
+5. What blaze's ELF loader (`crates/blaze-inproc/src/load/elf.rs`, by fastcompile-inproc-elf)
+   requires of an in-process ELF image, on top of item 3:
+   - no `PT_INTERP`; `e_entry` is called as `main(argc, argv, envp)`, never `_start`;
+   - `reloc::tp_offset` returns `reserve.bias + (s - tls.addr)` on both architectures (not
+     variant II on x86-64 or variant I on AArch64), and so do the static values of
+     `Holds::TpOff` GOT cells; general-dynamic and TLSDESC need no change (the loader
+     resolves `DTPMOD64`, `DTPOFF64` and `TLSDESC` to its own module and reserve);
+   - `.eh_frame` ends with a 4-byte zero after its last record (crtend.o's `__FRAME_END__`):
+     one ending exactly on a page boundary is refused today;
+   - `e_flags == 0`, no `DT_RPATH`/`DT_RUNPATH`, no `DT_TEXTREL`, no REL tables;
+   - the loader applies `R_*_IRELATIVE` (and `GLOB_DAT`/`ABS64` to a defined
+     `STT_GNU_IFUNC`), so `elf/read.rs`'s refusal "no IRELATIVE relocation to resolve one at
+     load" can be lifted for in-process images; `DT_RELR` is supported and preferred (denser,
+     as mold and lld `-z pack-relative-relocs`).
+6. What blaze's PE loader (`load/pe.rs`, by fastcompile-inproc-windows) requires of an
+   in-process PE image: the first section that is not code starts at a 64 KiB RVA (the
+   allocation granularity a view maps at); `PointerToRawData == VirtualAddress` (already
+   so); thread-locals' `SECREL` biased by `TlsReserve.bias`; no base relocation into code.
+   Added by fastcompile-inproc-windows (each is a load error naming what to change today):
+   - every section of code comes before every other section. The image maps as
+     `[0, code_end)` executable and shared, `[code_end, image_len)` copy-on-write, and the arena
+     executable, so no view is ever writable and executable. No section may be both writable
+     and executable. A code section whose `VirtualSize` exceeds its `SizeOfRawData` must hold
+     zeros in the image after its raw data, because the loader can't write the shared code view;
+   - from code, address RIP-relative only. Absolute addresses (`IMAGE_REL_AMD64_ADDR64`) go
+     only in data, and base relocations are DIR64 only;
+   - keep base relocations (no `/FIXED`). Otherwise the image must be linked at the code
+     memory's chosen base, the only address the loader maps at;
+   - the `.tls` template (`EndAddressOfRawData - StartAddressOfRawData + SizeOfZeroFill`) at
+     most `TlsReserve.size`, and its alignment (the TLS directory's `Characteristics`) at most
+     `TlsReserve.align`, which is 16 on Windows (the NT loader's heap alignment for TLS
+     blocks). TLS callbacks are allowed: the loader calls them;
+   - the entry (`AddressOfEntryPoint`) is the image's C runtime start, `mainCRTStartup`, called
+     with the PEB, unlike ELF's `main` in item 3. The loader rewrites the process's command
+     line so that the CRT's own argv parsing and std's `GetCommandLineW` see the program's;
+   - an executable (`IMAGE_FILE_EXECUTABLE_IMAGE`, not `IMAGE_FILE_DLL`), PE32+ x86-64, with
+     no delay-load imports (directory 13) and no CLR header (directory 14). Imports are by
+     name or ordinal from DLLs found by the standard search order;
+   - `.pdata` (directory 3) sorted, with no overlaps, entries within the code. The loader
+     registers it with `RtlAddFunctionTable`;
+   - `SizeOfStackReserve` no larger than the loader's main thread's stack (see
+     fastcompile-inproc 4).
+
+Why: idea 6 (docs/v2/plan/lanes/fastcompile/inproc.md): a dev run's image goes straight into
+the memory the run process maps, with no file and no link step; later commits are stores into
+it, and the jump-table switch reaches the program over its channel instead of a message file.
+`commit` and file outputs are untouched: `blaze build` and release write files as today.
+
+> forwarded to link (told by tmux).
+
+## fastcompile-inproc 2: cargo: dev `run` and tests load into the process (`crates/blaze-cargo/src/serve/unit/{run.rs,test.rs}`, the daemon's start, `crates/blaze-cargo/Cargo.toml`)
+
+What:
+
+1. `blaze-inproc = { workspace = true, features = ["host"] }` in blaze-cargo.
+2. At daemon start: run `blaze_inproc::host::Host::probe(loader)` once (an `Effect::Spawn`;
+   `loader` is `blaze-inproc-run` beside the running `blaze`, request 4), parse its stdout
+   with `TlsReserve::decode`, and make one `Host::new(<daemon state dir>/inproc, loader,
+   reserve)`, kept in an `Arc`. A failed probe is an error naming the loader on the first dev
+   run, never a quiet switch to writing executables.
+3. `run::start` for a dev profile with no `target.<triple>.runner`: link the binary with
+   `Output.in_process = Some(reserve)` (request `fastcompile-inproc 1`), stage, then make a
+   `CodeMemory::new(name, staged len + room, arena)` (pages cost nothing until written: 1 GiB
+   of room and blaze-lazy's arena size are fine) and `commit_into` it, and keep it in an
+   `Arc<Mutex<_>>` with a `host::Program` (`Program::new(host, memory, Format::host(),
+   sessions)`). The `Command` is made as today, then `let (command, started) =
+   program.command(command, false)?`; spawned with `Effect::Spawn` as today; on its completion
+   `program.exited(started)`. With a runner configured the run writes its executable (a runner
+   takes a file: the configuration decides, not a failure). Release and `blaze build` commit
+   to files as today.
+4. A thread of the run takes each `Session` from `sessions` and serves its channel: frames in
+   `kinds::LAZY` to blaze-lazy's runner, in `kinds::LIVE` from the message `commit_into`
+   returned (request 1 item 4), anything else answered `kinds::REFUSED` with why.
+5. `test::start`: the same for each dev test binary, handing the queue
+   `Binary.loaded = Some(program)` (request `fastcompile-inproc 3`).
+
+Why: the run and test requests choosing the in-process path for dev runs (idea 6).
+
+> forwarded to cargo (told by tmux).
+
+## fastcompile-inproc 3: usercode: the test queue starts a loaded binary through blaze's loader (`crates/blaze-usercode/src/test/queue.rs`, `Cargo.toml`)
+
+What: `blaze-inproc = { workspace = true, features = ["host"] }`; `Binary` gains `pub loaded:
+Option<Arc<blaze_inproc::host::Program>>`. Where the queue makes a binary's `Command`
+(`written`, the fork server; `start_whole`, libtest's threads), when `loaded` is set: `let
+(command, started) = loaded.command(command, forks)?`, `forks` true for the fork server, false
+for a whole run; an `Err` ends that binary's tests with the error, never a spawn of `program`.
+When the server and every child it forked have ended (or the whole run ended),
+`loaded.exited(started)`. The sandbox the queue builds stays; `Program::command` adds the
+loader to read and the host's socket to write.
+
+Why: tests run with no binary on disk (idea 6). Forked children are what `attach_forking` is
+for: the fence can't see a child before it is told of it, so nothing retired is freed while
+the server lives.
+
+> forwarded to usercode: its report ends DONE but its window is editing its crate now; told by tmux.
+
+## fastcompile-inproc 4: coordinator: ship `blaze-inproc-run` beside `blaze`
+
+What: the `blaze-inproc-run` binary target of `crates/blaze-inproc` (no features) built and
+installed in the same directory as the `blaze` binary in every package (the flake's package,
+release archives), as the daemon finds it there. And the `windows-sys` features the Windows
+half (`crates/blaze-inproc/src/sys/windows.rs`, `load/pe.rs`) uses, added to the workspace's
+`windows-sys` dependency in the root `Cargo.toml`: `Win32_System_Diagnostics_Debug`,
+`Win32_System_Kernel`, `Win32_System_Diagnostics_ToolHelp`, `Win32_System_LibraryLoader`,
+`Win32_System_SystemInformation`, `Win32_Security_Cryptography`,
+`Win32_System_Environment`.
+
+Added by fastcompile-inproc-windows: on Windows, link `blaze-inproc-run` with a stack reserve
+at least as large as any program's `SizeOfStackReserve`, because the program runs on the
+loader's main thread and a larger request is refused. The linker's default is 1 MiB, and
+`/STACK:0x800000` (8 MiB, the Linux main thread's size) also covers programs that raise theirs. Keep the MSVC CRT's `tlssup` (`_tls_index`, `_tls_used`, the
+default with `msvcrt`), which the loader's thread-local reserve and its `.CRT$XLM` callback
+rely on.
+
+Why: the run process of every dev run and test (docs/v2/plan/lanes/fastcompile/inproc.md, "The
+loader").
+
+> forwarded to coordinator: packaging (`flake.nix`, release archives) is not among the paths `requests` applies. `blaze-inproc` is already a workspace dependency.
+
+## From requests-nodes (2026-10-29): `idle: false` in `crates/blaze-history/src/tests.rs` (fastcompile-intent 2)
+
+`PlaneInput::Open` has a new field `idle: bool` (see `> applied` under fastcompile-intent 2).
+`crates/blaze-history/src/tests.rs:377` builds one, so it needs `idle: false`. Nothing else in
+blaze-history changes. Its tests only match `PlaneOutput::Run` and `Finished` with `matches!` and
+`if let`, never exhaustively.
+
+> forwarded to fastcompile: `crates/blaze-history/` is its (told by tmux).
+> forwarded to fastcompile: `crates/blaze-history/` is its.
+
+## fastcompile-inproc-macos 1: link: an in-process Mach-O's layout (`crates/blaze-link/src/macho.rs`, the `file_next` of `__DWARF` and `__LINKEDIT`)
+
+What: for an in-process image (`Output.in_process`, request fastcompile-inproc 1 item 3), make
+every segment's file offset its address from `__TEXT`'s, `__DWARF` and `__LINKEDIT` included:
+`file_next = vm_next - base` where `__DWARF` and `__LINKEDIT` are placed (lines 870 and 1006
+today), not the end of the last segment's file bytes. The file gap where `__DATA`'s zero pages
+are is zeros in the code memory, and such pages cost nothing until written. With that, the
+image's length covers its whole memory, zero pages included, so the code memory's image part
+holds it and its arena comes after it. The code signature can be left out of an in-process
+image: the loader never reads `LC_CODE_SIGNATURE`, and the pages run unsigned anyway.
+
+The rest of blaze-link's Mach-O is what blaze's Mach-O loader
+(`crates/blaze-inproc/src/load/macho.rs`, by fastcompile-inproc-macos) loads. It also needs:
+`MH_PIE`, `LC_MAIN`, `LC_DYLD_INFO_ONLY` opcodes with weak binds empty (no chained fixups),
+`@rpath` libraries only under absolute `LC_RPATH`s (no `@executable_path`/`@loader_path`: the
+run has no executable file), no Objective-C or Swift metadata sections, no interposing, no
+`__thread_init`, and no thread-local imported from a library. Each of these is a load error
+naming it. `__eh_frame` and `__unwind_info` in `__TEXT` are both registered (compact-only C
+functions included), so unwinding needs nothing more. `__tlv_bootstrap` binds stay as they
+are: the loader binds them, then overwrites each descriptor's thunk and key.
+
+Why: the loader maps each segment at `base + (vmaddr - __TEXT's vmaddr)` from the same offset
+of the image object, which is the file. Today `__LINKEDIT` sits at the end of `__DATA`'s file
+bytes, before `__DATA`'s zero pages end, so the loader refuses the image with "segment
+__LINKEDIT is at file offset X where its address puts it at Y".
+
+> forwarded to link: `crates/blaze-link/` is its.
+
+## fastcompile-inproc-macos 2: core, cargo: a sandboxed run looks up the daemon's rendezvous service (`crates/blaze-core/src/lib.rs` `Sandbox::On`, `crates/blaze-cargo/src/sandbox/macos.rs` the profile)
+
+What: `Sandbox::On` gains `services: Vec<String>`, Mach global names the process may look up
+(empty everywhere today, and ignored off macOS). blaze-cargo's macOS profile adds `(allow
+mach-lookup (global-name "<name>"))` for each, after its `(deny mach-lookup)`, beside
+`MACH_SERVICES`. Then fastcompile-inproc's `host` puts `dev.blaze.inproc.<daemon pid>` there
+for a sandboxed run it starts.
+
+Why: on macOS a run process gets its memory entries (Mach ports, which a Unix socket can't
+carry) by looking up a bootstrap service the daemon checks in, `dev.blaze.inproc.<daemon pid>`
+(`crates/blaze-inproc/src/sys/macos/rendezvous.rs`). Both sides check the other's audit token,
+so only the process on the channel gets the ports. The profile refuses every lookup outside
+`MACH_SERVICES`, so a sandboxed run (the sandboxed-tests experiment) fails to start with
+"bootstrap_look_up of the daemon's dev.blaze.inproc.<pid> (a sandbox must allow mach-lookup of
+it)". This allows a lookup of one service, of the daemon's own, and nothing else.
+
+> forwarded to the coordinator: it widens the macOS sandbox (one `mach-lookup`, of the daemon's own service), which sandbox-everything asks the coordinator to allow first. Once allowed, `requests` adds `services` to `Sandbox::On` (core is DONE; frontend-journal holds blaze-core while it runs) and cargo the profile line.
+
+## fastcompile-inproc-macos 3: coordinator: how `blaze-inproc-run` is signed on macOS (packaging, beside fastcompile-inproc 4)
+
+What: sign `blaze-inproc-run` ad hoc or with a Developer ID, without the hardened runtime
+(`codesign` without `--options runtime`). If a release must have the hardened runtime, it
+needs the entitlements `com.apple.security.cs.allow-unsigned-executable-memory` (the image's
+pages carry no signature), `com.apple.security.cs.disable-library-validation` (the program's
+own and third-party dylibs) and `com.apple.security.cs.allow-dyld-environment-variables` (a
+program's `DYLD_*` variables). `allow-jit` does not help.
+
+Why: from XNU (`vm_fault_cs_check_violation`, `kern_exec.c`), a process with `CS_ENFORCEMENT`
+(the hardened runtime without that entitlement) is killed at the first unsigned page it runs.
+Pages of blaze's code memory are never signed: they are written by the daemon. The loader
+checks `csops` before it maps code and refuses with an error naming this.
+
+> forwarded to the coordinator (packaging, `.github/`).
+
+## frontend-activate: `Address::Inherited` arm in `crates/blaze-global/src/lib.rs` `fn place`
+
+`blaze_core::Address` gets a variant `Inherited { fd: i32, at: FileName }` (a listening Unix
+socket systemd or launchd passed the daemon; requested of frontend-journal in
+`v2/requests/frontend-journal.md`). `place` matches `Address` exhaustively, so it needs the
+arm. Old:
+
+```rust
+        Address::Unix(name) => format!("unix:{name}"),
+        Address::Tcp(addr) => format!("tcp:{addr}"),
+```
+
+New:
+
+```rust
+        Address::Unix(name) => format!("unix:{name}"),
+        Address::Inherited { fd, at } => format!("unix:{at} (fd {fd})"),
+        Address::Tcp(addr) => format!("tcp:{addr}"),
+```
+
+Why: restore.md, "The daemon starts on demand". Nothing else in blaze-global changes.
+
+> forwarded to fastcompile: `crates/blaze-global/` is its.
+
+## fastcompile-stencil 1: codegen: `Backend::Stencil`, the stencil library's id in the settings, and `Target::Counter` (`crates/blaze-codegen/src/{lib.rs,settings.rs,content.rs}`)
+
+What:
+
+1. `Backend` gains `Stencil` (copy-and-patch, tier 0 of dev and test runs;
+   docs/v2/plan/lanes/fastcompile/stencil.md). `Spec::settings` hashes it as tag `2`
+   (`Cranelift` 0, `Llvm` 1).
+2. `Toolchain` gains `pub stencils: Option<String>`: the hex of `blaze_stencil::library_id`
+   for the toolchain's target (`None` for a blaze whose target has no library), hashed like
+   `llvm` (`[1]` + part, or `[0]`), and added to `every_field_is_in_the_settings`. A unit
+   with `Backend::Stencil` and `stencils: None` is refused by the backend, naming the target.
+3. `Target` gains `Counter(InstanceKey)`: the function's own two tier counter cells (16
+   bytes, 8-aligned, zeroed), written by its own code (`add [cell], 1`) and read by the
+   daemon. Placed by the linker in writable memory, one pair per instance, never merged.
+   `content::target_id` gives it a domain of its own (`"blaze v2 counter 1"` over the
+   key).
+
+Why: the third dev backend (idea 4) needs its own key (a changed stencil set changes every
+stencil unit's key, or stale code is reused), and its tier-up counters (idea 13) need a
+relocation that names one function's cells without a symbol per function.
+
+## fastcompile-stencil 2: codegen: the stencil backend in hir-ty-codegen (`crates/hir-ty-codegen/{Cargo.toml,v2.rs,v2/backend.rs,v2/convert.rs,unwind.rs,fragment.rs,target.rs}`)
+
+What:
+
+1. `blaze-stencil.workspace = true` in `hir-ty-codegen`'s `[dependencies]`.
+2. `Prepared::Stencil(Box<Function>)`, made by `prepared` for `Backend::Stencil` exactly as for
+   Cranelift (including `colocate`). `check_spec` accepts it on x86-64 and AArch64 with the
+   same checks as Cranelift (no target features, the process's target and CPU) and
+   `toolchain.stencils == Some(hex(blaze_stencil::library_id(&target)))`.
+3. `emit` of `Prepared::Stencil`: run `float_pair::lower` on the IR as `compiled` does, then
+   `blaze_stencil::compile(&func, &stencil_target)`. `stencil_target` is built from
+   `crate::Target`: `arch`; `os`; `cpu` (`AppleM1` for `apple-m1`, else `Baseline`); `pic`
+   and `tls` as `Target::isa` sets `is_pic` and `tls_model`; `probe_stack` true off wasm;
+   `probe_log2` as Cranelift's `probestack_size_log2` default (12). Then convert the
+   `blaze_stencil::Code` into a `fragment::Code`:
+   - `signature`: the function's (after `pairs.hold`, as for Cranelift);
+   - `bytes`, `align`;
+   - `relocs`: one `fragment::Reloc` per `code::Reloc`, with `RelocName` mapped one to one
+     (`User` by `RelocName::user`, `LibCall`, `Known`, `Own`). `code::Name::Counter` becomes
+     a new `RelocName::Counter`, which `convert.rs` makes `Target::Counter(unit key)`;
+   - `unwind`: `code::Unwind::Dwarf { len, rows }` becomes `FunctionUnwind::from_rows(FrameRows
+     { len, rows }, landing_pads)` (each `code::Rule` is the `FrameRule` of the same name),
+     and `Windows { len, info }` becomes `from_unwind_info(len, info, pads)`. The landing pads
+     are `lsda::write` over `code.calls`/`code.handlers` (`CallEntry { start: ret - 1,
+     landing_pad, catch: tag == CATCH }`, a call with no handlers one entry with landing pad
+     0), as `call_entries` does for Cranelift's call sites. `from_rows` and
+     `from_unwind_info` (and `seh::Pads` built from call sites) are no longer gated on the
+     `llvm` feature;
+   - `lines`: `LineRow::of_ranges(code.lines)`;
+   - `slots`: `SlotPlaces` from `code.slots` (base register and each named slot's offset), as
+     `of_frame` gives for Cranelift.
+   Then `told(...)` as for Cranelift. A `blaze_stencil::Error` is `failed(unit, e)`, never a
+   compile with Cranelift.
+4. `masked` returns `None` for `Prepared::Stencil` (no folds at tier 0); `summarize` and
+   `merge` refuse it as they refuse Cranelift units.
+
+Why: idea 4's backend plugs in where Cranelift's does and returns the same `CompiledFunction`,
+over the same IR, so both dev backends agree on what a program means.
+
+## fastcompile-stencil 3: link: place `Target::Counter` cells (`crates/blaze-link/`)
+
+What: for each function with a `Target::Counter(key)` relocation, 16 zeroed bytes, 8-aligned,
+in one writable region of the image (one cell pair per instance key, never merged). The
+relocation is resolved to the cell's address (with its addend, 0 or 8). The image says where
+each instance's cells are (`Image::counter(key) -> Option<u64>`), and the in-process image
+puts the region in blaze-inproc's code memory object, so the daemon reads the counts in place
+through its own view. A patch of a function keeps its cells (the counts carry over a
+recompile at the same tier) unless the instance key changes.
+
+Why: tier-up (idea 13) reads tier 0's counts in place, with no sampler and no channel round
+trip.
+
+## fastcompile-stencil 4: proof: a backend axis in the corpus differential (`harness/v2/corpus.py`, `engine.py`)
+
+What: an `EngineSpec` field `dev_backend` (`"default"`, `"stencil"`, `"cranelift"`) passed to
+the daemon as the dev tier's backend for every function. `corpus.py` takes `"backends":
+["stencil", "cranelift"]`, runs each project step once per backend, and adds a comparison
+per (project, step) between the two: the same output, exit status and panics, on top of each
+one's comparison with cargo.
+
+Why: idea 4's rule that the stencil backend's output behaves as Cranelift's on the corpus,
+checked on whole programs.
+
+## fastcompile-stencil 5: coordinator: dev-dependencies and LLVM for every build
+
+What:
+
+1. Workspace dependencies `cranelift-interpreter = "0.136"` and `cranelift-reader =
+   "0.136"`, for `blaze-stencil`'s tests (the reference interpreter of each stencil, and its
+   CLIF corpus).
+2. `LLVM_SYS_231_PREFIX` set in every environment that builds blaze (the flake's shell and
+   packages, CI): `blaze-stencil`'s build script links LLVM through `vendor/llvm-sys` to make
+   the stencils, so a blaze without the `llvm` feature needs the pinned LLVM at build time
+   too. It fails naming the variable when it is unset.
+3. With item 1, in `crates/blaze-stencil/Cargo.toml`'s `[dev-dependencies]`:
+   `cranelift-interpreter.workspace = true` and `cranelift-reader.workspace = true` (left out
+   until the workspace has them, so the workspace keeps loading).
+
+Why: docs/v2/plan/lanes/fastcompile/stencil.md, "Why a build script" and "Tests".

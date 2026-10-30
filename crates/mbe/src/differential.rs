@@ -2,7 +2,9 @@
 //! matched arm and error for every macro and input, over a corpus of the features, seeded
 //! random macros and inputs, and the benchmark's real-world macros. And
 //! [`crate::expect_fragment`], which parses a window of the level, against the model's, which
-//! converts the whole rest of it: the same fragment, error and position after.
+//! converts the whole rest of it: the same fragment, error and position after. And every input
+//! and expansion parsed through the parser input made from the token trees' columns against
+//! the old conversion's (`syntax_bridge::reference`): the same input, tree, errors and spans.
 
 use std::fmt::Write;
 
@@ -52,10 +54,12 @@ fn assert_same(
 ) -> Vec<tt::TopSubtree> {
     let call_site = call_site();
     let mut expansions = Vec::new();
+    assert_same_parses(db, input, &|| format!("{}\nthe input", what()));
     for style in STYLES {
         let new = expander::expand_rules(db, &mac.rules, input, |_| (), style, call_site);
         let old = expander::model::expand_rules(db, &mac.rules, input, |_| (), style, call_site);
         assert_eq!(new, old, "{}\nstyle: {style:?}", what());
+        assert_same_parses(db, &new.value.0, &|| format!("{}\nstyle: {style:?}", what()));
         expansions.push(new.value.0);
         if marked {
             let marker = |span: &mut Span| span.range = TextRange::empty(TextSize::from(7));
@@ -65,6 +69,66 @@ fn assert_same(
         }
     }
     expansions
+}
+
+const TOP_ENTRY_POINTS: usize = 5;
+
+fn top_entry_point(idx: usize) -> parser::TopEntryPoint {
+    use parser::TopEntryPoint::*;
+    [MacroItems, MacroStmts, Expr, Pattern, Type]
+        .into_iter()
+        .nth(idx)
+        .expect("an entry point index below `TOP_ENTRY_POINTS`")
+}
+
+/// What a closure gives, or that it panicked: the two conversions must fail alike too (a `'`
+/// with no name after it).
+fn caught<T>(f: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
+}
+
+/// Parses `tt` as each kind of expansion through the parser input made in one pass over its
+/// columns and through the one the old cursor conversion made, and asserts the trees, their
+/// errors and their span maps are the same, and so are the inputs, as a parser's and as a
+/// matcher's.
+fn assert_same_parses(db: &dyn salsa::Database, tt: &tt::TopSubtree, what: &dyn Fn() -> String) {
+    use syntax_bridge::reference;
+    let mut edition = |ctx: SyntaxContext| ctx.edition(db);
+    for view in [tt.view().strip_invisible(), tt.token_trees(), tt.view().as_token_trees()] {
+        let new = caught(|| syntax_bridge::to_parser_input(view, &mut edition));
+        let old = caught(|| reference::to_parser_input(view, &mut edition));
+        match (&new, &old) {
+            (Some(new), Some(old)) => {
+                assert!(reference::same_input(new, old), "{}\nthe parser's input", what())
+            }
+            (None, None) => continue,
+            _ => panic!("{}\none conversion panicked: new {}", what(), new.is_none()),
+        }
+        let new = syntax_bridge::to_matcher_input(view, &mut edition);
+        let old = reference::to_matcher_input(view, &mut edition);
+        assert!(reference::same_input(&new, &old), "{}\nthe matcher's input", what());
+    }
+    for idx in 0..TOP_ENTRY_POINTS {
+        let new = caught(|| {
+            let (parse, map) =
+                syntax_bridge::token_tree_to_syntax_node(tt, top_entry_point(idx), &mut edition);
+            (parse.debug_dump(), map)
+        });
+        let old = caught(|| {
+            let (parse, map) =
+                reference::token_tree_to_syntax_node(tt, top_entry_point(idx), &mut edition);
+            (parse.debug_dump(), map)
+        });
+        let context = || format!("{}\nparsed as {:?}", what(), top_entry_point(idx));
+        match (new, old) {
+            (Some((new_tree, new_map)), Some((old_tree, old_map))) => {
+                assert_eq!(new_tree, old_tree, "{}", context());
+                assert!(new_map == old_map, "{}: the span maps differ", context());
+            }
+            (None, None) => (),
+            (new, _) => panic!("{}\none parse panicked: new {}", context(), new.is_none()),
+        }
+    }
 }
 
 const ENTRY_POINTS: usize = 10;

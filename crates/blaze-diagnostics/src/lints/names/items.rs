@@ -6,7 +6,7 @@
 //! - after it, `rustc_privacy`'s `check_private_in_public` (`private_interfaces`,
 //!   `private_bounds`, E0446: `privacy`), `rustc_lint`'s late module pass over each item
 //!   (`externs`' `improper_ctypes`, `naming`, `derives`, `bounds`, `mangle`, `publicity`,
-//!   `docs`, `traits`, `runtime_symbols`), and `clashing_extern_declarations` (`externs`).
+//!   `track_caller`, `docs`, `traits`, `non_local`, `runtime_symbols`, `lifetime_syntax`, `c_void`), and `clashing_extern_declarations` (`externs`).
 //!
 //! `walk` gives the items in the order rustc's passes visit them; `visibility` their effective
 //! visibilities, as `rustc_privacy` computes them.
@@ -22,19 +22,25 @@ mod c_void;
 mod derives;
 mod docs;
 mod externs;
+mod lifetime_syntax;
 mod lifetimes;
 mod mangle;
 mod naming;
+mod non_local;
 mod privacy;
 mod publicity;
 mod runtime_symbols;
 mod statics;
+mod track_caller;
 mod traits;
 mod visibility;
 mod walk;
 
+use std::cell::OnceCell;
+
 use blaze_items::ItemId;
-use hir_def::{AdtId, FunctionId};
+use hir_def::{AdtId, FunctionId, lang_item::lang_items, unstable_features::UnstableFeatures};
+use intern::Symbol;
 use syntax::{
     AstNode, SyntaxNode, TextRange, TextSize,
     ast::{self, HasGenericParams, HasName, HasTypeBounds},
@@ -66,6 +72,8 @@ pub(super) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
     let items = walk::items(cx);
     let effective = visibility::Effective::of(cx, &items);
     let canonical = runtime_symbols::Canonical::of(cx, &items);
+    let anonymous_in_impl_trait = feature(cx, "anonymous_lifetime_in_impl_trait");
+    let async_track_caller = feature(cx, "async_fn_track_caller");
     let mut found = docs::krate(cx);
     found.extend(naming::krate(cx));
     for (index, item) in items.iter().enumerate() {
@@ -75,12 +83,15 @@ pub(super) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
         found.extend(bounds::type_alias(cx, item));
         found.extend(mangle::item(cx, item));
         found.extend(publicity::item(cx, item, &effective));
+        found.extend(track_caller::item(cx, item, async_track_caller));
         found.extend(bounds::drop(cx, item));
         found.extend(derives::debug(cx, item, &effective));
         found.extend(docs::item(cx, item, &effective));
         found.extend(traits::async_fn(cx, item, &effective));
+        found.extend(non_local::item(cx, item));
         found.extend(runtime_symbols::item(cx, item, &items[index + 1..], &canonical));
         found.extend(externs::ctypes_nested(cx, item));
+        found.extend(lifetime_syntax::item(cx, item, anonymous_in_impl_trait));
         found.extend(c_void::item(cx, item));
     }
     found

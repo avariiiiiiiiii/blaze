@@ -6,16 +6,21 @@
 //!   binary-independent identity and what it read at run time, so a test whose code and inputs
 //!   are as they were when it passed is reported unreached, in every view and worktree at the
 //!   same code. [`select::Why`] says why one runs (`--explain`).
-//! - [`wire`]: the fork server's protocol, and [`FORK_SERVER`] its harness side, which blaze's
+//! - [`wire`]: the fork server's protocol, and [`fork_server`] its harness side, which blaze's
 //!   generated test harness includes.
 //! - [`queue`]: the sans-IO queue over every binary's fork server: critical first, timeouts,
-//!   retries for flaky tests, fail-fast, output and reads per test; or a binary run whole as
-//!   libtest's threads for a package that opts out.
+//!   retries for flaky tests, fail-fast, output, reads and the execution record per test; or a
+//!   binary run whole as libtest's threads for a package that opts out.
 //!
 //! A request's tests go: [`select::wanted`] and [`select::select`] for each test, a
 //! [`queue::Queue`] of what runs, and for each [`queue::Finished`] what it read
 //! ([`queue::Trace::traced`]) and [`select::record`]; [`report`] gives each result as the agent
-//! API reports it.
+//! API reports it. [`queue::Finished::executed`] is what blaze-testsel keeps a pass by
+//! (`Record::of_hits`, `Record::incomplete`); once cargo selects through it
+//! (`blaze_testsel::select::{choose, keep}`), [`select::select`], [`select::record`] and
+//! [`select::Test::identity`] retire.
+//!
+//! The costs and the fastest known way of each part: docs/v2/plan/lanes/usercode/tests.md.
 
 pub mod queue;
 pub mod select;
@@ -24,20 +29,43 @@ pub mod wire;
 
 use std::time::Duration;
 
-pub use queue::{Binary, Config, Failure, Finished, Job, Mode, Outcome, Queue, Trace};
+pub use queue::{Binary, Config, Failure, Finished, Job, Lines, Mode, Outcome, Queue, Trace};
 pub use select::{
     Attrs, Decision, Filter, Ignored, Input, Passes, ShouldPanic, Suite, Test, Wanted, Why,
 };
+pub use wire::Executed;
 
 /// The harness side of the fork server: a module `fork_server` for blaze's generated test
 /// harness to put beside its `main` (inside the module that has `extern crate test`), with
 /// `pub fn serve(tests: &'static [&'static test::TestDescAndFn], socket: OsString) -> !` and
 /// `pub const SOCKET: &str` ([`wire::SOCKET`]). The harness's `main` calls `serve` when the
 /// variable is set and `test::test_main_env_args` otherwise.
-pub const FORK_SERVER: &str = concat!(
-    "\n    pub mod fork_server {\n",
+///
+/// With `record` (a binary with jump-table slots), the server asks the runtime's
+/// `__blaze_exec_slots` once, maps each test's execution record before its fork, has the child
+/// arm it (`__blaze_exec_arm`) and sends what it executed ([`wire::read_region`]); without, it
+/// names neither export, and every end says [`wire::UNRECORDED`]. Both texts are constants:
+/// nothing is made per binary or per test.
+pub fn fork_server(record: bool) -> &'static str {
+    match record {
+        true => RECORDED,
+        false => UNRECORDED,
+    }
+}
+
+const RECORDED: &str = concat!(
+    "\n    #[allow(dead_code)]\n    pub mod fork_server {\n",
     include_str!("test/wire.rs"),
     include_str!("test/fork_server.rs"),
+    include_str!("test/fork_server/recorded.rs"),
+    "    }\n"
+);
+
+const UNRECORDED: &str = concat!(
+    "\n    #[allow(dead_code)]\n    pub mod fork_server {\n",
+    include_str!("test/wire.rs"),
+    include_str!("test/fork_server.rs"),
+    include_str!("test/fork_server/unrecorded.rs"),
     "    }\n"
 );
 

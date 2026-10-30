@@ -196,7 +196,7 @@ pub fn atomic_ordering_of<'db>(
             };
             variant.try_to_leaf()?.to_uint_unchecked()
         }
-        ConstKind::Unevaluated(_) => try_const_usize(db, ordering)?,
+        ConstKind::Alias(..) => try_const_usize(db, ordering)?,
         _ => return None,
     };
     AtomicOrdering::from_discriminant(discriminant)

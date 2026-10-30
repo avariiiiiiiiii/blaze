@@ -23,6 +23,7 @@
 #![deny(unsafe_code)]
 
 mod persist;
+mod std_hash;
 mod table;
 
 #[cfg(test)]
@@ -32,6 +33,7 @@ use blaze_ids::{ContentId, Domain, Hasher};
 
 pub use crate::{
     persist::{Load, PACK_SCHEMA},
+    std_hash::hash_std,
     table::{HashCons, Interned},
 };
 

@@ -1,15 +1,17 @@
 //! The errors of rustc's AST validation: what it rejects of the crate once it is expanded and
 //! `cfg` has removed what it removes, before names are resolved. The lints it buffers for the
 //! early lint pass (`missing_abi`, `patterns_in_fns_without_body`, ..) are
-//! `crate::lints::syntax::early::validation`'s; what hir reports of the same thing
-//! (`MissingBody`, `PatternArgInExternFn`, `TraitImplIncorrectSafety`) is lowered in
-//! `crate::lower` and given here no second time.
+//! `crate::lints::syntax::early::validation`'s. What hir reports of the same thing
+//! (`MissingBody`, `PatternArgInExternFn`, and `TraitImplIncorrectSafety` of an `unsafe`
+//! negative or inherent impl) is given here, where the walk comes to it, and its lowering in
+//! `crate::lower` gives nothing.
 //!
 //! - `items`: `visit_item`, `visit_foreign_item`, `visit_assoc_item` (visibilities, `default`,
-//!   bodies, safety, auto traits, `extern` blocks, `#[no_mangle]` and module names), and
+//!   bodies, safety, auto traits, `extern` blocks, `#[no_mangle]` and module names, E0198), and
 //!   the parser's check of the modifiers of an inherent impl.
 //! - `fns`: `visit_fn` (parameters, the ABI's signature, `#[track_caller]`, C-variadics,
-//!   `const` with `async`, patterns of a function without a body) of functions and closures.
+//!   `const` with `async`, patterns of a function without a body or in an `extern` block
+//!   (E0642, E0130)) of functions and closures.
 //! - `generics`: `visit_generics`, `visit_param_bound`, `visit_generic_args` and the
 //!   `[const]` bounds a context allows.
 //! - `types`: `visit_ty_common` (function pointers, trait objects, `impl Trait`).

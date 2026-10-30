@@ -107,6 +107,18 @@ impl ZalsaLocal {
         zalsa.graph().record(&self.graph, edges)
     }
 
+    /// Writes a capture frame's edges and then its fingerprint words into the edge array
+    /// ([`crate::capture`]).
+    #[inline]
+    pub(crate) fn record_reads(
+        &self,
+        zalsa: &Zalsa,
+        edges: impl ExactSizeIterator<Item = QueryEdge>,
+        tail: &[u32],
+    ) -> EdgeSpan {
+        zalsa.graph().record_with_tail(&self.graph, edges, tail)
+    }
+
     /// The pages this task allocates in, which it gives up.
     pub(crate) fn take_unfilled_pages(
         &mut self,

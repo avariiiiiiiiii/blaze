@@ -3,11 +3,11 @@ use std::mem::offset_of;
 use blaze_v2_proof::{Rng, columns};
 
 use super::{
-    COLD_HEADER, CORRUPT, Codec, ColdDictionary, HotColumn, HotRef, Packed, WarmColumn, WarmRef,
-    Width, cold_codec, compress, decode_cold, decode_cold_bytes, decode_raw, encode_cold,
-    encode_cold_bytes, encode_raw, put_varint, raw_cold,
+    BufferColumns, COLD_HEADER, CORRUPT, Codec, ColdDictionary, HotColumn, HotRef, Packed,
+    WarmColumn, WarmRef, Width, cold_codec, columns_of, compress, decode_cold, decode_cold_bytes,
+    decode_raw, encode_cold, encode_cold_bytes, encode_raw, put_varint, raw_cold,
 };
-use crate::{Aligned, FormatError, Record, Writer, open, record};
+use crate::{Aligned, FormatError, Record, Rel, Slice, Str, WordTable, Writer, open, record, row_words};
 
 const SEEDS: [u64; 4] = [1, 17, 4242, 0x9e37_79b9_7f4a_7c15];
 
@@ -275,23 +275,6 @@ fn every_codec_size_is_computed_exactly() {
 }
 
 #[test]
-fn radix_sort_is_a_sort() {
-    let mut rng = Rng::new(9);
-    for seed in SEEDS {
-        for (name, values) in columns::shapes(seed) {
-            let mut shuffled = values.clone();
-            for i in (1..shuffled.len()).rev() {
-                shuffled.swap(i, rng.below(i as u64 + 1) as usize);
-            }
-            let mut expected = shuffled.clone();
-            expected.sort_unstable();
-            super::radix_sort(&mut shuffled);
-            assert_eq!(shuffled, expected, "{name} of {}", values.len());
-        }
-    }
-}
-
-#[test]
 fn a_warm_block_is_in_simd_bp128_layout() {
     let values: Vec<u32> = (0..super::BLOCK_VALUES as u32 + 3).collect();
     let packed = Packed::pack(&values);
@@ -435,4 +418,154 @@ fn the_tier_records_have_their_schemas() {
     assert_ne!(HotColumn::SCHEMA, WarmColumn::SCHEMA);
     assert_eq!(size_of::<HotColumn>(), 24);
     assert_eq!(size_of::<WarmColumn>(), 20);
+}
+
+record! {
+    #[derive(Clone, Copy, Debug)]
+    struct Node: 1 {
+        id: u32,
+        flag: bool,
+        pad: [u8; 3],
+        words: Slice<u32>,
+        name: Str,
+    }
+}
+
+record! {
+    #[derive(Clone, Copy, Debug)]
+    struct Tree: 1 {
+        nodes: Slice<Node>,
+        sizes: Slice<u32>,
+        /// The words of `sizes` from the second on: one column with it.
+        again: Slice<u32>,
+        first: Rel<Node>,
+        wide: Slice<u64>,
+        /// The first four words of `wide`, two a row: one table with it, a word a row.
+        pairs: Slice<[u32; 2]>,
+    }
+}
+
+/// A tree of `nodes` nodes from `rng`, and where its word tables are: the nodes (six words a
+/// row), each node's words that are not empty, `sizes`, and `wide`.
+fn tree_buffer(rng: &mut Rng, nodes: usize) -> (Aligned, Vec<WordTable>) {
+    let mut out = Writer::new(Tree::SCHEMA);
+    let mut expected = Vec::new();
+    let mut placed = Vec::new();
+    for n in 0..nodes {
+        let len = rng.below(300) as usize;
+        let spread = 1 + rng.below(1 << rng.below(32)) as u32;
+        let words: Vec<u32> = (0..len).map(|_| rng.below(spread as u64) as u32).collect();
+        let at = out.push_slice(&words);
+        if len > 0 {
+            expected.push(WordTable { at: at as usize, rows: len, stride: 1 });
+        }
+        let name = format!("node {n}");
+        placed.push((at, len, out.push_str(&name), name.len()));
+    }
+    let sizes: Vec<u32> = (0..nodes as u32 + 2).map(|it| it * 7).collect();
+    let sizes_at = out.push_slice(&sizes);
+    expected.push(WordTable { at: sizes_at as usize, rows: sizes.len(), stride: 1 });
+    let wide_at = out.push_slice(&[u64::MAX, 3, 1 << 40]);
+    expected.push(WordTable { at: wide_at as usize, rows: 6, stride: 1 });
+    let nodes_at = out.next::<Node>();
+    if nodes > 0 {
+        const { assert!(size_of::<Node>() == 24) };
+        expected.push(WordTable { at: nodes_at as usize, rows: nodes, stride: 6 });
+    }
+    let nodes: Vec<Node> = placed
+        .iter()
+        .enumerate()
+        .map(|(n, &(words, len, name, name_len))| {
+            let node_at = nodes_at + (n * size_of::<Node>()) as u64;
+            Node {
+                id: n as u32,
+                flag: n % 2 == 0,
+                pad: [0; 3],
+                words: Slice::between(node_at + offset_of!(Node, words) as u64, words, len),
+                name: Slice::between(node_at + offset_of!(Node, name) as u64, name, name_len),
+            }
+        })
+        .collect();
+    assert_eq!(out.push_slice(&nodes), nodes_at);
+    let at = out.next::<Tree>();
+    let field = |offset: usize| at + offset as u64;
+    let root = Tree {
+        nodes: Slice::between(field(offset_of!(Tree, nodes)), nodes_at, nodes.len()),
+        sizes: Slice::between(field(offset_of!(Tree, sizes)), sizes_at, sizes.len()),
+        again: Slice::between(field(offset_of!(Tree, again)), sizes_at + 4, sizes.len() - 1),
+        first: match nodes.is_empty() {
+            true => Rel::NONE,
+            false => Rel::between(field(offset_of!(Tree, first)), nodes_at),
+        },
+        wide: Slice::between(field(offset_of!(Tree, wide)), wide_at, 3),
+        pairs: Slice::between(field(offset_of!(Tree, pairs)), wide_at, 2),
+    };
+    assert_eq!(out.push(&root), at);
+    expected.sort_unstable();
+    (Aligned::copy_from(&out.finish(at)), expected)
+}
+
+#[test]
+fn a_buffer_s_word_columns_are_found_from_its_schema() {
+    const { assert!(Tree::COLUMNS && Node::COLUMNS && !<[u32; 4] as Record>::COLUMNS) };
+    const { assert!(row_words::<Node>() == 6 && row_words::<u64>() == 2 && row_words::<u8>() == 0) };
+    let mut rng = Rng::new(5);
+    for nodes in [0, 1, 2, 40] {
+        let (buffer, expected) = tree_buffer(&mut rng, nodes);
+        assert_eq!(columns_of::<Tree>(&buffer, Tree::SCHEMA), Ok(expected), "{nodes} nodes");
+    }
+    let (buffer, _) = tree_buffer(&mut rng, 3);
+    assert!(matches!(columns_of::<Tree>(&buffer, Node::SCHEMA), Err(FormatError::Schema { .. })));
+}
+
+#[test]
+fn a_buffer_round_trips_warm_and_cold_exactly() {
+    let forms = BufferColumns::of::<Tree>(Tree::SCHEMA);
+    for seed in SEEDS {
+        let mut rng = Rng::new(seed);
+        for nodes in [0, 1, 7, 60] {
+            let (buffer, _) = tree_buffer(&mut rng, nodes);
+            let warm = forms.warm(&buffer).unwrap();
+            assert_eq!(forms.hot_from_warm(&warm).unwrap(), &buffer[..], "{seed} {nodes} warm");
+            let cold = forms.cold(&buffer).unwrap();
+            assert_eq!(forms.hot_from_cold(&cold).unwrap(), &buffer[..], "{seed} {nodes} cold");
+            assert!(cold.len() < buffer.len() || nodes < 60, "{seed} {nodes}: {} cold bytes", cold.len());
+            let mut unaligned = vec![0u8];
+            unaligned.extend_from_slice(&buffer);
+            assert_eq!(forms.warm(&unaligned[1..]).unwrap(), warm, "{seed} {nodes} unaligned");
+        }
+    }
+}
+
+#[test]
+fn a_buffer_round_trips_cold_with_a_dictionary_and_only_with_it() {
+    let mut rng = Rng::new(21);
+    let samples: Vec<Vec<u8>> = (0..300).map(|_| tree_buffer(&mut rng, 3).0.to_vec()).collect();
+    let dictionary = ColdDictionary::train(&samples, 8 << 10).unwrap();
+    let forms = BufferColumns::of::<Tree>(Tree::SCHEMA).with_dictionary(dictionary);
+    let (buffer, _) = tree_buffer(&mut rng, 5);
+    let cold = forms.cold(&buffer).unwrap();
+    assert_eq!(forms.hot_from_cold(&cold).unwrap(), &buffer[..]);
+    assert!(BufferColumns::of::<Tree>(Tree::SCHEMA).hot_from_cold(&cold).is_err());
+}
+
+#[test]
+fn a_damaged_buffer_form_is_refused_or_decodes_never_panicking() {
+    let forms = BufferColumns::of::<Tree>(Tree::SCHEMA);
+    let (buffer, _) = tree_buffer(&mut Rng::new(8), 4);
+    let warm = forms.warm(&buffer).unwrap();
+    for at in 0..warm.len() {
+        for flip in [0x01, 0x80, 0xff] {
+            let mut bad = warm.clone();
+            bad[at] ^= flip;
+            if let Ok(back) = forms.hot_from_warm(&bad) {
+                assert!(back.len() <= 2 * buffer.len() + (1 << 16), "a flip at {at}");
+            }
+        }
+        assert!(forms.hot_from_warm(&warm[..at]).is_err(), "cut at {at}");
+    }
+    let mut longer = warm.clone();
+    longer.push(0);
+    assert!(forms.hot_from_warm(&longer).is_err());
+    assert!(forms.hot_from_cold(&warm).is_err(), "a warm form read as cold");
 }

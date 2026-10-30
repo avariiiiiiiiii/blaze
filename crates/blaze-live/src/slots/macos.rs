@@ -212,7 +212,9 @@ impl Memory for Os {
             let mut at = span.at;
             while at < span.end() {
                 let (found, protection) = match &region {
-                    Some((found, protection)) if found.contains(&at) => (found.clone(), *protection),
+                    Some((found, protection)) if found.contains(&at) => {
+                        (found.clone(), *protection)
+                    }
                     _ => {
                         let looked = region_at(at)?;
                         region = Some(looked.clone());

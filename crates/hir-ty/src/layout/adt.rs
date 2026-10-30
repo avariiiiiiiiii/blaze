@@ -8,14 +8,15 @@ use rustc_abi::{
     TargetDataLayout, WrappingRange,
 };
 use rustc_index::IndexVec;
+use blaze_hashcons::Interned;
 use smallvec::SmallVec;
-use triomphe::Arc;
 
 use crate::{
     db::HirDatabase,
     layout::{
-        FIELDS_INLINE, Layout, LayoutCx, LayoutError, RustcEnumVariantIdx, RustcFieldIdx,
-        enum_variant_ids, struct_flags, struct_tail_may_be_unsized, variant_field_ids,
+        FIELDS_INLINE, InternedLayout, Layout, LayoutCx, LayoutError, RustcEnumVariantIdx,
+        RustcFieldIdx, enum_variant_ids, intern_layout, struct_flags, struct_tail_may_be_unsized,
+        variant_field_ids,
     },
     next_solver::{DbInterner, GenericArgs, StoredGenericArgs},
     representability::{Representability, representability},
@@ -28,7 +29,7 @@ pub fn layout_of_adt_query(
     def: AdtId,
     args: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
-) -> Result<Arc<Layout>, LayoutError> {
+) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     let krate = trait_env.krate;
     let Ok(target) = db.target_data_layout(krate) else {
         return Err(LayoutError::TargetLayoutNotAvailable);
@@ -40,7 +41,7 @@ pub fn layout_of_adt_query(
     let cx = LayoutCx::new(dl);
     let args = args.as_ref();
     // Every variant's field layouts in one buffer, variant `i` at `fields[ends[i - 1]..ends[i]]`.
-    let mut fields = SmallVec::<[Arc<Layout>; FIELDS_INLINE]>::new();
+    let mut fields = SmallVec::<[&Layout; FIELDS_INLINE]>::new();
     let mut ends = SmallVec::<[u32; FIELDS_INLINE]>::new();
     let mut push_variant = |variant: VariantId| -> Result<(), LayoutError> {
         variant_field_layouts(db, variant, args, &trait_env, &mut fields)?;
@@ -83,8 +84,7 @@ pub fn layout_of_adt_query(
         AdtId::StructId(s) => struct_tail_may_be_unsized(db, s, krate),
         AdtId::UnionId(_) | AdtId::EnumId(_) => false,
     };
-    let refs: SmallVec<[&Layout; FIELDS_INLINE]> = fields.iter().map(|it| &**it).collect();
-    let variants = variants_of(&refs, &ends);
+    let variants = variants_of(&fields, &ends);
     let mut result = if matches!(def, AdtId::UnionId(..)) {
         cx.calc.layout_of_union(&repr, &variants)?
     } else {
@@ -122,7 +122,7 @@ pub fn layout_of_adt_query(
             });
         }
     }
-    Ok(Arc::new(result))
+    Ok(intern_layout(result))
 }
 
 /// Pushes the layout of each field of `variant` onto `out`, in order, reading the variant's
@@ -132,7 +132,7 @@ fn variant_field_layouts<'db>(
     variant: VariantId,
     args: GenericArgs<'db>,
     trait_env: &StoredParamEnvAndCrate,
-    out: &mut SmallVec<[Arc<Layout>; FIELDS_INLINE]>,
+    out: &mut SmallVec<[&'static Layout; FIELDS_INLINE]>,
 ) -> Result<(), LayoutError> {
     let interner = DbInterner::new_no_crate(db);
     let types = db.field_types(variant);
@@ -168,7 +168,7 @@ fn layout_of_adt_cycle_result(
     _def: AdtId,
     _args: StoredGenericArgs,
     _trait_env: StoredParamEnvAndCrate,
-) -> Result<Arc<Layout>, LayoutError> {
+) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     Err(LayoutError::RecursiveTypeWithoutIndirection)
 }
 
@@ -225,29 +225,28 @@ mod tests {
     /// What `layout_of_adt` did before: per variant a `Vec` of layouts, a `Vec` of references
     /// and an `IndexVec`.
     fn nested_with_vecs(
-        variants: &[Vec<Arc<Layout>>],
+        variants: &[Vec<&Layout>],
         layout: impl FnOnce(&Variants<'_, '_>) -> Result<Layout, LayoutError>,
     ) -> Result<Layout, LayoutError> {
         let variants = variants
             .iter()
-            .map(|it| it.iter().map(|it| &**it).collect::<Vec<_>>())
+            .map(|it| it.to_vec())
             .collect::<SmallVec<[_; 1]>>();
         let variants = variants.iter().map(|it| it.iter().collect()).collect::<IndexVec<_, _>>();
         layout(&variants)
     }
 
     fn flat(
-        variants: &[Vec<Arc<Layout>>],
+        variants: &[Vec<&Layout>],
         layout: impl FnOnce(&Variants<'_, '_>) -> Result<Layout, LayoutError>,
     ) -> Result<Layout, LayoutError> {
-        let mut fields = SmallVec::<[Arc<Layout>; FIELDS_INLINE]>::new();
+        let mut fields = SmallVec::<[&Layout; FIELDS_INLINE]>::new();
         let mut ends = SmallVec::<[u32; FIELDS_INLINE]>::new();
         for variant in variants {
-            fields.extend(variant.iter().cloned());
+            fields.extend(variant.iter().copied());
             ends.push(fields.len() as u32);
         }
-        let refs: SmallVec<[&Layout; FIELDS_INLINE]> = fields.iter().map(|it| &**it).collect();
-        layout(&variants_of(&refs, &ends))
+        layout(&variants_of(&fields, &ends))
     }
 
     #[test]
@@ -262,7 +261,7 @@ mod tests {
         };
         let mut seed = Seed(0x2545_f491_4f6c_dd1d);
         for case in 0..400 {
-            let mut field = || pool[seed.below(pool.len())].clone();
+            let mut field = || &pool[seed.below(pool.len())];
             let mut seed_len = Seed(case as u64 + 1);
             let count = match case % 3 {
                 // An enum: up to six variants, a variant without fields among them.
@@ -270,12 +269,12 @@ mod tests {
                 // A struct or a union.
                 _ => 1,
             };
-            let mut variants: Vec<Vec<Arc<Layout>>> = (0..count)
+            let mut variants: Vec<Vec<&Layout>> = (0..count)
                 .map(|_| (0..seed_len.below(6)).map(|_| field()).collect())
                 .collect();
             let unsized_tail = case % 3 == 2 && seed_len.below(2) == 0;
             if unsized_tail {
-                variants[0].push(tail.clone());
+                variants[0].push(&tail);
             }
             let is_enum = case % 3 == 0;
             let struct_or_enum = |variants: &Variants<'_, '_>| -> Result<Layout, LayoutError> {

@@ -685,7 +685,7 @@ impl Owner {
         match msg {
             Msg::Open { request, weight, keep_going, heard } => {
                 self.heard.insert(request, heard);
-                let input = PlaneInput::Open { at_ns, request, weight, keep_going };
+                let input = PlaneInput::Open { at_ns, request, weight, keep_going, idle: false };
                 if self.step(request, input) {
                     // Its room in the plane is given back once it finishes; after that a step
                     // naming it is refused as `UnknownRequest`.
@@ -805,6 +805,9 @@ impl Owner {
                 }
             }
             PlaneOutput::Run { id, pool, near, critical } => self.run(id, pool, near, critical),
+            PlaneOutput::Yield { id } => {
+                unreachable!("node {id} asked to give way: the scheduler opens no idle request")
+            }
             PlaneOutput::Finished { request, ok } => {
                 // Work found by a task that then gave way, and never added.
                 self.works.retain(|_, it| it.request != request);

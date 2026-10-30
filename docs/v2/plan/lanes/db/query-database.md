@@ -111,6 +111,15 @@ The front end's queries stay `#[salsa::tracked]` on `vendor/salsa`, remade by th
   is a sound fingerprint within one process. Salsa's fingerprints are not persisted.
 - One `Sync` database shared by reference: no per-thread handles, no `fork`; parallel work (the
   def-map collector's expansion rounds, `SourceDatabase::run_all`) runs as plane tasks.
+- The check (`hir::check`) matches rustc's parallel front end (`par_hir_for_each_module`, one
+  module per rayon task) and beats it twice. A run of small modules is one plane task: 32
+  items or more, except the last, cut in def-map order so the cut is deterministic. And the
+  diagnostics come out in def-map order whatever the threads did, which rustc's don't.
+- Well-formedness (`hir-ty-wfcheck`) matches rustc's `check_well_formed` under
+  `enter_wf_checking_ctxt`. It builds one inference context per item, and only for an item
+  with aliases to normalize. Outlives components live on the stack. The result is a zero-copy
+  record (`WfResultRef`): 24-byte rows with the text after them.
+- The borrow checker: [borrowck.md](borrowck.md).
 
 ## Not in `blaze-query`
 

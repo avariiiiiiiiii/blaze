@@ -9,7 +9,6 @@
 //! `InvalidTarget`), `compiler/rustc_attr_parsing/src/target_checking.rs` (`check_target`,
 //! `check_crate_level`) and `compiler/rustc_attr_parsing/src/template.rs` (MIT or Apache-2.0).
 
-use blaze_items::Fact;
 use hir::InFile;
 use span::Edition;
 use syntax::{TextRange, TextSize};
@@ -133,13 +132,9 @@ impl Session {
         self.features.enabled(name)
     }
 
-    /// rustc's `feature_err` of the language feature `feature` at `span`, which reads the
-    /// `#![feature]`s of the crate root besides its source.
-    pub(crate) fn feature_err(&self, cx: &Cx<'_, '_>, feature: &str, span: Span, explain: impl Into<String>) -> Diag {
-        let mut diag = crate::checks::features::feature_err(&self.features, feature, span, explain);
-        let root = cx.krate.root_module(cx.db);
-        diag.fact(Fact::Signature(cx.module_key(root)), "the `#![feature]`s of the crate root");
-        diag
+    /// rustc's `feature_err` of the language feature `feature` at `span`.
+    pub(crate) fn feature_err(&self, feature: &str, span: Span, explain: impl Into<String>) -> Diag {
+        crate::checks::features::feature_err(&self.features, feature, span, explain)
     }
 }
 
@@ -257,15 +252,6 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     /// An error with code `code` at `range` of the attribute's file.
     pub(crate) fn err(&self, code: Option<&str>, message: impl Into<String>, range: TextRange) -> Diag {
         Diag::error(code, message, self.span(range))
-    }
-
-    /// rustc's `feature_err(..).emit()` of the language feature `feature` at `range`, unless the
-    /// crate enables it.
-    pub(crate) fn gate(&mut self, feature: &str, range: TextRange, explain: impl Into<String>) {
-        if !self.feature(feature) {
-            let diag = self.session.feature_err(self.cx, feature, self.span(range), explain);
-            self.emit_err(diag);
-        }
     }
 
     /// The error of one of `checks::features::attributes`' gates, when it gives one.

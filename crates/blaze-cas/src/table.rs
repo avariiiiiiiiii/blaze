@@ -5,23 +5,43 @@
 //!   with one compare-and-swap. A lookup is acquire loads and key compares: it writes nothing.
 //! - A key never moves: a full level is not rehashed; the table adds a level twice as large,
 //!   and lookups look through every level, oldest first.
+//! - A key is in one level at most. An insert walks the levels oldest first too, and leaves a
+//!   level it finds too full by sealing the empty slot that ends the key's run there: every
+//!   inserter of the key meets that same slot, so one compare-and-swap decides for all of them
+//!   whether the key lands in that level or every one of them goes on to the next.
 //! - Only the store (the one writer) swaps a published value for another of the same key, and
 //!   hands the old one to its [`blaze_reclaim::Limbo`]: a reader may still hold it.
 //! - Each row (a slot, numbered across levels) has flag bits in words beside the slots, set
 //!   with one relaxed `fetch_or` and only when not set already.
 
-use std::{
-    marker::PhantomData,
-    ptr,
-    sync::{
-        OnceLock,
-        atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
-    },
-};
+use std::{marker::PhantomData, ptr};
 
 use blaze_reclaim::Guard;
 
+use crate::sync::{
+    OnceLock,
+    atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+};
+
 const LEVELS: usize = 40;
+
+/// What a sealed slot holds: an address no value has, never dereferenced.
+static SEAL: u8 = 0;
+
+fn seal<T>() -> *mut T {
+    ptr::from_ref(&SEAL).cast_mut().cast()
+}
+
+/// What a probe of a level for a key met.
+enum Probe<'a, T> {
+    /// The key, at this slot.
+    Found(usize, &'a T),
+    /// The empty slot that ends the key's run: the key is not in this level yet.
+    Empty(usize),
+    /// A seal ending the key's run, or a level with no empty slot: the key is not in this level
+    /// and never will be.
+    Past,
+}
 
 /// A value of a table: immutable once published, found by its key.
 pub(crate) trait Keyed: Send + Sync {
@@ -63,8 +83,6 @@ pub(crate) struct Table<T: Keyed> {
     /// Slots of level 0, a power of two; level `n` has `first << n`.
     first: usize,
     columns: usize,
-    /// The highest level made, as a hint where to insert.
-    top: AtomicUsize,
     /// It owns what its slots point to.
     _owns: PhantomData<Box<T>>,
 }
@@ -80,7 +98,6 @@ impl<T: Keyed> Table<T> {
             levels: [const { OnceLock::new() }; LEVELS],
             first: first.next_power_of_two().max(64),
             columns,
-            top: AtomicUsize::new(0),
             _owns: PhantomData,
         };
         table.level(0);
@@ -100,13 +117,11 @@ impl<T: Keyed> Table<T> {
         assert!(level < LEVELS, "a table of more than {LEVELS} levels");
         self.levels[level].get_or_init(|| {
             let cap = self.cap(level);
-            let made = Level {
+            Level {
                 slots: (0..cap).map(|_| AtomicPtr::new(ptr::null_mut())).collect(),
                 bits: (0..self.columns * cap / 64).map(|_| AtomicU64::new(0)).collect(),
                 used: AtomicUsize::new(0),
-            };
-            self.top.fetch_max(level, Ordering::AcqRel);
-            made
+            }
         })
     }
 
@@ -114,69 +129,71 @@ impl<T: Keyed> Table<T> {
         self.levels.iter().enumerate().map_while(|(at, level)| level.get().map(|it| (at, it)))
     }
 
-    fn probe<'a>(&'a self, level: &'a Level<T>, key: &T::Key) -> Result<(usize, &'a T), Option<usize>> {
+    /// Walks `key`'s run in `level` to the key, or to the null or seal that ends the run.
+    fn probe<'a>(&'a self, level: &'a Level<T>, key: &T::Key) -> Probe<'a, T> {
         let mask = level.slots.len() - 1;
         let mut at = T::hash(key) as usize & mask;
         for _ in 0..level.slots.len() {
             let found = level.slots[at].load(Ordering::Acquire);
             if found.is_null() {
-                return Err(Some(at));
+                return Probe::Empty(at);
+            }
+            if found == seal() {
+                return Probe::Past;
             }
             // SAFETY: a published value is freed only as `Held` says, and the caller holds one
             // for the lifetime it gives out.
             let found = unsafe { &*found };
             if found.key() == *key {
-                return Ok((at, found));
+                return Probe::Found(at, found);
             }
             at = (at + 1) & mask;
         }
-        Err(None)
+        Probe::Past
     }
 
     pub(crate) fn get<'a>(&'a self, _held: Held<'a>, key: &T::Key) -> Option<Hit<'a, T>> {
         for (number, level) in self.made() {
-            match self.probe(level, key) {
-                Ok((at, found)) => return Some((self.base(number) + at as u64, found)),
-                Err(_) => {}
+            if let Probe::Found(at, found) = self.probe(level, key) {
+                return Some((self.base(number) + at as u64, found));
             }
         }
         None
     }
 
     /// Publishes `value` unless its key is there already: then it gives `value` back with
-    /// what is there. Two inserts of one key racing across a level being added can both land;
-    /// a lookup finds the one in the older level.
-    pub(crate) fn insert<'a>(&'a self, held: Held<'a>, value: Box<T>) -> Result<Hit<'a, T>, (Box<T>, Hit<'a, T>)> {
+    /// what is there. Of inserts of one key racing, exactly one lands.
+    pub(crate) fn insert<'a>(&'a self, _held: Held<'a>, value: Box<T>) -> Result<Hit<'a, T>, (Box<T>, Hit<'a, T>)> {
         let key = value.key();
-        if let Some(found) = self.get(held, &key) {
-            return Err((value, found));
-        }
         let raw = Box::into_raw(value);
-        let mut number = self.top.load(Ordering::Acquire);
+        let mut number = 0;
         loop {
             let level = self.level(number);
-            if level.used.load(Ordering::Relaxed) * 2 >= level.slots.len() {
-                number += 1;
-                continue;
-            }
-            match self.probe(level, &key) {
-                Ok((at, found)) => {
+            let at = match self.probe(level, &key) {
+                Probe::Found(at, found) => {
                     // SAFETY: `raw` was never published.
                     let value = unsafe { Box::from_raw(raw) };
                     return Err((value, (self.base(number) + at as u64, found)));
                 }
-                Err(None) => number += 1,
-                Err(Some(at)) => {
-                    let won = level.slots[at]
-                        .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok();
-                    if won {
-                        level.used.fetch_add(1, Ordering::Relaxed);
-                        // SAFETY: published just now; freed only as `Held` says.
-                        return Ok((self.base(number) + at as u64, unsafe { &*raw }));
-                    }
-                    // Another value took the slot: probe the level again.
+                Probe::Past => {
+                    number += 1;
+                    continue;
                 }
+                Probe::Empty(at) => at,
+            };
+            // A level half full takes no more: probes stay short. Its runs are sealed rather
+            // than left open, so no inserter of this key can land here after this one moved on.
+            let full = level.used.load(Ordering::Relaxed) * 2 >= level.slots.len();
+            let put = if full { seal() } else { raw };
+            match level.slots[at].compare_exchange(ptr::null_mut(), put, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) if full => number += 1,
+                Ok(_) => {
+                    level.used.fetch_add(1, Ordering::Relaxed);
+                    // SAFETY: published just now; freed only as `Held` says.
+                    return Ok((self.base(number) + at as u64, unsafe { &*raw }));
+                }
+                // Another value or a seal took the slot: probing the level again sees which.
+                Err(_) => {}
             }
         }
     }
@@ -187,12 +204,13 @@ impl<T: Keyed> Table<T> {
     pub(crate) fn replace(&self, value: Box<T>) -> Result<Box<T>, Box<T>> {
         let key = value.key();
         for (_, level) in self.made() {
-            if let Ok((at, _)) = self.probe(level, &key) {
+            if let Probe::Found(at, _) = self.probe(level, &key) {
                 let old = level.slots[at].swap(Box::into_raw(value), Ordering::AcqRel);
-                // SAFETY: `old` is not null: `probe` found a value in this slot, and a slot once
-                // set is only swapped for another `Box::into_raw`, never cleared. The swap
-                // unlinked it, and the one caller that swaps (the store, under `&mut`) owns it
-                // now; readers that found it keep reading it until the limbo frees it.
+                // SAFETY: `old` is neither null nor the seal: `probe` found a value in this slot,
+                // and a slot holding a value is only swapped for another `Box::into_raw`, never
+                // cleared or sealed. The swap unlinked it, and the one caller that swaps (the
+                // store, under `&mut`) owns it now; readers that found it keep reading it until
+                // the limbo frees it.
                 return Ok(unsafe { Box::from_raw(old) });
             }
         }
@@ -206,7 +224,7 @@ impl<T: Keyed> Table<T> {
             level.slots.iter().enumerate().filter_map(move |(at, slot)| {
                 let found = slot.load(Ordering::Acquire);
                 // SAFETY: as in `probe`.
-                (!found.is_null()).then(|| (base + at as u64, unsafe { &*found }))
+                (!found.is_null() && found != seal()).then(|| (base + at as u64, unsafe { &*found }))
             })
         })
     }
@@ -262,7 +280,7 @@ impl<T: Keyed> Drop for Table<T> {
         for level in self.levels.iter_mut().filter_map(OnceLock::get_mut) {
             for slot in level.slots.iter_mut() {
                 let value = *slot.get_mut();
-                if !value.is_null() {
+                if !value.is_null() && value != seal() {
                     // SAFETY: the table owns what its slots hold, and nothing reads a table
                     // being dropped.
                     drop(unsafe { Box::from_raw(value) });
@@ -274,8 +292,6 @@ impl<T: Keyed> Drop for Table<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, thread};
-
     use super::*;
 
     struct Value {
@@ -349,7 +365,10 @@ mod tests {
     /// Threads insert overlapping keys at once: each key ends with one value, every insert
     /// that lost found the winner, and every reader during it saw only whole values.
     #[test]
+    #[cfg(not(blaze_check))]
     fn racing_inserts_keep_one_value_a_key() {
+        use std::{sync::Arc, thread};
+
         let table: Arc<Table<Value>> = Arc::new(Table::new(64, 0));
         let threads: Vec<_> = (0..8u64)
             .map(|t| {
@@ -380,7 +399,8 @@ mod tests {
         for key in 0..20_000 {
             assert_eq!(table.get(held, &key).map(|(_, it)| it.n), Some(key + 1));
         }
-        // Only a race across a level being added lands a key twice.
-        assert!(won >= 20_000, "{won} inserts won");
+        assert_eq!(won, 20_000, "one insert of each key lands");
+        assert_eq!(table.len(), 20_000);
+        assert_eq!(table.iter(held).count(), 20_000);
     }
 }

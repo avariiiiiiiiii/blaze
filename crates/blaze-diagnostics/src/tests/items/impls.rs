@@ -1,7 +1,8 @@
 //! rustc's UI tests of the errors of impls: coherence (E0116, E0117, E0118, E0390, E0120,
-//! E0204, E0184, E0206, E0366), the safety of impls (E0198, E0199, E0200), the items of a trait
-//! impl against its trait's (E0046, E0049, E0050, E0185, E0186, E0407, E0437, E0438) and items
-//! given twice (E0201, E0592). Each test's file is the UI test's source byte for byte.
+//! E0204, E0184, E0206, E0366), the safety of impls (E0199, E0200), the items of a trait impl
+//! against its trait's (E0046, E0049, E0050, E0185, E0186, E0407, E0437, E0438) and items
+//! given twice (E0201, E0592). Each test's file is the UI test's source byte for byte. An
+//! `unsafe` negative impl (E0198) is AST validation's (`tests/items/ast_validation.rs`).
 
 use crate::{
     Options,
@@ -151,34 +152,6 @@ error: aborting due to 2 previous errors
 For more information about this error, try `rustc --explain E0390`.
 "#;
     assert_eq!(ui("E0390.rs", "2015", source), stderr);
-}
-
-#[test]
-fn an_unsafe_negative_impl() {
-    // tests/ui/error-codes/E0198.rs
-    let source = r#"#![feature(negative_impls)]
-
-struct Foo;
-
-unsafe impl !Send for Foo { } //~ ERROR E0198
-
-fn main() {
-}
-"#;
-    let stderr = r#"error[E0198]: negative impls cannot be unsafe
-  --> $DIR/E0198.rs:5:13
-   |
-LL | unsafe impl !Send for Foo { }
-   | ------      -^^^^
-   | |           |
-   | |           negative because of this
-   | unsafe because of this
-
-error: aborting due to 1 previous error
-
-For more information about this error, try `rustc --explain E0198`.
-"#;
-    assert_eq!(ui_core("E0198.rs", "send", source), stderr);
 }
 
 #[test]

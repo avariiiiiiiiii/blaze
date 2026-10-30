@@ -206,7 +206,7 @@ impl Args<'_> {
     }
 }
 
-impl<'db> Evaluator<'db> {
+impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// `name` is the intrinsic's without `llvm.`.
     pub(super) fn exec_llvm_intrinsic(
         &mut self,

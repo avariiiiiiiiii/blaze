@@ -30,7 +30,7 @@ use hir_def::{
     signatures::{FunctionSignature, TraitSignature},
 };
 use rustc_type_ir::{
-    BoundRegionKind, BoundVar, ClauseKind, RegionKind, TypeVisitableExt as _,
+    AliasTyKind, BoundRegionKind, BoundVar, ClauseKind, RegionKind, TypeVisitableExt as _,
     inherent::{IntoKind, Term as _},
 };
 use salsa::SalsaValue;
@@ -39,7 +39,8 @@ use hir_ty::{
     GenericPredicates, ImplTraitId, InferBodyId, InferenceResult,
     db::HirDatabase,
     next_solver::{
-        BoundRegion, Clause, DbInterner, GenericArgKind, Region, SolverDefId, TermId, Ty, TyKind,
+        BoundRegion, Clause, DbInterner, GenericArgKind, OpaqueTyIdWrapper, Region, TermId, Ty,
+        TyKind,
     },
 };
 
@@ -133,7 +134,7 @@ impl<'db> Check<'_, 'db> {
             .of(self.db, adt)
             .into_iter()
             .filter_map(|it| {
-                let rustc_type_ir::OutlivesPredicate(arg, region) = it;
+                let rustc_type_ir::OutlivesClause(arg, region) = it;
                 match arg.kind() {
                     GenericArgKind::Type(ty) => Some(Needs::Type(ty, region)),
                     GenericArgKind::Lifetime(longer) => Some(Needs::Region(longer, region)),
@@ -386,7 +387,9 @@ impl<'db> Check<'_, 'db> {
         let mut opaques = Vec::new();
         outlives::opaques(output, &mut opaques);
         for alias in opaques {
-            let SolverDefId::InternedOpaqueTyId(opaque) = alias.kind.def_id() else { continue };
+            let AliasTyKind::Opaque { def_id: OpaqueTyIdWrapper(opaque) } = alias.kind else {
+                continue;
+            };
             let ImplTraitId::ReturnTypeImplTrait(owner, index) = opaque.loc(db) else { continue };
             if owner != function {
                 continue;
@@ -400,12 +403,12 @@ impl<'db> Check<'_, 'db> {
             let mut needs = Vec::new();
             let mut found = Vec::new();
             outlives::wf(db, &mut self.inferred, ty, &mut found);
-            let bounds = rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id());
+            let bounds = rustc_type_ir::Interner::item_bounds(interner, opaque.into());
             for clause in bounds.iter_instantiated(interner, alias.args.as_slice()) {
-                if let ClauseKind::TypeOutlives(rustc_type_ir::OutlivesPredicate(bounded, region)) =
+                if let ClauseKind::TypeOutlives(rustc_type_ir::OutlivesClause(bounded, region)) =
                     clause.kind().skip_binder()
-                    && let TyKind::Alias(bounded) = bounded.kind()
-                    && bounded.kind.def_id() == alias.kind.def_id()
+                    && let TyKind::Alias(_, bounded) = bounded.kind()
+                    && bounded.kind == alias.kind
                     && !region.has_escaping_bound_vars()
                 {
                     let region = match region.kind() {
@@ -435,13 +438,15 @@ impl<'db> Check<'_, 'db> {
         let mut opaques = Vec::new();
         outlives::opaques(output, &mut opaques);
         for alias in opaques {
-            let SolverDefId::InternedOpaqueTyId(opaque) = alias.kind.def_id() else { continue };
+            let AliasTyKind::Opaque { def_id: OpaqueTyIdWrapper(opaque) } = alias.kind else {
+                continue;
+            };
             let ImplTraitId::ReturnTypeImplTrait(owner, index) = opaque.loc(db) else { continue };
             if owner != function {
                 continue;
             }
             let mut found = Vec::new();
-            let bounds = rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id());
+            let bounds = rustc_type_ir::Interner::item_bounds(interner, opaque.into());
             for clause in bounds.iter_instantiated(interner, alias.args.as_slice()) {
                 let (args, term) = match clause.kind().skip_binder() {
                     ClauseKind::Trait(predicate) => (predicate.trait_ref.args, None),
@@ -526,7 +531,7 @@ impl<'db> Check<'_, 'db> {
                     }));
                     tys.extend(predicate.term.as_type());
                 }
-                ClauseKind::TypeOutlives(rustc_type_ir::OutlivesPredicate(ty, _)) => {
+                ClauseKind::TypeOutlives(rustc_type_ir::OutlivesClause(ty, _)) => {
                     self_ty = Some(ty);
                     tys.push(ty);
                 }
@@ -575,8 +580,8 @@ impl<'db> Check<'_, 'db> {
             let WherePredicate::TypeBound { target, bound, .. } = predicate else {
                 return false;
             };
-            let on_target = match (&store[*target], param) {
-                (TypeRef::TypeParam(id), Some(param)) => *id == param,
+            let on_target = match (store.type_ref(*target), param) {
+                (TypeRef::TypeParam(id), Some(param)) => id == param,
                 (TypeRef::TypeParam(_), None) | (_, Some(_)) => false,
                 (_, None) => true,
             };
@@ -635,7 +640,7 @@ impl<'db> Check<'_, 'db> {
             let code = match region.kind() {
                 RegionKind::ReStatic => "E0310",
                 RegionKind::ReLateParam(late)
-                    if !matches!(late.bound_region.kind, BoundRegionKind::Named(_)) =>
+                    if !matches!(late.kind.kind, BoundRegionKind::Named(_)) =>
                 {
                     "E0311"
                 }

@@ -26,7 +26,7 @@ use syntax::{
 };
 
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag},
 };
@@ -36,6 +36,10 @@ pub(super) struct InteriorMutableConsts;
 impl LatePass for InteriorMutableConsts {
     fn name(&self) -> &'static str {
         "InteriorMutableConsts"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

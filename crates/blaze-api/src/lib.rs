@@ -22,9 +22,12 @@
 //! - [`session`]: what each request does, over the VFS, the database and the [`build::Builder`].
 //! - [`client`]: the CLI's and CI's side, blocking.
 //! - [`json`]: the rendering for people.
+//! - [`activation`]: the socket a service manager passes the daemon, the one unsafe module.
+//! - [`units`]: the launchd agent and systemd units that socket-activate it.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+pub mod activation;
 pub mod build;
 pub mod client;
 pub mod frames;
@@ -33,6 +36,7 @@ pub mod intent;
 pub mod json;
 pub mod server;
 pub mod session;
+pub mod units;
 
 pub use intent::{Edit, Edited, EditedItem, How, Target};
 
@@ -43,7 +47,7 @@ use blaze_vfs::{Change, Op, View};
 use serde::{Deserialize, Serialize};
 
 /// The version of every body's schema. A change to any type here is a new number.
-pub const SCHEMA: u32 = 9;
+pub const SCHEMA: u32 = 10;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -495,6 +499,8 @@ pub enum TestOutcome {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Status {
+    /// The daemon's process: what `kill` and the restart budgets name.
+    pub pid: u32,
     pub views: u32,
     pub requests: Vec<u64>,
     pub budget_bytes: u64,

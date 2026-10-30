@@ -8,39 +8,34 @@
 //! words, as [`Code`] writes them. Type refs are written the same way, as the columns of
 //! [`TypeColumns`]: kinds, data words, `extra` and the list array copied, the side tables
 //! (bounds, paths, references, arrays, fn pointers, type params) in the words. Bindings, labels
-//! and lifetimes are one [`Node`] column per arena, their fields in the same words. Its source
-//! map is a buffer of its own, so that spans stay out of what is hashed: the maps back from an
-//! id to its syntax as dense columns of [`Src`], the maps from syntax to an id as two columns
-//! each, the keys as [`Src`]s in the [`SourceTable`]'s order and the ids beside them, and
-//! everything else in words.
+//! and lifetimes are one [`Node`] column per arena, their fields in the same words. Source maps
+//! are buffers of their own, so that spans stay out of what is hashed ([`source_map`]).
 //!
-//! What is read from a buffer is checked before it is used: each kind and each column's ids,
-//! and the order of each source table's keys, when the buffer is read; each id in a record or a
-//! side table, and the columns as a whole ([`HirColumns::check`], [`TypeColumns::check`]), when
-//! it is decoded. An id past the arena it indexes is a [`FormatError::Invalid`], never a later
-//! panic. The ids of a source map index its store, which is another buffer: they are not
-//! checked.
+//! What is read from a buffer is checked before it is used: each kind and each column's ids
+//! when the buffer is read; each id in a record or a side table, and the columns as a whole
+//! ([`HirColumns::check`], [`TypeColumns::check`]), when it is decoded. An id past the arena it
+//! indexes is a [`FormatError::Invalid`], never a later panic.
+
+mod source_map;
 
 use std::mem::{offset_of, size_of};
 
 use blaze_format::{
     FormatError, Part, Persist, Record, SchemaHash, Slice, Str, Writer, open_as, schema_of,
 };
-use either::Either;
 use hir_expand::{
-    HirFileId, InFile, MacroCallId, MacroCallStyles, MacroDefId, MacroDefKind,
+    MacroCallStyles, MacroDefId, MacroDefKind,
     builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
     name::Name,
     proc_macro::{CustomProcMacroExpander, ProcMacroKind},
 };
 use intern::Symbol;
-use la_arena::{Arena, ArenaMap, Idx, RawIdx};
+use la_arena::{Arena, Idx, RawIdx};
 use rustc_abi::ExternAbi;
 use rustc_hash::FxHashMap;
 use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
 use span::Edition;
-use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast};
 
 use crate::{
     AdtId, BlockId, ConstId, EnumId, EnumVariantId, FunctionId, GenericDefId, ImplId,
@@ -48,10 +43,8 @@ use crate::{
     TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
     expr_store::{
-        Body, BodySourceMap, ExprOrPatSource, ExprRoot, ExpressionOnlySourceMap,
-        ExpressionOnlyStore, ExpressionStore, ExpressionStoreDiagnostics, ExpressionStoreSourceMap,
-        ExprSource, FormatTemplate, HygieneId, IdTable, LabelSource, LifetimeSource, MacroCallPtr,
-        MissingBodyItemKind, NO_OWNER, PatSource, SourceTable, TypeSource,
+        Body, ExprRoot, ExpressionOnlyStore, ExpressionStore, HygieneId, MissingBodyItemKind,
+        NO_OWNER,
         body::Param,
         path::{
             AssociatedTypeBinding, GenericArg, GenericArgs, GenericArgsParentheses, NormalPath,
@@ -61,7 +54,7 @@ use crate::{
     hir::{
         AsmOperand, AsmOptions, AsmPiece, Binding, BindingAnnotation, BindingId, BindingProblems,
         ExprId, ExprOrPatId, ExprOrPatIdPacked, FloatTypeWrapper, InlineAsm, InlineAsmKind,
-        InlineAsmRegOrRegClass, Item, Label, LabelId, Literal, MatchArm, OffsetOf, PatId,
+        InlineAsmRegOrRegClass, Item, Label, Literal, MatchArm, OffsetOf, PatId,
         RecordFieldPat, RecordLitField, Statement,
         columns::{self, Frozen, HirColumns},
         persist::{Code, Column, Node, Placed, Read, Words, WordsRec, syntax_context},
@@ -72,6 +65,8 @@ use crate::{
         RefType, TraitBoundModifier, TypeBound, TypeColumns, TypeRefId, UseArgRef,
     },
 };
+
+pub use self::source_map::{BodySourceMapRef, ExpressionStoreSourceMapRef};
 
 blaze_format::record! {
     /// Two ids, or an id and what a side table holds for it.
@@ -198,69 +193,10 @@ blaze_format::record! {
     }
 }
 
-blaze_format::record! {
-    /// A syntax pointer in a file: absent when `file_kind` is 0, and then all zeros.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-    pub(crate) struct Src: 1 {
-        /// The salsa id of the file or of the macro call, as its bits.
-        pub(crate) file: u64,
-        /// 0 for no pointer, [`FILE`] or [`MACRO_FILE`].
-        pub(crate) file_kind: u32,
-        pub(crate) kind: u32,
-        pub(crate) start: u32,
-        pub(crate) end: u32,
-    }
-}
-
-blaze_format::record! {
-    /// The root of an [`ExpressionStoreSourceMap`]'s buffer. The back maps are dense, by id.
-    /// Each [`SourceTable`] is its keys, in strictly increasing order of [`Src::key`], and the
-    /// value of each beside it: an id raw (a packed one for expressions and patterns), a macro
-    /// call's salsa id as its bits.
-    #[derive(Clone, Copy)]
-    pub(crate) struct SourceMapRoot: 3 {
-        pub(crate) expr_map_back: Slice<Src>,
-        pub(crate) pat_map_back: Slice<Src>,
-        pub(crate) label_map_back: Slice<Src>,
-        pub(crate) types_map_back: Slice<Src>,
-        pub(crate) lifetime_map_back: Slice<Src>,
-        pub(crate) expr_map: Slice<Src>,
-        pub(crate) expr_map_ids: Slice<u32>,
-        pub(crate) pat_map: Slice<Src>,
-        pub(crate) pat_map_ids: Slice<u32>,
-        pub(crate) label_map: Slice<Src>,
-        pub(crate) label_map_ids: Slice<u32>,
-        pub(crate) types_map: Slice<Src>,
-        pub(crate) types_map_ids: Slice<u32>,
-        pub(crate) lifetime_map: Slice<Src>,
-        pub(crate) lifetime_map_ids: Slice<u32>,
-        pub(crate) expansions: Slice<Src>,
-        pub(crate) expansion_calls: Slice<u64>,
-        pub(crate) words: WordsRec,
-        /// [`HAS_EXPRS`].
-        pub(crate) flags: u32,
-    }
-}
-
-blaze_format::record! {
-    /// The root of a [`BodySourceMap`]'s buffer.
-    #[derive(Clone, Copy)]
-    pub(crate) struct BodySourceMapRoot: 3 {
-        pub(crate) store: SourceMapRoot,
-        /// The pointer to `self`, when there is one.
-        pub(crate) self_param: Slice<Src>,
-    }
-}
-
-/// The store has an [`ExpressionOnlyStore`], or the source map an [`ExpressionOnlySourceMap`].
+/// The store has an [`ExpressionOnlyStore`], or the source map an `ExpressionOnlySourceMap`.
 const HAS_EXPRS: u32 = 1 << 0;
 /// The store's `type_hygiene` is `Some`.
 const HAS_TYPE_HYGIENE: u32 = 1 << 1;
-
-/// A [`Src`] in a file.
-const FILE: u32 = 1;
-/// A [`Src`] in the expansion of a macro call.
-const MACRO_FILE: u32 = 2;
 
 macro_rules! kinds {
     ($($(#[$meta:meta])* $name:ident { $($variant:ident),* $(,)? })*) => {$(
@@ -451,10 +387,6 @@ fn edition_of(bits: u32) -> Option<Edition> {
     (bits <= Edition::LATEST as u32).then(|| Edition::from_u32(bits))
 }
 
-fn syntax_kind(bits: u32) -> Option<SyntaxKind> {
-    (bits < SyntaxKind::__LAST as u32).then(|| SyntaxKind::from(bits as u16))
-}
-
 /// The words of `bytes`, four to a word, after their length.
 fn put_bytes(w: &mut Words, bytes: &[u8]) {
     w.len(bytes.len());
@@ -476,199 +408,6 @@ fn get_bytes(r: &mut Read<'_>) -> Result<Box<[u8]>, FormatError> {
     }
     bytes.truncate(len);
     Ok(bytes.into_boxed_slice())
-}
-
-/// Writes `table` in its order, which is by id.
-fn put_table<K: Code, V: Code>(w: &mut Words, table: &IdTable<K, V>) {
-    w.len(table.entries().len());
-    for (k, v) in table.entries() {
-        k.put(w);
-        v.put(w);
-    }
-}
-
-fn get_table<K: Code + Ord + Copy, V: Code>(r: &mut Read<'_>) -> Result<IdTable<K, V>, FormatError> {
-    let len = r.len()?;
-    let entries = (0..len)
-        .map(|_| Ok((K::get(r)?, V::get(r)?)))
-        .collect::<Result<Box<[(K, V)]>, FormatError>>()?;
-    IdTable::from_sorted(entries).ok_or_else(|| r.invalid("a table not sorted by id, or an id twice"))
-}
-
-/// Writes `map` densely: a slot for each id up to its last, each an `Option`.
-fn put_arena_map<T, V: Code>(w: &mut Words, map: &ArenaMap<Idx<T>, V>) {
-    let len = map.iter().next_back().map_or(0, |(id, _)| raw(id) as usize + 1);
-    w.len(len);
-    let mut entries = map.iter().peekable();
-    for slot in 0..len {
-        match entries.next_if(|&(id, _)| raw(id) as usize == slot) {
-            Some((_, value)) => {
-                w.u32(1);
-                value.put(w);
-            }
-            None => w.u32(0),
-        }
-    }
-}
-
-fn get_arena_map<T, V: Code>(r: &mut Read<'_>) -> Result<ArenaMap<Idx<T>, V>, FormatError> {
-    let len = r.len()?;
-    let mut map = ArenaMap::default();
-    for slot in 0..len {
-        match r.get::<Option<V>>()? {
-            Some(value) => {
-                map.insert(idx(slot as u32), value);
-            }
-            None if slot + 1 == len => return Err(r.invalid("a map whose last slot is empty")),
-            None => {}
-        }
-    }
-    Ok(map)
-}
-
-fn file_bits(file: HirFileId) -> (u32, u64) {
-    match file {
-        HirFileId::FileId(file) => (FILE, bits(file)),
-        HirFileId::MacroFile(call) => (MACRO_FILE, bits(call)),
-    }
-}
-
-impl Src {
-    /// The order of a [`SourceTable`]'s keys: the file (files before macro files, each by its
-    /// salsa id), the range, the syntax kind.
-    fn key(&self) -> (u32, u64, u32, u32, u32) {
-        (self.file_kind, self.file, self.start, self.end, self.kind)
-    }
-
-    fn of<N: AstNode>(src: &InFile<AstPtr<N>>) -> Src {
-        let (file_kind, file) = file_bits(src.file_id);
-        let range = src.value.text_range();
-        Src {
-            file,
-            file_kind,
-            kind: u32::from(u16::from(src.value.kind())),
-            start: range.start().into(),
-            end: range.end().into(),
-        }
-    }
-
-    /// The pointer this is, `None` for no pointer.
-    fn get<N: AstNode>(&self) -> Result<Option<InFile<AstPtr<N>>>, &'static str> {
-        let file = match self.file_kind {
-            0 if *self == Src::default() => return Ok(None),
-            0 => return Err("an empty slot that is not zeros"),
-            FILE => HirFileId::FileId(FromId::from_id(salsa_id(self.file).ok_or("a salsa id of index 0")?)),
-            MACRO_FILE => {
-                HirFileId::MacroFile(FromId::from_id(salsa_id(self.file).ok_or("a salsa id of index 0")?))
-            }
-            _ => return Err("a file kind out of range"),
-        };
-        let kind = syntax_kind(self.kind).ok_or("a syntax kind out of range")?;
-        if self.start > self.end {
-            return Err("a range that ends before it starts");
-        }
-        let range = TextRange::new(TextSize::from(self.start), TextSize::from(self.end));
-        let ptr = AstPtr::try_from_raw(SyntaxNodePtr::from_parts(kind, range))
-            .ok_or("a syntax pointer of a kind its type does not cast")?;
-        Ok(Some(InFile::new(file, ptr)))
-    }
-}
-
-/// `map` as a dense column, up to its last id.
-fn back_column<T, N: AstNode>(map: &ArenaMap<Idx<T>, InFile<AstPtr<N>>>) -> Vec<Src> {
-    let len = map.iter().next_back().map_or(0, |(id, _)| raw(id) as usize + 1);
-    let mut column = vec![Src::default(); len];
-    for (id, src) in map.iter() {
-        column[raw(id) as usize] = Src::of(src);
-    }
-    column
-}
-
-fn check_back_column<N: AstNode>(column: &[Src], buffer: &[u8]) -> Result<(), FormatError> {
-    for src in column {
-        src.get::<N>().map_err(|what| FormatError::Invalid { at: at_of(src, buffer), what })?;
-    }
-    match column.last() {
-        Some(last) => ensure(last.file_kind != 0, last, buffer, "a map whose last slot is empty"),
-        None => Ok(()),
-    }
-}
-
-fn back_map<T, N: AstNode>(
-    column: &[Src],
-    buffer: &[u8],
-) -> Result<ArenaMap<Idx<T>, InFile<AstPtr<N>>>, FormatError> {
-    let mut map = ArenaMap::default();
-    for (slot, src) in column.iter().enumerate() {
-        let found =
-            src.get::<N>().map_err(|what| FormatError::Invalid { at: at_of(src, buffer), what })?;
-        if let Some(found) = found {
-            map.insert(idx(slot as u32), found);
-        }
-    }
-    Ok(map)
-}
-
-/// A [`SourceTable`]'s keys and the word of each value, in the table's order.
-fn table_columns<N: AstNode, V, W>(
-    table: &SourceTable<InFile<AstPtr<N>>, V>,
-    word: impl Fn(&V) -> W,
-) -> (Vec<Src>, Vec<W>) {
-    let (keys, words): (Vec<Src>, Vec<W>) =
-        table.entries().iter().map(|(src, value)| (Src::of(src), word(value))).unzip();
-    debug_assert!(
-        keys.windows(2).all(|pair| pair[0].key() < pair[1].key()),
-        "a source table not in the order of `Src::key`, which no reader accepts"
-    );
-    (keys, words)
-}
-
-/// Checks a [`SourceTable`]'s columns in place: a value for each key, each key a pointer of its
-/// type, the keys in strictly increasing order of [`Src::key`].
-fn check_table<N: AstNode, W>(
-    keys: &[Src],
-    values: &[W],
-    root: &SourceMapRoot,
-    buffer: &[u8],
-) -> Result<(), FormatError> {
-    let paired = keys.len() == values.len();
-    ensure(paired, root, buffer, "a source table that is not one value for each key")?;
-    for src in keys {
-        let found =
-            src.get::<N>().map_err(|what| FormatError::Invalid { at: at_of(src, buffer), what })?;
-        ensure(found.is_some(), src, buffer, "an empty key in a source table")?;
-    }
-    keys.windows(2).try_for_each(|pair| {
-        let ordered = pair[0].key() < pair[1].key();
-        ensure(ordered, &pair[1], buffer, "a source table out of order, or a key twice")
-    })
-}
-
-/// The [`SourceTable`] of columns [`check_table`] accepted, in their order.
-fn source_table<N: AstNode, W: Copy, V>(
-    keys: &[Src],
-    values: &[W],
-    buffer: &[u8],
-    value: impl Fn(W) -> V,
-) -> Result<SourceTable<InFile<AstPtr<N>>, V>, FormatError> {
-    let entries = (keys.iter().zip(values))
-        .map(|(src, &word)| {
-            let at = at_of(src, buffer);
-            let found = src.get::<N>().map_err(|what| FormatError::Invalid { at, what })?;
-            let found =
-                found.ok_or(FormatError::Invalid { at, what: "an empty key in a source table" })?;
-            Ok((found, value(word)))
-        })
-        .collect::<Result<Box<[_]>, FormatError>>()?;
-    let at = keys.first().map_or(0, |src| at_of(src, buffer));
-    SourceTable::from_sorted(entries)
-        .ok_or(FormatError::Invalid { at, what: "a source table out of order, or a key twice" })
-}
-
-/// The word of `src`'s value in a [`SourceTable`]'s checked columns, by binary search.
-fn table_get<N: AstNode, W: Copy>(keys: &[Src], values: &[W], src: &InFile<AstPtr<N>>) -> Option<W> {
-    let at = keys.binary_search_by_key(&Src::of(src).key(), Src::key).ok()?;
-    values.get(at).copied()
 }
 
 /// The ids a store's nodes may name: what each of its arenas holds.
@@ -1626,6 +1365,14 @@ impl<'a> ExpressionStoreRef<'a> {
     }
 }
 
+impl ExpressionStore {
+    /// The warm and cold forms of expression store buffers, codec by column: what the store's
+    /// `blaze_cas::Columns` for [`ExpressionStore`]'s schema is.
+    pub fn columns() -> blaze_format::tiers::BufferColumns {
+        blaze_format::tiers::BufferColumns::of::<StoreRoot>(<ExpressionStore as Persist>::SCHEMA)
+    }
+}
+
 impl Persist for ExpressionStore {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ExpressionStore"),
@@ -1691,6 +1438,13 @@ impl<'a> BodyRef<'a> {
     }
 }
 
+impl Body {
+    /// As [`ExpressionStore::columns`], for [`Body`]'s schema.
+    pub fn columns() -> blaze_format::tiers::BufferColumns {
+        blaze_format::tiers::BufferColumns::of::<BodyRoot>(<Body as Persist>::SCHEMA)
+    }
+}
+
 impl Persist for Body {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("Body"),
@@ -1735,419 +1489,6 @@ impl Persist for Body {
             ensure(fits, param, buffer, "a `self` parameter past the bindings")?;
         }
         Ok(BodyRef { store, params, self_param })
-    }
-}
-
-/// Where everything of a source map but its root was written.
-struct SourceMapColumns {
-    words: Placed,
-    expr_map_back: Column,
-    pat_map_back: Column,
-    label_map_back: Column,
-    types_map_back: Column,
-    lifetime_map_back: Column,
-    expr_map: Column,
-    expr_map_ids: Column,
-    pat_map: Column,
-    pat_map_ids: Column,
-    label_map: Column,
-    label_map_ids: Column,
-    types_map: Column,
-    types_map_ids: Column,
-    lifetime_map: Column,
-    lifetime_map_ids: Column,
-    expansions: Column,
-    expansion_calls: Column,
-    flags: u32,
-}
-
-impl SourceMapColumns {
-    fn write(map: &ExpressionStoreSourceMap, out: &mut Writer) -> SourceMapColumns {
-        let ExpressionStoreSourceMap {
-            expr_only,
-            types_map_back,
-            types_map,
-            lifetime_map_back,
-            lifetime_map,
-        } = map;
-        let mut w = Words::new();
-        let (types_map, types_map_ids) = table_columns(types_map, |&ty| raw(ty));
-        let (lifetime_map, lifetime_map_ids) = table_columns(lifetime_map, |&lifetime| raw(lifetime));
-        let (mut expr_map_back, mut pat_map_back, mut label_map_back) = (vec![], vec![], vec![]);
-        let (mut expr_keys, mut expr_ids, mut pat_keys, mut pat_ids) = (vec![], vec![], vec![], vec![]);
-        let (mut label_keys, mut label_ids, mut call_keys, mut calls) = (vec![], vec![], vec![], vec![]);
-        if let Some(it) = expr_only.as_deref() {
-            let ExpressionOnlySourceMap {
-                expr_map,
-                expr_map_back: exprs_back,
-                pat_map,
-                pat_map_back: pats_back,
-                label_map,
-                label_map_back: labels_back,
-                binding_definitions,
-                field_map_back,
-                pat_field_map_back,
-                template_map,
-                expansions,
-                diagnostics,
-            } = it;
-            put_arena_map(&mut w, binding_definitions);
-            put_table(&mut w, field_map_back);
-            put_table(&mut w, pat_field_map_back);
-            put_template(&mut w, template_map.as_deref());
-            w.put(diagnostics);
-            expr_map_back = back_column(exprs_back);
-            pat_map_back = back_column(pats_back);
-            label_map_back = back_column(labels_back);
-            (expr_keys, expr_ids) = table_columns(expr_map, |&id| packed_bits(id));
-            (pat_keys, pat_ids) = table_columns(pat_map, |&id| packed_bits(id));
-            (label_keys, label_ids) = table_columns(label_map, |&label| raw(label));
-            (call_keys, calls) = table_columns(expansions, |&call| bits(call));
-        }
-        let words = w.place(out);
-        SourceMapColumns {
-            words,
-            expr_map_back: Column::push(out, &expr_map_back),
-            pat_map_back: Column::push(out, &pat_map_back),
-            label_map_back: Column::push(out, &label_map_back),
-            types_map_back: Column::push(out, &back_column(types_map_back)),
-            lifetime_map_back: Column::push(out, &back_column(lifetime_map_back)),
-            expr_map: Column::push(out, &expr_keys),
-            expr_map_ids: Column::push(out, &expr_ids),
-            pat_map: Column::push(out, &pat_keys),
-            pat_map_ids: Column::push(out, &pat_ids),
-            label_map: Column::push(out, &label_keys),
-            label_map_ids: Column::push(out, &label_ids),
-            types_map: Column::push(out, &types_map),
-            types_map_ids: Column::push(out, &types_map_ids),
-            lifetime_map: Column::push(out, &lifetime_map),
-            lifetime_map_ids: Column::push(out, &lifetime_map_ids),
-            expansions: Column::push(out, &call_keys),
-            expansion_calls: Column::push(out, &calls),
-            flags: if expr_only.is_some() { HAS_EXPRS } else { 0 },
-        }
-    }
-
-    fn rec(&self, at: u64) -> SourceMapRoot {
-        let field = |offset: usize| at + offset as u64;
-        SourceMapRoot {
-            expr_map_back: self.expr_map_back.slice(field(offset_of!(SourceMapRoot, expr_map_back))),
-            pat_map_back: self.pat_map_back.slice(field(offset_of!(SourceMapRoot, pat_map_back))),
-            label_map_back: (self.label_map_back)
-                .slice(field(offset_of!(SourceMapRoot, label_map_back))),
-            types_map_back: (self.types_map_back)
-                .slice(field(offset_of!(SourceMapRoot, types_map_back))),
-            lifetime_map_back: (self.lifetime_map_back)
-                .slice(field(offset_of!(SourceMapRoot, lifetime_map_back))),
-            expr_map: self.expr_map.slice(field(offset_of!(SourceMapRoot, expr_map))),
-            expr_map_ids: self.expr_map_ids.slice(field(offset_of!(SourceMapRoot, expr_map_ids))),
-            pat_map: self.pat_map.slice(field(offset_of!(SourceMapRoot, pat_map))),
-            pat_map_ids: self.pat_map_ids.slice(field(offset_of!(SourceMapRoot, pat_map_ids))),
-            label_map: self.label_map.slice(field(offset_of!(SourceMapRoot, label_map))),
-            label_map_ids: (self.label_map_ids)
-                .slice(field(offset_of!(SourceMapRoot, label_map_ids))),
-            types_map: self.types_map.slice(field(offset_of!(SourceMapRoot, types_map))),
-            types_map_ids: (self.types_map_ids)
-                .slice(field(offset_of!(SourceMapRoot, types_map_ids))),
-            lifetime_map: self.lifetime_map.slice(field(offset_of!(SourceMapRoot, lifetime_map))),
-            lifetime_map_ids: (self.lifetime_map_ids)
-                .slice(field(offset_of!(SourceMapRoot, lifetime_map_ids))),
-            expansions: self.expansions.slice(field(offset_of!(SourceMapRoot, expansions))),
-            expansion_calls: (self.expansion_calls)
-                .slice(field(offset_of!(SourceMapRoot, expansion_calls))),
-            words: self.words.rec(field(offset_of!(SourceMapRoot, words))),
-            flags: self.flags,
-        }
-    }
-}
-
-fn put_template(w: &mut Words, template: Option<&FormatTemplate>) {
-    match template {
-        None => w.u32(0),
-        Some(template) => {
-            let FormatTemplate {
-                format_args_to_captures,
-                asm_to_captures,
-                implicit_capture_to_source,
-            } = template;
-            w.u32(1);
-            put_table(w, format_args_to_captures);
-            put_table(w, asm_to_captures);
-            put_table(w, implicit_capture_to_source);
-        }
-    }
-}
-
-fn get_template(r: &mut Read<'_>) -> Result<Option<Box<FormatTemplate>>, FormatError> {
-    Ok(match r.tag(2, "a template map that is neither 0 nor 1")? {
-        0 => None,
-        _ => Some(Box::new(FormatTemplate {
-            format_args_to_captures: get_table(r)?,
-            asm_to_captures: get_table(r)?,
-            implicit_capture_to_source: get_table(r)?,
-        })),
-    })
-}
-
-/// An [`ExpressionStoreSourceMap`] read in place from its buffer.
-#[derive(Clone, Copy)]
-pub struct ExpressionStoreSourceMapRef<'a> {
-    buffer: &'a [u8],
-    root: &'a SourceMapRoot,
-    expr_map_back: &'a [Src],
-    pat_map_back: &'a [Src],
-    label_map_back: &'a [Src],
-    types_map_back: &'a [Src],
-    lifetime_map_back: &'a [Src],
-    expr_map: &'a [Src],
-    expr_map_ids: &'a [u32],
-    pat_map: &'a [Src],
-    pat_map_ids: &'a [u32],
-    label_map: &'a [Src],
-    label_map_ids: &'a [u32],
-    types_map: &'a [Src],
-    types_map_ids: &'a [u32],
-    lifetime_map: &'a [Src],
-    lifetime_map_ids: &'a [u32],
-    expansions: &'a [Src],
-    expansion_calls: &'a [u64],
-}
-
-impl<'a> ExpressionStoreSourceMapRef<'a> {
-    /// The source map of `root`, in `buffer`, its columns checked.
-    fn new(
-        root: &'a SourceMapRoot,
-        buffer: &'a [u8],
-    ) -> Result<ExpressionStoreSourceMapRef<'a>, FormatError> {
-        let map = ExpressionStoreSourceMapRef {
-            buffer,
-            root,
-            expr_map_back: root.expr_map_back.follow(buffer)?,
-            pat_map_back: root.pat_map_back.follow(buffer)?,
-            label_map_back: root.label_map_back.follow(buffer)?,
-            types_map_back: root.types_map_back.follow(buffer)?,
-            lifetime_map_back: root.lifetime_map_back.follow(buffer)?,
-            expr_map: root.expr_map.follow(buffer)?,
-            expr_map_ids: root.expr_map_ids.follow(buffer)?,
-            pat_map: root.pat_map.follow(buffer)?,
-            pat_map_ids: root.pat_map_ids.follow(buffer)?,
-            label_map: root.label_map.follow(buffer)?,
-            label_map_ids: root.label_map_ids.follow(buffer)?,
-            types_map: root.types_map.follow(buffer)?,
-            types_map_ids: root.types_map_ids.follow(buffer)?,
-            lifetime_map: root.lifetime_map.follow(buffer)?,
-            lifetime_map_ids: root.lifetime_map_ids.follow(buffer)?,
-            expansions: root.expansions.follow(buffer)?,
-            expansion_calls: root.expansion_calls.follow(buffer)?,
-        };
-        ensure(root.flags & !HAS_EXPRS == 0, root, buffer, "source map flags out of range")?;
-        if root.flags & HAS_EXPRS == 0 {
-            let empty = map.expr_map_back.is_empty()
-                && map.pat_map_back.is_empty()
-                && map.label_map_back.is_empty()
-                && map.expr_map.is_empty()
-                && map.expr_map_ids.is_empty()
-                && map.pat_map.is_empty()
-                && map.pat_map_ids.is_empty()
-                && map.label_map.is_empty()
-                && map.label_map_ids.is_empty()
-                && map.expansions.is_empty()
-                && map.expansion_calls.is_empty();
-            ensure(empty, root, buffer, "expression maps in a source map without expressions")?;
-        }
-        check_back_column::<Either<ast::Expr, ast::Pat>>(map.expr_map_back, buffer)?;
-        check_back_column::<Either<ast::Expr, ast::Pat>>(map.pat_map_back, buffer)?;
-        check_back_column::<Either<ast::Label, ast::BlockExpr>>(map.label_map_back, buffer)?;
-        check_back_column::<ast::Type>(map.types_map_back, buffer)?;
-        check_back_column::<ast::Lifetime>(map.lifetime_map_back, buffer)?;
-        check_table::<ast::Expr, _>(map.expr_map, map.expr_map_ids, root, buffer)?;
-        check_table::<ast::Pat, _>(map.pat_map, map.pat_map_ids, root, buffer)?;
-        check_table::<Either<ast::Label, ast::BlockExpr>, _>(
-            map.label_map,
-            map.label_map_ids,
-            root,
-            buffer,
-        )?;
-        check_table::<ast::Type, _>(map.types_map, map.types_map_ids, root, buffer)?;
-        check_table::<ast::Lifetime, _>(map.lifetime_map, map.lifetime_map_ids, root, buffer)?;
-        check_table::<ast::MacroCall, _>(map.expansions, map.expansion_calls, root, buffer)?;
-        for call in map.expansion_calls {
-            ensure(salsa_id(*call).is_some(), call, buffer, "a macro call id of index 0")?;
-        }
-        Ok(map)
-    }
-
-    /// As [`ExpressionStoreSourceMap::node_expr`], by binary search over the keys in place.
-    pub fn node_expr(self, src: ExprSource) -> Option<ExprOrPatId> {
-        table_get(self.expr_map, self.expr_map_ids, &src).map(|bits| packed_of(bits).unpack())
-    }
-
-    pub fn node_pat(self, src: PatSource) -> Option<ExprOrPatId> {
-        table_get(self.pat_map, self.pat_map_ids, &src).map(|bits| packed_of(bits).unpack())
-    }
-
-    pub fn node_label(self, src: LabelSource) -> Option<LabelId> {
-        table_get(self.label_map, self.label_map_ids, &src).map(idx)
-    }
-
-    pub fn node_type(self, src: TypeSource) -> Option<TypeRefId> {
-        table_get(self.types_map, self.types_map_ids, &src).map(idx)
-    }
-
-    pub fn node_lifetime(self, src: LifetimeSource) -> Option<LifetimeRefId> {
-        table_get(self.lifetime_map, self.lifetime_map_ids, &src).map(idx)
-    }
-
-    /// As [`ExpressionStoreSourceMap::expansion`].
-    pub fn expansion(self, src: InFile<MacroCallPtr>) -> Option<MacroCallId> {
-        let call = table_get(self.expansions, self.expansion_calls, &src)?;
-        salsa_id(call).map(<MacroCallId as FromId>::from_id)
-    }
-
-    pub fn has_exprs(self) -> bool {
-        self.root.flags & HAS_EXPRS != 0
-    }
-
-    /// As [`ExpressionStoreSourceMap::expr_syntax`], `None` for a synthetic expression.
-    pub fn expr_syntax(self, expr: ExprId) -> Option<ExprOrPatSource> {
-        self.expr_map_back.get(raw(expr) as usize)?.get().ok()?
-    }
-
-    pub fn pat_syntax(self, pat: PatId) -> Option<ExprOrPatSource> {
-        self.pat_map_back.get(raw(pat) as usize)?.get().ok()?
-    }
-
-    pub fn label_syntax(self, label: LabelId) -> Option<LabelSource> {
-        self.label_map_back.get(raw(label) as usize)?.get().ok()?
-    }
-
-    pub fn type_syntax(self, ty: TypeRefId) -> Option<TypeSource> {
-        self.types_map_back.get(raw(ty) as usize)?.get().ok()?
-    }
-
-    pub fn lifetime_syntax(self, lifetime: LifetimeRefId) -> Option<LifetimeSource> {
-        self.lifetime_map_back.get(raw(lifetime) as usize)?.get().ok()?
-    }
-
-    /// The source map, back as the value that was written.
-    pub fn decode(self) -> Result<ExpressionStoreSourceMap, FormatError> {
-        let buffer = self.buffer;
-        let mut r = Read::new(&self.root.words, buffer);
-        let types_map = source_table(self.types_map, self.types_map_ids, buffer, idx)?;
-        let lifetime_map = source_table(self.lifetime_map, self.lifetime_map_ids, buffer, idx)?;
-        let expr_only = match self.has_exprs() {
-            false => None,
-            true => Some(Box::new(ExpressionOnlySourceMap {
-                expr_map: source_table(self.expr_map, self.expr_map_ids, buffer, packed_of)?,
-                expr_map_back: back_map(self.expr_map_back, buffer)?,
-                pat_map: source_table(self.pat_map, self.pat_map_ids, buffer, packed_of)?,
-                pat_map_back: back_map(self.pat_map_back, buffer)?,
-                label_map: source_table(self.label_map, self.label_map_ids, buffer, idx)?,
-                label_map_back: back_map(self.label_map_back, buffer)?,
-                binding_definitions: get_arena_map(&mut r)?,
-                field_map_back: get_table(&mut r)?,
-                pat_field_map_back: get_table(&mut r)?,
-                template_map: get_template(&mut r)?,
-                expansions: source_table(self.expansions, self.expansion_calls, buffer, |call| {
-                    <MacroCallId as FromId>::from_id(
-                        salsa_id(call).expect("checked when the buffer was read"),
-                    )
-                })?,
-                diagnostics: r.get()?,
-            })),
-        };
-        Ok(ExpressionStoreSourceMap {
-            expr_only,
-            types_map_back: back_map(self.types_map_back, buffer)?,
-            types_map,
-            lifetime_map_back: back_map(self.lifetime_map_back, buffer)?,
-            lifetime_map,
-        })
-    }
-}
-
-impl Persist for ExpressionStoreSourceMap {
-    const SCHEMA: SchemaHash = schema_of(&[
-        Part::Str("ExpressionStoreSourceMap"),
-        Part::U64(3),
-        Part::Schema(<SourceMapRoot as Record>::SCHEMA),
-    ]);
-    type Ref<'a> = ExpressionStoreSourceMapRef<'a>;
-
-    fn write(&self, out: &mut Writer) -> u64 {
-        let columns = SourceMapColumns::write(self, out);
-        let at = out.next::<SourceMapRoot>();
-        let written = out.push(&columns.rec(at));
-        debug_assert_eq!(written, at);
-        at
-    }
-
-    fn read(buffer: &[u8]) -> Result<ExpressionStoreSourceMapRef<'_>, FormatError> {
-        let root = open_as::<SourceMapRoot>(buffer, Self::SCHEMA)?;
-        ExpressionStoreSourceMapRef::new(root, buffer)
-    }
-}
-
-/// A [`BodySourceMap`] read in place from its buffer.
-#[derive(Clone, Copy)]
-pub struct BodySourceMapRef<'a> {
-    store: ExpressionStoreSourceMapRef<'a>,
-    self_param: Option<&'a Src>,
-}
-
-impl<'a> BodySourceMapRef<'a> {
-    pub fn store(self) -> ExpressionStoreSourceMapRef<'a> {
-        self.store
-    }
-
-    /// As [`BodySourceMap::self_param_syntax`].
-    pub fn self_param(self) -> Option<InFile<crate::expr_store::SelfParamPtr>> {
-        self.self_param?.get().ok()?
-    }
-
-    /// The source map, back as the value that was written.
-    pub fn decode(self) -> Result<BodySourceMap, FormatError> {
-        Ok(BodySourceMap { self_param: self.self_param(), store: self.store.decode()? })
-    }
-}
-
-impl Persist for BodySourceMap {
-    const SCHEMA: SchemaHash = schema_of(&[
-        Part::Str("BodySourceMap"),
-        Part::U64(3),
-        Part::Schema(<BodySourceMapRoot as Record>::SCHEMA),
-    ]);
-    type Ref<'a> = BodySourceMapRef<'a>;
-
-    fn write(&self, out: &mut Writer) -> u64 {
-        let BodySourceMap { self_param, store } = self;
-        let columns = SourceMapColumns::write(store, out);
-        let self_param: Vec<Src> = self_param.iter().map(Src::of).collect();
-        let self_param = Column::push(out, &self_param);
-        let at = out.next::<BodySourceMapRoot>();
-        let field = |offset: usize| at + offset as u64;
-        let root = BodySourceMapRoot {
-            store: columns.rec(field(offset_of!(BodySourceMapRoot, store))),
-            self_param: self_param.slice(field(offset_of!(BodySourceMapRoot, self_param))),
-        };
-        let written = out.push(&root);
-        debug_assert_eq!(written, at);
-        at
-    }
-
-    fn read(buffer: &[u8]) -> Result<BodySourceMapRef<'_>, FormatError> {
-        let root = open_as::<BodySourceMapRoot>(buffer, Self::SCHEMA)?;
-        let store = ExpressionStoreSourceMapRef::new(&root.store, buffer)?;
-        let self_params = root.self_param.follow(buffer)?;
-        ensure(self_params.len() <= 1, root, buffer, "more than one `self` parameter")?;
-        let self_param = self_params.first();
-        if let Some(src) = self_param {
-            let found = src
-                .get::<ast::SelfParam>()
-                .map_err(|what| FormatError::Invalid { at: at_of(src, buffer), what })?;
-            ensure(found.is_some(), src, buffer, "an empty `self` parameter")?;
-        }
-        Ok(BodySourceMapRef { store, self_param })
     }
 }
 
@@ -2934,95 +2275,10 @@ impl Code for MacroDefId {
     }
 }
 
-impl Code for SyntaxNodePtr {
-    fn put(&self, w: &mut Words) {
-        w.u32(u32::from(u16::from(self.kind())));
-        self.text_range().put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        let kind = r.u32()?;
-        let kind = syntax_kind(kind).ok_or_else(|| r.invalid("a syntax kind out of range"))?;
-        Ok(SyntaxNodePtr::from_parts(kind, r.get()?))
-    }
-}
-
-impl<N: AstNode> Code for AstPtr<N> {
-    fn put(&self, w: &mut Words) {
-        self.syntax_node_ptr().put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        let raw = r.get()?;
-        AstPtr::try_from_raw(raw)
-            .ok_or_else(|| r.invalid("a syntax pointer of a kind its type does not cast"))
-    }
-}
-
-impl Code for ExpressionStoreDiagnostics {
-    fn put(&self, w: &mut Words) {
-        use ExpressionStoreDiagnostics::*;
-        match self {
-            InactiveCode { node, cfg } => {
-                w.u32(0);
-                node.put(w);
-                cfg.put(w);
-            }
-            UnresolvedMacroCall { node, path } => {
-                w.u32(1);
-                node.put(w);
-                path.put(w);
-            }
-            UnreachableLabel { node, name } => {
-                w.u32(2);
-                node.put(w);
-                name.put(w);
-            }
-            AwaitOutsideOfAsync { node, location } => {
-                w.u32(3);
-                node.put(w);
-                location.put(w);
-            }
-            UndeclaredLabel { node, name } => {
-                w.u32(4);
-                node.put(w);
-                name.put(w);
-            }
-            PatternArgInExternFn { node } => {
-                w.u32(5);
-                node.put(w);
-            }
-            FruInDestructuringAssignment { node } => {
-                w.u32(6);
-                node.put(w);
-            }
-            MissingBody { node, kind } => {
-                w.u32(7);
-                node.put(w);
-                kind.put(w);
-            }
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        use ExpressionStoreDiagnostics::*;
-        Ok(match r.tag(8, "a diagnostic kind out of range")? {
-            0 => InactiveCode { node: r.get()?, cfg: r.get()? },
-            1 => UnresolvedMacroCall { node: r.get()?, path: r.get()? },
-            2 => UnreachableLabel { node: r.get()?, name: r.get()? },
-            3 => AwaitOutsideOfAsync { node: r.get()?, location: r.get()? },
-            4 => UndeclaredLabel { node: r.get()?, name: r.get()? },
-            5 => PatternArgInExternFn { node: r.get()? },
-            6 => FruInDestructuringAssignment { node: r.get()? },
-            _ => MissingBody { node: r.get()?, kind: r.get()? },
-        })
-    }
-}
-
 /// Writes `body` and `source_map` each into a buffer, reads them back in place and decoded,
 /// and checks both are what was written.
 #[cfg(test)]
-pub(crate) fn assert_round_trip(body: &Body, source_map: &BodySourceMap) {
+pub(crate) fn assert_round_trip(body: &Body, source_map: &crate::expr_store::BodySourceMap) {
     let bytes = blaze_format::to_bytes(body);
     let buffer = blaze_format::Aligned::copy_from(&bytes);
     let read = Body::read(&buffer).expect("a body just written");
@@ -3033,21 +2289,15 @@ pub(crate) fn assert_round_trip(body: &Body, source_map: &BodySourceMap) {
     let decoded = read.decode().expect("a body just written");
     assert_eq!(decoded, *body);
     assert_eq!(blaze_format::to_bytes(&decoded), bytes, "a body written again as other bytes");
-
-    let bytes = blaze_format::to_bytes(source_map);
-    let buffer = blaze_format::Aligned::copy_from(&bytes);
-    let read = BodySourceMap::read(&buffer).expect("a source map just written");
-    tests::assert_source_map_reads(read.store(), &source_map.store);
-    assert_eq!(read.self_param(), source_map.self_param);
-    let decoded = read.decode().expect("a source map just written");
-    tests::assert_source_maps_eq(&decoded.store, &source_map.store);
-    assert_eq!(decoded, *source_map);
-    assert_eq!(blaze_format::to_bytes(&decoded), bytes, "a source map written again as other bytes");
+    source_map::assert_body_round_trip(source_map);
 }
 
 /// [`assert_round_trip`] for a store without a body, as a signature's.
 #[cfg(test)]
-pub(crate) fn assert_store_round_trip(store: &ExpressionStore, source_map: &ExpressionStoreSourceMap) {
+pub(crate) fn assert_store_round_trip(
+    store: &ExpressionStore,
+    source_map: &crate::expr_store::ExpressionStoreSourceMap,
+) {
     let bytes = blaze_format::to_bytes(store);
     let buffer = blaze_format::Aligned::copy_from(&bytes);
     let read = ExpressionStore::read(&buffer).expect("a store just written");
@@ -3055,15 +2305,7 @@ pub(crate) fn assert_store_round_trip(store: &ExpressionStore, source_map: &Expr
     let decoded = read.decode().expect("a store just written");
     assert_eq!(decoded, *store);
     assert_eq!(blaze_format::to_bytes(&decoded), bytes, "a store written again as other bytes");
-
-    let bytes = blaze_format::to_bytes(source_map);
-    let buffer = blaze_format::Aligned::copy_from(&bytes);
-    let read = ExpressionStoreSourceMap::read(&buffer).expect("a source map just written");
-    tests::assert_source_map_reads(read, source_map);
-    let decoded = read.decode().expect("a source map just written");
-    tests::assert_source_maps_eq(&decoded, source_map);
-    assert_eq!(decoded, *source_map);
-    assert_eq!(blaze_format::to_bytes(&decoded), bytes, "a source map written again as other bytes");
+    source_map::assert_round_trip(source_map);
 }
 
 #[cfg(test)]
@@ -3194,74 +2436,8 @@ mod tests {
         assert!(read.block_scopes().eq(blocks.iter().copied()));
     }
 
-    /// Checks what `read` reads in place against `map`.
-    pub(super) fn assert_source_map_reads(
-        read: ExpressionStoreSourceMapRef<'_>,
-        map: &ExpressionStoreSourceMap,
-    ) {
-        assert_eq!(read.has_exprs(), map.expr_only.is_some());
-        if let Some(it) = map.expr_only.as_deref() {
-            for (id, src) in it.expr_map_back.iter() {
-                assert_eq!(read.expr_syntax(id), Some(*src));
-            }
-            for (id, src) in it.pat_map_back.iter() {
-                assert_eq!(read.pat_syntax(id), Some(*src));
-            }
-            for (id, src) in it.label_map_back.iter() {
-                assert_eq!(read.label_syntax(id), Some(*src));
-            }
-            for &(src, id) in it.expr_map.entries() {
-                assert_eq!(read.node_expr(src), Some(id.unpack()));
-            }
-            for &(src, id) in it.pat_map.entries() {
-                assert_eq!(read.node_pat(src), Some(id.unpack()));
-            }
-            for &(src, label) in it.label_map.entries() {
-                assert_eq!(read.node_label(src), Some(label));
-            }
-            for &(src, call) in it.expansions.entries() {
-                assert_eq!(read.expansion(src), Some(call));
-            }
-        }
-        for (id, src) in map.types_map_back.iter() {
-            assert_eq!(read.type_syntax(id), Some(*src));
-        }
-        for (id, src) in map.lifetime_map_back.iter() {
-            assert_eq!(read.lifetime_syntax(id), Some(*src));
-        }
-        for &(src, ty) in map.types_map.entries() {
-            assert_eq!(read.node_type(src), Some(ty));
-        }
-        for &(src, lifetime) in map.lifetime_map.entries() {
-            assert_eq!(read.node_lifetime(src), Some(lifetime));
-        }
-    }
-
-    /// Every field of two source maps equal, the ones their `PartialEq` skips too.
-    pub(super) fn assert_source_maps_eq(a: &ExpressionStoreSourceMap, b: &ExpressionStoreSourceMap) {
-        assert_eq!(a.types_map_back, b.types_map_back);
-        assert_eq!(a.types_map, b.types_map);
-        assert_eq!(a.lifetime_map_back, b.lifetime_map_back);
-        assert_eq!(a.lifetime_map, b.lifetime_map);
-        assert_eq!(a.expr_only.is_some(), b.expr_only.is_some());
-        if let (Some(a), Some(b)) = (a.expr_only.as_deref(), b.expr_only.as_deref()) {
-            assert_eq!(a.expr_map, b.expr_map);
-            assert_eq!(a.expr_map_back, b.expr_map_back);
-            assert_eq!(a.pat_map, b.pat_map);
-            assert_eq!(a.pat_map_back, b.pat_map_back);
-            assert_eq!(a.label_map, b.label_map);
-            assert_eq!(a.label_map_back, b.label_map_back);
-            assert_eq!(a.binding_definitions, b.binding_definitions);
-            assert_eq!(a.field_map_back, b.field_map_back);
-            assert_eq!(a.pat_field_map_back, b.pat_field_map_back);
-            assert_eq!(a.template_map, b.template_map);
-            assert_eq!(a.expansions, b.expansions);
-            assert_eq!(a.diagnostics, b.diagnostics);
-        }
-    }
-
     /// The functions of the fixture's crate root, each body lowered and round-tripped.
-    fn bodies(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, Vec<DefWithBodyId>) {
+    pub(super) fn bodies(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, Vec<DefWithBodyId>) {
         let db = TestDB::with_files(ra_fixture);
         let krate = db.fetch_test_crate();
         let def_map = crate_def_map(&db, krate);
@@ -3481,13 +2657,13 @@ fn main() {}
     }
 
     /// `bytes` with the word at `at` replaced by `word`.
-    fn with_word(bytes: &[u8], at: usize, word: u32) -> Aligned {
+    pub(super) fn with_word(bytes: &[u8], at: usize, word: u32) -> Aligned {
         let mut bytes = bytes.to_vec();
         bytes[at..at + size_of::<u32>()].copy_from_slice(&word.to_le_bytes());
         Aligned::copy_from(&bytes)
     }
 
-    fn offset_in<T>(slice: &[T], buffer: &[u8]) -> usize {
+    pub(super) fn offset_in<T>(slice: &[T], buffer: &[u8]) -> usize {
         slice.as_ptr() as usize - buffer.as_ptr() as usize
     }
 
@@ -3530,17 +2706,6 @@ fn f() -> u32 {
 
         assert!(Body::read(&buffer).is_err(), "a store's buffer read as a body's");
         assert!(ExpressionStore::read(&Aligned::copy_from(&bytes[..bytes.len() - 16])).is_err());
-
-        let (_, source_map) = Body::with_source_map(&db, defs[0]);
-        let bytes = blaze_format::to_bytes(&source_map.store);
-        let buffer = Aligned::copy_from(&bytes);
-        let read = ExpressionStoreSourceMap::read(&buffer).expect("a source map just written");
-        let slot = (read.expr_map_back.iter().position(|src| src.file_kind != 0))
-            .expect("an expression with syntax");
-        let src = offset_in(read.expr_map_back, &buffer) + slot * size_of::<Src>();
-        assert!(ExpressionStoreSourceMap::read(&with_word(&bytes, src + offset_of!(Src, kind), u32::MAX)).is_err());
-        assert!(ExpressionStoreSourceMap::read(&with_word(&bytes, src + offset_of!(Src, file_kind), 7)).is_err());
-        assert!(ExpressionStoreSourceMap::read(&with_word(&bytes, src + offset_of!(Src, file), 0)).is_err());
     }
 
     #[test]
@@ -3623,31 +2788,5 @@ fn f() -> u32 {
         let past = with_word(&bytes, element, read.types_len() as u32);
         let past = ExpressionStore::read(&past).expect("only `ty_lists` changed");
         assert!(past.decode().is_err(), "a tuple element past the types");
-    }
-
-    #[test]
-    fn an_unsorted_source_table_is_refused() {
-        let (db, defs) = bodies("fn f() -> u32 { let a = 1; a + 2 }");
-        let (_, source_map) = Body::with_source_map(&db, defs[0]);
-        let bytes = blaze_format::to_bytes(&source_map.store);
-        let buffer = Aligned::copy_from(&bytes);
-        let read = ExpressionStoreSourceMap::read(&buffer).expect("a source map just written");
-        assert!(read.expr_map.len() >= 2, "a body of more than one expression");
-        let (keys, size) = (offset_in(read.expr_map, &buffer), size_of::<Src>());
-
-        let mut swapped = bytes.clone();
-        let (first, second) = swapped[keys..keys + 2 * size].split_at_mut(size);
-        first.swap_with_slice(second);
-        let swapped = ExpressionStoreSourceMap::read(&Aligned::copy_from(&swapped));
-        assert!(swapped.is_err(), "a source table out of order");
-
-        let mut twice = bytes.clone();
-        twice.copy_within(keys..keys + size, keys + size);
-        let twice = ExpressionStoreSourceMap::read(&Aligned::copy_from(&twice));
-        assert!(twice.is_err(), "a key twice in a source table");
-
-        let expr_map = &source_map.store.expr_only.as_deref().expect("a body's source map").expr_map;
-        let reversed: Box<[_]> = expr_map.entries().iter().rev().copied().collect();
-        assert!(SourceTable::from_sorted(reversed).is_none(), "decoding re-sorts nothing");
     }
 }

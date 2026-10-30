@@ -12,6 +12,7 @@
 //! image: [`Plan::base`] is the address of the image's first byte.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use blaze_codegen::Arch;
 
@@ -275,6 +276,14 @@ impl Names {
     /// every name of a file once, when it takes the file).
     pub fn at(&self, name: Name) -> &str {
         &self.0[name.at as usize..name.at as usize + name.len as usize]
+    }
+
+    /// `name`'s bytes from `from`, a name inside it: what a string table indexed by offset (a
+    /// BSD `__.SYMDEF`, ELF's tail-merged `.strtab`) names, so each string is pushed once. None
+    /// past its end or off a character boundary.
+    pub fn suffix(&self, name: Name, from: u32) -> Option<Name> {
+        let rest = self.get(name)?.get(from as usize..)?;
+        Some(Name { at: name.at + from, len: rest.len() as u32 })
     }
 
     pub fn bytes(&self) -> usize {
@@ -591,8 +600,9 @@ pub(crate) struct Function {
     pub fde: Option<u64>,
     /// Windows: its `UNWIND_INFO` in [`Class::Rodata`], and its handler and data, resolved.
     pub windows: Option<WindowsUnwind>,
-    /// A name for debuggers and backtraces.
-    pub name: Option<String>,
+    /// A name for debuggers and backtraces: shared, since the functions list is kept across
+    /// links.
+    pub name: Option<Arc<str>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -770,6 +780,16 @@ pub(crate) trait Writer: Send + Sync {
     /// The file's headers and its parts outside the address space. `placed` holds each
     /// synthetic region's bytes as [`Writer::synthesize`] returned them.
     fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError>;
+
+    /// The 8-byte slots the file holds other than as placed, as (address, value) in address
+    /// order: Mach-O's chained fixups, where each rebase and bind slot holds its target and
+    /// the distance to the next. Called with what [`Writer::file`] sees. The regions keep the
+    /// plain values; the core lays these over them in the file and, on an incremental link,
+    /// writes only the slots whose value changed. None by default.
+    fn encode(&self, placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkError> {
+        let _ = placed;
+        Ok(Vec::new())
+    }
 }
 
 /// The writer of an output's format.
@@ -779,5 +799,23 @@ pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
         Format::MachO => crate::macho::writer(output),
         Format::Pe => crate::pe::writer(output),
         Format::Wasm => crate::wasm::writer(output),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_suffix_names_the_bytes_inside_a_name() {
+        let mut names = Names::default();
+        names.push("x").unwrap();
+        let name = names.push("_main€").unwrap();
+        assert_eq!(names.at(names.suffix(name, 0).unwrap()), "_main€");
+        assert_eq!(names.at(names.suffix(name, 1).unwrap()), "main€");
+        assert_eq!(names.at(names.suffix(name, 8).unwrap()), "");
+        assert_eq!(names.suffix(name, 9), None);
+        assert_eq!(names.suffix(name, 6), None);
+        assert_eq!(names.bytes(), 1 + "_main€".len());
     }
 }

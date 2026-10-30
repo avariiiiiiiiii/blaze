@@ -18,7 +18,7 @@ use rustc_type_ir::{Mutability, inherent::IntoKind as _};
 
 use super::{between, can_be_used_for_suggestions, for_loop, source_callsite};
 use crate::{
-    lints::bodies::{BodyCx, LatePass, types::util},
+    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -35,6 +35,10 @@ enum Fallible {
 impl LatePass for ForLoopsOverFallibles {
     fn name(&self) -> &'static str {
         "ForLoopsOverFallibles"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

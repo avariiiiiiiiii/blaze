@@ -14,8 +14,7 @@
 use std::mem::offset_of;
 
 use blaze_format::{
-    ALIGN, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema,
-    schema_of,
+    ALIGN, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema_of,
 };
 use hir_def::{
     AdtId, ConstId, ConstParamId, EnumId, EnumVariantId, FunctionId, GenericDefId,
@@ -48,7 +47,10 @@ use crate::{
 const _: () = assert!(align_of::<u128>() == ALIGN, "the type table is placed as `u128`s");
 
 /// The schema of the type table's own buffer inside a cold batch.
-const TY_TABLE_SCHEMA: SchemaHash = schema("hir_ty::lower::persist::TyTable");
+const TY_TABLE_SCHEMA: SchemaHash = schema_of(&[
+    Part::Str("hir_ty::lower::persist::TyTable"),
+    Part::Schema(crate::next_solver::persist::TABLE_SCHEMA),
+]);
 
 /// Which batch a cold batch is of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -582,10 +584,10 @@ impl<'a> ColdBatchRef<'a> {
             .zip(self.defaults)
             .map(|(&ty, &default)| {
                 Ok(FieldType {
-                    ty: StoredEarlyBinder::bind(tys.ty(ty)?.store()),
+                    ty: StoredEarlyBinder::bind(interner, tys.ty(ty)?.store()),
                     default: match default {
                         0 => None,
-                        at => Some(StoredEarlyBinder::bind(tys.konst(at - 1)?.store())),
+                        at => Some(StoredEarlyBinder::bind(interner, tys.konst(at - 1)?.store())),
                     },
                 })
             })
@@ -607,7 +609,7 @@ impl<'a> ColdBatchRef<'a> {
         let values = self
             .tys
             .iter()
-            .map(|&ty| Ok(StoredEarlyBinder::bind(tys.ty(ty)?.store())))
+            .map(|&ty| Ok(StoredEarlyBinder::bind(interner, tys.ty(ty)?.store())))
             .collect::<Result<_, FormatError>>()?;
         Ok(Batch { keys: self.impl_keys()?, values, side: self.side_table()? })
     }
@@ -630,7 +632,7 @@ impl<'a> ColdBatchRef<'a> {
                     .map(TraitId::from_id)
                     .ok_or(self.invalid("a trait of id index 0"))?;
                 let trait_ref = TraitRef::new_from_args(interner, trait_id.into(), tys.args(args)?);
-                Ok(Some(StoredEarlyBinder::bind(StoredTraitRef::new(trait_ref))))
+                Ok(Some(StoredEarlyBinder::bind(interner, StoredTraitRef::new(trait_ref))))
             })
             .collect::<Result<_, FormatError>>()?;
         Ok(Batch { keys: self.impl_keys()?, values, side: self.side_table()? })
@@ -660,7 +662,7 @@ impl<'a> ColdBatchRef<'a> {
                     "predicate parts that are not in order within their clauses",
                 )?;
                 Ok(GenericPredicates {
-                    predicates: StoredEarlyBinder::bind(clauses.store()),
+                    predicates: StoredEarlyBinder::bind(interner, clauses.store()),
                     has_trait_implied_predicate,
                     parent_assoc_ty_bounds_start: it.parent_assoc_ty_bounds_start,
                     own_predicates_start: it.own_predicates_start,

@@ -12,14 +12,7 @@
 //! - What a read sets (verified, read) is a bit set with one relaxed `fetch_or`, and only when
 //!   it is not set already, so a second read writes nothing.
 
-use std::{
-    borrow::Cow,
-    ptr,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-    },
-};
+use std::{borrow::Cow, ptr, sync::Arc};
 
 use blaze_core::{FileName, Mapping};
 use blaze_format::SchemaHash;
@@ -34,6 +27,10 @@ use crate::{
     index,
     segment::{ChunkRef, Segment},
     table::{Held, Keyed, Table},
+};
+use crate::sync::{
+    OnceLock,
+    atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
 
 /// Writers a store can have: a ticket names its writer's segment by number.

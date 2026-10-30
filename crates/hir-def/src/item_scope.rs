@@ -737,6 +737,25 @@ impl<K: Copy + Eq + Hash, V: PartialEq> PartialEq for Keyed<K, V> {
 
 impl<K: Copy + Eq + Hash, V: Eq> Eq for Keyed<K, V> {}
 
+/// A bit per position of a list beside it, 64 to a word; the bits past the list's end are clear,
+/// so two of the same length are equal when their words are.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Bits(ThinVec<u64>);
+
+impl Bits {
+    /// Sets bit `at` to `bit`, for the position the list just gave its newest element.
+    pub(crate) fn push(&mut self, at: usize, bit: bool) {
+        if at % 64 == 0 {
+            self.0.push(0);
+        }
+        self.0[at / 64] |= u64::from(bit) << (at % 64);
+    }
+
+    pub(crate) fn get(&self, at: usize) -> bool {
+        self.0.get(at / 64).is_some_and(|word| word >> (at % 64) & 1 == 1)
+    }
+}
+
 /// The items defined in or imported into a module or block.
 ///
 /// Each namespace is a [`Column`] of 40-byte entries in the order names were added, and
@@ -774,7 +793,12 @@ pub struct ItemScope {
     /// declared.
     pub(crate) declarations: ThinVec<ModuleDefId>,
 
-    pub(crate) impls: ThinVec<(ImplId, /* trait impl */ bool)>,
+    /// The impls declared here, in declaration order.
+    pub(crate) impls: ThinVec<ImplId>,
+    /// A bit per impl of `impls`, by position: whether it is a trait impl.
+    pub(crate) trait_impl: Bits,
+    /// A bit per impl of `impls`, by position: whether it is `#[rustc_reservation_impl]`.
+    pub(crate) reservation_impl: Bits,
     pub(crate) builtin_derive_impls: ThinVec<BuiltinDeriveImplId>,
     pub(crate) extern_blocks: ThinVec<ExternBlockId>,
     pub(crate) unnamed_consts: ThinVec<ConstId>,
@@ -822,6 +846,8 @@ impl PartialEq for ItemScope {
             by_def: _,
             declarations,
             impls,
+            trait_impl,
+            reservation_impl,
             builtin_derive_impls,
             extern_blocks,
             unnamed_consts,
@@ -843,6 +869,8 @@ impl PartialEq for ItemScope {
             && unresolved.iter().all(|it| other.position(UNRESOLVED, it).is_some())
             && *declarations == other.declarations
             && *impls == other.impls
+            && *trait_impl == other.trait_impl
+            && *reservation_impl == other.reservation_impl
             && *builtin_derive_impls == other.builtin_derive_impls
             && *extern_blocks == other.extern_blocks
             && *unnamed_consts == other.unnamed_consts
@@ -1171,16 +1199,37 @@ impl ItemScope {
         self.use_decls.iter().copied()
     }
 
+    /// The impls declared here, in declaration order.
     pub fn impls(&self) -> impl ExactSizeIterator<Item = ImplId> + '_ {
-        self.impls.iter().map(|&(id, _)| id)
+        self.impls.iter().copied()
+    }
+
+    /// The impls where `bits` is set (or, with `set` false, clear), in declaration order.
+    fn impls_where(&self, bits: &Bits, set: bool) -> impl Iterator<Item = ImplId> + '_ {
+        self.impls
+            .iter()
+            .enumerate()
+            .filter(move |&(at, _)| bits.get(at) == set)
+            .map(|(_, &it)| it)
     }
 
     pub fn trait_impls(&self) -> impl Iterator<Item = ImplId> + '_ {
-        self.impls.iter().filter(|&&(_, is_trait_impl)| is_trait_impl).map(|&(id, _)| id)
+        self.impls_where(&self.trait_impl, true)
     }
 
     pub fn inherent_impls(&self) -> impl Iterator<Item = ImplId> + '_ {
-        self.impls.iter().filter(|&&(_, is_trait_impl)| !is_trait_impl).map(|&(id, _)| id)
+        self.impls_where(&self.trait_impl, false)
+    }
+
+    /// The trait impls that are not `#[rustc_reservation_impl]`, in declaration order: what
+    /// coherence and trait selection take as impls (rustc's `impl_polarity` makes a reservation
+    /// impl `ReservationImpl`, which selection skips).
+    pub fn trait_impls_without_reservation(&self) -> impl Iterator<Item = ImplId> + '_ {
+        self.impls
+            .iter()
+            .enumerate()
+            .filter(|&(at, _)| self.trait_impl.get(at) && !self.reservation_impl.get(at))
+            .map(|(_, &it)| it)
     }
 
     pub fn builtin_derive_impls(&self) -> impl ExactSizeIterator<Item = BuiltinDeriveImplId> + '_ {
@@ -1367,8 +1416,11 @@ impl ItemScope {
         self.legacy_macros.get(name).map(|it| &**it)
     }
 
-    pub(crate) fn define_impl(&mut self, imp: ImplId, is_trait_impl: bool) {
-        self.impls.push((imp, is_trait_impl));
+    pub(crate) fn define_impl(&mut self, imp: ImplId, is_trait_impl: bool, is_reservation: bool) {
+        let at = self.impls.len();
+        self.impls.push(imp);
+        self.trait_impl.push(at, is_trait_impl);
+        self.reservation_impl.push(at, is_reservation);
     }
 
     pub(crate) fn define_builtin_derive_impl(&mut self, imp: BuiltinDeriveImplId) {
@@ -1733,6 +1785,8 @@ impl ItemScope {
             by_def: _,
             declarations,
             impls,
+            trait_impl,
+            reservation_impl,
             builtin_derive_impls,
             unnamed_consts,
             unnamed_trait_imports,
@@ -1757,6 +1811,8 @@ impl ItemScope {
         unresolved.shrink_to_fit();
         declarations.shrink_to_fit();
         impls.shrink_to_fit();
+        trait_impl.0.shrink_to_fit();
+        reservation_impl.0.shrink_to_fit();
         builtin_derive_impls.shrink_to_fit();
         unnamed_consts.shrink_to_fit();
         unnamed_trait_imports.shrink_to_fit();

@@ -85,3 +85,16 @@ is right as it is; when one is added, that error is the validator's and belongs 
 
 > for: diagnostics-items (note).
 > forwarded to diagnostics: between its own children.
+
+## diagnostics-items-ast: done, the order of the AST validation errors hir gives (option 1)
+
+What: none left to do. With the parent's agreement, `checks::ast_validation` gives E0130
+(`fns::visit_fn`), the five without-body errors (`items.rs`: `const_`, `static_`, `type_alias`)
+and E0198 (`items::impl_`) where its walk comes to them. `lower/pattern_arg_in_extern_fn.rs`
+and `lower/missing_body.rs` give nothing, and `lower/trait_impl_incorrect_safety.rs` gives
+nothing for an `unsafe` negative impl or an inherent one, even where blaze cannot find the
+impl. The tests moved from `tests/items/generics.rs` (E0130, free statics) and
+`tests/items/impls.rs` (E0198) to `tests/items/ast_validation.rs`.
+
+> for: diagnostics-items (note).
+> applied: noted, nothing left to apply.

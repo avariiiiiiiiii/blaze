@@ -49,6 +49,7 @@ use blaze_usercode::{
     Given, RunKey, RunKind,
     index::{self, FindError, Found},
     inputs::{self, Files, Now},
+    trace::Inputs,
 };
 
 pub use puts::{Published, Put, publish, put, take_puts};
@@ -107,12 +108,64 @@ struct Installed {
 
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
+/// The inputs of a server's expansion as they are now: the machine's files, and the
+/// environment it is sent ([`Environment::seen`]), worked out the first time a shape names a
+/// variable, so a hit of a run that read none allocates none.
+struct Seen<'a> {
+    passed: &'a [(String, String)],
+    call: &'a Env,
+    made: Option<inputs::Env>,
+    /// What file, directory and listing reads are asked through: no variable is read there.
+    none: inputs::Env,
+}
+
+impl Seen<'_> {
+    fn now(&mut self) -> Now<'_> {
+        let (passed, call) = (self.passed, self.call);
+        let env = self.made.get_or_insert_with(|| inputs::Env::new(Environment::seen(passed, call.iter())));
+        Now { files: Files::shared(), env }
+    }
+}
+
+impl Inputs for Seen<'_> {
+    type Error = inputs::Unreadable;
+
+    fn file(&mut self, path: &std::path::Path) -> Result<Option<[u8; 32]>, Self::Error> {
+        Now { files: Files::shared(), env: &self.none }.file(path)
+    }
+
+    fn dir(&mut self, path: &std::path::Path) -> Result<Option<[u8; 32]>, Self::Error> {
+        Now { files: Files::shared(), env: &self.none }.dir(path)
+    }
+
+    fn env(&mut self, name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+        self.now().env(name)
+    }
+
+    fn env_all(&mut self) -> &[(std::ffi::OsString, std::ffi::OsString)] {
+        let (passed, call) = (self.passed, self.call);
+        self.made.get_or_insert_with(|| inputs::Env::new(Environment::seen(passed, call.iter()))).vars()
+    }
+
+    fn names(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<Option<Vec<(std::ffi::OsString, bool)>>, Self::Error> {
+        Now { files: Files::shared(), env: &self.none }.names(path)
+    }
+}
+
+/// What `check` compares a kept expansion by, read in place: its bytes' hash.
+pub fn checked(bytes: &[u8]) -> ContentId {
+    ContentId::of("blaze v2 proc-macro checked expansion 1", bytes)
+}
+
 /// What the store has of a call.
 enum Lookup {
     /// Its expansion, read back.
     Read(tt::TopSubtree),
-    /// Its expansion's bytes, to compare a fresh one with ([`Mode::Check`]).
-    Bytes(Vec<u8>),
+    /// The hash of its expansion's bytes, to compare a fresh one with ([`Mode::Check`]).
+    Hashed(ContentId),
     Nothing,
 }
 
@@ -394,13 +447,15 @@ impl Kept {
         let (given, spans) = given(&installed.expansions.toolchain, &call);
         let code = self.dylib.code().map_err(|why| self.error(why))?;
         let run = RunKey { code, given: given.finish() };
-        let seen = inputs::Env::new(Environment::seen(
-            installed.expansions.environment.passed(),
-            env.iter(),
-        ));
-        // The files' table and this call's environment: no lock, and nothing here asks the
-        // database, so the store's guard is the one thing held across `find`.
-        let mut now = Now { files: Files::shared(), env: &seen };
+        // The files' table and this call's environment, made only if a shape read a variable:
+        // no lock, and nothing here asks the database, so the store's guard is the one thing
+        // held across `find`.
+        let mut now = Seen {
+            passed: installed.expansions.environment.passed(),
+            call: env,
+            made: None,
+            none: inputs::Env::default(),
+        };
         let found = {
             let store = installed.expansions.store.read().unwrap_or_else(|it| it.into_inner());
             match index::find(&store, &run, &mut now) {
@@ -408,7 +463,7 @@ impl Kept {
                 Ok(Found::Hit { value, .. }) if installed.mode == Mode::Keep => {
                     read(value, &spans).map(Lookup::Read).map_err(|why| self.error(why))
                 }
-                Ok(Found::Hit { value, .. }) => Ok(Lookup::Bytes(value.to_vec())),
+                Ok(Found::Hit { value, .. }) => Ok(Lookup::Hashed(checked(value))),
                 Ok(Found::Miss { .. }) => Ok(Lookup::Nothing),
                 Err(FindError::Corrupt(corrupt)) => Err(self.error(corrupt)),
                 Err(FindError::NotAShape { key, why }) => {
@@ -423,7 +478,7 @@ impl Kept {
                 count(Counted::Found, start.elapsed());
                 return Ok(output);
             }
-            Lookup::Bytes(bytes) => Some(bytes),
+            Lookup::Hashed(hash) => Some(hash),
             Lookup::Nothing => None,
         };
         let asked = load_cargo::asked();
@@ -442,7 +497,7 @@ impl Kept {
         };
         let bytes = written(&output, &spans);
         if let Some(kept) = &found {
-            if bytes.as_ref() != Some(kept) {
+            if bytes.as_deref().map(checked).as_ref() != Some(kept) {
                 return Err(self.error(format!(
                     "{CACHE}=check: it expanded otherwise than the store kept it, under a key \
                      of every input it was traced to read"

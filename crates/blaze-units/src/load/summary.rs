@@ -20,21 +20,7 @@ fn str_of<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key].as_str().ok_or_else(|| anyhow!("no `{key}` in a package"))
 }
 
-/// What the resolve and its graph read of one package.
-pub struct Read {
-    pub summary: Summary,
-    /// The crate name of its library, `-` as `_`.
-    pub lib: Option<InternedString>,
-    pub proc_macro_lib: bool,
-    pub any_proc_macro: bool,
-    /// Whether it has a build script, without which its build dependencies are not built.
-    pub build_script: bool,
-    /// The `required-features` of each of its binaries.
-    pub bins: Vec<Vec<String>>,
-    /// `package.license` and `package.repository`.
-    pub license: Option<String>,
-    pub repository: Option<String>,
-}
+pub use crate::Read;
 
 fn package_source(package: &Value) -> Result<SourceId> {
     match package["source"].as_str() {

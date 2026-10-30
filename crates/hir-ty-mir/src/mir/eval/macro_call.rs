@@ -135,7 +135,7 @@ fn read_string<'db>(evaluator: &Evaluator<'db>, value: Interval) -> Result<'db, 
         words.push(from_bytes!(usize, word));
     }
     let Some(addr) =
-        words.iter().map(|&it| Address::from_usize(it)).find(|it| matches!(it, Heap(_)))
+        words.iter().map(|&it| Address::from_usize(it)).find(|it| matches!(it.at(), Heap(_)))
     else {
         // An empty `String` holds a dangling pointer, not one into the heap.
         return Ok(String::new());
@@ -144,7 +144,7 @@ fn read_string<'db>(evaluator: &Evaluator<'db>, value: Interval) -> Result<'db, 
     let len = words
         .iter()
         .copied()
-        .filter(|&it| !matches!(Address::from_usize(it), Heap(_)))
+        .filter(|&it| !matches!(Address::from_usize(it).at(), Heap(_)))
         .min()
         .unwrap_or(0);
     let text = evaluator.read_memory(addr, len)?;

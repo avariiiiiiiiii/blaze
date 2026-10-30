@@ -180,10 +180,15 @@ fn up(root: ptr::NonNull<FlatRoot>, at: u32) -> Option<(ptr::NonNull<FlatRoot>, 
 
 /// [`flat`] for a root that is not borrowed from a cursor.
 ///
-/// SAFETY: the caller holds a cursor into `root`'s file, which keeps `root` alive (a part's
-/// root lives as long as its file's), for as long as the reference is used.
+/// # Safety
+///
+/// The caller holds a cursor into `root`'s file, which keeps `root` alive (a part's root lives
+/// as long as its file's), for as long as `'a`.
 #[inline]
 unsafe fn flat_unbound<'a>(root: ptr::NonNull<FlatRoot>) -> &'a FlatRoot {
+    // SAFETY: the caller's precondition keeps `root` alive for `'a`: a `FlatRoot` made from a
+    // box by `new_flat_root` or `part_root`, freed only when the last cursor into its file
+    // drops, and only ever read through shared references.
     unsafe { &*root.as_ptr() }
 }
 

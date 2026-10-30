@@ -1406,12 +1406,12 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                         Ok(it) => it,
                         // A borrow `format_args!` lowers to is at what it borrows, and a
                         // variable its template names at the template.
-                        Err(_) => match &body[expr] {
+                        Err(_) => match body.expr(expr) {
                             hir_def::hir::Expr::Ref { expr: inner, .. } => {
-                                match source_map.expr_syntax(*inner) {
+                                match source_map.expr_syntax(inner) {
                                     Ok(it) => it,
                                     Err(_) => source_map
-                                        .format_args_implicit_capture(*inner)?
+                                        .format_args_implicit_capture(inner)?
                                         .map(|(template, _)| template.wrap_left()),
                                 }
                             }
@@ -1660,7 +1660,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     }
                     impl StoreVisitor for Find<'_> {
                         fn on_type(&mut self, ty: TypeRefId) {
-                            if let TypeRef::ImplTrait(_) = self.store[ty] {
+                            if let TypeRef::ImplTrait(_) = self.store.type_ref(ty) {
                                 self.found.push(ty);
                             }
                             let store = self.store;
@@ -1677,7 +1677,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                         source_map.type_syntax(it).ok().or_else(|| {
                             // An `async fn`'s future has no syntax: its output, the type
                             // the function says it returns, has.
-                            let TypeRef::ImplTrait(bounds) = &store[it] else { return None };
+                            let TypeRef::ImplTrait(bounds) = store.type_ref(it) else { return None };
                             let [hir_def::hir::type_ref::TypeBound::Path(path, _)] = &bounds[..]
                             else {
                                 return None;

@@ -117,8 +117,10 @@ pub enum Access {
     Execute,
     /// Readable, shared: read-only data the daemon may still change.
     Read,
-    /// Readable and writable, a private copy made on first write: a program's data. What the
-    /// daemon writes later shows only in pages the process has not written.
+    /// Readable and writable, a private copy: a program's data. Nothing relies on whether the
+    /// daemon's later writes show through: on Linux and Windows they do in pages the process
+    /// has not written (copy on write), on macOS never (a snapshot taken when it is mapped,
+    /// since a mapping of a Mach memory entry can't gain more rights than the entry has).
     Copy,
     /// Readable and writable, shared both ways: the fence's control words.
     Shared,
@@ -442,6 +444,13 @@ impl CodeMemory {
             self.post();
         }
         Ok(freed)
+    }
+
+    /// Stores `value` where every run process reads it with one load
+    /// ([`runtime::Attached::announced`]): `blaze-live`'s patch generation, so its poll asks
+    /// the daemon for a patch over the channel only once there is one.
+    pub fn announce(&self, value: u64) {
+        self.fences.announce(value);
     }
 
     /// The bytes retired and not yet free.

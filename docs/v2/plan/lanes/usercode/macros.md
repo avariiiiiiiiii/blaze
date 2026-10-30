@@ -46,32 +46,38 @@ kept into an error.
 
 ## Speed
 
-The bar is rustc's in-process proc-macro bridge: one run of the macro for each call. A hit
-here costs no run. It is one BLAKE3 of the call, one lookup in the content store, a stat of
-each traced input (its hash is cached by stat, and BLAKE3 runs only when the stat changed),
-and a decode of the expansion in place from the store's bytes. The other two references are
-rust-analyzer's proc-macro server, which has a process boundary on every call and no cache,
-and dtolnay's watt, which runs wasm proc macros in process with no cache. A blaze hit does
-less than all three: it neither runs the macro nor crosses a process.
+A hit costs:
+- one BLAKE3 of the call: each `Given` part is hashed once, into 32 bytes, and the tokens are
+  encoded into a reused per-thread buffer;
+- one lookup in the content store, with `index::find` streaming each input of a shape into
+  the key;
+- a stat of each traced input, with hashes cached by stat in a process-wide lock-free table;
+- a decode of the expansion from the store's bytes in place.
 
-- **Wasm modules run in process.** There is no IPC, and a module is
-  compiled once to machine code, which the store keeps by digest.
-- **Warm servers** start once per library and sandbox, keyed without `PATH` or the variables
-  passed through (#805). Those variables are sent with each expansion instead. The client
-  asks the pool for its socket I/O as effects, through the sans-IO `Bridge`.
-- **No lock or shared write on a read.**
-  - The passed environment is interned and published through one atomic.
-  - The input check uses a hash table with no lock, shared by the whole process
-    (`blaze_usercode::inputs`).
-  - The store's read view is requested from the store lane.
-- **No copy on a hit.** The expansion is decoded from the stored bytes. The `check` mode
-  alone copies them, because it needs them to compare against.
-- **Still to do** (requests, section 6):
-  - a store read view without a lock;
-  - the trace record streamed over the server's socket instead of read from a file;
-  - a reused thread pool in the vendored server;
-  - a `Given` that hashes as it is built. The tree encoding already goes into one reused
-    buffer per thread, but `Given` still copies every part and variable before hashing them.
+It allocates nothing but the decoded expansion, apart from two things. The call's
+environment is made only if a shape read a variable. The token tree is flattened into
+`FlatTree`'s vectors before it is encoded (see Falls short). `check` compares by the hash of
+the kept bytes, also read in place. A miss runs the macro once and keeps what it made.
+
+| reference | what it does | blaze |
+|---|---|---|
+| rustc's in-process bridge | runs the macro on every call, through a buffer of `u32` handles | **beats** on a hit: no run. On a miss: wasm is slower than native code, and a warm server adds a socket round trip |
+| rust-analyzer's proc-macro-srv | a process per toolchain, a postcard message per call, no cache | **matches** on a miss (warm server, same protocol, socket instead of pipes); **beats** on a hit; and is not keyed by `PATH` (#805) |
+| dtolnay's watt | wasm macros in process, interpreted (or JIT), no cache | **beats**: Cranelift machine code kept in the store by module digest, and expansions kept |
+| wasmtime `InstancePre` | linking resolved once per module | **matches**: one `InstancePre` per module; each expansion only instantiates |
+| wasmtime precompiled `.cwasm` | `Module::deserialize_file` maps the code, and memory images are copy-on-write | **falls short**: the code comes from the store as bytes and is copied in. Needs a mapped file from the store (request) |
+| wasmtime pooling allocator | instance slots reserved up front, instantiation in microseconds | **falls short**: on-demand allocation, one `mmap` per instance on a miss. Pooling needs a bound on live instances, and stateful sessions live as long as their crate |
+| Relax (makepad) | verified macro crates compiled natively into the compiler | superseded by change 20 (fastcompile). On a miss Relax runs native code where blaze runs wasm. On a hit blaze does less |
+
+Falls short, and what it would take:
+- `Given::env` still copies each variable into an `OsString` (parent's `blaze-usercode`).
+- The key flattens the tree into `FlatTree`'s vectors. A walker that hashes tokens and span
+  shapes straight into the buffer would remove them.
+- The store's read guard (request: a lock-free view).
+- The warm record is read from a file after each expansion. The file stays open, the buffer
+  is reused, and lines are parsed in place; only this scope's lines and new common lines are
+  copied. Streaming it over the socket would remove the read (request).
+- The vendored server spawns a thread per expansion (request: a pool).
 
 ## For fastcompile: the proc-macro bridge
 

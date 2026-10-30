@@ -58,6 +58,7 @@ impl World {
             vfs: &mut self.vfs,
             db: &self.db,
             builder: &mut self.builder,
+            pid: 30,
             memory_bytes: 10,
             budget_bytes: 20,
         };
@@ -440,7 +441,7 @@ fn status_lists_every_connections_requests_sorted() {
     world.request(2, 8, Request::Check { view: head("main"), targets: targets() });
     world.request(1, 5, Request::Check { view: head("main"), targets: targets() });
     world.request(1, 1, Request::Open { view: head("main") });
-    let status = Status { requests: vec![5, 8], views: 3, memory_bytes: 10, budget_bytes: 20 };
+    let status = Status { pid: 30, requests: vec![5, 8], views: 3, memory_bytes: 10, budget_bytes: 20 };
     assert_eq!(world.request(3, 1, Request::Status), [reply(3, 1, Response::Status(status)), done(3, 1, true)]);
 }
 

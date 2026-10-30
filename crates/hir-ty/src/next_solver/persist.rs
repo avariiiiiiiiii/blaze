@@ -30,13 +30,13 @@ use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
 
 use super::{
-    AdtDef, AliasTermKind, AliasTyKind, Binder, BoundConst, BoundExistentialPredicate,
+    AdtDef, AliasTermKind, AnonConstIdWrapper, AliasTyKind, Binder, BoundConst, BoundExistentialPredicate,
     BoundExistentialPredicates, BoundRegion, BoundRegionKind, BoundTy, BoundTyKind, BoundVarKinds,
     BoundVariableKind, CallableIdWrapper, Clause, ClauseKind, Clauses, ClosureIdWrapper,
     CoercePredicate, Const, ConstKind, Consts, CoroutineClosureIdWrapper, CoroutineIdWrapper, Ctor,
     DbInterner, EarlyParamRegion, ErrorGuaranteed, ExistentialPredicate, ExistentialProjection,
     ExistentialTraitRef, ExprConst, FnHeader, FnSigKind, FreeConstAliasId, FreeTermAliasId,
-    FreeTyAliasId, GeneralConstIdWrapper, GenericArg, GenericArgKind, GenericArgs,
+    FreeTyAliasId, GenericArg, GenericArgKind, GenericArgs,
     HostEffectClause, ImplOrTraitAssocConstId, ImplOrTraitAssocTermId, ImplOrTraitAssocTyId,
     InherentAssocConstId, InherentAssocTermId, InherentAssocTyId, InternedConst, InternedRegion,
     LateParamRegion, NormalizesTo, OpaqueTyIdWrapper, OutlivesClause, ParamConst, ParamTy,
@@ -243,7 +243,43 @@ macro_rules! unit_code {
     )*};
 }
 
-unit_code!(ErrorGuaranteed, ExprConst, Symbol);
+unit_code!(ErrorGuaranteed, ExprConst);
+
+/// A name: its length in bytes, then its UTF-8 bytes four to a word, little-endian, the last
+/// word zero-padded. The text, not a declared symbol's index, which another build may number
+/// otherwise.
+impl<'db> Code<'db> for Symbol {
+    fn put(&self, sink: &mut impl Sink<'db>) {
+        let bytes = self.0.as_str().as_bytes();
+        sink.word(u32::try_from(bytes.len()).expect("a name shorter than 4 GiB"));
+        let mut chunks = bytes.chunks_exact(4);
+        for chunk in &mut chunks {
+            sink.word(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 4];
+            last[..rest.len()].copy_from_slice(rest);
+            sink.word(u32::from_le_bytes(last));
+        }
+    }
+
+    fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
+        let len = source.word()? as usize;
+        // Grows only with words actually read, so a length past the value's words costs nothing.
+        let mut bytes = SmallVec::<[u8; 32]>::new();
+        for _ in 0..len.div_ceil(4) {
+            bytes.extend_from_slice(&source.word()?.to_le_bytes());
+        }
+        if bytes[len..].iter().any(|&pad| pad != 0) {
+            return Err(source.invalid("a name padded with zeros"));
+        }
+        match std::str::from_utf8(&bytes[..len]) {
+            Ok(text) => Ok(Symbol(intern::Symbol::intern(text))),
+            Err(_) => Err(source.invalid("a name in UTF-8")),
+        }
+    }
+}
 
 /// `rustc_index` newtypes: one word, below their maximum.
 macro_rules! index_code {
@@ -434,7 +470,7 @@ def_id_code!(
     CoroutineIdWrapper<'db>,
     CoroutineClosureIdWrapper<'db>,
     OpaqueTyIdWrapper<'db>,
-    GeneralConstIdWrapper<'db>,
+    AnonConstIdWrapper<'db>,
     TraitAssocTyId,
     TraitAssocConstId,
     TraitAssocTermId,
@@ -496,7 +532,7 @@ impl<'db> Code<'db> for ConstParamId {
 }
 
 // The structs below are rebuilt with `from_checked_parts`: their parts were checked when the
-// value was first made (and `DbInterner`'s `debug_assert_args_compatible` is empty).
+// value was first made (and `DbInterner`'s `debug_assert_*_args_compatible` are empty).
 
 impl<'db> Code<'db> for TraitRef<'db> {
     fn put(&self, sink: &mut impl Sink<'db>) {
@@ -863,20 +899,33 @@ impl<'db> Code<'db> for rustc_type_ir::UnsafeBinderInner<DbInterner<'db>> {
     }
 }
 
-impl<'db> Code<'db> for FnHeader<'db> {
-    fn put(&self, sink: &mut impl Sink<'db>) {
-        let kind = self.fn_sig_kind;
-        sink.word(kind.abi().as_packed().into());
-        kind.is_safe().put(sink);
-        kind.c_variadic().put(sink);
-    }
-    fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
-        let abi = below(source, ExternAbi::ALL_VARIANTS.len() as u32, "an ABI")?;
-        let safety = if bool::get(source)? { Safety::Safe } else { Safety::Unsafe };
-        let c_variadic = bool::get(source)?;
-        let abi = ExternAbi::from_packed(abi as u8);
-        Ok(FnHeader { fn_sig_kind: FnSigKind::new(abi, safety, c_variadic) })
-    }
+/// A function pointer's signature and header. The header's splatted argument (`u8::MAX` for
+/// none) is checked against the signature's inputs, so the header is read after them.
+fn put_fn_ptr<'db>(
+    sig_tys: &Binder<'db, rustc_type_ir::FnSigTys<DbInterner<'db>>>,
+    header: FnHeader<'db>,
+    sink: &mut impl Sink<'db>,
+) {
+    sig_tys.put(sink);
+    let kind = header.fn_sig_kind;
+    sink.word(kind.abi().as_packed().into());
+    kind.is_safe().put(sink);
+    kind.c_variadic().put(sink);
+    sink.word(kind.splatted().unwrap_or(FnSigKind::NO_SPLATTED_ARG_INDEX).into());
+}
+
+fn get_fn_ptr<'db, S: Source<'db>>(source: &mut S) -> Result<TyKind<'db>, S::Error> {
+    let sig_tys = Binder::<'db, rustc_type_ir::FnSigTys<DbInterner<'db>>>::get(source)?;
+    let abi = below(source, ExternAbi::ALL_VARIANTS.len() as u32, "an ABI")?;
+    let safety = if bool::get(source)? { Safety::Safe } else { Safety::Unsafe };
+    let c_variadic = bool::get(source)?;
+    let splatted = below(source, u32::from(u8::MAX) + 1, "a splatted argument")? as u8;
+    let splatted = (splatted != FnSigKind::NO_SPLATTED_ARG_INDEX).then_some(splatted);
+    let inputs = sig_tys.as_ref().skip_binder().inputs_and_output.len().saturating_sub(1);
+    let abi = ExternAbi::from_packed(abi as u8);
+    let fn_sig_kind = FnSigKind::new(abi, safety, c_variadic, splatted, inputs)
+        .map_err(|_| source.invalid("a splatted argument among the inputs"))?;
+    Ok(TyKind::FnPtr(sig_tys, FnHeader { fn_sig_kind }))
 }
 
 impl<'db> Code<'db> for ScalarInt {
@@ -1059,8 +1108,7 @@ impl<'db> Code<'db> for TyKind<'db> {
             }
             TyKind::FnPtr(sig_tys, header) => {
                 sink.word(14);
-                sig_tys.put(sink);
-                header.put(sink);
+                put_fn_ptr(&sig_tys, header, sink);
             }
             TyKind::UnsafeBinder(inner) => {
                 sink.word(15);
@@ -1141,7 +1189,7 @@ impl<'db> Code<'db> for TyKind<'db> {
             11 => TyKind::RawPtr(Code::get(source)?, Code::get(source)?),
             12 => TyKind::Ref(Code::get(source)?, Code::get(source)?, Code::get(source)?),
             13 => TyKind::FnDef(Code::get(source)?, Code::get(source)?),
-            14 => TyKind::FnPtr(Code::get(source)?, Code::get(source)?),
+            14 => get_fn_ptr(source)?,
             15 => TyKind::UnsafeBinder(Code::get(source)?),
             16 => TyKind::Dynamic(Code::get(source)?, Code::get(source)?),
             17 => TyKind::Closure(Code::get(source)?, Code::get(source)?),
@@ -1875,7 +1923,7 @@ mod tests {
     use rustc_type_ir::{FlagComputation, Flags, INNERMOST, TypeFlags};
 
     use super::*;
-    use crate::{db::GeneralConstId, next_solver::TermId};
+    use crate::next_solver::TermId;
 
     #[test]
     fn record_at_views_only_checked_bytes_in_bounds_and_aligned() {
@@ -1926,6 +1974,10 @@ mod tests {
         rustc_type_ir::Const(InternedConst::intern(kind))
     }
 
+    fn name(text: &str) -> Symbol {
+        Symbol(intern::Symbol::intern(text))
+    }
+
     fn samples<'db>() -> Samples<'db> {
         let u8 = Ty::intern(TyKind::Uint(UintTy::U8));
         let statik = region(RegionKind::ReStatic);
@@ -1937,11 +1989,10 @@ mod tests {
         let lifetime = LifetimeParamId { parent: generic, local_id: local(0) };
         let trait_ = TraitIdWrapper(id(4));
         let alias: TypeAliasId = id(5);
-        let general = GeneralConstIdWrapper(GeneralConstId::ConstId(id(6)));
         let args = GenericArgs::new_from_slice(&[u8.into(), statik.into()]);
         let vars = BoundVarKinds::new_from_slice(&[
             BoundVariableKind::Region(BoundRegionKind::Anon),
-            BoundVariableKind::Region(BoundRegionKind::NamedForPrinting(Symbol)),
+            BoundVariableKind::Region(BoundRegionKind::NamedForPrinting(name("'a"))),
             BoundVariableKind::Region(BoundRegionKind::Named(SolverDefId::FunctionId(function))),
             BoundVariableKind::Region(BoundRegionKind::ClosureEnv),
             BoundVariableKind::Ty(BoundTyKind::Anon),
@@ -1950,14 +2001,19 @@ mod tests {
         ]);
         let seven = konst(ConstKind::Value(ValueConst::new(
             u8,
-            ValTreeKind::Leaf(ScalarInt::from(7u8)),
+            ValTree::new(ValTreeKind::Leaf(ScalarInt::from(7u8))),
         )));
+        // `pair` is `fn(u8) -> bool`: one input.
+        let header = |abi, safety, c_variadic, splatted| FnHeader {
+            fn_sig_kind: FnSigKind::new(abi, safety, c_variadic, splatted, 1)
+                .expect("a splatted argument among the inputs"),
+        };
         let pair = Tys::new_from_slice(&[u8, Ty::intern(TyKind::Bool)]);
         let trait_ref = TraitRef::from_checked_parts(trait_, args);
-        let alias_term = |kind| AliasTerm::from_checked_parts(kind, args);
-        let alias_ty = |kind| AliasTy::from_checked_parts(kind, args);
-        let alias_const = |kind| AliasConst::from_checked_parts(kind, args);
-        let anon: AnonConstId<'db> = general;
+        let alias_term = |kind| Alias::from_checked_parts(kind, args);
+        let alias_ty = |kind| Alias::from_checked_parts(kind, args);
+        let alias_const = |kind| Alias::from_checked_parts(kind, args);
+        let anon = AnonConstIdWrapper(id(11));
         let bound_ty = |var, kind| BoundTy { var: BoundVar::from_u32(var), kind };
         let bound_region = |var, kind| BoundRegion { var: BoundVar::from_u32(var), kind };
         let range = PatternKind::Range { start: seven, end: seven };
@@ -1984,11 +2040,15 @@ mod tests {
             ),
             TyKind::FnPtr(
                 Binder::bind_with_vars(rustc_type_ir::FnSigTys { inputs_and_output: pair }, vars),
-                FnHeader { fn_sig_kind: FnSigKind::new(ExternAbi::C { unwind: false }, Safety::Safe, true) },
+                header(ExternAbi::C { unwind: false }, Safety::Safe, true, None),
             ),
             TyKind::FnPtr(
                 Binder::dummy(rustc_type_ir::FnSigTys { inputs_and_output: pair }),
-                FnHeader { fn_sig_kind: FnSigKind::new(ExternAbi::Rust, Safety::Unsafe, false) },
+                header(ExternAbi::Rust, Safety::Unsafe, false, None),
+            ),
+            TyKind::FnPtr(
+                Binder::dummy(rustc_type_ir::FnSigTys { inputs_and_output: pair }),
+                header(ExternAbi::Rust, Safety::Safe, false, Some(0)),
             ),
             TyKind::UnsafeBinder(Binder::bind_with_vars(u8, vars).into()),
             TyKind::Dynamic(
@@ -2062,13 +2122,13 @@ mod tests {
             RegionKind::ReBound(BoundVarIndexKind::Canonical, bound_region(0, BoundRegionKind::Anon)),
             RegionKind::ReLateParam(LateParamRegion {
                 scope: SolverDefId::FunctionId(function),
-                kind: LATE_PARAM_KIND,
+                kind: bound_region(1, BoundRegionKind::ClosureEnv),
             }),
             RegionKind::ReStatic,
             RegionKind::ReVar(RegionVid::from_u32(9)),
             RegionKind::RePlaceholder(PlaceholderRegion::new(
                 UniverseIndex::from_u32(1),
-                bound_region(0, BoundRegionKind::NamedForPrinting(Symbol)),
+                bound_region(0, BoundRegionKind::NamedForPrinting(Symbol(intern::sym::tick_static))),
             )),
             RegionKind::ReErased,
             RegionKind::ReError(ErrorGuaranteed),
@@ -2101,10 +2161,10 @@ mod tests {
                 alias_const(AliasConstKind::Free { def_id: FreeConstAliasId(id(6)) }),
             ),
             ConstKind::Alias(IsRigid::Yes, alias_const(AliasConstKind::Anon { def_id: anon })),
-            ConstKind::Value(ValueConst::new(u8, ValTreeKind::Leaf(ScalarInt::from(7u8)))),
+            ConstKind::Value(ValueConst::new(u8, ValTree::new(ValTreeKind::Leaf(ScalarInt::from(7u8))))),
             ConstKind::Value(ValueConst::new(
                 Ty::intern(TyKind::Tuple(pair)),
-                ValTreeKind::Branch(Consts::new_from_slice(&[seven, seven])),
+                ValTree::new(ValTreeKind::Branch(Consts::new_from_slice(&[seven, seven]))),
             )),
             ConstKind::Error(ErrorGuaranteed),
             ConstKind::Expr(ExprConst),
@@ -2134,7 +2194,9 @@ mod tests {
             clause(ClauseKind::ConstEvaluatable(seven)),
             clause(ClauseKind::HostEffect(HostEffectClause { trait_ref, constness: BoundConstness::Const })),
             clause(ClauseKind::HostEffect(HostEffectClause { trait_ref, constness: BoundConstness::Maybe })),
-            clause(ClauseKind::UnstableFeature(Symbol)),
+            clause(ClauseKind::UnstableFeature(name("generic_const_items"))),
+            clause(ClauseKind::UnstableFeature(name("const_fn"))),
+            clause(ClauseKind::UnstableFeature(name(""))),
             Binder::dummy(PredicateKind::DynCompatible(trait_)),
             Binder::dummy(PredicateKind::Subtype(SubtypePredicate { a_is_expected: true, a: u8, b: u8 })),
             Binder::dummy(PredicateKind::Coerce(CoercePredicate { a: u8, b: u8 })),
@@ -2190,16 +2252,25 @@ mod tests {
             assert_eq!(Ty::intern(kind).index(), ty.index());
         }
         for &kind in &samples.regions {
-            assert_eq!(Region::intern(kind), Region::intern(kind));
+            assert_eq!(region(kind), region(kind));
         }
         for &kind in &samples.consts {
-            assert_eq!(Const::intern(kind).index(), Const::intern(kind).index());
+            assert_eq!(konst(kind), konst(kind));
         }
         for &kind in &samples.predicates {
             assert_eq!(Predicate::intern(kind), Predicate::intern(kind));
         }
+        // Every sample is another value, so another row: the codec tells apart each variant and
+        // each field (`IsRigid`, `FnDef`'s binder, the alias kinds), and drops none.
         let distinct: HashSet<_> = samples.tys.iter().map(|&kind| Ty::intern(kind)).collect();
         assert_eq!(distinct.len(), samples.tys.len());
+        let distinct: HashSet<_> = samples.regions.iter().map(|&kind| region(kind)).collect();
+        assert_eq!(distinct.len(), samples.regions.len());
+        let distinct: HashSet<_> = samples.consts.iter().map(|&kind| konst(kind)).collect();
+        assert_eq!(distinct.len(), samples.consts.len());
+        let distinct: HashSet<_> =
+            samples.predicates.iter().map(|&kind| Predicate::intern(kind)).collect();
+        assert_eq!(distinct.len(), samples.predicates.len());
         assert_eq!(
             GenericArgs::new_from_slice(samples.args.as_slice()).index(),
             samples.args.index()
@@ -2213,10 +2284,10 @@ mod tests {
             assert!(Ty::intern(kind).kind() == kind);
         }
         for &kind in &samples.regions {
-            assert!(Region::intern(kind).kind() == kind);
+            assert!(region(kind).kind() == kind);
         }
         for &kind in &samples.consts {
-            assert!(Const::intern(kind).kind() == kind);
+            assert!(konst(kind).kind() == kind);
         }
         for &kind in &samples.patterns {
             assert!(Pattern::intern(kind).kind() == kind);
@@ -2236,10 +2307,10 @@ mod tests {
             assert_eq!(ty.outer_exclusive_binder(), computed.outer_exclusive_binder);
         }
         for &kind in &samples.consts {
-            let konst = Const::intern(kind);
+            let value = konst(kind);
             let computed = FlagComputation::for_const_kind(&kind);
-            assert_eq!(konst.flags(), computed.flags);
-            assert_eq!(konst.outer_exclusive_binder(), computed.outer_exclusive_binder);
+            assert_eq!(value.flags(), computed.flags);
+            assert_eq!(value.outer_exclusive_binder(), computed.outer_exclusive_binder);
         }
         for &kind in &samples.predicates {
             let predicate = Predicate::intern(kind);
@@ -2270,7 +2341,6 @@ mod tests {
             assert_eq!(pattern.flags(), flags);
             assert_eq!(pattern.outer_exclusive_binder(), binder);
         }
-        let region = |kind| Region::intern(kind);
         assert_eq!(region(RegionKind::ReStatic).flags(), TypeFlags::HAS_FREE_REGIONS);
         assert_eq!(region(RegionKind::ReErased).flags(), TypeFlags::HAS_RE_ERASED);
         assert_eq!(
@@ -2295,7 +2365,7 @@ mod tests {
             match n % 3 {
                 0 => TyKind::Slice(leaf),
                 1 => TyKind::Tuple(Tys::new_from_slice(&[leaf, Ty::intern(TyKind::Infer(InferTy::FreshIntTy(n)))])),
-                _ => TyKind::Array(leaf, Const::intern(ConstKind::Infer(InferConst::Fresh(n)))),
+                _ => TyKind::Array(leaf, konst(ConstKind::Infer(InferConst::Fresh(n)))),
             }
         };
         let seen: Vec<Vec<u32>> = std::thread::scope(|scope| {
@@ -2326,8 +2396,8 @@ mod tests {
     fn a_table_reads_back_as_written() {
         let samples = samples();
         let tys: Vec<_> = samples.tys.iter().map(|&kind| Ty::intern(kind)).collect();
-        let regions: Vec<_> = samples.regions.iter().map(|&kind| Region::intern(kind)).collect();
-        let consts: Vec<_> = samples.consts.iter().map(|&kind| Const::intern(kind)).collect();
+        let regions: Vec<_> = samples.regions.iter().map(|&kind| region(kind)).collect();
+        let consts: Vec<_> = samples.consts.iter().map(|&kind| konst(kind)).collect();
         let clauses = Clauses::new_from_slice(
             &samples.predicates.iter().map(|&kind| Clause(Predicate::intern(kind))).collect::<Vec<_>>(),
         );
@@ -2337,7 +2407,7 @@ mod tests {
             .map(|&kind| Ty::intern(TyKind::Pat(tys[2], Pattern::intern(kind))))
             .collect();
 
-        let mut out = Writer::new(blaze_format::schema("a type table, in a test"));
+        let mut out = Writer::new(TABLE_SCHEMA);
         let mut writer = TyTableWriter::empty();
         let ty_places: Vec<_> = tys.iter().chain(&patterns).map(|&ty| writer.ty(ty)).collect();
         let region_places: Vec<_> = regions.iter().map(|&region| writer.region(region)).collect();
@@ -2364,19 +2434,77 @@ mod tests {
         assert!(reader.ty(u32::MAX).is_err(), "a place past the table");
     }
 
-    #[test]
-    fn a_table_that_names_a_later_value_is_refused() {
-        let mut out = Writer::new(blaze_format::schema("a broken type table, in a test"));
-        let nodes_at = out.push_slice(&[NodeRec { kind: Kind::Ty as u32, at: 0 }]);
-        // A tuple of the list at place 5, which is not before it.
-        let words_at = out.push_slice(&[22u32, 5]);
+    /// Whether the table of `values`, each its kind and words, in order, opens.
+    fn opens(values: &[(Kind, &[u32])]) -> bool {
+        let mut out = Writer::new(TABLE_SCHEMA);
+        let mut nodes = Vec::new();
+        let mut words = Vec::new();
+        for &(kind, value) in values {
+            nodes.push(NodeRec { kind: kind as u32, at: words.len() as u32 });
+            words.extend_from_slice(value);
+        }
+        let nodes_at = out.push_slice(&nodes);
+        let words_at = out.push_slice(&words);
         let at = out.next::<TableRec>();
+        let field = |offset: usize| at + offset as u64;
         let table = out.push(&TableRec {
-            nodes: Slice::between(at + std::mem::offset_of!(TableRec, nodes) as u64, nodes_at, 1),
-            words: Slice::between(at + std::mem::offset_of!(TableRec, words) as u64, words_at, 2),
+            nodes: Slice::between(field(std::mem::offset_of!(TableRec, nodes)), nodes_at, nodes.len()),
+            words: Slice::between(field(std::mem::offset_of!(TableRec, words)), words_at, words.len()),
         });
         let buffer = Aligned::copy_from(&out.finish(table));
-        assert!(TyTableReader::open_with(&buffer, table, adt).is_err());
-        assert!(TyTableReader::open_with(&buffer, table + 1, adt).is_err());
+        TyTableReader::open_with(&buffer, table, adt).is_ok()
+    }
+
+    #[test]
+    fn a_table_that_names_a_later_value_is_refused() {
+        // A tuple of the list at place 5, which is not before it.
+        assert!(!opens(&[(Kind::Ty, &[22, 5])]));
+        assert!(opens(&[(Kind::Tys, &[0]), (Kind::Ty, &[22, 0])]));
+    }
+
+    #[test]
+    fn a_table_of_words_no_kind_has_is_refused() {
+        // Places 0 to 3: no arguments, `bool`, no bound variables and the signature `() -> bool`.
+        let before: [(Kind, &[u32]); 4] = [
+            (Kind::GenericArgs, &[0]),
+            (Kind::Ty, &[0]),
+            (Kind::BoundVarKinds, &[0]),
+            (Kind::Tys, &[1, 1]),
+        ];
+        let with = |kind: Kind, words: &[u32]| {
+            let mut values = before.to_vec();
+            values.push((kind, words));
+            opens(&values)
+        };
+        // `TyKind::Alias(IsRigid, <bool as Trait>::Assoc)`, with an `IsRigid` past `No`.
+        assert!(with(Kind::Ty, &[23, 1, 0, 0, 10, 5, 0]));
+        assert!(!with(Kind::Ty, &[23, 2, 0, 0, 10, 5, 0]));
+        // `ConstKind::Alias(No, <_ as Trait>::CONST)`, with an `AliasConstKind` past `Anon`.
+        assert!(with(Kind::Const, &[4, 1, 0, 0, 3, 6, 0]));
+        assert!(!with(Kind::Const, &[4, 1, 0, 5, 3, 6, 0]));
+        // `NormalizesTo(<_ as Trait>::Assoc, bool)`, with an `AliasTermKind` past
+        // `InherentConstImpl`.
+        assert!(with(Kind::Predicate, &[6, 0, 0, 10, 5, 0, 0, 1, 2]));
+        assert!(!with(Kind::Predicate, &[6, 0, 9, 10, 5, 0, 0, 1, 2]));
+        // `PredicateKind`'s last variant is `NormalizesTo`: `AliasRelate` is gone.
+        assert!(with(Kind::Predicate, &[5, 2]));
+        assert!(!with(Kind::Predicate, &[7, 2]));
+        // `UnstableFeature(name)`: the name's length, its bytes four to a word, zero-padded.
+        let feature = |words: &[u32]| {
+            let mut predicate = vec![0, 8];
+            predicate.extend_from_slice(words);
+            predicate.push(2);
+            with(Kind::Predicate, predicate.as_slice())
+        };
+        assert!(feature(&[0]));
+        assert!(feature(&[1, u32::from(b'a')]));
+        assert!(feature(&[2, u32::from_le_bytes([0xC3, 0xA9, 0, 0])]), "`é`");
+        assert!(!feature(&[1, u32::from_le_bytes([b'a', b'a', 0, 0])]), "padding that is not zero");
+        assert!(!feature(&[1, 0xC3]), "half of `é`, not UTF-8");
+        assert!(!feature(&[5, u32::from_le_bytes(*b"abcd")]), "a name longer than its words");
+        // `fn() -> bool`: its ABI, safety, C-variadic flag and splatted argument, of no input.
+        assert!(with(Kind::Ty, &[14, 3, 2, 0, 1, 0, u32::from(u8::MAX)]));
+        assert!(!with(Kind::Ty, &[14, 3, 2, 0, 1, 0, 0]), "a splatted argument past the inputs");
+        assert!(!with(Kind::Ty, &[14, 3, 2, 0, 1, 0, 256]), "a splatted argument past `u8`");
     }
 }

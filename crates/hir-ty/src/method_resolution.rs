@@ -808,7 +808,7 @@ fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<De
 
 /// Built-in attributes that write no item, so one in a body leaves it without an impl. Any
 /// other (`derive`, `cfg_attr`, a tool's, a procedural macro's) may write one.
-const INERT_ATTRIBUTES: [&str; 11] = [
+const INERT_ATTRIBUTES: &[&str] = &[
     "allow",
     "warn",
     "deny",
@@ -822,8 +822,10 @@ const INERT_ATTRIBUTES: [&str; 11] = [
     "cfg",
 ];
 
+blaze_phf::phf_table!(static INERT_ATTRIBUTE = INERT_ATTRIBUTES;);
+
 fn attribute_is_inert(name: &str) -> bool {
-    INERT_ATTRIBUTES.contains(&name)
+    INERT_ATTRIBUTE.get(name).is_some()
 }
 
 /// What lexing a body found that may write an impl there.
@@ -1863,5 +1865,30 @@ fn self_ty_has_error_constructor<'db>(mut self_ty: Ty<'db>) -> bool {
             TyKind::UnsafeBinder(inner) => inner.skip_binder(),
             _ => return false,
         };
+    }
+}
+
+#[cfg(test)]
+mod inert_attribute_tests {
+    use super::{INERT_ATTRIBUTES, attribute_is_inert};
+
+    #[test]
+    fn inert_attributes_as_a_linear_search() {
+        let mut names: Vec<String> = Vec::new();
+        for name in INERT_ATTRIBUTES {
+            names.push((*name).to_owned());
+            names.push(format!("{name}_"));
+            names.push(format!("r#{name}"));
+            names.push(name.to_uppercase());
+            names.push(name[..name.len() - 1].to_owned());
+        }
+        names.extend(
+            ["", "derive", "cfg_attr", "test", "macro_export", "rustfmt", "clippy", "allowed"]
+                .map(str::to_owned),
+        );
+        for name in &names {
+            let by_search = INERT_ATTRIBUTES.contains(&name.as_str());
+            assert_eq!(attribute_is_inert(name), by_search, "{name}");
+        }
     }
 }

@@ -780,7 +780,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     pub fn lower_ty_ext(&mut self, type_ref_id: TypeRefId) -> (Ty<'db>, Option<TypeNs>) {
         let interner = self.interner;
         let mut res = None;
-        let type_ref = &self.store[type_ref_id];
+        let type_ref = self.store.type_ref(type_ref_id);
         tracing::debug!(?type_ref);
         let ty = match type_ref {
             TypeRef::Never => self.types.types.never,
@@ -794,14 +794,14 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 res = res_;
                 ty
             }
-            &TypeRef::TypeParam(type_param_id) => {
+            TypeRef::TypeParam(type_param_id) => {
                 res = Some(TypeNs::GenericParam(type_param_id));
 
                 let generics = self.generics();
                 let idx = generics.type_or_const_param_idx(type_param_id.into());
                 self.type_param(type_param_id, idx)
             }
-            &TypeRef::RawPtr(inner, mutability) => {
+            TypeRef::RawPtr(inner, mutability) => {
                 let inner_ty = self.lower_ty(inner);
                 Ty::new(interner, TyKind::RawPtr(inner_ty, lower_mutability(mutability)))
             }
@@ -810,7 +810,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 let const_len = self.lower_const(array.len, self.types.types.usize, false);
                 Ty::new_array_with_const_len(interner, inner_ty, const_len)
             }
-            &TypeRef::Slice(inner) => {
+            TypeRef::Slice(inner) => {
                 let inner_ty = self.lower_ty(inner);
                 Ty::new_slice(interner, inner_ty)
             }
@@ -824,7 +824,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                         None => self.types.regions.error,
                     },
                 };
-                let inner_ty = match &self.store[ref_.ty] {
+                let inner_ty = match self.store.type_ref(ref_.ty) {
                     // `&'a dyn Trait` is `&'a (dyn Trait + 'a)`.
                     TypeRef::DynTrait(bounds) if !lifetime.is_error() || self.impl_header => {
                         let object = self.object_default(lifetime);
@@ -950,7 +950,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     }
                 }
             }
-            &TypeRef::PatternType(ty, pat) => {
+            TypeRef::PatternType(ty, pat) => {
                 let ty = self.lower_ty(ty);
                 let Some(pat) = self.lower_pattern_type(pat, ty) else {
                     return (self.types.types.error, res);
@@ -963,7 +963,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 
     fn lower_pattern_type(&mut self, pat: PatId, ty: Ty<'db>) -> Option<Pattern<'db>> {
-        let pat_kind = match self.store[pat] {
+        let pat_kind = match self.store.pat(pat) {
             hir_def::hir::Pat::Range { start: Some(start), end: Some(end), range_type: _ } => {
                 // rustc allows using generic params in pattern types.
                 // In practice this does not matter since this feature is internal and I didn't find a way to actually use generic params,
@@ -974,7 +974,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 }
             }
             hir_def::hir::Pat::NotNull => rustc_type_ir::PatternKind::NotNull,
-            hir_def::hir::Pat::Or(ref pats) => rustc_type_ir::PatternKind::Or(
+            hir_def::hir::Pat::Or(pats) => rustc_type_ir::PatternKind::Or(
                 PatList::new_from_iter(
                     pats.iter().map(|&pat| self.lower_pattern_type(pat, ty).ok_or(())),
                 )
@@ -1044,10 +1044,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     /// lower the self types of the predicates since that could lead to cycles.
     /// So we just check here if the `type_ref` resolves to a generic param, and which.
     fn lower_ty_only_param(&self, type_ref: TypeRefId) -> Option<TypeOrConstParamId> {
-        let type_ref = &self.store[type_ref];
+        let type_ref = self.store.type_ref(type_ref);
         let path = match type_ref {
             TypeRef::Path(path) => path,
-            &TypeRef::TypeParam(idx) => return Some(idx.into()),
+            TypeRef::TypeParam(idx) => return Some(idx.into()),
             _ => return None,
         };
         if path.type_anchor().is_some() {
@@ -2593,7 +2593,7 @@ impl SupertraitsInfo {
                 else {
                     continue;
                 };
-                let target = &signature.store[*target];
+                let target = signature.store.type_ref(*target);
                 match target {
                     TypeRef::TypeParam(param)
                         if param.local_id() == GenericParams::SELF_PARAM_ID_IN_SELF => {}
@@ -3972,9 +3972,9 @@ fn input_lifetimes(
         Some((_, LifetimeRef::Error)) => None,
         Some((it, _)) => Some(Some(it)),
     };
-    match &store[ty] {
+    match store.type_ref(ty) {
         TypeRef::Reference(it) => {
-            if matches!(&store[it.ty], TypeRef::Path(path) if path.is_self_type()) {
+            if matches!(store.type_ref(it.ty), TypeRef::Path(path) if path.is_self_type()) {
                 self_references.push(found.len());
             }
             found.push(lifetime(it.lifetime)?);
@@ -3984,7 +3984,7 @@ fn input_lifetimes(
             .iter()
             .try_for_each(|&it| input_lifetimes(db, resolver, store, it, found, self_references)),
         TypeRef::RawPtr(it, _) | TypeRef::Slice(it) => {
-            input_lifetimes(db, resolver, store, *it, found, self_references)
+            input_lifetimes(db, resolver, store, it, found, self_references)
         }
         TypeRef::Array(it) => input_lifetimes(db, resolver, store, it.ty, found, self_references),
         TypeRef::Never | TypeRef::TypeParam(_) => Some(()),

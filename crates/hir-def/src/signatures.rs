@@ -6,29 +6,33 @@ use base_db::SourceDatabase;
 use bitflags::bitflags;
 use cfg::{CfgExpr, CfgOptions};
 use hir_expand::{
-    InFile, Intern, Lookup,
+    HirFileId, InFile, Intern, Lookup,
     name::{AsName, Name},
+    span_map::SpanMap,
 };
 use intern::{Symbol, sym};
 use la_arena::{Arena, Idx};
 use rustc_abi::{ExternAbi, IntegerType, ReprOptions};
 use smallvec::{SmallVec, smallvec};
+use span::{AstIdMap, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, T,
+    AstNode, FlatTree, FlatTreeBuilder, SyntaxKind, SyntaxNode, SyntaxNodePtr, T, TextRange,
+    TextSize,
     ast::{self, HasGenericParams, HasName, HasVisibility, IsString},
 };
 use thin_vec::ThinVec;
 use triomphe::Arc;
 
 use crate::{
-    ConstId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId, FunctionId, FxIndexMap,
-    HasModule, ImplId, ItemContainerId, LoweringMode, ModuleId, StaticId, StructId, TraitId,
-    TypeAliasId, UnionId, VariantId,
+    AdtId, ConstId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId, FunctionId, FxIndexMap,
+    GenericDefId, HasModule, ImplId, ItemContainerId, LoweringMode, ModuleId, StaticId, StructId,
+    TraitId, TypeAliasId, UnionId, VariantId,
     attrs::AttrFlags,
     expr_store::{
-        ExpressionStore, ExpressionStoreSourceMap,
+        ExpressionStore, ExpressionStoreSourceMap, Move,
         lower::{
-            ExprCollector, lower_function, lower_generic_params, lower_trait, lower_type_alias,
+            ExprCollector, lower_function, lower_generic_params_within, lower_impl, lower_trait,
+            lower_type_alias, lower_type_ref,
         },
     },
     hir::{ExprId, PatId, generics::GenericParams},
@@ -78,6 +82,233 @@ fn child_tokens<const N: usize>(node: &SyntaxNode, kinds: [SyntaxKind; N]) -> [b
         }
     }
     found
+}
+
+/// The maps a signature is lowered with when it is lowered from a [`SignatureSyntax`], `None`
+/// when it is lowered from its file.
+type Maps<'a> = Option<(&'a RealSpanMap, &'a AstIdMap)>;
+
+/// What a signature is lowered from: its item written in a file, as a tree of its own whose
+/// text starts at the item, with what no signature reads replaced by an empty node of its kind
+/// (the body of a fn, const or static, the items of an impl or trait, and for
+/// [`signature_syntax`] the variants of an enum), and the span and ast id maps of that tree.
+/// It is compared by that text, so it stays the same while an edit elsewhere in the file moves
+/// the item, or one inside what is left out: a signature is lowered again only when it
+/// changes, as a body is from its `BodySyntax`.
+///
+/// An item whose spans are counted from an item around it ([`RealSpanMap::anchor_at`]: an item
+/// in a body, or in an `impl`, trait or module that has attributes) is lowered from that whole
+/// item instead, nothing left out, so any edit inside that one lowers it again.
+pub struct SignatureSyntax {
+    pub file_id: HirFileId,
+    tree: std::sync::Arc<FlatTree>,
+    /// What the tree is made of ([`FlatTree::hash_subtree`]): what it is compared by.
+    hash: u128,
+    /// The item in the tree.
+    item: SyntaxNodePtr,
+    /// The empty node in place of what is left out, when something is.
+    elided: Option<SyntaxNodePtr>,
+    ast_id_map: AstIdMap,
+    span_map: RealSpanMap,
+}
+
+impl PartialEq for SignatureSyntax {
+    fn eq(&self, other: &Self) -> bool {
+        self.file_id == other.file_id
+            && self.hash == other.hash
+            && self.item == other.item
+            && self.elided == other.elided
+            && self.ast_id_map == other.ast_id_map
+            && self.span_map == other.span_map
+    }
+}
+
+impl Eq for SignatureSyntax {}
+
+impl std::fmt::Debug for SignatureSyntax {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignatureSyntax")
+            .field("file_id", &self.file_id)
+            .field("hash", &self.hash)
+            .field("item", &self.item)
+            .field("elided", &self.elided)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SignatureSyntax {
+    /// The syntax of item `src`, with `elide`'s node of it left out when the item is its own
+    /// anchor; `None` for an item a macro writes.
+    fn new(
+        db: &dyn SourceDatabase,
+        src: InFile<SyntaxNode>,
+        elide: fn(&SyntaxNode) -> Option<SyntaxNode>,
+    ) -> Option<SignatureSyntax> {
+        let SpanMap::RealSpanMap(span_map) = src.file_id.span_map(db) else { return None };
+        let item = src.value;
+        let item_range = item.text_range();
+        let file_ast_id_map = src.file_id.ast_id_map(db);
+        let (_, anchor) = span_map.anchor_at(item_range.start());
+        let anchor = match anchor == ROOT_ERASED_FILE_AST_ID {
+            true => item.ancestors().last()?,
+            false => {
+                let ptr = file_ast_id_map.get_erased(anchor);
+                item.ancestors().find(|it| SyntaxNodePtr::new(it) == ptr)?
+            }
+        };
+        let anchor_range = anchor.text_range();
+        let elided = match anchor_range == item_range && anchor.kind() == item.kind() {
+            true => elide(&item),
+            false => None,
+        };
+        let base = anchor_range.start();
+        let whole = anchor.clone_subtree();
+        let (whole_tree, _) = whole.flat().expect("a cloned subtree is flat");
+        let (tree, placeholder, spans_end) = match &elided {
+            None => (whole_tree.clone(), None, anchor_range.end()),
+            Some(node) => {
+                let range = node.text_range() - base;
+                let in_whole = SyntaxNodePtr::from_parts(node.kind(), range).to_node(&whole);
+                let (_, at) = in_whole.flat().expect("a node of a flat tree");
+                let source = whole_tree.source();
+                let text = [&source[..usize::from(range.start())], &source[usize::from(range.end())..]]
+                    .concat();
+                let mut empty = FlatTreeBuilder::new();
+                empty.start_node(whole_tree.kind(at));
+                empty.finish_node();
+                let tree = whole_tree.replace_subtree(at, &empty.finish(), text.into());
+                let placeholder = SyntaxNodePtr::from_parts(node.kind(), TextRange::empty(range.start()));
+                (std::sync::Arc::new(tree), Some(placeholder), node.text_range().start())
+            }
+        };
+        let removed = elided.as_ref().map_or(TextSize::new(0), |it| it.text_range().len());
+        let item_ptr = SyntaxNodePtr::from_parts(
+            item.kind(),
+            TextRange::new(item_range.start() - base, item_range.end() - base - removed),
+        );
+        let root = SyntaxNode::new_flat_root(tree.clone());
+        let ast_id_map = match &elided {
+            None => file_ast_id_map.relative_to(&anchor, &root),
+            Some(node) => {
+                file_ast_id_map.relative_without(&anchor, &root, SyntaxNodePtr::new(node))
+            }
+        };
+        Some(SignatureSyntax {
+            file_id: src.file_id,
+            hash: tree_hash(&tree),
+            tree,
+            item: item_ptr,
+            elided: placeholder,
+            ast_id_map,
+            span_map: span_map.within(TextRange::new(base, spans_end)),
+        })
+    }
+
+    fn root(&self) -> SyntaxNode {
+        SyntaxNode::new_flat_root(self.tree.clone())
+    }
+
+    fn maps(&self) -> (&RealSpanMap, &AstIdMap) {
+        (&self.span_map, &self.ast_id_map)
+    }
+
+    /// The item, in the tree.
+    fn node<N: AstNode>(&self) -> InFile<N> {
+        let node = self.item.to_node(&self.root());
+        InFile::new(self.file_id, N::cast(node).expect("the item is a node of its kind"))
+    }
+
+    /// `source_map`, of a signature lowered from this tree, moved to where the item is in its
+    /// file, `item` there: what follows the empty node moves on by what it left out.
+    fn moved(
+        &self,
+        item: &SyntaxNode,
+        source_map: &ExpressionStoreSourceMap,
+    ) -> ExpressionStoreSourceMap {
+        let (relative, file) = (self.item.text_range(), item.text_range());
+        let base = file.start() - relative.start();
+        let removed = file.len() - relative.len();
+        // Something is left out only of an item that is the tree's root, so the item is the
+        // one node around the empty node.
+        let to = |ptr: SyntaxNodePtr| {
+            let range = match self.elided {
+                _ if ptr == self.item => return SyntaxNodePtr::from_parts(ptr.kind(), file),
+                Some(elided) if ptr == elided => TextRange::at(elided.text_range().start(), removed),
+                Some(elided) if ptr.text_range().start() >= elided.text_range().start() => {
+                    ptr.text_range() + removed
+                }
+                _ => ptr.text_range(),
+            };
+            SyntaxNodePtr::from_parts(ptr.kind(), range + base)
+        };
+        source_map.moved(&Move { file: self.file_id, to: &to })
+    }
+}
+
+/// What `tree` is made of, as two 64-bit hashes of it.
+fn tree_hash(tree: &FlatTree) -> u128 {
+    use std::hash::{Hash, Hasher};
+    let half = |seed: u8| {
+        let mut hasher = std::hash::DefaultHasher::new();
+        seed.hash(&mut hasher);
+        tree.hash_subtree(0, &mut hasher);
+        u128::from(hasher.finish())
+    };
+    (half(0) << 64) | half(1)
+}
+
+/// The [`SignatureSyntax`] of `def`'s signature, `None` for an item a macro writes.
+#[salsa::tracked(returns(ref))]
+pub fn signature_syntax(db: &dyn SourceDatabase, def: GenericDefId) -> Option<SignatureSyntax> {
+    type Elide = fn(&SyntaxNode) -> Option<SyntaxNode>;
+    fn of<N: AstNode>(src: InFile<N>) -> InFile<SyntaxNode> {
+        src.map(|it| it.syntax().clone())
+    }
+    let nothing: Elide = |_| None;
+    let (src, elide): (_, Elide) = match def {
+        GenericDefId::AdtId(AdtId::StructId(it)) => (of(it.lookup(db).source(db)), nothing),
+        GenericDefId::AdtId(AdtId::UnionId(it)) => (of(it.lookup(db).source(db)), nothing),
+        GenericDefId::AdtId(AdtId::EnumId(it)) => (of(it.lookup(db).source(db)), |it| {
+            Some(ast::Enum::cast(it.clone())?.variant_list()?.syntax().clone())
+        }),
+        GenericDefId::FunctionId(it) => (of(it.lookup(db).source(db)), |it| {
+            Some(ast::Fn::cast(it.clone())?.body()?.syntax().clone())
+        }),
+        GenericDefId::ConstId(it) => (of(it.lookup(db).source(db)), |it| {
+            Some(ast::Const::cast(it.clone())?.body()?.syntax().clone())
+        }),
+        GenericDefId::StaticId(it) => (of(it.lookup(db).source(db)), |it| {
+            Some(ast::Static::cast(it.clone())?.body()?.syntax().clone())
+        }),
+        GenericDefId::ImplId(it) => (of(it.lookup(db).source(db)), |it| {
+            Some(ast::Impl::cast(it.clone())?.assoc_item_list()?.syntax().clone())
+        }),
+        GenericDefId::TraitId(it) => (of(it.lookup(db).source(db)), |it| {
+            Some(ast::Trait::cast(it.clone())?.assoc_item_list()?.syntax().clone())
+        }),
+        GenericDefId::TypeAliasId(it) => (of(it.lookup(db).source(db)), nothing),
+    };
+    SignatureSyntax::new(db, src, elide)
+}
+
+/// The [`SignatureSyntax`] of an enum with its variants, nothing left out: what its
+/// [`EnumVariants`] and the [`VariantFields`] of its variants are lowered from. `None` for an
+/// enum a macro writes.
+#[salsa::tracked(returns(ref))]
+pub fn variants_syntax(db: &dyn SourceDatabase, def: EnumId) -> Option<SignatureSyntax> {
+    SignatureSyntax::new(db, def.lookup(db).source(db).map(|it| it.syntax().clone()), |_| None)
+}
+
+/// `source_map`, of `def`'s signature lowered from its [`signature_syntax`], moved to `item`,
+/// where `def` is in its file.
+fn moved_to_file(
+    db: &dyn SourceDatabase,
+    def: GenericDefId,
+    item: &SyntaxNode,
+    source_map: &ExpressionStoreSourceMap,
+) -> ExpressionStoreSourceMap {
+    let syntax = signature_syntax(db, def).as_ref();
+    syntax.expect("a signature lowered from no syntax").moved(item, source_map)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -204,16 +435,45 @@ impl StructFlags {
 impl StructSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, id: StructId) -> Arc<Self> {
-        Self::with_source_map(db, id).0.clone()
+        match Self::relative(db, id) {
+            Some((it, _)) => it.clone(),
+            None => Self::with_source_map(db, id).0.clone(),
+        }
     }
 
-    #[salsa::tracked(returns(ref))]
+    /// The signature with where each part of it is written in its file.
+    #[salsa::tracked(returns(ref), lru = 1024)]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         id: StructId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let src = id.lookup(db).source(db);
+        match Self::relative(db, id) {
+            Some((it, map)) => {
+                (it.clone(), moved_to_file(db, id.into(), src.value.syntax(), map))
+            }
+            None => Self::lower(db, id, src, None),
+        }
+    }
+
+    /// The signature lowered from its [`signature_syntax`], with the source map of that tree;
+    /// `None` for a struct a macro writes.
+    #[salsa::tracked(returns(ref))]
+    pub fn relative(
+        db: &dyn SourceDatabase,
+        id: StructId,
+    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+        let syntax = signature_syntax(db, id.into()).as_ref()?;
+        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
+    }
+
+    fn lower(
+        db: &dyn SourceDatabase,
+        id: StructId,
+        InFile { file_id, value: source }: InFile<ast::Struct>,
+        maps: Maps<'_>,
+    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
-        let InFile { file_id, value: source } = loc.source(db);
         let attrs = AttrFlags::query(db, id.into());
 
         let mut flags = StructFlags::from_attrs(attrs);
@@ -222,7 +482,7 @@ impl StructSignature {
         }
         let shape = adt_shape(source.kind());
 
-        let (store, generic_params, source_map) = lower_generic_params(
+        let (store, generic_params, source_map) = lower_generic_params_within(
             db,
             loc.container,
             id.into(),
@@ -230,6 +490,7 @@ impl StructSignature {
             source.generic_param_list(),
             source.where_clause(),
             LoweringMode::Analysis,
+            maps,
         );
         (
             Arc::new(StructSignature {
@@ -274,19 +535,48 @@ pub struct UnionSignature {
 impl UnionSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, id: UnionId) -> Arc<Self> {
-        Self::with_source_map(db, id).0.clone()
+        match Self::relative(db, id) {
+            Some((it, _)) => it.clone(),
+            None => Self::with_source_map(db, id).0.clone(),
+        }
     }
 
-    #[salsa::tracked(returns(ref))]
+    /// The signature with where each part of it is written in its file.
+    #[salsa::tracked(returns(ref), lru = 1024)]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         id: UnionId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let src = id.lookup(db).source(db);
+        match Self::relative(db, id) {
+            Some((it, map)) => {
+                (it.clone(), moved_to_file(db, id.into(), src.value.syntax(), map))
+            }
+            None => Self::lower(db, id, src, None),
+        }
+    }
+
+    /// The signature lowered from its [`signature_syntax`], with the source map of that tree;
+    /// `None` for a union a macro writes.
+    #[salsa::tracked(returns(ref))]
+    pub fn relative(
+        db: &dyn SourceDatabase,
+        id: UnionId,
+    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+        let syntax = signature_syntax(db, id.into()).as_ref()?;
+        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
+    }
+
+    fn lower(
+        db: &dyn SourceDatabase,
+        id: UnionId,
+        InFile { file_id, value: source }: InFile<ast::Union>,
+        maps: Maps<'_>,
+    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
         let flags = StructFlags::from_attrs(AttrFlags::query(db, id.into()));
 
-        let InFile { file_id, value: source } = loc.source(db);
-        let (store, generic_params, source_map) = lower_generic_params(
+        let (store, generic_params, source_map) = lower_generic_params_within(
             db,
             loc.container,
             id.into(),
@@ -294,6 +584,7 @@ impl UnionSignature {
             source.generic_param_list(),
             source.where_clause(),
             LoweringMode::Analysis,
+            maps,
         );
         (
             Arc::new(UnionSignature {
@@ -350,19 +641,48 @@ pub struct EnumSignature {
 impl EnumSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, id: EnumId) -> Arc<Self> {
-        Self::with_source_map(db, id).0.clone()
+        match Self::relative(db, id) {
+            Some((it, _)) => it.clone(),
+            None => Self::with_source_map(db, id).0.clone(),
+        }
     }
 
-    #[salsa::tracked(returns(ref))]
+    /// The signature with where each part of it is written in its file.
+    #[salsa::tracked(returns(ref), lru = 1024)]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         id: EnumId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let src = id.lookup(db).source(db);
+        match Self::relative(db, id) {
+            Some((it, map)) => {
+                (it.clone(), moved_to_file(db, id.into(), src.value.syntax(), map))
+            }
+            None => Self::lower(db, id, src, None),
+        }
+    }
+
+    /// The signature lowered from its [`signature_syntax`] (its variants left out), with the
+    /// source map of that tree; `None` for an enum a macro writes.
+    #[salsa::tracked(returns(ref))]
+    pub fn relative(
+        db: &dyn SourceDatabase,
+        id: EnumId,
+    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+        let syntax = signature_syntax(db, id.into()).as_ref()?;
+        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
+    }
+
+    fn lower(
+        db: &dyn SourceDatabase,
+        id: EnumId,
+        InFile { file_id, value: source }: InFile<ast::Enum>,
+        maps: Maps<'_>,
+    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
         let flags = EnumFlags::from_attrs(AttrFlags::query(db, id.into()));
 
-        let InFile { file_id, value: source } = loc.source(db);
-        let (store, generic_params, source_map) = lower_generic_params(
+        let (store, generic_params, source_map) = lower_generic_params_within(
             db,
             loc.container,
             id.into(),
@@ -370,6 +690,7 @@ impl EnumSignature {
             source.generic_param_list(),
             source.where_clause(),
             LoweringMode::Analysis,
+            maps,
         );
 
         (
@@ -422,13 +743,43 @@ pub struct ConstSignature {
 impl ConstSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, id: ConstId) -> Arc<Self> {
-        Self::with_source_map(db, id).0.clone()
+        match Self::relative(db, id) {
+            Some((it, _)) => it.clone(),
+            None => Self::with_source_map(db, id).0.clone(),
+        }
     }
 
-    #[salsa::tracked(returns(ref))]
+    /// The signature with where each part of it is written in its file.
+    #[salsa::tracked(returns(ref), lru = 1024)]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         id: ConstId,
+    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let src = id.lookup(db).source(db);
+        match Self::relative(db, id) {
+            Some((it, map)) => {
+                (it.clone(), moved_to_file(db, id.into(), src.value.syntax(), map))
+            }
+            None => Self::lower(db, id, src, None),
+        }
+    }
+
+    /// The signature lowered from its [`signature_syntax`] (its body left out), with the
+    /// source map of that tree; `None` for a const a macro writes.
+    #[salsa::tracked(returns(ref))]
+    pub fn relative(
+        db: &dyn SourceDatabase,
+        id: ConstId,
+    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+        let syntax = signature_syntax(db, id.into()).as_ref()?;
+        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
+    }
+
+    fn lower(
+        db: &dyn SourceDatabase,
+        id: ConstId,
+        source: InFile<ast::Const>,
+        maps: Maps<'_>,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
 
@@ -437,11 +788,10 @@ impl ConstSignature {
         let mut flags = flags_from_attrs!(attrs, ConstFlags {
             RUSTC_ALLOW_INCOHERENT_IMPL => RUSTC_ALLOW_INCOHERENT_IMPL,
         });
-        let source = loc.source(db);
         flags.set(ConstFlags::HAS_BODY, source.value.body().is_some());
 
         let (store, source_map, type_ref) =
-            crate::expr_store::lower::lower_type_ref(db, module, source.as_ref().map(|it| it.ty()));
+            lower_type_ref(db, module, source.as_ref().map(|it| it.ty()), maps);
 
         (
             Arc::new(ConstSignature {
@@ -487,13 +837,43 @@ pub struct StaticSignature {
 impl StaticSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, id: StaticId) -> Arc<Self> {
-        Self::with_source_map(db, id).0.clone()
+        match Self::relative(db, id) {
+            Some((it, _)) => it.clone(),
+            None => Self::with_source_map(db, id).0.clone(),
+        }
     }
 
-    #[salsa::tracked(returns(ref))]
+    /// The signature with where each part of it is written in its file.
+    #[salsa::tracked(returns(ref), lru = 1024)]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         id: StaticId,
+    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let src = id.lookup(db).source(db);
+        match Self::relative(db, id) {
+            Some((it, map)) => {
+                (it.clone(), moved_to_file(db, id.into(), src.value.syntax(), map))
+            }
+            None => Self::lower(db, id, src, None),
+        }
+    }
+
+    /// The signature lowered from its [`signature_syntax`] (its body left out), with the
+    /// source map of that tree; `None` for a static a macro writes.
+    #[salsa::tracked(returns(ref))]
+    pub fn relative(
+        db: &dyn SourceDatabase,
+        id: StaticId,
+    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+        let syntax = signature_syntax(db, id.into()).as_ref()?;
+        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
+    }
+
+    fn lower(
+        db: &dyn SourceDatabase,
+        id: StaticId,
+        source: InFile<ast::Static>,
+        maps: Maps<'_>,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
 
@@ -504,7 +884,6 @@ impl StaticSignature {
         });
         flags.set(StaticFlags::EXTERN, matches!(loc.container, ItemContainerId::ExternBlockId(_)));
 
-        let source = loc.source(db);
         let [mut_, unsafe_, safe] =
             child_tokens(source.value.syntax(), [T![mut], T![unsafe], T![safe]]);
         flags.set(StaticFlags::HAS_BODY, source.value.body().is_some());
@@ -513,7 +892,7 @@ impl StaticSignature {
         flags.set(StaticFlags::EXPLICIT_SAFE, safe);
 
         let (store, source_map, type_ref) =
-            crate::expr_store::lower::lower_type_ref(db, module, source.as_ref().map(|it| it.ty()));
+            lower_type_ref(db, module, source.as_ref().map(|it| it.ty()), maps);
 
         (
             Arc::new(StaticSignature {
@@ -551,17 +930,46 @@ pub struct ImplSignature {
 impl ImplSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, id: ImplId) -> Arc<Self> {
-        Self::with_source_map(db, id).0.clone()
+        match Self::relative(db, id) {
+            Some((it, _)) => it.clone(),
+            None => Self::with_source_map(db, id).0.clone(),
+        }
     }
 
-    #[salsa::tracked(returns(ref))]
+    /// The signature with where each part of it is written in its file.
+    #[salsa::tracked(returns(ref), lru = 1024)]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         id: ImplId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let src = id.lookup(db).source(db);
+        match Self::relative(db, id) {
+            Some((it, map)) => {
+                (it.clone(), moved_to_file(db, id.into(), src.value.syntax(), map))
+            }
+            None => Self::lower(db, id, src, None),
+        }
+    }
+
+    /// The signature lowered from its [`signature_syntax`] (its items left out), with the
+    /// source map of that tree; `None` for an impl a macro writes.
+    #[salsa::tracked(returns(ref))]
+    pub fn relative(
+        db: &dyn SourceDatabase,
+        id: ImplId,
+    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+        let syntax = signature_syntax(db, id.into()).as_ref()?;
+        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
+    }
+
+    fn lower(
+        db: &dyn SourceDatabase,
+        id: ImplId,
+        src: InFile<ast::Impl>,
+        maps: Maps<'_>,
+    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
 
-        let src = loc.source(db);
         let [unsafe_, negative, default, const_] =
             child_tokens(src.value.syntax(), [T![unsafe], T![!], T![default], T![const]]);
         let mut flags = ImplFlags::empty();
@@ -571,7 +979,7 @@ impl ImplSignature {
         flags.set(ImplFlags::CONST, const_);
 
         let (store, source_map, self_ty, target_trait, generic_params) =
-            crate::expr_store::lower::lower_impl(db, loc.container, src, id);
+            lower_impl(db, loc.container, src, id, maps);
 
         (
             Arc::new(ImplSignature { store, generic_params, self_ty, target_trait, flags }),
@@ -639,18 +1047,47 @@ pub struct TraitSignature {
 impl TraitSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, id: TraitId) -> Arc<Self> {
-        Self::with_source_map(db, id).0.clone()
+        match Self::relative(db, id) {
+            Some((it, _)) => it.clone(),
+            None => Self::with_source_map(db, id).0.clone(),
+        }
     }
 
-    #[salsa::tracked(returns(ref))]
+    /// The signature with where each part of it is written in its file.
+    #[salsa::tracked(returns(ref), lru = 1024)]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         id: TraitId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let src = id.lookup(db).source(db);
+        match Self::relative(db, id) {
+            Some((it, map)) => {
+                (it.clone(), moved_to_file(db, id.into(), src.value.syntax(), map))
+            }
+            None => Self::lower(db, id, src, None),
+        }
+    }
+
+    /// The signature lowered from its [`signature_syntax`] (its items left out), with the
+    /// source map of that tree; `None` for a trait a macro writes.
+    #[salsa::tracked(returns(ref))]
+    pub fn relative(
+        db: &dyn SourceDatabase,
+        id: TraitId,
+    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+        let syntax = signature_syntax(db, id.into()).as_ref()?;
+        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
+    }
+
+    fn lower(
+        db: &dyn SourceDatabase,
+        id: TraitId,
+        source: InFile<ast::Trait>,
+        maps: Maps<'_>,
+    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
 
         let mut flags = TraitFlags::from_attrs(AttrFlags::query(db, id.into()));
-        let source = loc.source(db);
         let [auto, unsafe_, alias, const_] = child_tokens(
             source.value.syntax(),
             [T![auto], T![unsafe], T![=], T![const]],
@@ -663,7 +1100,7 @@ impl TraitSignature {
         flags.set(TraitFlags::CONST, const_);
 
         let name = as_name_opt(source.value.name());
-        let (store, source_map, generic_params) = lower_trait(db, loc.container, source, id);
+        let (store, source_map, generic_params) = lower_trait(db, loc.container, source, id, maps);
 
         (Arc::new(TraitSignature { store, generic_params, flags, name }), source_map)
     }
@@ -729,19 +1166,48 @@ pub struct FunctionSignature {
 impl FunctionSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, id: FunctionId) -> Arc<Self> {
-        Self::with_source_map(db, id).0.clone()
+        match Self::relative(db, id) {
+            Some((it, _)) => it.clone(),
+            None => Self::with_source_map(db, id).0.clone(),
+        }
     }
 
-    #[salsa::tracked(returns(ref))]
+    /// The signature with where each part of it is written in its file.
+    #[salsa::tracked(returns(ref), lru = 1024)]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         id: FunctionId,
+    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let src = id.lookup(db).source(db);
+        match Self::relative(db, id) {
+            Some((it, map)) => {
+                (it.clone(), moved_to_file(db, id.into(), src.value.syntax(), map))
+            }
+            None => Self::lower(db, id, src, None),
+        }
+    }
+
+    /// The signature lowered from its [`signature_syntax`] (its body left out), with the
+    /// source map of that tree; `None` for a function a macro writes.
+    #[salsa::tracked(returns(ref))]
+    pub fn relative(
+        db: &dyn SourceDatabase,
+        id: FunctionId,
+    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+        let syntax = signature_syntax(db, id.into()).as_ref()?;
+        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
+    }
+
+    fn lower(
+        db: &dyn SourceDatabase,
+        id: FunctionId,
+        source: InFile<ast::Fn>,
+        maps: Maps<'_>,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
         let module = loc.container.module(db);
 
         let attrs = AttrFlags::query(db, id.into());
-        let source = loc.source(db);
         let [unsafe_, async_, gen_, const_, default, safe] = child_tokens(
             source.value.syntax(),
             [T![unsafe], T![async], T![gen], T![const], T![default], T![safe]],
@@ -773,7 +1239,7 @@ impl FunctionSignature {
             })
             .unwrap_or(ExternAbi::Rust);
         let (store, source_map, generic_params, params, ret_type, self_param, variadic) =
-            lower_function(db, module, source, id);
+            lower_function(db, module, source, id, maps);
         flags.set(FnFlags::HAS_SELF_PARAM, self_param);
         flags.set(FnFlags::HAS_VARARGS, variadic);
         (
@@ -889,13 +1355,43 @@ pub struct TypeAliasSignature {
 impl TypeAliasSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, id: TypeAliasId) -> Arc<Self> {
-        Self::with_source_map(db, id).0.clone()
+        match Self::relative(db, id) {
+            Some((it, _)) => it.clone(),
+            None => Self::with_source_map(db, id).0.clone(),
+        }
     }
 
-    #[salsa::tracked(returns(ref))]
+    /// The signature with where each part of it is written in its file.
+    #[salsa::tracked(returns(ref), lru = 1024)]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         id: TypeAliasId,
+    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let src = id.lookup(db).source(db);
+        match Self::relative(db, id) {
+            Some((it, map)) => {
+                (it.clone(), moved_to_file(db, id.into(), src.value.syntax(), map))
+            }
+            None => Self::lower(db, id, src, None),
+        }
+    }
+
+    /// The signature lowered from its [`signature_syntax`], with the source map of that tree;
+    /// `None` for a type alias a macro writes.
+    #[salsa::tracked(returns(ref))]
+    pub fn relative(
+        db: &dyn SourceDatabase,
+        id: TypeAliasId,
+    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+        let syntax = signature_syntax(db, id.into()).as_ref()?;
+        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
+    }
+
+    fn lower(
+        db: &dyn SourceDatabase,
+        id: TypeAliasId,
+        source: InFile<ast::TypeAlias>,
+        maps: Maps<'_>,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
 
@@ -904,10 +1400,9 @@ impl TypeAliasSignature {
             TypeAliasFlags::IS_EXTERN,
             matches!(loc.container, ItemContainerId::ExternBlockId(_)),
         );
-        let source = loc.source(db);
         let name = as_name_opt(source.value.name());
         let (store, source_map, generic_params, bounds, ty) =
-            lower_type_alias(db, loc.container, source, id);
+            lower_type_alias(db, loc.container, source, id, maps);
 
         (
             Arc::new(TypeAliasSignature { store, generic_params, flags, bounds, name, ty }),
@@ -953,18 +1448,64 @@ pub struct VariantFields {
 // The field array (24 bytes), the shape and the store (72 bytes today): 104 bytes in one `Arc`.
 const _: () = assert!(size_of::<VariantFields>() == size_of::<ExpressionStore>() + 32);
 
+/// What the fields of `id` are lowered from: the [`variants_syntax`] of an enum variant's
+/// enum, the [`signature_syntax`] of a struct or union. `None` for one a macro writes.
+fn variant_syntax(db: &dyn SourceDatabase, id: VariantId) -> Option<&SignatureSyntax> {
+    match id {
+        VariantId::EnumVariantId(it) => variants_syntax(db, it.lookup(db).parent).as_ref(),
+        VariantId::StructId(it) => signature_syntax(db, it.into()).as_ref(),
+        VariantId::UnionId(it) => signature_syntax(db, it.into()).as_ref(),
+    }
+}
+
 #[salsa::tracked]
 impl VariantFields {
-    #[salsa::tracked(returns(ref))]
+    /// The fields with where each part of them is written in their file.
+    #[salsa::tracked(returns(ref), lru = 1024)]
     pub fn with_source_map(
         db: &dyn SourceDatabase,
         id: VariantId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let Some((it, map)) = Self::relative(db, id) else { return Self::lower(db, id, None) };
+        let item = match id {
+            VariantId::EnumVariantId(it) => {
+                it.lookup(db).parent.lookup(db).source(db).value.syntax().clone()
+            }
+            VariantId::StructId(it) => it.lookup(db).source(db).value.syntax().clone(),
+            VariantId::UnionId(it) => it.lookup(db).source(db).value.syntax().clone(),
+        };
+        let syntax = variant_syntax(db, id).expect("fields lowered from no syntax");
+        (it.clone(), syntax.moved(&item, map))
+    }
+
+    /// The fields lowered from their [`variant_syntax`], with the source map of that tree;
+    /// `None` for a variant, struct or union a macro writes.
+    #[salsa::tracked(returns(ref))]
+    pub fn relative(
+        db: &dyn SourceDatabase,
+        id: VariantId,
+    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
+        let syntax = variant_syntax(db, id)?;
+        Some(Self::lower(db, id, Some(syntax)))
+    }
+
+    fn lower(
+        db: &dyn SourceDatabase,
+        id: VariantId,
+        syntax: Option<&SignatureSyntax>,
+    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        let maps = syntax.map(SignatureSyntax::maps);
         let (shape, result) = match id {
             VariantId::EnumVariantId(id) => {
                 let loc = id.lookup(db);
                 let parent = loc.parent.lookup(db);
-                let source = loc.source(db);
+                let source = match syntax {
+                    Some(syntax) => {
+                        let variant = syntax.ast_id_map.get(loc.id.value).to_node(&syntax.root());
+                        InFile::new(syntax.file_id, variant)
+                    }
+                    None => loc.source(db),
+                };
                 let shape = adt_shape(source.value.kind());
                 let enum_vis = Some(source.value.parent_enum().visibility());
                 let fields = lower_field_list(
@@ -972,25 +1513,32 @@ impl VariantFields {
                     parent.container,
                     source.map(|src| src.field_list()),
                     enum_vis,
+                    maps,
                 );
                 (shape, fields)
             }
             VariantId::StructId(id) => {
                 let loc = id.lookup(db);
-                let source = loc.source(db);
+                let source = syntax.map_or_else(|| loc.source(db), SignatureSyntax::node);
                 let shape = adt_shape(source.value.kind());
-                let fields =
-                    lower_field_list(db, loc.container, source.map(|src| src.field_list()), None);
+                let fields = lower_field_list(
+                    db,
+                    loc.container,
+                    source.map(|src| src.field_list()),
+                    None,
+                    maps,
+                );
                 (shape, fields)
             }
             VariantId::UnionId(id) => {
                 let loc = id.lookup(db);
-                let source = loc.source(db);
+                let source = syntax.map_or_else(|| loc.source(db), SignatureSyntax::node);
                 let fields = lower_field_list(
                     db,
                     loc.container,
                     source.map(|src| src.record_field_list().map(ast::FieldList::RecordFieldList)),
                     None,
+                    maps,
                 );
                 (FieldsShape::Record, fields)
             }
@@ -1012,7 +1560,10 @@ impl VariantFields {
 
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &dyn SourceDatabase, id: VariantId) -> Arc<Self> {
-        Self::with_source_map(db, id).0.clone()
+        match Self::relative(db, id) {
+            Some((it, _)) => it.clone(),
+            None => Self::with_source_map(db, id).0.clone(),
+        }
     }
 }
 
@@ -1035,6 +1586,7 @@ fn lower_field_list(
     module: ModuleId,
     fields: InFile<Option<ast::FieldList>>,
     override_visibility: Option<Option<ast::Visibility>>,
+    maps: Maps<'_>,
 ) -> Option<(Arena<FieldData>, ExpressionStore, ExpressionStoreSourceMap)> {
     let file_id = fields.file_id;
     match fields.value? {
@@ -1046,6 +1598,7 @@ fn lower_field_list(
             |_, field| as_name_opt(field.name()),
             |field| field.eq_token().and_then(|_| field.default_val()),
             override_visibility,
+            maps,
         ),
         ast::FieldList::TupleFieldList(fields) => lower_fields(
             db,
@@ -1055,6 +1608,7 @@ fn lower_field_list(
             |idx, _| Name::new_tuple_field(idx),
             |_| None,
             override_visibility,
+            maps,
         ),
     }
 }
@@ -1069,15 +1623,20 @@ fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
     mut field_name: impl FnMut(usize, &Field) -> Name,
     mut default_value: impl FnMut(&Field) -> Option<ast::ConstArg>,
     override_visibility: Option<Option<ast::Visibility>>,
+    maps: Maps<'_>,
 ) -> Option<(Arena<FieldData>, ExpressionStore, ExpressionStoreSourceMap)> {
     if count == 0 {
         return None;
     }
     let cfg_options = module.krate(db).cfg_options(db);
-    let mut col = ExprCollector::new(db, module, fields.file_id, crate::LoweringMode::Analysis);
+    let mut col =
+        ExprCollector::with_maps(db, module, fields.file_id, crate::LoweringMode::Analysis, maps);
     let override_visibility = override_visibility.map(|vis| {
         LazyCell::new(|| {
-            let span_map = fields.file_id.span_map(db);
+            let span_map = match maps {
+                Some((span_map, _)) => SpanMap::RealSpanMap(span_map),
+                None => fields.file_id.span_map(db),
+            };
             visibility_from_ast(db, vis, &mut |range| span_map.span_for_range(range).ctx)
         })
     });
@@ -1187,8 +1746,15 @@ impl EnumVariants {
         e: EnumId,
     ) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
         let loc = e.lookup(db);
-        let source = loc.source(db);
-        let ast_id_map = source.file_id.ast_id_map(db);
+        // The relative tree's ast ids are the file's: what a variant is interned by.
+        let (source, ast_id_map) = match variants_syntax(db, e) {
+            Some(syntax) => (syntax.node::<ast::Enum>(), &syntax.ast_id_map),
+            None => {
+                let source = loc.source(db);
+                let ast_id_map = source.file_id.ast_id_map(db);
+                (source, ast_id_map)
+            }
+        };
 
         let mut diagnostics = ThinVec::new();
         let cfg_options = loc.container.krate(db).cfg_options(db);

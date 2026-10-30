@@ -607,5 +607,49 @@ fn an_evaluated_test_is_judged_as_libtest_judges_it() {
         let (outcome, output) = judged(Ran::Unsupported("inline assembly"), expects);
         assert_eq!(outcome, Failed);
         assert!(output.ends_with("inline assembly\n"), "{output}");
+        let stopped = Ran::Stopped { message: "stack overflow", seed: 3 };
+        assert_eq!(judged(stopped, expects), (Failed, "blaze's MIR evaluator stopped: stack overflow\nseed: 3\n".to_owned()));
     }
+}
+
+/// What `blaze test --ub` leaves out is the checker's default; what it gives is taken.
+#[test]
+fn ub_settings_are_the_checkers_where_none_is_given() {
+    let default = hir_ty_ub::Config::default();
+    let none = test::ub_config(blaze_api::Ub { seed: None, schedules: None });
+    assert_eq!((none.seed, none.schedules, none.leaks), (default.seed, default.schedules, default.leaks));
+    let given = test::ub_config(blaze_api::Ub { seed: Some(42), schedules: Some(8) });
+    assert_eq!((given.seed, given.schedules), (42, 8));
+}
+
+/// A unit's identity is final once every run of its closure is applied: each run applied
+/// readies the units it was the last run left for, once, and units with no run in their
+/// closure are ready from the start.
+#[test]
+fn a_unit_waits_on_every_run_of_its_closure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut units = build(dir.path());
+    let mut lib = unit(Z, target("z_sys", "lib", "/w/z-sys/src/lib.rs"), Mode::Build, &[1]);
+    lib.target.crate_types = vec!["lib".to_owned()];
+    units.graph.units.push(lib);
+    units.graph.units.push(unit(P, target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[4, 3]));
+    units.plans.push(plan("-0004", &[]));
+    units.plans.push(plan("-0005", &[]));
+    let graph = graph::Graph::new(&units);
+    assert_eq!(graph.dependents(1), [3, 4]);
+    assert_eq!(graph.dependents(4), [5]);
+    assert_eq!(graph.dependents(5), [] as [u32; 0]);
+    let mut waits = graph::Waits::new(&graph);
+    // The scripts' compiles wait on nothing; z-sys's run waits on nothing either.
+    assert!(waits.ready(0) && waits.ready(1) && waits.ready(2));
+    assert!(!waits.ready(3) && !waits.ready(4) && !waits.ready(5));
+    let mut ready = Vec::new();
+    waits.applied(1, &mut ready);
+    assert_eq!(ready, [3, 4], "p's run and z-sys's library; p's binary still waits on p's run");
+    waits.applied(1, &mut ready);
+    assert_eq!(ready, [3, 4], "a run applied again readies nothing");
+    ready.clear();
+    waits.applied(3, &mut ready);
+    assert_eq!(ready, [5]);
+    assert!((0..6).all(|at| waits.ready(at)));
 }

@@ -38,7 +38,7 @@ use syntax::{
 
 use crate::{
     lints::bodies::{
-        BodyCx, LatePass,
+        BodyCx, Hooks, LatePass,
         types::util::{self, Solver},
     },
     lower::{Found, Phase},
@@ -69,6 +69,10 @@ struct FmtTraits {
 impl LatePass for NonPanicFmt {
     fn name(&self) -> &'static str {
         "NonPanicFmt"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::EXPR
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

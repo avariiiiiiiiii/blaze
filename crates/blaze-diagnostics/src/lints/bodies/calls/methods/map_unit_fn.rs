@@ -23,7 +23,7 @@ use syntax::{AstNode as _, SyntaxKind, SyntaxNodePtr, TextRange, ast};
 use crate::{
     cx::signature_range,
     lints::bodies::{
-        BodyCx, LatePass,
+        BodyCx, Hooks, LatePass,
         types::util::{self, fn_item, from_expansion, method_fn},
     },
     lower::{Found, Phase, break_outside_of_loop::ancestors},
@@ -39,6 +39,10 @@ struct MapUnitFn;
 impl LatePass for MapUnitFn {
     fn name(&self) -> &'static str {
         "MapUnitFn"
+    }
+
+    fn hooks(&self) -> Hooks {
+        Hooks::STMT
     }
 
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {

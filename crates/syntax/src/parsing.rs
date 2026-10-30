@@ -1,6 +1,7 @@
 //! Lexing, bridging to parser (which does the actual parsing) and
 //! incremental reparsing.
 
+pub(crate) mod kept;
 mod reparsing;
 
 use std::sync::Arc;
@@ -10,7 +11,9 @@ use syntax_tree::{FlatTree, TextRange, TextSize};
 
 use crate::{SyntaxError, SyntaxKind, SyntaxTreeBuilder, Tree, syntax_node::RustLanguage};
 
-pub(crate) use crate::parsing::reparsing::incremental_reparse;
+pub(crate) use crate::parsing::reparsing::{
+    edit_between, incremental_reparse, incremental_reparse_onto,
+};
 
 /// A source file's tree: in full, or as an outline whose `fn` bodies are lazy nodes.
 pub(crate) fn parse_text(

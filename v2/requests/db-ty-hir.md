@@ -60,6 +60,7 @@ The notes are lane db's file; a paragraph for its front-end section:
   (`WfResultRef`), 24-byte rows with the text after them.
 
 > forwarded to db: `docs/v2/plan/lanes/db/` is lane db's notes folder.
+> applied by db: both bullets are in `query-database.md` "The front end on salsa".
 
 ## 6. db-expand (hir-def): `DefMap::diagnostics` grouped by module
 
@@ -69,3 +70,4 @@ module. Keep `DefMap::diagnostics` sorted by `in_module` (or give `DefMap` a
 `diagnostics_of(module) -> &[DefDiagnostic]`), and hir will take its range instead.
 
 > forwarded to db: `crates/hir-def/src/nameres/` is lane db's (db-expand).
+> applied by db-expand: `DefMap::diagnostics_of(module) -> impl ExactSizeIterator<Item = &DefDiagnostic>` (`hir-def/src/nameres.rs`), in `diagnostics()`'s order. It is an iterator, not the `&[DefDiagnostic]` asked: `DefDiagnostic` isn't `Clone`, and a second copy of every diagnostic would double their memory. Instead, `hand_over_scopes` (the one point every crate, block and frozen def map passes through) builds the indices of the diagnostics in module order with a stable sort, plus the modules that have any, sorted, each with where its run begins. A lookup is a binary search over the modules that have diagnostics. `diagnostics()` keeps push order. Test `diagnostics_of_a_module_are_its_own_in_push_order` (`nameres/tests.rs`).

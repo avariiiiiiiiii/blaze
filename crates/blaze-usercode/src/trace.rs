@@ -266,7 +266,7 @@ fn walk_in<I: Inputs + ?Sized>(
             continue;
         }
         whole.push(&name);
-        let rel = os_bytes(whole.strip_prefix(dir).unwrap_or(whole).as_os_str());
+        let rel = os_bytes(whole.strip_prefix(dir).unwrap_or(whole.as_path()).as_os_str());
         match is_dir {
             true => {
                 if let Some(inner) = inputs.names(whole)? {

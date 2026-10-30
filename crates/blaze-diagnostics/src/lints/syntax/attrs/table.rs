@@ -10,6 +10,8 @@
 //! `template!`) and `attributes/mod.rs` (`OnDuplicate`, `AttributeSafety`) (MIT or
 //! Apache-2.0).
 
+pub(crate) mod index;
+
 use span::Edition;
 
 use super::target::{GenericParamKind, MethodKind, Target};
@@ -194,7 +196,13 @@ pub(crate) struct Builtin {
 
 /// The parser of the attribute of path `path`, if rustc has one.
 pub(crate) fn builtin(path: &[&str]) -> Option<&'static Builtin> {
-    BUILTINS.binary_search_by(|it| it.path.cmp(path)).ok().map(|it| &BUILTINS[it])
+    index::of(path).map(|it| &BUILTINS[it])
+}
+
+/// Every parser, sorted by path.
+#[cfg(test)]
+pub(crate) fn builtins() -> &'static [Builtin] {
+    BUILTINS
 }
 
 /// rustc's `ALL_TARGETS`.

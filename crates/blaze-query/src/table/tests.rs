@@ -5,7 +5,7 @@ use std::{
 
 use blaze_ids::ContentId;
 
-use super::{Column, Edit, Map};
+use super::{Column, Edit, Free, Ids, Map, Rows};
 use crate::{QueryKey, QueryKind};
 
 fn key(n: u64) -> QueryKey {
@@ -84,6 +84,52 @@ fn a_replaced_entry_stays_readable_until_its_task_ends() {
     assert_eq!(map.held(), 1, "the old entry waits for this task");
     drop(task);
     freed(&map);
+}
+
+/// A replaced entry's row is not handed out again while a task that could hold it lives, and
+/// is once its grace has passed: entries are rows of one column, never a box each.
+#[test]
+fn a_retired_row_is_reused_only_after_its_grace() {
+    let map: Map<u64> = Map::new();
+    let task = blaze_reclaim::enter();
+    map.insert(&task, key(1), 1);
+    let first = map.row(&task, &key(1)).expect("inserted");
+    map.insert(&task, key(1), 2);
+    let second = map.row(&task, &key(1)).expect("replaced");
+    assert_ne!(first, second, "the old row may still be read");
+    map.insert(&task, key(1), 3);
+    map.collect();
+    let third = map.row(&task, &key(1)).expect("replaced");
+    assert!(third != first && third != second, "rows {first} and {second} wait for this task");
+    drop(task);
+    freed(&map);
+
+    let task = blaze_reclaim::enter();
+    map.insert(&task, key(1), 4);
+    let reused = map.row(&task, &key(1)).expect("replaced");
+    assert!(reused == first || reused == second, "row {reused} is new, not one past its grace");
+    assert_eq!(map.get(&task, &key(1)), Some(&4));
+}
+
+#[test]
+fn rows_are_chunked_by_index_and_never_move() {
+    let rows: Rows<u64> = Rows::new();
+    let ids = Ids::new();
+    let mut free = Free::default();
+    let claimed: Vec<u32> = (0..10_000).map(|_| ids.claim(&mut free)).collect();
+    assert_eq!(claimed, (0..10_000).collect::<Vec<u32>>(), "one writer's rows are dense");
+    for &row in &claimed {
+        // SAFETY: claimed just now by this thread alone and not yet published.
+        unsafe { rows.put(row, u64::from(row) * 3) };
+    }
+    // SAFETY: each row was put above by this thread, and nothing drops it.
+    let first = unsafe { rows.get(0) } as *const u64;
+    for &row in &claimed {
+        // SAFETY: as above.
+        assert_eq!(unsafe { *rows.get(row) }, u64::from(row) * 3);
+    }
+    // SAFETY: as above.
+    assert_eq!(unsafe { rows.get(0) } as *const u64, first, "growing never moved row 0");
 }
 
 #[test]

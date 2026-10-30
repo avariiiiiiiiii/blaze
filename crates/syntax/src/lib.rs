@@ -256,6 +256,36 @@ impl Parse<SourceFile> {
             None => SourceFile::parse_shared(text, edition),
         }
     }
+
+    /// The parse of `text`, made from this one: the bytes between the longest common prefix
+    /// and suffix of this parse's text and `text` are the edit, parsed again as
+    /// [`Parse::reparse`] parses one, and the tree shares `text`. The same parse as the one
+    /// [`SourceFile::parse_shared`] (or, for an outline, [`SourceFile::parse_outline`]) makes
+    /// of `text`; several edits since this parse are one edit covering them all. This parse is
+    /// one made in `edition`, as for [`Parse::reparse`].
+    pub fn reparse_to(&self, text: std::sync::Arc<str>, edition: Edition) -> Parse<SourceFile> {
+        let tree = self.tree.as_ref().unwrap().flat();
+        if **tree.source() == *text && self.outline.is_none_or(|it| it == edition) {
+            return self.clone();
+        }
+        let (delete, _insert) = parsing::edit_between(tree.source(), &text);
+        let errors = self.errors.as_deref().unwrap_or_default().iter().cloned();
+        match parsing::incremental_reparse_onto(tree, delete, &text, errors, edition, self.outline)
+        {
+            Some((tree, errors, _reparsed)) => {
+                Parse::with_outline(Tree::new(std::sync::Arc::new(tree)), errors, self.outline)
+            }
+            None => match self.outline {
+                Some(_) => SourceFile::parse_outline(text, edition),
+                None => SourceFile::parse_shared(text, edition),
+            },
+        }
+    }
+
+    /// Whether this is an outline ([`SourceFile::parse_outline`]).
+    pub fn is_outline(&self) -> bool {
+        self.outline.is_some()
+    }
 }
 
 impl ast::Expr {
@@ -346,6 +376,30 @@ impl SourceFile {
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
         Parse::with_outline(tree, errors, Some(edition))
+    }
+
+    /// The parse of the file `key` names (a number the caller gives one file and edition, as
+    /// base-db's `EditionedFileId`), whose text is now `text`: in full, or an outline when
+    /// `outline`. Made by [`Parse::reparse_to`] from the last parse of `key` this process
+    /// kept, when it kept one of the same kind, else by a whole parse; kept for the next.
+    /// Either way it is the parse [`SourceFile::parse_shared`] or
+    /// [`SourceFile::parse_outline`] makes of `text`, so which one was kept (or whether one
+    /// was) changes how long it takes, never what it is.
+    pub fn parse_file(
+        key: u32,
+        text: std::sync::Arc<str>,
+        edition: Edition,
+        outline: bool,
+    ) -> Parse<SourceFile> {
+        let parse = match parsing::kept::take(key).filter(|it| it.is_outline() == outline) {
+            Some(previous) => previous.reparse_to(text, edition),
+            None => match outline {
+                true => SourceFile::parse_outline(text, edition),
+                false => SourceFile::parse_shared(text, edition),
+            },
+        };
+        parsing::kept::keep(key, &parse);
+        parse
     }
 }
 

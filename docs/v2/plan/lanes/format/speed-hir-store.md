@@ -58,6 +58,15 @@ briefs live in `~/restart-2026-10-28/briefs/v2/`.
   once per body by `(file, start, end, kind)`, which is nearly sorted already because lowering is
   preorder. `store[e]` is still 0 hashes. An IDE lookup is a binary search
   (\(\log_2 n\) compares, no hash), and iteration order is deterministic.
+- **Back maps** (id to syntax, `expr_store/source_map.rs`): per arena, dense columns of a `u16`
+  kind (`u16::MAX` for no source) and two `u32` range ends, 10 bytes per id. Each file is
+  stored once per run of ids (16 bytes a run), since preorder lowering gives each macro
+  expansion a contiguous range of ids. Before, an `ArenaMap` slot of
+  `Option<InFile<AstPtr<_>>>` took 24 bytes per id. A lookup is an index plus a binary search
+  over the runs, which is one compare in a body without macros. `patterns_for_binding` is CSR,
+  4 bytes a binding plus 4 a pattern, built with a counting sort. Before, it was a 32-byte
+  `SmallVec<[PatId; 4]>` per binding. On disk a back map is 10 bytes per id plus 16 per run
+  (was a 24-byte `Src` per id), read with one copy per column (schema 4).
 - **Invalidation, finer than rustc's red-green graph**: the store holds no spans (positions live
   in the source map, relative to the body's anchor), and bodies are lowered from their own
   syntax (`Body::relative`). So a formatting or comment edit inside a body re-lowers it to an
@@ -70,12 +79,18 @@ briefs live in `~/restart-2026-10-28/briefs/v2/`.
 - **Expression scopes** (`scope.rs`, built for every body inference reads): one entries array
   with a range per scope, and a dense `ExprId`-indexed scope column (4 bytes, was 8 in an
   `ArenaMap` of `Option`). Per scope 17 bytes in columns, where before it was about 32 plus a
-  `Box` per macro scope. Built in per-thread scratch and copied out exactly.
+  `Box` per macro scope. Built in per-thread scratch and copied out exactly. Entries are grouped
+  by scope with a stable radix sort at `finish`, which is skipped when they are already grouped.
+  rust-analyzer's walk-order ranges let a `let` see a `const` pattern block's locals, where rustc
+  doesn't.
 - **`body_syntax`** (re-run for every body of a file on each edit of it) built the relative
   `AstIdMap` and span map once per body. It now builds them once per anchor, shared by its bodies:
   for an `impl` of \(M\) methods and \(n\) nodes, \(O(Mn) \to O(n + M)\) per edit.
 - **Scans**: `expr_ids()` / `pat_ids()` give a store's ids without decoding, for the id-only
   whole-store scans in `hir-ty-borrowck` (request in `v2/requests/db.md`).
+- **Paths no longer intern their `ModPath` a second time.** `ModPath` is a 16-byte `Copy` value
+  with interned segments (speed-hir-expand), and `Path::BarePath(ModPath)` holds it directly: one
+  intern probe per lowered path instead of two, and one pointer fewer on every read.
 
 ## Still short, and what it takes
 
@@ -83,10 +98,6 @@ briefs live in `~/restart-2026-10-28/briefs/v2/`.
   the other signatures lower from the file's AST with absolute pointers, so any edit re-runs them
   and they backdate. Making signatures relative to an anchor, as bodies are, removes that
   (`signatures.rs`, speed-hir-defs).
-- **Paths no longer intern their `ModPath` a second time.** `ModPath` is a 16-byte `Copy` value
-  with interned segments (speed-hir-expand), and `Path::BarePath(ModPath)` holds it directly: one
-  intern probe per lowered path instead of two, and one pointer fewer on every read.
-
 - **`Option<Idx>` is 8 bytes.** `la_arena::Idx` has no niche, so `Statement` stays 32 bytes,
   `MatchArm` 16 and `RefType` 16. A raw index that can't be `u32::MAX` (a `NonMaxU32`-style
   niche) makes them 20/12/12 with no API change. That needs `la-arena` vendored (root

@@ -105,6 +105,7 @@ blaze-tree = { path = "crates/blaze-tree" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
 blaze-core = { path = "crates/blaze-core" }
 blaze-graph = { path = "crates/blaze-graph" }
+blaze-image = { path = "crates/blaze-image" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-ui = { path = "crates/blaze-ui" }
 blaze-web = { path = "crates/blaze-web" }
@@ -117,6 +118,7 @@ blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-ids = { path = "crates/blaze-ids" }
+blaze-radix = { path = "crates/blaze-radix" }
 blaze-items = { path = "crates/blaze-items" }
 blaze-link = { path = "crates/blaze-link" }
 blaze-phf = { path = "crates/blaze-phf", version = "0.0.0" }
@@ -169,6 +171,7 @@ ra-ap-rustc_index = { version = "0.166", default-features = false }
 rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
 ra-ap-rustc_pattern_analysis = { version = "0.166", default-features = false }
 ra-ap-rustc_ast_ir = { version = "0.166", default-features = false }
+rustc_apfloat = "0.2.3"
 # The trait solver, with fixes of rustc's backported.
 rustc_type_ir = { path = "vendor/rustc_type_ir", version = "0.0.0", default-features = false }
 rustc_type_ir_macros = { path = "vendor/rustc_type_ir_macros", version = "0.0.0" }
@@ -191,6 +194,9 @@ camino = "1.2.2"
 # The Cranelift hir-ty-codegen compiles with.
 cranelift-codegen = "0.136"
 cranelift-frontend = "0.136"
+# The reference interpreter and CLIF reader blaze-stencil's tests check each stencil with.
+cranelift-interpreter = "0.136"
+cranelift-reader = "0.136"
 # `vendor/llvm-sys` by the patch above.
 llvm-sys = "231"
 crossbeam-channel = "0.5.15"

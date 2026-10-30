@@ -133,6 +133,10 @@ name = "backtrace"
 path = "tests/backtrace.rs"
 
 [[test]]
+name = "capture_reads"
+path = "tests/capture_reads.rs"
+
+[[test]]
 name = "cancellation_token"
 path = "tests/cancellation_token.rs"
 

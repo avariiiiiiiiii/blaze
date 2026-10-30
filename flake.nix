@@ -58,7 +58,7 @@
         # The Python workspace uses Nix's pinned interpreter on NixOS, where uv's downloaded
         # interpreters cannot run. uv itself comes from the same flake.lock as the toolchain.
         scripts = {
-          packages = [ pkgs.uv pkgs.python313 pkgs.nodejs ];
+          packages = [ pkgs.uv pkgs.python313 pkgs.nodejs pkgs.b3sum ];
           UV_PYTHON = "${pkgs.python313}/bin/python3";
           UV_PYTHON_DOWNLOADS = "never";
         };

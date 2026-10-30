@@ -530,7 +530,11 @@ impl Code for Name {
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        r.symbol().map(Name::new_symbol_root)
+        let symbol = r.symbol()?;
+        match symbol.as_str().starts_with("r#") {
+            true => Err(r.invalid("a name written with its `r#`")),
+            false => Ok(Name::new_symbol_root(symbol)),
+        }
     }
 }
 

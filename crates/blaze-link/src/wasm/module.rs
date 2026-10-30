@@ -8,7 +8,7 @@ use blaze_codegen::wasm::{Code, Import, Signature};
 
 use super::leb::{self, PADDED, padded_uleb};
 use super::reader::{MAGIC, Reader};
-use super::{FUNCTIONS, HEAP, PAGE, STACK_POINTER, Wasm, is_code, is_custom};
+use super::{FUNCTIONS, HEAP, PAGE, STACK_POINTER, Wasm, heap_base, in_memory};
 use crate::model::{Class, Placed, SymbolKind};
 use crate::output::OutputKind;
 
@@ -36,12 +36,11 @@ enum Body<'a> {
     Piece { code: Code, body: &'a [u8], name: Option<&'a str> },
     /// `__wasm_call_ctors`, which calls these.
     Ctors(Vec<u32>),
-    /// An index the core left free (room to grow, a function removed): it traps.
-    Unused,
 }
 
-/// The functions `__wasm_call_ctors` calls, in order: the slots in the init array.
-fn init_functions(placed: &Placed<'_>) -> Result<Vec<u32>, String> {
+/// The functions `__wasm_call_ctors` calls, in order: the slots in the init array, each a
+/// function's index + 1.
+pub(super) fn init_functions(placed: &Placed<'_>) -> Result<Vec<u32>, String> {
     let mut functions = Vec::new();
     for (index, _) in placed.regions.iter().enumerate().filter(|(_, it)| it.class == Class::InitArray)
     {
@@ -70,91 +69,49 @@ fn ctors_body(functions: &[u32]) -> Vec<u8> {
     body
 }
 
-/// The bytes of the synthetic region of functions: `__wasm_call_ctors` as a code piece.
-pub(super) fn ctors_piece(placed: &Placed<'_>) -> Result<Vec<u8>, String> {
-    Ok(Code::default().encode(&ctors_body(&init_functions(placed)?)).0)
-}
-
-/// The function index of an address in the index space of functions.
-fn function_index(addr: u64, count: u64) -> Result<u32, String> {
-    match addr.checked_sub(1) {
-        Some(index) if index < count => Ok(index as u32),
-        _ => Err(format!("the address {addr} is no function of the module's {count}")),
-    }
-}
-
-/// Every function of the module from its first import, and how many are imported.
-fn functions<'a>(placed: &'a Placed<'a>) -> Result<(u64, Vec<Body<'a>>), String> {
-    let imports = placed.imports.len() as u64;
-    if imports > 0 {
-        let (_, plt) = placed.region(&Class::Plt).ok_or("imports and no region of them")?;
-        if plt.addr != 1 || plt.size < imports {
-            return Err(format!(
-                "the {imports} imports at {}, {} of them: imports are the first functions, from \
-                 address 1",
-                plt.addr, plt.size
-            ));
-        }
-    }
-    let mut end = 1 + imports;
-    for region in placed.regions.iter().filter(|it| is_code(&it.class)) {
-        if region.size > 0 {
-            end = end.max(region.addr + region.size);
-        }
-    }
-    let count = end - 1;
-    let mut defined: Vec<Option<Body<'a>>> = Vec::new();
-    defined.resize_with((count - imports) as usize, || None);
-    let mut put = |addr: u64, body: Body<'a>| -> Result<(), String> {
-        let index = u64::from(function_index(addr, count)?);
-        if index < imports {
-            return Err(format!("a function at index {index}, among the {imports} imports"));
-        }
-        let slot = &mut defined[(index - imports) as usize];
-        if slot.is_some() {
-            return Err(format!("two functions at index {index}"));
-        }
-        *slot = Some(body);
-        Ok(())
+/// The functions the module defines, in index order after its imports, and the index of each
+/// by its address in the code space: the core numbers them so, the imports first, then the
+/// code by address.
+fn functions<'a>(
+    placed: &'a Placed<'a>,
+    imports: u32,
+) -> Result<(Vec<Body<'a>>, HashMap<u64, u32>), String> {
+    let mut units: BTreeMap<u64, Body<'a>> = BTreeMap::new();
+    let mut put = |addr: u64, body: Body<'a>| match units.insert(addr, body) {
+        None => Ok(()),
+        Some(_) => Err(format!("two functions at {addr} in the code space")),
     };
-
-    let mut by_addr = BTreeMap::new();
-    for function in placed.functions {
-        if by_addr.insert(function.addr, function).is_some() {
-            return Err(format!("two functions at address {}", function.addr));
-        }
-    }
     let mut taken = 0;
     for (index, region) in placed.regions.iter().enumerate() {
-        let range = region.addr..region.addr + region.size;
         match &region.class {
             Class::Text | Class::Patch => {
                 let bytes = placed.bytes(index);
-                let mut at = 0usize;
-                for (&addr, &function) in by_addr.range(range) {
+                let mut covered = vec![false; bytes.len()];
+                let end = region.addr + region.size;
+                for function in placed.functions.iter().filter(|it| (region.addr..end).contains(&it.addr)) {
+                    let name = function.name.as_deref();
+                    let at = (function.addr - region.addr) as usize;
                     let piece = usize::try_from(function.size)
                         .ok()
                         .and_then(|size| bytes.get(at..at.checked_add(size)?))
                         .ok_or_else(|| {
-                            format!("the function at {addr} reaches past its region's bytes")
+                            format!("the function at {} reaches past its region's bytes", function.addr)
                         })?;
-                    at += piece.len();
-                    let (code, start) = Code::decode(piece).map_err(|e| {
-                        format!("the function {}: {e}", function.name.as_deref().unwrap_or("?"))
-                    })?;
-                    put(addr, Body::Piece { code, body: &piece[start..], name: function.name.as_deref() })?;
+                    covered[at..at + piece.len()].fill(true);
+                    let (code, start) = Code::decode(piece)
+                        .map_err(|e| format!("the function {}: {e}", name.unwrap_or("?")))?;
+                    put(function.addr, Body::Piece { code, body: &piece[start..], name })?;
                     taken += 1;
                 }
-                if at != bytes.len() {
+                if let Some(at) = (0..bytes.len()).find(|&at| !covered[at] && bytes[at] != 0) {
                     return Err(format!(
-                        "the {:?} region at {} has {} bytes and its functions {at}",
-                        region.class,
-                        region.addr,
-                        bytes.len()
+                        "code at {} of the {:?} region that is no function of the image's",
+                        region.addr + at as u64,
+                        region.class
                     ));
                 }
             }
-            Class::Synthetic(name) if *name == FUNCTIONS && region.size > 0 => {
+            Class::Synthetic(name) if *name == FUNCTIONS => {
                 put(region.addr, Body::Ctors(init_functions(placed)?))?;
             }
             _ => {}
@@ -167,7 +124,17 @@ fn functions<'a>(placed: &'a Placed<'a>) -> Result<(u64, Vec<Body<'a>>), String>
             placed.functions.len()
         ));
     }
-    Ok((imports, defined.into_iter().map(|it| it.unwrap_or(Body::Unused)).collect()))
+    let mut index = HashMap::with_capacity(units.len());
+    let mut defined = Vec::with_capacity(units.len());
+    for (at, (addr, body)) in units.into_iter().enumerate() {
+        let function = u32::try_from(at)
+            .ok()
+            .and_then(|at| at.checked_add(imports))
+            .ok_or("more than 2^32 functions")?;
+        index.insert(addr, function);
+        defined.push(body);
+    }
+    Ok((defined, index))
 }
 
 /// What a placed image can't hold and still be a wasm module.
@@ -187,19 +154,16 @@ fn check(placed: &Placed<'_>) -> Result<(), String> {
     if let Some(addr) = placed.rebase.first() {
         return Err(format!("a rebase at {addr:#x}: a wasm32 module is never slid"));
     }
-    if placed.tls.is_some() {
-        return Err("thread-local data: wasm32 without shared memory has no TLS".to_owned());
-    }
     for region in placed.regions {
         let unplaceable = match &region.class {
-            Class::Stubs
+            Class::Plt
+            | Class::Stubs
             | Class::Veneers
             | Class::EhFrame
             | Class::Table
             | Class::Got
             | Class::FiniArray
-            | Class::Tdata
-            | Class::Tbss => true,
+            | Class::ThreadVars => true,
             Class::Named { exec, .. } => *exec,
             Class::Synthetic(name) => *name != FUNCTIONS && *name != HEAP,
             _ => false,
@@ -271,7 +235,7 @@ fn signature<'s>(index: u32, imports: &'s [Import], defined: &'s [Body<'_>]) -> 
         None => imports.get(index as usize).map(|it| &it.ty),
         Some(at) => match defined.get(at)? {
             Body::Piece { code, .. } => Some(&code.ty),
-            Body::Ctors(_) | Body::Unused => None,
+            Body::Ctors(_) => None,
         },
     }
 }
@@ -386,8 +350,8 @@ fn name_map(out: &mut Vec<u8>, id: u8, names: &BTreeMap<u32, &str>) {
 fn segment_name(class: &Class) -> &str {
     match class {
         Class::Rodata => ".rodata",
-        Class::Data => ".data",
-        Class::InitArray => ".init_array",
+        Class::RelRo => ".data.rel.ro",
+        Class::Tdata => ".tdata",
         Class::PatchData => ".data.patch",
         Class::Named { name, .. } => name,
         _ => ".data",
@@ -397,8 +361,14 @@ fn segment_name(class: &Class) -> &str {
 /// The module of a placed image.
 pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String> {
     check(placed)?;
-    let (imported, defined) = functions(placed)?;
-    let count = imported + defined.len() as u64;
+    let imported = u32::try_from(placed.imports.len()).map_err(|_| "more than 2^32 imports")?;
+    let (defined, index_of) = functions(placed, imported)?;
+    let count = u64::from(imported) + defined.len() as u64;
+    let index_at = |addr: u64, what: &str| {
+        index_of.get(&addr).copied().ok_or_else(|| {
+            format!("{what} at {addr} of the code space, where no function of the module starts")
+        })
+    };
     let imports = imports(placed, &defined)?;
 
     let mut types = Types::default();
@@ -435,7 +405,6 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
                 }
                 (types.of(&nothing), ctors_body(functions))
             }
-            Body::Unused => (types.of(&nothing), vec![0x00, 0x00, 0x0b]),
         };
         leb::uleb(&mut function_section, ty.into());
         leb::uleb(&mut code_section, bytes.len() as u64);
@@ -443,30 +412,37 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }
 
     // Memory: the stack, the data, then the heap from `__heap_base`.
-    let (_, heap) = placed
-        .region(&Class::Synthetic(HEAP))
-        .ok_or("no heap region: the writer's synthetic regions were not placed")?;
-    if heap.addr > 1 << 32 {
-        return Err(format!("data up to {:#x}, past 32-bit memory", heap.addr));
+    if placed.region(&Class::Synthetic(HEAP)).is_none() {
+        return Err("no heap region: the writer's synthetic regions were not placed".to_owned());
     }
-    let pages = heap.addr.div_ceil(PAGE).max(1);
+    let heap = heap_base(placed.regions);
+    if heap > 1 << 32 {
+        return Err(format!("data up to {heap:#x}, past 32-bit memory"));
+    }
+    let pages = heap.div_ceil(PAGE).max(1);
     let mut segments = Vec::new();
     for (index, region) in placed.regions.iter().enumerate() {
-        if is_code(&region.class) || is_custom(&region.class) {
+        if !in_memory(&region.class) {
             continue;
         }
-        if region.addr + region.size > heap.addr {
+        if region.addr < wasm.stack {
             return Err(format!(
-                "the {:?} region at {:#x} reaches past the heap's start {:#x}",
-                region.class, region.addr, heap.addr
+                "the {:?} region at {:#x}, in the stack below {:#x}",
+                region.class, region.addr, wasm.stack
+            ));
+        }
+        if region.addr + region.size > heap {
+            return Err(format!(
+                "the {:?} region at {:#x} reaches past the heap's start {heap:#x}",
+                region.class, region.addr
             ));
         }
         let bytes = placed.bytes(index);
-        if bytes.is_empty() || region.class == Class::Bss {
-            continue;
-        }
         if bytes.len() as u64 > region.size {
             return Err(format!("the {:?} region has more bytes than its size", region.class));
+        }
+        if bytes.iter().all(|&it| it == 0) {
+            continue;
         }
         segments.push((segment_name(&region.class), region.addr, bytes));
     }
@@ -491,12 +467,14 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }
     if let OutputKind::Executable { entry } = &wasm.kind {
         let addr = placed.entry.ok_or_else(|| format!("the entry `{entry}` is not defined"))?;
-        add(&mut exports, entry, EXPORT_FUNCTION, function_index(addr, count)?)?;
+        let function = index_at(addr, &format!("the entry `{entry}`"))?;
+        add(&mut exports, entry, EXPORT_FUNCTION, function)?;
     }
     for it in placed.exports {
         match it.kind {
             SymbolKind::Function => {
-                add(&mut exports, &it.name, EXPORT_FUNCTION, function_index(it.addr, count)?)?
+                let function = index_at(it.addr, &format!("the export `{}`", it.name))?;
+                add(&mut exports, &it.name, EXPORT_FUNCTION, function)?
             }
             SymbolKind::Data | SymbolKind::Other => {
                 if exports.iter().any(|(name, ..)| *name == it.name) {
@@ -514,19 +492,26 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }
     for (at, body) in defined.iter().enumerate() {
         if let Body::Piece { code: Code { export: Some(name), .. }, .. } = body {
-            add(&mut exports, name, EXPORT_FUNCTION, (imported as usize + at) as u32)?;
+            add(&mut exports, name, EXPORT_FUNCTION, imported + at as u32)?;
         }
     }
 
     // Custom sections, by name in address order.
     let mut customs: Vec<(&str, Vec<u8>)> = Vec::new();
-    for (index, region) in placed.regions.iter().enumerate() {
-        if let Class::Named { name, write: false, exec: false } = &region.class {
-            let bytes = placed.bytes(index);
-            match customs.iter_mut().find(|(it, _)| *it == name.as_str()) {
-                Some((_, contents)) => contents.extend(bytes),
-                None => customs.push((name.as_str(), bytes.to_vec())),
-            }
+    let mut by_addr: Vec<(u64, usize)> = placed
+        .regions
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| matches!(it.class, Class::Named { write: false, exec: false, .. }))
+        .map(|(index, it)| (it.addr, index))
+        .collect();
+    by_addr.sort_unstable();
+    for (_, index) in by_addr {
+        let Class::Named { name, .. } = &placed.regions[index].class else { continue };
+        let bytes = placed.bytes(index);
+        match customs.iter_mut().find(|(it, _)| *it == name.as_str()) {
+            Some((_, contents)) => contents.extend(bytes),
+            None => customs.push((name.as_str(), bytes.to_vec())),
         }
     }
     let mut last = Vec::new();
@@ -574,8 +559,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }
     leb::section(&mut out, id::EXPORT, &export_section);
     if count > 0 {
-        // One active segment of table 0 (flags 0) putting every function at its address: the
-        // slot a function pointer names.
+        // One active segment of table 0 (flags 0) putting every function at its slot, its
+        // index + 1: what a function pointer is.
         let mut element = vec![1, 0];
         leb::i32_const(&mut element, 1);
         leb::uleb(&mut element, count);
@@ -601,7 +586,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     }
 
     let mut names = Vec::new();
-    let mut function_names = BTreeMap::new();
+    let mut function_names: BTreeMap<u32, &str> = BTreeMap::new();
     for (index, import) in placed.imports.iter().enumerate() {
         function_names.insert(index as u32, import.name.as_str());
     }
@@ -609,16 +594,17 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         let name = match body {
             Body::Piece { name, .. } => *name,
             Body::Ctors(_) => Some("__wasm_call_ctors"),
-            Body::Unused => None,
         };
         if let Some(name) = name {
-            function_names.insert((imported as usize + at) as u32, name);
+            function_names.insert(imported + at as u32, name);
         }
     }
     name_map(&mut names, 1, &function_names);
-    let global_names = globals.iter().enumerate().map(|(at, it)| (at as u32, it.0)).collect();
+    let global_names: BTreeMap<u32, &str> =
+        globals.iter().enumerate().map(|(at, it)| (at as u32, it.0)).collect();
     name_map(&mut names, 7, &global_names);
-    let segment_names = segments.iter().enumerate().map(|(at, it)| (at as u32, it.0)).collect();
+    let segment_names: BTreeMap<u32, &str> =
+        segments.iter().enumerate().map(|(at, it)| (at as u32, it.0)).collect();
     name_map(&mut names, 9, &segment_names);
     leb::custom(&mut out, "name", &names);
 
@@ -630,4 +616,503 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         leb::custom(&mut out, name, &merged.map_err(|e| format!("the {name} sections: {e}"))?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_codegen::wasm::ValType;
+
+    use super::*;
+    use crate::model::{self, Export, Function, GotEntry, Holds, Plan, Prot, Region, Writer};
+    use crate::output::{Debug, Format, Output};
+    use crate::wasm::leb::padded_sleb;
+    use crate::wasm::reader;
+    use crate::wasm::{STACK, custom};
+
+    const DATA: u64 = STACK;
+
+    fn sig(params: &[ValType], results: &[ValType]) -> Signature {
+        Signature { params: params.to_vec(), results: results.to_vec() }
+    }
+
+    fn fd_write() -> Import {
+        Import {
+            module: "wasi_snapshot_preview1".to_owned(),
+            field: "fd_write".to_owned(),
+            ty: sig(&[ValType::I32; 4], &[ValType::I32]),
+        }
+    }
+
+    /// `_start`'s body: the stack pointer at 2, a call of `__wasm_call_ctors` (index 1, as the
+    /// core wrote it), the address of the data and `init`'s slot (3), and an indirect call
+    /// whose type is at 27.
+    fn start_body() -> Vec<u8> {
+        let mut body = vec![0x00, 0x23];
+        body.extend(padded_uleb(0));
+        body.extend([0x1a, 0x10]);
+        body.extend(padded_uleb(1));
+        body.push(0x41);
+        body.extend(padded_sleb(DATA as i32));
+        body.push(0x41);
+        body.extend(padded_sleb(3));
+        body.push(0x11);
+        body.extend(padded_uleb(0));
+        body.extend([0x00, 0x0b]);
+        assert_eq!(body.len(), 34);
+        body
+    }
+
+    fn piece(code: &Code, body: &[u8]) -> Vec<u8> {
+        code.encode(body).0
+    }
+
+    /// A placed image as the core hands it to the writer.
+    struct Image {
+        output: Output,
+        plan: Plan,
+        regions: Vec<Region>,
+        contents: Vec<Vec<u8>>,
+        imports: Vec<model::Import>,
+        exports: Vec<Export>,
+        functions: Vec<Function>,
+        entry: Option<u64>,
+        got: Vec<GotEntry>,
+        debug: Vec<(&'static str, Vec<u8>)>,
+    }
+
+    impl Image {
+        fn with<R>(&self, then: impl FnOnce(&Placed<'_>) -> R) -> R {
+            let contents: Vec<&[u8]> = self.contents.iter().map(Vec::as_slice).collect();
+            then(&Placed {
+                output: &self.output,
+                name: "app.wasm",
+                plan: &self.plan,
+                regions: &self.regions,
+                contents: &contents,
+                libraries: &[],
+                imports: &self.imports,
+                got: &self.got,
+                rebase: &[],
+                binds: &[],
+                exports: &self.exports,
+                functions: &self.functions,
+                entry: self.entry,
+                init: None,
+                fini: None,
+                tls: None,
+                id: [0; 16],
+                debug: &self.debug,
+            })
+        }
+
+        fn writer(&self) -> Box<dyn Writer> {
+            super::super::writer(&self.output).unwrap()
+        }
+
+        /// The module, written as the core asks for it: synthesized, then the file.
+        fn module(&mut self) -> Result<Vec<u8>, String> {
+            let writer = self.writer();
+            let synthetic = self.with(|placed| writer.synthesize(placed)).map_err(|e| e.what)?;
+            for (class, bytes) in synthetic {
+                let Some(at) = self.regions.iter().position(|it| it.class == class) else {
+                    return Err(format!("the writer filled {class:?}, which has no region"));
+                };
+                assert!(bytes.len() as u64 <= self.regions[at].capacity, "{class:?} outgrew its room");
+                self.regions[at].size = bytes.len() as u64;
+                self.contents[at] = bytes;
+            }
+            self.with(|placed| {
+                for region in placed.regions {
+                    assert_eq!(writer.offset(placed, region), None, "{:?}", region.class);
+                }
+            });
+            let file = self.with(|placed| writer.file(placed)).map_err(|e| e.what)?;
+            assert_eq!(file.parts.len(), 1);
+            assert_eq!(file.parts[0].0, 0);
+            assert_eq!(file.len, file.parts[0].1.len() as u64);
+            Ok(file.parts.into_iter().next().unwrap().1)
+        }
+    }
+
+    fn region(writer: &dyn Writer, class: Class, addr: u64, size: u64) -> Region {
+        let prot = writer.prot(&class);
+        Region { class, addr, capacity: size, size, prot, align: 1 }
+    }
+
+    /// A command: `fd_write` imported; `__wasm_call_ctors`, `init` (an init function) and
+    /// `_start` in the code space from 0; `.rodata`, `.data` (`init`'s slot) and `.bss` after
+    /// the stack; the heap; the init array and two custom sections after it.
+    fn command() -> Image {
+        let output = Output {
+            format: Format::Wasm,
+            arch: blaze_codegen::Arch::Wasm32,
+            kind: OutputKind::Executable { entry: "_start".to_owned() },
+            interpreter: None,
+            platform: None,
+            incremental: false,
+            debug: Debug::None,
+            live: None,
+            tags: 0,
+            stack: None,
+        };
+        let writer = super::super::writer(&output).unwrap();
+        let init = piece(&Code { ty: sig(&[], &[]), ..Code::default() }, &[0x00, 0x0b]);
+        let start = piece(
+            &Code {
+                ty: sig(&[], &[]),
+                types: vec![sig(&[ValType::I32], &[])],
+                type_fixups: vec![(27, 0)],
+                stack_pointer: vec![2],
+                imports: vec![("fd_write".to_owned(), fd_write())],
+                export: Some("_start".to_owned()),
+            },
+            &start_body(),
+        );
+        let (init_at, start_at) = (1, 1 + init.len() as u64);
+        let text = [init.clone(), start.clone()].concat();
+        let mut producers = Vec::new();
+        for (field, name, version) in [("processed-by", "clang", "19"), ("language", "C11", "")] {
+            leb::uleb(&mut producers, 1);
+            leb::name(&mut producers, field);
+            leb::uleb(&mut producers, 1);
+            leb::name(&mut producers, name);
+            leb::name(&mut producers, version);
+        }
+        let regions = vec![
+            region(&*writer, Class::Synthetic(FUNCTIONS), 0, 1),
+            region(&*writer, Class::Text, 1, text.len() as u64),
+            region(&*writer, Class::Rodata, DATA, 5),
+            region(&*writer, Class::Data, DATA + 8, 4),
+            region(&*writer, Class::Bss, DATA + 12, 4),
+            region(&*writer, Class::Synthetic(HEAP), DATA + 16, 0),
+            region(&*writer, Class::InitArray, DATA + 16, 4),
+            region(&*writer, custom("my_section"), DATA + 20, 3),
+            region(&*writer, custom("producers"), DATA + 23, producers.len() as u64),
+        ];
+        let contents = vec![
+            vec![0],
+            text,
+            b"hello".to_vec(),
+            vec![3, 0, 0, 0],
+            Vec::new(),
+            Vec::new(),
+            vec![3, 0, 0, 0],
+            vec![1, 2, 3],
+            producers,
+        ];
+        let function = |addr, piece: &Vec<u8>, name: &str| Function {
+            addr,
+            size: piece.len() as u64,
+            fde: None,
+            windows: None,
+            name: Some(name.to_owned()),
+        };
+        Image {
+            plan: writer.plan(),
+            output,
+            regions,
+            contents,
+            imports: vec![model::Import {
+                name: "fd_write".to_owned(),
+                library: None,
+                version: None,
+                kind: SymbolKind::Function,
+                weak: false,
+                wasm: None,
+            }],
+            exports: Vec::new(),
+            functions: vec![function(init_at, &init, "init"), function(start_at, &start, "_start")],
+            entry: Some(start_at),
+            got: Vec::new(),
+            debug: Vec::new(),
+        }
+    }
+
+    /// The module's sections: each id, a custom one's name, and its contents.
+    fn sections(module: &[u8]) -> Vec<(u8, String, Vec<u8>)> {
+        reader::sections(module)
+            .unwrap()
+            .into_iter()
+            .map(|section| {
+                let mut r = Reader::new(section.contents);
+                match section.id {
+                    0 => {
+                        let name = r.name().unwrap().to_owned();
+                        (0, name, r.rest().to_vec())
+                    }
+                    id => (id, String::new(), section.contents.to_vec()),
+                }
+            })
+            .collect()
+    }
+
+    fn find<'s>(sections: &'s [(u8, String, Vec<u8>)], id: u8, name: &str) -> &'s [u8] {
+        let found = sections.iter().find(|it| it.0 == id && it.1 == name);
+        &found.unwrap_or_else(|| panic!("no section {id} `{name}`")).2
+    }
+
+    fn names(r: &mut Reader<'_>) -> Vec<(u32, String)> {
+        (0..r.count().unwrap()).map(|_| (r.u32().unwrap(), r.name().unwrap().to_owned())).collect()
+    }
+
+    #[test]
+    fn a_command() {
+        let module = command().module().unwrap();
+        let file = ::object::File::parse(&*module).expect("object reads the module");
+        assert_eq!(::object::Object::format(&file), ::object::BinaryFormat::Wasm);
+
+        let sections = sections(&module);
+        let ids: Vec<u8> = sections.iter().map(|it| it.0).collect();
+        assert_eq!(ids, [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 0, 0, 0]);
+        let customs: Vec<&str> = sections.iter().filter(|it| it.0 == 0).map(|it| it.1.as_str()).collect();
+        assert_eq!(customs, ["my_section", "name", "producers"]);
+
+        // Types, deduplicated: the import's, `fn()`, then the indirect call's.
+        let types = find(&sections, 1, "");
+        assert_eq!(types[0], 3);
+        let mut at = 1;
+        let decoded: Vec<Signature> =
+            (0..3).map(|_| Signature::decode(types, &mut at).unwrap()).collect();
+        assert_eq!(at, types.len());
+        assert_eq!(decoded, [fd_write().ty, sig(&[], &[]), sig(&[ValType::I32], &[])]);
+
+        let mut r = Reader::new(find(&sections, 2, ""));
+        assert_eq!(r.count().unwrap(), 1);
+        assert_eq!((r.name().unwrap(), r.name().unwrap()), ("wasi_snapshot_preview1", "fd_write"));
+        assert_eq!((r.u8().unwrap(), r.u32().unwrap()), (0, 0));
+        assert!(r.done());
+
+        // `__wasm_call_ctors`, `init`, `_start`: all `fn()`.
+        assert_eq!(find(&sections, 3, ""), [3, 1, 1, 1]);
+        // A table of the 4 functions at slots 1 to 4, slot 0 null.
+        assert_eq!(find(&sections, 4, ""), [1, FUNCREF, 1, 5, 5]);
+        // Memory to the heap's start: 0x10_0010 is 17 pages.
+        assert_eq!(find(&sections, 5, ""), [1, 0, 17]);
+        let mut global = vec![1, I32, 1];
+        leb::i32_const(&mut global, STACK as i32);
+        assert_eq!(find(&sections, 6, ""), global);
+
+        let mut r = Reader::new(find(&sections, 7, ""));
+        assert_eq!(r.count().unwrap(), 2);
+        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.u32().unwrap()), ("memory", EXPORT_MEMORY, 0));
+        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.u32().unwrap()), ("_start", EXPORT_FUNCTION, 3));
+        assert!(r.done());
+
+        let mut element = vec![1, 0];
+        leb::i32_const(&mut element, 1);
+        element.extend([4, 0, 1, 2, 3]);
+        assert_eq!(find(&sections, 9, ""), element);
+
+        let mut r = Reader::new(find(&sections, 10, ""));
+        assert_eq!(r.count().unwrap(), 3);
+        let mut bodies = Vec::new();
+        for _ in 0..3 {
+            let len = r.u32().unwrap() as usize;
+            bodies.push(r.bytes(len).unwrap().to_vec());
+        }
+        assert!(r.done());
+        // `__wasm_call_ctors` calls `init` (slot 3 in the init array: index 2).
+        assert_eq!(bodies[0], [0x00, 0x10, 2, 0x0b]);
+        assert_eq!(bodies[1], [0x00, 0x0b]);
+        let mut start = start_body();
+        start[2..7].copy_from_slice(&padded_uleb(STACK_POINTER));
+        start[27..32].copy_from_slice(&padded_uleb(2));
+        assert_eq!(bodies[2], start);
+
+        // `.rodata` and `.data` after the stack; `.bss` and the init array are not written.
+        let mut r = Reader::new(find(&sections, 11, ""));
+        assert_eq!(r.count().unwrap(), 2);
+        for (addr, bytes) in [(DATA, &b"hello"[..]), (DATA + 8, &[3, 0, 0, 0][..])] {
+            assert_eq!(r.u32().unwrap(), 0);
+            assert_eq!(r.i32_const().unwrap(), addr as i32);
+            let len = r.u32().unwrap() as usize;
+            assert_eq!(r.bytes(len).unwrap(), bytes);
+        }
+        assert!(r.done());
+        assert_eq!(find(&sections, 0, "my_section"), [1, 2, 3]);
+
+        let mut r = Reader::new(find(&sections, 0, "name"));
+        let mut subsections = BTreeMap::new();
+        while !r.done() {
+            let id = r.u8().unwrap();
+            let len = r.u32().unwrap() as usize;
+            subsections.insert(id, r.bytes(len).unwrap());
+        }
+        let owned = |list: &[(u32, &str)]| -> Vec<(u32, String)> {
+            list.iter().map(|&(at, name)| (at, name.to_owned())).collect()
+        };
+        assert_eq!(
+            names(&mut Reader::new(subsections[&1])),
+            owned(&[(0, "fd_write"), (1, "__wasm_call_ctors"), (2, "init"), (3, "_start")])
+        );
+        assert_eq!(names(&mut Reader::new(subsections[&7])), owned(&[(0, "__stack_pointer")]));
+        assert_eq!(names(&mut Reader::new(subsections[&9])), owned(&[(0, ".rodata"), (1, ".data")]));
+        assert_eq!(subsections.keys().copied().collect::<Vec<_>>(), [1, 7, 9]);
+
+        // The producers sections as one, `language` first.
+        let mut r = Reader::new(find(&sections, 0, "producers"));
+        assert_eq!(r.count().unwrap(), 2);
+        assert_eq!(r.name().unwrap(), "language");
+        assert_eq!(r.count().unwrap(), 1);
+        assert_eq!((r.name().unwrap(), r.name().unwrap()), ("C11", ""));
+        assert_eq!(r.name().unwrap(), "processed-by");
+        assert_eq!(r.count().unwrap(), 1);
+        assert_eq!((r.name().unwrap(), r.name().unwrap()), ("clang", "19"));
+        assert!(r.done());
+    }
+
+    #[test]
+    fn the_same_image_is_the_same_module() {
+        assert_eq!(command().module().unwrap(), command().module().unwrap());
+    }
+
+    #[test]
+    fn a_reactor_exports_functions_and_data() {
+        let mut image = command();
+        image.output.kind = OutputKind::Shared {
+            name: "lib.wasm".to_owned(),
+            exports: vec!["init".to_owned(), "__heap_base".to_owned()],
+        };
+        image.entry = None;
+        image.imports[0].wasm = Some(fd_write());
+        let init = image.functions[0].addr;
+        image.exports = vec![
+            Export { name: "init".to_owned(), addr: init, size: 4, kind: SymbolKind::Function },
+            Export { name: "__heap_base".to_owned(), addr: DATA + 16, size: 0, kind: SymbolKind::Other },
+        ];
+        let module = image.module().unwrap();
+        let sections = sections(&module);
+        let mut r = Reader::new(find(&sections, 7, ""));
+        let mut exports = Vec::new();
+        for _ in 0..r.count().unwrap() {
+            exports.push((r.name().unwrap().to_owned(), r.u8().unwrap(), r.u32().unwrap()));
+        }
+        // `_start` is exported by its object's `export_name`, as a reactor's `_initialize` is.
+        assert_eq!(
+            exports,
+            [
+                ("memory".to_owned(), EXPORT_MEMORY, 0),
+                ("init".to_owned(), EXPORT_FUNCTION, 2),
+                ("__heap_base".to_owned(), EXPORT_GLOBAL, 1),
+                ("_start".to_owned(), EXPORT_FUNCTION, 3),
+            ]
+        );
+        let mut global = vec![2, I32, 1];
+        leb::i32_const(&mut global, STACK as i32);
+        global.extend([I32, 0]);
+        leb::i32_const(&mut global, (DATA + 16) as i32);
+        assert_eq!(find(&sections, 6, ""), global);
+    }
+
+    #[test]
+    fn functions_are_numbered_as_the_core_numbers_them() {
+        // Two imports, then the code by its address, whatever order the core lists it in.
+        let mut image = command();
+        let mut second = image.imports[0].clone();
+        second.name = "proc_exit".to_owned();
+        second.wasm = Some(Import {
+            module: "wasi_snapshot_preview1".to_owned(),
+            field: "proc_exit".to_owned(),
+            ty: sig(&[ValType::I32], &[]),
+        });
+        image.imports.push(second);
+        image.functions.reverse();
+        image.contents[3] = vec![4, 0, 0, 0];
+        image.contents[6] = vec![4, 0, 0, 0];
+        let module = image.module().unwrap();
+        let sections = sections(&module);
+        let mut r = Reader::new(find(&sections, 7, ""));
+        assert_eq!(r.count().unwrap(), 2);
+        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.u32().unwrap()), ("memory", EXPORT_MEMORY, 0));
+        assert_eq!((r.name().unwrap(), r.u8().unwrap(), r.u32().unwrap()), ("_start", EXPORT_FUNCTION, 4));
+        let mut r = Reader::new(find(&sections, 10, ""));
+        r.count().unwrap();
+        let len = r.u32().unwrap() as usize;
+        assert_eq!(r.bytes(len).unwrap(), [0x00, 0x10, 3, 0x0b]);
+        assert_eq!(find(&sections, 4, ""), [1, FUNCREF, 1, 6, 6]);
+    }
+
+    #[test]
+    fn what_a_module_cannot_hold() {
+        let refused = |change: fn(&mut Image), says: &str| {
+            let mut image = command();
+            change(&mut image);
+            let what = image.module().unwrap_err();
+            assert!(what.contains(says), "`{what}` does not say `{says}`");
+        };
+        refused(|it| it.debug.push((".debug_line", vec![1])), ".debug_line");
+        refused(|it| it.got.push(GotEntry { addr: DATA, holds: Holds::Local(DATA) }), "GOT");
+        refused(|it| it.imports[0].kind = SymbolKind::Data, "only functions");
+        refused(|it| it.entry = None, "`_start` is not defined");
+        refused(|it| it.entry = Some(2), "no function of the module starts");
+        refused(
+            |it| {
+                it.functions.remove(0);
+            },
+            "no function of the image's",
+        );
+        refused(|it| it.contents[6] = vec![0, 0, 0, 0], "undefined weak");
+        refused(|it| it.contents[6] = vec![9, 0, 0, 0], "init function 8");
+        refused(|it| it.contents[6] = vec![1, 0, 0, 0], "init function 0");
+        refused(|it| it.regions[2].addr = 16, "in the stack");
+        refused(
+            |it| {
+                let fini = Region {
+                    class: Class::FiniArray,
+                    addr: DATA,
+                    capacity: 4,
+                    size: 4,
+                    prot: Prot::RW,
+                    align: 4,
+                };
+                it.regions.push(fini);
+                it.contents.push(vec![0; 4]);
+            },
+            "FiniArray",
+        );
+        refused(
+            |it| {
+                let at = it.regions.iter().position(|r| r.class == Class::Synthetic(HEAP)).unwrap();
+                it.regions.remove(at);
+                it.contents.remove(at);
+            },
+            "heap",
+        );
+    }
+
+    #[test]
+    fn imports_need_a_module() {
+        // Neither the core nor any code piece says what `fd_write` is imported as.
+        let mut image = command();
+        let code = Code { ty: sig(&[], &[]), export: Some("_start".to_owned()), ..Code::default() };
+        let start = piece(&code, &[0x00, 0x0b]);
+        let init = image.contents[1][..image.functions[0].size as usize].to_vec();
+        image.functions[1].size = start.len() as u64;
+        image.contents[1] = [init, start].concat();
+        image.regions[1].size = image.contents[1].len() as u64;
+        image.regions[1].capacity = image.regions[1].size;
+        let what = image.module().unwrap_err();
+        assert!(what.contains("`fd_write`"), "{what}");
+        image.imports[0].wasm = Some(fd_write());
+        image.module().unwrap();
+    }
+
+    #[test]
+    fn merged_target_features() {
+        let mut payload = Vec::new();
+        for (prefix, feature) in [(b'+', "mutable-globals"), (b'+', "sign-ext")] {
+            leb::uleb(&mut payload, 1);
+            payload.push(prefix);
+            leb::name(&mut payload, feature);
+        }
+        let merged = target_features(&payload).unwrap();
+        let mut r = Reader::new(&merged);
+        assert_eq!(r.count().unwrap(), 2);
+        assert_eq!((r.u8().unwrap(), r.name().unwrap()), (b'+', "mutable-globals"));
+        assert_eq!((r.u8().unwrap(), r.name().unwrap()), (b'+', "sign-ext"));
+        leb::uleb(&mut payload, 1);
+        payload.push(b'-');
+        leb::name(&mut payload, "sign-ext");
+        assert!(target_features(&payload).unwrap_err().contains("sign-ext"));
+    }
 }

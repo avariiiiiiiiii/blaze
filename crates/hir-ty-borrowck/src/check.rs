@@ -293,12 +293,13 @@ fn member_choices(
     count: usize,
 ) -> Vec<(regions::Rv, Option<regions::Rv>)> {
     let fn_body = regions.universals[1].0;
-    let mut outlived_by: Vec<Vec<regions::Rv>> = vec![Vec::new(); count];
-    for constraint in &regions.outlives {
-        if constraint.sup < count && constraint.sub < count {
-            outlived_by[constraint.sub].push(constraint.sup);
-        }
-    }
+    let constraints = &regions.outlives;
+    let outlived_by = crate::relation::Csr::build(
+        count,
+        (0..constraints.len())
+            .filter(|&at| constraints.sup(at) < count && constraints.sub(at) < count)
+            .map(|at| (constraints.sub(at) as u32, constraints.sup(at) as u32)),
+    );
     let choices: Vec<usize> =
         regions.choices.iter().filter_map(|&it| regions.universal(it)).collect();
     let mut chosen = Vec::new();
@@ -309,7 +310,7 @@ fn member_choices(
         let mut seen = FxHashSet::default();
         let mut stack = vec![member];
         while let Some(at) = stack.pop() {
-            for &sup in &outlived_by[at] {
+            for sup in outlived_by.of(at).iter().map(|&it| it as regions::Rv) {
                 if seen.insert(sup) {
                     if sup != fn_body
                         && let Some(universal) = regions.universal(sup)

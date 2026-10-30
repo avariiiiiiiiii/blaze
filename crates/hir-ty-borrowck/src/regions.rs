@@ -40,6 +40,7 @@ use super::{
     Ctx,
     bitset::BitSet,
     cfg::{Cfg, Location},
+    constraints::Constraints,
 };
 
 /// A region variable.
@@ -175,7 +176,7 @@ pub(super) struct Regions<'db> {
     pub(super) local_tys: Vec<Ty<'db>>,
     /// The region of the loan each borrow makes.
     pub(super) loan_regions: FxHashMap<Location, Rv>,
-    pub(super) outlives: Vec<Outlives>,
+    pub(super) outlives: Constraints,
     pub(super) type_tests: Vec<TypeTest<'db>>,
     /// Whether universal regions are checked against each other: not in a closure whose
     /// signature could not be split into its own regions and its creator's.
@@ -706,7 +707,7 @@ pub(super) fn build<'db>(
             early: FxHashMap::default(),
             local_tys: Vec::new(),
             loan_regions: FxHashMap::default(),
-            outlives: Vec::new(),
+            outlives: Constraints::default(),
             type_tests: Vec::new(),
             check_universals: ctx.closure_local.is_none(),
             related_placeholders: FxHashSet::default(),
@@ -4042,11 +4043,10 @@ impl<'db> Builder<'_, '_, 'db> {
         // into a lifetime the annotation names, `let p: &'static T = ..`, is blamed on that.
         if projection.is_empty() && self.annotated.contains_key(&place.local) {
             for index in first..self.regions.outlives.len() {
-                let constraint = &self.regions.outlives[index];
-                if constraint.category == Category::Assignment
-                    && self.regions.universal(constraint.sub).is_some()
+                if self.regions.outlives.category(index) == Category::Assignment
+                    && self.regions.universal(self.regions.outlives.sub(index)).is_some()
                 {
-                    self.regions.outlives[index].category = Category::TypeAnnotation;
+                    self.regions.outlives.set_category(index, Category::TypeAnnotation);
                 }
             }
         }
@@ -7030,12 +7030,7 @@ pub(super) fn constraint_path(
     from: Rv,
     to: Rv,
 ) -> Vec<Outlives> {
-    let mut by_sup: Vec<Vec<usize>> = vec![Vec::new(); count];
-    for (index, constraint) in regions.outlives.iter().enumerate() {
-        if constraint.sup < count {
-            by_sup[constraint.sup].push(index);
-        }
-    }
+    let constraints = &regions.outlives;
     let mut came_from: Vec<Option<usize>> = vec![None; count];
     let mut seen = vec![false; count];
     let mut queue = std::collections::VecDeque::from([from]);
@@ -7045,14 +7040,16 @@ pub(super) fn constraint_path(
             let mut path = Vec::new();
             let mut at = to;
             while let Some(index) = came_from[at] {
-                path.push(regions.outlives[index]);
-                at = regions.outlives[index].sup;
+                path.push(constraints.get(index));
+                at = constraints.sup(index);
             }
             path.reverse();
             return path;
         }
-        for &index in &by_sup[rv] {
-            let sub = regions.outlives[index].sub;
+        let ids = if rv < count { constraints.of_sup(rv) } else { &[] };
+        for &index in ids {
+            let index = index as usize;
+            let sub = constraints.sub(index);
             if !seen[sub] {
                 seen[sub] = true;
                 came_from[sub] = Some(index);

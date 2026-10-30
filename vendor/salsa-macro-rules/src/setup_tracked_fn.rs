@@ -519,20 +519,20 @@ macro_rules! setup_tracked_fn {
                     $Configuration::fn_ingredient_mut(db).set_capacity(value);
                 }
 
-                /// Drops the memoized values of this function to free memory, keeping each
-                /// memo's fingerprint and dependency edges. A later call computes the value
-                /// again and, when it hashes to the kept fingerprint, backdates it, so nothing
-                /// that read it runs again. Returns how many values were dropped.
+                /// Drops the memoized values of this function to free memory. Each memo keeps
+                /// its dependency edges and gets the fingerprint of the value it drops. A later
+                /// call computes the value again and, when it hashes the same (and its
+                /// durability did not drop), backdates it, so nothing that read it runs again.
+                /// Returns how many values were dropped.
                 ///
-                /// Only functions with an `lru` option have this; `lru = 0` keeps every value
-                /// until it is evicted here.
+                /// Only functions whose output implements `Hash` have this.
                 ///
                 /// **WARNING:** Just like an ordinary write, this method triggers
                 /// cancellation. If you invoke it while a snapshot exists, it
                 /// will block until that snapshot is dropped -- if that snapshot
                 /// is owned by the current thread, this could trigger deadlock.
                 #[allow(dead_code)]
-                $vis fn evict_values(db: &mut dyn $Db) -> usize where for<'trivial_bounds> $Eviction: $zalsa::function::HasCapacity {
+                $vis fn evict_values(db: &mut dyn $Db) -> usize where for<'trivial_bounds> <$Configuration as $zalsa::function::Configuration>::Output<'trivial_bounds>: ::std::hash::Hash {
                     let zalsa = db.zalsa_mut();
                     let index = zalsa.lookup_jar_by_type::<$fn_name>();
                     $zalsa::function::IngredientImpl::<$Configuration>::evict_values(zalsa, index, None)
@@ -546,7 +546,7 @@ macro_rules! setup_tracked_fn {
                         $vis fn evict_values_of<$db_lt>(
                             db: &mut dyn $Db,
                             keys: impl ::std::iter::IntoIterator<Item = ($($interned_input_ty),*)>,
-                        ) -> usize where for<'trivial_bounds> $Eviction: $zalsa::function::HasCapacity {
+                        ) -> usize where for<'trivial_bounds> <$Configuration as $zalsa::function::Configuration>::Output<'trivial_bounds>: ::std::hash::Hash {
                             let keys: ::std::vec::Vec<$zalsa::Id> = keys
                                 .into_iter()
                                 .map(|key| $zalsa::AsId::as_id(&key))

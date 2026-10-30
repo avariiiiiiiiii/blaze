@@ -14,10 +14,11 @@ where
     /// then update `revisions.changed_at` to match `self.revisions.changed_at`. This is invoked
     /// on an old memo when a new memo has been produced to check whether there have been changed.
     ///
-    /// `revisions` must already hold the new value's fingerprint. When the old value
-    /// was evicted, the values are the same if both have value fingerprints and they are equal.
-    /// Without value fingerprints, an evicted value is only known to be the same when the old memo
-    /// was verified in `now`, the current revision: every input was unchanged, so executing again
+    /// When the old value is present, [`Configuration::values_equal`] decides. When it was
+    /// evicted with a fingerprint (taken at eviction), the new value is hashed the same way and
+    /// the fingerprints decide; the new fingerprint is kept in `revisions`, so readers record it.
+    /// Without a fingerprint, an evicted value is only known to be the same when the old memo was
+    /// verified in `now`, the current revision: every input was unchanged, so executing again
     /// computes the value the memo had.
     pub(super) fn backdate_if_appropriate<'db>(
         &self,
@@ -34,8 +35,9 @@ where
             Some(old_value) => C::values_equal(old_value, value),
             None => {
                 let old = old_memo.header.revisions.value_fingerprint();
-                let new = revisions.value_fingerprint();
-                if old.is_value() && new.is_value() {
+                if old.is_value() {
+                    let new = self.value_fingerprint(value);
+                    revisions.set_value_fingerprint(new);
                     old == new
                 } else {
                     old_memo.header.verified_at.load() == now

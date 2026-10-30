@@ -389,3 +389,11 @@ impl T for S { fn a(&self) {} fn b(&self) {} }
     );
     assert_ne!(val(&db, fact), before, "the slots are in declaration order");
 }
+
+#[test]
+fn batched_name_hashes_are_the_single_ones() {
+    let long = "x".repeat(1025);
+    let names = ["", "a", "self", "r#type", "über", long.as_str()];
+    let single: Vec<_> = names.iter().map(|it| key::name_hash(it)).collect();
+    assert_eq!(crate::index::name_hashes(names.iter().copied()), single);
+}

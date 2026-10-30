@@ -6,7 +6,6 @@
 
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{Variance, inherent::IntoKind};
-use smallvec::SmallVec;
 
 use hir_ty::{
     mir::{MirBody, OperandKind, Rvalue, StatementKind},
@@ -19,6 +18,7 @@ use super::{
     intervals::IntervalSet,
     loans::Loans,
     regions::{Regions, Rv, rv_of},
+    relation::Csr,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -79,26 +79,35 @@ pub(super) fn live_loans<'db>(
     let empty = IntervalSet::default();
     let live_at =
         |rv: Rv| if universal.contains(&rv) { &all } else { liveness.get(rv).unwrap_or(&empty) };
-    // The localized edges out of each region, by point.
-    let mut localized: Vec<Vec<(usize, Rv)>> = vec![Vec::new(); count];
-    let mut logical: Vec<SmallVec<[Rv; 4]>> = vec![SmallVec::new(); count];
-    for constraint in &regions.outlives {
-        if constraint.sup >= count || constraint.sub >= count {
-            continue;
-        }
-        match constraint.location {
-            Some(location) => localized[constraint.sup].push((cfg.point(location), constraint.sub)),
-            None => {
-                if !logical[constraint.sup].contains(&constraint.sub) {
-                    logical[constraint.sup].push(constraint.sub);
+    // The edges out of each region: those that hold at one point, sorted by point, and those
+    // that hold everywhere, each sub once.
+    let constraints = &regions.outlives;
+    let mut localized_pairs: Vec<(u32, (u32, u32))> = Vec::new();
+    let mut logical_pairs: Vec<(u32, u32)> = Vec::new();
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    for sup in 0..count {
+        let start = logical_pairs.len();
+        edges.clear();
+        for &at in constraints.of_sup(sup) {
+            let sub = constraints.sub(at as usize);
+            if sub >= count {
+                continue;
+            }
+            match constraints.location(at as usize) {
+                Some(location) => edges.push((cfg.point(location) as u32, sub as u32)),
+                None => {
+                    if !logical_pairs[start..].iter().any(|&(_, it)| it == sub as u32) {
+                        logical_pairs.push((sup as u32, sub as u32));
+                    }
                 }
             }
         }
-    }
-    for edges in &mut localized {
         edges.sort_unstable();
         edges.dedup();
+        localized_pairs.extend(edges.iter().map(|&it| (sup as u32, it)));
     }
+    let localized = Csr::build(count, localized_pairs);
+    let logical = Csr::build(count, logical_pairs);
     let last_of =
         |block| cfg.point(Location { block, statement: body.basic_blocks[block].statements.len() });
 
@@ -128,13 +137,15 @@ pub(super) fn live_loans<'db>(
             let region_live = live_at(region);
             let direction = direction(region);
             for (start, end) in visited[region].insert_new(start, end) {
-                for &sub in &logical[region] {
-                    stack.push((sub, start, end));
+                for &sub in logical.of(region) {
+                    stack.push((sub as Rv, start, end));
                 }
-                let edges = &localized[region];
-                let from = edges.partition_point(|&(point, _)| point < start);
-                for &(point, sub) in edges[from..].iter().take_while(|&&(point, _)| point <= end) {
-                    stack.push((sub, point, point));
+                let edges = localized.of(region);
+                let from = edges.partition_point(|&(point, _)| (point as usize) < start);
+                for &(point, sub) in
+                    edges[from..].iter().take_while(|&&(point, _)| point as usize <= end)
+                {
+                    stack.push((sub as Rv, point as usize, point as usize));
                 }
                 for (s, e) in region_live.runs_in(start, end) {
                     points.insert_range(s, e);

@@ -112,6 +112,8 @@ pub(crate) enum Form {
 /// encodings made it. A multiple of 16, so warm bytes keep the record's alignment.
 pub(crate) const SCHEMA_PREFIX: usize = 32;
 
+const _: () = assert!(SCHEMA_PREFIX.is_multiple_of(16) && SCHEMA_PREFIX == size_of::<blaze_format::SchemaHash>());
+
 impl Form {
     pub(crate) const fn code(self) -> u8 {
         match self {

@@ -244,6 +244,10 @@ fn diagnostic_lines(out: &mut String, diagnostic: &Diagnostic, depth: usize, col
         Level::Warning => ("warning", YELLOW),
         Level::Note => ("note", GREEN),
         Level::Help => ("help", CYAN),
+        Level::FailureNote => {
+            line(out, diagnostic.message.clone());
+            return;
+        }
     };
     let code = diagnostic.code.as_deref().map(|code| format!("[{code}]")).unwrap_or_default();
     if depth == 0 {

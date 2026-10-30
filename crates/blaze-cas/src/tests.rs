@@ -204,9 +204,11 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
             }
             let mut effects = Vec::new();
             if seed % 3 == 2 {
-                store.settle(&mut effects);
-                for ticket in drive(&mut sim, &mut store, &mut effects) {
-                    durable_keys.extend(tickets.get(&ticket).copied());
+                for _ in 0..2 {
+                    store.settle(&mut effects);
+                    for ticket in drive(&mut sim, &mut store, &mut effects) {
+                        durable_keys.extend(tickets.get(&ticket).copied());
+                    }
                 }
                 store.settle(&mut effects);
             }
@@ -743,6 +745,7 @@ fn what_is_unread_for_two_periods_goes_cold_and_what_is_read_stays_hot() {
     }
     flush(&mut sim, &mut store);
     assert_eq!(settle(&mut sim, &mut store).demoted, 0, "one period is not two");
+    assert_eq!(settle(&mut sim, &mut store).demoted, 0, "a record made in the last two periods stays");
     assert_eq!(bytes_of(&store, &key(0)).unwrap(), text(0, 8 << 10));
     let settled = settle(&mut sim, &mut store);
     assert_eq!(settled.demoted, 9, "{settled:?}");
@@ -769,6 +772,7 @@ fn a_cold_value_read_in_two_periods_running_comes_back_hot() {
     store.put(key(2), Kind::Output, text(2, 16 << 10)).unwrap();
     flush(&mut sim, &mut store);
     settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
     assert_eq!(settle(&mut sim, &mut store).demoted, 2);
     for round in 0..2 {
         assert_eq!(bytes_of(&store, &key(1)).unwrap(), text(1, 16 << 10));
@@ -791,6 +795,7 @@ fn a_value_that_does_not_compress_is_tried_once() {
     store.put(key(1), Kind::Code, noise(8 << 10, 320)).unwrap();
     flush(&mut sim, &mut store);
     settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
     assert_eq!(settle(&mut sim, &mut store).demoted, 0);
     let (_, row) = store.tiers[0].find(&key(1)).unwrap().unwrap();
     assert!(lock(&store.flags)[0].get(row, Flag::Tried));
@@ -809,6 +814,7 @@ fn packs_that_are_mostly_moved_out_are_rewritten_and_removed() {
     flush(&mut sim, &mut store);
     let before: Vec<FileName> = store.tiers[0].packs.iter().map(|it| it.file.clone()).collect();
     assert!(before.len() >= 3, "{} packs", before.len());
+    settle(&mut sim, &mut store);
     settle(&mut sim, &mut store);
     let settled = settle(&mut sim, &mut store);
     assert_eq!(settled.demoted, 50, "{settled:?}");
@@ -841,6 +847,7 @@ fn a_pack_left_behind_by_a_crash_is_removed_at_the_next_open() {
         store.put(key(n), Kind::Code, text(n, 12 << 10)).unwrap();
     }
     flush(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
     settle(&mut sim, &mut store);
     let mut effects = Vec::new();
     assert!(store.settle(&mut effects).retired >= 1);

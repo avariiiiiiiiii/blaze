@@ -33,6 +33,8 @@ ones already: `either`, `rustc-hash`, `serde`, `serde_json`, `smallvec`, `base-d
 `hir-ty`, `hir-ty-borrowck`, `intern`, `span`, `stdx`, `syntax`; dev: `expect-test`, `salsa`,
 `test-fixture`, `triomphe`.
 
+> applied: root `[workspace.dependencies]` gains `blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }`; `annotate-snippets = "=0.12.16"` with the reason. `Cargo.lock` already has annotate-snippets 0.12.16, so no lock change; members are globbed (`crates/*`).
+
 ## 2. `crates/blaze-api/src/lib.rs`: `Level::FailureNote` (ci)
 
 What: a fifth level, after `Help`:
@@ -46,6 +48,9 @@ and "Some errors have detailed explanations: ..." are `failure-note`s (its JSON 
 `"level":"failure-note"`, its text `For more information...` with no `note:` before it);
 cargo shows them and an agent reads them. Giving them as `Note` would print them wrong.
 `blaze_diagnostics::api` maps `Level::FailureNote` to it.
+
+> applied: `Level::FailureNote` in `crates/blaze-api/src/lib.rs` (ci is DONE), with ci's matches changed with it: `blaze-api/src/session/best_of.rs` and `blaze-ci/src/service.rs` count it as neither error nor warning, `service.rs` names it `failure-note`, and `blaze-ui/src/api.rs` prints its message with no level before it.
+> forwarded to cargo: `crates/blaze-cargo/src/cli/json.rs:224` `level` matches `Level` exhaustively and needs `Level::FailureNote => "failure-note"`.
 
 ## 3. `crates/blaze-engine` (codegen): builds refuse every error rustc gives (#1522, #1440, #780)
 
@@ -62,6 +67,8 @@ wasn't refused (#1440), and a `-p` build passed a type error (#780): an error no
 was not an error, and errors of files the edit didn't touch weren't looked for. salsa keeps
 the whole-crate check cheap: an unedited body's diagnostics are memoized.
 
+> forwarded to codegen
+
 ## 4. `crates/blaze-cargo` (cargo): the CLI prints what rustc and cargo print
 
 What: `errors.rs` (its one-span renderer) and `cargo/messages.rs`: for each unit, print
@@ -77,6 +84,8 @@ for non-local packages, as cargo does).
 
 Why: rustc's text exactly is the lane's goal; the old renderer has one span and no children.
 
+> forwarded to cargo
+
 ## 5. `crates/hir`, `crates/hir-ty-borrowck` (db): an unchecked body is always reported
 
 What: `AnyDiagnostic::BorrowckSkipped` given for every body borrowck does not check, always
@@ -85,6 +94,8 @@ What: `AnyDiagnostic::BorrowckSkipped` given for every body borrowck does not ch
 Why: no-fallback. A body borrowck skipped is a body blaze accepts that rustc might reject;
 blaze-diagnostics refuses it with ``blaze cannot borrow-check `<path>`: <reason>`` until
 borrowck checks it.
+
+> forwarded to db
 
 ## diagnostics-bodies: the front end's values of `hir::Type`, `hir::TraitRef`, `hir::TraitPredicate` (db)
 
@@ -128,11 +139,15 @@ defaults left out, trimmed paths, regions as rustc shows them. `HirDisplay` is r
 printing, not rustc's, and `hir::Type` has no public way to the structure (`TyKind`) it holds.
 The E0308/E0277 lowering needs the same of trait refs and predicates.
 
+> forwarded to db: `crates/hir/` is lane db's.
+
 ## diagnostics-bodies: `rustc_type_ir` for blaze-diagnostics (the parent, `diagnostics`)
 
 Where: `crates/blaze-diagnostics/Cargo.toml`: `rustc_type_ir.workspace = true` under
 `[dependencies]`. Why: `print.rs` matches on `rustc_type_ir::TyKind` and uses its `inherent`
 traits on `hir_ty::next_solver` types.
+
+> applied: `rustc_type_ir` is already a root workspace dependency; `crates/blaze-diagnostics/Cargo.toml` is lane diagnostics' own to add it to.
 
 ## diagnostics-bodies: names used through a glob import (db, hir-def)
 
@@ -142,3 +157,5 @@ a crate, the names that some path of the crate resolved through it (rustc's
 not unique (so `use a::*;` with `a::S` used makes `S` print as `a::S`), and only the names used.
 Until hir has it, `print.rs` counts every name a local glob import brings into a scope (more than
 rustc: such a name prints by its path where rustc may trim it).
+
+> forwarded to db

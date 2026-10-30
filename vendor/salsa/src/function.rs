@@ -42,6 +42,16 @@ pub use eviction::{EvictionPolicy, HasCapacity, Lru, NoopEviction};
 
 pub type Memo<C> = memo::Memo<C>;
 
+/// Hashes a value of `C` into its value fingerprint.
+type ValueHasher<C> = for<'a, 'db> fn(&'a <C as Configuration>::Output<'db>) -> Fingerprint;
+
+fn hash_value<C: Configuration>(value: &C::Output<'_>) -> Fingerprint
+where
+    for<'db> C::Output<'db>: std::hash::Hash,
+{
+    Fingerprint::of_value(value)
+}
+
 /// Configuration for a Salsa function ingredient.
 ///
 /// # Safety
@@ -83,9 +93,14 @@ pub unsafe trait Configuration: Any {
     /// This invokes user code in form of the `Eq` impl.
     fn values_equal<'db>(old_value: &Self::Output<'db>, new_value: &Self::Output<'db>) -> bool;
 
-    /// The stable hash of a value, kept with the memo when its value is evicted, or `None` when
-    /// the output has no stable hash and the memo is fingerprinted by revision instead. Values
-    /// that [`values_equal`](Self::values_equal) calls equal must have equal fingerprints.
+    /// The function has `no_eq`: a recomputed value is never taken to be the old one, neither
+    /// by [`values_equal`](Self::values_equal) nor by fingerprint.
+    const NO_EQ: bool = false;
+
+    /// The hash of a value of a function with `lru`, taken when the LRU drops the value, or
+    /// `None` for other functions (their values are fingerprinted only by `evict_values`, which
+    /// requires `Output: Hash`). Values that [`values_equal`](Self::values_equal) calls equal must
+    /// have equal fingerprints.
     ///
     /// This invokes user code in form of the `Hash` impl.
     fn fingerprint(_value: &Self::Output<'_>) -> Option<Fingerprint> {
@@ -273,6 +288,11 @@ pub struct IngredientImpl<C: Configuration> {
     /// we don't know that we can trust the database to give us the same runtime
     /// everytime and so forth.
     deleted_entries: DeletedEntries<C>,
+
+    /// Hashes values the function's `Configuration::fingerprint` does not, set by the first
+    /// `evict_values` (which requires `Output: Hash`) and used from then on whenever a value is
+    /// dropped or a recomputed value is compared with a dropped one.
+    value_hasher: Option<ValueHasher<C>>,
 }
 
 impl<C> IngredientImpl<C>
@@ -291,7 +311,22 @@ where
             deleted_entries: Default::default(),
             view_caster: OnceLock::new(),
             sync_table: SyncTable::new(index),
+            value_hasher: None,
         }
+    }
+
+    /// The value fingerprint of `value`, or [`Fingerprint::NONE`] if the function has none.
+    fn fingerprint_with(hasher: Option<ValueHasher<C>>, value: &C::Output<'_>) -> Fingerprint {
+        if C::NO_EQ {
+            return Fingerprint::NONE;
+        }
+        C::fingerprint(value)
+            .or_else(|| hasher.map(|hash| hash(value)))
+            .unwrap_or(Fingerprint::NONE)
+    }
+
+    pub(super) fn value_fingerprint(&self, value: &C::Output<'_>) -> Fingerprint {
+        Self::fingerprint_with(self.value_hasher, value)
     }
 
     /// Set the view-caster for this tracked function ingredient, if it has
@@ -321,17 +356,19 @@ where
     }
 
     /// Drops the values of the function ingredient at `index`: of the memos for `keys`, or of
-    /// every memo when `keys` is `None`. Each memo keeps its fingerprint and dependency edges, so
-    /// a later read computes the value again and, when the output has a value fingerprint equal
-    /// to the kept one, backdates it and nothing that read it runs again. Memos whose values
-    /// can't be computed again (assigned by `specify`, with untracked reads, or provisional) keep
-    /// their values. Returns how many values were dropped.
+    /// every memo when `keys` is `None`. Each memo keeps its dependency edges and gets the
+    /// fingerprint of the value it drops, so a later read computes the value again and, when it
+    /// hashes the same (and its durability did not drop), backdates it and nothing that read it
+    /// runs again. Memos whose values can't be computed again (assigned by `specify`, with
+    /// untracked reads, or provisional) keep their values. Returns how many values were dropped.
     pub fn evict_values(zalsa: &mut Zalsa, index: IngredientIndex, keys: Option<&[Id]>) -> usize
     where
-        C::Eviction: HasCapacity,
+        for<'db> C::Output<'db>: std::hash::Hash,
     {
         let (ingredient, runtime) = zalsa.lookup_ingredient_mut(index);
         let ingredient = ingredient.assert_type_mut::<Self>();
+        ingredient.value_hasher = Some(hash_value::<C>);
+        let hasher = ingredient.value_hasher;
         let table = runtime.table_mut();
         let mut evicted = 0;
         match keys {
@@ -342,6 +379,7 @@ where
                     evicted += usize::from(Self::evict_value_from_memo_for(
                         table.memos_mut(id),
                         memo_ingredient_index,
+                        hasher,
                     ));
                 }
             }
@@ -355,6 +393,7 @@ where
                     evicted += usize::from(Self::evict_value_from_memo_for(
                         memos,
                         memo_ingredient_index,
+                        hasher,
                     ));
                 },
             ),
@@ -556,11 +595,13 @@ where
     }
 
     fn reset_for_new_revision(&mut self, table: &mut Table) {
+        let hasher = self.value_hasher;
         self.eviction.for_each_evicted(|evict| {
             let ingredient_index = table.ingredient_index(evict);
             Self::evict_value_from_memo_for(
                 table.memos_mut(evict),
                 self.memo_ingredient_indices.get(ingredient_index),
+                hasher,
             );
         });
 

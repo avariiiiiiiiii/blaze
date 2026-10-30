@@ -22,9 +22,14 @@ pub(crate) enum Flag {
     ReadBefore,
     /// Compressing it saved too little to keep: not tried again.
     Tried,
+    /// Made since the last [`Flags::rotate`]: a record is unread for two periods only once it
+    /// has been there for two.
+    New,
+    /// Made between the two rotations before.
+    NewBefore,
 }
 
-const FLAGS: usize = 4;
+const FLAGS: usize = 6;
 
 #[derive(Clone, Default, Debug)]
 pub(crate) struct Bits(Vec<u64>);
@@ -70,10 +75,11 @@ impl Flags {
         bits.set(at);
     }
 
-    /// A new period of reading: what was read becomes read before.
+    /// A new period of reading: what was read becomes read before, what was made made before.
     pub(crate) fn rotate(&mut self) {
         for space in [&mut self.slots, &mut self.delta] {
             space[Flag::ReadBefore as usize] = std::mem::take(&mut space[Flag::Read as usize]);
+            space[Flag::NewBefore as usize] = std::mem::take(&mut space[Flag::New as usize]);
         }
     }
 
@@ -92,6 +98,7 @@ mod tests {
         let mut flags = Flags::default();
         flags.set(Row::Slot(3), Flag::Read);
         flags.set(Row::Delta(700), Flag::Verified);
+        flags.set(Row::Delta(5), Flag::New);
         assert!(flags.get(Row::Slot(3), Flag::Read));
         assert!(!flags.get(Row::Delta(3), Flag::Read));
         assert!(!flags.get(Row::Slot(700), Flag::Verified));
@@ -100,9 +107,11 @@ mod tests {
         flags.rotate();
         assert!(!flags.get(Row::Slot(3), Flag::Read));
         assert!(flags.get(Row::Slot(3), Flag::ReadBefore));
+        assert!(!flags.get(Row::Delta(5), Flag::New) && flags.get(Row::Delta(5), Flag::NewBefore));
         assert!(flags.get(Row::Delta(700), Flag::Verified), "rotating keeps the rest");
         flags.rotate();
         assert!(!flags.get(Row::Slot(3), Flag::ReadBefore));
+        assert!(!flags.get(Row::Delta(5), Flag::NewBefore));
         flags.forget();
         assert!(!flags.get(Row::Delta(700), Flag::Verified));
     }

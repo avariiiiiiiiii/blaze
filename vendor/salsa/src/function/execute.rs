@@ -3,7 +3,6 @@ use thin_vec::ThinVec;
 
 use crate::active_query::CompletedQuery;
 use crate::cycle::{CycleHeads, CycleRecoveryStrategy, IterationStamp, ProvisionalStatus};
-use crate::fingerprint::Fingerprint;
 use crate::function::memo::{Memo, MemoHeader};
 use crate::function::sync::ReleaseMode;
 use crate::function::{ClaimGuard, ClaimResult, Configuration, IngredientImpl, Reentrancy};
@@ -82,12 +81,6 @@ where
                 )
             }
         };
-
-        if *completed_query.revisions.verified_final.get_mut() {
-            completed_query
-                .revisions
-                .set_value_fingerprint(C::fingerprint(&new_value).unwrap_or(Fingerprint::NONE));
-        }
 
         if let Some(old_memo) = opt_old_memo {
             // If the new value is equal to the old one, then it didn't

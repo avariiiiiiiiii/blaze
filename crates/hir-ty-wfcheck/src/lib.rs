@@ -13,6 +13,9 @@
 extern crate rustc_type_ir;
 
 mod outlives;
+mod persist;
+
+use std::sync::LazyLock;
 
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, FunctionId, GenericDefId, ImplId, ItemContainerId,
@@ -39,6 +42,7 @@ use hir_ty::{
 };
 
 pub use outlives::Inferred;
+pub use persist::{WfResultRef, WfRow};
 use outlives::{Known, Needs, Wfcx};
 
 /// Where an error is: rustc's span of it.
@@ -63,7 +67,7 @@ pub enum Site {
     SelfTy(ImplId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
 pub struct WfDiagnostic {
     /// rustc's error code, as `E0310`.
     pub code: &'static str,
@@ -71,7 +75,7 @@ pub struct WfDiagnostic {
     pub site: Site,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, SalsaValue)]
 pub struct WfResult {
     pub diagnostics: Vec<WfDiagnostic>,
 }
@@ -80,7 +84,7 @@ pub struct WfResult {
 #[salsa::tracked(returns(ref))]
 pub fn wfcheck(db: &dyn HirDatabase, def: GenericDefId) -> WfResult {
     let mut result = WfResult::default();
-    if matches!(std::env::var("BLAZE_BORROWCK").as_deref(), Ok("off" | "0")) {
+    if off() {
         return result;
     }
     let mut check = Check { db, inferred: Inferred::default(), found: &mut result.diagnostics };
@@ -92,6 +96,14 @@ pub fn wfcheck(db: &dyn HirDatabase, def: GenericDefId) -> WfResult {
         _ => (),
     }
     result
+}
+
+/// `BLAZE_BORROWCK=off`, read once for the process as the borrow checker reads it, so a
+/// result does not depend on when its query ran.
+fn off() -> bool {
+    static OFF: LazyLock<bool> =
+        LazyLock::new(|| matches!(std::env::var("BLAZE_BORROWCK").as_deref(), Ok("off" | "0")));
+    *OFF
 }
 
 struct Check<'a, 'db> {

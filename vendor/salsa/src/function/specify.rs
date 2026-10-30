@@ -3,7 +3,6 @@ use thin_vec::ThinVec;
 #[cfg(feature = "accumulator")]
 use crate::accumulator::accumulated_map::InputAccumulatedValues;
 use crate::active_query::CompletedQuery;
-use crate::fingerprint::Fingerprint;
 use crate::function::memo::Memo;
 use crate::function::sync::{ClaimResult, Reentrancy};
 use crate::function::{Configuration, IngredientImpl};
@@ -123,11 +122,6 @@ where
             },
             stale_tracked_structs: Vec::new(),
         };
-        if !is_provisional {
-            completed_query
-                .revisions
-                .set_value_fingerprint(C::fingerprint(&value).unwrap_or(Fingerprint::NONE));
-        }
         if is_provisional {
             // Assigned memos aren't cycle heads, so only their inherited head stamps matter.
             completed_query

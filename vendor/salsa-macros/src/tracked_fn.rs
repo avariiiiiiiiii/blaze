@@ -116,7 +116,10 @@ impl Macro {
         // we need to generate the entire function here
         // as the locals (parameters) will have def site hygiene otherwise
         // if emitted in the decl macro
+        let no_eq = self.args.no_eq.is_some();
         let eq = quote! {
+            const NO_EQ: bool = #no_eq;
+
             fn values_equal<#db_lt>(
                 old_value: &Self::Output<#db_lt>,
                 new_value: &Self::Output<#db_lt>,
@@ -125,10 +128,9 @@ impl Macro {
             }
         };
 
-        // A function with `lru` hashes its output so that a value dropped by eviction can be
-        // compared with its recomputation. Other functions are fingerprinted by revision: their
-        // values are never dropped, and an output's `Hash` impl may hash addresses, which a
-        // fingerprint compared across revisions must not.
+        // The LRU of a function with `lru` drops values without a `Hash` bound in reach, so the
+        // function hashes its output here (when a value is dropped) and requires `Hash`. Other
+        // functions are hashed by `evict_values`, which is bounded on `Output: Hash`.
         let fingerprint = if self.args.lru.is_some() && self.args.no_eq.is_none() {
             quote_spanned!(output_ty.span() =>
                 ::salsa::plumbing::Some(::salsa::plumbing::Fingerprint::of_value(value))

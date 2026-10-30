@@ -337,6 +337,9 @@ pub enum Level {
     Warning,
     Note,
     Help,
+    /// rustc's closing lines ("For more information about this error, try `rustc --explain
+    /// E0308`."): printed with no level before them, `"failure-note"` in its JSON.
+    FailureNote,
 }
 
 /// A place in a file of the view, by 1-based line and column of characters.

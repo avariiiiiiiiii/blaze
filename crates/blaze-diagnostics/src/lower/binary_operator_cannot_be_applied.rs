@@ -145,7 +145,7 @@ pub(crate) fn lower<'db>(
 }
 
 /// The trait of an operator: rustc's `lang_item_for_binop`.
-fn lang_item(op: BinaryOp) -> Option<LangItem> {
+pub(crate) fn lang_item(op: BinaryOp) -> Option<LangItem> {
     let arith = |op: ArithOp, assign: bool| match (op, assign) {
         (ArithOp::Add, false) => LangItem::Add,
         (ArithOp::Sub, false) => LangItem::Sub,

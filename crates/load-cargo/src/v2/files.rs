@@ -1,0 +1,179 @@
+//! Where each path cargo names is (its mount's root and its path under that root), and the
+//! walk that reads a directory's files through the tree, following symlinks as the disk would.
+
+use std::sync::Arc;
+
+use blaze_ids::ContentId;
+use blaze_query::Tree;
+use blaze_units::query::{Mount, Origin};
+use blaze_vfs::Mode;
+
+use super::LowerError;
+
+/// Symlinks followed in a row before a path is refused, as Linux's `MAXSYMLINKS`.
+const MAX_LINKS: u32 = 40;
+
+pub(crate) struct Mounts<'a> {
+    pub(crate) mounts: &'a [Mount],
+    /// The root of `Origin::View` mounts.
+    pub(crate) view: ContentId,
+    pub(crate) tree: &'a dyn Tree,
+}
+
+/// A file read for the front end, by its absolute path as cargo names it.
+pub(crate) struct Loaded {
+    pub(crate) path: String,
+    pub(crate) id: ContentId,
+    pub(crate) bytes: Arc<[u8]>,
+}
+
+enum Node {
+    File(ContentId, Arc<[u8]>),
+    Dir(String),
+    None,
+}
+
+impl Mounts<'_> {
+    /// The root and the path under it of `path`, absolute: by its longest mount.
+    pub(crate) fn locate(&self, path: &str) -> Result<(ContentId, String), LowerError> {
+        let mount = self
+            .mounts
+            .iter()
+            .filter(|mount| rest(path, &mount.at).is_some())
+            .max_by_key(|mount| mount.at.trim_end_matches('/').len());
+        let Some(mount) = mount else {
+            return Err(LowerError::at(
+                format!(
+                    "`{path}` is under no mount of the build: blaze reads a file only from the view \
+                     and the sources it mounted, never from the disk"
+                ),
+                path,
+            ));
+        };
+        let rest = rest(path, &mount.at).unwrap_or_default();
+        let under = match (mount.under.as_str(), rest) {
+            ("", rest) => rest.to_owned(),
+            (under, "") => under.to_owned(),
+            (under, rest) => format!("{under}/{rest}"),
+        };
+        let root = match mount.origin {
+            Origin::View => self.view,
+            Origin::Root(root) => root,
+        };
+        Ok((root, under))
+    }
+
+    /// What `path` is, symlinks followed.
+    fn node(&self, path: &str) -> Result<Node, LowerError> {
+        let mut path = path.to_owned();
+        for _ in 0..=MAX_LINKS {
+            let (root, under) = self.locate(&path)?;
+            match self.tree.file(root, &under) {
+                Some((_, Mode::Symlink, target)) => {
+                    let target = std::str::from_utf8(&target).map_err(|_| {
+                        LowerError::at(format!("the symlink `{path}` points to a path that is not UTF-8"), &path)
+                    })?;
+                    path = follow(&path, target);
+                }
+                Some((id, _, bytes)) => return Ok(Node::File(id, bytes)),
+                None => {
+                    return Ok(match self.tree.list(root, &under) {
+                        Some(_) => Node::Dir(path),
+                        None => Node::None,
+                    });
+                }
+            }
+        }
+        Err(LowerError::at(format!("`{path}`: more than {MAX_LINKS} symlinks in a row"), &path))
+    }
+
+    /// Every file under the directory `dir`, by its path under `dir` as cargo names it, but
+    /// those under a path `skip` says. A symlink is read as what it points to; one that points
+    /// to nothing is no file, as on the disk.
+    pub(crate) fn walk(
+        &self,
+        dir: &str,
+        skip: &dyn Fn(&str) -> bool,
+        out: &mut Vec<Loaded>,
+    ) -> Result<(), LowerError> {
+        // Each directory as named, where its entries are read from, and the symlinks followed
+        // to reach it.
+        let mut dirs: Vec<(String, String, u32)> = vec![(dir.to_owned(), dir.to_owned(), 0)];
+        while let Some((named, real, links)) = dirs.pop() {
+            let (root, under) = self.locate(&real)?;
+            let Some(entries) = self.tree.list(root, &under) else {
+                return Err(LowerError::at(format!("the directory `{real}` is not in its mount's files"), &real));
+            };
+            for (name, is_dir) in entries.into_iter().rev() {
+                let child = format!("{named}/{name}");
+                if skip(&child) {
+                    continue;
+                }
+                let child_real = format!("{real}/{name}");
+                if is_dir {
+                    dirs.push((child, child_real, links));
+                    continue;
+                }
+                match self.node(&child_real)? {
+                    Node::File(id, bytes) => out.push(Loaded { path: child, id, bytes }),
+                    Node::Dir(target) if links < MAX_LINKS => dirs.push((child, target, links + 1)),
+                    Node::Dir(_) => {
+                        return Err(LowerError::at(
+                            format!("`{child}`: more than {MAX_LINKS} symlinked directories in a row"),
+                            &child,
+                        ));
+                    }
+                    Node::None => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What is after `at` in `path` ("" for `at` itself), when `path` is under the mount `at`.
+pub(crate) fn rest<'p>(path: &'p str, at: &str) -> Option<&'p str> {
+    let at = at.trim_end_matches('/');
+    let after = path.strip_prefix(at)?;
+    match after.strip_prefix('/') {
+        Some(rest) => Some(rest),
+        None if after.is_empty() => Some(""),
+        None => None,
+    }
+}
+
+/// The directory of `path`, absolute and `/`-separated.
+pub(crate) fn parent(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some(("", _)) => "/",
+        Some((parent, _)) => parent,
+        None => path,
+    }
+}
+
+/// Where the symlink at `link` pointing to `target` leads, `.` and `..` taken out.
+fn follow(link: &str, target: &str) -> String {
+    let target = target.replace('\\', "/");
+    let absolute = target.starts_with('/') || target.as_bytes().get(1) == Some(&b':');
+    let joined = if absolute { target } else { format!("{}/{target}", parent(link)) };
+    normalize(&joined)
+}
+
+/// An absolute path without `.`, `..` or empty parts: `/a/b`, or `C:/a/b` with its drive kept.
+pub(crate) fn normalize(path: &str) -> String {
+    let (root, rest) = match path.strip_prefix('/') {
+        Some(rest) => ("", rest),
+        None => path.split_once('/').unwrap_or((path, "")),
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("{root}/{}", parts.join("/"))
+}

@@ -138,6 +138,23 @@ pub trait Steps: Send + Sync + 'static {
     fn library(&self) -> Result<(String, Source), ApiError>;
     /// On a worker: the job's units lowered into the front end.
     fn lower(&self, job: &JobInput) -> Result<Arc<dyn Front>, Failed>;
+    /// On the loop, once at start: the queries of the daemon's database.
+    fn register(&self, db: &mut Database) {
+        blaze_units::query::register(db);
+    }
+    /// On a worker: the plan of `view` (opened with its [`BuildConfig`]).
+    fn plan(&self, db: &Database, view: ViewId) -> Result<Planned, Failed> {
+        match db.get::<Plan>(view, &()) {
+            Ok(planned) => Ok(planned.get()),
+            Err(DbError::Cancelled) => Err(Failed::Again),
+            Err(error) => Err(Failed::Error(ApiError::new(format!("the load of the workspace: {error}"), None))),
+        }
+    }
+    /// The key [`Steps::plan`] asks: where a view's memos are walked from, and what the
+    /// daemon's collection keeps.
+    fn plan_key(&self) -> QueryKey {
+        QueryKey { kind: <Plan as Query>::KIND, input: <Plan as Query>::input(&()) }
+    }
 }
 
 /// One job's front end, its units lowered: shared by the job's tasks.
@@ -167,6 +184,11 @@ pub trait Front: Send + Sync + 'static {
     -> Result<Box<dyn Runs>, ApiError>;
     /// On a worker: what the change from `from`'s view to this one reaches, building nothing.
     fn reach(&self, from: &dyn Front, changes: &[Change]) -> Result<Reach, Failed>;
+    /// On a worker: each codegen unit's inputs and output of the view's last build, as
+    /// [`Response::CodegenInputs`] lists them.
+    fn codegen_inputs(&self) -> Result<Vec<(ContentId, ContentId)>, Failed>;
+    /// On a worker: the front end's tables, each by its owner ([`Response::Tables`]).
+    fn tables(&self) -> Result<Vec<Table>, Failed>;
 }
 
 /// User code of a job run through the loop's driver: it asks with effects whose tags are in

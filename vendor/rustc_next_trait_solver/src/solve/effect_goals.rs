@@ -281,7 +281,8 @@ where
         _ecx: &mut EvalCtxt<'_, D>,
         _goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        todo!("Fn* are not yet const")
+        // `FnPtr` has no const impl: no `[const] FnPtr` bound holds.
+        Err(NoSolution.into())
     }
 
     #[instrument(level = "trace", skip_all, ret)]
@@ -339,7 +340,8 @@ where
         _goal: Goal<I, Self>,
         _kind: rustc_type_ir::ClosureKind,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        todo!("AsyncFn* are not yet const")
+        // No async closure or async fn is const, so no builtin `AsyncFn*` impl is.
+        Err(NoSolution.into())
     }
 
     fn consider_builtin_async_fn_kind_helper_candidate(
@@ -374,7 +376,7 @@ where
         _ecx: &mut EvalCtxt<'_, D>,
         _goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        todo!("Iterator is not yet const")
+        Err(NoSolution.into())
     }
 
     fn consider_builtin_fused_iterator_candidate(

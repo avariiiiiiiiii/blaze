@@ -250,8 +250,14 @@ where
         let impl_polarity = cx.impl_polarity(impl_def_id);
         match impl_polarity {
             ty::ImplPolarity::Negative => return Err(NoSolution.into()),
+            // As for a trait goal: not an impl outside coherence, an ambiguous one in it.
             ty::ImplPolarity::Reservation => {
-                unimplemented!("reservation impl for trait with assoc item: {:?}", goal)
+                if !ecx.typing_mode().is_coherence() {
+                    return Err(NoSolution.into());
+                }
+                return ecx.probe_trait_candidate(CandidateSource::Impl(impl_def_id)).enter(|ecx| {
+                    ecx.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+                });
             }
             ty::ImplPolarity::Positive => {}
         };
@@ -743,9 +749,30 @@ where
                 Some(tail_ty) => Ty::new_projection(cx, metadata_def_id, [tail_ty]),
             },
 
-            ty::UnsafeBinder(_) => {
-                // FIXME(unsafe_binder): Figure out how to handle pointee for unsafe binders.
-                todo!()
+            // An unsafe binder is as sized as the type it binds (`structural_traits`), so its
+            // metadata is that type's. Where the type names a lifetime of the binder, the only
+            // metadata a type outside it can be is `()`, which holds when it is `Sized`.
+            ty::UnsafeBinder(inner) => {
+                let inner: ty::Binder<I, I::Ty> = inner.into();
+                match inner.no_bound_vars() {
+                    Some(inner) => Ty::new_projection(cx, metadata_def_id, [inner]),
+                    None => {
+                        return ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(
+                            |ecx| {
+                                let sized = inner.map_bound(|inner| {
+                                    ty::TraitRef::new(
+                                        cx,
+                                        cx.require_trait_lang_item(SolverTraitLangItem::Sized),
+                                        [I::GenericArg::from(inner)],
+                                    )
+                                });
+                                ecx.add_goal(GoalSource::Misc, goal.with(cx, sized));
+                                ecx.instantiate_normalizes_to_term(goal, Ty::new_unit(cx).into());
+                                ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                            },
+                        );
+                    }
+                }
             }
 
             ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_))
@@ -959,12 +986,8 @@ where
             | ty::Slice(_)
             | ty::Dynamic(_, _)
             | ty::Tuple(_)
+            | ty::UnsafeBinder(_)
             | ty::Error(_) => self_ty.discriminant_ty(ecx.cx()),
-
-            ty::UnsafeBinder(_) => {
-                // FIXME(unsafe_binders): instantiate this with placeholders?? i guess??
-                todo!("discr subgoal...")
-            }
 
             // Given an alias, parameter, or placeholder we add an impl candidate normalizing to a rigid
             // alias. In case there's a where-bound further constraining this alias it is preferred over

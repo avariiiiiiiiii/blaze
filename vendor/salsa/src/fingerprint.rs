@@ -1,36 +1,38 @@
 //! 128-bit fingerprints of memoized values.
 //!
-//! Every memo carries a [`Fingerprint`]. For a tracked function with the `lru` option (and
-//! without `no_eq`) it is a stable hash of the value, which requires the output to implement
-//! [`Hash`]. A value that was dropped (by the LRU or by `evict_values`) can then still be compared
-//! with its recomputation: equal fingerprints backdate the new value exactly as an equal value
-//! would, and a query that read the value is unchanged when the value it read has the same
-//! fingerprint. Other functions carry the revision the value last changed in, which is what
-//! dependency checks compare anyway; their values are never dropped, so `Eq` decides backdating.
+//! A memo gets a value [`Fingerprint`] when its value is dropped: by the LRU of a function with
+//! `lru` (which requires its output to implement [`Hash`]), or by `evict_values` /
+//! `evict_values_of` (which exist for every tracked function whose output implements [`Hash`]).
+//! Values that are never dropped are never hashed. A value computed again after it was dropped
+//! is hashed the same way: equal fingerprints backdate it exactly as an equal value would (unless
+//! its durability dropped), the new memo keeps its fingerprint, and a query that reads it records
+//! the fingerprint it saw. While a value is present, `Eq` decides, as without fingerprints.
+//! Functions with `no_eq` get no fingerprint.
 //!
-//! The `Hash` impl of such an output must hash everything its `Eq` compares and nothing that
-//! depends on where a value lives in memory.
+//! The `Hash` impl of such an output must agree with its `Eq` (equal values write equal bytes)
+//! and must cover what `Eq` compares (unequal values write different bytes, short of a hash
+//! collision). Hashing an address is sound when the allocation is never freed while the process
+//! runs, as for the interned values and symbols of blaze's `intern` crate: their address is equal
+//! exactly when their value is. It is not sound for an allocation that can be freed and reused by
+//! a different value.
 //!
 //! A value fingerprint is SipHash-1-3 with 128-bit output and a fixed key over the bytes the
 //! value's [`Hash`] impl writes. Integers are written little-endian and `usize`/`isize` as 64
-//! bits, so the hash does not depend on the host. Salsa IDs hash their index and generation (see
-//! [`Id`](crate::Id)'s `Hash`), which name the same entity for as long as the database that
-//! assigned them exists: an ID is only reused after its generation is bumped. A fingerprint is
-//! therefore meaningful within one database, which is the only place salsa compares them. A `Hash`
-//! impl that writes an address is not stable in this sense, because a freed allocation can be
-//! reused by a different value.
+//! bits. Salsa IDs hash their index and generation (see [`Id`](crate::Id)'s `Hash`), which name
+//! the same entity for as long as the database that assigned them exists: an ID is only reused
+//! after its generation is bumped. A fingerprint is therefore meaningful within one process and
+//! one database, which is the only place salsa compares them; fingerprints are not persisted.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use crate::Revision;
 
-/// The 128-bit fingerprint of a memoized value: a stable hash of the value for tracked functions
-/// with the `lru` option, the revision the value last changed in otherwise.
+/// The 128-bit fingerprint of a memoized value, taken when the value is dropped (see the module
+/// docs), or of a revision.
 ///
 /// Value fingerprints are SipHash-1-3 over what the value's [`Hash`] impl writes (see
-/// [`StableHasher`]). Salsa IDs hash their index and generation, which name one entity for as
-/// long as the database that assigned them exists, so fingerprints compare within one database.
+/// [`StableHasher`]); they compare within one database.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Default)]
 #[repr(C)]
 pub struct Fingerprint([u32; 4]);

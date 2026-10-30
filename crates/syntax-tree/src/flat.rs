@@ -1,10 +1,9 @@
-//! A syntax tree as arrays, for trees nobody edits.
+//! A syntax tree as arrays, immutable: an edit makes a new tree.
 //!
 //! Every node and token is an element, numbered in preorder. Nothing is allocated per element,
-//! and walking is stepping through the arrays. The cursor ([`crate::cursor`]) serves these
-//! trees through the same API as green ones, and makes a green tree of a part only when asked
-//! for one; a walk that reads many elements reads them here, by number, and makes a cursor
-//! only of what it keeps ([`crate::cursor::SyntaxNode::flat`]).
+//! and walking is stepping through the arrays. The cursor ([`crate::cursor`]) is an element of
+//! one of these trees; a walk that reads many elements reads them here, by number, and makes
+//! a cursor only of what it keeps ([`crate::cursor::SyntaxNode::flat`]).
 //!
 //! What an element costs: a token 4 bytes, a node 8, and every element 0.7 more:
 //!
@@ -41,7 +40,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use crate::{GreenNode, GreenNodeBuilder, NodeCache, SyntaxKind, TextRange, TextSize};
+use crate::{SyntaxKind, TextRange, TextSize};
 
 /// Every how many elements a start is kept.
 const MARK: u32 = 8;
@@ -632,9 +631,9 @@ impl FlatTree {
         self.node_from(self.parent(at)?, self.end(at))
     }
 
-    /// The child or token of `at` that holds `range`, as syntax-tree's green nodes find it with a
-    /// binary search of the children: the one that holds `range` and overlaps it, else the
-    /// last that ends at or before its start, else the first.
+    /// The child or token of `at` that holds `range`, as a binary search of the children by
+    /// overlap finds it: the one that holds `range` and overlaps it, else the last that ends
+    /// at or before its start, else the first.
     pub(crate) fn child_at_range(&self, at: u32, range: TextRange) -> Option<u32> {
         let first = self.first_child_or_token(at)?;
         let (lo, hi) = (at + 1, self.end(at));
@@ -903,40 +902,6 @@ impl FlatTree {
         );
         part.moved(self.source.clone(), root.start().into(), range.start().into())
     }
-
-    /// A green tree of the element's subtree, made with `cache`, with the parts of its lazy
-    /// nodes in it.
-    pub(crate) fn green(&self, at: u32, cache: &mut NodeCache) -> GreenNode {
-        let mut builder = GreenNodeBuilder::with_cache(cache);
-        self.build(at, self.end(at), &mut builder);
-        builder.finish()
-    }
-
-    /// Gives `builder` the elements from `from` to `to`, whole subtrees, lazy nodes with their
-    /// parts.
-    fn build(&self, from: u32, to: u32, builder: &mut GreenNodeBuilder<'_>) {
-        let mut open = Vec::new();
-        for it in from..to {
-            while open.last().is_some_and(|&end| end <= it) {
-                open.pop();
-                builder.finish_node();
-            }
-            if self.is_token(it) {
-                builder.token(self.kind(it), self.token_text(it));
-            } else if self.is_lazy(it) {
-                let part = self.part(it);
-                builder.start_node(self.kind(it));
-                part.build(1, part.len(), builder);
-                builder.finish_node();
-            } else {
-                builder.start_node(self.kind(it));
-                open.push(self.end(it));
-            }
-        }
-        for _ in open {
-            builder.finish_node();
-        }
-    }
 }
 
 /// The vector's elements in an allocation of their size: an allocator may keep a block that
@@ -949,7 +914,7 @@ fn exact<T: Copy>(vec: Vec<T>) -> Box<[T]> {
     }
 }
 
-/// Makes a [`FlatTree`] from the same calls as [`GreenNodeBuilder`].
+/// Makes a [`FlatTree`] in preorder: nodes are started and finished around their children.
 #[derive(Default, Debug)]
 pub struct FlatTreeBuilder {
     /// The text appended so far, when the builder has no source.
@@ -1118,8 +1083,7 @@ mod tests {
     use super::{Expand, FlatTree, HUGE, LONG};
     use crate::{
         cursor::{SyntaxElement, SyntaxNode},
-        FlatTreeBuilder, GreenNodeBuilder, NodeOrToken, SyntaxKind, TextRange, TextSize,
-        TokenAtOffset, WalkEvent,
+        FlatTreeBuilder, NodeOrToken, SyntaxKind, TextRange, TextSize, TokenAtOffset, WalkEvent,
     };
 
     struct Rng(u64);
@@ -1241,14 +1205,202 @@ mod tests {
         }
     }
 
-    fn to_green(shape: &Shape, builder: &mut GreenNodeBuilder<'_>) {
-        match shape {
-            Shape::Node(kind, children, _) => {
-                builder.start_node(*kind);
-                children.iter().for_each(|it| to_green(it, builder));
-                builder.finish_node();
+    /// The model the cursor is checked against, independent of it: every element of a
+    /// [`Shape`] in preorder with its range, parent and children, each move read off by
+    /// indexing vectors.
+    struct Model {
+        elements: Vec<Modelled>,
+    }
+
+    struct Modelled {
+        kind: SyntaxKind,
+        /// A token's text; `None` for a node.
+        text: Option<String>,
+        range: TextRange,
+        parent: Option<usize>,
+        /// The number among its parent's children.
+        index: usize,
+        children: Vec<usize>,
+        /// The number after its subtree.
+        end: usize,
+    }
+
+    type Described = Option<(SyntaxKind, TextRange, bool)>;
+
+    impl Model {
+        fn new(shape: &Shape) -> Model {
+            fn push(
+                shape: &Shape,
+                parent: Option<usize>,
+                index: usize,
+                offset: &mut u32,
+                elements: &mut Vec<Modelled>,
+            ) {
+                let (at, start) = (elements.len(), *offset);
+                let (kind, text) = match shape {
+                    Shape::Node(kind, ..) => (*kind, None),
+                    Shape::Token(kind, text) => (*kind, Some(text.clone())),
+                };
+                let range = TextRange::empty(start.into());
+                let children = Vec::new();
+                elements.push(Modelled { kind, text, range, parent, index, children, end: at + 1 });
+                match shape {
+                    Shape::Node(_, children, _) => {
+                        for (i, child) in children.iter().enumerate() {
+                            let next = elements.len();
+                            elements[at].children.push(next);
+                            push(child, Some(at), i, offset, elements);
+                        }
+                    }
+                    Shape::Token(_, text) => *offset += text.len() as u32,
+                }
+                elements[at].range = TextRange::new(start.into(), (*offset).into());
+                elements[at].end = elements.len();
             }
-            Shape::Token(kind, text) => builder.token(*kind, text),
+            let mut elements = Vec::new();
+            push(shape, None, 0, &mut 0, &mut elements);
+            Model { elements }
+        }
+
+        fn describe(&self, at: Option<usize>) -> Described {
+            at.map(|it| {
+                let element = &self.elements[it];
+                (element.kind, element.range, element.text.is_some())
+            })
+        }
+
+        fn is_token(&self, at: usize) -> bool {
+            self.elements[at].text.is_some()
+        }
+
+        fn sibling(&self, at: usize, next: bool) -> Option<usize> {
+            let element = &self.elements[at];
+            let siblings = &self.elements[element.parent?].children;
+            match next {
+                true => siblings.get(element.index + 1).copied(),
+                false => element.index.checked_sub(1).map(|it| siblings[it]),
+            }
+        }
+
+        fn node_sibling(&self, at: usize, next: bool) -> Option<usize> {
+            let mut sibling = self.sibling(at, next);
+            while let Some(it) = sibling {
+                if !self.is_token(it) {
+                    return Some(it);
+                }
+                sibling = self.sibling(it, next);
+            }
+            None
+        }
+
+        fn first_token(&self, at: usize) -> Option<usize> {
+            match self.is_token(at) {
+                true => Some(at),
+                false => self.first_token(*self.elements[at].children.first()?),
+            }
+        }
+
+        fn last_token(&self, at: usize) -> Option<usize> {
+            match self.is_token(at) {
+                true => Some(at),
+                false => self.last_token(*self.elements[at].children.last()?),
+            }
+        }
+
+        fn ancestors(&self, from: Option<usize>) -> impl Iterator<Item = usize> + '_ {
+            std::iter::successors(from, |&it| self.elements[it].parent)
+        }
+
+        /// The token after (`next`) or before a token, its first or last token of the first
+        /// sibling or token there is, its own or an ancestor's.
+        fn token(&self, at: usize, next: bool) -> Option<usize> {
+            let edge = |it| match next {
+                true => self.first_token(it),
+                false => self.last_token(it),
+            };
+            match self.sibling(at, next) {
+                Some(it) => edge(it),
+                None => self
+                    .ancestors(self.elements[at].parent)
+                    .find_map(|it| self.sibling(it, next))
+                    .and_then(edge),
+            }
+        }
+
+        fn text(&self, at: usize) -> String {
+            (at..self.elements[at].end).filter_map(|it| self.elements[it].text.clone()).collect()
+        }
+
+        /// The child that holds `range` and is the one child that overlaps it; else, when
+        /// none overlaps it, the last that ends at or before its start (or the first), if it
+        /// holds `range`.
+        fn child_at_range(&self, at: usize, range: TextRange) -> Option<usize> {
+            let children = &self.elements[at].children;
+            let range_of = |it: usize| self.elements[it].range;
+            let overlaps = |it: usize| {
+                let of = range_of(it);
+                of.end() > range.start() && range.end() > of.start()
+            };
+            let overlapping: Vec<usize> = children.iter().copied().filter(|&it| overlaps(it)).collect();
+            let found = match overlapping[..] {
+                [] => {
+                    let before =
+                        children.iter().filter(|&&it| range_of(it).end() <= range.start()).count();
+                    children.get(before.saturating_sub(1)).copied()
+                }
+                [one] => Some(one),
+                _ => None,
+            };
+            found.filter(|&it| range_of(it).contains_range(range))
+        }
+
+        fn covering(&self, at: usize, range: TextRange) -> usize {
+            let mut it = at;
+            while !self.is_token(it) {
+                match self.child_at_range(it, range) {
+                    Some(child) => it = child,
+                    None => break,
+                }
+            }
+            it
+        }
+
+        /// The tokens not empty that hold `offset`, at either end or inside.
+        fn tokens_at(&self, at: usize, offset: TextSize) -> Vec<usize> {
+            if self.elements[at].range.is_empty() {
+                return Vec::new();
+            }
+            (at..self.elements[at].end)
+                .filter(|&it| {
+                    let range = self.elements[it].range;
+                    self.is_token(it)
+                        && !range.is_empty()
+                        && range.start() <= offset
+                        && offset <= range.end()
+                })
+                .collect()
+        }
+
+        /// What stepping down by [`Self::child_at_range`] from `at` finds first of `kind` at
+        /// `range`.
+        fn stepped(&self, at: usize, range: TextRange, kind: SyntaxKind) -> Option<usize> {
+            std::iter::successors(Some(at), |&it| {
+                self.child_at_range(it, range).filter(|&child| !self.is_token(child))
+            })
+            .find(|&it| self.elements[it].range == range && self.elements[it].kind == kind)
+        }
+
+        /// Gives `builder` element `at` and its subtree.
+        fn build(&self, at: usize, builder: &mut FlatTreeBuilder) {
+            let element = &self.elements[at];
+            match &element.text {
+                Some(text) => builder.token(element.kind, text),
+                None => {
+                    builder.start_node(element.kind);
+                    element.children.iter().for_each(|&it| self.build(it, builder));
+                    builder.finish_node();
+                }
+            }
         }
     }
 
@@ -1271,12 +1423,6 @@ mod tests {
             Shape::Node(kind, children, _) => node(*kind, children, builder, outline),
             Shape::Token(kind, text) => builder.token(*kind, text),
         }
-    }
-
-    fn build_green(shape: &Shape) -> SyntaxNode {
-        let mut builder = GreenNodeBuilder::new();
-        to_green(shape, &mut builder);
-        SyntaxNode::new_root(builder.finish())
     }
 
     /// `shape` as a flat tree in full, appending its text or over its source.
@@ -1303,7 +1449,7 @@ mod tests {
         Arc::new(builder.finish())
     }
 
-    fn describe(element: Option<SyntaxElement>) -> Option<(SyntaxKind, TextRange, bool)> {
+    fn describe(element: Option<SyntaxElement>) -> Described {
         element.map(|it| (it.kind(), it.text_range(), it.as_token().is_some()))
     }
 

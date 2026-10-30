@@ -109,6 +109,7 @@ blaze-api = { path = "crates/blaze-api" }
 blaze-cas = { path = "crates/blaze-cas" }
 blaze-ci = { path = "crates/blaze-ci" }
 blaze-codegen = { path = "crates/blaze-codegen" }
+blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-ids = { path = "crates/blaze-ids" }
 blaze-items = { path = "crates/blaze-items" }
@@ -163,7 +164,8 @@ la-arena = { version = "0.3.1" }
 anyhow = "1.0.98"
 arrayvec = "0.7.6"
 bitflags = "2.9.1"
-blake3 = { version = "1.8", default-features = false, features = ["std"] }
+# `neon`: aarch64 picks NEON at compile time; x86_64 detects AVX-512 at run time without a feature.
+blake3 = { version = "1.8", default-features = false, features = ["std", "neon"] }
 cargo_metadata = "0.23.1"
 camino = "1.2.2"
 crossbeam-channel = "0.5.15"
@@ -172,8 +174,12 @@ base64 = "0.23"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
-zstd = "0.13.3"
-annotate-snippets = "0.12.16"
+# `zdict_builder` trains the store's dictionary per kind; `zstdmt` lets long cold values use workers.
+zstd = { version = "0.13.3", default-features = false, features = ["zdict_builder", "zstdmt"] }
+# `safe-decode`: a rotted pack decodes to an error, never to an out-of-bounds read.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
+# rustc renders its diagnostics with exactly this version; another lays some snippets out differently.
+annotate-snippets = "=0.12.16"
 object = { version = "0.37", default-features = false, features = ["read_core", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
 gimli = { version = "0.33", default-features = false, features = ["read", "write", "std"] }
 either = "1.15.0"

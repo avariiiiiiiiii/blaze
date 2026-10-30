@@ -1,0 +1,28 @@
+//! E0614 "type `u32` cannot be dereferenced": a `*` on a type that is neither a pointer nor
+//! implements `Deref`, with the parentheses after a block rustc's parser ended a statement at.
+//!
+//! Follows rustc's `compiler/rustc_hir_typeck/src/expr.rs` (`check_expr_unop`) and
+//! `diagnostics.rs` (`CantDereference`) (MIT or Apache-2.0).
+
+use hir::LangItem;
+
+use super::binary_operator_cannot_be_applied::{code_fact, parentheses_needed};
+use crate::{
+    cx::Cx,
+    lower::{Found, Phase},
+    model::Diag,
+};
+
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::CannotBeDereferenced<'db>) -> Vec<Found> {
+    let span = cx.span_of_ptr(d.expr);
+    let ty = cx.ty(&d.found);
+    let mut diag =
+        Diag::error(Some("E0614"), format!("type `{ty}` cannot be dereferenced"), span.clone());
+    diag.span_label(span, "can't be dereferenced");
+    parentheses_needed(cx, d.expr, &mut diag);
+    if let Some(deref) = hir::Trait::lang(cx.db, cx.krate, LangItem::Deref) {
+        diag.fact_opt(cx.implements_fact(deref, &d.found), format!("whether `{ty}` implements `Deref`"));
+    }
+    code_fact(cx, d.expr.map(|it| it.syntax_node_ptr()), &mut diag);
+    vec![Found::new(diag, Phase::Bodies)]
+}

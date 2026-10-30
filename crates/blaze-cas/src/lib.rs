@@ -34,7 +34,7 @@ mod tests;
 use std::{
     borrow::Cow,
     fmt,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
@@ -45,7 +45,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::disk::{
     CHUNK_DOMAIN, DICTIONARY_DOMAIN, DictionaryRef, ExternalRef, Form, HEAD_FILE, Head,
-    IndexRef, Loc, NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, content_of,
+    IndexRef, Loc, NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader,
+    SCHEMA_PREFIX, content_of,
 };
 use crate::flags::{Flag, Flags, Row};
 use crate::index::{Shape, Table};
@@ -182,9 +183,39 @@ impl Kind {
 pub struct Entry<'a> {
     pub key: Key,
     pub kind: Kind,
-    /// The BLAKE3 hash of `bytes`, checked.
+    /// The BLAKE3 hash of the value's bytes as they were put, checked.
     pub content: ContentId,
+    /// The value's bytes as they were put; from [`Store::get_in_place`], what its [`Heat`] says.
     pub bytes: &'a [u8],
+}
+
+/// Format's encodings of the values of one schema (`blaze_format::tiers`), by which
+/// [`Store::settle`] moves a value between tiers. The store decides when, by how recently the
+/// value was read; what its columns are and how each is packed is the encoding's. A value is of
+/// a schema when it is a `blaze_format` buffer: its header names the schema.
+///
+/// Each direction must give back exactly what it was given; the store decodes every encoding
+/// it makes and compares before keeping it.
+pub trait Columns: Send + Sync {
+    /// The schema of the values it encodes.
+    fn schema(&self) -> SchemaHash;
+    /// `hot` with its columns bit-packed by frame of reference: random access, read in place.
+    fn warm(&self, hot: &[u8]) -> Result<Vec<u8>, String>;
+    /// The value [`Columns::warm`] was given.
+    fn hot_from_warm(&self, warm: &[u8]) -> Result<Vec<u8>, String>;
+    /// `hot` with a codec per column, then zstd: decoded when read.
+    fn cold(&self, hot: &[u8]) -> Result<Vec<u8>, String>;
+    /// The value [`Columns::cold`] was given.
+    fn hot_from_cold(&self, cold: &[u8]) -> Result<Vec<u8>, String>;
+}
+
+/// The form of the bytes [`Store::get_in_place`] gave.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Heat {
+    /// The value's bytes as they were put.
+    Hot,
+    /// [`Columns::warm`] of them, by the encoding of the value's schema.
+    Warm,
 }
 
 /// A put's place in line for durability.
@@ -283,12 +314,15 @@ pub struct Store {
     periods: u32,
     /// Values made whole to be read (decompressed, or put together from chunks), by place.
     owned: Mutex<FxHashMap<u64, (ContentId, Box<[u8]>)>>,
+    /// The encodings of each schema whose values it keeps in columns.
+    columns: FxHashMap<SchemaHash, Arc<dyn Columns>>,
 }
 
 /// What one [`Store::settle`] did.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Settled {
-    /// Records moved to the cold tier: nothing read them for two periods.
+    /// Records moved a tier colder (to warm or cold columns, or to zstd): nothing read them for
+    /// two periods.
     pub demoted: u64,
     /// Records moved to the hot tier: read in two periods running.
     pub promoted: u64,
@@ -442,10 +476,11 @@ impl Tier {
     }
 
     /// A record of the delta: where, the `seq` of its put, and its row.
-    fn note(&mut self, key: Key, loc: Loc, seq: u64) {
+    fn note(&mut self, key: Key, loc: Loc, seq: u64) -> Row {
         let row = self.next_row;
         self.next_row += 1;
         self.delta.insert(key, Delta { loc, seq, row });
+        Row::Delta(row)
     }
 }
 
@@ -538,6 +573,47 @@ impl Commit {
     }
 }
 
+/// The schema a `blaze_format` buffer's header names; `None` for bytes that are not one.
+fn header_schema(bytes: &[u8]) -> Option<SchemaHash> {
+    let magic = bytes.get(..8)?;
+    let schema = bytes.get(8..8 + SCHEMA_PREFIX)?;
+    (magic == blaze_format::MAGIC).then(|| SchemaHash(ContentId(schema.try_into().expect("32 bytes"))))
+}
+
+/// `encoded` behind the schema of the encodings that made it: a columns record's payload.
+fn columns_payload(columns: &dyn Columns, encoded: Vec<u8>) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(SCHEMA_PREFIX + encoded.len());
+    payload.extend_from_slice(&columns.schema().0.0);
+    payload.extend_from_slice(&encoded);
+    payload
+}
+
+/// The cold columns payload of `hot`, decoded back and compared.
+fn cold_columns(columns: &dyn Columns, hot: &[u8]) -> Result<Vec<u8>, String> {
+    let payload = columns_payload(columns, columns.cold(hot)?);
+    if columns.hot_from_cold(&payload[SCHEMA_PREFIX..])? != hot {
+        return Err(format!("the cold columns of schema {:x} do not decode to the value", columns.schema().0));
+    }
+    Ok(payload)
+}
+
+/// The next colder columns of `hot`, kept at `loc`: warm from hot (or cold, where warm saves
+/// less than an eighth), cold from warm; `None` when that saves less than an eighth too.
+fn colder_columns(columns: &dyn Columns, loc: Loc, hot: &[u8]) -> Result<Option<(Form, Vec<u8>)>, String> {
+    let saves = |payload: &[u8]| payload.len() as u64 + loc.stored / 8 <= loc.stored;
+    if loc.form != Form::Warm {
+        let payload = columns_payload(columns, columns.warm(hot)?);
+        if columns.hot_from_warm(&payload[SCHEMA_PREFIX..])? != hot {
+            return Err(format!("the warm columns of schema {:x} do not decode to the value", columns.schema().0));
+        }
+        if saves(&payload) {
+            return Ok(Some((Form::Warm, payload)));
+        }
+    }
+    let payload = cold_columns(columns, hot)?;
+    Ok(saves(&payload).then_some((Form::ColdColumns, payload)))
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -581,6 +657,7 @@ impl Store {
             placed: Vec::new(),
             flags: Mutex::new(flags),
             periods: 0,
+            columns: FxHashMap::default(),
             owned: Mutex::default(),
         };
         for tier in 0..store.tiers.len() {
@@ -616,6 +693,59 @@ impl Store {
         let Some(found) = self.find(key) else { return Ok(None) };
         let (tier, loc, row) = found?;
         self.read(tier, key, loc, row).map(Some)
+    }
+
+    /// The value of `key` as [`Store::get`] gives it, except that a value kept in warm columns
+    /// is given in them, read in place ([`Heat::Warm`]), for readers of its schema's warm form.
+    /// Checked as `get` checks: decoded and hashed once a record.
+    pub fn get_in_place(&self, key: &Key) -> Result<Option<(Heat, Entry<'_>)>, Corrupt> {
+        let Some(found) = self.find(key) else { return Ok(None) };
+        let (tier, loc, row) = found?;
+        if loc.form != Form::Warm {
+            return self.read(tier, key, loc, row).map(|entry| Some((Heat::Hot, entry)));
+        }
+        let (header, payload) = self.record(tier, key, loc)?;
+        if lock(&self.flags)[tier].get(row, Flag::Verified) {
+            self.was_read(tier, row);
+        } else {
+            self.value(tier, key, loc, row, Use::Read)?;
+        }
+        let warm = payload.get(SCHEMA_PREFIX..).ok_or_else(|| Corrupt {
+            key: *key,
+            pack: self.tiers[tier].packs[loc.pack as usize].file.clone(),
+            what: "its payload is shorter than the schema it starts with".into(),
+        })?;
+        Ok(Some((Heat::Warm, Entry { key: *key, kind: header.kind, content: header.content, bytes: warm })))
+    }
+
+    /// Gives it the encodings of one schema's values: [`Store::settle`] moves values of the
+    /// schema through warm and cold columns, and a value kept in them is read through these.
+    /// Until it is given them, a value of the schema kept in columns is refused, naming it.
+    pub fn encode_columns(&mut self, columns: Arc<dyn Columns>) {
+        let schema = columns.schema();
+        let old = self.columns.insert(schema, columns);
+        assert!(old.is_none(), "two encodings of schema {:x}", schema.0);
+    }
+
+    /// The encodings of the schema `bytes` are a buffer of, when it has been given them.
+    fn columns_of(&self, bytes: &[u8]) -> Option<Arc<dyn Columns>> {
+        let schema = header_schema(bytes)?;
+        self.columns.get(&schema).cloned()
+    }
+
+    /// The encodings named by a columns payload, and the encoded bytes after the name.
+    fn columns_in<'s, 'p>(&'s self, payload: &'p [u8]) -> Result<(&'s dyn Columns, &'p [u8]), String> {
+        let Some((schema, rest)) = payload.split_at_checked(SCHEMA_PREFIX) else {
+            return Err("its payload is shorter than the schema it starts with".into());
+        };
+        let schema = SchemaHash(ContentId(schema.try_into().expect("a schema is 32 bytes")));
+        match self.columns.get(&schema) {
+            Some(columns) => Ok((columns.as_ref(), rest)),
+            None => Err(format!(
+                "it is kept in the columns of schema {:x}, and the store was given no encoding of it",
+                schema.0
+            )),
+        }
     }
 
     /// Whether it has a value of `key`, unverified: for planning, never for use.
@@ -674,6 +804,13 @@ impl Store {
                 committed: false,
             });
             self.append_value(key, kind, Form::External, 0, content, raw, &[]);
+        } else if let Some(columns) = self.columns_of(&bytes).filter(|_| kind.cold()) {
+            match cold_columns(columns.as_ref(), &bytes) {
+                Ok(payload) => {
+                    self.append_value(key, kind, Form::ColdColumns, 0, content, raw, &payload);
+                }
+                Err(why) => self.cannot_compress(kind, why),
+            }
         } else if kind.cold() && bytes.len() >= cold::LONG_FROM {
             match cold::compress_long(&bytes) {
                 Ok(stored) => {
@@ -720,13 +857,15 @@ impl Store {
         }
     }
 
-    /// Moves records between the hot tier (raw or LZ4, read in place or nearly) and the cold
-    /// (zstd) by how recently they were read, copies the live records of packs that are half
-    /// replaced bytes into new packs, and commits as [`Store::flush`] does.
+    /// Moves records between tiers by how recently they were read, copies the live records of
+    /// packs that are half replaced bytes into new packs, and commits as [`Store::flush`] does.
     ///
-    /// Each call ends a period of reading: a record unread for two periods running is moved
-    /// cold, one read in two running moved hot. The daemon calls it when idle, never on the
-    /// way of a get or a put, and it moves a bounded number of bytes a call.
+    /// Each call ends a period of reading. A record unread for two periods running moves a tier
+    /// colder: a value of a schema it has [`Columns`] for goes from hot to warm columns (or
+    /// straight to cold where warm saves too little) and from warm to cold columns; any other
+    /// goes from raw or LZ4 to zstd. A record read in two periods running moves hot. The daemon
+    /// calls it when idle, never on the way of a get or a put, and it moves a bounded number of
+    /// bytes a call.
     pub fn settle(&mut self, effects: &mut Vec<Effect>) -> Settled {
         assert!(self.tiers[0].opened, "a settle of a store that is not open");
         self.forget_owned();
@@ -773,6 +912,20 @@ impl Store {
                 }
                 let Some((content, bytes)) = self.movable(key, loc, row) else { continue };
                 spent += loc.raw;
+                if let Some(columns) = self.columns_of(&bytes) {
+                    match colder_columns(columns.as_ref(), loc, &bytes) {
+                        Ok(Some((form, payload))) => {
+                            self.replace(key, loc, form, 0, content, &payload);
+                            settled.demoted += 1;
+                        }
+                        Ok(None) => lock(&self.flags)[0].set(row, Flag::Tried),
+                        Err(why) => {
+                            self.problems.push(format!("{:x} is not moved colder: {why}", key.0));
+                            lock(&self.flags)[0].set(row, Flag::Tried);
+                        }
+                    }
+                    continue;
+                }
                 let long = bytes.len() >= cold::LONG_FROM;
                 let stored = if long { cold::compress_long(&bytes) } else { batch.compress(&bytes) };
                 let stored = match stored {
@@ -818,7 +971,8 @@ impl Store {
             for (header, payload) in live {
                 let loc = self.append_record(header, &payload);
                 self.seq += 1;
-                self.tiers[0].note(header.key, loc, self.seq);
+                let row = self.tiers[0].note(header.key, loc, self.seq);
+                lock(&self.flags)[0].set(row, Flag::New);
             }
             self.tiers[0].packs[at].retiring = true;
             settled.retired += 1;
@@ -845,12 +999,19 @@ impl Store {
             let read = flags.get(row, Flag::Read);
             let before = flags.get(row, Flag::ReadBefore);
             match loc.form {
-                Form::Raw | Form::Lz4
-                    if self.periods >= 1 && !read && !before && !flags.get(row, Flag::Tried) =>
+                Form::Raw | Form::Lz4 | Form::Warm
+                    if self.periods >= 2
+                        && !read
+                        && !before
+                        && !flags.get(row, Flag::New)
+                        && !flags.get(row, Flag::NewBefore)
+                        && !flags.get(row, Flag::Tried) =>
                 {
                     demote.push((key, loc, row));
                 }
-                Form::Zstd if read && before => promote.push((key, loc, row)),
+                Form::Zstd | Form::Warm | Form::ColdColumns if read && before => {
+                    promote.push((key, loc, row));
+                }
                 _ => {}
             }
         }
@@ -1205,7 +1366,7 @@ impl Store {
 
     fn read(&self, tier: usize, key: &Key, loc: Loc, row: Row) -> Result<Entry<'_>, Corrupt> {
         let id = location(tier, loc.pack, loc.offset);
-        if matches!(loc.form, Form::Zstd | Form::Chunked | Form::Lz4) {
+        if matches!(loc.form, Form::Zstd | Form::Chunked | Form::Lz4 | Form::Warm | Form::ColdColumns) {
             if let Some((content, bytes)) = self.cached(id) {
                 self.was_read(tier, row);
                 return Ok(Entry { key: *key, kind: loc.kind, content, bytes });
@@ -1225,16 +1386,8 @@ impl Store {
         }
     }
 
-    /// The bytes of the record at `loc`, checked against its content hash: once a record for
-    /// reads and moves, every time for [`Use::Check`].
-    fn value<'a>(
-        &'a self,
-        tier_at: usize,
-        key: &Key,
-        loc: Loc,
-        row: Row,
-        why: Use,
-    ) -> Result<(RecordHeader, Cow<'a, [u8]>), Corrupt> {
+    /// The header of the record at `loc`, checked to be of `key`, and its payload.
+    fn record(&self, tier_at: usize, key: &Key, loc: Loc) -> Result<(RecordHeader, &[u8]), Corrupt> {
         let tier = &self.tiers[tier_at];
         let Some(pack) = tier.packs.get(loc.pack as usize) else {
             return Err(Corrupt {
@@ -1257,7 +1410,33 @@ impl Store {
         let payload = pack
             .bytes(at + RECORD_HEADER, header.stored)
             .ok_or_else(|| corrupt(format!("the record at {at} runs past the pack")))?;
+        Ok((header, payload))
+    }
+
+    /// The bytes of the record at `loc`, checked against its content hash: once a record for
+    /// reads and moves, every time for [`Use::Check`].
+    fn value<'a>(
+        &'a self,
+        tier_at: usize,
+        key: &Key,
+        loc: Loc,
+        row: Row,
+        why: Use,
+    ) -> Result<(RecordHeader, Cow<'a, [u8]>), Corrupt> {
+        let (header, payload) = self.record(tier_at, key, loc)?;
+        let tier = &self.tiers[tier_at];
+        let pack = &tier.packs[loc.pack as usize];
+        let corrupt = |what: String| Corrupt { key: *key, pack: pack.file.clone(), what };
+        let at = loc.offset;
         let bytes: Cow<'a, [u8]> = match header.form {
+            Form::Warm | Form::ColdColumns => {
+                let (columns, encoded) = self.columns_in(payload).map_err(corrupt)?;
+                let hot = match header.form {
+                    Form::Warm => columns.hot_from_warm(encoded),
+                    _ => columns.hot_from_cold(encoded),
+                };
+                Cow::Owned(hot.map_err(|why| corrupt(format!("its columns do not decode: {why}")))?)
+            }
             Form::Raw => Cow::Borrowed(payload),
             Form::Zstd if header.dictionary == NO_DICTIONARY => {
                 Cow::Owned(cold::decompress_long(payload, header.raw).map_err(corrupt)?)
@@ -1457,7 +1636,8 @@ impl Store {
         };
         let loc = self.append_record(header, payload);
         self.seq += 1;
-        self.tiers[0].note(key, loc, self.seq);
+        let row = self.tiers[0].note(key, loc, self.seq);
+        lock(&self.flags)[0].set(row, Flag::New);
         loc
     }
 

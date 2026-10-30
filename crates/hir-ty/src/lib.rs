@@ -60,11 +60,10 @@ use hir_def::{
     type_ref::{Rawness, TypeRefId},
 };
 use hir_expand::name::Name;
-use indexmap::{IndexMap, map::Entry};
 use macros::GenericTypeVisitable;
 use mir::{MirEvalError, VTableMap};
 use rustc_abi::ExternAbi;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     BoundVarIndexKind, TypeSuperVisitable, TypeVisitableExt,
     inherent::{IntoKind, Ty as _},
@@ -384,7 +383,7 @@ impl<'db> MemoryMap<'db> {
         &self,
         mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError<'db>>,
     ) -> Result<FxHashMap<usize, usize>, MirEvalError<'db>> {
-        let mut transform = |(addr, val): (&usize, &[u8])| -> Result<_, MirEvalError<'db>> {
+        let mut transform = |(addr, val): (&usize, &[u8])| {
             let addr = *addr;
             let align = match self.align_at(addr) {
                 Some(align) => align,
@@ -481,9 +480,9 @@ mod memory_map_tests {
     #[test]
     fn memory_at_finds_the_piece_at_an_address_or_the_lowest_holding_it() {
         let mut map = ComplexMemoryMap::default();
-        map.insert(104, Box::new([7; 4]));
-        map.insert(100, Box::new([6; 16]));
-        map.insert(200, Box::new([]));
+        map.insert(104, Box::new([7u8; 4]));
+        map.insert(100, Box::new([6u8; 16]));
+        map.insert(200, Box::new([0u8; 0]));
         let map = MemoryMap::Complex(Box::new(map));
         assert_eq!(map.memory_at(104), Some((104, &[7; 4][..])));
         assert_eq!(map.memory_at(106), Some((100, &[6; 16][..])));
@@ -499,14 +498,14 @@ mod memory_map_tests {
     #[test]
     fn alignments_are_kept_by_address_and_overwritten() {
         let mut map = ComplexMemoryMap::default();
-        map.insert(64, Box::new([0; 8]));
+        map.insert(64, Box::new([0u8; 8]));
         map.note_align(64, 4);
         map.note_align(8, 2);
         map.note_align(64, 8);
         let mut other = ComplexMemoryMap::default();
         other.note_align(8, 2);
         other.note_align(64, 8);
-        other.insert(64, Box::new([0; 8]));
+        other.insert(64, Box::new([0u8; 8]));
         let (map, other) = (MemoryMap::Complex(Box::new(map)), MemoryMap::Complex(Box::new(other)));
         assert_eq!(map.align_at(64), Some(8));
         assert_eq!(map.align_at(8), Some(2));
@@ -531,8 +530,8 @@ mod memory_map_tests {
         let with_static = MemoryMap::Complex(Box::new(with_static));
         assert_ne!(empty, with_static);
         assert_ne!(hash(&empty), hash(&with_static));
-        assert_ne!(hash(&MemoryMap::Empty), hash(&MemoryMap::simple(Box::new([]))));
-        assert_ne!(hash(&MemoryMap::simple(Box::new([1]))), hash(&MemoryMap::simple(Box::new([2]))));
+        assert_ne!(hash(&MemoryMap::Empty), hash(&MemoryMap::simple(Box::new([0u8; 0]))));
+        assert_ne!(hash(&MemoryMap::simple(Box::new([1u8]))), hash(&MemoryMap::simple(Box::new([2u8]))));
     }
 }
 

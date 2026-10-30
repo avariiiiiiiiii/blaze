@@ -78,7 +78,7 @@ impl BestOf {
             Response::Diagnostic(diagnostic) => match diagnostic.level {
                 Level::Error => candidate.errors += 1,
                 Level::Warning => candidate.warnings += 1,
-                Level::Note | Level::Help => {}
+                Level::Note | Level::Help | Level::FailureNote => {}
             },
             Response::TestResult(result) => match result.outcome {
                 TestOutcome::Passed => candidate.passed += 1,

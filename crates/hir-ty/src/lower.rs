@@ -1800,43 +1800,44 @@ impl<T: std::fmt::Debug> std::fmt::Debug for TyLoweringResult<'_, T> {
 }
 
 impl<'db, T> TyLoweringResult<'db, T> {
-    fn new(
+    pub(crate) fn new(
         value: T,
         mut diagnostics: ThinVec<TyLoweringDiagnostic>,
         mut defined_anon_consts: ThinVec<AnonConstId<'db>>,
     ) -> Self {
-        let info = if diagnostics.is_empty() && defined_anon_consts.is_empty() {
-            None
-        } else {
-            diagnostics.shrink_to_fit();
-            defined_anon_consts.shrink_to_fit();
-            Some(Box::new(TyLoweringResultInfo { diagnostics, anon_consts: defined_anon_consts }))
-        };
-        Self { value, info }
+        diagnostics.shrink_to_fit();
+        defined_anon_consts.shrink_to_fit();
+        Self { value, diagnostics, anon_consts: defined_anon_consts }
     }
 
     fn from_ctx(value: T, ctx: TyLoweringContext<'db, '_>) -> Self {
         Self::new(value, ctx.diagnostics, ctx.defined_anon_consts)
     }
 
-    fn empty(value: T) -> Self {
-        Self { value, info: None }
+    pub(crate) fn empty(value: T) -> Self {
+        Self { value, diagnostics: ThinVec::new(), anon_consts: ThinVec::new() }
+    }
+
+    /// The value with what lowering it found, taken apart.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (T, ThinVec<TyLoweringDiagnostic>, ThinVec<AnonConstId<'db>>) {
+        (self.value, self.diagnostics, self.anon_consts)
     }
 
     #[inline]
     pub fn diagnostics(&self) -> &[TyLoweringDiagnostic] {
-        match &self.info {
-            Some(info) => &info.diagnostics,
-            None => &[],
-        }
+        &self.diagnostics
     }
 
     #[inline]
     pub fn defined_anon_consts(&self) -> &[AnonConstId<'db>] {
-        match &self.info {
-            Some(info) => &info.anon_consts,
-            None => &[],
-        }
+        &self.anon_consts
+    }
+
+    #[inline]
+    pub fn as_lowered(&'db self) -> Lowered<'db, T> {
+        Lowered { value: &self.value, diagnostics: &self.diagnostics, anon_consts: &self.anon_consts }
     }
 }
 
@@ -1866,15 +1867,36 @@ pub(crate) fn impl_trait_query<'db>(
     db: &'db dyn HirDatabase,
     impl_id: ImplId,
 ) -> Option<EarlyBinder<'db, TraitRef<'db>>> {
-    impl_trait_with_diagnostics(db, impl_id)
-        .as_ref()
-        .map(|it| it.value.get(DbInterner::new_no_crate(db)))
+    impl_trait_with_diagnostics(db, impl_id).map(|it| it.value.get(DbInterner::new_no_crate(db)))
 }
 
-#[salsa::tracked(returns(ref), cycle_result = impl_trait_with_diagnostics_cycle_result)]
+/// The trait an impl implements, `None` for an inherent impl. A dependency crate's module-level
+/// impls are read from its batch (`lower::batch::batched_crate`).
 pub(crate) fn impl_trait_with_diagnostics<'db>(
     db: &'db dyn HirDatabase,
     impl_id: ImplId,
+) -> Option<Lowered<'db, StoredEarlyBinder<StoredTraitRef>>> {
+    if let Some(krate) = batch::batched_crate(db, impl_id.module(db)) {
+        return batch::CrateImplTraits::of(db, krate).get(impl_id).unwrap_or_else(|| {
+            panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
+        });
+    }
+    impl_trait_of_impl(db, impl_id).as_ref().map(TyLoweringResult::as_lowered)
+}
+
+#[salsa::tracked(returns(ref), cycle_result = impl_trait_with_diagnostics_cycle_result)]
+fn impl_trait_of_impl<'db>(
+    db: &'db dyn HirDatabase,
+    impl_id: ImplId,
+) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
+    lower_impl_trait(db, impl_id, db.impl_self_ty(impl_id).skip_binder())
+}
+
+/// Lowers the trait `impl_id` implements, for the self type `self_ty`, which is the impl's.
+pub(crate) fn lower_impl_trait<'db>(
+    db: &'db dyn HirDatabase,
+    impl_id: ImplId,
+    self_ty: Ty<'db>,
 ) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
     let impl_data = ImplSignature::of(db, impl_id);
     let resolver = impl_id.resolver(db);
@@ -1890,7 +1912,6 @@ pub(crate) fn impl_trait_with_diagnostics<'db>(
         LifetimeLoweringMode::Bound,
     );
     ctx.impl_header = true;
-    let self_ty = db.impl_self_ty(impl_id).skip_binder();
     let target_trait = impl_data.target_trait?;
     let trait_ref = ctx.lower_trait_ref(target_trait, self_ty)?;
     Some(TyLoweringResult::from_ctx(StoredEarlyBinder::bind(StoredTraitRef::new(trait_ref)), ctx))
@@ -2201,8 +2222,29 @@ pub(crate) fn impl_self_ty_query<'db>(
     impl_self_ty_with_diagnostics(db, impl_id).value.get()
 }
 
-#[salsa::tracked(returns(ref), cycle_result = impl_self_ty_with_diagnostics_cycle_result)]
+/// The self type of an impl. A dependency crate's module-level impls are read from its batch
+/// (`lower::batch::batched_crate`).
 pub(crate) fn impl_self_ty_with_diagnostics<'db>(
+    db: &'db dyn HirDatabase,
+    impl_id: ImplId,
+) -> Lowered<'db, StoredEarlyBinder<StoredTy>> {
+    if let Some(krate) = batch::batched_crate(db, impl_id.module(db)) {
+        return batch::CrateImplSelfTys::of(db, krate).get(impl_id).unwrap_or_else(|| {
+            panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
+        });
+    }
+    impl_self_ty_of_impl(db, impl_id).as_lowered()
+}
+
+#[salsa::tracked(returns(ref), cycle_result = impl_self_ty_with_diagnostics_cycle_result)]
+fn impl_self_ty_of_impl<'db>(
+    db: &'db dyn HirDatabase,
+    impl_id: ImplId,
+) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
+    lower_impl_self_ty(db, impl_id)
+}
+
+pub(crate) fn lower_impl_self_ty<'db>(
     db: &'db dyn HirDatabase,
     impl_id: ImplId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
@@ -2239,20 +2281,19 @@ pub(crate) fn const_param_ty<'db>(db: &'db dyn HirDatabase, def: ConstParamId) -
     const_param_types(db, def.parent()).get(def.local_id())
 }
 
-/// Wrapper struct around `ArenaMap` which implements [`SalsaValue`].
-///
-/// Required to make the `SalsaValue` derive for [`TyLoweringResult`] work.
-#[derive(Debug, Default, PartialEq, Eq, SalsaValue)]
+/// The types of an item's const parameters, by the parameter's `LocalTypeOrConstParamId`: one
+/// column, `None` at the type parameters' places.
+#[derive(Debug, Default, PartialEq, Eq, Hash, SalsaValue)]
 pub struct ConstParamTypes {
-    map: ArenaMap<LocalTypeOrConstParamId, StoredTy>,
+    tys: ThinVec<Option<StoredTy>>,
 }
 
 impl ConstParamTypes {
     #[inline]
     pub fn get(&self, local_id: LocalTypeOrConstParamId) -> Ty<'_> {
-        match self.map.get(local_id) {
-            Some(ty) => ty.as_ref(),
-            None => default_types().types.error,
+        match self.tys.get(local_id.into_raw().into_u32() as usize) {
+            Some(Some(ty)) => ty.as_ref(),
+            _ => default_types().types.error,
         }
     }
 }
@@ -2266,7 +2307,7 @@ pub(crate) fn const_param_types_with_diagnostics<'db>(
     db: &'db dyn HirDatabase,
     def: GenericDefId,
 ) -> TyLoweringResult<'db, ConstParamTypes> {
-    let mut result = ArenaMap::new();
+    let mut result = ThinVec::new();
     let (data, store) = GenericParams::with_store(db, def);
     let resolver = def.resolver(db);
     let generics = OnceCell::new();
@@ -2283,11 +2324,15 @@ pub(crate) fn const_param_types_with_diagnostics<'db>(
     ctx.forbid_params_after(0, ForbidParamsAfterReason::ConstParamTy);
     for (local_id, param_data) in data.iter_type_or_consts() {
         if let TypeOrConstParamData::ConstParamData(param_data) = param_data {
-            result.insert(local_id, ctx.lower_ty(param_data.ty).store());
+            let index = local_id.into_raw().into_u32() as usize;
+            if result.len() <= index {
+                result.resize(index + 1, None);
+            }
+            result[index] = Some(ctx.lower_ty(param_data.ty).store());
         }
     }
     result.shrink_to_fit();
-    TyLoweringResult::from_ctx(ConstParamTypes { map: result }, ctx)
+    TyLoweringResult::from_ctx(ConstParamTypes { tys: result }, ctx)
 }
 
 fn const_param_types_with_diagnostics_cycle_result<'db>(
@@ -2298,31 +2343,75 @@ fn const_param_types_with_diagnostics_cycle_result<'db>(
     TyLoweringResult::empty(ConstParamTypes::default())
 }
 
-/// Wrapper struct around `ArenaMap` which implements [`SalsaValue`].
-///
-/// Required to make the `SalsaValue` derive for [`TyLoweringResult`] work.
-#[derive(Default, PartialEq, Eq, SalsaValue)]
-pub struct FieldTypes {
-    map: ArenaMap<LocalFieldId, FieldType>,
+/// The types of a variant's fields, one per field in the order of its `LocalFieldId`s (every
+/// field has one): a slice of a per-item query's value, or a range of a crate's column of field
+/// types (`lower::batch`).
+#[derive(Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct FieldTypes([FieldType]);
+
+impl FieldTypes {
+    #[inline]
+    pub(crate) fn from_slice(fields: &[FieldType]) -> &FieldTypes {
+        // SAFETY: `FieldTypes` is `repr(transparent)` over `[FieldType]`.
+        unsafe { &*(fields as *const [FieldType] as *const FieldTypes) }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[FieldType] {
+        &self.0
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn get(&self, field: LocalFieldId) -> Option<&FieldType> {
+        self.0.get(field.into_raw().into_u32() as usize)
+    }
+
+    #[inline]
+    pub fn iter(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (LocalFieldId, &FieldType)> + ExactSizeIterator + '_ {
+        self.0.iter().enumerate().map(|(index, field)| {
+            (LocalFieldId::from_raw(la_arena::RawIdx::from_u32(index as u32)), field)
+        })
+    }
+
+    #[inline]
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &FieldType> + ExactSizeIterator + '_ {
+        self.0.iter()
+    }
 }
 
-impl Deref for FieldTypes {
-    type Target = ArenaMap<LocalFieldId, FieldType>;
+impl std::ops::Index<LocalFieldId> for FieldTypes {
+    type Output = FieldType;
 
-    fn deref(&self) -> &Self::Target {
-        &self.map
+    #[inline]
+    fn index(&self, field: LocalFieldId) -> &FieldType {
+        &self.0[field.into_raw().into_u32() as usize]
     }
 }
 
 pub(crate) fn field_types_query(db: &dyn HirDatabase, variant_id: VariantId) -> &FieldTypes {
-    &field_types_with_diagnostics(db, variant_id).value
+    field_types_with_diagnostics(db, variant_id).value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FieldType {
-    ty: StoredEarlyBinder<StoredTy>,
-    default: Option<StoredEarlyBinder<StoredConst>>,
+    pub(crate) ty: StoredEarlyBinder<StoredTy>,
+    pub(crate) default: Option<StoredEarlyBinder<StoredConst>>,
 }
+
+const _: () = assert!(size_of::<FieldType>() <= 16);
 
 impl FieldType {
     #[inline]
@@ -2336,16 +2425,43 @@ impl FieldType {
     }
 }
 
-/// Build the type of all specific fields of a struct or enum variant.
-#[salsa::tracked(returns(ref))]
+/// The types of the fields of a struct, union or enum variant. A dependency crate's module-level
+/// variants are read from its batch, every other variant from a query of its own
+/// (`lower::batch::batched_crate` says which and why).
 pub(crate) fn field_types_with_diagnostics<'db>(
     db: &'db dyn HirDatabase,
     variant_id: VariantId,
-) -> TyLoweringResult<'db, FieldTypes> {
+) -> Lowered<'db, FieldTypes> {
+    if let Some(krate) = batch::batched_crate(db, variant_id.module(db)) {
+        return batch::CrateFieldTypes::of(db, krate).get(variant_id).unwrap_or_else(|| {
+            panic!("{variant_id:?} is a module-level variant of {krate:?} but not in its batch")
+        });
+    }
+    let result = field_types_of_variant(db, variant_id);
+    Lowered::new(
+        FieldTypes::from_slice(&result.value),
+        result.diagnostics(),
+        result.defined_anon_consts(),
+    )
+}
+
+#[salsa::tracked(returns(ref))]
+fn field_types_of_variant<'db>(
+    db: &'db dyn HirDatabase,
+    variant_id: VariantId,
+) -> TyLoweringResult<'db, ThinVec<FieldType>> {
+    lower_field_types(db, variant_id)
+}
+
+/// Lowers the types of the fields of `variant_id`, in the order of their `LocalFieldId`s.
+pub(crate) fn lower_field_types<'db>(
+    db: &'db dyn HirDatabase,
+    variant_id: VariantId,
+) -> TyLoweringResult<'db, ThinVec<FieldType>> {
     let var_data = variant_id.fields(db);
     let fields = var_data.fields();
     if fields.is_empty() {
-        return TyLoweringResult::empty(FieldTypes::default());
+        return TyLoweringResult::empty(ThinVec::new());
     }
 
     let (resolver, generic_def): (_, GenericDefId) = match variant_id {
@@ -2354,7 +2470,7 @@ pub(crate) fn field_types_with_diagnostics<'db>(
         VariantId::EnumVariantId(it) => (it.resolver(db), it.lookup(db).parent.into()),
     };
     let generics = OnceCell::new();
-    let mut res = ArenaMap::default();
+    let mut res = ThinVec::with_capacity(fields.len());
     let mut ctx = TyLoweringContext::new(
         db,
         &resolver,
@@ -2366,17 +2482,15 @@ pub(crate) fn field_types_with_diagnostics<'db>(
         LifetimeLoweringMode::Bound,
     );
     for (field_id, field_data) in var_data.fields().iter() {
+        debug_assert_eq!(field_id.into_raw().into_u32() as usize, res.len());
         let ty = ctx.lower_ty(field_data.type_ref);
         let default = field_data.default_value.map(|default| ctx.lower_const(default, ty, true));
-        res.insert(
-            field_id,
-            FieldType {
-                ty: StoredEarlyBinder::bind(ty.store()),
-                default: default.map(|default| StoredEarlyBinder::bind(default.store())),
-            },
-        );
+        res.push(FieldType {
+            ty: StoredEarlyBinder::bind(ty.store()),
+            default: default.map(|default| StoredEarlyBinder::bind(default.store())),
+        });
     }
-    TyLoweringResult::from_ctx(FieldTypes { map: res }, ctx)
+    TyLoweringResult::from_ctx(res, ctx)
 }
 
 #[derive(Debug, PartialEq, Eq, Default)]
@@ -2984,26 +3098,43 @@ pub struct GenericPredicates {
     //    here, they are in 3.
     // 4. The explicit, self-only trait predicate for the child,
     // 5. The bounds of the associated types of the child.
-    predicates: StoredEarlyBinder<StoredClauses>,
+    pub(crate) predicates: StoredEarlyBinder<StoredClauses>,
     // Keep this ordered according to the above.
-    has_trait_implied_predicate: bool,
-    parent_assoc_ty_bounds_start: u32,
-    own_predicates_start: u32,
-    own_assoc_ty_bounds_start: u32,
+    pub(crate) has_trait_implied_predicate: bool,
+    pub(crate) parent_assoc_ty_bounds_start: u32,
+    pub(crate) own_predicates_start: u32,
+    pub(crate) own_assoc_ty_bounds_start: u32,
 }
 
-#[salsa::tracked]
-impl<'db> GenericPredicates {
+const _: () = assert!(size_of::<GenericPredicates>() <= 24);
+
+impl GenericPredicates {
     /// Resolve the where clause(s) of an item with generics.
     ///
-    /// Diagnostics are computed only for this item's predicates, not for parents.
-    #[salsa::tracked(returns(ref), cycle_result=generic_predicates_cycle_result)]
-    pub fn query_with_diagnostics(
+    /// Diagnostics are computed only for this item's predicates, not for parents. The impls of a
+    /// dependency crate's modules are read from its batch (`lower::batch::batched_crate`), which
+    /// coherence and method resolution read whole.
+    pub fn query_with_diagnostics<'db>(
         db: &'db dyn HirDatabase,
         def: GenericDefId,
-    ) -> TyLoweringResult<'db, GenericPredicates> {
-        generic_predicates(db, def)
+    ) -> Lowered<'db, GenericPredicates> {
+        if let GenericDefId::ImplId(impl_id) = def
+            && let Some(krate) = batch::batched_crate(db, impl_id.module(db))
+        {
+            return batch::CrateImplPredicates::of(db, krate).get(impl_id).unwrap_or_else(|| {
+                panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
+            });
+        }
+        generic_predicates_of(db, def).as_lowered()
     }
+}
+
+#[salsa::tracked(returns(ref), cycle_result = generic_predicates_cycle_result)]
+fn generic_predicates_of<'db>(
+    db: &'db dyn HirDatabase,
+    def: GenericDefId,
+) -> TyLoweringResult<'db, GenericPredicates> {
+    generic_predicates(db, def)
 }
 
 /// A cycle can occur from malformed code.
@@ -3046,7 +3177,7 @@ impl GenericPredicates {
 
     #[inline]
     pub fn query(db: &dyn HirDatabase, def: GenericDefId) -> &GenericPredicates {
-        &Self::query_with_diagnostics(db, def).value
+        Self::query_with_diagnostics(db, def).value
     }
 
     #[inline]
@@ -3223,7 +3354,7 @@ pub(crate) fn const_conditions<'db>(
 /// Resolve the where clause(s) of an item with generics,
 /// with a given filter
 #[tracing::instrument(skip(db), ret)]
-fn generic_predicates<'db>(
+pub(crate) fn generic_predicates<'db>(
     db: &'db dyn HirDatabase,
     def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
@@ -3250,7 +3381,7 @@ fn generic_predicates<'db>(
     let mut own_assoc_ty_bounds = Vec::new();
     let own_implicit_trait_predicate = implicit_trait_predicate(interner, def);
     let parent = if let Some(parent) = generics.parent() {
-        &GenericPredicates::query_with_diagnostics(db, parent.def()).value
+        GenericPredicates::query_with_diagnostics(db, parent.def()).value
     } else {
         GenericPredicates::empty()
     };

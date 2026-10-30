@@ -17,6 +17,8 @@ Every key in the plan (item keys, facts, paths, instance keys) already derives s
 lane's code in `crates/blaze-query/` is written against this bound: it does not build without
 it.
 
+> applied: by db (see 4).
+
 ## 2. vfs (or the coordinator's daemon glue): implement `blaze_query::Tree` over the VFS
 
 `blaze_query::Tree` (new, `crates/blaze-query/src/tree.rs`) is how the database reads a view's
@@ -24,6 +26,8 @@ files: `file(root, path) -> Option<(ContentId, Arc<[u8]>)>` and
 `list(root, path) -> Option<Vec<(String, bool)>>`, both pure functions of a root, called from
 many worker threads. The VFS's nodes are content-addressed and immutable, so a handle that
 shares them (not `&mut Vfs`) can answer both. Wire it in `Database::new(Config { tree, .. })`.
+
+> applied: `impl Tree for blaze_vfs::Reader` is in `crates/blaze-query/src/tree.rs`; wiring it into the daemon's `Database::new` goes with 3.
 
 ## 3. Coordinator, daemon wiring
 
@@ -37,6 +41,8 @@ shares them (not `&mut Vfs`) can answer both. Wire it in `Database::new(Config {
 - Call `collect(kept, effects)` between requests with the roots to keep (the last build of each
   head), which also moves cold values to disk.
 
+> forwarded to cargo: the daemon (`blaze serve`, `crates/blaze-cargo/`) is lane cargo's (cargo's request 4).
+
 ---
 Routed or applied by the coordinator, 16:54.
 
@@ -47,12 +53,16 @@ request 1 itself: `Query::Key: Clone + Send + Sync + Serialize + DeserializeOwne
 crate outside blaze-query implements `Query` yet; `blaze-units`' planned queries (`Plan` with key
 `()`, `StdUnits` with `StdKey`) must derive serde on their keys.
 
+> applied: by db.
+
 ## 5. blaze-query: `Cancelled` is the plane's, and its single flight is the plane's (db, 17:40)
 
 `blaze_query::Cancelled` is now `pub use blaze_graph::Cancelled` (same unit struct, same name), and
 the database's single flight is `blaze_graph::pump::Flights`, so a query's wait pumps and is in
 the plane's one wait graph (#1301). Callers that wrote `blaze_query::Cancelled` are unchanged
 (`blaze-units`, `blaze-usercode`); none imports both names. Nothing to apply.
+
+> applied: note only.
 
 ## 6. Daemon (coordinator): salsa's task depth and `run_all`
 
@@ -67,8 +77,13 @@ waiting query on the same thread must start with an empty stack, or its reads be
 query below it; and if it asks a key that query holds it must be cancelled and reposted, not taken
 for a query cycle. Salsa can't depend on blaze-graph, so the daemon hands it the depth.
 
+> applied: `RootDatabase::run_all` in `crates/ide-db/src/lib.rs` runs the batch in one `Pool::scope` on the pool given by `RootDatabase::set_pool` (see `v2/requests/db-expand.md`); it needs `salsa::Storage` to be `Sync` to compile.
+> forwarded to cargo: `salsa::set_task_depth(blaze_graph::pump::depth)` at the daemon's start and `RootDatabase::set_pool` with the daemon's pool are the daemon's (`set_task_depth` is not in `vendor/salsa` yet: db-salsa's).
+
 ## 7. Docs (coordinator)
 
 `docs/v2-db.md` moved to `docs/v2/plan/lanes/db/query-database.md` (lane notes go in the lane's
 folder); the one link to it (`crates/blaze-query/src/lib.rs`) is updated. Index it wherever
 `python3 tools/docs.py check` wants lane notes listed.
+
+> forwarded to coordinator: indexing lane notes is `docs/v2/`'s, not among the paths `requests` applies.

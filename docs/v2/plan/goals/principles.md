@@ -19,6 +19,21 @@ semantics, change it. Any dependency v2 needs to change is in the workspace and 
 place: salsa (`vendor/salsa`), cranelift, llvm-sys, `rustc_type_ir` and the trait solver are
 already there; anything else is vendored the moment it's in the way.
 
+**Fast in every line, not just in the design.** Every piece of v2 is written as the fastest
+code that keeps Rust's semantics. That means arenas, flat columns and no lock on a read, the
+way [data.md](../design/data.md) and [concurrency.md](../design/concurrency.md) say. The
+checklist every agent writes to is in
+[Fast code, line by line](#fast-code-line-by-line) below. Code that is correct but slow isn't
+finished.
+
+**State of the art in every part.** Each component matches or beats the fastest known way to do
+its job, and its lane names that benchmark in its notes. For example: the linker against mold
+and wild, hashing against BLAKE3's SIMD paths, the store against content-addressed stores with
+io_uring, interners against the best lock-free tables, parsing against simdjson-style
+branch-free lexing, the scheduler against work-stealing runtimes, and incremental invalidation
+against Unison and rustc's red-green graph, finer than both. Where we don't beat it, the notes
+say why and what it would take.
+
 **Deterministic**: the same inputs give the same bytes, whatever the scheduling, the core count
 or the machine. The invalidation oracle (section 11) depends on it.
 
@@ -35,3 +50,39 @@ all at once, in an ix VM.
 **Finished code only.** Every lane writes its part end to end: every body, wired into the path a
 real build takes, with no `unimplemented!`, `todo!`, stub or deferred piece. A lane isn't done
 while any remain in its paths. v2 lands complete or not at all.
+
+## Fast code, line by line
+
+- **Memory**
+  - **Arenas, not the heap.** A task allocates from its own bump arena, freed in one go when the
+    task ends. Long-lived data goes in typed arenas indexed by `u32` IDs. Nothing on a hot path
+    calls the global allocator per node, per item or per edge, and a cache hit allocates
+    nothing.
+  - **IDs, not pointers.** Things refer to each other by `u32` index into a column. No `Box`,
+    `Rc` or `Arc` per node and no pointer-linked trees. `Arc` is for a few long-lived roots;
+    never clone one in a loop.
+  - **Columns, not structs of everything** (SoA, [data.md](../design/data.md)). Hot fields sit
+    together and cold ones go to a side table. Small types carry a `const` size assertion:
+    tag plus `u32` data, lists as CSR ranges, sets as bitsets.
+  - **Interned once.** Names, paths and types are interned to IDs on the way in. After that,
+    comparing or hashing one compares a `u32`, never a string.
+- **Inner loops**
+  - **No hashing twice, and the cheapest hash that fits.** Keys that are already content
+    hashes index directly. Elsewhere use `FxHash` or a perfect index; SipHash is for untrusted
+    input only. Use the entry API, never a lookup followed by an insert.
+  - **No `dyn` and no `String` in inner loops.** Dispatch on a `u8` tag with a `match`, or batch
+    by kind. Formatting and `String` building happen only at the edge (diagnostics, logs, the
+    API).
+  - **Preallocate.** `Vec::with_capacity` from a known count, `SmallVec` for the usual tiny
+    case, and buffers reused across iterations instead of rebuilt.
+- **I/O and the machine**
+  - **Zero-copy.** Read mapped bytes in place: no deserialize-then-copy, no `Vec<u8>` per read,
+    no `to_vec()` or `clone()` to satisfy a borrow.
+  - **Batched I/O.** Many operations per syscall (io_uring, kqueue). No per-file `stat` and no
+    blocking call on a worker thread.
+  - **No lock on a read** and no shared cache line written on one
+    ([concurrency.md](../design/concurrency.md)).
+  - **Branch-light and SIMD where it pays**, chosen at run time, bit-identical across paths
+    ([hardware.md](../design/hardware.md)).
+- **Every hot structure states its cost**: a comment or a `const` assertion giving its size
+  per element and its lookup cost. `proof`'s budgets hold each lane to them.

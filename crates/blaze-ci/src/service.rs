@@ -826,7 +826,7 @@ impl Report {
                     }
                 }
                 Level::Warning => self.warnings += 1,
-                Level::Note | Level::Help => {}
+                Level::Note | Level::Help | Level::FailureNote => {}
             },
             Response::TestResult(test) => match test.outcome {
                 TestOutcome::Passed => self.passed += 1,
@@ -935,6 +935,7 @@ fn level_name(level: Level) -> &'static str {
         Level::Warning => "warning",
         Level::Note => "note",
         Level::Help => "help",
+        Level::FailureNote => "failure-note",
     }
 }
 

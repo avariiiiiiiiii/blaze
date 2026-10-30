@@ -9,6 +9,9 @@ use blaze_codegen::{
     summary::{Imports, Summary},
     template::Refs,
 };
+use blaze_format::SpanRef;
+use blaze_ids::ContentId;
+use blaze_items::ItemKey;
 use cranelift_codegen::{ir, isa::TargetIsa};
 use hir_def::{
     DefWithBodyId, HasModule, attrs::AttrFlags, expr_store::Body, signatures::FunctionSignature,
@@ -23,7 +26,7 @@ use super::{
     refs, shape, side,
 };
 use crate::{
-    Detach, Instance, InstanceDef, Pending, Produced, compile_as,
+    Detach, Instance, InstanceDef, Produced, compile_as,
     debuginfo::SlotPlaces,
     fragment::{self, Hint, Requests},
     home::Homes,
@@ -346,12 +349,55 @@ fn colocate(func: &mut ir::Function, places: &Places, refs: &[Ref]) {
 /// Compiles a prepared function with Cranelift, against `refs`.
 pub(crate) fn emit_cranelift(
     unit: &Unit,
-    function: Box<Function>,
+    mut function: Box<Function>,
     refs: &Refs,
 ) -> Result<Emitted, CodegenError> {
+    if function.places.refs as usize != refs.len() {
+        return Err(failed(
+            unit,
+            format!(
+                "{} references given for a function prepared against {}",
+                refs.len(),
+                function.places.refs
+            ),
+        ));
+    }
+    let Function { code, places, spans, variables, .. } = &mut *function;
+    match code {
+        Built::Ir(pending) => {
+            let func = std::mem::replace(&mut pending.func, ir::Function::new());
+            let code = compiled(unit, func, &pending.named)?;
+            told(unit, places, &pending.wants.requests, &code, refs, spans, variables)
+        }
+        Built::Assembled(code, requests) => {
+            told(unit, places, requests, code, refs, spans, variables)
+        }
+    }
+}
+
+/// What `emit` gives of a function's code, Cranelift's or LLVM's: its relocations and data
+/// through the function's places at `refs`, its lines and the side table of its named locals.
+pub(crate) fn emitted(
+    unit: &Unit,
+    function: &Function,
+    code: &fragment::Code,
+    refs: &Refs,
+) -> Result<Emitted, CodegenError> {
+    let requests = function.requests();
+    told(unit, &function.places, requests, code, refs, &function.spans, &function.variables)
+}
+
+fn told(
+    unit: &Unit,
+    places: &Places,
+    requests: &Requests,
+    code: &fragment::Code,
+    refs: &Refs,
+    spans: &[SpanRef],
+    variables: &[side::Variable],
+) -> Result<Emitted, CodegenError> {
     let fail = |what: String| failed(unit, what);
-    let Function { code, places, spans, variables } = *function;
-    if places.refs as usize != refs.len() {
+    if refs.len() < places.refs as usize {
         return Err(fail(format!(
             "{} references given for a function prepared against {}",
             refs.len(),
@@ -359,34 +405,59 @@ pub(crate) fn emit_cranelift(
         )));
     }
     let isa = isa(unit)?;
-    let (code, requests) = match code {
-        Built::Ir(pending) => cranelift(unit, isa, pending)?,
-        Built::Assembled(code, requests) => (code, requests),
-    };
-    let side = side::encode(&variables, &code.slots).map_err(fail)?;
-    let function = resolve(&places, refs, |resolve| {
+    let side = side::encode(variables, &code.slots).map_err(fail)?;
+    let compiled = resolve(places, refs, |resolve| {
         super::convert::function(
             unit.instance.key(),
             unit.arch,
             isa,
-            &code,
-            &requests,
+            code,
+            requests,
             resolve,
-            &spans,
+            spans,
             side.as_ref().map(|it| it.1),
         )
     })
     .map_err(fail)?;
-    Ok(Emitted { function, side: side.map(|it| it.0) })
+    Ok(Emitted { function: compiled, side: side.map(|it| it.0) })
 }
 
-/// Cranelift's code of the IR, with its requests.
-pub(crate) fn cranelift(
+/// Compiles `ir` in place of a prepared function's IR, its names being the function's: a
+/// fold's body, emitted as its first member, or one of its thunks, which names the body
+/// last of `refs` and has none of its member's lines or named locals.
+fn emit_ir(
     unit: &Unit,
-    isa: &dyn TargetIsa,
-    pending: Pending,
-) -> Result<(fragment::Code, Requests), CodegenError> {
-    let Pending { func, wants, named, .. } = pending;
+    function: &Function,
+    ir: ir::Function,
+    refs: &Refs,
+) -> Result<Emitted, CodegenError> {
+    let own = function.places.refs as usize;
+    let thunk = refs.len() == own + 1;
+    if !thunk && refs.len() != own {
+        return Err(failed(
+            unit,
+            format!("{} references given for a fold of a function of {own}", refs.len()),
+        ));
+    }
+    let Built::Ir(pending) = &function.code else {
+        return Err(failed(unit, "a fold of an assembly function"));
+    };
+    if thunk {
+        let code = compiled(unit, ir, &[])?;
+        told(unit, &function.places, function.requests(), &code, refs, &[], &[])
+    } else {
+        let code = compiled(unit, ir, &pending.named)?;
+        emitted(unit, function, &code, refs)
+    }
+}
+
+/// Cranelift's code of the IR, `named` being the stack slots of its named locals.
+fn compiled(
+    unit: &Unit,
+    func: ir::Function,
+    named: &[ir::StackSlot],
+) -> Result<fragment::Code, CodegenError> {
+    let isa = isa(unit)?;
     let mut context = cranelift_codegen::Context::for_function(func);
     let pairs = crate::float_pair::lower(&mut context.func);
     let mut code = crate::emit(&mut context).map_err(|e| failed(unit, e))?;
@@ -396,7 +467,7 @@ pub(crate) fn cranelift(
     if let Some(pairs) = pairs {
         pairs.hold(&context, &mut code).map_err(|e| failed(unit, e))?;
     }
-    Ok((code, wants.requests))
+    Ok(code)
 }
 
 impl Prepare for Backends {
@@ -448,14 +519,16 @@ impl Prepare for Backends {
                 }
                 emit_cranelift(unit, function, refs)
             }
-            Prepared::Llvm(function) => super::release::emit(unit, spec, function, refs, imports),
+            Prepared::Llvm(function) => super::release::emit(unit, spec, *function, refs, imports),
         }
     }
 
-    fn masked(&self, unit: &Unit, prepared: &Prepared) -> Option<Masked> {
+    fn masked(&self, _: &Unit, prepared: &Prepared) -> Option<Masked> {
         match prepared {
-            Prepared::Cranelift(function) => super::fold::masked(unit, function),
-            Prepared::Llvm(_) => None,
+            Prepared::Cranelift(function) if function.foldable => {
+                super::fold::masked(function, &function.refs)
+            }
+            Prepared::Cranelift(_) | Prepared::Llvm(_) => None,
         }
     }
 
@@ -473,7 +546,21 @@ impl Prepare for Backends {
                 }
             }
         }
-        super::fold::merge(group, functions)
+        let members: Vec<(&Unit, &Spec, &Function, &Refs)> = functions
+            .iter()
+            .map(|(unit, spec, function, refs)| (*unit, *spec, &**function, *refs))
+            .collect();
+        let Some(&(first, ..)) = members.first() else {
+            return Err(CodegenError {
+                unit: group.key(),
+                item: ItemKey(ContentId::default()),
+                what: "a fold of no functions".to_owned(),
+            });
+        };
+        let pointer = isa(first)?.pointer_type();
+        super::fold::merge(group, &members, pointer, |unit, _, function, ir, refs| {
+            emit_ir(unit, function, ir, refs)
+        })
     }
 
     fn compile_static(

@@ -266,18 +266,20 @@ mod private {
 
 #[cfg(test)]
 mod tests {
-    use crate::{green::SyntaxKind, GreenNodeBuilder};
+    use std::sync::Arc;
+
+    use crate::{FlatTreeBuilder, SyntaxKind};
 
     use super::*;
 
     fn build_tree(chunks: &[&str]) -> SyntaxNode {
-        let mut builder = GreenNodeBuilder::new();
+        let mut builder = FlatTreeBuilder::new();
         builder.start_node(SyntaxKind(62));
         for &chunk in chunks.iter() {
-            builder.token(SyntaxKind(92), chunk.into())
+            builder.token(SyntaxKind(92), chunk)
         }
         builder.finish_node();
-        SyntaxNode::new_root(builder.finish())
+        SyntaxNode::new_flat_root(Arc::new(builder.finish()))
     }
 
     #[test]

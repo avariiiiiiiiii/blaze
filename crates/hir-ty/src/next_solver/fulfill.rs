@@ -1,6 +1,6 @@
 //! Fulfill loop for next-solver.
 
-use std::ops::ControlFlow;
+use std::{mem, ops::ControlFlow};
 
 use rustc_hash::FxHashSet;
 use rustc_next_trait_solver::{
@@ -16,17 +16,101 @@ use rustc_type_ir::{
 use crate::{
     Span,
     next_solver::{
-        DbInterner, SolverContext, SolverDefId, Ty, TyKind, TypingMode,
+        DbInterner, ParamEnv, Predicate, SolverContext, SolverDefId, Ty, TyKind, TypingMode,
         infer::{
             InferCtxt,
-            traits::{PredicateObligation, PredicateObligations},
+            traits::{Obligation, ObligationCause, PredicateObligation, PredicateObligations},
         },
         inspect::ProofTreeVisitor,
     },
 };
 
-type PendingObligations<'db> =
-    Vec<(PredicateObligation<'db>, Option<GoalStalledOn<DbInterner<'db>>>)>;
+type StalledOn<'db> = Option<GoalStalledOn<DbInterner<'db>>>;
+
+/// Obligations in the order they are evaluated in, a column for each part of one and one for
+/// what it is stalled on. The order is rustc's: it decides which errors are reported and which
+/// inference variables are constrained first.
+#[derive(Debug, Default)]
+struct Pending<'db> {
+    cause: Vec<ObligationCause>,
+    param_env: Vec<ParamEnv<'db>>,
+    predicate: Vec<Predicate<'db>>,
+    recursion_depth: Vec<usize>,
+    stalled_on: Vec<StalledOn<'db>>,
+    /// Which rows `extract_if` keeps; kept for its allocation.
+    keep: Vec<bool>,
+}
+
+impl<'db> Pending<'db> {
+    fn len(&self) -> usize {
+        self.predicate.len()
+    }
+
+    fn push(&mut self, obligation: PredicateObligation<'db>, stalled_on: StalledOn<'db>) {
+        let Obligation { cause, param_env, predicate, recursion_depth } = obligation;
+        self.cause.push(cause);
+        self.param_env.push(param_env);
+        self.predicate.push(predicate);
+        self.recursion_depth.push(recursion_depth);
+        self.stalled_on.push(stalled_on);
+    }
+
+    fn obligation(&self, at: usize) -> PredicateObligation<'db> {
+        Obligation {
+            cause: self.cause[at],
+            param_env: self.param_env[at],
+            predicate: self.predicate[at],
+            recursion_depth: self.recursion_depth[at],
+        }
+    }
+
+    fn obligations(&self) -> impl Iterator<Item = PredicateObligation<'db>> + '_ {
+        (0..self.len()).map(|at| self.obligation(at))
+    }
+
+    fn clear(&mut self) {
+        self.cause.clear();
+        self.param_env.clear();
+        self.predicate.clear();
+        self.recursion_depth.clear();
+        self.stalled_on.clear();
+    }
+
+    /// Takes out, in order, the rows `extract` is true of, handing each to `out`; the others
+    /// stay in their order. `extract` may change what a row is stalled on.
+    fn extract_if(
+        &mut self,
+        mut extract: impl FnMut(&PredicateObligation<'db>, &mut StalledOn<'db>) -> bool,
+        mut out: impl FnMut(PredicateObligation<'db>, StalledOn<'db>),
+    ) {
+        let mut keep = mem::take(&mut self.keep);
+        keep.clear();
+        for at in 0..self.len() {
+            let obligation = self.obligation(at);
+            let taken = extract(&obligation, &mut self.stalled_on[at]);
+            if taken {
+                out(obligation, self.stalled_on[at].take());
+            }
+            keep.push(!taken);
+        }
+        retain_marked(&mut self.cause, &keep);
+        retain_marked(&mut self.param_env, &keep);
+        retain_marked(&mut self.predicate, &keep);
+        retain_marked(&mut self.recursion_depth, &keep);
+        retain_marked(&mut self.stalled_on, &keep);
+        self.keep = keep;
+    }
+}
+
+/// Keeps the items of `column` whose place in `keep` is true, in order.
+fn retain_marked<T>(column: &mut Vec<T>, keep: &[bool]) {
+    debug_assert_eq!(column.len(), keep.len());
+    let mut at = 0;
+    column.retain(|_| {
+        at += 1;
+        keep[at - 1]
+    });
+}
 
 /// A trait engine using the new trait solver.
 ///
@@ -48,10 +132,13 @@ pub struct FulfillmentCtxt<'db> {
     /// gets rolled back. Because of this we explicitly check that we only
     /// use the context in exactly this snapshot.
     usable_in_snapshot: usize,
-    try_evaluate_obligations_scratch: PendingObligations<'db>,
+    /// The obligations a round of `try_evaluate_obligations` evaluates: it swaps them with
+    /// `obligations.pending`, which takes those still pending, so no round allocates once
+    /// both have grown to the most it has had.
+    round: Pending<'db>,
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug)]
 struct ObligationStorage<'db> {
     /// Obligations which resulted in an overflow in fulfillment itself.
     ///
@@ -59,31 +146,18 @@ struct ObligationStorage<'db> {
     /// to avoid recomputing them each time `try_evaluate_obligations` is called.
     /// This also allows us to return the correct `FulfillmentError` for them.
     overflowed: Vec<PredicateObligation<'db>>,
-    pending: PendingObligations<'db>,
+    pending: Pending<'db>,
 }
 
 impl<'db> ObligationStorage<'db> {
-    fn register(
-        &mut self,
-        obligation: PredicateObligation<'db>,
-        stalled_on: Option<GoalStalledOn<DbInterner<'db>>>,
-    ) {
-        self.pending.push((obligation, stalled_on));
+    fn register(&mut self, obligation: PredicateObligation<'db>, stalled_on: StalledOn<'db>) {
+        self.pending.push(obligation, stalled_on);
     }
 
     fn clone_pending(&self) -> PredicateObligations<'db> {
-        let mut obligations: PredicateObligations<'db> =
-            self.pending.iter().map(|(o, _)| o.clone()).collect();
+        let mut obligations: PredicateObligations<'db> = self.pending.obligations().collect();
         obligations.extend(self.overflowed.iter().cloned());
         obligations
-    }
-
-    fn drain_pending<'this, 'cond>(
-        &'this mut self,
-        cond: impl 'cond + Fn(&PredicateObligation<'db>) -> bool,
-    ) -> impl Iterator<Item = (PredicateObligation<'db>, Option<GoalStalledOn<DbInterner<'db>>>)>
-    {
-        self.pending.extract_if(.., move |(o, _)| cond(o))
     }
 
     fn on_fulfillment_overflow(&mut self, infcx: &InferCtxt<'db>) {
@@ -93,19 +167,18 @@ impl<'db> ObligationStorage<'db> {
             // we get all obligations involved in the overflow. We pretty much check: if
             // we were to do another step of `try_evaluate_obligations`, which goals would
             // change.
-            // FIXME: <https://github.com/Gankra/thin-vec/pull/66> is merged, this can be removed.
-            self.overflowed.extend(
-                self.pending
-                    .extract_if(.., |(o, stalled_on)| {
-                        let goal = o.as_goal();
-                        let result = <&SolverContext<'db>>::from(infcx).evaluate_root_goal(
-                            goal,
-                            o.cause.span(),
-                            stalled_on.take(),
-                        );
-                        matches!(result, Ok(GoalEvaluation { has_changed: HasChanged::Yes, .. }))
-                    })
-                    .map(|(o, _)| o),
+            let overflowed = &mut self.overflowed;
+            self.pending.extract_if(
+                |o, stalled_on| {
+                    let goal = o.as_goal();
+                    let result = <&SolverContext<'db>>::from(infcx).evaluate_root_goal(
+                        goal,
+                        o.cause.span(),
+                        stalled_on.take(),
+                    );
+                    matches!(result, Ok(GoalEvaluation { has_changed: HasChanged::Yes, .. }))
+                },
+                |o, _| overflowed.push(o),
             );
         })
     }
@@ -116,7 +189,7 @@ impl<'db> FulfillmentCtxt<'db> {
         FulfillmentCtxt {
             obligations: Default::default(),
             usable_in_snapshot: infcx.num_open_snapshots(),
-            try_evaluate_obligations_scratch: Default::default(),
+            round: Default::default(),
         }
     }
 }
@@ -145,12 +218,14 @@ impl<'db> FulfillmentCtxt<'db> {
         &mut self,
         _infcx: &InferCtxt<'db>,
     ) -> Vec<NextSolverError<'db>> {
-        self.obligations
-            .pending
-            .drain(..)
-            .map(|(obligation, _)| NextSolverError::Ambiguity(obligation))
+        let pending = &mut self.obligations.pending;
+        let errors = pending
+            .obligations()
+            .map(NextSolverError::Ambiguity)
             .chain(self.obligations.overflowed.drain(..).map(NextSolverError::Overflow))
-            .collect()
+            .collect();
+        pending.clear();
+        errors
     }
 
     pub(crate) fn try_evaluate_obligations(
@@ -158,13 +233,19 @@ impl<'db> FulfillmentCtxt<'db> {
         infcx: &InferCtxt<'db>,
     ) -> Vec<NextSolverError<'db>> {
         assert_eq!(self.usable_in_snapshot, infcx.num_open_snapshots());
-        self.try_evaluate_obligations_scratch.clear();
+        // What a round left when it unwound.
+        self.round.clear();
         let mut errors = Vec::new();
         loop {
             let mut any_changed = false;
-            self.try_evaluate_obligations_scratch.extend(self.obligations.drain_pending(|_| true));
-            for (mut obligation, stalled_on) in self.try_evaluate_obligations_scratch.drain(..) {
+            // Every pending obligation, in order; those still pending go back to `pending`.
+            mem::swap(&mut self.round, &mut self.obligations.pending);
+            for at in 0..self.round.len() {
+                let mut obligation = self.round.obligation(at);
+                let stalled_on = self.round.stalled_on[at].take();
                 if obligation.recursion_depth >= infcx.interner.recursion_limit() {
+                    // The rest of the round is dropped, as rustc does.
+                    self.round.clear();
                     self.obligations.on_fulfillment_overflow(infcx);
                     // Only return true errors that we have accumulated while processing.
                     return errors;
@@ -214,6 +295,7 @@ impl<'db> FulfillmentCtxt<'db> {
                     Certainty::Maybe { .. } => self.obligations.register(obligation, stalled_on),
                 }
             }
+            self.round.clear();
 
             if !any_changed {
                 break;
@@ -258,8 +340,9 @@ impl<'db> FulfillmentCtxt<'db> {
             return Default::default();
         }
 
-        self.obligations
-            .drain_pending(|obl| {
+        let mut stalled = PredicateObligations::new();
+        self.obligations.pending.extract_if(
+            |obl, _| {
                 infcx.probe(|_| {
                     infcx
                         .visit_proof_tree(
@@ -272,9 +355,10 @@ impl<'db> FulfillmentCtxt<'db> {
                         )
                         .is_break()
                 })
-            })
-            .map(|(o, _)| o)
-            .collect()
+            },
+            |o, _| stalled.push(o),
+        );
+        stalled
     }
 }
 

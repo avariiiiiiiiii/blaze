@@ -87,16 +87,23 @@ impl<C: Configuration> IngredientImpl<C> {
     /// Evicts the existing memo for the given key, replacing it
     /// with an equivalent memo that has no value. If the memo is untracked
     /// or has values assigned as output of another query, this has no effect.
-    /// The memo keeps its fingerprint and dependency edges. Returns whether a value was dropped.
+    /// The memo keeps its dependency edges and gets the fingerprint of the value it drops.
+    /// Returns whether a value was dropped.
     pub(super) fn evict_value_from_memo_for(
         table: MemoTableWithTypesMut<'_>,
         memo_ingredient_index: MemoIngredientIndex,
+        hasher: Option<super::ValueHasher<C>>,
     ) -> bool {
         let mut evicted = false;
         let map = |memo: &mut Memo<C>| {
-            if memo.header.can_evict_value() {
-                // Set the memo value to `None`.
-                evicted = memo.value.take().is_some();
+            if memo.header.can_evict_value()
+                && let Some(value) = memo.value.take()
+            {
+                // The fingerprint is taken now, not when the value was stored, so values that
+                // are never evicted are never hashed.
+                let fingerprint = Self::fingerprint_with(hasher, &value);
+                memo.header.revisions.set_value_fingerprint(fingerprint);
+                evicted = true;
             }
         };
 
@@ -507,17 +514,11 @@ mod persistence {
             }
 
             let memo = DeserializeMemo::<C>::deserialize(deserializer)?;
-            // Only final memos are serialized (`Memo::should_serialize`), and the fingerprint of
-            // a value is not persisted but computed again from it.
-            let mut revisions = memo.revisions;
-            revisions.set_value_fingerprint(
-                C::fingerprint(&memo.value.0).unwrap_or(crate::fingerprint::Fingerprint::NONE),
-            );
 
             Ok(Memo::new(
                 Some(memo.value.0),
                 memo.verified_at.load(),
-                revisions,
+                memo.revisions,
             ))
         }
     }

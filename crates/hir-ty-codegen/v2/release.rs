@@ -204,17 +204,18 @@ pub(crate) fn emit(
     {
         return Err(failed(unit, "its imports are not those it was decided to have"));
     }
-    if let Built::Assembled(code, _) = &function.code {
+    if let Built::Assembled(code, requests) = &function.code {
         if !imported.is_empty() {
             return Err(failed(unit, "an assembly function is given imports"));
         }
-        return super::backend::emitted(unit, &function, code, refs);
+        return emitted(unit, &function, code, requests, refs);
     }
-    let own = match function.release.own.get() {
-        Some(own) => own.clone(),
+    let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner()).remove(&unit.instance.key());
+    let own = match kept {
+        Some(own) => own,
         None => Arc::new(prelinked(unit, spec, &function, refs, optimization)?.own),
     };
-    let Function { code: Built::Ir(pending), places, .. } = &mut function else {
+    let Function { code: Built::Ir(pending), places, .. } = &mut *function else {
         return Err(failed(unit, "an assembly function has no IR for LLVM"));
     };
     let mut linked = Vec::with_capacity(imported.len());
@@ -245,18 +246,49 @@ pub(crate) fn emit(
         .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))?;
     placed_since(unit, &pending.wants, places, refs)?;
     let code = crate::backend::pad(code).map_err(|why| failed(unit, why))?;
-    let mut emitted = super::backend::emitted(unit, &function, &code, refs)?;
+    let Built::Ir(pending) = &function.code else {
+        return Err(failed(unit, "an assembly function has no IR for LLVM"));
+    };
+    let mut emitted = emitted(unit, &function, &code, &pending.wants.requests, refs)?;
     inlined.sort_unstable();
     inlined.dedup();
     emitted.function.inlined = inlined;
     Ok(emitted)
 }
 
+/// `code` against `refs`, by `function`'s places, as the Cranelift backend converts its own
+/// (`super::backend::emit_cranelift`): its unwind information and lines come with it.
+#[cfg(feature = "llvm")]
+fn emitted(
+    unit: &Unit,
+    function: &Function,
+    code: &crate::fragment::Code,
+    requests: &Requests,
+    refs: &Refs,
+) -> Result<Emitted, CodegenError> {
+    let isa: &dyn cranelift_codegen::isa::TargetIsa = &**crate::target().map_err(|e| failed(unit, e))?;
+    let side = super::side::encode(&function.variables, &code.slots).map_err(|e| failed(unit, e))?;
+    let converted = super::places::resolve(&function.places, refs, |resolve| {
+        super::convert::function(
+            unit.instance.key(),
+            unit.arch,
+            isa,
+            code,
+            requests,
+            resolve,
+            &function.spans,
+            side.as_ref().map(|it| it.1),
+        )
+    })
+    .map_err(|e| failed(unit, e))?;
+    Ok(Emitted { function: converted, side: side.map(|it| it.0) })
+}
+
 #[cfg(not(feature = "llvm"))]
 pub(crate) fn emit(
     unit: &Unit,
     _: &Spec,
-    _: Function,
+    _: Box<Function>,
     _: &Refs,
     _: Option<(&Imports, &[Import<'_, Export>])>,
 ) -> Result<Emitted, CodegenError> {
@@ -316,7 +348,7 @@ fn key(unit: &Unit, places: &Places, refs: &Refs, request: u32) -> Result<Option
         .ok_or_else(|| failed(unit, format!("function request {request} has no place among the references")))?;
     match target {
         Target::Function(key) | Target::Direct(key) => Ok(Some(*key)),
-        Target::Extern(_) => Ok(None),
+        Target::Extern(_) | Target::Weak(_) => Ok(None),
         other => Err(failed(unit, format!("function request {request} is {other:?}"))),
     }
 }

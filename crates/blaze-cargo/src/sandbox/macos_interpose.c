@@ -20,24 +20,43 @@
 //     O\t<index>\t<directory>\t<upper>   an overlay (one line for each way to spell it)
 //     B\t<directory>\t<target>           a directory answered from `target`
 //     W\t<directory>                     a directory written for real
-//     L                                  record (W, N and X lines, and E and H for X)
-//     R                                  record reads (R lines) too
+//     Q\t<path>                          a path that is no input (`/dev`, the program)
+//     L                                  record (W, N and X lines, and P and H for X)
+//     R                                  record reads (R L D E T lines) too
+//     V\t<file>                          the live record, where the lines go
+//     I                                  the network is the program's: what it reaches is a
+//                                        `T network` line
 //
-// Records are lines appended to `record` in that directory with one write each, which `macos.rs`
-// reads when the run ends:
+// The record's lines (`blaze_usercode::trace::Line`), each appended with one write before the
+// call it notes returns, to the live record when there is one and to `record` in that
+// directory otherwise:
 //
 //     R\t<test>\t<path>      a path named
+//     D\t<test>\t<path>      a directory listed
+//     E\t<test>\t<name>      a variable read by name (`getenv`), or `*` for all of them
+//                            (`_NSGetEnviron`)
+//     T\t<test>\t<what>      what can't be traced: `clock` (the realtime clock), `random`
+//                            (every test's: what a process read of it stays in it),
+//                            `network`
 //     W\t<test>\t<path>      a write the sandbox refused
 //     N\t<test>\t<address>   an address the sandbox refused
 //     X\t<test>\t<why>       the record is not whole
-//     E\t<nonce>\t<test>\t<path>   a program run, with the nonce its process is given
+//
+// and what `macos.rs` reads from `record` when the run ends, to know the programs that ran
+// without this library:
+//
+//     P\t<nonce>\t<test>\t<path>   a program run, with the nonce its process is given
 //     H\t<nonce>             a process that loaded this library, by the nonce it was given
 //     F\t<nonce>             a program that did not run after all
+//     Z\t<errno>             a line could not be added to the live record: it is not whole
 //
-// An E with no H is a program that ran without this library.
+// A P with no H is a program that ran without this library. The test of a thread is what the
+// harness's marker named last; a process starts in its parent thread's (a fork keeps the
+// thread's, a program run is told it, `__BLAZE_SANDBOX_SCOPE`).
 
 #define _DARWIN_C_SOURCE
 #include <copyfile.h>
+#include <crt_externs.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -58,6 +77,7 @@
 #include <sys/clonefile.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -89,13 +109,19 @@ extern ssize_t sendmsg_nocancel(int, const struct msghdr *, int) __asm("_sendmsg
 extern int renameatx_np(int, const char *, int, const char *, unsigned int);
 extern int renamex_np(const char *, const char *, unsigned int);
 extern int getattrlistat(int, const char *, void *, void *, size_t, unsigned long);
+extern ssize_t __getdirentries64(int, void *, size_t, off_t *);
+extern int getattrlistbulk(int, void *, void *, size_t, uint64_t);
+// libcommonCrypto, part of libSystem: what Rust's `std` reads its hash maps' keys from.
+extern int32_t CCRandomGenerateBytes(void *, size_t);
 
 #define MARK "/.blaze-test/"
 #define WHITEOUT "\x01blaze-whiteout\x01"
-#define MAX_ROOTS 64
+#define SCOPE_VAR "__BLAZE_SANDBOX_SCOPE"
+#define MAX_ROOTS 128
 #define MAX_OVERLAYS 32
 
-enum kind { NONE, OVERLAY, BIND, WRITABLE, SCRATCH };
+// QUIET: seen as it is and no input (`/dev`, the program itself), named in no R line.
+enum kind { NONE, OVERLAY, BIND, WRITABLE, SCRATCH, QUIET };
 
 struct root {
     char *path;
@@ -123,7 +149,10 @@ static char lists[PATH_MAX];
 static size_t lists_len;
 static struct shared *shared;
 static int record_fd = -1;
+// Where the record's lines go: the live record, or `record_fd` without one.
+static int lines_fd = -1;
 static int record_reads;
+static int network_on;
 // Whether the library is set up; until then (dyld and libSystem starting) calls go through.
 static int alive;
 static char env_insert[PATH_MAX + 32];
@@ -132,6 +161,11 @@ static char env_dir[PATH_MAX + 32];
 
 static __thread int busy;           // inside a call here: the C library's calls go through
 static __thread char test[512];     // the test the thread runs, from the marker
+// Which of the thread's scopes it is in, one more at each marker, and the one it last said
+// it read the clock in: said without a lock, as a clock may be read in a signal handler.
+static __thread unsigned scope_number = 1;
+static __thread unsigned clock_said;
+static _Atomic int random_said;
 
 // ---------------------------------------------------------------------------------------
 // Records.
@@ -140,17 +174,19 @@ static os_unfair_lock seen_lock = OS_UNFAIR_LOCK_INIT;
 static uint64_t *seen;
 static size_t seen_size, seen_count;
 
-static uint64_t hash(const char *a, const char *b) {
+static uint64_t hash(char kind, const char *a, const char *b) {
     uint64_t h = 0xcbf29ce484222325ull;
+    h = (h ^ (uint8_t)kind) * 0x100000001b3ull;
     for (; *a; a++) h = (h ^ (uint8_t)*a) * 0x100000001b3ull;
     h = (h ^ 0xff) * 0x100000001b3ull;
     for (; *b; b++) h = (h ^ (uint8_t)*b) * 0x100000001b3ull;
     return h | 1;
 }
 
-// Whether the line is new to this process; the merge removes what several processes repeat.
-static int first_time(const char *a, const char *b) {
-    uint64_t h = hash(a, b);
+// Whether the line is new to this process; reading the record removes what several processes
+// repeat.
+static int first_time(char kind, const char *a, const char *b) {
+    uint64_t h = hash(kind, a, b);
     int fresh = 0;
     os_unfair_lock_lock(&seen_lock);
     if (seen_count * 2 >= seen_size) {
@@ -188,8 +224,27 @@ static void put(char *line, size_t *at, size_t cap, const char *text) {
     }
 }
 
-static void emit(const char *kind, const char *a, const char *b, const char *c) {
+// A line could not be added to the live record, for `error`: `macos.rs` finds it in `record`.
+// Written without `snprintf`, which a signal handler may not call.
+static void lost(int error) {
     if (record_fd < 0) return;
+    char line[32] = "Z\t", digits[12];
+    size_t at = 2;
+    int n = 0;
+    unsigned value = error > 0 ? (unsigned)error : 0;
+    do digits[n++] = (char)('0' + value % 10);
+    while ((value /= 10));
+    while (n) line[at++] = digits[--n];
+    line[at++] = '\n';
+    write(record_fd, line, at);
+}
+
+// Appends a line, with one write: `P`, `H`, `F` and `Z` to `record`, the record's own lines
+// where they go. Safe in a signal handler (its own buffer, `write` alone).
+static void emit(const char *kind, const char *a, const char *b, const char *c) {
+    int own = strchr("PHFZ", kind[0]) != NULL;
+    int fd = own ? record_fd : lines_fd;
+    if (fd < 0) return;
     char line[3 * PATH_MAX];
     size_t at = 0;
     put(line, &at, sizeof line, kind);
@@ -200,21 +255,35 @@ static void emit(const char *kind, const char *a, const char *b, const char *c) 
     }
     line[at++] = '\n';
     int saved = errno;
-    write(record_fd, line, at);
+    ssize_t wrote = write(fd, line, at);
+    if (wrote != (ssize_t)at && !own) lost(wrote < 0 ? errno : 0);
     errno = saved;
 }
 
-static void note(char kind, const char *path) {
-    if (record_fd < 0) return;
+static void note(char kind, const char *what) {
+    if (lines_fd < 0) return;
     // A tab or a line break would end the field: the record says it is not whole instead,
-    // as `Recorder` in `sandbox.rs` does.
-    if (strpbrk(path, "\t\n")) {
-        emit("X", test, "a path with a tab or a line break in it", NULL);
+    // as `blaze_usercode::trace::Line::new` does.
+    if (strpbrk(what, "\t\n")) {
+        emit("X", test, "a path or a name with a tab or a line break in it", NULL);
         return;
     }
     char k[2] = {kind, 0};
-    if (kind == 'R' && !first_time(test, path)) return;
-    emit(k, test, path, NULL);
+    if (!first_time(kind, test, what)) return;
+    emit(k, test, what, NULL);
+}
+
+// The realtime clock was read: once in each of the thread's scopes, with no lock.
+static void read_clock(void) {
+    if (!alive || !record_reads || clock_said == scope_number) return;
+    clock_said = scope_number;
+    emit("T", test, "clock", NULL);
+}
+
+// Randomness was read: once a process, every test's.
+static void read_random(void) {
+    if (!alive || !record_reads || atomic_exchange(&random_said, 1)) return;
+    emit("T", "", "random", NULL);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -628,6 +697,18 @@ static enum answer overlay(struct root *it, const char *virt, const char *rest, 
     return USE;
 }
 
+// Whether what is under `it` is an input: not the run's own directories, not a quiet path.
+static int input(const struct root *it) {
+    return !it || (it->kind != SCRATCH && it->kind != BIND && it->kind != QUIET);
+}
+
+// Notes `virt`, under `it`, read as `kind` says (`R`, or `D` for a listing): the random
+// devices are randomness, and what is no input is not noted.
+static void noted(const char *virt, const struct root *it, char kind) {
+    if (!strcmp(virt, "/dev/random") || !strcmp(virt, "/dev/urandom")) read_random();
+    else if (input(it)) note(kind, virt);
+}
+
 // What a call naming `path` from `dirfd` is to name for `how`: PASS for what it named
 // (outside the overlays and the bound directories), USE for `real`, FAIL with `errno` set.
 // `virt` is the whole path as the program sees it, or empty.
@@ -642,7 +723,7 @@ static enum answer resolve(int dirfd, const char *path, enum how how, char *real
     const char *rest;
     struct root *it = where(virt, &rest);
     *root = it;
-    if (record_reads && (!it || (it->kind != SCRATCH && it->kind != BIND))) note('R', virt);
+    if (record_reads) noted(virt, it, how == LIST ? 'D' : 'R');
     if (!it) return PASS;
     switch (it->kind) {
     case BIND:

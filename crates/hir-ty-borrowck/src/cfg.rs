@@ -137,6 +137,36 @@ impl Cfg {
     }
 }
 
+/// The blocks reachable from `start` in reverse postorder, and which are. rustc's `Postorder`
+/// takes each block's successors from the last, so its reverse postorder, the order errors are
+/// found in, has a loop's exit before its body.
+fn reverse_postorder(
+    successors: &[SmallVec<[BasicBlockId; 2]>],
+    start: BasicBlockId,
+) -> (Vec<BasicBlockId>, Vec<bool>) {
+    let count = successors.len();
+    let mut reachable = vec![false; count];
+    let mut postorder = Vec::with_capacity(count);
+    let mut stack = vec![(start, 0usize)];
+    reachable[index(start)] = true;
+    while let Some((block, next)) = stack.last_mut() {
+        let block = *block;
+        let all = &successors[index(block)];
+        if let Some(&target) = all.len().checked_sub(*next + 1).map(|it| &all[it]) {
+            *next += 1;
+            if !reachable[index(target)] {
+                reachable[index(target)] = true;
+                stack.push((target, 0));
+            }
+        } else {
+            postorder.push(block);
+            stack.pop();
+        }
+    }
+    postorder.reverse();
+    (postorder, reachable)
+}
+
 /// The dominator tree of the reachable blocks, as rustc's: immediate dominators by semi-NCA
 /// (Lengauer and Tarjan's semidominators, then nearest common ancestors), and each block's
 /// entry and exit in a walk of the tree, so that whether one dominates another is two

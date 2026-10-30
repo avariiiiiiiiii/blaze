@@ -13,12 +13,14 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+la-arena.workspace = true
 rustc-hash.workspace = true
 salsa.workspace = true
 
 rustc_type_ir.workspace = true
 
 # local deps
+blaze-format.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
 

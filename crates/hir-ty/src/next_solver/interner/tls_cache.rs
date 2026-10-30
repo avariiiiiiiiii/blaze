@@ -154,7 +154,7 @@ impl<S: Copy + Eq, T: Default> Table<S, T> {
     }
 
     /// The slots `key` may be in, the one it hashes to first.
-    fn window(&self, key: u64) -> impl Iterator<Item = usize> + use<S, T> {
+    fn window(&self, key: u64) -> impl Iterator<Item = usize> {
         let mask = (1usize << self.bits) - 1;
         let start = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.bits)) as usize;
         (0..PROBE.min(mask + 1)).map(move |step| (start + step) & mask)
@@ -268,11 +268,11 @@ mod tests {
         let query = key();
         let start = Barrier::new(8);
         thread::scope(|scope| {
-            for thread in 0..8u32 {
+            for worker in 0..8u32 {
                 let (table, start) = (&table, &start);
                 scope.spawn(move || {
                     start.wait();
-                    table.with(query, 0, |goals| goals.insert(thread, thread));
+                    table.with(query, 0, |goals| goals.insert(worker, worker));
                 });
             }
         });
@@ -347,11 +347,11 @@ mod tests {
         let queries: Vec<u64> = (0..96).map(|_| key()).collect();
         let shared_hits = std::sync::atomic::AtomicUsize::new(0);
         thread::scope(|scope| {
-            for thread in 0..8u64 {
+            for worker in 0..8u64 {
                 let (table, queries, shared_hits) = (&table, &queries, &shared_hits);
                 scope.spawn(move || {
                     let mut per_thread = PerThread { caches: Vec::new(), state: 0 };
-                    let mut seed = 0x2545_F491_4F6C_DD1D ^ (thread + 1);
+                    let mut seed = 0x2545_F491_4F6C_DD1Du64 ^ (worker + 1);
                     let mut next = move || {
                         seed ^= seed << 13;
                         seed ^= seed >> 7;

@@ -197,7 +197,7 @@ static DESCRIBED: Mutex<Vec<(AbsPathBuf, Option<Closure>)>> = Mutex::new(Vec::ne
 fn described(name: &str, closure: Option<Closure>) -> AbsPathBuf {
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| {
-        describe_with(Box::new(|dylib| {
+        describe_with(Box::new(|dylib: &AbsPath| {
             let described = lock(&DESCRIBED);
             match described.iter().find(|it| *it.0 == *dylib) {
                 Some((_, closure)) => Ok(closure.clone()),

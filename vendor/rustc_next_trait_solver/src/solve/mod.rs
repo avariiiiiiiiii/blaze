@@ -233,8 +233,9 @@ where
             ty::ConstKind::Unevaluated(uv) => {
                 self.cx().type_of(uv.def.into()).instantiate(self.cx(), uv.args).skip_norm_wip()
             }
-            ty::ConstKind::Expr(_) => unimplemented!(
-                "`feature(generic_const_exprs)` is not supported in the new trait solver"
+            ty::ConstKind::Expr(_) => unreachable!(
+                "a `ConstKind::Expr` without `feature(generic_const_exprs)`, which the interner \
+                 says is off: nothing lowers a constant to one"
             ),
             ty::ConstKind::Param(_) => {
                 unreachable!("`ConstKind::Param` should have been canonicalized to `Placeholder`")

@@ -7,6 +7,7 @@ use crate::model::Class;
 use crate::stage::{Stage, describe};
 use crate::state::What;
 use crate::symbols::SymKey;
+use crate::Format;
 use blaze_codegen::Arch;
 
 impl Stage<'_> {
@@ -133,6 +134,19 @@ impl Stage<'_> {
                     _ => {}
                 }
             }
+        }
+        if !patch.frames.is_empty() && self.output.format == Format::Elf {
+            let Some(space) = self.new.space_of(&Class::EhFrame) else {
+                return restart("its new call frame information has no region".to_owned());
+            };
+            let region = &self.new.spaces[space].region;
+            if region.size + 4 > region.capacity {
+                return restart(format!(
+                    "its call frame information fills its region ({} bytes)",
+                    region.capacity
+                ));
+            }
+            patch.data.push((region.addr + region.size, vec![0; 4]));
         }
         patch.rebase.sort_unstable();
         Message::Patch(patch)

@@ -2,12 +2,11 @@
 //! outlives constraints between regions, as rustc's `RegionInferenceContext` computes it on
 //! the strongly connected components of the constraint graph.
 
-use smallvec::SmallVec;
-
 use super::{
     bitset::BitSet,
     intervals::IntervalSet,
     regions::{Regions, Rv},
+    relation::Csr,
 };
 
 /// The points each region holds at, and the universal regions it outlives: one value for each
@@ -42,12 +41,12 @@ pub(super) fn infer(
     live: Vec<IntervalSet>,
 ) -> RegionValues {
     // `sup: sub` makes `sup` hold what `sub` does: an edge from `sup` to `sub`.
-    let mut edges: Vec<SmallVec<[u32; 4]>> = vec![SmallVec::new(); count];
-    for constraint in &regions.outlives {
-        if constraint.sup < count && constraint.sub < count {
-            edges[constraint.sup].push(constraint.sub as u32);
-        }
-    }
+    let edges = Csr::build(
+        count,
+        (0..count).flat_map(|sup| {
+            regions.outlives.subs_of(count, sup).map(move |sub| (sup as u32, sub as u32))
+        }),
+    );
     let (scc, sccs) = strongly_connected(&edges);
     // Tarjan's algorithm numbers a component after every component it reaches.
     let mut values = vec![IntervalSet::default(); sccs];
@@ -72,7 +71,7 @@ pub(super) fn infer(
     let mut seen = vec![u32::MAX; sccs];
     for at in 0..sccs {
         for &rv in &members[at] {
-            for &sub in &edges[rv as usize] {
+            for &sub in edges.of(rv as usize) {
                 let from = scc[sub as usize] as usize;
                 if from == at || seen[from] == at as u32 {
                     continue;
@@ -92,8 +91,8 @@ pub(super) fn infer(
 /// The strongly connected components of a graph, by Tarjan's algorithm without recursion: the
 /// component of each node, numbered so that every component a component reaches has a
 /// smaller number, and how many there are.
-fn strongly_connected(edges: &[SmallVec<[u32; 4]>]) -> (Vec<u32>, usize) {
-    let count = edges.len();
+fn strongly_connected(edges: &Csr) -> (Vec<u32>, usize) {
+    let count = edges.nodes();
     const NONE: u32 = u32::MAX;
     let mut index = vec![NONE; count];
     let mut low = vec![0u32; count];
@@ -116,7 +115,7 @@ fn strongly_connected(edges: &[SmallVec<[u32; 4]>]) -> (Vec<u32>, usize) {
         on_stack[root as usize] = true;
         while let Some(&mut (node, ref mut next)) = calls.last_mut() {
             let n = node as usize;
-            if let Some(&to) = edges[n].get(*next) {
+            if let Some(&to) = edges.of(n).get(*next) {
                 *next += 1;
                 let t = to as usize;
                 if index[t] == NONE {

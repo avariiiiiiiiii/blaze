@@ -528,7 +528,7 @@ fn dir_through<'a>(cx: &mut Cx<'_>, table: impl Table<'a>, path: &'a str, view: 
             Some(names) => sorted(names),
             None => Found::Absent,
         },
-        None if search(table.knowns(), path.as_bytes(), |at| table.known(at)).is_some() => {
+        None if known_dir(table, path) => {
             let prefix: Cow<'_, str> = if path == "/" { Cow::Borrowed("/") } else { Cow::Owned(format!("{path}/")) };
             let prefix = prefix.as_bytes();
             let mut names: FxHashMap<&str, bool> = FxHashMap::default();
@@ -658,19 +658,24 @@ fn under<'p>(at: &str, path: &'p str) -> Option<&'p str> {
     rest.strip_prefix('/')
 }
 
-/// Whether `path` is a file of a known directory, or of a known directory's `.cargo`: `known`
-/// is sorted.
-fn known_file<'a>(table: impl Table<'a>, path: &str) -> bool {
+/// Whether `path` is a known directory or a known directory's `.cargo`, the directories whose
+/// files [`known_file`] takes: `known` is sorted.
+fn known_dir<'a>(table: impl Table<'a>, path: &str) -> bool {
     let known = |dir: &str| search(table.knowns(), dir.as_bytes(), |at| table.known(at)).is_some();
-    let Some((dir, _)) = path.rsplit_once('/') else { return false };
-    let dir = if dir.is_empty() { "/" } else { dir };
-    if known(dir) {
+    if known(path) {
         return true;
     }
-    match dir.rsplit_once('/') {
+    match path.rsplit_once('/') {
         Some((above, ".cargo")) => known(if above.is_empty() { "/" } else { above }),
         _ => false,
     }
+}
+
+/// Whether `path` is a file of a known directory, or of a known directory's `.cargo`: `known`
+/// is sorted.
+fn known_file<'a>(table: impl Table<'a>, path: &str) -> bool {
+    let Some((dir, _)) = path.rsplit_once('/') else { return false };
+    known_dir(table, if dir.is_empty() { "/" } else { dir })
 }
 
 /// `path` as the load names it: absolute, `/`-separated, `.` and `..` taken out. `None` for a
@@ -1262,6 +1267,21 @@ mod tests {
         assert!(known_file(&table, "/Cargo.toml"));
         assert!(!known_file(&table, "/etc/passwd/x"));
         assert!(!known_file(&table, "/home/u/.cargo/registry/src/x/Cargo.toml"));
+    }
+
+    /// The config chain lists each directory's `.cargo` up to `/`: a known directory's
+    /// `.cargo` is listed like the directory, where a checkout's first build read `/.cargo`.
+    #[test]
+    fn a_known_directorys_cargo_directory_is_listed_as_its_files_are_read() {
+        let mut known: Vec<String> = ["/w", "/"].map(str::to_owned).to_vec();
+        known.sort();
+        let table = MountTable { mounts: Vec::new(), outside: Vec::new(), known };
+        for dir in ["/", "/.cargo", "/w", "/w/.cargo"] {
+            assert!(known_dir(&table, dir), "{dir}");
+        }
+        for dir in ["/etc", "/w/src", "/w/.cargo/x", "/.cargo/.cargo"] {
+            assert!(!known_dir(&table, dir), "{dir}");
+        }
     }
 
     /// A read of a path through the view's mounts costs a binary search per directory above

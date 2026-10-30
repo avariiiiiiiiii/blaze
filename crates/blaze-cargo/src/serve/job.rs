@@ -2311,10 +2311,8 @@ impl<S: Steps> Jobs<S> {
         refuse_held(w, &mut job.stage);
         if let (Some(request), false) = (job.request, job.finished) {
             w.plane.cancel(w.now, request);
-            if !job.closed {
-                job.closed = true;
-                w.plane.close(w.now, request);
-            }
+            // A cancelled request takes no more nodes, and no `Close` either.
+            job.closed = true;
         }
         self.kill_runs(w, id);
     }
@@ -2364,6 +2362,8 @@ impl<S: Steps> Jobs<S> {
         if let (Some(request), false) = (job.request, job.finished) {
             if !ok {
                 w.plane.cancel(w.now, request);
+                // A cancelled request takes no more nodes, and no `Close` either.
+                job.closed = true;
             }
             if !job.closed {
                 job.closed = true;

@@ -1076,7 +1076,8 @@ mod tests {
         let ptr = types::I64;
         let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), signature());
         if shuffled {
-            func.import_signature(ir::Signature::new(func.signature.call_conv));
+            let call_conv = func.signature.call_conv;
+            func.import_signature(ir::Signature::new(call_conv));
             func.declare_imported_user_function(ir::UserExternalName::new(0, 99));
         }
         let user = |func: &mut ir::Function, namespace, index| {

@@ -468,7 +468,7 @@ pub fn check_db_argument<'arg>(
 
                 let d = match &*ref_type.elem {
                     syn::Type::TraitObject(d) => d,
-                    syn::Type::Path(syn::TypePath { qself: None, path }) => {
+                    syn::Type::Path(syn::TypePath { qself: None, path, .. }) => {
                         return Ok(DbType::Concrete(path));
                     }
                     _ => return Err(ref_type.span()),

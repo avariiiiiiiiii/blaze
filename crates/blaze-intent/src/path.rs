@@ -140,7 +140,9 @@ fn squeeze(text: &str) -> String {
 /// Whether `text` and `want` read the same with their whitespace removed ([`squeeze`] of both,
 /// compared without making either).
 pub(crate) fn same_squeezed(text: &str, want: &str) -> bool {
-    let squeezed = |text: &str| text.chars().filter(|it| !it.is_whitespace());
+    fn squeezed(text: &str) -> impl Iterator<Item = char> + '_ {
+        text.chars().filter(|it| !it.is_whitespace())
+    }
     squeezed(text).eq(squeezed(want))
 }
 

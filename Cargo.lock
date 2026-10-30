@@ -847,6 +847,7 @@ dependencies = [
  "blaze-usercode",
  "blaze-vfs",
  "blaze-wasi",
+ "blaze-wasm-pack",
  "blaze-web",
  "cargo-platform",
  "cargo-util-schemas",
@@ -1921,6 +1922,23 @@ dependencies = [
  "blaze-alloc-count",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "blaze-wasm-pack"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "cfg",
+ "hir",
+ "hir-expand",
+ "intern",
+ "rustc-hash 2.1.2",
+ "serde",
+ "span",
+ "syntax-bridge",
+ "triomphe",
+ "tt",
 ]
 
 [[package]]

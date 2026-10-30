@@ -92,7 +92,7 @@ pub(crate) fn thunk(target: &ir::Signature, conv: CallConv) -> Result<ir::Functi
         [ir::ExceptionTableItem::Default(landed)],
     ));
 
-    let flags = ir::MemFlags::trusted();
+    let flags = ir::MemFlagsData::trusted();
     let mut pos = FuncCursor::new(&mut func).at_bottom(entry);
     let mut values: Vec<ir::Value> = params
         .iter()
@@ -146,7 +146,7 @@ pub(crate) fn stub(id: u32, sig: &ir::Signature, conv: CallConv) -> Result<ir::F
 
     let mut pos = FuncCursor::new(&mut func).at_bottom(entry);
     for (&param, i) in params.iter().zip(0..) {
-        pos.ins().stack_store(param, slot, (i * SLOT) as i32);
+        pos.ins().stack_store(types::I64, param, slot, (i * SLOT) as i32);
     }
     let id = pos.ins().iconst(types::I64, i64::from(id));
     let at = pos.ins().stack_addr(types::I64, slot, 0);
@@ -156,7 +156,7 @@ pub(crate) fn stub(id: u32, sig: &ir::Signature, conv: CallConv) -> Result<ir::F
         .returns
         .iter()
         .zip(0..)
-        .map(|(ret, i)| pos.ins().stack_load(ret.value_type, slot, (i * SLOT) as i32))
+        .map(|(ret, i)| pos.ins().stack_load(types::I64, ret.value_type, slot, (i * SLOT) as i32))
         .collect(); // alloc: per stub built
     pos.ins().return_(&results);
     Ok(func)

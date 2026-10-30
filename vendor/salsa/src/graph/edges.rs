@@ -157,7 +157,7 @@ impl Edges {
     }
 
     fn page(&self, page: usize) -> &[AtomicU32] {
-        self.pages[page].get_or_init(|| (0..page_len(page)).map(|_| AtomicU32::new(0)).collect())
+        self.pages[page].get_or_init(|| super::zeroed_u32s(page_len(page) as usize))
     }
 
     /// The words of `span`, which [`Edges::reserve`] or [`Edges::reserve_for_task`] gave.

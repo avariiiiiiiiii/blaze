@@ -53,6 +53,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use blaze_ids::radix;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
 
@@ -1471,7 +1472,7 @@ fn sorted(pieces: Vec<Vec<Slot>>) -> Vec<Slot> {
     let next = || buckets.lock().unwrap_or_else(PoisonError::into_inner).pop();
     let sort = || {
         while let Some(bucket) = next() {
-            bucket.sort_unstable_by_key(|it| it.start);
+            radix::sort_copy_by_key(bucket, |it| it.start);
         }
     };
     std::thread::scope(|scope| {
@@ -2112,7 +2113,7 @@ impl Store {
             .filter(|it| it.pack.checked.get().is_none())
             .map(|it| it.pack.clone())
             .collect();
-        packs.sort_unstable_by_key(|it| it.number);
+        radix::sort_by_key(&mut packs, |it| it.number);
         packs.dedup_by_key(|it| it.number);
         self.check(&packs, threads);
         let places: Vec<Option<([u8; KEY], Place)>> = (on_disk.into_iter().zip(found))

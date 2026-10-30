@@ -607,17 +607,6 @@ where
         self.maybe_changed_after(db, input, revision)
     }
 
-    unsafe fn verify_unclaimed(
-        &self,
-        zalsa: &Zalsa,
-        db: RawDatabase<'_>,
-        input: Id,
-        revision: Revision,
-        depth: u32,
-    ) -> Option<VerifyResult> {
-        self.verify_memo_unclaimed(zalsa, db, input, revision, depth)
-    }
-
     unsafe fn collect_minimum_serialized_edges(
         &self,
         zalsa: &Zalsa,

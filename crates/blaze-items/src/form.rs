@@ -20,7 +20,7 @@ use std::{
 };
 
 use base_db::Crate;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, radix};
 use hir_def::{
     AdtId, AssocItemId, AttrDefId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId,
     FunctionId, GenericDefId, GenericParamId, HasModule, ItemContainerId, LocalFieldId, Lookup,
@@ -46,6 +46,7 @@ use hir_ty::{
         ClosureKey, GeneralConstId, HirDatabase, InternedClosure, InternedClosureId,
         InternedCoroutineId, InternedOpaqueTyId,
     },
+    intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::loaded_crates,
     mir::{
         AggregateKind, AsmOperand, AssertKind, BasicBlockId, LocalId, MirBody, MirSpan, Operand,
@@ -2325,7 +2326,7 @@ impl<'db> Cx<'db> {
             MemoryMap::Complex(map) => {
                 f.u8(2);
                 let mut pieces: Vec<_> = map.memory.iter().collect();
-                pieces.sort_unstable_by_key(|it| *it.0);
+                radix::sort_copy_by_key(&mut pieces, |it| *it.0);
                 f.len(pieces.len());
                 for (&at, memory) in pieces {
                     f.u64(at as u64);
@@ -2708,8 +2709,12 @@ enum Named {
 /// an instance that does, and codegen keys such an instance on the [`crate::Fact::Name`] of
 /// the nominal types in its arguments.
 pub fn observes_names(db: &dyn HirDatabase, func: FunctionId) -> bool {
-    FunctionSignature::is_intrinsic(db, func)
-        && matches!(FunctionSignature::of(db, func).name.as_str(), "type_name" | "type_id")
+    // A call of an unknown intrinsic is refused when it is lowered; keying it on the names
+    // as well misses no input.
+    matches!(
+        intrinsic_of(db, func),
+        Ok(Some(Intrinsic::TypeName | Intrinsic::TypeId)) | Err(_)
+    )
 }
 
 fn same_kind(a: AssocItemId, b: AssocItemId) -> bool {
@@ -2871,7 +2876,9 @@ impl<'b, 'db> Canon<'b, 'db> {
                 number, at, to,
             ))
         }));
-        c.unwinds.sort_by_key(|&(number, at, _)| (number, at));
+        radix::sort_copy_by_key(&mut c.unwinds, |&(number, at, _)| {
+            radix::pack_64(u64::from(number), at as u64)
+        });
         c.uses.resize_with(body.locals.len().div_ceil(64), || Cell::new(0));
         c.numbers.resize_with(body.locals.len(), || Cell::new(UNNUMBERED));
         Canon {

@@ -25,7 +25,7 @@
 //!
 //! The layout on disk and why it survives a crash at any point: docs/v2-store.md.
 
-mod chunk;
+pub mod chunk;
 mod cold;
 mod copy;
 mod crc;
@@ -51,8 +51,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::disk::{
     DICTIONARY_DOMAIN, DictionaryRef, ExternalRef, Form, HEAD_FILE, Head, IndexRef, Loc,
-    NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, content_of,
+    NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX,
 };
+pub use crate::disk::content_of;
 use crate::flags::{FLAGS, Flag, Row};
 use crate::read::{ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View};
 use crate::segment::{COPY, Chunk, ChunkRef, FRAME, Own, Segment};
@@ -987,7 +988,8 @@ impl Store {
             if self.dictionary_of(kind).is_none() {
                 for &(_, loc, _) in group.iter().filter(|(_, loc, _)| loc.form == Form::Raw) {
                     let pack = &self.tiers[0].packs[loc.pack as usize];
-                    let Some(bytes) = pack.bytes(loc.offset + RECORD_HEADER, loc.raw).map(<[u8]>::to_vec) else {
+                    let payload = loc.offset.checked_add(RECORD_HEADER);
+                    let Some(bytes) = payload.and_then(|at| pack.bytes(at, loc.raw)).map(<[u8]>::to_vec) else {
                         continue;
                     };
                     self.sample(kind, &bytes);
@@ -1011,7 +1013,7 @@ impl Store {
                 }
             };
             for &(key, loc, row) in group {
-                if spent > 0 && spent + loc.raw > SETTLE_MOST {
+                if spent > 0 && spent.saturating_add(loc.raw) > SETTLE_MOST {
                     settled.more = true;
                     break 'kinds;
                 }
@@ -1050,7 +1052,7 @@ impl Store {
             }
         }
         for (key, loc, row) in promote {
-            if settled.more || (spent > 0 && spent + loc.raw > SETTLE_MOST) {
+            if settled.more || (spent > 0 && spent.saturating_add(loc.raw) > SETTLE_MOST) {
                 settled.more = true;
                 break;
             }
@@ -1146,12 +1148,18 @@ impl Store {
         let value = match look.find(&key) {
             Some(Ok(found)) if found.place == Place::Pack(loc) => look
                 .value(found, &key, Use::Move)
-                .map(|(header, bytes)| (header.content, bytes.into_owned())),
+                .map(|(header, bytes)| (header, bytes.into_owned())),
             Some(Err(corrupt)) => Err(corrupt),
             _ => return None,
         };
         match value {
-            Ok(value) => Some(value),
+            // `replace` counts the old record's bytes dead by `loc`, which came from an index
+            // slot nothing checked: it must be the record that was read.
+            Ok((header, _)) if header.stored != loc.stored || header.raw != loc.raw => {
+                self.problems.push(format!("{:x} is not moved: its record is not the one its index names", key.0));
+                None
+            }
+            Ok((header, bytes)) => Some((header.content, bytes)),
             Err(corrupt) => {
                 self.problems.push(format!("not moved between tiers: {corrupt}"));
                 None
@@ -1180,7 +1188,8 @@ impl Store {
             content,
         };
         self.rehome(unit, header, payload);
-        self.tiers[0].packs[old.pack as usize].dead += disk::aligned(RECORD_HEADER + old.stored);
+        self.tiers[0].packs[old.pack as usize].dead +=
+            disk::span_of(old.stored).expect("`movable` checked `old` against the record it read");
     }
 
     /// Writes a record the store moves into its own segment and points its key at it. The
@@ -2349,11 +2358,13 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
     for (number, pack) in tier.packs.iter().enumerate().filter(|(_, it)| !it.removed) {
         let fail = |why: String| (pack.file.clone(), why);
         let all = pack.mapping.as_ref().ok_or_else(|| fail("it was not mapped".into()))?.bytes();
-        let all = &all[..pack.committed as usize];
+        let all = usize::try_from(pack.committed).ok().and_then(|committed| all.get(..committed)).ok_or_else(
+            || fail(format!("it is {} bytes, shorter than the {} its head names", all.len(), pack.committed)),
+        )?;
         disk::check_pack_header(all, pack.unit).map_err(|why| fail(why.into()))?;
         let mut at = pack.indexed.max(PACK_HEADER);
         while at < pack.committed {
-            if all[at as usize..at as usize + 4] == [0; 4] {
+            if all.get(at as usize..at as usize + 4).is_none_or(|start| start == [0; 4]) {
                 let next = disk::blocks(at);
                 if next == at || all[at as usize..next as usize].iter().any(|&it| it != 0) {
                     return Err(fail(format!("at {at} is neither a record nor the zeros that end a commit")));

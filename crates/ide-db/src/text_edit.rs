@@ -4,6 +4,7 @@
 //! so `TextEdit` is the ultimate representation of the work done by
 //! rust-analyzer.
 
+use blaze_ids::radix;
 use itertools::Itertools;
 use macros::UpmapFromRaFixture;
 pub use span::{TextRange, TextSize};
@@ -210,7 +211,9 @@ fn assert_disjoint_or_equal(indels: &mut [Indel]) {
 }
 
 fn check_disjoint_and_sort(indels: &mut [Indel]) -> bool {
-    indels.sort_by_key(|indel| (indel.delete.start(), indel.delete.end()));
+    radix::sort_by_key(indels, |indel| {
+        radix::pack_32(indel.delete.start().into(), indel.delete.end().into())
+    });
     check_disjoint(&mut indels.iter())
 }
 

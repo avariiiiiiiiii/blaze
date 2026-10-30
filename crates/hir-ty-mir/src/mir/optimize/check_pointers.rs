@@ -32,6 +32,7 @@ use crate::{
     },
     next_solver::{Const, GenericArgs, Ty, TyKind, UnevaluatedConst},
 };
+
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
 /// Which of rustc's two pointer checks.
@@ -559,4 +560,44 @@ fn null_check<'db>(
     let is_ok = temp(body, consts.bool_ty);
     setup.push(assign(is_ok, Rvalue::UnaryOp(UnOp::Not, copy_of(fails)), span));
     Ok((copy_of(is_ok), msg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Lowered, lowered};
+    use crate::intrinsic::{AtomicOp, Intrinsic, SimdOp};
+
+    #[test]
+    fn what_lower_intrinsics_makes_of_each_intrinsic() {
+        assert_eq!(lowered(Intrinsic::Transmute), Some(Lowered::Transmute));
+        assert_eq!(lowered(Intrinsic::TransmuteUnchecked), Some(Lowered::Transmute));
+        assert_eq!(lowered(Intrinsic::UncheckedShr), Some(Lowered::Assign));
+        assert_eq!(lowered(Intrinsic::PtrMetadata), Some(Lowered::Assign));
+        assert_eq!(lowered(Intrinsic::ReadViaCopy), Some(Lowered::ReadViaCopy));
+        assert_eq!(lowered(Intrinsic::WriteViaMove), Some(Lowered::WriteViaMove));
+        assert_eq!(lowered(Intrinsic::OverflowChecks), Some(Lowered::Destination));
+        assert_eq!(lowered(Intrinsic::Forget), Some(Lowered::Destination));
+        assert_eq!(lowered(Intrinsic::Assume), Some(Lowered::Operands));
+        assert_eq!(lowered(Intrinsic::SliceGetUnchecked), Some(Lowered::SliceGetUnchecked));
+        assert_eq!(lowered(Intrinsic::Unreachable), Some(Lowered::Nothing));
+        // Calls `LowerIntrinsics` leaves terminators.
+        for kept in [
+            Intrinsic::Copy,
+            Intrinsic::SizeOf,
+            Intrinsic::VolatileLoad,
+            Intrinsic::Atomic(AtomicOp::Load),
+            Intrinsic::Simd(SimdOp::Add),
+        ] {
+            assert_eq!(lowered(kept), None, "{kept}");
+        }
+    }
+
+    #[test]
+    fn exactly_the_lowered_intrinsics_are_lowered() {
+        let count = (0..Intrinsic::COUNT as u16)
+            .filter_map(Intrinsic::from_index)
+            .filter(|&it| lowered(it).is_some())
+            .count();
+        assert_eq!(count, 29);
+    }
 }

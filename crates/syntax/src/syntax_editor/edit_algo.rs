@@ -2,6 +2,7 @@
 
 use std::{cmp::Ordering, ops::Range};
 
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 use stdx::format_to;
 use syntax_tree::TextRange;
@@ -628,7 +629,7 @@ impl TreeStore {
             .into_iter()
             .filter_map(|path| path.resolve(&new_root))
             .collect::<Vec<_>>();
-        changed_elements.sort_by_key(|element| element.text_range().start());
+        radix::sort_by_key(&mut changed_elements, |element| u32::from(element.text_range().start()));
 
         let mut annotations = FxHashMap::<SyntaxAnnotation, Vec<(usize, SyntaxElement)>>::default();
         for annotation in state.annotations {
@@ -642,7 +643,9 @@ impl TreeStore {
         let annotations = annotations
             .into_iter()
             .map(|(annotation, mut elements)| {
-                elements.sort_by_key(|(order, element)| (*order, element.text_range().start()));
+                radix::sort_by_key(&mut elements, |(order, element)| {
+                    radix::pack_64(*order as u64, u32::from(element.text_range().start()).into())
+                });
                 (annotation, elements.into_iter().map(|(_, element)| element).collect())
             })
             .collect();

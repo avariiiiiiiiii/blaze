@@ -35,6 +35,7 @@ use core::fmt;
 use std::{borrow::Cow, ops};
 
 use base_db::{Crate, SourceDatabase};
+use blaze_ids::radix;
 use either::Either;
 use mbe::MatchedArmIndex;
 use span::{
@@ -1800,7 +1801,9 @@ impl HirFileId {
                 .map(SyntaxError::range)
                 .collect(),
         };
-        ranges.sort_unstable_by_key(|range| (range.start(), range.end()));
+        radix::sort_copy_by_key(&mut ranges, |range| {
+            radix::pack_32(range.start().into(), range.end().into())
+        });
         ranges.into_boxed_slice()
     }
 }

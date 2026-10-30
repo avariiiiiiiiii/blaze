@@ -74,7 +74,7 @@ macro_rules! define_symbols {
 
         // The strings are in one `static` so that symbol equality holds and a symbol's index
         // is its offset in it.
-        static TEXTS: [Text; DECLARED] = [
+        pub(crate) static TEXTS: [Text; DECLARED] = [
             $( Text::new(stringify!($name)), )*
             $( Text::new($value), )*
         ];
@@ -741,4 +741,64 @@ define_symbols! {
     write_bytes, write_via_move,
     // `core::ub_checks` functions codegen answers as constants.
     check_language_ub, check_library_ub,
+    // Names older nightlies gave intrinsics, which `Intrinsic` keeps (see its docs):
+    atomic_and_acqrel, atomic_and_acquire, atomic_and_relaxed, atomic_and_release,
+    atomic_and_seqcst, atomic_cxchg_acqrel_acquire, atomic_cxchg_acqrel_relaxed,
+    atomic_cxchg_acqrel_seqcst, atomic_cxchg_acquire_acquire, atomic_cxchg_acquire_relaxed,
+    atomic_cxchg_acquire_seqcst, atomic_cxchg_relaxed_acquire, atomic_cxchg_relaxed_relaxed,
+    atomic_cxchg_relaxed_seqcst, atomic_cxchg_release_acquire, atomic_cxchg_release_relaxed,
+    atomic_cxchg_release_seqcst, atomic_cxchg_seqcst_acquire, atomic_cxchg_seqcst_relaxed,
+    atomic_cxchg_seqcst_seqcst, atomic_cxchgweak_acqrel_acquire, atomic_cxchgweak_acqrel_relaxed,
+    atomic_cxchgweak_acqrel_seqcst, atomic_cxchgweak_acquire_acquire,
+    atomic_cxchgweak_acquire_relaxed, atomic_cxchgweak_acquire_seqcst,
+    atomic_cxchgweak_relaxed_acquire, atomic_cxchgweak_relaxed_relaxed,
+    atomic_cxchgweak_relaxed_seqcst, atomic_cxchgweak_release_acquire,
+    atomic_cxchgweak_release_relaxed, atomic_cxchgweak_release_seqcst,
+    atomic_cxchgweak_seqcst_acquire, atomic_cxchgweak_seqcst_relaxed,
+    atomic_cxchgweak_seqcst_seqcst, atomic_fence_acqrel, atomic_fence_acquire, atomic_fence_release,
+    atomic_fence_seqcst, atomic_load_acquire, atomic_load_relaxed, atomic_load_seqcst,
+    atomic_max_acqrel, atomic_max_acquire, atomic_max_relaxed, atomic_max_release,
+    atomic_max_seqcst, atomic_min_acqrel, atomic_min_acquire, atomic_min_relaxed,
+    atomic_min_release, atomic_min_seqcst, atomic_nand_acqrel, atomic_nand_acquire,
+    atomic_nand_relaxed, atomic_nand_release, atomic_nand_seqcst, atomic_or_acqrel,
+    atomic_or_acquire, atomic_or_relaxed, atomic_or_release, atomic_or_seqcst,
+    atomic_singlethreadfence_acqrel, atomic_singlethreadfence_acquire,
+    atomic_singlethreadfence_release, atomic_singlethreadfence_seqcst, atomic_store_relaxed,
+    atomic_store_release, atomic_store_seqcst, atomic_umax_acqrel, atomic_umax_acquire,
+    atomic_umax_relaxed, atomic_umax_release, atomic_umax_seqcst, atomic_umin_acqrel,
+    atomic_umin_acquire, atomic_umin_relaxed, atomic_umin_release, atomic_umin_seqcst,
+    atomic_xadd_acqrel, atomic_xadd_acquire, atomic_xadd_relaxed, atomic_xadd_release,
+    atomic_xadd_seqcst, atomic_xchg_acqrel, atomic_xchg_acquire, atomic_xchg_relaxed,
+    atomic_xchg_release, atomic_xchg_seqcst, atomic_xor_acqrel, atomic_xor_acquire,
+    atomic_xor_relaxed, atomic_xor_release, atomic_xor_seqcst, atomic_xsub_acqrel,
+    atomic_xsub_acquire, atomic_xsub_relaxed, atomic_xsub_release, atomic_xsub_seqcst, box_new,
+    // Builtin attributes (`hir_expand::inert_attr_macro::INERT_ATTRIBUTES`) not named above,
+    // so that each is a declared symbol `find_builtin_attr_idx` finds by its index.
+    should_panic, automatically_derived, macro_escape, warn, expect, forbid, deny,
+    must_not_suspend, crate_name, crate_id, link, link_name, no_link, link_section, used,
+    link_ordinal, type_length_limit, move_size_limit, no_start, no_main, no_implicit_prelude,
+    windows_subsystem, panic_handler, no_builtins, track_caller, instruction_set, no_sanitize,
+    coverage, debugger_visualizer, naked, test_runner, reexport_test_harness_main, thread_local,
+    optimize, ffi_pure, ffi_const, cmse_nonsecure_entry, const_trait, deprecated_safe,
+    collapse_debuginfo, do_not_recommend, cfi_encoding, stable, rustc_const_unstable,
+    rustc_const_stable, rustc_default_body_unstable, rustc_allow_const_fn_unstable,
+    rustc_allowed_through_unstable_modules, rustc_nounwind, default_lib_allocator,
+    needs_allocator, linkage, rustc_std_internal_symbol, rustc_proc_macro_decls,
+    rustc_on_unimplemented, rustc_confusables, rustc_conversion_suggestion,
+    rustc_trivial_field_reads, rustc_lint_query_instability,
+    rustc_lint_untracked_query_information, rustc_lint_opt_ty, rustc_lint_opt_deny_field_access,
+    rustc_promotable, rustc_do_not_const_check, rustc_nonnull_optimization_guaranteed,
+    rustc_pass_by_value, rustc_never_returns_null_ptr, rustc_deny_explicit_impl, rustc_box,
+    rustc_inherit_overflow_checks, rustc_test_marker, rustc_unsafe_specialization_marker,
+    rustc_specialization_trait, rustc_main, rustc_must_implement_one_of, rustc_doc_primitive,
+    rustc_no_mir_inline, rustc_effective_visibility, rustc_outlives, rustc_capture_analysis,
+    rustc_insignificant_dtor, rustc_strict_coherence, rustc_variance, rustc_variance_of_opaques,
+    rustc_hidden_type_of_opaques, rustc_layout, rustc_abi, rustc_regions, rustc_dump_user_args,
+    rustc_evaluate_where_clauses, rustc_if_this_changed, rustc_then_this_would_need, rustc_clean,
+    rustc_partition_reused, rustc_partition_codegened, rustc_expected_cgu_reuse,
+    rustc_symbol_name, rustc_def_path, rustc_mir, rustc_dump_program_clauses,
+    rustc_dump_env_program_clauses, rustc_object_lifetime_default, rustc_dyn_incompatible_trait,
+    rustc_dump_vtable, rustc_dummy, omit_gdb_pretty_printer_section,
+    // fix-names: names code asked for by `Symbol::intern` of a literal.
+    abort,
 }

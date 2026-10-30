@@ -32,7 +32,7 @@ pub mod columns;
 
 use std::collections::BTreeMap;
 
-use blaze_ids::Fingerprint;
+use blaze_ids::{Fingerprint, radix};
 use blaze_query::{Edge, Memo, QueryKey};
 use serde::{Deserialize, Serialize};
 
@@ -499,7 +499,7 @@ pub fn sample<T: Clone>(items: &[T], n: usize, seed: u64) -> Vec<T> {
         at.swap(i, j);
     }
     let mut chosen = at[..n].to_vec();
-    chosen.sort_unstable();
+    radix::sort(&mut chosen);
     chosen.into_iter().map(|i| items[i].clone()).collect()
 }
 

@@ -23,6 +23,7 @@ use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value};
 use hir_def::FunctionId;
 use hir_ty::{
     db::HirDatabase,
+    intrinsic::{Intrinsic, SimdOp},
     layout::Layout,
     mir::{Operand, OperandKind, Rvalue, StatementKind},
     next_solver::{ConstKind, DbInterner, GenericArgs, Ty, TyKind},
@@ -1432,16 +1433,16 @@ impl<'db> FunctionCx<'_, 'db> {
     }
 
     /// The Rust intrinsics `core::arch`'s SVE functions use on scalable vectors. `false` when
-    /// `name` is none of them or has no scalable vector here.
+    /// `intrinsic` is none of them ([`on_scalable`]) or has no scalable vector here.
     pub(super) fn scalable_intrinsic(
         &mut self,
-        name: &str,
+        intrinsic: Intrinsic,
         generic_args: GenericArgs<'db>,
         args: &[Operand],
         dst: Value,
         dst_ty: Ty<'db>,
     ) -> Result<bool> {
-        let ours = name.starts_with("sve_tuple_") || matches!(name, "simd_select" | "simd_cast");
+        let ours = on_scalable(intrinsic);
         let Some(to) = self.scalable(dst_ty)?.filter(|_| ours) else { return Ok(false) };
         let mut operands = Vec::new();
         for arg in args {
@@ -1449,37 +1450,42 @@ impl<'db> FunctionCx<'_, 'db> {
             operands.push((addr, self.scalable(ty)?));
         }
         let vector = Size::from_bytes(DATA_MAX);
-        match (name, &operands[..]) {
-            ("sve_tuple_create2" | "sve_tuple_create3" | "sve_tuple_create4", _) => {
+        match (intrinsic, &operands[..]) {
+            (
+                Intrinsic::SveTupleCreate2
+                | Intrinsic::SveTupleCreate3
+                | Intrinsic::SveTupleCreate4,
+                _,
+            ) => {
                 if operands.len() as u64 != to.vectors
                     || operands
                         .iter()
                         .any(|(_, it)| it.is_none_or(|it| it.vectors != 1 || it.predicate()))
                 {
-                    unsupported!("`{name}` of {dst_ty:?}");
+                    unsupported!("`{intrinsic}` of {dst_ty:?}");
                 }
                 for (at, &(src, _)) in operands.iter().enumerate() {
                     let place = self.builder.ins().iadd_imm(dst, at as i64 * DATA_MAX as i64);
                     self.copy(place, src, vector);
                 }
             }
-            ("sve_tuple_get" | "sve_tuple_set", _) => {
+            (Intrinsic::SveTupleGet | Intrinsic::SveTupleSet, _) => {
                 let Some(index) = generic_args.iter().nth(2).and_then(|it| it.konst()) else {
-                    unsupported!("`{name}` without its index");
+                    unsupported!("`{intrinsic}` without its index");
                 };
                 let ConstKind::Value(index) = index.kind() else {
-                    unsupported!("`{name}` with an index not evaluated");
+                    unsupported!("`{intrinsic}` with an index not evaluated");
                 };
                 let index = index.value.inner().to_leaf().to_bits(Size::from_bytes(4)) as i32;
-                match (name, &operands[..]) {
-                    ("sve_tuple_get", [(tuple, Some(of))])
+                match (intrinsic, &operands[..]) {
+                    (Intrinsic::SveTupleGet, [(tuple, Some(of))])
                         if (0..of.vectors as i32).contains(&index) && to.vectors == 1 =>
                     {
                         let place =
                             self.builder.ins().iadd_imm(*tuple, index as i64 * DATA_MAX as i64);
                         self.copy(dst, place, vector);
                     }
-                    ("sve_tuple_set", [(tuple, Some(of)), (value, Some(one))])
+                    (Intrinsic::SveTupleSet, [(tuple, Some(of)), (value, Some(one))])
                         if (0..of.vectors as i32).contains(&index)
                             && one.vectors == 1
                             && *of == to =>
@@ -1489,16 +1495,19 @@ impl<'db> FunctionCx<'_, 'db> {
                             self.builder.ins().iadd_imm(dst, index as i64 * DATA_MAX as i64);
                         self.copy(place, *value, vector);
                     }
-                    _ => unsupported!("`{name}` of {dst_ty:?} at {index}"),
+                    _ => unsupported!("`{intrinsic}` of {dst_ty:?} at {index}"),
                 }
             }
-            ("simd_select", [(mask, Some(mask_shape)), (a, Some(value)), (b, Some(_))]) => {
+            (
+                Intrinsic::Simd(SimdOp::Select),
+                [(mask, Some(mask_shape)), (a, Some(value)), (b, Some(_))],
+            ) => {
                 let text = select(*mask_shape, *value).map_err(CodegenError::Unsupported)?;
                 let mut sig = self.cg.make_signature();
                 sig.params.extend([AbiParam::new(ptr()); 4]);
                 self.call_stub(text, &sig, &[dst, *mask, *a, *b], Ret::Vector(to), dst);
             }
-            ("simd_cast", [(src, Some(from))]) => {
+            (Intrinsic::Simd(SimdOp::Cast), [(src, Some(from))]) => {
                 match cast(*from, to).map_err(CodegenError::Unsupported)? {
                     None => self.copy(dst, *src, Size::from_bytes(to.storage())),
                     Some(text) => {
@@ -1508,10 +1517,24 @@ impl<'db> FunctionCx<'_, 'db> {
                     }
                 }
             }
-            _ => unsupported!("intrinsic `{name}` on scalable vectors"),
+            _ => unsupported!("intrinsic `{intrinsic}` on scalable vectors"),
         }
         Ok(true)
     }
+}
+
+/// Whether `intrinsic` is one [`FunctionCx::scalable_intrinsic`] lowers on scalable vectors:
+/// the `sve_tuple_*` ones, `simd_select` and `simd_cast`.
+fn on_scalable(intrinsic: Intrinsic) -> bool {
+    matches!(
+        intrinsic,
+        Intrinsic::SveTupleCreate2
+            | Intrinsic::SveTupleCreate3
+            | Intrinsic::SveTupleCreate4
+            | Intrinsic::SveTupleGet
+            | Intrinsic::SveTupleSet
+            | Intrinsic::Simd(SimdOp::Select | SimdOp::Cast)
+    )
 }
 
 #[cfg(test)]
@@ -1531,6 +1554,28 @@ mod tests {
         assert!(text.contains("mov w0, #16\n"), "{text}");
         let text = stub("aarch64.sve.cntw", &[Arg::Int(32, Some(7))], Ret::Int(64)).unwrap();
         assert!(text.contains("cntw x0, vl7\n"), "{text}");
+    }
+
+    #[test]
+    fn scalable_intrinsics_are_the_tuples_select_and_cast() {
+        let named = |name: &str| {
+            let intrinsic = Intrinsic::from_symbol(&intern::Symbol::intern(name));
+            intrinsic.unwrap_or_else(|| panic!("{name}"))
+        };
+        for name in [
+            "sve_tuple_create2",
+            "sve_tuple_create3",
+            "sve_tuple_create4",
+            "sve_tuple_get",
+            "sve_tuple_set",
+            "simd_select",
+            "simd_cast",
+        ] {
+            assert!(on_scalable(named(name)), "{name}");
+        }
+        for name in ["simd_as", "simd_select_bitmask", "simd_add", "transmute"] {
+            assert!(!on_scalable(named(name)), "{name}");
+        }
     }
 
     #[test]

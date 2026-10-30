@@ -4,9 +4,11 @@
 
 use std::ops::Range;
 
-pub(crate) const MIN: usize = 16 << 10;
+/// The shortest chunk but a value's last.
+pub const MIN: usize = 16 << 10;
 pub(crate) const AVERAGE: usize = 64 << 10;
-pub(crate) const MAX: usize = 256 << 10;
+/// The longest chunk.
+pub const MAX: usize = 256 << 10;
 
 /// Before [`AVERAGE`] a cut needs more of the hash's top bits zero (18), after it fewer (14),
 /// which keeps chunk sizes near the average.
@@ -246,8 +248,8 @@ fn cut_scalar(bytes: &[u8]) -> usize {
 }
 
 /// The chunks of `bytes`, in order, covering all of it: each at most [`MAX`], each but the last
-/// at least [`MIN`].
-pub(crate) fn chunks(bytes: &[u8]) -> Vec<Range<usize>> {
+/// at least [`MIN`]. These are the pieces the store keeps an output as.
+pub fn chunks(bytes: &[u8]) -> Vec<Range<usize>> {
     let mut out = Vec::with_capacity(bytes.len() / AVERAGE + 1);
     let mut start = 0;
     while start < bytes.len() {

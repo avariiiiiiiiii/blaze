@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
 use std::{fmt, mem, ops};
 
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::{ContentId, Hasher, radix};
 use cfg::{CfgOptions, HashableCfgOptions};
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
@@ -1100,7 +1100,9 @@ impl CrateGraphBuilder {
         // However, the overhead is small and it makes the `extend` method harder to misuse.
         self.arena
             .iter_mut()
-            .for_each(|(_, data)| data.basic.dependencies.sort_by_key(|dep| dep.crate_id));
+            .for_each(|(_, data)| {
+                radix::sort_by_key(&mut data.basic.dependencies, |dep| dep.crate_id.into_raw().into_u32())
+            });
 
         let m = self.arena.len();
         let topo = other.crates_in_topological_order();
@@ -1113,7 +1115,7 @@ impl CrateGraphBuilder {
                 .dependencies
                 .iter_mut()
                 .for_each(|dep| dep.crate_id = id_map[&dep.crate_id]);
-            crate_data.basic.dependencies.sort_by_key(|dep| dep.crate_id);
+            radix::sort_by_key(&mut crate_data.basic.dependencies, |dep| dep.crate_id.into_raw().into_u32());
 
             let find = self.arena.iter().take(m).find_map(|(k, v)| (v == crate_data).then_some(k));
             let new_id = find.unwrap_or_else(|| self.arena.alloc(crate_data.clone()));

@@ -21,8 +21,11 @@ mod invalid;
 mod transmutes;
 
 use hir::db::HirDatabase;
-use hir_def::{FunctionId, HasModule as _, hir::ExprId, signatures::FunctionSignature};
-use hir_ty::next_solver::{DbInterner, Region, Ty};
+use hir_def::{FunctionId, HasModule as _, hir::ExprId};
+use hir_ty::{
+    intrinsic::{Intrinsic, intrinsic_of},
+    next_solver::{DbInterner, Region, Ty},
+};
 use syntax::AstNode as _;
 
 use crate::lints::bodies::{BodyCx, LatePass, types::util};
@@ -38,9 +41,11 @@ pub(super) fn passes() -> Vec<Box<dyn LatePass>> {
     ]
 }
 
-/// rustc's `is_intrinsic(def, sym::transmute)`: `def` is the intrinsic `transmute`.
+/// rustc's `is_intrinsic(def, sym::transmute)`: `def` is the intrinsic `transmute`. An
+/// intrinsic rustc doesn't have is none of rustc's, `transmute` included; MIR lowering refuses
+/// its calls.
 fn is_transmute(db: &dyn HirDatabase, def: FunctionId) -> bool {
-    FunctionSignature::is_intrinsic(db, def) && *FunctionSignature::of(db, def).name.symbol() == util::items().transmute
+    matches!(intrinsic_of(db, def), Ok(Some(Intrinsic::Transmute)))
 }
 
 /// `ty` with its free regions erased, as rustc's type checking results have them.

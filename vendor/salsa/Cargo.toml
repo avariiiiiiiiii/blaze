@@ -429,6 +429,10 @@ name = "task_sync"
 path = "tests/task_sync.rs"
 
 [[test]]
+name = "unclaimed_verify"
+path = "tests/unclaimed_verify.rs"
+
+[[test]]
 name = "tracked-struct-entries"
 path = "tests/tracked-struct-entries.rs"
 

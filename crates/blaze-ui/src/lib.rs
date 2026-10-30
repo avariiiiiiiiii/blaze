@@ -36,9 +36,10 @@ pub use plain::Plain;
 use std::fmt;
 use std::hash::BuildHasher;
 
+use blaze_ids::radix;
 use blaze_protocol::events::{
-    Cache, Cause, CrateState, Event, Fns, Level, NodeKind, NodeState, Record, SLOW_NS, Slow, Step,
-    Summary, Took,
+    Cache, Cause, CrateState, Event, Fns, Level, NodeBatch, NodeKind, NodeState, Order, Record,
+    SLOW_NS, Slow, Step, Summary, Took,
 };
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
@@ -56,7 +57,8 @@ pub struct Build {
     pub command: Option<String>,
     /// Every step begun, in order.
     pub steps: Vec<Stepped>,
-    /// The nodes of the build's graph ([`Event::Node`]), each after what it waits for.
+    /// The nodes of the build's graph ([`Event::Node`], [`Event::Nodes`]), each after what it
+    /// waits for.
     pub graph: Vec<Noded>,
     /// Every crate of the graph, and every other the build said anything of, in the order it
     /// first did; and a row for each node of the graph that is not a crate's (a build
@@ -68,6 +70,8 @@ pub struct Build {
     /// How many more were compiled again than `rebuilt` names.
     pub unlisted: u64,
     pub refused: Vec<(String, String)>,
+    /// Why each record that could not be read was refused, said as an error.
+    pub malformed: Vec<String>,
     pub finished: Option<Finished>,
     /// The time of the last record.
     pub last_ns: u64,
@@ -133,6 +137,8 @@ struct Index {
     /// change: buffers kept for the next record.
     name: String,
     flips: Vec<u32>,
+    /// The order of the nodes of an [`Event::Nodes`] as it is read, kept for the next.
+    order: Order,
 }
 
 /// A kind of step begun: how many of it are under way, how long those done took, and the
@@ -532,6 +538,8 @@ pub enum Change<'a> {
     },
     Said(Level, &'a str),
     Refused(usize),
+    /// The record at this index of [`Build::malformed`] could not be read.
+    Malformed(usize),
     Rebuilt(usize),
     Finished,
 }
@@ -576,26 +584,27 @@ impl Build {
                 Change::Nothing
             }
             Event::Node { id, kind, name, deps } => {
-                let mut row_name = std::mem::take(&mut self.index.name);
-                row_name.clear();
-                row_name.push_str(name);
-                if let Some(what) = own(*kind) {
-                    row_name.push(' ');
-                    row_name.push_str(what);
-                }
-                let row = self.index.row(&mut self.crates, &row_name, at);
-                self.index.name = row_name;
-                let node = self.graph.len() as u32;
-                let from = self.deps.len();
-                let nodes = &self.index.nodes;
-                self.deps.extend(deps.iter().filter_map(|dep| nodes.get(dep).copied()));
-                let to = self.deps.len();
-                let deps = (from as u32, to as u32);
-                self.graph.push(Noded { id: *id, row: row as u32, deps, kind: *kind });
-                let busy = self.crates[row].is_busy();
-                self.index.node(node, row, &self.deps[from..to], busy);
-                self.index.nodes.insert(*id, node);
+                self.noded(*id, *kind, name, deps, at);
                 Change::Nothing
+            }
+            Event::Nodes { first, kinds, names, name_at, deps, deps_at } => {
+                let mut order = std::mem::take(&mut self.index.order);
+                let read = NodeBatch::new(*first, kinds, names, name_at, deps, deps_at, &mut order);
+                let change = match read {
+                    Ok(batch) => {
+                        for &place in order.places() {
+                            let node = batch.node(place as usize);
+                            self.noded(node.id, node.kind, node.name, node.deps, at);
+                        }
+                        Change::Nothing
+                    }
+                    Err(why) => {
+                        self.malformed.push(why.to_string());
+                        Change::Malformed(self.malformed.len() - 1)
+                    }
+                };
+                self.index.order = order;
+                change
             }
             Event::Moved { id, state } => match self.index.nodes.get(id) {
                 Some(&node) => {
@@ -717,6 +726,30 @@ impl Build {
         }
     }
 
+    /// Takes in node `id` of the graph, said at `at`: a row for it, and what it waits for of
+    /// the nodes said before it.
+    fn noded(&mut self, id: u32, kind: NodeKind, name: &str, deps: &[u32], at: u64) {
+        let mut row_name = std::mem::take(&mut self.index.name);
+        row_name.clear();
+        row_name.push_str(name);
+        if let Some(what) = own(kind) {
+            row_name.push(' ');
+            row_name.push_str(what);
+        }
+        let row = self.index.row(&mut self.crates, &row_name, at);
+        self.index.name = row_name;
+        let node = self.graph.len() as u32;
+        let from = self.deps.len();
+        let nodes = &self.index.nodes;
+        self.deps.extend(deps.iter().filter_map(|dep| nodes.get(dep).copied()));
+        let to = self.deps.len();
+        let deps = (from as u32, to as u32);
+        self.graph.push(Noded { id, row: row as u32, deps, kind });
+        let busy = self.crates[row].is_busy();
+        self.index.node(node, row, &self.deps[from..to], busy);
+        self.index.nodes.insert(id, node);
+    }
+
     /// Has the crate at `row` in `state` from `at` ([`Crated::moved`]), and the counts with it.
     fn moved(&mut self, row: usize, state: CrateState, at: u64) -> bool {
         let krate = &mut self.crates[row];
@@ -754,7 +787,7 @@ impl Build {
         let of = self.compiling.iter().filter(|(it, _)| it.krate == krate);
         let of = of.map(|(it, since)| (it.name.as_str(), now_ns.saturating_sub(*since)));
         let mut of: Vec<_> = of.filter(|it| it.1 >= SLOW_NS).collect();
-        of.sort_by_key(|it| std::cmp::Reverse(it.1));
+        radix::sort_copy_by_key(&mut of, |it| !it.1);
         of
     }
 
@@ -944,7 +977,7 @@ impl Build {
             }
         }
         // Longest first; of the same length, the one begun first.
-        by_step.sort_by_key(|it| std::cmp::Reverse(it.took_ns));
+        radix::sort_by_key(&mut by_step, |it| !it.took_ns);
         let worth = (now_ns / 50).max(100_000_000);
         by_step.retain(|it| it.took_ns >= worth);
         by_step.truncate(LISTED);
@@ -1277,6 +1310,10 @@ fn staying(
         Change::Refused(at) => {
             let (name, why) = &build.refused[at];
             said(out, Level::Error, format_args!("blaze does not build `{name}`: {why}"), color);
+            out.push('\n');
+        }
+        Change::Malformed(at) => {
+            said(out, Level::Error, &build.malformed[at], color);
             out.push('\n');
         }
         Change::Finished if !live => {

@@ -5,8 +5,6 @@ mod add;
 mod builtin;
 mod unexpected;
 
-use syntax::Edition;
-
 use crate::{
     Options,
     emit::Style,
@@ -20,9 +18,7 @@ fn flags(check_cfg: &[&str], cfg: &[&str], cargo: bool) -> Options {
     for spec in check_cfg {
         options.lints.check_cfg.add(spec).expect("the test's `--check-cfg` is rustc's");
     }
-    for spec in cfg {
-        options.lints.check_cfg.add_cfg(spec, Edition::Edition2015).expect("the test's `--cfg` is rustc's");
-    }
+    options.lints.cfg.extend(cfg.iter().map(|&it| it.to_owned()));
     options.lints.check_cfg.cargo = cargo;
     options
 }

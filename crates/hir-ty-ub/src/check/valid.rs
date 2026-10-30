@@ -11,6 +11,7 @@
 
 use std::{fmt, ops::Range};
 
+use blaze_ids::radix;
 use hir_def::{
     AdtId, EnumId, EnumVariantId, HasModule, Lookup, VariantId,
     signatures::{StructSignature, VariantFields},
@@ -817,7 +818,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
             return Ok(());
         }
         let data = &mut self.plans.data;
-        data.sort_unstable_by_key(|it| it.0);
+        radix::sort_copy_by_key(data, |&(at, len)| radix::pack_64(at, len));
         let mut done = 0;
         for &(at, len) in data.iter() {
             if at > done {
@@ -916,7 +917,7 @@ impl<'db> Plans<'db> {
             for op in &ops {
                 op_data(op, cx.target.pointer_size().bytes(), &mut covered);
             }
-            covered.sort_unstable_by_key(|it| it.0);
+            radix::sort_copy_by_key(&mut covered, |&(at, len)| radix::pack_64(at, len));
             let mut done = 0;
             for (at, len) in covered {
                 if at > done {
@@ -1065,7 +1066,7 @@ impl<'db> Plans<'db> {
                     let start = self.unions.len() as u32;
                     self.union_data(cx, ty, layout, 0)?;
                     let mut data = self.unions.split_off(start as usize);
-                    data.sort_unstable_by_key(|it| it.0);
+                    radix::sort_copy_by_key(&mut data, |&(off, len)| radix::pack_64(off, len));
                     let mut merged: Vec<(u64, u64)> = Vec::with_capacity(data.len());
                     for (off, len) in data {
                         match merged.last_mut() {
@@ -1129,7 +1130,7 @@ impl<'db> Plans<'db> {
         order.clear();
         order.extend(0..fields.len() as u32);
         if fields.len() > 0 {
-            order.sort_by_key(|&i| shape.offset(i as usize));
+            radix::sort_by_key(&mut order, |&i| shape.offset(i as usize).bytes());
         }
         let _ = layout;
         let result = (|| {
@@ -1542,7 +1543,7 @@ fn box_is_global<'db>(db: &'db dyn HirDatabase, args: hir_ty::next_solver::Gener
 
 /// Sorts and merges touching ranges.
 pub(crate) fn merge(cells: &mut Vec<Span>) {
-    cells.sort_unstable_by_key(|it| it.start);
+    radix::sort_copy_by_key(cells, |it| radix::pack_64(it.start, it.len));
     let mut out = 0;
     for i in 0..cells.len() {
         let c = cells[i];

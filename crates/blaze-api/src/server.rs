@@ -24,6 +24,7 @@
 use std::{fmt, net::SocketAddr};
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, FileName, Tag};
+use blaze_ids::radix;
 use blaze_protocol::cbor;
 use rustc_hash::FxHashMap;
 
@@ -248,7 +249,7 @@ impl Server {
             }
         }
         let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
-        conns.sort_unstable();
+        radix::sort_copy_by_key(&mut conns, |it| it.0);
         for conn in conns {
             self.gone(conn, effects);
         }

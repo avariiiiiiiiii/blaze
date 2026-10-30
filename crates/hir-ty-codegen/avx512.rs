@@ -21,6 +21,8 @@
 
 #![forbid(unsafe_code)]
 
+use hir_ty::{TargetFeature, TargetFeatureSet, intrinsic::SimdOp};
+
 /// An operand of the intrinsic as the code generator has it: its size, whether it is an
 /// address, and its value where that is a constant integer.
 #[derive(Clone, Copy, Debug)]
@@ -120,7 +122,7 @@ pub(super) fn lower(
     name: &str,
     args: &[Given],
     result: u32,
-    features: &[&str],
+    features: TargetFeatureSet,
 ) -> Option<Result<Lowered, String>> {
     let mut words: Vec<&str> = name.strip_prefix("x86.")?.split('.').collect();
     let width = match words.last() {
@@ -158,7 +160,7 @@ fn lowered(
     width: Option<u32>,
     args: &[Given],
     result: u32,
-    features: &[&str],
+    features: TargetFeatureSet,
 ) -> Option<Result<Lowered, String>> {
     let vector = |at: usize| {
         let it = args.get(at)?;
@@ -301,7 +303,7 @@ fn lowered(
             if a < 32 || result != a / 2 {
                 return None;
             }
-            if features.contains(&"avxneconvert") {
+            if features.contains(TargetFeature::AVXNECONVERT) {
                 return Some(Err("in a function with AVX-NE-CONVERT too".to_owned()));
             }
             let text = format!("{{evex}} vcvtneps2bf16 {}, {}", out(result), arg(a, 0));
@@ -344,7 +346,7 @@ fn lowered(
                 if a != bytes || result != 16 {
                     return None;
                 }
-                if features.contains(&"avx512bf16") {
+                if features.contains(TargetFeature::AVX512BF16) {
                     return Some(Err("in a function with AVX512-BF16 too".to_owned()));
                 }
                 let text = format!("{{vex}} vcvtneps2bf16 xmm0, {}", arg(a, 0));
@@ -491,7 +493,7 @@ fn lowered(
             // takes the shorter encoding) and AVX512-VNNI's otherwise: each runs only on a
             // processor with its extension. AVX-VNNI-INT8's and -INT16's have one encoding.
             let encoding = match (*family, result) {
-                ("avx512", 16 | 32) if features.contains(&"avxvnni") => "{vex} ",
+                ("avx512", 16 | 32) if features.contains(TargetFeature::AVXVNNI) => "{vex} ",
                 ("avx512", 16 | 32) => "{evex} ",
                 _ => "",
             };
@@ -594,31 +596,36 @@ fn lowered(
     }
 }
 
-/// The instruction LLVM selects for the generic intrinsic `name` of `core::intrinsics::simd`
+/// The instruction LLVM selects for the generic intrinsic `op` of `core::intrinsics::simd`
 /// on a vector of halves of `from` bytes, giving `to` bytes, in a function with the target
 /// features `features` (implied ones included): AVX512-FP16's of the lanes for the arithmetic,
 /// operands in order, and F16C's `vcvtph2ps` for `simd_cast` to single floats where the
 /// function does not have AVX512-FP16, which converts by its own. `None` for any other.
 pub(super) fn half_vector(
-    name: &str,
+    op: SimdOp,
     from: u32,
     to: u32,
-    features: impl Fn(&str) -> bool,
+    features: impl Fn(TargetFeature) -> bool,
 ) -> Option<Lowered> {
-    let fp16 =
-        features("avx512fp16") && (from == 64 || matches!(from, 16 | 32) && features("avx512vl"));
-    let (text, loads) = match name {
-        "simd_add" | "simd_sub" | "simd_mul" | "simd_div" if fp16 && from == to => {
-            let op = &name["simd_".len()..];
+    let fp16 = features(TargetFeature::AVX512FP16)
+        && (from == 64 || matches!(from, 16 | 32) && features(TargetFeature::AVX512VL));
+    let (text, loads) = match op {
+        SimdOp::Add | SimdOp::Sub | SimdOp::Mul | SimdOp::Div if fp16 && from == to => {
+            let op = match op {
+                SimdOp::Add => "add",
+                SimdOp::Sub => "sub",
+                SimdOp::Mul => "mul",
+                _ => "div",
+            };
             let text = format!("v{op}ph {}, {}, {}", reg(to, 0), arg(from, 0), arg(from, 1));
             (text, vec![Load::Vector(from); 2])
         }
-        "simd_fsqrt" if fp16 && from == to => {
+        SimdOp::Fsqrt if fp16 && from == to => {
             (format!("vsqrtph {}, {}", reg(to, 0), arg(from, 0)), vec![Load::Vector(from)])
         }
-        "simd_cast"
-            if features("f16c")
-                && !features("avx512fp16")
+        SimdOp::Cast
+            if features(TargetFeature::F16C)
+                && !features(TargetFeature::AVX512FP16)
                 && matches!((from, to), (8, 16) | (16, 32)) =>
         {
             (format!("vcvtph2ps {}, xmm1", reg(to, 0)), vec![Load::Vector(from)])
@@ -833,6 +840,7 @@ mod tests {
     fn describe(cases: &[(&str, &str, u32, &[&str])]) -> String {
         let mut out = String::new();
         for &(name, shape, result, features) in cases {
+            let features = features.iter().map(|it| TargetFeature::from_name(it).unwrap()).collect();
             let text = match lower(name, &given(shape), result, features) {
                 Some(Ok(it)) => format!("{} {:?}", it.text.replace('\n', "; "), it.out),
                 Some(Err(e)) => e,
@@ -988,5 +996,27 @@ x86.vcvtneoph2ps256: vcvtneoph2ps ymm0, ymmword ptr [r11] Vector(32)
 x86.vbcstnebf162ps128: vbcstnebf162ps xmm0, word ptr [r11] Vector(16)
 ";
         assert_eq!(described, expected);
+    }
+
+    #[test]
+    fn half_vectors_by_simd_op() {
+        let all = |_: TargetFeature| true;
+        let text = |op, from, to, features: &dyn Fn(TargetFeature) -> bool| {
+            half_vector(op, from, to, features).map(|it| it.text)
+        };
+        for (op, mnemonic) in [
+            (SimdOp::Add, "vaddph"),
+            (SimdOp::Sub, "vsubph"),
+            (SimdOp::Mul, "vmulph"),
+            (SimdOp::Div, "vdivph"),
+        ] {
+            assert_eq!(text(op, 16, 16, &all).unwrap(), format!("{mnemonic} xmm0, xmm1, xmm2"));
+        }
+        assert_eq!(text(SimdOp::Fsqrt, 64, 64, &all).unwrap(), "vsqrtph zmm0, zmm1");
+        let f16c = |it: TargetFeature| it == TargetFeature::F16C;
+        assert_eq!(text(SimdOp::Cast, 8, 16, &f16c).unwrap(), "vcvtph2ps xmm0, xmm1");
+        assert_eq!(text(SimdOp::Cast, 8, 16, &all), None);
+        assert_eq!(text(SimdOp::Neg, 16, 16, &all), None);
+        assert_eq!(text(SimdOp::Add, 16, 16, &f16c), None);
     }
 }

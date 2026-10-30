@@ -346,6 +346,38 @@ fn f() -> &'static str { intrinsics::type_name::<B>() }
 }
 
 #[test]
+fn only_the_name_and_id_intrinsics_observe_names() {
+    let (db, _) = single(
+        r#"
+#![feature(intrinsics)]
+mod intrinsics {
+    #[rustc_intrinsic]
+    pub const fn type_name<T: ?Sized>() -> &'static str;
+    #[rustc_intrinsic]
+    pub const fn type_id<T: ?Sized + 'static>() -> u128;
+    #[rustc_intrinsic]
+    pub const fn size_of<T>() -> usize;
+    #[rustc_intrinsic]
+    pub fn sqrtf32(x: f32) -> f32;
+}
+mod plain {
+    pub fn type_name() -> &'static str { "" }
+}
+"#,
+    );
+    let observes = |path: &str| {
+        let ItemId::Function(func) = item(&db, path) else { panic!("`{path}` is no fn") };
+        crate::observes_names(&db, func)
+    };
+    assert!(observes("intrinsics::type_name"));
+    assert!(observes("intrinsics::type_id"));
+    assert!(!observes("intrinsics::size_of"));
+    assert!(!observes("plain::type_name"));
+    // Not an intrinsic of the pinned nightly: refused where it is called, keyed on names here.
+    assert!(observes("intrinsics::sqrtf32"));
+}
+
+#[test]
 fn a_no_mangle_fn_s_name_is_its_interface() {
     let (mut db, file) = single(
         r#"

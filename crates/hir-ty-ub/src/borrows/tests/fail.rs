@@ -84,20 +84,6 @@ fn iw_arg_mut(s: &mut Sim, p: Ptr, len: u64) -> R<Ptr> {
     arg(s, p, PtrKind::Mut, true, &[], len, true)
 }
 
-/// Two threads' innermost frames, the other thread's on top: swaps them so the next `ret`
-/// returns the one below. Miri keeps a frame stack per thread; the model's one stack holds
-/// both threads' frames, and frames of different threads return in any order.
-fn swap_top_frames(s: &mut Sim) {
-    let b = &mut s.b;
-    let n = b.frames.len();
-    assert!(n >= 2, "two frames to swap");
-    let below = b.frames[n - 2] as usize;
-    let top = b.frames[n - 1] as usize;
-    b.protected[below..].rotate_left(top - below);
-    let top_len = b.protected.len() - top;
-    b.frames[n - 1] = (below + top_len) as u32;
-}
-
 /// `Box::new(v)` of a `len`-byte `v`: `box_new_uninit` hands out the heap block's root
 /// pointer, `write_via_move` writes `v` through it, `transmute(ptr)` writes the `Box` into the
 /// return place, and the return value is copied into the caller; each typed write of the
@@ -591,37 +577,42 @@ fn repeated_foreign_read_lazy_conflicted() {
 
 /// Miri: tests/fail/tree_borrows/reservedim_spurious_write.rs, revisions `without` and
 /// `with` (the spurious write `*x = 64`). The two threads run in the order the barriers
-/// force (the `.stderr`'s "Thread n executing" lines); thread 2's `inner` returns before
-/// thread 1's, so one frame stack holds both. The barriers, `Arc`s and `eprintln!`s touch
-/// other allocations only.
+/// force (the `.stderr`'s "Thread n executing" lines). The barriers, `Arc`s and `eprintln!`s
+/// touch other allocations only.
 fn reservedim_spurious_write(with: bool) {
     let mut s = Sim::new();
     // let mut data = 0u8;
     let data = s.alloc(1);
     // let ptr = SendPtr(std::ptr::addr_of_mut!(data));
     // thread 1: inner(unsafe { &mut *ptr.0 }, b.clone());   (retag x)
+    s.thread(1);
     let x = s.mutable(data, 1).unwrap();
     s.call();
     let x = s.arg_mut(x, 1).unwrap();
     //   *x = 42; // activate immediately
     s.write(x, 1).unwrap();
     // thread 2: let y_zst = unsafe { &mut *(ptr.0 as *mut Cell<()>) };   ([lazy] retag y)
+    s.thread(2);
     let y = s.mutable_cell(data, 0, &[]).unwrap();
     // thread 2: let y = inner(y_zst, b.clone());
     s.call();
     let y = s.arg_mut_cell(y, 0, &[]).unwrap();
     let created = s.last_site();
     // thread 1: if cfg!(with) { *x = 64; }   (spurious write x)
+    s.thread(1);
     let spurious = with.then(|| {
         s.write(x, 1).unwrap();
         s.last_site()
     });
     // thread 2: `y as *mut Cell<()> as *mut u8`, returned   (ret y)
+    s.thread(2);
     s.ret().unwrap();
     // thread 1: `inner` returns   (ret x)
+    s.thread(1);
     s.ret().unwrap();
     let released = s.last_site();
     // thread 2: unsafe { *y = 13 }   (write y)
+    s.thread(2);
     let e = expect_ub(s.write(y, 1), ChildAccessForbidden, "write access through");
     expect_title(&e, "write access through <TAG> at ALLOC[0x0] is forbidden");
     expect_detail(&e, "the accessed tag <TAG> has state Disabled which forbids this child write access");
@@ -710,7 +701,7 @@ fn return_invalid_mut() {
 
 /// Miri: tests/fail/tree_borrows/spurious_read.rs (`retagx_retagy_retx_writey_rety`). The
 /// threads run in the order the barriers force; thread 1's `as_mut` returns while thread 2's
-/// is still running, so its frame is swapped above thread 2's before the `ret`.
+/// is still running.
 #[test]
 fn spurious_read() {
     let mut s = Sim::new();
@@ -718,18 +709,21 @@ fn spurious_read() {
     let data = s.alloc(1);
     // let ptr = SendPtr(std::ptr::addr_of_mut!(data));
     // thread 1: let _x = as_mut(unsafe { &mut *ptr.0 }, b.clone());   (retag x)
+    s.thread(1);
     let x = s.mutable(data, 1).unwrap();
     s.call();
     s.arg_mut(x, 1).unwrap();
     // thread 2: let _y = as_mut(unsafe { &mut *ptr.0 }, b.clone());   (retag y)
+    s.thread(2);
     let y = s.mutable(data, 1).unwrap();
     s.call();
     let y = s.arg_mut(y, 1).unwrap();
     let created = s.last_site();
     // thread 1: `let x = x as *mut u8; x`, and `as_mut` returns   (ret x)
-    swap_top_frames(&mut s);
+    s.thread(1);
     s.ret().unwrap();
     let released = s.last_site();
+    s.thread(2);
     // thread 2: let y = y as *mut u8;
     //           unsafe { *y = 2; }   (write y)
     let e = expect_ub(s.write(y, 1), ChildAccessForbidden, "write access through");
@@ -1175,6 +1169,7 @@ mod implicit_writes {
         // thread 1: let _v = *x;
         s.read(x, 1).unwrap();
         // thread 2: write(&mut *y, 42, &barrier);   the reborrow (a read), then the argument
+        s.thread(2);
         let y = s.mutable(y, 1).unwrap();
         assert_eq!(s.b.retag_accesses(), &[(Span::new(0, 1), AccessKind::Read)]);
         s.call();
@@ -1205,6 +1200,10 @@ mod implicit_writes {
         let x = s.mutable(x, 8).unwrap();
         let accessed = s.last_site();
         assert_eq!(s.b.retag_accesses(), &[(Span::new(0, 8), AccessKind::Read)]);
+        // What `check` asks before the retag, to refuse it as `WriteToReadOnly` as Miri does.
+        let entry = NewPermission::new(PtrKind::Mut, RetagMode::FnEntry, true, true, &[]);
+        assert!(entry.clone().with_implicit_writes(true).writes());
+        assert!(!entry.writes());
         s.call();
         let e = expect_ub(iw_arg_mut(&mut s, x, 8), ChildAccessForbidden, "reborrow through");
         expect_title(&e, "reborrow through <TAG> at ALLOC[0x0] is forbidden");

@@ -6,18 +6,20 @@
 //! and never move: 12 bytes a key.
 //!
 //! The map from a key to its node is the SwissTable of `crates/intern/src/arena.rs`
-//! (docs/v2/plan/design/hardware.md, "interner and memo lookups"), with the key and node held in
-//! the slot: groups of seven 16-byte slots and a control word of tag bytes on one 128-byte pair of
-//! lines, found with no lock and no write. A miss takes its shard's lock to look again and insert.
-//! A table grows by copying into one twice its size, published once full; the tables it outgrew
-//! stay, as a reader may be probing one, until the database is dropped. Shards are four times the
+//! (docs/v2/plan/design/hardware.md, "interner and memo lookups"), its slots holding only the
+//! node: groups of seven 4-byte slots and a control word of tag bytes in 40 bytes, found with no
+//! lock and no write; a tag match compares the key through the node's key columns. A miss takes
+//! its shard's lock to look again and insert. A table fills to three quarters, then grows by
+//! copying into one twice its size, published once full; the tables it outgrew stay readable, as
+//! a reader may be probing one, until [`Nodes::release_outgrown`] frees them with `&mut`. So a
+//! key costs its 12 bytes of key columns and 7 to 15 bytes of table. Shards are four times the
 //! cores (docs/v2/plan/design/concurrency.md, "Writers shard by hash"), their locks padded apart
 //! from what readers load.
 //!
-//! Every write is an atomic store, so this module has no `unsafe`: a slot's key and node are
-//! stored before its tag is published with `Release`, and a reader that loads the control word
-//! with `Acquire` and sees the tag sees them. A node's key is stored before its slot is published,
-//! so whoever learns a node, through the table or an edge published after it, sees its key.
+//! Every write is an atomic store, so this module has no `unsafe`: a node's key is stored before
+//! the node is put in a slot, and a slot before its tag is published with `Release`; a reader that
+//! loads the control word with `Acquire` and sees the tag sees both. So whoever learns a node,
+//! through the table or an edge published after it, sees its key.
 
 use std::cell::{Cell, OnceCell};
 
@@ -49,27 +51,18 @@ const PAGES: usize = 22;
 /// Entries of a task's cache of key to node.
 const CACHE: usize = 1024;
 
-/// A key and its node. Written once, by the holder of its shard's lock, before its tag.
-struct Slot {
-    id: AtomicU64,
-    ingredient: AtomicU32,
-    node: AtomicU32,
-}
-
-/// Seven slots and their tags on one pair of cache lines.
+/// Seven slots, each a node written once by the holder of its shard's lock, and their tags.
 ///
 /// `ctrl` byte `i` (from the least significant) is slot `i`'s tag: 0 when empty, `0x80 |` the
-/// hash's top seven bits when full.
-#[repr(C, align(128))]
+/// hash's top seven bits when full. 40 bytes, so a probe touches one line or two adjacent ones.
+#[repr(C)]
 struct Group {
     ctrl: AtomicU64,
-    slots: [Slot; GROUP],
+    nodes: [AtomicU32; GROUP],
 }
 
 #[cfg(not(feature = "shuttle"))]
-const _: () = assert!(size_of::<Slot>() == 16);
-#[cfg(not(feature = "shuttle"))]
-const _: () = assert!(size_of::<Group>() == 128);
+const _: () = assert!(size_of::<Group>() == 40);
 
 struct Table {
     groups: Box<[Group]>,
@@ -161,16 +154,6 @@ fn locate(node: u32) -> (usize, usize) {
     ((bits - FIRST_PAGE_BITS) as usize, x - (1 << bits))
 }
 
-impl Slot {
-    fn new() -> Slot {
-        Slot {
-            id: AtomicU64::new(0),
-            ingredient: AtomicU32::new(0),
-            node: AtomicU32::new(0),
-        }
-    }
-}
-
 impl Table {
     fn new(groups: usize) -> Table {
         debug_assert!(groups.is_power_of_two());
@@ -178,7 +161,7 @@ impl Table {
             groups: (0..groups)
                 .map(|_| Group {
                     ctrl: AtomicU64::new(0),
-                    slots: std::array::from_fn(|_| Slot::new()),
+                    nodes: std::array::from_fn(|_| AtomicU32::new(0)),
                 })
                 .collect(),
         }
@@ -190,7 +173,7 @@ impl Table {
 
     /// The node of the key, probing groups from the hash's home until one with an empty slot.
     #[inline]
-    fn find(&self, hash: u64, id: u64, ingredient: u32) -> Option<u32> {
+    fn find(&self, keys: &Nodes, hash: u64, id: u64, ingredient: u32) -> Option<u32> {
         let mask = self.groups.len() - 1;
         let tag = tag(hash);
         let mut at = hash as usize & mask;
@@ -205,12 +188,11 @@ impl Table {
                 if (word >> (byte * 8)) & 0xff != tag {
                     continue;
                 }
-                // Relaxed: the tag's `Acquire` above ordered the slot's stores before us.
-                let slot = &group.slots[byte];
-                if slot.id.load(Ordering::Relaxed) == id
-                    && slot.ingredient.load(Ordering::Relaxed) == ingredient
-                {
-                    return Some(slot.node.load(Ordering::Relaxed));
+                // Relaxed: the tag's `Acquire` above ordered the slot's and its key's stores
+                // before us.
+                let node = group.nodes[byte].load(Ordering::Relaxed);
+                if keys.parts(node) == (id, ingredient) {
+                    return Some(node);
                 }
             }
             if empty(word) != 0 {
@@ -221,8 +203,8 @@ impl Table {
     }
 
     /// Fills the first empty slot from the hash's home group. Called by the holder of the
-    /// shard's lock, the only writer, on a table that stays at most half full.
-    fn put(&self, hash: u64, id: u64, ingredient: u32, node: u32, publish: Ordering) {
+    /// shard's lock, the only writer, on a table that stays at most three quarters full.
+    fn put(&self, hash: u64, node: u32, publish: Ordering) {
         let mask = self.groups.len() - 1;
         let mut at = hash as usize & mask;
         loop {
@@ -231,10 +213,7 @@ impl Table {
             let free = empty(word);
             if free != 0 {
                 let byte = (free.trailing_zeros() / 8) as usize;
-                let slot = &group.slots[byte];
-                slot.id.store(id, Ordering::Relaxed);
-                slot.ingredient.store(ingredient, Ordering::Relaxed);
-                slot.node.store(node, Ordering::Relaxed);
+                group.nodes[byte].store(node, Ordering::Relaxed);
                 group.ctrl.store(word | (tag(hash) << (byte * 8)), publish);
                 return;
             }
@@ -299,7 +278,7 @@ impl Nodes {
         let hash = hash_parts(id, ingredient);
         self.heads[self.shard(hash)]
             .current(Ordering::Acquire)?
-            .find(hash, id, ingredient)
+            .find(self, hash, id, ingredient)
     }
 
     /// The node of `key`, given one if it has none.
@@ -310,7 +289,7 @@ impl Nodes {
         let shard = self.shard(hash);
         if let Some(node) = self.heads[shard]
             .current(Ordering::Acquire)
-            .and_then(|table| table.find(hash, id, ingredient))
+            .and_then(|table| table.find(self, hash, id, ingredient))
         {
             return node;
         }
@@ -336,7 +315,7 @@ impl Nodes {
         let shard = self.shard(hash);
         let node = match self.heads[shard]
             .current(Ordering::Acquire)
-            .and_then(|table| table.find(hash, id, ingredient))
+            .and_then(|table| table.find(self, hash, id, ingredient))
         {
             Some(node) => node,
             None => self.insert(shard, hash, id, ingredient),
@@ -356,7 +335,7 @@ impl Nodes {
         // Another thread may have inserted it between the look and the lock.
         if let Some(node) = self.heads[shard]
             .current(Ordering::Acquire)
-            .and_then(|table| table.find(hash, id, ingredient))
+            .and_then(|table| table.find(self, hash, id, ingredient))
         {
             return node;
         }
@@ -369,27 +348,27 @@ impl Nodes {
         let page = self.pages[page].get_or_init(|| {
             let len = 1usize << (FIRST_PAGE_BITS as usize + page);
             KeyPage {
-                ids: (0..len).map(|_| AtomicU64::new(0)).collect(),
-                ingredients: (0..len).map(|_| AtomicU32::new(0)).collect(),
+                ids: super::zeroed_u64s(len),
+                ingredients: super::zeroed_u32s(len),
             }
         });
         page.ids[offset].store(id, Ordering::Relaxed);
         page.ingredients[offset].store(ingredient, Ordering::Relaxed);
         self.table_for_one_more(shard, *len)
-            .put(hash, id, ingredient, node, Ordering::Release);
+            .put(hash, node, Ordering::Release);
         *len += 1;
         node
     }
 
-    /// The table to insert one more key into, at most half full after it. Called with the
-    /// shard's lock held.
+    /// The table to insert one more key into, at most three quarters full after it. Called with
+    /// the shard's lock held.
     fn table_for_one_more(&self, shard: usize, len: usize) -> &Table {
         let head = &self.heads[shard];
         // Relaxed: only holders of the lock we hold store `level`.
         let level = head.level.load(Ordering::Relaxed);
         let current = head.current(Ordering::Relaxed);
         if let Some(table) = current
-            && (len + 1) * 2 <= table.capacity()
+            && (len + 1) * 4 <= table.capacity() * 3
         {
             return table;
         }
@@ -401,17 +380,9 @@ impl Nodes {
                 while full != 0 {
                     let byte = (full.trailing_zeros() / 8) as usize;
                     full &= full - 1;
-                    let slot = &group.slots[byte];
-                    let id = slot.id.load(Ordering::Relaxed);
-                    let ingredient = slot.ingredient.load(Ordering::Relaxed);
-                    let node = slot.node.load(Ordering::Relaxed);
-                    grown.put(
-                        hash_parts(id, ingredient),
-                        id,
-                        ingredient,
-                        node,
-                        Ordering::Relaxed,
-                    );
+                    let node = group.nodes[byte].load(Ordering::Relaxed);
+                    let (id, ingredient) = self.parts(node);
+                    grown.put(hash_parts(id, ingredient), node, Ordering::Relaxed);
                 }
             }
         }
@@ -429,13 +400,31 @@ impl Nodes {
     /// The key of `node`, which an edge or [`Nodes::node`] gave.
     #[inline]
     pub(crate) fn key(&self, node: u32) -> DatabaseKeyIndex {
+        let (id, ingredient) = self.parts(node);
+        DatabaseKeyIndex::new(IngredientIndex::new(ingredient), Id::from_bits(id))
+    }
+
+    /// The key columns of `node`: its id's bits and its ingredient.
+    #[inline]
+    fn parts(&self, node: u32) -> (u64, u32) {
         let (page, offset) = locate(node);
         let page = self.pages[page]
             .get()
             .expect("salsa: an edge names a node whose key was never stored");
-        let id = page.ids[offset].load(Ordering::Relaxed);
-        let ingredient = page.ingredients[offset].load(Ordering::Relaxed);
-        DatabaseKeyIndex::new(IngredientIndex::new(ingredient), Id::from_bits(id))
+        (
+            page.ids[offset].load(Ordering::Relaxed),
+            page.ingredients[offset].load(Ordering::Relaxed),
+        )
+    }
+
+    /// Frees the tables each shard outgrew. With `&mut`, no reader is probing one.
+    pub(crate) fn release_outgrown(&mut self) {
+        for head in &mut self.heads {
+            let level = head.level.load(Ordering::Relaxed);
+            for table in &mut head.tables[..level.saturating_sub(1)] {
+                *table = OnceLock::new();
+            }
+        }
     }
 
     /// How many keys have a node.
@@ -508,6 +497,26 @@ mod tests {
         }
         assert_eq!(nodes.len() as usize, model.len());
         assert_eq!(nodes.find(key(41, 1, 0)), None);
+    }
+
+    #[test]
+    fn freeing_outgrown_tables_keeps_every_node() {
+        let mut nodes = Nodes::new();
+        let keys: Vec<DatabaseKeyIndex> = (0..50_000).map(|i| key(i % 5, i, 0)).collect();
+        let first: Vec<u32> = keys[..25_000].iter().map(|&k| nodes.node(k)).collect();
+        nodes.release_outgrown();
+        let all: Vec<u32> = keys.iter().map(|&k| nodes.node(k)).collect();
+        nodes.release_outgrown();
+        assert_eq!(&all[..25_000], &first[..]);
+        assert_eq!(all, (0..50_000).collect::<Vec<u32>>());
+        for (&k, &node) in keys.iter().zip(&all) {
+            assert_eq!(nodes.find(k), Some(node));
+            assert_eq!(nodes.key(node), k);
+        }
+        for head in &nodes.heads {
+            let level = head.level.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(head.tables[..level.saturating_sub(1)].iter().all(|t| t.get().is_none()));
+        }
     }
 
     #[test]

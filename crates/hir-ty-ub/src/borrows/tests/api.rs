@@ -53,11 +53,13 @@ fn retag_accesses() {
     // `-Zmiri-tree-borrows-implicit-writes`: a protected `&mut` is `Unique` from the start and
     // its retag a write; outside function entry nothing changes.
     let write = NewPermission::new(PtrKind::Mut, RetagMode::FnEntry, true, true, &[]).with_implicit_writes(true);
+    assert!(write.writes());
     s.call();
     s.retag_with(x, write, 8).unwrap();
     assert_eq!(s.b.retag_accesses(), &[(Span::new(0, 8), AccessKind::Write)]);
     s.ret().unwrap();
     let default = NewPermission::new(PtrKind::Mut, RetagMode::Default, true, true, &[]).with_implicit_writes(true);
+    assert!(!default.writes());
     s.retag_with(x, default, 8).unwrap();
     assert_eq!(s.b.retag_accesses(), &[read(0, 8)]);
     // A no-op retag clears the last one's accesses.
@@ -111,6 +113,7 @@ fn foreign_write_disables_mut() {
     );
     assert_eq!(e.history()[1].site, Some(disabled));
     assert_eq!(e.history()[2].site, None);
+    assert!(e.history().iter().all(|ev| ev.tag == m.tag()));
 }
 
 /// A parent's state stops a child access: the error names both.
@@ -218,6 +221,36 @@ fn protected_shared_forbids_foreign_write() {
     let e = expect_ub(s.write(sibling, 1), AliasErrorKind::ProtectedDisabled, "write access through");
     expect_detail(&e, "protected tags must never be Disabled");
     let _ = a;
+}
+
+/// Each thread has its own stack of frames: thread 1's call returns while thread 2's runs,
+/// and only thread 1's protector ends.
+#[test]
+fn frames_are_per_thread() {
+    let mut s = Sim::new();
+    let x = s.alloc(2);
+    s.thread(1);
+    s.call();
+    s.arg_mut(x, 1).unwrap();
+    s.thread(2);
+    s.call();
+    s.arg_mut(x.add(1), 1).unwrap();
+    s.thread(1);
+    s.ret().unwrap();
+    s.write(x, 1).unwrap();
+    expect_ub(s.write(x.add(1), 1), AliasErrorKind::ProtectedDisabled, "write access through");
+}
+
+/// A refused function-entry retag leaves nothing protected for the frame's end.
+#[test]
+fn refused_fn_entry_retag_protects_nothing() {
+    let mut s = Sim::new();
+    let x = s.alloc(1);
+    let f = s.shared(x, 1).unwrap();
+    s.write(x, 1).unwrap();
+    s.call();
+    expect_ub(s.arg_mut(f, 1), AliasErrorKind::ChildAccessForbidden, "reborrow through");
+    s.ret().unwrap();
 }
 
 #[test]

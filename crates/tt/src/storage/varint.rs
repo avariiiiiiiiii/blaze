@@ -5,6 +5,7 @@
 //!
 //! The bytes are the old ones; the writer and reader are safe versions of the old ones.
 
+use blaze_ids::radix;
 use intern::Symbol;
 use rustc_hash::FxHashMap;
 use span::{Span, TextRange, TextSize};
@@ -398,9 +399,7 @@ fn encode_all(
             let len = compressed_spans.len();
             let compressed_spans = &mut compressed_spans[..len - 2];
             if compressed_span_frequencies.len() > n_bits_mask(4) as usize {
-                compressed_spans.sort_unstable_by_key(|span| {
-                    std::cmp::Reverse(compressed_span_frequencies[span])
-                });
+                radix::sort_by_key(compressed_spans, |span| !(compressed_span_frequencies[span] as u64));
             }
             for (index, span) in compressed_spans.iter().enumerate() {
                 *compressed_span_frequencies.get_mut(span).unwrap() = index;
@@ -412,7 +411,7 @@ fn encode_all(
     let (symbols, symbols_map) = {
         let mut symbols = symbol_frequencies.keys().copied().collect::<Box<[_]>>();
         if symbol_frequencies.len() > n_bits_mask(6) as usize {
-            symbols.sort_unstable_by_key(|symbol| std::cmp::Reverse(symbol_frequencies[symbol]));
+            radix::sort_by_key(&mut symbols, |symbol| !(symbol_frequencies[symbol] as u64));
         }
         for (index, symbol) in symbols.iter().enumerate() {
             *symbol_frequencies.get_mut(symbol).unwrap() = index;

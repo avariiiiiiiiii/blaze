@@ -287,6 +287,18 @@ mod tests {
         assert!(sym::DECLARED <= u16::MAX as usize);
     }
 
+    /// No two declared symbols share a text, and none is a list's: interning each text gives
+    /// its own declared symbol, which tables by declared index and compares with `sym::` rely on.
+    #[test]
+    fn every_declared_text_interns_to_itself() {
+        assert_eq!(symbols::TEXTS.len(), sym::DECLARED);
+        for (at, text) in symbols::TEXTS.iter().enumerate() {
+            let symbol = Symbol::intern(text.str);
+            assert_eq!(symbol.declared_index(), Some(at as u16), "{:?}", text.str);
+            assert_eq!(symbol.order_key(), order_key(text.str.as_bytes()));
+        }
+    }
+
     #[test]
     fn known_names() {
         use crate::sym::Declared;

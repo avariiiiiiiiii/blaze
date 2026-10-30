@@ -8,7 +8,7 @@
 
 use crate::{
     borrows::{AliasError, AliasErrorKind, Borrows, NewPermission, PtrKind, RetagMode},
-    ids::{AccessKind, AllocId, BorTag, Prov, SiteId, Span},
+    ids::{AccessKind, AllocId, BorTag, Prov, SiteId, Span, ThreadId},
 };
 
 /// A pointer: the allocation it points into, its provenance, and its offset there.
@@ -151,7 +151,12 @@ impl Sim {
         self.retag(p, PtrKind::Box, RetagMode::Default, true, true, &[], len)
     }
 
-    /// A call: pushes the callee's frame.
+    /// Runs the next calls, returns and function-entry retags on thread `t` (0 is main).
+    pub(crate) fn thread(&mut self, t: u32) {
+        self.b.set_thread(ThreadId(t));
+    }
+
+    /// A call on the current thread: pushes the callee's frame.
     pub(crate) fn call(&mut self) {
         self.b.push_frame();
     }

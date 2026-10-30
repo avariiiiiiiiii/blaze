@@ -36,6 +36,7 @@ use os::backtrace;
 use switch::{KEPT, Layout, Switch};
 
 mod hook;
+mod image;
 mod switch;
 #[cfg(test)]
 mod tests;
@@ -67,7 +68,7 @@ use windows as os;
     all(windows, target_arch = "x86_64"),
 )))]
 mod os {
-    use std::{path::Path, sync::Arc};
+    use std::{ops::Range, path::Path, sync::Arc};
 
     use super::{
         Events,
@@ -88,6 +89,22 @@ mod os {
     impl Memory for Os {
         const DWARF: Dwarf = Dwarf::Not;
         const SEH: bool = false;
+
+        fn cell(&self, _: u64) -> u64 {
+            match *self {}
+        }
+
+        fn in_image(&self, _: &Range<u64>) -> Result<(), String> {
+            match *self {}
+        }
+
+        fn bytes(&self, _: &Range<u64>) -> Result<&'static [u8], String> {
+            match *self {}
+        }
+
+        fn loaders(&self, _: u64, _: u64) -> &[u64] {
+            match *self {}
+        }
 
         fn code(&mut self, _: &Writes<'_>) -> Result<(), String> {
             match *self {}
@@ -110,7 +127,7 @@ mod os {
         }
     }
 
-    pub(super) fn descriptor() -> Result<u64, String> {
+    pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
         Err(PLATFORMS.to_owned())
     }
 
@@ -257,10 +274,7 @@ impl Live {
     }
 
     fn open() -> Result<Live, String> {
-        let at = os::descriptor()?;
-        // SAFETY: the symbol is the descriptor the linker wrote, `Descriptor::SIZE` bytes of
-        // the image's read-only data, mapped as long as the image is.
-        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, Descriptor::SIZE) };
+        let (at, bytes) = os::descriptor()?;
         let descriptor = Descriptor::decode(bytes).ok_or_else(|| {
             format!(
                 "{DESCRIPTOR} at {at:#x} does not start with {}",
@@ -268,8 +282,8 @@ impl Live {
             )
         })?;
         let layout = Layout::new(&descriptor, at)?;
-        let dir = directory(&layout)?;
         let memory = os::Os::new(&layout)?;
+        let dir = directory(&layout, &memory)?;
         let switch = Switch::new(memory, layout)?;
         let mut create = std::fs::DirBuilder::new();
         create.recursive(true);
@@ -385,15 +399,18 @@ impl Drop for Live {
     }
 }
 
-/// The directory the descriptor names.
-fn directory(layout: &Layout) -> Result<PathBuf, String> {
+/// The directory the descriptor names: `len` bytes (at most `MOST_DIR`, `Layout::new`
+/// checked) of the image's read-only data.
+fn directory(layout: &Layout, memory: &os::Os) -> Result<PathBuf, String> {
     let [at, len] = layout.dir;
     if len == 0 {
         return Err(format!("{DESCRIPTOR} names no directory to take patches through"));
     }
-    // SAFETY: the linker wrote the path in the image's read-only data, `len` bytes (at most
-    // `MOST_DIR`, `Layout::new` checked) at `at`, mapped as long as the image is.
-    let bytes = unsafe { std::slice::from_raw_parts(layout.slid(at) as *const u8, len as usize) };
+    let at = layout.slid(at);
+    let end = at
+        .checked_add(len)
+        .ok_or_else(|| format!("{DESCRIPTOR} names a directory past the end of memory"))?;
+    let bytes = memory.bytes(&(at..end))?;
     let path = std::str::from_utf8(bytes)
         .map_err(|_| format!("{DESCRIPTOR} names a directory that is not UTF-8"))?;
     Ok(PathBuf::from(path))

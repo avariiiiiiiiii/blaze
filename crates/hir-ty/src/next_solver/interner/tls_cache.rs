@@ -93,6 +93,9 @@ struct Shared<K, S, T> {
     born: AtomicU64,
 }
 
+/// A slot and the generation it was seen to hold.
+type Held<K, S, T> = (usize, *mut Generation<K, S, T>);
+
 static SHARED: LazyLock<Shared<Scope, Revision, Erased>> =
     LazyLock::new(|| Shared::new(SHARED_BITS));
 
@@ -107,8 +110,8 @@ pub(super) fn shared<'db, R>(
     let (nonce, revision) = db.nonce_and_revision();
     // Nested in the task the executor runs this in, so it writes nothing but a thread-local
     // count.
-    let _task = blaze_reclaim::enter();
-    f(unerase(SHARED.of(Scope { nonce, krate, regions }, revision)))
+    let task = blaze_reclaim::enter();
+    f(unerase(SHARED.of(&task, Scope { nonce, krate, regions }, revision)))
 }
 
 impl<K, S, T> Shared<K, S, T>
@@ -127,10 +130,9 @@ where
         }
     }
 
-    /// The value of `key` in `state`, a new one if there is none. Good until the caller's
-    /// `blaze_reclaim` guard is dropped: the caller must be in a task.
-    fn of(&self, key: K, state: S) -> &T {
-        debug_assert!(blaze_reclaim::in_task(), "read outside a task");
+    /// The value of `key` in `state`, a new one if there is none, good while `task` is. The
+    /// helpers below hand out what they load only to this, so only through it.
+    fn of<'g>(&'g self, _task: &'g blaze_reclaim::Guard, key: K, state: S) -> &'g T {
         let hint = FxBuildHasher.hash_one(key) | 1;
         'search: loop {
             for at in window(hint, self.generations.len()) {
@@ -148,45 +150,63 @@ where
                 // The first use in a new state: what the old value holds may be untrue now
                 // (for the solver: its goals read what may have changed since).
                 match self.replace(at, held, hint, key, state) {
-                    Some(made) => return made,
-                    None => continue 'search,
+                    Ok(made) => return made,
+                    Err(Some(won)) => return won,
+                    Err(None) => continue 'search,
                 }
             }
-            let (at, held) = self.victim(hint);
-            if let Some(made) = self.replace(at, held, hint, key, state) {
-                return made;
+            let (at, held) = match self.victim(hint, key, state) {
+                Ok(found) => return found,
+                Err(slot) => slot,
+            };
+            match self.replace(at, held, hint, key, state) {
+                Ok(made) | Err(Some(made)) => return made,
+                // Another thread gave the slot to another key or state first: look again.
+                Err(None) => {}
             }
-            // Another thread changed the slot first: look again.
         }
     }
 
-    /// The generation `held` points to, if any. Good until the caller's guard is dropped.
+    /// The generation `held` points to, if any. Called only by `of` and what it calls, on a
+    /// pointer loaded under its guard, and good while that guard is.
     #[inline]
     fn get(&self, held: *mut Generation<K, S, T>) -> Option<&Generation<K, S, T>> {
         // SAFETY: a generation is freed only by the limbo, after a grace started once it was
-        // unlinked from its slot; the caller's guard was entered before `held` was loaded, so
-        // that grace has not passed.
+        // unlinked from its slot; `of`'s guard was entered before `held` was loaded, so that
+        // grace has not passed while the guard lives, and `of` ties what it returns to it.
         unsafe { held.as_ref() }
     }
 
     /// The slot a key hashing to `hint` is given, and what it holds: an empty one, else the
-    /// one holding the oldest generation.
+    /// one holding the oldest generation. Or the value of `key` in `state`, if a thread made
+    /// it and has not yet published its hint.
     #[cold]
-    fn victim(&self, hint: u64) -> (usize, *mut Generation<K, S, T>) {
-        let mut oldest: Option<(usize, *mut Generation<K, S, T>, u64)> = None;
+    fn victim(&self, hint: u64, key: K, state: S) -> Result<&T, Held<K, S, T>> {
+        let mut empty = None;
+        let mut oldest: Option<(Held<K, S, T>, u64)> = None;
         for at in window(hint, self.generations.len()) {
             let held = self.generations[at].load(Ordering::Acquire);
-            let Some(generation) = self.get(held) else { return (at, held) };
-            if oldest.is_none_or(|(_, _, born)| generation.born < born) {
-                oldest = Some((at, held, generation.born));
+            let Some(generation) = self.get(held) else {
+                empty.get_or_insert(at);
+                continue;
+            };
+            if generation.key == key && generation.state == state {
+                return Ok(&generation.value);
+            }
+            if oldest.is_none_or(|(_, born)| generation.born < born) {
+                oldest = Some(((at, held), generation.born));
             }
         }
-        let (at, held, _) = oldest.expect("a window has a slot");
-        (at, held)
+        if let Some(at) = empty {
+            return Err((at, ptr::null_mut()));
+        }
+        Err(oldest.expect("a window has a slot").0)
     }
 
     /// Puts a new generation of `key` (hashing to `hint`) in slot `at` if it still holds
-    /// `held`, retiring `held`.
+    /// `held`, retiring `held`. When another thread changed the slot first, says what it put
+    /// there if that is the value of `key` in `state`, as two threads making one key at once
+    /// both pick the same empty slot.
     #[cold]
     fn replace(
         &self,
@@ -195,17 +215,22 @@ where
         hint: u64,
         key: K,
         state: S,
-    ) -> Option<&T> {
+    ) -> Result<&T, Option<&T>> {
         let born = self.born.fetch_add(1, Ordering::Relaxed);
         let made =
             Box::into_raw(Box::new(Generation { key, state, born, value: T::default() }));
-        if self.generations[at]
-            .compare_exchange(held, made, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if let Err(won) = self.generations[at].compare_exchange(
+            held,
+            made,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             // SAFETY: `made` was never published, so this is its only owner.
             drop(unsafe { Box::from_raw(made) });
-            return None;
+            return Err(self
+                .get(won)
+                .filter(|won| won.key == key && won.state == state)
+                .map(|won| &won.value));
         }
         self.hints[at].store(hint, Ordering::Release);
         if !held.is_null() {
@@ -217,7 +242,7 @@ where
         }
         // SAFETY: published above; freed only by the limbo, after the caller's guard is
         // dropped (see `of`).
-        Some(unsafe { &(*made).value })
+        Ok(unsafe { &(*made).value })
     }
 
     fn retire(&self, generation: Box<Generation<K, S, T>>) {
@@ -234,6 +259,18 @@ where
             if !held.is_null() {
                 // SAFETY: as in `replace`: the swap unlinked it, and only one swap can.
                 self.retire(unsafe { Box::from_raw(held) });
+            }
+        }
+    }
+}
+
+impl<K, S, T> Drop for Shared<K, S, T> {
+    fn drop(&mut self) {
+        for slot in &mut self.generations {
+            let held = mem::replace(slot.get_mut(), ptr::null_mut());
+            if !held.is_null() {
+                // SAFETY: `&mut self`: no reader is left, and each generation is in one slot.
+                drop(unsafe { Box::from_raw(held) });
             }
         }
     }
@@ -273,7 +310,9 @@ const SLOT_BITS: u32 = 9;
 /// How many slots from the one a key hashes to it may be kept in.
 const PROBE: usize = 16;
 
-static CACHES: LazyLock<Table<State, Erased>> = LazyLock::new(|| Table::new(SLOT_BITS));
+/// Each cache boxed: a slot is reset once per query that takes it, and stays two line pairs
+/// whatever the search graph's cache weighs.
+static CACHES: LazyLock<Table<State, Box<Erased>>> = LazyLock::new(|| Table::new(SLOT_BITS));
 
 /// Runs `f` on the cache of the interner `solved` alone, as `db` is now.
 #[inline]
@@ -327,9 +366,9 @@ struct Filled<S, T> {
     value: T,
 }
 
-// A slot, the search graph's cache included, takes at most four 128-byte pairs of cache lines.
+// A slot takes at most two 128-byte pairs of cache lines.
 const _: () = assert!(
-    align_of::<Slot<State, Erased>>() == 128 && size_of::<Slot<State, Erased>>() <= 512
+    align_of::<Slot<State, Box<Erased>>>() == 128 && size_of::<Slot<State, Box<Erased>>>() <= 256
 );
 // A generation's header is one line; the rest is the search graph's cache.
 const _: () =
@@ -662,6 +701,163 @@ mod tests {
                         let local = answer(per_thread.of(query, state), query, state, goal);
                         assert_eq!(shared, truth, "{query} {state} {goal}");
                         assert_eq!(shared, local, "{query} {state} {goal}");
+                    }
+                });
+            }
+        });
+        assert!(shared_hits.into_inner() > 0, "the shared table never answered from its cache");
+    }
+
+    /// A shared value: the goals of one key and state.
+    type SharedGoals = Mutex<Goals>;
+
+    fn address<T>(value: &T) -> usize {
+        value as *const T as usize
+    }
+
+    #[test]
+    fn every_thread_gets_the_one_value_of_a_key_and_state() {
+        let table = Shared::<u32, u32, SharedGoals>::new(4);
+        let start = Barrier::new(8);
+        let seen: Vec<usize> = thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let task = blaze_reclaim::enter();
+                        start.wait();
+                        address(table.of(&task, 7, 0))
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|it| it.join().unwrap()).collect()
+        });
+        assert!(seen.iter().all(|&it| it == seen[0]), "{seen:?}");
+        let task = blaze_reclaim::enter();
+        assert_eq!(address(table.of(&task, 7, 0)), seen[0]);
+        assert_ne!(address(table.of(&task, 8, 0)), seen[0]);
+    }
+
+    #[test]
+    fn a_new_state_gets_a_new_value() {
+        let table = Shared::<u32, u32, SharedGoals>::new(4);
+        let task = blaze_reclaim::enter();
+        table.of(&task, 7, 0).lock().unwrap().insert(1, 1);
+        assert_eq!(table.of(&task, 7, 1).lock().unwrap().get(&1), None);
+        assert_eq!(table.of(&task, 7, 1).lock().unwrap().len(), 0);
+        // The old state's value is gone, not kept beside the new one.
+        assert_eq!(table.of(&task, 7, 0).lock().unwrap().get(&1), None);
+    }
+
+    /// Counts its own drop once marked.
+    #[derive(Default)]
+    struct Marked(std::sync::atomic::AtomicBool);
+
+    static MARKED_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+    impl Drop for Marked {
+        fn drop(&mut self) {
+            if self.0.load(Ordering::Relaxed) {
+                MARKED_DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[test]
+    fn a_replaced_value_is_freed_only_after_its_readers_left_their_task() {
+        let table = Shared::<u32, u32, Marked>::new(4);
+        let (held, go) = (Barrier::new(2), Barrier::new(2));
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let task = blaze_reclaim::enter();
+                let old = table.of(&task, 1, 0);
+                old.0.store(true, Ordering::Relaxed);
+                held.wait();
+                go.wait();
+                // Replaced, and the limbo collected since, but this task still reads it.
+                assert!(old.0.load(Ordering::Relaxed));
+                assert_eq!(MARKED_DROPPED.load(Ordering::Relaxed), 0);
+            });
+            held.wait();
+            {
+                let task = blaze_reclaim::enter();
+                table.of(&task, 1, 1);
+                table.of(&task, 2, 0);
+                table.of(&task, 2, 1);
+            }
+            go.wait();
+        });
+        // The reader left: a later retire collects it (other tests' tasks may hold it a while).
+        for state in 0..10_000 {
+            if MARKED_DROPPED.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            let task = blaze_reclaim::enter();
+            table.of(&task, 3, state);
+            drop(task);
+            thread::yield_now();
+        }
+        assert_eq!(MARKED_DROPPED.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_full_window_gives_away_the_oldest_value() {
+        // Every slot is in every window of a 16-slot table.
+        let table = Shared::<u32, u32, SharedGoals>::new(4);
+        let task = blaze_reclaim::enter();
+        let first: Vec<usize> = (0..16).map(|key| address(table.of(&task, key, 0))).collect();
+        table.of(&task, 16, 0);
+        // Key 0 was made first: it alone is made again.
+        for key in 1..16 {
+            assert_eq!(address(table.of(&task, key, 0)), first[key as usize], "{key}");
+        }
+        table.of(&task, 0, 0).lock().unwrap().insert(1, 1);
+        assert_eq!(table.of(&task, 0, 0).lock().unwrap().get(&1), Some(&1));
+    }
+
+    #[test]
+    fn clear_unlinks_every_value() {
+        let table = Shared::<u32, u32, SharedGoals>::new(4);
+        let task = blaze_reclaim::enter();
+        for key in 0..8 {
+            table.of(&task, key, 0).lock().unwrap().insert(1, 1);
+        }
+        table.clear();
+        assert!(table.hints.iter().all(|it| it.load(Ordering::Relaxed) == EMPTY));
+        for key in 0..8 {
+            assert_eq!(table.of(&task, key, 0).lock().unwrap().get(&1), None);
+        }
+    }
+
+    #[test]
+    fn shared_answers_equal_those_solved_by_each_thread() {
+        // A small table, so values are given away while in use; states change under readers
+        // (which the solver never does, as a revision needs `&mut` of the database), so
+        // replacing and freeing race with lookups.
+        let table = Shared::<u64, u32, SharedGoals>::new(5);
+        let keys: Vec<u64> = (0..96).map(|_| key()).collect();
+        let shared_hits = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for worker in 0..8u64 {
+                let (table, keys, shared_hits) = (&table, &keys, &shared_hits);
+                scope.spawn(move || {
+                    let mut seed = 0x2545_F491_4F6C_DD1Du64 ^ (worker + 1);
+                    let mut next = move || {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        seed
+                    };
+                    for step in 0..20_000u32 {
+                        let task = blaze_reclaim::enter();
+                        let key = keys[next() as usize % keys.len()];
+                        let state = step / 8_000;
+                        let goal = (next() % 64) as u32;
+                        let mut goals = table.of(&task, key, state).lock().unwrap();
+                        if goals.contains_key(&goal) {
+                            shared_hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let found = answer(&mut goals, key, state, goal);
+                        assert_eq!(found, solve(key, state, goal), "{key} {state} {goal}");
                     }
                 });
             }

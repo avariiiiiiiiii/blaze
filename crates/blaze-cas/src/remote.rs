@@ -528,7 +528,9 @@ impl Client {
             answers.push(Completion { tag, done: Done::Read(frame) });
         };
         up.buffer.drain(..start);
-        up.buffer.reserve(owed(&up.buffer));
+        // What the next receive can bring, not the whole frame: a length prefix is only what the
+        // peer says, and the buffer grows with the bytes that do come.
+        up.buffer.reserve(owed(&up.buffer).min(CLIENT_RECV_MOST));
         result
     }
 
@@ -1398,6 +1400,15 @@ mod tests {
         assert!(effects.is_empty(), "nothing is owed, so nothing is received");
 
         assert_eq!(owed(&(LONGEST_FRAME + 1).to_le_bytes()), 0);
+
+        // A prefix that says a gigabyte reserves what one receive brings, not the gigabyte.
+        let (mut client, mut effects, recv) = connected(&["a"], Conn(5));
+        let prefix = Completion { tag: recv, done: Done::Read((1u64 << 30).to_le_bytes().to_vec()) };
+        assert!(completed(&mut client, prefix, &mut effects).is_empty());
+        let Link::Up(up) = &client.link else { panic!("the connection is up") };
+        assert!(up.buffer.capacity() <= 8 + CLIENT_RECV_MOST, "{}", up.buffer.capacity());
+        let [Effect::Recv { most, .. }] = effects[..] else { panic!("{effects:?}") };
+        assert_eq!(most, CLIENT_RECV_MOST);
         assert_eq!(owed(&[1, 0, 0]), 0);
     }
 

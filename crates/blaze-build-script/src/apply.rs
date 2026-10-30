@@ -10,6 +10,7 @@ use std::{
     time::SystemTime,
 };
 
+use blaze_ids::radix;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
@@ -72,7 +73,7 @@ impl Compile {
         let mut compile = Compile::default();
         let mut paths: Vec<&LibraryPath> =
             linked.iter().flat_map(|it| &it.output.library_paths).collect();
-        paths.sort_by_key(|it| matches!(it, LibraryPath::External(_)));
+        radix::sort_copy_by_key(&mut paths, |it| u8::from(matches!(it, LibraryPath::External(_))));
         compile.search = paths.into_iter().map(|it| it.path().to_owned()).collect();
         for it in linked {
             if it.own && pass_l {

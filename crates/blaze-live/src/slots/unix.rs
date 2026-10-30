@@ -1,10 +1,15 @@
 //! What Linux and macOS share: finding the descriptor with `dlsym`, walking a stack with
 //! `_Unwind_Backtrace`, and the unwinder's `__register_frame`.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+#![allow(unsafe_code)]
 
-use super::hook::FRAMES;
-use crate::patch::DESCRIPTOR;
+use std::{
+    ffi::{CStr, CString, c_char, c_int, c_void},
+    ops::Range,
+};
+
+use super::{hook::FRAMES, image};
+use crate::patch::{DESCRIPTOR, Descriptor};
 
 #[repr(C)]
 #[allow(dead_code)]
@@ -57,7 +62,7 @@ pub(super) fn image_base(address: u64) -> Option<u64> {
 /// Checks that the first and the last byte of `range` are in the image at `base`. The loader
 /// maps an image as one run of addresses; a gap within it is refused by the platform's walk
 /// of the mappings (unmapped, or mapped with no access).
-pub(super) fn in_image(range: &std::ops::Range<u64>, base: u64) -> Result<(), String> {
+pub(super) fn in_image(range: &Range<u64>, base: u64) -> Result<(), String> {
     let last = range.end.saturating_sub(1).max(range.start);
     if image_base(range.start) == Some(base) && image_base(last) == Some(base) {
         Ok(())
@@ -79,10 +84,29 @@ fn lookup(handle: *mut c_void, name: &CStr, base: u64) -> Option<u64> {
     (!found.is_null() && image_of(found)?.0 == base).then_some(found as u64)
 }
 
-/// Where the descriptor of the image this code is in is, in memory.
-pub(super) fn descriptor() -> Result<u64, String> {
+/// The image's bytes at `range`, checked to be in the image at `base`; the caller checks
+/// they are readable (the platform's walk of its mappings) or knows (the descriptor, which
+/// the loader found by name).
+pub(super) fn bytes(range: &Range<u64>, base: u64) -> Result<&'static [u8], String> {
+    in_image(range, base)?;
+    // SAFETY: `range` is in the image at `base` (checked above), which stays loaded as long as
+    // this code, the image's own, runs; what is read is data the linker wrote, which no patch
+    // writes over (the switch refuses data over the descriptor's cell and table, and the
+    // descriptor and the directory name are in read-only data).
+    Ok(unsafe { image::view(range.start, (range.end - range.start) as usize) })
+}
+
+/// Where the descriptor of the image this code is in is, in memory, and its bytes.
+pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
+    let at = find()?;
+    let base = image_base(at).ok_or_else(|| format!("no image has {DESCRIPTOR} at {at:#x}"))?;
+    let end = at.checked_add(Descriptor::SIZE as u64).ok_or("a descriptor past the end of memory")?;
+    Ok((at, bytes(&(at..end), base)?))
+}
+
+fn find() -> Result<u64, String> {
     let name = CString::new(DESCRIPTOR).map_err(|_| "a descriptor name with a zero")?;
-    let own = descriptor as fn() -> Result<u64, String> as *const c_void;
+    let own = descriptor as fn() -> Result<(u64, &'static [u8]), String> as *const c_void;
     let (base, path) = image_of(own).ok_or("the loader knows no image of blaze-live's own code")?;
     // SAFETY: a null path asks for the program's handle, which is never unloaded.
     let program = unsafe { dlopen(std::ptr::null(), RTLD_LAZY) };
@@ -128,4 +152,18 @@ pub(super) fn backtrace(pcs: &mut Vec<u64>) {
     }
     // SAFETY: `each` only pushes to the vector it is given.
     unsafe { _Unwind_Backtrace(each, pcs as *mut Vec<u64> as *mut c_void) };
+}
+
+/// What the table cell at `cell` holds, by one acquire load.
+pub(super) fn load_cell(cell: u64) -> u64 {
+    // SAFETY: the cell is the descriptor's, 8-aligned (`Layout::new` checked), checked to be
+    // in the image by `Switch::new` before the first load, and only ever accessed atomically.
+    unsafe { image::cell(cell) }.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The loader's table at `at`, `slots` addresses.
+pub(super) fn loaders(at: u64, slots: u64) -> &'static [u64] {
+    // SAFETY: `Switch::new` checked `at..at + slots * 8` is in the image and `at` 8-aligned
+    // before the first call; nothing writes it (the switch refuses data over it).
+    unsafe { image::words(at, slots as usize) }
 }

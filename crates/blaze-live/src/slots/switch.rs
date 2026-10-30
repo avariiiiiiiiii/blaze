@@ -20,10 +20,12 @@
 //!   registered run: the unwinder reads them from then on.
 //! - Data goes outside the patch code region, the table cell and the loader's table; the
 //!   platform checks that it is in the image.
-//! - Data writes are plain stores. While [`crate::slots::Live::poll`] runs, no other thread
-//!   may read or write the bytes a patch's data rewrites. That holds for data no code reaches
-//!   before the cell's store, such as a new static or a new unwind entry. For data running
-//!   code can reach, such as a static's new value, it is the program's to keep.
+//! - Data is written in place with atomic stores ([`Writes::store`]): one relaxed store per
+//!   naturally aligned piece of at most 8 bytes, each holding its final, rebased value, so no
+//!   write races another thread's load of that piece. A thread reading a static wider than
+//!   8 bytes while `poll` rewrites it can see part of it old and part new, as with any static
+//!   another thread changes; data no code reaches before the cell's store (a new static, a
+//!   new unwind entry) is seen whole.
 
 use std::{
     ops::Range,
@@ -151,8 +153,8 @@ pub(crate) enum Dwarf {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Span {
     pub(crate) at: u64,
-    from: usize,
-    len: usize,
+    pub(super) from: usize,
+    pub(super) len: usize,
 }
 
 const _: () = assert!(size_of::<Span>() == 24);
@@ -176,10 +178,10 @@ impl Span {
 /// address, none empty and none overlapping, and the addresses within them of 8-byte fields
 /// holding an image address, to add the slide to (sorted, each inside one span).
 pub(crate) struct Writes<'a> {
-    message: &'a [u8],
+    pub(super) message: &'a [u8],
     pub(crate) spans: &'a [Span],
-    rebase: &'a [u64],
-    slide: u64,
+    pub(super) rebase: &'a [u64],
+    pub(super) slide: u64,
 }
 
 impl<'a> Writes<'a> {
@@ -196,77 +198,33 @@ impl<'a> Writes<'a> {
     pub(crate) fn bytes(&self, span: &Span) -> &'a [u8] {
         &self.message[span.from..span.from + span.len]
     }
-
-    /// Writes what the spans have within `range` to `to`, which stands for `range.start`,
-    /// with the slide added to each field to rebase: the bytes go straight from the message
-    /// to where they run, once.
-    ///
-    /// # Safety
-    ///
-    /// `to` is valid for writes of `range.end - range.start` bytes, which nothing else reads
-    /// or writes while this runs.
-    pub(crate) unsafe fn put(&self, range: &Range<u64>, to: *mut u8) {
-        let first = self.spans.partition_point(|it| it.end() <= range.start);
-        for span in &self.spans[first..] {
-            if span.at >= range.end {
-                break;
-            }
-            let bytes = self.bytes(span);
-            let (from, until) = (span.at.max(range.start), span.end().min(range.end));
-            let part = &bytes[(from - span.at) as usize..(until - span.at) as usize];
-            // SAFETY: `from` is within `range`, which `to` stands for (the caller's).
-            let into = unsafe { to.add((from - range.start) as usize) };
-            // SAFETY: `from..until` is within `range`, writable at `into` (the caller's); the
-            // message is not the memory written.
-            unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), into, part.len()) };
-            let lowest = span.at.max(from.saturating_sub(7));
-            let first = self.rebase.partition_point(|it| *it < lowest);
-            for &field in self.rebase[first..].iter().take_while(|it| **it < until) {
-                let value = le64(&bytes[(field - span.at) as usize..])
-                    .wrapping_add(self.slide)
-                    .to_le_bytes();
-                let (start, end) = (field.max(from), (field + 8).min(until));
-                let part = &value[(start - field) as usize..(end - field) as usize];
-                // SAFETY: as above: `start` is within `range`.
-                let into = unsafe { to.add((start - range.start) as usize) };
-                // SAFETY: as above: `start..end` is within `range`; `value` is a local.
-                unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), into, part.len()) };
-            }
-        }
-    }
-
-    /// [`Writes::put`] into `to`, which stands for `range`.
-    pub(crate) fn fill(&self, range: &Range<u64>, to: &mut [u8]) {
-        assert_eq!(to.len() as u64, range.end - range.start, "a buffer the length of {range:x?}");
-        // SAFETY: `to` is `range`'s length (asserted) and borrowed mutably for this call.
-        unsafe { self.put(range, to.as_mut_ptr()) }
-    }
-
-    /// Writes every span where it goes.
-    ///
-    /// # Safety
-    ///
-    /// Every span's memory is writable, and nothing else reads or writes it while this runs.
-    pub(crate) unsafe fn put_in_place(&self) {
-        for span in self.spans {
-            // SAFETY: the caller's.
-            unsafe { self.put(&span.range(), span.at as *mut u8) };
-        }
-    }
 }
 
 /// What a platform does to the memory of a running image. Every address is in memory
 /// (slid). The switch has checked that code is in the patch code region, that data is
 /// outside it, the cell and the loader's table, and that neither is over lasting memory
-/// (the module's rules). Whether data is in the image is the platform's to check.
+/// (the module's rules). Whether data is in the image is the platform's to check. The
+/// platform is also where the switch reads the image: the cell and the loader's table.
 pub(crate) trait Memory {
     const DWARF: Dwarf;
     /// Whether the unwinder takes Windows `RUNTIME_FUNCTION`s.
     const SEH: bool;
+    /// What the table cell at `cell` (8-aligned, `Layout::new` checked) holds, by one
+    /// acquire load.
+    fn cell(&self, cell: u64) -> u64;
+    /// Checks that `range` is in the image, as the platform checks data.
+    fn in_image(&self, range: &Range<u64>) -> Result<(), String>;
+    /// The image's bytes at `range`, which the platform checks are in the image and
+    /// readable: read-only data the linker wrote, such as the directory's name.
+    fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String>;
+    /// The loader's table, `slots` addresses at `at`, which [`Switch::new`] checked is
+    /// 8-aligned and in the image. Nothing writes it: the switch stores only to the cell and
+    /// its own tables, and refuses data over it.
+    fn loaders(&self, at: u64, slots: u64) -> &[u64];
     /// Writes into the patch code region and makes it runnable again.
     fn code(&mut self, writes: &Writes<'_>) -> Result<(), String>;
-    /// Writes data anywhere in the image, making read-only pages writable for the write and
-    /// back.
+    /// Writes data anywhere in the image with [`Writes::store`], making read-only pages
+    /// writable for the write and back.
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String>;
     /// Registers with the unwinder what [`Memory::DWARF`] says it takes, at each address.
     fn frames(&mut self, starts: &[u64]) -> Result<(), String>;
@@ -442,12 +400,14 @@ pub(crate) struct Switch<M: Memory> {
 impl<M: Memory> Switch<M> {
     pub(crate) fn new(memory: M, layout: Layout) -> Result<Switch<M>, String> {
         let cell = layout.cell();
-        // SAFETY: the cell is the descriptor's, 8-aligned (`Layout::new` checked) and in the
-        // image's data, mapped as long as the image is. Only this switch stores to it.
-        let table = unsafe { AtomicU64::from_ptr(cell as *mut u64) }.load(Ordering::Acquire);
+        memory.in_image(&(cell..cell + 8))?;
+        let table = memory.cell(cell);
         if table == 0 || !table.is_multiple_of(8) {
             return Err(format!("the jump table cell at {cell:#x} holds {table:#x}"));
         }
+        let end = layout.slots.checked_mul(8).and_then(|len| table.checked_add(len));
+        let end = end.ok_or_else(|| format!("a jump table at {table:#x} past the end of memory"))?;
+        memory.in_image(&(table..end))?;
         let log = Log::new(layout.generation);
         Ok(Switch {
             memory,
@@ -730,12 +690,7 @@ impl<M: Memory> Switch<M> {
 
     /// The loader's table, which the cell pointed at when the program started.
     fn image(&self) -> &[u64] {
-        let slots = self.layout.slots as usize;
-        // SAFETY: `slots` code addresses (the descriptor's count), 8-aligned (`Switch::new`
-        // checked), in the image's data, mapped as long as it is. Nothing writes it: the
-        // switch stores only to the cell and its own tables, and refuses data over it
-        // (`apply`).
-        unsafe { std::slice::from_raw_parts(self.image as *const u64, slots) }
+        self.memory.loaders(self.image, self.layout.slots)
     }
 
     /// The target of `slot` in the table the cell points at.
@@ -1071,7 +1026,7 @@ fn le32(bytes: &[u8]) -> u32 {
     u32::from_le_bytes(value)
 }
 
-fn le64(bytes: &[u8]) -> u64 {
+pub(super) fn le64(bytes: &[u8]) -> u64 {
     let mut value = [0; 8];
     value.copy_from_slice(&bytes[..8]);
     u64::from_le_bytes(value)

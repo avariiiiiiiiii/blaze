@@ -258,6 +258,56 @@ fn a_cold_column_takes_the_smallest_codec() {
 }
 
 #[test]
+fn every_codec_size_is_computed_exactly() {
+    for seed in SEEDS {
+        for (name, values) in columns::shapes(seed) {
+            let shape = super::Shape::of(&values);
+            for codec in Codec::ALL {
+                assert_eq!(
+                    shape.size(values.len(), codec),
+                    encode_raw(&values, codec).map(|it| it.len()),
+                    "{name} of {} in {codec:?}",
+                    values.len()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn radix_sort_is_a_sort() {
+    let mut rng = Rng::new(9);
+    for seed in SEEDS {
+        for (name, values) in columns::shapes(seed) {
+            let mut shuffled = values.clone();
+            for i in (1..shuffled.len()).rev() {
+                shuffled.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            let mut expected = shuffled.clone();
+            expected.sort_unstable();
+            super::radix_sort(&mut shuffled);
+            assert_eq!(shuffled, expected, "{name} of {}", values.len());
+        }
+    }
+}
+
+#[test]
+fn a_warm_block_is_in_simd_bp128_layout() {
+    let values: Vec<u32> = (0..super::BLOCK_VALUES as u32 + 3).collect();
+    let packed = Packed::pack(&values);
+    assert_eq!((packed.min, packed.bits), (0, 8));
+    let lanes = super::LANES;
+    for lane in 0..lanes {
+        for word in 0..8 {
+            let expected = (0..4).fold(0u32, |acc, k| acc | ((4 * (4 * word + k) + lane) as u32) << (8 * k));
+            assert_eq!(packed.words[word * lanes + lane], expected, "lane {lane} word {word}");
+        }
+    }
+    let tail = &packed.words[8 * lanes..];
+    assert_eq!(tail, &[128 | 129 << 8 | 130 << 16, 0]);
+}
+
+#[test]
 fn equal_columns_are_equal_cold_bytes() {
     for (_, values) in columns::shapes(5) {
         assert_eq!(encode_cold(&values, None), encode_cold(&values.clone(), None));
@@ -329,7 +379,7 @@ fn a_corrupt_cold_column_is_refused() {
     let cold = encode_cold(&values, None);
     assert_eq!(decode_cold(&cold[..COLD_HEADER - 1], None), Err(FormatError::Header("a cold column shorter than its header")));
     let mut version = cold.clone();
-    version[0] = 2;
+    version[0] = super::COLD_VERSION + 1;
     assert_eq!(decode_cold(&version, None), Err(FormatError::Header("a cold column of another version")));
     let mut length = cold.clone();
     length[33..41].copy_from_slice(&(1u64 << 40).to_le_bytes());

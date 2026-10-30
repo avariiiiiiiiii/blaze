@@ -2,6 +2,7 @@
 
 use std::iter;
 
+use blaze_ids::radix;
 use rustc_abi::ExternAbi;
 use tracing::debug;
 
@@ -387,7 +388,7 @@ impl<'db> InferenceContext<'db> {
             } else {
                 // there are more parameters than there should be without legacy
                 // const params; use them
-                legacy_const_generics_indices.sort_unstable();
+                radix::sort(&mut legacy_const_generics_indices);
                 return legacy_const_generics_indices;
             }
         }
@@ -420,7 +421,7 @@ impl<'db> InferenceContext<'db> {
                 }
             }
         }
-        legacy_const_generics_indices.sort_unstable();
+        radix::sort(&mut legacy_const_generics_indices);
         legacy_const_generics_indices
     }
 

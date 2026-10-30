@@ -8,7 +8,7 @@
 //! and the marker attributes of no arguments; and ([`crate_checks`]) the checks rustc's
 //! stability pass makes of what they parse to: a `#[deprecated]` without a stability, a
 //! stability where one is useless, a stability after a deprecation, const stability on what is
-//! not a `const fn`, and (`lib_features`) a feature declared stable or unstable twice.
+//! not a `const fn`.
 //!
 //! Follows rustc's `compiler/rustc_attr_parsing/src/attributes/` `stability.rs`,
 //! `deprecation.rs`, `allow_unstable.rs`, `confusables.rs`, `lint_helpers.rs`, `traits.rs`,
@@ -18,8 +18,8 @@
 //! `compiler/rustc_ast_lowering/src/item.rs` (`lower_constness`) with the text of
 //! `compiler/rustc_ast_lowering/src/diagnostics.rs` (`ConstComptimeFn`);
 //! `compiler/rustc_passes/src/stability.rs` (`lookup_stability`, `lookup_deprecation_entry`,
-//! `annotation_kind`, `check_compatible_stability`, `MissingStabilityAnnotations`),
-//! `compiler/rustc_passes/src/lib_features.rs` with the texts of
+//! `annotation_kind`, `check_compatible_stability`, `MissingStabilityAnnotations`) with the
+//! texts of
 //! `compiler/rustc_passes/src/diagnostics.rs`; and `compiler/rustc_ast/src/util/literal.rs`
 //! (`escape_string_symbol`, `LitKind`'s `Display`) (MIT or Apache-2.0).
 
@@ -124,7 +124,8 @@ pub(crate) struct State {
 
 pub(crate) fn accept(state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Accepted {
     let other = |name| Parsed::Other(name);
-    match cx.builtin.path {
+    let path: &'static [&'static str] = cx.builtin.path;
+    match path {
         [name @ ("stable" | "unstable")] => {
             if state.stability.is_some() {
                 multiple_levels(cx);
@@ -331,11 +332,12 @@ fn is_ident(text: &str) -> bool {
 
 /// `MissingFeature` or `NonIdentFeature` where the feature is not one.
 fn checked_feature(cx: &mut Accept<'_, '_, '_>, feature: Option<String>) -> Option<String> {
-    let message = match &feature {
-        Some(name) if is_ident(name) => return feature,
-        Some(_) => "'feature' is not an identifier",
-        None => "missing 'feature'",
+    let message = match feature.as_deref() {
+        Some(name) if is_ident(name) => None,
+        Some(_) => Some("'feature' is not an identifier"),
+        None => Some("missing 'feature'"),
     };
+    let Some(message) = message else { return feature };
     let diag = cx.err(Some("E0546"), message, cx.attr_range());
     cx.emit_err(diag);
     None
@@ -538,7 +540,7 @@ fn deprecated(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
     let suggestions = cx.feature("deprecated_suggestion");
     let mut since: Option<String> = None;
     let mut note: Option<String> = None;
-    let mut suggestion: Option<String> = None;
+    let mut suggestion = false;
     match args {
         ArgParser::NoArgs => {}
         ArgParser::List(list) => {
@@ -575,7 +577,8 @@ fn deprecated(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
                             diag.note("see #94785 for more details");
                             cx.emit_err(diag);
                         }
-                        suggestion = Some(get(cx, "suggestion", meta.range(), &meta.args, suggestion.is_some())?);
+                        get(cx, "suggestion", meta.range(), &meta.args, suggestion)?;
+                        suggestion = true;
                     }
                     _ => {
                         let expected: &[&str] =
@@ -614,7 +617,6 @@ fn deprecated(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
         cx.emit_err(diag);
         return None;
     }
-    let _ = suggestion;
     Some(Parsed::Deprecated(since))
 }
 
@@ -770,9 +772,9 @@ fn const_comptime(fx: &mut Finalize<'_, '_, '_>, attr: usize) {
 /// The errors rustc's stability pass gives of the crate's parsed stability attributes, each
 /// with the owner whose attribute it is of: `check_compatible_stability` of each definition
 /// (E0549, `UselessStability`, `CannotStabilizeDeprecated`, `MissingConstErr`,
-/// `ConstStableNotStable`, `RustcConstStableIndirectPairing`), a module's after another, and
-/// `lib_features`' (E0711) after the crate root module's. `parsed` is what each of `owners` is
-/// parsed to (nothing for a macro call). Only a crate with `#![feature(staged_api)]` has them.
+/// `ConstStableNotStable`, `RustcConstStableIndirectPairing`), a module's after another.
+/// `parsed` is what each of `owners` is parsed to (nothing for a macro call). Only a crate with
+/// `#![feature(staged_api)]` has them.
 pub(crate) fn crate_checks(
     cx: &Cx<'_, '_>,
     session: &Session,
@@ -796,14 +798,7 @@ pub(crate) fn crate_checks(
         }
     }
     keyed.sort_by_key(|it| it.0);
-    let features = lib_features(cx, owners, parsed);
-    let root_end = keyed.iter().position(|it| it.0.0 > 0).unwrap_or(keyed.len());
-    let mut out: Vec<(usize, Diag)> = Vec::with_capacity(keyed.len() + features.len());
-    let mut keyed = keyed.into_iter();
-    out.extend(keyed.by_ref().take(root_end).map(|(_, at, diag)| (at, diag)));
-    out.extend(features);
-    out.extend(keyed.map(|(_, at, diag)| (at, diag)));
-    out
+    keyed.into_iter().map(|(_, at, diag)| (at, diag)).collect()
 }
 
 /// Whether `MissingStabilityAnnotations` checks a definition of `target`: an item, a trait's or
@@ -904,7 +899,9 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             }
         }
         let mut modules = FxHashMap::default();
-        modules.insert(InFile::new(crate_root, SyntaxNodePtr::new(&cx_root(cx, crate_root, owners))), 0);
+        if let Some(krate) = owners.iter().find(|it| it.target == Target::Crate) {
+            modules.insert(krate.at(), 0);
+        }
         Defs {
             cx,
             owners,
@@ -1076,7 +1073,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             }
             let Some(parent) = self.parent(&at) else { break };
             if matches!(parent.target, Target::Mod | Target::Crate) {
-                let ptr = self.module_ptr(&parent);
+                let ptr = parent.ptr();
                 let next = self.modules.len();
                 let module = *self.modules.entry(ptr).or_insert(next);
                 return (module, kind.unwrap_or(0));
@@ -1086,34 +1083,33 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
         (0, kind.unwrap_or(0))
     }
 
-    /// A module by one node: a module file's by its declaration.
-    fn module_ptr(&self, def: &Def) -> InFile<SyntaxNodePtr> {
-        def.ptr()
-    }
-
     /// `check_compatible_stability` of the owner `at`, whose node is `def`.
     fn compatible(&mut self, at: usize, def: &Def) -> Vec<Diag> {
-        let mut errors = Vec::new();
-        let owner = &self.owners[at];
-        let parsed = &self.parsed[at];
+        let stability = self.lookup_stability(def);
+        let deprecation = self.lookup_deprecation(def);
+        let kind = self.annotation(def);
+        let own_stability = self.own_stability(at);
+        let own_deprecation = self.own_deprecation(at);
+        let cx: &'a Cx<'c, 'db> = self.cx;
+        let owners: &'a [Owner] = self.owners;
+        let all: &'a [Vec<ParsedAttr>] = self.parsed;
+        let owner = &owners[at];
+        let parsed = &all[at];
         let attr_span = |index: usize| {
             let attr = &owner.attrs[index];
-            self.cx.span(attr.in_file(attr.range()))
+            cx.span(attr.in_file(attr.range()))
         };
         let path_span = |index: usize| {
             let attr = &owner.attrs[index];
-            self.cx.span(attr.in_file(attr.path_range()))
+            cx.span(attr.in_file(attr.path_range()))
         };
-        let item_span = || self.cx.span(InFile::new(def.node.file_id, def_range(&def.node.value)));
-        let own_stability = self.own_stability(at);
-        let own_deprecation = self.own_deprecation(at);
+        let item_span = || cx.span(InFile::new(def.node.file_id, def_range(&def.node.value)));
         let const_stability = parsed.iter().find_map(|it| match &it.parsed {
             Parsed::ConstStability(stability) => Some(stability),
             _ => None,
         });
         let const_stable_indirect = parsed.iter().any(|it| matches!(it.parsed, Parsed::RustcConstStableIndirect));
-        let stability = self.lookup_stability(def);
-        let deprecation = self.lookup_deprecation(def);
+        let mut errors = Vec::new();
         if stability.is_none()
             && let Some((DeprecatedSince::RustcVersion(_), attr)) = own_deprecation
         {
@@ -1121,7 +1117,6 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             errors.push(Diag::error(Some("E0549"), message, attr_span(attr)));
         }
         if let Some(stability) = own_stability {
-            let kind = self.annotation(def);
             let stable = matches!(stability.level, StabilityLevel::Stable(_));
             if kind == Annotation::Prohibited || kind == Annotation::Container && stable && deprecation.is_some() {
                 let span = attr_span(stability.attr);
@@ -1154,7 +1149,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
         if let Some(function) = &function
             && let Some(const_stability) = const_stability
         {
-            let signature = self.cx.span(InFile::new(def.node.file_id, signature_range(function)));
+            let signature = cx.span(InFile::new(def.node.file_id, signature_range(function)));
             let comptime = owner.attrs.iter().any(|it| it.is("rustc_comptime"));
             if function.const_token().is_none() && !comptime {
                 let message = "attributes `#[rustc_const_unstable]`, `#[rustc_const_stable]` and `#[rustc_const_stable_indirect]` require the function or method to be `const`";
@@ -1180,83 +1175,6 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
         }
         errors
     }
-}
-
-/// The crate root's node, as the owners have it.
-fn cx_root(cx: &Cx<'_, '_>, crate_root: HirFileId, owners: &[Owner]) -> SyntaxNode {
-    match owners.iter().find(|it| it.target == Target::Crate) {
-        Some(owner) => owner.node.value.clone(),
-        None => cx.db.parse_or_expand(crate_root),
-    }
-}
-
-/// rustc's `FeatureStability`.
-#[derive(Clone, PartialEq, Eq)]
-enum FeatureStability {
-    AcceptedSince(String),
-    Unstable,
-}
-
-/// `lib_features`: each feature the crate's stability attributes declare, in the order its
-/// attributes come, and the errors of one declared stable since two versions, or stable and
-/// unstable.
-fn lib_features(cx: &Cx<'_, '_>, owners: &[Owner], parsed: &[Vec<ParsedAttr>]) -> Vec<(usize, Diag)> {
-    let mut declared: FxHashMap<&str, FeatureStability> = FxHashMap::default();
-    let mut errors = Vec::new();
-    for (at, owner) in owners.iter().enumerate() {
-        let Some(parsed) = parsed.get(at) else { continue };
-        let mut attrs: Vec<(&Stability, bool)> = parsed
-            .iter()
-            .filter_map(|it| match &it.parsed {
-                Parsed::Stability(stability) | Parsed::BodyStability(stability) => Some((stability, false)),
-                Parsed::ConstStability(stability) => Some((stability, true)),
-                _ => None,
-            })
-            .collect();
-        attrs.sort_by_key(|(stability, _)| stability.attr);
-        for (stability, by_path) in attrs {
-            let feature_stability = match stability.level {
-                StabilityLevel::Unstable => FeatureStability::Unstable,
-                StabilityLevel::Stable(StableSince::Version(version)) => {
-                    FeatureStability::AcceptedSince(version_text(version))
-                }
-                StabilityLevel::Stable(StableSince::Current) => {
-                    FeatureStability::AcceptedSince(format!("{}-nightly", version_text(CURRENT)))
-                }
-                StabilityLevel::Stable(StableSince::Err) => continue,
-            };
-            let attr = &owner.attrs[stability.attr];
-            let range = if by_path { attr.path_range() } else { attr.range() };
-            let span = cx.span(attr.in_file(range));
-            let feature = stability.feature.as_str();
-            let message = match (declared.get(feature), &feature_stability) {
-                (None, _) => {
-                    declared.insert(feature, feature_stability);
-                    continue;
-                }
-                (Some(FeatureStability::AcceptedSince(prev)), FeatureStability::AcceptedSince(since)) => {
-                    if prev == since {
-                        continue;
-                    }
-                    format!("feature `{feature}` is declared stable since {since}, but was previously declared stable since {prev}")
-                }
-                (Some(FeatureStability::Unstable), FeatureStability::AcceptedSince(_)) => {
-                    format!("feature `{feature}` is declared stable, but was previously declared unstable")
-                }
-                (Some(FeatureStability::AcceptedSince(_)), FeatureStability::Unstable) => {
-                    format!("feature `{feature}` is declared unstable, but was previously declared stable")
-                }
-                (Some(FeatureStability::Unstable), FeatureStability::Unstable) => continue,
-            };
-            errors.push((at, Diag::error(Some("E0711"), message, span)));
-        }
-    }
-    errors
-}
-
-/// `RustcVersion`'s `Display`.
-fn version_text((major, minor, patch): RustcVersion) -> String {
-    format!("{major}.{minor}.{patch}")
 }
 
 #[cfg(test)]
@@ -1301,10 +1219,5 @@ mod tests {
     fn strings_are_escaped_as_rustc_prints_them() {
         assert_eq!(escape_string("a\"b\n\u{e9}"), "a\\\"b\\n\\u{e9}");
         assert_eq!(escape_string("1.2.3"), "1.2.3");
-    }
-
-    #[test]
-    fn versions_print_with_three_parts() {
-        assert_eq!(version_text((1, 0, 0)), "1.0.0");
     }
 }

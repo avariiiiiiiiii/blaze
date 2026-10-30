@@ -1105,6 +1105,24 @@ fn transmute_imut_to_mut() {
     );
 }
 
+/// A function named `transmute` that is not the intrinsic transmutes nothing to rustc.
+#[test]
+fn a_transmute_that_is_not_the_intrinsic() {
+    let std = r#"
+pub mod mem {
+    pub const unsafe fn transmute<Src, Dst>(src: Src) -> Dst {
+        loop {}
+    }
+}
+"#;
+    let source = r#"
+fn main() {
+    let _: &mut u8 = unsafe { std::mem::transmute(&0u8) };
+}
+"#;
+    check("not-the-intrinsic.rs", "sized", std, source, "");
+}
+
 /// `tests/ui/lint/force-warn/deny-by-default-lint.rs`.
 #[test]
 fn force_warn_mutable_transmutes() {

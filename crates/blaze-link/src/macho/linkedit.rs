@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 
+use blaze_ids::radix;
 use object::macho;
 
 /// A segment, by its index among the image's `LC_SEGMENT_64`s.
@@ -63,7 +64,7 @@ fn sorted(values: &[u64]) -> Cow<'_, [u64]> {
         return Cow::Borrowed(values);
     }
     let mut values = values.to_vec();
-    values.sort_unstable();
+    radix::sort(&mut values);
     Cow::Owned(values)
 }
 
@@ -138,7 +139,7 @@ pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span]) -> Result<Vec<u8>, S
     if binds.is_empty() {
         return Ok(Vec::new());
     }
-    binds.sort_unstable_by_key(|it| it.addr);
+    radix::sort_by_key(binds, |it| it.addr);
     if let Some(twice) = binds.windows(2).find(|it| it[0].addr == it[1].addr) {
         return Err(format!("the address {:#x} is to be bound twice", twice[0].addr));
     }

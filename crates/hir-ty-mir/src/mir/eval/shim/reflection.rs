@@ -22,33 +22,33 @@ type FieldBytes<'a, 'db> =
     &'a mut dyn FnMut(&mut Evaluator<'db>, &str, Ty<'db>) -> Result<'db, Vec<u8>>;
 
 impl<'db> Evaluator<'db> {
-    /// Answers the reflection intrinsic `name`, or says it is not one.
+    /// Answers the reflection intrinsic `intrinsic`, or says it is not one.
     pub(super) fn exec_reflection_intrinsic(
         &mut self,
-        name: &str,
+        intrinsic: Intrinsic,
         args: &[IntervalAndTy<'db>],
         destination: Interval,
         locals: &Locals<'db>,
     ) -> Result<'db, bool> {
-        match name {
-            "type_id_type_of" => {
+        match intrinsic {
+            Intrinsic::TypeIdTypeOf => {
                 let [id] = args else { not_supported!("type_id_type_of args") };
                 let ty = self.type_id_of(id)?;
                 let value = self.reflected_type(ty, locals)?;
                 destination.write_from_bytes(self, &value)?;
             }
-            "type_id_vtable" => {
+            Intrinsic::TypeIdVtable => {
                 let [id, trait_] = args else { not_supported!("type_id_vtable args") };
                 let ty = self.type_id_of(id)?;
                 let trait_ty = self.type_id_of(trait_)?;
                 self.reflected_vtable(ty, trait_ty, destination, locals)?;
             }
-            "type_id_is_signed" => {
+            Intrinsic::TypeIdIsSigned => {
                 let [id] = args else { not_supported!("type_id_is_signed args") };
                 let ty = self.type_id_of(id)?;
                 destination.write_from_bytes(self, &[matches!(ty.kind(), TyKind::Int(_)) as u8])?;
             }
-            "type_id_array_len" => {
+            Intrinsic::TypeIdArrayLen => {
                 let [id] = args else { not_supported!("type_id_array_len args") };
                 let len = match self.type_id_of(id)?.kind() {
                     TyKind::Array(_, len) => match try_const_usize(self.db, len) {
@@ -59,11 +59,13 @@ impl<'db> Evaluator<'db> {
                 };
                 destination.write_from_bytes(self, &word_bytes(len))?;
             }
-            "type_id_element_ty" | "type_id_points_to" => {
-                let [id] = args else { not_supported!("{name} args") };
-                let inner = match (name, self.type_id_of(id)?.kind()) {
-                    ("type_id_element_ty", TyKind::Array(it, _) | TyKind::Slice(it)) => Some(it),
-                    ("type_id_points_to", TyKind::RawPtr(it, _) | TyKind::Ref(_, it, _)) => {
+            Intrinsic::TypeIdElementTy | Intrinsic::TypeIdPointsTo => {
+                let [id] = args else { not_supported!("{intrinsic} args") };
+                let inner = match (intrinsic, self.type_id_of(id)?.kind()) {
+                    (Intrinsic::TypeIdElementTy, TyKind::Array(it, _) | TyKind::Slice(it)) => {
+                        Some(it)
+                    }
+                    (Intrinsic::TypeIdPointsTo, TyKind::RawPtr(it, _) | TyKind::Ref(_, it, _)) => {
                         Some(it)
                     }
                     _ => None,
@@ -75,7 +77,7 @@ impl<'db> Evaluator<'db> {
                 let type_id = self.type_id_adt()?;
                 self.write_option(destination, type_id, inner, locals)?;
             }
-            "type_id_points_mutably" => {
+            Intrinsic::TypeIdPointsMutably => {
                 let [id] = args else { not_supported!("type_id_points_mutably args") };
                 let mutably = matches!(
                     self.type_id_of(id)?.kind(),
@@ -83,20 +85,20 @@ impl<'db> Evaluator<'db> {
                 );
                 destination.write_from_bytes(self, &[mutably as u8])?;
             }
-            "type_id_size_of" => {
+            Intrinsic::TypeIdSizeOf => {
                 let [id] = args else { not_supported!("type_id_size_of args") };
                 let ty = self.type_id_of(id)?;
                 let size = self.size_align_of(ty, locals)?.map(|(size, _)| word_bytes(size));
                 let usize = Ty::new_uint(self.interner(), rustc_type_ir::UintTy::Usize);
                 self.write_option(destination, usize, size, locals)?;
             }
-            "type_id_variants" => {
+            Intrinsic::TypeIdVariants => {
                 let [id] = args else { not_supported!("type_id_variants args") };
                 let ty = self.type_id_of(id)?;
                 let variants = self.reflected_variants(ty)?;
                 destination.write_from_bytes(self, &word_bytes(variants))?;
             }
-            "type_id_variant_name" => {
+            Intrinsic::TypeIdVariantName => {
                 let [id, variant] = args else { not_supported!("type_id_variant_name args") };
                 let ty = self.type_id_of(id)?;
                 let variant = from_bytes!(usize, variant.get(self)?);
@@ -115,7 +117,7 @@ impl<'db> Evaluator<'db> {
                 let name = name.map(|it| it.as_str().to_owned()).unwrap_or_default();
                 self.write_str(destination, &name)?;
             }
-            "type_id_variant_non_exhaustive" => {
+            Intrinsic::TypeIdVariantNonExhaustive => {
                 let [id, variant] = args else {
                     not_supported!("type_id_variant_non_exhaustive args")
                 };
@@ -135,7 +137,7 @@ impl<'db> Evaluator<'db> {
                 let non_exhaustive = self.is_non_exhaustive(attrs_of);
                 destination.write_from_bytes(self, &[non_exhaustive as u8])?;
             }
-            "type_id_non_exhaustive" => {
+            Intrinsic::TypeIdNonExhaustive => {
                 let [id] = args else { not_supported!("type_id_non_exhaustive args") };
                 // rustc's `is_variant_list_non_exhaustive` of an enum and
                 // `is_field_list_non_exhaustive` of a struct's or union's one variant: the
@@ -146,13 +148,13 @@ impl<'db> Evaluator<'db> {
                 };
                 destination.write_from_bytes(self, &[non_exhaustive as u8])?;
             }
-            "type_id_fields" => {
+            Intrinsic::TypeIdFields => {
                 let [id, variant] = args else { not_supported!("type_id_fields args") };
                 let ty = self.type_id_of(id)?;
                 let fields = self.reflected_fields(ty, from_bytes!(usize, variant.get(self)?))?;
                 destination.write_from_bytes(self, &word_bytes(fields.len()))?;
             }
-            "type_id_field_representing_type" => {
+            Intrinsic::TypeIdFieldRepresentingType => {
                 let [id, variant, field] = args else {
                     not_supported!("type_id_field_representing_type args")
                 };
@@ -168,35 +170,37 @@ impl<'db> Evaluator<'db> {
                 let id = self.type_id(TypeIdOf::Field { base, variant, field });
                 destination.write_from_bytes(self, &id)?;
             }
-            "field_representing_type_actual_type_id"
-            | "field_representing_type_name"
-            | "field_representing_type_offset" => {
-                let [id] = args else { not_supported!("{name} args") };
+            Intrinsic::FieldRepresentingTypeActualTypeId
+            | Intrinsic::FieldRepresentingTypeName
+            | Intrinsic::FieldRepresentingTypeOffset => {
+                let [id] = args else { not_supported!("{intrinsic} args") };
                 let Some(&TypeIdOf::Field { base, variant, field }) = self.type_id_entry(id)?
                 else {
-                    not_supported!("{name} of a `TypeId` that is not a field's")
+                    not_supported!("{intrinsic} of a `TypeId` that is not a field's")
                 };
                 let (field_name, field_ty) =
                     self.reflected_fields(base, variant)?.swap_remove(field);
-                match name {
-                    "field_representing_type_actual_type_id" => {
+                match intrinsic {
+                    Intrinsic::FieldRepresentingTypeActualTypeId => {
                         let id = self.type_id_bytes(field_ty)?;
                         destination.write_from_bytes(self, &id)?;
                     }
-                    "field_representing_type_name" => self.write_str(destination, &field_name)?,
+                    Intrinsic::FieldRepresentingTypeName => {
+                        self.write_str(destination, &field_name)?
+                    }
                     _ => {
                         let offset = self.reflected_offset(base, variant, field, locals)?;
                         destination.write_from_bytes(self, &word_bytes(offset))?;
                     }
                 }
             }
-            "type_id_generics" => {
+            Intrinsic::TypeIdGenerics => {
                 let [id] = args else { not_supported!("type_id_generics args") };
                 let ty = self.type_id_of(id)?;
                 let value = self.reflected_generics(ty, locals)?;
                 destination.write_from_bytes(self, &value)?;
             }
-            "type_id_function_ptr" => {
+            Intrinsic::TypeIdFunctionPtr => {
                 let [id] = args else { not_supported!("type_id_function_ptr args") };
                 let ty = self.type_id_of(id)?;
                 let Some(fn_ptr) = self.lang_items().TypeInfoFnPtr else {

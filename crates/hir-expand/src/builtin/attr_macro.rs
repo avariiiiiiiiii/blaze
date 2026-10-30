@@ -24,7 +24,20 @@ macro_rules! register_builtin {
                 }
             }
 
+            /// The builtin attribute `name` names: its declared index and one load.
             fn find_by_name(name: &name::Name) -> Option<Self> {
+                static BY_SYMBOL: intern::KnownNames =
+                    intern::KnownNames::new(&[$( sym::Declared::$name, )*]);
+                BY_SYMBOL.get(name.symbol()).map(|at| Self::ALL[usize::from(at)])
+            }
+
+            /// Each builtin attribute's name, in declaration order.
+            #[cfg(test)]
+            const NAMES: &[intern::Symbol] = &[$( sym::$name, )*];
+
+            /// [`Self::find_by_name`] as a chain of compares, the reference it is tested by.
+            #[cfg(test)]
+            fn find_by_name_by_compare(name: &name::Name) -> Option<Self> {
                 match name {
                     $( id if id == &sym::$name => Some(BuiltinAttrExpander::$variant), )*
                      _ => None,
@@ -253,4 +266,37 @@ pub fn pseudo_derive_attr_expansion(
         token_trees.close(call_site);
     }
     ExpandResult::ok(token_trees.build())
+}
+
+#[cfg(test)]
+mod tests {
+    use intern::{Symbol, sym};
+
+    use super::BuiltinAttrExpander;
+    use crate::name::Name;
+
+    #[test]
+    fn builtin_attrs_found_as_by_compare() {
+        let mut symbols: Vec<Symbol> = BuiltinAttrExpander::NAMES.to_vec();
+        let texts: Vec<String> = symbols.iter().map(|it| it.as_str().to_owned()).collect();
+        for text in &texts {
+            symbols.push(Symbol::intern(text));
+            symbols.push(Symbol::intern(&format!("{text}_")));
+            symbols.push(Symbol::intern(&text.to_uppercase()));
+            symbols.push(Symbol::intern(&text[..text.len() - 1]));
+        }
+        symbols.extend([sym::self_, sym::cfg, Symbol::intern("inline"), Symbol::intern("tokio_test")]);
+        for symbol in symbols {
+            let name = Name::new_symbol_root(symbol);
+            assert_eq!(
+                BuiltinAttrExpander::find_by_name(&name),
+                BuiltinAttrExpander::find_by_name_by_compare(&name),
+                "{name:?}"
+            );
+        }
+        for (at, symbol) in BuiltinAttrExpander::NAMES.iter().enumerate() {
+            let name = Name::new_symbol_root(symbol.clone());
+            assert_eq!(BuiltinAttrExpander::find_by_name(&name), Some(BuiltinAttrExpander::ALL[at]));
+        }
+    }
 }

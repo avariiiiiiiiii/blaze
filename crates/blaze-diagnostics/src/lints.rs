@@ -21,6 +21,7 @@ mod names;
 pub mod registry;
 mod syntax;
 
+pub(crate) use levels::level_at;
 pub use levels::{CommandLine, Level};
 pub use self::syntax::CheckCfg;
 

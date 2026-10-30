@@ -84,6 +84,16 @@ pub struct Parse<T> {
     _ty: PhantomData<fn() -> T>,
 }
 
+/// What the derived `PartialEq` compares, without bounding the marker `T`: the tree's content
+/// (never its address), the errors and the outline's edition.
+impl<T> std::hash::Hash for Parse<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.tree.hash(state);
+        self.errors.hash(state);
+        self.outline.hash(state);
+    }
+}
+
 impl<T> Clone for Parse<T> {
     fn clone(&self) -> Parse<T> {
         Parse {

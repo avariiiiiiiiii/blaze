@@ -34,7 +34,7 @@ pub type SyntaxElementChildren = syntax_tree::SyntaxElementChildren<RustLanguage
 pub type PreorderWithTokens = syntax_tree::api::PreorderWithTokens<RustLanguage>;
 
 /// The tree of a parse, flat: every tree is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Tree(Arc<FlatTree>);
 
 impl Tree {

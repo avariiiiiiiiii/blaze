@@ -183,8 +183,8 @@ mod tests {
             fn env(&mut self, _: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
                 None
             }
-            fn env_all(&mut self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-                Vec::new()
+            fn env_all(&mut self) -> &[(std::ffi::OsString, std::ffi::OsString)] {
+                &[]
             }
         }
         match index::find(&store, &put.run, &mut Same) {

@@ -121,8 +121,9 @@ mod tests {
         fn env(&mut self, name: &OsStr) -> Option<OsString> {
             self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
         }
-        fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-            self.env.clone()
+        fn env_all(&mut self) -> &[(OsString, OsString)] {
+            self.env.sort();
+            &self.env
         }
         fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
             let Some(names) = self.dirs.get(path) else { return Ok(None) };

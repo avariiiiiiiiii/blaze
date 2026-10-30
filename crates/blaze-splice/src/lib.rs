@@ -69,6 +69,7 @@ use std::{
 };
 
 use anyhow::{Context, bail, ensure};
+use blaze_ids::radix;
 use object::{
     Endianness, Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags,
     RelocationTarget, SectionIndex, SymbolIndex, SymbolKind, elf,
@@ -777,7 +778,7 @@ fn laid_out(path: &Path, image: &Image, lock: Option<File>) -> std::io::Result<d
     let (table, headers) = image.described.pointed(&copies);
     write_all_at(&writing.file, &headers, table)?;
     let mut linkers: Vec<(u64, u64)> = moved.iter().map(|it| (it.from, it.from + it.len)).collect();
-    linkers.sort_unstable();
+    radix::sort_copy_by_key(&mut linkers, |&(from, to)| radix::pack_64(from, to));
     let mut runs: Vec<(u64, u64)> = Vec::with_capacity(linkers.len());
     for (start, end) in linkers {
         match runs.last_mut() {
@@ -1339,7 +1340,7 @@ impl Image {
                     .map(|it| it.address() + it.size()),
             )
             .collect();
-        starts.sort_unstable();
+        radix::sort(&mut starts);
         let padding: &[u8] = match machine {
             Machine::X86_64 => &[0xcc, 0x90],
             Machine::Aarch64 => &[],
@@ -1418,7 +1419,7 @@ impl Image {
                     }
                 }
             }
-            pads.sort_unstable();
+            radix::sort_copy_by_key(&mut pads, |&(at, len)| radix::pack_64(at, len));
         }
 
         let mut imports = FxHashMap::default();
@@ -1635,7 +1636,7 @@ impl UnwindTable {
     /// The table as it is at `address`, with `added` frames given by the address of their
     /// code and their own. All of them are of code behind the program's.
     fn moved(&self, address: u64, mut added: Vec<(u64, u64)>) -> anyhow::Result<Vec<u8>> {
-        added.sort_unstable();
+        radix::sort_copy_by_key(&mut added, |&(code, frame)| radix::pack_64(code, frame));
         let mut table = Vec::with_capacity(self.len_with(added.len()));
         table.extend_from_slice(&Self::ENCODINGS);
         table.extend_from_slice(&relative(self.frames, address + 4)?.to_le_bytes());
@@ -1718,7 +1719,7 @@ impl LoadRelocations {
     ) -> anyhow::Result<Vec<elf::Rela64<Endianness>>> {
         let e = Endianness::Little;
         if !statics.is_empty() {
-            statics.sort_unstable_by_key(|it| it.address);
+            radix::sort_copy_by_key(&mut statics, |it| it.address);
             let entries = object::slice_from_all_bytes_mut::<elf::Rela64<Endianness>>(table)
                 .map_err(|()| anyhow::anyhow!("misaligned load-time relocations"))?;
             for entry in entries {
@@ -2103,7 +2104,7 @@ impl<'a> Patch<'a> {
         }
 
         for statics in patch.in_place.values_mut() {
-            statics.sort_unstable_by_key(|it| it.offset);
+            radix::sort_copy_by_key(statics, |it| it.offset);
         }
         patch.keep_lasting(|name| match image.symbols.get(name) {
             Some(Named::One(Defined { kind: SymbolKind::Data, address, .. })) => Some(*address),

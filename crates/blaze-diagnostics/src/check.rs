@@ -10,6 +10,7 @@
 //! and `compiler/rustc_errors/src/lib.rs` (`DiagCtxtInner::emit_diagnostic`: a diagnostic
 //! emitted again is not written again, nor a `note_once` already written).
 
+use blaze_ids::radix;
 use hir::{Semantics, db::HirDatabase};
 use rustc_hash::FxHashSet;
 
@@ -62,7 +63,7 @@ pub fn check_crate_with<'db>(
     }
     found.extend(checks::check(&cx));
     found.extend(lints::early(&cx, &options.lints));
-    found.sort_by_key(|it| it.phase);
+    radix::sort_by_key(&mut found, |it| it.phase as u8);
     let aborted = found.iter().any(stops_before_late);
     if !aborted {
         let mut late = lints::late(&cx);

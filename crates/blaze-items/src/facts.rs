@@ -17,7 +17,7 @@
 //! | macro hygiene | `Resolves` in the def-site scope for def-site names; mixed-site names resolve at the call site |
 //! | auto-trait leakage | `AutoTraits(opaque)` |
 
-use blaze_ids::{ContentId, Fingerprint, Hasher};
+use blaze_ids::{ContentId, Fingerprint, Hasher, radix};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, ConstId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, HasModule,
@@ -479,7 +479,7 @@ fn write_const_value(
             h.part(b"complex");
             let mut blocks: Vec<(usize, &[u8])> =
                 map.memory.iter().map(|(&at, bytes)| (at, bytes)).collect();
-            blocks.sort_unstable_by_key(|&(at, _)| at);
+            radix::sort_copy_by_key(&mut blocks, |&(at, _)| at);
             h.update(&(blocks.len() as u64).to_le_bytes());
             for (at, bytes) in blocks {
                 h.update(&(at as u64).to_le_bytes()).part(bytes);

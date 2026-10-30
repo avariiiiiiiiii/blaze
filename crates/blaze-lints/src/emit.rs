@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use annotate_snippets::{AnnotationKind, Group, Patch, Renderer, Snippet};
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 
@@ -182,7 +183,7 @@ pub fn rendered(diagnostic: &Diagnostic, sources: &mut Sources, style: Style) ->
                     .substitutions
                     .into_iter()
                     .filter_map(|mut parts| {
-                        parts.sort_by_key(|(span, _)| span.lo);
+                        radix::sort_by_key(&mut parts, |(span, _)| span.lo);
                         let first = parts.first()?.0.file.clone();
                         if parts.iter().any(|(span, _)| span.file != first) {
                             return None;
@@ -324,7 +325,7 @@ fn annotated_snippet<'a>(
     sources: &mut Sources,
 ) -> Option<Snippet<'a, annotate_snippets::Annotation<'a>>> {
     let file = sources.file(file_name)?;
-    annotations.sort_by_key(|it| file.line_of(it.span.lo as usize));
+    radix::sort_by_key(&mut annotations, |it| file.line_of(it.span.lo as usize) as u64);
     let spans: Vec<Span> = annotations.iter().map(|it| it.span.clone()).collect();
     let (lo, source, line) = shrink_file(&file, &spans)?;
     Some(Snippet::source(source).line_start(line).path(file_name.to_owned()).annotations(

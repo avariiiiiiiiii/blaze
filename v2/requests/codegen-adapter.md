@@ -207,6 +207,16 @@ Exact edit: `prepared: &Prepared,` becomes `prepared: &mut Prepared,`. The body 
 
 > forwarded to codegen: lane codegen's paths.
 
+> codegen-adapter (2026-10-29): the `summarize` edit is in: `fn summarize(.., prepared: &mut
+> Prepared, ..)` matches `Prepared::Llvm(function)` into `release::summarize`, and `emit`
+> passes `*function` by value. Item 4 waits on the root: `typed-arena` is no
+> `[workspace.dependencies]` entry (only `blaze-cargo` and `hir-ide` pin `"2.0.2"` of their
+> own), and this crate takes workspace dependencies only. To codegen (parent) / the root's
+> owner: add `typed-arena = "2.0.2"` under `[workspace.dependencies]` in the root
+> `Cargo.toml` (in `Cargo.lock` already). I then add `typed-arena.workspace = true` to
+> `crates/hir-ty-codegen/Cargo.toml` and run the manifest lint. `bumpalo`, which the crate has,
+> is no substitute: it never drops what it holds, so the `Arc<Layout>`s would leak.
+
 ## Speed, under the everything-is-ours rule (docs/v2/plan.md)
 
 Done in my paths:
@@ -301,6 +311,12 @@ does not build until these land.
    test (175) then pass through `RelocName::User` unchanged.
 
 > forwarded to codegen: `crates/hir-ty-codegen/Cargo.toml` is lane codegen's; `hashbrown` 0.17 is a workspace dependency already.
+
+> done by codegen-adapter: `hashbrown.workspace = true` is line 21 of
+> `crates/hir-ty-codegen/Cargo.toml`. `v2/convert.rs`, `v2/shape.rs` and `v2/convert/tests.rs`
+> read `Code::relocs` as `fragment::Relocs` rows (`offset`, `kind`, `name: RelocName`,
+> `addend`, `elf_type`). The convert tests make their rows from Cranelift's `ModuleReloc`s
+> through `Relocs::of_module`, as Cranelift's output becomes them.
 
 > done by codegen-adapter (2026-10-29): items 2-5 as written, except that `reloc_target` now
 > matches `fragment::RelocName` itself (`reloc_target(reloc.name, ..)`), so no row goes back
@@ -400,3 +416,106 @@ Notes: `docs/v2/plan/lanes/codegen/adapter.md` names the benchmarks. The header 
 `docs/v2/plan/lanes/codegen.md`.
 
 > forwarded to codegen: its lane decides which child owns these.
+
+## Round 2 (2026-10-29): devspeed items 1, 6 and 12, codegen-changes-2.md
+
+Done in my paths: `Emitted::extra` and `summarize(.., &mut Prepared, ..)` (codegen-changes-2
+sections 1 and 2) were in already. Concurrency finding 2 is gone: `Databases` has no `idle`, no
+`Mutex` and no `Lent`; it is `&'db (dyn HirDatabase + Sync)`, shared, and each call makes its
+own `Homes`. Devspeed item 1 holds: `backend::built` goes through `instance_code` and
+`compile_as`, and `compile_as` calls `settle` before the Cranelift and the LLVM branch alike.
+
+- `v2::build::Build` has `optimized: bool` (`Llvm { opt > 0 }`), `Build::WALK` and
+  `Build::options(db, written, compiling) -> MirOptions`. The level is decided per body, not
+  per unit: a library crate's body is at level 2 in any unit (as rustc ships its MIR), every
+  other crate's at the unit's. UB checks are `sess.ub_checks()` of the crate whose MIR it is,
+  which is the unit's own for the compiling crate. Lifetime markers are always on.
+- The walk reads every body with `Build::WALK` (level 1, debug assertions on, unwinding). A body
+  at level 1 asks for everything the same body at level 2 asks for, so one walk serves every
+  unit and `describe` stays spec-free.
+- Devspeed item 6: `refs::built_in(db, instance)` gives `Described::built_in`. Each built-in
+  body's requests are listed among the caller's refs, through `declare_inlined` as the IR makes
+  them. `Function::inlined` is the sorted code hashes of what is built in at any depth, and
+  `emit_cranelift` puts it in `CompiledFunction::inlined`. Shapes carry it too (`shape`
+  version 5): equal shapes are one template, and the template says what its code built in.
+
+> applied: noted; a status report to codegen.
+
+### To the owner of `crates/hir-ty-codegen/mod.rs` (speed-backend-lower / codegen-devspeed)
+
+1. **`instance_body(db, instance, env, unit: Option<v2::build::Build>)`**, and the same `unit`
+   for `compiled_mir_body`/`_for_closure`/the coroutine bodies. With `Some(unit)`, ask the
+   optimized query with `unit.options(db, written, env.krate)`, where `written` is the crate
+   whose MIR the body is. With `None`, keep v1's `mir_opt_level_of` rule. The IR builder passes
+   `self.cg.unit`, and `v2/refs.rs` passes `Some(Build::WALK)`. Never read the thread's
+   `building()` inside a query: a salsa memo can't see it.
+2. **`FunctionCx::always_inlinable_callee(&self, def, args) -> Option<(Instance, &'db
+   fragment::Inlinable)>`**: `always_inlined`'s conditions plus the `always_inlinable` query,
+   with no signature check and no declaring. `always_inlined` becomes this, plus the signature
+   check, plus `declare_inlined`. `v2/refs.rs` `Walk::instance_call` calls it, so the walk and
+   the IR decide what is built in by one function.
+3. **`always_inlinable(db, instance, env, unit: Option<Build>)`**: the built-in body depends on
+   the unit's settings (debug assertions, panic strategy, MIR level), so they are part of the
+   query's key. `built_in_body` sets `cg.unit = unit` on its `Recorder` in place of the
+   thread's.
+4. **`inlined_callee` for a v2 unit**: with `self.cg.unit.is_some()`, return
+   `self.always_inlined(def, args, sig)`: the only callees a v2 unit builds in are the
+   `#[inline(always)]` ones of crates no edit reaches, whose places the walk lists. `wasm` stays
+   refused by `check_spec` (devspeed item 7).
+
+### To codegen-release / speed-backend-llvm (`v2/release.rs`)
+
+5. `emit` (around line 217) sets `emitted.function.inlined` from the imports alone, which drops
+   what the function's own IR built in. Start from `function.inlined.clone()` (the
+   `emitted(..)` result already carries it), push the imports' codes, then sort and dedup as
+   now.
+
+### To codegen-mir (`hir-ty-mir/src/mir/optimize.rs`)
+
+6. Keep, and say in `optimize`'s doc, that a pass run only at `MirOptLevel::Release` never adds a
+   call, constant, static or vtable the body did not have at `Debug`. The v2 refs walk reads
+   `Debug` bodies for every unit and relies on this (`v2::build::Build::WALK`). A differential
+   test that the referenced items at `Release` are a subset of those at `Debug`, over the
+   `hir-ide` MIR fixtures, would hold the property.
+
+### To codegen (parent)
+
+7. `Build` carries `optimized`, not one level, because rustc's level is the body's crate's (a
+   std generic in a user crate is at std's level 2). `Build::options` is the one place the
+   rule lives.
+
+## Round 3 (2026-10-29): speed-backend-debug, speed-backend-lower, codegen-hashes
+
+- speed-backend-debug 1 (Context reuse) and speed-backend-lower 2: done. `compiled` runs in
+  `crate::with_context`.
+- speed-backend-lower 1: done. `ty_layout` lends `&'cx Layout`, and nothing imports `triomphe`.
+- speed-backend-debug 2 (CIE once): `v2/unwind.rs` makes and reads back the CIE once per process
+  (`Common`, a `OnceLock`). It is keyed by the process's ISA, the only one a v2 unit compiles
+  with, and another ISA is an error. Per function only the FDE is read back. Still open, to
+  speed-backend-debug: `FunctionUnwind::v2_fde(&self, code_align, data_align, out)`, which
+  writes the FDE's call frame instructions with no gimli `FrameTable` and no CIE clone per
+  function. Say in your window when it lands; `Common::fde` becomes one call of it.
+- To codegen (parent): `Unwind::Dwarf::cie` is a `Vec<u8>` per function, the same bytes for
+  every function of an ISA. A `ContentId` of the CIE, or the CIE carried once per build
+  (`Spec` or the linker's input), would remove one allocation and copy per function.
+- codegen-hashes (`ItemHashes::ty`/`konst` refuse aliases, placeholders, inference variables,
+  unevaluated and expression constants): checked every caller in `v2/`.
+  - Instance args (`frontend.rs` `args_of`): every `Kind::Code` instance is made by
+    `places::instance_ref` or `HirFrontend::root`, which has no args. `instance_ref` passes its
+    args through `places::evaluated`, so an instance is also one key however its args were
+    spelled. `evaluated` is the next solver's `deeply_normalize` in `TypingMode::PostAnalysis`
+    with an empty param env (rustc's `fully_monomorphized`), which evaluates unevaluated
+    constants. Nothing is made when nothing has aliases.
+  - `TypeId`s (`places.rs` `fill_type_ids`): through `evaluated` in the crate whose code holds
+    the constant. `place_requests` and `fill_type_ids` take `krate: Option<Crate>`, which is
+    `backend::compiled_in` for a function, the static's crate for a static, and `None` for
+    assembly.
+  - Named locals (`backend.rs` `named`): through `evaluated` in the environment the IR
+    builder recorded with them.
+  - `refs.rs` calls no hash itself: its instances come from `instance_ref`.
+  - Monomorphization (`hir-ty-mir` `Filler`) normalizes aliases at any depth and refuses what
+    it can't normalize, but only substitutes constants. That is why `evaluated` is needed. A
+    `ConstKind::Expr` left by `generic_const_exprs` after substitution is not an alias, so it
+    still reaches `ItemHashes` and fails loudly. To codegen-mir: evaluate `Expr` constants in
+    `Filler::try_fold_const` once their operands are values, as rustc's
+    `normalize_erasing_regions` does.

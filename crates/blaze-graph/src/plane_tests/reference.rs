@@ -1,6 +1,7 @@
 //! The plane as core-plane wrote it, before its state moved to columns: nodes and tasks as
 //! structs of `Vec`s, ready sets as `BTreeSet`s. Kept unchanged but for its imports and visibility, as the
-//! model [`crate::plane::Plane`] is compared with step by step (`plane_tests`).
+//! model [`crate::plane::Plane`] is compared with step by step (`plane_tests`), and for the one
+//! [`Event::Nodes`] a batch of columns is said in.
 
 #![forbid(unsafe_code)]
 
@@ -289,7 +290,7 @@ impl Plane {
                     return Err(Error::Closed);
                 }
                 let nodes = self.check(r, nodes)?;
-                self.add(at, r, nodes, &mut out);
+                self.add(at, r, nodes, true, &mut out);
                 touched.push(r);
             }
             PlaneInput::AddNodes { request, nodes, .. } => {
@@ -297,8 +298,13 @@ impl Plane {
                 if self.requests[r].closed {
                     return Err(Error::Closed);
                 }
-                let nodes = self.check(r, (0..nodes.len()).map(|at| nodes.spec(at)).collect())?;
-                self.add(at, r, nodes, &mut out);
+                let given: Vec<Spec> = (0..nodes.len()).map(|at| nodes.spec(at)).collect();
+                let record = (!given.is_empty()).then(|| nodes_record(nodes.first(), &given));
+                let nodes = self.check(r, given)?;
+                if let Some(record) = record {
+                    out.push(said(request, at, record));
+                }
+                self.add(at, r, nodes, false, &mut out);
                 touched.push(r);
             }
             PlaneInput::Close { request, .. } => {
@@ -325,7 +331,7 @@ impl Plane {
                 let r = self.nodes[runner].request;
                 let added = self.check(r, added)?;
                 self.finish_task(at, task, outcome, group, &mut out, &mut touched);
-                self.add(at, r, added, &mut out);
+                self.add(at, r, added, true, &mut out);
                 touched.push(r);
             }
             PlaneInput::Held { bytes, .. } => self.held = bytes,
@@ -458,7 +464,16 @@ impl Plane {
         Ok(order.into_iter().filter_map(|at| nodes[at].take()).collect())
     }
 
-    fn add(&mut self, at: u64, r: usize, nodes: Vec<Spec>, out: &mut Vec<PlaneOutput>) {
+    /// Adds `nodes` to request `r`, each said in an [`Event::Node`] of its own if `said_each`,
+    /// else said before in their batch's [`Event::Nodes`].
+    fn add(
+        &mut self,
+        at: u64,
+        r: usize,
+        nodes: Vec<Spec>,
+        said_each: bool,
+        out: &mut Vec<PlaneOutput>,
+    ) {
         if nodes.is_empty() {
             return;
         }
@@ -494,16 +509,18 @@ impl Plane {
                 skipped = skipped.or(self.requests[r].nodes.first().copied());
             }
             let id = self.requests[r].id;
-            out.push(said(
-                id,
-                at,
-                Event::Node {
-                    id: spec.id.0,
-                    kind: spec.kind,
-                    name: spec.name.clone(),
-                    deps: spec.deps.iter().map(|it| it.0).collect(),
-                },
-            ));
+            if said_each {
+                out.push(said(
+                    id,
+                    at,
+                    Event::Node {
+                        id: spec.id.0,
+                        kind: spec.kind,
+                        name: spec.name.clone(),
+                        deps: spec.deps.iter().map(|it| it.0).collect(),
+                    },
+                ));
+            }
             self.index.insert(spec.id, me);
             let priority = spec.cost;
             let node = Node {
@@ -992,4 +1009,20 @@ enum Pick {
 
 fn said(request: RequestId, at_ns: u64, event: Event) -> PlaneOutput {
     PlaneOutput::Said { request, record: Record { at_ns, event } }
+}
+
+/// The [`Event::Nodes`] of a batch given as columns, from its nodes as specs in the order
+/// given, the ids from `first` on.
+fn nodes_record(first: NodeId, given: &[Spec]) -> Event {
+    let mut names = String::new();
+    let (mut name_at, mut deps, mut deps_at) = (vec![0], Vec::new(), vec![0]);
+    for (at, spec) in given.iter().enumerate() {
+        assert_eq!(spec.id.0, first.0 + at as u32, "a batch of columns is a run of ids");
+        names.push_str(&spec.name);
+        name_at.push(names.len() as u32);
+        deps.extend(spec.deps.iter().map(|it| it.0));
+        deps_at.push(deps.len() as u32);
+    }
+    let kinds = given.iter().map(|it| it.kind).collect();
+    Event::Nodes { first: first.0, kinds, names, name_at, deps, deps_at }
 }

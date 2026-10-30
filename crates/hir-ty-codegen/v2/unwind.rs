@@ -2,11 +2,16 @@
 //! `.eh_frame` entry, apart from where the function is, and its landing pads as read-only
 //! data of its own. The linker writes the entries.
 
+use std::sync::OnceLock;
+
 use blaze_codegen::{Data, Target, Unwind};
 use cranelift_codegen::{
     gimli::{
         self, RunTimeEndian,
-        write::{Address, CommonInformationEntry, EhFrame, EndianVec, FrameTable},
+        write::{
+            Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry,
+            FrameTable,
+        },
     },
     isa::TargetIsa,
 };
@@ -22,21 +27,19 @@ pub(crate) fn convert(
 ) -> Result<(Unwind, Option<Data>), String> {
     match unwind.v2_parts() {
         UnwindParts::Dwarf { fde, landing_pads } => {
-            let Some(cie) = isa.create_systemv_cie() else {
-                return Err(format!("{} has no DWARF call frame information", isa.triple()));
-            };
-            let entry = Entry::of(cie, fde)?;
+            let common = common(isa)?;
+            let fde = common.fde(fde)?;
             let lsda = landing_pads.map(|pads| Data::new(4, pads.to_vec(), Vec::new()));
             let personality = match lsda {
                 Some(_) => Some(personality()?),
                 None => None,
             };
             let unwind = Unwind::Dwarf {
-                code_align: entry.code_align,
-                data_align: entry.data_align,
-                return_address: entry.return_address,
-                cie: entry.cie,
-                fde: entry.fde,
+                code_align: common.entry.code_align,
+                data_align: common.entry.data_align,
+                return_address: common.entry.return_address,
+                cie: common.entry.cie.clone(),
+                fde,
                 personality,
                 lsda: lsda.as_ref().map(|it| it.id),
             };
@@ -49,6 +52,39 @@ pub(crate) fn convert(
             "a Windows function with landing pads: v2 has no SEH handler data yet".to_owned(),
         ),
     }
+}
+
+/// The CIE every function of the process's ISA shares, made and read back once: Cranelift's
+/// `create_systemv_cie` depends on the ISA alone.
+struct Common {
+    made: CommonInformationEntry,
+    /// Its fields as read back, with an FDE of no instructions.
+    entry: Entry,
+}
+
+impl Common {
+    /// The instructions of one function's FDE, written after the shared CIE and read back.
+    fn fde(&self, fde: gimli::write::FrameDescriptionEntry) -> Result<Vec<u8>, String> {
+        Entry::of(self.made.clone(), fde).map(|it| it.fde)
+    }
+}
+
+/// [`Common`] of `isa`, which is the process's: the only ISA a v2 unit compiles with
+/// (`backend::check_spec`).
+fn common(isa: &dyn TargetIsa) -> Result<&'static Common, String> {
+    static COMMON: OnceLock<Result<Common, String>> = OnceLock::new();
+    let process = crate::target().map_err(|e| e.to_string())?;
+    if !std::ptr::addr_eq(isa, &**process) {
+        return Err(format!("unwind information for {}, which is not the process's ISA", isa.triple()));
+    }
+    let common = COMMON.get_or_init(|| {
+        let Some(made) = process.create_systemv_cie() else {
+            return Err(format!("{} has no DWARF call frame information", process.triple()));
+        };
+        let entry = Entry::of(made.clone(), FrameDescriptionEntry::new(ANYWHERE, 0))?;
+        Ok(Common { made, entry })
+    });
+    common.as_ref().map_err(Clone::clone)
 }
 
 /// The fields of one CIE and FDE pair, as `.eh_frame` encodes them.

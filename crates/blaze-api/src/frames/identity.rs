@@ -13,14 +13,14 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use super::{decode, encode, encode_into};
 use crate::{
-    ApiError, Artifact, Basis, BuildScriptRan, Cached, Cargo, Diagnostic, Envelope, FactRead,
-    FetchVerb, Level, LinkKind, Mismatch, Ranked, Reach, ReachedItem, Request, Response, Span,
-    Status, Table, Targets, TestOutcome, TestResult, Traced, Ub, UnitOf, UnitProfile,
-    UnitStarted, UnitTarget, Verb, ViewRef, Worked,
+    ApiError, Artifact, Basis, BuildScriptRan, Cached, Cargo, Diagnostic, Edit, Edited,
+    EditedItem, Envelope, FactRead, FetchVerb, How, Level, LinkKind, Mismatch, Ranked, Reach,
+    ReachedItem, Request, Response, Span, Status, Table, Target, Targets, TestOutcome,
+    TestResult, Traced, Ub, UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 19;
-const RESPONSES: usize = 24;
+const REQUESTS: usize = 22;
+const RESPONSES: usize = 26;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -270,7 +270,61 @@ impl Gen {
             15 => Request::CodegenInputs { view: self.view(0), targets: self.targets() },
             16 => Request::Trace { view: self.view(0), targets: self.targets() },
             17 => Request::Tables { view: self.view(0) },
+            18 => Request::Edit { base: self.id(), head: self.text(), edits: self.many(0, Gen::edit) },
+            19 => Request::WillTest {
+                view: self.view(0),
+                filter: self.texts(0),
+                targets: self.targets(),
+                wait_ms: self.wide(),
+            },
+            20 => Request::WillSave {
+                ops: self.ops(0),
+                head: self.text(),
+                test: self.yes(),
+                targets: self.targets(),
+                wait_ms: self.wide(),
+            },
             _ => Request::Stop,
+        }
+    }
+
+    fn target(&mut self) -> Target {
+        Target { file: self.text(), item: self.text() }
+    }
+
+    fn edit(&mut self) -> Edit {
+        match self.below(9) {
+            0 => Edit::ReplaceBody { body: self.text(), item: self.target() },
+            1 => Edit::ReplaceSignature { item: self.target(), signature: self.text() },
+            2 => Edit::ReplaceItem { item: self.target(), text: self.text() },
+            3 => Edit::AddField { field: self.text(), strukt: self.target() },
+            4 => Edit::RemoveField { field: self.text(), strukt: self.target() },
+            5 => Edit::AddItem { file: self.text(), into: self.maybe(Gen::text), text: self.text() },
+            6 => Edit::RemoveItem { item: self.target() },
+            7 => Edit::AddUse { file: self.text(), into: self.maybe(Gen::text), path: self.text() },
+            _ => Edit::Rename { to: self.text(), item: self.target() },
+        }
+    }
+
+    fn edited(&mut self, depth: u32) -> Edited {
+        const HOWS: [How; 8] = [
+            How::Body,
+            How::Signature,
+            How::Fields,
+            How::Whole,
+            How::Added,
+            How::Removed,
+            How::Renamed,
+            How::Scope,
+        ];
+        Edited {
+            ops: self.ops(depth),
+            items: self.many(depth, |g| EditedItem {
+                how: HOWS[g.below(HOWS.len() as u64) as usize],
+                key: g.maybe(Gen::id),
+                file: g.text(),
+                path: g.text(),
+            }),
         }
     }
 
@@ -479,6 +533,8 @@ impl Gen {
                 bytes: g.wide(),
                 elements: g.wide(),
             })),
+            23 => Response::Edited(self.edited(depth)),
+            24 => Response::Announced { root: self.id() },
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }
             }
@@ -533,7 +589,10 @@ fn request_index(request: &Request) -> usize {
         Request::CodegenInputs { .. } => 15,
         Request::Trace { .. } => 16,
         Request::Tables { .. } => 17,
-        Request::Stop => 18,
+        Request::Edit { .. } => 18,
+        Request::WillTest { .. } => 19,
+        Request::WillSave { .. } => 20,
+        Request::Stop => 21,
     }
 }
 
@@ -563,7 +622,9 @@ fn response_index(response: &Response) -> usize {
         Response::CodegenInputs(_) => 20,
         Response::Trace(_) => 21,
         Response::Tables(_) => 22,
-        Response::Of { .. } => 23,
+        Response::Edited(_) => 23,
+        Response::Announced { .. } => 24,
+        Response::Of { .. } => 25,
     }
 }
 

@@ -267,6 +267,7 @@ answer), so a remote can hand on the receive buffer without a copy (C5). Once
 answers are refused as malformed (an error, never a wrong value).
 
 > forwarded to fastcompile: `crates/blaze-global/` is fastcompile-global's.
+> applied (fastcompile-global): both answers in `client.rs` (`fetched`, the missing and the kept value) are `Answer::encode_framed()`. A refused value stays `Done::Failed`.
 
 ### R4. store (or the coordinator): `docs/v2-store.md`
 
@@ -359,3 +360,26 @@ be the frame's whole length.
 fetch through a real `Client` into a `Store` ends as its frame says, so its seeds fail until
 `concurrency-remote` makes the client hand on the frame. Nothing in `cas_remote` needs changing
 when it does.
+
+> applied by concurrency (2026-10-29), nothing built:
+> - F1 `cold.rs`: `zstd_length` refuses a frame whose declared content size is missing or is not
+>   `raw`, and a `raw` above what its bytes can decode to (3-byte block headers, 128 KiB per
+>   block), before allocating; `unlz4` refuses `raw > 255 * stored + 16`. Test
+>   `a_length_the_bytes_cannot_reach_is_refused_before_it_is_allocated`.
+> - F2 `read.rs`: a chunk length over `chunk::MAX` is `Corrupt`, lengths are `checked_add`ed,
+>   and the value grows as its pieces are read (at most 64 MiB reserved, once the first is).
+> - F3 `disk.rs`: head decode refuses an `indexed` or `dead` that is not a multiple of 16;
+>   `open_tier` refuses a pack mapped shorter than `committed` (a second panic in the same
+>   lines) and reads a record's first word with `get`. Head test extended.
+> - F4 `disk.rs`: `span_of(stored) -> Option<u64>`; `RecordHeader::decode` refuses a `stored`
+>   with no span, so `span()` holds for every header. lib.rs: `movable` refuses a record whose
+>   header is not the `stored`/`raw` its index slot names, so `replace`'s dead count uses a
+>   checked length; settle's budgets add `loc.raw` saturating; the sample read's offset is
+>   checked. read.rs 543's `seg.stored` comes from the writer's own put and is not untrusted.
+>   Test `a_record_header_of_a_length_no_record_has_is_refused`.
+> - F5 `remote.rs`: the client reserves at most `CLIENT_RECV_MOST` (one receive) on a prefix.
+>   Test in `a_long_answer_is_received_in_reads_of_what_it_still_needs`.
+> - The framing note is settled: the client hands on the whole frame (`concurrency-remote`).
+>   But C8 changed `Client::complete` to `(completion, effects, answers: &mut Vec<Completion>)`
+>   returning nothing (and `close(effects, answers)`): `fuzz/targets/cas_remote.rs:212` must
+>   adapt. Asked of safety-fuzz-cas.

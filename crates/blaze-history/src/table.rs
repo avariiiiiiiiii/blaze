@@ -33,6 +33,7 @@ use std::{
 };
 
 use blaze_graph::{Key, admission::TaskKind};
+use blaze_ids::radix;
 
 /// Records a bucket holds.
 pub const WAYS: usize = 4;
@@ -81,7 +82,7 @@ impl Record {
         let count = (self.seen as usize).min(RUNS);
         let mut runs = self.runs;
         let last = &mut runs[..count];
-        last.sort_unstable();
+        radix::sort(last);
         match count {
             0 => 0,
             _ if count % 2 == 1 => u64::from(last[count / 2]),

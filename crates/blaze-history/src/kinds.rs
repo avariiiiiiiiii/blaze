@@ -3,6 +3,7 @@
 //! [`blaze_graph::admission::Estimates`], learned beside these.
 
 use blaze_graph::admission::TaskKind;
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 
 /// A new run's weight against the mean, as a shift: an eighth.
@@ -56,7 +57,7 @@ impl Times {
     /// Each kind and its times, in order of the kinds' numbers.
     pub fn sorted(&self) -> Vec<(TaskKind, Time)> {
         let mut kinds: Vec<(TaskKind, Time)> = self.by_kind.iter().map(|(&k, &t)| (k, t)).collect();
-        kinds.sort_unstable_by_key(|it| it.0);
+        radix::sort_copy_by_key(&mut kinds, |it| it.0.0);
         kinds
     }
 

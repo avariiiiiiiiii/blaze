@@ -3,6 +3,7 @@
 
 use std::marker::PhantomData;
 
+use base_db::Crate;
 use blaze_codegen::{
     Arch, Backend, CodegenError, CompiledFunction, Compile, Static, Unit,
     backend::{Emitted, FrontRef, Import, Prepare, Shape},
@@ -13,7 +14,7 @@ use blaze_codegen::{
 };
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
-use blaze_items::ItemKey;
+use blaze_items::{CodeHash, ItemKey};
 use cranelift_codegen::{ir, isa::TargetIsa};
 use hir_def::{
     DefWithBodyId, HasModule,
@@ -34,7 +35,7 @@ use super::{
     Built, DataPlace, Function, Hashes, HirFrontend, HirInstance, Kind, Places, Prepared,
     build::{self, Build},
     failed,
-    places::{Placer, Ref, place_requests, resolve},
+    places::{Placer, Ref, evaluated, place_requests, resolve},
     refs, shape, side,
 };
 use crate::{
@@ -162,16 +163,17 @@ impl Backends<'_> {
         let mut code = build::with(Build::of(spec), || built(db, instance, spec.overflow_checks))
             .map_err(fail)?
             .map_err(fail)?;
+        let krate = compiled_in(db, instance);
         let (places, source, variables) = match &mut code {
             Built::Ir(pending) => {
                 let requests = &mut pending.wants.requests;
-                let places =
-                    place_requests(db, homes, hashes, &mut placer, requests).map_err(fail)?;
+                let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
+                    .map_err(fail)?;
                 (places, pending.source.take(), pending.variables.take())
             }
             Built::Assembled(_, requests) => {
-                let places =
-                    place_requests(db, homes, hashes, &mut placer, requests).map_err(fail)?;
+                let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
+                    .map_err(fail)?;
                 (places, None, None)
             }
         };
@@ -186,8 +188,9 @@ impl Backends<'_> {
         };
         let told = matches!(spec.debuginfo, DebugInfo::Limited | DebugInfo::Full);
         let (variables, scopes) = match (&source, variables) {
-            (Some((owner, spans)), Some((_, variables))) if told => {
-                named(db, hashes, *owner, &variables, spans).map_err(fail)?
+            (Some((owner, spans)), Some((env, variables))) if told => {
+                let krate = env.as_ref(db).krate;
+                named(db, hashes, krate, *owner, &variables, spans).map_err(fail)?
             }
             _ => Default::default(),
         };
@@ -217,6 +220,16 @@ impl Backends<'_> {
             Backend::Llvm { .. } => Prepared::Llvm(Box::new(function)),
         };
         Ok((shape, prepared))
+    }
+}
+
+/// The crate an instance's code is compiled in; `None` for assembly, which is no crate's.
+pub(super) fn compiled_in(db: &dyn HirDatabase, instance: &HirInstance) -> Option<Crate> {
+    match &instance.0 {
+        Kind::Code(_, env) => Some(env.as_ref(db).krate),
+        Kind::Start(main) => Some(main.krate(db)),
+        Kind::Allocator(forward) => Some(forward.krate),
+        Kind::Asm(_) => None,
     }
 }
 
@@ -294,10 +307,12 @@ fn assembled(text: &str) -> Result<Built, String> {
 
 /// The named locals a debugger is told of, and the scopes of the body they are bound in: a
 /// name a macro of the compiler's made up is no name of the source. `spans` are the
-/// statements the function's line rows are of.
+/// statements the function's line rows are of. Their types are of a body monomorphized in
+/// `krate`.
 fn named(
     db: &dyn HirDatabase,
     hashes: &dyn Hashes,
+    krate: Crate,
     owner: DefWithBodyId,
     variables: &[fragment::Variable],
     spans: &[MirSpan],
@@ -311,7 +326,7 @@ fn named(
         named.push(side::Variable {
             name: *body[variable.binding].name.symbol(),
             param: variable.param,
-            ty: hashes.ty(db, variable.ty.as_ref())?,
+            ty: hashes.ty(db, evaluated(db, Some(krate), variable.ty.as_ref())?)?,
             slot: variable.slot,
             pointer: variable.pointer,
             scope: of_binding.get(&variable.binding).copied(),
@@ -472,8 +487,8 @@ pub(crate) fn emit_cranelift(
             ),
         ));
     }
-    let Function { code, places, spans, variables, scopes, .. } = *function;
-    let named = Named { spans: &spans, variables: &variables, scopes: &scopes };
+    let Function { code, places, spans, variables, scopes, inlined, .. } = *function;
+    let named = Named { spans: &spans, variables: &variables, scopes: &scopes, inlined };
     match code {
         Built::Ir(pending) => {
             let code = compiled(unit, pending.func, &pending.named)?;
@@ -483,17 +498,23 @@ pub(crate) fn emit_cranelift(
     }
 }
 
-/// What a debugger is told of a function: [`Function::spans`], `variables` and `scopes`.
-#[derive(Clone, Copy)]
+/// What a debugger is told of a function: [`Function::spans`], `variables` and `scopes`; and
+/// what its code has built in, [`Function::inlined`].
 struct Named<'a> {
     spans: &'a [SpanRef],
     variables: &'a [side::Variable],
     scopes: &'a side::Scopes,
+    inlined: Vec<CodeHash>,
 }
 
 impl Function {
     fn named(&self) -> Named<'_> {
-        Named { spans: &self.spans, variables: &self.variables, scopes: &self.scopes }
+        Named {
+            spans: &self.spans,
+            variables: &self.variables,
+            scopes: &self.scopes,
+            inlined: self.inlined.clone(),
+        }
     }
 }
 
@@ -514,7 +535,7 @@ fn told(
     requests: &Requests,
     code: fragment::Code,
     refs: &Refs,
-    Named { spans, variables, scopes }: Named<'_>,
+    Named { spans, variables, scopes, inlined }: Named<'_>,
 ) -> Result<Emitted, CodegenError> {
     let fail = |what: String| failed(unit, what);
     if refs.len() < places.refs as usize {
@@ -539,7 +560,8 @@ fn told(
         )
     })
     .map_err(fail)?;
-    Ok(Emitted { function: compiled, side: side.map(|it| it.0), extra: Vec::new() })
+    let function = CompiledFunction { inlined, ..compiled };
+    Ok(Emitted { function, side: side.map(|it| it.0), extra: Vec::new() })
 }
 
 /// Compiles `ir` in place of a prepared function's IR, its names being the function's: a
@@ -565,7 +587,7 @@ fn emit_ir(
     if thunk {
         let code = compiled(unit, ir, &[])?;
         let none = side::Scopes::default();
-        let named = Named { spans: &[], variables: &[], scopes: &none };
+        let named = Named { spans: &[], variables: &[], scopes: &none, inlined: Vec::new() };
         told(unit, &function.places, function.requests(), code, refs, named)
     } else {
         let code = compiled(unit, ir, &pending.named)?;

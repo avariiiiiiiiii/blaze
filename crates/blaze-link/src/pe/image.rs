@@ -21,6 +21,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
+use blaze_ids::radix;
 use object::pe;
 use rayon::prelude::*;
 
@@ -403,6 +404,11 @@ const _: () = assert!(size_of::<Cell>() == 16);
 type Entry = (u32, u32, u32);
 const _: () = assert!(size_of::<Entry>() == RUNTIME_FUNCTION);
 
+/// An entry's place in the order of the tuple.
+fn entry_key(&(begin, end, info): &Entry) -> u128 {
+    (u128::from(begin) << 64) | (u128::from(end) << 32) | u128::from(info)
+}
+
 /// The GOT's import cells sorted by library then cell: each DLL's IAT.
 fn iat(placed: &Placed<'_>) -> Result<Vec<Cell>, LinkError> {
     let mut cells = Vec::with_capacity(placed.imports.len());
@@ -417,7 +423,9 @@ fn iat(placed: &Placed<'_>) -> Result<Vec<Cell>, LinkError> {
         }
         cells.push((library, cell.addr, import));
     }
-    cells.sort_unstable();
+    radix::sort_copy_by_key(&mut cells, |&(library, addr, import): &Cell| {
+        (u128::from(library) << 96) | (u128::from(addr) << 32) | u128::from(import)
+    });
     Ok(cells)
 }
 
@@ -429,7 +437,7 @@ fn imports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
         return Ok(Vec::new());
     }
     let mut taken: Vec<u64> = placed.got.iter().map(|it| it.addr).collect();
-    taken.sort_unstable();
+    radix::sort(&mut taken);
     // Each DLL's run of `cells` (and of `names`, which is parallel to it).
     let mut groups: Vec<Range<usize>> = Vec::with_capacity(placed.libraries.len());
     for group in cells.chunk_by(|a, b| a.0 == b.0) {
@@ -625,7 +633,7 @@ fn pdata(image: Image<'_>) -> Result<Vec<u8>, LinkError> {
         })?);
     }
     if !ours.is_sorted() {
-        ours.sort_unstable();
+        radix::sort_copy_by_key(&mut ours, entry_key);
     }
     let mut native: Vec<Entry> = Vec::new();
     for (index, region) in image.regions.iter().enumerate() {
@@ -649,7 +657,7 @@ fn pdata(image: Image<'_>) -> Result<Vec<u8>, LinkError> {
         }
     }
     if !native.is_sorted() {
-        native.sort_unstable();
+        radix::sort_copy_by_key(&mut native, entry_key);
     }
     let mut out = Vec::with_capacity((ours.len() + native.len()) * RUNTIME_FUNCTION);
     let (mut a, mut b) = (ours.iter().peekable(), native.iter().peekable());
@@ -693,11 +701,11 @@ pub(super) fn relocations(image: Image<'_>, extra: &[u64], piece: usize) -> Resu
         Cow::Borrowed(image.rebase)
     } else {
         let mut sorted = image.rebase.to_vec();
-        sorted.sort_unstable();
+        radix::sort(&mut sorted);
         Cow::Owned(sorted)
     };
     let mut extra = extra.to_vec();
-    extra.sort_unstable();
+    radix::sort(&mut extra);
     let piece = piece.max(1);
     // The first address of each piece but the first: the first of a page.
     let mut cuts = Vec::with_capacity(rebase.len() / piece + 1);

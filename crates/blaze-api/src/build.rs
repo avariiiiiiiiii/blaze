@@ -4,7 +4,7 @@
 
 use blaze_vfs::{Change, View, ViewId};
 
-use crate::{Targets, Ub};
+use crate::{Edit, Targets, Ub};
 
 /// A job of the build, one per request (one per candidate of a best-of-N).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -53,6 +53,15 @@ pub enum Work {
     Trace(Targets),
     /// [`crate::Response::Tables`]: each table's owner reports its own.
     Tables,
+    /// The edits applied to the view in the front end (`blaze_intent::apply`), reported as
+    /// [`crate::Response::Edited`] before an `ok` finish; the session commits its ops. The
+    /// trees the edits left are the front end's parses of the files they wrote.
+    Edit(Vec<Edit>),
+    /// Built ahead for [`crate::Request::WillTest`]: the test units holding a test `filter`
+    /// selects, and the functions those tests reached when they last ran first
+    /// (`blaze_intent::ahead::plan`). Runs no test. Started only through
+    /// [`Builder::speculate`].
+    Ahead { targets: Targets, filter: Vec<String> },
 }
 
 /// The daemon's build, as the session drives it.
@@ -69,4 +78,12 @@ pub trait Builder {
     fn start(&mut self, job: JobId, view: Option<Opened>, work: Work);
     /// Ends `job` early. It still finishes, with `ok` false.
     fn cancel(&mut self, job: JobId);
+    /// [`Builder::start`] of declared intent: the job's tasks start only when no task of a
+    /// job started otherwise is ready and fits (the plane's idle class), so it never delays
+    /// one. Its reports are dropped; it finishes as any job does, and its memory is the
+    /// plane's to give back when it is cancelled.
+    fn speculate(&mut self, job: JobId, view: Opened, work: Work);
+    /// A job started by [`Builder::speculate`] runs from now on as one started by
+    /// [`Builder::start`]: a request takes its work over. Once per job.
+    fn promote(&mut self, job: JobId);
 }

@@ -4,7 +4,7 @@
 use blaze_codegen::{Arch, Init, Reloc, RelocKind, Static, backend::FrontRef, template::Refs};
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey};
-use hir_def::{StaticId, attrs::AttrFlags};
+use hir_def::{HasModule, StaticId, attrs::AttrFlags};
 use hir_ty::db::HirDatabase;
 
 use super::{
@@ -61,11 +61,11 @@ pub(crate) fn value(
                 compiled_static(db, id).as_ref().map_err(|e| e.to_string())?;
             let requests = Requests { funcs: requests.funcs.clone(), datas: requests.datas.clone() };
             let mut blob = blob.clone();
-            fill_type_ids(db, hashes, &mut blob)?;
+            fill_type_ids(db, hashes, Some(id.krate(db)), &mut blob)?;
             (blob, requests, *writable)
         }
     };
-    let places = place_requests(db, homes, hashes, &mut placer, &mut requests)?;
+    let places = place_requests(db, homes, hashes, Some(id.krate(db)), &mut placer, &mut requests)?;
     let mut bytes = super::shape::value(&blob, &requests, &places)?;
     bytes.push(u8::from(mutable));
     bytes.push(u8::from(thread_local));

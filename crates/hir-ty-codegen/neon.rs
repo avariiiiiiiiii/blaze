@@ -15,7 +15,7 @@ use std::ops::RangeInclusive;
 use cranelift_codegen::ir::{
     Endianness, InstBuilder, MemFlagsData, Type, Value, condcodes::IntCC, types,
 };
-use hir_ty::mir::Operand;
+use hir_ty::{intrinsic::SimdOp, mir::Operand};
 
 use super::{Arch, FunctionCx, MEM, Result};
 
@@ -190,49 +190,55 @@ pub(super) fn rounding(mnemonic: &str, lanes: Lanes) -> Option<Lowered> {
 /// the half-precision instructions: one instruction on the lanes, which rounds once and
 /// propagates a NaN as the instruction does. `signed` is whether the integers of a
 /// `simd_cast` are.
-pub(super) fn half_vector(op: &str, r: Lanes, a: Lanes, signed: bool) -> Option<Lowered> {
+pub(super) fn half_vector(op: SimdOp, r: Lanes, a: Lanes, signed: bool) -> Option<Lowered> {
     let half = |it: Lanes| it.float && it.bits == 16;
     if r.count != a.count || !r.is_register() || !a.is_register() || !(half(r) || half(a)) {
         return None;
     }
     let lowered = match op {
-        "simd_add" | "simd_sub" | "simd_mul" | "simd_div" if r == a => {
-            let text = format!("f{} {}, {}, {}", &op[5..], r.reg(0), a.reg(1), a.reg(2));
+        SimdOp::Add | SimdOp::Sub | SimdOp::Mul | SimdOp::Div if r == a => {
+            let mnemonic = match op {
+                SimdOp::Add => "fadd",
+                SimdOp::Sub => "fsub",
+                SimdOp::Mul => "fmul",
+                _ => "fdiv",
+            };
+            let text = format!("{mnemonic} {}, {}, {}", r.reg(0), a.reg(1), a.reg(2));
             instruction(&[], text, [a, a], [r])
         }
         // A true lane is all ones. `le` and `lt` are `ge` and `gt` of the operands swapped.
-        "simd_eq" | "simd_ge" | "simd_gt" | "simd_le" | "simd_lt"
+        SimdOp::Eq | SimdOp::Ge | SimdOp::Gt | SimdOp::Le | SimdOp::Lt
             if r.is_int() && r.bits == 16 && half(a) =>
         {
             let (mnemonic, first, second) = match op {
-                "simd_eq" => ("fcmeq", 1, 2),
-                "simd_ge" => ("fcmge", 1, 2),
-                "simd_gt" => ("fcmgt", 1, 2),
-                "simd_le" => ("fcmge", 2, 1),
+                SimdOp::Eq => ("fcmeq", 1, 2),
+                SimdOp::Ge => ("fcmge", 1, 2),
+                SimdOp::Gt => ("fcmgt", 1, 2),
+                SimdOp::Le => ("fcmge", 2, 1),
                 _ => ("fcmgt", 2, 1),
             };
             let text = format!("{mnemonic} {}, {}, {}", r.reg(0), a.reg(first), a.reg(second));
             instruction(&[], text, [a, a], [r])
         }
-        "simd_neg" | "simd_fabs" | "simd_fsqrt" | "simd_floor" | "simd_ceil" if r == a => {
+        SimdOp::Neg | SimdOp::Fabs | SimdOp::Fsqrt | SimdOp::Floor | SimdOp::Ceil if r == a => {
             let mnemonic = match op {
-                "simd_neg" => "fneg",
-                "simd_fabs" => "fabs",
-                "simd_fsqrt" => "fsqrt",
-                "simd_floor" => "frintm",
+                SimdOp::Neg => "fneg",
+                SimdOp::Fabs => "fabs",
+                SimdOp::Fsqrt => "fsqrt",
+                SimdOp::Floor => "frintm",
                 _ => "frintp",
             };
             instruction_of(mnemonic, r, a)
         }
         // `a * b + c`, rounded once, into the register of `c`. LLVM's pattern names the
         // factors the other way round, which decides which NaN the instruction keeps.
-        "simd_fma" if r == a => {
+        SimdOp::Fma if r == a => {
             let text = format!("mov v0.16b, v3.16b\nfmla {}, {}, {}", r.reg(0), a.reg(2), a.reg(1));
             instruction(&[], text, [a, a, a], [r])
         }
         // A float out of the integer's range is undefined for `simd_cast`; the instruction
         // saturates it and makes a NaN 0.
-        "simd_cast" => {
+        SimdOp::Cast => {
             let mnemonic = match (r.float, a.float, r.bits, a.bits) {
                 (true, true, 16, 32) => "fcvtn",
                 (true, true, 32, 16) => "fcvtl",

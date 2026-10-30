@@ -309,7 +309,7 @@ impl<T: 'static> LocalKey<T> {
     {
         match self.local() {
             Local::Outside => self.std.try_with(f).map_err(|_| AccessError),
-            Local::Value(value) => Ok(f(&value)),
+            Local::Value(value) => Ok(f(&*value)),
             Local::Gone => Err(AccessError),
         }
     }
@@ -344,14 +344,14 @@ impl<T: 'static> LocalKey<RefCell<T>> {
     where
         F: FnOnce(&T) -> R,
     {
-        self.with(|cell| f(&cell.borrow()))
+        self.with(|cell| f(&*cell.borrow()))
     }
 
     pub fn with_borrow_mut<F, R>(&'static self, f: F) -> R
     where
         F: FnOnce(&mut T) -> R,
     {
-        self.with(|cell| f(&mut cell.borrow_mut()))
+        self.with(|cell| f(&mut *cell.borrow_mut()))
     }
 
     pub fn set(&'static self, value: T) {

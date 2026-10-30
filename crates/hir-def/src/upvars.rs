@@ -1,6 +1,7 @@
 //! A simple query to collect tall locals (upvars) a closure use.
 
 use base_db::SourceDatabase;
+use blaze_ids::radix;
 use hir_expand::mod_path::{ModPath, PathKind};
 use intern::{Symbol, sym};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -186,7 +187,7 @@ impl UpvarsMentionedVisitor<'_> {
     /// Sorts and dedups the upvars `mentioned` has from `start` on.
     fn sort_dedup_from(&mut self, start: usize) {
         let upvars = &mut self.mentioned[start..];
-        upvars.sort_unstable();
+        radix::sort_copy_by_key(upvars, |it| it.into_raw().into_u32());
         let mut kept = 0;
         for i in 0..upvars.len() {
             if kept == 0 || upvars[kept - 1] != upvars[i] {

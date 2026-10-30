@@ -17,11 +17,17 @@ use hir_def::{
     attrs::AttrFlags,
     signatures::{FunctionSignature, StaticSignature},
 };
+use base_db::Crate;
 use hir_ty::{
     db::HirDatabase,
-    next_solver::{DbInterner, GenericArgs},
+    next_solver::{
+        DbInterner, GenericArgs, ParamEnv, TypingMode,
+        infer::{DbInternerInferExt, traits::ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    },
     traits::StoredParamEnvAndCrate,
 };
+use rustc_type_ir::{TypeFoldable, TypeVisitableExt};
 
 use super::{
     DataPlace, Hashes, HirInstance, HirStatic, Kind, Places,
@@ -76,7 +82,11 @@ pub(crate) fn instance_ref(
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> Result<Ref, String> {
-    let instance = Instance { checked: false, ..instance.clone() };
+    let mut instance = Instance { checked: false, ..instance.clone() };
+    let args = instance.args.as_ref();
+    if args.has_aliases() {
+        instance.args = evaluated(db, Some(env.as_ref(db).krate), args)?.store();
+    }
     if let InstanceDef::Fn(func) = instance.def
         && !FunctionSignature::of(db, func).has_body()
     {
@@ -230,11 +240,13 @@ impl<'a> Placer<'a> {
     }
 }
 
-/// The place of each of `requests`, whose `TypeId`s it fills in.
+/// The place of each of `requests`, whose `TypeId`s it fills in. `krate` is the crate whose
+/// code makes them, `None` for assembly.
 pub(crate) fn place_requests(
     db: &dyn HirDatabase,
     homes: &mut Homes,
     hashes: &dyn Hashes,
+    krate: Option<Crate>,
     placer: &mut Placer<'_>,
     requests: &mut Requests,
 ) -> Result<Places, String> {
@@ -254,7 +266,7 @@ pub(crate) fn place_requests(
                     .to_owned());
             }
             DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => {
-                fill_type_ids(db, hashes, blob)?;
+                fill_type_ids(db, hashes, krate, blob)?;
                 DataPlace::Own
             }
             DataRequest::Static(id) => DataPlace::Place(placer.place(static_ref(db, *id)?)?),
@@ -280,15 +292,46 @@ pub(crate) fn place_requests(
     Ok(Places { funcs, datas, refs: placer.refs().len() as u32 })
 }
 
+/// `value` as codegen sees a monomorphized type or constant, which is all [`Hashes`] gives an
+/// ID of: every alias normalized and every constant evaluated, in `krate` with no parameters
+/// (rustc's `TypingEnv::fully_monomorphized`). Monomorphization normalizes the aliases of a
+/// body's types but leaves their constants unevaluated: `[u8; N]` of a `const N`. One with
+/// neither, as nearly every one, is given back with nothing made.
+pub(crate) fn evaluated<'db, T>(
+    db: &'db dyn HirDatabase,
+    krate: Option<Crate>,
+    value: T,
+) -> Result<T, String>
+where
+    T: TypeFoldable<DbInterner<'db>> + std::fmt::Debug + Copy,
+{
+    if !value.has_aliases() {
+        return Ok(value);
+    }
+    let Some(krate) = krate else {
+        return Err(format!("`{value:?}` has aliases left, and no crate to normalize them in"));
+    };
+    let infcx = DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::PostAnalysis);
+    let normalized = ObligationCtxt::new(&infcx)
+        .deeply_normalize(&ObligationCause::dummy(), ParamEnv::empty(), value)
+        .map_err(|errors| format!("`{value:?}` does not normalize: {errors:?}"))?;
+    if normalized.has_aliases() || normalized.has_infer() {
+        return Err(format!("`{value:?}` normalizes to `{normalized:?}`, which has no content"));
+    }
+    Ok(normalized)
+}
+
 /// Writes each `TypeId` of a constant where const eval left the place of it: the first 16
-/// bytes of its type's content ID, one value for a type in every crate of the build.
+/// bytes of its type's content ID, one value for a type in every crate of the build. `krate`
+/// is the crate whose code holds the constant.
 pub(crate) fn fill_type_ids(
     db: &dyn HirDatabase,
     hashes: &dyn Hashes,
+    krate: Option<Crate>,
     blob: &mut ConstBlob,
 ) -> Result<(), String> {
     for (offset, ty) in std::mem::take(&mut blob.type_ids) {
-        let id = hashes.ty(db, ty.as_ref())?;
+        let id = hashes.ty(db, evaluated(db, krate, ty.as_ref())?)?;
         let at = offset as usize;
         let Some(bytes) = blob.bytes.get_mut(at..at + 16) else {
             return Err(format!("a `TypeId` at {at}, past the end of its constant"));

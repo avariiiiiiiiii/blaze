@@ -6,7 +6,7 @@
 //! - after it, `rustc_privacy`'s `check_private_in_public` (`private_interfaces`,
 //!   `private_bounds`, E0446: `privacy`), `rustc_lint`'s late module pass over each item
 //!   (`externs`' `improper_ctypes`, `naming`, `derives`, `bounds`, `mangle`, `publicity`,
-//!   `docs`, `traits`), and `clashing_extern_declarations` (`externs`).
+//!   `docs`, `traits`, `runtime_symbols`), and `clashing_extern_declarations` (`externs`).
 //!
 //! `walk` gives the items in the order rustc's passes visit them; `visibility` their effective
 //! visibilities, as `rustc_privacy` computes them.
@@ -18,6 +18,7 @@
 //! Apache-2.0).
 
 mod bounds;
+mod c_void;
 mod derives;
 mod docs;
 mod externs;
@@ -26,6 +27,7 @@ mod mangle;
 mod naming;
 mod privacy;
 mod publicity;
+mod runtime_symbols;
 mod statics;
 mod traits;
 mod visibility;
@@ -63,9 +65,10 @@ pub(super) fn private_in_public(cx: &Cx<'_, '_>) -> Vec<Found> {
 pub(super) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
     let items = walk::items(cx);
     let effective = visibility::Effective::of(cx, &items);
+    let canonical = runtime_symbols::Canonical::of(cx, &items);
     let mut found = docs::krate(cx);
     found.extend(naming::krate(cx));
-    for item in &items {
+    for (index, item) in items.iter().enumerate() {
         found.extend(externs::ctypes_item(cx, item));
         found.extend(naming::item(cx, item));
         found.extend(derives::copy(cx, item, &effective));
@@ -76,7 +79,9 @@ pub(super) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
         found.extend(derives::debug(cx, item, &effective));
         found.extend(docs::item(cx, item, &effective));
         found.extend(traits::async_fn(cx, item, &effective));
+        found.extend(runtime_symbols::item(cx, item, &items[index + 1..], &canonical));
         found.extend(externs::ctypes_nested(cx, item));
+        found.extend(c_void::item(cx, item));
     }
     found
 }

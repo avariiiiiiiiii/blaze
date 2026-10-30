@@ -15,6 +15,7 @@ use std::{
 };
 
 use base_db::{Crate, SourceDatabase};
+use blaze_ids::radix;
 use either::Either;
 use hir_expand::{AstId, MacroCallId, attrs::AttrId, name::Name};
 use itertools::Itertools;
@@ -1265,9 +1266,17 @@ impl ItemScope {
                 .collect();
             // The position last keeps a def's names in column order, which is the order
             // `name_of` (the first) and `names_of` (the first `Some`) answer in.
-            all.sort_unstable_by_key(|&at| {
+            // `(at >> 30, it.def_tag, it.def, at & POS_MASK)` packed in order: an `Option<Id>`
+            // orders `None` first, then by index and generation.
+            radix::sort_by_key(&mut all, |&at| {
                 let it = self.entry_at(at);
-                (at >> 30, it.def_tag, it.def, at & POS_MASK)
+                let def = it.def.map_or(0, |id| {
+                    1u128 << 64 | u128::from(radix::pack_32(id.index(), id.generation()))
+                });
+                u128::from(at >> 30) << 97
+                    | u128::from(it.def_tag) << 89
+                    | def << 24
+                    | u128::from(at & POS_MASK)
             });
             all.into_boxed_slice()
         })

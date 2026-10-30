@@ -20,7 +20,7 @@
 
 use std::{borrow::Cow, fmt};
 
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, radix};
 use rustc_hash::{FxHashMap, FxHashSet};
 use salsa::{Durability, Setter};
 use triomphe::Arc;
@@ -390,7 +390,7 @@ impl Files {
             .map(|it| it.1)
             .chain(plan.removed.iter().map(|it| it.0))
             .collect();
-        roots.sort_unstable();
+        radix::sort_copy_by_key(&mut roots, |it| it.0);
         roots.dedup();
         self.write_root_files(writer, db, &plan, &roots, &mut changed_roots);
         self.write_root_contents(writer, db, &changed_roots);
@@ -405,7 +405,7 @@ impl Files {
         writer.next_file = plan.next_file;
         change.roots = roots;
         for list in [&mut change.set, &mut change.added, &mut change.removed, &mut change.no_text] {
-            list.sort_unstable();
+            radix::sort_copy_by_key(list, |it| it.index());
             list.dedup();
         }
         change

@@ -11,7 +11,8 @@
 //! - [`Borrows::access`]: a read or write through a pointer, on every tag of the allocation;
 //! - [`Borrows::retag`]: a reference or `Box` made from a pointer gets a new child tag, with
 //!   the implicit read (or write) a reborrow does, and on function entry a protector;
-//! - [`Borrows::pop_frame`]: the frame's protectors end, with the access each does;
+//! - [`Borrows::pop_frame`]: the frame's protectors end, with the access each does; each
+//!   thread has its own stack of frames ([`Borrows::set_thread`]);
 //! - [`Borrows::expose`] and [`Prov::Wildcard`]: permissive provenance;
 //! - [`Borrows::gc`]: tags nothing holds any more are dropped and the trees compacted.
 
@@ -39,7 +40,7 @@ use self::{
     range_map::RangeMap,
     tree::{LocationState, Tree},
 };
-use crate::ids::{AccessKind, AllocId, BorTag, Prov, SiteId, Span};
+use crate::ids::{AccessKind, AllocId, BorTag, Prov, SiteId, Span, ThreadId};
 
 /// How strongly a function-entry retag protects. Miri: `borrow_tracker/mod.rs`,
 /// `ProtectorKind`.
@@ -116,6 +117,13 @@ impl NewPermission {
         self
     }
 
+    /// Whether this retag of a non-empty range writes through the parent (an implicitly
+    /// written `Unique`). Miri refuses such a retag into read-only memory as `WriteToReadOnly`
+    /// before the tree sees it (`tb_reborrow`), so the caller checks mutability first.
+    pub fn writes(&self) -> bool {
+        self.perms().is_some_and(|p| p.freeze_perm.associated_access() == Some(AccessKind::Write))
+    }
+
     /// `None`: the retag is a no-op.
     fn perms(&self) -> Option<Perms> {
         if matches!(self.mode, RetagMode::None | RetagMode::Raw) {
@@ -179,10 +187,11 @@ pub struct Borrows {
     next_tag: BorTag,
     /// By `AllocId::index`; `None` before the allocation and after its free.
     trees: Vec<Option<Tree>>,
-    /// Each frame's start in `protected` (Miri: `FrameState::protected_tags`, one list for
-    /// all frames).
-    frames: Vec<u32>,
-    protected: Vec<(AllocId, BorTag)>,
+    /// Each thread's frames, by `ThreadId::index`: frames of different threads return in any
+    /// order.
+    threads: Vec<ThreadFrames>,
+    /// The thread `push_frame`, `pop_frame` and function-entry retags act on.
+    thread: usize,
     retags_since_gc: u32,
     /// The GC's live set, a bit per tag; kept between runs.
     live: Vec<u64>,
@@ -190,6 +199,14 @@ pub struct Borrows {
     inside: RangeMap<LocationState>,
     /// The accesses the last retag did.
     retag_accesses: Vec<(Span, AccessKind)>,
+}
+
+/// One thread's stack of frames and their protected tags. Miri: each frame's
+/// `FrameState::protected_tags`, here one list per thread with each frame's start in it.
+#[derive(Debug, Default)]
+struct ThreadFrames {
+    frames: Vec<u32>,
+    protected: Vec<(AllocId, BorTag)>,
 }
 
 impl Default for Borrows {
@@ -206,8 +223,8 @@ impl Borrows {
         Borrows {
             next_tag: BorTag::new(1),
             trees: Vec::new(),
-            frames: Vec::new(),
-            protected: Vec::new(),
+            threads: vec![ThreadFrames::default()],
+            thread: ThreadId::MAIN.index(),
             retags_since_gc: 0,
             live: Vec::new(),
             inside: RangeMap::new(0, LocationState::new_accessed(Permission::new_disabled(), IdempotentForeignAccess::None)),
@@ -295,13 +312,24 @@ impl Borrows {
         let new_tag = self.new_ptr();
         self.retags_since_gc = self.retags_since_gc.saturating_add(1);
         if perms.protector.is_some() {
-            assert!(!self.frames.is_empty(), "Tree Borrows: a function-entry retag outside any frame");
-            self.protected.push((alloc, new_tag));
+            assert!(
+                !self.threads[self.thread].frames.is_empty(),
+                "Tree Borrows: a function-entry retag outside any frame"
+            );
         }
         let parent_tag = Borrows::source(alloc, parent);
-        let Borrows { trees, inside, retag_accesses, .. } = self;
+        let Borrows { trees, inside, retag_accesses, threads, thread, .. } = self;
+        // Miri registers the protector before the parent's access; here it is registered once
+        // the tag is in the tree, so a refused retag leaves no protected tag that isn't (the
+        // run stops at the error either way).
+        let protect = |threads: &mut Vec<ThreadFrames>| {
+            if perms.protector.is_some() {
+                threads[*thread].protected.push((alloc, new_tag));
+            }
+        };
         let Some(tree) = trees.get_mut(alloc.index()).and_then(Option::as_mut) else {
             assert!(range.is_empty(), "Tree Borrows: a retag of {} bytes of dead {alloc:?}", range.len);
+            protect(threads);
             return Ok(Some(new_tag));
         };
         let protected = perms.protector.is_some();
@@ -349,6 +377,7 @@ impl Borrows {
             }
         }
         tree.new_child(range.start, parent_tag, new_tag, inside, perms.outside_perm, perms.protector, site);
+        protect(threads);
         Ok(Some(new_tag))
     }
 
@@ -376,18 +405,33 @@ impl Borrows {
         }
     }
 
-    /// A call: its function-entry retags are protected until the matching `pop_frame`.
-    pub fn push_frame(&mut self) {
-        self.frames.push(self.protected.len() as u32);
+    /// The thread whose stack the next `push_frame`, `pop_frame` and function-entry retags
+    /// act on; the main thread's until set. Miri keeps each frame's protected tags in the
+    /// frame, so each thread's in its own stack.
+    pub fn set_thread(&mut self, thread: ThreadId) {
+        let i = thread.index();
+        if i >= self.threads.len() {
+            self.threads.resize_with(i + 1, ThreadFrames::default);
+        }
+        self.thread = i;
     }
 
-    /// The frame returns: each of its protected tags, in the order they were made, does its
-    /// protector's end access (only on locations it accessed, a write where it is `Unique`),
-    /// and then they are unprotected. Every tag of the frame stays protected until all have
-    /// done theirs. Miri: `on_stack_pop`, `release_protector`, `end_call`.
+    /// A call on the current thread: its function-entry retags are protected until the
+    /// matching `pop_frame`.
+    pub fn push_frame(&mut self) {
+        let t = &mut self.threads[self.thread];
+        t.frames.push(t.protected.len() as u32);
+    }
+
+    /// The current thread's innermost frame returns: each of its protected tags, in the order
+    /// they were made, does its protector's end access (only on locations it accessed, a write
+    /// where it is `Unique`), and then they are unprotected. Every tag of the frame stays
+    /// protected until all have done theirs. Miri: `on_stack_pop`, `release_protector`,
+    /// `end_call`.
     pub fn pop_frame(&mut self, site: SiteId) -> Result<(), AliasError> {
-        let start = self.frames.pop().expect("Tree Borrows: pop_frame without a frame") as usize;
-        let Borrows { trees, protected, .. } = self;
+        let Borrows { trees, threads, thread, .. } = self;
+        let ThreadFrames { frames, protected } = &mut threads[*thread];
+        let start = frames.pop().expect("Tree Borrows: pop_frame without a frame") as usize;
         for &(alloc, tag) in &protected[start..] {
             // A weak protector allows the free, so the allocation may be gone.
             if let Some(tree) = trees.get_mut(alloc.index()).and_then(Option::as_mut) {
@@ -415,7 +459,7 @@ impl Borrows {
     /// and exposed tags are kept anyway. Miri: `run_provenance_gc`, `remove_unreachable_tags`.
     pub fn gc(&mut self, mut live: impl FnMut(&mut dyn FnMut(AllocId, BorTag))) {
         self.retags_since_gc = 0;
-        let Borrows { trees, protected, live: set, next_tag, .. } = self;
+        let Borrows { trees, threads, live: set, next_tag, .. } = self;
         set.clear();
         set.resize((next_tag.get() as usize).div_ceil(64), 0);
         let mut mark = |tag: BorTag| {
@@ -427,7 +471,7 @@ impl Borrows {
         live(&mut |_, tag| mark(tag));
         // Protected tags still have an access coming, and the tree compaction relies on them
         // being live (Miri: `FrameState::visit_provenance`).
-        for &(_, tag) in protected.iter() {
+        for &(_, tag) in threads.iter().flat_map(|t| &t.protected) {
             mark(tag);
         }
         for tree in trees.iter().flatten() {

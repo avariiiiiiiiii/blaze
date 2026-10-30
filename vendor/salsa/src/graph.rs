@@ -14,7 +14,7 @@ pub(crate) use edges::{EdgeSpan, Edges};
 pub(crate) use nodes::NODE_LIMIT;
 use nodes::{NodeCache, Nodes};
 
-use crate::sync::atomic::{AtomicU32, Ordering};
+use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::zalsa_local::{QueryEdge, QueryEdgeKind};
 
 /// The top bit of an edge word: set for an output.
@@ -106,6 +106,11 @@ impl Graph {
         self.edges.len() > self.live.saturating_mul(2).max(COMPACT_AT_LEAST)
     }
 
+    /// Frees the node tables that shards outgrew, which no reader probes once we have `&mut`.
+    pub(crate) fn release_outgrown_nodes(&mut self) {
+        self.nodes.release_outgrown();
+    }
+
     /// Copies the live ranges into a new array: `relocate_all` hands every live range to the
     /// [`Relocation`] and stores the range it returns in place of the old.
     pub(crate) fn compact(&mut self, relocate_all: impl FnOnce(&mut Relocation<'_>)) {
@@ -150,6 +155,55 @@ impl Relocation<'_> {
         self.live += span.len;
         moved
     }
+}
+
+/// `len` zeroed words for a page of the node or edge columns, from a zeroed allocation: the part
+/// of a page that is never written is never touched, so it stays out of the resident set.
+#[cfg(not(feature = "shuttle"))]
+fn zeroed_u32s(len: usize) -> Box<[AtomicU32]> {
+    // SAFETY: all-zero bits are an `AtomicU32` of 0.
+    unsafe { zeroed(len) }
+}
+
+/// `len` zeroed words, as [`zeroed_u32s`].
+#[cfg(not(feature = "shuttle"))]
+fn zeroed_u64s(len: usize) -> Box<[AtomicU64]> {
+    // SAFETY: all-zero bits are an `AtomicU64` of 0.
+    unsafe { zeroed(len) }
+}
+
+/// A boxed slice of `len` `T`s from `alloc_zeroed`.
+///
+/// # Safety
+///
+/// All-zero bits must be a valid `T`.
+#[cfg(not(feature = "shuttle"))]
+unsafe fn zeroed<T>(len: usize) -> Box<[T]> {
+    let layout = std::alloc::Layout::array::<T>(len).expect("salsa: a graph page fits in memory");
+    if layout.size() == 0 {
+        return Vec::new().into_boxed_slice();
+    }
+    // SAFETY: `layout` has a nonzero size.
+    let words = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<T>();
+    if words.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    // SAFETY: `words` is a live allocation of `layout`, `len` `T`s with `T`'s alignment, made by
+    // the global allocator the box frees it with; its zeroed bytes are valid `T`s (the caller's
+    // contract), and nothing else owns it.
+    unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(words, len)) }
+}
+
+/// `len` zeroed words; shuttle's atomics are not plain words, so they are made one by one.
+#[cfg(feature = "shuttle")]
+fn zeroed_u32s(len: usize) -> Box<[AtomicU32]> {
+    (0..len).map(|_| AtomicU32::new(0)).collect()
+}
+
+/// `len` zeroed words, as [`zeroed_u32s`].
+#[cfg(feature = "shuttle")]
+fn zeroed_u64s(len: usize) -> Box<[AtomicU64]> {
+    (0..len).map(|_| AtomicU64::new(0)).collect()
 }
 
 #[cfg(all(test, not(feature = "shuttle")))]

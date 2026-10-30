@@ -34,6 +34,8 @@ mbe.workspace = true
 span.workspace = true
 parser.workspace = true
 syntax-bridge.workspace = true
+blaze-ids.workspace = true
+blaze-phf.workspace = true
 
 [dev-dependencies]
 expect-test = "1.5.1"

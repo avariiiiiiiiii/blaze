@@ -24,6 +24,7 @@ use std::{
 };
 
 use anyhow::{Context, bail, ensure};
+use blaze_ids::radix;
 use object::{
     LittleEndian as LE, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget,
     SectionIndex, SymbolIndex, SymbolKind, pe,
@@ -650,7 +651,7 @@ impl<'a> Patch<'a> {
             let over =
                 |at: &u64| self.in_place.iter().any(|it| (it.old..it.old + it.room).contains(at));
             fixed.extend(old.iter().copied().filter(|at| !over(at)));
-            fixed.sort_unstable();
+            radix::sort(&mut fixed);
             let fixups = Self::fixups(&fixed);
             appended[fixups_at as usize..][..fixups.len()].copy_from_slice(&fixups);
             point(pe::IMAGE_DIRECTORY_ENTRY_BASERELOC, fixups_at, fixups.len());
@@ -898,7 +899,7 @@ fn rooms<'a>(file: &CoffFile<'a>) -> anyhow::Result<FxHashMap<&'a [u8], Option<u
             places.entry(section).or_default().push(symbol.address());
         }
     }
-    places.values_mut().for_each(|it| it.sort_unstable());
+    places.values_mut().for_each(|it| radix::sort(it));
     let mut rooms = FxHashMap::default();
     for symbol in file.symbols() {
         let Some(index) = symbol.section_index() else { continue };
@@ -936,14 +937,14 @@ fn fixed_up(table: &[u8]) -> anyhow::Result<Vec<u64>> {
         }
         rest = &rest[len..];
     }
-    fixed.sort_unstable();
+    radix::sort(&mut fixed);
     Ok(fixed)
 }
 
 /// The entries of `.pdata` in `functions` in the order of where they start.
 fn sorted(functions: &[u8]) -> Vec<u8> {
     let mut entries: Vec<&[u8]> = functions.chunks_exact(FUNCTION).collect();
-    entries.sort_by_key(|it| read_u32(it));
+    radix::sort_copy_by_key(&mut entries, |it| read_u32(it));
     entries.concat()
 }
 

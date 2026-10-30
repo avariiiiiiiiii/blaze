@@ -358,6 +358,13 @@ the allocation per answer.
 
 > forwarded to db: `crates/hir-def/src/attrs.rs` is lane db's.
 
+> done by db-expand-next1: the reverse map is `hir_def::diagnostic_item::diagnostic_items(db, krate) -> &DiagnosticItems` (rustc's `all_diagnostic_items`), with `crate_diagnostic_items(db, krate)` for one crate's own (rustc's `diagnostic_items`). Look up with `.get(&sym::..) -> Option<AttrDefId>`; `.by_name` is the `FxHashMap<Symbol, AttrDefId>` asked for.
+> - It visits every HIR owner rustc's walk visits: modules, items, trait, impl and foreign items, unnamed consts, `use`s, `extern crate`s, macros (non-exported `macro_rules!` included), and items declared in bodies.
+> - It lowers only the bodies whose text says `rustc_diagnostic_item` or names a macro that may write it (`nameres::demand::Look::DiagnosticItems`, the same prefilter as the roots one).
+> - The dependencies are the extern prelude's, breadth first, so `#![no_std]` crates don't see `std`.
+> - `.duplicates` lists each name given to two items, as `(name, kept, other)`. rustc refuses those ("duplicate diagnostic item in crate ..." / "duplicate diagnostic item found"), so blaze-diagnostics should report them to match rustc.
+> - Tests: `crates/hir-def/src/diagnostic_item/tests.rs`.
+
 ## diagnostics-bodies-patterns: what pattern checking gives, as rustc gives it (db, `crates/hir-ty/src/infer/pat.rs`, `crates/hir/src/diagnostics.rs`)
 
 Four changes, each from `rustc_hir_typeck/src/pat.rs`:
@@ -2329,4 +2336,123 @@ namespace (types or values) and the place's `PathSource` expectation. Why:
 of types and traits) carry copies of them, because both are private to their files; once
 exposed the copies go.
 
+> forwarded to diagnostics: between its own children.
+
+## diagnostics-lints-syntax-cfg: `--cfg` and `--edition` on the command line (owner of `lints/levels.rs`)
+
+What: `CommandLine::cfg: Vec<String>`, every `--cfg v` / `--cfg=v` as given (already asked of
+levels by the parent). `check_cfg::lints` reads it: it parses each in the crate's edition
+(rustc's `parse_cfg`; one it cannot parse is rustc's fatal error, emitted unplaced), keeps each
+once, and lints `explicit_builtin_cfgs_in_flags`. Also: read `--edition x` / `--edition=x` and
+call `flags.check_cfg.add_in(&spec, edition)?` in place of `add(&spec)` for `--check-cfg`.
+Why: until `cfg` exists `check_cfg.rs` does not compile; and a `--check-cfg` naming `async` or
+`r#true` is read as 2015 whatever the crate's edition.
+
+> forwarded to diagnostics: `lints/levels.rs` is its own.
+
+## diagnostics-lints-syntax-cfg: say when rustc is run by cargo (owner of `lints/levels.rs`, blaze-cargo)
+
+What: set `CommandLine::check_cfg.cargo = true` when the crate is built by cargo (rustc's
+`CARGO_CRATE_NAME` is set), which under blaze is every crate `blaze-cargo` builds. Why:
+`unexpected_cfgs` then gives cargo's help (`[lints.rust]` `check-cfg` in `Cargo.toml`, a
+`cargo::rustc-check-cfg` line in `build.rs`, the cargo-specifics link) rather than rustc's
+`--check-cfg` help, as rustc does.
+
+> forwarded to diagnostics (`lints/levels.rs`) and cargo (setting it for every crate blaze-cargo builds).
+
+## diagnostics-lints-syntax-cfg: compiletest's automatic `--check-cfg` (owner of `tests.rs`)
+
+What (needed): in `compiletest`, `lints.cfg = options.lints.cfg.clone();` beside the
+`check_cfg` line. Why: it builds a fresh `CommandLine`, so the tests' `--cfg`s
+(`tests/lints/syntax/check_cfg/builtin.rs`, every `disallowed-cli-cfgs` case) never reach the lint.
+
+What (optional): compiletest's `--check-cfg cfg(test,FALSE)` plus `cfg(<revisions>)`, and each revision's
+`--cfg <rev>`, added by the UI harness as compiletest does. Why: the `tests/ui/check-cfg`
+tests rely on them; `tests/lints/syntax/check_cfg.rs` adds them by hand (`AUTO`).
+
 > forwarded to diagnostics: between its own children (the front-end parts go to db through it).
+
+## diagnostics-lints-names-items: `#[rustc_canonical_symbol]` as an attribute flag (crates/hir-def `attrs.rs`)
+
+What: an `AttrFlags::RUSTC_CANONICAL_SYMBOL` bit, set for a foreign function with
+`#[rustc_canonical_symbol]` (rustc's `AttributeKind::RustcCanonicalSymbol`). Why:
+`invalid_runtime_symbol_definitions` (deny) and `suspicious_runtime_symbol_definitions`
+(`lints/names/items/runtime_symbols.rs`) compare a crate's `#[no_mangle]`/`#[export_name]`
+functions and statics and its foreign items against the functions `core` and `std` declare
+canonical (rustc's `all_canonical_symbols`). Today it reads the attribute from the syntax of each
+foreign function whose symbol the crate defines, in the crates enabling `rustc_attrs`; the flag
+makes that a bit test with no parse.
+
+> forwarded to db: `crates/hir*` and `crates/base-db` are lane db's.
+
+## diagnostics-items-attrs: the signature of a proc macro function (hir-ty, `crates/hir`)
+
+What: `check_mod_attrs`' `check_proc_macro` (`compiler/rustc_passes/src/check_attr.rs`,
+`ProcMacroBadSig`) compares the `fn_sig` of a `#[proc_macro]`, `#[proc_macro_attribute]` or
+`#[proc_macro_derive]` function, its bound vars instantiated, with
+`fn(TokenStream) -> TokenStream` (two `TokenStream`s for an attribute macro), `TokenStream`
+the type of the diagnostic item `TokenStream`, and gives an error for a mismatched ABI,
+`unsafe`, generics, argument count, argument type or return type, each at its span. Why:
+`checks/attrs/check.rs` runs on syntax and `hir::Semantics`; it needs a function's lowered
+signature (`hir::Function::ret_type`, `assoc_fn_params` give `hir::Type`s, but not rustc's
+instantiated `FnSig` nor the diagnostic item), so `check_proc_macro` is not given.
+
+> for: diagnostics (parent): which lane owns proc macro signatures in hir-ty.
+> forwarded to db: `crates/hir*` and `crates/base-db` are lane db's.
+
+## diagnostics-items-attrs: the target's `has_thumb_interworking` (db, `crates/base-db/src/input.rs`)
+
+What: the crate's target spec flag `has_thumb_interworking` (or its target tuple, from which
+rustc's spec gives it). Why: `#[instruction_set(arm::a32)]` on a target without it is rustc's
+`UnsupportedInstructionSet` ("target `{tuple}` does not support `#[instruction_set(arm::*)]`",
+`compiler/rustc_attr_parsing/src/attributes/instruction_set.rs`), which names the tuple; the
+crate's cfg (`target_arch`, `target_os`, ..) gives neither. `checks/attrs/parsers/codegen.rs`
+`instruction_set` accepts `arm::a32` and `arm::t32` on every target until then.
+
+> for: db (target info of a crate).
+> forwarded to db: `crates/hir*` and `crates/base-db` are lane db's.
+
+## diagnostics-items-attrs: the crate root's feature fact (`checks/features/attributes.rs`)
+
+What: make `attributes.rs`' `features_fact` `pub(crate)`. Why: `Session::feature_err` in
+`checks/attrs/accept.rs` records the crate root's `#![feature]`s fact with its own copy of
+`features_fact`, for the gates that have no function in `attributes.rs` (`check_mod_attrs`'
+`naked_functions_rustic_abi`, and those the `stability` and `doc` parsers give through
+`Accept::gate`); with it exposed the copy goes.
+
+> for: diagnostics-items-features-attrs.
+> forwarded to diagnostics: its own `checks/features/`.
+
+## diagnostics-items-attrs: done, the three asks of diagnostics-items-features-attrs
+
+`checks/attrs.rs` declares `pub(in crate::checks) mod args;`. `lower` pushes
+`features::attributes::gate` after the safety check and before the arguments, for every owner
+but `Target::MacroCall`. The parsers call `repr_simd`, `link_cfg`, `link_kind_raw_dylib_elf`,
+`link_kind_link_arg`, `link_modifier`, `used_with_arg` and `naked_target_feature` where rustc
+gives them. `checks/attrs/cfg.rs` (rustc's `parse_cfg_entry`, for `#[link(.., cfg(..))]` and
+`#[doc(cfg(..))]`) calls `cfg_entry` on each predicate alone before its errors: a name, a
+`version(..)`, an empty `target()` for the compact gate, and each `target(..)` entry as its
+`target_` name, which is rustc's order. `doc_rust_logo` is the `doc` parser's. The `#[ignore]`d
+tests marked `needs gate called from checks/attrs parsed` can be turned on.
+
+> for: diagnostics-items-features-attrs.
+> applied: noted; a reply, nothing asked.
+
+## diagnostics-items-ast: the parser, for AST validation's errors (`crates/parser`)
+
+What, each as rustc's parser accepts it, so that AST validation can refuse it:
+
+- Patterns in the parameters of a function pointer type: `fn(mut arg: u8)`, `fn(&arg: u8)`,
+  `fn(mut self)` (rustc's `parse_fn_decl` with `req_name = false` reads a pattern whenever
+  `is_named_param` sees a name, `&`/`&&` or `mut` before `:`). blaze's parser reads only `x:`
+  and `_:`; the rest become type errors. E0561 (`tests/ui/pattern/no-patterns-in-args.rs`,
+  `tests/ui/parser/self-param-semantic-fail.rs`) needs them.
+- Negative bounds `!Trait` (`TypeBound` with a `!` token): `ConstraintOnNegativeBound` and
+  `NegativeBoundWithParentheticalNotation` need them.
+- `unsafe mod m {}` (`ast::Module::unsafe_token`): `UnsafeItem` "module cannot be declared
+  unsafe" needs it.
+
+Why: rustc parses these and refuses them in `rustc_ast_passes`; until the parser has them
+`checks/ast_validation` cannot give those errors.
+
+> for: parser (front end).

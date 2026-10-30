@@ -6,12 +6,13 @@
 //!
 //! - `args`: an attribute's arguments (rustc's `ArgParser`) and the errors of reading them.
 //! - `accept`: what a parser is given, and its errors of its input and its target.
+//! - `cfg`: the errors of a `cfg` predicate a parser reads.
 //! - `parsed`: what the parsers make of the attributes, as the checks after them read it.
 //! - `parsers`: the parsers, one module per group of rustc's files.
 //! - `check`: `check_mod_attrs`' errors.
 //!
-//! The lints of all of this are `lints::syntax::attrs`', the feature gates of attributes
-//! (E0658) `checks::features`'.
+//! The lints of all of this are `lints::syntax::attrs`'; the feature gates of attributes
+//! (E0658) are `checks::features::attributes`', which parsing calls where rustc gives them.
 //!
 //! Follows rustc's `compiler/rustc_attr_parsing/src/interface.rs` (`parse_attribute_list`),
 //! `compiler/rustc_attr_parsing/src/safety.rs` (`check_attribute_safety`),
@@ -23,7 +24,8 @@
 //! `compiler/rustc_attr_parsing/src/diagnostics.rs` (MIT or Apache-2.0).
 
 mod accept;
-mod args;
+pub(in crate::checks) mod args;
+mod cfg;
 mod check;
 mod parsed;
 mod parsers;
@@ -38,6 +40,7 @@ use self::{
     parsers::{Accepted, Finalize, GroupId, Module},
 };
 use crate::{
+    checks::features,
     cx::Cx,
     lints::syntax::{
         Walk,
@@ -141,6 +144,9 @@ fn lower(cx: &Cx<'_, '_>, session: &Session, owner: &Owner, emit: bool, errors: 
         };
         if emit {
             out.extend(safety(cx, attr, builtin.safety));
+            if owner.target != Target::MacroCall {
+                out.extend(features::attributes::gate(cx, &session.features, attr));
+            }
         }
         let Some(args) = args::parse(cx, attr, &path, out) else { continue };
         if builtin.path == ["doc"]

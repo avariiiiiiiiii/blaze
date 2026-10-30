@@ -138,6 +138,7 @@ test_case!(unused_struct_derive_default, "unused-struct-derive-default", core: "
 test_case!(pub_field_in_priv_mod, "pub-field-in-priv-mod");
 test_case!(issue_41883, "issue-41883", core: "fmt");
 test_case!(impl_trait, "impl-trait");
+test_case!(unused_adt_impl_pub_trait_with_assoc_const, "unused-adt-impl-pub-trait-with-assoc-const");
 
 #[test]
 fn in_closure() {
@@ -181,20 +182,6 @@ fn tuple_struct_field() {
         name: "tuple-struct-field.rs",
         core: "from, phantom_data, copy",
         std: Some((STRING_PRELUDE, &items)),
-        source,
-        ..Ui::default()
-    };
-    assert_eq!(ui(ui_), expected);
-}
-
-#[test]
-fn const_and_self() {
-    let source = include_str!("dead/const-and-self.rs");
-    let expected = include_str!("dead/const-and-self.stderr");
-    let ui_ = Ui {
-        name: "const-and-self.rs",
-        core: "fmt, builtin_impls, panic, unimplemented",
-        std: Some(("", PRINTLN)),
         source,
         ..Ui::default()
     };

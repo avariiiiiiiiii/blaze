@@ -9,8 +9,6 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
-use blaze_ids::radix;
-
 use crate::model::Sym;
 use crate::symbols::Symbols;
 
@@ -266,7 +264,7 @@ impl IdSet {
 
     pub fn sorted(&self) -> Vec<u32> {
         let mut out: Vec<u32> = self.iter().collect();
-        radix::sort(&mut out);
+        out.sort_unstable();
         out
     }
 

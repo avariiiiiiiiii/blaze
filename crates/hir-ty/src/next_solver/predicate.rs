@@ -4,13 +4,14 @@ use std::{cmp::Ordering, marker::PhantomData, num::NonZeroU32};
 
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_type_ir::{
-    self as ty, CollectAndApply, EarlyBinder, FlagComputation, Flags, GenericTypeVisitable,
-    PredicatePolarity, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, Upcast,
-    UpcastFrom,
+    self as ty, ClausePolarity, CollectAndApply, EarlyBinder, FlagComputation, Flags,
+    GenericTypeVisitable, PredicateProxy, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable,
+    TypeVisitable, Upcast, UpcastFrom,
     elaborate::Elaboratable,
     error::{ExpectedFound, TypeError},
     inherent::{IntoKind, SliceLike},
 };
+use smallvec::SmallVec;
 
 use crate::next_solver::{
     GenericArg, TraitIdWrapper, default_types, impl_foldable_for_interned_slice,
@@ -23,30 +24,30 @@ pub type BoundExistentialPredicate<'db> = Binder<'db, ExistentialPredicate<'db>>
 
 pub type TraitRef<'db> = ty::TraitRef<DbInterner<'db>>;
 pub type AliasTerm<'db> = ty::AliasTerm<DbInterner<'db>>;
-pub type ProjectionPredicate<'db> = ty::ProjectionPredicate<DbInterner<'db>>;
+pub type ProjectionClause<'db> = ty::ProjectionClause<DbInterner<'db>>;
 pub type ExistentialPredicate<'db> = ty::ExistentialPredicate<DbInterner<'db>>;
 pub type ExistentialTraitRef<'db> = ty::ExistentialTraitRef<DbInterner<'db>>;
 pub type ExistentialProjection<'db> = ty::ExistentialProjection<DbInterner<'db>>;
-pub type TraitPredicate<'db> = ty::TraitPredicate<DbInterner<'db>>;
-pub type HostEffectPredicate<'db> = ty::HostEffectPredicate<DbInterner<'db>>;
+pub type TraitClause<'db> = ty::TraitClause<DbInterner<'db>>;
+pub type HostEffectClause<'db> = ty::HostEffectClause<DbInterner<'db>>;
 pub type ClauseKind<'db> = ty::ClauseKind<DbInterner<'db>>;
 pub type PredicateKind<'db> = ty::PredicateKind<DbInterner<'db>>;
 pub type NormalizesTo<'db> = ty::NormalizesTo<DbInterner<'db>>;
 pub type CoercePredicate<'db> = ty::CoercePredicate<DbInterner<'db>>;
 pub type SubtypePredicate<'db> = ty::SubtypePredicate<DbInterner<'db>>;
-pub type OutlivesPredicate<'db, T> = ty::OutlivesPredicate<DbInterner<'db>, T>;
-pub type RegionOutlivesPredicate<'db> = OutlivesPredicate<'db, Region<'db>>;
-pub type TypeOutlivesPredicate<'db> = OutlivesPredicate<'db, Ty<'db>>;
-pub type PolyTraitPredicate<'db> = Binder<'db, TraitPredicate<'db>>;
-pub type PolyRegionOutlivesPredicate<'db> = Binder<'db, RegionOutlivesPredicate<'db>>;
-pub type PolyTypeOutlivesPredicate<'db> = Binder<'db, TypeOutlivesPredicate<'db>>;
+pub type OutlivesClause<'db, T> = ty::OutlivesClause<DbInterner<'db>, T>;
+pub type RegionOutlivesClause<'db> = OutlivesClause<'db, Region<'db>>;
+pub type TypeOutlivesClause<'db> = OutlivesClause<'db, Ty<'db>>;
+pub type PolyTraitClause<'db> = Binder<'db, TraitClause<'db>>;
+pub type PolyRegionOutlivesClause<'db> = Binder<'db, RegionOutlivesClause<'db>>;
+pub type PolyTypeOutlivesClause<'db> = Binder<'db, TypeOutlivesClause<'db>>;
 pub type PolySubtypePredicate<'db> = Binder<'db, SubtypePredicate<'db>>;
 pub type PolyCoercePredicate<'db> = Binder<'db, CoercePredicate<'db>>;
-pub type PolyProjectionPredicate<'db> = Binder<'db, ProjectionPredicate<'db>>;
+pub type PolyProjectionClause<'db> = Binder<'db, ProjectionClause<'db>>;
 pub type PolyTraitRef<'db> = Binder<'db, TraitRef<'db>>;
 pub type PolyExistentialTraitRef<'db> = Binder<'db, ExistentialTraitRef<'db>>;
 pub type PolyExistentialProjection<'db> = Binder<'db, ExistentialProjection<'db>>;
-pub type ArgOutlivesPredicate<'db> = OutlivesPredicate<'db, GenericArg<'db>>;
+pub type ArgOutlivesClause<'db> = OutlivesClause<'db, GenericArg<'db>>;
 
 /// Compares via an ordering that will not change if modules are reordered or other changes are
 /// made to the tree. In particular, this ordering is preserved across incremental compilations.
@@ -234,19 +235,29 @@ impl<'db> Predicate<'db> {
         let kind = self
             .kind()
             .map_bound(|kind| match kind {
-                PredicateKind::Clause(ClauseKind::Trait(TraitPredicate {
-                    trait_ref,
-                    polarity,
-                })) => Some(PredicateKind::Clause(ClauseKind::Trait(TraitPredicate {
-                    trait_ref,
-                    polarity: polarity.flip(),
-                }))),
+                PredicateKind::Clause(ClauseKind::Trait(TraitClause { trait_ref, polarity })) => {
+                    Some(PredicateKind::Clause(ClauseKind::Trait(TraitClause {
+                        trait_ref,
+                        polarity: polarity.flip(),
+                    })))
+                }
 
                 _ => None,
             })
             .transpose()?;
 
         Some(Predicate::new(interner, kind))
+    }
+
+    /// `f` of the projection clause this is, interned; `None` for any other predicate.
+    fn map_projection_clause(
+        self,
+        f: impl FnOnce(PolyProjectionClause<'db>) -> PolyProjectionClause<'db>,
+    ) -> Option<Self> {
+        let projection = self.as_projection_clause()?;
+        Some(Predicate::intern(
+            f(projection).map_bound(|it| PredicateKind::Clause(ClauseKind::Projection(it))),
+        ))
     }
 }
 
@@ -413,14 +424,47 @@ impl<'db> rustc_type_ir::TypeSuperFoldable<DbInterner<'db>> for Clauses<'db> {
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
-        Clauses::new_from_iter(self.iter().map(|clause| clause.try_fold_with(folder)))
+        let clauses = self.as_slice();
+        let mut iter = clauses.iter().copied().enumerate();
+        let first_change = iter.by_ref().find_map(|(i, clause)| match clause.try_fold_with(folder) {
+            Ok(new) if new == clause => None,
+            new => Some((i, new)),
+        });
+        match first_change {
+            None => Ok(self),
+            Some((_, Err(error))) => Err(error),
+            Some((i, Ok(new))) => {
+                let mut folded = SmallVec::<[Clause<'db>; 8]>::with_capacity(clauses.len());
+                folded.extend_from_slice(&clauses[..i]);
+                folded.push(new);
+                for (_, clause) in iter {
+                    folded.push(clause.try_fold_with(folder)?);
+                }
+                Ok(Clauses::new_from_slice(&folded))
+            }
+        }
     }
 
     fn super_fold_with<F: rustc_type_ir::TypeFolder<DbInterner<'db>>>(
         self,
         folder: &mut F,
     ) -> Self {
-        Clauses::new_from_iter(self.iter().map(|clause| clause.fold_with(folder)))
+        let clauses = self.as_slice();
+        let mut iter = clauses.iter().copied().enumerate();
+        let first_change = iter.by_ref().find_map(|(i, clause)| {
+            let new = clause.fold_with(folder);
+            (new != clause).then_some((i, new))
+        });
+        match first_change {
+            None => self,
+            Some((i, new)) => {
+                let mut folded = SmallVec::<[Clause<'db>; 8]>::with_capacity(clauses.len());
+                folded.extend_from_slice(&clauses[..i]);
+                folded.push(new);
+                folded.extend(iter.map(|(_, clause)| clause.fold_with(folder)));
+                Clauses::new_from_slice(&folded)
+            }
+        }
     }
 }
 
@@ -429,10 +473,10 @@ impl<'db> rustc_type_ir::TypeFoldable<DbInterner<'db>> for Clauses<'db> {
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
-        self.try_super_fold_with(folder)
+        folder.try_fold_clauses(self)
     }
     fn fold_with<F: rustc_type_ir::TypeFolder<DbInterner<'db>>>(self, folder: &mut F) -> Self {
-        self.super_fold_with(folder)
+        folder.fold_clauses(self)
     }
 }
 
@@ -441,13 +485,12 @@ impl<'db> rustc_type_ir::TypeVisitable<DbInterner<'db>> for Clauses<'db> {
         &self,
         visitor: &mut V,
     ) -> V::Result {
-        use rustc_ast_ir::visit::VisitorResult;
-        rustc_ast_ir::walk_visitable_list!(visitor, self.iter());
-        V::Result::output()
+        visitor.visit_clauses(*self)
     }
 }
 
-impl<'db, V: super::WorldExposer> rustc_type_ir::GenericTypeVisitable<V> for Clauses<'db> {
+// SAFETY: visits every field: the list's one field is its row, and every clause in it.
+unsafe impl<'db, V: super::WorldExposer> rustc_type_ir::GenericTypeVisitable<V> for Clauses<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
         if visitor.on_interned(ClausesStorage::table().name(), self.index.get()).is_continue() {
             self.as_slice().iter().for_each(|it| it.generic_visit_with(visitor));
@@ -472,7 +515,9 @@ impl<'db> rustc_type_ir::TypeSuperVisitable<DbInterner<'db>> for Clauses<'db> {
         &self,
         visitor: &mut V,
     ) -> V::Result {
-        self.as_slice().visit_with(visitor)
+        use rustc_ast_ir::visit::VisitorResult;
+        rustc_ast_ir::walk_visitable_list!(visitor, self.iter());
+        V::Result::output()
     }
 }
 
@@ -503,8 +548,8 @@ impl<'db> ParamEnv<'db> {
 }
 
 impl<'db> rustc_type_ir::inherent::ParamEnv<DbInterner<'db>> for ParamEnv<'db> {
-    fn caller_bounds(self) -> impl rustc_type_ir::inherent::SliceLike<Item = Clause<'db>> {
-        self.clauses
+    fn caller_bounds(self) -> impl Iterator<Item = Clause<'db>> {
+        self.clauses.iter()
     }
 }
 
@@ -529,7 +574,8 @@ impl<'db> TypeVisitable<DbInterner<'db>> for Predicate<'db> {
     }
 }
 
-impl<'db, V: super::WorldExposer> GenericTypeVisitable<V> for Predicate<'db> {
+// SAFETY: visits every field: the predicate's one field is its row, and its kind.
+unsafe impl<'db, V: super::WorldExposer> GenericTypeVisitable<V> for Predicate<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
         if visitor.on_interned(PREDICATES.name(), self.index.get()).is_continue() {
             self.kind().generic_visit_with(visitor);
@@ -588,13 +634,30 @@ impl<'db> Elaboratable<DbInterner<'db>> for Predicate<'db> {
         &self,
         clause: <DbInterner<'db> as rustc_type_ir::Interner>::Clause,
         _span: <DbInterner<'db> as rustc_type_ir::Interner>::Span,
-        _parent_trait_pred: rustc_type_ir::Binder<
-            DbInterner<'db>,
-            rustc_type_ir::TraitPredicate<DbInterner<'db>>,
-        >,
+        _parent_trait_pred: PolyTraitClause<'db>,
         _index: usize,
     ) -> Self {
         clause.as_predicate()
+    }
+}
+
+impl<'db> PredicateProxy<DbInterner<'db>> for Predicate<'db> {
+    #[inline]
+    fn allow_normalization(&self) -> bool {
+        rustc_type_ir::inherent::Predicate::allow_normalization(*self)
+    }
+
+    #[inline]
+    fn clause_kind_unchecked(&self) -> Option<Binder<'db, ClauseKind<'db>>> {
+        self.as_clause().map(IntoKind::kind)
+    }
+
+    fn map_projection(
+        self,
+        _cx: DbInterner<'db>,
+        f: impl FnOnce(PolyProjectionClause<'db>) -> PolyProjectionClause<'db>,
+    ) -> Option<Self> {
+        self.map_projection_clause(f)
     }
 }
 
@@ -672,81 +735,60 @@ impl<'db> UpcastFrom<DbInterner<'db>, ty::Binder<DbInterner<'db>, ty::TraitRef<D
         from: ty::Binder<DbInterner<'db>, ty::TraitRef<DbInterner<'db>>>,
         interner: DbInterner<'db>,
     ) -> Self {
-        from.map_bound(|trait_ref| TraitPredicate {
+        from.map_bound_no_validate_bound_vars(|trait_ref| TraitClause {
             trait_ref,
-            polarity: PredicatePolarity::Positive,
+            polarity: ClausePolarity::Positive,
         })
         .upcast(interner)
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, Binder<'db, ty::TraitPredicate<DbInterner<'db>>>>
-    for Predicate<'db>
-{
-    fn upcast_from(
-        from: Binder<'db, ty::TraitPredicate<DbInterner<'db>>>,
-        interner: DbInterner<'db>,
-    ) -> Self {
-        from.map_bound(|it| PredicateKind::Clause(ClauseKind::Trait(it))).upcast(interner)
+impl<'db> UpcastFrom<DbInterner<'db>, PolyTraitClause<'db>> for Predicate<'db> {
+    fn upcast_from(from: PolyTraitClause<'db>, interner: DbInterner<'db>) -> Self {
+        from.map_bound_no_validate_bound_vars(|it| PredicateKind::Clause(ClauseKind::Trait(it)))
+            .upcast(interner)
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, Binder<'db, ProjectionPredicate<'db>>> for Predicate<'db> {
-    fn upcast_from(from: Binder<'db, ProjectionPredicate<'db>>, interner: DbInterner<'db>) -> Self {
-        from.map_bound(|it| PredicateKind::Clause(ClauseKind::Projection(it))).upcast(interner)
+impl<'db> UpcastFrom<DbInterner<'db>, PolyProjectionClause<'db>> for Predicate<'db> {
+    fn upcast_from(from: PolyProjectionClause<'db>, interner: DbInterner<'db>) -> Self {
+        from.map_bound_no_validate_bound_vars(|it| {
+            PredicateKind::Clause(ClauseKind::Projection(it))
+        })
+        .upcast(interner)
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, ProjectionPredicate<'db>> for Predicate<'db> {
-    fn upcast_from(from: ProjectionPredicate<'db>, interner: DbInterner<'db>) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, ProjectionClause<'db>> for Predicate<'db> {
+    fn upcast_from(from: ProjectionClause<'db>, interner: DbInterner<'db>) -> Self {
         PredicateKind::Clause(ClauseKind::Projection(from)).upcast(interner)
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, ty::TraitPredicate<DbInterner<'db>>> for Predicate<'db> {
-    fn upcast_from(from: ty::TraitPredicate<DbInterner<'db>>, interner: DbInterner<'db>) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, TraitClause<'db>> for Predicate<'db> {
+    fn upcast_from(from: TraitClause<'db>, interner: DbInterner<'db>) -> Self {
         PredicateKind::Clause(ClauseKind::Trait(from)).upcast(interner)
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, ty::OutlivesPredicate<DbInterner<'db>, Ty<'db>>>
-    for Predicate<'db>
-{
-    fn upcast_from(
-        from: ty::OutlivesPredicate<DbInterner<'db>, Ty<'db>>,
-        interner: DbInterner<'db>,
-    ) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, TypeOutlivesClause<'db>> for Predicate<'db> {
+    fn upcast_from(from: TypeOutlivesClause<'db>, interner: DbInterner<'db>) -> Self {
         PredicateKind::Clause(ClauseKind::TypeOutlives(from)).upcast(interner)
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, ty::OutlivesPredicate<DbInterner<'db>, Region<'db>>>
-    for Predicate<'db>
-{
-    fn upcast_from(
-        from: ty::OutlivesPredicate<DbInterner<'db>, Region<'db>>,
-        interner: DbInterner<'db>,
-    ) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, RegionOutlivesClause<'db>> for Predicate<'db> {
+    fn upcast_from(from: RegionOutlivesClause<'db>, interner: DbInterner<'db>) -> Self {
         PredicateKind::Clause(ClauseKind::RegionOutlives(from)).upcast(interner)
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, ty::OutlivesPredicate<DbInterner<'db>, Ty<'db>>>
-    for Clause<'db>
-{
-    fn upcast_from(
-        from: ty::OutlivesPredicate<DbInterner<'db>, Ty<'db>>,
-        interner: DbInterner<'db>,
-    ) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, TypeOutlivesClause<'db>> for Clause<'db> {
+    fn upcast_from(from: TypeOutlivesClause<'db>, interner: DbInterner<'db>) -> Self {
         Clause(from.upcast(interner))
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, ty::OutlivesPredicate<DbInterner<'db>, Region<'db>>>
-    for Clause<'db>
-{
-    fn upcast_from(
-        from: ty::OutlivesPredicate<DbInterner<'db>, Region<'db>>,
-        interner: DbInterner<'db>,
-    ) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, RegionOutlivesClause<'db>> for Clause<'db> {
+    fn upcast_from(from: RegionOutlivesClause<'db>, interner: DbInterner<'db>) -> Self {
         Clause(from.upcast(interner))
     }
 }
 
-impl<'db> UpcastFrom<DbInterner<'db>, PolyRegionOutlivesPredicate<'db>> for Predicate<'db> {
-    fn upcast_from(from: PolyRegionOutlivesPredicate<'db>, tcx: DbInterner<'db>) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, PolyRegionOutlivesClause<'db>> for Predicate<'db> {
+    fn upcast_from(from: PolyRegionOutlivesClause<'db>, tcx: DbInterner<'db>) -> Self {
         from.map_bound(|p| PredicateKind::Clause(ClauseKind::RegionOutlives(p))).upcast(tcx)
     }
 }
@@ -761,7 +803,7 @@ impl<'db> rustc_type_ir::inherent::Predicate<DbInterner<'db>> for Predicate<'db>
 }
 
 impl<'db> Predicate<'db> {
-    pub fn as_trait_clause(self) -> Option<PolyTraitPredicate<'db>> {
+    pub fn as_trait_clause(self) -> Option<PolyTraitClause<'db>> {
         let predicate = self.kind();
         match predicate.skip_binder() {
             PredicateKind::Clause(ClauseKind::Trait(t)) => Some(predicate.rebind(t)),
@@ -769,7 +811,7 @@ impl<'db> Predicate<'db> {
         }
     }
 
-    pub fn as_projection_clause(self) -> Option<PolyProjectionPredicate<'db>> {
+    pub fn as_projection_clause(self) -> Option<PolyProjectionClause<'db>> {
         let predicate = self.kind();
         match predicate.skip_binder() {
             PredicateKind::Clause(ClauseKind::Projection(t)) => Some(predicate.rebind(t)),
@@ -799,7 +841,16 @@ impl<'db> TypeVisitable<DbInterner<'db>> for Clause<'db> {
         &self,
         visitor: &mut V,
     ) -> V::Result {
-        visitor.visit_predicate((*self).as_predicate())
+        visitor.visit_predicate(*self)
+    }
+}
+
+impl<'db> TypeSuperVisitable<DbInterner<'db>> for Clause<'db> {
+    fn super_visit_with<V: rustc_type_ir::TypeVisitor<DbInterner<'db>>>(
+        &self,
+        visitor: &mut V,
+    ) -> V::Result {
+        self.0.super_visit_with(visitor)
     }
 }
 
@@ -808,20 +859,70 @@ impl<'db> TypeFoldable<DbInterner<'db>> for Clause<'db> {
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
-        Ok(folder.try_fold_predicate(self.as_predicate())?.expect_clause())
+        folder.try_fold_predicate(self)
     }
     fn fold_with<F: rustc_type_ir::TypeFolder<DbInterner<'db>>>(self, folder: &mut F) -> Self {
-        folder.fold_predicate(self.as_predicate()).expect_clause()
+        folder.fold_predicate(self)
+    }
+}
+
+impl<'db> TypeSuperFoldable<DbInterner<'db>> for Clause<'db> {
+    fn try_super_fold_with<F: rustc_type_ir::FallibleTypeFolder<DbInterner<'db>>>(
+        self,
+        folder: &mut F,
+    ) -> Result<Self, F::Error> {
+        let kind = self.kind().try_fold_with(folder)?;
+        Ok(Clause(Predicate::intern(kind.map_bound_no_validate_bound_vars(PredicateKind::Clause))))
+    }
+    fn super_fold_with<F: rustc_type_ir::TypeFolder<DbInterner<'db>>>(
+        self,
+        folder: &mut F,
+    ) -> Self {
+        let kind = self.kind().fold_with(folder);
+        Clause(Predicate::intern(kind.map_bound_no_validate_bound_vars(PredicateKind::Clause)))
+    }
+}
+
+impl<'db> Flags for Clause<'db> {
+    #[inline]
+    fn flags(&self) -> rustc_type_ir::TypeFlags {
+        self.0.flags()
+    }
+
+    #[inline]
+    fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
+        self.0.outer_exclusive_binder()
+    }
+}
+
+impl<'db> PredicateProxy<DbInterner<'db>> for Clause<'db> {
+    #[inline]
+    fn allow_normalization(&self) -> bool {
+        rustc_type_ir::inherent::Predicate::allow_normalization(self.0)
+    }
+
+    #[inline]
+    fn clause_kind_unchecked(&self) -> Option<Binder<'db, ClauseKind<'db>>> {
+        Some(self.kind())
+    }
+
+    fn map_projection(
+        self,
+        _cx: DbInterner<'db>,
+        f: impl FnOnce(PolyProjectionClause<'db>) -> PolyProjectionClause<'db>,
+    ) -> Option<Self> {
+        self.0.map_projection_clause(f).map(Clause)
     }
 }
 
 impl<'db> IntoKind for Clause<'db> {
     type Kind = Binder<'db, ClauseKind<'db>>;
 
+    #[inline]
     fn kind(self) -> Self::Kind {
-        self.0.kind().map_bound(|pk| match pk {
+        self.0.kind().map_bound_no_validate_bound_vars(|pk| match pk {
             PredicateKind::Clause(kind) => kind,
-            _ => unreachable!(),
+            _ => unreachable!("a `Clause` is made of a `PredicateKind::Clause` only"),
         })
     }
 }
@@ -845,75 +946,45 @@ impl<'db> Elaboratable<DbInterner<'db>> for Clause<'db> {
         &self,
         clause: <DbInterner<'db> as rustc_type_ir::Interner>::Clause,
         _span: <DbInterner<'db> as rustc_type_ir::Interner>::Span,
-        _parent_trait_pred: rustc_type_ir::Binder<
-            DbInterner<'db>,
-            rustc_type_ir::TraitPredicate<DbInterner<'db>>,
-        >,
+        _parent_trait_pred: PolyTraitClause<'db>,
         _index: usize,
     ) -> Self {
         clause
     }
 }
 
-impl<'db> UpcastFrom<DbInterner<'db>, ty::Binder<DbInterner<'db>, ty::ClauseKind<DbInterner<'db>>>>
-    for Clause<'db>
-{
-    fn upcast_from(
-        from: ty::Binder<DbInterner<'db>, ty::ClauseKind<DbInterner<'db>>>,
-        interner: DbInterner<'db>,
-    ) -> Self {
-        Clause(from.map_bound(PredicateKind::Clause).upcast(interner))
+impl<'db> UpcastFrom<DbInterner<'db>, Binder<'db, ClauseKind<'db>>> for Clause<'db> {
+    fn upcast_from(from: Binder<'db, ClauseKind<'db>>, interner: DbInterner<'db>) -> Self {
+        Clause(from.map_bound_no_validate_bound_vars(PredicateKind::Clause).upcast(interner))
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, ty::TraitRef<DbInterner<'db>>> for Clause<'db> {
-    fn upcast_from(from: ty::TraitRef<DbInterner<'db>>, interner: DbInterner<'db>) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, TraitRef<'db>> for Clause<'db> {
+    fn upcast_from(from: TraitRef<'db>, interner: DbInterner<'db>) -> Self {
         Clause(from.upcast(interner))
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, ty::Binder<DbInterner<'db>, ty::TraitRef<DbInterner<'db>>>>
-    for Clause<'db>
-{
-    fn upcast_from(
-        from: ty::Binder<DbInterner<'db>, ty::TraitRef<DbInterner<'db>>>,
-        interner: DbInterner<'db>,
-    ) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, PolyTraitRef<'db>> for Clause<'db> {
+    fn upcast_from(from: PolyTraitRef<'db>, interner: DbInterner<'db>) -> Self {
         Clause(from.upcast(interner))
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, ty::TraitPredicate<DbInterner<'db>>> for Clause<'db> {
-    fn upcast_from(from: ty::TraitPredicate<DbInterner<'db>>, interner: DbInterner<'db>) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, TraitClause<'db>> for Clause<'db> {
+    fn upcast_from(from: TraitClause<'db>, interner: DbInterner<'db>) -> Self {
         Clause(from.upcast(interner))
     }
 }
-impl<'db>
-    UpcastFrom<DbInterner<'db>, ty::Binder<DbInterner<'db>, ty::TraitPredicate<DbInterner<'db>>>>
-    for Clause<'db>
-{
-    fn upcast_from(
-        from: ty::Binder<DbInterner<'db>, ty::TraitPredicate<DbInterner<'db>>>,
-        interner: DbInterner<'db>,
-    ) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, PolyTraitClause<'db>> for Clause<'db> {
+    fn upcast_from(from: PolyTraitClause<'db>, interner: DbInterner<'db>) -> Self {
         Clause(from.upcast(interner))
     }
 }
-impl<'db> UpcastFrom<DbInterner<'db>, ty::ProjectionPredicate<DbInterner<'db>>> for Clause<'db> {
-    fn upcast_from(
-        from: ty::ProjectionPredicate<DbInterner<'db>>,
-        interner: DbInterner<'db>,
-    ) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, ProjectionClause<'db>> for Clause<'db> {
+    fn upcast_from(from: ProjectionClause<'db>, interner: DbInterner<'db>) -> Self {
         Clause(from.upcast(interner))
     }
 }
-impl<'db>
-    UpcastFrom<
-        DbInterner<'db>,
-        ty::Binder<DbInterner<'db>, ty::ProjectionPredicate<DbInterner<'db>>>,
-    > for Clause<'db>
-{
-    fn upcast_from(
-        from: ty::Binder<DbInterner<'db>, ty::ProjectionPredicate<DbInterner<'db>>>,
-        interner: DbInterner<'db>,
-    ) -> Self {
+impl<'db> UpcastFrom<DbInterner<'db>, PolyProjectionClause<'db>> for Clause<'db> {
+    fn upcast_from(from: PolyProjectionClause<'db>, interner: DbInterner<'db>) -> Self {
         Clause(from.upcast(interner))
     }
 }
@@ -947,5 +1018,105 @@ impl<'db> rustc_type_ir::inherent::Clause<DbInterner<'db>> for Clause<'db> {
         let predicate: Predicate<'db> =
             ty::Binder::bind_with_vars(PredicateKind::Clause(new), bound_vars).upcast(cx);
         predicate.expect_clause()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_type_ir::inherent::Clause as _;
+    use salsa::plumbing::FromId;
+
+    use super::*;
+    use crate::next_solver::{AliasTermKind, GenericArgs, TraitAssocTyId};
+
+    fn id<T: FromId>(index: u32) -> T {
+        T::from_id(salsa::Id::from_bits(u64::from(index)))
+    }
+
+    fn clause<'db>(kind: ClauseKind<'db>) -> Clause<'db> {
+        Clause(Predicate::intern(Binder::dummy(PredicateKind::Clause(kind))))
+    }
+
+    struct Samples<'db> {
+        trait_: Clause<'db>,
+        outlives: Clause<'db>,
+        well_formed: Clause<'db>,
+        projection: Clause<'db>,
+    }
+
+    fn samples<'db>() -> Samples<'db> {
+        let types = &default_types().types;
+        let statik = default_types().regions.statik;
+        let args = GenericArgs::new_from_slice(&[types.u8.into()]);
+        let trait_ref = TraitRef::from_checked_parts(TraitIdWrapper(id(4)), args);
+        Samples {
+            trait_: clause(ClauseKind::Trait(TraitClause {
+                trait_ref,
+                polarity: ClausePolarity::Positive,
+            })),
+            outlives: clause(ClauseKind::TypeOutlives(ty::OutlivesClause(types.u8, statik))),
+            well_formed: clause(ClauseKind::WellFormed(types.u8.into())),
+            projection: clause(ClauseKind::Projection(ProjectionClause {
+                projection_term: AliasTerm::from_checked_parts(
+                    AliasTermKind::ProjectionTy { def_id: TraitAssocTyId(id(5)) },
+                    args,
+                ),
+                term: types.u8.into(),
+            })),
+        }
+    }
+
+    #[test]
+    fn a_clause_and_its_predicate_are_the_same_proxy() {
+        let c = samples();
+        for clause in [c.trait_, c.outlives, c.well_formed, c.projection] {
+            let predicate = clause.as_predicate();
+            assert_eq!(PredicateProxy::clause_kind_unchecked(&clause), Some(clause.kind()));
+            assert_eq!(PredicateProxy::clause_kind_unchecked(&predicate), Some(clause.kind()));
+            assert_eq!(
+                PredicateProxy::allow_normalization(&clause),
+                PredicateProxy::allow_normalization(&predicate),
+            );
+            assert_eq!(clause.flags(), predicate.flags());
+            assert_eq!(clause.outer_exclusive_binder(), predicate.outer_exclusive_binder());
+        }
+        assert!(!PredicateProxy::allow_normalization(&c.well_formed));
+        assert!(PredicateProxy::allow_normalization(&c.trait_));
+        let ambiguous = Predicate::intern(Binder::dummy(PredicateKind::Ambiguous));
+        assert_eq!(PredicateProxy::clause_kind_unchecked(&ambiguous), None);
+    }
+
+    #[test]
+    fn map_projection_maps_projection_clauses_only() {
+        let c = samples();
+        let types = &default_types().types;
+        let mapped = c
+            .projection
+            .0
+            .map_projection_clause(|it| {
+                it.map_bound(|it| ProjectionClause { term: types.bool.into(), ..it })
+            })
+            .expect("a projection clause");
+        let before = c.projection.0.as_projection_clause().unwrap().skip_binder();
+        let after = mapped.as_projection_clause().unwrap().skip_binder();
+        assert_eq!(after.term, types.bool.into());
+        assert_eq!(after.projection_term, before.projection_term);
+        assert_eq!(c.projection.0.map_projection_clause(|it| it), Some(c.projection.0));
+        for other in [c.trait_, c.outlives, c.well_formed] {
+            assert_eq!(other.0.map_projection_clause(|it| it), None);
+        }
+    }
+
+    #[test]
+    fn as_type_outlives_clause_finds_type_outlives_only() {
+        let c = samples();
+        let types = &default_types().types;
+        assert_eq!(
+            c.outlives.as_type_outlives_clause().map(Binder::skip_binder),
+            Some(ty::OutlivesClause(types.u8, default_types().regions.statik)),
+        );
+        for other in [c.trait_, c.well_formed, c.projection] {
+            assert!(other.as_type_outlives_clause().is_none());
+        }
     }
 }

@@ -576,7 +576,7 @@ impl<'a> Stage<'a> {
             }
             fixups.push(Fixup { at: u64::from(reloc.at), apply, target: *sym, addend: reloc.addend, minus: None });
         }
-        radix::sort_copy_by_key(&mut weak, |it: &Sym| it.0);
+        weak.sort_unstable();
         weak.dedup();
         Ok((fixups.into_bump_slice(), weak.into_bump_slice()))
     }
@@ -914,7 +914,7 @@ impl<'a> Stage<'a> {
                 }
             }
         }
-        radix::sort_copy_by_key(&mut wanted, |it| it.0.0);
+        wanted.sort_unstable_by_key(|it| it.0);
         wanted.dedup_by_key(|it| it.0);
         let class = self.new.class_id(&Class::RelRo);
         for (sym, anchor, index) in wanted {
@@ -973,7 +973,7 @@ impl<'a> Stage<'a> {
                     }
                 }
             }
-            radix::sort(&mut touched);
+            touched.sort_unstable();
             touched.dedup();
             for id in std::mem::take(&mut touched) {
                 let live = self.new.piece(id).is_some_and(|it| matches!(it.what(), What::Shared));

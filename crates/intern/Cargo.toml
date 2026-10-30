@@ -18,5 +18,8 @@ rustc-hash.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
 [lints]
 workspace = true

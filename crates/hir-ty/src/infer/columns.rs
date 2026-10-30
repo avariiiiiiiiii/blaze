@@ -14,6 +14,7 @@ use std::{
     ops::Index,
 };
 
+use blaze_ids::radix;
 use hir_def::{
     FieldId, TupleFieldId,
     hir::{ExprId, ExprOrPatIdPacked, PatId},
@@ -674,7 +675,7 @@ impl<K: DenseKey, T> CsrBuilder<K, T> {
         // An empty list may start inside another one; lists with items never overlap.
         let mut live: Vec<Range> =
             ranges.iter().copied().filter(|it| !it.is_absent() && it.len != 0).collect();
-        live.sort_unstable_by_key(|range| range.start);
+        radix::sort_copy_by_key(&mut live, |range| range.start);
         let mut rest: &mut [T] = items;
         let mut consumed = 0usize;
         live.into_iter().map(move |range| {

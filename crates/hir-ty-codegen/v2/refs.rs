@@ -36,6 +36,7 @@ use hir_ty_mir::mir::{
     location::{located_concats, track_caller},
     monomorphized_promoted_mir_body_query,
 };
+use intern::sym;
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxBuildHasher, FxHashSet};

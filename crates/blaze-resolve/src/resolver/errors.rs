@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Error;
+use blaze_ids::radix;
 
 use crate::edit_distance::{closest, edit_distance};
 use crate::interning::InternedString;
@@ -501,7 +502,7 @@ fn alt_names(
         .into_iter()
         .filter_map(|n| Some((edit_distance(&wild_dep.package_name(), &n.name(), 3)?, n)))
         .collect();
-    name_candidates.sort_by_key(|o| o.0);
+    radix::sort_by_key(&mut name_candidates, |o| o.0);
 
     if name_candidates.is_empty() { None } else { Some(Ok(name_candidates)) }
 }

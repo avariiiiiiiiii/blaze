@@ -8,6 +8,20 @@ use crate::{
 };
 
 #[test]
+fn plain_records_are_checked_by_their_bounds() {
+    const { assert!(<u32 as Record>::PLAIN && <[u8; 7] as Record>::PLAIN) };
+    const { assert!(<crate::RelSpan as Record>::PLAIN && <SpanRef as Record>::PLAIN) };
+    const { assert!(<ContentId as Record>::PLAIN && <[ContentId; 2] as Record>::PLAIN) };
+    const { assert!(!<bool as Record>::PLAIN && !<[bool; 2] as Record>::PLAIN) };
+    const { assert!(!<Leaf as Record>::PLAIN && !<Root as Record>::PLAIN) };
+    const { assert!(!<Rel<u32> as Record>::PLAIN && !<Slice<u32> as Record>::PLAIN) };
+    let buffer = Aligned::copy_from(&written(1));
+    let root = open::<Root>(&buffer).unwrap();
+    assert_eq!(root.numbers.get(&buffer), &[1, 2, 3]);
+    assert!(matches!(open::<Root>(&Aligned::copy_from(&written(2))), Err(FormatError::Invalid { .. })));
+}
+
+#[test]
 fn a_verified_open_reads_only_the_buffer_its_key_names() {
     let buffer = Aligned::copy_from(&written(1));
     let key = buffer_id(&buffer);

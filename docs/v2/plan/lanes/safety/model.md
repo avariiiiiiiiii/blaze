@@ -56,24 +56,40 @@ The `std` API, path for path, so the switch is a `use`:
 
 - `blaze_check::model(|| { ... })`: runs the closure under every execution;
   `blaze_check::Builder` sets the bounds (`max_preemptions`, from `CHECK_MAX_PREEMPTIONS`,
-  default 3; `max_branches`, default 10 000 per execution; `max_threads` up to 8), the random
-  mode (`CHECK_RANDOM=<runs>` with `CHECK_SEED`: shuttle's PCT over a seeded `Rng`, for models
-  too big to exhaust) and the replay (`CHECK_REPLAY=<schedule>`).
+  default 3, `none` for no bound; `max_branches`, from `CHECK_MAX_BRANCHES`, default 10 000 per
+  execution; `max_threads` up to 8; `stack_size`, from `CHECK_STACK_SIZE`, default 1 MiB per
+  model thread), the random mode (`CHECK_RANDOM=<runs>` with `CHECK_SEED` and
+  `CHECK_PCT_DEPTH`, default 3: shuttle's PCT over a seeded `Rng`, for models too big to
+  exhaust) and the replay (`CHECK_REPLAY=<schedule>`).
 - `sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize,
   AtomicI8, AtomicI16, AtomicI32, AtomicI64, AtomicIsize, AtomicPtr, Ordering, fence,
   compiler_fence}`: `const fn new`, `load`, `store`, `swap`, `compare_exchange`,
-  `compare_exchange_weak` (which may also fail spuriously: a branch), `fetch_*`, `fetch_update`,
-  `get_mut`, `into_inner`, `as_ptr` is not offered (a raw access the checker cannot see).
+  `compare_exchange_weak` (no spurious failure is explored, as loom), `fetch_*` (`fetch_not` on
+  `AtomicBool`), `fetch_update`, `get_mut`, `into_inner`, `Default`, `From`, `Debug`. `as_ptr`
+  is not offered (a raw access the checker cannot see). Acquire, release and AcqRel fences act
+  on the thread's own clocks and are no schedule points; an SC fence is.
 - `sync::{Arc, Weak}` (std's), `sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard,
   RwLockWriteGuard, Condvar, WaitTimeoutResult, OnceLock, LockResult, TryLockError,
-  TryLockResult, PoisonError}`.
-- `thread::{spawn, scope, Scope, ScopedJoinHandle, JoinHandle, yield_now, park, current,
-  Thread, ThreadId, sleep, available_parallelism, Builder}`; `hint::spin_loop` (a yield);
-  `thread_local!` with `LocalKey` (`with`, `set`, `get`, `take`, `replace`, `with_borrow`,
-  `with_borrow_mut`), one value per model thread, dropped when it ends.
+  TryLockResult, PoisonError}`. Taking a lock is a schedule point, releasing one is not (as
+  loom: the releaser's next operation is). A condvar wait is an access of the condvar (so DPOR
+  orders it with each notify) that releases the mutex and blocks in one step; a timed wait may
+  time out at once (a branch); untimed waits get no spurious wakeup (as loom). `OnceLock`
+  keeps its value in `std`'s cell: a `static` cell an earlier execution set stays set, as one
+  set before the model (its initializer must do no operation the model sees).
+- `thread::{spawn, Builder, JoinHandle, Thread, ThreadId, current, yield_now, sleep (a yield),
+  park, park_timeout (may return at once: a branch), available_parallelism (2 in a model),
+  panicking, Result, LocalKey, AccessError}`; `hint::spin_loop` (a yield);
+  `thread_local!` with std's syntax (`const { }` too) making `LocalKey`s (`with`, `try_with`,
+  and `set`, `get`, `take`, `replace`, `with_borrow`, `with_borrow_mut` on cells), one value per
+  model thread, dropped when it ends. `thread::scope` is not offered: the crates under test use
+  it only in tests, through `std::thread::scope`.
 - `cell::UnsafeCell` with loom's `with(|ptr: *const T| ..)` and `with_mut(|ptr: *mut T| ..)`,
   and `get_mut`: each access is a tracked non-atomic read or write, and one not ordered by
-  happens-before with another thread's write (or a write with a read) is a finding.
+  happens-before with another thread's write (or a write with a read) is a finding. Accesses
+  are no schedule points: whether two race depends only on the clocks.
+- `linear::{Spec, History}`: `History::record(op, |op| ..)` runs and records one operation of
+  the calling model thread; `History::check(init)` panics (a finding, with the schedule) unless
+  some linearization of the run gives every result on the `Spec`.
 
 Outside a model the shims are std's types: a model build runs its other tests too.
 
@@ -94,8 +110,8 @@ structure that wants each field access checked keeps the field in an `UnsafeCell
   calls `model`, with no lock and no OS scheduling: a switch costs nanoseconds where loom's
   generator crate pays about the same and shuttle the same, and an execution allocates nothing
   once its stacks and tables are warm (they are reused across executions).
-- **Schedule points** are every atomic operation, lock, unlock, wait, notify, spawn, join, park,
-  unpark and yield. Before each, the explorer picks the thread that runs: the current one unless
+- **Schedule points** are every atomic operation (but non-SC fences), lock, wait, notify,
+  once-cell access, join, park, unpark, yield and thread end. Before each, the explorer picks the thread that runs: the current one unless
   this execution's path says to preempt. The path is loom's (`rt/path.rs`): a list of branches
   (a schedule, the store a load reads, a spurious failure), replayed up to its end and extended
   past it; after an execution the last branch with an alternative left takes it.
@@ -138,6 +154,8 @@ structure that wants each field access checked keeps the field in an `UnsafeCell
 | `thread_local!` | `loom::thread_local!` | yes | yes, std syntax incl. `const { }` |
 | cells | `UnsafeCell::with`/`with_mut` | none | same as loom |
 | replay | checkpoint file (feature) | seed and schedule | seed and schedule string |
+| linearizability | none (asserts only) | none | `linear::History` against a sequential `Spec` |
+| spurious failures | none | none | none for `compare_exchange_weak` and untimed waits; timed waits and `park_timeout` branch |
 
 What none of them (and this) covers: load buffering (a load reading a store later in execution
 order) and modification orders that contradict execution order (2+2W); those need a promising
@@ -149,10 +167,12 @@ does), where loom, whose `new` isn't `const`, checks a first read racing with it
 
 Each lock-free structure gets a test that runs its operations from 2 or 3 threads under
 `model`, records each operation's call and result, and checks the outcome against a sequential
-model of the structure: some order of the operations consistent with the threads' own orders
-(a linearization) gives the same results on the sequential model. The checker is a small
-`blaze_check::linear::check(history, model)` (Wing and Gong's search with memoized states, as
-porcupine and lincheck do) so each test is the structure, its sequential model and a few calls.
+model of the structure: some order of the operations that keeps every call-before-return order
+of the run (a linearization) gives the same results on the sequential model. The checker is
+`blaze_check::linear` (Wing and Gong's search with Lowe's memo of (operations done, state)
+pairs, as porcupine and lincheck keep) so each test is the structure, its sequential model and
+a few calls. safety-model's children (`safety-model-{format,db,store,graph}`) write them: in
+the crate where its owners are done, as a request to them where not.
 
 | crate | structure | owner |
 |---|---|---|

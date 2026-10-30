@@ -159,24 +159,29 @@ pub fn expand_cfg_attr_with_doc_comments<'a, DocComment, BreakValue>(
     }
 }
 
+/// The builtin attributes the item tree leaves out.
+const ITEM_TREE_FILTERED_ATTRS: &[&str] = &[
+    "doc",
+    "stable",
+    "unstable",
+    "target_feature",
+    "allow",
+    "expect",
+    "warn",
+    "deny",
+    "forbid",
+    "repr",
+    "inline",
+    "track_caller",
+    "must_use",
+];
+
+blaze_phf::phf_table!(static ITEM_TREE_FILTERED = ITEM_TREE_FILTERED_ATTRS;);
+
+/// Whether the item tree leaves out the attribute `name`: one hash of its bytes and one compare.
 #[inline]
 pub(crate) fn is_item_tree_filtered_attr(name: &str) -> bool {
-    matches!(
-        name,
-        "doc"
-            | "stable"
-            | "unstable"
-            | "target_feature"
-            | "allow"
-            | "expect"
-            | "warn"
-            | "deny"
-            | "forbid"
-            | "repr"
-            | "inline"
-            | "track_caller"
-            | "must_use"
-    )
+    ITEM_TREE_FILTERED.get(name).is_some()
 }
 
 /// This collects attributes exactly as the item tree needs them. This is used for the item tree,
@@ -515,5 +520,43 @@ struct S;
             }
             assert_eq!(path.as_one_segment(), old_text(&path));
         }
+    }
+
+    /// The table finds what the `matches!` it replaced did: every member, near misses of each,
+    /// and other attribute names.
+    #[test]
+    fn filtered_attrs_as_the_string_match() {
+        let reference = |name: &str| {
+            matches!(
+                name,
+                "doc"
+                    | "stable"
+                    | "unstable"
+                    | "target_feature"
+                    | "allow"
+                    | "expect"
+                    | "warn"
+                    | "deny"
+                    | "forbid"
+                    | "repr"
+                    | "inline"
+                    | "track_caller"
+                    | "must_use"
+            )
+        };
+        let mut names: Vec<String> = Vec::new();
+        for text in ITEM_TREE_FILTERED_ATTRS {
+            names.push((*text).to_owned());
+            names.push(format!("{text}s"));
+            names.push(format!("r#{text}"));
+            names.push(text.to_uppercase());
+            names.push(text[..text.len() - 1].to_owned());
+            names.push(text[1..].to_owned());
+        }
+        names.extend(["", "cfg", "derive", "must_used", "rustc_const_stable", "test"].map(String::from));
+        for name in &names {
+            assert_eq!(is_item_tree_filtered_attr(name), reference(name), "{name}");
+        }
+        assert!(ITEM_TREE_FILTERED_ATTRS.iter().all(|it| is_item_tree_filtered_attr(it)));
     }
 }

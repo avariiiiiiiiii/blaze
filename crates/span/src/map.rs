@@ -4,7 +4,7 @@
 use std::{fmt, hash::Hash, sync::OnceLock};
 
 use blaze_format::Spans;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, radix};
 use stdx::{always, itertools::Itertools};
 
 use crate::{
@@ -136,8 +136,8 @@ impl SpanMap {
         always!(self.ends.iter().array_windows().all(|[a, b]| a < b), "spans are not in order");
         self.ends.shrink_to_fit();
         self.spans.shrink_to_fit();
-        self.fragment_starts.sort_unstable();
-        self.fragment_ends.sort_unstable();
+        radix::sort_copy_by_key(&mut self.fragment_starts, |it| u32::from(*it));
+        radix::sort_copy_by_key(&mut self.fragment_ends, |it| u32::from(*it));
     }
 
     /// Pushes a new span onto the [`SpanMap`].
@@ -155,12 +155,18 @@ impl SpanMap {
         self.by_anchor = OnceLock::new();
     }
 
-    /// The pieces sorted by [`down_key`], then number, made on first use: `O(n log n)` once,
-    /// then an acquire load per call.
+    /// The pieces sorted by [`down_key`], then number, made on first use: `O(n)` once (a stable
+    /// radix sort of the numbers in order), then an acquire load per call.
     fn by_anchor(&self) -> &[u32] {
         self.by_anchor.get_or_init(|| {
             let mut pieces = (0..self.spans.len() as u32).collect::<Box<[u32]>>();
-            pieces.sort_unstable_by_key(|&it| (down_key(&self.spans[it as usize]), it));
+            radix::sort_by_key(&mut pieces, |&it| {
+                let [file, ast_id, start, end] = down_key(&self.spans[it as usize]);
+                (u128::from(file) << 96)
+                    | (u128::from(ast_id) << 64)
+                    | (u128::from(start) << 32)
+                    | u128::from(end)
+            });
             pieces
         })
     }
@@ -231,7 +237,7 @@ impl SpanMap {
             .copied()
             .filter(|it| key(it)[3] >= end)
             .collect::<Vec<u32>>();
-        found.sort_unstable();
+        radix::sort(&mut found);
         found.into_iter().map(move |it| self.range_of(it))
     }
 
@@ -328,8 +334,8 @@ impl SpanMap {
         let start = other_range.start();
         self.fragment_starts.extend(other.fragment_starts.iter().map(|&offset| offset + start));
         self.fragment_ends.extend(other.fragment_ends.iter().map(|&offset| offset + start));
-        self.fragment_starts.sort_unstable();
-        self.fragment_ends.sort_unstable();
+        radix::sort_copy_by_key(&mut self.fragment_starts, |it| u32::from(*it));
+        radix::sort_copy_by_key(&mut self.fragment_ends, |it| u32::from(*it));
 
         // Matched arm info is no longer correct once we have multiple macros.
         self.matched_arm = None;

@@ -18,7 +18,7 @@ use blaze_api::{
     client::Client,
     frames::{self, Frames},
 };
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, radix};
 use blaze_vfs::{Op, View};
 use rustc_hash::FxHashMap;
 
@@ -81,7 +81,7 @@ impl Worker {
                 },
                 Command::Cancel => {
                     let mut ids: Vec<u64> = self.running.keys().copied().collect();
-                    ids.sort_unstable();
+                    radix::sort(&mut ids);
                     for id in ids {
                         // A connection that broke is reported by the reader as `Lost`.
                         let _ = self.send(Request::Cancel { id });
@@ -103,7 +103,7 @@ impl Worker {
                 Command::Lost(why) => {
                     self.stream = None;
                     let mut lost: Vec<(u64, RunId)> = std::mem::take(&mut self.running).into_iter().collect();
-                    lost.sort_unstable_by_key(|&(id, _)| id);
+                    radix::sort_copy_by_key(&mut lost, |&(id, _)| id);
                     for (_, run) in lost {
                         self.fail(run, why.clone());
                     }

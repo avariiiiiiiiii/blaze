@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use annotate_snippets::{Level, Renderer};
 use anyhow::{Context as _, anyhow, bail};
+use blaze_ids::radix;
 use rustc_hash::{FxHashMap, FxHashSet};
 use url::Url;
 
@@ -188,7 +189,7 @@ impl ConfigValue {
                     new.append(old);
                     std::mem::swap(&mut new, old);
                 }
-                old.sort_by_key(|v| v.definition().rank());
+                radix::sort_by_key(old, |v| v.definition().rank());
             }
             (CV::Table(old, _), CV::Table(new, _)) => {
                 for (key, value) in new {

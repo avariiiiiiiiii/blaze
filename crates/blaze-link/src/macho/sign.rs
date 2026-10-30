@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+use blaze_ids::radix;
 use rayon::prelude::*;
 
 use super::sha256;
@@ -50,7 +51,7 @@ impl<'a> View<'a> {
     pub(super) fn new(len: u64, mut parts: Vec<(u64, &'a [u8])>) -> Result<View<'a>, String> {
         parts.retain(|it| !it.1.is_empty());
         if !parts.is_sorted_by_key(|it| it.0) {
-            parts.sort_unstable_by_key(|it| it.0);
+            radix::sort_copy_by_key(&mut parts, |it| it.0);
         }
         let mut end = 0;
         for &(at, bytes) in &parts {

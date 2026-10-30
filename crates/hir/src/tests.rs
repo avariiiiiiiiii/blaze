@@ -416,6 +416,59 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
     });
 }
 
+#[test]
+fn a_goal_reused_from_another_query_reruns_it_when_what_the_goal_read_changes() {
+    let (mut db, files) = TestDB::with_many_files(
+        r#"
+//- minicore: sized
+//- /main.rs crate:main
+mod imp;
+pub trait Tr {}
+pub trait Other {}
+pub struct A;
+pub struct B<T>(T);
+fn needs<T: Tr>(_: T) {}
+fn first() { needs(B(A)); }
+fn second() { needs(B(A)); }
+fn unrelated() { let x = 1; let _ = x; }
+//- /imp.rs
+use super::*;
+impl Tr for A {}
+impl<T> Tr for B<T> where T: Tr {}
+"#,
+    );
+    let imp = files
+        .iter()
+        .map(|it| it.file_id(&db))
+        .find(|&it| db.file_text(it).text(&db).contains("impl Tr for A"))
+        .unwrap();
+    let [first, second, unrelated] =
+        crate::attach_db(&db, || ["first", "second", "unrelated"].map(|it| function(&db, it)));
+    crate::attach_db(&db, || {
+        // `B<A>: Tr` is solved for `first`, then answered for `second` from the shared cache.
+        for body in [first, second, unrelated] {
+            InferenceResult::of(&db, InferBodyId::DefWithBodyId(body));
+        }
+    });
+
+    // Only the impl's where clause changes: no item, name or body `second` reads directly.
+    db.set_file_text(imp, "use super::*;\nimpl Tr for A {}\nimpl<T> Tr for B<T> where T: Other {}\n");
+
+    crate::attach_db(&db, || {
+        let executed = db.executed(|| {
+            InferenceResult::of(&db, InferBodyId::DefWithBodyId(unrelated));
+        });
+        assert_eq!(count(&executed, "infer_body_query"), 0, "{executed:#?}");
+        // `second` took the goal's reads with its answer, so it reruns as `first` does.
+        for body in [second, first] {
+            let executed = db.executed(|| {
+                InferenceResult::of(&db, InferBodyId::DefWithBodyId(body));
+            });
+            assert_eq!(count(&executed, "infer_body_query"), 1, "{executed:#?}");
+        }
+    });
+}
+
 const BORROWCK: &str = r#"
 //- minicore: sized, copy
 struct S;

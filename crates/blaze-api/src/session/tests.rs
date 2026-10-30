@@ -7,8 +7,8 @@ use blaze_vfs::{Change, ChangeKind, Mode, Op, View, Vfs};
 
 use super::{Daemon, Session};
 use crate::{
-    ApiError, Arrived, Diagnostic, Level, Reach, Reply, Request, RequestRef, Response, Status,
-    Targets, TestOutcome, TestResult, Ub, ViewRef,
+    ApiError, Arrived, Diagnostic, Edit, Edited, EditedItem, How, Level, Reach, Reply, Request,
+    RequestRef, Response, Status, Target, Targets, TestOutcome, TestResult, Ub, ViewRef,
     build::{Builder, JobId, Opened, Work},
 };
 
@@ -17,6 +17,8 @@ use crate::{
 struct Fake {
     started: Vec<(JobId, Option<Opened>, Work)>,
     cancelled: Vec<JobId>,
+    speculated: Vec<(JobId, Opened, Work)>,
+    promoted: Vec<JobId>,
 }
 
 impl Builder for Fake {
@@ -26,6 +28,14 @@ impl Builder for Fake {
 
     fn cancel(&mut self, job: JobId) {
         self.cancelled.push(job);
+    }
+
+    fn speculate(&mut self, job: JobId, view: Opened, work: Work) {
+        self.speculated.push((job, view, work));
+    }
+
+    fn promote(&mut self, job: JobId) {
+        self.promoted.push(job);
     }
 }
 
@@ -80,6 +90,14 @@ impl World {
 
     fn last_job(&self) -> JobId {
         self.builder.started.last().expect("a job started").0
+    }
+
+    fn last_speculated(&self) -> JobId {
+        self.builder.speculated.last().expect("a job speculated").0
+    }
+
+    fn tick(&mut self, now_ns: u64) -> Vec<Reply> {
+        self.call(|session, cx, _| session.tick(cx, now_ns))
     }
 
     /// `main` with `files` written, made durable.
@@ -813,5 +831,360 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
         assert!(world.session.pending.is_empty(), "seed {seed}");
         assert!(world.session.live.is_empty(), "seed {seed}");
         assert_eq!(world.session.views(), 0, "seed {seed}");
+        assert!(world.builder.speculated.is_empty(), "seed {seed}: no intent, no speculation");
+        assert!(world.builder.promoted.is_empty(), "seed {seed}");
+        assert_eq!(world.session.deadline(), None, "seed {seed}");
+    }
+}
+
+fn lib_target(item: &str) -> Target {
+    Target { file: "src/lib.rs".to_owned(), item: item.to_owned() }
+}
+
+fn body_edit() -> Vec<Edit> {
+    vec![Edit::ReplaceBody { body: "{ 1 }".to_owned(), item: lib_target("a") }]
+}
+
+/// What the front end reports for [`body_edit`] on `fn a() {}\n`.
+fn body_edited() -> Edited {
+    let op = Op::Edit { at: 7, len: 2, path: "src/lib.rs".to_owned(), bytes: b"{ 1 }".to_vec() };
+    let item = EditedItem {
+        how: How::Body,
+        key: Some(ContentId([3; 32])),
+        file: "src/lib.rs".to_owned(),
+        path: "a".to_owned(),
+    };
+    Edited { ops: vec![op], items: vec![item] }
+}
+
+fn edit_request(base: ContentId) -> Request {
+    Request::Edit { base, head: "main".to_owned(), edits: body_edit() }
+}
+
+#[test]
+fn an_edit_reports_what_it_changed_then_commits_its_ops_once_durable() {
+    let mut world = World::new();
+    let base = world.commit(&[("src/lib.rs", "fn a() {}\n")]);
+    assert_eq!(world.request(1, 1, edit_request(base)), []);
+    let (job, view, work) = world.builder.started[0].clone();
+    assert_eq!(view.map(|it| it.view), Some(View { root: base }));
+    assert_eq!(work, Work::Edit(body_edit()));
+    assert_eq!(world.session.views(), 1);
+
+    let edited = Response::Edited(body_edited());
+    assert_eq!(world.report(job, edited.clone()), [reply(1, 1, edited)]);
+    assert_eq!(world.finish(job, true, None), [], "answered once the commit is durable");
+    assert_eq!(world.session.views(), 0);
+    let root = world.vfs.head("main").unwrap();
+    assert_eq!(world.vfs.apply(base, &body_edited().ops).unwrap(), root, "the reported ops");
+    assert_eq!(
+        world.durable(),
+        [reply(1, 1, Response::Committed { root, rebased: false }), done(1, 1, true)]
+    );
+    let replies = world.request(1, 2, Request::Cancel { id: 1 });
+    assert_eq!(error_at(&replies), Some("request 1".to_owned()), "it is over");
+}
+
+#[test]
+fn an_edit_that_fails_is_cancelled_or_reports_nothing_commits_nothing() {
+    let mut world = World::new();
+    let base = world.commit(&[("src/lib.rs", "fn a() {}\n")]);
+
+    world.request(1, 1, edit_request(base));
+    let error = ApiError::new("no item `a` in src/lib.rs", Some("src/lib.rs".to_owned()));
+    let replies = world.finish(world.last_job(), true, Some(error.clone()));
+    assert_eq!(replies, [reply(1, 1, Response::Error(error)), done(1, 1, false)]);
+
+    world.request(1, 2, edit_request(base));
+    let job = world.last_job();
+    assert_eq!(world.request(1, 3, Request::Cancel { id: 2 }), [done(1, 3, true)]);
+    assert_eq!(world.builder.cancelled, [job]);
+    world.report(job, Response::Edited(body_edited()));
+    assert_eq!(world.finish(job, false, None), [done(1, 2, false)]);
+
+    world.request(1, 4, edit_request(base));
+    let job = world.last_job();
+    let replies = world.finish(job, true, None);
+    assert_eq!(error_at(&replies), Some(format!("job {}", job.0)), "no `Edited` reported");
+    assert_eq!(replies.last(), Some(&done(1, 4, false)));
+
+    world.request(2, 1, edit_request(base));
+    let job = world.last_job();
+    world.report(job, Response::Edited(body_edited()));
+    world.gone(2);
+    assert_eq!(world.finish(job, true, None), [], "a gone connection's edit is not committed");
+
+    assert_eq!(world.vfs.head("main"), Some(base));
+    assert!(world.session.tickets.is_empty());
+    assert_eq!(world.session.views(), 0);
+
+    let replies = world.request(1, 5, edit_request(ContentId([7; 32])));
+    assert_eq!(error_at(&replies), Some("main".to_owned()), "an unknown base names the head");
+}
+
+#[test]
+fn an_intent_is_answered_at_once_and_a_request_on_its_root_takes_it_over() {
+    let mut world = World::new();
+    let root = world.commit(&[("src/lib.rs", "")]);
+    let filter = vec!["parse".to_owned()];
+    let will = Request::WillTest { view: head("main"), filter: filter.clone(), targets: targets(), wait_ms: 100 };
+    assert_eq!(
+        world.request(1, 1, will),
+        [reply(1, 1, Response::Announced { root }), done(1, 1, true)]
+    );
+    assert!(world.builder.started.is_empty(), "nothing started as a request's");
+    let (job, opened, work) = world.builder.speculated[0].clone();
+    assert_eq!((opened.view, work), (View { root }, Work::Ahead { targets: targets(), filter }));
+    assert_eq!(world.session.views(), 1);
+    assert_eq!(world.report(job, diagnostic(Level::Error)), [], "an intent's reports are dropped");
+
+    world.request(2, 1, Request::Test {
+        view: head("main"),
+        targets: targets(),
+        filter: Vec::new(),
+        all: false,
+        args: Vec::new(),
+        ub: None,
+    });
+    assert_eq!(world.builder.promoted, [job], "another connection's request takes it over");
+    world.request(2, 2, Request::Check { view: head("main"), targets: targets() });
+    assert_eq!(world.builder.promoted, [job], "once");
+    world.tick(u64::MAX);
+    world.gone(1);
+    assert!(world.builder.cancelled.is_empty(), "a taken-over intent runs to its end");
+    assert_eq!(world.finish(job, true, None), []);
+    assert_eq!(world.session.views(), 2, "the two requests' views");
+}
+
+#[test]
+fn a_reach_verify_or_tables_takes_no_intent_over() {
+    let mut world = World::new();
+    world.commit(&[("src/lib.rs", "")]);
+    let will = Request::WillTest { view: head("main"), filter: Vec::new(), targets: targets(), wait_ms: 100 };
+    world.request(1, 1, will);
+    world.request(1, 2, Request::Verify { view: head("main"), targets: targets() });
+    world.request(1, 3, Request::Tables { view: head("main") });
+    world.request(1, 4, Request::Reach { from: head("main"), to: head("main"), targets: targets() });
+    assert!(world.builder.promoted.is_empty());
+}
+
+#[test]
+fn a_save_of_the_same_root_takes_it_over_and_one_of_another_cancels_it() {
+    let mut world = World::new();
+    let base = world.commit(&[("src/lib.rs", "")]);
+    let ops = vec![write("src/lib.rs", "fn a() {}")];
+    let save = |ops: &Vec<Op>| Request::WillSave {
+        ops: ops.clone(),
+        head: "main".to_owned(),
+        test: true,
+        targets: targets(),
+        wait_ms: 1000,
+    };
+    let replies = world.request(1, 1, save(&ops));
+    let root = world.vfs.apply(base, &ops).unwrap();
+    assert_eq!(replies, [reply(1, 1, Response::Announced { root }), done(1, 1, true)]);
+    let (first, opened, work) = world.builder.speculated[0].clone();
+    assert_eq!(opened.view, View { root });
+    assert_eq!(
+        work,
+        Work::Test { targets: targets(), filter: Vec::new(), all: false, args: Vec::new(), ub: None }
+    );
+    assert_eq!(world.vfs.head("main"), Some(base), "an intent moves no head");
+
+    world.request(1, 2, Request::Commit { head: "main".to_owned(), base, ops: ops.clone() });
+    assert_eq!(world.builder.promoted, [first]);
+
+    let other = vec![write("src/lib.rs", "fn b() {}")];
+    world.request(1, 3, save(&other));
+    let second = world.last_speculated();
+    assert!(world.builder.cancelled.is_empty(), "the taken-over one is not the newer's to cancel");
+    let mut check = Request::WillSave {
+        ops: other.clone(),
+        head: "elsewhere".to_owned(),
+        test: false,
+        targets: targets(),
+        wait_ms: 1000,
+    };
+    world.request(2, 1, check.clone());
+    let elsewhere = world.last_speculated();
+    assert_eq!(world.builder.speculated[2].2, Work::Check(targets()));
+
+    let moved = world.vfs.head("main").unwrap();
+    let third = vec![write("src/lib.rs", "fn c() {}")];
+    world.request(1, 4, Request::Commit { head: "main".to_owned(), base: moved, ops: third });
+    assert_eq!(world.builder.cancelled, [second], "a commit to main of another root");
+    assert_eq!(world.builder.promoted, [first], "nothing on another head");
+
+    let now = world.vfs.head("main").unwrap();
+    world.call(|session, cx, _| session.head_moved(cx, "elsewhere", now));
+    assert_eq!(world.builder.cancelled, [second, elsewhere], "the watcher's move of a head");
+
+    if let Request::WillSave { ops, .. } = &mut check {
+        ops.push(Op::Delete { path: "never.rs".to_owned() });
+    }
+    let replies = world.request(2, 2, check);
+    assert_eq!(error_at(&replies), Some("never.rs".to_owned()), "a save whose ops don't apply");
+    assert_eq!(world.builder.speculated.len(), 3);
+
+    for job in [first, second, elsewhere] {
+        assert_eq!(world.finish(job, false, None), []);
+    }
+    world.durable();
+    assert_eq!(world.session.views(), 0);
+}
+
+#[test]
+fn an_intent_is_cancelled_by_a_newer_one_its_connections_end_or_its_wait() {
+    let mut world = World::new();
+    world.commit(&[("src/lib.rs", "")]);
+    let will = |wait_ms| Request::WillTest { view: head("main"), filter: Vec::new(), targets: targets(), wait_ms };
+    world.tick(1_000);
+    world.request(1, 1, will(5));
+    let first = world.last_speculated();
+    assert_eq!(world.session.deadline(), Some(5_001_000));
+    world.request(1, 2, will(5));
+    let second = world.last_speculated();
+    assert_eq!(world.builder.cancelled, [first], "a newer intent of the connection");
+    world.request(2, 1, will(9));
+    let third = world.last_speculated();
+    assert_eq!(world.gone(2), []);
+    assert_eq!(world.builder.cancelled, [first, third], "its connection's end");
+
+    world.tick(5_000_999);
+    assert_eq!(world.builder.cancelled, [first, third]);
+    world.tick(10);
+    assert_eq!(world.builder.cancelled, [first, third], "the clock never goes back");
+    world.tick(5_001_000);
+    assert_eq!(world.builder.cancelled, [first, third, second], "its wait");
+    assert_eq!(world.session.deadline(), None);
+
+    world.request(1, 3, Request::Check { view: head("main"), targets: targets() });
+    assert!(world.builder.promoted.is_empty(), "a cancelled intent is not taken over");
+    assert_eq!(world.session.views(), 4, "the intents' views stay until they finish");
+    for job in [first, second, third] {
+        assert_eq!(world.finish(job, false, None), []);
+    }
+    assert_eq!(world.session.views(), 1);
+    world.tick(u64::MAX);
+    assert_eq!(world.builder.cancelled.len(), 3, "each cancelled once");
+}
+
+#[test]
+fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
+    for seed in 1..=200u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xd1b5_4a32_d192_ed03) | 1);
+        let mut world = World::new();
+        let mut seen = Seen::default();
+        let mut conns: Vec<u64> = vec![0, 1, 2];
+        let mut next_conn = 3;
+        let mut ids: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut finished: BTreeSet<JobId> = BTreeSet::new();
+        let mut now = 0u64;
+        let texts = ["x", "y", "z"];
+
+        for _ in 0..200 {
+            let (promoted, cancelled) = (world.builder.promoted.len(), world.builder.cancelled.len());
+            match rng.below(8) {
+                0..=2 if !conns.is_empty() => {
+                    let conn = conns[rng.below(conns.len())];
+                    let next = ids.entry(conn).or_insert(0);
+                    let id = *next;
+                    *next += 1;
+                    let text = texts[rng.below(texts.len())];
+                    let wait_ms = rng.below(40) as u64;
+                    let request = match rng.below(5) {
+                        0 => Request::WillSave {
+                            ops: vec![write("a.rs", text)],
+                            head: "main".to_owned(),
+                            test: rng.below(2) == 0,
+                            targets: targets(),
+                            wait_ms,
+                        },
+                        1 => Request::WillTest {
+                            view: head("main"),
+                            filter: Vec::new(),
+                            targets: targets(),
+                            wait_ms,
+                        },
+                        2 => {
+                            let base = world.vfs.head("main").unwrap_or_else(|| world.vfs.empty());
+                            Request::Commit { head: "main".to_owned(), base, ops: vec![write("a.rs", text)] }
+                        }
+                        _ => Request::Check { view: head("main"), targets: targets() },
+                    };
+                    seen.asked.insert(to(conn, id));
+                    let replies = world.request(conn, id, request);
+                    seen.take(replies);
+                }
+                3 => {
+                    now += rng.below(30) as u64 * 1_000_000;
+                    world.tick(now);
+                    assert!(world.session.deadline().is_none_or(|it| it > now), "seed {seed}");
+                }
+                4 | 5 => {
+                    let mut jobs: Vec<JobId> = world.builder.started.iter().map(|it| it.0).collect();
+                    jobs.extend(world.builder.speculated.iter().map(|it| it.0));
+                    jobs.retain(|it| !finished.contains(it));
+                    if !jobs.is_empty() {
+                        let job = jobs[rng.below(jobs.len())];
+                        finished.insert(job);
+                        let replies = world.finish(job, rng.below(2) == 0, None);
+                        seen.take(replies);
+                    }
+                }
+                6 if !conns.is_empty() && rng.below(3) == 0 => {
+                    let conn = conns.swap_remove(rng.below(conns.len()));
+                    seen.gone.insert(Conn(conn));
+                    let replies = world.gone(conn);
+                    seen.take(replies);
+                    conns.push(next_conn);
+                    next_conn += 1;
+                }
+                _ => {
+                    let replies = world.durable();
+                    seen.take(replies);
+                }
+            }
+            for job in &world.builder.promoted[promoted..] {
+                assert!(!finished.contains(job), "seed {seed}: {job:?} taken over after its end");
+            }
+            for job in &world.builder.cancelled[cancelled..] {
+                assert!(!finished.contains(job), "seed {seed}: {job:?} cancelled after its end");
+            }
+        }
+
+        let promoted: BTreeSet<JobId> = world.builder.promoted.iter().copied().collect();
+        assert_eq!(promoted.len(), world.builder.promoted.len(), "seed {seed}: taken over once");
+        let speculated: BTreeSet<JobId> = world.builder.speculated.iter().map(|it| it.0).collect();
+        let cancelled: BTreeSet<JobId> =
+            world.builder.cancelled.iter().copied().filter(|it| speculated.contains(it)).collect();
+        assert_eq!(
+            cancelled.len(),
+            world.builder.cancelled.iter().filter(|it| speculated.contains(it)).count(),
+            "seed {seed}: an intent is cancelled once"
+        );
+        assert!(promoted.is_subset(&speculated), "seed {seed}: only intents are taken over");
+        assert!(promoted.is_disjoint(&cancelled), "seed {seed}: taken over or cancelled, not both");
+
+        let mut jobs: Vec<JobId> = world.builder.started.iter().map(|it| it.0).collect();
+        jobs.extend(world.builder.speculated.iter().map(|it| it.0));
+        for job in jobs.into_iter().filter(|it| !finished.contains(it)) {
+            let replies = world.finish(job, true, None);
+            seen.take(replies);
+        }
+        let replies = world.durable();
+        seen.take(replies);
+        for asked in &seen.asked {
+            if !seen.gone.contains(&asked.conn) {
+                assert!(seen.done.contains(asked), "seed {seed}: {asked:?} never ended");
+            }
+        }
+        for conn in conns {
+            let replies = world.gone(conn);
+            seen.take(replies);
+        }
+        assert!(world.session.pending.is_empty(), "seed {seed}");
+        assert_eq!(world.session.views(), 0, "seed {seed}");
+        assert_eq!(world.session.deadline(), None, "seed {seed}");
     }
 }

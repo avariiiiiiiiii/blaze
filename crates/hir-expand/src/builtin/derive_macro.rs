@@ -57,7 +57,20 @@ macro_rules! register_builtin {
                 }
             }
 
+            /// The builtin derive `name` names: its declared index and one load.
             fn find_by_name(name: &name::Name) -> Option<Self> {
+                static BY_SYMBOL: intern::KnownNames =
+                    intern::KnownNames::new(&[$( sym::Declared::$trait, )*]);
+                BY_SYMBOL.get(name.symbol()).map(|at| Self::ALL[usize::from(at)])
+            }
+
+            /// Each builtin derive's name, in declaration order.
+            #[cfg(test)]
+            const NAMES: &[intern::Symbol] = &[$( sym::$trait, )*];
+
+            /// [`Self::find_by_name`] as a chain of compares, the reference it is tested by.
+            #[cfg(test)]
+            fn find_by_name_by_compare(name: &name::Name) -> Option<Self> {
                 match name {
                     $( id if id == &sym::$trait => Some(BuiltinDeriveExpander::$trait), )*
                      _ => None,

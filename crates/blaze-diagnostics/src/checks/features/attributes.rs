@@ -23,7 +23,7 @@
 mod cfg;
 mod table;
 
-pub(crate) use cfg::cfg_entry;
+pub(crate) use cfg::{cfg_entry, target_compact, try_gate};
 
 use blaze_items::Fact;
 use hir::{HirFileId, InFile};
@@ -296,7 +296,7 @@ pub(crate) fn used_with_arg(cx: &Cx<'_, '_>, features: &Features, which: &str, a
 
 /// Records on `diag` what a feature gate reads besides its source: the `#![feature]`s of the
 /// crate root.
-fn features_fact(cx: &Cx<'_, '_>, diag: &mut Diag) {
+pub(crate) fn features_fact(cx: &Cx<'_, '_>, diag: &mut Diag) {
     let root = cx.krate.root_module(cx.db);
     diag.fact(Fact::Signature(cx.module_key(root)), "the `#![feature]`s of the crate root");
 }

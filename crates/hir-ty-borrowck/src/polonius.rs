@@ -4,6 +4,7 @@
 //! live, forwards for a covariant one, backwards for a contravariant one and both ways for an
 //! invariant one. A loan is in scope until the first point it is not live at.
 
+use blaze_ids::radix;
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{Variance, inherent::IntoKind};
 
@@ -100,7 +101,7 @@ pub(super) fn live_loans<'db>(
             }
         }
         let edges = localized.open_mut();
-        edges.sort_unstable();
+        radix::sort_copy_by_key(edges, |&(point, sub)| radix::pack_32(point, sub));
         let mut len = 0;
         for at in 0..edges.len() {
             if len == 0 || edges[at] != edges[len - 1] {

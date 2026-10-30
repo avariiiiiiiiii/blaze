@@ -1,8 +1,9 @@
 //! The names of `register_builtins` that are not lints: its groups, the alias `bad_style`, the
-//! renamed, removed and ignored names; and `register_internals`' group.
+//! renamed, removed and ignored names; and `register_internals`' group. `const`s, which the
+//! registry's perfect hash of names is built from.
 
 /// `add_lint_group!`, in order.
-pub(super) static GROUPS: &[(&str, &[&str])] = &[
+pub(super) const GROUPS: &[(&str, &[&str])] = &[
     ("nonstandard_style", &["non_camel_case_types", "non_snake_case", "non_upper_case_globals"]),
     (
         "unused",
@@ -59,10 +60,10 @@ pub(super) static GROUPS: &[(&str, &[&str])] = &[
 ];
 
 /// `register_group_alias`: the alias and the group, a silent one.
-pub(super) static ALIASES: &[(&str, &str)] = &[("bad_style", "nonstandard_style")];
+pub(super) const ALIASES: &[(&str, &str)] = &[("bad_style", "nonstandard_style")];
 
 /// `register_renamed`: the old name and the new.
-pub(super) static RENAMED: &[(&str, &str)] = &[
+pub(super) const RENAMED: &[(&str, &str)] = &[
     ("single_use_lifetime", "single_use_lifetimes"),
     ("elided_lifetime_in_path", "elided_lifetimes_in_paths"),
     ("bare_trait_object", "bare_trait_objects"),
@@ -84,7 +85,7 @@ pub(super) static RENAMED: &[(&str, &str)] = &[
 ];
 
 /// `register_ignored`: rustdoc's lints of old, before they were `rustdoc::`.
-pub(super) static IGNORED: &[&str] = &[
+pub(super) const IGNORED: &[&str] = &[
     "broken_intra_doc_links",
     "private_intra_doc_links",
     "missing_crate_level_docs",
@@ -96,7 +97,7 @@ pub(super) static IGNORED: &[&str] = &[
 ];
 
 /// `register_removed`: the name and why.
-pub(super) static REMOVED: &[(&str, &str)] = &[
+pub(super) const REMOVED: &[(&str, &str)] = &[
     ("intra_doc_link_resolution_failure", "use `rustdoc::broken_intra_doc_links` instead"),
     ("rustdoc", "use `rustdoc::all` instead"),
     ("unknown_features", "replaced by an error"),

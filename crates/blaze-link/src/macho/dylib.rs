@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use blaze_codegen::Arch;
+use blaze_ids::radix;
 use object::Endianness;
 use object::macho;
 use object::read::macho::{MachHeader as _, Nlist as _, Section as _, Segment as _, SymbolTable};
@@ -210,7 +211,7 @@ struct Sections<'a> {
 impl<'a> Sections<'a> {
     fn new(all: &'a [Section]) -> Sections<'a> {
         let mut sorted: Vec<Section> = all.iter().copied().filter(|it| it.size != 0).collect();
-        sorted.sort_by_key(|it| it.addr);
+        radix::sort_copy_by_key(&mut sorted, |it| it.addr);
         let disjoint = sorted.windows(2).all(|it| it[0].addr.checked_add(it[0].size).is_some_and(|end| end <= it[1].addr));
         Sections { all, sorted: disjoint.then_some(sorted) }
     }

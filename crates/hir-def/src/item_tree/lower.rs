@@ -6,6 +6,7 @@ use std::{
 };
 
 use base_db::{Crate, FxIndexSet, SourceDatabase};
+use blaze_ids::radix;
 use cfg::{CfgExpr, CfgOptions};
 use hir_expand::{
     HirFileId,
@@ -114,7 +115,7 @@ impl TreeBuilder {
     /// kept.
     fn finish(&mut self) -> ItemTree {
         debug_assert!(self.pending_use_trees.is_empty() && self.ctor_scratch.is_empty());
-        self.attr_owners.sort_unstable_by_key(|owner| owner.owner);
+        radix::sort_copy_by_key(&mut self.attr_owners, |owner| owner.owner.index);
         ItemTree {
             top_level: column(&mut self.pending_items),
             kinds: column(&mut self.kinds),

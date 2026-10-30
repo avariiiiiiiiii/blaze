@@ -707,9 +707,9 @@ pub struct Ran {
 }
 
 impl Wasm {
-    /// The module at `path`, compiled once a process, and its machine code kept beside it and
-    /// in `store` under [`code_key`], which says the host it is for: unlike the module, the
-    /// code is for one kind of host.
+    /// The module at `path`, compiled once a process, and its machine code kept in `store`
+    /// under [`code_key`], which says the host it is for: unlike the module, the code is for
+    /// one kind of host.
     pub fn at(path: &Path, store: Option<&blaze_store::Store>) -> Result<Arc<Wasm>, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let known = Known { digest: keyed::sha256(&bytes), identity: None };
@@ -717,7 +717,7 @@ impl Wasm {
     }
 
     /// As [`Wasm::at`], of a module whose digest is known: its bytes are read only if its
-    /// machine code is not beside it.
+    /// machine code is not in the store.
     fn known(
         path: &Path,
         known: Known,
@@ -748,47 +748,34 @@ impl Wasm {
         let read = std::cell::OnceCell::new();
         let bytes = || module_bytes(path, &digest, given, &read);
         let key = code_key(&digest);
-        let file = code_file(path, &key);
         let stats = std::env::var_os("BLAZE_STATS").is_some();
-        // SAFETY: rests on the file beside the module being what `serialize` wrote for this
-        // key (its name has the key) and nothing else writing that path; its bytes are not
-        // checked against the store's (v2/requests/usercode.md, safety-audit MAY BE UNSOUND
-        // 4), and other bytes would run as machine code. Wasmtime refuses code of another
-        // version, configuration or CPU.
-        let beside = unsafe { Module::deserialize_file(engine(), &file) }.ok();
-        let (module, was_kept) = match beside {
-            // Written beside it by the process that compiled it, which kept it in the store.
+        // Machine code is loaded only from the store, which checks what it gives against its
+        // checksum: a file anyone can write is never run as code.
+        let kept = store.and_then(|it| it.get_lasting(&key)).and_then(|code| {
+            // SAFETY: `code` is what the store keeps under `key`, checked against its checksum
+            // as it was read, and only `serialize` of this module on an engine of
+            // `code_key`'s compatibility hash puts under `key`; Wasmtime refuses code of
+            // another version, configuration or CPU. Other bytes would run as machine code.
+            unsafe { Module::deserialize(engine(), &code) }.ok()
+        });
+        let (module, was_kept) = match kept {
             Some(module) => (module, true),
-            None => match store.and_then(|it| it.get_lasting(&key)).and_then(|it| {
-                // SAFETY: the store gave what it keeps under `key`, checked against its
-                // checksum as it was read, which `serialize` wrote for this key; Wasmtime
-                // refuses code of another version, configuration or CPU; other bytes would
-                // run as machine code.
-                unsafe { Module::deserialize(engine(), &it) }.ok().map(|m| (m, it))
-            }) {
-                Some((module, code)) => {
-                    write_whole(&file, &code);
-                    (module, true)
+            None => {
+                let module = Module::new(engine(), bytes()?).map_err(failed)?;
+                if stats {
+                    eprintln!(
+                        "blaze: Cranelift compiled the proc-macro module {} in {:.1?}",
+                        path.display(),
+                        start.elapsed(),
+                    );
                 }
-                None => {
-                    let module = Module::new(engine(), bytes()?).map_err(failed)?;
-                    if stats {
-                        eprintln!(
-                            "blaze: Cranelift compiled the proc-macro module {} in {:.1?}, none kept as {}",
-                            path.display(),
-                            start.elapsed(),
-                            file.display()
-                        );
-                    }
+                if let Some(store) = store {
                     let code = module.serialize().map_err(failed)?;
-                    write_whole(&file, &code);
-                    if let Some(store) = store {
-                        store.insert_lasting(&key, &code);
-                        store.flush();
-                    }
-                    (module, store.is_some())
+                    store.insert_lasting(&key, &code);
+                    store.flush();
                 }
-            },
+                (module, store.is_some())
+            }
         };
         let mut linker = Linker::new(engine());
         wasi::add(&mut linker).map_err(failed)?;
@@ -1063,15 +1050,6 @@ fn code_key(digest: &[u8; 32]) -> [u8; 32] {
     key.done()
 }
 
-/// The file beside the module at `path` its machine code of `key` is kept in, for a process to
-/// map rather than read.
-fn code_file(path: &Path, key: &[u8; 32]) -> PathBuf {
-    let hex: String = key[..8].iter().map(|it| format!("{it:02x}")).collect();
-    let mut named = path.as_os_str().to_owned();
-    named.push(format!(".{hex}.cwasm"));
-    PathBuf::from(named)
-}
-
 /// Writes `bytes` to `path` whole or not at all: a process that reads it while it is written
 /// sees the old file or none.
 fn write_whole(path: &Path, bytes: &[u8]) {
@@ -1083,12 +1061,12 @@ fn write_whole(path: &Path, bytes: &[u8]) {
 
 /// Readies the module at `path` for the processes that expand with it, in the build that
 /// made it: compiles it with Cranelift (or finds its machine code in `store`), keeps the code
-/// beside it and in `store`, and writes the list of its macros beside it, so that a load
+/// in `store`, and writes the list of its macros beside it, so that a load with the store
 /// compiles nothing and reads the list without running it.
 pub fn prepare(path: &Path, store: Option<&blaze_store::Store>) -> Result<(), String> {
     let start = Instant::now();
     if let Some((known, _)) = listing(path)
-        && code_file(path, &code_key(&known.digest)).is_file()
+        && store.is_some_and(|it| it.has_lasting(&code_key(&known.digest)))
     {
         return Ok(());
     }
@@ -1111,7 +1089,7 @@ pub fn prepare(path: &Path, store: Option<&blaze_store::Store>) -> Result<(), St
 /// expand in this process waits for the compile.
 pub fn prepare_soon(path: &Path, store: Option<&'static blaze_store::Store>) -> Result<(), String> {
     if let Some((known, _)) = listing(path)
-        && code_file(path, &code_key(&known.digest)).is_file()
+        && store.is_some_and(|it| it.has_lasting(&code_key(&known.digest)))
     {
         return Ok(());
     }
@@ -2288,11 +2266,17 @@ mod tests {
         let (known, text) = listing(&path).expect("the list is written before the compile ends");
         assert_eq!(text, list);
         assert_eq!(known.digest, keyed::sha256(&module));
-        // Waits for the compile `prepare_soon` started, which keeps the code beside the module
-        // and in the store, under a key of no path.
+        // Waits for the compile `prepare_soon` started, which keeps the code in the store, under
+        // a key of no path, and nowhere beside the module.
         Wasm::known(&path, known, None, Some(store)).unwrap();
         let key = code_key(&known.digest);
-        assert!(code_file(&path, &key).is_file());
+        assert!(store.has_lasting(&key));
+        let beside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|it| it.unwrap().file_name())
+            .filter(|it| it.to_string_lossy().ends_with(".cwasm"))
+            .collect();
+        assert!(beside.is_empty(), "{beside:?}");
         store.seal();
         assert!(store.get_lasting(&key).is_some());
         // Another write of the module, even of the same bytes, is listed again.

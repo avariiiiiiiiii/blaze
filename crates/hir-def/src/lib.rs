@@ -30,6 +30,7 @@ pub mod dyn_map;
 pub mod item_tree;
 
 pub mod builtin_derive;
+pub mod diagnostic_item;
 pub mod lang_item;
 pub mod unstable_features;
 

@@ -632,6 +632,8 @@ fn where_clause_location(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, alias: &ast::
             let edition = v.edition_at(pred.syntax().text_range().start());
             pretty::where_predicate(&mut snippet, &pred, edition);
         }
+        // rustc's printer writes a break it ends on as nothing.
+        snippet.truncate(snippet.trim_end().len());
         let right = match &after {
             Some(after) => after.syntax().text_range().end(),
             None => ty.syntax().text_range().end(),

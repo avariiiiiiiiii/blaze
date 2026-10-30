@@ -16,6 +16,7 @@
 use std::borrow::Cow;
 
 use blaze_codegen::Arch;
+use blaze_ids::radix;
 
 use crate::LinkError;
 use crate::model::{Bind, Class, Function, Placed, Region};
@@ -87,10 +88,10 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
         compact(placed, dwarf_mode, &fdes)?;
     ends.extend(fdes.iter().map(|it| it.end));
     if !covered.is_sorted_by_key(|it| it.addr) {
-        covered.sort_by_key(|it| it.addr);
+        radix::sort_by_key(&mut covered, |it| it.addr);
     }
     if !ends.is_sorted() {
-        ends.sort_unstable();
+        radix::sort(&mut ends);
     }
     let Rows { rows, lsdas, last } = rows(placed, dwarf_mode, &covered, &fdes, &ends)?;
     let sentinel = offset(base, last, "the end of the last function")?;
@@ -269,7 +270,7 @@ fn compact(placed: &Placed<'_>, dwarf_mode: u32, fdes: &[Fde]) -> Result<Compact
         Cow::Borrowed(placed.binds)
     } else {
         let mut binds = placed.binds.to_vec();
-        binds.sort_by_key(|it| it.addr);
+        radix::sort_by_key(&mut binds, |it| it.addr);
         Cow::Owned(binds)
     };
     let mut covered = Vec::new();
@@ -402,7 +403,7 @@ fn rows(
         Starts::Placed(placed.functions)
     } else {
         let mut starts: Vec<u64> = placed.functions.iter().map(|it| it.addr).collect();
-        starts.sort_unstable();
+        radix::sort(&mut starts);
         Starts::Sorted(starts)
     };
 
@@ -548,7 +549,7 @@ impl Encodings {
             .filter(|it| it.used && it.count > 1)
             .map(|it| (it.count, it.encoding))
             .collect();
-        common.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        radix::sort_copy_by_key(&mut common, |&(count, encoding)| radix::pack_32(!count, encoding));
         common.truncate(COMMON_MAX);
         common
             .into_iter()
@@ -723,7 +724,7 @@ fn fdes(placed: &Placed<'_>) -> Result<Vec<Fde>, LinkError> {
         fdes.push(Fde { addr: start, end, offset: record as u64 });
     }
     if !fdes.is_sorted_by_key(|it| it.addr) {
-        fdes.sort_by_key(|it| it.addr);
+        radix::sort_by_key(&mut fdes, |it| it.addr);
     }
     fdes.dedup_by_key(|it| it.addr);
     Ok(fdes)

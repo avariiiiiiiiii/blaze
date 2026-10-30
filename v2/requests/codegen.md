@@ -719,3 +719,26 @@ The crate's unsafe is LLVM-C/inkwell FFI plus `backend.rs:527`, `mod.rs:8297`/`8
   > done by speed-backend-safety-llvm (2026-10-29).
 - `crates/hir-ty-codegen/fncache/dispatch.rs:59` block: no SAFETY (in the \`while let\` loop). Proposed: `// SAFETY: \`it\`'s module is only used within this call to find the next outer module, and none is stored or returned (\`owners\` returns body ids), so no \`ModuleId\` leaks out of the query, as \`ModuleIdLt::to_static\` requires.`
   > done by `speed-backend-code` (2026-10-29, see `v2/requests/safety.md`): both `dispatch.rs` blocks (57, 59 then; now in `why_not`) carry a SAFETY comment naming `to_static`'s invariant; checked by safety-audit-linkgen, nothing left.
+
+## From requests-nodes (2026-10-29): say the crate graph as one `Event::Nodes` (core-plane.md section 6)
+
+- What: `blaze-protocol` now has `Event::Nodes { first: u32, kinds: Vec<NodeKind>, names: String,
+  name_at: Vec<u32>, deps: Vec<u32>, deps_at: Vec<u32> }`: the nodes `first..first + kinds.len()`,
+  node `i` named `names[name_at[i]..name_at[i + 1]]` (UTF-8 bytes) and waiting for
+  `deps[deps_at[i]..deps_at[i + 1]]`; `name_at` and `deps_at` hold `kinds.len() + 1` offsets from 0 to
+  the end of `names` / `deps`, never going back. Readers check it with
+  `blaze_protocol::events::NodeBatch::new` (or `Event::nodes(&mut Order)`), which refuses a malformed
+  one with `Malformed`. `blaze-ui` and the plane read and say it; `Event::Node` still works.
+- Where: `crates/blaze-engine/src/events.rs`, `graph` (lines 74-110). The ids are already a run
+  (`first + index.len()` in push order) and each node already comes after its deps (the cycle
+  branch says the rest waiting for nothing), so build the columns in place of `nodes: Vec<Event>`:
+  `kinds` with capacity `order.len()`, `name_at`/`deps_at` starting `vec![0]` with capacity
+  `order.len() + 1`; for each node push its kind (`Std` for `STD`, else `Names`), `names.push_str(name)`,
+  `name_at.push(names.len() as u32)`, `deps.extend_from_slice(&on)`, `deps_at.push(deps.len() as u32)`.
+  Then one `say(Event::Nodes { first, kinds, names, name_at, deps, deps_at })` in place of the
+  `for event in nodes { say(event) }` loop, said only when `order` is not empty. The doc comment at
+  line 21 names `Event::Node`: name `Event::Nodes`.
+- Why: cargo.md section 16 and core-plane.md section 6. Each `Event::Node` owns a `String` and a
+  `Vec<u32>` and is a record of its own through `say`: two allocations and one record a crate. One
+  `Event::Nodes` is five allocations and one record for the whole graph, as the plane now says a
+  batch.

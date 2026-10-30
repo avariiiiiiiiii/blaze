@@ -1,78 +1,445 @@
 //! Stuff for handling `#[target_feature]` (needed for unsafe check).
+//!
+//! Every name of rustc's per-arch tables below is a [`TargetFeature`], a `u16` index into
+//! [`NAMES`]; a set of them is a [`TargetFeatureSet`], one bit each. Name bytes find their
+//! feature by a perfect hash built by `const fn`, and what each feature implies, transitively,
+//! is a `const`-built bitset per feature. Nothing is interned, hashed or allocated to ask whether
+//! a feature is enabled.
 
-use std::sync::LazyLock;
-use std::{borrow::Cow, ops::Deref};
+use std::fmt;
 
+use base_db::Crate;
 use hir_def::FunctionId;
 use hir_def::attrs::AttrFlags;
 use intern::Symbol;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::db::HirDatabase;
 
-#[derive(Debug, Default, Clone)]
+#[cfg(test)]
+mod tests;
+
+/// One name of rustc's target feature tables (of every arch: `aes` of Arm, AArch64 and x86 is
+/// one feature): its index in [`NAMES`], so features order as their names' bytes do.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TargetFeature(u16);
+
+impl TargetFeature {
+    /// The number of target features.
+    pub const COUNT: usize = COUNT;
+
+    pub const AVX512BF16: Self = Self::named("avx512bf16");
+    pub const AVX512F: Self = Self::named("avx512f");
+    pub const AVX512FP16: Self = Self::named("avx512fp16");
+    pub const AVX512VL: Self = Self::named("avx512vl");
+    pub const AVXNECONVERT: Self = Self::named("avxneconvert");
+    pub const AVXVNNI: Self = Self::named("avxvnni");
+    pub const F16C: Self = Self::named("f16c");
+    pub const FMA: Self = Self::named("fma");
+    pub const FMA4: Self = Self::named("fma4");
+    pub const FP16: Self = Self::named("fp16");
+    pub const OUTLINE_ATOMICS: Self = Self::named("outline-atomics");
+    pub const RELAXED_SIMD: Self = Self::named("relaxed-simd");
+    pub const SIMD128: Self = Self::named("simd128");
+
+    /// The feature named `name`, if a table has it: one hash of its bytes, two loads and one
+    /// compare.
+    #[inline]
+    pub fn from_name(name: &str) -> Option<Self> {
+        BY_NAME_TABLE.get(name).map(|at| Self(at as u16))
+    }
+
+    /// The feature named `name`, in a `const`: a name no table has fails to compile.
+    pub const fn named(name: &str) -> Self {
+        match BY_NAME.index_const(name.as_bytes()) {
+            Some(at) => Self(at as u16),
+            None => panic!("not a target feature of rustc's tables"),
+        }
+    }
+
+    #[inline]
+    pub fn name(self) -> &'static str {
+        NAMES[self.index()]
+    }
+
+    #[inline]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    /// The feature and every feature it implies, transitively.
+    #[inline]
+    pub fn implied(self) -> &'static TargetFeatureSet {
+        &IMPLIED[self.index()]
+    }
+}
+
+impl fmt::Debug for TargetFeature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A set of target features, one bit each: 72 bytes, a test is one load and a shift.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct TargetFeatureSet([u64; WORDS]);
+
+const _: () = assert!(size_of::<TargetFeatureSet>() == 72);
+
+impl TargetFeatureSet {
+    pub const EMPTY: Self = Self([0; WORDS]);
+
+    pub const fn of(features: &[TargetFeature]) -> Self {
+        let mut set = Self::EMPTY;
+        let mut i = 0;
+        while i < features.len() {
+            set = set.with(features[i]);
+            i += 1;
+        }
+        set
+    }
+
+    #[inline]
+    pub const fn with(mut self, feature: TargetFeature) -> Self {
+        self.0[feature.index() / 64] |= 1 << (feature.index() % 64);
+        self
+    }
+
+    #[inline]
+    pub fn insert(&mut self, feature: TargetFeature) {
+        self.0[feature.index() / 64] |= 1 << (feature.index() % 64);
+    }
+
+    #[inline]
+    pub const fn contains(&self, feature: TargetFeature) -> bool {
+        (self.0[feature.index() / 64] >> (feature.index() % 64)) & 1 != 0
+    }
+
+    #[inline]
+    pub const fn union(&self, other: &Self) -> Self {
+        let mut out = *self;
+        let mut i = 0;
+        while i < WORDS {
+            out.0[i] |= other.0[i];
+            i += 1;
+        }
+        out
+    }
+
+    /// Whether every feature of `other` is in `self`.
+    #[inline]
+    pub fn is_superset(&self, other: &Self) -> bool {
+        self.0.iter().zip(&other.0).all(|(mine, theirs)| theirs & !mine == 0)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|&word| word == 0)
+    }
+
+    /// The set and every feature its features imply, transitively.
+    pub fn implied(&self) -> Self {
+        self.iter().fold(*self, |out, feature| out.union(feature.implied()))
+    }
+
+    /// The features, in the order of their names' bytes.
+    pub fn iter(&self) -> impl Iterator<Item = TargetFeature> + '_ {
+        self.0.iter().enumerate().flat_map(|(at, &word)| {
+            let mut rest = word;
+            std::iter::from_fn(move || {
+                if rest == 0 {
+                    return None;
+                }
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                Some(TargetFeature((at * 64) as u16 + bit as u16))
+            })
+        })
+    }
+
+    /// The names of the features, sorted by their bytes.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.iter().map(TargetFeature::name)
+    }
+
+    const fn same(&self, other: &Self) -> bool {
+        let mut i = 0;
+        while i < WORDS {
+            if self.0[i] != other.0[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+impl FromIterator<TargetFeature> for TargetFeatureSet {
+    fn from_iter<I: IntoIterator<Item = TargetFeature>>(iter: I) -> Self {
+        let mut set = Self::EMPTY;
+        iter.into_iter().for_each(|feature| set.insert(feature));
+        set
+    }
+}
+
+impl fmt::Debug for TargetFeatureSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.names()).finish()
+    }
+}
+
+/// The target features of a function: those of rustc's tables as bits, and any other name
+/// `#[target_feature(enable = "…")]` gives (which implies nothing) as its symbol.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TargetFeatures<'db> {
-    pub(crate) enabled: Cow<'db, FxHashSet<Symbol>>,
+    known: TargetFeatureSet,
+    /// Sorted by bytes; almost always empty.
+    unknown: &'db [Symbol],
 }
 
 impl<'db> TargetFeatures<'db> {
     pub fn from_fn(db: &'db dyn HirDatabase, owner: FunctionId) -> Self {
-        let mut result = TargetFeatures::from_fn_no_implications(db, owner);
-        result.expand_implications();
-        result
+        let declared = TargetFeatures::from_fn_no_implications(db, owner);
+        Self { known: declared.known.implied(), ..declared }
     }
 
-    /// Whether `feature` is enabled, by the attributes or by a feature they enable.
-    pub fn enables(&self, feature: &str) -> bool {
-        self.enabled.contains(&Symbol::intern(feature))
+    /// The features the attributes name, without those they imply.
+    pub fn from_fn_no_implications(db: &'db dyn HirDatabase, owner: FunctionId) -> Self {
+        if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_TARGET_FEATURE) {
+            return Self::default();
+        }
+        Self::of(declared_target_features(db, owner))
     }
 
-    fn expand_implications(&mut self) {
-        let all_implications = LazyLock::force(&TARGET_FEATURE_IMPLICATIONS);
-        let enabled = self.enabled.to_mut();
-        let mut queue = enabled.iter().cloned().collect::<Vec<_>>();
-        while let Some(feature) = queue.pop() {
-            if let Some(implications) = all_implications.get(&feature) {
-                for implication in implications {
-                    if enabled.insert(implication.clone()) {
-                        queue.push(implication.clone());
-                    }
-                }
-            }
+    fn of(declared: &'db Declared) -> Self {
+        Self { known: declared.known, unknown: &declared.unknown }
+    }
+
+    /// Whether `feature` is enabled, by the attributes or (for [`Self::from_fn`]) by a feature
+    /// they enable.
+    #[inline]
+    pub fn enables(&self, feature: TargetFeature) -> bool {
+        self.known.contains(feature)
+    }
+
+    /// [`Self::enables`] of a feature by name, which may be one no table has.
+    pub fn enables_name(&self, name: &str) -> bool {
+        match TargetFeature::from_name(name) {
+            Some(feature) => self.known.contains(feature),
+            None => self.unknown.iter().any(|it| it.as_str() == name),
         }
     }
 
-    /// Retrieves the target features from the attributes, and does not expand the target features implied by them.
-    pub(crate) fn from_fn_no_implications(db: &'db dyn HirDatabase, owner: FunctionId) -> Self {
-        let enabled = AttrFlags::target_features(db, owner);
-        Self { enabled: Cow::Borrowed(enabled) }
+    /// Whether every feature of `other` is enabled here.
+    pub fn is_superset(&self, other: &TargetFeatures<'_>) -> bool {
+        self.known.is_superset(&other.known)
+            && other.unknown.iter().all(|it| self.unknown.contains(it))
+    }
+
+    /// The features of rustc's tables.
+    #[inline]
+    pub fn known(&self) -> TargetFeatureSet {
+        self.known
     }
 }
 
-// List of the target features each target feature implies.
-// Ideally we'd depend on rustc for this, but rustc_target doesn't compile on stable,
-// and t-compiler prefers for it to stay this way.
+/// What a function's `#[target_feature(enable = "…")]` attributes name.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+struct Declared {
+    known: TargetFeatureSet,
+    unknown: Box<[Symbol]>,
+}
 
-static TARGET_FEATURE_IMPLICATIONS: LazyLock<FxHashMap<Symbol, Box<[Symbol]>>> =
-    LazyLock::new(|| {
-        let mut result = FxHashMap::<Symbol, FxHashSet<Symbol>>::default();
-        for &(feature_str, ref _stability, implications) in
-            TARGET_FEATURE_IMPLICATIONS_RAW.iter().flat_map(Deref::deref)
-        {
-            let feature = Symbol::intern(feature_str);
-            let implications = implications.iter().copied().map(Symbol::intern);
-            // Some target features appear in two archs, e.g. Arm and x86.
-            // Sometimes they contain different implications, e.g. `aes`.
-            // We should probably choose by the active arch, but for now just merge them.
-            result.entry(feature).or_default().extend(implications);
+impl Declared {
+    fn of<'a>(names: impl IntoIterator<Item = &'a Symbol>) -> Self {
+        let mut known = TargetFeatureSet::EMPTY;
+        let mut unknown = Vec::new();
+        for name in names {
+            match TargetFeature::from_name(name.as_str()) {
+                Some(feature) => known.insert(feature),
+                None => unknown.push(name.clone()),
+            }
         }
-        let mut result = result
-            .into_iter()
-            .map(|(feature, implications)| (feature, Box::from_iter(implications)))
-            .collect::<FxHashMap<_, _>>();
-        result.shrink_to_fit();
-        result
-    });
+        unknown.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        unknown.dedup();
+        Self { known, unknown: unknown.into_boxed_slice() }
+    }
+}
+
+#[salsa::tracked(returns(ref))]
+fn declared_target_features(db: &dyn HirDatabase, owner: FunctionId) -> Declared {
+    Declared::of(AttrFlags::target_features(db, owner))
+}
+
+/// The target features of rustc's tables that `krate`'s cfg has (`cfg(target_feature = "…")`),
+/// without what they imply: `CfgOptions::check_atom` of each, once per crate.
+#[salsa::tracked(returns(copy))]
+pub fn crate_target_features(db: &dyn HirDatabase, krate: Crate) -> TargetFeatureSet {
+    let values = krate.cfg_options(db).get_cfg_values("target_feature");
+    values.filter_map(|it| TargetFeature::from_name(it.as_str())).collect()
+}
+
+/// Every name of the tables below, once, sorted by bytes: a feature's index is its place here.
+/// A name of a table missing here fails to compile; one here no table has fails a test.
+#[rustfmt::skip]
+const NAMES: &[&str] = &[
+    "10e60", "2e3", "32s", "3e3r1", "3e3r2", "3e3r3", "3e7", "7e10", "a", "aclass",
+    "acquire-release", "addsubiw", "adx", "aes", "allows-misaligned-mem-access", "altivec", "alu32",
+    "amx-avx512", "amx-bf16", "amx-complex", "amx-fp16", "amx-fp8", "amx-int8", "amx-movrs",
+    "amx-tile", "apxf", "atomics", "atomics-32", "audio", "avx", "avx10.1", "avx10.2", "avx2",
+    "avx512bf16", "avx512bitalg", "avx512bw", "avx512cd", "avx512dq", "avx512f", "avx512fp16",
+    "avx512ifma", "avx512vbmi", "avx512vbmi2", "avx512vl", "avx512vnni", "avx512vp2intersect",
+    "avx512vpopcntdq", "avxifma", "avxneconvert", "avxvnni", "avxvnniint16", "avxvnniint8", "b",
+    "backchain", "bf16", "bmi1", "bmi2", "bool", "break", "bti", "bulk-memory", "c", "cache",
+    "clflushopt", "cmpxchg16b", "concurrent-functions", "coprocessor", "crc", "cssc", "d", "d32",
+    "debug", "deflate-conversion", "dit", "div32", "doloop", "dotprod", "dpb", "dpb2", "dsp",
+    "dsp1e2", "dspe60", "e", "e1", "e2", "ecv", "edsp", "eijmpcall", "elpm", "elpmx", "elrw",
+    "enhanced-sort", "ermsb", "exception", "exception-handling", "extended-const", "extendedl32r",
+    "f", "f16c", "f32mm", "f64mm", "faminmax", "fcma", "fdivdu", "fhm", "flagm", "flagm2",
+    "float1e2", "float1e3", "float3e4", "float7e60", "floate1", "fma", "fma4", "forced-atomics",
+    "fp", "fp-armv8", "fp16", "fp64", "fp8", "fp8dot2", "fp8dot4", "fp8fma", "fpregs", "fpuv2_df",
+    "fpuv2_sf", "fpuv3_df", "fpuv3_hf", "fpuv3_hi", "fpuv3_sf", "frecipe", "frintts", "fxsr", "gc",
+    "gfni", "guarded-storage", "hard-float", "hard-float-abi", "hard-tp", "hbc", "high-registers",
+    "high-word", "highpriinterrupts", "hvx", "hvx-ieee-fp", "hvx-length128b", "hvx-length64b",
+    "hvx-qfloat", "hvxv60", "hvxv62", "hvxv65", "hvxv66", "hvxv67", "hvxv68", "hvxv69", "hvxv71",
+    "hvxv73", "hvxv75", "hvxv79", "hwdiv", "i8mm", "ijmpcall", "interrupt", "isa-68000",
+    "isa-68010", "isa-68020", "isa-68030", "isa-68040", "isa-68060", "isa-68881", "isa-68882",
+    "jmpcall", "jsconv", "kl", "lahfsahf", "lam-bh", "lamcas", "lasx", "lbt", "ld-seq-sa",
+    "leoncasa", "loop", "lor", "lowbytefirst", "lpm", "lpmx", "lse", "lse128", "lse2", "lsx", "lut",
+    "lvz", "lzcnt", "m", "mac16", "mclass", "message-security-assist-extension12",
+    "message-security-assist-extension3", "message-security-assist-extension4",
+    "message-security-assist-extension5", "message-security-assist-extension8",
+    "message-security-assist-extension9", "miscellaneous-extensions-2",
+    "miscellaneous-extensions-3", "miscellaneous-extensions-4", "miscsr", "mops", "movbe",
+    "movdir64b", "movdiri", "movrs", "movw", "mp", "mp1e2", "msa", "msync", "mte", "mul", "mul32",
+    "mul32high", "multivalue", "mutable-globals", "mve", "mve.fp", "neon", "nnp-assist",
+    "nontrapping-fptoint", "nsa", "nvic", "outline-atomics", "paca", "pacg", "pan",
+    "partword-atomics", "pauth-lr", "pclmulqdq", "pmuv3", "popcnt", "power10-vector",
+    "power8-altivec", "power8-crypto", "power8-vector", "power9-altivec", "power9-vector", "prfchw",
+    "prid", "ptx70", "ptx71", "ptx72", "ptx73", "ptx74", "ptx75", "ptx76", "ptx77", "ptx78",
+    "ptx80", "ptx81", "ptx82", "ptx83", "ptx84", "ptx85", "ptx86", "ptx87", "quadword-atomics",
+    "rand", "ras", "rclass", "rcpc", "rcpc2", "rcpc3", "rdm", "rdrand", "rdseed", "reference-types",
+    "regprotect", "relax", "relaxed-simd", "reserve-x18", "retpoline-external-thunk",
+    "retpoline-indirect-branches", "retpoline-indirect-calls", "rmw", "rtm", "rva23u64", "rvector",
+    "s32c1i", "sb", "scq", "sext", "sha", "sha2", "sha3", "sha512", "sign-ext", "simd128", "sm3",
+    "sm4", "sm_100", "sm_100a", "sm_101", "sm_101a", "sm_120", "sm_120a", "sm_70", "sm_72", "sm_75",
+    "sm_80", "sm_86", "sm_87", "sm_89", "sm_90", "sm_90a", "sme", "sme-b16b16", "sme-f16f16",
+    "sme-f64f64", "sme-f8f16", "sme-f8f32", "sme-fa64", "sme-i16i64", "sme-lutv2", "sme2", "sme2p1",
+    "soft-float", "spe", "spm", "spmx", "sram", "ssbs", "sse", "sse2", "sse3", "sse4.1", "sse4.2",
+    "sse4a", "ssse3", "ssve-fp8dot2", "ssve-fp8dot4", "ssve-fp8fma", "supm", "sve", "sve-b16b16",
+    "sve2", "sve2-aes", "sve2-bitperm", "sve2-sha3", "sve2-sm4", "sve2p1", "tail-call", "tbm",
+    "threadptr", "thumb-mode", "thumb2", "tinyencoding", "tme", "transactional-execution", "trust",
+    "trustzone", "ual", "unaligned-scalar-mem", "unaligned-vector-mem", "v", "v5te", "v6", "v60",
+    "v62", "v65", "v66", "v67", "v68", "v69", "v6k", "v6m", "v6t2", "v7", "v71", "v73", "v75",
+    "v79", "v8", "v8.1a", "v8.1m.main", "v8.2a", "v8.3a", "v8.4a", "v8.5a", "v8.6a", "v8.7a",
+    "v8.8a", "v8.9a", "v8m", "v8m.main", "v8plus", "v9", "v9.1a", "v9.2a", "v9.3a", "v9.4a",
+    "v9.5a", "v9a", "vaes", "vdsp2e60f", "vdspv1", "vdspv2", "vector", "vector-enhancements-1",
+    "vector-enhancements-2", "vector-enhancements-3", "vector-packed-decimal",
+    "vector-packed-decimal-enhancement", "vector-packed-decimal-enhancement-2",
+    "vector-packed-decimal-enhancement-3", "vfp2", "vfp2sp", "vfp3", "vfp4", "vh", "virt",
+    "virtualization", "vpclmulqdq", "vsx", "wfxt", "wide-arithmetic", "widekl", "windowed", "x87",
+    "xop", "xsave", "xsavec", "xsaveopt", "xsaves", "za128rs", "za64rs", "zaamo", "zabha", "zacas",
+    "zalrsc", "zama16b", "zawrs", "zba", "zbb", "zbc", "zbkb", "zbkc", "zbkx", "zbs", "zca", "zcb",
+    "zcmop", "zdinx", "zfa", "zfbfmin", "zfh", "zfhmin", "zfinx", "zhinx", "zhinxmin", "zic64b",
+    "zicbom", "zicbop", "zicboz", "ziccamoa", "ziccif", "zicclsm", "ziccrse", "zicntr", "zicond",
+    "zicsr", "zifencei", "zihintntl", "zihintpause", "zihpm", "zimop", "zk", "zkn", "zknd", "zkne",
+    "zkne_or_zknd", "zknh", "zkr", "zks", "zksed", "zksh", "zkt", "zmmul", "zreg", "ztso", "zvbb",
+    "zvbc", "zve32f", "zve32x", "zve64d", "zve64f", "zve64x", "zvfbfmin", "zvfbfwma", "zvfh",
+    "zvfhmin", "zvkb", "zvkg", "zvkn", "zvknc", "zvkned", "zvkng", "zvknha", "zvknhb", "zvks",
+    "zvksc", "zvksed", "zvksg", "zvksh", "zvkt", "zvl1024b", "zvl128b", "zvl16384b", "zvl2048b",
+    "zvl256b", "zvl32768b", "zvl32b", "zvl4096b", "zvl512b", "zvl64b", "zvl65536b", "zvl8192b",
+];
+
+const COUNT: usize = NAMES.len();
+const WORDS: usize = COUNT.div_ceil(64);
+
+const _: () = assert!(COUNT <= u16::MAX as usize);
+
+type ByName = blaze_phf::Phf<{ blaze_phf::slots(COUNT) }, { blaze_phf::buckets(COUNT) }>;
+/// For building the tables below in `const`; run time reads [`BY_NAME_TABLE`].
+const BY_NAME: ByName = ByName::new(NAMES);
+static BY_NAME_TABLE: ByName = BY_NAME;
+
+/// The index of each feature of every table and of each it implies, all of `NAMES`.
+const _: () = {
+    let mut arch = 0;
+    while arch < TARGET_FEATURE_IMPLICATIONS_RAW.len() {
+        let table = TARGET_FEATURE_IMPLICATIONS_RAW[arch];
+        let mut i = 0;
+        while i < table.len() {
+            TargetFeature::named(table[i].0);
+            i += 1;
+        }
+        arch += 1;
+    }
+};
+
+const EDGE_COUNT: usize = {
+    let mut count = 0;
+    let mut arch = 0;
+    while arch < TARGET_FEATURE_IMPLICATIONS_RAW.len() {
+        let table = TARGET_FEATURE_IMPLICATIONS_RAW[arch];
+        let mut i = 0;
+        while i < table.len() {
+            count += table[i].2.len();
+            i += 1;
+        }
+        arch += 1;
+    }
+    count
+};
+
+/// Each implication of every table, a feature and one it implies directly. Some features are in
+/// two archs' tables with different implications (`aes`); this merges them, as rustc would for
+/// neither, since the arch is not known here.
+const EDGES: [[u16; 2]; EDGE_COUNT] = {
+    let mut edges = [[0; 2]; EDGE_COUNT];
+    let mut at = 0;
+    let mut arch = 0;
+    while arch < TARGET_FEATURE_IMPLICATIONS_RAW.len() {
+        let table = TARGET_FEATURE_IMPLICATIONS_RAW[arch];
+        let mut i = 0;
+        while i < table.len() {
+            let from = TargetFeature::named(table[i].0).0;
+            let implied = table[i].2;
+            let mut j = 0;
+            while j < implied.len() {
+                edges[at] = [from, TargetFeature::named(implied[j]).0];
+                at += 1;
+                j += 1;
+            }
+            i += 1;
+        }
+        arch += 1;
+    }
+    edges
+};
+
+/// Each feature and every feature it implies, transitively: rows made the union of the rows
+/// they imply until none grows, which handles a cycle (`e2` implies itself). 72 bytes a feature.
+static IMPLIED: [TargetFeatureSet; COUNT] = {
+    let mut rows = [TargetFeatureSet::EMPTY; COUNT];
+    let mut f = 0;
+    while f < COUNT {
+        rows[f] = rows[f].with(TargetFeature(f as u16));
+        f += 1;
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut e = 0;
+        while e < EDGE_COUNT {
+            let [from, to] = EDGES[e];
+            let (from, to) = (from as usize, to as usize);
+            let merged = rows[from].union(&rows[to]);
+            if !merged.same(&rows[from]) {
+                rows[from] = merged;
+                changed = true;
+            }
+            e += 1;
+        }
+    }
+    rows
+};
 
 #[expect(dead_code, reason = "stubs for rustc_target")]
 enum Stability {
@@ -140,7 +507,7 @@ mod sym {
 
 // The following code is copied verbatim from compiler/rustc_target/src/target_features.rs.
 
-static ARM_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
+const ARM_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-start
     ("aclass", Unstable(sym::arm_target_feature), &[]),
     ("acquire-release", Unstable(sym::arm_target_feature), &[]),
@@ -198,7 +565,7 @@ static ARM_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-end
 ];
 
-static AARCH64_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
+const AARCH64_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-start
     // FEAT_AES & FEAT_PMULL
     ("aes", Stable, &["neon"]),
@@ -403,7 +770,7 @@ static AARCH64_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-end
 ];
 
-static X86_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
+const X86_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-start
     ("adx", Stable, &[]),
     ("aes", Stable, &["sse2"]),
@@ -575,7 +942,7 @@ const HEXAGON_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-end
 ];
 
-static POWERPC_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
+const POWERPC_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // If you are thinking of adding "efpu2" here, please double-check that it really does not
     // affect the ABI.
     // tidy-alphabetical-start
@@ -656,7 +1023,7 @@ const NVPTX_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-end
 ];
 
-static RISCV_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
+const RISCV_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-start
     ("a", Stable, &["zaamo", "zalrsc"]),
     ("b", Stable, &["zba", "zbb", "zbs"]),
@@ -823,7 +1190,7 @@ static RISCV_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-end
 ];
 
-static WASM_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
+const WASM_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-start
     ("atomics", Unstable(sym::wasm_target_feature), &[]),
     ("bulk-memory", Stable, &[]),
@@ -847,7 +1214,7 @@ const BPF_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     ("allows-misaligned-mem-access", Unstable(sym::bpf_target_feature), &[]),
 ];
 
-static CSKY_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
+const CSKY_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-start
     ("2e3", Unstable(sym::csky_target_feature), &["e2"]),
     ("3e3r1", Unstable(sym::csky_target_feature), &[]),
@@ -894,7 +1261,7 @@ static CSKY_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-end
 ];
 
-static LOONGARCH_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
+const LOONGARCH_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-start
     ("32s", Unstable(sym::loongarch_target_feature), &[]),
     ("d", Stable, &["f"]),
@@ -964,7 +1331,7 @@ const SPARC_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-end
 ];
 
-static M68K_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
+const M68K_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-start
     ("isa-68000", Unstable(sym::m68k_target_feature), &[]),
     ("isa-68010", Unstable(sym::m68k_target_feature), &["isa-68000"]),
@@ -978,7 +1345,7 @@ static M68K_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-end
 ];
 
-static AVR_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
+const AVR_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     // tidy-alphabetical-start
     ("addsubiw", Unstable(sym::avr_target_feature), &[]),
     ("break", Unstable(sym::avr_target_feature), &[]),
@@ -1038,7 +1405,7 @@ const XTENSA_FEATURES: &[(&str, Stability, ImpliedFeatures)] = &[
     ("miscsr", Unstable(sym::xtensa_target_feature), &[]),
 ];
 
-static TARGET_FEATURE_IMPLICATIONS_RAW: &[&[(&str, Stability, ImpliedFeatures)]] = &[
+const TARGET_FEATURE_IMPLICATIONS_RAW: &[&[(&str, Stability, ImpliedFeatures)]] = &[
     ARM_FEATURES,
     AARCH64_FEATURES,
     X86_FEATURES,

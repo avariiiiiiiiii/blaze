@@ -12,6 +12,7 @@
 //! there is no copy of a static in a patch that the next refers to.
 
 use anyhow::{Context, bail, ensure};
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 
 /// Whether `name`, of a symbol of a patch, is of a static a patch defines anew. A Mach-O
@@ -115,7 +116,7 @@ impl Lasting {
         pointers: &[u64],
     ) -> anyhow::Result<Vec<blaze_live::format::Write>> {
         let mut sorted = pointers.to_vec();
-        sorted.sort_unstable();
+        radix::sort(&mut sorted);
         let mut values = Vec::new();
         for it in own {
             let Some(kept) = self.at.get(&it.name).filter(|it| it.in_room) else { continue };

@@ -37,6 +37,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use blaze_ids::radix;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use syntax::{
     AstNode, AstPtr, FlatTree, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange,
@@ -805,10 +806,10 @@ impl Bodies {
     /// The bodies `placed`, elements of `tree`.
     fn new(tree: &Arc<FlatTree>, mut placed: Vec<Placed>) -> Bodies {
         // Bodies don't overlap, so no two begin at one place.
-        placed.sort_unstable_by_key(|it| it.range.start());
+        radix::sort_by_key(&mut placed, |it| u32::from(it.range.start()));
         let mut by_slot: Box<[[u32; 2]]> =
             placed.iter().zip(0u32..).map(|(it, body)| [it.first_slot, body]).collect();
-        by_slot.sort_unstable();
+        radix::sort_copy_by_key(&mut by_slot, |&[slot, body]| radix::pack_32(slot, body));
         let row = |it: &Placed| -> Row {
             [
                 u32::from(it.range.end()),
@@ -1126,13 +1127,15 @@ fn body_ids(tree: &FlatTree, root: u32, first_slot: u32, slots: u32) -> Box<[u32
         Some(())
     });
     let n = words.len() / 4;
-    words.as_chunks_mut::<4>().0.sort_unstable();
+    radix::sort_copy_by_key(words.as_chunks_mut::<4>().0, |&[a, b, c, d]| {
+        (u128::from(a) << 96) | (u128::from(b) << 64) | (u128::from(c) << 32) | u128::from(d)
+    });
     words.reserve_exact(2 * n);
     for number in 0..n {
         let id = words[4 * number + ID];
         words.extend_from_slice(&[id, number as u32]);
     }
-    words[4 * n..].as_chunks_mut::<2>().0.sort_unstable();
+    radix::sort_copy_by_key(words[4 * n..].as_chunks_mut::<2>().0, |&[a, b]| radix::pack_32(a, b));
     words.into_boxed_slice()
 }
 

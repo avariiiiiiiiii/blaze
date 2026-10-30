@@ -5,10 +5,11 @@ date: 2026-10-29
 ---
 # speed-salsa: vendor/salsa against the state of the art
 
-`vendor/salsa*` was not free when this was written: `db-salsa` was running its second brief
-(`db-salsa-sync.md`, the `Sync` database with claims by task). So nothing here is applied
-yet. The exact changes are in `v2/requests/db-salsa.md` under "From speed-salsa". Costs
-below come from reading the code, not from measurements: nothing was run.
+The changes were filed in `v2/requests/db-salsa.md` under "From speed-salsa" while `db-salsa`
+held `vendor/salsa*`, then applied on 10-29: S1, S3 and S4 by speed-salsa, S2 by
+speed-salsa-interned, and S5 (the edges, not yet the 24-byte memo) by speed-salsa. "How salsa
+compares today" is the state before them; "Before and after" is what changed. Costs come from
+reading the code, not from measurements: nothing was built or run.
 
 ## Benchmarks
 
@@ -79,6 +80,42 @@ lock in the common case. All three meet concurrency.md.
 **Tables**: `Table` is a `boxcar::Vec` of 128-slot pages. It is append-only and grows by a
 level, so readers never wait: this meets concurrency.md.
 
+## Before and after (10-29)
+
+| operation | before | after | rustc |
+|---|---|---|---|
+| memo hit | the seven lines above; a function with `lru` takes the LRU `Mutex` and inserts on every hit; a multi-argument function interns its tuple under a shard `Mutex` | the same seven lines, with no lock and no shared write: `lru` marks nothing on a hit (S1) and interning a tuple is a lock-free probe (S2) | 1 to 2 loads |
+| recording a read | FxHash and an `FxIndexSet` probe per read | a read of the same key as the last one is skipped before hashing (S4); the rest as before, in the task's own frame | a push, deduplicated by a scan |
+| edge record (query finishes) | one heap allocation per memo, 8 bytes an edge copied in | per edge, a probe of the task's 1024-entry node cache (L1 on a repeat key, the shared node table's lock-free probe otherwise) and one `Relaxed` store into the task's reserved chunk; one CAS per 256 edges; no allocation; published by the memo's own `Release` store | an `EdgesVec` moved into the graph |
+| deep verify | a claim per memo walked (a shard `Mutex` plus a `hashbrown` insert and remove), then a `dyn Ingredient` call per edge | no claim for a memo that ran no cycle, has no outputs and isn't provisional: an iterative walk, per edge one decode (the node's key: one page load and two column loads) then the hit check; a claim only for a memo that must run | one color load per edge, no lock |
+| memo at rest | 48 boxed + 8 an edge in a second allocation (rounded to its size class) + 8 per sibling function | 48 boxed + 4 an edge in the shared array, no second allocation, + 8 per sibling function; a memo with cycle, tracked-struct, accumulator or fingerprint data has them in one 64-byte box beside its edge range | 1 to 4 bytes an edge, a range per node |
+
+`tests/memory-usage.rs` moves with it: an interned argument's three memos 168 to 144 bytes, a
+tracked function's two 256 to 264 (their tracked-struct lists sit in the 64-byte box), the
+tuple 152 to 156.
+
+**What the edges cost against #734's 0.8 GB.** nushell's 0.8 GB is about 100M edges at 8
+bytes. The edge array holds them in 0.4 GB. Dead ranges of replaced memos stay until the array
+is twice what was live, so between compactions it can reach 0.8 GB of words, but a one-shot
+`check` replaces nothing and stays at 0.4 GB; pages come from zeroed allocations, so the unused
+end of the last page is never resident. Each distinct key read costs the node table 12 bytes of
+key columns plus 7 to 15 bytes of table (4-byte slots in 40-byte groups of seven, filled to three
+quarters before doubling; outgrown tables are freed at each new revision), and each thread 16 KB
+of node cache. At one key per ten edges (10M keys) that is 0.2 to 0.27 GB, so edges and nodes
+together are about 0.6 to 0.67 GB against 0.8 GB, and the per-memo edge allocations' headers and
+size-class rounding, which #734 counts under memos, are gone. Matching rustc's 0.3 GB needs its
+variable width (3 bytes under 16M nodes), which an atomic word array can't express; it would
+come with the frozen, persisted graph, not the live one.
+
+**Not done: the 24-byte memo.** The header is still 40 bytes (`verified_at` 8 and
+`QueryRevisions` 32: changed-at 8, the 13-byte origin, durability, `verified_final`,
+accumulated-inputs and padding), boxed per memo, plus an 8-byte `MemoEntry` pointer per function
+keyed on the struct. data.md's 24 needs changed-at and the flags packed into one `AtomicU64` and
+memos as columns of each function ingredient (rows by slot, no box, no per-sibling pointer). That
+rewrites `table/memo.rs`'s unsafe memo table and every ingredient's use of it, `evict_values`,
+`memory_usage` and memo persistence; it needs a build and the salsa tests run under it, so it
+was not done blind.
+
 ## What is filed (v2/requests/db-salsa.md, "From speed-salsa")
 
 1. **LRU with no write on a hit.** `Lru` keeps only its capacity. At the revision boundary
@@ -132,17 +169,19 @@ cold fingerprints to `Edge::saw`.
 
 ### The pieces
 
-- **Node table** (`src/node.rs`, one per database in `Zalsa`). A `DatabaseKeyIndex` gets a node the
+- **Node table** (`src/graph/nodes.rs`, one per database in `Zalsa`). A `DatabaseKeyIndex` gets a node the
   first time a finished query's edges name it, and keeps it for the life of the database (an edge
   must never come to name another key, so nodes are not reused). Two columns, `id` (`u64`) and
   `ingredient` (`u32`), in pages that grow by doubling and never move. The map from key to node
   is the SwissTable of `crates/intern/src/arena.rs`, sharded at four times the cores: groups of
-  seven slots and a control word of tag bytes on one 128-byte pair of lines, found with no lock
-  and no write; a miss takes the shard's lock to look again and insert. Every task keeps a
+  seven 4-byte node slots and a control word of tag bytes in 40 bytes, found with no lock and no
+  write, a tag match comparing the key through the node's columns; a miss takes the shard's lock
+  to look again and insert. A table fills to three quarters, then doubles; the tables it outgrew
+  are freed at the next new revision. Every task keeps a
   1024-entry direct-mapped cache of key to node, so the keys a task reads again and again (the
   crate graph, a file's text, the def map) cost one cache line in L1, not a probe of the shared
   table.
-- **Edge array** (`src/edges.rs`, one per database in `Zalsa`). `AtomicU32` words in pages that
+- **Edge array** (`src/graph/edges.rs`, one per database in `Zalsa`). `AtomicU32` words in pages that
   double and never move; a range never crosses a page, so a memo's edges are one slice. A task
   reserves 256 words at a time (one CAS on the array's length per 256 edges, never one per edge
   or per memo) and writes its query's edges there when the query finishes (`ActiveQuery` pop):
@@ -156,19 +195,22 @@ cold fingerprints to `Edge::saw`.
   One array for the database rather than one per memo table: rustc's `SerializedDepGraph` keeps
   one edge list for the whole graph; one array means one reservation per task (not one per
   function it ran), and one compaction pass.
-- **Memo header** (`function/memo.rs`, `zalsa_local.rs`): `verified_at`, the packed
-  changed-at and flags word, and a union of the edge span and `Box<Cold>`. The cold box holds
-  what most memos don't have: cycle heads, iteration and convergence, tracked struct IDs,
-  accumulated values, an assigning query (`specify`), and the edge and value fingerprints.
-  `const` assertions hold the header at 24 bytes.
+- **Origin** (`zalsa_local.rs`, applied): the 13-byte packed origin holds a kind tag and, in a
+  union, the edge span, an assigning query's key, or a box of the extra data with the span or
+  key beside it (`WithExtra`). The extra is what most memos don't have: cycle heads, iteration
+  and convergence, tracked struct IDs, accumulated values and the edge fingerprints.
+- **Memo header** (`function/memo.rs`, not done): `verified_at`, the packed changed-at and
+  flags word, and the origin, at 24 bytes; see "Not done: the 24-byte memo".
 - **Deep verify without a claim** (`function/maybe_changed_after.rs`, `fetch.rs`): a memo that
   isn't provisional, took no part in a cycle and has no outputs is verified before any claim is
   taken: its edges are checked in order, each dependency by the same claim-free check, which
   only reads (and stores `verified_at` once a memo is found unchanged, which is idempotent). If
   every edge is unchanged, the memo is marked verified with no claim. Only a memo that must run
   takes a claim, and the claimed path is the existing one, so cycle handling, backdating and
-  provisional memos are untouched. rustc's `try_mark_green` works this way. The recursion is
-  bounded (256 levels); deeper chains continue under claims.
+  provisional memos are untouched. rustc's `try_mark_green` works this way. The walk is
+  iterative (an explicit stack, eight frames inline), so a chain of any depth is verified in one
+  pass with no recursion. `tests/unclaimed_verify.rs` covers a 300-deep chain, backdating, and
+  eight threads verifying one chain at once.
 
 ### Kept
 

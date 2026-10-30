@@ -10,6 +10,9 @@
  *
  * An object is used by one thread at a time, and outlives no target machine or context it was
  * used with: blaze keeps one beside each target machine of a thread, and drops it first.
+ *
+ * LLVMBlazeRunSanitizers runs the sanitizers' instrumentation with the same analysis
+ * managers, as rustc runs it at the end of its pipeline.
  */
 #include <llvm-c/Error.h>
 #include <llvm-c/TargetMachine.h>
@@ -23,7 +26,13 @@
 #include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Target/TargetMachine.h>
+#include <llvm/Transforms/Instrumentation/AddressSanitizer.h>
+#include <llvm/Transforms/Instrumentation/MemorySanitizer.h>
+#include <llvm/Transforms/Instrumentation/SanitizerCoverage.h>
+#include <llvm/Transforms/Instrumentation/ThreadSanitizer.h>
+#include <llvm/Transforms/Utils/Instrumentation.h>
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 
@@ -88,6 +97,92 @@ struct LLVMBlazeOpaquePasses {
   std::unique_ptr<Pipelines> Plain;
 };
 
+/* What LLVMBlazeRunSanitizers instruments for: rustc's -Zsanitizer, -Zsanitizer-recover and
+ * -Zsanitizer-memory-track-origins, and SanitizerCoverage as -Cllvm-args=-sanitizer-coverage-*
+ * sets it. Declared field for field in src/transforms/pass_builder.rs; a 0 is false. */
+struct LLVMBlazeSanitizers {
+  uint8_t Address;
+  uint8_t AddressRecover;
+  uint8_t Thread;
+  uint8_t Memory;
+  uint8_t MemoryRecover;
+  /* -sanitizer-coverage-level: 1 the entry block, 2 every block, 3 and critical edges, 4 and
+   * indirect calls. Any other: no SanitizerCoverage, as LLVM takes it. */
+  uint8_t CoverageLevel;
+  /* The LLVMBlazeCoverage* bits. */
+  uint16_t CoverageFlags;
+  /* 0, 1 or 2. */
+  int32_t MemoryTrackOrigins;
+};
+
+/* SanitizerCoverage's -sanitizer-coverage-* switches, one bit each. The same values are
+ * blaze_codegen::settings::Coverage's. */
+enum : uint16_t {
+  LLVMBlazeCoverageTracePC = 1 << 0,
+  LLVMBlazeCoverageTracePCGuard = 1 << 1,
+  LLVMBlazeCoverageInline8bitCounters = 1 << 2,
+  LLVMBlazeCoverageInlineBoolFlag = 1 << 3,
+  LLVMBlazeCoveragePCTable = 1 << 4,
+  LLVMBlazeCoverageTraceCmp = 1 << 5,
+  LLVMBlazeCoverageTraceDiv = 1 << 6,
+  LLVMBlazeCoverageTraceGep = 1 << 7,
+  LLVMBlazeCoverageTraceLoads = 1 << 8,
+  LLVMBlazeCoverageTraceStores = 1 << 9,
+  LLVMBlazeCoverageNoPrune = 1 << 10,
+  LLVMBlazeCoverageStackDepth = 1 << 11,
+  LLVMBlazeCoverageTracePCEntryExit = 1 << 12,
+  LLVMBlazeCoverageControlFlow = 1 << 13,
+};
+
+namespace {
+
+/* SanitizerCoverage's options as its -sanitizer-coverage-* switches give them
+ * (SanitizerCoverage.cpp, getOptions and OverrideFromCL): here per module rather than per
+ * process, which a build of units with other settings needs. The pass still ORs in the
+ * process's switches, which blaze leaves unset. */
+SanitizerCoverageOptions coverage(const LLVMBlazeSanitizers &Wanted) {
+  SanitizerCoverageOptions Options;
+  switch (Wanted.CoverageLevel) {
+  case 1:
+    Options.CoverageType = SanitizerCoverageOptions::SCK_Function;
+    break;
+  case 2:
+    Options.CoverageType = SanitizerCoverageOptions::SCK_BB;
+    break;
+  case 3:
+    Options.CoverageType = SanitizerCoverageOptions::SCK_Edge;
+    break;
+  case 4:
+    Options.CoverageType = SanitizerCoverageOptions::SCK_Edge;
+    Options.IndirectCalls = true;
+    break;
+  default:
+    break;
+  }
+  uint16_t Flags = Wanted.CoverageFlags;
+  Options.TracePC = Flags & LLVMBlazeCoverageTracePC;
+  Options.TracePCGuard = Flags & LLVMBlazeCoverageTracePCGuard;
+  Options.Inline8bitCounters = Flags & LLVMBlazeCoverageInline8bitCounters;
+  Options.InlineBoolFlag = Flags & LLVMBlazeCoverageInlineBoolFlag;
+  Options.PCTable = Flags & LLVMBlazeCoveragePCTable;
+  Options.TraceCmp = Flags & LLVMBlazeCoverageTraceCmp;
+  Options.TraceDiv = Flags & LLVMBlazeCoverageTraceDiv;
+  Options.TraceGep = Flags & LLVMBlazeCoverageTraceGep;
+  Options.TraceLoads = Flags & LLVMBlazeCoverageTraceLoads;
+  Options.TraceStores = Flags & LLVMBlazeCoverageTraceStores;
+  Options.NoPrune = Flags & LLVMBlazeCoverageNoPrune;
+  Options.StackDepth = Flags & LLVMBlazeCoverageStackDepth;
+  Options.TracePCEntryExit = Flags & LLVMBlazeCoverageTracePCEntryExit;
+  Options.CollectControlFlow = Flags & LLVMBlazeCoverageControlFlow;
+  return Options;
+}
+
+bool covers(const LLVMBlazeSanitizers &Wanted) {
+  return Wanted.CoverageLevel >= 1 && Wanted.CoverageLevel <= 4;
+}
+
+} // namespace
+
 extern "C" {
 
 LLVMBlazeOpaquePasses *LLVMBlazeCreatePasses(LLVMTargetMachineRef Machine) {
@@ -133,6 +228,51 @@ LLVMErrorRef LLVMBlazeRunPasses(LLVMBlazeOpaquePasses *Passes, LLVMModuleRef M,
   }
   Manager->run(Mod, Kept.Modules);
   Kept.forget();
+  return nullptr;
+}
+
+/* Instruments `M` for `Wanted` (not null): SanitizerCoverage, then MemorySanitizer,
+ * ThreadSanitizer and AddressSanitizer, in clang's order (BackendUtil.cpp, addSanitizers), so
+ * that coverage traces none of the sanitizers' own checks; each with the options rustc's
+ * LLVMRustOptimize gives it. Only functions with the attribute `sanitize_address`,
+ * `sanitize_thread` or `sanitize_memory` get that sanitizer's checks. Every module given to
+ * one object is of one context, as for LLVMBlazeRunPasses. */
+LLVMErrorRef LLVMBlazeRunSanitizers(LLVMBlazeOpaquePasses *Passes, LLVMModuleRef M,
+                                    const LLVMBlazeSanitizers *Wanted) {
+  Module &Mod = *unwrap(M);
+  std::unique_ptr<Pipelines> &Slot = Passes->Plain;
+  if (!Slot) {
+    Slot = std::make_unique<Pipelines>(Passes->Machine, false, Mod.getContext());
+  } else if (&Slot->Context != &Mod.getContext()) {
+    return wrap(make_error<StringError>(
+        "blaze: passes kept for one LLVM context were given a module of another",
+        inconvertibleErrorCode()));
+  }
+  ModulePassManager Manager;
+  if (covers(*Wanted)) {
+    Manager.addPass(SanitizerCoveragePass(coverage(*Wanted)));
+  }
+  if (Wanted->Memory) {
+    MemorySanitizerOptions Options(Wanted->MemoryTrackOrigins, Wanted->MemoryRecover != 0,
+                                   /*Kernel=*/false, /*EagerChecks=*/true);
+    Manager.addPass(MemorySanitizerPass(Options));
+  }
+  if (Wanted->Thread) {
+    Manager.addPass(ModuleThreadSanitizerPass());
+    Manager.addPass(createModuleToFunctionPassAdaptor(ThreadSanitizerPass()));
+  }
+  if (Wanted->Address) {
+    AddressSanitizerOptions Options;
+    Options.CompileKernel = false;
+    Options.Recover = Wanted->AddressRecover != 0;
+    Options.UseAfterScope = true;
+    Options.UseAfterReturn = AsanDetectStackUseAfterReturnMode::Runtime;
+    /* Windows has no ODR indicators (https://reviews.llvm.org/D137227), as rustc says. */
+    bool Odr = !Passes->Machine->getTargetTriple().isOSWindows();
+    Manager.addPass(AddressSanitizerPass(Options, /*UseGlobalGC=*/true, Odr));
+  }
+  Manager.run(Mod, Slot->Modules);
+  Slot->forget();
   return nullptr;
 }
 

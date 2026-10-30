@@ -1312,3 +1312,25 @@ For **cargo-std** (`stdlib/`):
   `rustc_version` and `rustc_verbose_version`.
 
 > forwarded to cargo: between its own children (cargo-load, cargo-daemon).
+
+## From requests-nodes (2026-10-29): the plane says a batch as one `Event::Nodes` (core-plane.md section 6)
+
+- What: `blaze-protocol` now has `Event::Nodes { first, kinds, names, name_at, deps, deps_at }`, the
+  nodes `first..first + kinds.len()` each as its `Event::Node` would say it (doc on the variant).
+  `Plane` now says one `Event::Nodes` per `PlaneInput::AddNodes` batch, first among that step's
+  outputs, the batch's columns moved into it, and no `Event::Node` for those nodes; `Add` and
+  `Done { added }` still say an `Event::Node` a node. Read one only through
+  `blaze_protocol::events::NodeBatch::new` / `Event::nodes(&mut Order)`, which refuses a malformed
+  record with `Malformed` (never index the columns yourself); `Order::places()` gives the nodes each
+  after those of the batch it waits for, the order their `Event::Node`s would have come in.
+- Where and what to do:
+  - `crates/blaze-cargo/src/serve/plane.rs:521` (`outputs`): compiles as it is, since it takes only
+    `Event::Moved` and drops every other record, `Event::Node` before and `Event::Nodes` now. Nothing
+    to do unless the daemon is meant to show the plane's graph to watchers: then forward the
+    `Event::Nodes` record (`crate::events::say(record.event)`) before the `Moved` ones, as one record,
+    not expanded into `Event::Node`s; `blaze-ui` reads it.
+  - `crates/blaze-cargo/src/cargo/compile_time.rs:549`: nothing. It forwards what `Machine` says, and
+    `Machine` (`blaze-graph/src/machine.rs`) still says an `Event::Node` a node.
+  - Any `match` on `Event` added in blaze-cargo must take `Event::Nodes`; none is exhaustive today.
+- Why: section 16 here. `AddNodes` took a batch as columns, but the plane still made two allocations
+  a node for its `Event::Node`; now a batch is one record with no copy.

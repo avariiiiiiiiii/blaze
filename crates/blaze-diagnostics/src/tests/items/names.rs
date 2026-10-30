@@ -1,6 +1,6 @@
 //! rustc's UI tests of the names in signatures: types and traits that name nothing (E0425,
 //! E0405) or something else (E0573, E0404), private items (E0603), parameters of an outer item
-//! (E0401) and undeclared lifetimes (E0261).
+//! (E0401), undeclared lifetimes (E0261) and re-exports of private items (E0365).
 
 use crate::tests::{items::ui_core, ui};
 
@@ -252,6 +252,25 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0401`.
 "#;
     assert_eq!(ui("issue-98432.rs", "2015", source), stderr);
+}
+
+#[test]
+fn a_crate_private_module_cannot_be_re_exported() {
+    // tests/ui/error-codes/E0365.rs
+    let source = "mod foo {\n    pub const X: u32 = 1;\n}\n\npub use foo as foo2;\n//~^ ERROR `foo` is only public within the crate, and cannot be re-exported outside [E0365]\n\nfn main() {}\n";
+    let stderr = r#"error[E0365]: `foo` is only public within the crate, and cannot be re-exported outside
+  --> $DIR/E0365.rs:5:9
+   |
+LL | pub use foo as foo2;
+   |         ^^^^^^^^^^^ re-export of crate public `foo`
+   |
+   = note: consider declaring type or module `foo` with `pub`
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0365`.
+"#;
+    assert_eq!(ui("E0365.rs", "2015", source), stderr);
 }
 
 #[test]

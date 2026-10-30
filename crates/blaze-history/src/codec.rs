@@ -10,6 +10,7 @@
 use std::fmt;
 
 use blaze_graph::admission::{self, Estimates, TaskKind};
+use blaze_ids::radix;
 
 use crate::{
     Config, History,
@@ -207,7 +208,7 @@ pub(crate) fn decode(bytes: &[u8], config: &Config) -> Result<History, DecodeErr
         records.push((slot as usize, record));
     }
     let mut stamps: Vec<(u64, usize)> = records.iter().map(|(slot, it)| (it.stamp, *slot)).collect();
-    stamps.sort_unstable();
+    radix::sort_copy_by_key(&mut stamps, |&(stamp, slot)| radix::pack_64(stamp, slot as u64));
     if let Some(pair) = stamps.windows(2).find(|it| it[0].0 == it[1].0) {
         return Err(DecodeError::Unsound { slot: pair[1].1 as u32 });
     }

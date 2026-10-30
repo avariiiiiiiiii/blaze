@@ -1991,6 +1991,10 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
 
     let mut tts = TokenTreeChildren::new(tt).peekable();
 
+    let int = |int: Integer, signed: bool| ReprOptions {
+        int: Some(IntegerType::Fixed(int, signed)),
+        ..Default::default()
+    };
     let mut acc = ReprOptions::default();
     while let Some(tt) = tts.next() {
         let NodeOrToken::Token(ident) = tt else {
@@ -1999,10 +2003,6 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
         if !ident.kind().is_any_identifier() {
             continue;
         }
-        let int = |int, signed| ReprOptions {
-            int: Some(IntegerType::Fixed(int, signed)),
-            ..Default::default()
-        };
         let repr = match ReprWord::of(ident.text().trim_start_matches("r#")) {
             Some(ReprWord::packed) => {
                 let pack = if let Some(NodeOrToken::Node(tt)) = tts.peek() {

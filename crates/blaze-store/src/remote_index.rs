@@ -35,6 +35,7 @@
 
 use std::fmt::Write as _;
 
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 use sha2::{Digest as _, Sha256};
 
@@ -384,13 +385,16 @@ impl Builder {
         for entry in &mut placed {
             *entry = (truncated(entry.0, prefix), place[entry.1 as usize]);
         }
-        placed.sort_unstable();
+        radix::sort_copy_by_key(&mut placed, |&(entry, pack)| radix::pack_64(entry, u64::from(pack)));
         placed.dedup();
         let bits = (0..=BITS_MAX)
             .find(|bits| (placed.len() as u64 * u64::from(prefix)) >> bits <= SHARD_TARGET)
             .unwrap_or(BITS_MAX);
         // By slot, then by pack, then by entry: each slot's groups in the order written.
-        placed.sort_unstable_by_key(|(entry, pack)| (slot_of(*entry, bits), *pack, *entry));
+        radix::sort_copy_by_key(&mut placed, |&(entry, pack)| {
+            let slot = slot_of(entry, bits) as u32;
+            (u128::from(slot) << 96) | (u128::from(pack) << 64) | u128::from(entry)
+        });
         let mut run = Vec::with_capacity(RUN_HEAD + packs.len() * 32 + (RUN_SHARD << bits));
         run.extend_from_slice(RUN_MAGIC);
         run.extend_from_slice(&[bits, prefix, 0, 0]);
@@ -514,7 +518,7 @@ fn unhex(text: &str) -> Option<Hash> {
 /// project grows by a factor of [`FANOUT`].
 pub fn plan_merge(runs: &[u64]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..runs.len()).collect();
-    order.sort_by_key(|it| (runs[*it], *it));
+    radix::sort_copy_by_key(&mut order, |&it| radix::pack_64(runs[it], it as u64));
     let tier = |at: &usize| runs[*at].max(1).ilog(FANOUT as u64);
     let (mut seen, mut take) = (0, 0);
     for same in order.chunk_by(|a, b| tier(a) == tier(b)) {
@@ -531,7 +535,7 @@ pub fn plan_merge(runs: &[u64]) -> Vec<usize> {
         return Vec::new();
     }
     let mut chosen = order[..take].to_vec();
-    chosen.sort_unstable();
+    radix::sort(&mut chosen);
     chosen
 }
 

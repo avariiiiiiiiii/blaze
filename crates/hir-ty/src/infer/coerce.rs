@@ -775,7 +775,7 @@ where
                             let (target_features, target_feature_is_safe) =
                                 self.delegate.target_features();
                             if target_feature_is_safe == TargetFeatureIsSafeInTarget::No
-                                && !target_features.enabled.is_superset(&fn_target_features.enabled)
+                                && !target_features.is_superset(&fn_target_features)
                             {
                                 return Err(TypeError::TargetFeatureCast(
                                     CallableIdWrapper(def_id.into()).into(),

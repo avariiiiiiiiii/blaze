@@ -339,6 +339,8 @@ const ROOT_WORDS: &[&str] = &[
     "GlobalAlloc",
 ];
 
+blaze_phf::phf_table!(static ROOT_WORD = ROOT_WORDS;);
+
 /// What a scan of bodies' text looks for, to lower only the bodies that may declare such an item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Look {
@@ -352,7 +354,7 @@ impl Look {
     /// Whether `word`, an identifier without `r#`, is one this looks for.
     fn says(self, word: &str) -> bool {
         match self {
-            Look::Roots => ROOT_WORDS.contains(&word),
+            Look::Roots => ROOT_WORD.get(word).is_some(),
             Look::DiagnosticItems => word == "rustc_diagnostic_item",
         }
     }
@@ -377,9 +379,14 @@ impl Look {
         let Some(body) = body_syntax(db, owner) else { return false };
         let declaring = self.macros(db, owner.module(db).krate(db));
         any_word(&body, |word| {
-            self.says(word)
-                || local.contains(word)
-                || declaring.binary_search_by(|it| it.as_str().cmp(word)).is_ok()
+            self.says(word) || local.contains(word) || {
+                let key = intern::order_key(word.as_bytes());
+                declaring
+                    .binary_search_by(|it| {
+                        it.order_key().cmp(&key).then_with(|| it.as_str().cmp(word))
+                    })
+                    .is_ok()
+            }
         })
     }
 
@@ -497,23 +504,7 @@ fn body_syntax(db: &dyn SourceDatabase, owner: DefWithBodyId) -> Option<SyntaxNo
 /// syntax, and lowers no body. A body of which this is false declares no such item, though it
 /// may declare others; those are reached through it.
 pub fn may_declare_roots(db: &dyn SourceDatabase, owner: DefWithBodyId) -> bool {
-    may_declare_roots_with(db, owner, &FxHashSet::default())
-}
-
-/// [`may_declare_roots`], with the macros of the blocks around the body in `local`.
-fn may_declare_roots_with(
-    db: &dyn SourceDatabase,
-    owner: DefWithBodyId,
-    local: &FxHashSet<SmolStr>,
-) -> bool {
-    let Some(body) = body_syntax(db, owner) else { return false };
-    let declaring = macros_declaring_roots(db, owner.module(db).krate(db));
-    any_word(&body, |word| {
-        is_root_word(word) || local.contains(word) || {
-            let key = intern::order_key(word.as_bytes());
-            declaring.binary_search_by(|it| it.order_key().cmp(&key).then_with(|| it.as_str().cmp(word))).is_ok()
-        }
-    })
+    Look::Roots.may_say(db, owner, &FxHashSet::default())
 }
 
 /// What a macro is made of, for whether it may write an item a build keeps.
@@ -529,18 +520,20 @@ enum MacroText {
 fn macro_text(db: &dyn SourceDatabase, id: MacroId) -> MacroText {
     let (expander, node) = match id {
         MacroId::ProcMacroId(_) => return MacroText::Anything,
+        // The body only: the macro's own attributes are not in what it writes.
         MacroId::MacroRulesId(it) => {
             let loc = it.lookup(db);
-            (loc.expander, loc.id.to_node(db).syntax().clone())
+            (loc.expander, loc.id.to_node(db).token_tree())
         }
         MacroId::Macro2Id(it) => {
             let loc = it.lookup(db);
-            (loc.expander, loc.id.to_node(db).syntax().clone())
+            (loc.expander, loc.id.to_node(db).body())
         }
     };
     match expander {
         MacroExpander::Declarative { .. } => {
-            let mut words = words(&node);
+            let Some(node) = node else { return MacroText::Nothing };
+            let mut words = words(node.syntax());
             words.sort_unstable_by(Symbol::cmp_order);
             words.dedup();
             MacroText::Words(words)
@@ -555,44 +548,12 @@ fn macro_text(db: &dyn SourceDatabase, id: MacroId) -> MacroText {
     }
 }
 
-/// The macros of `scope`, by every name it has them under, that may write an item a build keeps,
-/// given that those named in `declaring` may.
-fn declaring_macros_of_scope(
-    db: &dyn SourceDatabase,
-    scope: &ItemScope,
-    declaring: &FxHashSet<SmolStr>,
-) -> Vec<Symbol> {
-    let mut found = Vec::new();
-    let mut calling = Vec::new();
-    for (name, id) in scope_macros(scope) {
-        classify(db, name, id, &mut found, &mut calling);
-    }
-    settle(found, calling, |word| declaring.contains(word.as_str()))
-}
-
 fn scope_macros(scope: &ItemScope) -> impl Iterator<Item = (Symbol, MacroId)> + '_ {
     let named = scope.macros().map(|(name, it)| (name.symbol().clone(), it.def));
     let legacy = scope
         .legacy_macros()
         .flat_map(|(name, ids)| ids.iter().map(move |&id| (name.symbol().clone(), id)));
     named.chain(legacy)
-}
-
-fn classify(
-    db: &dyn SourceDatabase,
-    name: Symbol,
-    id: MacroId,
-    found: &mut Vec<Symbol>,
-    calling: &mut Vec<(Symbol, Vec<Symbol>)>,
-) {
-    match macro_text(db, id) {
-        MacroText::Anything => found.push(name),
-        MacroText::Nothing => {}
-        MacroText::Words(words) if words.iter().any(|it| is_root_word(it.as_str())) => {
-            found.push(name)
-        }
-        MacroText::Words(words) => calling.push((name, words)),
-    }
 }
 
 /// `found`, with each of `calling` that names one of them, or one `known` says may write a
@@ -626,23 +587,41 @@ fn settle(
 /// Sorted. Reads def maps and macro definitions, no body.
 #[salsa::tracked(returns(deref))]
 pub fn macros_declaring_roots(db: &dyn SourceDatabase, krate: Crate) -> Box<[Symbol]> {
-    let mut known: FxHashSet<Symbol> = FxHashSet::default();
-    for dep in &krate.data(db).dependencies {
-        known.extend(macros_declaring_roots(db, dep.crate_id).iter().cloned());
-    }
-    let mut found = Vec::new();
-    let mut calling = Vec::new();
-    let mut seen = FxHashSet::default();
-    for (_, module) in crate_def_map(db, krate).modules(db) {
-        for (name, id) in scope_macros(module.scope(db)) {
-            if seen.insert((name.clone(), id)) {
-                classify(db, name, id, &mut found, &mut calling);
-            }
+    Look::Roots.crate_macros(db, krate)
+}
+
+/// As [`macros_declaring_roots`], for the macros that may write an item with a diagnostic item
+/// (`#[rustc_diagnostic_item = ".."]`): what [`crate::diagnostic_item`] reads bodies for.
+#[salsa::tracked(returns(deref))]
+pub fn macros_writing_diagnostic_items(db: &dyn SourceDatabase, krate: Crate) -> Box<[Symbol]> {
+    Look::DiagnosticItems.crate_macros(db, krate)
+}
+
+#[cfg(test)]
+mod root_word_tests {
+    use super::{Look, ROOT_WORDS};
+
+    /// The table says what `ROOT_WORDS.contains` did: every word, near misses of each, and
+    /// other identifiers.
+    #[test]
+    fn roots_as_a_linear_search() {
+        let mut words: Vec<String> = Vec::new();
+        for word in ROOT_WORDS {
+            words.extend([
+                (*word).to_owned(),
+                format!("{word}_"),
+                format!("r#{word}"),
+                word.to_uppercase(),
+                word.to_lowercase(),
+                word[..word.len() - 1].to_owned(),
+                word[1..].to_owned(),
+            ]);
         }
+        words.extend(["", "fn", "rustc_diagnostic_item", "allocator", "Global"].map(String::from));
+        for word in &words {
+            assert_eq!(Look::Roots.says(word), ROOT_WORDS.contains(&word.as_str()), "{word}");
+        }
+        assert!(Look::DiagnosticItems.says("rustc_diagnostic_item"));
+        assert!(!Look::DiagnosticItems.says("lang"));
     }
-    let settled = settle(found, calling, |word| known.contains(word));
-    known.extend(settled);
-    let mut names: Vec<Symbol> = known.into_iter().collect();
-    names.sort_unstable_by(Symbol::cmp_order);
-    names.into()
 }

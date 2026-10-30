@@ -15,8 +15,10 @@ use std::{
 };
 
 use blaze_core::{Traced, Untraceable};
-use blaze_ids::Hasher;
+use blaze_ids::{ContentId, Hasher};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+const LISTING_DOMAIN: &str = "blaze v2 traced listing 1";
 
 /// What a line says was seen.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -185,8 +187,9 @@ pub trait Inputs {
     /// The [`listing`] hash of the directory's names, `None` for no directory there.
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Self::Error>;
     fn env(&mut self, name: &OsStr) -> Option<OsString>;
-    /// The whole environment, for a run that read all of it.
-    fn env_all(&mut self) -> Vec<(OsString, OsString)>;
+    /// The whole environment, for a run that read all of it: sorted by name, each name once,
+    /// lent rather than copied, as [`crate::inputs::Env`] keeps it.
+    fn env_all(&mut self) -> &[(OsString, OsString)];
     /// The names in the directory, each with whether it is a directory, sorted; `None` for
     /// no directory there. What [`package`] walks.
     fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, Self::Error>;
@@ -239,43 +242,54 @@ pub fn walk<I: Inputs + ?Sized>(
         true => "blaze v2 package tree 1",
         false => "blaze v2 tree 1",
     });
-    let mut stack: Vec<(PathBuf, Vec<(OsString, bool)>)> = vec![(PathBuf::new(), top)];
-    // Depth first, each directory's names in order, so the walk's order is the paths'.
-    while let Some((rel, mut names)) = stack.pop() {
-        names.sort();
-        names.reverse();
-        let mut deeper = Vec::new();
-        while let Some((name, is_dir)) = names.pop() {
-            let skipped = os_bytes(&name).starts_with(b".")
-                || (rel.as_os_str().is_empty() && name == "target");
-            if package && skipped {
-                continue;
-            }
-            let rel = rel.join(&name);
-            let whole = dir.join(&rel);
-            match is_dir {
-                true => {
-                    if let Some(inner) = inputs.names(&whole)? {
-                        hasher.part(os_bytes(rel.as_os_str())).part(b"d");
-                        deeper.push((rel, inner));
-                    }
-                }
-                false => {
-                    let hash = inputs.file(&whole)?;
-                    hasher.part(os_bytes(rel.as_os_str()));
-                    match hash {
-                        Some(hash) => _ = hasher.part(&hash),
-                        None => _ = hasher.part(b"-"),
-                    }
-                }
-            }
-        }
-        // The first directory of this one is walked next.
-        while let Some(it) = deeper.pop() {
-            stack.push(it);
-        }
-    }
+    let mut whole = dir.to_path_buf();
+    walk_in(inputs, dir, &mut whole, top, (package, true), &mut hasher)?;
     Ok(Some(hasher.finish().0))
+}
+
+/// One directory of [`walk`], at `whole` below `dir` (`top` for `dir` itself): its names in
+/// order, then each of its directories the same way, so the walk's order is the paths'.
+/// `whole` is the one path buffer of the walk, pushed and popped, never joined anew.
+fn walk_in<I: Inputs + ?Sized>(
+    inputs: &mut I,
+    dir: &Path,
+    whole: &mut PathBuf,
+    mut names: Vec<(OsString, bool)>,
+    (package, top): (bool, bool),
+    hasher: &mut Hasher,
+) -> Result<(), I::Error> {
+    names.sort_unstable();
+    let mut deeper = Vec::new();
+    for (name, is_dir) in names {
+        if package && (os_bytes(&name).starts_with(b".") || (top && name == "target")) {
+            continue;
+        }
+        whole.push(&name);
+        let rel = os_bytes(whole.strip_prefix(dir).unwrap_or(whole).as_os_str());
+        match is_dir {
+            true => {
+                if let Some(inner) = inputs.names(whole)? {
+                    hasher.part(rel).part(b"d");
+                    deeper.push((name, inner));
+                }
+            }
+            false => {
+                let hash = inputs.file(whole)?;
+                hasher.part(rel);
+                match hash {
+                    Some(hash) => _ = hasher.part(&hash),
+                    None => _ = hasher.part(b"-"),
+                }
+            }
+        }
+        whole.pop();
+    }
+    for (name, inner) in deeper {
+        whole.push(&name);
+        walk_in(inputs, dir, whole, inner, (package, false), hasher)?;
+        whole.pop();
+    }
+    Ok(())
 }
 
 /// What a traced file that is a directory hashes as: what a look at it showed is that it is
@@ -287,7 +301,7 @@ pub fn listing<'a>(names: impl IntoIterator<Item = &'a OsStr>) -> [u8; 32] {
     let mut names: Vec<&[u8]> = names.into_iter().map(os_bytes).collect();
     names.sort_unstable();
     names.dedup();
-    let mut hasher = Hasher::new("blaze v2 traced listing 1");
+    let mut hasher = Hasher::new(LISTING_DOMAIN);
     for name in names {
         hasher.part(name);
     }
@@ -351,9 +365,9 @@ pub fn assemble<'l, I: Inputs>(
     let mut values: FxHashMap<OsString, Option<OsString>> = FxHashMap::default();
     if all_env {
         let all = inputs.env_all();
-        values.insert(ALL_ENV_NAME.into(), Some(names_hash(&all).into()));
+        values.insert(ALL_ENV_NAME.into(), Some(names_hash(all).into()));
         for (name, value) in all {
-            values.insert(name, Some(value));
+            values.insert(name.clone(), Some(value.clone()));
         }
     }
     for name in env {
@@ -368,8 +382,96 @@ pub fn assemble<'l, I: Inputs>(
 
 /// The value [`ALL_ENV_NAME`] has for the environment `all`.
 pub fn names_hash(all: &[(OsString, OsString)]) -> String {
-    let hash = listing(all.iter().map(|it| it.0.as_os_str()));
-    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+    names_hex(all).iter().map(|&it| char::from(it)).collect()
+}
+
+/// [`names_hash`]'s bytes, made on the stack: what a cache check hashes into a key.
+pub(crate) fn names_hex(all: &[(OsString, OsString)]) -> [u8; 64] {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    // An environment is sorted and each name once, so it is its own listing's order.
+    let hash = match all.is_sorted_by(|a, b| os_bytes(&a.0) < os_bytes(&b.0)) {
+        true => {
+            let mut hasher = Hasher::new(LISTING_DOMAIN);
+            for (name, _) in all {
+                hasher.part(os_bytes(name));
+            }
+            hasher.finish().0
+        }
+        false => listing(all.iter().map(|it| it.0.as_os_str())),
+    };
+    let mut hex = [0; 64];
+    for (at, byte) in hash.iter().enumerate() {
+        hex[2 * at] = DIGITS[usize::from(byte >> 4)];
+        hex[2 * at + 1] = DIGITS[usize::from(byte & 15)];
+    }
+    hex
+}
+
+/// A run's result key, hashed as its inputs are read ([`crate::RunKey::traced`]): a
+/// normalized [`Traced`]'s files, then its directories, its variables and what it could not
+/// trace, in that order, each entry tagged and each name framed. A cache check hashes a
+/// shape's inputs straight into one ([`crate::index::find`]) and builds no [`Traced`].
+pub(crate) struct Keyer(Hasher);
+
+impl Keyer {
+    pub(crate) fn new(run: &crate::RunKey) -> Keyer {
+        let mut hasher = Hasher::new(crate::RunKey::DOMAIN);
+        hasher.id(&run.code).id(&run.given);
+        Keyer(hasher)
+    }
+
+    pub(crate) fn file(&mut self, path: &[u8], hash: Option<&[u8; 32]>) {
+        self.0.update(b"f").part(path);
+        match hash {
+            Some(hash) => _ = self.0.update(&[1]).update(hash),
+            None => _ = self.0.update(&[0]),
+        }
+    }
+
+    pub(crate) fn dir(&mut self, path: &[u8], hash: &[u8; 32]) {
+        self.0.update(b"d").part(path).update(hash);
+    }
+
+    pub(crate) fn env(&mut self, name: &[u8], value: Option<&[u8]>) {
+        self.0.update(b"e").part(name);
+        match value {
+            Some(value) => _ = self.0.update(&[1]).part(value),
+            None => _ = self.0.update(&[0]),
+        }
+    }
+
+    pub(crate) fn untraceable(&mut self, name: &[u8]) {
+        self.0.update(b"u").part(name);
+    }
+
+    /// The key of `traced`, which is normalized.
+    pub(crate) fn traced(mut self, traced: &Traced) -> ContentId {
+        for (path, hash) in &traced.files {
+            self.file(os_bytes(path.as_os_str()), hash.as_ref());
+        }
+        for (path, hash) in &traced.dirs {
+            self.dir(os_bytes(path.as_os_str()), hash);
+        }
+        for (name, value) in &traced.env {
+            self.env(os_bytes(name), value.as_deref().map(os_bytes));
+        }
+        for it in &traced.untraceable {
+            self.untraceable(untraceable_name(*it).as_bytes());
+        }
+        self.finish()
+    }
+
+    pub(crate) fn finish(&self) -> ContentId {
+        self.0.finish()
+    }
+}
+
+/// Whether `traced` is as [`normalize`] leaves it: each list strictly increasing.
+pub(crate) fn normal(traced: &Traced) -> bool {
+    traced.files.is_sorted_by(|a, b| a < b)
+        && traced.dirs.is_sorted_by(|a, b| a < b)
+        && traced.env.is_sorted_by(|a, b| a < b)
+        && traced.untraceable.is_sorted_by(|a, b| a < b)
 }
 
 /// `traced` sorted and each entry once: what [`assemble`] makes, for a [`Traced`] made
@@ -417,6 +519,18 @@ pub(crate) fn os_from(bytes: &[u8]) -> Result<OsString, String> {
         std::str::from_utf8(bytes)
             .map(OsString::from)
             .map_err(|_| "a name is not UTF-8".to_owned())
+    }
+}
+
+/// The path [`os_bytes`] gave `bytes` of, borrowed in place where a path is its bytes.
+pub(crate) fn path_in(bytes: &[u8]) -> Result<std::borrow::Cow<'_, Path>, String> {
+    #[cfg(unix)]
+    {
+        Ok(std::borrow::Cow::Borrowed(Path::new(std::os::unix::ffi::OsStrExt::from_bytes(bytes))))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(std::borrow::Cow::Owned(PathBuf::from(os_from(bytes)?)))
     }
 }
 
@@ -634,8 +748,9 @@ mod tests {
         fn env(&mut self, name: &OsStr) -> Option<OsString> {
             self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
         }
-        fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-            self.env.clone()
+        fn env_all(&mut self) -> &[(OsString, OsString)] {
+            self.env.sort();
+            &self.env
         }
         fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
             let Some(names) = self.dirs.get(path) else { return Ok(None) };
@@ -765,7 +880,7 @@ mod tests {
             self.1.push(format!("env {}", name.display()));
             self.0.env(name)
         }
-        fn env_all(&mut self) -> Vec<(OsString, OsString)> {
+        fn env_all(&mut self) -> &[(OsString, OsString)] {
             self.1.push("env_all".into());
             self.0.env_all()
         }

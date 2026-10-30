@@ -17,6 +17,7 @@
 use std::ops::Range;
 
 use anyhow::{Context, bail, ensure};
+use blaze_ids::radix;
 use rustc_hash::{FxHashMap, FxHashSet};
 use wasmparser::{
     BinaryReader, CodeSectionReader, DataKind, DataSectionReader, ElementItems, ElementKind,
@@ -304,7 +305,7 @@ impl Module {
         for name in parts.names.iter().filter(|it| !listed.contains(&it.index)) {
             unlisted.entry(name.name.into()).or_default().push(name.index);
         }
-        unlisted.values_mut().for_each(|it| it.sort_unstable());
+        unlisted.values_mut().for_each(|it| radix::sort(it));
         let table = Module::table(&parts, &bytes)?;
         let slots = table
             .iter()

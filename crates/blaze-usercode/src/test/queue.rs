@@ -43,7 +43,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use blaze_core::{
     Address, Command, Completion, Conn, Done, Effect, Exit, FileName, Sandbox, Tag, Traced,
 };
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, radix};
 
 use super::wire::{self, End, Frame, Frames};
 use crate::{
@@ -985,7 +985,7 @@ impl Queue {
             effects.push(Effect::Unlisten { tag: listen });
         }
         let mut running: Vec<u64> = std::mem::take(&mut self.server(b).running).into_iter().collect();
-        running.sort_unstable();
+        radix::sort(&mut running);
         let why = match was {
             Phase::Quitting if running.is_empty() => return,
             _ => format!("{}: {why}", self.bins[b].plan.name),

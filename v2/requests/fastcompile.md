@@ -219,7 +219,7 @@ What:
   increasing, each below `slots`; encoded after `output`).
 - `test/fork_server.rs`, the harness text: two variants, `fork_server(record: bool)`. With
   `record`, `serve` declares `extern "C" { fn __blaze_exec_slots() -> u32; fn __blaze_exec_arm(region: *mut u8, len: usize) -> i32; }`
-  (request 4). In `start`, before `fork()`, it maps `16 + slots` bytes
+  (request 9). In `start`, before `fork()`, it maps `16 + slots` bytes
   `PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS` and writes the header of
   `blaze_testsel::record::header` (`b"blzexec1"`, `slots` LE u32, `armed` 0). The child calls
   `__blaze_exec_arm` before `run(test)`; a non-zero return goes on stderr and the record is not
@@ -283,6 +283,8 @@ one point every function call passes, from every thread and every forked process
 unwinding included. The prelude is marked so state left by startup code is covered.
 
 > forwarded to fastcompile: `crates/blaze-lazy/` is fastcompile-lazy's.
+
+> fastcompile-ident-select: re-addressed to link as request 9 (`fastcompile-lazy 6`: the slots are the jump table's).
 
 ## fastcompile-ident-select 5: codegen: each test binary's execution table
 
@@ -548,7 +550,14 @@ nothing is re-chunked (`wire::pieces`, which also checks each chunk is at most
 `wire::PIECE_MOST`). `blaze-global` calls `blaze_cas::content_of` and
 `blaze_cas::chunk::chunks` and does not build without them.
 
+> applied (by concurrency): `blaze_cas::content_of` (re-exported from `disk`), `pub mod chunk` with `chunks`, `MAX` and `MIN`. blaze-global's calls (`sign.rs`, `client.rs`, `server.rs`, `wire.rs`) match them.
+
 > forwarded to concurrency: store is DONE, but lane concurrency is reworking `crates/blaze-cas/src/lib.rs` now (it holds the crate), so the visibility changes are its to make.
+
+> applied by concurrency: `pub use crate::disk::content_of` in lib.rs (the fn `pub`, unchanged),
+> `pub mod chunk`, `pub fn chunks`, `pub const MAX`, and `pub const MIN` too, since `chunks`'
+> doc links it. Nothing built. Also for blaze-global: a fetch's `Done::Read` must now be the
+> whole frame (`Answer::encode_framed`, `v2/requests/concurrency.md` R3).
 
 ## fastcompile-global 2: codegen: the release driver's stored instance key public (`crates/blaze-codegen/src/driver.rs`, `fn stored`)
 
@@ -680,8 +689,13 @@ What, for an image that `blaze_lazy::Session` describes:
    `CodeMemory::publish` the range. Then store the code's address in the function's slot
    with one release store, in every table of blaze-live's pool (`slots/switch.rs`, `POOL`)
    and in the log's base generation, so a later table switch keeps the slot published instead
-   of returning it to the entry. Return the code's address. An error names the function and
-   what failed.
+   of returning it to the entry. The store goes through the same rule as
+   fastcompile-ident-select 9's `publish(slot, target)`: it writes the generation tables'
+   word, never the execution log table's word. While the log is armed, an uncalled log stub
+   therefore stays in place, and that function's first call is still logged. If the daemon
+   writes the tables through the code memory's writable view instead of calling `publish` in
+   the run process, it follows the same rule. Return the code's address. An error names the
+   function and what failed.
 4. **The runtime in the image.** Link `blaze-lazy` (without default features: only `hook`
    and `wire`) and `blaze-inproc`'s `runtime` into a lazy run's image, compiled ahead with
    it.
@@ -744,3 +758,50 @@ is answered at once with the published address (`hook.rs`, `fetch::Fetcher::ask`
 logging in the slot path misses no first call that lazy compilation serves.
 
 > forwarded to fastcompile: between its own children.
+
+> fastcompile-ident-select: agreed, re-addressed as request 9 (link). One thing stays on
+> lazy's side. While a test's log is armed, `runner::Placer`'s release store of a slot must
+> go through request 9's `publish` and not store the slot word itself. A plain store would
+> replace a log stub that hasn't been called yet, and that function's first call would go
+> straight to the code, unlogged. The ordering above (code, then the store; a stale slot
+> answered at once by the resolver) is what `publish` needs. Nothing else changes in
+> blaze-lazy.
+
+## fastcompile-ident-select 9: link: the jump table's execution log (`crates/blaze-live/src/slots.rs`, `slots/switch.rs`; blaze-link's slot stubs)
+
+Replaces request 4, which `fastcompile-lazy 6` showed is the jump table's, not blaze-lazy's.
+
+What:
+
+- blaze-link places a **log stub** per slot beside its slot stubs, and a **log table** of
+  `slots` words beside the loader's table, each word pointing at its slot's log stub. Log
+  stub `s` stores `1` at `map + 16 + s` (`map` is one word of the runtime's data), copies the
+  current generation's table word `s` into log-table word `s`, and jumps there. Its call
+  sequence carries every argument register through, as the slot stub does.
+- blaze-live exports, in the run process, for lazy and whole live builds alike:
+  - `#[no_mangle] extern "C" fn __blaze_exec_slots() -> u32`: the table's slot count.
+  - `#[no_mangle] extern "C" fn __blaze_exec_arm(region: *mut u8, len: usize) -> i32`:
+    0 on success, non-zero for a region shorter than `16 + slots` or one whose first 8 bytes
+    aren't `b"blzexec1"`. It runs in the forked child with one thread, before the test.
+    - It marks every slot already called in this process (the prelude: startup,
+      initializers, the harness). A process that may arm starts with its cell on the log
+      table and `map` at a process-private map, so the prelude is logged the same way.
+    - It sets `map = region`, resets every log-table word to its log stub, points the
+      table cell at the log table with one release store, and writes `armed = slots`
+      (LE u32 at bytes 12..16).
+- A slot write while the cell is on the log table goes to the generation's table (the
+  slot's `next`), never to the log-table word directly: a patch's switch (`switch.rs`) and
+  lazy's publish (`fastcompile-lazy 6`, `runner::Placer`) both go through one
+  `pub fn publish(slot: u32, target: u64)` that does so. A log stub that read the word
+  before the write lands on the old target. For lazy, that is its entry, and the resolver
+  answers at once with the published address.
+- A patch that switches generations while armed keeps the cell on the log table. Only the
+  generation's table changes, so slots logged once stay logged and unlogged ones still log.
+
+Why: idea 3 keys a test's pass by the functions it executed
+(`docs/v2/plan/lanes/fastcompile/select.md`, The record). Every call goes through the cell
+and a slot, so one cell store arms a whole process, from every thread and every forked
+process, panics and unwinding included. The region is the record `blaze_testsel::record`
+reads (`Record::of_region`).
+
+> forwarded to link: `crates/blaze-live/` and blaze-link's slot stubs are lane link's.

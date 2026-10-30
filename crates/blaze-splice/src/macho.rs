@@ -40,6 +40,7 @@ use std::{
 };
 
 use anyhow::{Context, bail, ensure};
+use blaze_ids::radix;
 use object::{
     Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionFlags,
     SectionIndex, SymbolIndex, SymbolKind, macho,
@@ -427,7 +428,7 @@ impl Rebases {
                 other => bail!("a fixup of kind {other:#x}"),
             }
         }
-        found.sort_unstable();
+        radix::sort(&mut found);
         Ok(found)
     }
 
@@ -636,7 +637,7 @@ impl Image {
             defined.push((u64_at(bytes, entry + 8)?, start + len, kind, entry));
         }
         let mut starts: Vec<u64> = defined.iter().map(|it| it.0).collect();
-        starts.sort_unstable();
+        radix::sort(&mut starts);
         starts.dedup();
         let mut symbols = FxHashMap::<Box<[u8]>, Named>::default();
         for (address, section_end, kind, entry) in defined {
@@ -1292,7 +1293,7 @@ impl<'a> Patch<'a> {
         // No symbol has a size: one reaches to the next of its section.
         let mut starts: Vec<u64> =
             patch.file.symbols().filter(|it| it.is_definition()).map(|it| it.address()).collect();
-        starts.sort_unstable();
+        radix::sort(&mut starts);
         starts.dedup();
         for symbol in patch.file.symbols() {
             if !symbol.is_definition() || symbol.is_local() {
@@ -1573,7 +1574,7 @@ impl<'a> Patch<'a> {
             .retain(|at| !statics.iter().any(|it| (it.address..it.address + it.size).contains(at)));
         rebases.extend(restored);
         rebases.extend(stored);
-        rebases.sort_unstable();
+        radix::sort(&mut rebases);
         rebases.dedup();
 
         let text = (base, data_at);

@@ -12,6 +12,7 @@ use std::collections::hash_map::Entry;
 use std::ops::Range;
 
 use blaze_codegen::wasm::{Import, Signature};
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 
 use super::code::{self, Parts, Sig};
@@ -629,7 +630,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             })?;
             code_relocs.push((body as u32, offset as u32, r));
         }
-        code_relocs.sort_by_key(|it| (it.0, it.1));
+        radix::sort_by_key(&mut code_relocs, |it| radix::pack_32(it.0, it.1));
     }
     // The last export of each body wins, as the export section's order says.
     let mut export_names: Vec<Option<&str>> = vec![None; bodies];
@@ -739,7 +740,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             }
         }
     }
-    segment_fixups.sort_by_key(|it| it.0);
+    radix::sort_copy_by_key(&mut segment_fixups, |it| it.0);
     let mut next = 0;
     let mut segment_sections = Vec::with_capacity(parsed.segments.len());
     for (segment, (range, info)) in parsed.segments.iter().zip(&linking.segments).enumerate() {

@@ -484,6 +484,87 @@ fn a_build_script_is_a_node_of_its_own() {
     );
 }
 
+/// The [`Event::Nodes`] of nodes given as their [`Event::Node`]s would say them, the ids from
+/// `first` on.
+fn nodes(first: u32, given: &[(NodeKind, &str, &[u32])]) -> Event {
+    let (mut names, mut name_at) = (String::new(), vec![0]);
+    let (mut deps, mut deps_at) = (Vec::new(), vec![0]);
+    for (_, name, on) in given {
+        names.push_str(name);
+        name_at.push(names.len() as u32);
+        deps.extend_from_slice(on);
+        deps_at.push(deps.len() as u32);
+    }
+    let kinds = given.iter().map(|it| it.0).collect();
+    Event::Nodes { first, kinds, names, name_at, deps, deps_at }
+}
+
+/// Nodes said in one record are the nodes said a record each: anim's graph so, given in
+/// order or each before what it waits for, is the same graph and draws the same tree. A
+/// record of nodes that cannot be read is said as an error, and adds no node.
+#[test]
+fn a_record_of_nodes_is_its_nodes() {
+    use NodeKind::{Names, Std};
+    let with = |nodes: Event| -> Vec<Record> {
+        let mut records = graphed();
+        records.retain(|it| !matches!(it.event, Event::Node { .. }));
+        records.insert(2, at(0, nodes));
+        records
+    };
+    let in_order = with(nodes(
+        10,
+        &[
+            (Std, "std", &[]),
+            (Names, "libc", &[10]),
+            (Names, "winit", &[10, 11]),
+            (Names, "wgpu", &[10, 11]),
+            (Names, "anim", &[12, 13]),
+        ],
+    ));
+    let backwards = with(nodes(
+        10,
+        &[
+            (Names, "anim", &[11, 12]),
+            (Names, "winit", &[14, 13]),
+            (Names, "wgpu", &[14, 13]),
+            (Names, "libc", &[14]),
+            (Std, "std", &[]),
+        ],
+    ));
+    let shape = |records: &[Record]| {
+        let mut build = Build::default();
+        for record in records {
+            build.apply(record);
+        }
+        let row = |at: usize| build.crates[build.graph[at].row as usize].name.clone();
+        let deps =
+            |at: usize| -> Vec<String> { build.deps(at).iter().map(|&it| row(it as usize)).collect() };
+        (0..build.graph.len())
+            .map(|at| (row(at), build.graph[at].kind, deps(at)))
+            .collect::<Vec<(String, NodeKind, Vec<String>)>>()
+    };
+    let each = graphed();
+    assert_eq!(shape(&in_order), shape(&each));
+    assert_eq!(shape(&backwards), shape(&each));
+    let region = region_at(&mut Live::new(120, false), each, 3 * S);
+    assert_eq!(region_at(&mut Live::new(120, false), in_order, 3 * S), region);
+    assert_eq!(region_at(&mut Live::new(120, false), backwards, 3 * S), region);
+
+    let mut plain = Plain::new(false);
+    let cycle = nodes(0, &[(Names, "a", &[1]), (Names, "b", &[0])]);
+    let said = plain.record(&at(0, cycle));
+    assert_eq!(said, "error: a record of nodes is malformed: nodes 0, 1 wait for each other\n");
+    let Event::Nodes { first, kinds, names, name_at, deps, .. } = nodes(0, &[(Std, "std", &[])])
+    else {
+        unreachable!("an Event::Nodes")
+    };
+    let cut = Event::Nodes { first, kinds, names, name_at, deps, deps_at: vec![0] };
+    let said = plain.record(&at(0, cut));
+    assert!(said.starts_with("error: a record of nodes is malformed: deps_at of 1 offsets"));
+    assert!(plain.build().graph.is_empty());
+    assert_eq!(plain.build().malformed.len(), 2);
+}
+
 /// A build that took long ends saying why: its slowest steps, and what the store had and,
 /// of a cold one, why it had nothing.
 #[test]
@@ -763,7 +844,7 @@ fn records(rng: &mut Rng, count: usize) -> Vec<Record> {
             };
             (0..rng.below(5)).map(|_| slow(rng)).collect()
         };
-        let event = match rng.below(21) {
+        let event = match rng.below(22) {
             0..=2 => {
                 let (step, of) = (rng.pick(&STEPS), rng.pick(&OFS).map(str::to_owned));
                 open.push((step, of.clone()));
@@ -833,6 +914,30 @@ fn records(rng: &mut Rng, count: usize) -> Vec<Record> {
                 _ => Event::Slowest { functions: slows(rng) },
             },
             19 if rng.chance(30) => finished(rng, now),
+            // Nodes said together, waiting for nodes said before and for each other, given
+            // before or after them; now and then waiting in a cycle, or with an offset off.
+            20 => {
+                let (first, len) = (rng.below(40) as u32, rng.below(5) as u32);
+                let (mut names, mut name_at) = (String::new(), vec![0]);
+                let (mut deps, mut deps_at) = (Vec::new(), vec![0]);
+                let kinds = (0..len).map(|_| rng.pick(&KINDS)).collect();
+                for _ in 0..len {
+                    names.push_str(&name(rng));
+                    name_at.push(names.len() as u32);
+                    for _ in 0..rng.below(3) {
+                        deps.push(match rng.chance(3) {
+                            true => first + rng.below(u64::from(len)) as u32,
+                            false => id(rng, &ids),
+                        });
+                    }
+                    deps_at.push(deps.len() as u32);
+                }
+                ids.extend(first..first + len);
+                if len > 0 && rng.chance(10) {
+                    name_at[len as usize] += 1;
+                }
+                Event::Nodes { first, kinds, names, name_at, deps, deps_at }
+            }
             _ => Event::Functions { object: 0, whole: true, functions: Vec::new() },
         };
         out.push(at(now, event));

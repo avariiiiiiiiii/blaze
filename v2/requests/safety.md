@@ -159,6 +159,9 @@ needs anything from safety-audit. `blaze-usercode` as a whole is the lead's (its
 
 ### C5. To safety-tb: per-thread frames
 
+Done (safety-tb, 2026-10-29): `Borrows::set_thread`, called by `Checker::schedule` at every
+switch. The checker no longer stops on interleaved frames.
+
 `Borrows::push_frame`/`pop_frame` keep one stack; two threads' frames interleave. Wanted:
 `push_frame(thread: ThreadId)` and `pop_frame(thread: ThreadId, site)` (Miri keeps
 `FrameState` per frame of each thread's stack). Until then `Checker::ret` stops the run as
@@ -753,3 +756,26 @@ then `BodyRef::decode()`, `<ExpressionStoreSourceMap as Persist>::read` then `.d
   is `Some("main")`) and `thread_display_name(&self, ThreadId) -> String` (`unnamed-N`, which
   Miri's reports use; `<unnamed>` is only its `Debug` output). `RaceError` already carries
   both names in `RacingOp::thread_name`.
+
+## From safety-tb (2026-10-29): `crate::borrows` is done; what `check` needs to call
+
+For safety-check (`check.rs`, `check/valid.rs`); no change to the parent's files.
+
+- **Per-thread frames.** `Borrows::set_thread(ThreadId)` picks the thread whose stack
+  `push_frame`, `pop_frame` and function-entry retags act on (main until set). Miri keeps
+  protected tags per frame of each thread, so frames of different threads return in any
+  order. `check` must call it on every thread switch before any call, return or retag
+  (`fail/tree_borrows/spurious_read.rs` needs it).
+- **Read-only memory.** `NewPermission::writes()` says whether a retag of a non-empty range
+  writes through the parent (implicit writes). Miri's `tb_reborrow` refuses that as
+  `WriteToReadOnly` before the tree sees it, so `check` checks mutability first when
+  `writes()` holds (`implicit_writes/static_memory_modification.rs`).
+- `check/valid.rs::retag` should pass `with_implicit_writes(true)` under
+  `-Zmiri-tree-borrows-implicit-writes`, except for `#[rustc_no_writable]` callees.
+- `Borrows::gc_due()` / `GC_EVERY`: call `gc` when due with every tag memory and the
+  evaluator hold.
+- `cells` is `check`'s to compute as Miri's `visit_freeze_sensitive`: each `UnsafeCell`
+  field's bytes, and a whole non-`Freeze` union or multi-variant enum.
+- `RetagMode::Raw`/`None` and a `&mut`/`Box` to a `!Unpin` pointee are no-ops (`Ok(None)`).
+  Accesses, frees and retags of a non-empty range of a dead allocation panic: memory checks
+  liveness first.

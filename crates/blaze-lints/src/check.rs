@@ -6,6 +6,7 @@
 
 use std::ops::ControlFlow;
 
+use blaze_ids::radix;
 use cfg::{CfgAtom, CfgDiff, CfgExpr, CfgOptions};
 use hir::{HirFileId, InFile, Semantics};
 use hir_expand::{MacroCallKind, MacroDefKind};
@@ -294,7 +295,7 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
         let Some(expansion) = self.sema().expand_macro_call(call) else { return Vec::new() };
         let mut found = Vec::new();
         self.args_in(&expansion.value, inner, &mut found, 0);
-        found.sort_by_key(|(range, _)| range.start());
+        radix::sort_by_key(&mut found, |(range, _)| u32::from(range.start()));
         found.dedup_by_key(|(range, _)| *range);
         found
     }

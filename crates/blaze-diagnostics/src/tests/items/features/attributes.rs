@@ -2,15 +2,9 @@
 //! feature-gate-*.rs`, `tests/ui/attributes/`): an unstable attribute's E0658 with each of
 //! `check_attribute_stability`'s kinds of text, and the gated `cfg` predicates expansion meets.
 
-use super::{ui, ui_fixture};
-
-/// [`ui`] of a test that needs core's items, from minicore's `flags`, with compiletest's flags.
-fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    ui_fixture(&format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}"))
-}
+use super::{ui, ui_core};
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn an_internal_attribute_has_its_notes() {
     // tests/ui/feature-gates/feature-gate-rustc-attrs-1.rs
     let source = r#"// Test that `#[rustc_*]` attributes are gated by `rustc_attrs` feature gate.
@@ -59,7 +53,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn an_internal_attribute_is_gated_before_its_arguments_are_read() {
     // tests/ui/attributes/malformed-never-type-options.rs
     let source = r#"//! Regression test for #124352
@@ -95,7 +88,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn a_stability_attribute_has_no_help() {
     // tests/ui/feature-gates/feature-gate-staged_api.rs
     let source = r#"#![stable(feature = "a", since = "3.3.3")]
@@ -133,7 +125,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn thread_local_says_it_does_not_handle_destructors() {
     // tests/ui/feature-gates/feature-gate-thread_local.rs
     let source = r#"// Test that `#[thread_local]` attribute is gated by `thread_local`
@@ -166,7 +157,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn linkage_is_not_portable() {
     // tests/ui/feature-gates/feature-gate-linkage.rs
     let source = r#"extern "C" {
@@ -194,7 +184,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn an_unsafe_attribute_is_gated_at_its_path() {
     // tests/ui/feature-gates/feature-gate-ffi_const.rs
     let source = r#"#![crate_type = "lib"]
@@ -222,7 +211,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn allow_internal_unstable_side_steps_the_gates() {
     // tests/ui/feature-gates/feature-gate-allow-internal-unstable.rs
     let source = r#"#![allow(unused_macros)]
@@ -251,7 +239,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn an_attribute_a_macro_writes_is_gated_in_its_expansion() {
     // tests/ui/feature-gates/feature-gate-allow-internal-unsafe-nested-macro.rs
     let source = r#"// gate-test-allow_internal_unsafe
@@ -293,7 +280,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn profiler_runtime_will_never_be_stable() {
     // tests/ui/feature-gates/feature-gate-profiler-runtime.rs
     let source = r#"#![profiler_runtime] //~ ERROR the `profiler_runtime` attribute is
@@ -317,7 +303,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn compiler_builtins_will_never_be_stable() {
     // tests/ui/feature-gates/feature-gate-compiler-builtins.rs
     let source = r#"#![compiler_builtins] //~ ERROR the `compiler_builtins` attribute is
@@ -341,7 +326,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn rustc_intrinsic_declares_intrinsics() {
     // tests/ui/feature-gates/feature-gate-intrinsics.rs
     let source = r#"#[rustc_intrinsic]
@@ -367,7 +351,6 @@ For more information about this error, try `rustc --explain E0658`.
 }
 
 #[test]
-#[ignore = "needs gate called from checks/attrs parsed"]
 fn may_dangle_has_unstable_semantics() {
     // tests/ui/feature-gates/feature-gate-may-dangle.rs
     let source = r#"// gate-test-dropck_eyepatch

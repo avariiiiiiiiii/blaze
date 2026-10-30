@@ -33,6 +33,7 @@ rustc_type_ir.workspace = true
 rustc_next_trait_solver.workspace = true
 
 # local deps
+blaze-ids.workspace = true
 stdx.workspace = true
 macros.workspace = true
 intern.workspace = true

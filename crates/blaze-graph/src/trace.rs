@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use blaze_protocol::events::Event;
+use blaze_protocol::events::{Event, NodeBatch, Order};
 use serde::{Deserialize, Serialize};
 
 use crate::machine::{Config, Error, Input, Machine, Output};
@@ -52,14 +52,26 @@ impl Trace {
     }
 }
 
-/// `outputs` a line each, for a person and for a test's expected file.
+/// `outputs` a line each, for a person and for a test's expected file: the nodes of an
+/// [`Event::Nodes`] a line each, as their [`Event::Node`]s, in the order given.
 pub fn render(outputs: &[Output]) -> String {
     let mut text = String::new();
+    let mut order = Order::default();
     for output in outputs {
         _ = match output {
             Output::Said(record) => match &record.event {
                 Event::Node { id, kind, name, deps } => {
                     writeln!(text, "{} node #{id} {kind:?} {name} deps {deps:?}", record.at_ns)
+                }
+                Event::Nodes { first, kinds, names, name_at, deps, deps_at } => {
+                    match NodeBatch::new(*first, kinds, names, name_at, deps, deps_at, &mut order) {
+                        Ok(batch) => batch.iter().try_for_each(|it| {
+                            let (id, kind, name, deps) = (it.id, it.kind, it.name, it.deps);
+                            let at = record.at_ns;
+                            writeln!(text, "{at} node #{id} {kind:?} {name} deps {deps:?}")
+                        }),
+                        Err(why) => writeln!(text, "{} {why}", record.at_ns),
+                    }
                 }
                 Event::Moved { id, state } => {
                     writeln!(text, "{} #{id} {state:?}", record.at_ns)

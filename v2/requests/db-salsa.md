@@ -334,6 +334,16 @@ interned, or the reader got a new ID; never a reused slot under an old ID.
 > forwarded to db: `vendor/salsa` is lane db's.
 > not applied: live agent `speed-salsa-interned` owns `src/interned.rs` and is writing S2; a second writer would collide.
 
+> Status: done by speed-salsa (10-29, agent `speed-salsa-interned`): key map in
+> `src/interned/table.rs` (groups of seven, `Release` tag publish, outgrown tables freed in
+> `reset_for_new_revision`), CLOCK sweep over a per-shard `Vec` (8 per sweep), durability
+> stored only when it rises. One refinement of the protocol: a reader pins a stale value (a
+> reader count in the low 16 bits of `last_interned_at`) before comparing its fields, and
+> records the revision in the unpin CAS, since comparing fields a reuser may be rewriting is a
+> data race; a claim CASes from "stale, no pins". Tests: `interned/table.rs` (against a locked
+> `hashbrown::HashTable`), `interned.rs` (pin/claim), `tests/interned_lockfree.rs`,
+> `tests/parallel/interned_reuse.rs` (shuttle).
+
 ## S2a. Existing unsafe against `unsafe.md` (note for you and the safety lane)
 
 salsa has 270 `unsafe {` blocks, and three files opt out of `clippy::undocumented_unsafe_blocks`:
@@ -394,6 +404,12 @@ rewrites `zalsa_local.rs`, `function/*`, `table/memo.rs` and every ingredient, s
 your current part.
 
 > forwarded to db: a plan for the salsa owner.
+
+> Status: edges done by speed-salsa (10-29), memo header not: edges are `u32` words in one
+> database-wide array (`src/graph/`), a memo holds an `EdgeSpan`, and deep verify runs without a
+> claim (`deep_verify_unclaimed`, `tests/unclaimed_verify.rs`). The 24-byte header and memos as
+> columns (`table/memo.rs`) are left, as they need a build to do safely; costs and what is left
+> are in the notes, "Before and after (10-29)". Not built or run.
 
 ## blaze-query: `Database::get` is now `Database::pin().get` (10-29; blaze-cargo, blaze-units, blaze-tree; lane db's doc)
 

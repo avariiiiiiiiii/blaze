@@ -2,18 +2,21 @@
 
 use std::{borrow::Cow, sync::OnceLock};
 
-use base_db::{AnchoredPath, SourceDatabase};
+use base_db::{AnchoredPath, FileText, SourceDatabase};
 use cfg::CfgExpr;
 use either::Either;
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use mbe::{DelimiterKind, expect_fragment};
 use span::{Edition, FileId, Span};
-use syntax::unescape::{unescape_byte, unescape_char};
+use syntax::{
+    SyntaxKind, SyntaxNode, TextRange,
+    unescape::{unescape_byte, unescape_char},
+};
 use syntax_bridge::syntax_node_to_token_tree;
 
 use crate::{
-    EditionedFileId, ExpandError, ExpandResult, HirFileId, MacroCallId,
+    EditionedFileId, ExpandError, ExpandResult, FileRange, HirFileId, InFile, MacroCallId,
     builtin::quote::{WithDelimiter, dollar_crate, emit, group, str_literal},
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt},
     name,
@@ -37,7 +40,21 @@ macro_rules! register_builtin {
                 }
             }
 
+            /// The builtin `ident` names: its declared index and one load. A name given twice
+            /// is its first.
             fn find_by_name(ident: &name::Name) -> Option<Self> {
+                static BY_SYMBOL: intern::KnownNames =
+                    intern::KnownNames::new(&[$( sym::Declared::$name, )*]);
+                BY_SYMBOL.get(ident.symbol()).map(|at| Self::ALL[usize::from(at)])
+            }
+
+            /// Each builtin's name, in declaration order.
+            #[cfg(test)]
+            const NAMES: &[Symbol] = &[$( sym::$name, )*];
+
+            /// [`Self::find_by_name`] as a chain of compares, the reference it is tested by.
+            #[cfg(test)]
+            fn find_by_name_by_compare(ident: &name::Name) -> Option<Self> {
                 match ident {
                     $( id if *id == sym::$name => Some(Self::$kind), )*
                     _ => None,
@@ -101,7 +118,7 @@ pub fn find_builtin_macro(
 
 register_builtin! {
     BuiltinFnLikeExpander:
-    (column, Column) => line_expand,
+    (column, Column) => column_expand,
     (file, File) => file_expand,
     (line, Line) => line_expand,
     (module_path, ModulePath) => module_path_expand,
@@ -182,22 +199,118 @@ fn module_path_expand(
 pub const MODULE_PATH_PLACEHOLDER: &str = "\u{0}module_path\u{0}";
 
 fn line_expand(
-    _db: &dyn SourceDatabase,
-    _id: MacroCallId,
-    _tt: &tt::TopSubtree,
+    db: &dyn SourceDatabase,
+    id: MacroCallId,
+    tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    // dummy implementation for type-checking purposes
-    // Note that `line!` and `column!` will never be implemented properly, as they are by definition
-    // not incremental
-    static ZERO_U32: OnceLock<Symbol> = OnceLock::new();
-    let zero = tt::Literal {
-        text_and_suffix: *ZERO_U32.get_or_init(|| Symbol::intern("0u32")),
+    place_expand(db, id, tt, span, "line!", |(line, _)| line)
+}
+
+fn column_expand(
+    db: &dyn SourceDatabase,
+    id: MacroCallId,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> ExpandResult<tt::TopSubtree> {
+    place_expand(db, id, tt, span, "column!", |(_, column)| column)
+}
+
+/// `line!()` or `column!()`: the `u32` that `pick` takes of [`written_place`], as rustc's
+/// `expand_line` and `expand_column` give it. Arguments are an error, after which the value is
+/// given all the same (rustc's `check_zero_tts`).
+fn place_expand(
+    db: &dyn SourceDatabase,
+    id: MacroCallId,
+    tt: &tt::TopSubtree,
+    span: Span,
+    name: &str,
+    pick: fn((u32, u32)) -> u32,
+) -> ExpandResult<tt::TopSubtree> {
+    let err = (!tt.token_trees().is_empty())
+        .then(|| ExpandError::other(span, format!("{name} takes no arguments")));
+    let value = match written_place(db, id) {
+        Some(place) => pick(place),
+        None => {
+            let err = ExpandError::other(span, format!("{name}: the call is not in its file's text"));
+            return ExpandResult::new(tt::TopSubtree::empty(DelimSpan::from_single(span)), err);
+        }
+    };
+    let literal = tt::Literal {
+        text_and_suffix: Symbol::intern(&format!("{value}u32")),
         span,
         kind: tt::LitKind::Integer,
         suffix_len: 3,
     };
-    ExpandResult::ok(tt::TopSubtree::invisible_from_leaves(span, [tt::Leaf::Literal(zero)]))
+    let expanded = tt::TopSubtree::invisible_from_leaves(span, [tt::Leaf::Literal(literal)]);
+    match err {
+        Some(err) => ExpandResult::new(expanded, err),
+        None => ExpandResult::ok(expanded),
+    }
+}
+
+/// The line and column, both from 1, where the macro call `id` comes from in the end (rustc's
+/// `expansion_cause`): the column in code points, as `column!` counts them.
+pub fn written_place(db: &dyn SourceDatabase, id: MacroCallId) -> Option<(u32, u32)> {
+    let call = written_call(db, id);
+    let range = InFile::new(call.file_id, written_range(&call.value));
+    line_and_column(db, range.original_node_file_range_rooted(db))
+}
+
+/// The call `id` is, when it is written in a file or in what a macro was passed; else the call
+/// of the macro whose expansion wrote it, and so on up. The tokens of an `include!`d file are
+/// its own, so the walk stops in it, as rustc's stops at `include!`.
+fn written_call(db: &dyn SourceDatabase, id: MacroCallId) -> InFile<SyntaxNode> {
+    let mut call = id.loc(db).to_node(db);
+    while let Some(outer) = call.file_id.macro_file() {
+        let start = TextRange::empty(written_range(&call.value).start());
+        if call.file_id.span_map(db).span_for_range(start).ctx.is_root() {
+            break;
+        }
+        call = outer.loc(db).to_node(db);
+    }
+    call
+}
+
+/// The range of a macro call without the attributes and comments on top of it, which rustc's
+/// span of it leaves out.
+fn written_range(node: &SyntaxNode) -> TextRange {
+    let start = node
+        .children_with_tokens()
+        .find(|it| {
+            !matches!(it.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
+                && !it.kind().is_trivia()
+        })
+        .map_or(node.text_range().start(), |it| it.text_range().start());
+    TextRange::new(start, node.text_range().end())
+}
+
+/// The line and column, from 1, where `range` begins, as rustc's source map counts them: a
+/// line ends at each `'\n'`, a column is a code point, and a byte order mark that starts the
+/// file is no column.
+pub fn line_and_column(db: &dyn SourceDatabase, range: FileRange) -> Option<(u32, u32)> {
+    let text = db.file_text(range.file_id.file_id(db));
+    let starts = line_starts(db, text);
+    let at = u32::from(range.range.start());
+    let line = starts.partition_point(|&start| start <= at);
+    let line_start = *starts.get(line.checked_sub(1)?)? as usize;
+    let mut written = text.text(db).get(line_start..at as usize)?;
+    if line == 1 {
+        written = written.strip_prefix('\u{feff}').unwrap_or(written);
+    }
+    Some((line as u32, written.chars().count() as u32 + 1))
+}
+
+/// Where each line of a file begins, the first at 0.
+#[salsa::tracked(returns(deref))]
+pub fn line_starts(db: &dyn SourceDatabase, text: FileText) -> Box<[u32]> {
+    let text = text.text(db).as_bytes();
+    let mut starts = Vec::with_capacity(text.len() / 32 + 1);
+    starts.push(0);
+    starts.extend(
+        text.iter().enumerate().filter(|&(_, &byte)| byte == b'\n').map(|(at, _)| at as u32 + 1),
+    );
+    starts.into_boxed_slice()
 }
 
 fn log_syntax_expand(
@@ -1456,5 +1569,56 @@ mod tests {
             assert_eq!(escape_ascii(it), it.escape_ascii().to_string(), "{len}");
         }
         assert_eq!(escape_ascii(b"\t\r\n\\'\"\x00\x7f\xff ok"), "\\t\\r\\n\\\\\\'\\\"\\x00\\x7f\\xff ok");
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use intern::{Symbol, sym};
+
+    use super::{BuiltinFnLikeExpander, EagerExpander};
+    use crate::name::Name;
+
+    /// Every builtin's name, the same texts interned at run time, near misses of each and
+    /// other names.
+    fn candidates() -> Vec<Name> {
+        let mut symbols: Vec<Symbol> =
+            BuiltinFnLikeExpander::NAMES.iter().chain(EagerExpander::NAMES).cloned().collect();
+        let texts: Vec<String> = symbols.iter().map(|it| it.as_str().to_owned()).collect();
+        for text in &texts {
+            symbols.push(Symbol::intern(text));
+            symbols.push(Symbol::intern(&format!("{text}_")));
+            symbols.push(Symbol::intern(&text.to_uppercase()));
+            symbols.push(Symbol::intern(&text[..text.len() - 1]));
+        }
+        symbols.extend([sym::self_, sym::derive, sym::Copy, sym::sized, Symbol::intern("panic")]);
+        symbols.into_iter().map(Name::new_symbol_root).collect()
+    }
+
+    #[test]
+    fn builtin_macros_found_as_by_compare() {
+        for name in candidates() {
+            assert_eq!(
+                BuiltinFnLikeExpander::find_by_name(&name),
+                BuiltinFnLikeExpander::find_by_name_by_compare(&name),
+                "{name:?}"
+            );
+            assert_eq!(
+                EagerExpander::find_by_name(&name),
+                EagerExpander::find_by_name_by_compare(&name),
+                "{name:?}"
+            );
+        }
+        for (at, symbol) in BuiltinFnLikeExpander::NAMES.iter().enumerate() {
+            let name = Name::new_symbol_root(symbol.clone());
+            assert_eq!(
+                BuiltinFnLikeExpander::find_by_name(&name),
+                Some(BuiltinFnLikeExpander::ALL[at])
+            );
+        }
+        for (at, symbol) in EagerExpander::NAMES.iter().enumerate() {
+            let name = Name::new_symbol_root(symbol.clone());
+            assert_eq!(EagerExpander::find_by_name(&name), Some(EagerExpander::ALL[at]));
+        }
     }
 }

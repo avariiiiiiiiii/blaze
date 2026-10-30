@@ -17,7 +17,7 @@
 
 use blaze_codegen::settings::Toolchain;
 use blaze_codegen::{Arch, CompiledFunction, Init, InstanceKey, Reloc, RelocKind, Settings, Static, Target};
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::{ContentId, Hasher, radix};
 use blaze_items::{CodeHash, ItemKey};
 use blaze_link::{Debug, Format, NativeKind, Output, OutputKind, Platform};
 
@@ -138,7 +138,7 @@ impl GraphKey {
         hasher.update(&base.to_le_bytes()).update(&tls_bias.to_le_bytes());
 
         let mut natives: Vec<&NativeInput> = natives.iter().collect();
-        natives.sort_unstable_by_key(|it| it.order);
+        radix::sort_copy_by_key(&mut natives, |it| it.order);
         count(&mut hasher, natives.len());
         for NativeInput { id, kind, order } in natives {
             hasher.id(id).update(&order.to_le_bytes());

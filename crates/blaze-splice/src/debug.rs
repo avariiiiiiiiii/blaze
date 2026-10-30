@@ -19,6 +19,7 @@
 //! of. Of a program with hundreds of megabytes of them, the first copy is seconds.
 
 use anyhow::{Context, bail, ensure};
+use blaze_ids::radix;
 use object::{
     Endianness, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget,
     SectionIndex, SymbolKind, elf,
@@ -110,7 +111,7 @@ impl Described {
                 headers[it].sh_flags(endian) & flags == 0 && headers[it].sh_size(endian) != 0
             })
             .collect();
-        laid.sort_unstable_by_key(|&it| headers[it].sh_offset(endian));
+        radix::sort_copy_by_key(&mut laid, |&it| radix::pack_64(headers[it].sh_offset(endian), it as u64));
         let table = file.elf_header().e_shoff(endian);
         Ok(Described { headers, table, sections, names, laid })
     }

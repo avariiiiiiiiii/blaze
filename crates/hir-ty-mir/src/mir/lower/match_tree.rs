@@ -9,6 +9,7 @@
 
 use std::rc::Rc;
 
+use blaze_ids::radix;
 use hir_def::{
     EnumVariantId, Lookup, VariantId,
     hir::{Expr, Literal, MatchArm, Pat, PatId, UnaryOp},
@@ -254,7 +255,7 @@ fn sort(
     if answered {
         let pair = candidate.pairs.remove(at);
         candidate.pairs.extend(pair.inside);
-        candidate.pairs.sort_by_key(|it| matches!(it.ask, Ask::Or(_)));
+        radix::sort_by_key(&mut candidate.pairs, |it| u8::from(matches!(it.ask, Ask::Or(_))));
     }
     Some(branch)
 }
@@ -266,7 +267,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         let candidates = arms.iter().enumerate().map(|(arm, it)| {
             let mut pairs = Vec::new();
             self.pairs_of(it.pat, Vec::new(), &mut pairs)?;
-            pairs.sort_by_key(|it| matches!(it.ask, Ask::Or(_)));
+            radix::sort_by_key(&mut pairs, |it| u8::from(matches!(it.ask, Ask::Or(_))));
             Some(Candidate { arm, pairs, guarded: it.guard.is_some(), then: None })
         });
         let Some(candidates) = candidates.collect::<Option<Vec<_>>>() else {
@@ -310,7 +311,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 let alternatives = alternatives.iter().map(|&it| {
                     let mut pairs = Vec::new();
                     self.pairs_of(it, place.clone(), &mut pairs)?;
-                    pairs.sort_by_key(|it| matches!(it.ask, Ask::Or(_)));
+                    radix::sort_by_key(&mut pairs, |it| u8::from(matches!(it.ask, Ask::Or(_))));
                     Some(pairs)
                 });
                 let ask = Ask::Or(alternatives.collect::<Option<_>>()?);

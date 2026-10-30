@@ -163,8 +163,6 @@ pub struct Checker<'db> {
     thread: ThreadId,
     /// Whether `exit` ran for the main thread before `finish`.
     main_exited: bool,
-    /// The thread of each Tree Borrows frame, innermost last.
-    frames: Vec<ThreadId>,
     /// By `AllocId::index`: where each allocation was made and freed, for reports.
     made_at: Vec<SiteId>,
     freed_at: Vec<SiteId>,
@@ -194,7 +192,6 @@ impl<'db> Checker<'db> {
             at: SiteId::START,
             thread: ThreadId::MAIN,
             main_exited: false,
-            frames: Vec::new(),
             made_at: Vec::new(),
             freed_at: Vec::new(),
             leaks: config.leaks,
@@ -545,7 +542,6 @@ impl<'db> Machine<'db> for Checker<'db> {
     // Miri: machine.rs, `after_stack_push` and `before_stack_pop` (`on_stack_pop`).
     fn call(&mut self) -> MResult<()> {
         self.borrows.push_frame();
-        self.frames.push(self.thread);
         Ok(())
     }
 
@@ -554,13 +550,6 @@ impl<'db> Machine<'db> for Checker<'db> {
     }
 
     fn ret(&mut self) -> MResult<()> {
-        if self.frames.pop() != Some(self.thread) {
-            return Err(self.stop_unsupported(
-                "frames of two threads interleaved: Tree Borrows keeps one stack of protectors \
-                 (v2/requests/safety.md, From safety-check)"
-                    .to_owned(),
-            ));
-        }
         self.borrows.pop_frame(self.at).map_err(|e| self.fail(e.into()))
     }
 
@@ -582,6 +571,7 @@ impl<'db> Machine<'db> for Checker<'db> {
         match self.races.schedule(self.thread, &self.runnable) {
             Ok(next) => {
                 self.thread = next;
+                self.borrows.set_thread(next);
                 Ok(next.0)
             }
             Err(deadlock) => Err(self.fail(Ub::Deadlock(deadlock))),

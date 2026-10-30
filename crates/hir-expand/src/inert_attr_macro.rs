@@ -8,13 +8,12 @@
 //! name resolution, and `BUILTIN_ATTRIBUTES` is almost entirely unchanged from the original, to
 //! ease updating.
 
-use std::sync::OnceLock;
-
-use intern::Symbol;
-use rustc_hash::FxHashMap;
+use intern::{KnownNames, Symbol, sym::Declared};
 
 pub struct BuiltinAttribute {
     pub name: &'static str,
+    /// The declared symbol of `name`.
+    pub declared: Declared,
     pub template: AttributeTemplate,
 }
 
@@ -27,20 +26,24 @@ pub struct AttributeTemplate {
     pub name_value_str: Option<&'static str>,
 }
 
+/// The index in [`INERT_ATTRIBUTES`] of the attribute `name`: its declared index and one load,
+/// no hash.
+#[inline]
 pub fn find_builtin_attr_idx(name: &Symbol) -> Option<usize> {
-    static BUILTIN_LOOKUP_TABLE: OnceLock<FxHashMap<Symbol, usize>> = OnceLock::new();
-    BUILTIN_LOOKUP_TABLE
-        .get_or_init(|| {
-            INERT_ATTRIBUTES
-                .iter()
-                .map(|attr| attr.name)
-                .enumerate()
-                .map(|(a, b)| (Symbol::intern(b), a))
-                .collect()
-        })
-        .get(name)
-        .copied()
+    static BY_SYMBOL: KnownNames = KnownNames::new(&INERT_ATTRIBUTE_SYMBOLS);
+    BY_SYMBOL.get(name).map(usize::from)
 }
+
+/// Each [`INERT_ATTRIBUTES`] entry's declared symbol, at its index.
+const INERT_ATTRIBUTE_SYMBOLS: [Declared; INERT_ATTRIBUTES.len()] = {
+    let mut symbols = [Declared::__empty; INERT_ATTRIBUTES.len()];
+    let mut i = 0;
+    while i < INERT_ATTRIBUTES.len() {
+        symbols[i] = INERT_ATTRIBUTES[i].declared;
+        i += 1;
+    }
+    symbols
+};
 
 /// A convenience macro for constructing attribute templates.
 /// E.g., `template!(Word, List: "description")` means that the attribute
@@ -66,16 +69,16 @@ macro_rules! template {
 
 macro_rules! ungated {
     ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr $(, @only_local: $only_local:expr)? $(,)?) => {
-        BuiltinAttribute { name: stringify!($attr), template: $tpl }
+        BuiltinAttribute { name: stringify!($attr), declared: Declared::$attr, template: $tpl }
     };
 }
 
 macro_rules! gated {
     ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr $(, @only_local: $only_local:expr)?, $gate:ident, $msg:expr $(,)?) => {
-        BuiltinAttribute { name: stringify!($attr), template: $tpl }
+        BuiltinAttribute { name: stringify!($attr), declared: Declared::$attr, template: $tpl }
     };
     ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr $(, @only_local: $only_local:expr)?, $msg:expr $(,)?) => {
-        BuiltinAttribute { name: stringify!($attr), template: $tpl }
+        BuiltinAttribute { name: stringify!($attr), declared: Declared::$attr, template: $tpl }
     };
 }
 
@@ -96,7 +99,7 @@ macro_rules! rustc_attr {
         )
     };
     ($attr:ident, $typ:expr, $tpl:expr, $duplicates:expr $(, @only_local: $only_local:expr)?, $msg:expr $(,)?) => {
-        BuiltinAttribute { name: stringify!($attr), template: $tpl }
+        BuiltinAttribute { name: stringify!($attr), declared: Declared::$attr, template: $tpl }
     };
 }
 
@@ -709,3 +712,50 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
         "the `#[omit_gdb_pretty_printer_section]` attribute is just used for the Rust test suite",
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use intern::{Symbol, sym};
+
+    use super::{INERT_ATTRIBUTES, find_builtin_attr_idx};
+
+    /// The lookup as it was: the last attribute of a name, by its interned text.
+    fn by_text(name: &Symbol) -> Option<usize> {
+        INERT_ATTRIBUTES.iter().rposition(|it| Symbol::intern(it.name) == *name)
+    }
+
+    #[test]
+    fn every_builtin_attribute_is_found_at_its_index() {
+        for (at, attr) in INERT_ATTRIBUTES.iter().enumerate() {
+            let name = Symbol::intern(attr.name);
+            assert_eq!(name.declared_index(), Some(attr.declared as u16), "{}", attr.name);
+            assert_eq!(find_builtin_attr_idx(&name), Some(at), "{}", attr.name);
+            assert_eq!(find_builtin_attr_idx(&Symbol::intern(&attr.name.to_owned())), Some(at));
+        }
+    }
+
+    #[test]
+    fn other_names_are_found_as_by_text() {
+        let mut names: Vec<Symbol> = Vec::new();
+        for attr in INERT_ATTRIBUTES {
+            let text = attr.name;
+            for near in [
+                format!("{text}_"),
+                format!("r#{text}"),
+                text.to_uppercase(),
+                text[..text.len() - 1].to_owned(),
+                text[1..].to_owned(),
+            ] {
+                names.push(Symbol::intern(&near));
+            }
+        }
+        names.extend(["", "derive", "macro_rules", "rustc_", "not_an_attribute"].map(Symbol::intern));
+        names.extend([sym::self_, sym::fn_, sym::sized, sym::Integer::get(7)]);
+        for name in &names {
+            assert_eq!(find_builtin_attr_idx(name), by_text(name), "{name:?}");
+        }
+        assert_eq!(find_builtin_attr_idx(&sym::cfg), by_text(&sym::cfg));
+        assert!(find_builtin_attr_idx(&sym::cfg).is_some());
+        assert_eq!(find_builtin_attr_idx(&Symbol::intern("not_an_attribute")), None);
+    }
+}

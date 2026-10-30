@@ -17,6 +17,7 @@
 //! - **Init and fini** pieces of both, merged in the whole link's order (rank, link-line
 //!   order, tie), each piece's pointers in address order; fini runs last to first.
 
+use blaze_ids::radix;
 use blaze_inproc::TlsReserve;
 
 use crate::PremapError;
@@ -182,7 +183,7 @@ pub fn plan<'a>(
 
     let mut libraries: Vec<(u32, &'a str)> = image.libraries().map(|it| (it.order, it.name)).collect();
     libraries.extend(workspace.libraries.iter().map(|it| (it.order, it.name.as_str())));
-    libraries.sort_by_key(|it| it.0);
+    radix::sort_copy_by_key(&mut libraries, |it| it.0);
     let mut seen = rustc_hash::FxHashSet::default();
     let libraries = libraries.into_iter().filter(|it| seen.insert(it.1)).map(|it| it.1).collect();
 

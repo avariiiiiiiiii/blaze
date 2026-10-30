@@ -14,12 +14,10 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-blake3.workspace = true
 postcard.workspace = true
 ra-ap-rustc_lexer.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 
 # The `proc_macro` of the in-process bridge (`src/native/proc_macro/`).
 native-proc-macro.workspace = true

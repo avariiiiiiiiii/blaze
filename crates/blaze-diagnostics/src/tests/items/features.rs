@@ -23,9 +23,9 @@ fn ui(name: &str, edition: &str, source: &str) -> String {
     dated(crate::tests::ui(name, edition, source))
 }
 
-/// [`crate::tests::items::ui_core`], dated as rustc's UI tests are.
+/// A UI test `name` with minicore's `flags` as its core, checked with compiletest's flags, dated.
 fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    dated(crate::tests::items::ui_core(name, edition, flags, source))
+    ui_fixture(&format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}"))
 }
 
 /// The `.stderr` of a fixture whose workspace crate is the UI test and whose `library` crates are

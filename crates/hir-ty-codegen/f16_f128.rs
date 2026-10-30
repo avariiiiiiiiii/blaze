@@ -18,6 +18,8 @@
 
 #![forbid(unsafe_code)]
 
+use hir_ty::TargetFeature;
+
 use super::*;
 
 /// Whether `ty` is a float this module lowers.
@@ -80,12 +82,12 @@ impl<'db> FunctionCx<'_, 'db> {
     /// LLVM then works on an `f16` with: in its own register, rounded once, a signalling NaN
     /// of either operand taking precedence over a quiet one.
     pub(super) fn half_precision(&self) -> bool {
-        self.cg.target.arch == Arch::Aarch64 && self.function_enables("fp16")
+        self.cg.target.arch == Arch::Aarch64 && self.function_enables(TargetFeature::FP16)
     }
 
     /// Whether the function being compiled enables the target feature `feature`, itself or by
     /// one that implies it.
-    pub(super) fn function_enables(&self, feature: &str) -> bool {
+    pub(super) fn function_enables(&self, feature: TargetFeature) -> bool {
         self.body
             .and_then(|it| it.owner.as_function())
             .is_some_and(|func| hir_ty::TargetFeatures::from_fn(self.cg.db, func).enables(feature))
@@ -111,14 +113,14 @@ impl<'db> FunctionCx<'_, 'db> {
     /// Whether the function being compiled is x86-64's with AVX512-FP16, whose instructions
     /// LLVM works on an `f16` with there.
     fn x86_half_precision(&self) -> bool {
-        self.x86() && self.function_enables("avx512fp16")
+        self.x86() && self.function_enables(TargetFeature::AVX512FP16)
     }
 
     /// Refuses an `f16` converted in a function with F16C (which AVX-512 implies): x86-64's
     /// LLVM converts it there by `vcvtph2ps` and `vcvtps2ph`, and works on it by AVX512-FP16's
     /// instructions where it has those, not by compiler-builtins.
     fn x86_soft_half(&self) -> Result<()> {
-        if self.function_enables("f16c") {
+        if self.function_enables(TargetFeature::F16C) {
             return Err(CodegenError::Unsupported(
                 "f16 in a function with F16C, which LLVM converts by its instructions".into(),
             ));
@@ -395,46 +397,53 @@ impl<'db> FunctionCx<'_, 'db> {
 
     /// `fabs`, `sqrt`, `floor`, `ceil`, `trunc`, `round_ties_even` or `round` of an `f16` or an
     /// `f128`.
-    pub(super) fn soft_unary(&mut self, op: &str, value: Value) -> Result<Value> {
+    pub(super) fn soft_unary(&mut self, intrinsic: Intrinsic, value: Value) -> Result<Value> {
         let ty = self.builder.func.dfg.value_type(value);
-        if op == "fabs" {
+        if intrinsic == Intrinsic::Fabs {
             return Ok(self.soft_abs(value));
         }
         if ty == types::F16 && self.half_precision() {
-            let mnemonic = match op {
-                "sqrt" => "fsqrt",
-                "floor" => "frintm",
-                "ceil" => "frintp",
-                "trunc" => "frintz",
+            let mnemonic = match intrinsic {
+                Intrinsic::Sqrt => "fsqrt",
+                Intrinsic::Floor => "frintm",
+                Intrinsic::Ceil => "frintp",
+                Intrinsic::Trunc => "frintz",
                 // `rint`, in the mode a Rust program runs in, to even.
-                "round_ties_even" => "frintx",
+                Intrinsic::RoundTiesEven => "frintx",
                 _ => "frinta",
             };
             return Ok(self.half_instruction(&format!("{mnemonic} h0, h0"), &[value]));
         }
         if ty == types::F16 {
             let wide = self.widen_half(value, types::F32)?;
-            let value = match op {
-                "sqrt" => self.builder.ins().sqrt(wide),
+            let value = match intrinsic {
+                Intrinsic::Sqrt => self.builder.ins().sqrt(wide),
                 // x86-64 without SSE4.1 has no instruction for them: LLVM calls libm.
-                "floor" if self.x86() => self.float_libcall("floorf", types::F32, &[wide])?,
-                "ceil" if self.x86() => self.float_libcall("ceilf", types::F32, &[wide])?,
-                "trunc" if self.x86() => self.float_libcall("truncf", types::F32, &[wide])?,
-                "round_ties_even" if self.x86() => {
+                Intrinsic::Floor if self.x86() => {
+                    self.float_libcall("floorf", types::F32, &[wide])?
+                }
+                Intrinsic::Ceil if self.x86() => self.float_libcall("ceilf", types::F32, &[wide])?,
+                Intrinsic::Trunc if self.x86() => {
+                    self.float_libcall("truncf", types::F32, &[wide])?
+                }
+                Intrinsic::RoundTiesEven if self.x86() => {
                     self.float_libcall("rintf", types::F32, &[wide])?
                 }
-                "floor" => self.builder.ins().floor(wide),
-                "ceil" => self.builder.ins().ceil(wide),
-                "trunc" => self.builder.ins().trunc(wide),
-                "round_ties_even" => self.builder.ins().nearest(wide),
+                Intrinsic::Floor => self.builder.ins().floor(wide),
+                Intrinsic::Ceil => self.builder.ins().ceil(wide),
+                Intrinsic::Trunc => self.builder.ins().trunc(wide),
+                Intrinsic::RoundTiesEven => self.builder.ins().nearest(wide),
                 _ => self.float_libcall("roundf", types::F32, &[wide])?,
             };
             return self.narrow_to_half(value);
         }
-        let libm = match op {
-            "sqrt" | "floor" | "ceil" | "trunc" => op,
+        let libm = match intrinsic {
+            Intrinsic::Sqrt => "sqrt",
+            Intrinsic::Floor => "floor",
+            Intrinsic::Ceil => "ceil",
+            Intrinsic::Trunc => "trunc",
             // In the rounding mode a Rust program runs in, ties to even.
-            "round_ties_even" => "rint",
+            Intrinsic::RoundTiesEven => "rint",
             _ => "round",
         };
         self.quad_libcall(libm, &[value])

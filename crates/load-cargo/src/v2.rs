@@ -37,6 +37,7 @@ use base_db::{
     AbsPathBuf, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet, LibraryRoots,
     LocalRoots, SourceDatabase, SourceRoot, SourceRootId, VfsPath, ViewChange, ViewFile, ViewRoot,
 };
+use blaze_ids::radix;
 use blaze_units::{
     query::{BuildConfig, PackagePlan, Units},
     schema::{Mode, Unit},
@@ -459,7 +460,7 @@ impl Lowered {
             runs.retain(|(it, _)| *it != run);
             let applying = Applied { cfgs: cfgs.clone(), env: ran.env.clone(), out_dir: out_dir.clone() };
             runs.push((run, applying));
-            runs.sort_by_key(|(it, _)| *it);
+            radix::sort_by_key(runs, |(it, _)| *it as u64);
             let base = &self.units[dependent];
             let mut cfg = base.cfg.clone();
             let mut env: Env = base.env.iter().cloned().collect();

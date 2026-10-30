@@ -51,6 +51,23 @@ pub struct Body {
     pub self_param: Option<Param<BindingId>>,
 }
 
+/// The hash of the buffer [`blaze_format::Persist`] writes. That encoding round-trips to an
+/// equal value (`persist::assert_round_trip`), so bodies of one encoding are equal, and an
+/// evicted body's fingerprint (db-salsa) covers all that `PartialEq` compares. Written only when
+/// a value is let go of, never on a read.
+impl std::hash::Hash for Body {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        blaze_format::to_bytes(self).hash(state);
+    }
+}
+
+/// As for [`Body`].
+impl std::hash::Hash for BodySourceMap {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        blaze_format::to_bytes(self).hash(state);
+    }
+}
+
 impl ops::Deref for Body {
     type Target = ExpressionStore;
 

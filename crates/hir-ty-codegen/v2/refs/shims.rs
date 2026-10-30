@@ -9,11 +9,12 @@
 use hir_def::{
     AdtId, CallableDefId, FunctionId, VariantId,
     layout::Variants,
-    signatures::{FunctionSignature, StructFlags, StructSignature},
+    signatures::{StructFlags, StructSignature},
 };
 use hir_ty::{
     consteval::try_const_usize,
     drop::DropGlue,
+    intrinsic::intrinsic_of,
     next_solver::{GenericArgs, Region, Ty, TyKind},
 };
 use hir_ty_mir::mir::location::track_caller;
@@ -328,8 +329,10 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
         match ty.kind() {
             TyKind::FnDef(def, generic_args) => match def.0 {
                 CallableDefId::FunctionId(func) => {
-                    if FunctionSignature::is_intrinsic(self.db(), func) {
-                        return Err("shim for an intrinsic".to_owned());
+                    if let Some(intrinsic) =
+                        intrinsic_of(self.db(), func).map_err(|it| it.to_string())?
+                    {
+                        return Err(format!("shim for the intrinsic `{intrinsic}`"));
                     }
                     // A callee that tracks its caller is handed the place of its
                     // declaration, data of the shim's own.

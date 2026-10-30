@@ -100,4 +100,48 @@ extern "C" {
         Length: usize,
         SLPVectorization: LLVMBool,
     ) -> LLVMErrorRef;
+    /// Instruments `M` for `Wanted`, which is read during the call only: SanitizerCoverage,
+    /// then MemorySanitizer, ThreadSanitizer and AddressSanitizer, as clang orders them and with
+    /// rustc's options for each. `M` is of the context the passes were first run with.
+    pub fn LLVMBlazeRunSanitizers(
+        Passes: LLVMBlazePassesRef,
+        M: LLVMModuleRef,
+        Wanted: *const LLVMBlazeSanitizers,
+    ) -> LLVMErrorRef;
 }
+
+/// blaze: what [`LLVMBlazeRunSanitizers`] instruments for (wrappers/passes.cpp's struct of
+/// the same name, field for field). A 0 is false.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct LLVMBlazeSanitizers {
+    pub Address: u8,
+    pub AddressRecover: u8,
+    pub Thread: u8,
+    pub Memory: u8,
+    pub MemoryRecover: u8,
+    /// `-sanitizer-coverage-level`, 1 to 4; any other is no SanitizerCoverage.
+    pub CoverageLevel: u8,
+    /// The `LLVMBlazeCoverage*` bits.
+    pub CoverageFlags: u16,
+    /// 0, 1 or 2.
+    pub MemoryTrackOrigins: i32,
+}
+
+/// The `-sanitizer-coverage-*` switches of [`LLVMBlazeSanitizers::CoverageFlags`].
+pub const LLVMBlazeCoverageTracePC: u16 = 1 << 0;
+pub const LLVMBlazeCoverageTracePCGuard: u16 = 1 << 1;
+pub const LLVMBlazeCoverageInline8bitCounters: u16 = 1 << 2;
+pub const LLVMBlazeCoverageInlineBoolFlag: u16 = 1 << 3;
+pub const LLVMBlazeCoveragePCTable: u16 = 1 << 4;
+pub const LLVMBlazeCoverageTraceCmp: u16 = 1 << 5;
+pub const LLVMBlazeCoverageTraceDiv: u16 = 1 << 6;
+pub const LLVMBlazeCoverageTraceGep: u16 = 1 << 7;
+pub const LLVMBlazeCoverageTraceLoads: u16 = 1 << 8;
+pub const LLVMBlazeCoverageTraceStores: u16 = 1 << 9;
+pub const LLVMBlazeCoverageNoPrune: u16 = 1 << 10;
+pub const LLVMBlazeCoverageStackDepth: u16 = 1 << 11;
+pub const LLVMBlazeCoverageTracePCEntryExit: u16 = 1 << 12;
+pub const LLVMBlazeCoverageControlFlow: u16 = 1 << 13;
+
+const _: () = assert!(std::mem::size_of::<LLVMBlazeSanitizers>() == 12);

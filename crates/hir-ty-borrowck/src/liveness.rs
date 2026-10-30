@@ -2,6 +2,7 @@
 //! whose type has it may still be used, and where a local may still be dropped while it may
 //! be initialized, for the regions dropping it uses.
 
+use blaze_ids::radix;
 use hir_def::{AdtId, attrs::AttrFlags};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
@@ -346,8 +347,9 @@ pub(super) fn region_liveness<'db>(
             next += 1;
         }
     }
-    dropped.sort_by_cached_key(|&local| {
-        (drop_live[local].iter().map(|point| rank[point]).min().unwrap_or(usize::MAX), local)
+    radix::sort_by_key(&mut dropped, |&local| {
+        let first = drop_live[local].iter().map(|point| rank[point]).min().unwrap_or(usize::MAX);
+        radix::pack_64(first as u64, local as u64)
     });
     let mut components = DropComponents::new(ctx, regions);
     for local in dropped {
@@ -570,7 +572,7 @@ impl<'c, 'a, 'db> DropComponents<'c, 'a, 'db> {
             return Some(low);
         }
         let all = &mut self.found[found..];
-        all.sort_unstable();
+        radix::sort(all);
         let from = self.pool.len() as u32;
         for (index, &rv) in all.iter().enumerate() {
             if index == 0 || all[index - 1] != rv {

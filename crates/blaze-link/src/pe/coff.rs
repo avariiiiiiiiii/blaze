@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 use std::sync::Mutex;
 
+use blaze_ids::radix;
 use object::LittleEndian as LE;
 use object::pe;
 use object::read::SymbolIndex;
@@ -668,7 +669,9 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             read.symbols.push(Symbol { name, def, binding, kind, hidden: true });
         }
         // A symbol's size runs to the next greater value in its section, or the section's end.
-        defined.sort_unstable();
+        radix::sort_copy_by_key(&mut defined, |&(section, value, symbol)| {
+            (u128::from(section) << 96) | (u128::from(value) << 32) | u128::from(symbol)
+        });
         for run in defined.chunk_by(|a, b| a.0 == b.0) {
             let mut end = u64::from(self.header(run[0].0 as usize).size_of_raw_data.get(LE));
             let mut at = None;
@@ -820,7 +823,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 group => members.push((group, index as u32)),
             }
         }
-        members.sort_by_key(|it| it.0);
+        radix::sort_copy_by_key(&mut members, |it| it.0);
         object.grouped.reserve(members.len());
         for run in members.chunk_by(|a, b| a.0 == b.0) {
             let start = self.run(object.grouped.len())?;

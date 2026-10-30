@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 blaze-graph.workspace = true
+blaze-ids.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]

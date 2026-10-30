@@ -9,6 +9,7 @@
 //! `InvalidTarget`), `compiler/rustc_attr_parsing/src/target_checking.rs` (`check_target`,
 //! `check_crate_level`) and `compiler/rustc_attr_parsing/src/template.rs` (MIT or Apache-2.0).
 
+use blaze_items::Fact;
 use hir::InFile;
 use span::Edition;
 use syntax::{TextRange, TextSize};

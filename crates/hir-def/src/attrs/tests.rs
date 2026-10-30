@@ -609,3 +609,354 @@ pub fn documented() {
     let docs = AttrFlags::docs(&db, func.into()).expect("docs");
     assert!(docs.docs().contains("outer") && docs.docs().contains("inner"), "{:?}", docs.docs());
 }
+
+fn tt_of(attr: &str) -> ast::TokenTree {
+    match meta_of(attr) {
+        ast::Meta::TokenTreeMeta(meta) => meta.token_tree().expect("a token tree"),
+        _ => panic!("no token tree in {attr:?}"),
+    }
+}
+
+/// Each option of a name set, the near misses of it, and other identifiers, as the one option
+/// of `#[path(..)]`.
+fn option_corpus(path: &str, texts: &[&str]) -> Vec<String> {
+    let mut options: Vec<String> = Vec::new();
+    for text in texts.iter().chain(&["xy", "Braces", "array_", "ignore"]) {
+        options.push((*text).to_owned());
+        options.push(format!("r#{text}"));
+        options.push(format!("{text}s"));
+        options.push(text[..text.len() - 1].to_owned());
+    }
+    let mut corpus: Vec<String> =
+        options.iter().filter(|it| !it.is_empty()).map(|it| format!("#[{path}({it})]")).collect();
+    corpus.push(format!("#[{path}()]"));
+    corpus.push(format!("#[{path}({}, {})]", texts[0], texts[texts.len() - 1]));
+    corpus.push(format!("#[{path}(\"{}\")]", texts[0]));
+    corpus
+}
+
+#[test]
+fn option_sets_flag_as_the_string_match_did() {
+    use syntax::{NodeOrToken, ast::TokenTreeChildren};
+
+    fn old_ra_completions(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
+        let tt = TokenTreeChildren::new(&tt);
+        if let Ok(NodeOrToken::Token(option)) = itertools::Itertools::exactly_one(tt)
+            && option.kind().is_any_identifier()
+        {
+            match option.text() {
+                "ignore_flyimport" => attr_flags.insert(AttrFlags::COMPLETE_IGNORE_FLYIMPORT),
+                "ignore_methods" => attr_flags.insert(AttrFlags::COMPLETE_IGNORE_METHODS),
+                "ignore_flyimport_methods" => {
+                    attr_flags.insert(AttrFlags::COMPLETE_IGNORE_FLYIMPORT_METHODS)
+                }
+                _ => {}
+            }
+        }
+    }
+    fn old_ra_macro_style(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
+        let tt = TokenTreeChildren::new(&tt);
+        if let Ok(NodeOrToken::Token(option)) = itertools::Itertools::exactly_one(tt)
+            && option.kind().is_any_identifier()
+        {
+            match option.text() {
+                "braces" => attr_flags.insert(AttrFlags::MACRO_STYLE_BRACES),
+                "brackets" => attr_flags.insert(AttrFlags::MACRO_STYLE_BRACKETS),
+                "parentheses" => attr_flags.insert(AttrFlags::MACRO_STYLE_PARENTHESES),
+                _ => {}
+            }
+        }
+    }
+    fn old_skip_during_method_dispatch(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
+        for kind in TokenTreeChildren::new(&tt) {
+            if let NodeOrToken::Token(kind) = kind
+                && kind.kind().is_any_identifier()
+            {
+                match kind.text() {
+                    "array" => {
+                        attr_flags.insert(AttrFlags::RUSTC_SKIP_ARRAY_DURING_METHOD_DISPATCH)
+                    }
+                    "boxed_slice" => {
+                        attr_flags.insert(AttrFlags::RUSTC_SKIP_BOXED_SLICE_DURING_METHOD_DISPATCH)
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    type Extract = fn(&mut AttrFlags, ast::TokenTree);
+    for (path, texts, new, old) in [
+        (
+            "rust_analyzer::completions",
+            Completions::TEXTS,
+            extract_ra_completions as Extract,
+            old_ra_completions as Extract,
+        ),
+        (
+            "rust_analyzer::macro_style",
+            MacroStyle::TEXTS,
+            extract_ra_macro_style as Extract,
+            old_ra_macro_style as Extract,
+        ),
+        (
+            "rustc_skip_during_method_dispatch",
+            SkipDuringMethodDispatch::TEXTS,
+            extract_rustc_skip_during_method_dispatch as Extract,
+            old_skip_during_method_dispatch as Extract,
+        ),
+    ] {
+        for attr in option_corpus(path, texts) {
+            let (mut got, mut want) = (AttrFlags::empty(), AttrFlags::empty());
+            new(&mut got, tt_of(&attr));
+            old(&mut want, tt_of(&attr));
+            assert_eq!(got, want, "{attr}");
+        }
+    }
+}
+
+#[test]
+fn doc_atoms_flag_as_the_string_match_did() {
+    let mut corpus = Vec::new();
+    for &text in DocWord::TEXTS.iter().chain(&["inline", "test", "xy"]) {
+        for atom in [
+            text.to_owned(),
+            format!("r#{text}"),
+            format!("{text}_"),
+            text[..text.len() - 1].to_owned(),
+        ] {
+            if atom.is_empty() {
+                continue;
+            }
+            corpus.push(format!("#[doc({atom})]"));
+            corpus.push(format!("#[doc({atom} = \"v\")]"));
+            corpus.push(format!("#[doc({atom} = 1)]"));
+            corpus.push(format!("#[doc({atom}(\"a\"))]"));
+            corpus.push(format!("#[doc({atom}, hidden)]"));
+        }
+    }
+    for attr in corpus {
+        let meta = meta_of(&attr);
+        let (mut old, mut new) = (AttrFlags::empty(), AttrFlags::empty());
+        let _ = old_match_attr_flags(&mut old, meta.clone());
+        let _ = match_attr_flags(&mut new, meta);
+        assert_eq!(new - GATING, old, "{attr}");
+    }
+}
+
+/// `parse_repr_tt` as it was, by string `match` and `BuiltinInt::from_suffix`.
+fn old_parse_repr_tt(tt: &ast::TokenTree) -> Option<rustc_abi::ReprOptions> {
+    use crate::builtin_type::{BuiltinInt, BuiltinUint};
+    use either::Either;
+    use rustc_abi::{Align, Integer, IntegerType, ReprFlags, ReprOptions};
+    use syntax::{NodeOrToken, ast::TokenTreeChildren};
+
+    let mut tts = TokenTreeChildren::new(tt).peekable();
+    let mut acc = ReprOptions::default();
+    while let Some(tt) = tts.next() {
+        let NodeOrToken::Token(ident) = tt else { continue };
+        if !ident.kind().is_any_identifier() {
+            continue;
+        }
+        let literal = |tts: &mut std::iter::Peekable<TokenTreeChildren>| {
+            if let Some(NodeOrToken::Node(tt)) = tts.peek() {
+                let tt = tt.clone();
+                tts.next();
+                let mut tt_iter = TokenTreeChildren::new(&tt);
+                if let Some(NodeOrToken::Token(lit)) = tt_iter.next()
+                    && let Some(lit) = ast::IntNumber::cast(lit)
+                    && let Ok(lit) = lit.value()
+                    && let Ok(lit) = u64::try_from(lit)
+                {
+                    return (true, Some(lit));
+                }
+                return (true, None);
+            }
+            (false, None)
+        };
+        let repr = match ident.text().trim_start_matches("r#") {
+            "packed" => {
+                let pack = literal(&mut tts).1.unwrap_or(0);
+                ReprOptions {
+                    pack: Some(Align::from_bytes(pack).unwrap_or(Align::ONE)),
+                    ..Default::default()
+                }
+            }
+            "align" => {
+                let align = literal(&mut tts).1.and_then(|it| Align::from_bytes(it).ok());
+                ReprOptions { align, ..Default::default() }
+            }
+            "C" => ReprOptions { flags: ReprFlags::IS_C, ..Default::default() },
+            "transparent" => ReprOptions { flags: ReprFlags::IS_TRANSPARENT, ..Default::default() },
+            "simd" => ReprOptions { flags: ReprFlags::IS_SIMD, ..Default::default() },
+            repr => {
+                let int = BuiltinInt::from_suffix(repr)
+                    .map(Either::Left)
+                    .or_else(|| BuiltinUint::from_suffix(repr).map(Either::Right))
+                    .map(|builtin| match builtin {
+                        Either::Left(bi) => match bi {
+                            BuiltinInt::Isize => IntegerType::Pointer(true),
+                            BuiltinInt::I8 => IntegerType::Fixed(Integer::I8, true),
+                            BuiltinInt::I16 => IntegerType::Fixed(Integer::I16, true),
+                            BuiltinInt::I32 => IntegerType::Fixed(Integer::I32, true),
+                            BuiltinInt::I64 => IntegerType::Fixed(Integer::I64, true),
+                            BuiltinInt::I128 => IntegerType::Fixed(Integer::I128, true),
+                        },
+                        Either::Right(bu) => match bu {
+                            BuiltinUint::Usize => IntegerType::Pointer(false),
+                            BuiltinUint::U8 => IntegerType::Fixed(Integer::I8, false),
+                            BuiltinUint::U16 => IntegerType::Fixed(Integer::I16, false),
+                            BuiltinUint::U32 => IntegerType::Fixed(Integer::I32, false),
+                            BuiltinUint::U64 => IntegerType::Fixed(Integer::I64, false),
+                            BuiltinUint::U128 => IntegerType::Fixed(Integer::I128, false),
+                        },
+                    });
+                ReprOptions { int, ..Default::default() }
+            }
+        };
+        super::merge_repr(&mut acc, repr);
+    }
+    Some(acc)
+}
+
+#[test]
+fn repr_hints_read_as_the_string_match_did() {
+    let mut hints: Vec<String> = Vec::new();
+    for &text in ReprWord::TEXTS.iter().chain(&["Rust", "c", "i256", "f32", "x"]) {
+        hints.push(text.to_owned());
+        hints.push(format!("r#{text}"));
+        hints.push(format!("{text}_"));
+        hints.push(text.to_uppercase());
+        hints.push(text[..text.len() - 1].to_owned());
+    }
+    let mut corpus: Vec<String> = hints
+        .iter()
+        .filter(|it| !it.is_empty() && !it.starts_with(|c: char| c.is_ascii_digit()))
+        .map(|it| format!("#[repr({it})]"))
+        .collect();
+    corpus.extend(
+        [
+            "#[repr(packed(4))]",
+            "#[repr(packed(3))]",
+            "#[repr(packed)]",
+            "#[repr(align(16))]",
+            "#[repr(align(3))]",
+            "#[repr(align)]",
+            "#[repr(C, u8)]",
+            "#[repr(u8, C, align(8), packed(2))]",
+            "#[repr(transparent, simd)]",
+            "#[repr(i32, u64)]",
+            "#[repr(\"C\")]",
+            "#[repr()]",
+        ]
+        .map(str::to_owned),
+    );
+    for attr in corpus {
+        let tt = tt_of(&attr);
+        assert_eq!(parse_repr_tt(&tt), old_parse_repr_tt(&tt), "{attr}");
+    }
+}
+
+/// `parse_link_tt` as it was, by string `match`.
+fn old_parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<cfg::CfgExpr>)> {
+    use syntax::{NodeOrToken, SyntaxKind, T, ast::TokenTreeChildren};
+
+    let mut lib = NativeLib {
+        name: Symbol::empty(),
+        kind: NativeLibKind::Unspecified,
+        verbatim: false,
+        whole_archive: false,
+        bundle: true,
+    };
+    let mut cfg = None;
+    let mut named = false;
+    let mut children = TokenTreeChildren::new(tt).peekable();
+    while let Some(child) = children.next() {
+        let NodeOrToken::Token(key) = child else { continue };
+        if key.kind() != SyntaxKind::IDENT {
+            continue;
+        }
+        match children.peek() {
+            Some(NodeOrToken::Node(group)) if key.text() == "cfg" => {
+                cfg = link_cfg(group);
+                children.next();
+            }
+            Some(NodeOrToken::Token(eq)) if eq.kind() == T![=] => {
+                children.next();
+                let Some(NodeOrToken::Token(value)) = children.next() else { continue };
+                let Some(value) =
+                    ast::String::cast(value).and_then(|it| Some(it.value().ok()?.into_owned()))
+                else {
+                    continue;
+                };
+                match key.text() {
+                    "name" => {
+                        lib.name = Symbol::intern(&value);
+                        named = true;
+                    }
+                    "kind" => {
+                        lib.kind = match &*value {
+                            "static" => NativeLibKind::Static,
+                            "dylib" => NativeLibKind::Dylib,
+                            "framework" => NativeLibKind::Framework,
+                            "raw-dylib" => NativeLibKind::RawDylib,
+                            _ => NativeLibKind::Unspecified,
+                        }
+                    }
+                    "modifiers" => {
+                        for modifier in value.split(',') {
+                            let (on, name) = modifier.split_at(modifier.len().min(1));
+                            match name {
+                                "verbatim" => lib.verbatim = on == "+",
+                                "whole-archive" => lib.whole_archive = on == "+",
+                                "bundle" => lib.bundle = on == "+",
+                                _ => (),
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            _ => (),
+        }
+    }
+    named.then_some((lib, cfg))
+}
+
+#[test]
+fn link_attrs_read_as_the_string_match_did() {
+    let mut corpus: Vec<String> = Vec::new();
+    for &key in LinkKey::TEXTS.iter().chain(&["wasm_import_module", "names", "Kind", "r#name"]) {
+        corpus.push(format!("#[link({key} = \"foo\")]"));
+        corpus.push(format!("#[link(name = \"a\", {key} = \"static\")]"));
+        corpus.push(format!("#[link(name = \"a\", {key}(unix))]"));
+        corpus.push(format!("#[link(name = \"a\", {key} = 1)]"));
+    }
+    let kinds = LinkKind::TEXTS.iter().chain(&["Static", "dylib_", "raw_dylib", "", "framewor"]);
+    for kind in kinds {
+        corpus.push(format!("#[link(name = \"a\", kind = \"{kind}\")]"));
+    }
+    let modifiers =
+        LinkModifier::TEXTS.iter().chain(&["whole_archive", "Bundle", "verbatim_", "", "x"]);
+    for modifier in modifiers {
+        for sign in ["+", "-", "", "*"] {
+            corpus.push(format!("#[link(name = \"a\", modifiers = \"{sign}{modifier}\")]"));
+        }
+    }
+    corpus.extend(
+        [
+            "#[link(name = \"a\", modifiers = \"+verbatim,-bundle,+whole-archive\")]",
+            "#[link(name = \"a\", modifiers = \"\")]",
+            "#[link(name = \"a\", kind = \"static\", kind = \"dylib\")]",
+            "#[link(name = \"a\", cfg(target_os = \"linux\"))]",
+            "#[link(name = \"a\", cfg = \"x\")]",
+            "#[link(wasm_import_module = \"m\")]",
+            "#[link()]",
+        ]
+        .map(str::to_owned),
+    );
+    for attr in corpus {
+        let tt = tt_of(&attr);
+        assert_eq!(parse_link_tt(&tt), old_parse_link_tt(&tt), "{attr}");
+    }
+}

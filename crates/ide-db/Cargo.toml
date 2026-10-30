@@ -32,6 +32,7 @@ smallvec.workspace = true
 # local deps
 base-db.workspace = true
 blaze-graph.workspace = true
+blaze-ids.workspace = true
 parser.workspace = true
 profile.workspace = true
 stdx.workspace = true

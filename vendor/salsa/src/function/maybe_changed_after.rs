@@ -11,7 +11,10 @@ use std::sync::atomic::Ordering;
 
 use crate::key::DatabaseKeyIndex;
 use crate::zalsa::{MemoIngredientIndex, Zalsa, ZalsaDatabase};
-use crate::zalsa_local::{QueryEdgeKind, QueryEdges, QueryOriginRef, QueryRevisions, ZalsaLocal};
+use crate::zalsa_local::{
+    QueryEdgeIter, QueryEdgeKind, QueryEdges, QueryOriginRef, QueryRevisions, ZalsaLocal,
+};
+use smallvec::SmallVec;
 use crate::{Id, Revision};
 
 /// Result of memo validation.
@@ -123,7 +126,7 @@ where
 
             if memo
                 .header
-                .deep_verify_unclaimed(zalsa, db.into(), database_key_index, 0)
+                .deep_verify_unclaimed(zalsa, db.into(), database_key_index)
             {
                 return memo.header.verify_result_after(revision);
             }
@@ -280,43 +283,65 @@ where
     }
 }
 
-impl<C> IngredientImpl<C>
-where
-    C: Configuration,
-{
-    /// [`Ingredient::verify_unclaimed`](crate::ingredient::Ingredient::verify_unclaimed) for a
-    /// function: the hot check, then the claim-free walk of the memo's edges.
-    pub(super) fn verify_memo_unclaimed(
-        &self,
-        zalsa: &Zalsa,
-        db: RawDatabase<'_>,
-        id: Id,
-        revision: Revision,
-        depth: u32,
-    ) -> Option<VerifyResult> {
-        let memo_ingredient_index = self.memo_ingredient_index(zalsa, id);
-        let database_key_index = self.database_key_index(id);
-        let Some(memo) = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index) else {
-            return Some(VerifyResult::changed());
-        };
-        if let Some(result) = memo.header.maybe_changed_after_hot(
-            zalsa,
-            database_key_index,
-            revision,
-            #[cfg(feature = "detailed-trace")]
-            memo.value.is_some(),
-        ) {
-            return Some(result);
-        }
-        memo.header
-            .deep_verify_unclaimed(zalsa, db, database_key_index, depth)
-            .then(|| memo.header.verify_result_after(revision))
-    }
+/// A memo on the claim-free walk, and the part of its edges still to check.
+struct UnclaimedFrame<'db> {
+    header: &'db MemoHeader,
+    key: DatabaseKeyIndex,
+    edges: QueryEdgeIter<'db>,
+    /// The position in `edges` of the next edge.
+    position: usize,
+    verified_at: Revision,
+    #[cfg(feature = "accumulator")]
+    inputs: InputAccumulatedValues,
 }
 
-/// How deep the claim-free walk goes before it leaves the rest to a claimed check, so the stack
-/// stays bounded on a long chain of memos.
-const UNCLAIMED_DEPTH: u32 = 256;
+impl<'db> UnclaimedFrame<'db> {
+    fn new(header: &'db MemoHeader, key: DatabaseKeyIndex, edges: QueryEdgeIter<'db>) -> Self {
+        UnclaimedFrame {
+            header,
+            key,
+            edges,
+            position: 0,
+            verified_at: header.verified_at.load(),
+            #[cfg(feature = "accumulator")]
+            inputs: InputAccumulatedValues::Empty,
+        }
+    }
+
+    /// Folds in what the input at `position` gave; false if it changed for this memo.
+    fn take(
+        &mut self,
+        zalsa: &Zalsa,
+        position: usize,
+        dependency: DatabaseKeyIndex,
+        mut result: VerifyResult,
+    ) -> bool {
+        if let VerifyResult::Changed = result
+            && let Some(saw) = self.header.revisions.edge_fingerprint(position)
+            && let Some(unchanged) =
+                unchanged_by_fingerprint(zalsa, dependency, saw, &self.header.revisions)
+        {
+            result = unchanged;
+        }
+        match result {
+            VerifyResult::Changed => false,
+            #[cfg(feature = "accumulator")]
+            VerifyResult::Unchanged { accumulated } => {
+                self.inputs |= accumulated;
+                true
+            }
+            #[cfg(not(feature = "accumulator"))]
+            VerifyResult::Unchanged { .. } => true,
+        }
+    }
+
+    /// Every input was unchanged: the memo is verified.
+    fn finish(&self, zalsa: &Zalsa) {
+        #[cfg(feature = "accumulator")]
+        self.header.revisions.accumulated_inputs.store(self.inputs);
+        self.header.mark_as_verified(zalsa, self.key);
+    }
+}
 
 impl MemoHeader {
     /// What a reader verified at `revision` learns from this memo, now verified.
@@ -329,70 +354,102 @@ impl MemoHeader {
         }
     }
 
-    /// Verifies the memo by its edges with no claim (rustc's `try_mark_green`): true when every
-    /// input is unchanged, and the memo is then marked verified. False when it can't be decided
-    /// without a claim: the memo is (or was) part of a cycle, has outputs to mark, read untracked
-    /// state, or an input changed or may have to run. Only reads and the idempotent stores of a
-    /// verification (`verified_at`, the accumulated-inputs flag) happen here, so two tasks
-    /// walking the same memo agree, and one running it under a claim sees the same inputs.
-    pub(super) fn deep_verify_unclaimed(
-        &self,
-        zalsa: &Zalsa,
-        db: RawDatabase<'_>,
-        database_key_index: DatabaseKeyIndex,
-        depth: u32,
-    ) -> bool {
-        if depth >= UNCLAIMED_DEPTH
-            || self.may_be_provisional()
+    /// The edges of a memo the claim-free walk may verify: not (ever) part of a cycle, and
+    /// derived from tracked reads only.
+    fn unclaimed_edges<'db>(&'db self, zalsa: &'db Zalsa) -> Option<QueryEdgeIter<'db>> {
+        if self.may_be_provisional()
             || self.was_cycle_participant()
             || !self.cycle_heads().is_empty()
         {
-            return false;
+            return None;
         }
-        let QueryOriginRef::Derived(edges) = self.origin(zalsa.graph()) else {
+        match self.origin(zalsa.graph()) {
+            QueryOriginRef::Derived(edges) => Some(edges.iter()),
+            QueryOriginRef::DerivedUntracked(_) | QueryOriginRef::Assigned(_) => None,
+        }
+    }
+
+    /// Verifies the memo by its edges with no claim (rustc's `try_mark_green`): true when every
+    /// input is unchanged, and the memo (with every function memo found unchanged on the way) is
+    /// then marked verified. False when only a claimed check can decide: a memo on the way is
+    /// (or was) part of a cycle, has outputs to mark, read untracked state, or has an input
+    /// that changed or may have to run. Nothing runs and nothing is claimed; the only writes
+    /// are the idempotent stores of a verification (`verified_at`, the accumulated-inputs
+    /// flag), so tasks walking the same memos agree, and one running a memo under its claim
+    /// sees the same inputs.
+    ///
+    /// The walk keeps its own stack (eight memos inline), so a chain of any depth is walked
+    /// once, in the order the claimed check walks it.
+    pub(super) fn deep_verify_unclaimed<'db>(
+        &'db self,
+        zalsa: &'db Zalsa,
+        db: RawDatabase<'_>,
+        database_key_index: DatabaseKeyIndex,
+    ) -> bool {
+        let Some(edges) = self.unclaimed_edges(zalsa) else {
             return false;
         };
-        let verified_at = self.verified_at.load();
-        #[cfg(feature = "accumulator")]
-        let mut inputs = InputAccumulatedValues::Empty;
+        let mut stack: SmallVec<[UnclaimedFrame<'db>; 8]> = SmallVec::new();
+        stack.push(UnclaimedFrame::new(self, database_key_index, edges));
 
-        for (position, edge) in edges.iter().enumerate() {
+        while let Some(frame) = stack.last_mut() {
+            let Some(edge) = frame.edges.next() else {
+                let done = stack.pop().expect("salsa: the walk's stack holds the memo it checks");
+                done.finish(zalsa);
+                let Some(parent) = stack.last_mut() else {
+                    return true;
+                };
+                let result = done.header.verify_result_after(parent.verified_at);
+                if !parent.take(zalsa, parent.position - 1, done.key, result) {
+                    return false;
+                }
+                continue;
+            };
+            let position = frame.position;
+            frame.position += 1;
             if edge.kind() == QueryEdgeKind::Output {
                 return false;
             }
-            let dependency_index = edge.key();
-            // SAFETY: `db` is the database every ingredient of `zalsa` was created with.
-            let mut result = unsafe {
-                zalsa
-                    .lookup_ingredient(dependency_index.ingredient_index())
-                    .verify_unclaimed(
+            let dependency = edge.key();
+            let ingredient = zalsa.lookup_ingredient(dependency.ingredient_index());
+            let result = match ingredient.as_function() {
+                Some(function) => {
+                    let Some(memo) = function.memo(zalsa, dependency.key_index()) else {
+                        return false;
+                    };
+                    let header = memo.header();
+                    match header.maybe_changed_after_hot(
+                        zalsa,
+                        dependency,
+                        frame.verified_at,
+                        #[cfg(feature = "detailed-trace")]
+                        memo.has_value(),
+                    ) {
+                        Some(result) => result,
+                        None => {
+                            let Some(edges) = header.unclaimed_edges(zalsa) else {
+                                return false;
+                            };
+                            stack.push(UnclaimedFrame::new(header, dependency, edges));
+                            continue;
+                        }
+                    }
+                }
+                // SAFETY: `db` is the database every ingredient of `zalsa` was created with.
+                None => unsafe {
+                    ingredient.maybe_changed_after(
                         zalsa,
                         db,
-                        dependency_index.key_index(),
-                        verified_at,
-                        depth + 1,
+                        dependency.key_index(),
+                        frame.verified_at,
                     )
+                },
             };
-            if let Some(VerifyResult::Changed) = result
-                && let Some(saw) = self.revisions.edge_fingerprint(position)
-                && let Some(unchanged) =
-                    unchanged_by_fingerprint(zalsa, dependency_index, saw, &self.revisions)
-            {
-                result = Some(unchanged);
-            }
-            match result {
-                #[cfg(feature = "accumulator")]
-                Some(VerifyResult::Unchanged { accumulated }) => inputs |= accumulated,
-                #[cfg(not(feature = "accumulator"))]
-                Some(VerifyResult::Unchanged { .. }) => {}
-                Some(VerifyResult::Changed) | None => return false,
+            if !frame.take(zalsa, position, dependency, result) {
+                return false;
             }
         }
-
-        #[cfg(feature = "accumulator")]
-        self.revisions.accumulated_inputs.store(inputs);
-        self.mark_as_verified(zalsa, database_key_index);
-        true
+        unreachable!("salsa: the claim-free walk returns when it pops its first memo")
     }
 
     fn maybe_changed_after_hot(

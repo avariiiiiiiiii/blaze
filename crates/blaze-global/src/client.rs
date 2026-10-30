@@ -683,7 +683,7 @@ fn fetched(
         }
         match which {
             wire::MISSING => {
-                outcomes.store.push(Completion { tag, done: Done::Read(Answer::Missing { key }.encode()) });
+                outcomes.store.push(Completion { tag, done: Done::Read(Answer::Missing { key }.encode_framed()) });
             }
             wire::DEFERRED => deferred.push((tag, key)),
             wire::FOUND => {
@@ -704,7 +704,7 @@ fn fetched(
                         let bytes = value.expect("a value whose record is checked is kept");
                         let found = blaze_cas::content_of(&bytes);
                         if found == record.content {
-                            Done::Read(Answer::Value { key, kind: record.kind, content: record.content, bytes }.encode())
+                            Done::Read(Answer::Value { key, kind: record.kind, content: record.content, bytes }.encode_framed())
                         } else {
                             let what = format!("its bytes hash to {found:x}, not the {:x} its record names", record.content);
                             Done::Failed(IoError(Refused { key, what }.to_string()))

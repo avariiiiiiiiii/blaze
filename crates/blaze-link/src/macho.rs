@@ -35,6 +35,7 @@ use std::cmp::Ordering;
 use std::sync::Mutex;
 
 use blaze_codegen::Arch;
+use blaze_ids::radix;
 use object::macho;
 
 use crate::model::{
@@ -1268,7 +1269,7 @@ impl MachO {
                 ranges.push((section.addr, section.addr + section.size, ordinal));
             }
         }
-        ranges.sort_unstable();
+        radix::sort_copy_by_key(&mut ranges, |&(start, end, _)| radix::pack_64(start, end));
         let section_at = |addr: u64, what: &str| -> Result<u8, LinkError> {
             let at = ranges.partition_point(|it| it.0 <= addr);
             (ranges[..at].iter().rev())
@@ -1367,7 +1368,7 @@ impl MachO {
         // The GOT's cells by address, walked alongside each `__got` section's cells.
         let mut got: Vec<(u64, &Holds)> = placed.got.iter().map(|it| (it.addr, &it.holds)).collect();
         if !got.is_sorted_by_key(|it| it.0) {
-            got.sort_unstable_by_key(|it| it.0);
+            radix::sort_by_key(&mut got, |it| it.0);
         }
         let mut indirect = Out::default();
         let mut indirect_count = 0u32;

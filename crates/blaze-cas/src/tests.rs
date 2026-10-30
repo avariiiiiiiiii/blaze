@@ -517,7 +517,7 @@ fn a_head_round_trips_and_refuses_any_change() {
                 unit: 2,
                 committed: 3 * 4096,
                 indexed: 4096,
-                dead: 100,
+                dead: 112,
                 removed: false,
             },
         ],
@@ -536,6 +536,35 @@ fn a_head_round_trips_and_refuses_any_change() {
     let mut torn = head.clone();
     torn.packs[0].committed = 4096 + 16;
     assert!(Head::decode(&torn.encode()).is_err(), "a commit ends on a block");
+    let mut torn = head.clone();
+    torn.packs[1].indexed = 4096 - 1;
+    assert!(Head::decode(&torn.encode()).is_err(), "the index ends on a record");
+    let mut torn = head.clone();
+    torn.packs[1].dead = 100;
+    assert!(Head::decode(&torn.encode()).is_err(), "dead bytes are whole records");
+}
+
+/// Lengths in a record header are not trusted before they are checked: one whose record would
+/// be longer than any number is refused, not wrapped into a record of no bytes.
+#[test]
+fn a_record_header_of_a_length_no_record_has_is_refused() {
+    let header = |stored| RecordHeader {
+        kind: Kind::Run,
+        form: Form::Raw,
+        dictionary: NO_DICTIONARY,
+        stored,
+        raw: 0,
+        key: key(1),
+        content: content_of(b""),
+    };
+    for stored in [0, 1 << 40, u64::MAX - RECORD_HEADER - 15] {
+        let decoded = RecordHeader::decode(&header(stored).encode()).unwrap();
+        assert_eq!(decoded.span(), disk::aligned(RECORD_HEADER + stored));
+    }
+    for stored in [u64::MAX - RECORD_HEADER - 14, u64::MAX - RECORD_HEADER + 1, u64::MAX] {
+        assert!(RecordHeader::decode(&header(stored).encode()).is_err(), "{stored}");
+        assert_eq!(disk::span_of(stored), None);
+    }
 }
 
 #[test]

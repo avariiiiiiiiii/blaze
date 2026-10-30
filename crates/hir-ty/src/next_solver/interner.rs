@@ -401,20 +401,27 @@ pub struct DbInterner<'db> {
     regions: bool,
 }
 
-// FIXME(safety): unsound, see https://github.com/rust-lang/rust/pull/144808: `&dyn HirDatabase`
-// is neither `Send` nor `Sync`, so nothing upholds these. Removing them is requested in
-// `v2/requests/db-ty-types.md`.
-unsafe impl Send for DbInterner<'_> {}
-unsafe impl Sync for DbInterner<'_> {}
+// The database is `Send + Sync` (`salsa::Database`), so an interner is, by the auto traits.
+const _: fn() = || {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<DbInterner<'static>>();
+};
 
 impl<'db> DbInterner<'db> {
-    // FIXME(next-solver): remove this method
+    /// An interner of the database attached to this thread (`salsa::attach`), for code that
+    /// holds no database. To be removed: its callers should take the database (hir's
+    /// `Type::unknown`, `new_unit`, `instantiate*`, which is a public API change).
+    ///
+    /// # Safety
+    ///
+    /// Nothing ties `'db` to the attachment. The interner, and anything holding its database or
+    /// lang items, must not outlive the `attach` call that is on the stack now. Interned values
+    /// (`Ty`, `GenericArgs`, ...) hold neither, so they may.
     #[doc(hidden)]
-    pub fn conjure() -> DbInterner<'db> {
+    pub unsafe fn conjure() -> DbInterner<'db> {
         crate::with_attached_db(|db| DbInterner {
-            // FIXME(safety): unsound: nothing ties `'db` to the attachment, so the interner can
-            // outlive the database it points to. Replacing `conjure` is requested in
-            // `v2/requests/db-ty-types.md`.
+            // SAFETY: the caller keeps the interner within the attachment `with_attached_db`
+            // found (`# Safety` above), and the database outlives its attachment.
             db: unsafe { std::mem::transmute::<&dyn HirDatabase, &'db dyn HirDatabase>(db) },
             krate: None,
             lang_items: None,
@@ -515,10 +522,14 @@ interned_slice!(
     CanonicalVarKind<'static>
 );
 
-pub struct DepNodeIndex;
-
+/// A solved goal's answer, with what solving it read from the database (`None` when it read
+/// something no other query may take on, see [`tls_cache`]): a query taking the answer takes
+/// the reads too, as rustc's `get_tracked` does.
 #[derive(Debug)]
-pub struct Tracked<T: fmt::Debug + Clone>(T);
+pub struct Tracked<T: fmt::Debug + Clone> {
+    value: T,
+    reads: Option<salsa::Reads>,
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct AllocId;
@@ -1067,7 +1078,7 @@ impl<'db> Interner for DbInterner<'db> {
         ExternalConstraints::new(self, data)
     }
 
-    type DepNodeIndex = DepNodeIndex;
+    type DepNodeIndex = Option<salsa::Reads>;
 
     type Tracked<T: fmt::Debug + Clone> = Tracked<T>;
 
@@ -1128,13 +1139,21 @@ impl<'db> Interner for DbInterner<'db> {
     fn mk_tracked<T: fmt::Debug + Clone>(
         self,
         data: T,
-        _dep_node: Self::DepNodeIndex,
+        reads: Self::DepNodeIndex,
     ) -> Self::Tracked<T> {
-        Tracked(data)
+        Tracked { value: data, reads }
     }
 
     fn get_tracked<T: fmt::Debug + Clone>(self, tracked: &Self::Tracked<T>) -> T {
-        tracked.0.clone()
+        match tracked.reads {
+            // From the shared cache: the query taking it reruns when the reads change, and so
+            // does any goal it is solving in a capture of its own, which takes them too.
+            Some(reads) => salsa::replay_reads(self.db, reads),
+            // From this query's own cache: the query made the reads itself, but a goal being
+            // captured now did not, and so must not be shared either.
+            None => salsa::unshareable_reads(self.db),
+        }
+        tracked.value.clone()
     }
 
     fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, Self::DepNodeIndex) {
@@ -1142,15 +1161,31 @@ impl<'db> Interner for DbInterner<'db> {
         // goal can take minutes of solving that asks the database nothing, so a cancelled one
         // is noticed here rather than at the next query.
         salsa::Database::unwind_if_revision_cancelled(self.db);
-        (super::ensure_sufficient_stack(task), DepNodeIndex)
+        salsa::capture_reads(self.db, || super::ensure_sufficient_stack(task))
+    }
+
+    fn cache_scope(self, reads: &Self::DepNodeIndex) -> rustc_type_ir::search_graph::CacheScope {
+        // A goal is shared only with its reads, which `capture_reads` gives only when any
+        // query may replay them.
+        match reads {
+            Some(_) => rustc_type_ir::search_graph::CacheScope::Shared,
+            None => rustc_type_ir::search_graph::CacheScope::Query,
+        }
     }
 
     fn with_global_cache<R>(
         self,
-        f: impl FnOnce(&mut rustc_type_ir::search_graph::GlobalCache<Self>) -> R,
+        scope: rustc_type_ir::search_graph::CacheScope,
+        f: impl FnOnce(&rustc_type_ir::search_graph::GlobalCache<Self>) -> R,
     ) -> R {
-        // The cache of this interner's `Solved`, in the database's present state.
-        tls_cache::borrow_assume_valid(self.db, self.solved, f)
+        match scope {
+            rustc_type_ir::search_graph::CacheScope::Shared => {
+                tls_cache::shared(self.db, self.krate, self.regions, f)
+            }
+            rustc_type_ir::search_graph::CacheScope::Query => {
+                tls_cache::of_query(self.db, self.solved, f)
+            }
+        }
     }
 
     fn canonical_param_env_cache_get_or_insert<R>(

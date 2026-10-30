@@ -9,7 +9,7 @@ mod reference;
 
 use std::sync::{Arc, Mutex};
 
-use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
+use blaze_protocol::events::{Event, NodeKind, NodeState, Order, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
@@ -424,19 +424,70 @@ fn as_nodes(first: u32, specs: &[Spec]) -> Nodes {
     nodes
 }
 
+/// `outputs` apart from what they say of nodes, and what they say of nodes as an
+/// [`Event::Node`] a node, in the order those would come: each [`Event::Nodes`] read as its
+/// nodes in [`Order::places`]. A malformed record fails the test.
+fn nodes_apart(outputs: &[PlaneOutput]) -> (Vec<PlaneOutput>, Vec<PlaneOutput>) {
+    let (mut rest, mut nodes) = (Vec::new(), Vec::new());
+    let mut order = Order::default();
+    for output in outputs {
+        let PlaneOutput::Said { request, record } = output else {
+            rest.push(output.clone());
+            continue;
+        };
+        match &record.event {
+            Event::Node { .. } => nodes.push(output.clone()),
+            Event::Nodes { .. } => {
+                let batch = record.event.nodes(&mut order).unwrap().unwrap();
+                for &place in order.places() {
+                    let event = batch.node(place as usize).event();
+                    let record = Record { at_ns: record.at_ns, event };
+                    nodes.push(PlaneOutput::Said { request: *request, record });
+                }
+            }
+            _ => rest.push(output.clone()),
+        }
+    }
+    (rest, nodes)
+}
+
 /// Batches as columns say what the same batches as specs say, refusals too: deps out of
-/// order, cycles, unknown deps, ids given before, single flight and two requests.
+/// order, cycles, unknown deps, ids given before, single flight and two requests. A batch of
+/// columns is said in one [`Event::Nodes`], first, which read gives the [`Event::Node`]s the
+/// specs say, in the order they say them; all else is the same, in the same order.
 #[test]
 fn nodes_as_columns_say_what_nodes_as_specs_say() {
     let kinds = [NodeKind::Codegen, NodeKind::Std, NodeKind::Link];
+    let mut batches = 0;
     for seed in 0..300 {
         let mut random = SplitMix(seed);
         let config = config(1 + random.below(2) as usize, 1 + random.below(3) as usize);
         let mut specs = Plane::new(config.clone()).unwrap();
         let mut columns = Plane::new(config).unwrap();
         let mut both = |input: PlaneInput, columns_input: PlaneInput| {
+            let batch = matches!(columns_input, PlaneInput::AddNodes { .. });
             let said = specs.step(input);
-            assert_eq!(said, columns.step(columns_input), "seed {seed}");
+            let columns_said = columns.step(columns_input);
+            match (&said, &columns_said) {
+                (Ok(each), Ok(together)) => {
+                    assert_eq!(nodes_apart(each), nodes_apart(together), "seed {seed}");
+                    if batch {
+                        batches += 1;
+                        let first = together.first().map(|it| match it {
+                            PlaneOutput::Said { record, .. } => &record.event,
+                            _ => panic!("seed {seed}: {it:?} before the batch's record"),
+                        });
+                        assert!(matches!(first, Some(Event::Nodes { .. })), "seed {seed}");
+                        assert!(each.iter().all(|it| !matches!(it, PlaneOutput::Said {
+                            record: Record { event: Event::Nodes { .. }, .. },
+                            ..
+                        })));
+                    } else {
+                        assert_eq!(each, together, "seed {seed}");
+                    }
+                }
+                _ => assert_eq!(said, columns_said, "seed {seed}"),
+            }
             said
         };
         for request in 1..=2 {
@@ -505,6 +556,66 @@ fn nodes_as_columns_say_what_nodes_as_specs_say() {
             }
         }
     }
+    assert!(batches > 500, "{batches} batches taken");
+}
+
+/// A batch of columns is said in one record before anything else: the columns as given,
+/// through the wire's codec unchanged, read as the records the same nodes as specs say, in
+/// their order, though given out of order; the same record malformed is refused.
+#[test]
+fn a_batch_of_columns_is_one_record() {
+    let specs = vec![
+        node(3, &[5], Pool::Work, 1, None, 0),
+        node(4, &[], Pool::Io, 2, Some(key(1)), 0),
+        node(5, &[4, 1], Pool::Work, 3, None, 0),
+    ];
+    let mut each = Plane::new(config(1, 2)).unwrap();
+    let mut together = Plane::new(config(1, 2)).unwrap();
+    for plane in [&mut each, &mut together] {
+        open(plane, 1, 1, true);
+        assert_eq!(runs(&add(plane, 1, vec![work(1, &[], 1)])), [1]);
+    }
+    let request = RequestId(1);
+    let nodes = as_nodes(3, &specs);
+    let said = each.step(PlaneInput::Add { at_ns: 2, request, nodes: specs }).unwrap();
+    let out = together.step(PlaneInput::AddNodes { at_ns: 2, request, nodes }).unwrap();
+    let PlaneOutput::Said { request: of, record } = &out[0] else { panic!("{out:?}") };
+    assert_eq!(*of, request);
+    let names = format!("{}{}{}", name(3), name(4), name(5));
+    let (three, four) = (name(3).len() as u32, name(4).len() as u32);
+    let want = Event::Nodes {
+        first: 3,
+        kinds: vec![NodeKind::Codegen; 3],
+        name_at: vec![0, three, three + four, names.len() as u32],
+        names,
+        deps: vec![5, 4, 1],
+        deps_at: vec![0, 1, 1, 3],
+    };
+    assert_eq!(*record, Record { at_ns: 2, event: want });
+    let bytes = blaze_protocol::cbor::to_vec(record).unwrap();
+    blaze_protocol::cbor::check(&bytes).unwrap();
+    assert_eq!(blaze_protocol::cbor::from_slice::<Record>(&bytes).unwrap(), *record);
+    // Read, its nodes are those the specs said, 4 then 5 then 3, and nothing else differs.
+    assert_eq!(nodes_apart(&out), nodes_apart(&said));
+    let mut order = Order::default();
+    record.event.nodes(&mut order).unwrap().unwrap();
+    assert_eq!(order.places(), [1, 2, 0]);
+    let said_ids: Vec<u32> = said
+        .iter()
+        .filter_map(|it| match it {
+            PlaneOutput::Said { record: Record { event: Event::Node { id, .. }, .. }, .. } => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said_ids, [4, 5, 3]);
+    let mut broken = record.event.clone();
+    let Event::Nodes { deps_at, .. } = &mut broken else { unreachable!("an Event::Nodes") };
+    deps_at[2] = 4;
+    let why = broken.nodes(&mut order).unwrap().unwrap_err().to_string();
+    assert!(why.contains("deps_at goes back at node 2"), "{why}");
+    assert!(order.places().is_empty());
 }
 
 /// A trace holds nodes as columns and gives back the same; columns that disagree are refused.
@@ -879,6 +990,20 @@ impl Model {
                     Event::Node { id, .. } => {
                         assert_eq!(self.request_of[id], request.0, "seed {seed}: #{id}");
                     }
+                    Event::Nodes { .. } => {
+                        let mut order = Order::default();
+                        let batch = record.event.nodes(&mut order).unwrap();
+                        let batch = batch.unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+                        for node in batch.iter() {
+                            let id = node.id;
+                            assert_eq!(self.request_of[&id], request.0, "seed {seed}: #{id}");
+                            assert!(!self.states.contains_key(&id), "seed {seed}: #{id} moved first");
+                            let spec = &self.specs[&id];
+                            assert_eq!((node.kind, node.name), (spec.kind, spec.name.as_str()));
+                            let deps = spec.deps.iter().map(|it| it.0);
+                            assert!(node.deps.iter().copied().eq(deps), "seed {seed}: #{id}");
+                        }
+                    }
                     Event::Moved { id, state } => {
                         assert_eq!(self.request_of[id], request.0, "seed {seed}: #{id}");
                         if let Some(was) = self.states.get(id) {
@@ -1250,7 +1375,15 @@ fn simulate(seed: u64, release: bool) -> Simulated {
                     let count = 1 + random.below(8);
                     let nodes = new_nodes(&mut random, &model, &mut next_id, r as u32, count);
                     model.register(r as u32, &nodes);
-                    driver.act(Act::Step(PlaneInput::Add { at_ns: at, request, nodes }), next_id)
+                    // A batch that is a run of ids, half the time given as columns.
+                    let run = nodes.windows(2).all(|it| it[1].id.0 == it[0].id.0 + 1);
+                    let input = if run && random.one_in(2) {
+                        let nodes = as_nodes(nodes[0].id.0, &nodes);
+                        PlaneInput::AddNodes { at_ns: at, request, nodes }
+                    } else {
+                        PlaneInput::Add { at_ns: at, request, nodes }
+                    };
+                    driver.act(Act::Step(input), next_id)
                 } else {
                     planned[r].closed = true;
                     driver.act(Act::Step(PlaneInput::Close { at_ns: at, request }), next_id)

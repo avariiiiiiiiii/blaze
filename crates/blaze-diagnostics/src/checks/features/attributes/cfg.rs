@@ -43,7 +43,7 @@ fn gated_cfg(name: &str) -> Option<&'static str> {
 
 /// rustc's `try_gate_cfg` of the `cfg` name `name` at `range` of `file`: E0658 when it is gated,
 /// its feature is not enabled and the expansion it comes from is not allowed it.
-fn try_gate(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, name: &str, range: TextRange, out: &mut Vec<Diag>) {
+pub(crate) fn try_gate(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, name: &str, range: TextRange, out: &mut Vec<Diag>) {
     let Some(feature) = gated_cfg(name) else { return };
     if features.enabled(feature) || allows_unstable(cx, file, range, feature) {
         return;
@@ -56,7 +56,7 @@ fn try_gate(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, name: &str, r
 
 /// `parse_cfg_entry_target`'s gate of `target(..)` at `range`: the feature only, not the
 /// expansion.
-fn target_compact(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, range: TextRange, out: &mut Vec<Diag>) {
+pub(crate) fn target_compact(cx: &Cx<'_, '_>, features: &Features, file: HirFileId, range: TextRange, out: &mut Vec<Diag>) {
     if features.enabled("cfg_target_compact") {
         return;
     }

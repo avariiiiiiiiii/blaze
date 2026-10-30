@@ -26,6 +26,7 @@ use crate::{Dependency, FeatureValue, PackageId, PackageIdSpec, Registry, Summar
 
 use crate::resolver::{HashMap, HashSet};
 use anyhow::Context as _;
+use blaze_ids::radix;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -296,7 +297,7 @@ impl<'a, T: Registry> RegistryQueryer<'a, T> {
         // dependencies with more candidates. This way if the dependency with
         // only one candidate can't be resolved we don't have to do a bunch of
         // work before we figure that out.
-        deps.sort_by_key(|(_, a, _)| a.len());
+        radix::sort_by_key(&mut deps, |(_, a, _)| a.len());
 
         let out = Rc::new((used_features, deps.into()));
 

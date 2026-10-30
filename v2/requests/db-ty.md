@@ -143,6 +143,69 @@ those crates: the `Interner` trait's associated types and the search graph's `Gl
 
 > forwarded to db: both vendor crates are lane db's own; db-ty is its child.
 
+## 13. Whoever writes `salsa::capture_reads` (through lane db): two more rules for the shared solver cache
+
+Context: `~/restart-2026-10-28/briefs/v2/db-salsa-reads.md` and `db-ty-solver-cache.md`. hir-ty
+now uses that API as the brief states it (`crates/hir-ty/src/next_solver/interner.rs`
+`with_cached_task`, `get_tracked`, `cache_scope`; `interner/tls_cache.rs` `shared`). It does not
+build until these exist in `vendor/salsa`:
+
+- `pub fn capture_reads<R>(db: &dyn Database, f: impl FnOnce() -> R) -> (R, Option<Reads>)`,
+  `pub fn replay_reads(db: &dyn Database, reads: Reads)` and `pub struct Reads` (`Copy`, `Send`,
+  `Sync`, `Debug`), at the crate root, as the brief says.
+- New: `pub fn unshareable_reads(db: &dyn Database)`. Every capture frame open on the current
+  task then returns `None`; with none open it does nothing. hir-ty calls it when the solver takes
+  an answer from the query's own cache (one whose capture was `None`). A goal being captured
+  that uses such an answer did not make its reads, so sharing it would miss them.
+- Captures nest, as the solver's goals do (a nested goal's `with_cached_task` runs inside its
+  parent's). The reads of an inner frame, and the edges a `replay_reads` appends inside it, are
+  also reads of every enclosing frame, and an inner `None` makes each enclosing frame `None`.
+  Otherwise a parent goal is shared without its children's reads.
+
+Test to add beside the brief's: an outer capture around an inner capture that reads input X,
+and a `replay_reads` of a capture of input Y. The outer `Reads` replayed into another query
+reruns it on a change to X or to Y. And an outer capture around `unshareable_reads` is `None`.
+
+hir's `a_goal_reused_from_another_query_reruns_it_when_what_the_goal_read_changes` checks the end
+to end.
+
+> forwarded to db: it asks through lane db.
+
+## 14. solver-sync (through lane db): hir-ty implements the `CacheScope` signature
+
+hir-ty's `next_solver/interner.rs` now implements item 3 of
+`~/restart-2026-10-28/briefs/v2/db-to-solver-sync.md`:
+`with_global_cache(self, scope: CacheScope, f: impl FnOnce(&GlobalCache<Self>) -> R)` and
+`cache_scope(self, &Self::DepNodeIndex) -> CacheScope`, with `DepNodeIndex = Option<Reads>`. It
+relies on item 2's `GlobalCache`: used through `&self`, `Default`, and `Send + Sync` by auto
+traits (`tls_cache.rs` asserts it). hir-ty does not build against the tree as it is now (old
+`&mut` signature) until the port carries items 2 and 3. Don't port `interner.rs`'s cache block
+back to the old signature.
+
+> forwarded to db: it asks through lane db (for solver-sync).
+
+## 15. Diagnostics (through the coordinator): stop on `#![feature(generic_const_exprs)]`
+
+Where: `crates/blaze-diagnostics/src/checks/features.rs`, beside the existing
+`next_solver_globally && generic_const_exprs` check (~line 243), which already finds the
+feature and its span.
+
+What: for any crate enabling `generic_const_exprs` (whatever the flags), add an error at the
+feature's span. Suggested message: "blaze does not implement `generic_const_exprs`: its constant
+expressions in types are not lowered". Add a test beside it in
+`tests/lints/syntax/attrs/features.rs`, whose fixture at ~line 206 already enables the feature.
+Check that the error is on the build path (errors_of fails the build), not only in the IDE.
+
+Why (no-fallback; lane db's note 4): hir-ty's `Features::generic_const_exprs` is `false` and
+nothing builds `ConstKind::Expr`. Under the feature, hir-ty lowers as if it were off. A type like
+`[u8; N + 1]` becomes an anon const with no generic arguments (`consteval.rs`
+`create_anon_const`, `allow_using_generic_params: false`), which then fails to evaluate. No
+error names the feature. If the diagnostics lane copies rustc and drops "generic parameters may
+not be used in const operations" when the feature is on, the crate would build with wrong types.
+A crate-level error at the attribute is the one place that names the feature and stops. hir-ty
+does it nowhere else, because a new `AnyDiagnostic` variant would break the exhaustive matches
+in `ide-diagnostics/src/lib.rs` and `blaze-diagnostics/src/lower/mod.rs`.
+
 ## 12. db-salsa (through lane db): interned values may hash their address
 
 `/tmp/blaze-lanes/v2-db-salsa.md` says `intern::Symbol` and `Interned<T>` hashes are unsound for

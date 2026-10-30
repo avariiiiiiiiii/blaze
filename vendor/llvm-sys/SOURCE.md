@@ -16,6 +16,10 @@ Changes, each marked `blaze:` in build.rs:
    standard instrumentation and parsed pipelines `LLVMRunPasses` makes on every call, kept per
    target machine instead. blaze runs passes over one small module per function.
    `cargo:rerun-if-changed` is printed for both wrappers.
+4. `wrappers/passes.cpp` also has `LLVMBlazeRunSanitizers` (declared with its options struct
+   `LLVMBlazeSanitizers` and the `LLVMBlazeCoverage*` bits in `src/transforms/pass_builder.rs`):
+   SanitizerCoverage, MemorySanitizer, ThreadSanitizer and AddressSanitizer over a module, in
+   clang's order and with rustc's options, through the analysis managers kept for the machine.
 
 Why here and not in hir-ty-codegen's build.rs: rustc names a crate's native libraries right after
 that crate's rlib, and GNU ld takes from an archive only what earlier inputs asked for. Libraries

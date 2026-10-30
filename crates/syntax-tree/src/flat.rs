@@ -40,6 +40,8 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use blaze_ids::radix;
+
 use crate::{SyntaxKind, TextRange, TextSize};
 
 /// Every how many elements a start is kept.
@@ -249,14 +251,14 @@ impl Packer {
 
     /// The tree, its first element starting at `base` in `source`.
     fn finish(mut self, source: Arc<str>, base: u32, lazy: Option<Box<Lazy>>) -> FlatTree {
-        self.big.sort_unstable_by_key(|it| it.0);
+        radix::sort_copy_by_key(&mut self.big, |it| it.0);
         let marks = marks(&self.words, &self.big, base);
         self.tree(source, marks, lazy)
     }
 
     /// The tree, with the [`FlatTree::marks`] made while its elements were pushed.
     fn tree(mut self, source: Arc<str>, marks: Box<[u32]>, lazy: Option<Box<Lazy>>) -> FlatTree {
-        self.big.sort_unstable_by_key(|it| it.0);
+        radix::sort_copy_by_key(&mut self.big, |it| it.0);
         let (nodes, ranks) = nodes(&self.words);
         FlatTree {
             source,

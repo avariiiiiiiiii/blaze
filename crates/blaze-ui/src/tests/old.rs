@@ -3,8 +3,8 @@
 //! the oracle the differential tests compare the fast one with; nothing else uses it.
 
 use blaze_protocol::events::{
-    Cache, CrateState, Event, Fns, Level, NodeKind, NodeState, Record, SLOW_NS, Slow, Step,
-    Took,
+    Cache, CrateState, Event, Fns, Level, NodeBatch, NodeKind, NodeState, Order, Record, SLOW_NS,
+    Slow, Step, Took,
 };
 
 use crate::{
@@ -125,6 +125,12 @@ fn count(stepped: &Stepped) -> Option<String> {
 }
 
 impl Build {
+    fn noded(&mut self, id: u32, kind: NodeKind, name: &str, deps: &[u32], at: u64) {
+        let row = self.row(&row_of(kind, name).0, at);
+        let deps = deps.iter().filter_map(|dep| self.node(*dep)).collect();
+        self.graph.push(Noded { id, kind, row, deps });
+    }
+
     pub fn apply(&mut self, record: &Record) -> Change {
         let at = record.at_ns;
         self.last_ns = self.last_ns.max(at);
@@ -151,10 +157,32 @@ impl Build {
                 Change::Nothing
             }
             Event::Node { id, kind, name, deps } => {
-                let row = self.row(&row_of(*kind, name).0, at);
-                let deps = deps.iter().filter_map(|dep| self.node(*dep)).collect();
-                self.graph.push(Noded { id: *id, kind: *kind, row, deps });
+                self.noded(*id, *kind, name, deps, at);
                 Change::Nothing
+            }
+            Event::Nodes { first, kinds, names, name_at, deps, deps_at } => {
+                let mut order = Order::default();
+                match NodeBatch::new(*first, kinds, names, name_at, deps, deps_at, &mut order) {
+                    // Each after those of it it waits for, the first that can go first, by a
+                    // search from the start each time.
+                    Ok(batch) => {
+                        let len = batch.len();
+                        let of_it = |dep: u32| dep.checked_sub(*first).filter(|&it| it < len as u32);
+                        let mut placed = vec![false; len];
+                        while let Some(at_node) = (0..len).find(|&it| {
+                            !placed[it]
+                                && batch.node(it).deps.iter().all(|&dep| {
+                                    of_it(dep).is_none_or(|dep| placed[dep as usize])
+                                })
+                        }) {
+                            placed[at_node] = true;
+                            let node = batch.node(at_node);
+                            self.noded(node.id, node.kind, node.name, node.deps, at);
+                        }
+                        Change::Nothing
+                    }
+                    Err(why) => Change::Said(Level::Error, why.to_string()),
+                }
             }
             Event::Moved { id, state } => match self.node(*id) {
                 Some(node) => {

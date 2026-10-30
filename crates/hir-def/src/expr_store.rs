@@ -7,39 +7,32 @@ pub mod path;
 pub mod persist;
 pub mod pretty;
 pub mod scope;
+mod source_map;
 #[cfg(test)]
 mod tests;
 
-use std::{
-    borrow::Borrow,
-    cell::RefCell,
-    mem,
-    ops::{Deref, Index},
-    sync::LazyLock,
-};
+use std::{borrow::Borrow, cell::RefCell, mem, ops::Index, sync::LazyLock};
 
 use base_db::SourceDatabase;
 use blaze_ids::radix;
 use cfg::CfgExpr;
 use either::Either;
-use hir_expand::{HirFileId, InFile, MacroCallId, mod_path::ModPath, name::Name};
-use la_arena::{Arena, ArenaMap, Idx};
+use hir_expand::{InFile, MacroCallId, mod_path::ModPath, name::Name};
+use la_arena::Arena;
 use rustc_hash::{FxHashMap, FxHashSet};
-use salsa::plumbing::AsId;
 use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
-use syntax::{AstNode, AstPtr, SyntaxNodePtr, ast};
+use syntax::{AstPtr, SyntaxNodePtr, ast};
 use thin_vec::ThinVec;
-use tt::TextRange;
 
 use crate::{
-    AdtId, BlockId, ExpressionStoreOwnerId, GenericDefId, SyntheticSyntax,
+    AdtId, BlockId, ExpressionStoreOwnerId, GenericDefId,
     expr_store::path::{AssociatedTypeBinding, GenericArg, GenericArgs, NormalPath, Path},
     hir::{
         Array, AsmOperand, Binding, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked,
         InlineAsm, Label, LabelId, Literal, MatchArm, OffsetOf, Pat, PatId, RecordFieldPat,
         RecordLitField, RecordSpread, Statement,
-        columns::{self, Frozen, Growing, HirColumns, take_exact},
+        columns::{self, Frozen, Growing, HirColumns},
     },
     nameres::{DefMap, block_def_map},
     signatures::VariantFields,
@@ -49,10 +42,16 @@ use crate::{
     },
 };
 
+use self::source_map::{
+    BackPushes, BindingPats, ExpressionOnlySourceMap, FormatTemplate, FreezeScratch, IdTable,
+    PendingTemplate, SourceTable,
+};
+
 pub use self::body::{Body, BodySourceMap};
 pub use self::lower::{
     hir_assoc_type_binding_to_ast, hir_generic_arg_to_ast, hir_segment_to_ast_segment,
 };
+pub use self::source_map::ExpressionStoreSourceMap;
 
 /// A wrapper around [`span::SyntaxContext`] that is intended only for comparisons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -195,333 +194,6 @@ pub struct ExpressionStore {
     type_hygiene: Option<Box<[(TypeRefId, HygieneId)]>>,
 }
 
-#[derive(Debug, Eq, Default)]
-struct ExpressionOnlySourceMap {
-    // AST expressions can create patterns in destructuring assignments. Therefore, `ExprSource` can also map
-    // to `PatId`, and `PatId` can also map to `ExprSource` (the other way around is unaffected).
-    expr_map: SourceTable<ExprSource, ExprOrPatIdPacked>,
-    expr_map_back: ArenaMap<ExprId, ExprOrPatSource>,
-
-    pat_map: SourceTable<PatSource, ExprOrPatIdPacked>,
-    pat_map_back: ArenaMap<PatId, ExprOrPatSource>,
-
-    label_map: SourceTable<LabelSource, LabelId>,
-    label_map_back: ArenaMap<LabelId, LabelSource>,
-
-    binding_definitions:
-        ArenaMap<BindingId, SmallVec<[PatId; 2 * size_of::<usize>() / size_of::<PatId>()]>>,
-
-    /// We don't create explicit nodes for record fields (`S { record_field: 92 }`).
-    /// Instead, we use id of expression (`92`) to identify the field.
-    field_map_back: IdTable<ExprId, FieldSource>,
-    pat_field_map_back: IdTable<PatId, PatFieldSource>,
-
-    template_map: Option<Box<FormatTemplate>>,
-
-    expansions: SourceTable<InFile<MacroCallPtr>, MacroCallId>,
-
-    /// Diagnostics accumulated during lowering. These contain `AstPtr`s and so are stored in
-    /// the source map (since they're just as volatile).
-    //
-    // We store diagnostics on the `ExpressionOnlySourceMap` because diagnostics are rare (except
-    // maybe for cfgs, and they are also not common in type places).
-    diagnostics: ThinVec<ExpressionStoreDiagnostics>,
-}
-
-/// A map from a store's own ids to values, as one column sorted by id and searched: what a
-/// finished store or source map keeps in place of a hash map keyed by its ids.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IdTable<K, V>(Box<[(K, V)]>);
-
-impl<K, V> Default for IdTable<K, V> {
-    fn default() -> Self {
-        IdTable(Box::default())
-    }
-}
-
-impl<K: Ord + Copy, V> IdTable<K, V> {
-    /// The table of `pushed`, in the order they were pushed: a later value for an id replaces
-    /// an earlier one, as an insert into a map does.
-    pub(crate) fn from_pushed(mut pushed: Vec<(K, V)>) -> Self {
-        pushed.reverse();
-        // Stable, so the latest value of each id comes first among its equals.
-        pushed.sort_by_key(|&(id, _)| id);
-        pushed.dedup_by_key(|&mut (id, _)| id);
-        IdTable(pushed.into_boxed_slice())
-    }
-
-    /// The table of `entries`, which are sorted by id with no id twice.
-    pub(crate) fn from_sorted(entries: Box<[(K, V)]>) -> Option<Self> {
-        entries.windows(2).all(|pair| pair[0].0 < pair[1].0).then_some(IdTable(entries))
-    }
-
-    pub(crate) fn get(&self, id: K) -> Option<&V> {
-        let at = self.0.binary_search_by_key(&id, |&(it, _)| it).ok()?;
-        Some(&self.0[at].1)
-    }
-
-    pub(crate) fn entries(&self) -> &[(K, V)] {
-        &self.0
-    }
-
-    /// The same ids, each value as `f` makes it of the old.
-    pub(crate) fn map<W>(&self, mut f: impl FnMut(K, &V) -> W) -> IdTable<K, W> {
-        IdTable(self.0.iter().map(|(id, value)| (*id, f(*id, value))).collect())
-    }
-}
-
-/// The order of a [`SourceTable`]'s keys, total and the same on every run (a hash map's is
-/// neither): the file (files before macro files, each by its salsa id's bits), the range's start
-/// and end, the syntax kind. `expr_store/persist.rs` writes and checks tables in exactly this
-/// order (`Src::key`), so a change here is a change of its format.
-pub(crate) trait SourceKey {
-    fn source_key(&self) -> (u8, u64, u32, u32, u16);
-}
-
-impl<N: AstNode> SourceKey for InFile<AstPtr<N>> {
-    #[inline]
-    fn source_key(&self) -> (u8, u64, u32, u32, u16) {
-        let (file_kind, file) = match self.file_id {
-            HirFileId::FileId(file) => (1, file.as_id().as_bits()),
-            HirFileId::MacroFile(call) => (2, call.as_id().as_bits()),
-        };
-        let range = self.value.text_range();
-        (file_kind, file, range.start().into(), range.end().into(), u16::from(self.value.kind()))
-    }
-}
-
-/// A map from syntax pointers to a store's ids, as one column sorted by [`SourceKey`] and
-/// searched: what a source map keeps in place of a hash map. 24 bytes per entry for an
-/// `InFile<AstPtr<_>>` key and a `u32` value; a lookup is `log2(n)` key compares with no
-/// hashing, and iteration is in key order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SourceTable<K, V>(Box<[(K, V)]>);
-
-impl<K, V> Default for SourceTable<K, V> {
-    fn default() -> Self {
-        SourceTable(Box::default())
-    }
-}
-
-impl<K: SourceKey, V> SourceTable<K, V> {
-    /// The table of `pushed`, in the order lowering pushed them: a later value for a key
-    /// replaces an earlier one, as an insert into a map does. `pushed` is left empty with its
-    /// capacity (it is a pooled builder's column); the table is one allocation of its length.
-    /// Lowering pushes in preorder, which is nearly in key order, so the stable sort is close to
-    /// one linear pass.
-    pub(crate) fn from_pushed(pushed: &mut Vec<(K, V)>) -> Self {
-        pushed.sort_by_key(|(key, _)| key.source_key());
-        // Stable, so equal keys stay in push order; keep the last of each run.
-        pushed.dedup_by(|later, kept| {
-            let same = later.0.source_key() == kept.0.source_key();
-            if same {
-                mem::swap(later, kept);
-            }
-            same
-        });
-        SourceTable(take_exact(pushed))
-    }
-
-    /// The table of `entries`, which are in strictly increasing key order (no key twice).
-    pub(crate) fn from_sorted(entries: Box<[(K, V)]>) -> Option<Self> {
-        let sorted = entries.windows(2).all(|pair| pair[0].0.source_key() < pair[1].0.source_key());
-        sorted.then_some(SourceTable(entries))
-    }
-
-    #[inline]
-    pub(crate) fn get(&self, key: &K) -> Option<&V> {
-        let key = key.source_key();
-        let at = self.0.binary_search_by(|(it, _)| it.source_key().cmp(&key)).ok()?;
-        Some(&self.0[at].1)
-    }
-
-    /// Every entry, in key order.
-    #[inline]
-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&K, &V)> + '_ {
-        self.0.iter().map(|(key, value)| (key, value))
-    }
-
-    #[inline]
-    pub(crate) fn entries(&self) -> &[(K, V)] {
-        &self.0
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl PartialEq for ExpressionOnlySourceMap {
-    fn eq(&self, other: &Self) -> bool {
-        // we only need to compare one of the two mappings
-        // as the other is a reverse mapping and thus will compare
-        // the same as normal mapping
-        let Self {
-            expr_map: _,
-            expr_map_back,
-            pat_map: _,
-            pat_map_back,
-            label_map: _,
-            label_map_back,
-            // If this changed, our pattern data must have changed
-            binding_definitions: _,
-            // If this changed, our expression data must have changed
-            field_map_back: _,
-            // If this changed, our pattern data must have changed
-            pat_field_map_back: _,
-            template_map,
-            expansions,
-            diagnostics,
-        } = self;
-        *expr_map_back == other.expr_map_back
-            && *pat_map_back == other.pat_map_back
-            && *label_map_back == other.label_map_back
-            && *template_map == other.template_map
-            && *expansions == other.expansions
-            && *diagnostics == other.diagnostics
-    }
-}
-
-#[derive(Debug, Eq, Default)]
-pub struct ExpressionStoreSourceMap {
-    expr_only: Option<Box<ExpressionOnlySourceMap>>,
-
-    types_map_back: ArenaMap<TypeRefId, TypeSource>,
-    types_map: SourceTable<TypeSource, TypeRefId>,
-
-    lifetime_map_back: ArenaMap<LifetimeRefId, LifetimeSource>,
-    lifetime_map: SourceTable<LifetimeSource, LifetimeRefId>,
-}
-
-impl PartialEq for ExpressionStoreSourceMap {
-    fn eq(&self, other: &Self) -> bool {
-        // we only need to compare one of the two mappings
-        // as the other is a reverse mapping and thus will compare
-        // the same as normal mapping
-        let Self { expr_only, types_map_back, types_map: _, lifetime_map_back, lifetime_map: _ } =
-            self;
-        *expr_only == other.expr_only
-            && *types_map_back == other.types_map_back
-            && *lifetime_map_back == other.lifetime_map_back
-    }
-}
-
-/// Moves the pointers into `file` of a source map: [`ExpressionStoreSourceMap::moved`].
-pub(crate) struct Move<'a> {
-    pub(crate) file: HirFileId,
-    pub(crate) to: &'a dyn Fn(SyntaxNodePtr) -> SyntaxNodePtr,
-}
-
-impl Move<'_> {
-    fn ptr<N: AstNode>(&self, src: InFile<AstPtr<N>>) -> InFile<AstPtr<N>> {
-        if src.file_id != self.file {
-            return src;
-        }
-        let moved = (self.to)(src.value.syntax_node_ptr());
-        InFile::new(src.file_id, AstPtr::try_from_raw(moved).expect("moved to another kind"))
-    }
-
-    fn back<I, N: AstNode>(
-        &self,
-        map: &ArenaMap<la_arena::Idx<I>, InFile<AstPtr<N>>>,
-    ) -> ArenaMap<la_arena::Idx<I>, InFile<AstPtr<N>>> {
-        map.iter().map(|(id, &src)| (id, self.ptr(src))).collect()
-    }
-
-    /// Moving pointers can change their order, so the table is sorted again.
-    fn forth<N: AstNode, V: Copy>(
-        &self,
-        map: &SourceTable<InFile<AstPtr<N>>, V>,
-    ) -> SourceTable<InFile<AstPtr<N>>, V> {
-        let mut moved = map.iter().map(|(&src, &id)| (self.ptr(src), id)).collect::<Vec<_>>();
-        SourceTable::from_pushed(&mut moved)
-    }
-
-    fn raw(&self, src: InFile<SyntaxNodePtr>) -> InFile<SyntaxNodePtr> {
-        match src.file_id == self.file {
-            true => InFile::new(src.file_id, (self.to)(src.value)),
-            false => src,
-        }
-    }
-}
-
-impl ExpressionStoreSourceMap {
-    /// The same map with what it points to in `mv.file` moved: what a body lowered as a tree of
-    /// its own maps to, as a map of where the body is in its file
-    /// ([`crate::expr_store::body::BodySyntax`]).
-    pub(crate) fn moved(&self, mv: &Move<'_>) -> ExpressionStoreSourceMap {
-        let types_map_back = mv.back(&self.types_map_back);
-        let lifetime_map_back = mv.back(&self.lifetime_map_back);
-        let expr_only = self.expr_only.as_deref().map(|it| {
-            let template_map = it.template_map.as_deref().map(|it| FormatTemplate {
-                format_args_to_captures: it.format_args_to_captures.clone(),
-                asm_to_captures: it.asm_to_captures.clone(),
-                implicit_capture_to_source: it.implicit_capture_to_source.map(|_, src| {
-                    let (ptr, range) = src.value;
-                    let ptr = mv.ptr(InFile::new(src.file_id, ptr)).value;
-                    InFile::new(src.file_id, (ptr, range))
-                }),
-            });
-            Box::new(ExpressionOnlySourceMap {
-                expr_map: mv.forth(&it.expr_map),
-                expr_map_back: mv.back(&it.expr_map_back),
-                pat_map: mv.forth(&it.pat_map),
-                pat_map_back: mv.back(&it.pat_map_back),
-                label_map: mv.forth(&it.label_map),
-                label_map_back: mv.back(&it.label_map_back),
-                binding_definitions: it.binding_definitions.clone(),
-                field_map_back: it.field_map_back.map(|_, &src| mv.ptr(src)),
-                pat_field_map_back: it.pat_field_map_back.map(|_, &src| mv.ptr(src)),
-                template_map: template_map.map(Box::new),
-                expansions: mv.forth(&it.expansions),
-                diagnostics: it.diagnostics.iter().map(|it| it.moved(mv)).collect(),
-            })
-        });
-        let mut types_map: Vec<_> = types_map_back.iter().map(|(id, &src)| (src, id)).collect();
-        let mut lifetime_map: Vec<_> =
-            lifetime_map_back.iter().map(|(id, &src)| (src, id)).collect();
-        ExpressionStoreSourceMap {
-            expr_only,
-            types_map: SourceTable::from_pushed(&mut types_map),
-            types_map_back,
-            lifetime_map: SourceTable::from_pushed(&mut lifetime_map),
-            lifetime_map_back,
-        }
-    }
-}
-
-impl ExpressionStoreDiagnostics {
-    fn moved(&self, mv: &Move<'_>) -> Self {
-        use ExpressionStoreDiagnostics::*;
-        match self {
-            InactiveCode { node, cfg } => InactiveCode { node: mv.raw(*node), cfg: cfg.clone() },
-            UnresolvedMacroCall { node, path } => {
-                UnresolvedMacroCall { node: mv.ptr(*node), path: path.clone() }
-            }
-            UnreachableLabel { node, name } => {
-                UnreachableLabel { node: mv.ptr(*node), name: name.clone() }
-            }
-            AwaitOutsideOfAsync { node, location } => {
-                AwaitOutsideOfAsync { node: mv.ptr(*node), location: location.clone() }
-            }
-            UndeclaredLabel { node, name } => {
-                UndeclaredLabel { node: mv.ptr(*node), name: name.clone() }
-            }
-            PatternArgInExternFn { node } => PatternArgInExternFn { node: mv.ptr(*node) },
-            FruInDestructuringAssignment { node } => {
-                FruInDestructuringAssignment { node: mv.ptr(*node) }
-            }
-            MissingBody { node, kind } => MissingBody { node: mv.raw(*node), kind: *kind },
-        }
-    }
-}
-
 /// The body of an item (function, const etc.) while it is lowered. Its columns, forward maps,
 /// back maps and list stacks are a [`Scratch`] taken from this thread's pool by
 /// [`ExpressionStoreBuilder::new`] and given back, emptied, by [`ExpressionStoreBuilder::finish`].
@@ -547,24 +219,26 @@ pub struct ExpressionStoreBuilder {
     // AST expressions can create patterns in destructuring assignments. Therefore, `ExprSource` can also map
     // to `PatId`, and `PatId` can also map to `ExprSource` (the other way around is unaffected).
     // The forward maps are pushed to in lowering order and never read while lowering; `finish`
-    // sorts each into a `SourceTable`, a later push for a pointer replacing an earlier one.
+    // sorts each into a `SourceTable`, a later push for a pointer replacing an earlier one. The
+    // back maps are pushed to in lowering order too, and `finish` makes each the dense columns of
+    // a `BackMap`, a later push for an id replacing an earlier one.
     expr_map: Vec<(ExprSource, ExprOrPatIdPacked)>,
-    expr_map_back: ArenaMap<ExprId, ExprOrPatSource>,
+    expr_map_back: BackPushes<Expr<'static>, Either<ast::Expr, ast::Pat>>,
 
     pat_map: Vec<(PatSource, ExprOrPatIdPacked)>,
-    pat_map_back: ArenaMap<PatId, ExprOrPatSource>,
+    pat_map_back: BackPushes<Pat<'static>, Either<ast::Expr, ast::Pat>>,
 
     label_map: Vec<(LabelSource, LabelId)>,
-    label_map_back: ArenaMap<LabelId, LabelSource>,
+    label_map_back: BackPushes<Label, Either<ast::Label, ast::BlockExpr>>,
 
-    types_map_back: ArenaMap<TypeRefId, TypeSource>,
+    types_map_back: BackPushes<TypeRef<'static>, ast::Type>,
     types_map: Vec<(TypeSource, TypeRefId)>,
 
-    lifetime_map_back: ArenaMap<LifetimeRefId, LifetimeSource>,
+    lifetime_map_back: BackPushes<LifetimeRef, ast::Lifetime>,
     lifetime_map: Vec<(LifetimeSource, LifetimeRefId)>,
 
-    binding_definitions:
-        ArenaMap<BindingId, SmallVec<[PatId; 2 * size_of::<usize>() / size_of::<PatId>()]>>,
+    /// Each binding and a pattern that defines it, in lowering order: `finish` makes them CSR.
+    binding_definitions: Vec<(BindingId, PatId)>,
 
     /// We don't create explicit nodes for record fields (`S { record_field: 92 }`).
     /// Instead, we use id of expression (`92`) to identify the field.
@@ -581,39 +255,9 @@ pub struct ExpressionStoreBuilder {
     // We store diagnostics on the `ExpressionOnlySourceMap` because diagnostics are rare (except
     // maybe for cfgs, and they are also not common in type places).
     pub(crate) diagnostics: Vec<ExpressionStoreDiagnostics>,
-}
 
-/// The captures of a `format_args!()`: its hygiene and each implicitly captured name.
-type FormatCaptures = (HygieneId, Vec<(syntax::TextRange, Name)>);
-/// The captures of each template piece of an `asm!()`.
-type AsmCaptures = Vec<Vec<(syntax::TextRange, usize)>>;
-/// Where an implicit capture is written: its template literal and the offset inside it.
-type CaptureSource = InFile<(ExprPtr, TextRange)>;
-/// A [`FormatTemplate`] while lowering: each map pushed to in the order it is made.
-type PendingTemplate = FormatTemplate<
-    Vec<(ExprId, FormatCaptures)>,
-    Vec<(ExprId, AsmCaptures)>,
-    Vec<(ExprId, CaptureSource)>,
->;
-
-/// The maps of a store's templates: pushed to while lowering ([`ExpressionStoreBuilder`]),
-/// tables once finished.
-#[derive(Default, Debug, Eq, PartialEq)]
-struct FormatTemplate<
-    F = IdTable<ExprId, FormatCaptures>,
-    A = IdTable<ExprId, AsmCaptures>,
-    C = IdTable<ExprId, CaptureSource>,
-> {
-    /// A map from `format_args!()` expressions to their captures.
-    format_args_to_captures: F,
-    /// A map from `asm!()` expressions to their captures.
-    asm_to_captures: A,
-    /// A map from desugared expressions of implicit captures to their source.
-    ///
-    /// The value stored for each capture is its template literal and offset inside it. The template literal
-    /// is from the `format_args[_nl]!()` macro and so needs to be mapped up once to go to the user-written
-    /// template.
-    implicit_capture_to_source: C,
+    /// What `finish` builds the back maps in, empty until then.
+    freeze: FreezeScratch,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -843,11 +487,14 @@ struct Scratch {
     types_map: Vec<(TypeSource, TypeRefId)>,
     lifetime_map: Vec<(LifetimeSource, LifetimeRefId)>,
     expansions: Vec<(InFile<MacroCallPtr>, MacroCallId)>,
-    expr_map_back: ArenaMap<ExprId, ExprOrPatSource>,
-    pat_map_back: ArenaMap<PatId, ExprOrPatSource>,
-    label_map_back: ArenaMap<LabelId, LabelSource>,
-    types_map_back: ArenaMap<TypeRefId, TypeSource>,
-    lifetime_map_back: ArenaMap<LifetimeRefId, LifetimeSource>,
+    expr_map_back: BackPushes<Expr<'static>, Either<ast::Expr, ast::Pat>>,
+    pat_map_back: BackPushes<Pat<'static>, Either<ast::Expr, ast::Pat>>,
+    label_map_back: BackPushes<Label, Either<ast::Label, ast::BlockExpr>>,
+    types_map_back: BackPushes<TypeRef<'static>, ast::Type>,
+    lifetime_map_back: BackPushes<LifetimeRef, ast::Lifetime>,
+    binding_definitions: Vec<(BindingId, PatId)>,
+    /// What [`ExpressionStoreBuilder::finish`] builds the back maps in.
+    freeze: FreezeScratch,
 }
 
 /// The scratch sets a thread keeps, and the elements above which a set is dropped instead of
@@ -898,6 +545,8 @@ impl Scratch {
             label_map_back,
             types_map_back,
             lifetime_map_back,
+            binding_definitions,
+            freeze,
         } = self;
         columns.clear();
         types.clear();
@@ -913,6 +562,8 @@ impl Scratch {
         label_map_back.clear();
         types_map_back.clear();
         lifetime_map_back.clear();
+        binding_definitions.clear();
+        freeze.clear();
     }
 
     fn capacity(&self) -> usize {
@@ -921,17 +572,18 @@ impl Scratch {
             + self.lists.capacity()
             + self.expr_map.capacity()
             + self.pat_map.capacity()
+            + self.label_map.capacity()
             + self.types_map.capacity()
+            + self.lifetime_map.capacity()
+            + self.expansions.capacity()
+            + self.expr_map_back.capacity()
+            + self.pat_map_back.capacity()
+            + self.label_map_back.capacity()
+            + self.types_map_back.capacity()
+            + self.lifetime_map_back.capacity()
+            + self.binding_definitions.capacity()
+            + self.freeze.capacity()
     }
-}
-
-/// `map`'s entries in a map of exactly their room, leaving `map` empty with its capacity.
-fn take_map<K, V: Copy>(map: &mut ArenaMap<Idx<K>, V>) -> ArenaMap<Idx<K>, V> {
-    let len = map.iter().next_back().map_or(0, |(id, _)| id.into_raw().into_u32() as usize + 1);
-    let mut exact = ArenaMap::with_capacity(len);
-    exact.extend(map.iter().map(|(id, &value)| (id, value)));
-    map.clear();
-    exact
 }
 
 impl ExpressionStoreBuilder {
@@ -952,6 +604,8 @@ impl ExpressionStoreBuilder {
             label_map_back,
             types_map_back,
             lifetime_map_back,
+            binding_definitions,
+            freeze,
         } = Scratch::take();
         ExpressionStoreBuilder {
             columns,
@@ -977,12 +631,13 @@ impl ExpressionStoreBuilder {
             types_map,
             lifetime_map_back,
             lifetime_map,
-            binding_definitions: ArenaMap::default(),
+            binding_definitions,
             field_map_back: Vec::new(),
             pat_field_map_back: Vec::new(),
             template_map: None,
             expansions,
             diagnostics: Vec::new(),
+            freeze,
         }
     }
 
@@ -1264,12 +919,13 @@ impl ExpressionStoreBuilder {
             types_map,
             lifetime_map_back,
             lifetime_map,
-            mut binding_definitions,
+            binding_definitions,
             field_map_back,
             pat_field_map_back,
             template_map,
             expansions,
             diagnostics,
+            freeze,
         } = self;
         debug_assert_eq!(lists.stacked(), None, "lowering left a list on this stack");
         let mut scratch = Scratch {
@@ -1287,26 +943,31 @@ impl ExpressionStoreBuilder {
             label_map_back,
             types_map_back,
             lifetime_map_back,
+            binding_definitions,
+            freeze,
         };
         let columns = scratch.columns.freeze_into();
         let types = scratch.types.freeze_into();
+        // Each back map is dense over its arena, so a source map can be checked on its own.
+        let freeze = &mut scratch.freeze;
+        let expr_map_back = scratch.expr_map_back.freeze(columns.expr_count(), freeze);
+        let pat_map_back = scratch.pat_map_back.freeze(columns.pat_count(), freeze);
+        let label_map_back = scratch.label_map_back.freeze(labels.len(), freeze);
+        let types_map_back = scratch.types_map_back.freeze(types.len(), freeze);
+        let lifetime_map_back = scratch.lifetime_map_back.freeze(lifetimes.len(), freeze);
+        let binding_definitions =
+            BindingPats::from_pushed(&mut scratch.binding_definitions, bindings.len());
         let expr_map = SourceTable::from_pushed(&mut scratch.expr_map);
-        let expr_map_back = take_map(&mut scratch.expr_map_back);
         let pat_map = SourceTable::from_pushed(&mut scratch.pat_map);
-        let pat_map_back = take_map(&mut scratch.pat_map_back);
         let label_map = SourceTable::from_pushed(&mut scratch.label_map);
-        let label_map_back = take_map(&mut scratch.label_map_back);
         let types_map = SourceTable::from_pushed(&mut scratch.types_map);
-        let types_map_back = take_map(&mut scratch.types_map_back);
         let lifetime_map = SourceTable::from_pushed(&mut scratch.lifetime_map);
-        let lifetime_map_back = take_map(&mut scratch.lifetime_map_back);
         let expansions = SourceTable::from_pushed(&mut scratch.expansions);
         scratch.give();
 
         labels.shrink_to_fit();
         bindings.shrink_to_fit();
         lifetimes.shrink_to_fit();
-        binding_definitions.shrink_to_fit();
         let field_map_back = IdTable::from_pushed(field_map_back);
         let pat_field_map_back = IdTable::from_pushed(pat_field_map_back);
         let template_map = template_map.map(|template| {

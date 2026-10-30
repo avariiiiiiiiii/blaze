@@ -776,7 +776,7 @@ fn build_body(
     // Drop glue is built from the type it drops, and has no MIR.
     let body = match instance.def {
         InstanceDef::DropGlue => None,
-        _ => match super::instance_body(db, instance, env.clone()) {
+        _ => match super::instance_body(db, instance, env.clone(), None) {
             Ok(body) => Some(body),
             Err(_) => {
                 refused("no body");

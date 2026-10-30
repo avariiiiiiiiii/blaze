@@ -8,6 +8,7 @@
 //! where a loan of that region is in scope. A universal region made to outlive another the
 //! signature does not say it outlives is rustc's "lifetime may not live long enough".
 
+use blaze_ids::radix;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, GenericDefId, ItemContainerId, Lookup as _,
     hir::{Pat, Statement},
@@ -1582,14 +1583,14 @@ impl<'db> Builder<'_, '_, 'db> {
                 let mut members = Vec::new();
                 member_regions(self.ctx.db, hidden, true, &mut members);
                 members.retain(|&it| it != self.regions.static_rv);
-                members.sort_unstable();
+                radix::sort(&mut members);
                 members.dedup();
                 // An alias's own bounds may already say it outlives them, so the regions within
                 // one are left to the member constraints.
                 let mut bounded = Vec::new();
                 member_regions(self.ctx.db, hidden, false, &mut bounded);
                 bounded.retain(|&it| it != self.regions.static_rv);
-                bounded.sort_unstable();
+                radix::sort(&mut bounded);
                 bounded.dedup();
                 for &member in &bounded {
                     for &sub in &outlived {
@@ -3313,7 +3314,7 @@ impl<'db> Builder<'_, '_, 'db> {
         let mut bounded = Vec::new();
         member_regions(self.ctx.db, output, false, &mut bounded);
         bounded.retain(|&it| it != self.regions.static_rv);
-        bounded.sort_unstable();
+        radix::sort(&mut bounded);
         bounded.dedup();
         for &member in &bounded {
             for &sub in &outlived {
@@ -3330,7 +3331,7 @@ impl<'db> Builder<'_, '_, 'db> {
         let mut members = Vec::new();
         member_regions(self.ctx.db, output, true, &mut members);
         members.retain(|&it| it != self.regions.static_rv);
-        members.sort_unstable();
+        radix::sort(&mut members);
         members.dedup();
         self.regions.members = members;
         self.regions.choices = choices;
@@ -6522,7 +6523,7 @@ fn prove_query(
         return Proven::Here;
     }
     let mut in_universe: Vec<_> = in_universe.into_iter().collect();
-    in_universe.sort_unstable();
+    radix::sort_copy_by_key(&mut in_universe, |&(vid, universe)| radix::pack_32(vid, universe));
     Proven::Gives {
         pairs: pairs.into_iter().map(|(a, b)| (a.store(), b.store())).collect(),
         obligations: obligations

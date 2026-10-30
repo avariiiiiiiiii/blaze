@@ -126,15 +126,39 @@ pub fn main() -> ! {
     }
 }
 
-struct Grant {
-    format: Format,
-    base: u64,
-    image_len: u64,
-    objects: Vec<(u64, u8)>,
-    maps: Vec<(u32, u64, u64, u64, Access)>,
+/// The body of a GRANT frame: what the daemon gives a loader.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Grant {
+    pub(crate) format: Format,
+    /// Where the image has to be mapped, 0 for anywhere.
+    pub(crate) base: u64,
+    pub(crate) image_len: u64,
+    /// Each object's length and what it is ([`GRANT_CODE`], [`GRANT_CONTROL`]): the image
+    /// first, the control words second, then the objects of fixed maps.
+    pub(crate) objects: Vec<(u64, u8)>,
+    /// Object, offset, length, address and access of each fixed map.
+    pub(crate) maps: Vec<(u32, u64, u64, u64, Access)>,
 }
 
-fn read_grant(body: &[u8]) -> Result<Grant, Error> {
+pub(crate) const GRANT_CODE: u8 = 1;
+pub(crate) const GRANT_CONTROL: u8 = 2;
+
+impl Grant {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        out.reserve(29 + 9 * self.objects.len() + 29 * self.maps.len());
+        let mut write = Writer::new(out);
+        write.u8(self.format.tag()).u64(self.base).u64(self.image_len).u32(self.objects.len() as u32);
+        for &(len, what) in &self.objects {
+            write.u64(len).u8(what);
+        }
+        write.u32(self.maps.len() as u32);
+        for &(object, offset, len, at, access) in &self.maps {
+            write.u32(object).u64(offset).u64(len).u64(at).u8(access.tag());
+        }
+    }
+}
+
+pub(crate) fn read_grant(body: &[u8]) -> Result<Grant, Error> {
     let bad = |it: crate::frame::FrameError| Error::new(format!("the daemon's grant: {it}"));
     let mut read = Reader::new(body);
     let tag = read.u8().map_err(bad)?;
@@ -149,6 +173,12 @@ fn read_grant(body: &[u8]) -> Result<Grant, Error> {
     if objects.len() < 2 {
         return Err(Error::new(format!("the daemon granted {} objects, not the image and the control words", objects.len())));
     }
+    for (index, &(_, what)) in objects.iter().enumerate() {
+        let want = if index == 1 { GRANT_CONTROL } else { GRANT_CODE };
+        if what != want {
+            return Err(Error::new(format!("granted object {index} is of kind {what}, where {want} belongs")));
+        }
+    }
     let count = read.count(29).map_err(bad)?;
     let mut maps = Vec::with_capacity(count);
     for _ in 0..count {
@@ -158,8 +188,11 @@ fn read_grant(body: &[u8]) -> Result<Grant, Error> {
         let at = read.u64().map_err(bad)?;
         let tag = read.u8().map_err(bad)?;
         let access = Access::from_tag(tag).ok_or_else(|| Error::new(format!("a fixed map of access {tag}")))?;
-        if object as usize >= objects.len() {
+        if object as usize >= objects.len() || object == 1 {
             return Err(Error::new(format!("a fixed map of object {object} of {}", objects.len())));
+        }
+        if access == Access::Shared {
+            return Err(Error::new(format!("a fixed map of object {object} at {at:#x} shared writable")));
         }
         maps.push((object, offset, len, at, access));
     }
@@ -273,7 +306,7 @@ fn start(channel: &mut Channel, token: [u8; 16], args: Vec<OsString>) -> Result<
     program.enter(args)
 }
 
-fn unhex(text: &str) -> Option<[u8; 16]> {
+pub(crate) fn unhex(text: &str) -> Option<[u8; 16]> {
     let text = text.as_bytes();
     if text.len() != 32 {
         return None;

@@ -13,10 +13,14 @@ use syntax::TextRange;
 
 use super::{Accepted, Finalize, GroupId, no_args, single_integer};
 use crate::{
-    checks::attrs::{
-        accept::{Accept, BinaryFormat},
-        args::{ArgParser, MetaItem, MetaItemOrLit, MetaList, NameValue},
-        parsed::{Inline, Optimize, Parsed, ParsedAttr, Repr},
+    checks::{
+        attrs::{
+            accept::{Accept, BinaryFormat},
+            args::{ArgParser, MetaItem, MetaItemOrLit, MetaList, NameValue},
+            cfg,
+            parsed::{Inline, Optimize, Parsed, ParsedAttr, Repr},
+        },
+        features::attributes,
     },
     lints::syntax::attrs::{
         Target,
@@ -338,11 +342,10 @@ fn naked_compatible(fx: &mut Finalize<'_, '_, '_>, naked: usize) {
         let attr = fx.attr(index);
         let path_span = fx.span(index, attr.path_range());
         if word == Some("target_feature") {
-            fx.gate(
-                "naked_functions_target_feature",
-                path_span,
-                "`#[target_feature(/* ... */)]` is currently unstable on `#[naked]` functions",
-            );
+            let diag = attributes::naked_target_feature(fx.cx, &fx.session.features, attr.in_file(attr.path_range()));
+            if let Some(diag) = diag {
+                fx.emit_err(diag);
+            }
             continue;
         }
         let mut diag = Diag::error(Some("E0736"), "attribute incompatible with `#[unsafe(naked)]`", path_span.clone());
@@ -360,7 +363,7 @@ fn used(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> bool {
             let Some(item) = cx.expect_single(list) else { return false };
             match word_of(item) {
                 Some(by @ ("compiler" | "linker")) => {
-                    cx.gate("used_with_arg", cx.attr_range(), format!("`#[used({by})]` is currently unstable"));
+                    cx.emit_gate(attributes::used_with_arg(cx.cx, &cx.session.features, by, cx.in_file(cx.attr_range())));
                     true
                 }
                 _ => {
@@ -708,7 +711,7 @@ fn repr_hint(cx: &mut Accept<'_, '_, '_>, param: &MetaItem) -> Option<Repr> {
             })
         }
         Some("simd") => {
-            cx.gate("repr_simd", param.range(), "SIMD types are experimental and possibly buggy");
+            cx.emit_gate(attributes::repr_simd(cx.cx, &cx.session.features, cx.in_file(param.range())));
             cx.check_target("(simd)", Targets::AllowList(&[Policy::Allow(Target::Struct)]));
             cx.expect_no_args(&param.args)?;
             Some(Repr::Simd)
@@ -881,10 +884,9 @@ fn link(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> bool {
             Some("cfg") => {
                 if cfg {
                     cx.duplicate_key(item.range(), "cfg");
-                } else if cx.expect_single_element_list(&item.args, item.range()).is_some() {
-                    cx.gate("link_cfg", item.range(), "link cfg is unstable");
-                    // The errors of the predicate are those of `cfg` (`parse_cfg_entry`).
-                    cfg = true;
+                } else if let Some(predicate) = cx.expect_single_element_list(&item.args, item.range()) {
+                    cx.emit_gate(attributes::link_cfg(cx.cx, &cx.session.features, cx.in_file(item.range())));
+                    cfg = cfg::entry(cx, predicate);
                 }
                 true
             }
@@ -973,7 +975,7 @@ fn link_kind(cx: &mut Accept<'_, '_, '_>, value: &str, range: TextRange) -> Opti
         "raw-dylib" => {
             if is_windows || is_elf && cx.feature("raw_dylib_elf") {
             } else if is_elf && cx.session.features.nightly {
-                cx.gate("raw_dylib_elf", range, "link kind `raw-dylib` is unstable on ELF platforms");
+                cx.emit_gate(attributes::link_kind_raw_dylib_elf(cx.cx, &cx.session.features, cx.in_file(range)));
             } else {
                 let diag = cx.err(Some("E0455"), "link kind `raw-dylib` is only supported on Windows targets", range);
                 cx.emit_err(diag);
@@ -981,7 +983,7 @@ fn link_kind(cx: &mut Accept<'_, '_, '_>, value: &str, range: TextRange) -> Opti
             LinkKind::RawDylib
         }
         "link-arg" => {
-            cx.gate("link_arg_attribute", range, "link kind `link-arg` is unstable");
+            cx.emit_gate(attributes::link_kind_link_arg(cx.cx, &cx.session.features, cx.in_file(range)));
             LinkKind::LinkArg
         }
         _ => {
@@ -1031,7 +1033,7 @@ fn link_modifiers(cx: &mut Accept<'_, '_, '_>, modifiers: &str, range: TextRange
                 cx.emit_err(diag);
             }
             "as-needed" if matches!(kind, Some(LinkKind::Dylib | LinkKind::Framework | LinkKind::RawDylib)) => {
-                cx.gate("native_link_modifiers_as_needed", range, "linking modifier `as-needed` is unstable");
+                cx.emit_gate(attributes::link_modifier(cx.cx, &cx.session.features, "as-needed", cx.in_file(range)));
                 assign(cx, "as-needed");
             }
             "as-needed" => {

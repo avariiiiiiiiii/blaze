@@ -13,10 +13,11 @@ mod probe;
 use std::{hash::BuildHasher, ops::Range};
 
 use crate::next_solver::StoredGenericArgs;
+use blaze_ids::radix;
 use either::Either;
 use hir_expand::name::Name;
-use intern::Symbol;
-use salsa::SalsaValue;
+use intern::{Symbol, sym};
+use salsa::{SalsaValue, plumbing::AsId};
 use span::Edition;
 use tracing::{debug, instrument};
 
@@ -867,14 +868,14 @@ pub(crate) fn may_hold<N: syntax::AstNode>(
 /// procedural macro of a dependency has it ([`macros_writing_impls`]). `macro_rules!` itself
 /// defines and writes nothing; `include!` writes what its file has.
 fn macro_is_inert(db: &dyn HirDatabase, krate: Crate, name: &Symbol) -> bool {
-    match name.as_str() {
-        "macro_rules" => true,
-        "include" => false,
-        _ => {
-            let known = macros_writing_impls(db, krate);
-            matches!(known.binary_search_by(|(it, _)| it.cmp_order(name)), Ok(i) if !known[i].1)
-        }
+    if *name == sym::macro_rules {
+        return true;
     }
+    if *name == sym::include {
+        return false;
+    }
+    let known = macros_writing_impls(db, krate);
+    matches!(known.binary_search_by(|(it, _)| it.cmp_order(name)), Ok(i) if !known[i].1)
 }
 
 /// Where `file` may write an impl in a body, found by its tokens: each `impl`, macro call and
@@ -1020,10 +1021,14 @@ fn macros_writing_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[(Symbol, boo
             }
         }
     }
-    let may_write = |known: &FxHashMap<Symbol, bool>, call: &Symbol| match call.as_str() {
-        "macro_rules" => false,
-        "include" => true,
-        _ => known.get(call).copied().unwrap_or(true),
+    let may_write = |known: &FxHashMap<Symbol, bool>, call: &Symbol| {
+        if *call == sym::macro_rules {
+            false
+        } else if *call == sym::include {
+            true
+        } else {
+            known.get(call).copied().unwrap_or(true)
+        }
     };
     loop {
         let before = calling.len();
@@ -1301,7 +1306,7 @@ impl<'db, T: Default> SelfTyGroups<'db, T> {
     /// were first seen.
     fn into_sorted(self) -> Vec<(SimplifiedType<'db>, T)> {
         let mut groups = self.groups;
-        groups.sort_by_cached_key(|(self_ty, _)| hash_self_ty(self_ty));
+        radix::sort_by_key(&mut groups, |(self_ty, _)| hash_self_ty(self_ty));
         groups
     }
 }
@@ -1463,7 +1468,10 @@ pub struct TraitImpls<'db> {
 impl<'db> TraitImpls<'db> {
     fn from_traits(traits: FxHashMap<TraitId, OneTraitImplsBuilder<'db>>) -> Self {
         let mut traits = traits.into_iter().collect::<Vec<_>>();
-        traits.sort_unstable_by_key(|&(trait_, _)| trait_);
+        radix::sort_by_key(&mut traits, |&(trait_, _)| {
+            let id = trait_.as_id();
+            radix::pack_32(id.index(), id.generation())
+        });
         let mut trait_rows = vec![0];
         let mut blanket = Vec::with_capacity(traits.len());
         let mut rows = Vec::new();

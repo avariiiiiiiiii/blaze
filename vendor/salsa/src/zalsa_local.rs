@@ -615,16 +615,6 @@ impl QueryRevisions {
         self.origin_and_extra.is_derived()
     }
 
-    /// The assigning query of a value set by `specify`.
-    #[inline]
-    pub(crate) const fn assigned_by(&self) -> Option<DatabaseKeyIndex> {
-        if self.origin_and_extra.is_derived() {
-            None
-        } else {
-            Some(self.origin_and_extra.assigned_key())
-        }
-    }
-
     #[inline]
     pub(crate) const fn is_derived_untracked(&self) -> bool {
         self.origin_and_extra.is_derived_untracked()

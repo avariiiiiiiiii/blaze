@@ -176,7 +176,7 @@ Each is a request in `v2/requests/fastcompile.md`:
 | --- | --- | --- |
 | 2 | usercode | The fork server maps and arms the record region and sends `Frame::Ended { executed }` (`wire::VERSION` 2); `Finished.executed`; usercode's reached-set selection retires in favor of blaze-testsel |
 | 3 | usercode (sandbox, `blaze-cargo/src/sandbox.rs`) | `not_inputs` only for the run's own process |
-| 4 | fastcompile-lazy | `__blaze_exec_slots` and `__blaze_exec_arm` in the run process's runtime, for lazy and whole builds |
+| 9 (was 4) | link (blaze-live, blaze-link's slot stubs) | Log stubs and a log table; `__blaze_exec_slots` and `__blaze_exec_arm` arm by one store of the table cell; slot writes while armed go through `publish`, which lazy's `Placer` uses too |
 | 5 | codegen | The per-binary exec table: versions in order, slot functions, `beside`, each test's reached indices |
 | 6 | items | `bound_hash` |
 | 7 | cargo | Wire `choose`/`keep` in `serve/unit/test.rs`, the table from `compile.rs`, the cached result in `result` |

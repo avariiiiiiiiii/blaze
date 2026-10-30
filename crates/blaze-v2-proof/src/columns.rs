@@ -7,6 +7,8 @@
 //! (format's encodings in blaze-format; store's tier moves, a record moved hot to warm to cold
 //! and back).
 
+use blaze_ids::radix;
+
 use crate::Rng;
 
 /// Columns of `u32` by what they look like, from `seed`: empty and single, constant, runs (tag
@@ -36,7 +38,7 @@ pub fn shapes(seed: u64) -> Vec<(&'static str, Vec<u32>)> {
         }
         out.push(("runs", runs));
         let mut sorted = random(n, 1 << 20);
-        sorted.sort_unstable();
+        radix::sort(&mut sorted);
         out.push(("sorted with repeats", sorted));
         let mut offsets = Vec::with_capacity(n);
         let mut at = 0u32;

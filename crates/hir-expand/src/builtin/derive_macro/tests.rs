@@ -282,3 +282,33 @@ fn joined_names() {
     let long = "x".repeat(100);
     assert_eq!(super::joined(&long, "_self"), intern::Symbol::intern(&format!("{long}_self")));
 }
+
+#[test]
+fn builtin_derives_found_as_by_compare() {
+    use intern::{Symbol, sym};
+
+    use super::BuiltinDeriveExpander;
+    use crate::name::Name;
+
+    let mut symbols: Vec<Symbol> = BuiltinDeriveExpander::NAMES.to_vec();
+    let texts: Vec<String> = symbols.iter().map(|it| it.as_str().to_owned()).collect();
+    for text in &texts {
+        symbols.push(Symbol::intern(text));
+        symbols.push(Symbol::intern(&format!("{text}_")));
+        symbols.push(Symbol::intern(&text.to_lowercase()));
+        symbols.push(Symbol::intern(&text[..text.len() - 1]));
+    }
+    symbols.extend([sym::self_, sym::derive, sym::copy, sym::sized, Symbol::intern("Serialize")]);
+    for symbol in symbols {
+        let name = Name::new_symbol_root(symbol);
+        assert_eq!(
+            BuiltinDeriveExpander::find_by_name(&name),
+            BuiltinDeriveExpander::find_by_name_by_compare(&name),
+            "{name:?}"
+        );
+    }
+    for (at, symbol) in BuiltinDeriveExpander::NAMES.iter().enumerate() {
+        let name = Name::new_symbol_root(symbol.clone());
+        assert_eq!(BuiltinDeriveExpander::find_by_name(&name), Some(BuiltinDeriveExpander::ALL[at]));
+    }
+}

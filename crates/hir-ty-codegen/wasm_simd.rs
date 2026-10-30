@@ -28,11 +28,11 @@ use cranelift_codegen::ir::{
 use cranelift_frontend::FunctionBuilder;
 use hir_def::{
     CallableDefId,
-    attrs::AttrFlags,
     layout::{BackendRepr, Primitive},
-    signatures::FunctionSignature,
 };
 use hir_ty::{
+    TargetFeature, TargetFeatures, crate_target_features,
+    intrinsic::{Intrinsic, SimdOp},
     mir::{LocalId, Operand, OperandKind, Rvalue, StatementKind, TerminatorKind},
     next_solver::{ConstKind, Ty, TyKind},
 };
@@ -102,49 +102,83 @@ enum Op {
 const _: () = assert!(size_of::<Op>() == 1);
 
 impl Op {
-    /// The intrinsic `name` is; rustc compiles the `match` to a test of the length and then a
-    /// compare of the bytes, the jump table of its own intrinsic symbols.
-    fn of(name: &str) -> Option<Op> {
-        Some(match name {
-            "simd_add" => Op::Add,
-            "simd_sub" => Op::Sub,
-            "simd_mul" => Op::Mul,
-            "simd_div" => Op::Div,
-            "simd_and" => Op::And,
-            "simd_or" => Op::Or,
-            "simd_xor" => Op::Xor,
-            "simd_eq" => Op::Eq,
-            "simd_ne" => Op::Ne,
-            "simd_lt" => Op::Lt,
-            "simd_le" => Op::Le,
-            "simd_gt" => Op::Gt,
-            "simd_ge" => Op::Ge,
-            "simd_saturating_add" => Op::SatAdd,
-            "simd_saturating_sub" => Op::SatSub,
-            "simd_shl" => Op::Shl,
-            "simd_shr" => Op::Shr,
-            "simd_neg" => Op::Neg,
-            "simd_fabs" => Op::Fabs,
-            "simd_fsqrt" => Op::Sqrt,
-            "simd_floor" => Op::Floor,
-            "simd_ceil" => Op::Ceil,
-            "simd_trunc" => Op::Trunc,
-            "simd_round_ties_even" => Op::RoundEven,
-            "simd_ctpop" => Op::Ctpop,
-            "simd_select" => Op::Select,
-            "simd_splat" => Op::Splat,
-            "simd_shuffle" => Op::Shuffle,
-            "simd_cast" | "simd_as" => Op::Cast,
-            "simd_bitmask" => Op::Bitmask,
-            "simd_reduce_add_unordered" => Op::ReduceAdd,
-            "simd_reduce_max" => Op::ReduceMax,
-            "simd_reduce_min" => Op::ReduceMin,
-            "simd_reduce_and" => Op::ReduceAnd,
-            "simd_reduce_or" => Op::ReduceOr,
-            "simd_reduce_xor" => Op::ReduceXor,
-            "simd_reduce_any" => Op::ReduceAny,
-            "simd_reduce_all" => Op::ReduceAll,
-            _ => return None,
+    /// The op of the `simd_*` intrinsic `op`, if this file lowers it: a jump table on a byte.
+    fn of(op: SimdOp) -> Option<Op> {
+        Some(match op {
+            SimdOp::Add => Op::Add,
+            SimdOp::Sub => Op::Sub,
+            SimdOp::Mul => Op::Mul,
+            SimdOp::Div => Op::Div,
+            SimdOp::And => Op::And,
+            SimdOp::Or => Op::Or,
+            SimdOp::Xor => Op::Xor,
+            SimdOp::Eq => Op::Eq,
+            SimdOp::Ne => Op::Ne,
+            SimdOp::Lt => Op::Lt,
+            SimdOp::Le => Op::Le,
+            SimdOp::Gt => Op::Gt,
+            SimdOp::Ge => Op::Ge,
+            SimdOp::SaturatingAdd => Op::SatAdd,
+            SimdOp::SaturatingSub => Op::SatSub,
+            SimdOp::Shl => Op::Shl,
+            SimdOp::Shr => Op::Shr,
+            SimdOp::Neg => Op::Neg,
+            SimdOp::Fabs => Op::Fabs,
+            SimdOp::Fsqrt => Op::Sqrt,
+            SimdOp::Floor => Op::Floor,
+            SimdOp::Ceil => Op::Ceil,
+            SimdOp::Trunc => Op::Trunc,
+            SimdOp::RoundTiesEven => Op::RoundEven,
+            SimdOp::Ctpop => Op::Ctpop,
+            SimdOp::Select => Op::Select,
+            SimdOp::Splat => Op::Splat,
+            SimdOp::Shuffle => Op::Shuffle,
+            SimdOp::Cast | SimdOp::As => Op::Cast,
+            SimdOp::Bitmask => Op::Bitmask,
+            SimdOp::ReduceAddUnordered => Op::ReduceAdd,
+            SimdOp::ReduceMax => Op::ReduceMax,
+            SimdOp::ReduceMin => Op::ReduceMin,
+            SimdOp::ReduceAnd => Op::ReduceAnd,
+            SimdOp::ReduceOr => Op::ReduceOr,
+            SimdOp::ReduceXor => Op::ReduceXor,
+            SimdOp::ReduceAny => Op::ReduceAny,
+            SimdOp::ReduceAll => Op::ReduceAll,
+            SimdOp::ArithOffset
+            | SimdOp::Bitreverse
+            | SimdOp::Bswap
+            | SimdOp::CarrylessMul
+            | SimdOp::CastPtr
+            | SimdOp::Ctlz
+            | SimdOp::Cttz
+            | SimdOp::ExposeProvenance
+            | SimdOp::Extract
+            | SimdOp::ExtractDyn
+            | SimdOp::Fcos
+            | SimdOp::Fexp
+            | SimdOp::Fexp2
+            | SimdOp::Flog
+            | SimdOp::Flog10
+            | SimdOp::Flog2
+            | SimdOp::Fma
+            | SimdOp::Fsin
+            | SimdOp::FunnelShl
+            | SimdOp::FunnelShr
+            | SimdOp::Gather
+            | SimdOp::Insert
+            | SimdOp::InsertDyn
+            | SimdOp::MaskedLoad
+            | SimdOp::MaskedStore
+            | SimdOp::MaximumNumberNsz
+            | SimdOp::MinimumNumberNsz
+            | SimdOp::ReduceAddOrdered
+            | SimdOp::ReduceMulOrdered
+            | SimdOp::ReduceMulUnordered
+            | SimdOp::RelaxedFma
+            | SimdOp::Rem
+            | SimdOp::Round
+            | SimdOp::Scatter
+            | SimdOp::SelectBitmask
+            | SimdOp::WithExposedProvenance => return None,
         })
     }
 
@@ -246,26 +280,22 @@ const LITTLE: MemFlagsData = MemFlagsData::new().with_endianness(Endianness::Lit
 impl<'db> FunctionCx<'_, 'db> {
     /// Whether the function is compiled with the wasm feature `feature`: by its crate, or by
     /// its own `#[target_feature(enable = ...)]`.
-    fn wasm_feature(&self, feature: &str) -> bool {
+    fn wasm_feature(&self, feature: TargetFeature) -> bool {
         if !self.cg.target.is_wasm() {
             return false;
         }
-        let atom = cfg::CfgAtom::KeyValue {
-            key: intern::sym::target_feature,
-            value: intern::Symbol::intern(feature),
-        };
-        if self.env.krate.cfg_options(self.cg.db).check_atom(&atom) {
+        if crate_target_features(self.cg.db, self.env.krate).contains(feature) {
             return true;
         }
         self.body.and_then(|body| body.owner.as_function()).is_some_and(|func| {
-            AttrFlags::target_features(self.cg.db, func).iter().any(|it| it.as_str() == feature)
+            TargetFeatures::from_fn_no_implications(self.cg.db, func).enables(feature)
         })
     }
 
     /// Whether the function may use wasm's `v128`: `relaxed-simd` implies `simd128`, as rustc
     /// has it.
     pub(super) fn simd128(&self) -> bool {
-        self.wasm_feature("simd128") || self.wasm_feature("relaxed-simd")
+        self.wasm_feature(TargetFeature::SIMD128) || self.wasm_feature(TargetFeature::RELAXED_SIMD)
     }
 
     /// Whether code generation may make a vector type: always but on wasm without `simd128`.
@@ -398,7 +428,7 @@ impl<'db> FunctionCx<'_, 'db> {
         if !place.projection.as_slice().is_empty() {
             return Ok(false);
         }
-        let mut callees = Vec::new();
+        let (mut calls, mut last) = (0u32, None);
         for (_, block) in body.basic_blocks.iter() {
             let assigns = block.statements.iter().any(
                 |it| matches!(&it.kind, StatementKind::Assign(to, _) if to.local == place.local),
@@ -406,62 +436,58 @@ impl<'db> FunctionCx<'_, 'db> {
             if assigns {
                 return Ok(false);
             }
-            if let Some(TerminatorKind::Call { func, destination, .. }) =
+            if let Some(TerminatorKind::Call { func, destination, intrinsic, .. }) =
                 block.terminator.as_ref().map(|it| &it.kind)
                 && destination.local == place.local
             {
                 if !destination.projection.as_slice().is_empty() {
                     return Ok(false);
                 }
-                callees.push(self.operand_ty(func)?);
+                calls += 1;
+                last = Some((self.operand_ty(func)?, *intrinsic));
             }
         }
-        let [callee] = callees[..] else { return Ok(false) };
-        let TyKind::FnDef(def, _) = callee.kind() else { return Ok(false) };
-        let CallableDefId::FunctionId(callee) = def.0 else { return Ok(false) };
-        if FunctionSignature::of(self.cg.db, callee).name.as_str() == "simd_splat" {
+        let (1, Some((callee, intrinsic))) = (calls, last) else { return Ok(false) };
+        if intrinsic == Some(Intrinsic::Simd(SimdOp::Splat)) {
             return Ok(true);
         }
+        let TyKind::FnDef(def, _) = callee.kind() else { return Ok(false) };
+        let CallableDefId::FunctionId(callee) = def.0 else { return Ok(false) };
         Ok(self.only_splats(callee))
     }
 
     /// Whether the body of `func` makes its result with one call, of `simd_splat`, and does
     /// nothing else that is a call.
     fn only_splats(&self, func: hir_def::FunctionId) -> bool {
-        let db = self.cg.db;
-        let Ok(body) = db.mir_body(func.into()) else { return false };
+        let Ok(body) = self.cg.db.mir_body(func.into()) else { return false };
         let mut calls = body.basic_blocks.iter().filter_map(|(_, block)| {
             match block.terminator.as_ref().map(|it| &it.kind) {
-                Some(TerminatorKind::Call { func, destination, .. }) => Some((func, destination)),
+                Some(TerminatorKind::Call { destination, intrinsic, .. }) => {
+                    Some((*intrinsic, destination))
+                }
                 _ => None,
             }
         });
-        let (Some((callee, destination)), None) = (calls.next(), calls.next()) else {
+        let (Some((intrinsic, destination)), None) = (calls.next(), calls.next()) else {
             return false;
         };
         if destination.local != return_slot() || !destination.projection.as_slice().is_empty() {
             return false;
         }
-        let ty = match &callee.kind {
-            OperandKind::Constant { ty, .. } => ty.as_ref(),
-            OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-            _ => return false,
-        };
-        let TyKind::FnDef(def, _) = ty.kind() else { return false };
-        let CallableDefId::FunctionId(callee) = def.0 else { return false };
-        FunctionSignature::of(db, callee).name.as_str() == "simd_splat"
+        intrinsic == Some(Intrinsic::Simd(SimdOp::Splat))
     }
 
     /// A `simd_*` intrinsic as vector instructions, when the target has them ([`Vectors`])
     /// and there is one for it. False when it is to be done a lane at a time.
     pub(super) fn wasm_simd_intrinsic(
         &mut self,
-        name: &str,
+        intrinsic: Intrinsic,
         args: &[Operand],
         dst: Value,
         dst_ty: Ty<'db>,
     ) -> Result<bool> {
-        let Some(op) = Op::of(name) else { return Ok(false) };
+        let Intrinsic::Simd(op) = intrinsic else { return Ok(false) };
+        let Some(op) = Op::of(op) else { return Ok(false) };
         let Some(vectors) = self.vectors() else { return Ok(false) };
         match (op, args) {
             (_, [l, r]) if op.is_binary() => self.wasm_simd_binary(vectors, op, l, r, dst, dst_ty),
@@ -1241,65 +1267,94 @@ mod tests {
         }
     }
 
-    const NAMES: [&str; 39] = [
-        "simd_add",
-        "simd_sub",
-        "simd_mul",
-        "simd_div",
-        "simd_and",
-        "simd_or",
-        "simd_xor",
-        "simd_eq",
-        "simd_ne",
-        "simd_lt",
-        "simd_le",
-        "simd_gt",
-        "simd_ge",
-        "simd_saturating_add",
-        "simd_saturating_sub",
-        "simd_shl",
-        "simd_shr",
-        "simd_neg",
-        "simd_fabs",
-        "simd_fsqrt",
-        "simd_floor",
-        "simd_ceil",
-        "simd_trunc",
-        "simd_round_ties_even",
-        "simd_ctpop",
-        "simd_select",
-        "simd_splat",
-        "simd_shuffle",
-        "simd_cast",
-        "simd_as",
-        "simd_bitmask",
-        "simd_reduce_add_unordered",
-        "simd_reduce_max",
-        "simd_reduce_min",
-        "simd_reduce_and",
-        "simd_reduce_or",
-        "simd_reduce_xor",
-        "simd_reduce_any",
-        "simd_reduce_all",
+    /// The names the string table admitted before the intrinsics were an enum, and their ops.
+    const NAMES: [(&str, Op); 39] = [
+        ("simd_add", Op::Add),
+        ("simd_sub", Op::Sub),
+        ("simd_mul", Op::Mul),
+        ("simd_div", Op::Div),
+        ("simd_and", Op::And),
+        ("simd_or", Op::Or),
+        ("simd_xor", Op::Xor),
+        ("simd_eq", Op::Eq),
+        ("simd_ne", Op::Ne),
+        ("simd_lt", Op::Lt),
+        ("simd_le", Op::Le),
+        ("simd_gt", Op::Gt),
+        ("simd_ge", Op::Ge),
+        ("simd_saturating_add", Op::SatAdd),
+        ("simd_saturating_sub", Op::SatSub),
+        ("simd_shl", Op::Shl),
+        ("simd_shr", Op::Shr),
+        ("simd_neg", Op::Neg),
+        ("simd_fabs", Op::Fabs),
+        ("simd_fsqrt", Op::Sqrt),
+        ("simd_floor", Op::Floor),
+        ("simd_ceil", Op::Ceil),
+        ("simd_trunc", Op::Trunc),
+        ("simd_round_ties_even", Op::RoundEven),
+        ("simd_ctpop", Op::Ctpop),
+        ("simd_select", Op::Select),
+        ("simd_splat", Op::Splat),
+        ("simd_shuffle", Op::Shuffle),
+        ("simd_cast", Op::Cast),
+        ("simd_as", Op::Cast),
+        ("simd_bitmask", Op::Bitmask),
+        ("simd_reduce_add_unordered", Op::ReduceAdd),
+        ("simd_reduce_max", Op::ReduceMax),
+        ("simd_reduce_min", Op::ReduceMin),
+        ("simd_reduce_and", Op::ReduceAnd),
+        ("simd_reduce_or", Op::ReduceOr),
+        ("simd_reduce_xor", Op::ReduceXor),
+        ("simd_reduce_any", Op::ReduceAny),
+        ("simd_reduce_all", Op::ReduceAll),
     ];
 
-    /// Each name is one op, the ops' kinds do not overlap, and the arity a kind is matched
-    /// with is the intrinsic's.
+    /// Every `simd_*` intrinsic of the pinned nightly.
+    fn simd_ops() -> impl Iterator<Item = SimdOp> {
+        (0..Intrinsic::COUNT as u16).filter_map(|index| match Intrinsic::from_index(index) {
+            Some(Intrinsic::Simd(op)) => Some(op),
+            _ => None,
+        })
+    }
+
+    /// Each name the string table admitted is the `SimdOp` that is still admitted as the same
+    /// op, and no other `SimdOp` is admitted.
+    #[test]
+    fn admits_the_names_it_did() {
+        for (name, op) in NAMES {
+            let intrinsic = Intrinsic::from_symbol(&intern::Symbol::intern(name));
+            let Some(Intrinsic::Simd(simd)) = intrinsic else { panic!("{name}: {intrinsic:?}") };
+            assert_eq!(Op::of(simd), Some(op), "{name}");
+        }
+        let mut admitted = 0;
+        for simd in simd_ops() {
+            let name = Intrinsic::Simd(simd).to_string();
+            let before = NAMES.iter().find(|(it, _)| *it == name).map(|&(_, op)| op);
+            assert_eq!(Op::of(simd), before, "{name}");
+            admitted += usize::from(before.is_some());
+        }
+        assert_eq!(admitted, NAMES.len());
+        assert_eq!(Op::of(SimdOp::ReduceAddOrdered), None);
+        assert_eq!(Op::of(SimdOp::Cast), Op::of(SimdOp::As));
+        assert_eq!(Intrinsic::from_symbol(&intern::Symbol::intern("simd_fmin")), None);
+    }
+
+    /// Each op is one `SimdOp` but `Cast`, which `simd_cast` and `simd_as` both are, the ops'
+    /// kinds do not overlap, and the arity a kind is matched with is the intrinsic's.
     #[test]
     fn every_op_is_named_once() {
         let mut seen = Vec::new();
-        for name in NAMES {
-            let op = Op::of(name).unwrap_or_else(|| panic!("{name}"));
+        for simd in simd_ops() {
+            let Some(op) = Op::of(simd) else { continue };
             let kinds = [op.is_binary(), op.is_unary(), op.is_reduce()];
-            assert!(kinds.iter().filter(|it| **it).count() <= 1, "{name}");
-            if name != "simd_as" {
-                assert!(!seen.contains(&op), "{name}");
+            assert!(kinds.iter().filter(|it| **it).count() <= 1, "{simd:?}");
+            if !matches!(simd, SimdOp::Cast | SimdOp::As) {
+                assert!(!seen.contains(&op), "{simd:?}");
             }
             seen.push(op);
         }
-        assert_eq!(Op::of("simd_cast"), Op::of("simd_as"));
-        assert_eq!(Op::of("simd_reduce_add_ordered"), None);
-        assert_eq!(Op::of("simd_fmin"), None);
+        assert_eq!(seen.len(), NAMES.len());
         assert!(Op::Shr.is_binary() && !Op::Neg.is_binary());
         assert!(Op::Ctpop.is_unary() && !Op::Select.is_unary());
         assert!(Op::ReduceAdd.is_reduce() && !Op::Bitmask.is_reduce());

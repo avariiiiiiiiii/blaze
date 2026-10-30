@@ -66,7 +66,7 @@ pub(super) fn known_abi(text: &str) -> Option<&'static str> {
 
 /// The ABI a function's or a function pointer's `extern` gives (`FALLBACK`, `"C"`, for one
 /// without a string), when rustc knows it.
-fn abi_of(abi: &ast::Abi) -> Option<&'static str> {
+pub(super) fn abi_of(abi: &ast::Abi) -> Option<&'static str> {
     match abi.string_token() {
         None => Some("C"),
         Some(string) => known_abi(&abi_text(&string)),
@@ -95,7 +95,7 @@ pub(super) enum Splat {
 
 impl Splat {
     /// `SplatSemantic::from_extern`.
-    fn of(abi: Option<&ast::Abi>) -> Splat {
+    pub(super) fn of(abi: Option<&ast::Abi>) -> Splat {
         let Some(abi) = abi else { return Splat::Yes };
         match abi.string_token() {
             Some(string) if abi_text(&string) == "rust-call" => Splat::NoAbiCall(abi.syntax().text_range()),
@@ -129,14 +129,16 @@ pub(super) fn inputs(v: &V<'_, '_, '_, '_>, list: Option<&ast::ParamList>) -> Ve
             is_self: true,
         });
     }
+    // rustc's parser reads a `self` parameter of a function pointer as one (`parse_self_param`),
+    // up to the `self`; a closure's is a pattern, the whole parameter.
+    let fn_ptr = list.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::FN_PTR_TYPE);
     for param in list.params().filter(|it| v.kept(it.syntax())) {
-        let range = TextRange::new(unattributed_start(param.syntax()), param.syntax().text_range().end());
-        inputs.push(Input {
-            node: param.syntax().clone(),
-            range,
-            variadic: param.dotdotdot_token().is_some(),
-            is_self: param_is_self(&param),
-        });
+        let is_self = param_is_self(&param);
+        let range = match param.pat() {
+            Some(pat) if is_self && fn_ptr => pat.syntax().text_range(),
+            _ => TextRange::new(unattributed_start(param.syntax()), param.syntax().text_range().end()),
+        };
+        inputs.push(Input { node: param.syntax().clone(), range, variadic: param.dotdotdot_token().is_some(), is_self });
     }
     inputs
 }
@@ -311,7 +313,7 @@ fn param_attrs(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, inputs: &[Input], out: 
             }
             let Some(name) = meta.path().and_then(|it| it.as_single_name_ref()) else { return };
             let name = name.text();
-            let name = unraw(name.as_str());
+            let name = unraw(name);
             if is_builtin_attr_name(name) && !PARAM_ATTRS.contains(&name) {
                 found.push((attr_range(meta, attr), false));
             }
@@ -500,7 +502,7 @@ impl<'i> Sig<'i> {
             inputs,
             params_end: params_end(item.param_list(), item.syntax()),
             ret: item.ret_type().and_then(|it| it.ty()),
-            name: item.name().map(|it| unraw(it.text().as_str()).to_owned()),
+            name: item.name().map(|it| unraw(it.text()).to_owned()),
             foreign,
             fn_ptr: false,
         }
@@ -511,7 +513,7 @@ impl<'i> Sig<'i> {
         let qualifiers =
             [ty.abi().map(|it| it.syntax().text_range()), safe.or(ty.unsafe_token().map(|it| it.text_range()))];
         Sig {
-            span: ty.syntax().text_range(),
+            span: decl_range(ty.syntax()),
             safe,
             unsafe_: ty.unsafe_token().map(|it| it.text_range()),
             coroutine: None,
@@ -529,6 +531,19 @@ impl<'i> Sig<'i> {
     fn output(&self) -> TextRange {
         self.ret.as_ref().map_or(TextRange::empty(self.params_end), |it| it.syntax().text_range())
     }
+}
+
+/// rustc's `decl_span` of a function pointer type: from its qualifiers to its end, without
+/// its `for<..>`.
+pub(super) fn decl_range(node: &SyntaxNode) -> TextRange {
+    let start = node
+        .children_with_tokens()
+        .find(|it| match it {
+            NodeOrToken::Node(node) => node.kind() != SyntaxKind::FOR_BINDER,
+            NodeOrToken::Token(token) => !token.kind().is_trivia(),
+        })
+        .map_or(node.text_range().start(), |it| it.text_range().start());
+    TextRange::new(start, node.text_range().end())
 }
 
 /// A function pointer type's `safe`, which blaze's tree keeps as a token of the type.
@@ -822,6 +837,7 @@ fn c_variadic_abi(
                 | "efiapi" | "system" | "system-unwind"
         );
         if is_c {
+            // A naked C-variadic `extern "C"` function is allowed.
         } else if supported {
             if !v.feature("c_variadic_naked_functions") {
                 let message = format!("Naked c-variadic `extern \"{abi}\"` functions are unstable");

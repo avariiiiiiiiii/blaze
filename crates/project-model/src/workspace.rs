@@ -11,6 +11,7 @@ use base_db::{
     CrateWorkspaceData, DependencyBuilder, Env, LangCrateOrigin, ProcMacroLoadingError,
     ProcMacroPaths, target::TargetLoadResult,
 };
+use blaze_ids::radix;
 use cfg::{CfgAtom, CfgDiff, CfgOptions};
 use intern::{Symbol, sym};
 use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
@@ -2076,7 +2077,7 @@ fn extend_crate_graph_with_sysroot(
         marker_set.extend(sysroot_crate_graph.transitive_deps(cid));
     }
 
-    marker_set.sort();
+    radix::sort_copy_by_key(&mut marker_set, |it| it.into_raw().into_u32());
     marker_set.dedup();
 
     // Remove all crates except the ones we are interested in to keep the sysroot graph small.

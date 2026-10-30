@@ -3,7 +3,7 @@
 //!
 //! The fork server maps a region of [`HEADER`] plus `slots` bytes shared (`MAP_SHARED`)
 //! before it forks a test's child, with [`header`] written at its start. The child's runtime
-//! arms every slot so its next call logs (`__blaze_exec_arm`, the lazy runtime's), first
+//! arms every slot so its next call logs (`__blaze_exec_arm`, blaze-live's, over the jump table), first
 //! marking what the server itself ran since it started, and says so by writing `armed`. A
 //! slot's first call stores a non-zero byte at `HEADER + slot`, from any thread and from any
 //! process the test forks, which shares the region. The server reads the region once the

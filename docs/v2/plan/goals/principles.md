@@ -34,18 +34,20 @@ branch-free lexing, the scheduler against work-stealing runtimes, and incrementa
 against Unison and rustc's red-green graph, finer than both. Where we don't beat it, the notes
 say why and what it would take.
 
-**It just works; conformance only where something depends on it.** The bar is that real
-programs build and run under blaze as they do under rustc, judged by the crate corpus and
-people's projects, not by matching rustc for its own sake.
-- **Match rustc where real code depends on it**, even unofficially: semantics, which programs
-  compile, trait selection, panics, overflow, layout, `--print` output that build scripts
-  read, and cargo's JSON. Layout stays rustc's because crates assert sizes
-  (`assert!(size_of::<T>() == 16)`) and unsafe code relies on it, and matching it costs nothing
-  since we compute it with rustc's algorithm anyway.
-- **Be free everywhere nobody can tell:** machine code, symbol names in dev builds, debug-info
-  layout, file and cache formats, `target/` internals no tool reads, diagnostic wording, and
-  `-Z` flags no project uses. Take the fastest way.
-- **When unsure, ask the corpus.** If changing something breaks no crate in it, it's free.
+**It just works, and nothing binds us to rustc.** The bar is that real programs build and run
+under blaze, judged by the crate corpus and people's projects. rustc's choices are defaults we
+follow where following is free and departing would cost users. They are not constraints, and
+no part of v2's design may assume them.
+- **Follow rustc by default where real code leans on it** and following costs nothing:
+  semantics, which programs compile, trait selection, layout (crates assert sizes; we compute
+  it with rustc's algorithm anyway), the `--print` output build scripts read, cargo's JSON.
+- **Keep every such choice replaceable.** Layout, mangling, the solver's rules, and the formats
+  are each one module behind an interface, so changing one is a local change. Changes come
+  through an opt-in (a blaze edition or a crate attribute, AGENTS.md superset-of-rust), or by
+  default once the corpus shows nothing breaks.
+- **Be free everywhere nobody can tell:** machine code, dev symbol names, debug-info layout,
+  file and cache formats, `target/` internals, diagnostic wording, unused `-Z` flags. Take the
+  fastest way.
 
 **Deterministic**: the same inputs give the same bytes, whatever the scheduling, the core count
 or the machine. The invalidation oracle (section 11) depends on it.

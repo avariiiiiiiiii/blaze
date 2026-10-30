@@ -564,7 +564,7 @@ impl Stage<'_> {
                 hot.set_zero(zero);
             }
         }
-        relay.sort_unstable();
+        radix::sort(&mut relay);
         relay.dedup();
         if relay.is_empty() {
             self.tls();

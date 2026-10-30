@@ -8,6 +8,7 @@ use std::{collections::hash_map::Entry, fmt, iter, mem};
 use crate::text_edit::{TextEdit, TextEditBuilder};
 use crate::{SnippetCap, assists::Command, syntax_helpers::tree_diff::diff};
 use base_db::AnchoredPathBuf;
+use blaze_ids::radix;
 use itertools::Itertools;
 use macros::UpmapFromRaFixture;
 use nohash_hasher::IntMap;
@@ -159,7 +160,7 @@ impl SnippetEdit {
             })
             .collect_vec();
 
-        snippet_ranges.sort_by_key(|(_, range)| range.start());
+        radix::sort_copy_by_key(&mut snippet_ranges, |(_, range)| u32::from(range.start()));
 
         // Ensure that none of the ranges overlap
         let disjoint_ranges = snippet_ranges

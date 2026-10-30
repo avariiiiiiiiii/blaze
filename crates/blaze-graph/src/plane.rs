@@ -45,6 +45,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    borrow::Cow,
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, hash_map::Entry},
     fmt,
@@ -132,7 +133,9 @@ pub enum PlaneInput {
     /// Nodes of the request, besides those it had. Their deps are nodes of the same request.
     Add { at_ns: u64, request: RequestId, nodes: Vec<Spec> },
     /// [`PlaneInput::Add`] of a run of ids as columns, one allocation a column rather than
-    /// two a node: the same nodes in the same order say the same.
+    /// two a node: the same nodes in the same order say the same, but that one
+    /// [`Event::Nodes`] of the columns, before anything else, says them all in place of an
+    /// [`Event::Node`] a node.
     AddNodes { at_ns: u64, request: RequestId, nodes: Nodes },
     /// No more nodes are added to the request but by [`PlaneInput::Done`].
     Close { at_ns: u64, request: RequestId },
@@ -282,18 +285,27 @@ impl Nodes {
         }
     }
 
-    /// What the plane takes of the node at `at`: the name and deps copied, for its record.
-    fn parts(&self, at: usize) -> Parts {
+    /// What the plane takes of the node at `at`: its name borrowed, and no record of its own,
+    /// since the batch's [`Nodes::record`] says it.
+    fn parts(&self, at: usize) -> Parts<'_> {
         Parts {
             id: self.id(at),
             kind: self.kinds[at],
-            name: self.name(at).to_owned(),
-            deps: self.deps(at).iter().map(|it| it.0).collect(),
+            name: Cow::Borrowed(self.name(at)),
+            deps: None,
             pool: self.pools[at],
             cost: self.costs[at],
             key: self.keys[at],
             memory: self.memory[at],
         }
+    }
+
+    /// The batch as one [`Event::Nodes`], its columns taken: the nodes as their
+    /// [`Event::Node`]s would say them, in the order given.
+    fn record(self) -> Event {
+        let Nodes { first, kinds, names, name_at, deps, deps_at, .. } = self;
+        let deps = deps.into_iter().map(|it| it.0).collect();
+        Event::Nodes { first: first.0, kinds, names, name_at, deps, deps_at }
     }
 }
 
@@ -362,24 +374,25 @@ impl TryFrom<Columns> for Nodes {
     }
 }
 
-/// What [`Plane::add_one`] takes of a node, from a [`Spec`] or from [`Nodes`]: the name and deps
-/// owned for the node's record.
-struct Parts {
+/// What [`Plane::add_one`] takes of a node, from a [`Spec`] or from [`Nodes`].
+struct Parts<'a> {
     id: NodeId,
     kind: NodeKind,
-    name: String,
-    deps: Vec<u32>,
+    name: Cow<'a, str>,
+    /// The deps its own [`Event::Node`] says, with its name; `None` for a node of [`Nodes`],
+    /// which its batch's [`Event::Nodes`] says.
+    deps: Option<Vec<u32>>,
     pool: Pool,
     cost: u64,
     key: Option<Key>,
     memory: u64,
 }
 
-impl From<Spec> for Parts {
-    fn from(spec: Spec) -> Parts {
+impl From<Spec> for Parts<'static> {
+    fn from(spec: Spec) -> Parts<'static> {
         let Spec { id, kind, name, deps, pool, cost, key, memory } = spec;
-        let deps = deps.into_iter().map(|it| it.0).collect();
-        Parts { id, kind, name, deps, pool, cost, key, memory }
+        let deps = Some(deps.into_iter().map(|it| it.0).collect());
+        Parts { id, kind, name: Cow::Owned(name), deps, pool, cost, key, memory }
     }
 }
 
@@ -1040,7 +1053,22 @@ impl Plane {
                     return Err(Error::Closed);
                 }
                 self.check(r, &nodes)?;
-                self.add_with(at, r, nodes.len(), |place| nodes.parts(place), out);
+                // The batch's record goes before any of its nodes moves; it takes the columns
+                // once the nodes are added from them, into the place kept for it.
+                let record_at = out.len();
+                if !nodes.is_empty() {
+                    let kept = Event::Nodes {
+                        first: 0,
+                        kinds: Vec::new(),
+                        names: String::new(),
+                        name_at: Vec::new(),
+                        deps: Vec::new(),
+                        deps_at: Vec::new(),
+                    };
+                    out.push(said(request, at, kept));
+                    self.add_with(at, r, nodes.len(), |place| nodes.parts(place), out);
+                    out[record_at] = said(request, at, nodes.record());
+                }
                 touched.push(r);
             }
             PlaneInput::Close { request, .. } => {
@@ -1238,12 +1266,12 @@ impl Plane {
 
     /// Adds the `len` nodes [`Plane::check`] took to request `r`, in its order: `part` gives the
     /// node at each place, called once a place.
-    fn add_with(
+    fn add_with<'p>(
         &mut self,
         at: u64,
         r: u32,
         len: usize,
-        mut part: impl FnMut(usize) -> Parts,
+        mut part: impl FnMut(usize) -> Parts<'p>,
         out: &mut Vec<PlaneOutput>,
     ) {
         if len == 0 {
@@ -1308,7 +1336,7 @@ impl Plane {
         &mut self,
         at: u64,
         r: u32,
-        parts: Parts,
+        parts: Parts<'_>,
         batch: &Batch,
         place: usize,
         out: &mut Vec<PlaneOutput>,
@@ -1397,12 +1425,10 @@ impl Plane {
         request.names.push_str(&name);
         request.nodes.push(me);
         request.open += 1;
-        let request_id = request.id;
-        out.push(said(
-            request_id,
-            at,
-            Event::Node { id: id.0, kind, name, deps },
-        ));
+        if let Some(deps) = deps {
+            let name = name.into_owned();
+            out.push(said(request.id, at, Event::Node { id: id.0, kind, name, deps }));
+        }
         *self.index.get_mut(&id).expect("a checked node in the index") = me;
         let seq = self.seq();
         let m = me as usize;

@@ -16,6 +16,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+blaze-ids.workspace = true
 blaze-in-place = { path = "../blaze-in-place" }
 # What the program reads of a patch for its statics (`lasting.rs`, `macho.rs`).
 blaze-live = { path = "../blaze-live" }

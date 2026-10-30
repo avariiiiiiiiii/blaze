@@ -44,6 +44,7 @@ use crate::{
     db::{AnonConstId, GeneralConstId, HirDatabase, InternedClosureId},
     drop::{DropGlue, has_drop_glue},
     infer::PointerCast,
+    intrinsic::Intrinsic,
     layout::{Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
@@ -946,6 +947,7 @@ impl<'db> Evaluator<'db> {
                             target,
                             cleanup: _,
                             from_hir_call: _,
+                            intrinsic,
                         } => {
                             let destination_interval = self.place_interval(destination, locals)?;
                             let fn_ty = self.operand_ty(func, locals)?;
@@ -953,8 +955,8 @@ impl<'db> Evaluator<'db> {
                                 .iter()
                                 .map(|it| self.operand_ty_and_eval(it, locals))
                                 .collect::<Result<'db, Vec<_>>>()?;
-                            let stack_frame = match fn_ty.kind() {
-                                TyKind::FnPtr(..) => {
+                            let stack_frame = match (fn_ty.kind(), *intrinsic) {
+                                (TyKind::FnPtr(..), _) => {
                                     let bytes = self.eval_operand(func, locals)?;
                                     self.exec_fn_pointer(
                                         bytes,
@@ -965,7 +967,24 @@ impl<'db> Evaluator<'db> {
                                         terminator.span,
                                     )?
                                 }
-                                TyKind::FnDef(def, generic_args) => self.exec_fn_def(
+                                (TyKind::FnDef(def, generic_args), Some(intrinsic)) => {
+                                    let CallableDefId::FunctionId(def) = def.0 else {
+                                        return Err(MirEvalError::InternalError(
+                                            "an intrinsic call of a constructor".into(),
+                                        ));
+                                    };
+                                    self.exec_intrinsic_fn(
+                                        def,
+                                        intrinsic,
+                                        &args,
+                                        generic_args,
+                                        locals,
+                                        destination_interval,
+                                        *target,
+                                        terminator.span,
+                                    )?
+                                }
+                                (TyKind::FnDef(def, generic_args), None) => self.exec_fn_def(
                                     def.0,
                                     generic_args,
                                     destination_interval,
@@ -974,7 +993,7 @@ impl<'db> Evaluator<'db> {
                                     *target,
                                     terminator.span,
                                 )?,
-                                it => not_supported!("unknown function type {it:?}"),
+                                (it, _) => not_supported!("unknown function type {it:?}"),
                             };
                             if let Some(stack_frame) = stack_frame {
                                 if self.limits_frames {
@@ -3675,9 +3694,36 @@ impl<'db> Evaluator<'db> {
         Ok(r)
     }
 
+    /// A call of `def`, the intrinsic `intrinsic`, as MIR lowering recognized it: the
+    /// evaluator's own implementation, or the fallback body where it has none.
+    fn exec_intrinsic_fn(
+        &mut self,
+        def: FunctionId,
+        intrinsic: Intrinsic,
+        args: &[IntervalAndTy<'db>],
+        generic_args: GenericArgs<'db>,
+        locals: &Locals<'db>,
+        destination: Interval,
+        target_bb: Option<BasicBlockId>,
+        span: MirSpan,
+    ) -> Result<'db, Option<StackFrame<'db>>> {
+        if self.exec_intrinsic_call(
+            def,
+            intrinsic,
+            args,
+            generic_args,
+            locals,
+            destination,
+            span,
+        )? {
+            return Ok(None);
+        }
+        self.exec_fn_body(def, args, generic_args, locals, destination, target_bb, span)
+    }
+
     fn exec_fn_with_args(
         &mut self,
-        mut def: FunctionId,
+        def: FunctionId,
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
         locals: &Locals<'db>,
@@ -3695,6 +3741,21 @@ impl<'db> Evaluator<'db> {
         )? {
             return Ok(None);
         }
+        self.exec_fn_body(def, args, generic_args, locals, destination, target_bb, span)
+    }
+
+    /// A call of `def` that runs its body: its own, or the method a `dyn` receiver dispatches
+    /// it to.
+    fn exec_fn_body(
+        &mut self,
+        mut def: FunctionId,
+        args: &[IntervalAndTy<'db>],
+        generic_args: GenericArgs<'db>,
+        locals: &Locals<'db>,
+        destination: Interval,
+        target_bb: Option<BasicBlockId>,
+        span: MirSpan,
+    ) -> Result<'db, Option<StackFrame<'db>>> {
         if let Some(redirect_def) = self.detect_and_redirect_special_function(def)? {
             def = redirect_def;
         }

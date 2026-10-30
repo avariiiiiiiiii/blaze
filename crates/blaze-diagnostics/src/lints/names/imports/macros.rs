@@ -58,7 +58,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found>
             let matched = uses.arms.get(&id);
             let mut fact = None;
             for (n, rule) in rules(&def).into_iter().enumerate() {
-                if rule.compile_error || matched.is_some_and(|it| it.contains(&(n as u32))) {
+                if rule.compile_error || matched.is_some_and(|it| it.contains(n)) {
                     continue;
                 }
                 let mut spans = rule.spans.into_iter().map(|it| cx.span(InFile::new(tree.file, it)));

@@ -35,6 +35,15 @@ miss, `emit` (`v2/backend.rs::told`, `v2/convert.rs`). With full debug info (the
   local); the table borrows them when written and borrows them from the stored bytes when read
   (postcard, zero-copy `&str`). `side::Variable` is 64 bytes (`const` asserted).
 
+- **Built-in callees: LLVM's always-inliner at -O0.** A v2 unit builds in the
+  `#[inline(always)]` callees of crates no edit reaches, as cargo's debug build does. The walk
+  lists the built-in body's requests from the memoized body (`declare_inlined`), walking no
+  callee again. The code hashes are gathered only for an instance that builds something in,
+  so nearly every instance allocates nothing for them.
+- **One walk for every unit.** The walk reads level-1 bodies with unwinding and debug
+  assertions on, which ask for a superset of every other setting. So `describe` is spec-free and
+  memoized once per instance, where rustc collects once per session and level.
+
 ## Where v2 is behind, and what it would take
 
 - `describe` copies the memoized walk into `Described::refs` and each outside symbol into a

@@ -33,7 +33,7 @@ use crate::{
     home::Homes,
     v2::{
         Body, BuildTime, Built, Databases, Hashes, HirFrontend, HirInstance, HirStatic, Kind,
-        backend::built,
+        backend::{built, compiled_in},
         build::{self, Build},
         places::{self, Placer, Ref, place_requests},
     },
@@ -219,7 +219,7 @@ fn placed(
         Built::Assembled(_, requests) => requests,
     };
     let mut placer = Placer::listed(walked.to_vec());
-    place_requests(db, homes, &ById, &mut placer, requests).unwrap_or_else(|e| {
+    place_requests(db, homes, &ById, compiled_in(db, instance), &mut placer, requests).unwrap_or_else(|e| {
         panic!("{instance:?} with {setting} asks for what its walk has not: {e}")
     });
 }
@@ -618,7 +618,7 @@ fn extern_and_variadic_calls_list_their_symbols() {
         assert_eq!(walk(db, assembly, homes), Ok(Vec::new()));
         let mut code = built(db, assembly, false).expect("the assembly");
         let Built::Assembled(_, requests) = &mut code else { panic!("IR of assembly") };
-        place_requests(db, homes, &ById, &mut Placer::listed(Vec::new()), requests)
+        place_requests(db, homes, &ById, None, &mut Placer::listed(Vec::new()), requests)
             .expect("assembly that names nothing");
     });
 }
@@ -628,20 +628,18 @@ const INTRINSICS: &str = r#"
 #![feature(intrinsics)]
 pub mod intrinsics {
     #[rustc_intrinsic]
-    pub fn abort() -> !;
+    pub const fn abort_immediate() -> !;
     #[rustc_intrinsic]
-    pub unsafe fn sqrtf64(x: f64) -> f64;
-    #[rustc_intrinsic]
-    pub unsafe fn sqrtf32(x: f32) -> f32;
+    pub fn sqrt<T>(x: T) -> T;
 }
-pub fn root_of(x: f64) -> f64 { unsafe { intrinsics::sqrtf64(x) + intrinsics::sqrtf32(x as f32) as f64 } }
+pub fn root_of(x: f64) -> f64 { intrinsics::sqrt(x) + intrinsics::sqrt(x as f32) as f64 }
 pub fn remainder(x: f64) -> f64 { x % 2.0 }
-pub fn give_up(fail: bool) -> u32 { if fail { intrinsics::abort() } 1 }
+pub fn give_up(fail: bool) -> u32 { if fail { intrinsics::abort_immediate() } 1 }
 pub fn roots(x: f64, fail: bool) -> f64 { root_of(x) + remainder(x) + give_up(fail) as f64 }
 "#;
 
-/// `abort` and a float `sqrt` are the IR builder's own and list no function; a float `%`
-/// lists the C library's `fmod`.
+/// `abort_immediate` and a float `sqrt` are the IR builder's own and list no function; a float
+/// `%` lists the C library's `fmod`.
 #[test]
 fn intrinsics_list_what_they_lower_to() {
     let (db, reached) = reach_from(INTRINSICS, "roots");
@@ -654,6 +652,44 @@ fn intrinsics_list_what_they_lower_to() {
         })
         .expect("`remainder` is reached");
     assert_extern(walked, "fmod");
+}
+
+const LIBCALLS: &str = r#"
+//- minicore: sized
+#![feature(intrinsics)]
+pub mod intrinsics {
+    #[rustc_intrinsic]
+    pub fn powi<T>(a: T, x: i32) -> T;
+    #[rustc_intrinsic]
+    pub fn powf<T>(a: T, x: T) -> T;
+    #[rustc_intrinsic]
+    pub const fn fma<T>(a: T, b: T, c: T) -> T;
+    #[rustc_intrinsic]
+    pub unsafe fn frem_fast<T>(a: T, b: T) -> T;
+    #[rustc_intrinsic]
+    pub const unsafe fn unchecked_div<T>(x: T, y: T) -> T;
+    #[rustc_intrinsic]
+    pub const fn mul_with_overflow<T>(x: T, y: T) -> (T, bool);
+}
+use intrinsics::*;
+pub fn roots(x: f64, a: u128, b: u128) -> f64 {
+    let (product, _) = mul_with_overflow(a, b);
+    let quotient = unsafe { unchecked_div(a, b) };
+    let floats = powi(x, 3) + powf(x, x) + fma(x, x, x) + unsafe { frem_fast(x, x) };
+    floats + (product ^ quotient) as f64
+}
+"#;
+
+/// Intrinsics dispatched by the enum the call holds list the functions their names did: the
+/// generic `powi`, `powf` and `fma` those of `powif64`, `powf64` and `fmaf64`, `frem_fast` C's
+/// `fmod`, and the 128-bit quotient and product compiler-builtins'.
+#[test]
+fn intrinsics_by_enum_list_what_their_names_did() {
+    let (_, reached) = reach_from(LIBCALLS, "roots");
+    let walked = root_walk(&reached);
+    for symbol in ["__powidf2", "pow", "fma", "fmod", "__udivti3", "__rust_u128_mulo"] {
+        assert_extern(walked, symbol);
+    }
 }
 
 const PROMOTED: &str = r#"

@@ -12,6 +12,15 @@ pub(crate) const fn aligned(n: u64) -> u64 {
     (n + ALIGN - 1) & !(ALIGN - 1)
 }
 
+/// The bytes a record of `stored` payload bytes takes in its pack, padding included; `None`
+/// for a length no record can have, as an unverified header or index slot may say.
+pub(crate) const fn span_of(stored: u64) -> Option<u64> {
+    match RECORD_HEADER.checked_add(stored) {
+        Some(n) if n <= u64::MAX - (ALIGN - 1) => Some(aligned(n)),
+        _ => None,
+    }
+}
+
 /// Every commit leaves each pack a whole number of blocks long, so every append starts and
 /// ends on a block and can be written with `O_DIRECT`. The rest of a commit's last block is
 /// zeros, which a record header never starts with.
@@ -27,7 +36,9 @@ pub(crate) const VALUE_DOMAIN: &str = "blaze v2 store value 1";
 pub(crate) const CHUNK_DOMAIN: &str = "blaze v2 store chunk 1";
 pub(crate) const DICTIONARY_DOMAIN: &str = "blaze v2 store dictionary 1";
 
-pub(crate) fn content_of(bytes: &[u8]) -> ContentId {
+/// What a value's bytes hash to: [`crate::Entry::content`], and what a fetched value is checked
+/// against.
+pub fn content_of(bytes: &[u8]) -> ContentId {
     ContentId::of(VALUE_DOMAIN, bytes)
 }
 
@@ -201,6 +212,9 @@ impl RecordHeader {
         }
         let kind = Kind::from_code(bytes[4]).ok_or("its header names no kind")?;
         let form = Form::from_code(bytes[5]).ok_or("its header names no form")?;
+        if span_of(u64_at(bytes, 16)).is_none() {
+            return Err("its header says a length no record can have");
+        }
         Ok(RecordHeader {
             kind,
             form,
@@ -214,7 +228,7 @@ impl RecordHeader {
 
     /// The bytes the record takes in its pack, padding included.
     pub(crate) fn span(&self) -> u64 {
-        aligned(RECORD_HEADER + self.stored)
+        span_of(self.stored).expect("a header is decoded, which refuses a length with no span, or made in memory")
     }
 }
 
@@ -474,6 +488,8 @@ impl Head {
         for (number, pack) in head.packs.iter().enumerate() {
             if pack.indexed > pack.committed
                 || pack.dead > pack.committed
+                || pack.indexed % ALIGN != 0
+                || pack.dead % ALIGN != 0
                 || pack.committed < PACK_HEADER
                 || pack.committed % BLOCK != 0
             {

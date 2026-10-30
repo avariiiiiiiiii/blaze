@@ -413,10 +413,6 @@ impl Runtime {
             }
         }
     }
-
-    pub(crate) fn epoch(&self) -> u64 {
-        self.epoch
-    }
 }
 
 /// `f` on the runtime of the model running this thread; `None` outside a model (or between
@@ -519,26 +515,6 @@ pub(crate) fn yield_now(at: At) -> Option<()> {
         th.last_yield = Some(th.clock.get(thread));
         th.yields += 1;
     });
-    Some(())
-}
-
-/// A schedule point after `f`, which may block the running thread: it returns what the
-/// thread then waits for.
-pub(crate) fn wait(
-    at: At,
-    what: &'static str,
-    f: impl FnOnce(&mut Runtime) -> Result<Option<Wait>, String>,
-) -> Option<()> {
-    let switch = with(|rt| {
-        rt.note(at, what);
-        let thread = rt.current();
-        if let Some(wait) = f(rt)? {
-            rt.threads[thread].state = State::Blocked(wait);
-        }
-        rt.threads[thread].op = None;
-        rt.schedule()
-    })?;
-    go_on(switch);
     Some(())
 }
 

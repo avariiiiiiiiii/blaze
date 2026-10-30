@@ -2,6 +2,8 @@
 //! cell, a two-slot table of two functions, and buffers for the patch regions, with the
 //! platform's writes done by [`Fake`].
 
+#![allow(unsafe_code)]
+
 use std::{
     collections::HashMap,
     ops::Range,
@@ -9,7 +11,7 @@ use std::{
 };
 
 use super::{
-    Outcome, hook,
+    Outcome, hook, image,
     switch::{Dwarf, HOST_ARCH, KEPT, Layout, Memory, POOL, Span, Switch, Writes},
 };
 use crate::patch::{
@@ -48,11 +50,39 @@ struct Fake {
     frames: Vec<u64>,
     functions: Vec<(u64, u64, u64)>,
     published: usize,
+    /// Memory the fake image does not have: a range touching it is refused as a platform
+    /// refuses an address outside the image.
+    outside: Option<Range<u64>>,
 }
 
 impl Memory for Fake {
     const DWARF: Dwarf = Dwarf::Sections;
     const SEH: bool = true;
+
+    fn cell(&self, cell: u64) -> u64 {
+        // SAFETY: the cell is the `Program`'s, an 8-aligned `AtomicU64` that outlives the
+        // switch.
+        unsafe { image::cell(cell) }.load(Ordering::Acquire)
+    }
+
+    fn in_image(&self, range: &Range<u64>) -> Result<(), String> {
+        match &self.outside {
+            Some(outside) if range.start < outside.end && outside.start < range.end => {
+                Err(format!("{:#x}..{:#x}, outside the image", range.start, range.end))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String> {
+        Err(format!("{:#x}: the fake image has no read-only data", range.start))
+    }
+
+    fn loaders(&self, at: u64, slots: u64) -> &[u64] {
+        // SAFETY: the table is the `Program`'s, 8-aligned and `slots` long (`Switch::new`
+        // checked the cell points at it), and outlives the switch; nothing writes it.
+        unsafe { image::words(at, slots as usize) }
+    }
 
     fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
         if self.write_code {
@@ -68,7 +98,7 @@ impl Memory for Fake {
         // SAFETY: every data write the tests make is to a buffer of their `Program`, which
         // outlives the switch; the switch checks only that it misses the code region, the
         // cell, the loader's table and lasting memory, so the tests keep to the buffers.
-        unsafe { writes.put_in_place() };
+        unsafe { writes.store_in_place() };
         Ok(())
     }
 
@@ -131,6 +161,10 @@ impl Program {
     /// A switch of the program, from its descriptor as the linker writes it for an image
     /// linked at `generation`.
     fn switch_at(&self, write_code: bool, generation: u64) -> Switch<Fake> {
+        self.switch_with(Fake { write_code, ..Fake::default() }, generation).expect("a switch")
+    }
+
+    fn switch_with(&self, fake: Fake, generation: u64) -> Result<Switch<Fake>, String> {
         let mut bytes = vec![0u8; Descriptor::SIZE];
         let at = bytes.as_ptr() as u64;
         let descriptor = Descriptor {
@@ -150,7 +184,7 @@ impl Program {
         let decoded = Descriptor::decode(&bytes).expect("a descriptor");
         let layout = Layout::new(&decoded, at).expect("a layout");
         assert_eq!(layout.slide, SLIDE);
-        Switch::new(Fake { write_code, ..Fake::default() }, layout).expect("a switch")
+        Switch::new(fake, layout)
     }
 
     /// Calls slot `slot` as code the linker made does: the cell, then the slot.
@@ -183,6 +217,23 @@ fn applied(switch: &mut Switch<Fake>, patch: Patch) {
     let (outcome, answer) = switch.handle(Message::Patch(patch));
     assert!(matches!(outcome, Outcome::Applied { .. }), "{outcome}");
     assert_eq!(answer, Some(Answer::Applied { generation }));
+}
+
+/// A cell or a loader's table the image doesn't have is refused before the switch reads it.
+#[test]
+fn a_table_outside_the_image_is_refused() {
+    let program = Program::new();
+    let cell = program.cell.as_ptr() as u64;
+    let table = program.table.as_ptr() as u64;
+    for (outside, named) in [(cell..cell + 8, cell), (table + 8..table + 9, table)] {
+        let fake = Fake { outside: Some(outside), ..Fake::default() };
+        let refused = program.switch_with(fake, FIRST_GENERATION).err().expect("refused");
+        assert!(refused.contains(&format!("{named:#x}")), "{refused}");
+    }
+    let zero = Program::new();
+    zero.cell.store(0, Ordering::Relaxed);
+    let refused = zero.switch_with(Fake::default(), FIRST_GENERATION).err().expect("refused");
+    assert!(refused.contains("holds 0x0"), "{refused}");
 }
 
 #[test]

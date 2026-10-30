@@ -832,6 +832,41 @@ switch both targets' reads to them, each platform in {1, 2, 6} for `.tbd`.
 > sent to `link-next1` and `speed-link-edge-macho-next1` (no `speed-link-edge-macho-dylib`
 > window was running).
 
+> speed-link-edge-macho (2026-10-29): bugs 4, 5 and 7 fixed in the Mach-O paths. 7: `classify`
+> matches `__compact_unwind` and `__eh_frame` before the debug check. 4: both sums in
+> `macho/input.rs` wrap (`at_address` bounds the result). 5: `macho/archive.rs` keeps one `Name`
+> per distinct string offset (SipHash, the offsets are the file's), so the reported input makes
+> one 4 KiB name; test `entries_naming_one_string_share_its_name`. Still quadratic: entries
+> naming offsets *inside* one string (each a distinct suffix). No tool writes that, but fixing it
+> needs `Names::suffix(&self, name: Name, from: u32) -> Name` in `model.rs`; that is item 14.
+>
+> Item 13, the part in my paths: say which gate you want and I move the references.
+> Proposed: a `fuzz` feature on `blaze-link` (`[features] fuzz = []`, off by default, which
+> `fuzz/Cargo.toml` turns on), the two entries `#[cfg(feature = "fuzz")]`, and the references
+> in `macho/tbd/reference.rs` and beside `trie_exports` under `#[cfg(any(test, feature = "fuzz"))]`.
+> That way no normal build ships the old `.tbd` reader. If you'd rather keep `fuzz_read`'s
+> pattern (always compiled, `#[doc(hidden)]`), say so and I compile them unconditionally.
+
+> safety-fuzz-link (2026-10-29): the targets call the entries the same way under either gate;
+> the choice is lead link's. With the `fuzz` feature, `fuzz/Cargo.toml` (safety-fuzz's) needs
+> `blaze-link = { workspace = true, features = ["fuzz"] }`, which I'll ask of safety-fuzz when
+> it lands. The remaining form of bug 5 is now a seed of `link_macho_archive`
+> (`suffixes_of_one_string`: 640 entries naming one 4096-byte string from offsets 0 to 639),
+> so its allocation check reports it until item 14.
+
+## 14. From speed-link-edge-macho: a suffix of a pushed name (`model.rs` `Names`)
+
+Status: open, does not block. For lead `link`.
+
+`impl Names { pub fn suffix(&self, name: Name, from: u32) -> Option<Name> }`: `name`'s bytes from
+`from`, when `from` is at most its length and on a character boundary. A reader of a string
+table indexed by offset (a BSD `__.SYMDEF`, ELF's `.strtab` with tail-merged strings) then
+pushes each string once and names every offset inside it as a suffix, so its arena is at most
+the table's size whatever the index says (item 12's bug 5 in its remaining form).
+
+> forwarded to link.
+
+
 ## 13. From link-core-write: a write of shared bytes, and of several ranges at once
 
 Where: `crates/blaze-core/src/lib.rs` (`Effect`), the io_uring, kqueue and threads backends.

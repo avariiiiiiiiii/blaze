@@ -25,7 +25,7 @@ use test_fixture::WithFixture;
 use super::{
     Backends, Body, BuildTime, Databases, Hashes, HirFrontend, HirInstance, Kind,
     allocator::{self, Forward},
-    backend::built,
+    backend::{built, compiled_in},
     build::{self, Build},
     places::{Placer, place_requests},
     refs,
@@ -78,7 +78,11 @@ impl Hashes for ById {
 
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
-    let db: &'static TestDB = Box::leak(Box::new(TestDB::with_single_file(text).0));
+    held(TestDB::with_single_file(text).0)
+}
+
+fn held(db: TestDB) -> (&'static TestDB, HirFrontend<'static>) {
+    let db: &'static TestDB = Box::leak(Box::new(db));
     (db, HirFrontend::new(Databases::new(db), Box::new(ById), BuildTime(Default::default())))
 }
 
@@ -263,7 +267,7 @@ fn the_walk_lists_what_the_ir_asks_for() {
                 super::Built::Assembled(_, requests) => requests,
             };
             let mut placer = Placer::listed(walked.clone());
-            place_requests(db, homes, &ById, &mut placer, requests)
+            place_requests(db, homes, &ById, compiled_in(db, &instance), &mut placer, requests)
                 .unwrap_or_else(|e| panic!("{instance:?} asks for what its walk has not: {e}"));
             for it in walked {
                 if let FrontRef::Function(next) = it
@@ -291,9 +295,107 @@ fn a_reference_left_out_of_the_walk_is_an_error() {
             .expect("the IR");
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(Vec::new());
-        let placed = place_requests(db, homes, &ById, &mut placer, &mut pending.wants.requests);
+        let krate = compiled_in(db, &root);
+        let placed = place_requests(db, homes, &ById, krate, &mut placer, &mut pending.wants.requests);
         assert!(placed.is_err());
     });
+}
+
+const ALWAYS: &str = r#"
+//- /dep.rs crate:dep library
+pub fn helper(x: u32) -> u32 { x }
+#[inline(always)]
+pub fn twice(x: u32) -> u32 { helper(x) }
+#[inline(always)]
+pub fn outer(x: u32) -> u32 { twice(x) }
+//- /main.rs crate:main deps:dep
+pub fn roots(x: u32) -> u32 { dep::outer(x) }
+"#;
+
+/// An `#[inline(always)]` callee of a crate no edit reaches is built in, as LLVM's
+/// always-inliner does at -O0: its place is listed as built in, what its body calls is among
+/// the caller's references, and the caller's code names the code of each body built in at
+/// any depth.
+#[test]
+fn an_always_inline_callee_of_a_dependency_is_built_in() {
+    let (db, frontend) = held(TestDB::with_files(ALWAYS));
+    let root = frontend.root(function(&db, "roots"));
+    let spec = spec();
+    frontend.with(|db, homes| {
+        let walked = refs::walk(db, &root, homes).expect("the walk");
+        let built_in = refs::built_in(db, &root).expect("the walk");
+        let [at] = built_in[..] else { panic!("built in: {built_in:?} of {walked:?}") };
+        let FrontRef::Function(outer) = &walked[at as usize] else { panic!("{walked:?}") };
+        let named = |it: &HirInstance, name: &str| match &it.0 {
+            Kind::Code(instance, _) => match instance.def {
+                InstanceDef::Fn(func) => FunctionSignature::of(db, func).name.as_str() == name,
+                _ => false,
+            },
+            _ => false,
+        };
+        assert!(named(outer, "outer"), "{outer:?}");
+        let calls_helper = |it: &FrontRef<HirInstance, _>| {
+            matches!(it, FrontRef::Function(callee) if named(callee, "helper"))
+        };
+        assert!(walked.iter().any(calls_helper), "{walked:?}");
+        let inlined = super::frontend::inlined(db, &ById, &root).expect("what is built in");
+        assert_eq!(inlined.len(), 2, "outer and twice: {inlined:?}");
+        let mut code = build::with(Build::of(&spec), || built(db, &root, false))
+            .and_then(|it| it)
+            .unwrap_or_else(|e| panic!("{root:?}: {e}"));
+        let super::Built::Ir(pending) = &mut code else { panic!("asm") };
+        let mut placer = Placer::listed(walked);
+        place_requests(db, homes, &ById, compiled_in(db, &root), &mut placer, &mut pending.wants.requests)
+            .expect("the IR asks only for what the walk lists");
+    });
+}
+
+const UNEVALUATED: &str = r#"
+//- minicore: sized
+pub const N: usize = 2 + 2;
+pub trait Has { type Held; }
+impl Has for u8 { type Held = [u8; N]; }
+pub fn takes<T>(x: T) -> T { x }
+pub fn roots() {
+    takes([0u8; N]);
+    takes::<<u8 as Has>::Held>([1u8; 4]);
+}
+"#;
+
+/// An instance's arguments are as codegen sees them, every alias normalized and every
+/// constant evaluated, which is all `Hashes` gives an ID of: `[u8; N]` of a `const N`, and
+/// the projection that names it, are `[u8; 4]`.
+#[test]
+fn an_instances_arguments_are_evaluated() {
+    use rustc_type_ir::TypeVisitableExt;
+    let (db, frontend) = frontend(UNEVALUATED);
+    let (roots, takes) = (function(&db, "roots"), function(&db, "takes"));
+    let root = frontend.root(roots);
+    let called = frontend.with(|db, homes| called(db, homes, &root, takes));
+    assert!(!called.is_empty(), "no instance of `takes`");
+    for it in &called {
+        let Kind::Code(instance, _) = &it.0 else { panic!("{it:?}") };
+        assert!(!instance.args.as_ref().has_aliases(), "{instance:?}");
+    }
+}
+
+/// A unit's MIR level is rustc's: level 2 for an LLVM unit above -O0 and for the library's
+/// crates, else 1; the walk reads level 1, whose bodies ask for all that level 2's do.
+#[test]
+fn a_units_mir_level_is_rustcs() {
+    use hir_ty_mir::mir::MirOptLevel;
+    let (db, _) = frontend(SIBLINGS);
+    let krate = db.test_crate();
+    let level = |spec: &Spec| Build::of(spec).options(db, krate, krate).level;
+    let mut spec = spec();
+    assert_eq!(level(&spec), MirOptLevel::Debug);
+    spec.backend = Backend::Llvm { opt: 0 };
+    assert_eq!(level(&spec), MirOptLevel::Debug);
+    spec.backend = Backend::Llvm { opt: 2 };
+    assert_eq!(level(&spec), MirOptLevel::Release);
+    assert_eq!(Build::WALK.options(db, krate, krate).level, MirOptLevel::Debug);
+    spec.debug_assertions = true;
+    assert!(Build::of(&spec).options(db, krate, krate).ub_checks);
 }
 
 /// An entry of the allocator shim is built against what its walk lists, the function it
@@ -316,7 +418,7 @@ fn an_allocator_entry_calls_what_its_walk_lists() {
             .expect("the IR");
         let super::Built::Ir(pending) = &mut code else { panic!("asm") };
         let mut placer = Placer::listed(walked);
-        place_requests(db, homes, &ById, &mut placer, &mut pending.wants.requests)
+        place_requests(db, homes, &ById, compiled_in(db, &ours), &mut placer, &mut pending.wants.requests)
             .expect("what the walk lists");
     });
     // The fixture links no `alloc`: its program has no shim.

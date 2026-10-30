@@ -129,7 +129,7 @@ const C: u32 = Counter.fetch_add();
 unsafe fn simd_reduce_add_ordered<T, U>(x: T, y: U) -> U;
 const unsafe fn sum(x: u32) -> u32 {
     unsafe { simd_reduce_add_ordered::<u32, u32>(x, 0) }
-           //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: cannot call non-const intrinsic `simd_reduce_add_ordered` in constant functions
+           //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ error: cannot call non-const intrinsic `simd_reduce_add_ordered` in constant functions
 }
 "#,
         );

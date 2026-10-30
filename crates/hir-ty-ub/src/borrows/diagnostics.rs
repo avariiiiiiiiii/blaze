@@ -7,6 +7,8 @@
 
 use std::{fmt, ops::Range};
 
+use blaze_ids::radix;
+
 use super::{
     ProtectorKind,
     perms::{PermTransition, Permission},
@@ -137,11 +139,12 @@ impl History {
     }
 }
 
-/// One line of an aliasing error's history: where (`None` for a note on the line before) and
-/// what, in Miri's words ("the accessed tag <3> was created here, in the initial state
-/// Reserved").
+/// One line of an aliasing error's history: the tag it is about, where (`None` for a note on
+/// the line before) and what, in Miri's words ("the accessed tag <3> was created here, in the
+/// initial state Reserved").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
+    pub tag: BorTag,
     pub site: Option<SiteId>,
     pub note: String,
 }
@@ -155,7 +158,7 @@ fn extend_history(out: &mut Vec<Event>, history: History, tag_name: &str, show_i
     } else {
         format!("{this} was created here")
     };
-    out.push(Event { site: Some(created.0), note });
+    out.push(Event { tag, site: Some(created.0), note });
     for event in &events {
         let access = event.access_cause.print_as_access(event.is_foreign);
         let access_range_text = match event.access_range {
@@ -163,6 +166,7 @@ fn extend_history(out: &mut Vec<Event>, history: History, tag_name: &str, show_i
             None => "on every location previously accessed by this tag".to_owned(),
         };
         out.push(Event {
+            tag,
             site: Some(event.span),
             note: format!(
                 "{this} later transitioned to {} due to a {access} {access_range_text}",
@@ -170,6 +174,7 @@ fn extend_history(out: &mut Vec<Event>, history: History, tag_name: &str, show_i
             ),
         });
         out.push(Event {
+            tag,
             site: None,
             note: format!("this transition corresponds to {}", event.transition.summary()),
         });
@@ -522,7 +527,7 @@ impl DisplayRepr {
         fn extraction_aux(tree: &Tree, idx: UniIndex, show_unnamed: bool, acc: &mut Vec<DisplayRepr>) {
             let name = tree.nodes.debug[idx.index()].name.clone();
             let mut children_sorted = tree.nodes.children(idx).to_vec();
-            children_sorted.sort_by_key(|&idx| tree.nodes.tag(idx));
+            radix::sort_by_key(&mut children_sorted, |&idx| tree.nodes.tag(idx).get());
             if !show_unnamed && name.is_none() {
                 for child_idx in children_sorted {
                     extraction_aux(tree, child_idx, show_unnamed, acc);

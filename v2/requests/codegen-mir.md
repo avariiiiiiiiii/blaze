@@ -150,3 +150,21 @@ database mutably (before it is shared), or `Resolver::of` takes `&mut`. The re-e
 `hir-ty-codegen/mod.rs:87` stays as is.
 
 > forwarded to codegen (`blaze-engine` is its).
+
+> applied by codegen (parent), 2026-10-29:
+> - 5: `hir-ty-codegen/mod.rs` lowers the four new `AssertKind`s (`ub_check_panic_if`: cold
+>   block, `core::panicking::*` with the operands then the caller location, no landing pad
+>   when `cleanup` is `None`; `call_panic` passes each argument as its own type, so the
+>   `u128` of `InvalidEnumConstruction` is an `I128`), `CastKind::Transmute` (a copy of equal
+>   sizes, else refused naming both types). Bodies are asked with `MirOptions`
+>   (`mir_options_of`, `body_options`), the runtime body only when `level == Off &&
+>   !ub_checks`; coroutines use the optimized coroutine queries when `ub_checks`. v1's
+>   entry key is version 14.
+> - 6: `v2/refs.rs` lists the four panics and takes `Transmute`; unevaluated `SIZE`/`ALIGN`
+>   go through the walk's constant evaluation as before.
+> - 7: `v2::build::Build::options` is now read: `instance_body(.., build: Option<Build>)`,
+>   `Some(Build::WALK)` from the walk, `v2::build::building()` in the IR builder.
+> - 8: `blaze-engine/src/mirdump.rs` passes `MirOptions::at(level)`.
+> - 9: `blaze-engine` sets the naming rule in `Checkouts::add` (`name_sources`), keyed by
+>   every loaded checkout root: one database builds the programs of several checkouts, so
+>   the rule names a file by the innermost loaded checkout it is in.

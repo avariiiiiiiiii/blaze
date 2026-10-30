@@ -14,6 +14,7 @@
 //! whole, from the back. If a drop of one part unwinds, the parts after it are dropped on the
 //! way out, as rustc's drop ladders do.
 
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 
@@ -304,7 +305,7 @@ pub(super) fn elaborate_drops<'db>(
     }
     // Every flag starts clear, but those of what the body is given.
     let mut flagged: Vec<PathId> = flags.keys().copied().collect();
-    flagged.sort_unstable();
+    radix::sort(&mut flagged);
     let mut start = set(&flagged, false);
     for param in body.entry_locals() {
         if let Some(path) = data.for_local(param) {

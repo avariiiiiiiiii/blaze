@@ -3,6 +3,7 @@
 use std::cell::Cell;
 
 use base_db::SourceDatabase;
+use blaze_ids::radix;
 use span::Span;
 use syntax::{AstNode, TextRange, ast};
 
@@ -163,7 +164,7 @@ pub(crate) fn real_span_map(
     });
     // The lookup is a binary search, and the nested items were added after the items that
     // hold them.
-    pairs.sort_by_key(|&(offset, _)| offset);
+    radix::sort_copy_by_key(&mut pairs, |&(offset, _)| u32::from(offset));
 
     RealSpanMap::from_file(
         editioned_file_id.span_file_id(db),

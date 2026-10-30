@@ -21,6 +21,7 @@ triomphe.workspace = true
 rustc_abi.workspace = true
 rustc_type_ir.workspace = true
 base-db.workspace = true
+blaze-ids.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true

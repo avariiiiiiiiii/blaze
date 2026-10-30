@@ -1,6 +1,7 @@
 //! rustc's leak check (`rustc_infer::infer::region_constraints::leak_check`), on the constraint
 //! columns, with Tarjan's algorithm for the strongly connected components.
 
+use blaze_ids::radix;
 use rustc_type_ir::error::TypeError;
 use rustc_type_ir::inherent::IntoKind;
 use rustc_type_ir::solve::VisibleForLeakCheck;
@@ -466,7 +467,7 @@ impl Sccs {
                     }
                 }
             }
-            successors[first..].sort_unstable();
+            radix::sort(&mut successors[first..]);
             let mut kept = first;
             for at in first..successors.len() {
                 if at == first || successors[at] != successors[kept - 1] {

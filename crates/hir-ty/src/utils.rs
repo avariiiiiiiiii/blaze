@@ -79,7 +79,7 @@ pub fn is_fn_unsafe_to_call(
     if data.has_target_feature() && target_feature_is_safe == TargetFeatureIsSafeInTarget::No {
         // RFC 2396 <https://rust-lang.github.io/rfcs/2396-target-feature-1.1.html>.
         let callee_target_features = TargetFeatures::from_fn_no_implications(db, func);
-        if !caller_target_features.enabled.is_superset(&callee_target_features.enabled) {
+        if !caller_target_features.is_superset(&callee_target_features) {
             return Unsafety::Unsafe;
         }
     }

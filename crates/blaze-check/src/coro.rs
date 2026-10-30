@@ -84,11 +84,6 @@ impl Coroutine {
             None => Ran::Suspended,
         }
     }
-
-    /// Whether its last job ended (and it may take another).
-    pub(crate) fn idle(&self) -> bool {
-        !self.busy
-    }
 }
 
 impl Drop for Coroutine {

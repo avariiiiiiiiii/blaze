@@ -4,6 +4,7 @@
 
 use std::ops::Range;
 
+use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
 
@@ -16,7 +17,6 @@ use crate::{
     },
     next_solver::{Region, Ty, TyKind},
 };
-use rustc_ast_ir::Mutability;
 
 use super::super::{block_id, block_index, local_index, map_place, successors_mut};
 use super::operand_ty;
@@ -33,7 +33,7 @@ pub(super) struct Site<'a> {
     pub(super) nested: &'a [u32],
 }
 
-/// Temporaries the call needs: each live from the call on, dead where it returns.
+/// The temporaries of the call: each live from the call on and dead where it returns.
 struct Temps {
     span: MirSpan,
     /// Statements before the jump into the callee.
@@ -71,7 +71,7 @@ impl Temps {
     }
 }
 
-/// The spans of the callee, which become [`MirSpan::Inlined`] of the caller.
+/// The spans of the callee as [`MirSpan::Inlined`] spans of the caller.
 struct Spans<'a> {
     /// The scope of this call.
     scope: u32,
@@ -101,8 +101,9 @@ impl Spans<'_> {
     }
 }
 
-/// The call at `site.block` replaced by `callee`, a body of the callee instantiated for the
-/// call. Says which blocks are the callee's now.
+/// The call that ends `site.block` replaced by `callee`, the callee's body instantiated for
+/// the call, whose parameters the caller checked the arguments against. Says which blocks
+/// are the callee's now.
 pub(super) fn inline_call<'db>(
     ctx: &Ctx<'db>,
     body: &mut MirBody<'db>,
@@ -110,14 +111,17 @@ pub(super) fn inline_call<'db>(
     mut callee: MirBody<'db>,
 ) -> Range<usize> {
     let interner = ctx.infcx.interner;
-    let Some(terminator) = body.basic_blocks[site.block].terminator.take() else {
-        return 0..0;
-    };
-    let span = terminator.span;
-    let TerminatorKind::Call { args, destination, target, cleanup, .. } = terminator.kind else {
-        body.basic_blocks[site.block].terminator = Some(terminator);
-        return 0..0;
-    };
+    let (span, args, destination, target, cleanup) =
+        match body.basic_blocks[site.block].terminator.take() {
+            Some(Terminator {
+                span,
+                kind: TerminatorKind::Call { args, destination, target, cleanup, .. },
+            }) => (span, args, destination, target, cleanup),
+            other => {
+                body.basic_blocks[site.block].terminator = other;
+                return 0..0;
+            }
+        };
     let return_block = target.map(|target| {
         let is_cleanup = body.basic_blocks[target].is_cleanup;
         body.basic_blocks.alloc(BasicBlock {
@@ -128,7 +132,7 @@ pub(super) fn inline_call<'db>(
     });
     let mut temps = Temps { span, before: Vec::new(), made: Vec::new() };
 
-    // `a[*i] = f(i)`, where `f` may change `i`: what the place is is taken before the call.
+    // `a[*i] = f(i)`, where `f` may change `i`: which place it is is decided before the call.
     let needs_borrow = destination
         .projection
         .as_slice()
@@ -136,7 +140,8 @@ pub(super) fn inline_call<'db>(
         .any(|it| matches!(it, ProjectionElem::Deref | ProjectionElem::Index(_)));
     let destination_ty = destination.as_ref().ty(body, &ctx.infcx, ctx.env).ty;
     let dest = if needs_borrow {
-        let ty = Ty::new_ref(interner, Region::new_erased(interner), destination_ty, Mutability::Mut);
+        let ty =
+            Ty::new_ref(interner, Region::new_erased(interner), destination_ty, Mutability::Mut);
         let temp = temps.new_temp(body, ty);
         let borrow = Rvalue::Ref(BorrowKind::Mut { kind: MutBorrowKind::Default }, destination);
         temps.assign(Place::from(temp).store(), borrow);
@@ -148,16 +153,11 @@ pub(super) fn inline_call<'db>(
     let destination_local = temps.new_temp(body, destination_ty);
 
     let mut params: Vec<LocalId> = Vec::with_capacity(callee.param_locals.len());
-    let mut args = args.into_vec().into_iter();
-    if site.spread {
-        let first = args.next();
-        let second = args.next();
-        let (receiver, tuple) = match (first, second) {
-            (Some(receiver), Some(tuple)) => (Some(receiver), tuple),
-            (Some(tuple), None) => (None, tuple),
-            (None, _) => (None, Operand { kind: OperandKind::Copy(Place::from(return_slot()).store()), span: None }),
-        };
-        if let Some(receiver) = receiver {
+    let mut args = args.into_vec();
+    if site.spread
+        && let Some(tuple) = args.pop()
+    {
+        for receiver in args {
             params.push(temps.argument(ctx, body, receiver));
         }
         let tuple = temps.argument(ctx, body, tuple);
@@ -175,42 +175,41 @@ pub(super) fn inline_call<'db>(
         }
     }
 
-    // Each local of the callee: `_0` the destination, a parameter its argument, any other a
-    // new local of the caller.
-    let mut always_live = vec![true; callee.locals.len()];
+    // `_0` is the destination, a parameter its argument, any other local a new one of the
+    // caller; a new one the callee never marks live or dead is live for the whole call.
+    let mut marked = vec![false; callee.locals.len()];
     for (_, block) in callee.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::StorageLive(local) | StatementKind::StorageDead(local) =
                 statement.kind
             {
-                always_live[local_index(local)] = false;
+                marked[local_index(local)] = true;
             }
         }
     }
+    let first_new = body.locals.len();
     let mut map: Vec<LocalId> = Vec::with_capacity(callee.locals.len());
-    let mut fresh: Vec<LocalId> = Vec::new();
-    let locals = std::mem::take(&mut callee.locals);
-    for (local, decl) in locals.into_iter().enumerate() {
-        let local = super::super::local_id(local);
+    let mut always_live: Vec<LocalId> = Vec::new();
+    for (local, decl) in std::mem::take(&mut callee.locals) {
         let mapped = if local == return_slot() {
             destination_local
         } else if let Some(at) = callee.param_locals.iter().position(|it| *it == local) {
             params[at]
         } else {
             let new = body.locals.alloc(decl);
-            if always_live[local_index(local)] {
-                fresh.push(new);
+            if !marked[local_index(local)] {
+                always_live.push(new);
             }
             new
         };
         map.push(mapped);
     }
     let lookup = |local: LocalId| map[local_index(local)];
-    for &local in &fresh {
+    for &local in &always_live {
         temps.before.push(Statement { kind: StatementKind::StorageLive(local), span });
     }
 
-    // The scope of this call, the callee's own scopes and spans after it.
+    // The scope of this call, then the callee's own scopes and spans.
     let scope = body.inlined.scopes.len() as u32;
     body.inlined.scopes.push(InlinedScope { callee: site.callee, call_site: span });
     let scope_base = scope + 1;
@@ -238,6 +237,7 @@ pub(super) fn inline_call<'db>(
     let map_block = |block: BasicBlockId| block_id(offset + block_index(block));
     callee.walk_places(|place| map_place(place, &mut |local| lookup(local)));
     for (_, block) in callee.basic_blocks.iter_mut() {
+        let is_cleanup = block.is_cleanup;
         for statement in &mut block.statements {
             statement.span = spans.map(statement.span);
             statement.kind.for_each_operand_mut(&mut |it| spans.operand(it));
@@ -251,31 +251,27 @@ pub(super) fn inline_call<'db>(
         terminator.span = spans.map(terminator.span);
         terminator.kind.for_each_operand_mut(&mut |it| spans.operand(it));
         successors_mut(&mut terminator.kind, |it| *it = map_block(*it));
-        match &mut terminator.kind {
-            TerminatorKind::Return => {
-                terminator.kind = match return_block {
-                    Some(target) => TerminatorKind::Goto { target },
-                    None => TerminatorKind::Unreachable,
-                };
-            }
-            TerminatorKind::UnwindResume => {
-                if let Some(target) = cleanup {
-                    terminator.kind = TerminatorKind::Goto { target };
-                }
-            }
-            // Unwinding out of the callee is unwinding out of the call; in a cleanup block
-            // no unwind edge is one that terminates.
-            kind if !block.is_cleanup => {
-                if let Some(unwind @ None) = kind.unwind_mut() {
-                    *unwind = cleanup;
-                }
-            }
-            _ => {}
+        let replaced = match &terminator.kind {
+            TerminatorKind::Return => Some(match return_block {
+                Some(target) => TerminatorKind::Goto { target },
+                None => TerminatorKind::Unreachable,
+            }),
+            TerminatorKind::UnwindResume => cleanup.map(|target| TerminatorKind::Goto { target }),
+            _ => None,
+        };
+        if let Some(kind) = replaced {
+            terminator.kind = kind;
+        } else if !is_cleanup
+            && let Some(unwind @ None) = terminator.kind.unwind_mut()
+        {
+            // Unwinding out of the callee is unwinding out of the call. In a cleanup block no
+            // unwind edge is one that terminates, and stays one.
+            *unwind = cleanup;
         }
     }
     let callee_start = map_block(callee.start_block);
 
-    let bindings = callee.binding_locals.iter().map(|(binding, &local)| InlinedBinding {
+    let own_bindings = callee.binding_locals.iter().map(|(binding, &local)| InlinedBinding {
         scope,
         binding,
         local: lookup(local),
@@ -285,16 +281,17 @@ pub(super) fn inline_call<'db>(
         binding: it.binding,
         local: lookup(it.local),
     });
-    let bindings: Vec<InlinedBinding> = bindings.chain(nested_bindings).collect();
+    let bindings: Vec<InlinedBinding> = own_bindings.chain(nested_bindings).collect();
     body.inlined.scopes.extend(scopes);
     body.inlined.bindings.extend(bindings);
 
     if let Some(block) = return_block {
         let statements = &mut body.basic_blocks[block].statements;
-        statements.reserve(1 + fresh.len() + temps.made.len());
-        let moved = Operand { kind: OperandKind::Move(Place::from(destination_local).store()), span: None };
+        statements.reserve(1 + always_live.len() + temps.made.len());
+        let moved =
+            Operand { kind: OperandKind::Move(Place::from(destination_local).store()), span: None };
         statements.push(Statement { kind: StatementKind::Assign(dest, Rvalue::Use(moved)), span });
-        for &local in fresh.iter().rev().chain(temps.made.iter().rev()) {
+        for &local in always_live.iter().rev().chain(temps.made.iter().rev()) {
             statements.push(Statement { kind: StatementKind::StorageDead(local), span });
         }
     }
@@ -303,20 +300,20 @@ pub(super) fn inline_call<'db>(
     caller_block.terminator =
         Some(Terminator { span, kind: TerminatorKind::Goto { target: callee_start } });
 
-    let unreached = callee.unreached.iter().map(|&it| map_block(it));
-    body.unreached.extend(unreached);
-    let panic_unwinds =
-        callee.panic_unwinds.iter().map(|&(block, at, to)| (map_block(block), at, map_block(to)));
-    body.panic_unwinds.extend(panic_unwinds);
-    let ends: Vec<LocalId> = callee
+    body.unreached.extend(callee.unreached.iter().map(|&it| map_block(it)));
+    body.panic_unwinds.extend(
+        callee.panic_unwinds.iter().map(|&(block, at, to)| (map_block(block), at, map_block(to))),
+    );
+    // The callee's scopes end before any of the caller's that is open at the call.
+    let ends = callee
         .scope_ends
         .iter()
         .map(|&it| lookup(it))
-        .filter(|it| local_index(*it) >= offset_locals(&map, &params, destination_local))
-        .collect();
+        .filter(|it| local_index(*it) >= first_new)
+        .collect::<Vec<_>>();
     body.scope_ends.splice(0..0, ends);
 
-    for (_, block) in std::mem::take(&mut callee.basic_blocks).into_iter() {
+    for (_, block) in std::mem::take(&mut callee.basic_blocks) {
         body.basic_blocks.alloc(block);
     }
     offset..body.basic_blocks.len()

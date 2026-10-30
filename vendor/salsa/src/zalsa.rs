@@ -466,6 +466,7 @@ impl Zalsa {
             self.ingredients_vec[ingredient.as_u32() as usize]
                 .reset_for_new_revision(self.runtime.table_mut());
         }
+        self.graph.release_outgrown_nodes();
         self.compact_edges_if_worth_it();
 
         new_revision

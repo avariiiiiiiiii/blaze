@@ -3,6 +3,7 @@
 //! for being allowed to mutate what it mutates and, with the loans in scope, for conflicting
 //! with a loan.
 
+use blaze_ids::radix;
 use hir_def::hir::{BindingAnnotation, BindingId, ExprId, Pat, Statement};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
@@ -281,7 +282,7 @@ pub(super) fn check<'db>(
     out.extend(unused_mut);
     let count = regions.creator_positions.values().filter(|&&it| it < regions::IMPL_ANON).count();
     let mut used_mut_upvars = checker.used_mut_upvars;
-    used_mut_upvars.sort_unstable();
+    radix::sort(&mut used_mut_upvars);
     used_mut_upvars.dedup();
     (count, checker.requirements, used_mut_upvars)
 }
@@ -2357,7 +2358,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     }
             })
             .collect();
-        unused.sort_by_key(|&(local, _)| local.into_raw().into_u32());
+        radix::sort_copy_by_key(&mut unused, |&(local, _)| local.into_raw().into_u32());
         let mut seen = FxHashSet::default();
         unused.retain(|&(_, binding)| seen.insert(binding));
         unused
@@ -2829,7 +2830,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         let mut rustc_key =
             move_outs.iter().map(|&it| self.rustc_moves[it]).collect::<Option<Vec<usize>>>();
         if let Some(key) = &mut rustc_key {
-            key.sort_unstable();
+            radix::sort(key);
         }
         let place = match self.upvar_sources.get(&used.local) {
             Some(source) => {
@@ -2913,7 +2914,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 back_edges.extend(self.cfg.predecessor_locations(self.body, location));
             }
         }
-        result.sort_unstable();
+        radix::sort(&mut result);
         result.dedup();
         result
     }

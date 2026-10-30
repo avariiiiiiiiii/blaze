@@ -12,6 +12,7 @@
 
 use std::{path::PathBuf, time::Duration};
 
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -407,7 +408,7 @@ impl Sim {
             .map(|(&tag, _)| tag)
             .collect();
         // By tag, so the seed's numbers go to the same watches whatever the table's order.
-        watching.sort_unstable();
+        radix::sort_copy_by_key(&mut watching, |it| it.0);
         for tag in watching {
             let done = match self.rng.one_in(self.faults.lose_change_one_in) {
                 true => Done::Changed { files: Vec::new(), lost: true },

@@ -23,6 +23,7 @@ rustc_type_ir.workspace = true
 
 # local deps
 base-db.workspace = true
+blaze-ids.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true

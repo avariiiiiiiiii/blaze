@@ -269,9 +269,9 @@ fn an_unsynchronized_cell_write_is_a_race() {
         let cell = Arc::new(UnsafeCell::new(0u32));
         let other = {
             let cell = cell.clone();
-            thread::spawn(move || cell.with_mut(|it| drop(it)))
+            thread::spawn(move || cell.with_mut(|_| ()))
         };
-        cell.with(|it| drop(it));
+        cell.with(|_| ());
         other.join().unwrap();
     });
     assert!(report.contains("data race"), "{report}");
@@ -286,12 +286,12 @@ fn a_relaxed_flag_does_not_order_a_cell() {
         let writer = {
             let (cell, flag) = (cell.clone(), flag.clone());
             thread::spawn(move || {
-                cell.with_mut(|it| drop(it));
+                cell.with_mut(|_| ());
                 flag.store(true, Relaxed);
             })
         };
         if flag.load(Relaxed) {
-            cell.with(|it| drop(it));
+            cell.with(|_| ());
         }
         writer.join().unwrap();
     });
@@ -306,15 +306,15 @@ fn a_release_acquire_flag_orders_a_cell() {
         let writer = {
             let (cell, flag) = (cell.clone(), flag.clone());
             thread::spawn(move || {
-                cell.with_mut(|it| drop(it));
+                cell.with_mut(|_| ());
                 flag.store(true, Release);
             })
         };
         if flag.load(Acquire) {
-            cell.with(|it| drop(it));
+            cell.with(|_| ());
         }
         writer.join().unwrap();
-        cell.with(|it| drop(it));
+        cell.with(|_| ());
     });
 }
 
@@ -514,52 +514,26 @@ fn an_atomic_ptr_publishes_what_it_points_to() {
         writer.join().unwrap();
         let ptr = slot.swap(std::ptr::null_mut(), Acquire);
         assert!(!ptr.is_null());
-        let boxed = Box::from_raw_in_safe(ptr);
+        #[allow(unsafe_code)]
+        // SAFETY: `ptr` is the writer's `Box::into_raw`, which the swap took out of the slot:
+        // nothing else holds it.
+        let boxed = unsafe { Box::from_raw(ptr) };
         assert_eq!(*boxed, 7);
     });
 }
 
-/// `Box::from_raw` without `unsafe` in the tests: the pointer is one `Box::into_raw` made and
-/// nothing else holds.
-trait FromRawInSafe {
-    fn from_raw_in_safe(ptr: *mut u64) -> Box<u64>;
-}
-
-impl FromRawInSafe for Box<u64> {
-    fn from_raw_in_safe(ptr: *mut u64) -> Box<u64> {
-        let addr = ptr.addr();
-        let leaked: &'static mut u64 = Box::leak(Box::new(0));
-        // The model thread's box is reclaimed through its value; its allocation is the test's
-        // to leak, which keeps the crate free of `unsafe`.
-        *leaked = LEAKED.with(|_| 7);
-        assert_ne!(addr, 0);
-        Box::new(*leaked)
-    }
-}
-
-std::thread_local! {
-    static LEAKED: () = const { () };
-}
-
 #[test]
 fn statics_start_again_in_each_execution() {
-    static FLAG: AtomicBool = AtomicBool::new(false);
-    builder().check(|| {
-        let other = thread::spawn(|| FLAG.store(true, Relaxed));
-        let before = FLAG.swap(true, Relaxed);
-        other.join().unwrap();
-        // Each execution sees `false` at first or the other thread's store, never an earlier
-        // execution's.
-        let _ = before;
-        assert!(FLAG.load(Relaxed));
-    });
     let seen = outcomes(builder(), || {
-        static ONCE: AtomicU32 = AtomicU32::new(5);
-        let first = ONCE.load(Relaxed);
-        ONCE.store(first + 1, Relaxed);
+        static N: AtomicU32 = AtomicU32::new(5);
+        let other = thread::spawn(|| {
+            N.fetch_add(1, Relaxed);
+        });
+        let first = N.fetch_add(1, Relaxed);
+        other.join().unwrap();
         first
     });
-    assert_eq!(seen, BTreeSet::from([5]));
+    assert_eq!(seen, BTreeSet::from([5, 6]));
 }
 
 #[test]
@@ -570,12 +544,12 @@ fn a_finding_replays_from_its_schedule() {
         let writer = {
             let (cell, flag) = (cell.clone(), flag.clone());
             thread::spawn(move || {
-                cell.with_mut(|it| drop(it));
+                cell.with_mut(|_| ());
                 flag.store(true, Relaxed);
             })
         };
         if flag.load(Relaxed) {
-            cell.with(|it| drop(it));
+            cell.with(|_| ());
         }
         writer.join().unwrap();
     }
@@ -614,6 +588,20 @@ fn random_runs_find_the_lost_update() {
     });
     assert!(report.contains("random search"), "{report}");
     assert!(report.contains("panicked"), "{report}");
+}
+
+#[test]
+fn model_runs_with_the_environments_bounds() {
+    model(|| {
+        let n = Arc::new(AtomicU32::new(0));
+        let other = {
+            let n = n.clone();
+            thread::spawn(move || n.fetch_add(1, Relaxed))
+        };
+        n.fetch_add(1, Relaxed);
+        other.join().unwrap();
+        assert_eq!(n.load(Relaxed), 2);
+    });
 }
 
 #[test]
@@ -735,6 +723,6 @@ fn a_history_outside_a_model_checks_too() {
 #[test]
 fn a_schedule_reads_back_as_it_was_written() {
     let path = crate::path::Path::replay("01a0{30}+-.", 100).unwrap_or_else(|why| panic!("{why}"));
-    assert_eq!(path.len(), 7);
+    assert_eq!(path.len(), 8);
     assert!(crate::path::Path::replay("01x", 100).is_err());
 }

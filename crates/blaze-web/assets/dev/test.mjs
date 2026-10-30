@@ -114,6 +114,9 @@ test("snapshot: a huge count is refused before allocating", () => {
   assert.throws(() => parseSnapshot(b), /cannot fit/);
 });
 
+// Ids 2 and 3: "std" waiting for 0, said before, and "ab" waiting for 2.
+const NODES = { first: 2, kinds: ["Std", "Names"], names: "stdab", name_at: [0, 3, 5], deps: [0, 2], deps_at: [0, 1, 2] };
+
 test("records: every variant", () => {
   const evs = [
     { Began: { build: 1, command: "build", root: "/w" } },
@@ -125,6 +128,7 @@ test("records: every variant", () => {
     { Unlisted: { count: 4 } }, { Refused: { name: "x", why: "y" } }, { Said: { level: "Warning", text: "t" } },
     { Finished: { ok: true, summary: { took_ns: 5, crates: 1, fns: { total: 1, done: 1, kept: 0 }, rebuilt: [["anim::f", "Body"]], more: 0, error: null, cache: null, slowest: [{ step: "Codegen", of: "anim", took_ns: 5 }] } } },
     { Node: { id: 1, kind: "Codegen", name: "anim", deps: [0] } }, { Moved: { id: 1, state: { Cached: { remote: false } } } },
+    { Nodes: { first: 2, kinds: ["Std", "Names"], names: "stdab", name_at: [0, 3, 5], deps: [0, 2], deps_at: [0, 1, 2] } },
     { Moved: { id: 1, state: "Running" } }, { Moved: { id: 1, state: "Cancelled" } }, { Critical: { path: [0, 1] } }, { Cores: { busy: 790, of: 8 } },
     { Compiling: { functions: [{ krate: "anim", name: "anim::f", ns: 300000000 }] } }, { Slowest: { functions: [] } },
     { Functions: { object: 0, whole: true, functions: [{ id: 0, key: 2n ** 63n, krate: "anim", name: "anim::f", calls: [1], how: { Compiled: { ns: 7 } } }] } },
@@ -143,7 +147,24 @@ for (const [name, r, what] of [
   ["struct without fields", { at_ns: 1, event: { Rebuilt: { name: "a", krate: "b", cause: "Edited" } } }, /without its fields/],
   ["id above u32", { at_ns: 1, event: { Critical: { path: [2 ** 32] } } }, /more than a u32/],
   ["huge at_ns", { at_ns: 2n ** 60n, event: { Unlisted: { count: 1 } } }, /counts exactly/],
+  ...[
+    ["nodes with offsets too few", { name_at: [0, 3] }, /name_at: has 2 offsets for 2 nodes and 5 entries/],
+    ["nodes with offsets going back", { deps_at: [0, 2, 1] }, /deps_at: has 3 offsets for 2 nodes and 2 entries/],
+    ["nodes with offsets going back inside", { deps_at: [0, 3, 2], deps: [0, 2] }, /deps_at: goes back at node 1/],
+    ["nodes cutting a character", { names: "st\u00e9", name_at: [0, 3, 4] }, /name_at: cuts a character at node 0/],
+    ["nodes past a u32", { first: 0xffffffff }, /2 ids from 4294967295, past a u32/],
+    ["nodes waiting for each other", { deps: [3, 2] }, /nodes 2, 3 waiting for each other/],
+    ["a node waiting for itself", { deps: [0, 3] }, /nodes 3 waiting for each other/],
+  ].map(([name, edit, what]) => [name, { at_ns: 1, event: { Nodes: { ...NODES, ...edit } } }, what]),
 ]) test(`records: refuses ${name}`, () => assert.throws(() => parseRecord(r), (e) => e instanceof RecordError && what.test(e.message)));
+
+test("records: nodes said together read as their nodes", () => {
+  const { event } = parseRecord({ at_ns: 1, event: { Nodes: { ...NODES, names: "\u00e9ab", name_at: [0, 2, 4], deps: [3, 0] } } });
+  assert.deepEqual(event.nodes, [
+    { id: 2, kind: "Std", name: "\u00e9", deps: [3] },
+    { id: 3, kind: "Names", name: "ab", deps: [0] },
+  ]);
+});
 
 for (const [name, krate, want] of [
   ["anim::scene::render", "anim", "anim::scene"],

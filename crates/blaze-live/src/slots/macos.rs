@@ -11,6 +11,10 @@
 //! The code region's protection and the table cell's are read once, at start. A patch's code
 //! is one remap per run of pages it writes (runs closer than [`MERGE`] are one, the pages
 //! between copied as they are), its bytes copied straight from the message into the copy.
+//! Data in writable pages is written in place with atomic stores ([`Writes::store`]), since
+//! other threads may read it meanwhile.
+
+#![allow(unsafe_code)]
 
 use std::{
     ffi::{CString, c_char, c_int, c_void},
@@ -27,7 +31,7 @@ pub(super) use super::unix::{backtrace, descriptor};
 use super::{
     Events,
     switch::{Dwarf, Layout, Memory, Writes},
-    unix::{__register_frame, image_base, in_image},
+    unix::{__register_frame, image_base, in_image, load_cell, loaders},
 };
 
 #[repr(C)]
@@ -155,6 +159,32 @@ impl Memory for Os {
     const DWARF: Dwarf = Dwarf::Entries;
     const SEH: bool = false;
 
+    fn cell(&self, cell: u64) -> u64 {
+        load_cell(cell)
+    }
+
+    fn in_image(&self, range: &Range<u64>) -> Result<(), String> {
+        in_image(range, self.base)?;
+        let mut at = range.start;
+        while at < range.end {
+            let (region, protection) = region_at(at)?;
+            if protection & READ == 0 {
+                return Err(format!("{at:#x}, in pages with no access"));
+            }
+            at = region.end;
+        }
+        Ok(())
+    }
+
+    fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String> {
+        self.in_image(range)?;
+        super::unix::bytes(range, self.base)
+    }
+
+    fn loaders(&self, at: u64, slots: u64) -> &[u64] {
+        loaders(at, slots)
+    }
+
     fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
         let mut run: Option<Range<u64>> = None;
         for span in writes.spans {
@@ -195,10 +225,9 @@ impl Memory for Os {
                     return Err(format!("data at {:#x}, in pages with no access", piece.start));
                 }
                 if protection & WRITE != 0 {
-                    // SAFETY: the image's (checked above), mapped and writable; no other thread
-                    // uses the bytes a patch rewrites while `poll` writes them (the rule
-                    // `Live::poll` gives the program).
-                    unsafe { writes.put(&piece, piece.start as *mut u8) };
+                    // SAFETY: the image's (checked above), mapped and writable, and stays
+                    // mapped; other threads may use the bytes meanwhile, which `store` allows.
+                    unsafe { writes.store(&piece, piece.start as *mut u8) };
                     continue;
                 }
                 let pages = pages(&piece);

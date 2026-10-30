@@ -210,7 +210,13 @@ impl V<'_, '_, '_, '_> {
     /// Where rustc's validator is at `node`: the trait, impl or `extern` block whose item it
     /// is, else free. An item of an expansion is where the macro call is.
     fn ctxt(&self, node: &SyntaxNode) -> Ctxt {
-        for at in self.ancestors(node) {
+        self.ctxt_in(self.tree.file, node)
+    }
+
+    /// [`V::ctxt`] of `node` of `file`, a tree this one is expanded from.
+    fn ctxt_in(&self, file: HirFileId, node: &SyntaxNode) -> Ctxt {
+        let ancestors = Ancestors { db: self.cx.db, file, next: node.parent() };
+        for at in ancestors {
             match at.value.kind() {
                 SyntaxKind::ASSOC_ITEM_LIST => {
                     let Some(parent) = at.value.parent() else { return Ctxt::Free };

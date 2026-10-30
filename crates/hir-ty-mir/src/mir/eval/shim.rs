@@ -14,6 +14,8 @@ use stdx::never;
 use crate::{
     InferBodyId,
     drop::{DropGlue, has_drop_glue},
+    intrinsic::{AtomicOp, FloatWidth, Intrinsic, SimdOp, intrinsic_of},
+    mir::MirLowerError,
     mir::eval::{
         Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, Interval,
         IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
@@ -49,22 +51,28 @@ impl<'db> Evaluator<'db> {
             return Ok(false);
         }
 
+        match intrinsic_of(self.db, def) {
+            Ok(Some(intrinsic)) => {
+                return self.exec_intrinsic_call(
+                    def,
+                    intrinsic,
+                    args,
+                    generic_args,
+                    locals,
+                    destination,
+                    span,
+                );
+            }
+            Ok(None) => {}
+            Err(unknown) => {
+                return Err(MirEvalError::MirLowerError(
+                    def,
+                    MirLowerError::UnknownIntrinsic(unknown.0),
+                ));
+            }
+        }
         let function_data = FunctionSignature::of(self.db, def);
         let attrs = AttrFlags::query(self.db, def.into());
-        let is_intrinsic = FunctionSignature::is_intrinsic(self.db, def);
-
-        if is_intrinsic {
-            return self.exec_intrinsic(
-                function_data.name.as_str(),
-                args,
-                generic_args,
-                destination,
-                locals,
-                span,
-                !function_data.has_body()
-                    || attrs.contains(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN),
-            );
-        }
         if let ItemContainerId::ExternBlockId(_) = def.lookup(self.db).container
             && let Some(link_name) = AttrFlags::link_name(self.db, def.into())
             && let Some(name) = link_name.as_str().strip_prefix("llvm.")
@@ -572,178 +580,96 @@ impl<'db> Evaluator<'db> {
         }
     }
 
+    /// A call of the intrinsic `intrinsic`, the function `def`: `Ok(false)` when the evaluator
+    /// does not implement it and its fallback body is to run, an error when it has none or
+    /// must be overridden.
+    pub(super) fn exec_intrinsic_call(
+        &mut self,
+        def: FunctionId,
+        intrinsic: Intrinsic,
+        args: &[IntervalAndTy<'db>],
+        generic_args: GenericArgs<'db>,
+        locals: &Locals<'db>,
+        destination: Interval,
+        span: MirSpan,
+    ) -> Result<'db, bool> {
+        if self.exec_intrinsic(intrinsic, args, generic_args, destination, locals, span)? {
+            return Ok(true);
+        }
+        let needs_override = !FunctionSignature::of(self.db, def).has_body()
+            || AttrFlags::query(self.db, def.into())
+                .contains(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN);
+        if needs_override {
+            not_supported!("intrinsic {intrinsic} is not implemented");
+        }
+        Ok(false)
+    }
+
+    /// Runs `intrinsic`, or says the evaluator does not implement it (`Ok(false)`).
     fn exec_intrinsic(
         &mut self,
-        name: &str,
+        intrinsic: Intrinsic,
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
         destination: Interval,
         locals: &Locals<'db>,
         span: MirSpan,
-        needs_override: bool,
     ) -> Result<'db, bool> {
-        if let Some(name) = name.strip_prefix("atomic_") {
-            return self
-                .exec_atomic_intrinsic(name, args, generic_args, destination, locals, span)
-                .map(|()| true);
-        }
-        if let Some(name) = name.strip_prefix("simd_") {
-            return self
-                .exec_simd_intrinsic(name, args, generic_args, destination, locals, span)
-                .map(|()| true);
-        }
-        if self.exec_reflection_intrinsic(name, args, destination, locals)? {
-            return Ok(true);
-        }
-        // FIXME(#17451): Add `f16` and `f128` intrinsics.
-        if let Some(name) = name.strip_suffix("f64") {
-            let result = match name {
-                "sqrt" | "sin" | "cos" | "exp" | "exp2" | "log" | "log10" | "log2" | "fabs"
-                | "floor" | "ceil" | "trunc" | "rint" | "nearbyint" | "round" | "roundeven" => {
-                    let [arg] = args else {
-                        return Err(MirEvalError::InternalError(
-                            "f64 intrinsic signature doesn't match fn (f64) -> f64".into(),
-                        ));
-                    };
-                    let arg = from_bytes!(f64, arg.get(self)?);
-                    match name {
-                        "sqrt" => arg.sqrt(),
-                        "sin" => arg.sin(),
-                        "cos" => arg.cos(),
-                        "exp" => arg.exp(),
-                        "exp2" => arg.exp2(),
-                        "log" => arg.ln(),
-                        "log10" => arg.log10(),
-                        "log2" => arg.log2(),
-                        "fabs" => arg.abs(),
-                        "floor" => arg.floor(),
-                        "ceil" => arg.ceil(),
-                        "trunc" => arg.trunc(),
-                        // FIXME: these rounds should be different, but only `.round()` is stable now.
-                        "rint" => arg.round(),
-                        "nearbyint" => arg.round(),
-                        "round" => arg.round(),
-                        "roundeven" => arg.round(),
-                        _ => unreachable!(),
-                    }
-                }
-                "pow" | "minnum" | "maxnum" | "copysign" => {
-                    let [arg1, arg2] = args else {
-                        return Err(MirEvalError::InternalError(
-                            "f64 intrinsic signature doesn't match fn (f64, f64) -> f64".into(),
-                        ));
-                    };
-                    let arg1 = from_bytes!(f64, arg1.get(self)?);
-                    let arg2 = from_bytes!(f64, arg2.get(self)?);
-                    match name {
-                        "pow" => arg1.powf(arg2),
-                        "minnum" => arg1.min(arg2),
-                        "maxnum" => arg1.max(arg2),
-                        "copysign" => arg1.copysign(arg2),
-                        _ => unreachable!(),
-                    }
-                }
-                "powi" => {
-                    let [arg1, arg2] = args else {
-                        return Err(MirEvalError::InternalError(
-                            "powif64 signature doesn't match fn (f64, i32) -> f64".into(),
-                        ));
-                    };
-                    let arg1 = from_bytes!(f64, arg1.get(self)?);
-                    let arg2 = from_bytes!(i32, arg2.get(self)?);
-                    arg1.powi(arg2)
-                }
-                "fma" => {
-                    let [arg1, arg2, arg3] = args else {
-                        return Err(MirEvalError::InternalError(
-                            "fmaf64 signature doesn't match fn (f64, f64, f64) -> f64".into(),
-                        ));
-                    };
-                    let arg1 = from_bytes!(f64, arg1.get(self)?);
-                    let arg2 = from_bytes!(f64, arg2.get(self)?);
-                    let arg3 = from_bytes!(f64, arg3.get(self)?);
-                    arg1.mul_add(arg2, arg3)
-                }
-                _ if needs_override => not_supported!("unknown f64 intrinsic {name}"),
-                _ => return Ok(false),
-            };
-            return destination.write_from_bytes(self, &result.to_le_bytes()).map(|()| true);
-        }
-        if let Some(name) = name.strip_suffix("f32") {
-            let result = match name {
-                "sqrt" | "sin" | "cos" | "exp" | "exp2" | "log" | "log10" | "log2" | "fabs"
-                | "floor" | "ceil" | "trunc" | "rint" | "nearbyint" | "round" | "roundeven" => {
-                    let [arg] = args else {
-                        return Err(MirEvalError::InternalError(
-                            "f32 intrinsic signature doesn't match fn (f32) -> f32".into(),
-                        ));
-                    };
-                    let arg = from_bytes!(f32, arg.get(self)?);
-                    match name {
-                        "sqrt" => arg.sqrt(),
-                        "sin" => arg.sin(),
-                        "cos" => arg.cos(),
-                        "exp" => arg.exp(),
-                        "exp2" => arg.exp2(),
-                        "log" => arg.ln(),
-                        "log10" => arg.log10(),
-                        "log2" => arg.log2(),
-                        "fabs" => arg.abs(),
-                        "floor" => arg.floor(),
-                        "ceil" => arg.ceil(),
-                        "trunc" => arg.trunc(),
-                        // FIXME: these rounds should be different, but only `.round()` is stable now.
-                        "rint" => arg.round(),
-                        "nearbyint" => arg.round(),
-                        "round" => arg.round(),
-                        "roundeven" => arg.round(),
-                        _ => unreachable!(),
-                    }
-                }
-                "pow" | "minnum" | "maxnum" | "copysign" => {
-                    let [arg1, arg2] = args else {
-                        return Err(MirEvalError::InternalError(
-                            "f32 intrinsic signature doesn't match fn (f32, f32) -> f32".into(),
-                        ));
-                    };
-                    let arg1 = from_bytes!(f32, arg1.get(self)?);
-                    let arg2 = from_bytes!(f32, arg2.get(self)?);
-                    match name {
-                        "pow" => arg1.powf(arg2),
-                        "minnum" => arg1.min(arg2),
-                        "maxnum" => arg1.max(arg2),
-                        "copysign" => arg1.copysign(arg2),
-                        _ => unreachable!(),
-                    }
-                }
-                "powi" => {
-                    let [arg1, arg2] = args else {
-                        return Err(MirEvalError::InternalError(
-                            "powif32 signature doesn't match fn (f32, i32) -> f32".into(),
-                        ));
-                    };
-                    let arg1 = from_bytes!(f32, arg1.get(self)?);
-                    let arg2 = from_bytes!(i32, arg2.get(self)?);
-                    arg1.powi(arg2)
-                }
-                "fma" => {
-                    let [arg1, arg2, arg3] = args else {
-                        return Err(MirEvalError::InternalError(
-                            "fmaf32 signature doesn't match fn (f32, f32, f32) -> f32".into(),
-                        ));
-                    };
-                    let arg1 = from_bytes!(f32, arg1.get(self)?);
-                    let arg2 = from_bytes!(f32, arg2.get(self)?);
-                    let arg3 = from_bytes!(f32, arg3.get(self)?);
-                    arg1.mul_add(arg2, arg3)
-                }
-                _ if needs_override => not_supported!("unknown f32 intrinsic {name}"),
-                _ => return Ok(false),
-            };
-            return destination.write_from_bytes(self, &result.to_le_bytes()).map(|()| true);
-        }
-        match name {
-            "size_of" => {
+        match intrinsic {
+            Intrinsic::Atomic(op) => {
+                return self
+                    .exec_atomic_intrinsic(op, args, generic_args, destination, locals, span)
+                    .map(|()| true);
+            }
+            Intrinsic::Simd(op) => {
+                return self
+                    .exec_simd_intrinsic(op, args, generic_args, destination, locals, span)
+                    .map(|()| true);
+            }
+            Intrinsic::TypeIdTypeOf
+            | Intrinsic::TypeIdVtable
+            | Intrinsic::TypeIdIsSigned
+            | Intrinsic::TypeIdArrayLen
+            | Intrinsic::TypeIdElementTy
+            | Intrinsic::TypeIdPointsTo
+            | Intrinsic::TypeIdPointsMutably
+            | Intrinsic::TypeIdSizeOf
+            | Intrinsic::TypeIdVariants
+            | Intrinsic::TypeIdVariantName
+            | Intrinsic::TypeIdVariantNonExhaustive
+            | Intrinsic::TypeIdNonExhaustive
+            | Intrinsic::TypeIdFields
+            | Intrinsic::TypeIdFieldRepresentingType
+            | Intrinsic::FieldRepresentingTypeActualTypeId
+            | Intrinsic::FieldRepresentingTypeName
+            | Intrinsic::FieldRepresentingTypeOffset
+            | Intrinsic::TypeIdGenerics
+            | Intrinsic::TypeIdFunctionPtr => {
+                return self.exec_reflection_intrinsic(intrinsic, args, destination, locals);
+            }
+            Intrinsic::Sqrt
+            | Intrinsic::Sin
+            | Intrinsic::Cos
+            | Intrinsic::Exp
+            | Intrinsic::Exp2
+            | Intrinsic::Log
+            | Intrinsic::Log10
+            | Intrinsic::Log2
+            | Intrinsic::Floor
+            | Intrinsic::Ceil
+            | Intrinsic::Trunc
+            | Intrinsic::Round
+            | Intrinsic::RoundTiesEven
+            | Intrinsic::Powf
+            | Intrinsic::Powi
+            | Intrinsic::Fma => {
+                let width = float_width(intrinsic, args)?;
+                self.exec_float_intrinsic(intrinsic, width, args, destination)
+            }
+            Intrinsic::CopySign(width @ (FloatWidth::F32 | FloatWidth::F64)) => {
+                self.exec_float_intrinsic(intrinsic, width, args, destination)
+            }
+            Intrinsic::SizeOf => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "size_of generic arg is not provided".into(),
@@ -752,7 +678,7 @@ impl<'db> Evaluator<'db> {
                 let size = self.size_of_sized(ty, locals, "size_of arg")?;
                 destination.write_from_bytes(self, &size.to_le_bytes()[0..destination.size])
             }
-            "align_of" => {
+            Intrinsic::AlignOf => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "align_of generic arg is not provided".into(),
@@ -761,7 +687,7 @@ impl<'db> Evaluator<'db> {
                 let align = self.layout(ty)?.align.bytes();
                 destination.write_from_bytes(self, &align.to_le_bytes()[0..destination.size])
             }
-            "size_of_val" => {
+            Intrinsic::SizeOfVal => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "size_of_val generic arg is not provided".into(),
@@ -780,7 +706,7 @@ impl<'db> Evaluator<'db> {
                     destination.write_from_bytes(self, &super::word_bytes(size))
                 }
             }
-            "align_of_val" => {
+            Intrinsic::AlignOfVal => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "align_of_val generic arg is not provided".into(),
@@ -799,7 +725,7 @@ impl<'db> Evaluator<'db> {
                     destination.write_from_bytes(self, &super::word_bytes(align))
                 }
             }
-            "type_id" => {
+            Intrinsic::TypeId => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "type_id generic arg is not provided".into(),
@@ -809,7 +735,7 @@ impl<'db> Evaluator<'db> {
                 let id = self.type_id(TypeIdOf::Ty(ty));
                 destination.write_from_bytes(self, &id)
             }
-            "type_name" => {
+            Intrinsic::TypeName => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "type_name generic arg is not provided".into(),
@@ -825,7 +751,7 @@ impl<'db> Evaluator<'db> {
                     .slice(self.ptr_size()..2 * self.ptr_size())
                     .write_from_bytes(self, &super::word_bytes(len))
             }
-            "needs_drop" => {
+            Intrinsic::NeedsDrop => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "size_of generic arg is not provided".into(),
@@ -841,7 +767,7 @@ impl<'db> Evaluator<'db> {
                 };
                 destination.write_from_bytes(self, &[u8::from(result)])
             }
-            "ptr_guaranteed_cmp" => {
+            Intrinsic::PtrGuaranteedCmp => {
                 // FIXME: this is wrong for const eval, it should return 2 in some
                 // cases.
                 let [lhs, rhs] = args else {
@@ -852,37 +778,30 @@ impl<'db> Evaluator<'db> {
                 let ans = lhs.get(self)? == rhs.get(self)?;
                 destination.write_from_bytes(self, &[u8::from(ans)])
             }
-            "saturating_add" | "saturating_sub" => {
+            Intrinsic::SaturatingAdd | Intrinsic::SaturatingSub => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "saturating_add args are not provided".into(),
                     ));
                 };
+                let add = intrinsic == Intrinsic::SaturatingAdd;
                 let signed = matches!(lhs.ty.kind(), TyKind::Int(_));
                 let bits = destination.size as u32 * 8;
                 let ans = if signed {
                     let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::Yes));
                     let rhs = i128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::Yes));
-                    let ans = match name {
-                        "saturating_add" => lhs.saturating_add(rhs),
-                        "saturating_sub" => lhs.saturating_sub(rhs),
-                        _ => unreachable!(),
-                    };
+                    let ans = if add { lhs.saturating_add(rhs) } else { lhs.saturating_sub(rhs) };
                     let max = i128::MAX >> (128 - bits);
                     ans.clamp(-max - 1, max) as u128
                 } else {
                     let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
                     let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                    let ans = match name {
-                        "saturating_add" => lhs.saturating_add(rhs),
-                        "saturating_sub" => lhs.saturating_sub(rhs),
-                        _ => unreachable!(),
-                    };
+                    let ans = if add { lhs.saturating_add(rhs) } else { lhs.saturating_sub(rhs) };
                     ans.min(u128::MAX >> (128 - bits))
                 };
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "wrapping_add" => {
+            Intrinsic::WrappingAdd => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "wrapping_add args are not provided".into(),
@@ -893,7 +812,7 @@ impl<'db> Evaluator<'db> {
                 let ans = lhs.wrapping_add(rhs);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "ptr_offset_from_unsigned" | "ptr_offset_from" => {
+            Intrinsic::PtrOffsetFromUnsigned | Intrinsic::PtrOffsetFrom => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "wrapping_sub args are not provided".into(),
@@ -911,7 +830,7 @@ impl<'db> Evaluator<'db> {
                 let ans = ans / size;
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "wrapping_sub" => {
+            Intrinsic::WrappingSub => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "wrapping_sub args are not provided".into(),
@@ -922,7 +841,7 @@ impl<'db> Evaluator<'db> {
                 let ans = lhs.wrapping_sub(rhs);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "wrapping_mul" => {
+            Intrinsic::WrappingMul => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "wrapping_mul args are not provided".into(),
@@ -933,47 +852,25 @@ impl<'db> Evaluator<'db> {
                 let ans = lhs.wrapping_mul(rhs);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "wrapping_shl" => {
-                // FIXME: signed
+            Intrinsic::UncheckedAdd
+            | Intrinsic::UncheckedSub
+            | Intrinsic::UncheckedMul
+            | Intrinsic::UncheckedShl
+            | Intrinsic::UncheckedShr
+            | Intrinsic::UncheckedDiv
+            | Intrinsic::UncheckedRem
+            | Intrinsic::ExactDiv => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
-                        "unchecked_shl args are not provided".into(),
+                        format!("{intrinsic} args are not provided").into(),
                     ));
                 };
-                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                let ans = lhs.wrapping_shl(rhs as u32);
+                let ans = self.unchecked_int(intrinsic, lhs, rhs)?;
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "wrapping_shr" => {
-                // FIXME: signed
-                let [lhs, rhs] = args else {
-                    return Err(MirEvalError::InternalError(
-                        "unchecked_shr args are not provided".into(),
-                    ));
-                };
-                let signed = matches!(lhs.ty.kind(), TyKind::Int(_));
-                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, IsSigned::No));
-                let ans = if signed {
-                    let lhs = i128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::Yes));
-                    lhs.wrapping_shr(rhs as u32) as u128
-                } else {
-                    let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, IsSigned::No));
-                    lhs.wrapping_shr(rhs as u32)
-                };
-                destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
-            }
-            "unchecked_add" | "unchecked_sub" | "unchecked_mul" | "unchecked_shl"
-            | "unchecked_shr" | "unchecked_div" | "unchecked_rem" | "exact_div" => {
-                let [lhs, rhs] = args else {
-                    return Err(MirEvalError::InternalError(
-                        format!("{name} args are not provided").into(),
-                    ));
-                };
-                let ans = self.unchecked_int(name, lhs, rhs)?;
-                destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
-            }
-            "add_with_overflow" | "sub_with_overflow" | "mul_with_overflow" => {
+            Intrinsic::AddWithOverflow
+            | Intrinsic::SubWithOverflow
+            | Intrinsic::MulWithOverflow => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "const_eval_select args are not provided".into(),
@@ -990,11 +887,10 @@ impl<'db> Evaluator<'db> {
                 let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, extend()));
                 let (ans, is_overflow) = if signed {
                     let (lhs, rhs) = (lhs as i128, rhs as i128);
-                    let (ans, overflow) = match name {
-                        "add_with_overflow" => lhs.overflowing_add(rhs),
-                        "sub_with_overflow" => lhs.overflowing_sub(rhs),
-                        "mul_with_overflow" => lhs.overflowing_mul(rhs),
-                        _ => unreachable!(),
+                    let (ans, overflow) = match intrinsic {
+                        Intrinsic::AddWithOverflow => lhs.overflowing_add(rhs),
+                        Intrinsic::SubWithOverflow => lhs.overflowing_sub(rhs),
+                        _ => lhs.overflowing_mul(rhs),
                     };
                     // The result fits when sign-extending its low bytes gives it back.
                     let fits = op_size == 16 || {
@@ -1003,11 +899,10 @@ impl<'db> Evaluator<'db> {
                     };
                     (ans as u128, overflow || !fits)
                 } else {
-                    let (ans, overflow) = match name {
-                        "add_with_overflow" => lhs.overflowing_add(rhs),
-                        "sub_with_overflow" => lhs.overflowing_sub(rhs),
-                        "mul_with_overflow" => lhs.overflowing_mul(rhs),
-                        _ => unreachable!(),
+                    let (ans, overflow) = match intrinsic {
+                        Intrinsic::AddWithOverflow => lhs.overflowing_add(rhs),
+                        Intrinsic::SubWithOverflow => lhs.overflowing_sub(rhs),
+                        _ => lhs.overflowing_mul(rhs),
                     };
                     (ans, overflow || ans.to_le_bytes()[op_size..].iter().any(|&it| it != 0))
                 };
@@ -1023,7 +918,7 @@ impl<'db> Evaluator<'db> {
                 )?;
                 destination.write_from_bytes(self, &result)
             }
-            "copy" | "copy_nonoverlapping" => {
+            Intrinsic::Copy | Intrinsic::CopyNonoverlapping => {
                 let [src, dst, offset] = args else {
                     return Err(MirEvalError::InternalError(
                         "copy_nonoverlapping args are not provided".into(),
@@ -1043,7 +938,7 @@ impl<'db> Evaluator<'db> {
                 let dst = Interval { addr: dst, size };
                 dst.write_from_interval(self, src)
             }
-            "slice_get_unchecked" => {
+            Intrinsic::SliceGetUnchecked => {
                 let [slice_ptr, index] = args else {
                     return Err(MirEvalError::InternalError(
                         "slice_get_unchecked args are not provided".into(),
@@ -1080,11 +975,11 @@ impl<'db> Evaluator<'db> {
                 let addr = Address::from_usize(addr);
                 destination.write_from_bytes(self, &addr.to_bytes()[..destination.size])
             }
-            "offset" | "arith_offset" => {
+            Intrinsic::Offset | Intrinsic::ArithOffset => {
                 let [ptr, offset] = args else {
                     return Err(MirEvalError::InternalError("offset args are not provided".into()));
                 };
-                let ty = if name == "offset" {
+                let ty = if intrinsic == Intrinsic::Offset {
                     let Some(ty0) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                         return Err(MirEvalError::InternalError(
                             "offset generic arg is not provided".into(),
@@ -1126,18 +1021,17 @@ impl<'db> Evaluator<'db> {
                 let ans = ptr + offset * size;
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "assert_inhabited"
-            | "assert_zero_valid"
-            | "assert_uninit_valid"
-            | "assert_mem_uninitialized_valid" => {
+            Intrinsic::AssertInhabited
+            | Intrinsic::AssertZeroValid
+            | Intrinsic::AssertMemUninitializedValid => {
                 // FIXME: We should actually implement these checks
                 Ok(())
             }
-            "forget" => {
+            Intrinsic::Forget => {
                 // FIXME
                 Ok(())
             }
-            "transmute" | "transmute_unchecked" => {
+            Intrinsic::Transmute | Intrinsic::TransmuteUnchecked => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError(
                         "transmute arg is not provided".into(),
@@ -1145,7 +1039,7 @@ impl<'db> Evaluator<'db> {
                 };
                 destination.write_from_interval(self, arg.interval)
             }
-            "black_box" => {
+            Intrinsic::BlackBox => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError(
                         "black_box arg is not provided".into(),
@@ -1153,7 +1047,7 @@ impl<'db> Evaluator<'db> {
                 };
                 destination.write_from_interval(self, arg.interval)
             }
-            "ctpop" => {
+            Intrinsic::Ctpop => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("ctpop arg is not provided".into()));
                 };
@@ -1161,7 +1055,7 @@ impl<'db> Evaluator<'db> {
                 destination
                     .write_from_bytes(self, &(result as u128).to_le_bytes()[0..destination.size])
             }
-            "bswap" => {
+            Intrinsic::Bswap => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("bswap arg is not provided".into()));
                 };
@@ -1169,7 +1063,7 @@ impl<'db> Evaluator<'db> {
                 result.reverse();
                 destination.write_from_bytes(self, &result)
             }
-            "bitreverse" => {
+            Intrinsic::Bitreverse => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError(
                         "bitreverse arg is not provided".into(),
@@ -1182,7 +1076,7 @@ impl<'db> Evaluator<'db> {
                 }
                 destination.write_from_bytes(self, &result)
             }
-            "ctlz" | "ctlz_nonzero" => {
+            Intrinsic::Ctlz | Intrinsic::CtlzNonzero => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("ctlz arg is not provided".into()));
                 };
@@ -1192,7 +1086,7 @@ impl<'db> Evaluator<'db> {
                 destination
                     .write_from_bytes(self, &(result as u128).to_le_bytes()[0..destination.size])
             }
-            "cttz" | "cttz_nonzero" => {
+            Intrinsic::Cttz | Intrinsic::CttzNonzero => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("cttz arg is not provided".into()));
                 };
@@ -1202,7 +1096,7 @@ impl<'db> Evaluator<'db> {
                 destination
                     .write_from_bytes(self, &(result as u128).to_le_bytes()[0..destination.size])
             }
-            "rotate_left" => {
+            Intrinsic::RotateLeft => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "rotate_left args are not provided".into(),
@@ -1234,7 +1128,7 @@ impl<'db> Evaluator<'db> {
                     s => not_supported!("destination with size {s} for rotate_left"),
                 }
             }
-            "rotate_right" => {
+            Intrinsic::RotateRight => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "rotate_right args are not provided".into(),
@@ -1266,7 +1160,7 @@ impl<'db> Evaluator<'db> {
                     s => not_supported!("destination with size {s} for rotate_right"),
                 }
             }
-            "variant_count" => {
+            Intrinsic::VariantCount => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
                         "variant_count generic arg is not provided".into(),
@@ -1284,7 +1178,7 @@ impl<'db> Evaluator<'db> {
                 };
                 destination.write_from_bytes(self, &count.to_le_bytes()[0..destination.size])
             }
-            "discriminant_value" => {
+            Intrinsic::DiscriminantValue => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError(
                         "discriminant_value arg is not provided".into(),
@@ -1301,7 +1195,7 @@ impl<'db> Evaluator<'db> {
                 let r = self.compute_discriminant(ty, interval.get(self)?)?;
                 destination.write_from_bytes(self, &r.to_le_bytes()[0..destination.size])
             }
-            "const_eval_select" => {
+            Intrinsic::ConstEvalSelect => {
                 let [tuple, const_fn, _] = args else {
                     return Err(MirEvalError::InternalError(
                         "const_eval_select args are not provided".into(),
@@ -1334,7 +1228,7 @@ impl<'db> Evaluator<'db> {
                 }
                 not_supported!("FnOnce was not available for executing const_eval_select");
             }
-            "read_via_copy" | "volatile_load" => {
+            Intrinsic::ReadViaCopy | Intrinsic::VolatileLoad => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError(
                         "read_via_copy args are not provided".into(),
@@ -1343,7 +1237,7 @@ impl<'db> Evaluator<'db> {
                 let addr = Address::from_bytes(arg.interval.get(self)?)?;
                 destination.write_from_interval(self, Interval { addr, size: destination.size })
             }
-            "write_via_move" => {
+            Intrinsic::WriteViaMove => {
                 let [ptr, val] = args else {
                     return Err(MirEvalError::InternalError(
                         "write_via_move args are not provided".into(),
@@ -1359,7 +1253,7 @@ impl<'db> Evaluator<'db> {
                 Interval { addr: dst, size }.write_from_interval(self, val.interval)?;
                 Ok(())
             }
-            "write_bytes" => {
+            Intrinsic::WriteBytes => {
                 let [dst, val, count] = args else {
                     return Err(MirEvalError::InternalError(
                         "write_bytes args are not provided".into(),
@@ -1378,7 +1272,7 @@ impl<'db> Evaluator<'db> {
                 self.write_memory_using_ref(dst, size)?.fill(val);
                 Ok(())
             }
-            "ptr_metadata" => {
+            Intrinsic::PtrMetadata => {
                 let [ptr] = args else {
                     return Err(MirEvalError::InternalError(
                         "ptr_metadata args are not provided".into(),
@@ -1389,7 +1283,7 @@ impl<'db> Evaluator<'db> {
                 destination.write_from_bytes(self, metadata)?;
                 Ok(())
             }
-            "three_way_compare" => {
+            Intrinsic::ThreeWayCompare => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
                         "three_way_compare args are not provided".into(),
@@ -1434,7 +1328,7 @@ impl<'db> Evaluator<'db> {
                     Err(MirEvalError::InternalError("Ordering enum not found".into()))
                 }
             }
-            "aggregate_raw_ptr" => {
+            Intrinsic::AggregateRawPtr => {
                 let [data, meta] = args else {
                     return Err(MirEvalError::InternalError(
                         "aggregate_raw_ptr args are not provided".into(),
@@ -1448,7 +1342,7 @@ impl<'db> Evaluator<'db> {
                 .write_from_interval(self, meta.interval)?;
                 Ok(())
             }
-            "fabs" => {
+            Intrinsic::Fabs => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError(
                         "fabs intrinsic signature doesn't match fn (T) -> T".into(),
@@ -1460,12 +1354,12 @@ impl<'db> Evaluator<'db> {
                 }
                 destination.write_from_bytes(self, &bytes)
             }
-            "unreachable" => {
+            Intrinsic::Unreachable => {
                 return Err(MirEvalError::UndefinedBehavior(
                     "`unreachable` intrinsic executed".to_owned(),
                 ));
             }
-            "compare_bytes" => {
+            Intrinsic::CompareBytes => {
                 // `<[u8]>::cmp` and `memcmp` in `core`: rustc's evaluation gives the order as
                 // -1, 0 or 1, where at run time only the sign is promised.
                 let [left, right, bytes] = args else {
@@ -1479,7 +1373,7 @@ impl<'db> Evaluator<'db> {
                 let order = self.read_memory(left, bytes)?.cmp(self.read_memory(right, bytes)?);
                 destination.write_from_bytes(self, &(order as i32).to_le_bytes())
             }
-            "const_allocate" => {
+            Intrinsic::ConstAllocate => {
                 let [size, align] = args else {
                     return Err(MirEvalError::InternalError(
                         "const_allocate args are not provided".into(),
@@ -1491,7 +1385,7 @@ impl<'db> Evaluator<'db> {
                 let result = self.allocate(size, align, origin)?;
                 destination.write_from_bytes(self, &result.to_bytes())
             }
-            "const_deallocate" => {
+            Intrinsic::ConstDeallocate => {
                 let [ptr, ..] = args else {
                     return Err(MirEvalError::InternalError(
                         "const_deallocate args are not provided".into(),
@@ -1501,7 +1395,7 @@ impl<'db> Evaluator<'db> {
                 let origin = Origin::ConstHeap { global: false };
                 self.deallocate(ptr, origin, "const_deallocate")
             }
-            "const_make_global" => {
+            Intrinsic::ConstMakeGlobal => {
                 let [ptr] = args else {
                     return Err(MirEvalError::InternalError(
                         "const_make_global args are not provided".into(),
@@ -1510,24 +1404,112 @@ impl<'db> Evaluator<'db> {
                 self.make_global(Address::from_bytes(ptr.get(self)?)?)?;
                 destination.write_from_interval(self, ptr.interval)
             }
-            "caller_location" => {
+            Intrinsic::CallerLocation => {
                 let site = self.caller_site(locals, span)?;
                 let location = self.location_of(site, locals)?;
                 destination.write_from_bytes(self, &location.to_bytes())
             }
-            "box_new" => {
-                let ty = generic_args.type_at(0);
-                let Some((size, align)) = self.size_align_of(ty, locals)? else {
-                    not_supported!("unsized box initialization");
+            Intrinsic::WriteBoxViaMove => {
+                let [boxed, value] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "write_box_via_move args are not provided".into(),
+                    ));
                 };
-                let addr = self.allocate(size, align, Origin::Allocator)?;
-                self.copy_from_interval(addr, args[0].interval)?;
-                destination.write_from_bytes(self, &addr.to_bytes()[..self.ptr_size()])
+                let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
+                    return Err(MirEvalError::InternalError(
+                        "write_box_via_move generic arg is not provided".into(),
+                    ));
+                };
+                let size = self.size_of_sized(ty, locals, "write_box_via_move value type")?;
+                let Some(ptr) = boxed.get(self)?.get(..self.ptr_size()) else {
+                    return Err(MirEvalError::InternalError(
+                        "write_box_via_move box is smaller than a pointer".into(),
+                    ));
+                };
+                let addr = Address::from_bytes(ptr)?;
+                Interval { addr, size }.write_from_interval(self, value.interval)?;
+                destination.write_from_interval(self, boxed.interval)
             }
-            _ if needs_override => not_supported!("intrinsic {name} is not implemented"),
             _ => return Ok(false),
         }
         .map(|()| true)
+    }
+
+    /// A float intrinsic generic over its float type, in the width of `width`.
+    fn exec_float_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        width: FloatWidth,
+        args: &[IntervalAndTy<'db>],
+        destination: Interval,
+    ) -> Result<'db, ()> {
+        match width {
+            FloatWidth::F32 => {
+                let result = self.float_intrinsic::<f32>(intrinsic, args)?;
+                destination.write_from_bytes(self, &result.to_le_bytes())
+            }
+            FloatWidth::F64 => {
+                let result = self.float_intrinsic::<f64>(intrinsic, args)?;
+                destination.write_from_bytes(self, &result.to_le_bytes())
+            }
+            // FIXME(#17451): Add `f16` and `f128` intrinsics.
+            FloatWidth::F16 | FloatWidth::F128 => {
+                not_supported!("intrinsic {intrinsic} of `f{}`", width.bits())
+            }
+        }
+    }
+
+    /// The result of the float intrinsic `intrinsic` of `args`, computed in `F` as `std`
+    /// rounds it.
+    fn float_intrinsic<F: EvalFloat>(
+        &self,
+        intrinsic: Intrinsic,
+        args: &[IntervalAndTy<'db>],
+    ) -> Result<'db, F> {
+        let float = |arg: &IntervalAndTy<'db>| -> Result<'db, F> {
+            F::from_le(arg.get(self)?).ok_or_else(|| {
+                MirEvalError::InternalError("mismatched size in constructing a float".into())
+            })
+        };
+        Ok(match intrinsic {
+            Intrinsic::Powf | Intrinsic::CopySign(_) => {
+                let [arg1, arg2] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "float intrinsic signature doesn't match fn (T, T) -> T".into(),
+                    ));
+                };
+                let (arg1, arg2) = (float(arg1)?, float(arg2)?);
+                if intrinsic == Intrinsic::Powf { arg1.powf(arg2) } else { arg1.copysign(arg2) }
+            }
+            Intrinsic::Powi => {
+                let [arg1, arg2] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "powi signature doesn't match fn (T, i32) -> T".into(),
+                    ));
+                };
+                float(arg1)?.powi(from_bytes!(i32, arg2.get(self)?))
+            }
+            Intrinsic::Fma => {
+                let [arg1, arg2, arg3] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "fma signature doesn't match fn (T, T, T) -> T".into(),
+                    ));
+                };
+                float(arg1)?.mul_add(float(arg2)?, float(arg3)?)
+            }
+            _ => {
+                let [arg] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "float intrinsic signature doesn't match fn (T) -> T".into(),
+                    ));
+                };
+                float(arg)?.unary(intrinsic).ok_or_else(|| {
+                    MirEvalError::InternalError(
+                        format!("{intrinsic} is not a float intrinsic of one argument").into(),
+                    )
+                })?
+            }
+        })
     }
 
     fn size_align_of_unsized(
@@ -1593,7 +1575,7 @@ impl<'db> Evaluator<'db> {
     /// reports where it is not.
     fn unchecked_int(
         &self,
-        name: &str,
+        intrinsic: Intrinsic,
         lhs: &IntervalAndTy<'db>,
         rhs: &IntervalAndTy<'db>,
     ) -> Result<'db, u128> {
@@ -1606,38 +1588,40 @@ impl<'db> Evaluator<'db> {
         let uint = |arg: &IntervalAndTy<'db>| -> Result<'db, u128> {
             Ok(u128::from_le_bytes(pad16(arg.get(self)?, IsSigned::No)))
         };
-        if let "unchecked_shl" | "unchecked_shr" = name {
+        if let Intrinsic::UncheckedShl | Intrinsic::UncheckedShr = intrinsic {
             let amount =
                 if signed(rhs) { int(rhs)? } else { uint(rhs)?.min(i128::MAX as u128) as i128 };
             if amount < 0 || amount >= i128::from(bits) {
-                return ub(format!("overflowing shift by {amount} in `{name}`"));
+                return ub(format!("overflowing shift by {amount} in `{intrinsic}`"));
             }
-            return Ok(match (name, signed(lhs)) {
-                ("unchecked_shl", _) => uint(lhs)? << amount,
+            return Ok(match (intrinsic, signed(lhs)) {
+                (Intrinsic::UncheckedShl, _) => uint(lhs)? << amount,
                 (_, true) => (int(lhs)? >> amount) as u128,
                 _ => uint(lhs)? >> amount,
             });
         }
-        let overflow = || format!("arithmetic overflow in `{name}`");
-        let by_zero = || match name {
-            "unchecked_rem" => "calculating the remainder with a divisor of zero".to_owned(),
+        let overflow = || format!("arithmetic overflow in `{intrinsic}`");
+        let by_zero = || match intrinsic {
+            Intrinsic::UncheckedRem => {
+                "calculating the remainder with a divisor of zero".to_owned()
+            }
             _ => "dividing by zero".to_owned(),
         };
         if signed(lhs) {
             let (a, b) = (int(lhs)?, int(rhs)?);
             let (min, max) = (i128::MIN >> (128 - bits), i128::MAX >> (128 - bits));
-            let ans = match name {
-                "unchecked_add" => a.checked_add(b),
-                "unchecked_sub" => a.checked_sub(b),
-                "unchecked_mul" => a.checked_mul(b),
+            let ans = match intrinsic {
+                Intrinsic::UncheckedAdd => a.checked_add(b),
+                Intrinsic::UncheckedSub => a.checked_sub(b),
+                Intrinsic::UncheckedMul => a.checked_mul(b),
                 _ if b == 0 => return ub(by_zero()),
                 _ if a == min && b == -1 => return ub(overflow()),
-                "exact_div" if a % b != 0 => {
+                Intrinsic::ExactDiv if a % b != 0 => {
                     return ub(format!(
                         "exact_div: {a} cannot be divided by {b} without remainder"
                     ));
                 }
-                "unchecked_rem" => Some(a % b),
+                Intrinsic::UncheckedRem => Some(a % b),
                 _ => Some(a / b),
             };
             match ans {
@@ -1647,17 +1631,17 @@ impl<'db> Evaluator<'db> {
         } else {
             let (a, b) = (uint(lhs)?, uint(rhs)?);
             let max = u128::MAX >> (128 - bits);
-            let ans = match name {
-                "unchecked_add" => a.checked_add(b),
-                "unchecked_sub" => a.checked_sub(b),
-                "unchecked_mul" => a.checked_mul(b),
+            let ans = match intrinsic {
+                Intrinsic::UncheckedAdd => a.checked_add(b),
+                Intrinsic::UncheckedSub => a.checked_sub(b),
+                Intrinsic::UncheckedMul => a.checked_mul(b),
                 _ if b == 0 => return ub(by_zero()),
-                "exact_div" if a % b != 0 => {
+                Intrinsic::ExactDiv if a % b != 0 => {
                     return ub(format!(
                         "exact_div: {a} cannot be divided by {b} without remainder"
                     ));
                 }
-                "unchecked_rem" => Some(a % b),
+                Intrinsic::UncheckedRem => Some(a % b),
                 _ => Some(a / b),
             };
             match ans {
@@ -1669,7 +1653,7 @@ impl<'db> Evaluator<'db> {
 
     fn exec_atomic_intrinsic(
         &mut self,
-        name: &str,
+        op: AtomicOp,
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
         destination: Interval,
@@ -1677,11 +1661,9 @@ impl<'db> Evaluator<'db> {
         _span: MirSpan,
     ) -> Result<'db, ()> {
         // We are a single threaded runtime with no UB checking and no optimization, so
-        // we can implement atomic intrinsics as normal functions. The pinned nightly takes the
-        // orderings as const generics (`atomic_load::<T, ORD, VOLATILE>`); older names carried
-        // them as suffixes (`atomic_load_seqcst`).
-        let op = name.split('_').next().unwrap_or(name);
-        if matches!(op, "fence" | "singlethreadfence") {
+        // we can implement atomic intrinsics as normal functions. The orderings are const
+        // generics (`atomic_load::<T, ORD, VOLATILE>`), which change nothing here.
+        if let AtomicOp::Fence | AtomicOp::SingleThreadFence = op {
             return Ok(());
         }
 
@@ -1698,7 +1680,7 @@ impl<'db> Evaluator<'db> {
         let arg0_addr = Address::from_bytes(arg0.get(self)?)?;
         let arg0_interval =
             Interval::new(arg0_addr, self.size_of_sized(ty, locals, "atomic intrinsic type arg")?);
-        if op == "load" {
+        if op == AtomicOp::Load {
             return destination.write_from_interval(self, arg0_interval);
         }
         let Some(arg1) = args.get(1) else {
@@ -1706,72 +1688,81 @@ impl<'db> Evaluator<'db> {
                 "atomic intrinsic arg1 is not provided".into(),
             ));
         };
-        if op == "store" {
-            return arg0_interval.write_from_interval(self, arg1.interval);
-        }
-        if op == "xchg" {
-            destination.write_from_interval(self, arg0_interval)?;
-            return arg0_interval.write_from_interval(self, arg1.interval);
-        }
         let size = arg0_interval.size;
         let signed = matches!(ty.kind(), TyKind::Int(_));
         let read = |this: &Self, interval: Interval, sign: bool| -> Result<'db, u128> {
             let bytes = interval.get(this)?;
             Ok(u128::from_le_bytes(pad16(&bytes[..size.min(bytes.len())], sign.into())))
         };
-        let combined = match op {
-            "xadd" | "xsub" | "and" | "nand" | "or" | "xor" | "umax" | "umin" => {
+        let ans = match op {
+            AtomicOp::Store => return arg0_interval.write_from_interval(self, arg1.interval),
+            AtomicOp::Xchg => {
+                destination.write_from_interval(self, arg0_interval)?;
+                return arg0_interval.write_from_interval(self, arg1.interval);
+            }
+            AtomicOp::Xadd
+            | AtomicOp::Xsub
+            | AtomicOp::And
+            | AtomicOp::Nand
+            | AtomicOp::Or
+            | AtomicOp::Xor
+            | AtomicOp::Umax
+            | AtomicOp::Umin => {
                 let lhs = read(self, arg0_interval, false)?;
                 let rhs = read(self, arg1.interval, false)?;
-                Some(match op {
-                    "xadd" => lhs.wrapping_add(rhs),
-                    "xsub" => lhs.wrapping_sub(rhs),
-                    "and" => lhs & rhs,
-                    "nand" => !(lhs & rhs),
-                    "or" => lhs | rhs,
-                    "xor" => lhs ^ rhs,
-                    "umax" => lhs.max(rhs),
+                match op {
+                    AtomicOp::Xadd => lhs.wrapping_add(rhs),
+                    AtomicOp::Xsub => lhs.wrapping_sub(rhs),
+                    AtomicOp::And => lhs & rhs,
+                    AtomicOp::Nand => !(lhs & rhs),
+                    AtomicOp::Or => lhs | rhs,
+                    AtomicOp::Xor => lhs ^ rhs,
+                    AtomicOp::Umax => lhs.max(rhs),
                     _ => lhs.min(rhs),
-                })
+                }
             }
-            "max" | "min" => {
+            AtomicOp::Max | AtomicOp::Min => {
                 let lhs = read(self, arg0_interval, signed)? as i128;
                 let rhs = read(self, arg1.interval, signed)? as i128;
-                Some((if op == "max" { lhs.max(rhs) } else { lhs.min(rhs) }) as u128)
+                (if op == AtomicOp::Max { lhs.max(rhs) } else { lhs.min(rhs) }) as u128
             }
-            _ => None,
-        };
-        if let Some(ans) = combined {
-            destination.write_from_interval(self, arg0_interval)?;
-            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..size]);
-        }
-        let Some(arg2) = args.get(2) else {
-            return Err(MirEvalError::InternalError(
-                "atomic intrinsic arg2 is not provided".into(),
-            ));
-        };
-        if matches!(op, "cxchg" | "cxchgweak") {
-            let dest = if arg1.get(self)? == arg0_interval.get(self)? {
-                arg0_interval.write_from_interval(self, arg2.interval)?;
-                (arg1.interval, true)
-            } else {
-                (arg0_interval, false)
-            };
-            let result_ty = Ty::new_tup_from_iter(
-                self.interner(),
-                [ty, Ty::new_bool(self.interner())].into_iter(),
-            );
-            let layout = self.layout(result_ty)?;
-            let result = self.construct_with_layout(
-                layout.size.bytes_usize(),
-                &layout,
-                None,
-                [IntervalOrOwned::Borrowed(dest.0), IntervalOrOwned::Owned(vec![u8::from(dest.1)])]
+            AtomicOp::Cxchg | AtomicOp::CxchgWeak => {
+                let Some(arg2) = args.get(2) else {
+                    return Err(MirEvalError::InternalError(
+                        "atomic intrinsic arg2 is not provided".into(),
+                    ));
+                };
+                let dest = if arg1.get(self)? == arg0_interval.get(self)? {
+                    arg0_interval.write_from_interval(self, arg2.interval)?;
+                    (arg1.interval, true)
+                } else {
+                    (arg0_interval, false)
+                };
+                let result_ty = Ty::new_tup_from_iter(
+                    self.interner(),
+                    [ty, Ty::new_bool(self.interner())].into_iter(),
+                );
+                let layout = self.layout(result_ty)?;
+                let result = self.construct_with_layout(
+                    layout.size.bytes_usize(),
+                    &layout,
+                    None,
+                    [
+                        IntervalOrOwned::Borrowed(dest.0),
+                        IntervalOrOwned::Owned(vec![u8::from(dest.1)]),
+                    ]
                     .into_iter(),
-            )?;
-            return destination.write_from_bytes(self, &result);
-        }
-        not_supported!("unknown atomic intrinsic {name}");
+                )?;
+                return destination.write_from_bytes(self, &result);
+            }
+            AtomicOp::Load | AtomicOp::Fence | AtomicOp::SingleThreadFence => {
+                return Err(MirEvalError::InternalError(
+                    "an atomic load or fence taken for a read-modify-write".into(),
+                ));
+            }
+        };
+        destination.write_from_interval(self, arg0_interval)?;
+        arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..size])
     }
 
     /// The bytes of the `TypeId` of `of`, made when it is the first one asked for.
@@ -1917,6 +1908,76 @@ impl<'db> Evaluator<'db> {
         destination.write_from_bytes(self, &bytes)
     }
 }
+
+/// The width of the float a float intrinsic generic over its type is of: its first argument's.
+fn float_width<'db>(intrinsic: Intrinsic, args: &[IntervalAndTy<'db>]) -> Result<'db, FloatWidth> {
+    use rustc_type_ir::FloatTy;
+    Ok(match args.first().map(|it| it.ty.kind()) {
+        Some(TyKind::Float(FloatTy::F16)) => FloatWidth::F16,
+        Some(TyKind::Float(FloatTy::F32)) => FloatWidth::F32,
+        Some(TyKind::Float(FloatTy::F64)) => FloatWidth::F64,
+        Some(TyKind::Float(FloatTy::F128)) => FloatWidth::F128,
+        _ => {
+            return Err(MirEvalError::InternalError(
+                format!("{intrinsic} of an argument that is not a float").into(),
+            ));
+        }
+    })
+}
+
+/// A float the evaluator computes float intrinsics in, each in its own width.
+trait EvalFloat: Copy {
+    fn from_le(bytes: &[u8]) -> Option<Self>;
+    fn powf(self, other: Self) -> Self;
+    fn powi(self, exponent: i32) -> Self;
+    fn copysign(self, sign: Self) -> Self;
+    fn mul_add(self, a: Self, b: Self) -> Self;
+    /// The float intrinsic of one argument `intrinsic` of `self`, if it is one.
+    fn unary(self, intrinsic: Intrinsic) -> Option<Self>;
+}
+
+macro_rules! eval_float {
+    ($ty:ident) => {
+        impl EvalFloat for $ty {
+            fn from_le(bytes: &[u8]) -> Option<Self> {
+                bytes.try_into().ok().map($ty::from_le_bytes)
+            }
+            fn powf(self, other: Self) -> Self {
+                $ty::powf(self, other)
+            }
+            fn powi(self, exponent: i32) -> Self {
+                $ty::powi(self, exponent)
+            }
+            fn copysign(self, sign: Self) -> Self {
+                $ty::copysign(self, sign)
+            }
+            fn mul_add(self, a: Self, b: Self) -> Self {
+                $ty::mul_add(self, a, b)
+            }
+            fn unary(self, intrinsic: Intrinsic) -> Option<Self> {
+                Some(match intrinsic {
+                    Intrinsic::Sqrt => self.sqrt(),
+                    Intrinsic::Sin => self.sin(),
+                    Intrinsic::Cos => self.cos(),
+                    Intrinsic::Exp => self.exp(),
+                    Intrinsic::Exp2 => self.exp2(),
+                    Intrinsic::Log => self.ln(),
+                    Intrinsic::Log10 => self.log10(),
+                    Intrinsic::Log2 => self.log2(),
+                    Intrinsic::Floor => self.floor(),
+                    Intrinsic::Ceil => self.ceil(),
+                    Intrinsic::Trunc => self.trunc(),
+                    Intrinsic::Round => self.round(),
+                    Intrinsic::RoundTiesEven => self.round_ties_even(),
+                    _ => return None,
+                })
+            }
+        }
+    };
+}
+
+eval_float!(f32);
+eval_float!(f64);
 
 /// Numbers the variables of every binder in what it folds in their order, with no names.
 struct Anonymized<'db>(crate::next_solver::DbInterner<'db>);

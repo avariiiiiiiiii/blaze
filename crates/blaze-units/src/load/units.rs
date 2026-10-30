@@ -227,18 +227,29 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
+    // A standard library's packages are hashed against the library's root, so their hashes do
+    // not depend on where it is named.
+    let sysroot = spec.foreign.as_ref().and_then(|ask| Path::new(&ask.manifest).parent());
+    let base_profile = profiles.base_profile();
     let input = super::plan::PlanInput {
         units: &graph.units,
         std_plans: &std_plans,
         packages: &packages_by_spec,
+        manifests: &resolved.manifests,
+        roots: &graph.roots,
         config,
+        intent: spec.intent,
+        build_std: spec.build_std.is_some(),
         ws_root: ws.root(),
         ws_manifest: ws.root_manifest(),
+        sysroot,
         target_dir: &out_dir,
         build_dir: &out_build,
         host: &host.triple,
         target: target.as_ref().map(|it| it.triple.as_str()),
         requested_profile: &requested,
+        profile_dir: &dir_name,
+        base_profile: &base_profile,
         jobs,
     };
     let planned = match super::plan::plan(&input) {

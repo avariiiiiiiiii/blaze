@@ -120,7 +120,7 @@ where
         memo.value.as_ref()?;
         if !memo
             .header
-            .deep_verify_unclaimed(zalsa, db.into(), self.database_key_index(id), 0)
+            .deep_verify_unclaimed(zalsa, db.into(), self.database_key_index(id))
         {
             return None;
         }

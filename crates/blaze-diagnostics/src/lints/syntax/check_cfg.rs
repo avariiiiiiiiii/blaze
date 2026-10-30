@@ -39,8 +39,6 @@ pub struct CheckCfg {
     exhaustive_names: bool,
     /// The names given, in the order first given, with their values.
     expecteds: Vec<(String, Values)>,
-    /// The `--cfg`s given, each once, in the order first given.
-    cfgs: Vec<(String, Option<String>)>,
     /// rustc is run by cargo (`CARGO_CRATE_NAME` is set), as it is under blaze: the lint's help
     /// says what to write in `Cargo.toml` and `build.rs` rather than on the command line.
     pub cargo: bool,
@@ -68,16 +66,6 @@ impl CheckCfg {
     /// which names are keywords).
     pub fn add_in(&mut self, spec: &str, edition: Edition) -> Result<(), String> {
         self.add_diag(spec, edition).map_err(|it| rendered(&it))
-    }
-
-    /// One `--cfg` value, as rustc parses it for a crate of `edition`; the error is rustc's,
-    /// as it writes it. `explicit_builtin_cfgs_in_flags` lints those that set a cfg rustc sets.
-    pub fn add_cfg(&mut self, spec: &str, edition: Edition) -> Result<(), String> {
-        let cfg = parse_cfg(spec, edition)?;
-        if !self.cfgs.contains(&cfg) {
-            self.cfgs.push(cfg);
-        }
-        Ok(())
     }
 
     /// Whether any `--check-cfg` was given.
@@ -252,13 +240,8 @@ fn rendered(diag: &Diag) -> String {
     crate::emit::rendered(diag, &mut Sources::of(std::iter::empty()), Style::default())
 }
 
-/// One `--cfg` value as rustc parses it for a crate of `edition`: its name, and its value
-/// when it has one; the error is rustc's, as it writes it.
-pub fn parse_cfg(spec: &str, edition: Edition) -> Result<(String, Option<String>), String> {
-    parse_cfg_diag(spec, edition).map_err(|it| rendered(&it))
-}
-
-/// [`parse_cfg`], its error rustc's fatal error.
+/// One `--cfg` value as rustc's `parse_cfg` reads it for a crate of `edition`: its name, and
+/// its value when it has one; the error is rustc's fatal error.
 pub(crate) fn parse_cfg_diag(spec: &str, edition: Edition) -> Result<(String, Option<String>), Diag> {
     let error = |reason: &str| Diag::new(Level::Error, None, format!("invalid `--cfg` argument: `{spec}` ({reason})"));
     if let Some(tokens) = meta::lex(spec, edition) {
@@ -299,24 +282,37 @@ pub(crate) fn parse_cfg_diag(spec: &str, edition: Edition) -> Result<(String, Op
 
 /// What this module lints: `explicit_builtin_cfgs_in_flags` of each `--cfg`, as the session is
 /// made, then `unexpected_cfgs` as expansion reads each cfg, when a `--check-cfg` was given.
+/// A `--cfg` rustc cannot parse is its fatal error, and nothing else is said.
 pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> Vec<Emitted> {
-    let mut emitted = builtin_cfgs(cx, &cmd.check_cfg, walk);
+    let mut emitted = match builtin_cfgs(cx, &cmd.cfg, walk) {
+        Ok(emitted) => emitted,
+        Err(fatal) => return vec![fatal],
+    };
     if cmd.check_cfg.is_given() {
         emitted.extend(unexpected::lints(cx, &cmd.check_cfg, walk));
     }
     emitted
 }
 
-/// rustc's `disallow_cfgs`: a `--cfg` setting a cfg rustc sets itself, buffered for the crate.
-fn builtin_cfgs(cx: &Cx<'_, '_>, check: &CheckCfg, walk: &Walk<'_>) -> Vec<Emitted> {
+/// rustc's `parse_cfg` of each `--cfg` (an `IndexSet`: each once, in the order first given),
+/// then its `disallow_cfgs`: a `--cfg` setting a cfg rustc sets itself, buffered for the crate.
+fn builtin_cfgs(cx: &Cx<'_, '_>, specs: &[String], walk: &Walk<'_>) -> Result<Vec<Emitted>, Emitted> {
     let mut emitted = Vec::new();
-    if check.cfgs.is_empty() {
-        return emitted;
+    let mut cfgs: Vec<(String, Option<String>)> = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let cfg = parse_cfg_diag(spec, cx.edition)
+            .map_err(|diag| Emitted::unplaced(diag, Phase::Resolve, Pass::Buffered))?;
+        if !cfgs.contains(&cfg) {
+            cfgs.push(cfg);
+        }
+    }
+    if cfgs.is_empty() {
+        return Ok(emitted);
     }
     let root = cx.krate.root_module(cx.db).definition_source_file_id(cx.db);
-    let Some(tree) = walk.tree(root) else { return emitted };
+    let Some(tree) = walk.tree(root) else { return Ok(emitted) };
     let at = tree.ptr(&tree.root);
-    for (name, value) in &check.cfgs {
+    for (name, value) in &cfgs {
         let Some(controlled_by) = controlled_by(name, value.as_deref()) else { continue };
         let shown = match &value {
             Some(value) => format!(r#"{name}="{value}""#),
@@ -331,7 +327,7 @@ fn builtin_cfgs(cx: &Cx<'_, '_>, check: &CheckCfg, walk: &Walk<'_>) -> Vec<Emitt
         diag.note("manually setting a built-in cfg can and does create incoherent behaviors");
         emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at));
     }
-    emitted
+    Ok(emitted)
 }
 
 /// The flag that sets the builtin cfg `name` (with `value`), if rustc refuses it on the

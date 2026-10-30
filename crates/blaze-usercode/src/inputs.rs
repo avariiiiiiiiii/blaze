@@ -238,14 +238,19 @@ impl Inputs for Now<'_> {
             Err(error) if missing(&error) => return Ok(None),
             Err(error) => return Err(unreadable(error)),
         };
-        let mut names = Vec::new();
+        let mut names = Vec::with_capacity(entries.size_hint().0);
         for entry in entries {
             let entry = entry.map_err(unreadable)?;
-            // A link is what it leads to, as the program that opens it sees.
-            let dir = std::fs::metadata(entry.path()).is_ok_and(|it| it.is_dir());
+            // The listing says what each entry is, without a `stat`; a link is what it leads
+            // to, as the program that opens it sees, which only a `stat` of it says.
+            let kind = entry.file_type().map_err(unreadable)?;
+            let dir = match kind.is_symlink() {
+                true => std::fs::metadata(entry.path()).is_ok_and(|it| it.is_dir()),
+                false => kind.is_dir(),
+            };
             names.push((entry.file_name(), dir));
         }
-        names.sort();
+        names.sort_unstable();
         Ok(Some(names))
     }
 
@@ -253,8 +258,8 @@ impl Inputs for Now<'_> {
         self.env.get(name).map(OsStr::to_owned)
     }
 
-    fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-        self.env.vars().to_vec()
+    fn env_all(&mut self) -> &[(OsString, OsString)] {
+        self.env.vars()
     }
 }
 
@@ -277,8 +282,8 @@ impl Inputs for Disk {
         self.now().env(name)
     }
 
-    fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-        self.now().env_all()
+    fn env_all(&mut self) -> &[(OsString, OsString)] {
+        self.env.vars()
     }
 }
 
@@ -328,9 +333,20 @@ pub struct ViewInputs<'a, 'db> {
 }
 
 impl ViewInputs<'_, '_> {
-    /// `path` as the view names it, when it is in the view.
-    fn in_view(&self, path: &Path) -> Option<String> {
+    /// `path` as the view names it, when it is in the view: borrowed from `path` when its
+    /// rest is already the view's name for it, `/`-separated with nothing to drop.
+    fn in_view<'p>(&self, path: &'p Path) -> Option<std::borrow::Cow<'p, str>> {
         let rest = path.strip_prefix(self.root).ok()?;
+        let named = |text: &str| {
+            text.is_empty()
+                || (std::path::MAIN_SEPARATOR == '/'
+                    && text.split('/').all(|part| !matches!(part, "" | "." | "..")))
+        };
+        if let Some(text) = rest.to_str()
+            && named(text)
+        {
+            return Some(std::borrow::Cow::Borrowed(text));
+        }
         let mut name = String::new();
         for part in rest.components() {
             let std::path::Component::Normal(part) = part else { return None };
@@ -339,7 +355,7 @@ impl ViewInputs<'_, '_> {
             }
             name.push_str(part.to_str()?);
         }
-        Some(name)
+        Some(std::borrow::Cow::Owned(name))
     }
 }
 
@@ -375,8 +391,8 @@ impl Inputs for ViewInputs<'_, '_> {
         self.now.env(name)
     }
 
-    fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-        self.now.env_all()
+    fn env_all(&mut self) -> &[(OsString, OsString)] {
+        self.now.env.vars()
     }
 }
 

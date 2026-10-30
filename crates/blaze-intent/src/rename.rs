@@ -10,6 +10,7 @@
 
 use base_db::FileId;
 use blaze_api::{ApiError, How, Target};
+use blaze_ids::radix;
 use blaze_vfs::Op;
 use either::Either;
 use hir::{
@@ -137,7 +138,7 @@ pub(crate) fn rename(cx: &mut Edits<'_>, target: &Target, to: &str) -> Result<()
         cx.touches.push(Touch { file: home, at, how: How::Scope });
     }
 
-    hits.sort_unstable_by(|a, b| (b.file, b.range.start()).cmp(&(a.file, a.range.start())));
+    radix::sort_by_key(&mut hits, |it| !radix::pack_32(it.file, it.range.start().into()));
     for hit in hits {
         let file = &mut cx.working[hit.file as usize];
         let now = file.to_now(hit.range).ok_or_else(|| {

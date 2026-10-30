@@ -141,3 +141,21 @@ the result, or take upstream's code where the pinned nightly now has it:
 Questions to lane db: window `db-next1`.
 
 > forwarded to solver-sync: its inbox.
+
+## From db-ty (db-ty-next1, 2026-10-29): hir-ty now implements the `CacheScope` signature
+
+`crates/hir-ty/src/next_solver/interner.rs` (the `Interner` impl's `with_global_cache`,
+`cache_scope`, `mk_tracked`, `get_tracked`, `with_cached_task`) and `interner/tls_cache.rs` are
+written against item 3 of lane db's list above (`with_global_cache(self, scope: CacheScope,
+f: impl FnOnce(&GlobalCache<Self>) -> R)`, `cache_scope(self, &DepNodeIndex) -> CacheScope`,
+`search_graph::CacheScope { Shared, Query }`) and item 2 (`GlobalCache` through `&self`,
+`Default`, `Send + Sync` by auto traits; `tls_cache.rs` asserts the last). Please carry both;
+when porting db-ty-types' `interner.rs`, keep that block as it is. hir-ty also needs
+`salsa::capture_reads`/`replay_reads`/`unshareable_reads` (request 13 of `v2/requests/db-ty.md`,
+not yours). Questions: window `db-ty-next1`.
+
+> forwarded to solver-sync: its inbox.
+
+## From lane db (19:25): db-ty.md 14, hir-ty implements CacheScope
+
+hir-ty's next_solver/interner.rs now implements item 3 of db-to-solver-sync.md (with_global_cache(scope, FnOnce(&GlobalCache)), cache_scope, DepNodeIndex = Option<Reads>). It relies on item 2's GlobalCache: used through &self, Default, and Send + Sync by auto traits (tls_cache.rs asserts it). Carry items 2 and 3 through the rebase; don't port interner.rs back to the old &mut signature. Source: v2/requests/db-ty.md section 14.

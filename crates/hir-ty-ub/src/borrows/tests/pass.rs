@@ -1405,12 +1405,7 @@ fn slice_get_mut_no_implicit_write_index_mut() -> R {
 }
 
 // Miri: tests/pass/tree_borrows/spurious_read.rs, retagx_retagy_spuriousx_retx_rety_writey:
-// the threads' steps in the order of `spurious_read.stderr`, but for one swap. `Borrows` keeps
-// one stack of frames for all threads, so calls must return in the reverse order they were
-// made, and here thread x's `as_mut` returns first: so thread y's call (and its retag) comes
-// first. That is the interleaving "retag y, retag x, spurious read x, ret x, ret y, write y",
-// as UB-free as Miri's: the spurious read conflicts the protected `y` either way, and `y` is
-// written only after its protector ends.
+// the threads' steps in the order of `spurious_read.stderr` (thread x is 1, thread y is 2).
 #[test]
 fn spurious_read_retagx_retagy_spuriousx_retx_rety_writey() -> R {
     let mut s = Sim::new();
@@ -1418,21 +1413,25 @@ fn spurious_read_retagx_retagy_spuriousx_retx_rety_writey() -> R {
     // let ptr = SendPtr(std::ptr::addr_of_mut!(data));
     let data = s.alloc(1);
     let ptr = data;
-    // thread y: let y = as_mut(unsafe { &mut *ptr.0 }, b.clone());  ("retag y")
-    let arg = s.mutable(ptr, 1)?;
-    let arg = s.mutable(arg, 1)?;
-    s.call();
-    let y = s.arg_mut(arg, 1)?;
     // thread x: let _x = as_mut(unsafe { &mut *ptr.0 }, b.clone());  ("retag x")
+    s.thread(1);
     let arg = s.mutable(ptr, 1)?;
     let arg = s.mutable(arg, 1)?;
     s.call();
     let x = s.arg_mut(arg, 1)?;
+    // thread y: let y = as_mut(unsafe { &mut *ptr.0 }, b.clone());  ("retag y")
+    s.thread(2);
+    let arg = s.mutable(ptr, 1)?;
+    let arg = s.mutable(arg, 1)?;
+    s.call();
+    let y = s.arg_mut(arg, 1)?;
     // thread x: let _v = *x;  ("spurious read x")
+    s.thread(1);
     s.read(x, 1)?;
     // thread x: let x = x as *mut u8; x  ("ret x")
     s.ret()?;
     // thread y: let y = y as *mut u8; y  ("ret y")
+    s.thread(2);
     s.ret()?;
     // thread y: unsafe { *y = 2; }  ("write y")
     s.write(y, 1)

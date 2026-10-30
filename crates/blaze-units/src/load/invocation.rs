@@ -115,7 +115,7 @@ pub(crate) struct Invocation;
 impl Query for Invocation {
     const KIND: QueryKind = QueryKind(0x6010);
     const NAME: &'static str = "cargo invocation";
-    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 1");
+    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 2");
     type Key = ();
     type Value = Cbor<Configured>;
 
@@ -202,7 +202,14 @@ fn read_by_cargo(name: &str) -> bool {
     name.starts_with("CARGO_")
         || matches!(
             name,
-            "RUSTFLAGS" | "RUSTDOCFLAGS" | "HOME" | "USERPROFILE" | "__CARGO_DEFAULT_LIB_METADATA"
+            "RUSTFLAGS"
+                | "RUSTDOCFLAGS"
+                | "RUSTC_WORKSPACE_WRAPPER"
+                | "HOME"
+                | "USERPROFILE"
+                | "__CARGO_DEFAULT_LIB_METADATA"
+                | "__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT"
+                | "__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT"
         )
 }
 

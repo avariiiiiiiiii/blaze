@@ -6,7 +6,10 @@
 //! of protection, so no TLB shootdown and no moment a page of the region can't run: what JITs
 //! that keep code W^X by mapping it twice do. The image's other mappings and their
 //! protections are read from /proc/self/maps once, at start; a data write to read-only pages
-//! makes each run of them writable once, writes and protects it again.
+//! makes each run of them writable once, writes and protects it again. Data is written
+//! with atomic stores ([`Writes::store`]), since other threads may read it meanwhile.
+
+#![allow(unsafe_code)]
 
 use std::{
     ffi::{CString, c_char, c_void},
@@ -23,7 +26,7 @@ pub(super) use super::unix::{backtrace, descriptor};
 use super::{
     Events,
     switch::{Dwarf, Layout, Memory, Writes},
-    unix::{__register_frame, image_base, in_image},
+    unix::{__register_frame, image_base, in_image, load_cell, loaders},
 };
 use crate::patch::MESSAGE_PREFIX;
 
@@ -142,10 +145,9 @@ impl Os {
                 std::io::Error::last_os_error()
             ));
         }
-        // SAFETY: the pages are the image's (`data` checked) and writable now; no other
-        // thread uses the bytes a patch rewrites while `poll` writes them (the rule
-        // `Live::poll` gives the program, the switch's module doc).
-        unsafe { writes.put(pages, pages.start as *mut u8) };
+        // SAFETY: the pages are the image's (`data` checked) and writable now, and stay mapped;
+        // other threads may read the bytes meanwhile, which `store` allows.
+        unsafe { writes.store(pages, pages.start as *mut u8) };
         // SAFETY: as for making them writable: their protection from before.
         if unsafe { mprotect(start, len, protection) } != 0 {
             return Err(format!(
@@ -219,6 +221,29 @@ impl Memory for Os {
     const DWARF: Dwarf = Dwarf::Sections;
     const SEH: bool = false;
 
+    fn cell(&self, cell: u64) -> u64 {
+        load_cell(cell)
+    }
+
+    fn in_image(&self, range: &Range<u64>) -> Result<(), String> {
+        in_image(range, self.base)?;
+        self.maps.each(range, |piece, protection| {
+            if protection & PROT_READ == 0 {
+                return Err(format!("{:#x}, in pages with no access", piece.start));
+            }
+            Ok(())
+        })
+    }
+
+    fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String> {
+        self.in_image(range)?;
+        super::unix::bytes(range, self.base)
+    }
+
+    fn loaders(&self, at: u64, slots: u64) -> &[u64] {
+        loaders(at, slots)
+    }
+
     fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
         let (Some(first), Some(last)) = (writes.spans.first(), writes.spans.last()) else {
             return Ok(());
@@ -244,9 +269,9 @@ impl Memory for Os {
                 }
                 if protection & PROT_WRITE != 0 {
                     // SAFETY: the piece is the image's (checked above) and mapped writable
-                    // (read at start); no other thread uses the bytes a patch rewrites while
-                    // `poll` writes them (the rule `Live::poll` gives the program).
-                    unsafe { writes.put(&piece, piece.start as *mut u8) };
+                    // (read at start); other threads may use the bytes meanwhile, which
+                    // `store` allows.
+                    unsafe { writes.store(&piece, piece.start as *mut u8) };
                     return Ok(());
                 }
                 let pages = self.pages(&piece);

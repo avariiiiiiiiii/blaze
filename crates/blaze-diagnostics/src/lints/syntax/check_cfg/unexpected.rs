@@ -23,7 +23,7 @@ use hir::{HirFileId, InFile, MacroCallId};
 use hir_expand::{MacroCallKind, MacroDefKind, builtin::BuiltinFnLikeExpander};
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
-    AstNode, AstToken, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange,
+    AstNode, AstToken, Edition, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange,
     ast::{self, HasLoopBody as _},
 };
 
@@ -380,7 +380,7 @@ impl Lints<'_, '_> {
 
     /// rustc's `unexpected_cfg_name`.
     fn name_diag(&self, file: HirFileId, check: &Check) -> Diag {
-        let edition = self.cx.edition;
+        let edition = self.edition_at(file, check.name_range);
         let expected = &self.expected;
         let name = check.name.as_str();
         let name_span = self.span(file, check.name_range);
@@ -520,7 +520,7 @@ impl Lints<'_, '_> {
 
     /// rustc's `unexpected_cfg_value`.
     fn value_diag(&self, file: HirFileId, check: &Check) -> Diag {
-        let edition = self.cx.edition;
+        let edition = self.edition_at(file, check.name_range);
         let expected = &self.expected;
         let name = check.name.as_str();
         let name_span = self.span(file, check.name_range);
@@ -648,6 +648,15 @@ impl Lints<'_, '_> {
                 "using a cfg inside a {kind} will use the cfgs from the destination crate and not the ones from the defining crate"
             ));
             diag.help(format!("try referring to `{path}` crate for guidance on how handle this unexpected cfg"));
+        }
+    }
+
+    /// The edition of the token at `range` of `file`, as rustc has it of the token's span: the
+    /// names are shown (raw or not) in it.
+    fn edition_at(&self, file: HirFileId, range: TextRange) -> Edition {
+        match file.macro_file() {
+            None => self.cx.edition,
+            Some(call) => call.expansion_span_map(self.cx.db).span_at(range.start()).ctx.edition(self.cx.db),
         }
     }
 

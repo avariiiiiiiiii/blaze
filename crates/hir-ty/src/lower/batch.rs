@@ -8,9 +8,10 @@
 //! body, and a signature query reads no body, so such items keep a query of their own.
 
 use base_db::Crate;
+use blaze_ids::radix;
 use hir_def::{AdtId, ImplId, ModuleDefId, ModuleId, VariantId, nameres::crate_def_map};
 use rustc_type_ir::inherent::Ty as _;
-use salsa::SalsaValue;
+use salsa::{SalsaValue, plumbing::AsId};
 use thin_vec::ThinVec;
 
 use crate::{
@@ -287,7 +288,14 @@ fn module_variants(db: &dyn HirDatabase, krate: Crate) -> Vec<VariantId> {
             }
         }
     }
-    variants.sort_unstable();
+    radix::sort_copy_by_key(&mut variants, |&it| {
+        let (kind, id) = match it {
+            VariantId::EnumVariantId(it) => (0, it.as_id()),
+            VariantId::StructId(it) => (1, it.as_id()),
+            VariantId::UnionId(it) => (2, it.as_id()),
+        };
+        radix::pack_64(kind, radix::pack_32(id.index(), id.generation()))
+    });
     variants.dedup();
     variants
 }
@@ -298,7 +306,10 @@ fn module_impls(db: &dyn HirDatabase, krate: Crate) -> Vec<ImplId> {
     for (_, module) in crate_def_map(db, krate).modules(db) {
         impls.extend(module.scope(db).impls());
     }
-    impls.sort_unstable();
+    radix::sort_copy_by_key(&mut impls, |it| {
+        let id = it.as_id();
+        radix::pack_32(id.index(), id.generation())
+    });
     impls.dedup();
     impls
 }

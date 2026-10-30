@@ -73,10 +73,9 @@ impl Inputs for World {
         self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
     }
 
-    fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-        let mut all = self.env.clone();
-        all.sort();
-        all
+    fn env_all(&mut self) -> &[(OsString, OsString)] {
+        self.env.sort();
+        &self.env
     }
 }
 

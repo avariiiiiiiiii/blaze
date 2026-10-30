@@ -29,9 +29,12 @@ pub mod build;
 pub mod client;
 pub mod frames;
 pub mod http;
+pub mod intent;
 pub mod json;
 pub mod server;
 pub mod session;
+
+pub use intent::{Edit, Edited, EditedItem, How, Target};
 
 use blaze_core::Conn;
 use blaze_ids::{ContentId, Fingerprint};
@@ -40,7 +43,7 @@ use blaze_vfs::{Change, Op, View};
 use serde::{Deserialize, Serialize};
 
 /// The version of every body's schema. A change to any type here is a new number.
-pub const SCHEMA: u32 = 8;
+pub const SCHEMA: u32 = 9;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -190,6 +193,19 @@ pub enum Request {
     /// `blaze stop`: the daemon's state made durable, then it exits; answered with
     /// `Done { ok: true }` before it does.
     Stop,
+    /// Edits by meaning, applied in the front end to `base` and committed to `head` as
+    /// [`Request::Commit`] commits: answered with [`Response::Edited`], then
+    /// [`Response::Committed`] once durable.
+    Edit { base: ContentId, head: String, edits: Vec<Edit> },
+    /// Declared intent: the tests `filter` selects in the view will be run soon. What they
+    /// reach is built ahead at a priority below every request's, answered at once with
+    /// [`Response::Announced`]. A request on the same root takes the work over; a newer intent
+    /// of this connection, the connection's end, or `wait_ms` with no such request cancels it.
+    WillTest { view: ViewRef, filter: Vec<String>, targets: Targets, wait_ms: u64 },
+    /// Declared intent: `ops` will be committed to `head`. The what-if is checked (tested,
+    /// with `test`) ahead as [`Request::WillTest`] builds ahead; a commit to `head` that makes
+    /// the same root takes the work over, and one that makes another root cancels it.
+    WillSave { ops: Vec<Op>, head: String, test: bool, targets: Targets, wait_ms: u64 },
 }
 
 /// `blaze test --ub`: each selected test run under `hir_ty_ub::run_test`, nothing compiled.
@@ -244,6 +260,10 @@ pub enum Response {
     CodegenInputs(Vec<(ContentId, ContentId)>),
     Trace(Vec<Traced>),
     Tables(Vec<Table>),
+    /// What a [`Request::Edit`] changed, before its commit's [`Response::Committed`].
+    Edited(Edited),
+    /// The root a [`Request::WillTest`] or [`Request::WillSave`] builds ahead.
+    Announced { root: ContentId },
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

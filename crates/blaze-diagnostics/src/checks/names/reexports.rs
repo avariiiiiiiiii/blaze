@@ -83,14 +83,12 @@ fn leaf(
     let path = tree.value.path()?;
     let segment = path.segment()?;
     let is_self = segment.self_token().is_some() && path.qualifier().is_none();
-    let ident = match tree.value.rename() {
-        Some(rename) if rename.underscore_token().is_some() => return None,
-        Some(rename) => rename.name()?.text().to_string(),
-        None if is_self => {
-            let parent = tree.value.syntax().ancestors().skip(1).find_map(ast::UseTree::cast)?;
-            parent.path()?.segment()?.name_ref()?.text().to_string()
-        }
-        None => segment.name_ref()?.text().to_string(),
+    // rustc names the import's source, not what it is renamed to.
+    let ident = if is_self {
+        let parent = tree.value.syntax().ancestors().skip(1).find_map(ast::UseTree::cast)?;
+        parent.path()?.segment()?.name_ref()?.text().to_string()
+    } else {
+        segment.name_ref()?.text().to_string()
     };
     let resolved = cx.sema.resolve_path_per_ns(&path)?;
     let namespaces = [
@@ -118,7 +116,12 @@ fn leaf(
     };
     let mut diag;
     if ns == Ns::Type {
-        diag = Diag::error(Some("E0365"), message, span);
+        diag = Diag::error(Some("E0365"), message, span.clone());
+        let label = match crate_private {
+            true => format!("re-export of crate public `{ident}`"),
+            false => format!("re-export of private `{ident}`"),
+        };
+        diag.span_label(span, label);
         diag.note(format!("consider declaring type or module `{ident}` with `pub`"));
     } else {
         diag = Diag::error(Some("E0364"), message, span.clone());

@@ -52,27 +52,6 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
         revision: Revision,
     ) -> VerifyResult;
 
-    /// Like [`Ingredient::maybe_changed_after`], but never claims, blocks or runs a query: `None`
-    /// when only a claimed check can decide (a memo that may have to run). `depth` counts the
-    /// memos above this one on the claim-free walk. Inputs, fields and interned values are
-    /// checked by a read, so the default is the plain check.
-    ///
-    /// # Safety
-    ///
-    /// The passed in database needs to be the same one that the ingredient was created with.
-    unsafe fn verify_unclaimed(
-        &self,
-        zalsa: &Zalsa,
-        db: RawDatabase<'_>,
-        input: Id,
-        revision: Revision,
-        depth: u32,
-    ) -> Option<VerifyResult> {
-        _ = depth;
-        // SAFETY: Forwarded from the caller.
-        Some(unsafe { self.maybe_changed_after(zalsa, db, input, revision) })
-    }
-
     /// Collects the minimum edges necessary to serialize a given dependency edge on this ingredient,
     /// without necessarily serializing the dependency edge itself.
     ///

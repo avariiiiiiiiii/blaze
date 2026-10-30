@@ -47,6 +47,32 @@ format-hir) append below with their name.
    (blaze-v2-proof -> blaze-query -> blaze-format) is one cargo allows for dev-dependencies.
 
 > applied: `blaze-v2-proof = { path = "crates/blaze-v2-proof" }` is in the root `[workspace.dependencies]` (ci's request 8 asked the same).
+6. **Pin blake3 exactly** — root `Cargo.toml` `[workspace.dependencies]` (coordinator):
+   `blake3 = { version = "=1.8.7", default-features = false, features = ["std", "neon"] }`
+   in place of `"1.8"`. Why: `ContentId::of_many` (`crates/blaze-ids/src/many.rs`) drives
+   `blake3::platform::Platform::hash_many`, which blake3 marks unstable, to hash many short
+   inputs a SIMD lane each (docs/v2/plan/lanes/format/speed-ids-format.md). A test holds it to
+   `blake3::Hasher` at every length, so a bump is a deliberate change that runs that test,
+   not a lockfile refresh.
+7. **Warm words are `u32` now** — `crates/blaze-cas/src/tests.rs:1000`, `OneColumn::hot_from_warm`
+   (lane store): read the words as `u32`s,
+   `warm[WARM_HEAD..].chunks_exact(4).map(|it| u32::from_le_bytes(it.try_into().unwrap()))`,
+   in place of `chunks_exact(8)` and `u64::from_le_bytes`. `tiers::Packed::words` is a
+   `Vec<u32>` in SIMD-BP128 layout. The writer at :992 already writes them as 4 bytes each.
+   Why: the warm tier's speed pass (docs/v2/plan/lanes/format/speed-ids-format.md); until this
+   changes, blaze-cas's tests don't compile.
+
+**Speed pass (2026-10-29), changes others see** (docs/v2/plan/lanes/format/speed-ids-format.md):
+- `blaze-format`: `Record` has `const PLAIN: bool` (default `false`). `record!` sets it when
+  every field is plain, and a plain record is checked by bounds alone. A hand-written
+  `unsafe impl Record` may set it only if every bit pattern of its size is a valid value.
+- `blaze-format::tiers`: `WarmColumn` holds `u32` words in SIMD-BP128 layout (its schema hash
+  changed), and cold columns are `COLD_VERSION` 2. No buffer of either was ever stored, so
+  nothing needs to migrate. `ColdDictionary` keeps prepared zstd dictionaries: it clones by
+  re-preparing and compares by `id`.
+- `blaze-ids`: `ContentId::of_many` hashes one-chunk inputs through `hash_many`, with the
+  same results. `Sharded`'s table places are tagged `u64`s, and `find` on an empty shard no
+  longer allocates. The API is unchanged.
 
 ## format-span-intern
 

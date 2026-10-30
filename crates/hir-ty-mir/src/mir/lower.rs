@@ -4,6 +4,7 @@ use std::{borrow::Cow, iter, mem};
 
 use arrayvec::ArrayVec;
 use base_db::Crate;
+use blaze_ids::radix;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId,
     LocalFieldId, Lookup,
@@ -4114,7 +4115,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         }
         let locals: FxHashSet<LocalId> = scope.locals.iter().copied().collect();
         let mut exits = scope.exits.clone();
-        exits.sort_unstable_by_key(|it| it.into_raw());
+        radix::sort_copy_by_key(&mut exits, |it| it.into_raw().into_u32());
         exits.dedup();
         for block in exits {
             let block = &mut self.result.basic_blocks[block];

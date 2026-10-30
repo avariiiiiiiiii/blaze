@@ -36,7 +36,7 @@ use syntax::{
     ast::{self, HasName},
 };
 
-use super::used::{Binding, Entry, ExternCrate, Ns, Tree, TreeKind, UseItem, Used, Uses, entry};
+use super::used::{Binding, Bits, Entry, ExternCrate, Ns, Tree, TreeKind, UseItem, Used, Uses, entry};
 use crate::{
     cx::{Cx, item_range},
     lower::{Found, Phase},
@@ -319,46 +319,8 @@ impl Candidates {
     }
 }
 
-/// A set of an item's trees by index: one bit each, inline for up to 64 trees.
-#[derive(Default)]
-struct Trees(SmallVec<[u64; 1]>);
-
-impl Trees {
-    fn insert(&mut self, j: usize) {
-        let word = j / 64;
-        if self.0.len() <= word {
-            self.0.resize(word + 1, 0);
-        }
-        self.0[word] |= 1 << (j % 64);
-    }
-
-    fn remove(&mut self, j: usize) {
-        if let Some(word) = self.0.get_mut(j / 64) {
-            *word &= !(1 << (j % 64));
-        }
-    }
-
-    fn contains(&self, j: usize) -> bool {
-        self.0.get(j / 64).is_some_and(|word| word & (1 << (j % 64)) != 0)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.iter().all(|it| *it == 0)
-    }
-
-    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().enumerate().flat_map(|(word, &bits)| {
-            let mut bits = bits;
-            std::iter::from_fn(move || {
-                (bits != 0).then(|| {
-                    let bit = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    word * 64 + bit
-                })
-            })
-        })
-    }
-}
+/// A set of an item's trees by index.
+type Trees = Bits;
 
 /// Whether name resolution used `binding`, or it did not resolve (rustc's dummy binding of
 /// an unresolved import counts as used).

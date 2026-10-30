@@ -53,6 +53,10 @@ pub struct SchemaHash(pub ContentId);
 /// impl for a struct and asserts it has no padding.
 pub unsafe trait Record: Copy + 'static {
     const SCHEMA: SchemaHash;
+    /// Every `size_of::<Self>()` bytes are a valid value and hold no reference: `check`
+    /// accepts anything at the right size and alignment, so a [`Slice`] of them is checked by
+    /// its bounds alone, in O(1), however long it is.
+    const PLAIN: bool = false;
     /// Whether `bytes`, `size_of::<Self>()` of them at an aligned address, are a valid value,
     /// the [`Rel`]s and [`Slice`]s in it within `buffer`.
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError>;
@@ -92,6 +96,7 @@ macro_rules! plain {
         // SAFETY: a primitive or a byte array, with no padding; every bit pattern is a value.
         unsafe impl Record for $ty {
             const SCHEMA: SchemaHash = schema($name);
+            const PLAIN: bool = true;
             fn check(_: &[u8], _: &[u8]) -> Result<(), FormatError> {
                 Ok(())
             }
@@ -124,7 +129,11 @@ unsafe impl Record for bool {
 unsafe impl<T: Record, const N: usize> Record for [T; N] {
     const SCHEMA: SchemaHash =
         schema_of(&[Part::Str("array"), Part::U64(N as u64), Part::Schema(T::SCHEMA)]);
+    const PLAIN: bool = T::PLAIN;
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        if T::PLAIN {
+            return fits::<[T; N]>(bytes, buffer);
+        }
         (0..N).try_for_each(|i| check_field::<T>(bytes, i * size_of::<T>(), buffer))
     }
 }
@@ -255,9 +264,12 @@ impl<T: Record> Slice<T> {
         let target = target::<T>(at, self.offset, self.len, buffer)?;
         let size = size_of::<T>();
         let bytes = &buffer[target..target + size * self.len as usize];
-        (0..self.len as usize).try_for_each(|i| check_field::<T>(bytes, i * size, buffer))?;
-        // SAFETY: `bytes` are in `buffer`, `len` `T`s of them, aligned for `T`, and each was
-        // accepted by `T::check`, which `Record`'s contract makes a valid `T`.
+        if !T::PLAIN {
+            (0..self.len as usize).try_for_each(|i| check_field::<T>(bytes, i * size, buffer))?;
+        }
+        // SAFETY: `bytes` are in `buffer`, `len` `T`s of them, aligned for `T` (the first is,
+        // and a `T`'s size is a multiple of its alignment), and each was accepted by
+        // `T::check` or is a `T::PLAIN` value, which `Record`'s contract makes a valid `T`.
         Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), self.len as usize) })
     }
 }
@@ -343,11 +355,15 @@ macro_rules! record {
                     $crate::Part::Schema(<$ty as $crate::Record>::SCHEMA),
                 )*
             ]);
+            const PLAIN: bool = true $( && <$ty as $crate::Record>::PLAIN )*;
 
             fn check(
                 bytes: &[u8],
                 buffer: &[u8],
             ) -> ::core::result::Result<(), $crate::FormatError> {
+                if <Self as $crate::Record>::PLAIN {
+                    return ::core::result::Result::Ok(());
+                }
                 $(
                     $crate::check_field::<$ty>(
                         bytes,
@@ -633,6 +649,7 @@ unsafe impl Record for SpanRef {
         Part::U64(offset_of!(SpanRef, index) as u64),
         Part::Schema(<u32 as Record>::SCHEMA),
     ]);
+    const PLAIN: bool = true;
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
         fits::<SpanRef>(bytes, buffer)
     }

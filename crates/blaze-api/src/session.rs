@@ -11,8 +11,13 @@
 //!
 //! The daemon flushes the VFS ([`blaze_vfs::Vfs::flush`]) after each call, so what a call
 //! committed is on its way to durability when the call returns.
+//!
+//! Declared intent ([`Request::WillTest`], [`Request::WillSave`]) is answered at once and
+//! built ahead as jobs of no request ([`intent`]); the daemon gives the session its clock
+//! through [`Session::tick`], before each other call and at [`Session::deadline`].
 
 mod best_of;
+mod intent;
 #[cfg(test)]
 mod tests;
 
@@ -20,14 +25,14 @@ use std::collections::{BTreeMap, VecDeque};
 
 use blaze_core::Conn;
 use rustc_hash::FxHashMap;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, radix};
 use blaze_query::QueryKey;
 use blaze_vfs::{CommitError, OpError, Ticket, View, ViewId, Vfs};
 
 use crate::{
     ApiError, Arrived, Reply, Request, RequestRef, Response, Status, ViewRef,
     build::{Builder, JobId, Opened, Work},
-    session::best_of::BestOf,
+    session::{best_of::BestOf, intent::Intents},
 };
 
 /// What the session works on, lent for one call.
@@ -64,6 +69,7 @@ pub struct Session {
     /// The database's view of the last job that ended on each of the latest [`KEPT`] roots,
     /// oldest first: what [`Request::Why`] reads, since a view's reruns are its own.
     kept: VecDeque<(ContentId, ViewId)>,
+    intents: Intents,
 }
 
 /// How many roots' last builds [`Session`] keeps for [`Request::Why`].
@@ -102,6 +108,15 @@ enum Kind {
         kept: Option<Opened>,
         owes_work: bool,
     },
+    /// A [`Request::Edit`]'s job, on its base, and the ops it reported; it becomes the
+    /// `Commit` of them when it ends.
+    Edit {
+        job: JobId,
+        cancelled: bool,
+        opened: Opened,
+        head: String,
+        ops: Option<Vec<blaze_vfs::Op>>,
+    },
     BestOf(BestOf),
 }
 
@@ -109,7 +124,7 @@ impl Kind {
     fn cancel(&mut self, builder: &mut dyn Builder) {
         match self {
             Kind::Commit { .. } => {}
-            Kind::Job { job, cancelled, .. } => {
+            Kind::Job { job, cancelled, .. } | Kind::Edit { job, cancelled, .. } => {
                 if !*cancelled {
                     *cancelled = true;
                     builder.cancel(*job);
@@ -123,6 +138,7 @@ impl Kind {
         match self {
             Kind::Commit { .. } => 0,
             Kind::Job { views, .. } => views.len(),
+            Kind::Edit { .. } => 1,
             Kind::BestOf(best) => best.views(),
         }
     }
@@ -145,7 +161,25 @@ impl Session {
             tickets: FxHashMap::default(),
             held: FxHashMap::default(),
             kept: VecDeque::new(),
+            intents: Intents::default(),
         }
+    }
+
+    /// The daemon's monotonic clock is `now_ns`: the intents whose wait it passed are
+    /// cancelled.
+    pub fn tick(&mut self, cx: &mut Daemon<'_>, now_ns: u64) {
+        self.intents.tick(cx.builder, now_ns);
+    }
+
+    /// When [`Session::tick`] next has something to do, on the clock it is given.
+    pub fn deadline(&self) -> Option<u64> {
+        self.intents.deadline()
+    }
+
+    /// The daemon moved `head` to `root` itself (the watcher's commit): intent on the head is
+    /// taken over or cancelled as by a commit request.
+    pub fn head_moved(&mut self, cx: &mut Daemon<'_>, head: &str, root: ContentId) {
+        self.intents.moved(cx.builder, head, root);
     }
 
     pub fn arrive(&mut self, cx: &mut Daemon<'_>, arrived: Arrived, out: &mut Vec<Reply>) {
@@ -194,6 +228,12 @@ impl Session {
                 }
                 sink.send(out, response);
             }
+            (Kind::Edit { ops, .. }, _) => {
+                if let Response::Edited(edited) = &response {
+                    *ops = Some(edited.ops.clone());
+                }
+                sink.send(out, response);
+            }
             _ => sink.send(out, response),
         }
     }
@@ -223,12 +263,28 @@ impl Session {
         mut queries: Option<ViewId>,
         out: &mut Vec<Reply>,
     ) {
+        if let Some(opened) = self.intents.finish(job) {
+            close(cx, opened);
+            if let Some(queries) = queries {
+                cx.db.close(queries);
+            }
+            return;
+        }
         let Some((serial, candidate)) = self.jobs.remove(&job) else {
             if let Some(queries) = queries {
                 cx.db.close(queries);
             }
             return;
         };
+        if matches!(self.pending[&serial].what, Kind::Edit { .. }) {
+            if let Some(queries) = queries {
+                cx.db.close(queries);
+            }
+            if self.edit_ended(cx, serial, ok, error, out) {
+                self.end(serial);
+            }
+            return;
+        }
         let pending = self.pending.get_mut(&serial).expect("a job's request is pending");
         let sink = pending.sink;
         let ok = ok && error.is_none();
@@ -294,6 +350,69 @@ impl Session {
         }
     }
 
+    /// An edit's job ended: its ops committed to its head, the request then waiting on the
+    /// commit's ticket; true when the request is over instead (it failed, was cancelled, or
+    /// the commit was refused).
+    fn edit_ended(
+        &mut self,
+        cx: &mut Daemon<'_>,
+        serial: u64,
+        ok: bool,
+        error: Option<ApiError>,
+        out: &mut Vec<Reply>,
+    ) -> bool {
+        let pending = self.pending.get_mut(&serial).expect("a job's request is pending");
+        let sink = pending.sink;
+        let Kind::Edit { job, cancelled, opened, head, ops } = &mut pending.what else {
+            unreachable!("job of serial {serial} is no edit")
+        };
+        let (job, opened, base) = (*job, *opened, opened.view.root);
+        let made = match (error, ops.take()) {
+            (Some(error), _) => Err(error),
+            (None, _) if !ok || *cancelled => Ok(None),
+            (None, None) => Err(ApiError::new(
+                format!(
+                    "the edits of {base:x} ended without reporting what they changed \
+                     (`Response::Edited`)"
+                ),
+                Some(format!("job {}", job.0)),
+            )),
+            (None, Some(ops)) => Ok(Some(ops)),
+        };
+        let head = std::mem::take(head);
+        let over = match made {
+            Ok(Some(ops)) => match cx.vfs.commit(&head, base, &ops) {
+                Ok(commit) => {
+                    self.intents.moved(cx.builder, &head, commit.root);
+                    self.tickets.insert(commit.ticket, serial);
+                    pending.what = Kind::Commit {
+                        root: commit.root,
+                        rebased: commit.rebased,
+                        ticket: commit.ticket,
+                        head,
+                    };
+                    false
+                }
+                Err(error) => {
+                    sink.send(out, Response::Error(commit_error(&head, base, &error)));
+                    sink.send(out, Response::Done { ok: false });
+                    true
+                }
+            },
+            Ok(None) => {
+                sink.send(out, Response::Done { ok: false });
+                true
+            }
+            Err(error) => {
+                sink.send(out, Response::Error(error));
+                sink.send(out, Response::Done { ok: false });
+                true
+            }
+        };
+        close(cx, opened);
+        over
+    }
+
     /// Commits the VFS now says are durable (what [`Vfs::complete`] returned). Tickets of
     /// commits the session did not make (the watcher's, a gone connection's) are not its own
     /// and are passed over.
@@ -322,6 +441,7 @@ impl Session {
                     .vfs
                     .commit(&head, base, &ops)
                     .map_err(|error| commit_error(&head, base, &error))?;
+                self.intents.moved(cx.builder, &head, commit.root);
                 let serial = self.begin(
                     req,
                     Kind::Commit {
@@ -365,6 +485,37 @@ impl Session {
             }
             Request::Snapshot => self.start(cx, req, None, Vec::new(), Work::Snapshot),
             Request::Stop => out.push(Reply { to: req, response: Response::Done { ok: true } }),
+            Request::Edit { base, head, edits } => {
+                if !cx.vfs.has(base) {
+                    return Err(commit_error(&head, base, &CommitError::UnknownBase(base)));
+                }
+                let opened = open(cx, base)?;
+                let job = self.job();
+                let edit = Kind::Edit { job, cancelled: false, opened, head, ops: None };
+                let serial = self.begin(req, edit);
+                self.jobs.insert(job, (serial, None));
+                cx.builder.start(job, Some(opened), Work::Edit(edits));
+            }
+            Request::WillTest { view, filter, targets, wait_ms } => {
+                let root = resolve(cx.vfs, &view)?;
+                let work = Work::Ahead { targets, filter };
+                self.intend(cx, req, root, None, wait_ms, work, out)?;
+            }
+            Request::WillSave { ops, head, test, targets, wait_ms } => {
+                let base = cx.vfs.head(&head).unwrap_or_else(|| cx.vfs.empty());
+                let root = cx.vfs.apply(base, &ops).map_err(|error| {
+                    ApiError::new(
+                        format!("the save's ops don't apply to head `{head}` at {base:x}: {error}"),
+                        Some(op_path(&error)),
+                    )
+                })?;
+                let work = if test {
+                    Work::Test { targets, filter: Vec::new(), all: false, args: Vec::new(), ub: None }
+                } else {
+                    Work::Check(targets)
+                };
+                self.intend(cx, req, root, Some(head), wait_ms, work, out)?;
+            }
             Request::BestOf { base, candidates, targets, test, filter } => {
                 let base = resolve(cx.vfs, &base)?;
                 if candidates.is_empty() {
@@ -385,6 +536,7 @@ impl Session {
                     });
                     match root.and_then(|root| open(cx, root)) {
                         Ok(opened) => {
+                            self.intents.take_over(cx.builder, opened.view.root);
                             let job = self.job();
                             let candidate = best.started(job, opened);
                             starts.push((job, candidate, opened));
@@ -445,7 +597,7 @@ impl Session {
             }
             Request::Status => {
                 let mut requests: Vec<u64> = self.live.keys().map(|it| it.id).collect();
-                requests.sort_unstable();
+                radix::sort(&mut requests);
                 let status = Status {
                     requests,
                     views: self.views(),
@@ -528,11 +680,34 @@ impl Session {
     ) {
         let job = self.job();
         let kept = view.filter(|_| incremental(&work));
+        if let Some(kept) = kept {
+            self.intents.take_over(cx.builder, kept.view.root);
+        }
         let owes_work = matches!(work, Work::Build(_) | Work::Test { .. } | Work::Run { .. });
         let serial =
             self.begin(req, Kind::Job { job, cancelled: false, views, kept, owes_work });
         self.jobs.insert(job, (serial, None));
         cx.builder.start(job, view, work);
+    }
+
+    /// Declared intent: `work` on `root` started through [`Builder::speculate`], belonging to
+    /// no request, and the request answered at once.
+    fn intend(
+        &mut self,
+        cx: &mut Daemon<'_>,
+        req: RequestRef,
+        root: ContentId,
+        head: Option<String>,
+        wait_ms: u64,
+        work: Work,
+        out: &mut Vec<Reply>,
+    ) -> Result<(), ApiError> {
+        let opened = open(cx, root)?;
+        let job = self.job();
+        self.intents.add(cx.builder, req.conn, job, opened, head, wait_ms);
+        cx.builder.speculate(job, opened, work);
+        answer(out, req, Response::Announced { root });
+        Ok(())
     }
 
     fn job(&mut self) -> JobId {
@@ -574,6 +749,7 @@ impl Session {
                 pending.what.cancel(cx.builder);
             }
         }
+        self.intents.gone(cx.builder, conn);
         let mut held: Vec<(ContentId, Vec<ViewId>)> =
             self.held.remove(&conn).into_iter().flatten().collect();
         held.sort_unstable_by_key(|&(root, _)| root);
@@ -586,7 +762,7 @@ impl Session {
     fn views(&self) -> u32 {
         let held: usize = self.held.values().flat_map(FxHashMap::values).map(Vec::len).sum();
         let jobs: usize = self.pending.values().map(|it| it.what.views()).sum();
-        u32::try_from(held + jobs).expect("fewer than 2^32 open views")
+        u32::try_from(held + jobs + self.intents.views()).expect("fewer than 2^32 open views")
     }
 }
 
@@ -653,7 +829,12 @@ fn incremental(work: &Work) -> bool {
         | Work::Run { .. }
         | Work::CodegenInputs(_)
         | Work::Trace(_) => true,
-        Work::Reach { .. } | Work::Verify(_) | Work::Snapshot | Work::Tables => false,
+        Work::Reach { .. }
+        | Work::Verify(_)
+        | Work::Snapshot
+        | Work::Tables
+        | Work::Edit(_)
+        | Work::Ahead { .. } => false,
     }
 }
 

@@ -129,7 +129,7 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
-    fn guard(&self, guard: std::sync::MutexGuard<'_, T>, model: bool) -> MutexGuard<'_, T> {
+    fn guard<'a>(&'a self, guard: std::sync::MutexGuard<'a, T>, model: bool) -> MutexGuard<'a, T> {
         MutexGuard { mutex: self, guard: Some(guard), model }
     }
 
@@ -277,11 +277,11 @@ impl<T> RwLock<T> {
 }
 
 impl<T: ?Sized> RwLock<T> {
-    fn reader(&self, guard: std::sync::RwLockReadGuard<'_, T>, model: bool) -> RwLockReadGuard<'_, T> {
+    fn reader<'a>(&'a self, guard: std::sync::RwLockReadGuard<'a, T>, model: bool) -> RwLockReadGuard<'a, T> {
         RwLockReadGuard { rwlock: self, guard: Some(guard), model }
     }
 
-    fn writer(&self, guard: std::sync::RwLockWriteGuard<'_, T>, model: bool) -> RwLockWriteGuard<'_, T> {
+    fn writer<'a>(&'a self, guard: std::sync::RwLockWriteGuard<'a, T>, model: bool) -> RwLockWriteGuard<'a, T> {
         RwLockWriteGuard { rwlock: self, guard: Some(guard), model }
     }
 
@@ -463,19 +463,31 @@ impl Condvar {
         drop(guard.guard.take());
         let lock: &'a Mutex<T> = guard.mutex;
         let mutex = &lock.id;
-        let mut timed_out = false;
-        rt::wait(at, "Condvar::wait", |rt| {
-            let condvar = rt.condvar(&self.id);
-            let obj = rt.mutex(mutex);
-            rt.mutex_release(obj);
-            if timed && rt.path.branch_spurious().map_err(|stuck| rt.stuck(stuck))? {
-                timed_out = true;
-                return Ok(None);
-            }
-            rt.condvar_enqueue(condvar);
-            Ok(Some(Wait::Notify(condvar)))
-        })
+        // An access of the condvar, so DPOR orders it with each notify; releasing, enqueueing
+        // and blocking then happen with no other thread in between.
+        let waits = rt::op(
+            at,
+            "Condvar::wait",
+            |rt| Ok(Op { obj: rt.condvar(&self.id), kind: Kind::Opaque }),
+            |rt| {
+                let condvar = rt.condvar(&self.id);
+                let obj = rt.mutex(mutex);
+                rt.mutex_release(obj);
+                if timed && rt.path.branch_spurious().map_err(|stuck| rt.stuck(stuck))? {
+                    return Ok(None);
+                }
+                rt.condvar_enqueue(condvar);
+                Ok(Some(condvar))
+            },
+        )
         .expect("blaze-check: a model lock's guard used outside its model");
+        let timed_out = match waits {
+            Some(condvar) => {
+                rt::block(Wait::Notify(condvar));
+                false
+            }
+            None => true,
+        };
         if !acquire(mutex, at, "Condvar::wait (lock again)", None) {
             panic!("blaze-check: a model lock's guard used outside its model");
         }

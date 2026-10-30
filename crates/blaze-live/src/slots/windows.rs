@@ -3,7 +3,10 @@
 //! Pages are made writable for a write with `VirtualProtect` and given their protection
 //! back, once per run of pages of one protection that a patch writes; code stays runnable
 //! while written, for a thread running an older generation's code on the same pages.
-//! Unwinding goes by `RUNTIME_FUNCTION`s, added with `RtlAddFunctionTable`.
+//! Unwinding goes by `RUNTIME_FUNCTION`s, added with `RtlAddFunctionTable`. Data is written
+//! with atomic stores ([`Writes::store`]), since other threads may read it meanwhile.
+
+#![allow(unsafe_code)]
 
 use std::{
     ffi::c_void,
@@ -17,10 +20,10 @@ use std::{
 };
 
 use super::{
-    Events,
+    Events, image,
     switch::{Dwarf, Layout, Memory, Writes},
 };
-use crate::patch::DESCRIPTOR;
+use crate::patch::{DESCRIPTOR, Descriptor};
 
 #[repr(C)]
 #[allow(dead_code)]
@@ -100,9 +103,9 @@ fn module_of(address: *const c_void) -> Result<*mut c_void, String> {
     Ok(module)
 }
 
-/// Where the descriptor of the module this code is in is, in memory.
-pub(super) fn descriptor() -> Result<u64, String> {
-    let own = descriptor as fn() -> Result<u64, String> as *const c_void;
+/// Where the descriptor of the module this code is in is, in memory, and its bytes.
+pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
+    let own = descriptor as fn() -> Result<(u64, &'static [u8]), String> as *const c_void;
     let module = module_of(own)?;
     let name: Vec<u8> = DESCRIPTOR.bytes().chain([0]).collect();
     // SAFETY: the module is loaded and the name ends in a zero.
@@ -113,7 +116,29 @@ pub(super) fn descriptor() -> Result<u64, String> {
              live patches"
         ));
     }
-    Ok(found as u64)
+    let at = found as u64;
+    let end = at.checked_add(Descriptor::SIZE as u64).ok_or("a descriptor past the end of memory")?;
+    Ok((at, readable(&(at..end), module as u64)?))
+}
+
+/// The image's bytes at `range`, checked to be committed, readable and of the image at
+/// `base`.
+fn readable(range: &Range<u64>, base: u64) -> Result<&'static [u8], String> {
+    regions(range, |piece, region| {
+        if region.allocation != base {
+            return Err(format!("{:#x}, outside the image at {base:#x}", piece.start));
+        }
+        let protect = region.protect & 0xff;
+        if protect == PAGE_NOACCESS || region.protect & PAGE_GUARD != 0 {
+            return Err(format!("{:#x}, in pages with no access", piece.start));
+        }
+        Ok(())
+    })?;
+    // SAFETY: `range` is committed, readable memory of the image (checked above), which stays
+    // loaded as long as its code, this, runs; it is data the linker wrote, which no patch
+    // writes over (the switch refuses data over the descriptor's cell and table, and the
+    // descriptor and the directory name are read-only data).
+    Ok(unsafe { image::view(range.start, (range.end - range.start) as usize) })
 }
 
 /// Pushes the code address of each frame of this thread's stack, newest first.
@@ -191,17 +216,8 @@ impl Os {
         }
         Ok(Os { base })
     }
-}
 
-impl Memory for Os {
-    const DWARF: Dwarf = Dwarf::Not;
-    const SEH: bool = true;
-
-    fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
-        self.data(writes)
-    }
-
-    fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
+    fn write(&mut self, writes: &Writes<'_>, kind: Kind) -> Result<(), String> {
         let base = self.base;
         let mut run: Option<(Range<u64>, Region)> = None;
         for span in writes.spans {
@@ -218,11 +234,8 @@ impl Memory for Os {
                 }
                 if protect & WRITABLE != 0 {
                     // SAFETY: the piece is the image's, committed and writable (`regions` read
-                    // it). Code bytes written are over no code the cell ever pointed at nor any
-                    // registered unwind entry (the switch's `Lasting`); no other thread uses
-                    // the data bytes a patch rewrites while `poll` writes them (the rule
-                    // `Live::poll` gives the program).
-                    unsafe { writes.put(&piece, piece.start as *mut u8) };
+                    // it), and stays committed.
+                    unsafe { kind.write(writes, &piece) };
                     if protect & EXECUTABLE != 0 {
                         flush(&piece);
                     }
@@ -236,7 +249,7 @@ impl Memory for Os {
                     }
                     _ => {
                         if let Some((done, region)) = run.replace((pages, region)) {
-                            protected(writes, &done, region.protect & 0xff)?;
+                            protected(writes, &done, region.protect & 0xff, kind)?;
                         }
                     }
                 }
@@ -244,9 +257,69 @@ impl Memory for Os {
             })?;
         }
         if let Some((done, region)) = run {
-            protected(writes, &done, region.protect & 0xff)?;
+            protected(writes, &done, region.protect & 0xff, kind)?;
         }
         Ok(())
+    }
+}
+
+/// What a write is of, which says how it may be written.
+#[derive(Clone, Copy)]
+enum Kind {
+    /// Patch code: over no code the cell ever pointed at nor any registered unwind entry
+    /// (the switch's `Lasting`), so no thread runs or reads the bytes, and plain copies do.
+    Code,
+    /// The image's data, which other threads may read or write meanwhile: atomic stores.
+    Data,
+}
+
+impl Kind {
+    /// Writes what `writes` has within `range`.
+    ///
+    /// # Safety
+    ///
+    /// `range` is committed memory of the image, writable while this runs.
+    unsafe fn write(self, writes: &Writes<'_>, range: &Range<u64>) {
+        match self {
+            // SAFETY: the caller's; no thread uses the bytes (`Kind::Code`).
+            Kind::Code => unsafe { writes.put(range, range.start as *mut u8) },
+            // SAFETY: the caller's; `store` allows other threads to use the bytes.
+            Kind::Data => unsafe { writes.store(range, range.start as *mut u8) },
+        }
+    }
+}
+
+impl Memory for Os {
+    const DWARF: Dwarf = Dwarf::Not;
+    const SEH: bool = true;
+
+    fn cell(&self, cell: u64) -> u64 {
+        // SAFETY: the cell is the descriptor's, 8-aligned (`Layout::new` checked), checked to
+        // be in the image by `Switch::new` before the first load, and only ever accessed
+        // atomically.
+        unsafe { image::cell(cell) }.load(Ordering::Acquire)
+    }
+
+    fn in_image(&self, range: &Range<u64>) -> Result<(), String> {
+        readable(range, self.base).map(drop)
+    }
+
+    fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String> {
+        readable(range, self.base)
+    }
+
+    fn loaders(&self, at: u64, slots: u64) -> &[u64] {
+        // SAFETY: `Switch::new` checked `at..at + slots * 8` is in the image and `at` 8-aligned
+        // before the first call; nothing writes it (the switch refuses data over it).
+        unsafe { image::words(at, slots as usize) }
+    }
+
+    fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
+        self.write(writes, Kind::Code)
+    }
+
+    fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
+        self.write(writes, Kind::Data)
     }
 
     fn frames(&mut self, starts: &[u64]) -> Result<(), String> {
@@ -352,12 +425,16 @@ fn regions(
 
 /// Writes what `writes` has within `pages`, committed memory of the image with `protect`,
 /// which isn't writable: made writable once for the write, then given it back.
-fn protected(writes: &Writes<'_>, pages: &Range<u64>, protect: u32) -> Result<(), String> {
+fn protected(
+    writes: &Writes<'_>,
+    pages: &Range<u64>,
+    protect: u32,
+    kind: Kind,
+) -> Result<(), String> {
     let put = || {
-        // SAFETY: the pages are the image's and writable while this runs (`writable`); no
-        // other thread uses the bytes a patch rewrites while `poll` writes them (the rule
-        // `Live::poll` gives the program), and the code bytes are over no lasting code.
-        unsafe { writes.put(pages, pages.start as *mut u8) }
+        // SAFETY: the pages are the image's, committed and writable while this runs
+        // (`writable`).
+        unsafe { kind.write(writes, pages) }
     };
     // SAFETY: the pages are the image's, committed with `protect` (`regions` read it).
     unsafe { writable(pages, protect, put)? };

@@ -25,7 +25,7 @@
 //! is still there.
 
 use base_db::{Crate, CrateOrigin, LangCrateOrigin, TargetKind};
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::{ContentId, Hasher, radix};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, DefWithBodyId, EnumId, EnumVariantId, ExpressionStoreOwnerId,
     GenericDefId, HasModule, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId,
@@ -931,7 +931,7 @@ fn crates_by_prefix(db: &dyn HirDatabase) -> Vec<(u64, Crate)> {
         .iter()
         .map(|&krate| (u64::from_le_bytes(crate_prefix(&crate_key(db, krate))), krate))
         .collect();
-    krates.sort_unstable_by_key(|&(prefix, _)| prefix);
+    radix::sort_copy_by_key(&mut krates, |&(prefix, _)| prefix);
     for pair in krates.windows(2) {
         let ((prefix, krate), (other_prefix, other)) = (pair[0], pair[1]);
         if prefix == other_prefix {

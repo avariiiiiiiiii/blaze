@@ -466,58 +466,153 @@ fn own(layout: Layout) -> NonNull<u8> {
 }
 
 /// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p intern --release
-/// model_`): every interleaving of racing inserts across a table growth, and a lock-free reader
-/// during it, against the sequential model (each value interned once, at one address, found
-/// once published).
+/// model_`): racing inserts and lock-free finds, on an empty store and across a table growth,
+/// against a set: an insert is new exactly when the value was not there, a find sees what was
+/// inserted before it, and each value has one address and is read whole.
 #[cfg(all(test, blaze_check))]
 mod model {
+    use std::sync::Arc;
+
+    use blaze_check::{
+        linear::{History, Spec},
+        thread,
+    };
+
     use super::*;
 
-    /// One hash for every value: one shard, one home group and tag, so seven values fill the
-    /// first table to half and the racing inserts grow it.
+    /// One hash for every value: one shard, one home group and one tag, so every probe
+    /// compares values and seven values fill the first table to half.
     const HASH: u64 = 7;
 
     fn read(at: NonNull<u8>) -> u64 {
-        // SAFETY: Every value of the model's store is a `u64`.
+        // SAFETY: Every value of the model's stores is a `u64`, written before it was published.
         unsafe { *at.cast::<u64>().as_ref() }
     }
 
-    fn intern(store: &Store, value: u64) -> usize {
-        let at = match store.entry(HASH, |at| read(at) == value) {
-            Entry::Found(at) => at,
-            Entry::Vacant(vacant) => vacant
+    /// `value`'s address, and whether this call inserted it.
+    fn intern(store: &Store, value: u64) -> (usize, bool) {
+        let (at, new) = match store.entry(HASH, |at| read(at) == value) {
+            Entry::Found(at) => (at, false),
+            Entry::Vacant(vacant) => {
                 // SAFETY: `insert` hands `write` fresh memory of `Layout::new::<u64>()`, aligned
                 // and written by no one else.
-                .insert(Layout::new::<u64>(), |to| unsafe { to.cast::<u64>().write(value) }),
+                let at = vacant.insert(Layout::new::<u64>(), |to| unsafe { to.cast::<u64>().write(value) });
+                (at, true)
+            }
         };
-        assert_eq!(read(at), value);
-        at.as_ptr().addr()
+        assert_eq!(read(at), value, "an interned value is read whole");
+        (at.as_ptr().addr(), new)
     }
 
+    fn find(store: &Store, value: u64) -> Option<usize> {
+        let at = store.find(HASH, |at| read(at) == value)?;
+        assert_eq!(read(at), value, "a found value is read whole");
+        Some(at.as_ptr().addr())
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        Intern(u64),
+        Find(u64),
+    }
+
+    /// The sequential store: bit `v` is set when value `v` is in it.
+    #[derive(Clone, PartialEq, Eq, Hash, Default)]
+    struct Set(u16);
+
+    impl Spec for Set {
+        type Op = Op;
+        /// `Intern`: whether it inserted. `Find`: whether it found.
+        type Ret = bool;
+
+        fn apply(&mut self, op: &Op) -> bool {
+            match *op {
+                Op::Intern(value) => {
+                    let new = self.0 & (1 << value) == 0;
+                    self.0 |= 1 << value;
+                    new
+                }
+                Op::Find(value) => self.0 & (1 << value) != 0,
+            }
+        }
+    }
+
+    /// Runs `op` as one operation of `history`: the address it interned or found.
+    fn run(history: &History<Set>, store: &Store, op: Op) -> Option<usize> {
+        let mut at = None;
+        history.record(op, |&op| match op {
+            Op::Intern(value) => {
+                let (addr, new) = intern(store, value);
+                at = Some(addr);
+                new
+            }
+            Op::Find(value) => {
+                at = find(store, value);
+                at.is_some()
+            }
+        });
+        at
+    }
+
+    /// First inserts into an empty store: one of the two threads makes and publishes the shard's
+    /// first table, and a find racing with it sees nothing or the whole value.
     #[test]
-    fn model_racing_inserts_across_growth() {
+    fn model_first_inserts_publish_a_table() {
         blaze_check::model(|| {
-            let store: &'static Store = Box::leak(Box::new(Store::new()));
-            let before: Vec<usize> = (0..6).map(|value| intern(store, value)).collect();
-            let first = before[0];
-            let a = blaze_check::thread::spawn(move || [6, 7, 8].map(|value| intern(store, value)));
-            let b = blaze_check::thread::spawn(move || [8, 7, 9].map(|value| intern(store, value)));
-            let reader = blaze_check::thread::spawn(move || {
-                let found = store.find(HASH, |at| read(at) == 0).map(|at| at.as_ptr().addr());
-                assert_eq!(found, Some(first), "a published value is always found");
-            });
-            let a = a.join().unwrap();
-            let b = b.join().unwrap();
-            reader.join().unwrap();
-            assert_eq!(a[1], b[1], "7 interned once");
-            assert_eq!(a[2], b[0], "8 interned once");
-            let mut all: Vec<usize> = before.iter().chain(&a).chain(&b).copied().collect();
+            let store = Arc::new(Store::new());
+            let history = Arc::new(History::<Set>::new());
+            let other = {
+                let (store, history) = (store.clone(), history.clone());
+                thread::spawn(move || {
+                    let one = run(&history, &store, Op::Intern(1));
+                    let two = run(&history, &store, Op::Find(2));
+                    (one, two)
+                })
+            };
+            let two = run(&history, &store, Op::Intern(2));
+            let one = run(&history, &store, Op::Find(1));
+            let (one_at, two_found) = other.join().unwrap();
+            history.check(Set::default());
+            assert_ne!(one_at, two, "two values, two addresses");
+            if one.is_some() {
+                assert_eq!(one, one_at, "1 found where it was interned");
+            }
+            if two_found.is_some() {
+                assert_eq!(two_found, two, "2 found where it was interned");
+            }
+            assert_eq!(store.len(), 2);
+        });
+    }
+
+    /// Seven values fill the first table to half, so whichever of 7 and 8 goes in first grows
+    /// it, while the other thread finds a value from before the growth and races the insert.
+    #[test]
+    fn model_inserts_race_across_growth() {
+        blaze_check::model(|| {
+            let store = Arc::new(Store::new());
+            let before: Vec<usize> = (0..7).map(|value| intern(&store, value).0).collect();
+            let history = Arc::new(History::<Set>::new());
+            let other = {
+                let (store, history) = (store.clone(), history.clone());
+                thread::spawn(move || [Op::Intern(7), Op::Intern(8)].map(|op| run(&history, &store, op)))
+            };
+            let zero = run(&history, &store, Op::Find(0));
+            let eight = run(&history, &store, Op::Intern(8));
+            let seven = run(&history, &store, Op::Find(7));
+            let [seven_at, eight_at] = other.join().unwrap();
+            history.check(Set(0x7f));
+            assert_eq!(zero, Some(before[0]), "a value from before the growth is found where it was");
+            assert_eq!(eight, eight_at, "8 interned once");
+            if seven.is_some() {
+                assert_eq!(seven, seven_at, "7 found where it was interned");
+            }
+            let mut all: Vec<usize> = before.iter().copied().chain(seven_at).chain(eight_at).collect();
             all.sort_unstable();
             all.dedup();
-            assert_eq!(all.len(), 10, "ten values, ten addresses");
-            assert_eq!(store.len(), 10);
+            assert_eq!(all.len(), 9, "nine values, nine addresses");
+            assert_eq!(store.len(), 9);
             for (value, &at) in before.iter().enumerate() {
-                assert_eq!(intern(store, value as u64), at);
+                assert_eq!(find(&store, value as u64), Some(at), "kept across the growth");
             }
         });
     }

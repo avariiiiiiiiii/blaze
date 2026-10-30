@@ -33,6 +33,8 @@
 
 #![forbid(unsafe_code)]
 
+use hir_ty::TargetFeature;
+
 use super::*;
 
 /// What runs after the fma, in its block: whether FastISel can select it.
@@ -137,6 +139,33 @@ fn callee_of(func: &Operand) -> Option<(FunctionId, bool)> {
     Some((func, args.is_empty()))
 }
 
+/// Whether `intrinsic` is a fused multiply-add: `Some(true)` for one that always fuses,
+/// `Some(false)` for one LLVM may or may not fuse, `None` for any other intrinsic.
+fn fused(intrinsic: Intrinsic) -> Option<bool> {
+    match intrinsic {
+        Intrinsic::Fma | Intrinsic::Simd(SimdOp::Fma) => Some(true),
+        Intrinsic::Fmuladd | Intrinsic::Simd(SimdOp::RelaxedFma) => Some(false),
+        _ => None,
+    }
+}
+
+/// What FastISel makes of a call of `intrinsic` after the fma; `None` for `simd_neg`, which
+/// depends on the type it negates.
+fn intrinsic_step(intrinsic: Intrinsic) -> Option<Step> {
+    match intrinsic {
+        Intrinsic::Simd(
+            SimdOp::Insert
+            | SimdOp::Extract
+            | SimdOp::Shuffle
+            | SimdOp::SelectBitmask
+            | SimdOp::Select,
+        ) => Some(Step::Fails),
+        Intrinsic::Simd(SimdOp::Neg) => None,
+        _ if fused(intrinsic) == Some(true) => Some(Step::Selected),
+        _ => Some(Step::Unknown),
+    }
+}
+
 fn plain_local(operand: &Operand) -> Option<LocalId> {
     match &operand.kind {
         OperandKind::Copy(place) | OperandKind::Move(place)
@@ -149,7 +178,7 @@ fn plain_local(operand: &Operand) -> Option<LocalId> {
 }
 
 impl<'db> Facts<'db> {
-    fn new(db: &'db dyn HirDatabase, body: &'db MirBody<'db>) -> Self {
+    fn new(body: &'db MirBody<'db>) -> Self {
         let mut facts = Facts {
             body,
             func: body.owner.as_function(),
@@ -197,10 +226,8 @@ impl<'db> Facts<'db> {
             let Some(terminator) = &block.terminator else { continue };
             match &terminator.kind {
                 TerminatorKind::Goto { target } => _ = goes_on.insert(*target, id),
-                TerminatorKind::Call { func, target: Some(target), cleanup, .. }
-                    if cleanup.is_none()
-                        || callee_of(func)
-                            .is_some_and(|(f, _)| FunctionSignature::is_intrinsic(db, f)) =>
+                TerminatorKind::Call { target: Some(target), cleanup, intrinsic, .. }
+                    if cleanup.is_none() || intrinsic.is_some() =>
                 {
                     goes_on.insert(*target, id);
                 }
@@ -266,9 +293,13 @@ impl<'db> Facts<'db> {
         }
     }
 
-    fn call(&self, block: BasicBlockId) -> Option<(&'db Operand, &'db [Operand])> {
+    /// The callee, arguments and intrinsic of the call `block` ends in.
+    fn call(
+        &self,
+        block: BasicBlockId,
+    ) -> Option<(&'db Operand, &'db [Operand], Option<Intrinsic>)> {
         match &self.body.basic_blocks[block].terminator.as_ref()?.kind {
-            TerminatorKind::Call { func, args, .. } => Some((func, args)),
+            TerminatorKind::Call { func, args, intrinsic, .. } => Some((func, args, *intrinsic)),
             _ => None,
         }
     }
@@ -299,41 +330,40 @@ impl<'db> FunctionCx<'_, 'db> {
     /// Whether the function has FMA or FMA4: by its crate, or by its own `#[target_feature]`
     /// and what that implies, as AVX-512 does FMA.
     pub(super) fn x86_fused(&self) -> bool {
-        self.cg.target.arch == Arch::X86_64 && (self.enables("fma") || self.enables("fma4"))
+        self.cg.target.arch == Arch::X86_64
+            && (self.enables(TargetFeature::FMA) || self.enables(TargetFeature::FMA4))
     }
 
     /// Whether the function's crate or the function has `feature`.
-    fn enables(&self, feature: &str) -> bool {
-        let atom = cfg::CfgAtom::KeyValue {
-            key: intern::sym::target_feature,
-            value: intern::Symbol::intern(feature),
-        };
-        self.env.krate.cfg_options(self.cg.db).check_atom(&atom) || self.function_enables(feature)
+    fn enables(&self, feature: TargetFeature) -> bool {
+        hir_ty::crate_target_features(self.cg.db, self.env.krate).contains(feature)
+            || self.function_enables(feature)
     }
 
-    /// The fma `name` of the intrinsic call this block ends in, into `dst`.
+    /// The fma `intrinsic` of the intrinsic call this block ends in, into `dst`.
     pub(super) fn x86_fma(
         &mut self,
-        name: &str,
+        intrinsic: Intrinsic,
         args: &[Operand],
         dst: Value,
         dst_ty: Ty<'db>,
     ) -> Result<()> {
-        let [a, b, c] = args else { unsupported!("`{name}` with {} arguments", args.len()) };
-        if matches!(name, "simd_relaxed_fma" | "fmuladdf32" | "fmuladdf64") {
+        let [a, b, c] = args else { unsupported!("`{intrinsic}` with {} arguments", args.len()) };
+        if fused(intrinsic) == Some(false) {
             unsupported!(
-                "`{name}` in an x86-64 function with FMA, which LLVM may or may not fuse there"
+                "`{intrinsic}` in an x86-64 function with FMA, which LLVM may or may not fuse \
+                 there"
             );
         }
         let body = self.body.expect("MIR body");
-        let Some(block) = self.block else { unsupported!("`{name}` outside a block") };
+        let Some(block) = self.block else { unsupported!("`{intrinsic}` outside a block") };
         let Some(TerminatorKind::Call { destination, target, .. }) =
             body.basic_blocks[block].terminator.as_ref().map(|it| &it.kind)
         else {
-            unsupported!("`{name}` not called by its block's terminator");
+            unsupported!("`{intrinsic}` not called by its block's terminator");
         };
         let site = Site { operands: [a, b, c], negated: [false; 3], destination, target: *target };
-        self.lower_fma(name, &site, dst, dst_ty)
+        self.lower_fma(intrinsic, &site, dst, dst_ty)
     }
 
     /// Makes the fma of a call of `func` here when rustc's MIR inliner puts the body of `func`,
@@ -349,16 +379,21 @@ impl<'db> FunctionCx<'_, 'db> {
     ) -> Result<bool> {
         let db = self.cg.db;
         let caller = self.body.and_then(|it| it.owner.as_function());
-        if !self.x86_fused()
-            || FunctionSignature::is_intrinsic(db, func)
-            || !caller.is_some_and(|it| it.krate(db).data(db).origin.is_lang())
-        {
+        if !self.x86_fused() {
+            return Ok(false);
+        }
+        match hir_ty::intrinsic::intrinsic_of(db, func) {
+            Ok(None) => {}
+            Ok(Some(_)) => return Ok(false),
+            Err(e) => unsupported!("{e}"),
+        }
+        if !caller.is_some_and(|it| it.krate(db).data(db).origin.is_lang()) {
             return Ok(false);
         }
         if !self.has_fma(func)? {
             return Ok(false);
         }
-        let name = FunctionSignature::of(self.cg.db, func).name.as_str().to_owned();
+        let name = FunctionSignature::of(db, func).name.as_str();
         match self.rustc_inlines(caller, func)? {
             Some(false) => return Ok(false),
             None => unsupported!(
@@ -388,19 +423,19 @@ impl<'db> FunctionCx<'_, 'db> {
             destination,
             target,
         };
-        self.lower_fma("simd_fma", &site, dst, dst_ty)?;
+        self.lower_fma(Intrinsic::Simd(SimdOp::Fma), &site, dst, dst_ty)?;
         Ok(true)
     }
 
     fn lower_fma(
         &mut self,
-        name: &str,
+        intrinsic: Intrinsic,
         site: &Site<'_>,
         dst: Value,
         dst_ty: Ty<'db>,
     ) -> Result<()> {
-        if self.enables("fma4") {
-            unsupported!("`{name}` in an x86-64 function with FMA4");
+        if self.enables(TargetFeature::FMA4) {
+            unsupported!("`{intrinsic}` in an x86-64 function with FMA4");
         }
         let layout = self.layout(dst_ty)?;
         let bytes = layout.size.bytes() as u32;
@@ -409,30 +444,31 @@ impl<'db> FunctionCx<'_, 'db> {
             BackendRepr::SimdVector { element, count } => {
                 (self.scalar(element)?.ty, count.as_u64(), false)
             }
-            _ => unsupported!("`{name}` of {dst_ty:?}"),
+            _ => unsupported!("`{intrinsic}` of {dst_ty:?}"),
         };
         if !lane.is_float() || lane == types::F128 {
-            unsupported!("`{name}` of {lane} in an x86-64 function with FMA");
+            unsupported!("`{intrinsic}` of {lane} in an x86-64 function with FMA");
         }
-        if lane == types::F16 && !self.enables("avx512fp16") {
+        if lane == types::F16 && !self.enables(TargetFeature::AVX512FP16) {
             unsupported!(
-                "`{name}` of f16 in an x86-64 function with FMA and without AVX512-FP16, \
+                "`{intrinsic}` of f16 in an x86-64 function with FMA and without AVX512-FP16, \
                  which LLVM fuses by its context"
             );
         }
-        let vl = lane == types::F16 && !scalar && bytes < 64 && !self.enables("avx512vl");
+        let vl =
+            lane == types::F16 && !scalar && bytes < 64 && !self.enables(TargetFeature::AVX512VL);
         if !scalar && !matches!(bytes, 16 | 32 | 64)
-            || bytes == 64 && !self.enables("avx512f")
+            || bytes == 64 && !self.enables(TargetFeature::AVX512F)
             || vl
         {
-            unsupported!("`{name}` of {dst_ty:?} in an x86-64 function with FMA");
+            unsupported!("`{intrinsic}` of {dst_ty:?} in an x86-64 function with FMA");
         }
         let body = self.body.expect("MIR body");
-        let facts = std::rc::Rc::new(Facts::new(self.cg.db, body));
+        let facts = std::rc::Rc::new(Facts::new(body));
         let block = self.block.expect("the fma's block");
         let fold = self.folds(&facts, site, block, false).map_err(|why| {
             CodegenError::Unsupported(format!(
-                "`{name}` in an x86-64 function with FMA, where whether LLVM folds into it \
+                "`{intrinsic}` in an x86-64 function with FMA, where whether LLVM folds into it \
                  the negations of its operands is not known: {why}"
             ))
         })?;
@@ -444,20 +480,20 @@ impl<'db> FunctionCx<'_, 'db> {
             for (i, operand) in site.operands.iter().enumerate() {
                 traced[i] = self.trace(&facts, operand, block).map_err(|why| {
                     CodegenError::Unsupported(format!(
-                        "`{name}` in an x86-64 function with FMA, whose operand {why}, which \
-                         LLVM may fold into it"
+                        "`{intrinsic}` in an x86-64 function with FMA, whose operand {why}, \
+                         which LLVM may fold into it"
                     ))
                 })?;
                 if let Traced::Negated { .. } = traced[i] {
                     if site.negated[i] {
-                        unsupported!("`{name}` of a negation of a negation");
+                        unsupported!("`{intrinsic}` of a negation of a negation");
                     }
                     given[i] = true;
                 }
             }
             swapped = self.fma_consumers(&facts, site, &traced, scalar).map_err(|why| {
                 CodegenError::Unsupported(format!(
-                    "`{name}` in an x86-64 function with FMA, whose result {why}"
+                    "`{intrinsic}` in an x86-64 function with FMA, whose result {why}"
                 ))
             })?;
         }
@@ -639,7 +675,15 @@ impl<'db> FunctionCx<'_, 'db> {
                         }
                     }
                 }
-                TerminatorKind::Call { func, args, destination, target, cleanup, .. } => {
+                TerminatorKind::Call {
+                    func,
+                    args,
+                    destination,
+                    target,
+                    cleanup,
+                    intrinsic,
+                    ..
+                } => {
                     let Some((callee, monomorphic)) = callee_of(func) else {
                         return Err("then a call of a pointer".to_owned());
                     };
@@ -657,15 +701,10 @@ impl<'db> FunctionCx<'_, 'db> {
                         Step::Unknown
                     };
                     let Some(target) = *target else { return unknown.map_or(Ok(false), Err) };
-                    let name = FunctionSignature::of(db, callee).name.as_str();
-                    if FunctionSignature::is_intrinsic(db, callee) {
-                        let step = match name {
-                            "simd_insert"
-                            | "simd_extract"
-                            | "simd_shuffle"
-                            | "simd_select_bitmask"
-                            | "simd_select" => Step::Fails,
-                            "simd_neg" => {
+                    if let Some(intrinsic) = *intrinsic {
+                        let step = match intrinsic_step(intrinsic) {
+                            Some(step) => step,
+                            None => {
                                 let ty = frame.facts.body.locals[destination.local].ty.as_ref();
                                 let wide = self.layout(ty).is_ok_and(|it| {
                                     matches!(it.backend_repr, BackendRepr::SimdVector { .. })
@@ -677,15 +716,14 @@ impl<'db> FunctionCx<'_, 'db> {
                                     Step::Unknown
                                 }
                             }
-                            "simd_fma" | "fma" | "fmaf32" | "fmaf64" => Step::Selected,
-                            _ => Step::Unknown,
                         };
                         match (step, returned) {
                             (Step::Fails, _) | (_, Step::Fails) => return Ok(true),
                             (Step::Selected, Step::Selected) => {}
-                            _ => note(&mut unknown, format!("then `{name}`")),
+                            _ => note(&mut unknown, format!("then `{intrinsic}`")),
                         }
                     } else {
+                        let name = FunctionSignature::of(db, callee).name.as_str();
                         let inlined = if monomorphic {
                             self.rustc_inlines(frame.facts.func, callee)
                                 .map_err(|e| format!("{e:?}"))?
@@ -702,7 +740,7 @@ impl<'db> FunctionCx<'_, 'db> {
                                 } else {
                                     None
                                 };
-                                let facts = std::rc::Rc::new(Facts::new(db, callee_body));
+                                let facts = std::rc::Rc::new(Facts::new(callee_body));
                                 frames.push(Frame {
                                     block: callee_body.start_block,
                                     facts,
@@ -907,11 +945,9 @@ impl<'db> FunctionCx<'_, 'db> {
                         Def::Statement(b, at) => {
                             matches!(facts.rvalue(b, at), Some(Rvalue::UnaryOp(UnOp::Neg, _)))
                         }
-                        Def::Call(b) => {
-                            facts.call(b).and_then(|(f, _)| callee_of(f)).is_some_and(|(f, _)| {
-                                FunctionSignature::of(self.cg.db, f).name.as_str() == "simd_neg"
-                            })
-                        }
+                        Def::Call(b) => facts.call(b).is_some_and(|(_, _, intrinsic)| {
+                            intrinsic == Some(Intrinsic::Simd(SimdOp::Neg))
+                        }),
                         Def::Param => false,
                     });
                     if negations {
@@ -948,13 +984,15 @@ impl<'db> FunctionCx<'_, 'db> {
                     rvalue => return Err(format!("is {rvalue:?}")),
                 },
                 Def::Call(b) => {
-                    let Some((func, args)) = facts.call(b) else { return Err("is a call".into()) };
+                    let Some((func, args, intrinsic)) = facts.call(b) else {
+                        return Err("is a call".into());
+                    };
                     let Some((callee, monomorphic)) = callee_of(func) else {
                         return Err("is the result of a call of a pointer".to_owned());
                     };
-                    let db = self.cg.db;
-                    let name = FunctionSignature::of(db, callee).name.as_str();
-                    if !FunctionSignature::is_intrinsic(db, callee) {
+                    let Some(intrinsic) = intrinsic else {
+                        let db = self.cg.db;
+                        let name = FunctionSignature::of(db, callee).name.as_str();
                         let inlined = if monomorphic {
                             self.rustc_inlines(facts.func, callee).map_err(|e| format!("{e:?}"))?
                         } else {
@@ -964,13 +1002,13 @@ impl<'db> FunctionCx<'_, 'db> {
                             Some(false) => Ok(plain(local, None)),
                             _ => Err(format!("is the result of `{name}`, which rustc may inline")),
                         };
-                    }
-                    match (name, args) {
-                        ("simd_neg", [op]) => {
+                    };
+                    match (intrinsic, args) {
+                        (Intrinsic::Simd(SimdOp::Neg), [op]) => {
                             negate(&mut negated)?;
                             local = plain_local(op).ok_or_else(|| format!("is {:?}", op.kind))?;
                         }
-                        ("simd_extract", [vector, index]) => {
+                        (Intrinsic::Simd(SimdOp::Extract), [vector, index]) => {
                             let index =
                                 if facts.func == self.body.and_then(|it| it.owner.as_function()) {
                                     self.immediate(index).map_err(|e| format!("{e:?}"))?
@@ -997,13 +1035,9 @@ impl<'db> FunctionCx<'_, 'db> {
                                         _ => break,
                                     },
                                     Some(Def::Call(b)) => {
-                                        let neg = facts
-                                            .call(b)
-                                            .and_then(|(f, _)| callee_of(f))
-                                            .is_some_and(|(f, _)| {
-                                                FunctionSignature::of(db, f).name.as_str()
-                                                    == "simd_neg"
-                                            });
+                                        let neg = facts.call(b).is_some_and(|(_, _, intrinsic)| {
+                                            intrinsic == Some(Intrinsic::Simd(SimdOp::Neg))
+                                        });
                                         if neg {
                                             return Err("is a lane of a negated vector".to_owned());
                                         }
@@ -1014,7 +1048,7 @@ impl<'db> FunctionCx<'_, 'db> {
                             }
                             return Ok(plain(local, lane_of));
                         }
-                        _ => return Err(format!("is the result of `{name}`")),
+                        _ => return Err(format!("is the result of `{intrinsic}`")),
                     }
                 }
                 Def::Param => unreachable!(),
@@ -1081,34 +1115,34 @@ impl<'db> FunctionCx<'_, 'db> {
                     }
                 }
             }
-            if let Some(TerminatorKind::Call { func, args, .. }) =
+            if let Some(TerminatorKind::Call { func, args, intrinsic, .. }) =
                 data.terminator.as_ref().map(|it| &it.kind)
             {
                 let positions: Vec<usize> = (0..args.len())
                     .filter(|&i| plain_local(&args[i]).is_some_and(|it| held.contains(&it)))
                     .collect();
                 if !positions.is_empty() {
-                    uses.push((func, args, positions));
+                    uses.push((func, args, *intrinsic, positions));
                 }
             }
         }
         let mut swapped = false;
-        for (func, args, positions) in uses {
+        for (func, args, intrinsic, positions) in uses {
             let Some((callee, _)) = callee_of(func) else {
                 return Err("is passed to a pointer".into());
             };
-            let db = self.cg.db;
-            let name = FunctionSignature::of(db, callee).name.as_str();
-            if !FunctionSignature::is_intrinsic(db, callee) {
+            let Some(intrinsic) = intrinsic else {
+                let db = self.cg.db;
                 if self.rustc_inlines(facts.func, callee).map_err(|e| format!("{e:?}"))?
                     != Some(false)
                 {
+                    let name = FunctionSignature::of(db, callee).name.as_str();
                     return Err(format!("is passed to `{name}`, which rustc may inline"));
                 }
                 continue;
-            }
-            match (name, positions.as_slice()) {
-                ("simd_select_bitmask" | "simd_select", [1]) => {
+            };
+            match (intrinsic, positions.as_slice()) {
+                (Intrinsic::Simd(SimdOp::SelectBitmask | SimdOp::Select), [1]) => {
                     // A passthru of `y` would be matched by the commuted masked form.
                     let passthru = plain_local(&args[2]).map(|it| facts.root(it));
                     if passthru.is_some()
@@ -1118,8 +1152,8 @@ impl<'db> FunctionCx<'_, 'db> {
                         return Err("is merged into its second factor".to_owned());
                     }
                 }
-                ("simd_shuffle", _) if !scalar => {}
-                ("simd_insert", [2]) if scalar => {
+                (Intrinsic::Simd(SimdOp::Shuffle), _) if !scalar => {}
+                (Intrinsic::Simd(SimdOp::Insert), [2]) if scalar => {
                     let index = self.immediate(&args[1]).map_err(|e| format!("{e:?}"))?;
                     let vector = plain_local(&args[0]).map(|it| facts.root(it));
                     let lane = |t: &Traced| match *t {
@@ -1137,7 +1171,7 @@ impl<'db> FunctionCx<'_, 'db> {
                         }
                     }
                 }
-                _ => return Err(format!("is read by `{name}`")),
+                _ => return Err(format!("is read by `{intrinsic}`")),
             }
         }
         Ok(swapped)
@@ -1155,15 +1189,16 @@ impl<'db> FunctionCx<'_, 'db> {
     ) -> std::result::Result<(), String> {
         let db = self.cg.db;
         let Ok((body, _)) = root_body(db, func) else { return Err("its body is not known".into()) };
-        let facts = std::rc::Rc::new(Facts::new(db, body));
+        let facts = std::rc::Rc::new(Facts::new(body));
         let here = self.block.expect("the call's block");
-        let caller = Facts::new(db, self.body.expect("MIR body"));
+        let caller = Facts::new(self.body.expect("MIR body"));
         for (id, data) in body.basic_blocks.iter() {
             let Some(TerminatorKind::Call {
                 func: callee,
                 args: operands,
                 destination,
                 target,
+                intrinsic,
                 ..
             }) = data.terminator.as_ref().map(|it| &it.kind)
             else {
@@ -1172,23 +1207,23 @@ impl<'db> FunctionCx<'_, 'db> {
             let Some((callee, _)) = callee_of(callee) else {
                 return Err("it calls a pointer".into());
             };
-            let name = FunctionSignature::of(db, callee).name.as_str();
-            if !FunctionSignature::is_intrinsic(db, callee) {
+            let Some(intrinsic) = *intrinsic else {
                 let inlined =
                     self.rustc_inlines(Some(func), callee).map_err(|e| format!("{e:?}"))?;
                 if inlined != Some(false) && self.has_fma(callee).map_err(|e| format!("{e:?}"))? {
+                    let name = FunctionSignature::of(db, callee).name.as_str();
                     return Err(format!("its call of `{name}` may have one"));
                 }
                 continue;
+            };
+            match fused(intrinsic) {
+                Some(true) => {}
+                Some(false) => return Err(format!("it has a `{intrinsic}`")),
+                None => continue,
             }
-            match name {
-                "simd_fma" | "fma" | "fmaf32" | "fmaf64" => {}
-                "simd_relaxed_fma" | "fmuladdf32" | "fmuladdf64" => {
-                    return Err(format!("it has a `{name}`"));
-                }
-                _ => continue,
-            }
-            let [x, y, z] = &operands[..] else { return Err(format!("its `{name}` is odd")) };
+            let [x, y, z] = &operands[..] else {
+                return Err(format!("its `{intrinsic}` is odd"));
+            };
             let site =
                 Site { operands: [x, y, z], negated: [false; 3], destination, target: *target };
             if !self.folds(&facts, &site, id, true)? {
@@ -1259,7 +1294,7 @@ impl<'db> FunctionCx<'_, 'db> {
                         return Err(format!("its result is read by {rvalue:?}"));
                     }
                 }
-                let Some(TerminatorKind::Call { func: user, args: inputs, .. }) =
+                let Some(TerminatorKind::Call { args: inputs, intrinsic: used_by, .. }) =
                     data.terminator.as_ref().map(|it| &it.kind)
                 else {
                     continue;
@@ -1267,11 +1302,8 @@ impl<'db> FunctionCx<'_, 'db> {
                 if !inputs.iter().any(|it| plain_local(it).is_some_and(|it| held.contains(&it))) {
                     continue;
                 }
-                let shuffle = callee_of(user).is_some_and(|(f, _)| {
-                    FunctionSignature::is_intrinsic(db, f)
-                        && FunctionSignature::of(db, f).name.as_str() == "simd_shuffle"
-                });
-                if !shuffle || name != "simd_fma" {
+                let shuffle = *used_by == Some(Intrinsic::Simd(SimdOp::Shuffle));
+                if !shuffle || intrinsic != Intrinsic::Simd(SimdOp::Fma) {
                     return Err("its result goes to more than a shuffle".into());
                 }
             }
@@ -1346,26 +1378,26 @@ impl<'db> FunctionCx<'_, 'db> {
                 }
                 Some(TerminatorKind::Goto { target }) => block = *target,
                 Some(TerminatorKind::Call {
-                    func,
                     args,
                     destination,
                     target: Some(target),
+                    intrinsic,
                     ..
                 }) => {
-                    let Some((callee, _)) = callee_of(func) else { return Ok(None) };
-                    if !FunctionSignature::is_intrinsic(db, callee)
-                        || !destination.projection.as_slice().is_empty()
-                    {
+                    let Some(intrinsic) = *intrinsic else { return Ok(None) };
+                    if !destination.projection.as_slice().is_empty() {
                         return Ok(None);
                     }
-                    match (FunctionSignature::of(db, callee).name.as_str(), &args[..]) {
-                        ("simd_neg", [op]) => match local_of(op).and_then(|it| of.get(&it)) {
+                    match (intrinsic, &args[..]) {
+                        (Intrinsic::Simd(SimdOp::Neg), [op]) => match local_of(op)
+                            .and_then(|it| of.get(&it))
+                        {
                             Some(&(param, false)) => {
                                 _ = of.insert(destination.local, (param, true))
                             }
                             _ => return Ok(None),
                         },
-                        ("simd_fma", [x, y, z]) if found.is_none() => {
+                        (Intrinsic::Simd(SimdOp::Fma), [x, y, z]) if found.is_none() => {
                             let mut params = [0; 3];
                             let mut negated = [false; 3];
                             for (i, op) in [x, y, z].into_iter().enumerate() {
@@ -1410,8 +1442,8 @@ fn rustc_inlines_at(
             hir_ty::TargetFeatures::from_fn(db, caller),
             hir_ty::TargetFeatures::from_fn(db, callee),
         );
-        let differ = mine.iter().any(|it| !enabled_there.enables(it.as_str()))
-            || theirs.iter().any(|it| !enabled.enables(it.as_str()));
+        let differ = mine.iter().any(|it| !enabled_there.enables_name(it.as_str()))
+            || theirs.iter().any(|it| !enabled.enables_name(it.as_str()));
         return Ok(if differ { Some(false) } else { None });
     }
     // Not generic, so only what is `#[inline]` is inlined across crates and within one.
@@ -1511,14 +1543,14 @@ fn inline_cost<'db>(
         }
         let kind = &data.terminator.as_ref().expect("a reached block's end").kind;
         cost += match kind {
-            TerminatorKind::Call { func: callee, args, cleanup, .. } => {
+            TerminatorKind::Call { func: callee, args, cleanup, intrinsic, .. } => {
                 if args.iter().any(operand_projected) {
                     return Ok(None);
                 }
                 let Some((callee, _)) = callee_of(callee) else { return Ok(None) };
                 let unwinds = cleanup.is_some() && !AttrFlags::is_rustc_nounwind(db, callee);
                 let pad = if unwinds { 50 } else { 0 };
-                if FunctionSignature::is_intrinsic(db, callee) {
+                if intrinsic.is_some() {
                     5 + pad
                 } else if rustc_inlines_at(db, Some(func), callee, depth + 1)? == Some(false) {
                     25 + pad
@@ -1547,24 +1579,14 @@ fn inline_cost<'db>(
 fn reaches_fma(db: &dyn HirDatabase, func: FunctionId) -> bool {
     let Ok((body, _)) = root_body(db, func) else { return false };
     for (_, data) in body.basic_blocks.iter() {
-        let Some(TerminatorKind::Call { func: callee, .. }) =
+        let Some(TerminatorKind::Call { func: callee, intrinsic, .. }) =
             data.terminator.as_ref().map(|it| &it.kind)
         else {
             continue;
         };
         let Some((callee, _)) = callee_of(callee) else { continue };
-        if FunctionSignature::is_intrinsic(db, callee) {
-            let name = FunctionSignature::of(db, callee).name.as_str();
-            if matches!(
-                name,
-                "simd_fma"
-                    | "simd_relaxed_fma"
-                    | "fma"
-                    | "fmaf32"
-                    | "fmaf64"
-                    | "fmuladdf32"
-                    | "fmuladdf64"
-            ) {
+        if let Some(intrinsic) = *intrinsic {
+            if fused(intrinsic).is_some() {
                 return true;
             }
         } else if !rustc_inlines_at(db, Some(func), callee, 0).is_ok_and(|it| it == Some(false))
@@ -1574,4 +1596,50 @@ fn reaches_fma(db: &dyn HirDatabase, func: FunctionId) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fma_intrinsics_go_as_their_names_did() {
+        let of = |name: &str| Intrinsic::from_symbol(&intern::Symbol::intern(name));
+        // `fma`/`fmaf32`/`fmaf64` and `simd_fma` fused and were selected after an fma;
+        // `fmuladd*` and `simd_relaxed_fma` were refused, and unknown after an fma.
+        for (name, intrinsic, fuses, step) in [
+            ("fma", Intrinsic::Fma, Some(true), Step::Selected),
+            ("simd_fma", Intrinsic::Simd(SimdOp::Fma), Some(true), Step::Selected),
+            ("fmuladd", Intrinsic::Fmuladd, Some(false), Step::Unknown),
+            ("simd_relaxed_fma", Intrinsic::Simd(SimdOp::RelaxedFma), Some(false), Step::Unknown),
+        ] {
+            assert_eq!(of(name), Some(intrinsic), "{name}");
+            assert_eq!(intrinsic.to_string(), name);
+            assert_eq!(fused(intrinsic), fuses, "{name}");
+            assert_eq!(intrinsic_step(intrinsic), Some(step), "{name}");
+        }
+        for gone in ["fmaf32", "fmaf64", "fmuladdf32", "fmuladdf64"] {
+            assert_eq!(of(gone), None, "{gone}");
+        }
+    }
+
+    #[test]
+    fn what_follows_an_fma() {
+        for op in [SimdOp::Insert, SimdOp::Extract, SimdOp::Shuffle, SimdOp::SelectBitmask] {
+            assert_eq!(intrinsic_step(Intrinsic::Simd(op)), Some(Step::Fails), "{op:?}");
+        }
+        assert_eq!(intrinsic_step(Intrinsic::Simd(SimdOp::Select)), Some(Step::Fails));
+        assert_eq!(intrinsic_step(Intrinsic::Simd(SimdOp::Neg)), None);
+        for other in [
+            Intrinsic::Simd(SimdOp::Add),
+            Intrinsic::Simd(SimdOp::InsertDyn),
+            Intrinsic::Simd(SimdOp::ExtractDyn),
+            Intrinsic::Sqrt,
+            Intrinsic::Transmute,
+            Intrinsic::Atomic(AtomicOp::Load),
+        ] {
+            assert_eq!(intrinsic_step(other), Some(Step::Unknown), "{other}");
+            assert_eq!(fused(other), None, "{other}");
+        }
+    }
 }

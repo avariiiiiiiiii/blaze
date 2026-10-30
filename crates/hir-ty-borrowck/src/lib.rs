@@ -37,6 +37,7 @@ pub mod timings;
 use std::sync::LazyLock;
 
 use base_db::Crate;
+use blaze_ids::radix;
 use hir_def::{
     DefWithBodyId, HasModule,
     expr_store::ExpressionStore,
@@ -593,7 +594,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
             if let Some(data) = infer.closures_data.get(&expr) {
                 let mut locals: Vec<LocalId> =
                     body.upvar_locals.values().flatten().map(|(local, _)| *local).collect();
-                locals.sort_by_key(|it| it.into_raw().into_u32());
+                radix::sort_copy_by_key(&mut locals, |it| it.into_raw().into_u32());
                 for (capture, local) in data.min_captures.values().flatten().zip(locals) {
                     upvars.push(Upvar {
                         binding: capture.captured_local(),

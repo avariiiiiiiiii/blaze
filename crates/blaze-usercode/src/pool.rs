@@ -14,7 +14,7 @@
 use std::{collections::HashMap, ffi::OsString, path::PathBuf};
 
 use blaze_core::{Address, Command, Completion, Conn, Done, Effect, Exit, FileName, IoError, Sandbox, Tag};
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::{ContentId, Hasher, radix};
 use rustc_hash::FxHashMap;
 
 use crate::confine::LIVE;
@@ -237,7 +237,7 @@ impl Pool {
     /// Stops every process: the daemon is ending.
     pub fn stop_all(&mut self, effects: &mut Vec<Effect>) {
         let mut servers: Vec<Server> = self.servers.keys().copied().collect();
-        servers.sort_unstable();
+        radix::sort_copy_by_key(&mut servers, |it| it.0);
         for server in servers {
             self.stop(server, effects);
         }

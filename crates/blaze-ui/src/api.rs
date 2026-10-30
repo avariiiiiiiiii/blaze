@@ -8,8 +8,8 @@
 use std::fmt;
 
 use blaze_api::{
-    Diagnostic, FetchVerb, Level, LinkKind, Ranked, Response, TestOutcome, TestResult, Traced,
-    Verb, Worked,
+    Diagnostic, FetchVerb, How, Level, LinkKind, Ranked, Response, TestOutcome, TestResult,
+    Traced, Verb, Worked,
 };
 use blaze_ids::ContentId;
 use blaze_query::QueryKey;
@@ -102,6 +102,14 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 put!(out, "{name}: {elements} elements, {bytes} bytes\n");
             }
         }
+        Response::Edited(edited) => {
+            let (items, ops) = (edited.items.len(), edited.ops.len());
+            put!(out, "{} {items} items, {ops} ops\n", status("Edited"));
+            for item in &edited.items {
+                put!(out, "  {} {}: {}\n", how_word(item.how), item.file, item.path);
+            }
+        }
+        Response::Announced { root } => put!(out, "{} {root}\n", status("Announced")),
         Response::TestResult(result) => test_lines(out, result, color),
         Response::Ran { code, stdout, stderr } => {
             bytes(out, stdout);
@@ -210,6 +218,19 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 put!(out, "  {head} {root}\n");
             }
         }
+    }
+}
+
+fn how_word(how: How) -> &'static str {
+    match how {
+        How::Body => "body",
+        How::Signature => "signature",
+        How::Fields => "fields",
+        How::Whole => "whole",
+        How::Added => "added",
+        How::Removed => "removed",
+        How::Renamed => "renamed",
+        How::Scope => "scope",
     }
 }
 
@@ -572,6 +593,26 @@ mod tests {
     fn a_successful_end_says_nothing() {
         assert_eq!(lines(&Response::Done { ok: true }, false), "");
         assert_eq!(lines(&Response::Done { ok: false }, false), "failed\n");
+    }
+
+    #[test]
+    fn an_edit_lists_what_it_changed_and_an_intent_its_root() {
+        let item = |how, path: &str| blaze_api::EditedItem {
+            how,
+            key: None,
+            file: "src/lib.rs".to_owned(),
+            path: path.to_owned(),
+        };
+        let edited = blaze_api::Edited {
+            ops: Vec::new(),
+            items: vec![item(How::Body, "fn parse"), item(How::Added, "struct Token")],
+        };
+        assert_eq!(
+            lines(&Response::Edited(edited), false),
+            "      Edited 2 items, 0 ops\n  body src/lib.rs: fn parse\n  added src/lib.rs: struct Token\n"
+        );
+        let root = ContentId([2; 32]);
+        assert_eq!(lines(&Response::Announced { root }, false), format!("   Announced {root}\n"));
     }
 
     #[test]

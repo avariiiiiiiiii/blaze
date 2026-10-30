@@ -22,6 +22,7 @@ use std::{
 use blake3::hazmat::{self, ContextKey, HasherExt};
 use serde::{Deserialize, Serialize};
 
+mod many;
 pub mod names;
 pub mod radix;
 
@@ -47,18 +48,14 @@ impl ContentId {
         hasher.finish()
     }
 
-    /// `inputs.iter().map(|it| ContentId::of(domain, it))`, the domain's context key looked up
-    /// once for all of them.
+    /// `inputs.iter().map(|it| ContentId::of(domain, it))`, many inputs a SIMD lane each.
+    ///
+    /// An input of at most one BLAKE3 chunk (1 KiB) is hashed as one chunk: its blocks
+    /// before the last go through `hash_many` beside the other inputs with as many (AVX-512
+    /// hashes 16 at once, NEON 4), and its last block is one compression as the root. A
+    /// longer input goes through the hasher, which uses SIMD within it.
     pub fn of_many(domain: &'static str, inputs: &[&[u8]]) -> Vec<ContentId> {
-        let key = context_key(domain);
-        inputs
-            .iter()
-            .map(|input| {
-                let mut hasher = blake3::Hasher::new_from_context_key(key);
-                hasher.update(input);
-                ContentId(*hasher.finalize().as_bytes())
-            })
-            .collect()
+        many::of_many(context_key(domain), inputs)
     }
 
     /// The first 128 bits, as a result's fingerprint.
@@ -138,7 +135,7 @@ fn context_key(domain: &'static str) -> &'static ContextKey {
             Some(entry) => entry,
             None => slot.get_or_init(|| (domain, hazmat::hash_derive_key_context(domain))),
         };
-        if *name == domain {
+        if std::ptr::eq(*name, domain) || *name == domain {
             return key;
         }
         at = (at + 1) & (DOMAIN_SLOTS - 1);
@@ -334,8 +331,21 @@ struct Shard {
     len: AtomicU32,
     /// Which of `tables` is the one in use.
     level: AtomicUsize,
-    /// A place holds an index plus one; 0 is empty.
-    tables: [OnceLock<Box<[AtomicU32]>>; TABLES],
+    /// A place holds [`entry`]: an index plus one in its low half (0 is empty) and the ID's
+    /// [`tag`] in its high half, so a probe compares the tag in the table and reads a value
+    /// only on a match, and growing never reads a value. 8 bytes a place, at most half full;
+    /// a find is one acquire load per place probed, about 1.5 at that load.
+    tables: [OnceLock<Box<[AtomicU64]>>; TABLES],
+}
+
+/// Bits 64..96 of the ID: where its probe starts (masked to the table) and the tag a place
+/// keeps of it. The shard was picked by bits 0..32, so these are independent of it.
+fn tag(id: &ContentId) -> u32 {
+    u32::from_le_bytes([id.0[8], id.0[9], id.0[10], id.0[11]])
+}
+
+fn entry(tag: u32, raw: u32) -> u64 {
+    (tag as u64) << 32 | (raw as u64 + 1)
 }
 
 fn chunk_of(raw: u32) -> (usize, usize) {
@@ -379,53 +389,48 @@ impl<T: Send + Sync> Sharded<T> {
         &self.shards[u32::from_le_bytes(word) as usize & self.mask]
     }
 
-    /// Where `id`'s probe starts: bits of the ID the shard was not picked by.
-    fn home(id: &ContentId) -> usize {
-        let mut word = [0; 8];
-        word.copy_from_slice(&id.0[8..16]);
-        u64::from_le_bytes(word) as usize
+    /// The table in use, made if the shard has none yet: for writers only.
+    fn table(shard: &Shard, level: usize) -> &[AtomicU64] {
+        shard.tables[level].get_or_init(|| (0..TABLE << level).map(|_| AtomicU64::new(0)).collect())
     }
 
-    fn table(shard: &Shard, level: usize) -> &[AtomicU32] {
-        shard.tables[level].get_or_init(|| (0..TABLE << level).map(|_| AtomicU32::new(0)).collect())
-    }
-
-    fn probe(&self, table: &[AtomicU32], id: &ContentId) -> Result<Idx<T>, usize> {
+    fn probe(&self, table: &[AtomicU64], id: &ContentId) -> Result<Idx<T>, usize> {
         let mask = table.len() - 1;
-        let mut at = Self::home(id) & mask;
+        let tag = tag(id);
+        let mut at = tag as usize & mask;
         loop {
             match table[at].load(Ordering::Acquire) {
                 0 => return Err(at),
-                plus_one => {
-                    let raw = plus_one - 1;
+                entry if (entry >> 32) as u32 == tag => {
+                    let raw = entry as u32 - 1;
                     let (content, _) = self.slot(raw).expect("a table entry before its value");
                     if content == id {
                         return Ok(Idx::from_raw(raw));
                     }
                 }
+                _ => {}
             }
             at = (at + 1) & mask;
         }
     }
 
-    /// Moves a full shard's entries into a table twice its size and makes it the one in use.
-    /// Called with the shard locked.
+    /// Moves a full shard's entries into a table twice its size and makes it the one in use,
+    /// from the tags alone. Called with the shard locked.
     fn grow(&self, shard: &Shard, level: usize) -> usize {
         assert!(level + 1 < TABLES, "a shard of more than 2^30 values");
         let old = Self::table(shard, level);
         let new = Self::table(shard, level + 1);
         let mask = new.len() - 1;
         for entry in old {
-            let plus_one = entry.load(Ordering::Relaxed);
-            if plus_one == 0 {
+            let entry = entry.load(Ordering::Relaxed);
+            if entry == 0 {
                 continue;
             }
-            let (content, _) = self.slot(plus_one - 1).expect("a table entry before its value");
-            let mut at = Self::home(content) & mask;
+            let mut at = (entry >> 32) as usize & mask;
             while new[at].load(Ordering::Relaxed) != 0 {
                 at = (at + 1) & mask;
             }
-            new[at].store(plus_one, Ordering::Relaxed);
+            new[at].store(entry, Ordering::Relaxed);
         }
         shard.level.store(level + 1, Ordering::Release);
         level + 1
@@ -469,7 +474,7 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
         }
         let table = Self::table(shard, level);
         let Err(empty) = self.probe(table, &id) else { unreachable!("interned under the lock") };
-        table[empty].store(raw + 1, Ordering::Release);
+        table[empty].store(entry(tag(&id), raw), Ordering::Release);
         shard.len.store(len + 1, Ordering::Relaxed);
         Idx::from_raw(raw)
     }
@@ -482,10 +487,11 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
         self.slot(idx.raw()).expect("an index this interner did not hand out").0
     }
 
+    /// No lock, no write and no allocation: a shard with no table yet holds nothing.
     fn find(&self, id: &ContentId) -> Option<Idx<T>> {
         let shard = self.shard(id);
         let level = shard.level.load(Ordering::Acquire);
-        self.probe(Self::table(shard, level), id).ok()
+        self.probe(shard.tables[level].get()?, id).ok()
     }
 
     fn len(&self) -> usize {
@@ -533,6 +539,49 @@ mod tests {
             assert_eq!(ContentId::of_many(domain, &inputs), expected, "{domain:?}");
         }
         assert_eq!(ContentId::of_many("blaze v2 a 1", &[]), Vec::new());
+    }
+
+    #[test]
+    fn of_many_is_the_hasher_at_every_length_and_group_size() {
+        let bytes: Vec<u8> = (0..2100u32).map(|n| (n.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        for copies in [1, 2, 3, 4, 5, 8, 16, 17, 33] {
+            let inputs: Vec<&[u8]> = (0..=1100)
+                .flat_map(|len| (0..copies).map(move |copy| (len, copy)))
+                .map(|(len, copy)| &bytes[copy * 31..copy * 31 + len])
+                .collect();
+            let many = ContentId::of_many("blaze v2 a 1", &inputs);
+            for (input, id) in inputs.iter().zip(&many) {
+                let mut expected = blake3::Hasher::new_derive_key("blaze v2 a 1");
+                expected.update(input);
+                assert_eq!(*id, ContentId(*expected.finalize().as_bytes()), "{} bytes", input.len());
+            }
+        }
+    }
+
+    #[test]
+    fn ids_of_one_tag_are_told_apart_by_their_value() {
+        let interner = Sharded::<u32>::new();
+        let mut ids = Vec::new();
+        for n in 0..200u32 {
+            let mut bytes = [0; 32];
+            bytes[..4].copy_from_slice(&7u32.to_le_bytes());
+            bytes[8..12].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+            bytes[16..20].copy_from_slice(&n.to_le_bytes());
+            ids.push(ContentId(bytes));
+        }
+        let indices: Vec<_> = ids.iter().zip(0..).map(|(&id, n)| interner.intern(id, || n)).collect();
+        for (n, (id, &idx)) in ids.iter().zip(&indices).enumerate() {
+            assert_eq!(interner.find(id), Some(idx));
+            assert_eq!(*interner.get(idx), n as u32);
+        }
+        assert_eq!(interner.len(), 200);
+    }
+
+    #[test]
+    fn a_find_in_an_empty_shard_makes_no_table() {
+        let interner = Sharded::<u8>::new();
+        assert_eq!(interner.find(&id(3)), None);
+        assert!(interner.shards.iter().all(|shard| shard.tables.iter().all(|it| it.get().is_none())));
     }
 
     #[test]

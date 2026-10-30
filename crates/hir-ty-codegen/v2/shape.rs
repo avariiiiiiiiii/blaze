@@ -22,7 +22,7 @@ use crate::{
     fragment::{self, DataRequest, Hint, RelocName, Requests},
 };
 
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 
 /// Where data is in a shape, as the names of its IR have it.
 mod namespace {
@@ -44,6 +44,7 @@ mod part {
     pub(super) const HINT: u8 = 8;
     pub(super) const VALUE: u8 = 9;
     pub(super) const SCOPES: u8 = 10;
+    pub(super) const INLINED: u8 = 11;
 }
 
 pub(crate) fn of(function: &Function) -> Result<Shape, String> {
@@ -113,6 +114,12 @@ pub(crate) fn of(function: &Function) -> Result<Shape, String> {
     variables(&mut out, &function.variables);
     out.u8(part::SCOPES);
     scopes(&mut out, &function.scopes);
+    // Equal shapes are one template, which says what its code has built in.
+    out.u8(part::INLINED);
+    out.u32(function.inlined.len() as u32);
+    for code in &function.inlined {
+        out.raw(&code.0.0);
+    }
     out.u8(part::HINT);
     out.u8(match function.hint {
         Hint::None => 0,
@@ -157,7 +164,8 @@ fn estimate(function: &Function) -> usize {
         Built::Assembled(code, _) => code.bytes.len() + 24 * code.relocs.len(),
     };
     let scopes = 5 * function.scopes.parents.len() + 5 * function.scopes.of_span.len();
-    256 + code + data + 36 * function.spans.len() + 53 * function.variables.len() + scopes
+    let inlined = 32 * function.inlined.len();
+    256 + code + data + 36 * function.spans.len() + 53 * function.variables.len() + scopes + inlined
 }
 
 /// The shape being written. As a [`Hasher`] it keeps every byte it is given: the stencil's

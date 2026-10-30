@@ -404,7 +404,7 @@ fn call(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, at: InFile<SyntaxNodePtr>) -
     };
     let missing: Vec<Symbol> = AttrFlags::target_feature_list(cx.db, id)
         .into_iter()
-        .filter(|it| !caller.enables(it.as_str()))
+        .filter(|it| !caller.enables_name(it.as_str()))
         .collect();
     let cfg = cx.krate.cfg(cx.db);
     let build_enabled = missing

@@ -35,6 +35,7 @@ base-db.workspace = true
 blaze-api.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
+blaze-phf.workspace = true
 blaze-query.workspace = true
 cfg.workspace = true
 hir.workspace = true

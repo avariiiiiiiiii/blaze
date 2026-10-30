@@ -12,6 +12,7 @@
 
 use std::collections::hash_map::Entry;
 
+use blaze_ids::radix;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -140,7 +141,7 @@ fn functions<'a>(placed: &'a Placed<'a>) -> Result<Vec<Unit<'a>>, String> {
     for region in placed.regions.iter().filter(|it| it.class == Class::Synthetic(FUNCTIONS)) {
         units.push(Unit { addr: region.addr, name: Some("__wasm_call_ctors"), header: None });
     }
-    units.sort_unstable_by_key(|it| it.addr);
+    radix::sort_by_key(&mut units, |it| it.addr);
     if let Some(pair) = units.windows(2).find(|it| it[0].addr == it[1].addr) {
         return Err(format!("two functions at {} in the code space", pair[0].addr));
     }
@@ -594,7 +595,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         .filter(|(_, it)| matches!(it.class, Class::Named { write: false, exec: false, .. }))
         .map(|(index, it)| (it.addr, index))
         .collect();
-    by_addr.sort_unstable();
+    radix::sort_copy_by_key(&mut by_addr, |&(addr, index)| radix::pack_64(addr, index as u64));
     let mut customs: Vec<(&str, Vec<&[u8]>)> = Vec::with_capacity(by_addr.len());
     let mut last: Vec<(&str, Vec<&[u8]>)> = Vec::new();
     let mut custom_at: FxHashMap<&str, (bool, usize)> = FxHashMap::default();

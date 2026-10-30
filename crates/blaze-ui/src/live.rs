@@ -6,8 +6,7 @@
 //! screen shows after each draw is what clearing the region and writing it whole would
 //! show (tests: `the_diffed_region_shows_what_redrawing_it_whole_did`).
 
-use std::cmp::Reverse;
-
+use blaze_ids::radix;
 use blaze_protocol::events::{CrateState, Record};
 
 use crate::{
@@ -642,7 +641,7 @@ impl Pen<'_> {
                     deps.push((krate(dep).busy_ns(now_ns), place as u32, dep));
                 }
             }
-            deps.sort_unstable_by_key(|&(busy, place, _)| (Reverse(busy), place));
+            radix::sort_copy_by_key(&mut deps, |&(busy, place, _)| radix::pack_64(!busy, u64::from(place)));
             // Deeper than this, a chain goes on at the same indent.
             let indent = match last {
                 Some(last) if indent.depth < Indent::MOST => indent.with(last),

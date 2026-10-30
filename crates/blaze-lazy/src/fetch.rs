@@ -24,6 +24,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use blaze_ids::radix;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::LazyId;
@@ -246,7 +247,7 @@ impl Fetcher {
     /// The functions whose compile failed, by id, with why.
     pub fn failures(&self) -> impl Iterator<Item = (LazyId, &str)> {
         let mut ids: Vec<u32> = self.failures.keys().copied().collect();
-        ids.sort_unstable();
+        radix::sort(&mut ids);
         ids.into_iter().map(|id| (LazyId(id), &*self.failures[&id]))
     }
 

@@ -84,6 +84,51 @@ impl Ns {
     }
 }
 
+const _: () = assert!(size_of::<Ns>() == 1 && size_of::<Used>() == 1 && size_of::<TreeKind>() == 1);
+
+/// A set of small indices (a `use` item's trees, a macro's rules): one bit each, one inline
+/// word up to 64. Insert, remove and test are O(1); iteration is one `trailing_zeros` per
+/// member, in ascending order.
+#[derive(Default)]
+pub(super) struct Bits(SmallVec<[u64; 1]>);
+
+impl Bits {
+    pub(super) fn insert(&mut self, i: usize) {
+        let word = i / 64;
+        if self.0.len() <= word {
+            self.0.resize(word + 1, 0);
+        }
+        self.0[word] |= 1 << (i % 64);
+    }
+
+    pub(super) fn remove(&mut self, i: usize) {
+        if let Some(word) = self.0.get_mut(i / 64) {
+            *word &= !(1 << (i % 64));
+        }
+    }
+
+    pub(super) fn contains(&self, i: usize) -> bool {
+        self.0.get(i / 64).is_some_and(|word| word & (1 << (i % 64)) != 0)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.iter().all(|it| *it == 0)
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().flat_map(|(word, &bits)| {
+            let mut bits = bits;
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    word * 64 + bit
+                })
+            })
+        })
+    }
+}
+
 /// What a name is in one namespace of a scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Entry {
@@ -177,6 +222,11 @@ pub(super) struct ExternCrate {
 }
 
 /// What the crate's name resolution goes through.
+///
+/// Built once per crate. Each set and map is one FxHash probe per query; `by_module`, `globs`
+/// and `trees` point into `items` by `u32` index, so a module's imports or a binding's tree
+/// cost one probe and no scan. `lookups` memoizes scope lookups, hashed once over the
+/// borrowed key: a hit allocates nothing.
 pub(super) struct Uses {
     /// The `use` items, in the order rustc's walk comes to them.
     pub(super) items: Vec<UseItem>,
@@ -200,7 +250,7 @@ pub(super) struct Uses {
     /// The macros invoked: by a call, an attribute or a derive.
     pub(super) macros: FxHashSet<MacroId>,
     /// The rules of each `macro_rules!` a call matched.
-    pub(super) arms: FxHashMap<MacroId, FxHashSet<u32>>,
+    pub(super) arms: FxHashMap<MacroId, Bits>,
     /// The macros invoked where which rule matched can't be told.
     pub(super) arms_unknown: FxHashSet<MacroId>,
     /// The names of macro calls that don't resolve: a macro of such a name may be used.
@@ -739,7 +789,7 @@ impl Uses {
                     self.macros.insert(id);
                     match cx.sema.resolve_macro_call_arm(&call) {
                         Some(arm) => {
-                            self.arms.entry(id).or_default().insert(arm);
+                            self.arms.entry(id).or_default().insert(arm as usize);
                         }
                         None => {
                             self.arms_unknown.insert(id);

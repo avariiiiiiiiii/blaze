@@ -18,7 +18,7 @@ use blaze_core::{Command, Sandbox};
 
 use crate::channel::Channel;
 use crate::frame::{Reader, Writer, kinds};
-use crate::load::{HOST_VAR, VERSION};
+use crate::load::{GRANT_CODE, GRANT_CONTROL, Grant, HOST_VAR, VERSION};
 use crate::sys::{self, Rights};
 use crate::{Access, CodeMemory, Error, FixedMap, Format, TlsReserve};
 
@@ -56,7 +56,6 @@ type Table = Arc<Mutex<HashMap<[u8; 16], Waiting>>>;
 pub struct Host {
     loader: PathBuf,
     address: String,
-    dir: PathBuf,
     reserve: TlsReserve,
     waiting: Table,
 }
@@ -73,7 +72,7 @@ impl Host {
             .name("blaze-inproc host".to_owned())
             .spawn(move || accept(listener, table))
             .map_err(|it| Error::new(format!("starting the host's thread: {it}")))?;
-        Ok(Host { loader, address, dir: dir.to_owned(), reserve, waiting })
+        Ok(Host { loader, address, reserve, waiting })
     }
 
     /// The command that prints the loader's thread-local reserve ([`TlsReserve::decode`]),
@@ -128,20 +127,23 @@ impl Host {
             };
             maps.push((index as u32, map));
         }
-        let mut grant = Vec::with_capacity(64 + 40 * maps.len());
-        let mut out = Writer::new(&mut grant);
-        out.u8(launch.format.tag()).u64(launch.image.base().unwrap_or(0)).u64(launch.image.image_len());
-        out.u32(objects.len() as u32);
-        for (object, rights) in &objects {
-            out.u64(object.len()).u8(match rights {
-                Rights::Code => 1,
-                Rights::Control => 2,
-            });
+        let mut grant = Vec::new();
+        Grant {
+            format: launch.format,
+            base: launch.image.base().unwrap_or(0),
+            image_len: launch.image.image_len(),
+            objects: objects
+                .iter()
+                .map(|(object, rights)| {
+                    (object.len(), match rights {
+                        Rights::Code => GRANT_CODE,
+                        Rights::Control => GRANT_CONTROL,
+                    })
+                })
+                .collect(),
+            maps: maps.iter().map(|(object, map)| (*object, map.range.offset, map.range.len, map.at, map.access)).collect(),
         }
-        out.u32(maps.len() as u32);
-        for (object, map) in &maps {
-            out.u32(*object).u64(map.range.offset).u64(map.range.len).u64(map.at).u8(map.access.tag());
-        }
+        .encode(&mut grant);
 
         let mut token = [0u8; 16];
         sys::random(&mut token)?;
@@ -162,9 +164,13 @@ impl Host {
             Sandbox::On { read, write, network, trace } => {
                 let mut read = read.clone();
                 read.push(self.loader.clone());
-                read.push(self.dir.clone());
+                // Connecting to a Unix socket is a write of the socket alone: the program gets
+                // neither the directory nor the other runs' sockets in it. A named pipe is not
+                // a path the sandbox's file rules cover.
                 let mut write = write.clone();
-                write.push(self.dir.clone());
+                if cfg!(unix) {
+                    write.push(PathBuf::from(&self.address));
+                }
                 Sandbox::On { read, write, network: *network, trace: *trace }
             }
         };

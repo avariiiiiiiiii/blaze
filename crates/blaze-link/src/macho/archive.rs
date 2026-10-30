@@ -4,7 +4,7 @@
 
 use object::read::archive::{ArchiveFile, ArchiveKind};
 
-use crate::model::{Archive, Member, Names};
+use crate::model::{Archive, Member, Name, Names};
 
 /// A BSD `ar` archive (as Apple's `libtool`/`ar` write it, `#1/<len>` long names) or a GNU one,
 /// with its `__.SYMDEF`/`__.SYMDEF SORTED`/`__.SYMDEF_64` index (a GNU `/` index too).
@@ -37,7 +37,7 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
     let mut index_bytes = 0;
     for symbol in symbols.clone() {
         let raw = symbol.map_err(|e| format!("{name}: {e}"))?.name();
-        if by_offset.insert(raw.as_ptr() as usize - bytes.as_ptr() as usize, None).is_none() {
+        if by_offset.insert((raw.as_ptr() as usize).wrapping_sub(bytes.as_ptr() as usize), None).is_none() {
             index_bytes += raw.len() + 1;
         }
     }
@@ -73,10 +73,14 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
             format!("{name}: the index puts {shown} at offset {}, which is no member", symbol.offset().0)
         })?;
         let raw = symbol.name();
-        let slot = by_offset.entry(raw.as_ptr() as usize - bytes.as_ptr() as usize).or_default();
+        let slot = by_offset.entry((raw.as_ptr() as usize).wrapping_sub(bytes.as_ptr() as usize)).or_default();
         let core = match *slot {
             Some(core) => core,
-            None => *slot.insert(super::push_core_name(&mut names, raw).map_err(|e| format!("{name}: {e}"))?),
+            None => {
+                let core = super::push_core_name(&mut names, raw).map_err(|e| format!("{name}: {e}"))?;
+                *slot = Some(core);
+                core
+            }
         };
         index.push((core, found as u32));
     }
@@ -246,6 +250,23 @@ mod tests {
         bytes[at..at + 4].copy_from_slice(&(offset + 2).to_le_bytes());
         let error = read("libx.a", &bytes).unwrap_err();
         assert!(error.contains("_a") && error.contains("no member"), "{error}");
+    }
+
+    #[test]
+    fn entries_naming_one_string_share_its_name() {
+        let long = format!("_{}", "x".repeat(4095));
+        let symbols: Vec<(&str, usize)> = vec![(long.as_str(), 0); 640];
+        let mut bytes = bsd(&[("a.o", &b"aaaa"[..])], &symbols);
+        // Every entry's string offset (the first word of each) to the first string's.
+        let ranlib = 8 + 60 + ("__.SYMDEF SORTED".len() + 1).next_multiple_of(8) + 4;
+        for i in 0..symbols.len() {
+            bytes[ranlib + 8 * i..ranlib + 8 * i + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let archive = read("libsame.a", &bytes).unwrap();
+        assert_eq!(archive.index.len(), 640);
+        assert!(archive.index.iter().all(|it| *it == archive.index[0]), "one `Name` for one string");
+        assert_eq!(archive.name(archive.index[0].0), core(&long));
+        assert_eq!(archive.names.bytes(), "a.o".len() + core(&long).len());
     }
 
     #[test]

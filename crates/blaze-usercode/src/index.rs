@@ -157,8 +157,8 @@ pub fn result_key(run: &RunKey, traced: &Traced) -> Key {
 /// What [`find`] found.
 #[derive(Debug)]
 pub enum Found<'s> {
-    /// A result whose every input is as it is now: what was read, and the value kept.
-    Hit { traced: Traced, key: Key, value: &'s [u8] },
+    /// A result whose every input is as it is now: its key, and the value kept, in place.
+    Hit { key: Key, value: &'s [u8] },
     /// No result of a shape the run has had is for the inputs as they are now; `shapes` is
     /// how many it has had.
     Miss { shapes: u32 },
@@ -319,8 +319,9 @@ mod tests {
             fn env(&mut self, name: &OsStr) -> Option<OsString> {
                 self.0.iter().find(|it| it.0 == name).map(|it| it.1.clone())
             }
-            fn env_all(&mut self) -> Vec<(OsString, OsString)> {
-                self.0.clone()
+            fn env_all(&mut self) -> &[(OsString, OsString)] {
+                self.0.sort();
+                &self.0
             }
             fn names(&mut self, _: &Path) -> Result<Option<Vec<(OsString, bool)>>, ()> {
                 Ok(None)

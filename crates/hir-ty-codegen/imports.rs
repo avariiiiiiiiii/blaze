@@ -245,7 +245,7 @@ fn build(
         // Drop glue is built from the type it drops, and has no MIR.
         let body = match instance.def {
             InstanceDef::DropGlue => None,
-            _ => Some(super::instance_body(db, instance, env.clone()).ok()?),
+            _ => Some(super::instance_body(db, instance, env.clone(), None).ok()?),
         };
         let mut cg = Recorder::new(
             db,

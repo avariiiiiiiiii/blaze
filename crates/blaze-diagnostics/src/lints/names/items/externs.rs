@@ -655,7 +655,7 @@ fn adt_source(db: &dyn hir::db::HirDatabase, adt: AdtId) -> InFile<SyntaxNode> {
 }
 
 /// The ABI an `extern` block or a `fn` pointer type is written with, `None` if it is not one.
-fn abi_of(abi: Option<ast::Abi>, default: ExternAbi) -> Option<ExternAbi> {
+pub(super) fn abi_of(abi: Option<ast::Abi>, default: ExternAbi) -> Option<ExternAbi> {
     let Some(abi) = abi else { return Some(default) };
     match abi.abi_string() {
         Some(it) => ExternAbi::from_str(&it.value().ok()?).ok(),

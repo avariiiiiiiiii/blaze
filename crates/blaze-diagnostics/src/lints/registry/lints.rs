@@ -1,6 +1,9 @@
 //! The lints of rustc's `declare_lint!`s, in the order `register_builtins` registers them: the
 //! pre-expansion pass's, the early pass's, the late module pass's (each in its passes' order),
 //! `foreign_modules`', then `rustc_lint_defs`' hardwired ones.
+//!
+//! These are `const`s so that the registry numbers and indexes them as blaze is built; the
+//! lints with their ids are `index::ALL`'s, which is where every `&'static Lint` points.
 
 use span::Edition::{Edition2018, Edition2021, Edition2024};
 
@@ -17,7 +20,7 @@ const fn l(name: &'static str, level: super::Level, desc: &'static str) -> Lint 
     Lint::new(name, level, desc)
 }
 
-pub(super) static BUILTIN: &[Lint] = &[
+pub(super) const BUILTIN: &[Lint] = &[
     // BuiltinCombinedPreExpansionLintPass
     l("keyword_idents_2018", Allow, "detects edition keywords being used as an identifier")
         .fcw(EditionError(Edition2018, "new-keywords")),
@@ -890,7 +893,7 @@ pub(super) static BUILTIN: &[Lint] = &[
 
 /// The lints of the tool `blaze`, blaze's own (docs/fn-cache.md), always registered: rustc
 /// has none of them.
-pub(super) static BLAZE: &[Lint] = &[l(
+pub(super) const BLAZE: &[Lint] = &[l(
     "blaze::const_impure",
     Warn,
     "detects a `#[blaze::cache]` function whose result depends on more than its arguments",
@@ -898,7 +901,7 @@ pub(super) static BLAZE: &[Lint] = &[l(
 
 /// Lints rustc declares and never registers: an attribute can't name them, but
 /// `private_macro_use` is still emitted by name resolution at its default level.
-pub(super) static UNREGISTERED: &[Lint] = &[
+pub(super) const UNREGISTERED: &[Lint] = &[
     l(
         "private_macro_use",
         Deny,
@@ -914,7 +917,7 @@ pub(super) static UNREGISTERED: &[Lint] = &[
 ];
 
 /// `register_internals`: the internal early pass's, then the internal late pass's.
-pub(super) static INTERNAL: &[Lint] = &[
+pub(super) const INTERNAL: &[Lint] = &[
     l(
         "rustc::lint_pass_impl_without_macro",
         Allow,

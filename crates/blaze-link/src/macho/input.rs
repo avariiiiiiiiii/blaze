@@ -664,7 +664,7 @@ impl Reader<'_> {
                     x86_64_name(r.r_type)
                 ));
             }
-            let target = (self.inputs[s].addr + at)
+            let target = (self.inputs[s].addr.wrapping_add(at))
                 .wrapping_add((4 + tail) as u64)
                 .wrapping_add_signed(implicit);
             let (symbol, extra) = self.at_address(r.r_symbolnum, target)?;
@@ -933,7 +933,7 @@ impl Reader<'_> {
             match encoding & 0x70 {
                 0x10 => {
                     let value = self.read(s, at as u64, length, true)?;
-                    let target = (self.inputs[s].addr + at as u64).wrapping_add_signed(value);
+                    let target = (self.inputs[s].addr.wrapping_add(at as u64)).wrapping_add_signed(value);
                     if by_addr.is_none() {
                         by_addr = Some(self.by_addr()?);
                     }

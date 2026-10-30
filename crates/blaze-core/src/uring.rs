@@ -44,6 +44,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -1570,7 +1571,7 @@ impl Uring {
         // Timers need no ring, but end with it as everything in flight does.
         self.timers.drain(|_, tag| self.ready.push(failed(tag)));
         let mut spawns: Vec<(Tag, Spawning)> = self.spawns.drain().collect();
-        spawns.sort_unstable_by_key(|it| it.0);
+        radix::sort_by_key(&mut spawns, |it| it.0.0);
         for (tag, mut spawn) in spawns {
             if !spawn.exited {
                 _ = kill(spawn.pidfd.as_raw_fd());
@@ -1579,7 +1580,7 @@ impl Uring {
             self.ready.push(Completion { tag, done: spawn.end() });
         }
         let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
-        conns.sort_unstable();
+        radix::sort_copy_by_key(&mut conns, |it| it.0);
         for conn in conns {
             let conn = self.conns.get_mut(&conn).expect("listed");
             for (tag, _) in conn.recvs.drain(..) {

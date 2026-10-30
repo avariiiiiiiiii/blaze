@@ -1678,17 +1678,16 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
             },
         };
 
-        // The creating query is keyed by content including the parent and the declaration, so
-        // every revision in which a value naming this id is live re-creates it and salsa keeps it
+        // The creating query is keyed by content including the parent, so every revision in
+        // which a value naming this id is live re-creates it and salsa keeps it
         // (nameres-core.md §3).
-        let module = crate::ModuleIdLt::new(
+        let module = super::queries::child_module(
             db,
             self.cx.krate,
             self.sink.def_map().block_id(),
-            Some(self.module_id),
+            self.module_id,
             name,
-        )
-        .to_static();
+        );
         let inherited = textual_scope(self.sink.def_map().module(db, self.module_id).scope(db));
         let parent = self.module_id;
         self.sink.apply(DeclOp::PushChild { parent, name, child: module });

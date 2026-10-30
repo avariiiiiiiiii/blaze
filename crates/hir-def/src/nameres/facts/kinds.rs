@@ -29,6 +29,7 @@ blaze_query::query_kinds! {
     ROUND_KIND = 0x2216, "round_kind";
     ROW = 0x2217, "row";
     ROUND_ACTIVE = 0x2218, "round_active";
+    CHILD_MODULE = 0x2219, "child_module";
 }
 
 #[cfg(test)]

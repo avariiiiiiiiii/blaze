@@ -52,7 +52,7 @@ use crate::{
     ExternCrateId, ExternCrateLoc, FunctionLoc, FxIndexMap, ImplId, ImplLoc, Intern,
     ItemContainerId, Lookup,
     Macro2Loc, MacroExpander, MacroId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId,
-    ModuleIdLt, ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseId,
+    ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseId,
     UseLoc,
     builtin_derive::BuiltinDeriveImplTrait,
     builtin_type::BuiltinType,
@@ -3297,8 +3297,7 @@ impl Dec<'_> {
             let parent = *self.own.get(parent).ok_or("a module before its parent")?;
             // clone: the decoded map's own storage, once per crate served
             let name = name.clone().ok_or("a module with no name")?;
-            // The ids go only into the `DefMap` the def-map query reading this frozen map returns.
-            let module = ModuleIdLt::new(db, krate, None, Some(parent), name).to_static();
+            let module = super::facts::queries::child_module(db, krate, None, parent, name);
             self.own.push(module);
         }
         let mut table = super::ModulesMap::new();
@@ -3649,7 +3648,9 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
         let bytes = frozen();
         let live = fixture::db(FIXTURE).into_db();
         let served = with(Mode::Serve, &bytes);
-        let main = |db: &TestDB| super::super::crate_def_map(db, crate_named(db, "main"));
+        fn main(db: &TestDB) -> &super::super::DefMap {
+            super::super::crate_def_map(db, crate_named(db, "main"))
+        }
         let records = main(&live).name_records(&live);
         assert!(!records.uses.is_empty() && !records.glob_targets.is_empty());
         assert!(!records.macro_calls.is_empty() && !records.not_introducing.is_empty());

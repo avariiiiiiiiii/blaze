@@ -374,6 +374,21 @@ pub(crate) fn crate_root(db: &Db, krate: Crate) -> ModuleId {
         .to_static()
 }
 
+/// The id of the module `name` in `parent`, in `krate`'s def map or `block`'s. Created here, keyed
+/// by what names the module, so every collection that finds it shares it: a def-map query's,
+/// and the name-resolution maintainer's, which runs in no query and so can make no tracked
+/// struct itself.
+#[salsa::tracked(returns(copy))]
+pub(crate) fn child_module(
+    db: &Db,
+    krate: Crate,
+    block: Option<crate::BlockId>,
+    parent: ModuleId,
+    name: Name,
+) -> ModuleId {
+    crate::ModuleIdLt::new(db, krate, block, Some(parent), name).to_static()
+}
+
 /// The crate attributes of the root file (`seed_with_top_level`'s first part).
 #[salsa::tracked(returns(ref))]
 pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {

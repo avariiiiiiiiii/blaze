@@ -3525,16 +3525,13 @@ impl<'db> ModCollector<'_, 'db> {
             },
         };
 
-        // The id goes only into the `DefMap` this def-map query builds, so it lives as long as the
-        // query's result.
-        let module = crate::ModuleIdLt::new(
+        let module = super::facts::queries::child_module(
             self.def_collector.db,
             self.def_collector.def_map.krate,
             self.def_collector.def_map.block_id(),
-            Some(self.module_id),
+            self.module_id,
             name,
-        )
-        .to_static();
+        );
         let def_map = &mut self.def_collector.def_map;
         let modules = def_map.modules.building();
         let mut data = ModuleData::new(origin, vis, Some(self.module_id));

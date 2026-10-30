@@ -824,7 +824,7 @@ blaze_format::record! {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum FieldsShape {
     Record,
     Tuple,

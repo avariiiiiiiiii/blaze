@@ -156,7 +156,7 @@ What it leaves to a person, and prints at the end:
 3. `uv run --frozen python harness/toolchain_bump.py checks '{}'` in an ix VM, under Cranelift and under LLVM
    (in `nix develop`, with `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`). It builds
    blaze and runs, in parallel, `toolchain_pins.py` and the gate's quick parts.
-4. The full tier re-measured at the new commit: `libsuite.py` and the crates' own test suites.
+4. The full tier re-measured at the new commit: the train and the crates' own test suites.
 5. One commit for the bump, landed like any other change.
 
 A blaze built before the bump refuses the new nightly until it is rebuilt, since the two
@@ -191,8 +191,8 @@ did about it in one line.
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
   you did not run. CI's merge gate is the build and the unit tests on Linux x86-64, and
   `blaze check --workspace` with the released blaze on Linux x86-64 and macOS; every
-  harness on every platform, Windows too, and the slow ones (`wholeprogram.py`, `keys.py`,
-  the store, `blaze_cli.py` on real projects) run in the release train on
+  harness on every platform, Windows too, and the slow ones (`norustc.py`, the store,
+  `blaze_cli.py` on real projects) run in the release train on
   main after the merge, and a red train opens or adds to the issue "Release train is red",
   with the commits since the last green one ([harness.md](harness.md#ci)). The gate letting a
   change through is not the harnesses passing on it.

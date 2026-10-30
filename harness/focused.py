@@ -1,6 +1,6 @@
 """focused.py: named harnesses of ci.py, alone, against one build (focused.yaml).
 
-    focused.py parts '{"harnesses": ["anonstatics.py", "worktrees.py --overlay"]}'
+    focused.py parts '{"harnesses": ["anonstatics.py", "coldbuild.py statics"]}'
         CI's matrix for this machine, as ci.py's `parts` gives it: {"include": [{"backend",
         "part": "focused", "apt"}, ...]}, one entry per backend that runs any of them here.
     focused.py run '{"harnesses": ["anonstatics.py"], "backend": "llvm"}'
@@ -9,8 +9,7 @@
         `failed:` line.
 
 A name is a harness's label in ci.py (`ci.py list '{}'`), or the start of one up to a space, as
-FAST and CORE name them: `worktrees.py` is all three of its runs, `worktrees.py --overlay` the
-one. A name that is no harness's, or one whose harnesses run on no backend of this machine,
+FAST and CORE name them: `coldbuild.py` is both of its runs, `coldbuild.py statics` the one. A name that is no harness's, or one whose harnesses run on no backend of this machine,
 stops it with an error rather than run nothing. Harnesses run as the full tier's do
 (BLAZE_CI_TIER=full): a known flaky step counts.
 

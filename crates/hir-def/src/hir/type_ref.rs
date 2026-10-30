@@ -305,7 +305,7 @@ impl TypeRefKind {
 }
 
 /// Every column of a store's type refs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub(crate) struct TypeColumns<V: ColumnVec = Frozen> {
     /// [`TypeRefKind`], by type ref.
     pub(crate) kind: V::Of<u8>,

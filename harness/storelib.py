@@ -166,12 +166,14 @@ def artifact(stdout, program):
 
 
 class Daemon:
-    """`blaze serve` with `home` as its home, its output appended to `<home>/<name>.log`."""
+    """`blaze serve` with `home` as its home, its output appended to `<home>/<name>.log`; `env`
+    is set for it and for every build asked of it, over what `environment` leaves, a value of
+    None unsetting the variable."""
 
-    def __init__(self, blaze, home, name="serve", wait=True):
+    def __init__(self, blaze, home, name="serve", wait=True, env=None):
         self.blaze, self.home = blaze, home
         os.makedirs(home, exist_ok=True)
-        self.env = environment(home)
+        self.env = {name: value for name, value in {**environment(home), **(env or {})}.items() if value is not None}
         self.log_path = os.path.join(home, f"{name}.log")
         self.seen = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
         with open(self.log_path, "a") as out:

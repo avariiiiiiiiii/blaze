@@ -272,7 +272,7 @@ blaze is pinned to {name} ({new[1]}). Left to do:
   - `cargo build -p blaze-engine --release` and fix what the new rustc_abi and std ask for;
   - `uv run --frozen python harness/toolchain_bump.py checks '{{}}'` in an ix VM, under Cranelift and under LLVM
     (`nix develop -c ...` with BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast);
-  - the full tier (libsuite.py and the crates' own test suites) re-measured at the new commit;
+  - the full tier (the train and the crates' own test suites) re-measured at the new commit;
   - `git diff --stat` and one commit for the bump (docs/contributing.md).""")
 
 

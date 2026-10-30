@@ -4,11 +4,6 @@
     bench.py [PROJECT...] [--backend cranelift|llvm]... [--runs N] [--out FILE] [--work DIR]
              [--reference DIR] [--keep]
     bench.py --compare BASELINE RESULT [--threshold PERCENT]
-    bench.py --runtime [NAME...] [--runs N] [--builds release,checked,blaze] [--out FILE]
-
-`--runtime` is how fast programs run rather than how fast they build: it runs runbench.py on
-its programs (NAME..., its defaults without), `--runs` rounds each (default 5), and writes its
-result with the machine, the commit and the date, for benchreport.py's runtime table.
 
 Each project is one pinned checkout (cloned into `BLAZE_PROJECTS` as blaze_cli.py does, and
 copied; the clone is never written to). A project with `prepare` (bun) is copied from the tree
@@ -19,9 +14,8 @@ paths in it. Under each
 backend, with a store, a daemon and a home of its own, and plain cargo building the same source
 into a target directory of its own outside the checkout (under `--reference`, which lets the two be on different disks, or `WORK/reference`):
   cold       `blaze build` from nothing, then the wait until the daemon has the
-             workspace loaded and its first build linked; the standard library's unit is
-             fetched into the empty store from what `blaze-engine std` made once, as a release's
-             first build fetches it (`std_made_s` is how long making it took)
+             workspace loaded and its first build linked; the standard library's crates are
+             units of that build like any other, built into the empty store
   no-op      `blaze build` with nothing changed
   body       one function's body is edited
   signature  a function gets another parameter, and every caller the argument
@@ -61,7 +55,7 @@ The blaze of a backend is `BLAZE_BIN` (cranelift) or `BLAZE_LLVM_BIN` (llvm).
 """
 import glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
-import blaze_cli, memory, packs
+import blaze_cli, memory, storelib
 from blaze_cli import HERE, ROOT, TOOLCHAIN, Side, fetch, how_built, program_output, test_results, test_verdict, timed, wait_warm
 
 LET = "\n    let _bench_edit = 1u32;"
@@ -294,7 +288,7 @@ PROJECTS = {
             leaf=body("src/bun_core/string/StringBuilder.rs", "pub fn append(&mut self, slice: &[u8]) -> &[u8] {"),
             generic=body("src/collections/multi_array_list.rs", "pub(crate) fn push(&mut self, elem: T) -> Result<(), AllocError> {"),
         ),
-        # bun's transpiler on five of its own TypeScript files, as runbench.py's `bun`.
+        # bun's transpiler on five of its own TypeScript files.
         runtime=dict(bin="bun", args=["-e", "const t = new Bun.Transpiler({ loader: 'ts', minifyWhitespace: true }); "
                                       "const fs = require('fs'); const sources = ['http2', 'net', '_http_server', 'fs', 'child_process']"
                                       ".map(n => fs.readFileSync('src/js/node/' + n + '.ts', 'utf8')); let n = 0; "
@@ -434,29 +428,6 @@ def blaze_of(backend):
     if backend == "llvm":
         return os.environ.get("BLAZE_LLVM_BIN") or os.path.join(ROOT, "target-llvm/release/blaze-engine")
     return blaze_cli.BLAZE
-
-
-SHIPPED = {}
-
-
-def shipped_std(blaze, backend, work):
-    """The remote a release of `blaze` would fetch the standard library's unit from, made once
-    by `blaze-engine std` as the release workflow makes it: a cold build fetches it into its empty
-    store, as a user's first build does, rather than making it. The seconds making it took are
-    the second value, outside every phase."""
-    if (blaze, backend) not in SHIPPED:
-        remote = os.path.join(work, f"std-{backend}")
-        shutil.rmtree(remote, ignore_errors=True)
-        env = dict(blaze_cli.base_env(os.path.join(work, f"home-std-{backend}")), **BACKENDS[backend])
-        sysroot = subprocess.run(["rustc", "--print", "sysroot"], capture_output=True, text=True, env=env,
-                                 check=True).stdout.strip()
-        start = time.monotonic()
-        made = subprocess.run([blaze, "std", remote, sysroot], capture_output=True, text=True, env=env)
-        if made.returncode != 0:
-            raise Failed(f"{backend}: `blaze-engine std` failed:\n{made.stderr[-3000:]}")
-        SHIPPED[blaze, backend] = (remote, round(time.monotonic() - start, 3))
-        print(f"  standard library for {backend}, as a release ships it: {SHIPPED[blaze, backend][1]:.1f}s", flush=True)
-    return SHIPPED[blaze, backend]
 
 
 def seconds(text):
@@ -681,37 +652,11 @@ def setup_times(setups, samples):
 def disk(ws, ours, theirs):
     """What each side has on disk, in megabytes as `du` counts them (memory.disk_mb): blaze's
     target directory (cargo's own build, which `blaze build` starts with, and the
-    daemon's programs), its store and its home (workers' files, logs), and cargo's target
-    directory."""
-    return {"target": memory.disk_mb(os.path.join(ws, "target")), "store": memory.disk_mb(ours.env["BLAZE_CACHE"]),
-            "home": memory.disk_mb(ours.env["BLAZE_HOME"]), "cargo target": memory.disk_mb(theirs.env["CARGO_TARGET_DIR"])}
-
-
-# The keys the projects measured so far in this run stored: what one store on the machine would
-# have before the next project (docs/benchmarks.md, "Fairness").
-STORED = {}
-
-
-def store_entries(path):
-    """The keys of the sealed packs of the store at `path`, each with the bytes of disk it takes:
-    its pack's size shared among the pack's entries by the length of their values. A pack of
-    another format than packs.py reads is not counted."""
-    entries = {}
-    names = os.listdir(path) if os.path.isdir(path) else []
-    for name in names:
-        if not name.endswith(".pack"):
-            continue
-        try:
-            pack = open(os.path.join(path, name), "rb").read()
-        except OSError:
-            continue
-        laid = packs.index(pack)
-        if laid is None:
-            continue
-        values = sum(length for _, _, _, length, _ in laid[1]) or 1
-        for key, _, _, length, _ in laid[1]:
-            entries.setdefault(key, len(pack) * length / values)
-    return entries
+    daemon's programs), its store and the rest of its home (workers' files, logs), and cargo's
+    target directory."""
+    store = memory.disk_mb(storelib.store_of(ours.env["BLAZE_HOME"]))
+    return {"target": memory.disk_mb(os.path.join(ws, "target")), "store": store,
+            "home": memory.disk_mb(ours.env["BLAZE_HOME"]) - store, "cargo target": memory.disk_mb(theirs.env["CARGO_TARGET_DIR"])}
 
 
 def store_mb(path):
@@ -820,11 +765,8 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         return took, warm, mine, used
 
     # Each cold run starts from nothing: no target directories, an empty store and a daemon of
-    # its own, with the standard library's unit to fetch as a release has it. The builds take
-    # turns, never at once: they would share the cores (a daemon that is ready is idle). The
-    # last one's daemon is the one the edits are measured with.
-    std_from, std_s = shipped_std(blaze, backend, work)
-    ours.env["BLAZE_STD_FROM"] = std_from
+    # its own. The builds take turns, never at once: they would share the cores (a daemon that
+    # is ready is idle). The last one's daemon is the one the edits are measured with.
     colds, builds = [], [0]
     for turn in range(cold_runs):
         ours.cargo("stop")
@@ -859,8 +801,7 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
                         build_samples_s=[round(c["build_s"], 3) for c in colds],
                         setups=setup_times(setups, [c["setups"] for c in colds]),
                         compiled=compiled(said), steps_s=cold_steps(said), threads_s=thread_steps(said), started_over=rounds(said),
-                        memory=memory_phase([(c["used"], c["cargo_used"]) for c in colds], ready_mb), disk_mb=cold_disk,
-                        std_made_s=std_s))
+                        memory=memory_phase([(c["used"], c["cargo_used"]) for c in colds], ready_mb), disk_mb=cold_disk))
 
     samples = [both() for _ in range(max(runs, 3))]
     said = daemon.said()
@@ -931,12 +872,10 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
                               warm_store_samples_s=[round(b + w, 3) for b, w, _ in warm_store],
                               warm_store_memory=dict(peak_mb=round(statistics.median(u["peak_mb"] for _, _, u in warm_store)),
                                                      resident_mb=round(statistics.median(u["resident_mb"] for _, _, u in warm_store))))
-    entries = store_entries(ours.env["BLAZE_CACHE"])
-    added = sum(size for key, size in entries.items() if key not in STORED)
-    STORED.update(entries)
-    print(f"  store {store_mb(ours.env['BLAZE_CACHE'])} MB, {added / 1e6:.0f} MB of it not stored by a project before", flush=True)
-    result = dict(phases=phases, wrong=wrong, tag=spec["tag"], rev=spec["rev"], store_mb=store_mb(ours.env["BLAZE_CACHE"]),
-                  store_added_mb=round(added / 1e6), cold_runs=cold_runs, resident=resident, disk_mb=end_disk)
+    stored = store_mb(storelib.store_of(ours.env["BLAZE_HOME"]))
+    print(f"  store {stored} MB", flush=True)
+    result = dict(phases=phases, wrong=wrong, tag=spec["tag"], rev=spec["rev"], store_mb=stored,
+                  cold_runs=cold_runs, resident=resident, disk_mb=end_disk)
     # The project's own toolchain, which cargo builds with, not the one blaze is pinned to.
     if own := prepared.get("RUSTUP_TOOLCHAIN") or spec.get("env", {}).get("RUSTUP_TOOLCHAIN"):
         result["toolchain"] = own
@@ -1125,29 +1064,8 @@ def options(argv, name, default=None):
     return found or ([default] if default is not None else [])
 
 
-def runtime_bench(argv):
-    """`--runtime`: runbench.py's programs, built by blaze's LLVM and by cargo, timed against
-    `cargo build --release`, in a result that names the machine, commit and date as the rest."""
-    rounds = options(argv, "--runs", "5")[0]
-    out = options(argv, "--out", os.path.join(HERE, "runtime.json"))[0]
-    builds = [arg for given in options(argv, "--builds") for arg in ("--builds", given)]
-    names = [a for a in argv if not a.startswith("--")]
-    measured = os.path.join(tempfile.mkdtemp(prefix="blaze-runbench-"), "runbench.json")
-    ran = subprocess.run([sys.executable, os.path.join(HERE, "runbench.py"), *names, "--rounds", rounds, *builds, "--json", measured])
-    result = dict(toolchain=TOOLCHAIN, commit=blaze_commit(), date=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                  host=machine(), runbench=json.load(open(measured)) if os.path.exists(measured) else None)
-    if os.environ.get("GITHUB_RUN_ID"):
-        result["run_url"] = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-    json.dump(result, open(out, "w"), indent=1)
-    print(f"wrote {out}")
-    sys.exit(ran.returncode or (0 if result["runbench"] else 1))
-
-
 def main():
     argv = sys.argv[1:]
-    if "--runtime" in argv:
-        argv.remove("--runtime")
-        runtime_bench(argv)
     threshold = float(options(argv, "--threshold", "25")[0])
     if "--compare" in argv:
         argv.remove("--compare")

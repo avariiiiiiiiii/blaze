@@ -73,36 +73,52 @@ where
 }
 
 /// The function `code` is, `requests` being what its relocations name and `spans` what its
-/// line rows do. Its bytes move into the result, uncopied; its tables are in `frame`, the
-/// unit's, and its lists of relocations and line rows go back to the thread.
+/// line rows do. Its bytes move into the result, uncopied but on wasm32 where `wasm` has
+/// something to say; its tables are in `frame`, the unit's, and its lists of relocations and
+/// line rows go back to the thread.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn function(
     frame: &Frame,
     key: InstanceKey,
     arch: Arch,
     // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     isa: &dyn TargetIsa,
-    code: fragment::Code,
+    mut code: fragment::Code,
     requests: &Requests,
     resolve: &impl Resolver,
     spans: &[SpanRef],
     side: Option<ContentId>,
+    wasm: &super::wasm::Header,
 ) -> Result<CompiledFunction, String> {
-    let word = word(arch)?;
+    let is_wasm = arch == Arch::Wasm32;
+    let moved = if is_wasm {
+        let (bytes, moved) = super::wasm::with_header(std::mem::take(&mut code.bytes), wasm)?;
+        code.bytes = bytes;
+        moved
+    } else if !wasm.is_empty() {
+        // alloc: an error
+        return Err(format!("a wasm header of imports and an export for code of {arch:?}"));
+    } else {
+        0
+    };
     // alloc: none until it has data of its own, which the result keeps
-    let mut own = OwnData { data: Vec::new(), word };
+    let mut own = OwnData { data: Vec::new(), word: word(arch) };
     let size = code.bytes.len();
     let names: Relocs<RelocName> = Relocs::try_from_iter_in(
         frame,
         code.relocs.iter().map(|reloc| {
             let kind = match reloc.elf_type {
                 Some(elf) => elf_kind(elf)?,
+                None if is_wasm => super::wasm::reloc_kind(reloc.kind, reloc.name)?,
                 None => reloc_kind(reloc.kind)?,
             };
             let (target, addend) = match reloc.name {
                 RelocName::Own(offset) => (RelocName::Own(0), own_addend(offset, reloc.addend, size)?),
                 name => (name, reloc.addend),
             };
-            Ok::<_, String>(Relocation { at: reloc.offset, kind, target, addend })
+            // alloc: an error
+            let at = reloc.offset.checked_add(moved).ok_or("a relocation past 4 GiB of code")?;
+            Ok::<_, String>(Relocation { at, kind, target, addend })
         }),
     )?;
     let named = names.targets().iter().filter_map(|name| match *name {
@@ -170,7 +186,7 @@ pub(crate) fn names(
     resolve: &impl Resolver,
 ) -> Result<(Vec<Target>, Vec<Data>), String> {
     // alloc: none until it has data of its own, which the caller keeps
-    let mut own = OwnData { data: Vec::new(), word: word(arch)? };
+    let mut own = OwnData { data: Vec::new(), word: word(arch) };
     let declared = func.params.user_named_funcs();
     let named = declared.values().filter(|it| it.namespace == 1).map(|it| it.index as usize);
     let datas = own.requests(frame, requests, resolve, named)?;
@@ -193,25 +209,35 @@ pub(crate) fn value(
     resolve: &impl Resolver,
 ) -> Result<(Vec<Data>, Relocs), String> {
     // alloc: none until it has data of its own, which the caller keeps
-    let mut own = OwnData { data: Vec::new(), word: word(arch)? };
+    let mut own = OwnData { data: Vec::new(), word: word(arch) };
     let named = blob.relocs.iter().map(|&(_, data, _)| data.as_u32() as usize);
     let targets = own.requests(frame, requests, resolve, named)?;
     let relocs = own.relocs(blob, requests.datas.len(), &targets, requests, resolve)?;
     Ok((own.data, relocs))
 }
 
-fn word(arch: Arch) -> Result<usize, String> {
+/// An address in data: how many bytes it takes, and the kind of a relocation that writes one
+/// of data there and one of a function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Word {
+    pub(crate) size: usize,
+    pub(crate) data: RelocKind,
+    pub(crate) func: RelocKind,
+}
+
+/// On wasm32 an address is four bytes: of data where it is in linear memory, of a function
+/// its slot in the table.
+pub(crate) fn word(arch: Arch) -> Word {
     match arch {
-        Arch::X86_64 | Arch::Aarch64 => Ok(8),
-        // alloc: an error
-        Arch::Wasm32 => Err("wasm: v2 has no relocations of wasm's data yet".to_owned()),
+        Arch::X86_64 | Arch::Aarch64 => Word { size: 8, data: RelocKind::Abs64, func: RelocKind::Abs64 },
+        Arch::Wasm32 => Word { size: 4, data: RelocKind::WasmMemory, func: RelocKind::WasmTable },
     }
 }
 
 /// A function's own data, in the order it is made: an object points only at the ones before.
 struct OwnData {
     data: Vec<Data>,
-    word: usize,
+    word: Word,
 }
 
 impl OwnData {
@@ -316,7 +342,7 @@ impl OwnData {
                 return Err(format!("data {index} points at data {at_data}, not one before it"));
             };
             // clone: a `Target` is an ID but for an `Extern`'s name; each relocation at the request owns one
-            relocs.push(Relocation { at, kind: RelocKind::Abs64, target: target.clone(), addend });
+            relocs.push(Relocation { at, kind: self.word.data, target: target.clone(), addend });
         }
         for &(at, func) in &blob.fn_relocs {
             let request = requests.funcs.get(func.as_u32() as usize).ok_or_else(|| {
@@ -324,24 +350,28 @@ impl OwnData {
                 format!("data {index} points at function {}, never requested", func.as_u32())
             })?;
             let target = resolve.func(func.as_u32(), request)?;
-            relocs.push(Relocation { at, kind: RelocKind::Abs64, target, addend: 0 });
+            relocs.push(Relocation { at, kind: self.word.func, target, addend: 0 });
         }
         Ok(relocs.into())
     }
 
     /// The bytes of `text`, and the `&str` of them.
     fn text(&mut self, text: String) -> Target {
+        let Word { size: word, data: kind, .. } = self.word;
         let len = text.len() as u64;
         let bytes = self.push(Data::new(1, text.into_bytes(), Relocs::new()));
         // alloc: the `&str`'s bytes, which the data owns
-        let mut fat = vec![0; 2 * self.word];
-        fat[self.word..].copy_from_slice(&len.to_le_bytes()[..self.word]);
-        let pointer = Relocation { at: 0, kind: RelocKind::Abs64, target: bytes, addend: 0 };
-        self.push(Data::new(self.word as u32, fat, Relocs::from_iter([pointer])))
+        let mut fat = vec![0; 2 * word];
+        fat[word..].copy_from_slice(&len.to_le_bytes()[..word]);
+        let pointer = Relocation { at: 0, kind, target: bytes, addend: 0 };
+        self.push(Data::new(word as u32, fat, Relocs::from_iter([pointer])))
     }
 
-    /// A `core::panic::Location` of no file, as v1 makes it: `<blaze>`, line 0, column 0.
+    /// A `core::panic::Location` of no file, as v1 makes it: `<blaze>`, line 0, column 0. The
+    /// file's pointer and length, then the two `u32`s: 24 bytes aligned to 8, on wasm32 16
+    /// aligned to 4.
     fn nowhere(&mut self) -> Target {
+        let Word { size: word, data: kind, .. } = self.word;
         let file = "<blaze>";
         let mut name = Vec::with_capacity(file.len() + 1);
         name.extend_from_slice(file.as_bytes());
@@ -349,11 +379,10 @@ impl OwnData {
         name.push(0);
         let name = self.push(Data::new(1, name, Relocs::new()));
         // alloc: the `Location`'s bytes, which the data owns
-        let mut bytes = vec![0u8; 2 * self.word + 8];
-        bytes[self.word..2 * self.word]
-            .copy_from_slice(&(file.len() as u64).to_le_bytes()[..self.word]);
-        let pointer = Relocation { at: 0, kind: RelocKind::Abs64, target: name, addend: 0 };
-        self.push(Data::new(self.word as u32, bytes, Relocs::from_iter([pointer])))
+        let mut bytes = vec![0u8; 2 * word + 8];
+        bytes[word..2 * word].copy_from_slice(&(file.len() as u64).to_le_bytes()[..word]);
+        let pointer = Relocation { at: 0, kind, target: name, addend: 0 };
+        self.push(Data::new(word as u32, bytes, Relocs::from_iter([pointer])))
     }
 }
 

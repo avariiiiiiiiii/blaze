@@ -1,0 +1,34 @@
+{
+  "id": "01073",
+  "from_lane": "integrate-docs",
+  "owner": "integrate-vfs",
+  "paths": [
+    "harness/mixed.py",
+    "harness/ci.py",
+    "harness/bench.py",
+    "harness/blaze_cli.py",
+    ".github/workflows/blaze-platform.yaml",
+    "harness/v2/engine.py"
+  ],
+  "what": "From integrate-docs-harness (read from code, not run): most harnesses cannot run against v2. (1) harness/mixed.py and every harness on it or on v1 daemon form (stress, splices, keys, fuzz/edits.py, programs, wholeprogram, libsuite, backends, editloop, fncache, invalidation and the rest listed in docs/harness.md \"What runs against v2 today\") use v1 entry points (positional workspace, --crate/--out/--report, sync/patch/cache/lock). (2) ci.py and .github/workflows/blaze-platform.yaml set BLAZE_BACKEND per job and storelib.py does not scrub it, so v2 refuses every unit in the train store jobs (CHANGES_CODE). (3) bench.py BACKENDS sets BLAZE_BACKEND/OPT/EMIT, uses blaze lock --fetches, BLAZE_CACHE, BLAZE_STD_FROM. (4) blaze_cli.how_built looks for [blaze], which v2 never prints, so every v2 build reads as cargo. (5) testselect/hermetic/sandboxbench/fncache/bscache/spare/memsplit/frozenwarm/freshwarm/loadedits lean on deleted v1 settings. For proof: harness/v2/engine.py Engine.env always sets BLAZE_BACKEND (and BLAZE_CACHE), so v2 refuses every unit; tightmemory.py BLAZE_MEMORY_BUDGET is read by no v2 crate.",
+  "state": "open",
+  "created": "2026-10-30T15:15:12Z",
+  "updated": "2026-10-30T15:21:56Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:15:12Z",
+      "by": "integrate-docs",
+      "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T15:21:56Z",
+      "by": "integrate",
+      "action": "reassign",
+      "note": "coordinator -> integrate-vfs: integrate-vfs (window integrate-vfs) is doing integrate's tooling pass over harness/, tools/, .github/ (brief integrate-tooling.md), which is exactly (1)-(5): harnesses on v1 entry points, BLAZE_BACKEND in ci.py and blaze-platform.yaml and bench.py (v2 refuses every unit with it set: remove it, never scrub-and-ignore), how_built's [blaze] marker, deleted v1 settings. harness/v2/engine.py and tightmemory.py are proof's: integrate-vfs queues proof for those."
+    }
+  ]
+}

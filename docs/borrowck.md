@@ -503,11 +503,11 @@ With no borrow checker, the 246 units rustc accepts would pass. Now:
 460 units are out of scope; 346 of them need a nightly feature (at 68be5dec, nightly-2026-10-27,
 rustc's tests at 12433c30).
 
-The check that stays is that it finds nothing in code rustc accepts. `harness/borrowck_apps.py`
-checks every application of `apps/apps.json` at its pinned rev and lists each app's errors and
+The check that stays is that it finds nothing in code rustc accepts. v1's `borrowck_apps.py`
+checked every application of `apps/apps.json` at its pinned rev and listed each app's errors and
 panics. It ran v1's `blaze-engine borrowck --project`, which loaded the workspace through
-rust-analyzer and is gone; until it runs `blaze check` it has no command to run. At 68be5dec
-all 22 applications checked
+rust-analyzer and is gone, and was deleted on 2026-10-30; its v2 successor, over `blaze check`,
+is queued. At 68be5dec all 22 applications checked
 clean; at 47793534 nushell (53, E0716 in its tests), ruff (19, E0716 and "lifetime may not live
 long enough") and rust-analyzer (1, E0515) got errors rustc does not give.
 
@@ -674,11 +674,10 @@ small fraction of type inference, which it needs anyway.
 The numbers below were measured with v1's `blaze-engine borrowck --project DIR --timings`, which
 went through every body of a project's own crates on one thread, inferring and checking each
 once cold (`infer_us`, `first_us`) and then as an edit of it costs in the daemon
-(`infer_warm_us`, each mode's phases and sizes). It loaded through rust-analyzer and is gone;
-`harness/borrowck_speed.py`, which ran it over the bench apps and reports totals, p50/p99/max
-and the slowest bodies (`--rustc TOOLCHAIN` measures rustc's own `mir_borrowck` and `typeck`
-with `-Zself-profile` as the baseline), has no command to run until it measures through
-`blaze check`.
+(`infer_warm_us`, each mode's phases and sizes). It loaded through rust-analyzer and is gone,
+and so is v1's `borrowck_speed.py`, which ran it over the bench apps and reported totals,
+p50/p99/max and the slowest bodies (`--rustc TOOLCHAIN` measured rustc's own `mir_borrowck` and
+`typeck` with `-Zself-profile` as the baseline); a v2 measure goes through `blaze check`.
 
 Before any speed work, on main 31b3345f (arm64 ix VM, 16 vCPUs): the checker's total
 without MIR lowering, beside type inference's, in ms, and its slowest body:

@@ -12,7 +12,7 @@ use rustc_hash::FxHashMap;
 use super::{TestDB, edit, item, items, single};
 use crate::{
     ItemId,
-    form::{Cx, Missed, Sub, check, ty_form},
+    form::{Cx, FormTy, Missed, Sub, check, ty_form},
     key,
 };
 
@@ -595,7 +595,7 @@ fn shared_type_forms_are_the_forms_each_cx_spelled() {
             for (_, local) in body.locals.iter() {
                 let ty = local.ty.as_ref();
                 let old = Cx::reference(&db).reference_ty(ty);
-                assert_eq!(*ty_form(&db, local.ty), old, "the form of {ty:?}");
+                assert_eq!(*ty_form(&db, FormTy::new(&db, local.ty)), old, "the form of {ty:?}");
                 assert_eq!(*Cx::new(&db).ty(ty), old.sub, "the form of {ty:?}");
                 forms += 1;
             }

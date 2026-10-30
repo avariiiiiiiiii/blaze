@@ -20,7 +20,7 @@ import os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request, 
 
 import blaze_cli
 from blaze_cli import PROJECTS, Side, base_env, fetch, how_built, rewrite, wait_warm
-from debuginfo import DWARFDUMP, LLVM, OPTIMIZED_OUT, Tally, held, own_ranges, panics, units, unit_of
+from dwarf import DWARFDUMP, LLVM, OPTIMIZED_OUT, Tally, held, own_ranges, panics, units, unit_of
 
 PANIC = 'if std::env::var_os("REALDEBUG_PANIC").is_some() { panic!("asked for"); }'
 

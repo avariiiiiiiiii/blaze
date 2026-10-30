@@ -269,7 +269,8 @@ pub enum Asked {
     /// `blaze daemon install` or `blaze daemon uninstall`: the units that socket-activate it.
     Daemon(DaemonVerb),
     /// `blaze codegen-inputs`, `blaze trace` or `blaze tables`: what the daemon's last build of
-    /// the checkout did, with the words after the command, which [`super::inspect`] reads.
+    /// the checkout did; or `blaze pack`: a program packed for the in-browser compiler. With the
+    /// words after the command, which [`super::inspect`] reads.
     Inspect(super::inspect::Inspected, Vec<OsString>),
     Help(Option<Command>),
     Version,

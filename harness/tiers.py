@@ -3,8 +3,8 @@
 takes edits runs under the daemon, which samples it and compiles its hot functions again with
 LLVM, swapping them in as patches while it runs (docs/tiers.md).
 
-usage: tiers.py          (BLAZE_BIN names the blaze built; blaze and blaze-rustc
-                          are found next to it)
+usage: tiers.py          (BLAZE_BIN names the blaze built; blaze is found next
+                          to it)
 
 A copy of demo/lifebench (the Game of Life on a large grid, run flat out) is built by blaze
 from nothing (a home, store and target directory of its own, BLAZE_TIER=off), then by a

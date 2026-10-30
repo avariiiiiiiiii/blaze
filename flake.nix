@@ -257,8 +257,8 @@
           # this the binary finds neither the store's glibc nor its libgcc_s when it runs.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "-Clinker-features=-lld";
         });
-        # What builds, runs and inspects wasm32 programs (harness/wasm32.py, the train's wasm32
-        # job): wasmtime for wasm32-wasip1 and `--invoke` of a library's exports,
+        # What builds, runs and inspects wasm32 programs: wasmtime for wasm32-wasip1 and
+        # `--invoke` of a library's exports,
         # wasm-tools where the harnesses read objects, wasm-bindgen and node for web guests. The
         # targets are rustup's: `rustup target add wasm32-wasip1 wasm32-unknown-unknown`.
         devShells.wasm = pkgs.mkShell (llvmEnv // {
@@ -270,7 +270,7 @@
         devShells.bench = pkgs.mkShell bench;
         # Python-only work needs neither LLVM nor a Rust toolchain.
         devShells.scripts = pkgs.mkShell scripts;
-        # What harness/bench.py and runbench.py measure bun in (bunprep.py, docs/research/bun.md):
+        # What harness/bench.py measures bun in (bunprep.py, docs/research/bun.md):
         # bun's own pinned nightly in place of blaze's, for the cargo side (blaze ignores the pin
         # and compiles its own library/), with rust-src, which bun's own build of its Rust
         # (`-Zbuild-std`, run by bunprep.py's plan step) reads std from, and

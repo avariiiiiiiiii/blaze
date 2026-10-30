@@ -32,10 +32,6 @@ on:
         description: harness/bench.py on ripgrep against the stored baseline (not required)
         type: boolean
         default: false
-      wasm32:
-        description: harness/wasm32.py, programs built for wasm32 and run under wasmtime
-        type: boolean
-        default: false
       smoke:
         description: the std cases of the smoke corpus (harness/smoke.py), in every tier
         type: boolean
@@ -203,15 +199,14 @@ jobs:
       - name: blaze's proc-macro server
         if: env.BLAZE == 'true' && runner.os != 'Windows'
         run: RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 target/release/blaze-proc-macro-srv --version
-      # The binaries run each other from next to themselves (`blaze enable` links `cargo fmt`
-      # and `cargo clippy` to the blaze beside it, and fails without one; a load finds
-      # blaze-proc-macro-srv beside blaze). A tar keeps them executable.
+      # The binaries run each other from next to themselves (a load finds blaze-proc-macro-srv
+      # beside blaze). A tar keeps them executable.
       - name: Pack
         working-directory: target/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
           server=$([ -f blaze-proc-macro-srv ] && echo blaze-proc-macro-srv || true)
-          tar -cf blaze.tar blaze-engine$exe blaze$exe blaze-rustc$exe $server
+          tar -cf blaze.tar blaze-engine$exe blaze$exe $server
       - uses: actions/upload-artifact@v7
         with:
           name: blaze-${{ inputs.platform }}
@@ -270,26 +265,13 @@ jobs:
       # `debuginfo.py` has perf unwind what blaze built, which it says it did not run where
       # there is no perf or the kernel does not let this user sample.
       - name: perf
-        if: runner.os == 'Linux' && startsWith(matrix.part, 'core-')
+        if: runner.os == 'Linux' && matrix.backend == 'cranelift' && startsWith(matrix.part, 'core-')
         continue-on-error: true
         run: |
           sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
           perf --version || sudo ln -sf "$(ls /usr/lib/linux-tools/*/perf | tail -n 1)" /usr/local/bin/perf
           perf --version
           sudo sysctl kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
-      # MinIO as one program in the home directory, which is where remote.py looks for it and
-      # needs it: it kills the service and starts it again. The image is the one that is still
-      # published, for both architectures; the runner's docker takes a file out of it without
-      # root.
-      - name: MinIO
-        if: runner.os == 'Linux' && matrix.part == 'daemon'
-        run: |
-          image=cgr.dev/chainguard/minio@sha256:c93745c56fccdaf0e5dcb88999a96a65a136428beb045ef5d546255a80d747a7
-          mkdir -p "$HOME/s3tools"
-          container=$(docker create "$image")
-          docker cp "$container:/usr/bin/minio" "$HOME/s3tools/minio"
-          docker rm "$container"
-          "$HOME/s3tools/minio" --version
       - uses: actions/download-artifact@v8
         with:
           name: blaze-${{ inputs.platform }}
@@ -326,31 +308,6 @@ jobs:
           done
           true
 
-  # wasm32 with blaze's own wasm lowering (docs/platforms.md, "wasm32"): this build compiles for
-  # the target and the programs run under the wasmtime of the flake's `wasm` shell.
-  wasm32:
-    name: wasm32
-    if: inputs.wasm32 && (inputs.tier == 'fast' || inputs.tier == 'full')
-    needs: build
-    runs-on: ${{ inputs.os }}
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: run
-          targets: wasm32-wasip1 wasm32-unknown-unknown
-      - uses: actions/download-artifact@v8
-        with:
-          name: blaze-${{ inputs.platform }}
-          path: target/release
-      - name: blaze
-        working-directory: target/release
-        run: |
-          tar -xf blaze.tar
-          echo "BLAZE_BIN=$PWD/blaze-engine" >> "$GITHUB_ENV"
-      - run: nix develop .#wasm --command python3 harness/wasm32.py
-
   # The std cases of the smoke corpus (docs/release.md): small programs with no dependencies
   # that `blaze run` must print the expected output of and `blaze test` must pass, dev and
   # --release, as a user runs them. The merge gate's; the whole corpus, against a release's
@@ -382,8 +339,8 @@ jobs:
           BLAZE_HOME="$RUNNER_TEMP/blaze-home" $PYTHON harness/smoke.py \
             "{\"groups\": [\"std\"], \"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze\", \"work\": \"$RUNNER_TEMP/smoke\"}"
 
-  # `blaze` in place of cargo on projects at pinned commits, and the flags, the daemon's
-  # life and plain cargo after `blaze enable`. Incremental compilation is left to the profile,
+  # `blaze` in place of cargo on projects at pinned commits, and the flags and the daemon's
+  # life. Incremental compilation is left to the profile,
   # as on a developer's machine: with it off the tests of every project are cargo's (the
   # harness has that case among the flags).
   blaze-cli:

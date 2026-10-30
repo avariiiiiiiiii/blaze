@@ -204,6 +204,8 @@ pub(super) enum Does<S: Steps> {
     Verify { steps: Arc<S>, input: JobInput, view: blaze_vfs::View },
     Edit { front: Arc<S::Front>, edits: Vec<Edit> },
     Ahead { front: Arc<S::Front>, filter: Vec<String> },
+    /// Posted with the job's writer, once its check is built and nothing reads its front end.
+    Pack { front: Arc<S::Front>, program: String },
 }
 
 impl<S: Steps> Step<S> {
@@ -285,6 +287,10 @@ impl<S: Steps> plane::Work for Step<S> {
                 self.settle(front.edit(this(readers), edits), |it| Value::Answer(it.map(Response::Edited)))
             }
             Does::Ahead { front, filter } => self.settle(front.ahead(this(readers), filter), Value::Ahead),
+            Does::Pack { front, program } => {
+                let writer = readers.writer.expect("the pack's task is posted with its job's writer");
+                self.settle(front.pack(writer, program), |it| Value::Answer(it.map(|pack| Response::Packed { pack })))
+            }
         }
     }
 }
@@ -336,7 +342,8 @@ fn command_of(work: &Work) -> Command {
         | Work::Trace(_)
         | Work::Tables
         | Work::Snapshot
-        | Work::Edit(_) => Command::Check,
+        | Work::Edit(_)
+        | Work::Pack { .. } => Command::Check,
     }
 }
 
@@ -347,9 +354,13 @@ fn goal_of(work: &Work) -> Goal {
         Work::Test { .. } | Work::Ahead { .. } => Goal::Test,
         Work::Run { .. } => Goal::Run,
         Work::Reach { .. } => Goal::Reach,
-        Work::Check(_) | Work::Verify(_) | Work::Trace(_) | Work::Tables | Work::Snapshot | Work::Edit(_) => {
-            Goal::Check
-        }
+        Work::Check(_)
+        | Work::Verify(_)
+        | Work::Trace(_)
+        | Work::Tables
+        | Work::Snapshot
+        | Work::Edit(_)
+        | Work::Pack { .. } => Goal::Check,
     }
 }
 
@@ -363,7 +374,8 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Test { targets, .. }
         | Work::Run { targets, .. }
         | Work::Reach { targets, .. }
-        | Work::Ahead { targets, .. } => Some(targets),
+        | Work::Ahead { targets, .. }
+        | Work::Pack { targets, .. } => Some(targets),
         Work::Tables | Work::Snapshot | Work::Edit(_) => None,
     }
 }
@@ -1152,7 +1164,7 @@ impl<S: Steps> Jobs<S> {
                 Some(Readers { this: Some(this), images, ..Readers::default() })
             }
             Some(job) if matches!(job.stage, Stage::Answer(_) | Stage::Ahead(_)) => match job.work {
-                Work::Tables => job.ready.last_mut().and_then(|it| it.writer.take()).map(|writer| Readers {
+                Work::Tables | Work::Pack { .. } => job.ready.last_mut().and_then(|it| it.writer.take()).map(|writer| Readers {
                     writer: Some(writer),
                     ..Readers::default()
                 }),
@@ -1572,7 +1584,7 @@ impl<S: Steps> Jobs<S> {
             self.prepare(w, id);
             return;
         }
-        if matches!(job.work, Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. }) {
+        if matches!(job.work, Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } | Work::Pack { .. }) {
             self.build(w, id, None);
             return;
         }
@@ -2148,6 +2160,7 @@ impl<S: Steps> Jobs<S> {
         }
         let ok = ok && job.over.is_none();
         let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
+        let pack = ok && matches!(job.work, Work::Pack { .. });
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
         let Build { input, front, mut writer, artifacts, evaluation, root, .. } = *build;
         if let Err(error) = writer.finished() {
@@ -2166,17 +2179,29 @@ impl<S: Steps> Jobs<S> {
                 w.said.push(Said::Report(id, Response::Diagnostic(note)));
             }
         }
-        if let Some(root) = root
-            && let Some(kept) = writer.keep()
-        {
-            self.roots.fronts[root as usize] = Some(kept);
-        }
+        // A pack's front end is not kept: recording its expansions changes its proc macros.
+        let packing = match pack {
+            true => Some(writer),
+            false => {
+                if let Some(root) = root
+                    && let Some(kept) = writer.keep()
+                {
+                    self.roots.fronts[root as usize] = Some(kept);
+                }
+                None
+            }
+        };
         if let Some(job) = self.jobs.get_mut(key_of(id)) {
             job.served = served;
         }
         let profile = input.units.finished.clone(); // clone: the report owns it, once per build
         let members = input.units.packages.iter().filter(|it| it.is_member).count();
         let members = u32::try_from(members).unwrap_or(u32::MAX);
+        if let Some(writer) = packing {
+            w.said.push(Said::Report(id, Response::Built { members, profile, artifacts }));
+            self.pack(w, id, input, front, writer);
+            return;
+        }
         if !runs {
             let ok = ok && evaluation.is_none_or(|it| !it.failed);
             w.said.push(Said::Report(id, Response::Built { members, profile, artifacts }));
@@ -2234,6 +2259,27 @@ impl<S: Steps> Jobs<S> {
                 }
             }
         }
+    }
+
+    /// [`Work::Pack`]'s check built: the pack made by one task of a plane request of its own,
+    /// posted with the front end's writer, as no task reads the front end any more.
+    fn pack(&mut self, w: &mut World<'_, S>, id: JobId, input: JobInput, front: Arc<S::Front>, writer: S::Writer) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        job.ready.push(Ready { input, root: None, front: Some(front), writer: Some(writer) });
+        let work = match answer(job, &self.paths, w.steps) {
+            Ok(work) => work,
+            Err(error) => {
+                self.end(w, id, false, Some(error));
+                return;
+            }
+        };
+        job.request = Some(w.plane.open(w.now, false, job.idle));
+        job.finished = false;
+        job.closed = false;
+        let fresh = lone(w.plane, NodeKind::Bodies, "the pack", Pool::Work, None, kinds::WALK);
+        job.stage = Stage::Answer(fresh.first());
+        self.add(w, id, fresh, Some(work), true);
+        self.close(w, id);
     }
 
     /// `Work` of a build, test or run: what the plane and the units did.
@@ -2406,7 +2452,8 @@ impl<S: Steps> Jobs<S> {
 }
 
 /// The task that answers a job's work on its ready views: a reach, the codegen inputs, the
-/// tables, a trace, a verify, an edit, or the units a build ahead picks.
+/// tables, a trace, a verify, an edit, the units a build ahead picks, or a checked pack's
+/// pack.
 fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<Step<S>, ApiError> {
     let Some(ready) = job.ready.last() else { return Err(ApiError::new("the job has no view", None)) };
     let not_lowered = || ApiError::new("the job's view is not lowered", None);
@@ -2438,6 +2485,8 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
         Work::Edit(edits) => Does::Edit { front: lowered()?, edits: edits.clone() },
         // clone: the task owns the filter, once per job
         Work::Ahead { filter, .. } => Does::Ahead { front: lowered()?, filter: filter.clone() },
+        // clone: the task owns the program's name, once per job
+        Work::Pack { program, .. } => Does::Pack { front: lowered()?, program: program.clone() },
         Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } | Work::Snapshot => {
             return Err(ApiError::new("the job's work builds its units, answering nothing on its own", None));
         }

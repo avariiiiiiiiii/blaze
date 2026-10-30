@@ -48,10 +48,9 @@ them. macOS and Linux; stdlib only.
 With `--server` the blaze just built builds blaze's proc-macro server (`blaze-proc-macro-srv`, the
 binary of the workspace's crates/proc-macro-srv-cli, docs/no-rustc.md step J1) into DIR, the server that expands with the
 proc-macro libraries blaze links, found beside blaze (`BLAZE_PROC_MACRO_SERVER=1`). It is
-built whole by blaze (`--exe`), over the standard library blaze compiles, so it speaks the
-bridge of the libraries that blaze compiles; its own serde derives are expanded by the
-toolchain's server with rustc's libraries, as blaze's own executable may be built with rustc.
-Not on Windows, whose release blaze does not build yet.
+built by `blaze build --release`, over the standard library blaze compiles, so it speaks the
+bridge of the libraries that blaze compiles. Not on Windows, whose release blaze does not
+build yet.
 
 On Linux every binary in DIR, the server's included, is refused when it asks for a glibc newer
 than `GLIBC` (RHEL 9's; Debian 12 and Ubuntu 22.04 have newer): the release builds on the
@@ -87,10 +86,10 @@ RELEASE = "https://github.com/indexable-inc/blaze/releases/download/pgo-profiles
 # A training run that reached the workers counts tens of billions; one that lost them a few
 # million (the client's own short runs).
 MIN_COUNT = 1_000_000_000
-# blaze's proc-macro server: its workspace (blaze's own), the crate of its executable, and the
+# blaze's proc-macro server: its workspace (blaze's own), the package of its executable, and the
 # name it is built and ships as.
 SERVER = ROOT
-SERVER_CRATE = "blaze_proc_macro_srv"
+SERVER_PACKAGE = "proc-macro-srv-cli"
 SERVER_BIN = "blaze-proc-macro-srv"
 # What LLVM says of a function whose control flow changed since the profile was trained.
 STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
@@ -300,16 +299,20 @@ def pin(dirs):
 
 
 def proc_macro_server(blaze, out):
-    """blaze's proc-macro server, built and linked by `blaze` into `out`, from a store of its
-    own; the path of the executable."""
+    """blaze's proc-macro server, built by `blaze build --release` with a home and target
+    directory of its own and copied into `out`; the path of the executable."""
     exe = out / SERVER_BIN
     with tempfile.TemporaryDirectory(prefix="blaze-server-") as work:
-        env = dict(os.environ, RUSTUP_TOOLCHAIN=TOOLCHAIN, BLAZE_CACHE=str(Path(work) / "store"),
-                   BLAZE_STD_FROM="off", RUST_BACKTRACE="0")
+        env = dict(os.environ, BLAZE_HOME=str(Path(work) / "home"),
+                   CARGO_TARGET_DIR=str(Path(work) / "target"), RUST_BACKTRACE="0")
         start = time.monotonic()
-        # `proc_macro` is not in the standard library's unit: the program that links it has it.
-        run([str(blaze), str(SERVER), "--crate", SERVER_CRATE, "--crate", "proc_macro",
-             "--out", str(Path(work) / "server.o"), "--exe", str(exe)], cwd=SERVER, env=env)
+        try:
+            run([str(blaze), "build", "--release", "-p", SERVER_PACKAGE, "--bin", SERVER_BIN],
+                cwd=SERVER, env=env)
+        finally:
+            # The daemon the build started lives in the home, which goes with `work`.
+            subprocess.run([str(blaze), "stop"], cwd=SERVER, env=env, check=False)
+        shutil.copy2(Path(work) / "target" / "release" / SERVER_BIN, exe)
     said = subprocess.run([str(exe), "--version"], capture_output=True, text=True, check=True,
                           env=dict(os.environ, RUST_ANALYZER_INTERNALS_DO_NOT_USE="this is unstable"))
     print(f"build_release: {said.stdout.strip()} as {exe}, built by blaze in {time.monotonic() - start:.1f} s",

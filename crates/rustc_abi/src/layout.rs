@@ -106,7 +106,7 @@ enum NicheBias {
     End,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LayoutCalculatorError<F> {
     /// An unsized type was found in a location where a sized type was expected.
     ///

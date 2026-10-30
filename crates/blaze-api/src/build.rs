@@ -74,6 +74,9 @@ pub enum Work {
     Trace(Targets),
     /// [`crate::Response::Tables`]: each table's owner reports its own.
     Tables,
+    /// Checked as [`Work::Check`] is, then [`crate::Response::Packed`] of package `program`
+    /// ([`crate::Request::Pack`]).
+    Pack { targets: Targets, program: String },
     /// The edits applied to the view in the front end (`blaze_intent::apply`), reported as
     /// [`crate::Response::Edited`] before an `ok` finish; the session commits its ops. The
     /// trees the edits left are the front end's parses of the files they wrote.

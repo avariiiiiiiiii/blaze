@@ -159,7 +159,7 @@ impl From<PatId> for ExprOrPatIdPacked {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Label {
     pub name: Name,
 }
@@ -182,7 +182,7 @@ const _: () = {
 // We leave float values as a string to avoid double rounding.
 // For PartialEq, string comparison should work, as ordering is not important
 // https://github.com/rust-lang/rust-analyzer/issues/12380#issuecomment-1137284360
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct FloatTypeWrapper(Symbol);
 
 // FIXME(#17451): Use builtin types once stabilised.
@@ -229,7 +229,7 @@ impl fmt::Display for FloatTypeWrapper {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)] // clone: a borrowed expression pushed; lowering moves them
+#[derive(Debug, Clone, Eq, PartialEq, Hash)] // clone: a borrowed expression pushed; lowering moves them
 pub enum Literal {
     String(Symbol),
     ByteString(Box<[u8]>),
@@ -526,13 +526,13 @@ pub enum UnsafeBinderCastKind {
     Unwrap,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)] // clone: as `Literal`'s
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: as `Literal`'s
 pub struct OffsetOf {
     pub container: TypeRefId,
     pub fields: Box<[Name]>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)] // clone: as `Literal`'s
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: as `Literal`'s
 pub struct InlineAsm {
     pub operands: Box<[(Option<Name>, AsmOperand)]>,
     /// What to assemble, the template strings joined by newlines. `None` when a string could
@@ -733,14 +733,14 @@ pub enum Array<'a> {
     Repeat { initializer: ExprId, repeat: ExprId },
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct MatchArm {
     pub pat: PatId,
     pub guard: Option<ExprId>,
     pub expr: ExprId,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct RecordLitField {
     pub name: Name,
     pub expr: ExprId,
@@ -895,7 +895,7 @@ impl FusedIterator for StatementIter<'_> {}
 /// Explicit binding annotations given in the HIR for a binding. Note
 /// that this is not the final binding *mode* that we infer after type
 /// inference.
-#[derive(Clone, PartialEq, Eq, Debug, Copy)]
+#[derive(Clone, PartialEq, Eq, Debug, Copy, Hash)]
 pub enum BindingAnnotation {
     /// No binding annotation given: this means that the final binding mode
     /// will depend on whether we have skipped through a `&` reference
@@ -925,7 +925,7 @@ impl BindingAnnotation {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum BindingProblems {
     /// <https://doc.rust-lang.org/stable/error_codes/E0416.html>
     BoundMoreThanOnce,
@@ -935,7 +935,7 @@ pub enum BindingProblems {
     NotBoundAcrossAll,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Binding {
     pub name: Name,
     pub mode: BindingAnnotation,
@@ -945,7 +945,7 @@ pub struct Binding {
     pub hygiene: HygieneId,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct RecordFieldPat {
     pub name: Name,
     pub pat: PatId,

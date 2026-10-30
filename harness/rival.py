@@ -10,9 +10,9 @@ same pinned source, each arm in a checkout, home, store and target directory of 
 
 Per project and arm:
   cold       the first build from nothing (no target, empty store, no daemon), plus for a blaze
-             arm the wait until its daemon has the workspace loaded (`ready_s`); the standard
-             library comes from a remote made once by the arm's own `std` command, as a release
-             ships it
+             arm the wait until its daemon has the workspace loaded (`ready_s`); under ours the
+             standard library's crates are units of that build like any other, under Astral's
+             they come from a remote made once by its own `std` command, as its release ships them
   no-op      the build again with nothing changed
   body       a statement added to one function's body (bench.py's `body` edit)
   signature  a method gets a parameter and every caller the argument (bench.py's `signature`)
@@ -253,8 +253,8 @@ class Runner:
 
 
 def shipped_std(arm, runner, work):
-    """A remote with the arm's standard library unit, made by its own `std` command once, as its
-    release would ship it."""
+    """A remote with Astral's arm's standard library unit, made by its own `std` command once, as
+    its release would ship it."""
     remote = os.path.join(work, f"std-{arm.name}")
     if os.path.isdir(remote):
         return remote
@@ -340,7 +340,7 @@ def measure(name, spec, arms, given, log):
         runners[arm.name].stop()
     for arm in arms:
         r = runners[arm.name]
-        if r.prefix:
+        if r.prefix and arm.kind == "astral":
             try:
                 r.env[r.prefix + "STD_FROM"] = shipped_std(arm, r, given.work)
             except (RuntimeError, subprocess.CalledProcessError) as e:

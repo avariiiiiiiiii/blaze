@@ -120,25 +120,6 @@ jobs:
           name: ${{ env.NAME }}
           path: ${{ env.NAME }}.tar.gz*
           if-no-files-found: error
-      # The standard library a build with nothing of rustc's starts from, made by the binary
-      # just archived for the toolchain the README pins, so that no user's first build makes
-      # it. The release's assets are the remote its builds fetch it from: each file of the
-      # remote under its path with `.` for `/`. A release without them builds it on the
-      # user's machine, so this does not hold the release up.
-      - name: Standard library
-        continue-on-error: true
-        run: |
-          shipped/blaze-engine std "$RUNNER_TEMP/std" "$(rustc +"$(cat harness/toolchain)" --print sysroot)"
-          mkdir std-assets
-          cd "$RUNNER_TEMP/std"
-          find manifests packs keys -type f ! -name '*.lock' | while read -r file; do
-            cp "$file" "$GITHUB_WORKSPACE/std-assets/${file//\//.}"
-          done
-      - uses: actions/upload-artifact@v7
-        with:
-          name: std-${{ matrix.target }}
-          path: std-assets/*
-          if-no-files-found: warn
 
   # blaze's crate and the forks it depends on (`blaze-hir`, `blaze-rustc_abi`, ...) on crates.io, as
   # its own job so it can be rerun alone: versions already published are skipped. Each crate is
@@ -196,8 +177,7 @@ jobs:
           EOF
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
-            out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/library-*.tar.xz \
-            out/manifests.* out/packs.* out/keys.*
+            out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/library-*.tar.xz
       # A canary: the canary pointer names it (what a workspace pinned to canary reads), and
       # promote.yaml tests the archives just published and makes this same release stable when
       # they pass (docs/release.md). By dispatch, since a release this token publishes starts no

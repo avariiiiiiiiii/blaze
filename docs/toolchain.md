@@ -102,13 +102,13 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    since.) The train is
    what a bump needs beyond the gate: every harness on four platforms and `blaze` on real
    projects.
-4. When the train finishes, `harness/stdcount.py` compiles the standard library with the bump's
-   build and with `toolchain/base`'s (the same main commit, the old pin), each against its own
-   `library/`, and counts the functions each refuses. Against main's newest build
-   instead, the first bump counted +1463 that were main's std fixes since the bump's commit. The verdict (`.github/scripts/toolchain_bump_ci.py verdict`):
+4. When the train finishes, the verdict (`.github/scripts/toolchain_bump_ci.py verdict`)
+   compares its jobs with `toolchain/base`'s train. (v1's count of the functions the standard
+   library refused, `stdcount.py`, was deleted on 2026-10-30: v2 compiles std's crates as units
+   of the build like any other, and the train's harnesses build them.)
    - **green**: no job or harness red that is green on `toolchain/base`'s train (waited for, or
-     started if there is none; main's newest finished train only if it was cancelled), and no
-     more std refusals than main: `gh pr merge --auto`, so it lands once the gate passes, and
+     started if there is none; main's newest finished train only if it was cancelled):
+     `gh pr merge --auto`, so it lands once the gate passes, and
      the next release of blaze carries the new pin. The gate passed hours before, and GitHub
      acts on auto-merge only when a check finishes after it is set, so the gate's `ci` job runs
      again (seconds). A merge made for GITHUB_TOKEN starts no workflow, so once it merges the

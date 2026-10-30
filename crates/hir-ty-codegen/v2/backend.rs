@@ -111,10 +111,17 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
         // alloc: the error's message
         return Err(fail(format!("a unit for {:?} with a spec for {:?}", unit.arch, toolchain.arch)));
     }
-    if toolchain.arch == Arch::Wasm32 {
-        return Err(fail("wasm: v2 builds in the bodies wasm-bindgen needs built in, and has no \
-                         relocations of wasm's, neither of which it has yet"
-            .to_owned())); // alloc: the error's message
+    // wasm32 code is written from the IR by `wasm::lower` where Cranelift's would be made
+    // (`emit_with`): no other back end has code of the form a page links
+    // (`blaze_codegen::wasm::Code`), and none counts into cells, which a page has none of.
+    if toolchain.arch == Arch::Wasm32 && (!spec.backend.is_cranelift() || spec.counted) {
+        // alloc: the error's message
+        return Err(fail(format!(
+            "a wasm32 unit for {:?}{}: wasm32 code is lowered from the IR as Cranelift's is \
+             compiled (`wasm::lower`), and counts no calls",
+            spec.backend,
+            if spec.counted { " that counts its calls" } else { "" }
+        )));
     }
     let target = crate::Target::selected().map_err(fail)?;
     let arch = match target.arch {
@@ -354,6 +361,15 @@ pub(super) fn built_function(
     }
     let inlined = super::frontend::inlined(db, hashes, (instance, inlined)).map_err(fail)?;
     let (features, own_features) = features(db, spec, instance).map_err(fail)?;
+    let wasm = if unit.arch == Arch::Wasm32 {
+        let requests = match &code {
+            Built::Ir(pending) => &pending.wants.requests,
+            Built::Assembled(_, requests) => requests,
+        };
+        super::wasm::header(db, instance, requests).map_err(fail)?
+    } else {
+        Default::default()
+    };
     Ok(Function {
         code,
         places,
@@ -368,6 +384,7 @@ pub(super) fn built_function(
         // A fold would share one function's counter cells between its members, and
         // give one function's code of its own target features to the others.
         foldable: !spec.counted && !own_features && foldable(db, instance),
+        wasm,
     })
 }
 
@@ -538,6 +555,12 @@ pub(super) fn built(db: &Db, instance: &HirInstance, checked: bool) -> Result<Bu
 
 /// The function of an `asm!` block: its assembly, which names nothing.
 fn assembled(text: &str) -> Result<Built, String> {
+    if crate::Target::selected()?.is_wasm() {
+        // alloc: the error's message
+        return Err("an `asm!` or `global_asm!` function on wasm32: blaze assembles x86-64 and \
+                    AArch64, and wasm32's ISA is one whose settings only the IR borrows"
+            .to_owned());
+    }
     let isa = crate::target().map_err(|e| e.to_string())?; // alloc: the error's message
     // alloc: only an `asm!` function, whose assembler takes the triple as text
     let assembled = crate::asm::assemble(&isa.triple().to_string(), text)?;
@@ -822,14 +845,14 @@ fn emit_built(
             ),
         ));
     }
-    let Function { code, places, spans, variables, scopes, inlined, .. } = *function;
+    let Function { code, places, spans, variables, scopes, inlined, wasm, .. } = *function;
     let named = Named { spans: &spans, variables: &variables, scopes: &scopes, inlined };
     match code {
         Built::Ir(pending) => {
             let code = backend(pending.func, &pending.named)?;
-            told(unit, &places, &pending.wants.requests, code, refs, named)
+            told(unit, (&places, &wasm), &pending.wants.requests, code, refs, named)
         }
-        Built::Assembled(code, requests) => told(unit, &places, &requests, code, refs, named),
+        Built::Assembled(code, requests) => told(unit, (&places, &wasm), &requests, code, refs, named),
     }
 }
 
@@ -863,12 +886,12 @@ pub(crate) fn emitted(
     code: fragment::Code,
     refs: &Refs,
 ) -> Result<Emitted, CodegenError> {
-    told(unit, &function.places, function.requests(), code, refs, function.named())
+    told(unit, (&function.places, &function.wasm), function.requests(), code, refs, function.named())
 }
 
 fn told(
     unit: &Unit,
-    places: &Places,
+    (places, wasm): (&Places, &super::wasm::Header),
     requests: &Requests,
     code: fragment::Code,
     refs: &Refs,
@@ -896,6 +919,7 @@ fn told(
             resolve,
             spans,
             side.as_ref().map(|it| it.1),
+            wasm,
         )?;
         Ok::<_, String>((compiled, side))
     })
@@ -931,7 +955,7 @@ fn emit_ir(
         let none = side::Scopes::default();
         // alloc: empty, allocates nothing
         let named = Named { spans: &[], variables: &[], scopes: &none, inlined: Vec::new() };
-        told(unit, &function.places, function.requests(), code, refs, named)
+        told(unit, (&function.places, &function.wasm), function.requests(), code, refs, named)
     } else {
         let code = compiled(unit, ir, &pending.named, false, function.features)?;
         emitted(unit, function, code, refs)
@@ -1175,7 +1199,12 @@ impl<'db> Prepare for Backends<'db> {
                 what: "a fold of no functions".to_owned(), // alloc: the error's message
             });
         };
-        let pointer = isa(first)?.pointer_type();
+        // On wasm32 the ISA is one whose settings the IR is made under, with its 64-bit
+        // pointers; the IR's are 32-bit.
+        let pointer = match first.arch {
+            Arch::Wasm32 => ir::types::I32,
+            Arch::X86_64 | Arch::Aarch64 => isa(first)?.pointer_type(),
+        };
         super::fold::merge(group, &members, pointer, |unit, _, function, ir, refs| {
             emit_ir(unit, function, ir, refs)
         })

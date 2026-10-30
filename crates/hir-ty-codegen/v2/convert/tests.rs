@@ -77,7 +77,8 @@ fn convert(code: Code, requests: &Requests) -> Result<blaze_codegen::CompiledFun
     let body = || Ok(Target::Extern("body".to_owned()));
     let resolve = Resolve { func: &func, data: &data, symbol: &symbol, body: &body };
     blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
-        function(frame, key(), Arch::X86_64, isa, code, requests, &resolve, &[span(0), span(1)], None)
+        let none = &crate::v2::wasm::Header::default();
+        function(frame, key(), Arch::X86_64, isa, code, requests, &resolve, &[span(0), span(1)], None, none)
     })
 }
 

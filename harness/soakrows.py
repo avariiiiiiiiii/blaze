@@ -482,7 +482,7 @@ def pinned_to_a_nightly(row):
 
 # The programs of one build, which run each other from next to themselves: with one missing,
 # `blaze` is cargo's.
-PROGRAMS = ("blaze-engine", "blaze", "blaze-rustc")
+PROGRAMS = ("blaze-engine", "blaze")
 
 
 def another_build(source, bin):

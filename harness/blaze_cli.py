@@ -47,18 +47,20 @@ import collections, contextlib, glob, json, os, re, shutil, signal, stat, subpro
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-# `mixed` turns incremental compilation off for the harnesses of the mixed model. Here it
-# stays as the caller has it: without it the tests of every project are cargo's, and that
-# case is one of the flags.
-INCREMENTAL = os.environ.get("CARGO_INCREMENTAL")
-from mixed import host
-if INCREMENTAL is None:
-    os.environ.pop("CARGO_INCREMENTAL", None)
-else:
-    os.environ["CARGO_INCREMENTAL"] = INCREMENTAL
+# The cargo this compares with is the pinned nightly's.
+os.environ.setdefault("RUSTUP_TOOLCHAIN", open(os.path.join(HERE, "toolchain")).read().strip())
+# Set, not unset: cargo's `[env]` fills in only what is not already set, so an unset
+# RUST_BACKTRACE would take its value and panics would print differently.
+os.environ["RUST_BACKTRACE"] = "0"
 ROOT = os.path.dirname(HERE)
 WINDOWS = os.name == "nt"
 EXE = ".exe" if WINDOWS else ""
+
+
+def host():
+    return subprocess.check_output(["rustc", "-vV"], text=True).split("host: ")[1].split()[0]
+
+
 BLAZE = os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine" + EXE)
 TOOLCHAIN = open(os.path.join(HERE, "toolchain")).read().strip()
 SOURCES = os.environ.get("BLAZE_PROJECTS") or os.path.expanduser("~/blaze-projects")
@@ -243,7 +245,7 @@ def another_build(other):
     step of blaze-platform.yaml): a load of a workspace with a proc macro fails without the
     proc-macro server (`own_macro::find`)."""
     os.makedirs(other, exist_ok=True)
-    shipped = [it + EXE for it in ("blaze-engine", "blaze", "blaze-rustc", "blaze-proc-macro-srv")]
+    shipped = [it + EXE for it in ("blaze-engine", "blaze", "blaze-proc-macro-srv")]
     for name in shipped:
         if os.path.exists(os.path.join(os.path.dirname(BLAZE), name)):
             shutil.copy(os.path.join(os.path.dirname(BLAZE), name), os.path.join(other, name))
@@ -1318,8 +1320,8 @@ pub fn moved() -> usize { let text = String::new(); taken(text) + text.len() }
 
 
 def manners(work, ws, env, here, check, edit):
-    """What the commands say for themselves, a daemon that is going away, the store that is
-    on without being asked for, and an error only rustc's borrow checker finds."""
+    """What the commands say for themselves, a daemon that is going away, and an error only
+    rustc's borrow checker finds."""
     for argv in (["blaze-engine", "--help"], ["blaze-engine", "-h"], ["blaze", "--help"], ["blaze", "-h"]):
         ran = subprocess.run([BLAZE, *argv[1:]] if argv[0] == "blaze-engine" else argv, cwd=ws, env=env, capture_output=True, text=True)
         listed = all(word in ran.stdout for word in ("status", "stop"))
@@ -1327,7 +1329,7 @@ def manners(work, ws, env, here, check, edit):
 
     here.cargo("build")
     wait_warm(here, ws)
-    for argv in ([BLAZE, "status"], [BLAZE, "cache", "stats"], [BLAZE, "--help"], ["blaze", "status"], ["blaze", "--help"]):
+    for argv in ([BLAZE, "status"], [BLAZE, "tables", "--format=json"], [BLAZE, "--help"], ["blaze", "status"], ["blaze", "--help"]):
         shown = subprocess.Popen(argv, cwd=ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         shown.stdout.close()
         said = shown.stderr.read()
@@ -1363,25 +1365,6 @@ def manners(work, ws, env, here, check, edit):
         _, mended = here.cargo("run")
         check("and the build once it is mended is right", mended.returncode == 0 and "hello world" in mended.stdout, how_built(mended.stderr))
     here.cargo("stop")
-
-    for value, kept in ((None, True), ("off", False), ("0", False), ("", False)):
-        cache = os.path.join(work, f"cache-{value}")
-        home = os.path.join(work, f"home-store-{value}")
-        own = base_env(home)
-        own.pop("BLAZE_CACHE")
-        own["XDG_CACHE_HOME"] = cache
-        if value is not None:
-            own["BLAZE_CACHE"] = value
-        side = Side(ws, own, True)
-        edit(ws, f"store {value}")
-        side.cargo("build")
-        wait_warm(side, ws)
-        store = os.path.join(cache, "blaze", "store")
-        filled = os.path.isdir(store) and any(files for _, _, files in os.walk(store))
-        stats = subprocess.run([BLAZE, "cache", "stats"], cwd=ws, env=own, capture_output=True, text=True)
-        side.cargo("stop")
-        asked = "unset" if value is None else repr(value)
-        check(f"BLAZE_CACHE {asked}: the store is {'on, in the user cache directory' if kept else 'off'}", filled == kept and (stats.returncode == 0) == kept, f"`blaze-engine cache stats` exit {stats.returncode}")
 
 
 def greets(out, greeting):
@@ -1571,14 +1554,15 @@ def stranger(home, check):
         check("with the modes opened, the daemon turns the second user away by its uid", refused.startswith("answer:") and "Status" not in refused and "the peer is user" in log, f"{refused!r}")
         mine = knock(None)
         check("and still answers its own user", "Status" in mine, mine[:60])
-        # The other way round: the second user listens where a command line points the
-        # user's client, which sends its request and its variables to whoever serves it.
-        trap = os.path.join(tempfile.mkdtemp(prefix="blaze-trap-", dir="/tmp"), "sock")
+        # The other way round: the second user listens where BLAZE_HOME points the user's
+        # client, which sends its request and its variables to whoever serves it.
+        trap = os.path.join(tempfile.mkdtemp(prefix="blaze-trap-", dir="/tmp"), "v2.sock")
         os.chmod(os.path.dirname(trap), 0o777)
         listener = subprocess.Popen(["sudo", "-n", "-u", name, sys.executable, "-c", LISTEN, trap], stdout=subprocess.PIPE, text=True, cwd="/")
         try:
             listener.stdout.readline()
-            asked = subprocess.run([BLAZE, "sync", trap], capture_output=True, text=True, timeout=60)
+            asked = subprocess.run([BLAZE, "status"], capture_output=True, text=True, timeout=60,
+                                   env=dict(os.environ, BLAZE_HOME=os.path.dirname(trap)))
             heard = listener.communicate(timeout=30)[0].strip()
         finally:
             listener.kill()

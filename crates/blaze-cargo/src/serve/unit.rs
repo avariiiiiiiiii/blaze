@@ -14,6 +14,7 @@
 //!   run in blaze's MIR evaluator under the checker of undefined behavior, nothing compiled.
 //! - [`run`]: the program `cargo run` picks, run in the tests' sandbox.
 //! - [`reach`]: what a change reaches, from the database's facts.
+//! - [`pack`]: `blaze pack`'s pack of a checked program, for blaze's in-browser compiler.
 //! - [`say`]: cargo's own lines (`error: ...`, `warning: ...`) as diagnostics.
 //!
 //! The front end is written by the loop alone, through the job's [`UnitWriter`], and read by
@@ -34,6 +35,7 @@ mod files;
 mod graph;
 mod harness;
 mod intent;
+mod pack;
 mod reach;
 mod run;
 mod say;
@@ -787,6 +789,21 @@ impl Front<Real> for JobFront {
         let mut counted = writer.tables()?;
         counted.extend_from_slice(images);
         Ok(summed(counted))
+    }
+
+    fn pack(&self, mut writer: UnitWriter, program: &str) -> Result<Vec<u8>, Failed> {
+        if self.0.cancelled() {
+            return Err(Failed::Again);
+        }
+        if !writer.apply()? {
+            let what = "the pack is made with no task reading the front end, and one still does";
+            return Err(ApiError::new(what, None).into());
+        }
+        let Some(lowered) = Arc::get_mut(&mut writer.front) else {
+            let what = "the pack is made with no task reading the front end, and one still does";
+            return Err(ApiError::new(what, None).into());
+        };
+        cancellable(|| pack::pack(&self.0, lowered, program))?.map_err(Failed::Error)
     }
 }
 

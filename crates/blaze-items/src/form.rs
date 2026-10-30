@@ -469,19 +469,27 @@ pub(crate) struct Cx<'db> {
     reference: Option<Reference<'db>>,
 }
 
+/// A type as [`ty_form`] and [`signature_ty_form`] keep it, interned: a tracked function's one
+/// argument is a salsa struct.
+#[salsa::interned(debug, revisions = usize::MAX)]
+pub(crate) struct FormTy<'db> {
+    #[returns(copy)]
+    pub(crate) ty: StoredTy,
+}
+
 /// A type's form, spelled once per revision for every item that writes it and kept across
 /// revisions while what it reads is unchanged: rustc's stable hash cached in each interned
 /// type, with salsa's backdating on top.
 #[salsa::tracked(returns(ref), cycle_result = ty_form_cycle)]
-pub(crate) fn ty_form(db: &Db, ty: StoredTy) -> Code {
+pub(crate) fn ty_form<'db>(db: &'db Db, ty: FormTy<'db>) -> Code {
     let mut form = Form::new("ty");
-    Cx::new(db).spell(&mut form, ty.as_ref());
+    Cx::new(db).spell(&mut form, ty.ty(db).as_ref());
     form.code()
 }
 
 /// A type met again while it is spelled contains itself, which only a program rustc rejects
 /// has: every type of the cycle gets this, whichever of them was asked for first.
-fn ty_form_cycle(_: &Db, _: salsa::Id, _: StoredTy) -> Code {
+fn ty_form_cycle<'db>(_: &'db Db, _: salsa::Id, _: FormTy<'db>) -> Code {
     let mut form = Form::new("ty");
     form.error(Missed::ErrorType);
     form.code()
@@ -491,9 +499,9 @@ fn ty_form_cycle(_: &Db, _: salsa::Id, _: StoredTy) -> Code {
 /// closure's captures and a coroutine's held locals, which are of the inference and MIR of
 /// the body the closure is written in.
 #[salsa::tracked(returns(ref), cycle_result = ty_form_cycle)]
-pub(crate) fn signature_ty_form(db: &Db, ty: StoredTy) -> Code {
+pub(crate) fn signature_ty_form<'db>(db: &'db Db, ty: FormTy<'db>) -> Code {
     let mut form = Form::new("ty");
-    Cx::leak_free(db).spell(&mut form, ty.as_ref());
+    Cx::leak_free(db).spell(&mut form, ty.ty(db).as_ref());
     form.code()
 }
 
@@ -883,10 +891,11 @@ impl<'db> Cx<'db> {
         {
             return code;
         }
+        let key = FormTy::new(self.db, ty.store());
         let code = if self.leak_free {
-            signature_ty_form(self.db, ty.store())
+            signature_ty_form(self.db, key)
         } else {
-            ty_form(self.db, ty.store())
+            ty_form(self.db, key)
         };
         entry.set(Some((ty, code)));
         code
@@ -3107,10 +3116,8 @@ impl Drop for Canon<'_, '_> {
 pub(crate) mod check {
     use std::fmt::Debug;
 
-    use hir_ty::{
-        db::HirDatabase,
-        mir::{BasicBlockId, MirBody},
-    };
+    use base_db::Db;
+    use hir_ty::mir::{BasicBlockId, MirBody};
 
     use super::{Canon, Cx, Form, local_index};
     use crate::ItemId;

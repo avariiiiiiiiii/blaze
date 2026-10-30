@@ -18,13 +18,10 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 - [harness.md](harness.md): The harnesses that test blaze (real crates' own tests, and blaze held to itself), what each checks, and how CI runs them.
 - [install.md](install.md): Installing blaze: the install script, the release channels and what gets installed.
 - [mir-passes.md](mir-passes.md): The MIR passes from built MIR to runtime MIR, ported from rustc, that codegen and the interpreter run on.
-- [platforms.md](platforms.md): The state of each platform blaze runs on, from the last CI run that covered them all.
 - [release.md](release.md): Releases: the canary and stable channels, how a release is cut and what gates promotion to stable.
 - [resolve.md](resolve.md): Reading Cargo.toml and .cargo/config.toml as cargo does (blaze-manifest), and how it measured against cargo.
-- [support.md](support.md): What is supported, cell by cell, each pointing at the report or harness run behind it.
 - [toolchain.md](toolchain.md): blaze's own pinned nightly: what it is, how it is fetched and checked, and the daily bump.
 - [usage.md](usage.md): Getting started: using blaze on a project, in short.
-- [web.md](web.md): The build page blaze ui serves: every function of the build drawn live on the GPU, from a Flecs world of the program.
 
 ## Plans
 
@@ -375,6 +372,9 @@ Designs not (fully) built, newest first.
 
 Research, reports and measurements, true on their date and not brought up to date. Newest first.
 
+- [web.md](web.md) (2026-10-30): The build page v1's blaze ui served, every function of the build drawn live on the GPU from a Flecs world of the program. v2 has no blaze ui and its daemon does not start the page.
+- [support.md](support.md) (2026-10-30): What blaze v1 supported, cell by cell, each pointing at the report or harness run behind it. v2 has none of these measurements yet.
+- [platforms.md](platforms.md) (2026-10-30): The state of each platform under blaze v1 (rustc's link line, the splice, `blaze-engine weaken`), from v1's last CI run that covered them all. v2 has not been run on any platform yet.
 - [doc.md](doc.md) (2026-10-30): blaze doc as blaze v1 did it (the engine's doc.rs, over a workspace loaded into rust-analyzer): HTML documentation written from the front end's HIR, with no rustdoc. v2 has no `blaze doc` yet.
 - [rename.md](rename.md) (2026-10-28): The rename from ra-jit and cargo blaze to blaze (#270), and what tools/rename.py changes.
 - [results.md](results.md) (2026-10-27): Results: every number with the harness, commit and report it came from.

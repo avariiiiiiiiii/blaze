@@ -69,15 +69,7 @@ def main():
                RUSTUP_TOOLCHAIN="nr-pin",
                BLAZE_HOME=home, BLAZE_CACHE=store, CARGO_HOME=cargo_home, RUST_BACKTRACE="0",
                BLAZE_SKIPPED=f"{L}/logs/{name}.skipped", NR_LOG=log, **spec.get("env", {}))
-    # A release ships the standard library its builds start from (crates/blaze-engine/src/shipped.rs):
-    # made here by the blaze under test as the release workflow makes it, from the toolchain
-    # the builds use, and fetched by the first build. NR_STD=build has the builds make it.
-    if os.environ.get("NR_STD") != "build":
-        toolchain = f"{L}/tc-pin"
-        shipped = f"{L}/std-remote"
-        # What the toolchain runs for it is the release's, not the build's: counted apart.
-        subprocess.run(["blaze-engine", "std", shipped, toolchain], env=dict(env, NR_LOG=f"{L}/logs/std.log"), check=True)
-        env["BLAZE_STD_FROM"] = shipped
+    # The standard library's crates are units of the first build like any other.
     extra = json.loads(os.environ.get("NR_ENV", "{}"))
     env.update(extra)
     steps_out = f"{L}/logs/{name}.steps.jsonl"

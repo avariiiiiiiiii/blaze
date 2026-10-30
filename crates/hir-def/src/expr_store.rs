@@ -121,7 +121,7 @@ pub type TypeSource = InFile<TypePtr>;
 pub type LifetimePtr = AstPtr<ast::Lifetime>;
 pub type LifetimeSource = InFile<LifetimePtr>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ExprRoot {
     root: ExprId,
     // We store, for each root, the range of exprs (and pats and bindings) it holds.
@@ -134,7 +134,7 @@ struct ExprRoot {
 
 // We split the store into types-only and expressions, because most stores (e.g. generics)
 // don't store any expressions and this saves memory. Same thing for the source map.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct ExpressionOnlyStore {
     /// The expressions and patterns.
     columns: HirColumns<Frozen>,
@@ -201,7 +201,7 @@ fn kinds_of(expr_kind: &[u8]) -> u64 {
     expr_kind.iter().fold(0, |kinds, &kind| kinds | 1 << kind)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ExpressionStore {
     expr_only: Option<Box<ExpressionOnlyStore>>,
     /// The type refs ([`ExpressionStore::type_ref`]).
@@ -299,7 +299,7 @@ pub enum MissingBodyItemKind {
     TypeAlias,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Hash)]
 pub enum ExpressionStoreDiagnostics {
     InactiveCode { node: InFile<SyntaxNodePtr>, cfg: CfgExpr },
     UnresolvedMacroCall { node: InFile<MacroCallPtr>, path: ModPath },

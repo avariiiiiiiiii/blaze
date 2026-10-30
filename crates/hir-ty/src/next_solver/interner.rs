@@ -3033,7 +3033,7 @@ TrivialTypeTraversalImpls! {
 mod tls_db {
     use std::{cell::Cell, ptr::NonNull};
 
-    use crate::db::HirDatabase;
+    use base_db::Db;
 
     struct Attached {
         database: Cell<Option<NonNull<Db>>>,

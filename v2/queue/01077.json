@@ -1,0 +1,24 @@
+{
+  "id": "01077",
+  "from_lane": "integrate-tooling",
+  "owner": "integrate-store",
+  "paths": [
+    "harness/",
+    "tools/bench/remote-cache/selfbuild/"
+  ],
+  "what": "From integrate-tooling: deleted as v1 store/remote harnesses: soak.py (you had edited it), freshwarm.py, deps.py, bscache.py, allblaze.py, keys.py (store key correctness: a v2 harness for keys missing an input is yours to decide), stdstatics.py (std units relocatable), fncache.py, fnincr.py, frozenwarm.py, netdown.py. Left to you: tools/bench/remote-cache/selfbuild (xfer.sh runs `blaze-engine cache push|pull`, step0.sh packs blaze-rustc, bench.py sets BLAZE_CACHE), .github/actions/blaze/action.yml:10 (`blaze-engine cache build`). Many kept harnesses still set BLAZE_CACHE (blaze_cli.py base_env, soakrows.py, constmacros.py, anonstatics.py, hermetic.py, live_types.py, tiers.py, abbench.py, coldprof.py, realbench.py, warmstart.py, memsplit.py, norustc.py, norustc/count.py, own_inputs.py, spare.py, bench.py): v2's store is <BLAZE_HOME>/v2/store, so these are dead settings, or refused if v2 refuses unknown BLAZE_* variables; say which and whether a sweep is yours.",
+  "state": "open",
+  "created": "2026-10-30T15:39:32Z",
+  "updated": "2026-10-30T15:39:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:39:32Z",
+      "by": "integrate-tooling",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

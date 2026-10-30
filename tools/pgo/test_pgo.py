@@ -308,8 +308,8 @@ class Steps(unittest.TestCase):
 
     def test_binaries(self) -> None:
         manifest = '[package]\nname = "e"\n[[bin]]\nname = "blaze-engine"\npath = "src/main.rs"\n'
-        got = pgo.binaries(manifest, ["blaze", "blaze-rustc"])
-        self.assertEqual(got, ["blaze", "blaze-engine", "blaze-rustc"])
+        got = pgo.binaries(manifest, ["blaze", "blaze-proc-macro-srv"])
+        self.assertEqual(got, ["blaze", "blaze-engine", "blaze-proc-macro-srv"])
         off = '[package]\nname = "e"\nautobins = false\n[[bin]]\nname = "blaze-engine"\n'
         self.assertEqual(pgo.binaries(off, ["blaze"]), ["blaze-engine"])
         engine = (HERE.parents[1] / "crates" / "blaze-engine" / "Cargo.toml").read_text()

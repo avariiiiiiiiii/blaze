@@ -47,6 +47,7 @@ pub(crate) mod statics;
 mod tests;
 pub(crate) mod toolchain;
 pub(crate) mod unwind;
+pub(crate) mod wasm;
 
 pub use backend::Backends;
 pub use frontend::{BodyChecks, Databases, HirFrontend};
@@ -247,6 +248,8 @@ pub(crate) struct Function {
     /// Whether a fold may give it another function's code: not where its address is
     /// significant (a symbol of its own) or it is C-variadic.
     pub(crate) foldable: bool,
+    /// On wasm32, what its code's header says of its imports and export; empty elsewhere.
+    pub(crate) wasm: wasm::Header,
 }
 
 pub(crate) enum Built {

@@ -134,6 +134,7 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
             }
         }
         Response::Announced { root } => put!(out, "{} {root}\n", status("Announced")),
+        Response::Packed { pack } => put!(out, "{} {} bytes\n", status("Packed"), pack.len()),
         Response::TestResult(result) => test_lines(out, result, color),
         Response::Ran { code, stdout, stderr } => {
             bytes(out, stdout);

@@ -21,8 +21,8 @@ use crate::{
     UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 23;
-const RESPONSES: usize = 27;
+const REQUESTS: usize = 24;
+const RESPONSES: usize = 28;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -286,6 +286,7 @@ impl Gen {
                 wait_ms: self.wide(),
             },
             21 => Request::Memory,
+            22 => Request::Pack { view: self.view(0), targets: self.targets(), program: self.text() },
             _ => Request::Stop,
         }
     }
@@ -598,6 +599,7 @@ impl Gen {
                 committed: self.wide(),
                 committed_high_water: self.wide(),
             }),
+            26 => Response::Packed { pack: self.bytes() },
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
             }
@@ -656,7 +658,8 @@ fn request_index(request: &Request) -> usize {
         Request::WillTest { .. } => 19,
         Request::WillSave { .. } => 20,
         Request::Memory => 21,
-        Request::Stop => 22,
+        Request::Pack { .. } => 22,
+        Request::Stop => 23,
     }
 }
 
@@ -689,7 +692,8 @@ fn response_index(response: &Response) -> usize {
         Response::Edited(_) => 23,
         Response::Announced { .. } => 24,
         Response::Memory(_) => 25,
-        Response::Of { .. } => 26,
+        Response::Packed { .. } => 26,
+        Response::Of { .. } => 27,
     }
 }
 

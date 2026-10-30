@@ -31,7 +31,6 @@ include = [
   ".github/scripts/downstream_build.py",
   "harness/ci.py",
   "harness/focused.py",
-  "harness/fnincr.py",
   "harness/fuzz/edits.py",
   "harness/includes.py",
   "harness/keys.py",
@@ -44,10 +43,9 @@ include = [
   "tools/v2",
 ]
 
-# These older harnesses arrange their sibling imports after computing HERE. Their runtime
+# These harnesses arrange their sibling imports after computing HERE. Their runtime
 # migration keeps that existing import order; new workspace packages use normal imports.
 [tool.ruff.lint.per-file-ignores]
-"harness/fnincr.py" = ["E402"]
 "harness/fuzz/edits.py" = ["E402"]
 "harness/includes.py" = ["E402"]
 "harness/keys.py" = ["E402"]
@@ -59,7 +57,6 @@ include = [
   ".github/scripts/downstream_build.py",
   "harness/ci.py",
   "harness/focused.py",
-  "harness/fnincr.py",
   "harness/fuzz/edits.py",
   "harness/includes.py",
   "harness/keys.py",

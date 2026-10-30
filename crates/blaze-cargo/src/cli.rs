@@ -10,7 +10,8 @@
 //! - [`daemon`]: finding and starting `blaze serve`, and the [`daemon::Api`] it is spoken to by.
 //! - [`print`]: a build's responses as cargo's lines; [`say`] and [`json`] are their texts.
 //! - [`run`] and [`test`]: what runs after the build.
-//! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`).
+//! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`),
+//!   and `pack`, the in-browser compiler's pack of a program.
 
 #![forbid(unsafe_code)]
 
@@ -65,6 +66,7 @@ Commands:
     codegen-inputs --format=json   Each instance the last build made, with its code hash
     trace --out PATH               Every result of the last build, with its edges, as CBOR
     tables --format=json           The size of each of the daemon's long-lived tables
+    pack -p PACKAGE --out PATH     The program checked for wasm32, packed for the in-browser compiler
 
 Options:
     -V, --version  Print version info and exit
@@ -133,7 +135,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 serve, stop, status, daemon, codegen-inputs, trace and tables"
+                 serve, stop, status, daemon, codegen-inputs, trace, tables and pack"
             );
             eprint!("{}", say::error(&what, auto_color()));
             FAILED

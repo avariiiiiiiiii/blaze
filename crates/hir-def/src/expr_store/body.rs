@@ -22,7 +22,7 @@ use crate::{
     src::HasSource,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Param<Id> {
     /// The id of the formal parameter. In analysis, you want to use this: it has a special status as a parameter,
     /// while [`user_written`][Self::user_written] is just a local variable.
@@ -41,7 +41,7 @@ impl<Id: Copy> Param<Id> {
 }
 
 /// The body of an item (function, const etc.).
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Hash)]
 pub struct Body {
     pub store: ExpressionStore,
     /// The patterns for the function's parameters. While the parameter types are
@@ -52,23 +52,6 @@ pub struct Body {
     /// empty.
     pub params: Box<[Param<PatId>]>,
     pub self_param: Option<Param<BindingId>>,
-}
-
-/// The hash of the buffer [`blaze_format::Persist`] writes. That encoding round-trips to an
-/// equal value (`persist::assert_round_trip`), so bodies of one encoding are equal, and an
-/// evicted body's fingerprint (db-salsa) covers all that `PartialEq` compares. Written only when
-/// a value is let go of, never on a read.
-impl std::hash::Hash for Body {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        blaze_format::to_bytes(self).hash(state);
-    }
-}
-
-/// As for [`Body`].
-impl std::hash::Hash for BodySourceMap {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        blaze_format::to_bytes(self).hash(state);
-    }
 }
 
 impl ops::Deref for Body {
@@ -91,7 +74,7 @@ impl ops::Deref for Body {
 /// both the HirFileId and the position inside the file. However, we only store
 /// AST -> ExprId mapping for non-macro files, as it is not clear how to handle
 /// this properly for macros.
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Default, Debug, Eq, PartialEq, Hash)]
 pub struct BodySourceMap {
     pub self_param: Option<InFile<SelfParamPtr>>,
     pub store: ExpressionStoreSourceMap,

@@ -62,6 +62,10 @@ pub enum ResponseRef<'a> {
     Edited(Edited),
     Announced { root: ContentId },
     Memory(Memory),
+    Packed {
+        #[serde(deserialize_with = "blaze_protocol::bytes::borrow")]
+        pack: &'a [u8],
+    },
 }
 
 /// [`Diagnostic`], read where it lies.
@@ -264,6 +268,7 @@ impl ResponseRef<'_> {
             ResponseRef::Edited(it) => Response::Edited(it),
             ResponseRef::Announced { root } => Response::Announced { root },
             ResponseRef::Memory(it) => Response::Memory(it),
+            ResponseRef::Packed { pack } => Response::Packed { pack: bytes(pack) },
         }
     }
 }

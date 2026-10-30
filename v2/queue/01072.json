@@ -1,0 +1,24 @@
+{
+  "id": "01072",
+  "from_lane": "integrate-docs",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/stub.rs",
+    "crates/blaze-units/src/load/sandbox.rs"
+  ],
+  "what": "From integrate-docs-cargo (read from code): (1) crates/blaze-cargo/src/stub.rs is an orphan file (no mod stub) that runs rustc: delete (no-rustc). (2) manifest opt-outs unsandboxed-proc-macros, build-script-env, wasi-build-scripts are accepted and only checked to be lists, then ignored (blaze-units load/sandbox.rs): a silent no-op, make them errors or honour them (no-fallback; with usercode). (3) no doctests (blaze test --doc makes none), no daemon idle exit, no command reports the Rust version, no blaze cache list/clear (blaze_cache::store::clear_stale uncalled). docs/cargo.md and docs/usage.md now say these as v2 gaps.",
+  "state": "open",
+  "created": "2026-10-30T15:15:12Z",
+  "updated": "2026-10-30T15:15:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:15:12Z",
+      "by": "integrate-docs",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

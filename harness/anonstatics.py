@@ -3,8 +3,8 @@
 through code blaze compiles, is rustc's static. Linux and macOS: on Windows `blaze`
 hands builds to cargo.
 
-usage: anonstatics.py    (BLAZE_BIN names the blaze built; blaze and blaze-rustc are
-                          found next to it)
+usage: anonstatics.py    (BLAZE_BIN names the blaze built; blaze is found next to
+                          it)
 
 objc2's `declare_class!` (winit 0.30's) keeps a class's ivar offsets in `static mut`s inside a
 `const _: () = { .. }`, written by rustc's code when the class registers and read by an

@@ -3,7 +3,7 @@
 
 use base_db::Db;
 use blaze_codegen::{
-    Arch, Init, RelocKind, Relocation, Static, backend::FrontRef, template::Refs, wasm::Import,
+    Arch, Init, Relocation, Static, backend::FrontRef, template::Refs, wasm::Import,
 };
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey};
@@ -14,12 +14,10 @@ use super::{
     places::{Placer, Ref, fill_type_ids, place_requests, resolve, weak_symbol},
 };
 use crate::{
-    ConstBlob, InstanceDef, compiled_static,
-    fragment::{CompiledStatic, FuncTarget, Requests},
+    ConstBlob, compiled_static,
+    fragment::{CompiledStatic, Requests},
     home::Homes,
-    is_thread_local, link_name,
-    wasm::WasmSignature,
-    wasm_import_module,
+    is_thread_local,
 };
 
 const VALUE_DOMAIN: &str = "blaze v2 static value 2";
@@ -54,11 +52,12 @@ pub(crate) fn value(
         // What code reads of it is the address of the symbol.
         Some(symbol) => {
             placer.place(FrontRef::Weak(symbol))?;
+            let word = crate::Target::selected()?.word();
             let blob = ConstBlob {
-                bytes: vec![0; 8], // alloc: only an `extern_weak` static, its one address
+                bytes: vec![0; word], // alloc: only an `extern_weak` static, its one address
                 relocs: Vec::new(), // alloc: empty, allocates nothing
                 fn_relocs: Vec::new(), // alloc: empty, allocates nothing
-                align: 8,
+                align: word as u64,
                 type_ids: Vec::new(), // alloc: empty, allocates nothing
             };
             (blob, Requests::default(), false)
@@ -118,60 +117,7 @@ fn value_id(
 
 fn wasm_imports(db: &Db, id: StaticId, requests: &Requests) -> Result<Vec<(String, Import)>, String> {
     // alloc: an error's name of the static
-    imports_of(db, requests, || format!("the static `{}`", StaticSignature::of(db, id).name.as_str()))
-}
-
-/// What each `#[link(wasm_import_module)]` function `requests` name is imported as, by its
-/// symbol (the `Target::Extern` it is a reference to): as rustc imports it, the field its
-/// link name and the type the one a call of it is lowered to ([`WasmSignature::of`], as
-/// `finish_wasm` declares an import). Empty but on a target whose objects are wasm's.
-/// `owner` names what asks, in an error: a static, or a function whose `Code::imports` these
-/// are.
-pub(crate) fn imports_of(
-    db: &Db,
-    requests: &Requests,
-    owner: impl Fn() -> String,
-) -> Result<Vec<(String, Import)>, String> {
-    // alloc: empty, allocates only for what points to a wasm import
-    let mut imports: Vec<(String, Import)> = Vec::new();
-    for request in &requests.funcs {
-        let FuncTarget::Instance(instance, _) = &request.target else { continue };
-        let InstanceDef::Fn(func) = instance.def else { continue };
-        let Some(module) = wasm_import_module(db, func) else { continue };
-        let Some(name) = link_name(db, func) else {
-            // alloc: an error
-            return Err(format!(
-                "{} points to a function of the wasm module `{module}` with no link name",
-                owner()
-            ));
-        };
-        let ty = WasmSignature::of(&request.sig).map_err(|what| {
-            // alloc: an error
-            format!(
-                "{} points to `{name}` of the wasm module `{module}`, whose signature has no \
-                 wasm type: {what}",
-                owner()
-            )
-        })?;
-        // clone: the field is the symbol, and both are the import's to keep
-        let import = Import { module, field: name.clone(), ty: ty.format() };
-        match imports.iter().find(|it| it.0 == name) {
-            Some((_, seen)) if *seen == import => {}
-            Some((_, seen)) => {
-                // alloc: an error
-                return Err(format!(
-                    "{} points to `{name}` as two imports: of `{}` with {:?}, and of `{}` with {:?}",
-                    owner(),
-                    seen.module,
-                    seen.ty,
-                    import.module,
-                    import.ty
-                ));
-            }
-            None => imports.push((name, import)),
-        }
-    }
-    Ok(imports)
+    super::wasm::imports(db, requests, || format!("the static `{}`", StaticSignature::of(db, id).name.as_str()))
 }
 
 /// The static `id` with its references at `refs`.
@@ -207,8 +153,11 @@ pub(crate) fn compile(
         super::convert::value(resolve.frame(), arch, &value.blob, &value.requests, resolve)
     })?;
     if weak_symbol(db, id)?.is_some() {
+        // The symbol is data whatever the static's type, as rustc declares it to LLVM: on
+        // wasm32 its address is in linear memory.
+        let kind = super::convert::word(arch).data;
         // clone: only an `extern_weak` static; `Relocation` owns its target
-        relocs.push(Relocation { at: 0, kind: RelocKind::Abs64, target: refs[0].clone(), addend: 0 });
+        relocs.push(Relocation { at: 0, kind, target: refs[0].clone(), addend: 0 });
     }
     // alloc: the error's message
     let align = u32::try_from(value.blob.align).map_err(|e| e.to_string())?;

@@ -178,4 +178,5 @@ that constant.
   nothing is hashed or compiled for the hash unless one is called, so a workspace without the
   attribute builds as it did before.
 
-`harness/fncache.py` checks it end to end; its `--live` mode checked v1's live edit.
+v1's `fncache.py` checked it end to end through v1's `cache` command; it was deleted on
+2026-10-30 with that command, and v2 has no end-to-end check of it yet.

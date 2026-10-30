@@ -29,7 +29,7 @@ small table of a few projects on one platform (PICK) between `<!-- benchpick:sta
 `memory`, `resident` and `disk_mb`, docs/benchmarks.md "Memory and disk") between
 `<!-- benchmem:start -->` and `<!-- benchmem:end -->`, and every number between
 `<!-- bench:start -->` and `<!-- bench:end -->`.
-A result of `bench.py --runtime` (harness/runbench.py's numbers) writes docs/benchmarks.md's
+A runtime result (v1's harness/runbench.py's numbers; v2 has no runtime bench yet) writes docs/benchmarks.md's
 runtime table instead, between `<!-- runbench:start -->` and `<!-- runbench:end -->`: how fast each
 benchmark's program runs built by blaze's LLVM against `cargo build --release`, and the
 geometric mean. It is stored in docs/benchmarks/runtime-<platform>.json, and differs when a
@@ -936,8 +936,8 @@ def runtime_section(results):
         lines += ["", f"**{p}**", "", *runtime_tables(r)]
     lines += ["", "Release with dev checks: `cargo build --release` with `-C overflow-checks=on -C debug-assertions=on`.", "",
               "</details>", "",
-              "Measured by hand with `harness/bench.py --runtime` (harness/runbench.py), or by the `bench-readme` workflow (a "
-              "project measured on its own, by its own workflow) on each platform's benchmark machine once it is registered. "
+              "Measured by v1's runbench.py on each platform's benchmark machine, the last results before v2, "
+              "which has no runtime bench yet. "
               f"Raw JSON: {raw_links(results, 'runtime')}.", RUN_END]
     return "\n".join(lines)
 

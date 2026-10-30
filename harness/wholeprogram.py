@@ -4,13 +4,11 @@
 usage: wholeprogram.py [CASE...] [--release] [--keep]
 
 Each case is a program of the workspace `harness/wholeprogram`, copied to a directory of
-its own. It is built with blaze as `RUSTC_WRAPPER` and `RUSTC_WORKSPACE_WRAPPER` as
-`runbench.py` builds a program: rustc builds the registry's crates and stand-ins of no code for
-the workspace's, and blaze compiles every crate of the program into one object, with the C
-`main` of it, which is linked in their place. The program runs with no arguments, and what it
-prints on either stream and the status it exits with have to be what Rust says of its source
-(`EXPECTED`: a pattern where a count is the standard library's to choose). blaze then builds
-the object once more, and it has to be the same bytes: a whole program's layout follows the
+its own, and built by `blaze build -p CASE` in an empty home. The program runs with no
+arguments, and what it prints on either stream and the status it exits with have to be what
+Rust says of its source (`EXPECTED`: a pattern where a count is the standard library's to
+choose). blaze then builds it once more, in another empty home and into the same target
+directory, and the executable has to be the same bytes: a whole program's layout follows the
 order its functions were asked for, not the order the threads finished them (#200).
 
   default_alloc  the default allocator; output on both streams and a status of its own
@@ -20,19 +18,16 @@ order its functions were asked for, not the order the threads finished them (#20
   trait_block    a method a trait provides calls a function declared in its body
   c_main         `#![no_main]` and a `main` of C's, as bun's, with a body of 16 384 statements
 
-The backend is `BLAZE_BACKEND`'s; `--release` builds both with the release profile. With
-LLVM, a build of a whole program, whichever `main` it has, leaves no function to Cranelift
-for being large or for its handlers, as a build that edits follow does.
+`--release` builds both with the release profile, which v2 compiles with LLVM; the dev
+profile it compiles with Cranelift.
 """
-import argparse, os, re, shutil, sys, tempfile
+import argparse, os, re, shutil, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import apps
+from rebuild import Project, copy, scratch
 
 CASES = ["default_alloc", "custom_alloc", "lib_alloc", "cfg_alloc", "trait_block", "c_main"]
-# What `backend::Backend::emit` leaves to Cranelift only in a build that is not of a whole program.
-NOT_WHOLE = ("a body larger than LLVM is given in a build", "a handler LLVM lowers only for a tier")
 
 
 def mixed(seed, rounds):
@@ -64,38 +59,39 @@ EXPECTED = {
 }
 
 
-def check(ws, case, release):
-    spec = {"package": case, "cargo_args": ["--release"] if release else []}
-    fx = apps.App(ws, spec, alone=True)
-    fx.blaze_args = ["--release"] if release else []
+def built(ws, work, case, release, name):
+    """`blaze build -p CASE` in the empty home `<work>/<name>`: (Built, the project)."""
+    project = Project(ws, work, home=os.path.join(work, name), name=name)
     try:
-        fx.rustc_build()
-        fx.blaze_build()
-    except SystemExit as failed:
-        return f"  blaze's build failed: {str(failed)[-800:]}"
-    log = open(os.path.join(fx.work, "all.stderr")).read()
-    left = [line.strip() for line in log.splitlines() if line.strip().endswith(NOT_WHOLE)]
-    if left:
-        return "  not built as a whole program, LLVM left to Cranelift:\n" + "\n".join(f"    {it}" for it in left)
+        return project.build(case, "-p", case, *(["--release"] if release else [])), project
+    finally:
+        project.stop()
+
+
+def check(ws, work, case, release):
+    shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
+    first, project = built(ws, work, case, release, f"{case}-1")
+    if first.status != 0 or not first.executable:
+        return f"  blaze's build failed ({first.status}):\n{first.said[-800:]}"
     status, stdout, stderr = EXPECTED[case]
-    got = fx.behaviour(fx.binary)
+    got = project.ran(first)
     lines = []
     if got[0] != status:
         lines.append(f"  status: {got[0]!r}, and Rust says {status}")
     for what, pattern, printed in (("stdout", stdout, got[1]), ("stderr", stderr, got[2])):
-        if re.fullmatch(pattern, printed.decode(errors="replace")) is None:
+        if re.fullmatch(pattern, printed) is None:
             lines.append(f"  {what}: {printed!r}, not /{pattern}/")
     if lines:
         return "\n".join(lines)
-    # The same source has to give the same object every build, whichever thread compiled
+    # The same source has to give the same executable every build, whichever thread compiled
     # which function first (#200).
-    first = open(fx.objects[0], "rb").read()
-    try:
-        fx.blaze_build()
-    except SystemExit as failed:
-        return f"  blaze's second build failed: {str(failed)[-800:]}"
-    if open(fx.objects[0], "rb").read() != first:
-        return f"  built differently the second time: {fx.objects[0]} ({len(first)} bytes the first)"
+    bytes_first = open(first.executable, "rb").read()
+    shutil.rmtree(os.path.join(ws, "target"), ignore_errors=True)
+    second, _ = built(ws, work, case, release, f"{case}-2")
+    if second.status != 0 or not second.executable:
+        return f"  blaze's second build failed ({second.status}):\n{second.said[-800:]}"
+    if open(second.executable, "rb").read() != bytes_first:
+        return f"  built differently the second time: {second.executable} ({len(bytes_first)} bytes the first)"
     return None
 
 
@@ -105,12 +101,11 @@ def main():
     parser.add_argument("--release", action="store_true")
     parser.add_argument("--keep", action="store_true", help="keep the copy of the workspace")
     args = parser.parse_args()
-    work = tempfile.mkdtemp(prefix="blaze-wholeprogram-")
-    ws = os.path.join(work, "ws")
-    shutil.copytree(os.path.join(HERE, "wholeprogram"), ws, ignore=shutil.ignore_patterns("target*"))
+    work = scratch("blaze-wholeprogram-")
+    ws = copy(os.path.join(HERE, "wholeprogram"), os.path.join(work, "ws"))
     failed = 0
     for case in args.cases:
-        wrong = check(ws, case, args.release)
+        wrong = check(ws, work, case, args.release)
         print(f"{case:15} {'WRONG' if wrong else 'ok'}")
         if wrong:
             print(wrong)

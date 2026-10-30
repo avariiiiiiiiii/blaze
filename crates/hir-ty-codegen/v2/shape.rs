@@ -24,7 +24,7 @@ use crate::{
     fragment::{self, DataRequest, Hint, RelocName, Requests},
 };
 
-const VERSION: u8 = 7;
+const VERSION: u8 = 8;
 
 /// Where data is in a shape, as the names of its IR have it.
 mod namespace {
@@ -49,6 +49,7 @@ mod part {
     pub(super) const INLINED: u8 = 11;
     pub(super) const UNSANITIZED: u8 = 12;
     pub(super) const FEATURES: u8 = 13;
+    pub(super) const WASM: u8 = 14;
 }
 
 pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shape, String> {
@@ -150,6 +151,10 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
         for feature in features {
             out.bytes(feature.as_bytes());
         }
+        // A wasm function's code holds the symbols it imports and exports, which are names of
+        // its references rather than places: one template a header.
+        out.u8(part::WASM);
+        wasm(&mut out, &function.wasm);
         Ok(Shape::of(unit, out.0))
     })
 }
@@ -382,6 +387,26 @@ fn scopes(out: &mut Out<'_>, scopes: &Scopes) {
     out.u32(scopes.inlined_of_span.len() as u32);
     for &of in &scopes.inlined_of_span {
         option(out, of);
+    }
+}
+
+fn wasm(out: &mut Out<'_>, header: &super::wasm::Header) {
+    out.u32(header.imports.len() as u32);
+    for (name, import) in &header.imports {
+        out.bytes(name.as_bytes());
+        out.bytes(import.module.as_bytes());
+        out.bytes(import.field.as_bytes());
+        for values in [&import.ty.params, &import.ty.results] {
+            out.u32(values.len() as u32);
+            out.0.extend(values.iter().map(|&it| it as u8));
+        }
+    }
+    match &header.export {
+        Some(name) => {
+            out.u8(1);
+            out.bytes(name.as_bytes());
+        }
+        None => out.u8(0),
     }
 }
 

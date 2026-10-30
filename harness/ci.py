@@ -52,7 +52,6 @@ BLAZE_CLI = os.path.join(
     os.path.dirname(os.path.abspath(os.environ.get("BLAZE_BIN") or os.path.join(ROOT, "target/release/blaze-engine"))),
     "blaze.exe" if SYSTEM == "windows" else "blaze",
 )
-KEYS = 3
 
 
 def here(hosts):
@@ -72,18 +71,21 @@ def on(*hosts, backend=None):
 
 
 EVERYWHERE = on()
+# What builds with the v2 daemon (rebuild.py, storelib.py): its CLI speaks over a Unix socket, so
+# not Windows. A dev build is Cranelift's under either backend of the matrix (v2 picks it by
+# profile), so these run under one.
+DAEMON = on("linux", "macos", backend="cranelift")
+KEYS = 3
 # (part in the full tier, arguments, environment, where it runs, in the fast tier: None or not).
 # The order is the order of each part's run. A harness in the fast tier needs a line in FAST.
 HARNESSES = [
-    ("core", ["programs.py"], {}, EVERYWHERE, 1),
-    # The daemon compiles every function of both programs, main too, and LLVM is optimizing: an
-    # edit of what both use has to reach each program, whatever its callers had built into them.
-    ("core", ["programs.py"], {"BLAZE_ALONE": "1"}, on("linux", "macos", backend="llvm"), 1),
-    ("core", ["unwinds.py"], {}, EVERYWHERE, 1),
-    ("core", ["growth.py"], {}, on(backend="cranelift"), 1),
-    # 11 to 22 minutes a run, longer than the rest of the fast tier, and it caught nothing there
-    # in 2026-10-25 and 26's 270 runs: the full tier's alone.
-    ("core", ["wholeprogram.py"], {}, on("linux", "macos"), None),
+    # An edit gives the program a fresh build gives (rebuild.py): two programs of one workspace.
+    ("core", ["programs.py"], {}, DAEMON, 1),
+    ("core", ["unwinds.py"], {}, DAEMON, 1),
+    ("core", ["growth.py"], {}, DAEMON, 1),
+    # 11 to 22 minutes a run under v1, longer than the rest of the fast tier, and it caught
+    # nothing there in 2026-10-25 and 26's 270 runs: the full tier's alone.
+    ("core", ["wholeprogram.py"], {}, DAEMON, None),
     # `blaze build` from nothing: G's whole build, no cargo build.
     ("core", ["coldbuild.py"], {}, on("linux"), 2),
     # A load refused for configuration must be retried without stopping the daemon (#597).
@@ -92,9 +94,6 @@ HARNESSES = [
     ("core", ["scriptenv.py"], {}, on("linux", "macos"), 2),
     # Its program of writable statics of its own crates on macOS too, where anim's `HOME` was refused.
     ("core", ["coldbuild.py", "statics"], {}, on("macos"), None),
-    # std's own writable statics (`thread_local!`s, `MIN`), from a unit built on another machine (#840).
-    ("core", ["stdstatics.py"], {}, on("linux", "macos"), 2),
-    ("core", ["splices.py"], {}, EVERYWHERE, 2),
     ("core", ["live_e2e.py"], {}, on("linux-x86_64"), 1),
     # A type added beside another, the code moved to it and the old one deleted, each a patch.
     ("core", ["live_types.py"], {}, on("linux-x86_64"), 1),
@@ -104,12 +103,6 @@ HARNESSES = [
     ("core", ["headerpad.py"], {}, on("macos"), 1),
     # bun links with `-no_compact_unwind`, which leaves `__eh_frame` alone to the unwinder.
     ("core", ["nocompact.py"], {}, on("macos"), 1),
-    # A branch reaches 128 MB on AArch64, and the splice has to get past that. Mach-O is not spliced.
-    ("core", ["farsplices.py"], {"BLAZE_SPLICE": "1"}, on("linux-aarch64"), 1),
-    # A file 2.3 GB past what it loads, as bevy's debug builds are; about 9 GB of disk at once.
-    ("core", ["farfile.py"], {}, on("linux"), None),
-    # 220 MB of code, 16 MB of frames and, on Linux, 4.2 GB of DWARF: no size is a full link.
-    ("core", ["bigbinary.py"], {}, on("linux", "macos"), None),
     # `blaze` hands Windows builds to cargo, so there the daemon links nothing to test.
     ("core", ["unreached.py"], {}, on("linux", "macos"), 1),
     ("core", ["anonstatics.py"], {}, on("linux", "macos"), 1),
@@ -122,14 +115,11 @@ HARNESSES = [
     # Each kind of reason a test is not hermetic, told from its code, and pure tests kept by it.
     ("core", ["hermetic.py"], {}, on("linux", "macos"), 2),
     ("core", ["doctestonce.py"], {}, on("linux", "macos"), 1),
-    ("core", ["asmedits.py"], {}, EVERYWHERE, 1),
-    # The assembler of a build of blaze without LLVM, which is the release's.
-    ("core", ["asmedits.py"], {"BLAZE_ASSEMBLER": "cc"}, on("linux", "macos", backend="cranelift"), 1),
-    ("core", ["includes.py", arg({})], {}, EVERYWHERE, 1),
     # A lazy static's initializer inlines a dependency's helper, which is then edited.
     ("core", ["staticcallbacks.py"], {}, on("linux", "macos"), None),
     ("core", ["latelisted.py"], {}, on("linux", "macos"), 1),
-    ("core", ["rustsrc.py"], {}, EVERYWHERE, 1),
+    ("core", ["includes.py", arg({})], {}, DAEMON, 1),
+    ("core", ["rustsrc.py"], {}, DAEMON, 1),
     # The release's library archive, made and served here, installed from by digest.
     ("core", ["libraryfetch.py"], {}, EVERYWHERE, 1),
     # Each scenario runs rustc and rustdoc no more often than norustc/baseline.json says.
@@ -143,19 +133,19 @@ HARNESSES = [
     ("core", ["wasmcmacro.py"], {}, on("linux"), 2),
     # A derive on what it cannot derive stops with the error the case names.
     ("core", ["deriveerrors.py"], {}, on("linux", "macos"), 2),
-    ("core", ["worktrees.py"], {}, EVERYWHERE, 2),
-    ("core", ["worktrees.py", "--join", "--together"], {}, on("macos"), 2),
-    ("core", ["worktrees.py", "--overlay"], {}, on("macos"), 2),
+    ("core", ["worktrees.py"], {}, DAEMON, 2),
+    ("core", ["worktrees.py", "--together"], {}, on("macos", backend="cranelift"), 2),
     # Tiers take live edits, which are macOS's alone; the harness picks its backends.
     ("core", ["tiers.py"], {}, on("macos", backend="cranelift"), 1),
     # #418: the same seeds with an empty and a warm store, and asm! text changed under one IR;
     # v2 picks the backend by profile (dev: Cranelift, release: LLVM).
     ("core", ["fuzz/store.py", arg({"blaze": BLAZE_CLI, "profiles": [{"cranelift": "dev", "llvm": "release"}[BACKEND]]})],
      {}, on("linux-x86_64"), 2),
-    ("core", ["fuzz/edits.py", "smoke", arg({"backends": [BACKEND]})], {}, on("linux-x86_64"), 2),
-    # DWARF read by gdb out of an ELF executable, or a PDB read by cdb.
-    ("core", ["debuginfo.py"], {}, on("linux", "windows"), None),
-    *((f"keys-{k}", ["keys.py", arg({"shard": {"index": k, "count": KEYS}})], {}, EVERYWHERE, None) for k in range(1, KEYS + 1)),
+    ("core", ["fuzz/edits.py", "smoke", arg({"profiles": [{"cranelift": "dev", "llvm": "release"}[BACKEND]]})],
+     {}, on("linux-x86_64"), 2),
+    # DWARF read by gdb out of an ELF executable.
+    ("core", ["debuginfo.py"], {}, on("linux", backend="cranelift"), None),
+    *((f"keys-{k}", ["keys.py", arg({"shard": {"index": k, "count": KEYS}})], {}, DAEMON, None) for k in range(1, KEYS + 1)),
     # The v2 daemon's store (crates/blaze-cas): its CLI speaks over a Unix socket, so not Windows.
     ("store-kills", ["storekills.py", arg({"blaze": BLAZE_CLI, "kills": 100})], {}, on("linux", "macos"), None),
     ("store", ["storecorrupts.py", arg({"blaze": BLAZE_CLI, "rounds": 4})], {}, on("linux", "macos"), None),
@@ -165,8 +155,8 @@ HARNESSES = [
     ("store", ["storeguards.py", arg({"blaze": BLAZE_CLI})], {}, on("linux", "macos"), None),
     ("store", ["storetracked.py", arg({"blaze": BLAZE_CLI})], {}, on("linux", "macos"), 2),
     ("store", ["storerevisions.py", arg({"blaze": BLAZE_CLI})], {}, on("linux", "macos"), None),
-    ("daemon", ["stress.py"], {}, EVERYWHERE, 2),
-    ("daemon", ["selects.py"], {}, on("linux"), 2),
+    ("daemon", ["stress.py"], {}, DAEMON, 2),
+    ("daemon", ["selects.py"], {}, on("linux", backend="cranelift"), 2),
 ]
 
 
@@ -176,21 +166,14 @@ HARNESSES = [
 # the start of a harness's label (`label`); the longest that fits is the harness's.
 X64, MAC = "linux-x86_64", "macos"
 FAST = {
-    "programs.py": (20, ()),
-    "BLAZE_ALONE=1 programs.py": (20, (X64,)),
-    "unwinds.py": (11, ()),
-    "growth.py": (31, (X64,)),
     "coldbuild.py": (78, (X64,)),
-    "stdstatics.py": (113, (X64, MAC)),
     "loadretry.py": (30, ()),
     "scriptenv.py": (70, ()),
-    "splices.py": (51, ()),
     "live_e2e.py": (16, ()),
     "live_types.py": (9, ()),
     "LIVE_PROGRAM=live-alloc live_e2e.py": (16, ()),
     "headerpad.py": (18, ()),
     "nocompact.py": (12, ()),
-    "BLAZE_SPLICE=1 farsplices.py": (8, ()),
     "unreached.py": (9, ()),
     "anonstatics.py": (9, ()),
     "loadedits.py": (19, (X64, MAC)),
@@ -198,11 +181,7 @@ FAST = {
     "testselect.py": (58, (X64, MAC)),
     "hermetic.py": (15, (X64, MAC)),
     "doctestonce.py": (92, (X64,)),
-    "asmedits.py": (12, ()),
-    "BLAZE_ASSEMBLER=cc asmedits.py": (12, ()),
-    "includes.py": (12, ()),
     "latelisted.py": (126, (X64,)),
-    "rustsrc.py": (1, ()),
     # Not measured yet: library.py's xz of library/ (79 MB) is most of it.
     "libraryfetch.py": (90, (X64,)),
     "norustc.py": (253, (X64,)),
@@ -210,14 +189,20 @@ FAST = {
     # Not measured yet: two cargo and two blaze builds of three small crates, as nativespans.py.
     "wasmcmacro.py": (60, (X64,)),
     "deriveerrors.py": (65, (X64,)),
-    "worktrees.py": (26, (X64, MAC)),
-    "worktrees.py --join --together": (28, ()),
-    "worktrees.py --overlay": (34, ()),
     "tiers.py": (87, ()),
     "fuzz/store.py": (120, ()),
-    "fuzz/edits.py smoke": (62, ()),
     "storefull.py": (59, (X64,)),
     "storetracked.py": (33, (X64, MAC)),
+    # v1's seconds, from before these were ported onto `blaze build` (rebuild.py): not measured
+    # under v2 yet.
+    "programs.py": (20, ()),
+    "unwinds.py": (11, ()),
+    "growth.py": (31, (X64,)),
+    "includes.py": (12, ()),
+    "rustsrc.py": (1, ()),
+    "worktrees.py": (26, (X64, MAC)),
+    "worktrees.py --together": (28, ()),
+    "fuzz/edits.py smoke": (62, ()),
     "stress.py": (74, (X64,)),
     "selects.py": (29, (X64,)),
 }
@@ -227,28 +212,23 @@ PART_SECS = 240
 # The full tier's part `core`, packed as the fast tier is: the seconds each harness took on the
 # slowest host it runs on (the train's 2026-10-26 run 40283386868, the slower backend), keyed
 # as FAST is. As one part it took 36 to 47 minutes on Linux and macOS, every other part 25 or
-# less; wholeprogram.py alone is 19 minutes on macOS, and nothing packs a part below that.
-# A harness CORE does not name counts CORE_DEFAULT.
+# less. A harness CORE does not name counts CORE_DEFAULT.
 CORE = {
-    "wholeprogram.py": 1155,
-    "debuginfo.py": 500,
-    "bigbinary.py": 457,
     "norustc.py": 229,
     "latelisted.py": 91,
-    "splices.py": 89,
-    "farfile.py": 84,
     "tiers.py": 79,
     "coldbuild.py": 62,
-    "stdstatics.py": 113,
     "doctestonce.py": 54,
-    "fuzz/edits.py smoke": 52,
     "testselect.py": 51,
     "fuzz/store.py": 120,
-    "worktrees.py --overlay": 30,
+    "loadedits.py": 20,
+    # v1's seconds, as in FAST: wholeprogram.py alone was 19 minutes on macOS.
+    "wholeprogram.py": 1155,
+    "debuginfo.py": 500,
+    "fuzz/edits.py smoke": 52,
     "worktrees.py": 27,
     "growth.py": 26,
-    "worktrees.py --join --together": 26,
-    "loadedits.py": 20,
+    "worktrees.py --together": 26,
 }
 CORE_DEFAULT = 15
 CORE_SECS = 600

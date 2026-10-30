@@ -616,7 +616,7 @@ fn file_range<N: AstIdNode>(db: &Db, item: AstId<N>) -> TextRange {
     item.file_id.ast_id_map(db).get(item.value).syntax_node_ptr().text_range()
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct StructSignature {
     pub name: Name,
     pub generic_params: GenericParams,
@@ -666,7 +666,7 @@ const _: () = assert!(size_of::<FnFlags>() == 2);
 const _: () = assert!(size_of::<TypeAliasFlags>() == 1);
 
 bitflags! {
-    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
     pub struct StructFlags: u16 {
         /// Indicates whether this struct has `#[repr]`.
         const HAS_REPR = 1 << 0;
@@ -798,7 +798,7 @@ fn adt_shape(adt_kind: ast::StructKind<'_>) -> FieldsShape {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct UnionSignature {
     pub name: Name,
     pub generic_params: GenericParams,
@@ -848,7 +848,7 @@ impl UnionSignature {
 }
 
 bitflags! {
-    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
     pub struct EnumFlags: u8 {
         /// Indicates whether this enum has `#[repr]`.
         const HAS_REPR = 1 << 0;
@@ -871,7 +871,7 @@ impl EnumFlags {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct EnumSignature {
     pub name: Name,
     pub generic_params: GenericParams,
@@ -967,7 +967,7 @@ impl EnumSignature {
     }
 }
 bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Hash)]
     pub struct ConstFlags: u8 {
         const HAS_BODY = 1 << 1;
         /// Written `default const` (`specialization`).
@@ -978,7 +978,7 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ConstSignature {
     pub name: Option<Name>,
     // generic_params: GenericParams,
@@ -1029,7 +1029,7 @@ impl ConstSignature {
 }
 
 bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Hash)]
     pub struct StaticFlags: u8 {
         const HAS_BODY = 1 << 1;
         const MUTABLE    = 1 << 3;
@@ -1040,7 +1040,7 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct StaticSignature {
     pub name: Name,
 
@@ -1085,7 +1085,7 @@ impl StaticSignature {
 }
 
 bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Hash)]
     pub struct ImplFlags: u8 {
         const NEGATIVE = 1 << 1;
         const DEFAULT = 1 << 2;
@@ -1095,7 +1095,7 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ImplSignature {
     pub generic_params: GenericParams,
     pub store: ExpressionStore,
@@ -1149,7 +1149,7 @@ impl ImplSignature {
 }
 
 bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Hash)]
     pub struct TraitFlags: u16 {
         const RUSTC_HAS_INCOHERENT_INHERENT_IMPLS = 1 << 1;
         const FUNDAMENTAL = 1 << 2;
@@ -1181,7 +1181,7 @@ impl TraitFlags {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TraitSignature {
     pub name: Name,
     pub generic_params: GenericParams,
@@ -1222,7 +1222,7 @@ impl TraitSignature {
 }
 
 bitflags! {
-    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Hash)]
     pub struct FnFlags: u16 {
         const HAS_BODY = 1 << 1;
         const DEFAULT = 1 << 2;
@@ -1266,7 +1266,7 @@ impl FnFlags {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct FunctionSignature {
     pub name: Name,
     pub generic_params: GenericParams,
@@ -1403,7 +1403,7 @@ impl FunctionSignature {
 }
 
 bitflags! {
-    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Hash)]
     pub struct TypeAliasFlags: u8 {
         const RUSTC_HAS_INCOHERENT_INHERENT_IMPL = 1 << 1;
         /// Written `default type` (`specialization`).
@@ -1422,7 +1422,7 @@ impl TypeAliasFlags {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TypeAliasSignature {
     pub name: Name,
     pub generic_params: GenericParams,
@@ -1471,7 +1471,7 @@ pub struct VariantFieldsBody {
 }
 
 /// A single field of an enum variant or struct
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FieldData {
     pub name: Name,
     pub type_ref: TypeRefId,
@@ -1485,7 +1485,7 @@ const _: () = assert!(size_of::<FieldData>() == size_of::<RawVisibility>() + 24)
 
 pub type LocalFieldId = Idx<FieldData>;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct VariantFields {
     fields: Arena<FieldData>,
     pub store: ExpressionStore,

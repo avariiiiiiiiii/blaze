@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """unwinds.py: a daemon follows edits to functions that a panic unwinds through.
 
-Unless BLAZE_SPLICE=0 the edited functions are code added to the linked binary, which the unwinder
-has to find the frames of. Each step is compared with what blaze's build of the same source from nothing prints.
+The unwinder has to find the frames of each edited function in the program the daemon builds.
+Each step is held to what a fresh build of the same source does (includes.py's `follow`).
 """
 from includes import follow
 

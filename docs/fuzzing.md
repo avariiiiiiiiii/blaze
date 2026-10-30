@@ -14,17 +14,18 @@ program with cargo too (`fuzz/fuzz.py`) was deleted on 2026-10-30 with the other
 ## Running them
 
     cd harness
-    export BLAZE_BIN=$PWD/../target/release/blaze-engine
-    uv run --frozen python fuzz/edits.py smoke '{"backends": ["cranelift"]}'   # fixed seeds; in CI
-    uv run --frozen python fuzz/edits.py run '{"seed": "S", "rounds": N, "steps": K}'
-    uv run --frozen python fuzz/edits.py run '{"seed": "S", "first": R, "rounds": 1}'   # round R again
-    uv run --frozen python fuzz/edits.py check '{"files": ["FILE.rs"]}'    # stored sequences again
-    uv run --frozen python fuzz/edits.py report '{"dir": "DIR"}'           # add up a run's logs
-    python3 fuzz/store.py [--backends cranelift,llvm]                         # asm changes, cold and warm store; in CI
+    uv run --frozen python fuzz/store.py '{"blaze": "../target/release/blaze", "profiles": ["dev", "release"]}'   # asm changes, cold and warm store; in CI
+    uv run --frozen python fuzz/edits.py smoke '{"profiles": ["dev"]}'                                              # generated edits under one warm daemon; in CI
+    uv run --frozen python fuzz/edits.py run '{"seed": "S", "rounds": 10, "steps": 20}'                             # a longer run
 
-The fields each subcommand of `edits.py` takes are in its docstring. By default a program is
-built under both backends, so `BLAZE_BIN` should be a build with `--features llvm`. LLVM is
-run with `BLAZE_OPT=2 BLAZE_EMIT=fast`. The exit status is 1 when there is a finding.
+Both take the cargo profiles to build, which pick the backend as v2 picks it: opt-level 0 and
+1 are Cranelift, the rest LLVM, so `release` needs a blaze built with `--features llvm`
+([harness.md](harness.md#under-llvm)). `store.py` takes v2's `blaze` in its input; `edits.py`
+the one `BLAZE_BIN` names, through `rebuild.py`. `edits.py` was v1's on v1's daemon (`--socket`,
+`sync` and `patch`) and its mixed model; on 2026-10-30 it moved onto `blaze build` in a warm
+home, each step held to a build of the same source in an empty home (`rebuild.Project`), and
+its `check` and `report` subcommands with it; `fuzz/runs.py` went. Each exits 1 when there is
+a finding.
 
 ## What a program is
 
@@ -45,35 +46,36 @@ observed; every loop is bounded. They are a single crate and use only `std`.
 
 ## What counts as a finding
 
-`fuzz/edits.py`: a round is one program under a daemon that keeps its binary up to date. Each
-step edits the source (a case's body, functions, constants or types regenerated; a constant's
-value; fields or variants reordered; `#[repr(C)]` put on or taken off; one literal; a function
-added, its signature changed or removed; an earlier step undone) and asks the daemon for the
-binary, which it splices, patches or links in full. The same source is built by blaze from
-nothing, with no daemon and no store (`fuzz/runs.py`'s `Project`). A finding is a step whose
-binary prints otherwise than the one from nothing, a step the daemon refused, a daemon that
-died, or one that panicked and went on. A finding's sequence is kept under `fuzz/found/edits/`
-for `check` to run again.
-
-`fuzz/store.py`: one function compiled, then only the text of its `asm!` changed, each version
-read back from the store; and the smoke programs built with no store, into a fresh store and
-from the store that filled. Every build with a store has to run as the one without, and leave
-no function out. This covers #418, where two `asm!` wrappers with the same Cranelift IR and
+`fuzz/store.py`: one function compiled, then only the text of its `asm!` changed and changed
+back, each version built by a fresh v2 daemon whose store (`<home>/v2/store`, with the VFS's
+journal and the database's image removed) holds what the versions before it left; and the
+smoke programs (`gen.program` on fixed seeds) built in an empty home, into a fresh store and
+again from the store that filled. Every build with a store has to run, case by case, as the
+same source built in an empty home does. This covers #418, where two `asm!` wrappers with the same Cranelift IR and
 different assembly shared one entry of LLVM's store (the assembly is in the key since
 `2a3a0a35`).
 
+`fuzz/edits.py`: a generated program built under one warm daemon, then edited a step at a time
+(a case's code generated anew, constants, the fields and `repr` of types, one literal, a
+function added, re-signed or removed, an earlier step's source again), each step built by
+`blaze build` and run case by case against the same source built in an empty home. A finding
+is a step whose program prints otherwise, one the daemon refused, or a daemon that died or
+panicked; an edit the fresh build turns down is not shown to the daemon. A finding is reduced
+to the fewest steps that still show it and written under `found/edits/`, which `check` runs
+again.
+
 ## From a finding to a fix
 
-1. `edits.py run` with the round's seed and `first` builds it again.
+1. `store.py` keeps a failure's work directory and its daemons' logs.
 2. Reduce it to a test ([harness.md](harness.md#adding-a-test)): a step of the daemon harness
    of that area whose warm build has to give what blaze's build from nothing gives.
-3. Fix it, run `edits.py check` and the gate.
+3. Fix it and run the gate.
 
 ## What they have found
 
 The differential fuzzer found twenty-one problems in whole builds before it was deleted, most
 of them miscompiles of drop order; [reports/FUZZ.md](reports/FUZZ.md) lists them and
-[results.md](results.md) tabulates the runs. Generated edits against a running daemon found
+[results.md](results.md) tabulates the runs. Generated edits against v1's running daemon found
 four more problems in the incremental path, all fixed, and a fifth that is open: after some
 edits a panic inside `core` names the file by its `/rustc/<commit>/library/...` path instead of
 the local one.
@@ -82,9 +84,10 @@ the local one.
 
 - A program blaze builds wrong the same way warm and from nothing: since 2026-10-30 that is for
   real crates' own test suites to find, not a fuzzer.
-- Generated edits have had a few short runs only, so the daemon's incremental path, the patch
-  object and the splice are barely fuzzed.
-- Only Linux x86-64 has been run; the smoke run is in the Linux x86-64 CI jobs only.
+- Generated edits had a few short runs only, all of v1's daemon; `edits.py` on v2's has not
+  run yet. It covers rebuilds, not live patches of a running program, which wait on the v2
+  API's live-patch request.
+- Only Linux x86-64 has been run.
 - Single-crate programs using only `std`: nothing about dependencies, features, build
   scripts or proc macros. No threads, macros of their own, SIMD intrinsics, or I/O other than
   the checksum lines.

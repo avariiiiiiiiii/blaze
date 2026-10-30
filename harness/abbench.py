@@ -5,8 +5,8 @@
                [--rounds R] [--runs N] [--kinds body,leaf,signature,no-op] [--out FILE]
                [--work DIR] [--pause SECS] [--train]
 
-Each DIR holds a `blaze` and the programs it runs from next to itself (`blaze`,
-`blaze-rustc`). A round goes through the builds in turn, in an order that rotates from round to
+Each DIR holds a `blaze` and the programs it runs from next to itself (`blaze-engine`,
+`blaze-proc-macro-srv`). A round goes through the builds in turn, in an order that rotates from round to
 round; each build gets a copy of the project and a home and store of its own that live for the
 whole run, and in its turn it stops any daemon of its own, starts one from nothing, waits until
 it is warm (the cold start), and makes every edit `--runs` times and takes it back. So a machine

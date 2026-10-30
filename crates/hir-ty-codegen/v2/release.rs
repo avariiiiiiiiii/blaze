@@ -341,6 +341,8 @@ fn emitted(
             resolve,
             spans,
             side.as_ref().map(|it| it.1),
+            // LLVM compiles no wasm32 unit (`backend::check_built`).
+            &super::wasm::Header::default(),
         )?;
         Ok::<_, String>((converted, side))
     });

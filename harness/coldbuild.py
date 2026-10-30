@@ -23,10 +23,9 @@ long blaze's cold build took against cargo's, the speed baseline, then its body 
 edits (bench.py's) against cargo's incremental build of each. The edits are built by the
 daemon's worker on what it loaded for the cold build, and each program has to print what
 blaze's build of the edited source from nothing prints (`blaze_cli.Scratch`). The standard
-library comes from a remote `blaze-engine std` made once, as a release's does.
+library's crates are units of each project's cold build like any other.
 
-BLAZE_BIN names the blaze built; blaze is found next to it. Linux, as allblaze.py;
-`statics` on macOS too.
+BLAZE_BIN names the blaze built; blaze is found next to it. Linux; `statics` on macOS too.
 """
 import os, re, shutil, subprocess, sys, tempfile, time
 
@@ -187,11 +186,8 @@ def write(root, files):
             f.write(text)
 
 
-def env_for(root, remote=None):
-    env = base_env(os.path.join(root, "home"))
-    if remote:
-        env["BLAZE_STD_FROM"] = remote
-    return env
+def env_for(root):
+    return base_env(os.path.join(root, "home"))
 
 
 def blaze(ws, env, *args):
@@ -355,14 +351,13 @@ def edited(ws, root, name, env, build, changes, spec):
 def bench(names, keep=False):
     import bench as benchpy
     root = tempfile.mkdtemp(prefix="blaze-coldbuild-bench-", dir="/tmp")
-    remote, made = benchpy.shipped_std(BLAZE, "cranelift", root)
     rows, wrong = [], 0
     for name in names:
         spec = benchpy.PROJECTS[name]
         ws = os.path.join(root, name)
         shutil.copytree(blaze_cli.fetch(name, spec), ws, symlinks=True,
                         ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
-        env = dict(env_for(os.path.join(root, f"{name}-h"), remote), **spec.get("env", {}))
+        env = dict(env_for(os.path.join(root, f"{name}-h")), **spec.get("env", {}))
         subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
         build = spec.get("build", [])
         reference, cargo_took = cargo(ws, env, os.path.join(root, f"{name}-ref"), "build", *build)
@@ -397,7 +392,7 @@ def bench(names, keep=False):
         wrong += not verdict.startswith(("runs", "builds"))
         rows.append((name, verdict, took, cargo_took))
         print(f"{name:12} {verdict:40} blaze {took:7.1f}s  cargo {cargo_took:7.1f}s{edits}", flush=True)
-    print(f"standard library made once in {made:.1f}s; under {root}")
+    print(f"under {root}")
     if wrong:
         sys.exit(1)
     if not keep:

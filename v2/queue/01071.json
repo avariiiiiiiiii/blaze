@@ -1,0 +1,25 @@
+{
+  "id": "01071",
+  "from_lane": "integrate-docs",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/backend.rs",
+    "crates/hir-ty-codegen/v2/hashes.rs",
+    "crates/hir-ty-codegen/fncache.rs"
+  ],
+  "what": "From integrate-docs (found by its children, read from code, not run): (1) cache-key hole: BLAZE_EMIT changes LLVM output but is in neither hir-ty-codegen/v2/backend.rs CHANGES_CODE nor any unit key, so code kept under one value is reused under the other. (2) possible stale code identity: hir_ty_share::code via hir-ty-codegen/v2/hashes.rs takes callees by interface hash and does not include the __blaze_cache_code constant, so a function asking for its cached closure code may keep a stale hash after an edit to code the closure reaches (v1 recompiled via patch.rs cached_roots; docs/fn-cache.md). (3) tests_reach in hir-ty-codegen/fncache.rs has no v2 caller: delete or wire (docs/cargo.md calls hermetic tests v1).",
+  "state": "open",
+  "created": "2026-10-30T15:15:12Z",
+  "updated": "2026-10-30T15:15:12Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T15:15:12Z",
+      "by": "integrate-docs",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

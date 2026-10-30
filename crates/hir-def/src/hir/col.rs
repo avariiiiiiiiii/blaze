@@ -12,6 +12,7 @@
 
 use std::{
     fmt,
+    hash::{Hash, Hasher},
     marker::PhantomData,
     mem::MaybeUninit,
     ops::Deref,
@@ -182,6 +183,12 @@ impl<T: PartialEq> PartialEq for Col<T> {
 }
 
 impl<T: Eq> Eq for Col<T> {}
+
+impl<T: Hash> Hash for Col<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
 
 impl<T: fmt::Debug> fmt::Debug for Col<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

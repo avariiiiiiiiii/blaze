@@ -63,8 +63,9 @@ use serde::{Deserialize, Serialize};
 /// [`TestResult::outside`]; [`Worked::served`]; dense ids
 /// ([`UnitOf::id`], [`UnitStarted::package`], [`TestResult::executable`]); the fixed name sets
 /// as enums ([`TargetKind`], [`CrateType`], [`ArtifactKind`], [`Applicability`]), written by
-/// name as before. [`ResponseRef`] reads the same bytes.
-pub const SCHEMA: u32 = 14;
+/// name as before. [`ResponseRef`] reads the same bytes. 15: [`Request::Pack`] and
+/// [`Response::Packed`].
+pub const SCHEMA: u32 = 15;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -265,6 +266,11 @@ pub enum Request {
     /// What each subsystem's memory is doing, from blaze-mem's counters; answered with
     /// [`Response::Memory`].
     Memory,
+    /// The front end of package `program`'s crate and every crate it is made of, checked as
+    /// `targets` asks (its build scripts run and its proc macros loaded in the sandbox, every
+    /// expansion of the program recorded) as one file for blaze's in-browser compiler
+    /// (`blaze_wasm_pack::Pack`); answered with [`Response::Packed`].
+    Pack { view: ViewRef, targets: Targets, program: String },
 }
 
 /// `blaze test --ub`: each selected test run under `hir_ty_ub::run_test`, nothing compiled.
@@ -330,6 +336,11 @@ pub enum Response {
     /// The root a [`Request::WillTest`] or [`Request::WillSave`] builds ahead.
     Announced { root: ContentId },
     Memory(Memory),
+    /// A [`Request::Pack`]'s pack: `blaze_wasm_pack::Pack` as JSON.
+    Packed {
+        #[serde(with = "blaze_protocol::bytes")]
+        pack: Vec<u8>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

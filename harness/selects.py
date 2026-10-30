@@ -6,17 +6,17 @@ one the build asked for does not need: the script of a dev-dependency or of anot
 of the workspace for a build of one program, or a proc macro only the tests use.
 
 Every script and macro of the workspace here writes a line when it runs. Each selection is
-given to blaze on a copy of the workspace nothing was built in, and every line blaze's build
-wrote has to be one of the selection's (`SELECTIONS`).
+given to blaze (`blaze build` or `blaze test --no-run`) on a copy of the workspace nothing was
+built in, in an empty home, and every line blaze's build wrote has to be one of the selection's
+(`SELECTIONS`).
 
     python3 selects.py
 """
-import os, shutil, subprocess, sys
+import os, shutil, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from storelib import scratch
-from mixed import BLAZE, sysroot_rlibs
+from rebuild import Project, scratch
 
 MARK = '''
 fn mark(what: &str) {
@@ -36,9 +36,9 @@ SCRIPT, MACRO = "build script of %s", "proc macro of devmacro"
 # dev-dependencies and the macro they call too, the workspace every member's script and no
 # macro, as nothing it builds calls one.
 SELECTIONS = [
-    ("one program", ["--package", "app"], {SCRIPT % "dep"}),
-    ("its tests", ["--package", "app", "--unit-test"], {SCRIPT % "dep", SCRIPT % "devdep", MACRO}),
-    ("the workspace", ["--workspace"], {SCRIPT % "dep", SCRIPT % "devdep", SCRIPT % "other"}),
+    ("one program", "build", ["--package", "app"], {SCRIPT % "dep"}),
+    ("its tests", "test", ["--package", "app", "--no-run"], {SCRIPT % "dep", SCRIPT % "devdep", MACRO}),
+    ("the workspace", "build", ["--workspace"], {SCRIPT % "dep", SCRIPT % "devdep", SCRIPT % "other"}),
 ]
 
 
@@ -86,21 +86,25 @@ def fresh(work, name):
     return ws
 
 
-def by_blaze(work, args):
+def by_blaze(work, command, args):
     ws = fresh(work, "blaze")
-    symbols = [x for rlib in sysroot_rlibs() for x in ("--symbols", rlib)]
-    done = subprocess.run([BLAZE, ws, "--crate", "dep", "--crate", "app", "--out", os.path.join(work, "app.o"),
-                           *args, *symbols], capture_output=True, text=True)
-    if done.returncode != 0:
-        raise SystemExit(f"blaze {' '.join(args)} failed:\n{done.stderr[-2000:]}")
+    home = os.path.join(work, "home")
+    shutil.rmtree(home, ignore_errors=True)
+    project = Project(ws, work, home=home)
+    try:
+        done = project.build("app", *args, command=command)
+    finally:
+        project.stop()
+    if done.status != 0:
+        raise SystemExit(f"blaze {command} {' '.join(args)} failed:\n{done.said[-2000:]}")
     return ran(ws)
 
 
 def main():
     work = scratch("blaze-selects-")
     wrong = 0
-    for what, blaze_args, needed in SELECTIONS:
-        blazes = by_blaze(work, blaze_args)
+    for what, command, blaze_args, needed in SELECTIONS:
+        blazes = by_blaze(work, command, blaze_args)
         more = sorted(blazes - needed)
         wrong += bool(more)
         print(f"  {what}: {len(needed)} needed ({', '.join(sorted(needed))}); blaze ran {len(blazes)}"

@@ -225,7 +225,7 @@ impl PathTag {
 }
 
 /// Every column of a store's paths.
-#[derive(Debug, Clone, Default, PartialEq, Eq)] // clone: in `TypeColumns`; path.rs tests copy it
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)] // clone: in `TypeColumns`; path.rs tests copy it
 pub(crate) struct PathColumns {
     /// [`PathTag`], by path.
     pub(crate) kind: Vec<u8>,

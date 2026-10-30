@@ -105,11 +105,11 @@ pub(crate) trait ColumnVec: Sized {
 }
 
 /// The builder's columns, which grow.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Growing;
 
 /// A finished store's columns.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Frozen;
 
 impl ColumnVec for Growing {
@@ -153,7 +153,7 @@ impl<'a> Rows<'a> {
 }
 
 /// Every column of an expression store's bodies.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub(crate) struct HirColumns<V: ColumnVec = Frozen> {
     pub(crate) expr_kind: V::Of<u8>,
     pub(crate) expr_data: V::Of<u32>,

@@ -10,7 +10,11 @@
 //! - the maps from syntax to an id ([`SourceTable`]) are sorted by [`SourceKey`] and searched;
 //! - the maps keyed by a store's own ids ([`IdTable`]) are sorted by id and searched.
 
-use std::{fmt, marker::PhantomData};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    marker::PhantomData,
+};
 
 use blaze_ids::radix;
 use either::Either;
@@ -35,7 +39,7 @@ use super::{
 
 /// A map from a store's own ids to values, as one column sorted by id and searched: what a
 /// finished store or source map keeps in place of a hash map keyed by its ids.
-#[derive(Debug, Clone, PartialEq, Eq)] // clone: `ExpressionStoreSourceMap::moved`, per run
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: `ExpressionStoreSourceMap::moved`, per run
 pub(crate) struct IdTable<K, V>(Box<[(K, V)]>);
 
 impl<K, V> Default for IdTable<K, V> {
@@ -123,7 +127,7 @@ impl<N: AstNode> SourceKey for InFile<AstPtr<N>> {
 /// searched: what a source map keeps in place of a hash map. 24 bytes per entry for an
 /// `InFile<AstPtr<_>>` key and a `u32` value; a lookup is `log2(n)` key compares with no
 /// hashing, and iteration is in key order.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SourceTable<K, V>(Box<[(K, V)]>);
 
 impl<K, V> Default for SourceTable<K, V> {
@@ -288,6 +292,16 @@ impl<T, N> PartialEq for BackMap<T, N> {
 }
 
 impl<T, N> Eq for BackMap<T, N> {}
+
+impl<T, N> Hash for BackMap<T, N> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kinds.hash(state);
+        self.starts.hash(state);
+        self.ends.hash(state);
+        self.run_starts.hash(state);
+        self.run_files.hash(state);
+    }
+}
 
 impl<T, N: AstNode> fmt::Debug for BackMap<T, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -654,7 +668,7 @@ pub(crate) type PendingTemplate = FormatTemplate<
 
 /// The maps of a store's templates: pushed to while lowering ([`super::ExpressionStoreBuilder`]),
 /// tables once finished.
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Default, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct FormatTemplate<
     F = IdTable<ExprId, FormatCaptures>,
     A = IdTable<ExprId, AsmCaptures>,
@@ -735,6 +749,31 @@ impl PartialEq for ExpressionOnlySourceMap {
     }
 }
 
+impl Hash for ExpressionOnlySourceMap {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self {
+            expr_map: _,
+            expr_map_back,
+            pat_map: _,
+            pat_map_back,
+            label_map: _,
+            label_map_back,
+            binding_definitions: _,
+            field_map_back: _,
+            pat_field_map_back: _,
+            template_map,
+            expansions,
+            diagnostics,
+        } = self;
+        expr_map_back.hash(state);
+        pat_map_back.hash(state);
+        label_map_back.hash(state);
+        template_map.hash(state);
+        expansions.hash(state);
+        diagnostics.hash(state);
+    }
+}
+
 #[derive(Debug, Eq, Default)]
 pub struct ExpressionStoreSourceMap {
     pub(in crate::expr_store) expr_only: Option<Box<ExpressionOnlySourceMap>>,
@@ -756,6 +795,16 @@ impl PartialEq for ExpressionStoreSourceMap {
         *expr_only == other.expr_only
             && *types_map_back == other.types_map_back
             && *lifetime_map_back == other.lifetime_map_back
+    }
+}
+
+impl Hash for ExpressionStoreSourceMap {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let Self { expr_only, types_map_back, types_map: _, lifetime_map_back, lifetime_map: _ } =
+            self;
+        expr_only.hash(state);
+        types_map_back.hash(state);
+        lifetime_map_back.hash(state);
     }
 }
 

@@ -41,7 +41,7 @@ use crate::{
         Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CallArguments, CaptureInfo,
         CaptureSourceStack, CapturedPlace, ClosureData, ExplicitDropMethodUseKind,
         InferenceDiagnostic, InferenceResult, MinCaptures, OverloadedDeref, PatAdjust,
-        PatAdjustment, PointerCast, ReturnKind, Unreachable, UnreachableAt,
+        PatAdjustment, PointerCast, ReturnKind, Unreachable, UnreachableAt, UpvarCapture,
         cast::{CastError, CastPointerKind, CastPointers},
         closure::analysis::{
             BorrowKind,

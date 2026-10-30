@@ -27,7 +27,7 @@ use span::FileId;
 
 use crate::{
     BuiltinAttr, ConstParam, Crate, DeriveHelper, ExpressionStoreOwner, Function, Impl, ItemInNs,
-    Label, Local, Module, ModuleDef, Name, ScopeDef, ToolModule, Trait, TypeAlias, TypeParam,
+    Label, Local, Module, ModuleDef, Name, ScopeDef, ToolModule, Trait, Type, TypeAlias, TypeParam,
     semantics::source_to_def::{SourceToDefCache, SourceToDefCtx},
     source_analyzer::resolve_hir_path,
 };
@@ -229,10 +229,11 @@ impl<'db> SemanticsImpl<'db> {
                 // alloc: cached once per signature
                 .collect(),
             Either::Right(def) => {
-                let all_anon_consts =
-                    self.db.field_types_with_diagnostics(def).defined_anon_consts().iter().copied();
+                let all_anon_consts: &[AnonConstId<'db>] =
+                    self.db.field_types_with_diagnostics(def).defined_anon_consts();
                 all_anon_consts
-                    .map(|anon_const| (anon_const.loc(self.db).expr, anon_const))
+                    .iter()
+                    .map(|&anon_const| (anon_const.loc(self.db).expr, anon_const))
                     // alloc: cached once per signature
                     .collect()
             }

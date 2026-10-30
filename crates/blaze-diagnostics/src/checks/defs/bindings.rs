@@ -7,7 +7,7 @@
 //! (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
-use hir::{HirFileId, InFile, Name};
+use hir::{EditionedFileId, InFile, Name};
 use hir_def::{
     DefWithBodyId,
     expr_store::{Body, ExprOrPatSource, ExpressionStore, HygieneId},
@@ -77,7 +77,10 @@ fn check_body(cx: &Cx<'_, '_>, owner: DefWithBodyId, scratch: &mut Scratch, foun
             let list = list.parent().filter(|it| ast::ParamList::can_cast(it.kind()))?;
             Some(node.with_value(ast::ptr(list)))
         });
-        let at = node.map(|node| (node.file_id, node.value.syntax().text_range().start()));
+        let at = node.map(|node| {
+            let at = node.with_value(node.value.syntax().text_range()).original_node_file_range_rooted(cx.db);
+            (at.file_id, at.range.start())
+        });
         roots.push(Root { pat, list, at });
     }
     roots.sort_by_key(|root| root.at);
@@ -113,7 +116,8 @@ struct Root {
     pat: PatId,
     /// The parameter list the pattern is a parameter of.
     list: Option<InFile<SyntaxNodePtr>>,
-    at: Option<(HirFileId, TextSize)>,
+    /// Where it is written in a file, for a pattern of a macro's expansion where its tokens are.
+    at: Option<(EditionedFileId, TextSize)>,
 }
 
 /// rustc's `PatBoundCtx` with the names bound in it.

@@ -380,7 +380,7 @@ impl Frame {
         let Some(region) = header(block).span.as_deref() else {
             unreachable!("a chunk has no pages to commit")
         };
-        let len = end - region.base().addr();
+        let len = end - region.base().addr().get();
         let before = region.committed();
         let more = region.committed_after(len)? - before;
         let granted = match self.task && more > 0 {
@@ -406,7 +406,7 @@ impl Frame {
     fn usable_end(&self, block: *mut Block, before: usize) -> usize {
         let head = header(block);
         let end = match head.span.as_deref() {
-            Some(region) => region.base().addr() + region.committed(),
+            Some(region) => region.base().addr().get() + region.committed(),
             None => head.end,
         };
         end.min(data(block).addr().saturating_add(self.limit.saturating_sub(before)))
@@ -779,7 +779,7 @@ impl Frame {
         let head = header_mut(current);
         if let Some(region) = head.span.as_deref_mut() {
             let before = region.committed();
-            let in_use = self.cursor.get().addr() - region.base().addr();
+            let in_use = self.cursor.get().addr() - region.base().addr().get();
             // A refused decommit leaves the pages committed: memory held, nothing broken.
             _ = region.decommit_after(in_use.max(HEADER));
             let freed = before - region.committed();

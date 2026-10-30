@@ -514,7 +514,7 @@ impl<'cx, 'db, M: CanonicalizeMode> Canonicalizer<'cx, 'db, M> {
             return base.unchecked_map(|b| (b, value));
         }
 
-        let mut canonicalizer = Canonicalizer {
+        let mut canonicalizer = Canonicalizer::<'_, '_, M> {
             infcx,
             tcx,
             needs_canonical_flags,

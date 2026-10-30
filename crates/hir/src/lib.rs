@@ -692,6 +692,17 @@ impl Module {
         self.id.def_map(db).module(db, self.id).definition_source_file_id()
     }
 
+    /// Whether this module is written in its parent's file: a `mod m {}` or a block.
+    pub fn is_inline(self, db: &Db) -> bool {
+        self.id.def_map(db).module(db, self.id).origin.is_inline()
+    }
+
+    /// The range which declares this module, either a `mod foo;` or a `mod foo {}`. `None` for
+    /// the crate root or a block.
+    pub fn declaration_source_range(self, db: &Db) -> Option<InFile<TextRange>> {
+        self.id.def_map(db).module(db, self.id).declaration_source_range(db)
+    }
+
     /// Iterates over all child modules.
     pub fn children(self, db: &Db) -> impl Iterator<Item = Module> {
         let def_map = self.id.def_map(db);

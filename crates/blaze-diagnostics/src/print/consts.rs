@@ -11,9 +11,9 @@ use hir_def::{
     hir::generics::{GenericParams, TypeOrConstParamData},
     item_tree::FieldsShape,
 };
-use hir_ty::{
-    db::GeneralConstId,
-    next_solver::{Const, ConstKind, Consts, GenericArgs, ScalarInt, Ty, TyKind, ValTreeKind, ValueConst},
+use hir_ty::next_solver::{
+    AliasConstKind, AnonConstIdWrapper, Const, ConstKind, Consts, FreeConstAliasId, GenericArgs,
+    InherentAssocConstId, ScalarInt, TraitAssocConstId, Ty, TyKind, ValTreeKind, ValueConst,
 };
 use rustc_apfloat::{
     Float as _,
@@ -27,10 +27,14 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     /// rustc's `pretty_print_const`, without the type.
     pub(crate) fn print_const(&mut self, c: Const<'t>) {
         match c.kind() {
-            ConstKind::Unevaluated(uv) => match uv.def.0 {
-                GeneralConstId::ConstId(it) => self.print_value_path(Def::Const(it), uv.args.as_slice()),
-                GeneralConstId::StaticId(it) => self.print_value_path(Def::Static(it), uv.args.as_slice()),
-                GeneralConstId::AnonConstId(it) => {
+            ConstKind::Alias(_, alias) => match alias.kind {
+                AliasConstKind::Projection { def_id: TraitAssocConstId(it) }
+                | AliasConstKind::InherentSelf { def_id: InherentAssocConstId(it) }
+                | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(it) }
+                | AliasConstKind::Free { def_id: FreeConstAliasId(it) } => {
+                    self.print_value_path(Def::Const(it), alias.args.as_slice())
+                }
+                AliasConstKind::Anon { def_id: AnonConstIdWrapper(it) } => {
                     let loc = it.loc(self.db);
                     let (_, map) = hir_def::expr_store::ExpressionStore::with_source_map(self.db, loc.owner);
                     let src = map.expr_syntax(loc.expr).expect("an anonymous constant is written");

@@ -90,11 +90,9 @@ impl<'t> Binder<'t> {
         }
         let kind = match cast::<ast::Item>(node)? {
             ast::Item::Fn(_) => Kind::Function,
-            ast::Item::Struct(_)
-            | ast::Item::Enum(_)
-            | ast::Item::Union(_)
-            | ast::Item::Trait(_)
-            | ast::Item::TraitAlias(_) => Kind::Item,
+            ast::Item::Struct(_) | ast::Item::Enum(_) | ast::Item::Union(_) | ast::Item::Trait(_) => {
+                Kind::Item
+            }
             ast::Item::TypeAlias(_) => {
                 let in_impl = node
                     .parent()

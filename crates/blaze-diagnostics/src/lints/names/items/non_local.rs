@@ -239,14 +239,14 @@ pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Option<Found> {
 }
 
 fn impl_<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, imp: ast::Impl<'db>) -> Option<Found> {
-    let owners = owners(cx, item.syntax());
-    let depth = depth(&owners);
-    let parent = owners.first()?;
+    let ours = owners(cx, item.syntax());
+    let depth = depth(&ours);
+    let parent = ours.first()?;
     if depth == 0 || (depth == 1 && parent.kind == Kind::AnonConst) {
         return None;
     }
     let self_ty = imp.self_ty()?;
-    let outermost = peel(&owners).map(Owner::key);
+    let outermost = peel(&ours).map(Owner::key);
     let mut paths: SmallVec<[(ast::Path<'db>, Option<PathResolution<'_>>); 4]> = SmallVec::new();
     let roots = std::iter::once(self_ty.syntax()).chain(imp.trait_().map(|it| it.syntax()));
     for root in roots {

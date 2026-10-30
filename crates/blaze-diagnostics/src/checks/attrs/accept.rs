@@ -695,7 +695,7 @@ pub(crate) fn target_error(
     // alloc: the error's help
     diag.help(format!("the `{name}{args}` attribute can {only}be applied to {}", stdx::list::list(applied.iter(), Join::And, false)));
     match (path.as_slice(), owner.target) {
-        ([it], Target::Static) if it == "link_name" => {
+        ([it], Target::Static) if it.as_str() == "link_name" => {
             let inner = cx.span(attr.in_file(attr.inner_range()));
             // alloc: the error's suggestion
             let mut parts = Vec::new();
@@ -711,10 +711,10 @@ pub(crate) fn target_error(
             }
             diag.multipart_suggestion("did you mean to use `#[export_name]`?", parts, Applicability::MaybeIncorrect);
         }
-        ([it], Target::Fn | Target::Method(_)) if it == "repr" && args == "(align(...))" && krate.fn_align => {
+        ([it], Target::Fn | Target::Method(_)) if it.as_str() == "repr" && args == "(align(...))" && krate.fn_align => {
             diag.help("use `#[rustc_align(...)]` instead");
         }
-        ([it], Target::Static) if it == "repr" && args == "(align(...))" && krate.static_align => {
+        ([it], Target::Static) if it.as_str() == "repr" && args == "(align(...))" && krate.static_align => {
             diag.help("use `#[rustc_align_static(...)]` instead");
         }
         _ => {}

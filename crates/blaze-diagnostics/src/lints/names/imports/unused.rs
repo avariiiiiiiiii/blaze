@@ -132,14 +132,14 @@ impl Unused {
         }
 
         // What is redundant is read by `unused_qualifications` too.
-        let redundant = cx.lint_may_fire(LintId::named("redundant_imports"))
+        let check_redundant = cx.lint_may_fire(LintId::named("redundant_imports"))
             || cx.lint_may_fire(LintId::named("unused_qualifications"));
         let mut seen: hashbrown::HashSet<ModuleId, FxBuildHasher, _> = hashbrown::HashSet::with_capacity_and_hasher_in(
-            if redundant { uses.by_module.len() } else { 0 },
+            if check_redundant { uses.by_module.len() } else { 0 },
             FxBuildHasher,
             cx.frame(),
         );
-        for module in uses.items.iter().map(|it| it.module).filter(|_| redundant) {
+        for module in uses.items.iter().map(|it| it.module).filter(|_| check_redundant) {
             if !seen.insert(module) {
                 continue;
             }

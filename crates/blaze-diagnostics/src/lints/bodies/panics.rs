@@ -43,7 +43,7 @@ use hir_expand::{MacroDefKind, builtin::BuiltinFnLikeExpander};
 use hir_ty::{
     ParamEnvAndCrate,
     consteval::try_const_usize,
-    db::{GeneralConstId, HirDatabase, InternedClosureId},
+    db::{HirDatabase, InternedClosureId},
     method_resolution::lookup_impl_const,
     mir::{
         AggregateKind, AsmOperand, AssertKind, BasicBlockId, BinOp, BorrowKind, CastKind, LocalId, MirBody, MirSpan,
@@ -51,7 +51,8 @@ use hir_ty::{
         UnOp,
     },
     next_solver::{
-        Allocation, Const, ConstKind, DbInterner, GenericArgKind, ParamEnv, Ty, TyKind, TypingMode,
+        AliasConst, AliasConstKind, Allocation, Const, ConstKind, DbInterner, FreeConstAliasId, GenericArgKind,
+        InherentAssocConstId, ParamEnv, TraitAssocConstId, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
     utils::detect_variant_from_bytes,
@@ -810,13 +811,15 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                 }
                 return Some(Value::Scalar(Scalar::new(leaf.to_bits_unchecked(), size, kind)));
             }
-            ConstKind::Unevaluated(unevaluated) => match unevaluated.def.0 {
-                GeneralConstId::ConstId(id) => {
-                    let (id, args) = lookup_impl_const(&self.owner.infcx, self.owner.env, id, unevaluated.args);
+            ConstKind::Alias(_, AliasConst { kind, args, .. }) => match kind {
+                AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
+                | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
+                | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => {
+                    let (id, args) = lookup_impl_const(&self.owner.infcx, self.owner.env, id, args);
                     self.db.const_eval(id, args, None).ok()?
                 }
-                GeneralConstId::AnonConstId(id) => self.db.anon_const_eval(id, unevaluated.args, None).ok()?,
-                GeneralConstId::StaticId(_) => return None,
+                AliasConstKind::Anon { def_id } => self.db.anon_const_eval(def_id.0, args, None).ok()?,
+                AliasConstKind::InherentSelf { .. } => return None,
             },
             _ => return None,
         };

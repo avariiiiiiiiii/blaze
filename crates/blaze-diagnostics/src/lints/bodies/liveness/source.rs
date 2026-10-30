@@ -424,7 +424,7 @@ pub(super) fn mut_reference_param(
     let pat = ast::IdentPat::cast(b.cx.syntax_view(b.pat_node(param)?).value)?;
     let ast::Type::RefType(ty) = ast::Param::cast(pat.syntax().parent()?)?.ty()? else { return None };
     let Expr::Assignment { target, value } = store.expr(assign) else { return None };
-    let Expr::Ref { expr: inner, rawness: hir_def::hir::Rawness::Ref, .. } = store.expr(value) else { return None };
+    let Expr::Ref { expr: inner, rawness: hir_def::hir::type_ref::Rawness::Ref, .. } = store.expr(value) else { return None };
     let node = b.pat_node(param)?;
     let at = |range: TextRange| b.cx.span(InFile::new(node.file_id, range));
     // alloc: for a lint's suggestion, once a lint is found

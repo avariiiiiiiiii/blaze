@@ -426,18 +426,18 @@ fn served<S: Sig>(db: &Db, item: Item, live: impl FnOnce(Crate) -> R<Vec<u8>>) -
     let image = super::image_of(db, krate).as_ref()?;
     let what = item.what();
     let part = image.view().part(Part::Signatures);
-    let record = find(db, part, item).unwrap_or_else(|why| corrupt(db, krate, item, &why));
-    let value = read::<S>(db, krate, what, image.bytes(), record)
+    let stored = find(db, part, item).unwrap_or_else(|why| corrupt(db, krate, item, &why));
+    let value = read::<S>(db, krate, what, image.bytes(), stored)
         .unwrap_or_else(|why| corrupt(db, krate, item, &why));
     match image.mode() {
         Mode::Serve => {}
         Mode::Check => {
             let written = live(krate);
-            compare(db, krate, item, "the signature lowered from syntax", written, record);
+            compare(db, krate, item, "the signature lowered from syntax", written, stored);
         }
         Mode::Verify => {
             let written = record::<S>(db, krate, what, S::of(&value));
-            compare(db, krate, item, "what was read of it", written, record);
+            compare(db, krate, item, "what was read of it", written, stored);
         }
     }
     Some(value)

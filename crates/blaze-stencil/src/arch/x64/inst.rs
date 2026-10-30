@@ -203,13 +203,13 @@ pub fn inst(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
             Ok(())
         }
         Opcode::SymbolValue | Opcode::TlsValue => {
-            let InstructionData::UnaryGlobalValue { global_value, .. } = data else {
+            let InstructionData::UnaryGlobalValue { global_value: gv, .. } = data else {
                 return Err(Error::at(inst, "a global value instruction of another format"));
             };
             let Some(dst) = result_slot(inst, cx.loc(func.dfg.first_result(inst)))? else {
                 return Ok(());
             };
-            let tls = match func.global_values[global_value] {
+            let tls = match func.global_values[gv] {
                 ir::GlobalValueData::Symbol { tls, .. } => Some(tls),
                 _ => None,
             };
@@ -227,7 +227,7 @@ pub fn inst(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
                     ));
                 }
             }
-            global_value(cx, inst, global_value, GV_DEPTH)?;
+            global_value(cx, inst, gv, GV_DEPTH)?;
             asm::store(cx.buf, slot(dst), RAX);
             Ok(())
         }

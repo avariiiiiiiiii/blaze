@@ -238,7 +238,7 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
     }
 
     fn nonnull_optimization_guaranteed(&self, adt: AdtId) -> bool {
-        walk::attr(self.cx, &adt_source(self.cx, adt).value, "rustc_nonnull_optimization_guaranteed").is_some()
+        walk::attr(self.cx, adt_source(self.cx, adt).value, "rustc_nonnull_optimization_guaranteed").is_some()
     }
 
     /// rustc's `ty_is_known_nonnull`.

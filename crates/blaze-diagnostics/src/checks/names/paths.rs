@@ -363,7 +363,6 @@ fn missing_parameter(cx: &Cx<'_, '_>, signature: &Signature<'_>, path: ast::Path
         | ast::Item::Union(_)
         | ast::Item::TypeAlias(_)
         | ast::Item::Trait(_)
-        | ast::Item::TraitAlias(_)
         | ast::Item::Impl(_)
         | ast::Item::Const(_) => ast::AnyHasGenericParams::cast(item.syntax())?,
         _ => return None,

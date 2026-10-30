@@ -13,7 +13,7 @@ use hir_ty::{ParamEnvAndCrate, next_solver::{DbInterner, ParamEnv}};
 
 use super::{HirInstance, Kind, places::Ref};
 use crate::{
-    ALLOCATOR_ENTRIES, Produced, compile_as, declares_global_allocator, depended_crates,
+    ALLOCATOR_ENTRIES, Produced, compile_as, declares_global_allocator, linked_crates,
     fragment::FuncTarget, global_allocator_export, ptr,
 };
 
@@ -42,7 +42,7 @@ pub(super) fn shim(
     let Some(boxed) = DbInterner::new_with(db, krate).lang_items().OwnedBox else {
         return Ok(Vec::new()); // alloc: empty, allocates nothing
     };
-    let program = depended_crates(db, [krate]);
+    let program = linked_crates(db, [krate]);
     if !program.contains(&boxed.krate(db)) {
         return Ok(Vec::new()); // alloc: empty, allocates nothing
     }

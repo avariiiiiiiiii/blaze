@@ -9,7 +9,7 @@ any. A line is exempt when it, or the line above it, has a `// alloc: <why>`, `/
 
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from typed_input import parse
@@ -19,7 +19,7 @@ HOT = (
     "blaze-query", "blaze-ids", "intern", "blaze-graph", "blaze-cas", "blaze-vfs", "blaze-core",
     "blaze-link", "blaze-codegen", "blaze-stencil", "blaze-lazy", "blaze-tier", "blaze-items",
     "parser", "syntax-tree", "span", "tt", "mbe", "hir-def", "hir-expand", "hir-ty",
-    "hir-ty-mir", "hir-ty-codegen", "base-db",
+    "hir-ty-mir", "hir-ty-codegen", "base-db", "blaze-diagnostics",
 )
 CHECKS = (
     ("clone", re.compile(r"\.clone\(\)"), "`.clone()`: borrow, copy an ID, or make the type not `Clone`"),
@@ -36,7 +36,7 @@ EXEMPT = re.compile(r"//\s*(alloc|dyn|clone):\s*\S")
 @dataclass(frozen=True)
 class Input:
     root: str
-    crates: list[str] = field(default_factory=lambda: list(HOT))
+    crates: tuple[str, ...] = HOT
 
 
 def in_test_module(lines: list[str]) -> list[bool]:
@@ -86,13 +86,16 @@ def main() -> None:
     total = 0
     counts: list[tuple[str, int]] = []
     for crate in cfg.crates:
-        src = root / "crates" / crate / "src"
+        # A crate may keep its sources at its root (`hir-ty-codegen` does) rather than in `src/`.
+        base = root / "crates" / crate
+        src = base / "src" if (base / "src").is_dir() else base
         if not src.is_dir():
             continue
         found: list[str] = []
         for path in sorted(src.rglob("*.rs")):
             name = path.name
-            if "tests" in path.parts or name.endswith("tests.rs") or name == "tests.rs":
+            parts = path.relative_to(base).parts
+            if {"tests", "benches", "examples", "target"} & set(parts) or name.endswith("tests.rs"):
                 continue
             found.extend(lint_file(path, root))
         for line in found:

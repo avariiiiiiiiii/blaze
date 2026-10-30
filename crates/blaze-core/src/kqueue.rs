@@ -68,9 +68,9 @@ const SPARE_WATCHES: usize = 64;
 /// Tags watched, spawned or listening at once that the maps hold before they grow.
 const TAGS: usize = 256;
 
-/// `struct kevent` as the system lays it out, with `udata` the driver's handle, so the lists
-/// of changes and events are plain data of the driver's own.
-#[repr(C)]
+/// `struct kevent` as the system lays it out (`<sys/event.h>` packs it to 4), with `udata` the
+/// driver's handle, so the lists of changes and events are plain data of the driver's own.
+#[repr(C, packed(4))]
 #[derive(Clone, Copy)]
 struct Kevent {
     ident: usize,

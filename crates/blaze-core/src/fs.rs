@@ -237,7 +237,7 @@ fn meta_of(meta: &std::fs::Metadata) -> Meta {
 /// symbolic links are not followed.
 pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Meta)>> {
     // alloc: the listing's payload.
-    let mut found = Vec::new();
+    let mut found: Vec<(FileName, Meta)> = Vec::new();
     // Each directory still to read, by its index in `found`; `None` for `dir` itself.
     let mut todo: Vec<Option<usize>> = Vec::with_capacity(16); // alloc: once per listing.
     todo.push(None);

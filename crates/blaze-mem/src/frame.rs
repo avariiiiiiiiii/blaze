@@ -467,7 +467,7 @@ impl Frame {
                 prev: ptr::null_mut(),
                 next: ptr::null_mut(),
                 before: 0,
-                end: base.addr() + CHUNK,
+                end: base.addr().get() + CHUNK,
                 chunk: chunk.index(),
                 granted: 0,
                 span: None,
@@ -519,7 +519,7 @@ impl Frame {
             return Err(error);
         }
         let base = region.base();
-        let end = base.addr() + region.reserved();
+        let end = base.addr().get() + region.reserved();
         let committed = region.committed();
         let block = base.cast::<Block>().as_ptr();
         // SAFETY: the region is fresh, committed for `need >= HEADER` bytes and aligned to a

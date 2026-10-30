@@ -455,15 +455,15 @@ mod tests {
             .map(|(name, values)| {
                 let values = values
                     .into_iter()
-                    .map(|(dep, shape, sub)| {
-                        let (dep, sub) = (DEPS[dep], SUBS[sub]);
+                    .map(|(dep, shape, at)| {
+                        let (dep, sub) = (DEPS[dep], SUBS[at]);
                         match shape {
                             0 => dep.to_owned(),
                             1 => format!("dep:{dep}"),
                             2 => format!("{dep}/{sub}"),
                             3 => format!("{dep}?/{sub}"),
                             4 => format!("dep:{dep}/{sub}"),
-                            5 => FEATURES[sub].to_owned(),
+                            5 => FEATURES[at].to_owned(),
                             _ => sub.to_owned(),
                         }
                     })

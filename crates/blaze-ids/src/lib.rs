@@ -10,7 +10,7 @@
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/lanes/items.md
 //!   section 6.2).
 
-#![feature(allocator_api, portable_simd)]
+#![feature(allocator_api, allocator_ext, portable_simd)]
 #![deny(unsafe_code)]
 
 use std::{fmt, hash, marker::PhantomData};

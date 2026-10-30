@@ -11,7 +11,7 @@
 //! `docs/borrowck.md` in the repository describes what is checked.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 
 extern crate rustc_type_ir;
 

@@ -969,7 +969,9 @@ fn nest(depth: usize) {
         if depth > 1 {
             nest(depth - 1);
         }
-        frame::current(|frame| frame.alloc_slice_fill_with(64, |_| 0xAA));
+        frame::current(|frame| {
+            frame.alloc_slice_fill_with(64, |_| 0xAA);
+        });
         // SAFETY: the bytes are in this task's frame, alive until the task ends, and nothing
         // else refers to them.
         let kept = unsafe { &*kept };
@@ -1598,7 +1600,7 @@ fn limbo_matches_a_model_and_allocates_nothing_once_warm() {
     let mut cache = pool.cache();
     let mut limbo = pool::Limbo::new(&pool).expect("reserve");
     let mut rng = Xorshift64Star::new(9);
-    let mut round = |cache: &mut crate::Cache<'_, [u64; 4]>, limbo: &mut pool::Limbo<'_, [u64; 4]>| {
+    let mut round = || {
         let mut retired = 0;
         let mut collected = 0;
         for _ in 0..20_000 {
@@ -1613,8 +1615,8 @@ fn limbo_matches_a_model_and_allocates_nothing_once_warm() {
         assert_eq!(collected, retired, "with no reader every grace passes");
         assert!(limbo.is_empty());
     };
-    round(&mut cache, &mut limbo);
-    let (_, used) = measure(|| round(&mut cache, &mut limbo));
+    round();
+    let (_, used) = measure(&mut round);
     assert_eq!(used.allocations, 0, "retiring and collecting reuse the limbo's column");
     assert!(pool.carved() <= 3 * 128 + 64, "collected slots are reused");
 }

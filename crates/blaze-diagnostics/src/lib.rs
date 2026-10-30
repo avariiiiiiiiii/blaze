@@ -16,7 +16,7 @@
 //! A check is one task: its tables live in the task's [`blaze_mem::Frame`] ([`Cx::frame`]),
 //! freed in one go when it returns. Only the diagnostics it gives outlive it.
 
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
 
 #[cfg(test)]

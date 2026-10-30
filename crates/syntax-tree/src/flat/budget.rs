@@ -93,12 +93,12 @@ mod tests {
     }
 
     /// A tree made in a task counts its block's bytes against the task's tag (no other test of
-    /// this crate makes a tree of [`Tag::Ide`]) until it is freed and the thread's frees are
-    /// folded, at the latest when the thread ends; one walked into lazily counts its part
+    /// this crate makes a tree of [`Tag::Diagnostics`]) until it is freed and the thread's frees
+    /// are folded, at the latest when the thread ends; one walked into lazily counts its part
     /// against its tree's tag, made outside any task.
     #[test]
     fn a_tree_counts_against_its_tasks_tag_until_freed() {
-        let tag = Tag::Ide;
+        let tag = Tag::Diagnostics;
         let before = live(tag);
         let held = std::thread::spawn(move || {
             let tree = frame::task(tag, |_| {
@@ -137,7 +137,7 @@ mod tests {
             builder.finish_node();
             (builder.finish(), Vec::new())
         }
-        let tag = Tag::Ide;
+        let tag = Tag::Diagnostics;
         std::thread::spawn(move || {
             let tree = frame::task(tag, |_| {
                 let mut builder = FlatTreeBuilder::sourced("{body}".into());

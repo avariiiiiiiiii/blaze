@@ -3,7 +3,7 @@
 //! Every local lives in memory. Calls follow rustc's (unstable) Rust ABI so the
 //! output can be linked against rustc-compiled objects.
 
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 // Unsafe code is in `llvm` (LLVM's C API) and `lent` alone (docs/v2/plan/design/unsafe.md).
 #![deny(unsafe_code)]
 

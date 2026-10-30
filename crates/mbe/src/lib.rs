@@ -7,7 +7,7 @@
 //! `hir_def::macro_expansion_tests::mbe`.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
 
 #[cfg(not(feature = "in-rust-tree"))]

@@ -164,7 +164,8 @@ fn check(rng: &mut SplitMix64, of: Of<'_>, input: &[u8]) {
     theirs.set_position(position);
     for _ in 0..2 {
         let size = rng.range(0..1025) as usize;
-        let (a, b) = (&mut a[..size.min(a.len())], &mut b[..size.min(b.len())]);
+        let (a_len, b_len) = (size.min(a.len()), size.min(b.len()));
+        let (a, b) = (&mut a[..a_len], &mut b[..b_len]);
         ours.fill(a);
         theirs.fill(b);
         assert_eq!(a, b, "{size} output bytes from {position}, {of:?}, {len} B");

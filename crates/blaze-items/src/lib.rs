@@ -35,7 +35,7 @@
 //! the item it names, so hashing nests as deep as the graph of refs, past the frames a worker
 //! keeps warm. Preimages are written into the worker's scratch buffers.
 
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
 
 mod bound;

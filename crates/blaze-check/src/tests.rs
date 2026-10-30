@@ -265,10 +265,25 @@ fn compare_exchange_elects_one_winner() {
     assert_eq!(seen, BTreeSet::from([(true, false, 1), (false, true, 2)]));
 }
 
+/// A cell shared between threads, as a crate's own type shares one: `UnsafeCell` is `!Sync`
+/// like std's, so the claim that sharing is safe is the wrapper's, and the model checks it.
+struct Shared<T>(UnsafeCell<T>);
+
+// SAFETY: every access goes through `with`/`with_mut`, which the model checks for races.
+unsafe impl<T: Send> Sync for Shared<T> {}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = UnsafeCell<T>;
+
+    fn deref(&self) -> &UnsafeCell<T> {
+        &self.0
+    }
+}
+
 #[test]
 fn an_unsynchronized_cell_write_is_a_race() {
     let report = finding(builder(), || {
-        let cell = Arc::new(UnsafeCell::new(0u32));
+        let cell = Arc::new(Shared(UnsafeCell::new(0u32)));
         let other = {
             let cell = cell.clone();
             thread::spawn(move || cell.with_mut(|_| ()))
@@ -283,7 +298,7 @@ fn an_unsynchronized_cell_write_is_a_race() {
 #[test]
 fn a_relaxed_flag_does_not_order_a_cell() {
     let report = finding(builder(), || {
-        let cell = Arc::new(UnsafeCell::new(0u32));
+        let cell = Arc::new(Shared(UnsafeCell::new(0u32)));
         let flag = Arc::new(AtomicBool::new(false));
         let writer = {
             let (cell, flag) = (cell.clone(), flag.clone());
@@ -303,7 +318,7 @@ fn a_relaxed_flag_does_not_order_a_cell() {
 #[test]
 fn a_release_acquire_flag_orders_a_cell() {
     builder().check(|| {
-        let cell = Arc::new(UnsafeCell::new(0u32));
+        let cell = Arc::new(Shared(UnsafeCell::new(0u32)));
         let flag = Arc::new(AtomicBool::new(false));
         let writer = {
             let (cell, flag) = (cell.clone(), flag.clone());
@@ -541,7 +556,7 @@ fn statics_start_again_in_each_execution() {
 #[test]
 fn a_finding_replays_from_its_schedule() {
     fn racy() {
-        let cell = Arc::new(UnsafeCell::new(0u32));
+        let cell = Arc::new(Shared(UnsafeCell::new(0u32)));
         let flag = Arc::new(AtomicBool::new(false));
         let writer = {
             let (cell, flag) = (cell.clone(), flag.clone());

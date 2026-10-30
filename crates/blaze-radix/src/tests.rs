@@ -265,7 +265,8 @@ fn sorting_in_a_given_scratch_is_the_same_sort() {
     let mut want = wide.clone();
     want.sort_by_key(|it| it.0);
     let mut got = wide;
-    sort_copy_by_key_in(&mut got, |it| it.0, &mut scratch);
+    let mut wide_scratch = Vec::new();
+    sort_copy_by_key_in(&mut got, |it| it.0, &mut wide_scratch);
     assert_eq!(got, want, "u128 keys from WIDE take 8-bit digits on the stack");
 }
 

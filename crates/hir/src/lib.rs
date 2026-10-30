@@ -18,7 +18,7 @@
 //! <https://www.tedinski.com/2018/02/06/system-boundaries.html>.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 #![recursion_limit = "512"]
 
 extern crate rustc_type_ir;

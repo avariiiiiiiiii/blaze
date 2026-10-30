@@ -31,7 +31,7 @@
 //!   lock's [`bundle::BundleId`], fetched in parallel and placed in the store.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 
 pub mod bundle;
 pub mod client;

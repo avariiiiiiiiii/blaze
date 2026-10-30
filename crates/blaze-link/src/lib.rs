@@ -13,7 +13,7 @@
 //! The one `unsafe` block is `intern::name_at`'s `from_utf8_unchecked` of names it appended as
 //! `&str`s.
 
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 #![deny(unsafe_code)]
 
 mod arena;

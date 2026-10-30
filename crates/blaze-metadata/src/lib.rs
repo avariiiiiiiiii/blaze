@@ -345,7 +345,7 @@ pub fn units(asked: &Asked<'_>, units: &Units<'_>) -> Result<blaze_units::UnitGr
         units.release,
         units.profile,
     )?;
-    resolved(asked, None, |resolved| {
+    resolved(asked, as_asked(asked), |resolved| {
         let FeatureRoots { specs, members: member_features } = resolved.one_feature_resolve()?;
         let Resolved { ws, resolve, behavior, packages: reads, .. } = resolved;
         let profiles = blaze_manifest::profiles::Profiles::new(

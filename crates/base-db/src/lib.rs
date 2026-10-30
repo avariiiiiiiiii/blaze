@@ -2,7 +2,7 @@
 //! roots and the crate graph.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]

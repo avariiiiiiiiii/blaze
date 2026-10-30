@@ -387,7 +387,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Completion, Done, Driver, Effect, Names,
+        Completion, Done, Driver, Effect, Names, Tag,
         sim::{Faults, Sim},
     };
 

@@ -23,7 +23,7 @@
 //! [#89]: https://github.com/indexable-inc/blaze/issues/89
 //! [#147]: https://github.com/indexable-inc/blaze/issues/147
 
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
 
 pub mod apply;

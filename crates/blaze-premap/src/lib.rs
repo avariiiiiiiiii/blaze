@@ -18,7 +18,7 @@
 //! Design and the case for each behavior: `docs/v2/plan/lanes/fastcompile/premap.md`.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 
 use std::fmt;
 

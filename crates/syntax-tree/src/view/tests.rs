@@ -246,7 +246,9 @@ fn check(tree: &Arc<FlatTree>) {
         match (c, v) {
             (NodeOrToken::Node(c), NodeOrToken::Node(v)) => {
                 let node = |it: Option<api::SyntaxNode<Raw>>| find(it.map(NodeOrToken::Node));
-                let as_element = |it: Option<View<'_>>| it.map(NodeOrToken::Node);
+                fn as_element(it: Option<View<'_>>) -> Option<ViewElement<'_>> {
+                    it.map(NodeOrToken::Node)
+                }
                 let token = |it: Option<api::SyntaxToken<Raw>>| find(it.map(NodeOrToken::Token));
                 assert!(same(v.first_token().map(NodeOrToken::Token), token(c.first_token())));
                 assert!(same(v.last_token().map(NodeOrToken::Token), token(c.last_token())));

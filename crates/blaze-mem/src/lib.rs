@@ -32,7 +32,7 @@
 //! allocator that turn a committed address into a typed place; every block says which
 //! invariant holds and where it is upheld (docs/v2/plan/design/unsafe.md).
 
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 
 pub mod align;
 pub mod append;

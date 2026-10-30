@@ -15,7 +15,7 @@ struct Plain {
     data: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[derive(Deserialize, PartialEq, Eq, Debug)]
 struct Files {
     files: Vec<(String, Buf)>,
 }

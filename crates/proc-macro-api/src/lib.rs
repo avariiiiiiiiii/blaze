@@ -10,7 +10,7 @@
     feature = "in-rust-tree",
     feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span)
 )]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 #![allow(internal_features, unused_features)]
 
 #[cfg(test)]

@@ -14,7 +14,7 @@
 //! which functions a [`blaze_api::Request::WillTest`] needs built.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 
 pub mod ahead;
 pub mod edit;

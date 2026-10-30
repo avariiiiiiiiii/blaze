@@ -8,7 +8,7 @@
 //! actually true.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 #![deny(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]

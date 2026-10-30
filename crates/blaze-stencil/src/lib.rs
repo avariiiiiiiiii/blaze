@@ -26,7 +26,7 @@
 // Denied, not forbidden: the one unsafe module is the tests' `tests/exec.rs`, which maps code
 // and calls it.
 #![deny(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 
 pub mod arch;
 pub mod buf;

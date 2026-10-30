@@ -12,7 +12,7 @@
 //! subtree is a range of words, and region inference over the SCCs of the outlives graph.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 extern crate rustc_type_ir;

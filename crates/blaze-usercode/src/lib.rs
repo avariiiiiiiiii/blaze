@@ -17,7 +17,7 @@
 //! needs no compile (docs/v2/plan/lanes/pure-scripts/design.md); [`test`] selects and runs tests
 //! (docs/v2/plan/lanes/usercode/notes.md).
 
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 #![forbid(unsafe_code)]
 
 pub mod confine;

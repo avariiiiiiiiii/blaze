@@ -2,7 +2,7 @@
 //! Allows bidirectional lookup.
 
 use std::{
-    alloc::{Allocator, Global},
+    alloc::{Allocator, AllocatorNightly, Global},
     cell::RefCell,
     fmt,
     hash::Hash,
@@ -415,7 +415,9 @@ impl<A: Allocator + Clone> SpanMap<A> {
         other_range: TextRange,
         other_size: TextSize,
         other: &SpanMap<B>,
-    ) {
+    ) where
+        A: AllocatorNightly,
+    {
         // I find the following diagram helpful to illustrate the bounds and why we use `<` or `<=`:
         // --------------------------------------------------------------------
         //   1   3   5   6   7   10    11          <-- offsets we store

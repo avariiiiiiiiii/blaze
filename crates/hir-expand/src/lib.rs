@@ -4,7 +4,7 @@
 //! tree originates not from the text of some `FileId`, but from some macro
 //! expansion.
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 // It's useful to refer to code that is private in doc comments.
 #![allow(rustdoc::private_intra_doc_links)]
 #![forbid(unsafe_code)]

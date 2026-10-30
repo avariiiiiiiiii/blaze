@@ -12,7 +12,7 @@
 //! Code dedupe never merges statics or anything whose address the program can compare as
 //! distinct: those are [`Target::Static`], keyed by which item they are, never by content.
 
-#![feature(allocator_api)]
+#![feature(allocator_api, allocator_ext)]
 // Unsafe code is in `memo` alone (docs/v2/plan/design/unsafe.md).
 #![deny(unsafe_code)]
 

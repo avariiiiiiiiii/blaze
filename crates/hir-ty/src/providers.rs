@@ -5,7 +5,8 @@
 //! through the table, as only a miss calls `execute` in rustc. The crate with the code
 //! registers its table with `inventory::submit!`, which the linker keeps in every binary that
 //! links that crate: nothing installs anything, and a binary with no table, or two, panics on
-//! the first miss, naming what to link.
+//! the first miss, naming what to link. A crate's own unit tests, which link a test build and a
+//! library copy, use the test build ([`Mir::own_tests`]).
 //!
 //! The MIR queries are one per [`MirOwner`] kind and [`MirStage`], each monomorphized or not:
 //! each keeps its own memo under its own key, and every one computes through `compute` or
@@ -68,6 +69,9 @@ pub struct Mir {
         InternedOpaqueTyId<'db>,
         GenericArgs<'db>,
     ) -> Option<Ty<'db>>,
+    /// `cfg!(test)` where the table is built. A crate's own unit tests link it twice, their
+    /// test build and the library copy a dev-dependency links; the test build is the one tested.
+    pub own_tests: bool,
 }
 
 inventory::collect!(Mir);
@@ -75,7 +79,14 @@ inventory::collect!(Mir);
 /// The linked MIR table.
 pub fn mir() -> &'static Mir {
     static ONE: OnceLock<&'static Mir> = OnceLock::new();
-    ONE.get_or_init(|| one::<Mir>("hir-ty-mir"))
+    ONE.get_or_init(|| {
+        let mut tested = inventory::iter::<Mir>().filter(|it| it.own_tests);
+        let Some(first) = tested.next() else { return one::<Mir>("hir-ty-mir") };
+        assert!(tested.next().is_none(), "two test builds of `{}` are linked", std::any::type_name::<Mir>());
+        let libraries = inventory::iter::<Mir>().filter(|it| !it.own_tests).count();
+        assert!(libraries <= 1, "two `{}` are linked beside a test build", std::any::type_name::<Mir>());
+        first
+    })
 }
 
 fn one<T: inventory::Collect>(by: &str) -> &'static T {

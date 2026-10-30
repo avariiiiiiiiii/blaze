@@ -39,6 +39,7 @@ inventory::submit! {
         coroutine_witnesses: held_bindings,
         interpret_mir: no_interpret,
         opaque_of_impl: no_opaque_of_impl,
+        own_tests: true,
     }
 }
 

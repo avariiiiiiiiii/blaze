@@ -21,6 +21,7 @@ inventory::submit! {
         interpret_mir,
         opaque_of_impl: monomorphization::opaque_of_impl,
         coroutine_witnesses: transform::compute_coroutine_witnesses,
+        own_tests: cfg!(test),
     }
 }
 

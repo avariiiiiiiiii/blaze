@@ -41,7 +41,7 @@ struct Node {
 /// `ready`), watched (a bit in `watched`), or finished in the current call (a bit in `dead`);
 /// later rows are new and ready. A node left in a list by a row woken through another key may
 /// wake it again later, which only costs a stall check.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Watches {
     known: u32,
     ready: Vec<u64>,
@@ -60,6 +60,26 @@ pub(super) struct Watches {
     keys: u32,
     cursors: [Option<TouchedAt>; TABLES],
     opaque_seen: Option<u64>,
+}
+
+impl Default for Watches {
+    fn default() -> Self {
+        Watches {
+            known: 0,
+            ready: Vec::new(),
+            watched: Vec::new(),
+            dead: Vec::new(),
+            any_dead: false,
+            heads: Default::default(),
+            opaque_rows: Vec::new(),
+            nodes: Vec::new(),
+            free: NONE,
+            linked: 0,
+            keys: 0,
+            cursors: [None; TABLES],
+            opaque_seen: None,
+        }
+    }
 }
 
 impl Watches {

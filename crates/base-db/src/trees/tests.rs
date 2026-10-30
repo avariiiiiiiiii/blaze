@@ -5,7 +5,7 @@ use salsa::Durability;
 use span::Edition;
 use syntax::{FlatTree, SourceFile};
 use triomphe::Arc;
-use vfs::{FileId, VfsPath, file_set::FileSet};
+use crate::{FileId, FileSet, VfsPath};
 
 use super::{Trees, write_section};
 use crate::{Db, EditionedFileId, SourceRoot, SourceRootId, reparse::WHOLE};

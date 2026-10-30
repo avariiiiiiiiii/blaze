@@ -13,6 +13,8 @@
 //!
 //! And the fetcher's priorities: an ask is taken before what is prefetched.
 
+use std::sync::Arc;
+
 use super::Rng;
 use crate::{
     LazyId,
@@ -66,7 +68,7 @@ impl World {
             })
             .collect();
         let workers = 1 + rng.below(4) as u32;
-        let mut fetcher = Fetcher::new(functions, workers);
+        let mut fetcher = Fetcher::new(functions, workers).unwrap();
         for _ in 0..rng.below(6) {
             let priority = [Priority::Callee, Priority::History, Priority::Idle][rng.below(3) as usize];
             fetcher.want(LazyId(rng.below(u64::from(functions)) as u32), priority);
@@ -259,9 +261,84 @@ fn the_same_seed_gives_the_same_trace() {
     }
 }
 
+/// The fetcher's waiters, in its slab, against a list per function in a map (how they were
+/// kept before): random asks, resent asks and compiles ending well or not give the same
+/// actions in the same order after every step.
+#[test]
+fn the_waiters_in_a_slab_answer_as_a_list_per_function_did() {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Done {
+        No,
+        Ready(u64),
+        Failed,
+    }
+    for seed in 0..200u64 {
+        let mut rng = Rng::new(seed);
+        let functions = 1 + rng.below(12) as u32;
+        let mut fetcher = Fetcher::new(functions, 1 + rng.below(3) as u32).unwrap();
+        let mut waiters: Vec<Vec<Waiter>> = vec![Vec::new(); functions as usize];
+        let mut done = vec![Done::No; functions as usize];
+        let mut stopped = vec![false; functions as usize];
+        let mut compiling: Vec<LazyId> = Vec::new();
+        let (mut out, mut expected) = (Vec::new(), Vec::new());
+        for step in 0..300 {
+            out.clear();
+            expected.clear();
+            match rng.below(3) {
+                0 => {
+                    let to = Waiter { client: rng.below(3) as u32, seq: rng.below(3) as u32, request: rng.below(2) };
+                    let lazy = rng.below(u64::from(functions)) as u32;
+                    fetcher.ask(to, lazy, &mut out);
+                    let at = lazy as usize;
+                    match done[at] {
+                        Done::Ready(target) => expected.push(Action::Answer { to, lazy, outcome: Outcome::Ready(target) }),
+                        Done::Failed => {
+                            let why: Arc<str> = "no MIR".into();
+                            expected.push(Action::Answer { to, lazy, outcome: Outcome::Failed(Arc::clone(&why)) });
+                            if !std::mem::replace(&mut stopped[at], true) {
+                                expected.push(Action::Stop { lazy, why });
+                            }
+                        }
+                        Done::No if !waiters[at].contains(&to) => waiters[at].push(to),
+                        Done::No => {}
+                    }
+                }
+                1 => compiling.extend(fetcher.next().map(|it| it.0)),
+                _ if compiling.is_empty() => {}
+                _ => {
+                    let id = compiling.swap_remove(rng.below(compiling.len() as u64) as usize);
+                    let at = id.index();
+                    let lazy = id.0;
+                    if rng.one_in(4) {
+                        fetcher.done(id, Err("no MIR"), &mut out);
+                        done[at] = Done::Failed;
+                        let why: Arc<str> = "no MIR".into();
+                        let asked = std::mem::take(&mut waiters[at]);
+                        for to in &asked {
+                            expected.push(Action::Answer { to: *to, lazy, outcome: Outcome::Failed(Arc::clone(&why)) });
+                        }
+                        if !asked.is_empty() {
+                            stopped[at] = true;
+                            expected.push(Action::Stop { lazy, why });
+                        }
+                    } else {
+                        let target = 0x1000 + u64::from(lazy) * 16;
+                        fetcher.done(id, Ok(target), &mut out);
+                        done[at] = Done::Ready(target);
+                        for to in std::mem::take(&mut waiters[at]) {
+                            expected.push(Action::Answer { to, lazy, outcome: Outcome::Ready(target) });
+                        }
+                    }
+                }
+            }
+            assert_eq!(out, expected, "seed {seed}, step {step}");
+        }
+    }
+}
+
 #[test]
 fn an_ask_is_taken_before_prefetches_and_moves_a_queued_function_up() {
-    let mut fetcher = Fetcher::new(6, 2);
+    let mut fetcher = Fetcher::new(6, 2).unwrap();
     fetcher.want(LazyId(0), Priority::Idle);
     fetcher.want(LazyId(1), Priority::History);
     fetcher.want(LazyId(2), Priority::Callee);
@@ -288,7 +365,7 @@ fn an_ask_is_taken_before_prefetches_and_moves_a_queued_function_up() {
 
 #[test]
 fn an_ask_of_a_published_function_is_answered_at_once() {
-    let mut fetcher = Fetcher::new(2, 1);
+    let mut fetcher = Fetcher::new(2, 1).unwrap();
     fetcher.want(LazyId(1), Priority::Callee);
     assert_eq!(fetcher.next(), Some((LazyId(1), Priority::Callee)));
     let mut actions = Vec::new();
@@ -302,7 +379,7 @@ fn an_ask_of_a_published_function_is_answered_at_once() {
 
 #[test]
 fn only_published_code_is_retargeted() {
-    let mut fetcher = Fetcher::new(4, 1);
+    let mut fetcher = Fetcher::new(4, 1).unwrap();
     let mut actions = Vec::new();
     assert!(!fetcher.retarget(LazyId(0), 0x40), "lazy");
     assert!(!fetcher.retarget(LazyId(9), 0x40), "past the session");

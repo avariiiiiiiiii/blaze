@@ -16,16 +16,10 @@ pub use program::main;
 /// bulk of a build comes from `blaze-mem`, which gives its pages back itself) wants the fastest
 /// small-object allocator, mimalloc. Counted, so that the plane's `arena::measure` and
 /// admission's `arena::held` see its bytes.
-#[cfg(all(not(test), not(all(unix, feature = "heap-profile"))))]
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOC: blaze_graph::arena::Counting<mimalloc::MiMalloc> =
     blaze_graph::arena::Counting(mimalloc::MiMalloc);
-
-/// `heap-profile` profiles jemalloc's heap, so jemalloc serves under it. Not on Windows.
-#[cfg(all(unix, feature = "heap-profile", not(test)))]
-#[global_allocator]
-static ALLOC: blaze_graph::arena::Counting<tikv_jemallocator::Jemalloc> =
-    blaze_graph::arena::Counting(tikv_jemallocator::Jemalloc);
 
 /// The tests hold the hot paths to allocation budgets.
 #[cfg(test)]

@@ -87,6 +87,7 @@ pub mod image;
 pub mod runtime;
 
 mod alloc;
+mod bind;
 mod handshake;
 mod sys;
 
@@ -231,6 +232,34 @@ pub struct FixedMap<'a> {
     /// it, never another address.
     pub at: u64,
     pub access: Access,
+}
+
+/// An 8-byte word of a fixed map's run-private copy that the start hook stores before any code
+/// of the map runs: `blaze-premap`'s binding of a dependency image's open cells to a definition
+/// the image's link could not see (`blaze_premap::start::Write`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ImageWrite {
+    /// Linked, inside a [`FixedMap`] of [`Access::Copy`]; the run's slide is added.
+    pub place: u64,
+    pub value: u64,
+    /// `value` is a linked address, which moves with the run's slide as `place` does; a
+    /// thread-local's offset from the thread pointer does not.
+    pub address: bool,
+}
+
+/// An 8-byte word of a fixed map's run-private copy bound to `name` in the run process's
+/// global scope, which the system loader filled from the executable's libraries
+/// (`blaze_premap::start::Lookup`): the start hook stores its address plus `addend`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ImageLookup<'a> {
+    /// Linked, inside a [`FixedMap`] of [`Access::Copy`]; the run's slide is added.
+    pub place: u64,
+    /// As the image's symbol table has it: on Mach-O with its leading `_`, which the hook takes
+    /// off for `dlsym`.
+    pub name: &'a str,
+    pub addend: i64,
+    /// 0 when nothing defines it; a strong one nothing defines fails the start, naming it.
+    pub weak: bool,
 }
 
 /// The run processes a code memory is mapped in.

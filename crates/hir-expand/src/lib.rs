@@ -28,7 +28,6 @@ pub mod span_map;
 
 mod cfg_process;
 mod fixup;
-mod prettify_macro_expansion_;
 
 #[cfg(test)]
 #[global_allocator]
@@ -52,11 +51,11 @@ use blaze_mem::Frame;
 use either::Either;
 use mbe::MatchedArmIndex;
 use span::{
-    AstIdMap, Edition, ErasedFileAstId, FileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, Span,
+    AstIdMap, Edition, ErasedFileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, Span,
     SyntaxContext,
 };
 use syntax::{
-    Parse, SyntaxError, SyntaxNode, SyntaxToken, T, TextRange, TextSize,
+    Parse, SyntaxError, SyntaxNode, T, TextRange, TextSize,
     ast::{self, AstNode},
     view::{self, AstNode as _},
 };
@@ -75,10 +74,7 @@ use crate::{
     span_map::{ExpansionSpanMap, InOrder, MacroRulesArgs, SpanMap},
 };
 
-pub use crate::{
-    files::{AstId, ErasedAstId, FileRange, InFile, InMacroFile, InRealFile},
-    prettify_macro_expansion_::prettify_macro_expansion,
-};
+pub use crate::files::{AstId, ErasedAstId, FileRange, InFile, InMacroFile, InRealFile};
 
 pub use base_db::EditionedFileId;
 pub use mbe::{
@@ -575,10 +571,8 @@ pub enum MacroKind {
 }
 
 impl MacroCallId {
-    pub fn call_node(self, db: &Db) -> InFile<SyntaxNode> {
-        self.loc(db).to_node(db)
-    }
-    /// [`Self::call_node`] as a view.
+    /// The call: the macro call, the meta of the derive in its attribute, or the item an
+    /// attribute macro is on.
     pub fn call_node_view(self, db: &Db) -> InFile<view::Node<'_>> {
         self.loc(db).to_node_view(db)
     }
@@ -1193,40 +1187,7 @@ impl MacroDefId {
 }
 
 impl MacroCallLoc {
-    pub fn to_node(&self, db: &Db) -> InFile<SyntaxNode> {
-        match &self.kind {
-            MacroCallKind::FnLike { ast_id, .. } => {
-                ast_id.with_value(ast_id.to_node(db).syntax().clone()) // clone: a node handle, a non-atomic count
-            }
-            MacroCallKind::Derive { ast_id, derive_attr_index, .. } => {
-                let (_, attr) = derive_attr_index.find_attr_range(db, self.krate, *ast_id);
-                ast_id.with_value(attr.syntax().clone()) // clone: a node handle, a non-atomic count
-            }
-            MacroCallKind::Attr { ast_id, censored_attr_ids: attr_ids, .. } => {
-                if self.def.is_attribute_derive() {
-                    let (_, attr) = attr_ids.invoc_attr().find_attr_range(db, self.krate, *ast_id);
-                    ast_id.with_value(attr.syntax().clone()) // clone: a node handle, a non-atomic count
-                } else {
-                    ast_id.with_value(ast_id.to_node(db).syntax().clone()) // clone: a node handle, a non-atomic count
-                }
-            }
-        }
-    }
-
-    pub fn to_node_item(&self, db: &Db) -> InFile<ast::Item> {
-        match self.kind {
-            MacroCallKind::FnLike { ast_id, .. } => {
-                InFile::new(ast_id.file_id, ast_id.map(FileAstId::upcast).to_node(db))
-            }
-            MacroCallKind::Derive { ast_id, .. } => {
-                InFile::new(ast_id.file_id, ast_id.map(FileAstId::upcast).to_node(db))
-            }
-            MacroCallKind::Attr { ast_id, .. } => InFile::new(ast_id.file_id, ast_id.to_node(db)),
-        }
-    }
-
-    /// [`Self::to_node`] as a view: the call, the meta of the derive in its attribute, or the
-    /// item an attribute macro is on.
+    /// The call, the meta of the derive in its attribute, or the item an attribute macro is on.
     pub fn to_node_view<'db>(&self, db: &'db Db) -> InFile<view::Node<'db>> {
         match &self.kind {
             MacroCallKind::FnLike { ast_id, .. } => ast_id.with_value(ast_id.to_view(db).syntax()),
@@ -1246,7 +1207,7 @@ impl MacroCallLoc {
         }
     }
 
-    /// [`Self::to_node_item`] as a view.
+    /// The item the call is in: the macro call item, or the item a derive or attribute is on.
     pub fn to_node_item_view<'db>(&self, db: &'db Db) -> InFile<view::Item<'db>> {
         match self.kind {
             MacroCallKind::FnLike { ast_id, .. } => {
@@ -1388,21 +1349,7 @@ impl MacroCallKind {
         FileRange { range, file_id }
     }
 
-    fn arg(&self, db: &Db) -> InFile<Option<SyntaxNode>> {
-        match self {
-            MacroCallKind::FnLike { ast_id, .. } => {
-                ast_id.to_in_file_node(db).map(|it| Some(it.token_tree()?.syntax().clone())) // clone: a node handle, a non-atomic count
-            }
-            MacroCallKind::Derive { ast_id, .. } => {
-                ast_id.to_in_file_node(db).syntax().cloned().map(Some)
-            }
-            MacroCallKind::Attr { ast_id, .. } => {
-                ast_id.to_in_file_node(db).syntax().cloned().map(Some)
-            }
-        }
-    }
-
-    /// [`Self::arg`] as a view.
+    /// The macro's input: the token tree of a call, or the item of a derive or attribute.
     fn arg_view<'db>(&self, db: &'db Db) -> InFile<Option<view::Node<'db>>> {
         match self {
             MacroCallKind::FnLike { ast_id, .. } => {
@@ -1423,17 +1370,12 @@ impl MacroCallKind {
 // simpler function calls if the map is only used once
 #[derive(Clone, Debug)]
 pub struct ExpansionInfo<'db> {
-    db: &'db Db,
     expanded_file: MacroCallId,
-    expanded_parse: &'db Parse<view::Untyped>,
     /// The expansion's root and the argument TokenTree or item for attributes, as views of the
     /// trees the database keeps.
     expanded_root: view::Node<'db>,
     arg_file: HirFileId,
     arg_root: Option<view::Node<'db>>,
-    /// The argument's handle, made by the first [`Self::arg`]: only hir's handle `Semantics`
-    /// asks for it.
-    arg_handle: std::cell::OnceCell<Option<SyntaxNode>>,
     exp_map: &'db ExpansionSpanMap,
     arg_map: SpanMap<'db>,
     loc: &'db MacroCallLoc,
@@ -1449,21 +1391,12 @@ impl PartialEq for ExpansionInfo<'_> {
 impl Eq for ExpansionInfo<'_> {}
 
 impl<'db> ExpansionInfo<'db> {
-    pub fn expanded(&self) -> InMacroFile<SyntaxNode> {
-        InMacroFile::new(self.expanded_file, self.expanded_parse.syntax_node())
-    }
-
-    pub fn arg(&self) -> InFile<Option<&SyntaxNode>> {
-        let arg = self.arg_handle.get_or_init(|| self.loc.kind.arg(self.db).value);
-        InFile::new(self.arg_file, arg.as_ref())
-    }
-
-    /// [`Self::expanded`] as a view.
+    /// The expansion's root.
     pub fn expanded_view(&self) -> InMacroFile<view::Node<'db>> {
         InMacroFile::new(self.expanded_file, self.expanded_root)
     }
 
-    /// [`Self::arg`] as a view.
+    /// The macro's input, in the file of the call.
     pub fn arg_view(&self) -> InFile<Option<view::Node<'db>>> {
         InFile::new(self.arg_file, self.arg_root)
     }
@@ -1486,7 +1419,10 @@ impl<'db> ExpansionInfo<'db> {
         Some(InMacroFile::new(self.expanded_file, tokens))
     }
 
-    /// [`Self::map_range_down`] to tokens of the view of the expansion.
+    /// Maps the passed in file range down into a macro expansion if it is the input to a macro call.
+    /// Unlike [`ExpansionInfo::map_range_down_exact_view`], this will consider spans that contain the given span.
+    ///
+    /// A binary search of the span map's index by anchor, then the run of entries in it.
     pub fn map_range_down_view(
         &self,
         span: Span,
@@ -1512,26 +1448,6 @@ impl<'db> ExpansionInfo<'db> {
             self.loc.def.kind,
             MacroDefKind::BuiltInAttr(..) | MacroDefKind::ProcMacro(_, _, ProcMacroKind::Attr)
         )
-    }
-
-    /// Maps the passed in file range down into a macro expansion if it is the input to a macro call.
-    /// Unlike [`ExpansionInfo::map_range_down_exact_view`], this will consider spans that contain the given span.
-    ///
-    /// A binary search of the span map's index by anchor, then the run of entries in it.
-    pub fn map_range_down(
-        &self,
-        span: Span,
-    ) -> Option<InMacroFile<impl Iterator<Item = (SyntaxToken, SyntaxContext)> + '_>> {
-        if span.anchor.ast_id == NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER {
-            return None;
-        }
-
-        let root = self.expanded_parse.syntax_node();
-        let tokens = self.exp_map.ranges_with_span(span).flat_map(move |(range, ctx)| {
-            root.covering_element(range).into_token().zip(Some(ctx))
-        });
-
-        Some(InMacroFile::new(self.expanded_file, tokens))
     }
 
     /// Looks up the span at the given offset.
@@ -1597,13 +1513,10 @@ impl<'db> ExpansionInfo<'db> {
         let (parse, exp_map) = &macro_file.parse_macro_expansion(db).value;
 
         ExpansionInfo {
-            db,
             expanded_file: macro_file,
-            expanded_parse: parse,
             expanded_root: parse.root(),
             arg_file: arg.file_id,
             arg_root: arg.value,
-            arg_handle: std::cell::OnceCell::new(),
             loc,
             exp_map,
             arg_map,
@@ -1683,8 +1596,9 @@ pub fn span_for_offset(
     (resolve_span(db, span), span.ctx)
 }
 
-// FIXME: This is only public because of its use in `load_cargo` (which we should consider removing
-// by moving the implementations of the subrequests to `hir_expand`, and calling within `load-cargo`).
+// FIXME: This is only public because of its use in `blaze_lower::answer` (which we should consider
+// removing by moving the implementations of the subrequests to `hir_expand`, and calling within
+// blaze-lower).
 // Avoid adding any more outside uses.
 pub fn resolve_span(db: &Db, Span { range, anchor, ctx: _ }: Span) -> FileRange {
     let file_id = EditionedFileId::from_span_file_id(db, anchor.file_id);
@@ -1897,21 +1811,7 @@ impl HirFileId {
         }
     }
 
-    pub fn original_call_node(self, db: &Db) -> Option<InRealFile<SyntaxNode>> {
-        let mut call = self.macro_file()?.loc(db).to_node(db);
-        loop {
-            match call.file_id {
-                HirFileId::FileId(file_id) => {
-                    break Some(InRealFile { file_id, value: call.value });
-                }
-                HirFileId::MacroFile(macro_call_id) => {
-                    call = macro_call_id.loc(db).to_node(db);
-                }
-            }
-        }
-    }
-
-    /// [`Self::original_call_node`] as a view: the outermost call, in the real file.
+    /// The outermost call, in the real file.
     pub fn original_call_node_view(self, db: &Db) -> Option<InRealFile<view::Node<'_>>> {
         let mut call = self.macro_file()?.loc(db).to_node_view(db);
         loop {
@@ -1926,11 +1826,7 @@ impl HirFileId {
         }
     }
 
-    pub fn call_node(self, db: &Db) -> Option<InFile<SyntaxNode>> {
-        Some(self.macro_file()?.loc(db).to_node(db))
-    }
-
-    /// [`Self::call_node`] as a view.
+    /// The macro file's call, as [`MacroCallId::call_node_view`].
     pub fn call_node_view(self, db: &Db) -> Option<InFile<view::Node<'_>>> {
         Some(self.macro_file()?.loc(db).to_node_view(db))
     }

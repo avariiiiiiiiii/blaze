@@ -23,8 +23,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NO_MORE_FILES, ERROR_TIMEOUT, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-    SetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NO_MORE_FILES, ERROR_TIMEOUT, GetLastError, HANDLE, HMODULE,
+    INVALID_HANDLE_VALUE, SetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Cryptography::ProcessPrng;
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -34,7 +34,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_COMMIT, MEM_IMAGE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
     MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
@@ -874,6 +874,72 @@ pub(crate) fn overlay(channel: &mut Channel, _: &[Granted], _: &[Overlay], _: u6
         return Err(Error::new(format!("an OVERLAID of {} bytes", body.len())));
     }
     Ok(())
+}
+
+#[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+unsafe extern "system" {
+    /// psapi's `EnumProcessModules`, which kernel32 exports under this name: the process's
+    /// modules in load order, read from its loader's list without taking the loader lock.
+    fn K32EnumProcessModules(process: HANDLE, modules: *mut HMODULE, bytes: u32, needed: *mut u32) -> windows_sys::core::BOOL;
+}
+
+/// What the process's global scope is on Windows: every module the system loader loaded, the
+/// executable first, each export found by `GetProcAddress` (forwarders followed), the first
+/// module that exports a name winning.
+pub(crate) struct Scope {
+    /// Listed at the first lookup.
+    modules: Option<Vec<HMODULE>>,
+    /// The name being looked up, NUL-terminated; reused.
+    name: Vec<u8>,
+}
+
+impl Scope {
+    pub(crate) fn new() -> Scope {
+        Scope { modules: None, name: Vec::new() }
+    }
+
+    fn modules() -> Result<Vec<HMODULE>, Error> {
+        let mut modules: Vec<HMODULE> = vec![std::ptr::null_mut(); 64];
+        loop {
+            let bytes = u32::try_from(modules.len() * size_of::<HMODULE>())
+                .map_err(|_| Error::new(format!("{} modules in this process", modules.len())))?;
+            let mut needed = 0u32;
+            // SAFETY: the process's own pseudo-handle; `modules` is `bytes` writable bytes and
+            // `needed` a live `u32`, the only memory the call writes.
+            if unsafe { K32EnumProcessModules(GetCurrentProcess(), modules.as_mut_ptr(), bytes, &mut needed) } == 0 {
+                return Err(os("EnumProcessModules of this process"));
+            }
+            let count = needed as usize / size_of::<HMODULE>();
+            if count <= modules.len() {
+                modules.truncate(count);
+                return Ok(modules);
+            }
+            modules.resize(count, std::ptr::null_mut());
+        }
+    }
+
+    pub(crate) fn find(&mut self, name: &str) -> Result<Option<u64>, Error> {
+        if name.is_empty() || name.as_bytes().contains(&0) {
+            return Err(Error::new(format!("a lookup of {name:?}: not a C name")));
+        }
+        let modules = match &mut self.modules {
+            Some(modules) => modules,
+            none => none.insert(Scope::modules()?),
+        };
+        self.name.clear();
+        self.name.reserve(name.len() + 1);
+        self.name.extend_from_slice(name.as_bytes());
+        self.name.push(0);
+        for &module in modules.iter() {
+            // SAFETY: `module` is a module of this process the loader listed, loaded for as
+            // long as the start hook runs (it runs under the loader lock, so nothing unloads
+            // one); `self.name` is NUL-terminated with no NUL before its end (checked above).
+            if let Some(found) = unsafe { GetProcAddress(module, self.name.as_ptr()) } {
+                return Ok(Some(found as usize as u64));
+            }
+        }
+        Ok(None)
+    }
 }
 
 pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {

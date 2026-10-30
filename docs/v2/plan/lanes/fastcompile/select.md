@@ -94,8 +94,42 @@ A function is keyed by two hashes (`crates/blaze-testsel/src/table.rs`):
   arguments by identity (idea 15). A rename or a move makes another.
 - **`Bound`**: its code as it runs: its code hash, the `FnId` of each function or method each
   ref binds to, the deep hash of each constant and static it refers to, for each unsize
-  coercion the identities its vtable holds, and for an instance the facts of its type
-  arguments its code reads. Requested from items as `bound_hash`.
+  coercion the identities its vtable holds, for an instance the facts of its type
+  arguments its code reads, and the positions it names ([Positions](#positions)). Requested
+  from items as `bound_hash` and from codegen as `ExecTable::fns`.
+
+### Positions
+
+Code holds no position: `line!()`, `file!()`, `column!()`, a panic's and a `#[track_caller]`
+function's `Location` are a `Target::Position` relocation to a record the link fills from the
+span table of the span's anchor (`crates/blaze-link/src/position.rs`), and debug lines name
+spans the same way. So a line added above a function changes no code hash, and a test can
+still see the move: `#[should_panic(expected = "src/lib.rs:12")]`, `assert_eq!(line!(), 12)`,
+a backtrace's lines.
+
+Two ways to put positions in the key were weighed:
+
+- **One hash of the binary's span tables beside `unlogged`** (`ExecTable::beside`), as cargo's
+  reached-set selection does (`SPANS` in `crates/blaze-cargo/src/serve/unit/compile.rs`). It
+  is exact, and it reruns every test of the binary on almost every edit: a line added or
+  removed in a file moves the table of every item below it, so a test that never ran any of
+  them reruns too. Copy-and-patch makes such an edit cost nothing to compile; this would make
+  it cost the whole suite to test.
+- **Each function's `Bound` covers the span tables it names** (chosen): the tables of the
+  anchors of its positions, its data's positions and its debug lines, by content. A test sees
+  a position only by running code that names it: a `Location` is made by the function whose
+  relocation names it, and a backtrace shows the lines of the frames on the stack. Those
+  functions are in the test's set (executed, or reached when the record is not whole) or in
+  `unlogged`. So a move reruns exactly the tests that executed a moved function, and a test
+  that executed none of them keeps its pass. A function's anchors are its body's own (a body
+  has several), and an edit inside a body changes its code anyway, so naming whole tables
+  rather than each span costs no selectivity and a lookup per anchor instead of per span.
+
+blaze-testsel needs nothing new for this: a moved function is a changed `Bound`, found by the
+selector's postings like any edit (\(O(P_D)\)), and `Why::Changed` names it. Codegen folds the
+tables into `ExecTable::fns` (queue 01028) from the span tables cargo passes it (queue 01029).
+The same request covers a static's value, which no `Bound` held either: a test reading
+`static N: u32` kept its pass when `N`'s value changed.
 
 The rebinding edit (`a()` to `b()`) changes the caller's `Bound`; a swap of two bodies changes
 both `Bound`s. Each test binary carries a table (requested from codegen): its functions as
@@ -156,8 +190,8 @@ S is the same and the inputs read under T have the same values.
   a superset (incomplete record).
 - Every function called not through a slot is in the unlogged hash, which S carries.
 - Each function's `Bound` covers its code and which function each of its calls binds to, so
-  the same versions make the same calls to the same functions, with the same constants, data
-  and vtables.
+  the same versions make the same calls to the same functions, with the same constants, data,
+  statics and vtables, and see the same positions.
 
 By induction over the run's steps, it makes the same calls with the same values and reads the
 same inputs, so it passes again. A function that is new in the binary can't be reached
@@ -178,6 +212,7 @@ Each is a request in `v2/requests/fastcompile.md`:
 | 3 | usercode (sandbox, `blaze-cargo/src/sandbox.rs`) | `not_inputs` only for the run's own process |
 | 9 (was 4) | link (blaze-live, blaze-link's slot stubs) | Log stubs and a log table; `__blaze_exec_slots` and `__blaze_exec_arm` arm by one store of the table cell; slot writes while armed go through `publish`, which lazy's `Placer` uses too |
 | 5 | codegen | The per-binary exec table: versions in order, slot functions, `beside`, each test's reached indices |
+| queue 01028, 01029 | codegen, cargo | Each `Bound` in the exec table covers the span tables its function names and the values of the statics it refers to; cargo passes the link's span tables to `ExecTable::new` |
 | 6 | items | `bound_hash` |
 | 7 | cargo | Wire `choose`/`keep` in `serve/unit/test.rs`, the table from `compile.rs`, the cached result in `result` |
 | 8 | ci | `blaze_api::Cached`, `Basis`, `TestResult::cached`, `SCHEMA` 8, and every constructor site |
@@ -203,12 +238,15 @@ The tests live beside the code:
   changes rerun; a gone function, read inputs, unkeepable passes, outside, all, attributes and
   lookback; history end at every length; entry round trip.
 - `sim_tests.rs`, a deterministic simulation of a program whose function versions call others
-  (some only under a bit of a file they read), read or not, and fail or not. Over random
-  edits, reverts, input changes and incomplete records, a test not run must pass now and must
-  have a past pass at the same versions of what it executed now and the same input. Over
-  synthetic single-pass histories, a test runs exactly when a function it executed, the
-  unlogged code, or an input it read changed: never skipped when its executed set meets the
-  changed set, and never run when it doesn't. A `Selector` kept across the edits (and one
+  (some only under a bit of a file they read), read or not, fail or not, and observe their
+  own position or not (a `should_panic` with a location). Over random edits, reverts, moves (a
+  line added or removed above a function moves it and the next three, their code unchanged),
+  input changes and incomplete records, a test not run must pass now and must have a past pass
+  at the same versions and positions of what it executed now and the same input. Over
+  synthetic single-pass histories, a test runs exactly when a function it executed (its code
+  or its positions), the unlogged code, or an input it read changed: never skipped when its
+  executed set meets the changed set, and never run when it doesn't; moves of functions it did
+  not execute keep its pass. A `Selector` kept across the edits (and one
   made afresh half-way, as after a restart) gives every test, at every step, the choice
   `choose` gives over the same store, with other attributes, outside tests and runs of all
   mixed in.

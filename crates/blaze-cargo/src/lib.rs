@@ -7,34 +7,16 @@
 
 use std::path::{Path, PathBuf};
 
-use blaze_in_place as splice;
-
 pub mod answers;
 pub mod as_rustc;
-pub mod cargo;
-pub mod check;
 /// blaze v2's CLI: a client of the agent API with cargo's flags, output and exit codes
 /// (docs/v2/plan/lanes/cargo/notes.md section 7).
 pub mod cli;
 pub mod content;
-pub mod dep_info;
-pub mod deps;
 pub mod directives;
-pub mod doctest;
-pub mod engine;
-pub mod errors;
-pub mod events;
-pub mod link;
-pub mod live;
-pub mod memory;
-pub mod plan;
-pub mod process;
 #[allow(unsafe_code, reason = "the kernel calls std has no wrapper for, behind safe functions")]
 pub mod raw;
 pub mod release;
-#[allow(unsafe_code, reason = "the remote store's own")]
-pub mod remote;
-pub mod renamed;
 #[allow(unsafe_code, reason = "the sandbox's own system calls")]
 pub mod sandbox;
 /// blaze v2's daemon: the plane, the agent API's server and session, the VFS, the database and
@@ -43,11 +25,8 @@ pub mod sandbox;
 pub mod serve;
 pub mod socket;
 pub mod stub;
-pub mod symbols;
 pub mod toolchain;
-pub mod trace;
 pub mod unstable;
-pub mod weaken;
 
 /// How many of the functions blaze could not compile an error names.
 const REFUSED_SHOWN: usize = 16;

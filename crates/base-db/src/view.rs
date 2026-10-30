@@ -3,7 +3,7 @@
 //! whose content changed, so salsa sees no change where there is none.
 //!
 //! A view's path maps to a file and a source root through what the database has already: a
-//! path a source root has named keeps its [`FileId`] for good (as `vfs::Vfs` gives one), and a
+//! path a source root has named keeps its [`FileId`] for good, and a
 //! path none has is given an unused one and put in the source root that the partition the roots
 //! were made with ([`FileSetConfig`]) puts it in.
 //!
@@ -25,10 +25,7 @@ use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use salsa::{Durability, Setter};
 use triomphe::Arc;
-use vfs::{
-    AbsPath, AbsPathBuf, FileId, VfsPath,
-    file_set::{FileSet, FileSetConfig},
-};
+use crate::{AbsPath, AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
 
 use crate::{
     Db, FileText, Files, FxIndexMap, SourceRoot, SourceRootId, content,
@@ -63,7 +60,7 @@ pub struct ViewRoot<'a> {
 }
 
 /// What setting a view wrote, each list sorted.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)] // clone: once per view change, the edge
 pub struct ViewChange {
     /// Files that were in a source root already whose text was set.
     pub set: Vec<FileId>,
@@ -79,7 +76,7 @@ pub struct ViewChange {
 }
 
 /// Why a view was refused. Nothing is written when one is.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)] // clone: an error, cold
 pub enum ViewError {
     /// Empty, absolute, or with an empty, `.` or `..` part.
     BadPath(String),

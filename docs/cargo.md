@@ -12,8 +12,11 @@ blaze had another name and another command before 2026-10-28; [rename.md](rename
 Every setting below is `BLAZE_<NAME>`, and blaze stops when one is set under its name from
 before, saying what it is called now.
 
-Everything in this file was checked against the code in `crates/blaze-cargo/src/cargo/` and run on
-Linux x86-64. On macOS arm64 `harness/blaze_cli.py --small` was run, and what is known of
+This file was checked against v1's code (blaze-cargo's `cargo/` directory) and run on
+Linux x86-64. That code was deleted on 2026-10-30: blaze is its daemon (`crates/blaze-cargo/src/serve/`)
+and the client of it (`crates/blaze-cargo/src/cli.rs`, whose commands are build, check, run,
+test, bench, serve, stop, status, daemon, codegen-inputs, trace and tables). Where a section
+below names a v1 setting or command the daemon lacks, it says so. On macOS arm64 `harness/blaze_cli.py --small` was run, and what is known of
 it is under [macOS arm64](#macos-arm64). The design notes it was written from are in
 [reports/CARGO.md](reports/CARGO.md).
 
@@ -61,7 +64,7 @@ own servers (the standard library's source is blaze's own `library/`, a 6.0 MB a
 blaze's release, [toolchain.md](toolchain.md#the-standard-library-library)), 97 MB on macOS, 134 MB on Linux x86-64 and 118 MB on Linux ARM64 (548 MB on macOS
 and 710 MB on Linux x86-64 once unpacked). Each file's sha256 is built
 into blaze, from the nightly's published manifest (`harness/toolchain_pins.py` writes them into
-`crates/blaze-cargo/src/cargo/toolchain/pins.txt`), and a file with other bytes is refused. Concurrent
+`crates/blaze-cargo/src/toolchain/pins.txt`), and a file with other bytes is refused. Concurrent
 builds download it once; a download that stopped goes on from where it stopped the next time.
 Building with blaze's copy, blaze names its cargo, rustc and rustdoc in `CARGO`, `RUSTC` and
 `RUSTDOC` and puts its `bin` first on `PATH`, for the commands it runs and not for your shell.
@@ -401,9 +404,8 @@ it; a missing or stale entry fails the build, naming the command, and nothing is
 A script that clones a repository (`ffmpeg-sys-fframes`' FFmpeg, for the feature sets it has
 no prebuilt one of) is given the locked tarball of its branch as a git repository of one
 commit, which git's `url.<repository>.insteadOf` (`GIT_CONFIG_COUNT`) makes its clone of the
-address. The crates blaze knows and their variables are
-`OVERRIDES` in `crates/blaze-cargo/src/cargo/fetches.rs`; a script refused the network that it does
-not know is told which variable an entry there would set.
+address. The crates blaze knew and their variables were v1's `OVERRIDES` table; the daemon
+has no such table yet, so a script that downloads fails in its sandbox.
 
 The ways out, in the workspace's root manifest, which is the only one a dependency from a
 registry can be named in:
@@ -416,7 +418,7 @@ build-script-env = ["OPENSSL_DIR", "LIBGIT2_NO_VENDOR"]       # given to every b
 build-script-link-dirs = ["/opt/vendor/lib"]                 # rustc-link-search may name
 ```
 
-What a sandboxed script prints is checked before cargo reads it (`cargo/directives.rs`), since
+What a sandboxed script prints is checked before it is used (`crates/blaze-cargo/src/directives.rs`), since
 it goes into every rustc and linker run of its package and of what links it. A
 `rustc-link-search` (or `rustc-flags`' `-L`) names a directory in its `OUT_DIR`, its package,
 the target directory's build directory (its dependencies' `OUT_DIR`s), a system directory
@@ -520,8 +522,7 @@ runs succeed in their closure, 24 of them with libraries of the table, and every
 store hit on the same machine and from another's store pulled from the remote, at the same
 checkout path (`tools/bench/results/2026-10-27-bscache/closure.md`). A script cargo's rustc compiled
 is keyed by its bytes, which name `CARGO_HOME`, so another checkout path misses it yet.
-`BLAZE_KEY_TRACE=<dir>` writes each key's fields to `<dir>/<key>.txt`, to see what two
-machines' keys differ in.
+v1's setting that wrote each key's fields to a file is gone with v1; the daemon has none.
 
 Compiling a build script, running it and building a proc macro are each an entry of the
 store, so they travel with `blaze-engine cache push` and `pull` and through the gateway like any
@@ -550,11 +551,8 @@ the sandbox (`unsandboxed-build-scripts`, `BLAZE_SANDBOX=off`) is never kept, so
 pushed either. The daemon's check of a script (`blaze-reads` beside its `OUT_DIR`) needs no
 run when what it read is as it was.
 
-`BLAZE_BSCACHE=check` builds and runs everything the store has anyway and compares: a run
-that printed or wrote something else, or a build that read files the store's build of it did
-not, fails the build. Two builds of one script by blaze are not the same bytes (the order of
-functions in the executable is not), so a build is compared by what it read, not by bytes.
-With `BLAZE_STATS` each hit says so (`blaze: a run the store kept`, `blaze: a build the
+v1 had a setting that built and ran everything the store had anyway and compared them; it
+is gone with v1, and the daemon has none. With `BLAZE_STATS` each hit says so (`blaze: a run the store kept`, `blaze: a build the
 store kept: ...`), where cargo shows what a script printed.
 
 Every proc-macro server a load starts, the toolchain's and blaze's own, runs in the sandbox
@@ -564,8 +562,8 @@ variables come with each expansion. A server is started
 once, when a load first needs it, and serves every expansion after, so the sandbox costs its
 start (about 8 ms on Linux, 25 ms on macOS) and nothing per expansion. The packages of
 `unsandboxed-proc-macros` are expanded by servers of their own, started outside. The hook is
-`proc_macro_api::wrap` (the command a server is started with) and
-`load_cargo::unsandboxed_macros_with` (which libraries get the outside servers).
+`proc_macro_api::wrap` (the command a server is started with); which libraries got the outside
+servers was v1's load-cargo, deleted on 2026-10-30.
 
 What it costs, measured on 2026-10-26 (cold builds with an empty store and target
 directory, `BLAZE_SANDBOX=off` against the default; a server's start is its start and exit with
@@ -633,11 +631,8 @@ scripts run unchanged and why the others don't.
 By default every proc macro of a load is built by blaze, from its source, as a WebAssembly
 module (`wasm32-wasip1`, a WASI reactor), and blaze expands with it in its own process under
 Wasmtime and Cranelift (`crates/blaze-macro-wasm`): no rustc-built code runs, and no
-proc-macro server is started for it. In blaze's own target directory the module is built
-from cargo's unit graph, with the build scripts (`cargo/compile_time.rs`). Elsewhere it is
-built from the load's own description of the macro's crate and what it depends on
-(`load_cargo::described`), whoever compiled the macro's library. Either build is kept in the
-store like a build script's. The macro's `proc_macro` crate is a shim
+proc-macro server is started for it. The module is built from the build's unit graph, with
+the build scripts, and kept in the store like a build script's. The macro's `proc_macro` crate is a shim
 (`crates/blaze-macro-wasm/guest/proc_macro.rs`, followed by the API it shares with the
 in-process bridge, `crates/blaze-macro-wasm/native/proc_macro/api.rs`) whose handles go to the
 host by imports, so
@@ -1008,15 +1003,10 @@ A single build goes to cargo when:
   Errors rust-analyzer does not find are not caught here; see "Known problems";
 - the daemon refused the build or failed.
 
-Doc tests are blaze's, with no cargo, rustc or rustdoc (`doctest.rs`). An example blaze
-cannot build fails, saying why; nothing is left to rustdoc. Of the test harness's flags, `-q`,
-`--format pretty`, `--format terse`, `--color never`, `--exact`, `--skip`, `--test-threads`
-and test filters are handled, and the results are shown as libtest shows them; any other flag
-fails the library's doctests with the flag named. `blaze test` writes down the run of rustdoc
-cargo would make for each library (`cargo/whole.rs`), then one run of blaze loads the
-workspace, with blaze's own build scripts and proc macros, and tests the libraries' examples
-in cargo's order, each in the directory and with the variables cargo gives its rustdoc, and
-says `Doc-tests` and what failed as cargo does. The daemon does not run doctests yet.
+Doc tests are not run: v1 ran them itself, with no cargo, rustc or rustdoc, and that code
+was deleted on 2026-10-30. The daemon makes no doctest yet (the agent API has the artifact
+kind, `ArtifactKind::Doctest`, and `blaze test` runs any it is given), so `blaze test` runs a
+library's unit and integration tests and none of its examples.
 
 An example marked `compile_fail` passes when blaze's front end finds an error in it that
 rustc gives too: one of the errors `blaze check` is as sure of as rustc
@@ -1354,9 +1344,13 @@ A command blaze has not written yet fails, says so and does nothing, with status
     note: what blaze has of each cargo command: https://github.com/indexable-inc/blaze/blob/main/docs/cargo.md#every-subcommand
 
 A command cargo does not have is refused the same way (`error: no such command`): cargo would
-run a plugin, `cargo-<name>`, from the path, and blaze runs none. `blaze --list` prints
-the table below; flags typed before the command (`blaze -v fmt`) are read after it, as
-cargo reads them. The table is `SUBCOMMANDS` in `crates/blaze-cargo/src/cargo/own/mod.rs`.
+run a plugin, `cargo-<name>`, from the path, and blaze runs none.
+
+Since v1 was deleted (2026-10-30), the client has only build, check, run, test, bench, serve,
+stop, status, daemon, codegen-inputs, trace and tables (`crates/blaze-cargo/src/cli.rs`), and
+refuses every other command with `error: no such command`. The table below is what v1 had: the
+crates it names (blaze-metadata, blaze-fmt, blaze-lints, ...) are still there, and a command
+comes back once the client asks the daemon for it.
 
 | Command | blaze's | What it is, and what it waits for |
 |---|---|---|

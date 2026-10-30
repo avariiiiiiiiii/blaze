@@ -35,7 +35,7 @@ blaze-mem.workspace = true
 blaze-vfs.workspace = true
 cfg.workspace = true
 syntax.workspace = true
-vfs.workspace = true
+paths.workspace = true
 span.workspace = true
 intern.workspace = true
 

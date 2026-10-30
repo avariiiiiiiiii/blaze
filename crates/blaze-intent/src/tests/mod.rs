@@ -2,6 +2,7 @@
 //! a tree equal to a fresh parse of them, and the same changed items as a whole-file diff of
 //! the two finds. Rename over a module graph, against the front end.
 
+mod budget;
 mod db;
 mod edits;
 mod rename;

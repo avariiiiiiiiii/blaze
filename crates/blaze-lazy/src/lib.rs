@@ -15,7 +15,10 @@
 //! next at lower priority: the callees of what it compiled, and what history says the run
 //! reaches. [`runner::Runner`] drives it on threads against the [`runner::Compiler`] and
 //! [`runner::Placer`] the daemon gives it (codegen's memo and store first, then the
-//! copy-and-patch backend; blaze-link's placement into blaze-inproc's code memory).
+//! copy-and-patch backend; blaze-link's placement into blaze-inproc's code memory). A real
+//! run's compiler is [`compile::Lazily`]: codegen's lazy build kept for the run, each compile
+//! on a database reader of its own, exact at any later revision while the function's key is the
+//! image's.
 //!
 //! [`plan::Plan`] says what is compiled ahead instead: what runs before `main` and the entry.
 //! Every function's address is its slot's stub, compiled or not, so laziness changes no
@@ -29,6 +32,8 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(feature = "daemon")]
+pub mod compile;
 #[cfg(feature = "daemon")]
 pub mod fetch;
 pub mod hook;

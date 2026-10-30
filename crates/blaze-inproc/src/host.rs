@@ -20,9 +20,9 @@ use blaze_core::{Command, Sandbox};
 
 use crate::channel::Channel;
 use crate::frame::{Reader, Writer, kinds};
-use crate::handshake::{Grant, HOST_VAR, Hello, Overlay, Place, VERSION, decode_map, hex};
+use crate::handshake::{Grant, HOST_VAR, Hello, Lookup, Overlay, Place, VERSION, decode_map, hex};
 use crate::sys::{self, Rights};
-use crate::{Access, CodeMemory, CodeRange, Error, FixedMap, ask};
+use crate::{Access, CodeMemory, CodeRange, Error, FixedMap, ImageLookup, ImageWrite, ask};
 
 /// How long a start hook may take between its frames during the handshake.
 const HANDSHAKE: Duration = Duration::from_secs(30);
@@ -78,7 +78,14 @@ impl Identity {
 /// ([`Host::write_executable`]), with the `maps` laid over its reservations too.
 pub struct Launch<'a> {
     pub image: &'a CodeMemory,
+    /// Each a dependency image's (`blaze-premap`'s): the run must be unslid while there is one.
     pub maps: Vec<FixedMap<'a>>,
+    /// The words of the `maps`' private copies the start hook stores once they are mapped and
+    /// before the program runs, and those it binds to a name in the run's global scope:
+    /// `blaze_premap::start::Start`'s writes and lookups. Each 8 bytes inside an
+    /// [`Access::Copy`] map, else the launch is an error.
+    pub writes: Vec<ImageWrite>,
+    pub lookups: Vec<ImageLookup<'a>>,
     pub program: PathBuf,
     /// The program's arguments after `argv[0]`, which is `program`.
     pub args: Vec<OsString>,
@@ -262,12 +269,28 @@ fn grant(launch: &Launch<'_>) -> Result<(Vec<(sys::Object, Rights)>, Grant), Err
     let mut overlays: Vec<Overlay> = layout
         .code
         .iter()
-        .map(|it| Overlay { object: 0, offset: it.offset, len: it.len, at: it.linked, access: Access::Execute, place: Place::Code })
+        .map(|it| Overlay {
+            object: 0,
+            offset: it.offset,
+            len: it.len,
+            at: it.linked,
+            access: Access::Execute,
+            place: Place::Code,
+            image: false,
+        })
         .collect();
     if let Some((range, at)) = memory.arena_part()
         && range.len != 0
     {
-        overlays.push(Overlay { object: 0, offset: range.offset, len: range.len, at, access: Access::Execute, place: Place::Reserved });
+        overlays.push(Overlay {
+            object: 0,
+            offset: range.offset,
+            len: range.len,
+            at,
+            access: Access::Execute,
+            place: Place::Reserved,
+            image: false,
+        });
     }
     if let (Some(object), Some((range, at))) = (memory.cells_object(), memory.cells_part()) {
         objects.push((object.duplicate()?, Rights::Words));
@@ -278,6 +301,7 @@ fn grant(launch: &Launch<'_>) -> Result<(Vec<(sys::Object, Rights)>, Grant), Err
             at,
             access: Access::Shared,
             place: Place::Reserved,
+            image: false,
         });
     }
     let mut seen: Vec<(*const CodeMemory, u32)> = Vec::new();
@@ -316,6 +340,7 @@ fn grant(launch: &Launch<'_>) -> Result<(Vec<(sys::Object, Rights)>, Grant), Err
             at: map.at,
             access: map.access,
             place: Place::Reserved,
+            image: true,
         });
     }
     overlays.sort_by_key(|it| it.at);
@@ -336,13 +361,27 @@ fn grant(launch: &Launch<'_>) -> Result<(Vec<(sys::Object, Rights)>, Grant), Err
             )));
         }
     }
+    let mut names = String::with_capacity(launch.lookups.iter().map(|it| it.name.len()).sum());
+    let mut lookups = Vec::with_capacity(launch.lookups.len());
+    for it in &launch.lookups {
+        let start = u32::try_from(names.len())
+            .ok()
+            .filter(|start| u32::try_from(it.name.len()).is_ok_and(|len| start.checked_add(len).is_some()))
+            .ok_or_else(|| Error::new(format!("the names of a launch's lookups run past 4 GiB at `{}`", it.name)))?; // alloc: error path
+        names.push_str(it.name);
+        lookups.push(Lookup { place: it.place, addend: it.addend, weak: it.weak, name: start, len: it.name.len() as u32 });
+    }
     let grant = Grant {
         format: layout.format,
         header: layout.header,
         span: layout.span.clone(),
         objects: objects.iter().map(|(object, rights)| (object.len(), *rights)).collect(),
         overlays,
+        writes: launch.writes.clone(),
+        lookups,
+        names,
     };
+    grant.check_binds()?;
     Ok((objects, grant))
 }
 
@@ -458,6 +497,22 @@ impl Program {
     /// says the process forks children that run the program (a fork server): see
     /// [`CodeMemory::attach_forking`].
     pub fn command(&self, command: Command, forks: bool) -> Result<(Command, Started), Error> {
+        self.command_with(command, forks, Vec::new(), Vec::new(), Vec::new()) // alloc: none, empty
+    }
+
+    /// As [`Program::command`], with dependency images mapped into the run: `maps` laid over
+    /// the executable's reservation for fixed maps (`blaze_premap::map::Memory::maps`), and
+    /// their open words written and bound before the program runs (`blaze_premap::start::plan`'s
+    /// writes and lookups, [`Launch::writes`]). The maps' memory is only borrowed for the launch:
+    /// the grant holds references of its own.
+    pub fn command_with(
+        &self,
+        command: Command,
+        forks: bool,
+        maps: Vec<FixedMap<'_>>,
+        writes: Vec<ImageWrite>,
+        lookups: Vec<ImageLookup<'_>>,
+    ) -> Result<(Command, Started), Error> {
         let (command, pending) = {
             let memory = lock(&self.memory);
             let executable = Executable {
@@ -469,7 +524,9 @@ impl Program {
             self.host.write_executable(&memory, &executable)?;
             let launch = Launch {
                 image: &memory,
-                maps: Vec::new(),
+                maps,
+                writes,
+                lookups,
                 program: command.program,
                 args: command.args,
                 env: command.env,

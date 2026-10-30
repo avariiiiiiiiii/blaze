@@ -54,7 +54,7 @@ use hir_expand::proc_macro::{CrateProcMacros, ProcMacros};
 use rustc_hash::{FxHashMap, FxHashSet};
 use salsa::{Durability, Setter};
 use triomphe::Arc;
-use vfs::file_set::FileSetConfig;
+use base_db::FileSetConfig;
 
 pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};

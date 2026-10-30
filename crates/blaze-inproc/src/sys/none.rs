@@ -215,6 +215,18 @@ pub(crate) fn overlay(_: &mut Channel, _: &[Granted], _: &[Overlay], _: u64) -> 
     unsupported()
 }
 
+pub(crate) struct Scope;
+
+impl Scope {
+    pub(crate) fn new() -> Scope {
+        Scope
+    }
+
+    pub(crate) fn find(&mut self, _: &str) -> Result<Option<u64>, Error> {
+        unsupported()
+    }
+}
+
 pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {
     unsupported()
 }

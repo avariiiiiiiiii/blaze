@@ -425,6 +425,33 @@ pub(crate) fn random(out: &mut [u8; 16]) -> Result<(), Error> {
     Ok(())
 }
 
+/// The process's global scope: what `dlsym(RTLD_DEFAULT, ..)` searches, the executable and
+/// the libraries the system loader loaded for it, in its order.
+pub(crate) struct Scope {
+    /// The name being looked up, NUL-terminated; reused.
+    name: Vec<u8>,
+}
+
+impl Scope {
+    pub(crate) fn new() -> Scope {
+        Scope { name: Vec::new() }
+    }
+
+    pub(crate) fn find(&mut self, name: &str) -> Result<Option<u64>, Error> {
+        if name.is_empty() || name.as_bytes().contains(&0) {
+            return Err(Error::new(format!("a lookup of {name:?}: not a C name")));
+        }
+        self.name.clear();
+        self.name.reserve(name.len() + 1);
+        self.name.extend_from_slice(name.as_bytes());
+        self.name.push(0);
+        // SAFETY: `self.name` is NUL-terminated with no NUL before its end (checked above) and
+        // lives for the call; RTLD_DEFAULT asks the loader's global scope, which it only reads.
+        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, self.name.as_ptr().cast()) };
+        Ok((!found.is_null()).then_some(found as u64))
+    }
+}
+
 pub(crate) fn protection(access: Access) -> c_int {
     match access {
         Access::Execute => libc::PROT_READ | libc::PROT_EXEC,

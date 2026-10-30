@@ -1,8 +1,10 @@
 //! The image in memory: one [`CodeMemory`] per key on the machine, holding the image's
 //! address space from its base (gaps and the zeroed tails of segments are pages never
-//! written, which take no memory), and the [`FixedMap`]s every run maps it by: code read and
-//! execute, read-only data read only, both shared; data copied on a run's first write, so
-//! each run gets the image's initial values of its statics and none sees another's writes.
+//! written, which take no memory), and the [`FixedMap`]s every run maps it by, each at its
+//! linked address inside the workspace executable's reservation for fixed maps (plus the
+//! run's slide): code read and execute, read-only data read only, both shared; data copied on
+//! a run's first write, so each run gets the image's initial values of its statics and none
+//! sees another's writes.
 
 use blaze_inproc::{Access, CodeMemory, CodeRange, FixedMap};
 

@@ -155,7 +155,10 @@ codegen nothing when unused. The rewrite, per instruction:
 | `func_addr` | the function's table pointer, an absolute relocation |
 | `call_indirect`, `return_call_indirect`, `try_call_indirect` | the checked sequence above |
 | `call` of an external | its binding (below): a direct call of a shim stub, or a refusal |
-| `get_frame_pointer`, `get_stack_pointer`, `get_return_address`, `stack_switch`, `dynamic_stack_*`, a `StructArgument` parameter or argument | refused, naming the function: each one gives the macro an address of the machine's stack |
+| a `StructArgument` argument (x86-64's `byval`: the bridge's `run`, `reserve`, `drop` and `Closure::call` all take one) | the confined host address of the guest pointer, which the call copies from: at most 64 KiB past the region, inside the tail guard |
+| a `StructArgument` parameter | its words copied from the machine's stack to the shadow frame at entry, unconfined (the pass made both addresses), and the frame's guest address used in its place |
+| a `StructArgument` return, or one past 64 KiB or of no whole words | refused, naming the function |
+| `get_frame_pointer`, `get_stack_pointer`, `get_return_address`, `stack_switch`, `dynamic_stack_*` | refused, naming the function: each one gives the macro an address of the machine's stack |
 | an assembly unit (`Built::Asm`), `asm!`, `global_asm!`, `naked_asm!` | refused, naming the function |
 
 The units are compiled with `pic = false` and `probe_stack = true`. Overflow checks, debug
@@ -203,28 +206,55 @@ never reads), so a pointer of any function has one table signature. Each name it
 bound by the caller as code (called with `vmctx`, its address a table pointer) or data (its
 address a guest offset); what it adds are names in its own namespace (`confine::Ref`): a code
 name's pointer, the table's address and its size. Every external symbol is non-colocated, so
-the loader resolves each relocation as an absolute address. None of the following is written
-yet:
+the loader resolves each relocation as an absolute address.
 
-- **The machine stack**: each expansion thread has its own machine stack (8 MiB, guard page
-  below), outside every region. The entry trampoline saves the host's callee-saved registers
-  and stack pointer, switches to it, and calls the client's `run` with `vmctx`.
-- **Shim stubs**: a call from the macro to a shim switches back to the host stack and calls
-  the Rust shim with `&mut Memory`. The macro's stack pointer is kept for a nested entry,
-  which continues below it.
-- **Unwinding**: `__rust_start_panic` (claimed) walks the macro's frames by the frame-pointer
-  chain. Every stencil function keeps one. Each frame pointer read is checked to lie inside the
-  machine stack and to rise. The walk finds each return address's call site and handler in
-  the image's call-site table (stencil's `Code::calls`/`handlers`) and resumes at the landing
-  pad with the payload, through a resume trampoline. Cleanup pads end in `_Unwind_Resume`
-  (claimed), which goes on. `catch_unwind`'s landing pad gets the payload through
-  `__rust_panic_cleanup`, as on the evaluator. No libunwind, no DWARF, no personality routine
-  runs. The panic message, the hook and the payload are std's own code, compiled.
-- **Faults**: a fault (SIGSEGV/SIGBUS, an EXCEPTION_ACCESS_VIOLATION, or a trap instruction)
-  whose PC is in an image's code is turned into the expansion's error. The error carries the
-  trap code (stencil's `Code::traps`) and the macro's frame by its line table. The machine
-  stack is unwound to the entry trampoline. A fault anywhere else is blaze's, and goes to the
-  default handler.
+**The loader** (`tier/load.rs`, written, staged) lays out the confined functions, the shim
+stubs and the entry thunks in one `blaze_inproc::exec::Executable`, written through the slices
+it gives at their run addresses (no unsafe code), fills the call table, and lays out the
+region's image (statics, constants, `Location` records) with its 8-byte addresses resolved to
+guest offsets and table pointers. Targets are resolved before it runs (`load::To`).
+
+What runs it (decided 2026-10-30 by fastcompile-next1; to write):
+
+- **The machine stack** is the stack of a thread the run starts for its expansions (64 MiB,
+  std's guard page below, std's alternate signal stack), outside every region. No code
+  switches stacks: blaze enters the macro through an **entry thunk**, a function of our own IR
+  compiled by stencil, `thunk(args, rets, vmctx, code) -> i64`, which loads the target's
+  arguments from 16-byte slots, `try_call`s `code`, stores its results, and returns 0, or 1
+  from its handler block when an escape lands there. One thunk per table signature entered,
+  made the first time (the bridge's `run`, `reserve` and `drop`), in its own `Executable`.
+  A struct argument is passed as a host pointer to its bytes (the thunk's call copies it); a
+  struct return as a guest pointer into the shadow stack.
+- **Shim stubs** are our IR too, one per binding, of the signature the macro calls it with:
+  each stores its arguments to a frame slot and calls the Rust dispatcher with the shim's id,
+  the slot, `vmctx` and its own frame pointer (`get_frame_pointer`), then loads the results.
+  Shims run on the machine stack, and a nested entry (the bridge buffer's `reserve`) is
+  another thunk call below them. A shim needs at least 256 KiB of the stack left or stops.
+- **Escapes.** Every stencil function keeps a frame pointer, so a walk of `([fp+8], [fp])`
+  pairs, each frame pointer checked to lie in the machine stack and to rise, finds each return
+  address's function (`Image::function_at`) and call site (`load::Call`). An escape resumes at
+  a landing with `sp = fp - frame`, `fp`, and the payload in Cranelift's payload registers
+  (x86-64 `rax`, `rdx`; AArch64 `x0`, `x1`), through the one hand-written routine, `resume`
+  (6 instructions an architecture). Three escapes:
+  - a **panic**: std's own `panic_unwind` is compiled (`__rust_start_panic`,
+    `__rust_panic_cleanup`, the `Exception` box and its canary), and its
+    `_Unwind_RaiseException` is a shim that lands at the first call site with a landing pad,
+    with the exception's guest address in payload 0; `_Unwind_Resume` goes on from its
+    caller. A panic that reaches a thunk is the expansion's error. No libunwind, no DWARF, no
+    personality routine runs;
+  - a **fault** (SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE) whose PC is in an image's code: the
+    handler rewrites the interrupted context to land at the innermost thunk's handler, and
+    records the PC's function, trap code (`Code::traps`) and signal for the error. A fault
+    anywhere else goes to the handler installed before ours (std's), or the default;
+  - a **stop** from a shim (a `Stop`: an access out of bounds, the heap's bound, a refused
+    call): it lands at the innermost thunk, as a fault does.
+- **Externals reachability can't settle.** The reach over-approximates: std's backtrace
+  printing and the personality routine reach libc and libunwind functions (`dl_iterate_phdr`,
+  `_Unwind_GetIP`) that no expansion calls unless `RUST_BACKTRACE` is set, which the run's
+  environment never has. So a function with no shim is bound to a stub that stops the
+  expansion naming the symbol when called, as the evaluator stops at it; `_Unwind_Backtrace`
+  is a shim that walks no frame (`_URC_END_OF_STACK`). Data with no shim is still refused
+  when the crate is compiled.
 
 ## Which tier
 

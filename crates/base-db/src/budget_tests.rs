@@ -5,10 +5,7 @@
 use salsa::Durability;
 use span::Edition;
 use triomphe::Arc;
-use vfs::{
-    AbsPathBuf, FileId, VfsPath,
-    file_set::{FileSet, FileSetConfig},
-};
+use crate::{AbsPathBuf, FileId, FileSet, FileSetConfig, VfsPath};
 
 use crate::{
     ContentId, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData, Db,

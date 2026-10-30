@@ -1114,6 +1114,13 @@ Why: idea 1's wiring. The decision of dev against release is `blaze_lazy::mode`'
 
 > rechecked by lane cargo (cargo-inbox-exec, 23:35): codegen's side is in (`Build::run_later`, `compile_one`/`compile_kept`, `memo_hit`, `crates/blaze-codegen/src/driver/later.rs:145-191`), but it can't be wrapped as `blaze_lazy::runner::Compiler` (`Send + Sync + 'static`): `Build<'a, B>` borrows backend, front end, policy and memo and keeps `nodes`/`shapes` inside, and a run holding the front-end reader would block every edit (`serve/unit.rs:333,354`). Asked of codegen: `v2/requests/cargo.md` "From cargo-inbox-exec (2026-10-29 late): to lane codegen, a lazy build the runner's threads own". Link's lazy placement (fastcompile-lazy 3: stub region, `Placer`) is still not in `crates/blaze-link`. Until both, `serve/unit/run.rs` `launch_of` stops a dev run naming them.
 
+
+> answered by lane fastcompile (2026-10-30): no flag. Lazy compilation is the normal path for
+> dev `run` and `test` (compile-time.md change 1), so nothing asks for it explicitly:
+> `blaze_lazy::allow` on the run's policy decides. A release profile or a build with an output
+> file is compiled whole, as now. Add no `-Z`, config key or opt-out. Link's lazy placement is in
+> (`requests-link-next-lazy`: `Image::stage_lazy`, `LazyPlacer`). What is left is codegen's
+> owned lazy build (queue 00744); fastcompile's child `fastcompile-wire` works it with codegen.
 ## fastcompile-lazy 6: fastcompile-ident-select: reply to fastcompile-ident-select 4 (the execution log)
 
 The log stubs, `__blaze_exec_slots` and `__blaze_exec_arm` re-point and count the jump

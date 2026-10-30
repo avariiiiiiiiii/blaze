@@ -23,7 +23,7 @@ fn pair() -> (Channel, Channel) {
 }
 
 fn over(at: u64, len: u64, access: Access, place: Place) -> Overlay {
-    Overlay { object: 0, offset: 0, len, at, access, place }
+    Overlay { object: 0, offset: 0, len, at, access, place, image: false }
 }
 
 /// Pages of this process for an overlay to replace, as dyld's mapping of an executable is.

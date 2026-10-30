@@ -155,7 +155,7 @@ impl Layout {
 }
 
 /// A region's bytes and layout.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Stubs {
     pub bytes: Vec<u8>,
     pub layout: Layout,

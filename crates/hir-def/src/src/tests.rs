@@ -1,6 +1,9 @@
-//! The view twins of this module against their handles, element by element: the same node for
-//! every item, child and use tree of a fixture rich in each.
+//! The views of this module on a fixture rich in items, children and use trees: each item's
+//! source view against its handle, and each child and use tree's node as a stored expectation.
 
+use std::fmt::Write as _;
+
+use expect_test::expect_file;
 use la_arena::{Idx, RawIdx};
 use syntax::{SyntaxKind, TextRange};
 use hir_expand::fixture;
@@ -142,73 +145,77 @@ fn source_view_is_source() {
     }
 }
 
+/// Each child's node, by owner (numbered in the order [`defs`] walks them) and index, up to and
+/// including the first index past the last child, which has none.
 #[test]
-fn child_source_view_is_child_source() {
+fn child_source_view() {
     let db = fixture::db(FIXTURE).into_db();
     let defs = defs(&db);
+    let mut out = String::new();
     let mut seen = 0;
-    for variant in defs.variants {
-        let map = variant.child_source(&db);
-        // One past the last: `None` where the map has no entry.
-        for raw in 0..=map.value.iter().count() as u32 {
+    for (owner, variant) in defs.variants.iter().enumerate() {
+        for raw in 0.. {
             let id = LocalFieldId::from_raw(RawIdx::from(raw));
             let view = variant.child_source_view(&db, id);
-            assert_eq!(view.file_id, map.file_id);
-            let handle = map.value.get(id).map(|it| {
-                it.as_ref().either(|it| of_handle(it.syntax()), |it| of_handle(it.syntax()))
-            });
-            assert_eq!(view.value.as_ref().map(either_view), handle, "{variant:?} {raw}");
-            seen += usize::from(handle.is_some());
+            let node = view.value.as_ref().map(either_view);
+            writeln!(out, "variant {owner} field {raw}: {:?} {node:?}", view.file_id).unwrap();
+            if node.is_none() {
+                break;
+            }
+            seen += 1;
         }
     }
-    for def in defs.generics {
-        let map = HasChildSource::<LocalTypeOrConstParamId>::child_source(&def, &db);
-        for raw in 0..=map.value.iter().count() as u32 {
+    for (owner, def) in defs.generics.iter().enumerate() {
+        for raw in 0.. {
             let id = LocalTypeOrConstParamId::from_raw(RawIdx::from(raw));
             let view = def.child_source_view(&db, id);
-            assert_eq!(view.file_id, map.file_id);
-            let handle = map.value.get(id).map(|it| {
-                it.as_ref().either(|it| of_handle(it.syntax()), |it| of_handle(it.syntax()))
-            });
-            assert_eq!(view.value.as_ref().map(either_view), handle, "{def:?} {raw}");
-            seen += usize::from(handle.is_some());
+            let node = view.value.as_ref().map(either_view);
+            writeln!(out, "generics {owner} type or const {raw}: {:?} {node:?}", view.file_id)
+                .unwrap();
+            if node.is_none() {
+                break;
+            }
+            seen += 1;
         }
-        let map = HasChildSource::<LocalLifetimeParamId>::child_source(&def, &db);
-        for raw in 0..=map.value.iter().count() as u32 {
+        for raw in 0.. {
             let id = LocalLifetimeParamId::from_raw(RawIdx::from(raw));
             let view = def.child_source_view(&db, id);
-            assert_eq!(view.file_id, map.file_id);
-            let handle = map.value.get(id).map(|it| of_handle(it.syntax()));
-            let view = view.value.map(|it| of_view(view::AstNode::syntax(&it)));
-            assert_eq!(view, handle, "{def:?} {raw}");
-            seen += usize::from(handle.is_some());
+            let node = view.value.map(|it| of_view(view::AstNode::syntax(&it)));
+            writeln!(out, "generics {owner} lifetime {raw}: {:?} {node:?}", view.file_id).unwrap();
+            if node.is_none() {
+                break;
+            }
+            seen += 1;
         }
     }
     assert!(seen >= 30, "the fixture's children: {seen}");
+    expect_file!["child_source_view.txt"].assert_eq(&out);
 }
 
+/// Each use tree of each import (numbered in the order [`defs`] walks them): the arena of
+/// [`use_trees_view`], [`use_tree_to_view`] and [`use_tree_sources_view`] give the same node.
 #[test]
-fn use_tree_to_view_is_child_source() {
+fn use_tree_views() {
     let db = fixture::db(FIXTURE).into_db();
+    let mut out = String::new();
     let mut seen = 0;
-    for use_ in defs(&db).uses {
+    for (owner, use_) in defs(&db).uses.into_iter().enumerate() {
         let id = use_.lookup(&db).id;
-        let map = use_.child_source(&db);
         let trees = use_trees_view(&db, id);
-        assert_eq!(trees.len(), map.value.iter().count());
         let views = use_tree_sources_view(&db, use_);
-        assert_eq!(views.file_id, map.file_id);
-        assert_eq!(views.value.iter().count(), map.value.iter().count());
+        assert_eq!(views.value.iter().count(), trees.len());
         for (idx, tree) in trees.iter() {
             let index: Idx<ast::UseTree> = Idx::from_raw(idx.into_raw());
-            let in_map = map.value.get(index).map(|it| of_handle(it.syntax()));
-            assert_eq!(Some(of_view(view::AstNode::syntax(tree))), in_map);
+            let node = of_view(view::AstNode::syntax(tree));
             let view = use_tree_to_view(&db, id, index);
-            assert_eq!(Some(of_view(view::AstNode::syntax(&view))), in_map);
+            assert_eq!(of_view(view::AstNode::syntax(&view)), node);
             let in_views = views.value.get(index).map(|&it| of_view(view::AstNode::syntax(&it)));
-            assert_eq!(in_views, in_map);
+            assert_eq!(in_views, Some(node));
+            writeln!(out, "use {owner} tree {}: {:?} {node:?}", u32::from(idx.into_raw()), views.file_id)
+                .unwrap();
             seen += 1;
         }
     }
     assert!(seen >= 8, "the fixture's use trees: {seen}");
+    expect_file!["use_tree_views.txt"].assert_eq(&out);
 }

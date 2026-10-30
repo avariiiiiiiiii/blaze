@@ -62,7 +62,7 @@ class Input:
     # Crates left out: deleted at integration, or not ours.
     skip: tuple[str, ...] = ("ide", "ide-assists", "ide-completion", "ide-diagnostics",
                              "ide-ssr", "rust-analyzer", "test-fixture", "test-utils",
-                             "blaze-store", "blaze-in-place", "vfs", "vfs-notify",
+                             "blaze-store", "vfs", "vfs-notify",
                              "load-cargo", "project-model")
     model: str = "Alibaba-NLP/gte-modernbert-base"
     device: Literal["auto", "mps", "cuda", "cpu"] = "auto"

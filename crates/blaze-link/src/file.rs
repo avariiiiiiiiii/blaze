@@ -376,12 +376,15 @@ impl<'a> Stage<'a> {
             return Err(error(None, format!("the writer laid debug section {nth} at {at:#x}, of no debug section")));
         }
         for (at, (_, bytes)) in homes.into_iter().zip(synthetic) {
-            let space = &mut self.new.spaces[at];
+            let space = &mut Arc::make_mut(&mut self.new.spaces)[at];
             space.region.size = bytes.len() as u64;
             space.bytes = bytes;
         }
-        for (space, offset) in self.new.spaces.iter_mut().zip(offsets) {
-            space.offset = if space.zero { None } else { offset };
+        let in_file = |space: &Space, offset: Option<u64>| if space.zero { None } else { offset };
+        if self.new.spaces.iter().zip(offsets.iter()).any(|(space, &offset)| space.offset != in_file(space, offset)) {
+            for (space, offset) in Arc::make_mut(&mut self.new.spaces).iter_mut().zip(offsets) {
+                space.offset = in_file(&*space, offset);
+            }
         }
         self.new.encoded = if encoded.is_empty() {
             std::sync::Arc::default()

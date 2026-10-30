@@ -23,6 +23,7 @@ mod env;
 mod files;
 mod random;
 pub(crate) mod target;
+mod thread;
 
 #[cfg(test)]
 mod tests;
@@ -406,7 +407,7 @@ impl<'a> Os<'a> {
                 self.fstatat(t, g, ret, at, word(rest, 4)?, int(rest, 2)?, files::Form::Statx)
             }
             Sys::Getrandom => self.getrandom(g, ret, (word(rest, 0)?, word(rest, 1)?)),
-            Sys::Evaluator => Ok(Answer::Evaluator),
+            Sys::Evaluator(_) => Ok(Answer::Evaluator),
             Sys::Other(name) => {
                 let name = name.unwrap_or("one blaze has no name for");
                 // alloc: error path

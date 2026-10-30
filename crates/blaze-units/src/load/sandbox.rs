@@ -1,10 +1,10 @@
 //! The ways out of the sandbox a workspace's manifests name (docs/cargo.md, "Build scripts and
-//! proc macros run in a sandbox"), read from the manifests the load already parsed, as v1's
-//! `blaze-cargo/src/cargo/sandboxed.rs` reads them from the disk: the workspace's root manifest
-//! names packages by name (the only place one from a registry can be named), and a member may
-//! take its own build script out and say how its tests run. Any other key, or a value of another
-//! type, is an error. The workspace's `experimental` list (v1's `cargo/experimental.rs`) is read
-//! here too, for the `sandboxed-tests` experiment.
+//! proc macros run in a sandbox"), read from the manifests the load already parsed: the
+//! workspace's root manifest names packages by name (the only place one from a registry can be
+//! named), and a member may take its own build script out and say how its tests run. Any other
+//! key, or a value of another type, is an error. The workspace's `experimental` list is read
+//! here too, for the `sandboxed-tests` and `const-macros` experiments, and a package's
+//! `const-macros` file with it.
 
 use std::path::Path;
 

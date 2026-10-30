@@ -193,6 +193,16 @@ impl<'a> TableView<'a> {
         Some(def_of(&self.bytes[at * SLOT..(at + 1) * SLOT]))
     }
 
+    /// The slot `id` is in, for [`TableView::def_at`] with no probe and no digest.
+    pub fn slot_of(&self, id: &SymbolId) -> Option<usize> {
+        self.find(&id.0)
+    }
+
+    /// The definition in slot `at`, which [`TableView::slot_of`] gave.
+    pub fn def_at(&self, at: usize) -> Def {
+        def_of(&self.bytes[at * SLOT..(at + 1) * SLOT])
+    }
+
     /// Whether `id` is a name the image defines weakly and its own code reaches other than
     /// through a bind, so no definition beside the image may win over it.
     pub fn reached_directly(&self, id: &SymbolId) -> bool {

@@ -246,7 +246,7 @@ impl Backend {
             super::overlap::share(&mut context.func, &frame, &mut recorder.named);
         }
         let pairs = super::float_pair::lower(&mut context.func);
-        let mut code = super::emit_cached(context)?;
+        let mut code = super::emit(context)?;
         if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
             code.slots =
                 SlotPlaces::of_frame(recorder.isa, frame, &context.func, recorder.named_slots());
@@ -273,20 +273,12 @@ pub(super) fn pad(mut code: Code) -> Result<Code> {
 
 #[cfg(feature = "llvm")]
 impl Backend {
-    /// What LLVM makes of the function, from the store if the same IR was compiled at the
-    /// same level before. That LLVM left the function to Cranelift is kept as well: else
-    /// every build would try LLVM on it again, miss in the store and count the function as
-    /// compiled, though Cranelift's code of it then comes from the store.
+    /// What LLVM makes of the function.
     fn emit_with_llvm(
         recorder: &mut Recorder<'_>,
         func: &cranelift_codegen::ir::Function,
         optimization: Optimization,
     ) -> std::result::Result<Code, super::llvm::Unhandled> {
-        use super::{
-            cached::{LlvmEntry, StoredCode},
-            llvm::Unhandled,
-            store::Store,
-        };
         let mut named: smallvec::SmallVec<[cranelift_codegen::ir::StackSlot; 16]> =
             smallvec::SmallVec::from_iter(recorder.named_slots());
         let shared = recorder
@@ -299,53 +291,17 @@ impl Backend {
             // alloc: empty, allocates nothing
             false => Vec::new(),
         };
-        // Not stored: the code is of the bodies imported too.
         if !imports.is_empty() {
             let mut code =
                 super::llvm::emit(&mut recorder.wants, &named, func, optimization, None, &imports)?;
             recorder.keep_referenced(&mut code);
             return Ok(code);
         }
-        let recorder = &mut recorder.wants;
-        // The key is of the function's own IR, which the bodies LLVM is shown are not part of.
-        let store = Store::global().filter(|_| recorder.seen.is_empty());
-        let Some((store, key)) = store.zip(StoredCode::key(
-            optimization,
-            func,
-            named.iter().copied(),
-            recorder.constants(),
-            recorder.asm_texts(),
-            &recorder.pointees,
-        )) else {
-            return super::llvm::emit(recorder, &named, func, optimization, None, &[]);
-        };
-        match store.lookup(&key).and_then(|it| LlvmEntry::decode(&it)) {
-            Some(LlvmEntry::Code(stored)) => {
-                if let Some(code) = stored.restore(recorder) {
-                    return Ok(code);
-                }
-            }
-            Some(LlvmEntry::LeftToCranelift(reason)) => return Err(Unhandled::Kept(reason)),
-            None => {}
-        }
-        let mark = recorder.mark();
-        let (entry, out) = match super::llvm::emit(recorder, &named, func, optimization, None, &[])
-        {
-            Ok(code) => (StoredCode::of(&code, recorder, mark).map(LlvmEntry::Code), Ok(code)),
-            Err(unhandled) => {
-                // alloc: the reason the store's entry keeps, of a function LLVM left
-                (Some(LlvmEntry::LeftToCranelift(unhandled.to_string())), Err(unhandled))
-            }
-        };
-        if let Some(bytes) = entry.and_then(|it| it.encode()) {
-            store.insert(&key, &bytes);
-        }
-        out
+        super::llvm::emit(&mut recorder.wants, &named, func, optimization, None, &[])
     }
 }
 
 impl fmt::Display for Backend {
-    /// Also what tells the entries of one producer from another's in the store.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Backend::Cranelift => f.write_str("cranelift"),

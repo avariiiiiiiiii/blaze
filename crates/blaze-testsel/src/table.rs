@@ -27,8 +27,11 @@ use crate::record::Record;
 pub struct FnId(pub ContentId);
 
 /// A function's code as it runs: its code hash, each function or method it refers to by its
-/// [`FnId`], each constant and static it refers to by the deep hash of its value, and for an
-/// instance the facts of its type arguments its code reads.
+/// [`FnId`], each constant and static it refers to by the deep hash of its value, for an
+/// instance the facts of its type arguments its code reads, and the positions it names (the
+/// content of each span table its code, its data and its debug lines name), as a test sees a
+/// `line!()`, a panic's `Location` and a backtrace's lines only by running the code that names
+/// them. A line added above a function moves it: its code hash stays and its bound does not.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Bound(pub ContentId);
 

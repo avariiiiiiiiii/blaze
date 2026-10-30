@@ -24,7 +24,7 @@ use blaze_link::{Debug, DevRun, Format, NativeKind, Output, OutputKind, Platform
 use blaze_mem::{Tag, frame, frame::Frame};
 
 pub const GRAPH_DOMAIN: &str = "blaze v2 premap graph 2";
-pub const IMAGE_DOMAIN: &str = "blaze v2 premap image 2";
+pub const IMAGE_DOMAIN: &str = "blaze v2 premap image 3";
 pub const INLINED_DOMAIN: &str = "blaze v2 premap inlined 1";
 
 /// The dependency graph an image is of: what every image of it shares.
@@ -70,8 +70,9 @@ pub struct GraphInputs<'a> {
     pub linker: ContentId,
     pub output: &'a Output,
     pub base: u64,
-    /// Where the run's loader keeps the program's thread-locals: the image's code reaches
-    /// them at this bias.
+    /// Where the image's thread-locals are in the workspace executable's own thread-local
+    /// block, which the system loader sets up: the image's code reaches them at this bias
+    /// from the thread pointer, and the executable's link puts the image's part there.
     pub tls_bias: i64,
     pub natives: &'a [NativeInput],
     /// The span side tables positions are filled from: each anchor and its table's content ID.

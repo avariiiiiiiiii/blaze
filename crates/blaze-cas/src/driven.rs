@@ -17,12 +17,11 @@ pub struct Driven {
 }
 
 impl Driven {
-    /// The store in `root/store`, open, under a native driver whose root is `root`.
+    /// The store in `root/store`, made if it is missing, open, under a native driver whose root
+    /// is `root`.
     pub fn open(root: &Path) -> Result<Driven, String> {
         let dir = FileName::new("store").expect("a relative name");
         let at = root.join(dir.as_str());
-        // alloc: the error of a store that cannot open
-        std::fs::create_dir_all(&at).map_err(|e| format!("{}: {e}", at.display()))?;
         let mut driver = blaze_core::native(root, 2)
             // alloc: the error of a store that cannot open
             .map_err(|e| format!("the native driver over {}: {e}", root.display()))?;

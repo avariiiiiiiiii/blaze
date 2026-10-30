@@ -13,7 +13,7 @@ use blaze_mem::{
     scratch::{self, Scratch},
 };
 use cfg::{CfgAtom, CfgOptions};
-use vfs::VfsPath;
+use crate::VfsPath;
 
 /// A content ID as an input holds it. Only base-db makes one, from the value the input is set
 /// with, so an input's ID and value never disagree.

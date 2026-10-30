@@ -24,7 +24,8 @@
 //! binding the tier-up. A worker with nothing to do spins a while before it sleeps (one at a
 //! time), and a queued compile wakes one sleeper, not all. A lone ask whose code is compiled
 //! already ([`Compiler::hit`]) skips the workers: the thread that read it places and answers
-//! it, saving the hand-off. A compile that panics or fails
+//! it, saving the hand-off, and what the compiler keeps of the hit for the store comes after the
+//! answer ([`Compiler::hit_answered`]). A compile that panics or fails
 //! answers `Failed` naming the function; a run that called it is stopped with that error,
 //! never left to run something else. The fetcher's lock ([`Shared::state`]) is held only to
 //! take or record a compile, never across one; the placer's only across one placement.
@@ -55,9 +56,12 @@ pub trait Compiler: Send + Sync + 'static {
     fn compile(&self, key: InstanceKey) -> Result<CompiledFunction, String>;
     /// `key`'s code when it is compiled already (codegen's memo, the store's mapped index),
     /// found by a probe: no compile, no I/O, no lock held past the lookup. `None` when it is
-    /// not, and [`Compiler::compile`] compiles it. Called on the thread that read the ask,
-    /// which answers a hit itself.
-    fn hit(&self, key: InstanceKey) -> Option<CompiledFunction>;
+    /// not, and [`Compiler::compile`] compiles it; an `Err` is the function's failure, as a
+    /// compile's would be. Called on the thread that read the ask, which answers a hit itself.
+    fn hit(&self, key: InstanceKey) -> Option<Result<CompiledFunction, String>>;
+    /// After a [`Compiler::hit`] of `key` was placed and its askers answered, on the same
+    /// thread: what the compiler keeps of it, off the askers' path. A panic stops the run.
+    fn hit_answered(&self, _key: InstanceKey) {}
     /// The instance whose first code `key` is, compiled again at `to` (its backend,
     /// [`Tier::backend`], counting calls and back edges in cells when [`Tier::counts`]).
     fn tier_up(&self, key: InstanceKey, to: Tier) -> Result<CompiledFunction, String>;
@@ -200,7 +204,7 @@ pub struct Runner<C: Compiler, P: Placer, A: Answers> {
 }
 
 /// What a closed runner found: the functions that failed to compile, asked for or not.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: a run's result, once at its close
 pub struct Closed {
     pub failures: Vec<(InstanceKey, ItemKey, String)>,
     pub compiles: u64,
@@ -228,7 +232,7 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
     ) -> Result<Runner<C, P, A>, String> {
         let workers = config.workers.max(1);
         let functions = session.plan().len();
-        let mut fetcher = Fetcher::new(functions, workers);
+        let mut fetcher = Fetcher::new(functions, workers)?;
         for &(id, priority) in first {
             fetcher.want(id, priority);
         }
@@ -420,9 +424,13 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
             {
                 drop(state);
                 let placed = self.place_compiled(id, compiled);
+                let answered = placed.is_ok();
                 let mut buffers = lock(&self.spare).pop().unwrap_or_else(|| self.buffers());
                 self.finish(id, placed, Some(to), &mut buffers);
                 lock(&self.spare).push(buffers);
+                if answered {
+                    self.hit_answered(id);
+                }
                 return;
             }
         }
@@ -612,13 +620,25 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
     }
 
     /// `id`'s code when the compiler has it already ([`Compiler::hit`]), for
-    /// [`Shared::place_compiled`]: a probe that panicked is the compile's failure.
+    /// [`Shared::place_compiled`]: a probe that failed or panicked is the compile's failure.
     fn hit(&self, id: LazyId) -> Option<std::thread::Result<Result<CompiledFunction, String>>> {
         let key = self.session.plan().key(id);
         match catch_unwind(AssertUnwindSafe(|| self.compiler.hit(key))) {
             Ok(None) => None,
-            Ok(Some(function)) => Some(Ok(Ok(function))),
+            Ok(Some(compiled)) => Some(Ok(compiled)),
             Err(payload) => Some(Err(payload)),
+        }
+    }
+
+    /// [`Compiler::hit_answered`] for `id`, whose hit was placed and answered: a panic in it
+    /// stops the run, naming the function.
+    fn hit_answered(&self, id: LazyId) {
+        let plan = self.session.plan();
+        let (key, item) = (plan.key(id), plan.item(id));
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.compiler.hit_answered(key))) {
+            // alloc: the run's end.
+            let why = format!("keeping {key:?} (item {item:?}) after its first call: the compiler panicked: {}", panic_text(&*payload));
+            self.answers.stop(Some((key, item)), &why);
         }
     }
 

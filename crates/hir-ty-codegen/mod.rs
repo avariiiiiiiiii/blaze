@@ -168,18 +168,6 @@ pub use target::{Arch, Calls, Features, ObjectFormat, Target, UnwindFormat, Vari
 pub mod tier;
 
 pub use patch::{OutOfDate, Stale, StaleSteps};
-/// For `crates/blaze-bench` alone.
-#[doc(hidden)]
-pub mod bench {
-    use blaze_store::KEY;
-
-    /// The key of the entry for `name`, as a build asks for it: one that tells a debugger of
-    /// its variables when `debug`.
-    pub fn entry_key(name: &str, debug: bool, program: &[u8; KEY]) -> Option<[u8; KEY]> {
-        let told = super::cached::Told::of(debug, debug);
-        super::cached::Entry::key(name, told, Some(program))
-    }
-}
 mod type_id;
 mod unwind;
 pub mod v2;
@@ -859,7 +847,7 @@ impl CodegenUnit {
             let statics = start.elapsed();
             let mut stale = std::mem::take(&mut known.stale);
             if stale.is_empty() {
-                stale.push(base.stale(db, Some(symbols), 0, 1));
+                stale.push(base.stale(db, 0, 1));
             }
             let patch = loop {
                 let patch = base.patch(
@@ -986,9 +974,6 @@ impl CodegenUnit {
         let mut rounds = 0;
         let mut discarded = std::time::Duration::ZERO;
         let mut start = roots.start;
-        // The entries read from the store, for every round: one that starts over for an
-        // instance that did not compile would read them all again.
-        let mut entries: Option<std::sync::Arc<cached::Entries>> = None;
         loop {
             rounds += 1;
             let round = stdx::time::Instant::now();
@@ -1008,12 +993,6 @@ impl CodegenUnit {
                 None,
                 hydrate,
             )?;
-            match &entries {
-                // clone: an `Arc`, once per round
-                Some(read) if cg.entries.is_some() => cg.entries = Some(read.clone()),
-                // clone: an `Arc`, once per round
-                _ => entries = cg.entries.clone(),
-            }
             cg.patching = patching;
             // clone: once per round; `known` keeps the set for the build after
             cg.rustc_futures = futures.clone();
@@ -1044,9 +1023,6 @@ impl CodegenUnit {
             for &id in roots.offered {
                 _ = cg.static_data(id);
             }
-            // Every root at once: an entry calls roots a later round is to find.
-            // alloc: once per round, every root at once
-            cg.find_stored_roots(&all().collect::<Vec<_>>());
             loop {
                 // Every core compiles the roots found so far, before they are put in the
                 // object one by one.
@@ -1057,9 +1033,8 @@ impl CodegenUnit {
                     // alloc: once per wave of roots, handed to `compile_ahead` by value
                     .collect();
                 let start = stdx::time::Instant::now();
-                cg.find_stored_roots(&ours);
                 // One without a symbol is not compiled, and is still lowered to be told why.
-                let (told, stored) = (cg.tells_variables().then_some(&cg.told), &cg.stored_roots);
+                let told = cg.tells_variables().then_some(&cg.told);
                 if cg.units() {
                     #[cfg(feature = "llvm")]
                     // alloc: empty, allocates nothing
@@ -1068,7 +1043,6 @@ impl CodegenUnit {
                     symbols.in_parallel(ours.len(), &|db, symbols, at| {
                         if symbols.function(ours[at]).is_none() {
                             _ = db.mir_body(ours[at].into());
-                        } else if stored.get(&ours[at]).is_some_and(Option::is_some) {
                         } else if let (Ok(compiled), Some(told)) =
                             (compiled_root(db, ours[at]).as_ref(), told)
                         {
@@ -1139,13 +1113,6 @@ impl CodegenUnit {
             cg.make_later();
             if let Some(refused) = cg.refused.take() {
                 return Err(refused);
-            }
-            if cg.misfit {
-                // What was read of the entry that did not fit, and of those that call it.
-                entries = None;
-                start_over("an entry of the store did not fit");
-                rejected.extend(failed);
-                continue;
             }
             // The `main` the C runtime calls would call a `main` that is not in the object.
             if start.is_some_and(|main| skipped.iter().any(|(root, _)| *root == main)) {
@@ -1255,28 +1222,6 @@ impl CodegenUnit {
             }
             if failed.is_empty() {
                 let instances = cg.instances.len();
-                if let Some(store) = store::Store::global() {
-                    // alloc: once per build, the names it reports missing
-                    let mut misses: Vec<_> = cg.names.misses.take().into_iter().collect();
-                    blaze_ids::radix::sort_copy_by_key(&mut misses, |it| !it.1);
-                    let (mut kept, writer) = (std::mem::take(&mut cg.kept), cg.writer.take());
-                    // The object and the link do not wait for the store to have what was
-                    // kept: whoever reads the store next does.
-                    store.settle_with(move || {
-                        if let Some(mut writer) = writer {
-                            kept.written(writer.finish());
-                        }
-                        store.flush();
-                        let (found, added) = store.take_counts();
-                        if found + added != 0 {
-                            eprintln!("store: {found} functions found, {added} compiled and added");
-                        }
-                        kept.report();
-                        if !misses.is_empty() {
-                            eprintln!("without a stable name: {misses:?}");
-                        }
-                    });
-                }
                 let compiled_now = counted.compiled();
                 *stats = BuildStats {
                     bodies: cg.bodies,
@@ -1310,8 +1255,6 @@ impl CodegenUnit {
                         // alloc: the error's message
                         .map_err(|e| CodegenError::Backend(format!("layout log: {e}")))?;
                 }
-                // The object frees them as it is written, on a thread of its own.
-                drop(entries.take());
                 let start = stdx::time::Instant::now();
                 let (object, apart) = cg.finish()?;
                 stats.phases.object = start.elapsed();
@@ -1571,16 +1514,8 @@ impl Rejections {
 
     /// Looks at one part in `parts` of what the last full build compiled for what an edit
     /// changed, which threads can do a part each. `None` when no patch is to be made.
-    /// `symbols` names what the last build had from the store.
-    pub fn stale(
-        &self,
-        db: &Db,
-        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
-        symbols: Option<&dyn SymbolResolver>,
-        part: usize,
-        parts: usize,
-    ) -> Option<Stale> {
-        Some(self.patched()?.stale(db, symbols, part, parts))
+    pub fn stale(&self, db: &Db, part: usize, parts: usize) -> Option<Stale> {
+        Some(self.patched()?.stale(db, part, parts))
     }
 
     /// What the next build is a patch of, if it is one.
@@ -1695,11 +1630,8 @@ impl Rejections {
         if let Some((root, _)) = base.compiled.iter().find(|(_, it)| it == symbol) {
             return Some(tier::Node(tier::Kind::Root(*root)));
         }
-        if let Some((instance, known)) = base.instances.iter().find(|(_, it)| it.symbol == symbol) {
-            return Some(tier::Node(tier::Kind::Instance(*instance, known.env)));
-        }
-        let (instance, env) = base.found_instances.get(symbol)?;
-        Some(tier::Node(tier::Kind::Instance(*instance, *env)))
+        let (instance, known) = base.instances.iter().find(|(_, it)| it.symbol == symbol)?;
+        Some(tier::Node(tier::Kind::Instance(*instance, known.env)))
     }
 
     /// The symbol `node` is defined under, as [`Rejections::tier_node`] takes it.
@@ -1710,22 +1642,11 @@ impl Rejections {
                 // clone: the owned symbol blaze-engine takes, once per function it promotes
                 base.compiled.iter().find(|(it, _)| it == root).map(|it| it.1.clone())
             }
-            tier::Kind::Instance(instance, env) => {
+            tier::Kind::Instance(instance, _) => {
                 // clone: the owned symbol blaze-engine takes, once per function it promotes
-                base.instances.get(instance).map(|it| it.symbol.clone()).or_else(|| {
-                    let mut found = base.found_instances.iter();
-                    // clone: the owned symbol blaze-engine takes, once per function it promotes
-                    found.find(|(_, it)| it.0 == *instance && it.1 == *env).map(|it| it.0.clone())
-                })
+                base.instances.get(instance).map(|it| it.symbol.clone())
             }
         }
-    }
-
-    /// Makes the next build compile the code of the checkout that the last one took from the
-    /// store, which no patch can replace: built while nothing waits, the first edit after it
-    /// is a patch. Whether the next build has that to do and no edit had asked for it.
-    pub fn dehydrate(&mut self) -> bool {
-        self.base.as_mut().is_some_and(|it| it.dehydrate())
     }
 
     /// Makes the next build a full one. A patch looks at everything the last build compiled,
@@ -1816,10 +1737,10 @@ impl Rejections {
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
     /// items, and not handed to a macro.
-    pub fn touch_bodies(&mut self, db: &Db, file: base_db::FileId) {
+    pub fn touch_bodies(&mut self, _db: &Db, file: base_db::FileId) {
         self.frozen.edit_bodies(file);
         for base in [&mut self.base, &mut self.rustc].into_iter().flatten() {
-            base.touch_bodies(db, file);
+            base.touch_bodies(file);
         }
         self.forget();
     }
@@ -1856,8 +1777,6 @@ impl Rejections {
             left: longest(|it| it.left),
             roots_asked: self.stale.iter().map(|it| it.steps.roots_asked).sum(),
             instances_asked: self.stale.iter().map(|it| it.steps.instances_asked).sum(),
-            roots_unchanged: self.stale.iter().map(|it| it.steps.roots_unchanged).sum(),
-            instances_unchanged: self.stale.iter().map(|it| it.steps.instances_unchanged).sum(),
             slowest: longest(|it| it.slowest),
         }
     }
@@ -5525,28 +5444,11 @@ fn inline(ctx: &mut cranelift_codegen::Context, inlined: &[ir::Function]) -> Res
     Ok(())
 }
 
-/// The store as Cranelift asks for it: one of these per function compiled.
-struct IncrementalCache(&'static store::Store);
-
-impl cranelift_codegen::incremental_cache::CacheKvStore for IncrementalCache {
-    fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>> {
-        let key = <&[u8; store::KEY]>::try_from(key).ok()?;
-        self.0.lookup(key).map(Cow::Owned)
-    }
-
-    fn insert(&mut self, key: &[u8], val: Vec<u8>) {
-        if let Ok(key) = <&[u8; store::KEY]>::try_from(key) {
-            self.0.insert(key, &val);
-        }
-    }
-}
-
-/// [`emit_lent`] into lists of its own, at Cranelift's default optimization: what the tests
-/// compile a function with.
-#[cfg(test)]
+/// [`emit_lent`] into lists of its own, at Cranelift's default optimization: v1's compile
+/// (`Backend::emit`, and the shims it defines), and what the tests compile a function with.
 fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
-    // alloc: none until the code's rows are written, then exactly that many: the test keeps them
-    emit_with(ctx, None, false, Features::BASELINE, Relocs::default(), Vec::new())
+    // alloc: none until the code's rows are written, then exactly that many: the caller keeps them
+    emit_with(ctx, false, Features::BASELINE, Relocs::default(), Vec::new())
 }
 
 /// Runs Cranelift on a finished function: v2's compile (`v2/backend.rs`), at
@@ -5560,24 +5462,14 @@ fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
 /// into the thread's kept lists ([`spare::relocs`], [`spare::lines`]), which v2's conversion
 /// gives back ([`spare::keep_relocs`], [`spare::keep_lines`]).
 fn emit_lent(ctx: &mut cranelift_codegen::Context, speed: bool, features: Features) -> Result<Code> {
-    emit_with(ctx, None, speed, features, spare::relocs(), spare::lines())
+    emit_with(ctx, speed, features, spare::relocs(), spare::lines())
 }
 
-/// [`emit_lent`]'s compile for v1's build (`Backend::emit`), into lists of its own (v1 keeps
-/// them), at Cranelift's default optimization, through Cranelift's incremental cache in v1's
-/// store when there is one.
-fn emit_cached(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
-    // alloc: none until the code's rows are written, then exactly that many: v1 keeps them
-    emit_with(ctx, store::Store::global(), false, Features::BASELINE, Relocs::default(), Vec::new())
-}
-
-/// Runs Cranelift on a finished function, with `store` as its incremental cache, writing its
-/// relocations and line rows into `relocs` and `lines`, which are empty. Cranelift panics on IR
-/// it has no lowering for (i128 corners, for one); that must cost us one function, not the
-/// process.
+/// Runs Cranelift on a finished function, writing its relocations and line rows into `relocs`
+/// and `lines`, which are empty. Cranelift panics on IR it has no lowering for (i128 corners,
+/// for one); that must cost us one function, not the process.
 fn emit_with(
     ctx: &mut cranelift_codegen::Context,
-    store: Option<&'static store::Store>,
     speed: bool,
     features: Features,
     relocs: Relocs,
@@ -5611,14 +5503,10 @@ fn emit_with(
         isa = &**target_of(features, Isa::FramePointer, speed)?;
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        match store {
-            Some(store) => ctx
-                .compile_with_cache(isa, &mut IncrementalCache(store), &mut Default::default())
-                .map(drop),
-            None => ctx.compile(isa, &mut Default::default()).map(drop),
-        }
-        // alloc: the error's message
-        .map_err(|e| format!("{:?}", e.inner))?;
+        ctx.compile(isa, &mut Default::default())
+            .map(drop)
+            // alloc: the error's message
+            .map_err(|e| format!("{:?}", e.inner))?;
         backend::Tally::global().passes();
         let Some(compiled) = ctx.compiled_code() else {
             // alloc: the error's message
@@ -6111,11 +5999,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         self.placed(id, watch::Of::Root(func), &ids, kept);
         // clone: once per root, `later::Of::Root` and this function's caller each own the symbol
         let of = later::Of::Root { func, symbol: symbol.clone() };
-        let mut later = later::Later::new(&self.module, id, of, compiled, ids);
+        let mut later = later::Later::new(id, of, compiled);
         // The rows of the Cranelift code are not those of LLVM's.
         later.unit_rows = unit.as_ref().filter(|_| self.debug.is_some()).map(|it| rows_of(db, it));
-        (later.tiered, later.keeps) =
-            (tiered.is_some(), tiered.is_none() && self.roots_from_store());
+        later.tiered = tiered.is_some();
         match (tiered, &unit) {
             (None, None) if self.defers() => {
                 let compiled = compiled_root(db, func).as_ref().map_err(Clone::clone)?;
@@ -6812,10 +6699,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let kept = if unit.is_some() { watch::How::Unit } else { watch::How::Unchanged };
         self.placed(id, watch::Of::Instance(instance, env), &ids, kept);
         let of = later::Of::Instance { instance: *instance, env: *env };
-        let mut later = later::Later::new(&self.module, id, of, compiled, ids);
+        let mut later = later::Later::new(id, of, compiled);
         later.unit_rows =
             unit.as_ref().filter(|_| self.debug.is_some()).map(|it| rows_of(self.db, it));
-        (later.tiered, later.keeps) = (tiered.is_some(), tiered.is_none());
+        later.tiered = tiered.is_some();
         match (tiered, &unit) {
             (None, None) if self.defers() => {
                 let compiled = compiled_instance(self.db, *instance, *env);
@@ -6839,50 +6726,25 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Whether what is made of a function once it is in the object waits for every function
     /// to be in it ([`later`]): not in a program with code of rustc's, which settles what it
-    /// refers to by the build, nor in a patch, nor for units, nor when entries are checked.
+    /// refers to by the build, nor in a patch, nor for units.
     fn defers(&self) -> bool {
-        self.mixed.is_none()
-            && self.base.is_none()
-            && !self.units()
-            && !checks_cache()
+        self.mixed.is_none() && self.base.is_none() && !self.units()
     }
 
-    fn keeper(&mut self, settled: Option<Vec<Option<Instance>>>) -> later::Keeper<'_, 'db> {
-        let program = self.mixed.as_ref().map(|it| it.key);
-        let markable = self.mixed.is_none() && !self.units();
+    fn keeper(&mut self) -> later::Keeper<'_, 'db> {
         later::Keeper {
             db: self.db,
             symbols: self.symbols,
-            names: &self.names,
-            stable_names: &mut self.stable_names,
             source_paths: &mut self.source_paths,
-            kept: &mut self.kept,
-            declarations: self.module.declarations(),
-            type_ids: &self.type_ids,
-            root_names: &self.root_names,
-            own_crates: &self.own_statics.crates,
             told: &self.told,
             debug: self.debug.is_some(),
             variables: self.symbols.describes_variables(),
-            program,
-            own: self.base.is_none() && program != Some(None) && !self.symbols.onto_rustcs(),
-            markable,
-            settled,
         }
     }
 
     /// Makes what is made of a function once it is in the object, here and now.
     fn make_now(&mut self, later: &later::Later<'_>) {
-        let settled = self.mixed.is_some().then(|| {
-            let funcs = later.compiled.requests.funcs.iter();
-            let settled = funcs.map(|request| match &request.target {
-                FuncTarget::Instance(callee, _) => self.settled(callee).ok(),
-                _ => None,
-            });
-            // alloc: per function of a program with rustc's code; `later::Keeper` owns the list
-            settled.collect()
-        });
-        let made = self.keeper(settled).make(later);
+        let made = self.keeper().make(later);
         self.apply(later, made);
     }
 
@@ -6890,16 +6752,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let (Some(debug), Some(describer)) = (made.debug, &self.debug) {
             describer.add_function(later.id, later.compiled.code.bytes.len() as u32, debug);
         }
-        if let Some(kept) = made.kept
-            && let Some(store) = store::Store::global()
-        {
-            self.writer(store).keep(kept);
-        }
     }
 
     /// Makes what is made of the functions in the object that waited for it ([`later`]),
-    /// on every core, and tells the debugger and the store of them in the order they were
-    /// put in the object.
+    /// on every core, and tells the debugger of them in the order they were put in the
+    /// object.
     fn make_later(&mut self) {
         let later = std::mem::take(&mut self.later);
         if later.is_empty() {
@@ -6907,54 +6764,29 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         const AT_ONCE: usize = 64;
         let parts: Vec<_> = later.chunks(AT_ONCE).collect(); // alloc: once per object
-        type Part = (Vec<later::Made>, Kept, FxHashMap<&'static str, usize>);
+        type Part = Vec<later::Made>;
         let made: Vec<std::sync::Mutex<Option<Part>>> =
             parts.iter().map(|_| Default::default()).collect(); // alloc: once per object
         {
-            let (owned, hydrate) = (&self.own_statics.crates, self.hydrate);
-            let (declarations, type_ids, root_names) =
-                (self.module.declarations(), &self.type_ids, &self.root_names);
-            let program = self.mixed.as_ref().map(|it| it.key);
             let (debug, told) = (self.debug.is_some(), &self.told);
-            // Each thread names what it makes with names of its own, which it asks the same
-            // of over and over: they are not made again for each part.
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let listings = self.names.listings();
             // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
             let work = |db: &Db, symbols: &dyn SymbolResolver, _: usize| {
-                // clone: once per thread per object, the names own their crates and listings
-                let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate)
-                    .listing(listings.clone()); // clone: as above
-                let (mut stable_names, mut source_paths) = Default::default();
-                let mut kept = Kept::default();
+                let mut source_paths = Default::default();
                 let mut keeper = later::Keeper {
                     db,
                     symbols,
-                    names: &names,
-                    stable_names: &mut stable_names,
                     source_paths: &mut source_paths,
-                    kept: &mut kept,
-                    declarations,
-                    type_ids,
-                    root_names,
-                    own_crates: owned,
                     told,
                     debug,
                     variables: symbols.describes_variables(),
-                    program,
-                    own: program != Some(None) && !symbols.onto_rustcs(),
-                    markable: true,
-                    settled: None,
                 };
                 loop {
                     let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(part) = parts.get(at) else { break };
                     // alloc: once per 64 functions, handed to the thread that applies them
                     let part = part.iter().map(|it| keeper.make(it)).collect();
-                    let kept = std::mem::take(&mut *keeper.kept);
-                    let misses = names.misses.take();
-                    *made[at].lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some((part, kept, misses));
+                    *made[at].lock().unwrap_or_else(|e| e.into_inner()) = Some(part);
                 }
             };
             let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
@@ -6963,20 +6795,15 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         for (part, made) in parts.iter().zip(made) {
             let made = made.into_inner().unwrap_or_else(|e| e.into_inner());
             // A resolver without threads leaves the work to whoever asks for it.
-            let Some((part_made, kept, misses)) = made else {
+            let Some(part_made) = made else {
                 for it in part.iter() {
-                    let made = self.keeper(None).make(it);
+                    let made = self.keeper().make(it);
                     self.apply(it, made);
                 }
                 continue;
             };
             for (it, made) in part.iter().zip(part_made) {
                 self.apply(it, made);
-            }
-            self.kept.merge(kept);
-            let mut ours = self.names.misses.borrow_mut();
-            for (why, count) in misses {
-                *ours.entry(why).or_default() += count;
             }
         }
     }
@@ -7404,7 +7231,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Compiles a function built here, whose IR names what it uses by the ids of the module.
     fn define_shim(&mut self, id: FuncId, ctx: &mut cranelift_codegen::Context) -> Result<()> {
-        let code = emit_cached(ctx)?;
+        let code = emit(ctx)?;
         let mut relocs = RELOCS.take();
         relocs.extend(code.relocs.iter().map(|it| (it.module(id), it.elf_type)));
         let defined = self.define_code(id, &code, &relocs);

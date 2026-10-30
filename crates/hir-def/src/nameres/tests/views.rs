@@ -1,9 +1,12 @@
-//! The view twins of a module's source give the handles' nodes: for modules of every origin
-//! (the crate root, a `mod foo;` file, an inline module, one a macro writes, a block with
-//! items), [`ModuleData::definition_source_view`] has the file and variant of
-//! [`ModuleData::definition_source`] and the same elements, and
-//! [`ModuleData::declaration_source_view`] those of [`ModuleData::declaration_source`].
+//! A module's source views, for modules of every origin (the crate root, a `mod foo;` file, an
+//! inline module, one a macro writes, a block with items): the file, variant and node of
+//! [`ModuleData::definition_source_view`] as a stored expectation, and
+//! [`ModuleData::declaration_source_view`] against the handle [`ModuleData::declaration_source`],
+//! element by element.
 
+use std::fmt::Write as _;
+
+use expect_test::expect_file;
 use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, TextRange, view};
 use hir_expand::fixture;
 
@@ -11,7 +14,7 @@ use crate::{
     DefWithBodyId, ModuleDefId,
     expr_store::Body,
     nameres::{
-        DefMap, ModuleData, ModuleOrigin, ModuleSource, ModuleSourceView, crate_def_map,
+        DefMap, ModuleData, ModuleOrigin, ModuleSourceView, crate_def_map,
     },
     test_db::{TestDB, TestDBExt},
 };
@@ -38,14 +41,6 @@ fn view_elements(node: view::Node<'_>) -> Vec<Element> {
         .collect()
 }
 
-fn handle_variant(source: &ModuleSource) -> &'static str {
-    match source {
-        ModuleSource::SourceFile(_) => "SourceFile",
-        ModuleSource::Module(_) => "Module",
-        ModuleSource::BlockExpr(_) => "BlockExpr",
-    }
-}
-
 fn view_variant(source: ModuleSourceView<'_>) -> &'static str {
     match source {
         ModuleSourceView::SourceFile(_) => "SourceFile",
@@ -64,25 +59,39 @@ struct Seen {
     block: usize,
 }
 
-fn compare_module(db: &TestDB, data: &ModuleData, seen: &mut Seen) {
-    match data.origin {
-        ModuleOrigin::CrateRoot { .. } => seen.crate_root += 1,
-        ModuleOrigin::File { .. } => seen.file += 1,
-        ModuleOrigin::Inline { .. } => seen.inline += 1,
-        ModuleOrigin::BlockExpr { .. } => seen.block += 1,
-    }
+fn compare_module(db: &TestDB, data: &ModuleData, seen: &mut Seen, out: &mut String) {
+    let origin = match data.origin {
+        ModuleOrigin::CrateRoot { .. } => {
+            seen.crate_root += 1;
+            "crate root"
+        }
+        ModuleOrigin::File { .. } => {
+            seen.file += 1;
+            "file"
+        }
+        ModuleOrigin::Inline { .. } => {
+            seen.inline += 1;
+            "inline"
+        }
+        ModuleOrigin::BlockExpr { .. } => {
+            seen.block += 1;
+            "block"
+        }
+    };
 
-    let handle = data.definition_source(db);
     let view = data.definition_source_view(db);
-    assert_eq!(handle.file_id, view.file_id, "{:?}", data.origin);
-    assert_eq!(handle_variant(&handle.value), view_variant(view.value), "{:?}", data.origin);
-    assert_eq!(
-        handle_elements(&handle.value.node()),
-        view_elements(view.value.node()),
-        "{:?}",
-        data.origin
-    );
-    if handle.file_id.is_macro() {
+    let node = view.value.node();
+    writeln!(
+        out,
+        "{origin}: {:?} {} {:?}@{:?}, {} elements",
+        view.file_id,
+        view_variant(view.value),
+        node.kind(),
+        node.text_range(),
+        view_elements(node).len()
+    )
+    .unwrap();
+    if view.file_id.is_macro() {
         seen.in_macro += 1;
     }
 
@@ -107,21 +116,21 @@ fn compare_module(db: &TestDB, data: &ModuleData, seen: &mut Seen) {
 }
 
 /// Every module of `def_map`, then those of the block def maps of its functions' bodies.
-fn compare_def_map(db: &TestDB, def_map: &DefMap, seen: &mut Seen) {
+fn compare_def_map(db: &TestDB, def_map: &DefMap, seen: &mut Seen, out: &mut String) {
     for (_, data) in def_map.modules(db) {
-        compare_module(db, data, seen);
+        compare_module(db, data, seen, out);
         for decl in data.scope(db).declarations() {
             let ModuleDefId::FunctionId(function) = decl else { continue };
             let body = Body::of(db, DefWithBodyId::FunctionId(function));
             for (_, block) in body.blocks(db) {
-                compare_def_map(db, block, seen);
+                compare_def_map(db, block, seen, out);
             }
         }
     }
 }
 
 #[test]
-fn a_modules_source_views_are_its_handles() {
+fn a_modules_source_views() {
     let db = fixture::db(
         r#"
 //- /lib.rs
@@ -159,7 +168,8 @@ fn in_file() {
     )
     .into_db();
     let mut seen = Seen::default();
-    compare_def_map(&db, crate_def_map(&db, db.fetch_test_crate()), &mut seen);
+    let mut out = String::new();
+    compare_def_map(&db, crate_def_map(&db, db.fetch_test_crate()), &mut seen, &mut out);
     assert_eq!(seen.crate_root, 1);
     assert_eq!(seen.file, 1);
     // `inline`, `sub` and `written`.
@@ -167,4 +177,5 @@ fn in_file() {
     assert_eq!(seen.in_macro, 1);
     // The bodies of `in_inline`, `in_file` and `with_block`, its inner block, and `deeper`.
     assert_eq!(seen.block, 5);
+    expect_file!["views_definition_source.txt"].assert_eq(&out);
 }

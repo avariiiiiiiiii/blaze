@@ -61,10 +61,10 @@ use super::{
     Backend, CompiledFunction, Detach, Instance, InstanceDef, ObjectCodegen, ObjectFormat,
     ParallelWork, Pending, Produced, Rejected, Result, SymbolResolver,
     backend::{self, Tally},
-    cached, compiled_instance, compiled_root,
+    compiled_instance, compiled_root,
     fragment::{self, DataRequest, FuncRequest, FuncTarget, Recorder},
     frame_map,
-    home, imports, instance_rows, llvm, root_instance, root_rows, stable,
+    home, imports, instance_rows, llvm, root_instance, root_rows,
     tier::{self, Kind},
 };
 
@@ -122,12 +122,10 @@ struct Found {
 
 /// Which of the functions a function calls are to be compiled, as
 /// [`ObjectCodegen::compile_ahead`] has it: not a root, which is called by its symbol, unless
-/// it is compiled only once called; not an instance an earlier round rejected; and not one
-/// the store has.
+/// it is compiled only once called; and not an instance an earlier round rejected.
 struct Finder<'x> {
     rejected: &'x FxHashMap<Instance, Rejected>,
     on_demand: &'x FxHashSet<FunctionId>,
-    entries: Option<&'x cached::Entries>,
 }
 
 impl Finder<'_> {
@@ -136,17 +134,10 @@ impl Finder<'_> {
         db: &Db,
         // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
-        names: &stable::StableNames<'_, '_>,
         homes: &mut home::Homes,
         requests: impl IntoIterator<Item = &'r FuncRequest>,
         found: &mut Found,
     ) {
-        let in_store = |callee: &Instance| {
-            let Some(entries) = self.entries else { return false };
-            names.instance(callee).is_some_and(|name| {
-                entries.usable(&name, symbols)
-            })
-        };
         for request in requests {
             let FuncTarget::Instance(callee, asked) = &request.target else { continue };
             // A function without generic arguments is a root, called by its symbol when
@@ -160,7 +151,7 @@ impl Finder<'_> {
                 }
                 _ => false,
             };
-            if !root && !self.rejected.contains_key(callee) && !in_store(callee) {
+            if !root && !self.rejected.contains_key(callee) {
                 // clone: a few `u32` ids, nothing on the heap; kept for the next wave
                 found.instances.push((callee.clone(), homes.home(db, callee, asked)));
             }
@@ -327,14 +318,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
         // clone: an `Arc`, once per build, shared with the threads
         let told = self.tells_variables().then(|| self.told.clone());
-        let entries = self.entries.as_deref();
         let ctx = Context {
-            stored: &self.stored_roots,
-            roots_from_store: self.roots_from_store(),
-            entries,
-            finder: Finder { rejected: self.rejected, on_demand: self.on_demand, entries },
-            owned: &self.own_statics.crates,
-            hydrate: self.hydrate,
+            finder: Finder { rejected: self.rejected, on_demand: self.on_demand },
             told: told.as_ref(),
         };
         let stats = std::env::var_os("BLAZE_STATS").is_some();
@@ -567,12 +552,7 @@ impl Eq for Queued {}
 
 /// What the threads of a [`Round`] share of the build.
 struct Context<'x> {
-    stored: &'x FxHashMap<FunctionId, Option<super::StableName>>,
-    roots_from_store: bool,
-    entries: Option<&'x cached::Entries>,
     finder: Finder<'x>,
-    owned: &'x FxHashSet<base_db::Crate>,
-    hydrate: bool,
     told: Option<&'x super::ToldTypes>,
 }
 
@@ -587,8 +567,6 @@ impl Context<'_> {
         // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
     ) {
-        // clone: once per thread per round, setup; `StableNames::new` takes the set by value
-        let names = stable::StableNames::new(db, symbols, self.owned.clone(), self.hydrate);
         let mut homes = home::Homes::default();
         let lock = || round.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = lock();
@@ -601,7 +579,7 @@ impl Context<'_> {
                 drop(state);
                 // The unit's frame: what building its IR needs and drops (`calls_after_imports`).
                 let built = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
-                    self.built(db, symbols, &names, &mut homes, &kind, frame)
+                    self.built(db, symbols, &mut homes, &kind, frame)
                 });
                 state = lock();
                 (state.built[at], state.building) = (Some(built), state.building - 1);
@@ -615,7 +593,7 @@ impl Context<'_> {
                 drop(state);
                 // The unit's frame: each member's `build()` nests its own in it.
                 let (outcomes, found) = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |_| {
-                    self.compiled(db, symbols, &names, &mut homes, job)
+                    self.compiled(db, symbols, &mut homes, job)
                 });
                 state = lock();
                 state.done.push((place, outcomes, found));
@@ -631,14 +609,13 @@ impl Context<'_> {
 
     /// The IR of a function, with LLVM's part left for later, and what its code calls once
     /// LLVM has built in what it imports. `None` for one that is not compiled, without a
-    /// symbol or in the store, and an error for one whose IR could not be built for a unit:
-    /// that one is compiled alone here, to find what it calls.
+    /// symbol, and an error for one whose IR could not be built for a unit: that one is
+    /// compiled alone here, to find what it calls.
     fn built(
         &self,
         db: &Db,
         // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
-        names: &stable::StableNames<'_, '_>,
         homes: &mut home::Homes,
         kind: &Kind,
         frame: &Frame,
@@ -649,21 +626,7 @@ impl Context<'_> {
                 _ = db.mir_body((*root).into());
                 None
             }
-            Kind::Root(root) => {
-                let in_store = match self.stored.get(root) {
-                    Some(name) => name.is_some(),
-                    None => {
-                        self.roots_from_store
-                            && names.instance(&root_instance(db, *root)).is_some_and(|name| {
-                                stable::StableNames::of_checkout(&name)
-                                    && self.entries.is_some_and(|entries| {
-                                        entries.usable(&name, symbols)
-                                    })
-                            })
-                    }
-                };
-                (!in_store).then(|| tier::for_build(|| super::root_code(db, *root, true)))
-            }
+            Kind::Root(root) => Some(tier::for_build(|| super::root_code(db, *root, true))),
             Kind::Instance(instance, env) => Some(tier::for_build(|| {
                 // clone: the query takes them by value; a few `u32` ids, nothing on the heap
                 super::instance_code(db, instance.clone(), env.clone(), Detach::Unit, None)
@@ -674,7 +637,7 @@ impl Context<'_> {
             None => {}
             Some(Ok(Produced::Pending(pending))) if shares(pending).is_ok() => {
                 calls_after_imports(db, pending, frame, |calls| {
-                    self.finder.find(db, symbols, names, homes, calls.iter().copied(), &mut found)
+                    self.finder.find(db, symbols, homes, calls.iter().copied(), &mut found)
                 });
             }
             Some(_) => {
@@ -687,7 +650,7 @@ impl Context<'_> {
                 };
                 if let Ok(compiled) = compiled {
                     let calls = &compiled.requests.funcs;
-                    self.finder.find(db, symbols, names, homes, calls, &mut found);
+                    self.finder.find(db, symbols, homes, calls, &mut found);
                 }
             }
         }
@@ -700,7 +663,6 @@ impl Context<'_> {
         db: &Db,
         // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
-        names: &stable::StableNames<'_, '_>,
         homes: &mut home::Homes,
         job: Job,
     ) -> (Vec<(Kind, Outcome)>, Found) {
@@ -739,7 +701,7 @@ impl Context<'_> {
                 }),
                 _ => true,
             });
-            self.finder.find(db, symbols, names, homes, calls, &mut found);
+            self.finder.find(db, symbols, homes, calls, &mut found);
         }
         (outcomes, found)
     }

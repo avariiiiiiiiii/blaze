@@ -6,24 +6,56 @@ date: 2026-10-29
 # fastcompile-global: one global cache
 
 Idea 8 of [compile-time.md](../../design/compile-time.md). What depends only on public inputs
-(crates.io crate versions, std, sandboxed proc-macro and build-script runs, LLVM-optimized
-functions) is computed once, by blaze's builders, and fetched by every machine instead of
+(crates.io crate versions, std, sandboxed proc-macro and build-script runs, dependencies'
+front-end results and code) is computed once, by blaze's builders, and fetched by every machine instead of
 built. The code is `crates/blaze-global/`; the boundaries are in [notes.md](notes.md).
 
 ## What is public (`public.rs`)
 
 A store `Key` is a hash, so nothing in it says what it was made from. Publicness is judged where
-a key is made: a `Rule` takes how the key was made (`QueryMade`, `RunMade`, `FunctionMade`, a
-side table of a public function), makes the key again with its owner's own function
-(`Key::of`, `blaze_usercode::index`, `blaze_codegen::query::keys`), and checks every input's
-`Origin`. What passes is a `Public`, which no other code can make, and the client fetches and
-publishes only those. The client asserts that every key the store asks it for was shown public.
+a key is made: a `Rule` takes how the key was made (`QueryMade`, `RunMade`, `FunctionMade`,
+`DevFunctionMade`, a side table of a public function, a `DerivedMade` from a public front-end
+value), makes the key again with its owner's own function (`Key::of`,
+`blaze_usercode::index`, `blaze_codegen::query::keys`, `blaze_diagnostics::cache`,
+`hir_ty::consteval::deps`), and checks every input's `Origin`. What passes is a `Public`,
+which no other code can make, and the client fetches and publishes only those. The client
+asserts that every key the store asks it for was shown public.
 
 - Public: a crates.io crate version by its lock checksum, the pinned toolchain's files, the
   builders' system image, and the outputs of public runs.
 - Never public: a workspace member, a path or git dependency, another registry, a variable of
   the machine's environment read with a value, a run that read the whole environment or
-  anything untraceable, or a dev (Cranelift) function.
+  anything untraceable, or code compiled for more than its target's baseline.
+
+**Front-end results of a dependency** (`Rule::derived`, request 00842 from cold-v2). A fetched
+image is followed by the crate's check, its constants, goals and MIR. Those built from a public
+image key are public too:
+
+- the bodies part of its check (`cache::bodies_key` of the image, its dependencies' check keys,
+  each a `Public`, and the borrow checker's mode), whose key is the crate's check key;
+- its check outcome (`cache::key` of the check key and the lint flags and mode, `Inputs`);
+- the values of its constants (`consteval::deps::key` of the check key and the constant's
+  stable key).
+
+The flags, the mode and the item key are settings and names in the key, not inputs read from
+the machine; the outcome's texts hold the package directory and `OUT_DIR` as placeholders, not
+paths. Two kinds are not covered yet: goal answers (`next_solver::goal_store`) and the item
+store's records (`body_store`, kinds 0x3800 to 0x3840). Their keys are made in private modules
+(`record`, `stable`), and a goal's answer is public only when every fact it read is of a public
+crate. Lane db was asked for the key functions and each fact's crate (fastcompile-queue 3).
+Until they are given, the builders don't publish these two kinds.
+
+**Dev functions** (`Rule::dev_function`). Cranelift's and copy-and-patch's code is kept under
+`keys::template(stored(instance, built_in))`, with no import decisions. It is public on the
+same terms as release code (pinned toolchain, public code and type arguments), and only when
+compiled for the target's baseline (`Toolchain::features` empty: a `Runs::Elsewhere` build
+with no `-C target-cpu` or `-C target-feature`). Code tuned to the builder's CPU has a key of
+those features, which no other machine's build asks for. Nondeterminism is no reason to keep
+dev code private. Cranelift and the stencil library give the same bytes for the same input,
+and the local store already reuses a template by this key, so a template that depends on
+anything outside its key is a bug in the local cache first. A cold dev build is
+`Runs::Here`, so its keys are of the host's features. It finds published code only when the
+dev driver asks for baseline code of dependencies (cold-v2's side).
 
 `Secrets` holds the publisher's seed (raw and as hex) and every non-public environment value. A
 value that contains any of them is refused before it is signed (`Client::publish`), and the

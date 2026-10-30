@@ -8,6 +8,10 @@ mod mapped;
 pub(crate) use mapped::map;
 pub use mapped::{Advice, MapOptions, Mapped};
 
+mod private;
+
+pub(crate) use private::private;
+
 #[cfg(unix)]
 use std::{fs::File, io::Write as _};
 use std::{

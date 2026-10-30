@@ -2141,6 +2141,7 @@ impl Driver for Uring {
                 Effect::Link { from, to, .. } => self.copy(tag, Kind::Link, &from, &to).map(|()| None),
                 Effect::Stat { file, .. } => self.look(tag, Kind::Stat, &file).map(|()| None),
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
+                private @ Effect::Private { .. } => self.off_ring(private).map(|()| None),
                 Effect::WriteAt { file, at, bytes, .. } => self.write_at(tag, &file, at, bytes).map(|()| None),
                 Effect::Rename { from, to, .. } => self.rename(tag, &from, &to).map(|()| None),
                 Effect::Mode { file, mode, .. } => {

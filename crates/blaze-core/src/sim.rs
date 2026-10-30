@@ -30,7 +30,7 @@ use rustc_hash::FxHashMap;
 
 pub use self::journal::Journal;
 use crate::{
-    Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError, Meta, RECV_MOST, Tag,
+    Access, Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError, Meta, RECV_MOST, Tag,
     threads::tagged::{Id, Tagged},
     wheel::{self, Wheel},
 };
@@ -252,6 +252,9 @@ pub struct Sim {
     faults: Faults,
     now: Duration,
     files: FxHashMap<FileName, SimFile>,
+    /// Whose a file or directory is and who else can write it, where a test said it is not
+    /// the user's alone ([`Sim::set_access`]).
+    access: FxHashMap<FileName, Access>,
     /// Effects in flight by the tick of the virtual clock they are ready at. The clock ends
     /// some 584 years in ([`wheel::ticks`]): one due later is due at its end.
     pending: Wheel<Pending>,
@@ -309,6 +312,7 @@ impl Sim {
             faults,
             now: Duration::ZERO,
             files: FxHashMap::default(),
+            access: FxHashMap::default(),
             pending: Wheel::new(),
             spawns: Tagged::new(RESERVE),
             ready: Vec::with_capacity(RESERVE),
@@ -514,6 +518,26 @@ impl Sim {
         Done::Listed(listed)
     }
 
+    /// [`Effect::Private`] on the simulated disk, whose directories are made 0o700: the first,
+    /// by name, of `dir` and what is under it that [`Sim::set_access`] took from the user or
+    /// whose mode lets others write it.
+    fn private(&self, dir: &FileName) -> Done {
+        if let Some(&access) = self.access.get(dir) {
+            // clone: the refusal names the directory
+            return Done::Private(Some((dir.clone(), access)));
+        }
+        // What a test set of a file comes before what its mode says.
+        let given = self.access.iter().filter(|(it, _)| it.is_under(dir)).map(|(it, &access)| (it, 0, access));
+        let moded = self
+            .files
+            .iter()
+            .filter(|(it, sim)| sim.mode & 0o002 != 0 && it.is_under(dir))
+            .map(|(it, _)| (it, 1, Access::OthersWrite));
+        let first = given.chain(moded).min_by_key(|&(file, rank, _)| (file, rank));
+        // clone: the refusal names the file
+        Done::Private(first.map(|(file, _, access)| (file.clone(), access)))
+    }
+
     /// The file removed by something outside the state machine.
     pub fn delete(&mut self, file: &FileName) {
         self.files.remove(file);
@@ -606,6 +630,17 @@ impl Sim {
             self.disk.attributes(file);
             self.tell_journals();
         }
+    }
+
+    /// The file or directory made another user's, or writable by others, by something outside
+    /// the state machine, for [`Effect::Private`] to find; [`Access::Alone`] makes it the
+    /// user's again.
+    pub fn set_access(&mut self, file: &FileName, access: Access) {
+        match access {
+            Access::Alone => self.access.remove(file),
+            // clone: the world changed by the test, not an op.
+            access => self.access.insert(file.clone(), access),
+        };
     }
 
     /// `from` renamed over `to` by something outside the state machine.
@@ -810,6 +845,7 @@ impl Sim {
                 }
             }),
             Effect::List { dir, .. } => self.list(&dir),
+            Effect::Private { dir, .. } => self.private(&dir),
             Effect::Stamp { files, .. } => Done::Stamped(
                 files
                     .iter()
@@ -1300,6 +1336,43 @@ mod tests {
         );
         let mut effects = vec![Effect::WriteAt { file: to, at: 0, bytes: vec![1], tag: Tag(3) }];
         run_until_idle(&mut sim, &mut effects, |it, _| assert!(matches!(it.done, Done::Failed(_))));
+    }
+
+    /// What a test took from the user, or a mode that lets others write, is found by a check of
+    /// the directory, the first by name, and what was set comes before the mode; anything
+    /// outside the directory is not looked at.
+    #[test]
+    fn a_private_directory_names_the_first_that_is_not_the_users_alone() {
+        let mut sim = Sim::new(1, Faults::default());
+        let name = |it: &str| FileName::new(it).unwrap();
+        let (store, a, b) = (name("store"), name("store/a"), name("store/b"));
+        let check = |sim: &mut Sim| {
+            let mut found = None;
+            let mut effects = vec![Effect::Private { dir: store.clone(), tag: Tag(9) }];
+            run_until_idle(sim, &mut effects, |it, _| found = Some(it.done));
+            found.expect("the check completed")
+        };
+        let mut effects = vec![
+            Effect::Write { file: a.clone(), bytes: b"a".to_vec(), tag: Tag(0) },
+            Effect::Write { file: b.clone(), bytes: b"b".to_vec(), tag: Tag(1) },
+            Effect::Write { file: name("other/c"), bytes: b"c".to_vec(), tag: Tag(2) },
+        ];
+        run_until_idle(&mut sim, &mut effects, |_, _| {});
+        assert_eq!(check(&mut sim), Done::Private(None));
+        sim.chmod(&name("other/c"), 0o666);
+        sim.set_access(&name("other"), Access::OtherUser);
+        assert_eq!(check(&mut sim), Done::Private(None));
+        sim.chmod(&b, 0o646);
+        assert_eq!(check(&mut sim), Done::Private(Some((b.clone(), Access::OthersWrite))));
+        sim.set_access(&b, Access::Unknown);
+        assert_eq!(check(&mut sim), Done::Private(Some((b.clone(), Access::Unknown))));
+        sim.set_access(&a, Access::OtherUser);
+        assert_eq!(check(&mut sim), Done::Private(Some((a.clone(), Access::OtherUser))));
+        sim.set_access(&store, Access::OthersWrite);
+        assert_eq!(check(&mut sim), Done::Private(Some((store.clone(), Access::OthersWrite))));
+        sim.set_access(&store, Access::Alone);
+        sim.set_access(&a, Access::Alone);
+        assert_eq!(check(&mut sim), Done::Private(Some((b, Access::Unknown))));
     }
 
     /// A file's times set: its stamp's mtime is the time given and its change time moves, its

@@ -27,7 +27,7 @@ use blaze_mem::{Tag, frame, scratch};
 use salsa::Durability;
 use span::{FileId, TextSize};
 use triomphe::Arc;
-use vfs::AnchoredPath;
+use crate::{AbsPath, AbsPathBuf, AnchoredPath, VfsPath};
 
 use crate::{
     Crate, CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Files, IncludedFile,
@@ -229,7 +229,7 @@ impl Db {
     }
 
     /// See [`Files::reload_included_file`].
-    pub fn reload_included_file(&mut self, path: &vfs::AbsPath) -> bool {
+    pub fn reload_included_file(&mut self, path: &AbsPath) -> bool {
         let files = Arc::clone(&self.files);
         self.batch(|db| {
             let changed = files.reload_included_file(db, path);
@@ -328,6 +328,20 @@ impl Db {
         (there.source_root_ref(self).file_for_path(&target) == Some(&file)).then_some(file)
     }
 
+    /// The file a source root names at `path`, tracked as [`Db::resolve_path`]'s lookup outside
+    /// the anchor's root is.
+    pub fn file_for_path(&self, path: &VfsPath) -> Option<FileId> {
+        let file = crate::named::lookup(self, path)?;
+        let there = self.source_root(self.file_source_root(file).source_root_id(self));
+        (there.source_root_ref(self).file_for_path(path) == Some(&file)).then_some(file)
+    }
+
+    /// The path the file's source root has it at.
+    pub fn path_for_file(&self, file: FileId) -> Option<&VfsPath> {
+        let root = self.source_root(self.file_source_root(file).source_root_id(self));
+        root.source_root_ref(self).path_for_file(&file)
+    }
+
     /// The file `path` names relative to its anchor, when it is not one of the files of the
     /// VFS, as `krate` reads it (`include_bytes!`, `include_str!`): `None` when the anchor has
     /// no path on disk to be relative to.
@@ -342,7 +356,7 @@ impl Db {
 
     /// The path [`Db::included_file`] reads, as rustc writes it in an error: the anchor's
     /// directory joined with `path`, not normalized.
-    pub fn included_path(&self, path: AnchoredPath<'_>) -> Option<vfs::AbsPathBuf> {
+    pub fn included_path(&self, path: AnchoredPath<'_>) -> Option<AbsPathBuf> {
         let root = self.source_root(self.file_source_root(path.anchor).source_root_id(self));
         let root = root.source_root_ref(self);
         let anchor = root.path_for_file(&path.anchor)?.as_path()?;

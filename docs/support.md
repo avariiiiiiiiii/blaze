@@ -266,7 +266,7 @@ which 92 were supported and 5 refused.
 `blaze` is narrower. Its column was recorded while it still handed builds to cargo. Since
 2026-10-27 it hands none ([#408](https://github.com/indexable-inc/blaze/pull/408),
 [#571](https://github.com/indexable-inc/blaze/pull/571)): what it does not build fails with the
-reason (`refused` in `crates/blaze-cargo/src/cargo/whole.rs`). A cell that says "cargo" or "handed to
+reason (`refused_error` in `crates/blaze-cargo/src/lib.rs`). A cell that says "cargo" or "handed to
 cargo" now means one of the two, and which is unverified.
 
 | Feature | Daemon | `blaze` |

@@ -2,9 +2,11 @@
 //!
 //! A store [`Key`] is a hash: nothing in it says what it was made from. So the rule is
 //! checked where a key is made, from what it was made from: a [`QueryMade`], a [`RunMade`],
-//! a [`FunctionMade`] or a side table of a public function. Each check makes the key again
-//! with the function its owner makes it with (`Key::of`, `blaze_usercode::index`,
-//! `blaze_codegen::query::keys`), so what is checked is what the key is a hash of, and then
+//! a [`FunctionMade`] or [`DevFunctionMade`], a side table of a public function, or a
+//! [`DerivedMade`] from a public front-end value. Each check makes the key again with the
+//! function its owner makes it with (`Key::of`, `blaze_usercode::index`,
+//! `blaze_codegen::query::keys`, `blaze_diagnostics::cache`, `hir_ty::consteval::deps`), so
+//! what is checked is what the key is a hash of, and then
 //! checks every input's [`Origin`]. A dependency's front-end image ([`ImageMade`]) is the one
 //! key not made again here: it is a hash of the crate graph and files only the front end's
 //! database holds, so what it covers comes from the walk that makes it, and is checked the
@@ -23,8 +25,9 @@
 //!
 //! Never public: a workspace member, a path dependency, a git dependency, a registry other
 //! than crates.io, a variable of the machine's environment a run read with a value, a run
-//! that read the whole environment or what can't be traced, a test, and a dev (Cranelift)
-//! function. And whatever the inputs, a value holding a [`Secrets`] entry is never published.
+//! that read the whole environment or what can't be traced, a test, and code compiled for
+//! more than the target's baseline. And whatever the inputs, a value holding a [`Secrets`]
+//! entry is never published.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -35,9 +38,11 @@ use std::{
 use blaze_cas::{Key, Kind};
 use blaze_codegen::{Backend, Instance, InstanceKey, query::keys, settings::Spec, summary::Imports};
 use blaze_core::{Traced, Untraceable};
+use blaze_diagnostics::cache::{self, Inputs};
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 use blaze_usercode::{Given, RunKey, index, trace};
+use hir_ty_borrowck::Mode;
 use memchr::memmem;
 
 use crate::sign::Publisher;
@@ -235,6 +240,34 @@ pub enum ImagePart {
     Slot(ContentId),
     /// The image filed by those names and their values (`hir_def::deps::reads::image_key`).
     Filed(ContentId),
+}
+
+/// A dev function (Cranelift's or copy-and-patch's) as the dev driver keeps it: under
+/// `keys::template(stored(instance, built_in))`. It has no import decisions: those are
+/// release code's.
+#[derive(Clone, Copy, Debug)]
+pub struct DevFunctionMade<'a> {
+    /// The settings its instance's `Settings` are of.
+    pub spec: &'a Spec,
+    pub function: &'a FnSource,
+    /// The bodies its code builds in, in the driver's order.
+    pub built_in: &'a [FnSource],
+}
+
+/// A dependency's front-end result, keyed by its owner from a public base key (a crate's
+/// image key, or its check key) and the further inputs here.
+#[derive(Clone, Copy, Debug)]
+pub enum DerivedMade<'a> {
+    /// The bodies part of a crate's check (`blaze_diagnostics::cache::bodies_key`), from its
+    /// image: `deps` are its dependencies' check keys, in its dependency list's order, each
+    /// proven public. Its key is the crate's check key.
+    Bodies { deps: &'a [Public], borrowck: Mode },
+    /// A crate's check outcome (`blaze_diagnostics::cache::key`), from its check key: the
+    /// lint flags cargo gives and the borrow checker's mode.
+    Outcome(Inputs<'a>),
+    /// The value of a constant of the crate (`hir_ty::consteval::deps::key`), from its check
+    /// key: `item` is the constant's stable key (`hir_def::deps::const_key`).
+    Const { item: ContentId },
 }
 
 /// The hash of a path's components up to and with `component`, from `hash`, theirs before
@@ -438,14 +471,7 @@ impl Rule {
             return Err(private("its settings are not those of the spec given".into()));
         }
         if !matches!(spec.backend, Backend::Llvm { .. }) {
-            return Err(private("it is not compiled by LLVM: only release code is shared".into()));
-        }
-        if spec.toolchain.id != self.toolchain {
-            // alloc: an error's message, made only when it fails.
-            return Err(private(format!(
-                "it is compiled by the toolchain {:x}, not the pinned {:x}",
-                spec.toolchain.id, self.toolchain
-            )));
+            return Err(private("it is not compiled by LLVM: dev code is shown public by `Rule::dev_function`".into()));
         }
         if made.imported.len() != made.imports.imported.len()
             || made.imported.iter().zip(&made.imports.imported).any(|(it, key)| it.instance.key() != *key)
@@ -453,16 +479,89 @@ impl Rule {
             return Err(private("the functions given are not those it imports".into()));
         }
         let all = std::iter::once(made.function).chain(made.built_in).chain(made.imported);
-        for source in all {
+        self.code(spec, all).map_err(private)?;
+        Ok(Public { key, kind: Kind::Code })
+    }
+
+    /// Whether a dev function is public: as [`Rule::function`], under the key the dev driver
+    /// keeps it by, for code compiled for the target's baseline. Code tuned to the machine
+    /// that built it (a `-C target-cpu` or `-C target-feature`, a build run where it is built
+    /// with the host's features) is not: its key is of those features, which no build of
+    /// another machine asks for.
+    pub fn dev_function(&self, made: &DevFunctionMade<'_>) -> Result<Public, Private> {
+        let instance = made.function.instance.key();
+        let stored = with_keys(made.built_in, |built_in| blaze_codegen::driver::stored(instance, built_in));
+        let key = keys::template(&stored);
+        let private = |why: String| Private { key, why };
+        let spec = made.spec;
+        if spec.settings() != made.function.instance.settings {
+            return Err(private("its settings are not those of the spec given".into()));
+        }
+        if matches!(spec.backend, Backend::Llvm { .. }) {
+            return Err(private("it is compiled by LLVM: release code is shown public by `Rule::function`".into()));
+        }
+        if !spec.toolchain.features.is_empty() {
+            // alloc: an error's message, made only when it fails.
+            return Err(private(format!(
+                "it is compiled for {} {}, not the target's baseline",
+                spec.toolchain.cpu,
+                spec.toolchain.features.join(",")
+            )));
+        }
+        self.code(spec, std::iter::once(made.function).chain(made.built_in)).map_err(private)?;
+        Ok(Public { key, kind: Kind::Code })
+    }
+
+    /// What every function's code needs, whatever compiles it: the pinned toolchain, and the
+    /// code and type arguments of each of `sources` from public crates.
+    fn code<'s>(&self, spec: &Spec, sources: impl Iterator<Item = &'s FnSource>) -> Result<(), String> {
+        if spec.toolchain.id != self.toolchain {
+            // alloc: an error's message, made only when it fails.
+            return Err(format!(
+                "it is compiled by the toolchain {:x}, not the pinned {:x}",
+                spec.toolchain.id, self.toolchain
+            ));
+        }
+        for source in sources {
             let what = || source.instance.key().0;
             // alloc: an error's message, made only when it fails.
-            self.origin(&source.code).map_err(|why| private(format!("the code of {:x}: {why}", what())))?;
+            self.origin(&source.code).map_err(|why| format!("the code of {:x}: {why}", what()))?;
             for origin in &source.args {
                 // alloc: an error's message, made only when it fails.
-                self.origin(origin).map_err(|why| private(format!("a type argument of {:x}: {why}", what())))?;
+                self.origin(origin).map_err(|why| format!("a type argument of {:x}: {why}", what()))?;
             }
         }
-        Ok(Public { key, kind: Kind::Code })
+        Ok(())
+    }
+
+    /// Whether a dependency's front-end result made from `base` is public: its key made again
+    /// with its owner's function from `base` and `made`'s further inputs. `base` is a public
+    /// front-end value's key (an image's or a check's), so the crate and its closure are
+    /// covered by it; each further key it names is a [`Public`] too, and the rest (lint flags,
+    /// the borrow checker's mode, a constant's stable key) are settings and names in the key,
+    /// not inputs of the machine.
+    pub fn derived(&self, base: &Public, made: &DerivedMade<'_>) -> Result<Public, Private> {
+        let from = base.key.0;
+        let key = Key(match made {
+            DerivedMade::Bodies { deps, borrowck } => {
+                with_ids(deps, |deps| cache::bodies_key(from, deps, *borrowck))
+            }
+            DerivedMade::Outcome(inputs) => cache::key(from, inputs),
+            DerivedMade::Const { item } => hir_ty::consteval::deps::key(from, *item),
+        });
+        if base.kind != Kind::Query {
+            // alloc: an error's message, made only when it fails.
+            return Err(Private { key, why: format!("it is made from {:x}, which is not a front-end value", base.key.0) });
+        }
+        let deps: &[Public] = match made {
+            DerivedMade::Bodies { deps, .. } => *deps,
+            DerivedMade::Outcome(_) | DerivedMade::Const { .. } => &[],
+        };
+        if let Some(dep) = deps.iter().find(|it| it.kind != Kind::Query) {
+            // alloc: an error's message, made only when it fails.
+            return Err(Private { key, why: format!("a dependency's check key {:x} is not a front-end value", dep.key.0) });
+        }
+        Ok(Public { key, kind: Kind::Query })
     }
 
     /// The side table (debug info, panic locations) of a public function, by its bytes' ID.
@@ -566,6 +665,22 @@ fn with_keys<R>(sources: &[FnSource], f: impl FnOnce(&[InstanceKey]) -> R) -> R 
         *key = source.instance.key();
     }
     f(&keys[..sources.len()])
+}
+
+/// `f` of the content IDs of `keys`, in their order: on the stack for as many dependencies as
+/// most crates have.
+fn with_ids<R>(keys: &[Public], f: impl FnOnce(&[ContentId]) -> R) -> R {
+    const INLINE: usize = 64;
+    if keys.len() > INLINE {
+        // alloc: a crate with more dependencies than are kept inline.
+        let ids: Vec<ContentId> = keys.iter().map(|it| it.key.0).collect();
+        return f(&ids);
+    }
+    let mut ids = [ContentId([0; 32]); INLINE];
+    for (id, key) in ids.iter_mut().zip(keys) {
+        *id = key.key.0;
+    }
+    f(&ids[..keys.len()])
 }
 
 /// What no published value may hold: the publisher's seed, and every value of the
@@ -921,6 +1036,87 @@ mod tests {
             assert!(rule.function(&FunctionMade { imported: &imported, ..made }).is_err());
         }
         assert!(rule.function(&FunctionMade { imported: &[], ..made }).unwrap_err().why.contains("imports"));
+    }
+
+    #[test]
+    fn a_dev_function_of_public_crates_for_the_baseline_is_public_under_its_template_key() {
+        let rule = rule();
+        for backend in [Backend::Cranelift { speed: true }, Backend::Cranelift { speed: false }, Backend::Stencil] {
+            let dev = spec(backend, TOOLCHAIN);
+            let settings = dev.settings();
+            let function = source(10, settings, serde());
+            let built_in = [source(20, settings, Origin::Toolchain(TOOLCHAIN))];
+            let made = DevFunctionMade { spec: &dev, function: &function, built_in: &built_in };
+            let public = rule.dev_function(&made).unwrap();
+            let stored = blaze_codegen::driver::stored(function.instance.key(), &[built_in[0].instance.key()]);
+            assert_eq!((public.key(), public.kind()), (keys::template(&stored), Kind::Code));
+            assert_eq!(rule.side(&ContentId([1; 32]), &public).unwrap().kind(), Kind::Debug);
+
+            let mut native = spec(backend, TOOLCHAIN);
+            native.toolchain.features = vec!["+avx2".into()];
+            let native_fn = source(10, native.settings(), serde());
+            let tuned = DevFunctionMade { spec: &native, function: &native_fn, built_in: &built_in };
+            let why = rule.dev_function(&tuned).unwrap_err().why;
+            assert!(why.contains("baseline") && why.contains("+avx2"), "{why}");
+            assert!(rule.dev_function(&DevFunctionMade { spec: &native, ..made }).unwrap_err().why.contains("settings"));
+
+            let other = spec(backend, ContentId([9; 32]));
+            let other_fn = source(10, other.settings(), serde());
+            let made_other = DevFunctionMade { spec: &other, function: &other_fn, ..made };
+            assert!(rule.dev_function(&made_other).unwrap_err().why.contains("pinned"));
+
+            for private in private_origins() {
+                let built_in = [source(20, settings, private.clone())];
+                assert!(rule.dev_function(&DevFunctionMade { built_in: &built_in, ..made }).is_err(), "{private}");
+                let function = source(10, settings, private.clone());
+                let why = rule.dev_function(&DevFunctionMade { function: &function, ..made }).unwrap_err().why;
+                assert!(why.contains("the code of"), "{private}: {why}");
+            }
+        }
+        let release = spec(Backend::Llvm { opt: 3 }, TOOLCHAIN);
+        let function = source(10, release.settings(), serde());
+        let made = DevFunctionMade { spec: &release, function: &function, built_in: &[] };
+        assert!(rule.dev_function(&made).unwrap_err().why.contains("Rule::function"));
+    }
+
+    #[test]
+    fn a_front_end_result_made_from_a_public_value_is_keyed_as_its_owner_keys_it() {
+        let rule = rule();
+        let crates = [serde()];
+        let out_dirs = [Path::new(OUT)];
+        let base = rule.image(&image(&crates, &out_dirs, &[]), ImagePart::Image).unwrap();
+        let deps = [Public::listed(Key(ContentId([21; 32])), Kind::Query)];
+
+        let bodies = DerivedMade::Bodies { deps: &deps, borrowck: Mode::Nll };
+        let check = rule.derived(&base, &bodies).unwrap();
+        assert_eq!((check.key(), check.kind()), (Key(cache::bodies_key(IMAGE, &[ContentId([21; 32])], Mode::Nll)), Kind::Query));
+        let (again, used) = blaze_alloc_count::measure(|| rule.derived(&base, &bodies).map(|it| it.key()));
+        assert_eq!(again, Ok(check.key()));
+        assert_eq!(used, blaze_alloc_count::Used::default(), "a check key is shown public with no allocation");
+        let polonius = rule.derived(&base, &DerivedMade::Bodies { deps: &deps, borrowck: Mode::Polonius }).unwrap();
+        assert_ne!(polonius.key(), check.key());
+
+        let flags = vec!["-Wunused".to_owned(), "--cap-lints=allow".to_owned()];
+        let inputs = Inputs { lint_flags: &flags, keep_duplicates: false, borrowck: Mode::Nll };
+        let outcome = rule.derived(&check, &DerivedMade::Outcome(inputs)).unwrap();
+        assert_eq!((outcome.key(), outcome.kind()), (Key(cache::key(check.key().0, &inputs)), Kind::Query));
+
+        let item = ContentId([22; 32]);
+        let value = rule.derived(&check, &DerivedMade::Const { item }).unwrap();
+        assert_eq!(value.key(), Key(hir_ty::consteval::deps::key(check.key().0, item)));
+
+        let many: Vec<Public> = (0..100u8).map(|n| Public::listed(Key(ContentId([n; 32])), Kind::Query)).collect();
+        let ids: Vec<ContentId> = many.iter().map(|it| it.key().0).collect();
+        let wide = rule.derived(&base, &DerivedMade::Bodies { deps: &many, borrowck: Mode::Nll }).unwrap();
+        assert_eq!(wide.key(), Key(cache::bodies_key(IMAGE, &ids, Mode::Nll)), "more dependencies than kept inline");
+
+        let code = Public::listed(Key(ContentId([23; 32])), Kind::Code);
+        let error = rule.derived(&code, &DerivedMade::Const { item }).unwrap_err();
+        assert!(error.why.contains("not a front-end value"), "{error}");
+        assert_eq!(error.key, Key(hir_ty::consteval::deps::key(code.key().0, item)));
+        let run = [Public::listed(Key(ContentId([24; 32])), Kind::Run)];
+        let error = rule.derived(&base, &DerivedMade::Bodies { deps: &run, borrowck: Mode::Nll }).unwrap_err();
+        assert!(error.why.contains("a dependency's check key"), "{error}");
     }
 
     #[test]

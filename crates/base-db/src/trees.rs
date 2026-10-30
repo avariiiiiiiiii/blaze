@@ -55,7 +55,7 @@ pub struct Trees {
 }
 
 /// Why a section or one of its entries cannot be read.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)] // clone: an error, cold
 pub struct TreeError(pub String);
 
 impl std::fmt::Display for TreeError {

@@ -63,9 +63,9 @@ run, and the committed fixtures are what holds it now. Part of the self-containe
 - A manifest that does not parse or fit the schema is shown as cargo shows it, a snippet with
   the place marked (`blaze_manifest::diagnostic`).
 
-`blaze` reads the workspace with it (`crates/blaze-cargo/src/cargo/metadata.rs`): every
-command's `cargo metadata --no-deps`, with `--manifest-path` and `--config` as the command was
-given them. A manifest cargo refuses ends the command with cargo's message and status 101.
+`blaze` reads the workspace with it through blaze-units (`crates/blaze-units/src/load/`), with
+`--manifest-path` and `--config` as the command was given them, and runs no cargo. v1, deleted
+on 2026-10-30, read it the same way in place of `cargo metadata --no-deps`.
 
 The daemon's loads read the workspace with `crates/blaze-metadata` (2026-10-25): the root found
 without `cargo locate-project`, every package the lock file locks fetched by blaze-registry
@@ -77,10 +77,9 @@ another member's features reach (axum's examples to `mime_guess` through `tower-
 build scripts the build never ran, and `env!` of their variables failed. A lock file that is
 missing or that the manifests no longer agree with is written as cargo writes it (2026-10-26),
 a registry package it does not pin chosen from the registry's index as cargo chooses it
-(blaze-registry's `IndexRegistry`, #321). What it does not read yet goes to cargo's `cargo
-metadata` with the reason printed: a git or vendored package the lock file does not pin.
-`[replace]` is read as cargo 1.99's `toml::replace` reads it (2026-10-28).
-`BLAZE_OWN_RESOLVE=0` sends every load to cargo.
+(blaze-registry's `IndexRegistry`, #321). v1 handed what it did not read yet (a git or
+vendored package the lock file does not pin) to cargo's `cargo metadata`; the daemon hands
+nothing to cargo. `[replace]` is read as cargo 1.99's `toml::replace` reads it (2026-10-28).
 
 The unit graph is blaze's own (`crates/blaze-units`, 2026-10-27): a port of cargo's unit
 generator (`ops/cargo_compile/unit_generator.rs`), `compiler/unit_dependencies.rs` and the
@@ -187,15 +186,16 @@ crates.io with `library/vendor`) as rust-analyzer's `Sysroot::load_workspace` as
 `--filter-platform` and with each target of `harness/answers.py`. cargo reads the full metadata
 against a copy of the lock file (`CARGO_RESOLVER_LOCKFILE_PATH`); blaze-metadata's
 `metadata_locked` never writes it and refuses a lock file the manifests no longer agree with, as
-`--locked` does. blaze answers rust-analyzer with these (`blaze/src/cargo/metadata.rs`
-`library`, through `OwnMetadata.library`), so loading a workspace runs no cargo for the sysroot.
+`--locked` does. v1 answered rust-analyzer with these (its `cargo/metadata.rs`, through
+project-model's `OwnMetadata.library`, both deleted on 2026-10-30), so loading a workspace ran
+no cargo for the sysroot.
 
 On VM nc-sysroot (Linux arm64), 2026-10-27, with the pinned nightly: 26 of 26 equal (no platform and
 the 12 targets, each `--no-deps` and full; 15 packages without dependencies, 30 to 50 with).
 
 The `toolchain` part asks what a workspace load asked cargo of the toolchain and the
 configuration, of cargo and of `blaze-engine cargo-answer`, which answers it with no cargo run
-(`crates/blaze-cargo/src/answers/cargo.rs` over blaze-manifest): `cargo --version`, `cargo config
+(v1's `answers/cargo.rs` over blaze-manifest, deleted on 2026-10-30): `cargo --version`, `cargo config
 get` as TOML with `--show-origin` and as JSON, `cargo rustc --print cfg -- -O` and `--print
 target-spec-json` for the host and five other targets (and for `build.target`), comparing exit
 code and stdout as text, and, in a tree with a package, the flags cargo hands rustc for each
@@ -229,7 +229,7 @@ missing vendored lolhtml first, blaze-metadata the missing vendored rust-argon2,
 path packages in another order than cargo's resolver asks for them.
 
 The `ctdeps` part (named only: it builds what it compares) holds blaze's own build of a load's
-build scripts and proc macros (`crates/blaze-cargo/src/cargo/compile_time.rs`, in place of
+build scripts and proc macros (v1's `cargo/compile_time.rs`, deleted on 2026-10-30, in place of
 rust-analyzer's `cargo check --compile-time-deps`) to cargo's. For harness/norustc/fixture and
 each bench project, copied into a directory of its own, and for a build and a test load (the
 test adds `--cfg-test`, cargo's `--all-targets`, and the project's `test=[...]` flags of

@@ -141,8 +141,8 @@ pub(super) fn cache_code(
         return Err(format!("`{name}` is not cached: {why}"));
     }
     let mut hasher = rustc_stable_hash::StableSipHasher128::new();
-    (FORMAT, super::target::Target::current().triple(), super::store::toolchain())
-        .hash(&mut hasher);
+    // No toolchain is hashed: the `None` holds its place, which every hash so far was of.
+    (FORMAT, super::target::Target::current().triple(), None::<&str>).hash(&mut hasher);
     closure.checked.hash(&mut hasher);
     for arg in closure.args.as_ref().iter() {
         arg.ty()
@@ -170,9 +170,8 @@ pub(super) fn cache_code(
 ///
 /// A function of crates outside the checkout, instantiated with their types, is hashed by its
 /// stable name and not gone into: the name stands for its code and for all it reaches, as it
-/// does for the store's compiled functions ([`super::cached`]). What a test's hash says of
-/// what is below it, what it reaches of each kind, is kept in the store by the name, so that
-/// a daemon with the store compiles none of it.
+/// does for code of a stable name. What a test's hash says of what is below it, what it
+/// reaches of each kind, is kept by the name for the rest of the process ([`KNOWN`]).
 pub fn tests_reach(
     db: &Db,
     // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
@@ -183,14 +182,14 @@ pub fn tests_reach(
         FORMAT,
         "tests by stable names",
         super::target::Target::current().triple(),
-        super::store::toolchain(),
+        // As in `cache_code`: the place of a toolchain, which is not hashed.
+        None::<&str>,
     );
     let started = std::time::Instant::now();
     let zero = std::time::Duration::ZERO;
     let mut took = [("names", zero), ("nodes", zero), ("below", zero), ("roots", zero)];
     let names = super::stable::StableNames::new(db, symbols, FxHashSet::default(), true);
     took[0].1 = started.elapsed();
-    let store = super::store::Store::global();
     let below_prefix = below_prefix(&header);
     let mut walk = Walk::new(db, false);
     walk.tests = true;
@@ -203,8 +202,8 @@ pub fn tests_reach(
     let mut looked = Vec::new();
     // alloc: reused by every wave
     let mut hashed: Vec<u32> = Vec::new();
-    // In waves of the nodes found and not yet hashed: each is named and looked up in the
-    // store, the code of those to be hashed is compiled on every core, then they are hashed
+    // In waves of the nodes found and not yet hashed: each is named and looked up in
+    // [`KNOWN`], the code of those to be hashed is compiled on every core, then they are hashed
     // in the order found, which is all a hash depends on.
     while next < walk.nodes.len() {
         let end = walk.nodes.len();
@@ -219,7 +218,7 @@ pub fn tests_reach(
             };
             let key = below_key(&below_prefix, &name);
             let before = std::time::Instant::now();
-            let below = Below::known(store, &key);
+            let below = Below::known(&key);
             spent[1] += before.elapsed();
             looked.push(Some((name, key, below)));
         }
@@ -262,19 +261,11 @@ pub fn tests_reach(
         // alloc: once a call, the sealed nodes gone into
         sealed.iter().filter(|(_, it)| it.below.is_none()).map(|(&at, _)| at).collect();
     blaze_ids::radix::sort_copy_by_key(&mut walked, |&it| !it);
-    let added = walked.len();
     for at in walked {
-        // alloc: the entry `KNOWN` and the store keep, once a sealed node gone into
+        // alloc: the entry `KNOWN` keeps, once a sealed node gone into
         let below = Arc::new(below_of(&walk, &sealed, at));
-        Below::keep(store, &sealed[&at].key, &below);
+        Below::remember(&sealed[&at].key, &below);
         sealed.get_mut(&at).unwrap().below = Some(below);
-    }
-    // What a daemon adds is left in the store's open pack, which the next daemon does not
-    // read: sealed now, a daemon that starts later walks none of it again.
-    if added >= SEAL_AFTER
-        && let Some(store) = store
-    {
-        std::thread::spawn(move || store.seal());
     }
     took[2].1 = started.elapsed();
     let mut local: FxHashMap<u32, u32> = FxHashMap::default();
@@ -399,9 +390,9 @@ fn joined(mut path: Vec<Call>, rest: &[Call]) -> Vec<Call> {
 
 /// A node [`tests_reach`] takes whole by its stable name.
 struct Sealed {
-    /// Where the store keeps what is below it.
-    key: [u8; super::store::KEY],
-    /// Read from the store, or found by going into it.
+    /// Where [`KNOWN`] keeps what is below it.
+    key: [u8; 32],
+    /// Known in the process, or found by going into it.
     below: Option<Arc<Below>>,
 }
 
@@ -412,14 +403,8 @@ struct Below {
     found: Vec<Found>,
 }
 
-/// What is below each sealed node this process found or read, by its key: the store gives
-/// only what its sealed packs have, and a pack is sealed once it is full, so what one build
-/// adds is not found there by the next builds of the daemon.
-static KNOWN: LazyLock<Mutex<FxHashMap<[u8; super::store::KEY], Arc<Below>>>> =
-    LazyLock::new(Default::default);
-
-/// How many sealed nodes a walk finds what is below of for the store's open pack to be sealed.
-const SEAL_AFTER: usize = 256;
+/// What is below each sealed node this process found, by its key.
+static KNOWN: LazyLock<Mutex<FxHashMap<[u8; 32], Arc<Below>>>> = LazyLock::new(Default::default);
 
 /// How many sealed nodes [`KNOWN`] keeps before it starts again.
 const KNOWN_AT_MOST: usize = 1 << 20;
@@ -427,97 +412,20 @@ const KNOWN_AT_MOST: usize = 1 << 20;
 impl Below {
     const FORMAT: &str = "below 2";
 
-    /// What is below the sealed node of `key`, as this process or the store has it.
-    fn known(
-        store: Option<&super::store::Store>,
-        key: &[u8; super::store::KEY],
-    ) -> Option<Arc<Below>> {
-        if let Some(it) = KNOWN.lock().unwrap().get(key) {
-            // clone: a reference count, no allocation; the walk keeps it past the lock
-            return Some(it.clone());
-        }
-        // alloc: once a process a key; `Store::get` gives bytes owned, `Found` owns its text
-        let below = Arc::new(Below::read(&store?.get(key)?)?);
-        Below::remember(key, &below);
-        Some(below)
+    /// What is below the sealed node of `key`, as this process has it.
+    fn known(key: &[u8; 32]) -> Option<Arc<Below>> {
+        // clone: a reference count, no allocation; the walk keeps it past the lock
+        KNOWN.lock().unwrap().get(key).cloned()
     }
 
-    /// Keeps what is below the sealed node of `key`, for this process and in the store.
-    fn keep(
-        store: Option<&super::store::Store>,
-        key: &[u8; super::store::KEY],
-        below: &Arc<Below>,
-    ) {
-        if let Some(store) = store {
-            store.insert(key, below.write().as_bytes());
-        }
-        Below::remember(key, below);
-    }
-
-    fn remember(key: &[u8; super::store::KEY], below: &Arc<Below>) {
+    /// Keeps what is below the sealed node of `key`, for this process.
+    fn remember(key: &[u8; 32], below: &Arc<Below>) {
         let mut known = KNOWN.lock().unwrap();
         if known.len() >= KNOWN_AT_MOST {
             known.clear();
         }
         // clone: a reference count, no allocation
         known.insert(*key, below.clone());
-    }
-
-    /// A line for each found: its kind, what, why and each call, all after tabs; where a
-    /// call calls the next follows its name after a `\x1f`.
-    fn write(&self) -> String {
-        let field = |out: &mut String, it: &str| {
-            out.extend(it.chars().map(|c| if matches!(c, '\t' | '\n' | '\x1f') { ' ' } else { c }));
-        };
-        // alloc: the bytes the store keeps, once a sealed node gone into
-        let mut out = String::with_capacity(256);
-        out.push_str(Self::FORMAT);
-        out.push('\n');
-        for it in &self.found {
-            out.push_str(it.kind.name());
-            for text in [&it.what, &it.why] {
-                out.push('\t');
-                field(&mut out, text);
-            }
-            for call in &it.path {
-                out.push('\t');
-                field(&mut out, &call.name);
-                if let Some(at) = &call.at {
-                    out.push('\x1f');
-                    field(&mut out, at);
-                }
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    fn read(bytes: &[u8]) -> Option<Below> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        let mut lines = text.lines();
-        if lines.next()? != Self::FORMAT {
-            return None;
-        }
-        let mut below = Below::default();
-        for line in lines {
-            let mut fields = line.split('\t');
-            let kind = Kind::from_name(fields.next()?)?;
-            // alloc: `Found` owns its text, read once a process a key
-            let what = fields.next()?.to_owned();
-            // alloc: `Found` owns its text, read once a process a key
-            let why = fields.next()?.to_owned();
-            let path = fields
-                .map(|it| match it.split_once('\x1f') {
-                    // alloc: `Call` owns its text, read once a process a key
-                    Some((name, at)) => Call { name: name.to_owned(), at: Some(at.to_owned()) },
-                    // alloc: `Call` owns its text, read once a process a key
-                    None => Call { name: it.to_owned(), at: None },
-                })
-                // alloc: `Found` owns its calls, read once a process a key
-                .collect();
-            below.found.push(Found { kind, what, why, path });
-        }
-        Some(below)
     }
 }
 
@@ -549,7 +457,7 @@ fn below_prefix(header: &impl std::fmt::Debug) -> String {
     format!("tests reach below\n{}\n{header:?}\n", Below::FORMAT)
 }
 
-fn below_key(prefix: &str, name: &str) -> [u8; super::store::KEY] {
+fn below_key(prefix: &str, name: &str) -> [u8; 32] {
     use sha2::Digest;
     sha2::Sha256::new().chain_update(prefix).chain_update(name).finalize().into()
 }
@@ -2590,52 +2498,6 @@ mod tests {
         let other = code(&[0x90, 0x90, 0xc3], Vec::new());
         assert_eq!(hash(&here), hash(&moved));
         assert_ne!(hash(&here), hash(&other));
-    }
-
-    #[test]
-    fn what_is_below_a_sealed_node_reads_back_as_it_was_written() {
-        let call = |name: &str, at: Option<&str>| Call {
-            name: name.to_owned(),
-            at: at.map(str::to_owned),
-        };
-        let found = |kind, what: &str, why: &str, path| Found {
-            kind,
-            what: what.to_owned(),
-            why: why.to_owned(),
-            path,
-        };
-        let below = Below {
-            found: vec![
-                found(
-                    Kind::Fs,
-                    "open",
-                    "it reaches `open`, which reads or writes files",
-                    vec![
-                        call("std::fs::read", Some("library/std/src/fs.rs:300:5")),
-                        call("std::fs::File::open", None),
-                        call("open", None),
-                    ],
-                ),
-                found(
-                    Kind::GlobalState,
-                    "c::N",
-                    "it uses the static `c::N`",
-                    vec![call("f", None)],
-                ),
-            ],
-        };
-        let read = Below::read(below.write().as_bytes()).unwrap();
-        assert_eq!(read.found, below.found);
-        let nothing = Below::read(Below::default().write().as_bytes()).unwrap();
-        assert!(nothing.found.is_empty());
-        // A tab in what is said would start a call of its own.
-        let tabbed = Below {
-            found: vec![found(Kind::Uncompiled, "f", "a\tb", vec![call("f", Some("x\ty"))])],
-        };
-        let read = Below::read(tabbed.write().as_bytes()).unwrap();
-        assert_eq!(read.found[0].why, "a b");
-        assert_eq!(read.found[0].path, vec![call("f", Some("x y"))]);
-        assert!(Below::read(b"below 1\n").is_none());
     }
 
     #[test]

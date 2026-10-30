@@ -20,7 +20,6 @@ salsa.workspace = true
 base-db.workspace = true
 blaze-codegen.workspace = true
 blaze-ids.workspace = true
-blaze-store.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true

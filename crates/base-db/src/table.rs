@@ -65,8 +65,9 @@ impl<T: AsId + FromId + Copy> Column<T> {
         if bits == 0 && raw >= self.words.len() {
             return;
         }
-        while self.words.len() <= raw {
-            self.words.append(AtomicU64::new(0));
+        let len = self.words.len();
+        if len <= raw {
+            self.words.writer().extend_with((raw - len + 1) as usize, |_| AtomicU64::new(0));
         }
         self.words.as_slice()[raw as usize].store(bits, Ordering::Release);
     }

@@ -34,7 +34,7 @@ the standard library is part of a compiler.
   is; `blaze toolchain --path` prints the directory alone.
 - **Bytes:** the upstream nightly's `rustc`, `cargo` and `rust-std` (the host's, and
   `wasm32-wasip1`'s, which proc macros are built for), unchanged, from static.rust-lang.org, each checked against the sha256 compiled into blaze
-  (`crates/blaze-cargo/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
+  (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
   when rustup already has it (the same bytes). The installer downloads it once;
@@ -42,8 +42,8 @@ the standard library is part of a compiler.
 - **The standard library's source** is not the toolchain's `rust-src`, which blaze neither
   downloads nor reads: it is blaze's own `library/` ([below](#the-standard-library-library)).
   A rustup toolchain that has `rust-src` is used without it, `RUST_SRC_PATH` is not read,
-  and a process of blaze's front end with no `BLAZE_LIBRARY` stops with an error naming it
-  rather than looking for a `rust-src` (`crates/project-model/src/sysroot.rs`). Where
+  and the daemon's front end reads the library blaze fetched (`crates/blaze-cargo/src/toolchain/library.rs`,
+  the build's `library` mount) rather than looking for a `rust-src`. Where
   `rust-src` is still installed it is for something that is not blaze: rustc's side of the
   harnesses (`.github/actions/toolchain`, [harness.md](harness.md#running-them)), rust-analyzer
   in an editor of this repository (the dev shell of `flake.nix`), and `harness/library.py`,
@@ -143,7 +143,7 @@ from crates.io so that a cold build needs no network beyond blaze's store, and s
 paths, which panics and `file!()` show, are the ones `rust-src` gives: blaze names a file of
 it `/rustc/<commit>/library/...` as rustc does, wherever it is on disk.
 
-Where blaze reads it (`crates/blaze-cargo/src/cargo/toolchain/library.rs`): it is known by its
+Where blaze reads it (`crates/blaze-cargo/src/toolchain/library.rs`): it is known by its
 digest, `library/DIGEST` (the sha256 of a line per file, `harness/library.py digest` writes
 it), which is compiled into blaze and is what the store keys the standard library by
 (`library=<digest>` in place of the nightly's commit and `rustc_driver` name). Every process

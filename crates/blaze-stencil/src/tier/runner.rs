@@ -32,7 +32,7 @@ impl Default for Config {
 }
 
 /// A recompile that did not happen.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: a failure, once per failed recompile
 pub struct Failure {
     pub function: u32,
     pub to: Tier,
@@ -40,7 +40,7 @@ pub struct Failure {
 }
 
 /// What a closed runner did.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: a run's result, once at its close, inside blaze-lazy's `Closed`
 pub struct Closed {
     /// Every function's tier at the end, by index.
     pub tiers: Vec<Tier>,

@@ -825,7 +825,7 @@ fn read_value<'db, Q: Query>(bytes: &'db [u8]) -> <Q::Value as Persist>::Ref<'db
 pub use blaze_graph::Cancelled;
 
 /// Why a query reran: from it, each edge whose fingerprint differed, back to an input.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)] // clone: an inspection's answer, owned by its caller
 pub struct Why {
     /// The first is what `query` read that changed, the last an input.
     pub chain: Vec<Changed>,

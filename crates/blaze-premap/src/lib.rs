@@ -8,8 +8,10 @@
 //! - [`prelink`]: the image linked by blaze-link at its base, checked ([`Prelink`]).
 //! - [`table`], [`image`]: the image's format: its segments, symbol table by instance key,
 //!   open cells, libraries, init and fini pieces, thread-local template.
-//! - [`map`]: the image as one memory object every run maps at its base.
-//! - [`start`]: what a run does before its entry so image and workspace behave as one link.
+//! - [`map`]: the image as one memory object every run maps at its linked address, inside the
+//!   workspace executable's reservation for fixed maps.
+//! - [`start`]: the image's open cells, bound as a whole link binds them; the rest of a run's
+//!   start is the system loader's, on the executable.
 //! - [`cache`], [`store`], [`dev`]: one image per key on the machine, made again only when
 //!   the key changes, kept in the store.
 //!

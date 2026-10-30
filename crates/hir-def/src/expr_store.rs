@@ -134,7 +134,7 @@ struct ExprRoot {
 
 // We split the store into types-only and expressions, because most stores (e.g. generics)
 // don't store any expressions and this saves memory. Same thing for the source map.
-#[derive(Debug, Clone, PartialEq, Eq)] // clone: inside `ExpressionStore`, until queue 00952
+#[derive(Debug, PartialEq, Eq)]
 struct ExpressionOnlyStore {
     /// The expressions and patterns.
     columns: HirColumns<Frozen>,
@@ -201,7 +201,7 @@ fn kinds_of(expr_kind: &[u8]) -> u64 {
     expr_kind.iter().fold(0, |kinds, &kind| kinds | 1 << kind)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)] // clone: of the empty store only, cold, until queue 00952
+#[derive(Debug, PartialEq, Eq)]
 pub struct ExpressionStore {
     expr_only: Option<Box<ExpressionOnlyStore>>,
     /// The type refs ([`ExpressionStore::type_ref`]).

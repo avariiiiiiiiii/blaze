@@ -8,9 +8,10 @@
 //!
 //! 1. [`plan`]. On [`Plan::Make`], run the job now (the graph has no image yet), finish it,
 //!    plan again; on [`Plan::Wait`], wait for the build making it.
-//! 2. On [`Plan::Link`], link the workspace part with the image's table as its outside
-//!    symbols, and run with the image's maps and [`crate::start::plan`]'s start; run `next`,
-//!    when set, at idle priority and finish it, so the next build links against it.
+//! 2. On [`Plan::Link`], link the workspace executable beside the image (its `View` is the
+//!    link's outside), and run it with the image's fixed maps and the cells
+//!    [`crate::start::plan`] binds; run `next`, when set, at idle priority and finish it, so
+//!    the next build links against it.
 
 use std::sync::Arc;
 

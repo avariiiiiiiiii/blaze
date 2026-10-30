@@ -20,7 +20,7 @@ pub struct Purpose<'a> {
 }
 
 /// Why a build may not compile lazily.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error, once per build, inside `SessionError`
 pub enum Refused {
     /// The build writes `path`: an output is compiled whole.
     Output { profile: String, path: String },

@@ -576,6 +576,8 @@ impl Tags {
 }
 
 enum Op {
+    /// The store's directory checked to be the user's alone, before anything in it is read.
+    Private,
     Head { tier: usize },
     Map { tier: usize, file: FileName, what: Mapped },
     Truncate { pack: usize },
@@ -887,12 +889,26 @@ impl Store {
             periods: 0,
             columns,
         };
-        for tier in 0..store.tiers.len() {
-            let file = store.tiers[tier].file(HEAD_FILE);
-            let tag = store.tags.ask(Op::Head { tier });
+        store.ask_private(effects);
+        store
+    }
+
+    /// Asks that the store's directory be made the user's alone, and checked to be with all in
+    /// it: it keeps machine code that is run, and a value is checked against its own hash,
+    /// never against what its key says made it, so whoever else may write there could plant
+    /// code under any key. A layer is read-only and may be shared, so is not asked of.
+    fn ask_private(&mut self, effects: &mut Vec<Effect>) {
+        let tag = self.tags.ask(Op::Private);
+        // clone: setup, once per open
+        effects.push(Effect::Private { dir: self.config.dir.clone(), tag });
+    }
+
+    fn read_heads(&mut self, effects: &mut Vec<Effect>) {
+        for tier in 0..self.tiers.len() {
+            let file = self.tiers[tier].file(HEAD_FILE);
+            let tag = self.tags.ask(Op::Head { tier });
             effects.push(Effect::ReadAll { file, tag });
         }
-        store
     }
 
     /// Whether it has mapped what it needs to answer gets.
@@ -1553,6 +1569,20 @@ impl Store {
         let Some(op) = self.tags.ops.remove(&completion.tag) else { return Vec::new() };
         let done = completion.done;
         match op {
+            Op::Private => match done {
+                Done::Private(None) => self.read_heads(effects),
+                Done::Private(Some((file, access))) => {
+                    // alloc: the error that breaks the store
+                    self.fail(file, format!("{access}, and the store and all in it must be the user's alone"))
+                }
+                done => {
+                    // clone: the name of what failed, on an error path
+                    let dir = self.config.dir.clone();
+                    if self.retry(&dir, &done) {
+                        self.ask_private(effects);
+                    }
+                }
+            },
             Op::Head { tier } => match done {
                 Done::Read(bytes) => self.read_head(tier, bytes, effects),
                 done => {

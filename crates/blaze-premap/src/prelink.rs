@@ -22,7 +22,8 @@ use crate::key::ImageKey;
 use crate::table::{self, Def, Kind, Strength, SymbolId, TableView};
 
 /// What the prelink links: blaze-link's request (its output is [`output`]: a shared image,
-/// never incremental or live; its `tls_bias` is [`crate::start::TlsReserve`]'s), and
+/// never incremental or live; its `tls_bias` is where the workspace executable's own
+/// thread-local block holds the image's part, [`crate::key::GraphInputs::tls_bias`]), and
 /// codegen's digests of its `functions`, `statics` and `debug_names`, in their order: kept
 /// in the image so a build checks its pieces against it with no hash of its own.
 pub struct Request<'a> {
@@ -185,20 +186,29 @@ pub struct Prelinked {
     pub reached_directly: Vec<String>,
 }
 
-/// The addresses dependency images and the workspace images beside them take: just above
-/// where run processes map other code memory ([`blaze_inproc::BASES`]), so never in its way,
-/// and below the top of a 39-bit address space, the smallest AArch64 Linux configures.
-pub const IMAGES: std::ops::Range<u64> = blaze_inproc::BASES.end..0x80_0000_0000;
+/// The top of a 39-bit address space, the smallest AArch64 Linux configures: no segment of a
+/// dependency image reaches past it.
+pub const END: u64 = 1 << 39;
 
-/// The address every image of an output is placed at: the start of [`IMAGES`], aligned to
-/// 64 KiB, a multiple of every target's page. The workspace image follows it, within reach
-/// of a call.
+/// The linked address every dependency image of an output starts at, one per format and
+/// never per workspace, so every workspace build of a graph shares its image. It is the start
+/// of the workspace executable's reservation for fixed maps (blaze-inproc's `FixedMap`), and
+/// the executable's own segments follow the image's end ([`blaze_link::Image::beside`]), so
+/// calls between the two stay within reach. The image slides with the executable. Each is a
+/// multiple of 64 KiB, every target's mapping granule:
+///
+/// - ELF: 4 MiB, where executables customarily start; the executable's headers go in its own
+///   first segment, after the image;
+/// - Mach-O: 4 GiB, just past `__PAGEZERO`;
+/// - PE: one granule past the executable's base `0x1_4000_0000`, where its headers are.
 pub fn base(format: Format, arch: Arch) -> Result<u64, PremapError> {
     match (format, arch) {
         (Format::Wasm, _) | (_, Arch::Wasm32) => {
             Err(PremapError::of(format_args!("wasm has no dependency image: code is reached by index, not mapped")))
         }
-        _ => Ok(IMAGES.start),
+        (Format::Elf, _) => Ok(0x40_0000),
+        (Format::MachO, _) => Ok(0x1_0000_0000),
+        (Format::Pe, _) => Ok(0x1_4001_0000),
     }
 }
 
@@ -234,10 +244,11 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
         )));
     }
     let page = page(request.link.output.format, request.link.output.arch);
-    if request.link.base % page != 0 || !IMAGES.contains(&request.link.base) {
+    let from = base(request.link.output.format, request.link.output.arch)?;
+    if request.link.base % page != 0 || !(from..END).contains(&request.link.base) {
         return Err(PremapError::of(format_args!(
-            "the image's base {:#x} is not page-aligned in {:#x}..{:#x}",
-            request.link.base, IMAGES.start, IMAGES.end
+            "the image's base {:#x} is not page-aligned in {from:#x}..{END:#x}",
+            request.link.base
         )));
     }
     let placed = linker.prelink(request)?;
@@ -327,12 +338,12 @@ fn check(request: &Request<'_>, placed: &impl Placed, page: u64) -> Result<(), P
         if placed.len(at) > segment.size || segment.size == 0 {
             return fail(format_args!("made a segment at {:#x} of {} bytes in {}", segment.addr, placed.len(at), segment.size));
         }
-        end = match segment.addr.checked_add(segment.size).filter(|end| *end <= IMAGES.end) {
+        end = match segment.addr.checked_add(segment.size).filter(|end| *end <= END) {
             Some(end) => end,
             None => {
                 return fail(format_args!(
-                    "made a segment at {:#x} reaching past {:#x}, where run processes map images",
-                    segment.addr, IMAGES.end
+                    "made a segment at {:#x} reaching past {END:#x}, the top of the smallest address space",
+                    segment.addr
                 ));
             }
         };

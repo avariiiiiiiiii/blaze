@@ -70,6 +70,12 @@ mod unix {
         usize::try_from(n).map_err(|_| io::Error::last_os_error())
     }
 
+    /// The user the process runs as, for what it trusts as its own.
+    pub(crate) fn euid() -> libc::uid_t {
+        // SAFETY: no arguments and no memory; `geteuid` always succeeds.
+        unsafe { libc::geteuid() }
+    }
+
     /// `SIGKILL` to `pid`. Memory-safe for any pid; the caller names a child it has not reaped,
     /// so that the pid is no one else's.
     pub(crate) fn kill(pid: libc::pid_t) {

@@ -1,9 +1,11 @@
 //! A model linker for the tests: it places pieces as blaze-link's layout would (code, then
 //! read-only data and the thread-local template, then data and the open cells, each on its
 //! own page), and links them three ways: as the image ([`Model`], the [`Prelink`] hook), as
-//! the workspace link against an image, and whole. Placement is shared, so what the tests
-//! compare is what premap changes: how references resolve, through the image's table, its
-//! binds and the run's start, against the whole link's one symbol space.
+//! the workspace executable against an image, and whole. Placement is shared, so what the
+//! tests compare is what premap changes: how references resolve, through the image's table,
+//! its binds and the run's start, against the whole link's one symbol space. The workspace
+//! executable carries the image's init pieces and thread-local part for the system loader, as
+//! blaze-link's link beside an image must: [`split`] runs them as that loader does.
 
 use std::collections::BTreeMap;
 
@@ -20,12 +22,19 @@ use crate::prelink::{
     StaticAt, Tls,
 };
 use crate::split::WorkspacePart;
-use crate::start::{self, Start, TlsReserve, WorkspaceLink, workspace_tls_offset};
+use crate::start::{self, Start};
 use crate::table::{Def, Kind, Strength, SymbolId};
 
 /// Every host's mapping granule divides it, so the tests' images map on every host.
 pub(crate) const PAGE: u64 = 64 << 10;
-pub(crate) const RESERVE: TlsReserve = TlsReserve { bias: -(64 << 10), size: 64 << 10, align: 64 };
+/// Where the model's executable keeps the image's thread-locals from the thread pointer.
+pub(crate) const TLS_BIAS: i64 = -(64 << 10);
+
+/// Where the workspace's thread-locals start in the executable's block: after the image's,
+/// at their alignment, as blaze-link's link beside an image puts them.
+fn tls_from(image: Option<&Tls>, align: u64) -> u64 {
+    image.map_or(0, |it| it.size.next_multiple_of(align.max(1)))
+}
 
 /// The shared libraries of the model's run: name and the address it finds.
 pub(crate) type Libraries<'a> = &'a [(&'a str, u64)];
@@ -110,7 +119,7 @@ pub(crate) fn place(from: u64, tls_from: u64, functions: &[&CompiledFunction], s
                 *size
             }
         };
-        let at = StaticAt::ThreadLocal(offset.wrapping_add_signed(RESERVE.bias));
+        let at = StaticAt::ThreadLocal(offset.wrapping_add_signed(TLS_BIAS));
         out_statics.push(PlacedStatic { item: value.item, instance: value.instance, at, size });
     }
     let tls = (!template.is_empty()).then(|| {
@@ -254,7 +263,7 @@ impl Prelink for Model {
     type Placed = Prelinked;
 
     fn prelink(&self, request: &Request<'_>) -> Result<Prelinked, PremapError> {
-        assert_eq!(request.link.tls_bias, RESERVE.bias, "the model's run keeps its thread-locals at its bias");
+        assert_eq!(request.link.tls_bias, TLS_BIAS, "the model's executable keeps the image's thread-locals at its bias");
         let mut layout = place(request.link.base, 0, request.link.functions, request.link.statics);
         let names = layout.names(request.link.names)?;
         let local = |target: &Target| layout.local(target).map(|it| it.0);
@@ -327,7 +336,7 @@ pub(crate) fn whole(
     libraries: Libraries<'_>,
 ) -> Result<Run, PremapError> {
     let mut first = place(base, 0, image.0, image.1);
-    let tls_from = workspace_tls_offset(first.tls.as_ref(), tls_align(workspace.1));
+    let tls_from = tls_from(first.tls.as_ref(), tls_align(workspace.1));
     let mut second = place(first.end.next_multiple_of(PAGE), tls_from, workspace.0, workspace.1);
     let mut names = first.names(image.2)?;
     names.extend(second.names(workspace.2)?);
@@ -379,7 +388,7 @@ fn run(layouts: &[&Layout], memory: Memory, init: Vec<u64>, tls: Vec<(u64, u64, 
 
 /// The workspace link against `image`, and the run's start for it.
 pub(crate) fn link_workspace(part: &WorkspacePart<'_>, image: &View<'_>) -> Result<Layout, PremapError> {
-    let tls_from = workspace_tls_offset(image.tls().as_ref(), tls_align(&part.statics));
+    let tls_from = tls_from(image.tls().as_ref(), tls_align(&part.statics));
     let mut layout = place(image.end().next_multiple_of(PAGE), tls_from, &part.functions, &part.statics);
     let table = image.table();
     let resolved: Vec<(Target, Option<u64>)> = layout
@@ -398,24 +407,9 @@ pub(crate) fn link_workspace(part: &WorkspacePart<'_>, image: &View<'_>) -> Resu
     Ok(layout)
 }
 
-/// The run's start for `image` beside the workspace link `layout`.
-pub(crate) fn start_of<'v>(
-    image: &View<'v>,
-    layout: &'v Layout,
-    names: &'v [(String, Def)],
-    libraries: &'v [Library],
-) -> Result<Start<'v>, PremapError> {
-    let link = WorkspaceLink {
-        names,
-        init: &layout.init,
-        fini: &[],
-        tls: layout.tls,
-        tls_offset: layout.tls.map(|_| layout.tls_from),
-        thread_vars: &[],
-        libraries,
-        unwind: &[],
-    };
-    start::plan(image, &link, &RESERVE)
+/// The run's start for `image` beside the workspace executable whose names are `names`.
+pub(crate) fn start_of<'v>(image: &View<'v>, names: &[(String, Def)]) -> Result<Start<'v>, PremapError> {
+    start::plan(image, names)
 }
 
 /// The names the workspace link defines, sorted, as its layout placed them.
@@ -425,7 +419,9 @@ pub(crate) fn workspace_names(layout: &Layout, part: &WorkspacePart<'_>) -> Resu
 
 /// The split run: the image's segments and the workspace's, the workspace link's open cells
 /// bound against its names, then the image's, then the libraries, the start's writes and
-/// lookups made. Symbols are found where a run finds them: the workspace link's, then the
+/// lookups made. The executable carries both sides' init pieces, which the system loader runs
+/// in the whole link's order, and its thread-local block holds the image's part, then the
+/// workspace's. Symbols are found where a run finds them: the workspace link's, then the
 /// image's table, for every function and static of `keys`.
 pub(crate) fn split(
     image: &View<'_>,
@@ -452,15 +448,20 @@ pub(crate) fn split(
         };
         poke(&mut memory, *cell, value);
     }
-    for (at, value) in &start.writes {
-        poke(&mut memory, *at, *value);
+    for write in &start.writes {
+        poke(&mut memory, write.place, write.value);
     }
     for lookup in &start.lookups {
         let value = library(libraries, lookup.name, lookup.weak)?;
         poke(&mut memory, lookup.place, if value == 0 { 0 } else { value.wrapping_add_signed(lookup.addend) });
     }
-    let init = start.init.iter().map(|it| read(&memory, *it)).collect();
-    let tls = start.tls.iter().map(|it| (it.template, it.size, it.offset)).collect();
+    let mut pieces: Vec<InitEntry> = image.init().chain(layout.init.iter().copied()).collect();
+    pieces.sort_by_key(|it| it.sort_key());
+    let init = pieces.iter().flat_map(|it| (0..u64::from(it.count)).map(|n| read(&memory, it.at + n * 8))).collect();
+    let tls = [(image.tls(), 0), (layout.tls, layout.tls_from)]
+        .into_iter()
+        .filter_map(|(tls, offset)| tls.map(|it| (it.template, it.size, offset)))
+        .collect();
 
     let table = image.table();
     let mut functions = BTreeMap::new();

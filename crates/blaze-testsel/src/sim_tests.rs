@@ -1,10 +1,12 @@
 //! A deterministic simulation of record, edit and select (docs/v2/plan/lanes/fastcompile/
 //! select.md, "Proof"). A program of functions, each version of which calls others (some only
-//! under a bit of an input file it reads), reads or not, and fails or not, is edited at random;
-//! after each edit every test is chosen for, then run for the truth. A test not run must pass
-//! now, and a pass of it must have been kept at the same versions of what it executed and the
-//! same input. A run that ends with its record incomplete keeps its pass under what the test
-//! reaches. A [`Selector`] kept across the edits chooses as the store alone does.
+//! under a bit of an input file it reads), reads or not, fails or not, and observes its own
+//! position or not, is edited at random: a body edited, reverted, or moved by a line added or
+//! removed above it, its code unchanged. After each edit every test is chosen for, then run for
+//! the truth. A test not run must pass now, and a pass of it must have been kept at the same
+//! versions and positions of what it executed and the same input. A run that ends with its
+//! record incomplete keeps its pass under what the test reaches. A [`Selector`] kept across the
+//! edits chooses as the store alone does.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -20,10 +22,7 @@ use crate::{
         tests::{Mem, World},
     },
     selector::Selector,
-    table::{
-        Image, Version,
-        tests::{bound, id},
-    },
+    table::{Bound, Image, Version, tests::id},
 };
 
 const FNS: u32 = 32;
@@ -33,11 +32,13 @@ const TESTS: u32 = 12;
 const DATA: &str = "/ws/sim";
 
 /// What a function does at a version: whom it calls, each under a bit of the input or always;
-/// whether it reads the input; whether it fails.
+/// whether it reads the input; whether it fails; whether what it does depends on its own
+/// position (a `#[should_panic(expected = "src/lib.rs:12")]`, an `assert_eq!(line!(), ..)`).
 struct Body {
     calls: Vec<(u32, Option<u8>)>,
     reads: bool,
     fails: bool,
+    observes: bool,
 }
 
 fn body(n: u32, version: u32) -> Body {
@@ -51,12 +52,22 @@ fn body(n: u32, version: u32) -> Body {
         })
         .collect();
     let reads = rng.below(4) == 0 || calls.iter().any(|it| it.1.is_some());
-    Body { calls, reads, fails: rng.below(29) == 0 }
+    let fails = rng.below(29) == 0;
+    Body { calls, reads, fails, observes: rng.below(5) == 0 }
+}
+
+/// A function's bound code as codegen gives it: of its code and of the positions it names.
+fn placed(n: u32, version: u32, place: u32) -> Bound {
+    let bytes = [n.to_le_bytes(), version.to_le_bytes(), place.to_le_bytes()].concat();
+    Bound(ContentId::of("blaze v2 testsel sim bound 1", &bytes))
 }
 
 #[derive(Clone)]
 struct Program {
     versions: Vec<u32>,
+    /// Each function's positions: what the span tables its code names say, which a line added
+    /// above it in its file moves while its code stays.
+    places: Vec<u32>,
     beside: u32,
 }
 
@@ -69,11 +80,21 @@ struct Truth {
 
 impl Program {
     fn new() -> Program {
-        Program { versions: vec![0; FNS as usize], beside: 0 }
+        Program { versions: vec![0; FNS as usize], places: vec![0; FNS as usize], beside: 0 }
+    }
+
+    /// A line added (or, `back`, removed) above function `from` in its file: it and the three
+    /// after it move, and their code is as it was.
+    fn shift(&mut self, from: usize, back: bool) {
+        for place in &mut self.places[from..(from + 4).min(FNS as usize)] {
+            *place = if back { place.saturating_sub(1) } else { *place + 1 };
+        }
     }
 
     fn image(&self) -> Image {
-        let fns = (0..FNS).map(|n| Version { id: id(n), bound: bound(n, self.versions[n as usize]) }).collect();
+        let fns = (0..FNS)
+            .map(|n| Version { id: id(n), bound: placed(n, self.versions[n as usize], self.places[n as usize]) })
+            .collect();
         Image::new(fns, (0..SLOTS).collect(), ContentId::of("blaze v2 testsel sim beside 1", &self.beside.to_le_bytes())).unwrap()
     }
 
@@ -87,7 +108,7 @@ impl Program {
             }
             let body = body(n, self.versions[n as usize]);
             read |= body.reads;
-            passed &= !body.fails;
+            passed &= !body.fails && !(body.observes && self.places[n as usize] % 4 == 3);
             for (callee, bit) in body.calls {
                 if bit.is_none_or(|bit| (data >> bit) & 1 == 1) {
                     stack.push(callee);
@@ -131,9 +152,10 @@ fn record(truth: &Truth, whole: bool) -> Record {
 
 /// A run, as the simulation remembers it to check a cached result against.
 struct Past {
-    /// Each function it executed, at its version then.
-    executed: Vec<(u32, u32)>,
+    /// Each function it executed, at its version and position then.
+    executed: Vec<(u32, u32, u32)>,
     unlogged: Vec<u32>,
+    unlogged_places: Vec<u32>,
     beside: u32,
     /// The input, when it read it.
     data: Option<u8>,
@@ -143,8 +165,13 @@ struct Past {
 impl Past {
     fn of(program: &Program, truth: &Truth, data: u8) -> Past {
         Past {
-            executed: truth.executed.iter().map(|&n| (n, program.versions[n as usize])).collect(),
+            executed: truth
+                .executed
+                .iter()
+                .map(|&n| (n, program.versions[n as usize], program.places[n as usize]))
+                .collect(),
             unlogged: program.versions[SLOTS as usize..].to_vec(),
+            unlogged_places: program.places[SLOTS as usize..].to_vec(),
             beside: program.beside,
             data: truth.read.then_some(data),
             passed: truth.passed,
@@ -155,8 +182,23 @@ impl Past {
         self.passed
             && self.beside == program.beside
             && self.unlogged == program.versions[SLOTS as usize..]
-            && self.executed.iter().all(|&(n, v)| program.versions[n as usize] == v)
+            && self.unlogged_places == program.places[SLOTS as usize..]
+            && self.executed.iter().all(|&(n, v, p)| program.versions[n as usize] == v && program.places[n as usize] == p)
             && self.data.is_none_or(|it| it == data)
+    }
+}
+
+/// A random edit: the input, the code beside, a revert, a line added or removed above a
+/// function, or a body edited.
+fn edit(rng: &mut Rng, program: &mut Program, data: &mut u8) {
+    let n = rng.below(u64::from(FNS)) as usize;
+    match rng.below(12) {
+        0 => *data = rng.next_u64() as u8,
+        1 => program.beside += 1,
+        2 => program.versions[n] = program.versions[n].saturating_sub(1),
+        3 => program.shift(n, false),
+        4 => program.shift(n, true),
+        _ => program.versions[n] += 1,
     }
 }
 
@@ -202,19 +244,7 @@ fn record_edit_select_never_skips_what_would_run_otherwise() {
                     }
                 }
             }
-            match rng.below(10) {
-                0 => data = rng.next_u64() as u8,
-                1 => program.beside += 1,
-                // Going back: code that was, a revert.
-                2 => {
-                    let n = rng.below(u64::from(FNS)) as usize;
-                    program.versions[n] = program.versions[n].saturating_sub(1);
-                }
-                _ => {
-                    let n = rng.below(u64::from(FNS)) as usize;
-                    program.versions[n] += 1;
-                }
-            }
+            edit(&mut rng, &mut program, &mut data);
         }
     }
     assert!(skipped > ran / 4, "the simulation skips too little to say anything: {skipped} skipped, {ran} ran");
@@ -265,34 +295,29 @@ fn a_selector_chooses_as_the_store_alone_does() {
                     cached += 1;
                 }
             }
-            match rng.below(10) {
-                0 => data = rng.next_u64() as u8,
-                1 => program.beside += 1,
-                2 => {
-                    let n = rng.below(u64::from(FNS)) as usize;
-                    program.versions[n] = program.versions[n].saturating_sub(1);
-                }
-                _ => {
-                    let n = rng.below(u64::from(FNS)) as usize;
-                    program.versions[n] += 1;
-                }
-            }
+            edit(&mut rng, &mut program, &mut data);
         }
     }
     assert!(cached > ran / 4 && ran > 100, "{cached} cached, {ran} ran");
 }
 
 /// Over synthetic histories of one whole pass: the test runs again exactly when a function it
-/// executed changed, the unlogged code changed, or it read the input and the input changed.
+/// executed changed, its code or its positions, the unlogged code changed, or it read the input
+/// and the input changed. A move of functions it did not execute keeps its pass.
 #[test]
 fn a_test_runs_exactly_when_what_it_executed_or_read_changed() {
     let attrs = Attrs::default();
     let (mut cached, mut runs) = (0u32, 0u32);
+    // Of edits that only moved functions: those that kept the pass, and those that ran it.
+    let (mut moved_kept, mut moved_ran) = (0u32, 0u32);
     for seed in 0..600u64 {
         let mut rng = Rng::new(seed ^ 0x5eed);
         let mut program = Program::new();
         for version in &mut program.versions {
             *version = rng.below(3) as u32;
+        }
+        for place in &mut program.places {
+            *place = rng.below(3) as u32;
         }
         let data = rng.next_u64() as u8;
         let root = rng.below(u64::from(SLOTS)) as u32;
@@ -312,10 +337,18 @@ fn a_test_runs_exactly_when_what_it_executed_or_read_changed() {
         let before = program.clone();
         for _ in 0..1 + rng.below(3) {
             let n = rng.below(u64::from(FNS)) as usize;
-            program.versions[n] += 1;
+            match rng.below(2) {
+                0 => program.versions[n] += 1,
+                _ => program.shift(n, rng.below(2) == 0),
+            }
         }
         let now = if rng.below(4) == 0 { rng.next_u64() as u8 } else { data };
-        let changed: Vec<u32> = (0..FNS).filter(|&n| program.versions[n as usize] != before.versions[n as usize]).collect();
+        let changed: Vec<u32> = (0..FNS)
+            .filter(|&n| {
+                let n = n as usize;
+                program.versions[n] != before.versions[n] || program.places[n] != before.places[n]
+            })
+            .collect();
         let should_run = changed.iter().any(|n| truth.executed.binary_search(n).is_ok())
             || changed.iter().any(|&n| n >= SLOTS)
             || (truth.read && now != data);
@@ -326,6 +359,13 @@ fn a_test_runs_exactly_when_what_it_executed_or_read_changed() {
             true => runs += 1,
             false => cached += 1,
         }
+        if !changed.is_empty() && program.versions == before.versions && now == data {
+            match runs_now {
+                true => moved_ran += 1,
+                false => moved_kept += 1,
+            }
+        }
     }
     assert!(cached > 50 && runs > 50, "{cached} cached, {runs} ran");
+    assert!(moved_kept > 10 && moved_ran > 10, "of moves only, {moved_kept} kept the pass and {moved_ran} ran it");
 }

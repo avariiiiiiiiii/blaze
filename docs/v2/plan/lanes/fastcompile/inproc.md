@@ -66,8 +66,31 @@ construction. What blaze adds is one swap of mappings whose bytes are equal.
    pages with the mapping of its object at the linked address plus the slide (Linux `mmap`
    `MAP_FIXED`, macOS `mach_vm_map` with `VM_FLAGS_OVERWRITE`; on Windows the daemon rebuilds
    the image's region, below). The bytes are equal at the moment of the swap: the file was written from the
-   object, and the daemon writes only code no thread can reach yet. The hook says STARTED and
-   returns; the C runtime, the program's initializers and `main` run as anywhere.
+   object, and the daemon writes only code no thread can reach yet.
+7. **The dependency images' open words** (`bind.rs`, queue item 01032). `host::Launch` carries
+   `blaze_premap::start::Start`'s writes and lookups (`ImageWrite`, `ImageLookup`), and the GRANT
+   carries them after the overlays: each write's place, value and whether the value is an
+   address; each lookup's place, addend, weak flag and name (names pooled in one string, at
+   most `MOST_NAME` bytes each, at most `MOST_BINDS` of either; every count is checked against
+   the bytes left before anything is allocated). Every overlay of a fixed map is flagged a
+   dependency image's; decoding refuses the flag on anything else, and refuses a write or
+   lookup that is not 8 bytes whole inside a flagged `Access::Copy` overlay. Before mapping
+   anything the hook refuses a slide other than 0 while a flagged map is in the grant, naming
+   it: the image's words that name its own addresses are linked at its base, and blaze-link
+   lists none for rebasing yet. Once the overlays are mapped it stores each write at
+   `place + slide` (the value plus the slide when it is an address, never for a thread-pointer
+   offset), then resolves each lookup in the process's global scope (`sys::Scope`:
+   `dlsym(RTLD_DEFAULT, ..)` on Linux and macOS, the C name, so a Mach-O name's leading `_`
+   taken off; `GetProcAddress` over `K32EnumProcessModules`' modules in load order on Windows)
+   and stores its address plus the addend. A weak miss stores 0. A strong miss is never stored:
+   the start fails with exit 127, naming the names (the first eight and how many more). Every
+   store is one unaligned 8-byte write (`sys::store_private`) into the run's private copy
+   (`MAP_PRIVATE`, the anonymous copy on macOS, a copy-on-write view on Windows), never the
+   memory object. The hook says STARTED and returns; the C runtime, the program's initializers
+   and `main` run as anywhere.
+
+   `host::Program::command_with` takes the maps, writes and lookups (`Program::command` is it
+   with none); the caller that holds `blaze_premap::map::Memory` and its `Start` passes them.
 
 A hook that can't attach says FAILED (when the channel is up), prints why on stderr and exits
 with 127: a run never runs the file's code in place of the object's. A program started with no

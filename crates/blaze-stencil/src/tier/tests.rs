@@ -55,7 +55,7 @@ fn weighted_counts_saturate() {
 fn tiers_count_except_the_last() {
     assert!(Tier::Stencil.counts() && Tier::Cranelift.counts() && !Tier::Llvm.counts());
     assert_eq!(Tier::Stencil.backend(), Backend::Stencil);
-    assert_eq!(Tier::Cranelift.backend(), Backend::Cranelift);
+    assert_eq!(Tier::Cranelift.backend(), Backend::Cranelift { speed: false });
     assert_eq!(Tier::Llvm.backend(), Backend::Llvm { opt: 3 });
 }
 

@@ -21,6 +21,7 @@
 
 pub mod codec;
 pub mod kinds;
+pub mod section;
 pub mod table;
 
 #[cfg(test)]

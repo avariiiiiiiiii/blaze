@@ -1,6 +1,7 @@
 //! Allocation budgets of the hot paths: an ask of a published function, the frames, and the
-//! plan's lookups allocate nothing; a first ask, once the runner is warm, allocates only the
-//! list of its waiters, and a lone hit, answered by the thread that read it, nothing.
+//! plan's lookups allocate nothing; nor does a first ask once the runner is warm (its waiters
+//! go in the fetcher's slab), a warm round of asks and answers, or a lone hit, answered by the
+//! thread that read it.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -97,12 +98,12 @@ fn an_ask_of_a_published_function_allocates_nothing() {
 }
 
 #[test]
-fn a_first_ask_of_a_warm_runner_allocates_only_its_waiters() {
+fn a_first_ask_of_a_warm_runner_allocates_nothing() {
     let (runner, kept) = runner(2);
     runner.frame(0, ASK_KIND, 1, &wire::ask(1, 0)).unwrap();
     kept.wait(1);
     let asked = wire::ask(2, 1);
-    assert_at_most(1, "a first ask, the runner warm", || runner.frame(0, ASK_KIND, 2, &asked).unwrap());
+    assert_at_most(0, "a first ask, the runner warm", || runner.frame(0, ASK_KIND, 2, &asked).unwrap());
     let (kind, bytes, _) = kept.wait(2);
     assert_eq!(kind, READY_KIND);
     assert_eq!(Frame::decode(&bytes).unwrap(), Frame::Ready { request: 2, lazy: 1, target: target_of(1) });
@@ -117,8 +118,8 @@ impl Compiler for Empty {
         Err(format!("{key:?}: every function is a hit"))
     }
 
-    fn hit(&self, key: InstanceKey) -> Option<CompiledFunction> {
-        Some(CompiledFunction {
+    fn hit(&self, key: InstanceKey) -> Option<Result<CompiledFunction, String>> {
+        Some(Ok(CompiledFunction {
             key,
             arch: Arch::X86_64,
             align: 16,
@@ -131,7 +132,7 @@ impl Compiler for Empty {
             lines: Vec::new(),
             coverage: None,
             profile: None,
-        })
+        }))
     }
 
     fn tier_up(&self, key: InstanceKey, _: Tier) -> Result<CompiledFunction, String> {
@@ -165,7 +166,7 @@ fn a_lone_hit_of_a_warm_runner_allocates_nothing() {
 
 #[test]
 fn the_fetchers_answer_of_a_published_function_allocates_nothing() {
-    let mut fetcher = Fetcher::new(4, 2);
+    let mut fetcher = Fetcher::new(4, 2).unwrap();
     let mut out = Vec::with_capacity(8);
     let to = Waiter { client: 1, seq: 1, request: 1 };
     fetcher.ask(to, 2, &mut out);
@@ -182,6 +183,32 @@ fn the_fetchers_answer_of_a_published_function_allocates_nothing() {
     });
     fetcher.ask(Waiter { seq: 100, ..to }, 2, &mut out);
     assert_eq!(out, [Action::Answer { to: Waiter { seq: 100, ..to }, lazy: 2, outcome: Outcome::Ready(0x1000) }]);
+}
+
+/// Asks of functions not compiled yet, four clients each, then their answers: once the slab,
+/// the map and the queues have held a round, the next rounds allocate nothing.
+#[test]
+fn a_warm_round_of_asks_and_answers_allocates_nothing() {
+    let mut fetcher = Fetcher::new(64, 4).unwrap();
+    let mut out: Vec<Action> = Vec::with_capacity(64);
+    let round = |fetcher: &mut Fetcher, out: &mut Vec<Action>, base: u32| {
+        for lazy in base..base + 8 {
+            for client in 0..4 {
+                fetcher.ask(Waiter { client, seq: lazy, request: u64::from(client) }, lazy, out);
+            }
+        }
+        while let Some((id, _)) = fetcher.next() {
+            fetcher.done(id, Ok(0x1000 + u64::from(id.0)), out);
+        }
+        let answered = out.iter().filter(|it| matches!(it, Action::Answer { outcome: Outcome::Ready(_), .. })).count();
+        out.clear();
+        answered
+    };
+    assert_eq!(round(&mut fetcher, &mut out, 0), 32);
+    let answered = assert_at_most(0, "a warm round of asks and answers", || {
+        round(&mut fetcher, &mut out, 8) + round(&mut fetcher, &mut out, 16)
+    });
+    assert_eq!(answered, 64);
 }
 
 #[test]

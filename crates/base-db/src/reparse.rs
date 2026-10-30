@@ -386,7 +386,7 @@ mod seed_tests {
     use span::Edition;
     use syntax::SourceFile;
     use triomphe::Arc;
-    use vfs::{FileId, VfsPath, file_set::FileSet};
+    use crate::{FileId, FileSet, VfsPath};
 
     use super::{REPARSED, assert_whole};
     use crate::{Db, EditionedFileId, SourceRoot, SourceRootId};

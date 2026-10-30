@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: blaze v2 lane fastcompile, idea 1 (lazy compilation, per function): crates/blaze-lazy, its stubs and resolver per arch, the daemon's single-flight fetcher, what is compiled ahead and why each case is exact, the release refusal, the hooks in inproc, link, codegen and cargo, and the state of the art it matches or beats.
-date: 2026-10-29
+date: 2026-10-30
 ---
 # fastcompile: lazy compilation, per function (`crates/blaze-lazy`)
 
@@ -19,6 +19,7 @@ are compiled whole.
 | `stub` | daemon | One position-independent region per session: the hook's cell, one shared resolver, and 16-byte entries. Generated as bytes for x86-64 (SysV, Win64) and AArch64 (with or without SVE). |
 | `fetch` | daemon | `Fetcher`: a deterministic state machine with single flight, four priorities and failure handling. |
 | `runner` | daemon | `Runner`: the fetcher on worker threads, against `Compiler`, `Placer` and `Answers`. |
+| `compile` | daemon | `Lazily`: the `Compiler` of a run, over a `Source` (codegen's `Later`, the front end and the store, as cargo holds them). |
 | `session` | daemon | `Session`: refusal, plan and stub region together, plus what to fetch first. |
 | `wire` | both | The frames `Ask`, `Ready` and `Failed`, carried in blaze-inproc's `kinds::LAZY` range. |
 | `hook` | run process | `blaze_lazy_resolve(id) -> address`, which the resolver calls. |
@@ -63,6 +64,38 @@ item. The run is stopped once, through `Answers::stop`. A failure nobody called 
 and `Runner::close` reports it. In the run process, a `Failed` answer, a broken channel or an
 answer to another ask writes the reason to stderr and aborts. The resolver never jumps to
 anything the daemon did not publish.
+
+The waiters live in one `blaze_mem` slab per fetcher, a list per function in ask order, with
+room for every inproc ask slot of 4096 run processes. A warm runner's first ask allocates nothing. An ask past
+that room fails, naming the limit, and stops the run.
+
+## The compiler of a run
+
+`Runner` needs a `Compiler` that is `Send + Sync + 'static` and serves every worker at once,
+for the whole run, while the user edits. Codegen's `Build<'a, B>` borrows the front end and
+the backend, and the front end's reader blocks every write (`base_db::Shared::write` waits for
+readers; `Db` has no fork, [db.md](../frontend/db.md)). So no reader is held for the run:
+
+- **Codegen** turns the walk into an owned `Later<I, S>` (`Build::into_later`, queue 01038):
+  the nodes and shapes, generic over the front end's instance and static, with the backend
+  and the front end passed per call.
+- **blaze-lazy** (`compile::Lazily`) takes a reader per compile from its `Source` and lets it
+  go before placement. A write that stops the reader (`Cancelled::PendingWrite`) has the
+  compile run again on the next reader, at most 64 times in a row, then fails naming why.
+  A memo hit takes no reader.
+- **The key decides, not the revision.** A lazy slot never takes a patch's code
+  (`blaze-link`'s `lazy.rs`), so a lazy function's code is the image's for the whole run. A
+  compile at a later revision is exact while the front end still describes the same code and
+  arguments for the function's key. Otherwise codegen refuses it with an error naming the
+  function and both code hashes, and the run stops: never a new body in the old image.
+- **Cargo** (queue 01039) implements `Source` over its unit's front end and the store,
+  launches the run with `Launch::Lazy`, and routes inproc's `kinds::LAZY` frames to
+  `Runner::frame`. There is no lazy flag: a dev `run` or `test` is lazy, a release one is
+  refused (`mode`).
+
+What a compile makes for the store goes to `Source::keep`, so the next build's check reads it.
+A memo hit answered by the reading thread keeps its template only after the askers are
+answered (`Compiler::hit_answered`), off their path.
 
 ## What is compiled ahead, and why each case is exact
 
@@ -127,8 +160,13 @@ inside the hook's ask. That waits on inproc's signal-safe asks (fastcompile-lazy
   identically.
 - `plan` and `refuse`: what is compiled ahead, ids, history, callees, and the release and
   output refusals.
-- `budget`: an ask of a published function, a lone hit, the frames and the plan's lookups
-  allocate nothing; a first ask of a warm runner allocates only its list of waiters.
+- `budget`: an ask of a published function, a lone hit, the frames, the plan's lookups, a
+  first ask of a warm runner and a warm round of asks and answers allocate nothing.
+- `sim` also checks the slab's waiter lists against a list per function, over 200 seeds.
+- `compile`: each compile takes its own reader and lets it go before it returns; a write that
+  stops it has it compiled again, and 64 in a row fail naming why; a refusal keeps nothing; a
+  memo hit takes no reader and keeps its template only once answered; a tier-up follows the
+  same rule; in a run, a function edited before its first call fails and stops the run.
 - `hit`: a lone hit is answered before `Runner::frame` returns and is never compiled. Its
   callees are still prefetched, a miss goes to a worker, and a probe that panics fails the
   function, naming it, and stops the run once. Many threads asking for hits at once start
@@ -144,11 +182,17 @@ inside the hook's ask. That waits on inproc's signal-safe asks (fastcompile-lazy
 - fastcompile-lazy 3 (link): slots that start at entries, the stub region, the `Placer`,
   and the runtime linked into the image.
 - fastcompile-lazy 4 (codegen): a "compile later" walk and `compile_one`.
-- fastcompile-lazy 5 (cargo): dev `run` and `test` take the lazy path. An explicit lazy
+- fastcompile-lazy 5 (cargo): dev `run` and `test` take the lazy path, with no flag. A lazy
   release is an error.
+- queue 01038 (codegen): `Build::into_later`, an owned `Later` whose compiles check the key
+  against the front end before they build.
+- queue 01039 (cargo): `Source` over the unit, `Launch::Lazy`, and inproc's lazy frames routed
+  to the runner.
+- queue 01041 (codegen): `Later::memo_hit` with nothing encoded, and `Later::memo_put` apart.
 - fastcompile-sol-lazy 1 (inproc, done): an asker and the reader spin briefly before they
   sleep.
-- fastcompile-sol-lazy 2 (cargo): `Compiler::hit`, a probe of codegen's memo and the store.
+- fastcompile-sol-lazy 2 (cargo): `Compiler::hit`, a probe of codegen's memo and the store
+  (now `Lazily::hit`, through `Source::memo_hit`).
 - fastcompile-sol-lazy 3 (codegen): `Build::memo_hit`, the probe `hit` wraps.
 
 ## Speed of light
@@ -217,8 +261,9 @@ That is 7.3 µs with a memo hit, 11.3 µs with blaze-stencil (5 µs) and 36.3 µ
   \(S\) and the wakes.
 - **The reader** (inproc's) wakes on the doorbell, scans 64 state words, takes the slot with a
   compare-and-swap and calls `Runner::frame`. That decodes 16 bytes, takes the fetcher's lock,
-  runs `Fetcher::ask` (a hash insert and a waiter push, the one allocation of a first ask,
-  `budget.rs`), counts the compiles it queued and lets the lock go.
+  runs `Fetcher::ask` (a hash insert and a slot taken in the waiters' slab, with no
+  allocation on a warm runner, `budget.rs`), counts the compiles it queued and lets the lock
+  go.
 - **The hand-off to a worker**, changed by this pass:
   - *Before*, it was `notify_all` on the condvar. Every sleeping worker woke, which put a third
     \(W\) on the critical path, and the woken workers all contended for the fetcher's lock.
@@ -227,7 +272,9 @@ That is 7.3 µs with a memo hit, 11.3 µs with blaze-stencil (5 µs) and 36.3 µ
     worker at a time. The reader bumps `jobs` under the lock, so the spinner sees the bump
     within about \(L\) and takes the compile. A sleeping worker is woken (`notify_one`) only
     for a compile no spinner covers.
-- **The worker** takes the lock, calls `Fetcher::next`, lets the lock go, compiles, and places
+- **The worker** takes the lock, calls `Fetcher::next`, lets the lock go, compiles (a memo
+  probe with no reader first, then a reader taken and let go around the compile, about
+  0.1 µs: an atomic check that no write is pending and the front end's handle), and places
   under the placer's lock (held for that one placement). It then takes the lock again for
   `Fetcher::done` and sends the answers.
   - *Before*, the answers waited on the callee scan (with a dedupe quadratic in the number of
@@ -235,7 +282,9 @@ That is 7.3 µs with a memo hit, 11.3 µs with blaze-stencil (5 µs) and 36.3 µ
   - *Now*, the answers go first, and all of that comes after them, off the asker's path.
 - **The answer** goes through `Runs::send`: a lock, a map probe, and the `Sender`'s `Arc`
   cloned and dropped. Then three words go into the slot, the state is stored with release,
-  and the futex wake is the second \(W\).
+  and the futex wake is the second \(W\). inproc makes the `FUTEX_WAKE` on every answer, after
+  the store, so an asker still spinning sees the store within \(L\), and the wake's system call
+  (about 0.3 µs with no sleeper) is the answering thread's, not the asker's.
 
 - **A lone hit skips the worker** (`Compiler::hit`, request `fastcompile-sol-lazy 2`). An ask
   more than 1 µs after the last one (`ALONE`) probes the compiler for code it already has. On
@@ -243,7 +292,9 @@ That is 7.3 µs with a memo hit, 11.3 µs with blaze-stencil (5 µs) and 36.3 µ
   asker directly, never as a waiter. Nothing wakes, no cache line moves to a worker, and
   nothing is allocated (`budget.rs`). A miss costs the probe and one more hold of the lock,
   then goes to a worker as before. Asks closer together than 1 µs are a burst from several
-  threads, and stay with the workers so that they place in parallel.
+  threads, and stay with the workers so that they place in parallel. What the hit keeps for
+  the store (its template's put, about 0.15 µs to encode) comes after the answer
+  (`Compiler::hit_answered`); before it did, a hit was 0.15 µs over the bound below.
 
 **How far it is.** The bound also carries the bookkeeping no design avoids, \(B \approx
 0.1\ \mu s\): claiming a slot, recording the compile once for single flight, and routing the
@@ -263,11 +314,24 @@ sleeping worker adds \(W\).
 
 | compile | in a burst: bound | handed to a worker | now | isolated: bound | before this pass | now |
 |---|---|---|---|---|---|---|
-| memo hit (1 µs) | 1.6 µs | 1.9 µs (+19%) | 1.7 µs (+8%) | 7.4 µs | 10.9 µs (+47%) | 7.5 µs (+2%) |
-| blaze-stencil (5 µs) | 8.5 µs | 8.8 µs (+4%) | 8.8 µs (+4%) | 11.4 µs | 14.9 µs (+31%) | 14.6 µs (+28%) |
-| Cranelift (30 µs) | 33.5 µs | 33.8 µs (+1%) | 33.8 µs (+1%) | 36.4 µs | 39.9 µs (+10%) | 39.6 µs (+9%) |
+| memo hit (1 µs) | 1.6 µs | 1.9 µs (+19%) | 1.7 µs (+6%) | 7.4 µs | 10.9 µs (+47%) | 7.5 µs (+1%) |
+| blaze-stencil (5 µs) | 8.5 µs | 8.8 µs (+4%) | 8.9 µs (+5%) | 11.4 µs | 14.9 µs (+31%) | 14.7 µs (+29%) |
+| Cranelift (30 µs) | 33.5 µs | 33.8 µs (+1%) | 33.9 µs (+1%) | 36.4 µs | 39.9 µs (+10%) | 39.7 µs (+9%) |
 
 A memo hit is answered by the reading thread in both regimes; a compile is a worker's.
+
+Recounted on 2026-10-30, with inproc spinning (`fastcompile-sol-lazy 1`) and the compiler of
+a run (above) in place:
+
+- The asker always rings the doorbell, after it marks its slot asked, so the `send` runs
+  alongside the reader's scan and is off the critical path.
+- A worker's compile now takes a reader and lets it go, about 0.1 µs, which is the 0.1 µs
+  added to the blaze-stencil and Cranelift rows. A memo hit takes none, on either thread.
+- The answer's unconditional `FUTEX_WAKE` is off the asker's path (above). It delays the
+  answering thread's next work by about 0.3 µs.
+- A memo hit's template is kept after the answer. Until codegen splits the put from the hit
+  (queue 01041), `Later::memo_hit` encodes it first, and the burst's memo hit is 1.85 µs
+  (+16%). That gap is codegen's.
 
 An isolated compile still waits on a worker's wake. Every worker is asleep only when no
 compile ended in the 50 µs before the ask, which makes that ask the first of a burst. A run's first calls do come in bursts: its start, each new code
@@ -333,8 +397,9 @@ Take 32 threads, 8 functions, 4 workers and blaze-stencil compiles. The bound is
     30 µs of compile work.
 
 Asks in a burst come closer together than 1 µs (\(r\)), so they stay with the workers. Only
-a burst's first ask can be served by the reader as a lone hit, which delays the rest by one
-placement, about 0.2 µs.
+a burst's first ask can be served by the reader as a lone hit, which delays the rest by its
+placement, its answer's wake and its kept template: about 0.2 + 0.3 + 0.15 µs, under 0.7 µs
+once per burst.
 
 Single flight costs an extra asker only its waiter push and its own answer. `flight.rs`
 checks that 32 threads asking for 8 functions get 8 compiles.

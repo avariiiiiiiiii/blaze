@@ -749,6 +749,7 @@ impl Iocp {
             | Effect::Stat { .. }
             | Effect::List { .. }
             | Effect::Mode { .. }
+            | Effect::Private { .. }
             | Effect::Map { .. }
             | Effect::Stamp { .. }
             | Effect::Entries { .. }) => {

@@ -6,6 +6,9 @@
 //! The steps after an impl look in every impl that matches it: a type's methods may be spread
 //! over several `impl S` blocks.
 
+use std::alloc::Allocator;
+
+use blaze_mem::{Tag, frame};
 use syntax::{
     SyntaxKind,
     view::{self as ast, AstNode as _, Node},
@@ -95,13 +98,12 @@ enum Step<'a> {
     Named { kind: Option<Kind>, name: &'a str },
     /// The impls whose type, and trait if any, read `ty` and `of` with whitespace removed; the
     /// `nth` of them when given.
-    Impl { ty: String, of: Option<String>, nth: Option<usize> },
+    Impl { ty: &'a str, of: Option<&'a str>, nth: Option<usize> },
 }
 
-/// `path` cut at each `::` outside angle brackets (an `->`'s `>` closes none).
-fn split(path: &str) -> Result<Vec<&str>, String> {
+/// `path` cut at each `::` outside angle brackets (an `->`'s `>` closes none), into `parts`.
+fn split<'p>(path: &'p str, parts: &mut Vec<&'p str, impl Allocator>) -> Result<(), String> {
     let bytes = path.as_bytes();
-    let mut parts = Vec::with_capacity(4);
     let mut depth = 0u32;
     let mut start = 0;
     let mut at = 0;
@@ -112,7 +114,7 @@ fn split(path: &str) -> Result<Vec<&str>, String> {
             b'>' => {
                 depth = depth
                     .checked_sub(1)
-                    .ok_or_else(|| format!("`{path}` closes an angle bracket it never opened"))?;
+                    .ok_or_else(|| format!("`{path}` closes an angle bracket it never opened"))?; // alloc: error path
             }
             b':' if depth == 0 && bytes.get(at + 1) == Some(&b':') => {
                 parts.push(&path[start..at]);
@@ -125,19 +127,29 @@ fn split(path: &str) -> Result<Vec<&str>, String> {
         at += 1;
     }
     if depth != 0 {
-        return Err(format!("`{path}` leaves an angle bracket open"));
+        return Err(format!("`{path}` leaves an angle bracket open")); // alloc: error path
     }
     parts.push(&path[start..]);
-    Ok(parts)
+    Ok(())
 }
 
 fn squeeze(text: &str) -> String {
-    text.chars().filter(|it| !it.is_whitespace()).collect()
+    text.chars().filter(|it| !it.is_whitespace()).collect() // alloc: the path `of` writes back
 }
 
-/// Whether `text` with its whitespace removed is `squeezed`.
-fn squeezes_to(text: &str, squeezed: &str) -> bool {
-    text.chars().filter(|it| !it.is_whitespace()).eq(squeezed.chars())
+/// Whether `text` and `want` read the same with their whitespace removed ([`squeeze`] of both,
+/// compared without making either).
+pub(crate) fn same_squeezed(text: &str, want: &str) -> bool {
+    let squeezed = |text: &str| text.chars().filter(|it| !it.is_whitespace());
+    squeezed(text).eq(squeezed(want))
+}
+
+/// Whether `text` is `n` as `usize`'s `to_string` writes it.
+fn is_decimal(text: &str, n: usize) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|it| it.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'))
+        && text.parse::<usize>() == Ok(n)
 }
 
 fn strip_raw(name: &str) -> &str {
@@ -147,37 +159,37 @@ fn strip_raw(name: &str) -> &str {
 fn step<'p>(part: &'p str, path: &str) -> Result<Step<'p>, String> {
     let part = part.trim();
     if part.is_empty() {
-        return Err(format!("`{path}` has an empty step"));
+        return Err(format!("`{path}` has an empty step")); // alloc: error path
     }
     if part.starts_with('<') {
         let (body, nth) = match part.rsplit_once(">@") {
             Some((body, nth)) => {
                 let nth = nth
                     .parse::<usize>()
-                    .map_err(|_| format!("`{part}` in `{path}`: `@` takes a number"))?;
+                    .map_err(|_| format!("`{part}` in `{path}`: `@` takes a number"))?; // alloc: error path
                 (&body[1..], Some(nth))
             }
             None => {
                 let body = part
                     .strip_suffix('>')
-                    .ok_or_else(|| format!("`{part}` in `{path}` opens an impl it never closes"))?;
+                    .ok_or_else(|| format!("`{part}` in `{path}` opens an impl it never closes"))?; // alloc: error path
                 (&body[1..], None)
             }
         };
         let (ty, of) = match top_level_as(body) {
-            Some(at) => (&body[..at], Some(squeeze(&body[at + 4..]))),
+            Some(at) => (&body[..at], Some(&body[at + 4..])),
             None => (body, None),
         };
-        let ty = squeeze(ty);
-        if ty.is_empty() || of.as_deref() == Some("") {
-            return Err(format!("`{part}` in `{path}` names no type"));
+        let blank = |text: &str| text.chars().all(char::is_whitespace);
+        if blank(ty) || of.is_some_and(blank) {
+            return Err(format!("`{part}` in `{path}` names no type")); // alloc: error path
         }
         return Ok(Step::Impl { ty, of, nth });
     }
     match part.split_once(char::is_whitespace) {
         Some((keyword, name)) => {
             let kind = Kind::by_keyword(keyword).ok_or_else(|| {
-                format!("`{part}` in `{path}`: `{keyword}` is no kind of item (fn, struct, mod, …)")
+                format!("`{part}` in `{path}`: `{keyword}` is no kind of item (fn, struct, mod, …)") // alloc: error path
             })?;
             Ok(Step::Named { kind: Some(kind), name: name.trim() })
         }
@@ -236,9 +248,9 @@ pub fn name_of(member: Node<'_>) -> Option<String> {
             .children()
             .filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD)
             .position(|it| it == member)?;
-        return Some(at.to_string());
+        return Some(at.to_string()); // alloc: the path `of` writes back
     }
-    Some(own_name(member)?.to_owned())
+    Some(own_name(member)?.to_owned()) // alloc: the path `of` writes back
 }
 
 /// The text of a member's name, for one with a name.
@@ -255,15 +267,26 @@ fn impl_of(member: Node<'_>) -> Option<(String, Option<String>)> {
     Some((ty, of))
 }
 
-/// Whether `member` is an impl whose type and trait, whitespace removed, are `ty` and `of`.
+/// Whether `member` is an impl whose type and trait, whitespace removed, are `ty` and `of`'s.
 fn impl_is(member: Node<'_>, ty: &str, of: Option<&str>) -> bool {
     let Some(imp) = ast::Impl::cast(member) else { return false };
-    imp.self_ty().is_some_and(|it| squeezes_to(it.syntax().text(), ty))
+    imp.self_ty().is_some_and(|it| same_squeezed(it.syntax().text(), ty))
         && match (imp.trait_(), of) {
             (None, None) => true,
-            (Some(its), Some(of)) => squeezes_to(its.syntax().text(), of),
+            (Some(its), Some(of)) => same_squeezed(its.syntax().text(), of),
             _ => false,
         }
+}
+
+/// Whether `member` goes by `name`: [`name_of`] compared without making its `String`.
+fn name_is(member: Node<'_>, name: &str) -> bool {
+    let name = strip_raw(name);
+    if member.kind() == SyntaxKind::TUPLE_FIELD {
+        let Some(list) = member.parent() else { return false };
+        let at = list.children().filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD).position(|it| it == member);
+        return at.is_some_and(|at| is_decimal(name, at));
+    }
+    own_name(member).is_some_and(|it| strip_raw(it) == name)
 }
 
 fn matches(member: Node<'_>, step: &Step<'_>) -> bool {
@@ -271,67 +294,65 @@ fn matches(member: Node<'_>, step: &Step<'_>) -> bool {
         Step::Named { kind, name } => {
             kind.is_none_or(|kind| Kind::of(member.kind()) == Some(kind))
                 && member.kind() != SyntaxKind::IMPL
-                && match member.kind() {
-                    SyntaxKind::TUPLE_FIELD => name_of(member).is_some_and(|it| it == strip_raw(name)),
-                    _ => own_name(member).is_some_and(|it| strip_raw(it) == strip_raw(name)),
-                }
+                && name_is(member, name)
         }
-        Step::Impl { ty, of, .. } => impl_is(member, ty, of.as_deref()),
+        Step::Impl { ty, of, .. } => impl_is(member, ty, *of),
     }
 }
 
 fn describe(node: &Node<'_>) -> String {
     let kind = Kind::of(node.kind()).map_or("item", Kind::keyword);
-    format!("{kind} at byte {}", u32::from(node.text_range().start()))
+    format!("{kind} at byte {}", u32::from(node.text_range().start())) // alloc: error path
 }
 
 /// The one node `path` names in the file whose tree is `root`.
 pub fn find<'t>(root: Node<'t>, path: &str) -> Result<Node<'t>, String> {
-    let mut frontier = vec![root];
-    let parts = split(path)?;
-    for (at, part) in parts.iter().enumerate() {
-        let step = step(part, path)?;
-        let mut found: Vec<Node<'t>> = frontier
-            .iter()
-            .flat_map(|it| members(*it))
-            .filter(|member| matches(*member, &step))
-            .collect();
-        if let Step::Impl { nth: Some(nth), .. } = step {
-            let count = found.len();
-            let one = found.get(nth).copied().ok_or_else(|| {
-                format!("`{path}` asks for impl {nth} of `{part}`, and the file has {count}")
-            })?;
+    frame::task(Tag::Api, |temp| -> Result<Node<'t>, String> {
+        let mut parts = Vec::with_capacity_in(4, temp);
+        split(path, &mut parts)?;
+        let (mut frontier, mut found) = (Vec::with_capacity_in(4, temp), Vec::with_capacity_in(4, temp));
+        frontier.push(root);
+        for (at, part) in parts.iter().enumerate() {
+            let step = step(part, path)?;
             found.clear();
-            found.push(one);
-        }
-        let last = at + 1 == parts.len();
-        match (found.len(), &step) {
-            (0, _) => {
-                let within = parts[..at].join("::");
-                let within = if within.is_empty() { "the file".to_owned() } else { format!("`{within}`") };
-                return Err(format!("no `{part}` in {within}"));
+            found.extend(frontier.iter().flat_map(|it| members(*it)).filter(|member| matches(*member, &step)));
+            if let Step::Impl { nth: Some(nth), .. } = step {
+                let count = found.len();
+                if nth >= count {
+                    return Err(format!("`{path}` asks for impl {nth} of `{part}`, and the file has {count}")); // alloc: error path
+                }
+                found.swap(0, nth);
+                found.truncate(1);
             }
-            (1, _) => {}
-            (_, Step::Impl { .. }) if !last => {}
-            _ => {
-                let all: Vec<String> = found.iter().map(describe).collect();
-                return Err(format!(
-                    "`{}` names {} items: {}; lead the step with its kind (`fn {part}`) or, for \
-                     an impl, add `@n`",
-                    parts[..=at].join("::"),
-                    found.len(),
-                    all.join(", ")
-                ));
+            let last = at + 1 == parts.len();
+            match (found.len(), &step) {
+                (0, _) => {
+                    let within = parts[..at].join("::");
+                    let within = if within.is_empty() { "the file".to_owned() } else { format!("`{within}`") }; // alloc: error path
+                    return Err(format!("no `{part}` in {within}")); // alloc: error path
+                }
+                (1, _) => {}
+                (_, Step::Impl { .. }) if !last => {}
+                _ => {
+                    let all: Vec<String> = found.iter().map(describe).collect(); // alloc: error path
+                    return Err(format!(
+                        "`{}` names {} items: {}; lead the step with its kind (`fn {part}`) or, for \
+                         an impl, add `@n`",
+                        parts[..=at].join("::"),
+                        found.len(),
+                        all.join(", ")
+                    ));
+                }
             }
+            std::mem::swap(&mut frontier, &mut found);
         }
-        frontier = found;
-    }
-    Ok(frontier.into_iter().next().expect("a path's last step found one node"))
+        Ok(frontier[0])
+    })
 }
 
 /// The path [`find`] takes back to `node`, a member of a chain of containers up to the file.
 pub fn of(node: Node<'_>) -> String {
-    let mut steps: Vec<String> = Vec::new();
+    let mut steps: Vec<String> = Vec::new(); // alloc: the path `of` writes back
     let mut at = Some(node);
     while let Some(node) = at {
         let parent = container_of(node);
@@ -366,20 +387,20 @@ fn step_of<'t>(node: Node<'t>, container: Option<Node<'t>>) -> String {
     let siblings = || container.into_iter().flat_map(members);
     if let Some((ty, of)) = impl_of(node) {
         let text = match &of {
-            Some(of) => format!("<{ty} as {of}>"),
-            None => format!("<{ty}>"),
+            Some(of) => format!("<{ty} as {of}>"), // alloc: the path `of` writes back
+            None => format!("<{ty}>"), // alloc: the path `of` writes back
         };
         let alike = || siblings().filter(|it| impl_is(*it, &ty, of.as_deref()));
         if alike().count() > 1 {
             let nth = alike().position(|it| it == node).expect("an impl is its own sibling");
-            return format!("{text}@{nth}");
+            return format!("{text}@{nth}"); // alloc: the path `of` writes back
         }
         return text;
     }
     let name = name_of(node).unwrap_or_default();
     let same = siblings().filter(|it| it.kind() != SyntaxKind::IMPL && named_exactly(*it, &name)).count();
     match Kind::of(node.kind()) {
-        Some(kind) if same > 1 => format!("{} {name}", kind.keyword()),
+        Some(kind) if same > 1 => format!("{} {name}", kind.keyword()), // alloc: the path `of` writes back
         _ => name,
     }
 }

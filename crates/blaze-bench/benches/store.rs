@@ -1,5 +1,4 @@
-//! The store's hot paths: the key a function is kept under, the key a value is kept under, a
-//! put, and a read of the store that finds a value (checked against its content hash) or does
+//! The store's hot paths: the key a value is kept under, a put, and a read of the store that finds a value (checked against its content hash) or does
 //! not, of a store committed to disk.
 //!
 //! Every benchmark does the same work on every run, so that tango can pair the binary of a
@@ -9,12 +8,7 @@ use std::hint::black_box;
 
 use blaze_cas::{Driven, Handle, Key, Kind};
 use blaze_ids::ContentId;
-use hir_ty_codegen::bench::entry_key;
 use tango_bench::{IntoBenchmarks, benchmark_fn, tango_benchmarks};
-
-/// A name as long as a mangled generic function's.
-const NAME: &str = "_ZN4core4iter6traits8iterator8Iterator4fold17h0123456789abcdefE\
-                    <alloc::vec::into_iter::IntoIter<u32>, usize, closure>";
 
 /// What the store holds when the benchmarks read it: a thousand values of 512 bytes.
 const COUNT: usize = 1000;
@@ -56,10 +50,6 @@ impl Filled {
 
 fn benchmarks() -> impl IntoBenchmarks {
     [
-        benchmark_fn("key/entry", |b| {
-            let program = [7; 32];
-            b.iter(move || entry_key(black_box(NAME), false, &program))
-        }),
         benchmark_fn("key/of", |b| {
             let producer = producer();
             let input = ContentId::of("blaze-bench store input 1", b"an input");

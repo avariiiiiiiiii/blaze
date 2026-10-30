@@ -10,7 +10,7 @@ use blaze_dbsp::Work;
 use salsa::Durability;
 use span::Edition;
 use triomphe::Arc;
-use vfs::{AbsPathBuf, FileId, VfsPath, file_set::FileSet};
+use crate::{AbsPathBuf, FileId, FileSet, VfsPath};
 
 use crate::{
     CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, Env, SourceRoot, SourceRootId,

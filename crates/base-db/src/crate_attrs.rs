@@ -22,7 +22,7 @@ use blaze_mem::{Frame, Tag, frame};
 use salsa::Durability;
 use smallvec::SmallVec;
 use syntax::{LexedStr, SourceFile, SyntaxKind, T, TextRange, TextSize};
-use vfs::FileId;
+use crate::FileId;
 
 use crate::{
     Crate, Db, EditionedFileId, FileSourceRootInput, FileText, Files, relevant_crates,

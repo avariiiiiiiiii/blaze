@@ -65,7 +65,7 @@ from typed_input import fail, parse
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PIN = os.path.join(HERE, "toolchain")
-PINS = os.path.join(ROOT, "crates/blaze-cargo/src/cargo/toolchain/pins.txt")
+PINS = os.path.join(ROOT, "crates/blaze-cargo/src/toolchain/pins.txt")
 DIST = "https://static.rust-lang.org/dist"
 RUST = "https://github.com/rust-lang/rust"
 CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "blaze-bump")

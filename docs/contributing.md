@@ -109,7 +109,7 @@ itself is built with that nightly (`cargo +"$(cat harness/toolchain)"`; in `nix 
 plain `cargo` is it), and so are the harnesses' reference builds. The pin is written in that
 one file; everything else reads it or is written from it:
 
-- `crates/blaze-cargo/src/cargo/toolchain/pins.txt` (by `harness/toolchain_pins.py '{"write": true}'`): the
+- `crates/blaze-cargo/src/toolchain/pins.txt` (by `harness/toolchain_pins.py '{"write": true}'`): the
   sha256 and size of each file blaze downloads as its own toolchain, the nightly's `rustc -V`
   line and its rust-lang/rust commit. A rustc is taken for the pinned one by that whole line,
   since every nightly of a release has the same number.
@@ -326,7 +326,7 @@ make the stencils. The flake's dev shell fetches it (the flake's `blaze-llvm`) a
 Outside the shell, fetch the same archive and point the build at it, as CI's merge gate does
 (`.github/actions/blaze`). It goes below `/usr/local/lib`: llvm-sys's build script names the
 prefix's `lib` to the linker, and a build script in blaze's sandbox may name only a system
-directory of libraries (`crates/blaze-cargo/src/cargo/directives.rs`, `SYSTEM`), so `blaze
+directory of libraries (`crates/blaze-cargo/src/directives.rs`, `SYSTEM`), so `blaze
 build` refuses a prefix in your home directory.
 
     sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm

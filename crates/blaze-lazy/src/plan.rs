@@ -76,7 +76,7 @@ impl std::error::Error for PlanError {}
 
 /// A lazy build's functions: the ones compiled ahead, and the lazy ones by [`LazyId`], in
 /// columns. Lookups by key hash once; by code hash binary-search a sorted column.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Plan {
     ahead: Vec<(InstanceKey, Ahead)>,
     keys: Vec<InstanceKey>,

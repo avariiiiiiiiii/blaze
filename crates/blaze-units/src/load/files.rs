@@ -728,8 +728,8 @@ pub fn normal_text(path: &str) -> String {
 mod normal_text_tests {
     use super::normal_text;
 
-    /// load-cargo's `normalize` of `crates/load-cargo/src/v2/files.rs`, kept to check the one
-    /// that replaced it and blaze-units' `load/source/tree.rs` copy.
+    /// The `normalize` of load-cargo's v2 `files.rs` (deleted 2026-10-30), kept to check the
+    /// one that replaced it and blaze-units' `load/source/tree.rs` copy.
     fn load_cargo(path: &str) -> String {
         let (root, rest) = match path.strip_prefix('/') {
             Some(rest) => ("", rest),

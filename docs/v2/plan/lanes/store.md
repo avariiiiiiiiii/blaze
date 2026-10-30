@@ -20,8 +20,13 @@ Part of the [v2 plan](../../plan.md). Section numbers refer to the plan as first
 - **The user's alone**: the store refuses a directory of another user or one others may write
   to, and reads no pack or file others may write to, as v1's did: a value is checked against its
   own hash, never against what its key says made it, and the store keeps machine code that is
-  run (`Kind::Machine`). Not done yet: it needs `blaze_core` to say who owns a file and who may
-  write it (queue 00999).
+  run (`Kind::Machine`). `Store::open` asks `blaze_core::Effect::Private` of its directory
+  before reading anything in it. That effect makes the directory 0o700 if it is missing, refuses
+  it if another user owns it or others may write it, closes it to the group and others (Unix),
+  then refuses any file under it, links followed, that is another user's or others may write.
+  A file's group write bit (a 002 umask) is refused only while the directory lets its group in.
+  On Windows it reads the owner and the access list, as v1's `acl.rs` did. A layer is read-only
+  and may be shared, so it is not checked; nothing outside tests configures one yet.
 - **Remote** is a read-through tier for machines outside the pool (a laptop) only, never on the
   hot path of the VM. Supersedes the per-job, per-pin remote naming (#1481).
 

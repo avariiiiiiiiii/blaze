@@ -14,6 +14,8 @@
 //! with only pieces whose keys tie compared by their symbols' contents. Classes are a dense
 //! index and sort in parallel.
 
+use std::sync::Arc;
+
 use blaze_ids::radix;
 use blaze_mem::align::align_up_u64;
 use rayon::prelude::*;
@@ -281,7 +283,7 @@ impl<'a> Stage<'a> {
     /// Room for the zero length after the call frame entries just placed at the end of the
     /// patch code region `space`: the stage's [`Stage::frames_end`].
     fn end_frames(&mut self, space: usize) -> Result<(), LinkError> {
-        let region = &mut self.new.spaces[space].region;
+        let region = &mut Arc::make_mut(&mut self.new.spaces)[space].region;
         let at = align_up_u64(region.addr + region.size, 4) - region.addr;
         if at + 4 > region.capacity {
             return Err(error(
@@ -577,7 +579,8 @@ impl<'a> Stage<'a> {
             }
             self.write.extend(ids);
         }
-        self.new.spaces = spaces;
+        // alloc: once per full layout, the list's shared home
+        self.new.spaces = Arc::new(spaces);
         self.new.laid_out = true;
         self.tls();
         Ok(())
@@ -669,7 +672,7 @@ impl<'a> Stage<'a> {
                     ));
                 }
                 let addr = region.addr + at;
-                self.new.spaces[space].region.size = end;
+                Arc::make_mut(&mut self.new.spaces)[space].region.size = end;
                 let hot = self.new.hot_mut(id);
                 hot.addr = addr;
                 hot.region = space as u32;
@@ -758,9 +761,12 @@ impl<'a> Stage<'a> {
             hot.set_zero(zero);
         }
         let old = self.new.spaces[space].region.size;
-        self.new.spaces[space].region.size = size;
-        if size < old && !zero {
-            self.new.spaces[space].bytes.resize(size as usize);
+        if size != old {
+            let space = &mut Arc::make_mut(&mut self.new.spaces)[space];
+            space.region.size = size;
+            if size < old && !zero {
+                space.bytes.resize(size as usize);
+            }
         }
         Ok(())
     }

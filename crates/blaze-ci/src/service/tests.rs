@@ -968,7 +968,7 @@ impl OldReport {
 #[test]
 fn a_report_in_one_string_a_list_summarizes_as_one_string_an_item_did() {
     let mut rng = SplitMix64::new(0x5eed_0f_5e1f);
-    let outputs = ["", "ok\n", "a```b\nline two\r\n\n", "é\xff\n", "panicked at src/lib.rs:3:5\n"];
+    let outputs = ["", "ok\n", "a```b\nline two\r\n\n", "é\u{ff}\n", "panicked at src/lib.rs:3:5\n"];
     for round in 0..300 {
         let (mut new, mut old) = (Report::default(), OldReport::default());
         let count = if round % 10 == 0 { 2 * MOST_LISTED + 20 } else { rng.index(30) };

@@ -67,7 +67,7 @@ pub struct Cached {
     pub basis: Basis,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Choice {
     /// It runs; `expected` is how long it took when it last ran, if it has.
     Run { why: Why, expected: Option<Duration> },
@@ -76,7 +76,7 @@ pub enum Choice {
 
 /// Why a test runs (`--explain`): of the newest run in its history, unless an older one says
 /// more.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Why {
     /// It has never run here.
     New,

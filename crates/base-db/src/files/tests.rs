@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
 use blaze_mem::{Frame, Tag, frame};
 use rustc_hash::FxHashMap;
-use vfs::{FileId, VfsPath};
+use crate::{FileId, VfsPath};
 
 use super::{MAX_DEPTH, NO_NODE, RootContent, digit};
 use crate::{SourceRoot, SourceRootId, content};

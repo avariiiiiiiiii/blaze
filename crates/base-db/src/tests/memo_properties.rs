@@ -4,7 +4,7 @@
 use hegel::{Hegel, Settings, TestCase};
 use hegel::generators as gs;
 use salsa::{Database as _, Durability};
-use vfs::FileId;
+use crate::FileId;
 
 use crate::{Db, FileText};
 

@@ -82,7 +82,7 @@ impl Tier {
     pub fn backend(self) -> Backend {
         match self {
             Tier::Stencil => Backend::Stencil,
-            Tier::Cranelift => Backend::Cranelift,
+            Tier::Cranelift => Backend::Cranelift { speed: false },
             Tier::Llvm => Backend::Llvm { opt: 3 },
         }
     }

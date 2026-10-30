@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::Duration;
 
 pub(crate) use super::unix::{
-    Bells, Errno, Listener, Stream, backtrace, connect, hung_up, random, ring, serialize, wait_answer,
+    Bells, Errno, Listener, Scope, Stream, backtrace, connect, hung_up, random, ring, serialize, wait_answer,
 };
 use super::Rights;
 use super::unix::protection;

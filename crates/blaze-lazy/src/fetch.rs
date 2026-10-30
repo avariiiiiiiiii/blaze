@@ -18,13 +18,17 @@
 //!   report.
 //!
 //! Per function: one state byte, one priority byte and one target word, by [`LazyId`];
-//! waiters only for functions being asked for. Nothing is allocated on an ask of a
-//! published function.
+//! waiters only for functions being asked for, as a list per function in a slab. Nothing is
+//! allocated on an ask of a published function, nor, once the slab and the map hold the most
+//! waiters the run had at once, on an ask of one not compiled yet or on its answers.
 
 use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use blaze_ids::radix;
+use blaze_inproc::ask;
+use blaze_mem::{Handle, Slab, Tag};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::LazyId;
@@ -60,6 +64,16 @@ pub struct Waiter {
     pub request: u64,
 }
 
+/// A waiter in its function's list, which is in the order they asked.
+struct Waiting {
+    to: Waiter,
+    next: Option<Handle<Waiting>>,
+}
+
+/// The most asks waiting at once, over every function: each ask slot of 4096 run processes.
+/// The slab reserves room for them and commits only what the run uses.
+const MOST_WAITERS: u32 = ask::SLOTS as u32 * 4096;
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
     /// Published in its slot, at this address.
@@ -82,7 +96,9 @@ pub struct Fetcher {
     priority: Vec<Priority>,
     target: Vec<u64>,
     queues: [VecDeque<LazyId>; PRIORITIES],
-    waiters: FxHashMap<u32, Vec<Waiter>>,
+    /// The first and last waiter of each function being asked for.
+    waiters: FxHashMap<u32, (Handle<Waiting>, Handle<Waiting>)>,
+    waiting: Slab<Waiting>,
     failures: FxHashMap<u32, Arc<str>>,
     /// Whether a failed function was asked for: stopped once.
     stopped: FxHashSet<u32>,
@@ -93,22 +109,26 @@ pub struct Fetcher {
 }
 
 impl Fetcher {
-    /// The fetcher of `count` lazy functions, compiled by at most `workers` at once.
-    pub fn new(count: u32, workers: u32) -> Fetcher {
+    /// The fetcher of `count` lazy functions, compiled by at most `workers` at once; an error
+    /// when the room for its waiters can't be reserved.
+    pub fn new(count: u32, workers: u32) -> Result<Fetcher, String> {
+        let waiting = Slab::new(MOST_WAITERS, Tag::Link)
+            .map_err(|it| format!("reserving room for {MOST_WAITERS} lazy asks waiting at once: {it}"))?; // alloc: an error
         let count = count as usize;
-        Fetcher {
+        Ok(Fetcher {
             state: vec![State::Lazy; count], // alloc: setup, a column per run
             priority: vec![Priority::Idle; count], // alloc: setup, a column per run
             target: vec![0; count], // alloc: setup, a column per run
             queues: Default::default(),
             waiters: FxHashMap::default(),
+            waiting,
             failures: FxHashMap::default(),
             stopped: FxHashSet::default(),
             workers: workers.max(1),
             running: 0,
             running_background: 0,
             compiles: 0,
-        }
+        })
     }
 
     pub fn len(&self) -> u32 {
@@ -142,14 +162,56 @@ impl Fetcher {
                 }
             }
             State::Lazy | State::Queued | State::Compiling => {
-                let waiting = self.waiters.entry(lazy).or_default();
-                if !waiting.contains(&to) {
-                    waiting.push(to);
+                if let Err(why) = self.wait(to, lazy) {
+                    out.push(Action::Answer { to, lazy, outcome: Outcome::Failed(why.clone()) }); // clone: an Arc, the run's end
+                    out.push(Action::Stop { lazy, why });
+                    return;
                 }
                 if state != State::Compiling {
                     self.want(LazyId(lazy), Priority::Asked);
                 }
             }
+        }
+    }
+
+    /// `to` at the end of `lazy`'s waiters, unless it waits already (a resent ask); an error
+    /// when more asks wait at once than the slab holds.
+    fn wait(&mut self, to: Waiter, lazy: u32) -> Result<(), Arc<str>> {
+        let Fetcher { waiters, waiting, .. } = self;
+        let full = |error: blaze_mem::MemError| -> Arc<str> {
+            // alloc: the run's end.
+            format!("more than {MOST_WAITERS} lazy asks waiting at once: {error}").into()
+        };
+        match waiters.entry(lazy) {
+            Entry::Vacant(ends) => {
+                let at = waiting.try_insert(Waiting { to, next: None }).map_err(full)?;
+                ends.insert((at, at));
+            }
+            Entry::Occupied(mut ends) => {
+                let mut at = Some(ends.get().0);
+                while let Some(handle) = at {
+                    let waiter = waiting.get(handle).expect("a function's waiters are live in the slab");
+                    if waiter.to == to {
+                        return Ok(());
+                    }
+                    at = waiter.next;
+                }
+                let new = waiting.try_insert(Waiting { to, next: None }).map_err(full)?;
+                waiting.get_mut(ends.get().1).expect("a function's waiters are live in the slab").next = Some(new);
+                ends.get_mut().1 = new;
+            }
+        }
+        Ok(())
+    }
+
+    /// Answers the waiters of the list from `first` with `outcome`, in the order they asked,
+    /// and frees their room.
+    fn answer(&mut self, mut first: Option<Handle<Waiting>>, lazy: u32, outcome: &Outcome, out: &mut Vec<Action>) {
+        while let Some(handle) = first {
+            let Waiting { to, next } = self.waiting.remove(handle).expect("a function's waiters are live in the slab");
+            // clone: a word for a ready function, an Arc per asker of a failure
+            out.push(Action::Answer { to, lazy, outcome: outcome.clone() });
+            first = next;
         }
     }
 
@@ -223,24 +285,19 @@ impl Fetcher {
         if self.priority[at] != Priority::Asked {
             self.running_background -= 1;
         }
-        let waiting = self.waiters.remove(&id.0).unwrap_or_default();
+        let first = self.waiters.remove(&id.0).map(|ends| ends.0);
         match result {
             Ok(target) => {
                 self.state[at] = State::Ready;
                 self.target[at] = target;
-                for to in waiting {
-                    out.push(Action::Answer { to, lazy: id.0, outcome: Outcome::Ready(target) });
-                }
+                self.answer(first, id.0, &Outcome::Ready(target), out);
             }
             Err(why) => {
                 self.state[at] = State::Failed;
                 let why: Arc<str> = why.into();
                 self.failures.insert(id.0, why.clone()); // clone: an Arc, a failure
-                if !waiting.is_empty() {
-                    for to in waiting {
-                        // clone: an Arc per asker of a failure.
-                        out.push(Action::Answer { to, lazy: id.0, outcome: Outcome::Failed(why.clone()) });
-                    }
+                if first.is_some() {
+                    self.answer(first, id.0, &Outcome::Failed(why.clone()), out); // clone: an Arc, a failure
                     self.stopped.insert(id.0);
                     out.push(Action::Stop { lazy: id.0, why });
                 }

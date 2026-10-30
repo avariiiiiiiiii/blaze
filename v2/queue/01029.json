@@ -1,0 +1,24 @@
+{
+  "id": "01029",
+  "from_lane": "fastcompile-testsel",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit/codegen.rs",
+    "crates/blaze-cargo/src/serve/unit/test/image.rs"
+  ],
+  "what": "## fastcompile-testsel 2: cargo: pass the span tables to `ExecTable::new` (queue 00745 item 3)\n\nOnce codegen lands fastcompile-testsel 1 (`ExecTable::new` takes `spans: &[(ContentId, Vec<u8>)]` and folds the positions each function names into its `Bound`): `serve/unit/test/image.rs` `table` takes `spans: &[(ContentId, Vec<u8>)]` and passes it through, and `serve/unit/codegen.rs:820` passes `&side.spans`, the tables the same link takes. That closes the positions miss you reported: an edit that only moves a `panic!` or a `line!()` reruns the tests that executed the moved function, and only those. Nothing else changes for cargo; `compile.rs`'s `SPANS` in usercode's reached sets is yours to keep or drop as that path retires.",
+  "state": "open",
+  "created": "2026-10-30T14:20:31Z",
+  "updated": "2026-10-30T14:20:31Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:20:31Z",
+      "by": "fastcompile-testsel",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

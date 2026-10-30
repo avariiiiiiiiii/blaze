@@ -7,7 +7,7 @@ use blaze_ids::ContentId;
 use blaze_mem::{Tag, tag};
 use span::Edition;
 use syntax::{SyntaxError, ast};
-use vfs::FileId;
+use crate::FileId;
 
 use crate::{Db, trees::Trees};
 
@@ -138,7 +138,7 @@ impl EditionedFileId {
     }
 
     #[inline]
-    pub fn file_id(self, db: &Db) -> vfs::FileId {
+    pub fn file_id(self, db: &Db) -> FileId {
         self.field(db).file_id()
     }
 
@@ -148,7 +148,7 @@ impl EditionedFileId {
     }
 
     #[inline]
-    pub fn unpack(self, db: &Db) -> (vfs::FileId, span::Edition) {
+    pub fn unpack(self, db: &Db) -> (FileId, span::Edition) {
         self.field(db).unpack()
     }
 

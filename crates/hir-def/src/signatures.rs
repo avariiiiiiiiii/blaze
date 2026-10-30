@@ -1636,8 +1636,7 @@ impl VariantFields {
             None => (
                 VariantFields {
                     fields: Arena::default(),
-                    // clone: of the empty store, which allocates nothing
-                    store: ExpressionStore::empty().clone(),
+                    store: ExpressionStore::empty_owned(),
                     shape,
                 },
                 ExpressionStoreSourceMap::default(),

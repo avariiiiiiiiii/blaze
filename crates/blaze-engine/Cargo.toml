@@ -70,17 +70,10 @@ cfg.workspace = true
 hir.workspace = true
 intern.workspace = true
 
-[target.'cfg(unix)'.dependencies]
-# The global allocator only under `heap-profile`.
-tikv-jemallocator = { version = "0.5.4", optional = true }
-
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 
 [features]
-# Serve from jemalloc and profile its heap: see blaze-cargo's `memory.rs`. Not on Windows.
-heap-profile = ["dep:tikv-jemallocator", "tikv-jemallocator/profiling", "blaze-cargo/heap-profile"]
-
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm`.
 llvm = ["hir-ty-codegen/llvm", "blaze-cargo/llvm"]
 

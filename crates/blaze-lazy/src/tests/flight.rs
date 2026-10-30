@@ -97,7 +97,7 @@ impl Compiler for Counting {
         Ok(function)
     }
 
-    fn hit(&self, key: InstanceKey) -> Option<CompiledFunction> {
+    fn hit(&self, key: InstanceKey) -> Option<Result<CompiledFunction, String>> {
         if !self.hits.contains(&key) {
             return None;
         }
@@ -106,7 +106,7 @@ impl Compiler for Counting {
         }
         let mut function = compiled(0, &[], &[]);
         function.key = key;
-        Some(function)
+        Some(Ok(function))
     }
 
     fn tier_up(&self, key: InstanceKey, to: Tier) -> Result<CompiledFunction, String> {
@@ -333,7 +333,7 @@ impl Compiler for Tiers {
         Counting::default().compile(key)
     }
 
-    fn hit(&self, _: InstanceKey) -> Option<CompiledFunction> {
+    fn hit(&self, _: InstanceKey) -> Option<Result<CompiledFunction, String>> {
         None
     }
 

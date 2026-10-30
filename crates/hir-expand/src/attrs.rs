@@ -1,10 +1,10 @@
 //! Defines the basics of attributes lowering.
 //!
-//! The heart and soul of this module is [`expand_cfg_attr()`], alongside its sibling
-//! [`expand_cfg_attr_with_doc_comments()`]. It is used to implement all attribute lowering
-//! in r-a. Its basic job is to list attributes; however, attributes do not necessarily map
-//! into [`ast::Attr`], because `cfg_attr` can map to zero, one, or more attributes
-//! (`#[cfg_attr(predicate, attr1, attr2, ...)]`). [`expand_cfg_attr()`] expands `cfg_attr`s
+//! The heart and soul of this module is [`expand_cfg_attr_view()`], alongside its sibling
+//! [`expand_cfg_attr_with_doc_comments_view()`]. It is used to implement all attribute lowering.
+//! Its basic job is to list attributes; however, attributes do not necessarily map
+//! into [`view::Attr`], because `cfg_attr` can map to zero, one, or more attributes
+//! (`#[cfg_attr(predicate, attr1, attr2, ...)]`). [`expand_cfg_attr_view()`] expands `cfg_attr`s
 //! as it goes (as its name implies), to list all attributes.
 //!
 //! Another thing to note is that we need to be able to map an attribute back to a range
@@ -46,48 +46,12 @@ pub trait AstPathExt {
 }
 
 /// `f` of the text of the path's one segment, without `r#`, read in place.
-pub(crate) fn with_one_segment<R>(path: &ast::Path, f: impl FnOnce(&str) -> R) -> Option<R> {
-    let name_ref = path.as_single_name_ref()?;
-    Some(f(name_ref.text().trim_start_matches("r#")))
-}
-
-/// [`with_one_segment`] of a view.
 pub(crate) fn with_one_segment_view<R>(
     path: &view::Path<'_>,
     f: impl FnOnce(&str) -> R,
 ) -> Option<R> {
     let name_ref = path.as_single_name_ref()?;
     Some(f(name_ref.text().trim_start_matches("r#")))
-}
-
-impl AstPathExt for ast::Path {
-    fn is1(&self, segment: &str) -> bool {
-        with_one_segment(self, |it| it == segment).unwrap_or(false)
-    }
-
-    fn as_one_segment(&self) -> Option<SmolStr> {
-        with_one_segment(self, |it| SmolStr::new(it))
-    }
-
-    fn as_up_to_two_segment(&self) -> Option<(SmolStr, Option<SmolStr>)> {
-        let parent = self.qualifier().as_one_segment();
-        let this = self.segment()?.name_ref()?.text().trim_start_matches("r#").into();
-        if let Some(parent) = parent { Some((parent, Some(this))) } else { Some((this, None)) }
-    }
-}
-
-impl AstPathExt for Option<ast::Path> {
-    fn is1(&self, segment: &str) -> bool {
-        self.as_ref().is_some_and(|it| it.is1(segment))
-    }
-
-    fn as_one_segment(&self) -> Option<SmolStr> {
-        self.as_ref().and_then(|it| it.as_one_segment())
-    }
-
-    fn as_up_to_two_segment(&self) -> Option<(SmolStr, Option<SmolStr>)> {
-        self.as_ref().and_then(|it| it.as_up_to_two_segment())
-    }
 }
 
 impl AstPathExt for view::Path<'_> {
@@ -137,85 +101,8 @@ impl AstKeyValueMetaExt for view::KeyValueMeta<'_> {
     }
 }
 
-impl AstKeyValueMetaExt for ast::KeyValueMeta {
-    fn value_string(&self) -> Option<SmolStr> {
-        if let Some(ast::Expr::Literal(value)) = self.expr()
-            && let ast::LiteralKind::String(value) = value.kind()
-            && let Ok(value) = value.value()
-        {
-            Some((*value).into())
-        } else {
-            None
-        }
-    }
-}
-
-/// The callback is passed the attribute and the outermost `ast::Attr`.
-/// Note that one node may map to multiple [`ast::Meta`]s due to `cfg_attr`.
-///
-/// `unsafe(attr)` are passed the inner attribute for now.
-#[inline]
-pub fn expand_cfg_attr<'a, BreakValue>(
-    attrs: impl Iterator<Item = ast::Attr>,
-    cfg_options: impl FnMut() -> &'a CfgOptions,
-    mut callback: impl FnMut(ast::Meta, ast::Attr) -> ControlFlow<BreakValue>,
-) -> Option<BreakValue> {
-    expand_cfg_attr_with_doc_comments::<Infallible, _>(
-        attrs.map(Either::Left),
-        cfg_options,
-        move |Either::Left((meta, top_attr))| callback(meta, top_attr),
-    )
-}
-
-#[inline]
-pub fn expand_cfg_attr_with_doc_comments<'a, DocComment, BreakValue>(
-    mut attrs: impl Iterator<Item = Either<ast::Attr, DocComment>>,
-    mut cfg_options: impl FnMut() -> &'a CfgOptions,
-    mut callback: impl FnMut(Either<(ast::Meta, ast::Attr), DocComment>) -> ControlFlow<BreakValue>,
-) -> Option<BreakValue> {
-    let mut stack = SmallVec::<[_; 1]>::new();
-    'process_attrs: loop {
-        let (mut meta, top_attr) = if let Some(it) = stack.pop() {
-            it
-        } else {
-            let attr = attrs.next()?;
-            match attr {
-                Either::Left(attr) => {
-                    let Some(meta) = attr.meta() else { continue };
-                    stack.push((meta, attr));
-                }
-                Either::Right(doc_comment) => {
-                    if let ControlFlow::Break(break_value) = callback(Either::Right(doc_comment)) {
-                        return Some(break_value);
-                    }
-                }
-            }
-            continue;
-        };
-
-        while let ast::Meta::UnsafeMeta(unsafe_meta) = &meta {
-            let Some(inner) = unsafe_meta.meta() else { continue 'process_attrs };
-            meta = inner;
-        }
-
-        if let ast::Meta::CfgAttrMeta(meta) = meta {
-            let Some(cfg_predicate) = meta.cfg_predicate() else { continue };
-            let cfg_predicate = CfgExpr::parse_from_ast(cfg_predicate);
-            if cfg_options().check(&cfg_predicate) != Some(false) {
-                let prev_stack_len = stack.len();
-                stack.extend(meta.metas().map(|meta| (meta, top_attr.clone()))); // clone: a node handle, a non-atomic count
-                stack[prev_stack_len..].reverse();
-            }
-        } else {
-            if let ControlFlow::Break(break_value) = callback(Either::Left((meta, top_attr))) {
-                return Some(break_value);
-            }
-        }
-    }
-}
-
-/// [`expand_cfg_attr`] over views: the callback is passed each attribute `cfg_attr` leaves,
-/// in order, and the outermost [`view::Attr`] it is in.
+/// The callback is passed each attribute `cfg_attr` leaves, in order, and the outermost
+/// [`view::Attr`] it is in. `unsafe(attr)` are passed the inner attribute for now.
 #[inline]
 pub fn expand_cfg_attr_view<'t, 'a, BreakValue>(
     attrs: impl Iterator<Item = view::Attr<'t>>,
@@ -229,7 +116,7 @@ pub fn expand_cfg_attr_view<'t, 'a, BreakValue>(
     )
 }
 
-/// [`expand_cfg_attr_with_doc_comments`] over views.
+/// [`expand_cfg_attr_view`] with the doc comments passed through in order.
 pub fn expand_cfg_attr_with_doc_comments_view<'t, 'a, DocComment, BreakValue>(
     mut attrs: impl Iterator<Item = Either<view::Attr<'t>, DocComment>>,
     mut cfg_options: impl FnMut() -> &'a CfgOptions,
@@ -345,46 +232,9 @@ pub(crate) fn is_item_tree_filtered_attr(name: &str) -> bool {
     ITEM_TREE_FILTERED.get(name).is_some()
 }
 
-/// This collects attributes exactly as the item tree needs them, of an owner's attributes as
-/// [`ast::attrs_including_inner`] gives them. This is used for the item tree, as well as for
-/// resolving [`AttrId`]s.
-pub fn collect_item_tree_attrs<'a, BreakValue>(
-    attrs: ast::AttrsIncludingInner,
-    cfg_options: impl Fn() -> &'a CfgOptions,
-    mut on_attr: impl FnMut(ast::Meta, ast::Attr) -> ControlFlow<BreakValue>,
-) -> Option<Either<BreakValue, CfgExpr>> {
-    expand_cfg_attr(
-        attrs,
-        || cfg_options(),
-        |attr, top_attr| {
-            // We filter builtin attributes that we don't need for nameres, because this saves memory.
-            // I only put the most common attributes, but if some attribute becomes common feel free to add it.
-            // Notice, however: for an attribute to be filtered out, it *must* not be shadowable with a macro!
-            let filter = match &attr {
-                ast::Meta::CfgMeta(attr) => {
-                    let Some(cfg_predicate) = attr.cfg_predicate() else {
-                        return ControlFlow::Continue(());
-                    };
-                    let cfg = CfgExpr::parse_from_ast(cfg_predicate);
-                    if cfg_options().check(&cfg) == Some(false) {
-                        return ControlFlow::Break(Either::Right(cfg));
-                    }
-                    true
-                }
-                _ => attr.path().is_some_and(|path| {
-                    with_one_segment(&path, is_item_tree_filtered_attr) == Some(true)
-                }),
-            };
-            if !filter && let ControlFlow::Break(v) = on_attr(attr, top_attr) {
-                return ControlFlow::Break(Either::Left(v));
-            }
-            ControlFlow::Continue(())
-        },
-    )
-}
-
-/// [`collect_item_tree_attrs`] of a view of the owner: the same metas, as the item tree takes
-/// them. One concrete owner type, so one instance and no `dyn`.
+/// This collects attributes exactly as the item tree needs them, of a view of the owner. This is
+/// used for the item tree, as well as for resolving [`AttrId`]s. One concrete owner type, so one
+/// instance and no `dyn`.
 pub fn collect_item_tree_attrs_view<'t, 'a, BreakValue>(
     owner: view::AnyHasAttrs<'t>,
     cfg_options: impl Fn() -> &'a CfgOptions,
@@ -394,8 +244,8 @@ pub fn collect_item_tree_attrs_view<'t, 'a, BreakValue>(
         view::attrs_including_inner(&owner),
         || cfg_options(),
         |attr, top_attr| {
-            // The filter of `collect_item_tree_attrs`: an attribute filtered out must not be
-            // shadowable by a macro.
+            // We filter builtin attributes that we don't need for nameres, because this saves memory.
+            // For an attribute to be filtered out, it *must* not be shadowable with a macro!
             let filter = match attr {
                 view::Meta::CfgMeta(attr) => {
                     let Some(cfg_predicate) = attr.cfg_predicate() else {
@@ -569,65 +419,13 @@ impl AttrId {
         self.id
     }
 
-    /// Returns the containing `ast::Attr` (note that it may contain other attributes as well due
-    /// to `cfg_attr`) and its [`ast::Meta`].
-    pub fn find_attr_range<N: ast::HasAttrs>(
-        self,
-        db: &Db,
-        krate: Crate,
-        owner: AstId<N>,
-    ) -> (ast::Attr, ast::Meta) {
-        self.find_attr_range_with_source(db, krate, &owner.to_node(db))
-    }
-
-    /// Returns the containing `ast::Attr` (note that it may contain other attributes as well due
-    /// to `cfg_attr`) and its [`ast::Meta`].
-    ///
-    /// Assumes that the attribute syntax node was present in the
-    /// original file (not speculatively expanded macro output).
-    pub fn find_attr_range_with_source(
-        self,
-        db: &Db,
-        krate: Crate,
-        owner: &impl ast::HasAttrs,
-    ) -> (ast::Attr, ast::Meta) {
-        self.find_attr_range_in(db, krate, ast::attrs_including_inner(owner))
-            .unwrap_or_else(|| self.incorrect(krate))
-    }
-
     #[cold]
     fn incorrect(self, krate: Crate) -> ! {
         panic!("used an incorrect `AttrId`; crate={krate:?}, attr_id={self:?}");
     }
 
-    /// The containing `ast::Attr` and its [`ast::Meta`] of an owner's attributes, as
-    /// [`ast::attrs_including_inner`] gives them: one instance for every kind of owner.
-    fn find_attr_range_in(
-        self,
-        db: &Db,
-        krate: Crate,
-        attrs: ast::AttrsIncludingInner,
-    ) -> Option<(ast::Attr, ast::Meta)> {
-        let cfg_options = OnceCell::new();
-        let mut index = 0;
-        let result = collect_item_tree_attrs(
-            attrs,
-            || cfg_options.get_or_init(|| krate.cfg_options(db)),
-            |meta, top_attr| {
-                if index == self.id {
-                    return ControlFlow::Break((top_attr, meta));
-                }
-                index += 1;
-                ControlFlow::Continue(())
-            },
-        );
-        match result {
-            Some(Either::Left(it)) => Some(it),
-            _ => None,
-        }
-    }
-
-    /// [`Self::find_attr_range`] as views: the containing `Attr` and its `Meta`.
+    /// The containing `Attr` (note that it may contain other attributes as well due to
+    /// `cfg_attr`) and its `Meta`.
     pub fn find_attr_range_view<'db, N: AstNode + view::Typed>(
         self,
         db: &'db Db,
@@ -640,7 +438,8 @@ impl AttrId {
         self.find_attr_range_with_source_view(db, krate, view::AnyHasAttrs::new(owner.to_view(db)))
     }
 
-    /// [`Self::find_attr_range_with_source`] of a view of the owner.
+    /// [`Self::find_attr_range_view`] of a view of the owner, which must be in the original file
+    /// (not speculatively expanded macro output).
     pub fn find_attr_range_with_source_view<'t>(
         self,
         db: &Db,

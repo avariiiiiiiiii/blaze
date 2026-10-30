@@ -2,9 +2,9 @@
 //! (macros-tier.md, "Externals"), decided when the crate is compiled: the tier's own shims
 //! (the allocator, memory and string functions, `errno`, the panic runtime), the shims the
 //! evaluator's run claims too (`os.rs`'s, the bridge's `Closure::call`), scalar math the
-//! host runs on registers alone, or a refusal naming the symbol. Nothing is decided by
-//! running it: a reachable call of an unknown function refuses the crate even if no
-//! expansion would make it.
+//! host runs on registers alone, or, for any other function, a stub that stops the
+//! expansion when it is called, naming the symbol. The address of unknown data is refused
+//! when the crate is compiled: no stub can stand in for bytes.
 
 use crate::guest::Stop;
 
@@ -53,12 +53,14 @@ pub(crate) enum Own {
     Strlen,
     /// The header's `errno` cell.
     Errno,
-    /// The panic runtime, as the evaluator is it: `__rust_start_panic` unwinds the macro's
-    /// frames to the nearest landing pad, `__rust_panic_cleanup` gives the payload to
-    /// `catch_unwind`, `_Unwind_Resume` goes on from a cleanup pad.
-    StartPanic,
-    PanicCleanup,
+    /// The unwinder std's own `panic_unwind` calls, compiled with the rest of std: a raise
+    /// and a resume go to the first landing pad up the frames (or out of the macro, a panic it
+    /// didn't catch); a delete is of a foreign exception, which no macro has; a backtrace
+    /// walks no frames.
+    RaiseException,
     UnwindResume,
+    DeleteException,
+    Backtrace,
     /// `abort`: the expansion stops.
     Abort,
 }
@@ -71,6 +73,10 @@ pub(crate) enum Binding {
     /// A function of scalars in registers that touches no memory (libm, compiler-rt):
     /// the host's own, called directly.
     Pure,
+    /// A function with no shim: its stub stops the expansion when it is called, naming it
+    /// ([`Refusal::stop`] with [`Why::Function`]). std reaches many a function no macro
+    /// calls (threads, sockets, signals), so only a call is an error, never the name.
+    Unshimmed,
     /// Data that only has to exist and read as zero: the header's zero cell
     /// (`__rust_no_alloc_shim_is_unstable`, `__rust_alloc_error_handler_should_panic`).
     Zero,
@@ -104,7 +110,7 @@ impl Refusal {
         let name = &self.name;
         Stop(match self.why {
             // alloc: error path
-            Why::Function => format!("calls `{name}`, a function outside its own code that blaze has no shim for{TAIL}"),
+            Why::Function => format!("calls `{name}`, a function outside its own code that blaze has no shim for"),
             // alloc: error path
             Why::Data => format!("uses `{name}`, data outside its own code that blaze has no shim for{TAIL}"),
             // alloc: error path
@@ -130,23 +136,17 @@ pub(crate) fn external(symbol: &str, used: Use, shims: &impl Shims) -> Result<Bi
     if let Some(id) = shims.external(symbol, used) {
         return Ok(Binding::Shim(id));
     }
-    let why = match used {
-        Use::Call => Why::Function,
-        Use::Address => Why::Data,
-    };
-    // alloc: the refusal, once per crate compiled
-    Err(Refusal { name: symbol.to_owned(), why })
+    match used {
+        Use::Call => Ok(Binding::Unshimmed),
+        // alloc: the refusal, once per crate compiled
+        Use::Address => Err(Refusal { name: symbol.to_owned(), why: Why::Data }),
+    }
 }
 
-/// The tier's own shim for a function of the macro's crate graph that the evaluator runs
-/// itself, by its link name: the panic runtime's entry points, which std defines and the
-/// tier replaces with its unwinder.
+/// The tier's own shim for a function of the macro's crate graph, by its link name, run in
+/// place of its body: Rust's allocator, which the tier's heap is.
 pub(crate) fn instance(link_name: &str) -> Option<Own> {
-    match link_name {
-        "__rust_start_panic" => Some(Own::StartPanic),
-        "__rust_panic_cleanup" => Some(Own::PanicCleanup),
-        _ => own_allocator(link_name),
-    }
+    own_allocator(link_name)
 }
 
 fn own_allocator(symbol: &str) -> Option<Own> {
@@ -179,7 +179,10 @@ fn own_function(symbol: &str) -> Option<Own> {
         "memrchr" => Own::Memrchr,
         "strlen" => Own::Strlen,
         "__errno_location" | "__error" | "_errno" => Own::Errno,
+        "_Unwind_RaiseException" => Own::RaiseException,
         "_Unwind_Resume" => Own::UnwindResume,
+        "_Unwind_DeleteException" => Own::DeleteException,
+        "_Unwind_Backtrace" => Own::Backtrace,
         "abort" => Own::Abort,
         _ => return None,
     })
@@ -270,11 +273,13 @@ mod tests {
         assert_eq!(external("bcmp", Use::Call, &Run), Ok(Binding::Own(Own::Memcmp)));
         assert_eq!(external("__error", Use::Call, &Run), Ok(Binding::Own(Own::Errno)));
         assert_eq!(external("_Unwind_Resume", Use::Call, &Run), Ok(Binding::Own(Own::UnwindResume)));
+        assert_eq!(external("_Unwind_RaiseException", Use::Call, &Run), Ok(Binding::Own(Own::RaiseException)));
         assert_eq!(
             external("__rust_no_alloc_shim_is_unstable_v2", Use::Address, &Run),
             Ok(Binding::Zero)
         );
-        assert_eq!(instance("__rust_start_panic"), Some(Own::StartPanic));
+        assert_eq!(instance("__rust_alloc"), Some(Own::Alloc));
+        assert_eq!(instance("__rust_start_panic"), None, "std's panic runtime is compiled, not shimmed");
         assert_eq!(instance("main"), None);
     }
 
@@ -297,11 +302,10 @@ mod tests {
     }
 
     #[test]
-    fn anything_else_is_refused_naming_it() {
-        let refusal = external("pthread_create", Use::Call, &Run).unwrap_err();
-        assert_eq!(refusal, Refusal { name: "pthread_create".to_owned(), why: Why::Function });
-        let stop = refusal.stop();
-        assert!(stop.0.contains("`pthread_create`") && stop.0.contains("compiles"), "{stop}");
+    fn any_other_function_stops_when_called_and_other_data_is_refused() {
+        assert_eq!(external("pthread_create", Use::Call, &Run), Ok(Binding::Unshimmed));
+        let stop = Refusal { name: "pthread_create".to_owned(), why: Why::Function }.stop();
+        assert_eq!(stop.0, "calls `pthread_create`, a function outside its own code that blaze has no shim for");
         let data = external("__tls_get_addr", Use::Address, &Run).unwrap_err();
         assert!(data.stop().0.starts_with("uses `__tls_get_addr`, data"), "{}", data.stop());
         let asm = Refusal { name: "core::arch::x86_64::_rdtsc".to_owned(), why: Why::Assembly };

@@ -149,28 +149,25 @@ HARNESSES = [
     ("core", ["worktrees.py", "--overlay"], {}, on("macos"), 2),
     # Tiers take live edits, which are macOS's alone; the harness picks its backends.
     ("core", ["tiers.py"], {}, on("macos", backend="cranelift"), 1),
-    # #418: the same seeds with an empty and a warm store, and asm! text changed under one IR.
-    ("core", ["fuzz/store.py", "--backends", BACKEND], {}, on("linux-x86_64"), 2),
+    # #418: the same seeds with an empty and a warm store, and asm! text changed under one IR;
+    # v2 picks the backend by profile (dev: Cranelift, release: LLVM).
+    ("core", ["fuzz/store.py", arg({"blaze": BLAZE_CLI, "profiles": [{"cranelift": "dev", "llvm": "release"}[BACKEND]]})],
+     {}, on("linux-x86_64"), 2),
     ("core", ["fuzz/edits.py", "smoke", arg({"backends": [BACKEND]})], {}, on("linux-x86_64"), 2),
     # DWARF read by gdb out of an ELF executable, or a PDB read by cdb.
     ("core", ["debuginfo.py"], {}, on("linux", "windows"), None),
     *((f"keys-{k}", ["keys.py", arg({"shard": {"index": k, "count": KEYS}})], {}, EVERYWHERE, None) for k in range(1, KEYS + 1)),
-    ("store-kills", ["storekills.py", "--kills", "100"], {}, EVERYWHERE, None),
-    ("store", ["storecorrupts.py", "--rounds", "4"], {}, EVERYWHERE, None),
-    # It mounts a tmpfs, or fills a disk image on Windows. In the fast tier: what a build
-    # keeps grows with features that write the store, and a full disk is where that shows.
-    ("store", ["storefull.py"], {}, on("linux", "windows"), 2),
-    ("store", ["storeshared.py"], {}, EVERYWHERE, None),
-    ("store", ["storeguards.py"], {}, on("linux"), None),
-    ("store", ["storetracked.py"], {}, on("linux", "macos"), 2),
-    ("store", ["storebuilds.py"], {}, on("linux", "macos"), 2),
-    # Typed JSON from the Python workspace: the harness job has to run ci.py under `uv run --frozen`.
-    ("store", ["storerevisions.py", json.dumps({"blaze_bin": os.environ.get("BLAZE_BIN", "")})], {},
-     on("linux", "macos"), None),
+    # The v2 daemon's store (crates/blaze-cas): its CLI speaks over a Unix socket, so not Windows.
+    ("store-kills", ["storekills.py", arg({"blaze": BLAZE_CLI, "kills": 100})], {}, on("linux", "macos"), None),
+    ("store", ["storecorrupts.py", arg({"blaze": BLAZE_CLI, "rounds": 4})], {}, on("linux", "macos"), None),
+    # It mounts a tmpfs. In the fast tier: what a build keeps grows with features that write
+    # the store, and a full disk is where that shows.
+    ("store", ["storefull.py", arg({"blaze": BLAZE_CLI})], {}, on("linux"), 2),
+    ("store", ["storeguards.py", arg({"blaze": BLAZE_CLI})], {}, on("linux", "macos"), None),
+    ("store", ["storetracked.py", arg({"blaze": BLAZE_CLI})], {}, on("linux", "macos"), 2),
+    ("store", ["storerevisions.py", arg({"blaze": BLAZE_CLI})], {}, on("linux", "macos"), None),
     ("daemon", ["stress.py"], {}, EVERYWHERE, 2),
     ("daemon", ["selects.py"], {}, on("linux"), 2),
-    # MinIO as one program in ~/s3tools, which CI puts there on Linux.
-    ("daemon", ["remote.py"], {}, on("linux"), None),
 ]
 
 
@@ -222,7 +219,6 @@ FAST = {
     "fuzz/edits.py smoke": (62, ()),
     "storefull.py": (59, (X64,)),
     "storetracked.py": (33, (X64, MAC)),
-    "storebuilds.py": (10, (X64, MAC)),
     "stress.py": (74, (X64,)),
     "selects.py": (29, (X64,)),
 }

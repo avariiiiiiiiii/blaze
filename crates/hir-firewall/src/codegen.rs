@@ -27,7 +27,6 @@ pub struct Codegen {
 impl Codegen {
     /// A dev build of workspace member `package` for this machine.
     pub fn dev(package: &str, names: Arc<HashMap<FileId, String>>) -> Result<Codegen, String> {
-        blaze_store::compiles_against("hir-firewall");
         let toolchain = hir_ty_codegen::v2::toolchain(hir_ty_codegen::Target::host(), &[], Runs::Here)?;
         hir_ty_codegen::v2::select(&toolchain)?;
         let policy = Policy {

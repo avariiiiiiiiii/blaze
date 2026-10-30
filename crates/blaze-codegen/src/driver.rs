@@ -36,6 +36,7 @@ use crate::{
     },
     blob,
     dedupe::{Deduped, dedupe},
+    flight::Asked,
     fold::{self, Group, Masked, Masking},
     imports,
     memo::Memo,
@@ -79,6 +80,9 @@ pub struct Stats {
     pub stored: usize,
     /// Templates the memo had: compiles saved up to callee renaming.
     pub memo: usize,
+    /// Templates another build of the memo compiled, before this one reached them or while it
+    /// waited ([`crate::flight`]): neither prepared nor compiled here.
+    pub flown: usize,
     pub compiled: usize,
     /// Functions that became thunks of a folded body.
     pub folded: usize,
@@ -1143,6 +1147,92 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
             }
         }
+        // Each function the store missed is compiled by one build of the memo
+        // ([`crate::flight`]): this one when it asks first, else the other's template, waited
+        // for once this build's own compiles landed and its other claims are let go of.
+        let flights = self.memo.flights();
+        let mut claims = flights.claims();
+        while !missing.is_empty() {
+            // alloc: per batch of store misses, sized by it
+            let stored_keys: Vec<InstanceKey> = missing.iter().map(|key| nodes[key].stored()).collect();
+            let asked = claims.claim(&stored_keys);
+            // alloc: per batch of store misses, sized by it
+            let (mut ours, mut theirs) = (Vec::new(), Vec::new());
+            for ((key, stored_key), asked) in missing.iter().zip(stored_keys).zip(asked) {
+                match asked {
+                    Asked::Ours => ours.push(*key),
+                    Asked::Theirs => theirs.push((*key, stored_key)),
+                    Asked::Landed(shape) => self.landed(nodes, *key, shape, &mut prepared, out),
+                }
+            }
+            let landed = self.compile_missing(nodes, ours, &mut prepared, out);
+            claims.land(&landed);
+            claims.release();
+            if self.frontend.stopped() {
+                out.errors.push(stopped());
+                return;
+            }
+            // alloc: per batch of store misses, sized by it
+            let waited_for: Vec<InstanceKey> = theirs.iter().map(|it| it.1).collect();
+            let Some(waited) = flights.wait(&waited_for, || self.frontend.stopped()) else {
+                out.errors.push(stopped());
+                return;
+            };
+            missing.clear();
+            for ((key, _), shape) in theirs.into_iter().zip(waited) {
+                match shape {
+                    Some(shape) => self.landed(nodes, key, shape, &mut prepared, out),
+                    // Let go of by the build that claimed it, which did not compile it.
+                    None => missing.push(key),
+                }
+            }
+        }
+        drop(claims);
+
+        self.folded(nodes, &groups, prepared, store, out);
+    }
+
+    /// Function `key`, whose template another build compiled into the memo under `shape`,
+    /// made with this build's places: neither prepared nor compiled here.
+    fn landed(
+        &self,
+        nodes: &Sorted<InstanceKey, FnNode<B>>,
+        key: InstanceKey,
+        shape: ContentId,
+        prepared: &mut HashMap<InstanceKey, (Shape, B::Prepared)>,
+        out: &mut Out,
+    ) {
+        prepared.remove(&key);
+        let node = &nodes[&key];
+        match self.memo.get(&shape) {
+            Some(template) => {
+                out.stats.flown += 1;
+                out.template(keys::template(&node.stored()), template);
+                out.instantiate(&node.unit, key, template, &node.refs);
+            }
+            // A landing is dropped with its template ([`Memo::retain`]), between builds.
+            None => out.errors.push(error(
+                key,
+                node.unit.item,
+                // alloc: an error
+                format!("its compile landed under shape {shape:?}, which the memo has no template of"),
+            )),
+        }
+    }
+
+    /// Compiles `missing`, functions the store missed that this build claimed: each prepared
+    /// once and compiled once per shape, the memo's template where it has one. What landed:
+    /// each one's stored key and the shape its template is kept under in the memo. A build
+    /// stopped lands what it has so far.
+    fn compile_missing(
+        &self,
+        nodes: &Sorted<InstanceKey, FnNode<B>>,
+        missing: Vec<InstanceKey>,
+        prepared: &mut HashMap<InstanceKey, (Shape, B::Prepared)>,
+        out: &mut Out,
+    ) -> Vec<(InstanceKey, ContentId)> {
+        // alloc: per batch of store misses, sized by it
+        let mut landed = Vec::with_capacity(missing.len());
         // alloc: per build, sized by its units
         let unprepared: Vec<InstanceKey> = missing.iter().filter(|it| !prepared.contains_key(*it)).copied().collect();
         for (key, made) in self.prepare_all(nodes, &unprepared, &mut out.errors) {
@@ -1154,8 +1244,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
         }
         if self.frontend.stopped() {
-            out.errors.push(stopped());
-            return;
+            return landed;
         }
         // One compile per shape: the first of a shape compiles, the rest wait for its template.
         // alloc: per build, sized by its units
@@ -1172,6 +1261,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     out.stats.memo += 1;
                     out.template(keys::template(&node.stored()), template);
                     out.instantiate(&node.unit, key, template, &node.refs);
+                    landed.push((node.stored(), shape));
                 }
                 None if first_of.contains_key(&shape) => waiting.push((key, shape)),
                 None => {
@@ -1185,8 +1275,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             (key, shape, self.backend.emit(&node.unit, &node.spec, made, &node.refs, None))
         });
         if self.frontend.stopped() {
-            out.errors.push(stopped());
-            return;
+            return landed;
         }
         for (key, shape, emitted) in emitted {
             let node = &nodes[&key];
@@ -1213,6 +1302,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             let kept = self.memo.put(shape, template);
             out.template(keys::template(&node.stored()), kept);
             out.instantiate(&node.unit, key, kept, &node.refs);
+            landed.push((node.stored(), shape));
         }
         for (key, shape) in waiting {
             let node = &nodes[&key];
@@ -1221,6 +1311,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     out.stats.memo += 1;
                     out.template(keys::template(&node.stored()), template);
                     out.instantiate(&node.unit, key, template, &node.refs);
+                    landed.push((node.stored(), shape));
                 }
                 None => out.errors.push(error(
                     key,
@@ -1230,8 +1321,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 )),
             }
         }
-
-        self.folded(nodes, &groups, prepared, store, out);
+        landed
     }
 
     /// Each group's body and thunks, from the store or merged from the members' IR.
@@ -1476,73 +1566,143 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Read::Failed => {}
             }
         }
-        let mut needed: Vec<InstanceKey> = missing
-            .iter()
-            .flat_map(|(name, imports, _, _)| std::iter::once(name).chain(&imports.imported))
-            .filter(|it| !prepared.contains_key(*it) && !exports.contains_key(*it))
-            .copied()
-            // alloc: per build, sized by its units
-            .collect();
-        needed.sort();
-        needed.dedup();
-        let made = prepare(&needed, &mut out.errors);
-        for (name, summarized) in summarize(made, &mut out.errors) {
-            match summarized {
-                Ok((_, export, made)) => {
-                    exports.insert(name, export);
-                    prepared.insert(name, made);
+        // Each compile the store missed is one build's of the memo ([`crate::flight`]), by its
+        // blob key; its template is kept in the memo under that key, a domain of its own, so a
+        // build that waited for it or asks after takes it there.
+        let flights = self.memo.flights();
+        let mut claims = flights.claims();
+        while !missing.is_empty() {
+            // alloc: per batch of store misses, sized by it
+            let flight_keys: Vec<InstanceKey> = missing.iter().map(|it| InstanceKey(it.3.0)).collect();
+            let asked = claims.claim(&flight_keys);
+            // alloc: per batch of store misses, sized by it
+            let (mut ours, mut theirs) = (Vec::new(), Vec::new());
+            for (it, asked) in missing.drain(..).zip(asked) {
+                match asked {
+                    Asked::Ours => ours.push(it),
+                    Asked::Theirs => theirs.push(it),
+                    Asked::Landed(_) => self.landed_release(&by_name, &it.0, &it.2, it.3, out),
                 }
-                Err(why) => out.errors.push(why),
             }
-        }
-        if self.frontend.stopped() {
-            out.errors.push(stopped());
-            return;
-        }
-        let exports = &exports;
-        // alloc: per build, sized by its units
-        let mut compiles = Vec::new();
-        for (name, imports, refs, blob_key) in missing {
-            if let Some(made) = prepared.remove(&name) {
-                compiles.push((name, imports, refs, blob_key, made));
-            }
-        }
-        let emitted = self.until_stopped(compiles.into_par_iter(), &mut out.errors, |(name, imports, refs, blob_key, made)| {
-            let job = by_name[&name];
-            let list: Option<Vec<Import<'_, B::Export>>> = imports
-                .imported
+            let mut needed: Vec<InstanceKey> = ours
                 .iter()
-                .map(|it| Some(Import { key: *it, export: exports.get(it)?, refs: &by_name[it].node.refs }))
-                // alloc: per release compile, sized by its imports
+                .flat_map(|(name, imports, _, _)| std::iter::once(name).chain(&imports.imported))
+                .filter(|it| !prepared.contains_key(*it) && !exports.contains_key(*it))
+                .copied()
+                // alloc: per build, sized by its units
                 .collect();
-            let emitted = match list {
-                Some(list) => self.backend.emit(&job.unit, job.spec, made, &refs, Some((&imports, list.as_slice()))),
-                None => Err(error(job.unit.instance.key(), job.unit.item, "an import whose export was not made")),
-            };
-            (name, imports, refs, blob_key, emitted)
-        });
-        for (name, imports, refs, blob_key, emitted) in emitted {
-            let job = by_name[&name];
-            let key = job.unit.instance.key();
-            let mut emitted = match emitted {
-                Ok(it) if it.function.key == key => it,
-                Ok(it) => {
-                    // alloc: an error
-                    out.errors.push(error(key, job.unit.item, format!("compiled as {:?}", it.function.key)));
-                    continue;
+            needed.sort();
+            needed.dedup();
+            let made = prepare(&needed, &mut out.errors);
+            for (name, summarized) in summarize(made, &mut out.errors) {
+                match summarized {
+                    Ok((_, export, made)) => {
+                        exports.insert(name, export);
+                        prepared.insert(name, made);
+                    }
+                    Err(why) => out.errors.push(why),
                 }
-                Err(why) => {
-                    out.errors.push(why);
-                    continue;
-                }
-            };
-            out.stats.compiled += 1;
-            out.stats.imported += imports.imported.len();
-            out.side(&job.unit, &mut emitted);
-            if let Some(template) = out.template_of(&job.unit, emitted, &refs) {
-                out.template(blob_key, &template);
-                out.instantiate(&job.unit, key, &template, &refs);
             }
+            if self.frontend.stopped() {
+                out.errors.push(stopped());
+                return;
+            }
+            let exports = &exports;
+            // alloc: per build, sized by its units
+            let mut compiles = Vec::new();
+            for (name, imports, refs, blob_key) in ours {
+                if let Some(made) = prepared.remove(&name) {
+                    compiles.push((name, imports, refs, blob_key, made));
+                }
+            }
+            let emitted = self.until_stopped(compiles.into_par_iter(), &mut out.errors, |(name, imports, refs, blob_key, made)| {
+                let job = by_name[&name];
+                let list: Option<Vec<Import<'_, B::Export>>> = imports
+                    .imported
+                    .iter()
+                    .map(|it| Some(Import { key: *it, export: exports.get(it)?, refs: &by_name[it].node.refs }))
+                    // alloc: per release compile, sized by its imports
+                    .collect();
+                let emitted = match list {
+                    Some(list) => self.backend.emit(&job.unit, job.spec, made, &refs, Some((&imports, list.as_slice()))),
+                    None => Err(error(job.unit.instance.key(), job.unit.item, "an import whose export was not made")),
+                };
+                (name, imports, refs, blob_key, emitted)
+            });
+            // alloc: per batch of store misses, sized by it
+            let mut landed = Vec::with_capacity(emitted.len());
+            for (name, imports, refs, blob_key, emitted) in emitted {
+                let job = by_name[&name];
+                let key = job.unit.instance.key();
+                let mut emitted = match emitted {
+                    Ok(it) if it.function.key == key => it,
+                    Ok(it) => {
+                        // alloc: an error
+                        out.errors.push(error(key, job.unit.item, format!("compiled as {:?}", it.function.key)));
+                        continue;
+                    }
+                    Err(why) => {
+                        out.errors.push(why);
+                        continue;
+                    }
+                };
+                out.stats.compiled += 1;
+                out.stats.imported += imports.imported.len();
+                out.side(&job.unit, &mut emitted);
+                if let Some(template) = out.template_of(&job.unit, emitted, &refs) {
+                    let kept = self.memo.put(blob_key.0, template);
+                    out.template(blob_key, kept);
+                    out.instantiate(&job.unit, key, kept, &refs);
+                    landed.push((InstanceKey(blob_key.0), blob_key.0));
+                }
+            }
+            claims.land(&landed);
+            claims.release();
+            if self.frontend.stopped() {
+                out.errors.push(stopped());
+                return;
+            }
+            // alloc: per batch of store misses, sized by it
+            let waited_for: Vec<InstanceKey> = theirs.iter().map(|it| InstanceKey(it.3.0)).collect();
+            let Some(waited) = flights.wait(&waited_for, || self.frontend.stopped()) else {
+                out.errors.push(stopped());
+                return;
+            };
+            for (it, shape) in theirs.into_iter().zip(waited) {
+                match shape {
+                    Some(_) => self.landed_release(&by_name, &it.0, &it.2, it.3, out),
+                    // Let go of by the build that claimed it, which did not compile it.
+                    None => missing.push(it),
+                }
+            }
+        }
+    }
+
+    /// Release compile `name` with `refs`, which another build compiled into the memo under
+    /// its blob key `blob_key`, made with this build's places: nothing prepared or compiled.
+    fn landed_release(
+        &self,
+        by_name: &HashMap<InstanceKey, &Job<'_, B>>,
+        name: &InstanceKey,
+        refs: &[Target],
+        blob_key: Key,
+        out: &mut Out,
+    ) {
+        let job = by_name[name];
+        let key = job.unit.instance.key();
+        match self.memo.get(&blob_key.0) {
+            Some(template) => {
+                out.stats.flown += 1;
+                out.template(blob_key, template);
+                out.instantiate(&job.unit, key, template, refs);
+            }
+            // A landing is dropped with its template ([`Memo::retain`]), between builds.
+            None => out.errors.push(error(
+                key,
+                job.unit.item,
+                // alloc: an error
+                format!("its compile landed under {blob_key:?}, which the memo has no template of"),
+            )),
         }
     }
 

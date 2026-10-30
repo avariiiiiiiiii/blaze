@@ -15,11 +15,13 @@ mod content;
 pub mod crate_attrs;
 mod db;
 mod editioned_file_id;
+mod file_set;
 mod files;
 mod input;
 pub mod maintain;
 mod named;
 mod reparse;
+mod source_path;
 mod table;
 pub mod target;
 pub mod trees;
@@ -59,7 +61,12 @@ use rustc_hash::FxHashSet;
 use salsa::{Durability, Setter};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 use triomphe::Arc;
-pub use vfs::{AbsPathBuf, AnchoredPath, AnchoredPathBuf, FileId, VfsPath, file_set::FileSet};
+pub use crate::{
+    file_set::{FileSet, FileSetConfig, FileSetConfigBuilder},
+    source_path::{AnchoredPath, AnchoredPathBuf, VfsPath},
+};
+pub use paths::{AbsPath, AbsPathBuf};
+pub use span::FileId;
 
 pub type FxIndexSet<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
 pub type FxIndexMap<K, V> =
@@ -163,7 +170,7 @@ pub struct FileText {
     #[get(text_field)]
     #[set(set_text_field)]
     text: syntax::Text,
-    pub file_id: vfs::FileId,
+    pub file_id: FileId,
     /// The module a crate root's text ends with that the compiler wrote, not the file on disk:
     /// blaze's test harness or list of proc macros. rustc injects its own after it applies
     /// the crate's `#![cfg]`, so a root that `#![cfg]` takes away still has it.

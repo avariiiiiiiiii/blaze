@@ -31,6 +31,7 @@ pub mod content;
 pub mod dedupe;
 pub mod driver;
 pub mod exec;
+pub mod flight;
 pub mod fold;
 pub mod imports;
 #[allow(unsafe_code)]

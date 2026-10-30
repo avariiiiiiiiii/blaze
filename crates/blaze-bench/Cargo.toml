@@ -12,7 +12,6 @@ rust-version.workspace = true
 [dependencies]
 
 [dev-dependencies]
-hir-ty-codegen.workspace = true
 blaze-cas.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true

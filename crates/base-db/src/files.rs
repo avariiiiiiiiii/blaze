@@ -25,7 +25,7 @@ use rustc_hash::FxHashMap;
 use salsa::{Durability, Setter};
 use smallvec::SmallVec;
 use triomphe::Arc;
-use vfs::{AbsPath, AbsPathBuf, FileId, VfsPath, file_set::FileSet};
+use crate::{AbsPath, AbsPathBuf, FileId, FileSet, VfsPath};
 
 use crate::{
     Crate, Db, FileSourceRootInput, FileText, IncludedFile, InputId, ReadError, SourceRoot,
@@ -82,7 +82,7 @@ struct Included {
 }
 
 /// A checkout that is looked at as the one it was loaded as with other contents.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone)] // clone: setup, `set_view` copies the few other views once
 struct View {
     base: PathBuf,
     over: PathBuf,
@@ -237,7 +237,7 @@ impl Files {
         match self.text.get(file_id.index()) {
             Some(text) => text,
             None => {
-                panic!("Unable to fetch file text for `vfs::FileId`: {file_id:?}; this is a bug")
+                panic!("Unable to fetch file text for `FileId`: {file_id:?}; this is a bug")
             }
         }
     }
@@ -697,7 +697,7 @@ impl Files {
         match self.file_source_roots.get(id.index()) {
             Some(file_source_root) => file_source_root,
             None => panic!(
-                "Unable to get `FileSourceRootInput` with `vfs::FileId` ({id:?}, path: {}); this is a bug",
+                "Unable to get `FileSourceRootInput` with `FileId` ({id:?}, path: {}); this is a bug",
                 self.path_for_file(db, id)
                     // alloc: the panic's message.
                     .map_or_else(|| "<unknown>".to_owned(), |path| path.to_string()),
@@ -820,7 +820,8 @@ pub(crate) fn index_file(
 pub(crate) struct RootContent {
     pub(crate) is_library: bool,
     /// Whether the root's [`FileSet`] names each of its files at one path and each path for
-    /// one file, as every set a `vfs::Vfs` partition makes does: then a file is taken out of
+    /// one file, as every set a [`FileSetConfig::partition`](crate::FileSetConfig::partition)
+    /// makes does: then a file is taken out of
     /// it in place ([`Files::set_view_root`]).
     pub(crate) one_to_one: bool,
     /// Each file's entry in `entries`.

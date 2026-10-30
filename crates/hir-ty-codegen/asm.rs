@@ -17,7 +17,6 @@ use std::{
     },
 };
 
-use blaze_format::cursor::{Put, Reader};
 use cranelift_codegen::binemit::Reloc;
 use hir_def::hir::{AsmOptions, AsmPiece, InlineAsmRegOrRegClass};
 use object::{
@@ -31,7 +30,6 @@ use smallvec::SmallVec;
 use super::{
     Arch, ObjectFormat, Target,
     avx512::{Load, Out},
-    store::Store,
 };
 
 mod aarch64;
@@ -1420,19 +1418,6 @@ pub(super) struct Named {
     pub(super) addend: i64,
 }
 
-/// The relocations a `sym` is assembled to, each with the number it is stored as.
-const RELOCS: [Reloc; 9] = [
-    Reloc::X86PCRel4,
-    Reloc::X86CallPLTRel4,
-    Reloc::X86GOTPCRel4,
-    Reloc::Abs8,
-    Reloc::Arm64Call,
-    Reloc::Aarch64AdrPrelPgHi21,
-    Reloc::Aarch64AddAbsLo12Nc,
-    Reloc::Aarch64AdrGotPage21,
-    Reloc::Aarch64Ld64GotLo12Nc,
-];
-
 impl Named {
     /// What Cranelift calls the relocation an assembler wrote for a `sym`, by the format
     /// of the object and the architecture, and the type ELF has for it where Cranelift has
@@ -1507,48 +1492,8 @@ impl Named {
     }
 }
 
-impl Assembled {
-    /// The bytes the store keeps.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(4 + self.code.len() + 21 * self.relocs.len());
-        bytes.put_bytes_u32(&self.code);
-        for named in &self.relocs {
-            let kind = RELOCS.iter().position(|it| *it == named.kind);
-            let kind = kind.expect("`Named::kind` gives only the relocations of `RELOCS`");
-            bytes.put_u32(named.offset);
-            bytes.put_u8(kind as u8);
-            bytes.put_u32(named.elf_type.unwrap_or(0));
-            bytes.put_u32(named.operand);
-            bytes.put_i64(named.addend);
-        }
-        bytes
-    }
-
-    /// Reads what [`Assembled::to_bytes`] wrote; `None` for any other bytes, which come from
-    /// the store or another machine.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Assembled> {
-        let mut read = Reader::new(bytes);
-        let code = read.bytes_u32().ok()?;
-        // alloc: the relocations the process keeps, once per text read from the store
-        let mut relocs = Vec::with_capacity(read.left() / 21);
-        while !read.is_done() {
-            relocs.push(Named {
-                offset: read.u32().ok()?,
-                kind: *RELOCS.get(usize::from(read.u8().ok()?))?,
-                // No relocation that is read has the type 0.
-                elf_type: Some(read.u32().ok()?).filter(|it| *it != 0),
-                operand: read.u32().ok()?,
-                addend: read.i64().ok()?,
-            });
-        }
-        // alloc: the code the process keeps, once per text read from the store
-        Some(Assembled { code: code.to_vec(), relocs })
-    }
-}
-
 /// The machine code of the function that `text` defines. Each text is assembled once: the
-/// store keeps the code, as it does a compiled function's, and the process keeps it for as
-/// long as it runs. A thread that asked for a text before has it from its own table, with no
+/// process keeps the code for as long as it runs. A thread that asked for a text before has it from its own table, with no
 /// write another core sees and no hash of the text but `FxHash`; one that has not looks in
 /// the shared [`Table`] by its SHA-256, with loads alone.
 pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, String> {
@@ -1589,32 +1534,7 @@ fn assembled(triple: &str, text: &str) -> Result<&'static Assembled, String> {
     if let Some((_, code)) = ASSEMBLED.get(hash, &key) {
         return Ok(code);
     }
-    let store = Store::global();
-    // The store gives back only bytes whose checksum it checked; bytes that pass it and are
-    // still not an `Assembled` were written by another format of it, which is a bug to name.
-    let kept = match store.and_then(|it| it.get(&key)) {
-        Some(bytes) => Some(Assembled::from_bytes(&bytes).ok_or_else(|| {
-            // alloc: the error's message
-            format!(
-                "the store's assembled code of key {} is not one this blaze reads \
-                 ({} bytes); bump the domain \"blaze asm 3\" when its format changes",
-                // alloc: the error's message
-                key.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-                bytes.len(),
-            )
-        })?),
-        None => None,
-    };
-    let code = match kept {
-        Some(code) => code,
-        None => {
-            let code = Assembler::selected().assemble(triple, text, &key)?;
-            if let Some(store) = store {
-                store.insert(&key, &code.to_bytes());
-            }
-            code
-        }
-    };
+    let code = Assembler::selected().assemble(triple, text, &key)?;
     // Two threads may both have assembled it: the first one kept is the one all are given.
     let (_, code) = ASSEMBLED.insert(hash, key, code).expect("2^36 blocks of assembly at most");
     Ok(code)
@@ -1971,36 +1891,5 @@ mod tests {
         keep_inline(two, Some(block("nop")));
         assert_eq!(inline_block(two), None);
         assert_eq!(inline_block("a_wrapper_of_two_blocks_is_neither 3"), None);
-    }
-
-    /// What the store keeps of an `Assembled` reads back as it was, over seeded code and
-    /// relocations, and the bytes with any one of them taken out are refused, not misread.
-    #[test]
-    fn kept_code_reads_back_and_short_bytes_are_refused() {
-        use blaze_ids::rng::SplitMix64;
-
-        use super::{Assembled, Named, RELOCS};
-        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
-        for _ in 0..200 {
-            let code = (0..rng.below(64)).map(|_| rng.next_u64() as u8).collect::<Vec<_>>();
-            let relocs = (0..rng.below(5))
-                .map(|_| Named {
-                    offset: rng.next_u64() as u32,
-                    kind: RELOCS[rng.index(RELOCS.len())],
-                    elf_type: Some(rng.next_u64() as u32).filter(|it| *it != 0),
-                    operand: rng.next_u64() as u32,
-                    addend: rng.next_u64() as i64,
-                })
-                .collect::<Vec<_>>();
-            let bytes = Assembled { code: code.clone(), relocs }.to_bytes();
-            let read = Assembled::from_bytes(&bytes).expect("its own bytes");
-            assert_eq!(read.code, code);
-            assert_eq!(read.to_bytes(), bytes);
-            // The records after the code are then a byte short of a whole number of them.
-            for cut in 0..bytes.len() {
-                let short = [&bytes[..cut], &bytes[cut + 1..]].concat();
-                assert!(Assembled::from_bytes(&short).is_none(), "cut at {cut}");
-            }
-        }
     }
 }

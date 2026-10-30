@@ -143,7 +143,7 @@
             mkdir -p $out/bin $out/share/blaze
             cp shipped/* $out/bin/
             # The standard library's source, which blaze finds above its programs
-            # (crates/blaze-cargo/src/cargo/toolchain/library.rs).
+            # (crates/blaze-cargo/src/toolchain/library.rs).
             cp -r library $out/share/blaze/library
             runHook postInstall
           '';

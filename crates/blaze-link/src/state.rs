@@ -1,9 +1,9 @@
 //! An image's state: its pieces, where each is, what every symbol is defined as, and the
-//! bytes of every region. Cloning it is O(1) in the image's size: a reference count per column,
-//! list arena and region, and one allocation (the regions' list, plus a name per
-//! [`Class::Named`] region). So a stage works on a copy and the state it started from stays
-//! whole: a stage that fails leaves nothing behind, and a rollback is the state before. A stage
-//! copies only the tables, chunks and pages it writes ([`crate::cow`]).
+//! bytes of every region. Cloning it is O(1) in the image's size and allocates nothing: a
+//! reference count per column, list arena and the regions' list. So a stage works on a copy and
+//! the state it started from stays whole: a stage that fails leaves nothing behind, and a
+//! rollback is the state before. A stage copies only the tables, chunks and pages it writes
+//! ([`crate::cow`]), and the regions' list (a few dozen) once, at its first write to a region.
 //!
 //! A piece is a row of columns: [`Hot`] (32 bytes: what placement, relocation and the writers
 //! read of every piece), [`What`] (16), [`Sort`] (16), and its lists (fixups, weak targets,
@@ -430,13 +430,15 @@ impl Pairs {
 }
 
 /// Every field is `Copy`, an `Arc`, or a copy-on-write container whose clone is a reference
-/// count, except `spaces` (a few dozen regions): see the module's comment for the cost.
-#[derive(Clone)] // clone: once per stage, one allocation (`spaces`): `a_clone_allocates_the_regions_list_only`
+/// count.
+#[derive(Clone)] // clone: once per stage, no allocation: `a_clone_allocates_nothing`
 pub(crate) struct State {
     pub generation: u64,
     /// Written only by resolution ([`crate::native`]), with `Arc::make_mut`.
     pub specials: Arc<Vec<Special>>,
-    pub spaces: Vec<Space>,
+    /// Written with `Arc::make_mut`, only where a region changes, so a stage that writes none
+    /// shares the list it started from.
+    pub spaces: Arc<Vec<Space>>,
     /// The names Rust code defines (`#[no_mangle]`, `main`), each the symbol it is.
     // BTreeMap: changed by every stage and walked in order by each native resolve.
     pub names: Arc<BTreeMap<NameId, Sym>>,
@@ -519,8 +521,7 @@ impl State {
         State {
             generation: blaze_live::patch::FIRST_GENERATION,
             specials: Arc::default(),
-            // alloc: none (an empty `Vec`), once per image
-            spaces: Vec::new(),
+            spaces: Arc::default(),
             names: Arc::default(),
             wasm_imports: Arc::default(),
             inputs: Arc::default(),
@@ -1242,26 +1243,46 @@ mod tests {
             let id = state.add(&piece(sym, class, &fixups[(n % 57) as usize..(n % 57 + n % 8) as usize]));
             state.set_def(sym, Def::Piece { piece: id, offset: 0 });
         }
-        state.spaces.push(space(Class::Text, 0x1000, vec![0x90; 3 * CowBytes::PAGE]));
+        let spaces = Arc::make_mut(&mut state.spaces);
+        spaces.push(space(Class::Text, 0x1000, vec![0x90; 3 * CowBytes::PAGE]));
         let named = Class::Named { name: SectionName::new("linkme_ITEMS"), write: false, exec: false };
-        state.spaces.push(space(named, 0x10000, vec![0; 64]));
+        spaces.push(space(named, 0x10000, vec![0; 64]));
         Arc::make_mut(&mut state.specials).push(Special::Absolute(1));
         state
     }
 
-    /// What `Image::stage` pays to stage on a copy, whatever the image's size: the spaces list.
-    /// Every column, arena and region is shared, a `Class::Named` region's read name too.
-    /// Queue 00951 shares the list as well, taking this to 0.
+    /// What `Image::stage` pays to stage on a copy, whatever the image's size: nothing. Every
+    /// column, arena and the regions' list is shared.
     #[test]
-    fn a_clone_allocates_the_regions_list_only() {
+    fn a_clone_allocates_nothing() {
         assert!(blaze_alloc_count::installed());
         for pieces in [10, 5000] {
             let state = image(pieces);
             let (copy, used) = blaze_alloc_count::measure(|| state.clone());
-            assert_eq!(used.allocations, 1, "{pieces} pieces: {used:?}");
+            assert_eq!(used.allocations, 0, "{pieces} pieces: {used:?}");
             assert_eq!(copy.piece_count(), pieces);
             assert!(Arc::ptr_eq(&copy.specials, &state.specials));
+            assert!(Arc::ptr_eq(&copy.spaces, &state.spaces));
         }
+    }
+
+    /// A copy's first write to a region copies the list once (its buffer and its `Arc`), a
+    /// second write nothing, and the original's regions and bytes stay as they were.
+    #[test]
+    fn a_write_to_a_copys_region_leaves_the_original() {
+        assert!(blaze_alloc_count::installed());
+        let old = image(3);
+        let mut new = old.clone();
+        let (_, used) = blaze_alloc_count::measure(|| Arc::make_mut(&mut new.spaces)[1].region.size = 8);
+        assert_eq!(used.allocations, 2, "{used:?}");
+        let (_, used) = blaze_alloc_count::measure(|| Arc::make_mut(&mut new.spaces)[1].region.size = 9);
+        assert_eq!(used.allocations, 0, "{used:?}");
+        Arc::make_mut(&mut new.spaces)[1].region.size = 8;
+        Arc::make_mut(&mut new.spaces)[0].bytes.write(0, &[1, 2]);
+        assert!(!Arc::ptr_eq(&new.spaces, &old.spaces));
+        assert_eq!((old.spaces[1].region.size, new.spaces[1].region.size), (64, 8));
+        assert!(old.spaces[0].bytes.same(0, &CowBytes::from_vec(vec![0x90; 2]), 0, 2));
+        assert!(new.spaces[0].bytes.same(0, &CowBytes::from_vec(vec![1, 2]), 0, 2));
     }
 
     #[test]
@@ -1316,7 +1337,7 @@ mod tests {
             hot.addr = addr;
         }
         let mut new = old.clone();
-        new.spaces[0].bytes.write((page - 4) as usize, &[1, 2]);
+        Arc::make_mut(&mut new.spaces)[0].bytes.write((page - 4) as usize, &[1, 2]);
         for id in 0..3 {
             assert_eq!(new.same_bytes(&old, id), new.bytes(id) == old.bytes(id), "piece {id}");
         }

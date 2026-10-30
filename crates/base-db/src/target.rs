@@ -14,7 +14,7 @@ pub enum Arch {
     Other,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)] // clone: setup: once per crate graph
 pub struct TargetData {
     /// The target tuple, as `--target` names it (`x86_64-unknown-linux-gnu`): what rustc's
     /// messages about the target say.

@@ -14,17 +14,18 @@ use crate::cache::{Images, Pick, Ready};
 use crate::dev::{self, Dev, Plan};
 use crate::image::View;
 use crate::key::{DepUnit, GraphInputs, GraphKey, ImageInputs, ImageKey, KeyedFunction, KeyedStatic, NativeInput, static_definition};
-use crate::model::{self, Libraries, Model, PAGE, RESERVE};
+use crate::model::{self, Libraries, Model, PAGE, TLS_BIAS};
 use crate::prelink::{
-    self, Bind, BindKind, InitEntry, Library, PlacedName, Prelink, Prelinked, Prot, Request, Segment, Tls,
+    self, Bind, BindKind, Library, PlacedName, Prelink, Prelinked, Prot, Request, Segment,
 };
 use crate::split::{Built, Fit, Owned, SidedNative, Stale, WorkspacePart, image_part, workspace_part};
-use crate::start::{self, WorkspaceLink};
+use crate::start::{self, Write};
 use crate::store::Shelf;
 use crate::table::{self, Def, Kind, Refs, Strength, SymbolId, TableView};
 use crate::PremapError;
 
-const BASE: u64 = prelink::IMAGES.start;
+/// `prelink::base` of the tests' ELF x86-64 output.
+const BASE: u64 = 0x40_0000;
 
 fn id(n: u64) -> ContentId {
     ContentId::of("blaze v2 premap test 1", &n.to_le_bytes())
@@ -147,7 +148,7 @@ impl Graph {
             linker: id(9_200),
             output: dev_output(),
             base: BASE,
-            tls_bias: RESERVE.bias,
+            tls_bias: TLS_BIAS,
             natives: vec![NativeInput { id: id(9_300), kind: NativeKind::Shared { as_needed: true }, order: 1 }],
             spans: vec![(id(9_400), id(9_401))],
         }
@@ -426,7 +427,7 @@ fn prelink_request<'a>(output: &'a Output, part: &'a crate::split::ImagePart<'a>
         link: blaze_link::premap::Request {
             output,
             base: BASE,
-            tls_bias: RESERVE.bias,
+            tls_bias: TLS_BIAS,
             functions: &part.functions,
             statics: &part.statics,
             names: &part.names,
@@ -458,9 +459,8 @@ fn prelinked_and_workspace_link_run_as_the_whole_link() {
 
     let layout = model::link_workspace(&workspace, &image).unwrap();
     let names = model::workspace_names(&layout, &workspace).unwrap();
-    let libraries: Vec<Library> = Vec::new();
-    let start = model::start_of(&image, &layout, &names, &libraries).unwrap();
-    assert_eq!(start.libraries, ["libc.so.6"]);
+    let start = model::start_of(&image, &names).unwrap();
+    assert_eq!(start.lookups.iter().map(|it| it.name).collect::<Vec<_>>(), ["malloc", "absent"], "only names no side defines are looked up");
 
     let whole_image: Vec<&CompiledFunction> =
         small.functions.iter().filter(|it| small.owned_functions.iter().any(|o| o.0 == it.key)).collect();
@@ -684,6 +684,7 @@ fn image_round_trips_and_refuses_damage() {
     let bytes = prelink::build(&Model, &prelink_request(&output, &part), key).unwrap();
     let image = View::parse(&bytes, key).unwrap();
     assert_eq!(image.meta().base, BASE);
+    assert_eq!(prelink::base(Format::Elf, Arch::X86_64).unwrap(), BASE);
     assert_eq!(image.meta().page, prelink::page(Format::Elf, Arch::X86_64));
     assert!(image.segments().all(|it| it.addr % PAGE == 0));
     assert_eq!(image.segments().map(|it| it.prot).collect::<Vec<_>>(), [Prot::Code, Prot::ReadOnly, Prot::Data]);
@@ -786,6 +787,13 @@ fn prelink_refuses_what_it_was_not_asked() {
     let mut request = prelink_request(&output, &part);
     request.link.output = &incremental;
     assert!(prelink::build(&Model, &request, ImageKey(id(1))).is_err(), "an incremental image");
+
+    let mut below = prelink_request(&output, &part);
+    below.link.base = BASE - PAGE;
+    assert!(prelink::build(&Model, &below, ImageKey(id(1))).is_err(), "a base below the executable's reservation");
+    let mut past = prelink_request(&output, &part);
+    past.link.base = prelink::END;
+    assert!(prelink::build(&Model, &past, ImageKey(id(1))).is_err(), "a base past the smallest address space");
 }
 
 #[test]
@@ -840,8 +848,8 @@ fn a_prelink_refuses_a_segment_written_outside_the_image() {
     assert_eq!(&out[..64], &[1; 64][..]);
 }
 
-/// An image of hand-made binds and names, for the start's rules.
-fn image_of(binds: Vec<Bind>, names: Vec<PlacedName>, init: Vec<InitEntry>, tls: Option<Tls>) -> (Vec<u8>, ImageKey) {
+/// An image of hand-made binds and names, for the start's rules, or the prelink's refusal.
+fn try_image_of(binds: Vec<Bind>, names: Vec<PlacedName>, reached_directly: Vec<String>) -> Result<(Vec<u8>, ImageKey), PremapError> {
     struct Fixed(Prelinked);
     impl Prelink for Fixed {
         type Placed = Prelinked;
@@ -859,8 +867,7 @@ fn image_of(binds: Vec<Bind>, names: Vec<PlacedName>, init: Vec<InitEntry>, tls:
         libraries: vec![Library { name: "libc.so.6".to_owned(), order: 3, as_needed: false }],
         binds,
         names,
-        init,
-        tls,
+        reached_directly,
         ..Prelinked::default()
     };
     let output = prelink::output(&dev_output(), "blaze-premap-test");
@@ -868,7 +875,7 @@ fn image_of(binds: Vec<Bind>, names: Vec<PlacedName>, init: Vec<InitEntry>, tls:
         link: blaze_link::premap::Request {
             output: &output,
             base: BASE,
-            tls_bias: RESERVE.bias,
+            tls_bias: TLS_BIAS,
             functions: &[],
             statics: &[],
             names: &[],
@@ -881,7 +888,11 @@ fn image_of(binds: Vec<Bind>, names: Vec<PlacedName>, init: Vec<InitEntry>, tls:
         debug_digests: &[],
     };
     let key = ImageKey(id(80));
-    (prelink::build(&Fixed(linked), &request, key).unwrap(), key)
+    Ok((prelink::build(&Fixed(linked), &request, key)?, key))
+}
+
+fn image_of(binds: Vec<Bind>, names: Vec<PlacedName>) -> (Vec<u8>, ImageKey) {
+    try_image_of(binds, names, Vec::new()).unwrap()
 }
 
 fn bind(n: u64, name: &str, kind: BindKind, weak: bool) -> Bind {
@@ -890,10 +901,6 @@ fn bind(n: u64, name: &str, kind: BindKind, weak: bool) -> Bind {
 
 fn def(value: u64, kind: Kind, strength: Strength, order: u32) -> Def {
     Def { value, size: 8, kind, strength, order }
-}
-
-fn link<'a>(names: &'a [(String, Def)], init: &'a [InitEntry], libraries: &'a [Library]) -> WorkspaceLink<'a> {
-    WorkspaceLink { names, init, fini: &[], tls: None, tls_offset: None, thread_vars: &[], libraries, unwind: &[] }
 }
 
 #[test]
@@ -909,7 +916,7 @@ fn start_binds_as_a_whole_link_resolves() {
         bind(3, "write", BindKind::Addr, false),
         bind(4, "maybe", BindKind::Addr, true),
     ];
-    let (bytes, key) = image_of(binds, image_names, Vec::new(), None);
+    let (bytes, key) = image_of(binds, image_names);
     let image = View::parse(&bytes, key).unwrap();
     let mut names = vec![
         ("hook".to_owned(), def(0x9000, Kind::Function, Strength::Strong, u32::MAX)),
@@ -917,72 +924,96 @@ fn start_binds_as_a_whole_link_resolves() {
         ("only_workspace".to_owned(), def(0x9200, Kind::Data, Strength::Strong, u32::MAX)),
     ];
     names.sort_by(|a, b| a.0.cmp(&b.0));
-    let libraries = vec![
-        Library { name: "libm.so.6".to_owned(), order: 1, as_needed: false },
-        Library { name: "libc.so.6".to_owned(), order: 3, as_needed: false },
-    ];
-    let start = start::plan(&image, &link(&names, &[], &libraries), &RESERVE).unwrap();
-    let writes: FxHashMap<u64, u64> = start.writes.iter().copied().collect();
+    let start = start::plan(&image, &names).unwrap();
+    let writes: FxHashMap<u64, u64> = start.writes.iter().map(|it| (it.place, it.value)).collect();
     assert_eq!(writes[&(BASE + PAGE)], 0x9000, "a strong definition beats a weak one");
     assert_eq!(writes[&(BASE + PAGE + 8)], 0x9100, "of two weak ones the first on the line");
     assert_eq!(writes[&(BASE + PAGE + 16)], 0x9200);
+    assert!(start.writes.iter().all(|it| it.address), "an address moves with the run's slide");
     assert_eq!(start.lookups.iter().map(|it| (it.name, it.weak)).collect::<Vec<_>>(), [("write", false), ("maybe", true)]);
-    assert_eq!(start.libraries, ["libm.so.6", "libc.so.6"], "in line order, each once");
 
     let strong = vec![("hook".to_owned(), def(0x9000, Kind::Function, Strength::Strong, u32::MAX))];
     let (bytes, key) = image_of(
         vec![bind(0, "hook", BindKind::Addr, false)],
         vec![PlacedName { name: "hook".to_owned(), def: def(BASE + 16, Kind::Function, Strength::Strong, 5) }],
-        Vec::new(),
-        None,
     );
     let image = View::parse(&bytes, key).unwrap();
-    assert!(start::plan(&image, &link(&strong, &[], &[]), &RESERVE).is_err(), "two strong definitions");
+    assert!(start::plan(&image, &strong).is_err(), "two strong definitions");
 
-    let (bytes, key) = image_of(vec![bind(0, "errno_tls", BindKind::TpOff, false)], Vec::new(), Vec::new(), None);
+    let (bytes, key) = image_of(vec![bind(0, "errno_tls", BindKind::TpOff, false)], Vec::new());
     let image = View::parse(&bytes, key).unwrap();
-    assert!(start::plan(&image, &link(&[], &[], &[]), &RESERVE).is_err(), "a fixed offset into a library's thread-locals");
+    assert!(start::plan(&image, &[]).is_err(), "a fixed offset into a library's thread-locals");
     let tls = vec![("errno_tls".to_owned(), def(16, Kind::ThreadLocal, Strength::Strong, u32::MAX))];
-    let start = start::plan(&image, &link(&tls, &[], &[]), &RESERVE).unwrap();
-    assert_eq!(start.writes, [(BASE + PAGE, 16)]);
+    let start = start::plan(&image, &tls).unwrap();
+    assert_eq!(start.writes, [Write { place: BASE + PAGE, value: 16, address: false }], "an offset from the thread pointer never slides");
     let data = vec![("errno_tls".to_owned(), def(0x9000, Kind::Data, Strength::Strong, u32::MAX))];
-    assert!(start::plan(&image, &link(&data, &[], &[]), &RESERVE).is_err(), "a thread-local bound to an address");
+    assert!(start::plan(&image, &data).is_err(), "a thread-local bound to an address");
 }
 
 #[test]
-fn start_runs_init_in_whole_link_order_and_places_thread_locals() {
-    let entry = |rank: u32, order: u32, n: u64| InitEntry {
-        rank,
-        order: [order, 0, 0],
-        tie: [0; 64],
-        at: BASE + 64 + n * 8,
-        count: 1,
-    };
-    let image_init = vec![entry(100, 2, 0), entry(u32::MAX, 4, 1)];
-    let tls = Tls { template: BASE + 128, init: 8, size: 24, align: 8 };
-    let (bytes, key) = image_of(Vec::new(), Vec::new(), image_init, Some(tls));
+fn start_refuses_workspace_names_out_of_order() {
+    let (bytes, key) = image_of(vec![bind(0, "a", BindKind::Addr, false)], Vec::new());
     let image = View::parse(&bytes, key).unwrap();
-    let workspace_init = vec![entry(100, 1, 2), entry(u32::MAX, 5, 3), entry(50, 9, 4)];
-    let start = start::plan(&image, &link(&[], &workspace_init, &[]), &RESERVE).unwrap();
-    let cell = |n: u64| BASE + 64 + n * 8;
-    assert_eq!(start.init, [cell(4), cell(2), cell(0), cell(1), cell(3)]);
+    let names = vec![
+        ("b".to_owned(), def(0x9000, Kind::Function, Strength::Strong, u32::MAX)),
+        ("a".to_owned(), def(0x9100, Kind::Function, Strength::Strong, u32::MAX)),
+    ];
+    assert!(start::plan(&image, &names).is_err(), "out of order");
+    let twice = vec![names[1].clone(), names[1].clone()];
+    assert!(start::plan(&image, &twice).is_err(), "a name twice");
+}
 
-    let clash = vec![entry(100, 2, 2)];
-    assert!(start::plan(&image, &link(&[], &clash, &[]), &RESERVE).is_err(), "two pieces with one place");
+#[test]
+fn an_image_marks_the_weak_names_its_code_reaches_directly() {
+    use blaze_link::Outside;
+    let names = vec![
+        PlacedName { name: "weak_hook".to_owned(), def: def(BASE + 16, Kind::Function, Strength::Weak, 5) },
+        PlacedName { name: "other_weak".to_owned(), def: def(BASE + 32, Kind::Function, Strength::Weak, 5) },
+        PlacedName { name: "strong".to_owned(), def: def(BASE + 48, Kind::Function, Strength::Strong, 5) },
+    ];
+    let (bytes, key) = try_image_of(Vec::new(), names.clone(), vec!["weak_hook".to_owned()]).unwrap();
+    let image = View::parse(&bytes, key).unwrap();
+    assert!(Outside::reached_directly(&image, "weak_hook"));
+    assert!(!Outside::reached_directly(&image, "other_weak"));
+    assert!(!Outside::reached_directly(&image, "strong"));
+    assert!(!Outside::reached_directly(&image, "absent"));
+    assert!(try_image_of(Vec::new(), names.clone(), vec!["strong".to_owned()]).is_err(), "a strong name");
+    assert!(try_image_of(Vec::new(), names, vec!["absent".to_owned()]).is_err(), "a name with no slot");
 
-    let own = Tls { template: 0x9000, init: 4, size: 4, align: 16 };
-    let offset = start::workspace_tls_offset(Some(&tls), own.align);
-    assert_eq!(offset, 32);
-    let mut workspace = link(&[], &[], &[]);
-    workspace.tls = Some(own);
-    workspace.tls_offset = Some(offset);
-    let start = start::plan(&image, &workspace, &RESERVE).unwrap();
-    assert_eq!(start.tls.iter().map(|it| (it.template, it.offset)).collect::<Vec<_>>(), [(BASE + 128, 0), (0x9000, 32)]);
-    workspace.tls_offset = Some(24);
-    assert!(start::plan(&image, &workspace, &RESERVE).is_err(), "the workspace's thread-locals elsewhere");
-    let small = start::TlsReserve { bias: RESERVE.bias, size: 32, align: 64 };
-    workspace.tls_offset = Some(offset);
-    assert!(start::plan(&image, &workspace, &small).is_err(), "more thread-locals than the loader keeps");
+    let table_at = |bytes: &[u8]| {
+        let at = |n: usize| u64::from_le_bytes(bytes[n..n + 8].try_into().unwrap()) as usize;
+        (at(80 + 16), at(80 + 16 + 8))
+    };
+    let slot_of = |bytes: &[u8], name: &str| {
+        let (offset, len) = table_at(bytes);
+        let id = SymbolId::name(name).0.0;
+        offset + bytes[offset..offset + len].chunks(table::SLOT).position(|it| it[..32] == id).unwrap() * table::SLOT
+    };
+    let mut damaged = bytes.clone();
+    damaged[slot_of(&bytes[..], "weak_hook") + 54] = 2;
+    assert!(View::parse(&damaged, key).is_err(), "a flag of no value there is");
+    let mut damaged = bytes.clone();
+    damaged[slot_of(&bytes[..], "strong") + 54] = 1;
+    assert!(View::parse(&damaged, key).is_err(), "a strong name reached directly");
+}
+
+#[test]
+fn a_bind_carries_the_slot_of_the_images_own_definition() {
+    let names = vec![PlacedName { name: "hook".to_owned(), def: def(BASE + 16, Kind::Function, Strength::Weak, 5) }];
+    let binds = vec![bind(0, "hook", BindKind::Addr, true), bind(8, "absent", BindKind::Addr, true)];
+    let (bytes, key) = image_of(binds, names);
+    let image = View::parse(&bytes, key).unwrap();
+    let own: Vec<_> = image.binds().map(|it| (it.name, it.own)).collect();
+    assert_eq!(own, [("hook", image.get(&SymbolId::name("hook"))), ("absent", None)]);
+    assert!(own[0].1.is_some());
+
+    let binds_at = u64::from_le_bytes(bytes[80 + 2 * 16..80 + 2 * 16 + 8].try_into().unwrap()) as usize;
+    for (record, slot) in [(0, 0u32), (1, 1), (0, u32::MAX)] {
+        let mut damaged = bytes.clone();
+        let at = binds_at + record * 32 + 28;
+        damaged[at..at + 4].copy_from_slice(&slot.to_le_bytes());
+        assert!(View::parse(&damaged, key).is_err(), "bind {record} naming slot {slot}");
+    }
 }
 
 fn drive(sim: &mut Sim, store: &mut Store, effects: &mut Vec<Effect>) {

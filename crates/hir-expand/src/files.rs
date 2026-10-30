@@ -4,7 +4,7 @@ use std::borrow::Borrow;
 use base_db::Db;
 use either::Either;
 use span::{AstIdNode, ErasedFileAstId, FileAstId, FileId, SyntaxContext};
-use syntax::{AstNode, AstPtr, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, TextSize, view};
+use syntax::{AstNode, AstPtr, SyntaxNode, SyntaxNodePtr, TextRange, TextSize, view};
 
 use crate::{
     EditionedFileId, HirFileId, MacroCallId, MacroKind, map_node_range_up,
@@ -98,9 +98,6 @@ impl<N: AstNode> AstId<N> {
     }
     pub fn to_range(&self, db: &Db) -> TextRange {
         self.to_ptr(db).text_range()
-    }
-    pub fn to_in_file_node(&self, db: &Db) -> crate::InFile<N> {
-        crate::InFile::new(self.file_id, self.to_ptr(db).to_node(&self.file_id.parse_or_expand(db)))
     }
     pub fn to_ptr(&self, db: &Db) -> AstPtr<N> {
         self.file_id.ast_id_map(db).get(self.value)
@@ -298,51 +295,7 @@ impl<'t, FileId: Copy, N: view::AstNode<'t>> InFileWrapper<FileId, N> {
 }
 
 // region:specific impls
-impl<FileId: Copy, SN: Borrow<SyntaxNode>> InFileWrapper<FileId, SN> {
-    pub fn file_range(&self) -> FileRangeWrapper<FileId> {
-        FileRangeWrapper { file_id: self.file_id, range: self.value.borrow().text_range() }
-    }
-}
-
 impl<SN: Borrow<SyntaxNode>> InFile<SN> {
-    pub fn parent_ancestors_with_macros(
-        self,
-        db: &Db,
-    ) -> impl Iterator<Item = InFile<SyntaxNode>> + '_ {
-        let succ = move |node: &InFile<SyntaxNode>| match node.value.parent() {
-            Some(parent) => Some(node.with_value(parent)),
-            None => node
-                .file_id
-                .macro_file()?
-                .loc(db)
-                .to_node_item(db)
-                .syntax()
-                .cloned()
-                .map(|node| node.parent())
-                .transpose(),
-        };
-        std::iter::successors(succ(&self.borrow().cloned()), succ)
-    }
-
-    pub fn ancestors_with_macros(
-        self,
-        db: &Db,
-    ) -> impl Iterator<Item = InFile<SyntaxNode>> + '_ {
-        let succ = move |node: &InFile<SyntaxNode>| match node.value.parent() {
-            Some(parent) => Some(node.with_value(parent)),
-            None => node
-                .file_id
-                .macro_file()?
-                .loc(db)
-                .to_node_item(db)
-                .syntax()
-                .cloned()
-                .map(|node| node.parent())
-                .transpose(),
-        };
-        std::iter::successors(Some(self.borrow().cloned()), succ)
-    }
-
     pub fn kind(&self) -> parser::SyntaxKind {
         self.value.borrow().kind()
     }
@@ -350,69 +303,10 @@ impl<SN: Borrow<SyntaxNode>> InFile<SN> {
     pub fn text_range(&self) -> TextRange {
         self.value.borrow().text_range()
     }
-
-    /// Falls back to the macro call range if the node cannot be mapped up fully.
-    ///
-    /// For attributes and derives, this will point back to the attribute only.
-    /// For the entire item use `InFile::original_file_range_full`.
-    pub fn original_file_range_rooted(self, db: &Db) -> FileRange {
-        self.borrow().map(SyntaxNode::text_range).original_node_file_range_rooted(db)
-    }
-
-    /// Falls back to the macro call range if the node cannot be mapped up fully.
-    pub fn original_file_range_with_macro_call_input(self, db: &Db) -> FileRange {
-        self.borrow().map(SyntaxNode::text_range).original_node_file_range_with_macro_call_input(db)
-    }
-
-    pub fn original_syntax_node_rooted(
-        self,
-        db: &Db,
-    ) -> Option<InRealFile<SyntaxNode>> {
-        // This kind of upmapping can only be achieved in attribute expanded files,
-        // as we don't have node inputs otherwise and therefore can't find an `N` node in the input
-        let file_id = match self.file_id {
-            HirFileId::FileId(file_id) => {
-                return Some(InRealFile { file_id, value: self.value.borrow().clone() }); // clone: a node handle, a non-atomic count
-            }
-            HirFileId::MacroFile(m)
-                if matches!(m.kind(db), MacroKind::Attr | MacroKind::AttrBuiltIn) =>
-            {
-                m
-            }
-            _ => return None,
-        };
-
-        let FileRange { file_id: editioned_file_id, range } = map_node_range_up_rooted(
-            db,
-            file_id.expansion_span_map(db),
-            self.value.borrow().text_range(),
-        )?;
-
-        let kind = self.kind();
-        let value = editioned_file_id
-            .parse(db)
-            .syntax_node()
-            .covering_element(range)
-            .ancestors()
-            .take_while(|it| it.text_range() == range)
-            .find(|it| it.kind() == kind)?;
-        Some(InRealFile::new(editioned_file_id, value))
-    }
 }
 
-impl InFile<&SyntaxNode> {
-    /// Attempts to map the syntax node back up its macro calls.
-    pub fn original_file_range_opt(
-        self,
-        db: &Db,
-    ) -> Option<(FileRange, SyntaxContext)> {
-        self.borrow().map(SyntaxNode::text_range).original_node_file_range_opt(db)
-    }
-}
-
-/// The views' twins of the `InFile<SyntaxNode>` methods above, each the same nodes and ranges in
-/// the same order: named `_view`, as `impl<SN: Borrow<SyntaxNode>> InFile<SN>` may overlap
-/// `InFile<view::Node>` in coherence's eyes.
+/// Walks and mappings of a node view: named `_view`, as `impl<SN: Borrow<SyntaxNode>> InFile<SN>`
+/// may overlap `InFile<view::Node>` in coherence's eyes.
 impl<'db> InFile<view::Node<'db>> {
     pub fn parent_ancestors_with_macros_view(
         self,
@@ -496,20 +390,7 @@ fn parent_with_macros<'db>(
     }
 }
 
-impl InFile<SyntaxToken> {
-    /// Falls back to the macro call range if the node cannot be mapped up fully.
-    pub fn original_file_range(self, db: &Db) -> FileRange {
-        token_original_file_range(db, self.map(|it| it.text_range()))
-    }
-
-    /// Attempts to map the syntax node back up its macro calls.
-    pub fn original_file_range_opt(self, db: &Db) -> Option<FileRange> {
-        token_original_file_range_opt(db, self.map(|it| it.text_range()))
-    }
-}
-
-/// The views' [`InFile::<SyntaxToken>::original_file_range`] and `_opt`. The names are the
-/// handles' own: `InFile<SyntaxToken>` is a concrete type, so the impls cannot overlap.
+/// A token view mapped up its macro calls.
 impl InFile<view::Token<'_>> {
     /// Falls back to the macro call range if the node cannot be mapped up fully.
     pub fn original_file_range(self, db: &Db) -> FileRange {
@@ -643,34 +524,7 @@ impl InFile<TextRange> {
     }
 }
 
-impl<N: AstNode> InFile<N> {
-    pub fn original_ast_node_rooted(self, db: &Db) -> Option<InRealFile<N>> {
-        // This kind of upmapping can only be achieved in attribute expanded files,
-        // as we don't have node inputs otherwise and therefore can't find an `N` node in the input
-        let file_id = match self.file_id {
-            HirFileId::FileId(file_id) => {
-                return Some(InRealFile { file_id, value: self.value });
-            }
-            HirFileId::MacroFile(m) => m,
-        };
-        if !matches!(file_id.kind(db), MacroKind::Attr | MacroKind::AttrBuiltIn) {
-            return None;
-        }
-
-        let FileRange { file_id: editioned_file_id, range } = map_node_range_up_rooted(
-            db,
-            file_id.expansion_span_map(db),
-            self.value.syntax().text_range(),
-        )?;
-
-        // FIXME: This heuristic is brittle and with the right macro may select completely unrelated nodes?
-        let anc = editioned_file_id.parse(db).syntax_node().covering_element(range);
-        let value = anc.ancestors().find_map(N::cast)?;
-        Some(InRealFile::new(editioned_file_id, value))
-    }
-}
-
-/// The views' [`InFile::original_ast_node_rooted`], named `_view` as above.
+/// Maps a node view up to the real file, in attribute expansions only.
 impl<'db, N: view::AstNode<'db>> InFile<N> {
     pub fn original_ast_node_rooted_view(self, db: &'db Db) -> Option<InRealFile<N>> {
         // This kind of upmapping can only be achieved in attribute expanded files,

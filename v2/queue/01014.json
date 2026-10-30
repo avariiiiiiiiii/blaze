@@ -1,0 +1,23 @@
+{
+  "id": "01014",
+  "from_lane": "pure-scripts",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/Cargo.toml"
+  ],
+  "what": "00852 is applied: the root Cargo.toml has `hir-ty-pure` as a workspace dependency. In crates/blaze-cargo/Cargo.toml, replace `hir-ty-pure = { path = \"../hir-ty-pure\" }` with `hir-ty-pure.workspace = true`.",
+  "state": "open",
+  "created": "2026-10-30T14:11:06Z",
+  "updated": "2026-10-30T14:11:06Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:11:06Z",
+      "by": "pure-scripts",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

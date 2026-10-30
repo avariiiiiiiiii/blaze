@@ -1,7 +1,8 @@
 //! The platform: memory objects and their mappings, the channel's transport, handing objects
 //! to a run process and laying them over its executable, its threads, the instruction cache
 //! and stack walks. Every `unsafe` of the crate is under this module (but the start hooks'
-//! entry points and their environment, `crate::runtime`'s), behind the safe API each
+//! entry points, their environment and their stores of a dependency image's words through
+//! [`store_private`], `crate::runtime`'s), behind the safe API each
 //! platform module exports with the same names and these signatures (`Error` is
 //! `crate::Error`, `Channel` is `crate::channel::Channel`, `Access` is `crate::Access`,
 //! `Overlay` and `Grant` are `crate::handshake`'s):
@@ -67,6 +68,11 @@
 //!   (one `mmap` or `mach_vm_map` each; Windows asks the daemon, OVERLAY). The caller proved
 //!   every overlay is a code segment of the image, with the bytes it replaces, or inside a
 //!   reservation ([`crate::handshake::Grant::check`]).
+//! - `struct Scope` (start hook): the run process's global scope, as the system loader filled
+//!   it from the executable's libraries. `fn new() -> Scope`, `fn find(&mut self, name: &str)
+//!   -> Result<Option<u64>, Error>`: the address of the C name `name`, none when nothing loaded
+//!   defines it (`dlsym(RTLD_DEFAULT, ..)` on Linux and macOS, `GetProcAddress` over the
+//!   process's modules in load order on Windows; an error elsewhere).
 //! - `fn own_image() -> Result<(u64, &'static [u8]), Error>` (start hook): where this
 //!   process's executable has its header, and its headers' bytes (the program headers, load
 //!   commands or section table), as the system loader mapped them.
@@ -164,6 +170,18 @@ pub(crate) fn adopt_words(at: u64, len: u64, least: u64) -> Result<&'static [std
     // `len / 8` whole words (checked above). Every access to it, here and in the daemon's
     // process, is atomic, so a `&[AtomicU64]` to it is sound for the rest of the process.
     Ok(unsafe { std::slice::from_raw_parts(at as *const std::sync::atomic::AtomicU64, (len / 8) as usize) })
+}
+
+/// Stores `value` in the 8 bytes at `at` of this process, unaligned: a word of a fixed map's
+/// private copy the start hook binds ([`crate::bind`]).
+///
+/// # Safety
+///
+/// `at..at + 8` is mapped readable and writable in this process and private to it (an
+/// `Access::Copy` overlay), and no other thread reads or writes it meanwhile.
+pub(crate) unsafe fn store_private(at: u64, value: u64) {
+    // SAFETY: the caller's contract: 8 writable bytes of this process's own, nobody else's.
+    unsafe { std::ptr::write_unaligned(at as *mut u64, value) };
 }
 
 impl crate::fence::Words for View {

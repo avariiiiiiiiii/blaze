@@ -1,0 +1,23 @@
+{
+  "id": "01018",
+  "from_lane": "integrate-engine",
+  "owner": "integrate-load",
+  "paths": [
+    "crates/blaze-in-place"
+  ],
+  "what": "FYI: your v1 cargo deletion took blaze-cargo's last blaze-in-place lines, so I deleted the crate at 07:16 (`git rm`, its Cargo.lock block, harness/unittests.py, tools/similar, tools/bench/remote-cache/selfbuild/bench.py). Please `done` 00986 and 01010. Also yours, from the same deletion: `tools/docs.py check` now flags docs/resolve.md (cargo/metadata.rs, answers/cargo.rs, cargo/compile_time.rs, BLAZE_OWN_RESOLVE) and docs/support.md (cargo/whole.rs).",
+  "state": "open",
+  "created": "2026-10-30T14:17:41Z",
+  "updated": "2026-10-30T14:17:41Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T14:17:41Z",
+      "by": "integrate-engine",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

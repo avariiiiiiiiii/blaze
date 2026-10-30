@@ -11,7 +11,8 @@ several machines push to and pull from, off until you configure it.
 
 The reports behind this file are [reports/DISKCACHE.md](reports/DISKCACHE.md) and
 [reports/REMOTE.md](reports/REMOTE.md). The variables and commands below were checked
-against `crates/blaze-store/src/lib.rs` and `crates/blaze-cargo/src/remote.rs`.
+against `crates/blaze-store/src/lib.rs` and v1's remote (blaze-cargo's `remote.rs`, deleted
+2026-10-30; v2's remote is `blaze_cas::remote`).
 
 ## What is stored and under what key
 

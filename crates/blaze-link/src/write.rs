@@ -712,11 +712,10 @@ impl<'a> Stage<'a> {
     /// Copies and relocates every piece to write, in parallel.
     pub fn relocate_all(&mut self) -> Result<(), LinkError> {
         let full = self.full;
-        if !full {
-            for space in &mut self.new.spaces {
-                if has_bytes(space) && (space.bytes.len() as u64) < space.region.size {
-                    space.bytes.resize(space.region.size as usize);
-                }
+        let short = |space: &Space| has_bytes(space) && (space.bytes.len() as u64) < space.region.size;
+        if !full && self.new.spaces.iter().any(short) {
+            for space in Arc::make_mut(&mut self.new.spaces).iter_mut().filter(|it| short(&**it)) {
+                space.bytes.resize(space.region.size as usize);
             }
         }
         let arena = self.arena;
@@ -876,14 +875,15 @@ impl<'a> Stage<'a> {
             return Err(it);
         }
         if full {
-            for (space, buffer) in self.new.spaces.iter_mut().zip(buffers) {
+            for (space, buffer) in Arc::make_mut(&mut self.new.spaces).iter_mut().zip(buffers) {
                 if has_bytes(space) {
                     space.bytes = CowBytes::from_vec(buffer);
                 }
             }
-        } else {
+        } else if !back.is_empty() {
+            let spaces = Arc::make_mut(&mut self.new.spaces);
             for (region, offset, range) in back {
-                self.new.spaces[region as usize].bytes.write(offset, &scratch[range]);
+                spaces[region as usize].bytes.write(offset, &scratch[range]);
             }
         }
         let mut records: FrameVec<'a, (u32, u32, u32, u32, u32, u32)> =
@@ -942,9 +942,11 @@ impl<'a> Stage<'a> {
             }
             writes.push((start + slot as usize * 8, addr.to_le_bytes()));
         }
-        let bytes = &mut self.new.spaces[region].bytes;
-        for (at, cell) in writes {
-            bytes.write(at, &cell);
+        if !writes.is_empty() {
+            let bytes = &mut Arc::make_mut(&mut self.new.spaces)[region].bytes;
+            for (at, cell) in writes {
+                bytes.write(at, &cell);
+            }
         }
         if self.filled_slots_changed(id) {
             let rebase = collect_in(self.new.filled_cells().map(|(slot, _)| u64::from(slot) * 8), self.arena);

@@ -1,102 +1,37 @@
-//! What a dev run does before its entry, so that the image and the workspace link behave as
-//! one whole link: [`plan`].
+//! What a dev run's start does for the dependency image: bind its open cells ([`plan`]).
 //!
-//! - **Bindings.** Each of the image's open cells ([`crate::prelink::Bind`]) takes what a
-//!   whole link resolves its name to: a strong definition beats a weak one, of two weak ones
-//!   the first on the link line wins, two strong ones are the whole link's error. Candidates
-//!   are the workspace's definition and the image's own; with neither, the shared libraries
-//!   in link-line order, looked up in the run process ([`Lookup`]), 0 for a weak reference.
-//! - **Libraries** load in link-line order, each once: the image's and the workspace's lists
-//!   merged by their place on the line. Each list holds what its link uses (an `as_needed`
-//!   library neither uses is in neither), so the union is the whole link's list.
-//! - **Thread-locals.** The run's loader keeps one area aside in every thread's static block
-//!   ([`TlsReserve`]); a program's thread-locals are at `bias + offset` in it. The image's
-//!   part is at offset 0, so the offsets its link computed alone hold in every run; the
-//!   workspace's part follows it ([`workspace_tls_offset`]). On Mach-O the same offsets are
-//!   into the one template the loader's descriptors point at.
-//! - **Init and fini** pieces of both, merged in the whole link's order (rank, link-line
-//!   order, tie), each piece's pointers in address order; fini runs last to first.
-
-use blaze_ids::radix;
+//! The image is a fixed map at its linked address inside a reservation of the workspace
+//! executable ([`crate::map`]), so it slides with the executable. Everything else a start
+//! does is the system loader's, on the executable itself, which the workspace executable's
+//! link (blaze-link, beside the image's [`View`]) writes into it: the image's shared libraries
+//! are among the executable's to load, its thread-locals are a part of the executable's own
+//! thread-local block, its init and fini pieces are among the executable's in the whole
+//! link's order, and its call frame information is in the executable's unwind tables.
+//!
+//! What is left is the cells the image's own link could not fill. Each of its binds
+//! ([`crate::prelink::Bind`]) takes what a whole link resolves its name to: a strong
+//! definition beats a weak one, of two weak ones the first on the link line wins, two strong
+//! ones are the whole link's error. Candidates are the workspace's definition and the image's
+//! own; with neither, the name is the shared libraries' ([`Lookup`]), 0 for a weak reference.
 
 use crate::PremapError;
 use crate::image::View;
-use crate::prelink::{BindKind, InitEntry, Library, Tls};
-use crate::table::{Def, Kind, Strength, SymbolId};
+use crate::prelink::BindKind;
+use crate::table::{Def, Kind, Strength};
 
-/// The area the run's loader keeps aside in every thread's static block: a program's
-/// thread-locals are at `bias + offset` in it, from the thread pointer on ELF, from the start
-/// of the module's block on PE.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
-pub struct TlsReserve {
-    pub bias: i64,
-    pub size: u64,
-    pub align: u64,
-}
-
-/// One part of the program's thread-local area: the template's bytes at `template`, `init`
-/// initialized and zeroes to `size`, copied to `offset` in the area.
+/// An 8-byte cell of the image the start writes before any of its code runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TlsPart {
-    pub template: u64,
-    pub init: u64,
-    pub size: u64,
-    pub offset: u64,
+pub struct Write {
+    /// Linked, as every address of the image.
+    pub place: u64,
+    pub value: u64,
+    /// `value` is a linked address, which moves with the run's slide as `place` does; a
+    /// thread-local's offset from the thread pointer does not.
+    pub address: bool,
 }
 
-/// Where the workspace's thread-locals start in the area, after the image's. The workspace
-/// link places them there (`v2/requests/fastcompile.md`, fastcompile-premap 2) and says where
-/// it put them ([`WorkspaceLink::tls_offset`]); [`plan`] refuses a difference.
-pub fn workspace_tls_offset(image: Option<&Tls>, align: u64) -> u64 {
-    image.map_or(0, |it| it.size.next_multiple_of(align.max(1)))
-}
-
-/// The parts of the area, the image's first, checked against what the loader keeps aside.
-pub fn tls_parts(
-    reserve: &TlsReserve,
-    image: Option<&Tls>,
-    workspace: Option<(&Tls, u64)>,
-) -> Result<Vec<TlsPart>, PremapError> {
-    let mut parts = Vec::with_capacity(2);
-    if let Some(tls) = image {
-        parts.push((tls, 0));
-    }
-    if let Some((tls, offset)) = workspace {
-        parts.push((tls, offset));
-    }
-    let mut out = Vec::with_capacity(parts.len());
-    for (tls, offset) in parts {
-        let end = offset.checked_add(tls.size);
-        if tls.align > reserve.align || !offset.is_multiple_of(tls.align) || end.is_none_or(|end| end > reserve.size) {
-            return Err(PremapError::of(format_args!(
-                "the run's loader keeps {} bytes aligned to {} for thread-locals, and they need {} bytes \
-                 aligned to {} at {offset}",
-                reserve.size, reserve.align, tls.size, tls.align
-            )));
-        }
-        out.push(TlsPart { template: tls.template, init: tls.init, size: tls.size, offset });
-    }
-    Ok(out)
-}
-
-/// What the workspace link made, as the run's start needs it (blaze-link's layout of the
-/// workspace image, `v2/requests/fastcompile.md`, fastcompile-premap 1).
-#[derive(Clone, Copy, Debug)]
-pub struct WorkspaceLink<'a> {
-    /// The global names it defines, sorted by name, each once.
-    pub names: &'a [(String, Def)],
-    pub init: &'a [InitEntry],
-    pub fini: &'a [InitEntry],
-    pub tls: Option<Tls>,
-    /// Where its link put its thread-locals in the run's area.
-    pub tls_offset: Option<u64>,
-    /// Mach-O: its thread-local descriptors (`__thread_vars`), as address and length.
-    pub thread_vars: &'a [(u64, u64)],
-    pub libraries: &'a [Library],
-    pub unwind: &'a [(u64, u64)],
-}
-
-/// A cell the run process binds itself: a name only a shared library defines.
+/// A cell bound to a name only a shared library defines: found in the run process's global
+/// scope, which the system loader filled from the executable's libraries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Lookup<'a> {
     pub place: u64,
@@ -106,49 +41,25 @@ pub struct Lookup<'a> {
     pub weak: bool,
 }
 
-/// What the run process does, in this order, before its entry.
+/// The image's open cells, bound.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Start<'a> {
-    /// Loaded with every symbol global, in this order.
-    pub libraries: Vec<&'a str>,
-    /// 8-byte cells to write: `(address, value)`.
-    pub writes: Vec<(u64, u64)>,
+    pub writes: Vec<Write>,
     pub lookups: Vec<Lookup<'a>>,
-    /// The program's thread-local area, the image's part first.
-    pub tls: Vec<TlsPart>,
-    /// Mach-O: thread-local descriptors the loader fills (its thunk, a key, the offset kept).
-    pub thread_vars: Vec<(u64, u64)>,
-    /// Call frame information to register: address and length.
-    pub unwind: Vec<(u64, u64)>,
-    /// Cells holding the functions to call, in order, with `argc`, `argv` and `envp`.
-    pub init: Vec<u64>,
-    /// Cells holding the functions to call at exit, last to first.
-    pub fini: Vec<u64>,
 }
 
-/// The run's start for `image` mapped beside `workspace`, in a loader that keeps `reserve`
-/// for thread-locals.
-pub fn plan<'a>(
-    image: &View<'a>,
-    workspace: &WorkspaceLink<'a>,
-    reserve: &TlsReserve,
-) -> Result<Start<'a>, PremapError> {
-    if !workspace.names.is_sorted_by(|a, b| a.0 < b.0) {
+/// The binding of `image`'s open cells beside the workspace executable whose global names
+/// are `workspace` (blaze-link's `premap::layout`), sorted by name, each once.
+pub fn plan<'a>(image: &View<'a>, workspace: &[(String, Def)]) -> Result<Start<'a>, PremapError> {
+    if !workspace.is_sorted_by(|a, b| a.0 < b.0) {
         return Err(PremapError::of(format_args!("the workspace link's names are not sorted, each once")));
     }
-    let image_tls = image.tls();
-
     let binds = image.binds().count();
     let mut writes = Vec::with_capacity(binds);
     let mut lookups = Vec::with_capacity(binds);
     for bind in image.binds() {
-        let theirs = workspace
-            .names
-            .binary_search_by(|it| it.0.as_str().cmp(bind.name))
-            .ok()
-            .map(|at| workspace.names[at].1);
-        let own = image.get(&SymbolId::name(bind.name));
-        let def = match (theirs, own) {
+        let theirs = workspace.binary_search_by(|it| it.0.as_str().cmp(bind.name)).ok().map(|at| workspace[at].1);
+        let def = match (theirs, bind.own) {
             (Some(a), Some(b)) if a.strength == Strength::Strong && b.strength == Strength::Strong => {
                 return Err(PremapError::of(format_args!(
                     "`{}` is defined in the workspace and in a dependency, both strongly",
@@ -165,10 +76,10 @@ pub fn plan<'a>(
         };
         match (def, bind.kind) {
             (Some(def), BindKind::Addr) if def.kind != Kind::ThreadLocal => {
-                writes.push((bind.place, def.value.wrapping_add_signed(bind.addend)));
+                writes.push(Write { place: bind.place, value: def.value.wrapping_add_signed(bind.addend), address: true });
             }
             (Some(def), BindKind::TpOff) if def.kind == Kind::ThreadLocal => {
-                writes.push((bind.place, def.value.wrapping_add_signed(bind.addend)));
+                writes.push(Write { place: bind.place, value: def.value.wrapping_add_signed(bind.addend), address: false });
             }
             (Some(_), _) => {
                 return Err(PremapError::of(format_args!(
@@ -190,61 +101,5 @@ pub fn plan<'a>(
             }
         }
     }
-
-    let mut libraries: Vec<(u32, &'a str)> = Vec::with_capacity(image.libraries().count() + workspace.libraries.len());
-    libraries.extend(image.libraries().map(|it| (it.order, it.name)));
-    libraries.extend(workspace.libraries.iter().map(|it| (it.order, it.name.as_str())));
-    radix::sort_copy_by_key(&mut libraries, |it| it.0);
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut once = Vec::with_capacity(libraries.len());
-    once.extend(libraries.into_iter().filter(|it| seen.insert(it.1)).map(|it| it.1));
-    let libraries = once;
-
-    let tls = match (workspace.tls, workspace.tls_offset) {
-        (Some(tls), Some(offset)) => {
-            let expected = workspace_tls_offset(image_tls.as_ref(), tls.align);
-            if offset != expected {
-                return Err(PremapError::of(format_args!(
-                    "the workspace link put its thread-locals at {offset} in the run's area, and after \
-                     the dependency image's they start at {expected}"
-                )));
-            }
-            tls_parts(reserve, image_tls.as_ref(), Some((&tls, offset)))?
-        }
-        (None, None) => tls_parts(reserve, image_tls.as_ref(), None)?,
-        _ => {
-            return Err(PremapError::of(format_args!(
-                "the workspace link has a thread-local template and no place for it, or a place and none"
-            )));
-        }
-    };
-
-    let init = merged(image.init(), image.init().count(), workspace.init)?;
-    let fini = merged(image.fini(), image.fini().count(), workspace.fini)?;
-    let mut unwind = Vec::with_capacity(image.unwind().count() + workspace.unwind.len());
-    unwind.extend(image.unwind());
-    unwind.extend_from_slice(workspace.unwind);
-    let mut thread_vars = Vec::with_capacity(image.thread_vars().count() + workspace.thread_vars.len());
-    thread_vars.extend(image.thread_vars());
-    thread_vars.extend_from_slice(workspace.thread_vars);
-    Ok(Start { libraries, writes, lookups, tls, thread_vars, unwind, init, fini })
-}
-
-/// The cells of both sides' pieces in a whole link's order.
-fn merged(image: impl Iterator<Item = InitEntry>, count: usize, workspace: &[InitEntry]) -> Result<Vec<u64>, PremapError> {
-    let mut all = Vec::with_capacity(count + workspace.len());
-    all.extend(image);
-    all.extend_from_slice(workspace);
-    all.sort_by_key(|it| it.sort_key());
-    if let Some(pair) = all.windows(2).find(|it| it[0].sort_key() == it[1].sort_key()) {
-        return Err(PremapError::of(format_args!(
-            "two init pieces, at {:#x} and {:#x}, have one place in a whole link's order",
-            pair[0].at, pair[1].at
-        )));
-    }
-    let mut cells = Vec::with_capacity(all.iter().map(|it| it.count as usize).sum());
-    for entry in all {
-        cells.extend((0..u64::from(entry.count)).map(|n| entry.at + n * 8));
-    }
-    Ok(cells)
+    Ok(Start { writes, lookups })
 }

@@ -2,9 +2,8 @@
 //! **the** most important module, because all other fancy stuff is strictly
 //! derived from this input.
 //!
-//! Note that neither this module, nor any other part of the analyzer's core do
-//! actual IO. See `vfs` and `project_model` in the `rust-analyzer` crate for how
-//! actual IO is done and lowered to input.
+//! Nothing here does IO: files come in as blaze-vfs views ([`crate::Db::set_view_root`]) and
+//! the crate graph from `blaze-lower`.
 
 use std::collections::hash_map::Entry;
 use std::error::Error;
@@ -22,7 +21,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use salsa::{Durability, Setter};
 use span::Edition;
 use triomphe::Arc;
-use vfs::{AbsPathBuf, AnchoredPath, FileId, VfsPath, file_set::FileSet};
+use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, VfsPath};
 
 use crate::{
     CrateWorkspaceData, Db, EditionedFileId, FxIndexSet, all_crates,
@@ -34,7 +33,7 @@ use crate::{
 pub type ProcMacroPaths =
     FxHashMap<CrateBuilderId, Result<(String, AbsPathBuf), ProcMacroLoadingError>>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: an error, cold
 pub enum ProcMacroLoadingError {
     Disabled,
     FailedToBuild,
@@ -160,7 +159,7 @@ impl SourceRoot {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone)] // clone: setup: the crate graph, once per load
 pub struct CrateGraphBuilder {
     arena: Arena<CrateBuilder>,
 }
@@ -227,7 +226,7 @@ impl ops::Deref for CrateName {
 }
 
 /// Origin of the crates.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: setup: the crate graph, once per load
 pub enum CrateOrigin {
     /// Crates that are from the rustc workspace.
     Rustc { name: Symbol },
@@ -546,13 +545,13 @@ impl FromStr for ReleaseChannel {
 /// So we store only the root file - unless we find that this crate has the same root file as
 /// another crate, in which case we store all data for one of them (if one is a dependency of
 /// the other, we store for it, because it has more dependencies to be invalidated).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: setup: the crate graph, once per load
 pub struct UniqueCrateData {
     root_file_id: FileId,
     disambiguator: Option<Box<(BuiltCrateData, HashableCfgOptions)>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: setup: the crate graph, once per load
 pub struct CrateData<Id> {
     pub root_file_id: FileId,
     pub edition: Edition,
@@ -581,7 +580,7 @@ pub type CrateDataBuilder = CrateData<CrateBuilderId>;
 pub type BuiltCrateData = CrateData<Crate>;
 
 /// Crate data unrelated to analysis.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)] // clone: setup: the crate graph, once per load
 pub struct ExtraCrateData {
     pub version: Option<String>,
     /// A name used in the package's project declaration: for Cargo projects,
@@ -595,7 +594,7 @@ pub struct ExtraCrateData {
     pub potential_cfg_options: Option<CfgOptions>,
 }
 
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)] // clone: setup: the crate graph, once per load
 pub struct Env {
     entries: FxHashMap<String, String>,
 }
@@ -1763,7 +1762,7 @@ impl fmt::Display for CyclicDependenciesError {
 #[cfg(test)]
 mod tests {
     use triomphe::Arc;
-    use vfs::AbsPathBuf;
+    use crate::AbsPathBuf;
 
     use crate::{CrateWorkspaceData, DependencyBuilder, TargetKind};
 

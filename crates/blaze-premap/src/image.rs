@@ -29,7 +29,7 @@ use crate::prelink::{Bind, BindKind, InitEntry, Placed, Prot, Tls};
 use crate::table::{Def, Entry, Kind, SymbolId, TableView};
 
 pub const MAGIC: [u8; 8] = *b"BZPREMAP";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 const SEGMENTS: usize = 0;
 const TABLE: usize = 1;
@@ -53,7 +53,8 @@ const HEADER: usize = DIRECTORY + SECTIONS * 16;
 
 /// addr, size, offset of its bytes, their length, prot, 7 zero bytes.
 const SEGMENT: usize = 40;
-/// place, addend, name offset u32, name length u32, kind, weak, 6 zero bytes.
+/// place, addend, name offset u32, name length u32, kind, weak, 2 zero bytes, and the table
+/// slot of the image's own definition of the name u32, from 1, 0 for none.
 const BIND: usize = 32;
 /// name offset u32, name length u32, order u32, as_needed u8, 3 zero bytes.
 const LIBRARY: usize = 16;
@@ -106,8 +107,13 @@ pub(crate) fn encode(meta: &Meta, prelink: &impl Placed, pieces: &Pieces<'_>) ->
         Ok((at, len))
     };
 
+    let table = TableView::trusted(pieces.table);
     let mut binds = Vec::with_capacity(linked.binds.len() * BIND);
     for Bind { place, name, addend, kind, weak } in &linked.binds {
+        let own = match table.slot_of(&SymbolId::name(name)) {
+            Some(at) => u32::try_from(at + 1).map_err(|_| PremapError::of(format_args!("a table of 4 Gi slots")))?,
+            None => 0,
+        };
         let (at, len) = string(name)?;
         binds.extend_from_slice(&place.to_le_bytes());
         binds.extend_from_slice(&addend.to_le_bytes());
@@ -118,7 +124,8 @@ pub(crate) fn encode(meta: &Meta, prelink: &impl Placed, pieces: &Pieces<'_>) ->
             BindKind::TpOff => 2,
         });
         binds.push(*weak as u8);
-        binds.extend_from_slice(&[0; 6]);
+        binds.extend_from_slice(&[0; 2]);
+        binds.extend_from_slice(&own.to_le_bytes());
     }
     let mut libraries = Vec::with_capacity(linked.libraries.len() * LIBRARY);
     for library in &linked.libraries {
@@ -260,6 +267,8 @@ pub struct BindRef<'a> {
     pub addend: i64,
     pub kind: BindKind,
     pub weak: bool,
+    /// The image's own definition of `name`, read from the slot the image recorded for it.
+    pub own: Option<Def>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -384,12 +393,14 @@ impl<'a> View<'a> {
         for at in 0..directory[BINDS].1 / BIND {
             let record = view.record(BINDS, BIND, at);
             let place = u64_at(record, 0);
-            if name(u32_at(record, 16), u32_at(record, 20)).is_none()
-                || !matches!(record[24], 1 | 2)
-                || record[25] > 1
-                || record[26..32] != [0; 6]
-            {
+            let Some(text) = name(u32_at(record, 16), u32_at(record, 20)) else {
                 return bad(format_args!("has bind {at} that is not one"));
+            };
+            if !matches!(record[24], 1 | 2) || record[25] > 1 || record[26..28] != [0; 2] {
+                return bad(format_args!("has bind {at} that is not one"));
+            }
+            if table.slot_of(&SymbolId::name(text)).map_or(0, |it| it as u64 + 1) != u64::from(u32_at(record, 28)) {
+                return bad(format_args!("has bind {at} naming another slot than its own definition of `{text}`"));
             }
             if place % 8 != 0 || !view.inside(place, 8, true) {
                 return bad(format_args!("binds a cell at {place:#x}, outside its writable segments"));
@@ -533,6 +544,7 @@ impl<'a> View<'a> {
                 name: view.string(u32_at(record, 16), u32_at(record, 20)),
                 kind: if record[24] == 1 { BindKind::Addr } else { BindKind::TpOff },
                 weak: record[25] == 1,
+                own: (u32_at(record, 28) as usize).checked_sub(1).map(|at| view.table.def_at(at)),
             }
         })
     }

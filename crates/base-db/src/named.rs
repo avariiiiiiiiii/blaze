@@ -25,7 +25,7 @@ use std::{
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, scratch};
 use salsa::{Durability, Setter};
-use vfs::{FileId, VfsPath};
+use crate::{FileId, VfsPath};
 
 use crate::{
     Db, InputId, SourceRoot, content,

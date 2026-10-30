@@ -90,7 +90,7 @@ fn prefetched_callees_are_taken_by_sleeping_workers() {
             let callees: Vec<u32> = if n == 0 { (1..8).collect() } else { Vec::new() };
             Ok(compiled(n, &callees, &[]))
         }
-        fn hit(&self, _: blaze_codegen::InstanceKey) -> Option<blaze_codegen::CompiledFunction> {
+        fn hit(&self, _: blaze_codegen::InstanceKey) -> Option<Result<blaze_codegen::CompiledFunction, String>> {
             None
         }
         fn tier_up(&self, at: blaze_codegen::InstanceKey, _: blaze_stencil::tier::Tier) -> Result<blaze_codegen::CompiledFunction, String> {

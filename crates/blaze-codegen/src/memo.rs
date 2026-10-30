@@ -24,7 +24,7 @@ use std::{marker::PhantomData, ptr};
 use blaze_check::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use blaze_ids::ContentId;
 
-use crate::template::Template;
+use crate::{flight::Flights, template::Template};
 
 /// Slots of level 0; level `n` has `FIRST << n`. Under the model checker a level is a few
 /// slots, so a handful of puts spill and race to make the next level.
@@ -45,6 +45,9 @@ pub struct Memo {
     levels: [AtomicPtr<AtomicPtr<Entry>>; LEVELS],
     len: AtomicUsize,
     owns: PhantomData<Box<Entry>>,
+    /// Which build of the memo's compiles each function a store missed, and the shape it
+    /// landed under.
+    flights: Flights,
 }
 
 const _: () = {
@@ -73,7 +76,13 @@ impl Memo {
             levels: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             len: AtomicUsize::new(0),
             owns: PhantomData,
+            flights: Flights::new(),
         }
+    }
+
+    /// The single flight of the memo's builds ([`crate::flight`]).
+    pub fn flights(&self) -> &Flights {
+        &self.flights
     }
 
     /// Level `n`, if it was made.
@@ -220,6 +229,7 @@ impl Memo {
     /// Drops every template not of `kept`: what the daemon's collection keeps reachable. Runs
     /// between builds, when nothing borrows the memo.
     pub fn retain(&mut self, kept: impl Fn(&ContentId) -> bool) {
+        self.flights.retain(&kept);
         for entry in self.drain() {
             if kept(&entry.shape) {
                 let Entry { shape, template } = *entry;

@@ -6,7 +6,7 @@ use std::fmt;
 use rustc_hash::FxHashSet;
 use salsa::{Durability, Setter as _};
 use triomphe::Arc;
-use vfs::FileId;
+use crate::FileId;
 
 use crate::{
     CrateGraphBuilder, CratesIdMap, Db, LibraryRoots, LocalRoots, SourceRoot, SourceRootId,

@@ -61,7 +61,6 @@ typed-arena = "2.0.2"
 hir-ty-codegen.workspace = true
 blaze-macro-wasm.workspace = true
 blaze-macro-eval.workspace = true
-blaze-store.workspace = true
 blaze-fmt.workspace = true
 blaze-lints.workspace = true
 blaze-manifest.workspace = true
@@ -87,7 +86,6 @@ blaze-registry = { path = "../blaze-registry" }
 blaze-source.workspace = true
 blaze-build-script = { path = "../blaze-build-script" }
 cargo-util-schemas = "=0.14.3"
-project-model.workspace = true
 triomphe.workspace = true
 paths.workspace = true
 syntax.workspace = true
@@ -129,8 +127,6 @@ lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "x
 # graph, by hyper-util.
 base64 = "0.23"
 blaze-live = { path = "../blaze-live" }
-# What a client waits for of an executable the daemon splices in place (`crate::splice`).
-blaze-in-place = { path = "../blaze-in-place" }
 # blaze's std::process for build scripts compiled for wasm32-wasip1; its runner with the
 # feature `wasi`.
 blaze-wasi = { path = "../blaze-wasi" }

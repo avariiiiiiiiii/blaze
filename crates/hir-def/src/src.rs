@@ -46,14 +46,8 @@ where
     }
 }
 
-pub trait HasChildSource<ChildId> {
-    type Value;
-    fn child_source(&self, db: &Db) -> InFile<ArenaMap<ChildId, Self::Value>>;
-}
-
-/// One child's node of [`HasChildSource::child_source`], as a view of the database's tree: the
-/// node the map has at `child`, found by walking the children up to it, `None` where the map has
-/// none.
+/// One child's node, as a view of the database's tree: found by walking the children up to
+/// `child`, `None` where the owner has no such child.
 pub trait HasChildSourceView<ChildId> {
     type Value<'db>: view::AstNode<'db>;
     fn child_source_view<'db>(
@@ -87,8 +81,8 @@ pub fn use_trees_view<'db>(
     .expect("failed to lower use tree")
 }
 
-/// [`HasChildSource::child_source`] of a `UseId` as views of the database's tree: every
-/// `UseTree` of the import, by the index the item tree gives it.
+/// The use trees of a `UseId` as views of the database's tree: every `UseTree` of the import,
+/// by the index the item tree gives it.
 pub fn use_tree_sources_view<'db>(
     db: &'db Db,
     id: UseId,
@@ -100,83 +94,6 @@ pub fn use_tree_sources_view<'db>(
         // alloc: a use's trees by item-tree index, for diagnostics
         .collect();
     InFile::new(loc.id.file_id, map)
-}
-
-impl HasChildSource<la_arena::Idx<ast::UseTree>> for UseId {
-    type Value = ast::UseTree;
-    fn child_source(
-        &self,
-        db: &Db,
-    ) -> InFile<ArenaMap<la_arena::Idx<ast::UseTree>, Self::Value>> {
-        let loc = self.lookup(db);
-        let root = loc.id.file_id.parse_or_expand(db);
-        let trees = use_trees_view(db, loc.id);
-        let map = trees
-            .iter()
-            .map(|(idx, &tree)| {
-                (Idx::from_raw(idx.into_raw()), AstPtr::<ast::UseTree>::of(tree).to_node(&root))
-            })
-            // alloc: a use's trees back to syntax, for diagnostics
-            .collect();
-        InFile::new(loc.id.file_id, map)
-    }
-}
-
-impl HasChildSource<LocalTypeOrConstParamId> for GenericDefId {
-    type Value = Either<ast::TypeOrConstParam, ast::Trait>;
-    fn child_source(
-        &self,
-        db: &Db,
-    ) -> InFile<ArenaMap<LocalTypeOrConstParamId, Self::Value>> {
-        let generic_params = GenericParams::of(db, *self);
-        let mut idx_iter = generic_params.iter_type_or_consts().map(|(idx, _)| idx);
-
-        let mut params = ArenaMap::with_capacity(generic_params.len_type_or_consts());
-
-        // For traits and trait aliases the first type index is `Self`, we need to add it before
-        // the other params.
-        let (file_id, generic_params_list) = match *self {
-            GenericDefId::TraitId(id) => {
-                let source = id.lookup(db).source(db);
-                let list = ast::HasGenericParams::generic_param_list(&source.value);
-                let idx = idx_iter.next().unwrap();
-                params.insert(idx, Either::Right(source.value));
-                (source.file_id, list)
-            }
-            _ => self.file_id_and_params_of(db),
-        };
-
-        if let Some(generic_params_list) = generic_params_list {
-            for (idx, ast_param) in idx_iter.zip(generic_params_list.type_or_const_params()) {
-                params.insert(idx, Either::Left(ast_param));
-            }
-        }
-
-        InFile::new(file_id, params)
-    }
-}
-
-impl HasChildSource<LocalLifetimeParamId> for GenericDefId {
-    type Value = ast::LifetimeParam;
-    fn child_source(
-        &self,
-        db: &Db,
-    ) -> InFile<ArenaMap<LocalLifetimeParamId, Self::Value>> {
-        let generic_params = GenericParams::of(db, *self);
-        let idx_iter = generic_params.iter_lt().map(|(idx, _)| idx);
-
-        let (file_id, generic_params_list) = self.file_id_and_params_of(db);
-
-        let mut params = ArenaMap::with_capacity(generic_params.len_lifetimes());
-
-        if let Some(generic_params_list) = generic_params_list {
-            for (idx, ast_param) in idx_iter.zip(generic_params_list.lifetime_params()) {
-                params.insert(idx, ast_param);
-            }
-        }
-
-        InFile::new(file_id, params)
-    }
 }
 
 impl HasChildSourceView<LocalTypeOrConstParamId> for GenericDefId {
@@ -272,31 +189,5 @@ impl HasChildSourceView<LocalFieldId> for VariantId {
     ) -> InFile<Option<Self::Value<'db>>> {
         let nth = u32::from(child.into_raw()) as usize;
         enabled_fields_view(db, *self).map(|mut fields| fields.nth(nth))
-    }
-}
-
-impl HasChildSource<LocalFieldId> for VariantId {
-    type Value = Either<ast::TupleField, ast::RecordField>;
-
-    fn child_source(&self, db: &Db) -> InFile<ArenaMap<LocalFieldId, Self::Value>> {
-        let fields = enabled_fields_view(db, *self);
-        let root = fields.file_id.parse_or_expand(db);
-        let map = fields
-            .value
-            .enumerate()
-            .map(|(idx, field)| {
-                let field = match field {
-                    Either::Left(it) => {
-                        Either::Left(AstPtr::<ast::TupleField>::of(it).to_node(&root))
-                    }
-                    Either::Right(it) => {
-                        Either::Right(AstPtr::<ast::RecordField>::of(it).to_node(&root))
-                    }
-                };
-                (LocalFieldId::from_raw(la_arena::RawIdx::from(idx as u32)), field)
-            })
-            // alloc: the map asked for, for diagnostics
-            .collect();
-        InFile::new(fields.file_id, map)
     }
 }

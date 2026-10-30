@@ -30,8 +30,8 @@ are what carries the weight.
 You need Python 3, the pinned nightly (`harness/toolchain`) with `rust-src`, a C compiler
 and linker, and a release build of blaze. blaze reads no toolchain's `rust-src`; an editor's
 rust-analyzer does. Some harnesses need
-more: `debuginfo.py` needs gdb and `llvm-dwarfdump`, `remote.py` needs a MinIO or SeaweedFS binary,
-`storefull.py` needs passwordless `sudo` to mount a tmpfs.
+more: `debuginfo.py` needs gdb and `llvm-dwarfdump`, `storefull.py` needs passwordless `sudo` to
+mount a tmpfs.
 
     cargo +"$(cat harness/toolchain)" build -p blaze-engine --release
     cd harness
@@ -192,21 +192,25 @@ written from cargo again, and a change to one is a change to what blaze expects.
 | `tiers.py` | Tiers ([tiers.md](tiers.md)): `demo/lifebench` running under the daemon reaches levels 2 and 3 with output identical to blaze's build from nothing with `BLAZE_TIER=off`, an edit of a tiered function demotes it and is applied at once, and `BLAZE_TIER=off` changes nothing. macOS on AArch64 with `--features llvm`; it exits 0 elsewhere |
 | `tierbench.py` | The benchmark table of [tiers.md](tiers.md): `demo/lifebench` at level 1, 2 and 3 under a daemon and as cargo builds it (release, and `-O3` with the dev profile's checks), in interleaved rounds, the steady rate of each; `--together` runs a round's builds at once, for a loaded machine. Measures; checks nothing; not in CI |
 
-### The store and the remote
+### The store
+
+The `store*.py` harnesses and `fuzz/store.py` run v2's daemon (`blaze serve`, its store
+`<home>/v2/store` as `crates/blaze-cas` lays it out) through `harness/storelib.py`, and take one
+typed JSON input naming the `blaze` command line (`{"blaze": "target/release/blaze"}`). Linux
+and macOS: v2's command line speaks to its daemon over a Unix socket. v2 has no remote of its
+own to test here: its remote is the read-through tier of `crates/blaze-cas/src/remote.rs`.
 
 | Script | What it checks |
 |---|---|
 | `keys.py '{"cases": [...], "shard": {"index": K, "count": N}}'` | Whether the store ever hands a build code compiled from something else. One case per thing code depends on besides its file's text; `cases` picks those whose names contain one of its strings, `shard` every Nth build from the Kth (CI's `keys-1..3`) |
-| `storekills.py` | The daemon killed at random moments while writing its store |
-| `storecorrupts.py` | Packs damaged on disk, and stores of other formats |
-| `storefull.py` | A store on a disk with no room |
-| `storeshared.py` | Several daemons and `blaze-engine cache` commands on one store at once |
-| `storebuilds.py` | A store one build of blaze wrote serves another build of the same sources: the store keys by what blaze was built from, not by the bytes of its executable ([#105](https://github.com/indexable-inc/blaze/issues/105)). Linux and macOS |
-| `storerevisions.py` | A fresh daemon on a checkout edited before it started, and on the undo of that edit from a store holding only the edited revision, gets nothing stale: each case changes one thing a function's code depends on besides its own text (a callee's body or signature, an inline helper, a rebound import, a module constant, a field, a layout, a constant table), and both builds have to print what a cold build of the same tree prints. The acceptance test of a per-function store key ([#1336](https://github.com/indexable-inc/blaze/issues/1336), [#1291](https://github.com/indexable-inc/blaze/issues/1291)); it asserts no reuse. From astral-experiments/blaze#66-#78. `uv run`, typed JSON. Linux and macOS |
+| `storekills.py` | v2's daemon killed (SIGKILL) at random moments while it opens, builds into and commits its store: after each kill the next daemon in the same home, with or without its journal and image, opens the store and builds what a build from nothing prints |
+| `storecorrupts.py` | A head, index, pack or `file-*` of the store flipped, cut, grown, zeroed, replaced or removed: the next daemon refuses to start naming the file, or a build stops naming it, or the build prints what a build from nothing does; a head of an older, newer or no format is refused naming the head and the format, and the store left as it was |
+| `storefull.py` | The store on a tmpfs of its own with no room: the daemon refuses saying the disk is full, or each build is right or stops saying so; with room the store opens and builds right, and room made under a running daemon is kept by the next. Linux |
+| `storeguards.py` | The store is its user's alone: the directory 0700 and its files 0600, a pack others can write to not read, a store directory others can write to refused, each said naming the file. Fails until blaze-cas checks ownership (queue 00999) |
+| `storetracked.py` | A daemon on a store holding the checkout's code (with nothing else of the home), and one in another home with a copy of that store on a copy of the checkout elsewhere, build it right, and every edit after: a generic body, closures moved, a static, an `#[inline]` function, an `impl Trait`'s closure, all taken back ([#105](https://github.com/indexable-inc/blaze/issues/105), [#216](https://github.com/indexable-inc/blaze/issues/216)) |
+| `storerevisions.py` | A fresh daemon on a checkout edited before it started, and on the undo of that edit from a store holding only the edited revision, gets nothing stale: each case changes one thing a function's code depends on besides its own text (a callee's body or signature, an inline helper, a rebound import, a module constant, a field, a layout, a constant table), and both builds have to print what a cold build of the same tree prints. The acceptance test of v2's keys by every input ([#1336](https://github.com/indexable-inc/blaze/issues/1336), [#1291](https://github.com/indexable-inc/blaze/issues/1291), [#1439](https://github.com/indexable-inc/blaze/issues/1439)); it asserts no reuse and prints the `blaze-work` counts. From astral-experiments/blaze#66-#78. `uv run` |
 | `deepnames.py` | Closures nested 20 deep keep the store under 64 MB, and a second daemon finds their entries again: a type spelled out longer than 1 KB is named by its hash (issue #29) |
 | `expansions.py` | Uses the native proc-macro server. A second daemon on one store finds every derive and attribute expansion the first kept, and after an edit, with `BLAZE_PROC_MACRO_CACHE=check`, none expands otherwise than it was kept (issue #38) |
-| `remote.py`, `s3fake.py` | A store shared by two machines through an S3 service, with the transfer broken, objects spoiled and manifests forged |
-| `packs.py` | Not a check: the sealed pack's layout ([cache.md](cache.md)) read and written, for `remote.py`, `storeguards.py` and `bench.py` |
 | `deps.py` | cargo's builds of registry crates pushed and pulled. Builds offline from cargo's registry cache, so it does not run on a clean CI machine |
 | `netdown.py` | No build waits on the network ([cache.md](cache.md), "The standard library"): hello world built whole with the standard library's remote served fine, slowly, hung and at an address nothing answers. A warm store builds as fast as with the remote fine and prints no error; a cold one compiles the library from the start, as fast as with `BLAZE_STD_FROM=off`, and says the fetch failed in one line at most |
 

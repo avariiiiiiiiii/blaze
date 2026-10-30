@@ -20,7 +20,13 @@ use blaze_ids::ContentId;
 
 use crate::{ObjectFormat, Target};
 
-const ID_DOMAIN: &str = "blaze v2 toolchain id 1";
+const ID_DOMAIN: &str = "blaze v2 toolchain id 2";
+
+/// The nightly blaze is pinned to (`harness/toolchain`).
+const NIGHTLY: &str = include_str!("../../../harness/toolchain").trim_ascii_end();
+
+/// The code generator's producer: bump it whenever what it emits for the same input changes.
+const PRODUCER: &str = "blaze v2 codegen 1";
 
 /// The version of Cranelift blaze is built with, as `Cargo.lock` has it (checked there).
 const CRANELIFT: &str = "0.136.2";
@@ -200,7 +206,7 @@ pub fn toolchain(target: &str, rustflags: &[String], runs: Runs) -> Result<Toolc
         }
     };
     Ok(Toolchain {
-        id: id()?,
+        id: id(),
         // alloc: per toolchain made, a few names
         target: target.to_owned(),
         arch,
@@ -232,17 +238,14 @@ pub fn select(toolchain: &Toolchain) -> Result<(), String> {
     Ok(())
 }
 
-/// blaze's own code identity with the pinned nightly it compiles against: the store's name
-/// of the running build (`blaze_store::build_name`), which is what it was built from (else
-/// the bytes of its executable) and the toolchain it was told of.
-fn id() -> Result<ContentId, String> {
-    let name = blaze_store::build_name().ok_or_else(|| {
-        "blaze's code identity is not known: the store was not told the toolchain blaze \
-         compiles against (`blaze_store::compiles_against`)"
-            // alloc: an error
-            .to_owned()
-    })?;
-    Ok(ContentId::of(ID_DOMAIN, name.as_bytes()))
+/// The pinned nightly blaze compiles against and the code generator's producer (#1439): the
+/// backends' versions are fields of their own.
+fn id() -> ContentId {
+    let mut named = [0u8; NIGHTLY.len() + 1 + PRODUCER.len()];
+    named[..NIGHTLY.len()].copy_from_slice(NIGHTLY.as_bytes());
+    named[NIGHTLY.len()] = b'\n';
+    named[NIGHTLY.len() + 1..].copy_from_slice(PRODUCER.as_bytes());
+    ContentId::of(ID_DOMAIN, &named)
 }
 
 /// The pinned LLVM's version and commit; `None` for a blaze built without it.

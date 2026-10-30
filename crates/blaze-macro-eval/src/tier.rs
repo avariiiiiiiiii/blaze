@@ -31,9 +31,14 @@ use blaze_ids::ContentId;
 
 pub(crate) mod bind;
 pub(crate) mod confine;
+pub(crate) mod glue;
 pub(crate) mod heap;
+pub(crate) mod load;
+#[allow(unsafe_code)]
+pub(crate) mod machine;
 pub(crate) mod memory;
 pub(crate) mod region;
+pub(crate) mod shims;
 pub(crate) mod table;
 
 #[cfg(test)]

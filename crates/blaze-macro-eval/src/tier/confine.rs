@@ -29,7 +29,7 @@ use cranelift_codegen::{
 
 use super::{
     bind::{Refusal, Use, Why},
-    region::{Layout, cell},
+    region::{Layout, TAIL_GUARD, cell},
     table::{SIG, Sig, Signatures},
 };
 use crate::guest::Stop;
@@ -106,14 +106,35 @@ pub(crate) fn confine(
         return Err(Stop(format!("has a name in the compiled tier's own namespace in `{function}`")));
     }
 
-    // Every signature takes `vmctx` last; none passes a struct on the machine's stack.
+    // Every signature takes `vmctx` last. A struct argument (x86-64's `byval`) is copied by the
+    // call from the confined host address of the caller's guest pointer, so the copy reads at
+    // most its size past the region's last byte, within the tail guard; the callee copies it
+    // on to its shadow frame. None is returned.
     let vmctx_param = ir::AbiParam::special(types::I64, ArgumentPurpose::VMContext);
-    let struct_argument = |sig: &ir::Signature| {
-        sig.params.iter().chain(&sig.returns).any(|it| matches!(it.purpose, ArgumentPurpose::StructArgument(_)))
+    let struct_return = |sig: &ir::Signature| {
+        sig.returns.iter().any(|it| matches!(it.purpose, ArgumentPurpose::StructArgument(_)))
     };
-    if struct_argument(&func.signature) || func.dfg.signatures.values().any(struct_argument) {
-        return Err(refuse(Why::Operation("a struct argument on the machine's stack")));
+    if struct_return(&func.signature) || func.dfg.signatures.values().any(struct_return) {
+        return Err(refuse(Why::Operation("a struct returned on the machine's stack")));
     }
+    let unconfinable = |sig: &ir::Signature| {
+        sig.params.iter().any(|it| {
+            matches!(it.purpose, ArgumentPurpose::StructArgument(size) if size as usize > TAIL_GUARD || size % 8 != 0)
+        })
+    };
+    if unconfinable(&func.signature) || func.dfg.signatures.values().any(unconfinable) {
+        return Err(refuse(Why::Operation("a struct argument past 64 KiB or of no whole words")));
+    }
+    let structs: Vec<(ir::Value, u32)> = func
+        .signature
+        .params
+        .iter()
+        .zip(func.dfg.block_params(entry))
+        .filter_map(|(param, &value)| match param.purpose {
+            ArgumentPurpose::StructArgument(size) => Some((value, size)),
+            _ => None,
+        })
+        .collect(); // alloc: per function compiled, its struct parameters
     func.signature.params.push(vmctx_param);
     for sig in func.dfg.signatures.values_mut() {
         sig.params.push(vmctx_param);
@@ -176,6 +197,19 @@ pub(crate) fn confine(
         };
         size = end;
     }
+    // Each struct parameter's copy, after the slots.
+    // alloc: one per struct parameter, per function compiled
+    let mut copies: Vec<(ir::Value, u32, u32)> = Vec::with_capacity(structs.len());
+    for &(from, len) in &structs {
+        let Some(at) = size.checked_next_multiple_of(SHADOW_ALIGN) else {
+            return Err(refuse(Why::Operation("a stack frame past 4 GiB")));
+        };
+        copies.push((from, at, len));
+        let Some(end) = at.checked_add(len) else {
+            return Err(refuse(Why::Operation("a stack frame past 4 GiB")));
+        };
+        size = end;
+    }
     let Some(size) = size.checked_next_multiple_of(SHADOW_ALIGN) else {
         return Err(refuse(Why::Operation("a stack frame past 4 GiB")));
     };
@@ -209,7 +243,9 @@ pub(crate) fn confine(
     let sp_cell = (Layout::HEADER + cell::SHADOW_SP) as i32;
     let limit_cell = (Layout::HEADER + cell::SHADOW_LIMIT) as i32;
     let mut frame = None;
-    if !slots.is_empty() || !handlers.is_empty() {
+    // alloc: one per struct parameter, per function compiled
+    let mut moved: Vec<(ir::Value, ir::Value)> = Vec::with_capacity(copies.len());
+    if !slots.is_empty() || !handlers.is_empty() || !copies.is_empty() {
         let mut cur = FuncCursor::new(func).at_first_insertion_point(entry);
         let sp = cur.ins().load(types::I64, trusted, vmctx, sp_cell);
         let own = if size > 0 {
@@ -224,7 +260,26 @@ pub(crate) fn confine(
         } else {
             sp
         };
+        // The caller's copy is on the machine's stack, which no guest address names: its
+        // words go to the frame, unconfined (the pass made both addresses), and the function
+        // uses the frame's guest address from here on.
+        for &(from, at, len) in &copies {
+            let guest = cur.ins().iadd_imm(own, i64::from(at));
+            let to = cur.ins().iadd(vmctx, guest);
+            for word in (0..len).step_by(8) {
+                let value = cur.ins().load(types::I64, trusted, from, word as i32);
+                cur.ins().store(trusted, value, to, word as i32);
+            }
+            moved.push((from, guest));
+        }
         frame = Some((sp, own));
+    }
+    if !moved.is_empty() {
+        for &inst in &insts {
+            func.dfg.map_inst_values(inst, |value| {
+                moved.iter().find(|(from, _)| *from == value).map_or(value, |(_, guest)| *guest)
+            });
+        }
     }
 
     let mut table: Option<(ir::GlobalValue, ir::GlobalValue)> = None;
@@ -312,10 +367,12 @@ pub(crate) fn confine(
                 };
                 func.replace(inst).symbol_value(ty, gv);
             }
-            InstructionData::Call { .. } | InstructionData::TryCall { .. } => {
+            InstructionData::Call { func_ref, .. } | InstructionData::TryCall { func_ref, .. } => {
                 if opcode == Opcode::ReturnCall {
                     restore(func, inst, vmctx, frame, sp_cell);
                 }
+                let sig_ref = func.dfg.ext_funcs[func_ref].signature;
+                struct_args(func, inst, vmctx, sig_ref, 0, function)?;
                 push_arg(func, inst, vmctx);
             }
             InstructionData::CallIndirect { .. } | InstructionData::TryCallIndirect { .. } => {
@@ -343,6 +400,7 @@ pub(crate) fn confine(
                 }
                 let code = checked(func, inst, pointer, sig, base, end);
                 func.dfg.inst_args_mut(inst)[0] = code;
+                struct_args(func, inst, vmctx, sig_ref, 1, function)?;
                 push_arg(func, inst, vmctx);
             }
             InstructionData::MultiAry { .. } if opcode == Opcode::Return => {
@@ -432,6 +490,27 @@ fn restore(func: &mut ir::Function, inst: ir::Inst, vmctx: ir::Value, frame: Opt
     {
         FuncCursor::new(func).at_inst(inst).ins().store(ir::MemFlagsData::trusted(), sp, vmctx, sp_cell);
     }
+}
+
+/// Each struct argument of the call `inst` (of signature `sig_ref`, its arguments from `skip`
+/// on) given as the confined host address of its guest pointer, which the call copies from.
+fn struct_args(
+    func: &mut ir::Function,
+    inst: ir::Inst,
+    vmctx: ir::Value,
+    sig_ref: ir::SigRef,
+    skip: usize,
+    function: &str,
+) -> Result<(), Stop> {
+    for at in 0..func.dfg.signatures[sig_ref].params.len() {
+        if !matches!(func.dfg.signatures[sig_ref].params[at].purpose, ArgumentPurpose::StructArgument(_)) {
+            continue;
+        }
+        let Some(&p) = func.dfg.inst_args(inst).get(skip + at) else { continue };
+        let host = confined(func, inst, vmctx, p, 0, function)?;
+        func.dfg.inst_args_mut(inst)[skip + at] = host;
+    }
+    Ok(())
 }
 
 /// `vmctx` as the call's last argument.

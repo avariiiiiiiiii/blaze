@@ -16,11 +16,11 @@ use crate::{
     wire::{self, ASK_KIND, FAILED_KIND, Frame, READY_KIND},
 };
 
-fn target_of(n: u32) -> u64 {
+pub(super) fn target_of(n: u32) -> u64 {
     0x50_0000 + u64::from(n) * 0x40
 }
 
-fn start<C: Compiler>(count: u32, compiler: C, workers: u32) -> (Runner<C, Addresses, Mail>, Arc<Mailbox>) {
+pub(super) fn start<C: Compiler>(count: u32, compiler: C, workers: u32) -> (Runner<C, Addresses, Mail>, Arc<Mailbox>) {
     let functions: Vec<Function> = (0..count).map(function).collect();
     let mail = Arc::new(Mailbox::default());
     let runner = Runner::start(
@@ -37,7 +37,7 @@ fn start<C: Compiler>(count: u32, compiler: C, workers: u32) -> (Runner<C, Addre
 }
 
 /// Past [`crate::runner`]'s `ALONE`, so the next ask is a lone one.
-fn pause() {
+pub(super) fn pause() {
     std::thread::sleep(Duration::from_millis(1));
 }
 
@@ -82,8 +82,8 @@ fn a_hits_callees_are_prefetched_by_the_workers() {
             self.0.lock().unwrap().push(at);
             Ok(compiled(n, &[], &[]))
         }
-        fn hit(&self, at: InstanceKey) -> Option<CompiledFunction> {
-            (at == key(0)).then(|| compiled(0, &(1..8).collect::<Vec<_>>(), &[]))
+        fn hit(&self, at: InstanceKey) -> Option<Result<CompiledFunction, String>> {
+            (at == key(0)).then(|| Ok(compiled(0, &(1..8).collect::<Vec<_>>(), &[])))
         }
         fn tier_up(&self, at: InstanceKey, _: Tier) -> Result<CompiledFunction, String> {
             Err(format!("{at:?}: not tiered"))

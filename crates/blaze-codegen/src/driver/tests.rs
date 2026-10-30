@@ -690,6 +690,7 @@ fn a_level_without_its_backend_names_the_function() {
     assert_eq!(errors[0].item, item(1));
 }
 
+mod flight;
 mod later;
 mod masks;
 mod pieces;

@@ -16,7 +16,7 @@ use crate::channel::Channel;
 use crate::fence::{MOST_FRAMES, Thread};
 use crate::frame::{Kind, Reader, Writer, kinds};
 use crate::handshake::{Grant, HOST_VAR, Hello, VERSION, host_var};
-use crate::{Access, Error, Format, ask, image, sys};
+use crate::{Access, Error, Format, ask, bind, image, sys};
 
 pub struct Attached {
     control: &'static [AtomicU64],
@@ -199,13 +199,14 @@ fn open(var: &[u8], out: &mut Option<Channel>) -> Result<Attached, Error> {
         }
     };
     grant.check(&own, page)?;
+    let slide = header.wrapping_sub(grant.header);
+    bind::check_slide(&grant, slide)?;
     let objects = sys::recv_objects(channel, grant.objects.len())?;
     for (index, (object, (len, _))) in objects.iter().zip(&grant.objects).enumerate() {
         if object.len() != *len {
             return Err(Error::new(format!("object {index} is {:#x} bytes, where the grant says {len:#x}", object.len())));
         }
     }
-    let slide = header.wrapping_sub(grant.header);
     let control = &objects[1];
     let at = control.map_anywhere(channel, Access::Shared)?;
     let words = sys::adopt_words(at, control.len(), crate::fence::CONTROL_BYTES)?;
@@ -219,6 +220,20 @@ fn open(var: &[u8], out: &mut Option<Channel>) -> Result<Attached, Error> {
         return Err(Error::new(format!("the asks at {at:#x} are not set up")));
     }
     sys::overlay(channel, &objects, &grant.overlays, slide)?;
+    let mut scope = sys::Scope::new();
+    bind::bind(
+        &grant,
+        slide,
+        |name| scope.find(name),
+        |at, value| {
+            // SAFETY: `bind` stores only at a place plus `slide` that `Grant::decode` proved
+            // is 8 bytes inside an overlay of `Access::Copy`, which `sys::overlay` just mapped
+            // at its linked address plus `slide`, readable, writable and private to this
+            // process (`MAP_PRIVATE`, an anonymous copy on macOS, a copy-on-write view on
+            // Windows): never the memory object. No other thread of the program runs yet.
+            unsafe { sys::store_private(at, value) }
+        },
+    )?;
 
     let mut started = Vec::with_capacity(8);
     Writer::new(&mut started).u64(sys::thread_id());

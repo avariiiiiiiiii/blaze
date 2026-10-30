@@ -27,7 +27,7 @@ use base_db::{Crate, EditionedFileId};
 use expect_test::Expect;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, GenericDefId, HasModule, ModuleDefId, ModuleId,
-    SyntheticSyntax, VariantId,
+    VariantId,
     expr_store::{Body, ExpressionStore, ExpressionStoreSourceMap, SelfParamPtr},
     hir::{BindingId, ClosureKind, Expr, ExprId, Pat, PatId},
     item_scope::ItemScope,
@@ -39,8 +39,8 @@ use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use stdx::format_to;
 use syntax::{
-    SyntaxNode,
     ast::{self, AstNode, HasName},
+    view::{self, AstNode as _},
 };
 use hir_expand::fixture;
 
@@ -237,7 +237,7 @@ fn check_impl(
                     Some(value) => value,
                     None => continue,
                 };
-                let range = node.as_ref().original_file_range_rooted(&db);
+                let range = node.original_file_range_rooted_view(&db);
                 if let Some(expected) = types.remove(&range) {
                     let actual = if display_source {
                         ty.display_source_code(&db, def.module(&db), true).unwrap()
@@ -254,7 +254,7 @@ fn check_impl(
                     Some(value) => value,
                     None => continue,
                 };
-                let range = node.as_ref().original_file_range_rooted(&db);
+                let range = node.original_file_range_rooted_view(&db);
                 if let Some(expected) = types.remove(&range) {
                     let actual = if display_source {
                         ty.display_source_code(&db, def.module(&db), true).unwrap()
@@ -292,7 +292,7 @@ fn check_impl(
                 }) else {
                     continue;
                 };
-                let range = node.as_ref().original_file_range_rooted(&db);
+                let range = node.original_file_range_rooted_view(&db);
                 let actual = format!(
                     "expected {}, got {}",
                     expected.display_test(&db, display_target),
@@ -311,7 +311,7 @@ fn check_impl(
                     Some(value) => value,
                     None => continue,
                 };
-                let range = node.as_ref().original_file_range_rooted(&db);
+                let range = node.original_file_range_rooted_view(&db);
                 if let Some(expected) = types.remove(&range) {
                     let actual = salsa::attach(&db, || {
                         if display_source {
@@ -351,46 +351,31 @@ fn check_impl(
     });
 }
 
-fn expr_node(
+fn expr_node<'db>(
     source_map: &ExpressionStoreSourceMap,
     expr: ExprId,
-    db: &TestDB,
-) -> Option<InFile<SyntaxNode>> {
-    Some(match source_map.expr_syntax(expr) {
-        Ok(sp) => {
-            let root = sp.file_id.parse_or_expand(db);
-            sp.map(|ptr| ptr.to_node(&root).syntax().clone())
-        }
-        Err(SyntheticSyntax) => return None,
-    })
+    db: &'db TestDB,
+) -> Option<InFile<view::Node<'db>>> {
+    let ptr = source_map.expr_syntax(expr).ok()?;
+    Some(ptr.with_value(ptr.to_view(db).syntax()))
 }
 
-fn pat_node(
+fn pat_node<'db>(
     source_map: &ExpressionStoreSourceMap,
     pat: PatId,
-    db: &TestDB,
-) -> Option<InFile<SyntaxNode>> {
-    Some(match source_map.pat_syntax(pat) {
-        Ok(sp) => {
-            let root = sp.file_id.parse_or_expand(db);
-            sp.map(|ptr| ptr.to_node(&root).syntax().clone())
-        }
-        Err(SyntheticSyntax) => return None,
-    })
+    db: &'db TestDB,
+) -> Option<InFile<view::Node<'db>>> {
+    let ptr = source_map.pat_syntax(pat).ok()?;
+    Some(ptr.with_value(ptr.to_view(db).syntax()))
 }
 
-fn type_node(
+fn type_node<'db>(
     source_map: &ExpressionStoreSourceMap,
     type_ref: TypeRefId,
-    db: &TestDB,
-) -> Option<InFile<SyntaxNode>> {
-    Some(match source_map.type_syntax(type_ref) {
-        Ok(sp) => {
-            let root = sp.file_id.parse_or_expand(db);
-            sp.map(|ptr| ptr.to_node(&root).syntax().clone())
-        }
-        Err(SyntheticSyntax) => return None,
-    })
+    db: &'db TestDB,
+) -> Option<InFile<view::Node<'db>>> {
+    let ptr = source_map.type_syntax(type_ref).ok()?;
+    Some(ptr.with_value(ptr.to_view(db).syntax()))
 }
 
 fn infer(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {

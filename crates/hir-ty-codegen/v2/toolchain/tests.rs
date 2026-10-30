@@ -9,7 +9,6 @@ fn here(flags: &[&str]) -> Result<Toolchain, String> {
 }
 
 fn runs(target: &str, flags: &[&str], runs: Runs) -> Result<Toolchain, String> {
-    blaze_store::compiles_against("hir-ty-codegen v2 toolchain tests");
     let flags: Vec<String> = flags.iter().map(|it| (*it).to_owned()).collect();
     toolchain(target, &flags, runs)
 }
@@ -32,6 +31,13 @@ fn no_flags_is_the_targets_baseline() {
     assert_eq!(it.relocation, Relocation::Pic);
     assert_eq!(it.cranelift, CRANELIFT);
     assert_eq!(it.id, of(LINUX, &[]).unwrap().id, "one identity for one blaze");
+}
+
+#[test]
+fn the_identity_is_the_pinned_nightly_and_the_producer() {
+    assert!(NIGHTLY.starts_with("nightly-") && !NIGHTLY.contains(char::is_whitespace), "{NIGHTLY:?}");
+    let named = format!("{NIGHTLY}\n{PRODUCER}");
+    assert_eq!(of(LINUX, &[]).unwrap().id, ContentId::of(ID_DOMAIN, named.as_bytes()));
 }
 
 #[test]

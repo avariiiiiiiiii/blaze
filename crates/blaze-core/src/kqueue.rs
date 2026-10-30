@@ -452,6 +452,7 @@ impl Kqueue {
             | Effect::WriteAt { .. }
             | Effect::Rename { .. }
             | Effect::Mode { .. }
+            | Effect::Private { .. }
             | Effect::Times { .. }
             | Effect::Clone { .. }
             | Effect::Link { .. }

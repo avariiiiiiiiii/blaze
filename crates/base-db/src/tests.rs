@@ -10,10 +10,7 @@ use salsa::Durability;
 use span::{Edition, TextSize};
 use syntax::TextRange;
 use triomphe::Arc;
-use vfs::{
-    AbsPathBuf, AnchoredPath, FileId, VfsPath,
-    file_set::{FileSet, FileSetConfig},
-};
+use crate::{AbsPathBuf, AnchoredPath, FileId, FileSet, FileSetConfig, VfsPath};
 
 use crate::{
     BuiltDependency, ContentId, Crate, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin,

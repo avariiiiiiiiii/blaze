@@ -88,7 +88,7 @@ use smallvec::SmallVec;
 use span::{Edition, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
 use stdx::format_to;
 use syntax::{
-    AstNode, SmolStr, SyntaxNode, TextSize, ToSmolStr, ast,
+    AstNode, SmolStr, TextSize, ToSmolStr, ast,
     view::{self, AstNode as _},
 };
 use triomphe::Arc;
@@ -464,28 +464,8 @@ impl ModuleOrigin {
         }
     }
 
-    /// Returns a node which defines this module.
+    /// Returns a node which defines this module, a view of the tree the database keeps.
     /// That is, a file or a `mod foo {}` with items.
-    pub fn definition_source(&self, db: &Db) -> InFile<ModuleSource> {
-        match self {
-            &ModuleOrigin::File { definition: editioned_file_id, .. }
-            | &ModuleOrigin::CrateRoot { definition: editioned_file_id } => {
-                let sf = editioned_file_id.parse(db).tree();
-                InFile::new(editioned_file_id.into(), ModuleSource::SourceFile(sf))
-            }
-            &ModuleOrigin::Inline { definition, definition_tree_id } => InFile::new(
-                definition_tree_id.file_id(),
-                ModuleSource::Module(
-                    AstId::new(definition_tree_id.file_id(), definition).to_node(db),
-                ),
-            ),
-            ModuleOrigin::BlockExpr { block, .. } => {
-                InFile::new(block.file_id, ModuleSource::BlockExpr(block.to_node(db)))
-            }
-        }
-    }
-
-    /// [`ModuleOrigin::definition_source`] as a view of the tree the database keeps.
     pub fn definition_source_view<'db>(&self, db: &'db Db) -> InFile<ModuleSourceView<'db>> {
         match self {
             &ModuleOrigin::File { definition: editioned_file_id, .. }
@@ -1449,17 +1429,13 @@ impl ModuleData {
         }
     }
 
-    /// Returns a node which defines this module. That is, a file or a `mod foo {}` with items.
-    pub fn definition_source(&self, db: &Db) -> InFile<ModuleSource> {
-        self.origin.definition_source(db)
-    }
-
-    /// [`ModuleData::definition_source`] as a view.
+    /// Returns a node which defines this module, as a view. That is, a file or a `mod foo {}`
+    /// with items.
     pub fn definition_source_view<'db>(&self, db: &'db Db) -> InFile<ModuleSourceView<'db>> {
         self.origin.definition_source_view(db)
     }
 
-    /// Same as [`ModuleData::definition_source`] but only returns the file id to prevent parsing the ASt.
+    /// Same as [`ModuleData::definition_source_view`] but only returns the file id to prevent parsing the AST.
     pub fn definition_source_file_id(&self) -> HirFileId {
         match self.origin {
             ModuleOrigin::File { definition, .. } | ModuleOrigin::CrateRoot { definition } => {
@@ -1511,26 +1487,7 @@ impl ModuleData {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModuleSource {
-    SourceFile(ast::SourceFile),
-    Module(ast::Module),
-    BlockExpr(ast::BlockExpr),
-}
-
-impl ModuleSource {
-    pub fn node(&self) -> SyntaxNode {
-        let node = match self {
-            ModuleSource::SourceFile(it) => it.syntax(),
-            ModuleSource::Module(it) => it.syntax(),
-            ModuleSource::BlockExpr(it) => it.syntax(),
-        };
-        // clone: an owned handle for the caller, a count bump
-        node.clone()
-    }
-}
-
-/// [`ModuleSource`] as views of the tree the database keeps.
+/// The node that defines a module, as views of the tree the database keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleSourceView<'db> {
     SourceFile(view::SourceFile<'db>),

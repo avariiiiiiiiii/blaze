@@ -70,7 +70,7 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | cargo | `crates/blaze-cargo/` but store's and usercode's paths, `crates/load-cargo/`, `crates/project-model/`, `crates/blaze-lower/`, `crates/blaze-units/`, `crates/blaze-tree/`, `crates/blaze-manifest/`, `crates/blaze-metadata/`, `crates/blaze-resolve/`, `crates/blaze-registry/`, `crates/blaze-source/`, `library/` |
 | diagnostics | `crates/blaze-diagnostics/` (new), `crates/ide-diagnostics/` |
 | core | `crates/blaze-core/`, `crates/blaze-graph/`, `docs/v2/plan/lanes/core/plane.md` |
-| vfs | `crates/blaze-vfs/`, `crates/vfs/`, `crates/vfs-notify/` |
+| vfs | `crates/blaze-vfs/` (v1 `vfs` and `vfs-notify` deleted 2026-10-30) |
 | format | `crates/blaze-ids/`, `crates/blaze-format/`, `crates/syntax-tree/`, `crates/syntax/`, `crates/parser/`, `crates/span/`, `crates/intern/`, `crates/tt/`, `crates/mbe/`, `crates/syntax-bridge/`, `crates/const-ast/`; in `crates/hir-def/src/`: `expr_store.rs`, `expr_store/`, `hir.rs`, `hir/`, `item_tree.rs`, `item_tree/` |
 | db | `crates/blaze-query/`, `vendor/salsa/`, `vendor/rustc_type_ir/`, `vendor/rustc_next_trait_solver/`, `vendor/salsa-macros/`, `vendor/salsa-macro-rules/`, `crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/` but format's files, `crates/hir-ty/` but items' and codegen's files, `crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/` |
 | items | `crates/blaze-items/`; in `crates/hir-ty/src/`: `method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs`, `layout.rs`, `layout/`, `drop.rs` |
@@ -101,7 +101,7 @@ coordinator's: a change there is a request.
 | `hir-ty-codegen` | changed: compiles one `Unit` to one `CompiledFunction` | codegen |
 | `hir-ty-mir` | changed: instances keyed by `Instance`, code dedupe, inlining edges | codegen |
 | `blaze-splice` | replaced by `blaze-link`; deleted at integration, 2026-10-30 | link |
-| `blaze-in-place` | replaced by `blaze-link` | link |
+| `blaze-in-place` | replaced by `blaze-link`; deleted at integration, 2026-10-30 | link |
 | `blaze-live` | changed: patches through `blaze-link`'s slots and commit | link |
 | `blaze-expand` | replaced: expansions keyed by `RunKey` with traced inputs; deleted at integration, 2026-10-30 | usercode |
 | `blaze-build-script`, `blaze-macro-wasm`, `blaze-wasi`, `proc-macro-api`, `proc-macro-srv` | changed: run in tracing sandboxes, from a warm pool | usercode |

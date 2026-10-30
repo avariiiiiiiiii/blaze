@@ -7,10 +7,10 @@
 use blaze_ids::rng::SplitMix64;
 
 use crate::frame::{self, FrameError, Header, Kind, Reader, Writer, kinds};
-use crate::handshake::{Grant, Hello, Overlay, Place, VERSION, hex, host_var, unhex};
+use crate::handshake::{Grant, Hello, Lookup, MOST_BINDS, MOST_NAME, Overlay, Place, VERSION, hex, host_var, unhex};
 use crate::image::tests::{R, RX, elf};
 use crate::sys::Rights;
-use crate::{Access, CodeMemory, CodeRange, Format, Layout, Segment};
+use crate::{Access, CodeMemory, CodeRange, Format, ImageWrite, Layout, Segment};
 
 fn random_bytes(rng: &mut SplitMix64, len: usize) -> Vec<u8> {
     let mut bytes = vec![0; len];
@@ -185,11 +185,36 @@ fn a_grant() -> Grant {
             (0x10_0000, Rights::Code),
         ],
         overlays: vec![
-            Overlay { object: 0, offset: P, len: 2 * P, at: 0x10_0000 + P, access: Access::Execute, place: Place::Code },
-            Overlay { object: 0, offset: 4 * P, len: 4 * P, at: 0x10_8000, access: Access::Execute, place: Place::Reserved },
-            Overlay { object: 3, offset: 0, len: P, at: 0x10_c000, access: Access::Shared, place: Place::Reserved },
-            Overlay { object: 4, offset: 0, len: 8 * P, at: 0x11_0000, access: Access::Copy, place: Place::Reserved },
+            Overlay {
+                object: 0,
+                offset: P,
+                len: 2 * P,
+                at: 0x10_0000 + P,
+                access: Access::Execute,
+                place: Place::Code,
+                image: false,
+            },
+            Overlay {
+                object: 0,
+                offset: 4 * P,
+                len: 4 * P,
+                at: 0x10_8000,
+                access: Access::Execute,
+                place: Place::Reserved,
+                image: false,
+            },
+            Overlay { object: 3, offset: 0, len: P, at: 0x10_c000, access: Access::Shared, place: Place::Reserved, image: false },
+            Overlay { object: 4, offset: 0, len: 8 * P, at: 0x11_0000, access: Access::Copy, place: Place::Reserved, image: true },
         ],
+        writes: vec![
+            ImageWrite { place: 0x11_0010, value: 0x11_2000, address: true },
+            ImageWrite { place: 0x11_0000 + 8 * P - 8, value: 0x40, address: false },
+        ],
+        lookups: vec![
+            Lookup { place: 0x11_0020, addend: 0, weak: false, name: 0, len: 6 },
+            Lookup { place: 0x11_0028, addend: -16, weak: true, name: 6, len: 10 },
+        ],
+        names: "malloc__rg_alloc".to_owned(),
     }
 }
 
@@ -234,6 +259,7 @@ fn a_grant_cut_or_mutated_is_an_error_not_a_panic() {
                 assert!(grant.span.start <= overlay.at && overlay.range().end <= grant.span.end);
             }
             assert!(grant.overlays.windows(2).all(|it| it[0].range().end <= it[1].at));
+            grant.check_binds().unwrap();
         }
         let len = rng.index(128);
         let _ = Grant::decode(&random_bytes(&mut rng, len));
@@ -290,6 +316,239 @@ fn a_grant_is_checked_against_the_image_relative_to_its_header() {
     refused(&|it| it.span.end += P, "not the executable the daemon wrote");
     refused(&|it| it.format = Format::MachO, "a grant for a MachO image");
     refused(&|it| it.overlays[2].len = P / 2, "not whole pages");
+}
+
+/// Where the writes' count is in an encoded grant: after the header, the objects and the
+/// overlays.
+fn writes_at(grant: &Grant) -> usize {
+    25 + 4 + 9 * grant.objects.len() + 4 + 35 * grant.overlays.len()
+}
+
+#[test]
+fn a_grants_writes_and_lookups_round_trip_and_refuse_short_or_oversized_counts() {
+    let grant = a_grant();
+    let decoded = Grant::decode(&encoded(&grant)).unwrap();
+    assert_eq!(decoded.writes, grant.writes);
+    assert_eq!(decoded.lookups.iter().map(|it| decoded.name(it)).collect::<Vec<_>>(), ["malloc", "__rg_alloc"]);
+    assert_eq!(decoded, grant);
+
+    let empty = Grant { writes: Vec::new(), lookups: Vec::new(), names: String::new(), ..a_grant() };
+    assert_eq!(Grant::decode(&encoded(&empty)), Ok(empty));
+
+    let bytes = encoded(&grant);
+    let writes = writes_at(&grant);
+    assert_eq!(bytes[writes..writes + 4], 2u32.to_le_bytes());
+    let lookups = writes + 4 + 17 * grant.writes.len();
+    assert_eq!(bytes[lookups..lookups + 4], 2u32.to_le_bytes());
+    // Counts past the bytes there are refused before anything is allocated for them.
+    for (at, count) in [(writes, u32::MAX), (writes, 3), (lookups, u32::MAX), (lookups, 3), (lookups, 1 << 30)] {
+        let mut forged = bytes.clone();
+        forged[at..at + 4].copy_from_slice(&count.to_le_bytes());
+        assert!(Grant::decode(&forged).is_err(), "a count of {count} at {at} was read");
+    }
+    // A name's length past the body, and past the most a name may have.
+    let name = lookups + 4 + 17;
+    assert_eq!(bytes[name..name + 4], 6u32.to_le_bytes());
+    let mut forged = bytes.clone();
+    forged[name..name + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(Grant::decode(&forged).is_err());
+    let long = "x".repeat(MOST_NAME + 1);
+    let oversized = Grant {
+        lookups: vec![Lookup { place: 0x11_0020, addend: 0, weak: false, name: 0, len: long.len() as u32 }],
+        names: long.clone(),
+        ..a_grant()
+    };
+    assert!(oversized.check_binds().is_err());
+    let error = Grant::decode(&encoded(&oversized)).unwrap_err();
+    assert!(error.what.contains(&format!("{} bytes", MOST_NAME + 1)), "{error}");
+    let mut most = Grant { names: long[..MOST_NAME].to_owned(), ..oversized.clone() };
+    most.lookups[0].len = MOST_NAME as u32;
+    assert_eq!(Grant::decode(&encoded(&most)), Ok(most));
+    assert!(MOST_BINDS * 17 > frame::MOST_BODY as usize, "the frame bounds what a grant carries first");
+}
+
+#[test]
+fn a_grant_stores_only_into_a_dependency_images_private_copy() {
+    let refused = |change: &dyn Fn(&mut Grant), why: &str| {
+        let mut grant = a_grant();
+        change(&mut grant);
+        assert!(grant.check_binds().is_err(), "the daemon made a grant that {why}");
+        let error = Grant::decode(&encoded(&grant)).unwrap_err();
+        assert!(!error.what.is_empty(), "{why}");
+    };
+    // Into the arena, the cells, the code, or outside every overlay.
+    refused(&|it| it.writes[0].place = 0x10_8000, "writes code");
+    refused(&|it| it.writes[0].place = 0x10_c000, "writes the cells");
+    refused(&|it| it.writes[0].place = 0x10_0000 + P, "writes the image's code");
+    refused(&|it| it.writes[0].place = 0x10_f000, "writes between overlays");
+    refused(&|it| it.lookups[0].place = 0x10_0000, "binds a header");
+    // Across the end of the copy, or past the top of the address space.
+    refused(&|it| it.writes[1].place = 0x11_0000 + 8 * P - 4, "writes past the copy");
+    refused(&|it| it.lookups[1].place = u64::MAX - 3, "wraps");
+    // A copy not flagged a dependency image's, or the image's data not a copy.
+    refused(&|it| it.overlays[3].image = false, "writes a fixed map that is no dependency image");
+    refused(&|it| it.overlays[3].access = Access::Read, "writes read-only data");
+    refused(&|it| it.overlays[3].access = Access::Execute, "writes code");
+    // Names empty, with a NUL, or out of the names.
+    refused(&|it| it.lookups[0].len = 0, "binds an empty name");
+    refused(&|it| it.names = "mal\0oc__rg_alloc".to_owned(), "binds a name with a NUL");
+    refused(&|it| it.lookups[1].len = 11, "binds a name past the names");
+    // Only a fixed map is a dependency image: never the code memory, the arena or the cells.
+    for overlay in 0..3 {
+        let mut grant = a_grant();
+        grant.overlays[overlay].image = true;
+        assert!(Grant::decode(&encoded(&grant)).is_err(), "overlay {overlay} flagged a dependency image");
+    }
+    // Flags other than 0 and 1.
+    let bytes = encoded(&a_grant());
+    let image = writes_at(&a_grant()) - 1;
+    let address = writes_at(&a_grant()) + 4 + 16;
+    let weak = writes_at(&a_grant()) + 4 + 17 * 2 + 4 + 16;
+    for at in [image, address, weak] {
+        assert!(bytes[at] <= 1);
+        let mut forged = bytes.clone();
+        forged[at] = 2;
+        assert!(Grant::decode(&forged).is_err(), "a flag of 2 at {at}");
+    }
+}
+
+/// The run's private copy of the dependency image's data and the memory object it was copied
+/// from, as `sys::overlay` leaves them for an `Access::Copy` overlay on every platform: the
+/// model where a platform can't be run here.
+struct Copied {
+    at: u64,
+    object: Vec<u8>,
+    copy: Vec<u8>,
+}
+
+impl Copied {
+    fn of(grant: &Grant, slide: u64) -> Copied {
+        let map = grant.overlays.iter().find(|it| it.image).unwrap();
+        let object: Vec<u8> = (0..map.len).map(|it| it as u8 | 0x80).collect();
+        Copied { at: map.at.wrapping_add(slide), copy: object.clone(), object }
+    }
+
+    fn store(&mut self, at: u64, value: u64) {
+        let offset = (at - self.at) as usize;
+        self.copy[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn word(&self, at: u64) -> u64 {
+        let offset = (at - self.at) as usize;
+        u64::from_le_bytes(self.copy[offset..offset + 8].try_into().unwrap())
+    }
+
+    fn untouched(&self, at: u64) -> bool {
+        let offset = (at - self.at) as usize;
+        self.copy[offset..offset + 8] == self.object[offset..offset + 8]
+    }
+}
+
+#[test]
+fn the_start_stores_writes_and_lookups_in_the_private_copy_and_a_weak_miss_as_zero() {
+    let grant = Grant::decode(&encoded(&a_grant())).unwrap();
+    let mut copied = Copied::of(&grant, 0);
+    let mut asked = Vec::new();
+    crate::bind::bind(
+        &grant,
+        0,
+        |name| {
+            asked.push(name.to_owned());
+            Ok((name == "malloc").then_some(0x7f12_3456_7000))
+        },
+        |at, value| copied.store(at, value),
+    )
+    .unwrap();
+    assert_eq!(asked, ["malloc", "__rg_alloc"]);
+    assert_eq!(copied.word(0x11_0010), 0x11_2000);
+    assert_eq!(copied.word(0x11_0000 + 8 * P - 8), 0x40);
+    assert_eq!(copied.word(0x11_0020), 0x7f12_3456_7000);
+    assert_eq!(copied.word(0x11_0028), 0, "a weak miss is 0, not its addend");
+    assert!(copied.untouched(0x11_0030));
+    assert_eq!(copied.object, Copied::of(&grant, 0).object, "the memory object never changes");
+
+    // A weak lookup found gets its addend.
+    let mut copied = Copied::of(&grant, 0);
+    crate::bind::bind(&grant, 0, |_| Ok(Some(0x1000)), |at, value| copied.store(at, value)).unwrap();
+    assert_eq!(copied.word(0x11_0028), 0x1000 - 16);
+}
+
+#[test]
+fn a_strong_miss_fails_the_start_naming_it_and_is_never_stored() {
+    let mut grant = a_grant();
+    grant.lookups.push(Lookup { place: 0x11_0030, addend: 0, weak: false, name: 0, len: 6 });
+    let grant = Grant::decode(&encoded(&grant)).unwrap();
+    let mut copied = Copied::of(&grant, 0);
+    let error = crate::bind::bind(&grant, 0, |_| Ok(None), |at, value| copied.store(at, value)).unwrap_err();
+    assert!(error.what.contains("`malloc`, `malloc`"), "{error}");
+    assert!(copied.untouched(0x11_0020) && copied.untouched(0x11_0030), "a strong miss stored");
+    assert_eq!(copied.word(0x11_0028), 0, "the weak one is still 0");
+
+    let names: String = (0..12).map(|it| format!("f{it:02}")).collect();
+    let many = Grant {
+        writes: Vec::new(),
+        lookups: (0..12).map(|it| Lookup { place: 0x11_0100 + 8 * it as u64, addend: 0, weak: false, name: 3 * it, len: 3 }).collect(),
+        names,
+        ..a_grant()
+    };
+    let many = Grant::decode(&encoded(&many)).unwrap();
+    let error = crate::bind::bind(&many, 0, |_| Ok(None), |_, _| panic!("stored a strong miss")).unwrap_err();
+    assert!(error.what.contains("`f00`") && error.what.contains("`f07`") && !error.what.contains("f08"), "{error}");
+    assert!(error.what.contains("and 4 more"), "{error}");
+
+    // What the scope says goes wrong is the start's error.
+    let failed = crate::bind::bind(&grant, 0, |_| Err(crate::Error::new("no scope")), |_, _| {});
+    assert_eq!(failed.unwrap_err().what, "no scope");
+}
+
+#[test]
+fn a_slide_is_refused_while_a_dependency_image_is_mapped_and_moves_only_addresses() {
+    let grant = a_grant();
+    crate::bind::check_slide(&grant, 0).unwrap();
+    let error = crate::bind::check_slide(&grant, 0x5555_0000_0000).unwrap_err();
+    assert!(error.what.contains("0x110000..0x118000") && error.what.contains("0x555500000000"), "{error}");
+    let mut plain = a_grant();
+    plain.overlays[3].image = false;
+    plain.writes.clear();
+    plain.lookups.clear();
+    crate::bind::check_slide(&plain, 0x5555_0000_0000).unwrap();
+
+    // Where the rule is lifted, a write's address moves with the slide and an offset doesn't.
+    let slide = 0x1_0000;
+    let mut copied = Copied::of(&grant, slide);
+    crate::bind::bind(&grant, slide, |_| Ok(Some(0x9000)), |at, value| copied.store(at, value)).unwrap();
+    assert_eq!(copied.word(0x11_0010 + slide), 0x11_2000 + slide);
+    assert_eq!(copied.word(0x11_0000 + 8 * P - 8 + slide), 0x40);
+    assert_eq!(copied.word(0x11_0020 + slide), 0x9000, "a found address is the process's own");
+}
+
+#[test]
+fn lookups_use_the_c_name() {
+    use crate::bind::c_name;
+    assert_eq!(c_name(Format::Elf, "malloc").unwrap(), "malloc");
+    assert_eq!(c_name(Format::Pe, "_malloc").unwrap(), "_malloc");
+    assert_eq!(c_name(Format::MachO, "_malloc").unwrap(), "malloc");
+    assert_eq!(c_name(Format::MachO, "__rg_alloc").unwrap(), "_rg_alloc");
+    assert!(c_name(Format::MachO, "malloc").unwrap_err().what.contains("`malloc`"));
+    assert!(c_name(Format::MachO, "_").is_err());
+
+    let mut grant = a_grant();
+    grant.format = Format::MachO;
+    grant.names = "_malloc__rg_alloc".to_owned();
+    grant.lookups[0].len = 7;
+    grant.lookups[1].name = 7;
+    let mut asked = Vec::new();
+    crate::bind::bind(
+        &grant,
+        0,
+        |name| {
+            asked.push(name.to_owned());
+            Ok(Some(1))
+        },
+        |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(asked, ["malloc", "_rg_alloc"]);
 }
 
 #[test]
@@ -657,7 +916,8 @@ mod linux {
         std::thread::sleep(Duration::from_millis(20));
         let (mut channel, _, _) = connected();
         let granted = [sys::granted(memory.object(), Rights::Code).unwrap()];
-        let overlay = Overlay { object: 0, offset: 0, len: page, at: 0x1000_0000, access: Access::Execute, place: Place::Code };
+        let overlay =
+            Overlay { object: 0, offset: 0, len: page, at: 0x1000_0000, access: Access::Execute, place: Place::Code, image: false };
         sys::overlay(&mut channel, &granted, &[overlay], image.at.wrapping_sub(0x1000_0000)).unwrap();
         assert_eq!(image.bytes(), memory.bytes(CodeRange { offset: 0, len: page }).unwrap());
         std::thread::sleep(Duration::from_millis(20));
@@ -772,6 +1032,58 @@ mod linux {
         daemon.set_timeout(Some(Duration::from_millis(50))).unwrap();
         let timed = daemon.recv().unwrap_err();
         assert!(timed.what.contains("timed out"), "{timed}");
+    }
+
+    #[test]
+    fn a_bound_word_lands_in_the_runs_private_copy_never_the_memory_object() {
+        let mut memory = CodeMemory::new("binds", 1, 0).unwrap();
+        let page = memory.page();
+        let data: Vec<u8> = (0..page).map(|it| it as u8 | 0x80).collect();
+        memory.write(0, &data).unwrap();
+        let (_daemon, mut hook, _) = connected();
+        let granted = sys::granted(memory.object(), Rights::Code).unwrap();
+        let at = granted.map_anywhere(&mut hook, Access::Copy).unwrap();
+        let grant = Grant {
+            objects: vec![
+                (memory.object().len(), Rights::Code),
+                (P, Rights::Words),
+                (P, Rights::Words),
+                (memory.object().len(), Rights::Code),
+            ],
+            overlays: vec![Overlay { object: 3, offset: 0, len: page, at, access: Access::Copy, place: Place::Reserved, image: true }],
+            writes: vec![ImageWrite { place: at + 8, value: 0x1234, address: false }],
+            lookups: vec![
+                Lookup { place: at + 0x13, addend: 4, weak: false, name: 0, len: 6 },
+                Lookup { place: at + 0x20, addend: 0, weak: true, name: 6, len: 25 },
+            ],
+            names: "getpidblaze_inproc_no_such_name".to_owned(),
+            ..a_grant()
+        };
+        grant.check_binds().unwrap();
+        let mut scope = sys::Scope::new();
+        crate::bind::bind(
+            &grant,
+            0,
+            |name| scope.find(name),
+            // SAFETY: `at..at + page` is the private copy just mapped, readable and writable,
+            // and `check_binds` put every place 8 bytes inside it; no other thread uses it.
+            |at, value| unsafe { sys::store_private(at, value) },
+        )
+        .unwrap();
+        // SAFETY: the private copy, mapped for the rest of the test.
+        let copy = unsafe { std::slice::from_raw_parts(at as *const u8, page as usize) };
+        let word = |offset: usize| u64::from_le_bytes(copy[offset..offset + 8].try_into().unwrap());
+        assert_eq!(word(8), 0x1234);
+        assert_eq!(word(0x13), libc::getpid as usize as u64 + 4, "the global scope's getpid, unaligned");
+        assert_eq!(word(0x20), 0, "a weak miss");
+        assert_eq!(copy[..8], data[..8]);
+        assert_eq!(copy[0x28..], data[0x28..]);
+        assert_eq!(memory.bytes(CodeRange { offset: 0, len: page }).unwrap(), &data[..], "the memory object changed");
+
+        let mut strong = grant.clone();
+        strong.lookups[1].weak = false;
+        let error = crate::bind::bind(&strong, 0, |name| scope.find(name), |_, _| {}).unwrap_err();
+        assert!(error.what.contains("`blaze_inproc_no_such_name`"), "{error}");
     }
 
     #[test]
@@ -954,6 +1266,8 @@ mod linux {
             let launch = Launch {
                 image: &memory,
                 maps: Vec::new(),
+                writes: Vec::new(),
+                lookups: Vec::new(),
                 program: program.clone(),
                 args: vec!["a".into(), "b".into()],
                 env: vec![("X".into(), "1".into()), (HOST_VAR.into(), "stale".into())],
@@ -993,9 +1307,17 @@ mod linux {
                 [Rights::Code, Rights::Words, Rights::Words, Rights::Words]
             );
             assert_eq!(grant.overlays, [
-                Overlay { object: 0, offset: page, len: page, at: page, access: Access::Execute, place: Place::Code },
-                Overlay { object: 0, offset: 2 * page, len: page, at: 4 * page, access: Access::Execute, place: Place::Reserved },
-                Overlay { object: 3, offset: 0, len: page, at: 6 * page, access: Access::Shared, place: Place::Reserved },
+                Overlay { object: 0, offset: page, len: page, at: page, access: Access::Execute, place: Place::Code, image: false },
+                Overlay {
+                    object: 0,
+                    offset: 2 * page,
+                    len: page,
+                    at: 4 * page,
+                    access: Access::Execute,
+                    place: Place::Reserved,
+                    image: false,
+                },
+                Overlay { object: 3, offset: 0, len: page, at: 6 * page, access: Access::Shared, place: Place::Reserved, image: false },
             ]);
             let session = pending.wait(Duration::from_secs(10)).unwrap();
             assert_eq!((session.pid, session.slide, session.thread), (std::process::id(), slide, sys::thread_id()));

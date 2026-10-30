@@ -94,7 +94,7 @@ pub enum TlsModel {
 }
 
 /// Why a function did not compile: the instruction (when one is to blame) and what of it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error, once per function that fails
 pub struct Error {
     pub inst: Option<ir::Inst>,
     pub what: String,

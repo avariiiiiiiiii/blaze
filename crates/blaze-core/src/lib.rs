@@ -247,6 +247,15 @@ pub enum Effect {
     /// The file's permission bits set to `mode` (0o755 for an executable). Completes with
     /// [`Done::Moded`].
     Mode { file: FileName, mode: u32, tag: Tag },
+    /// `dir` made the user's alone, and checked to be with everything under it, for what keeps
+    /// code it runs (the store: a value is checked against its own hash, never against what its
+    /// key says made it, so whoever may write there can plant code under any key). A missing
+    /// `dir` is made with its parents, on Unix with mode 0o700. Then `dir` and every file and
+    /// directory under it, links followed, is checked to be the user's with no one else able
+    /// to write it ([`Access`]); once `dir` is, on Unix the group's and others' bits are taken
+    /// off it, so that no one else reads what was built either. What is refused is never
+    /// mended. Completes with [`Done::Private`].
+    Private { dir: FileName, tag: Tag },
     /// The file's access and modification times both set to `modified_ns`, nanoseconds since
     /// the Unix epoch, as cargo gives a build script's `output` the time its run began. Of the
     /// file as it is when this runs, so asked once the write that made it has completed; a
@@ -350,6 +359,7 @@ impl Effect {
             | Effect::WriteAt { tag, .. }
             | Effect::Rename { tag, .. }
             | Effect::Mode { tag, .. }
+            | Effect::Private { tag, .. }
             | Effect::Times { tag, .. }
             | Effect::Clone { tag, .. }
             | Effect::Link { tag, .. }
@@ -549,6 +559,34 @@ pub struct Meta {
     pub modified_ns: u64,
 }
 
+/// Who may change a file besides the user the process runs as, as [`Effect::Private`] finds.
+/// On Windows the system and the administrators count as the user: they may change every file
+/// of the user's whatever its access list says, and a file an elevated process made is theirs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Access {
+    /// The user's, and no one else may write it.
+    Alone,
+    /// Another user's.
+    OtherUser,
+    /// The user's, and someone else may write it: a group or others write bit, or on Windows
+    /// an entry of its access list that lets someone else write.
+    OthersWrite,
+    /// Who owns it, or who may write it, could not be read: it is not known to be the user's
+    /// alone.
+    Unknown,
+}
+
+impl fmt::Display for Access {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Access::Alone => "is the user's alone",
+            Access::OtherUser => "belongs to another user",
+            Access::OthersWrite => "can be written to by other users",
+            Access::Unknown => "has an owner or access that could not be read",
+        })
+    }
+}
+
 /// How an [`Effect`] went.
 #[derive(PartialEq, Eq, Debug)]
 #[cfg_attr(test, derive(Clone))] // clone: tests keep what they saw; a completion moves to its owner
@@ -563,6 +601,9 @@ pub enum Done {
     Listed(Vec<(FileName, Meta)>),
     Renamed,
     Moded,
+    /// Of an [`Effect::Private`]: `None` when the directory and everything under it is the
+    /// user's alone, else the first that is not and why.
+    Private(Option<(FileName, Access)>),
     /// Of an [`Effect::Times`].
     Timed,
     Cloned,

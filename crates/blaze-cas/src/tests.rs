@@ -461,6 +461,95 @@ fn a_missing_layer_stops_the_store() {
     assert_eq!(store.broken().unwrap().file, name("nowhere/head"));
 }
 
+/// Opened, and refused with what of it is not the user's alone and why; nothing in it is read.
+fn refused(sim: &mut Sim) -> Broken {
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    let mut asked = Vec::new();
+    run_until_idle(sim, &mut effects, |completion, effects| {
+        if store.owns(completion.tag) {
+            store.complete(completion, effects);
+        }
+        asked.extend(effects.iter().map(|it| format!("{it:?}")));
+    });
+    assert!(!store.ready());
+    assert_eq!(asked, Vec::<String>::new(), "nothing is read from a store that is refused");
+    let Broken { file, what } = store.broken().expect("refused");
+    Broken { file: file.clone(), what: what.clone() }
+}
+
+#[test]
+fn a_store_of_another_user_is_refused() {
+    let mut sim = Sim::new(40, quiet());
+    sim.set_access(&name("store"), blaze_core::Access::OtherUser);
+    let broken = refused(&mut sim);
+    assert_eq!(broken.file, name("store"));
+    assert!(broken.what.contains("belongs to another user"), "{broken}");
+}
+
+#[test]
+fn a_store_others_can_write_to_is_refused() {
+    let mut sim = Sim::new(41, quiet());
+    sim.set_access(&name("store"), blaze_core::Access::OthersWrite);
+    let broken = refused(&mut sim);
+    assert_eq!(broken.file, name("store"));
+    assert!(broken.what.contains("can be written to by other users"), "{broken}");
+}
+
+/// A value is checked against its own hash and never against what its key says made it, so a
+/// pack another user rewrote is refused before any of it is read.
+#[test]
+fn a_pack_others_can_write_to_is_not_read() {
+    let mut sim = Sim::new(42, quiet());
+    let mut store = open(&mut sim, "store");
+    store.put(key(1), Kind::Code, b"code".to_vec()).unwrap();
+    store.put(key(2), Kind::Query, b"a result".to_vec()).unwrap();
+    flush(&mut sim, &mut store);
+    drop(store);
+    let pack = name("store/pack-000000");
+    assert!(sim.exists(&pack));
+    sim.chmod(&pack, 0o646);
+    let broken = refused(&mut sim);
+    assert_eq!(broken.file, pack);
+    assert!(broken.what.contains("can be written to by other users"), "{broken}");
+    sim.chmod(&pack, 0o644);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), b"a result");
+}
+
+/// On this machine's disk: the store's directory is made the user's alone, closed to others if
+/// it was open to their reading, and refused with a file in it others may write to.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_store_and_its_files_are_the_users_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let chmod = |path: &std::path::Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let root = std::env::temp_dir().join(format!("blaze-cas-private-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("store");
+    {
+        let mut driven = Driven::open(&root).unwrap();
+        driven.store().put(key(1), Kind::Query, b"kept".to_vec()).unwrap();
+        driven.flush().unwrap();
+    }
+    assert_eq!(mode(&dir), 0o700);
+    chmod(&dir, 0o705);
+    drop(Driven::open(&root).unwrap());
+    assert_eq!(mode(&dir), 0o700, "closed to others' reading");
+    let head = dir.join("head");
+    chmod(&head, 0o666);
+    let refused = Driven::open(&root).err().unwrap();
+    assert!(refused.contains("store/head") && refused.contains("can be written to by other users"), "{refused}");
+    assert_eq!(mode(&head), 0o666, "what is refused is never mended");
+    chmod(&dir, 0o777);
+    let refused = Driven::open(&root).err().unwrap();
+    assert!(refused.contains("store: can be written to by other users"), "{refused}");
+    _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn the_index_is_rewritten_into_the_other_slot_and_the_head_flipped() {
     let mut sim = Sim::new(13, quiet());
@@ -648,7 +737,7 @@ fn a_store_that_cannot_write_stops_and_says_where() {
     let mut store = Store::open(config("store"), &mut effects);
     drive(&mut sim, &mut store, &mut effects);
     let broken = store.broken().expect("every effect fails");
-    assert_eq!(broken.file, name("store/head"));
+    assert_eq!(broken.file, name("store"), "the first thing asked is the check of the directory");
     assert!(broken.what.contains("injected"), "{broken}");
 }
 

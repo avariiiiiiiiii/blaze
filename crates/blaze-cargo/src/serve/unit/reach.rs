@@ -3,21 +3,21 @@
 //! the items whose hashes differ with the facts that changed (a function's signature, a type's
 //! layout, a body's code), the functions that would compile again, and the tests that reach
 //! code that changed, from what the last compile of each test binary recorded.
+//!
+//! Cost: one merge of each crate's sorted key columns (`changed_since`), so `O(items)` per
+//! member crate with nothing allocated per unchanged item; a path is resolved only for an item
+//! that changed; the tests are matched against a hash set of the old code hashes of what
+//! changed, `O(1)` per hash a test reached.
 
 use std::collections::BTreeSet;
 
 use blaze_api::{FactRead, Reach, ReachedItem};
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
-use blaze_units::schema::Unit;
 use hir_ty::db::HirDatabase;
+use rustc_hash::FxHashSet;
 
 use super::Job;
 use crate::serve::work::Failed;
-
-/// A member crate's unit, by what it is in every view: its package, target and mode.
-fn same(a: &Unit, b: &Unit) -> bool {
-    a.pkg_id == b.pkg_id && a.target.name == b.target.name && a.target.kind == b.target.kind && a.mode == b.mode
-}
 
 /// The facts of an item that differ from `old` to `new`, each with what it says.
 pub(crate) fn changed_facts(key: ItemKey, old: Option<&ItemHashes>, new: Option<&ItemHashes>) -> Vec<(Fact, String)> {
@@ -56,21 +56,19 @@ pub(crate) fn reach(from: &Job, to: &Job, changes: &[blaze_vfs::Change]) -> Resu
     let new_db: &dyn HirDatabase = &after;
     let mut items = Vec::new();
     let mut compiled = BTreeSet::new();
-    let mut changed_code: BTreeSet<CodeHash> = BTreeSet::new();
-    let mut seen = BTreeSet::new();
+    let mut changed_code: FxHashSet<CodeHash> = FxHashSet::default();
+    let mut seen: FxHashSet<ItemKey> = FxHashSet::default();
     for (at, unit) in to.units().graph.units.iter().enumerate() {
         let Ok(package) = to.package(unit) else { continue };
         if !package.is_member || unit.is_std {
             continue;
         }
         let Some(new_krate) = to.lowered.krate(at) else { continue };
+        // A member crate's unit, by what it is in every view: its package, target and mode.
         let old_krate = from
-            .units()
             .graph
-            .units
-            .iter()
-            .position(|it| same(it, unit))
-            .and_then(|it| from.lowered.krate(it));
+            .find(&from.units().graph.units, &unit.pkg_id, &unit.target.name, &unit.target.kind, unit.mode)
+            .and_then(|it| from.lowered.krate(it as usize));
         if to.cancelled() {
             return Err(Failed::Again);
         }
@@ -104,9 +102,8 @@ pub(crate) fn reach(from: &Job, to: &Job, changes: &[blaze_vfs::Change]) -> Resu
             });
         }
     }
-    let made = from.made.lock().unwrap_or_else(|it| it.into_inner());
     let mut tests = BTreeSet::new();
-    for done in made.values() {
+    for done in from.made.iter().filter_map(|it| it.get()) {
         for test in &done.tests {
             if test.outside || test.reached.iter().any(|it| changed_code.contains(it)) {
                 tests.insert(test.name.clone());

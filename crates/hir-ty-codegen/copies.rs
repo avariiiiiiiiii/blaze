@@ -48,24 +48,29 @@ pub(super) fn lower_small(func: &mut ir::Function) -> bool {
             if !(0..=MOST).contains(&size) {
                 continue;
             }
-            let chunks = chunks(size as u32);
+            // `memcpy` and `memmove` give back where they copied to, if they are declared to.
+            let result = match *cursor.func.dfg.inst_results(inst) {
+                [] => None,
+                [result] => Some(result),
+                _ => continue,
+            };
             // What `memmove` copies may overlap where it goes: every byte is read first.
-            let mut loaded = Vec::new();
-            for &(at, ty) in &chunks {
-                let value = cursor.ins().load(ty, super::MEM, from, at);
+            let mut loaded = [to; CHUNKS];
+            for (at, (offset, ty)) in chunks(size as u32).enumerate() {
+                let value = cursor.ins().load(ty, super::MEM, from, offset);
                 if overlap {
-                    loaded.push(value);
+                    loaded[at] = value;
                 } else {
-                    cursor.ins().store(super::MEM, value, to, at);
+                    cursor.ins().store(super::MEM, value, to, offset);
                 }
             }
-            for (&(at, _), value) in chunks.iter().zip(loaded) {
-                cursor.ins().store(super::MEM, value, to, at);
+            if overlap {
+                for ((offset, _), value) in chunks(size as u32).zip(loaded) {
+                    cursor.ins().store(super::MEM, value, to, offset);
+                }
             }
-            // `memcpy` and `memmove` give back where they copied to.
-            let results = cursor.func.dfg.inst_results(inst).to_vec();
             cursor.func.dfg.detach_inst_results(inst);
-            for result in results {
+            if let Some(result) = result {
                 cursor.func.dfg.change_to_alias(result, to);
             }
             cursor.remove_inst_and_step_back();
@@ -75,18 +80,20 @@ pub(super) fn lower_small(func: &mut ir::Function) -> bool {
     lowered
 }
 
+/// The most loads [`chunks`] splits a copy of at most [`MOST`] bytes into: 16 of 8 bytes,
+/// then one each of 4, 2 and 1.
+const CHUNKS: usize = MOST as usize / 8 + 3;
+
 /// Where each load and store of a copy of `size` bytes is and what type it is of: the widest
 /// integers first, as FastISel splits one.
-fn chunks(size: u32) -> Vec<(i32, ir::Type)> {
-    let mut chunks = Vec::new();
+fn chunks(size: u32) -> impl Iterator<Item = (i32, ir::Type)> {
     let mut at = 0;
-    for ty in [types::I64, types::I32, types::I16, types::I8] {
-        while size - at >= ty.bytes() {
-            chunks.push((at as i32, ty));
-            at += ty.bytes();
-        }
-    }
-    chunks
+    [types::I64, types::I32, types::I16, types::I8].into_iter().flat_map(move |ty| {
+        let count = (size - at) / ty.bytes();
+        let first = at;
+        at += count * ty.bytes();
+        (0..count).map(move |it| ((first + it * ty.bytes()) as i32, ty))
+    })
 }
 
 /// Whether the `size` bytes at `a` and at `b` are the same, as an `i8` of 0 or 1, compared
@@ -115,4 +122,21 @@ pub(super) fn equal_bytes(
         Some(differ) => builder.ins().bxor_imm(differ, 1),
         None => builder.ins().iconst(types::I8, 1),
     })
+}
+
+#[test]
+fn chunks_are_the_widest_first_and_fit_the_array() {
+    for size in 0..=MOST as u32 {
+        let mut expected = Vec::new();
+        let mut at = 0;
+        for ty in [types::I64, types::I32, types::I16, types::I8] {
+            while size - at >= ty.bytes() {
+                expected.push((at as i32, ty));
+                at += ty.bytes();
+            }
+        }
+        let chunks: Vec<_> = chunks(size).collect();
+        assert_eq!(chunks, expected, "{size} bytes");
+        assert!(chunks.len() <= CHUNKS);
+    }
 }

@@ -59,7 +59,12 @@ impl Directive {
 }
 
 /// rustc's `parse_list`: the options of an attribute that has some, else its lint.
-pub(super) fn parse_list<'a>(sink: &mut Sink<'_, '_, '_>, args: &'a Args, attr_range: TextRange, mode: Mode) -> Option<&'a [Item]> {
+pub(super) fn parse_list<'a>(
+    sink: &mut Sink<'_, '_, '_>,
+    args: &'a Args,
+    attr_range: TextRange,
+    mode: Mode,
+) -> Option<&'a [Item]> {
     match args {
         Args::List(list) if !list.items.is_empty() => return Some(&list.items),
         Args::List(list) => {
@@ -91,7 +96,8 @@ fn malformed(sink: &mut Sink<'_, '_, '_>, mode: Mode, range: TextRange) {
 /// rustc's `IgnoredDiagnosticOption`.
 fn ignored(sink: &mut Sink<'_, '_, '_>, option: &str, first: InFile<TextRange>, later: InFile<TextRange>) {
     let later = sink.cx.span(later);
-    let mut diag = Diag::lint(MALFORMED, format!("`{option}` is ignored due to previous definition of `{option}`"), later.clone());
+    let message = format!("`{option}` is ignored due to previous definition of `{option}`");
+    let mut diag = Diag::lint(MALFORMED, message, later.clone());
     diag.span_label(sink.cx.span(first), format!("`{option}` is first declared here"));
     diag.span_label(later, format!("`{option}` is later redundantly declared here"));
     sink.parsed(diag);
@@ -248,8 +254,8 @@ fn format_string(sink: &mut Sink<'_, '_, '_>, lit: &Lit, value: &str, mode: Mode
                         diag
                     }
                     Warning::Specifier(range) => {
-                        let mut diag =
-                            sink.lint(FORMAT_LITERALS, "format specifiers are not permitted in diagnostic attributes", range);
+                        let message = "format specifiers are not permitted in diagnostic attributes";
+                        let mut diag = sink.lint(FORMAT_LITERALS, message, range);
                         diag.span_label(sink.span(range), "remove this format specifier");
                         diag
                     }

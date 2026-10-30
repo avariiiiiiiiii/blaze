@@ -8,6 +8,7 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use blaze_api::{ApiError, Artifact, Response};
 use blaze_cas::Store;
 use blaze_core::{Command, Completion, Done, Effect, Sandbox, Tag};
+use blaze_units::schema::Mode;
 
 use super::{Job, package_of};
 use crate::serve::work::Runs;
@@ -107,18 +108,21 @@ pub(crate) fn start(
         packages.sort_unstable();
         packages.dedup();
         match packages.as_slice() {
-            [one] => units.packages.iter().find(|it| it.id == *one).and_then(|it| it.default_run.as_deref()),
+            [one] => units
+                .packages
+                .binary_search_by(|it| it.id.as_str().cmp(one))
+                .ok()
+                .and_then(|at| units.packages[at].default_run.as_deref()),
             _ => None,
         }
     };
     let chosen = choose(built, bin, default_run).map_err(|what| ApiError::new(what, None))?;
     let program = chosen.executable.clone().unwrap_or_else(|| chosen.path.clone());
-    let at = units
+    let target = &chosen.target;
+    let at = job
         .graph
-        .units
-        .iter()
-        .position(|it| it.pkg_id == chosen.package && it.target.name == chosen.target.name && it.target.kind == chosen.target.kind)
-        .ok_or_else(|| ApiError::new(format!("no unit of `{}` is in the build", chosen.target.name), None))?;
+        .find(&units.graph.units, &chosen.package, &target.name, &target.kind, Mode::Build)
+        .ok_or_else(|| ApiError::new(format!("no unit of `{}` is in the build", target.name), None))? as usize;
     let unit = &units.graph.units[at];
     let package = package_of(units, unit)?;
     let config = &job.input.config;

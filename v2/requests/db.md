@@ -358,3 +358,5 @@ and in its doc, replace "The reader lends a file's bytes; this trait gives an `A
 takes one count" with "The trait gives an `Arc`, so `file` takes one count" (lent bytes are
 `Reader::pin()`'s `Pinned::file`, for when the database holds a view's bytes as lent:
 v2/requests/vfs.md item 8).
+
+> forwarded to db: `crates/blaze-query/` is lane db's.

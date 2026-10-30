@@ -44,9 +44,7 @@ fn is_fragment(message: &str) -> bool {
 
 /// rustc's `token_descr` of the token the parser stopped at.
 fn found(cx: &Cx<'_, '_>, root: &SyntaxNode, range: TextRange) -> Option<String> {
-    let token = root
-        .descendants_with_tokens()
-        .filter_map(NodeOrToken::into_token)
-        .find(|it| !it.kind().is_trivia() && it.text_range().start() >= range.start())?;
+    let at = root.token_at_offset(range.start()).right_biased()?;
+    let token = std::iter::successors(Some(at), |it| it.next_token()).find(|it| !it.kind().is_trivia())?;
     Some(token_descr(&token, cx.edition))
 }

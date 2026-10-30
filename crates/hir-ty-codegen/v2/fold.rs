@@ -100,6 +100,20 @@ pub(crate) fn name(
 /// A data request's content: what it points at by target, so equal IDs in two functions are
 /// one object whatever their places.
 fn data(function: &Function, refs: &Refs, index: usize) -> Option<ContentId> {
+    data_of(function, refs, index, &mut Vec::new())
+}
+
+/// [`data`], with `known[i]` request `i`'s content once hashed: an object many others point
+/// at is hashed once, not once per path to it.
+fn data_of(
+    function: &Function,
+    refs: &Refs,
+    index: usize,
+    known: &mut Vec<Option<ContentId>>,
+) -> Option<ContentId> {
+    if let Some(&Some(id)) = known.get(index) {
+        return Some(id);
+    }
     let mut hasher = Hasher::new(FOLD_DATA_DOMAIN);
     match function.places.datas.get(index)? {
         DataPlace::Place(place) => {
@@ -129,7 +143,11 @@ fn data(function: &Function, refs: &Refs, index: usize) -> Option<ContentId> {
                 if target >= index {
                     return None;
                 }
-                let id = data(function, refs, target)?;
+                let id = data_of(function, refs, target, known)?;
+                if known.len() <= target {
+                    known.resize(target + 1, None);
+                }
+                known[target] = Some(id);
                 hasher.update(&at.to_le_bytes()).id(&id).update(&addend.to_le_bytes());
             }
             hasher.update(&(blob.fn_relocs.len() as u64).to_le_bytes());

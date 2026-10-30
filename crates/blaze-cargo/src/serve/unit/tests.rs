@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf, sync::OnceLock};
 
 use blaze_api::{Artifact, Level, UnitProfile};
 use blaze_ids::ContentId;
@@ -138,11 +138,15 @@ fn build(out: &std::path::Path) -> Units {
     }
 }
 
+fn slots(units: &Units) -> Vec<OnceLock<script::Applied>> {
+    units.graph.units.iter().map(|_| OnceLock::new()).collect()
+}
+
 fn value(code: i32, stdout: &str, stderr: &str) -> Value {
     Value { code: Some(code), signal: None, stdout: stdout.as_bytes().to_vec(), stderr: stderr.as_bytes().to_vec(), files: Vec::new() }
 }
 
-fn of<'a>(units: &'a Units, scripts: &'a BTreeMap<usize, script::Applied>, tools: &'a std::path::Path) -> script::Of<'a> {
+fn of<'a>(units: &'a Units, scripts: &'a [OnceLock<script::Applied>], tools: &'a std::path::Path) -> script::Of<'a> {
     script::Of {
         units,
         host: HOST,
@@ -158,7 +162,7 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
     let dir = tempfile::tempdir().unwrap();
     let units = build(dir.path());
     let tools = PathBuf::from("/state/tools");
-    let mut scripts = BTreeMap::new();
+    let scripts = slots(&units);
     let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
     assert_eq!(z.package.descr(), "z-sys v0.1.0 (/w/z-sys)");
     assert_eq!(z.package.links.as_deref(), Some("z"));
@@ -188,7 +192,8 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
     assert_eq!(codegen::link_lib(&output.library_links[0]).unwrap().name, "z");
 
     // The dependent's script is told `DEP_Z_INCLUDE`.
-    scripts.insert(1, script::Applied { package_id: Z.to_owned(), links: Some("z".to_owned()), output, out_dir: out_dir.clone() });
+    let applied = script::Applied { package_id: Z.to_owned(), links: Some("z".to_owned()), output, out_dir: out_dir.clone() };
+    assert!(scripts[1].set(applied).is_ok());
     let p = script::script_unit(&of(&units, &scripts, &tools), 3).unwrap();
     assert_eq!(p.dependencies.len(), 1);
     let env = blaze_build_script::env(&p, &[]).unwrap();
@@ -200,7 +205,7 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
 fn a_directive_the_sandbox_refuses_fails_the_build() {
     let dir = tempfile::tempdir().unwrap();
     let units = build(dir.path());
-    let scripts = BTreeMap::new();
+    let scripts = slots(&units);
     let tools = PathBuf::from("/state/tools");
     let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
     let began = blaze_build_script::run::elided(&z, Vec::new()).unwrap().began;
@@ -217,7 +222,7 @@ fn a_directive_the_sandbox_refuses_fails_the_build() {
 fn a_failed_script_says_what_cargo_says() {
     let dir = tempfile::tempdir().unwrap();
     let units = build(dir.path());
-    let scripts = BTreeMap::new();
+    let scripts = slots(&units);
     let tools = PathBuf::from("/state/tools");
     let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
     let began = blaze_build_script::run::elided(&z, Vec::new()).unwrap().began;
@@ -260,7 +265,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
     assert_eq!(get("SECRET_TOKEN"), Some(OsString::from("hunter2")));
     assert_eq!(get("PATH"), Some(OsString::from("/usr/bin")));
 
-    let scripts = BTreeMap::new();
+    let scripts = slots(&units);
     let tools = PathBuf::from("/state/tools");
     let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
     let place = blaze_usercode::script::Place {

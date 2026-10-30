@@ -181,6 +181,8 @@ pub(super) struct Uses {
     pub(super) typeck: FxHashSet<Binding>,
     /// The bindings the crate re-exports: rustc's `effective_visibilities.is_exported`.
     pub(super) exported: FxHashSet<Binding>,
+    /// The modules reachable from other crates, through public names from the root.
+    pub(super) public_modules: FxHashSet<ModuleId>,
     /// The `#[macro_use]` imports used: of every macro (`None`) or of one.
     pub(super) macro_uses: FxHashSet<(ExternCrateId, Option<Name>)>,
     /// The macros invoked: by a call, an attribute or a derive.
@@ -205,6 +207,7 @@ impl Uses {
             candidates: Vec::new(),
             typeck: FxHashSet::default(),
             exported: FxHashSet::default(),
+            public_modules: FxHashSet::default(),
             macro_uses: FxHashSet::default(),
             macros: FxHashSet::default(),
             arms: FxHashMap::default(),
@@ -994,10 +997,9 @@ impl Uses {
     /// every public name, into each public module and along each public import's chain.
     fn export(&mut self, cx: &Cx<'_, '_>) {
         let db = cx.db;
-        let mut seen = FxHashSet::default();
         let mut stack: Vec<ModuleId> = vec![cx.krate.root_module(db).into()];
         while let Some(module) = stack.pop() {
-            if !seen.insert(module) {
+            if !self.public_modules.insert(module) {
                 continue;
             }
             let scope = module.def_map(db).module(db, module).scope(db);

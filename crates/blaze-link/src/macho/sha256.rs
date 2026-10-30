@@ -99,44 +99,63 @@ fn portable(state: &mut [u32; 8], blocks: &[u8]) {
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
     use std::arch::aarch64::{
-        uint32x4_t, vaddq_u32, vld1q_u8, vld1q_u32, vreinterpretq_u32_u8, vrev32q_u8,
+        uint8x16_t, uint32x4_t, vaddq_u32, vld1q_u8, vld1q_u32, vreinterpretq_u32_u8, vrev32q_u8,
         vsha256h2q_u32, vsha256hq_u32, vsha256su0q_u32, vsha256su1q_u32, vst1q_u32,
     };
 
     use super::K;
+
+    /// The four words at the start of `words`, as one vector.
+    #[inline(always)]
+    fn words(words: &[u32]) -> uint32x4_t {
+        let words: &[u32; 4] = words[..4].try_into().expect("four words");
+        // SAFETY: `words` is 4 readable `u32`s, the 16 bytes `vld1q_u32` reads; NEON is in
+        // every aarch64 target, so the load needs no detection.
+        unsafe { vld1q_u32(words.as_ptr()) }
+    }
+
+    #[inline(always)]
+    fn bytes(bytes: &[u8]) -> uint8x16_t {
+        let bytes: &[u8; 16] = bytes[..16].try_into().expect("16 bytes");
+        // SAFETY: `bytes` is 16 readable bytes, what `vld1q_u8` reads, at any alignment.
+        unsafe { vld1q_u8(bytes.as_ptr()) }
+    }
+
+    #[inline(always)]
+    fn store(out: &mut [u32], value: uint32x4_t) {
+        let out: &mut [u32; 4] = (&mut out[..4]).try_into().expect("four words");
+        // SAFETY: `out` is 4 writable `u32`s, the 16 bytes `vst1q_u32` writes.
+        unsafe { vst1q_u32(out.as_mut_ptr(), value) }
+    }
 
     /// # Safety
     ///
     /// The processor has the SHA-256 instructions.
     #[target_feature(enable = "sha2")]
     pub(super) unsafe fn compress(state: &mut [u32; 8], blocks: &[u8]) {
-        // SAFETY: every load and store is of 16 bytes within `state`, `blocks` and `K`.
-        unsafe {
-            let mut abcd = vld1q_u32(state.as_ptr());
-            let mut efgh = vld1q_u32(state.as_ptr().add(4));
-            for block in blocks.chunks_exact(64) {
-                let (abcd_was, efgh_was) = (abcd, efgh);
-                let load =
-                    |at: usize| vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block[at..].as_ptr())));
-                let mut words: [uint32x4_t; 4] = [load(0), load(16), load(32), load(48)];
-                for group in 0..16 {
-                    let at = group % 4;
-                    if group >= 4 {
-                        let early = vsha256su0q_u32(words[at], words[(at + 1) % 4]);
-                        words[at] =
-                            vsha256su1q_u32(early, words[(at + 2) % 4], words[(at + 3) % 4]);
-                    }
-                    let mixed = vaddq_u32(words[at], vld1q_u32(K[group * 4..].as_ptr()));
-                    let was = abcd;
-                    abcd = vsha256hq_u32(abcd, efgh, mixed);
-                    efgh = vsha256h2q_u32(efgh, was, mixed);
+        let mut abcd = words(&state[..4]);
+        let mut efgh = words(&state[4..]);
+        for block in blocks.chunks_exact(64) {
+            let (abcd_was, efgh_was) = (abcd, efgh);
+            let mut words: [uint32x4_t; 4] = std::array::from_fn(|nth| {
+                vreinterpretq_u32_u8(vrev32q_u8(bytes(&block[nth * 16..])))
+            });
+            for group in 0..16 {
+                let at = group % 4;
+                if group >= 4 {
+                    let early = vsha256su0q_u32(words[at], words[(at + 1) % 4]);
+                    words[at] = vsha256su1q_u32(early, words[(at + 2) % 4], words[(at + 3) % 4]);
                 }
-                abcd = vaddq_u32(abcd, abcd_was);
-                efgh = vaddq_u32(efgh, efgh_was);
+                let mixed = vaddq_u32(words[at], self::words(&K[group * 4..]));
+                let was = abcd;
+                abcd = vsha256hq_u32(abcd, efgh, mixed);
+                efgh = vsha256h2q_u32(efgh, was, mixed);
             }
-            vst1q_u32(state.as_mut_ptr(), abcd);
-            vst1q_u32(state.as_mut_ptr().add(4), efgh);
+            abcd = vaddq_u32(abcd, abcd_was);
+            efgh = vaddq_u32(efgh, efgh_was);
         }
+        store(&mut state[..4], abcd);
+        store(&mut state[4..], efgh);
     }
 }
 
@@ -156,6 +175,22 @@ mod x86 {
             && std::arch::is_x86_feature_detected!("sse4.1")
     }
 
+    /// The 16 bytes at the start of `bytes`, as one vector.
+    #[inline(always)]
+    fn load<T>(bytes: &[T]) -> __m128i {
+        assert!(size_of_val(bytes) >= 16, "16 bytes to load");
+        // SAFETY: `bytes` has at least the 16 readable bytes `_mm_loadu_si128` reads, at any
+        // alignment; SSE2 is in every x86-64 target, so the load needs no detection.
+        unsafe { _mm_loadu_si128(bytes.as_ptr().cast()) }
+    }
+
+    #[inline(always)]
+    fn store(out: &mut [u32], value: __m128i) {
+        let out: &mut [u32; 4] = (&mut out[..4]).try_into().expect("four words");
+        // SAFETY: `out` is the 16 writable bytes `_mm_storeu_si128` writes, at any alignment.
+        unsafe { _mm_storeu_si128(out.as_mut_ptr().cast(), value) }
+    }
+
     /// Intel's SHA extensions: the state as ABEF and CDGH, two rounds per `sha256rnds2`.
     ///
     /// # Safety
@@ -163,44 +198,39 @@ mod x86 {
     /// The processor has SHA-NI, SSSE3 and SSE4.1 ([`detected`]).
     #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
     pub(super) unsafe fn compress(state: &mut [u32; 8], blocks: &[u8]) {
-        // SAFETY: every load and store is of 16 bytes within `state`, `blocks` and `K`, unaligned.
-        unsafe {
-            let swap = _mm_set_epi64x(0x0c0d_0e0f_0809_0a0b, 0x0405_0607_0001_0203);
-            let dcba = _mm_shuffle_epi32(_mm_loadu_si128(state.as_ptr().cast()), 0xb1);
-            let efgh = _mm_shuffle_epi32(_mm_loadu_si128(state.as_ptr().add(4).cast()), 0x1b);
-            let mut abef = _mm_alignr_epi8(dcba, efgh, 8);
-            let mut cdgh = _mm_blend_epi16(efgh, dcba, 0xf0);
-            for block in blocks.chunks_exact(64) {
-                let (abef_was, cdgh_was) = (abef, cdgh);
-                let at = block.as_ptr().cast::<__m128i>();
-                let mut words: [__m128i; 4] = [
-                    _mm_shuffle_epi8(_mm_loadu_si128(at), swap),
-                    _mm_shuffle_epi8(_mm_loadu_si128(at.add(1)), swap),
-                    _mm_shuffle_epi8(_mm_loadu_si128(at.add(2)), swap),
-                    _mm_shuffle_epi8(_mm_loadu_si128(at.add(3)), swap),
-                ];
-                for group in 0..16 {
-                    let at = group % 4;
-                    if group >= 4 {
-                        let early = _mm_add_epi32(
-                            _mm_sha256msg1_epu32(words[at], words[(at + 1) % 4]),
-                            _mm_alignr_epi8(words[(at + 3) % 4], words[(at + 2) % 4], 4),
-                        );
-                        words[at] = _mm_sha256msg2_epu32(early, words[(at + 3) % 4]);
-                    }
-                    let mixed =
-                        _mm_add_epi32(words[at], _mm_loadu_si128(K[group * 4..].as_ptr().cast()));
-                    cdgh = _mm_sha256rnds2_epu32(cdgh, abef, mixed);
-                    abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(mixed, 0x0e));
+        let swap = _mm_set_epi64x(0x0c0d_0e0f_0809_0a0b, 0x0405_0607_0001_0203);
+        let dcba = _mm_shuffle_epi32(load(&state[..4]), 0xb1);
+        let efgh = _mm_shuffle_epi32(load(&state[4..]), 0x1b);
+        let mut abef = _mm_alignr_epi8(dcba, efgh, 8);
+        let mut cdgh = _mm_blend_epi16(efgh, dcba, 0xf0);
+        for block in blocks.chunks_exact(64) {
+            let (abef_was, cdgh_was) = (abef, cdgh);
+            let mut words: [__m128i; 4] = [
+                _mm_shuffle_epi8(load(&block[..16]), swap),
+                _mm_shuffle_epi8(load(&block[16..32]), swap),
+                _mm_shuffle_epi8(load(&block[32..48]), swap),
+                _mm_shuffle_epi8(load(&block[48..]), swap),
+            ];
+            for group in 0..16 {
+                let at = group % 4;
+                if group >= 4 {
+                    let early = _mm_add_epi32(
+                        _mm_sha256msg1_epu32(words[at], words[(at + 1) % 4]),
+                        _mm_alignr_epi8(words[(at + 3) % 4], words[(at + 2) % 4], 4),
+                    );
+                    words[at] = _mm_sha256msg2_epu32(early, words[(at + 3) % 4]);
                 }
-                abef = _mm_add_epi32(abef, abef_was);
-                cdgh = _mm_add_epi32(cdgh, cdgh_was);
+                let mixed = _mm_add_epi32(words[at], load(&K[group * 4..group * 4 + 4]));
+                cdgh = _mm_sha256rnds2_epu32(cdgh, abef, mixed);
+                abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(mixed, 0x0e));
             }
-            let feba = _mm_shuffle_epi32(abef, 0x1b);
-            let dchg = _mm_shuffle_epi32(cdgh, 0xb1);
-            _mm_storeu_si128(state.as_mut_ptr().cast(), _mm_blend_epi16(feba, dchg, 0xf0));
-            _mm_storeu_si128(state.as_mut_ptr().add(4).cast(), _mm_alignr_epi8(dchg, feba, 8));
+            abef = _mm_add_epi32(abef, abef_was);
+            cdgh = _mm_add_epi32(cdgh, cdgh_was);
         }
+        let feba = _mm_shuffle_epi32(abef, 0x1b);
+        let dchg = _mm_shuffle_epi32(cdgh, 0xb1);
+        store(&mut state[..4], _mm_blend_epi16(feba, dchg, 0xf0));
+        store(&mut state[4..], _mm_alignr_epi8(dchg, feba, 8));
     }
 }
 

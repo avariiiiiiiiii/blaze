@@ -302,7 +302,11 @@ fn checkout(db: &mut TestDb) -> (AbsPathBuf, FileSetConfig) {
 }
 
 fn vfs_file(bytes: &[u8]) -> blaze_vfs::File<'_> {
-    blaze_vfs::File { id: ContentId::of(blaze_vfs::FILE_DOMAIN, bytes), bytes }
+    blaze_vfs::File {
+        id: ContentId::of(blaze_vfs::FILE_DOMAIN, bytes),
+        mode: blaze_vfs::Mode::Regular,
+        bytes,
+    }
 }
 
 fn set_view(
@@ -409,7 +413,11 @@ fn a_content_id_that_is_not_its_bytes_is_refused() {
         ViewFile { path: "src/lib.rs", file: vfs_file(b"mod a;") },
         ViewFile {
             path: "src/main.rs",
-            file: blaze_vfs::File { id: ContentId::of(blaze_vfs::FILE_DOMAIN, b"other"), bytes },
+            file: blaze_vfs::File {
+                id: ContentId::of(blaze_vfs::FILE_DOMAIN, b"other"),
+                mode: blaze_vfs::Mode::Regular,
+                bytes,
+            },
         },
     ];
     let view =

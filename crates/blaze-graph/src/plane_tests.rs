@@ -378,6 +378,31 @@ fn a_request_says_what_it_ran_and_its_measured_critical_path() {
     assert_eq!(plane.stats(RequestId(4)), None);
 }
 
+/// A run is critical when nothing ready or running of its request has a longer path to go;
+/// a running node that rises as nodes are added after it counts at its new priority.
+#[test]
+fn a_run_says_whether_it_is_on_the_critical_path() {
+    let critical = |outputs: &[PlaneOutput]| -> Vec<(u32, bool)> {
+        outputs
+            .iter()
+            .filter_map(|it| match it {
+                PlaneOutput::Run { id, critical, .. } => Some((id.0, *critical)),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut plane = Plane::new(config(1, 2)).unwrap();
+    open(&mut plane, 1, 1, false);
+    // 1 (then 2) has 10 to go, 3 has 1.
+    let out = add(&mut plane, 1, vec![work(1, &[], 5), work(2, &[1], 5), work(3, &[], 1)]);
+    assert_eq!(critical(&out), [(1, true), (3, false)]);
+    // 4 after running 3 raises 3 to 101: the most of the request is now running 3.
+    assert!(runs(&add(&mut plane, 1, vec![work(4, &[3], 100)])).is_empty());
+    close(&mut plane, 1);
+    assert_eq!(critical(&built(&mut plane, 1)), [(2, false)]);
+    assert_eq!(critical(&built(&mut plane, 3)), [(4, true)]);
+}
+
 /// The plane keeps no results of its own: without a database a key done before runs again.
 #[test]
 fn without_a_database_a_key_done_before_runs_again() {
@@ -683,9 +708,6 @@ struct Model {
     cancelled: FxHashSet<u32>,
     /// How many `Run`s each request was said.
     ran: FxHashMap<u32, u64>,
-    /// `Run`s said critical and not, so the test knows it saw both.
-    critical_runs: u64,
-    other_runs: u64,
     outputs: Vec<PlaneOutput>,
 }
 
@@ -793,11 +815,6 @@ impl Model {
                         .max()
                         .unwrap_or(0);
                     assert_eq!(*critical, mine >= most, "seed {seed}: #{id} at {mine}, most {most}");
-                    if *critical {
-                        self.critical_runs += 1;
-                    } else {
-                        self.other_runs += 1;
-                    }
                     for dep in &spec.deps {
                         assert!(self.done_well(dep.0), "seed {seed}: #{id} runs before #{dep}");
                     }
@@ -1172,10 +1189,18 @@ fn simulate(seed: u64, release: bool) -> Simulated {
 #[test]
 fn random_requests_keep_the_rules() {
     let mut steps = 0;
+    let mut critical = [0u64; 2];
     for seed in 0..600u64 {
-        steps += simulate(seed, false).steps;
+        let run = simulate(seed, false);
+        steps += run.steps;
+        for output in &run.outputs {
+            if let PlaneOutput::Run { critical: it, .. } = output {
+                critical[usize::from(*it)] += 1;
+            }
+        }
     }
     assert!(steps > 5_000, "{steps} steps");
+    assert!(critical.iter().all(|&it| it > 100), "runs off and on the critical path: {critical:?}");
 }
 
 #[test]

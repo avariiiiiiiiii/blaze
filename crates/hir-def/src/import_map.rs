@@ -35,22 +35,36 @@ pub struct ImportInfo {
     pub complete: Complete,
 }
 
+/// 24 bytes: the name's symbol (8), the module's salsa id (8) and three bytes of flags.
+const _: () = assert!(size_of::<ImportInfo>() == 24);
+
 /// A map from publicly exported items to its name.
 ///
 /// Reexports of items are taken into account.
+///
+/// Columns over a row per item, in the order the collection first meets each item: `items` (the
+/// key with its hash, found in one probe), the row's infos as a CSR range of `infos`, and a bit
+/// for "associated item of a trait". A row costs its set entry and index slot (about 34 bytes)
+/// and 4 for its CSR offset; each info 24, and 4 for its place in `importables`; plus the FST's
+/// share of the names' bytes. Nothing is allocated per row or per info.
 #[derive(Default)]
 pub struct ImportMap {
-    /// Maps from `ItemInNs` to information of imports that bring the item into scope.
-    item_to_info_map: ImportMapIndex,
-    /// List of keys stored in [`Self::item_to_info_map`], sorted lexicographically by their
-    /// [`Name`]. Indexed by the values returned by running `fst`.
+    /// Every importable item; an item's index is its row.
+    items: FxIndexSet<ItemInNs>,
+    /// The infos of row `i` are `infos[info_start[i]..info_start[i + 1]]`, in the order the
+    /// imports were found. Every row has at least one, so the offsets strictly increase.
+    info_start: Box<[u32]>,
+    /// Information of the imports that bring each item into scope, grouped by row.
+    infos: Box<[ImportInfo]>,
+    /// Bit `i` set: row `i` is an associated item of a trait.
+    trait_assoc_items: Box<[u64]>,
+    /// Indices into [`Self::infos`], sorted by their names lowercased (ASCII), ties in row
+    /// order. Indexed by the values returned by running `fst`.
     ///
     /// Since a name can refer to multiple items due to namespacing and import aliases, we store all
     /// items with the same name right after each other. This allows us to find all items after the
     /// fst gives us the index of the first one.
-    ///
-    /// The [`u32`] is the index into the smallvec in the value of [`Self::item_to_info_map`].
-    importables: Vec<(ItemInNs, u32)>,
+    importables: Box<[u32]>,
     fst: fst::Map<Vec<u8>>,
 }
 
@@ -59,8 +73,6 @@ enum IsTraitAssocItem {
     Yes,
     No,
 }
-
-type ImportMapIndex = FxIndexMap<ItemInNs, (SmallVec<[ImportInfo; 1]>, IsTraitAssocItem)>;
 
 #[salsa::tracked]
 impl ImportMap {
@@ -73,9 +85,9 @@ impl ImportMap {
 impl ImportMap {
     pub fn dump(&self, db: &dyn SourceDatabase) -> String {
         let mut out = String::new();
-        for (k, v) in self.item_to_info_map.iter() {
-            format_to!(out, "{:?} ({:?}) -> ", k, v.1);
-            for v in &v.0 {
+        for (row, item) in self.items.iter().enumerate() {
+            format_to!(out, "{:?} ({:?}) -> ", item, self.is_trait_assoc_item(row));
+            for v in self.row_infos(row) {
                 format_to!(out, "{}:{:?}, ", v.name.display(db, Edition::CURRENT), v.container);
             }
             format_to!(out, "\n");
@@ -86,59 +98,126 @@ impl ImportMap {
     fn import_map_query_impl(db: &dyn SourceDatabase, krate: Crate) -> Self {
         let _p = tracing::info_span!("import_map_query").entered();
 
-        let map = Self::collect_import_map(db, krate);
+        let found = Collector::collect(db, krate);
+        let rows = found.items.len();
 
-        let mut importables: Vec<_> = map
-            .iter()
-            // We've only collected items, whose name cannot be tuple field so unwrapping is fine.
-            .flat_map(|(&item, (info, _))| {
-                info.iter()
-                    .enumerate()
-                    .map(move |(idx, info)| (item, info.name.as_str(), idx as u32))
-            })
-            .collect();
-        importables.sort_by(|(_, l_info, _), (_, r_info, _)| {
-            let lhs_chars = l_info.chars().map(|c| c.to_ascii_lowercase());
-            let rhs_chars = r_info.chars().map(|c| c.to_ascii_lowercase());
-            lhs_chars.cmp(rhs_chars)
-        });
-        importables.dedup();
+        // Group the infos by row with a counting sort, which keeps the order they were found in
+        // within a row: count, prefix-sum to the starts, then place with the starts as cursors
+        // (which leaves each at its row's end) and shift them back.
+        let mut info_start = vec![0u32; rows + 1];
+        for &(row, _) in &found.infos {
+            info_start[row as usize + 1] += 1;
+        }
+        for row in 0..rows {
+            info_start[row + 1] += info_start[row];
+        }
+        let mut order = vec![0u32; found.infos.len()];
+        for (at, &(row, _)) in found.infos.iter().enumerate() {
+            let cursor = &mut info_start[row as usize];
+            order[*cursor as usize] = at as u32;
+            *cursor += 1;
+        }
+        info_start.copy_within(0..rows, 1);
+        info_start[0] = 0;
+        let infos: Box<[ImportInfo]> =
+            order.iter().map(|&at| found.infos[at as usize].1.clone()).collect();
 
-        // Build the FST, taking care not to insert duplicate values.
-        let mut builder = fst::MapBuilder::memory();
-        let mut iter = importables
-            .iter()
-            .enumerate()
-            .dedup_by(|&(_, (_, lhs, _)), &(_, (_, rhs, _))| lhs.eq_ignore_ascii_case(rhs));
-
-        let mut insert = |name: &str, start, end| {
-            builder.insert(name.to_ascii_lowercase(), ((start as u64) << 32) | end as u64).unwrap()
-        };
-
-        if let Some((mut last, (_, name, _))) = iter.next() {
-            debug_assert_eq!(last, 0);
-            let mut last_name = name;
-            for (next, (_, next_name, _)) in iter {
-                insert(last_name, last, next);
-                last = next;
-                last_name = next_name;
+        let mut trait_assoc_items = vec![0u64; rows.div_ceil(64)];
+        for (row, &is_trait_assoc_item) in found.trait_assoc_items.iter().enumerate() {
+            if is_trait_assoc_item {
+                trait_assoc_items[row / 64] |= 1 << (row % 64);
             }
-            insert(last_name, last, importables.len());
         }
 
-        let importables = importables.into_iter().map(|(item, _, idx)| (item, idx)).collect();
-        ImportMap { item_to_info_map: map, fst: builder.into_map(), importables }
+        // Every info, in row order, stably sorted by its lowercased name. The order of UTF-8
+        // bytes is the order of chars, and lowercasing ASCII bytes leaves the others alone, so
+        // this is the FST's key order.
+        let mut importables: Vec<u32> = (0..infos.len() as u32).collect();
+        importables.sort_by(|&l, &r| {
+            cmp_ascii_lowercase(infos[l as usize].name.as_str(), infos[r as usize].name.as_str())
+        });
+
+        // One FST key per run of names equal up to ASCII case, each written into one buffer.
+        let mut builder = fst::MapBuilder::memory();
+        let mut key = Vec::new();
+        let mut start = 0;
+        while start < importables.len() {
+            let name = infos[importables[start] as usize].name.as_str();
+            let mut end = start + 1;
+            while end < importables.len()
+                && infos[importables[end] as usize].name.as_str().eq_ignore_ascii_case(name)
+            {
+                end += 1;
+            }
+            key.clear();
+            key.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
+            builder.insert(&key, ((start as u64) << 32) | end as u64).unwrap();
+            start = end;
+        }
+
+        ImportMap {
+            items: found.items,
+            info_start: info_start.into_boxed_slice(),
+            infos,
+            trait_assoc_items: trait_assoc_items.into_boxed_slice(),
+            importables: importables.into_boxed_slice(),
+            fst: builder.into_map(),
+        }
     }
 
     pub fn import_info_for(&self, item: ItemInNs) -> Option<&[ImportInfo]> {
-        self.item_to_info_map.get(&item).map(|(info, _)| &**info)
+        self.items.get_index_of(&item).map(|row| self.row_infos(row))
     }
 
-    fn collect_import_map(db: &dyn SourceDatabase, krate: Crate) -> ImportMapIndex {
+    fn row_infos(&self, row: usize) -> &[ImportInfo] {
+        &self.infos[self.info_start[row] as usize..self.info_start[row + 1] as usize]
+    }
+
+    /// The row an index into [`Self::infos`] belongs to: a binary search of the offsets.
+    fn row_of_info(&self, info: u32) -> usize {
+        self.info_start.partition_point(|&start| start <= info) - 1
+    }
+
+    fn is_trait_assoc_item(&self, row: usize) -> IsTraitAssocItem {
+        if self.trait_assoc_items[row / 64] & (1 << (row % 64)) != 0 {
+            IsTraitAssocItem::Yes
+        } else {
+            IsTraitAssocItem::No
+        }
+    }
+}
+
+fn cmp_ascii_lowercase(l: &str, r: &str) -> Ordering {
+    let l = l.bytes().map(|b| b.to_ascii_lowercase());
+    let r = r.bytes().map(|b| b.to_ascii_lowercase());
+    l.cmp(r)
+}
+
+/// What the walk over the public modules finds, before it is laid out as columns.
+#[derive(Default)]
+struct Collector {
+    items: FxIndexSet<ItemInNs>,
+    /// Per row, whether the item is an associated item of a trait (as the first info found
+    /// for it says).
+    trait_assoc_items: Vec<bool>,
+    /// `(row, info)` in the order found.
+    infos: Vec<(u32, ImportInfo)>,
+}
+
+impl Collector {
+    fn add(&mut self, item: ItemInNs, is_trait_assoc_item: bool, info: ImportInfo) {
+        let (row, inserted) = self.items.insert_full(item);
+        if inserted {
+            self.trait_assoc_items.push(is_trait_assoc_item);
+        }
+        self.infos.push((row as u32, info));
+    }
+
+    fn collect(db: &dyn SourceDatabase, krate: Crate) -> Collector {
         let _p = tracing::info_span!("collect_import_map").entered();
 
         let def_map = crate_def_map(db, krate);
-        let mut map = FxIndexMap::default();
+        let mut found = Collector::default();
 
         // We look only into modules that are public(ly reexported), starting with the crate root.
         let root = def_map.root_module_id();
@@ -156,123 +235,132 @@ impl ImportMap {
                 &module.def_map(db).module(db, module)
             };
 
-            let visible_items = mod_data.scope(db).entries().filter_map(|(name, per_ns)| {
-                let per_ns = per_ns.filter_visibility(|vis| vis == Visibility::Public);
-                if per_ns.is_none() { None } else { Some((name, per_ns)) }
-            });
-
-            for (name, per_ns) in visible_items {
-                for (item, import) in per_ns.iter_items() {
-                    let attr_id = if let Some(import) = import {
-                        match import {
-                            ImportOrExternCrate::ExternCrate(id) => Some(id.into()),
-                            ImportOrExternCrate::Import(id) => Some(id.use_.into()),
-                            ImportOrExternCrate::Glob(id) => Some(id.use_.into()),
-                        }
-                    } else {
-                        match item {
-                            ItemInNs::Types(id) | ItemInNs::Values(id) => match id {
-                                ModuleDefId::ModuleId(it) => Some(AttrDefId::ModuleId(it)),
-                                ModuleDefId::FunctionId(it) => Some(it.into()),
-                                ModuleDefId::AdtId(it) => Some(it.into()),
-                                ModuleDefId::EnumVariantId(it) => Some(it.into()),
-                                ModuleDefId::ConstId(it) => Some(it.into()),
-                                ModuleDefId::StaticId(it) => Some(it.into()),
-                                ModuleDefId::TraitId(it) => Some(it.into()),
-                                ModuleDefId::TypeAliasId(it) => Some(it.into()),
-                                ModuleDefId::MacroId(it) => Some(it.into()),
-                                ModuleDefId::BuiltinType(_) => None,
-                            },
-                            ItemInNs::Macros(id) => Some(id.into()),
-                        }
-                    };
-                    let (is_doc_hidden, is_unstable, do_not_complete) = match attr_id {
-                        None => (false, false, Complete::Yes),
-                        Some(attr_id) => {
-                            let attrs = AttrFlags::query(db, attr_id);
-                            let do_not_complete =
-                                Complete::extract(matches!(attr_id, AttrDefId::TraitId(_)), attrs);
-                            (
-                                attrs.contains(AttrFlags::IS_DOC_HIDDEN),
-                                attrs.contains(AttrFlags::IS_UNSTABLE),
-                                do_not_complete,
-                            )
-                        }
-                    };
-
-                    let import_info = ImportInfo {
-                        name: name.clone(),
-                        container: module,
-                        is_doc_hidden,
-                        is_unstable,
-                        complete: do_not_complete,
-                    };
-
-                    let module_def = item.as_module_def_id();
-                    if let Some(ModuleDefId::TraitId(tr)) = module_def {
-                        Self::collect_trait_assoc_items(
-                            db,
-                            &mut map,
-                            tr,
-                            matches!(item, ItemInNs::Types(_)),
-                            &import_info,
-                        );
-                    } else if let Some(ModuleDefId::AdtId(AdtId::EnumId(enum_))) = module_def {
-                        Self::collect_enum_variants(db, &mut map, enum_, &import_info);
-                    }
-
-                    let (infos, _) =
-                        map.entry(item).or_insert_with(|| (SmallVec::new(), IsTraitAssocItem::No));
-                    infos.reserve_exact(1);
-                    infos.push(import_info);
-
-                    // If we've just added a module, descend into it.
-                    if let Some(ModuleDefId::ModuleId(mod_id)) = module_def {
-                        worklist.push(mod_id);
-                    }
+            // The public items of each name, types then values then macros.
+            for (&name, per_ns) in mod_data.scope(db).entries() {
+                if let Some(it) = per_ns.types
+                    && it.vis == Visibility::Public
+                {
+                    found.visit(db, &mut worklist, name, module, ItemInNs::Types(it.def), it.import);
+                }
+                if let Some(it) = per_ns.values
+                    && it.vis == Visibility::Public
+                {
+                    let import = it.import.map(ImportOrExternCrate::from);
+                    found.visit(db, &mut worklist, name, module, ItemInNs::Values(it.def), import);
+                }
+                if let Some(it) = per_ns.macros
+                    && it.vis == Visibility::Public
+                {
+                    found.visit(db, &mut worklist, name, module, ItemInNs::Macros(it.def), it.import);
                 }
             }
         }
-        map.shrink_to_fit();
-        map
+        found
+    }
+
+    fn visit(
+        &mut self,
+        db: &dyn SourceDatabase,
+        worklist: &mut Vec<ModuleId>,
+        name: Name,
+        module: ModuleId,
+        item: ItemInNs,
+        import: Option<ImportOrExternCrate>,
+    ) {
+        let attr_id = if let Some(import) = import {
+            match import {
+                ImportOrExternCrate::ExternCrate(id) => Some(id.into()),
+                ImportOrExternCrate::Import(id) => Some(id.use_.into()),
+                ImportOrExternCrate::Glob(id) => Some(id.use_.into()),
+            }
+        } else {
+            match item {
+                ItemInNs::Types(id) | ItemInNs::Values(id) => match id {
+                    ModuleDefId::ModuleId(it) => Some(AttrDefId::ModuleId(it)),
+                    ModuleDefId::FunctionId(it) => Some(it.into()),
+                    ModuleDefId::AdtId(it) => Some(it.into()),
+                    ModuleDefId::EnumVariantId(it) => Some(it.into()),
+                    ModuleDefId::ConstId(it) => Some(it.into()),
+                    ModuleDefId::StaticId(it) => Some(it.into()),
+                    ModuleDefId::TraitId(it) => Some(it.into()),
+                    ModuleDefId::TypeAliasId(it) => Some(it.into()),
+                    ModuleDefId::MacroId(it) => Some(it.into()),
+                    ModuleDefId::BuiltinType(_) => None,
+                },
+                ItemInNs::Macros(id) => Some(id.into()),
+            }
+        };
+        let (is_doc_hidden, is_unstable, do_not_complete) = match attr_id {
+            None => (false, false, Complete::Yes),
+            Some(attr_id) => {
+                let attrs = AttrFlags::query(db, attr_id);
+                let do_not_complete =
+                    Complete::extract(matches!(attr_id, AttrDefId::TraitId(_)), attrs);
+                (
+                    attrs.contains(AttrFlags::IS_DOC_HIDDEN),
+                    attrs.contains(AttrFlags::IS_UNSTABLE),
+                    do_not_complete,
+                )
+            }
+        };
+
+        let import_info = ImportInfo {
+            name,
+            container: module,
+            is_doc_hidden,
+            is_unstable,
+            complete: do_not_complete,
+        };
+
+        let module_def = item.as_module_def_id();
+        if let Some(ModuleDefId::TraitId(tr)) = module_def {
+            self.collect_trait_assoc_items(
+                db,
+                tr,
+                matches!(item, ItemInNs::Types(_)),
+                &import_info,
+            );
+        } else if let Some(ModuleDefId::AdtId(AdtId::EnumId(enum_))) = module_def {
+            self.collect_enum_variants(db, enum_, &import_info);
+        }
+
+        self.add(item, false, import_info);
+
+        // If we've just added a module, descend into it.
+        if let Some(ModuleDefId::ModuleId(mod_id)) = module_def {
+            worklist.push(mod_id);
+        }
     }
 
     fn collect_enum_variants(
+        &mut self,
         db: &dyn SourceDatabase,
-        map: &mut ImportMapIndex,
         enum_: EnumId,
         enum_import_info: &ImportInfo,
     ) {
-        let _p = tracing::info_span!("collect_enum_variants").entered();
-        for (variant_name, &(variant, _)) in &enum_.enum_variants(db).variants {
+        for (&variant_name, &(variant, _)) in &enum_.enum_variants(db).variants {
             let attr_id = variant.into();
             let attrs = AttrFlags::query(db, attr_id);
             let do_not_complete = Complete::extract(false, attrs);
             let variant_info = ImportInfo {
                 container: enum_import_info.container,
-                name: variant_name.clone(),
+                name: variant_name,
                 is_doc_hidden: attrs.contains(AttrFlags::IS_DOC_HIDDEN),
                 is_unstable: attrs.contains(AttrFlags::IS_UNSTABLE),
                 complete: do_not_complete,
             };
-
-            let (infos, _) = map
-                .entry(ItemInNs::Types(variant.into()))
-                .or_insert_with(|| (SmallVec::new(), IsTraitAssocItem::No));
-            infos.reserve_exact(1);
-            infos.push(variant_info);
+            self.add(ItemInNs::Types(variant.into()), false, variant_info);
         }
     }
 
     fn collect_trait_assoc_items(
+        &mut self,
         db: &dyn SourceDatabase,
-        map: &mut ImportMapIndex,
         tr: TraitId,
         is_type_in_ns: bool,
         trait_import_info: &ImportInfo,
     ) {
-        let _p = tracing::info_span!("collect_trait_assoc_items").entered();
-        for &(ref assoc_item_name, item) in &TraitItems::query(db, tr).items {
+        for &(assoc_item_name, item) in &TraitItems::query(db, tr).items {
             let module_def_id = match item {
                 AssocItemId::FunctionId(f) => ModuleDefId::from(f),
                 AssocItemId::ConstId(c) => ModuleDefId::from(c),
@@ -296,35 +384,39 @@ impl ImportMap {
                 Complete::for_trait_item(trait_import_info.complete, item_do_not_complete);
             let assoc_item_info = ImportInfo {
                 container: trait_import_info.container,
-                name: assoc_item_name.clone(),
+                name: assoc_item_name,
                 is_doc_hidden: attrs.contains(AttrFlags::IS_DOC_HIDDEN),
                 is_unstable: attrs.contains(AttrFlags::IS_UNSTABLE),
                 complete: do_not_complete,
             };
-
-            let (infos, _) =
-                map.entry(assoc_item).or_insert_with(|| (SmallVec::new(), IsTraitAssocItem::Yes));
-            infos.reserve_exact(1);
-            infos.push(assoc_item_info);
+            self.add(assoc_item, true, assoc_item_info);
         }
     }
 }
 
 impl Eq for ImportMap {}
+/// The same items with the same infos and flags, in any row order. `fst` and `importables` are
+/// built from those, so they are not compared.
 impl PartialEq for ImportMap {
     fn eq(&self, other: &Self) -> bool {
-        // `fst` and `importables` are built from `map`, so we don't need to compare them.
-        self.item_to_info_map == other.item_to_info_map
+        self.items.len() == other.items.len()
+            && self.items.iter().enumerate().all(|(row, item)| {
+                other.items.get_index_of(item).is_some_and(|other_row| {
+                    self.is_trait_assoc_item(row) == other.is_trait_assoc_item(other_row)
+                        && self.row_infos(row) == other.row_infos(other_row)
+                })
+            })
     }
 }
 
 impl fmt::Debug for ImportMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut importable_names: Vec<_> = self
-            .item_to_info_map
+            .items
             .iter()
-            .map(|(item, (infos, _))| {
-                let l = infos.len();
+            .enumerate()
+            .map(|(row, item)| {
+                let l = self.row_infos(row).len();
                 match item {
                     ItemInNs::Types(it) => format!("- {it:?} (t) [{l}]",),
                     ItemInNs::Values(it) => format!("- {it:?} (v) [{l}]",),

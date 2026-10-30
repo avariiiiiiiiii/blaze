@@ -79,7 +79,7 @@ enum Binding<'a> {
 
 /// [`crate::expect_fragment`] as it was: the parser's input made from every token left in the
 /// level, whatever the fragment's length.
-fn expect_fragment<'t>(
+pub(crate) fn expect_fragment<'t>(
     db: &dyn salsa::Database,
     tt_iter: &mut TtIter<'t>,
     entry_point: ::parser::PrefixEntryPoint,

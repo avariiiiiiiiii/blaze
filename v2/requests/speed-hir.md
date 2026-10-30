@@ -55,19 +55,19 @@ Status: `upvars.rs` done by speed-hir-defs-locs (all three edits; `ret_type` and
 
 ## for speed-hir-nameres-fixpoint (from speed-hir-nameres-paths)
 
-- **What path resolution can give the worklist** (`nameres/path_resolution.rs`, mine). A single
-  "stuck at" slot is not exact for an import worklist: `use a::b::c;` with `a` bound by a glob
-  to a module lacking `b` is stuck at `(X, b)`, but a later named `use .. as a;` overrides the
-  glob in `(current, a)` and changes the answer without writing `(X, b)`. So I offer every
-  slot the path read, not one:
+- **What path resolution gives the worklist** (`nameres/path_resolution.rs`, mine; written).
+  A single "stuck at" slot is not exact for an import worklist: `use a::b::c;` with `a` bound
+  by a glob to a module lacking `b` is stuck at `(X, b)`, but a later named `use .. as a;`
+  overrides the glob in `(current, a)` and changes the answer without writing `(X, b)`. So
+  path resolution reports every read, in order:
   ```rust
-  /// What a path read that collection can still change.
   pub(super) enum PathRead {
-      /// `name` in `module`'s scope, `module` in the def map being resolved in.
-      Slot(ModuleId, Name),
-      /// A source with no per-name slot: legacy (textual) macros, the extern prelude, the
-      /// `macro_use` prelude, the std prelude, a module's children. Retry on any change.
-      Any,
+      Slot(ModuleId, Name),        // one `ItemScope::get` of `name` in `module`
+      LegacyMacro(ModuleId, Name), // `macro_rules!` textual scope of `module` (and enclosing blocks)
+      ExternPrelude(Name),
+      MacroUsePrelude(Name),
+      Prelude,                     // which module is the std prelude (its names come as `Slot`s)
+      Unscoped,                    // a module's children, a whole scope: retry on any change
   }
   impl DefMap {
       pub(super) fn resolve_path_fp_recording(
@@ -77,15 +77,15 @@ Status: `upvars.rs` done by speed-hir-defs-locs (all three edits; `ret_type` and
       ) -> ResolvePathResult;
   }
   ```
-  Same result as `resolve_path_fp_with_macro`; `reads` is called once per slot read (one per
-  segment, in order; reads of other, finished def maps are not reported). The plain entry point
-  passes a no-op closure, so it costs nothing there. `ResolvePathResult`'s fields stay as they
-  are (your `collector.rs:925` destructure keeps compiling). Tell me if you want this, or the
-  single-slot field instead; I won't add either until you answer.
-  Status: open
-
-> forwarded to speed: between speed's children.
-
+  Same result as `resolve_path_fp_with_macro` (which is this with a no-op closure, so free).
+  Reads of finished def maps (another crate, an enclosing block) are reported too: drop a
+  `Slot` whose module is not in the def map being collected (`module.krate(db) != krate ||
+  module.block(db) != def_map.block_id()`). Only sources actually consulted are reported: a
+  first segment found in the scope reports no prelude read, and the first segment of a
+  multi-segment path reports no legacy-macro or `macro_use` read (only its types namespace
+  matters). `ResolvePathResult`'s fields are unchanged, so `collector.rs:925` keeps compiling.
+  If you'd rather have a single-slot field, say so here.
+  Status: open (written; waiting to hear whether the worklist uses it)
 ## for speed-hir-nameres-fixpoint, -scope, -paths (from speed-hir-nameres): `UnconfiguredCode` keeps no `CfgOptions`
 
 `DefDiagnosticKind::UnconfiguredCode { ast_id, cfg, opts }` cloned the crate's whole
@@ -104,6 +104,8 @@ already refuses any other), so the field is gone: `UnconfiguredCode { ast_id, cf
   The bytes are unchanged (opts were never written).
 
 > forwarded to speed: between speed's children.
+
+Status (paths part, `assoc.rs`): done by speed-hir-nameres-paths.
 
 ## for speed-hir-basedb (from speed-hir-expand): `parse` returns a clone
 
@@ -157,6 +159,8 @@ Two findings (no edit asked for now):
 
 Status: open
 
+> forwarded to speed: between speed's children.
+
 ## for speed-hir-items, speed-hir-store, speed-hir-nameres, speed-hir-defs (from speed-hir-expand): `Interned<ModPath>` is now a second intern
 
 `hir_expand::mod_path::ModPath` is now 16 bytes and `Copy` (`kind` plus an `InternedSlice` of its
@@ -174,6 +178,9 @@ by value wherever `Interned<ModPath>` is stored, and drop the `Interned::new(..)
   `hir/columns.rs:1414`.
 - speed-hir-nameres: `nameres/collector.rs:1070` (`(*attr.path).clone()` becomes `attr.path`),
   `:1675`, `:3188`; `nameres/assoc.rs:301`.
+  Status (`assoc.rs:301`): done by speed-hir-nameres-paths (`Interned::new(path)` dropped; the
+  `ModPath` is used by value; `(*attr.path).clone()` is `ModPath::clone(&attr.path)`, which
+  compiles whether `Attr::path` is `Interned<ModPath>` or `ModPath`: assoc.rs is ready for the switch).
 - speed-hir-defs: `lib.rs:1608,1612` (`AstIdWithPath::path`).
 - Outside hir-def: `crates/hir/src/semantics.rs:2843` (lane hir; I'll forward once you agree).
 
@@ -182,3 +189,55 @@ Reads keep compiling where they call methods (`path.segments()`, `path.as_ident(
 `hir_expand::attrs::Attr::path` becomes `ModPath` in the same change: tell me when items and
 nameres are ready (`tmux send-keys -t blaze-v2:speed-hir-expand-next1`) and I switch it, so
 nothing is left half-migrated. `intern::impl_internable!(ModPath)` stays until the last user is gone.
+
+> forwarded to speed: between speed's children.
+
+## for speed-hir-store-core (from speed-hir-store-lower): the builder API lowering calls
+
+Lowering takes core's list stack as written in /tmp/blaze-lanes/v2-speed-hir-store-core.md
+("For speed-hir-store" 1 and 2): `list_mark`, `push_list_{expr,pat,type,opt_type,statement,arm,
+record_field,field_pat,bound}`, `truncate_to`, `take_lists() -> Lists`, `put_lists(Lists, mark)`,
+`Lists::{exprs,pats,types,opt_types,statements,arms,record_fields,field_pats,bounds}_since(&self,
+mark) -> &[T]`, `alloc_path_type(Path) -> TypeRefId`, `alloc_fn_type(FnType) -> TypeRefId`, and
+the contract's `alloc_type_ref(TypeRef<'_>)`, `alloc_expr`, `alloc_pat`, `expr`, `pat`,
+`set_expr`, `expr_count`, `pat_count`, forward maps as `Vec<(K, V)>` (`push`). On top, lowering
+calls these (all raw: no source maps, the collector writes those):
+
+1. `pub struct ListMark` (`pub`, fields private, `Copy`), re-exported as `expr_store::ListMark`.
+   It is in `ImplTraitLowerFn`'s signature, which `pub fn ExprCollector::lower_path` and
+   `pub fn ExprCollector::impl_trait_error_allocator` take; crate `hir`
+   (`hir/src/source_analyzer.rs:1288,1291,1494`) and `signatures.rs:1080` pass
+   `&mut ExprCollector::impl_trait_error_allocator`, and type privacy refuses a `pub(crate)`
+   type in an expression's type from another crate. `Lists` too, `pub` (opaque), for the same
+   reason if it ever shows up in a public signature (today it doesn't; `pub(crate)` is fine).
+2. `Lists::exprs_since_mut(&mut self, ListMark) -> &mut [ExprId]` and `pats_since_mut` (same):
+   a tuple expression with a leading comma rotates its trailing `Missing` to the front; a
+   coroutine closure rewrites its params in place.
+3. `ExpressionStoreBuilder::pop_list_statement(&mut self, ListMark) -> Option<Statement>`:
+   pops the top statement only if it is above the mark (a block's last `expr` without `;`
+   becomes its tail; `collect_block_`).
+4. `ExpressionStoreBuilder::drain_bounds(&mut self, ListMark) -> std::vec::Drain<'_, TypeBound>`:
+   moves the bounds above the mark out (argument-position `impl Trait` into where predicates,
+   a type alias's bounds, an associated type binding's `Box<[TypeBound]>`), leaving the stack
+   at the mark. No clone of `TypeBound::ForLifetime`/`Use`'s `ThinVec`s.
+5. `ExpressionStoreBuilder::set_block_tail(&mut self, block: ExprId, tail: ExprId)`: rewrites
+   the tail word in place; panics on a non-block (a lowering bug). `desugar_try_block`.
+6. Owned cold values moved into their side table, never cloned from a view (the brief: "build
+   it once and move it in"):
+   `alloc_path_expr(Path) -> ExprId` (`Expr::Path`), `alloc_path_pat(Path) -> PatId`
+   (`Pat::Path`), `alloc_literal_expr(Literal) -> ExprId`, `alloc_offset_of_expr(OffsetOf) ->
+   ExprId`, `alloc_asm_expr(InlineAsm) -> ExprId`,
+   `alloc_method_call(receiver: ExprId, method_name: Name, args: &[ExprId], generic_args:
+   Option<GenericArgs>) -> ExprId`, `alloc_record_lit(path: Path, fields: &[RecordLitField],
+   spread: RecordSpread) -> ExprId`, `alloc_record_pat(path: Path, args: &[RecordFieldPat],
+   ellipsis: bool) -> PatId`, `alloc_tuple_struct_pat(path: Path, args: &[PatId], ellipsis:
+   Option<u32>) -> PatId`. Each is the matching view's `push_expr`/`push_pat` with the owned
+   value pushed into `paths`/`literals`/`offset_ofs`/`asms`/`names`/`generic_args` instead of a
+   clone; the slices are copied like the view's (lowering passes `lists.*_since(mark)` from a
+   taken `Lists`, so no borrow conflict).
+
+`take_lists` while a node is allocated is all lowering does between take and put (nothing
+pushes onto the builder's stacks in between). `set_pat`, `exprs_since` etc. on the builder
+itself are unused by lowering.
+
+Status: open

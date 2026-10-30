@@ -452,8 +452,38 @@ mod trees {
     /// is not let go of while this holds it, and the anchor's number in it.
     type Kept = (u128, SyntaxNode, Option<(Weak<FlatTree>, u32)>);
 
+    /// The maps of an anchor of a file: the anchor as in [`Kept`], and the file it is of.
+    type KeptMaps = (Weak<FlatTree>, u32, HirFileId, AnchorMaps);
+
     thread_local! {
         static TREES: RefCell<VecDeque<Kept>> = const { RefCell::new(VecDeque::new()) };
+        static MAPS: RefCell<VecDeque<KeptMaps>> = const { RefCell::new(VecDeque::new()) };
+    }
+
+    /// The maps of `anchor`, written in `file_id`: the ones kept when they are of this anchor of
+    /// this tree, else those `make` makes, kept. What they are made of is the anchor's tree and
+    /// the maps of the file that tree is the parse of, so the same anchor has the same maps.
+    pub(super) fn maps(
+        anchor: &SyntaxNode,
+        file_id: HirFileId,
+        make: impl FnOnce() -> AnchorMaps,
+    ) -> AnchorMaps {
+        let Some((file, at)) = anchor.flat() else { return make() };
+        let of = |it: &&KeptMaps| {
+            it.1 == at && it.2 == file_id && std::ptr::eq(it.0.as_ptr(), Arc::as_ptr(file))
+        };
+        if let Some(found) = MAPS.with_borrow(|maps| maps.iter().find(of).map(|it| it.3.clone())) {
+            return found;
+        }
+        let made = make();
+        let kept = (Arc::downgrade(file), at, file_id, made.clone());
+        MAPS.with_borrow_mut(|maps| {
+            if maps.len() == KEPT_MAPS {
+                maps.pop_front();
+            }
+            maps.push_back(kept);
+        });
+        made
     }
 
     pub(super) fn get(tree: u128) -> Option<SyntaxNode> {
@@ -492,10 +522,11 @@ pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySy
     let SpanMap::RealSpanMap(span_map) = src.file_id.span_map(db) else { return None };
     let item = src.value;
     let (start, anchor) = span_map.anchor_at(item.text_range().start());
+    let ast_id_map = src.file_id.ast_id_map(db);
     let anchor = match anchor == ROOT_ERASED_FILE_AST_ID {
         true => item.ancestors().last()?,
         false => {
-            let ptr = src.file_id.ast_id_map(db).get_erased(anchor);
+            let ptr = ast_id_map.get_erased(anchor);
             item.ancestors().find(|it| SyntaxNodePtr::new(it) == ptr)?
         }
     };
@@ -508,6 +539,13 @@ pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySy
     let relative =
         relative.ancestors().find(|it| it.text_range() == range && it.kind() == item.kind())?;
     let (file, edition) = src.file_id.file_id()?.unpack(db);
+    let AnchorMaps { ast_id_map, span_map, outline } = trees::maps(&anchor, src.file_id, || {
+        AnchorMaps {
+            ast_id_map: Arc::new(ast_id_map.relative_to(&anchor, &root)),
+            span_map: Arc::new(span_map.within(anchor.text_range())),
+            outline: holds_lazy(&anchor),
+        }
+    });
     Some(BodySyntax {
         file_id: src.file_id,
         tree,
@@ -515,10 +553,10 @@ pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySy
         range: anchor.text_range(),
         kind: anchor.kind(),
         edition,
-        outline: holds_lazy(&anchor),
+        outline,
         item: SyntaxNodePtr::new(&relative),
-        ast_id_map: src.file_id.ast_id_map(db).relative_to(&anchor, &root),
-        span_map: span_map.within(anchor.text_range()),
+        ast_id_map,
+        span_map,
     })
 }
 

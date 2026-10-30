@@ -191,8 +191,16 @@ pub(crate) struct Job {
     /// Each unit's record key, worked out once: `fresh` on the loop and `compile` on a worker
     /// both read it.
     pub(crate) keys: Box<[OnceLock<Option<blaze_cas::Key>>]>,
+    /// The view and the mounts, as paths.
+    pub(crate) mounted: Arc<files::Mounted>,
+    /// What each build script prints, by its compile unit, when it provably prints only
+    /// constants; worked out once.
+    pub(crate) inert: Box<[OnceLock<Option<blaze_usercode::run::Value>>]>,
     /// How each unit's program is run, worked out once (the key and the artifact read it).
     pub(crate) runs: Box<[OnceLock<artifact::Runs>]>,
+    /// Each build script run prepared by `fresh`, taken by `script`, so it is prepared once.
+    /// Only the loop touches it: the lock is never contended.
+    pub(crate) starts: Box<[Mutex<Option<Box<script::Start>>>]>,
     /// The crates built for build scripts and proc macros, as the code generator takes them.
     pub(crate) build_time: OnceLock<hir_ty_codegen::v2::BuildTime>,
     /// When the job's front was made: the clock the test queue is given.
@@ -202,6 +210,8 @@ pub(crate) struct Job {
 impl Job {
     fn new(input: JobInput, lowered: Lowered, shared: Arc<Shared>) -> Job {
         let graph = graph::Graph::new(&input.units);
+        let config = &input.config;
+        let mounted = Arc::new(files::Mounted::new(input.files.clone(), input.root, &config.mounts, &config.invocation.root));
         let slots = graph.len();
         Job {
             input,
@@ -212,6 +222,9 @@ impl Job {
             made: (0..slots).map(|_| OnceLock::new()).collect(),
             keys: (0..slots).map(|_| OnceLock::new()).collect(),
             runs: (0..slots).map(|_| OnceLock::new()).collect(),
+            mounted,
+            inert: (0..slots).map(|_| OnceLock::new()).collect(),
+            starts: (0..slots).map(|_| Mutex::new(None)).collect(),
             build_time: OnceLock::new(),
             began: Instant::now(),
         }

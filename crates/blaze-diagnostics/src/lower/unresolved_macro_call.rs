@@ -121,7 +121,7 @@ fn suggestions(
     kind: Kind,
     ident: &Segment,
     span: Span,
-    names: &[(String, ScopeDef<'_>)],
+    names: &[(hir::Name, ScopeDef<'_>)],
     node: &SyntaxNode,
     attr: Option<&ast::Attr>,
 ) {
@@ -186,7 +186,7 @@ fn suggestions(
 
 /// rustc's typo suggestion of a macro: one of the kind asked for in scope (or a built-in
 /// attribute, for an attribute) whose name is close, labelled where it is defined.
-fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, kind: Kind, name: &str, span: Span, names: &[(String, ScopeDef<'_>)]) {
+fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, kind: Kind, name: &str, span: Span, names: &[(hir::Name, ScopeDef<'_>)]) {
     let db = cx.db;
     let mut candidates: Vec<(&str, Option<hir::Macro>)> = names
         .iter()
@@ -223,11 +223,11 @@ fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, kind: Kind, name: &str, span: Span, na
 }
 
 /// What `name` is in scope when it is not a macro of `kind`, as rustc's note says it.
-fn other_meaning(cx: &Cx<'_, '_>, kind: Kind, name: &str, names: &[(String, ScopeDef<'_>)]) -> Option<String> {
+fn other_meaning(cx: &Cx<'_, '_>, kind: Kind, name: &str, names: &[(hir::Name, ScopeDef<'_>)]) -> Option<String> {
     let db = cx.db;
     let defs: Vec<ModuleDef> = names
         .iter()
-        .filter(|(it, _)| it == name)
+        .filter(|(it, _)| it.as_str() == name)
         .filter_map(|(_, def)| match def {
             ScopeDef::ModuleDef(it) => Some(*it),
             _ => None,
@@ -278,10 +278,10 @@ fn def_descr(def: ModuleDef) -> (&'static str, &'static str) {
 }
 
 /// The names in scope at `node`, with what each means.
-fn names_in_scope<'db>(cx: &Cx<'_, 'db>, node: &SyntaxNode) -> Vec<(String, ScopeDef<'db>)> {
+fn names_in_scope<'db>(cx: &Cx<'_, 'db>, node: &SyntaxNode) -> Vec<(hir::Name, ScopeDef<'db>)> {
     let mut names = Vec::new();
     if let Some(scope) = cx.sema.scope(node) {
-        scope.process_all_names(&mut |name, def| names.push((name.as_str().to_owned(), def)));
+        scope.process_all_names(&mut |name, def| names.push((name, def)));
     }
     names
 }

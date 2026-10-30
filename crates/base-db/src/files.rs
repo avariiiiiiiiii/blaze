@@ -225,6 +225,11 @@ impl Files {
         self.write_root_contents(&mut writer, db, &changed);
     }
 
+    /// The text input of `file` while it has text.
+    pub(crate) fn text_input(&self, file: FileId) -> Option<FileText> {
+        self.text.get(file.index())
+    }
+
     /// The text input of `file`, with text or without.
     pub(crate) fn input_of(&self, writer: &Writer, file: FileId) -> Option<FileText> {
         self.text.get(file.index()).or_else(|| writer.parked.get(&file).copied())

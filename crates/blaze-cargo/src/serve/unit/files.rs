@@ -3,7 +3,7 @@
 //! through the VFS's reader, never from the disk; and the name rustc gives a file in a
 //! diagnostic, from the root of the workspace when it is below it.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use base_db::FileId;
 use blaze_ids::ContentId;
@@ -29,7 +29,8 @@ impl Mounted {
     }
 
     /// The root and path in it of absolute `path`: the mount with the longest `at` holding it.
-    pub(crate) fn locate(&self, path: &str) -> Option<(ContentId, String)> {
+    /// Borrowed from `path` when the mount is a whole root, as the view's and most are.
+    pub(crate) fn locate<'p>(&self, path: &'p str) -> Option<(ContentId, Cow<'p, str>)> {
         self.mounts.iter().find_map(|mount| {
             let rest = under(path, &mount.at)?;
             let root = match mount.origin {
@@ -37,9 +38,9 @@ impl Mounted {
                 Origin::Root(id) => id,
             };
             let inner = match (mount.under.as_str(), rest) {
-                ("", rest) => rest.to_owned(),
-                (under, "") => under.to_owned(),
-                (under, rest) => format!("{under}/{rest}"),
+                ("", rest) => Cow::Borrowed(rest),
+                (under, "") => Cow::Owned(under.to_owned()),
+                (under, rest) => Cow::Owned(format!("{under}/{rest}")),
             };
             Some((root, inner))
         })

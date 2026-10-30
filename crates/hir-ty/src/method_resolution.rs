@@ -23,7 +23,7 @@ use tracing::{debug, instrument};
 use base_db::Crate;
 use hir_def::{
     AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
-    GenericParamId, HasModule, ImplId, ItemContainerId, ModuleDefId, ModuleId, TraitId,
+    GenericParamId, HasModule, ImplId, ItemContainerId, MacroId, ModuleDefId, ModuleId, TraitId,
     attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplMethod,
     expr_store::{Body, path::GenericArgs as HirGenericArgs},
@@ -691,21 +691,30 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
 /// name, and those are looked into in every crate. A function can hold one as well, of a type
 /// that is not its own (zerocopy's tests `impl KnownLayout for elain::Align<8>` in a test), and
 /// a workspace crate's functions are all looked into. Lowering every body of every dependency
-/// for this is too much, so a dependency's function is looked into when lexing its file finds
-/// an impl in it (bincode's `deserialize_enum` holds its `EnumAccess` for `&mut Deserializer`).
+/// for this is too much, so a dependency's function, static or associated constant is looked
+/// into unless lexing its text proves it holds none ([`may_hold`]): bincode's
+/// `deserialize_enum` holds its `EnumAccess` for `&mut Deserializer`, and a `#[derive]` on a
+/// struct in a body or a procedural macro called there writes one with no `impl` in the text.
 fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
     let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
     let local = krate.data(db).origin.is_local();
-    let holds = |it: FunctionId| local || holds_impl(db, krate, it);
     let declared = scope.declarations().filter_map(|def| match def {
-        ModuleDefId::FunctionId(it) if holds(it) => Some(DefWithBodyId::from(it)),
-        ModuleDefId::StaticId(it) if local => Some(DefWithBodyId::from(it)),
+        ModuleDefId::FunctionId(it) if local || may_hold(db, krate, it.loc(db).id, true) => {
+            Some(DefWithBodyId::from(it))
+        }
+        ModuleDefId::StaticId(it) if local || may_hold(db, krate, it.loc(db).id, true) => {
+            Some(DefWithBodyId::from(it))
+        }
         _ => None,
     });
     holders.extend(declared);
     let item = |item: &AssocItemId| match *item {
-        AssocItemId::FunctionId(it) if holds(it) => Some(DefWithBodyId::from(it)),
-        AssocItemId::ConstId(it) if local => Some(DefWithBodyId::from(it)),
+        AssocItemId::FunctionId(it) if local || may_hold(db, krate, it.loc(db).id, true) => {
+            Some(DefWithBodyId::from(it))
+        }
+        AssocItemId::ConstId(it) if local || may_hold(db, krate, it.loc(db).id, true) => {
+            Some(DefWithBodyId::from(it))
+        }
         _ => None,
     };
     let in_impls = scope.impls().flat_map(|it| &it.impl_items(db).items);
@@ -721,89 +730,201 @@ fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<De
     holders
 }
 
-/// Whether an impl of [`impls_in_bodies`] is in the text of `function`, or a call of one of
-/// `krate`'s [`macros_writing_impls`]. The file is parsed for the function's range only when its
-/// lexing found one.
-fn holds_impl(db: &dyn HirDatabase, krate: Crate, function: FunctionId) -> bool {
-    let ast_id = function.loc(db).id;
-    let Some(file) = ast_id.file_id.file_id() else { return false };
-    let at = impls_in_bodies(db, file);
-    if at.is_empty() {
+/// Built-in attributes that write no item, so one in a body leaves it without an impl. Any
+/// other (`derive`, `cfg_attr`, a tool's, a procedural macro's) may write one.
+const INERT_ATTRIBUTES: [&str; 11] = [
+    "allow",
+    "warn",
+    "deny",
+    "forbid",
+    "expect",
+    "doc",
+    "inline",
+    "cold",
+    "must_use",
+    "track_caller",
+    "cfg",
+];
+
+fn attribute_is_inert(name: &str) -> bool {
+    INERT_ATTRIBUTES.contains(&name)
+}
+
+/// What lexing a body found that may write an impl there.
+#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+enum BodyMark {
+    /// An `impl` token.
+    Impl,
+    /// A macro call, by the name before its `!`.
+    Call(Symbol),
+    /// An attribute, `#[..]` or `#![..]`, by its first identifier (empty when it has none).
+    Attribute(Symbol),
+}
+
+/// Whether the body of `id` may hold an impl (or, without `impls`, an item a macro or an
+/// attribute writes): its text has an `impl`, a call of a macro not proven to write none
+/// ([`macro_is_inert`]) or an attribute that is not inert. An item a macro writes has no text
+/// of its own and may. The file is parsed for the item's range only when lexing it found one.
+pub(crate) fn may_hold<N: syntax::AstNode>(
+    db: &dyn HirDatabase,
+    krate: Crate,
+    id: hir_expand::AstId<N>,
+    impls: bool,
+) -> bool {
+    let Some(file) = id.file_id.file_id() else { return true };
+    let marks = impls_in_bodies(db, file);
+    if marks.is_empty() {
         return false;
     }
-    let range = ast_id.file_id.ast_id_map(db).get(ast_id.value).text_range();
-    at.iter().any(|(it, call)| {
-        range.contains(*it)
-            && call.as_ref().is_none_or(|name| macros_writing_impls(db, krate).contains(name))
+    let range = id.file_id.ast_id_map(db).get(id.value).text_range();
+    marks.iter().any(|(at, mark)| {
+        range.contains(*at)
+            && match mark {
+                BodyMark::Impl => impls,
+                BodyMark::Call(name) => !macro_is_inert(db, krate, name),
+                BodyMark::Attribute(name) => !attribute_is_inert(name.as_str()),
+            }
     })
 }
 
-/// Where `file` writes an impl in the body of a function, found by its tokens: an `impl` after
-/// `{`, `}`, `;`, an attribute or `unsafe`, inside the braces that follow `fn name`. A macro's
-/// `impl` is found as well, which costs a lowering and nothing else. A macro called in a body
-/// is found with its name, for an impl the macro writes.
+/// Whether a macro called `name` in a body of `krate` writes no impl: some `macro_rules!` of
+/// `krate` or its dependencies has the name, none of that name may write one, and no
+/// procedural macro of a dependency has it ([`macros_writing_impls`]). `macro_rules!` itself
+/// defines and writes nothing; `include!` writes what its file has.
+fn macro_is_inert(db: &dyn HirDatabase, krate: Crate, name: &Symbol) -> bool {
+    match name.as_str() {
+        "macro_rules" => true,
+        "include" => false,
+        name => {
+            let known = macros_writing_impls(db, krate);
+            matches!(known.binary_search_by(|(it, _)| it.as_str().cmp(name)), Ok(i) if !known[i].1)
+        }
+    }
+}
+
+/// Where `file` may write an impl in a body, found by its tokens: each `impl`, macro call and
+/// attribute inside the braces that follow `fn name`, or between the `=` and the `;` of a
+/// `const` or `static`. An `impl Trait` type is found as well, which costs a lowering and
+/// nothing else.
 #[salsa::tracked(returns(deref))]
 fn impls_in_bodies(
     db: &dyn HirDatabase,
     file: base_db::EditionedFileId,
-) -> Box<[(TextSize, Option<Symbol>)]> {
+) -> Box<[(TextSize, BodyMark)]> {
     let text = db.file_text(file.file_id(db)).text(db);
     let lexed = syntax::LexedStr::new(file.edition(db), text);
+    let tokens: Vec<usize> = (0..lexed.len()).filter(|&i| !lexed.kind(i).is_trivia()).collect();
+    let kind = |at: usize| tokens.get(at).map_or(SyntaxKind::EOF, |&i| lexed.kind(i));
+    let start = |at: usize| TextSize::from(lexed.text_start(tokens[at]) as u32);
     // For each open brace, whether it is a function's body.
     let mut braces = Vec::new();
     let mut bodies = 0usize;
     // The parentheses and brackets open: a `;` in `-> [u8; 4]` does not end the signature.
     let mut nested = 0usize;
     let mut signature = None;
-    let mut previous = SyntaxKind::EOF;
-    let mut previous_at = 0;
+    // Every delimiter open, and the depths at which a `const` or `static` initializer is.
+    let mut depth = 0usize;
+    let mut constant = None;
+    let mut initializers: Vec<usize> = Vec::new();
     let mut found = Vec::new();
-    for i in 0..lexed.len() {
-        let kind = lexed.kind(i);
-        if kind.is_trivia() {
-            continue;
-        }
-        match kind {
+    for at in 0..tokens.len() {
+        let previous = if at == 0 { SyntaxKind::EOF } else { kind(at - 1) };
+        let in_body = bodies > 0 || !initializers.is_empty();
+        match kind(at) {
             SyntaxKind::IDENT if previous == T![fn] => signature = Some(nested),
-            T!['('] | T!['['] => nested += 1,
-            T![')'] | T![']'] => nested = nested.saturating_sub(1),
-            T![;] if signature == Some(nested) => signature = None,
+            SyntaxKind::IDENT if matches!(previous, T![const] | T![static] | T![mut]) => {
+                constant = Some(depth)
+            }
+            T![=] if constant == Some(depth) => {
+                constant = None;
+                initializers.push(depth);
+            }
+            T!['('] | T!['['] => {
+                nested += 1;
+                depth += 1;
+            }
+            T![')'] | T![']'] => {
+                nested = nested.saturating_sub(1);
+                depth = depth.saturating_sub(1);
+                initializers.retain(|&it| it <= depth);
+            }
+            T![;] => {
+                if signature == Some(nested) {
+                    signature = None;
+                }
+                if constant == Some(depth) {
+                    constant = None;
+                }
+                if initializers.last() == Some(&depth) {
+                    initializers.pop();
+                }
+            }
             T!['{'] => {
                 let body = signature.take().is_some();
                 bodies += usize::from(body);
                 braces.push(body);
+                depth += 1;
             }
-            T!['}'] => bodies -= usize::from(braces.pop().unwrap_or(false)),
-            T![impl]
-                if bodies > 0
-                    && matches!(previous, T!['{'] | T!['}'] | T![;] | T![']'] | T![unsafe]) =>
-            {
-                found.push((TextSize::from(lexed.text_start(i) as u32), None));
-            }
-            T![!] if bodies > 0 && previous == SyntaxKind::IDENT => {
-                let name = Symbol::intern(lexed.text(previous_at));
-                found.push((TextSize::from(lexed.text_start(previous_at) as u32), Some(name)));
+            T!['}'] => {
+                bodies -= usize::from(braces.pop().unwrap_or(false));
+                depth = depth.saturating_sub(1);
+                initializers.retain(|&it| it <= depth);
             }
             _ => {}
         }
-        previous = kind;
-        previous_at = i;
+        if !in_body {
+            continue;
+        }
+        match kind(at) {
+            T![impl] => found.push((start(at), BodyMark::Impl)),
+            T![!] if previous == SyntaxKind::IDENT => {
+                let name = Symbol::intern(lexed.text(tokens[at - 1]));
+                found.push((start(at - 1), BodyMark::Call(name)));
+            }
+            T![#] => {
+                let open = if kind(at + 1) == T![!] { at + 2 } else { at + 1 };
+                if kind(open) == T!['['] {
+                    let name = match kind(open + 1) {
+                        SyntaxKind::IDENT => lexed.text(tokens[open + 1]),
+                        _ => "",
+                    };
+                    found.push((start(at), BodyMark::Attribute(Symbol::intern(name))));
+                }
+            }
+            _ => {}
+        }
     }
     found.into()
 }
 
-/// The `macro_rules!` of `krate` and of its dependencies that write an impl, in their own text
-/// or by calling another that does: dtoa's `dtoa!`, called in the body of `<f64 as
-/// Sealed>::write`, calls `diyfp!`, which writes `impl DiyFp` there. Known by name, so a
-/// macro of the same name costs a lowering and nothing else.
+/// Every `macro_rules!` name of `krate` and of its dependencies, and every procedural macro
+/// of a dependency, with whether a macro of that name may write an impl, sorted by name. A
+/// `macro_rules!` may when its transcribers have an `impl`, an attribute that is not inert or
+/// one written from a fragment (`#[$meta]`), or a call of a macro that may: one passed in
+/// (`$name!`), `include!`, a procedural one, one of no known definition, or one that may in
+/// turn (dtoa's `dtoa!`, called in the body of `<f64 as Sealed>::write`, calls `diyfp!`, which
+/// writes `impl DiyFp` there). Known by name, so a name that may costs a lowering and nothing
+/// else.
 #[salsa::tracked(returns(deref))]
-fn macros_writing_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[Symbol]> {
-    let mut writing: Vec<Symbol> = krate
-        .data(db)
-        .dependencies
-        .iter()
-        .flat_map(|dep| macros_writing_impls(db, dep.crate_id).iter().cloned())
-        .collect();
+fn macros_writing_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[(Symbol, bool)]> {
+    fn add(known: &mut FxHashMap<Symbol, bool>, name: &Symbol, writes: bool) {
+        *known.entry(name.clone()).or_default() |= writes;
+    }
+    let mut known = FxHashMap::default();
+    for dep in &krate.data(db).dependencies {
+        for (name, writes) in macros_writing_impls(db, dep.crate_id) {
+            add(&mut known, name, *writes);
+        }
+        if dep.crate_id.data(db).target_kind.is_proc_macro() {
+            for (_, module) in crate_def_map(db, dep.crate_id).modules(db) {
+                for (name, item) in module.scope(db).macros() {
+                    if matches!(item.def, MacroId::ProcMacroId(_)) {
+                        add(&mut known, name.symbol(), true);
+                    }
+                }
+            }
+        }
+    }
     let mut calling = Vec::new();
     let mut files = FxHashSet::default();
     for (_, module) in crate_def_map(db, krate).modules(db) {
@@ -812,33 +933,39 @@ fn macros_writing_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[Symbol]> {
             continue;
         }
         for (name, writes, calls) in macro_definitions(db, file) {
-            match writes {
-                true => writing.push(name.clone()),
-                false => calling.push((name, calls)),
+            add(&mut known, name, *writes);
+            if !*writes {
+                calling.push((name, calls));
             }
         }
     }
+    let may_write = |known: &FxHashMap<Symbol, bool>, call: &Symbol| match call.as_str() {
+        "macro_rules" => false,
+        "include" => true,
+        _ => known.get(call).copied().unwrap_or(true),
+    };
     loop {
-        let before = writing.len();
+        let before = calling.len();
         calling.retain(|&(name, calls)| {
-            let writes = calls.iter().any(|it| writing.contains(it));
+            let writes = calls.iter().any(|it| may_write(&known, it));
             if writes {
-                writing.push(name.clone());
+                known.insert(name.clone(), true);
             }
             !writes
         });
-        if writing.len() == before {
+        if calling.len() == before {
             break;
         }
     }
-    writing.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-    writing.dedup();
-    writing.into()
+    let mut known = known.into_iter().collect::<Vec<_>>();
+    known.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    known.into()
 }
 
-/// The `macro_rules!` of `file`, found by its tokens: each one's name, whether its text writes
-/// an impl (an `impl` after `{`, `}`, `;`, `(`, `*`, an attribute or `unsafe`) and the names of
-/// the macros it calls.
+/// The `macro_rules!` of `file`, found by its tokens: each one's name, whether its
+/// transcribers write an impl (an `impl` after `{`, `}`, `;`, `(`, `*`, an attribute or
+/// `unsafe`), an attribute that is not inert or one from a fragment, or call a macro passed in
+/// as `$name!`, and the names of the other macros they call.
 #[salsa::tracked(returns(deref))]
 fn macro_definitions(
     db: &dyn HirDatabase,
@@ -864,11 +991,18 @@ fn macro_definitions(
             continue;
         }
         let name = Symbol::intern(lexed.text(tokens[at + 2]));
-        let (mut writes, mut calls, mut depth) = (false, Vec::new(), 0usize);
+        // The rules alternate, a matcher then a transcriber, each a group at depth 1.
+        let (mut writes, mut calls, mut depth, mut groups) = (false, Vec::new(), 0usize, 0usize);
         at += 3;
         while at < tokens.len() {
+            let transcriber = depth >= 2 && groups % 2 == 0;
             match kind(at) {
-                T!['{'] | T!['('] | T!['['] => depth += 1,
+                T!['{'] | T!['('] | T!['['] => {
+                    if depth == 1 {
+                        groups += 1;
+                    }
+                    depth += 1;
+                }
                 T!['}'] | T![')'] | T![']'] => {
                     depth -= 1;
                     if depth == 0 {
@@ -876,15 +1010,28 @@ fn macro_definitions(
                     }
                 }
                 T![impl]
-                    if matches!(
-                        kind(at - 1),
-                        T!['{'] | T!['}'] | T![;] | T!['('] | T![*] | T![']'] | T![unsafe]
-                    ) =>
+                    if transcriber
+                        && matches!(
+                            kind(at - 1),
+                            T!['{'] | T!['}'] | T![;] | T!['('] | T![*] | T![']'] | T![unsafe]
+                        ) =>
                 {
                     writes = true
                 }
-                T![!] if kind(at - 1) == SyntaxKind::IDENT && kind(at - 2) != T![$] => {
-                    calls.push(Symbol::intern(lexed.text(tokens[at - 1])))
+                T![#] if transcriber => {
+                    let open = if kind(at + 1) == T![!] { at + 2 } else { at + 1 };
+                    let inert = kind(open + 1) == SyntaxKind::IDENT
+                        && attribute_is_inert(lexed.text(tokens[open + 1]));
+                    if kind(open) == T!['['] && !inert {
+                        writes = true;
+                    }
+                }
+                T![!] if transcriber && kind(at - 1) == SyntaxKind::IDENT => {
+                    if kind(at - 2) == T![$] {
+                        writes = true;
+                    } else {
+                        calls.push(Symbol::intern(lexed.text(tokens[at - 1])));
+                    }
                 }
                 _ => {}
             }

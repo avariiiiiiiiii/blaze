@@ -4,7 +4,7 @@ use std::{
 };
 
 use expect_test::expect;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use span::{Edition, Span};
 use syntax::{AstNode, SyntaxNode, ast};
 use test_utils::extract_annotations;
@@ -13,7 +13,8 @@ use tt::{Leaf, Punct, Spacing, buffer::Cursor};
 use crate::{
     DocCommentDesugarMode,
     dummy_test_span_utils::{DUMMY, DummyTestSpanMap},
-    parse_to_token_tree_static_span, syntax_node_to_token_tree, token_tree_to_syntax_node,
+    parse_to_token_tree_static_span, syntax_node_to_token_tree, syntax_node_to_token_tree_modified,
+    token_tree_to_syntax_node,
 };
 
 fn check_punct_spacing(fixture: &str) {
@@ -232,4 +233,31 @@ fn a_lazy_body_in_a_node_is_parsed_for_its_token_tree() {
     let full = ast::SourceFile::parse_shared(text, Edition::CURRENT).syntax_node();
     assert_eq!(token_tree(&outline), token_tree(&full));
     assert!(tree.is_parsed(lazies[0]));
+}
+
+#[test]
+fn a_flat_tree_converts_as_the_cursor_does() {
+    for (path, text) in corpus() {
+        let path = path.display();
+        let full = ast::SourceFile::parse_shared(text, Edition::CURRENT).syntax_node();
+        assert!(full.flat().is_some(), "{path}: a full parse is a flat tree");
+        for mode in [DocCommentDesugarMode::Mbe, DocCommentDesugarMode::ProcMacro] {
+            let nodes = std::iter::once(full.clone())
+                .chain(full.descendants().filter(|it| it.kind() == syntax::SyntaxKind::FN));
+            for node in nodes {
+                let flat = syntax_node_to_token_tree(&node, DummyTestSpanMap, DUMMY, mode);
+                let cursor = syntax_node_to_token_tree_modified(
+                    &node,
+                    DummyTestSpanMap,
+                    FxHashMap::default(),
+                    FxHashSet::default(),
+                    DUMMY,
+                    mode,
+                    |_, _| (true, Vec::new()),
+                );
+                assert_eq!(flat, cursor, "{path}: {node:?}");
+                assert_eq!(flat.to_string(), cursor.to_string(), "{path}: {node:?}");
+            }
+        }
+    }
 }

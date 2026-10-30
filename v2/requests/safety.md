@@ -81,3 +81,61 @@ unbounded memory, and each has a safe model in its tests to compare against:
 `blaze-usercode/src/test/fork_server.rs` and `blaze-cargo/src/sandbox/windows.rs` is one
 operation with a `// SAFETY:` comment, and `interrupted` has a `# Safety` section, so neither
 needs anything from safety-audit. `blaze-usercode` as a whole is the lead's (its `lib.rs`).
+
+> forwarded to safety: for safety-fuzz, lane safety's.
+
+## From safety-check
+
+### C1. Parent: `crates/hir-ty-ub/Cargo.toml`
+
+- `[dependencies]`: `either.workspace = true` (the call stack of `MirEvalError::InFunction`),
+  `hir-expand.workspace = true`, `span.workspace = true`, `syntax.workspace = true` (a
+  `Site`'s source place through the body's source map, as `hir-ide`'s `mir_pretty/errors.rs`
+  `source_range`).
+- `[dev-dependencies]`: `hir-ide.workspace = true` (`impl_hir_database!` for the tests'
+  database), `salsa.workspace = true`, `test-fixture.workspace = true`,
+  `test-utils.workspace = true`. No cycle: nothing under `hir-ide` depends on `hir-ty-ub`.
+
+### C2. Parent: `crates/hir-ty-ub/src/ub.rs`
+
+- `Ub::Value(it) => write!(f, "Undefined Behavior: {it}")`: `check::ValueError`'s Display is
+  rustc's whole message, "constructing invalid value of type T: at .0.<enum-variant(Some)>.0,
+  encountered 0x02, but expected a boolean" (`rustc_middle/src/mir/interpret/error.rs` line
+  ~468), which puts the type and path before the message.
+- A variant `Ub::ThreadsLeft` with Display "the main thread terminated without waiting for all
+  remaining threads": Miri's leak check fails a run whose main thread returns while others
+  still run (`src/tools/miri/src/eval.rs` line ~560), before it looks at memory.
+
+### C3. Forward to the evaluator's owner (codegen-mir, `crates/hir-ty-mir/src/mir/eval*`)
+
+1. Export `AtomicOrd` and `MResult` from `hir_ty_mir::mir` beside the others (the trait's
+   signatures name them).
+2. `Shadow::require_init` has no way to say *what* failed: it holds no machine. Add
+   `fn require_init(&mut self, shadow: &Self::Shadow, range: Range<usize>) -> MResult<()>` to
+   `Machine` and call it instead (Plain: `Ok(())`). Until then `check` keeps the failure of
+   `Shadow::require_init` in a thread-local slot that `run_test` reads when the run stops.
+3. Order around frames, as Miri: `call` before the arguments are copied into the callee's
+   locals (so `FnEntry` retags protect in the new frame), and `ret` *before* the return value is
+   copied into the caller's destination (`before_stack_pop`: protectors end first).
+4. In-place arguments and the return place (Miri `protect_in_place_function_argument`):
+   `fn protect(&mut self, place: Ptr<Self::Prov>, size: u64) -> MResult<()>` for every
+   `Operand::Move` argument and the return place, after `call`; the checker retags it with a
+   strong protector and makes it uninitialized. `Checker::protect` implements it.
+5. `cmpxchg`: the evaluator compares itself first, then on success `read` and `write` with
+   `Access::Atomic { ord: success, rmw: true }`; on failure one `read` with
+   `Access::Atomic { ord: failure, rmw: false }` and no write.
+6. GC soundness: no `Shadow` with provenance may live across a `step` outside memory (the
+   checker collects the tags it keeps from memory only, at `step`). If the evaluator does keep
+   one, it needs `fn live_tags(&self, out: &mut dyn FnMut(Self::Prov))`.
+7. Atomic orderings of the suffix intrinsics (`atomic_load_acquire`) and of the const-generic
+   ones (`atomic_load::<T, {AtomicOrdering::Acquire}>`) both map to `AtomicOrd`; the tests use
+   the suffix form, as minicore has no `AtomicOrdering`.
+
+### C4. Forward to db-ty (hir-def lang items)
+
+`UnsafeUnpin` (`sym::unsafe_unpin`, trait), `GlobalAlloc` (`sym::global_alloc_ty`, struct) and
+`MaybeDangling` (`sym::maybe_dangling`, struct) in `crates/hir-def/src/lang_item.rs`: Tree
+Borrows' `NewPermission::new` asks `is_unpin && is_unsafe_unpin`, `tb_retag_ptr_value` retags a
+`Box` only of the global allocator, and validity skips dereferenceability inside
+`MaybeDangling`. Until they land `check::valid` uses `Unpin` alone, takes a `Box` whose
+allocator is `alloc`'s `Global` (by crate and name) as global, and has no `MaybeDangling`.

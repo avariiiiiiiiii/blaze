@@ -106,7 +106,14 @@ impl Check {
             CheckKind::Check => Request::Check { view, targets },
             CheckKind::Build => Request::Build { view, targets },
             CheckKind::Test => {
-                Request::Test { view, targets, filter: self.filter.clone(), all: self.all }
+                Request::Test {
+                    view,
+                    targets,
+                    filter: self.filter.clone(),
+                    all: self.all,
+                    args: Vec::new(),
+                    ub: None,
+                }
             }
         }
     }

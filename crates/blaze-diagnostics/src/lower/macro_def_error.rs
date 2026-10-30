@@ -27,16 +27,17 @@ use crate::{
 /// rustc's `VALID_FRAGMENT_NAMES_MSG`.
 const VALID_FRAGMENT_NAMES: &str = "valid fragment specifiers are `ident`, `block`, `stmt`, `expr`, `pat`, `ty`, `lifetime`, `literal`, `path`, `meta`, `tt`, `item` and `vis`, along with `expr_2021` and `pat_param` for edition compatibility";
 
+/// A definition mbe refuses: nothing when [`check`] has rustc's error of it (`checks::macros`
+/// gives it, with those of the definitions mbe accepts), else an error naming what mbe said.
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroDefError) -> Vec<Found> {
     let node = cx.node(d.node);
-    let mut out = check(cx, node.as_ref());
-    if out.is_empty() {
-        let range = d.name.unwrap_or_else(|| item_range(node.value.syntax()));
-        let span = cx.span(InFile::new(d.node.file_id, range));
-        let message = format!("blaze can't define this macro: {}", d.message);
-        out.push(Found::new(Diag::error(None, message, span), Phase::Resolve));
+    if !check(cx, node.as_ref()).is_empty() {
+        return Vec::new();
     }
-    out
+    let range = d.name.unwrap_or_else(|| item_range(node.value.syntax()));
+    let span = cx.span(InFile::new(d.node.file_id, range));
+    let message = format!("blaze can't define this macro: {}", d.message);
+    vec![Found::new(Diag::error(None, message, span), Phase::Resolve)]
 }
 
 /// rustc's errors on the definition of `mac`, in the order rustc gives them. Empty, and nothing
@@ -494,17 +495,14 @@ impl Checker<'_, '_, '_> {
             Tree::Group(group) => {
                 let entire = group.syntax().text_range();
                 match (part, delimiter(&group)) {
-                    (Part::Pattern, Some(SyntaxKind::L_PAREN)) | (Part::Body, _) => {}
-                    (Part::Pattern, open) => {
-                        let open = group.left_delimiter_token().map_or("", |_| match open {
-                            Some(SyntaxKind::L_CURLY) => "{",
-                            _ => "[",
-                        });
-                        self.dollar_in_lhs(entire, open);
+                    (Part::Pattern, Some(SyntaxKind::L_CURLY)) => self.dollar_in_lhs(entire, "{"),
+                    (Part::Pattern, Some(SyntaxKind::L_BRACK)) => self.dollar_in_lhs(entire, "["),
+                    // A meta-variable expression, whose parse is not ported: mbe checks it.
+                    (Part::Body, Some(SyntaxKind::L_CURLY)) => return (Elem::Token, None),
+                    (Part::Body, Some(SyntaxKind::L_BRACK)) => {
+                        self.error(entire, "expected `(` or `{`, found `[`");
                     }
-                }
-                if part == Part::Body && delimiter(&group) == Some(SyntaxKind::L_BRACK) {
-                    self.error(entire, "expected `(` or `{`, found `[`");
+                    _ => {}
                 }
                 let (contents_empty, first_vis) = self.parse(&mut Trees::of(&group), part, empty);
                 let (separator, op, op_range) = self.separator_and_kleene(trees, entire);
@@ -550,18 +548,24 @@ impl Checker<'_, '_, '_> {
 
     /// rustc's `parse_sep_and_kleene_op`: whether there is a separator, the operator and its range.
     fn separator_and_kleene(&mut self, trees: &mut Trees, span: TextRange) -> (bool, Kleene, TextRange) {
-        let at = match trees.next() {
-            Some(tree) if let Some(op) = Kleene::of(tree.kind()) => return (false, op, tree.range()),
-            Some(Tree::Token(separator)) => match trees.next() {
-                Some(tree) if Kleene::of(tree.kind()) == Some(Kleene::ZeroOrOne) => {
-                    self.error(separator.text_range(), "the `?` macro repetition operator does not take a separator");
-                    return (false, Kleene::ZeroOrMore, tree.range());
-                }
-                Some(tree) if let Some(op) = Kleene::of(tree.kind()) => return (true, op, tree.range()),
-                Some(tree) => tree.range(),
-                None => separator.text_range(),
+        let first = trees.next();
+        let at = match first {
+            Some(tree) => match (Kleene::of(tree.kind()), tree) {
+                (Some(op), tree) => return (false, op, tree.range()),
+                (None, Tree::Token(separator)) => match trees.next() {
+                    Some(tree) => match Kleene::of(tree.kind()) {
+                        Some(Kleene::ZeroOrOne) => {
+                            let msg = "the `?` macro repetition operator does not take a separator";
+                            self.error(separator.text_range(), msg);
+                            return (false, Kleene::ZeroOrMore, tree.range());
+                        }
+                        Some(op) => return (true, op, tree.range()),
+                        None => tree.range(),
+                    },
+                    None => separator.text_range(),
+                },
+                (None, group) => group.range(),
             },
-            Some(group) => group.range(),
             None => span,
         };
         self.error(at, "expected one of: `*`, `+`, or `?`");

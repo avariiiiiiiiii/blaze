@@ -64,3 +64,14 @@
   output.
 
 > applied: by core (`exec.rs` calls `plane.release(request)`).
+
+## 5. `PlaneOutput::Run` gained `critical: bool` (cargo-daemon)
+
+- What: in `crates/blaze-cargo/src/serve/plane.rs:494`, the pattern
+  `PlaneOutput::Run { id, pool, near }` no longer compiles; make it
+  `PlaneOutput::Run { id, pool, near, .. }` (or use `critical` to place the task on a fast
+  core, as `exec.rs` does).
+- Where: `crates/blaze-cargo/src/serve/plane.rs`.
+- Why: plan design/hardware.md, "P cores for the critical path": the plane now says whether a
+  task is on its request's critical path. `exec.rs` already takes it; `machine.rs` and
+  `build.rs` match with `..`.

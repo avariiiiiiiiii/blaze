@@ -140,9 +140,6 @@ pub(crate) struct Function {
     /// Whether a fold may give it another function's code: not where its address is
     /// significant (a symbol of its own) or it is C-variadic.
     pub(crate) foldable: bool,
-    /// The references a Cranelift unit was prepared against, which a fold names its data by
-    /// (`Prepare::masked` is given none); empty for LLVM.
-    pub(crate) refs: Vec<blaze_codegen::Target>,
 }
 
 pub(crate) enum Built {

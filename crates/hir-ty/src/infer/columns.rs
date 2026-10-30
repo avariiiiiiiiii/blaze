@@ -1271,6 +1271,80 @@ mod tests {
     }
 
     #[test]
+    fn a_list_removed_at_the_end_leaves_the_same_column() {
+        let mut forward = CsrBuilder::<Key, u32>::default();
+        forward.insert(key(1), [1]);
+        let mut backward = CsrBuilder::<Key, u32>::default();
+        backward.insert(key(1), [1]);
+        backward.insert(key(7), [7, 8]);
+        assert!(backward.remove_in_place(&key(7)));
+        let (forward, backward) = (forward.freeze(), backward.freeze());
+        assert!(forward == backward);
+        assert_eq!(backward.ranges().len(), 2);
+        let trailing = Csr::<Key, u32>::from_parts(
+            Box::new([Range::ABSENT, Range { start: 0, len: 1 }, Range::ABSENT]),
+            Box::new([1]),
+        );
+        assert!(trailing.is_err());
+    }
+
+    #[test]
+    fn a_column_ending_in_a_key_without_a_value_is_refused() {
+        let types = &crate::next_solver::default_types().types;
+        assert!(TyColumn::<Key>::from_parts(Box::new([0, NONE]), Box::new([types.i32.store()])).is_err());
+        assert!(IndexColumn::<Key, u32>::from_parts(Box::new([0, NONE]), Box::new([5])).is_err());
+        assert!(ModeColumn::<Key>::from_codes(Box::new([0, MODE_NONE])).is_err());
+        assert!(ModeColumn::<Key>::from_codes(Box::new([MODE_NONE, 3])).is_ok());
+    }
+
+    #[test]
+    fn index_column_takes_back_its_parts_and_refuses_others() {
+        let column = IndexColumn::from_entries([(key(4), 40u32), (key(1), 10), (key(9), 90)]);
+        let again = IndexColumn::<Key, u32>::from_parts(column.at().into(), column.rows().into()).unwrap();
+        assert!(again == column);
+        assert!(IndexColumn::<Key, u32>::from_parts(Box::new([1, NONE, 0]), Box::new([1, 2])).is_err());
+        assert!(IndexColumn::<Key, u32>::from_parts(Box::new([0, NONE, 1]), Box::new([1])).is_err());
+        assert!(IndexColumn::<Key, u32>::from_parts(Box::new([0]), Box::new([1, 2])).is_err());
+    }
+
+    #[test]
+    fn field_column_takes_back_its_parts_and_refuses_others() {
+        use salsa::plumbing::FromId;
+        let id = |index: u32| salsa::Id::from_bits(u64::from(index) | (2 << 32));
+        let field = |local: u32| FieldId {
+            parent: hir_def::StructId::from_id(id(3)).into(),
+            local_id: Idx::from_raw(RawIdx::from_u32(local)),
+        };
+        let tuple_field = |tuple: u32, index: u32| TupleFieldId { tuple: hir_def::TupleId(tuple), index };
+        let expr = |index: u32| -> ExprId { Idx::from_raw(RawIdx::from_u32(index)) };
+        let column = FieldColumn::from_entries([
+            (expr(5), either::Either::Left(field(2))),
+            (expr(1), either::Either::Right(tuple_field(0, 1))),
+            (expr(3), either::Either::Left(field(0))),
+        ]);
+        assert_eq!(column.get(expr(3)), Some(either::Either::Left(field(0))));
+        assert_eq!(column.get(expr(2)), None);
+        let again = FieldColumn::from_parts(
+            column.tags().into(),
+            column.data().into(),
+            column.fields().into(),
+            column.tuple_fields().into(),
+        )
+        .unwrap();
+        assert!(again == column);
+        let parts = |tags: &[u8], data: &[u32]| {
+            FieldColumn::from_parts(tags.into(), data.into(), Box::new([field(0)]), Box::new([]))
+        };
+        assert!(parts(&[FIELD], &[0]).is_ok());
+        assert!(parts(&[FIELD, FIELD_NONE], &[0, 0]).is_err());
+        assert!(parts(&[FIELD], &[1]).is_err());
+        assert!(parts(&[FIELD], &[0, 0]).is_err());
+        assert!(parts(&[FIELD_NONE, FIELD], &[1, 0]).is_err());
+        assert!(parts(&[7], &[0]).is_err());
+        assert!(parts(&[], &[]).is_err());
+    }
+
+    #[test]
     fn an_empty_list_is_not_an_absent_one() {
         let mut builder = CsrBuilder::<Key, u32>::default();
         builder.ensure(key(3));

@@ -844,6 +844,13 @@ fn put_one<T: Clone>(table: &mut Vec<T>, value: &T, old: Option<u32>) -> u32 {
     }
 }
 
+/// Appends `value`, as its index.
+fn push_one<T>(table: &mut Vec<T>, value: T) -> u32 {
+    let at = len(table.len());
+    table.push(value);
+    at
+}
+
 /// [`put_one`] of an optional value, as its index plus one; `old` is the replaced node's word.
 fn put_opt<T: Clone>(table: &mut Vec<T>, value: Option<&T>, old: Option<u32>) -> u32 {
     value.map_or(0, |value| put_one(table, value, old.and_then(|word| word.checked_sub(1))) + 1)
@@ -883,6 +890,112 @@ impl HirColumns<Growing> {
         let old = (self.pat_kind[at] == kind).then_some(self.pat_data[at]);
         self.pat_data[at] = self.encode_pat(pat, old);
         self.pat_kind[at] = kind;
+    }
+
+    fn node_expr(&mut self, kind: ExprKind, data: u32) -> ExprId {
+        let id = idx(len(self.expr_kind.len()));
+        self.expr_kind.push(kind as u8);
+        self.expr_data.push(data);
+        id
+    }
+
+    fn node_pat(&mut self, kind: PatKind, data: u32) -> PatId {
+        let id = idx(len(self.pat_kind.len()));
+        self.pat_kind.push(kind as u8);
+        self.pat_data.push(data);
+        id
+    }
+
+    // The by-value pushes below write the same words as `push_expr`/`push_pat` of the matching
+    // view, with the cold values moved into their side tables where the view's are cloned.
+
+    pub(crate) fn push_path_expr(&mut self, path: Path) -> ExprId {
+        let data = push_one(&mut self.paths, path);
+        self.node_expr(ExprKind::Path, data)
+    }
+
+    pub(crate) fn push_literal_expr(&mut self, literal: Literal) -> ExprId {
+        let data = push_one(&mut self.literals, literal);
+        self.node_expr(ExprKind::Literal, data)
+    }
+
+    pub(crate) fn push_offset_of_expr(&mut self, offset_of: OffsetOf) -> ExprId {
+        let data = push_one(&mut self.offset_ofs, offset_of);
+        self.node_expr(ExprKind::OffsetOf, data)
+    }
+
+    pub(crate) fn push_asm_expr(&mut self, asm: InlineAsm) -> ExprId {
+        let data = push_one(&mut self.asms, asm);
+        self.node_expr(ExprKind::InlineAsm, data)
+    }
+
+    pub(crate) fn push_method_call(
+        &mut self,
+        receiver: ExprId,
+        method_name: Name,
+        args: &[ExprId],
+        generic_args: Option<GenericArgs>,
+    ) -> ExprId {
+        let name = push_one(&mut self.names, method_name);
+        let (start, count) = put_list(&mut self.expr_lists, args, None);
+        let generic_args = generic_args.map_or(0, |it| plus(push_one(&mut self.generic_args, it), 1));
+        let data = self.words(None, [raw(receiver), name, start, count, generic_args]);
+        self.node_expr(ExprKind::MethodCall, data)
+    }
+
+    /// A `RecordLit`, its fields moved in from `fields`.
+    pub(crate) fn push_record_lit(
+        &mut self,
+        path: Path,
+        fields: impl ExactSizeIterator<Item = RecordLitField>,
+        spread: RecordSpread,
+    ) -> ExprId {
+        let path = push_one(&mut self.paths, path);
+        let (start, count) = (len(self.record_fields.len()), len(fields.len()));
+        self.record_fields.extend(fields);
+        let data = self.words(None, [path, start, count, spread_word(spread)]);
+        self.node_expr(ExprKind::RecordLit, data)
+    }
+
+    /// A `Pat::Record`, its fields moved in from `args`.
+    pub(crate) fn push_record_pat(
+        &mut self,
+        path: Path,
+        args: impl ExactSizeIterator<Item = RecordFieldPat>,
+        ellipsis: bool,
+    ) -> PatId {
+        let path = push_one(&mut self.paths, path);
+        let (start, count) = (len(self.field_pats.len()), len(args.len()));
+        self.field_pats.extend(args);
+        let data = self.words(None, [path, start, count, ellipsis as u32]);
+        self.node_pat(PatKind::Record, data)
+    }
+
+    pub(crate) fn push_path_pat(&mut self, path: Path) -> PatId {
+        let data = push_one(&mut self.paths, path);
+        self.node_pat(PatKind::Path, data)
+    }
+
+    pub(crate) fn push_tuple_struct_pat(
+        &mut self,
+        path: Path,
+        args: &[PatId],
+        ellipsis: Option<u32>,
+    ) -> PatId {
+        let path = push_one(&mut self.paths, path);
+        let (start, count) = put_list(&mut self.pat_lists, args, None);
+        let ellipsis = ellipsis.map_or(0, |at| plus(at, 1));
+        let data = self.words(None, [path, start, count, ellipsis]);
+        self.node_pat(PatKind::TupleStruct, data)
+    }
+
+    /// Gives the block `block` the tail `tail` in place: one word written. Panics when `block`
+    /// is not a block, a bug in lowering.
+    pub(crate) fn set_block_tail(&mut self, block: ExprId, tail: ExprId) {
+        let at = raw(block) as usize;
+        assert_eq!(self.expr_kind[at], ExprKind::Block as u8, "a tail given to a non-block");
+        let words = self.expr_data[at] as usize;
+        self.extra[words + 4] = opt(Some(tail));
     }
 
     /// The columns of a finished store, each its exact length.
@@ -1603,9 +1716,9 @@ mod tests {
             Pat::Wild,
             Pat::Missing,
             Pat::Rest,
-            Pat::Tuple { args: &[P0, P0], ellipsis: SomE1 },
+            Pat::Tuple { args: &[P0, P0], ellipsis: Some(1) },
             Pat::Tuple { args: &[], ellipsis: None },
-            Pat::Tuple { args: &[P0], ellipsis: SomE0 },
+            Pat::Tuple { args: &[P0], ellipsis: Some(0) },
             Pat::Or(&[P0, P0]),
             Pat::Record { path: &v.paths[0], args: &v.field_pats, ellipsis: true },
             Pat::Record { path: &v.paths[1], args: &[], ellipsis: false },
@@ -1617,7 +1730,7 @@ mod tests {
             Pat::Lit(E0),
             Pat::Bind { id: idx(0), subpat: Some(P0) },
             Pat::Bind { id: idx(0), subpat: None },
-            Pat::TupleStruct { path: &v.paths[0], args: &[P0], ellipsis: SomE1 },
+            Pat::TupleStruct { path: &v.paths[0], args: &[P0], ellipsis: Some(1) },
             Pat::TupleStruct { path: &v.paths[0], args: &[], ellipsis: None },
             Pat::Ref { pat: P0, mutability: Mutability::Mut },
             Pat::Ref { pat: P0, mutability: Mutability::Shared },
@@ -1837,5 +1950,119 @@ mod tests {
         assert!(scratch.is_empty() && scratch.extra.is_empty() && scratch.names.is_empty());
         assert!(scratch.capacity() > 0, "the scratch keeps its room");
         assert_eq!(scratch.freeze_into(), HirColumns::<Frozen>::default());
+    }
+
+    #[test]
+    fn by_value_pushes_match_the_views() {
+        let v = values();
+        let mut viewed = columns_of(&[Expr::Missing], &[Pat::Wild]);
+        let mut owned = columns_of(&[Expr::Missing], &[Pat::Wild]);
+        let pairs: [(ExprId, ExprId); 8] = [
+            (viewed.push_expr(Expr::Path(&v.paths[0])), owned.push_path_expr(v.paths[0].clone())),
+            (
+                viewed.push_expr(Expr::Literal(&v.literals[2])),
+                owned.push_literal_expr(v.literals[2].clone()),
+            ),
+            (
+                viewed.push_expr(Expr::OffsetOf(&v.offset_of)),
+                owned.push_offset_of_expr(v.offset_of.clone()),
+            ),
+            (viewed.push_expr(Expr::InlineAsm(&v.asm)), owned.push_asm_expr(v.asm.clone())),
+            (
+                viewed.push_expr(Expr::MethodCall {
+                    receiver: E0,
+                    method_name: &v.names[0],
+                    args: &[E0, E0],
+                    generic_args: Some(&v.generic_args),
+                }),
+                owned.push_method_call(
+                    E0,
+                    v.names[0].clone(),
+                    &[E0, E0],
+                    Some(v.generic_args.clone()),
+                ),
+            ),
+            (
+                viewed.push_expr(Expr::MethodCall {
+                    receiver: E0,
+                    method_name: &v.names[1],
+                    args: &[],
+                    generic_args: None,
+                }),
+                owned.push_method_call(E0, v.names[1].clone(), &[], None),
+            ),
+            (
+                viewed.push_expr(Expr::RecordLit {
+                    path: &v.paths[1],
+                    fields: &v.fields,
+                    spread: RecordSpread::Expr(E0),
+                }),
+                owned.push_record_lit(
+                    v.paths[1].clone(),
+                    v.fields.clone().into_iter(),
+                    RecordSpread::Expr(E0),
+                ),
+            ),
+            (
+                viewed.push_expr(Expr::RecordLit {
+                    path: &v.paths[0],
+                    fields: &[],
+                    spread: RecordSpread::FieldDefaults,
+                }),
+                owned.push_record_lit(
+                    v.paths[0].clone(),
+                    std::iter::empty(),
+                    RecordSpread::FieldDefaults,
+                ),
+            ),
+        ];
+        for (viewed_id, owned_id) in pairs {
+            assert_eq!(viewed_id, owned_id);
+        }
+        let pats: [(PatId, PatId); 4] = [
+            (viewed.push_pat(Pat::Path(&v.paths[1])), owned.push_path_pat(v.paths[1].clone())),
+            (
+                viewed.push_pat(Pat::Record { path: &v.paths[0], args: &v.field_pats, ellipsis: true }),
+                owned.push_record_pat(v.paths[0].clone(), v.field_pats.clone().into_iter(), true),
+            ),
+            (
+                viewed.push_pat(Pat::TupleStruct { path: &v.paths[0], args: &[P0], ellipsis: Some(1) }),
+                owned.push_tuple_struct_pat(v.paths[0].clone(), &[P0], Some(1)),
+            ),
+            (
+                viewed.push_pat(Pat::TupleStruct { path: &v.paths[1], args: &[], ellipsis: None }),
+                owned.push_tuple_struct_pat(v.paths[1].clone(), &[], None),
+            ),
+        ];
+        for (viewed_id, owned_id) in pats {
+            assert_eq!(viewed_id, owned_id);
+        }
+        assert_eq!(owned, viewed);
+        assert_eq!(owned.freeze().check(1, 1, 1), Ok(()));
+    }
+
+    #[test]
+    fn a_block_tail_set_in_place_matches_the_view() {
+        let v = values();
+        let block = |tail| Expr::Block {
+            id: Some(block_id(3)),
+            statements: &v.statements,
+            tail,
+            label: Some(idx(0)),
+            unsafe_: Unsafe::Yes,
+        };
+        let mut columns = columns_of(&[Expr::Missing, block(None)], &[]);
+        let before = columns.clone();
+        columns.set_block_tail(E1, E0);
+        assert_eq!(columns.expr(E1), block(Some(E0)));
+        let mut viewed = before;
+        viewed.set_expr(E1, block(Some(E0)));
+        assert_eq!(columns, viewed);
+    }
+
+    #[test]
+    #[should_panic = "a tail given to a non-block"]
+    fn a_block_tail_on_a_non_block_panics() {
+        columns_of(&[Expr::Missing], &[]).set_block_tail(E0, E0);
     }
 }

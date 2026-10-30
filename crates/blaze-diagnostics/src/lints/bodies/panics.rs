@@ -30,7 +30,7 @@ use hir_def::{
 };
 use hir_expand::{MacroDefKind, builtin::BuiltinFnLikeExpander};
 use hir_ty::{
-    InferBodyId, ParamEnvAndCrate,
+    ParamEnvAndCrate,
     consteval::try_const_usize,
     db::{GeneralConstId, HirDatabase},
     method_resolution::lookup_impl_const,
@@ -196,7 +196,7 @@ impl fmt::Display for Panic {
 #[derive(Clone)]
 enum Value<'db> {
     Immediate(Imm<'db>),
-    /// The variant is `None` but of an enum.
+    /// The variant is `None` for what is not an enum.
     Aggregate { variant: Option<EnumVariantId>, fields: Vec<Value<'db>> },
     Uninit,
 }
@@ -256,6 +256,16 @@ fn index(local: LocalId) -> usize {
     local.into_raw().into_u32() as usize
 }
 
+/// rustc's `CheckedBinaryOp` is the operation that gives the overflow with the result.
+fn with_overflow(op: &BinOp) -> &BinOp {
+    match op {
+        BinOp::Add => &BinOp::AddWithOverflow,
+        BinOp::Sub => &BinOp::SubWithOverflow,
+        BinOp::Mul => &BinOp::MulWithOverflow,
+        op => op,
+    }
+}
+
 fn is_indirect(place: &StoredPlace) -> bool {
     place.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Deref))
 }
@@ -293,7 +303,8 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
             if !self.visited.insert(block) {
                 continue;
             }
-            let data = &self.body.basic_blocks[block];
+            let body = self.body;
+            let data = &body.basic_blocks[block];
             for statement in &data.statements {
                 match &statement.kind {
                     StatementKind::Assign(_, Rvalue::Ref(BorrowKind::Shallow, _)) => {}
@@ -378,8 +389,8 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                             place(taken, Use::Store);
                         }
                     }
+                    StatementKind::Deinit(deinit) => place(deinit, Use::Store),
                     StatementKind::FakeRead(_)
-                    | StatementKind::Deinit(_)
                     | StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
                     | StatementKind::Nop => {}
@@ -430,11 +441,11 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         match rvalue {
             Rvalue::UnaryOp(op, arg) => self.check_unary_op(*op, arg, span)?,
             Rvalue::BinaryOp(op, left, right) => self.check_binary_op(op, left, right, span)?,
+            Rvalue::CheckedBinaryOp(op, left, right) => self.check_binary_op(with_overflow(op), left, right, span)?,
             Rvalue::Ref(_, place) => {
                 self.remove_const(place.local);
                 return None;
             }
-            Rvalue::CheckedBinaryOp(..) => return None,
             Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => match *never {},
             Rvalue::Use(_)
             | Rvalue::Repeat(..)
@@ -480,12 +491,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                 return None;
             }
         }
-        let op = match op {
-            BinOp::Add => &BinOp::AddWithOverflow,
-            BinOp::Sub => &BinOp::SubWithOverflow,
-            BinOp::Mul => &BinOp::MulWithOverflow,
-            op => op,
-        };
+        let op = with_overflow(op);
         if let (Some(Imm::Scalar(l)), Some(Imm::Scalar(r))) = (l, r)
             && l.is_integral()
             && matches!(op, BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow)
@@ -501,7 +507,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
     /// a bounds check or a division (the overflows are linted at their operation).
     fn check_assertion(&mut self, expected: bool, msg: &AssertKind, cond: &Operand, span: MirSpan) {
         let Some(Imm::Scalar(value)) = self.eval_operand(cond) else { return };
-        if value.size == 1 && value.bits == u128::from(expected) {
+        if value.kind != Kind::Bool || value.bits == u128::from(expected) {
             return;
         }
         if let OperandKind::Copy(place) | OperandKind::Move(place) = &cond.kind {
@@ -539,9 +545,13 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         let value = match rvalue {
             Rvalue::Use(operand) => Value::Immediate(self.eval_operand(operand)?),
             Rvalue::CopyForDeref(place) => Value::Immediate(self.eval_place(place)?),
-            Rvalue::BinaryOp(op, left, right) => {
+            Rvalue::BinaryOp(op, left, right) | Rvalue::CheckedBinaryOp(op, left, right) => {
                 let (Imm::Scalar(l), Imm::Scalar(r)) = (self.eval_operand(left)?, self.eval_operand(right)?) else {
                     return None;
+                };
+                let op = match rvalue {
+                    Rvalue::CheckedBinaryOp(..) => with_overflow(op),
+                    _ => op,
                 };
                 match scalar::binary_op(op, l, r)? {
                     Output::One(value) => Value::Immediate(Imm::Scalar(value)),
@@ -558,6 +568,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                 let Imm::Scalar(value) = self.eval_operand(operand)? else { return None };
                 Value::Immediate(Imm::Scalar(scalar::unary_op(*op, value)?))
             }
+            Rvalue::Aggregate(AggregateKind::Union(..), _) => return None,
             Rvalue::Aggregate(kind, operands) => Value::Aggregate {
                 fields: operands.iter().map(|it| self.eval_operand(it).map_or(Value::Uninit, Value::Immediate)).collect(),
                 variant: match kind {
@@ -589,7 +600,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
                 let (kind, size) = self.scalar_kind(dest_ty)?;
                 Value::Immediate(Imm::Scalar(Scalar::new(bits, size, kind)))
             }
-            Rvalue::Repeat(..) | Rvalue::Ref(..) | Rvalue::Len(_) | Rvalue::CheckedBinaryOp(..) => return None,
+            Rvalue::Repeat(..) | Rvalue::Ref(..) | Rvalue::Len(_) => return None,
             Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => match *never {},
         };
         *self.access_mut(dest.local)? = value;

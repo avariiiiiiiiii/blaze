@@ -19,6 +19,7 @@ use crate::{
     ImplTraitId, InferBodyId, InferenceResult,
     db::{HirDatabase, InternedOpaqueTyId},
     lower::{ImplTraitIdx, SelfAndAssocBounds},
+    method_resolution::may_hold,
     next_solver::{
         DbInterner, ErrorGuaranteed, SolverDefId, StoredEarlyBinder, StoredTy, Ty, TypingMode,
         infer::{DbInternerInferExt, traits::ObligationCause},
@@ -284,16 +285,22 @@ fn defined_type_aliases(
 /// Every function of the crate with a `#[define_opaque(..)]`: in a module, in an impl, and in
 /// a block of a body, as std's `sys::paths::unix::split_paths_ref` has the function that
 /// defines `SplitPathsRef` inside it. Of a crate that is not local, a body is lowered for its
-/// blocks only when its text says `define_opaque`, so one written by a macro there is not found
-/// and its opaque type stays an error, which no function using it compiles with.
+/// blocks when its text says `define_opaque` or may have it written by a macro or an attribute
+/// ([`may_hold`]), and always when a macro wrote the body itself.
 #[salsa::tracked(returns(deref))]
 fn define_opaque_functions(db: &dyn HirDatabase, krate: Crate) -> Box<[FunctionId]> {
     let local = krate.data(db).origin.is_local();
     let mut result = Vec::new();
-    collect(db, crate_def_map(db, krate), local, &mut result);
+    collect(db, krate, crate_def_map(db, krate), local, &mut result);
     return result.into_boxed_slice();
 
-    fn collect(db: &dyn HirDatabase, def_map: &DefMap, local: bool, result: &mut Vec<FunctionId>) {
+    fn collect(
+        db: &dyn HirDatabase,
+        krate: Crate,
+        def_map: &DefMap,
+        local: bool,
+        result: &mut Vec<FunctionId>,
+    ) {
         for (_, module) in def_map.modules(db) {
             let scope = module.scope(db);
             let mut holders: Vec<DefWithBodyId> = Vec::new();
@@ -320,9 +327,9 @@ fn define_opaque_functions(db: &dyn HirDatabase, krate: Crate) -> Box<[FunctionI
                 {
                     result.push(func);
                 }
-                if local || mentions_define_opaque(db, owner) {
+                if local || may_define_opaque(db, krate, owner) {
                     for (_, block) in Body::of(db, owner).blocks(db) {
-                        collect(db, block, local, result);
+                        collect(db, krate, block, local, result);
                     }
                 }
             }
@@ -330,26 +337,31 @@ fn define_opaque_functions(db: &dyn HirDatabase, krate: Crate) -> Box<[FunctionI
     }
 }
 
-/// Whether the text of `owner` says `define_opaque`, in a file of its own: where its blocks
-/// may have a function with the attribute.
-fn mentions_define_opaque(db: &dyn HirDatabase, owner: DefWithBodyId) -> bool {
-    let (file_id, range) = match owner {
-        DefWithBodyId::FunctionId(it) => {
-            let id = it.loc(db).id;
-            (id.file_id, id.file_id.ast_id_map(db).get(id.value).text_range())
+/// Whether a block of `owner` may have a function with `#[define_opaque]`: its text says
+/// `define_opaque`, or [`may_hold`] finds a macro call or an attribute that may write one.
+fn may_define_opaque(db: &dyn HirDatabase, krate: Crate, owner: DefWithBodyId) -> bool {
+    match owner {
+        DefWithBodyId::FunctionId(it) => text_may_define_opaque(db, krate, it.loc(db).id),
+        DefWithBodyId::ConstId(it) => text_may_define_opaque(db, krate, it.loc(db).id),
+        DefWithBodyId::StaticId(it) => text_may_define_opaque(db, krate, it.loc(db).id),
+        DefWithBodyId::VariantId(_) => false,
+    }
+}
+
+fn text_may_define_opaque<N: syntax::AstNode>(
+    db: &dyn HirDatabase,
+    krate: Crate,
+    id: hir_expand::AstId<N>,
+) -> bool {
+    let Some(file) = id.file_id.file_id() else { return true };
+    let says = || {
+        let at = define_opaque_at(db, file);
+        !at.is_empty() && {
+            let range = id.file_id.ast_id_map(db).get(id.value).text_range();
+            at.iter().any(|&at| range.contains(at))
         }
-        DefWithBodyId::ConstId(it) => {
-            let id = it.loc(db).id;
-            (id.file_id, id.file_id.ast_id_map(db).get(id.value).text_range())
-        }
-        DefWithBodyId::StaticId(it) => {
-            let id = it.loc(db).id;
-            (id.file_id, id.file_id.ast_id_map(db).get(id.value).text_range())
-        }
-        DefWithBodyId::VariantId(_) => return false,
     };
-    let Some(file) = file_id.file_id() else { return false };
-    define_opaque_at(db, file).iter().any(|&at| range.contains(at))
+    says() || may_hold(db, krate, id, false)
 }
 
 /// Where the text of `file` says `define_opaque`.

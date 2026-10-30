@@ -181,6 +181,8 @@ with per-task bump arenas and inline small vectors (principles.md "Arenas, not t
 - speed-backend-lower 1: `v2/refs/intrinsics.rs` `ty_layout` lends `&'cx Layout`, and
   `use triomphe::Arc` is gone.
 
+> applied: noted; codegen-adapter's own answers.
+
 ## From speed-backend-llvm (2026-10-29): `summarize` takes `&mut Prepared`
 
 `crates/hir-ty-codegen/v2/backend.rs:496`, `impl Prepare ... fn summarize`: the trait
@@ -190,3 +192,10 @@ with per-task bump arenas and inline small vectors (principles.md "Arenas, not t
 Exact edit: `prepared: &Prepared,` becomes `prepared: &mut Prepared,`. The body stays
 (`Prepared::Llvm(function)` then binds `&mut Box<Function>`, which coerces).
 `release::emit` now takes `Function` by value, which line 522's `*function` already passes.
+4. **`typed-arena` in `crates/hir-ty-codegen/Cargo.toml`** (`docs/v2/plan/design/unsafe.md`).
+   Under `[dependencies]`, add `typed-arena = "2.0.2"` (already in `Cargo.lock` as a dependency
+   of others, so nothing new is downloaded). `mod.rs` lends each layout a build asks for as
+   `&'cx Layout` out of a `typed_arena::Arena<Arc<Layout>>` (`KeptLayouts`). That replaces
+   the `unsafe` `Layouts::lend`, which was a safe function that safe code could misuse, so
+   `mod.rs` has no `unsafe` of its own outside the LLVM FFI in `host_cpu`. The crate does not
+   build until this lands (with item 1).

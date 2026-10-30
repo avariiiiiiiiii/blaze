@@ -198,7 +198,7 @@ where
     let parser_input = to_parser_input(buffer, span_to_edition);
     // It matters what edition we parse with even when we escape all identifiers correctly.
     let parser_output = entry_point.parse(&parser_input);
-    let mut tree_sink = TtTreeSink::new(buffer.cursor());
+    let mut tree_sink = TtTreeSink::new(buffer.cursor(), parser_input.len());
     for event in parser_output.iter() {
         match event {
             parser::Step::Token { kind, n_input_tokens: n_raw_tokens } => {
@@ -1125,13 +1125,14 @@ struct TtTreeSink<'a> {
 }
 
 impl<'a> TtTreeSink<'a> {
-    fn new(cursor: Cursor<'a>) -> Self {
+    /// A sink for the parse of the `tokens` input tokens `cursor` walks.
+    fn new(cursor: Cursor<'a>, tokens: usize) -> Self {
         TtTreeSink {
             buf: String::new(),
             cursor,
             text_pos: 0.into(),
             inner: SyntaxTreeBuilder::default(),
-            token_map: SpanMap::empty(),
+            token_map: SpanMap::with_capacity(tokens),
             open_fragments: Vec::new(),
             token_end: 0.into(),
         }

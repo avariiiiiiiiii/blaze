@@ -167,3 +167,59 @@ error: aborting due to 1 previous error
 "#;
     assert_eq!(ui("bad-macro-definition.rs", "2015", source), stderr);
 }
+
+#[test]
+fn a_macro_with_no_rules_is_refused() {
+    // tests/ui/parser/issues/issue-7970b.rs: mbe defines it, rustc does not.
+    let source = r#"fn main() {}
+
+macro_rules! test {}
+//~^ ERROR macros must contain at least one rule
+"#;
+    let stderr = r#"error: macros must contain at least one rule
+  --> $DIR/issue-7970b.rs:3:1
+   |
+LL | macro_rules! test {}
+   | ^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+
+"#;
+    assert_eq!(ui("issue-7970b.rs", "2015", source), stderr);
+}
+
+#[test]
+fn an_unknown_fragment_specifier_is_refused() {
+    // tests/ui/macros/invalid-fragment-specifier.rs
+    let source = r#"macro_rules! test {
+    ($wrong:id) => {};
+} //~^ ERROR: invalid fragment specifier `id`
+
+// guard against breaking raw identifier diagnostic
+macro_rules! test_raw_identifer {
+    ($wrong:r#if) => {};
+} //~^ ERROR: invalid fragment specifier `r#if`
+
+fn main() {}
+"#;
+    let stderr = r#"error: invalid fragment specifier `id`
+  --> $DIR/invalid-fragment-specifier.rs:2:6
+   |
+LL |     ($wrong:id) => {};
+   |      ^^^^^^^^^
+   |
+   = help: valid fragment specifiers are `ident`, `block`, `stmt`, `expr`, `pat`, `ty`, `lifetime`, `literal`, `path`, `meta`, `tt`, `item` and `vis`, along with `expr_2021` and `pat_param` for edition compatibility
+
+error: invalid fragment specifier `r#if`
+  --> $DIR/invalid-fragment-specifier.rs:7:6
+   |
+LL |     ($wrong:r#if) => {};
+   |      ^^^^^^^^^^^
+   |
+   = help: valid fragment specifiers are `ident`, `block`, `stmt`, `expr`, `pat`, `ty`, `lifetime`, `literal`, `path`, `meta`, `tt`, `item` and `vis`, along with `expr_2021` and `pat_param` for edition compatibility
+
+error: aborting due to 2 previous errors
+
+"#;
+    assert_eq!(ui("invalid-fragment-specifier.rs", "2015", source), stderr);
+}

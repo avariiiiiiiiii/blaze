@@ -8,15 +8,21 @@
 //!   at the root of a library, `linker_messages`/`linker_info` at the root of a crate that is
 //!   not linked, `default_method_body_is_const`; and, below the crate root, `linker_messages`/
 //!   `linker_info` as "crate-level attribute should be an inner attribute" / "... in the root
-//!   module".
-//! - `check_inline` (`unused_attributes`): `#[inline]` on a function `#[no_mangle]`,
-//!   `#[export_name]` or `#[linkage]` exports. A closure is never linted: it has no codegen
-//!   attributes of its own there.
+//!   module". The two that ask for the crate types are not given where the front end does not
+//!   know them (a cargo library's or example's `crate-type`).
+//! - `check_inline` (`unused_attributes`): `#[inline]` on a function, inherent method or
+//!   provided trait method that `#[no_mangle]`, `#[export_name]`, `#[linkage]`,
+//!   `#[rustc_std_internal_symbol]` or a weak lang item exports. A closure is never linted: it
+//!   is no HIR owner there. An implementation of an externally implementable item (the
+//!   unstable `extern_item_impls`) is exported too; the syntax does not say which functions
+//!   are, and those are not linted.
 //! - `check_link` (`unused_attributes`): `#[link]` on an `extern "Rust"` block, or one whose ABI
 //!   rustc does not know (lowered as `Rust`).
 //! - `check_macro_export` (`unused_attributes`): `#[macro_export]` on a `macro` (2.0).
 //! - `check_repr` (`conflicting_repr_hints`, deny): two integer hints, `C` with `simd`, or `C`
-//!   with an integer on an enum whose variants have no fields, at every hint.
+//!   with an integer on an enum whose variants have no fields, at every hint. rustc gives
+//!   this lint the code E0566 (`error[E0566]: conflicting representation hints`); the model
+//!   has no code for a lint yet (asked of the parent).
 //! - `check_mix_no_mangle_export` (`unused_attributes`).
 //!
 //! The rest of the file gives errors (`diagnostics-items`' `checks/attrs.rs`):
@@ -125,47 +131,52 @@ fn span_of(cx: &Cx<'_, '_>, attr: &Attr) -> Span {
 }
 
 /// The crate types rustc builds the crate as, as far as `check_attr` asks: whether one is an
-/// executable, and whether one is linked (anything but an rlib or a staticlib).
+/// executable, and whether one is linked (anything but an rlib or a staticlib); `None` where
+/// the front end does not know (the `crate-type` of a cargo library or example), and neither
+/// lint that asks is given.
 #[derive(Clone, Copy)]
 struct CrateTypes {
-    executable: bool,
-    needs_link: bool,
+    executable: Option<bool>,
+    needs_link: Option<bool>,
 }
 
 impl CrateTypes {
-    const BIN: CrateTypes = CrateTypes { executable: true, needs_link: true };
+    const BIN: CrateTypes = CrateTypes { executable: Some(true), needs_link: Some(true) };
 
-    /// rustc's `collect_crate_types`: the `--crate-type` cargo gives for the target, else (a
-    /// crate rustc is run on alone) the `#![crate_type]`s of the crate, else `bin`.
+    /// rustc's `collect_crate_types`: `--test` builds an executable; else the `--crate-type`
+    /// cargo gives for the target, else (a crate rustc is run on alone) the `#![crate_type]`s
+    /// of the crate, else `bin`.
     fn of(cx: &Cx<'_, '_>, owners: &[Owner]) -> CrateTypes {
         match cx.krate.target_kind(cx.db) {
-            TargetKind::Bin
-            | TargetKind::Example
-            | TargetKind::Test
-            | TargetKind::Bench
-            | TargetKind::BuildScript => CrateTypes::BIN,
-            TargetKind::Lib { is_proc_macro: true } => CrateTypes { executable: false, needs_link: true },
-            TargetKind::Lib { is_proc_macro: false } => CrateTypes { executable: false, needs_link: false },
+            TargetKind::Bin | TargetKind::Test | TargetKind::Bench | TargetKind::BuildScript => CrateTypes::BIN,
+            TargetKind::Lib { is_proc_macro: true } => CrateTypes { executable: Some(false), needs_link: Some(true) },
+            // A cargo library is never an executable; its `crate-type` can be an rlib or a
+            // cdylib. An example can be a library too.
+            TargetKind::Lib { is_proc_macro: false } => CrateTypes { executable: Some(false), needs_link: None },
+            TargetKind::Example => CrateTypes { executable: None, needs_link: None },
             TargetKind::Other => CrateTypes::from_attrs(owners),
         }
     }
 
     fn from_attrs(owners: &[Owner]) -> CrateTypes {
         let Some(root) = owners.iter().find(|it| it.target == Target::Crate) else { return CrateTypes::BIN };
-        let mut types: Option<CrateTypes> = None;
+        let (mut any, mut executable, mut needs_link) = (false, false, false);
         for attr in root.attrs.iter().filter(|it| it.inner && word(it).is_some_and(|it| it.text() == "crate_type")) {
             let Some(value) = string_value(attr) else { continue };
-            let (executable, needs_link) = match value.as_str() {
+            let (bin, linked) = match value.as_str() {
                 "bin" => (true, true),
                 "lib" | "rlib" | "staticlib" => (false, false),
                 "dylib" | "cdylib" | "proc-macro" | "sdylib" => (false, true),
                 _ => continue,
             };
-            let all = types.get_or_insert(CrateTypes { executable: false, needs_link: false });
-            all.executable |= executable;
-            all.needs_link |= needs_link;
+            any = true;
+            executable |= bin;
+            needs_link |= linked;
         }
-        types.unwrap_or(CrateTypes::BIN)
+        match any {
+            true => CrateTypes { executable: Some(executable), needs_link: Some(needs_link) },
+            false => CrateTypes::BIN,
+        }
     }
 }
 
@@ -190,11 +201,14 @@ fn unused(cx: &Cx<'_, '_>, owner: &Owner, attr: &Attr, name: &str, types: CrateT
                 if owner.target != Target::Crate {
                     return Some(crate_level(cx, attr));
                 }
-                if types.needs_link {
+                if types.needs_link != Some(false) {
                     return None;
                 }
                 "the `linker_messages` and `linker_info` lints can only be controlled at the root of a crate that needs to be linked".to_owned()
-            } else if owner.target == Target::Crate && !types.executable && lints_named(&["dead_code_pub_in_binary"]) {
+            } else if owner.target == Target::Crate
+                && lints_named(&["dead_code_pub_in_binary"])
+                && types.executable == Some(false)
+            {
                 "the `dead_code_pub_in_binary` lint has no effect in library crates".to_owned()
             } else {
                 return None;
@@ -236,11 +250,12 @@ fn until_bracket(cx: &Cx<'_, '_>, span: &Span) -> Span {
     span.with_hi(span.lo + before.len() as u32)
 }
 
-/// rustc's `check_inline`: `#[inline]`, `#[inline(always)]` on a function that is exported.
+/// rustc's `check_inline`: `#[inline]`, `#[inline(always)]` on a function, an inherent method
+/// or a provided trait method that is exported (a method of a trait impl is not checked).
 fn inline(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> {
     let functions = matches!(
         node.owner.target,
-        Target::Fn | Target::Method(MethodKind::Inherent | MethodKind::TraitImpl | MethodKind::Trait { body: true })
+        Target::Fn | Target::Method(MethodKind::Inherent | MethodKind::Trait { body: true })
     );
     if !functions {
         return None;
@@ -277,13 +292,31 @@ fn inline_never(attr: &Attr) -> Option<bool> {
 }
 
 /// rustc's `contains_extern_indicator` of a function's codegen attributes: `#[no_mangle]`,
-/// `#[rustc_std_internal_symbol]`, a well-formed `#[export_name]`, or a `#[linkage]` that is
-/// not `internal` (the first well-formed one is the one kept).
+/// `#[rustc_std_internal_symbol]` or a weak lang item (which `codegen_fn_attrs` makes one), a
+/// well-formed `#[export_name]`, or a `#[linkage]` that is not `internal` (the first
+/// well-formed one is the one kept).
 fn exported(node: &Node<'_>) -> bool {
     node.named("no_mangle").next().is_some()
         || node.named("rustc_std_internal_symbol").next().is_some()
+        || weak_lang_item(node)
         || node.named("export_name").any(|it| export_name(it).is_some())
         || node.named("linkage").find_map(linkage).is_some_and(|it| it != "internal")
+}
+
+/// Whether the lang item rustc's `find_attr!(attrs, Lang(..))` finds is a weak one
+/// (`panic_impl`, `eh_personality`: those with a `link_name`). `#[panic_handler]` is
+/// `panic_impl`; of it and `#[lang = ".."]`, the parsed attributes are in the order each is
+/// first written. Of several `#[lang]`s the first with a string is taken: one naming no lang
+/// item is an error (E0522) that would leave the next.
+fn weak_lang_item(node: &Node<'_>) -> bool {
+    let first_of = |name: &'static str| node.words.iter().position(|it| it.as_ref().is_some_and(|it| it.text() == name));
+    let lang = node.named("lang").find_map(string_value);
+    let weak = |lang: &str| matches!(lang, "panic_impl" | "eh_personality");
+    match (lang, first_of("panic_handler")) {
+        (Some(lang), Some(panic_handler)) => first_of("lang").is_none_or(|it| it > panic_handler) || weak(&lang),
+        (Some(lang), None) => weak(&lang),
+        (None, panic_handler) => panic_handler.is_some(),
+    }
 }
 
 /// The name of a well-formed `#[export_name = ".."]`: rustc's `ExportNameParser` takes a string,

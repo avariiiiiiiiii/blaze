@@ -180,7 +180,6 @@ impl Backends {
                 colocate(&mut pending.func, &places, placer.refs());
             }
         }
-        let cranelift = unit.backend == Backend::Cranelift;
         let function = Function {
             code,
             places,
@@ -189,7 +188,6 @@ impl Backends {
             hint: hint(db, instance),
             release: Default::default(),
             foldable: foldable(db, instance),
-            refs: if cranelift { refs.to_vec() } else { Vec::new() },
         };
         let shape = shape::of(&function).map_err(fail)?;
         let prepared = match unit.backend {
@@ -494,7 +492,7 @@ impl Prepare for Backends {
         &self,
         unit: &Unit,
         spec: &Spec,
-        prepared: &Prepared,
+        prepared: &mut Prepared,
         refs: &Refs,
     ) -> Result<(Summary, Self::Export), CodegenError> {
         match prepared {
@@ -524,11 +522,9 @@ impl Prepare for Backends {
         }
     }
 
-    fn masked(&self, _: &Unit, prepared: &Prepared) -> Option<Masked> {
+    fn masked(&self, _: &Unit, prepared: &Prepared, refs: &Refs) -> Option<Masked> {
         match prepared {
-            Prepared::Cranelift(function) if function.foldable => {
-                super::fold::masked(function, &function.refs)
-            }
+            Prepared::Cranelift(function) if function.foldable => super::fold::masked(function, refs),
             Prepared::Cranelift(_) | Prepared::Llvm(_) => None,
         }
     }

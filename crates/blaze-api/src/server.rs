@@ -554,28 +554,39 @@ impl Server {
     }
 }
 
-/// `response` to request `id` as one frame. One too long to frame is sent as the error that
-/// says so.
-fn frame(id: u64, response: Response) -> Vec<u8> {
-    match frames::encode(&Envelope::new(id, response)) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let what = format!("a response that could not be sent: {}", error.what);
-            let error = Response::Error(ApiError::new(what, error.at));
-            frames::encode(&Envelope::new(id, error)).expect("an error's envelope has a frame")
-        }
-    }
+/// `response` to request `id` as one frame onto the end of `out`. One too long to frame is
+/// sent as the error that says so.
+fn frame(writer: &mut cbor::Writer, out: &mut Vec<u8>, id: u64, response: &Response) {
+    let Err(error) = frames::encode_into(writer, out, &Envelope::new(id, response)) else {
+        return;
+    };
+    let what = format!("a response that could not be sent: {}", error.what);
+    let error = Response::Error(ApiError::new(what, error.at));
+    frames::encode_into(writer, out, &Envelope::new(id, &error))
+        .expect("an error's envelope has a frame");
 }
 
-/// `response` to request `id` as one chunk of an HTTP reply.
-fn rendered(id: u64, response: Response, json: bool) -> Vec<u8> {
+/// `response` to request `id` as one chunk of an HTTP reply onto the end of `out`, its
+/// content put together in `line` first.
+fn rendered(
+    writer: &mut cbor::Writer,
+    line: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+    id: u64,
+    response: &Response,
+    json: bool,
+) {
+    line.clear();
     match json {
         true => {
-            let mut line = json::response(&Envelope::new(id, response));
-            line.push('\n');
-            http::chunk(line.as_bytes())
+            json::line_into(line, &Envelope::new(id, response));
+            line.push(b'\n');
         }
-        false => http::chunk(&frame(id, response)),
+        false => frame(writer, line, id, response),
+    }
+    http::chunk_into(out, line);
+    if line.capacity() > KEPT_LINE {
+        *line = Vec::new();
     }
 }
 

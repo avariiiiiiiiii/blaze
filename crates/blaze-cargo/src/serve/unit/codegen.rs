@@ -7,7 +7,7 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use blaze_codegen::{
@@ -216,7 +216,7 @@ pub(crate) fn generate(
     job: &Job,
     unit: usize,
     makes: &Makes,
-    mounted: &Mounted,
+    mounted: &Arc<Mounted>,
 ) -> Result<Result<Generated, Vec<String>>, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let krate = job
@@ -231,7 +231,7 @@ pub(crate) fn generate(
         Box::new(snapshot.clone()) as Box<dyn HirDatabase + Send>
     });
     let names = {
-        let mounted = mounted.clone();
+        let mounted = Arc::clone(mounted);
         let paths = job.lowered.paths();
         move |file: base_db::FileId| -> Option<String> { paths.get(&file).map(|path| mounted.name(path)) }
     };
@@ -332,7 +332,13 @@ fn given(job: &Job, unit: u32) -> Result<Compile, String> {
             own.push(&applied.output);
         }
     }
-    let package = bs::Package { targets: script::targets(units, &u.pkg_id), ..bs::Package::default() };
+    // `Compile::of` asks of the package only whether it has a library.
+    let lib = bs::Target { name: String::new(), kind: vec!["lib".to_owned()], crate_types: Vec::new() };
+    let targets = match job.graph.package_has_lib(unit) {
+        true => vec![lib],
+        false => Vec::new(),
+    };
+    let package = bs::Package { targets, ..bs::Package::default() };
     Ok(Compile::of(&package, &script::target_of(u), job.graph.has(unit, flag::TEST), &linked, &own))
 }
 

@@ -20,6 +20,8 @@ visitor impls are gone from `crates/hir-ty/src/next_solver/interner.rs`. Nothing
 (`rg collect_ty_garbage`); this is the same change as `v2/requests/format.md` request 1. Until
 it is applied, `hir` does not compile.
 
+> forwarded to db: `crates/hir/` is lane db's.
+
 ## 2. Lane db: interner-free constructors in `vendor/rustc_type_ir`
 
 What: a constructor that takes no interner for each struct whose private `()` field forces one
@@ -94,6 +96,8 @@ field is a `()` and `DbInterner`'s two `debug_assert_*_args_compatible` are empt
 `assemble!` goes and each use becomes `X::from_checked_parts(..)`; I make that change when this
 lands.
 
+> forwarded to db: `vendor/rustc_type_ir` is lane db's.
+
 ## 3. Lane db (optional): flags of `GenericArgs` tested in blocks
 
 What: none needed today. `Clauses` keeps its flags and outer binder in columns of its list table
@@ -103,6 +107,8 @@ lane db wants arguments tested in one read, the change is `type GenericArgs: .. 
 `vendor/rustc_type_ir/src/interner.rs` and a `TypeVisitableExt` fast path; my side would then
 intern `GenericArgs` with `intern_with`, as `Clauses` is.
 
+> forwarded to db: `vendor/rustc_type_ir` is lane db's.
+
 ## Applied requests of others
 
 - db-ty-solver request 1 (drop `reinit_cache`): done in `interner.rs` (`new_with`, `attach`,
@@ -111,3 +117,5 @@ intern `GenericArgs` with `intern_with`, as `Clauses` is.
   `Allocation::new(AllocationData { ty, memory, memory_map })` and its `Deref` are kept;
   `TyTableWriter::ty`/`TyTableReader::ty` are in `next_solver/persist.rs` with shared rule 2's
   signatures.
+
+> applied: noted; db-ty-types' own record.

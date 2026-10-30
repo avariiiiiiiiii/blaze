@@ -4,7 +4,7 @@
 
 use blaze_vfs::{Change, View, ViewId};
 
-use crate::Targets;
+use crate::{Targets, Ub};
 
 /// A job of the build, one per request (one per candidate of a best-of-N).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -33,7 +33,9 @@ pub enum Work {
     Build(Targets),
     /// Then a [`crate::Response::TestResult`] per test, [`crate::TestOutcome::Unreached`] for
     /// each the change reached none of (all run with `all`), and [`crate::Response::Work`].
-    Test { targets: Targets, filter: Vec<String>, all: bool },
+    /// `args` is libtest's selection; with `ub` each test runs in the MIR evaluator, checked
+    /// for undefined behavior, and nothing is compiled.
+    Test { targets: Targets, filter: Vec<String>, all: bool, args: Vec<String>, ub: Option<Ub> },
     /// Then [`crate::Response::Ran`] and [`crate::Response::Work`].
     Run { targets: Targets, bin: Option<String>, args: Vec<String> },
     /// What the job's view's change from `from` reaches ([`crate::Response::Reached`]),

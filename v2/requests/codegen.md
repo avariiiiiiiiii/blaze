@@ -474,6 +474,8 @@ worker). The closure there captures `mounted` and `job.lowered.paths()`; both mu
 
 Why: otherwise the call doesn't type-check.
 
+> forwarded to cargo: `serve/unit/codegen.rs` is lane cargo's.
+
 ## 8. link: who builds the span tables `Target::Position` names
 
 Where: lane link (`crates/blaze-link/src/position.rs` decodes a `SpanTable`; nothing in v2
@@ -490,6 +492,8 @@ these, keyed by anchor, so a reformat rebuilds tables and compiles nothing.
 
 Why: without them every panic location and `#[track_caller]` `Location` points at nothing.
 
+> forwarded to link: lane link's call.
+
 ## 9. items (optional, speed): spans of a body form and a by-move code query
 
 Where: `crates/blaze-items/src/hash.rs`.
@@ -500,3 +504,5 @@ and `mir_body_for_coroutine_by_move` and hashes them beside `code_hash`/`closure
 the MIR names, and a `coroutine_by_move_code` query, would hash each body once in one place.
 
 Why: hash once (principles.md); today the MIR's spans are walked twice per body.
+
+> forwarded to coordinator: lane items is DONE and this is a restructure of its hashing (`hash.rs`) with a new code query, optional: new work for a lane the coordinator names, not an edit.

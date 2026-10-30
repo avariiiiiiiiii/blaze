@@ -303,10 +303,7 @@ pub(crate) fn cargo_hides(message: &str) -> bool {
         || message.ends_with("warnings emitted")
 }
 
-fn mounted(job: &Job) -> Mounted {
-    let config = &job.input.config;
-    Mounted::new(job.input.files.clone(), job.input.root, &config.mounts, &config.invocation.root)
-}
+
 
 fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
     let u = job.unit(unit)?;
@@ -317,8 +314,8 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
     let krate = job.lowered.krate(unit).ok_or_else(|| {
         ApiError::new(format!("unit {unit} (`{}`) has no crate in the front end", u.target.name), None)
     })?;
-    let mounted = mounted(job);
-    let names = Names::new(&job.lowered, &mounted);
+    let mounted = &job.mounted;
+    let names = Names::new(&job.lowered, mounted);
     let lints = CommandLine::parse(&lint_flags(u, plan, local(package.source.as_deref())))
         .map_err(|why| ApiError::new(why, Some(format!("the lint flags of `{}`", u.target.name))))?;
     let options = Options { lints, ..Options::default() };
@@ -368,7 +365,7 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
                 return Ok(nothing(diagnostics, false, made));
             }
         };
-        let mut generated = match codegen::generate(job, unit, &makes, &mounted)
+        let mut generated = match codegen::generate(job, unit, &makes, mounted)
             .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?
         {
             Ok(it) => it,
@@ -445,7 +442,7 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
         let (key, executable) = match found {
             Some((_, key, executable)) => (*key, *executable),
             None if path.ends_with(".d") => {
-                let text = dep_info(path, plan, main_file.as_deref(), &sources, &mounted);
+                let text = dep_info(path, plan, main_file.as_deref(), &sources, mounted);
                 (put_output(&mut puts, text.into_bytes()), false)
             }
             // Debug info beside an image (`.dSYM`, `.pdb`, `.dwp`): blaze's images carry

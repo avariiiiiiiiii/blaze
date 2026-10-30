@@ -268,22 +268,63 @@ impl Form {
 
     /// For what holds no id: what one build of blaze writes of it is the same in every run, and
     /// the store's keys hash what blaze was built from.
-    fn debug(&mut self, value: &dyn Debug) {
-        let at = self.digest.len();
-        self.u64(0);
+    fn debug<T: Debug + ?Sized>(&mut self, value: &T) {
+        if self.quiet {
+            return;
+        }
+        let at = self.len_at();
         write!(Text(&mut self.digest), "{value:?}").expect("`Debug` into a `Vec` does not fail");
-        let len = (self.digest.len() - at - 8) as u64;
-        self.digest[at..at + 8].copy_from_slice(&len.to_le_bytes());
+        let len = self.digest.len() - at - 8;
+        self.set_len(at, len);
     }
 
     /// The slot of `id`: the first item referred to is 0, the next other one 1.
     fn item(&mut self, id: ItemId) {
-        let next = self.refs.len() as u32;
-        let slot = *self.slots.entry(id).or_insert(next);
-        if slot == next {
-            self.refs.push(id);
+        if self.quiet {
+            return;
         }
+        let slot = if self.refs.len() <= SCAN {
+            match self.refs.iter().position(|&it| it == id) {
+                Some(at) => at as u32,
+                None => {
+                    self.refs.push(id);
+                    (self.refs.len() - 1) as u32
+                }
+            }
+        } else {
+            if self.slots.is_empty() {
+                self.slots.extend(self.refs.iter().enumerate().map(|(at, &it)| (it, at as u32)));
+            }
+            let next = self.refs.len() as u32;
+            let slot = *self.slots.entry(id).or_insert(next);
+            if slot == next {
+                self.refs.push(id);
+            }
+            slot
+        };
         self.u32(slot);
+    }
+
+    /// A finished form written into this one: its digest and positions, and its refs as slots
+    /// of this one.
+    fn merge(
+        &mut self,
+        digest: &ContentId,
+        spans: &ContentId,
+        refs: &[ItemId],
+        missed: Option<Missed>,
+    ) {
+        if self.quiet {
+            return;
+        }
+        self.update(&digest.0);
+        self.spans.extend_from_slice(&spans.0);
+        for &id in refs {
+            self.item(id);
+        }
+        if let Some(why) = missed {
+            self.missed.get_or_insert(why);
+        }
     }
 
     fn error(&mut self, why: Missed) {
@@ -293,6 +334,9 @@ impl Form {
     }
 
     fn span(&mut self, span: MirSpan) {
+        if self.quiet {
+            return;
+        }
         let (tag, at) = match span {
             MirSpan::ExprId(it) => (0u8, it.into_raw().into_u32()),
             MirSpan::ExprEnd(it) => (1, it.into_raw().into_u32()),
@@ -305,17 +349,64 @@ impl Form {
         self.spans.extend_from_slice(&at.to_le_bytes());
     }
 
-    fn sub(self) -> Sub {
-        Sub {
-            digest: ContentId::of(DOMAIN, &self.digest),
-            refs: self.refs.into_boxed_slice(),
-            missed: self.missed,
+    /// An operand's position, if it has one.
+    fn operand_span(&mut self, span: Option<MirSpan>) {
+        if self.quiet {
+            return;
+        }
+        match span {
+            Some(span) => {
+                self.spans.push(1);
+                self.span(span);
+            }
+            None => self.spans.push(0),
         }
     }
 
+    fn digest_id(&self) -> ContentId {
+        ContentId::of(DOMAIN, &self.digest)
+    }
+
+    fn spans_id(&self) -> ContentId {
+        if self.spans.is_empty() { *NO_SPANS } else { ContentId::of(SPANS_DOMAIN, &self.spans) }
+    }
+
+    fn sub(self) -> Sub {
+        Sub { digest: self.digest_id(), refs: self.refs.as_slice().into(), missed: self.missed }
+    }
+
     fn code(self) -> Code {
-        let spans = ContentId::of(SPANS_DOMAIN, &self.spans);
+        let spans = self.spans_id();
         Code { sub: self.sub(), spans }
+    }
+}
+
+impl Drop for Form {
+    fn drop(&mut self) {
+        if self.quiet
+            || self.digest.capacity() > SPARE_BYTES
+            || self.spans.capacity() > SPARE_BYTES
+            || self.refs.capacity() * size_of::<ItemId>() > SPARE_BYTES
+        {
+            return;
+        }
+        let mut buffers = FormBuffers {
+            digest: mem::take(&mut self.digest),
+            spans: mem::take(&mut self.spans),
+            refs: mem::take(&mut self.refs),
+            slots: mem::take(&mut self.slots),
+        };
+        buffers.digest.clear();
+        buffers.spans.clear();
+        buffers.refs.clear();
+        buffers.slots.clear();
+        let _ = SPARE.try_with(|spare| {
+            if let Ok(mut spare) = spare.try_borrow_mut()
+                && spare.forms.len() < SPARE_COUNT
+            {
+                spare.forms.push(buffers);
+            }
+        });
     }
 }
 
@@ -330,20 +421,68 @@ impl std::fmt::Write for Text<'_> {
 }
 
 /// A body written inside another: a closure or a coroutine, whose code is part of its owner's.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Nested<'db> {
     Closure(InternedClosureId<'db>),
     Coroutine(InternedCoroutineId<'db>),
 }
 
+/// The bodies written in one, in the order the walks first meet them.
+#[derive(Default)]
+struct Nests<'db> {
+    order: Vec<Nested<'db>>,
+    seen: FxHashSet<Nested<'db>>,
+}
+
+impl<'db> Nests<'db> {
+    fn push(&mut self, it: Nested<'db>) {
+        if self.seen.insert(it) {
+            self.order.push(it);
+        }
+    }
+}
+
+/// Entries of [`Cx::seen`].
+const SEEN: usize = 64;
+
+/// 16 bytes an entry, 1 KiB a [`Cx`].
+const _: () = assert!(size_of::<Option<(Ty<'static>, &'static Code)>>() == 16);
+
 pub(crate) struct Cx<'db> {
     db: &'db dyn HirDatabase,
-    tys: RefCell<FxHashMap<Ty<'db>, Part>>,
-    /// The refs of every finished [`Part`], each one's a range.
-    refs: RefCell<Vec<ItemId>>,
-    /// The spans hash of a form with no positions, which most are.
-    no_spans: ContentId,
-    /// The types being spelled, outermost first: one met again contains itself.
+    /// The type forms asked of [`ty_form`] lately, direct-mapped by the type's hash: one probe
+    /// and no allocation, against salsa's interning of the key (a shard lock) and its memo
+    /// lookup. A `Cx` lives inside one query, so a hit skips only a read that query recorded.
+    seen: [Cell<Option<(Ty<'db>, &'db Code)>>; SEEN],
+    #[cfg(test)]
+    reference: Option<Reference<'db>>,
+}
+
+/// A type's form, spelled once per revision for every item that writes it and kept across
+/// revisions while what it reads is unchanged: rustc's stable hash cached in each interned
+/// type, with salsa's backdating on top.
+#[salsa::tracked(returns(ref), cycle_result = ty_form_cycle)]
+pub(crate) fn ty_form(db: &dyn HirDatabase, ty: StoredTy) -> Code {
+    let mut form = Form::new("ty");
+    Cx::new(db).spell(&mut form, ty.as_ref());
+    form.code()
+}
+
+/// A type met again while it is spelled contains itself, which only a program rustc rejects
+/// has: every type of the cycle gets this, whichever of them was asked for first.
+fn ty_form_cycle(_: &dyn HirDatabase, _: salsa::Id, _: StoredTy) -> Code {
+    let mut form = Form::new("ty");
+    form.error(Missed::ErrorType);
+    form.code()
+}
+
+/// The type forms as each `Cx` spelled them before [`ty_form`]: memoized for its lifetime,
+/// with a stack of the types being spelled to stop at one that contains itself. The tests
+/// check that both give the same forms.
+#[cfg(test)]
+#[derive(Default)]
+struct Reference<'db> {
+    tys: RefCell<FxHashMap<Ty<'db>, Code>>,
     spelling: RefCell<Vec<Ty<'db>>>,
 }
 
@@ -407,26 +546,53 @@ impl<'db> Cx<'db> {
     pub(crate) fn new(db: &'db dyn HirDatabase) -> Cx<'db> {
         Cx {
             db,
-            tys: RefCell::default(),
-            refs: RefCell::default(),
-            no_spans: ContentId::of(SPANS_DOMAIN, &[]),
-            spelling: RefCell::default(),
+            seen: [const { Cell::new(None) }; SEEN],
+            #[cfg(test)]
+            reference: None,
         }
     }
 
-    fn part(&self, form: Form) -> Part {
-        let digest = ContentId::of(DOMAIN, &form.digest);
-        let spans = if form.spans.is_empty() {
-            self.no_spans
-        } else {
-            ContentId::of(SPANS_DOMAIN, &form.spans)
-        };
-        self.finished(form, digest, spans)
+    /// A `Cx` that spells types itself, as every `Cx` did before [`ty_form`].
+    #[cfg(test)]
+    pub(crate) fn reference(db: &'db dyn HirDatabase) -> Cx<'db> {
+        Cx { reference: Some(Reference::default()), ..Cx::new(db) }
     }
 
-    /// Each form finished as [`Cx::part`] would, the digests and the positions hashed in one
-    /// batched call each.
-    fn parts(&self, forms: Vec<Form>) -> Vec<Part> {
+    /// `ty`'s form as a [`Cx::reference`] spells it.
+    #[cfg(test)]
+    pub(crate) fn reference_ty(&self, ty: Ty<'db>) -> Code {
+        let reference = self.reference.as_ref().expect("a reference `Cx`");
+        if let Some(known) = reference.tys.borrow().get(&ty) {
+            return known.clone();
+        }
+        let mut form = Form::new("ty");
+        if reference.spelling.borrow().contains(&ty) {
+            form.error(Missed::ErrorType);
+            return form.code();
+        }
+        reference.spelling.borrow_mut().push(ty);
+        self.spell(&mut form, ty);
+        reference.spelling.borrow_mut().pop();
+        let code = form.code();
+        reference.tys.borrow_mut().insert(ty, code.clone());
+        code
+    }
+
+    /// `form` finished and written into `f`.
+    fn nest(&self, f: &mut Form, form: Form) {
+        f.merge(&form.digest_id(), &form.spans_id(), &form.refs, form.missed);
+    }
+
+    /// Forms as a set, in an order no order they are written in changes: by digest, then by
+    /// the keys of what they refer to. Most sets have one form or none, which need no sorting
+    /// and no batch.
+    fn set(&self, f: &mut Form, mut forms: impl Iterator<Item = Form>) {
+        let Some(first) = forms.next() else { return f.len(0) };
+        let Some(second) = forms.next() else {
+            f.len(1);
+            return self.nest(f, first);
+        };
+        let forms: Vec<Form> = [first, second].into_iter().chain(forms).collect();
         let digests: Vec<&[u8]> = forms.iter().map(|it| it.digest.as_slice()).collect();
         let digests = ContentId::of_many(DOMAIN, &digests);
         let positioned: Vec<&[u8]> = forms
@@ -435,50 +601,25 @@ impl<'db> Cx<'db> {
             .map(|it| it.spans.as_slice())
             .collect();
         let mut positioned = ContentId::of_many(SPANS_DOMAIN, &positioned).into_iter();
-        forms
-            .into_iter()
+        let mut finished: Vec<(ContentId, ContentId, &Form)> = forms
+            .iter()
             .zip(digests)
             .map(|(form, digest)| {
                 let spans = if form.spans.is_empty() {
-                    self.no_spans
+                    *NO_SPANS
                 } else {
                     positioned.next().expect("a spans hash per form with positions")
                 };
-                self.finished(form, digest, spans)
+                (digest, spans, form)
             })
-            .collect()
-    }
-
-    fn finished(&self, form: Form, digest: ContentId, spans: ContentId) -> Part {
-        let mut refs = self.refs.borrow_mut();
-        let refs_at = refs.len() as u32;
-        refs.extend_from_slice(&form.refs);
-        Part { digest, spans, refs_at, refs_len: form.refs.len() as u32, missed: form.missed }
-    }
-
-    /// `part` written into `f`: its digest and positions, and its refs as slots of `f`.
-    fn merge(&self, f: &mut Form, part: Part) {
-        f.update(&part.digest.0);
-        f.spans.extend_from_slice(&part.spans.0);
-        let refs = self.refs.borrow();
-        let at = part.refs_at as usize;
-        for &id in &refs[at..at + part.refs_len as usize] {
-            f.item(id);
+            .collect();
+        let db = self.db;
+        let keys = |form: &Form| form.refs.iter().map(move |&it| item_key(db, it));
+        finished.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| keys(a.2).cmp(keys(b.2))));
+        f.len(finished.len());
+        for (digest, spans, form) in finished {
+            f.merge(&digest, &spans, &form.refs, form.missed);
         }
-        if let Some(why) = part.missed {
-            f.missed.get_or_insert(why);
-        }
-    }
-
-    fn nest(&self, f: &mut Form, form: Form) {
-        let part = self.part(form);
-        self.merge(f, part);
-    }
-
-    fn sub_of(&self, part: Part) -> Sub {
-        let at = part.refs_at as usize;
-        let refs = self.refs.borrow()[at..at + part.refs_len as usize].into();
-        Sub { digest: part.digest, refs, missed: part.missed }
     }
 
     /// What the item's dependents see of it.

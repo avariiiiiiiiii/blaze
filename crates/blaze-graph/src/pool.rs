@@ -585,30 +585,19 @@ impl Shared {
         }
     }
 
-    /// The group with the least queued and awake per worker, the fast ones first on a tie:
-    /// read from what idling and queueing already keep, so a job adds no count of its own.
-    fn least_loaded(&self) -> usize {
+    /// The group with the least queued and awake per worker (of the fast ones alone when
+    /// `only_fast`), the fast ones first on a tie: read from what idling and queueing already
+    /// keep, so a job adds no count of its own.
+    fn least_loaded(&self, only_fast: bool) -> usize {
         if self.groups.len() == 1 {
             return 0;
         }
-        let load = |group: &Group| {
+        least(self.groups.len(), only_fast, |at| {
+            let group = &self.groups[at];
             let workers = group.workers.len() as u64;
             let asleep = u64::from(group.sleepers.load(Ordering::Relaxed)).min(workers);
-            group.injector.len() as u64 + workers - asleep
-        };
-        let mut best = 0;
-        for at in 1..self.groups.len() {
-            let (a, b) = (&self.groups[at], &self.groups[best]);
-            // Load per worker, compared without division.
-            let (load_a, load_b) = (
-                u128::from(load(a)) * b.workers.len() as u128,
-                u128::from(load(b)) * a.workers.len() as u128,
-            );
-            if load_a < load_b || (load_a == load_b && a.fast && !b.fast) {
-                best = at;
-            }
-        }
-        best
+            (group.injector.len() as u64 + workers - asleep, workers, group.fast)
+        })
     }
 
     /// Wakes one parked worker, of `group` first, then of the groups that steal from it first,
@@ -645,6 +634,28 @@ impl Shared {
                 .iter()
                 .any(|it| !it.stealer.is_empty() || !it.next.load(Ordering::SeqCst).is_null())
     }
+}
+
+/// Of `count` groups, where `of(at)` is a group's load, its workers and whether it is fast:
+/// the one of least load per worker, the fast ones first on a tie, then the lower index; of
+/// the fast ones alone when `only_fast` and there is one. Compared without division.
+fn least(count: usize, only_fast: bool, of: impl Fn(usize) -> (u64, u64, bool)) -> usize {
+    let mut best: Option<(usize, (u64, u64, bool))> = None;
+    for at in 0..count {
+        let this = of(at);
+        if only_fast && !this.2 {
+            continue;
+        }
+        let better = best.is_none_or(|(_, (load, workers, fast))| {
+            let (mine, theirs) =
+                (u128::from(this.0) * u128::from(workers), u128::from(load) * u128::from(this.1));
+            mine < theirs || (mine == theirs && this.2 && !fast)
+        });
+        if better {
+            best = Some((at, this));
+        }
+    }
+    best.map_or(0, |(at, _)| at)
 }
 
 impl Local {
@@ -898,7 +909,7 @@ mod tests {
     fn groups_of(count: u32, each: u32) -> Topology {
         Topology {
             cpus: (0..count * each)
-                .map(|id| Cpu { id, group: id / each, socket: 0, fast: true })
+                .map(|id| Cpu { id, group: id / each, socket: 0, node: 0, fast: true })
                 .collect(),
         }
     }
@@ -1265,10 +1276,105 @@ mod tests {
         }
     }
 
+    /// `least` against the model: the group first in the order (load per worker, slow after
+    /// fast, index), over seeded loads, of every group or the fast ones alone.
+    #[test]
+    fn the_least_loaded_group_is_the_models() {
+        let mut rng = Rng(7);
+        for _ in 0..2000 {
+            let count = 1 + rng.below(6) as usize;
+            let groups: Vec<(u64, u64, bool)> = (0..count)
+                .map(|_| (rng.below(9), 1 + rng.below(4), rng.below(2) == 0))
+                .collect();
+            for only_fast in [false, true] {
+                let model = (0..count)
+                    .filter(|&at| !only_fast || groups[at].2)
+                    .min_by(|&a, &b| {
+                        let ((la, wa, fa), (lb, wb, fb)) = (groups[a], groups[b]);
+                        (u128::from(la) * u128::from(wb))
+                            .cmp(&(u128::from(lb) * u128::from(wa)))
+                            .then(fb.cmp(&fa))
+                            .then(a.cmp(&b))
+                    })
+                    .unwrap_or(0);
+                assert_eq!(super::least(count, only_fast, |at| groups[at]), model, "{groups:?}");
+            }
+        }
+    }
+
+    /// Two fast groups of two and a slow group of four: a critical job goes to its `near`
+    /// group only if that is fast, else to a fast group; any other job goes to `near`, and one
+    /// near no group to a least loaded one (fast first on a tie, so group 0 when idle).
+    #[test]
+    fn a_critical_job_is_placed_on_a_fast_group() {
+        let topology = Topology::from_perflevels(&[(4, 2), (4, 4)]);
+        let pool = Pool::new(&topology, false).unwrap();
+        let shared = &*pool.shared;
+        assert!(shared.mixed);
+        assert_eq!(shared.groups.iter().map(|it| it.fast).collect::<Vec<_>>(), [true, true, false]);
+        until("every worker to park", || {
+            sleeping(shared.idle.0.load(Ordering::SeqCst)) == 8
+        });
+        for near in [None, Some(0), Some(1), Some(2), Some(9)] {
+            let at = shared.place(near, true);
+            assert!(shared.groups[at].fast, "critical near {near:?} went to slow group {at}");
+            if let Some(near @ (0 | 1)) = near {
+                assert_eq!(at, near as usize);
+            }
+        }
+        assert_eq!(shared.place(Some(2), false), 2);
+        assert_eq!(shared.place(Some(1), false), 1);
+        assert_eq!(shared.place(None, false), 0);
+        assert_eq!(shared.place(Some(9), false), 0, "a group the pool lacks is none");
+        let (tx, rx) = unbounded::<Option<u32>>();
+        for _ in 0..50 {
+            let tx = tx.clone();
+            pool.submit_critical(Some(2), group, move |it| _ = tx.send(it.unwrap()));
+        }
+        for _ in 0..50 {
+            assert!(rx.recv_timeout(LONG).unwrap().is_some_and(|it| it < 3));
+        }
+        assert_eq!(pool.critical_submitted(), 50);
+    }
+
+    /// Where every group is fast, a critical job is placed as any other.
+    #[test]
+    fn on_an_all_fast_machine_critical_changes_nothing() {
+        let pool = Pool::new(&groups_of(3, 2), false).unwrap();
+        let shared = &*pool.shared;
+        assert!(!shared.mixed);
+        until("every worker to park", || {
+            sleeping(shared.idle.0.load(Ordering::SeqCst)) == 6
+        });
+        for near in [None, Some(0), Some(1), Some(2), Some(5)] {
+            assert_eq!(shared.place(near, true), shared.place(near, false), "near {near:?}");
+        }
+    }
+
+    /// Each worker names its CPU's node: on two nodes of a group each, a job's node is that of
+    /// the group it ran on, wherever it was stolen to; off the pool there is none.
+    #[test]
+    fn a_worker_says_its_numa_node() {
+        let cpus = (0..4).map(|id| Cpu { id, group: id / 2, socket: 0, node: id / 2, fast: true });
+        let pool = Pool::new(&Topology { cpus: cpus.collect() }, false).unwrap();
+        assert_eq!(super::node(), None);
+        let (tx, rx) = unbounded::<(Option<u32>, Option<u32>)>();
+        for job in 0..200u32 {
+            let tx = tx.clone();
+            let ran = || (group(), super::node());
+            pool.submit(Some(job % 2), ran, move |it| _ = tx.send(it.unwrap()));
+        }
+        for _ in 0..200 {
+            let (group, node) = rx.recv_timeout(LONG).unwrap();
+            assert!(group.is_some());
+            assert_eq!(node, group);
+        }
+    }
+
     #[test]
     fn no_cpu_is_refused() {
         assert!(Pool::new(&Topology { cpus: Vec::new() }, false).is_err());
-        let gap = Topology { cpus: vec![Cpu { id: 0, group: 1, socket: 0, fast: true }] };
+        let gap = Topology { cpus: vec![Cpu { id: 0, group: 1, socket: 0, node: 0, fast: true }] };
         assert!(Pool::new(&gap, false).is_err());
     }
 

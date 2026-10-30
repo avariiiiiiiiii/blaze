@@ -939,3 +939,14 @@ is a `TestResult` with outcome `Failed` and `output` = the report, then `seed: N
 prints the output as libtest prints a failure's stdout). `Unsupported { what }` is `Failed` with
 `what` as its output, never a pass and never a compiled run (no-fallback). `binary` is the test
 target's would-be executable path, or its name, which the CLI shows after `Running`.
+
+> applied: lane ci is DONE. `crates/blaze-api/src/lib.rs`: `Request::Test` gains `args: Vec<String>` and `ub: Option<Ub>`, and `Ub { seed: Option<u64>, schedules: Option<u32> }` as written; `SCHEMA` is 7. `Work::Test` (`build.rs`) carries both to the daemon, the session passes them through (test `test_run_and_verify_start_their_work` now sends both), BestOf's tests send none, and blaze-ci's `Check::request` sends `args: Vec::new(), ub: None`. > forwarded to cargo: `serve/job.rs:1451` and `serve/tests.rs:656` build a `Work::Test`/`Request::Test` and need the two fields; the daemon runs `ub` and `args`.
+
+## From core (2026-10-29): `crates/blaze-cargo/src/serve/plane.rs:494`, `PlaneOutput::Run` gains `critical`
+
+What: `blaze_graph::PlaneOutput::Run` gains `critical: bool` (the node is on its request's
+critical path). `serve/plane.rs:494` matches `PlaneOutput::Run { id, pool, near }` with no
+`..`, so it stops compiling once the field lands. Match `Run { id, pool, near, critical }` and,
+where the task goes to the pool, submit it with `Pool::submit_critical` when `critical`
+(as `blaze_graph::exec` does), so a critical task runs on a fast group (P cores on Apple).
+Why: docs/v2/plan/design/hardware.md, threads row: the critical path on the fast cores.

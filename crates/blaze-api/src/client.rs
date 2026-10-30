@@ -6,7 +6,7 @@
 use std::{
     collections::VecDeque,
     fmt,
-    io::{self, Read, Write},
+    io::{self, Read},
     net::{SocketAddr, TcpStream},
     path::Path,
 };
@@ -65,6 +65,12 @@ pub struct Client {
     frames: Frames,
     next_id: u64,
     kept: VecDeque<Envelope<Response>>,
+    /// Every request is encoded with it, into `out`.
+    writer: cbor::Writer,
+    /// The request being sent: its frame, or over HTTP its item.
+    out: Vec<u8>,
+    /// An HTTP request's head, written before `out` in one write.
+    head: Vec<u8>,
 }
 
 impl fmt::Debug for Client {
@@ -126,7 +132,15 @@ impl Client {
     }
 
     fn over(link: Link) -> Client {
-        Client { link, frames: Frames::new(), next_id: 1, kept: VecDeque::new() }
+        Client {
+            link,
+            frames: Frames::new(),
+            next_id: 1,
+            kept: VecDeque::new(),
+            writer: cbor::Writer::new(),
+            out: Vec::new(),
+            head: Vec::new(),
+        }
     }
 
     /// Sends `request`; returns its id (chosen by the client, increasing).
@@ -137,16 +151,19 @@ impl Client {
         let id = self.next_id;
         self.next_id += 1;
         let envelope = Envelope::new(id, request);
+        self.out.clear();
         match &mut self.link {
             #[cfg(unix)]
             Link::Unix(stream) => {
-                let frame = frames::encode(&envelope).map_err(ClientError::Refused)?;
-                stream.write_all(&frame)?;
+                frames::encode_into(&mut self.writer, &mut self.out, &envelope)
+                    .map_err(ClientError::Refused)?;
+                io::Write::write_all(stream, &self.out)?;
             }
             Link::Http(link) => {
-                let item = cbor::to_vec(&envelope).map_err(|error| {
+                self.writer.append(&mut self.out, &envelope).map_err(|error| {
                     ClientError::Refused(ApiError::new(format!("a request with no encoding: {error}"), None))
                 })?;
+                let item = self.out.as_slice();
                 if item.len() > LONGEST_REQUEST as usize {
                     let said = format!("a request of {} bytes, longer than {LONGEST_REQUEST}", item.len());
                     return Err(ClientError::Refused(ApiError::new(said, None)));
@@ -156,7 +173,10 @@ impl Client {
                     ("Content-Type", "application/cbor"),
                     ("Accept", "application/cbor"),
                 ];
-                link.stream.write_all(&http::request("POST", &link.host, "/api", &headers, &item))?;
+                let head = &mut self.head;
+                head.clear();
+                http::request_head_into(head, "POST", &link.host, "/api", &headers, item.len());
+                blaze_protocol::write_both(&mut link.stream, head, item)?;
                 let mut response = ResponseParser::new(usize::MAX);
                 let rest = std::mem::take(&mut link.rest);
                 if !rest.is_empty() {
@@ -299,7 +319,7 @@ impl Client {
                 return Err(ClientError::Refused(ApiError::new(said, Some(url(&link.host)))));
             }
         }
-        self.frames.push(&response.take_body());
+        self.frames.push_vec(response.take_body());
         Ok(true)
     }
 }

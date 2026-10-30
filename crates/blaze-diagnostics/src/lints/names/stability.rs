@@ -41,7 +41,7 @@ use crate::{
     cx::Cx,
     lints::syntax::source_fact,
     lower::{Found, Phase, mutable_ref_binding::BUILT_ON},
-    model::{Applicability, Diag},
+    model::{Applicability, Diag, Level, MultiSpan},
 };
 
 pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
@@ -50,12 +50,8 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
     let mut found = Vec::new();
 
     for escape in &walked.escapes {
-        let mut diag = Diag::new(
-            crate::model::Level::Warning,
-            None,
-            "`#[macro_escape]` is a deprecated synonym for `#[macro_use]`",
-        );
-        diag.primary(cx.span(escape.range));
+        let mut diag = Diag::new(Level::Warning, None, "`#[macro_escape]` is a deprecated synonym for `#[macro_use]`");
+        diag.span = MultiSpan::of(cx.span(escape.range));
         if escape.inner {
             diag.help("try an outer attribute: `#[macro_use]`");
         }
@@ -87,6 +83,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
     items.sort_by_key(|(key, _)| *key);
     bodies.sort_by_key(|(key, _)| *key);
     found.extend(items.into_iter().map(|(_, it)| it));
+    drop(checker);
     let useless: Vec<target::Attribute> = walked.attrs.into_iter().map(|it| it.attr).collect();
     found.extend(target::useless(cx, &useless));
     found.extend(bodies.into_iter().map(|(_, it)| it));
@@ -138,7 +135,7 @@ impl Checker<'_, '_, '_> {
                 if self.unstable(used).is_some() {
                     let depr = Deprecation { since: Since::Unspecified, note: Some(message), suggestion: None };
                     let main = &self.walked.uses[main];
-                    found.extend(self.deprecated(used.def, &depr, main.span, None, main.at));
+                    found.extend(self.deprecated(used.def, &depr, main.span, None, main.at, main.phase));
                 }
                 return found;
             }
@@ -151,7 +148,7 @@ impl Checker<'_, '_, '_> {
             let skip = parent.as_ref().is_some_and(|it| it.same_origin(&entry));
             if !skip || entry.depr.is_since_rustc_version() {
                 let suggestion = used.expr.then_some(used.span);
-                found.extend(self.deprecated(used.def, &entry.depr, used.span, suggestion, used.at));
+                found.extend(self.deprecated(used.def, &entry.depr, used.span, suggestion, used.at, used.phase));
             }
         }
         let unstable = self.unstable(used);
@@ -216,6 +213,7 @@ impl Checker<'_, '_, '_> {
         span: InFile<TextRange>,
         suggestion: Option<InFile<TextRange>>,
         at: InFile<SyntaxNodePtr>,
+        phase: Phase,
     ) -> Option<Found> {
         let cx = self.cx;
         let kind = def.descr(cx.db);
@@ -223,10 +221,6 @@ impl Checker<'_, '_, '_> {
         let mut diag = deprecation_diag(cx, depr, kind, &path, span, suggestion);
         diag.fact_opt(self.definition_fact(def), format!("the attributes of `{path}`"));
         source_fact(cx, &mut diag, at);
-        let phase = match self.walked.uses.iter().find(|it| it.at == at && it.span == span) {
-            Some(it) => it.phase,
-            None => Phase::Items,
-        };
         Some(Found::lint(diag, phase, at))
     }
 

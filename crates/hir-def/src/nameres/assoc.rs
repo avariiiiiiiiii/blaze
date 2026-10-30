@@ -197,7 +197,6 @@ impl<'db> AssocItemCollector<'db> {
                     self.module_id,
                     InFile::new(self.file_id, ast_id.erase()),
                     cfg.0,
-                    self.cfg_options.clone(),
                 ));
                 return;
             }
@@ -228,7 +227,7 @@ impl<'db> AssocItemCollector<'db> {
                             self.diagnostics.push(DefDiagnostic::macro_error(
                                 self.module_id,
                                 ast_id,
-                                *attr.path,
+                                ModPath::clone(&attr.path),
                                 err,
                             ));
                             continue 'attrs;
@@ -248,7 +247,7 @@ impl<'db> AssocItemCollector<'db> {
                             attr_args: None,
                             censored_attr_ids: AttrMacroAttrIds::from_one(attr_id),
                         },
-                        *attr.path,
+                        ModPath::clone(&attr.path),
                     ));
                 }
             }

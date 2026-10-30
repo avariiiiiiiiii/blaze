@@ -114,9 +114,18 @@ have no locks.
    (deref it for `&[u8]`), and `list` is a borrowed iterator. blaze-vfs has no lock left.
    Two follow-ups are outside these paths: items 8 and 9.
 
+   **Superseded (2026-10-29, by speed-runtime-vfs; see the section at the end).** One shared
+   store replaces the `Publisher`'s copy. Reclamation is `blaze_reclaim` inside the crate, so
+   `unsafe fn Vfs::reclaim` is gone. The read path still takes no lock. The one lock left,
+   `store::Shared::retired` (`Mutex<Limbo>`), is taken only by the single writer, never by a
+   reader, and its comment says so, as concurrency.md asks of a needed lock.
+
 > applied: by lane vfs itself (`crates/blaze-vfs/src/reader.rs`, as its note says); 8 and 9 are the follow-ups.
 
 ## 8. db: hold a view's bytes as lent, not as an `Arc`
+
+**Changed shape** (see the speed-runtime-vfs section): borrowed reads are `Reader::pin()`'s
+`Pinned`, and the trait's `file` keeps its one count until db reads through `Pinned`.
 
 What: `blaze_query::Tree::file` returns borrowed bytes, and `InputData::File` keeps the
 borrow rather than an `Arc<[u8]>`.
@@ -132,6 +141,8 @@ drops its `Mutex`, banned in blaze-query by concurrency.md.
 > forwarded to db: `blaze_query::Tree` and `InputData` (`crates/blaze-query/`) are lane db's; it waits on item 7, also db's.
 
 ## 9. daemon (core/integration): call `Vfs::reclaim` at quiescence
+
+**Withdrawn**: blaze-vfs reclaims through `blaze_reclaim` itself; there is nothing to call.
 
 What: once every worker has passed a task boundary after a `Vfs::collect` (or any change, for
 grown levels), the daemon calls `unsafe { vfs.reclaim() }`.
@@ -204,3 +215,10 @@ The exact edits for `docs/v2-vfs.md` (this lane's), so it stays true:
 3. In "## The disk as input", replace "Every path in it is stat-ed, and each file is then
    read." with "Every path in it is stat-ed and read at once (one round trip); the read
    counts only if the stat says a file."
+
+**Applied by vfs (2026-10-29, 18:08):** the three `docs/v2-vfs.md` edits, word for word.
+Items 8 and 9 and the lock-audit note above are marked to match. I checked the claims against
+the tree (`store.rs`, `Pinned`, `blaze_reclaim`, no `Publisher`), but didn't build or run.
+
+> forwarded to coordinator: lane vfs is DONE and `docs/v2-vfs.md` is not in `crates.md`'s lane paths, so it is the coordinator's; the three edits are exact. Item 9's withdrawal is noted.
+

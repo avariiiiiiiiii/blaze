@@ -34,6 +34,8 @@ send on a channel."
 
 Why: `docs-say-what-they-are`; the change is in `crates/blaze-web/src/lib.rs` (`State::flush`).
 
+> forwarded to coordinator: `docs/web.md` is the coordinator's, not among the paths `requests` applies.
+
 ## 2. `blaze-protocol`: encode into a buffer the caller has (speed-link-edge-wire)
 
 What: in `crates/blaze-protocol/src/cbor/ser.rs`, beside `to_vec`, and exported from
@@ -58,3 +60,5 @@ Why: blaze-web encodes each record once, straight into the buffer it is kept or 
 With only `to_vec`, each record costs one more allocation and one more copy of its bytes. Once
 `append` exists, those three calls become `blaze_protocol::cbor::append(&mut buffer, record)`
 (the kept one writes its length prefix after, into a reserved 4 bytes).
+
+> forwarded to speed: speed-link-edge-wire's.

@@ -96,6 +96,31 @@ hooks.
     A foreground request preempts all of it at once. `blaze build` outputs stay whole,
     ahead-of-time and byte-identical; tiering applies only to processes the daemon runs.
 
+15. **Profiles follow a function across versions.** Profiles are keyed by identity, not by
+    code hash:
+    - **Identity:** crate, module path and name; for a method, the impl's self type and trait;
+      for an instance, that plus its type arguments by identity. Renames and moves keep it,
+      through lane items' rename and move tracking.
+    - **Version chain:** each identity keeps its chain of code hashes, with each version's
+      profile (call and loop counts, branch weights, tier reached).
+
+    What that gives:
+    - **An edited function starts at its old tier.** Its new version inherits its
+      predecessor's hotness, and idle cores compile it straight to the tier the old version
+      reached, before the next test runs.
+    - **Branch weights carry over.** They map onto the new code by aligning basic blocks:
+      unchanged blocks keep their weights, and new ones get weights inferred from flow
+      conservation (stale-profile matching, as LLVM's `-salvage-stale-profile` and BOLT's
+      stale-profile inference do).
+    - **The likely tests are compiled ahead.** Each test's last run recorded the identities it
+      executed. After an edit, the tests that will rerun (change 3) tell the daemon which
+      functions to compile at which tier, hottest first, before anyone asks.
+    - **New functions borrow a guess.** A function with no history takes one from its callers'
+      hotness.
+
+    Profiles only choose tiers and optimizations, never meaning. A wrong guess costs background
+    compile time, and the next run's counters correct it.
+
 ## Make blaze itself faster
 
 11. **Scheduling from history.** Each task's past duration and peak memory, by query kind and

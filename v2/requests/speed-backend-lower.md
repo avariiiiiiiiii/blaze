@@ -32,6 +32,27 @@ list stays a superset.
 
 > forwarded to speed: between speed's children.
 
+## From speed-backend-intrinsics: call `x86_vector` first for those x86 names
+
+Where: the same place, right after the NEON `if` in `llvm_intrinsic`:
+
+```rust
+        if self.x86_vector(name, args, dst)? {
+            return Ok(());
+        }
+```
+
+New signature, in `x86.rs` (mine): `pub(super) fn x86_vector(&mut self, name: &str, args:
+&[Operand], dst: Value) -> Result<bool>`, `name` the whole `x86.sse.min.ps`. False off x86-64
+and for any other name. It takes `x86.{sse,sse2,avx}.{min,max}.{ps,pd}[.256]`, the
+`packsswb`/`packuswb`/`packssdw`/`packusdw` of SSE2, SSE4.1 and AVX2, `pmadd.wd` and
+`pavg.{b,w}` of SSE2 and AVX2 (not the avx512 ones), which today are your scalar arms (about
+17483, 17532, 17619 and `x86_lanewise`). Each 16 bytes becomes 2 loads, the one instruction
+(`minps`, `packsswb`, `pmaddwd`, `pavgb`) and a store; the test
+`x86::tests::each_vector_is_the_instruction_of_sse2` compiles each with Cranelift's x64 ISA of
+SSE2 alone and checks it. Bit-identical to your arms (same instruction definitions). Your arms
+then only see the avx512 names; keep them for those.
+
 ## From speed-backend-intrinsics: FYI, `wasm_simd_intrinsic` now runs on every target
 
 No edit needed. `FunctionCx::wasm_simd_intrinsic` (called first in `intrinsic`) now lowers the

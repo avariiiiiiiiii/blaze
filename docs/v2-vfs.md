@@ -43,15 +43,19 @@ v2 interface; what changed from it is below.
 - **Readers on other threads**: `Vfs::reader` is a cloneable `Send` and `Sync` handle that
   the query database reads as its `blaze_query::Tree` (the impl is in blaze-query, which
   depends on blaze-vfs). It follows docs/v2/plan/design/concurrency.md:
-  - The nodes are in an append-only open-addressed table keyed by the content ID's bits.
-  - A place is published once by a release store of a pointer to an immutable node, and a
-    read is acquire loads: no lock and no count. `file` lends `&Arc<[u8]>`.
-  - The `Vfs` is the only writer. It publishes the nodes each change made, children first,
-    before the call that gives the new root's ID returns.
-  - Growth and collection fill a new level and swap it in with one release store. The old
-    level and the dropped nodes are retired, and freed by `unsafe fn Vfs::reclaim` once
-    every worker has passed a task boundary, or with the last handle.
-  - A node an open view, head or `keep` reaches is never retired.
+  - The tree and every reader share one store: append-only columns in chunks that never move
+    (each node's ID and an 8-byte shape; each directory's entries as a `u32` name, a `u32`
+    node and a mode byte; each file's bytes as one `Arc<[u8]>`) and an open-addressed index
+    keyed by the content ID's bits, grown by adding a level.
+  - The `Vfs` is the only writer. It writes each node, children first, and releases it
+    before anything names it, so a node is readable before the call that gives its ID
+    returns. A read is in a task (`blaze_reclaim::enter`) and is acquire loads: an index
+    probe for the root and a binary search of a name column per component, no lock.
+    `file` returns the bytes' `Arc` with one count; `pin()` gives a `Pinned` that lends
+    them with none.
+  - A collection builds the next table and swaps it in with one release store; the old one
+    is freed once every task that could read it has ended (blaze-reclaim), or with the last
+    handle. A node an open view, head or `keep` reaches is kept.
 
 ## The journal
 
@@ -63,10 +67,10 @@ v2 interface; what changed from it is below.
 - **Compaction**: `collect` drops unreached nodes from memory and, if anything was appended
   since the last rewrite, asks the next flush to replace the whole file in one `Effect::Write`
   with the nodes the heads reach and one record per head. That write is atomic, so a crash
-  leaves the old file or the new. Nothing is appended while it is in flight. A failed one is
-  made again from the state then, which holds every commit recorded since. The rewrite ends
-  with a sequence record, so the numbers of removals it drops are not given out again after
-  recovery.
+  leaves the old file or the new. Nothing is appended while it is in flight. A failed one, or
+  a failed append or sync, is made again as a rewrite from the state then, which holds every
+  commit recorded since. The rewrite ends with a sequence record, so the numbers of removals
+  it drops are not given out again after recovery.
 - Recovery rebuilds the tree and heads, skips damaged stretches, drops a head whose root did
   not survive (falling back to its latest earlier move that did), and cuts a torn tail before
   the first append.
@@ -75,8 +79,9 @@ v2 interface; what changed from it is below.
 
 [`Watcher`](../crates/blaze-vfs/src/watch.rs) is its own state machine with its own tags:
 
-- Each `Done::Changed` is a batch. Every path in it is stat-ed, and each file is then read.
-  Batches commit in the order they were told, so a later read wins.
+- Each `Done::Changed` is a batch. Every path in it is stat-ed and read at once (one round
+  trip); the read counts only if the stat says a file. Batches commit in the order they were
+  told, so a later read wins.
 - Ops are made against the head as it is at commit time: a delete for a path gone, a write for
   a file whose bytes differ (bytes the head has already make nothing, so a file blaze wrote
   is not taken back), a delete of a file where a directory now is, and of any file above a

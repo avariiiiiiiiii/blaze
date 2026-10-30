@@ -95,8 +95,9 @@ pub struct Ran<T> {
 
 /// Runs thread tasks and hands back how each ended.
 pub trait Runner<T>: Send {
-    /// `work` is the batch's, shared: posting costs one reference count, not a closure.
-    fn post(&mut self, id: NodeId, pool: Pool, near: Option<u32>, kind: TaskKind, work: Work<T>, arg: u32);
+    /// `work` is the batch's, shared: posting costs one reference count, not a closure. A
+    /// `critical` task is on its request's critical path: it goes to the fastest cores.
+    fn post(&mut self, task: Posting, work: Work<T>);
     /// Moves the tasks that ended into `out`.
     fn take(&mut self, out: &mut Vec<Ran<T>>);
     /// Whether a task ended and was not taken yet: the loop then polls the driver without
@@ -104,6 +105,17 @@ pub trait Runner<T>: Send {
     fn ready(&self) -> bool;
     /// How many tasks were posted and not taken.
     fn running(&self) -> usize;
+}
+
+/// A thread task as the plane posts it.
+#[derive(Clone, Copy, Debug)]
+pub struct Posting {
+    pub id: NodeId,
+    pub pool: Pool,
+    pub near: Option<u32>,
+    pub critical: bool,
+    pub kind: TaskKind,
+    pub arg: u32,
 }
 
 /// The daemon's: work tasks on the process's worker pool, IO tasks on threads of their own.
@@ -115,10 +127,8 @@ pub struct Threads<T> {
 }
 
 struct IoJob<T> {
-    id: NodeId,
-    kind: TaskKind,
+    task: Posting,
     work: Work<T>,
-    arg: u32,
     done: Sender<Ran<T>>,
 }
 
@@ -140,11 +150,11 @@ impl<T: Send + 'static> Threads<T> {
                         // A task that gave way runs again on this thread: an IO task waits on
                         // the world, not on another task.
                         let (did, peak) = loop {
-                            if let (Some(did), peak) = run_measured(&job.work, job.arg) {
+                            if let (Some(did), peak) = run_measured(&job.work, job.task.arg) {
                                 break (did, peak);
                             }
                         };
-                        _ = job.done.send(Ran { id: job.id, kind: job.kind, did, peak });
+                        _ = job.done.send(Ran { id: job.task.id, kind: job.task.kind, did, peak });
                     }
                 })
                 .unwrap_or_else(|why| panic!("an IO thread of the daemon's plane: {why}"));
@@ -172,35 +182,30 @@ fn panicked(panic: &(dyn std::any::Any + Send)) -> String {
     format!("panicked: {what}")
 }
 
-fn post_work<T: Send + 'static>(
-    id: NodeId,
-    near: Option<u32>,
-    kind: TaskKind,
-    work: Work<T>,
-    arg: u32,
-    done: Sender<Ran<T>>,
-) {
+fn post_work<T: Send + 'static>(task: Posting, work: Work<T>, done: Sender<Ran<T>>) {
     let pool = blaze_graph::exec::shared();
     let again = work.clone();
-    pool.submit(
-        near,
-        move || run_measured(&work, arg),
-        move |result| match result {
-            Ok((Some(did), peak)) => _ = done.send(Ran { id, kind, did, peak }),
-            // Gave way: posted again behind what is ready on the group it ran on.
-            Ok((None, _)) => post_work(id, blaze_graph::pool::group(), kind, again, arg, done),
-            Err(panic) => _ = done.send(Ran { id, kind, did: Err(panicked(&*panic)), peak: 0 }),
-        },
-    );
+    let (id, kind, arg) = (task.id, task.kind, task.arg);
+    let run = move || run_measured(&work, arg);
+    let then = move |result: std::thread::Result<_>| match result {
+        Ok((Some(did), peak)) => _ = done.send(Ran { id, kind, did, peak }),
+        // Gave way: posted again behind what is ready on the group it ran on.
+        Ok((None, _)) => post_work(Posting { near: blaze_graph::pool::group(), ..task }, again, done),
+        Err(panic) => _ = done.send(Ran { id, kind, did: Err(panicked(&*panic)), peak: 0 }),
+    };
+    match task.critical {
+        true => pool.submit_critical(task.near, run, then),
+        false => pool.submit(task.near, run, then),
+    }
 }
 
 impl<T: Send + 'static> Runner<T> for Threads<T> {
-    fn post(&mut self, id: NodeId, pool: Pool, near: Option<u32>, kind: TaskKind, work: Work<T>, arg: u32) {
+    fn post(&mut self, task: Posting, work: Work<T>) {
         self.running += 1;
-        match pool {
-            Pool::Work => post_work(id, near, kind, work, arg, self.done_tx.clone()),
+        match task.pool {
+            Pool::Work => post_work(task, work, self.done_tx.clone()),
             Pool::Io => {
-                let job = IoJob { id, kind, work, arg, done: self.done_tx.clone() };
+                let job = IoJob { task, work, done: self.done_tx.clone() };
                 // The IO threads hold the receiver for as long as the process lives.
                 _ = self.io.send(job);
             }
@@ -232,7 +237,7 @@ pub struct Inline<T> {
     posted: Vec<Posted<T>>,
 }
 
-type Posted<T> = (NodeId, TaskKind, Work<T>, u32);
+type Posted<T> = (Posting, Work<T>);
 
 impl<T> Inline<T> {
     pub fn new(seed: u64) -> Inline<T> {

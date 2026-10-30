@@ -272,7 +272,8 @@ fn unknown(
     } else {
         let candidates: Vec<&str> = KNOWN.iter().zip(enabled).filter(|(_, on)| **on).map(|((it, _), _)| *it).collect();
         if let Some(typo) = find_best_match_for_name(&candidates, name, None) {
-            diag.suggestion_verbose(span, "an attribute with a similar name exists", typo, Applicability::MachineApplicable);
+            let message = "an attribute with a similar name exists";
+            diag.suggestion_verbose(span, message, typo, Applicability::MachineApplicable);
         }
     }
     source_fact(cx, &mut diag, owner.at());
@@ -376,7 +377,8 @@ fn check(sink: &mut Sink<'_, '_, '_>, state: State) {
                 "the `diagnostic::on_const` attribute can only be applied to non-const trait implementations",
                 sink.cx.span(*path_range),
             );
-            diag.span_label(sink.cx.span(InFile::new(owner.node.file_id, def_range(node))), "this is a const trait implementation");
+            let item_span = sink.cx.span(InFile::new(owner.node.file_id, def_range(node)));
+            diag.span_label(item_span, "this is a const trait implementation");
             sink.checked(diag);
         }
     }

@@ -105,9 +105,12 @@ sorted column (Eytzinger order pays only once the column is out of L2).
   `write_spans` and `Display` read the anchors in text order, and a file's few thousand
   anchors (under 16 KB) stay in L1 while its tokens are mapped. `Debug` prints what it printed
   before.
-- A cursor that remembers the last anchor (tokens are mapped in order) would save the search.
-  It needs `syntax_bridge::SpanMapper::span_for` to take state, which is `speed-span-tt`'s, and
-  the gain is a few compares per token. It waits for the profile.
+- Cursor (asked for by speed-hir-expand): `span_for_range_from(range, hint: &mut u32)` gives
+  exactly `span_for_range`'s span. It searches forward from the anchor `hint` names in steps of
+  1, 2, 4, ... then binary-searches the last step, or binary-searches what is before `hint`, and
+  stores the anchor it found. Tokens mapped in order cost two compares each while they stay in
+  one anchor or move to the next, and `O(log d)` for a jump of `d` anchors. The hint lives with
+  the caller (a `Cell<u32>` in hir-expand's mapper), so `SpanMapper::span_for` keeps `&self`.
 
 **`SpanMap`** (one per expansion; `span_at` for every token mapped back).
 - Before: `Vec<(TextSize, Span)>`, 24 bytes per span. The binary search strode 24 bytes, so
@@ -118,6 +121,20 @@ sorted column (Eytzinger order pays only once the column is out of L2).
   the same order, because the three runs (kept, inserted, shifted) are already sorted. The
   fragment lists no longer build a temporary `Vec`. `Debug` prints the same `spans: [(end,
   span), ..]` as before.
+- `span_at_from(offset, hint: &mut u32)`: the same cursor over `ends`, giving exactly
+  `span_at`'s span. `with_capacity(n)` lets `token_tree_to_syntax_node` size both columns once.
+- Down-mapping (`ranges_with_span_exact`, `ranges_with_span`) scanned every span. Now
+  `by_anchor` holds the piece numbers sorted by (file, ast id, start, end, number), 4 bytes per
+  piece. It is built under a `OnceLock` on the first down-mapping (`O(n log n)` once, then one
+  acquire load), and `push` and `merge` drop it, so it can't go stale. It is not part of Eq,
+  Hash or Debug. An exact lookup is a binary search plus the run of equal keys, which is
+  already in text order. A containing lookup bounds the pieces with the same anchor that start
+  at or before the span with two binary searches, keeps those that end at or after it, and
+  sorts them back into text order: `O(log n + c log c)` and one allocation. Both return what
+  the scan returned, in the same order.
+- The `SpanMapDropper` and `AstIdMapDropper` threads are gone. They cost an mpsc send on every
+  drop (a shared write) to defer a handful of frees, and both maps are now a few boxed
+  columns. Both maps free in place.
 - Not matched: rustc's 8-byte span. A `Span` here is 20 bytes (range 8, anchor 8, context 4),
   because it is relative to an anchor (file and ast id) rather than absolute. `tt` already keeps
   its spans compressed. To match, `SpanMap` would keep per expansion a table of distinct anchors
@@ -183,5 +200,10 @@ and nothing is copied per element. Nothing to change. The host that writes the a
     are equal, and equal maps hash the same.
   - `expansion_maps_agree_with_the_pairs`: the old `Vec<(TextSize, Span)>` layout kept as a
     model. Its `span_at`, `spans_for_range`, `ranges_with_span(_exact)`, `iter` and `merge` are
-    compared, through 8 merges each.
+    compared, through 8 merges each, with `span_at_from` (in order, from random hints, in random
+    order) and down-mapping of absent spans; the down-mapping index is rebuilt after each merge.
+  - `a_search_from_any_hint_is_a_binary_search`: the galloping search against `partition_point`
+    for every key, every hint (including past the end) and arrays of 0 to 39 keys.
+  - `a_cursor_gives_the_spans_a_search_does`: `span_for_range_from` against `span_for_range`,
+    walking in order, from random hints and in random order with a `u32::MAX` start.
   - `expansion_maps_are_equal_when_their_pairs_are`: the same Eq/Hash check for expansion maps.

@@ -10,6 +10,11 @@
 //!   committed everything it was told before it. Only then does the session see it.
 //! - A checkout whose directory can't be read, or whose watch ended, fails the requests waiting
 //!   on it, naming it; the next request watches it again.
+//!
+//! A checkout is a slot, its watcher's tags `watchers + slot * 2^32`, so a completion finds its
+//! checkout by one shift; a head's name is looked up once, as a request arrives. A batch of
+//! changes costs one pass over its files: each is matched against the checkout's cookie prefix
+//! and filtered in place, nothing allocated per file.
 
 use std::collections::BTreeMap;
 
@@ -17,6 +22,7 @@ use blaze_api::{ApiError, Arrived, Reply, Request, RequestRef, Response, ViewRef
 use blaze_core::{Completion, Conn, Done, Effect, FileName, Tag};
 use blaze_ids::ContentId;
 use blaze_vfs::{Vfs, Watched, Watcher};
+use rustc_hash::FxHashMap;
 
 /// How many tags one watcher uses ([`Watcher::new`]).
 const WATCHER_TAGS: u64 = 1 << 32;
@@ -34,14 +40,19 @@ pub enum Out {
 struct Held {
     from: RequestRef,
     request: Request,
-    /// Each checkout it names, and the cookie it waits for there.
-    waits: Vec<(String, u64)>,
+    /// Each checkout it names, by slot, and the cookie it waits for there.
+    waits: Vec<(u32, u64)>,
 }
 
 struct Checkout {
+    head: String,
     watcher: Watcher,
-    /// The checkout's directory under the driver's root.
-    dir: FileName,
+    /// Its directory under the driver's root, then `/`: what its files' paths start with.
+    below: String,
+    /// `<dir>/target`, where its cookies are.
+    cookie_dir: String,
+    /// `<dir>/target/.blaze-cookie-<pid>-`: a cookie's path is this and its number.
+    cookie_prefix: String,
     /// Cookies written or being written and not seen yet, by number.
     cookies: BTreeMap<u64, Cookie>,
 }
@@ -55,14 +66,17 @@ struct Cookie {
 pub struct Heads {
     /// The cookies' writes and removes: `tags..tags + 2^32`.
     tags: u64,
-    /// The first tag of the next watcher's range.
-    next_watcher: u64,
+    /// The first tag of slot 0's watcher.
+    watchers: u64,
     /// The last tag of every watcher's range.
     watcher_end: u64,
     next_cookie: u64,
-    checkouts: BTreeMap<String, Checkout>,
-    /// By cookie tag: the checkout and the cookie.
-    writing: BTreeMap<Tag, (String, u64)>,
+    /// By slot; a slot whose watch ended stays empty, its tags never used again.
+    checkouts: Vec<Option<Box<Checkout>>>,
+    /// The slot of each checkout watched, by its head.
+    slots: FxHashMap<String, u32>,
+    /// By cookie tag: the checkout's slot and the cookie.
+    writing: FxHashMap<Tag, (u32, u64)>,
     held: Vec<Held>,
 }
 
@@ -72,9 +86,9 @@ pub fn is_checkout(head: &str) -> bool {
 }
 
 /// The checkout heads `view` names.
-fn view_heads(view: &ViewRef, out: &mut Vec<String>) {
+fn view_heads<'a>(view: &'a ViewRef, out: &mut Vec<&'a str>) {
     match view {
-        ViewRef::Head(head) if is_checkout(head) => out.push(head.clone()),
+        ViewRef::Head(head) if is_checkout(head) => out.push(head),
         ViewRef::Head(_) | ViewRef::Root(_) => {}
         ViewRef::WhatIf { base, .. } => view_heads(base, out),
     }
@@ -82,7 +96,7 @@ fn view_heads(view: &ViewRef, out: &mut Vec<String>) {
 
 /// The checkout heads `request` reads. A commit names a head to move, not to read: it waits for
 /// nothing.
-pub fn named(request: &Request) -> Vec<String> {
+pub fn named(request: &Request) -> Vec<&str> {
     let mut heads = Vec::new();
     match request {
         Request::Check { view, .. }
@@ -110,7 +124,20 @@ pub fn named(request: &Request) -> Vec<String> {
 /// Whether the file at `rel` of a checkout is out of its view: the build's `target/` at the
 /// root and every `.git`.
 pub fn excluded(rel: &str) -> bool {
-    rel == "target" || rel.starts_with("target/") || rel.split('/').any(|part| part == ".git")
+    rel.strip_prefix("target").is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        || (rel.contains(".git") && rel.split('/').any(|part| part == ".git"))
+}
+
+/// Whether `dir` is `at` or under it.
+fn within(dir: &str, at: &str) -> bool {
+    dir.strip_prefix(at).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+impl Checkout {
+    /// Whether `file` is in the view: outside the checkout, or not [`excluded`].
+    fn keeps(&self, file: &FileName) -> bool {
+        file.as_str().strip_prefix(self.below.as_str()).is_none_or(|rel| !excluded(rel))
+    }
 }
 
 impl Heads {
@@ -119,22 +146,33 @@ impl Heads {
     pub fn new(tags: u64, watchers: u64, watchers_end: u64) -> Heads {
         Heads {
             tags,
-            next_watcher: watchers,
+            watchers,
             watcher_end: watchers_end,
             next_cookie: 0,
-            checkouts: BTreeMap::new(),
-            writing: BTreeMap::new(),
+            checkouts: Vec::new(),
+            slots: FxHashMap::default(),
+            writing: FxHashMap::default(),
             held: Vec::new(),
         }
     }
 
     pub fn owns(&self, tag: Tag) -> bool {
-        tag.0.wrapping_sub(self.tags) < 1 << 32 || self.checkouts.values().any(|it| it.watcher.owns(tag))
+        tag.0.wrapping_sub(self.tags) < 1 << 32 || (tag.0 >= self.watchers && tag.0 < self.watcher_end)
+    }
+
+    /// The checkout's slot a watcher's tag is of.
+    fn slot_of(&self, tag: Tag) -> Option<u32> {
+        let slot = tag.0.checked_sub(self.watchers)? / WATCHER_TAGS;
+        u32::try_from(slot).ok()
+    }
+
+    fn checkout(&self, slot: u32) -> Option<&Checkout> {
+        self.checkouts.get(slot as usize)?.as_deref()
     }
 
     /// The checkout whose head is at `root`, if one is: where an agent's build of it is placed.
     pub fn path_of(&self, vfs: &Vfs, root: ContentId) -> Option<String> {
-        self.checkouts.keys().find(|head| vfs.head(head) == Some(root)).cloned()
+        self.slots.keys().find(|head| vfs.head(head) == Some(root)).cloned()
     }
 
     /// How many requests wait for a watcher.
@@ -176,8 +214,8 @@ impl Heads {
         }
         let mut waits = Vec::with_capacity(heads.len());
         for head in heads {
-            match self.cookie(&head, effects) {
-                Ok(cookie) => waits.push((head, cookie)),
+            match self.cookie(head, effects) {
+                Ok(wait) => waits.push(wait),
                 Err(error) => {
                     answer(out, from, Some(error), false);
                     return;
@@ -187,35 +225,57 @@ impl Heads {
         self.held.push(Held { from, request, waits });
     }
 
-    /// A cookie written into `head`'s checkout, its watcher started first if it has none.
-    fn cookie(&mut self, head: &str, effects: &mut Vec<Effect>) -> Result<u64, ApiError> {
-        if !self.checkouts.contains_key(head) {
-            let path = head.trim_end_matches('/');
-            let Some(dir) = FileName::new(path.trim_start_matches('/')) else {
-                return Err(ApiError::new(
-                    format!("the head `{head}` names no directory a checkout can be in"),
-                    Some(head.to_owned()),
-                ));
-            };
-            assert!(
-                self.next_watcher < self.watcher_end,
-                "the daemon has watched 2^32 checkouts and has no tags for another"
-            );
-            let mut watcher = Watcher::new(head, dir.clone(), self.next_watcher);
-            self.next_watcher += WATCHER_TAGS;
-            watcher.start(effects);
-            self.checkouts.insert(head.to_owned(), Checkout { watcher, dir, cookies: BTreeMap::new() });
-        }
-        let checkout = self.checkouts.get_mut(head).expect("a checkout just watched");
+    /// A cookie written into `head`'s checkout, its watcher started first if it has none: the
+    /// checkout's slot and the cookie's number.
+    fn cookie(&mut self, head: &str, effects: &mut Vec<Effect>) -> Result<(u32, u64), ApiError> {
+        let slot = match self.slots.get(head) {
+            Some(&slot) => slot,
+            None => self.watch(head, effects)?,
+        };
+        let checkout = self.checkouts[slot as usize].as_deref_mut().expect("a slot named is watched");
         let number = self.next_cookie;
         self.next_cookie += 1;
-        let file = FileName::new(&format!("{}/target/.blaze-cookie-{}-{number}", checkout.dir, std::process::id()))
-            .expect("a cookie's name is a name");
+        let mut path = String::with_capacity(checkout.cookie_prefix.len() + 20);
+        path.push_str(&checkout.cookie_prefix);
+        path.push_str(itoa(number, &mut [0; 20]));
+        let file = FileName::new(&path).expect("a cookie's name is a name");
         let tag = Tag(self.tags + (number % (1 << 31)) * 2);
-        self.writing.insert(tag, (head.to_owned(), number));
-        effects.push(Effect::Write { file: file.clone(), bytes: format!("{number}\n").into_bytes(), tag });
+        self.writing.insert(tag, (slot, number));
+        path.clear();
+        path.push_str(itoa(number, &mut [0; 20]));
+        path.push('\n');
+        effects.push(Effect::Write { file: file.clone(), bytes: path.into_bytes(), tag });
         checkout.cookies.insert(number, Cookie { file, written: false, seen: false });
-        Ok(number)
+        Ok((slot, number))
+    }
+
+    /// Starts watching `head`'s checkout in a new slot.
+    fn watch(&mut self, head: &str, effects: &mut Vec<Effect>) -> Result<u32, ApiError> {
+        let path = head.trim_end_matches('/');
+        let Some(dir) = FileName::new(path.trim_start_matches('/')) else {
+            return Err(ApiError::new(
+                format!("the head `{head}` names no directory a checkout can be in"),
+                Some(head.to_owned()),
+            ));
+        };
+        let slot = u32::try_from(self.checkouts.len()).expect("under 2^32 checkouts");
+        let tags = self.watchers + u64::from(slot) * WATCHER_TAGS;
+        assert!(tags < self.watcher_end, "the daemon has watched every checkout its tags allow");
+        let mut watcher = Watcher::new(head, dir.clone(), tags);
+        watcher.start(effects);
+        let cookie_dir = format!("{dir}/target");
+        let cookie_prefix = format!("{cookie_dir}/.blaze-cookie-{}-", std::process::id());
+        let checkout = Checkout {
+            head: head.to_owned(),
+            watcher,
+            below: format!("{dir}/"),
+            cookie_dir,
+            cookie_prefix,
+            cookies: BTreeMap::new(),
+        };
+        self.checkouts.push(Some(Box::new(checkout)));
+        self.slots.insert(head.to_owned(), slot);
+        Ok(slot)
     }
 
     /// Takes a completion of its own; what was held and is now caught up goes on.
@@ -230,8 +290,8 @@ impl Heads {
 
     fn cookie_done(&mut self, completion: Completion, out: &mut Vec<Out>) {
         // Odd tags are the removes of cookies seen: nothing waits for them.
-        let Some((head, number)) = self.writing.remove(&completion.tag) else { return };
-        let Some(checkout) = self.checkouts.get_mut(&head) else { return };
+        let Some((slot, number)) = self.writing.remove(&completion.tag) else { return };
+        let Some(checkout) = self.checkouts.get_mut(slot as usize).and_then(Option::as_deref_mut) else { return };
         match completion.done {
             Done::Written => {
                 if let Some(cookie) = checkout.cookies.get_mut(&number) {
@@ -245,43 +305,50 @@ impl Heads {
                     other => format!("the driver answered {other:?}"),
                 };
                 let what = format!(
-                    "writing the cookie {} that shows the watcher of {head} has caught up: {why}",
-                    file.map_or_else(String::new, |it| format!("/{it}"))
+                    "writing the cookie {} that shows the watcher of {} has caught up: {why}",
+                    file.map_or_else(String::new, |it| format!("/{it}")),
+                    checkout.head,
                 );
-                self.fail_waiting(|it| it.0 == head && it.1 == number, &what, &head, out);
+                let head = checkout.head.clone();
+                self.fail_waiting(|it| *it == (slot, number), &what, &head, out);
             }
         }
     }
 
     fn watched(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>, out: &mut Vec<Out>) {
-        let Some((head, checkout)) =
-            self.checkouts.iter_mut().find(|(_, it)| it.watcher.owns(completion.tag))
-        else {
-            return;
-        };
-        let head = head.clone();
-        let below = format!("{}/", checkout.dir);
-        let rel = |file: &FileName| file.as_str().strip_prefix(&below).map(str::to_owned);
+        let Some(slot) = self.slot_of(completion.tag) else { return };
+        let Some(checkout) = self.checkouts.get_mut(slot as usize).and_then(Option::as_deref_mut) else { return };
         let done = match completion.done {
-            Done::Changed { files, lost } => {
-                for cookie in checkout.cookies.values_mut() {
-                    let told = files.iter().any(|it| {
-                        cookie.file == *it
-                            || cookie.file.as_str().strip_prefix(it.as_str()).is_some_and(|rest| rest.starts_with('/'))
-                    });
-                    if told || (lost && cookie.written) {
-                        cookie.seen = true;
+            Done::Changed { mut files, lost } => {
+                // A directory reported for what changed in it tells every cookie in it.
+                let mut told = false;
+                for file in &files {
+                    let file = file.as_str();
+                    match file.strip_prefix(checkout.cookie_prefix.as_str()).and_then(|it| it.parse::<u64>().ok()) {
+                        Some(number) => {
+                            if let Some(cookie) = checkout.cookies.get_mut(&number) {
+                                cookie.seen = true;
+                            }
+                        }
+                        None => told |= within(&checkout.cookie_dir, file),
                     }
                 }
-                let files = files.into_iter().filter(|it| rel(it).is_none_or(|rel| !excluded(&rel))).collect();
+                if told || lost {
+                    for cookie in checkout.cookies.values_mut() {
+                        cookie.seen |= told || cookie.written;
+                    }
+                }
+                files.retain(|it| checkout.keeps(it));
                 Done::Changed { files, lost }
             }
-            Done::Listed(listed) => {
-                Done::Listed(listed.into_iter().filter(|(it, _)| rel(it).is_none_or(|rel| !excluded(&rel))).collect())
+            Done::Listed(mut listed) => {
+                listed.retain(|(it, _)| checkout.keeps(it));
+                Done::Listed(listed)
             }
             done => done,
         };
         let watched = checkout.watcher.complete(vfs, Completion { tag: completion.tag, done }, effects);
+        let head = &checkout.head;
         let mut ended = None;
         for it in watched {
             match it {
@@ -303,57 +370,53 @@ impl Heads {
                 }
             }
         }
-        if let Some(what) = ended {
-            if let Some(mut gone) = self.checkouts.remove(&head) {
-                gone.watcher.stop(effects);
-            }
-            self.writing.retain(|_, it| it.0 != head);
-            self.fail_waiting(|it| it.0 == head, &what, &head, out);
+        if let Some(what) = ended
+            && let Some(mut gone) = self.checkouts[slot as usize].take()
+        {
+            gone.watcher.stop(effects);
+            self.slots.remove(&gone.head);
+            self.writing.retain(|_, it| it.0 != slot);
+            self.fail_waiting(|it| it.0 == slot, &what, &gone.head, out);
         }
     }
 
     /// Fails every held request with a wait `matches` says, naming `what`.
-    fn fail_waiting(&mut self, matches: impl Fn(&(String, u64)) -> bool, what: &str, head: &str, out: &mut Vec<Out>) {
-        let (failed, kept): (Vec<Held>, Vec<Held>) =
-            std::mem::take(&mut self.held).into_iter().partition(|it| it.waits.iter().any(&matches));
-        self.held = kept;
-        for held in failed {
+    fn fail_waiting(&mut self, matches: impl Fn(&(u32, u64)) -> bool, what: &str, head: &str, out: &mut Vec<Out>) {
+        for held in self.held.extract_if(.., |it| it.waits.iter().any(&matches)) {
             answer(out, held.from, Some(ApiError::new(what, Some(head.to_owned()))), false);
         }
     }
 
     /// Hands on every held request whose every checkout has seen its cookie and committed what
-    /// it was told before, oldest first, and removes the cookies no request waits for.
+    /// it was told before, oldest first.
     fn release(&mut self, out: &mut Vec<Out>) {
         let checkouts = &self.checkouts;
-        let caught_up = |(head, number): &(String, u64)| {
-            checkouts.get(head).is_some_and(|it| {
+        let caught_up = |(slot, number): &(u32, u64)| {
+            checkouts.get(*slot as usize).and_then(Option::as_deref).is_some_and(|it| {
                 it.watcher.idle() && it.cookies.get(number).is_some_and(|cookie| cookie.seen)
             })
         };
-        let (ready, waiting): (Vec<Held>, Vec<Held>) =
-            std::mem::take(&mut self.held).into_iter().partition(|it| it.waits.iter().all(caught_up));
-        self.held = waiting;
-        for held in ready {
+        for held in self.held.extract_if(.., |it| it.waits.iter().all(&caught_up)) {
             out.push(Out::Pass(Arrived::Request { from: held.from, request: held.request }));
         }
     }
 
     /// Removes the cookies seen that no held request waits for.
     pub fn sweep(&mut self, effects: &mut Vec<Effect>) {
-        let held = &self.held;
-        for (head, checkout) in &mut self.checkouts {
-            let done: Vec<u64> = checkout
-                .cookies
-                .iter()
-                .filter(|(number, cookie)| {
-                    cookie.seen && !held.iter().any(|it| it.waits.iter().any(|(h, n)| h == head && n == *number))
-                })
-                .map(|(number, _)| *number)
-                .collect();
-            for number in done {
+        let (held, tags) = (&self.held, self.tags);
+        let mut swept = Vec::new();
+        for (slot, checkout) in (0u32..).zip(&mut self.checkouts) {
+            let Some(checkout) = checkout.as_deref_mut() else { continue };
+            swept.extend(
+                checkout
+                    .cookies
+                    .iter()
+                    .filter(|(number, cookie)| cookie.seen && !held.iter().any(|it| it.waits.contains(&(slot, **number))))
+                    .map(|(number, _)| *number),
+            );
+            for number in swept.drain(..) {
                 let cookie = checkout.cookies.remove(&number).expect("a cookie just found");
-                let tag = Tag(self.tags + (number % (1 << 31)) * 2 + 1);
+                let tag = Tag(tags + (number % (1 << 31)) * 2 + 1);
                 effects.push(Effect::Remove { file: cookie.file, tag });
             }
         }
@@ -361,7 +424,7 @@ impl Heads {
 
     /// Stops every watch.
     pub fn stop(&mut self, effects: &mut Vec<Effect>) {
-        for checkout in self.checkouts.values_mut() {
+        for checkout in self.checkouts.iter_mut().flatten() {
             checkout.watcher.stop(effects);
         }
     }
@@ -370,6 +433,20 @@ impl Heads {
     pub fn of(&self, conn: Conn) -> impl Iterator<Item = RequestRef> + '_ {
         self.held.iter().filter(move |it| it.from.conn == conn).map(|it| it.from)
     }
+}
+
+/// `number` in decimal, written into `buf`.
+fn itoa(mut number: u64, buf: &mut [u8; 20]) -> &str {
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (number % 10) as u8;
+        number /= 10;
+        if number == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&buf[at..]).expect("digits are UTF-8")
 }
 
 fn answer(out: &mut Vec<Out>, to: RequestRef, error: Option<ApiError>, ok: bool) {
@@ -390,8 +467,25 @@ mod tests {
         assert!(excluded(".git/HEAD"));
         assert!(excluded("vendor/x/.git/config"));
         assert!(!excluded("src/target.rs"));
+        assert!(!excluded("targets/a.rs"));
         assert!(!excluded("crates/target/src/lib.rs"));
         assert!(!excluded(".cargo/config.toml"));
+        assert!(!excluded("src/.gitignore.rs"));
+    }
+
+    #[test]
+    fn a_cookie_dir_is_within_what_contains_it() {
+        assert!(within("w/target", "w/target"));
+        assert!(within("w/target", "w"));
+        assert!(!within("w/target", "w/tar"));
+        assert!(!within("w/target", "w/target/x"));
+    }
+
+    #[test]
+    fn numbers_are_written_in_decimal() {
+        for number in [0, 7, 10, 1234567890, u64::MAX] {
+            assert_eq!(itoa(number, &mut [0; 20]), number.to_string());
+        }
     }
 
     #[test]
@@ -407,15 +501,15 @@ mod tests {
             cargo: None,
         };
         let build = Request::Build { view: head("/w"), targets: targets.clone() };
-        assert_eq!(named(&build), vec!["/w".to_owned()]);
+        assert_eq!(named(&build), vec!["/w"]);
         let what_if = Request::Check {
             view: ViewRef::WhatIf { base: Box::new(head("/w")), ops: Vec::new() },
             targets: targets.clone(),
         };
-        assert_eq!(named(&what_if), vec!["/w".to_owned()]);
+        assert_eq!(named(&what_if), vec!["/w"]);
         assert!(named(&Request::Build { view: head("ci/main"), targets }).is_empty());
         assert!(named(&Request::Status).is_empty());
         let diff = Request::Diff { from: head("/w"), to: head("/w") };
-        assert_eq!(named(&diff), vec!["/w".to_owned()]);
+        assert_eq!(named(&diff), vec!["/w"]);
     }
 }

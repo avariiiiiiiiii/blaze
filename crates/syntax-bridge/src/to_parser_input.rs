@@ -33,8 +33,18 @@ fn convert(
 
     let mut current = buffer.cursor();
     let mut syntax_context_to_edition_cache = FxHashMap::default();
-    let mut ctx_edition =
-        |ctx| *syntax_context_to_edition_cache.entry(ctx).or_insert_with(|| span_to_edition(ctx));
+    let mut last: Option<(SyntaxContext, Edition)> = None;
+    let mut ctx_edition = |ctx: SyntaxContext| {
+        if let Some((last_ctx, edition)) = last
+            && last_ctx == ctx
+        {
+            return edition;
+        }
+        let edition =
+            *syntax_context_to_edition_cache.entry(ctx).or_insert_with(|| span_to_edition(ctx));
+        last = Some((ctx, edition));
+        edition
+    };
 
     while !current.eof() {
         if let Some(at) = fragment_at

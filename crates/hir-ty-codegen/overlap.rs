@@ -225,3 +225,244 @@ fn slot_mut(inst: &mut InstructionData) -> Option<&mut ir::StackSlot> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use cranelift_codegen::ir::{
+        InstBuilder, StackSlotData, StackSlotKind,
+        types::{I32, I64},
+    };
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use rustc_hash::FxHashSet;
+
+    use super::*;
+
+    /// [`escaping`] as it was, with hash maps.
+    fn escaping_model(func: &ir::Function) -> FxHashSet<ir::StackSlot> {
+        let dfg = &func.dfg;
+        let mut of: FxHashMap<ir::Value, ir::StackSlot> = FxHashMap::default();
+        loop {
+            let known = of.len();
+            for block in func.layout.blocks() {
+                for inst in func.layout.block_insts(block) {
+                    let slot = match dfg.insts[inst] {
+                        InstructionData::StackAddr { stack_slot, .. } => Some(stack_slot),
+                        InstructionData::Binary { opcode: ir::Opcode::Iadd, args } => {
+                            args.iter().find_map(|it| of.get(&dfg.resolve_aliases(*it)).copied())
+                        }
+                        _ => None,
+                    };
+                    if let Some(slot) = slot {
+                        of.insert(dfg.first_result(inst), slot);
+                    }
+                }
+            }
+            if of.len() == known {
+                break;
+            }
+        }
+        let mut escaping = FxHashSet::default();
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                let followed = match dfg.insts[inst] {
+                    InstructionData::Load { .. } | InstructionData::StackAddr { .. } => true,
+                    InstructionData::Store { args: [value, _], .. } => {
+                        if let Some(&slot) = of.get(&dfg.resolve_aliases(value)) {
+                            escaping.insert(slot);
+                        }
+                        true
+                    }
+                    InstructionData::Binary { opcode: ir::Opcode::Iadd, .. } => true,
+                    _ => false,
+                };
+                if !followed {
+                    escaping.extend(
+                        dfg.inst_values(inst)
+                            .filter_map(|it| of.get(&dfg.resolve_aliases(it)).copied()),
+                    );
+                }
+            }
+        }
+        escaping
+    }
+
+    /// [`share_slots`] as it was: groups as lists of their members, each tried member by
+    /// member.
+    fn share_model(
+        func: &mut ir::Function,
+        frame: &FrameLocals,
+        named: &mut [ir::StackSlot],
+        only: Option<&FxHashSet<ir::StackSlot>>,
+    ) {
+        if frame.slots.is_empty() {
+            return;
+        }
+        let mut used = FxHashSet::default();
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                used.extend(func.dfg.inst_values(inst).map(|it| func.dfg.resolve_aliases(it)));
+            }
+        }
+        let mut addressed = vec![false; func.sized_stack_slots.len()];
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                let Some(slot) = slot_of(&func.dfg.insts[inst]) else { continue };
+                if used.contains(&func.dfg.first_result(inst)) {
+                    addressed[slot.as_u32() as usize] = true;
+                }
+            }
+        }
+        for slot in named.iter() {
+            addressed[slot.as_u32() as usize] = true;
+        }
+        let mut order: Vec<usize> = Vec::new();
+        for (at, slot) in frame.slots.iter().enumerate() {
+            let Some(slot) = *slot else { continue };
+            if !addressed[slot.as_u32() as usize] {
+                func.sized_stack_slots[slot].size = 0;
+            } else if only.is_none_or(|only| only.contains(&slot)) {
+                order.push(at);
+            }
+        }
+        let slot = |at: usize| frame.slots[at].expect("a local's slot");
+        let size = |func: &ir::Function, at: usize| func.sized_stack_slots[slot(at)].size;
+        order.sort_by_key(|&at| (std::cmp::Reverse(size(func, at)), at));
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for at in order {
+            let fits =
+                |group: &Vec<usize>| group.iter().all(|&it| !frame.conflicts.contains(it, at));
+            match groups.iter_mut().find(|group| fits(group)) {
+                Some(group) => group.push(at),
+                None => groups.push(vec![at]),
+            }
+        }
+        let mut moved: FxHashMap<ir::StackSlot, ir::StackSlot> = FxHashMap::default();
+        for group in groups.iter().filter(|it| it.len() > 1) {
+            let kept = slot(group[0]);
+            for &at in &group[1..] {
+                let slot = slot(at);
+                let (size, align_shift) =
+                    (func.sized_stack_slots[slot].size, func.sized_stack_slots[slot].align_shift);
+                let into = &mut func.sized_stack_slots[kept];
+                into.size = into.size.max(size);
+                into.align_shift = into.align_shift.max(align_shift);
+                func.sized_stack_slots[slot].size = 0;
+                moved.insert(slot, kept);
+            }
+        }
+        let blocks: Vec<ir::Block> = func.layout.blocks().collect();
+        for block in blocks {
+            let insts: Vec<ir::Inst> = func.layout.block_insts(block).collect();
+            for inst in insts {
+                if let Some(slot) = slot_mut(&mut func.dfg.insts[inst])
+                    && let Some(&kept) = moved.get(slot)
+                {
+                    *slot = kept;
+                }
+            }
+        }
+        for slot in named.iter_mut() {
+            if let Some(&kept) = moved.get(slot) {
+                *slot = kept;
+            }
+        }
+    }
+
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// A function with slots of sizes and alignments `seed` picks, whose addresses are loaded
+    /// through, offset, stored, returned or left unused; the frame over them, some of its
+    /// locals in registers, with conflicts `seed` picks; and the slots of named locals.
+    fn frame(seed: u64) -> (ir::Function, FrameLocals, Vec<ir::StackSlot>) {
+        let mut random = Seeded(seed);
+        let mut func = ir::Function::new();
+        func.signature.returns.push(ir::AbiParam::new(I64));
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut context);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        let count = 1 + random.below(24) as usize;
+        let slots: Vec<_> = (0..count)
+            .map(|_| {
+                let size = 8 * (1 + random.below(8) as u32);
+                let align_shift = random.below(5) as u8;
+                let data = StackSlotData::new(StackSlotKind::ExplicitSlot, size, align_shift);
+                builder.create_sized_stack_slot(data)
+            })
+            .collect();
+        let mut returned = None;
+        for &slot in &slots {
+            let addr = builder.ins().stack_addr(I64, slot, 0);
+            match random.below(6) {
+                0 => {}
+                1 => {
+                    let at = builder.ins().iadd_imm(addr, 4);
+                    let _ = builder.ins().load(I32, super::super::MEM, at, 0);
+                }
+                2 => {
+                    let other = builder.ins().stack_addr(I64, slots[0], 0);
+                    builder.ins().store(super::super::MEM, addr, other, 0);
+                }
+                3 => returned = Some(addr),
+                _ => {
+                    let _ = builder.ins().load(I64, super::super::MEM, addr, 0);
+                }
+            }
+        }
+        let returned = returned.unwrap_or_else(|| builder.ins().iconst(I64, 0));
+        builder.ins().return_(&[returned]);
+        builder.seal_all_blocks();
+        builder.finalize(super::super::target().unwrap().frontend_config());
+        let registers = random.below(4) as usize;
+        let frame_slots: Vec<_> = slots
+            .iter()
+            .map(|&it| (random.below(5) != 0).then_some(it))
+            .chain((0..registers).map(|_| None))
+            .collect();
+        let locals = frame_slots.len();
+        let mut conflicts = BitMatrix::new(locals, locals);
+        for a in 0..locals {
+            for b in a + 1..locals {
+                if random.below(3) == 0 {
+                    conflicts.insert(a, b);
+                    conflicts.insert(b, a);
+                }
+            }
+        }
+        let named = slots.iter().copied().filter(|_| random.below(4) == 0).collect();
+        let lazy = FxHashMap::default();
+        (func, FrameLocals { slots: frame_slots, conflicts, lazy }, named)
+    }
+
+    #[test]
+    fn shared_slots_are_those_of_the_member_lists() {
+        for seed in 0..500 {
+            let (func, frame, named) = frame(seed);
+            for escaping_only in [false, true] {
+                let (mut dense, mut listed) = (func.clone(), func.clone());
+                let (mut dense_named, mut listed_named) = (named.clone(), named.clone());
+                let dense_escaping = escaping(&func);
+                let model = escaping_model(&func);
+                let ours: Vec<_> =
+                    func.sized_stack_slots.keys().filter(|&it| dense_escaping.contains(it)).collect();
+                let mut theirs: Vec<_> = model.iter().copied().collect();
+                theirs.sort();
+                assert_eq!(ours, theirs, "seed {seed}");
+                let (only, only_model) =
+                    if escaping_only { (Some(&dense_escaping), Some(&model)) } else { (None, None) };
+                share_slots(&mut dense, &frame, &mut dense_named, only);
+                share_model(&mut listed, &frame, &mut listed_named, only_model);
+                let (dense, listed) = (dense.display().to_string(), listed.display().to_string());
+                assert_eq!(dense, listed, "seed {seed}");
+                assert_eq!(dense_named, listed_named, "seed {seed}");
+            }
+        }
+    }
+}

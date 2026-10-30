@@ -8,7 +8,7 @@ use blaze_vfs::{Change, ChangeKind, Mode, Op, View, Vfs};
 use super::{Daemon, Session};
 use crate::{
     ApiError, Arrived, Diagnostic, Level, Reach, Reply, Request, RequestRef, Response, Status,
-    Targets, TestOutcome, TestResult, ViewRef,
+    Targets, TestOutcome, TestResult, Ub, ViewRef,
     build::{Builder, JobId, Opened, Work},
 };
 
@@ -204,14 +204,20 @@ fn a_job_that_could_not_run_ends_with_its_error() {
 fn test_run_and_verify_start_their_work() {
     let mut world = World::new();
     let filter = vec!["parse".to_owned()];
-    world.request(1, 1, Request::Test { view: head("main"), targets: targets(), filter: filter.clone(), all: true });
+    let args = vec!["--exact".to_owned()];
+    let ub = Some(Ub { seed: Some(7), schedules: None });
+    world.request(
+        1,
+        1,
+        Request::Test { view: head("main"), targets: targets(), filter: filter.clone(), all: true, args: args.clone(), ub },
+    );
     world.request(1, 2, Request::Run { view: head("main"), targets: targets(), bin: None, args: vec!["-v".to_owned()] });
     world.request(1, 3, Request::Verify { view: head("main"), targets: targets() });
     let works: Vec<Work> = world.builder.started.iter().map(|it| it.2.clone()).collect();
     assert_eq!(
         works,
         [
-            Work::Test { targets: targets(), filter, all: true },
+            Work::Test { targets: targets(), filter, all: true, args, ub },
             Work::Run { targets: targets(), bin: None, args: vec!["-v".to_owned()] },
             Work::Verify(targets()),
         ]
@@ -522,7 +528,7 @@ fn a_build_test_or_run_that_ends_without_its_work_fails_naming_the_job() {
     let mut world = World::new();
     let requests = [
         Request::Build { view: head("main"), targets: targets() },
-        Request::Test { view: head("main"), targets: targets(), filter: Vec::new(), all: false },
+        Request::Test { view: head("main"), targets: targets(), filter: Vec::new(), all: false, args: Vec::new(), ub: None },
         Request::Run { view: head("main"), targets: targets(), bin: None, args: Vec::new() },
     ];
     for (id, request) in (1..).zip(requests) {
@@ -612,7 +618,7 @@ fn best_of_tests_rank_by_failed_then_passed() {
     let filter = vec!["it".to_owned()];
     let request = Request::BestOf { base: head("main"), candidates, targets: targets(), test: true, filter: filter.clone() };
     assert_eq!(world.request(1, 1, request), []);
-    assert!(world.builder.started.iter().all(|it| it.2 == Work::Test { targets: targets(), filter: filter.clone(), all: false }));
+    assert!(world.builder.started.iter().all(|it| it.2 == Work::Test { targets: targets(), filter: filter.clone(), all: false, args: Vec::new(), ub: None }));
     let jobs: Vec<JobId> = world.builder.started.iter().map(|it| it.0).collect();
     world.report(jobs[0], test_result(TestOutcome::Passed));
     world.report(jobs[0], test_result(TestOutcome::Failed));

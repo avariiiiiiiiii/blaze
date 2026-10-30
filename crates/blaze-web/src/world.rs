@@ -3,10 +3,11 @@
 //!
 //! What it holds:
 //!
-//! - a workspace: [`Workspace`], unnamed; in it (Flecs's `Parent`) each crate the build put a
-//!   function of, `Crate`, named as the crate, and in a crate its modules, `Module`, named as
-//!   the module, one in another as in the crate;
-//! - a function: [`Function`], unnamed, in the module its path is in ([`module_path`]: a
+//! - a workspace: `Workspace { root, build }`, unnamed; in it (Flecs's `Parent`) each crate the
+//!   build put a function of, `Crate`, named as the crate, and in a crate its modules, `Module`,
+//!   named as the module, one in another as in the crate;
+//! - a function: `Function { key, name, how, ns, build }`, unnamed, in the module its path is
+//!   in ([`module_path`]: a
 //!   type's path is a module here, as on the page), or the crate when it is in none, and
 //!   `Callees`, the functions it calls;
 //! - a module's `Callees`, the other modules its functions call, and `(Calls, crate)` on a
@@ -20,52 +21,18 @@
 //! Flecs through a reused buffer, its module is one hash of its path, and a call to an id not
 //! yet named waits in a chain of its `(object, id)` rather than in a list every record scans.
 //!
-//! One thread has the world: [`World`] is not `Send`.
+//! One thread has the world: [`World`] is not `Send`. Flecs is reached only through
+//! [`crate::flecs`], so this module is safe code.
 
-use std::{
-    ffi::{CStr, CString, c_char, c_void},
-    path::{Path, PathBuf},
-};
+#![forbid(unsafe_code)]
+
+use std::path::{Path, PathBuf};
 
 use blaze_protocol::events::{Event, How, Record};
-use flecs_c as ecs;
 use rustc_hash::FxHashMap;
 
-type Entity = ecs::ecs_entity_t;
-
-/// The kinds the world's entities have, as Flecs script.
-const KINDS: &str = "
-struct Workspace(root: string, build: u64)
-struct Function(key: u64, name: string, how: u8, ns: u64, build: u64)
-vector Callees(entity)
-Crate {}
-Module {}
-Calls { Relationship }
-";
-
-/// A workspace, as Flecs has it (its layout is [`KINDS`]'s).
-#[repr(C)]
-struct Workspace {
-    root: *const c_char,
-    build: u64,
-}
-
-/// A function, as Flecs has it (its layout is [`KINDS`]'s). `how` is the snapshot's number
-/// for it (docs/web.md).
-#[repr(C)]
-struct Function {
-    key: u64,
-    name: *const c_char,
-    how: u8,
-    ns: u64,
-    build: u64,
-}
-
-/// Flecs's `EcsParent`.
-#[repr(C)]
-struct Parent {
-    value: Entity,
-}
+pub use crate::flecs::Answer;
+use crate::flecs::{Entity, Flecs, Tag};
 
 /// What a record did to a program.
 #[derive(Debug, PartialEq, Eq)]
@@ -78,22 +45,13 @@ pub enum Applied {
 
 /// A Flecs world of programs.
 pub struct World {
-    world: *mut ecs::ecs_world_t,
-    rest: *mut ecs::ecs_http_server_t,
-    workspace: Entity,
-    function: Entity,
-    callees: Entity,
-    krate: Entity,
-    module: Entity,
-    calls: Entity,
+    flecs: Flecs,
     scratch: Scratch,
 }
 
 /// Buffers reused by every record, so placing a function allocates nothing.
 #[derive(Default)]
 struct Scratch {
-    /// A name as Flecs is handed it, NUL-terminated.
-    text: Vec<u8>,
     /// A module's key in [`Program::modules`], and where each of its segments' keys ends.
     path: Vec<u8>,
     ends: Vec<usize>,

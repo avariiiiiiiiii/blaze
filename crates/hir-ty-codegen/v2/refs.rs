@@ -55,23 +55,48 @@ mod shims;
 #[cfg(test)]
 mod tests;
 
-/// Everything the IR of `instance` can request, each once, in the order of its MIR.
+/// Everything the IR of `instance` can request, each once, in the order of its MIR: [`walked`],
+/// owned.
 pub(crate) fn walk(
     db: &dyn HirDatabase,
     instance: &HirInstance,
-    homes: &mut Homes,
+    _: &mut Homes,
 ) -> Result<Vec<Ref>, String> {
+    walked(db, instance).map(<[Ref]>::to_vec)
+}
+
+/// Everything the IR of `instance` can request, each once, in the order of its MIR, walked once
+/// a revision ([`code_walk`], [`start_walk`]) as rustc's collector has `items_of_instance`: a
+/// second asker (`describe`, then `prepare`) gets the list of the first and allocates nothing.
+pub(crate) fn walked<'db>(
+    db: &'db dyn HirDatabase,
+    instance: &HirInstance,
+) -> Result<&'db [Ref], String> {
     let walked = match &instance.0 {
         // Its assembly names nothing: `asm::wrapper` refuses a `sym`, and the backend an
         // assembly function with a relocation.
-        Kind::Asm(_) => Ok(Vec::new()),
-        Kind::Start(main) => {
-            let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
-            scratch(db, env, None, false, homes, |walk| walk.start_shim(*main))
-        }
-        Kind::Code(code, env) => code_refs(db, code, env, homes),
+        Kind::Asm(_) => return Ok(&[]),
+        Kind::Start(main) => start_walk(db, *main),
+        Kind::Code(code, env) => code_walk(db, code.clone(), env.clone()),
     };
-    walked.map_err(|what| format!("the references of {instance:?}: {what}"))
+    walked.as_deref().map_err(|what| format!("the references of {instance:?}: {what}"))
+}
+
+// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
+// fewer revisions), so they stay interned and are never verified.
+#[salsa::tracked(returns(ref), revisions = usize::MAX)]
+fn code_walk<'db>(
+    db: &'db dyn HirDatabase,
+    instance: Instance,
+    env: StoredParamEnvAndCrate,
+) -> Result<Vec<Ref>, String> {
+    code_refs(db, &instance, &env)
+}
+
+#[salsa::tracked(returns(ref))]
+fn start_walk<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<Vec<Ref>, String> {
+    let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
+    scratch(db, env, None, false, |walk| walk.start_shim(main))
 }
 
 /// The walk of a function, closure, `async` body or shim, as `instance_code` builds each.
@@ -79,28 +104,25 @@ fn code_refs(
     db: &dyn HirDatabase,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
-    homes: &mut Homes,
 ) -> Result<Vec<Ref>, String> {
     let ty = || instance.args.as_ref().type_at(0);
     let shim_env = env.as_ref(db);
     match instance.def {
         InstanceDef::DropGlue => {
-            return scratch(db, shim_env, None, false, homes, |walk| walk.drop_glue(ty()));
+            return scratch(db, shim_env, None, false, |walk| walk.drop_glue(ty()));
         }
         InstanceDef::CallOnceShim => {
-            return scratch(db, shim_env, None, false, homes, |walk| walk.call_once_shim(ty()));
+            return scratch(db, shim_env, None, false, |walk| walk.call_once_shim(ty()));
         }
         InstanceDef::VtableShim(func) => {
             let args = instance.args.as_ref();
-            return scratch(db, shim_env, None, false, homes, |walk| walk.vtable_shim(func, args));
+            return scratch(db, shim_env, None, false, |walk| walk.vtable_shim(func, args));
         }
         InstanceDef::FnPointerShim => {
-            return scratch(db, shim_env, None, false, homes, |walk| walk.fn_pointer_shim(ty()));
+            return scratch(db, shim_env, None, false, |walk| walk.fn_pointer_shim(ty()));
         }
         InstanceDef::ReifyShim { receiver } => {
-            return scratch(db, shim_env, None, false, homes, |walk| {
-                walk.reify_shim(ty(), receiver)
-            });
+            return scratch(db, shim_env, None, false, |walk| walk.reify_shim(ty(), receiver));
         }
         InstanceDef::Fn(_)
         | InstanceDef::Closure(_)
@@ -117,7 +139,7 @@ fn code_refs(
         _ => (false, ExternAbi::Rust, false),
     };
     let args = instance.args.clone();
-    scratch(db, env.as_ref(db), Some(body), tracked, homes, |walk| {
+    scratch(db, env.as_ref(db), Some(body), tracked, |walk| {
         walk.fx.abi = abi;
         walk.fx.variadic = variadic;
         walk.fx.args = Some(args);
@@ -132,12 +154,15 @@ fn scratch<'db>(
     env: ParamEnvAndCrate<'db>,
     body: Option<&'db MirBody<'db>>,
     tracked: bool,
-    homes: &mut Homes,
     work: impl for<'w, 'cx> FnOnce(&mut Walk<'w, 'cx, 'db>) -> Result<(), String>,
 ) -> Result<Vec<Ref>, String> {
     let isa = &**crate::target().map_err(told)?;
     let target = crate::selected_target().map_err(told)?;
     let mut cg = Recorder::new(db, isa, target, true);
+    // The settings a walk reads are its own, never the thread's unit's: the walk is a query.
+    cg.unit = Some(Build { debug_assertions: true, aborts: false });
+    // About one reference a block, and the few of `outside`.
+    let capacity = body.map_or(0, |it| it.basic_blocks.len()) + 8;
     let mut walked = None;
     crate::build(&mut cg, env, body, tracked, |fx| {
         // The union of what the settings of a unit compile.
@@ -146,14 +171,18 @@ fn scratch<'db>(
         fx.ub_checks = true;
         let mut walk = Walk {
             fx,
-            homes,
+            homes: Homes::default(),
             env: env.store(),
-            refs: Vec::new(),
-            listed: FxHashSet::default(),
+            listed: Listed::with_capacity(capacity),
+            called: FxHashSet::with_capacity_and_hasher(capacity, Default::default()),
             drained: (0, 0),
         };
         let done = walk.outside().and_then(|()| work(&mut walk)).and_then(|()| walk.drain());
-        walked = Some(done.map(|()| walk.refs));
+        walked = Some(done.map(|()| {
+            let mut refs = walk.listed.refs;
+            refs.shrink_to_fit();
+            refs
+        }));
         Ok(())
     })
     .map_err(told)?;
@@ -164,16 +193,113 @@ fn told(error: CodegenError) -> String {
     error.to_string()
 }
 
-/// A walk of one instance: the references found so far, each once, in the order found.
+/// A walk of one instance.
 pub(super) struct Walk<'w, 'cx, 'db> {
     fx: &'w mut FunctionCx<'cx, 'db>,
-    homes: &'w mut Homes,
+    homes: Homes,
     /// `fx.env`, as the requests hold it.
     env: StoredParamEnvAndCrate,
-    refs: Vec<Ref>,
-    listed: FxHashSet<Ref>,
-    /// How many of the function and data requests of `fx.cg` are in `refs`.
+    listed: Listed,
+    /// The calls listed already, by their interned definition and arguments: a call made
+    /// again costs a hash of two ids and no homing (`places::call_ref`).
+    called: FxHashSet<(InstanceDef, GenericArgs<'db>)>,
+    /// How many of the function and data requests of `fx.cg` are in `listed`.
     drained: (usize, usize),
+}
+
+/// The references found so far, each once, in the order found, as rustc's collector keeps the
+/// items of an instance in an index set. Each is hashed once (FxHash) and kept once: the
+/// tables hold its hash and place (16 bytes an entry, one probe a lookup), and growing them
+/// hashes nothing again. A symbol is looked up by its name, so one listed already makes no
+/// `String`, nor does a routine of Cranelift's listed already.
+struct Listed {
+    refs: Vec<Ref>,
+    /// The places in `refs` of all but the symbols.
+    at: HashTable<Slot>,
+    /// The places in `refs` of the symbols ([`FrontRef::Extern`]), by the hash of the name.
+    symbols: HashTable<Slot>,
+    libcalls: SmallVec<[ir::LibCall; 8]>,
+}
+
+#[derive(Clone, Copy)]
+struct Slot {
+    hash: u64,
+    at: u32,
+}
+
+const _: () = assert!(size_of::<Slot>() == 16);
+
+impl Listed {
+    fn with_capacity(capacity: usize) -> Self {
+        Listed {
+            refs: Vec::with_capacity(capacity),
+            at: HashTable::with_capacity(capacity),
+            symbols: HashTable::with_capacity(8),
+            libcalls: SmallVec::new(),
+        }
+    }
+
+    fn next(&self) -> u32 {
+        u32::try_from(self.refs.len()).expect("fewer than 2^32 references")
+    }
+
+    fn add(&mut self, it: Ref) {
+        let it = match it {
+            FrontRef::Extern(name) => return self.symbol(Cow::Owned(name)),
+            it => it,
+        };
+        let hash = FxBuildHasher.hash_one(&it);
+        let refs = &self.refs;
+        let entry = self.at.entry(hash, |slot| refs[slot.at as usize] == it, |slot| slot.hash);
+        if let Entry::Vacant(vacant) = entry {
+            vacant.insert(Slot { hash, at: u32::try_from(refs.len()).expect("fewer than 2^32 references") });
+            self.refs.push(it);
+        }
+    }
+
+    fn symbol(&mut self, name: Cow<'_, str>) {
+        let hash = FxBuildHasher.hash_one(&*name);
+        let refs = &self.refs;
+        let same = |slot: &Slot| matches!(&refs[slot.at as usize], FrontRef::Extern(it) if *it == *name);
+        if let Entry::Vacant(vacant) = self.symbols.entry(hash, same, |slot| slot.hash) {
+            vacant.insert(Slot { hash, at: u32::try_from(refs.len()).expect("fewer than 2^32 references") });
+            self.refs.push(FrontRef::Extern(name.into_owned()));
+        }
+    }
+
+    fn libcall(&mut self, libcall: ir::LibCall) {
+        if !self.libcalls.contains(&libcall) {
+            self.libcalls.push(libcall);
+            self.symbol(Cow::Owned(places::libcall_symbol(libcall)));
+        }
+    }
+}
+
+/// A set of the blocks of a body, a bit a block.
+struct Blocks(Vec<u64>);
+
+impl Blocks {
+    fn new(count: usize) -> Self {
+        Blocks(vec![0; count.div_ceil(64)])
+    }
+
+    fn bit(id: BasicBlockId) -> (usize, u64) {
+        let index = id.into_raw().into_u32() as usize;
+        (index / 64, 1 << (index % 64))
+    }
+
+    /// Adds `id`, saying whether it was not in the set.
+    fn insert(&mut self, id: BasicBlockId) -> bool {
+        let (word, bit) = Self::bit(id);
+        let new = self.0[word] & bit == 0;
+        self.0[word] |= bit;
+        new
+    }
+
+    fn contains(&self, id: BasicBlockId) -> bool {
+        let (word, bit) = Self::bit(id);
+        self.0[word] & bit != 0
+    }
 }
 
 impl<'cx, 'db> Walk<'_, 'cx, 'db> {
@@ -181,35 +307,28 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         self.fx.cg.db
     }
 
-    fn list(&mut self, it: Ref) {
-        if self.listed.insert(it.clone()) {
-            self.refs.push(it);
-        }
-    }
-
     /// Lists what the resolvers have asked of the recorder since last time, as the IR
     /// builder's requests are placed: a function by its target, a static as itself or its
     /// symbol, with what Cranelift calls to reach a thread-local one.
     fn drain(&mut self) -> Result<(), String> {
-        let db = self.fx.cg.db;
-        let requests = &self.fx.cg.wants.requests;
-        let (funcs, datas) = self.drained;
-        let mut found = Vec::new();
-        for request in &requests.funcs[funcs..] {
-            found.push(places::func_ref(db, self.homes, &request.target)?);
+        let Walk { fx, homes, listed, drained, .. } = self;
+        let db = fx.cg.db;
+        let requests = &fx.cg.wants.requests;
+        for request in &requests.funcs[drained.0..] {
+            match &request.target {
+                FuncTarget::Symbol(symbol) => listed.symbol(Cow::Borrowed(symbol)),
+                target => listed.add(places::func_ref(db, homes, target)?),
+            }
         }
-        for request in &requests.datas[datas..] {
+        for request in &requests.datas[drained.1..] {
             if let DataRequest::Static(id) = request {
-                found.push(places::static_ref(db, *id)?);
+                listed.add(places::static_ref(db, *id)?);
                 if is_thread_local(db, *id) {
-                    found.push(places::libcall_ref(ir::LibCall::ElfTlsGetAddr));
+                    listed.libcall(ir::LibCall::ElfTlsGetAddr);
                 }
             }
         }
-        self.drained = (requests.funcs.len(), requests.datas.len());
-        for it in found {
-            self.list(it);
-        }
+        *drained = (requests.funcs.len(), requests.datas.len());
         Ok(())
     }
 

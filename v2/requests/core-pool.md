@@ -70,3 +70,5 @@ them in. `topology.rs` (NUMA) and `exec.rs` (the callers) are done by core-pool 
 - Where: `crates/blaze-graph/src/pool.rs`.
 - Why: core-hardware.md ("P cores for the critical path", "NUMA"); hardware.md's threads and
   memory rows.
+
+> forwarded to speed: speed-runtime-pool is rewriting `pool.rs`.

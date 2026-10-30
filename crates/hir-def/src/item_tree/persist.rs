@@ -1,152 +1,163 @@
-//! An [`ItemTree`] in a [`blaze_format`] buffer (docs/v2/plan/lanes/format.md section 5), written with the
-//! encoding of [`crate::hir::persist`].
+//! An [`ItemTree`] in a [`blaze_format`] buffer (docs/v2/plan/lanes/format.md section 5): its
+//! columns as they are in memory (docs/v2/plan/design/data.md), and its tables (names, paths,
+//! visibilities, attributes, `cfg`s) in the words of [`crate::hir::persist`].
 //!
-//! The buffer is a [`Root`] of columns: the top-level items as `u32`s, read without decoding,
-//! one [`Node`] per element of each of the tree's arrays (`small_data`, `big_data`, `attrs`,
-//! `vis`; the node's kind is the variant, its `at` the word its fields start at) and the words
-//! all of them are written in. `small_data` and `big_data` keep their order, which is what a
-//! [`ModItemId`] indexes, and `attrs` its order by id, so equal trees are equal bytes.
+//! The buffer is a [`Root`] of [`Slice`]s, one per column of the tree, each read back by a
+//! copy; the per-item columns, the payload columns and the lists are plain records, written
+//! byte for byte. What the records name (items, names, paths, visibilities, lists, `cfg`s) is
+//! checked on decode, so a tree read back indexes only what it holds, and each list's items are
+//! before the item holding it, so no module holds itself. Equal trees are equal bytes.
 //!
 //! A token tree is written as its flat tokens and built again with the
 //! [`tt::TopSubtreeBuilder`] calls that built it, so the encoding inside a [`tt::TopSubtree`],
 //! which its `==` compares, comes out the same.
 
-use std::{mem::offset_of, ops::Deref};
+use std::mem::offset_of;
 
 use blaze_format::{FormatError, Part, Persist, Record, Slice, Writer};
 use hir_expand::{
     ExpandTo,
     attrs::{Attr, AttrInput},
-    name::Name,
 };
-use span::{FileAstId, Span};
-use syntax::ast;
-use thin_vec::ThinVec;
+use span::{ErasedFileAstId, FileAstId, Span, SyntaxContext};
 
 use super::{
-    AttrsOrCfg, AttrsOwned, BigModItem, Const, Enum, ExternBlock, ExternCrate, FieldsShape,
-    Function, Impl, ImportAlias, ItemTree, ItemVisibilities, Macro2, MacroCall, MacroRules, Mod,
-    ModItemId, ModKind, RawVisibility, RawVisibilityId, SmallModItem, Static, Struct,
-    StructValueNsCtor, Trait, TypeAlias, Union, Use, UseTree, UseTreeKind,
-    VisibilityExplicitness,
+    AliasId, AttrOwner, Const, Enum, ExternBlock, ExternCrate, FieldsShape, Function, IdRange,
+    Impl, ImportAlias, ItemKind, ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId, NameId,
+    PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias, Union, Use,
+    UseTree, UseTreeId, VisibilityExplicitness,
 };
-use crate::hir::persist::{Code, Column, Node, Read, Words, WordsRec, nodes};
+use crate::hir::persist::{Code, Column, Read, Words, WordsRec};
 
 blaze_format::record! {
-    /// An item tree's columns.
-    #[derive(Clone, Copy)]
-    pub(crate) struct Root: 1 {
-        top_level: Slice<u32>,
-        small_data: Slice<Node>,
-        big_data: Slice<Node>,
-        attrs: Slice<Node>,
-        vis: Slice<Node>,
-        words: WordsRec,
+    /// A [`MacroCall`] as a record: its context and its expansion kind as words.
+    #[derive(Clone, Copy, Debug)]
+    struct MacroCallRec: 1 {
+        path: PathId,
+        ctxt: u32,
+        expand_to: u32,
     }
 }
 
-const SMALL_KINDS: u32 = 12;
-const BIG_KINDS: u32 = 4;
-const ATTRS_KINDS: u32 = 2;
-const VIS_KINDS: u32 = 4;
+blaze_format::record! {
+    /// An item tree's columns, and where in its words each of its tables starts.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Root: 2 {
+        top_level: Slice<ModItemId>,
+        kinds: Slice<u8>,
+        data: Slice<u32>,
+        ast_ids: Slice<u32>,
+        children: Slice<ModItemId>,
+        consts: Slice<Const>,
+        enums: Slice<Enum>,
+        extern_blocks: Slice<ExternBlock>,
+        extern_crates: Slice<ExternCrate>,
+        functions: Slice<Function>,
+        impls: Slice<Impl>,
+        macro2s: Slice<Macro2>,
+        macro_calls: Slice<MacroCallRec>,
+        macro_rules: Slice<MacroRules>,
+        mods: Slice<Mod>,
+        statics: Slice<Static>,
+        structs: Slice<Struct>,
+        traits: Slice<Trait>,
+        type_aliases: Slice<TypeAlias>,
+        unions: Slice<Union>,
+        uses: Slice<Use>,
+        use_trees: Slice<UseTree>,
+        use_tree_lists: Slice<UseTreeId>,
+        ctor_vis: Slice<RawVisibilityId>,
+        attr_owners: Slice<AttrOwner>,
+        words: WordsRec,
+        names_at: u32,
+        paths_at: u32,
+        vis_at: u32,
+        attrs_at: u32,
+        cfgs_at: u32,
+    }
+}
 
 /// An [`ItemTree`] read in place.
 #[derive(Clone, Copy)]
 pub struct ItemTreeRef<'a> {
     buffer: &'a [u8],
     root: &'a Root,
-    top_level: &'a [u32],
-    small: &'a [Node],
-    big: &'a [Node],
-    attrs: &'a [Node],
-    vis: &'a [Node],
+    top_level: &'a [ModItemId],
 }
 
 impl<'a> ItemTreeRef<'a> {
     /// The items at the top level of the file, as [`ItemTree::top_level_items`] lists them.
-    pub fn top_level(&self) -> impl Iterator<Item = ModItemId> + 'a {
-        self.top_level.iter().map(|&index| ModItemId { index })
+    pub fn top_level(self) -> impl Iterator<Item = ModItemId> + 'a {
+        self.top_level.iter().copied()
     }
 
-    /// How many of the tree's items are of the small kinds (all but extern crates, modules, uses
-    /// and structs).
-    pub fn small_items(&self) -> usize {
-        self.small.len()
+    /// How many items the tree has, at the top level or not.
+    pub fn len(self) -> usize {
+        self.root.kinds.get(self.buffer).len()
     }
 
-    /// How many of the tree's items are extern crates, modules, uses and structs.
-    pub fn big_items(&self) -> usize {
-        self.big.len()
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
     }
 
     /// The owned tree, equal to the one written.
     pub fn decode(self) -> Result<ItemTree, FormatError> {
-        let words = Read::new(&self.root.words, self.buffer);
-        let small_data = (self.small.iter())
-            .map(|node| {
-                let kind = self.kind(node, SMALL_KINDS, "a small item kind out of range")?;
-                let mut r = words.from(node.at);
-                let ast_id: FileAstId<ast::Item> = r.get()?;
-                Ok((ast_id, get_small(kind, &mut r)?))
+        let (root, buffer) = (self.root, self.buffer);
+        let invalid = |what| FormatError::Invalid { at: self.position(root), what };
+        let kinds = (root.kinds.follow(buffer)?.iter())
+            .map(|&kind| ItemKind::from_u8(kind).ok_or_else(|| invalid("an item kind out of range")))
+            .collect::<Result<Box<[ItemKind]>, FormatError>>()?;
+        let ast_ids = (root.ast_ids.follow(buffer)?.iter())
+            .map(|&raw| FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(raw)))
+            .collect();
+        let macro_calls = (root.macro_calls.follow(buffer)?.iter())
+            .map(|call| {
+                let expand_to = expand_to_of(call.expand_to)
+                    .ok_or_else(|| invalid("a macro expansion kind out of range"))?;
+                if call.ctxt == u32::MAX {
+                    return Err(invalid("a syntax context of u32::MAX"));
+                }
+                // SAFETY: `ctxt` is what `into_u32` gave for a context of the database that
+                // wrote the buffer, which is the one reading it (`crate::hir::persist`'s docs).
+                let ctxt = unsafe { SyntaxContext::from_u32(call.ctxt) };
+                Ok(MacroCall { path: call.path, ctxt, expand_to })
             })
-            .collect::<Result<ThinVec<(FileAstId<ast::Item>, SmallModItem)>, FormatError>>()?;
-        let big_data = (self.big.iter())
-            .map(|node| {
-                let kind = self.kind(node, BIG_KINDS, "a big item kind out of range")?;
-                let mut r = words.from(node.at);
-                let ast_id: FileAstId<ast::Item> = r.get()?;
-                Ok((ast_id, get_big(kind, &mut r)?))
-            })
-            .collect::<Result<ThinVec<(FileAstId<ast::Item>, BigModItem)>, FormatError>>()?;
-        let attrs = (self.attrs.iter())
-            .map(|node| {
-                let kind = self.kind(node, ATTRS_KINDS, "an attribute list kind out of range")?;
-                let mut r = words.from(node.at);
-                let owner: ModItemId = r.get()?;
-                let attrs = match kind {
-                    0 => AttrsOrCfg::Enabled { attrs: get_attrs(&mut r)? },
-                    _ => {
-                        let cfg = r.get()?;
-                        AttrsOrCfg::CfgDisabled(Box::new((cfg, get_attrs(&mut r)?)))
-                    }
-                };
-                Ok((owner, attrs))
-            })
-            .collect::<Result<ThinVec<(ModItemId, AttrsOrCfg)>, FormatError>>()?;
-        let arena = (self.vis.iter())
-            .map(|node| {
-                let kind = self.kind(node, VIS_KINDS, "a visibility kind out of range")?;
-                let mut r = words.from(node.at);
-                Ok(match kind {
-                    0 => {
-                        let path = r.get()?;
-                        RawVisibility::Module(path, r.get()?)
-                    }
-                    1 => RawVisibility::PubSelf(r.get()?),
-                    2 => RawVisibility::PubCrate,
-                    _ => RawVisibility::Public,
-                })
-            })
-            .collect::<Result<ThinVec<RawVisibility>, FormatError>>()?;
+            .collect::<Result<Box<[MacroCall]>, FormatError>>()?;
+        let words = Read::new(&root.words, buffer);
         let tree = ItemTree {
-            top_level: self.top_level().collect(),
-            attrs,
-            vis: ItemVisibilities { arena },
-            big_data,
-            small_data,
+            top_level: self.top_level.into(),
+            kinds,
+            data: column(&root.data, buffer)?,
+            ast_ids,
+            children: column(&root.children, buffer)?,
+            consts: column(&root.consts, buffer)?,
+            enums: column(&root.enums, buffer)?,
+            extern_blocks: column(&root.extern_blocks, buffer)?,
+            extern_crates: column(&root.extern_crates, buffer)?,
+            functions: column(&root.functions, buffer)?,
+            impls: column(&root.impls, buffer)?,
+            macro2s: column(&root.macro2s, buffer)?,
+            macro_calls,
+            macro_rules: column(&root.macro_rules, buffer)?,
+            mods: column(&root.mods, buffer)?,
+            statics: column(&root.statics, buffer)?,
+            structs: column(&root.structs, buffer)?,
+            traits: column(&root.traits, buffer)?,
+            type_aliases: column(&root.type_aliases, buffer)?,
+            unions: column(&root.unions, buffer)?,
+            uses: column(&root.uses, buffer)?,
+            use_trees: column(&root.use_trees, buffer)?,
+            use_tree_lists: column(&root.use_tree_lists, buffer)?,
+            ctor_vis: column(&root.ctor_vis, buffer)?,
+            names: words.from(root.names_at).seq()?,
+            paths: words.from(root.paths_at).seq()?,
+            vis: words.from(root.vis_at).seq()?,
+            attr_owners: column(&root.attr_owners, buffer)?,
+            attrs: words.from(root.attrs_at).seq()?,
+            cfgs: words.from(root.cfgs_at).seq()?,
         };
-        match check(&tree) {
-            Ok(()) => Ok(tree),
-            Err(what) => Err(FormatError::Invalid { at: self.position(self.root), what }),
-        }
-    }
-
-    /// A node's kind, refused when it is not one of `count`.
-    fn kind(&self, node: &Node, count: u32, what: &'static str) -> Result<u32, FormatError> {
-        match node.kind < count {
-            true => Ok(node.kind),
-            false => Err(FormatError::Invalid { at: self.position(node), what }),
-        }
+        check(&tree).map_err(invalid)?;
+        Ok(tree)
     }
 
     fn position<T>(&self, value: &T) -> u64 {
@@ -154,77 +165,115 @@ impl<'a> ItemTreeRef<'a> {
     }
 }
 
-/// Whether every item and visibility an item names is in the tree, and the attributes are in
-/// the order [`ItemTree::attrs`] searches them in: what indexing the tree relies on.
+/// The records of a column, copied out of the buffer.
+fn column<T: Record>(slice: &Slice<T>, buffer: &[u8]) -> Result<Box<[T]>, FormatError> {
+    Ok(slice.follow(buffer)?.into())
+}
+
+/// Whether every id the tree's records hold names something the tree has, every list is within
+/// its array and holds only what comes before its holder, and the attributes are in the order
+/// [`ItemTree::attrs`] searches them in: what indexing the tree relies on.
 fn check(tree: &ItemTree) -> Result<(), &'static str> {
-    let item = |id: &ModItemId| {
-        let index = (id.index >> 1) as usize;
-        match id.index & 1 {
-            0 => index < tree.small_data.len(),
-            _ => index < tree.big_data.len(),
-        }
+    let items = tree.kinds.len();
+    if tree.data.len() != items || tree.ast_ids.len() != items {
+        return Err("per-item columns of different lengths");
+    }
+    let vis = |id: RawVisibilityId| id.is_builtin() || (id.0 as usize) < tree.vis.len();
+    let name = |id: NameId| (id.0 as usize) < tree.names.len();
+    let path = |id: PathId| (id.0 as usize) < tree.paths.len();
+    let path_or_none = |id: PathId| id == PathId::NONE || path(id);
+    let alias =
+        |id: AliasId| matches!(id, AliasId::NONE | AliasId::UNDERSCORE) || name(NameId(id.0));
+    let named = |name_id: NameId, vis_id: RawVisibilityId| name(name_id) && vis(vis_id);
+    // A list of items, each before the item `holder` that holds the list.
+    let list = |range: IdRange, holder: usize| {
+        range.within(tree.children.len())
+            && tree.children[range.range()].iter().all(|child| (child.index as usize) < holder)
     };
-    let items = |ids: &[ModItemId]| ids.iter().all(|id| item(id));
-    let vis = |id: &RawVisibilityId| {
-        [
-            RawVisibilityId::PUB,
-            RawVisibilityId::PRIV_IMPLICIT,
-            RawVisibilityId::PRIV_EXPLICIT,
-            RawVisibilityId::PUB_CRATE,
-        ]
-        .contains(id)
-            || (id.0 as usize) < tree.vis.arena.len()
-    };
-    if !items(&tree.top_level[..]) {
+
+    if !tree.top_level.iter().all(|id| (id.index as usize) < items) {
         return Err("a top-level item that is not in the tree");
     }
-    for (_, it) in &tree.small_data {
-        let named = match it {
-            SmallModItem::Const(it) => vis(&it.visibility),
-            SmallModItem::Enum(it) => vis(&it.visibility),
-            SmallModItem::ExternBlock(it) => items(&it.children[..]),
-            SmallModItem::Function(it) => vis(&it.visibility),
-            SmallModItem::Impl(_) | SmallModItem::MacroCall(_) | SmallModItem::MacroRules(_) => {
-                true
+    for at in 0..items {
+        let (kind, data) = (tree.kinds[at], tree.data[at] as usize);
+        if data >= tree.column_len(kind) {
+            return Err("an item past the column of its kind");
+        }
+        let ok = match kind {
+            ItemKind::Const => {
+                let it = &tree.consts[data];
+                (it.name == NameId::NONE || name(it.name)) && vis(it.visibility)
             }
-            SmallModItem::Macro2(it) => vis(&it.visibility),
-            SmallModItem::Static(it) => vis(&it.visibility),
-            SmallModItem::Trait(it) => vis(&it.visibility),
-            SmallModItem::TypeAlias(it) => vis(&it.visibility),
-            SmallModItem::Union(it) => vis(&it.visibility),
+            ItemKind::Enum => named(tree.enums[data].name, tree.enums[data].visibility),
+            ItemKind::ExternBlock => list(tree.extern_blocks[data].children, at),
+            ItemKind::ExternCrate => {
+                let it = &tree.extern_crates[data];
+                named(it.name, it.visibility) && alias(it.alias)
+            }
+            ItemKind::Function => {
+                named(tree.functions[data].name, tree.functions[data].visibility)
+            }
+            ItemKind::Impl => true,
+            ItemKind::Macro2 => named(tree.macro2s[data].name, tree.macro2s[data].visibility),
+            ItemKind::MacroCall => path(tree.macro_calls[data].path),
+            ItemKind::MacroRules => name(tree.macro_rules[data].name),
+            ItemKind::Mod => {
+                let it = &tree.mods[data];
+                named(it.name, it.visibility) && (it.items == IdRange::NONE || list(it.items, at))
+            }
+            ItemKind::Static => named(tree.statics[data].name, tree.statics[data].visibility),
+            ItemKind::Struct => {
+                let it = &tree.structs[data];
+                named(it.name, it.visibility) && it.value_ns_ctor.within(tree.ctor_vis.len())
+            }
+            ItemKind::Trait => named(tree.traits[data].name, tree.traits[data].visibility),
+            ItemKind::TypeAlias => {
+                named(tree.type_aliases[data].name, tree.type_aliases[data].visibility)
+            }
+            ItemKind::Union => named(tree.unions[data].name, tree.unions[data].visibility),
+            ItemKind::Use => {
+                let it = &tree.uses[data];
+                vis(it.visibility) && (it.use_tree.0 as usize) < tree.use_trees.len()
+            }
         };
-        if !named {
-            return Err("an item naming an item or a visibility that is not in the tree");
+        if !ok {
+            return Err("an item naming something that is not in the tree");
         }
     }
-    for (_, it) in &tree.big_data {
-        let named = match it {
-            BigModItem::ExternCrate(it) => vis(&it.visibility),
-            BigModItem::Mod(it) => {
-                vis(&it.visibility)
-                    && match &it.kind {
-                        ModKind::Inline { items: children } => items(&children[..]),
-                        ModKind::Outline => true,
-                    }
+    if !tree.ctor_vis.iter().all(|&id| vis(id)) {
+        return Err("a constructor visibility that is not in the tree");
+    }
+    for (at, it) in tree.use_trees.iter().enumerate() {
+        let ok = match it.kind {
+            UseTree::SINGLE => path(it.path) && alias(it.alias) && it.list == IdRange::EMPTY,
+            UseTree::GLOB => {
+                path_or_none(it.path) && it.alias == AliasId::NONE && it.list == IdRange::EMPTY
             }
-            BigModItem::Use(it) => vis(&it.visibility),
-            BigModItem::Struct(it) => {
-                vis(&it.visibility)
-                    && match &it.value_ns_ctor {
-                        StructValueNsCtor::NoValueNsCtor => true,
-                        StructValueNsCtor::ValueNsCtorWithVis(it) => vis(it),
-                        StructValueNsCtor::ValueNsCtorWithMinVis(all) => all.iter().all(vis),
-                    }
+            UseTree::PREFIXED => {
+                path_or_none(it.path)
+                    && it.alias == AliasId::NONE
+                    && it.list.within(tree.use_tree_lists.len())
+                    && (tree.use_tree_lists[it.list.range()].iter())
+                        .all(|child| (child.0 as usize) < at)
             }
+            _ => false,
         };
-        if !named {
-            return Err("an item naming an item or a visibility that is not in the tree");
+        if !ok {
+            return Err("a use tree that is not one, or not before the tree holding it");
         }
     }
-    if !tree.attrs.iter().all(|(id, _)| *id == ModItemId::TOP_OWNER || item(id)) {
-        return Err("attributes of an item that is not in the tree");
+    for owner in &tree.attr_owners {
+        if owner.owner != ModItemId::TOP_OWNER && owner.owner.index as usize >= items {
+            return Err("attributes of an item that is not in the tree");
+        }
+        if !owner.attrs.within(tree.attrs.len()) {
+            return Err("attributes past the tree's");
+        }
+        if owner.cfg != AttrOwner::ENABLED && owner.cfg as usize >= tree.cfgs.len() {
+            return Err("a `cfg` that is not in the tree");
+        }
     }
-    if !tree.attrs.windows(2).all(|pair| pair[0].0 <= pair[1].0) {
+    if !tree.attr_owners.windows(2).all(|pair| pair[0].owner < pair[1].owner) {
         return Err("attributes not in the order of their items");
     }
     Ok(())
@@ -233,86 +282,95 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
 impl Persist for ItemTree {
     const SCHEMA: blaze_format::SchemaHash = blaze_format::schema_of(&[
         Part::Str("ItemTree"),
-        Part::U64(1),
+        Part::U64(2),
         Part::Schema(<Root as Record>::SCHEMA),
     ]);
     type Ref<'a> = ItemTreeRef<'a>;
 
     fn write(&self, out: &mut Writer) -> u64 {
         let mut w = Words::new();
-        let small = nodes(
-            &mut w,
-            self.small_data.iter(),
-            |(_, item)| small_kind(item),
-            |(ast_id, item), w| {
-                ast_id.put(w);
-                put_small(item, w);
-            },
-        );
-        let big = nodes(
-            &mut w,
-            self.big_data.iter(),
-            |(_, item)| big_kind(item),
-            |(ast_id, item), w| {
-                ast_id.put(w);
-                put_big(item, w);
-            },
-        );
-        let attrs = nodes(
-            &mut w,
-            self.attrs.iter(),
-            |(_, attrs)| match attrs {
-                AttrsOrCfg::Enabled { .. } => 0,
-                AttrsOrCfg::CfgDisabled(_) => 1,
-            },
-            |(owner, attrs), w| {
-                owner.put(w);
-                match attrs {
-                    AttrsOrCfg::Enabled { attrs } => put_attrs(attrs, w),
-                    AttrsOrCfg::CfgDisabled(disabled) => {
-                        let (cfg, attrs) = &**disabled;
-                        cfg.put(w);
-                        put_attrs(attrs, w);
-                    }
-                }
-            },
-        );
-        // `pub(crate)` and `pub` have no fields: their nodes start where the next value does.
-        let vis: Vec<Node> = (self.vis.arena.iter())
-            .map(|vis| {
-                let at = w.at();
-                let kind = match vis {
-                    RawVisibility::Module(path, explicitness) => {
-                        path.put(&mut w);
-                        explicitness.put(&mut w);
-                        0
-                    }
-                    RawVisibility::PubSelf(explicitness) => {
-                        explicitness.put(&mut w);
-                        1
-                    }
-                    RawVisibility::PubCrate => 2,
-                    RawVisibility::Public => 3,
-                };
-                Node { kind, at }
+        let names_at = w.at();
+        w.seq(self.names.iter());
+        let paths_at = w.at();
+        w.seq(self.paths.iter());
+        let vis_at = w.at();
+        w.seq(self.vis.iter());
+        let attrs_at = w.at();
+        w.seq(self.attrs.iter());
+        let cfgs_at = w.at();
+        w.seq(self.cfgs.iter());
+
+        let kinds: Vec<u8> = self.kinds.iter().map(|&kind| kind as u8).collect();
+        let ast_ids: Vec<u32> = self.ast_ids.iter().map(|id| id.erase().into_raw()).collect();
+        let macro_calls: Vec<MacroCallRec> = (self.macro_calls.iter())
+            .map(|call| MacroCallRec {
+                path: call.path,
+                ctxt: call.ctxt.into_u32(),
+                expand_to: expand_to_word(call.expand_to),
             })
             .collect();
-        let top_level: Vec<u32> = self.top_level.iter().map(|id| id.index).collect();
 
         let placed = w.place(out);
-        let top_level = Column::push(out, &top_level);
-        let small = Column::push(out, &small);
-        let big = Column::push(out, &big);
-        let attrs = Column::push(out, &attrs);
-        let vis = Column::push(out, &vis);
+        let top_level = Column::push(out, &self.top_level);
+        let kinds = Column::push(out, &kinds);
+        let data = Column::push(out, &self.data);
+        let ast_ids = Column::push(out, &ast_ids);
+        let children = Column::push(out, &self.children);
+        let consts = Column::push(out, &self.consts);
+        let enums = Column::push(out, &self.enums);
+        let extern_blocks = Column::push(out, &self.extern_blocks);
+        let extern_crates = Column::push(out, &self.extern_crates);
+        let functions = Column::push(out, &self.functions);
+        let impls = Column::push(out, &self.impls);
+        let macro2s = Column::push(out, &self.macro2s);
+        let macro_calls = Column::push(out, &macro_calls);
+        let macro_rules = Column::push(out, &self.macro_rules);
+        let mods = Column::push(out, &self.mods);
+        let statics = Column::push(out, &self.statics);
+        let structs = Column::push(out, &self.structs);
+        let traits = Column::push(out, &self.traits);
+        let type_aliases = Column::push(out, &self.type_aliases);
+        let unions = Column::push(out, &self.unions);
+        let uses = Column::push(out, &self.uses);
+        let use_trees = Column::push(out, &self.use_trees);
+        let use_tree_lists = Column::push(out, &self.use_tree_lists);
+        let ctor_vis = Column::push(out, &self.ctor_vis);
+        let attr_owners = Column::push(out, &self.attr_owners);
+
         let at = out.next::<Root>();
+        let field = |offset: usize| at + offset as u64;
         let root = Root {
-            top_level: top_level.slice(at + offset_of!(Root, top_level) as u64),
-            small_data: small.slice(at + offset_of!(Root, small_data) as u64),
-            big_data: big.slice(at + offset_of!(Root, big_data) as u64),
-            attrs: attrs.slice(at + offset_of!(Root, attrs) as u64),
-            vis: vis.slice(at + offset_of!(Root, vis) as u64),
-            words: placed.rec(at + offset_of!(Root, words) as u64),
+            top_level: top_level.slice(field(offset_of!(Root, top_level))),
+            kinds: kinds.slice(field(offset_of!(Root, kinds))),
+            data: data.slice(field(offset_of!(Root, data))),
+            ast_ids: ast_ids.slice(field(offset_of!(Root, ast_ids))),
+            children: children.slice(field(offset_of!(Root, children))),
+            consts: consts.slice(field(offset_of!(Root, consts))),
+            enums: enums.slice(field(offset_of!(Root, enums))),
+            extern_blocks: extern_blocks.slice(field(offset_of!(Root, extern_blocks))),
+            extern_crates: extern_crates.slice(field(offset_of!(Root, extern_crates))),
+            functions: functions.slice(field(offset_of!(Root, functions))),
+            impls: impls.slice(field(offset_of!(Root, impls))),
+            macro2s: macro2s.slice(field(offset_of!(Root, macro2s))),
+            macro_calls: macro_calls.slice(field(offset_of!(Root, macro_calls))),
+            macro_rules: macro_rules.slice(field(offset_of!(Root, macro_rules))),
+            mods: mods.slice(field(offset_of!(Root, mods))),
+            statics: statics.slice(field(offset_of!(Root, statics))),
+            structs: structs.slice(field(offset_of!(Root, structs))),
+            traits: traits.slice(field(offset_of!(Root, traits))),
+            type_aliases: type_aliases.slice(field(offset_of!(Root, type_aliases))),
+            unions: unions.slice(field(offset_of!(Root, unions))),
+            uses: uses.slice(field(offset_of!(Root, uses))),
+            use_trees: use_trees.slice(field(offset_of!(Root, use_trees))),
+            use_tree_lists: use_tree_lists.slice(field(offset_of!(Root, use_tree_lists))),
+            ctor_vis: ctor_vis.slice(field(offset_of!(Root, ctor_vis))),
+            attr_owners: attr_owners.slice(field(offset_of!(Root, attr_owners))),
+            words: placed.rec(field(offset_of!(Root, words))),
+            names_at,
+            paths_at,
+            vis_at,
+            attrs_at,
+            cfgs_at,
         };
         let written = out.push(&root);
         debug_assert_eq!(written, at, "`Writer::next` is not where `push` writes");
@@ -321,122 +379,71 @@ impl Persist for ItemTree {
 
     fn read(buffer: &[u8]) -> Result<ItemTreeRef<'_>, FormatError> {
         let root = blaze_format::open_as::<Root>(buffer, Self::SCHEMA)?;
-        Ok(ItemTreeRef {
-            buffer,
-            root,
-            top_level: root.top_level.follow(buffer)?,
-            small: root.small_data.follow(buffer)?,
-            big: root.big_data.follow(buffer)?,
-            attrs: root.attrs.follow(buffer)?,
-            vis: root.vis.follow(buffer)?,
+        Ok(ItemTreeRef { buffer, root, top_level: root.top_level.follow(buffer)? })
+    }
+}
+
+impl Code for RawVisibility {
+    fn put(&self, w: &mut Words) {
+        match self {
+            RawVisibility::Module(path, explicitness) => {
+                w.u32(0);
+                path.put(w);
+                explicitness.put(w);
+            }
+            RawVisibility::PubSelf(explicitness) => {
+                w.u32(1);
+                explicitness.put(w);
+            }
+            RawVisibility::PubCrate => w.u32(2),
+            RawVisibility::Public => w.u32(3),
+        }
+    }
+
+    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
+        Ok(match r.tag(4, "a visibility out of range")? {
+            0 => {
+                let path = r.get()?;
+                RawVisibility::Module(path, r.get()?)
+            }
+            1 => RawVisibility::PubSelf(r.get()?),
+            2 => RawVisibility::PubCrate,
+            _ => RawVisibility::Public,
         })
     }
 }
 
-fn put_attrs(attrs: &AttrsOwned, w: &mut Words) {
-    let attrs = attrs.as_ref();
-    w.seq(attrs.deref().iter());
-}
-
-fn get_attrs(r: &mut Read<'_>) -> Result<AttrsOwned, FormatError> {
-    r.seq::<Attr, Box<[Attr]>>().map(AttrsOwned::from_attrs)
-}
-
-fn small_kind(item: &SmallModItem) -> u32 {
-    match item {
-        SmallModItem::Const(_) => 0,
-        SmallModItem::Enum(_) => 1,
-        SmallModItem::ExternBlock(_) => 2,
-        SmallModItem::Function(_) => 3,
-        SmallModItem::Impl(_) => 4,
-        SmallModItem::Macro2(_) => 5,
-        SmallModItem::MacroCall(_) => 6,
-        SmallModItem::MacroRules(_) => 7,
-        SmallModItem::Static(_) => 8,
-        SmallModItem::Trait(_) => 9,
-        SmallModItem::TypeAlias(_) => 10,
-        SmallModItem::Union(_) => 11,
+/// The word an [`ExpandTo`] is written as.
+fn expand_to_word(expand_to: ExpandTo) -> u32 {
+    match expand_to {
+        ExpandTo::Statements => 0,
+        ExpandTo::Items => 1,
+        ExpandTo::Pattern => 2,
+        ExpandTo::Type => 3,
+        ExpandTo::Expr => 4,
     }
 }
 
-fn put_small(item: &SmallModItem, w: &mut Words) {
-    match item {
-        SmallModItem::Const(it) => it.put(w),
-        SmallModItem::Enum(it) => it.put(w),
-        SmallModItem::ExternBlock(it) => it.put(w),
-        SmallModItem::Function(it) => it.put(w),
-        SmallModItem::Impl(it) => it.put(w),
-        SmallModItem::Macro2(it) => it.put(w),
-        SmallModItem::MacroCall(it) => it.put(w),
-        SmallModItem::MacroRules(it) => it.put(w),
-        SmallModItem::Static(it) => it.put(w),
-        SmallModItem::Trait(it) => it.put(w),
-        SmallModItem::TypeAlias(it) => it.put(w),
-        SmallModItem::Union(it) => it.put(w),
-    }
-}
-
-fn get_small(kind: u32, r: &mut Read<'_>) -> Result<SmallModItem, FormatError> {
-    Ok(match kind {
-        0 => SmallModItem::Const(r.get()?),
-        1 => SmallModItem::Enum(r.get()?),
-        2 => SmallModItem::ExternBlock(r.get()?),
-        3 => SmallModItem::Function(r.get()?),
-        4 => SmallModItem::Impl(r.get()?),
-        5 => SmallModItem::Macro2(r.get()?),
-        6 => SmallModItem::MacroCall(r.get()?),
-        7 => SmallModItem::MacroRules(r.get()?),
-        8 => SmallModItem::Static(r.get()?),
-        9 => SmallModItem::Trait(r.get()?),
-        10 => SmallModItem::TypeAlias(r.get()?),
-        _ => SmallModItem::Union(r.get()?),
+/// The [`ExpandTo`] written as `word`, if one is.
+fn expand_to_of(word: u32) -> Option<ExpandTo> {
+    Some(match word {
+        0 => ExpandTo::Statements,
+        1 => ExpandTo::Items,
+        2 => ExpandTo::Pattern,
+        3 => ExpandTo::Type,
+        4 => ExpandTo::Expr,
+        _ => return None,
     })
 }
 
-fn big_kind(item: &BigModItem) -> u32 {
-    match item {
-        BigModItem::ExternCrate(_) => 0,
-        BigModItem::Mod(_) => 1,
-        BigModItem::Use(_) => 2,
-        BigModItem::Struct(_) => 3,
-    }
-}
-
-fn put_big(item: &BigModItem, w: &mut Words) {
-    match item {
-        BigModItem::ExternCrate(it) => it.put(w),
-        BigModItem::Mod(it) => it.put(w),
-        BigModItem::Use(it) => it.put(w),
-        BigModItem::Struct(it) => it.put(w),
-    }
-}
-
-fn get_big(kind: u32, r: &mut Read<'_>) -> Result<BigModItem, FormatError> {
-    Ok(match kind {
-        0 => BigModItem::ExternCrate(r.get()?),
-        1 => BigModItem::Mod(r.get()?),
-        2 => BigModItem::Use(r.get()?),
-        _ => BigModItem::Struct(r.get()?),
-    })
-}
-
-impl Code for ModItemId {
+impl Code for ExpandTo {
     fn put(&self, w: &mut Words) {
-        w.u32(self.index);
+        w.u32(expand_to_word(*self));
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        r.u32().map(|index| ModItemId { index })
-    }
-}
-
-impl Code for RawVisibilityId {
-    fn put(&self, w: &mut Words) {
-        w.u32(self.0);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        r.u32().map(RawVisibilityId)
+        let word = r.u32()?;
+        expand_to_of(word).ok_or_else(|| r.invalid("a macro expansion kind out of range"))
     }
 }
 
@@ -490,232 +497,6 @@ impl Code for ImportAlias {
             0 => ImportAlias::Underscore,
             _ => ImportAlias::Alias(r.get()?),
         })
-    }
-}
-
-impl Code for UseTree {
-    fn put(&self, w: &mut Words) {
-        self.kind.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(UseTree { kind: r.get()? })
-    }
-}
-
-impl Code for UseTreeKind {
-    fn put(&self, w: &mut Words) {
-        match self {
-            UseTreeKind::Single { path, alias } => {
-                w.u32(0);
-                path.put(w);
-                alias.put(w);
-            }
-            UseTreeKind::Glob { path } => {
-                w.u32(1);
-                path.put(w);
-            }
-            UseTreeKind::Prefixed { prefix, list } => {
-                w.u32(2);
-                prefix.put(w);
-                list.put(w);
-            }
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(3, "a use tree kind out of range")? {
-            0 => {
-                let path = r.get()?;
-                UseTreeKind::Single { path, alias: r.get()? }
-            }
-            1 => UseTreeKind::Glob { path: r.get()? },
-            _ => {
-                let prefix = r.get()?;
-                UseTreeKind::Prefixed { prefix, list: r.get()? }
-            }
-        })
-    }
-}
-
-impl Code for Use {
-    fn put(&self, w: &mut Words) {
-        self.visibility.put(w);
-        self.use_tree.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        let visibility = r.get()?;
-        Ok(Use { visibility, use_tree: r.get()? })
-    }
-}
-
-impl Code for ExternCrate {
-    fn put(&self, w: &mut Words) {
-        self.name.put(w);
-        self.alias.put(w);
-        self.visibility.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        let name = r.get()?;
-        let alias = r.get()?;
-        Ok(ExternCrate { name, alias, visibility: r.get()? })
-    }
-}
-
-impl Code for ExternBlock {
-    fn put(&self, w: &mut Words) {
-        self.children.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(ExternBlock { children: r.get()? })
-    }
-}
-
-/// `Code` for the items that are a name and a visibility.
-macro_rules! named_items {
-    ($($ty:ident),* $(,)?) => {$(
-        impl Code for $ty {
-            fn put(&self, w: &mut Words) {
-                self.name.put(w);
-                self.visibility.put(w);
-            }
-
-            fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-                let name = r.get()?;
-                Ok($ty { name, visibility: r.get()? })
-            }
-        }
-    )*};
-}
-named_items!(Function, Union, Enum, Const, Static, Trait, TypeAlias, Macro2);
-
-impl Code for StructValueNsCtor {
-    fn put(&self, w: &mut Words) {
-        match self {
-            StructValueNsCtor::NoValueNsCtor => w.u32(0),
-            StructValueNsCtor::ValueNsCtorWithVis(vis) => {
-                w.u32(1);
-                vis.put(w);
-            }
-            StructValueNsCtor::ValueNsCtorWithMinVis(all) => {
-                w.u32(2);
-                all.put(w);
-            }
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(3, "a struct constructor visibility out of range")? {
-            0 => StructValueNsCtor::NoValueNsCtor,
-            1 => StructValueNsCtor::ValueNsCtorWithVis(r.get()?),
-            _ => StructValueNsCtor::ValueNsCtorWithMinVis(r.get()?),
-        })
-    }
-}
-
-impl Code for Struct {
-    fn put(&self, w: &mut Words) {
-        self.name.put(w);
-        self.visibility.put(w);
-        self.value_ns_ctor.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        let name = r.get()?;
-        let visibility = r.get()?;
-        Ok(Struct { name, visibility, value_ns_ctor: r.get()? })
-    }
-}
-
-impl Code for Impl {
-    fn put(&self, w: &mut Words) {
-        w.bool(self.is_trait_impl);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(Impl { is_trait_impl: r.bool()? })
-    }
-}
-
-impl Code for ModKind {
-    fn put(&self, w: &mut Words) {
-        match self {
-            ModKind::Inline { items } => {
-                w.u32(0);
-                items.put(w);
-            }
-            ModKind::Outline => w.u32(1),
-        }
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(2, "a module kind out of range")? {
-            0 => ModKind::Inline { items: r.get()? },
-            _ => ModKind::Outline,
-        })
-    }
-}
-
-impl Code for Mod {
-    fn put(&self, w: &mut Words) {
-        self.name.put(w);
-        self.visibility.put(w);
-        self.kind.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        let name = r.get()?;
-        let visibility = r.get()?;
-        Ok(Mod { name, visibility, kind: r.get()? })
-    }
-}
-
-impl Code for ExpandTo {
-    fn put(&self, w: &mut Words) {
-        w.u32(match self {
-            ExpandTo::Statements => 0,
-            ExpandTo::Items => 1,
-            ExpandTo::Pattern => 2,
-            ExpandTo::Type => 3,
-            ExpandTo::Expr => 4,
-        });
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(5, "a macro expansion kind out of range")? {
-            0 => ExpandTo::Statements,
-            1 => ExpandTo::Items,
-            2 => ExpandTo::Pattern,
-            3 => ExpandTo::Type,
-            _ => ExpandTo::Expr,
-        })
-    }
-}
-
-impl Code for MacroCall {
-    fn put(&self, w: &mut Words) {
-        self.path.put(w);
-        self.expand_to.put(w);
-        self.ctxt.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        let path = r.get()?;
-        let expand_to = r.get()?;
-        Ok(MacroCall { path, expand_to, ctxt: r.get()? })
-    }
-}
-
-impl Code for MacroRules {
-    fn put(&self, w: &mut Words) {
-        self.name.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(MacroRules { name: r.get::<Name>()? })
     }
 }
 
@@ -1020,8 +801,7 @@ pub(crate) fn assert_round_trip(tree: &ItemTree) {
     let buffer = blaze_format::Aligned::copy_from(&bytes);
     let read = ItemTree::read(&buffer).expect("an item tree just written");
     assert_eq!(read.top_level().collect::<Vec<_>>(), tree.top_level.to_vec());
-    assert_eq!(read.small_items(), tree.small_data.len());
-    assert_eq!(read.big_items(), tree.big_data.len());
+    assert_eq!(read.len(), tree.kinds.len());
     let decoded = read.decode().expect("an item tree just written");
     assert_eq!(decoded, *tree);
     assert_eq!(blaze_format::to_bytes(&decoded), bytes, "an item tree written twice differs");
@@ -1177,10 +957,22 @@ fn f() {}
     fn values_only_the_item_tree_holds_round_trip() {
         round_trip(&FieldsShape::Tuple);
         round_trip(&FieldsShape::Unit);
-        round_trip(&ExpandTo::Pattern);
+        for expand_to in [
+            ExpandTo::Statements,
+            ExpandTo::Items,
+            ExpandTo::Pattern,
+            ExpandTo::Type,
+            ExpandTo::Expr,
+        ] {
+            round_trip(&expand_to);
+            assert_eq!(expand_to_of(expand_to_word(expand_to)), Some(expand_to));
+        }
+        assert_eq!(expand_to_of(5), None);
         round_trip(&VisibilityExplicitness::Implicit);
         round_trip(&ImportAlias::Underscore);
-        round_trip(&RawVisibilityId::PUB_CRATE);
+        round_trip(&RawVisibility::PubCrate);
+        round_trip(&RawVisibility::Public);
+        round_trip(&RawVisibility::PubSelf(VisibilityExplicitness::Explicit));
         for kind in [
             tt::LitKind::Byte,
             tt::LitKind::StrRaw(3),
@@ -1263,12 +1055,29 @@ fn f() {}
         value as *const T as usize - buffer.as_ptr() as usize
     }
 
+    /// `bytes` with the `u32` at byte `field` of `record` (which is in `buffer`) set to `word`.
+    fn patched_field<T>(
+        bytes: &[u8],
+        buffer: &[u8],
+        record: &T,
+        field: usize,
+        word: u32,
+    ) -> blaze_format::Aligned {
+        patched(bytes, offset_in(record, buffer) + field, word)
+    }
+
+    /// Whether a buffer that opens is refused on decode.
+    fn refused(buffer: &blaze_format::Aligned) -> bool {
+        ItemTree::read(buffer).expect("ids are checked on decode").decode().is_err()
+    }
+
     #[test]
     fn a_corrupted_buffer_is_refused() {
         let (db, file_id) = TestDB::with_single_file(
             r#"
 extern "C" { fn f(); }
 pub(in crate::m) fn g() {}
+use a::{b, c};
 "#,
         );
         let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
@@ -1276,34 +1085,49 @@ pub(in crate::m) fn g() {}
         let bytes = blaze_format::to_bytes(tree);
         let buffer = blaze_format::Aligned::copy_from(&bytes);
         let root = blaze_format::open_as::<Root>(&buffer, ItemTree::SCHEMA).unwrap();
-        let small = root.small_data.get(&buffer);
-        let words = root.words.words.get(&buffer);
-        let word_at = |index: u32| offset_in(&words[index as usize], &buffer);
 
-        // A node's kind out of range.
-        let kind_at = offset_in(&small[0], &buffer) + offset_of!(Node, kind);
-        let bad = patched(&bytes, kind_at, SMALL_KINDS + 3);
-        assert!(ItemTree::read(&bad).expect("a node's kind is checked on decode").decode().is_err());
+        // An item's kind out of range.
+        let kinds = root.kinds.get(&buffer);
+        let mut bad = bytes.clone();
+        bad[offset_in(&kinds[0], &buffer)] = ItemKind::ALL.len() as u8;
+        assert!(refused(&blaze_format::Aligned::copy_from(&bad)));
 
-        // The extern block's count of children past the words.
-        let block = small.iter().find(|node| node.kind == 2).expect("the extern block");
-        let bad = patched(&bytes, word_at(block.at + 1), u32::MAX);
-        assert!(ItemTree::read(&bad).unwrap().decode().is_err());
+        // An item past the column of its kind.
+        let data = root.data.get(&buffer);
+        assert!(refused(&patched_field(&bytes, &buffer, &data[0], 0, 1000)));
 
-        // An extern block child that is not an item of the tree.
-        let bad = patched(&bytes, word_at(block.at + 2), 1000 << 1);
-        assert!(ItemTree::read(&bad).unwrap().decode().is_err());
+        // The extern block's list of children past the array.
+        let block = &root.extern_blocks.get(&buffer)[0];
+        let len = offset_of!(ExternBlock, children) + offset_of!(IdRange, len);
+        assert!(refused(&patched_field(&bytes, &buffer, block, len, u32::MAX)));
 
-        // A function's visibility that is not in the arena.
-        let function = small.iter().rfind(|node| node.kind == 3).expect("a function");
-        let bad = patched(&bytes, word_at(function.at + 2), 7);
-        assert!(ItemTree::read(&bad).unwrap().decode().is_err());
+        // An extern block child that is not an item of the tree, or not before the block.
+        let children = root.children.get(&buffer);
+        assert!(refused(&patched_field(&bytes, &buffer, &children[0], 0, 1000)));
+        let block_item = (0..kinds.len())
+            .find(|&at| kinds[at] == ItemKind::ExternBlock as u8)
+            .expect("the extern block");
+        assert!(refused(&patched_field(&bytes, &buffer, &children[0], 0, block_item as u32)));
+
+        // A function's visibility and name that are not in the tables.
+        let functions = root.functions.get(&buffer);
+        let g = functions.iter().rfind(|it| !it.visibility.is_builtin()).expect("`g`");
+        let vis = offset_of!(Function, visibility);
+        assert!(refused(&patched_field(&bytes, &buffer, g, vis, 7)));
+        assert!(refused(&patched_field(&bytes, &buffer, g, offset_of!(Function, name), 1000)));
+
+        // A use tree holding itself.
+        let use_trees = root.use_trees.get(&buffer);
+        let lists = root.use_tree_lists.get(&buffer);
+        let parent = use_trees.len() as u32 - 1;
+        assert_eq!(use_trees[parent as usize].kind, UseTree::PREFIXED);
+        assert!(refused(&patched_field(&bytes, &buffer, &lists[0], 0, parent)));
 
         // A top-level item past the arrays reads in place, and is refused on decode.
         let top = root.top_level.get(&buffer);
-        let bad = patched(&bytes, offset_in(&top[0], &buffer), 999 << 1);
+        let bad = patched_field(&bytes, &buffer, &top[0], 0, 999);
         let read = ItemTree::read(&bad).unwrap();
-        assert_eq!(read.top_level().next(), Some(ModItemId { index: 999 << 1 }));
+        assert_eq!(read.top_level().next(), Some(ModItemId { index: 999 }));
         assert!(read.decode().is_err());
 
         // A buffer of another schema.
@@ -1320,14 +1144,13 @@ pub(in crate::m) fn g() {}
         let bytes = blaze_format::to_bytes(tree);
         let buffer = blaze_format::Aligned::copy_from(&bytes);
         let root = blaze_format::open_as::<Root>(&buffer, ItemTree::SCHEMA).unwrap();
-        let attrs = root.attrs.get(&buffer);
         let words = root.words.words.get(&buffer);
         let word_at = |index: u32| offset_in(&words[index as usize], &buffer);
-        // The words of the one attribute list: its owner, the count of attributes, the path
-        // (its kind, the count of segments, a segment), the input's option and kind, then the
-        // token tree: whether it dropped a top, the count of tokens, the top subtree's tag.
-        let node = attrs.iter().find(|node| node.kind == 0).expect("the function's attributes");
-        let count = node.at + 1 + 1 + 3 + 2 + 1;
+        // The words of the tree's attributes: their count, then the one attribute's path (its
+        // kind, the count of segments, a segment), the input's option and kind, then the token
+        // tree: whether it dropped a top, the count of tokens, the top subtree's tag.
+        assert_eq!(words[root.attrs_at as usize], 1, "the one attribute");
+        let count = root.attrs_at + 1 + 3 + 2 + 1;
         assert_eq!(words[count as usize], 4, "the flat tokens of `(a, b)`: ( a , b");
         // The top subtree: its tag, two spans of 5 words, its kind, then its length.
         let top_len = count + 1 + 1 + 2 * 5 + 1;

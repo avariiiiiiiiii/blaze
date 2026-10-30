@@ -3172,14 +3172,17 @@ impl ModCollector<'_, '_> {
             }
             // out of line module, resolve, parse and recurse
             ModKind::Outline => {
-                let ast_id = AstId::new(self.file_id(), module_ast_id);
+                let file_id = self.file_id();
+                let ast_id = AstId::new(file_id, module_ast_id);
                 let db = self.def_collector.db;
+                let krate = self.def_collector.def_map.krate;
                 match self.mod_dir.resolve_declaration(
                     db,
-                    self.def_collector.def_map.krate,
-                    self.file_id(),
+                    krate,
+                    file_id,
                     &module.name,
                     path_attr.as_deref(),
+                    &mut self.def_collector.path_buf,
                 ) {
                     Ok((file_id, is_mod_rs, mod_dir)) => {
                         let item_tree =
@@ -3280,8 +3283,12 @@ impl ModCollector<'_, '_> {
                 data.scope_mut().define_legacy_macro(name.clone(), mac);
             }
         }
-        modules[self.module_id].children_mut().insert(name.clone(), module);
+        let replaced = modules[self.module_id].children_mut().insert(name.clone(), module);
         modules.insert(module, data);
+        if replaced.is_some() {
+            // A path can read whether a module is its parent's `__blaze_test_harness`.
+            self.def_collector.imports.wake_all();
+        }
 
         let def = ModuleDefId::from(module);
 
@@ -3308,8 +3315,11 @@ impl ModCollector<'_, '_> {
         mod_item: ModItemId,
         container: ItemContainerId,
     ) -> Result<(), ()> {
-        let ignore_up_to =
-            self.def_collector.skip_attrs.get(&InFile::new(self.file_id(), mod_item)).copied();
+        let skip_attrs = &self.def_collector.skip_attrs;
+        let ignore_up_to = match skip_attrs.is_empty() {
+            true => None,
+            false => skip_attrs.get(&InFile::new(self.file_id(), mod_item)).copied(),
+        };
         for (attr_id, attr) in attrs.iter_after(ignore_up_to) {
             if self.def_collector.def_map.is_builtin_or_registered_attr(&attr.path) {
                 continue;
@@ -3568,19 +3578,10 @@ impl ModCollector<'_, '_> {
                 // is not in its scope until imports are resolved, after this call would be:
                 // lol_html's `cfg_if!` defines its `trace!` for the modules that follow.
                 let imported = || {
-                    self.def_collector.unresolved_imports.iter().find_map(|it| {
-                        let import = &it.import;
-                        let named = match &import.alias {
-                            Some(ImportAlias::Alias(alias)) => alias,
-                            Some(ImportAlias::Underscore) => return None,
-                            None => import.path.segments().last()?,
-                        };
-                        let plain = matches!(import.source.kind, ImportKind::Plain);
-                        if it.module_id != self.module_id || !plain || named != name {
-                            return None;
-                        }
-                        of_another_crate(&import.path)
-                    })
+                    self.def_collector
+                        .imports
+                        .unresolved_named(self.module_id, *name)
+                        .find_map(|it| of_another_crate(&it.import.path))
                 };
                 // The std prelude is another crate's, collected in full. Its `include!` read at
                 // item level puts the `macro_rules!` of the file in the textual scope of what
@@ -3687,7 +3688,9 @@ impl ModCollector<'_, '_> {
 
         for (name, macs) in source.scope(self.def_collector.db).legacy_macros() {
             if let Some(&mac) = macs.last() {
-                target.scope_mut().define_legacy_macro(name.clone(), mac);
+                let name: Name = name.clone();
+                target.scope_mut().define_legacy_macro(name, mac);
+                self.def_collector.imports.wake_env(name, MACROS);
             }
         }
     }

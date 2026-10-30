@@ -1,22 +1,26 @@
-//! The canonical bytes of a prepared function ([`Shape`]): its IR as Cranelift prints it, with
-//! each function, static and symbol by its place among the references and each object of its
-//! own data by content, then its data, positions and named locals. Nothing in it is a number
-//! of the run or of the order requests were made in, so two instances whose IR is the same
-//! but for which places they name are one shape (`Vec<A>::drop` and `Vec<B>::drop` of a
-//! pointer-sized `A` and `B`).
+//! The canonical bytes of a prepared function ([`Shape`]): its IR as Cranelift's own `Hash` of
+//! the function's stencil writes it (what Cranelift's incremental cache keys on), then each
+//! name of the IR by its place among the references or the number of its own data, then that
+//! data, the positions and the named locals. Nothing in it is a number of the run or of the
+//! order requests were made in, so two instances whose IR is the same but for which places
+//! they name are one shape (`Vec<A>::drop` and `Vec<B>::drop` of a pointer-sized `A` and `B`).
+//!
+//! Cost: one pass over the IR and its data into one buffer sized up front, with no clone of
+//! the function, no printing and no `String`; about 4 to 8 bytes per value and instruction.
 
-use std::fmt::Write as _;
+use std::hash::{Hash as _, Hasher};
 
 use blaze_codegen::backend::Shape;
-use cranelift_codegen::ir::{self, UserExternalName, UserFuncName};
+use cranelift_codegen::ir::{self, UserExternalName};
+use cranelift_module::ModuleRelocTarget;
 
 use super::{Built, DataPlace, Function, Places, side::Variable};
 use crate::{
     ConstBlob, DataIdentity,
-    fragment::{self, DataRequest, Requests},
+    fragment::{self, DataRequest, Hint, Requests},
 };
 
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 /// Where data is in a shape, as the names of its IR have it.
 mod namespace {
@@ -26,80 +30,171 @@ mod namespace {
     pub(super) const OWN: u32 = 4;
 }
 
+/// The parts of a shape, each once, in this order.
+mod part {
+    pub(super) const IR: u8 = 1;
+    pub(super) const NAMES: u8 = 2;
+    pub(super) const NAMED: u8 = 3;
+    pub(super) const ASM: u8 = 4;
+    pub(super) const DATA: u8 = 5;
+    pub(super) const SPANS: u8 = 6;
+    pub(super) const VARIABLES: u8 = 7;
+    pub(super) const HINT: u8 = 8;
+    pub(super) const VALUE: u8 = 9;
+}
+
 pub(crate) fn of(function: &Function) -> Result<Shape, String> {
-    let mut out = Out(vec![VERSION]);
     let places = &function.places;
-    out.part(b"refs", &places.refs.to_le_bytes());
     let requests = function.requests();
     let data = Data::of(places, requests)?;
+    let mut out = Out::with_capacity(estimate(function));
+    out.u8(VERSION);
+    out.u32(places.refs);
     match &function.code {
         Built::Ir(pending) => {
-            out.part(b"ir", ir(&pending.func, places, &data)?.as_bytes());
-            let mut more = String::new();
-            for slot in &pending.named {
-                write!(more, "{slot} ").expect("a String");
+            let func = &pending.func;
+            out.u8(part::IR);
+            func.stencil.hash(&mut out);
+            out.u8(part::NAMES);
+            let names = func.params.user_named_funcs();
+            out.u32(names.len() as u32);
+            for (_, name) in names.iter() {
+                let canonical = match name.namespace {
+                    0 => UserExternalName::new(namespace::PLACE, place(places, name.index)?),
+                    1 => data.name(name.index)?,
+                    fragment::INLINED => return Err("a reference of a body built in".to_owned()),
+                    other => return Err(format!("a name in the unknown namespace {other}")),
+                };
+                out.name(canonical);
             }
-            write!(more, "| {:?}", pending.wants.pointees).expect("a String");
-            out.part(b"named", more.as_bytes());
+            out.u8(part::NAMED);
+            out.u32(pending.named.len() as u32);
+            for slot in &pending.named {
+                out.u32(slot.as_u32());
+            }
+            pending.wants.pointees.hash(&mut out);
         }
         Built::Assembled(code, _) => {
-            out.part(b"asm", &code.bytes);
-            out.part(b"align", &code.align.to_le_bytes());
-            let mut relocs = String::new();
+            out.u8(part::ASM);
+            out.bytes(&code.bytes);
+            out.u64(code.align);
+            out.u32(code.relocs.len() as u32);
             for reloc in &code.relocs {
-                let name = match &reloc.name {
-                    cranelift_module::ModuleRelocTarget::User { namespace: 0, index } => {
-                        format!("f{}", place(places, *index)?)
+                out.u32(reloc.offset);
+                out.u8(reloc_kind(reloc.kind));
+                out.u64(reloc.addend as u64);
+                match reloc.name {
+                    ModuleRelocTarget::User { namespace: 0, index } => {
+                        out.name(UserExternalName::new(namespace::PLACE, place(places, index)?));
                     }
-                    cranelift_module::ModuleRelocTarget::User { namespace: 1, index } => {
-                        format!("d{:?}", data.name(*index)?)
-                    }
-                    other => format!("{other:?}"),
-                };
-                writeln!(relocs, "{} {:?} {name} {}", reloc.offset, reloc.kind, reloc.addend)
-                    .expect("a String");
+                    ModuleRelocTarget::User { namespace: 1, index } => out.name(data.name(index)?),
+                    ref other => return Err(format!("assembly naming {other:?}")),
+                }
             }
-            out.part(b"relocs", relocs.as_bytes());
-            let elf: Vec<u8> = code
-                .elf_types
-                .iter()
-                .flat_map(|&(at, kind)| [at, kind])
-                .flat_map(u32::to_le_bytes)
-                .collect();
-            out.part(b"elf", &elf);
+            out.u32(code.elf_types.len() as u32);
+            for &(at, kind) in &code.elf_types {
+                out.u32(at);
+                out.u32(kind);
+            }
         }
     }
     data.write(&mut out, requests, places)?;
-    let mut spans = Vec::with_capacity(function.spans.len() * 36);
+    out.u8(part::SPANS);
+    out.u32(function.spans.len() as u32);
     for span in &function.spans {
-        spans.extend_from_slice(&span.anchor.0);
-        spans.extend_from_slice(&span.index.to_le_bytes());
+        out.raw(&span.anchor.0);
+        out.u32(span.index);
     }
-    out.part(b"spans", &spans);
-    out.part(b"variables", &variables(&function.variables));
-    out.part(b"hint", format!("{:?}", function.hint).as_bytes());
+    out.u8(part::VARIABLES);
+    variables(&mut out, &function.variables);
+    out.u8(part::HINT);
+    out.u8(match function.hint {
+        Hint::None => 0,
+        Hint::Inline => 1,
+        Hint::Always => 2,
+        Hint::Never => 3,
+    });
     Ok(Shape(out.0))
 }
 
 /// The canonical bytes of a static's value, as [`of`] has a function's data.
 pub(crate) fn value(blob: &ConstBlob, requests: &Requests, places: &Places) -> Result<Vec<u8>, String> {
-    let mut out = Out(vec![VERSION]);
-    out.part(b"refs", &places.refs.to_le_bytes());
     let data = Data::of(places, requests)?;
+    let mut out = Out::with_capacity(64 + 2 * blob.bytes.len());
+    out.u8(VERSION);
+    out.u32(places.refs);
     data.write(&mut out, requests, places)?;
-    let mut text = String::new();
-    data.blob(&mut text, blob, places)?;
-    out.part(b"value", text.as_bytes());
+    out.u8(part::VALUE);
+    data.blob(&mut out, blob, places)?;
     Ok(out.0)
 }
 
+/// A shape's size, give or take: the stencil's `Hash` writes a few words per value, instruction
+/// and block.
+fn estimate(function: &Function) -> usize {
+    let data: usize = function
+        .requests()
+        .datas
+        .iter()
+        .map(|it| match it {
+            DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => {
+                blob.bytes.len() + 16 * (blob.relocs.len() + blob.fn_relocs.len())
+            }
+            _ => 40,
+        })
+        .sum();
+    let code = match &function.code {
+        Built::Ir(pending) => {
+            let dfg = &pending.func.dfg;
+            24 * dfg.num_insts() + 8 * dfg.num_values() + 16 * dfg.num_blocks()
+        }
+        Built::Assembled(code, _) => code.bytes.len() + 24 * code.relocs.len(),
+    };
+    256 + code + data + 36 * function.spans.len() + 48 * function.variables.len()
+}
+
+/// The shape being written. As a [`Hasher`] it keeps every byte it is given: the stencil's
+/// derived `Hash` is a serialization of it, so equal bytes are equal IR, with no hash between.
 struct Out(Vec<u8>);
 
 impl Out {
-    fn part(&mut self, name: &[u8], bytes: &[u8]) {
-        self.0.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        self.0.extend_from_slice(name);
-        self.0.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    fn with_capacity(capacity: usize) -> Out {
+        Out(Vec::with_capacity(capacity))
+    }
+
+    fn u8(&mut self, it: u8) {
+        self.0.push(it);
+    }
+
+    fn u32(&mut self, it: u32) {
+        self.0.extend_from_slice(&it.to_le_bytes());
+    }
+
+    fn u64(&mut self, it: u64) {
+        self.0.extend_from_slice(&it.to_le_bytes());
+    }
+
+    fn raw(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.u64(bytes.len() as u64);
+        self.raw(bytes);
+    }
+
+    fn name(&mut self, name: UserExternalName) {
+        self.u32(name.namespace);
+        self.u32(name.index);
+    }
+}
+
+impl Hasher for Out {
+    fn finish(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
         self.0.extend_from_slice(bytes);
     }
 }
@@ -148,15 +243,21 @@ impl Data {
 
     /// The content of the function's own data and its positions, in their order.
     fn write(&self, out: &mut Out, requests: &Requests, places: &Places) -> Result<(), String> {
-        let mut text = String::new();
+        out.u8(part::DATA);
+        out.u32(places.datas.len() as u32);
         for (index, place) in places.datas.iter().enumerate() {
             match place {
-                DataPlace::Place(_) => {}
+                DataPlace::Place(_) => out.u8(0),
                 DataPlace::Position(span) => {
-                    writeln!(text, "position {} {}", span.anchor, span.index).expect("a String");
+                    out.u8(1);
+                    out.raw(&span.anchor.0);
+                    out.u32(span.index);
                 }
-                DataPlace::Text(it) => writeln!(text, "text {it:?}").expect("a String"),
-                DataPlace::Nowhere => writeln!(text, "nowhere").expect("a String"),
+                DataPlace::Text(it) => {
+                    out.u8(2);
+                    out.bytes(it.as_bytes());
+                }
+                DataPlace::Nowhere => out.u8(3),
                 DataPlace::Own => {
                     let blob = match &requests.datas[index] {
                         DataRequest::Blob { identity: DataIdentity::Writable, .. } => {
@@ -165,64 +266,55 @@ impl Data {
                         DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => blob,
                         _ => return Err(format!("data {index} is its own but has no blob")),
                     };
-                    self.blob(&mut text, blob, places)?;
+                    out.u8(4);
+                    self.blob(out, blob, places)?;
                 }
             }
         }
-        out.part(b"data", text.as_bytes());
         Ok(())
     }
 
-    fn blob(&self, text: &mut String, blob: &ConstBlob, places: &Places) -> Result<(), String> {
+    fn blob(&self, out: &mut Out, blob: &ConstBlob, places: &Places) -> Result<(), String> {
         if !blob.type_ids.is_empty() {
             return Err("a constant with a `TypeId` not filled in".to_owned());
         }
-        write!(text, "blob {} {:02x?}", blob.align, blob.bytes).expect("a String");
-        for (at, data, addend) in &blob.relocs {
-            let name = self.name(data.as_u32())?;
-            write!(text, " {at}:{}:{}{addend:+}", name.namespace, name.index).expect("a String");
+        out.u64(blob.align);
+        out.bytes(&blob.bytes);
+        out.u32(blob.relocs.len() as u32);
+        for &(at, data, addend) in &blob.relocs {
+            out.u32(at);
+            out.name(self.name(data.as_u32())?);
+            out.u64(addend as u64);
         }
-        for (at, func) in &blob.fn_relocs {
-            write!(text, " {at}:f{}", place(places, func.as_u32())?).expect("a String");
+        out.u32(blob.fn_relocs.len() as u32);
+        for &(at, func) in &blob.fn_relocs {
+            out.u32(at);
+            out.u32(place(places, func.as_u32())?);
         }
-        text.push('\n');
         Ok(())
     }
 }
 
-/// The IR as Cranelift prints it, every name by its place.
-fn ir(func: &ir::Function, places: &Places, data: &Data) -> Result<String, String> {
-    let mut func = func.clone();
-    func.name = UserFuncName::user(0, 0);
-    let names: Vec<_> =
-        func.params.user_named_funcs().iter().map(|(at, name)| (at, name.clone())).collect();
-    for (at, name) in names {
-        let canonical = match name.namespace {
-            0 => UserExternalName::new(namespace::PLACE, place(places, name.index)?),
-            1 => data.name(name.index)?,
-            fragment::INLINED => return Err("a reference of a body built in".to_owned()),
-            other => return Err(format!("a name in the unknown namespace {other}")),
-        };
-        func.params.reset_user_func_name(at, canonical);
-    }
-    Ok(func.display().to_string())
+/// A relocation kind of an assembly function by number: Cranelift's `Reloc` has no `Hash`.
+fn reloc_kind(kind: cranelift_codegen::binemit::Reloc) -> u8 {
+    // A fieldless enum: its discriminant is the kind, stable within one Cranelift, which the
+    // unit's settings name.
+    kind as u8
 }
 
-fn variables(variables: &[Variable]) -> Vec<u8> {
-    let mut bytes = Vec::new();
+fn variables(out: &mut Out, variables: &[Variable]) {
+    out.u32(variables.len() as u32);
     for variable in variables {
-        bytes.extend_from_slice(&(variable.name.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(variable.name.as_bytes());
-        bytes.push(u8::from(variable.param));
-        bytes.extend_from_slice(&variable.ty.0);
-        bytes.extend_from_slice(&variable.slot.to_le_bytes());
+        out.bytes(variable.name.as_bytes());
+        out.u8(u8::from(variable.param));
+        out.raw(&variable.ty.0);
+        out.u32(variable.slot);
         match variable.pointer {
             Some(offset) => {
-                bytes.push(1);
-                bytes.extend_from_slice(&offset.to_le_bytes());
+                out.u8(1);
+                out.u32(offset);
             }
-            None => bytes.push(0),
+            None => out.u8(0),
         }
     }
-    bytes
 }

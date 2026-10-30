@@ -5,19 +5,47 @@
 //! A copy of its pages is written, given their protection, and mapped over them in one
 //! `mach_vm_remap`, then the instruction cache is invalidated (`sys_icache_invalidate`).
 //! `pthread_jit_write_protect_np` only switches pages mapped `MAP_JIT`, which can't be mapped
-//! at a fixed address such as the image's patch code region, so it has no part here.
+//! at a fixed address (XNU refuses `MAP_JIT | MAP_FIXED`) such as the image's patch code
+//! region, where the linker resolved the patch's references, so it has no part here.
+//!
+//! The code region's protection and the table cell's are read once, at start. A patch's code
+//! is one remap per run of pages it writes (runs closer than [`MERGE`] are one, the pages
+//! between copied as they are), its bytes copied straight from the message into the copy.
 
 use std::{
-    ffi::c_void,
+    ffi::{CString, c_char, c_int, c_void},
     ops::Range,
-    sync::atomic::{AtomicU64, Ordering},
+    os::unix::ffi::OsStrExt,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
-pub(super) use super::unix::{backtrace, descriptor};
+pub(super) use super::unix::{Map, backtrace, descriptor};
 use super::{
-    switch::{Dwarf, Layout, Memory},
+    Events,
+    switch::{Dwarf, Layout, Memory, Writes},
     unix::__register_frame,
 };
+
+#[repr(C)]
+#[allow(dead_code)]
+struct Kevent {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: isize,
+    udata: *mut c_void,
+}
+
+#[repr(C)]
+struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
 
 unsafe extern "C" {
     fn mach_task_self() -> u32;
@@ -47,18 +75,48 @@ unsafe extern "C" {
         object: *mut u32,
     ) -> i32;
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
+    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+    fn close(fd: c_int) -> c_int;
+    fn kqueue() -> c_int;
+    fn kevent(
+        kq: c_int,
+        changes: *const Kevent,
+        change_count: c_int,
+        events: *mut Kevent,
+        event_count: c_int,
+        timeout: *const Timespec,
+    ) -> c_int;
 }
 
+const READ: i32 = 1;
 const WRITE: i32 = 2;
 const EXECUTE: i32 = 4;
 const PAGE: u64 = 0x4000;
+/// Runs of pages written this close together are remapped as one.
+const MERGE: u64 = 4 * PAGE;
 const ANYWHERE: i32 = 1;
 const FIXED: i32 = 0;
 const OVERWRITE: i32 = 0x4000;
 const INHERIT_NONE: u32 = 2;
 const BASIC_INFO_64: i32 = 9;
+const O_EVTONLY: c_int = 0x8000;
+const O_CLOEXEC: c_int = 0x0100_0000;
+const EVFILT_VNODE: i16 = -4;
+const EV_ADD: u16 = 0x1;
+const EV_CLEAR: u16 = 0x20;
+const NOTE_DELETE: u32 = 0x1;
+const NOTE_WRITE: u32 = 0x2;
+const NOTE_RENAME: u32 = 0x20;
+/// How long the watching thread blocks before it looks whether to stop.
+const WAKE_EVERY: Timespec = Timespec { sec: 1, nsec: 0 };
 
-pub(super) struct Os;
+pub(super) struct Os {
+    /// The patch code region in memory, and its protection.
+    code: Range<u64>,
+    protection: i32,
+    /// The protection of the table cell's region.
+    cell: i32,
+}
 
 impl Os {
     pub(super) fn new(layout: &Layout) -> Result<Os, String> {
@@ -69,12 +127,23 @@ impl Os {
                 code.start, code.end
             ));
         }
+        let mut protection = None;
         let mut at = code.start;
         while at < code.end {
-            at = region_at(at)?.0.end;
+            let (region, this) = region_at(at)?;
+            match protection {
+                Some(other) if other != this => {
+                    return Err(format!(
+                        "the patch code region has pages of protection {other:#x} and, at \
+                         {at:#x}, {this:#x}"
+                    ));
+                }
+                _ => protection = Some(this),
+            }
+            at = region.end;
         }
-        region_at(layout.cell())?;
-        Ok(Os)
+        let (_, cell) = region_at(layout.cell())?;
+        Ok(Os { code, protection: protection.unwrap_or(READ | EXECUTE), cell })
     }
 }
 
@@ -82,63 +151,65 @@ impl Memory for Os {
     const DWARF: Dwarf = Dwarf::Entries;
     const SEH: bool = false;
 
-    fn code(&mut self, writes: &[(u64, Vec<u8>)]) -> Result<(), String> {
-        let mut writes: Vec<&(u64, Vec<u8>)> =
-            writes.iter().filter(|it| !it.1.is_empty()).collect();
-        writes.sort_by_key(|it| it.0);
-        // The writes in runs of pages, each swapped once.
-        let mut runs: Vec<(Range<u64>, Vec<&(u64, Vec<u8>)>)> = Vec::new();
-        for write in writes {
-            let pages = pages(&(write.0..write.0 + write.1.len() as u64));
-            match runs.last_mut() {
-                Some((run, within)) if pages.start <= run.end => {
-                    run.end = run.end.max(pages.end);
-                    within.push(write);
+    fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
+        let mut run: Option<Range<u64>> = None;
+        for span in writes.spans {
+            let pages = pages(&span.range());
+            match &mut run {
+                Some(at) if pages.start <= at.end + MERGE => at.end = at.end.max(pages.end),
+                _ => {
+                    if let Some(done) = run.replace(pages) {
+                        self.swap_code(writes, &done)?;
+                    }
                 }
-                _ => runs.push((pages, vec![write])),
             }
         }
-        for (run, within) in runs {
-            let mut at = run.start;
-            while at < run.end {
-                let (region, protection) = region_at(at)?;
-                let piece = at..region.end.min(run.end);
-                let parts: Vec<(u64, &[u8])> = within
-                    .iter()
-                    .filter_map(|(start, bytes)| clip(*start, bytes, &piece))
-                    .collect();
-                // SAFETY: the pages are the patch code region's, mapped (`Os::new` checked);
-                // the bytes written are where no kept generation's code is, and the rest of
-                // the pages is copied as it is.
-                unsafe { swap(&piece, &parts, protection)? };
-                at = piece.end;
-            }
+        if let Some(done) = run {
+            self.swap_code(writes, &done)?;
         }
         Ok(())
     }
 
-    fn data(&mut self, writes: &[(u64, Vec<u8>)]) -> Result<(), String> {
-        for (start, bytes) in writes.iter().filter(|it| !it.1.is_empty()) {
-            let end = start + bytes.len() as u64;
-            let mut at = *start;
-            while at < end {
-                let (region, protection) = region_at(at)?;
-                let piece = at..region.end.min(end);
-                let from = &bytes[(piece.start - start) as usize..(piece.end - start) as usize];
+    fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
+        let mut region: Option<(Range<u64>, i32)> = None;
+        let mut run: Option<(Range<u64>, i32)> = None;
+        for span in writes.spans {
+            let mut at = span.at;
+            while at < span.end() {
+                let (found, protection) = match &region {
+                    Some((found, protection)) if found.contains(&at) => (found.clone(), *protection),
+                    _ => {
+                        let looked = region_at(at)?;
+                        region = Some(looked.clone());
+                        looked
+                    }
+                };
+                let piece = at..found.end.min(span.end());
+                at = piece.end;
                 if protection & WRITE != 0 {
                     // SAFETY: mapped and writable; nothing else of the program's writes the
                     // image's data a patch writes while `poll` writes it.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(from.as_ptr(), at as *mut u8, from.len())
-                    };
-                } else {
-                    let pages = pages(&piece);
-                    // SAFETY: read-only pages of the image, which nothing writes; the copy
-                    // mapped over them has the rest of their bytes as they are.
-                    unsafe { swap(&pages, &[(piece.start, from)], protection)? };
+                    unsafe { writes.put(&piece, piece.start as *mut u8) };
+                    continue;
                 }
-                at = piece.end;
+                let pages = pages(&piece);
+                match &mut run {
+                    Some((pending, same)) if *same == protection && pages.start <= pending.end => {
+                        pending.end = pending.end.max(pages.end);
+                    }
+                    _ => {
+                        if let Some((done, protection)) = run.replace((pages, protection)) {
+                            // SAFETY: read-only pages of the image, which nothing writes; the
+                            // copy mapped over them has the rest of their bytes as they are.
+                            unsafe { swap(&done, protection, |copy| writes.put(&done, copy))? };
+                        }
+                    }
+                }
             }
+        }
+        if let Some((done, protection)) = run {
+            // SAFETY: as above.
+            unsafe { swap(&done, protection, |copy| writes.put(&done, copy))? };
         }
         Ok(())
     }
@@ -157,28 +228,37 @@ impl Memory for Os {
     }
 
     fn publish(&mut self, cell: u64, table: u64) -> Result<(), String> {
-        let (_, protection) = region_at(cell)?;
-        if protection & WRITE != 0 {
+        if self.cell & WRITE != 0 {
             // SAFETY: the cell is 8-aligned in the image's data, and writable.
             unsafe { AtomicU64::from_ptr(cell as *mut u64) }.store(table, Ordering::Release);
             return Ok(());
         }
         // A page mapped over the cell's in one step is a store a reader sees all of or none.
+        let pages = pages(&(cell..cell + 8));
         let bytes = table.to_le_bytes();
-        // SAFETY: the cell's page is read-only data of the image, which nothing else writes.
-        unsafe { swap(&pages(&(cell..cell + 8)), &[(cell, &bytes[..])], protection) }
+        // SAFETY: the cell's page is read-only data of the image, which nothing else writes;
+        // the cell is within the copy, 8 bytes from `cell - pages.start`.
+        unsafe {
+            swap(&pages, self.cell, |copy| {
+                let to = copy.add((cell - pages.start) as usize);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, 8);
+            })
+        }
+    }
+}
+
+impl Os {
+    fn swap_code(&self, writes: &Writes<'_>, run: &Range<u64>) -> Result<(), String> {
+        debug_assert!(run.start >= self.code.start && run.end <= self.code.end);
+        // SAFETY: the pages are the patch code region's, mapped with one protection
+        // (`Os::new` checked, and every swap keeps it); the bytes written are where no kept
+        // generation's code is, and the rest of the pages is copied as it is.
+        unsafe { swap(run, self.protection, |copy| writes.put(run, copy)) }
     }
 }
 
 fn pages(range: &Range<u64>) -> Range<u64> {
     range.start & !(PAGE - 1)..range.end.next_multiple_of(PAGE)
-}
-
-/// The part of the write of `bytes` at `start` that is in `piece`.
-fn clip<'a>(start: u64, bytes: &'a [u8], piece: &Range<u64>) -> Option<(u64, &'a [u8])> {
-    let from = start.max(piece.start);
-    let to = (start + bytes.len() as u64).min(piece.end);
-    (from < to).then(|| (from, &bytes[(from - start) as usize..(to - start) as usize]))
 }
 
 fn check(code: i32) -> Result<(), String> {
@@ -211,27 +291,29 @@ fn region_at(address: u64) -> Result<(Range<u64>, i32), String> {
     Ok((start..start + size, info[0]))
 }
 
-/// Writes `parts` within the whole pages `pages`, of one region with `protection`, by
-/// mapping a written copy of them over them.
+/// Writes the whole pages `pages`, mapped with `protection`, by mapping a copy of them over
+/// them: `fill` writes the copy, at the address it is given for `pages.start`.
 ///
 /// # Safety
 ///
-/// `pages` are mapped, and nothing writes them while this runs.
-unsafe fn swap(pages: &Range<u64>, parts: &[(u64, &[u8])], protection: i32) -> Result<(), String> {
+/// `pages` are mapped and readable, nothing writes them while this runs, and `fill` writes
+/// only within the copy's `pages.end - pages.start` bytes.
+unsafe fn swap(
+    pages: &Range<u64>,
+    protection: i32,
+    fill: impl FnOnce(*mut u8),
+) -> Result<(), String> {
     let len = pages.end - pages.start;
     // SAFETY: it takes no pointer.
     let task = unsafe { mach_task_self() };
     let mut scratch = 0u64;
-    // SAFETY: a new allocation anywhere; `pages` are readable (the caller's), the parts are
-    // within them, and the scratch is freed once mapped over them.
+    // SAFETY: a new allocation anywhere; `pages` are readable (the caller's), `fill` writes
+    // within the copy, and the scratch is freed once mapped over them.
     unsafe {
         check(mach_vm_allocate(task, &mut scratch, len, ANYWHERE))
             .map_err(|it| format!("allocating a copy of {:#x}: {it}", pages.start))?;
         std::ptr::copy_nonoverlapping(pages.start as *const u8, scratch as *mut u8, len as usize);
-        for &(at, bytes) in parts {
-            let to = (scratch + (at - pages.start)) as *mut u8;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len());
-        }
+        fill(scratch as *mut u8);
         let swapped = (|| {
             check(mach_vm_protect(task, scratch, len, 0, protection))?;
             let (mut current, mut max, mut target) = (0, 0, pages.start);
@@ -256,4 +338,89 @@ unsafe fn swap(pages: &Range<u64>, parts: &[(u64, &[u8])], protection: i32) -> R
         }
     }
     Ok(())
+}
+
+/// Opens `path` for events only and adds it to `kq`: its descriptor.
+fn register(kq: c_int, path: &CString) -> Option<c_int> {
+    // SAFETY: the path ends in a zero.
+    let fd = unsafe { open(path.as_ptr(), O_EVTONLY | O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let change = Kevent {
+        ident: fd as usize,
+        filter: EVFILT_VNODE,
+        flags: EV_ADD | EV_CLEAR,
+        fflags: NOTE_WRITE | NOTE_DELETE | NOTE_RENAME,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: one change, no events asked for.
+    if unsafe { kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+        // SAFETY: this function's descriptor.
+        unsafe { close(fd) };
+        return None;
+    }
+    Some(fd)
+}
+
+/// Watches `dir` on a thread of its own: each change to its entries (a message renamed into
+/// place) is told to `events`.
+pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
+    let path = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| format!("{}: a directory with a zero byte", dir.display()))?;
+    let error = || format!("watching {}: {}", dir.display(), std::io::Error::last_os_error());
+    // SAFETY: it takes no pointer.
+    let kq = unsafe { kqueue() };
+    if kq < 0 {
+        return Err(error());
+    }
+    let Some(fd) = register(kq, &path) else {
+        let error = error();
+        // SAFETY: this function's queue.
+        unsafe { close(kq) };
+        return Err(error);
+    };
+    let watching = move || {
+        let mut watched = Some(fd);
+        while !events.stopped() {
+            if watched.is_none() {
+                // A directory removed or moved and made again is watched again.
+                watched = register(kq, &path);
+                if watched.is_some() {
+                    events.tell();
+                }
+            }
+            let mut event = Kevent {
+                ident: 0,
+                filter: 0,
+                flags: 0,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: room for one event; the timeout is a whole `timespec`.
+            if unsafe { kevent(kq, std::ptr::null(), 0, &mut event, 1, &WAKE_EVERY) } > 0 {
+                events.tell();
+                if event.fflags & (NOTE_DELETE | NOTE_RENAME) != 0 {
+                    if let Some(fd) = watched.take() {
+                        // SAFETY: the thread's own descriptor; closing it removes its event.
+                        unsafe { close(fd) };
+                    }
+                }
+            }
+        }
+        // SAFETY: the thread's own descriptors.
+        unsafe {
+            if let Some(fd) = watched {
+                close(fd);
+            }
+            close(kq);
+        }
+    };
+    std::thread::Builder::new()
+        .name("blaze-live-slots".to_owned())
+        .spawn(watching)
+        .map(drop)
+        .map_err(|it| format!("starting the thread that watches for patches: {it}"))
 }

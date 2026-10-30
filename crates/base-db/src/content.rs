@@ -87,8 +87,8 @@ pub(crate) fn opt_bytes(out: &mut Vec<u8>, part: Option<&str>) {
     }
 }
 
-/// `ContentId::of(domain, &buf[range])` for each range, hashed many at a time (BLAKE3's SIMD
-/// lanes over many small inputs, docs/v2/plan/design/hardware.md).
+/// `ContentId::of(domain, &buf[range])` for each range, through [`ContentId::of_many`]: the
+/// domain's key derived once for all of them, and the inputs laid out in one buffer.
 pub(crate) fn hash_ranges(domain: &'static str, buf: &[u8], ranges: &[Range<usize>]) -> Vec<ContentId> {
     if ranges.is_empty() {
         return Vec::new();

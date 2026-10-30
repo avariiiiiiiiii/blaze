@@ -28,3 +28,15 @@ so a crate with both kinds lists them in a different order from rustc's. Until t
 use `Phase::Resolve` and `checks::PASSES`.
 
 > forwarded to diagnostics: the parent's files.
+
+## 3. The follow-set errors of `macro_rules!` matchers (`diagnostics-lints-syntax-early`: `crates/blaze-diagnostics/src/lints/syntax/early/macros/matchers/follow.rs`)
+
+What: give rustc's hard errors of `check_matcher_core` (`compiler/rustc_expand/src/mbe/
+macro_rules.rs`): "`$x:expr` is followed by `y`, which is not allowed for `expr` fragments" with
+its label and "allowed there are: ..." note, the `$x:pat` / `|` note, and the rest, as `Found`s at
+`Phase::Resolve`, either from that module or as a `pub(crate)` function of a definition that
+`crate::checks::macros` (mine) calls for each `macro_rules!` with `lower::macro_def_error::check`.
+Why: `follow.rs` already ports FIRST/FOLLOW and `check_matcher_core`, but only for
+`rust_2021_incompatible_or_patterns`; mbe checks no follow set, and `macro_def_error` does not
+port it, so a matcher rustc refuses is accepted by blaze (superset-of-rust: accepting what rustc
+rejects is a bug). One port of the sets, not two.

@@ -1,0 +1,161 @@
+//! rustc's `ShadowedIntoIter`: `.into_iter()` on an array before 2021 (`array_into_iter`) or
+//! on a boxed slice before 2024 (`boxed_slice_into_iter`), which method resolution takes as
+//! `(&x).into_iter()` for compatibility (`#[rustc_skip_during_method_dispatch(array,
+//! boxed_slice)]` on `IntoIterator`) and the next edition by value, with what to write
+//! instead: `.iter()`, `IntoIterator::into_iter(x)`, or in a `for` loop no call at all.
+//!
+//! Follows rustc's `compiler/rustc_lint/src/shadowed_into_iter.rs`, the diagnostics of
+//! `compiler/rustc_lint/src/lints.rs` (`ShadowedIntoIterDiag`, `ShadowedIntoIterDiagSub`) and
+//! `compiler/rustc_span/src/lib.rs` (`Span::find_ancestor_in_same_ctxt`) (MIT or Apache-2.0).
+
+use blaze_items::{Fact, ItemId};
+use hir_def::{
+    ModuleDefId,
+    hir::{Expr, ExprId},
+};
+use hir_ty::next_solver::{Ty, TyKind};
+use rustc_hash::FxHashSet;
+use rustc_type_ir::inherent::IntoKind as _;
+use syntax::{AstNode, ast};
+
+use super::for_loop;
+use crate::{
+    lints::bodies::{BodyCx, LatePass, types::util},
+    lower::{Found, Phase},
+    model::{Applicability, Diag, Span, SuggestionStyle},
+};
+
+#[derive(Default)]
+pub(crate) struct ShadowedIntoIter {
+    /// The iterated expressions of the body's `for` loops visited so far: the argument of the
+    /// `IntoIterator::into_iter` call each is desugared to (rustc's parent of the parent of a
+    /// method call that is one).
+    for_heads: FxHashSet<ExprId>,
+}
+
+impl LatePass for ShadowedIntoIter {
+    fn name(&self) -> &'static str {
+        "ShadowedIntoIter"
+    }
+
+    fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+        self.for_heads.clear();
+    }
+
+    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+        if let Some(found) = for_loop(b, expr)
+            && into_iter_path(b, found.into_iter)
+        {
+            self.for_heads.insert(found.head);
+            return;
+        }
+        let Expr::MethodCall { receiver, .. } = b.store().expr(expr) else { return };
+        let solver = util::Solver::of(b);
+        let Some(into_iter) = solver.interner().lang_items().IntoIterIntoIter else { return };
+        let Some(method) = util::method_fn(b, expr) else { return };
+        if method != into_iter {
+            return;
+        }
+
+        let receiver_ty = util::ty(b, receiver);
+        let mut adjusted: Vec<Ty<'_>> = vec![receiver_ty];
+        if let Some(adjustments) = b.infer.expr_adjustment(receiver) {
+            adjusted.extend(adjustments.iter().map(|it| it.target.as_ref()));
+        }
+        let Some(&last) = adjusted.last() else { return };
+        let first_before = |is_ref: fn(Ty<'_>) -> bool, is: fn(Ty<'_>) -> bool| {
+            adjusted.iter().copied().take_while(|it| !is_ref(*it)).position(is)
+        };
+        let (lint, target, edition, can_suggest_ufcs) = if is_ref_to_array(last)
+            && let Some(index) = first_before(is_ref_to_array, Ty::is_array)
+        {
+            ("array_into_iter", "[T; N]", "2021", index == 0)
+        } else if is_ref_to_boxed_slice(last)
+            && let Some(index) = first_before(is_ref_to_boxed_slice, is_boxed_slice)
+        {
+            ("boxed_slice_into_iter", "Box<[T]>", "2024", index == 0)
+        } else {
+            return;
+        };
+
+        let (Some(at), Some(expr_span), Some(name_span)) = (b.expr_node(expr), util::span(b, expr), method_name(b, expr))
+        else {
+            return;
+        };
+        let span = util::span(b, receiver).and_then(|it| ancestor_in_same_ctxt(&it, &expr_span));
+        let message = format!(
+            "this method call resolves to `<&{target} as IntoIterator>::into_iter` (due to backwards compatibility), but will resolve to `<{target} as IntoIterator>::into_iter` in Rust {edition}"
+        );
+        let mut diag = Diag::lint(lint, message, name_span.clone());
+        diag.suggestion(
+            name_span,
+            "use `.iter()` instead of `.into_iter()` to avoid ambiguity",
+            "iter",
+            Applicability::MachineApplicable,
+        );
+        match span {
+            Some(span) if self.for_heads.contains(&expr) => {
+                diag.suggestion_with_style(
+                    vec![(span.shrink_to_hi().to(&expr_span.shrink_to_hi()), String::new())],
+                    "or remove `.into_iter()` to iterate by value",
+                    Applicability::MaybeIncorrect,
+                    SuggestionStyle::ShowCode,
+                );
+            }
+            Some(span) if can_suggest_ufcs => {
+                diag.suggestion_with_style(
+                    vec![
+                        (expr_span.shrink_to_lo(), "IntoIterator::into_iter(".to_owned()),
+                        (span.shrink_to_hi().to(&expr_span.shrink_to_hi()), ")".to_owned()),
+                    ],
+                    "or use `IntoIterator::into_iter(..)` instead of `.into_iter()` to explicitly iterate by value",
+                    Applicability::MaybeIncorrect,
+                    SuggestionStyle::ShowCode,
+                );
+            }
+            _ => {}
+        }
+        let called = b.cx.def_path(ModuleDefId::FunctionId(method).into());
+        diag.fact(Fact::Signature(b.cx.key(ItemId::Function(method))), format!("the signature of `{called}`"));
+        out.push(b.lint(diag, Phase::Late, at));
+    }
+}
+
+/// Whether the callee of the call `call` is the path to `IntoIterator::into_iter` (rustc's
+/// `qpath_is_lang_item(qpath, LangItem::IntoIterIntoIter)`).
+fn into_iter_path(b: &BodyCx<'_, '_>, call: ExprId) -> bool {
+    let Some((def, _)) = util::called_fn(b, call) else { return false };
+    util::Solver::of(b).interner().lang_items().IntoIterIntoIter == Some(def)
+}
+
+fn is_ref_to_array(ty: Ty<'_>) -> bool {
+    matches!(ty.kind(), TyKind::Ref(_, pointee, _) if pointee.is_array())
+}
+
+fn is_boxed_slice(ty: Ty<'_>) -> bool {
+    ty.boxed_ty().is_some_and(Ty::is_slice)
+}
+
+fn is_ref_to_boxed_slice(ty: Ty<'_>) -> bool {
+    matches!(ty.kind(), TyKind::Ref(_, pointee, _) if is_boxed_slice(pointee))
+}
+
+/// The span of the name of the method `expr` calls (rustc's `segment.ident.span`).
+fn method_name(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
+    let node = util::syntax(b, expr)?;
+    let call = ast::MethodCallExpr::cast(node.value.clone())?;
+    let name = call.name_ref()?;
+    Some(b.cx.span(node.with_value(name.syntax().text_range())))
+}
+
+/// rustc's `Span::find_ancestor_in_same_ctxt`: `span`, or the call of the macro it came
+/// from, and of the macro that call came from, .., the first in the expansion `other` is in.
+fn ancestor_in_same_ctxt(span: &Span, other: &Span) -> Option<Span> {
+    let mut at = span.clone();
+    loop {
+        if at.expansion == other.expansion {
+            return Some(at);
+        }
+        at = at.expansion?.call_site;
+    }
+}

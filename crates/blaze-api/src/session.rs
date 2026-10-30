@@ -333,8 +333,8 @@ impl Session {
             }
             Request::Check { view, targets } => self.build(cx, req, &view, Work::Check(targets))?,
             Request::Build { view, targets } => self.build(cx, req, &view, Work::Build(targets))?,
-            Request::Test { view, targets, filter, all } => {
-                self.build(cx, req, &view, Work::Test { targets, filter, all })?
+            Request::Test { view, targets, filter, all, args, ub } => {
+                self.build(cx, req, &view, Work::Test { targets, filter, all, args, ub })?
             }
             Request::Run { view, targets, bin, args } => {
                 self.build(cx, req, &view, Work::Run { targets, bin, args })?
@@ -403,7 +403,13 @@ impl Session {
                 for (job, candidate, opened) in starts {
                     self.jobs.insert(job, (serial, Some(candidate)));
                     let work = if test {
-                        Work::Test { targets: targets.clone(), filter: filter.clone(), all: false }
+                        Work::Test {
+                            targets: targets.clone(),
+                            filter: filter.clone(),
+                            all: false,
+                            args: Vec::new(),
+                            ub: None,
+                        }
                     } else {
                         Work::Check(targets.clone())
                     };

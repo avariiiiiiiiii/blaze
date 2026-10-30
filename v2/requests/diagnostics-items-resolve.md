@@ -29,6 +29,10 @@ What: call `lower::macro_def_error::check(cx, InFile<&ast::Macro>)` for each loc
 that hir does not report a `MacroDefError` for (or for all of them, and have
 `AnyDiagnostic::MacroDefError` lower to nothing).
 
+Run it from a salsa-tracked query keyed by the definition's `AstId`, so an unchanged definition
+is never read again and a cache hit allocates nothing; `check` itself is one allocation-free
+pass over the definition's tokens when there is no error.
+
 Why: mbe accepts definitions rustc refuses: no rules at all (`macro_rules! f {}`), an invalid
 fragment specifier (`$x:id`), duplicate bindings, empty repetitions; hir only reports what mbe
 refuses, so those give no error today.
@@ -74,3 +78,14 @@ crate named `x`, use `cargo add x` to add it to your `Cargo.toml`" under cargo;
 `lower/unresolved_import.rs` gives the non-cargo text.
 
 > forwarded to diagnostics: `Options` is in `crates/blaze-diagnostics/src/check.rs`, its own; `blaze-api` needs no change (the daemon that sets the flag is lane cargo's).
+
+## 6. `#![forbid(unsafe_code)]` on `blaze-diagnostics` (diagnostics)
+
+Where: `crates/blaze-diagnostics/src/lib.rs`.
+
+What: add `#![forbid(unsafe_code)]`.
+
+Why: `docs/v2/plan/design/unsafe.md`: a crate with no unsafe module forbids it. The crate has
+no `unsafe` of its own (`rg` finds it only inside test sources, as Rust text in strings), and
+nothing in this lane needs it: the speed here comes from not running on a clean build and from
+`macro_def_error::check`'s allocation-free single pass, not from unchecked access.

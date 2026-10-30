@@ -128,15 +128,27 @@ pub fn host_cpu() -> Option<(String, String)> {
     #[cfg(feature = "llvm")]
     {
         use inkwell::llvm_sys::{core::LLVMDisposeMessage, target_machine as tm};
-        let taken = |message: *mut std::ffi::c_char| {
-            // SAFETY: LLVM returns a C string the caller owns and disposes of.
+        /// The text of `message`, which is then disposed of.
+        ///
+        /// # Safety
+        ///
+        /// `message` is a NUL-terminated string that LLVM allocated, that the caller owns and
+        /// that nothing reads after this.
+        unsafe fn owned(message: *mut std::ffi::c_char) -> String {
+            // SAFETY: the caller's: `message` is NUL-terminated and live until disposed of below.
             let text = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy().into_owned();
+            // SAFETY: the caller's: LLVM allocated `message`, and nothing reads it after this.
             unsafe { LLVMDisposeMessage(message) };
             text
-        };
-        // SAFETY: neither reads anything but the host's CPU.
-        let (name, features) =
-            unsafe { (taken(tm::LLVMGetHostCPUName()), taken(tm::LLVMGetHostCPUFeatures())) };
+        }
+        // SAFETY: it reads only the host's CPU and needs no LLVM state set up first.
+        let name = unsafe { tm::LLVMGetHostCPUName() };
+        // SAFETY: `name` is LLVM's string from just above, owned here and taken once.
+        let name = unsafe { owned(name) };
+        // SAFETY: as for the name.
+        let features = unsafe { tm::LLVMGetHostCPUFeatures() };
+        // SAFETY: as for the name.
+        let features = unsafe { owned(features) };
         Some((name, features))
     }
     #[cfg(not(feature = "llvm"))]
@@ -4962,7 +4974,7 @@ fn build<'db>(
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<cranelift_codegen::Context> {
     let interner = DbInterner::new_with(cg.db, env.krate);
-    let kept = KeptLayouts::default();
+    let kept = KeptLayouts::new();
     let mut ctx = spare::context();
     ctx.func.signature.call_conv = cg.isa.default_call_conv();
     // Source locations are kept as distances from the first one set, and the distance of
@@ -19686,33 +19698,33 @@ mod tests {
     use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
-    /// What `Layouts::lend` hands out is the layout an `Arc` clone of the map's entry would
-    /// have been, before the map grows and after: entries move when it rehashes, the layouts
-    /// behind them don't. Seeded layouts of every integer width, more than the map's first
-    /// capacities hold.
+    /// A layout kept for a build is the database's own, not a copy: lent from the `Arc` the
+    /// query gave, however many more the build keeps after it. Seeded layouts of every
+    /// integer width, more than the arena's first chunk holds.
     #[test]
-    fn a_lent_layout_is_the_entry_however_the_map_grows() {
-        use super::{Arc, Layout, Layouts, Primitive, Scalar};
+    fn a_kept_layout_is_the_one_the_query_gave() {
+        use super::{Arc, KeptLayouts, Layout, Primitive, Scalar};
         use rustc_abi::Integer;
         let dl = rustc_abi::TargetDataLayout::default();
         let widths = [Integer::I8, Integer::I16, Integer::I32, Integer::I64, Integer::I128];
-        let layouts = Layouts::default();
-        let mut entries: rustc_hash::FxHashMap<u32, Arc<Layout>> = Default::default();
+        let kept = KeptLayouts::new();
+        let mut given = Vec::new();
         let mut lent = Vec::new();
         let mut seed = 0x9e37_79b9_u32;
-        for key in 0..4096u32 {
+        for _ in 0..4096 {
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
             let int = widths[seed as usize % widths.len()];
             let scalar = Scalar::Union { value: Primitive::Int(int, seed & 1 == 0) };
-            let entry = entries.entry(key).or_insert(Arc::new(Layout::scalar(&dl, scalar)));
-            lent.push((key, layouts.lend(entry)));
+            let layout = Arc::new(Layout::scalar(&dl, scalar));
+            given.push(layout.clone());
+            let layout: &Layout = kept.asked.alloc(layout);
+            lent.push(layout);
         }
-        for (key, layout) in lent {
-            let cloned = entries[&key].clone();
-            assert!(std::ptr::eq(layout, &*cloned));
-            assert_eq!(*layout, *cloned);
+        for (layout, given) in lent.into_iter().zip(given) {
+            assert!(std::ptr::eq(layout, &*given));
+            assert_eq!(*layout, *given);
         }
     }
 

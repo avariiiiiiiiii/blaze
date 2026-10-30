@@ -70,6 +70,8 @@ pub(crate) struct Graph {
     /// The units compiled for build scripts and proc macros: all a script's compile or a proc
     /// macro depends on, and themselves.
     build_time: Bits,
+    /// The packages with a library target, by index into `Units::packages`.
+    lib_packages: Bits,
     /// Units by [`target_hash`] of what they build, each hash's units in order: how an artifact
     /// finds its unit with no string built.
     by_target: FxHashMap<u64, Vec<u32>>,
@@ -134,8 +136,14 @@ impl Graph {
             package,
             flags,
             build_time: Bits::new(count),
+            lib_packages: Bits::new(units.packages.len()),
             by_target: FxHashMap::default(),
         };
+        for (at, unit) in all.iter().enumerate() {
+            if unit.target.is_lib() && graph.package[at] != u32::MAX {
+                graph.lib_packages.insert(graph.package[at]);
+            }
+        }
         graph.by_target.reserve(count);
         for (at, unit) in all.iter().enumerate() {
             let hash = target_hash(&unit.pkg_id, &unit.target.name, &unit.target.kind, unit.mode);
@@ -212,6 +220,12 @@ impl Graph {
     #[inline]
     pub(crate) fn package(&self, at: u32) -> u32 {
         self.package[at as usize]
+    }
+
+    /// Whether unit `at`'s package has a library target.
+    #[inline]
+    pub(crate) fn package_has_lib(&self, at: u32) -> bool {
+        self.lib_packages.contains(self.package(at))
     }
 
     #[inline]

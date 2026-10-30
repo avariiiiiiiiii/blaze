@@ -38,7 +38,7 @@ use blaze_vfs::{Change, Op, View};
 use serde::{Deserialize, Serialize};
 
 /// The version of every body's schema. A change to any type here is a new number.
-pub const SCHEMA: u32 = 6;
+pub const SCHEMA: u32 = 7;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -135,8 +135,17 @@ pub enum Request {
     /// Checks the view; answered with diagnostics.
     Check { view: ViewRef, targets: Targets },
     Build { view: ViewRef, targets: Targets },
-    /// Runs the tests the view's change reached (all, with `all`), filtered by name.
-    Test { all: bool, view: ViewRef, filter: Vec<String>, targets: Targets },
+    /// Runs the tests the view's change reached (all, with `all`), filtered by name, with
+    /// libtest's selection `args`; in blaze's MIR evaluator, checked for undefined behavior,
+    /// with `ub`.
+    Test {
+        ub: Option<Ub>,
+        all: bool,
+        args: Vec<String>,
+        view: ViewRef,
+        filter: Vec<String>,
+        targets: Targets,
+    },
     Run { bin: Option<String>, args: Vec<String>, view: ViewRef, targets: Targets },
     /// The files that differ between two views.
     Diff { to: ViewRef, from: ViewRef },
@@ -179,6 +188,14 @@ pub enum Request {
     /// `blaze stop`: the daemon's state made durable, then it exits; answered with
     /// `Done { ok: true }` before it does.
     Stop,
+}
+
+/// `blaze test --ub`: each selected test run under `hir_ty_ub::run_test`, nothing compiled.
+/// `None` is `hir_ty_ub::Config::default()`'s.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Ub {
+    pub seed: Option<u64>,
+    pub schedules: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

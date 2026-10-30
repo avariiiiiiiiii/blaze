@@ -180,3 +180,5 @@ vector to its lane type) to `shared/instructions.rs`, lowered on AArch64 to `uma
 Why: `simd_reduce_max` (`vmaxvq_u8`, memchr's NEON hot loop `vector_is_zero`/`movemask` path)
 is now `ext`+`umax` four times and a `umov` (9 instructions, `wasm_simd.rs` `simd_reduce`)
 where LLVM emits `umaxv` + `fmov` (2). Without the op, Cranelift cannot express it.
+
+> applied: `blaze-reclaim = { path = "crates/blaze-reclaim" }` is in the root `[workspace.dependencies]` (seen by speed-runtime-vfs at 2026-10-29; the manifest lint is clean for blaze-vfs).

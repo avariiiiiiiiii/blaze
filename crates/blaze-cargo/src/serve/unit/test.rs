@@ -32,14 +32,11 @@ const TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a test's server is given to end a test it was told to kill.
 const KILL_GRACE: Duration = Duration::from_secs(5);
 
-/// The unit an artifact is of: the test of its package's target.
-pub(crate) fn unit_of_artifact(units: &blaze_units::query::Units, artifact: &Artifact) -> Option<usize> {
-    units.graph.units.iter().position(|unit| {
-        unit.pkg_id == artifact.package
-            && unit.target.name == artifact.target.name
-            && unit.target.kind == artifact.target.kind
-            && matches!(unit.mode, Mode::Test)
-    })
+/// The unit an artifact is of: the test of its package's target, by the graph's hash of it.
+pub(crate) fn unit_of_artifact(job: &Job, artifact: &Artifact) -> Option<usize> {
+    let all = &job.units().graph.units;
+    let target = &artifact.target;
+    job.graph.find(all, &artifact.package, &target.name, &target.kind, Mode::Test).map(|it| it as usize)
 }
 
 /// The target as selection names it: `lib`, `test:parse`, `bin:blaze`.
@@ -83,7 +80,20 @@ struct Suited {
     name: String,
     given: blaze_ids::ContentId,
     tests: Vec<Test>,
-    binary: Binary,
+    /// `tests` by name, sorted: a finished test is found in `O(log n)` with nothing allocated.
+    by_name: Vec<u32>,
+    /// Handed to the queue when it starts.
+    binary: Option<Binary>,
+    /// The machine's files and the binary's environment, as what a test read is checked
+    /// against: made once per binary.
+    disk: blaze_usercode::inputs::Disk,
+}
+
+impl Suited {
+    fn test(&self, name: &str) -> Option<&Test> {
+        let at = self.by_name.binary_search_by(|it| self.tests[*it as usize].name.as_str().cmp(name)).ok()?;
+        Some(&self.tests[self.by_name[at] as usize])
+    }
 }
 
 /// The tests of `built`, filtered by `filter`, run on the loop.
@@ -116,12 +126,14 @@ pub(crate) fn start(
     let mut suites = Vec::new();
     for artifact in built.iter().filter(|it| it.profile.test) {
         let Some(program) = &artifact.executable else { continue };
-        let Some(at) = unit_of_artifact(units, artifact) else {
+        let Some(at) = unit_of_artifact(job, artifact) else {
             return Err(ApiError::new(format!("no test unit of `{}` is in the build", artifact.target.name), None));
         };
         let unit = &units.graph.units[at];
         let package = package_of(units, unit)?;
-        let made = job.made.lock().unwrap_or_else(|it| it.into_inner()).get(&at).cloned().unwrap_or_default();
+        let Some(made) = job.made[at].get() else {
+            return Err(ApiError::new(format!("the test binary `{program}` was not compiled by this job"), None));
+        };
         let Some(context) = made.context else {
             return Err(ApiError::new(format!("the test binary `{program}` was not compiled by this job"), None));
         };
@@ -159,7 +171,10 @@ pub(crate) fn start(
             mode: TestMode::Process,
             jobs: Vec::new(),
         };
-        suites.push(Suited { name: program.clone(), given: suite.given(), tests, binary });
+        let mut by_name: Vec<u32> = (0..tests.len() as u32).collect();
+        by_name.sort_unstable_by(|a, b| tests[*a as usize].name.cmp(&tests[*b as usize].name));
+        let disk = blaze_usercode::inputs::Disk::new(binary.env.clone());
+        suites.push(Suited { name: program.clone(), given: suite.given(), tests, by_name, binary: Some(binary), disk });
     }
     let filter = Filter { names: filter.to_vec(), ..Filter::default() };
     Ok(Box::new(TestRun { job: job.clone(), tags, filter, all, suites, queue: None, ok: true }))
@@ -172,9 +187,8 @@ impl TestRun {
 
     /// What finished: reported, and kept for selection.
     fn finished(&mut self, finished: Vec<Finished>, store: &mut Store, out: &mut Vec<Response>) {
-        let mut disk = self.job.shared.disk.lock().unwrap_or_else(|it| it.into_inner());
         for done in finished {
-            let Some(suite) = self.suites.get(done.binary) else { continue };
+            let Some(suite) = self.suites.get_mut(done.binary) else { continue };
             if let Outcome::Failed(_) = done.outcome {
                 self.ok = false;
             }
@@ -187,9 +201,7 @@ impl TestRun {
                 Outcome::NotRun => continue,
             };
             let Some(name) = &done.test else { continue };
-            let Some(test) = suite.tests.iter().find(|it| it.name == *name) else { continue };
-            disk.set_env(suite.binary.env.clone());
-            let traced = match done.trace.traced(&mut *disk) {
+            let traced = match done.trace.traced(&mut suite.disk) {
                 Ok(it) => it,
                 Err(error) => {
                     out.push(Response::Diagnostic(super::say::refused(
@@ -200,6 +212,7 @@ impl TestRun {
                     None
                 }
             };
+            let Some(test) = suite.test(name) else { continue };
             let ran = select::Ran { passed, took: done.took, traced: traced.as_ref() };
             if let Err(error) = select::record(store, suite.given, test, &ran) {
                 self.ok = false;
@@ -212,17 +225,16 @@ impl TestRun {
         }
     }
 
-    fn end(&mut self) -> Option<bool> {
+    fn end(&self) -> Option<bool> {
         Some(self.ok)
     }
 }
 
 impl Runs for TestRun {
     fn start(&mut self, store: &Store, effects: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
-        let mut disk = self.job.shared.disk.lock().unwrap_or_else(|it| it.into_inner());
-        let mut binaries = Vec::new();
+        let mut binaries = Vec::with_capacity(self.suites.len());
         for suite in &mut self.suites {
-            disk.set_env(suite.binary.env.clone());
+            let Some(mut binary) = suite.binary.take() else { continue };
             for test in &suite.tests {
                 match select::wanted(test, &self.filter) {
                     Wanted::Filtered => continue,
@@ -233,12 +245,12 @@ impl Runs for TestRun {
                     }
                     Wanted::Yes => {}
                 }
-                match select::select(store, suite.given, test, self.all, &mut *disk) {
+                match select::select(store, suite.given, test, self.all, &mut suite.disk) {
                     Ok(Decision::Skip { took }) => {
                         let report = test::report_unrun(&suite.name, &test.name, Reported::Unreached, took);
                         out.push(Response::TestResult(result(report)));
                     }
-                    Ok(Decision::Run { expected, .. }) => suite.binary.jobs.push(TestJob {
+                    Ok(Decision::Run { expected, .. }) => binary.jobs.push(TestJob {
                         name: test.name.clone(),
                         ignore: false,
                         expected: expected.unwrap_or_default(),
@@ -255,9 +267,8 @@ impl Runs for TestRun {
                     }
                 }
             }
-            binaries.push(suite.binary.clone());
+            binaries.push(binary);
         }
-        drop(disk);
         let Some(dir) = FileName::new(&format!("tests/{:016x}", self.tags)) else { return self.end() };
         let config = Config {
             root: self.job.shared.state.clone(),

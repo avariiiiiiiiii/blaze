@@ -1,7 +1,6 @@
 //! The derives as they were written before they wrote into one builder: nested `quote!`s, a
 //! `format!` per name. Kept for the tests only, which check the new code gives the same trees.
 
-use intern::sym;
 use itertools::izip;
 use rustc_hash::FxHashSet;
 use span::Span;
@@ -33,7 +32,7 @@ fn parse_adt(
 }
 
 #[derive(Clone)]
-enum VariantShape {
+pub(super) enum VariantShape {
     Struct(Vec<tt::Ident>),
     /// The span of each field, which what is said about the field (as that moving it out of a
     /// packed struct is E0507) points at, as rustc's do.
@@ -133,7 +132,7 @@ impl VariantShape {
 }
 
 #[derive(Clone)]
-enum AdtShape {
+pub(super) enum AdtShape {
     Struct(VariantShape),
     Enum { variants: Vec<(tt::Ident, VariantShape)>, default_variant: Option<usize> },
     Union,
@@ -191,7 +190,7 @@ impl AdtShape {
 }
 
 #[derive(Clone)]
-struct BasicAdtInfo {
+pub(super) struct BasicAdtInfo {
     name: tt::Ident,
     shape: AdtShape,
     /// first field is the name, and
@@ -288,7 +287,7 @@ impl BasicAdtInfo {
 }
 
 #[derive(Clone)]
-struct AdtParam {
+pub(super) struct AdtParam {
     name: tt::TopSubtree,
     /// `None` if this is a type parameter.
     const_ty: Option<tt::TopSubtree>,

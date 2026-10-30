@@ -139,26 +139,28 @@ pub struct Merged {
     pub thunks: Vec<Emitted>,
 }
 
-/// A constant as members are compared by: a place by its target.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-enum Cell {
+/// A constant as members are compared by: a place by its target. Targets are compared
+/// whole, equal exactly when their [`target_id`]s are, which is hashed only into a group's
+/// shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cell<'a> {
     Value(Constant),
-    Target(ContentId),
+    Target(&'a Target),
 }
 
-fn cell(key: InstanceKey, constant: Constant, refs: &Refs) -> Cell {
+fn cell(key: InstanceKey, constant: Constant, refs: &Refs) -> Cell<'_> {
     match constant {
         Constant::Place(at) => {
             let Some(target) = refs.get(at as usize) else {
                 panic!("{key:?}'s masked IR names place {at} of its {} references", refs.len())
             };
-            Cell::Target(target_id(target))
+            Cell::Target(target)
         }
         other => Cell::Value(other),
     }
 }
 
-fn cell_into(hasher: &mut Hasher, cell: &Cell) {
+fn cell_into(hasher: &mut Hasher, cell: &Cell<'_>) {
     match *cell {
         Cell::Value(Constant::Int { bits, value }) => {
             hasher.update(&[0, bits]).update(&value.to_le_bytes())
@@ -167,7 +169,7 @@ fn cell_into(hasher: &mut Hasher, cell: &Cell) {
         Cell::Value(Constant::F64(bits)) => hasher.update(&[2]).update(&bits.to_le_bytes()),
         Cell::Value(Constant::Place(at)) => hasher.update(&[3]).update(&at.to_le_bytes()),
         Cell::Value(Constant::Data(id)) => hasher.update(&[6]).id(&id),
-        Cell::Target(id) => hasher.update(&[4]).id(&id),
+        Cell::Target(target) => hasher.update(&[4]).id(&target_id(target)),
     };
 }
 
@@ -204,7 +206,7 @@ struct Split<'a> {
     /// Sorted and deduplicated by key.
     members: Vec<Candidate<'a>>,
     /// `cells[m * n + at]`: member `m`'s constant `at` as members are compared.
-    cells: Vec<Cell>,
+    cells: Vec<Cell<'a>>,
     /// Per member, its part.
     part_of: Vec<u32>,
     /// Per part, its first member.
@@ -221,7 +223,7 @@ struct Split<'a> {
     param_of: Vec<u32>,
 }
 
-impl Split<'_> {
+impl<'a> Split<'a> {
     /// The groups of `self.members`, one bucket, into `out`.
     fn groups(&mut self, limits: &Limits, out: &mut Vec<Group>) {
         let n = self.members[0].masked.constants.len();
@@ -407,20 +409,21 @@ pub fn groups(
     limits: &Limits,
 ) -> Vec<Group> {
     let mut all: Vec<Candidate<'_>> = Vec::with_capacity(candidates.len());
+    // The constants' kinds, given to the hasher in one update.
+    let mut kinds: Vec<u8> = Vec::new();
     for &(key, settings, masked, refs) in candidates {
+        kinds.clear();
         for constant in &masked.constants {
             if let Constant::Place(at) = *constant
                 && at as usize >= refs.len()
             {
                 panic!("{key:?}'s masked IR names place {at} of its {} references", refs.len());
             }
+            kinds.extend_from_slice(&kind(constant));
         }
         let mut hasher = Hasher::new(MASKED_DOMAIN);
         hasher.part(&masked.shape).update(&masked.size.to_le_bytes());
-        hasher.update(&(masked.constants.len() as u64).to_le_bytes());
-        for constant in &masked.constants {
-            hasher.update(&kind(constant));
-        }
+        hasher.update(&(masked.constants.len() as u64).to_le_bytes()).update(&kinds);
         all.push(Candidate { key, settings, masked_id: hasher.finish(), masked, refs });
     }
     // One sort makes every bucket a run, its members in key order. Stable, so of candidates
@@ -677,7 +680,7 @@ mod tests {
         struct Candidate<'a> {
             key: InstanceKey,
             masked: &'a Masked,
-            cells: Vec<Cell>,
+            cells: Vec<Cell<'a>>,
         }
 
         struct Plan {
@@ -845,6 +848,33 @@ mod tests {
             }
         }
         assert!(found > 400, "the inputs make groups: {found}");
+    }
+
+    #[test]
+    fn targets_compare_as_their_ids_did() {
+        let mut rng = Rng(7);
+        let target = |rng: &mut Rng| {
+            let n = rng.below(3) as u8;
+            let name = ["a", "ab", "b"][n as usize].to_owned();
+            let id = ContentId([n; 32]);
+            match rng.below(7) {
+                0 => Target::Function(key(n)),
+                1 => Target::Direct(key(n)),
+                2 => Target::Static { item: blaze_items::ItemKey(id), instance: ContentId([0; 32]) },
+                3 => Target::Data(id),
+                4 => Target::Extern(name),
+                5 => Target::Weak(name),
+                _ => Target::Position(blaze_format::SpanRef { anchor: id, index: 1 }),
+            }
+        };
+        let (mut equal, mut other) = (0, 0);
+        for _ in 0..2000 {
+            let (a, b) = (target(&mut rng), target(&mut rng));
+            let (cell_a, cell_b) = (Cell::Target(&a), Cell::Target(&b));
+            assert_eq!(cell_a == cell_b, target_id(&a) == target_id(&b), "{a:?} {b:?}");
+            if a == b { equal += 1 } else { other += 1 }
+        }
+        assert!(equal > 50 && other > 50);
     }
 
     #[test]

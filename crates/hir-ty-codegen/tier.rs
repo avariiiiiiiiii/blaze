@@ -744,7 +744,7 @@ fn spend(instance: &Instance, env: &StoredParamEnvAndCrate, body: &super::fragme
 
 /// Says why a body is not built in, with `BLAZE_DUMP_TIER`.
 fn refused(db: &dyn HirDatabase, instance: &Instance, why: &str) {
-    if std::env::var_os("BLAZE_DUMP_TIER").is_none() {
+    if !super::dumps_tier() {
         return;
     }
     let name = match instance.def {
@@ -885,7 +885,7 @@ pub fn prepare(db: &dyn HirDatabase, asked: &Asked) -> std::result::Result<Prepa
             }
         }
     }
-    if std::env::var_os("BLAZE_DUMP_TIER").is_some() {
+    if super::dumps_tier() {
         eprintln!(
             "tier: {:?} at {:?}: {} roots and {} instances may be built in",
             asked.node,
@@ -1035,7 +1035,7 @@ pub(super) fn emit(
     if let Some(first) = request.counters {
         count(recorder, func, first, &found)?;
     }
-    if std::env::var_os("BLAZE_DUMP_TIER").is_some() {
+    if super::dumps_tier() {
         eprintln!("tier {:?}:\n{}", request.level, func.display());
     }
     produce(recorder, named, func, weights.as_ref())

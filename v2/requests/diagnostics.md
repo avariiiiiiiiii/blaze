@@ -1335,6 +1335,8 @@ Until then `types/casts`' tests pick the variant that gives compiletest's flags:
 `Test::Passes` for every test but `static-mut-refs.rs`'s e2021 revision (`//@ [e2021] run-pass`),
 which is `Test::Fails`. Flip them with the rename.
 
+> forwarded to diagnostics: its own UI harness.
+
 ## diagnostics-lints-bodies-types-casts: three things of core minicore lacks (`crates/test-utils/src/minicore.rs`; test-utils)
 
 `static-mut-refs.rs` and `static-mut-refs-interior-mutability{,-no-sugg}.rs` (tests in
@@ -1344,6 +1346,8 @@ which is `Test::Fails`. Flip them with the rename.
 2. `fmt::rt::Argument::new_debug` (under `fmt`): `format!("{:?}", Z)` lowers to it.
 3. `impl<T: Debug, const N: usize> Debug for [T; N]` (under `fmt`): `Z` is `&[i32; 3]` (minicore has `Debug for &T`).
 Without them these tests get an unresolved-method / unmet-bound error besides the lint.
+
+> forwarded to coordinator: `crates/test-utils/` is "every other path" in `crates.md`, not among the paths `requests` applies.
 
 ## diagnostics-lints-bodies-types-casts: an expression's span across macro contexts (`Cx::span`; `diagnostics`)
 
@@ -1356,6 +1360,8 @@ cast is its syntax node's, from `&` (68:9, 17 carets). Not mine to patch per lin
 an expression whose operand is a `$e` fragment differs the same way. Test waiting:
 `tests/lints/bodies/types/casts/raw_borrows.rs`.
 
+> forwarded to diagnostics: `Cx::span` is its own.
+
 ## diagnostics-lints-bodies-types-casts: the value a path resolved to, from inference (`hir-ty` `InferenceResult`; db)
 
 `static_mut_refs` asks for every `&path`, `&path.field`, method receiver and `let ref x =
@@ -1364,6 +1370,8 @@ path is a local or a static; both go through `types::util::path_value`, which ru
 resolver again. Inference already resolved each value path: recording it (`ExprId ->
 ValueNs`, as `InferenceResult` records `variant_resolutions`) makes these a table lookup.
 
+> forwarded to db: `InferenceResult` (`crates/hir-ty/src/infer.rs`) is lane db's.
+
 ## diagnostics-lints-syntax-delims: `#![forbid(unsafe_code)]` on blaze-diagnostics
 
 What: add `#![forbid(unsafe_code)]` to `crates/blaze-diagnostics/src/lib.rs`.
@@ -1371,6 +1379,8 @@ Where: `crates/blaze-diagnostics/src/lib.rs` (the lane parent's).
 Why: `docs/v2/plan/design/unsafe.md` says a crate with no unsafe module forbids `unsafe_code`.
 `rg` finds no `unsafe` block, fn or impl in the crate's Rust; the only hits are rustc's
 error-code docs in `emit/codes/*.md` and the sources the UI tests lint.
+
+> forwarded to diagnostics: its own `src/lib.rs`.
 
 ## diagnostics-lints-bodies-calls-items: `concat_bytes!`'s literal has the call's span, as rustc's (`crates/hir-expand/src/builtin/fn_macro.rs`; db)
 
@@ -1383,3 +1393,5 @@ With the cover span, `Cx::span` maps the literal back to `b"cl", b"\x82ippy"` (r
 so `invalid_from_utf8`'s label ("the literal was valid UTF-8 up to the 2 bytes") is 14 columns
 short of rustc's at four places in `invalid_from_utf8.stderr` (lines 61, 63, 123, 125 of the test).
 Test waiting: `tests/lints/bodies/calls/items.rs`, `invalid_from_utf8`.
+
+> forwarded to db: `crates/hir-expand/`'s builtin macros are lane db's.

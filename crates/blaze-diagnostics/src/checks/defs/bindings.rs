@@ -71,7 +71,7 @@ fn check_body(cx: &Cx<'_, '_>, owner: DefWithBodyId, found: &mut Vec<Found>) {
         hir::DefWithBody::Const(it) => hir::ModuleDef::Const(it),
         hir::DefWithBody::EnumVariant(it) => hir::ModuleDef::EnumVariant(it),
     };
-    let mut walk = Walk { cx, body, source: &source, item, owner, ctxs: Vec::new(), found };
+    let mut walk = Walk { cx, body: &body.store, source: &source, item, owner, ctxs: Vec::new(), found };
     let mut lists: FxHashMap<InFile<SyntaxNodePtr>, Vec<Ctx>> = FxHashMap::default();
     for root in roots {
         match root.list {
@@ -125,7 +125,8 @@ struct Walk<'a, 'cx, 'db, S> {
 
 impl<S: Fn(PatId) -> Option<ExprOrPatSource>> Walk<'_, '_, '_, S> {
     fn pat(&mut self, pat: PatId, param: bool) {
-        match self.body.pat(pat) {
+        let body = self.body;
+        match body.pat(pat) {
             Pat::Or(alternatives) => {
                 self.ctxs.push(Ctx::or());
                 for &alternative in alternatives {
@@ -137,7 +138,7 @@ impl<S: Fn(PatId) -> Option<ExprOrPatSource>> Walk<'_, '_, '_, S> {
             }
             Pat::Bind { id, subpat } => {
                 if (self.source)(pat).is_some() {
-                    let binding = &self.body[id];
+                    let binding = &body[id];
                     self.bind(pat, (binding.name.clone(), binding.hygiene), param);
                 }
                 if let Some(subpat) = subpat {
@@ -146,7 +147,7 @@ impl<S: Fn(PatId) -> Option<ExprOrPatSource>> Walk<'_, '_, '_, S> {
             }
             _ => {
                 let mut children = Vec::new();
-                self.body.walk_pats_shallow(pat, |child| children.push(child));
+                body.walk_pats_shallow(pat, |child| children.push(child));
                 for child in children {
                     self.pat(child, param);
                 }

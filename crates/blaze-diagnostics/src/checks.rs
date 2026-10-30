@@ -10,6 +10,7 @@ mod defs;
 mod features;
 pub(crate) mod impls;
 mod krate;
+mod macros;
 mod names;
 
 use std::ops::ControlFlow;
@@ -29,14 +30,15 @@ use crate::{
 /// early lints, before the checks of items. Every check of that pass is given at this phase.
 pub(crate) const PASSES: Phase = Phase::Items;
 
-/// What rustc says of `cx.krate` that `hir` does not, in rustc's order: AST validation, the
+/// What rustc says of `cx.krate` that `hir` does not, in rustc's order: the definitions of
+/// `macro_rules!` (as expansion meets them), AST validation, the
 /// resolver's, the feature gates (with the early lints), what attribute parsing says as the
 /// AST is lowered, `misc_checking_1` (the entry point, then `check_mod_attrs`), the checks of
 /// items.
 pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
     let walk = Walk::of(cx);
     let owners: Vec<Owner> = owners(cx, &walk);
-    let mut found = Vec::new();
+    let mut found = macros::check(cx, &walk);
     found.extend(ast_validation::check(cx, &walk));
     found.extend(defs::check(cx));
     found.extend(names::check(cx));

@@ -55,22 +55,18 @@ impl PermissionPriv {
         }
     }
 
-    fn is_reserved_frz(self) -> bool {
-        matches!(self, ReservedFrz | ReservedFrzConflicted)
-    }
-
     /// Miri: `perms.rs`, `PermissionPriv::is_initial`.
-    fn is_initial(self) -> bool {
+    pub(super) fn is_initial(self) -> bool {
         matches!(self, ReservedFrz | Frozen | ReservedIM | Cell | Unique)
     }
 
     /// Miri: `perms.rs`, `PermissionPriv::compatible_with_protector`.
-    fn compatible_with_protector(self) -> bool {
+    pub(super) fn compatible_with_protector(self) -> bool {
         !matches!(self, ReservedIM | Cell)
     }
 
     /// Miri: `perms.rs`, `PermissionPriv::strongest_idempotent_foreign_access`.
-    fn strongest_idempotent_foreign_access(self, prot: bool) -> IdempotentForeignAccess {
+    pub(super) fn strongest_idempotent_foreign_access(self, prot: bool) -> IdempotentForeignAccess {
         match self {
             Cell => IdempotentForeignAccess::Write,
             ReservedFrz if prot => IdempotentForeignAccess::None,
@@ -415,9 +411,12 @@ impl PermTransition {
                     (ReservedFrz | ReservedIM | Cell, _) => {
                         unreachable!("self is a noop transition")
                     }
-                    (Disabled, Cell | ReservedFrz | ReservedIM | Unique | Frozen)
-                    | (Frozen, Cell | ReservedFrz | ReservedIM | Unique)
-                    | (Unique, Cell | ReservedFrz | ReservedIM) => {
+                    (
+                        Disabled,
+                        Cell | ReservedFrz | ReservedFrzConflicted | ReservedIM | Unique | Frozen,
+                    )
+                    | (Frozen, Cell | ReservedFrz | ReservedFrzConflicted | ReservedIM | Unique)
+                    | (Unique, Cell | ReservedFrz | ReservedFrzConflicted | ReservedIM) => {
                         unreachable!("permissions between self and err must be increasing")
                     }
                 }
@@ -451,9 +450,4 @@ impl fmt::Display for PermTransition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "from {} to {}", self.from, self.to)
     }
-}
-
-/// `ReservedFrz` with or without the conflicted flag, as Miri's `ReservedFrz { .. }` pattern.
-pub(super) fn is_reserved_frz(perm: Permission) -> bool {
-    perm.inner.is_reserved_frz()
 }

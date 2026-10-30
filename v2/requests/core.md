@@ -288,3 +288,5 @@ The watcher (`crates/blaze-vfs/src/watch.rs`) now asks a reported path's `Effect
    says what it is").
 
 The watcher moves to both once they exist; until then it stays correct with Stat + ReadAll.
+
+> forwarded to coordinator: lane core is DONE and `Effect::Look` and `Done::Changed`'s kinds are a new effect and completion in every driver (io_uring, kqueue, IOCP, threads, the simulation): new work for a lane the coordinator names. The watcher stays correct with `Stat` + `ReadAll` meanwhile.

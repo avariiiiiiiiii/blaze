@@ -44,20 +44,24 @@ use std::{
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
     },
+    thread::ThreadId,
     time::{Duration, Instant},
 };
 
 use base_db::{Crate, Env, Nonce, SourceDatabase};
 use blaze_core::Traced;
-use blaze_expand::Mode;
-use blaze_ids::ContentId;
+use blaze_expand::{
+    Mode, Put,
+    tally::{Mine, Tally},
+};
+use blaze_ids::{ContentId, Hasher, Idx, Interner, Sharded};
 use blaze_usercode::{
     Given, RunKey, RunKind,
-    index::{self, FindError, Found, KeepError},
-    inputs::{Disk, Unreadable},
+    index::{self, FindError, Found},
+    inputs::{self, Files, Unreadable},
     trace::Inputs,
 };
 use hir_expand::proc_macro::{
@@ -780,7 +784,7 @@ impl Wasm {
         let kept = was_kept.into();
         let wasm = Wasm { path: path.to_owned(), digest, identity, pre, compiled_in, kept };
         wasm.keep_code(store);
-        LOADED.add(start.elapsed());
+        count(Counted::Loaded, start.elapsed());
         Ok(wasm)
     }
 
@@ -948,7 +952,7 @@ impl Session {
             self.failed = true;
         }
         let took = start.elapsed();
-        RAN.add(took);
+        count(Counted::Ran, took);
         Ran { output, found: false, retained: self.store.data().retained, took }
     }
 
@@ -1393,13 +1397,29 @@ fn what_it_read(state: &mut State) -> Option<Traced> {
 
 /// The inputs of a module's expansion as they are now ([`index::find`]): its package's files
 /// on the machine, by the paths the module has for them, its environment, and the database's
-/// answers to its questions of a span.
+/// answers to its questions of a span. It asks the database nothing, as `find` runs with the
+/// store's guard held: a question it has no answer to yet is noted in `unanswered`, and
+/// [`find_answered`] asks it once `find` has returned and looks again.
 struct Now<'a> {
     root: Option<&'a Path>,
-    disk: &'a mut Disk,
+    machine: inputs::Now<'a>,
     env: &'a [(String, String)],
     shapes: &'a Shapes,
-    db: Option<&'a dyn SourceDatabase>,
+    /// The answers so far, by question as a read set has it ([`Value::read`]).
+    answers: &'a FxHashMap<String, String>,
+    unanswered: Vec<String>,
+}
+
+/// What a read set has for the question `read` ([`Value::read`]) of the input of `shapes`, as
+/// `db` answers it: no database answers nothing ([`Value::said`]).
+fn answer(read: &str, shapes: &Shapes, db: Option<&dyn SourceDatabase>) -> String {
+    match Value::parse(read, shapes) {
+        Some((value, span)) => {
+            let answer = db.map(|db| load_cargo::answer(db, value.request(span)));
+            value.said(answer.as_ref())
+        }
+        None => "?".to_owned(),
+    }
 }
 
 impl Now<'_> {
@@ -1419,14 +1439,14 @@ impl Inputs for Now<'_> {
 
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
         match self.real(path)? {
-            Some(real) => self.disk.file(&real),
+            Some(real) => self.machine.file(&real),
             None => Ok(None),
         }
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
         match self.real(path)? {
-            Some(real) => self.disk.dir(&real),
+            Some(real) => self.machine.dir(&real),
             None => Ok(None),
         }
     }
@@ -1434,14 +1454,13 @@ impl Inputs for Now<'_> {
     fn env(&mut self, name: &OsStr) -> Option<OsString> {
         let name = name.to_str()?;
         if name.starts_with('\0') {
-            let said = match Value::parse(name, self.shapes) {
-                Some((value, span)) => {
-                    let answer = self.db.map(|db| load_cargo::answer(db, value.request(span)));
-                    value.said(answer.as_ref())
-                }
-                None => "?".to_owned(),
-            };
-            return Some(said.into());
+            if let Some(said) = self.answers.get(name) {
+                return Some(said.into());
+            }
+            if !self.unanswered.iter().any(|it| it == name) {
+                self.unanswered.push(name.to_owned());
+            }
+            return None;
         }
         self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone().into())
     }
@@ -1452,16 +1471,45 @@ impl Inputs for Now<'_> {
 
     fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, Unreadable> {
         match self.real(path)? {
-            Some(real) => self.disk.names(&real),
+            Some(real) => self.machine.names(&real),
             None => Ok(None),
         }
     }
 }
 
-thread_local! {
-    /// The machine's files, hashed once per change of what `stat` says of them: one per
-    /// expanding thread, so no check of an expansion's inputs waits on another's.
-    static DISK: std::cell::RefCell<Disk> = std::cell::RefCell::new(Disk::new(Vec::new()));
+/// What the store has of `run` for its inputs as they are now, by `look` of what
+/// [`index::find`] found, which runs with the store's guard held. A pass that met a question
+/// of a span with no answer yet is thrown away: the questions are asked of `db` with no guard
+/// alive, since answering one can expand other macros on this thread, and it looks again.
+/// Each pass that does not end answers at least one more of the finitely many questions the
+/// store's shapes of `run` ask.
+fn find_answered<T>(
+    expansions: &blaze_expand::Expansions,
+    run: &RunKey,
+    root: Option<&Path>,
+    env: &[(String, String)],
+    shapes: &Shapes,
+    db: Option<&dyn SourceDatabase>,
+    look: impl Fn(Found<'_>) -> T,
+) -> Result<T, FindError<Unreadable>> {
+    let none = inputs::Env::default();
+    let machine = inputs::Now { files: Files::shared(), env: &none };
+    let mut answers = FxHashMap::default();
+    loop {
+        let mut now = Now { root, machine, env, shapes, answers: &answers, unanswered: Vec::new() };
+        let looked = {
+            let store = expansions.store.read().unwrap_or_else(|it| it.into_inner());
+            index::find(&store, run, &mut now).map(&look)
+        };
+        if now.unanswered.is_empty() {
+            return looked;
+        }
+        let unanswered = std::mem::take(&mut now.unanswered);
+        for read in unanswered {
+            let said = answer(&read, shapes, db);
+            answers.insert(read, said);
+        }
+    }
 }
 
 /// Expands the macro at `index` of the module whose expansions are kept under `code` in a
@@ -1525,29 +1573,27 @@ fn expand<'a>(
     let keeping = blaze_expand::keeping();
     let found = match keeping {
         Some(keeping) => {
-            let store = keeping.expansions.store.read().unwrap_or_else(|it| it.into_inner());
-            // Taken out while in use: a question asked of the database can expand another
-            // macro on this thread, which then gets a fresh one.
-            let mut disk = DISK.replace(Disk::new(Vec::new()));
-            let mut now =
-                Now { root: root.as_deref(), disk: &mut disk, env: &env, shapes: &shapes, db };
-            let found = match index::find(&store, &run, &mut now) {
-                // Read in place, under the lock: a hit copies nothing out of the store.
-                Ok(Found::Hit { value, .. }) if keeping.mode == Mode::Keep => {
-                    Ok(Err(shapes.read(value)))
-                }
-                Ok(Found::Hit { value, .. }) => Ok(Ok(Some(value.to_vec()))),
-                Ok(Found::Miss { .. }) => Ok(Ok(None)),
-                Err(error) => Err(error),
-            };
-            DISK.set(disk);
+            let found = find_answered(
+                keeping.expansions,
+                &run,
+                root.as_deref(),
+                &env,
+                &shapes,
+                db,
+                |found| match found {
+                    // Read in place, under the guard: a hit copies nothing out of the store.
+                    Found::Hit { value, .. } if keeping.mode == Mode::Keep => Err(shapes.read(value)),
+                    Found::Hit { value, .. } => Ok(Some(value.to_vec())),
+                    Found::Miss { .. } => Ok(None),
+                },
+            );
             match found {
                 Ok(Ok(found)) => found,
                 Ok(Err(kept)) => {
                     let output = kept
                         .map(&restore)
                         .ok_or_else(|| failed("the store's expansion of it is not one".to_owned()));
-                    FOUND.add(start.elapsed());
+                    count(Counted::Found, start.elapsed());
                     return Ran { output, found: true, retained: false, took: start.elapsed() };
                 }
                 Err(error) => {
@@ -1594,31 +1640,26 @@ fn expand<'a>(
             }
             return Ok(restore(trees));
         }
-        let Some(keeping) = keeping else { return Ok(restore(trees)) };
+        if keeping.is_none() {
+            return Ok(restore(trees));
+        }
         let traced = what_it_read(&mut state);
-        match (&traced, &value) {
-            (None, _) => ASKED.add(Duration::ZERO),
-            (Some(traced), _) if index::untraceable(traced) => UNTRACEABLE.add(Duration::ZERO),
+        match (traced, value) {
+            (None, _) => count(Counted::Asked, Duration::ZERO),
+            (Some(traced), _) if index::untraceable(&traced) => {
+                count(Counted::Untraceable, Duration::ZERO)
+            }
             (Some(_), _) if state.retained => {}
             (Some(traced), Some(value)) => {
-                let mut store = keeping.expansions.store.write().unwrap_or_else(|it| it.into_inner());
-                match index::keep(&mut store, &run, traced, value.clone()) {
-                    Ok(_) => KEPT.add(Duration::ZERO),
-                    Err(KeepError::Corrupt(corrupt)) => return Err(failed(corrupt.to_string())),
-                    Err(KeepError::Mismatch(mismatch)) => {
-                        return Err(failed(format!(
-                            "the store has another expansion under the same key of every input \
-                             it read, so the key misses an input or the macro is not \
-                             deterministic: {mismatch:?}"
-                        )));
-                    }
-                }
+                let what = format!("the wasm proc macro `{}`", listed.name);
+                blaze_expand::put(Put { run, traced, value, what });
+                count(Counted::Kept, Duration::ZERO);
             }
             (Some(_), None) => {}
         }
         Ok(restore(trees))
     });
-    RAN.add(start.elapsed());
+    count(Counted::Ran, start.elapsed());
     Ran { output, found: false, retained, took: start.elapsed() }
 }
 
@@ -1673,12 +1714,102 @@ struct Lazy {
     /// Whether one of its expansions ran in this process, and whether one left state.
     ran: AtomicBool,
     retained: AtomicBool,
-    /// Each crate's session has its own lock, so crates expand the library at once.
-    sessions: Mutex<FxHashMap<(Nonce, Crate), (salsa::Revision, Slot)>>,
+    /// Each crate's seat in each database, found with no lock by the hash of the two
+    /// ([`seat_id`]): crates expand the library at once, and a crate's expansions take turns.
+    seats: Sharded<Seat>,
+    /// Every seat, for [`Lazy::sweep`]; locked only when a seat is made and when a database
+    /// moves to a new revision.
+    made: Mutex<Vec<Idx<Seat>>>,
+    /// The revision each database's seats were last swept for.
+    swept: Mutex<FxHashMap<Nonce, salsa::Revision>>,
 }
 
-/// A crate's session, started by its first expansion in the revision.
-type Slot = Arc<Mutex<Option<Result<Session, String>>>>;
+/// The session of one crate in one database, and the turns its expansions take in it: a module
+/// that keeps state between calls is a function of the calls before, so one runs at a time,
+/// in the order they came. No lock is held while one runs: it takes the session out of the
+/// queue, so the database it asks can expand any other macro meanwhile.
+struct Seat {
+    of: (Nonce, Crate),
+    /// Locked only to take a turn or end one, never while an expansion runs.
+    queue: Mutex<Queue>,
+    turn: Condvar,
+}
+
+#[derive(Default)]
+struct Queue {
+    /// The session and the revision it is of, while no expansion runs in it; `None` before
+    /// the first.
+    session: Option<(salsa::Revision, Result<Session, String>)>,
+    /// The thread an expansion runs in it on, while one does.
+    running: Option<ThreadId>,
+    /// The next ticket handed out, and the one whose turn it is.
+    next: u64,
+    serving: u64,
+}
+
+/// One expansion's turn in a [`Seat`]: the session is its until the turn is dropped.
+struct Turn<'a> {
+    seat: &'a Seat,
+    session: Option<(salsa::Revision, Result<Session, String>)>,
+}
+
+impl Seat {
+    fn new(of: (Nonce, Crate)) -> Seat {
+        Seat { of, queue: Mutex::new(Queue::default()), turn: Condvar::new() }
+    }
+
+    /// This thread's turn, once every expansion that came before has had its. An expansion
+    /// asked for in the seat while this thread's own runs in it (a question of a span that
+    /// expands the crate's macros again) is refused: the module's instance is in the middle
+    /// of a call, and the expansion can't wait for itself.
+    fn take(&self) -> Result<Turn<'_>, ()> {
+        let me = std::thread::current().id();
+        let mut queue = self.queue.lock().unwrap_or_else(|it| it.into_inner());
+        if queue.running == Some(me) {
+            return Err(());
+        }
+        let ticket = queue.next;
+        queue.next += 1;
+        while queue.serving != ticket {
+            queue = self.turn.wait(queue).unwrap_or_else(|it| it.into_inner());
+        }
+        queue.running = Some(me);
+        let session = queue.session.take();
+        Ok(Turn { seat: self, session })
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut queue = self.seat.queue.lock().unwrap_or_else(|it| it.into_inner());
+        queue.session = self.session.take();
+        queue.running = None;
+        queue.serving += 1;
+        drop(queue);
+        self.seat.turn.notify_all();
+    }
+}
+
+/// Feeds what a value hashes into to a content ID, so two values that hash differently have
+/// different IDs.
+struct Feed(Hasher);
+
+impl std::hash::Hasher for Feed {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        unreachable!("a feed is finished as a content ID")
+    }
+}
+
+/// What a seat is found by: its database and crate.
+fn seat_id(of: &(Nonce, Crate)) -> ContentId {
+    let mut feed = Feed(Hasher::new("blaze v2 wasm macro seat 1"));
+    std::hash::Hash::hash(of, &mut feed);
+    feed.0.finish()
+}
 
 impl Lazy {
     fn new(path: &Path, known: Known) -> Lazy {
@@ -1749,60 +1880,58 @@ impl fmt::Debug for Expander {
     }
 }
 
-/// Counts macro expansions and loaded modules for the daemon's build statistics.
-struct Count {
-    calls: AtomicU64,
-    nanos: AtomicU64,
+/// What is counted of macro expansions and loaded modules for the daemon's build statistics,
+/// each with the time it took, on the thread that did it ([`blaze_expand::tally`]).
+#[derive(Clone, Copy)]
+enum Counted {
+    /// Expansions run in a module, from their call.
+    Ran,
+    /// Expansions the store had, from their call.
+    Found,
+    /// Expansions left for the store's owner to keep ([`blaze_expand::take_puts`]).
+    Kept,
+    /// Expansions run that were not kept, as they asked the database what their key does not
+    /// say or met a file they could not read.
+    Asked,
+    /// Expansions run that were not kept, as they read the clock or randomness.
+    Untraceable,
+    /// Modules made ready to run in this process (machine code loaded or compiled, linked).
+    Loaded,
 }
 
-impl Count {
-    const fn new() -> Count {
-        Count { calls: AtomicU64::new(0), nanos: AtomicU64::new(0) }
-    }
+const COUNTED: usize = Counted::Loaded as usize + 1;
 
-    fn add(&self, took: Duration) {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        self.nanos.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
-    }
+static TALLY: Tally<COUNTED> = Tally::new();
 
-    fn get(&self) -> (u64, f64) {
-        (self.calls.load(Ordering::Relaxed), self.nanos.load(Ordering::Relaxed) as f64 / 1e9)
-    }
+thread_local! {
+    static MINE: Mine<COUNTED> = Mine::of(&TALLY);
 }
 
-/// Expansions run in a module, with the time each took from its call.
-static RAN: Count = Count::new();
-/// Expansions the store had, with the time each took from its call.
-static FOUND: Count = Count::new();
-/// Expansions kept.
-static KEPT: Count = Count::new();
-/// Expansions run that were not kept, as they asked the database what their key does not
-/// say or met a file they could not read.
-static ASKED: Count = Count::new();
-/// Expansions run that were not kept, as they read the clock or randomness.
-static UNTRACEABLE: Count = Count::new();
-/// Modules made ready to run in this process (machine code loaded or compiled, linked).
-static LOADED: Count = Count::new();
+fn count(what: Counted, took: Duration) {
+    // A thread that is ending has no block left to count into.
+    _ = MINE.try_with(|it| it.add(what as usize, took));
+}
 
 /// The expansions so far, for the daemon's log: `None` before the first.
 pub fn report() -> Option<String> {
-    let (ran, running) = RAN.get();
-    let (found, finding) = FOUND.get();
+    let counted = |what: Counted| TALLY.get(what as usize);
+    let (ran, running) = counted(Counted::Ran);
+    let (found, finding) = counted(Counted::Found);
     if ran + found == 0 {
         return None;
     }
-    let (loaded, loading) = LOADED.get();
+    let (loaded, loading) = counted(Counted::Loaded);
     let mut said = format!(
         "wasm proc macros: {ran} ran in {running:.3}s, {found} from the store in \
          {finding:.3}s, {loaded} modules loaded in {loading:.3}s"
     );
     let rest = [
-        (&KEPT, "kept"),
-        (&ASKED, "not kept, as they asked the database what their key does not say or met a file they could not read"),
-        (&UNTRACEABLE, "not kept, as they read the clock or randomness"),
+        (Counted::Kept, "kept"),
+        (Counted::Asked, "not kept, as they asked the database what their key does not say or met a file they could not read"),
+        (Counted::Untraceable, "not kept, as they read the clock or randomness"),
     ];
-    for (count, what) in rest {
-        let (calls, _) = count.get();
+    for (which, what) in rest {
+        let (calls, _) = counted(which);
         if calls != 0 {
             said += &format!("; {calls} {what}");
         }

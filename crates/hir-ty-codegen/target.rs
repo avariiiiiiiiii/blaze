@@ -359,3 +359,40 @@ impl Target {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Target;
+
+    fn setting(target: &Target, name: &str) -> Option<bool> {
+        let isa = target.isa("backtracking", false).expect("the ISA");
+        isa.isa_flags().iter().find(|it| it.name == name).and_then(|it| it.as_bool())
+    }
+
+    #[test]
+    fn only_a_cpu_that_has_lse_is_given_it() {
+        let apple = Target::parse("aarch64-apple-darwin").expect("a target");
+        let linux = Target::parse("aarch64-unknown-linux-gnu").expect("a target");
+        assert_eq!(setting(&apple, "has_lse"), Some(true));
+        assert_eq!(setting(&linux, "has_lse"), Some(false));
+    }
+
+    #[test]
+    fn the_baseline_of_x86_64_is_what_rustc_compiles_for() {
+        for triple in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+            let target = Target::parse(triple).expect("a target");
+            let later = ["has_sse3", "has_sse41", "has_popcnt", "has_avx", "has_bmi1", "has_lzcnt"];
+            for name in later {
+                assert_eq!(setting(&target, name), Some(false), "{triple}: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn tests_verify_what_cranelift_is_given() {
+        let target = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let isa = target.isa("backtracking", false).expect("the ISA");
+        assert!(isa.flags().enable_verifier());
+        assert_eq!(isa.flags().opt_level(), cranelift_codegen::settings::OptLevel::None);
+    }
+}

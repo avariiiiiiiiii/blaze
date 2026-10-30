@@ -1,0 +1,151 @@
+//! `MapUnitFn`: `map_unit_fn`, a statement `slice.iter_mut().map(f);` whose `f` returns `()`
+//! or `!`, which maps lazily and is dropped unused.
+//!
+//! Follows rustc's `compiler/rustc_lint/src/map_unit_fn.rs`, `compiler/rustc_lint/src/lints.rs`
+//! (`MappingToUnit`) and `compiler/rustc_middle/src/ty/mod.rs` (`span_of_impl`: a local
+//! item's `def_span`, else nothing) (MIT or Apache-2.0).
+
+use hir::InFile;
+use hir_def::{
+    CallableDefId, FunctionId, HasModule as _, ItemContainerId, Lookup as _,
+    expr_store::ExpressionStore,
+    hir::{Expr, ExprId, Statement},
+    src::HasSource as _,
+};
+use hir_ty::{
+    InferBodyId,
+    db::{HirDatabase, InternedClosure},
+    next_solver::{CallableIdWrapper, Ty, TyKind},
+};
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
+use syntax::{AstNode as _, SyntaxKind, SyntaxNodePtr, TextRange, ast};
+
+use crate::{
+    cx::signature_range,
+    lints::bodies::{
+        BodyCx, LatePass,
+        types::util::{self, fn_item, from_expansion, method_fn},
+    },
+    lower::{Found, Phase, break_outside_of_loop::ancestors},
+    model::{Applicability, Diag, Span},
+};
+
+pub(super) fn pass() -> Box<dyn LatePass> {
+    Box::new(MapUnitFn)
+}
+
+struct MapUnitFn;
+
+impl LatePass for MapUnitFn {
+    fn name(&self) -> &'static str {
+        "MapUnitFn"
+    }
+
+    fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+        if let Some(found) = map_unit_fn(b, block, index) {
+            out.push(found);
+        }
+    }
+}
+
+fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found> {
+    let Expr::Block { statements, .. } = b.store().expr(block) else { return None };
+    let Statement::Expr { expr, has_semi: true } = *statements.get(index)? else { return None };
+    let Expr::MethodCall { receiver, method_name, args: &[arg], .. } = b.store().expr(expr) else { return None };
+    if method_name.as_str() != "map" {
+        return None;
+    }
+    let node = util::syntax(b, expr)?;
+    let stmt = ancestors(b.cx, &node).into_iter().find(|it| it.value.kind() == SyntaxKind::EXPR_STMT)?;
+    if from_expansion(&b.cx.span(stmt.as_ref().map(|it| it.text_range())))
+        || from_expansion(&b.expr_span(receiver)?)
+        || from_expansion(&b.expr_span(arg)?)
+        || !is_impl_slice(b, receiver)
+        || method_fn(b, expr).and_then(|it| fn_item(b.db(), it)).as_deref() != Some("IteratorMap")
+    {
+        return None;
+    }
+    let (function_label, ret_ty) = match b.infer.expr_ty(arg).kind() {
+        TyKind::Closure(closure, args) => (closure_span(b, closure.0.loc(b.db())), args.as_closure().sig().skip_binder().output()),
+        TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(function)), _) => {
+            let sig = b.db().callable_item_signature(CallableDefId::FunctionId(function));
+            (fn_span(b, function), sig.skip_binder().skip_binder().output())
+        }
+        _ => return None,
+    };
+    if !returns_nothing(ret_ty) {
+        return None;
+    }
+
+    let call = ast::MethodCallExpr::cast(node.value.clone())?;
+    let name = call.name_ref()?;
+    let name_span = b.cx.span(node.with_value(name.syntax().text_range()));
+    let span = b.cx.span(node.with_value(TextRange::new(name.syntax().text_range().start(), node.value.text_range().end())));
+    let arg_span = util::span(b, arg)?;
+    let mut diag = Diag::lint("map_unit_fn", "`Iterator::map` call that discard the iterator's values", span.clone());
+    diag.note("`Iterator::map`, like many of the methods on `Iterator`, gets executed lazily, meaning that its effects won't be visible until it is iterated");
+    diag.span_label(
+        function_label.unwrap_or_else(|| arg_span.clone()),
+        "this function returns `()`, which is likely not what you wanted",
+    );
+    diag.span_label(arg_span, "called `Iterator::map` with callable that returns `()`");
+    diag.span_label(span, "after this call to map, the resulting iterator is `impl Iterator<Item = ()>`, which means the only information carried by the iterator is the number of items");
+    diag.suggestion_verbose(name_span, "you might have meant to use `Iterator::for_each`", "for_each", Applicability::MaybeIncorrect);
+    Some(b.lint(diag, Phase::Late, stmt.map(|it| SyntaxNodePtr::new(&it))))
+}
+
+/// rustc's `ret_ty.is_unit() || ret_ty.is_never()`.
+fn returns_nothing(ty: Ty<'_>) -> bool {
+    ty.is_unit() || ty.is_never()
+}
+
+/// rustc's `is_impl_slice`: `receiver` is a method call of a method of an inherent impl on a
+/// slice (`<[T]>::iter_mut`).
+fn is_impl_slice(b: &BodyCx<'_, '_>, receiver: ExprId) -> bool {
+    let db = b.db();
+    let Some(method) = method_fn(b, receiver) else { return false };
+    let ItemContainerId::ImplId(impl_id) = method.lookup(db).container else { return false };
+    db.impl_self_ty(impl_id).skip_binder().is_slice()
+}
+
+/// rustc's `span_of_impl` of a function: its `def_span` (its signature) when it is of this
+/// crate.
+fn fn_span(b: &BodyCx<'_, '_>, function: FunctionId) -> Option<Span> {
+    let db = b.db();
+    if hir::Crate::from(function.krate(db)) != b.cx.krate {
+        return None;
+    }
+    let source = function.lookup(db).source(db);
+    Some(b.cx.span(source.as_ref().map(signature_range)))
+}
+
+/// rustc's `span_of_impl` of a closure (always of this crate): its `def_span`, the closure's
+/// header from `move` (or its first token after its attributes) to its parameters' `|` or its
+/// return type.
+fn closure_span(b: &BodyCx<'_, '_>, closure: InternedClosure<'_>) -> Option<Span> {
+    let db = b.db();
+    let ptr = match closure.owner {
+        InferBodyId::DefWithBodyId(owner) if owner == b.owner => b.expr_node(closure.expr)?,
+        owner => expr_node(db, owner, closure.expr)?,
+    };
+    let node = b.cx.syntax(ptr);
+    let written = ast::ClosureExpr::cast(node.value.clone())?;
+    let start = node
+        .value
+        .children_with_tokens()
+        .find(|it| !matches!(it.kind(), SyntaxKind::ATTR | SyntaxKind::WHITESPACE | SyntaxKind::COMMENT))?
+        .text_range()
+        .start();
+    let end = match written.ret_type() {
+        Some(ret) => ret.syntax().text_range().end(),
+        None => written.param_list()?.syntax().text_range().end(),
+    };
+    Some(b.cx.span(node.with_value(TextRange::new(start, end))))
+}
+
+/// The node an expression of another body is written as.
+fn expr_node(db: &dyn HirDatabase, owner: InferBodyId<'_>, expr: ExprId) -> Option<InFile<SyntaxNodePtr>> {
+    let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
+    let source = source_map.expr_syntax(expr).ok()?;
+    Some(source.map(|it| it.syntax_node_ptr()))
+}

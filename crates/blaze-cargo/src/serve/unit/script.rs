@@ -60,7 +60,8 @@ pub(crate) fn compile_of(units: &Units, run: usize) -> Option<usize> {
 }
 
 /// What a script that provably prints only constants prints, read from its source through the
-/// VFS: it is then neither compiled nor run. `unit` is the script's compile or its run.
+/// VFS: it is then neither compiled nor run. `unit` is the script's compile or its run. Worked
+/// out once per job and script: its compile and its run both ask.
 pub(crate) fn inert(job: &Job, unit: usize) -> Option<Value> {
     let units = job.units();
     let u = units.graph.units.get(unit)?;
@@ -68,14 +69,13 @@ pub(crate) fn inert(job: &Job, unit: usize) -> Option<Value> {
         Mode::RunCustomBuild => compile_of(units, unit)?,
         _ => unit,
     };
+    job.inert.get(compile)?.get_or_init(|| work_out_inert(job, compile)).clone()
+}
+
+fn work_out_inert(job: &Job, compile: usize) -> Option<Value> {
+    let units = job.units();
     let root = units.graph.units.get(compile)?.target.src_path.to_string_lossy().into_owned();
-    let mounted = super::files::Mounted::new(
-        job.input.files.clone(),
-        job.input.root,
-        &job.input.config.mounts,
-        &job.input.config.invocation.root,
-    );
-    let (_, _, bytes) = mounted.read(&root)?;
+    let (_, _, bytes) = job.mounted.read(&root)?;
     let files: BTreeMap<PathBuf, Vec<u8>> = [(PathBuf::from(&root), bytes.to_vec())].into();
     script::inert(Path::new(&root), &files, &units.plans.get(compile)?.rustflags)
 }
@@ -89,7 +89,8 @@ pub(crate) struct Of<'a> {
     pub(crate) launcher: &'a Path,
     /// The compiled script.
     pub(crate) program: PathBuf,
-    pub(crate) scripts: &'a BTreeMap<usize, Applied>,
+    /// What each run told cargo, by its unit; a slot not set is a run not ended.
+    pub(crate) scripts: &'a [std::sync::OnceLock<Applied>],
 }
 
 fn var<'a>(plan: &'a UnitPlan, name: &str) -> Option<&'a str> {
@@ -126,7 +127,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
     let dependencies = unit
         .dependencies
         .iter()
-        .filter_map(|dep| of.scripts.get(&dep.index).map(|applied| (dep, applied)))
+        .filter_map(|dep| of.scripts.get(dep.index).and_then(|it| it.get()).map(|applied| (dep, applied)))
         .map(|(dep, applied)| {
             let name = units
                 .graph
@@ -384,18 +385,24 @@ fn walk(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 }
 
 /// Whether the store has run `unit`'s result for its inputs as they are now, or the script is
-/// inert; false when that is not known.
+/// inert; false when that is not known. The run it prepares is kept for [`start`], which
+/// takes it rather than prepare it again.
 pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
-    let Ok(Some(start)) = prepare(job, unit) else { return false };
+    let Some(slot) = job.starts.get(unit) else { return false };
+    let mut slot = slot.lock().unwrap_or_else(|it| it.into_inner());
+    if slot.is_none() {
+        let Ok(Some(start)) = prepare(job, unit) else { return false };
+        *slot = Some(Box::new(start));
+    }
+    let Some(start) = slot.as_mut() else { return false };
+    let start = &mut **start;
     match &start.how {
         How::Inert(_) => true,
         How::Outside(_) => false,
         How::Sandboxed(prepared) => {
             let store = job.input.store.read().unwrap_or_else(|it| it.into_inner());
-            let mut disk = job.shared.disk.lock().unwrap_or_else(|it| it.into_inner());
-            disk.set_env(prepared.env.clone());
             matches!(
-                blaze_usercode::index::find(&store, &prepared.spec.key, &mut *disk),
+                blaze_usercode::index::find(&store, &prepared.spec.key, &mut start.disk),
                 Ok(blaze_usercode::index::Found::Hit { .. })
             )
         }
@@ -403,10 +410,13 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
 }
 
 /// A run ready to begin.
-struct Start {
+pub(crate) struct Start {
     unit: bs::Unit,
     /// The environment it is started in, which its output is read with.
     env: Vec<(OsString, OsString)>,
+    /// The machine's files and the run's environment, as what it read is checked against:
+    /// made once per run, so no check sorts the environment again or takes a shared lock.
+    disk: blaze_usercode::inputs::Disk,
     how: How,
 }
 
@@ -437,14 +447,12 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         // Never compiled: its program is named, not there.
         Some(_) => None,
         None => {
-            let made = job.made.lock().unwrap_or_else(|it| it.into_inner());
-            match made.get(&compile).and_then(|it| it.main.clone()) {
+            match job.made[compile].get().and_then(|it| it.main.clone()) {
                 Some(it) => Some(it),
                 None => return Ok(None),
             }
         }
     };
-    let scripts = job.scripts.lock().unwrap_or_else(|it| it.into_inner());
     let script_path = match &program {
         Some((path, _)) => PathBuf::from(path),
         None => PathBuf::from(&units.plans[compile].outputs.first().cloned().unwrap_or_default()),
@@ -455,14 +463,14 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         tools: &job.shared.tools,
         launcher: &job.shared.launcher,
         program: script_path,
-        scripts: &scripts,
+        scripts: &job.scripts,
     };
     let unit = script_unit(&of, run).map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
-    drop(scripts);
     let env = inherited(&job.input.config.invocation.env, job.plan(run)?);
     let (Some((_, code)), None) = (program, inert.clone()) else {
         let value = inert.ok_or_else(|| ApiError::new("a build script neither built nor inert", None))?;
-        return Ok(Some(Start { unit, env, how: How::Inert(value) }));
+        let disk = blaze_usercode::inputs::Disk::new(Vec::new());
+        return Ok(Some(Start { unit, env, disk, how: How::Inert(value) }));
     };
     let mut read = vec![
         unit.package.manifest_dir.clone(),
@@ -475,11 +483,12 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     let place = Place { code, read, network: false, memory: None, mode: blaze_usercode::run::Mode::Normal };
     let prepared = script::prepare(&unit, &env, &place)
         .map_err(|error| ApiError::new(error.0, Some(unit.package.descr())))?;
+    let disk = blaze_usercode::inputs::Disk::new(prepared.env.clone());
     let how = match outside(job, run) {
         true => How::Outside(Command { sandbox: Sandbox::Off, ..prepared.spec.command }),
         false => How::Sandboxed(prepared),
     };
-    Ok(Some(Start { unit, env, how }))
+    Ok(Some(Start { unit, env, disk, how }))
 }
 
 /// A build script's run, on the loop.
@@ -501,8 +510,18 @@ pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<Box<dyn Ru
     if !matches!(u.mode, Mode::RunCustomBuild) {
         return Err(ApiError::new(format!("unit {unit} (`{}`) is no build script's run", u.target.name), None));
     }
-    let Some(start) = prepare(job, unit)? else {
-        return Err(ApiError::new(format!("the build script of `{}` was not built before its run", u.target.name), None));
+    let kept = job.starts.get(unit).and_then(|it| it.lock().unwrap_or_else(|it| it.into_inner()).take());
+    let start = match kept {
+        Some(it) => *it,
+        None => match prepare(job, unit)? {
+            Some(it) => it,
+            None => {
+                return Err(ApiError::new(
+                    format!("the build script of `{}` was not built before its run", u.target.name),
+                    None,
+                ));
+            }
+        },
     };
     Ok(Box::new(ScriptRun { job: job.clone(), unit, tag: Tag(tags), state: State::Ready(Box::new(start)) }))
 }
@@ -551,7 +570,9 @@ impl ScriptRun {
         out.push(Response::BuildScript(executed(&package_id, &output, &out_dir)));
         let links = start.unit.package.links.clone();
         let applied = Applied { package_id, links, output, out_dir };
-        job.scripts.lock().unwrap_or_else(|it| it.into_inner()).insert(self.unit, applied);
+        if job.scripts[self.unit].set(applied).is_err() {
+            return self.error(format!("the build script run of unit {} ended twice in one job", self.unit), out);
+        }
         self.state = State::Done;
         Some(true)
     }
@@ -559,7 +580,7 @@ impl ScriptRun {
 
 impl Runs for ScriptRun {
     fn start(&mut self, store: &Store, effects: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
-        let State::Ready(start) = std::mem::replace(&mut self.state, State::Done) else { return None };
+        let State::Ready(mut start) = std::mem::replace(&mut self.state, State::Done) else { return None };
         // cargo's start of a run: `OUT_DIR` made, and the time it began.
         let stdout = match &start.how {
             How::Inert(value) => value.stdout.clone(),
@@ -580,10 +601,7 @@ impl Runs for ScriptRun {
                 None
             }
             How::Sandboxed(prepared) => {
-                let mut disk = self.job.shared.disk.lock().unwrap_or_else(|it| it.into_inner());
-                disk.set_env(prepared.env.clone());
-                let begun = Run::begin(prepared.spec.clone(), store, &mut *disk, self.tag, effects);
-                drop(disk);
+                let begun = Run::begin(prepared.spec.clone(), store, &mut start.disk, self.tag, effects);
                 match begun {
                     Ok(Begun::Reused(value)) => self.finish(&start, &value, began, out),
                     Ok(Begun::Running(run)) => {
@@ -610,29 +628,27 @@ impl Runs for ScriptRun {
         _effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
-        let State::Running { start, run, began, cancelled } = std::mem::replace(&mut self.state, State::Done) else {
+        let State::Running { mut start, run, began, cancelled } = std::mem::replace(&mut self.state, State::Done) else {
             return None;
         };
         if cancelled {
             // A run killed is no result: nothing of it is kept or applied.
             return Some(false);
         }
-        let value = match (run, &start.how) {
+        let Start { unit, env, disk, how } = &mut *start;
+        let value = match (run, &*how) {
             (Some(run), How::Sandboxed(prepared)) => {
-                let mut disk = self.job.shared.disk.lock().unwrap_or_else(|it| it.into_inner());
-                disk.set_env(prepared.env.clone());
                 let completed = run.complete(
                     completion,
                     store,
-                    &mut *disk,
-                    |exit| script::cargo_rule(&start.unit, &start.env, exit),
+                    disk,
+                    |exit| script::cargo_rule(unit, env, exit),
                     |traced| script::keyed(prepared, traced),
                 );
-                drop(disk);
                 match completed {
                     Ok((value, _, _)) => value,
                     Err(error) => {
-                        let what = format!("the build script of `{}`: {error}", start.unit.package.descr());
+                        let what = format!("the build script of `{}`: {error}", unit.package.descr());
                         return self.error(what, out);
                     }
                 }
@@ -645,8 +661,8 @@ impl Runs for ScriptRun {
                     let what = format!(
                         "failed to run custom build command for `{}`\n\nCaused by:\n  could not execute process `{}` \
                          (never executed)\n\nCaused by:\n  {error}",
-                        start.unit.package.descr(),
-                        start.unit.script.display()
+                        unit.package.descr(),
+                        unit.script.display()
                     );
                     return self.error(what, out);
                 }

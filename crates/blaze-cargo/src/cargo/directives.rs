@@ -12,7 +12,8 @@
 //! - `rustc-link-arg` (and its `-bins`, `-bin=`, `-tests`, `-benches`, `-examples` and
 //!   `-cdylib` forms): one of [`LINK_ARGS`], or an rpath to a directory `rustc-link-search`
 //!   may name.
-//! - `rustc-env`: not a variable cargo or rustc gives a crate itself ([`given_by_cargo`]).
+//! - `rustc-env`: not a variable cargo gives a crate itself, nor one rustc, rustdoc or cargo
+//!   reads when building it ([`given_by_cargo`]).
 //!
 //! What counting these rules over the bench corpus found (590 scripts,
 //! `tools/bench/results/2026-10-27-bscache/directives.md`) decided their edges: no
@@ -172,31 +173,95 @@ fn allowed_args() -> String {
     all.join(", ")
 }
 
-/// Whether cargo or rustc gives a crate the variable `name` itself, which a script's
-/// `rustc-env` may not set over: what cargo sets for a crate's compilation (cargo's
-/// "Environment variables Cargo sets for crates") and what the toolchain reads from its own
-/// environment (`RUSTC_BOOTSTRAP`, the jobserver's `CARGO_MAKEFLAGS`). What cargo gives only
-/// build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`,
-/// `CARGO_MANIFEST_LINKS`) is not one: a crate has it only when its script forwards it, as
-/// rav1e's does. Nor is `CARGO_COMMIT_HASH`, which cargo's build sets for cargo.
+/// The variables, sorted, that cargo gives a crate's compilation or that rustc, rustdoc or cargo
+/// read at run time when building a crate, from their source at the pinned nightly
+/// (rust-lang/rust 16d1ffac17ad, its cargo at cad07cf8e597). Left out: what only bootstrap
+/// (`src/bootstrap`), tests or tidy read, what the compiler's own build bakes in with
+/// `option_env!` or `env!` (`RUSTC_VERIFY_LLVM_IR`, `RUSTC_INSTALL_BINDIR`), what only rustc's
+/// build scripts read (`RUSTC_WINDOWS_RC`), and what cargo gives only build scripts
+/// (`RUSTC_LINKER`).
+pub const GIVEN: [&str; 47] = [
+    // cargo `src/lib.rs` (`CARGO_ENV`), `src/compiler/compilation.rs`.
+    "CARGO",
+    "CARGO_BIN_NAME",
+    "CARGO_CRATE_NAME",
+    // The jobserver crate's `Client::configure`, which cargo calls on each rustc.
+    "CARGO_MAKEFLAGS",
+    "CARGO_MANIFEST_DIR",
+    "CARGO_MANIFEST_PATH",
+    // cargo `src/compiler/mod.rs`.
+    "CARGO_PRIMARY_PACKAGE",
+    // Unstable in cargo's "Environment variables Cargo sets for crates"; not set at this commit.
+    "CARGO_RUSTC_CURRENT_DIR",
+    // cargo `src/compiler/mod.rs`.
+    "CARGO_SBOM_PATH",
+    "CARGO_TARGET_TMPDIR",
+    // cargo `src/compiler/mod.rs`.
+    "OUT_DIR",
+    "RUSTC",
+    // `compiler/rustc_feature/src/lib.rs`, cargo `src/compiler/custom_build.rs`.
+    "RUSTC_BOOTSTRAP",
+    // `compiler/rustc_driver_impl/src/lib.rs`.
+    "RUSTC_BREAK_ON_ICE",
+    // `compiler/rustc_session/src/session.rs`.
+    "RUSTC_CTFE_BACKTRACE",
+    // `compiler/rustc_span/src/def_id.rs`, `compiler/rustc_incremental/src/persist/file_format.rs`.
+    "RUSTC_FORCE_RUSTC_VERSION",
+    // `compiler/rustc_session/src/config.rs`.
+    "RUSTC_GRAPHVIZ_FONT",
+    // `compiler/rustc_driver_impl/src/lib.rs`.
+    "RUSTC_ICE",
+    // `compiler/rustc_driver_impl/src/lib.rs` into `compiler/rustc_log/src/lib.rs`
+    // (`LoggerConfig::from_env`), `compiler/rustc_session/src/session.rs`.
+    "RUSTC_LOG",
+    "RUSTC_LOG_BACKTRACE",
+    "RUSTC_LOG_COLOR",
+    "RUSTC_LOG_ENTRY_EXIT",
+    "RUSTC_LOG_FORMAT_JSON",
+    "RUSTC_LOG_LINES",
+    "RUSTC_LOG_OUTPUT_TARGET",
+    "RUSTC_LOG_THREAD_IDS",
+    "RUSTC_LOG_WRAPTREE",
+    // `compiler/rustc_driver_impl/src/lib.rs`, `compiler/rustc_ast/src/attr/version.rs`.
+    "RUSTC_OVERRIDE_VERSION_STRING",
+    // cargo `src/context/mod.rs` (`maybe_get_tool`).
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTC_WRAPPER",
+    "RUSTDOC",
+    // cargo `src/compiler/build_context/target_info.rs`.
+    "RUSTDOCFLAGS",
+    // `src/librustdoc/doctest.rs`, `src/librustdoc/doctest/runner.rs`.
+    "RUSTDOC_DOCTEST_BIN_PATH",
+    "RUSTDOC_DOCTEST_RUN_NB_TEST",
+    // cargo `src/ops/cargo_compile/mod.rs`.
+    "RUSTDOC_FLAGS",
+    // `src/librustdoc/lib.rs` into `compiler/rustc_log/src/lib.rs` (`LoggerConfig::from_env`).
+    "RUSTDOC_LOG",
+    "RUSTDOC_LOG_BACKTRACE",
+    "RUSTDOC_LOG_COLOR",
+    "RUSTDOC_LOG_ENTRY_EXIT",
+    "RUSTDOC_LOG_FORMAT_JSON",
+    "RUSTDOC_LOG_LINES",
+    "RUSTDOC_LOG_OUTPUT_TARGET",
+    "RUSTDOC_LOG_THREAD_IDS",
+    "RUSTDOC_LOG_WRAPTREE",
+    "RUSTFLAGS",
+    // `compiler/rustc_driver_impl/src/lib.rs`, `compiler/rustc_lint/src/non_local_def.rs`.
+    "UNSTABLE_RUSTDOC_TEST_LINE",
+    "UNSTABLE_RUSTDOC_TEST_PATH",
+];
+
+/// Whether `name` is one a script's `rustc-env` may not set: one of [`GIVEN`], or what cargo
+/// gives a crate under `CARGO_PKG_` and `CARGO_BIN_EXE_`, or what blaze gives one under
+/// `BLAZE_PROC_MACRO_LIBRARY_` (`proc-macro-libraries` in `[package.metadata.blaze]`, as
+/// `crates/proc-macro-srv/Cargo.toml` uses it). What cargo gives only build scripts
+/// (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_MANIFEST_LINKS`) is not
+/// one: a crate has it only when its script forwards it, as rav1e's does. Nor is
+/// `CARGO_COMMIT_HASH`, which cargo's build sets for cargo, or a `RUSTC_*` no tool reads, such
+/// as rust-analyzer's `RUSTC_VERSION`.
 pub fn given_by_cargo(name: &str) -> bool {
-    const NAMES: [&str; 13] = [
-        "CARGO",
-        "CARGO_MANIFEST_DIR",
-        "CARGO_MANIFEST_PATH",
-        "CARGO_CRATE_NAME",
-        "CARGO_BIN_NAME",
-        "CARGO_PRIMARY_PACKAGE",
-        "CARGO_TARGET_TMPDIR",
-        "CARGO_RUSTC_CURRENT_DIR",
-        "CARGO_MAKEFLAGS",
-        "OUT_DIR",
-        "RUSTC",
-        "RUSTDOC",
-        "RUSTFLAGS",
-    ];
-    const PREFIXES: [&str; 4] = ["CARGO_PKG_", "CARGO_BIN_EXE_", "RUSTC_", "RUSTDOC_"];
-    NAMES.contains(&name) || PREFIXES.iter().any(|it| name.starts_with(it))
+    const PREFIXES: [&str; 3] = ["CARGO_PKG_", "CARGO_BIN_EXE_", "BLAZE_PROC_MACRO_LIBRARY_"];
+    GIVEN.binary_search(&name).is_ok() || PREFIXES.iter().any(|it| name.starts_with(it))
 }
 
 /// The directory of a search path, without its kind (`native=`, `framework=`, ...).
@@ -252,7 +317,9 @@ pub fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<(String, String)> {
             "rustc-env" => value
                 .split_once('=')
                 .filter(|(name, _)| given_by_cargo(name))
-                .map(|(name, _)| format!("`{name}`, which cargo gives the crate itself")),
+                .map(|(name, _)| {
+                    format!("`{name}`, which cargo gives the crate or the toolchain acts on itself")
+                }),
             _ => None,
         };
         if let Some(why) = why {
@@ -372,6 +439,43 @@ mod tests {
                       cargo::rustc-env=CARGO_FEATURE_ASM=1\n\
                       cargo:rustc-env=CARGO_MANIFEST_LINKS=z\n";
         assert_eq!(refused_lines(stdout), Vec::<String>::new());
+    }
+
+    #[test]
+    fn given_is_sorted_for_its_binary_search() {
+        assert!(GIVEN.windows(2).all(|it| it[0] < it[1]), "{GIVEN:?}");
+    }
+
+    #[test]
+    fn rustc_env_may_not_set_what_the_toolchain_reads() {
+        for name in ["RUSTC_BOOTSTRAP", "RUSTC_LOG", "RUSTDOC_DOCTEST_RUN_NB_TEST"] {
+            assert!(given_by_cargo(name), "{name}");
+        }
+        for name in GIVEN {
+            assert!(given_by_cargo(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn rustc_env_may_set_rustc_names_no_tool_reads() {
+        for name in ["RUSTC_VERSION", "RUSTC_SEMVER", "RUSTDOC_FOO_BAR", "RUSTC_X"] {
+            assert!(!given_by_cargo(name), "{name}");
+        }
+        assert!(refused(b"cargo::rustc-env=RUSTC_VERSION=1\n", &ran()).is_empty());
+        assert_eq!(
+            refused_lines("cargo::rustc-env=RUSTC_BOOTSTRAP=1\n"),
+            ["cargo::rustc-env=RUSTC_BOOTSTRAP=1"]
+        );
+    }
+
+    #[test]
+    fn rustc_env_may_not_set_a_proc_macro_library_blaze_gives() {
+        assert!(given_by_cargo("BLAZE_PROC_MACRO_LIBRARY_PROC_MACRO_TEST_IMPL"));
+        assert!(!given_by_cargo("BLAZE_PROC_MACRO_LIBRARY"));
+        assert_eq!(
+            refused_lines("cargo::rustc-env=BLAZE_PROC_MACRO_LIBRARY_X=/tmp/libx.so\n"),
+            ["cargo::rustc-env=BLAZE_PROC_MACRO_LIBRARY_X=/tmp/libx.so"]
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ use std::{
 use blaze_mem::RegionVec;
 
 use super::{
+    flight::{error, failed},
     ops::{DIRECT, LINKS, MADE, MAKE, NO_SLOT, SECOND, WHOLE, arena_of},
     *,
 };
@@ -136,14 +137,9 @@ fn made_for(kind: Kind) -> usize {
     }
 }
 
-/// The `u32` at `at` of a `struct statx` at `statx`.
-///
-/// # Safety
-///
-/// `statx` points at [`STATX_SIZE`] bytes the kernel wrote and no longer writes.
-unsafe fn word(statx: *const u8, at: usize) -> u32 {
-    // SAFETY: the caller's; `at + 4` is within the struct.
-    unsafe { statx.add(at).cast::<u32>().read_unaligned() }
+/// The `u32` at `at` of a `struct statx`.
+fn word(statx: &[u8; STATX_SIZE], at: usize) -> u32 {
+    u32::from_ne_bytes(statx[at..at + 4].try_into().expect("four bytes"))
 }
 
 /// `bytes`, a path, NUL-terminated at the end of `into`; where it starts.
@@ -246,10 +242,25 @@ impl Uring {
         Ok(self.start(hot, buf, cold))
     }
 
-    /// The name `n` of the request `id`.
+    /// The `struct statx` the request `hot` (`id`) asked into its arena, once it completed.
+    fn statx_of(&self, id: Id, hot: &Hot) -> [u8; STATX_SIZE] {
+        let at = self.paths.at(arena_of(hot), self.ops.cold(id).names[4]).cast_const();
+        // SAFETY: the `STATX_SIZE` bytes the request pushed at `at` and holds until it ends; its
+        // `statx` has completed, so the kernel no longer writes them.
+        unsafe { at.cast::<[u8; STATX_SIZE]>().read_unaligned() }
+    }
+
+    /// The name `n` of the request `id`. Each caller asks for a name its kind's push put there
+    /// (0 and 1 the paths, 2 and 3 a rename's directories) or, for 4, the directory
+    /// `next_parent` put there before the `made` that asks; never `write_at`'s `statx` room,
+    /// which only `statx_of` reads.
     fn name_of(&self, id: Id, n: usize) -> &CStr {
         let hot = self.ops.get(id).expect("a request in flight");
-        self.paths.name(arena_of(hot), self.ops.cold(id).names[n])
+        // SAFETY: as above, `names[n]` starts a NUL-terminated name in the request's arena,
+        // which it holds while in flight. An index its push left unset is 0, which is still a
+        // name: every request pushes a path first, so the arena's first bytes are one, kept
+        // until no request holds the arena.
+        unsafe { self.paths.name(arena_of(hot), self.ops.cold(id).names[n]) }
     }
 
     /// Why the request `id` failed with `res` doing `what` to its name `n`.
@@ -748,11 +759,9 @@ impl Uring {
                 return self.failed_on(id, "opening", 0, res);
             }
             let (at, len) = (self.ops.cold(id).at, self.ops.buf(id).len() as u64);
-            let statx = self.paths.at(arena_of(&hot), self.ops.cold(id).names[4]).cast_const();
-            // SAFETY: the `statx` this request asked, complete: the kernel no longer writes it.
-            let (mask, align) = unsafe { (word(statx, 0), word(statx, 156)) };
+            let statx = self.statx_of(id, &hot);
             // `stx_dio_offset_align`, where the mask says it is filled in.
-            let align = u64::from(if mask & STATX_DIOALIGN != 0 { align } else { 0 });
+            let align = u64::from(if word(&statx, 0) & STATX_DIOALIGN != 0 { word(&statx, 156) } else { 0 });
             let hot = self.ops.get_mut(id).expect("in flight");
             if align != 0 && DIRECT_PIECE as u64 % align == 0 && at % align == 0 && len % align == 0 {
                 hot.flags |= DIRECT;
@@ -866,8 +875,11 @@ impl Uring {
         if res >= 0 {
             // SAFETY: the open's completion: a descriptor of the driver's, owned by no other.
             let fd = unsafe { OwnedFd::from_raw_fd(res) };
-            let arena = arena_of(&hot);
-            let at = put(self.paths.arena(arena), &res.to_ne_bytes()).map(|()| self.paths.arena(arena).len() as u32 - 4);
+            // The descriptor the kernel reads as an `__s32`, at an offset it may read as one.
+            let names = self.paths.arena(arena_of(&hot));
+            let pad = names.len().next_multiple_of(4) - names.len();
+            let at = (names.len() + pad) as u32;
+            let at = put(names, &[0; 3][..pad]).and_then(|()| put(names, &res.to_ne_bytes())).map(|()| at);
             let cold = self.ops.cold_mut(id);
             cold.fds[0] = Some(fd);
             match at {
@@ -983,8 +995,7 @@ impl Uring {
         }
         let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
         drop((source, target));
-        let hot = self.ops.get_mut(id).expect("in flight");
-        hot.phase = UNLINKING;
+        self.ops.get_mut(id).expect("in flight").phase = UNLINKING;
         self.ops.cold_mut(id).at = errno as u64;
         Step::Again
     }
@@ -1012,13 +1023,10 @@ impl Uring {
         if res < 0 {
             return Step::Ends(failed(res));
         }
-        let statx = self.paths.at(arena_of(&hot), self.ops.cold(id).names[4]).cast_const();
-        // SAFETY: the `statx` this request asked, complete: the kernel no longer writes it.
-        let (mask, mode, size, seconds, nanos) = unsafe {
-            let size = u64::from(word(statx, 40)) | u64::from(word(statx, 44)) << 32;
-            let seconds = (u64::from(word(statx, 112)) | u64::from(word(statx, 116)) << 32) as i64;
-            (word(statx, 0), word(statx, 28) & 0xffff, size, seconds, word(statx, 120))
-        };
+        let statx = self.statx_of(id, &hot);
+        let wide = |at: usize| u64::from(word(&statx, at)) | u64::from(word(&statx, at + 4)) << 32;
+        let (mask, mode, size) = (word(&statx, 0), word(&statx, 28) & 0xffff, wide(40));
+        let (seconds, nanos) = (wide(112) as i64, word(&statx, 120));
         let modified_ns = match (mask & STATX_MTIME != 0, u64::try_from(seconds)) {
             (true, Ok(seconds)) => seconds.saturating_mul(1_000_000_000).saturating_add(u64::from(nanos)),
             _ => 0,
@@ -1071,7 +1079,9 @@ impl Uring {
             (cold.names[made_for(hot.kind)], cold.at as usize)
         };
         let pushed = scratch::with_bytes(|dir| {
-            let path = self.paths.name(arena, path).to_bytes();
+            // SAFETY: `path` is the request's name `made_for` its kind, a path its push put
+            // NUL-terminated in `arena`, which the request holds while in flight.
+            let path = unsafe { self.paths.name(arena, path) }.to_bytes();
             let Some(end) = path.get(from..).and_then(|rest| rest.iter().position(|&it| it == b'/')) else {
                 return Ok(None);
             };

@@ -132,6 +132,22 @@ pub fn rustc_debug_function<'db>(
     Some(out.into_name())
 }
 
+/// How a type with no parts is written, the same in every spelling of a type: `type_name`,
+/// symbols, debug info and the names [`crate`]'s users keep across runs. `None` for any
+/// other type.
+pub fn scalar_name(ty: Ty<'_>) -> Option<&'static str> {
+    Some(match ty.kind() {
+        TyKind::Bool => "bool",
+        TyKind::Char => "char",
+        TyKind::Str => "str",
+        TyKind::Never => "!",
+        TyKind::Int(it) => it.name_str(),
+        TyKind::Uint(it) => it.name_str(),
+        TyKind::Float(it) => it.name_str(),
+        _ => return None,
+    })
+}
+
 /// What a function is written in, as a debugger is told of it.
 fn write_container<'db>(
     db: &'db Db,
@@ -379,14 +395,11 @@ fn write_list<'db>(
 }
 
 fn write_ty<'db>(db: &'db Db, out: &mut Spelled, ty: Ty<'db>) -> Option<()> {
+    if let Some(name) = scalar_name(ty) {
+        out.push_str(name);
+        return Some(());
+    }
     match ty.kind() {
-        TyKind::Bool => out.push_str("bool"),
-        TyKind::Char => out.push_str("char"),
-        TyKind::Str => out.push_str("str"),
-        TyKind::Never => out.push('!'),
-        TyKind::Int(it) => out.push_str(it.name_str()),
-        TyKind::Uint(it) => out.push_str(it.name_str()),
-        TyKind::Float(it) => out.push_str(it.name_str()),
         TyKind::Ref(region, pointee, mutability) => {
             out.push('&');
             // To `type_name` a lifetime of a `for<'a>` is `'_`, and any other is not there.

@@ -17,7 +17,7 @@ use crate::{
     registry::{self, Group, Info, LintIndex, Named},
 };
 
-pub use blaze_diagnostics::lints::{CommandLine, Level};
+pub use blaze_diagnostics::lints::{CommandLine, Level, LintOptions};
 
 /// What a level set applies to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,7 +166,7 @@ pub fn of_manifest(lints: &[(String, String, Level, i8)]) -> CommandLine {
         .collect();
     flags.sort_by(|a, b| (a.0, a.1, flag_of(a.3), &a.2).cmp(&(b.0, b.1, flag_of(b.3), &b.2)));
     let opts = flags.into_iter().map(|(_, _, name, level)| (name.replace('-', "_"), level));
-    CommandLine { opts: opts.collect(), ..CommandLine::default() }
+    CommandLine { lints: LintOptions { opts: opts.collect(), cap: None }, ..CommandLine::default() }
 }
 
 /// cargo's flag for a level, which it sorts flags of one name by.
@@ -196,12 +196,12 @@ pub struct Levels {
 
 impl Levels {
     pub fn new(command_line: &CommandLine) -> Levels {
-        let sets = command_line.opts.iter().filter_map(|(name, level)| {
+        let sets = command_line.lints.opts.iter().filter_map(|(name, level)| {
             let target = Target::of(name)?;
             let source = Source::CommandLine { flag: name.clone(), level: *level };
             Some((target, Spec { level: *level, source }))
         });
-        Levels { sets: sets.collect(), cap: command_line.cap }
+        Levels { sets: sets.collect(), cap: command_line.lints.cap }
     }
 
     /// The level of `lint` where the attributes `sets` are, outermost first and each node's in
@@ -313,14 +313,14 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(
-            flags.opts,
+            flags.lints.opts,
             vec![
                 ("clippy::all".to_owned(), Level::Warn),
                 ("warnings".to_owned(), Level::Deny),
                 ("clippy::needless_bool".to_owned(), Level::Allow),
             ]
         );
-        assert_eq!(flags.cap, Some(Level::Warn));
+        assert_eq!(flags.lints.cap, Some(Level::Warn));
     }
 
     #[test]
@@ -396,7 +396,7 @@ mod tests {
             ("cargo".to_owned(), "x".to_owned(), Level::Warn, 0),
             ("blaze".to_owned(), "hot_alloc".to_owned(), Level::Deny, 0),
         ];
-        let names: Vec<_> = of_manifest(&lints).opts.into_iter().map(|it| it.0).collect();
+        let names: Vec<_> = of_manifest(&lints).lints.opts.into_iter().map(|it| it.0).collect();
         assert_eq!(
             names,
             [

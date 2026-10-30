@@ -102,20 +102,22 @@ pub(crate) fn summarize(
         Built::Assembled(code, requests) => {
             let params = u32::try_from(code.signature.params.len())
                 .map_err(|_| failed(unit, "a function of more than 2^32 parameters"))?;
-            let all = (0..requests.funcs.len() as u32).collect::<Vec<_>>();
             let summary = Summary {
                 key: unit.instance.key(),
                 size: 0,
                 hint: summary::Hint::Never,
+                // alloc: empty, allocates nothing
                 calls: Vec::new(),
                 // Its code calls what it calls with whatever it likes.
-                addressed: keys(unit, places, refs, all.iter().copied())?,
+                addressed: keys(unit, places, refs, 0..requests.funcs.len() as u32)?,
                 params,
+                // alloc: empty, allocates nothing
                 unused: Vec::new(),
                 attrs: Default::default(),
                 body: Default::default(),
                 external: true,
             };
+            // clone: the export is held for the build; the function keeps its own to emit by
             let export = Export { module: None, places: places.clone(), code: unit.instance.code };
             return Ok((summary, export));
         }
@@ -143,12 +145,14 @@ pub(crate) fn summarize(
         }
     }
     // What data points at is called from where no summary says: a vtable's methods.
-    let in_data = requests.datas.iter().flat_map(|it| match it {
-        DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => {
-            blob.fn_relocs.iter().map(|it| it.1.as_u32()).collect()
-        }
-        _ => Vec::new(),
-    });
+    let in_data = requests
+        .datas
+        .iter()
+        .flat_map(|it| match it {
+            DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => &blob.fn_relocs[..],
+            _ => &[][..],
+        })
+        .map(|it| it.1.as_u32());
     let addressed = keys(unit, places, refs, facts.addressed.iter().copied().chain(in_data))?;
     // An instrumented body counts into counters of its own, which an importer's copy has not.
     let importable = requests.ordered() && spec.pgo != Pgo::Generate;
@@ -174,14 +178,17 @@ pub(crate) fn summarize(
         external: true,
     };
     let module = importable.then(|| {
+        // alloc: one a function, held for the build and shared by every compile that imports it
         Arc::new(crate::imports::Export {
             bitcode: export,
             requests: copied(requests),
+            // clone: the export's own; the function keeps its IR's to emit
             signature: pending.func.signature.clone(),
             size,
             hint: function.hint,
         })
     });
+    // clone: the export is held for the build; the function keeps its own to emit by
     Ok((summary, Export { module, places: places.clone(), code: unit.instance.code }))
 }
 
@@ -209,6 +216,7 @@ pub(crate) fn emit(
     if function.places.refs as usize > refs.len() {
         return Err(failed(
             unit,
+            // alloc: an error
             format!("{} references given for a function prepared against {}", refs.len(), function.places.refs),
         ));
     }
@@ -245,25 +253,30 @@ pub(crate) fn emit(
     let mut inlined = Vec::with_capacity(imported.len());
     for import in imported {
         let Some(module) = &import.export.module else {
+            // alloc: an error
             return Err(failed(unit, format!("imports {}, which has no LLVM export", import.key.0)));
         };
         let (funcs, datas) =
             merge(unit, &mut pending.wants, places, refs, &module.requests, &import.export.places, import.refs)?;
-        let id = by_key(places, refs, import.key).into_iter().next().ok_or_else(|| {
+        let id = requests_of(places, refs, import.key).next().ok_or_else(|| {
+            // alloc: an error
             failed(unit, format!("imports {}, which nothing it builds calls", import.key.0))
         })?;
+        // clone: a count of the `Arc`, one an import; LLVM's import holds the export it links
         linked.push(crate::imports::Import { export: module.clone(), id, funcs, datas });
         // A body LLVM did not build in can still have told it what the function returns or
         // that it writes nothing: every import is what the code is made of.
         inlined.push(import.export.code);
     }
     places.refs = u32::try_from(refs.len()).map_err(|_| failed(unit, "more than 2^32 references"))?;
+    // clone: `Given` owns what LLVM is told; the decision is the build's, borrowed
     let mut given = Given { constants: decided.constants.clone(), ..Given::default() };
     for (callee, attrs) in &decided.callees {
-        given.callees.extend(by_key(places, refs, *callee).into_iter().map(|it| (it, *attrs)));
+        given.callees.extend(requests_of(places, refs, *callee).map(|it| (it, *attrs)));
     }
     for (callee, params) in &decided.dead {
-        given.dead.extend(by_key(places, refs, *callee).into_iter().map(|it| (it, params.clone())));
+        // clone: `Given` owns each request's dead parameters; the decision is borrowed
+        given.dead.extend(requests_of(places, refs, *callee).map(|it| (it, params.clone())));
     }
     let signature = &pending.func.signature;
     let name = (spec.pgo == Pgo::Generate).then(|| pgo::name(unit.item, unit.instance.args));
@@ -278,6 +291,7 @@ pub(crate) fn emit(
         name.as_deref(),
         features,
     )
+    // alloc: an error
     .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))?;
     let profile = profiled(unit, spec, counted, mismatched)?;
     placed_since(unit, &pending.wants, places, refs)?;
@@ -365,6 +379,7 @@ fn optimization(unit: &Unit, spec: &Spec) -> Result<Optimization, CodegenError> 
         1 => Passes::Less,
         2 => Passes::Default,
         3 => Passes::Aggressive,
+        // alloc: an error
         _ => return Err(failed(unit, format!("LLVM has no level {opt}"))),
     };
     let selection = if passes == Passes::None { Selection::Fast } else { Selection::Optimized };
@@ -404,6 +419,7 @@ fn prelinked(
         wanted.zip(name.as_deref()),
         function.features,
     )
+    // alloc: an error
     .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))
 }
 
@@ -447,10 +463,12 @@ fn key(unit: &Unit, places: &Places, refs: &Refs, request: u32) -> Result<Option
         .funcs
         .get(request as usize)
         .and_then(|&it| refs.get(it as usize))
+        // alloc: an error
         .ok_or_else(|| failed(unit, format!("function request {request} has no place among the references")))?;
     match target {
         Target::Function(key) | Target::Direct(key) => Ok(Some(*key)),
         Target::Extern(_) | Target::Weak(_) => Ok(None),
+        // alloc: an error
         other => Err(failed(unit, format!("function request {request} is {other:?}"))),
     }
 }
@@ -463,7 +481,7 @@ fn keys(
     refs: &Refs,
     requests: impl Iterator<Item = u32>,
 ) -> Result<Vec<InstanceKey>, CodegenError> {
-    let mut keys = Vec::new();
+    let mut keys = Vec::with_capacity(requests.size_hint().0);
     for request in requests {
         keys.extend(key(unit, places, refs, request)?);
     }
@@ -474,12 +492,19 @@ fn keys(
 
 /// The function requests that are the build's function `wanted`, in order.
 #[cfg(feature = "llvm")]
-fn by_key(places: &Places, refs: &Refs, wanted: InstanceKey) -> Vec<u32> {
-    let is = |place: u32| match refs.get(place as usize) {
+fn requests_of(places: &Places, refs: &Refs, wanted: InstanceKey) -> impl Iterator<Item = u32> {
+    let is = move |place: u32| match refs.get(place as usize) {
         Some(Target::Function(key) | Target::Direct(key)) => *key == wanted,
         _ => false,
     };
-    (0..places.funcs.len() as u32).filter(|&at| is(places.funcs[at as usize])).collect()
+    (0..places.funcs.len() as u32).filter(move |&at| is(places.funcs[at as usize]))
+}
+
+/// [`requests_of`], gathered.
+#[cfg(test)]
+#[cfg(feature = "llvm")]
+fn by_key(places: &Places, refs: &Refs, wanted: InstanceKey) -> Vec<u32> {
+    requests_of(places, refs, wanted).collect()
 }
 
 /// Gives a place to each request LLVM's object asked for as it was read back: constants LLVM
@@ -510,6 +535,7 @@ fn placed_since(unit: &Unit, wants: &Wants, places: &mut Places, refs: &Refs) ->
 
 #[cfg(feature = "llvm")]
 fn copied(requests: &Requests) -> Requests {
+    // clone: the export's own, once a function; the function keeps its, which its emit grows
     Requests { funcs: requests.funcs.clone(), datas: requests.datas.clone() }
 }
 
@@ -530,12 +556,14 @@ fn merge(
     let place_in = |target: &Target| {
         let found = refs.iter().position(|it| it == target).map(|it| it as u32);
         found.ok_or_else(|| {
+            // alloc: an error
             failed(unit, format!("an import refers to {target:?}, which the compile's references lack"))
         })
     };
     let theirs_of = |place: u32| {
         their_refs
             .get(place as usize)
+            // alloc: an error
             .ok_or_else(|| failed(unit, format!("an import's place {place} is past its references")))
     };
     let mut funcs = Vec::with_capacity(requests.funcs.len());
@@ -543,6 +571,7 @@ fn merge(
         let theirs = *theirs.funcs.get(at).ok_or_else(|| failed(unit, "an import's request without its place"))?;
         let place = place_in(theirs_of(theirs)?)?;
         let before = wants.requests.funcs.len();
+        // clone: `Wants::func` takes the target owned; the import's export is shared, borrowed
         let id = wants.func(request.target.clone(), &request.sig).as_u32();
         if id as usize == before {
             places.funcs.push(place);
@@ -555,6 +584,7 @@ fn merge(
     for (at, request) in requests.datas.iter().enumerate() {
         let place = match theirs.datas.get(at) {
             Some(DataPlace::Place(theirs)) => DataPlace::Place(place_in(theirs_of(*theirs)?)?),
+            // clone: an ID but for a `Text`'s bytes; the compile's place is its own
             Some(other) => other.clone(),
             None => return Err(failed(unit, "an import's data without its place")),
         };
@@ -570,10 +600,12 @@ fn merge(
                 Ok((offset, FuncId::from_u32(moved)))
             });
             Ok(ConstBlob {
+                // clone: the compile's request owns its blob; the import's export is shared, borrowed
                 bytes: blob.bytes.clone(),
                 relocs: relocs.collect::<Result<_, CodegenError>>()?,
                 fn_relocs: fn_relocs.collect::<Result<_, CodegenError>>()?,
                 align: blob.align,
+                // clone: as `bytes`
                 type_ids: blob.type_ids.clone(),
             })
         };
@@ -589,6 +621,7 @@ fn merge(
                     Some(found) => found as u32,
                     None => {
                         let blob = moved(blob)?;
+                        // clone: the compile's request owns its type; the import's export is shared, borrowed
                         wants.requests.datas.push(DataRequest::Vtable { ty: ty.clone(), trait_ref: trait_ref.clone(), blob });
                         before as u32
                     }
@@ -597,6 +630,7 @@ fn merge(
             other => match wants.requests.datas.iter().position(|it| it == other) {
                 Some(found) => found as u32,
                 None => {
+                    // clone: the compile's request is its own; the import's export is shared, borrowed
                     wants.requests.datas.push(other.clone());
                     before as u32
                 }

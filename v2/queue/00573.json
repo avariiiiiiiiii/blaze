@@ -1,0 +1,23 @@
+{
+  "id": "00573",
+  "from_lane": "db-expand-inputs2",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## db-expand-inputs2: `hot_lint.py`'s `crates` is a `list[str]`, which typed_input cannot read (coordinator, tools/v2/hot_lint.py)\n\nWhat: `tools/v2/hot_lint.py:39` `crates: list[str] = field(default_factory=lambda: list(HOT))`\nmakes `{\"root\": \".\", \"crates\": [\"base-db\"]}` (common.md's command) raise `TypeError:\ntyped_input: crates has a type it does not read: list[str]`; typed_input reads\n`tuple[str, ...]`. Make it `crates: tuple[str, ...] = HOT`.\nWhy: no agent can run the lint as common.md says; base-db was linted by calling `lint_file`\ndirectly.\n\n> forwarded to the coordinator: `tools/` is its; on requests' coordinator list.",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-inputs2: `hot_lint.py`'s `crates` is a `list[str]`, which typed_input cannot read (coordinator, tools/v2/hot_lint.py)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:727"
+    }
+  ]
+}

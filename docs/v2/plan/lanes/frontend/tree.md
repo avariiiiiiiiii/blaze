@@ -183,3 +183,25 @@ exactly; the request that moves a handle function's last caller deletes it. One 
 across layers: `MacroCallLoc::to_node_view(db) -> InFile<view::Node<'db>>`, beside
 `to_node_item_view`. `syntax::view::Typed` covers `Either<L, R>` (source maps' `AstPtr<Either<..>>`)
 and the hand-written `ast::Macro`.
+
+## Deleting the handle layer
+
+What remains on handles once every `frontend-tree` request is applied, so what gates the
+deletion of `syntax-tree`'s `api.rs`/`cursor.rs`/`syntax_text.rs` and `syntax`'s `ast/` handle
+types, `SyntaxNode`/`SyntaxToken`/`SyntaxElement`, `ptr.rs`'s `to_node`, `algo.rs`,
+`syntax_editor`, `ast/make`, `hacks.rs`:
+
+- The IDE crates (`ide*`, `rust-analyzer`, `hir-ide`), deleted at integration, and what only
+  they call: `hir`'s handle `Semantics`, `source_to_def`, `symbols.rs`, `term_search*`;
+  `hir-expand`'s `expand_speculative` (with its `cfg_process.rs`/`fixup.rs` helpers) and
+  `prettify_macro_expansion`; `syntax-bridge`'s `prettify_macro_expansion`.
+- `blaze-engine/src/lib.rs` `callers_of_generic`: its callers come from
+  `ide_db::defs::Definition::usages`. It needs a build-path index of callers, not a syntax move.
+- The handle functions' own bodies in `hir-expand` (`files.rs`, `lib.rs`) and `hir`, which the
+  requests delete as their last callers move.
+- Kind tags (`AstId<ast::Fn>`, `AstPtr<N>`, `FileAstId<N>`, `Parse<ast::SourceFile>`) and
+  `Parse<SyntaxNode>` for an untyped parse (`token_tree_to_syntax_node`, blaze-fmt
+  `stream.rs`). These need a tag type that is not a handle (a zero-sized `ast` kind marker
+  per node type, generated beside the views) before `SyntaxNode` can go.
+- Tests that compare views against handles. After the deletion they compare against stored
+  expectations.

@@ -252,19 +252,19 @@ fn a_frame_that_is_not_one_is_refused() {
     quit.push(0);
     assert!(Frame::decode(&quit).is_err());
     let run = Frame::Run { id: 1, index: 2 }.to_bytes();
-    assert!(Frame::decode(&run[4..run.len() - 1]).is_err());
+    assert_eq!(Frame::decode(&run[4..run.len() - 1]).unwrap_err(), "a frame ends early, in its test index");
     let mut hello = Frame::Hello { version: 1, pid: 1, fork: 0, tests: vec!["ab".into()] }.to_bytes()[4..].to_vec();
     let at = hello.len() - 1;
     hello[at] = 0xff;
-    assert!(Frame::decode(&hello).is_err());
-    assert!(Frame::decode(&[]).is_err());
+    assert_eq!(Frame::decode(&hello).unwrap_err(), "the test name of a frame is not UTF-8");
+    assert_eq!(Frame::decode(&[]).unwrap_err(), "a frame ends early, in its kind");
     // A count past what the body holds ends early, never allocates for it.
     let mut lying = vec![1];
     lying.extend_from_slice(&1u32.to_le_bytes());
     lying.extend_from_slice(&1u32.to_le_bytes());
     lying.extend_from_slice(&0u64.to_le_bytes());
     lying.extend_from_slice(&u32::MAX.to_le_bytes());
-    assert!(Frame::decode(&lying).is_err());
+    assert_eq!(Frame::decode(&lying).unwrap_err(), "a frame ends early, in its test name");
 }
 
 /// An end's record must be what a region reader makes: hits strictly increasing, each below
@@ -281,7 +281,7 @@ fn an_execution_record_out_of_order_or_past_its_slots_is_refused() {
     // A count past the hits there: ends early.
     let mut short = ended(10, vec![1, 2]).to_bytes()[4..].to_vec();
     short.truncate(short.len() - 1);
-    assert!(Frame::decode(&short).unwrap_err().contains("ends early"));
+    assert_eq!(Frame::decode(&short).unwrap_err(), "a frame ends early, in its slots hit");
     let mut huge = ended(10, Vec::new()).to_bytes()[4..].to_vec();
     let at = huge.len() - 4;
     huge[at..].copy_from_slice(&u32::MAX.to_le_bytes());

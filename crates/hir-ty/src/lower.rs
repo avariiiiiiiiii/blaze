@@ -80,8 +80,8 @@ use crate::{
         util::BottomUpFolder,
     },
 };
-use crate::{frame_map, frame_set};
-pub(crate) use crate::{FrameMap, FrameSet};
+use crate::frame_map;
+pub(crate) use crate::FrameMap;
 
 /// A memo's list of `items`, allocated once at its length: nothing when it is empty (R4).
 pub(crate) fn exact_thin<T>(
@@ -130,6 +130,36 @@ impl SelfAndAssocBounds {
     #[inline]
     pub fn self_bounds(&self) -> EarlyBinder<'_, &[Clause<'_>]> {
         self.bounds.get().map_bound(|it| &it.as_slice()[..self.assoc_ty_bounds_start as usize])
+    }
+}
+
+/// The sizedness bounds written on a type: `Sized`, `?Sized`, `MetaSized` and `PointeeSized`.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct WrittenSizedness {
+    sized: bool,
+    relaxed: bool,
+    meta_sized: bool,
+    pointee_sized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplicitSizedness {
+    Sized,
+    MetaSized,
+}
+
+impl WrittenSizedness {
+    /// rustc's `add_implicit_sizedness_bounds`: `?Sized` alone is `MetaSized`, and a type with
+    /// no sizedness bound is `Sized`, or `MetaSized` for a trait's `Self`.
+    fn implicit(self, of_trait_self: bool) -> Option<ImplicitSizedness> {
+        let WrittenSizedness { sized, relaxed, meta_sized, pointee_sized } = self;
+        if relaxed && !sized && !meta_sized && !pointee_sized {
+            Some(ImplicitSizedness::MetaSized)
+        } else if !(sized || relaxed || meta_sized || pointee_sized) {
+            Some(if of_trait_self { ImplicitSizedness::MetaSized } else { ImplicitSizedness::Sized })
+        } else {
+            None
+        }
     }
 }
 
@@ -327,8 +357,9 @@ pub struct TyLoweringContext<'db, 'a> {
     in_binders: DebruijnIndex,
     impl_trait_mode: ImplTraitLoweringState<'a>,
     interning_mode: LoweringMode,
-    /// Tracks types with explicit `?Sized` bounds.
-    pub(crate) unsized_types: FrameSet<'a, Ty<'db>>,
+    /// The sizedness bounds written on each type, for its implicit one
+    /// ([`WrittenSizedness::implicit`]).
+    pub(crate) unsized_types: FrameMap<'a, Ty<'db>, WrittenSizedness>,
     pub(crate) diagnostics: Vec<TyLoweringDiagnostic, &'a Frame>,
     lifetime_elision: LifetimeElisionKind<'db>,
     forbid_params_after: Option<u32>,
@@ -397,7 +428,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             in_binders,
             impl_trait_mode,
             interning_mode: LoweringMode::Analysis,
-            unsized_types: frame_set(frame),
+            unsized_types: frame_map(frame),
             diagnostics: Vec::new_in(frame),
             lifetime_elision,
             forbid_params_after: None,
@@ -1426,6 +1457,15 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         .into_iter()
     }
 
+    /// The trait of `ty`'s implicit sizedness bound, for the bounds lowered on it so far.
+    fn implicit_sizedness_trait(&self, ty: Ty<'db>, of_trait_self: bool) -> Option<TraitId> {
+        let written = self.unsized_types.get(&ty).copied().unwrap_or_default();
+        match written.implicit(of_trait_self)? {
+            ImplicitSizedness::Sized => self.lang_items.Sized,
+            ImplicitSizedness::MetaSized => self.lang_items.MetaSized,
+        }
+    }
+
     pub(crate) fn lower_type_bound<'b>(
         &'b mut self,
         bound: &'b TypeBound,
@@ -1434,6 +1474,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     ) -> impl Iterator<Item = (Clause<'db>, GenericPredicateSource)> + use<'a, 'db> {
         let interner = self.interner;
         let frame = self.frame;
+        let sized = self.lang_items.Sized;
         let meta_sized = self.lang_items.MetaSized;
         let pointee_sized = self.lang_items.PointeeSized;
 
@@ -1447,13 +1488,15 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             // Lowering the path bound the lifetimes left out of it.
             let binder = ctx.ty_ctx().bound_vars_with_elided();
             {
-                // FIXME(sized-hierarchy): Remove this bound modifications once we have implemented
-                // sized-hierarchy correctly.
-                if meta_sized.is_some_and(|it| it == trait_ref.def_id.0) {
-                    // Ignore this bound
-                } else if pointee_sized.is_some_and(|it| it == trait_ref.def_id.0) {
-                    // Regard this as `?Sized` bound
-                    ctx.ty_ctx().unsized_types.insert(self_ty);
+                let trait_id = Some(trait_ref.def_id.0);
+                if trait_id == sized {
+                    ctx.ty_ctx().unsized_types.entry(self_ty).or_default().sized = true;
+                } else if trait_id == meta_sized {
+                    ctx.ty_ctx().unsized_types.entry(self_ty).or_default().meta_sized = true;
+                }
+                // As rustc's lowering, a `PointeeSized` bound is no clause: every type is one.
+                if trait_id == pointee_sized {
+                    ctx.ty_ctx().unsized_types.entry(self_ty).or_default().pointee_sized = true;
                 } else {
                     if !ignore_bindings {
                         assoc_bounds = ctx
@@ -1521,7 +1564,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     .lower_trait_ref_from_path(path, self_ty)
                     .map(|(trait_ref, _)| trait_ref.def_id.0);
                 if trait_id == sized_trait {
-                    self.unsized_types.insert(self_ty);
+                    self.unsized_types.entry(self_ty).or_default().relaxed = true;
                 }
             }
             &TypeBound::Lifetime(l) => {
@@ -1864,25 +1907,21 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             }
         }
 
-        if !self.unsized_types.contains(&self_ty) {
-            let sized_trait = self.lang_items.Sized;
-            let sized_clause = sized_trait.map(|trait_id| {
-                let trait_ref = TraitRef::new_from_args(
-                    interner,
-                    trait_id.into(),
-                    GenericArgs::new_from_slice(&[self_ty.into()]),
-                );
-                Clause(Predicate::new(
-                    interner,
-                    Binder::dummy(rustc_type_ir::PredicateKind::Clause(
-                        rustc_type_ir::ClauseKind::Trait(TraitClause {
-                            trait_ref,
-                            polarity: rustc_type_ir::ClausePolarity::Positive,
-                        }),
-                    )),
-                ))
-            });
-            predicates.extend(sized_clause);
+        if let Some(trait_id) = self.implicit_sizedness_trait(self_ty, false) {
+            let trait_ref = TraitRef::new_from_args(
+                interner,
+                trait_id.into(),
+                GenericArgs::new_from_slice(&[self_ty.into()]),
+            );
+            predicates.push(Clause(Predicate::new(
+                interner,
+                Binder::dummy(rustc_type_ir::PredicateKind::Clause(
+                    rustc_type_ir::ClauseKind::Trait(TraitClause {
+                        trait_ref,
+                        polarity: rustc_type_ir::ClausePolarity::Positive,
+                    }),
+                )),
+            )));
         }
 
         let assoc_ty_bounds_start = predicates.len() as u32;
@@ -3294,16 +3333,13 @@ fn type_alias_bounds_in<'db>(
         });
     }
 
-    if !ctx.unsized_types.contains(&interner_ty) {
-        let sized_trait = ctx.lang_items.Sized;
-        if let Some(sized_trait) = sized_trait {
-            let trait_ref = TraitRef::new_from_args(
-                interner,
-                sized_trait.into(),
-                GenericArgs::new_from_slice(&[interner_ty.into()]),
-            );
-            bounds.push(trait_ref.upcast(interner));
-        };
+    if let Some(sized_trait) = ctx.implicit_sizedness_trait(interner_ty, false) {
+        let trait_ref = TraitRef::new_from_args(
+            interner,
+            sized_trait.into(),
+            GenericArgs::new_from_slice(&[interner_ty.into()]),
+        );
+        bounds.push(trait_ref.upcast(interner));
     }
 
     let assoc_ty_bounds_start = bounds.len() as u32;
@@ -3850,7 +3886,8 @@ pub enum PredicateSource {
     /// From `GenericParams::of(def).where_predicates()[index]`: a bound written on a parameter,
     /// in a where clause, or an `impl Trait` argument's.
     Written { def: GenericDefId, index: u32 },
-    /// A type parameter's implicit `Sized`.
+    /// A type parameter's implicit sizedness: `Sized`, or `MetaSized` for one bound `?Sized` and
+    /// for a trait's `Self`.
     ImplicitSized(TypeParamId),
     /// A const parameter's `ConstArgHasType`.
     ConstParamType(ConstParamId),
@@ -3893,7 +3930,6 @@ fn lower_generic_predicates<'db, 'f>(
         frame,
     );
     let generics = generics.get().unwrap();
-    let sized_trait = ctx.lang_items.Sized;
     let myself = generics.owner();
 
     let mut own_predicates = Vec::new_in(frame);
@@ -3933,45 +3969,48 @@ fn lower_generic_predicates<'db, 'f>(
         }));
     }
 
-    if let Some(sized_trait) = sized_trait {
-        let mut add_sized_clause = |param_idx, param_id, param_data| {
-            let (
-                GenericParamId::TypeParamId(param_id),
-                GenericParamDataRef::TypeParamData(param_data),
-            ) = (param_id, param_data)
-            else {
-                return;
-            };
-
-            if param_data.provenance == TypeParamProvenance::TraitSelf {
-                return;
-            }
-
-            let param_ty = Ty::new_param(interner, param_id, param_idx);
-            if ctx.unsized_types.contains(&param_ty) {
-                return;
-            }
-            let trait_ref = TraitRef::new_from_args(
-                interner,
-                sized_trait.into(),
-                GenericArgs::new_from_slice(&[param_ty.into()]),
-            );
-            let clause = Clause(Predicate::new(
-                interner,
-                Binder::dummy(rustc_type_ir::PredicateKind::Clause(
-                    rustc_type_ir::ClauseKind::Trait(TraitClause {
-                        trait_ref,
-                        polarity: rustc_type_ir::ClausePolarity::Positive,
-                    }),
-                )),
-            ));
-            own_predicates.push(clause);
-            own_sources.iter_mut().for_each(|it| it.push(PredicateSource::ImplicitSized(param_id)));
+    // As rustc, a trait's `Self` gets a `MetaSized` supertrait, except an auto trait's (it could
+    // not be relaxed) and `PointeeSized`'s own.
+    let trait_self_gets_implicit = match def {
+        GenericDefId::TraitId(id) => {
+            Some(id) != ctx.lang_items.PointeeSized
+                && !TraitSignature::of(db, id).flags.contains(TraitFlags::AUTO)
+        }
+        _ => false,
+    };
+    let mut add_sized_clause = |param_idx, param_id, param_data| {
+        let (GenericParamId::TypeParamId(param_id), GenericParamDataRef::TypeParamData(param_data)) =
+            (param_id, param_data)
+        else {
+            return;
         };
-        generics.iter_with_idx().for_each(|(param_idx, param_id, param_data)| {
-            add_sized_clause(param_idx, param_id, param_data);
-        });
-    }
+
+        let of_trait_self = param_data.provenance == TypeParamProvenance::TraitSelf;
+        if of_trait_self && !trait_self_gets_implicit {
+            return;
+        }
+
+        let param_ty = Ty::new_param(interner, param_id, param_idx);
+        let Some(sized_trait) = ctx.implicit_sizedness_trait(param_ty, of_trait_self) else {
+            return;
+        };
+        let trait_ref = TraitRef::new_from_args(
+            interner,
+            sized_trait.into(),
+            GenericArgs::new_from_slice(&[param_ty.into()]),
+        );
+        let clause = Clause(Predicate::new(
+            interner,
+            Binder::dummy(rustc_type_ir::PredicateKind::Clause(rustc_type_ir::ClauseKind::Trait(
+                TraitClause { trait_ref, polarity: rustc_type_ir::ClausePolarity::Positive },
+            ))),
+        ));
+        own_predicates.push(clause);
+        own_sources.iter_mut().for_each(|it| it.push(PredicateSource::ImplicitSized(param_id)));
+    };
+    generics.iter_with_idx().for_each(|(param_idx, param_id, param_data)| {
+        add_sized_clause(param_idx, param_id, param_data);
+    });
 
     let parent_predicates = parent.predicates.get().skip_binder().as_slice();
     let mut all = Vec::with_capacity_in(
@@ -4706,6 +4745,30 @@ mod tests {
         });
         assert_eq!(used.allocations, 1, "the supertraits; no associated types");
         assert_eq!(info.all_supertraits().len() + info.direct_supertraits().len(), 3);
+    }
+
+    #[test]
+    fn implicit_sizedness_follows_rustc() {
+        let written = |sized, relaxed, meta_sized, pointee_sized| WrittenSizedness {
+            sized,
+            relaxed,
+            meta_sized,
+            pointee_sized,
+        };
+        let (s, m) = (Some(ImplicitSizedness::Sized), Some(ImplicitSizedness::MetaSized));
+        for (bounds, param, trait_self) in [
+            (written(false, false, false, false), s, m),
+            (written(false, true, false, false), m, m),
+            (written(true, false, false, false), None, None),
+            (written(true, true, false, false), None, None),
+            (written(false, false, true, false), None, None),
+            (written(false, true, true, false), None, None),
+            (written(false, false, false, true), None, None),
+            (written(false, true, false, true), None, None),
+        ] {
+            assert_eq!(bounds.implicit(false), param, "{bounds:?} on a parameter");
+            assert_eq!(bounds.implicit(true), trait_self, "{bounds:?} on a trait's `Self`");
+        }
     }
 
     #[test]

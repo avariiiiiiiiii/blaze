@@ -250,6 +250,28 @@ impl<'db> SourceAnalyzer<'db> {
         Some((mk_ty(ty), coerced.map(mk_ty)))
     }
 
+    /// [`Self::type_of_pat_view`]'s type as writeback named it when it found it undecided,
+    /// for rustc's "consider giving `x` an explicit type": each variable made for a const
+    /// parameter, or for a type parameter outside a macro expansion, is that parameter, and
+    /// every other variable an error, so it has the shape of `type_of_pat_view`'s type.
+    pub(crate) fn named_type_of_pat_view(
+        &self,
+        db: &'db Db,
+        pat: ast::Pat<'_>,
+    ) -> Option<Type<'db>> {
+        let ExprOrPatId::PatId(pat) = self.pat_id_view(pat)? else { return None };
+        let named = self.infer()?.named_pat_type(pat)?;
+        let source_map = self.store_sm()?;
+        let named = named.named(DbInterner::new_no_crate(db), |span, param| match param {
+            hir_def::GenericParamId::TypeParamId(_) => {
+                crate::AnyDiagnostic::span_syntax(span, source_map)
+                    .is_none_or(|span| !span.file_id.is_macro())
+            }
+            _ => true,
+        });
+        Some(self.ty(db, named.ty()?))
+    }
+
     pub(crate) fn type_of_binding_in_pat_view(
         &self,
         db: &'db Db,

@@ -11,6 +11,25 @@
 //!
 //! Anything on the way that this has no answer for is an [`Unhandled`], and the function is
 //! compiled by Cranelift instead.
+//!
+//! # Unsafe
+//!
+//! This module is the crate's one door to LLVM's C API (`vendor/llvm-sys`, whose root states
+//! the contract: who owns each handle, which strings need a NUL, the thread rules). Every
+//! call into it is here or in two children, each behind a safe function:
+//! - this file: the passes kept per target machine ([`Kept`]), the diagnostic handler
+//!   ([`diagnosed`]), the process's command-line options, the host CPU, the byte GEPs the
+//!   lowering builds ([`byte_offset`]), and the handful of inkwell calls that are `unsafe`
+//!   (deleting a function nothing uses, wrapping a raw call site);
+//! - [`rebase`] and [`release`]: walks of a module's raw IR (use lists, constant expressions,
+//!   call operands) that inkwell has no type for. Through inkwell each value read would also be
+//!   classified into its enum, one or two more calls into LLVM per operand.
+//!
+//! The safe version of all of it is LLVM's own `LLVMRunPasses` and inkwell's safe surface,
+//! which rebuild the pass builder, its analysis managers and a process-wide lock on every run
+//! ([`Kept`]), and cannot reach what `rebase` and `release` read. `lower`, `pgo`, `sanitize`
+//! and `emitted` forbid unsafe code. The values are of one context, the thread's
+//! ([`Machine`]): no handle crosses threads.
 
 use std::{cell::RefCell, collections::hash_map::Entry, fmt, sync::Once};
 
@@ -18,6 +37,7 @@ use cranelift_codegen::ir::{self, Opcode, Type};
 use inkwell::{
     AddressSpace, GlobalVisibility, OptimizationLevel,
     attributes::{Attribute, AttributeLoc},
+    builder::{Builder, BuilderError},
     context::Context,
     llvm_sys::{
         support::LLVMParseCommandLineOptions,
@@ -32,9 +52,10 @@ use inkwell::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
     },
     types::{AnyType, BasicTypeEnum},
-    values::{BasicValueEnum, FunctionValue},
+    values::{BasicValueEnum, FunctionValue, GlobalValue, IntValue, PointerValue},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::{
     Arch,
@@ -70,10 +91,8 @@ pub(super) fn plain_handlers(func: &ir::Function) -> bool {
         let mut items = table.items();
         match (items.next(), items.next()) {
             (Some(ir::ExceptionTableItem::Tag(_, handler)), None) => {
-                matches!(
-                    handler.args(&dfg.value_lists).collect::<Vec<_>>()[..],
-                    [ir::BlockArg::TryCallExn(0)]
-                )
+                let mut args = handler.args(&dfg.value_lists);
+                matches!((args.next(), args.next()), (Some(ir::BlockArg::TryCallExn(0)), None))
             }
             _ => false,
         }
@@ -160,33 +179,35 @@ fn compiled(
         Members::Unit(_) => None,
     };
     let weights = alone.and_then(|it| it.weights);
-    let (requested, defined): (Vec<String>, Vec<Defined<'_>>) = match &members {
-        Members::Alone(it) => {
-            let defined = Defined {
-                name: "",
-                func: it.func,
-                pointees: it.pointees,
-                named: it.named,
-                weights,
-                marked: true,
-            };
-            (vec![String::new()], vec![defined])
-        }
-        Members::Unit(members) => members
-            .iter()
-            .map(|it| {
+    // A member's request, none for a function alone.
+    let (requested, defined): (SmallVec<[Option<SymbolName>; 1]>, SmallVec<[Defined<'_>; 1]>) =
+        match &members {
+            Members::Alone(it) => {
                 let defined = Defined {
                     name: "",
                     func: it.func,
                     pointees: it.pointees,
                     named: it.named,
-                    weights: None,
+                    weights,
                     marked: true,
                 };
-                (Symbol::Func(it.request).to_string(), defined)
-            })
-            .unzip(),
-    };
+                (SmallVec::from_buf([None]), SmallVec::from_buf([defined]))
+            }
+            Members::Unit(members) => members
+                .iter()
+                .map(|it| {
+                    let defined = Defined {
+                        name: "",
+                        func: it.func,
+                        pointees: it.pointees,
+                        named: it.named,
+                        weights: None,
+                        marked: true,
+                    };
+                    (Some(Symbol::Func(it.request).named()), defined)
+                })
+                .unzip(),
+        };
     // LLVM's optimizing register allocator takes more than linear time, as Cranelift's does:
     // one function of dx kept it busy for minutes. Such a function is compiled without
     // optimization, and counted.
@@ -204,26 +225,29 @@ fn compiled(
         && optimization.pipeline().is_some()
         && alone.is_some_and(|it| it.pointees.iter().any(|(_, it)| it.unique))
         && super::Target::selected().is_ok_and(|it| it.object_format == super::ObjectFormat::MachO);
-    let names: Vec<&str> = requested
+    let names = requested
         .iter()
-        .map(|name| match alone {
-            Some(_) if wrapped => INNER,
-            Some(_) => OWN,
-            None => name.as_str(),
+        .map(|name| match name {
+            Some(name) => &**name,
+            None if wrapped => INNER,
+            None => OWN,
         })
-        .collect();
-    let defined: Vec<Defined<'_>> = std::iter::zip(&names, defined)
+        .collect::<SmallVec<[&str; 1]>>();
+    let defined = std::iter::zip(&names, defined)
         .map(|(&name, defined)| Defined { name, ..defined })
-        .collect();
+        .collect::<SmallVec<[Defined<'_>; 1]>>();
     Machine::with(optimization, |context, machine| {
         let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
+        // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
         let constants: FxHashMap<u32, &[u8]> = recorder.constants().collect();
+        // alloc: once per module, as `constants`
         let statics: FxHashSet<u32> = recorder.statics().collect();
         let resume = recorder.resume();
         let memcmp = recorder.memcmp();
         let blocks_asm = recorder.asm_blocks();
+        // alloc: once per module, as `constants`
         let readonly: FxHashMap<u32, &super::ConstBlob> = recorder.readonly().collect();
         told_constants(
             context,
@@ -234,7 +258,9 @@ fn compiled(
         let debug = lower::Debug::of(&module)?;
         let (shown, failed) = tally.time(Phase::Lower, || {
             // What is wrong with the function of each member, which is then only declared.
-            let mut failed: Vec<Option<Unhandled>> = defined.iter().map(|_| None).collect();
+            let mut failed = std::iter::repeat_with(|| None::<Unhandled>)
+                .take(defined.len())
+                .collect::<SmallVec<[_; 1]>>();
             let mut functions = Vec::with_capacity(defined.len());
             for (at, defined) in defined.iter().enumerate() {
                 match Lowering::add(context, &module, defined) {
@@ -261,17 +287,17 @@ fn compiled(
                 None => Linkage::LinkOnceODR,
             };
             link(context, &module, imports, linkage)?;
-            let names: Vec<String> = seen.iter().map(|it| shown_name(it.id.as_u32())).collect();
-            let shown: Vec<Defined<'_>> = std::iter::zip(&seen, &names)
-                .map(|(it, name)| Defined {
-                    name,
-                    func: &it.func,
-                    pointees: &it.pointees,
-                    named: &[],
-                    weights: None,
-                    marked: false,
-                })
-                .collect();
+            let mut names = Vec::with_capacity(seen.len());
+            names.extend(seen.iter().map(|it| shown_name(it.id.as_u32())));
+            let mut shown = Vec::with_capacity(seen.len());
+            shown.extend(std::iter::zip(&seen, &names).map(|(it, name)| Defined {
+                name: &**name,
+                func: &it.func,
+                pointees: &it.pointees,
+                named: &[],
+                weights: None,
+                marked: false,
+            }));
             // Every body shown is declared before any is defined, as one may call another.
             let mut by_id = FxHashMap::default();
             for (it, defined) in std::iter::zip(&seen, &shown) {
@@ -283,7 +309,9 @@ fn compiled(
             // A body shown calls the others shown, as the function being compiled does, so
             // that what LLVM learns of one (that it keeps no pointer it is given, say) holds
             // of those that call it.
-            let declared = by_id.clone();
+            // Each is defined seeing all that were declared: the ones that fail leave `by_id`
+            // after.
+            let mut unshown: SmallVec<[u32; 4]> = SmallVec::new();
             for (it, defined) in std::iter::zip(&seen, &shown) {
                 let Some(&function) = by_id.get(&it.id.as_u32()) else { continue };
                 let defined = Lowering::define(
@@ -296,13 +324,16 @@ fn compiled(
                     resume,
                     memcmp,
                     &blocks_asm,
-                    &declared,
+                    &by_id,
                     None,
                 );
                 if defined.is_err() {
-                    by_id.remove(&it.id.as_u32());
-                    unshow(&module, &FxHashMap::from_iter([(it.id.as_u32(), function)]));
+                    unshown.push(it.id.as_u32());
+                    unshow(&module, [(it.id.as_u32(), function)]);
                 }
+            }
+            for id in unshown {
+                by_id.remove(&id);
             }
             for (at, (defined, function)) in std::iter::zip(&defined, &functions).enumerate() {
                 let Some(function) = *function else { continue };
@@ -359,14 +390,14 @@ fn compiled(
         // What a compile alone imports is only there to be built in: a body LLVM did not
         // build in is the callee's own code, called. The passes above drop them; a function
         // too large for them gets none. What a unit imports and still calls is kept.
-        let mut kept = Vec::new();
+        let mut kept: SmallVec<[(SymbolName, &Import); 4]> = SmallVec::new();
         if !imports.is_empty() {
             let pass = if alone.is_some() { "elim-avail-extern" } else { "globaldce" };
             machine.run(&module, pass, false)?;
         }
         if alone.is_none() {
             for import in imports {
-                let name = Symbol::Func(import.id).to_string();
+                let name = Symbol::Func(import.id).named();
                 let Some(body) = module.get_function(&name) else { continue };
                 if body.count_basic_blocks() == 0 {
                     continue;
@@ -376,7 +407,7 @@ fn compiled(
                 kept.push((name, import));
             }
         }
-        unshow(&module, &shown);
+        unshow(&module, shown.iter().map(|(&id, &body)| (id, body)));
         retold_bytes(context, &module, &readonly);
         if module.get_function(INNER).is_some() {
             return Err(Unhandled::Shape("a body not built into the function that calls it"));
@@ -387,14 +418,13 @@ fn compiled(
         let object = tally
             .time(Phase::Emit, || machine.write_to_memory_buffer(&module, FileType::Object))
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
-        let mut read: Vec<(&str, ir::Signature)> = std::iter::zip(&names, &defined)
-            .map(|(&name, defined)| {
-                (if wrapped { OWN } else { name }, defined.func.signature.clone())
+        // In the object a member alone is `OWN` whether it was wrapped or not.
+        let mut read = std::iter::zip(&requested, &defined)
+            .map(|(name, defined)| {
+                (name.as_ref().map_or(OWN, SymbolName::bare), &defined.func.signature)
             })
-            .collect();
-        read.extend(
-            kept.iter().map(|(name, import)| (name.as_str(), import.export.signature.clone())),
-        );
+            .collect::<SmallVec<[(&str, &ir::Signature); 1]>>();
+        read.extend(kept.iter().map(|(name, import)| (name.bare(), &import.export.signature)));
         let mut codes =
             tally.time(Phase::Read, || emitted::read(object.as_slice(), &read, recorder))?;
         let kept_codes = codes.split_off(defined.len());
@@ -405,7 +435,9 @@ fn compiled(
                     Some(failed) => Err(failed),
                     None => code,
                 })
+                // alloc: the unit's result, one per member
                 .collect(),
+            // alloc: the unit's result, one per import kept
             kept: kept.collect(),
         })
     })
@@ -414,6 +446,7 @@ fn compiled(
 /// Leaves `function`, whose body could not be lowered, a declaration of the same name and
 /// type, which the other functions of the module call.
 fn declared_only<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>) {
+    // alloc: a function of a unit that failed to lower; the name outlives its renaming
     let name = function.get_name().to_owned();
     function.as_global_value().set_name("blaze.unlowered");
     let declaration =
@@ -459,7 +492,10 @@ fn wrap<'ctx>(
     inner.add_attribute(AttributeLoc::Function, context.create_enum_attribute(always, 0));
     let builder = context.create_builder();
     builder.position_at_end(context.append_basic_block(outer, ""));
-    let args: Vec<_> = outer.get_param_iter().map(Into::into).collect();
+    let args = outer
+        .get_param_iter()
+        .map(Into::into)
+        .collect::<SmallVec<[inkwell::values::BasicMetadataValueEnum<'ctx>; 8]>>();
     let call = builder.build_direct_call(inner, &args, "")?;
     match call.try_as_basic_value().basic() {
         Some(returned) => builder.build_return(Some(&returned))?,
@@ -505,6 +541,71 @@ pub(crate) fn attribute_kind(name: &str) -> u32 {
     let kind = Attribute::get_named_enum_kind_id(name);
     assert_ne!(kind, 0, "the linked LLVM has no attribute `{name}`");
     kind
+}
+
+/// `getelementptr i8, ptr base, by`: `base` moved by `by` bytes, which may be any number:
+/// not `inbounds`, so no offset makes it poison.
+fn byte_offset<'ctx>(
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    base: PointerValue<'ctx>,
+    by: IntValue<'ctx>,
+) -> Result<PointerValue<'ctx>, BuilderError> {
+    // SAFETY: inkwell's GEP is unsafe because indices that do not fit the type are invalid IR,
+    // on which LLVM crashes. Here the type is `i8` and there is one index, a scalar integer
+    // (an `IntValue` is never a vector), which LLVM takes for any `by`. `builder`, `base` and
+    // `by` are of the one context `'ctx` names, as every inkwell call here takes them to be.
+    unsafe { builder.build_gep(context.i8_type(), base, &[by], "") }
+}
+
+/// [`byte_offset`] marked `inbounds`, as rustc emits `<*const T>::offset`: the claim that
+/// `base` and the result are in one allocation, which lets LLVM tell what the result is based
+/// on. A wrong claim makes the compiled program's result poison; it cannot make this process
+/// unsound, so the caller says why it holds.
+fn in_bounds_byte_offset<'ctx>(
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    base: PointerValue<'ctx>,
+    by: IntValue<'ctx>,
+) -> Result<PointerValue<'ctx>, BuilderError> {
+    // SAFETY: as in `byte_offset`: an `i8` element and one scalar integer index make valid IR
+    // for any `by`, of the one context `'ctx`. `inbounds` is a statement about the program
+    // being compiled, not about this process.
+    unsafe { builder.build_in_bounds_gep(context.i8_type(), base, &[by], "") }
+}
+
+/// The indexed profile `LLVMBlazeWriteProfile` writes of `records` (name, hash, counts), as
+/// `llvm-profdata merge` does. What a test uses a profile of ([`pgo::written`]).
+#[cfg(test)]
+fn written_profile(records: &[(&str, u64, &[u64])]) -> Result<Vec<u8>, Unhandled> {
+    use inkwell::llvm_sys::transforms::pass_builder::{
+        LLVMBlazeProfileRecord, LLVMBlazeWriteProfile,
+    };
+    let records: Vec<LLVMBlazeProfileRecord> = records
+        .iter()
+        .map(|&(name, hash, counts)| LLVMBlazeProfileRecord {
+            Name: name.as_ptr().cast(),
+            NameLength: name.len(),
+            Hash: hash,
+            Counts: counts.as_ptr(),
+            CountsLength: counts.len(),
+        })
+        .collect();
+    let mut out = std::ptr::null_mut();
+    // SAFETY: each record points at a name and counts borrowed from `records`' caller, which
+    // outlive the call, with their lengths (no NUL needed); `out` is written once, with a
+    // buffer this then owns. A record outliving its bytes would have LLVM read freed memory.
+    let failed = unsafe { LLVMBlazeWriteProfile(records.as_ptr(), records.len(), &mut out) };
+    // SAFETY: `failed` is what LLVMBlazeWriteProfile just returned, taken nowhere else.
+    unsafe { Kept::taken(failed) }?;
+    if out.is_null() {
+        return Err(Unhandled::Llvm("LLVM wrote no profile".to_owned()));
+    }
+    // SAFETY: `out` is the non-null buffer LLVMBlazeWriteProfile just made, owned by nothing
+    // else: the `MemoryBuffer` disposes of it once, when dropped below. Wrapped twice it would
+    // be freed twice.
+    let buffer = unsafe { MemoryBuffer::new(out) };
+    Ok(buffer.as_slice().to_vec())
 }
 
 /// Tells LLVM what the function's `#[inline]` asks, as rustc does.
@@ -577,7 +678,9 @@ pub(super) fn export(
         let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
+        // alloc: once per export; `Wants` (fragment.rs) lists these, and the lowering looks them up
         let constants: FxHashMap<u32, &[u8]> = recorder.constants().collect();
+        // alloc: once per export, as `constants`
         let statics: FxHashSet<u32> = recorder.statics().collect();
         let own = Defined { name: OWN, func, pointees, named: &[], weights: None, marked: false };
         let function = Lowering::add(context, &module, &own)?;
@@ -637,7 +740,7 @@ fn link<'ctx>(
     let Some(all) = modules.pop() else { return Ok(()) };
     module.link_in_module(all).map_err(llvm)?;
     for import in imports {
-        let name = Symbol::Func(import.id).to_string();
+        let name = Symbol::Func(import.id).named();
         let body = module.get_function(&name).ok_or(Unhandled::Shape("an import not linked"))?;
         body.set_linkage(linkage);
     }
@@ -656,21 +759,27 @@ fn imported<'ctx>(
     let buffer = MemoryBuffer::create_from_memory_range(&import.export.bitcode, "import");
     let imported = context.create_module_from_ir(buffer).map_err(llvm)?;
     let own = imported.get_function(OWN).ok_or(Unhandled::Shape("an export without its body"))?;
-    let own_name = Symbol::Func(import.id).to_string();
+    let own_name = Symbol::Func(import.id).named();
     let renamed = |name: &std::ffi::CStr| match Symbol::parse(name.to_str().ok()?)? {
-        Symbol::Func(at) => Some(Symbol::Func(*import.funcs.get(at as usize)?).to_string()),
-        Symbol::Data(at) => Some(Symbol::Data(*import.datas.get(at as usize)?).to_string()),
+        Symbol::Func(at) => Some(Symbol::Func(*import.funcs.get(at as usize)?).named()),
+        Symbol::Data(at) => Some(Symbol::Data(*import.datas.get(at as usize)?).named()),
     };
-    let mut names = vec![(own.as_global_value(), own_name.clone())];
-    let functions: Vec<FunctionValue<'ctx>> = imported.get_functions().collect();
-    for function in functions.into_iter().filter(|&it| it != own) {
+    let mut names: SmallVec<[(GlobalValue<'ctx>, SymbolName); 16]> = SmallVec::new();
+    names.push((own.as_global_value(), own_name));
+    let mut next = imported.get_first_function();
+    while let Some(function) = next {
+        next = function.get_next_function();
+        if function == own {
+            continue;
+        }
         let Some(name) = renamed(function.get_name()) else { continue };
         // A call of itself is of the body.
         if name == own_name {
             function.replace_all_uses_with(own);
-            // SAFETY: `function` is owned by `imported` and is not `own` (filtered out above);
+            // SAFETY: `function` is owned by `imported` and is not `own` (skipped above);
             // `replace_all_uses_with(own)` just above left no use of it, and neither `names`
-            // nor the loop keeps it, so freeing it leaves nothing dangling.
+            // nor the loop keeps it (`next` was read before), so freeing it leaves nothing
+            // dangling.
             unsafe { function.delete() };
             continue;
         }
@@ -683,7 +792,7 @@ fn imported<'ctx>(
     }
     // In two steps, as a name given may be one another still has.
     for (at, (global, _)) in names.iter().enumerate() {
-        global.set_name(&format!("blaze.import.{at}"));
+        global.set_name(&SymbolName::of("blaze.import.", at as u32));
     }
     for (global, name) in &names {
         global.set_name(name);
@@ -763,7 +872,8 @@ fn agree_calls<'ctx>(context: &'ctx Context, module: &Module<'ctx>) -> Result<()
                 }
                 builder.position_before(&instruction);
                 let params = ty.get_param_types();
-                let mut args: Vec<BasicValueEnum<'ctx>> = Vec::new();
+                let mut args: SmallVec<[BasicValueEnum<'ctx>; 8]> =
+                    SmallVec::with_capacity(params.len());
                 for (at, param) in params.iter().enumerate() {
                     let arg = instruction
                         .get_operand(at as u32)
@@ -800,8 +910,10 @@ fn agree_calls<'ctx>(context: &'ctx Context, module: &Module<'ctx>) -> Result<()
                         builder.build_direct_invoke(callee, &args, then, catch, "")?
                     }
                     _ => {
-                        let args: Vec<BasicMetadataValueEnum<'ctx>> =
-                            args.iter().map(|&it| it.into()).collect();
+                        let args = args
+                            .iter()
+                            .map(|&it| it.into())
+                            .collect::<SmallVec<[BasicMetadataValueEnum<'ctx>; 8]>>();
                         let made = builder.build_direct_call(callee, &args, "")?;
                         made.set_tail_call_kind(call.get_tail_call_kind());
                         made
@@ -842,17 +954,20 @@ fn agree_calls<'ctx>(context: &'ctx Context, module: &Module<'ctx>) -> Result<()
 
 /// What the body of the requested function `id` that LLVM is shown is called in the module.
 /// No symbol of a program has such a name.
-fn shown_name(id: u32) -> String {
-    format!("blaze.a.{id}")
+fn shown_name(id: u32) -> SymbolName {
+    SymbolName::of("blaze.a.", id)
 }
 
 /// Has every call of a body shown that LLVM kept call the function itself, and drops the
 /// bodies: only the function being compiled is in the object. What LLVM made of the calls
 /// from what it read in the bodies holds of the functions, which are what the bodies are of
 /// (an edit of one sends the function being compiled back to level 1).
-fn unshow<'ctx>(module: &Module<'ctx>, shown: &FxHashMap<u32, FunctionValue<'ctx>>) {
-    for (&id, &body) in shown {
-        let name = Symbol::Func(id).to_string();
+fn unshow<'ctx>(
+    module: &Module<'ctx>,
+    shown: impl IntoIterator<Item = (u32, FunctionValue<'ctx>)>,
+) {
+    for (id, body) in shown {
+        let name = Symbol::Func(id).named();
         let function = module.get_function(&name).unwrap_or_else(|| {
             module.add_function(&name, body.get_type(), Some(Linkage::External))
         });
@@ -874,15 +989,19 @@ pub(super) fn assemble(text: &str) -> Result<Vec<u8>, String> {
         module.set_triple(&machine.get_triple());
         // What rustc wraps `global_asm!` in, where there are two syntaxes.
         let text = match super::Target::selected().map_err(Unhandled::Llvm)?.arch {
+            // alloc: once per block of assembly the store does not have (`asm::assemble`)
             Arch::X86_64 => format!(".intel_syntax noprefix\n{text}\n.att_syntax\n"),
+            // alloc: as above
             Arch::Aarch64 | Arch::Wasm32 => format!("{text}\n"),
         };
         module.set_inline_assembly(&text);
         let object = machine
             .write_to_memory_buffer(&module, FileType::Object)
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into_owned()))?;
+        // alloc: the object, which the caller keeps
         Ok(object.as_slice().to_vec())
     })
+    // alloc: the error's message
     .map_err(|e| format!("inline assembly: {e}"))
 }
 
@@ -911,10 +1030,12 @@ pub(super) fn inline_threshold() -> u32 {
 fn set_options(arch: Arch) {
     static SET: Once = Once::new();
     SET.call_once(|| {
+        // alloc: once per process
         let mut arguments = vec![c"blaze".as_ptr()];
         if arch == Arch::Aarch64 {
             arguments.push(c"-aarch64-enable-global-isel-at-O=-1".as_ptr());
         }
+        // alloc: once per process
         let threshold = std::ffi::CString::new(format!("-inline-threshold={}", inline_threshold()))
             .expect("no NUL");
         arguments.push(threshold.as_ptr());
@@ -923,8 +1044,12 @@ fn set_options(arch: Arch) {
         // `-Cprofile-generate` and `-Cprofile-use`; and value profiling is off (`pgo`'s notes).
         arguments.push(c"-disable-preinline".as_ptr());
         arguments.push(c"-disable-vp".as_ptr());
-        // SAFETY: the arguments are C strings that outlive the call, and LLVM is given
-        // their number.
+        // SAFETY: the arguments are NUL-terminated C strings (`c"..."` and `threshold`, a
+        // `CString`) that outlive the call, and LLVM is given their number. LLVM's option
+        // registry is process-wide and unsynchronized: `SET` makes this its one write, and
+        // every thread reaches it before its first target machine (`Machine::create_for`),
+        // waiting in `call_once` until it is done. A second, racing parse would be a data race
+        // in LLVM.
         unsafe {
             LLVMParseCommandLineOptions(
                 arguments.len() as i32,
@@ -1001,6 +1126,7 @@ impl Optimization {
 thread_local! {
     /// The errors LLVM diagnosed in the context of this thread's [`Machine`] since it was
     /// last asked to work.
+    // alloc: empty, allocates nothing until LLVM diagnoses an error
     static DIAGNOSED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -1067,6 +1193,7 @@ impl Kept {
             (pgo::Wanted::Generate, _) => (LLVMBlazePgoGenerate, &[][..]),
             (pgo::Wanted::Use(_), Some(bytes @ [.., 0])) => (LLVMBlazePgoUse, bytes),
             (pgo::Wanted::Use(id), _) => {
+                // alloc: the error's message
                 return Err(Unhandled::Llvm(format!("the profile {id:x} without its bytes and their NUL")));
             }
         };
@@ -1081,6 +1208,7 @@ impl Kept {
         let made = unsafe { LLVMBlazeCreatePgoPasses(machine.as_mut_ptr(), &pgo) };
         std::ptr::NonNull::new(made)
             .map(Kept)
+            // alloc: the error's message
             .ok_or_else(|| Unhandled::Llvm("LLVM made no passes for PGO".to_owned()))
     }
 
@@ -1313,6 +1441,7 @@ impl Machine {
             Arch::X86_64 => Target::initialize_x86(&InitializationConfig::default()),
             Arch::Aarch64 => Target::initialize_aarch64(&InitializationConfig::default()),
             // The lowering of `wasm.rs` produces a module's functions.
+            // alloc: the error's message
             Arch::Wasm32 => return Err(Unhandled::Llvm("no LLVM producer for wasm32".to_owned())),
         }
         let name = emitted.triple();
@@ -1385,6 +1514,66 @@ impl fmt::Display for Symbol {
     }
 }
 
+impl Symbol {
+    /// Its name, as [`fmt::Display`] writes it, for the module's calls that take one.
+    fn named(self) -> SymbolName {
+        match self {
+            Symbol::Func(index) => SymbolName::of("blaze.f.", index),
+            Symbol::Data(index) => SymbolName::of("blaze.d.", index),
+        }
+    }
+}
+
+/// A name of the module's own ([`Symbol::named`], [`shown_name`]) on the stack, with a NUL
+/// after it: inkwell takes a `&str` that ends in one as the C string it is, and copies one
+/// that does not. Only for inkwell: compared with a name without the NUL, it differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SymbolName {
+    bytes: [u8; SymbolName::CAPACITY],
+    len: u8,
+}
+
+impl SymbolName {
+    /// A prefix of up to [`SymbolName::PREFIX`] bytes, the ten digits of a `u32` and the NUL.
+    const CAPACITY: usize = SymbolName::PREFIX + 10 + 1;
+    const PREFIX: usize = 13;
+
+    /// `prefix` and `index` in decimal, as `format!("{prefix}{index}")` writes them.
+    fn of(prefix: &str, mut index: u32) -> SymbolName {
+        assert!(prefix.len() <= SymbolName::PREFIX, "a prefix too long for a symbol name");
+        let mut digits = [0u8; 10];
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (index % 10) as u8;
+            count += 1;
+            index /= 10;
+            if index == 0 {
+                break;
+            }
+        }
+        let mut bytes = [0u8; SymbolName::CAPACITY];
+        let start = prefix.len();
+        bytes[..start].copy_from_slice(prefix.as_bytes());
+        for (at, &digit) in digits[..count].iter().rev().enumerate() {
+            bytes[start + at] = digit;
+        }
+        SymbolName { bytes, len: (start + count + 1) as u8 }
+    }
+
+    /// The name without its NUL, as an object file has it.
+    fn bare(&self) -> &str {
+        &(**self)[..usize::from(self.len) - 1]
+    }
+}
+
+impl std::ops::Deref for SymbolName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).expect("an ASCII name")
+    }
+}
+
 /// Declares each of `readonly` that holds no function's address with what it holds, its
 /// bytes and the addresses into the others, as an `available_externally` constant, as rustc's
 /// constants are known to LLVM: a load through a pointer to it folds (a comparison with a
@@ -1403,6 +1592,7 @@ fn told_constants<'ctx>(
                 .relocs
                 .iter()
                 .map(|&(offset, target, addend)| (offset as usize, target.as_u32(), addend))
+                // alloc: once per module per constant, its relocations sorted by offset
                 .collect();
             blaze_ids::radix::sort_copy_by_key(&mut relocs, |it| it.0);
             let fits = relocs.iter().all(|it| readonly.contains_key(&it.1))
@@ -1411,11 +1601,15 @@ fn told_constants<'ctx>(
             (!blob.bytes.is_empty() && blob.fn_relocs.is_empty() && fits)
                 .then_some((index, blob, relocs))
         })
+        // alloc: once per module, the constants told
         .collect();
     blaze_ids::radix::sort_by_key(&mut told, |it| it.0);
     let mut globals = Vec::with_capacity(told.len());
+    // A field before each address, the address, and one after the last.
+    let most = told.iter().map(|(_, _, relocs)| 2 * relocs.len() + 1).max().unwrap_or(0);
+    let mut fields: Vec<BasicTypeEnum<'ctx>> = Vec::with_capacity(most);
     for (index, blob, relocs) in &told {
-        let mut fields: Vec<BasicTypeEnum<'ctx>> = Vec::new();
+        fields.clear();
         let mut at = 0;
         for &(offset, _, _) in relocs {
             if offset > at {
@@ -1430,7 +1624,7 @@ fn told_constants<'ctx>(
         let global = module.add_global(
             context.struct_type(&fields, true),
             None,
-            &Symbol::Data(*index).to_string(),
+            &Symbol::Data(*index).named(),
         );
         global.set_linkage(Linkage::AvailableExternally);
         global.set_visibility(GlobalVisibility::Hidden);
@@ -1438,14 +1632,15 @@ fn told_constants<'ctx>(
         global.set_alignment(blob.align as u32);
         globals.push(global);
     }
+    let mut fields: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(most);
     for ((_, blob, relocs), global) in std::iter::zip(&told, globals) {
-        let mut fields: Vec<BasicValueEnum<'ctx>> = Vec::new();
+        fields.clear();
         let mut at = 0;
         for &(offset, target, addend) in relocs {
             if offset > at {
                 fields.push(context.const_string(&blob.bytes[at..offset], false).into());
             }
-            let name = Symbol::Data(target).to_string();
+            let name = Symbol::Data(target).named();
             let target = module.get_global(&name).unwrap_or_else(|| {
                 let declared = module.add_global(i8, None, &name);
                 declared.set_linkage(Linkage::External);
@@ -1485,7 +1680,7 @@ fn retold_bytes<'ctx>(
         if !blob.points_nowhere() || blob.bytes.is_empty() {
             continue;
         }
-        let Some(global) = module.get_global(&Symbol::Data(index).to_string()) else { continue };
+        let Some(global) = module.get_global(&Symbol::Data(index).named()) else { continue };
         if global.get_initializer().is_some() {
             continue;
         }
@@ -1984,5 +2179,33 @@ attributes #0 = { alwaysinline }
         let module = context.create_module_from_ir(source).unwrap();
         let pipeline = optimization.pipeline().unwrap();
         module.run_passes(pipeline, &machine, PassBuilderOptions::create()).unwrap();
+    }
+
+    /// The safe byte GEPs give the IR inkwell's unsafe `build_gep`/`build_in_bounds_gep` of
+    /// `i8` give, which is what the lowering built before they were wrapped: for a parameter
+    /// offset, a constant one and a negative one, and the module verifies.
+    #[test]
+    fn byte_offsets_are_the_geps_of_bytes() {
+        let context = Context::create();
+        let module = context.create_module("offsets");
+        let (pointer, i64) = (context.ptr_type(AddressSpace::default()), context.i64_type());
+        let ty = context.void_type().fn_type(&[pointer.into(), i64.into()], false);
+        let function = module.add_function("f", ty, None);
+        let builder = context.create_builder();
+        builder.position_at_end(context.append_basic_block(function, ""));
+        let base = function.get_nth_param(0).unwrap().into_pointer_value();
+        let by = function.get_nth_param(1).unwrap().into_int_value();
+        byte_offset(&builder, &context, base, by).unwrap();
+        byte_offset(&builder, &context, base, i64.const_int(-3i64 as u64, true)).unwrap();
+        in_bounds_byte_offset(&builder, &context, base, i64.const_int(8, false)).unwrap();
+        builder.build_return(None).unwrap();
+        module.verify().unwrap();
+        let text = function.print_to_string().to_string();
+        assert!(text.contains("= getelementptr i8, ptr %0, i64 %1"), "{text}");
+        assert!(text.contains("= getelementptr i8, ptr %0, i64 -3"), "{text}");
+        assert!(text.contains("= getelementptr inbounds i8, ptr %0, i64 8"), "{text}");
+        // Unpositioned, the builder refuses as inkwell's own call does.
+        let loose = context.create_builder();
+        assert!(byte_offset(&loose, &context, base, by).is_err());
     }
 }

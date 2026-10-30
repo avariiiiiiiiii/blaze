@@ -1,0 +1,24 @@
+{
+  "id": "00779",
+  "from_lane": "hot-sweep-store-casremote",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/blaze-cas/src/remote.rs"
+  ],
+  "what": "## `tools/v2/hot_lint.py`: treat `#[cfg(all(test, ...))]` modules as test code\n\n- What: `in_test_module` matches only the literal `#[cfg(test)]`. Also match a `cfg` whose\n  predicate is `test` inside `all(...)`, e.g. `#[cfg(all(test, not(blaze_check)))]`.\n- Where: `tools/v2/hot_lint.py`, `in_test_module` (line ~49).\n- Why: `crates/blaze-cas/src/remote.rs` keeps its tests under\n  `#[cfg(all(test, not(blaze_check)))]`, so the lint reports 80 findings inside that test module\n  (the module starts at line 876), which the hot-sweep briefs say are not to be changed. 39\n  files under `crates/` use `cfg(all(test, ...))`, so other sweep lanes see the same false count.",
+  "state": "open",
+  "created": "2026-10-30T07:24:21Z",
+  "updated": "2026-10-30T07:24:21Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/hot-sweep-store-casremote.md#`tools/v2/hot_lint.py`: treat `#[cfg(all(test, ...))]` modules as test code",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/hot-sweep-store-casremote.md:3"
+    }
+  ]
+}

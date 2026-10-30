@@ -2,7 +2,7 @@
 //! `_Unwind_Backtrace`, the unwinder's `__register_frame`, and address space reserved with
 //! `mmap` and committed with `mprotect` ([`Reserved`]).
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "the loader's and the kernel's calls both Unix platforms share")]
 
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},

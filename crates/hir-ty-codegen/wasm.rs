@@ -43,7 +43,8 @@ use cranelift_codegen::{
 };
 use cranelift_module::{ModuleReloc, ModuleRelocTarget};
 use serde_derive::{Deserialize, Serialize};
-use wasm_encoder::{BlockType, Encode, Instruction as I, MemArg, ValType};
+use smallvec::SmallVec;
+use wasm_encoder::{BlockType, Encode, Instruction as I, InstructionSink, MemArg, ValType};
 
 use super::target::Calls;
 
@@ -127,7 +128,7 @@ impl WasmSignature {
     }
 
     pub fn of(sig: &Signature) -> Result<WasmSignature, String> {
-        let mut params = Vec::new();
+        let mut params = Vec::with_capacity(sig.params.len() + 1);
         let returned = Returned::of(sig)?;
         if let Returned::Through(_) = returned {
             params.push(WasmType::I32);
@@ -139,7 +140,9 @@ impl WasmSignature {
             }
         }
         let results = match returned {
+            // alloc: the signature's one result, part of the signature it returns
             Returned::Value(class) => vec![class.wasm()],
+            // alloc: empty, allocates nothing
             Returned::Nothing | Returned::Through(_) => Vec::new(),
         };
         Ok(WasmSignature { params, results })
@@ -154,7 +157,7 @@ enum Returned {
     /// Written through a pointer that is the first parameter, each value at its offset: what
     /// LLVM does with a return of several values or of an `i128` where a wasm function has
     /// one result of one of four types.
-    Through(Vec<(u64, Class)>),
+    Through(SmallVec<[(u64, Class); 8]>),
 }
 
 impl Returned {
@@ -163,7 +166,7 @@ impl Returned {
     const ALIGN: u64 = 16;
 
     fn of(sig: &Signature) -> Result<Returned, String> {
-        let classes: Vec<Class> =
+        let classes: SmallVec<[Class; 8]> =
             sig.returns.iter().map(|it| Class::of(it.value_type)).collect::<Result<_, _>>()?;
         match classes[..] {
             [] => return Ok(Returned::Nothing),
@@ -172,7 +175,7 @@ impl Returned {
         }
         // The fields of the struct the values are to LLVM, each aligned to its size.
         let mut end = 0u64;
-        let mut places = Vec::new();
+        let mut places = SmallVec::new();
         for class in classes {
             let size = class.bytes();
             let at = end.next_multiple_of(size);
@@ -180,6 +183,7 @@ impl Returned {
             end = at + size;
         }
         if end > Returned::SPACE {
+            // alloc: the error's message
             return Err("wasm: more returned values than there is room for".to_owned());
         }
         Ok(Returned::Through(places))
@@ -277,6 +281,7 @@ impl Class {
             types::F32 => Class::F32,
             types::F64 => Class::F64,
             _ if ty.is_vector() && ty.bits() == 128 => Class::V128,
+            // alloc: the error's message
             _ => return Err(format!("wasm: type {ty}")),
         })
     }
@@ -477,6 +482,9 @@ struct Lower<'a> {
 
 const MEMORY: u32 = 0;
 
+/// The first local of each value a call returns.
+type Returns = SmallVec<[u32; 8]>;
+
 fn mem(offset: u64) -> MemArg {
     MemArg { offset, align: 0, memory_index: MEMORY }
 }
@@ -491,7 +499,7 @@ impl<'a> Lower<'a> {
             block_count += 1;
             order[block] = block_count;
         }
-        let mut slot_offsets = Vec::new();
+        let mut slot_offsets = Vec::with_capacity(func.sized_stack_slots.len());
         let mut size = 0u64;
         for (_, slot) in func.sized_stack_slots.iter() {
             let align = 1u64 << slot.align_shift;
@@ -500,6 +508,7 @@ impl<'a> Lower<'a> {
             size += u64::from(slot.size);
         }
         if func.dynamic_stack_slots.iter().next().is_some() {
+            // alloc: the error's message
             return Err("wasm: dynamic stack slot".to_owned());
         }
         let mut returned_at = None;
@@ -519,7 +528,9 @@ impl<'a> Lower<'a> {
             reachable: Self::reachable(func),
             param_count: signature.params.len() as u32,
             signature,
+            // alloc: once per function, the instructions of the body it returns
             code: Vec::new(),
+            // alloc: once per function, its locals as the body declares them
             locals: Vec::new(),
             values: SecondaryMap::new(),
             order,
@@ -527,9 +538,13 @@ impl<'a> Lower<'a> {
             next_block: None,
             frame: None,
             slot_offsets,
+            // alloc: once per function, moved into what it returns; empty until pushed
             relocs: Vec::new(),
+            // alloc: as above
             types: Vec::new(),
+            // alloc: as above
             type_fixups: Vec::new(),
+            // alloc: as above
             stack_pointer_fixups: Vec::new(),
         };
         if size != 0 || !this.slot_offsets.is_empty() {
@@ -542,6 +557,7 @@ impl<'a> Lower<'a> {
     fn run(mut self) -> Result<(WasmFunction, Vec<ModuleReloc>), String> {
         let func = self.func;
         let Some(entry) = func.layout.entry_block() else {
+            // alloc: the error's message
             return Err("wasm: function without blocks".to_owned());
         };
         // The parameters of the entry block are the parameters of the function, after the
@@ -559,6 +575,7 @@ impl<'a> Lower<'a> {
             local += if class == Class::Pair { 2 } else { 1 };
         }
         if local != self.param_count {
+            // alloc: the error's message
             return Err("wasm: entry block and signature disagree".to_owned());
         }
         if let Some((frame, size)) = self.frame {
@@ -592,8 +609,7 @@ impl<'a> Lower<'a> {
         }
         if let Some(next) = self.next_block {
             self.i(I::LocalGet(next));
-            let targets: Vec<u32> = (0..self.block_count).collect();
-            self.i(I::BrTable(targets.into(), 0));
+            InstructionSink::new(&mut self.code).br_table(0..self.block_count, 0);
         }
         for block in func.layout.blocks() {
             self.i(I::End);
@@ -611,15 +627,16 @@ impl<'a> Lower<'a> {
         self.i(I::Unreachable);
         self.i(I::End);
 
-        let mut body = Vec::new();
         // Runs of the same type, as the format wants them.
-        let mut runs: Vec<(u32, ValType)> = Vec::new();
+        let mut runs: SmallVec<[(u32, ValType); 8]> = SmallVec::new();
         for &ty in &self.locals {
             match runs.last_mut() {
                 Some((count, last)) if *last == ty => *count += 1,
                 _ => runs.push((1, ty)),
             }
         }
+        // A LEB128 of a `u32` is at most five bytes, a value type one.
+        let mut body = Vec::with_capacity(5 + runs.len() * 6 + self.code.len());
         (runs.len() as u32).encode(&mut body);
         for (count, ty) in runs {
             count.encode(&mut body);
@@ -649,7 +666,8 @@ impl<'a> Lower<'a> {
     /// The blocks reached from the entry without unwinding.
     fn reachable(func: &Function) -> SecondaryMap<Block, bool> {
         let mut reachable = SecondaryMap::new();
-        let mut pending: Vec<Block> = func.layout.entry_block().into_iter().collect();
+        let mut pending: SmallVec<[Block; 16]> = SmallVec::new();
+        pending.extend(func.layout.entry_block());
         while let Some(block) = pending.pop() {
             if std::mem::replace(&mut reachable[block], true) {
                 continue;
@@ -802,7 +820,9 @@ impl<'a> Lower<'a> {
                 self.i(I::I64Const(0));
                 self.i(I::I64Ne);
             }
+            // alloc: the error's message
             Class::F32 | Class::F64 => return Err("wasm: float as a condition".to_owned()),
+            // alloc: the error's message
             Class::V128 => return Err("wasm: vector as a condition".to_owned()),
         }
         Ok(())
@@ -826,6 +846,7 @@ impl<'a> Lower<'a> {
                     self.i(I::I32WrapI64);
                 }
             }
+            // alloc: the error's message
             _ => return Err("wasm: float as a shift amount".to_owned()),
         }
         Ok(())
@@ -834,6 +855,7 @@ impl<'a> Lower<'a> {
     /// Pushes an address that a linker fills in.
     fn address(&mut self, name: &ExternalName, addend: i64) -> Result<(), String> {
         let ExternalName::User(name) = name else {
+            // alloc: the error's message
             return Err(format!("wasm: address of {name:?}"));
         };
         let name = &self.func.params.user_named_funcs()[*name];
@@ -856,6 +878,7 @@ impl<'a> Lower<'a> {
             return self.call_slot(signature);
         }
         let ExternalName::User(name) = name else {
+            // alloc: the error's message
             return Err(format!("wasm: call of {name:?}"));
         };
         let name = &self.func.params.user_named_funcs()[*name];
@@ -891,6 +914,7 @@ impl<'a> Lower<'a> {
 
     fn slot_address(&mut self, slot: ir::StackSlot, offset: i64) -> Result<(), String> {
         let Some((frame, _)) = self.frame else {
+            // alloc: the error's message
             return Err("wasm: stack slot without a frame".to_owned());
         };
         let offset = self.slot_offsets[slot.index()] as i64 + offset;
@@ -1024,6 +1048,7 @@ impl<'a> Lower<'a> {
                         self.i(I::LocalGet(local + 1));
                     }
                 }
+                // alloc: the error's message
                 BlockArg::TryCallExn(_) => return Err("wasm: exception payload".to_owned()),
             }
             passed += 1;
@@ -1039,6 +1064,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let Some(next) = self.next_block else {
+            // alloc: the error's message
             return Err("wasm: jump backwards without a loop".to_owned());
         };
         self.i(I::I32Const(target as i32));
@@ -1048,24 +1074,10 @@ impl<'a> Lower<'a> {
     }
 
     fn return_(&mut self, values: &[Value]) -> Result<(), String> {
-        match self.returned.clone() {
-            Returned::Nothing => {}
-            Returned::Value(_) => {
-                let [value] = values else {
-                    return Err("wasm: return and signature disagree".to_owned());
-                };
-                let signed =
-                    self.func.signature.returns[0].extension == ir::ArgumentExtension::Sext;
-                self.get_for(*value, signed)?;
-            }
-            Returned::Through(places) => {
-                for (&value, (at, class)) in values.iter().zip(places) {
-                    self.i(I::LocalGet(0));
-                    self.get(value)?;
-                    self.store_class(class, at);
-                }
-            }
-        }
+        let returned = std::mem::replace(&mut self.returned, Returned::Nothing);
+        let stored = self.return_values(&returned, values);
+        self.returned = returned;
+        stored?;
         if let Some((frame, size)) = self.frame {
             self.i(I::LocalGet(frame));
             self.i(I::I32Const(size as i32));
@@ -1073,6 +1085,30 @@ impl<'a> Lower<'a> {
             self.stack_pointer(true);
         }
         self.i(I::Return);
+        Ok(())
+    }
+
+    /// Hands back `values` the way `returned` says, short of leaving the frame.
+    fn return_values(&mut self, returned: &Returned, values: &[Value]) -> Result<(), String> {
+        match returned {
+            Returned::Nothing => {}
+            Returned::Value(_) => {
+                let [value] = values else {
+                    // alloc: the error's message
+                    return Err("wasm: return and signature disagree".to_owned());
+                };
+                let signed =
+                    self.func.signature.returns[0].extension == ir::ArgumentExtension::Sext;
+                self.get_for(*value, signed)?;
+            }
+            Returned::Through(places) => {
+                for (&value, &(at, class)) in values.iter().zip(places) {
+                    self.i(I::LocalGet(0));
+                    self.get(value)?;
+                    self.store_class(class, at);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1123,6 +1159,7 @@ impl<'a> Lower<'a> {
     fn arguments(&mut self, signature: &Signature, args: &[Value]) -> Result<(), String> {
         if let Returned::Through(_) = Returned::of(signature)? {
             let Some(at) = self.returned_at else {
+                // alloc: the error's message
                 return Err("wasm: no room for what a call returns".to_owned());
             };
             let (frame, _) = self.frame.ok_or("wasm: no frame for what a call returns")?;
@@ -1142,7 +1179,7 @@ impl<'a> Lower<'a> {
         &mut self,
         callee: Option<&ExternalName>,
         signature: &Signature,
-    ) -> Result<Vec<u32>, String> {
+    ) -> Result<Returns, String> {
         match callee {
             Some(name) => self.call_named(name, signature)?,
             None => self.call_slot(signature)?,
@@ -1155,17 +1192,19 @@ impl<'a> Lower<'a> {
             local
         };
         match Returned::of(signature)? {
-            Returned::Nothing => Ok(Vec::new()),
+            Returned::Nothing => Ok(Returns::new()),
             Returned::Value(class) => {
                 let local = local_of(self, class);
                 self.mask_for(class);
                 self.i(I::LocalSet(local));
-                Ok(vec![local])
+                let mut locals = Returns::new();
+                locals.push(local);
+                Ok(locals)
             }
             Returned::Through(places) => {
                 let (frame, _) = self.frame.ok_or("wasm: no frame for what a call returns")?;
                 let base = self.returned_at.ok_or("wasm: no room for what a call returns")?;
-                let mut locals = Vec::new();
+                let mut locals = Returns::new();
                 for (at, class) in places {
                     let local = local_of(self, class);
                     self.i(I::LocalGet(frame));
@@ -1215,11 +1254,12 @@ impl<'a> Lower<'a> {
         callee: Option<&ExternalName>,
         signature: &Signature,
         args: &[Value],
-    ) -> Result<Vec<u32>, String> {
+    ) -> Result<Returns, String> {
         match callee {
             Some(_) => self.arguments(signature, args)?,
             None => {
                 let [slot, args @ ..] = args else {
+                    // alloc: the error's message
                     return Err("wasm: indirect call of nothing".to_owned());
                 };
                 self.arguments(signature, args)?;
@@ -1249,6 +1289,7 @@ impl<'a> Lower<'a> {
                 self.get(len)?;
                 self.i(I::MemoryFill(MEMORY));
             }
+            // alloc: the error's message
             _ => return Err(format!("wasm: libcall {libcall}")),
         }
         if let (&[to, ..], &[result]) = (args, results) {
@@ -1279,7 +1320,7 @@ impl<'a> Lower<'a> {
         // it returns is the address it was given.
         if let Some(ExternalName::LibCall(libcall)) = callee {
             self.libcall(*libcall, args, &[])?;
-            let mut returned = Vec::new();
+            let mut returned = Returns::new();
             for ret in &signature.returns {
                 let wide = ret.value_type == types::I64;
                 let local = self.temp(if wide { ValType::I64 } else { ValType::I32 });
@@ -1333,11 +1374,11 @@ impl<'a> Lower<'a> {
                         self.i(I::I64GeU);
                         self.i(I::Select);
                     }
+                    // alloc: the error's message
                     _ => return Err("wasm: br_table on a wide value".to_owned()),
                 }
-                let targets: Vec<u32> = (0..cases.len() as u32).collect();
-                self.i(I::BrTable(targets.into(), cases.len() as u32));
                 let count = cases.len() as u32;
+                InstructionSink::new(&mut self.code).br_table(0..count, count);
                 for (at, &case) in cases.iter().enumerate() {
                     self.i(I::End);
                     self.jump(block, case, count - at as u32, &[])?;
@@ -1390,6 +1431,7 @@ impl<'a> Lower<'a> {
                 let GlobalValueData::Symbol { name, offset, .. } =
                     &func.global_values[global_value]
                 else {
+                    // alloc: the error's message
                     return Err("wasm: global value that is not a symbol".to_owned());
                 };
                 self.address(name, offset.bits())?;
@@ -1412,6 +1454,7 @@ impl<'a> Lower<'a> {
                         self.i(I::I64Const(imm.bits()));
                         self.i(I::I64Const(0));
                     }
+                    // alloc: the error's message
                     _ => return Err(format!("wasm: iconst of {class:?}")),
                 }
                 self.set(results[0])
@@ -1440,6 +1483,7 @@ impl<'a> Lower<'a> {
                         Opcode::Sload16 => (16, true),
                         Opcode::Uload32 => (32, false),
                         Opcode::Sload32 => (32, true),
+                        // alloc: the error's message
                         _ => return Err(format!("wasm: {opcode}")),
                     };
                     let class = self.class(results[0])?;
@@ -1456,6 +1500,7 @@ impl<'a> Lower<'a> {
                         Opcode::Istore8 => 8,
                         Opcode::Istore16 => 16,
                         Opcode::Istore32 => 32,
+                        // alloc: the error's message
                         _ => return Err(format!("wasm: {opcode}")),
                     };
                     let class = self.class(value)?;
@@ -1469,10 +1514,12 @@ impl<'a> Lower<'a> {
                 Opcode::Bitcast => self.bitcast(results[0], arg),
                 // One thread runs the code: an atomic load is a load.
                 Opcode::AtomicLoad => self.load(results[0], arg, 0),
+                // alloc: the error's message
                 _ => Err(format!("wasm: {opcode}")),
             },
             InstructionData::StoreNoOffset { args: [value, base], .. } => match opcode {
                 Opcode::AtomicStore => self.store(value, base, 0),
+                // alloc: the error's message
                 _ => Err(format!("wasm: {opcode}")),
             },
             InstructionData::AtomicRmw { args: [base, value], op, .. } => {
@@ -1492,6 +1539,7 @@ impl<'a> Lower<'a> {
                         self.get(expected)?;
                         self.i(I::I64Eq);
                     }
+                    // alloc: the error's message
                     _ => return Err("wasm: atomic_cas of a wide type".to_owned()),
                 }
                 self.i(I::If(BlockType::Empty));
@@ -1527,6 +1575,7 @@ impl<'a> Lower<'a> {
                     .try_into()
                     .map_err(|_| "wasm: shuffle mask of other than 16 bytes")?;
                 if lanes.iter().any(|&lane| lane >= 32) {
+                    // alloc: the error's message
                     return Err("wasm: shuffle of a lane past both vectors".to_owned());
                 }
                 self.get(a)?;
@@ -1572,6 +1621,7 @@ impl<'a> Lower<'a> {
                     let long = match self.class(b)? {
                         Class::Word(_) => false,
                         Class::Long => true,
+                        // alloc: the error's message
                         _ => return Err("wasm: bitselect of this type".to_owned()),
                     };
                     self.get(b)?;
@@ -1586,14 +1636,17 @@ impl<'a> Lower<'a> {
                     self.mask_for(self.class(b)?);
                     self.set(results[0])
                 }
+                // alloc: the error's message
                 _ => Err(format!("wasm: {opcode}")),
             },
             InstructionData::Unary { arg, .. } => self.unary(opcode, results, arg),
             InstructionData::Binary { args: [a, b], .. } => self.binary(opcode, results, a, b),
             InstructionData::NullAry { .. } => match opcode {
                 Opcode::Nop | Opcode::Fence => Ok(()),
+                // alloc: the error's message
                 _ => Err(format!("wasm: {opcode}")),
             },
+            // alloc: the error's message
             _ => Err(format!("wasm: {opcode}")),
         }
     }
@@ -1677,6 +1730,7 @@ impl<'a> Lower<'a> {
                     self.i(I::Select);
                 }
             },
+            // alloc: the error's message
             _ => return Err("wasm: icmp of floats".to_owned()),
         }
         Ok(())
@@ -1707,7 +1761,7 @@ impl<'a> Lower<'a> {
             FloatCC::Ordered | FloatCC::Unordered => {
                 self.get(a)?;
                 self.get(a)?;
-                self.i(eq.clone());
+                self.i(pick(single, I::F32Eq, I::F64Eq));
                 self.get(b)?;
                 self.get(b)?;
                 self.i(eq);
@@ -1767,6 +1821,7 @@ impl<'a> Lower<'a> {
             (Class::Long, Class::F64) => self.i(I::F64ReinterpretI64),
             (Class::F64, Class::Long) => self.i(I::I64ReinterpretF64),
             (from, to) if from == to => {}
+            // alloc: the error's message
             (from, to) => return Err(format!("wasm: bitcast from {from:?} to {to:?}")),
         }
         self.set(result)
@@ -1783,6 +1838,7 @@ impl<'a> Lower<'a> {
         let long = match class {
             Class::Word(_) => false,
             Class::Long => true,
+            // alloc: the error's message
             _ => return Err("wasm: atomic_rmw of a wide type".to_owned()),
         };
         self.load(old, base, 0)?;
@@ -1863,6 +1919,7 @@ impl<'a> Lower<'a> {
                         self.i(if signed { I::I64ExtendI32S } else { I::I64ExtendI32U });
                     }
                     (Class::Long, Class::Pair) => self.get(arg)?,
+                    // alloc: the error's message
                     _ => return Err(format!("wasm: extend from {from:?} to {to:?}")),
                 }
                 if to == Class::Pair {
@@ -1907,6 +1964,7 @@ impl<'a> Lower<'a> {
                     self.i(I::I64ExtendI32U);
                     self.i(I::I64Sub);
                 }
+                // alloc: the error's message
                 _ => return Err("wasm: ineg of a float".to_owned()),
             },
             Opcode::Bnot => match to {
@@ -1924,6 +1982,7 @@ impl<'a> Lower<'a> {
                     self.i(I::I64Const(-1));
                     self.i(I::I64Xor);
                 }
+                // alloc: the error's message
                 _ => return Err("wasm: bnot of a float".to_owned()),
             },
             Opcode::Popcnt => match to {
@@ -1939,6 +1998,7 @@ impl<'a> Lower<'a> {
                     self.i(I::I64Add);
                     self.i(I::I64Const(0));
                 }
+                // alloc: the error's message
                 _ => return Err("wasm: popcnt of a float".to_owned()),
             },
             Opcode::Clz => match to {
@@ -1967,6 +2027,7 @@ impl<'a> Lower<'a> {
                     self.i(I::Select);
                     self.i(I::I64Const(0));
                 }
+                // alloc: the error's message
                 _ => return Err("wasm: clz of a float".to_owned()),
             },
             Opcode::Ctz => match to {
@@ -1996,6 +2057,7 @@ impl<'a> Lower<'a> {
                     self.i(I::Select);
                     self.i(I::I64Const(0));
                 }
+                // alloc: the error's message
                 _ => return Err("wasm: ctz of a float".to_owned()),
             },
             Opcode::Bswap => match to {
@@ -2017,6 +2079,7 @@ impl<'a> Lower<'a> {
                     self.get_low(arg)?;
                     self.swap_bytes(true, 64);
                 }
+                // alloc: the error's message
                 _ => return Err("wasm: bswap of this type".to_owned()),
             },
             Opcode::Bitrev => match to {
@@ -2034,6 +2097,7 @@ impl<'a> Lower<'a> {
                     self.get_low(arg)?;
                     self.reverse_bits(true, 64);
                 }
+                // alloc: the error's message
                 _ => return Err("wasm: bitrev of a float".to_owned()),
             },
             Opcode::Fneg => {
@@ -2084,6 +2148,7 @@ impl<'a> Lower<'a> {
                     (Class::Long, Class::F32, true) => I::F32ConvertI64S,
                     (Class::Long, Class::F64, false) => I::F64ConvertI64U,
                     (Class::Long, Class::F64, true) => I::F64ConvertI64S,
+                    // alloc: the error's message
                     _ => return Err(format!("wasm: {opcode} from {from:?}")),
                 });
             }
@@ -2099,6 +2164,7 @@ impl<'a> Lower<'a> {
                     (true, Class::Long, true) => I::I64TruncSatF32S,
                     (false, Class::Long, false) => I::I64TruncSatF64U,
                     (false, Class::Long, true) => I::I64TruncSatF64S,
+                    // alloc: the error's message
                     _ => return Err(format!("wasm: {opcode} to {to:?}")),
                 });
                 if let Some(bits) = to.narrow() {
@@ -2120,6 +2186,7 @@ impl<'a> Lower<'a> {
                     self.mask(bits);
                 }
             }
+            // alloc: the error's message
             _ => return Err(format!("wasm: {opcode}")),
         }
         self.set(result)
@@ -2199,6 +2266,7 @@ impl<'a> Lower<'a> {
                     Opcode::Fmin => float(I::F32Min, I::F64Min),
                     Opcode::Fmax => float(I::F32Max, I::F64Max),
                     Opcode::Fcopysign => float(I::F32Copysign, I::F64Copysign),
+                    // alloc: the error's message
                     _ => return Err(format!("wasm: {opcode}")),
                 };
                 self.get(a)?;
@@ -2403,6 +2471,7 @@ impl<'a> Lower<'a> {
                 self.i(I::I64Ne);
                 return self.set(results[1]);
             }
+            // alloc: the error's message
             _ => return Err(format!("wasm: {opcode}")),
         }
         self.set(result)
@@ -2715,6 +2784,7 @@ impl<'a> Lower<'a> {
                 self.i(I::LocalSet(out + 1));
                 Ok(())
             }
+            // alloc: the error's message
             _ => Err(format!("wasm: {opcode} of a wide integer")),
         }
     }

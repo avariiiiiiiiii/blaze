@@ -15,6 +15,7 @@ The checks, each a script of this directory run with the same `engine` (v1 now, 
     share         share.py: the instance-sharing programs print what Rust guarantees under rustc and blaze
     determinism   determinism.py: two builds on different core counts, byte for byte the same
     tightmemory   tightmemory.py: a build under a tight memory budget finishes, never OOMs
+    macroeval     macroeval_corpus.py: blaze-macro-eval's corpus expands as rustc's proc macros do
     budgets       budgets.py: the targets of docs/v2/plan/goals/targets.md
 
 Each writes its result (report.py's shape) to `OUT/<check>.json` and what it printed to
@@ -52,7 +53,7 @@ from typed_input import fail, parse  # noqa: E402
 
 SCRIPT = "proof.py"
 type Name = Literal["oracle", "corpus", "rejections", "cases", "fuzz", "share", "determinism", "tightmemory",
-                    "budgets"]
+                    "macroeval", "budgets"]
 SCRIPTS: dict[str, tuple[str, ...]] = {
     "oracle": ("oracle.py", "run"),
     "corpus": ("corpus.py",),
@@ -62,6 +63,7 @@ SCRIPTS: dict[str, tuple[str, ...]] = {
     "share": ("share.py",),
     "determinism": ("determinism.py",),
     "tightmemory": ("tightmemory.py",),
+    "macroeval": ("macroeval_corpus.py",),
     "budgets": ("budgets.py",),
 }
 WORST: tuple[report.Verdict, ...] = ("fail", "error", "unmeasured", "pass")

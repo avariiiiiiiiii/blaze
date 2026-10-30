@@ -1,0 +1,23 @@
+{
+  "id": "00236",
+  "from_lane": "solver-sync-glue",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## 7. coordinator (`tools/v2/hot_lint.py`): `crates` can't be given\n\n- `{\"root\": \".\", \"crates\": [\"hir-ty\"]}` fails: \"typed_input: crates has a type it does not\n  read: list[str]\". `typed_input` reads `tuple[str, ...]`, so `Input.crates` should be\n  `tuple[str, ...] = HOT`. Until then the full run (no `crates`) works and can be filtered.\n\n> forwarded to the coordinator (`tools/`), listed in requests' report.",
+  "state": "open",
+  "created": "2026-10-30T02:32:39Z",
+  "updated": "2026-10-30T02:32:39Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync-glue.md#7. coordinator (`tools/v2/hot_lint.py`): `crates` can't be given",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync-glue.md:104"
+    }
+  ]
+}

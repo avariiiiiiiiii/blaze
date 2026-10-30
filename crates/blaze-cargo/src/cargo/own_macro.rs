@@ -1,7 +1,7 @@
 //! Proc macros compiled and linked by blaze (docs/no-rustc.md, step J). When rust-analyzer's
 //! `cargo check --compile-time-deps` of a load into blaze's own target directory asks rustc
 //! for a proc macro, and the load names a server that reads the list of macros blaze writes
-//! into a library ([`SERVER`], `vendor/proc-macro-srv`), the wrapper describes the proc macro
+//! into a library ([`SERVER`], `crates/proc-macro-srv-cli`), the wrapper describes the proc macro
 //! and the libraries it links as it does a build script (`own_script.rs`), and blaze links it
 //! as a shared library where rustc would have put it, with the dep-info cargo reads. The
 //! load expands with it by that server. Cargo's own builds never read that directory, and
@@ -232,9 +232,9 @@ pub fn missing_server() -> String {
         .map_or_else(|| SHIPPED.to_owned(), |it| it.display().to_string());
     format!(
         "no proc-macro server is beside blaze (looked for {beside}), and blaze links proc \
-         macros only for its own. Build it there from a blaze checkout with `blaze \
-         vendor/proc-macro-srv --crate rust_analyzer_proc_macro_srv --crate proc_macro --out \
-         <scratch>/server.o --exe {beside}` (what `.github/scripts/build_release.py --server` \
+         macros only for its own. Build it there from the root of a blaze checkout with \
+         `blaze . --crate blaze_proc_macro_srv --crate proc_macro --out <scratch>/server.o \
+         --exe {beside}` (what `.github/scripts/build_release.py --server` \
          runs; the releases ship it on Linux and macOS), or have rustc build the load's proc macros \
          with `BLAZE_PROC_MACRO_SERVER=0`"
     )

@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 
-use hir::Semantics;
 use span::FileId;
 use syntax::view::{self as ast, AstNode as _};
 use test_fixture::WithFixture;
@@ -25,10 +24,9 @@ fn each_let(fixture: &str, f: impl Fn(&Cx<'_, '_>, &hir::Type<'_>) -> String) ->
         .map(|(file, path)| (file.file_id(&db), format!("$DIR/{path}")))
         .collect();
     hir::attach_db(&db, || {
-        let sema = Semantics::new(&db);
         let krate = hir::check::workspace_crates(&db)[0];
         let frame = crate::tests::frame();
-        let cx = Cx::new(&sema, krate, Files::new(&names, ""), &frame);
+        let cx = Cx::new(&db, krate, Files::new(&names, ""), &frame);
         let source = cx.vsema.parse(files[0]);
         source
             .syntax()

@@ -40,7 +40,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     Mode, Recovered, Ticket,
-    tree::{DIR_MODE, NodeId, Tree, parts},
+    tree::{DIR_MODE, NodeId, Tree, check},
 };
 
 const MAGIC: [u8; 4] = *b"BZJ3";
@@ -158,6 +158,8 @@ pub(crate) struct Journal {
     settled: bool,
     /// The rewrite in flight leaves the file settled.
     rewrite_settles: bool,
+    /// The nodes [`write_node`] has still to record, reused.
+    stack: Vec<(NodeId, bool)>,
 }
 
 /// What [`Journal::recover`] rebuilt.
@@ -229,6 +231,8 @@ impl Journal {
             switching: None,
             settled: true,
             rewrite_settles: false,
+            // alloc: empty, allocates nothing; grown once and reused by every record.
+            stack: Vec::new(),
         };
         match from {
             Some((image, true)) => {
@@ -239,6 +243,7 @@ impl Journal {
             None => {}
         }
         let mut heads = FxHashMap::default();
+        // alloc: once per recovery, the heads by name.
         let mut names: Vec<Box<str>> = moves.keys().cloned().collect();
         names.sort_unstable();
         for name in names {
@@ -254,6 +259,7 @@ impl Journal {
                     journal.compact = true;
                     continue;
                 };
+                // clone: once per head recovered, its name kept by both maps.
                 heads.insert(name.clone(), root);
                 journal.heads.insert(name, sequence);
                 break;
@@ -266,9 +272,14 @@ impl Journal {
     /// once that is durable.
     pub(crate) fn record_head(&mut self, tree: &Tree, head: &str, root: NodeId) -> Ticket {
         self.written.grow(tree.len());
-        write_node(tree, &mut self.written, &mut self.open.bytes, root);
+        write_node(tree, &mut self.written, &mut self.stack, &mut self.open.bytes, root);
         self.sequence = next(self.sequence);
-        self.heads.insert(head.into(), self.sequence);
+        match self.heads.get_mut(head) {
+            Some(sequence) => *sequence = self.sequence,
+            None => {
+                self.heads.insert(head.into(), self.sequence);
+            }
+        }
         head_record(&mut self.open.bytes, self.sequence, Some(&tree.id(root)), head);
         self.ticket()
     }
@@ -346,6 +357,7 @@ impl Journal {
             self.cut = None;
             self.dirty = false;
             let target = self.next.take();
+            // alloc: the rewrite's bytes, moved into its effect; once per rewrite.
             let mut bytes = Vec::new();
             self.written = match target.as_ref().or(self.base.as_ref()) {
                 Some(base) => {
@@ -362,10 +374,11 @@ impl Journal {
             };
             self.rewrite_settles = true;
             self.switching = target;
+            // alloc: once per rewrite, the heads by name.
             let mut names: Vec<&Box<str>> = heads.keys().collect();
             names.sort_unstable();
             for name in &names {
-                write_node(tree, &mut self.written, &mut bytes, heads[*name]);
+                write_node(tree, &mut self.written, &mut self.stack, &mut bytes, heads[*name]);
             }
             for name in &names {
                 let sequence = self.heads[&***name];
@@ -374,11 +387,13 @@ impl Journal {
             frame(&mut bytes, SEQUENCE, |out| out.put_u64(self.sequence));
             // What was recorded and not appended is in the rewrite: the heads as they are now.
             let tickets = std::mem::take(&mut self.open).tickets;
+            // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
             effects.push(Effect::Write { file: self.file.clone(), bytes, tag: self.tag(REWRITE) });
             self.flight = Flight::Rewriting(tickets);
             return;
         }
         if let Some(len) = self.cut {
+            // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
             effects.push(Effect::Truncate { file: self.file.clone(), len, tag: self.tag(CUT) });
             self.flight = Flight::Cutting;
             return;
@@ -387,6 +402,7 @@ impl Journal {
             return;
         }
         let Batch { bytes, tickets } = std::mem::take(&mut self.open);
+        // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
         effects.push(Effect::Append { file: self.file.clone(), bytes, tag: self.tag(APPEND) });
         self.dirty = true;
         self.flight = Flight::Appending(tickets);
@@ -409,16 +425,20 @@ impl Journal {
         effects: &mut Vec<Effect>,
     ) -> Vec<Ticket> {
         let offset = completion.tag.0 - self.tags;
+        // alloc: empty, allocates nothing; the tickets of a batch made durable move in.
         let mut durable = Vec::new();
         match (offset, completion.done, std::mem::replace(&mut self.flight, Flight::Idle)) {
             (APPEND, Done::Appended, Flight::Appending(tickets)) => {
+                // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
                 effects.push(Effect::Sync { file: self.file.clone(), tag: self.tag(SYNC) });
                 self.flight = Flight::Syncing(tickets);
             }
             (SYNC, Done::Synced, Flight::Syncing(tickets)) => durable = tickets,
             (CUT, Done::Truncated, Flight::Cutting) => {
                 self.cut = None;
+                // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
                 effects.push(Effect::Sync { file: self.file.clone(), tag: self.tag(SYNC) });
+                // alloc: empty, allocates nothing.
                 self.flight = Flight::Syncing(Vec::new());
             }
             (CUT, Done::Failed(_), Flight::Cutting) => {}
@@ -488,8 +508,15 @@ fn next(sequence: u64) -> u64 {
 
 /// Records `node` and everything under it not recorded yet, children first, so a record only
 /// names nodes recorded before it. Each record is framed in place in `out`.
-fn write_node(tree: &Tree, written: &mut Written, out: &mut Vec<u8>, node: NodeId) {
-    let mut stack = vec![(node, false)];
+fn write_node(
+    tree: &Tree,
+    written: &mut Written,
+    stack: &mut Vec<(NodeId, bool)>,
+    out: &mut Vec<u8>,
+    node: NodeId,
+) {
+    stack.clear();
+    stack.push((node, false));
     while let Some((node, children_done)) = stack.pop() {
         if written.contains(node) {
             continue;
@@ -605,13 +632,15 @@ fn load(
             tree.file(std::sync::Arc::from(payload));
         }
         DIR => {
+            // alloc: recovery only, one directory record's entries, which `Tree::dir` takes.
             let mut entries = Vec::new();
             let mut rest = Reader::new(payload);
             let mut last: Option<&str> = None;
             while !rest.is_done() {
                 let name = rest.str_u32().ok()?;
                 // As the tree writes them: one component each, sorted by bytes, so distinct.
-                if parts(name).ok()?.len() != 1 || last.is_some_and(|it| it >= name) {
+                let one = check(name).is_ok() && !name.contains('/');
+                if !one || last.is_some_and(|it| it >= name) {
                     return None;
                 }
                 last = Some(name);

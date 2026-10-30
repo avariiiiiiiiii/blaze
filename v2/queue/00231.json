@@ -1,0 +1,24 @@
+{
+  "id": "00231",
+  "from_lane": "requests-link-fuzz",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/blaze-link/src/macho/tbd.rs"
+  ],
+  "what": "## 3. `tools/v2/hot_lint.py`: braces inside strings end a test module early\n\nWhat: in `in_test_module`, count `{` and `}` only outside string literals, char literals and\ncomments.\n\nWhere: `in_test_module` in `tools/v2/hot_lint.py` (`opens, closes = line.count(\"{\"), line.count(\"}\")`).\n\nWhy: a test module whose strings hold unbalanced braces (YAML and format fixtures) is taken\nto end early, and the tests after that point count as hot code.\n`crates/blaze-link/src/macho/tbd.rs`'s tests module is taken to end at line 2475 of 2560, so\nits `sdk_libsystem` helper makes 5 findings.\n\n> forwarded to the coordinator (`tools/`), listed in requests' report.",
+  "state": "open",
+  "created": "2026-10-30T02:28:48Z",
+  "updated": "2026-10-30T02:28:48Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/requests-link-fuzz.md#3. `tools/v2/hot_lint.py`: braces inside strings end a test module early",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/requests-link-fuzz.md:34"
+    }
+  ]
+}

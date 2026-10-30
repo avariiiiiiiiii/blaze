@@ -632,17 +632,22 @@ impl Tier {
             opened: false,
             waiting: 0,
             index: None,
+            // alloc: empty, allocates nothing
             packs: Vec::new(),
+            // alloc: once per tier, at opening
             delta: Arc::new(Table::new(DELTA_FIRST, FLAGS)),
             prev: None,
             externals: ByHash::default(),
+            // alloc: empty, allocates nothing
             dictionaries: Vec::new(),
+            // alloc: empty, allocates nothing
             units: Vec::new(),
             unit_of: ByHash::default(),
         }
     }
 
     fn file(&self, name: &str) -> FileName {
+        // alloc: a file name for an effect, which owns it; once per file asked for, never per get or put
         FileName::new(&format!("{}/{name}", self.dir))
             .expect("a store's file names stay in its directory")
     }
@@ -651,24 +656,34 @@ impl Tier {
         self.file(&disk::index_file(self.head.index.map_or(0, |it| it.slot)))
     }
 
-    /// It as readers see it.
+    /// It as readers see it. Made once a published view (an opening, a commit's mappings, an
+    /// index swap, a dictionary or encoding given), never per get or put; readers share it.
     fn view(&self) -> TierView {
         TierView {
+            // clone: the published view owns its names; once per view
             dir: self.dir.clone(),
             index_file: self.index_file(),
+            // clone: an `Arc` per tier, once per view
             index: self.index.clone(),
+            // clone: an `Arc` per tier, once per view
             delta: self.delta.clone(),
+            // clone: an `Arc` per tier, once per view
             prev: self.prev.clone(),
             packs: self
                 .packs
                 .iter()
+                // clone: the published view owns its names and mappings; once per pack a view
                 .map(|it| PackView { file: it.file.clone(), mapping: it.mapping.clone(), usable: it.usable })
+                // alloc: the view's packs, exactly sized; once per view
                 .collect(),
             externals: self
                 .externals
                 .iter()
+                // clone: the published view owns its names and mappings; once per external a view
                 .map(|(content, it)| (*content, ExternalView { file: it.file.clone(), mapping: it.mapping.clone() }))
+                // alloc: the view's externals; once per view
                 .collect(),
+            // clone: an `Arc` (or a dictionary's error) per dictionary, into the view's list; once per view
             dictionaries: self.dictionaries.iter().map(|it| (it.kind, it.bytes.clone())).collect(),
         }
     }
@@ -774,6 +789,7 @@ fn columns_payload(columns: &Columns, encoded: Vec<u8>) -> Vec<u8> {
 fn cold_columns(columns: &Columns, hot: &[u8]) -> Result<Vec<u8>, String> {
     let payload = columns_payload(columns, columns.cold(hot)?);
     if columns.hot_from_cold(&payload[SCHEMA_PREFIX..])? != hot {
+        // alloc: the message of an encoding that does not decode back
         return Err(format!("the cold columns of schema {:x} do not decode to the value", columns.schema().0));
     }
     Ok(payload)
@@ -786,6 +802,7 @@ fn colder_columns(columns: &Columns, loc: Loc, hot: &[u8]) -> Result<Option<(For
     if loc.form != Form::Warm {
         let payload = columns_payload(columns, columns.warm(hot)?);
         if columns.hot_from_warm(&payload[SCHEMA_PREFIX..])? != hot {
+            // alloc: the message of an encoding that does not decode back
             return Err(format!("the warm columns of schema {:x} do not decode to the value", columns.schema().0));
         }
         if saves(&payload) {
@@ -801,8 +818,10 @@ fn location(tier: usize, pack: u32, offset: u64) -> u64 {
     ((tier as u64) << 56) | (u64::from(pack) << 40) | offset
 }
 
+/// Why an effect failed, as a message: only ever for an error.
 fn describe(done: &Done) -> String {
     match done {
+        // clone: the message of an error
         Done::Failed(error) => error.0.clone(),
         Done::Read(_) => "it was answered with a read".into(),
         Done::Mapped(_) => "it was answered with a mapping".into(),
@@ -813,13 +832,18 @@ fn describe(done: &Done) -> String {
 impl Store {
     /// A store that is opening: it asks to map its index and packs.
     pub fn open(config: Config, effects: &mut Vec<Effect>) -> Store {
+        // alloc: setup, once per store
         let mut tiers = vec![Tier::new(config.dir.clone())];
         tiers.extend(config.layers.iter().cloned().map(Tier::new));
         let columns = Arc::<Encodings>::default();
+        // clone: setup, once per store
         let view = View { tiers: tiers.iter().map(Tier::view).collect(), columns: columns.clone() };
+        // alloc: setup, once per store
         let shared = Arc::new(Shared::new(view));
         let own = Own::new(0);
+        // clone: setup, the store's own segment's `Arc`, once per store
         shared.add_segment(own.segment().clone());
+        // clone: setup, once per store
         let drains = vec![Drain::new(own.segment().clone())];
         let mut store = Store {
             tags: Tags { range: blaze_core::Tags::new(config.tags), ops: FxHashMap::default() },
@@ -840,9 +864,12 @@ impl Store {
             migrating: None,
             limbo: Limbo::new(),
             training: Default::default(),
+            // alloc: empty, allocates nothing
             problems: Vec::new(),
             fetching: ByHash::default(),
+            // alloc: empty, allocates nothing
             fetched: Vec::new(),
+            // alloc: empty, allocates nothing
             placed: Vec::new(),
             periods: 0,
             columns,
@@ -877,6 +904,7 @@ impl Store {
 
     /// A reader of it for any thread: what it reads is valid while the task it reads in runs.
     pub fn reader(&self) -> Reader {
+        // clone: one `Arc` per reader made, once per thread that reads; its gets clone nothing
         Reader { shared: self.shared.clone() }
     }
 
@@ -885,8 +913,11 @@ impl Store {
     pub fn writer(&mut self) -> Writer {
         assert!(self.tiers[0].opened, "a writer of a store that is not open");
         let own = Own::new(self.drains.len() as u32);
+        // clone: setup, the segment's `Arc`, once per writer made
         self.shared.add_segment(own.segment().clone());
+        // clone: setup, the segment's `Arc`, once per writer made
         self.drains.push(Drain::new(own.segment().clone()));
+        // clone: setup, once per writer made; its puts clone nothing
         Writer { shared: self.shared.clone(), own }
     }
 
@@ -984,6 +1015,7 @@ impl Store {
         let look = Look::new(&self.shared, Held::writer(&*self.shared));
         let put = self.own.put(look, unit, key, kind, content, bytes);
         if let Some(why) = self.own.segment().failed() {
+            // clone: the error that breaks the store
             let (dir, why) = (self.tiers[0].dir.clone(), why.to_owned());
             self.fail(dir, why);
         }
@@ -1041,6 +1073,7 @@ impl Store {
                 for &(_, loc, _) in group.iter().filter(|(_, loc, _)| loc.form == Form::Raw) {
                     let pack = &self.tiers[0].packs[loc.pack as usize];
                     let payload = loc.offset.checked_add(RECORD_HEADER);
+                    // alloc: a settle (idle), until a dictionary is trained; `sample` keeps a copy and may append to the pack this borrows
                     let Some(bytes) = payload.and_then(|at| pack.bytes(at, loc.raw)).map(<[u8]>::to_vec) else {
                         continue;
                     };
@@ -1054,6 +1087,7 @@ impl Store {
             let dictionary = number.map(|number| {
                 self.tiers[0].dictionaries[number as usize]
                     .bytes
+                    // clone: an `Arc`, once per kind a settle (idle), held while it appends
                     .clone()
                     .expect("a dictionary of its own is held")
             });
@@ -1079,6 +1113,7 @@ impl Store {
                         }
                         Ok(None) => self.set_flag(row, Flag::Tried),
                         Err(why) => {
+                            // alloc: a problem reported, an encoding that failed
                             self.problems.push(format!("{:x} is not moved colder: {why}", key.0));
                             self.set_flag(row, Flag::Tried);
                         }
@@ -1149,8 +1184,10 @@ impl Store {
     /// ending now. A record still in a segment is new, and stays.
     fn tier_moves(&self) -> (Vec<(Key, Loc, Row)>, Vec<(Key, Loc, Row)>) {
         let own = &self.tiers[0];
+        // alloc: once a settle (idle, never on the way of a get or a put); empty unless a slot is not whole
         let mut bad = Vec::new();
         let rows = self.look().rows(0, &mut bad);
+        // alloc: once a settle (idle), the records it moves, sorted after
         let (mut demote, mut promote) = (Vec::new(), Vec::new());
         for (key, found) in rows {
             let Place::Pack(loc) = found.place else { continue };
@@ -1208,11 +1245,13 @@ impl Store {
             // `replace` counts the old record's bytes dead by `loc`, which came from an index
             // slot nothing checked: it must be the record that was read.
             Ok((header, _)) if header.stored != loc.stored || header.raw != loc.raw => {
+                // alloc: a problem reported
                 self.problems.push(format!("{:x} is not moved: its record is not the one its index names", key.0));
                 None
             }
             Ok((header, bytes)) => Some((header.content, bytes)),
             Err(corrupt) => {
+                // alloc: a problem reported
                 self.problems.push(format!("not moved between tiers: {corrupt}"));
                 None
             }
@@ -1278,6 +1317,7 @@ impl Store {
                     && own.packs.iter().rposition(|it| it.unit == pack.unit && !it.removed) != Some(at)
                     && !own.dictionaries.iter().any(|it| it.pack as usize == at)
             })
+            // alloc: once a settle (idle), the packs it may rewrite, which it appends to as it goes
             .collect()
     }
 
@@ -1286,17 +1326,20 @@ impl Store {
     fn live_records(&mut self, at: usize) -> Option<Vec<(RecordHeader, Vec<u8>)>> {
         let own = &self.tiers[0];
         let pack = &own.packs[at];
+        // alloc: once per pack a settle (idle) rewrites, its live records
         let mut live = Vec::new();
         let mut offset = PACK_HEADER;
         let mut why = None;
         while offset < pack.committed {
             let Some(start) = pack.bytes(offset, 4) else {
+                // alloc: a problem reported
                 why = Some(format!("at {offset} is not mapped"));
                 break;
             };
             if start == [0; 4] {
                 let next = offset.next_multiple_of(disk::BLOCK);
                 if next == offset {
+                    // alloc: a problem reported
                     why = Some(format!("at {offset} is neither a record nor padding"));
                     break;
                 }
@@ -1306,10 +1349,12 @@ impl Store {
             let header = match pack.bytes(offset, RECORD_HEADER).map(RecordHeader::decode) {
                 Some(Ok(header)) => header,
                 Some(Err(what)) => {
+                    // alloc: a problem reported
                     why = Some(format!("the record at {offset}: {what}"));
                     break;
                 }
                 None => {
+                    // alloc: a problem reported
                     why = Some(format!("the record at {offset} is outside the pack"));
                     break;
                 }
@@ -1320,9 +1365,11 @@ impl Store {
             );
             if here && header.form != Form::Dictionary {
                 let Some(payload) = pack.bytes(offset + RECORD_HEADER, header.stored) else {
+                    // alloc: a problem reported
                     why = Some(format!("the record at {offset} runs past the pack"));
                     break;
                 };
+                // alloc: a settle (idle) rewriting a half-dead pack; `rehome` takes `&mut self` while this borrows it
                 live.push((header, payload.to_vec()));
             }
             offset += header.span();
@@ -1330,8 +1377,8 @@ impl Store {
         match why {
             None => Some(live),
             Some(why) => {
-                let file = pack.file.clone();
-                self.problems.push(format!("{file} is not rewritten: {why}"));
+                // alloc: a problem reported
+                self.problems.push(format!("{} is not rewritten: {why}", pack.file));
                 None
             }
         }
@@ -1339,11 +1386,13 @@ impl Store {
 
     fn remove_pack(&mut self, pack: usize, effects: &mut Vec<Effect>) {
         let tag = self.tags.ask(Op::RemovePack { pack });
+        // clone: the effect owns its file name; once per pack removed
         effects.push(Effect::Remove { file: self.tiers[0].packs[pack].file.clone(), tag });
     }
 
     /// Checks every value of `kind` (all, for `None`): what a scrub or the oracle runs.
     pub fn verify(&self, kind: Option<Kind>) -> Vec<Corrupt> {
+        // alloc: a scrub's report, empty unless something is corrupt
         let mut out = Vec::new();
         let nothing = Key(ContentId::default());
         let look = self.look();
@@ -1354,6 +1403,7 @@ impl Store {
                     out.push(Corrupt {
                         key: nothing,
                         pack: tier.index_file(),
+                        // alloc: a corrupt index reported
                         what: format!(
                             "the index's CRC-32C is {found:08x}, not the {:08x} its head names",
                             index.check
@@ -1367,11 +1417,14 @@ impl Store {
                 {
                     out.push(Corrupt {
                         key: nothing,
+                        // clone: a corrupt value reported
                         pack: tier.packs[dictionary.pack as usize].file.clone(),
+                        // alloc: a corrupt value reported
                         what: format!("its {} dictionary {why}", dictionary.kind.name()),
                     });
                 }
             }
+            // alloc: a scrub's slots that are not whole, once per tier; empty unless one is not
             let mut bad = Vec::new();
             let mut entries = look.rows(tier_at, &mut bad);
             for (key, what) in bad {
@@ -1413,16 +1466,18 @@ impl Store {
         let look = self.look();
         let found = look.find(key)?;
         let plan = match found.and_then(|found| Ok((found, look.read(found, key)?))) {
+            // alloc: the error of a corrupt value
             Err(corrupt) => Plan::Refused(corrupt.to_string()),
             Ok((found, entry)) => match self.tiers[found.tier].externals.get(&entry.content) {
                 Some(external)
                     if matches!(found.place, Place::Pack(loc) if loc.form == Form::External)
                         && external.committed =>
                 {
+                    // clone: the clone effect owns the name it clones from; once per place
                     Plan::Clone(external.file.clone())
                 }
                 _ => {
-                    let mut bytes = Vec::new();
+                    let mut bytes = Vec::with_capacity(entry.bytes.len());
                     copy::append(&mut bytes, entry.bytes);
                     Plan::Write(bytes)
                 }
@@ -1431,10 +1486,12 @@ impl Store {
         let tag = self.tags.fresh();
         match plan {
             Plan::Clone(from) => {
+                // clone: the effect and the op each own the name; once per place
                 effects.push(Effect::Remove { file: to.clone(), tag });
                 self.tags.ops.insert(tag, Op::Clear { asked: tag, from, to });
             }
             Plan::Write(bytes) => {
+                // clone: the effect and the op each own the name; once per place
                 effects.push(Effect::Write { file: to.clone(), bytes, tag });
                 self.tags.ops.insert(tag, Op::Place { asked: tag, to });
             }
@@ -1479,6 +1536,7 @@ impl Store {
     /// durable.
     pub fn complete(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Ticket> {
         self.tidy();
+        // alloc: empty, allocates nothing
         let Some(op) = self.tags.ops.remove(&completion.tag) else { return Vec::new() };
         let done = completion.done;
         match op {
@@ -1502,6 +1560,7 @@ impl Store {
             },
             Op::Clear { asked, from, to } => match done {
                 Done::Removed => {
+                    // clone: the effect and the op each own the name; once per place
                     let tag = self.tags.ask(Op::Place { asked, to: to.clone() });
                     effects.push(Effect::Clone { from, to, tag });
                 }
@@ -1522,6 +1581,7 @@ impl Store {
             Op::RemovePack { pack } => {
                 if !matches!(done, Done::Removed) {
                     let file = &self.tiers[0].packs[pack].file;
+                    // alloc: a problem reported
                     self.problems.push(format!(
                         "{file} was left behind (it is removed at the next open): {}",
                         describe(&done)
@@ -1530,6 +1590,7 @@ impl Store {
             }
             op => return self.step(op, done, effects),
         }
+        // alloc: empty, allocates nothing
         Vec::new()
     }
 
@@ -1570,6 +1631,7 @@ impl Store {
             file,
             mapping: None,
             usable: 0,
+            // alloc: once per pack made (a unit's first, or one past `PACK_MOST`); appends then reuse it
             memory: disk::pack_header(unit.0).to_vec(),
             committed: 0,
             indexed: 0,
@@ -1661,6 +1723,7 @@ impl Store {
                 len: header.raw,
                 file,
                 mapping: None,
+                // alloc: a value of `EXTERNAL_FROM` bytes or more, held past its segment's chunk until its own file is written and mapped
                 memory: Some(payload.to_vec()),
                 committed: false,
             });
@@ -1743,6 +1806,7 @@ impl Store {
                 _ = fresh.insert(Held::writer(&fresh), spot.at(spot.place));
             }
         }
+        // alloc: once per index swap (every `INDEX_AFTER` records), the delta readers are handed
         let old = std::mem::replace(&mut own.delta, Arc::new(fresh));
         own.index = Some(index);
         let writers = self.drains.len() > 1;
@@ -1771,6 +1835,7 @@ impl Store {
         let table = own.index.as_ref().map(|it| it.table());
         for (_, spot) in prev.iter(held) {
             match own.delta.get(held, &spot.key) {
+                // alloc: a problem reported
                 Some((_, kept)) if kept.content != spot.content => self.problems.push(format!(
                     "{:x} was put twice across an index swap, as {:x} and {:x}: the first is kept",
                     spot.key.0, kept.content, spot.content
@@ -1792,6 +1857,7 @@ impl Store {
 
     /// Publishes what readers see, and frees the view it replaces at task boundaries.
     fn publish(&mut self) {
+        // clone: the view readers share, made once a publish (see `Tier::view`), with an `Arc` of the encodings
         let view = View { tiers: self.tiers.iter().map(Tier::view).collect(), columns: self.columns.clone() };
         let old = self.shared.publish(view);
         self.limbo.retire(old);
@@ -1801,9 +1867,11 @@ impl Store {
     /// its grace, ends an index swap whose writers are gone, and lets go of the values made
     /// whole once they hold too much.
     fn tidy(&mut self) {
+        // alloc: none, `Limbo::collect` frees what passed its grace; it is not `Iterator::collect`
         self.limbo.collect();
         let own = &self.tiers[0];
         for table in std::iter::once(&own.delta).chain(&own.prev) {
+            // alloc: none, `Table::collect` drops swapped-out values and keeps their slots; it is not `Iterator::collect`
             table.collect();
         }
         self.end_migration();
@@ -1816,7 +1884,9 @@ impl Store {
     /// zstd refusing a value is a broken build of it (a missing feature), not something a
     /// value can cause: the store stops rather than keep the value another way.
     fn cannot_compress(&mut self, kind: Kind, why: String) {
+        // clone: the error that breaks the store
         let dir = self.tiers[0].dir.clone();
+        // alloc: the error that breaks the store
         self.fail(dir, format!("compressing a {} value: {why}", kind.name()));
     }
 
@@ -1831,6 +1901,7 @@ impl Store {
     fn sample(&mut self, kind: Kind, bytes: &[u8]) {
         let training = &mut self.training[kind.code() as usize];
         if training.samples.len() < cold::SAMPLES_MOST && training.bytes < cold::SAMPLE_BYTES_MOST {
+            // alloc: a training sample, at most `SAMPLES_MOST` a kind and only before its dictionary is trained
             training.samples.push(bytes.to_vec());
             training.bytes += bytes.len() as u64;
         }
@@ -1844,6 +1915,7 @@ impl Store {
     fn train(&mut self, kind: Kind) {
         let trained = {
             let samples: Vec<&[u8]> =
+                // alloc: once per dictionary trained, the samples as slices for zstd
                 self.training[kind.code() as usize].samples.iter().map(Vec::as_slice).collect();
             cold::train(&samples)
         };
@@ -1865,12 +1937,14 @@ impl Store {
                     kind,
                     pack: loc.pack,
                     offset: loc.offset,
+                    // alloc: once per dictionary trained
                     bytes: Ok(Arc::new(cold::Prepared::new(dictionary))),
                 });
                 self.publish();
             }
             Err(why) => {
                 training.after = training.samples.len() * 2;
+                // alloc: a problem reported
                 self.problems.push(format!("the {} values are kept raw: {why}", kind.name()));
             }
         }
@@ -1879,8 +1953,10 @@ impl Store {
     fn start_commit(&mut self, effects: &mut Vec<Effect>) {
         debug_assert!(self.commit.is_none());
         self.drain();
+        // alloc: the error that breaks the store; `None` otherwise
         let failed = self.drains.iter().find_map(|it| it.segment.failed().map(str::to_owned));
         if let Some(why) = failed {
+            // clone: the error that breaks the store
             let dir = self.tiers[0].dir.clone();
             return self.fail(dir, why);
         }
@@ -1898,8 +1974,10 @@ impl Store {
             .enumerate()
             .filter(|(_, it)| it.end > it.committed)
             .map(|(at, it)| (at, it.end))
+            // alloc: once per commit (a group of puts), the packs it writes, held in the `Commit`
             .collect();
         let mut externals: Vec<ContentId> =
+            // alloc: once per commit, the files it writes, sorted, held in the `Commit`
             own.externals.iter().filter(|(_, it)| !it.committed).map(|(it, _)| *it).collect();
         externals.sort_unstable();
         let compact = !self.index_mapping && self.migrating.is_none() && own.delta.len() >= INDEX_AFTER;
@@ -1910,6 +1988,7 @@ impl Store {
             .externals
             .iter()
             .map(|(content, it)| ExternalRef { content: *content, len: it.len })
+            // alloc: once per commit, the head it writes
             .collect();
         all_externals.sort_unstable_by_key(|it| it.content);
         let mut head = Head {
@@ -1925,21 +2004,26 @@ impl Store {
                     dead: it.dead,
                     removed: it.removed || it.retiring,
                 })
+                // alloc: once per commit, the head it writes
                 .collect(),
             dictionaries: own
                 .dictionaries
                 .iter()
                 .map(|it| DictionaryRef { kind: it.kind, pack: it.pack, offset: it.offset })
+                // alloc: once per commit, the head it writes
                 .collect(),
             externals: all_externals,
+            // clone: once per commit, the head it writes
             units: own.units.clone(),
         };
         let mut index = None;
         if compact {
+            // alloc: once per index written (every `INDEX_AFTER` records); empty unless a slot is not whole
             let mut bad = Vec::new();
             let mut entries = self.index_entries(&mut bad);
             for (_, what) in bad {
                 self.problems
+                    // alloc: a problem reported
                     .push(format!("a slot of {} left out of the next index: {what}", own.index_file()));
             }
             entries.sort_unstable_by_key(|(key, _)| *key);
@@ -1963,13 +2047,16 @@ impl Store {
         for &(at, _) in &packs {
             let pack = &own.packs[at];
             let tag = self.tags.ask(Op::Truncate { pack: at });
+            // clone: the effect owns its file name; once per pack a commit
             effects.push(Effect::Truncate { file: pack.file.clone(), len: pack.committed, tag });
             steps += 1;
         }
         for content in &externals {
             let external = &own.externals[content];
+            // clone: the write owns its bytes, and a commit that fails writes them again from these
             let bytes = external.memory.clone().expect("a file not yet written is held");
             let tag = self.tags.ask(Op::WriteExternal { content: *content });
+            // clone: the effect owns its file name; once per file a commit
             effects.push(Effect::Write { file: external.file.clone(), bytes, tag });
             steps += 1;
         }
@@ -2006,7 +2093,8 @@ impl Store {
         }
         let held = Held::writer(&*self.shared);
         let own = &self.tiers[0];
-        let mut out = Vec::new();
+        let indexed = own.index.as_ref().map_or(0, |it| it.table().count() as usize);
+        let mut out = Vec::with_capacity(own.delta.len() + indexed);
         let mut taken = FxHashSet::default();
         for (_, spot) in own.delta.iter(held) {
             let loc = match spot.place {
@@ -2033,13 +2121,16 @@ impl Store {
     }
 
     fn step(&mut self, op: Op, done: Done, effects: &mut Vec<Effect>) -> Vec<Ticket> {
+        // alloc: empty, allocates nothing
         let Some(commit) = self.commit.as_mut() else { return Vec::new() };
         commit.steps -= 1;
         let own = &self.tiers[0];
         let file_of = |op: &Op| match op {
             Op::Truncate { pack } | Op::WritePack { pack } | Op::Sync { pack } => {
+                // clone: the error of a step that failed
                 own.packs[*pack].file.clone()
             }
+            // clone: the error of a step that failed
             Op::WriteExternal { content } => own.externals[content].file.clone(),
             Op::WriteIndex => own.file(&disk::index_file(commit.index.map_or(0, |it| it.0))),
             _ => own.file(HEAD_FILE),
@@ -2052,10 +2143,12 @@ impl Store {
                     let to = commit.to(at).expect("a pack the commit truncated it writes");
                     let bytes = pack.memory
                         [(pack.committed - pack.usable) as usize..(to - pack.usable) as usize]
+                        // alloc: the write owns its bytes, and the pack keeps its memory until a mapping covers it; once per pack a commit
                         .to_vec();
                     // `committed` and `to` are block ends (each commit pads its packs), so on a
                     // driver that can, a long write skips the page cache.
                     let tag = self.tags.ask(Op::WritePack { pack: at });
+                    // clone: the effect owns its file name; once per pack a commit
                     effects.push(Effect::WriteAt { file: pack.file.clone(), at: pack.committed, bytes, tag });
                     commit.steps += 1;
                 }
@@ -2063,6 +2156,7 @@ impl Store {
             (Op::WritePack { pack }, Done::Written) => {
                 if commit.failed.is_none() {
                     let tag = self.tags.ask(Op::Sync { pack: *pack });
+                    // clone: the effect owns its file name; once per pack a commit
                     effects.push(Effect::Sync { file: own.packs[*pack].file.clone(), tag });
                     commit.steps += 1;
                 }
@@ -2077,6 +2171,7 @@ impl Store {
             }
         }
         if commit.steps > 0 {
+            // alloc: empty, allocates nothing
             return Vec::new();
         }
         if let Some(failed) = commit.failed.take() {
@@ -2088,6 +2183,7 @@ impl Store {
             } else {
                 self.start_commit(effects);
             }
+            // alloc: empty, allocates nothing
             return Vec::new();
         }
         if !commit.head_sent {
@@ -2096,6 +2192,7 @@ impl Store {
             let tag = self.tags.ask(Op::WriteHead);
             effects.push(Effect::Write { file: own.file(HEAD_FILE), bytes: commit.head.encode(), tag });
         }
+        // alloc: empty, allocates nothing
         Vec::new()
     }
 
@@ -2109,34 +2206,36 @@ impl Store {
             pack.indexed = written.indexed;
         }
         own.head = commit.head;
-        let mut removes = Vec::new();
-        for (at, pack) in own.packs.iter_mut().enumerate() {
+        for at in 0..self.tiers[0].packs.len() {
+            let pack = &mut self.tiers[0].packs[at];
             if std::mem::take(&mut pack.retiring) {
                 pack.removed = true;
                 pack.mapping = None;
+                // alloc: empty, allocates nothing; it lets go of the pack's memory
                 pack.memory = Vec::new();
-                removes.push(at);
+                self.remove_pack(at, effects);
             }
         }
-        for at in removes {
-            self.remove_pack(at, effects);
-        }
-        let own = &mut self.tiers[0];
         let mut batch = commit.batch;
-        let mut maps = Vec::new();
         for content in &commit.externals {
-            let external = own.externals.get_mut(content).expect("a file the commit wrote");
+            let external = self.tiers[0].externals.get_mut(content).expect("a file the commit wrote");
             external.committed = true;
-            maps.push((external.file.clone(), Mapped::External { content: *content, batch: Some(batch.id) }));
+            // clone: the op and the effect own the name; once per file a commit
+            let file = external.file.clone();
+            self.ask_map(0, file, Mapped::External { content: *content, batch: Some(batch.id) }, effects);
         }
         for &(at, to) in &commit.packs {
-            maps.push((own.packs[at].file.clone(), Mapped::Pack { pack: at, usable: to, batch: Some(batch.id) }));
+            // clone: the op and the effect own the name; once per pack a commit
+            let file = self.tiers[0].packs[at].file.clone();
+            self.ask_map(0, file, Mapped::Pack { pack: at, usable: to, batch: Some(batch.id) }, effects);
         }
-        batch.maps = maps.len();
+        batch.maps = commit.externals.len() + commit.packs.len();
         if let Some((slot, covers)) = commit.index {
-            maps.push((own.file(&disk::index_file(slot)), Mapped::Index { covers: Some(covers) }));
+            let file = self.tiers[0].file(&disk::index_file(slot));
+            self.ask_map(0, file, Mapped::Index { covers: Some(covers) }, effects);
             self.index_mapping = true;
         }
+        // alloc: the tickets returned, once per commit; empty when no put became durable
         let mut tickets = Vec::new();
         for (number, &puts) in batch.puts.iter().enumerate() {
             let segment = &self.drains[number].segment;
@@ -2147,9 +2246,6 @@ impl Store {
             }
         }
         self.pending.push_back(batch);
-        for (file, what) in maps {
-            self.ask_map(0, file, what, effects);
-        }
         self.finish_batches();
         self.failures = 0;
         if std::mem::take(&mut self.flush_wanted) {
@@ -2168,6 +2264,7 @@ impl Store {
     fn retry(&mut self, file: &FileName, done: &Done) -> bool {
         self.failures += 1;
         if self.failures >= FAILURES_MOST {
+            // clone: the error that breaks the store
             self.fail(file.clone(), describe(done));
             return false;
         }
@@ -2175,6 +2272,7 @@ impl Store {
     }
 
     fn ask_map(&mut self, tier: usize, file: FileName, what: Mapped, effects: &mut Vec<Effect>) {
+        // clone: the op keeps the name to match `Store::mapped` and to ask again; once per file mapped
         let tag = self.tags.ask(Op::Map { tier, file: file.clone(), what });
         effects.push(Effect::Map { file, tag });
     }
@@ -2190,6 +2288,7 @@ impl Store {
             },
         };
         if head.packs.len() > PACKS_MOST {
+            // alloc: the error that breaks the store
             return self.fail(file, format!("it names more than {PACKS_MOST} packs"));
         }
         let tier = &mut self.tiers[at];
@@ -2202,6 +2301,7 @@ impl Store {
                 file: tier.file(&disk::pack_file(number)),
                 mapping: None,
                 usable: it.committed,
+                // alloc: empty, allocates nothing
                 memory: Vec::new(),
                 committed: it.committed,
                 indexed: it.indexed,
@@ -2210,6 +2310,7 @@ impl Store {
                 removed: it.removed,
                 retiring: false,
             })
+            // alloc: opening, once per tier
             .collect();
         let externals: ByHash<ContentId, External> = head
             .externals
@@ -2223,19 +2324,25 @@ impl Store {
                     committed: true,
                 })
             })
+            // alloc: opening, once per tier
             .collect();
+        // alloc: opening, once per tier, the mappings it asks for
         let mut maps = Vec::new();
         if let Some(index) = head.index {
             maps.push((tier.file(&disk::index_file(index.slot)), Mapped::Index { covers: None }));
         }
         for (pack, it) in packs.iter().enumerate().filter(|(_, it)| !it.removed) {
+            // clone: opening, once per pack; the op and the effect own the name
             maps.push((it.file.clone(), Mapped::Pack { pack, usable: it.committed, batch: None }));
         }
         let removed: Vec<usize> =
+            // alloc: opening, once per tier
             packs.iter().enumerate().filter(|(_, it)| it.removed).map(|(at, _)| at).collect();
+        // alloc: opening, once per tier, sorted so the mappings are asked for in one order
         let mut contents: Vec<&ContentId> = externals.keys().collect();
         contents.sort_unstable();
         for content in contents {
+            // clone: opening, once per external; the op and the effect own the name
             maps.push((externals[content].file.clone(), Mapped::External { content: *content, batch: None }));
         }
         tier.dictionaries = head
@@ -2247,10 +2354,13 @@ impl Store {
                 offset: it.offset,
                 bytes: Err("was not read".into()),
             })
+            // alloc: opening, once per tier
             .collect();
         tier.packs = packs;
         tier.externals = externals;
+        // alloc: opening, once per tier
         tier.unit_of = head.units.iter().enumerate().map(|(at, it)| (*it, Unit(at as u32 + 1))).collect();
+        // clone: opening, once per tier
         tier.units = head.units.clone();
         tier.head = head;
         tier.head_read = true;
@@ -2277,6 +2387,7 @@ impl Store {
                 if len < usable {
                     return self.fail(
                         file,
+                        // alloc: the error that breaks the store
                         format!("it is {len} bytes, shorter than the {usable} its head names"),
                     );
                 }
@@ -2293,6 +2404,7 @@ impl Store {
                     if len != external.len {
                         return self.fail(
                             file,
+                            // alloc: the error that breaks the store
                             format!("it is {len} bytes, not the {} its head names", external.len),
                         );
                     }
@@ -2303,6 +2415,7 @@ impl Store {
             }
             Mapped::Index { covers } => {
                 let index = match Index::new(mapping) {
+                    // alloc: once per index table mapped (opening, or every `INDEX_AFTER` records)
                     Ok(index) => Arc::new(index),
                     Err(why) => return self.fail(file, why),
                 };
@@ -2360,6 +2473,7 @@ impl Store {
             Ok(remote::Parsed::Value { key: it, kind, content, bytes }) if it == key => {
                 let found = content_of(bytes);
                 if found != content {
+                    // alloc: the error of a refused fetch
                     return Fetched::Refused(format!(
                         "its bytes hash to {found:x}, not the {content:x} they were sent as"
                     ));
@@ -2369,6 +2483,7 @@ impl Store {
                 }
                 match self.put_hashed(Unit::SHARED, key, kind, content, bytes) {
                     Ok(ticket) => Fetched::Kept(ticket),
+                    // alloc: the error of a refused fetch
                     Err(mismatch) => Fetched::Refused(format!(
                         "the store keeps {:x} under it, not the {:x} sent",
                         mismatch.kept, mismatch.given
@@ -2393,25 +2508,32 @@ impl Drop for Store {
 fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
     if let Some(index) = tier.head.index {
         let file = tier.index_file();
+        // clone: the error that stops the opening
         let mapped = tier.index.as_ref().ok_or_else(|| (file.clone(), "it was not mapped".to_owned()))?;
         let bytes = mapped.mapping.bytes();
         if bytes.len() as u64 != index.len {
+            // alloc: the error that stops the opening
             return Err((file, format!("it is not the {} bytes its head names", index.len)));
         }
         let check = crc::crc32c(bytes);
         if check != index.check {
+            // alloc: the error that stops the opening
             return Err((file, format!("its CRC-32C is {check:08x}, not the {:08x} its head names", index.check)));
         }
         let count = mapped.table().count();
         if count != index.count {
+            // alloc: the error that stops the opening
             return Err((file, format!("it holds {count} values, not the {} its head names", index.count)));
         }
     }
+    // alloc: opening, once per tier, the records past its index table
     let mut found = Vec::new();
     for (number, pack) in tier.packs.iter().enumerate().filter(|(_, it)| !it.removed) {
+        // clone: the error that stops the opening
         let fail = |why: String| (pack.file.clone(), why);
         let all = pack.mapping.as_ref().ok_or_else(|| fail("it was not mapped".into()))?.bytes();
         let all = usize::try_from(pack.committed).ok().and_then(|committed| all.get(..committed)).ok_or_else(
+            // alloc: the error that stops the opening
             || fail(format!("it is {} bytes, shorter than the {} its head names", all.len(), pack.committed)),
         )?;
         disk::check_pack_header(all, pack.unit).map_err(|why| fail(why.into()))?;
@@ -2420,14 +2542,17 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
             if all.get(at as usize..at as usize + 4).is_none_or(|start| start == [0; 4]) {
                 let next = at.next_multiple_of(disk::BLOCK);
                 if next == at || all[at as usize..next as usize].iter().any(|&it| it != 0) {
+                    // alloc: the error that stops the opening
                     return Err(fail(format!("at {at} is neither a record nor the zeros that end a commit")));
                 }
                 at = next;
                 continue;
             }
             let header = RecordHeader::decode(&all[at as usize..])
+                // alloc: the error that stops the opening
                 .map_err(|why| fail(format!("the record at {at}: {why}")))?;
             let end = at.checked_add(header.span()).filter(|&end| end <= pack.committed).ok_or_else(
+                // alloc: the error that stops the opening
                 || fail(format!("the record at {at} runs past the {} bytes its head names", pack.committed)),
             )?;
             if header.form != Form::Dictionary {
@@ -2451,6 +2576,7 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
     for spot in found.into_iter().rev() {
         _ = delta.insert(held, spot);
     }
+    // alloc: opening, once per tier
     tier.delta = Arc::new(delta);
     let packs = &tier.packs;
     for dictionary in &mut tier.dictionaries {
@@ -2458,14 +2584,19 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
         let at = dictionary.offset;
         dictionary.bytes = pack
             .bytes(at, RECORD_HEADER)
+            // alloc: the error of a dictionary that cannot be read
             .ok_or_else(|| format!("at {at} is outside {}", pack.file))
+            // alloc: the error of a dictionary that cannot be read
             .and_then(|bytes| RecordHeader::decode(bytes).map_err(|why| format!("at {at} of {}: {why}", pack.file)))
             .and_then(|header| match header.form == Form::Dictionary && header.kind == dictionary.kind {
                 true => pack
                     .bytes(at + RECORD_HEADER, header.stored)
                     .filter(|bytes| content_of(bytes) == header.content)
+                    // alloc: opening, once per dictionary, whose bytes the prepared dictionary keeps
                     .map(|bytes| Arc::new(cold::Prepared::new(bytes.to_vec())))
+                    // alloc: the error of a dictionary that cannot be read
                     .ok_or_else(|| format!("at {at} of {} is not what was recorded", pack.file)),
+                // alloc: the error of a dictionary that cannot be read
                 false => Err(format!("at {at} of {} is not a dictionary of its kind", pack.file)),
             });
     }

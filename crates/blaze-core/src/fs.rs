@@ -2,8 +2,10 @@
 //! [`crate::uring::Uring`] does where it is submitted; and [`Mapped`], every crate's read-only
 //! file mapping.
 
+#[allow(unsafe_code, reason = "mmap and MapViewOfFile, and the byte view of what they map")]
 mod mapped;
 
+pub(crate) use mapped::map;
 pub use mapped::{Advice, MapOptions, Mapped};
 
 #[cfg(unix)]
@@ -135,12 +137,8 @@ pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
     // macOS keeps it coherent with cached and mapped pages.
     #[cfg(target_os = "macos")]
     if bytes.len() >= 1 << 20 && at % 4096 == 0 && bytes.len() % 4096 == 0 {
-        use std::os::fd::AsRawFd as _;
-        // SAFETY: `file`, opened above, owns the descriptor and outlives the call; the flag
-        // changes only how its writes use the cache.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        use std::os::fd::AsFd as _;
+        crate::raw::no_cache(file.as_fd())?;
     }
     #[cfg(unix)]
     return std::os::unix::fs::FileExt::write_all_at(&file, bytes, at);
@@ -183,20 +181,8 @@ pub(crate) fn set_times(path: &Path, modified_ns: u64) -> io::Result<()> {
             ),
         ));
     };
-    // SAFETY: `timespec` is integers, and padding on some targets: all zeros is a valid one.
-    let mut time: libc::timespec = unsafe { std::mem::zeroed() };
-    time.tv_sec = seconds;
-    // Below 10^9, which every target's `tv_nsec` holds.
-    time.tv_nsec = (modified_ns % 1_000_000_000) as _;
-    let times = [time, time];
-    with_c_path(path, |c| {
-        // SAFETY: a NUL-terminated path and the two `timespec`s (access, then modification) the
-        // call reads, both alive across it; no flags, so a link is followed.
-        match unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) } {
-            0 => Ok(()),
-            _ => Err(io::Error::last_os_error()),
-        }
-    })
+    let time = crate::raw::timespec(seconds, (modified_ns % 1_000_000_000) as u32);
+    with_c_path(path, |c| crate::raw::utimens(c, &[time, time]))
     // alloc: an error path.
     .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
@@ -320,17 +306,12 @@ fn refuses_sharing(_: i32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    /// `_IOW(0x94, 9, int)` of `linux/fs.h`.
-    const FICLONE: libc::c_ulong = 0x4004_9409;
+    use std::os::fd::AsFd as _;
     let source = File::open(from)?;
     let target = OpenOptions::new().write(true).create_new(true).open(to)?;
-    // SAFETY: two open descriptors; the call reads the first's blocks into the second.
-    let cloned = unsafe { libc::ioctl(target.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
-    if cloned == 0 {
+    let Err(error) = crate::raw::ficlone(target.as_fd(), source.as_fd()) else {
         return Ok(());
-    }
-    let error = io::Error::last_os_error();
+    };
     drop(target);
     _ = std::fs::remove_file(to);
     Err(error)
@@ -338,25 +319,7 @@ fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
-    with_c_path(from, |source| {
-        with_c_path(to, |target| {
-            // SAFETY: two NUL-terminated paths.
-            match unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) } {
-                0 => Ok(()),
-                _ => Err(io::Error::last_os_error()),
-            }
-        })
-    })
-}
-
-/// The file mapped read-only and shared, for [`crate::Effect::Map`], as one [`Mapped`] that the
-/// last [`crate::Mapping`] of it unmaps.
-pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
-    // SAFETY: `Effect::Map`'s contract: while any `Mapping` of the file lives, no effect writes,
-    // appends to or truncates it in place; the store and the image replace a file only by
-    // renaming another over it.
-    let mapped = unsafe { Mapped::open(path) }?;
-    Ok(crate::Mapping::file(mapped))
+    with_c_path(from, |source| with_c_path(to, |target| crate::raw::clonefile(source, target)))
 }
 
 /// The [`Stamp`] of a `stat` of a name, not followed through a symlink.
@@ -376,36 +339,21 @@ pub(crate) fn stamp_of(stat: &libc::stat) -> Stamp {
 /// The root's directory, opened once for a batch of `fstatat`s relative to it.
 #[cfg(unix)]
 fn open_dir(root: &Path) -> io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd as _;
-    let fd = with_c_path(root, |path| {
-        // SAFETY: a NUL-terminated path; the result is a descriptor of its own or -1.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-        match fd < 0 {
-            true => Err(io::Error::last_os_error()),
-            false => Ok(fd),
-        }
-    })
-    // alloc: an error path.
-    .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", root.display())))?;
-    // SAFETY: the call returned a descriptor of its own.
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    with_c_path(root, crate::raw::open_dir)
+        // alloc: an error path.
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", root.display())))
 }
 
 /// One name's stamp, relative to the directory `dir`.
 #[cfg(unix)]
-fn stamp_at(dir: std::os::fd::RawFd, name: &std::ffi::CStr) -> Stamp {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: an open directory, a NUL-terminated relative name and room for one `stat`.
-    let failed =
-        unsafe { libc::fstatat(dir, name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0;
-    if failed {
-        return match io::Error::last_os_error().raw_os_error() {
+fn stamp_at(dir: std::os::fd::BorrowedFd<'_>, name: &std::ffi::CStr) -> Stamp {
+    match crate::raw::stat_at(dir, name) {
+        Ok(stat) => stamp_of(&stat),
+        Err(error) => match error.raw_os_error() {
             Some(libc::ENOENT | libc::ENOTDIR) => Stamp::GONE,
             _ => Stamp::UNKNOWN,
-        };
+        },
     }
-    // SAFETY: the call succeeded, so it filled the `stat`.
-    stamp_of(unsafe { &stat.assume_init() })
 }
 
 /// How many names one thread of a sweep stamps.
@@ -417,9 +365,9 @@ const SWEEP_CHUNK: usize = 2048;
 /// root cannot be opened.
 #[cfg(unix)]
 pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::AsFd as _;
     let dir = open_dir(root)?;
-    let dir = dir.as_raw_fd();
+    let dir = dir.as_fd();
     // alloc: the batch's payload.
     let mut out = vec![Stamp::GONE; names.len()];
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get().min(8));
@@ -446,7 +394,7 @@ pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
 /// name; symbolic links are stamped themselves.
 #[cfg(unix)]
 pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Stamp)>> {
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::AsFd as _;
     let fd = open_dir(dir)?;
     // alloc: the listing's payload.
     let mut found = Vec::new();
@@ -458,7 +406,7 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
         let leaf = entry.file_name();
         // alloc: the name, the listing's payload.
         let file = child_name(name, &leaf, || entry.path())?;
-        let stamp = with_c_path(Path::new(&leaf), |leaf| Ok(stamp_at(fd.as_raw_fd(), leaf)))?;
+        let stamp = with_c_path(Path::new(&leaf), |leaf| Ok(stamp_at(fd.as_fd(), leaf)))?;
         found.push((file, stamp));
     }
     found.sort_unstable_by(|a, b| a.0.cmp(&b.0));

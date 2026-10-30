@@ -129,6 +129,7 @@ pub(super) fn equal_bytes(
 #[test]
 fn chunks_are_the_widest_first_and_fit_the_array() {
     for size in 0..=MOST as u32 {
+        // alloc: a test's
         let mut expected = Vec::new();
         let mut at = 0;
         for ty in [types::I64, types::I32, types::I16, types::I8] {
@@ -137,6 +138,7 @@ fn chunks_are_the_widest_first_and_fit_the_array() {
                 at += ty.bytes();
             }
         }
+        // alloc: a test's
         let chunks: Vec<_> = chunks(size).collect();
         assert_eq!(chunks, expected, "{size} bytes");
         assert!(chunks.len() <= CHUNKS);

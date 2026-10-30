@@ -45,8 +45,6 @@ you send them, including fixes you find here and want to upstream.
     crates/hir-ty-borrowck/   the borrow checker, a crate next to hir-ty (borrowck.md)
     crates/syntax-tree/             rowan 0.17.0 with a flat kind of tree behind its cursor (flat-syntax.md)
     crates/rustc_abi/         rustc's layout crate at the pinned nightly's commit
-    vendor/proc-macro-srv/    the pinned nightly's proc-macro server, built by blaze to load
-                              the proc-macro libraries blaze links (no-rustc.md, step J1)
     vendor/source.rev         the commit of the old development branch this tree last took from
 
 `crates/hir-ty-codegen` is the code generator, a crate of its own over `hir-ty`'s MIR: what
@@ -116,8 +114,8 @@ one file; everything else reads it or is written from it:
   line and its rust-lang/rust commit. A rustc is taken for the pinned one by that whole line,
   since every nightly of a release has the same number.
 - What mirrors rustc, all from that commit: `crates/rustc_abi` (rustc's `compiler/rustc_abi`),
-  `vendor/proc-macro-srv` (the nightly's proc-macro server with blaze's J1 changes and its
-  `RUSTC_VERSION_STRING`), the answers to rustc's questions
+  `crates/proc-macro-srv` (blaze's proc-macro server, over the nightly's `proc_macro` bridge,
+  which it follows by hand, and its `RUSTC_VERSION_STRING`), the answers to rustc's questions
   (`crates/blaze-cargo/src/answers/rustc.json`), and the code written by hand to agree with rustc:
   the Rust ABI in the code generator, `vtable.rs`, `type_id.rs`, symbol names (v0) in
   `symbols.rs`, the intrinsics and lang items, the test harness's call into libtest.
@@ -135,12 +133,10 @@ a nightly breaks, on the bump's branch `toolchain/bump`, or for trying a nightly
 
 picks the nightly (the newest of the last two weeks whose manifest has every component blaze
 needs on every host it ships for, or the date given), writes `harness/toolchain` and
-`pins.txt`, re-vendors `crates/rustc_abi` and `vendor/proc-macro-srv` from rust-lang/rust at
-the new commit (blaze's changes to the server carried over by a three-way apply; a conflict
-stops it and names the files), merges that nightly's standard library into `library/`
-(`harness/library.py merge`: upstream's changes applied three-way, so blaze's own changes to it
+`pins.txt`, re-vendors `crates/rustc_abi` from rust-lang/rust at the new commit, merges that
+nightly's standard library into `library/` (`harness/library.py merge`: upstream's changes applied three-way, so blaze's own changes to it
 are kept; a conflict stops it and names the files), moves the pin where else it is written (`install.sh`, the
-server's version string and manifest, `Cargo.toml`, the flake's rust-overlay input) and
+server's version string, `Cargo.toml`, the flake's rust-overlay input) and
 installs the nightly with rustup. Each step names itself when it fails.
 
 What it leaves to a person, and prints at the end:
@@ -191,7 +187,8 @@ did about it in one line.
   generator feature, a breaker for a bug found in real code, a step in the relevant edit
   harness for a daemon bug. [harness.md](harness.md) says how to add each.
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
-  you did not run. CI's merge gate is the build and the unit tests on Linux x86-64; every
+  you did not run. CI's merge gate is the build and the unit tests on Linux x86-64, and
+  `blaze check --workspace` with the released blaze on Linux x86-64 and macOS; every
   harness on every platform, Windows too, and the slow ones (`wholeprogram.py`, `keys.py`,
   `buildmodel.py`, the store, `blaze_cli.py` on real projects) run in the release train on
   main after the merge, and a red train opens or adds to the issue "Release train is red",
@@ -270,7 +267,8 @@ run in the lane's worktree
 
 It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") and turns
 on auto-merge. The pull request's own run is the merge gate, the build and the unit tests on
-Linux x86-64 (about five minutes, [harness.md](harness.md#ci)); a failure there ends `land.py`
+Linux x86-64 and the released blaze's `blaze check --workspace` on Linux x86-64 and macOS
+([harness.md](harness.md#ci)); a failure there ends `land.py`
 with the check's link. Once it passes, GitHub merges the branch with a merge commit, as
 `git merge --no-ff` would. There is no merge queue and the branch need not be up to date with
 main: two changes that each pass but break together are caught on main by the release train.
@@ -306,8 +304,11 @@ few thousand and before a release after large changes to the daemon.
 
 ## LLVM for `--features llvm`
 
-The LLVM backend builds against one LLVM, 23.1.4 with our fixes, built by blaze for each target it ships on
-and pinned by its sha256 in `crates/hir-ty-codegen/llvm.json`. The flake's dev shell fetches it:
+blaze builds against one LLVM, 23.1.4 with our fixes, built by blaze for each target it ships on
+and pinned by its commit, version and per-target sha256 in `crates/hir-ty-codegen/llvm.json`.
+Every build of blaze needs it, not only the LLVM backend: `blaze-stencil`'s build script has it
+make the stencils. The flake's dev shell fetches it (the flake's `blaze-llvm`) and sets
+`LLVM_SYS_231_PREFIX` to it:
 
     nix develop -c cargo build -p blaze-engine --release --features llvm
 
@@ -321,8 +322,13 @@ build` refuses a prefix in your home directory.
     python3 .github/scripts/llvm.py fetch --target <triple> --dir /usr/local/lib/blaze-llvm/<triple>
     LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/<triple> blaze build -p blaze-engine --release --features llvm
 
-`build.rs` checks the prefix's `blaze-llvm.json` against the pin and stops otherwise: neither
-Homebrew's LLVM nor a distribution's is a source. LLVM is linked in statically, and on Linux so
+Every crate that uses LLVM (`hir-ty-codegen` through inkwell, `blaze-stencil`'s build script)
+links it through llvm-sys, whose build script checks the prefix before anything else
+(`vendor/llvm-sys/pin.rs`): its `blaze-llvm.json` must name the pinned commit and version and
+its `llvm-config --version` must say that version. `LLVM_SYS_231_PREFIX` unset, a stock LLVM
+(no `blaze-llvm.json`) or another build stops the build with one error naming what it found,
+the pin and the fix. Nothing else is searched: not `PATH`, Homebrew's LLVM, a distribution's or
+another `LLVM_SYS_*_PREFIX`. LLVM is linked in statically, and on Linux so
 is libstdc++, so a binary built with the feature needs no LLVM where it runs. inkwell's llvm-sys
 does the linking (vendored in `vendor/llvm-sys` for the static libstdc++; its SOURCE.md says why
 the libraries must come from a crate below inkwell for GNU ld). CI and Windows
@@ -332,7 +338,8 @@ The archives are built by the `llvm` workflow (`.github/workflows/llvm.yaml`, re
 `.github/scripts/llvm.py build`): our fork `indexable-inc/llvm` at the `ix/23.x` commit
 wasm-host's ix-aot pins (LLVM 23.1.4 and our fixes, so both run one LLVM), the X86 and AArch64 targets,
 no zlib, zstd, libxml2 or terminfo, on the release's runners (Ubuntu 22.04 for an old glibc,
-macOS 13 as the deployment target, the static CRT on Windows). To move the pin, change
+macOS 13 as the deployment target, the static CRT on Windows). For a target `llvm.json` has no
+archive for, run the workflow for it and add the `targets` entry its summary prints. To move the pin, change
 `ref`, `commit` and `version` in `llvm.json`, run the workflow, and write the `targets` its
 summary prints (`llvm.py pin`). LLVM's own release archives do not do: the macOS ones hold
 bitcode, and the Linux ones need zlib, zstd and libxml2.

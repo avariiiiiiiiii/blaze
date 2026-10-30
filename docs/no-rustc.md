@@ -248,7 +248,6 @@ What is left starts rustc only outside a user's build. `harness/rustcsites.py` c
 | `blaze-cargo/src/plan.rs` `cargo_in`, `cargo/state.rs` `cargo_path` | cargo, with blaze answering its questions | the same loads |
 | `blaze-cargo/src/stub.rs` | blaze standing in for rustc for a whole build (`BLAZE_WRAPS_RUSTC`) | the harness's "alone" builds (`difftest.py`, `alone.py`, `wholeprogram.py`) |
 | `blaze-cargo/src/cargo/own_macro.rs` | `rustup target add wasm32-wasip1` for the wasi-libc a proc macro's module links | a toolchain without it |
-| `proc-macro-srv/build.rs`, `proc-macro-srv/proc-macro-test/build.rs` | build scripts of blaze's own crates | building blaze |
 
 ### How often
 
@@ -1036,7 +1035,9 @@ a server and a library agree on the bridge only when both are built from one
 `library/proc_macro`, so `vendor/proc-macro-srv` is `src/tools/rust-analyzer`'s crates and
 `compiler/rustc_lexer` at the pinned nightly's commit (12433c307), which has
 `bridge::IdentKind`, with blaze's changes carried over, and `harness/toolchain_bump.py` takes
-it again at each bump.
+it again at each bump. Since 2026-10-30 (the last item below) the server is the workspace's own
+`crates/proc-macro-srv` and `crates/proc-macro-srv-cli`, which follow the toolchain's
+`proc_macro` bridge by hand, and nothing is re-vendored for it.
 
 Where J stands (2026-10-24):
 
@@ -1132,6 +1133,15 @@ Where J stands (2026-10-24):
   blaze's server and no other, and made `clap_derive` in 19 s from an empty store, then took
   it from the store when it was deleted. Left: #327, and the key names the target
   directory's paths, so another checkout of the same crates links again.
+- The workspace's own server (2026-10-30, `selfbuild-srv`): `vendor/proc-macro-srv` is gone.
+  The loader that `dlopen`s a library and reads `BLAZE_PROC_MACROS` is in `crates/proc-macro-srv`
+  (`dylib.rs`), over the standard library's `proc_macro` and no other crate of rustc's tree,
+  and the executable is `blaze-proc-macro-srv` of `crates/proc-macro-srv-cli`, on the
+  workspace's `proc-macro-api`: it speaks protocol version 8, with the warm socket
+  (`BLAZE_WARM_SOCKET`, scoped expansions) and wire trees. blaze's own build has it
+  (`blaze build -p blaze-engine -p proc-macro-srv-cli`), `build_release.py --server` builds it
+  `--exe` from the workspace's root, and `harness/toolchain_bump.py` re-vendors nothing for it:
+  a bridge that changed at a bump is fixed in `crates/proc-macro-srv` by hand. Not built yet.
 
 J, K and M are planned together in [self-contained.md](self-contained.md#j-k-and-m), since
 what they remove is most of the toolchain blaze still keeps: rustc and the sysroot's rlibs (116

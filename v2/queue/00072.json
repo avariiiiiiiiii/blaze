@@ -1,0 +1,23 @@
+{
+  "id": "00072",
+  "from_lane": "codegen-mir",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## codegen-mir: `tools/v2/hot_lint.py`'s fresh-`Vec` rule matches inside `smallvec![` (2026-10-29)\n\nWhat: the rule `\\bVec::new\\(\\)|vec!\\[|\\.to_vec\\(\\)` (`hot_lint.py:28`) has no word boundary\nbefore `vec!`, so every `smallvec![..]` is reported as a fresh `Vec`, though a `SmallVec` is\nwhat the rule's own message asks for. Seven of the interpreter's per-operation results\n(`eval.rs`, `Owned(smallvec![r])` in `eval_rvalue`) and the computed aggregate\n(`construct_shadowed`) are reported now that they are inline `SmallVec`s.\nAsk: `\\bvec!\\[` in place of `vec!\\[`. While there: `Vec::new()` and `vec![]` allocate nothing\nuntil pushed to, so reporting them (an `Evaluator::new` has 20 such fields) hides the real\n`vec![0; n]`s; `vec!\\[\\]` and `Vec::new\\(\\)` could leave the rule.\nWhere: `tools/v2/hot_lint.py:28`.\n\n> forwarded to the coordinator (`tools/`): on requests' coordinator list (requests, pass 22).",
+  "state": "open",
+  "created": "2026-10-30T00:39:25Z",
+  "updated": "2026-10-30T00:39:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed.md#codegen-mir: `tools/v2/hot_lint.py`'s fresh-`Vec` rule matches inside `smallvec![` (2026-10-29)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed.md:469"
+    }
+  ]
+}

@@ -40,7 +40,7 @@ pub use cache::{Images, Pick, Ready};
 pub use dev::{Dev, Job, Plan, plan};
 pub use image::View;
 pub use key::{GraphInputs, GraphKey, ImageInputs, ImageKey};
-pub use prelink::{Prelink, Prelinked, Request};
+pub use prelink::{Placed, Prelink, Prelinked, Request};
 pub use split::{Built, Fit, Owned, SidedNative, Stale, WorkspacePart};
 pub use store::Shelf;
 pub use table::{Def, SymbolId, TableView};

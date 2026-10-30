@@ -428,6 +428,41 @@ fn undecided() { let _x = make(); }
     });
 }
 
+/// rustc's "consider giving `x` an explicit type" names every variable of the `let`'s type,
+/// not only the error's: writeback keeps each undecided pattern's type named, and a decided
+/// one has none.
+#[test]
+fn an_undecided_pattern_keeps_its_type_with_every_variable_named() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+fn make<T, U>() -> (T, U) { loop {} }
+fn undecided() { let x = make(); let y = 1u8; }
+"#,
+    );
+    crate::attach_db(&db, || {
+        let (body, result) = infer(&db, "undecided");
+        let binding = |name: &str| {
+            body.pats()
+                .find_map(|(id, pat)| match pat {
+                    hir_def::hir::Pat::Bind { id: binding, .. }
+                        if body[binding].name.as_str() == name =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no binding `{name}`"))
+        };
+        let named = result.named_pat_type(binding("x")).expect("`x` is undecided");
+        assert_eq!(named.params.len(), 2, "`T` and `U`, not only the error's own: {named:?}");
+        let interner = hir_ide::next_solver::DbInterner::new_no_crate(&db);
+        let named_all = named.named(interner, |_, _| true);
+        assert!(!named_all.has_infer() && !named_all.references_error(), "{named_all:?}");
+        assert!(result.named_pat_type(binding("y")).is_none(), "`y` is `u8`");
+    });
+}
+
 /// rustc's `report_projection_error`: E0271 keeps what the alias normalizes to ("expected `u8`,
 /// found `bool`").
 #[test]
@@ -458,6 +493,21 @@ fn mismatch() { need(S); }
         assert!(
             matches!(normalized[..], [Some(TyKind::Bool)]),
             "one E0271 whose alias normalized to `bool`, not {normalized:?}"
+        );
+        let impls: Vec<_> = result
+            .diagnostics()
+            .iter()
+            .filter_map(|it| match it {
+                InferenceDiagnostic::SolverDiagnostic(SolverDiagnostic {
+                    kind: SolverDiagnosticKind::ProjectionMismatch { impl_, .. },
+                    ..
+                }) => Some(*impl_),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(impls[..], [Some(hir_ide::next_solver::AnyImplId::ImplId(_))]),
+            "the E0271 names `impl Tr for S`, selected for `S: Tr`, not {impls:?}"
         );
     });
 }

@@ -2,25 +2,34 @@
 //! spin on and through a channel one of them sleeps on: what handing work from one core to
 //! another costs. `cargo run --release -p blaze-core --example pingpong -- A B [ROUNDS]`
 #![allow(clippy::print_stdout)]
+#![deny(unsafe_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-fn pin(cpu: usize) {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: `cpu_set_t` is an array of integers, valid as all-zero bytes.
-        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `CPU_SET` indexes `set.bits` with Rust's bounds check, so a `cpu` past
-        // `CPU_SETSIZE` panics rather than writing out of bounds.
-        unsafe { libc::CPU_SET(cpu, &mut set) };
-        // SAFETY: `&set` is a live `cpu_set_t` of the size passed, read and not kept by the call.
-        let pinned = unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set) };
-        assert_eq!(pinned, 0, "pinning to CPU {cpu}");
+use crate::affinity::pin;
+
+/// Pinning the calling thread to a CPU: `sched_setaffinity`, which std does not offer.
+#[allow(unsafe_code, reason = "sched_setaffinity and the cpu_set_t it reads")]
+mod affinity {
+    /// The calling thread pinned to `cpu` (Linux; elsewhere nothing).
+    pub(crate) fn pin(cpu: usize) {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `cpu_set_t` is an array of integers, valid as all-zero bytes.
+            let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `CPU_SET` indexes `set.bits` with Rust's bounds check, so a `cpu` past
+            // `CPU_SETSIZE` panics rather than writing out of bounds.
+            unsafe { libc::CPU_SET(cpu, &mut set) };
+            // SAFETY: `&set` is a live `cpu_set_t` of the size passed, read and not kept by the
+            // call.
+            let pinned = unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set) };
+            assert_eq!(pinned, 0, "pinning to CPU {cpu}");
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = cpu;
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = cpu;
 }
 
 /// A cache line of its own, and the one after it, which the prefetcher pulls in with it.

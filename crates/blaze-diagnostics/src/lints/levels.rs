@@ -1,14 +1,13 @@
-//! The level of each lint found, as rustc decides it: the command line (`-A`, `-W`,
-//! `--force-warn`, `-D`, `-F` in order, `--cap-lints`), the lint attributes on the node and
-//! around it (through the macro call an expansion is of, the `mod` a file is of, to the
-//! crate's), `cfg_attr`, `#![warn(warnings)]`, `forbid`, `expect`, `reason`; rustc's notes on
-//! where a level came from and on a future-incompatible lint; what rustc says of the names in
-//! the attributes and on the command line (unknown, renamed, removed, a tool's, unstable,
-//! malformed, `forbid` overruled, only at crate level); the `#[expect]`s nothing fulfilled.
+//! The level of each lint found, as rustc decides it, and what rustc says of it: the rule is
+//! the front end's (`hir_lint_levels`: the command line, the lint attributes on the node and
+//! around it, `cfg_attr`, `#![warn(warnings)]`, `forbid`, `expect`, `reason`), and this is
+//! rustc's notes on where a level came from and on a future-incompatible lint; what rustc
+//! says of the names in the attributes and on the command line (unknown, renamed, removed, a
+//! tool's, unstable, malformed, `forbid` overruled, only at crate level), worded in
+//! `builder`; the `#[expect]`s nothing fulfilled.
 //!
-//! - `attrs`: the lint attributes of a node as rustc reads them, and the node around it.
-//! - `builder`: rustc's `LintLevelsBuilder`, as the early lint pass has it and as the HIR
-//!   has it.
+//! - `attrs`: where rustc's walk comes to a node, and whether a span is an external macro's.
+//! - `builder`: the diagnostics of what the front end's builder finds.
 //!
 //! Cost: a node with no attribute costs the walk a check of its kind. A lint found costs one
 //! perfect hash of its name to its lint, one FxHash of its node (or of each node out to the
@@ -26,27 +25,21 @@
 mod attrs;
 mod builder;
 
-use std::num::NonZeroU32;
-
-use blaze_ids::bits::BitSet;
-use cfg::CfgOptions;
 use hir::{HirFileId, InFile};
-use hir_def::unstable_features::UnstableFeatures;
-use intern::Symbol;
-use rustc_hash::FxHashMap;
+use hir_lint_levels::{LevelCx, Levels, Source, Spec, attrs as front};
 use syntax::{
-    SyntaxKind, SyntaxNodePtr, TextRange,
-    view::{self as ast, AstNode as _},
+    SyntaxKind, SyntaxNodePtr,
+    view::{self as ast, AstNode as _, HasAttrs as _},
 };
 
-pub use crate::lints::registry::Level;
+pub use crate::lints::registry::{Level, LintOptions};
 
-use self::builder::{Levels, When, owner_rank, root_file};
+use self::builder::{Said, When, owner_rank};
 use crate::{
     cx::Cx,
     lints::{
         CheckCfg,
-        registry::{self, Lint, LintId, LintSet, Store},
+        registry::{self, Args, Lint, LintId, LintSet, Store},
         syntax::Walk,
     },
     lower::{Found, Phase},
@@ -56,11 +49,9 @@ use crate::{
 /// The lint flags rustc is given.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommandLine {
-    /// `-A`, `-W`, `--force-warn`, `-D` and `-F`, in the order given: the lint, group or
-    /// tool's lint, with `_` for `-`, and its level.
-    pub opts: Vec<(String, Level)>,
-    /// `--cap-lints`.
-    pub cap: Option<Level>,
+    /// `-A`, `-W`, `--force-warn`, `-D`, `-F` and `--cap-lints`: what base-db holds of a
+    /// crate's, and what the front end's levels read.
+    pub lints: LintOptions,
     /// `--check-cfg`.
     pub check_cfg: CheckCfg,
     /// Each `--cfg` value as given, in order.
@@ -73,57 +64,28 @@ pub struct CommandLine {
 
 impl CommandLine {
     /// The lint flags among rustc's arguments `args`: `-A x`, `-Ax`, `--allow x`,
-    /// `--allow=x` and so on, `--cap-lints`, `--check-cfg` and `--cfg`. The other arguments
-    /// are not lint flags and are passed by. `--emit` is read for [`CommandLine::codegen`].
+    /// `--allow=x` and so on, `--cap-lints` ([`LintOptions::take`]), `--check-cfg` and
+    /// `--cfg`. The other arguments are not lint flags and are passed by. `--emit` is read for
+    /// [`CommandLine::codegen`].
     pub fn parse(args: &[String]) -> Result<CommandLine, String> {
         let mut flags = CommandLine::default();
         // alloc: setup, the command line read once per check
         let mut emit = Vec::new();
-        let mut args = args.iter();
-        let levels = [
-            ("--allow", Level::Allow),
-            ("--warn", Level::Warn),
-            ("--force-warn", Level::ForceWarn),
-            ("--deny", Level::Deny),
-            ("--forbid", Level::Forbid),
-            ("-A", Level::Allow),
-            ("-W", Level::Warn),
-            ("-D", Level::Deny),
-            ("-F", Level::Forbid),
-        ];
-        while let Some(arg) = args.next() {
-            let mut value = |flag: &str| -> Result<Option<String>, String> {
-                if arg == flag {
-                    // alloc: setup, as above; and the error's text
-                    let next = args.next().ok_or_else(|| format!("Argument to option '{}' missing", flag.trim_start_matches('-')))?;
-                    // clone: setup, as above
-                    return Ok(Some(next.clone()));
-                }
-                let rest = arg.strip_prefix(flag);
-                let rest = match flag.starts_with("--") {
-                    true => rest.and_then(|it| it.strip_prefix('=')),
-                    false => rest,
-                };
-                Ok(rest.map(str::to_owned))
-            };
-            if let Some(cap) = value("--cap-lints")? {
-                if flags.cap.is_some() {
-                    // alloc: an error's text
-                    return Err("Option 'cap-lints' given more than once".to_owned());
-                }
-                // alloc: an error's text
-                flags.cap = Some(Level::of_cap(&cap).ok_or_else(|| format!("unknown lint level: `{cap}`"))?);
+        let mut args = Args::new(args);
+        while let Some(arg) = args.arg() {
+            if flags.lints.take(&mut args, arg)? {
                 continue;
             }
-            if let Some(spec) = value("--check-cfg")? {
-                flags.check_cfg.add(&spec)?;
+            if let Some(spec) = args.value(arg, "--check-cfg")? {
+                flags.check_cfg.add(spec)?;
                 continue;
             }
-            if let Some(cfg) = value("--cfg")? {
-                flags.cfg.push(cfg);
+            if let Some(cfg) = args.value(arg, "--cfg")? {
+                // alloc: setup, as above
+                flags.cfg.push(cfg.to_owned());
                 continue;
             }
-            if let Some(list) = value("--emit")? {
+            if let Some(list) = args.value(arg, "--emit")? {
                 for kind in list.split(',') {
                     let kind = kind.split_once('=').map_or(kind, |(kind, _)| kind);
                     if !EMIT_KINDS.contains(&kind) {
@@ -132,26 +94,11 @@ impl CommandLine {
                         // alloc: as above
                         return Err(format!("unknown emission type: `{kind}` - expected one of: {}", expected.join(", ")));
                     }
-                    // alloc: setup, the command line read once per check
-                    emit.push(kind.to_owned());
-                }
-                continue;
-            }
-            let mut found = None;
-            for (flag, level) in levels {
-                if let Some(name) = value(flag)? {
-                    found = Some((name, level));
-                    break;
+                    emit.push(kind);
                 }
             }
-            let Some((name, level)) = found else { continue };
-            if name == "help" {
-                // alloc: an error's text
-                return Err(format!("`{} help` asks for rustc's list of lints, which blaze does not write", level.to_cmd_flag()));
-            }
-            flags.opts.push((name.replace('-', "_"), level));
         }
-        flags.codegen = emit.is_empty() || emit.iter().any(|it| it != "metadata" && it != "dep-info");
+        flags.codegen = emit.is_empty() || emit.iter().any(|&it| it != "metadata" && it != "dep-info");
         Ok(flags)
     }
 }
@@ -159,144 +106,12 @@ impl CommandLine {
 /// rustc's `--emit` kinds, in its order (`OutputType`'s shorthands).
 const EMIT_KINDS: [&str; 9] = ["asm", "llvm-bc", "dep-info", "link", "llvm-ir", "metadata", "mir", "obj", "thin-link-bitcode"];
 
-/// A lint's level where it is: rustc's `LevelSpec`, as 12 bytes. What rustc keeps in it of
-/// where the level came from is in [`Shared::sources`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Spec {
-    level: Level,
-    /// For `expect`, and `--force-warn` over one: the expectation a lint at it fulfills.
-    expect: Option<ExpectId>,
-    source: SourceId,
-}
-
-const _: () = assert!(size_of::<Spec>() == 12);
-
-/// An `#[expect]`'s name, by where it is: an index into [`Shared::fulfilled`], from 1.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct ExpectId(NonZeroU32);
-
-impl ExpectId {
-    fn index(self) -> usize {
-        self.0.get() as usize - 1
-    }
-}
-
-/// An index into [`Shared::sources`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SourceId(u32);
-
-impl SourceId {
-    /// rustc's `LintLevelSource::Default`, always the first.
-    pub(super) const DEFAULT: SourceId = SourceId(0);
-}
-
-/// Where a level came from: rustc's `LintLevelSource`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Source {
-    Default,
-    /// An attribute: the name it sets the level of (the new one of a renamed lint, with its
-    /// tool for a tool's), where the name is, and its `reason`. The span rustc gives where the
-    /// name is ([`Cx::span`]) is made only when a note shows it.
-    Node { name: Symbol, at: InFile<TextRange>, reason: Option<Symbol> },
-    /// The command line: the name given, with `_` for `-`, and the level of its flag.
-    CommandLine { name: Box<str>, level: Level },
-}
-
-/// What deciding levels in a crate reads and what it finds along the way, but the context and
-/// the command line: what a builder keeps from one question to the next ([`LevelMap`]).
-pub(super) struct Kept<'db> {
-    store: Store,
-    features: &'db UnstableFeatures,
-    cfg: &'db CfgOptions,
-    /// The crate's root file.
-    root: HirFileId,
-    /// The level the first `-D warnings` or the like gives `warnings` on the command line.
-    cmd_warnings: Option<Level>,
-    /// The `warnings` lint.
-    warnings: LintId,
-    /// Where each level came from, by [`SourceId`]: one per name in an attribute or on the
-    /// command line, not one per lint or per node.
-    sources: Vec<Source>,
-    /// Each `#[expect]`'s name by where it is, hashed once as both builders come to it.
-    expects: FxHashMap<(HirFileId, TextRange), ExpectId>,
-    /// Bit `i`: whether a lint at its level fulfilled the expectation of index `i`.
-    fulfilled: BitSet,
-}
-
-impl<'db> Kept<'db> {
-    fn new(cx: &Cx<'_, 'db>, cmd: &CommandLine, cfg: &'db CfgOptions, root: HirFileId) -> Kept<'db> {
-        let registered_tools = ast::AnyHasAttrs::cast(cx.root(root))
-            .map(|it| attrs::registered_tools(it, cfg, cx.edition))
-            .unwrap_or_default();
-        Kept {
-            store: Store { internal: false, registered_tools },
-            features: UnstableFeatures::query(cx.db, cx.krate.base()),
-            cfg,
-            root,
-            cmd_warnings: cmd.opts.iter().find(|(it, _)| it == "warnings").map(|&(_, it)| it),
-            warnings: LintId::WARNINGS,
-            sources: vec![Source::Default], // alloc: once per builder
-            expects: FxHashMap::default(),
-            fulfilled: BitSet::default(),
-        }
-    }
-
-    pub(super) fn source(&mut self, source: Source) -> SourceId {
-        let id = SourceId(u32::try_from(self.sources.len()).expect("fewer than 2^32 lint names"));
-        self.sources.push(source);
-        id
-    }
-
-    /// The expectation of the `#[expect]` name at `range` of `file`, the same to both builders.
-    pub(super) fn expect_id(&mut self, file: HirFileId, range: TextRange) -> ExpectId {
-        let next = self.expects.len();
-        *self.expects.entry((file, range)).or_insert_with(|| {
-            let id = u32::try_from(next + 1).ok().and_then(NonZeroU32::new).expect("fewer than 2^32 expectations");
-            ExpectId(id)
-        })
-    }
-
-    fn fulfill(&mut self, id: ExpectId) {
-        self.fulfilled.insert_growing(id.index());
-    }
-
-    fn is_fulfilled(&self, id: ExpectId) -> bool {
-        self.fulfilled.contains(id.index())
-    }
-}
-
-/// What deciding levels in a crate reads and what it finds along the way: the context, the
-/// command line, and what the builder keeps ([`Kept`], which it derefs to).
-pub(super) struct Shared<'a, 'b, 'db> {
-    cx: &'a Cx<'b, 'db>,
-    cmd: &'a CommandLine,
-    kept: &'a mut Kept<'db>,
-}
-
-impl<'db> std::ops::Deref for Shared<'_, '_, 'db> {
-    type Target = Kept<'db>;
-
-    fn deref(&self) -> &Kept<'db> {
-        &*self.kept
-    }
-}
-
-impl<'db> std::ops::DerefMut for Shared<'_, '_, 'db> {
-    fn deref_mut(&mut self) -> &mut Kept<'db> {
-        &mut *self.kept
-    }
-}
-
-impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
-    fn new(cx: &'a Cx<'b, 'db>, cmd: &'a CommandLine, kept: &'a mut Kept<'db>) -> Self {
-        Shared { cx, cmd, kept }
-    }
-
+impl Said<'_, '_, '_> {
     /// `diag` of `lint` at `spec` as rustc's `emit_lint_base` emits it: nothing when it is
     /// allowed or expected (the expectation fulfilled), or in another crate's macro and not of
     /// a lint given there; else at its level, with the future-incompatible warning and link
     /// and the notes on where its level came from.
-    fn finish(&mut self, lint: &'static Lint, spec: Spec, mut diag: Diag) -> Option<Diag> {
+    fn finish(&mut self, lcx: &LevelCx<'_, '_>, lint: &'static Lint, spec: Spec, mut diag: Diag) -> Option<Diag> {
         if spec.level == Level::Allow {
             return None;
         }
@@ -319,17 +134,17 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
         };
         if let Some(future) = lint.future_incompatible {
             if future.explain_reason {
-                diag.warn(future.reason.explanation(self.cx.edition));
+                diag.warn(future.reason.explanation(lcx.edition));
             }
             // alloc: a note of a lint that fires
             diag.note(format!("for more information, see {}", future.reason.reference()));
         }
-        self.explain(lint, spec, &mut diag);
+        self.explain(lcx, lint, spec, &mut diag);
         Some(diag)
     }
 
     /// rustc's `explain_lint_level_source`.
-    fn explain(&self, lint: &'static Lint, spec: Spec, diag: &mut Diag) {
+    fn explain(&self, lcx: &LevelCx<'_, '_>, lint: &'static Lint, spec: Spec, diag: &mut Diag) {
         let level = spec.level;
         if level == Level::Allow {
             return;
@@ -339,9 +154,9 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
         };
         let name = lint.name;
         let shown = level.as_str();
-        match &self.sources[spec.source.0 as usize] {
+        match lcx.source(spec.source) {
             Source::Default => {
-                let note = match self.store.group_of(lint) {
+                let note = match lcx.store.group_of(lint) {
                     // alloc: a note of a lint that fires
                     Some(group) => format!("`#[{shown}({name})]` (part of `#[{shown}({group})]`) on by default"),
                     // alloc: as above
@@ -381,7 +196,7 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
                 }
             }
         }
-        if let Some(warnings) = self.cmd_warnings
+        if let Some(warnings) = lcx.cmd_warnings
             && warnings >= Level::Deny
             && level < warnings
         {
@@ -389,6 +204,17 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
             once(diag, Sublevel::Note, format!("the `{name}` lint ignores `-D warnings`"));
         }
     }
+}
+
+/// The nodes of `walk` the builder (`early`, or the HIR's) reads attributes of, as rustc's
+/// walk of the crate comes to them. A node without costs a read of the tree's two columns,
+/// kind and `Tree::attrs`; only the rest are looked at.
+fn owners<'w, 'db>(walk: &'w Walk<'db>, early: bool) -> impl Iterator<Item = InFile<ast::Node<'db>>> + 'w {
+    walk.trees.iter().flat_map(move |tree| {
+        tree.with_attrs(move |kind| front::may_be_owner(kind, early))
+            .filter(move |&node| front::owns(node, early))
+            .map(move |node| InFile::new(tree.file, node))
+    })
 }
 
 /// The diagnostics of `found` with the level of each lint decided, and what deciding them
@@ -400,19 +226,18 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
 /// as many times, for `-Z deduplicate-diagnostics=no`: see [`builder::When`].
 pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, aborted: bool) -> Vec<Diag> {
     let walk = cx.walk();
-    let root = root_file(cx).expect("a crate's root module is a file");
-    let mut kept = Kept::new(cx, cmd, walk.cfg, root);
-    let mut sh = Shared::new(cx, cmd, &mut kept);
-    let mut early = Levels::new(&mut sh, true, true);
-    early.walk(&mut sh, walk);
-    let mut late = Levels::new(&mut sh, false, true);
-    late.walk(&mut sh, walk);
+    let mut lcx = LevelCx::new(cx.db, cx.krate.base(), &cmd.lints);
+    let mut said = Said::new(cx);
+    let mut early = Levels::new(&mut lcx, &mut said, true, true);
+    early.walk(&mut lcx, &mut said, owners(walk, true));
+    let mut late = Levels::new(&mut lcx, &mut said, false, true);
+    late.walk(&mut lcx, &mut said, owners(walk, false));
 
     let (mut pre, mut during): (Vec<_>, Vec<_>) =
-        std::mem::take(&mut early.emitted).into_iter().partition(|it| it.when == When::Pre);
+        std::mem::take(&mut said.early).into_iter().partition(|it| it.when == When::Pre);
     pre.sort_by(|a, b| a.place.cmp(&b.place));
     during.sort_by(|a, b| a.place.cmp(&b.place));
-    let hir = std::mem::take(&mut late.emitted);
+    let hir = std::mem::take(&mut said.hir);
     let extra = pre.len() + during.len() + hir.len();
     let mut pre = pre.into_iter().map(|it| it.diag);
     let mut during = during.into_iter().map(|it| it.diag);
@@ -450,9 +275,9 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
             true => &mut early,
             false => &mut late,
         };
-        let set = levels.set_of(&mut sh, at);
-        let spec = levels.spec(&sh, lint, set);
-        out.extend(sh.finish(lint, spec, it.diag));
+        let set = levels.set_of(&mut lcx, &mut said, at);
+        let spec = levels.spec(&lcx, lint, set);
+        out.extend(said.finish(&lcx, lint, spec, it.diag));
     }
     out.extend(pre);
     out.extend(during);
@@ -466,66 +291,67 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
     // unfulfilled; ranked before the test, as what the loop emits can fulfill another
     let mut expectations: Vec<_> = std::mem::take(&mut late.expectations)
         .into_iter()
-        .map(|it| ((owner_rank(&sh, it.node), attrs::place(&cx.vsema, it.node)), it))
+        .map(|it| ((owner_rank(cx, &lcx, it.node), attrs::place(&cx.vsema, it.node)), it))
         // alloc: as above
         .collect();
     expectations.sort_by(|a, b| a.0.cmp(&b.0));
     for (_, expectation) in expectations {
-        if sh.is_fulfilled(expectation.id) {
+        if said.is_fulfilled(expectation.id) {
             continue;
         }
-        let mut diag = Diag::lint(unfulfilled.name, "this lint expectation is unfulfilled", expectation.key);
+        let mut diag = Diag::lint(unfulfilled.name, "this lint expectation is unfulfilled", cx.span(expectation.key));
         if let Some(reason) = expectation.reason {
             diag.note(reason.as_str());
         }
         if expectation.is_unfulfilled {
             diag.note("the `unfulfilled_lint_expectations` lint can't be expected and will always produce this message");
         }
-        let set = late.set_at(&mut sh, expectation.node);
-        let spec = late.spec(&sh, unfulfilled, set);
-        out.extend(sh.finish(unfulfilled, spec, diag));
+        let set = late.set_at(&mut lcx, &mut said, expectation.node);
+        let spec = late.spec(&lcx, unfulfilled, set);
+        out.extend(said.finish(&lcx, unfulfilled, spec, diag));
     }
     out
 }
 
 /// rustc's HIR lint levels of a crate (`shallow_lint_levels_on`, `lint_level_at_node`), kept
-/// for the whole check in [`Cx`]: the command line's set is made once, and each node's set is
-/// made the first time a level is asked at it or at a node in it, from the nearest node out
-/// from it already seen, and kept. For a pass that must know a level before it can say what to
-/// emit (`missing_unsafe`'s `unsafe_op_in_unsafe_fn`).
+/// for the whole check in [`Cx`]: the front end's builder, which says nothing, with its sets
+/// kept. The command line's set is made once, and each node's set is made the first time a
+/// level is asked at it or at a node in it, from the nearest node out from it already seen.
+/// For a pass that must know a level before it can say what to emit (`missing_unsafe`'s
+/// `unsafe_op_in_unsafe_fn`) at a node of a body; at an item, it is
+/// `hir_lint_levels::lint_level`'s.
 ///
 /// Cost: a level at a node seen before is one FxHash probe and the bit tests of
 /// [`Levels::spec`], with nothing allocated. At a node not seen, the node is found in its tree
 /// and each node between it and the nearest one seen is hashed once and read for attributes.
 /// Nothing is said of the names in the attributes: [`decide`]'s builders say it.
-pub(crate) struct LevelMap<'db> {
-    kept: Kept<'db>,
+pub(crate) struct LevelMap<'a, 'db> {
+    lcx: LevelCx<'a, 'db>,
     levels: Levels<'db>,
 }
 
-impl<'db> LevelMap<'db> {
-    pub(crate) fn new(cx: &Cx<'_, 'db>, cmd: &CommandLine) -> LevelMap<'db> {
-        let root = root_file(cx).expect("a crate's root module is a file");
-        let mut kept = Kept::new(cx, cmd, cx.krate.cfg(cx.db), root);
-        let levels = Levels::new(&mut Shared::new(cx, cmd, &mut kept), false, false);
-        LevelMap { kept, levels }
+impl<'a, 'db> LevelMap<'a, 'db> {
+    pub(crate) fn new(cx: &Cx<'_, 'db>, opts: &'a LintOptions) -> LevelMap<'a, 'db> {
+        let mut lcx = LevelCx::new(cx.db, cx.krate.base(), opts);
+        let levels = Levels::new(&mut lcx, &mut (), false, false);
+        LevelMap { lcx, levels }
     }
 
-    /// The level of `lint` at the node `at`: the attributes on it and around it, the command
-    /// line `cmd` (the one the map was made with), `warnings` and `--cap-lints`.
-    pub(crate) fn level(&mut self, cx: &Cx<'_, 'db>, cmd: &CommandLine, lint: LintId, at: InFile<SyntaxNodePtr>) -> Level {
-        let mut sh = Shared::new(cx, cmd, &mut self.kept);
-        let set = self.levels.set_of(&mut sh, at);
-        self.levels.spec(&sh, lint.lint(), set).level
+    /// The level of `lint` at the node `at`: the attributes on it and around it, the lint
+    /// flags the map was made with, `warnings` and `--cap-lints`.
+    pub(crate) fn level(&mut self, lint: LintId, at: InFile<SyntaxNodePtr>) -> Level {
+        let set = self.levels.set_of(&mut self.lcx, &mut (), at);
+        self.levels.spec(&self.lcx, lint.lint(), set).level
     }
 }
 
 /// The lints a diagnostic of may be shown in the crate: rustc's `lints_that_dont_need_to_run`,
 /// the other way round. A lint is in it when its default level is not `allow`, or the command
-/// line or a lint attribute anywhere in the crate gives it (or a group of it, or its old name)
-/// a level other than `allow`, `expect` included, as an expectation needs the lint to run.
-/// Under `--cap-lints allow` it has only the lints `--force-warn` names. A lint not in it is
-/// allowed at every node, so a pass that gives nothing else need not run.
+/// line or a lint attribute anywhere in the crate (`-Z crate-attr`'s included) gives it (or a
+/// group of it, or its old name) a level other than `allow`, `expect` included, as an
+/// expectation needs the lint to run. Under `--cap-lints allow` it has only the lints
+/// `--force-warn` names. A lint not in it is allowed at every node, so a pass that gives
+/// nothing else need not run.
 ///
 /// Cost: a pass over the lint table (a few hundred bit operations), the perfect hashes of
 /// each name on the command line, and over the walk's pre-order columns one `kind` read per
@@ -541,7 +367,7 @@ pub(crate) fn may_fire(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> L
     let mut set = LintSet::EMPTY;
     let mut held = LintSet::EMPTY;
     let mut forced = LintSet::EMPTY;
-    for (name, level) in &cmd.opts {
+    for (name, level) in &cmd.lints.opts {
         let (tool, name) = match name.split_once("::") {
             Some((tool, name)) => (Some(tool), name),
             None => (None, name.as_str()),
@@ -571,7 +397,7 @@ pub(crate) fn may_fire(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> L
             }
         }
     }
-    if cmd.cap == Some(Level::Allow) {
+    if cmd.lints.cap == Some(Level::Allow) {
         return forced;
     }
     for lint in registry::all() {
@@ -582,7 +408,13 @@ pub(crate) fn may_fire(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> L
     for tree in &walk.trees {
         for node in tree.of_kind(|it| it == SyntaxKind::ATTR) {
             let Some(attr) = ast::Attr::cast(node) else { continue };
-            attrs::not_allowed(attr, &store, walk.cfg, cx.edition, &mut set);
+            front::not_allowed(attr, &store, walk.cfg, cx.edition, &mut set);
+        }
+    }
+    for &file in base_db::applied_crate_attr_files(cx.db, cx.krate.base()).iter() {
+        let Some(root) = ast::SourceFile::cast(cx.root(HirFileId::from(file))) else { continue };
+        for attr in root.attrs() {
+            front::not_allowed(attr, &store, walk.cfg, cx.edition, &mut set);
         }
     }
     set
@@ -590,7 +422,6 @@ pub(crate) fn may_fire(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> L
 
 #[cfg(test)]
 mod tests {
-    use hir::Semantics;
     use syntax::view::{AstNode as _, HasName as _};
 
     use super::*;
@@ -603,10 +434,9 @@ mod tests {
         let cmd = CommandLine::parse(&args).unwrap();
         let db = &checked.db;
         hir::attach_db(db, || {
-            let sema = Semantics::new(db);
             let krate = hir::check::workspace_crates(db)[0];
             let frame = crate::tests::frame();
-            let cx = Cx::new(&sema, krate, checked.files(), &frame).with_lints(&cmd);
+            let cx = Cx::new(db, krate, checked.files(), &frame).with_lints(&cmd);
             check(&cx);
         });
     }
@@ -632,7 +462,7 @@ mod tests {
         with_cx(fixture, args, |cx| {
             for (name, at) in fns(cx) {
                 let level = cx.lint_level(lint, at);
-                let alone = LevelMap::new(cx, cx.lint_flags()).level(cx, cx.lint_flags(), lint, at);
+                let alone = LevelMap::new(cx, &cx.lint_flags().lints).level(lint, at);
                 assert_eq!(level, alone, "the level at `{name}`");
                 assert_eq!(cx.lint_level(lint, at), level, "the level at `{name}`, asked again");
                 out.push((name, level));
@@ -754,9 +584,9 @@ fn main() {}
             let fns = fns(cx);
             assert_eq!(fns.len(), n + 1, "the walk comes to every function");
             used = blaze_alloc_count::measure(|| {
-                let mut map = LevelMap::new(cx, cx.lint_flags());
+                let mut map = LevelMap::new(cx, &cx.lint_flags().lints);
                 for (_, at) in &fns {
-                    map.level(cx, cx.lint_flags(), lint, *at);
+                    map.level(lint, *at);
                 }
             })
             .1
@@ -804,6 +634,36 @@ fn main() {}
         let plain = "//- /main.rs crate:main edition:2021\nfn main() {}\n";
         assert_eq!(levels_of_fns(plain, &[], lint), named(&[("main", Level::Allow)]));
         assert_eq!(levels_of_fns(plain, &["-F", "unsafe-op-in-unsafe-fn"], lint), named(&[("main", Level::Forbid)]));
+    }
+
+    /// The check's levels and the front end's query are one rule: at every function of the level
+    /// fixtures, [`LevelMap`] and `hir_lint_levels::lint_levels_on` agree on every lint. No
+    /// lint flags are given, because the query reads them from the crate's base-db input and
+    /// the map from the command line.
+    #[test]
+    fn the_checks_levels_are_the_front_ends() {
+        for (fixture, functions) in [(LEVELS_FIXTURE.to_owned(), 5), (attributed_fns(12), 13)] {
+            with_cx(&fixture, &[], |cx| {
+                let opts = LintOptions::default();
+                let mut map = LevelMap::new(cx, &opts);
+                let def_map = hir_def::nameres::crate_def_map(cx.db, cx.krate.base());
+                let mut asked = 0;
+                for (_, module) in def_map.modules(cx.db) {
+                    for def in module.scope(cx.db).declarations() {
+                        let hir_def::ModuleDefId::FunctionId(id) = def else { continue };
+                        let owner = hir_def::ExpressionStoreOwnerId::Body(hir_def::DefWithBodyId::FunctionId(id));
+                        let node = hir_lint_levels::query::owner_node(cx.db, owner);
+                        let at = InFile::new(node.file_id, ast::ptr(node.value));
+                        let front = hir_lint_levels::lint_levels_on(cx.db, owner, ());
+                        for lint in registry::all() {
+                            assert_eq!(map.level(lint.id(), at), front.level(lint.id()), "{} at {at:?}", lint.name);
+                        }
+                        asked += 1;
+                    }
+                }
+                assert_eq!(asked, functions, "every function of the fixture");
+            });
+        }
     }
 
     #[test]

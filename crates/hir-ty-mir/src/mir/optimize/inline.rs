@@ -192,7 +192,7 @@ pub(super) fn inline<'db>(
             overflow_checks: overflow::crate_checks_overflow(db, krate).unwrap_or(false),
         },
         env: ParamEnvAndCrate { param_env: ctx.env, krate },
-        history: Vec::new(),
+        history: SmallVec::new(),
         top_down_counter: 0,
         changed: false,
         caller_is_inline_forwarder: caller_attrs.hinted() && body_is_forwarder(body),
@@ -214,7 +214,7 @@ struct Inliner<'a, 'f, 'db> {
     session: cost::Session,
     env: ParamEnvAndCrate<'db>,
     /// The callees inlined into one another down to the blocks being looked at.
-    history: Vec<InlinedBody<'db>>,
+    history: SmallVec<[InlinedBody<'db>; 8]>,
     /// How many callees inlined down to here made more than one call.
     top_down_counter: usize,
     changed: bool,
@@ -245,7 +245,8 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
     /// rustc's `process_blocks`, without recursion: the blocks of each inlined callee are
     /// looked at with it in the history, before the blocks after the call.
     fn run(&mut self, body: &mut MirBody<'db>) {
-        let mut stack: Vec<(Range<usize>, bool)> = vec![(0..body.basic_blocks.len(), false)];
+        let mut stack: SmallVec<[(Range<usize>, bool); 8]> = SmallVec::new();
+        stack.push((0..body.basic_blocks.len(), false));
         while let Some((blocks, _)) = stack.last_mut() {
             let Some(index) = blocks.next() else {
                 if let Some((_, true)) = stack.pop() {
@@ -265,7 +266,7 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
             self.changed = true;
             let db = self.db;
             let calls = new_blocks
-                .clone()
+                .clone() // clone: a `Range<usize>`, two words
                 .filter(|&it| {
                     let written = |span| written_checked_at(db, body, span);
                     cost::block_is_call_like(&body.basic_blocks[block_id(it)], written)
@@ -325,6 +326,7 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
             return None;
         };
         let arg_tys: SmallVec<[Ty<'db>; 4]> =
+            // alloc: inline `SmallVec`, on the stack for up to four arguments
             args.iter().map(|it| operand_ty(ctx, body, it)).collect();
         // Inlining an unsized argument would make an unsized local.
         if !arg_tys.iter().all(|&ty| ctx.is_sized(ty)) {
@@ -356,7 +358,7 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
             .callees
             .iter()
             .map(|it| self.list(body, it.body, it.args.as_ref(), it.written_checked))
-            .collect();
+            .collect(); // alloc: inline `SmallVec`, on the stack for up to eight callees
         let site = integrate::Site {
             block: site.block,
             spread: site.spread,
@@ -449,7 +451,7 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
         let ctx = self.ctx;
         let cost = cost::cost(callee, self.session, written_checker(self.db, callee), |place| {
             ctx.needs_drop(place.as_ref().ty(callee, &ctx.infcx, ctx.env).ty)
-        });
+        })?;
         (cost <= threshold).then_some(())
     }
 

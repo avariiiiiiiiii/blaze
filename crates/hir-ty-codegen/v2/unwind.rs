@@ -30,6 +30,7 @@ pub(crate) fn convert(
         UnwindParts::Dwarf { fde, landing_pads } => {
             let common = common(isa)?;
             let fde = common.fde(fde)?;
+            // alloc: the landing pads' data, kept with the code; `Data::new` owns its bytes
             let lsda = landing_pads.map(|pads| Data::new(4, pads.to_vec(), Relocs::new()));
             let personality = match lsda {
                 Some(_) => Some(personality()?),
@@ -39,6 +40,7 @@ pub(crate) fn convert(
                 code_align: common.entry.code_align,
                 data_align: common.entry.data_align,
                 return_address: common.entry.return_address,
+                // clone: `Unwind::Dwarf` owns its CIE's few bytes, kept with the code
                 cie: common.entry.cie.clone(),
                 fde,
                 personality,
@@ -47,9 +49,11 @@ pub(crate) fn convert(
             Ok((unwind, lsda))
         }
         UnwindParts::Windows { info, landing_pads: None, .. } => {
+            // alloc: the function's unwind info, kept with its code; `Unwind::Windows` owns it
             Ok((Unwind::Windows { info: info.to_vec(), handler: None, lsda: None }, None))
         }
         UnwindParts::Windows { landing_pads: Some(_), .. } => Err(
+            // alloc: the error's message
             "a Windows function with landing pads: v2 has no SEH handler data yet".to_owned(),
         ),
     }
@@ -77,12 +81,14 @@ impl Common {
 // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
 fn common(isa: &dyn TargetIsa) -> Result<&'static Common, String> {
     static COMMON: OnceLock<Result<Common, String>> = OnceLock::new();
-    let process = crate::target().map_err(|e| e.to_string())?;
+    let process = crate::target().map_err(|e| e.to_string())?; // alloc: the error's message
     if !std::ptr::addr_eq(isa, &**process) {
+        // alloc: the error's message
         return Err(format!("unwind information for {}, which is not the process's ISA", isa.triple()));
     }
     let common = COMMON.get_or_init(|| {
         let Some(made) = process.create_systemv_cie() else {
+            // alloc: the error's message, once per process
             return Err(format!("{} has no DWARF call frame information", process.triple()));
         };
         let entry = Entry::of(made, FrameDescriptionEntry::new(ANYWHERE, 0))?;
@@ -111,6 +117,7 @@ impl Entry {
         let id = table.add_cie(cie);
         table.add_fde(id, fde);
         let mut eh_frame = EhFrame(EndianVec::new(RunTimeEndian::Little));
+        // alloc: the error's message; once per process, by `common`
         table.write_eh_frame(&mut eh_frame).map_err(|e| e.to_string())?;
         Entry::read(eh_frame.0.slice())
     }
@@ -121,25 +128,27 @@ impl Entry {
         let mut at = Reader { bytes, at: 0 };
         let cie_end = at.length()?;
         if at.u32()? != 0 {
-            return Err("the first entry is no CIE".to_owned());
+            return Err("the first entry is no CIE".to_owned()); // alloc: the error's message
         }
         if at.u8()? != 1 {
-            return Err("a CIE of another version than 1".to_owned());
+            return Err("a CIE of another version than 1".to_owned()); // alloc: the error's message
         }
         if at.u8()? != 0 {
-            return Err("a CIE with an augmentation".to_owned());
+            return Err("a CIE with an augmentation".to_owned()); // alloc: the error's message
         }
+        // alloc: the error's message
         let code_align = u32::try_from(at.uleb()?).map_err(|e| e.to_string())?;
+        // alloc: the error's message
         let data_align = i32::try_from(at.sleb()?).map_err(|e| e.to_string())?;
         let return_address = u16::from(at.u8()?);
-        let cie = at.take(cie_end)?.to_vec();
+        let cie = at.take(cie_end)?.to_vec(); // alloc: once per process, by `common`
         let fde_end = at.length()?;
         at.u32()?;
         // Where the function starts and how long it is: the linker's to write.
         at.skip(16)?;
-        let fde = at.take(fde_end)?.to_vec();
+        let fde = at.take(fde_end)?.to_vec(); // alloc: once per process, by `common`
         if at.at != bytes.len() {
-            return Err("more than one CIE and one FDE".to_owned());
+            return Err("more than one CIE and one FDE".to_owned()); // alloc: the error's message
         }
         Ok(Entry { code_align, data_align, return_address, cie, fde })
     }
@@ -167,14 +176,14 @@ impl Reader<'_> {
     fn length(&mut self) -> Result<usize, String> {
         let length = self.u32()?;
         if length == u32::MAX {
-            return Err("a 64-bit entry".to_owned());
+            return Err("a 64-bit entry".to_owned()); // alloc: the error's message
         }
         Ok(self.at + length as usize)
     }
 
     fn skip(&mut self, count: usize) -> Result<(), String> {
         if self.at + count > self.bytes.len() {
-            return Err("the entry ends early".to_owned());
+            return Err("the entry ends early".to_owned()); // alloc: the error's message
         }
         self.at += count;
         Ok(())
@@ -191,6 +200,7 @@ impl Reader<'_> {
         loop {
             let byte = self.u8()?;
             if shift >= 64 {
+                // alloc: the error's message
                 return Err("a LEB128 of more than 64 bits".to_owned());
             }
             value |= u64::from(byte & 0x7f) << shift;
@@ -206,6 +216,7 @@ impl Reader<'_> {
         loop {
             let byte = self.u8()?;
             if shift >= 64 {
+                // alloc: the error's message
                 return Err("a LEB128 of more than 64 bits".to_owned());
             }
             value |= i64::from(byte & 0x7f) << shift;

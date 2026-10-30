@@ -45,17 +45,21 @@ impl Mixed {
         let crates: Vec<(Crate, bool)> = program
             .iter()
             .filter_map(|&krate| Some((krate, crate_checks_overflow(db, krate)?)))
+            // alloc: once per build, setup
             .collect();
         if crates.iter().all(|it| it.1 == crates[0].1) {
             return None;
         }
         let identity = |&(krate, checks): &(Crate, bool)| {
             let id = match symbols.content_id(krate) {
+                // alloc: once per crate of a program whose crates check overflow differently
                 Some(content) => content.0.to_vec(),
+                // alloc: as above, setup
                 None => symbols.stable_crate_id(krate)?.to_le_bytes().to_vec(),
             };
             Some((id, checks))
         };
+        // alloc: once per build of such a program, setup
         let key = crates.iter().map(identity).collect::<Option<Vec<_>>>().map(|mut ids| {
             ids.sort_unstable();
             let mut hasher = Sha256::new();
@@ -67,11 +71,14 @@ impl Mixed {
         });
         let sees = crates
             .iter()
+            // alloc: once per build of such a program, setup
             .map(|&(krate, _)| (krate, krate.transitive_deps(db).iter().copied().collect()))
+            // alloc: once per build of such a program, setup
             .collect();
         let by_id = program
             .iter()
             .filter_map(|&krate| Some((symbols.stable_crate_id(krate)?, krate)))
+            // alloc: once per build of such a program, setup
             .collect();
         Some(Mixed { crates, sees, by_id, key })
     }
@@ -130,6 +137,7 @@ impl Mixed {
             mentions.is_none_or(|mentions| mentions.iter().all(|it| self.sees[krate].contains(it)))
                 && makers.is_none_or(|makers| makers.iter().any(|it| it.0 == *krate))
         };
+        // alloc: only a program whose crates check overflow differently gets here
         let able: Vec<Holder> = self.crates.iter().copied().filter(|it| able(&it.0)).collect();
         let sees = |asker: &Holder, it: &Holder| self.sees[&asker.0].contains(&it.0);
         let alike =

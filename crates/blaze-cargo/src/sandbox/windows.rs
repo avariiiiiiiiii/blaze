@@ -22,6 +22,13 @@
 //! ([`Kept`]) and the session lock's handle; in the warm launcher also the read checks
 //! ([`reads`]).
 //!
+//! This module and [`reads`] and [`serve`] below it are the Windows driver, the one place the
+//! sandbox may use unsafe code on Windows: std has no AppContainer, job object, DACL, token or
+//! change-watch call, so each is a `windows-sys` call in a block of its own with what it relies
+//! on stated above it. The read checks' table ([`reads`]) is lock-free so that the warm
+//! launcher's runs look a path up without a lock they all take; a `Mutex<HashMap>` would be the
+//! safe version, at one shared lock a check. Its model tests run with `--cfg blaze_check`.
+//!
 //! [#1390]: https://github.com/indexable-inc/blaze/issues/1390
 
 mod reads;

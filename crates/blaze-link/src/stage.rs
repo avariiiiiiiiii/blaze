@@ -41,10 +41,10 @@ static NO_RELOCS: Relocs = Relocs::new();
 
 /// SanitizerCoverage's sections as LLVM's `getSectionName` names them in each format: the
 /// counters, flags and guards (one array per covered function each), then the PC table.
-const SANCOV_ELF: [&str; 4] = ["__sancov_cntrs", "__sancov_bools", "__sancov_guards", "__sancov_pcs"];
-const SANCOV_MACHO: [&str; 4] =
+pub(crate) const SANCOV_ELF: [&str; 4] = ["__sancov_cntrs", "__sancov_bools", "__sancov_guards", "__sancov_pcs"];
+pub(crate) const SANCOV_MACHO: [&str; 4] =
     ["__DATA,__sancov_cntrs", "__DATA,__sancov_bools", "__DATA,__sancov_guards", "__DATA,__sancov_pcs"];
-const SANCOV_COFF: [&str; 4] = [".SCOV$CM", ".SCOV$BM", ".SCOV$GM", ".SCOVP$M"];
+pub(crate) const SANCOV_COFF: [&str; 4] = [".SCOV$CM", ".SCOV$BM", ".SCOV$GM", ".SCOVP$M"];
 /// [`Stage::sancov`]'s index of the PC table, after the arrays.
 const SANCOV_PCS: usize = Covered::ARRAYS as usize;
 
@@ -185,6 +185,8 @@ pub(crate) struct Stage<'a> {
     /// Where the zero length ending the call frame entries this patch placed in
     /// [`Class::Patch`] is ([`crate::place`]).
     pub frames_end: Option<u64>,
+    /// A lazy image's session ([`crate::lazy`]).
+    pub lazy: Option<&'a crate::lazy::Lazy>,
 }
 
 pub(crate) fn error(function: Option<InstanceKey>, what: impl Into<String>) -> LinkError {
@@ -371,10 +373,15 @@ impl<'a> Stage<'a> {
     pub fn apply(&mut self, change: &Change<'a>) -> Result<(), LinkError> {
         self.spans(change)?;
         if self.table && !self.new.laid_out {
-            self.fixed(change.added.len() as u64)?;
+            let lazy = self.lazy.map_or(0, |it| it.keys.len() as u64);
+            self.fixed(change.added.len() as u64 + lazy)?;
+            self.lazy_slots()?;
         }
         for key in &change.removed {
             if let Some(sym) = self.symbols.find_body(key) {
+                if self.is_lazy(sym) {
+                    return Err(error(Some(*key), "removed, and it is lazy: the image keeps every lazy function's slot"));
+                }
                 if let Some((piece, _)) = self.new.home(sym) {
                     self.remove_function(piece);
                 }
@@ -623,6 +630,13 @@ impl<'a> Stage<'a> {
             ));
         }
         for (name, function) in slots {
+            if self.symbols.find_body(name).is_some_and(|it| self.is_lazy(it)) {
+                return Err(error(
+                    Some(*name),
+                    "another function put in its slot, and it is lazy: the lazy placer replaces its code \
+                     (`Placer::replace`)",
+                ));
+            }
             let body = self
                 .symbols
                 .find_body(function)
@@ -673,6 +687,9 @@ impl<'a> Stage<'a> {
                 ));
             }
             let body = self.symbols.find_body(&function.key);
+            if body.is_some_and(|it| self.is_lazy(it)) {
+                return Err(error(Some(function.key), "added, and it is lazy: the lazy placer places its code"));
+            }
             if body.and_then(|it| self.new.home(it)).is_some() {
                 continue;
             }
@@ -781,6 +798,62 @@ impl<'a> Stage<'a> {
         let mut piece = self.piece(sym, &class, crate::counter::PAIR, 0, &[], What::Fixed);
         piece.zero = true;
         self.make(&piece, Content::Zero);
+    }
+
+    /// A lazy image's stub region and its lazy functions' slots ([`crate::lazy`]), at its first
+    /// link, right after the table is made: the region one piece after the slot stubs, its hook
+    /// cell a reference to [`blaze_lazy::hook::SYMBOL`] (its offset from the cell, which
+    /// [`crate::LazyPlacer::new`] replaces with the hook's address); each lazy function's slot
+    /// in plan order, its cell holding its entry, its body an alias of its slot stub.
+    fn lazy_slots(&mut self) -> Result<(), LinkError> {
+        let Some(lazy) = self.lazy else { return Ok(()) };
+        let region = self.sym(SymKey::LazyStubs);
+        let hook = self.sym_name(blaze_lazy::hook::SYMBOL);
+        let cell = Fixup { at: u64::from(blaze_lazy::stub::CELL), apply: Apply::Rel64, target: hook, addend: 0, minus: None };
+        let fixups = self.fixup_slice([cell]);
+        let bytes: &'a [u8] = &lazy.bytes;
+        let mut piece = self.piece(region, &Class::Stubs, crate::lazy::REGION_ALIGN, bytes.len() as u64, fixups, What::Fixed);
+        piece.rank = 1;
+        let id = self.make(&piece, Content::Bytes(bytes));
+        // Interned once per lazy function, at the image's first link.
+        for (at, key) in lazy.keys.iter().enumerate() {
+            let function = self.symbols.id(&key.0);
+            let slot = self.sym(SymKey::Slot(function));
+            let entry = self.sym(SymKey::LazyEntry(function));
+            let body = self.sym(SymKey::Body(function));
+            self.new_slot(slot, *key)?;
+            let offset = u64::from(lazy.layout.entry(blaze_lazy::LazyId(at as u32)));
+            self.define(entry, Def::Piece { piece: id, offset });
+            self.define(body, Def::Alias(slot));
+            self.cell(slot, entry);
+        }
+        Ok(())
+    }
+
+    /// Whether `body` is a lazy function's: only those are an alias of a slot stub.
+    fn is_lazy(&self, body: Sym) -> bool {
+        self.lazy.is_some()
+            && matches!(self.new.def(body), Def::Alias(to) if matches!(self.symbols.key(to), SymKey::Slot(_)))
+    }
+
+    /// A lazy image's hook, which its stubs call ([`blaze_lazy::hook::SYMBOL`]), resolved to
+    /// code in the image: an error naming it otherwise.
+    pub fn lazy_hook(&self) -> Result<(), LinkError> {
+        if self.lazy.is_none() {
+            return Ok(());
+        }
+        let hook = self.symbols.find_name(blaze_lazy::hook::SYMBOL).and_then(|it| self.symbols.find(SymKey::Name(it)));
+        if hook.is_some_and(|it| self.new.home(it).is_some()) {
+            return Ok(());
+        }
+        Err(error(
+            None,
+            // alloc: error path
+            format!(
+                "a lazy image without `{}`, the hook its lazy stubs call: link blaze-lazy's `hook` into it",
+                crate::lazy::hook_name(self.output.format)
+            ),
+        ))
     }
 
     fn add_function(&mut self, function: &'a CompiledFunction, syms: &[Sym]) -> Result<(), LinkError> {

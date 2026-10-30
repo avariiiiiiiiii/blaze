@@ -4,7 +4,8 @@
 //! the daemon reads in place.
 //!
 //! Pair `n` is the 16 bytes at `16 * n` from the reservation's start, given to instance keys in
-//! the order first seen ([`pair`]) and kept in the image's state ([`crate::state::Pairs`]). A
+//! the order first seen ([`pair`]; the lazy placer's from the top, [`placed_pair`]) and kept in
+//! the image's state ([`crate::state::Pairs`]). A
 //! pair is never freed or given to another key while the image lives: a removed function's
 //! code, or a tier-up's old code, may still be running in a thread and adding to it. The
 //! reservation has no file bytes and is zero when mapped, so nothing writes the pairs.
@@ -30,6 +31,18 @@ pub(crate) fn capacity(output: &Output) -> u32 {
 /// Counting code in an image that is not a dev run, and a dev run whose cells are all given
 /// out, are errors naming `key`.
 pub(crate) fn pair(output: &Output, state: &mut State, id: IdNo, key: &InstanceKey) -> Result<u32, LinkError> {
+    give(output, state, id, key, false)
+}
+
+/// [`pair`] for the lazy placer ([`crate::lazy`]), which places functions while a stage may be
+/// in flight on a copy of the state: a new pair is the next from the top of the cells, never
+/// one a stage gives from the bottom, and the commit of that stage carries it over
+/// ([`crate::Image::commit`]). A key has one pair whichever gave it.
+pub(crate) fn placed_pair(output: &Output, state: &mut State, id: IdNo, key: &InstanceKey) -> Result<u32, LinkError> {
+    give(output, state, id, key, true)
+}
+
+fn give(output: &Output, state: &mut State, id: IdNo, key: &InstanceKey, placed: bool) -> Result<u32, LinkError> {
     if let Some(pair) = state.pairs.of(id) {
         return Ok(pair);
     }
@@ -42,7 +55,7 @@ pub(crate) fn pair(output: &Output, state: &mut State, id: IdNo, key: &InstanceK
         });
     };
     let capacity = capacity(output);
-    if state.pairs.given() >= capacity {
+    if state.pairs.given() + state.pairs.placed() >= capacity {
         return Err(LinkError {
             function: Some(*key),
             // alloc: error path
@@ -53,7 +66,7 @@ pub(crate) fn pair(output: &Output, state: &mut State, id: IdNo, key: &InstanceK
             ),
         });
     }
-    Ok(state.pairs.give(id))
+    Ok(if placed { state.pairs.give_placed(id, capacity) } else { state.pairs.give(id) })
 }
 
 /// The byte offset of pair `pair` from the cells reservation's start.

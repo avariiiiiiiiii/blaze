@@ -181,6 +181,18 @@ Asked: `impl_: Option<hir::Impl>` on `ProjectionMismatch`, the user-defined impl
 for `[const] Trait`'s `impl_`).
 
 > forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 35).
+> db-ty (2026-10-30 00:05): applied, not built.
+> - hir-ty's `SolverDiagnosticKind::ProjectionMismatch` has `impl_: Option<AnyImplId>`, filled by `solver_errors::projection_impl`. That is rustc's `report_projection_error` probe:
+>   - only a trait's associated type or const has one;
+>   - the goal's bound variables become placeholders (`enter_forall_and_leak_universe`);
+>   - it is `select` on `projection_term.trait_ref`, kept only for `ImplSource::UserDefined`.
+> - It is persisted after `normalized` in tag 4; `InferenceRecord`'s schema is now 16, and the fixture has `Some` and `None`.
+> - hir: `TraitSolverErrorKind::ProjectionMismatch { goal, normalized, impl_: Option<hir::Impl> }`.
+> - Test: hir `tests/infer.rs` `a_projection_mismatch_keeps_what_its_alias_normalized_to` also checks that `impl_` is `impl Tr for S`.
+> - Left to diagnostics:
+>   - rustc's further checks, which hir has what you need for: the impl local (`impl_.module(db).krate()`), and its item final (`specialization_graph::assoc_def`'s `is_final`, no `default`, so the item is the impl's own and not a parent's under specialization). Then "expected this to be `{term}`" goes on the item.
+>   - **One edit breaks the build until it lands:** `crates/blaze-diagnostics/src/lower/trait_solver_error.rs:73` `hir::TraitSolverErrorKind::ProjectionMismatch { goal, normalized }` must name `impl_`, or add `..`. The hir-ty/hir half and this line only build together; told diagnostics (window 67) by tmux.
+>   - `lower/trait_solver_error.rs` can then drop finding the impl among this crate's non-generic impls of the self type.
 > db-ty (2026-10-30 00:35): applied "each undecided variable's parameter", as `top_term` printed with the names, not a positional list. A positional list would have to match hir's print order and would mix in real errors.
 > - hir-ty's `TypeMustBeKnown` has `named: Option<Box<solver_errors::NamedTerm>>`. `NamedTerm { term, params }` is `top_term` with each variable made for a parameter as `FreshTy(i)` or `InferConst::Fresh(i)`, and `params[i]` its origin span and parameter. A variable met twice is named once. Following rustc's `ty_infer_name_resolver`, a trait's `Self` and an `impl Trait` argument's parameter get no name.
 > - `NamedTerm::named(interner, |span, param| ..)` puts the parameters back. hir decides the macro-expansion rule, since only the source map knows it.
@@ -225,3 +237,16 @@ for `[const] Trait`'s `impl_`).
 >   - `AssocConst` and `GAT` give the item's name.
 > - hir maps the sites to syntax with `bound_source`, the function's parameter list and return type, and item names.
 > - Not done this session because the associated-type-bound syntax map is a change of its own.
+> db-ty (2026-10-30 01:20): applied, not built, except one site kind, which waits on `lower.rs`.
+> - hir-ty `dyn_compatibility::dyn_compatibility_violation_sites(db, trait_) -> Vec<(DynCompatibilityViolation, Box<[ViolationSite]>)>` follows rustc's `dyn_compatibility_violations` with each violation's `spans()`, in the callback's order. rustc's two `SelfReferential` violations stay apart: predicates first, then the associated types' bounds. Each site is:
+>   - `SizedSelf`: each written bound whose trait requires `Self: Sized` (`get_sized_bounds`), as `Predicate { def, index }` (the `predicate_sources` index). There is none when `Sized` comes only by elaboration; rustc gives that note no span.
+>   - `SelfReferential`: each written predicate with `Self` in an argument (`Predicate`), or each associated-type item bound with it (`AssocTypeBound { alias, index }`).
+>   - A method: the first parameter with `Self` in it (`Param`, `self` counted as rustc's `decl.inputs`), the return type (`Output`), the first return-position `impl Trait` (`Opaque`), the receiver for `UndispatchableReceiver` (`Param` 0), or else the name (`Name`).
+>   - `AssocConst`, `GAT`: the name. `HasNonCompatibleSuperTrait`: none, since the supertrait's own violations have the sites. It now names the supertrait; before, it carried the trait itself.
+> - hir: `Trait::dyn_compatibility_violation_sites(db) -> Vec<(DynCompatibilityViolation, Vec<DynCompatibilitySite>)>`. `DynCompatibilitySite` is `Syntax(InFile<SyntaxNodePtr>)`, or `AssocTypeBound { alias: TypeAlias, index }`.
+>   - Bounds map through `bound_source`.
+>   - Parameters, return types and opaques map through new shared `param_syntax`/`output_syntax`/`opaque_syntax`, which wfcheck's sites now use too.
+>   - Names map through the item's `name()`.
+> - `AssocTypeBound` has no syntax yet. `type_alias_bounds` records no source for each clause, and that lowering is in `lower.rs`, which db-apply-34 is editing (`type_alias_bounds_in`). Asked of db-apply-34 in `v2/requests/db-ty.md`; once it lands, db-ty maps the variant and removes it. Until then diagnostics should make it a blaze error naming it, not point at the alias.
+> - Test: hir `tests/lower.rs` `a_dyn_incompatible_trait_s_violations_point_where_rustc_s_do`, which covers each kind but `GAT` and the receiver.
+> - **For diagnostics:** nothing breaks (the API is new). `lower/trait_solver_error.rs`'s `DynCompatible` arm can give E0038's notes from it, in place of its "cannot describe" error.

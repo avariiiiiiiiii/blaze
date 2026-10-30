@@ -338,11 +338,14 @@ fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Resul
             _ => SymbolKind::Data,
         }
     };
+    // alloc: the reference walk, for tests and the fuzz differential only
     let mut out = Vec::new();
     let mut visited = rustc_hash::FxHashSet::default();
+    // alloc: the reference walk, for tests and the fuzz differential only
     let mut stack = vec![(0usize, Vec::new())];
     while let Some((node, prefix)) = stack.pop() {
         if !visited.insert(node) {
+            // alloc: the reference walk's error
             return Err(format!("node {node:#x} is reached twice (a cycle)"));
         }
         let mut r = Reader::starting_at(data, node).map_err(trie_error)?;
@@ -351,10 +354,13 @@ fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Resul
             let info = usize::try_from(terminal)
                 .ok()
                 .and_then(|it| r.take(it).ok())
+                // alloc: the reference walk's error
                 .ok_or_else(|| format!("node {node:#x}'s export info runs past the end"))?;
+            // alloc: the reference walk's error
             let (kind, weak) = export(info, &classify).map_err(|what| format!("node {node:#x}: {what}"))?;
             out.push(Owned { name: super::core_name(&prefix)?, kind, weak });
         }
+        // alloc: the reference walk's error
         let count = r.u8().map_err(|_| format!("node {node:#x} runs past the end"))?;
         let mut children = Vec::with_capacity(usize::from(count));
         for _ in 0..count {
@@ -363,7 +369,9 @@ fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Resul
             let child = usize::try_from(child)
                 .ok()
                 .filter(|&it| it < data.len())
+                // alloc: the reference walk's error
                 .ok_or_else(|| format!("node {node:#x} has a child at {child:#x}, out of range"))?;
+            // clone: the reference walk's owned prefixes, which the real walk does without
             let mut name = prefix.clone();
             name.extend_from_slice(label);
             children.push((child, name));
@@ -376,6 +384,7 @@ fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Resul
 #[cfg(any(test, feature = "fuzz"))]
 fn test_sections() -> Vec<Section> {
     let code = macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
+    // alloc: sections for tests and the fuzz differential only
     vec![
         Section { addr: 0x4000, size: 0x100, flags: 0 },
         Section { addr: 0x1000, size: 0x100, flags: code },
@@ -396,13 +405,16 @@ pub(crate) fn trie_differential(trie: &[u8]) -> Result<bool, String> {
     let new = trie_exports(trie, 0, &sections, &mut names).map(|symbols| {
         symbols
             .iter()
+            // alloc: the fuzz differential only, to compare with the reference's owned names
             .map(|it| Owned { name: names.at(it.name).to_owned(), kind: it.kind, weak: it.weak })
+            // alloc: the fuzz differential only
             .collect::<Vec<_>>()
     });
     let old = reference_trie_exports(trie, 0, &sections);
     if new == old {
         Ok(new.is_ok())
     } else {
+        // alloc: the fuzz differential's failure message
         Err(format!("trie_exports: {new:?}\nthe reference: {old:?}"))
     }
 }

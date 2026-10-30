@@ -651,14 +651,12 @@ impl Threads {
         };
         let (id, _) = self.watches.insert(tag, Watching(watch));
         let (_, Watching(watch)) = self.watches.by_id_mut(id).expect("inserted above");
-        // SAFETY: the watch is in a slab entry, which never moves while it holds it, and it is
-        // stopped (`retire`, or in `Drop`) before it is taken out.
-        let started = unsafe {
-            match since {
-                None => watch.start(&self.shared.root, dir, tag).map(|()| None),
-                Some(since) => watch.journal(&self.shared.root, dir, since, tag),
-            }
+        let mut first = None;
+        let started = match since {
+            None => watch.start(&self.shared.root, dir, tag),
+            Some(since) => watch.journal(&self.shared.root, dir, since, tag, |it| first = Some(it)),
         };
+        let started = started.map(|()| first);
         match started {
             Ok(first) => {
                 self.in_flight += 1;
@@ -774,18 +772,10 @@ impl Threads {
 
     #[cfg(unix)]
     fn listen(&mut self, at: &crate::Address, tag: Tag) -> io::Result<()> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        use std::os::fd::{AsRawFd as _, OwnedFd};
         let listener = crate::net::listen(&self.shared.root, at)?;
-        let mut ends = [0; 2];
-        // SAFETY: two descriptors written by the call.
-        if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `pipe` succeeded, so `ends[0]` is a new descriptor nothing else owns; owned
-        // once, here.
-        let read_end = unsafe { OwnedFd::from_raw_fd(ends[0]) };
-        // SAFETY: as above, for `ends[1]`.
-        let write_end = unsafe { OwnedFd::from_raw_fd(ends[1]) };
+        let (read_end, write_end) = std::io::pipe()?;
+        let (read_end, write_end) = (OwnedFd::from(read_end), OwnedFd::from(write_end));
         crate::net::set_cloexec(read_end.as_raw_fd())?;
         crate::net::set_cloexec(write_end.as_raw_fd())?;
         listener.set_nonblocking(true)?;
@@ -998,9 +988,9 @@ struct Listening {
 #[cfg(unix)]
 impl Listening {
     fn stop(&self) {
-        use std::os::fd::AsRawFd as _;
-        // SAFETY: one byte to the pipe's write end.
-        unsafe { libc::write(self.stop.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        use std::os::fd::AsFd as _;
+        // A full pipe fails it, and is readable already: the stop is seen either way.
+        _ = crate::raw::write(self.stop.as_fd(), b"x");
     }
 }
 
@@ -1324,14 +1314,10 @@ fn accept_until_stopped(
             libc::pollfd { fd: listener.fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 },
         ];
-        // SAFETY: two pollfds of open descriptors.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return failed(error);
+        match crate::raw::poll(&mut fds, -1) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return failed(error),
         }
         if fds[1].revents != 0 {
             return Some(Done::Unlistened);
@@ -1365,7 +1351,7 @@ struct Watching {
 mod linux {
     use std::{
         io,
-        os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
+        os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd},
         sync::{Arc, Condvar, Mutex},
     };
 
@@ -1394,32 +1380,21 @@ mod linux {
         spare: Option<crate::watch::Spare>,
     }
 
-    fn eventfd() -> io::Result<OwnedFd> {
-        // SAFETY: no pointers; a descriptor of its own or -1.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the call returned a descriptor of its own.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    /// One added to an eventfd's count. A full count (2^64 - 2) fails with `EAGAIN`, which
+    /// still leaves it readable: the signal is seen either way.
+    fn signal(fd: BorrowedFd<'_>) {
+        _ = crate::raw::write(fd, &1u64.to_ne_bytes());
     }
 
-    fn signal(fd: RawFd) {
-        let one: u64 = 1;
-        // SAFETY: eight bytes to an eventfd.
-        unsafe { libc::write(fd, (&raw const one).cast(), 8) };
-    }
-
-    fn reset(fd: RawFd) {
-        let mut count = 0u64;
-        // SAFETY: eight bytes from a nonblocking eventfd, which resets it; nothing to read
-        // fails with EAGAIN and changes nothing.
-        unsafe { libc::read(fd, (&raw mut count).cast(), 8) };
+    /// An eventfd's count read, which resets it; nothing to read fails with `EAGAIN` and
+    /// changes nothing.
+    fn reset(fd: BorrowedFd<'_>) {
+        _ = crate::raw::read(fd, &mut [0; 8]);
     }
 
     impl Control {
         pub(super) fn new() -> io::Result<Arc<Control>> {
-            let (stop, wake) = (eventfd()?, eventfd()?);
+            let (stop, wake) = (crate::raw::eventfd()?, crate::raw::eventfd()?);
             // alloc: once per watch at once, kept for the next: room for a few flushes at once.
             let flushes = Vec::with_capacity(4);
             let state = State { flushes, open: false, started: None, spare: None };
@@ -1429,8 +1404,8 @@ mod linux {
 
         /// Ready for a watch: nothing signalled, nothing asked for.
         pub(super) fn reset(&self) {
-            reset(self.stop.as_raw_fd());
-            reset(self.wake.as_raw_fd());
+            reset(self.stop.as_fd());
+            reset(self.wake.as_fd());
             let mut state = lock(&self.state);
             state.flushes.clear();
             state.open = true;
@@ -1438,7 +1413,7 @@ mod linux {
         }
 
         pub(super) fn stop(&self) {
-            signal(self.stop.as_raw_fd());
+            signal(self.stop.as_fd());
         }
 
         /// Asks for a flush `tag`, which the errand answers: `false` once it ended.
@@ -1448,7 +1423,7 @@ mod linux {
                 return false;
             }
             state.flushes.push(tag);
-            signal(self.wake.as_raw_fd());
+            signal(self.wake.as_fd());
             true
         }
 
@@ -1538,18 +1513,14 @@ mod linux {
                 libc::pollfd { fd: stop, events: libc::POLLIN, revents: 0 },
                 libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
             ];
-            // SAFETY: three pollfds of open descriptors.
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
+            match crate::raw::poll(&mut fds, -1) {
+                Ok(_) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
                 // alloc: an error path.
-                return Some(Done::Failed(IoError(error.to_string())));
+                Err(error) => return Some(Done::Failed(IoError(error.to_string()))),
             }
             if fds[2].revents != 0 {
-                reset(wake);
+                reset(control.wake.as_fd());
                 // Drained, not taken: both lists keep their room, so a flush allocates nothing.
                 room.taken.extend(lock(&control.state).flushes.drain(..));
                 let mut gone = false;
@@ -1575,10 +1546,9 @@ mod linux {
             }
             if fds[0].revents != 0 {
                 let buffer = &mut room.buffer;
-                // SAFETY: the buffer has room for what is read.
-                let n = unsafe { libc::read(tree.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
-                if n > 0 {
-                    let done = shared.payload(|| heard(tree.take(&buffer[..n as usize])));
+                // A failed read is looked at again by the next poll, as one that read nothing.
+                if let Ok(n @ 1..) = tree.read(buffer) {
+                    let done = shared.payload(|| heard(tree.take(&buffer[..n])));
                     if !tell(done) {
                         return None;
                     }

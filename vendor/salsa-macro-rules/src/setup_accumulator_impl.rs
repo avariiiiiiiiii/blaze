@@ -19,6 +19,7 @@ macro_rules! setup_accumulator_impl {
         #[allow(dead_code)]
         const _: () = {
             use salsa::plumbing as $zalsa;
+            use $zalsa::ZalsaDatabase as _;
             use salsa::plumbing::accumulator as $zalsa_struct;
 
             impl $zalsa::HasJar for $Struct {

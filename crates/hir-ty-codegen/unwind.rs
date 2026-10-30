@@ -124,6 +124,7 @@ impl FunctionUnwind {
         let Some(code) = context.compiled_code() else { return Ok(None) };
         let frame = match SystemV::of(isa) {
             Some(systemv) => Frame::Rows(systemv.rows(code)?),
+            // alloc: the error's message
             None => match code.create_unwind_info(isa).map_err(|e| e.to_string())? {
                 Some(UnwindInfo::SystemV(info)) => Frame::Cranelift(info),
                 Some(UnwindInfo::WindowsX64(info)) => {
@@ -137,6 +138,7 @@ impl FunctionUnwind {
         for call_site in code.buffer.call_sites() {
             for handler in call_site.exception_handlers {
                 let FinalizedMachExceptionHandler::Tag(..) = handler else {
+                    // alloc: the error's message
                     return Err("unexpected exception handler".to_owned());
                 };
                 lands = true;
@@ -719,6 +721,7 @@ fn personality(module: &mut ObjectModule) -> Result<FuncId, String> {
     }
     let pointer = module.target_config().pointer_type();
     let signature = Signature {
+        // alloc: once per object, declaring the personality
         params: vec![
             AbiParam::new(types::I32),
             AbiParam::new(types::I32),
@@ -726,9 +729,11 @@ fn personality(module: &mut ObjectModule) -> Result<FuncId, String> {
             AbiParam::new(pointer),
             AbiParam::new(pointer),
         ],
+        // alloc: once per object, declaring the personality
         returns: vec![AbiParam::new(types::I32)],
         call_conv: module.target_config().default_call_conv,
     };
+    // alloc: the error's message
     module.declare_function(NAME, Linkage::Import, &signature).map_err(|e| e.to_string())
 }
 
@@ -762,6 +767,7 @@ impl UnwindContext {
         };
         let pcrel = gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
         cie.fde_address_encoding = pcrel;
+        // clone: once per object, the two entries differ in their personality
         let plain = frame_table.add_cie(cie.clone());
         cie.lsda_encoding = Some(pcrel);
 
@@ -787,6 +793,7 @@ impl UnwindContext {
         // It must not be zero-initialized: the unwinder cannot handle it being in `.bss`.
         let personality_ref = module
             .declare_data("DW.ref.rust_eh_personality", Linkage::Local, false, false)
+            // alloc: the error's message
             .map_err(|e| e.to_string())?;
         // A linker of AArch64 may put more than four gigabytes between the two.
         let distance = match module.isa().triple().architecture {
@@ -814,10 +821,12 @@ impl UnwindContext {
         let personality = personality(module)?;
         let mut data = DataDescription::new();
         data.define(
+            // alloc: once per object, the personality's pointer
             vec![0; usize::from(module.target_config().pointer_bytes())].into_boxed_slice(),
         );
         let func_ref = module.declare_func_in_data(personality, &mut data);
         data.write_function_addr(0, func_ref);
+        // alloc: the error's message
         module.define_data(personality_ref, &data).map_err(|e| e.to_string())
     }
 
@@ -847,14 +856,17 @@ impl UnwindContext {
             self.frame_table.add_fde(cies.plain, fde);
             return Ok(());
         };
+        // alloc: the error's message
         let lsda = module.declare_anonymous_data(false, false).map_err(|e| e.to_string())?;
         let mut data = DataDescription::new();
+        // clone: cranelift's data owns its bytes, and the caller keeps the `FunctionUnwind`
         data.define(landing_pads.clone().into_boxed_slice());
         // Mach-O has room for 255 sections and every custom one counts, so there the tables
         // lie with the constants, where the unwinder finds them as well.
         if module.isa().triple().binary_format != target_lexicon::BinaryFormat::Macho {
             data.set_custom_section(".gcc_except_table");
         }
+        // alloc: the error's message
         module.define_data(lsda, &data).map_err(|e| e.to_string())?;
         fde.lsda = Some(address_for_data(lsda));
 
@@ -865,6 +877,7 @@ impl UnwindContext {
     pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<(), String> {
         self.seh.emit(product)?;
         let mut eh_frame = EhFrame::from(WriterRelocate::new());
+        // alloc: the error's message
         self.frame_table.write_eh_frame(&mut eh_frame).map_err(|e| e.to_string())?;
         if eh_frame.0.writer.slice().is_empty() {
             return Ok(());
@@ -907,6 +920,7 @@ impl UnwindContext {
                         addend: offset as i64 + reloc.addend,
                     },
                 )
+                // alloc: the error's message
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -931,6 +945,7 @@ struct WriterRelocate {
 
 impl WriterRelocate {
     fn new() -> Self {
+        // alloc: empty, allocates nothing; once per object's `.eh_frame`
         WriterRelocate { relocs: Vec::new(), writer: EndianVec::new(RunTimeEndian::Little) }
     }
 }

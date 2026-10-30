@@ -606,6 +606,76 @@ fn main() {
     );
 }
 
+const CXCHG: &str = r#"
+#[rustc_intrinsic]
+unsafe fn atomic_cxchg_seqcst_acquire<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+"#;
+
+/// The atomic accesses of `x`'s address in a program whose `main` makes `p = &raw mut x`.
+fn atomics_of(events: &[Event]) -> Vec<Event> {
+    let raw = made(events, TyClass::RawPtr, RetagMode::Raw);
+    events
+        .iter()
+        .filter(|it| match **it {
+            Event::Read { addr, access: Access::Atomic { .. }, .. }
+            | Event::Write { addr, access: Access::Atomic { .. }, .. }
+            | Event::AtomicStore { addr, .. } => addr == raw.to,
+            _ => false,
+        })
+        .copied()
+        .collect()
+}
+
+/// Miri's `atomic_compare_exchange_scalar`: a failed compare-exchange is one load at the failure
+/// ordering, of the latest store, and writes nothing. The race checker's `failed_cxchg` sees it
+/// alone, not after a read of the read-modify-write.
+#[test]
+fn a_failed_compare_exchange_is_one_read_at_the_failure_ordering() {
+    let events = record(&format!(
+        "{CXCHG}
+fn main() {{
+    let mut x = 1u32;
+    let p = &raw mut x;
+    let _ = unsafe {{ atomic_cxchg_seqcst_acquire(p, 5, 2) }};
+}}
+"
+    ));
+    let failed = Access::Atomic { ord: AtomicOrd::Acquire, rmw: true, cxchg_failed: true };
+    let atomics = atomics_of(&events);
+    assert!(
+        matches!(atomics[..], [Event::Read { size: 4, access, .. }] if access == failed),
+        "{atomics:#?}"
+    );
+}
+
+/// A compare-exchange that exchanges is a read-modify-write at its success ordering: one read,
+/// then the write and its `atomic_store`.
+#[test]
+fn a_compare_exchange_that_exchanges_is_one_rmw() {
+    let events = record(&format!(
+        "{CXCHG}
+fn main() {{
+    let mut x = 1u32;
+    let p = &raw mut x;
+    let _ = unsafe {{ atomic_cxchg_seqcst_acquire(p, 1, 2) }};
+}}
+"
+    ));
+    let rmw = Access::Atomic { ord: AtomicOrd::SeqCst, rmw: true, cxchg_failed: false };
+    let atomics = atomics_of(&events);
+    assert!(
+        matches!(
+            atomics[..],
+            [
+                Event::Read { size: 4, access: read, .. },
+                Event::Write { size: 4, access: write, .. },
+                Event::AtomicStore { ord: AtomicOrd::SeqCst, .. },
+            ] if read == rmw && write == rmw
+        ),
+        "{atomics:#?}"
+    );
+}
+
 #[test]
 fn references_are_retagged_by_how_they_are_made() {
     let events = record(

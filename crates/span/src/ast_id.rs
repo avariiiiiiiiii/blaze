@@ -42,8 +42,7 @@ use blaze_ids::{bits::BitArray, radix};
 use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use syntax::{
-    AstNode, AstPtr, FlatTree, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize, ast,
-    view::NodeId,
+    AstNode, AstPtr, FlatTree, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast, view::NodeId,
 };
 
 // The first index is always the root node's AstId
@@ -625,7 +624,7 @@ register_assoc_item_ast_id! {
     TypeAlias = |it| it.name()
 }
 
-/// Maps items' `SyntaxNode`s to `ErasedFileAstId`s and back.
+/// Maps items' nodes to `ErasedFileAstId`s and back.
 ///
 /// The ids of what is outside fn bodies are made with the map. Each body's are made when
 /// something in it is first asked about, from the tree the map keeps of it, so a map of an
@@ -1239,21 +1238,7 @@ fn shared(node: syntax::view::Node<'_>) -> (&Arc<FlatTree>, u32) {
     }
 }
 
-/// A cursor's tree and its number there, as [`shared`] gives a view's.
-#[inline]
-fn flat_of(node: &SyntaxNode) -> (&Arc<FlatTree>, u32) {
-    node.flat().expect("a flat tree")
-}
-
 impl AstIdMap {
-    /// [`AstIdMap::from_view`] of a cursor of the file's root.
-    pub fn from_source(node: &SyntaxNode) -> AstIdMap {
-        assert!(node.parent().is_none());
-        let (tree, at) = flat_of(node);
-        debug_assert_eq!(at, 0, "a root is its tree's first element");
-        AstIdMap::from_view(syntax::view::Node::root(tree))
-    }
-
     /// The map of the file whose root is `root`. A view is made only of an item, to name it,
     /// and a fn's body is not walked into, but kept to be walked when asked about.
     pub fn from_view(root: syntax::view::Node<'_>) -> AstIdMap {
@@ -1309,21 +1294,6 @@ impl AstIdMap {
         let by_start = Index::new(entries.len(), |it| entries[it][START]);
         let by_id = Index::new(entries.len(), |it| entries[it][ID]);
         AstIdMap { entries, by_start, by_id, bodies }
-    }
-
-    /// [`AstIdMap::relative_to_view`] of cursors.
-    pub fn relative_to(&self, node: &SyntaxNode, relative: &SyntaxNode) -> AstIdMap {
-        self.relative(flat_of(node), flat_of(relative), &[])
-    }
-
-    /// [`AstIdMap::relative_without_view`] of cursors.
-    pub fn relative_without(
-        &self,
-        node: &SyntaxNode,
-        relative: &SyntaxNode,
-        elided: &[SyntaxNodePtr],
-    ) -> AstIdMap {
-        self.relative(flat_of(node), flat_of(relative), elided)
     }
 
     /// The ids of the nodes of `node`, a node of the tree this map is of, as nodes of
@@ -1535,8 +1505,8 @@ impl AstIdMap {
         self.entries.iter().map(entry_ptr).chain(bodies)
     }
 
-    /// The node of `id`, when this map has it: a map [`AstIdMap::relative_to`] a node has only
-    /// the ids of what is in that node. The id of a node in a fn body walks that body if no
+    /// The node of `id`, when this map has it: a map [`AstIdMap::relative_to_view`] a node has
+    /// only the ids of what is in that node. The id of a node in a fn body walks that body if no
     /// one asked about it before.
     pub fn try_get_erased(&self, id: ErasedFileAstId) -> Option<SyntaxNodePtr> {
         if id.in_body() {
@@ -1569,9 +1539,9 @@ mod tests {
     use blaze_ids::rng::SplitMix64;
     use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
     use syntax::{
-        AstNode, AstPtr, Edition, FlatTreeBuilder, SourceFile, SyntaxKind, SyntaxNode,
-        SyntaxNodePtr, TextRange, TextSize, WalkEvent,
-        ast::{self, HasName},
+        AstNode, AstPtr, Edition, Parse, SourceFile, SyntaxKind, SyntaxNode, SyntaxNodePtr,
+        TextRange, TextSize, ast,
+        view::{self, AstNode as _, HasName as _},
     };
 
     use super::ErasedFileAstId;
@@ -1607,11 +1577,9 @@ static mut S: i32 = 0;
 const FOO: i32 = 0;
         "#,
             Edition::CURRENT,
-        )
-        .syntax_node();
-        let ast_id_map = AstIdMap::from_source(&syntax);
-        for node in syntax.preorder() {
-            let WalkEvent::Enter(node) = node else { continue };
+        );
+        let ast_id_map = AstIdMap::from_view(syntax.root());
+        for node in syntax.root().descendants() {
             if !matches!(
                 node.kind(),
                 SyntaxKind::EXTERN_CRATE
@@ -1632,7 +1600,7 @@ const FOO: i32 = 0;
             ) {
                 continue;
             }
-            let ptr = SyntaxNodePtr::new(&node);
+            let ptr = view::ptr(node);
             let ast_id = ast_id_map.erased_ast_id(ptr);
             let turn_back = ast_id_map.get_erased(ast_id);
             assert_eq!(ptr, turn_back);
@@ -1647,15 +1615,14 @@ fn foo() {}
 fn bar() {}
         "#,
             Edition::CURRENT,
-        )
-        .syntax_node();
-        let ast_id_map = AstIdMap::from_source(&syntax);
-        let fns = syntax.descendants().filter_map(ast::Fn::cast).collect::<Vec<_>>();
+        );
+        let ast_id_map = AstIdMap::from_view(syntax.root());
+        let fns = syntax.root().descendants().filter_map(view::Fn::cast).collect::<Vec<_>>();
         let [foo_fn, bar_fn] = fns.as_slice() else {
             panic!("not exactly 2 functions");
         };
-        let foo_fn_id = ast_id_map.ast_id(foo_fn);
-        let bar_fn_id = ast_id_map.ast_id(bar_fn);
+        let foo_fn_id = ast_id_map.ast_id_of_view::<ast::Fn>(*foo_fn);
+        let bar_fn_id = ast_id_map.ast_id_of_view::<ast::Fn>(*bar_fn);
         assert_ne!(foo_fn_id.raw.hash_value(), bar_fn_id.raw.hash_value(), "hashes are equal");
     }
 
@@ -1671,15 +1638,15 @@ fn bar() {
 }
         "#,
             Edition::CURRENT,
-        )
-        .syntax_node();
-        let ast_id_map = AstIdMap::from_source(&syntax);
-        let macro_calls = syntax.descendants().filter_map(ast::MacroCall::cast).collect::<Vec<_>>();
+        );
+        let ast_id_map = AstIdMap::from_view(syntax.root());
+        let macro_calls =
+            syntax.root().descendants().filter_map(view::MacroCall::cast).collect::<Vec<_>>();
         let [macro_call_foo, macro_call_bar] = macro_calls.as_slice() else {
             panic!("not exactly 2 macro calls");
         };
-        let macro_call_foo_id = ast_id_map.ast_id(macro_call_foo);
-        let macro_call_bar_id = ast_id_map.ast_id(macro_call_bar);
+        let macro_call_foo_id = ast_id_map.ast_id_of_view::<ast::MacroCall>(*macro_call_foo);
+        let macro_call_bar_id = ast_id_map.ast_id_of_view::<ast::MacroCall>(*macro_call_bar);
         assert_ne!(
             macro_call_foo_id.raw.hash_value(),
             macro_call_bar_id.raw.hash_value(),
@@ -1693,9 +1660,9 @@ fn bar() {
     fn entries_are_lent_root_first_in_the_walks_order() {
         let text: Arc<str> = "struct A;\nimpl T for A { fn b() { struct C; } }\nfn d() {}\n".into();
         let file = full_of(&text);
-        let map = AstIdMap::from_source(&file);
+        let map = AstIdMap::from_view(file.root());
         let entries = map.entries();
-        assert_eq!(super::entry_ptr(&entries[0]), SyntaxNodePtr::new(&file));
+        assert_eq!(super::entry_ptr(&entries[0]), view::ptr(file.root()));
         let kinds: Vec<SyntaxKind> = entries.iter().map(|it| super::entry_ptr(it).kind()).collect();
         let want = [
             SyntaxKind::SOURCE_FILE,
@@ -1721,28 +1688,27 @@ fn foo() {
 }
         "#,
             Edition::CURRENT,
-        )
-        .syntax_node();
-        let ast_id_map = AstIdMap::from_source(&syntax);
-        let block = syntax.descendants().find_map(ast::BlockExpr::cast).expect("no block");
-        assert!(ast_id_map.ast_id_for_block(&block).is_none());
+        );
+        let ast_id_map = AstIdMap::from_view(syntax.root());
+        let block = syntax.root().descendants().find_map(view::BlockExpr::cast).expect("no block");
+        assert!(ast_id_map.ast_id_for_block_view(block).is_none());
     }
 
-    fn outline_of(text: &Arc<str>) -> SyntaxNode {
-        SourceFile::parse_outline(text.clone(), Edition::CURRENT).syntax_node()
+    fn outline_of(text: &Arc<str>) -> Parse<SourceFile> {
+        SourceFile::parse_outline(text.clone(), Edition::CURRENT)
     }
 
-    fn full_of(text: &Arc<str>) -> SyntaxNode {
-        SourceFile::parse_shared(text.clone(), Edition::CURRENT).syntax_node()
+    fn full_of(text: &Arc<str>) -> Parse<SourceFile> {
+        SourceFile::parse_shared(text.clone(), Edition::CURRENT)
     }
 
     fn count(ids: &[(SyntaxNodePtr, ErasedFileAstId)], kind: SyntaxKind) -> usize {
         ids.iter().filter(|(ptr, _)| ptr.kind() == kind).count()
     }
 
-    /// The lazy bodies of `root`'s tree that are parsed.
-    fn parsed(root: &SyntaxNode) -> Vec<syntax::TextRange> {
-        let (tree, _) = root.flat().expect("a flat tree");
+    /// The lazy bodies of `parse`'s tree that are parsed.
+    fn parsed(parse: &Parse<SourceFile>) -> Vec<syntax::TextRange> {
+        let (tree, _) = parse.root().flat();
         tree.lazies().filter(|&it| tree.is_parsed(it)).map(|it| tree.range(it)).collect()
     }
 
@@ -1813,13 +1779,13 @@ fn foo() {
         for (path, text) in corpus() {
             let path = path.display();
             let full = full_of(&text);
-            let full_map = AstIdMap::from_source(&full);
+            let full_map = AstIdMap::from_view(full.root());
             let want = ids(&full_map);
             let distinct: FxHashSet<_> = want.iter().map(|&(_, id)| id).collect();
             assert_eq!(distinct.len(), want.len(), "{path}: two nodes have one id");
             let with_id: FxHashSet<_> = want.iter().map(|&(ptr, _)| ptr).collect();
-            for node in full.descendants() {
-                let ptr = SyntaxNodePtr::new(&node);
+            for node in full.root().descendants() {
+                let ptr = view::ptr(node);
                 if ErasedFileAstId::should_alloc(node.kind()).is_some() {
                     assert!(with_id.contains(&ptr), "{path}: {node:?} has no id");
                 }
@@ -1830,7 +1796,7 @@ fn foo() {
 
             for reverse in [false, true] {
                 let outline = outline_of(&text);
-                let map = AstIdMap::from_source(&outline);
+                let map = AstIdMap::from_view(outline.root());
                 assert!(parsed(&outline).is_empty(), "{path}: making the map parsed a body");
                 assert!(map == full_map, "{path}: the outline's map is not the full parse's");
                 assert_eq!(FxBuildHasher.hash_one(&map), FxBuildHasher.hash_one(&full_map));
@@ -1848,7 +1814,7 @@ fn foo() {
             }
 
             let outline = outline_of(&text);
-            let map = AstIdMap::from_source(&outline);
+            let map = AstIdMap::from_view(outline.root());
             std::thread::scope(|scope| {
                 for thread in 0..4 {
                     let (map, want) = (&map, &want);
@@ -1873,33 +1839,36 @@ fn foo() {
                 .into();
         let full = full_of(&text);
         let call = full
+            .root()
             .descendants()
-            .filter_map(ast::MacroCall::cast)
-            .find(|it| it.path().is_some_and(|it| it.syntax().to_string() == "n"))
+            .filter_map(view::MacroCall::cast)
+            .find(|it| it.path().is_some_and(|it| it.syntax().text() == "n"))
             .expect("`n!()`");
         let body = full
+            .root()
             .descendants()
-            .filter_map(ast::Fn::cast)
-            .find(|it| it.name().is_some_and(|it| it.syntax().to_string() == "b"))
+            .filter_map(view::Fn::cast)
+            .find(|it| it.name().is_some_and(|it| it.syntax().text() == "b"))
             .and_then(|it| it.body())
             .expect("`b`'s body")
             .syntax()
             .text_range();
+        let call_ptr = AstPtr::<ast::MacroCall>::of(call);
 
         let outline = outline_of(&text);
-        let map = AstIdMap::from_source(&outline);
-        let (tree, _) = outline.flat().expect("a flat tree");
+        let map = AstIdMap::from_view(outline.root());
+        let (tree, _) = outline.root().flat();
         assert_eq!(tree.lazies().count(), 3, "the bodies of `a`, `b` and `c`");
         assert!(parsed(&outline).is_empty());
-        let id = map.ast_id(&call);
+        let id = map.ast_id_for_ptr(call_ptr);
         assert!(id.erase().in_body());
         assert_eq!(parsed(&outline), [body], "asking for `n!()` parses `b`'s body alone");
-        assert_eq!(map.get(id), AstPtr::new(&call));
+        assert_eq!(map.get(id), call_ptr);
 
         // An id from another map of the same text finds its body by its slots.
         let again = outline_of(&text);
-        let map = AstIdMap::from_source(&again);
-        assert_eq!(map.get(id), AstPtr::new(&call));
+        let map = AstIdMap::from_view(again.root());
+        assert_eq!(map.get(id), call_ptr);
         assert_eq!(parsed(&again), [body]);
     }
 
@@ -1908,13 +1877,13 @@ fn foo() {
         let text: String =
             (0..5000).map(|i| format!("fn f{i}() {{ a!(); a!(); {{ b!(); }} }}\n")).collect();
         let text: Arc<str> = text.into();
-        let full_map = AstIdMap::from_source(&full_of(&text));
+        let full_map = AstIdMap::from_view(full_of(&text).root());
         let want = ids(&full_map);
         assert_eq!(count(&want, SyntaxKind::FN), 5000);
         assert_eq!(count(&want, SyntaxKind::MACRO_CALL), 3 * 5000);
         let distinct: FxHashSet<_> = want.iter().map(|&(_, id)| id).collect();
         assert_eq!(distinct.len(), want.len());
-        let map = AstIdMap::from_source(&outline_of(&text));
+        let map = AstIdMap::from_view(outline_of(&text).root());
         for &(ptr, id) in want.iter().rev() {
             assert_eq!(map.try_get_erased(id), Some(ptr));
         }
@@ -1925,19 +1894,20 @@ fn foo() {
         let text: Arc<str> =
             "struct A;\nimpl T for A {\n    fn c() { m!(); fn d() { n!() } }\n    fn e() {}\n}\n"
                 .into();
-        let full_map = AstIdMap::from_source(&full_of(&text));
+        let full_map = AstIdMap::from_view(full_of(&text).root());
         for file in [outline_of(&text), full_of(&text)] {
-            let map = AstIdMap::from_source(&file);
+            let map = AstIdMap::from_view(file.root());
             let anchor =
-                file.children().find(|it| it.kind() == SyntaxKind::IMPL).expect("the impl");
+                file.root().children().find(|it| it.kind() == SyntaxKind::IMPL).expect("the impl");
             let (start, range) = (anchor.text_range().start(), anchor.text_range());
             let anchor_text: Arc<str> = Arc::from(&text[range]);
             for relative_root in [outline_of(&anchor_text), full_of(&anchor_text)] {
                 let relative = relative_root
+                    .root()
                     .children()
                     .find(|it| it.kind() == SyntaxKind::IMPL)
                     .expect("the impl");
-                let relative_map = map.relative_to(&anchor, &relative);
+                let relative_map = map.relative_to_view(anchor, relative);
                 assert_eq!(relative_map.root().text_range(), relative.text_range());
                 let inside = ids(&full_map)
                     .into_iter()

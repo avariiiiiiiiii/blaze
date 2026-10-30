@@ -8,15 +8,13 @@ exclude = [
     "harness",
     # The standard library's own workspace (docs/toolchain.md).
     "library",
-    "vendor/proc-macro-srv",
-    "crates/proc-macro-srv/proc-macro-test/imp",
 ]
 resolver = "2"
 
 [workspace.metadata.blaze]
 experimental = ["sandboxed-tests"]
 
-# hir-ty-codegen's build script checks the pinned LLVM `nix develop` names (its `llvm` feature).
+# llvm-sys's build script (vendor/llvm-sys/pin.rs) checks the pinned LLVM `nix develop` names.
 [workspace.metadata.blaze.sandbox]
 build-script-env = ["LLVM_SYS_231_PREFIX"]
 
@@ -129,6 +127,7 @@ blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-ids = { path = "crates/blaze-ids" }
+blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
 blaze-items = { path = "crates/blaze-items" }
@@ -181,6 +180,9 @@ ra-ap-rustc_parse_format = { version = "0.166", default-features = false }
 ra-ap-rustc_index = { version = "0.166", default-features = false }
 # rustc's layout code, from the tag of the stable in `harness/toolchain`.
 rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
+# rustc's lexer at the commit of `harness/toolchain`, for proc-macro-srv.
+rustc_lexer = { path = "crates/rustc_lexer", version = "0.0.0" }
+unicode-properties = { version = "0.1.4", default-features = false }
 ra-ap-rustc_pattern_analysis = { version = "0.166", default-features = false }
 ra-ap-rustc_ast_ir = { version = "0.166", default-features = false }
 rustc_apfloat = "0.2.3"

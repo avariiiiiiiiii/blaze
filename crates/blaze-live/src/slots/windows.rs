@@ -8,7 +8,7 @@
 //! space for the switch's columns is reserved and committed with `VirtualAlloc`
 //! ([`Reserved`]).
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "the jump table's executable memory, protections and unwind registration")]
 
 use std::{
     ffi::c_void,

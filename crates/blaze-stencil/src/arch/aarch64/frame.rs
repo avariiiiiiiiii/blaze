@@ -163,7 +163,7 @@ pub(super) fn call_signature(func: &ir::Function, inst: ir::Inst) -> Option<ir::
 /// `tlv` thunk), as Cranelift's `ElfTlsGetAddr` and `MachOTlsGetAddr` are calls.
 fn makes_tls_call(func: &ir::Function, target: &Target, inst: ir::Inst) -> bool {
     let InstructionData::UnaryGlobalValue {
-        opcode: Opcode::TlsValue | Opcode::GlobalValue,
+        opcode: Opcode::TlsValue,
         global_value,
     } = func.dfg.insts[inst]
     else {

@@ -15,7 +15,7 @@ mod build;
 
 use cranelift_codegen::ir;
 
-use self::build::{Baked, build};
+use self::build::{Baked, OFFSET, build};
 use super::{
     host,
     rng::{Rng, edges},
@@ -24,7 +24,7 @@ use crate::{
     Target,
     code::{Code, Name},
     enc::Form,
-    shape::{self, Dst, Isa, Op, Shape, Src, Ty},
+    shape::{self, Disp, Dst, Isa, Op, Shape, Src, Ty},
     table::{
         Library, Variant,
         format::{self, HoleKind, Stencil},
@@ -253,11 +253,15 @@ fn bakeds(shape: Shape, budget: &Budget, rng: &mut Rng) -> Vec<Baked> {
         }
         Op::Shuffle => masks(budget.baked, rng).into_iter().map(|bytes| Baked { imms: [0; 3], bytes }).collect(),
         _ => {
-            let imms: Vec<usize> = (0..3).filter(|n| shape.srcs[*n] == Src::Imm).collect();
+            let mut imms: Vec<usize> = (0..3).filter(|n| shape.srcs[*n] == Src::Imm).collect();
+            let mut lists: Vec<Vec<i64>> = imms.iter().map(|n| imm_values(shape, *n, budget.baked, rng)).collect();
+            if let Some(offsets) = confined_offsets(shape) {
+                imms.push(OFFSET);
+                lists.push(offsets);
+            }
             if imms.is_empty() {
                 return vec![Baked::default()];
             }
-            let lists: Vec<Vec<i64>> = imms.iter().map(|n| imm_values(shape, *n, budget.baked, rng)).collect();
             combos(&lists, budget.baked, rng)
                 .into_iter()
                 .map(|picks| {
@@ -269,6 +273,17 @@ fn bakeds(shape: Shape, budget: &Budget, rng: &mut Rng) -> Vec<Baked> {
                 })
                 .collect()
         }
+    }
+}
+
+/// The offsets a confined access of `shape` is tried at, when its [`Disp`] adds one: both ends
+/// of `Lo12`'s range and an aligned one, and for `Imm32` one past 12 bits, a negative one and
+/// both ends of 32 bits (none of them `Lo12`'s, so AArch64 selects `Imm32` for each).
+fn confined_offsets(shape: Shape) -> Option<Vec<i64>> {
+    match shape.confined()?.1 {
+        Disp::Zero => None,
+        Disp::Lo12 => Some(vec![1, 8, 4095]),
+        Disp::Imm32 => Some(vec![0x1000, -8, i64::from(i32::MIN), i64::from(i32::MAX)]),
     }
 }
 
@@ -462,7 +477,7 @@ fn hole_problems(shape: Shape, stencil: &Stencil<'_>, a64: bool) -> Vec<String> 
                     | Op::Uload32x2
                     | Op::Sload32x2
                     | Op::StackAddr
-            ),
+            ) || confined_offsets(shape).is_some(),
             HoleKind::Next | HoleKind::Rodata => true,
             HoleKind::Target => info.branches,
             HoleKind::Trap | HoleKind::TrapOverflow => info.traps,
@@ -501,6 +516,9 @@ fn hole_problems(shape: Shape, stencil: &Stencil<'_>, a64: bool) -> Vec<String> 
     }
     if matches!(op, Op::Vconst | Op::Shuffle) {
         need(HoleKind::Const, "the 16-byte constant");
+    }
+    if confined_offsets(shape).is_some() {
+        need(HoleKind::Offset, "the confined access's offset");
     }
     if op == Op::Jump {
         need(HoleKind::Next, "the jump");
@@ -672,11 +690,15 @@ mod run {
     fn run_one(op: Op, built: &Built, exec: &Exec, set: &[[u8; 16]]) -> Option<String> {
         let args = args(&built.inputs, set);
         let reference = interpreted(op).then(|| interpret(&built.func, &args));
-        let traps = match &reference {
-            Some(Ok(Run::Trapped(_))) => true,
-            Some(Ok(Run::Returned(_))) => false,
-            _ => op.info().traps,
-        };
+        // A confined access whose stencil computes the wrong address faults: in a child, so
+        // only its shape fails.
+        let confined = matches!(op, Op::LoadConfined | Op::StoreConfined);
+        let traps = confined
+            || match &reference {
+                Some(Ok(Run::Trapped(_))) => true,
+                Some(Ok(Run::Returned(_))) => false,
+                _ => op.info().traps,
+            };
         let calls = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if traps {
                 (exec.values_forked(0, &args), exec.values_forked(1, &args))

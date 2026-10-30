@@ -10,12 +10,12 @@ impl From<bridge::PanicMessage> for crate::PanicMessage {
     }
 }
 
-pub(crate) struct ProcMacros(Vec<(bridge::client::Client, rustc_metadata::ProcMacroKind)>);
+/// A library's macros as blaze listed them: each one's client, kind and name, the name in
+/// the library, which is never unloaded.
+pub(crate) struct ProcMacros(Vec<(bridge::client::Client, ProcMacroKind, &'static str)>);
 
 impl ProcMacros {
-    pub(super) fn new(
-        macros: Vec<(bridge::client::Client, rustc_metadata::ProcMacroKind)>,
-    ) -> Self {
+    pub(super) fn new(macros: Vec<(bridge::client::Client, ProcMacroKind, &'static str)>) -> Self {
         ProcMacros(macros)
     }
 
@@ -32,11 +32,12 @@ impl ProcMacros {
     ) -> Result<TokenStream<S>, crate::PanicMessage> {
         let parsed_attributes = attribute.unwrap_or_default();
 
-        for (client, kind) in &self.0 {
+        for (client, kind, name) in &self.0 {
+            if *name != macro_name {
+                continue;
+            }
             match kind {
-                rustc_metadata::ProcMacroKind::CustomDerive { trait_name, .. }
-                    if trait_name.as_str() == macro_name =>
-                {
+                ProcMacroKind::CustomDerive | ProcMacroKind::Bang => {
                     let res = client.run1(
                         &bridge::server::SAME_THREAD,
                         S::make_server(call_site, def_site, mixed_site, tracked_env, callback),
@@ -45,16 +46,7 @@ impl ProcMacros {
                     );
                     return res.map_err(crate::PanicMessage::from);
                 }
-                rustc_metadata::ProcMacroKind::Bang { name } if name.as_str() == macro_name => {
-                    let res = client.run1(
-                        &bridge::server::SAME_THREAD,
-                        S::make_server(call_site, def_site, mixed_site, tracked_env, callback),
-                        macro_body,
-                        cfg!(debug_assertions),
-                    );
-                    return res.map_err(crate::PanicMessage::from);
-                }
-                rustc_metadata::ProcMacroKind::Attr { name } if name.as_str() == macro_name => {
+                ProcMacroKind::Attr => {
                     let res = client.run2(
                         &bridge::server::SAME_THREAD,
                         S::make_server(call_site, def_site, mixed_site, tracked_env, callback),
@@ -64,7 +56,6 @@ impl ProcMacros {
                     );
                     return res.map_err(crate::PanicMessage::from);
                 }
-                _ => continue,
             }
         }
 
@@ -73,16 +64,6 @@ impl ProcMacros {
     }
 
     pub(crate) fn list_macros(&self) -> impl Iterator<Item = (&str, ProcMacroKind)> {
-        self.0.iter().map(|(_client, kind)| match kind {
-            rustc_metadata::ProcMacroKind::CustomDerive { trait_name, .. } => {
-                (trait_name.as_str(), ProcMacroKind::CustomDerive)
-            }
-            rustc_metadata::ProcMacroKind::Bang { name, .. } => {
-                (name.as_str(), ProcMacroKind::Bang)
-            }
-            rustc_metadata::ProcMacroKind::Attr { name, .. } => {
-                (name.as_str(), ProcMacroKind::Attr)
-            }
-        })
+        self.0.iter().map(|(_client, kind, name)| (*name, *kind))
     }
 }

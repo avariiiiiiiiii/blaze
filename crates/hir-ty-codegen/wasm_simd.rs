@@ -38,6 +38,7 @@ use hir_ty::{
     next_solver::{ConstKind, Ty, TyKind},
 };
 use rustc_type_ir::inherent::IntoKind;
+use smallvec::SmallVec;
 
 use super::wasm::{self, Instruction};
 use super::{AbiScalar, Arch, CodegenError, FunctionCx, MEM, Result, return_slot};
@@ -388,15 +389,17 @@ impl<'db> FunctionCx<'_, 'db> {
                     let blob = self.valtree_blob(ty.as_ref(), value.value)?;
                     (blob.relocs.is_empty() && blob.fn_relocs.is_empty()).then_some(blob.bytes)
                 }
+                // alloc: once per `simd_shuffle`, its indices out of a const evaluated here
                 ConstKind::Unevaluated(named) => Some(self.eval_const(named)?.memory.to_vec()),
                 _ => None,
             },
+            // alloc: once per `simd_shuffle`, its indices
             OperandKind::Allocation { allocation } => Some(allocation.as_ref().memory.to_vec()),
             OperandKind::Copy(place) | OperandKind::Move(place)
                 if place.projection.as_slice().is_empty() =>
             {
                 let Some(from) = self.only_assignment(place.local) else { return Ok(None) };
-                self.constant_bytes(&from)?
+                self.constant_bytes(from)?
             }
             _ => None,
         })
@@ -404,7 +407,7 @@ impl<'db> FunctionCx<'_, 'db> {
 
     /// What a local is set to, when one statement of the body sets all of it and nothing else
     /// does: a const generic argument is moved to a local of its own first.
-    fn only_assignment(&self, local: LocalId) -> Option<Operand> {
+    fn only_assignment(&self, local: LocalId) -> Option<&'db Operand> {
         let body = self.body?;
         let mut assigned = body.basic_blocks.iter().flat_map(|(_, block)| {
             block.statements.iter().filter_map(move |it| match &it.kind {
@@ -415,7 +418,7 @@ impl<'db> FunctionCx<'_, 'db> {
         let (Some((to, Rvalue::Use(from))), None) = (assigned.next(), assigned.next()) else {
             return None;
         };
-        to.projection.as_slice().is_empty().then(|| from.clone())
+        to.projection.as_slice().is_empty().then_some(from)
     }
 
     /// Whether `operand` is a local that only one call sets, of `simd_splat` or of a function
@@ -767,6 +770,7 @@ impl<'db> FunctionCx<'_, 'db> {
                 let lane = lanes.lane.ty.bytes() as u8;
                 let mut by = 8;
                 while by >= lane {
+                    // alloc: the shuffle's mask, which the function's IR owns
                     let mask = self.builder.func.dfg.immediates.push(rotation(by).to_vec().into());
                     let bytes = self.vbitcast(types::I8X16, value);
                     let moved = self.builder.ins().shuffle(bytes, bytes, mask);
@@ -803,11 +807,10 @@ impl<'db> FunctionCx<'_, 'db> {
         if bytes.len() < count * 4 {
             return Ok(false);
         }
-        let indices: Vec<u64> = bytes
-            .chunks_exact(4)
-            .take(count)
-            .map(|it| u64::from(u32::from_le_bytes(it.try_into().expect("four bytes"))))
-            .collect();
+        let indices = &bytes[..count * 4];
+        let index = |at: usize| {
+            u64::from(u32::from_le_bytes(indices[at * 4..at * 4 + 4].try_into().expect("four bytes")))
+        };
         // The operands in pieces a vector each: 16 bytes, or 8 that are the low half of one.
         let piece = match lanes.bytes() {
             8 => 8,
@@ -821,18 +824,18 @@ impl<'db> FunctionCx<'_, 'db> {
             _ => return Ok(false),
         };
         let lane = u64::from(lanes.lane.ty.bytes());
-        if indices.iter().any(|&it| it >= 2 * lanes.count) {
+        if (0..count).any(|at| index(at) >= 2 * lanes.count) {
             return Ok(false);
         }
         // For each piece of the result, the pieces of the operands it takes bytes of and the
         // byte of those each of its bytes is.
-        let mut plans = Vec::new();
+        let mut plans: SmallVec<[(u64, SmallVec<[u64; 4]>, [u8; 16]); 4]> = SmallVec::new();
         for start in (0..out_bytes).step_by(out_piece as usize) {
-            let mut sources: Vec<u64> = Vec::new();
+            let mut sources: SmallVec<[u64; 4]> = SmallVec::new();
             let mut mask = [0u8; 16];
             for (at, byte) in mask.iter_mut().enumerate().take(out_piece as usize) {
                 let at = start + at as u64;
-                let from = indices[(at / lane) as usize] * lane + at % lane;
+                let from = index((at / lane) as usize) * lane + at % lane;
                 let source = from / piece;
                 let slot = match sources.iter().position(|&it| it == source) {
                     Some(slot) => slot,
@@ -851,7 +854,7 @@ impl<'db> FunctionCx<'_, 'db> {
         let (first, _) = self.operand(first)?;
         let (second, _) = self.operand(second)?;
         for (start, sources, mask) in plans {
-            let mut loaded = Vec::new();
+            let mut loaded: SmallVec<[Value; 4]> = SmallVec::new();
             for &source in &sources {
                 let operand = if source < per_operand { first } else { second };
                 let at = ((source % per_operand) * piece) as i32;
@@ -862,6 +865,7 @@ impl<'db> FunctionCx<'_, 'db> {
                 });
             }
             let (a, b) = (loaded[0], *loaded.get(1).unwrap_or(&loaded[0]));
+            // alloc: the shuffle's mask, which the function's IR owns
             let mask = self.builder.func.dfg.immediates.push(mask.to_vec().into());
             let value = self.builder.ins().shuffle(a, b, mask);
             if out_piece == 16 {
@@ -934,6 +938,7 @@ impl<'db> FunctionCx<'_, 'db> {
                     let at = at as u8;
                     *byte = (at / tb) * fb + at % tb;
                 }
+                // alloc: the shuffle's mask, which the function's IR owns
                 let mask = self.builder.func.dfg.immediates.push(mask.to_vec().into());
                 if to_bytes == 8 {
                     let x = self.builder.ins().load(types::I8X16, MEM, src, 0);

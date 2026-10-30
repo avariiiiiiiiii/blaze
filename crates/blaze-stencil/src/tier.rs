@@ -78,13 +78,12 @@ pub enum Tier {
 impl Tier {
     pub const ALL: [Tier; 3] = [Tier::Stencil, Tier::Cranelift, Tier::Llvm];
 
-    /// The backend that compiles it; `None` for tier 0, which is this crate's
-    /// (`Backend::Stencil`, codegen request `fastcompile-stencil 1`).
-    pub fn backend(self) -> Option<Backend> {
+    /// The backend that compiles it.
+    pub fn backend(self) -> Backend {
         match self {
-            Tier::Stencil => None,
-            Tier::Cranelift => Some(Backend::Cranelift),
-            Tier::Llvm => Some(Backend::Llvm { opt: 3 }),
+            Tier::Stencil => Backend::Stencil,
+            Tier::Cranelift => Backend::Cranelift,
+            Tier::Llvm => Backend::Llvm { opt: 3 },
         }
     }
 

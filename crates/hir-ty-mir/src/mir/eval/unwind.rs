@@ -23,7 +23,8 @@ use base_db::{Db, Crate};
 
 use super::{
     Address, BasicBlockId, Evaluator, Interval, IntervalAndTy, Locals, MirBody, MirEvalError,
-    MirSpan, Origin, Result, StackFrame, Then, from_bytes, machine::Machine, not_supported,
+    MirSpan, Origin, OwnedBytes, Result, StackFrame, Then, from_bytes, machine::Machine,
+    not_supported,
     word_bytes,
 };
 use crate::{
@@ -80,7 +81,7 @@ fn message(error: &MirEvalError<'_>) -> String {
         // clone: error path
         MirEvalError::Panic(message) => message.clone(),
         MirEvalError::InFunction(inner, _) => message(inner),
-        _ => String::new(),
+        _ => String::new(), // alloc: empty, allocates nothing
     }
 }
 
@@ -125,7 +126,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let func = frame.locals.body.owner.as_function()?;
                 Some((Either::Left(func), frame.span.0, frame.span.1))
             })
-            .collect()
+            .collect() // alloc: a panic's backtrace, error path
     }
 
     /// `error` came out of `frame` at `block`, of its statement `statement` or (`None`) its
@@ -403,7 +404,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let vtable = from_bytes!(usize, self.read_scalar(Interval::new(boxed.offset(size), size))?);
                 let message = self.payload_message(data, vtable)?;
                 let payload = Payload::Boxed { data, vtable };
-                self.unwinding = Some(Unwinding { payload, error: None, trace: Vec::new() });
+                self.unwinding = Some(Unwinding { payload, error: None, trace: Vec::new() }); // alloc: empty, allocates nothing
                 Err(MirEvalError::Panic(message))
             }
             // `fn __rust_panic_cleanup(exception: *mut u8) -> *mut (dyn Any + Send)`.
@@ -414,7 +415,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let size = self.ptr_size();
                 let cell = self.read_pointer(exception.interval.addr)?;
                 let data = self.read_pointer(cell)?;
-                let vtable = self.read_scalar(Interval::new(cell.offset(size), size))?.to_vec();
+                let vtable =
+                    OwnedBytes::from_slice(self.read_scalar(Interval::new(cell.offset(size), size))?);
                 self.write_pointer(destination.addr, data)?;
                 self.write_memory(destination.addr.offset(size), &vtable)?;
                 Ok(true)
@@ -434,7 +436,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let text = self.read_pointer(data)?;
             let len = from_bytes!(usize, self.read_scalar(Interval::new(data.offset(size), size))?);
             let bytes = self.read_memory(text, len)?;
-            return Ok(String::from_utf8_lossy(bytes).into_owned());
+            return Ok(String::from_utf8_lossy(bytes).into_owned()); // alloc: a panic's message, error path
         }
         // dyn: rustc's text for a payload that is no string, not a trait object
         Ok("Box<dyn Any>".to_owned())

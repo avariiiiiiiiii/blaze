@@ -37,6 +37,8 @@ fn output_at(arch: Arch, kind: OutputKind, minimum: u32) -> Output {
         windows_subsystem: false,
         dev_run: None,
         exec_log: false,
+        sanitize: blaze_codegen::settings::Sanitize::default(),
+        rpaths: Vec::new(),
         triple: match arch { Arch::X86_64 => "x86_64-apple-darwin", _ => "aarch64-apple-darwin" }.into(),
     }
 }

@@ -684,8 +684,6 @@ fn block(top: &Context, node: InFile<ast::Node<'_>>, it: ast::BlockExpr<'_>) -> 
 #[cfg(test)]
 pub(crate) mod tests {
     use blaze_alloc_count::assert_at_most;
-    use hir::Semantics;
-    use syntax::SyntaxNode;
 
     use super::*;
 
@@ -694,10 +692,9 @@ pub(crate) mod tests {
         let checked = crate::tests::checked(&format!("//- /main.rs crate:main\n{source}"));
         let db = &checked.db;
         hir::attach_db(db, || {
-            let sema = Semantics::new(db);
             let krate = hir::check::workspace_crates(db)[0];
             let frame = crate::tests::frame();
-            let cx = Cx::new(&sema, krate, checked.files(), &frame);
+            let cx = Cx::new(db, krate, checked.files(), &frame);
             let file = krate.root_module(db).definition_source_file_id(db);
             check(&cx, InFile::new(file, cx.root(file)));
         });
@@ -796,42 +793,26 @@ fn main() {}
         });
     }
 
-    /// The nodes from `node` up, through each macro expansion to its call, `node` first, as
-    /// handles: the walk [`up`] replaced, gathered whole.
-    fn ancestors(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<InFile<SyntaxNode>> {
-        let mut chain = Vec::new();
-        let (mut file, mut next) = (node.file_id, Some(node.value.clone()));
-        loop {
-            let node = match next.take() {
-                Some(it) => it,
-                None => {
-                    let Some(call) = file.macro_file() else { break };
-                    let call = call.loc(cx.db).to_node(cx.db);
-                    file = call.file_id;
-                    call.value
-                }
-            };
-            next = node.parent();
-            chain.push(InFile::new(file, node));
-        }
-        chain
-    }
-
-    /// The handle walk up gives the nodes the view walk does.
+    /// In a file with no macro call, the walk up is each node's chain of parents, `node` first,
+    /// all in the file, ending at the file's root.
     #[test]
-    fn the_handle_walk_up_is_the_view_walk() {
+    fn a_walk_up_in_a_file_is_the_parent_chain() {
         with_file(BLOCKS, |cx, root| {
-            let handles = cx.sema.parse_or_expand(root.file_id);
-            for (it, view) in handles.descendants().zip(root.value.descendants()) {
-                let handle = ancestors(cx, &root.with_value(it));
-                let key = |file, kind, range| (file, kind, range);
-                assert!(
-                    handle
-                        .iter()
-                        .map(|it| key(it.file_id, it.value.kind(), it.value.text_range()))
-                        .eq(up(cx, root.with_value(view)).map(|it| key(it.file_id, it.value.kind(), it.value.text_range())))
-                );
+            let mut compared = 0;
+            for node in root.value.descendants() {
+                let key = |file, it: ast::Node<'_>| (file, it.kind(), it.text_range());
+                let walk: Vec<_> = up(cx, root.with_value(node)).map(|it| key(it.file_id, it.value)).collect();
+                let mut parents = Vec::new();
+                let mut at = Some(node);
+                while let Some(it) = at {
+                    parents.push(key(root.file_id, it));
+                    at = it.parent();
+                }
+                assert_eq!(walk, parents, "at {node:?}");
+                assert_eq!(walk.last(), Some(&key(root.file_id, root.value)));
+                compared += 1;
             }
+            assert!(compared > 100, "the fixture has many nodes: {compared}");
         });
     }
 }

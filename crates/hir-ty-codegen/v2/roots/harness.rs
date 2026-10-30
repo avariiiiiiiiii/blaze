@@ -397,42 +397,50 @@ fn text(tests: &[Test], test_type: &str, digest: &str, fork_server: &str) -> Str
     );
     for (at, test) in tests.iter().enumerate() {
         let name = &test.name;
-        let ignore_message = match &test.ignore_message {
-            Some(it) => format!("::core::option::Option::Some({it:?})"),
-            None => "::core::option::Option::None".to_owned(),
-        };
-        let should_panic = match &test.should_panic {
-            None => "No".to_owned(),
-            Some(None) => "Yes".to_owned(),
-            Some(Some(it)) => format!("YesWithMessage({it:?})"),
-        };
         let ((start_line, start_col), (end_line, end_col)) = (test.start, test.end);
-        let testfn = match test.bench {
-            true => format!("test::StaticBenchFn(|b| test::assert_test_result(crate::{name}(b)))"),
-            false => format!("test::StaticTestFn(|| test::assert_test_result(crate::{name}()))"),
-        };
         _ = write!(
             text,
             "\n    const T{at}: test::TestDescAndFn = test::TestDescAndFn {{\n        \
              desc: test::TestDesc {{\n            \
              name: test::StaticTestName({name:?}),\n            \
              ignore: {ignore},\n            \
-             ignore_message: {ignore_message},\n            \
+             ignore_message: ",
+            ignore = test.ignore,
+        );
+        _ = match &test.ignore_message {
+            Some(it) => write!(text, "::core::option::Option::Some({it:?})"),
+            None => write!(text, "::core::option::Option::None"),
+        };
+        _ = write!(
+            text,
+            ",\n            \
              source_file: {file:?},\n            \
              start_line: {start_line}usize,\n            \
              start_col: {start_col}usize,\n            \
              end_line: {end_line}usize,\n            \
              end_col: {end_col}usize,\n            \
-             should_panic: test::ShouldPanic::{should_panic},\n            \
+             should_panic: test::ShouldPanic::",
+            file = test.file,
+        );
+        _ = match &test.should_panic {
+            None => write!(text, "No"),
+            Some(None) => write!(text, "Yes"),
+            Some(Some(it)) => write!(text, "YesWithMessage({it:?})"),
+        };
+        _ = write!(
+            text,
+            ",\n            \
              compile_fail: false,\n            \
              no_run: false,\n            \
              test_type: test::TestType::{test_type},\n        \
              }},\n        \
-             testfn: {testfn},\n    \
-             }};\n",
-            ignore = test.ignore,
-            file = test.file,
+             testfn: "
         );
+        _ = match test.bench {
+            true => write!(text, "test::StaticBenchFn(|b| test::assert_test_result(crate::{name}(b)))"),
+            false => write!(text, "test::StaticTestFn(|| test::assert_test_result(crate::{name}()))"),
+        };
+        text.push_str(",\n    };\n");
     }
     text.push_str("}\n");
     text

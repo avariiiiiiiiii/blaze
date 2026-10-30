@@ -574,6 +574,17 @@ impl<'a, 'db> Collect<'a, 'db> {
                 }
                 self.place(destination);
             }
+            // A `Call` whose destination is the caller's return place.
+            TerminatorKind::TailCall { func, args, .. } => {
+                self.operand(func, true);
+                if self.operand_has_params(func) {
+                    let func = self.ty_of(func);
+                    self.ops.push(Op::Call { func, intrinsic: None });
+                }
+                for operand in args.iter() {
+                    self.operand(operand, true);
+                }
+            }
         }
     }
 

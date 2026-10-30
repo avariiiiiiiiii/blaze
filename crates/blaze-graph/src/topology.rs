@@ -59,6 +59,7 @@ impl Topology {
     pub fn flat(count: usize) -> Topology {
         let count = u32::try_from(count).unwrap_or(u32::MAX);
         Topology {
+            // alloc: the pool's shape, once per pool
             cpus: (0..count).map(|id| Cpu { id, group: 0, socket: 0, node: 0, fast: true }).collect(),
         }
     }
@@ -71,6 +72,7 @@ impl Topology {
         let mut found = Vec::with_capacity(online.len());
         let mut capacities: FxHashMap<u32, u64> = FxHashMap::default();
         for &id in &online {
+            // alloc: a sysfs path, once per CPU per pool
             let cpu = root.join(format!("cpu{id}"));
             let cache = last_level(&cpu)?.map(|it| &it & &online);
             let cluster = cluster(&cpu, id, &online)?;
@@ -78,6 +80,7 @@ impl Topology {
                 (Some(cache), Some(cluster)) if cluster.len() < cache.len() => cluster,
                 (Some(cache), _) => cache,
                 (None, Some(cluster)) => cluster,
+                // clone: once per CPU per pool, setup
                 (None, None) => online.clone(),
             };
             share.insert(id);
@@ -93,6 +96,7 @@ impl Topology {
             found.push((id, share, socket.unwrap_or(0), node_of(&cpu)?));
         }
         let node: FxHashMap<u32, u32> =
+            // alloc: once per pool, setup
             found.iter().map(|&(id, _, _, node)| (id, node)).collect();
         let fastest = capacities.values().copied().max();
         // Groups are numbered in the order they are first met, so the map's order is never read.
@@ -101,6 +105,7 @@ impl Topology {
         for (id, share, socket, home) in found {
             // A cache shared across nodes is split by node: a group's memory is all local.
             let share: Vec<u32> =
+                // alloc: a group's key, once per CPU per pool
                 share.into_iter().filter(|it| node.get(it) == Some(&home)).collect();
             let next = u32::try_from(sets.len()).unwrap_or(u32::MAX);
             let group = *sets.entry(share).or_insert(next);
@@ -116,6 +121,7 @@ impl Topology {
     /// macOS's shape: for each performance level from the fastest, its CPUs and how many of
     /// them share an L2 (`hw.perflevel{N}.logicalcpu`, `hw.perflevel{N}.cpusperl2`).
     pub fn from_perflevels(levels: &[(u32, u32)]) -> Topology {
+        // alloc: the pool's shape, once per pool
         let (mut cpus, mut id, mut first_group) = (Vec::new(), 0u32, 0u32);
         for (level, &(logical, per_l2)) in levels.iter().enumerate() {
             let per_l2 = if per_l2 == 0 { logical.max(1) } else { per_l2 };
@@ -131,6 +137,7 @@ impl Topology {
 
     /// Only the CPUs of `allowed`, their groups numbered again.
     pub fn only(&self, allowed: &BTreeSet<u32>) -> Topology {
+        // alloc: the pool's shape, once per pool
         dense(self.cpus.iter().copied().filter(|it| allowed.contains(&it.id)).collect())
     }
 
@@ -146,8 +153,10 @@ impl Topology {
         for cpu in &self.cpus {
             place_of.entry(cpu.group).or_insert((cpu.socket, cpu.node));
         }
+        // alloc: empty, allocates nothing
         let Some(&(socket, node)) = place_of.get(&group) else { return Vec::new() };
         let mut rest: Vec<(u32, (u32, u32))> =
+            // alloc: a worker's steal order, once per worker per pool
             place_of.into_iter().filter(|&(it, _)| it != group).collect();
         // The key ends in the group id, which is unique: a total order, whatever the map's.
         radix::sort_copy_by_key(&mut rest, |&(it, (its_socket, its_node))| {
@@ -156,11 +165,13 @@ impl Topology {
                 | u128::from(radix::pack_32(it.abs_diff(group), it))
         });
         let rest = rest.into_iter().map(|(it, _)| it);
+        // alloc: a worker's steal order, once per worker per pool
         std::iter::once(group).chain(rest).collect()
     }
 
     /// The NUMA node of each group, by group id.
     pub fn nodes(&self) -> Vec<u32> {
+        // alloc: once per pool, setup
         let mut node_of = vec![0; self.groups() as usize];
         for cpu in &self.cpus {
             node_of[cpu.group as usize] = cpu.node;
@@ -188,6 +199,7 @@ fn detect() -> io::Result<Topology> {
     if only.cpus.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
+            // alloc: the error's message
             format!("the process's affinity mask {allowed:?} has no online CPU"),
         ));
     }
@@ -198,13 +210,17 @@ fn detect() -> io::Result<Topology> {
 fn detect() -> io::Result<Topology> {
     let say = |name: &str| {
         macos::sysctl(name).ok_or_else(|| {
+            // alloc: the error's message
             io::Error::new(io::ErrorKind::Unsupported, format!("sysctl {name} says nothing"))
         })
     };
     let levels = say("hw.nperflevels")?;
+    // alloc: once per pool, setup
     let mut shape = Vec::new();
     for level in 0..levels {
+        // alloc: a sysctl name, once per performance level per pool
         let logical = say(&format!("hw.perflevel{level}.logicalcpu"))?;
+        // alloc: a sysctl name, once per performance level per pool
         let per_l2 = say(&format!("hw.perflevel{level}.cpusperl2"))?;
         shape.push((logical, per_l2));
     }
@@ -250,6 +266,7 @@ fn last_level(cpu: &Path) -> io::Result<Option<BTreeSet<u32>>> {
         Err(why) if why.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(why) => return Err(at(&dir, why)),
     };
+    // alloc: once per CPU per pool, setup
     let mut indexes: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|why| at(&dir, why))?;
@@ -289,6 +306,7 @@ fn cluster(cpu: &Path, id: u32, online: &BTreeSet<u32>) -> io::Result<Option<BTr
 fn list(text: &str) -> io::Result<BTreeSet<u32>> {
     let number = |it: &str| {
         it.trim().parse::<u32>().map_err(|_| {
+            // alloc: the error's message
             io::Error::new(io::ErrorKind::InvalidData, format!("{it:?} is not a CPU number"))
         })
     };
@@ -301,6 +319,7 @@ fn list(text: &str) -> io::Result<BTreeSet<u32>> {
         if from > to {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
+                // alloc: the error's message
                 format!("{part:?} is a range that ends before it begins"),
             ));
         }
@@ -322,10 +341,14 @@ fn read_opt(path: &Path) -> io::Result<Option<String>> {
 }
 
 fn at(path: &Path, why: io::Error) -> io::Error {
+    // alloc: the error's message
     io::Error::new(why.kind(), format!("{}: {why}", path.display()))
 }
 
+/// The affinity calls: the kernel reads or writes a CPU mask through a pointer this passes,
+/// which only `libc`'s raw functions reach.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 pub(crate) mod linux {
     use std::{collections::BTreeSet, io, mem::size_of};
 
@@ -335,6 +358,7 @@ pub(crate) mod linux {
     pub(crate) fn affinity() -> io::Result<BTreeSet<u32>> {
         let mut words = 1024 / BITS;
         loop {
+            // alloc: the affinity mask, once per pool
             let mut mask: Vec<libc::c_ulong> = vec![0; words];
             // SAFETY: the kernel writes at most `words * size_of::<c_ulong>()` bytes of the mask,
             // which is what `mask` holds; a `cpu_set_t` is such words.
@@ -363,6 +387,7 @@ pub(crate) mod linux {
                 words *= 2;
                 continue;
             }
+            // alloc: the error's message
             return Err(io::Error::new(why.kind(), format!("sched_getaffinity: {why}")));
         }
     }
@@ -370,6 +395,7 @@ pub(crate) mod linux {
     /// Binds the calling thread to `cpu`.
     pub(crate) fn bind(cpu: u32) -> io::Result<()> {
         let cpu = cpu as usize;
+        // alloc: the affinity mask, once per worker start
         let mut mask: Vec<libc::c_ulong> = vec![0; (cpu / BITS + 1).max(1024 / BITS)];
         mask[cpu / BITS] |= 1 << (cpu % BITS);
         // SAFETY: the kernel reads `mask.len() * size_of::<c_ulong>()` bytes, which `mask` holds.
@@ -384,12 +410,15 @@ pub(crate) mod linux {
             Ok(())
         } else {
             let why = io::Error::last_os_error();
+            // alloc: the error's message
             Err(io::Error::new(why.kind(), format!("binding a worker to CPU {cpu}: {why}")))
         }
     }
 }
 
+/// `sysctlbyname`, which writes into a buffer this passes.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 pub(crate) mod macos {
     use std::{ffi::CString, mem::size_of, ptr};
 

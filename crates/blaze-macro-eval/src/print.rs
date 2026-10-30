@@ -100,7 +100,7 @@ pub(crate) enum Op {
 
 impl Op {
     /// rustc's `ToInternal` of a `Punct`.
-    fn of(ch: u8) -> Option<Op> {
+    pub(crate) fn of(ch: u8) -> Option<Op> {
         Some(match ch {
             b'=' => Op::Eq,
             b'<' => Op::Lt,

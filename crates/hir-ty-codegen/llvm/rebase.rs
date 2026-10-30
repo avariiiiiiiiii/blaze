@@ -9,6 +9,13 @@
 //! it is stays in memory (nbody's `delta`, summed through `iter()`). The lowering already
 //! takes a pointer plus any integer to be based on the pointer; this does so for what
 //! building in made of it, with `getelementptr i8, p, n` and `phi`s of pointers.
+//!
+//! Unsafe: the walk is over raw `LLVMValueRef`s, as a web of addresses mixes instructions with
+//! constant expressions (`ptrtoint @g`, `add` of one), which inkwell has no type for, and
+//! inkwell would classify every operand it hands back with a further call into LLVM. The one
+//! entry, [`rebase`], is safe: it takes a live `&Module` and keeps every handle inside the
+//! call. Each `unsafe fn` here says in `# Safety` which values must be live; the tests below
+//! check the rewrite against the IR it must give and leave what is not an address alone.
 
 use inkwell::{
     llvm_sys::{
@@ -29,6 +36,7 @@ use inkwell::{
     module::Module,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 /// The most integers one address is made of that are rewritten as pointers.
 const LARGEST: usize = 64;
@@ -102,10 +110,10 @@ enum Node {
 struct Web {
     nodes: FxHashMap<LLVMValueRef, Node>,
     /// In an order that has an operand before what is made of it, `phi`s aside.
-    order: Vec<LLVMValueRef>,
+    order: SmallVec<[LLVMValueRef; 16]>,
     /// The `phi`s, in the order [`Web::add`] met them: what is built for them is built in this
     /// order, never in `nodes`' (by address, so another each run).
-    phis: Vec<LLVMValueRef>,
+    phis: SmallVec<[LLVMValueRef; 4]>,
     addresses: usize,
     /// The type of every integer of the web: the one `inttoptr` takes.
     int: LLVMTypeRef,
@@ -131,8 +139,8 @@ impl Web {
         let int = unsafe { LLVMTypeOf(root) };
         let mut web = Web {
             nodes: FxHashMap::default(),
-            order: Vec::new(),
-            phis: Vec::new(),
+            order: SmallVec::new(),
+            phis: SmallVec::new(),
             addresses: 0,
             int,
         };
@@ -223,12 +231,9 @@ impl Web {
     ///
     /// Every value of the web is still a live value of its module.
     unsafe fn ordered(&self) -> bool {
-        let mut built: FxHashSet<LLVMValueRef> = self
-            .nodes
-            .iter()
-            .filter(|(_, node)| matches!(node, Node::Phi))
-            .map(|(&value, _)| value)
-            .collect();
+        let mut built: FxHashSet<LLVMValueRef> =
+            FxHashSet::with_capacity_and_hasher(self.nodes.len(), Default::default());
+        built.extend(self.phis.iter().copied());
         for &value in &self.order {
             let ready = match self.nodes[&value] {
                 Node::Address(_) | Node::Null | Node::Phi => true,

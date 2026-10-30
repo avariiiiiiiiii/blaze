@@ -480,8 +480,9 @@ writer has its own tests from hand-made `Placed` values. None was run.
 - The whole cells array (8 bytes per slot of capacity, about 512 KiB at the least capacity) is
   written on each incremental link of an image with a table; writing only changed entries is a
   smaller write the effects can already say.
-- A Mach-O object's `LC_LINKER_OPTION` libraries (`-lz`, `-framework X`) are neither put on
-  the line nor checked (ld64 follows them); link.md 25.
+- A Mach-O object's `-weak-lNAME` and `-weak_framework NAME` linker options are an error:
+  `NativeKind` has no weak library, so the writer can't emit `LC_LOAD_WEAK_DYLIB` for one
+  (link.md 25).
 - An archive member is pulled even when a shared library given earlier defines the name.
 - AArch64: no range-extension veneers; a call past ±128 MiB is an error naming it
   (`Class::Veneers` exists in the model but the core makes none).

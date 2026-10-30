@@ -163,6 +163,7 @@ integration; until then it must compile.)
 > `is_temporary_rvalue`, and the operand's answer in `drop_forget_useless.rs`
 > `can_have_side_effects`. No other exhaustive `Expr` match in blaze-diagnostics or
 > ide-diagnostics. Not built.
+> applied (requests, pass 41): `| ast::Expr::UnsafeBinderCastExpr(_)` after `IncludeBytesExpr` in the `cb(expr)` arm; the variant is generated now. No other exhaustive `ast::Expr` match in ide-db, hir-ide or test-fixture. Not built.
 
 ## 7. coordinator (`crates/blaze-fmt/src/parse/lower/expr.rs:274`): lower `UnsafeBinderCastExpr` as rustfmt's AST has it
 

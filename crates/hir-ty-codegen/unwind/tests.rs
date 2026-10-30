@@ -19,6 +19,7 @@ fn stencil<'a>(
         lines,
         traps: &[],
         slots: SlotsRef { base: 6, offsets: &[] },
+        frame: 0,
     }
 }
 

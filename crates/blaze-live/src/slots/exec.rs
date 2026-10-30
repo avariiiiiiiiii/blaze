@@ -18,7 +18,7 @@
 //! and unmarked ones still mark. So a slot first called before a switch keeps the target it
 //! copied, for the rest of the process.
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "the execution log's header and region, at the addresses the linker placed them")]
 
 use std::{
     ops::Range,

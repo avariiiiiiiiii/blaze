@@ -1,0 +1,25 @@
+{
+  "id": "00023",
+  "from_lane": "safety-fuzz-macrowasm",
+  "owner": "format",
+  "paths": [
+    "crates/tt/src/lib.rs",
+    "fuzz/corpus/macro_wasm_lex/suffix-256.hex",
+    "crates/tt"
+  ],
+  "what": "## From safety-fuzz-macrowasm (2026-10-29): `tt::Literal::new` panics on a suffix over 255 bytes\n\n`crates/tt/src/lib.rs:408` (and `:467`): `suffix_len: suffix.len().try_into().unwrap()` with\n`suffix_len: u8`. Any literal with a suffix of 256+ bytes panics. rustc lexes it, then reports\nan invalid suffix. It is reached from blaze-macro-wasm's lexer and wire reader, with any text\n`1` followed by 256 letters (usercode is told, item 6 of its request). Source code through\nsyntax-bridge may reach it too. Input: `fuzz/corpus/macro_wasm_lex/suffix-256.hex`.\nWhat: store a longer suffix (a `u16`/`u32` length, or the split kept in the symbol), or give\nthe callers a fallible constructor.\n\n> forwarded to format: `crates/tt/` is lane format's.",
+  "state": "open",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-29T23:57:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/format.md#From safety-fuzz-macrowasm (2026-10-29): `tt::Literal::new` panics on a suffix over 255 bytes",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:1080"
+    }
+  ]
+}

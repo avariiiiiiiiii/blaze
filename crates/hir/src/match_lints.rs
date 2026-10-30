@@ -9,7 +9,7 @@ use hir_def::{
     expr_store::{Body, BodySourceMap, ExprOrPatPtr},
     hir::{ExprId, PatId},
     item_scope::ImportId,
-    src::HasChildSource as _,
+    src::use_tree_sources_view,
 };
 use hir_expand::InFile;
 use hir_ide::{
@@ -19,8 +19,8 @@ use hir_ide::{
 use hir_ty_matchck::{self as matchck, LetAt, MatchError};
 use stdx::never;
 use syntax::{
-    AstNode, AstPtr, SyntaxNodePtr, TextRange,
-    ast::{self, HasName as _},
+    AstNode, AstPtr, SyntaxNodePtr, TextRange, ast,
+    view::{self, AstNode as _, HasName as _, Typed},
 };
 
 pub use hir_ty_matchck::{BindingOrigin, SpecialTy};
@@ -439,10 +439,13 @@ impl<'db> Syntax<'_, 'db> {
     }
 
     /// The node a pattern is the whole pattern of: a match arm, a `let` statement.
-    fn parent<N: AstNode>(&self, pat: InFile<AstPtr<ast::Pat>>) -> Option<InFile<AstPtr<N>>> {
-        let root = pat.file_syntax(self.db);
-        let parent = N::cast(pat.value.to_node(&root).syntax().parent()?)?;
-        Some(InFile::new(pat.file_id, AstPtr::new(&parent)))
+    fn parent<N: AstNode + Typed>(
+        &self,
+        pat: InFile<AstPtr<ast::Pat>>,
+    ) -> Option<InFile<AstPtr<N>>> {
+        let parent = pat.to_view(self.db).syntax().parent()?;
+        let parent = <N::Of<'_> as view::AstNode<'_>>::cast(parent)?;
+        Some(InFile::new(pat.file_id, AstPtr::of(parent)))
     }
 
     fn typo(&self, typo: &matchck::PatternTypo) -> Option<PatternTypo> {
@@ -462,8 +465,7 @@ impl<'db> Syntax<'_, 'db> {
             }
             &matchck::PatternTypo::PatternLetBinding(pat) => {
                 let pat = self.pat(pat)?;
-                let root = pat.file_syntax(self.db);
-                let ast::Pat::IdentPat(ident) = pat.value.to_node(&root) else { return None };
+                let view::Pat::IdentPat(ident) = pat.to_view(self.db) else { return None };
                 PatternTypo::PatternLetBinding(InFile::new(
                     pat.file_id,
                     ident.name()?.syntax().text_range(),
@@ -474,7 +476,7 @@ impl<'db> Syntax<'_, 'db> {
 
     /// The span rustc gives an import's ident: its rename, else its path's last segment.
     fn import_name(&self, import: ImportId) -> Option<InFile<TextRange>> {
-        let source = import.use_.child_source(self.db);
+        let source = use_tree_sources_view(self.db, import.use_);
         let tree = source.value.get(import.idx)?;
         let range = match tree.rename() {
             Some(rename) => rename.name()?.syntax().text_range(),

@@ -159,7 +159,11 @@ impl Backend {
     /// The producer the environment asks for, or what is wrong with what it asks.
     pub fn from_env() -> std::result::Result<Backend, String> {
         static SELECTED: OnceLock<std::result::Result<Backend, String>> = OnceLock::new();
-        SELECTED.get_or_init(Self::read_env).clone()
+        match SELECTED.get_or_init(Self::read_env) {
+            Ok(backend) => Ok(*backend),
+            // clone: the error's message
+            Err(why) => Err(why.clone()),
+        }
     }
 
     fn read_env() -> std::result::Result<Backend, String> {
@@ -168,6 +172,7 @@ impl Backend {
             Ok("1") => Passes::Less,
             Ok("2") | Err(_) => Passes::Default,
             Ok("3") => Passes::Aggressive,
+            // alloc: the error's message
             Ok(other) => return Err(format!("BLAZE_OPT={other}: expected 0, 1, 2 or 3")),
         };
         let selection = match std::env::var(SELECTION).as_deref() {
@@ -175,6 +180,7 @@ impl Backend {
             Ok("optimized") | Err(_) if passes != Passes::None => Selection::Optimized,
             Ok("optimized") | Err(_) => Selection::Fast,
             Ok(other) => {
+                // alloc: the error's message
                 return Err(format!("BLAZE_EMIT={other}: expected `fast` or `optimized`"));
             }
         };
@@ -183,8 +189,10 @@ impl Backend {
             Ok("cranelift") | Err(_) => Ok(Backend::Cranelift),
             Ok("llvm") if cfg!(feature = "llvm") => Ok(Backend::Llvm(optimization)),
             Ok("llvm") => {
+                // alloc: the error's message
                 Err(format!("BLAZE_BACKEND=llvm: blaze was built without `--features llvm`"))
             }
+            // alloc: the error's message
             Ok(other) => Err(format!("BLAZE_BACKEND={other}: expected `cranelift` or `llvm`")),
         }
     }
@@ -225,6 +233,7 @@ impl Backend {
                         tally.llvm.add(start.elapsed(), code.bytes.len());
                         return Ok(code);
                     }
+                    // alloc: the reason LLVM left a function to Cranelift, for the report
                     Err(unhandled) => tally.fell_back(start.elapsed(), &unhandled.to_string()),
                 }
             }
@@ -278,7 +287,8 @@ impl Backend {
             llvm::Unhandled,
             store::Store,
         };
-        let mut named: Vec<_> = recorder.named_slots().collect();
+        let mut named: smallvec::SmallVec<[cranelift_codegen::ir::StackSlot; 16]> =
+            smallvec::SmallVec::from_iter(recorder.named_slots());
         let shared = recorder
             .frame_locals
             .as_ref()
@@ -286,6 +296,7 @@ impl Backend {
         let func = shared.as_ref().unwrap_or(func);
         let imports = match super::imports::enabled() {
             true => super::imports::chosen(recorder),
+            // alloc: empty, allocates nothing
             false => Vec::new(),
         };
         // Not stored: the code is of the bodies imported too.
@@ -322,6 +333,7 @@ impl Backend {
         {
             Ok(code) => (StoredCode::of(&code, recorder, mark).map(LlvmEntry::Code), Ok(code)),
             Err(unhandled) => {
+                // alloc: the reason the store's entry keeps, of a function LLVM left
                 (Some(LlvmEntry::LeftToCranelift(unhandled.to_string())), Err(unhandled))
             }
         };
@@ -506,6 +518,7 @@ impl Registry {
                 return counts;
             }
         }
+        // alloc: once per thread, counts that are never freed
         let counts: &'static Counts = Box::leak(Box::new(Counts::new(true)));
         let mut link = &self.head;
         loop {
@@ -572,6 +585,7 @@ impl Held {
         // Cranelift times every pass of every function it compiles, with two reads of the
         // clock and a token for each, for the report `BLAZE_STATS` asks for alone.
         if !stats() {
+            // alloc: of no size, allocates nothing; once per thread
             drop(cranelift_codegen::timing::set_thread_profiler(Box::new(Untimed)));
         }
         Held(REGISTRY.claim())
@@ -599,6 +613,7 @@ struct Untimed;
 impl cranelift_codegen::timing::Profiler for Untimed {
     // dyn: cranelift's `Profiler::start_pass` returns `Box<dyn Any>`; a `()` is no allocation
     fn start_pass(&self, _: cranelift_codegen::timing::Pass) -> Box<dyn std::any::Any> {
+        // alloc: a `()` is of no size, which allocates nothing
         Box::new(())
     }
 }
@@ -673,6 +688,7 @@ impl Produced {
         let bytes = sums[self.0 + 2];
         (functions != 0).then(|| {
             let each = took / functions as u32;
+            // alloc: a line of the report, once per build
             format!("{functions} functions, {bytes} bytes, {took:.1?} ({each:.1?} each)")
         })
     }
@@ -703,6 +719,7 @@ impl Tally {
         let mut fallbacks = counts.fallbacks.lock().unwrap_or_else(|e| e.into_inner());
         match fallbacks.get_mut(reason) {
             Some(count) => *count += 1,
+            // alloc: once per distinct reason, the first time it is counted
             None => _ = fallbacks.insert(reason.to_owned(), 1),
         }
     }
@@ -720,6 +737,7 @@ impl Tally {
         let mut alone = counts.alone.lock().unwrap_or_else(|e| e.into_inner());
         match alone.get_mut(reason) {
             Some(count) => *count += functions,
+            // alloc: once per distinct reason, the first time it is counted
             None => _ = alone.insert(reason.to_owned(), functions),
         }
     }
@@ -777,16 +795,17 @@ impl Tally {
             Phase::ALL.map(|phase| Duration::from_nanos(sums[word::PHASES + phase as usize]));
         let (llvm, cranelift) = (self.llvm.take(&sums), self.cranelift.take(&sums));
         let large = sums[self.large.0];
-        let steps = Step::ALL.map(|(step, name)| {
-            let took = Duration::from_nanos(sums[word::STEPS + step as usize]);
-            format!("{name} {took:.1?}")
-        });
         let selected = Self::selected_llvm();
         let stats = stats();
         if !selected && !stats {
             return;
         }
         if stats {
+            let steps = Step::ALL.map(|(step, name)| {
+                let took = Duration::from_nanos(sums[word::STEPS + step as usize]);
+                // alloc: a line of the report, once per build
+                format!("{name} {took:.1?}")
+            });
             eprintln!("steps: {}", steps.join(", "));
             if let Some(passes) = passes {
                 eprint!("cranelift passes:\n{passes}");
@@ -794,7 +813,9 @@ impl Tally {
         }
         if let Some(llvm) = llvm {
             let phases = std::iter::zip(Phase::ALL, phases)
+                // alloc: a line of the report, once per build
                 .map(|(phase, took)| format!("{} {took:.1?}", format!("{phase:?}").to_lowercase()))
+                // alloc: a line of the report, once per build
                 .collect::<Vec<_>>()
                 .join(", ");
             eprintln!("backend: llvm compiled {llvm}: {phases}");

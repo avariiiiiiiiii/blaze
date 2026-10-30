@@ -18,7 +18,7 @@ pub(crate) struct Corpus {
     pub(crate) scratch: Option<String>,
     /// The `CARGO_HOME` the packages were fetched into and the build ran with.
     pub(crate) cargo_home: String,
-    /// The toolchain's proc-macro server, of `vendor/proc-macro-srv` for the pinned nightly.
+    /// The toolchain's own proc-macro server, of the pinned nightly.
     pub(crate) server: Option<String>,
     /// rustc's library of each proc-macro crate of the workspace by crate name
     /// (`serde_derive`), built by the pinned nightly's cargo.

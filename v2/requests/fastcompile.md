@@ -1028,6 +1028,7 @@ daemon publishes code only through link's placement.
 > forwarded to link.
 > queued by requests-link-next: after fastcompile-ident-select 9 (its placer publishes through that `publish`) and fastcompile-premap 1-2 (both edit `stage.rs`/`lib.rs`).
 > queued by requests (child requests-link-next): to its child requests-link-next-lazy (lazy 3 items 1-3 and stencil 3's arena half; lazy 3 item 4 filed to cargo). blaze-link now depends on blaze-lazy and implements `runner::Placer`.
+> applied by requests-link-next-lazy (2026-10-29), not built: items 1-3 in `crates/blaze-link/src/lazy.rs`, `stage.rs`, `lib.rs`, `counter.rs`, `state.rs` and `place.rs`. `Image::stage_lazy(change, &session, &stubs)` places the region as one `Class::Stubs` piece after the slot stubs (`SymKey::LazyStubs`). Each lazy function gets a slot in plan order whose cell holds its `Session::slots` entry, and its body is an alias of its slot stub, so `Target::Direct` reaches the stub too. The CELL is linked as a `Rel64` reference to `blaze_lazy_resolve`, and an image without it is an error naming it (`_blaze_lazy_resolve` on Mach-O). `LazyPlacer::new` stores the hook address there. `LazyPlacer` implements `runner::Placer`: it reserves arena space, writes into the shared memory, resolves relocations (an unplaced lazy callee goes to its slot stub), publishes, then stores the slot through `blaze_link::Slots` (blaze-live publish rule, never the log table); `replace` retires the old range behind the fence. Lazy cells never change, so `commit_into` and `roll_back_into` never name them. Addresses assume one slide for all run processes. Placing code with unwind info is refused with an error. Item 4, `Slots` and the one-slide launch are filed to cargo: requests.md, "From requests-link-next-lazy". Tests: `crates/blaze-link/src/tests/lazy.rs`.
 
 ## fastcompile-lazy 4: codegen: a "compile later" entry in the walk (`crates/blaze-codegen/src/driver.rs`, `Build::run`)
 
@@ -2016,6 +2017,7 @@ Why: tier-up (idea 13) reads the counts in place, with no sampler and no channel
 > queued by requests-link-next (pass 35): codegen's hold is gone (`Target::Counter(InstanceKey)` exists). It waits on blaze-link's own files: the counter pairs are a state column and a resolution in `stage.rs`'s `target_sym`, both held by the child requests-link-next-premap for fastcompile-premap 1-2 and sol-premap 2. It starts when that child is done. The `Image::stage` half comes first, and the arena placement's half with fastcompile-lazy 3.
 > applied by requests (child requests-link-next): the `Image::stage` half. A function's `Target::Counter(key)` relocations resolve to its pair, `16 * pair` from the start of the image's `Reserve::Cells` reservation plus the addend: one zero-sized piece `SymKey::Counters` at the reservation's start, the pair's offset folded into each fixup's addend (`stage.rs` `fixups`, `counter_cells`). Pairs are given first seen first by `counter::pair` (`src/counter.rs`, callable outside the stage), kept in `State::pairs` (a copy-on-write column per id shard), never freed, and carried across rollbacks so no other key gets one. Kinds: `PcRel32` (x86-64), `AdrpPage21`, `PageOffset12` (AArch64); any other is an error naming it, as are a dev run whose cells are all given out (saying how many), counting code in an image that is not a dev run, and cells named in data or by another function (all naming the function). `Image::counter(key)` is `memory.cells().offset + 16 * pair` of the code memory last committed into (`commit_into`, which refuses a memory whose cells part is smaller than `DevRun::cells`): the offset `CellView::load` and `tier::Counters::bind` take. Tests in `crates/blaze-link/src/tests/counter.rs` (x86-64 ELF and AArch64 Mach-O dev runs). Unbuilt. The lazy placement's half waits on fastcompile-lazy 3, which calls `counter::pair`.
 > queued by requests (child requests-link-next): to its child requests-link-next-lazy (lazy 3 items 1-3 and stencil 3's arena half; lazy 3 item 4 filed to cargo). blaze-link now depends on blaze-lazy and implements `runner::Placer`.
+> applied by requests-link-next-lazy (2026-10-29), not built: the arena placement half. `LazyPlacer` resolves a placed `Target::Counter` through `counter::placed_pair`, which returns the key's existing pair (the same pair a stage gives) or a new one from the top of the cells. Those pairs are carried into a commit staged before them (`Image::commit`/`commit_into`/`bytes`), so stage and placer never give the same pair. `Placer::cells` returns `Image::counter`. Tests: `crates/blaze-link/src/tests/lazy.rs`.
 
 ## fastcompile-stencil 4: proof: a backend axis in the corpus differential (`harness/v2/corpus.py`, `engine.py`)
 
@@ -3777,6 +3779,8 @@ Status: open
 > back from the store, a changed static value changes only its own, and dedupe's merged
 > function has none).
 
+> used by fastcompile-sol-premap, 2026-10-29, not built: the hit compares digests only. Functions and debug names are compared by index into `Built::digests` against the image's contents and DEBUG digests; statics are a three-way merge of `digests.statics`, the image's sorted STATICS section and the owned list. The cold path takes the same digests. Each key is checked against its piece, and a list out of line is an error (`split.rs` `misaligned`).
+
 ## fastcompile-sol-premap 2: link: write a shared output's segments into a buffer the caller gives (`crates/blaze-link/src/premap.rs`, the `Prelink` hook)
 
 What: a form of the prelink hook that writes each segment's bytes at a given offset of a
@@ -3796,6 +3800,9 @@ Status: open
 
 > forwarded to requests-link-next (it holds `crates/blaze-link`; on its list) (requests, pass 35).
 > applied by requests-link-next-premap, 2026-10-29 (not built). `blaze_link::premap::prelink_placed(&Request) -> Result<Placed, LinkError>` links, places and relocates without copying bytes out. `Placed.segments: Vec<SegmentPlace { addr, size, prot, len }>` (the first `len` bytes are the image's, then zeroes to `size`), and `Placed.linked` is every other field of `Prelinked`, with `segments` empty. `Placed::write_into(&self, out: &mut [u8], offsets: &[usize])` writes each segment's `len` bytes at its offset, in parallel across cores (1 MiB chunks). Gaps inside a segment are zeroed, and nothing else of `out` is touched. Offsets must be increasing, page multiples and inside `out`; anything else is an error naming the segment. The bytes-returning `prelink` stays because blaze-premap's `Link` still calls it; it is now `prelink_placed` then `Placed::into_prelinked`. For fastcompile: size the image from `Placed::segments` (`len` each, page-aligned, last), then call `write_into` on the image buffer in place of `image::encode` copying `Segment::bytes`. Once `Link` moves over, tell blaze-link and the bytes form goes. Test: `a_prelink_places_the_image_at_its_base_and_says_where_everything_is` checks `write_into` against the bytes form, plus untouched bytes and the four refusals.
+
+> used by fastcompile-sol-premap, 2026-10-29, not built: `prelink::Link` calls `prelink_placed`. premap's `Prelink` has `type Placed: prelink::Placed` (`linked`, `len(at)`, `write_into`), and `image::encode` sizes the image from `len`, copies in its own metadata and hands the buffer to `write_into`. So the segments are written once, straight into the image. blaze-link's bytes-returning `prelink` is no longer called by premap and can go. Tests: `a_prelink_that_writes_its_own_segments_makes_the_same_image`, `a_prelink_refuses_a_segment_written_outside_the_image`.
+> applied by requests (child requests-link-next): with premap on `prelink_placed` and `Placed::write_into`, the bytes-form `blaze_link::premap::prelink` and `Placed::into_prelinked` are removed. `tests/premap.rs` now reads each segment through `write_into` (helper `segments`). `Prelinked::segments` and `Segment` go next, once blaze-premap's `from_link` stops mapping them (`v2/requests/requests.md`, "blaze-premap: stop reading `blaze_link::premap::Prelinked::segments`"). Not built.
 
 ## fastcompile-sol-premap 3: link: refuse a strong workspace definition of a name the dependency image reaches PC-relatively and defines weakly (`crates/blaze-link/src/premap.rs`, `Image::stage_beside`)
 
@@ -3818,6 +3825,8 @@ Status: open
 
 > forwarded to link (requests-link-next, which holds `crates/blaze-link`); told by tmux (requests, pass 36).
 > applied by requests-link-next-premap, 2026-10-29 (not built). `blaze_link::premap::Prelinked::reached_directly: Vec<String>` (sorted, each once) lists the names the image defines weakly that its own code reaches some way other than a bind: any fixup but a GOT one or an `Abs64` in writable data, a `Delta` minus included. An `Abs64` to a weak name in read-only data no longer fails the prelink; it is listed here. `blaze_link::Outside` gains the required method `fn reached_directly(&self, name: &str) -> bool;` (no default; `NoOutside` gives `false`, inlined). In `native.rs` `Stage::beside_names`, when this image's definition would win (a strong one, a weak one earlier on the line, or Rust's) over a weak one for which `reached_directly` is true, the stage fails with "`{name}` is defined by {input | Rust code} in {image}, and weakly by the dependency image it is linked beside, whose own code reaches its definition directly: a whole link would reach this one from there too". Tests in `crates/blaze-link/src/tests/premap.rs`: `a_prelink_lists_the_weak_names_its_code_reaches_directly` and `a_definition_that_would_win_over_a_weak_one_the_image_beside_reaches_directly_is_an_error`. For fastcompile: store `reached_directly` in the image and answer it in `impl Outside for View` (`image.rs`); until then blaze-premap does not compile.
+
+> used by fastcompile-sol-premap, 2026-10-29, not built: each listed name sets byte 54 of its table slot. `table::set_reached_directly` makes this an error for a name with no slot or with a slot that isn't weak, and the parse refuses any other value. `View::reached_directly` reads the slot, and `prelink::from_link` carries the list.
 
 ## fastcompile-macros 2: codegen-mir: `Evaluator::set_errno`, item 7 of "fastcompile-macros 1", missing from `eval/foreign.rs`
 
@@ -3893,7 +3902,7 @@ beside the sandbox, and asks nothing of the IR builder but this entry. The IR is
 `fastcompile-stencil 2` already builds for `Prepared::Stencil`; this hands it out instead of
 emitting it.
 
-Status: open
+Status: done
 
 > forwarded to codegen-next2 (requests, pass 37; told by tmux)
 > taken by codegen (codegen-next2, 2026-10-29 23:45): child codegen-rq-tier.
@@ -3949,6 +3958,7 @@ Status: open
 >   `Unit { instance: Instance { settings: tier_spec.settings(), ..unit.instance },
 >   backend: Backend::Stencil, ..unit }`, and calls `lowered` with the matching `refs`. The test
 >   `the_reach_of_a_root_is_the_drivers` does exactly that.
+> fastcompile-macros-tier (2026-10-29 23:50): received; `crates/blaze-macro-eval/src/tier/confine.rs` confines `Lowering::Ir`'s `func` and takes `names`/`data` through the caller's binding. Done.
 
 ## fastcompile-macros-tier 2: fastcompile-stencil: a fused confined access, and the frame offset of a call site (`crates/blaze-stencil/src/patch/select.rs`, `shape.rs`, `code.rs`)
 
@@ -4075,7 +4085,8 @@ changed is recorded stateless under its code hash, and from the next load its ex
 found in the store and the calling crates get dependency images. Without the call every macro
 stays in a session forever: correct, but every expansion runs again each build.
 
-Status: open
+Status: done (the dependency, `flush()` and the publish after it are in; checked by
+fastcompile-macros against `job.rs:2135-2143`)
 
 > answered by lane cargo (cargo-inbox-user): to do, in cargo-inbox's paths. The exact edits are
 > 8 and 9 under "For cargo-inbox" in `/tmp/blaze-lanes/v2-cargo-inbox-user.md`: the dependency
@@ -4120,7 +4131,15 @@ Why: the patcher fuses the pattern into one stencil (`patch/select.rs` `confine`
 what prove each fused shape means what its parts mean, against Cranelift and the interpreter.
 `patch/tests.rs` covers when the fusion is taken, its holes and its fault, with the mock library.
 
-Status: open
+Status: partly done by fastcompile-stencil-diff at the freeze. `build.rs` has fastcompile-stencil's
+`confined()` (one arm), now an `iadd` of an `iconst` (`confine` fuses no `iadd_imm`) and `off`
+from `Baked::imms[OFFSET]`; `stencil.rs` `bakeds` tries the offsets above, `hole_problems`
+allows and needs the `Offset` hole for a `Disp` other than `Zero`, and confined runs are
+forked; the fuzzer lists both ops as not drawn. Left: `p` as an input (it is an `iconst`), so
+it ranges over wrapping sums and bit 31, and `p` (and a store's `x`) from the accumulator,
+made last with `vmctx` from a second copy of the arithmetic; the fuzzer drawing the pattern.
+
+> forwarded to fastcompile-stencil-diff-next1 (requests, pass 41; told by tmux)
 
 ## fastcompile-stencil-fuse 2: codegen: `frame` in the test `CodeRef` (`crates/hir-ty-codegen/unwind/tests.rs`)
 
@@ -4135,3 +4154,83 @@ Why: without it `hir-ty-codegen`'s tests don't compile. The tier's unwinder resu
 pad with `sp = fp - frame`.
 
 Status: open
+
+> forwarded to codegen-next2 (requests, pass 41; told by tmux)
+> applied by codegen (codegen-next2, 2026-10-29 23:52): `frame: 0,` in `stencil`'s `CodeRef`
+> literal; the other literal at :65 spreads `..stencil(..)`, so needs nothing. No other
+> `CodeRef` literal outside blaze-stencil.
+
+## fastcompile-macros 4: frontend: a crate's `#![feature]`s without its def map, for a proc macro it calls (`crates/hir-def/src/unstable_features.rs`, `item_tree.rs` `top_level_attrs`)
+
+Owner: lane frontend (hir-def). Asked by fastcompile-macros (window `fastcompile-macros-next2`).
+
+What: a public salsa query, say `UnstableFeatures::of_root(db: &Db, krate: Crate) ->
+&UnstableFeatures`, built from what `DefCollector::seed_with_top_level` reads
+(`file_item_tree(db, krate.root_file_id(db), krate).top_level_attrs()`, `cfg_attr` applied,
+the `-Z crate-attr` files after them) and never from `crate_def_map(db, krate)`.
+`UnstableFeatures::query` goes through the def map, and the proc macros of a crate expand while
+its def map is being built, so calling it from an expansion is a cycle; `top_level_attrs` is
+`pub(crate)`.
+
+Why: rustc gates every `k#ident` a proc macro lexes through `TokenStream::from_str` with the
+calling crate's `forced_keywords` (`psess.gated_spans`, checked after expansion). blaze's server
+(`crates/blaze-macro-eval/src/lex.rs` `Emitted::finish`) reports the gate as an error always,
+so a crate with `#![feature(forced_keywords)]` gets an error rustc does not give. With the query
+the server takes the bit (and the expansion's key gets it as a part).
+
+Status: open
+
+> forwarded to frontend (requests, pass 42: hir-def's `unstable_features.rs`/`item_tree.rs` is lane frontend's to apply in lane db's crate; told by tmux)
+
+## fastcompile-macros 5: diagnostics: the level of a lexer lint at a crate's root, for a proc macro it calls (`crates/blaze-diagnostics/src/lints/levels.rs`)
+
+Owner: lane diagnostics (lints-syntax-early wrote `lints/syntax/early/lexer.rs`). Asked by
+fastcompile-macros (window `fastcompile-macros-next2`).
+
+What: a public function giving the level rustc's `buffer_lint` at `CRATE_NODE_ID` ends at for
+`text_direction_codepoint_in_comment` and `text_direction_codepoint_in_literal` in a crate:
+the crate root's `#![allow/warn/deny/forbid]`, the crate's `-A/-W/-D/-F` and `--cap-lints`
+(cargo caps every registry dependency at `allow`), without the crate's def map (it is asked
+while the crate's proc macros expand, so the def map is being built; see
+"fastcompile-macros 4"). Say `pub fn root_level(db: &Db, krate: Crate, lint: &str) -> Level`
+with `Level` public.
+
+Why: rustc's lexer buffers both lints for the text a proc macro lexes through
+`TokenStream::from_str` (`rustc_parse::lexer`, `report_text_direction_codepoint`), deny by
+default. blaze's server (`crates/blaze-macro-eval/src/lex.rs` `Emitted::finish`) reports them
+as errors always, so an allowed or capped crate gets an error rustc does not give. With the
+level the server drops an allowed one, prints a warning one and errors only on deny or forbid.
+
+Status: open
+
+> forwarded to diagnostics-levels (requests, pass 42: the root level belongs with `hir-lint-levels`/`blaze-lint-defs`, which it writes; told by tmux)
+
+## fastcompile-macros 6: proof: a harness that runs blaze-macro-eval's corpus against rustc (`harness/macroeval_corpus.py`)
+
+Owner: lane proof (`harness/`). Asked by fastcompile-macros (window `fastcompile-macros-next2`),
+for its child fastcompile-macros-corpus (report `/tmp/blaze-lanes/v2-fastcompile-macros-corpus.md`).
+
+What: `harness/macroeval_corpus.py`, taking one JSON value (rule 17), run in an ix VM:
+1. copy `crates/blaze-macro-eval/tests/corpus/ws` twice (`workspace`, `scratch`);
+2. `cargo fetch --locked` its registry packages into a `CARGO_HOME` of its own;
+3. build each copy with `blaze build -p corpus-calls`, leaving std's and every build script's
+   runs beside their `OUT_DIR`;
+4. build the reference: rustc's (pinned nightly) library of each proc-macro crate
+   (`serde_derive`, `thiserror_impl`, `tokio_macros`, `corpus_macros`, `corpus_state`) and the
+   toolchain's `proc-macro-srv`; optionally blaze's wasm module of each;
+5. write the `BLAZE_MACRO_CORPUS` config (its shape is `crates/blaze-macro-eval/tests/corpus/config.rs`)
+   and run `blaze test -p blaze-macro-eval --test corpus --test kept -- --ignored` with
+   `BLAZE_CACHE` and `BLAZE_PROC_MACRO_CACHE` unset.
+
+Why: the two tests are the differential proof of change 20 (every macro of the corpus, run on
+blaze's evaluator, gives the tokens rustc's own build of it gives, and kept expansions are
+found again only when every input matches). They are `#[ignore]`d without the config, so
+nothing runs them until this script exists. The dev-dependencies they need are in
+`crates/blaze-macro-eval/Cargo.toml`.
+
+Status: open
+
+> taken by requests (pass 43; lane proof is DONE): child `requests-macroeval` writes it as `harness/v2/macroeval_corpus.py` (proof's directory; `harness/` outside `v2/` is the coordinator's). Its outcome line follows when done.
+
+> applied (requests-macroeval, child of requests): written as `harness/v2/macroeval_corpus.py` (not `harness/macroeval_corpus.py`: the v2 harness directory, beside `share.py` and `corpus.py`). One JSON input (rule 17: `engine`, `out`, `work`, `target`, `wasm`, `keep`) into a frozen dataclass. It copies the fixture as `workspace`, `scratch` and `reference`, runs `cargo fetch --locked` into a CARGO_HOME of its own and checks every registry package of the lock was unpacked. It runs `blaze build -p corpus-calls` in both copies on one daemon and checks every build script's run has `output` beside its `OUT_DIR`. The pinned cargo builds `corpus-calls` `--frozen`, and rustc's library of each of the five proc-macro crates is read from its `compiler-artifact` messages; one missing is an error naming it. The server is the toolchain's `libexec/rust-analyzer-proc-macro-srv`, checked with `--version`. It is never built from `vendor/proc-macro-srv`, because that one reads the macro list blaze writes into its libraries, not rustc's metadata, so it can't load rustc's libraries. The `BLAZE_MACRO_CORPUS` config is written with config.rs's six fields, and then `blaze test -p blaze-macro-eval --test corpus --test kept -- --ignored` runs with BLAZE_CACHE and BLAZE_PROC_MACRO_CACHE unset. There is one report.py outcome per step and per `#[test]` of the two files: a test that fails, is ignored, is missing or was kept is a fail. Wasm modules are optional input (`wasm: [{"crate", "path"}]`), because blaze v2 has no command that emits one alone. `selftest` (7 checks, config fields read from config.rs) passes; nothing was built or run. Not added to `proof.py`'s `SCRIPTS`, which `requests` holds.
+> applied by requests (pass 44): `proof.py` runs it as check `macroeval` (`Name`, `SCRIPTS`, the docstring's list), before `budgets`. `docs/harness.md`'s table of v2 scripts is the coordinator's (listed in requests' report).

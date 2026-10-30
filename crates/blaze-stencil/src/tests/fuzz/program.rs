@@ -1103,7 +1103,9 @@ impl Gen<'_, '_> {
             | Op::X86Pshufb
             | Op::X86Pmulhrsw
             | Op::X86Pmaddubsw
-            | Op::X86Cvtt2dq => panic!("the generator never draws `{}`", op.info().name),
+            | Op::X86Cvtt2dq
+            | Op::LoadConfined
+            | Op::StoreConfined => panic!("the generator never draws `{}`", op.info().name),
         }
     }
 

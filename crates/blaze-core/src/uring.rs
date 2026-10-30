@@ -30,6 +30,15 @@
 //! in [`flight`]. A large send on a TCP connection goes from the asker's pages
 //! (`IORING_OP_SEND_ZC`). docs/v2/plan/lanes/core/speed-uring.md has the costs per request and
 //! how they compare with other runtimes.
+//!
+//! Why unsafe: the rings are memory shared with the kernel (`mmap` of the ring's file), read and
+//! written through pointers at the offsets the kernel gives, and every request lends the kernel
+//! a buffer or a name by address until it completes. Std's blocking calls are the safe version,
+//! at one system call (and a thread blocked) per operation, where a ring takes a batch in one
+//! `io_uring_enter` or none (`SQPOLL`). What comes back is checked before it names memory: a
+//! completion's `user_data` is a handle, looked up in the slab by index and generation, never
+//! a pointer; a provided buffer's id is checked against its group (`Provided::buffer`); and a
+//! ring offset against its mapping (`Map::at`), in every build.
 
 mod files;
 mod flight;
@@ -51,7 +60,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence},
+        atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
         mpsc,
     },
     time::{Duration, Instant},
@@ -64,6 +73,7 @@ use rustc_hash::FxHashMap;
 use self::ops::{Cold, Hot, Id, Kind};
 use crate::{
     Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names, RECV_MOST, Stamp, Tag,
+    handoff::Claims,
     wheel::{self, Wheel},
 };
 
@@ -197,8 +207,8 @@ const CONNS: u32 = 1 << 20;
 const SPAWNS: u32 = 1 << 16;
 const WATCHES: u32 = 1 << 16;
 const LISTENS: u32 = 1 << 16;
-/// A request's slot is the `user_data`'s bits 2 to 31, beside its link.
-const _: () = assert!(PENDING < 1 << 30);
+/// A request's slot is the `user_data`'s bits 3 to 31, beside its link.
+const _: () = assert!(PENDING < 1 << 29);
 /// Buffers, watches' tables and paths kept from what ended for what starts next.
 const SPARES: usize = 64;
 
@@ -453,6 +463,9 @@ struct Table {
     ring: Rc<OwnedFd>,
     /// Slots of the driver's half that are free.
     free: RefCell<Vec<u32>>,
+    /// Slots of either half whose file was let go, to empty through the ring
+    /// (`IORING_OP_CLOSE`); free again once that completes.
+    closing: RefCell<Vec<u32>>,
     ours: u32,
 }
 
@@ -475,8 +488,10 @@ impl Table {
         let ours = size / 2;
         let range = FileIndexRange { off: ours, len: size - ours, resv: 0 };
         register(fd, REGISTER_FILE_ALLOC_RANGE, &raw const range, 0, "a range of the file table for direct accepts", "6.0")?;
+        // alloc: setup, once per driver: room for every slot, so a drop never grows it.
+        let closing = RefCell::new(Vec::with_capacity(size as usize));
         // alloc: clone: setup, once per driver; `ring` is a reference count.
-        Ok(Rc::new(Table { ring: ring.clone(), free: RefCell::new((0..ours).rev().collect()), ours }))
+        Ok(Rc::new(Table { ring: ring.clone(), free: RefCell::new((0..ours).rev().collect()), closing, ours }))
     }
 
     /// Slot `slot` made `fd`'s file, or emptied with -1.
@@ -536,13 +551,21 @@ impl Fixed {
     }
 }
 
+impl Fixed {
+    /// A kept file's, until its open puts it in a slot.
+    fn unopened(table: &Rc<Table>) -> Fixed {
+        // clone: a reference count.
+        Fixed { fd: None, slot: None, table: Rc::clone(table) }
+    }
+}
+
 impl Drop for Fixed {
+    /// Its slot emptied through the ring as the driver next writes to it: that drops the
+    /// table's reference, so a socket accepted into it closes.
     fn drop(&mut self) {
         let Some(slot) = self.slot else { return };
-        // Emptying the slot drops the table's reference: a socket accepted into it closes.
-        if self.table.set(slot, -1).is_ok() && slot < self.table.ours {
-            self.table.free.borrow_mut().push(slot);
-        }
+        // alloc: none, its capacity is every slot's.
+        self.table.closing.borrow_mut().push(slot);
     }
 }
 
@@ -558,11 +581,7 @@ impl Registered {
     fn new(ring: RawFd) -> io::Result<Registered> {
         let map = anonymous(DIRECT_BUFFERS as usize * DIRECT_PIECE)?;
         let iovecs: Vec<libc::iovec> = (0..DIRECT_BUFFERS as usize)
-            .map(|n| libc::iovec {
-                // SAFETY: within the mapping.
-                iov_base: unsafe { map.at.add(n * DIRECT_PIECE) }.cast(),
-                iov_len: DIRECT_PIECE,
-            })
+            .map(|n| libc::iovec { iov_base: map.at.wrapping_add(n * DIRECT_PIECE).cast(), iov_len: DIRECT_PIECE })
             .collect(); // alloc: setup, once per driver.
         let buffers = RsrcRegister { nr: DIRECT_BUFFERS.into(), flags: 0, resv2: 0, data: iovecs.as_ptr() as u64, tags: 0 };
         let nr = size_of::<RsrcRegister>() as libc::c_uint;
@@ -582,9 +601,10 @@ impl Registered {
         Ok(Registered { map })
     }
 
+    /// The start of buffer `index`, checked to be one of the [`DIRECT_BUFFERS`] in every build.
     fn at(&self, index: u16) -> *mut u8 {
-        // SAFETY: within the mapping: `index` is one of its buffers.
-        unsafe { self.map.at.add(index as usize * DIRECT_PIECE) }
+        assert!(index < DIRECT_BUFFERS, "registered buffer {index} of {DIRECT_BUFFERS}");
+        self.map.at.wrapping_add(index as usize * DIRECT_PIECE)
     }
 }
 
@@ -621,15 +641,22 @@ impl Provided {
         Ok(provided)
     }
 
+    /// The start of buffer `bid`. `bid` comes from a completion's flags, the kernel's word, so
+    /// it is checked against the group in every build (one compare per 16 KiB received): a
+    /// larger id would hand out memory past `buffers`.
+    fn buffer(&self, bid: u16) -> *mut u8 {
+        assert!(bid < RECV_BUFFERS, "the kernel named provided buffer {bid} of a group of {RECV_BUFFERS}");
+        self.buffers.at.wrapping_add(bid as usize * RECV_BUFFER)
+    }
+
     /// The bytes the kernel put in buffer `bid`.
     fn bytes(&self, bid: u16, len: usize) -> &[u8] {
-        // SAFETY: `bid` is a buffer id the kernel took from this group, below `RECV_BUFFERS`, so
-        // the offset is within `buffers` (`RECV_BUFFERS * RECV_BUFFER` bytes); if not, the
-        // pointer leaves the mapping.
-        let at = unsafe { self.buffers.at.add(bid as usize * RECV_BUFFER) };
-        // SAFETY: `at` starts buffer `bid`, `RECV_BUFFER` bytes the kernel wrote for this
-        // completion and does not touch again until `give(bid)`, which needs `&mut self` and so
-        // cannot run while the slice borrows `self`; if not, the slice aliases a kernel write.
+        let at = self.buffer(bid);
+        // SAFETY: `at` starts buffer `bid` (checked to be in the group by `buffer`), and at most
+        // `RECV_BUFFER` bytes of it are read (`len` is the kernel's count, clamped), all in
+        // `buffers`, which the kernel wrote for this completion and does not touch again until
+        // `give(bid)`, which needs `&mut self` and so cannot run while the slice borrows
+        // `self`; if not, the slice aliases a kernel write.
         unsafe { std::slice::from_raw_parts(at, len.min(RECV_BUFFER)) }
     }
 
@@ -638,9 +665,7 @@ impl Provided {
     fn give(&mut self, bid: u16) {
         let mask = RECV_BUFFERS - 1;
         let entry: *mut ProvidedBuf = self.ring.at((self.tail & mask) as u32 * size_of::<ProvidedBuf>() as u32);
-        // SAFETY: `bid` is below `RECV_BUFFERS` (from `new`'s loop or a completion of this
-        // group), so the offset is within `buffers`.
-        let addr = unsafe { self.buffers.at.add(bid as usize * RECV_BUFFER) } as u64;
+        let addr = self.buffer(bid) as u64;
         // SAFETY: `entry` is slot `tail & mask` of the ring `new` mapped for `RECV_BUFFERS`
         // entries; the kernel does not read it until `publish` stores a tail past it (at most
         // `RECV_BUFFERS` given back between publishes, as every buffer is given back once per
@@ -684,6 +709,7 @@ const _: () = assert!(RECV_BUFFERS.is_power_of_two());
 
 /// What `statx` says of a descriptor's file: its device, and the alignment of offset and
 /// length a write bypassing the page cache needs (0 where its file system has none).
+#[cfg(test)]
 fn direct_alignment(fd: RawFd) -> io::Result<(u64, u32)> {
     #[repr(C, align(8))]
     struct Statx([u8; 256]);
@@ -731,14 +757,17 @@ impl Map {
         Ok(Map { at: at.cast(), len })
     }
 
-    /// The `T` at `offset`, which the kernel's offsets say is one.
+    /// The `T` at `offset`, which the kernel's offsets say is one. Checked against the mapping
+    /// in every build (one compare, at setup or once per buffer given back), so a pointer it
+    /// returns is always inside it; reading through one is the caller's `unsafe`.
     fn at<T>(&self, offset: u32) -> *mut T {
-        debug_assert!(offset as usize + size_of::<T>() <= self.len);
-        // SAFETY: every caller passes an offset the kernel gave in `io_uring_params` (`sq_off`,
-        // `cq_off`, 0 for the SQE array) or the fixed `resv` offset 14 of a provided-buffer ring,
-        // each within the `len` bytes mapped (the debug assertion checks it); if not, the pointer
-        // leaves the mapping.
-        unsafe { self.at.add(offset as usize).cast() }
+        assert!(
+            offset as usize + size_of::<T>() <= self.len,
+            "offset {offset} of a {}-byte value is past the {}-byte ring mapping",
+            size_of::<T>(),
+            self.len,
+        );
+        self.at.wrapping_add(offset as usize).cast()
     }
 }
 
@@ -1111,27 +1140,33 @@ struct Watching {
 }
 
 /// A file opened for reading and appending, kept open: under its name in [`Uring::names`]
-/// while `named`, and kept while any request in flight uses it.
+/// while `named`, and kept while any request in flight uses it (its open among them). Opened
+/// through the ring into its slot of the table, by which every request on it names it; until
+/// `open`, they wait.
 struct Kept {
     fixed: Fixed,
     users: u32,
     named: bool,
+    open: bool,
+    /// A request waiting for it makes it if missing.
+    make: bool,
 }
 
-/// The links of a whole file's write: the write, its sync, the rename and its directory's sync.
-const WRITE_LINKS: usize = 4;
+/// The bits of a `user_data` that are its link.
+const LINK_MASK: u64 = 7;
+const _: () = assert!(ops::LINKS as u64 <= LINK_MASK + 1);
 
 /// The `user_data` of link `link` of the request `id`, a request of no chain its link 0: the
 /// generation in the high half, the slot and the link in the low.
 fn data(id: Id, link: usize) -> u64 {
-    debug_assert!(id.index() < PENDING && link < 4);
-    u64::from(id.generation()) << 32 | u64::from(id.index()) << 2 | link as u64
+    debug_assert!(id.index() < PENDING && (link as u64) <= LINK_MASK);
+    u64::from(id.generation()) << 32 | u64::from(id.index()) << 3 | link as u64
 }
 
 /// The request and link of a `user_data` [`data`] made; any other names no request.
 fn of_data(user_data: u64) -> (Id, usize) {
-    let index = (user_data as u32) >> 2;
-    (Handle::from_bits(user_data >> 32 << 32 | u64::from(index)), (user_data & 3) as usize)
+    let index = (user_data as u32) >> 3;
+    (Handle::from_bits(user_data >> 32 << 32 | u64::from(index)), (user_data & LINK_MASK) as usize)
 }
 
 /// The handle a [`Conn`] is.
@@ -1266,13 +1301,13 @@ struct Connecting {
 /// the last chunk sends the completion and wakes the ring.
 struct Job {
     tag: Tag,
-    root: OwnedFd,
+    root: Arc<Path>,
+    /// The root, opened by the first stamper to claim a chunk (never the ring's thread), or
+    /// why it could not be: the sweep then fails, naming it.
+    dir: std::sync::OnceLock<Result<OwnedFd, i32>>,
     names: Arc<Names>,
-    chunks: usize,
-    /// The next chunk to claim.
-    next: AtomicUsize,
-    /// Chunks whose stamps are all written.
-    finished: AtomicUsize,
+    /// The chunks of `names`, [`STAMP_CHUNK`] each, claimed and finished by the stampers.
+    claims: Claims,
     /// One stamp per name, written through `base`.
     out: UnsafeCell<Vec<Stamp>>,
     base: *mut Stamp,
@@ -1281,25 +1316,25 @@ struct Job {
 }
 
 // SAFETY: `out` is written through `base` at disjoint chunks, each only by the one thread whose
-// `fetch_add` on `next` claimed it, and taken whole only by the thread whose `fetch_add` on
-// `finished` counted the last chunk, after every writer's release (`Job::run`). Every other
-// field is `Sync`.
+// `Claims::claim` returned it, and taken whole only by the thread whose `Claims::finish` counted
+// the last chunk, which orders every writer's chunk before it (`Job::run`; the protocol is
+// model-checked in `handoff`). Every other field is `Sync`.
 unsafe impl Sync for Job {}
 // SAFETY: as above; `base` points into `out`'s heap buffer, which no move of the job moves.
 unsafe impl Send for Job {}
 
 impl Job {
-    fn new(tag: Tag, root: OwnedFd, names: Arc<Names>, offload: &Offload) -> Job {
+    fn new(tag: Tag, root: Arc<Path>, names: Arc<Names>, offload: &Offload) -> Job {
         // alloc: the sweep's result, one per sweep, handed to its asker.
         let mut out = vec![Stamp::UNKNOWN; names.len()];
         let base = out.as_mut_ptr();
         Job {
             tag,
             root,
-            chunks: names.len().div_ceil(STAMP_CHUNK),
+            dir: std::sync::OnceLock::new(),
+            // One at least, so a sweep of no names still opens the root.
+            claims: Claims::new(names.len().div_ceil(STAMP_CHUNK).max(1)),
             names,
-            next: AtomicUsize::new(0),
-            finished: AtomicUsize::new(0),
             out: UnsafeCell::new(out),
             base,
             sender: offload.sender.clone(), // clone: a channel's handle, one per sweep.
@@ -1310,24 +1345,34 @@ impl Job {
     /// Claims chunks until none is left, stamping each; whoever finishes the last completes
     /// the job. `parent` is the caller's buffer for a directory's name.
     fn run(&self, parent: &mut Vec<u8>) {
-        loop {
-            let chunk = self.next.fetch_add(1, Ordering::Relaxed);
-            if chunk >= self.chunks {
-                return;
-            }
-            let from = chunk * STAMP_CHUNK;
+        while let Some(chunk) = self.claims.claim() {
+            let from = (chunk * STAMP_CHUNK).min(self.names.len());
             let to = (from + STAMP_CHUNK).min(self.names.len());
-            stamp_names(self.root.as_raw_fd(), &self.names, from..to, parent, |at, stamp| {
-                // SAFETY: `at` is below `names.len()`, the length of `out`'s buffer.
-                let slot = unsafe { self.base.add(at) };
-                // SAFETY: `at` is in the chunk this thread alone claimed.
-                unsafe { slot.write(stamp) };
-            });
-            if self.finished.fetch_add(1, Ordering::AcqRel) + 1 == self.chunks {
-                // SAFETY: every chunk is finished, each writer's release before this acquire,
-                // and no thread writes or reads `out` after.
+            let dir = self.dir.get_or_init(|| open_dir(&self.root).map_err(|it| it.raw_os_error().unwrap_or(libc::EIO)));
+            if let Ok(dir) = dir {
+                stamp_names(dir.as_raw_fd(), &self.names, from..to, parent, |at, stamp| {
+                    assert!((from..to).contains(&at), "stamp {at} outside the chunk {from}..{to} claimed");
+                    let slot = self.base.wrapping_add(at);
+                    // SAFETY: `at` is in `from..to` (checked above), below `names.len()`, the
+                    // length of `out`'s buffer, and in the chunk this thread alone claimed, so
+                    // no other thread reads or writes `slot` until the last finish.
+                    unsafe { slot.write(stamp) };
+                });
+            }
+            if self.claims.finish() {
+                // SAFETY: every chunk is finished and ordered before this (`Claims::finish`),
+                // and no thread writes or reads `out` after: every claim is taken.
                 let out = std::mem::take(unsafe { &mut *self.out.get() });
-                if self.sender.send(Completion { tag: self.tag, done: Done::Stamped(out) }).is_ok() {
+                let done = match dir {
+                    Ok(_) => Done::Stamped(out),
+                    // alloc: the error of a sweep that failed.
+                    Err(errno) => Done::Failed(IoError(format!(
+                        "{}: {}",
+                        self.root.display(),
+                        io::Error::from_raw_os_error(*errno)
+                    ))),
+                };
+                if self.sender.send(Completion { tag: self.tag, done }).is_ok() {
                     wake_ring(&self.wake);
                 }
             }
@@ -1418,7 +1463,7 @@ fn stamper(me: usize, inbox: &crossbeam_channel::Receiver<ToStamp>, inboxes: &[c
     let mut parent = Vec::with_capacity(libc::PATH_MAX as usize);
     while let Ok(work) = inbox.recv() {
         let wanted = match &work {
-            ToStamp::Sweep(job) => job.chunks,
+            ToStamp::Sweep(job) => job.claims.chunks(),
             ToStamp::List(_) => 0,
             ToStamp::End => usize::MAX,
         };
@@ -1549,8 +1594,14 @@ pub struct Uring {
     paths: ManuallyDrop<ops::Paths>,
     /// Requests for which the ring had no room.
     waiting: VecDeque<Id>,
-    /// Devices whose file system refused `O_DIRECT`: their writes go through the page cache.
-    refused: rustc_hash::FxHashSet<u64>,
+    /// Requests on kept files whose open is in flight, in the order they were asked.
+    on_open: Vec<Id>,
+    /// Requests waiting for slots of the table for their opens, in the order they asked.
+    slot_waiting: VecDeque<Id>,
+    /// Closes of slots in flight.
+    closes: usize,
+    /// Slots of the table requests on paths hold.
+    slots_held: usize,
     /// Writes that bypassed the page cache, ended.
     direct_writes: u64,
     /// Sends that went from the asker's pages (`IORING_OP_SEND_ZC`), ended.
@@ -1616,7 +1667,12 @@ impl Uring {
             paths: ManuallyDrop::new(ops::Paths::new().map_err(io::Error::other)?),
             // alloc: setup, once per driver: room for as many as the ring holds.
             waiting: VecDeque::with_capacity(ENTRIES as usize),
-            refused: rustc_hash::FxHashSet::default(),
+            // alloc: setup, once per driver: room for as many as the ring holds, grown only
+            // past that.
+            on_open: Vec::with_capacity(ENTRIES as usize),
+            slot_waiting: VecDeque::with_capacity(ENTRIES as usize), // alloc: setup, as above.
+            closes: 0,
+            slots_held: 0,
             direct_writes: 0,
             zero_copy_sends: 0,
             ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
@@ -1659,32 +1715,26 @@ impl Uring {
         forget(&mut self.names, &mut self.kept, name);
     }
 
-    /// The file, opened once and put in the driver's half of the table; `make` makes it if
-    /// missing, with its directories. Where that half is full, the files kept are let go
-    /// (each request in flight holds its own until it ends) to make room.
+    /// The file kept under `name`, its open through the ring started where none is; `make`
+    /// makes it if missing, with its directories. Requests on it wait for the open
+    /// ([`Uring::prepared`]); where the driver's half of the table is full, the files kept
+    /// are let go (each request in flight holds its own until it ends) to make room.
     fn file(&mut self, name: &FileName, make: bool) -> io::Result<Handle<Kept>> {
         if let Some(&file) = self.names.get(name) {
+            let kept = self.kept.get_mut(file).expect("named files are kept");
+            kept.make |= make && !kept.open;
             return Ok(file);
         }
-        let fd = under(&self.root, name, |path| {
-            if make && let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            open(path, make)
-        })?;
-        if self.table.free.borrow().is_empty() {
-            for (_, file) in self.names.drain() {
-                let kept = self.kept.get_mut(file).expect("named files are kept");
-                kept.named = false;
-                if kept.users == 0 {
-                    self.kept.remove(file);
-                }
-            }
-        }
-        let fixed = self.table.install(fd)?;
-        let file = self.kept.insert(Kept { fixed, users: 0, named: true });
+        let fixed = Fixed::unopened(&self.table);
+        // Held by its open until it ends.
+        let file = self.kept.insert(Kept { fixed, users: 1, named: true, open: false, make });
         // clone: the name once per file opened, as the key it is kept under.
         self.names.insert(name.clone(), file);
+        if let Err(error) = self.open(file, name, make) {
+            self.names.remove(name);
+            self.kept.remove(file);
+            return Err(error);
+        }
         Ok(file)
     }
 
@@ -1705,39 +1755,6 @@ impl Uring {
         if self.buffers.len() < SPARES && buffer.len() == PIPE {
             self.buffers.push(buffer);
         }
-    }
-
-    /// Whether `WriteAt` of `len` bytes at `at` through `fd` bypasses the page cache, `fd`
-    /// set to do so if it does: a write of [`DIRECT_LEAST`] or more whose offset and length
-    /// are multiples of the alignment its file system says such writes need. A file system
-    /// that refuses `O_DIRECT` (tmpfs) is remembered, and its writes go through the cache.
-    fn direct(&mut self, fd: RawFd, at: u64, len: usize) -> io::Result<bool> {
-        const SECTOR: u64 = 512;
-        if len < DIRECT_LEAST || at % SECTOR != 0 || len as u64 % SECTOR != 0 {
-            return Ok(false);
-        }
-        let (device, align) = direct_alignment(fd)?;
-        let align = u64::from(align);
-        if align == 0
-            || self.refused.contains(&device)
-            || DIRECT_PIECE as u64 % align != 0
-            || at % align != 0
-            || len as u64 % align != 0
-        {
-            return Ok(false);
-        }
-        // SAFETY: an open descriptor; no pointers.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        // SAFETY: as above.
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_DIRECT) } != 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINVAL) {
-                self.refused.insert(device);
-                return Ok(false);
-            }
-            return Err(error);
-        }
-        Ok(true)
     }
 
     /// `effect` done by [`crate::threads::run`] on a thread of its own, its completion taken
@@ -1796,19 +1813,12 @@ impl Uring {
     }
 
     /// Starts the sweep of [`Effect::Stamp`] `tag` over `names` on the [`Stampers`], made for
-    /// the first. Fails only where the root cannot be opened or the stampers cannot start.
+    /// the first. Fails here only where the stampers cannot start; where the root cannot be
+    /// opened, its completion says so.
     fn sweep(&mut self, tag: Tag, names: Arc<Names>) -> io::Result<()> {
-        let root = open_dir(&self.root)
-            // alloc: the error of a sweep that failed.
-            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", self.root.display())))?;
-        if names.is_empty() {
-            // alloc: empty, nothing allocated.
-            self.ready.push(Completion { tag, done: Done::Stamped(Vec::new()) });
-            return Ok(());
-        }
         self.make_stampers()?;
         // alloc: one per sweep, shared by the stampers.
-        let job = Arc::new(Job::new(tag, root, names, &self.offload));
+        let job = Arc::new(Job::new(tag, Arc::clone(&self.root), names, &self.offload));
         self.offloaded(tag);
         self.stampers.as_ref().expect("made above").start(job);
         Ok(())
@@ -2005,12 +2015,6 @@ fn with_c<R>(path: &Path, f: impl FnOnce(&CStr) -> io::Result<R>) -> io::Result<
     })
 }
 
-fn open(path: &Path, make: bool) -> io::Result<OwnedFd> {
-    let flags =
-        libc::O_RDWR | libc::O_APPEND | libc::O_CLOEXEC | if make { libc::O_CREAT } else { 0 };
-    with_c(path, |path| open_c(path, flags))
-}
-
 /// `path` opened with `flags`, made `0o644` where they make it.
 fn open_c(path: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
     // SAFETY: a NUL-terminated path; the descriptor returned is this driver's.
@@ -2022,26 +2026,7 @@ fn open_c(path: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// A file made for writing, that was not there.
-fn create(path: &CStr) -> io::Result<OwnedFd> {
-    open_c(path, libc::O_WRONLY | libc::O_CLOEXEC | libc::O_CREAT | libc::O_EXCL)
-}
-
-/// A file opened for writing where it is told to; `flags` added to the opening's.
-fn open_to_write(path: &Path, flags: libc::c_int) -> io::Result<OwnedFd> {
-    with_c(path, |path| open_c(path, libc::O_WRONLY | libc::O_CLOEXEC | flags))
-}
-
-/// The directory `path` is in, opened to be synced.
-fn open_dir_of(path: &Path) -> io::Result<OwnedFd> {
-    let dir = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    open_dir(dir)
-}
-
-/// The directory `dir`, opened to be synced or for calls relative to it.
+/// The directory `dir`, opened on a stamper's thread for calls relative to it.
 fn open_dir(dir: &Path) -> io::Result<OwnedFd> {
     with_c(dir, |dir| open_c(dir, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC))
 }
@@ -2130,34 +2115,11 @@ impl Driver for Uring {
             self.in_flight += 1;
             let started = match effect {
                 Effect::Write { file, bytes, .. } => self.write(tag, file, bytes).map(|()| None),
-                Effect::Clone { from, to, .. } => {
-                    self.forget(&to);
-                    under(&self.root, &from, |from| under(&self.root, &to, |to| crate::fs::clone(from, to)))
-                        .map(|()| Some(Done::Cloned))
-                }
-                Effect::Link { from, to, .. } => {
-                    self.forget(&to);
-                    under(&self.root, &from, |from| under(&self.root, &to, |to| crate::fs::link(from, to)))
-                        .map(|()| Some(Done::Linked))
-                }
-                Effect::Stat { file, .. } => {
-                    under(&self.root, &file, crate::fs::stat).map(|it| Some(Done::Stat(it)))
-                }
+                Effect::Clone { from, to, .. } => self.copy(tag, Kind::Clone, &from, &to).map(|()| None),
+                Effect::Link { from, to, .. } => self.copy(tag, Kind::Link, &from, &to).map(|()| None),
+                Effect::Stat { file, .. } => self.look(tag, Kind::Stat, &file).map(|()| None),
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
-                Effect::WriteAt { file, at: offset, bytes, .. } => {
-                    under(&self.root, &file, |path| open_to_write(path, 0)).and_then(|fd| match bytes.is_empty() {
-                        true => Ok(Some(Done::Written)),
-                        false => {
-                            let direct = self.direct(fd.as_raw_fd(), offset, bytes.len())?;
-                            let mut hot = Hot::new(tag, Kind::WriteAt, 0);
-                            if direct {
-                                hot.flags |= ops::DIRECT;
-                            }
-                            self.start(hot, bytes, Cold { at: offset, fds: [Some(fd), None], ..Cold::EMPTY });
-                            Ok(None)
-                        }
-                    })
-                }
+                Effect::WriteAt { file, at, bytes, .. } => self.write_at(tag, &file, at, bytes).map(|()| None),
                 Effect::Rename { from, to, .. } => self.rename(tag, &from, &to).map(|()| None),
                 Effect::Mode { file, mode, .. } => {
                     under(&self.root, &file, |path| crate::fs::set_mode(path, mode)).map(|()| Some(Done::Moded))
@@ -2168,10 +2130,7 @@ impl Driver for Uring {
                 Effect::Times { file, modified_ns, .. } => {
                     under(&self.root, &file, |path| crate::fs::set_times(path, modified_ns)).map(|()| Some(Done::Timed))
                 }
-                Effect::Remove { file, .. } => {
-                    self.forget(&file);
-                    under(&self.root, &file, crate::fs::remove).map(|()| Some(Done::Removed))
-                }
+                Effect::Remove { file, .. } => self.remove(tag, &file).map(|()| None),
                 Effect::Watch { dir, .. } => self.watch(tag, dir, false).map(|()| None),
                 // Linux keeps no journal across a restart: the first batch says what of the
                 // cursor is lost, and the watch is live from its start.
@@ -2188,24 +2147,14 @@ impl Driver for Uring {
                 Effect::Unwatch { .. } | Effect::Unlisten { .. } | Effect::Kill { .. } => {
                     unreachable!("taken above")
                 }
-                Effect::ReadAll { file, .. } => match self.file(&file, false) {
-                    Ok(file) => size_of_file(self.kept.get(file).expect("just kept").fixed.fd()).map(|size| {
-                        // alloc: the read's result, handed to its asker.
-                        let bytes = vec![0; size as usize];
-                        match size {
-                            0 => Some(Done::Read(bytes)),
-                            _ => {
-                                let file = self.hold(file);
-                                self.start(Hot::new(tag, Kind::Read, file.to_bits()), bytes, Cold::EMPTY);
-                                None
-                            }
-                        }
-                    }),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        Ok(Some(Done::Read(Vec::new()))) // alloc: empty, nothing allocated.
-                    }
-                    Err(error) => Err(error),
-                },
+                // Its buffer is the file's size, once it is open (a missing file's, empty).
+                Effect::ReadAll { file, .. } => self.file(&file, false).map(|file| {
+                    let file = self.hold(file);
+                    let mut hot = Hot::new(tag, Kind::Read, file.to_bits());
+                    hot.flags |= ops::WHOLE;
+                    self.start(hot, ops::NO_BYTES, Cold::EMPTY);
+                    None
+                }),
                 Effect::Read { file, at, len, .. } => self.file(&file, false).map(|file| {
                     let file = self.hold(file);
                     let hot = Hot::new(tag, Kind::Read, file.to_bits());
@@ -2213,35 +2162,28 @@ impl Driver for Uring {
                     self.start(hot, vec![0; len], Cold { at, ..Cold::EMPTY });
                     None
                 }),
-                Effect::Append { file, bytes, .. } => {
-                    self.file(&file, true).map(|file| match bytes.is_empty() {
-                        true => Some(Done::Appended),
-                        false => {
-                            let file = self.hold(file);
-                            self.start(Hot::new(tag, Kind::Append, file.to_bits()), bytes, Cold::EMPTY);
-                            None
-                        }
-                    })
-                }
+                // An empty one too, so it answers once the file it makes is there.
+                Effect::Append { file, bytes, .. } => self.file(&file, true).map(|file| {
+                    let file = self.hold(file);
+                    self.start(Hot::new(tag, Kind::Append, file.to_bits()), bytes, Cold::EMPTY);
+                    None
+                }),
                 Effect::Sync { file, .. } => self.file(&file, true).map(|file| {
                     let file = self.hold(file);
                     self.start(Hot::new(tag, Kind::Sync, file.to_bits()), ops::NO_BYTES, Cold::EMPTY);
                     None
                 }),
-                Effect::Truncate { file, len, .. } => self.file(&file, true).and_then(|file| {
-                    let fd = self.kept.get(file).expect("just kept").fixed.fd();
-                    // SAFETY: an open descriptor.
-                    match unsafe { libc::ftruncate(fd, len as libc::off_t) } {
-                        0 => Ok(Some(Done::Truncated)),
-                        _ => Err(io::Error::last_os_error()),
-                    }
+                Effect::Truncate { file, len, .. } => self.file(&file, true).map(|file| {
+                    let file = self.hold(file);
+                    self.start(Hot::new(tag, Kind::Truncate, file.to_bits()), ops::NO_BYTES, Cold { at: len, ..Cold::EMPTY });
+                    None
                 }),
                 Effect::Timer { after, .. } => {
                     let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
                     self.timers.insert(due, tag);
                     Ok(None)
                 }
-                Effect::Map { file, .. } => under(&self.root, &file, crate::fs::map).map(|it| Some(Done::Mapped(it))),
+                Effect::Map { file, .. } => self.look(tag, Kind::Map, &file).map(|()| None),
                 Effect::Spawn { command, .. } => self.spawn(tag, command).map(|()| None),
                 Effect::Listen { at: address, .. } => {
                     crate::net::listen(&self.root, &address).and_then(|listener| {
@@ -2354,7 +2296,16 @@ mod tests {
         dir
     }
 
-    /// The same effects on the ring and on threads end the same.
+    /// An offset into a ring's mapping is checked in every build: the last whole value is
+    /// handed out, one byte further is refused, never a pointer past the mapping.
+    #[test]
+    fn a_ring_offset_past_its_mapping_is_refused() {
+        let map = anonymous(4096).unwrap();
+        let last: *mut u32 = map.at(4092);
+        assert_eq!(last.addr() - map.at.addr(), 4092);
+        let past = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map.at::<u32>(4093)));
+        assert!(past.is_err(), "a u32 at 4093 of 4096 bytes was handed out");
+    }
     #[test]
     fn as_threads_do() {
         let file = FileName::new("vfs/journal").unwrap();
@@ -2862,7 +2813,13 @@ mod tests {
         let mut seen = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
         assert_eq!(seen, [Done::Read(b"one".to_vec()), Done::Removed]);
-        assert_eq!(driver.table.free.borrow().len(), free + 1);
+        // The slot is emptied through the ring, a close no effect waits for.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while driver.table.free.borrow().len() < free + 1 && Instant::now() < deadline {
+            driver.poll(&mut Vec::new(), Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!((driver.table.free.borrow().len(), driver.closes), (free + 1, 0));
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2916,10 +2873,10 @@ mod tests {
             assert!(file[n * piece..(n + 1) * piece] == bytes(n), "piece {n}");
         }
         assert!(file[odd as usize..].iter().all(|&it| it == 9));
-        let fd = open(&root.join("store/pack"), false).unwrap();
-        let (device, align) = direct_alignment(fd.as_raw_fd()).unwrap();
+        let fd = std::fs::File::open(root.join("store/pack")).unwrap();
+        let (_, align) = direct_alignment(fd.as_raw_fd()).unwrap();
         let aligned = align != 0 && piece % align as usize == 0 && DIRECT_PIECE % align as usize == 0;
-        let direct = if aligned && !driver.refused.contains(&device) { count as u64 } else { 0 };
+        let direct = if aligned { count as u64 } else { 0 };
         assert_eq!(driver.direct_writes(), direct, "alignment {align}");
         assert_eq!((driver.lent.free(), driver.lent.waiters().count()), (DIRECT_BUFFERS as usize, 0));
         drop(driver);
@@ -3392,6 +3349,8 @@ mod tests {
         std::fs::write(root.join("file"), b"bytes").unwrap();
         let mut driver = Uring::new(&root).unwrap();
         let file = FileName::new("file").unwrap();
+        // Kept open from here, so each request on it is its own alone.
+        run_until_idle(&mut driver, &mut vec![Effect::Sync { file: file.clone(), tag: Tag(0) }], |_, _| {});
         driver.submit(&mut vec![Effect::Sync { file: file.clone(), tag: Tag(1) }]);
         let ids = requests(&driver);
         let [synced] = ids[..] else { panic!("{ids:?}") };
@@ -3647,47 +3606,204 @@ mod tests {
         _ = std::fs::remove_dir_all(root);
     }
 
-    /// A warm append, positioned write, whole file's write and rename allocate nothing: their
-    /// bytes are the asker's, their names go in an arena and their descriptors in a column.
+    /// The calls of this thread that open, make, link, rename or unlink a name, counted from
+    /// [`path_calls::forbid`] on: each traps (`SECCOMP_RET_TRAP`), is counted and fails with
+    /// `EPERM`, as the budget tests count allocations. The ring's requests are no calls of the
+    /// thread's, so they pass.
+    mod path_calls {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TRAPPED: AtomicU64 = AtomicU64::new(0);
+
+        #[cfg(target_arch = "x86_64")]
+        const ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
+        #[cfg(target_arch = "aarch64")]
+        const ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
+        #[cfg(target_arch = "x86_64")]
+        const CALLS: &[libc::c_long] = &[
+            libc::SYS_open,
+            libc::SYS_creat,
+            libc::SYS_openat,
+            libc::SYS_openat2,
+            libc::SYS_mkdir,
+            libc::SYS_mkdirat,
+            libc::SYS_rmdir,
+            libc::SYS_unlink,
+            libc::SYS_unlinkat,
+            libc::SYS_link,
+            libc::SYS_linkat,
+            libc::SYS_rename,
+            libc::SYS_renameat,
+            libc::SYS_renameat2,
+        ];
+        #[cfg(target_arch = "aarch64")]
+        const CALLS: &[libc::c_long] = &[
+            libc::SYS_openat,
+            libc::SYS_openat2,
+            libc::SYS_mkdirat,
+            libc::SYS_unlinkat,
+            libc::SYS_linkat,
+            libc::SYS_renameat,
+            libc::SYS_renameat2,
+        ];
+
+        extern "C" fn trapped(_: libc::c_int, _: *mut libc::siginfo_t, context: *mut libc::c_void) {
+            TRAPPED.fetch_add(1, Ordering::Relaxed);
+            let context = context.cast::<libc::ucontext_t>();
+            // SAFETY: the context the kernel hands an `SA_SIGINFO` handler, of the thread whose
+            // call trapped; the register written is the one the call returns in.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                (*context).uc_mcontext.gregs[libc::REG_RAX as usize] = -i64::from(libc::EPERM)
+            };
+            // SAFETY: as above.
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                (*context).uc_mcontext.regs[0] = (-i64::from(libc::EPERM)) as u64
+            };
+        }
+
+        /// From now on, this thread's calls on names trap; it should be one of the test's own.
+        pub(super) fn forbid() {
+            static HANDLER: std::sync::Once = std::sync::Once::new();
+            HANDLER.call_once(|| {
+                // SAFETY: `sigaction` is a C struct of integers, pointers and a mask, for which
+                // all-zero bytes is a valid value; the fields read are set below.
+                let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+                action.sa_sigaction = trapped as usize;
+                action.sa_flags = libc::SA_SIGINFO;
+                // SAFETY: a handler that touches an atomic and its context alone.
+                assert_eq!(unsafe { libc::sigaction(libc::SIGSYS, &action, std::ptr::null_mut()) }, 0);
+            });
+            const LD_W_ABS: u16 = 0x20;
+            const JEQ_K: u16 = 0x15;
+            const RET_K: u16 = 0x06;
+            const ALLOW: u32 = 0x7fff_0000;
+            const TRAP: u32 = 0x0003_0000;
+            let insn = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
+            let mut program = vec![
+                insn(LD_W_ABS, 0, 0, 4), // the architecture
+                insn(JEQ_K, 1, 0, ARCH),
+                insn(RET_K, 0, 0, ALLOW),
+                insn(LD_W_ABS, 0, 0, 0), // the call
+            ];
+            for &call in CALLS {
+                program.extend([insn(JEQ_K, 0, 1, call as u32), insn(RET_K, 0, 0, TRAP)]);
+            }
+            program.push(insn(RET_K, 0, 0, ALLOW));
+            let fprog = libc::sock_fprog { len: program.len() as u16, filter: program.as_mut_ptr() };
+            // SAFETY: no pointers.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }, 0);
+            // SAFETY: a program of `len` instructions, which the call copies and does not keep.
+            let set = unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &raw const fprog) };
+            assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+        }
+
+        pub(super) fn count() -> u64 {
+            TRAPPED.load(Ordering::Relaxed)
+        }
+    }
+
+    /// A warm append, positioned write, whole file's write and rename allocate nothing and
+    /// call nothing on a name: their bytes are the asker's, their names go in an arena, and
+    /// every open, rename and unlink is a request of the ring's, each open into a slot of the
+    /// table that a close through the ring empties after.
     #[test]
     fn warm_writes_and_renames_allocate_nothing() {
         let root = dir("uring-warm-writes");
         std::fs::create_dir_all(root.join("d")).unwrap();
         std::fs::write(root.join("d/block"), [0u8; 64]).unwrap();
-        let mut driver = Uring::new(&root).unwrap();
-        let name = |it: &str| FileName::new(it).unwrap();
-        let (log, block, whole, moved) = (name("d/log"), name("d/block"), name("d/whole"), name("d/moved"));
-        let mut out = Vec::with_capacity(16);
-        for round in 0..2 * WARM {
-            let at = 8 * round;
-            let mut writes = Vec::with_capacity(4);
-            writes.push(Effect::Append { file: log.clone(), bytes: b"line\n".to_vec(), tag: Tag(10 * round) });
-            writes.push(Effect::WriteAt { file: block.clone(), at, bytes: round.to_le_bytes().to_vec(), tag: Tag(10 * round + 1) });
-            writes.push(Effect::Write { file: whole.clone(), bytes: round.to_le_bytes().to_vec(), tag: Tag(10 * round + 2) });
-            let mut renames = Vec::with_capacity(1);
-            renames.push(Effect::Rename { from: whole.clone(), to: moved.clone(), tag: Tag(10 * round + 3) });
-            out.clear();
-            let ((), used) = blaze_alloc_count::measure(|| {
-                driver.submit(&mut writes);
-                poll_until(&mut driver, &mut out, |out| out.len() == 3);
-                driver.submit(&mut renames);
-                poll_until(&mut driver, &mut out, |out| out.len() == 4);
-            });
-            out.sort_by_key(|it| it.tag.0);
-            let done: Vec<&Done> = out.iter().map(|it| &it.done).collect();
-            assert_eq!(done, [&Done::Appended, &Done::Written, &Done::Written, &Done::Renamed], "round {round}");
-            if round >= WARM {
-                assert_eq!(used.allocations, 0, "round {round}: {} bytes", used.bytes);
+        // On a thread of its own: the filter that counts calls on names stays with it.
+        let ours = root.clone();
+        std::thread::spawn(move || {
+            let mut driver = Uring::new(&ours).unwrap();
+            let name = |it: &str| FileName::new(it).unwrap();
+            let (log, block, whole, moved) = (name("d/log"), name("d/block"), name("d/whole"), name("d/moved"));
+            let mut out = Vec::with_capacity(16);
+            for round in 0..2 * WARM {
+                if round == WARM {
+                    path_calls::forbid();
+                }
+                let at = 8 * round;
+                let mut writes = Vec::with_capacity(4);
+                writes.push(Effect::Append { file: log.clone(), bytes: b"line\n".to_vec(), tag: Tag(10 * round) });
+                let bytes = round.to_le_bytes().to_vec();
+                writes.push(Effect::WriteAt { file: block.clone(), at, bytes, tag: Tag(10 * round + 1) });
+                let bytes = round.to_le_bytes().to_vec();
+                writes.push(Effect::Write { file: whole.clone(), bytes, tag: Tag(10 * round + 2) });
+                let mut renames = Vec::with_capacity(1);
+                renames.push(Effect::Rename { from: whole.clone(), to: moved.clone(), tag: Tag(10 * round + 3) });
+                out.clear();
+                let calls = path_calls::count();
+                let ((), used) = blaze_alloc_count::measure(|| {
+                    driver.submit(&mut writes);
+                    poll_until(&mut driver, &mut out, |out| out.len() == 3);
+                    driver.submit(&mut renames);
+                    poll_until(&mut driver, &mut out, |out| out.len() == 4);
+                });
+                let calls = path_calls::count() - calls;
+                out.sort_by_key(|it| it.tag.0);
+                let done: Vec<&Done> = out.iter().map(|it| &it.done).collect();
+                assert_eq!(done, [&Done::Appended, &Done::Written, &Done::Written, &Done::Renamed], "round {round}");
+                if round >= WARM {
+                    assert_eq!(used.allocations, 0, "round {round}: {} bytes", used.bytes);
+                    assert_eq!(calls, 0, "round {round}: calls on names on the driver's thread");
+                }
             }
-        }
+            assert_eq!((driver.paths.held(), driver.slots_held), ([0, 0], 0));
+            assert_eq!(driver.in_flight(), 0);
+        })
+        .join()
+        .unwrap();
         let last = 2 * WARM - 1;
         assert_eq!(std::fs::read(root.join("d/moved")).unwrap(), last.to_le_bytes());
         assert_eq!(std::fs::read(root.join("d/block")).unwrap()[8 * last as usize..][..8], last.to_le_bytes());
         assert_eq!(std::fs::read(root.join("d/log")).unwrap().len(), 5 * 2 * WARM as usize);
         assert!(!root.join("d/whole").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An open through the ring that fails ends its request failed, the error naming the path
+    /// it opened, and every link after it cancelled: a write at an offset of a missing file, a
+    /// whole file's write and a rename into a directory that is a file, a read of a file under
+    /// one. Each slot it took is free again after, and the files are as they were.
+    #[test]
+    fn a_failed_open_fails_its_chain_naming_the_path() {
+        let root = dir("uring-open-fails");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("plain"), b"x").unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let free = driver.table.free.borrow().len();
+        let name = |it: &str| FileName::new(it).unwrap();
+        let mut effects = vec![
+            Effect::WriteAt { file: name("missing"), at: 0, bytes: b"a".to_vec(), tag: Tag(1) },
+            Effect::Write { file: name("plain/under"), bytes: b"b".to_vec(), tag: Tag(2) },
+            Effect::Rename { from: name("plain"), to: name("plain/under"), tag: Tag(3) },
+            Effect::Read { file: name("plain/under"), at: 0, len: 1, tag: Tag(4) },
+        ];
+        let mut seen = BTreeMap::new();
+        run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
+        let opened = |tag: u64, path: PathBuf| match &seen[&tag] {
+            Done::Failed(IoError(why)) => {
+                let path = path.display().to_string();
+                assert!(why.starts_with(&format!("opening {path}: ")), "{tag}: {why} (wanted {path})");
+            }
+            other => panic!("{tag}: {other:?}"),
+        };
+        opened(1, root.join("missing"));
+        opened(2, root.join("plain"));
+        opened(3, root.join("plain"));
+        opened(4, root.join("plain/under"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (driver.table.free.borrow().len() < free || driver.closes > 0) && Instant::now() < deadline {
+            driver.poll(&mut Vec::new(), Duration::ZERO);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!((driver.table.free.borrow().len(), driver.closes, driver.slots_held), (free, 0, 0));
         assert_eq!(driver.paths.held(), [0, 0]);
-        assert_eq!(driver.in_flight(), 0);
         drop(driver);
+        assert!(!root.join("missing").exists());
+        assert_eq!(std::fs::read(root.join("plain")).unwrap(), b"x");
         std::fs::remove_dir_all(root).unwrap();
     }
 

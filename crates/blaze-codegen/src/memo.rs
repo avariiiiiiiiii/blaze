@@ -79,8 +79,10 @@ impl Memo {
     /// Level `n`, if it was made.
     fn level(&self, n: usize) -> Option<&Level> {
         let first = self.levels[n].load(Ordering::Acquire);
-        // SAFETY: a non-null level is a leaked `Box<[AtomicPtr<Entry>]>` of `slots(n)`
-        // slots, published once by `level_or_make`'s CAS and freed only under `&mut self`.
+        // SAFETY: a non-null level is a leaked `Box<[AtomicPtr<Entry>]>` of exactly `slots(n)`
+        // slots, published once by `level_or_make`'s CAS (release, read here with acquire, so
+        // its slots are initialized) and freed only by `drain` under `&mut self`, which no
+        // returned `&Level` can outlive. A wrong length would read past the allocation.
         (!first.is_null()).then(|| unsafe { std::slice::from_raw_parts(first, slots(n)) })
     }
 
@@ -88,11 +90,14 @@ impl Memo {
         if let Some(level) = self.level(n) {
             return level;
         }
+        // alloc: a level, made once for the memo's life (at most `LEVELS`), on a put that spills
         let made: Box<Level> = (0..slots(n)).map(|_| AtomicPtr::new(ptr::null_mut())).collect();
         let made = Box::into_raw(made) as *mut AtomicPtr<Entry>;
         match self.levels[n].compare_exchange(ptr::null_mut(), made, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {}
-            // SAFETY: `made` was never published, so this is its only owner.
+            // SAFETY: the CAS failed, so `made` (the `Box` of `slots(n)` slots leaked just
+            // above) was never published and no other thread can have it: this is its only
+            // owner and it is freed once. Freed after a successful CAS, readers would use it.
             Err(_) => drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(made, slots(n))) }),
         }
         self.level(n).expect("made or made by another")
@@ -101,7 +106,10 @@ impl Memo {
     /// The entry at `slot`, if one is there.
     fn entry(slot: &AtomicPtr<Entry>) -> Option<&Entry> {
         let it = slot.load(Ordering::Acquire);
-        // SAFETY: a published entry is immutable and freed only under `&mut self`.
+        // SAFETY: a non-null slot holds an entry `put` boxed and published with a release CAS
+        // (read here with acquire, so it is initialized). Entries are never written after,
+        // and are freed only by `drain` under `&mut self`, which the `&self` this borrow is
+        // tied to excludes. Freed under a reader, this would be a use after free.
         (!it.is_null()).then(|| unsafe { &*it })
     }
 
@@ -128,6 +136,8 @@ impl Memo {
     /// so every instantiation of the shape in a build shares one template.
     pub fn put(&self, shape: ContentId, template: Template) -> &Template {
         let start = start(&shape);
+        // A slot is one pointer so that a CAS publishes the whole entry.
+        // alloc: one per compiled shape, after a compile that costs far more
         let ours = Box::into_raw(Box::new(Entry { shape, template }));
         for n in 0..LEVELS {
             let level = self.level_or_make(n);
@@ -136,7 +146,8 @@ impl Memo {
                 let slot = &level[(start + probe) & mask];
                 if let Some(entry) = Self::entry(slot) {
                     if entry.shape == shape {
-                        // SAFETY: `ours` was never published.
+                        // SAFETY: `ours` is the `Box` leaked at the top of `put`, not yet
+                        // offered to any slot, so no other thread can have it; freed once here.
                         drop(unsafe { Box::from_raw(ours) });
                         return &entry.template;
                     }
@@ -145,14 +156,19 @@ impl Memo {
                 match slot.compare_exchange(ptr::null_mut(), ours, Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => {
                         self.len.fetch_add(1, Ordering::Relaxed);
-                        // SAFETY: published just now, and freed only under `&mut self`.
+                        // SAFETY: `ours` is the live entry this CAS just published; from here
+                        // the memo owns it, never writes it again, and frees it only in `drain`
+                        // under `&mut self`, which the returned borrow of `&self` excludes.
                         return unsafe { &(*ours).template };
                     }
                     Err(theirs) => {
-                        // SAFETY: published by another put, as above.
+                        // SAFETY: the CAS expected null and failed, so `theirs` is non-null: an
+                        // entry another `put` published with a release CAS (acquired here),
+                        // immutable and freed only under `&mut self`, as in `entry`.
                         let theirs = unsafe { &*theirs };
                         if theirs.shape == shape {
-                            // SAFETY: `ours` was never published.
+                            // SAFETY: the CAS failed, so `ours` was never published: this is
+                            // its only owner, and it is freed once.
                             drop(unsafe { Box::from_raw(ours) });
                             return &theirs.template;
                         }
@@ -160,7 +176,8 @@ impl Memo {
                 }
             }
         }
-        // SAFETY: `ours` was never published.
+        // SAFETY: every CAS of `ours` failed, so it was never published: this is its only
+        // owner, and it is freed once, before the panic.
         drop(unsafe { Box::from_raw(ours) });
         panic!("the back-end memo is full: {LEVELS} levels of {PROBES} probes each")
     }
@@ -181,7 +198,10 @@ impl Memo {
             if first.is_null() {
                 continue;
             }
-            // SAFETY: `&mut self`: no reader holds a level or an entry.
+            // SAFETY: `first` is level `n`'s `Box` of `slots(n)` slots, leaked by
+            // `level_or_make` and just taken out of `levels` (nulled), so this is its one
+            // owner; `&mut self` means no reader holds a borrow of it. A reader left would read
+            // freed slots.
             let level = unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(first, slots(n))) };
             for mut slot in level.into_vec() {
                 let it = std::mem::replace(slot.get_mut(), ptr::null_mut());

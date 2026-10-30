@@ -43,7 +43,9 @@ impl<'db> VtableLayout<'db> {
             interner,
             plain,
             visited: FxHashSet::from_iter([trait_ref]),
+            // alloc: the layout's own lists, returned in it
             slots: Vec::new(),
+            // alloc: the layout's own lists, returned in it
             prefixes: Vec::new(),
             emit_vptr: false,
         };
@@ -102,16 +104,17 @@ impl<'db, P: Fn(TraitRef<'db>) -> TraitRef<'db>> Walk<'_, 'db, P> {
             .filter_map(|clause| clause.skip_norm_wip().0.as_trait_clause())
             .map(|pred| interner.instantiate_bound_regions_with_erased(pred).trait_ref)
             .map(self.plain)
+            // alloc: all made plain (normalized by the caller's inference) before any is visited
             .collect();
         for supertrait in supertraits {
             if self.visited.insert(supertrait) {
                 self.visit(supertrait, self.emit_vptr);
             }
         }
-        let methods = own_methods(interner, trait_ref.def_id.0);
-        let has_methods = !methods.is_empty();
+        let mut methods = own_methods(interner, trait_ref.def_id.0).peekable();
+        let has_methods = methods.peek().is_some();
         self.emit_vptr |= has_methods;
-        self.slots.extend(methods.into_iter().map(|func| Slot::Method(func, trait_ref)));
+        self.slots.extend(methods.map(|func| Slot::Method(func, trait_ref)));
         if !vptr {
             self.prefixes.push(trait_ref);
         } else if has_methods {
@@ -122,7 +125,10 @@ impl<'db, P: Fn(TraitRef<'db>) -> TraitRef<'db>> Walk<'_, 'db, P> {
 }
 
 /// The methods of `trait_` that can be called on a trait object, in declaration order.
-fn own_methods(interner: DbInterner<'_>, trait_: TraitId) -> Vec<FunctionId> {
+fn own_methods<'db>(
+    interner: DbInterner<'db>,
+    trait_: TraitId,
+) -> impl Iterator<Item = FunctionId> + 'db {
     let db = interner.db;
     trait_
         .trait_items(db)
@@ -132,8 +138,7 @@ fn own_methods(interner: DbInterner<'_>, trait_: TraitId) -> Vec<FunctionId> {
             AssocItemId::FunctionId(func) => Some(func),
             _ => None,
         })
-        .filter(|&func| !generics_require_sized_self(db, func.into()))
-        .collect()
+        .filter(move |&func| !generics_require_sized_self(db, func.into()))
 }
 
 /// `trait_ref` with every lifetime erased and the lifetimes of a `for<'a>` unnamed, as rustc

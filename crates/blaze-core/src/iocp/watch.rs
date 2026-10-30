@@ -92,7 +92,14 @@ impl Watching {
     /// Asks for the next changes, into the buffer, completing on the port through
     /// `overlapped`. Both stay where they are until that completion is dequeued (the driver
     /// keeps the request, and the buffer with it, until then).
-    pub(super) fn read(&mut self, overlapped: *mut OVERLAPPED) -> io::Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// `overlapped` is a request's [`super::sys::Head::overlapped`], made ready for this step,
+    /// and the request's entry (its head and this watch with its buffer) stays where it is, alive, until the
+    /// step's completion is dequeued: the kernel writes them after this returns, so freeing or
+    /// moving either first is a write to freed memory.
+    pub(super) unsafe fn read(&mut self, overlapped: *mut OVERLAPPED) -> io::Result<()> {
         // SAFETY: an open directory handle, a buffer of the length given (aligned to 64 KiB,
         // so to the `DWORD`s the call writes), and an `OVERLAPPED`, which outlive the request
         // (above).

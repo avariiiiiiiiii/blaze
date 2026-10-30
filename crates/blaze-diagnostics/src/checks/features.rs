@@ -349,9 +349,22 @@ pub(crate) fn lowered_feature_err(
     span: impl Into<MultiSpan>,
     explain: impl Into<String>,
 ) -> Diag {
-    let bootstrap = cx.krate.base().env(cx.db).get("RUSTC_BOOTSTRAP");
-    let features = Features { nightly: nightly_build(bootstrap.as_deref(), None), ..Features::default() };
+    let features = Features { nightly: lowered_nightly(cx), ..Features::default() };
     feature_err(&features, feature, span, explain)
+}
+
+/// rustc's `sess.is_nightly_build()` for a lowering of what hir found, read off
+/// `RUSTC_BOOTSTRAP` as [`configured`] reads it.
+pub(crate) fn lowered_nightly(cx: &Cx<'_, '_>) -> bool {
+    let bootstrap = cx.krate.base().env(cx.db).get("RUSTC_BOOTSTRAP");
+    nightly_build(bootstrap.as_deref(), None)
+}
+
+/// rustc's `add_feature_diagnostics` of `feature` on an error a lowering of what hir found
+/// built itself (`create_feature_err`, a `ConditionallyConstCall`'s `const_trait_impl`).
+pub(crate) fn lowered_feature_notes(cx: &Cx<'_, '_>, diag: &mut Diag, feature: &str) {
+    let features = Features { nightly: lowered_nightly(cx), ..Features::default() };
+    feature_notes(diag, &features, feature);
 }
 
 /// rustc's `feature_warn`: the warning of a soft gate, `unstable_syntax_pre_expansion` (a

@@ -252,7 +252,14 @@ impl Accepting {
     }
 
     /// Asks for the next connection, completing through `overlapped`.
-    pub(super) fn accept(&mut self, overlapped: *mut OVERLAPPED) -> io::Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// `overlapped` is a request's [`super::sys::Head::overlapped`], made ready for this step,
+    /// and the request's entry (its head and this `Accepting` with its address buffer and accepted socket) stays where it is, alive, until the
+    /// step's completion is dequeued: the kernel writes them after this returns, so freeing or
+    /// moving either first is a write to freed memory.
+    pub(super) unsafe fn accept(&mut self, overlapped: *mut OVERLAPPED) -> io::Result<()> {
         let accepted = stream(self.listener.family)?;
         let mut got = 0;
         // SAFETY: two open sockets, the address buffer of the lengths given, and an
@@ -334,7 +341,14 @@ impl Connecting {
     }
 
     /// Asks for the connect, through `overlapped`.
-    pub(super) fn start(
+    ///
+    /// # Safety
+    ///
+    /// `overlapped` is a request's [`super::sys::Head::overlapped`], made ready for this step,
+    /// and the request's entry (its head and this `Connecting` with its address and socket) stays where it is, alive, until the
+    /// step's completion is dequeued: the kernel writes them after this returns, so freeing or
+    /// moving either first is a write to freed memory.
+    pub(super) unsafe fn start(
         &mut self,
         associate: impl FnOnce(&OwnedSocket) -> io::Result<()>,
         overlapped: *mut OVERLAPPED,
@@ -435,7 +449,14 @@ pub(super) fn connect_blocking(root: &Path, at: &Address) -> io::Result<OwnedSoc
 /// A receive into the `len` bytes at `into` (which need not be initialized: the kernel only
 /// writes them), completing through `overlapped`; they, and `flags` (which Winsock may write as
 /// it completes), are the request's, kept until its completion is taken.
-pub(super) fn recv(
+///
+/// # Safety
+///
+/// `into` is `len` writable bytes and `flags` a writable `u32`, both the request's, and
+/// `overlapped` its head's, made ready for this step; all three stay where they are, alive and
+/// unread by anything else, until the completion is dequeued, as Winsock writes them after
+/// this returns. `socket` is open.
+pub(super) unsafe fn recv(
     socket: SOCKET,
     into: *mut u8,
     len: usize,
@@ -452,7 +473,13 @@ pub(super) fn recv(
 }
 
 /// A send of `bytes`, completing through `overlapped`; both outlive the request.
-pub(super) fn send(socket: SOCKET, bytes: &[u8], overlapped: *mut OVERLAPPED) -> io::Result<()> {
+///
+/// # Safety
+///
+/// `bytes` and `overlapped` (the request's head, made ready for this step) stay where they
+/// are, alive and unwritten, until the completion is dequeued: Winsock reads the bytes after
+/// this returns, past the borrow. `socket` is open.
+pub(super) unsafe fn send(socket: SOCKET, bytes: &[u8], overlapped: *mut OVERLAPPED) -> io::Result<()> {
     let buffer = WSABUF { len: bytes.len().min(u32::MAX as usize) as u32, buf: bytes.as_ptr().cast_mut() };
     // SAFETY: as in `recv`; the bytes are only read.
     let ok = unsafe { WSASend(socket, &buffer, 1, std::ptr::null_mut(), 0, overlapped, None) };

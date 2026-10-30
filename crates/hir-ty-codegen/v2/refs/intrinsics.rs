@@ -10,7 +10,10 @@
 //! `fma.rs`), every form it may take is listed.
 
 use hir_ty::db::HirDatabase;
-use std::fmt;
+use std::{
+    borrow::Cow,
+    fmt::{self, Write as _},
+};
 
 use cranelift_codegen::ir::{self, types};
 use hir_def::{
@@ -166,6 +169,18 @@ fn int_of_quad(bits: u32, signed: bool) -> &'static str {
     }
 }
 
+/// `text` with each `{imm}` in it made `value`, as `str::replace` makes it.
+fn put_immediate(text: &str, value: impl fmt::Display) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    for (i, piece) in text.split("{imm}").enumerate() {
+        if i > 0 {
+            _ = write!(out, "{value}");
+        }
+        out.push_str(piece);
+    }
+    out
+}
+
 /// The letter `asm::fcvt` names a float of `ty` by.
 fn letter(ty: ir::Type) -> char {
     match ty {
@@ -179,7 +194,7 @@ fn letter(ty: ir::Type) -> char {
 fn neon_pairwise(name: &str, arity: usize) -> bool {
     let mut parts = name.split('.');
     let op = parts.next().unwrap_or_default();
-    let parts: Vec<&str> = parts.collect();
+    let first = name.split('.').nth(1);
     let Some((lanes, ty)) = parts.last().and_then(|it| {
         let (lanes, bits) = it.strip_prefix('v')?.split_once('i')?;
         Some((lanes.parse::<i32>().ok()?, ir::Type::int(bits.parse().ok()?)?))
@@ -192,8 +207,7 @@ fn neon_pairwise(name: &str, arity: usize) -> bool {
         ("umaxp" | "smaxp" | "uminp" | "sminp" | "addp", 2) => true,
         ("sqdmulh", 2) => ty.bits() <= 32,
         ("uaddlp" | "saddlp", 1) => ty.bits() <= 32,
-        ("uaddlv" | "saddlv" | "uaddv" | "saddv", 1) => parts
-            .first()
+        ("uaddlv" | "saddlv" | "uaddv" | "saddv", 1) => first
             .and_then(|it| ir::Type::int(it.strip_prefix('i')?.parse().ok()?))
             .is_some(),
         ("sqdmull", 2) => ty.bits() >= 32,
@@ -205,21 +219,17 @@ fn neon_pairwise(name: &str, arity: usize) -> bool {
 /// The instructions `lower_fma` may make of an fma of `bytes` with the instruction suffix
 /// `suffix`: each folded negation (`vfnmadd`, `vfmsub`, `vfnmsub`), and either factor first.
 fn fma_texts(bytes: u32, suffix: &str) -> Vec<String> {
-    let reg = |number: usize| match bytes {
-        64 => format!("zmm{number}"),
-        32 => format!("ymm{number}"),
-        _ => format!("xmm{number}"),
+    let reg = match bytes {
+        64 => "zmm",
+        32 => "ymm",
+        _ => "xmm",
     };
     let mut texts = Vec::with_capacity(8);
     for op in ["vfmadd", "vfnmadd", "vfmsub", "vfnmsub"] {
         for (first, second) in [(1, 2), (2, 1)] {
+            // alloc: the instruction's text, which `avx512_function` is handed
             texts.push(format!(
-                "vmovaps {}, {}\n{op}213{suffix} {}, {}, {}",
-                reg(0),
-                reg(second),
-                reg(0),
-                reg(first),
-                reg(3),
+                "vmovaps {reg}0, {reg}{second}\n{op}213{suffix} {reg}0, {reg}{first}, {reg}3"
             ));
         }
     }
@@ -267,9 +277,10 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let Some((name, lowered)) = self.fx.neon_fused().map_err(told)? else { return Ok(false) };
         let body = self.fx.body.expect("MIR body");
         let arg_tys: Tys<'db> =
+            // alloc: into `Tys`, inline up to eight parameters
             body.param_locals.iter().map(|&local| body.locals[local].ty.as_ref()).collect();
         let dst_ty = body.locals[crate::returned_local(body)].ty.as_ref();
-        let text = self.neon_text(&name, &lowered, &arg_tys, dst_ty)?;
+        let text = self.neon_text(&name, &lowered, &lowered.text, &arg_tys, dst_ty)?;
         self.assembly(text)?;
         Ok(true)
     }
@@ -314,6 +325,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         {
             return match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Ok(()),
+                // alloc: the error's message
                 _ => Err(unsupported(format!("{op:?} on wide pointers"))),
             };
         }
@@ -327,6 +339,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         if float {
             if overflowing {
+                // alloc: the error's message
                 return Err(unsupported(format!("{given:?} of floats")));
             }
             return Ok(());
@@ -419,14 +432,17 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 if shapes.len() as u64 != to.vectors
                     || shapes.iter().any(|it| it.is_none_or(|it| it.vectors != 1 || it.predicate()))
                 {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`{intrinsic}` of {dst_ty:?}")));
                 }
             }
             (I::SveTupleGet | I::SveTupleSet, _) => {
                 let Some(index) = generic_args.iter().nth(2).and_then(|it| it.konst()) else {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`{intrinsic}` without its index")));
                 };
                 let ConstKind::Value(index) = index.kind() else {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`{intrinsic}` with an index not evaluated")));
                 };
                 let index = index.value.inner().to_leaf().to_bits(Size::from_bytes(4)) as i32;
@@ -440,6 +456,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     _ => false,
                 };
                 if !fits {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`{intrinsic}` of {dst_ty:?} at {index}")));
                 }
             }
@@ -452,6 +469,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     self.assembly(text)?;
                 }
             }
+            // alloc: the error's message
             _ => return Err(unsupported(format!("intrinsic `{intrinsic}` on scalable vectors"))),
         }
         Ok(true)
@@ -483,6 +501,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 | I::Breakpoint
         );
         let arg_tys = match unread {
+            // alloc: into `Tys`, inline up to eight operands
             true => args.iter().map(|it| self.operand_ty(it)).collect(),
             false => self.operands(args)?,
         };
@@ -523,6 +542,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             (I::TypeName, []) => {
                 let ty = generic_args.type_at(0);
                 if hir_ty_mir::mir::type_name::rustc_type_name(self.db(), ty).is_none() {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`type_name` of `{ty:?}`")));
                 }
             }
@@ -645,6 +665,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                         | S::Div
                 );
                 if lane.ty.is_float() && !by_lanes {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`{intrinsic}` of floats")));
                 }
                 if !lane.ty.is_float() && op == S::Div {
@@ -654,6 +675,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             (I::Simd(S::Fma | S::RelaxedFma), [_, _, _]) => {
                 let (lane, count) = self.simd_lanes_of(dst_ty)?;
                 if !lane.ty.is_float() {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`{intrinsic}` of integers")));
                 }
                 let swapped = self.fx.cg.target.arch == Arch::Aarch64 && count > 1;
@@ -679,10 +701,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             (I::Simd(S::Bitmask), [_]) => {
                 let (lane, count) = self.simd_lanes_of(arg_tys[0])?;
                 let BackendRepr::Scalar(_) = self.ty_layout(dst_ty)?.backend_repr else {
+                    // alloc: the error's message
                     return Err(unsupported(format!("simd_bitmask into {dst_ty:?}")));
                 };
                 self.ty_scalar(dst_ty)?;
                 if count > 64 || lane.ty.bits() > 64 {
+                    // alloc: the error's message
                     return Err(unsupported(format!("simd_bitmask of {count} lanes")));
                 }
             }
@@ -692,6 +716,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             ) => {
                 let (lane, _) = self.simd_lanes_of(arg_tys[0])?;
                 if lane.ty.is_float() {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`{intrinsic}` of floats")));
                 }
             }
@@ -704,8 +729,10 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                         Primitive::Float(float) => {
                             neon::Lanes::floats(float.size().bits() as u32, count.as_u64() as u32)
                         }
+                        // alloc: the error's message
                         _ => return Err(unsupported(format!("`{intrinsic}` of integers"))),
                     },
+                    // alloc: the error's message
                     _ => return Err(unsupported(format!("vector operation on {ty:?}"))),
                 };
                 let instruction = match op {
@@ -714,6 +741,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     _ => "frintx",
                 };
                 let Some(lowered) = neon::rounding(instruction, lanes) else {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`{intrinsic}` of {ty:?}")));
                 };
                 self.neon_assembly(&intrinsic, &lowered, args, dst_ty)?;
@@ -737,14 +765,17 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 let float = lane.ty.is_float();
                 match op {
                     S::Ctpop | S::Ctlz | S::Cttz | S::Bswap | S::Bitreverse if float => {
+                        // alloc: the error's message
                         return Err(unsupported(format!("`{intrinsic}` of floats")));
                     }
                     S::Fabs | S::Fsqrt | S::Floor | S::Ceil if !float => {
+                        // alloc: the error's message
                         return Err(unsupported(format!("`{intrinsic}` of integers")));
                     }
                     S::Fsqrt | S::Floor | S::Ceil
                         if lane.ty != types::F32 && lane.ty != types::F64 =>
                     {
+                        // alloc: the error's message
                         return Err(unsupported(format!("`{intrinsic}` of {:?} lanes", lane.ty)));
                     }
                     S::Floor => self.cranelift_routine(Routine::Floor, lane.ty)?,
@@ -755,6 +786,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             (I::Simd(S::FunnelShl | S::FunnelShr), [_, _, _]) => {
                 let (lane, _) = self.simd_lanes_of(arg_tys[0])?;
                 if lane.ty.is_float() {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`{intrinsic}` of floats")));
                 }
             }
@@ -767,6 +799,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             ) => {
                 let scalar = self.ty_scalar(arg_tys[0])?;
                 if !scalar.ty.is_float() {
+                    // alloc: the error's message
                     return Err(unsupported(format!(
                         "intrinsic `{intrinsic}` on {:?}",
                         scalar.ty
@@ -812,6 +845,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 let scalar = self.ty_scalar(arg_tys[0])?;
                 self.ty_scalar(arg_tys[1])?;
                 if !scalar.ty.is_float() {
+                    // alloc: the error's message
                     return Err(unsupported(format!(
                         "intrinsic `{intrinsic}` on {:?}",
                         scalar.ty
@@ -826,6 +860,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                         I::FdivFast | I::FdivAlgebraic => Some(BinOp::Div),
                         I::FremFast | I::FremAlgebraic => Some(BinOp::Rem),
                         _ => {
+                            // alloc: the error's message
                             let why = format!("intrinsic `{intrinsic}` on {:?}", scalar.ty);
                             return Err(unsupported(why));
                         }
@@ -841,6 +876,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     I::Powf => self.symbol(if single { "powf" } else { "pow" })?,
                     I::FremFast | I::FremAlgebraic => {
                         if !single && scalar.ty != types::F64 {
+                            // alloc: the error's message
                             let why = format!("intrinsic `{intrinsic}` on {:?}", scalar.ty);
                             return Err(unsupported(why));
                         }
@@ -865,6 +901,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             (I::CatchUnwind, [_, _, _]) => {
                 let outcome = self.ty_layout(dst_ty)?.size.bytes();
                 if ir::Type::int_with_byte_size(outcome as u16).is_none() {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`catch_unwind` giving {outcome} bytes")));
                 }
                 // The calls of the closures go through the pointers MIR passes, whose
@@ -958,6 +995,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 [_, _, predicate],
             ) => {
                 if self.const_immediate(predicate)?.is_none() {
+                    // alloc: the error's message
                     let why = format!("`llvm.{name}` with a predicate that is not a constant");
                     return Err(unsupported(why));
                 }
@@ -970,6 +1008,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 [_, mode],
             ) => {
                 let Some(mode) = self.const_immediate(mode)? else {
+                    // alloc: the error's message
                     let why = format!("LLVM intrinsic `{name}` with a mode that is not a constant");
                     return Err(unsupported(why));
                 };
@@ -988,8 +1027,14 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 | "x86.sha256msg2",
                 [_, _],
             ) => {
-                let instruction = format!("{} xmm0, xmm1", name.trim_start_matches("x86."));
-                self.assembly(asm::vector_instruction(&instruction, "xmm0"))?;
+                let instruction = match name {
+                    "x86.sha1msg1" => "sha1msg1 xmm0, xmm1",
+                    "x86.sha1msg2" => "sha1msg2 xmm0, xmm1",
+                    "x86.sha1nexte" => "sha1nexte xmm0, xmm1",
+                    "x86.sha256msg1" => "sha256msg1 xmm0, xmm1",
+                    _ => "sha256msg2 xmm0, xmm1",
+                };
+                self.assembly(asm::vector_instruction(instruction, "xmm0"))?;
             }
             ("x86.sha256rnds2", [_, _, _]) => {
                 let rounds = "movdqa xmm3, xmm0\nmovdqa xmm0, xmm2\nsha256rnds2 xmm3, xmm1";
@@ -1033,6 +1078,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             }
             ("aarch64.dmb" | "aarch64.dsb" | "aarch64.hint", [option]) => {
                 let Some(option) = self.const_immediate(option)? else {
+                    // alloc: the error's message
                     let why = format!("`llvm.{name}` of an option that is not a constant");
                     return Err(unsupported(why));
                 };
@@ -1042,6 +1088,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     _ => (0xd503_201f, 127, 5),
                 };
                 if option > most {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`llvm.{name}` of option {option}")));
                 }
                 self.assembly(asm::instruction_word(word | (option as u32) << at))?;
@@ -1049,6 +1096,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             ("aarch64.rndr" | "aarch64.rndrrs", []) => {
                 let layout = self.ty_layout(dst_ty)?;
                 if layout.size.bytes() != 16 || layout.fields.offset(1).bytes() != 8 {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`llvm.{name}` returning {dst_ty:?}")));
                 }
                 self.assembly(asm::random(name == "aarch64.rndrrs"))?;
@@ -1061,6 +1109,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             }
             (_, [_, _, _]) if name.starts_with("x86.avx512.vpermi2var.") => {
                 if !matches!(name.split('.').nth(3), Some("qi" | "hi" | "d" | "ps" | "q" | "pd")) {
+                    // alloc: the error's message
                     return Err(unsupported(format!("LLVM intrinsic `{name}`")));
                 }
             }
@@ -1118,6 +1167,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             {
                 self.x86_assembly(name, &lowered, args, arg_tys, dst_ty)?
             }
+            // alloc: the error's message
             _ => return Err(unsupported(format!("LLVM intrinsic `{name}`"))),
         }
         Ok(())
@@ -1150,9 +1200,11 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<(), String> {
         if args.len() != 3 {
+            // alloc: the error's message
             return Err(unsupported(format!("`{name}` with {} arguments", args.len())));
         }
         if matches!(name, Intrinsic::Simd(SimdOp::RelaxedFma) | Intrinsic::Fmuladd) {
+            // alloc: the error's message
             return Err(unsupported(format!(
                 "`{name}` in an x86-64 function with FMA, which LLVM may or may not fuse there"
             )));
@@ -1168,6 +1220,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<(u32, &'static str), String> {
         if self.enables_feature(TargetFeature::FMA4) {
+            // alloc: the error's message
             return Err(unsupported(format!("`{name}` in an x86-64 function with FMA4")));
         }
         let layout = self.ty_layout(dst_ty)?;
@@ -1177,12 +1230,15 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             BackendRepr::SimdVector { element, .. } => {
                 (self.fx.scalar(element).map_err(told)?.ty, false)
             }
+            // alloc: the error's message
             _ => return Err(unsupported(format!("`{name}` of {dst_ty:?}"))),
         };
         if !lane.is_float() || lane == types::F128 {
+            // alloc: the error's message
             return Err(unsupported(format!("`{name}` of {lane} in an x86-64 function with FMA")));
         }
         if lane == types::F16 && !self.enables_feature(TargetFeature::AVX512FP16) {
+            // alloc: the error's message
             return Err(unsupported(format!(
                 "`{name}` of f16 in an x86-64 function with FMA and without AVX512-FP16, \
                  which LLVM fuses by its context"
@@ -1196,6 +1252,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             || bytes == 64 && !self.enables_feature(TargetFeature::AVX512F)
             || vl
         {
+            // alloc: the error's message
             let why = format!("`{name}` of {dst_ty:?} in an x86-64 function with FMA");
             return Err(unsupported(why));
         }
@@ -1249,6 +1306,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     ) -> Result<(), String> {
         let name = Intrinsic::Simd(op);
         let Some(&ty) = arg_tys.first() else {
+            // alloc: the error's message
             return Err(unsupported(format!("`{name}` without operands")));
         };
         let (a, a_signed) = self.fx.neon_lanes_of(ty).map_err(told)?;
@@ -1262,6 +1320,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 && a.bits == 16
             {
                 if args.len() != 1 {
+                    // alloc: the error's message
                     return Err(unsupported(format!("`simd_neg` with {} arguments", args.len())));
                 }
                 return Ok(());
@@ -1270,6 +1329,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 self.fx.function_enables(it)
             });
             let Some(lowered) = lowered.filter(|it| it.loads.len() == args.len()) else {
+                // alloc: the error's message
                 return Err(unsupported(format!(
                     "`{name}` of lanes of f16 on x86-64 without an instruction for it here"
                 )));
@@ -1286,6 +1346,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         let signed = if a.float { r_signed } else { a_signed };
         let Some(lowered) = neon::half_vector(op, r, a, signed) else {
+            // alloc: the error's message
             return Err(unsupported(format!("`{name}` of lanes of f16 into {dst_ty:?}")));
         };
         self.neon_assembly(&name, &lowered, args, dst_ty)
@@ -1300,10 +1361,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         args: &[Operand],
         dst_ty: Ty<'db>,
     ) -> Result<(), String> {
+        // alloc: inline up to eight operands
         let mut args: SmallVec<[&Operand; 8]> = args.iter().collect();
         let mut with_immediate = None;
         if let Some(immediate) = &lowered.immediate {
             if immediate.arg >= args.len() {
+                // alloc: the error's message
                 return Err(unsupported(format!("`{name}` with {} arguments", args.len())));
             }
             let arg = args.remove(immediate.arg);
@@ -1315,30 +1378,34 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             let Some(value) =
                 value.and_then(|it| u32::try_from(it).ok()).filter(|it| range.contains(it))
             else {
+                // alloc: the error's message
                 return Err(unsupported(format!(
                     "`{name}` with an immediate that is not a constant of {}..={}",
                     range.start(),
                     range.end()
                 )));
             };
-            let text = lowered.text.replace("{imm}", &value.to_string());
-            with_immediate = Some(neon::Lowered { text, ..lowered.clone() });
+            with_immediate = Some(put_immediate(&lowered.text, value));
         }
+        // alloc: into `Tys`, inline up to eight operands
         let arg_tys: Tys<'db> = args.iter().map(|arg| self.operand_ty(arg)).collect();
-        let text =
-            self.neon_text(name, with_immediate.as_ref().unwrap_or(lowered), &arg_tys, dst_ty)?;
+        let text = with_immediate.as_deref().unwrap_or(lowered.text.as_str());
+        let text = self.neon_text(name, lowered, text, &arg_tys, dst_ty)?;
         self.assembly(text)
     }
 
-    /// The text `neon_call` assembles for `lowered` on operands of `arg_tys`.
+    /// The text `neon_call` assembles for `lowered`, whose instructions are `text`, on operands
+    /// of `arg_tys`.
     fn neon_text(
         &self,
         name: &(impl fmt::Display + ?Sized),
         lowered: &neon::Lowered,
+        text: &str,
         arg_tys: &[Ty<'db>],
         dst_ty: Ty<'db>,
     ) -> Result<String, String> {
         if arg_tys.len() != lowered.args.len() {
+            // alloc: the error's message
             return Err(unsupported(format!("`{name}` with {} arguments", arg_tys.len())));
         }
         for (&ty, expected) in arg_tys.iter().zip(&lowered.args) {
@@ -1348,6 +1415,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 Some(bytes) => !pointer && self.ty_layout(ty)?.size.bytes() == u64::from(*bytes),
             };
             if !fits {
+                // alloc: the error's message
                 return Err(unsupported(format!(
                     "`{name}` of {ty:?}, which is not what its name says"
                 )));
@@ -1355,24 +1423,28 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         let layout = self.ty_layout(dst_ty)?;
         let size: u64 = lowered.results.iter().map(|&it| u64::from(it)).sum();
-        let results: Vec<(u32, u32)> = match lowered.results.as_slice() {
-            [] if layout.is_zst() => Vec::new(),
-            &[bytes] if layout.size.bytes() == u64::from(bytes) => vec![(0, bytes)],
+        let results: SmallVec<[(u32, u32); 4]> = match lowered.results.as_slice() {
+            [] if layout.is_zst() => SmallVec::new(),
+            &[bytes] if layout.size.bytes() == u64::from(bytes) => {
+                SmallVec::from_slice(&[(0, bytes)])
+            }
             many if layout.size.bytes() == size
                 && layout.fields.count() == many.len()
                 && (0..many.len())
                     .all(|i| layout.fields.offset(i).bytes() == i as u64 * u64::from(many[0])) =>
             {
+                // alloc: inline up to four results
                 many.iter().enumerate().map(|(i, &bytes)| (i as u32 * bytes, bytes)).collect()
             }
             _ => {
+                // alloc: the error's message
                 return Err(unsupported(format!(
                     "`{name}` returning {dst_ty:?}, which is not what its name says"
                 )));
             }
         };
         let directives = asm::extensions(Arch::Aarch64, lowered.features.iter().copied());
-        Ok(asm::neon_function(&directives, &lowered.args, &lowered.text, &results))
+        Ok(asm::neon_function(&directives, &lowered.args, text, &results))
     }
 
     /// `FunctionCx::immediate`, of the walk's types.
@@ -1420,14 +1492,20 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     /// `FunctionCx::splat_immediate`, of the walk's types.
     fn splat_immediate(&mut self, operand: &Operand, lane: u32) -> Result<Option<u128>, String> {
-        let memory = match &operand.kind {
-            OperandKind::Allocation { allocation } => allocation.as_ref().memory.to_vec(),
+        let (blob, interned);
+        let memory: &[u8] = match &operand.kind {
+            OperandKind::Allocation { allocation } => {
+                interned = allocation.as_ref();
+                &interned.memory[..]
+            }
             OperandKind::Constant { konst, ty } => match konst.as_ref().kind() {
                 ConstKind::Value(value) => {
-                    self.recorded(|fx| fx.valtree_blob(ty.as_ref(), value.value))?.bytes
+                    blob = self.recorded(|fx| fx.valtree_blob(ty.as_ref(), value.value))?.bytes;
+                    &blob[..]
                 }
                 ConstKind::Unevaluated(named) => {
-                    self.recorded(|fx| fx.eval_const(named))?.memory.to_vec()
+                    interned = self.recorded(|fx| fx.eval_const(named))?;
+                    &interned.memory[..]
                 }
                 _ => return Ok(None),
             },
@@ -1490,6 +1568,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         if let avx512::Out::Masks(_, at) = lowered.out
             && (layout.fields.count() != 2 || layout.fields.offset(1).bytes() != u64::from(at))
         {
+            // alloc: the error's message
             return Err(unsupported(format!("`llvm.{name}` returning {dst_ty:?}")));
         }
         self.assembly(asm::avx512_function(&lowered.loads, &lowered.text, lowered.out))?;
@@ -1506,22 +1585,25 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<(), String> {
         if args.len() != lowered.args.len() {
+            // alloc: the error's message
             return Err(unsupported(format!("`{name}` with {} arguments", args.len())));
         }
-        let mut text = lowered.text.clone();
-        let mut reads = Vec::new();
+        let mut text = Cow::Borrowed(lowered.text.as_str());
+        let mut reads = Vec::with_capacity(args.len());
         let mut size = 0;
         for ((arg, &ty), register) in args.iter().zip(arg_tys).zip(&lowered.args) {
             let Some(register) = register else {
                 let Some(immediate) = self.const_immediate(arg)?.filter(|it| *it <= 0xff) else {
+                    // alloc: the error's message
                     let why = format!("`{name}` with an immediate that is not a constant byte");
                     return Err(unsupported(why));
                 };
-                text = text.replace("{imm}", &immediate.to_string());
+                text = Cow::Owned(put_immediate(&text, immediate));
                 continue;
             };
             let bytes = asm::x86_register_bytes(register).expect("a register of x86");
             if self.ty_layout(ty)?.size.bytes() != u64::from(bytes) {
+                // alloc: the error's message
                 return Err(unsupported(format!(
                     "`{name}` of {ty:?}, which is not what its name says"
                 )));
@@ -1531,11 +1613,14 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         let layout = self.ty_layout(dst_ty)?;
         let register_bytes = |it: &str| u64::from(asm::x86_register_bytes(it).expect("x86's"));
-        let writes: Vec<(&str, u32)> = match lowered.results.as_slice() {
-            [] if layout.is_zst() => Vec::new(),
-            &[register] if layout.size.bytes() == register_bytes(register) => vec![(register, 0)],
+        let writes: SmallVec<[(&str, u32); 4]> = match lowered.results.as_slice() {
+            [] if layout.is_zst() => SmallVec::new(),
+            &[register] if layout.size.bytes() == register_bytes(register) => {
+                SmallVec::from_slice(&[(register, 0)])
+            }
             many => {
-                let fields: Vec<Ty<'db>> = match dst_ty.kind() {
+                let fields: Tys<'db> = match dst_ty.kind() {
+                    // alloc: into `Tys`, inline up to eight fields
                     TyKind::Tuple(tys) => tys.iter().collect(),
                     TyKind::Adt(adt_def, subst) if let AdtId::StructId(id) = adt_def.def_id() => {
                         let field_types = self.db().field_types(id.into());
@@ -1546,11 +1631,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                                     it.ty().instantiate(self.fx.interner, subst).skip_norm_wip();
                                 self.fx.normalize(ty)
                             })
+                            // alloc: into `Tys`, inline up to eight fields
                             .collect()
                     }
-                    _ => Vec::new(),
+                    _ => Tys::new(),
                 };
-                let mut writes = Vec::new();
+                let mut writes = SmallVec::with_capacity(many.len());
                 for (i, (&register, &field)) in many.iter().zip(&fields).enumerate() {
                     if self.ty_layout(field)?.size.bytes() != register_bytes(register) {
                         break;
@@ -1558,6 +1644,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     writes.push((register, layout.fields.offset(i).bytes() as u32));
                 }
                 if fields.len() != many.len() || writes.len() != many.len() {
+                    // alloc: the error's message
                     return Err(unsupported(format!(
                         "`{name}` returning {dst_ty:?}, which is not what its name says"
                     )));
@@ -1590,6 +1677,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 continue;
             }
             let BackendRepr::Scalar(_) = layout.backend_repr else {
+                // alloc: the error's message
                 return Err(unsupported(format!(
                     "LLVM intrinsic `{name}` with an operand of {ty:?}"
                 )));
@@ -1624,20 +1712,28 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let bits = match ty.kind() {
             TyKind::Int(_) | TyKind::Uint(_) => self.const_immediate(operand)?,
             TyKind::Adt(..) => {
-                let bytes = match &operand.kind {
+                let (blob, interned);
+                let bytes: Option<&[u8]> = match &operand.kind {
                     OperandKind::Constant { konst, .. } => match konst.as_ref().kind() {
                         ConstKind::Value(value) => {
-                            let blob = self.recorded(|fx| fx.valtree_blob(ty, value.value))?;
-                            (blob.relocs.is_empty() && blob.fn_relocs.is_empty())
-                                .then_some(blob.bytes)
+                            let made = self.recorded(|fx| fx.valtree_blob(ty, value.value))?;
+                            match made.relocs.is_empty() && made.fn_relocs.is_empty() {
+                                true => {
+                                    blob = made.bytes;
+                                    Some(&blob[..])
+                                }
+                                false => None,
+                            }
                         }
                         ConstKind::Unevaluated(named) => {
-                            Some(self.recorded(|fx| fx.eval_const(named))?.memory.to_vec())
+                            interned = self.recorded(|fx| fx.eval_const(named))?;
+                            Some(&interned.memory[..])
                         }
                         _ => None,
                     },
                     OperandKind::Allocation { allocation } => {
-                        Some(allocation.as_ref().memory.to_vec())
+                        interned = allocation.as_ref();
+                        Some(&interned.memory[..])
                     }
                     // A const generic argument is moved to a local of its own first.
                     OperandKind::Copy(place) | OperandKind::Move(place)
@@ -1730,31 +1826,37 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             }
             TyKind::Adt(adt_def, subst) => {
                 let layout = self.ty_layout(ty)?;
-                let variants: Vec<VariantId> = match adt_def.def_id() {
+                let variants: SmallVec<[VariantId; 8]> = match adt_def.def_id() {
                     AdtId::UnionId(_) => return Err(unsupported("comparison of a union")),
-                    AdtId::StructId(id) => vec![id.into()],
+                    AdtId::StructId(id) => SmallVec::from_slice(&[id.into()]),
                     AdtId::EnumId(id) => {
                         let all = id.enum_variants(db).variants.values().map(|&(it, _)| it);
                         match &layout.variants {
-                            Variants::Empty => Vec::new(),
+                            Variants::Empty => SmallVec::new(),
                             Variants::Single { index } => all
                                 .filter(|variant| variant.index(db) == index.0)
                                 .take(1)
                                 .map(VariantId::from)
+                                // alloc: one variant, inline
                                 .collect(),
                             // Only the variants with fields that compare in parts are
                             // compared field by field.
-                            Variants::Multiple { .. } => all
-                                .filter(|&variant| {
+                            Variants::Multiple { .. } => {
+                                let mut stack = Vec::with_capacity(8);
+                                all.filter(|&variant| {
+                                    stack.clear();
+                                    stack.push(ty);
                                     db.field_types(variant.into()).iter().next().is_some()
                                         && self.fx.fields_compare_in_parts(
                                             variant.into(),
                                             subst,
-                                            &mut vec![ty],
+                                            &mut stack,
                                         )
                                 })
                                 .map(VariantId::from)
-                                .collect(),
+                                // alloc: inline up to eight variants
+                                .collect()
+                            }
                         }
                     }
                 };
@@ -1784,6 +1886,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         if from.ty == types::I128 || to.ty == types::I128 {
             let Some(name) = wide_int_float(from, to) else {
+                // alloc: the error's message
                 return Err(unsupported(format!("cast from {} to {}", from.ty, to.ty)));
             };
             return self.symbol(name);
@@ -1831,6 +1934,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 Ok(())
             }
             (_, types::F128) => self.symbol(quad_of_int(from.ty.bits(), from.signed)),
+            // alloc: the error's message
             _ => Err(unsupported(format!("cast from {} to {}", from.ty, to.ty))),
         }
     }
@@ -1849,6 +1953,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             | BinOp::Mul
             | BinOp::Div => Ok(()),
             BinOp::Rem => self.symbol(if ty == types::F32 { "fmodf" } else { "fmod" }),
+            // alloc: the error's message
             _ => Err(unsupported(format!("float operator {op:?}"))),
         }
     }
@@ -1856,19 +1961,18 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// `soft_binary_op` of two `f16`s or two `f128`s.
     fn soft_binary(&mut self, op: &BinOp, ty: ir::Type) -> Result<(), String> {
         if ty == types::F16 {
-            let mnemonic = match op {
-                BinOp::Add => Some("fadd"),
-                BinOp::Sub => Some("fsub"),
-                BinOp::Mul => Some("fmul"),
-                BinOp::Div => Some("fdiv"),
+            let instructions = match op {
+                BinOp::Add => Some(("fadd h0, h0, h1", "vaddsh xmm0, xmm0, xmm1")),
+                BinOp::Sub => Some(("fsub h0, h0, h1", "vsubsh xmm0, xmm0, xmm1")),
+                BinOp::Mul => Some(("fmul h0, h0, h1", "vmulsh xmm0, xmm0, xmm1")),
+                BinOp::Div => Some(("fdiv h0, h0, h1", "vdivsh xmm0, xmm0, xmm1")),
                 _ => None,
             };
-            if let Some(mnemonic) = mnemonic.filter(|_| self.fx.half_precision()) {
-                return self.half_instruction(&format!("{mnemonic} h0, h0, h1"));
+            if let Some((aarch64, _)) = instructions.filter(|_| self.fx.half_precision()) {
+                return self.half_instruction(aarch64);
             }
-            if let Some(mnemonic) = mnemonic.filter(|_| self.x86_half_precision()) {
-                let op = &mnemonic[1..];
-                return self.half_instruction(&format!("v{op}sh xmm0, xmm0, xmm1"));
+            if let Some((_, x86)) = instructions.filter(|_| self.x86_half_precision()) {
+                return self.half_instruction(x86);
             }
             self.widen_half(types::F32)?;
             self.float_binary(op, types::F32)?;
@@ -1882,13 +1986,14 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             BinOp::Sub => "__subtf3",
             BinOp::Mul => "__multf3",
             BinOp::Div => "__divtf3",
-            BinOp::Rem => return self.quad_libcall("fmod"),
+            BinOp::Rem => return self.quad_libcall(("fmodf128", "fmodl")),
             BinOp::Eq => "__eqtf2",
             BinOp::Ne => "__netf2",
             BinOp::Lt => "__lttf2",
             BinOp::Le => "__letf2",
             BinOp::Gt => "__gttf2",
             BinOp::Ge => "__getf2",
+            // alloc: the error's message
             _ => return Err(unsupported(format!("float operator {op:?}"))),
         };
         self.symbol(name)
@@ -1928,12 +2033,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             return self.narrow_to_half(types::F32);
         }
         let libm = match op {
-            I::Sqrt => "sqrt",
-            I::Floor => "floor",
-            I::Ceil => "ceil",
-            I::Trunc => "trunc",
-            I::RoundTiesEven => "rint",
-            _ => "round",
+            I::Sqrt => ("sqrtf128", "sqrtl"),
+            I::Floor => ("floorf128", "floorl"),
+            I::Ceil => ("ceilf128", "ceill"),
+            I::Trunc => ("truncf128", "truncl"),
+            I::RoundTiesEven => ("rintf128", "rintl"),
+            _ => ("roundf128", "roundl"),
         };
         self.quad_libcall(libm)
     }
@@ -1941,7 +2046,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// `soft_fma`.
     fn soft_fma(&mut self, ty: ir::Type) -> Result<(), String> {
         if ty == types::F128 {
-            return self.quad_libcall("fma");
+            return self.quad_libcall(("fmaf128", "fmal"));
         }
         if self.fx.half_precision() {
             return self.half_instruction("fmadd h0, h0, h1, h2");
@@ -1988,10 +2093,10 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         self.assembly(text)
     }
 
-    /// `quad_libcall`: C's function of `f128` named `base`, with the suffix of the target's.
-    fn quad_libcall(&mut self, base: &str) -> Result<(), String> {
-        let suffix = if self.on_x86() { "f128" } else { "l" };
-        self.symbol(&format!("{base}{suffix}"))
+    /// `quad_libcall`: C's function of `f128`, by its `f128` name on x86-64 and its `long
+    /// double` name elsewhere.
+    fn quad_libcall(&mut self, (f128, long): (&str, &str)) -> Result<(), String> {
+        self.symbol(if self.on_x86() { f128 } else { long })
     }
 
     fn x86_soft_half(&self) -> Result<(), String> {

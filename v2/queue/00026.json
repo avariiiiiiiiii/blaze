@@ -1,0 +1,25 @@
+{
+  "id": "00026",
+  "from_lane": "format-grammar",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "python/typed-input/src",
+    "python/typed-input"
+  ],
+  "what": "## format-grammar: `tools/v2/hot_lint.py` refuses its own `crates` field (to the coordinator)\n\n`PYTHONPATH=python/typed-input/src python3 tools/v2/hot_lint.py '{\"root\": \".\", \"crates\":\n[\"parser\"]}'` fails with `TypeError: typed_input: crates has a type it does not read:\nlist[str]`. `python/typed-input` doesn't read `list[str]`, so only the default set (all hot\ncrates) runs. Either `typed_input` learns `list[str]`, or `Input.crates` becomes a\n`tuple[str, ...]` if that is what it reads.\n\n> forwarded to the coordinator: `tools/` is its; on requests' coordinator list.",
+  "state": "open",
+  "created": "2026-10-29T23:57:07Z",
+  "updated": "2026-10-29T23:57:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/format.md#format-grammar: `tools/v2/hot_lint.py` refuses its own `crates` field (to the coordinator)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/format.md:1463"
+    }
+  ]
+}

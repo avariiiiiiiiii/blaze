@@ -52,7 +52,9 @@ impl<'c> Later<'c> {
         let funcs = ids.funcs.iter().map(|&it| declarations.get_function_decl(it).linkage);
         let datas = ids.datas.iter().map(|&it| declarations.get_data_decl(it).linkage);
         let imported = (
+            // alloc: one exact-size buffer per function, the `Later` holds it until it is made
             funcs.map(|it| it == Linkage::Import).collect(),
+            // alloc: one exact-size buffer per function, the `Later` holds it until it is made
             datas.map(|it| it == Linkage::Import).collect(),
         );
         Later { id, of, compiled, ids, imported, unit_rows: None, tiered: false, keeps: false }
@@ -104,6 +106,7 @@ impl<'db> Keeper<'_, 'db> {
         let (debug, declared, rows, kept) = match &later.of {
             Of::Root { func, symbol } => {
                 let name = hir_ty_mir::mir::type_name::rustc_debug_function(db, *func, &[])
+                    // alloc: the name `FunctionDebug` owns
                     .unwrap_or_else(|| FunctionSignature::of(db, *func).name.as_str().to_owned());
                 let declared = self.debug_declaration_at(*func);
                 let rows = match &later.unit_rows {
@@ -111,6 +114,7 @@ impl<'db> Keeper<'_, 'db> {
                     None => (self.debug && !later.tiered).then(|| root_rows(db, *func)),
                 };
                 let kept = later.keeps.then(|| (root_instance(db, *func), func.krate(db)));
+                // clone: the linkage name `FunctionDebug` owns; the `Later` is only borrowed
                 (FunctionDebug::new(name, symbol.clone()), declared, rows, kept)
             }
             Of::Instance { instance, env } => {
@@ -132,19 +136,22 @@ impl<'db> Keeper<'_, 'db> {
                     }
                     _ => None,
                 };
+                // clone: `FunctionDebug` owns both its name and its linkage name
                 let known = known.unwrap_or_else(|| name.clone());
                 let rows = match &later.unit_rows {
                     Some(rows) => Some(rows),
                     None => (self.debug && !later.tiered)
-                        .then(|| instance_rows(db, instance.clone(), env.clone())),
+                        // clone: an interned handle, the tracked query's key
+                        .then(|| instance_rows(db, *instance, env.clone())),
                 };
-                let kept = later.keeps.then(|| (instance.clone(), env.krate));
+                let kept = later.keeps.then(|| (*instance, env.krate));
                 (FunctionDebug::new(known, name), declared, rows, kept)
             }
         };
         let debug = self.describe(later.compiled, rows, debug, declared);
         let kept = kept.and_then(|(instance, home)| {
             let tally = backend::Tally::global();
+            // clone: the store's entry owns a copy of what the object's debug info is made of
             tally.step(Step::StoreWrite, || self.keep(&instance, home, later, debug.clone()))
         });
         Made { debug, kept }
@@ -152,17 +159,25 @@ impl<'db> Keeper<'_, 'db> {
 
     fn stable_name(&mut self, instance: &Instance) -> Option<StableName> {
         if let Some(known) = self.stable_names.get(instance) {
+            // clone: an `Arc<str>`, a count and no allocation
             return known.clone();
         }
         let name = self.names.instance(instance).map(StableName::from);
-        self.stable_names.insert(instance.clone(), name.clone());
+        // clone: an `Arc<str>`, a count and no allocation
+        self.stable_names.insert(*instance, name.clone());
         name
     }
 
-    fn source_path(&mut self, file: base_db::FileId) -> Option<String> {
+    /// The path rustc reports `file` by, spelled once per file.
+    fn spelled(&mut self, file: base_db::FileId) -> Option<&str> {
         let symbols = self.symbols;
         let spelled = || symbols.source_path(file).map(|it| as_rustc_spells(it.as_str()));
-        self.source_paths.entry(file).or_insert_with(spelled).clone()
+        self.source_paths.entry(file).or_insert_with(spelled).as_deref()
+    }
+
+    fn source_path(&mut self, file: base_db::FileId) -> Option<String> {
+        // alloc: the path a location or the store's entry owns
+        self.spelled(file).map(str::to_owned)
     }
 
     fn location_at(&mut self, at: Option<(DefWithBodyId, MirSpan)>) -> Option<(String, u32, u32)> {
@@ -181,13 +196,15 @@ impl<'db> Keeper<'_, 'db> {
     }
 
     fn text(&mut self, parts: &[TextPart]) -> Option<String> {
-        parts
-            .iter()
-            .map(|part| match part {
-                TextPart::Text(text) => Some(text.clone()),
-                TextPart::FilePath(file) => self.source_path(*file),
-            })
-            .collect()
+        // alloc: the text the store's entry owns, built once
+        let mut text = String::new();
+        for part in parts {
+            match part {
+                TextPart::Text(part) => text.push_str(part),
+                TextPart::FilePath(file) => text.push_str(self.spelled(*file)?),
+            }
+        }
+        Some(text)
     }
 
     /// Where what `instance` is the code of is written, which is the line of whatever of its
@@ -256,8 +273,13 @@ impl<'db> Keeper<'_, 'db> {
             debug.declared = Some(debug.place(file, line, column));
         }
         for &(offset, file, line, column) in rows {
-            let Some(file) = self.source_path(file) else { continue };
-            let place = debug.place(file, line, column);
+            let Some(path) = self.spelled(file) else { continue };
+            // As `FunctionDebug::place`, with the path copied only the first time it is seen.
+            let place = match debug.files.iter().position(|it| it == path) {
+                Some(file) => debuginfo::Place { file: file as u32, line, column },
+                // alloc: once per file of the function, which `FunctionDebug` owns
+                None => debug.place(path.to_owned(), line, column),
+            };
             debug.row(offset, place);
         }
         // Compiled code of no statement with a place is of where the function is written
@@ -277,9 +299,11 @@ impl<'db> Keeper<'_, 'db> {
             let places = &compiled.code.slots;
             let db = self.db;
             let len = compiled.code.bytes.len() as u32;
-            let mut rows: Vec<(u32, MirSpan)> = (compiled.code.lines.iter())
-                .filter_map(|row| Some((row.offset, *source.spans.get(row.span as usize)?)))
-                .collect();
+            let mut rows: Vec<(u32, MirSpan)> = Vec::with_capacity(compiled.code.lines.len());
+            rows.extend(
+                (compiled.code.lines.iter())
+                    .filter_map(|row| Some((row.offset, *source.spans.get(row.span as usize)?))),
+            );
             blaze_ids::radix::sort_copy_by_key(&mut rows, |row| row.0);
             let scopes = describe_scopes(db, *owner, variables, &rows, len, &mut debug);
             describe_variables(
@@ -314,6 +338,7 @@ impl<'db> Keeper<'_, 'db> {
         let told = cached::Told::of(debug.is_some(), self.variables);
         let key = cached::Entry::key(&name, told, self.program.flatten().as_ref())?;
         let check = std::env::var_os("BLAZE_CACHE_CHECK");
+        // alloc: the type sets `cached::Kept::Types` owns, only for an entry the store has
         let sets = || debug.iter().flat_map(|it| &it.types).cloned().collect::<Vec<_>>();
         if check.is_none() && store.has(&key) {
             return Some(cached::Kept::Types(sets()));
@@ -329,6 +354,7 @@ impl<'db> Keeper<'_, 'db> {
                 Err(why) => self.kept.untracked(&name, why),
             }
         }
+        // alloc: `cached::Kept::Entry` boxes the entry it hands to the store's writer
         let mut entry = Box::new(entry);
         let Some(check) = check else {
             return Some(cached::Kept::Entry { key, entry });
@@ -350,8 +376,10 @@ impl<'db> Keeper<'_, 'db> {
                 self.kept.differing += 1;
                 eprintln!("entry of `{name}` is not what was compiled");
                 if check != "1" {
+                    // alloc: `BLAZE_CACHE_CHECK` dump of a differing entry, debug only
                     let at = std::path::Path::new(&check).join(self.kept.differing.to_string());
                     let was = cached::Entry::decode(&stored);
+                    // alloc: `BLAZE_CACHE_CHECK` dump of a differing entry, debug only
                     _ = std::fs::write(at, format!("{name}\n{was:#?}\n{entry:#?}"));
                 }
             }
@@ -408,8 +436,8 @@ impl<'db> Keeper<'_, 'db> {
     /// The callee asked for at `at` among the requests, as the crate rustc had compile it does.
     fn settled(&self, at: usize, callee: &Instance) -> Option<Instance> {
         match &self.settled {
-            Some(settled) => settled.get(at).cloned().flatten(),
-            None => Some(callee.clone()),
+            Some(settled) => settled.get(at).copied().flatten(),
+            None => Some(*callee),
         }
     }
 
@@ -466,6 +494,7 @@ impl<'db> Keeper<'_, 'db> {
                         if self.root_named(&name).is_none() {
                             return self.kept.unkept("unlisted function of the checkout");
                         }
+                        // alloc: `CachedTarget` owns its name
                         CachedTarget::Root(name.as_ref().to_owned())
                     }
                     // A function of the checkout without generic arguments, which `callee`
@@ -477,6 +506,7 @@ impl<'db> Keeper<'_, 'db> {
                             && copied.is_some_and(|func| !returns_async_block(db, func))
                             && self.root_named(&name).is_some() =>
                     {
+                        // alloc: `CachedTarget` owns its name
                         CachedTarget::Copy { name: name.as_ref().to_owned(), symbol }
                     }
                     Some(name)
@@ -501,15 +531,19 @@ impl<'db> Keeper<'_, 'db> {
                     && !matches!(callee.def, InstanceDef::Fn(func)
                         if rustcs_callers_pass_scalable(db, self.symbols, func))
                 {
+                    // alloc: `CachedTarget` owns its name
                     CachedTarget::Root(name.as_ref().to_owned())
                 } else {
+                    // alloc: `CachedTarget` owns its name
                     CachedTarget::Named(name.as_ref().to_owned())
                 }
             } else if let FuncTarget::Asm(text) = &request.target {
+                // clone: `CachedTarget` owns its assembly; the compiled function is only borrowed
                 CachedTarget::Asm(text.clone())
             } else {
                 return self.kept.unkept("call of no instance");
             };
+            // clone: the entry owns the call's signature; the compiled function is only borrowed
             funcs.push(CachedFunc { target, sig: request.sig.clone() });
         }
         // Only a crate of the checkout is compiled with where the checkout is.
@@ -532,6 +566,7 @@ impl<'db> Keeper<'_, 'db> {
                 }
             }
             let mut hashed = match request {
+                // clone: `hash_type_ids` rewrites the entry's copy; the compiled blob stays as is
                 DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => blob.clone(),
                 _ => ConstBlob::default(),
             };
@@ -585,6 +620,7 @@ impl<'db> Keeper<'_, 'db> {
             });
         }
         Some(cached::Entry {
+            // alloc: the label the entry owns
             label: callee_name(db, instance.def).to_owned(),
             funcs,
             datas,

@@ -273,8 +273,8 @@ IR and flags:
   records the call site with its exception handlers, and stores results to slots (for
   `try_call`, the pseudo slots of `TryCallRet`). At a landing pad it stores the exception
   payload (`rax`/`rdx`, `x0`/`x1`) into the pseudo slots of `TryCallExn`.
-- **Addresses**: `func_addr`, `symbol_value`, `tls_value`, and `global_value` with its
-  legalized forms, written as Cranelift writes them for `is_pic` and `tls_model` (GOT loads for
+- **Addresses**: `func_addr`, `symbol_value` and `tls_value` (Cranelift 0.136 has no
+  `global_value`), written as Cranelift writes them for `is_pic` and `tls_model` (GOT loads for
   what is not colocated, `__tls_get_addr`/TLS descriptors/`tlv` thunks/`_tls_index`).
 - **Other**: `br_table` (bounds check, then a table of 32-bit offsets in the code),
   `get_frame_pointer`, `get_stack_pointer`, `get_return_address`, `trap`, `debugtrap`, the

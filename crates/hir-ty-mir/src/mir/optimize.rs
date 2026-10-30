@@ -300,7 +300,9 @@ fn validate(body: &MirBody<'_>, frame: &Frame) -> std::result::Result<(), String
             }
             continue;
         };
-        if let Some(target) = successors(&terminator.kind).find(|it| block_index(*it) >= blocks) {
+        if let Some(target) =
+            terminator.kind.all_successors().find(|it| block_index(*it) >= blocks)
+        {
             // alloc: error path
             return Err(format!(
                 "bb{} goes to bb{} of {blocks}",
@@ -344,34 +346,9 @@ fn successors_mut(kind: &mut TerminatorKind, mut f: impl FnMut(&mut BasicBlockId
         | TerminatorKind::Abort
         | TerminatorKind::Return
         | TerminatorKind::Unreachable
+        | TerminatorKind::TailCall { .. }
         | TerminatorKind::CoroutineDrop => (),
     }
-}
-
-/// The blocks [`successors_mut`] goes through, in its order, read in place.
-fn successors(kind: &TerminatorKind) -> impl DoubleEndedIterator<Item = BasicBlockId> + '_ {
-    use std::slice::from_ref;
-    let (first, then, last): (&[BasicBlockId], _, _) = match kind {
-        TerminatorKind::Goto { target } => (from_ref(target), None, None),
-        TerminatorKind::SwitchInt { targets, .. } => (targets.all_targets(), None, None),
-        TerminatorKind::Drop { target, unwind, .. }
-        | TerminatorKind::DropAndReplace { target, unwind, .. }
-        | TerminatorKind::FalseUnwind { real_target: target, unwind } => {
-            (from_ref(target), *unwind, None)
-        }
-        TerminatorKind::Call { target, cleanup, .. } => (&[], *target, *cleanup),
-        TerminatorKind::Assert { target, cleanup, .. } => (from_ref(target), *cleanup, None),
-        TerminatorKind::Yield { resume, drop, .. } => (from_ref(resume), *drop, None),
-        TerminatorKind::FalseEdge { real_target, imaginary_target } => {
-            (from_ref(real_target), Some(*imaginary_target), None)
-        }
-        TerminatorKind::UnwindResume
-        | TerminatorKind::Abort
-        | TerminatorKind::Return
-        | TerminatorKind::Unreachable
-        | TerminatorKind::CoroutineDrop => (&[], None, None),
-    };
-    first.iter().copied().chain(then).chain(last)
 }
 
 /// rustc's `fn_can_unwind` where panics unwind: whether a panic may unwind out of `func`
@@ -424,7 +401,7 @@ fn reverse_postorder<'f>(body: &MirBody<'_>, frame: &'f Frame) -> Vec<BasicBlock
         let next = body.basic_blocks[*block]
             .terminator
             .as_ref()
-            .and_then(|it| successors(&it.kind).nth(*at));
+            .and_then(|it| it.kind.all_successors().nth(*at));
         if let Some(target) = next {
             *at += 1;
             if visited.insert(block_index(target)) {
@@ -460,7 +437,7 @@ impl<'f> Dominators<'f> {
         starts.resize(count + 1, 0usize);
         for &block in &rpo {
             if let Some(terminator) = &body.basic_blocks[block].terminator {
-                for target in successors(&terminator.kind) {
+                for target in terminator.kind.all_successors() {
                     starts[block_index(target) + 1] += 1;
                 }
             }
@@ -474,7 +451,7 @@ impl<'f> Dominators<'f> {
         preds.resize(starts[count], 0usize);
         for &block in &rpo {
             if let Some(terminator) = &body.basic_blocks[block].terminator {
-                for target in successors(&terminator.kind) {
+                for target in terminator.kind.all_successors() {
                     let slot = &mut next[block_index(target)];
                     preds[*slot] = block_index(block);
                     *slot += 1;

@@ -16,12 +16,12 @@ use blaze_expand::bridge::spans;
 use intern::Symbol;
 use load_cargo::{SubRequest, SubResponse};
 use rustc_hash::FxHashMap;
-use span::{Edition, ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor, SyntaxContext, TextRange};
+use span::{Edition, ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor, SyntaxContext, TextRange, TextSize};
 
 use crate::{
     guest::Stop,
     lex,
-    print,
+    print::{self, Op},
     protocol::Method,
     stream::{DelimSpan, Delimiter, IdentKind, LitKind, Spacing, Stream, Tree, push_given},
     wire::{Reader, Writer},
@@ -59,6 +59,28 @@ pub(crate) struct Server {
 
 fn freed() -> Stop {
     Stop("used a token stream it had given back (use-after-free in a `proc_macro` handle)".to_owned()) // alloc: error path
+}
+
+/// The end of the run of trees from `at` that rustc's stream holds as one token, and the
+/// operator it is (`None` for one tree, or a lifetime).
+fn glued(trees: &[Tree], at: usize) -> (usize, Option<Op>) {
+    let Some(Tree::Punct { ch, .. }) = trees.get(at) else { return (at + 1, None) };
+    let Some(mut op) = Op::of(*ch) else { return (at + 1, None) };
+    let mut end = at;
+    while let Tree::Punct { spacing: Spacing::Joint | Spacing::JointHidden, .. } = &trees[end] {
+        match trees.get(end + 1) {
+            Some(Tree::Punct { ch, .. }) => match Op::of(*ch).and_then(|next| op.glue(next)) {
+                Some(glued) => {
+                    op = glued;
+                    end += 1;
+                }
+                None => break,
+            },
+            Some(Tree::Ident { .. }) if op == Op::SingleQuote => return (end + 2, None),
+            _ => break,
+        }
+    }
+    (end + 1, if end > at { Some(op) } else { None })
 }
 
 /// `n` as a byte of the bridge's enums.
@@ -346,27 +368,93 @@ impl Server {
                     w.handle(handle);
                 }
             }
-            Tree::Punct { ch, spacing, span } => {
-                *count += 1;
-                w.u8(1);
-                w.u8(*ch);
-                w.bool(*spacing == Spacing::Joint);
-                let handle = self.span_handle(*span);
-                w.handle(handle);
-            }
-            Tree::Ident { sym, kind, span, .. } => {
-                *count += 1;
-                w.u8(2);
-                w.str(sym.as_str());
-                w.u8(ident_kind_tag(*kind));
-                let handle = self.span_handle(*span);
-                w.handle(handle);
+            Tree::Punct { span, spacing, .. } | Tree::Ident { span, spacing, .. } => {
+                self.put_token(w, tree, *span, *spacing == Spacing::Joint, count)
             }
             Tree::Literal { kind, symbol, suffix, span, .. } => {
                 *count += 1;
                 w.u8(3);
                 self.put_literal(w, *kind, symbol, suffix.as_ref(), *span);
             }
+        }
+    }
+
+    /// A punctuation mark or identifier as the client reads it, at `span`; `joint` is the
+    /// mark's.
+    fn put_token(&mut self, w: &mut Writer<'_>, tree: &Tree, span: Span, joint: bool, count: &mut u64) {
+        match tree {
+            Tree::Punct { ch, .. } => {
+                w.u8(1);
+                w.u8(*ch);
+                w.bool(joint);
+            }
+            Tree::Ident { sym, kind, .. } => {
+                w.u8(2);
+                w.str(sym.as_str());
+                w.u8(ident_kind_tag(*kind));
+            }
+            _ => return,
+        }
+        *count += 1;
+        let handle = self.span_handle(span);
+        w.handle(handle);
+    }
+
+    /// `trees` as the client reads them (`FromInternal`) of the stream rustc would hold:
+    /// `TokenStream::push_tree` glues each token to the one before it when that one is joint
+    /// (`Token::glue`), so a run of punctuation marks is one operator spanning theirs
+    /// (`Span::to`), split again into characters, each its byte of a span exactly the
+    /// operator's length and else the whole span; a `'` glued to an identifier is a lifetime,
+    /// both at its span. Streams the lexer made hold glued tokens split this way already.
+    fn put_trees(&mut self, db: &Db, w: &mut Writer<'_>, trees: &[Tree], count: &mut u64) -> Result<(), Stop> {
+        let mut at = 0;
+        while at < trees.len() {
+            let (end, op) = glued(trees, at);
+            if end == at + 1 {
+                self.put_tree(w, &trees[at], count);
+                at = end;
+                continue;
+            }
+            let mut span = trees[at].ends().0;
+            for tree in &trees[at + 1..end] {
+                span = self.to(db, span, tree.ends().0)?;
+            }
+            let split = op.is_some_and(|op| usize::from(span.range.len()) == op.text().len());
+            let last = end - at - 1;
+            for (i, tree) in trees[at..end].iter().enumerate() {
+                // Each character but the last is joint; the last has the glued token's spacing.
+                let joint = i < last || tree.spacing() == Spacing::Joint;
+                let span = match split {
+                    true => Span {
+                        range: TextRange::at(span.range.start() + TextSize::from(i as u32), TextSize::from(1)),
+                        ..span
+                    },
+                    false => span,
+                };
+                self.put_token(w, tree, span, joint, count);
+            }
+            at = end;
+        }
+        Ok(())
+    }
+
+    /// rustc's `Span::to`: the span from `first` to `second`. Of spans of two contexts it is
+    /// the one not of the root (`prepare_to_combine`); two contexts neither at the root, or
+    /// two files, would need what rustc's source map has, so the call stops.
+    fn to(&mut self, db: &Db, first: Span, second: Span) -> Result<Span, Stop> {
+        if first.ctx == second.ctx {
+            return spans::join(first, second, |req| Some(self.ask(db, req))).ok_or_else(|| {
+                // alloc: error path
+                Stop(format!("glued punctuation of two files ({first:?} and {second:?}), whose joined span blaze does not have"))
+            });
+        }
+        match (first.ctx.is_root(), second.ctx.is_root()) {
+            (true, _) => Ok(second),
+            (false, true) => Ok(first),
+            // alloc: error path
+            (false, false) => Err(Stop(format!(
+                "glued punctuation of two macro expansions ({first:?} and {second:?}), whose joined span blaze does not have"
+            ))),
         }
     }
 
@@ -569,9 +657,7 @@ impl Server {
                 let at = w.out.len();
                 w.usize(0);
                 let mut count = 0;
-                for tree in stream.trees() {
-                    self.put_tree(&mut w, tree, &mut count);
-                }
+                self.put_trees(db, &mut w, stream.trees(), &mut count)?;
                 w.out[at..at + 8].copy_from_slice(&count.to_le_bytes());
             }
             Method::SpanDebug => {

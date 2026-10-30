@@ -270,7 +270,8 @@ where
 // * AssocItems(SmallVec<[ast::AssocItem; 1]>)
 // * ForeignItems(SmallVec<[ast::ForeignItem; 1]>
 
-/// Converts a [`tt::Subtree`] back to a [`SyntaxNode`].
+/// Converts a [`tt::Subtree`] back to a syntax tree, an untyped parse read through its views
+/// ([`Parse::root`]).
 /// The produced `SpanMap` contains a mapping from the syntax nodes offsets to the subtree's spans.
 ///
 /// The parser reads the words the tree keeps ([`view_tokens`]; made once, the first time it is

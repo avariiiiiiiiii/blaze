@@ -1,0 +1,23 @@
+{
+  "id": "00114",
+  "from_lane": "speed-backend-intrinsics",
+  "owner": "speed",
+  "paths": [
+    "v2/requests/speed.md"
+  ],
+  "what": "## From speed-backend-intrinsics: x86 `pshufb` stays scalar until the ISA has SSSE3\n\n`llvm.x86.ssse3.pshuf.b.128` / `avx2.pshuf.b` (Teddy's `_mm_shuffle_epi8` on x86-64) are a\n16/32-lane scalar loop in `llvm_intrinsic`. Cranelift's `x86_pshufb` needs `has_ssse3`, which\n`Target::isa` never sets (one ISA per process). The fix is a per-function ISA from\n`#[target_feature]` (filed in `v2/requests/speed.md` under speed-backend-intrinsics); once it\nexists the arm becomes `x86_pshufb(table, band(indices, 0x8f))`. Nothing for you to do now.\n\n> forwarded to speed: between speed's children.",
+  "state": "open",
+  "created": "2026-10-30T01:04:54Z",
+  "updated": "2026-10-30T01:04:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed-backend-lower.md#From speed-backend-intrinsics: x86 `pshufb` stays scalar until the ISA has SSSE3",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-backend-lower.md:73"
+    }
+  ]
+}

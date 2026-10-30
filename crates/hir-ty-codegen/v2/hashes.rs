@@ -67,12 +67,13 @@ impl ItemHashes {
         let spans: [Vec<MirSpan>; TABLES] = [
             store.expr_ids().map(MirSpan::ExprId).collect(), // alloc: the tables returned, exact size
             store.expr_ids().map(MirSpan::ExprEnd).collect(), // alloc: the tables returned, exact size
-            store.pat_ids().map(MirSpan::PatId).collect(),
+            store.pat_ids().map(MirSpan::PatId).collect(), // alloc: the tables returned, exact size
+            // alloc: the tables returned, exact size
             store.bindings().map(|(it, _)| MirSpan::BindingId(it)).collect(),
-            vec![MirSpan::SelfParam],
-            vec![MirSpan::Unknown],
+            vec![MirSpan::SelfParam], // alloc: the tables returned, one span
+            vec![MirSpan::Unknown], // alloc: the tables returned, one span
         ];
-        anchors.into_iter().zip(spans).collect()
+        anchors.into_iter().zip(spans).collect() // alloc: the tables returned, exact size
     }
 
     /// The anchor of the table [`Hashes::declaration`] names: one span, where `func` is
@@ -99,15 +100,20 @@ impl Hashes for ItemHashes {
                     code::of_coroutine_by_move(db, InternedCoroutineId::from_id(id))
                 }
             };
-            code.clone().map(CodeHash).map_err(|why| why.to_string())
+            match code {
+                Ok(code) => Ok(CodeHash(*code)),
+                Err(why) => Err(why.to_string()), // alloc: the error's message
+            }
         })
     }
 
     fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
+        // alloc: the error's message
         hir_ty::attach_db(db, || identity::ty(db, ty).map_err(|why| why.to_string()))
     }
 
     fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
+        // alloc: the error's message
         hir_ty::attach_db(db, || identity::konst(db, konst).map_err(|why| why.to_string()))
     }
 
@@ -118,6 +124,7 @@ impl Hashes for ItemHashes {
         span: MirSpan,
     ) -> Result<SpanRef, String> {
         let Ok((table, index)) = code::table_of(span) else {
+            // alloc: the error's message
             return Err(format!(
                 "{span:?} of the body of {owner:?}, a span of code inlined into it, which is of \
                  the body it was inlined from: its place is the inlined span's"
@@ -136,6 +143,7 @@ impl Hashes for ItemHashes {
 
     fn file_name(&self, _: &Db, file: base_db::FileId) -> Result<String, String> {
         (self.names)(file).ok_or_else(|| {
+            // alloc: the error's message
             format!(
                 "the file {file:?} has no name in the program: the build did not name it, so \
                  `file!()` and the positions of its code have none"

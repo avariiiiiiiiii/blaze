@@ -19,6 +19,11 @@
 //! neither ever waits and a round trip allocates nothing. Watches tell through a channel of
 //! their own, and a stopped watch is kept with its buffers for the next. A warm submit and
 //! poll allocate only what a completion carries.
+//!
+//! Why unsafe: std has no kqueue. One `kevent` call makes every change and takes every event of
+//! a wait, written into the driver's kept list; there is no safe equivalent short of a thread
+//! per descriptor. An event's `udata` is never followed as a pointer: it is a handle's bits,
+//! looked up in a slab by index and generation (`dispatch`).
 
 use std::{
     collections::VecDeque,
@@ -334,6 +339,7 @@ impl Kqueue {
         )?;
         let workers = (0..threads.max(1))
             .map(|n| {
+                // clone: setup, one count of each per worker thread.
                 let (root, queue, notify) = (root.clone(), queue.clone(), notify.clone());
                 std::thread::Builder::new()
                     // alloc: setup, once per thread.
@@ -494,18 +500,15 @@ impl Kqueue {
         }
         let watch = match self.spare.pop() {
             Some(watch) => watch,
+            // clone: one count per watch made, only when no spare one is left; never per event.
             None => fsevents::Watch::new(Watched(self.notify.clone()))?,
         };
         let id = self.watches.insert(watch);
         let watch = self.watches.get_mut(id).expect("inserted above");
         let mut first = None;
-        // SAFETY: the watch is in a slab entry, which never moves while it holds it, and it is
-        // stopped (`retire`, or dropped in place with the slab) before it is taken out.
-        let started = unsafe {
-            match since {
-                None => watch.start(&self.root, dir, tag),
-                Some(since) => watch.journal(&self.root, dir, since, tag, |it| first = Some(it)),
-            }
+        let started = match since {
+            None => watch.start(&self.root, dir, tag),
+            Some(since) => watch.journal(&self.root, dir, since, tag, |it| first = Some(it)),
         };
         match started {
             Ok(()) => {
@@ -965,7 +968,10 @@ impl Kqueue {
             self.events = events;
             return;
         }
-        // SAFETY: the call wrote `got` events.
+        // SAFETY: the call wrote `got` events, at most the `room` it was given, which `reserve`
+        // made capacity for; a `Kevent` is integers only, so any bytes it wrote are one. What
+        // `udata` names is checked in `dispatch` (a slab lookup by index and generation),
+        // never followed as a pointer.
         unsafe { events.set_len(got as usize) };
         for &event in &events {
             self.dispatch(event);

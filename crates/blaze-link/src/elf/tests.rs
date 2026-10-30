@@ -29,6 +29,8 @@ fn output(arch: blaze_codegen::Arch, kind: OutputKind, interpreter: Option<&str>
         windows_subsystem: false,
         dev_run: None,
         exec_log: false,
+        sanitize: blaze_codegen::settings::Sanitize::default(),
+        rpaths: Vec::new(),
         triple: match arch { blaze_codegen::Arch::Aarch64 => "aarch64-unknown-linux-gnu", _ => "x86_64-unknown-linux-gnu" }.into(),
     }
 }

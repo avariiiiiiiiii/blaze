@@ -28,18 +28,7 @@ use crate::{
     mir::{MirSpan, is_builtin_index},
 };
 
-/// The range of an item or a macro call without the attributes and comments on top of it,
-/// which rustc's span of it leaves out.
-pub fn written_range(node: Node<'_>) -> TextRange {
-    let start = node
-        .children_with_tokens()
-        .find(|it| {
-            !matches!(it.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
-                && !it.kind().is_trivia()
-        })
-        .map_or(node.text_range().start(), |it| it.text_range().start());
-    TextRange::new(start, node.text_range().end())
-}
+pub use syntax::view::written_range;
 
 /// Whether lowering `body` met a call of `file!` or `concat!`: only then can a literal of it be
 /// what `file!` expanded to, and only then is its source map read. `line!()` and `column!()`

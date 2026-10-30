@@ -1067,6 +1067,7 @@ fuzz engine sees no counters and stops.
 > written by speed-backend-sanitize (2026-10-29); told link by tmux.
 > forwarded to link.
 > queued by requests (child requests-link-next): items 1-5 to its child requests-link-next-sanitize. Item 5's arrays and PC table were already in; its init calls, the runtimes (1), MSan options (3) and ASan globals (4) were not. Output gains `sanitize`; Apple runtimes get rustc's absolute-directory rpath.
+> done (requests-link-next-sanitize), 2026-10-29, not built. Items 1-5 are in blaze-link: `target::locate` (now `&mut Output`) puts the runtimes on the line from `<sysroot>/lib/rustlib/<triple>/lib`, after the C start objects. Linux uses the `.a` whole; an ELF shared library gets none, as in rustc. macOS uses the `.dylib`, with `Output::rpaths` holding that absolute directory (`LC_RPATH`; ELF `DT_RUNPATH`), as codegen.md "From codegen-rq-features" 1 asks rather than `@loader_path` beside a copy. Windows and wasm are errors. The rest is `src/sanitize.rs`, three `Stage` passes, all pieces with fixups so incremental links keep them. MSan options are read-only 4-byte globals under their names (not weak: a strong native definition of the same name is a duplicate-symbol error). ASan redzones use `getRedzoneSizeForGlobal`, with `shouldInstrumentGlobal`'s skips. The descriptor array has one `__asan_global` per live instrumented global, with an ODR byte each; it does not keep its globals alive, and is remade when one is added or gone. The ASan ctor/dtor are at priority 1 (Mach-O: the ctor registers the dtor with `__cxa_atexit`). The SanitizerCoverage init ctor is at priority 2, calling counters, flags, guards, pcs only for sections that exist. COFF bounds are `.SCOV$?A`/`$?Z` pieces, but a sanitized PE image is an error. Item 2 needed no change: TLSGD and GOT loads resolve by name, and the TLSGD refusal applies only beside a prelink. Tests: `src/tests/sanitize.rs`, `src/target/tests.rs`. cargo must set `Output::sanitize` (requests.md "From requests-link-next-sanitize").
 
 ## 15. From speed-link-edge-live-safety: what v1's stop-the-world can't see, for the functions it redirects
 
@@ -1970,6 +1971,8 @@ Tests: an object's `-lz`, a member's `-framework`, and a missing one.
 
 > forwarded to requests-link-next (requests, pass 39: blaze-link's own, which it holds; told by tmux)
 > queued by requests (child requests-link-next): started child requests-link-next-autolink (brief ~/restart-2026-10-28/briefs/v2/requests-link-next-autolink.md).
+> applied by requests (child requests-link-next): the Mach-O reader (`macho/input.rs`) reads an `LC_LINKER_OPTION` as ld64 follows one (`autolink`: `-lNAME`, `-framework NAME`); `-weak-lNAME` and `-weak_framework NAME` are an error, since `NativeKind` has no weak library (the Mach-O writer marks a library weak only when all its imports are), and so is any other option, naming it and the `archive(member)` (ld64 warns and drops those). Finding is `target::locate`'s (`Line::autolinks`, the Mach-O twin of `Line::defaults`): each Mach-O object or archive on the line is read for its objects' options (`macho::asked_libraries`: load commands only, universal files sliced for the arch, kept per process by content, one domain per architecture), and each library goes right after its asker, `-lNAME` as a `dylib` is searched (`libNAME.tbd`, `.dylib`, `.so`, `.a`; the link's `-L` then the SDK's `usr/lib`), `-framework NAME` in the link's directories then the SDK's frameworks, followed transitively, each once; an unfound one is an error naming it, the asker and the directories searched. Checking is the engine's (`native.rs` `linker_options`, in `rebuild` after the load rounds): every option of every loaded Mach-O object and taken member must be on the line by ld64's file names (`libNAME.{tbd,dylib,so,a}`, `NAME.framework/NAME[.tbd]`), else a `LinkError` naming the option and `archive(member)`. Tests: `macho/input.rs` (`autolink`'s forms and refusals, an object's and members' options, a universal file), `target/tests.rs` (an object's `-lz`, a member's `-framework Security`, transitive asks, a missing library and framework, an unknown option, a weak one), `src/tests/natives.rs` (the engine: an object's `-lz` and a member's `-framework Security` taken from the line, a member not taken asking nothing, each missing one the error, an unknown and a weak option the error). Not built.
+> queued by requests (child requests-link-next): the weak forms (`-weak-lNAME`, `-weak_framework`) need `NativeKind::Shared` to carry `weak`, through `Library` to the writer's `LC_LOAD_WEAK_DYLIB`. `output.rs` and the writers are the sanitize child's, so this starts after it. Until then they are an error. Child requests-link-next-autolink is done and closed.
 
 ## From cargo (2026-10-29): the driver's link needs a target's `Output` and its native libraries located
 
@@ -2006,3 +2009,34 @@ Status: open
 
 > forwarded to requests-link-next (requests' child, which holds `crates/blaze-link`; lane link is DONE); told by tmux (requests, pass 29).
 > applied by requests (child requests-link-next-target): `blaze_link::target::{output, locate, Located}` in `src/target.rs`, tests in `src/target/tests.rs`. `output` ports rustc's specs for x86_64/aarch64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-pc-windows-msvc, wasm32-wasip1 and wasm32-unknown-unknown, and errors on any other triple. It sets `Output.triple` (new field). `locate` finds the toolchain's files by asking for paths only: Linux `cc -print-search-dirs`/`-print-file-name`, macOS `SDKROOT`/`xcrun`, MSVC `LIB`/vswhere/registry, and wasi-libc in blaze's sysroot. Answers are cached per process for each triple and environment variable. It follows rustc's `-l` rules plus the target's start/end objects and late libraries. A missing library is an error naming it and every directory searched. One change for cargo: `locate` takes a fourth argument, `sysroot: &Path` (requests.md "cargo: pass blaze's sysroot to `blaze_link::target::locate`"). Not built.
+
+## speed-unsafe-back (2026-10-30): blaze-link's crate root gate (unsafe.md, item 2)
+
+For whoever holds `crates/blaze-link/src/lib.rs` and `src/tests.rs` (requests-link-next-lazy and
+requests-link-next-sanitize at 00:20). With these three edits blaze-link's only unsafe block is
+`intern.rs`'s `name_at`, which already has `#[allow(unsafe_code)]` on the function.
+
+1. `crates/blaze-link/src/lib.rs`: under `#![feature(allocator_api)]` add the line
+   `#![deny(unsafe_code)]`, and to the crate doc a line saying that the one unsafe block is
+   `intern::name_at`'s `from_utf8_unchecked` of names it appended as `&str`s. Nothing else in
+   `src/` (or `elf*`, `macho*`, `pe*`, `wasm*`) compiles `unsafe` or `#[no_mangle]`.
+2. `crates/blaze-link/src/tests.rs`, `impl Linked`: the view of the words as bytes becomes safe
+   (`object`'s ELF parser wants the 8-byte alignment the words give, which is why they are words):
+   ```rust
+   fn bytes(&self) -> &[u8] {
+       &zerocopy::IntoBytes::as_bytes(&self.words[..])[..self.len]
+   }
+   ```
+   replacing the `// SAFETY:` comment and the `unsafe { std::slice::from_raw_parts(..) }` block.
+   (If `src/tests.rs` gets a module-level `#![allow(unsafe_code)]` instead, the deny above still
+   holds for everything else, but the block buys nothing: it is a test's view, not a fast path.)
+3. `crates/blaze-link/Cargo.toml`, `[dev-dependencies]`: `zerocopy.workspace = true` (a workspace
+   dependency already, root `Cargo.toml` line 231, with `derive`; `IntoBytes` for `[u64]` needs no
+   feature).
+
+Item 4 of unsafe.md for the readers (ELF, Mach-O, COFF, wasm objects and archives) is met:
+they are safe code under `#![forbid(unsafe_code)]`, every offset is checked through
+`cursor::Reader` or `.get` before it is sliced, and every one has a fuzz target
+(`fuzz/targets/link_*`). I found nothing to change there.
+
+> applied by requests (pass 45; link and both link children are DONE): as written. `lib.rs` has `#![deny(unsafe_code)]` under `#![feature(allocator_api)]` and a crate-doc line naming `intern::name_at` as the one unsafe block (`rg` finds no other `unsafe`, `#[no_mangle]`, `#[export_name]` or `#[unsafe(..)]` in `src/`). `tests.rs` `Linked::bytes` is `&zerocopy::IntoBytes::as_bytes(&self.words[..])[..self.len]`, the `// SAFETY:` block gone. `Cargo.toml` `[dev-dependencies]` has `zerocopy.workspace = true` (on the first compile: a new lock edge, no new package). Not built.

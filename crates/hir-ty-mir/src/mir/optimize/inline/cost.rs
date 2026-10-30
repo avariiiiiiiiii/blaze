@@ -7,6 +7,8 @@
 //! overflow, where this MIR has the `Assert` always: one where the body is not written
 //! checked is no terminator to rustc.
 
+use smallvec::SmallVec;
+
 use crate::{
     intrinsic::Intrinsic,
     mir::{
@@ -15,7 +17,7 @@ use crate::{
     },
 };
 
-use super::super::{block_index, successors};
+use super::super::block_index;
 
 const INSTR_COST: usize = 5;
 const CALL_PENALTY: usize = 25;
@@ -119,7 +121,9 @@ pub(super) fn block_is_call_like(
 /// rustc's `is_call_like`, of a terminator rustc's MIR has.
 fn call_like(terminator: &Terminator) -> bool {
     match &terminator.kind {
-        TerminatorKind::Drop { .. } | TerminatorKind::Assert { .. } => true,
+        TerminatorKind::Drop { .. }
+        | TerminatorKind::Assert { .. }
+        | TerminatorKind::TailCall { .. } => true,
         TerminatorKind::Call { intrinsic, .. } => {
             matches!(classify(*intrinsic), Call::Function | Call::Intrinsic)
         }
@@ -130,13 +134,14 @@ fn call_like(terminator: &Terminator) -> bool {
 /// What inlining `body` costs, as rustc's `check_callee_mir_body` adds it up: its blocks
 /// reachable from the start, the unwind edge of a drop of a value with nothing to drop not
 /// followed. `written_checked` is [`super::written_checked_at`] of the body, `needs_drop`
-/// says what a drop drops.
+/// says what a drop drops. `None` when one of those blocks ends in a tail call: rustc
+/// inlines no function with one ("can't inline functions with tail calls").
 pub(super) fn cost(
     body: &MirBody<'_>,
     session: Session,
     mut written_checked: impl FnMut(MirSpan) -> bool,
     mut needs_drop: impl FnMut(&StoredPlace) -> bool,
-) -> usize {
+) -> Option<usize> {
     let mut call_likes = 0usize;
     for (_, block) in body.basic_blocks.iter() {
         call_likes += block
@@ -159,8 +164,9 @@ pub(super) fn cost(
     let landing_pad = |unwind: &Option<BasicBlockId>| {
         if unwind.is_some() { LANDINGPAD_PENALTY } else { 0 }
     };
-    let mut visited = vec![false; body.basic_blocks.len()];
-    let mut work = vec![body.start_block];
+    let mut visited: SmallVec<[bool; 64]> = SmallVec::from_elem(false, body.basic_blocks.len());
+    let mut work: SmallVec<[BasicBlockId; 16]> = SmallVec::new();
+    work.push(body.start_block);
     while let Some(id) = work.pop() {
         if std::mem::replace(&mut visited[block_index(id)], true) {
             continue;
@@ -229,6 +235,7 @@ pub(super) fn cost(
                     penalty += landing_pad(cleanup);
                 }
             }
+            TerminatorKind::TailCall { .. } => return None,
             TerminatorKind::UnwindResume => penalty += RESUME_PENALTY,
             TerminatorKind::Unreachable => bonus += INSTR_COST,
             TerminatorKind::Goto { .. }
@@ -240,9 +247,9 @@ pub(super) fn cost(
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. } => {}
         }
-        work.extend(successors(&terminator.kind));
+        work.extend(terminator.kind.all_successors());
     }
-    penalty.saturating_sub(bonus)
+    Some(penalty.saturating_sub(bonus))
 }
 
 /// rustc's leaf check of `cross_crate_inlinable`: `body` calls nothing but intrinsics, has no

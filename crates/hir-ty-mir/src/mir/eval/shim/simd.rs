@@ -10,6 +10,11 @@ use crate::consteval::try_const_usize;
 
 use super::*;
 
+/// The value of each lane of a vector, inline for vectors of up to 16 lanes.
+type LaneValues = smallvec::SmallVec<[u128; 16]>;
+/// The bytes of a vector, inline for vectors of up to 512 bits.
+type VectorBytes = smallvec::SmallVec<[u8; 64]>;
+
 /// What a lane of a vector holds, for the intrinsics that compute with lanes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
@@ -59,7 +64,7 @@ impl Lane {
 /// which of them are initialized and carry a pointer's provenance.
 struct Lanes<S> {
     size: usize,
-    bytes: Vec<u8>,
+    bytes: VectorBytes,
     shadow: S,
 }
 
@@ -258,6 +263,7 @@ fn int_op<'db>(op: SimdOp, lane: Lane, index: usize, args: &[u128]) -> Result<'d
                 b < u128::from(bits)
             };
             if !in_range {
+                // alloc: error path
                 let amount = if signed { (b as i128).to_string() } else { b.to_string() };
                 // alloc: error path
                 return Err(ub(format!("overflowing shift by {amount}")));
@@ -441,13 +447,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// The lanes of a vector the intrinsic computes with, which must be initialized.
-    fn read_lanes(&self, arg: &IntervalAndTy<'db>) -> Result<'db, (Lane, Vec<u128>)> {
+    fn read_lanes(&self, arg: &IntervalAndTy<'db>) -> Result<'db, (Lane, LaneValues)> {
         let (len, lane) = self.simd_lanes(arg.ty)?;
         if arg.interval.size < len * lane.size() {
             return Err(MirEvalError::InternalError("simd vector smaller than its lanes".into()));
         }
         let bytes = self.read_scalar(arg.interval.slice(0..len * lane.size()))?;
-        Ok((lane, bytes.chunks(lane.size()).map(|it| lane.read(it)).collect()))
+        Ok((lane, bytes.chunks(lane.size()).map(|it| lane.read(it)).collect::<LaneValues>()))
     }
 
     fn write_lanes(
@@ -456,8 +462,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         lane: Lane,
         values: &[u128],
     ) -> Result<'db, ()> {
-        let bytes: Vec<u8> =
-            values.iter().flat_map(|it| it.to_le_bytes()[..lane.size()].to_vec()).collect();
+        let mut bytes = VectorBytes::with_capacity(values.len() * lane.size());
+        for it in values {
+            bytes.extend_from_slice(&it.to_le_bytes()[..lane.size()]);
+        }
         destination.write_from_bytes(self, &bytes)
     }
 
@@ -473,20 +481,20 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             return Err(MirEvalError::InternalError("simd vector smaller than its lanes".into()));
         }
         let (bytes, shadow) = self.read_shadowed(arg.interval.addr, len * size)?;
-        Ok(Lanes { size, bytes: bytes.to_vec(), shadow })
+        Ok(Lanes { size, bytes: VectorBytes::from_slice(bytes), shadow })
     }
 
     /// Lane `index` of `from` put at the end of `bytes`, and what it carries over `shadow`.
     fn push_lane(
         &self,
-        bytes: &mut Vec<u8>,
+        bytes: &mut VectorBytes,
         shadow: &mut M::Shadow,
         from: &Lanes<M::Shadow>,
         index: usize,
     ) {
         let range = from.range(index);
         if M::CHECKS {
-            shadow.put(bytes.len(), &from.shadow.slice(range.clone()));
+            shadow.put(bytes.len(), &from.shadow.slice(range.clone())); // clone: a `Range<usize>`
         }
         bytes.extend_from_slice(&from.bytes[range]);
     }
@@ -526,7 +534,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// The lanes of a mask, each of which must be all zeros (false) or all ones (true).
-    fn read_mask(&self, arg: &IntervalAndTy<'db>, op: SimdOp) -> Result<'db, Vec<bool>> {
+    fn read_mask(
+        &self,
+        arg: &IntervalAndTy<'db>,
+        op: SimdOp,
+    ) -> Result<'db, smallvec::SmallVec<[bool; 64]>> {
         let (lane, values) = self.read_lanes(arg)?;
         if !matches!(lane, Lane::Int { .. }) {
             not_supported!("`{}` with a mask of float lanes", Intrinsic::Simd(op));
@@ -543,11 +555,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     Intrinsic::Simd(op)
                 ))),
             })
-            .collect()
+            .collect::<Result<'db, smallvec::SmallVec<[bool; 64]>>>()
     }
 
     /// The indices of `simd_shuffle`: an array of `u32` or a vector of them.
-    fn shuffle_indices(&self, index: &IntervalAndTy<'db>) -> Result<'db, Vec<u32>> {
+    fn shuffle_indices(
+        &self,
+        index: &IntervalAndTy<'db>,
+    ) -> Result<'db, smallvec::SmallVec<[u32; 64]>> {
         let len = match index.ty.kind() {
             TyKind::Array(_, len) => match try_const_usize(self.db, len) {
                 Some(it) => it as usize,
@@ -568,7 +583,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         Ok(bytes
             .chunks_exact(4)
             .map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]))
-            .collect())
+            .collect::<smallvec::SmallVec<[u32; 64]>>())
     }
 
     fn shuffle(
@@ -587,7 +602,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             lanes.shadow.put(lanes.bytes.len(), &right.shadow);
         }
         lanes.bytes.extend_from_slice(&right.bytes);
-        let mut result = Vec::with_capacity(indices.len() * lanes.size);
+        let mut result = VectorBytes::with_capacity(indices.len() * lanes.size);
         let mut shadow = M::Shadow::default();
         for &index in indices {
             if index as usize >= lanes.len() {
@@ -669,7 +684,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         SimdOp::Or => it | y,
                         _ => it ^ y,
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<VectorBytes>(); // alloc: inline `VectorBytes`, on the stack up to 512 bits
                 destination.write_from_bytes(self, &result)
             }
             SimdOp::Add
@@ -735,7 +750,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         }
                         lane_op(op, lane, i, &lane_args[..arity])
                     })
-                    .collect::<Result<'_, Vec<_>>>()?;
+                    .collect::<Result<'_, LaneValues>>()?;
                 self.write_lanes(destination, lane, &result)
             }
             SimdOp::Fsin
@@ -775,7 +790,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         };
                         if holds { u128::MAX } else { 0 }
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<LaneValues>();
                 self.write_lanes(destination, out, &result)
             }
             SimdOp::Cast | SimdOp::As => {
@@ -789,7 +804,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     .iter()
                     .enumerate()
                     .map(|(i, &it)| cast_lane(op, from, to, i, it).map(|it| to.extend(it)))
-                    .collect::<Result<'_, Vec<_>>>()?;
+                    .collect::<Result<'_, LaneValues>>()?;
                 self.write_lanes(destination, to, &result)
             }
             SimdOp::CastPtr => {
@@ -809,7 +824,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     ));
                 }
                 let (bytes, shadow) = self.read_shadowed(vector.interval.addr, destination.size)?;
-                let bytes = bytes.to_vec();
+                let bytes = VectorBytes::from_slice(bytes);
                 self.write_shadowed(destination.addr, &bytes, &shadow)
             }
             SimdOp::ExposeProvenance => {
@@ -833,7 +848,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let len = self.check_pointer_lanes(op, vector, destination)?;
                 let size = self.ptr_size();
-                let bytes = self.read_scalar(vector.interval)?.to_vec();
+                let bytes = VectorBytes::from_slice(self.read_scalar(vector.interval)?);
                 let mut shadow = M::Shadow::default();
                 if M::CHECKS {
                     for i in 0..len {
@@ -852,7 +867,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let (yes, no) = (self.lanes_of(yes, locals)?, self.lanes_of(no, locals)?);
                 check_lanes(op, mask.len(), yes.len())?;
                 check_lanes(op, mask.len(), no.len())?;
-                let mut result = Vec::with_capacity(yes.bytes.len());
+                let mut result = VectorBytes::with_capacity(yes.bytes.len());
                 let mut shadow = M::Shadow::default();
                 for (i, &mask) in mask.iter().enumerate() {
                     self.push_lane(&mut result, &mut shadow, if mask { &yes } else { &no }, i);
@@ -875,7 +890,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 if yes.len() > 128 {
                     not_supported!("`simd_select_bitmask` of more than 128 lanes");
                 }
-                let mut result = Vec::with_capacity(yes.bytes.len());
+                let mut result = VectorBytes::with_capacity(yes.bytes.len());
                 let mut shadow = M::Shadow::default();
                 for i in 0..yes.len() {
                     let from = if (mask >> i) & 1 == 1 { &yes } else { &no };
@@ -917,7 +932,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let range = lanes.range(index);
                 match value {
                     None => {
-                        let shadow = lanes.shadow.slice(range.clone());
+                        let shadow = lanes.shadow.slice(range.clone()); // clone: a `Range<usize>`
                         self.write_shadowed(destination.addr, &lanes.bytes[range], &shadow)
                     }
                     Some(value) => {
@@ -934,7 +949,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             ));
                         }
                         let (bytes, shadow) = self.read_shadowed(value.interval.addr, lanes.size)?;
-                        lanes.bytes[range.clone()].copy_from_slice(bytes);
+                        lanes.bytes[range.clone()].copy_from_slice(bytes); // clone: a `Range<usize>`
                         if M::CHECKS {
                             lanes.shadow.put(range.start, &shadow);
                         }
@@ -1041,12 +1056,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let range = lanes.range(i);
                     if gather {
                         let (bytes, shadow) = self.read_shadowed(addr, lanes.size)?;
-                        lanes.bytes[range.clone()].copy_from_slice(bytes);
+                        lanes.bytes[range.clone()].copy_from_slice(bytes); // clone: a `Range<usize>`
                         if M::CHECKS {
                             lanes.shadow.put(range.start, &shadow);
                         }
                     } else {
-                        let shadow = lanes.shadow.slice(range.clone());
+                        let shadow = lanes.shadow.slice(range.clone()); // clone: a `Range<usize>`
                         self.write_shadowed(addr, &lanes.bytes[range], &shadow)?;
                     }
                 }
@@ -1076,12 +1091,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let addr = base.offset(range.start).aligned(1);
                     if load {
                         let (bytes, shadow) = self.read_shadowed(addr, lanes.size)?;
-                        lanes.bytes[range.clone()].copy_from_slice(bytes);
+                        lanes.bytes[range.clone()].copy_from_slice(bytes); // clone: a `Range<usize>`
                         if M::CHECKS {
                             lanes.shadow.put(range.start, &shadow);
                         }
                     } else {
-                        let shadow = lanes.shadow.slice(range.clone());
+                        let shadow = lanes.shadow.slice(range.clone()); // clone: a `Range<usize>`
                         self.write_shadowed(addr, &lanes.bytes[range], &shadow)?;
                     }
                 }
@@ -1105,7 +1120,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 if M::CHECKS {
                     self.machine.require_init(&provs, 0..width)?;
                 }
-                let values = bytes.chunks(lane.size()).map(|it| lane.read(it)).collect::<Vec<_>>();
+                let values = bytes.chunks(lane.size()).map(|it| lane.read(it)).collect::<LaneValues>();
                 let (_, counts) = self.read_lanes(offsets)?;
                 check_lanes(op, values.len(), counts.len())?;
                 let (_, ptr_ty) = self.detect_simd_ty(ptrs.ty)?;
@@ -1125,13 +1140,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         let count = ((count << shift) as i128) >> shift;
                         ptr.wrapping_add(count.wrapping_mul(size as i128) as u128)
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<LaneValues>();
                 if !M::CHECKS {
                     return self.write_lanes(destination, lane, &result);
                 }
                 // Each pointer keeps its provenance, as `wrapping_offset` does.
-                let bytes: Vec<u8> =
-                    result.iter().flat_map(|it| it.to_le_bytes()[..lane.size()].to_vec()).collect();
+                let mut bytes = VectorBytes::with_capacity(result.len() * lane.size());
+                for it in &result {
+                    bytes.extend_from_slice(&it.to_le_bytes()[..lane.size()]);
+                }
                 let mut shadow = M::Shadow::default();
                 for i in 0..result.len() {
                     let at = i * lane.size();

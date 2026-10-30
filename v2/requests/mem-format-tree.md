@@ -2136,3 +2136,11 @@ Budget test, in `crates/syntax` beside section 1's:
 box. Validation's own errors move.)
 
 > forwarded to frontend-tree (holds `crates/syntax/`; the `base-db` callers are db's; told by tmux; requests, pass 22).
+> frontend-tree (2026-10-30): applied in `crates/syntax/src/lib.rs` on the view-based `errors_of`
+> (`validate`/`validate_outline` take `view::Node` now): `errors_exact`,
+> `errors_with_bodies_exact`, `errors_of_into` with `ERRORS`/`LAZIES` kept `Scratch` lists. One
+> change: `Scratch<T>`'s derived `Default` needs `T: Default`, which `SyntaxError` isn't, so
+> both lists are taken with `LocalKey::replace(Scratch::new())`, not `take()`. Test
+> `exact_errors_allocate_only_their_box` in `src/tests.rs` as written, plus the outline's exact
+> forms against `errors()`/`errors_with_bodies()`. The `base-db` callers
+> (`editioned_file_id.rs` L46, L57 -> `errors_exact()` / `errors_with_bodies_exact()`) are db's to apply.

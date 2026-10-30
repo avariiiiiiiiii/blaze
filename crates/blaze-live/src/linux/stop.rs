@@ -15,7 +15,7 @@
 //! counts in no other ([`take`]), so the count the stopper waits for is of this round's
 //! threads alone.
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "stops the process's other threads by signal, and reads their pcs")]
 
 use std::{
     ffi::c_void,

@@ -74,7 +74,7 @@ const ALLOW: u8 = 3;
 pub(super) struct Crate<'c, 'a, 'db> {
     pub(super) cx: &'c Cx<'a, 'db>,
     pub(super) defs: &'c Defs,
-    pub(super) levels: &'c Levels,
+    pub(super) levels: &'c Levels<'a, 'db>,
     pub(super) reach: &'c Reach,
     /// rustc builds an executable of the crate: `None` where the front end does not know.
     pub(super) executable: Option<bool>,
@@ -85,7 +85,7 @@ pub(super) struct Crate<'c, 'a, 'db> {
 }
 
 impl<'c, 'a, 'db> Crate<'c, 'a, 'db> {
-    pub(super) fn new(cx: &'c Cx<'a, 'db>, defs: &'c Defs, levels: &'c Levels, reach: &'c Reach) -> Self {
+    pub(super) fn new(cx: &'c Cx<'a, 'db>, defs: &'c Defs, levels: &'c Levels<'a, 'db>, reach: &'c Reach) -> Self {
         Crate {
             cx,
             defs,

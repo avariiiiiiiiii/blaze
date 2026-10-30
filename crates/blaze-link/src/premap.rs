@@ -2,7 +2,7 @@
 //! prelinked image of the workspace's dependencies at a fixed address and links the
 //! workspace's own code beside it, so the two behave as one whole link.
 //!
-//! - [`prelink`] links the image whole, at the request's base, never slid: its segments,
+//! - [`prelink_placed`] links the image whole, at the request's base, never slid: its segments,
 //!   where every function, static and global name is, the cells the run binds, its libraries,
 //!   init and fini pieces, thread-local template, call frame information and Mach-O
 //!   thread-local descriptors. Its thread-locals are at `tls_bias` from offset 0 of the run's
@@ -66,15 +66,6 @@ pub enum Prot {
     ReadOnly,
     /// Read and write: each run gets its own copy of the page on its first write.
     Data,
-}
-
-/// A segment of the image: `bytes` from `addr`, then zeroes to `size`.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Segment {
-    pub addr: u64,
-    pub size: u64,
-    pub prot: Prot,
-    pub bytes: Vec<u8>,
 }
 
 /// Where a static is.
@@ -189,8 +180,6 @@ pub struct Tls {
 /// What the prelink gives back.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Prelinked {
-    /// In address order.
-    pub segments: Vec<Segment>,
     /// Each function asked for: its key, address and size.
     pub functions: Vec<(InstanceKey, u64, u64)>,
     pub statics: Vec<PlacedStatic>,
@@ -357,7 +346,7 @@ pub struct SegmentPlace {
 pub struct Placed {
     /// In address order.
     pub segments: Vec<SegmentPlace>,
-    /// Everything else the prelink says; its `segments` are empty.
+    /// Everything else the prelink says.
     pub linked: Prelinked,
     state: State,
     /// Of each segment, its regions' range of [`State::spaces`].
@@ -427,34 +416,6 @@ impl Placed {
         out.fill(0);
         Ok(())
     }
-
-    /// The segments with their bytes, each in a buffer of its own.
-    pub fn into_prelinked(self) -> Result<Prelinked, LinkError> {
-        // alloc: each segment's bytes, once per prelink
-        let mut bytes: Vec<Vec<u8>> = self.segments.iter().map(|it| vec![0; it.len as usize]).collect();
-        {
-            // alloc: the copy jobs, once per prelink
-            let mut jobs: Vec<CopyJob<'_, '_>> = Vec::new();
-            for (at, out) in bytes.iter_mut().enumerate() {
-                self.carve(at, out, &mut jobs)?;
-            }
-            jobs.into_par_iter().for_each(|(space, at, out)| space.bytes.copy_to(at, out));
-        }
-        let segments = self
-            .segments
-            .iter()
-            .zip(bytes)
-            .map(|(it, bytes)| Segment { addr: it.addr, size: it.size, prot: it.prot, bytes })
-            // alloc: the answer's segments, once per prelink
-            .collect();
-        Ok(Prelinked { segments, ..self.linked })
-    }
-}
-
-/// Links `request` whole at its base, and says where everything is, with each segment's
-/// bytes: [`prelink_placed`] then [`Placed::into_prelinked`].
-pub fn prelink(request: &Request<'_>) -> Result<Prelinked, LinkError> {
-    prelink_placed(request)?.into_prelinked()
 }
 
 /// Links `request` whole at its base, and says where everything is: its segments' bytes are
@@ -516,7 +477,6 @@ pub fn prelink_placed(request: &Request<'_>) -> Result<Placed, LinkError> {
     let (segments, groups) = segments(state, page, &binds, &thread_vars);
     let linked = Prelinked {
         // alloc: none: an empty `Vec` allocates nothing
-        segments: Vec::new(),
         functions,
         statics,
         // alloc: the answer's names, once per prelink

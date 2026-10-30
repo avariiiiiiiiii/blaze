@@ -1466,6 +1466,8 @@ mod tests {
             dev_run: None,
             triple: "x86_64-unknown-linux-gnu".into(),
             exec_log: true,
+            sanitize: blaze_codegen::settings::Sanitize::default(),
+            rpaths: Vec::new(),
         };
         assert!(exec_log(&ok).is_ok());
         assert!(writer(&ok).is_ok());

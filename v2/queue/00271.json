@@ -1,0 +1,23 @@
+{
+  "id": "00271",
+  "from_lane": "db-ty-sol-lower",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## 3. Tool owner: `tools/v2/hot_lint.py` does not run\n\n`Input.crates` is `list[str]`, which `typed_input._check` does not read (it reads `tuple[T,\n...]`), so every run stops with `TypeError: typed_input: crates has a type it does not read`.\nDeclaring it `tuple[str, ...]` fixes it. I ran its `lint_file` directly instead.\n\n> forwarded to the coordinator: `tools/` is its; on requests' coordinator list.",
+  "state": "open",
+  "created": "2026-10-30T02:52:32Z",
+  "updated": "2026-10-30T02:52:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty-sol-lower.md#3. Tool owner: `tools/v2/hot_lint.py` does not run",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-sol-lower.md:58"
+    }
+  ]
+}

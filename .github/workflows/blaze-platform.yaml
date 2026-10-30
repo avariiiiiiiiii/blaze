@@ -191,10 +191,12 @@ jobs:
           job: build
           llvm: true
       # Against the LLVM blaze pins. On Windows, which has no Nix, the build is against the static
-      # C runtime, and names libraries of the SDK that the linker is not otherwise shown.
-      - name: blaze build -p blaze-engine --release --features llvm
+      # C runtime, and names libraries of the SDK that the linker is not otherwise shown. blaze's
+      # build has blaze's proc-macro server in it too, `blaze-proc-macro-srv` of the workspace's
+      # crates/proc-macro-srv-cli, built by blaze over the standard library blaze compiles.
+      - name: blaze build -p blaze-engine -p proc-macro-srv-cli --release --features blaze-engine/llvm
         if: env.BLAZE == 'true'
-        run: blaze build -p blaze-engine --release --features llvm --locked
+        run: blaze build -p blaze-engine -p proc-macro-srv-cli --release --features blaze-engine/llvm --locked
       - name: cargo build -p blaze-engine --release --features llvm
         if: env.BLAZE != 'true'
         run: |
@@ -214,24 +216,13 @@ jobs:
           project: ${{ steps.blaze.outputs.project }}
           token: ${{ secrets.BLAZE_CACHE_TOKEN }}
           sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
-      # blaze's proc-macro server beside blaze, as a release has it: a load into blaze's own
-      # target directory has blaze link every proc macro for that server, and fails without
-      # one ("blaze did not build the proc macro", docs/no-rustc.md, J). Not on Windows, whose
-      # release blaze does not build yet. Only for the harnesses of the `fast` and `full` tiers:
-      # the smoke corpus of every tier is std alone, with no proc macros.
+      # blaze's proc-macro server beside blaze, as a release has it, from blaze's build above: a
+      # load into blaze's own target directory has blaze link every proc macro for that server,
+      # and fails without one ("blaze did not build the proc macro", docs/no-rustc.md, J). Not on
+      # Windows, whose release blaze does not build yet.
       - name: blaze's proc-macro server
-        if: runner.os != 'Windows' && inputs.harnesses == '' && (inputs.tier == 'fast' || inputs.tier == 'full')
-        run: nix develop --command python3 .github/scripts/build_release.py --server-beside target/release/blaze-engine
-      - name: blaze's proc-macro server (named harnesses)
-        if: runner.os != 'Windows' && inputs.harnesses != ''
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/proc-macro-server
-          BLAZE_STD_FROM: 'off'
-          RUST_BACKTRACE: '0'
-        run: |
-          "$PWD/target/release/blaze-engine" cargo build --manifest-path vendor/proc-macro-srv/Cargo.toml -p proc-macro-srv-cli --bin rust-analyzer-proc-macro-srv --release --locked
-          cp "$CARGO_TARGET_DIR/release/rust-analyzer-proc-macro-srv" target/release/blaze-proc-macro-srv
-          RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 target/release/blaze-proc-macro-srv --version
+        if: env.BLAZE == 'true' && runner.os != 'Windows'
+        run: RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 target/release/blaze-proc-macro-srv --version
       # The binaries run each other from next to themselves (`blaze enable` links `cargo fmt`
       # and `cargo clippy` to the blaze beside it, and fails without one; a load finds
       # blaze-proc-macro-srv beside blaze). A tar keeps them executable.

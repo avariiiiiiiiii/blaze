@@ -6,6 +6,8 @@
 //! [`pointerish`]), so that LLVM can tell what each access is based on, and parameters carry
 //! what their Rust types say of the memory they point to ([`Pointee`]).
 
+#![forbid(unsafe_code)]
+
 use cranelift_codegen::ir::{
     self, ArgumentExtension, ArgumentPurpose, AtomicRmwOp, Block, BlockArg, BlockCall,
     ExceptionTableItem, ExternalName, GlobalValueData, Inst, InstructionData, LibCall, Opcode,
@@ -36,6 +38,7 @@ use inkwell::{
     },
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use hir_def::hir::AsmOptions;
 use inkwell::InlineAsmDialect;
@@ -194,16 +197,7 @@ pub(super) fn entry_count<'ctx>(context: &'ctx Context, function: FunctionValue<
     let count = context.i64_type().const_int(count, false);
     let node = context
         .metadata_node(&[context.metadata_string("function_entry_count").into(), count.into()]);
-    use inkwell::{llvm_sys::core, values::AsValueRef as _};
-    // SAFETY: `node` is a metadata node of `context`, which owns it for `'ctx`; this only views
-    // it as metadata.
-    let node = unsafe { core::LLVMValueAsMetadata(node.as_value_ref()) };
-    // SAFETY: `function` is a global of a module of `context` and `node` metadata of the same
-    // context, both live for `'ctx`; metadata of another context would corrupt LLVM's
-    // uniquing.
-    unsafe {
-        core::LLVMGlobalSetMetadata(function.as_value_ref(), context.get_kind_id("prof"), node);
-    }
+    function.as_global_value().set_metadata(node, context.get_kind_id("prof"));
 }
 
 /// A function of the module and what it is lowered from.
@@ -332,6 +326,7 @@ impl Flow {
 /// turned into one there (`ptrtoint`, which LLVM takes for the address escaping).
 fn addresses(func: &ir::Function, flow: &Flow) -> FxHashSet<Value> {
     let dfg = &func.dfg;
+    // alloc: once per function lowered, the analysis's worklist
     let mut work = Vec::new();
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
@@ -394,16 +389,16 @@ fn pointerish(
     params: &[Value],
 ) -> FxHashSet<Value> {
     let dfg = &func.dfg;
+    // clone: once per function lowered; `addresses` is kept beside it (`Lowering::addresses`)
     let mut found = addresses.clone();
     found.extend(params.iter().copied());
     let constant = |value: Value| {
         matches!(dfg.value_def(value), ir::ValueDef::Result(inst, _)
             if dfg.insts[inst].opcode() == Opcode::Iconst)
     };
-    let moved: Vec<Value> = flow.incoming.keys().chain(flow.loaded.keys()).copied().collect();
     loop {
         let before = found.len();
-        for &value in &moved {
+        for &value in flow.incoming.keys().chain(flow.loaded.keys()) {
             let sources = flow.sources(value);
             if !found.contains(&value)
                 && sources.iter().any(|it| found.contains(it))
@@ -530,8 +525,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         func: &ir::Function,
         pointees: &[(u32, Pointee)],
         addresses: &FxHashSet<Value>,
-    ) -> Vec<u32> {
-        let mut pointers: Vec<u32> = pointees.iter().map(|it| it.0).collect();
+    ) -> SmallVec<[u32; 8]> {
+        let mut pointers = pointees.iter().map(|it| it.0).collect::<SmallVec<[u32; 8]>>();
         if let Some(entry) = func.layout.entry_block() {
             let params = func.dfg.block_params(entry).iter().zip(&func.signature.params);
             for (at, (param, abi)) in params.enumerate() {
@@ -601,9 +596,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         let flow = Flow::of(func);
         let addresses = addresses(func, &flow);
         let pointers = Self::pointers(func, defined.pointees, &addresses);
-        let pointer_values: Vec<Value> = func.layout.entry_block().map_or_else(Vec::new, |entry| {
+        let pointer_values = func.layout.entry_block().map_or_else(SmallVec::new, |entry| {
             let params = func.dfg.block_params(entry);
-            pointers.iter().filter_map(|&at| params.get(at as usize).copied()).collect()
+            pointers
+                .iter()
+                .filter_map(|&at| params.get(at as usize).copied())
+                .collect::<SmallVec<[Value; 8]>>()
         });
         let pointerish = pointerish(func, &flow, &addresses, &pointer_values);
         let mut lowering = Lowering {
@@ -661,6 +659,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         ]);
         branch
             .set_metadata(node, self.context.get_kind_id("prof"))
+            // alloc: the error's message
             .map_err(|e| Unhandled::Llvm(e.to_string()))
     }
 
@@ -674,16 +673,18 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         block: BasicBlock<'ctx>,
     ) -> Lowered<()> {
         let Some(marks) = &self.marks else { return Ok(()) };
-        let name = slot.as_u32().to_string();
+        let number = super::SymbolName::of("", slot.as_u32());
+        let name = number.bare();
         let ty = marks
             .debug
             .builder
-            .create_basic_type(&name, u64::from(size) * 8, DW_ATE_UNSIGNED, DIFlags::ZERO)
+            .create_basic_type(name, u64::from(size) * 8, DW_ATE_UNSIGNED, DIFlags::ZERO)
+            // alloc: the error's message
             .map_err(|e| Unhandled::Llvm(e.to_string()))?;
         let scope = marks.function.as_debug_info_scope();
         let variable = marks.debug.builder.create_auto_variable(
             scope,
-            &name,
+            name,
             marks.file,
             0,
             ty.as_type(),
@@ -715,6 +716,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 .as_instruction()
                 .expect("an alloca")
                 .set_alignment(align)
+                // alloc: the error's message
                 .map_err(|e| Unhandled::Llvm(e.to_string()))?;
             self.slots.insert(slot, alloca);
             if named.contains(&slot) {
@@ -730,7 +732,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 continue;
             }
             self.builder.position_at_end(lowered);
-            let mut phis = Vec::new();
+            let mut phis = Vec::with_capacity(self.func.dfg.block_params(block).len());
             for &param in self.func.dfg.block_params(block) {
                 let ty = match self.pointerish.contains(&param) {
                     true => self.context.ptr_type(AddressSpace::default()).into(),
@@ -767,10 +769,11 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     fn reverse_post_order(&self, entry: Block) -> Vec<Block> {
-        let mut order = Vec::new();
+        let mut order = Vec::with_capacity(self.func.dfg.num_blocks());
         let mut seen = rustc_hash::FxHashSet::default();
         seen.insert(entry);
-        let mut stack = vec![(entry, self.successors(entry), 0)];
+        let mut stack: SmallVec<[(Block, SmallVec<[Block; 2]>, usize); 16]> = SmallVec::new();
+        stack.push((entry, self.successors(entry), 0));
         while let Some((block, successors, next)) = stack.last_mut() {
             match successors.get(*next) {
                 Some(&successor) => {
@@ -789,14 +792,14 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         order
     }
 
-    fn successors(&self, block: Block) -> Vec<Block> {
+    fn successors(&self, block: Block) -> SmallVec<[Block; 2]> {
         let dfg = &self.func.dfg;
-        let Some(last) = self.func.layout.last_inst(block) else { return Vec::new() };
+        let Some(last) = self.func.layout.last_inst(block) else { return SmallVec::new() };
         dfg.insts[last]
             .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
             .iter()
             .map(|call| call.block(&dfg.value_lists))
-            .collect()
+            .collect::<SmallVec<[Block; 2]>>()
     }
 
     fn ty(&self, ty: Type) -> Lowered<BasicTypeEnum<'ctx>> {
@@ -908,8 +911,11 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             return ty;
         }
         let pointer = context.ptr_type(AddressSpace::default());
-        let mut params: Vec<BasicMetadataTypeEnum<'ctx>> =
-            ty.get_param_types().into_iter().map(Into::into).collect();
+        let mut params = ty
+            .get_param_types()
+            .into_iter()
+            .map(Into::into)
+            .collect::<SmallVec<[BasicMetadataTypeEnum<'ctx>; 8]>>();
         for &at in pointers {
             if let Some(param) = params.get_mut(at as usize) {
                 *param = pointer.into();
@@ -1105,9 +1111,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     fn offset(&self, base: PointerValue<'ctx>, by: IntValue<'ctx>) -> Lowered<PointerValue<'ctx>> {
-        // SAFETY: `base` and `by` are values of this function's module, live for `'ctx`, and the
-        // GEP is not `inbounds`, so any offset is defined (no poison).
-        Ok(unsafe { self.builder.build_gep(self.context.i8_type(), base, &[by], "")? })
+        Ok(super::byte_offset(&self.builder, self.context, base, by)?)
     }
 
     fn address(&self, base: Value, offset: i32) -> Lowered<PointerValue<'ctx>> {
@@ -1135,22 +1139,26 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     ) -> Lowered<BasicValueEnum<'ctx>> {
         let function = Intrinsic::find(name)
             .and_then(|it| it.get_declaration(self.module, types))
+            // alloc: the error's message
             .ok_or_else(|| Unhandled::Llvm(format!("no intrinsic `{name}`")))?;
         let call = self.builder.build_call(function, args, "")?;
         call.try_as_basic_value()
             .basic()
+            // alloc: the error's message
             .ok_or_else(|| Unhandled::Llvm(format!("`{name}` returns nothing")))
     }
 
     fn int_intrinsic(&self, name: &str, args: &[IntValue<'ctx>]) -> Lowered<IntValue<'ctx>> {
         let ty = args[0].get_type();
-        let args: Vec<_> = args.iter().map(|&it| it.into()).collect();
+        let args =
+            args.iter().map(|&it| it.into()).collect::<SmallVec<[BasicMetadataValueEnum<'ctx>; 4]>>();
         Ok(self.intrinsic(name, &[ty.into()], &args)?.into_int_value())
     }
 
     fn float_intrinsic(&self, name: &str, args: &[FloatValue<'ctx>]) -> Lowered<FloatValue<'ctx>> {
         let ty = args[0].get_type();
-        let args: Vec<_> = args.iter().map(|&it| it.into()).collect();
+        let args =
+            args.iter().map(|&it| it.into()).collect::<SmallVec<[BasicMetadataValueEnum<'ctx>; 4]>>();
         Ok(self.intrinsic(name, &[ty.into()], &args)?.into_float_value())
     }
 
@@ -1545,12 +1553,14 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     fn make_atomic(access: InstructionValue<'ctx>) -> Lowered<()> {
         access
             .set_atomic_ordering(AtomicOrdering::SequentiallyConsistent)
+            // alloc: the error's message
             .map_err(|e| Unhandled::Llvm(e.to_string()))
     }
 
     fn trap(&self) -> Lowered<()> {
         let trap = Intrinsic::find("llvm.trap")
             .and_then(|it| it.get_declaration(self.module, &[]))
+            // alloc: the error's message
             .ok_or_else(|| Unhandled::Llvm("no intrinsic `llvm.trap`".to_owned()))?;
         self.builder.build_call(trap, &[], "")?;
         self.builder.build_unreachable()?;
@@ -1702,10 +1712,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     let index = self.context.i32_type();
                     let lanes = l.get_type().get_size();
                     let mask = |first: u32| {
-                        let lanes: Vec<IntValue<'ctx>> = (0..lanes)
+                        let lanes = (0..lanes)
                             .map(|lane| index.const_int(u64::from(lane * 2 + first), false))
-                            .collect();
-                        VectorType::const_vector(&lanes)
+                            .collect::<SmallVec<[IntValue<'ctx>; 16]>>();
+                        VectorType::const_vector(lanes.as_slice())
                     };
                     let even = b.build_shuffle_vector(l, r, mask(0), "")?;
                     let odd = b.build_shuffle_vector(l, r, mask(1), "")?;
@@ -1719,12 +1729,11 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         // An `offset` is of an address, whether or not it was loaded as an integer.
         if opcode == Opcode::Iadd && unwind::seh::is_in_bounds(self.func.srcloc(inst)) {
             let (base, by) = (self.pointer(l)?, self.int(r)?);
-            // SAFETY: only an `iadd` marked by `unwind::seh::in_bounds` gets here, and `mod.rs`
-            // marks only the add of the `offset` intrinsic (kept on its copy in a body built
-            // in), whose result Rust requires to stay within `base`'s allocation, as rustc
-            // emits it `inbounds`; otherwise the result would be poison.
-            let address =
-                unsafe { b.build_in_bounds_gep(self.context.i8_type(), base, &[by], "")? };
+            // `inbounds` holds: only an `iadd` marked by `unwind::seh::in_bounds` gets here, and
+            // `mod.rs` marks only the add of the `offset` intrinsic (kept on its copy in a body
+            // built in), whose result Rust requires to stay within `base`'s allocation, as
+            // rustc emits it `inbounds`; otherwise the result would be poison.
+            let address = super::in_bounds_byte_offset(b, self.context, base, by)?;
             self.set(inst, Operand::Pointer(address));
             return Ok(());
         }
@@ -1867,6 +1876,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         if aligned {
             return Ok(());
         }
+        // alloc: the error's message
         access.set_alignment(1).map_err(|e| Unhandled::Llvm(e.to_string()))
     }
 
@@ -1967,6 +1977,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         match name {
             ExternalName::User(name) => {
                 let name = &self.func.params.user_named_funcs()[*name];
+                // The name is kept by `callees` and `globals`, once per callee or data object, and
+                // made at most once per call that passes an address (`pointer_params`).
+                // alloc: the owned name those maps keep
                 Ok(super::Symbol::of_user(name.namespace, name.index).to_string())
             }
             ExternalName::LibCall(libcall) => {
@@ -1976,10 +1989,21 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         }
     }
 
+    /// The request `name` is, as [`Self::external_name`] names it: a library function's name
+    /// is no request's.
+    fn symbol(&self, name: &ExternalName) -> Option<super::Symbol> {
+        match name {
+            ExternalName::User(name) => {
+                let name = &self.func.params.user_named_funcs()[*name];
+                Some(super::Symbol::of_user(name.namespace, name.index))
+            }
+            _ => None,
+        }
+    }
+
     /// The `asm!` block the call of `func_ref` runs, when it goes where it is called.
     fn asm_block(&self, func_ref: ir::FuncRef) -> Option<&'static asm::Inline> {
-        let name = self.external_name(&self.func.dfg.ext_funcs[func_ref].name).ok()?;
-        match super::Symbol::parse(&name)? {
+        match self.symbol(&self.func.dfg.ext_funcs[func_ref].name)? {
             super::Symbol::Func(id) => self.blocks_asm.get(&id).copied(),
             super::Symbol::Data(_) => None,
         }
@@ -1999,19 +2023,18 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         };
         let at = |lowering: &Self, offset: u32| {
             let offset = lowering.context.i64_type().const_int(offset.into(), false);
-            // SAFETY: `base` and `offset` are values of this module, live for `'ctx`; the GEP is
-            // not `inbounds`, so any offset is defined, and the wrapper's offsets are within
-            // the slot.
-            unsafe { lowering.builder.build_gep(lowering.context.i8_type(), base, &[offset], "") }
+            super::byte_offset(&lowering.builder, lowering.context, base, offset)
         };
-        let mut args: Vec<BasicMetadataValueEnum<'ctx>> = Vec::new();
-        let mut params: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::new();
+        let mut args: SmallVec<[BasicMetadataValueEnum<'ctx>; 8]> =
+            SmallVec::with_capacity(block.inputs.len());
+        let mut params: SmallVec<[BasicMetadataTypeEnum<'ctx>; 8]> =
+            SmallVec::with_capacity(block.inputs.len());
         for &(offset, size) in &block.inputs {
             let address = at(self, offset)?;
             args.push(self.builder.build_load(int(size)?, address, "")?.into());
             params.push(int(size)?.into());
         }
-        let outputs: Vec<BasicTypeEnum<'ctx>> =
+        let outputs: SmallVec<[BasicTypeEnum<'ctx>; 4]> =
             block.outputs.iter().map(|&(_, size)| Ok(int(size)?.into())).collect::<Lowered<_>>()?;
         let ty = match outputs.as_slice() {
             [] => self.context.void_type().fn_type(&params, false),
@@ -2025,7 +2048,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         let pure = options.contains(AsmOptions::PURE);
         let code = self.context.create_inline_asm(
             ty,
+            // clone: inkwell's `create_inline_asm` takes the text by value; once per `asm!` call
             block.text.clone(),
+            // clone: as the text
             block.constraints.clone(),
             !pure,
             !options.contains(AsmOptions::NOSTACK),
@@ -2067,8 +2092,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         let mut name = self.external_name(&data.name)?;
         let sig = &self.func.dfg.signatures[data.signature];
         let ty = Self::function_type(self.context, sig)?;
-        let shown = match super::Symbol::parse(&name) {
+        let shown = match self.symbol(&data.name) {
             Some(super::Symbol::Func(id)) if Some(id) == self.memcmp => {
+                // alloc: once per callee of the function, which `callees` keeps
                 name = "memcmp".to_owned();
                 None
             }
@@ -2111,6 +2137,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         if offset.bits() != 0 {
             return Err(Unhandled::Shape("a symbol with an offset"));
         }
+        let symbol = self.symbol(name);
         let name = self.external_name(name)?;
         let data = match self.module.get_global(&name) {
             Some(known) => known,
@@ -2120,7 +2147,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 // their addresses to false. One of a type without a size may be at any
                 // address, another's too.
                 let is_static = matches!(
-                    super::Symbol::parse(&name),
+                    symbol,
                     Some(super::Symbol::Data(index)) if self.statics.contains(&index)
                 );
                 let data = if is_static {
@@ -2163,14 +2190,13 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         let GlobalValueData::Symbol { name, .. } = &self.func.global_values[global_value] else {
             return None;
         };
-        let name = self.external_name(name).ok()?;
-        let Some(super::Symbol::Data(index)) = super::Symbol::parse(&name) else { return None };
+        let Some(super::Symbol::Data(index)) = self.symbol(name) else { return None };
         let from = usize::try_from(offset).ok()?;
         let bytes = self.constants.get(&index)?.get(from..from + ty.bytes() as usize)?;
-        let words: Vec<u64> = bytes
+        let words = bytes
             .chunks(8)
             .map(|word| word.iter().rev().fold(0, |all, &byte| all << 8 | u64::from(byte)))
-            .collect();
+            .collect::<SmallVec<[u64; 2]>>();
         let bits = self.context.custom_width_int_type(std::num::NonZero::new(ty.bits())?).ok()?;
         let value = bits.const_int_arbitrary_precision(&words);
         match self.ty(ty).ok()? {
@@ -2185,8 +2211,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         ty: FunctionType<'ctx>,
         sig: &Signature,
         args: &[Value],
-    ) -> Lowered<Vec<BasicMetadataValueEnum<'ctx>>> {
-        Ok(self.invoke_arguments(ty, sig, args)?.into_iter().map(Into::into).collect())
+    ) -> Lowered<SmallVec<[BasicMetadataValueEnum<'ctx>; 8]>> {
+        let args = self.invoke_arguments(ty, sig, args)?;
+        Ok(args.into_iter().map(Into::into).collect::<SmallVec<[_; 8]>>())
     }
 
     /// What a call of type `ty` passes for `args`: what is a pointer there is passed as one.
@@ -2195,7 +2222,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         ty: FunctionType<'ctx>,
         sig: &Signature,
         args: &[Value],
-    ) -> Lowered<Vec<BasicValueEnum<'ctx>>> {
+    ) -> Lowered<SmallVec<[BasicValueEnum<'ctx>; 8]>> {
         let types = ty.get_param_types();
         std::iter::zip(&sig.params, args)
             .enumerate()
@@ -2206,21 +2233,21 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     _ => self.pointer(arg)?.into(),
                 })
             })
-            .collect()
+            .collect::<Lowered<SmallVec<[_; 8]>>>()
     }
 
     /// The type of an indirect call of `sig` with `args`: an argument that is an address is
     /// passed as a pointer, which does not have it escape before the call.
     fn indirect_type(&self, sig: &Signature, args: &[Value]) -> Lowered<FunctionType<'ctx>> {
         let ty = Self::function_type(self.context, sig)?;
-        let pointers: Vec<u32> = std::iter::zip(&sig.params, args)
+        let pointers = std::iter::zip(&sig.params, args)
             .enumerate()
             .filter(|(_, (param, arg))| {
                 param.purpose == ArgumentPurpose::Normal
                     && matches!(self.operand(**arg), Operand::Pointer(_))
             })
             .map(|(at, _)| at as u32)
-            .collect();
+            .collect::<SmallVec<[u32; 8]>>();
         Ok(Self::with_pointers(self.context, ty, &pointers))
     }
 
@@ -2237,14 +2264,20 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     _ => continue,
                 };
                 let data = &dfg.ext_funcs[func_ref];
-                let Ok(name) = self.external_name(&data.name) else { continue };
                 let sig = &dfg.signatures[data.signature];
                 let args = std::iter::zip(&sig.params, dfg.inst_args(inst)).enumerate();
+                // The callee's entry, made at the first address passed; a callee without a
+                // name has none.
+                let mut positions: Option<&mut Vec<u32>> = None;
                 for (at, (param, arg)) in args {
                     if param.purpose == ArgumentPurpose::Normal
                         && pointerish.contains(&dfg.resolve_aliases(*arg))
                     {
-                        let positions = found.entry(name.clone()).or_default();
+                        if positions.is_none() {
+                            let Ok(name) = self.external_name(&data.name) else { break };
+                            positions = Some(found.entry(name).or_default());
+                        }
+                        let positions = positions.as_deref_mut().expect("made just above");
                         if !positions.contains(&(at as u32)) {
                             positions.push(at as u32);
                         }
@@ -2259,14 +2292,14 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         &self,
         call: CallSiteValue<'ctx>,
         sig: &Signature,
-    ) -> Lowered<Vec<BasicValueEnum<'ctx>>> {
+    ) -> Lowered<SmallVec<[BasicValueEnum<'ctx>; 2]>> {
         Self::mark_signature(self.context, sig, Side::Caller, |loc, attribute| {
             call.add_attribute(loc, attribute)
         });
         let value = call.try_as_basic_value().basic();
         Ok(match (sig.returns.len(), value) {
-            (0, _) => Vec::new(),
-            (1, Some(value)) => vec![value],
+            (0, _) => SmallVec::new(),
+            (1, Some(value)) => SmallVec::from_slice(&[value]),
             (count, Some(BasicValueEnum::StructValue(pair))) => (0..count as u32)
                 .map(|at| self.builder.build_extract_value(pair, at, ""))
                 .collect::<Result<_, _>>()?,
@@ -2375,8 +2408,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         }) else {
             return Err(Unhandled::Shape("an exception table without a handler"));
         };
-        let handler_args: Vec<_> = handler.args(&dfg.value_lists).collect();
-        if !matches!(handler_args[..], [BlockArg::TryCallExn(0)]) {
+        let mut handler_args = handler.args(&dfg.value_lists);
+        let plain = (handler_args.next(), handler_args.next());
+        if !matches!(plain, (Some(BlockArg::TryCallExn(0)), None)) {
             let pad = self.landing_pad_of_call(tag.as_u32(), handler)?;
             return Ok((self.context.append_basic_block(self.function, ""), pad));
         }
@@ -2393,8 +2427,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     fn resumes(&self, func_ref: ir::FuncRef) -> bool {
-        let name = self.external_name(&self.func.dfg.ext_funcs[func_ref].name);
-        let id = name.ok().and_then(|it| super::Symbol::parse(&it));
+        let id = self.symbol(&self.func.dfg.ext_funcs[func_ref].name);
         matches!(id, Some(super::Symbol::Func(id)) if Some(id) == self.resume)
     }
 
@@ -2431,12 +2464,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         let from = self.builder.get_insert_block().expect("a block being filled");
         let exception = self.int(exception)?;
         let target = handler.block(&dfg.value_lists);
-        let args: Vec<BlockArg> = handler.args(&dfg.value_lists).collect();
-        let phis = self.phis.get(&target).cloned().unwrap_or_default();
+        let args = handler.args(&dfg.value_lists);
+        let phis = self.phis.get(&target).map_or(&[][..], Vec::as_slice);
         if phis.len() != args.len() {
             return Err(Unhandled::Shape("a handler given other values than it takes"));
         }
-        for (phi, arg) in std::iter::zip(&phis, args) {
+        for (phi, arg) in std::iter::zip(phis, args) {
             let value: BasicValueEnum<'ctx> = match arg {
                 BlockArg::Value(value) => self.passed(*phi, value)?,
                 BlockArg::TryCallExn(0) => self.as_phi(*phi, exception.into())?,
@@ -2503,12 +2536,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             self.builder.build_ptr_to_int(payload.into_pointer_value(), context.i64_type(), "")?;
         let dfg = &self.func.dfg;
         let target = handler.block(&dfg.value_lists);
-        let args: Vec<BlockArg> = handler.args(&dfg.value_lists).collect();
-        let phis = self.phis.get(&target).cloned().unwrap_or_default();
+        let args = handler.args(&dfg.value_lists);
+        let phis = self.phis.get(&target).map_or(&[][..], Vec::as_slice);
         if phis.len() != args.len() {
             return Err(Unhandled::Shape("a handler given other values than it takes"));
         }
-        for (phi, arg) in std::iter::zip(&phis, args) {
+        for (phi, arg) in std::iter::zip(phis, args) {
             let value: BasicValueEnum<'ctx> = match arg {
                 BlockArg::Value(value) => self.passed(*phi, value)?,
                 BlockArg::TryCallExn(0) => self.as_phi(*phi, payload.into())?,
@@ -2597,6 +2630,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
 
 impl From<BuilderError> for Unhandled {
     fn from(e: BuilderError) -> Self {
+        // alloc: the error's message
         Unhandled::Llvm(e.to_string())
     }
 }

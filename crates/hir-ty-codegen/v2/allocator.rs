@@ -39,15 +39,16 @@ pub(super) fn shim(
     root: impl Fn(hir_def::FunctionId) -> HirInstance,
 ) -> Result<Vec<HirInstance>, String> {
     let Some(boxed) = DbInterner::new_with(db, krate).lang_items().OwnedBox else {
-        return Ok(Vec::new());
+        return Ok(Vec::new()); // alloc: empty, allocates nothing
     };
     let program = linked_crates(db, [krate]);
     if !program.contains(&boxed.krate(db)) {
-        return Ok(Vec::new());
+        return Ok(Vec::new()); // alloc: empty, allocates nothing
     }
     let mut declared = program.iter().copied().filter(|&it| declares_global_allocator(db, it));
     let allocator = declared.next();
     if let Some(other) = declared.next() {
+        // alloc: the error's message
         return Err(format!(
             "two `#[global_allocator]`s in one program, in crates `{}` and `{}`",
             crate::fncache::crate_name(db, allocator.expect("the first")),
@@ -60,6 +61,7 @@ pub(super) fn shim(
             Some(allocator) => {
                 let Some(func) = global_allocator_export(db, allocator, ours) else {
                     let name = crate::fncache::crate_name(db, allocator);
+                    // alloc: the error's message
                     return Err(format!("`#[global_allocator]` of crate `{name}` exports no `{ours}`"));
                 };
                 shim.push(root(func));
@@ -89,6 +91,7 @@ fn default_of(symbol: &'static str) -> Result<&'static str, String> {
         "__rust_dealloc" => "__rdl_dealloc",
         "__rust_realloc" => "__rdl_realloc",
         "__rust_alloc_zeroed" => "__rdl_alloc_zeroed",
+        // alloc: the error's message
         other => return Err(format!("the allocator entry `{other}`, which std has no default of")),
     })
 }
@@ -111,6 +114,7 @@ pub(super) fn code(forward: &Forward) -> CodeHash {
 
 /// What its IR asks for: the function it calls, by symbol.
 pub(super) fn walk(forward: &Forward) -> Vec<Ref> {
+    // alloc: one of the shim's few entries, once per program; `FrontRef::Extern` owns its name
     forward.to.iter().map(|to| FrontRef::Extern((*to).to_owned())).collect()
 }
 
@@ -120,19 +124,23 @@ pub(super) fn built(db: &Db, forward: &Forward, checked: bool) -> crate::Result<
         let mut sig = Signature::new(fx.cg.isa.default_call_conv());
         sig.params.extend((0..forward.params).map(|_| AbiParam::new(ptr())));
         sig.returns.extend(forward.returns.then(|| AbiParam::new(ptr())));
+        // clone: one of the shim's few entries, once per program
         fx.builder.func.signature = sig.clone();
         let entry = fx.builder.create_block();
         fx.builder.append_block_params_for_function_params(entry);
         fx.builder.switch_to_block(entry);
+        // alloc: one of the shim's few entries, once per program
         let args = fx.builder.block_params(entry).to_vec();
         let results = match forward.to {
             Some(to) => {
+                // alloc: one of the shim's few entries; `FuncTarget::Symbol` owns its name
                 let callee = fx.cg.wants.func(FuncTarget::Symbol(to.to_owned()), &sig);
                 let callee = fx.cg.declare_func_in_func(callee, fx.builder.func);
                 let call = fx.builder.ins().call(callee, &args);
+                // alloc: one of the shim's few entries, once per program
                 fx.builder.inst_results(call).to_vec()
             }
-            None => Vec::new(),
+            None => Vec::new(), // alloc: empty, allocates nothing
         };
         fx.builder.ins().return_(&results);
         Ok(())

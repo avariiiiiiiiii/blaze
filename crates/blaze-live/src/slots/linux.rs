@@ -9,7 +9,7 @@
 //! makes each run of them writable once, writes and protects it again. Data is written
 //! with atomic stores ([`Writes::store`]), since other threads may read it meanwhile.
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "the jump table's executable memory, protections and unwind registration")]
 
 use std::{
     ffi::{CString, c_char, c_void},

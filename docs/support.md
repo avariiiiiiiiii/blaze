@@ -21,8 +21,8 @@ says `rustc 1.101.0-nightly (12433c307 2026-10-24)` (rust-lang/rust 12433c307b5a
 23.1.4). blaze links against what rustc built, so it must agree with that rustc on symbol
 mangling (v0), type layout, the unstable Rust ABI, vtable layout and `TypeId` hashes, and
 everything that mirrors rustc is taken from that one commit: `crates/rustc_abi` is its
-`compiler/rustc_abi`, `vendor/proc-macro-srv` its proc-macro server with blaze's changes,
-and the answers to rustc's questions (`crates/blaze-cargo/src/answers/rustc.json`) are what that
+`compiler/rustc_abi`, blaze's proc-macro server (`crates/proc-macro-srv`) follows its
+`proc_macro` bridge, and the answers to rustc's questions (`crates/blaze-cargo/src/answers/rustc.json`) are what that
 rustc says on x86-64 Linux, AArch64 Linux and arm64 macOS. Stable Rust is not supported as a
 toolchain of its own: a stable release's code builds because the nightly builds it. The pin
 moves to a newer nightly with `harness/toolchain_bump.py`

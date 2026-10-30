@@ -82,6 +82,7 @@ macro_rules! setup_input_struct {
         #[allow(dead_code)]
         const _: () = {
             use ::salsa::plumbing as $zalsa;
+            use $zalsa::ZalsaDatabase as _;
             use $zalsa::input as $zalsa_struct;
 
             type $Configuration = $Struct;
@@ -378,6 +379,8 @@ macro_rules! setup_input_struct {
                 use super::*;
 
                 use ::salsa::plumbing as $zalsa;
+
+                use $zalsa::ZalsaDatabase as _;
                 use $zalsa::input as $zalsa_struct;
 
                 // These are standalone functions instead of methods on `Builder` to prevent

@@ -11,8 +11,8 @@
 //! 40 and, for a read or a send it ends, the 24: one cache line, two where a record straddles
 //! one. A lookup is a bounds check, one compare of the generation and a load.
 //!
-//! The names whole-file writes and renames hand the kernel are in [`Paths`], two arenas used in
-//! turn, and the registered buffers of writes that bypass the page cache are lent by [`Lent`],
+//! The names requests on paths hand the kernel (and the `statx` and descriptor it reads or
+//! writes beside them) are in [`Paths`], two arenas used in turn, and the registered buffers of writes that bypass the page cache are lent by [`Lent`],
 //! in the order they were asked for.
 
 use std::{collections::VecDeque, ffi::CStr, mem, os::fd::OwnedFd};
@@ -345,9 +345,16 @@ impl Paths {
     }
 
     /// The NUL-terminated name at `at` of `arena`, which a request put there.
-    pub(super) fn name(&self, arena: u8, at: u32) -> &CStr {
-        // SAFETY: `at` starts a name a request pushed NUL-terminated and holds until it ends;
-        // the kernel only reads names, so nothing writes its bytes while this borrows them.
+    ///
+    /// # Safety
+    ///
+    /// `at` starts a name pushed NUL-terminated (`push_c` and the like) into `arena` by a
+    /// request that still holds it, never a `statx` room: the scan runs to the first NUL, so
+    /// from anywhere else it could run into bytes the kernel is writing, or past the arena.
+    pub(super) unsafe fn name(&self, arena: u8, at: u32) -> &CStr {
+        // SAFETY: as the caller says, `at` starts a NUL-terminated name the arena keeps until
+        // its request ends (it is cleared only once none holds it); the kernel only reads
+        // names, so nothing writes the bytes scanned while this borrows them.
         unsafe { CStr::from_ptr(self.at(arena, at).cast()) }
     }
 

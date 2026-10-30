@@ -192,6 +192,39 @@ impl<T: Typed> Parse<T> {
     }
 }
 
+/// The tag of a parse whose root has no one kind (a macro expansion, a fragment): it has no view
+/// type of its own, so a `Parse<Untyped>` is walked from [`Parse::root`] or cast with
+/// [`Parse::cast_view`].
+pub enum Untyped {}
+
+impl<T> Parse<T> {
+    /// The same parse with its kind forgotten.
+    #[inline]
+    pub fn into_untyped(mut self) -> Parse<Untyped> {
+        Parse {
+            tree: self.tree.take(),
+            errors: self.errors.take(),
+            outline: self.outline,
+            _ty: PhantomData,
+        }
+    }
+}
+
+impl Parse<Untyped> {
+    /// The parse as a `T`, when its root is one.
+    pub fn cast_view<T: Typed>(mut self) -> Option<Parse<T>> {
+        if !<T::Of<'_> as AstNode<'_>>::can_cast(self.root().kind()) {
+            return None;
+        }
+        Some(Parse {
+            tree: self.tree.take(),
+            errors: self.errors.take(),
+            outline: self.outline,
+            _ty: PhantomData,
+        })
+    }
+}
+
 /// Typed views of the root of any flat tree, for trees not held by a [`Parse`].
 #[inline]
 pub fn root<'t, N: AstNode<'t>>(tree: &'t Arc<FlatTree>) -> Option<N> {

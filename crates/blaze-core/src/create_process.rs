@@ -19,7 +19,9 @@ pub fn command_line(
     args: &[std::ffi::OsString],
 ) -> io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
+    // alloc: once per process spawned, which a CreateProcessW call dwarfs
     let program: Vec<u16> = program.as_os_str().encode_wide().collect();
+    // alloc: once per process spawned, which a CreateProcessW call dwarfs
     let args: Vec<Vec<u16>> = args.iter().map(|it| it.encode_wide().collect()).collect();
     wide_command_line(&program, &args)
 }
@@ -30,7 +32,9 @@ pub fn environment(env: &[(std::ffi::OsString, std::ffi::OsString)]) -> io::Resu
     use std::os::windows::ffi::OsStrExt;
     wide_environment(
         env.iter()
+            // alloc: once per process spawned, which a CreateProcessW call dwarfs
             .map(|(name, value)| (name.encode_wide().collect(), value.encode_wide().collect()))
+            // alloc: once per process spawned, which a CreateProcessW call dwarfs
             .collect(),
     )
 }
@@ -38,8 +42,10 @@ pub fn environment(env: &[(std::ffi::OsString, std::ffi::OsString)]) -> io::Resu
 /// [`command_line`] of a program and arguments in code units.
 pub fn wide_command_line(program: &[u16], args: &[Vec<u16>]) -> io::Result<Vec<u16>> {
     if program.iter().any(|&it| it == 0 || it == QUOTE) {
+        // alloc: the error's message
         return Err(invalid(format!(
             "the program's path has a quote or a NUL in it: {}",
+            // alloc: the error's message
             String::from_utf16_lossy(program)
         )));
     }
@@ -58,8 +64,10 @@ pub fn wide_command_line(program: &[u16], args: &[Vec<u16>]) -> io::Result<Vec<u
 
 fn push_arg(line: &mut Vec<u16>, arg: &[u16]) -> io::Result<()> {
     if arg.contains(&0) {
+        // alloc: the error's message
         return Err(invalid(format!(
             "an argument has a NUL in it: {}",
+            // alloc: the error's message
             String::from_utf16_lossy(arg)
         )));
     }
@@ -93,14 +101,18 @@ pub fn wide_environment(env: Vec<(Vec<u16>, Vec<u16>)>) -> io::Result<Vec<u16>> 
     for (given, (name, value)) in env.into_iter().enumerate() {
         // A name may start with `=` (cmd's `=C:`), and has none after.
         if name.is_empty() || name.contains(&0) || name[1..].contains(&EQUALS) {
+            // alloc: the error's message
             return Err(invalid(format!(
                 "the environment has a variable that can't be named: {}",
+                // alloc: the error's message
                 String::from_utf16_lossy(&name)
             )));
         }
         if value.contains(&0) {
+            // alloc: the error's message
             return Err(invalid(format!(
                 "the variable {} has a NUL in it",
+                // alloc: the error's message
                 String::from_utf16_lossy(&name)
             )));
         }
@@ -135,6 +147,7 @@ fn upper(units: &[u16]) -> Vec<u16> {
                 _ => unit,
             }
         })
+        // alloc: once per variable of a process spawned, its name's sort key
         .collect()
 }
 

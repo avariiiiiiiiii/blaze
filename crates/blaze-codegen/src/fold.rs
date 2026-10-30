@@ -175,7 +175,8 @@ impl Group {
     /// The references of member `member`'s thunk: the member's own, then the merged body,
     /// [`Target::Direct`] of [`Group::key`], which the thunk calls.
     pub fn thunk_refs(&self, own: &Refs) -> Vec<Target> {
-        let mut refs = own.to_vec();
+        let mut refs = Vec::with_capacity(own.len() + 1);
+        refs.extend_from_slice(own);
         refs.push(Target::Direct(self.key()));
         refs
     }
@@ -296,6 +297,8 @@ struct Split<'a> {
     starts: Vec<u32>,
     flat: Vec<u32>,
     param_of: Vec<u32>,
+    /// Per varying constant of the part at hand, the parameter it reads.
+    reads: Vec<u32>,
 }
 
 impl<'a> Split<'a> {
@@ -356,7 +359,9 @@ impl<'a> Split<'a> {
             let (varying_of, classes) = (&self.varying[part * n..][..n], &self.classes[part * n..][..n]);
             self.param_of.clear();
             self.param_of.resize(n, u32::MAX);
-            let (mut varying, mut reads, mut params) = (Vec::new(), Vec::new(), 0u32);
+            // alloc: the group's own list, moved into it
+            let (mut varying, mut params) = (Vec::new(), 0u32);
+            self.reads.clear();
             for at in 0..n {
                 if !varying_of[at] {
                     continue;
@@ -367,7 +372,7 @@ impl<'a> Split<'a> {
                     params += 1;
                 }
                 varying.push(at as u32);
-                reads.push(*param);
+                self.reads.push(*param);
             }
             let first = self.members[members[0] as usize];
             if params == 0 || !profitable(first.size, members.len(), params, limits) {
@@ -375,7 +380,7 @@ impl<'a> Split<'a> {
             }
             let mut hasher = Hasher::new(FOLD_SHAPE_DOMAIN);
             hasher.id(&first.masked_id);
-            let mut reads_of = varying.iter().zip(&reads).peekable();
+            let mut reads_of = varying.iter().zip(&self.reads).peekable();
             let first_cells = &self.cells[members[0] as usize * n..][..n];
             for (at, it) in first_cells.iter().enumerate() {
                 if let Some((_, param)) = reads_of.next_if(|(v, _)| **v as usize == at) {
@@ -388,13 +393,16 @@ impl<'a> Split<'a> {
                 .iter()
                 .map(|&it| {
                     let constants = self.members[it as usize].constants;
+                    // alloc: the group's own list, exact size
                     varying.iter().map(|&at| constants[at as usize]).collect()
                 })
+                // alloc: the group's own list, exact size
                 .collect();
             out.push(Group {
                 shape: hasher.finish(),
                 settings: first.settings,
                 varying,
+                // alloc: the group's own list, exact size
                 members: members.iter().map(|&it| self.members[it as usize].key).collect(),
                 constants,
             });
@@ -517,12 +525,14 @@ pub fn groups(
     }
     // One sort makes every bucket a run, its members in key order. Stable, so of candidates
     // given twice under one key in one bucket, the first given stays.
+    // alloc: one exact-size column per build
     let mut order: Vec<u32> = (0..all.len() as u32).collect();
     order.sort_by(|&a, &b| {
         let (a, b) = (&all[a as usize], &all[b as usize]);
         (a.settings, a.masked_id, a.key).cmp(&(b.settings, b.masked_id, b.key))
     });
     let mut split = Split::default();
+    // alloc: the build's answer, once per build
     let mut groups = Vec::new();
     let mut start = 0;
     while start < order.len() {

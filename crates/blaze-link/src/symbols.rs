@@ -118,6 +118,10 @@ pub(crate) enum SymKey {
     /// A dev run's tier-up counter pairs ([`blaze_codegen::Target::Counter`]): the start of the
     /// cells reservation, each pair at an offset of it ([`crate::counter`]).
     Counters,
+    /// A lazy image's stub region ([`crate::lazy`]): one piece after the slot stubs.
+    LazyStubs,
+    /// A lazy function's entry in the stub region, by its instance key: its slot's first target.
+    LazyEntry(IdNo),
 }
 
 const _: () = assert!(size_of::<SymKey>() == 20);
@@ -156,6 +160,8 @@ impl SymKey {
             CoveragePcs(a) => [24, a.0, 0, 0, 0],
             StartHook => [25, 0, 0, 0, 0],
             Counters => [26, 0, 0, 0, 0],
+            LazyStubs => [27, 0, 0, 0, 0],
+            LazyEntry(a) => [28, a.0, 0, 0, 0],
         }
     }
 }
@@ -471,7 +477,8 @@ impl Symbols {
             | (Cie(x), Cie(y))
             | (Fde(x), Fde(y))
             | (WinInfo(x), WinInfo(y))
-            | (CoveragePcs(x), CoveragePcs(y)) => id(x, y),
+            | (CoveragePcs(x), CoveragePcs(y))
+            | (LazyEntry(x), LazyEntry(y)) => id(x, y),
             (Static(x, i), Static(y, j)) | (Tlv(x, i), Tlv(y, j)) => id(x, y).then_with(|| id(i, j)),
             (Name(x), Name(y)) | (FileName(x), FileName(y)) | (IatEnd(x), IatEnd(y)) | (Common(x), Common(y)) => {
                 name(x, y)
@@ -501,6 +508,7 @@ impl Symbols {
                 write!(out, "SanitizerCoverage array {array} of the function {:?}", self.instance(key))
             }
             SymKey::CoveragePcs(key) => write!(out, "the SanitizerCoverage PC table of the function {:?}", self.instance(key)),
+            SymKey::LazyEntry(key) => write!(out, "the lazy entry of the function {:?}", self.instance(key)),
             key => self.write_debug(key, &mut out),
         };
         out
@@ -566,6 +574,8 @@ impl Symbols {
             SymKey::CoveragePcs(it) => write!(out, "CoveragePcs({:?})", self.instance(it)),
             SymKey::StartHook => write!(out, "StartHook"),
             SymKey::Counters => write!(out, "Counters"),
+            SymKey::LazyStubs => write!(out, "LazyStubs"),
+            SymKey::LazyEntry(it) => write!(out, "LazyEntry({:?})", self.instance(it)),
         }
     }
 
@@ -583,7 +593,8 @@ impl Symbols {
             | SymKey::Cie(a)
             | SymKey::Fde(a)
             | SymKey::WinInfo(a)
-            | SymKey::CoveragePcs(a) => id(out, a),
+            | SymKey::CoveragePcs(a)
+            | SymKey::LazyEntry(a) => id(out, a),
             SymKey::Static(a, b) | SymKey::Tlv(a, b) => {
                 id(out, a);
                 id(out, b);
@@ -617,7 +628,8 @@ impl Symbols {
             | SymKey::Descriptor
             | SymKey::LiveDir
             | SymKey::StartHook
-            | SymKey::Counters => {}
+            | SymKey::Counters
+            | SymKey::LazyStubs => {}
         }
     }
 

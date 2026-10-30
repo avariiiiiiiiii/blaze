@@ -312,6 +312,7 @@ pub struct BuildTime(pub rustc_hash::FxHashSet<Crate>);
 
 /// The error of `unit`, saying `what`.
 pub(crate) fn failed(unit: &Unit, what: impl std::fmt::Display) -> CodegenError {
+    // alloc: the error's message
     CodegenError { unit: unit.instance.key(), item: unit.item, what: what.to_string() }
 }
 
@@ -324,6 +325,6 @@ pub(crate) fn undescribed(
     CodegenError {
         unit: InstanceKey(ContentId::default()),
         item: item.unwrap_or(ItemKey(ContentId::default())),
-        what: format!("{instance:?}: {what}"),
+        what: format!("{instance:?}: {what}"), // alloc: the error's message
     }
 }

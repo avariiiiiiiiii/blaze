@@ -1,0 +1,24 @@
+{
+  "id": "00242",
+  "from_lane": "frontend-nameres",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-def/src/nameres/facts",
+    "docs/v2/plan/lanes/frontend/nameres"
+  ],
+  "what": "## parent\n\n- Coordinator: when `frontend-nameres-core`'s db hook lands, `crates/hir-def/src/nameres/facts/`\n  becomes compiled (`mod facts;`); before that, `facts/ops.rs` (committed) is not part of the\n  build. Commit the `facts/` tree, `docs/v2/plan/lanes/frontend/nameres*.md` and the hooks\n  together.\n\n> forwarded to the coordinator: committing is its; listed in requests' report.",
+  "state": "open",
+  "created": "2026-10-30T02:33:45Z",
+  "updated": "2026-10-30T02:33:45Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/frontend-nameres.md#parent",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/frontend-nameres.md:7"
+    }
+  ]
+}

@@ -100,6 +100,7 @@ impl BuiltinDeriveExpander {
         } else {
             self.expander()(db, frame, span, tt)
         };
+        let expanded = expanded.map(|it| with_automatically_derived(frame, span, it));
         // rustc's `CoercePointee` writes its impls itself, with only `#[automatically_derived]`.
         let expanded = match self {
             BuiltinDeriveExpander::CoercePointee => expanded,
@@ -182,6 +183,59 @@ fn with_item_attrs<'f>(
             && ident.sym == sym::kw_impl
         {
             attrs.iter().for_each(|attr| builder.extend_with_tt(*attr));
+        }
+        let Some(item) = items.next_as_view() else { break };
+        builder.extend_with_tt(item);
+    }
+    builder.build_in(frame)
+}
+
+/// The derive's impls, each starting with `#[automatically_derived]` at the derive's `span`, as
+/// rustc's `create_derived_impl` (`generic/mod.rs`) and `coerce_pointee.rs` start every derived
+/// impl with `GeneratedAttr::AutomaticallyDerived`. It goes before [`with_item_attrs`]' copies
+/// and a `derive_const` impl's `const`, as rustc's does. An impl is an `impl` at the top of the
+/// expansion, or one of its invisible groups that starts with `impl` (`CoercePointee` writes
+/// each of its impls in one).
+fn with_automatically_derived<'f>(
+    frame: &'f Frame,
+    span: Span,
+    expanded: tt::TopSubtree<&'f Frame>,
+) -> tt::TopSubtree<&'f Frame> {
+    let is_impl = |element: Option<tt::TtElement<'_>>| {
+        matches!(element, Some(tt::TtElement::Leaf(tt::Leaf::Ident(it))) if it.sym == sym::kw_impl)
+    };
+    let write_attr = |b: &mut tt::TopSubtreeBuilder| {
+        b.push(tt::Leaf::Punct(punct('#', tt::Spacing::Alone, span)));
+        b.open(tt::DelimiterKind::Bracket, span);
+        b.push(tt::Leaf::Ident(tt::Ident {
+            sym: sym::automatically_derived,
+            span,
+            is_raw: tt::IdentIsRaw::No,
+        }));
+        b.close(span);
+    };
+    let mut builder = tt::TopSubtreeBuilder::new(expanded.top_subtree().delimiter);
+    let mut items = expanded.token_trees().iter();
+    while let Some(next) = items.peek() {
+        match next {
+            tt::TtElement::Subtree(group, mut inner)
+                if group.delimiter.kind == tt::DelimiterKind::Invisible
+                    && is_impl(inner.peek()) =>
+            {
+                builder.open(tt::DelimiterKind::Invisible, group.delimiter.open);
+                write_attr(&mut builder);
+                while let Some(tt) = inner.next_as_view() {
+                    builder.extend_with_tt(tt);
+                }
+                builder.close(group.delimiter.close);
+                items.next();
+                continue;
+            }
+            next => {
+                if is_impl(Some(next)) {
+                    write_attr(&mut builder);
+                }
+            }
         }
         let Some(item) = items.next_as_view() else { break };
         builder.extend_with_tt(item);

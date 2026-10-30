@@ -7,6 +7,7 @@
 //! on Linux, which it joins before it runs its program, and on macOS a watch of its footprint.
 //! Where none can be made, it is not started.
 
+#[allow(unsafe_code, reason = "fork, exec and the calls the child makes before exec, which std cannot make")]
 mod spawn;
 
 use std::{
@@ -226,18 +227,10 @@ impl Finish {
 
 /// Reaps `pid`, waiting until it has exited: its status and what it used.
 pub(crate) fn reap(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> {
-    let mut status = 0;
-    // SAFETY: all zeros is a valid `rusage`.
-    let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
     loop {
-        // SAFETY: a child of this process; the status and usage are written by the call.
-        let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut rusage) };
-        if reaped == pid {
-            return Ok((status, rusage));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+        match crate::raw::wait4(pid) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            reaped => return reaped,
         }
     }
 }
@@ -245,26 +238,16 @@ pub(crate) fn reap(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> 
 /// Waits until `pid` has exited without reaping it, so its pid is not another's until it is.
 pub(crate) fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
     loop {
-        // SAFETY: all zeros is a valid `siginfo_t`; the call writes it.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: a child of this process and a `siginfo_t` to write.
-        let waited = unsafe {
-            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
-        };
-        if waited == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+        match crate::raw::wait_exited(pid) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            waited => return waited,
         }
     }
 }
 
-/// Signals `pid`, which has not been reaped.
+/// Signals `pid`, which has not been reaped, so no one else's.
 pub(crate) fn kill(pid: libc::pid_t) {
-    // SAFETY: no pointers; the pid is a child not yet reaped, so no one else's.
-    unsafe { libc::kill(pid, libc::SIGKILL) };
+    crate::raw::kill(pid);
 }
 
 /// What one read of a pipe takes at most.
@@ -281,15 +264,10 @@ pub(crate) fn communicate(
     stdout: OwnedFd,
     stderr: OwnedFd,
 ) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::{AsFd as _, AsRawFd as _};
     let mut stdin = stdin.filter(|_| !input.is_empty());
     if let Some(fd) = &stdin {
-        // SAFETY: an open descriptor of the caller's.
-        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-        // SAFETY: as above.
-        if flags < 0 || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        crate::raw::set_nonblocking(fd.as_fd())?;
     }
     let mut written = 0;
     let mut outputs = [Some(stdout), Some(stderr)];
@@ -316,44 +294,39 @@ pub(crate) fn communicate(
             let [stdout, stderr] = said;
             return Ok((stdout, stderr));
         }
-        // SAFETY: `n` pollfds of open descriptors.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), n as libc::nfds_t, -1) };
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
+        match crate::raw::poll(&mut fds[..n], -1) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
-        for (fd, which) in fds[..n].iter().zip(which) {
-            if fd.revents == 0 {
+        for (polled, which) in fds[..n].iter().zip(which) {
+            if polled.revents == 0 {
                 continue;
             }
             match which {
                 None => {
-                    // SAFETY: the rest of `input`, to an open descriptor.
-                    let wrote =
-                        unsafe { libc::write(fd.fd, input[written..].as_ptr().cast(), input.len() - written) };
-                    let again = wrote < 0
-                        && matches!(
-                            io::Error::last_os_error().kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        );
-                    if wrote > 0 {
-                        written += wrote as usize;
-                    }
+                    // Listed this round, so still open: only this arm closes it.
+                    let Some(fd) = &stdin else { continue };
+                    let broken = match crate::raw::write(fd.as_fd(), &input[written..]) {
+                        Ok(wrote) => {
+                            written += wrote;
+                            false
+                        }
+                        Err(error) => {
+                            !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted)
+                        }
+                    };
                     // Done, or the process is not reading (EPIPE and the rest): its input ends.
-                    if written == input.len() || (wrote < 0 && !again) || fd.revents & libc::POLLOUT == 0 {
+                    if written == input.len() || broken || polled.revents & libc::POLLOUT == 0 {
                         stdin = None;
                     }
                 }
                 Some(at) => {
-                    // SAFETY: room for `CHUNK` bytes, from an open descriptor.
-                    let read = unsafe { libc::read(fd.fd, chunk.as_mut_ptr().cast(), CHUNK) };
-                    match read {
-                        1.. => said[at].extend_from_slice(&chunk[..read as usize]),
-                        0 => outputs[at] = None,
-                        _ => match io::Error::last_os_error().kind() {
+                    let Some(fd) = &outputs[at] else { continue };
+                    match crate::raw::read(fd.as_fd(), &mut chunk) {
+                        Ok(0) => outputs[at] = None,
+                        Ok(read) => said[at].extend_from_slice(&chunk[..read]),
+                        Err(error) => match error.kind() {
                             io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock => {}
                             _ => outputs[at] = None,
                         },

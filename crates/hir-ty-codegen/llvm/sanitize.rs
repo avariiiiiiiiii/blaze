@@ -9,6 +9,8 @@
 //! of it; the runtimes, the arrays of every function together and their initialization are
 //! the link's (`v2/requests/link.md`).
 
+#![forbid(unsafe_code)]
+
 use blaze_codegen::settings::{Coverage, Sanitize, Sanitizers};
 use inkwell::{
     ThreadLocalMode, attributes::AttributeLoc, context::Context,
@@ -106,11 +108,13 @@ pub(super) fn instrument(
     let triple = machinery.get_triple();
     let triple = triple.as_str().to_string_lossy();
     if wanted.Memory != 0 && !["-linux", "-freebsd", "-netbsd"].iter().any(|os| triple.contains(os)) {
+        // alloc: the error message, once before the build stops
         return Err(Unhandled::Llvm(format!(
             "MemorySanitizer for {triple}, which LLVM has for Linux, FreeBSD and NetBSD only"
         )));
     }
     if wanted.CoverageLevel != 0 && triple.contains("-windows") {
+        // alloc: the error message, once before the build stops
         return Err(Unhandled::Llvm(format!(
             "SanitizerCoverage for {triple}: the release path reads SanitizerCoverage's \
              sections of ELF and Mach-O objects only"

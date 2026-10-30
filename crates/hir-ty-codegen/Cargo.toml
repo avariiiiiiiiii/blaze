@@ -65,7 +65,7 @@ target-lexicon = "0.13"
 object = { version = "0.37", default-features = false, features = ["read", "std", "elf", "macho", "coff"] }
 wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
 sha2 = "0.10"
-# The LLVM backend, against the LLVM 23 blaze pins (llvm.json beside build.rs, checked there).
+# The LLVM backend, against the LLVM 23 blaze pins (llvm.json, checked by vendor/llvm-sys/pin.rs).
 # inkwell's llvm-sys (vendor/llvm-sys) links it statically, with libstdc++ on Linux. Nothing of
 # LLVM's calls into libffi, so inkwell need not link it.
 inkwell = { version = "0.11.0", default-features = false, features = ["llvm23-1-prefer-static", "target-x86", "target-aarch64", "no-libffi-linking"], optional = true }

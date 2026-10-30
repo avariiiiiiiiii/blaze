@@ -1095,3 +1095,25 @@ builds a `Span` for each literal that reaches `lint_literal`, which is already t
 - **Writing** (`emit.rs` `Carried`). A diagnostic with no file without a path allocates
   nothing more: one `split_once` on `\0` per file name met. A crate attribute's file is
   indexed from the text its name carries, a few dozen bytes, once per diagnostic written.
+
+## Lint levels as a front-end query (`diagnostics-levels`)
+
+- **A level asked of the query again** (`hir_lint_levels::lint_level`, what the const
+  evaluator reads at step 2,000,000). The bound is the salsa memo probe, a few tens of
+  cycles. On top of it: one bit test of the flattened `LintSet` for a lint nothing names
+  (nearly all), else a binary search of the few 2-byte ids named from the item out, a handful
+  of compares in one cache line. Nothing is allocated (a test holds it at 0). It is met.
+- **The first ask at an item.** Bound: reading the attributes of each node from the item out
+  to the crate root, a few nodes, each one kind test, and the perfect hash of each name in a
+  level attribute. The builder does that and allocates its CSR columns (a few `Vec`s sized to
+  the names on the chain) and the result's two boxed slices. It is within the bound up to the
+  allocator's constant.
+- **An expression with attributes between it and its item** (`lint_level_at`, rare). The
+  walk to the item is one kind test per node. Only when a node there has a lint attribute is a
+  builder run for that expression, unmemoized: the bound is the same walk, and it is met for
+  the evaluator, which asks once per evaluation that runs long.
+- **The check** (`decide`, `LevelMap`, the dead-code pass). This is the code the check ran
+  before, moved: the same CSR sets, one FxHash probe per node seen, one bit test per lint. A
+  silent builder (`()` sink) makes no event, so the query pays nothing for what the check
+  says. The one new cost is reading `-Z crate-attr`'s attributes at the crate root: one
+  memoized slice read, empty for a crate given none.

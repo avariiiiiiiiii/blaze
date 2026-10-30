@@ -12,6 +12,7 @@ pub(crate) mod parse;
 
 pub(crate) mod ambiguous_associated_item;
 pub(crate) mod bad_rtn;
+pub(crate) mod const_param_ty_not_allowed;
 pub(crate) mod elided_lifetimes_in_path;
 pub(crate) mod generic_args_prohibited;
 pub(crate) mod generic_default_refers_to_self;
@@ -106,6 +107,7 @@ pub(crate) mod return_outside_function;
 pub(crate) mod undeclared_label;
 pub(crate) mod unreachable_label;
 pub(crate) mod unused_must_use;
+pub(crate) mod val_tree_error;
 pub(crate) mod yield_outside_coroutine;
 
 /// When rustc gives a diagnostic, by the pass that gives it: the driver writes them in this
@@ -168,6 +170,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
     match d {
         AnyDiagnostic::AmbiguousAssociatedItem(d) => ambiguous_associated_item::lower(cx, &d),
         AnyDiagnostic::BadRtn(d) => bad_rtn::lower(cx, &d),
+        AnyDiagnostic::ConstParamTyNotAllowed(d) => const_param_ty_not_allowed::lower(cx, &d),
         AnyDiagnostic::ElidedLifetimesInPath(d) => elided_lifetimes_in_path::lower(cx, &d),
         AnyDiagnostic::GenericArgsProhibited(d) => generic_args_prohibited::lower(cx, &d),
         AnyDiagnostic::GenericDefaultRefersToSelf(d) => generic_default_refers_to_self::lower(cx, &d),
@@ -285,6 +288,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::UndeclaredLabel(d) => undeclared_label::lower(cx, &d),
         AnyDiagnostic::UnreachableLabel(d) => unreachable_label::lower(cx, &d),
         AnyDiagnostic::UnusedMustUse(d) => unused_must_use::lower(cx, &d),
+        AnyDiagnostic::ValTreeError(d) => val_tree_error::lower(cx, &d),
         AnyDiagnostic::YieldOutsideCoroutine(d) => yield_outside_coroutine::lower(cx, &d),
 
         // rust-analyzer's own: code rustc says nothing of (a `cfg` that is off) and style

@@ -381,3 +381,27 @@ fn read_text(path: &Path) -> String {
         .unwrap_or_else(|_| panic!("File at {path:?} should be valid"))
         .replace("\r\n", "\n")
 }
+
+/// A warm exact list of a parse's errors is one allocation (the box) plus a clone of each
+/// stored parser error's message, as `errors` makes; none for a parse without errors.
+#[test]
+fn exact_errors_allocate_only_their_box() {
+    let text = "fn f() { let = ; } fn g( { } struct S { a: }";
+    let parse = SourceFile::parse(text, Edition::CURRENT);
+    let want = parse.errors();
+    assert!(!want.is_empty());
+    assert_eq!(parse.errors_exact().as_deref(), Some(&want[..]));
+    blaze_alloc_count::assert_at_most(1 + want.len() as u64, "exact errors", || {
+        std::hint::black_box(parse.errors_exact());
+    });
+    let clean = SourceFile::parse("fn f() {}", Edition::CURRENT);
+    assert_eq!(clean.errors_exact(), None);
+    blaze_alloc_count::assert_at_most(0, "no errors", || {
+        std::hint::black_box(clean.errors_exact());
+    });
+
+    let outline = SourceFile::parse_outline(text.into(), Edition::CURRENT);
+    let want = outline.errors_with_bodies();
+    assert_eq!(outline.errors_with_bodies_exact().as_deref(), Some(&want[..]));
+    assert_eq!(outline.errors_exact().as_deref().unwrap_or_default(), &outline.errors()[..]);
+}

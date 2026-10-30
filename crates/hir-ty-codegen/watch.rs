@@ -135,11 +135,13 @@ pub(crate) enum Of<'a> {
 impl Watch {
     /// The watch of a new object, of the whole program or a patch, when the build is watched.
     pub(crate) fn new(whole: bool) -> Option<Watch> {
+        // clone: once per object, and only when the build is watched
         let sink = SINK.read().unwrap_or_else(|e| e.into_inner()).clone()?;
         Some(Watch {
             object: OBJECTS.fetch_add(1, Ordering::Relaxed),
             whole,
             sink,
+            // alloc: empty, allocates nothing; each batch is handed to the sink whole
             batch: Vec::new(),
             since: Instant::now(),
             crates: FxHashMap::default(),
@@ -160,6 +162,7 @@ impl Watch {
             Of::Root(func) => {
                 let name = hir_ty_mir::mir::type_name::rustc_function_name(db, func, &[]);
                 let name = name.unwrap_or_else(|| {
+                    // alloc: the record's name, which the sink owns; only when the build is watched
                     crate::FunctionSignature::of(db, func).name.as_str().to_owned()
                 });
                 (hash(&(0u8, func)), Some(Timed::Root(func)), Some(func.krate(db)), name)
@@ -182,6 +185,7 @@ impl Watch {
                 };
                 (key, Some(timed), Some(krate), crate::backtrace_name(db, instance))
             }
+            // alloc: the record's name, which the sink owns; only when the build is watched
             Of::Named(name) => (hash(&(2u8, name)), None, None, name.to_owned()),
         };
         let took =
@@ -195,7 +199,9 @@ impl Watch {
                 .crates
                 .entry(krate)
                 .or_insert_with(|| crate::fncache::crate_name(db, krate))
+                // clone: the record's crate, which the sink owns; only when the build is watched
                 .clone(),
+            // alloc: empty, allocates nothing
             None => String::new(),
         };
         self.batch.push(Placed { id, key, krate, name, calls, how });

@@ -957,7 +957,9 @@ impl<'db> Look<'_, '_, 'db> {
                     self.read_operand(cond, &mut tally)?;
                 }
                 TerminatorKind::SwitchInt { discr, .. } => self.read_operand(discr, &mut tally)?,
-                TerminatorKind::Yield { .. } | TerminatorKind::CoroutineDrop => return Err(Shared),
+                TerminatorKind::Yield { .. }
+                | TerminatorKind::CoroutineDrop
+                | TerminatorKind::TailCall { .. } => return Err(Shared),
                 _ => {}
             }
         }

@@ -10,7 +10,7 @@
 //!   LLVM's constant pool, a hole out of its stencil or of a kind its shape has no use for;
 //! - a constant pool LLVM put relocations in (the patcher copies it verbatim).
 
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 use object::{
     Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionIndex,
@@ -49,6 +49,9 @@ pub struct Elf<'a> {
     symbols: HashMap<&'a str, (SymbolSection, u64, u64)>,
     /// The constant-pool sections (`.rodata.cst4`, `8`, `16`) and their bytes.
     pools: HashMap<SectionIndex, &'a [u8]>,
+    /// Every refused instruction so far (stencil, instruction, offset), reported together by
+    /// [`Elf::refusals`] so one run names them all.
+    refusals: RefCell<Vec<String>>,
 }
 
 impl<'a> Elf<'a> {
@@ -86,7 +89,7 @@ impl<'a> Elf<'a> {
                 symbols.insert(name, (symbol.section(), symbol.address(), symbol.size()));
             }
         }
-        Elf { file, isa, sections, symbols, pools }
+        Elf { file, isa, sections, symbols, pools, refusals: RefCell::new(Vec::new()) }
     }
 
     /// The function `name` (`what` in messages): its bytes, holes and tail, its constants
@@ -231,7 +234,7 @@ impl<'a> Elf<'a> {
                 panic!("stencil `{what}`: bytes at {at:#x} that are no instruction: {:02x?}", &code[at..])
             });
             if let Some(why) = refused(self.isa, &text) {
-                panic!("stencil `{what}`: `{text}` at {at:#x} {why}");
+                self.refusals.borrow_mut().push(format!("stencil `{what}`: `{}` at {at:#x} {why}", text.trim()));
             }
             insts.push(Inst { at, len, text });
             at += len;
@@ -252,6 +255,15 @@ impl<'a> Elf<'a> {
             }
             _ => 0,
         }
+    }
+
+    /// The refused instructions of every stencil read so far, each once (the probe is
+    /// disassembled twice).
+    pub fn refusals(self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut refusals = self.refusals.into_inner();
+        refusals.retain(|it| seen.insert(it.clone())); // clone: build time, refusals only
+        refusals
     }
 
     /// Checks the probe (`ir::PROBE`): it stores `frame` to `Result0`, `acc` to `Result1` and

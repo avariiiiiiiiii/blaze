@@ -594,11 +594,10 @@ fn source(db: &Db, source_map: &BodySourceMap, span: MirSpan) -> String {
         other => panic!("{other:?} has no source"),
     }
     .unwrap_or_else(|_| panic!("{span:?} has no source"));
-    let root = source.file_id.parse_or_expand(db);
-    let node = source.value.syntax_node_ptr().to_node(&root);
+    let node = syntax::view::to_node(source.value.syntax_node_ptr(), source.file_id.root(db));
     match span {
         MirSpan::ExprEnd(_) => node.last_token().unwrap().text().to_owned(),
-        _ => node.text().to_string(),
+        _ => node.text().to_owned(),
     }
 }
 

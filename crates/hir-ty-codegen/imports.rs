@@ -120,12 +120,14 @@ pub(super) fn chosen_for(
     budget: usize,
 ) -> Vec<Import> {
     let db = recorder.db;
+    // alloc: the result, owned by the caller; empty until an import is chosen
     let mut chosen = Vec::new();
     let mut taken: FxHashSet<u32> = FxHashSet::default();
     let mut spent = 0;
     // The calls to look at, by the number of the callee among the compile's requests, with
     // the share of a body's room left to it.
     let mut next: VecDeque<(u32, f32, u32)> =
+        // alloc: one exact block per compile, the queue of its calls
         (0..recorder.requests.funcs.len() as u32).map(|id| (id, 1.0, 0)).collect();
     while let Some((id, share, depth)) = next.pop_front() {
         if taken.contains(&id) {
@@ -155,7 +157,9 @@ pub(super) fn chosen_for(
         if depth + 1 < DEPTH {
             next.extend(funcs.iter().map(|it| (it.as_u32(), share * EVOLUTION, depth + 1)));
         }
+        // alloc: the import's own lists, one exact block each, kept with the result
         let funcs = funcs.iter().map(|it| it.as_u32()).collect();
+        // alloc: the import's own lists, one exact block each, kept with the result
         let datas = datas.iter().map(|it| it.as_u32()).collect();
         chosen.push(Import { export, id, funcs, datas });
     }
@@ -174,6 +178,7 @@ struct Exports {
 }
 
 static EXPORTS: LazyLock<Exports> =
+    // alloc: once per process, the table's shards
     LazyLock::new(|| Exports { shards: (0..64).map(|_| Mutex::default()).collect() });
 
 /// The export of `instance`, built if no compile asked for it before. `None` for one that is
@@ -183,9 +188,11 @@ fn export(
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> Option<Arc<Export>> {
+    // clone: a refcount of the interned arguments, which the shared table keeps as its key
     let key = (instance.def, instance.args.clone(), instance.checked);
     let shards = &EXPORTS.shards;
     let shard = &shards[FxBuildHasher.hash_one(&key) as usize % shards.len()];
+    // clone: the slot's `Arc`, so the shard's lock is let go before the export is built
     let slot = shard.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_default().clone();
     slot.get_or_init(|| {
         let start = stdx::time::Instant::now();
@@ -195,6 +202,7 @@ fn export(
         tally.exports.add(start.elapsed(), bytes);
         built
     })
+    // clone: a refcount; the import holds the export past the slot's borrow
     .clone()
 }
 
@@ -246,6 +254,7 @@ fn build(
         // Drop glue is built from the type it drops, and has no MIR.
         let body = match instance.def {
             InstanceDef::DropGlue => None,
+            // clone: once per export in the process; the query takes its key
             _ => Some(super::instance_body(db, instance, env.clone(), None).ok()?),
         };
         let mut cg = Recorder::new(
@@ -255,6 +264,7 @@ fn build(
             instance.checked,
         );
         cg.unlocated = true;
+        // clone: once per export in the process, moved into the closure that builds it
         let args = instance.args.clone();
         let mut ctx =
             super::build(&mut cg, env.as_ref(db), body.as_deref(), tracked, |fx| match fx.body {
@@ -286,6 +296,7 @@ fn build(
         if size > room || !requests.ordered() {
             return None;
         }
+        // clone: once per export in the process, kept with it
         let signature = ctx.func.signature.clone();
         Some(Export { bitcode, requests, signature, size, hint })
     })

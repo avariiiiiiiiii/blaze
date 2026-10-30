@@ -99,6 +99,71 @@ fn trees_given_become_a_stream_with_rustcs_spacing_and_come_back_as_given() {
     assert!(server.dispatch(&db, &into, &mut reply).is_err());
 }
 
+/// The spans and jointness of the punctuation and identifiers of `reply` to `into_trees`.
+fn read_tokens(server: &Server, reply: &[u8]) -> Vec<(Span, bool)> {
+    let mut r = Reader::new(reply);
+    assert!(r.some().unwrap());
+    let count = r.count().unwrap();
+    let mut tokens = Vec::new();
+    for _ in 0..count {
+        let joint = match r.u8().unwrap() {
+            1 => {
+                r.u8().unwrap();
+                r.bool().unwrap()
+            }
+            2 => {
+                r.str().unwrap();
+                r.u8().unwrap();
+                false
+            }
+            other => panic!("tree tag {other} in a test of tokens"),
+        };
+        tokens.push((server.span(r.handle().unwrap()).unwrap(), joint));
+    }
+    tokens
+}
+
+#[test]
+fn glued_trees_come_back_at_the_span_rustcs_glued_token_splits_into() {
+    let db = Db::new();
+    let mut server = server(&db);
+    let mut reply = Vec::new();
+    let site = server.span_handle(at(10, 12));
+    let [first, second] = [at(20, 21), at(21, 22)].map(|span| server.span_handle(span));
+    let [quote, name] = [at(30, 31), at(31, 32)].map(|span| server.span_handle(span));
+    // `::` with both marks at a two-byte span, `::` at each its byte, `'a` at its two, and a
+    // `+` whose jointness glues to nothing.
+    let concat = request(Method::TsConcatTrees, |w| {
+        w.some(false);
+        w.usize(8);
+        punct_tree(w, b':', true, site);
+        punct_tree(w, b':', false, site);
+        punct_tree(w, b':', true, first);
+        punct_tree(w, b':', false, second);
+        punct_tree(w, b'\'', true, quote);
+        ident_tree(w, "a", name);
+        punct_tree(w, b'+', true, site);
+        ident_tree(w, "b", site);
+    });
+    server.dispatch(&db, &concat, &mut reply).unwrap();
+    let handle = handle_of(&reply);
+    let into = request(Method::TsIntoTrees, |w| w.handle(handle));
+    server.dispatch(&db, &into, &mut reply).unwrap();
+    assert_eq!(
+        read_tokens(&server, &reply),
+        [
+            (at(10, 11), true),
+            (at(11, 12), false),
+            (at(20, 21), true),
+            (at(21, 22), false),
+            (at(30, 32), true),
+            (at(30, 32), false),
+            (at(10, 12), true),
+            (at(10, 12), false),
+        ]
+    );
+}
+
 #[test]
 fn a_negative_literal_given_is_a_minus_before_it() {
     let db = Db::new();

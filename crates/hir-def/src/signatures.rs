@@ -18,9 +18,8 @@ use rustc_abi::{ExternAbi, IntegerType, ReprOptions};
 use smallvec::SmallVec;
 use span::{AstIdMap, AstIdNode, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
-    AstNode, FlatTree, SyntaxKind, SyntaxNode, SyntaxNodePtr, T, TextRange,
-    TextSize,
-    ast::{self, HasGenericParams, HasName, HasVisibility, IsString},
+    FlatTree, SyntaxKind, SyntaxNodePtr, T, TextRange, TextSize,
+    view::{self as ast, AstNode, HasGenericParams, HasName, HasVisibility, IsString},
 };
 use thin_vec::ThinVec;
 use triomphe::Arc;
@@ -44,7 +43,7 @@ use crate::{
 };
 
 #[inline]
-fn as_name_opt(name: Option<ast::Name>) -> Name {
+fn as_name_opt(name: Option<ast::Name<'_>>) -> Name {
     name.map_or_else(Name::missing, |it| it.as_name())
 }
 
@@ -71,8 +70,8 @@ const fn single_bit(bits: u128) -> u32 {
 
 /// Which of `kinds` are among the tokens directly under `node`, read in one pass over its
 /// children in the flat tree's kind column: each `*_token()` accessor scans them once more.
-fn child_tokens<const N: usize>(node: &SyntaxNode, kinds: [SyntaxKind; N]) -> [bool; N] {
-    let Some((tree, at)) = node.flat() else { unreachable!("a syntax node outside a flat tree") };
+fn child_tokens<const N: usize>(node: ast::Node<'_>, kinds: [SyntaxKind; N]) -> [bool; N] {
+    let (tree, at) = node.flat();
     let kinds = kinds.map(u16::from);
     let mut found = [false; N];
     for child in tree.children_with_tokens(at) {
@@ -164,7 +163,7 @@ macro_rules! signature_queries {
                     }
                     None => {
                         let kept = Self::kept(db, id);
-                        let source = id.lookup(db).source(db);
+                        let source = id.lookup(db).source_view(db);
                         let lowering = kept.lowering(&kept.store);
                         let (it, map) = Self::lower(db, id, source, None, lowering);
                         (kept.with_map(it), map)
@@ -198,7 +197,7 @@ macro_rules! signature_queries {
             pub(crate) fn lower_alone(db: &Db, id: $Id) -> $Sig {
                 let (source, maps) = match signature_syntax(db, id.into()) {
                     Some(syntax) => (syntax.node(), Some(syntax.maps())),
-                    None => (id.lookup(db).source(db), None),
+                    None => (id.lookup(db).source_view(db), None),
                 };
                 Self::lower(db, id, source, maps, BodyLowering::Body).0
             }
@@ -262,7 +261,7 @@ impl SignatureSyntax {
     /// the bodies `source` already left out of it.
     fn new(
         source: Source<'_>,
-        item: &SyntaxNode,
+        item: ast::Node<'_>,
         elide: Elide,
         frame: &Frame,
     ) -> Option<SignatureSyntax> {
@@ -273,7 +272,7 @@ impl SignatureSyntax {
             true => item.ancestors().last()?,
             false => {
                 let ptr = ast_id_map.get_erased(anchor);
-                item.ancestors().find(|it| SyntaxNodePtr::new(it) == ptr)?
+                item.ancestors().find(|&it| ast::ptr(it) == ptr)?
             }
         };
         let anchor_range = anchor.text_range();
@@ -284,8 +283,8 @@ impl SignatureSyntax {
         let mut elided = Vec::with_capacity_in(1, frame);
         match own {
             true => elided.extend(elide(item)),
-            false => bodies_under(&anchor, |body| {
-                let ptr = SyntaxNodePtr::new(&body);
+            false => bodies_under(anchor, |body| {
+                let ptr = ast::ptr(body);
                 let start = ptr.text_range().start();
                 let at = cuts.partition_point(|it| it.text_range().start() < start);
                 if cuts.get(at) == Some(&ptr) {
@@ -294,9 +293,7 @@ impl SignatureSyntax {
             }),
         }
         let base = anchor_range.start();
-        let copy = anchor.clone_subtree_without(&elided);
-        // clone: an `Arc` count of the item's tree
-        let tree = copy.flat().expect("a cloned subtree is flat").0.clone();
+        let tree = copy_without(anchor, &elided);
         let (placeholder, removed, spans_end) = match (own, elided.first()) {
             (true, Some(node)) => {
                 let range = node.text_range();
@@ -310,19 +307,20 @@ impl SignatureSyntax {
             item.kind(),
             TextRange::new(item_range.start() - base, item_range.end() - base - removed),
         );
-        let ptrs = frame.alloc_slice_from_iter(elided.iter().map(SyntaxNodePtr::new));
+        let ptrs = frame.alloc_slice_from_iter(elided.iter().map(|&it| ast::ptr(it)));
+        let ast_id_map = ast_id_map.relative_without_view(anchor, ast::Node::root(&tree), ptrs);
         Some(SignatureSyntax {
             file_id,
             tree,
             item: item_ptr,
             elided: placeholder,
-            ast_id_map: ast_id_map.relative_without(&anchor, &copy, ptrs),
+            ast_id_map,
             span_map: span_map.within(TextRange::new(base, spans_end)),
         })
     }
 
-    fn root(&self) -> SyntaxNode {
-        SyntaxNode::new_flat_root(self.tree.clone()) // clone: an `Arc` count of the outline tree
+    fn root(&self) -> ast::Node<'_> {
+        ast::Node::root(&self.tree)
     }
 
     fn maps(&self) -> (&RealSpanMap, &AstIdMap) {
@@ -330,8 +328,8 @@ impl SignatureSyntax {
     }
 
     /// The item, in the tree.
-    fn node<N: AstNode>(&self) -> InFile<N> {
-        let node = self.item.to_node(&self.root());
+    fn node<'s, N: AstNode<'s>>(&'s self) -> InFile<N> {
+        let node = ast::to_node(self.item, self.root());
         InFile::new(self.file_id, N::cast(node).expect("the item is a node of its kind"))
     }
 
@@ -353,7 +351,7 @@ impl SignatureSyntax {
 }
 
 /// What [`SignatureSyntax::new`] leaves out of an item: the child of it that no signature reads.
-type Elide = fn(&SyntaxNode) -> Option<SyntaxNode>;
+type Elide = for<'t> fn(ast::Node<'t>) -> Option<ast::Node<'t>>;
 
 /// What a [`SignatureSyntax`] is read from: its file's [`FileOutline`], or the file itself for
 /// an item in a body the outline leaves out. The maps are of the tree the item is a node of.
@@ -369,7 +367,7 @@ struct Source<'a> {
 /// The body a [`FileOutline`] leaves out of `item` when the item is its own anchor: a fn's
 /// block, a const's or static's expression. Each is the child the item's accessor returns
 /// (`ast::Fn::body`, `ast::Const::body`): the first child of that kind.
-fn left_out(item: &SyntaxNode) -> Option<SyntaxNode> {
+fn left_out(item: ast::Node<'_>) -> Option<ast::Node<'_>> {
     match item.kind() {
         SyntaxKind::FN => item.child_where(|kind| kind == SyntaxKind::BLOCK_EXPR),
         SyntaxKind::CONST | SyntaxKind::STATIC => item.child_where(ast::Expr::can_cast),
@@ -381,18 +379,17 @@ fn left_out(item: &SyntaxNode) -> Option<SyntaxNode> {
 /// [`syntax::view::block_may_start_with_inner_attr`] reads it (comments skipped; a maybe for
 /// any text it can't rule out): such a body holds attributes of its fn, so the outline keeps
 /// it. Doc comments aren't attributes the outline is read for (the docs read the file).
-fn may_start_with_inner_attr(body: &SyntaxNode) -> bool {
-    body.flat().is_none_or(|(tree, at)| {
-        syntax::view::block_may_start_with_inner_attr(&tree.source()[tree.range(at)], false)
-    })
+fn may_start_with_inner_attr(body: ast::Node<'_>) -> bool {
+    let (tree, at) = body.flat();
+    ast::block_may_start_with_inner_attr(&tree.source()[tree.range(at)], false)
 }
 
 /// The [`left_out`] bodies of the items that can be span anchors under `node` (a file or an
 /// item of one), in order: the file's items, and those of each impl, trait and module among
 /// them, where `real_span_map` finds anchors. Only a fn's body is ever lazy, and none of these
 /// is in one, so nothing here parses a body.
-fn bodies_under(node: &SyntaxNode, mut body: impl FnMut(SyntaxNode)) {
-    let mut item = |item: &SyntaxNode| {
+fn bodies_under<'t>(node: ast::Node<'t>, mut body: impl FnMut(ast::Node<'t>)) {
+    let mut item = |item: ast::Node<'t>| {
         let list = match item.kind() {
             SyntaxKind::IMPL | SyntaxKind::TRAIT => SyntaxKind::ASSOC_ITEM_LIST,
             SyntaxKind::MODULE => SyntaxKind::ITEM_LIST,
@@ -404,13 +401,26 @@ fn bodies_under(node: &SyntaxNode, mut body: impl FnMut(SyntaxNode)) {
             }
         };
         if let Some(list) = item.child_where(|kind| kind == list) {
-            list.children().filter_map(|it| left_out(&it)).for_each(&mut body);
+            list.children().filter_map(left_out).for_each(&mut body);
         }
     };
     match node.kind() {
-        SyntaxKind::SOURCE_FILE => node.children().for_each(|it| item(&it)),
+        SyntaxKind::SOURCE_FILE => node.children().for_each(&mut item),
         _ => item(node),
     }
+}
+
+/// A copy of `node`'s subtree with `elided` (under it, in order) each left as an empty node of
+/// its kind, shared: the file's own tree when `node` is its root and nothing is left out, as
+/// `clone_subtree` shared it.
+fn copy_without(node: ast::Node<'_>, elided: &[ast::Node<'_>]) -> std::sync::Arc<FlatTree> {
+    if elided.is_empty() && node.parent().is_none() && node.text_range().start() == TextSize::new(0)
+    {
+        // clone: an `Arc` count of the file's tree, which a copy would equal
+        return std::sync::Arc::clone(node.shared_file());
+    }
+    // alloc: the copy, the memo's tree
+    std::sync::Arc::new(node.subtree_without(elided))
 }
 
 /// A file's tree with the body of every fn, const and static that is its own span anchor left
@@ -448,8 +458,8 @@ impl std::fmt::Debug for FileOutline {
 }
 
 impl FileOutline {
-    fn root(&self) -> SyntaxNode {
-        SyntaxNode::new_flat_root(self.tree.clone()) // clone: an `Arc` count of the outline tree
+    fn root(&self) -> ast::Node<'_> {
+        ast::Node::root(&self.tree)
     }
 }
 
@@ -459,27 +469,27 @@ impl FileOutline {
 pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
     blaze_mem::frame::current(|frame| {
         let file = HirFileId::from(file_id);
-        let root = file.parse_or_expand(db);
+        let root = file.root(db);
         let ast_id_map = file.ast_id_map(db);
         let SpanMap::RealSpanMap(span_map) = file.span_map(db) else {
             unreachable!("the spans of a file, not a macro's, are a real span map")
         };
         let mut bodies = Vec::new_in(frame);
-        bodies_under(&root, |body| {
+        bodies_under(root, |body| {
             let item = body.parent().expect("a body is under its item");
-            if item.kind() == SyntaxKind::FN && may_start_with_inner_attr(&body) {
+            if item.kind() == SyntaxKind::FN && may_start_with_inner_attr(body) {
                 return;
             }
             let (start, anchor) = span_map.anchor_at(item.text_range().start());
             let own = start == item.text_range().start()
                 && anchor != ROOT_ERASED_FILE_AST_ID
-                && ast_id_map.get_erased(anchor) == SyntaxNodePtr::new(&item);
+                && ast_id_map.get_erased(anchor) == ast::ptr(item);
             if own {
                 bodies.push(body);
             }
         });
-        let outline = root.clone_subtree_without(&bodies);
-        let ptrs = frame.alloc_slice_from_iter(bodies.iter().map(SyntaxNodePtr::new));
+        let outline = copy_without(root, &bodies);
+        let ptrs = frame.alloc_slice_from_iter(bodies.iter().map(|&it| ast::ptr(it)));
         let ranges = frame.alloc_slice_from_iter(ptrs.iter().map(SyntaxNodePtr::text_range));
         let mut cut = TextSize::new(0);
         let cuts = ptrs
@@ -492,10 +502,9 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
             // alloc: the memo's cuts, exact: a slice's length
             .collect();
         FileOutline {
-            ast_id_map: ast_id_map.relative_without(&root, &outline, ptrs),
+            ast_id_map: ast_id_map.relative_without_view(root, ast::Node::root(&outline), ptrs),
             span_map: span_map.without(ranges),
-            // clone: an `Arc` count of the outline tree
-            tree: outline.flat().expect("a cloned subtree is flat").0.clone(),
+            tree: outline,
             cuts,
         }
     })
@@ -520,12 +529,13 @@ fn item_syntax<N: AstIdNode>(
             ast_id_map: &outline.ast_id_map,
             cuts: &outline.cuts,
         };
-        return SignatureSyntax::new(source, &ptr.to_node(&outline.root()), elide, frame);
+        return SignatureSyntax::new(source, ast::to_node(ptr, outline.root()), elide, frame);
     }
     let SpanMap::RealSpanMap(span_map) = id.file_id.span_map(db) else { return None };
     let ast_id_map = id.file_id.ast_id_map(db);
+    let item = ast::to_node(ast_id_map.get_erased(id.value.erase()), id.file_id.root(db));
     let source = Source { file_id: id.file_id, span_map, ast_id_map, cuts: &[] };
-    SignatureSyntax::new(source, id.to_node(db).syntax(), elide, frame)
+    SignatureSyntax::new(source, item, elide, frame)
 }
 
 /// The node at `id` in its file's [`FileOutline`], when the outline has it: the item's
@@ -730,7 +740,7 @@ impl StructSignature {
     fn lower(
         db: &Db,
         id: StructId,
-        InFile { file_id, value: source }: InFile<ast::Struct>,
+        InFile { file_id, value: source }: InFile<ast::Struct<'_>>,
         maps: Maps<'_>,
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
@@ -771,7 +781,7 @@ impl StructSignature {
 }
 
 #[inline]
-fn adt_shape(adt_kind: ast::StructKind) -> FieldsShape {
+fn adt_shape(adt_kind: ast::StructKind<'_>) -> FieldsShape {
     match adt_kind {
         ast::StructKind::Record(_) => FieldsShape::Record,
         ast::StructKind::Tuple(_) => FieldsShape::Tuple,
@@ -793,7 +803,7 @@ impl UnionSignature {
     fn lower(
         db: &Db,
         id: UnionId,
-        InFile { file_id, value: source }: InFile<ast::Union>,
+        InFile { file_id, value: source }: InFile<ast::Union<'_>>,
         maps: Maps<'_>,
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
@@ -867,7 +877,7 @@ impl EnumSignature {
     fn lower(
         db: &Db,
         id: EnumId,
-        InFile { file_id, value: source }: InFile<ast::Enum>,
+        InFile { file_id, value: source }: InFile<ast::Enum<'_>>,
         maps: Maps<'_>,
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
@@ -894,14 +904,14 @@ impl EnumSignature {
 /// Whether a field of `fields` that `cfg_options` keeps is written `unsafe`: rustc's
 /// `VariantDef::has_unsafe_fields`, read off the syntax so a signature doesn't read the
 /// variant's [`VariantFields`].
-fn has_unsafe_field(fields: Option<ast::FieldList>, cfg_options: &CfgOptions) -> bool {
-    fn any<Field: ast::HasAttrs>(
+fn has_unsafe_field(fields: Option<ast::FieldList<'_>>, cfg_options: &CfgOptions) -> bool {
+    fn any<'t, Field: ast::HasAttrs<'t>>(
         mut fields: impl Iterator<Item = Field>,
         cfg_options: &CfgOptions,
     ) -> bool {
         fields.any(|field| {
             let [is_unsafe] = child_tokens(field.syntax(), [T![unsafe]]);
-            is_unsafe && AttrFlags::is_cfg_enabled_for(&field, cfg_options).is_ok()
+            is_unsafe && AttrFlags::is_cfg_enabled_for(field, cfg_options).is_ok()
         })
     }
     match fields {
@@ -918,13 +928,13 @@ fn has_unsafe_field(fields: Option<ast::FieldList>, cfg_options: &CfgOptions) ->
 fn enum_has_unsafe_fields(db: &Db, id: EnumId) -> bool {
     let loc = id.lookup(db);
     let source = match variants_syntax(db, id) {
-        Some(syntax) => syntax.node::<ast::Enum>().value,
-        None => loc.source(db).value,
+        Some(syntax) => syntax.node::<ast::Enum<'_>>().value,
+        None => loc.source_view(db).value,
     };
     let cfg_options = loc.container.krate(db).cfg_options(db);
     source.variant_list().is_some_and(|list| {
         list.variants().any(|variant| {
-            AttrFlags::is_cfg_enabled_for(&variant, cfg_options).is_ok()
+            AttrFlags::is_cfg_enabled_for(variant, cfg_options).is_ok()
                 && has_unsafe_field(variant.field_list(), cfg_options)
         })
     })
@@ -973,7 +983,7 @@ impl ConstSignature {
     fn lower(
         db: &Db,
         id: ConstId,
-        source: InFile<ast::Const>,
+        source: InFile<ast::Const<'_>>,
         maps: Maps<'_>,
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
@@ -989,7 +999,7 @@ impl ConstSignature {
         flags.set(ConstFlags::IS_DEFAULT, default);
 
         let (store, source_map, type_ref) =
-            lower_type_ref(db, module, source.as_ref().map(|it| it.ty()), maps, lowering);
+            lower_type_ref(db, module, source.map(|it| it.ty()), maps, lowering);
         let name = source.value.name().map(|it| it.as_name());
         (ConstSignature { store, type_ref, flags, name }, source_map)
     }
@@ -1030,7 +1040,7 @@ impl StaticSignature {
     fn lower(
         db: &Db,
         id: StaticId,
-        source: InFile<ast::Static>,
+        source: InFile<ast::Static<'_>>,
         maps: Maps<'_>,
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
@@ -1051,7 +1061,7 @@ impl StaticSignature {
         flags.set(StaticFlags::EXPLICIT_SAFE, safe);
 
         let (store, source_map, type_ref) =
-            lower_type_ref(db, module, source.as_ref().map(|it| it.ty()), maps, lowering);
+            lower_type_ref(db, module, source.map(|it| it.ty()), maps, lowering);
         let name = as_name_opt(source.value.name());
         (StaticSignature { store, type_ref, flags, name }, source_map)
     }
@@ -1084,7 +1094,7 @@ impl ImplSignature {
     fn lower(
         db: &Db,
         id: ImplId,
-        src: InFile<ast::Impl>,
+        src: InFile<ast::Impl<'_>>,
         maps: Maps<'_>,
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
@@ -1169,7 +1179,7 @@ impl TraitSignature {
     fn lower(
         db: &Db,
         id: TraitId,
-        source: InFile<ast::Trait>,
+        source: InFile<ast::Trait<'_>>,
         maps: Maps<'_>,
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
@@ -1260,7 +1270,7 @@ impl FunctionSignature {
     fn lower(
         db: &Db,
         id: FunctionId,
-        source: InFile<ast::Fn>,
+        source: InFile<ast::Fn<'_>>,
         maps: Maps<'_>,
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
@@ -1411,7 +1421,7 @@ impl TypeAliasSignature {
     fn lower(
         db: &Db,
         id: TypeAliasId,
-        source: InFile<ast::TypeAlias>,
+        source: InFile<ast::TypeAlias<'_>>,
         maps: Maps<'_>,
         lowering: BodyLowering<'_>,
     ) -> (Self, ExpressionStoreSourceMap) {
@@ -1556,10 +1566,10 @@ impl VariantFields {
                 let parent = loc.parent.lookup(db);
                 let source = match syntax {
                     Some(syntax) => {
-                        let variant = syntax.ast_id_map.get(loc.id.value).to_node(&syntax.root());
+                        let variant = syntax.ast_id_map.get(loc.id.value).to_view(syntax.root());
                         InFile::new(syntax.file_id, variant)
                     }
-                    None => loc.source(db),
+                    None => loc.source_view(db),
                 };
                 let shape = adt_shape(source.value.kind());
                 let enum_vis = Some(source.value.parent_enum().visibility());
@@ -1576,7 +1586,7 @@ impl VariantFields {
             }
             VariantId::StructId(id) => {
                 let loc = id.lookup(db);
-                let source = syntax.map_or_else(|| loc.source(db), SignatureSyntax::node);
+                let source = syntax.map_or_else(|| loc.source_view(db), SignatureSyntax::node);
                 let shape = adt_shape(source.value.kind());
                 let fields = lower_field_list(
                     db,
@@ -1591,7 +1601,7 @@ impl VariantFields {
             }
             VariantId::UnionId(id) => {
                 let loc = id.lookup(db);
-                let source = syntax.map_or_else(|| loc.source(db), SignatureSyntax::node);
+                let source = syntax.map_or_else(|| loc.source_view(db), SignatureSyntax::node);
                 let fields = lower_field_list(
                     db,
                     loc.container,
@@ -1645,8 +1655,8 @@ impl VariantFields {
 fn lower_field_list(
     db: &Db,
     module: ModuleId,
-    fields: InFile<Option<ast::FieldList>>,
-    override_visibility: Option<Option<ast::Visibility>>,
+    fields: InFile<Option<ast::FieldList<'_>>>,
+    override_visibility: Option<Option<ast::Visibility<'_>>>,
     maps: Maps<'_>,
     lowering: BodyLowering<'_>,
     frame: &Frame,
@@ -1682,14 +1692,14 @@ fn lower_field_list(
 
 /// The `count` fields of a list, written with their types; `None` when it has none written,
 /// before anything is set up to lower them.
-fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
+fn lower_fields<'t, Field: ast::HasAttrs<'t> + ast::HasVisibility<'t> + Copy>(
     db: &Db,
     module: ModuleId,
     count: usize,
-    fields: InFile<impl Iterator<Item = (Option<ast::Type>, Field)>>,
+    fields: InFile<impl Iterator<Item = (Option<ast::Type<'t>>, Field)>>,
     mut field_name: impl FnMut(usize, &Field) -> Name,
-    mut default_value: impl FnMut(&Field) -> Option<ast::ConstArg>,
-    override_visibility: Option<Option<ast::Visibility>>,
+    mut default_value: impl FnMut(&Field) -> Option<ast::ConstArg<'t>>,
+    override_visibility: Option<Option<ast::Visibility<'_>>>,
     maps: Maps<'_>,
     lowering: BodyLowering<'_>,
     frame: &Frame,
@@ -1714,7 +1724,7 @@ fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
     let mut lowered = Vec::with_capacity_in(count, frame);
     let mut idx = 0;
     for (ty, field) in fields.value {
-        match AttrFlags::is_cfg_enabled_for(&field, cfg_options) {
+        match AttrFlags::is_cfg_enabled_for(field, cfg_options) {
             Ok(()) => {
                 let type_ref =
                     col.lower_type_ref_opt(ty, &mut ImplTraitLowering::Error);
@@ -1736,7 +1746,7 @@ fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
             Err(cfg) => {
                 col.store.diagnostics.push(
                     crate::expr_store::ExpressionStoreDiagnostics::InactiveCode {
-                        node: InFile::new(fields.file_id, SyntaxNodePtr::new(field.syntax())),
+                        node: InFile::new(fields.file_id, ast::ptr(field.syntax())),
                         cfg,
                     },
                 );
@@ -1756,7 +1766,7 @@ fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
 pub struct InactiveEnumVariantCode {
     pub cfg: CfgExpr,
     pub opts: CfgOptions,
-    pub ast_id: span::FileAstId<ast::Variant>,
+    pub ast_id: span::FileAstId<syntax::ast::Variant>,
 }
 
 #[derive(Debug)]
@@ -1809,9 +1819,9 @@ impl EnumVariants {
             let loc = e.lookup(db);
             // The relative tree's ast ids are the file's: what a variant is interned by.
             let (source, ast_id_map) = match variants_syntax(db, e) {
-                Some(syntax) => (syntax.node::<ast::Enum>(), &syntax.ast_id_map),
+                Some(syntax) => (syntax.node::<ast::Enum<'_>>(), &syntax.ast_id_map),
                 None => {
-                    let source = loc.source(db);
+                    let source = loc.source_view(db);
                     let ast_id_map = source.file_id.ast_id_map(db);
                     (source, ast_id_map)
                 }
@@ -1827,8 +1837,8 @@ impl EnumVariants {
             let mut kept = Vec::with_capacity_in(count, frame);
             let mut inactive = Vec::new_in(frame);
             for variant in list.variants() {
-                let ast_id = ast_id_map.ast_id(&variant);
-                match AttrFlags::is_cfg_enabled_for(&variant, cfg_options) {
+                let ast_id = ast_id_map.ast_id_of_view::<syntax::ast::Variant>(variant);
+                match AttrFlags::is_cfg_enabled_for(variant, cfg_options) {
                     Ok(()) => {
                         let name = as_name_opt(variant.name());
                         let id = source.with_value(ast_id);
@@ -1938,7 +1948,7 @@ impl EnumVariants {
 
 #[salsa::tracked(returns(copy), mem_tag = Nameres)]
 pub(crate) fn extern_block_abi(db: &Db, extern_block: ExternBlockId) -> ExternAbi {
-    let source = extern_block.lookup(db).source(db);
+    let source = extern_block.lookup(db).source_view(db);
     source
         .value
         .abi()
@@ -1949,7 +1959,7 @@ pub(crate) fn extern_block_abi(db: &Db, extern_block: ExternBlockId) -> ExternAb
 #[cfg(test)]
 mod tests {
     use blaze_ids::rng::SplitMix64;
-    use syntax::{AstNode, Edition, NodeOrToken, SourceFile, T, ast};
+    use syntax::{Edition, NodeOrToken, SourceFile, T};
 
     use super::*;
 
@@ -2145,7 +2155,7 @@ impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; co
 
     #[test]
     fn child_tokens_as_the_accessors() {
-        let file = SourceFile::parse(KEYWORDS, Edition::CURRENT).tree();
+        let parse = SourceFile::parse(KEYWORDS, Edition::CURRENT);
         let mut seen_fn = [false; 6];
         let mut seen_static = [false; 3];
         let mut seen_impl = [false; 4];
@@ -2155,8 +2165,8 @@ impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; co
         fn or(seen: &mut [bool], found: &[bool]) {
             seen.iter_mut().zip(found).for_each(|(seen, found)| *seen |= *found)
         }
-        for node in file.syntax().descendants() {
-            if let Some(it) = ast::Fn::cast(node.clone()) {
+        for node in parse.root().descendants() {
+            if let Some(it) = ast::Fn::cast(node) {
                 let found = child_tokens(
                     it.syntax(),
                     [T![unsafe], T![async], T![gen], T![const], T![default], T![safe]],
@@ -2171,7 +2181,7 @@ impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; co
                 ];
                 assert_eq!(found, accessors, "{it}");
                 or(&mut seen_fn, &found);
-            } else if let Some(it) = ast::Static::cast(node.clone()) {
+            } else if let Some(it) = ast::Static::cast(node) {
                 let found = child_tokens(it.syntax(), [T![mut], T![unsafe], T![safe]]);
                 let accessors = [
                     it.mut_token().is_some(),
@@ -2180,7 +2190,7 @@ impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; co
                 ];
                 assert_eq!(found, accessors, "{it}");
                 or(&mut seen_static, &found);
-            } else if let Some(it) = ast::Impl::cast(node.clone()) {
+            } else if let Some(it) = ast::Impl::cast(node) {
                 let found =
                     child_tokens(it.syntax(), [T![unsafe], T![!], T![default], T![const]]);
                 let accessors = [
@@ -2191,7 +2201,7 @@ impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; co
                 ];
                 assert_eq!(found, accessors, "{it}");
                 or(&mut seen_impl, &found);
-            } else if let Some(it) = ast::Trait::cast(node.clone()) {
+            } else if let Some(it) = ast::Trait::cast(node) {
                 let found = child_tokens(it.syntax(), [T![auto], T![unsafe], T![=], T![const]]);
                 let accessors = [
                     it.auto_token().is_some(),
@@ -2201,7 +2211,7 @@ impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; co
                 ];
                 assert_eq!(found, accessors, "{it}");
                 or(&mut seen_trait, &found[..3]);
-            } else if let Some(it) = ast::RecordField::cast(node.clone()) {
+            } else if let Some(it) = ast::RecordField::cast(node) {
                 let [found] = child_tokens(it.syntax(), [T![unsafe]]);
                 let scanned = it
                     .syntax()
@@ -2210,11 +2220,11 @@ impl<T> Tr for T { default type A = u8; default const C: u8 = 0; type B = u8; co
                     .any(|token| token.kind() == T![unsafe]);
                 assert_eq!(found, scanned, "{it}");
                 seen_unsafe_field |= found;
-            } else if let Some(it) = ast::Const::cast(node.clone()) {
+            } else if let Some(it) = ast::Const::cast(node) {
                 let found = child_tokens(it.syntax(), [T![default]]);
                 assert_eq!(found, [it.default_token().is_some()], "{it}");
                 seen_default[0] |= found[0];
-            } else if let Some(it) = ast::TypeAlias::cast(node.clone()) {
+            } else if let Some(it) = ast::TypeAlias::cast(node) {
                 let found = child_tokens(it.syntax(), [T![default]]);
                 assert_eq!(found, [it.default_token().is_some()], "{it}");
                 seen_default[1] |= found[0];
@@ -2515,14 +2525,14 @@ pub enum F { A(u8), #[cfg(any())] B { unsafe b: u8 } }
     fn the_outline_leaves_out_each_body_of_its_own_anchor() {
         let (db, file) = TestDB::with_single_file(CODE);
         let outline = file_outline(&db, file);
-        assert_eq!(outline.root().to_string(), edited(CODE, &LEFT_OUT));
+        assert_eq!(outline.root().text(), edited(CODE, &LEFT_OUT));
         assert_eq!(outline.cuts.len(), BODY_EDITS.len(), "{outline:?}");
         let root = outline.root();
         for cut in &outline.cuts {
             assert!(cut.text_range().is_empty(), "{cut:?}");
             let item = root
                 .descendants()
-                .find(|it| left_out(it).is_some_and(|it| SyntaxNodePtr::new(&it) == *cut));
+                .find(|&it| left_out(it).is_some_and(|it| ast::ptr(it) == *cut));
             assert!(item.is_some(), "{cut:?} is not the body of an item in the outline");
         }
     }
@@ -2575,11 +2585,11 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
 "#;
         let (db, file) = TestDB::with_single_file(NESTED);
         let file_id = HirFileId::from(file);
-        let root = file_id.parse_or_expand(&db);
+        let root = file_id.root(&db);
         let named = |name: &str| {
             root.descendants()
                 .filter_map(ast::Struct::cast)
-                .find(|it| it.name().is_some_and(|it| it.syntax().text() == name))
+                .find(|it| it.name().is_some_and(|it| it.text() == name))
                 .unwrap_or_else(|| panic!("no struct {name}"))
         };
         let nothing: Elide = |_| None;
@@ -2588,16 +2598,43 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
             ("InType", "pub fn p(x: [u8; { struct InType; 1 }]) -> u8 "),
         ] {
             let item = named(name);
-            let id = InFile::new(file_id, file_id.ast_id_map(&db).ast_id(&item));
+            let id = InFile::new(
+                file_id,
+                file_id.ast_id_map(&db).ast_id_of_view::<syntax::ast::Struct>(item),
+            );
             let syntax = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
                 item_syntax(&db, id, nothing, frame)
             })
             .unwrap_or_else(|| panic!("{name}"));
-            assert_eq!(syntax.root().to_string(), text, "{name}");
-            assert_eq!(syntax.node::<ast::Struct>().value.syntax().to_string(), item.to_string());
+            assert_eq!(syntax.root().text(), text, "{name}");
+            assert_eq!(syntax.node::<ast::Struct<'_>>().value.syntax().text(), item.syntax().text());
             assert_eq!(syntax.ast_id_map.get_erased(id.value.erase()), syntax.item, "{name}");
             assert_eq!(syntax.elided, None, "{name}");
         }
+    }
+
+    /// Allocation budget: the outline's walks on views, `bodies_under` over a file and
+    /// `child_tokens` of every node in it, count nothing and allocate nothing once the file's
+    /// lazy bodies are parsed.
+    #[test]
+    fn walking_the_outline_allocates_nothing() {
+        let (db, file) = TestDB::with_single_file(CODE);
+        let root = HirFileId::from(file).root(&db);
+        let walk = || {
+            let mut bodies = 0;
+            bodies_under(root, |_| bodies += 1);
+            let mut found = 0;
+            for node in root.descendants() {
+                let [unsafe_, const_] = child_tokens(node, [T![unsafe], T![const]]);
+                found += usize::from(unsafe_) + usize::from(const_);
+            }
+            std::hint::black_box((bodies, found))
+        };
+        // The bodies `LEFT_OUT` names, and `h`'s, which its impl's attribute keeps.
+        assert_eq!(walk().0, LEFT_OUT.len() + 1);
+        blaze_alloc_count::assert_at_most(0, "walking a file's outline through views", || {
+            walk();
+        });
     }
 
     /// Every read of a lowered signature: the memo hits of its queries, and each field, variant
@@ -2693,7 +2730,7 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
             ($db:ident, $Signature:ident, $id:expr) => {{
                 let id = $id;
                 let (signature, map) = $Signature::with_source_map(&$db, id);
-                let source = id.lookup(&$db).source(&$db);
+                let source = id.lookup(&$db).source_view(&$db);
                 let (whole, whole_map) =
                     $Signature::lower(&$db, id, source, None, BodyLowering::Whole);
                 assert_eq!(**signature, *whole, "{id:?}");

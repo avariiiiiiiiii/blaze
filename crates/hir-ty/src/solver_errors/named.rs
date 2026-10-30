@@ -33,6 +33,7 @@ pub struct NamedTerm {
 
 impl NamedTerm {
     pub(crate) fn new<'db>(infcx: &InferCtxt<'db>, term: Term<'db>) -> Self {
+        // alloc: error path, the variables of a term a diagnostic names
         let mut namer = Namer { infcx, vars: Vec::new(), params: Vec::new() };
         let term = GenericArg::from(term).fold_with(&mut namer).store();
         NamedTerm { term, params: namer.params }
@@ -45,9 +46,9 @@ impl NamedTerm {
         interner: DbInterner<'db>,
         mut name: impl FnMut(Span, GenericParamId) -> bool,
     ) -> GenericArg<'db> {
+        let params = self.params.iter().map(|&(span, param)| name(span, param).then_some(param));
         // alloc: error path, one per named variable of a reported diagnostic
-        let params =
-            self.params.iter().map(|&(span, param)| name(span, param).then_some(param)).collect();
+        let params = params.collect();
         self.term.as_ref().fold_with(&mut Unnamer { interner, params })
     }
 }

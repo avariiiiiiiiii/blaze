@@ -1,6 +1,12 @@
 //! The sockets behind [`crate::Effect::Listen`] and [`crate::Effect::Connect`], for every
 //! driver on Unix: made here, then read and written as each driver does (blocking on a thread,
 //! through the ring, through a kqueue).
+//!
+//! Why unsafe: a socket made here is handed to a driver by descriptor and taken back as a std
+//! stream (`from_raw_fd`, owned once), and std has no `recv` into a `Vec`'s spare room: its
+//! `Read::read` needs initialized bytes, which would zero each buffer before every read (a
+//! write of the whole buffer per receive). `sockaddr_storage` is viewed as the family it holds
+//! only after its `ss_family` says which.
 
 use std::{
     io::{self, Write as _},

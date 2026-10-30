@@ -816,7 +816,14 @@ impl Journal {
     /// Asks for the next records, completing on the port through `overlapped`. The request
     /// and the buffer stay where they are until that completion is dequeued (the driver keeps
     /// the journal in the request until then).
-    pub(super) fn read(&mut self, overlapped: *mut OVERLAPPED) -> io::Result<()> {
+    ///
+    /// # Safety
+    ///
+    /// `overlapped` is a request's [`super::sys::Head::overlapped`], made ready for this step,
+    /// and the request's entry (its head and this journal with its buffer and input) stays where it is, alive, until the
+    /// step's completion is dequeued: the kernel writes them after this returns, so freeing or
+    /// moving either first is a write to freed memory.
+    pub(super) unsafe fn read(&mut self, overlapped: *mut OVERLAPPED) -> io::Result<()> {
         self.input = READ_USN_JOURNAL_DATA_V1 {
             StartUsn: self.next,
             ReasonMask: REASONS,

@@ -17,9 +17,7 @@ use crate::mir::{
     return_slot,
 };
 
-use super::{
-    Location, Mention, reverse_postorder, successors, visit_statement, visit_terminator,
-};
+use super::{Location, Mention, reverse_postorder, visit_statement, visit_terminator};
 
 /// The mentions of one statement or terminator, reused for each.
 type Mentions<'f> = Vec<(LocalId, Mention), &'f Frame>;
@@ -108,7 +106,7 @@ fn terminator_effect(
 fn exit_into(entry: &[Bits<'_>], block: &BasicBlock, live: &mut Bits<'_>) {
     live.clear();
     if let Some(terminator) = &block.terminator {
-        for target in successors(&terminator.kind) {
+        for target in terminator.kind.all_successors() {
             live.union_with(&entry[block_index(target)]);
         }
     }

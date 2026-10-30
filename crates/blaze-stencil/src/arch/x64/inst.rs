@@ -40,7 +40,6 @@ pub fn takes(opcode: Opcode) -> bool {
             | Opcode::FuncAddr
             | Opcode::SymbolValue
             | Opcode::TlsValue
-            | Opcode::GlobalValue
             | Opcode::BrTable
             | Opcode::Trap
             | Opcode::Debugtrap
@@ -203,7 +202,7 @@ pub fn inst(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
             asm::store(cx.buf, slot(dst), RAX);
             Ok(())
         }
-        Opcode::SymbolValue | Opcode::TlsValue | Opcode::GlobalValue => {
+        Opcode::SymbolValue | Opcode::TlsValue => {
             let InstructionData::UnaryGlobalValue { global_value, .. } = data else {
                 return Err(Error::at(inst, "a global value instruction of another format"));
             };
@@ -215,7 +214,7 @@ pub fn inst(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
                 _ => None,
             };
             match (data.opcode(), tls) {
-                (Opcode::GlobalValue, _) | (Opcode::SymbolValue, Some(false)) => {}
+                (Opcode::SymbolValue, Some(false)) => {}
                 (Opcode::TlsValue, Some(true)) => {}
                 (opcode, _) => {
                     return Err(Error::at(
@@ -726,7 +725,7 @@ pub fn bound(func: &ir::Function, target: &Target, inst: ir::Inst) -> u32 {
         }
         // The address and its store.
         Opcode::FuncAddr => EXT_NAME + 8,
-        Opcode::SymbolValue | Opcode::TlsValue | Opcode::GlobalValue => {
+        Opcode::SymbolValue | Opcode::TlsValue => {
             let InstructionData::UnaryGlobalValue { global_value, .. } = *data else { return 0 };
             gv_bound(func, target, global_value) + 8
         }

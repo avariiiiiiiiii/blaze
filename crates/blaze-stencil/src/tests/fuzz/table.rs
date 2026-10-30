@@ -66,7 +66,10 @@ pub(super) fn candidates(isa: Isa) -> Vec<Candidate> {
 /// - `fcvt_to_uint` and `fcvt_to_sint`, which trap on NaN and out-of-range values: the
 ///   generator converts with `_sat` only;
 /// - the extending vector loads (`uload8x8` and the rest), `blendv` and the `x86_*` ops, which
-///   `cranelift-interpreter` does not implement, so nothing would say what they mean.
+///   `cranelift-interpreter` does not implement, so nothing would say what they mean;
+/// - `load_confined` and `store_confined`, the fusion of an access with its address
+///   arithmetic: the generator draws the plain access and the arithmetic, but not yet the one
+///   address pattern the patcher fuses (`stencil.rs` runs every confined shape).
 fn drawn(op: Op) -> bool {
     !matches!(
         op,
@@ -92,6 +95,8 @@ fn drawn(op: Op) -> bool {
             | Op::X86Pmulhrsw
             | Op::X86Pmaddubsw
             | Op::X86Cvtt2dq
+            | Op::LoadConfined
+            | Op::StoreConfined
     )
 }
 

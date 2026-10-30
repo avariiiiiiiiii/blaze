@@ -1,0 +1,24 @@
+{
+  "id": "00580",
+  "from_lane": "db-expand-names",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/hir-def/src/nameres/collector.rs"
+  ],
+  "what": "## db-expand-names: hot_lint skips a file whose `mod` is `#[cfg(test)]` (tools owner, `tools/v2/hot_lint.py`)\n\n`nameres.rs` declares `#[cfg(test)] mod collector;`: since the facts switch-over, the old\ncollector is test-only. hot_lint skips `#[cfg(test)]` items within a file, but not a whole file\ndeclared that way, so it reports 47 lines in `crates/hir-def/src/nameres/collector.rs`. It only\nrecognises test files by name (`tests/`, `*tests.rs`, L98). Make it also skip a file whose `mod`\ndeclaration, in its parent file, is under `#[cfg(test)]`. The alternative is 47 justification\ncomments on code that never runs outside tests.\n\n> forwarded to the coordinator: `tools/` is its; on requests' coordinator list (with dedyn-misc's string literals and diagnostics-speed-lower 2, the same `cfg(test)` file skip) (requests, pass 25).",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#db-expand-names: hot_lint skips a file whose `mod` is `#[cfg(test)]` (tools owner, `tools/v2/hot_lint.py`)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:4907"
+    }
+  ]
+}

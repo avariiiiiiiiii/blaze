@@ -3,8 +3,8 @@
 //! [`output`] is rustc's target spec of a triple (the pinned nightly's `rustc_target::spec`) as
 //! an [`Output`]: format, architecture, entry, the ELF interpreter, the Mach-O platform and the
 //! stack. [`locate`] finds the files of a link line, in its order: the C runtime's start
-//! objects, the libraries the crates ask for (`-l`, `#[link]`), the libraries the C toolchain's
-//! driver adds, then its end objects.
+//! objects, the sanitizer runtimes in blaze's toolchain, the libraries the crates ask for (`-l`,
+//! `#[link]`), the libraries the C toolchain's driver adds, then its end objects.
 //!
 //! blaze never links with `cc` (docs/linker.md, "The C toolchain stays a source of files, not
 //! a linker"): the platform's C toolchain is asked where its files are, never to compile or
@@ -50,6 +50,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use blaze_codegen::settings::{Sanitize, Sanitizers};
 use blaze_codegen::{Arch, NativeLib, NativeLibKind};
 use blaze_ids::ContentId;
 use smallvec::SmallVec;
@@ -104,20 +105,136 @@ pub fn output(
     output_with(&CACHE, &System, triple, shared, debug, incremental)
 }
 
-/// The files of `output`'s link line, in its order: the C runtime's start objects, `libs`
-/// (searched in `search`, the link's `-L`s, then the toolchain's directories), the libraries
-/// the toolchain's driver adds, the C runtime's end objects. A linker script's files follow
-/// it, and so do the libraries a PE archive's members ask for and those a Mach-O object's or
-/// archive member's `LC_LINKER_OPTION`s ask for. A library not found is an error naming it
-/// (and the script, object or member that asked) and every directory searched. `sysroot` is
-/// blaze's toolchain (`blaze toolchain --path`), whose self-contained C runtime WASI links.
+/// The files of `output`'s link line, in its order: the C runtime's start objects, the
+/// runtimes of [`Output::sanitize`]'s sanitizers, `libs` (searched in `search`, the link's
+/// `-L`s, then the toolchain's directories), the libraries the toolchain's driver adds, the C
+/// runtime's end objects. A linker script's files follow it, and so do the libraries a PE
+/// archive's members ask for and those a Mach-O object's or archive member's
+/// `LC_LINKER_OPTION`s ask for. A library not found is an error naming it (and the script,
+/// object or member that asked) and every directory searched. `sysroot` is blaze's toolchain
+/// (`blaze toolchain --path`), whose self-contained C runtime WASI links and whose target
+/// library directory has the sanitizer runtimes. Sets [`Output::rpaths`] to where the loader
+/// finds a shared runtime; set [`Output::sanitize`] first.
 pub fn locate(
-    output: &Output,
+    output: &mut Output,
     libs: &[NativeLib],
     search: &[PathBuf],
     sysroot: &Path,
 ) -> Result<Vec<Located>, LinkError> {
-    locate_with(&CACHE, &System, output, libs, search, sysroot)
+    let located = locate_with(&CACHE, &System, output, libs, search, sysroot)?;
+    output.rpaths = rpaths(Target::parse(&output.triple)?, output, sysroot)?;
+    Ok(located)
+}
+
+/// The release channel in the sanitizer runtimes' names, as rustc's `CFG_RELEASE_CHANNEL`
+/// names them: blaze's toolchain is a nightly.
+const CHANNEL: &str = "nightly";
+
+/// The sanitizers with a runtime: rustc's name for each, and what errors call it.
+const RUNTIMES: [(Sanitizers, &str, &str); 3] = [
+    (Sanitizers::ADDRESS, "asan", "AddressSanitizer"),
+    (Sanitizers::THREAD, "tsan", "ThreadSanitizer"),
+    (Sanitizers::MEMORY, "msan", "MemorySanitizer"),
+];
+
+/// The toolchain's target library directory, where rustc's `find_sanitizer_runtime` finds the
+/// runtimes: `<sysroot>/lib/rustlib/<triple>/lib`.
+fn runtime_dir(target: Target, sysroot: &Path) -> PathBuf {
+    sysroot.join("lib").join("rustlib").join(target.triple()).join("lib")
+}
+
+/// The runtime of each of `output`'s sanitizers, as rustc's `add_sanitizer_libraries` links
+/// it: on macOS `librustc-nightly_rt.<name>.dylib`, a shared library found by its
+/// `@rpath` install name ([`rpaths`]); elsewhere `librustc-nightly_rt.<name>.a`, whole. An
+/// ELF shared library gets none: the executable that loads it has the runtime. MSVC's
+/// AddressSanitizer is MSVC's own runtime (`/INFERASANLIBS`), which the PE link does not
+/// take, and wasm has none; MemorySanitizer is only Linux's.
+fn runtimes(target: Target, output: &Output, sysroot: &Path) -> Result<SmallVec<[(PathBuf, NativeKind); 1]>, LinkError> {
+    let mut out = SmallVec::new();
+    let sanitizers = output.sanitize.sanitizers;
+    if sanitizers.is_empty() {
+        return Ok(out);
+    }
+    let named = RUNTIMES.iter().filter(|it| sanitizers.contains(it.0));
+    // clone: a filter over three entries, copied to peek at its first two
+    if let (Some(first), Some(second)) = (named.clone().next(), named.clone().nth(1)) {
+        return Err(fail(
+            // alloc: error path
+            format!(
+                "{} and {} in one build: rustc builds with one of AddressSanitizer, ThreadSanitizer \
+                 and MemorySanitizer at a time",
+                first.2, second.2
+            ),
+        ));
+    }
+    let executable = matches!(output.kind, OutputKind::Executable { .. });
+    let triple = target.triple();
+    for &(sanitizer, name, what) in named {
+        match target {
+            Target::Wasip1 | Target::WasmUnknown => {
+                // alloc: error path
+                return Err(fail(format!("{what} on {triple}: rustc has no sanitizer runtime for wasm")));
+            }
+            Target::Msvc => {
+                return Err(fail(
+                    // alloc: error path
+                    format!(
+                        "{what} on {triple}: rustc links MSVC's own runtime there (`/INFERASANLIBS`), \
+                         which blaze's PE link does not take yet"
+                    ),
+                ));
+            }
+            Target::MacOs if sanitizer == Sanitizers::MEMORY => {
+                // alloc: error path
+                return Err(fail(format!("{what} on {triple}: it has a runtime only on Linux and FreeBSD")));
+            }
+            _ => {}
+        }
+        if target.format() == Format::Elf && !executable {
+            continue;
+        }
+        let (file, kind) = match target {
+            // alloc: once per sanitized link, the runtime's file name
+            Target::MacOs => (format!("librustc-{CHANNEL}_rt.{name}.dylib"), NativeKind::Shared { as_needed: false }),
+            // alloc: once per sanitized link, the runtime's file name
+            _ => (format!("librustc-{CHANNEL}_rt.{name}.a"), NativeKind::Archive { whole: true }),
+        };
+        let path = runtime_dir(target, sysroot).join(file);
+        if !path.is_file() {
+            return Err(fail(
+                // alloc: error path
+                format!(
+                    "{what}'s runtime {} is not in blaze's toolchain: the pinned nightly's `rust-std` \
+                     for {triple} ships it there",
+                    path.display()
+                ),
+            ));
+        }
+        out.push((path, kind));
+    }
+    Ok(out)
+}
+
+/// Where the loader finds the shared runtimes [`runtimes`] put on the line, as rustc passes
+/// `-rpath`: on macOS the target library directory, absolute; none elsewhere.
+fn rpaths(target: Target, output: &Output, sysroot: &Path) -> Result<Vec<String>, LinkError> {
+    if target != Target::MacOs || output.sanitize.sanitizers.is_empty() {
+        // alloc: none, an empty `Vec`
+        return Ok(Vec::new());
+    }
+    let dir = runtime_dir(target, sysroot);
+    if !dir.is_absolute() {
+        return Err(fail(
+            // alloc: error path
+            format!("the sanitizer runtimes' directory {} is not absolute, as an rpath must be", dir.display()),
+        ));
+    }
+    let dir = dir
+        .to_str()
+        // alloc: error path
+        .ok_or_else(|| fail(format!("the sanitizer runtimes' directory {} is not UTF-8", dir.display())))?;
+    // alloc: once per sanitized link, the one rpath
+    Ok(vec![dir.to_owned()])
 }
 
 fn output_with<A: Ask>(
@@ -168,6 +285,9 @@ fn output_with<A: Ask>(
         exec_log: false,
         // alloc: once per link, the triple the output is for
         triple: triple.to_owned(),
+        sanitize: Sanitize::default(),
+        // alloc: none, an empty `Vec` until `locate` sets it
+        rpaths: Vec::new(),
     })
 }
 
@@ -193,11 +313,15 @@ fn locate_with<A: Ask>(
             ),
         ));
     }
+    let runtimes = runtimes(target, output, sysroot)?;
     let found = cache.found(ask, target, Some(sysroot))?;
     let executable = matches!(output.kind, OutputKind::Executable { .. });
     let mut line = Line { cache, output, search, found: &found, out: Vec::with_capacity(libs.len() + 8) };
     for name in target.start(executable) {
         line.object(name)?;
+    }
+    for (path, kind) in runtimes {
+        line.push(path, kind)?;
     }
     for lib in libs {
         line.library(&lib.name, lib.kind, lib.verbatim)?;

@@ -223,10 +223,11 @@ pub(crate) fn encode(
         if told.is_empty() { Vec::new_in(frame) } else { ranges(scopes, lines, len, frame)? };
     let frame_base = Cow::Borrowed(&slots.frame_base[..]);
     let side = Written { version: VERSION, frame_base, scopes, variables: told, inlined };
+    // alloc: the error's message
     let size = postcard::experimental::serialized_size(&side).map_err(|e| e.to_string())?;
     // alloc: the side table's bytes, kept in the store: one allocation of their exact size
-    let bytes =
-        postcard::to_extend(&side, Vec::<u8>::with_capacity(size)).map_err(|e| e.to_string())?;
+    let bytes = postcard::to_extend(&side, Vec::<u8>::with_capacity(size))
+        .map_err(|e| e.to_string())?; // alloc: the error's message
     let id = ContentId::of(SIDE_DOMAIN, &bytes);
     Ok(Some((bytes, id)))
 }
@@ -238,6 +239,7 @@ pub(crate) fn of(
     code: &crate::fragment::Code,
     frame: &Frame,
 ) -> Result<Option<(Vec<u8>, ContentId)>, String> {
+    // alloc: the error's message
     let len = u32::try_from(code.bytes.len()).map_err(|e| e.to_string())?;
     encode(variables, scopes, &code.slots, &code.lines, len, frame)
 }
@@ -265,11 +267,12 @@ fn ranges<'f>(
             Some(SpanScope::Before) => {}
             Some(SpanScope::Outside) => scope = None,
             Some(&SpanScope::In(it)) => scope = Some(it),
+            // alloc: the error's message
             None => return Err(format!("a line row of statement {}, which has no scope", row.span)),
         }
         let len = out.len();
         extend(&mut out, |it| (it.parent, &mut it.ranges), scope, (row.offset, to))
-            .map_err(|e| format!("{e} of {len}"))?;
+            .map_err(|e| format!("{e} of {len}"))?; // alloc: the error's message
     }
     Ok(out)
 }
@@ -295,11 +298,12 @@ fn inlined_ranges<'f>(
     let ends = lines.iter().skip(1).map(|row| row.offset).chain([len]);
     for (row, to) in lines.iter().zip(ends) {
         let Some(&scope) = scopes.inlined_of_span.get(row.span as usize) else {
+            // alloc: the error's message
             return Err(format!("a line row of statement {}, which is of no body", row.span));
         };
         let len = out.len();
         extend(&mut out, |it| (it.parent, &mut it.ranges), scope, (row.offset, to))
-            .map_err(|e| format!("inlined {e} of {len}"))?;
+            .map_err(|e| format!("inlined {e} of {len}"))?; // alloc: the error's message
     }
     Ok(out)
 }
@@ -319,6 +323,7 @@ fn extend<'f, T>(
     // Each scope's parent comes before it, so the chain ends within as many steps.
     for _ in 0..out.len() {
         let Some(index) = at else { break };
+        // alloc: the error's message
         let Some(it) = out.get_mut(index as usize) else { return Err(format!("scope {index}")) };
         let (parent, ranges) = parts(it);
         match ranges.last_mut() {
@@ -332,8 +337,10 @@ fn extend<'f, T>(
 
 /// The table in `bytes`, its names borrowed from them.
 pub(crate) fn decode(bytes: &[u8]) -> Result<Side<'_>, String> {
+    // alloc: the error's message
     let side: Side<'_> = postcard::from_bytes(bytes).map_err(|e| e.to_string())?;
     if side.version != VERSION {
+        // alloc: the error's message
         return Err(format!("a side table of version {}, not {VERSION}", side.version));
     }
     Ok(side)

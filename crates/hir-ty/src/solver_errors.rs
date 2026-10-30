@@ -25,7 +25,7 @@ use rustc_type_ir::{
 use crate::{
     InferenceDiagnostic, Span,
     next_solver::{
-        AnyImplId, ClauseKind, DbInterner, GenericArg, ParamEnv, PolyProjectionClause,
+        AliasTermKind, AnyImplId, ClauseKind, DbInterner, GenericArg, ParamEnv, PolyProjectionClause,
         PolyTraitClause, Predicate, PredicateKind, ProjectionClause, StoredGenericArg,
         StoredGenericArgs,
         StoredTraitRef, StoredTy, Term, TraitClause, TyKind, Unnormalized,
@@ -98,6 +98,10 @@ pub enum SolverDiagnosticKind {
         /// What the goal's alias normalizes to where that is not the goal's term: rustc's
         /// "expected `term`, found `normalized`".
         normalized: Option<StoredGenericArg>,
+        /// The user-written impl selection picks for the projection's trait ref, whose
+        /// associated item rustc labels "expected this to be `term`" (when local and final).
+        #[type_visitable(ignore)]
+        impl_: Option<AnyImplId>,
     },
     /// E0308: a subtyping or coercion goal of two types that differ (`report_mismatched_types`).
     TypesDiffer { expected: StoredTy, found: StoredTy },
@@ -343,6 +347,7 @@ impl SolverDiagnostic {
             FulfillmentErrorCode::Project(_) => SolverDiagnosticKind::ProjectionMismatch {
                 goal: goal(),
                 normalized: projection_normalized(infcx, &error.obligation),
+                impl_: projection_impl(infcx, &error.obligation),
             },
             FulfillmentErrorCode::Outlives => SolverDiagnosticKind::HigherRankedOutlives,
             FulfillmentErrorCode::Subtype(expected_found, _) => SolverDiagnosticKind::TypesDiffer {
@@ -387,6 +392,37 @@ fn projection_normalized<'db>(
             let normalized = infcx.deeply_resolve_ignoring_regions(normalized);
             GenericArg::from(normalized).fold_with(&mut ReplaceInferWithError::new(interner)).store()
         })
+    })
+}
+
+/// The user-written impl selection picks for a projection goal's trait ref: rustc's
+/// `report_projection_error`, which selects it with the goal's bound variables as placeholders
+/// to label that impl's associated item. `None` for an alias that is not a trait's associated
+/// item, and for a selection that is ambiguous, fails or is not a user-written impl.
+fn projection_impl<'db>(
+    infcx: &InferCtxt<'db>,
+    obligation: &PredicateObligation<'db>,
+) -> Option<AnyImplId> {
+    let interner = infcx.interner;
+    let kind = infcx.deeply_resolve_ignoring_regions(obligation.predicate).kind();
+    let PredicateKind::Clause(ClauseKind::Projection(data)) = kind.skip_binder() else {
+        return None;
+    };
+    if !matches!(
+        data.projection_term.kind(interner),
+        AliasTermKind::ProjectionTy { .. } | AliasTermKind::ProjectionConst { .. }
+    ) {
+        return None;
+    }
+    infcx.probe(|_| {
+        let trait_ref = infcx
+            .enter_forall_and_leak_universe(kind.rebind(data.projection_term.trait_ref(interner)));
+        let obligation =
+            Obligation::new(interner, ObligationCause::dummy(), obligation.param_env, trait_ref);
+        match infcx.select(&obligation) {
+            Ok(Some(ImplSource::UserDefined(impl_))) => Some(impl_.impl_def_id),
+            _ => None,
+        }
     })
 }
 

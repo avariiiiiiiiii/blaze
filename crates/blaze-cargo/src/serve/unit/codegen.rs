@@ -453,11 +453,22 @@ impl Generated<'_> {
 /// thread of the build reads the one database of the task's reader by reference: salsa's reads
 /// take `&self`, so none waits on another and none is cloned.
 fn frontend<'db>(job: &Job, reader: &'db UnitReader, mounted: &Arc<Mounted>) -> HirFrontend<'db> {
+    frontend_over(job, reader.db(), reader.paths(), mounted)
+}
+
+/// [`frontend`] over the database `db`, whose files are `paths`: what the loop's writer reads
+/// before it lends the front end to a task ([`super::harness::write`]).
+pub(crate) fn frontend_over<'db>(
+    job: &Job,
+    db: &'db base_db::Db,
+    paths: &Arc<std::collections::HashMap<base_db::FileId, String>>,
+    mounted: &Arc<Mounted>,
+) -> HirFrontend<'db> {
     let names = {
-        let (mounted, paths) = (Arc::clone(mounted), Arc::clone(reader.paths()));
+        let (mounted, paths) = (Arc::clone(mounted), Arc::clone(paths));
         move |file: base_db::FileId| -> Option<String> { paths.get(&file).map(|path| mounted.name(path)) }
     };
-    HirFrontend::new(Databases::new(reader.db()), HashSource::Items(ItemHashes::new(Box::new(names))), build_time(job))
+    HirFrontend::new(Databases::new(db), HashSource::Items(ItemHashes::new(Box::new(names))), build_time(job))
 }
 
 /// The tests of test unit `unit` as its harness lists them, compiling nothing: the same
@@ -704,10 +715,11 @@ pub(crate) fn link(
     let test = job.graph.has(unit as u32, flag::TEST);
     let mut output = blaze_link::target::output(triple(job, u), shared, debug, true).map_err(|it| it.to_string())?;
     output.exec_log = test && blaze_codegen::exec::records(generated.policy.mode);
+    output.sanitize = generated.policy.sanitize;
     let (libs, search) = natives(job, unit, &generated.frontend)?;
     let sysroot = crate::cargo::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
     let located =
-        blaze_link::target::locate(&output, &libs, &search, &sysroot).map_err(|it| it.to_string())?;
+        blaze_link::target::locate(&mut output, &libs, &search, &sysroot).map_err(|it| it.to_string())?;
     let side = generated.side()?;
 
     let kept = images.iter().position(|it| it.path == path).map(|at| images.swap_remove(at).kept);

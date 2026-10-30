@@ -5,7 +5,7 @@
 //! Also the typed rows of the address space the switch's columns reserve ([`rows`]), whose
 //! safety rests on the platform's [`Reserved`].
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "atomic views of the image's words at the addresses the linker placed them")]
 
 use std::{
     ops::Range,

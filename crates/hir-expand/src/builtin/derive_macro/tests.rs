@@ -517,48 +517,70 @@ fn derived_impls_get_the_items_lint_and_stability_attributes() {
             #[warn(z)]#[unstable(feature=\"u\",issue=\"none\")]",
         ),
     ];
-    let written = |it: &tt::TopSubtree<&Frame>| it.to_string().split_whitespace().collect::<String>();
     for (edition, text, copied) in cases {
         let (adt, map) = item_at(text, edition);
         let parse = parsed_at(text, edition);
         assert!(parse.errors().is_empty(), "{edition:?} `{text}`: {:?}", parse.errors());
         let input = item_input(&adt, &map);
         let source = ItemSource(&adt, &map);
+        let check = Copied { input: &input, copied, edition };
         for (name, derive) in derives() {
-            let what = format!("{name} of the {edition:?} item");
             let frame = &Frame::new(Tag::Expand).expect("a test's frame");
             let (_, plain) = derive(frame, &source, adt_view(&parse), span);
             let (_, again) = derive(frame, &source, adt_view(&parse), span);
-            let with = again.map(|it| super::with_item_attrs(frame, &input, it));
-            assert_eq!(plain.err, None, "{what}");
-            assert_eq!(with.err, None, "{what}");
-            let (plain, with) = (plain.value, with.value);
-            let impls = written(&plain).matches("impl").count();
-            let expected = if name == "PartialEq" { 2 } else { 1 };
-            assert_eq!(impls, expected, "{what}: {plain}");
-            assert_eq!(
-                written(&with),
-                written(&plain).replace("impl", &format!("{copied}impl")),
-                "{what}"
-            );
-            assert_eq!(
-                with.token_trees().first_span(),
-                input.token_trees().first_span(),
-                "{what}: the first copied `#` is the item's own"
-            );
-            assert_eq!(
-                with.token_trees().first_span().map(|it| it.ctx),
-                Some(SyntaxContext::root(edition)),
-                "{what}: the copied `#` keeps the item's edition"
-            );
-
-            let as_const = super::as_const_impls(frame, with);
-            assert_eq!(
-                written(&as_const).matches(&format!("{copied}constimpl")).count(),
-                impls,
-                "{what}: {as_const}"
-            );
+            let impls = if name == "PartialEq" { 2 } else { 1 };
+            check.assert(&format!("{name} of the {edition:?} item"), frame, plain, again, impls);
         }
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let plain = super::from_derive(frame, span, adt_view(&parse), &map);
+        let again = super::from_derive(frame, span, adt_view(&parse), &map);
+        check.assert(&format!("From of the {edition:?} item"), frame, plain, again, 1);
+    }
+}
+
+/// What [`derived_impls_get_the_items_lint_and_stability_attributes`] checks of one derive:
+/// `copied`, the item's attributes as `input` has them, before each of its `impls` impls.
+struct Copied<'a> {
+    input: &'a tt::TopSubtree,
+    copied: &'a str,
+    edition: Edition,
+}
+
+impl Copied<'_> {
+    fn assert<'f>(
+        &self,
+        what: &str,
+        frame: &'f Frame,
+        plain: ExpandResult<tt::TopSubtree<&'f Frame>>,
+        again: ExpandResult<tt::TopSubtree<&'f Frame>>,
+        impls: usize,
+    ) {
+        let written =
+            |it: &tt::TopSubtree<&Frame>| it.to_string().split_whitespace().collect::<String>();
+        let copied = self.copied;
+        let with = again.map(|it| super::with_item_attrs(frame, self.input, it));
+        assert_eq!(plain.err, None, "{what}");
+        assert_eq!(with.err, None, "{what}");
+        let (plain, with) = (plain.value, with.value);
+        assert_eq!(written(&plain).matches("impl").count(), impls, "{what}: {plain}");
+        assert_eq!(written(&with), written(&plain).replace("impl", &format!("{copied}impl")), "{what}");
+        assert_eq!(
+            with.token_trees().first_span(),
+            self.input.token_trees().first_span(),
+            "{what}: the first copied `#` is the item's own"
+        );
+        assert_eq!(
+            with.token_trees().first_span().map(|it| it.ctx),
+            Some(SyntaxContext::root(self.edition)),
+            "{what}: the copied `#` keeps the item's edition"
+        );
+
+        let as_const = super::as_const_impls(frame, with);
+        assert_eq!(
+            written(&as_const).matches(&format!("{copied}constimpl")).count(),
+            impls,
+            "{what}: {as_const}"
+        );
     }
 }
 
@@ -858,4 +880,69 @@ fn coerce_pointee_substitutes_as_rustc() {
     let new = super::coerce_pointee_derive(frame, span, adt_view(&parse), &map);
     let err = new.err.expect("`?::Sized` is not `?Sized`");
     assert!(format!("{:?}", err.kind()).contains("requires `T` to be marked `?Sized`"), "{err:?}");
+}
+
+/// rustc's `create_derived_impl` and `coerce_pointee.rs`: every derived impl starts with
+/// `#[automatically_derived]`, at the derive's span, `CoercePointee`'s two (each in its own
+/// invisible group) included. Then come the item's copied attributes and a `derive_const` impl's
+/// `const`, in that order, as `BuiltinDeriveExpander::expand` applies them.
+#[test]
+fn derived_impls_start_with_automatically_derived() {
+    let span = call_site();
+    let text = "#[allow(dead_code)] #[repr(transparent)] struct S<T: ?Sized>(Box<T>);";
+    let marker = "#[automatically_derived]";
+    let written = |it: &tt::TopSubtree<&Frame>| it.to_string().split_whitespace().collect::<String>();
+    let (adt, map) = item(text);
+    let parse = parsed(text);
+    let input = item_input(&adt, &map);
+    let source = ItemSource(&adt, &map);
+    let check = |what: &str, plain: &tt::TopSubtree<&Frame>, marked: &tt::TopSubtree<&Frame>| {
+        let impls = written(plain).matches("impl").count();
+        assert!(impls >= 1, "{what}: {plain}");
+        assert_eq!(written(marked), written(plain).replace("impl", &format!("{marker}impl")), "{what}");
+        let mut at_span = 0;
+        each_leaf(marked.iter(), &mut |leaf| {
+            if let tt::Leaf::Ident(it) = leaf
+                && it.sym.as_str() == "automatically_derived"
+            {
+                assert_eq!(it.span, span, "{what}: `automatically_derived` at the derive's span");
+                at_span += 1;
+            }
+        });
+        assert_eq!(at_span, impls, "{what}");
+    };
+    let mut names = 0;
+    for (name, derive) in derives() {
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let (_, plain) = derive(frame, &source, adt_view(&parse), span);
+        let (_, again) = derive(frame, &source, adt_view(&parse), span);
+        assert_eq!(plain.err, None, "{name}");
+        let marked = super::with_automatically_derived(frame, span, again.value);
+        check(name, &plain.value, &marked);
+        let impls = written(&plain.value).matches("impl").count();
+        let full = super::as_const_impls(frame, super::with_item_attrs(frame, &input, marked));
+        assert_eq!(
+            written(&full).matches(&format!("{marker}#[allow(dead_code)]constimpl")).count(),
+            impls,
+            "{name}: {full}"
+        );
+        names += 1;
+    }
+    assert_eq!(names, 12);
+
+    let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+    let plain = super::from_derive(frame, span, adt_view(&parse), &map);
+    let again = super::from_derive(frame, span, adt_view(&parse), &map);
+    assert_eq!(plain.err, None, "From");
+    check("From", &plain.value, &super::with_automatically_derived(frame, span, again.value));
+
+    let plain = super::coerce_pointee_derive(frame, span, adt_view(&parse), &map);
+    let again = super::coerce_pointee_derive(frame, span, adt_view(&parse), &map);
+    assert_eq!(plain.err, None, "CoercePointee");
+    assert_eq!(written(&plain.value).matches("impl").count(), 2, "CoercePointee: {}", plain.value);
+    check(
+        "CoercePointee",
+        &plain.value,
+        &super::with_automatically_derived(frame, span, again.value),
+    );
 }

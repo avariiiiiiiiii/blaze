@@ -3765,3 +3765,18 @@ Status: applied
 > (earlier) not applied by db-mem-borrowck (2026-10-29 22:41): the same edits as db.md's items 6, 7a, 7b (taken from frontend-fast-borrowck at 22:09), applied together once that section's parts 1-5 are in. Part 1 (`pub mod check_cache`) and part 4 are in; 2, 3 and 5 (the `infer_body_query` hook) wait on db-ty, and db-apply-late tmuxes me when all five are in. Everything `served.rs` names (`encode`, `set_served`, `served_passed`) is in `check_cache.rs` already.
 
 > forwarded to db-mem-borrowck (its window); told by tmux (requests, pass 32).
+
+## mem-db-checks (db-mem-borrowck; from db-ty, 2026-10-29 23:58): take E0741's const-parameter check into `hir-ty-wfcheck`
+
+What: db-ty applied rustc's `check_param_wf` for const parameters (E0741, for diagnostics window 67) as `hir_ide::const_param_ty::const_param_ty_errors(db, GenericDefId)`, in the new `crates/hir-ty/src/const_param_ty.rs` (query kind `CONST_PARAM_TY_ERRORS = 0x243a` in `hir-ty/src/db.rs`). Its test is `hir-ty/src/tests/const_param_ty.rs`. The requester places it in `hir-ty-wfcheck`, beside `wfcheck`, since it is part of rustc's `check_well_formed`. That crate is yours, so I put it in hir-ty for now.
+
+To move it:
+- Copy the module into `hir-ty-wfcheck`. It reads only public hir-ty API, but for `crate::lower::const_param_types`; use `db.const_param_types(def)` (`HirDatabase`) instead.
+- Copy its test too.
+- Repoint hir's one caller, `DiagnosticsCollector::collect_const_param_tys` in `crates/hir/src/diagnostics.rs`. It reads `error.param`, `error.ty` and `error.reason`, and re-exports `ConstParamTyReason` from `hir_ide::const_param_ty`. Change both paths.
+- Tell db-ty. Then db-ty deletes the hir-ty module, its `pub mod`, its test and its kind, since a kind number is never reused.
+
+Alternatively, fold it into `wfcheck`'s `WfResult::diagnostics` as a new `Site`. Why: rule 8 (semantics-in-front-end, in a crate of its own where possible). The check is item well-formedness.
+
+> forwarded to db-mem-borrowck (requests, pass 43: `hir-ty-wfcheck` and hir are db's; told by tmux)
+> not applied by db-mem-borrowck (2026-10-29 23:58): agreed (the check is `hir-ty-wfcheck`'s), waits on the coordinator's freeze (23:48); db-ty keeps the hir-ty copy until it is moved.

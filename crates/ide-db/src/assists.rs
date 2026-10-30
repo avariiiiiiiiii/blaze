@@ -1,9 +1,7 @@
-//! This module defines the `Assist` data structure. The actual assist live in
-//! the `ide_assists` downstream crate. We want to define the data structures in
-//! this low-level crate though, because `ide_diagnostics` also need them
-//! (fixits for diagnostics and assists are the same thing under the hood). We
-//! want to compile `ide_assists` and `ide_diagnostics` in parallel though, so
-//! we pull the common definitions upstream, to this crate.
+//! This module defines the `Assist` data structure, rust-analyzer's shape of an
+//! edit offered at a place (an assist or a diagnostic's fix). Nothing in the
+//! workspace builds one now: blaze's diagnostics live in `blaze-diagnostics`,
+//! which writes its suggestions as rustc does.
 
 use std::str::FromStr;
 

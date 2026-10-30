@@ -43,7 +43,7 @@ use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind as _;
 use span::{AstIdMap, ErasedFileAstId, RealSpanMap, SyntaxContext};
 use syntax::{
-    AstPtr, FlatTree, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, ast as tag,
+    AstPtr, FlatTree, SyntaxKind, SyntaxNodePtr, TextRange, ast as tag,
     view::{self as ast, AstNode as _},
 };
 
@@ -128,10 +128,10 @@ impl<'db> BodyAnalysis<'db> {
 
     /// The tree every pointer is into, and its file: [`BodySyntax::root`] and its `file_id`,
     /// or the expansion's root and its macro file.
-    pub fn tree(&self) -> (SyntaxNode, HirFileId) {
+    pub fn tree(&self) -> (ast::Node<'_>, HirFileId) {
         let root = match self.syntax {
-            Some(syntax) => syntax.root(self.db),
-            None => self.file_id.parse_or_expand(self.db),
+            Some(syntax) => ast::Node::root(self.anchor.get_or_init(|| syntax.tree(self.db))),
+            None => self.file_id.root(self.db),
         };
         (root, self.file_id)
     }

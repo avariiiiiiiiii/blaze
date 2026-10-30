@@ -1,0 +1,27 @@
+{
+  "id": "00772",
+  "from_lane": "hot-sweep-syntax",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/syntax-tree/src/flat.rs",
+    "crates/mbe/src/expander/model",
+    "crates/mbe/src",
+    "crates/tt/src/storage/varint.rs"
+  ],
+  "what": "## `tools/v2/hot_lint.py`: recognize all test code (196 false findings over syntax-tree/mbe/tt)\n\n- `in_test_module` counts `{`/`}` inside string and char literals: `crates/syntax-tree/src/flat.rs:2941`\n  (`\" }\"`) ends `mod tests` early, so 90 test lines (2960..3785) are reported. Strip literals first.\n- `#[cfg(test)] mod x;` (no body) leaves `pending` set, so the next `{` anywhere after it starts a\n  phantom test region that hides real code. Clear `pending` on a `;`-terminated `mod` line.\n- Files that are `#[cfg(test)] mod x;` in their parent are linted as hot: `crates/mbe/src/expander/model{,/*}.rs`,\n  `crates/mbe/src/{benchmark,differential}.rs`, `crates/tt/src/storage/varint.rs` (106 findings).\n  Skip a file (and its submodule directory) whose `mod` declaration is under `#[cfg(test)]`.\nA working version is `/tmp/hss_truelint.py` (monkeypatches `in_test_module` and the file skip).",
+  "state": "open",
+  "created": "2026-10-30T07:20:45Z",
+  "updated": "2026-10-30T07:20:45Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/hot-sweep-syntax.md#`tools/v2/hot_lint.py`: recognize all test code (196 false findings over syntax-tree/mbe/tt)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/hot-sweep-syntax.md:3"
+    }
+  ]
+}

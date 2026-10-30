@@ -73,7 +73,7 @@ pub struct HirFrontend<'db> {
     units: Option<Units>,
     // dyn: `reached` once a level of the walk, `stopped` once a function compiled (2 ns
     // against its 50 to 200 µs), never per instruction
-    checks: Option<&'db dyn BodyChecks>,
+    checks: Option<&'db dyn BodyChecks>, // dyn: never per instruction, as above
     /// Set when the build's job is cancelled or gives way to another task.
     stop: Option<&'db AtomicBool>,
 }
@@ -295,7 +295,7 @@ impl<'db> HirFrontend<'db> {
             },
             _ => return Ok(units.any),
         };
-        of_origin.as_ref().copied().map_err(|it| it.to_string())
+        of_origin.as_ref().copied().map_err(|it| it.to_string()) // alloc: the error's message
     }
 
     /// A function that is not generic, as a root of the build: `main`, a test, an exported
@@ -313,6 +313,7 @@ impl<'db> HirFrontend<'db> {
     /// functions it calls: roots of a program with a `main`, and of a `cdylib`.
     pub fn allocator_shim(&self, krate: Crate) -> Result<Vec<HirInstance>, CodegenError> {
         self.with(|db, _| super::allocator::shim(db, krate, |func| self.root(func)))
+            // alloc: the error's message
             .map_err(|what| undescribed(&krate, None, format!("its allocator shim: {what}")))
     }
 
@@ -339,7 +340,7 @@ impl<'db> HirFrontend<'db> {
         let generic = generic(&instance.0);
         let origin = match crate_of(db, &instance.0) {
             Some(krate) if !generic => self.origin(db, krate),
-            _ => requester.clone(),
+            _ => *requester,
         };
         let args = match generic {
             true => self.shared_args(db, &instance.0, &origin),
@@ -354,6 +355,7 @@ impl<'db> HirFrontend<'db> {
         let symbol = symbol_of(db, &instance.0);
         let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
         let refs = refs::walk(db, instance, inlined, homes).map_err(fail)?;
+        // alloc: `Described::built_in` owns its list, which the memo's is borrowed from
         let built_in = refs::built_in(db, instance, inlined).map_err(fail)?.to_vec();
         Ok(Described {
             item,
@@ -483,6 +485,7 @@ impl<'db> HirFrontend<'db> {
             thread_local: held.thread_local,
             section: held.section,
             origin: self.origin(db, value.0.krate(db)),
+            // alloc: only an exported static, whose `DescribedStatic::symbol` owns its name
             symbol: exported_static(db, value.0).map(|it| it.as_str().to_owned()),
             refs: held.refs,
         })
@@ -573,7 +576,8 @@ pub(crate) fn inlined<'a>(
     hashes: &HashSource,
     (instance, inlined): (&'a HirInstance, bool),
 ) -> Result<Vec<CodeHash>, String> {
-    let mut found = Vec::new();
+    let mut found = Vec::new(); // alloc: the list returned, empty for nearly every instance
+    // alloc: inline, eight on the stack
     let mut queue: SmallVec<[&HirInstance; 8]> = smallvec![instance];
     let mut seen = FxHashSet::default();
     while let Some(at) = queue.pop() {
@@ -584,6 +588,7 @@ pub(crate) fn inlined<'a>(
         let refs = refs::walked(db, at, inlined)?;
         for &place in built_in {
             let Some(FrontRef::Function(callee)) = refs.get(place as usize) else {
+                // alloc: the error's message
                 return Err(format!("{at:?} builds in place {place}, which is no function"));
             };
             if seen.insert(callee) {
@@ -617,6 +622,7 @@ fn owner_item(db: &Db, owner: InferBodyId<'_>) -> Result<ItemId, String> {
             DefWithBodyId::VariantId(it) => ItemId::Adt(AdtId::EnumId(it.lookup(db).parent)),
         }),
         InferBodyId::AnonConstId(_) => {
+            // alloc: the error's message
             Err("a closure in an anonymous constant, which is no item".to_owned())
         }
     }
@@ -628,13 +634,16 @@ pub(super) fn item_of(db: &Db, kind: &Kind) -> Result<ItemId, String> {
     let (instance, env) = match kind {
         Kind::Code(instance, env) => (instance, env),
         Kind::Start(main) => return Ok(ItemId::Function(*main)),
+        // alloc: the error's message
         Kind::Asm(_) => return Err("an `asm!` function, which is no item".to_owned()),
         Kind::Allocator(_) => {
+            // alloc: the error's message
             return Err("a function of the allocator shim, which is no item".to_owned());
         }
     };
     let lang_items = || DbInterner::new_with(db, env.krate).lang_items();
     let lang = |item: Option<FunctionId>, name: &str| {
+        // alloc: the error's message
         item.map(ItemId::Function).ok_or_else(|| format!("no `{name}` lang item"))
     };
     match instance.def {
@@ -881,7 +890,9 @@ pub(super) fn symbol_of(db: &Db, kind: &Kind) -> Option<String> {
             }
             _ => None,
         },
+        // alloc: once per program, the C `main`; `Described::symbol` owns its name
         Kind::Start(_) => Some(crate::Target::current().entry().0.to_owned()),
+        // alloc: one of the shim's few entries, once per program
         Kind::Allocator(forward) => Some(forward.symbol.to_owned()),
         Kind::Asm(_) => None,
     }

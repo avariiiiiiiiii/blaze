@@ -1,0 +1,23 @@
+{
+  "id": "00275",
+  "from_lane": "codegen-mir-prov-shim",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## 5. Coordinator: `tools/v2/hot_lint.py` with `\"crates\"`\n\n`'{\"root\": \".\", \"crates\": [\"hir-ty-mir\"]}'` fails before linting:\n`typed_input: crates has a type it does not read: list[str]`. Without `crates` it runs.\n\n> forwarded to the coordinator: `tools/` is its; on requests' coordinator list.",
+  "state": "open",
+  "created": "2026-10-30T02:54:43Z",
+  "updated": "2026-10-30T02:54:43Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-mir-prov-shim.md#5. Coordinator: `tools/v2/hot_lint.py` with `\"crates\"`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-mir-prov-shim.md:89"
+    }
+  ]
+}

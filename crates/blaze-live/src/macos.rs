@@ -6,7 +6,7 @@
 //! The jumps and statics are written so with every other thread stopped ([`stop`],
 //! `crate::apply`).
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "v1's patcher: maps executable memory and writes jumps into running code")]
 
 mod stop;
 

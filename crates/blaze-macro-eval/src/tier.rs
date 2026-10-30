@@ -30,6 +30,7 @@
 use blaze_ids::ContentId;
 
 pub(crate) mod bind;
+pub(crate) mod confine;
 pub(crate) mod heap;
 pub(crate) mod memory;
 pub(crate) mod region;
@@ -67,10 +68,9 @@ pub(crate) enum Tier {
 pub(crate) struct Policy {
     /// Runs in the evaluator before a crate runs compiled.
     pub(crate) warm: u64,
-    /// Whether this blaze runs the compiled tier. It doesn't yet: the confining pass and the
-    /// loader wait on the IR of an instance from hir-ty-codegen and the runner's unwinder on
-    /// stencil's frame offsets (requests `fastcompile-macros-tier 1` and `2` in
-    /// `v2/requests/fastcompile.md`), so every expansion runs in the evaluator.
+    /// Whether this blaze runs the compiled tier. It doesn't yet: the loader and the runner
+    /// (machine stack, shim stubs, unwinder, fault handler) are not written, so every
+    /// expansion runs in the evaluator.
     pub(crate) compiled: bool,
 }
 
@@ -94,9 +94,10 @@ pub(crate) fn choose(code: ContentId, runs: u64) -> Tier {
 /// starting from the statics `preset`, giving what the last gave and what all of them did.
 ///
 /// The image is made first: the crate's reached functions lowered to Cranelift IR, confined,
-/// compiled by copy-and-patch and loaded. hir-ty-codegen gives no caller the IR of an
-/// instance yet (request `fastcompile-macros-tier 1`), so this stops there, saying so. The
-/// policy never sends an expansion here while [`Policy::compiled`] is false.
+/// compiled by copy-and-patch and loaded. hir-ty-codegen hands out the IR and [`confine`]
+/// confines it, but nothing loads the image or runs it on its own machine stack yet, so this
+/// stops there, saying so. The policy never sends an expansion here while
+/// [`Policy::compiled`] is false.
 pub(crate) fn run(
     _db: &base_db::Db,
     _code: ContentId,
@@ -108,8 +109,8 @@ pub(crate) fn run(
         // alloc: error path
         return Err(crate::guest::Stop("was given nothing to expand".to_owned()));
     }
-    const NO_IR: &str = "can't be compiled for the compiled tier: hir-ty-codegen gives no caller \
-                         the Cranelift IR of an instance to confine (request fastcompile-macros-tier 1)";
+    const NO_RUNNER: &str = "can't run on the compiled tier: blaze has no loader for a confined image \
+                             and no runner for its code yet";
     // alloc: error path
-    Err(crate::guest::Stop(NO_IR.to_owned()))
+    Err(crate::guest::Stop(NO_RUNNER.to_owned()))
 }

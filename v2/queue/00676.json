@@ -1,0 +1,26 @@
+{
+  "id": "00676",
+  "from_lane": "codegen",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/design/unsafe.md",
+    "fuzz/targets/codegen_blob.rs",
+    "crates/blaze-codegen/src/blob.rs",
+    "docs/v2/plan/reference/crates.md"
+  ],
+  "what": "## From codegen (lead, 2026-10-29): to safety, a fuzz target for the template blob (`docs/v2/plan/design/unsafe.md` \"Fuzzing\")\n\nWhat: `fuzz/targets/codegen_blob.rs`, feeding arbitrary bytes to each decoder of\n`crates/blaze-codegen/src/blob.rs`: `decode`, `decode_static`, `decode_masked`, and\n`decode_view(bytes, &frame)` with a fresh `Frame`. Each gives `Err` or a value; for a value, check\nthat decoding its encoding (`encode`, `encode_static`, `encode_masked`) gives it again (the\nformat need not be canonical, so not \"its encoding is the input\"), and for `decode_view` that it\nagrees with `decode` of the same bytes.\nWhy: the blob is read from the store and the remote cache. The store verifies each value against\nits key before the decoder sees it (`blaze-cas` `Reader::get`), and the decoders are safe Rust,\nbut a parser of bytes from disk or the network gets a fuzz target by the plan. All four functions\nare `pub` already; nothing in codegen changes.\n\n> forwarded to the coordinator: `fuzz/` and `blaze-fuzz` are on the coordinator's line of `docs/v2/plan/reference/crates.md`, and no safety window runs; on requests' coordinator list (requests, pass 32).",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen.md#From codegen (lead, 2026-10-29): to safety, a fuzz target for the template blob (`docs/v2/plan/design/unsafe.md` \"Fuzzing\")",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen.md:10221"
+    }
+  ]
+}

@@ -194,7 +194,7 @@ impl<'db> StackFrame<'db> {
         callee: Option<FunctionId>,
     ) -> Self {
         let at = locals.body.start_block;
-        StackFrame { locals, then, drops: Vec::new(), at, catch: None, prev_stack_ptr, span, callee }
+        StackFrame { locals, then, drops: Vec::new(), at, catch: None, prev_stack_ptr, span, callee } // alloc: empty; a drop fills it from `spare_drops`
     }
 }
 
@@ -298,6 +298,24 @@ fn size_class(size: usize) -> usize {
     size.max(8).checked_next_power_of_two().unwrap_or(usize::MAX)
 }
 
+/// The layout of one variant of an ADT ([`Evaluator::layout_of_variant`]): the type's own,
+/// or one made for a variant of an enum with several.
+enum VariantLayout {
+    Shared(Arc<Layout>),
+    Made(Layout),
+}
+
+impl std::ops::Deref for VariantLayout {
+    type Target = Layout;
+
+    fn deref(&self) -> &Layout {
+        match self {
+            VariantLayout::Shared(it) => it,
+            VariantLayout::Made(it) => it,
+        }
+    }
+}
+
 /// The provenances the machine gave the evaluation's pointers, each once, by [`ProvId`].
 struct Provs<P> {
     list: Vec<P>,
@@ -306,7 +324,7 @@ struct Provs<P> {
 
 impl<P> Default for Provs<P> {
     fn default() -> Self {
-        Provs { list: Vec::new(), index: FxHashMap::default() }
+        Provs { list: Vec::new(), index: FxHashMap::default() } // alloc: empty, allocates nothing
     }
 }
 
@@ -898,24 +916,24 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             stack: vec![0],
             // alloc: one evaluation's stack and heap, reused across its calls
             heap: vec![0],
-            stack_allocations: Vec::new(),
+            stack_allocations: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             heap_blocks: BTreeMap::new(),
             free_blocks: FxHashMap::default(),
             promoted: FxHashMap::default(),
             drop_glue: FxHashMap::default(),
             constants: FxHashMap::default(),
-            code_stack: vec![],
-            spare_code_stacks: Vec::new(),
-            spare_args: Vec::new(),
-            spare_drops: Vec::new(),
+            code_stack: vec![], // alloc: empty, allocates nothing; one per evaluation
+            spare_code_stacks: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
+            spare_args: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
+            spare_drops: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             running: None,
             body_running: None,
-            threads: Vec::new(),
+            threads: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             thread: 0,
             nesting: 0,
             waiting: None,
             yielded: false,
-            at_exit: Vec::new(),
+            at_exit: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             thread_statics: FxHashMap::default(),
             process: shim::Process::default(),
             clock: 0,
@@ -923,15 +941,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             unwinding: None,
             call_then: Then::Nested,
             pending: None,
-            moved_args: Vec::new(),
+            moved_args: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             escaped: false,
             panic_handler: std::cell::OnceCell::new(),
             vtable_map: VTableMap::default(),
             thread_local_storage: shim::TlsData::default(),
             static_locations: Default::default(),
-            static_memory: Vec::new(),
+            static_memory: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             read_statics: None,
-            unevaluated_statics: Vec::new(),
+            unevaluated_statics: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             missing_static: Cell::new(None),
             in_static: matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(_))),
             db,
@@ -941,9 +959,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 krate: crate_id,
             }),
             crate_id,
-            stdout: vec![],
-            stderr: vec![],
-            type_ids: Vec::new(),
+            stdout: vec![], // alloc: empty, allocates nothing; one per evaluation
+            stderr: vec![], // alloc: empty, allocates nothing; one per evaluation
+            type_ids: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
             assert_placeholder_ty_is_unused,
             stack_depth_limit,
             limits_frames,
@@ -1986,13 +2004,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         let ls = from_bytes!(usize, self.read_scalar(lv.slice(ps..ps * 2))?);
                         let rs = from_bytes!(usize, self.read_scalar(rv.slice(ps..ps * 2))?);
                         if ls != rs {
-                            break 'binary_op Owned(smallvec![0]);
+                            break 'binary_op Owned(smallvec![0]); // alloc: inline `OwnedBytes`, no heap
                         }
                         let la = self.read_pointer(lv.addr)?.aligned(element_align);
                         let ra = self.read_pointer(rv.addr)?.aligned(element_align);
                         let lc = self.read_scalar(Interval::new(la, ls * element))?;
                         let rc = self.read_scalar(Interval::new(ra, ls * element))?;
-                        break 'binary_op Owned(smallvec![u8::from(lc == rc)]);
+                        break 'binary_op Owned(smallvec![u8::from(lc == rc)]); // alloc: inline `OwnedBytes`, no heap
                     } else {
                         self.size_align_of_sized(ty, locals, "operand of binary op")?
                     };
@@ -2015,7 +2033,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 | BinOp::Eq
                                 | BinOp::Ne => {
                                     let r = op.run_compare(l, r) as u8;
-                                    Owned(smallvec![r])
+                                    Owned(smallvec![r]) // alloc: inline `OwnedBytes`, no heap
                                 }
                                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
@@ -2046,7 +2064,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 | BinOp::Eq
                                 | BinOp::Ne => {
                                     let r = op.run_compare(l, r) as u8;
-                                    Owned(smallvec![r])
+                                    Owned(smallvec![r]) // alloc: inline `OwnedBytes`, no heap
                                 }
                                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
@@ -2078,7 +2096,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 | BinOp::Eq
                                 | BinOp::Ne => {
                                     let r = op.run_compare(l, r) as u8;
-                                    Owned(smallvec![r])
+                                    Owned(smallvec![r]) // alloc: inline `OwnedBytes`, no heap
                                 }
                                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
@@ -2110,7 +2128,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 | BinOp::Eq
                                 | BinOp::Ne => {
                                     let r = op.run_compare(l, r) as u8;
-                                    Owned(smallvec![r])
+                                    Owned(smallvec![r]) // alloc: inline `OwnedBytes`, no heap
                                 }
                                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
@@ -2136,7 +2154,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     match op {
                         BinOp::Ge | BinOp::Gt | BinOp::Le | BinOp::Lt | BinOp::Eq | BinOp::Ne => {
                             let r = op.run_compare(l128, r128) as u8;
-                            Owned(smallvec![r])
+                            Owned(smallvec![r]) // alloc: inline `OwnedBytes`, no heap
                         }
                         BinOp::BitAnd
                         | BinOp::BitOr
@@ -2245,7 +2263,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 let value = self.eval_operand(it, locals)?;
                 let (val, shadow) = self.read_shadowed(value.addr, value.size)?;
-                let bytes = val.iter().copied().cycle().take(len * val.len()).collect();
+                let bytes = val.iter().copied().cycle().take(len * val.len()).collect(); // alloc: the repeated value, sized once from the exact `take` hint
                 if !M::CHECKS {
                     return Ok(Owned(bytes));
                 }
@@ -2756,7 +2774,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         it: VariantId,
         subst: GenericArgs<'db>,
         locals: &Locals<'db>,
-    ) -> Result<'db, (usize, Arc<Layout>, Option<(usize, usize, i128)>)> {
+    ) -> Result<'db, (usize, VariantLayout, Option<(usize, usize, i128)>)> {
         let adt = it.adt_id(self.db);
         if let Some(f) = locals.body.owner.as_variant()
             && let VariantId::EnumVariantId(it) = it
@@ -2766,11 +2784,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             // Computing the exact size of enums require resolving the enum discriminants. In order to prevent loops (and
             // infinite sized type errors) we use a dummy layout
             let i = self.const_eval_discriminant(it)?;
-            return Ok((16, self.layout(Ty::new_empty_tuple(self.interner()))?, Some((0, 16, i))));
+            let layout = self.layout(Ty::new_empty_tuple(self.interner()))?;
+            return Ok((16, VariantLayout::Shared(layout), Some((0, 16, i))));
         }
         let layout = self.layout_adt(adt, subst)?;
         Ok(match &layout.variants {
-            Variants::Single { .. } | Variants::Empty => (layout.size.bytes_usize(), layout, None),
+            Variants::Single { .. } | Variants::Empty => {
+                (layout.size.bytes_usize(), VariantLayout::Shared(layout), None)
+            }
             Variants::Multiple { tag, tag_encoding, .. } => {
                 let enum_variant_id = match it {
                     VariantId::EnumVariantId(it) => it,
@@ -2794,7 +2815,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 (
                     layout.size.bytes_usize(),
-                    Arc::new(variant_layout),
+                    VariantLayout::Made(variant_layout),
                     if have_tag {
                         Some((
                             layout.fields.offset(0).bytes_usize(),
@@ -2815,8 +2836,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         variant_layout: &Layout,
         tag: Option<(usize, usize, i128)>,
         values: impl Iterator<Item = IntervalOrOwned>,
-    ) -> Result<'db, Vec<u8>> {
-        let mut result = vec![0; size];
+    ) -> Result<'db, OwnedBytes> {
+        let mut result: OwnedBytes = smallvec![0; size]; // alloc: inline for a value up to 16 bytes
         if let Some((offset, size, value)) = tag {
             match result.get_mut(offset..offset + size) {
                 Some(it) => it.copy_from_slice(&value.to_le_bytes()[0..size]),
@@ -2864,7 +2885,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         tag: Option<(usize, usize, i128)>,
         fields: impl Iterator<Item = (usize, Interval)>,
     ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
-        let mut result: OwnedBytes = smallvec![0; size];
+        let mut result: OwnedBytes = smallvec![0; size]; // alloc: inline for a value up to 16 bytes
         let mut shadow = M::Shadow::default();
         if let Some((offset, tag_size, value)) = tag {
             match result.get_mut(offset..offset + tag_size) {
@@ -3645,7 +3666,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, (&'b [u8], M::Shadow)> {
         Ok(match value {
             IntervalOrOwned::Owned(bytes) => (bytes, M::Shadow::init(bytes.len())),
-            IntervalOrOwned::Shadowed(bytes, shadow) => (bytes, shadow.clone()),
+            IntervalOrOwned::Shadowed(bytes, shadow) => (bytes, shadow.clone()), // clone: `()` without checks, an inline `SmallVec` of pointer pieces with them
             IntervalOrOwned::Borrowed(it) => self.read_shadowed(it.addr, it.size)?,
         })
     }
@@ -3706,7 +3727,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let bytes = threads::region(&self.stack, &self.threads, running, src_thread)
                         .and_then(|it| it.get(src..src + r.size))
                         .ok_or_else(oob)?
-                        .to_vec();
+                        .to_vec(); // alloc: a move between two threads' stacks, through a pointer into another thread's stack
                     threads::region_mut(&mut self.stack, &mut self.threads, running, dst_thread)
                         .and_then(|it| it.get_mut(dst..dst + r.size))
                         .ok_or_else(oob)?
@@ -4046,17 +4067,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             TyKind::Array(inner, _) | TyKind::Pat(inner, _) => self.holds_no_pointer(inner),
             TyKind::Tuple(fields) => fields.iter().all(|it| self.holds_no_pointer(it)),
             TyKind::Adt(adt, subst) => {
-                let variants: Vec<VariantId> = match adt.def_id() {
-                    AdtId::StructId(it) => vec![it.into()],
-                    AdtId::UnionId(it) => vec![it.into()],
-                    AdtId::EnumId(it) => it
-                        .enum_variants(self.db)
-                        .variants
-                        .values()
-                        .map(|&(v, _)| v.into())
-                        .collect(),
+                let mut variants = match adt.def_id() {
+                    AdtId::StructId(it) => Either::Left(iter::once(VariantId::from(it))),
+                    AdtId::UnionId(it) => Either::Left(iter::once(VariantId::from(it))),
+                    AdtId::EnumId(it) => Either::Right(
+                        it.enum_variants(self.db).variants.values().map(|&(v, _)| VariantId::from(v)),
+                    ),
                 };
-                variants.into_iter().all(|variant| {
+                variants.all(|variant| {
                     self.db.field_types(variant).iter().all(|(_, field)| {
                         let field = field.ty().instantiate(self.interner(), subst).skip_norm_wip();
                         self.holds_no_pointer(field)
@@ -4091,17 +4109,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 if self.lang_items().TypeId.is_some_and(|it| adt.def_id() == AdtId::StructId(it)) {
                     return false;
                 }
-                let variants: Vec<VariantId> = match adt.def_id() {
-                    AdtId::StructId(it) => vec![it.into()],
-                    AdtId::UnionId(it) => vec![it.into()],
-                    AdtId::EnumId(it) => it
-                        .enum_variants(self.db)
-                        .variants
-                        .values()
-                        .map(|&(v, _)| v.into())
-                        .collect(),
+                let mut variants = match adt.def_id() {
+                    AdtId::StructId(it) => Either::Left(iter::once(VariantId::from(it))),
+                    AdtId::UnionId(it) => Either::Left(iter::once(VariantId::from(it))),
+                    AdtId::EnumId(it) => Either::Right(
+                        it.enum_variants(self.db).variants.values().map(|&(v, _)| VariantId::from(v)),
+                    ),
                 };
-                variants.into_iter().all(|variant| {
+                variants.all(|variant| {
                     self.db.field_types(variant).iter().all(|(_, field)| {
                         let field = field.ty().instantiate(self.interner(), subst).skip_norm_wip();
                         self.holds_no_type_id(field, seen)
@@ -4177,10 +4192,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             if addr.is_of_nothing(size) {
                                 return Ok(());
                             }
-                            let bytes = this.read_memory(addr, size)?.to_vec();
-                            mm.memory.insert(addr_usize, &bytes);
+                            let bytes = this.read_memory(addr, size)?;
+                            mm.memory.insert(addr_usize, bytes);
                             this.note_align(mm, addr_usize);
-                            rec(this, &bytes, t, locals, mm, stack_depth_limit - 1)?;
+                            rec(this, bytes, t, locals, mm, stack_depth_limit - 1)?;
                         }
                         None => {
                             let mut check_inner = None;
@@ -4396,8 +4411,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let Ok(memory) = this.read_memory(Address::from_usize(start), size) else {
                 return Ok(());
             };
-            let memory = memory.to_vec();
-            mm.memory.insert(start, &memory);
+            mm.memory.insert(start, memory);
             mm.note_align(start, align);
             for word in memory.chunks_exact(this.ptr_size()) {
                 let inner = from_bytes!(usize, word);
@@ -4477,7 +4491,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     None => {
                         let bytes = self.peek_memory(addr, my_size)?;
                         let (current, metadata) = bytes.split_at(my_size / 2);
-                        let metadata = metadata.to_vec();
+                        let metadata = OwnedBytes::from_slice(metadata);
                         let current = from_bytes!(usize, current);
                         let patched = match patch_map.get(&current) {
                             Some(it) => {
@@ -4724,9 +4738,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             true => self.pointer_value(closure_addr, None)?,
             false => IntervalOrOwned::Borrowed(closure_data),
         };
-        let arg_values: Vec<IntervalOrOwned<M::Shadow>> = iter::once(first)
-            .chain(args.iter().map(|it| IntervalOrOwned::Borrowed(it.interval)))
-            .collect();
+        let arg_values =
+            iter::once(first).chain(args.iter().map(|it| IntervalOrOwned::Borrowed(it.interval)));
         // A `Fn` or `FnMut` closure called by value through `FnOnce::call_once` is dropped
         // after the call, as rustc's `ClosureOnceShim` does: nothing else owns it then. One
         // whose body takes it by value dropped it itself.
@@ -4734,7 +4747,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if then == Then::Nested {
             let mark = self.stack.len();
             let interval =
-                self.interpret_mir(mir_body, arg_values.into_iter(), None).map_err(|e| {
+                self.interpret_mir(mir_body, arg_values, None).map_err(|e| {
                     MirEvalError::InFunction(
                         // alloc: error path
                         Box::new(e),
@@ -4751,7 +4764,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let (mut callee_locals, prev_stack_ptr) =
             self.create_locals_for_body(mir_body, Some(destination))?;
-        self.enter_frame(mir_body, &mut callee_locals, arg_values.into_iter(), true)?;
+        self.enter_frame(mir_body, &mut callee_locals, arg_values, true)?;
         let mut frame =
             StackFrame::new(callee_locals, then, prev_stack_ptr, (span, locals.body.owner), None);
         if let Some(closure_ty) = dropped {
@@ -4857,7 +4870,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 MirEvalError::InFunction(
                     // alloc: error path
                     Box::new(MirEvalError::MirLowerError(imp, e)),
-                    vec![(Either::Left(imp), span, locals.body.owner)],
+                    vec![(Either::Left(imp), span, locals.body.owner)], // alloc: error path
                 )
             })?;
             MirOrDynIndex::Mir(mir_body)
@@ -4947,12 +4960,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 // `&T`, `&mut T`, `Box<T>`, `Rc<T>`, `Arc<T>`, and `Pin<P>` where `P` is one of possible receivers,
                 // the vtable is exactly in the `[ptr_size..2*ptr_size]` bytes. So we can use it without branching on
                 // the type.
-                let first_arg = arg_bytes.clone().next().unwrap();
+                let first_arg = arg_bytes.clone().next().unwrap(); // clone: a slice iterator
                 let first_arg = first_arg.get(self)?;
                 let ty = self
                     .vtable_map
                     .ty_of_bytes(&first_arg[self.ptr_size()..self.ptr_size() * 2])?;
-                let mut args_for_target = args.to_vec();
+                let mut args_for_target: SmallVec<[IntervalAndTy<'db>; 4]> =
+                    SmallVec::from_slice(args);
                 args_for_target[0] = IntervalAndTy {
                     interval: args_for_target[0].interval.slice(0..self.ptr_size()),
                     ty,
@@ -5219,8 +5233,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, Option<StackFrame<'db>>> {
         let (addr, ty, metadata) = self.place_addr_and_ty_and_metadata(place, locals)?;
         let metadata = match metadata {
-            Some(it) => it.get(self)?.to_vec(),
-            None => vec![],
+            Some(it) => OwnedBytes::from_slice(it.get(self)?),
+            None => OwnedBytes::new(),
         };
         self.run_drop_glue(ty, locals, addr, &metadata, span, then)
     }

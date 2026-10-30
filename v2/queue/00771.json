@@ -1,0 +1,23 @@
+{
+  "id": "00771",
+  "from_lane": "hot-sweep-mir",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## `tools/v2/hot_lint.py`: skip test modules declared out of line\n\nWhat: in `in_test_module`/`main`, treat a file as test code when its parent file declares it as\n`#[cfg(test)] mod <name>;` (attribute on the line before a `mod <name>;` with no braces), and\nwhen the file is only reached from a `tests/` target through `#[path = ...]`.\n\nWhere: `tools/v2/hot_lint.py`.\n\nWhy: 118 of the 283 findings over hir-ty-mir, hir-def and hir-expand are test code the lint\nreports as hot: `hir-def/src/macro_expansion_tests/**` (`#[cfg(test)] mod macro_expansion_tests;`\nin `hir-def/src/lib.rs`), `hir-expand/src/builtin/derive_macro/reference.rs`\n(`#[cfg(test)] mod reference;` in `derive_macro.rs`) and\n`hir-ty-mir/src/mir/optimize/inline/fixtures.rs` (`#[path]` from `hir-ty-mir/tests/mir/main.rs`).\nThe brief says test code is not ours to change, so the lint can't reach zero over these crates\nwithout this.",
+  "state": "open",
+  "created": "2026-10-30T07:19:59Z",
+  "updated": "2026-10-30T07:19:59Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/hot-sweep-mir.md#`tools/v2/hot_lint.py`: skip test modules declared out of line",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/hot-sweep-mir.md:3"
+    }
+  ]
+}

@@ -4,7 +4,7 @@
 //! anything reaches them; its jumps and statics are written over the image with every other
 //! thread suspended ([`stop`], `crate::apply`).
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "v1's patcher: maps executable memory and writes jumps into running code")]
 
 mod stop;
 

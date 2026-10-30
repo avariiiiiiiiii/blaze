@@ -552,19 +552,29 @@ impl<V: Clone + Send + Sync + 'static> Drop for Linked<'_, V> {
             if let Some(entry) = shard.get_mut(&self.key) {
                 let runner = entry.runner;
                 let mut link: *mut *const Waiter<V> = &raw mut entry.waiters.0;
-                // SAFETY: under the shard's lock every waiter of the list is linked and in
-                // place, and its `next` is read and written only under the lock.
-                unsafe {
-                    while !(*link).is_null() {
-                        if *link == me {
-                            *link = *(*me).next.get();
-                            if let Some(mine) = published(self.waiter.task) {
-                                _ = mine.on.compare_exchange(runner, 0, Ordering::Relaxed, Ordering::Relaxed);
-                            }
-                            return;
-                        }
-                        link = (**link).next.get();
+                loop {
+                    // SAFETY: `link` is the entry's head or the `next` of a waiter of its list;
+                    // under the shard's lock, held here, every waiter of the list is linked and in
+                    // place, and its `next` is read and written only under the lock. A waiter
+                    // that left its place while linked would make this a use after free.
+                    let at = unsafe { *link };
+                    if at.is_null() {
+                        break;
                     }
+                    if at == me {
+                        // SAFETY: `me` is this waiter, in place for as long as `self` lives, and
+                        // its `next` is read only under the lock.
+                        let next = unsafe { *self.waiter.next.get() };
+                        // SAFETY: as for the read of `link` above: it is written only under the
+                        // lock.
+                        unsafe { *link = next };
+                        if let Some(mine) = published(self.waiter.task) {
+                            _ = mine.on.compare_exchange(runner, 0, Ordering::Relaxed, Ordering::Relaxed);
+                        }
+                        return;
+                    }
+                    // SAFETY: `at` is a waiter of the list, in place under the lock (as above).
+                    link = unsafe { &*at }.next.get();
                 }
             }
         }
@@ -607,21 +617,23 @@ impl<V: Clone + Send + Sync + 'static> Ending<'_, V> {
         }
         let state = if value.is_some() { DONE } else { GAVE_WAY };
         let mut at = waiters.0;
-        while !at.is_null() {
-            // SAFETY: as above: the waiter is in place until its state is stored, and everything
-            // read of it is read before that. The store's `&self` outlives the store itself
-            // only as `std`'s own wake-ups' do (rust-lang/rust#55005): nothing is read after.
-            let thread = unsafe {
-                let next = *(*at).next.get();
-                // clone: a reference count, so the waiter is woken after it may have left
-                let thread = (*at).thread.clone();
-                if let Some(value) = value {
-                    *(*at).value.get() = Some(value.clone()); // clone: each waiter's own value
-                }
-                (*at).state.store(state, Ordering::Release);
-                at = next;
-                thread
-            };
+        // SAFETY: as above: the waiter is in place until its state is stored, and everything read
+        // of it is read before that. `waiter` is not used after the store, whose `&self` outlives
+        // the store itself only as `std`'s own wake-ups' do (rust-lang/rust#55005).
+        while let Some(waiter) = unsafe { at.as_ref() } {
+            // SAFETY: as above; no other thread writes a `next` of a list taken out.
+            let next = unsafe { *waiter.next.get() };
+            // clone: a reference count, so the waiter is woken after it may have left
+            let thread = waiter.thread.clone();
+            if let Some(value) = value {
+                // clone: each waiter's own value
+                let value = Some(value.clone());
+                // SAFETY: the waiter reads `value` only once it loaded `DONE`, stored below, and
+                // nobody else writes it.
+                unsafe { *waiter.value.get() = value };
+            }
+            waiter.state.store(state, Ordering::Release);
+            at = next;
             thread.unpark();
         }
     }

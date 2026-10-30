@@ -250,9 +250,12 @@ impl Job {
         /// this is its one run (it gives the cell back).
         unsafe fn run<F: FnOnce()>(header: NonNull<Header>) {
             let at = header.cast::<Placed<F>>().as_ptr();
-            // SAFETY: `at` is the live `Placed<F>` that `erase` wrote, run once: its cell and
-            // closure are each read out once, and the rest of it needs no drop.
-            let (cell, f) = unsafe { ((&raw const (*at).cell).read(), (&raw const (*at).f).read()) };
+            // SAFETY: `at` is the live `Placed<F>` that `erase` wrote, run once: its cell is read
+            // out once here, and the rest of it needs no drop. Read twice, the cell would be
+            // given back twice.
+            let cell = unsafe { (&raw const (*at).cell).read() };
+            // SAFETY: as above, for the closure: read out once, so it runs and drops once.
+            let f = unsafe { (&raw const (*at).f).read() };
             give_back(cell);
             f();
         }
@@ -541,8 +544,10 @@ impl Pool {
         let mut threads = Vec::with_capacity(deques.len());
         let mut failed = None;
         for (index, deque) in deques.into_iter().enumerate() {
+            // clone: setup, once per worker thread.
             let (cpu, shared, ready) = (topology.cpus[index], shared.clone(), ready_tx.clone());
             let spawned = thread::Builder::new()
+                // alloc: setup, once per worker thread.
                 .name(format!("blaze-work-{index}"))
                 .stack_size(STACK)
                 .spawn(move || {

@@ -364,18 +364,54 @@ const NO_PAIR: u32 = u32::MAX;
 #[derive(Clone)]
 pub(crate) struct Pairs {
     given: u32,
+    /// How many the lazy placer gave, from the top: its `n`th is `capacity - 1 - n`
+    /// ([`crate::counter::placed_pair`]).
+    placed: u32,
     /// Per id shard ([`Symbols::split_id`]), [`NO_PAIR`] where none.
     of: [CowVec<u32>; SHARDS],
 }
 
 impl Pairs {
     fn new() -> Pairs {
-        Pairs { given: 0, of: std::array::from_fn(|_| CowVec::default()) }
+        Pairs { given: 0, placed: 0, of: std::array::from_fn(|_| CowVec::default()) }
     }
 
-    /// How many are given out: the next one's index.
+    /// How many are given out from the bottom: the next one's index.
     pub fn given(&self) -> u32 {
         self.given
+    }
+
+    /// How many the lazy placer gave out from the top.
+    pub fn placed(&self) -> u32 {
+        self.placed
+    }
+
+    /// Gives `id` the next pair from the top of `capacity`, which the caller checked is there;
+    /// `id` has none.
+    pub fn give_placed(&mut self, id: IdNo, capacity: u32) -> u32 {
+        let pair = capacity - 1 - self.placed;
+        let (shard, at) = Symbols::split_id(id);
+        self.of[shard].set(at, pair, || NO_PAIR);
+        self.placed += 1;
+        pair
+    }
+
+    /// Takes the placer's pair `pair` of `id` from `from`, a later state of the image, into
+    /// this one, staged before the placer gave it. `false` when this state gave `id` another,
+    /// or gave from the bottom of `capacity` into what the placer gave from the top.
+    pub fn carry(&mut self, id: IdNo, pair: u32, from: &Pairs, capacity: u32) -> bool {
+        if u64::from(self.given) + u64::from(from.placed) > u64::from(capacity) {
+            return false;
+        }
+        match self.of(id) {
+            Some(it) => it == pair,
+            None => {
+                let (shard, at) = Symbols::split_id(id);
+                self.of[shard].set(at, pair, || NO_PAIR);
+                self.placed = self.placed.max(from.placed);
+                true
+            }
+        }
     }
 
     pub fn of(&self, id: IdNo) -> Option<u32> {

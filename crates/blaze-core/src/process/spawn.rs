@@ -3,7 +3,12 @@
 //! until the child runs its program (`CLONE_VM | CLONE_VFORK`, as `posix_spawn` does), so a
 //! spawn costs the same however large the warm daemon is, where a `fork` copies its page
 //! tables; the child joins its cgroup before its program runs, and the pidfd comes back with
-//! the pid. On macOS `posix_spawn`. Elsewhere std's spawn.
+//! the pid. On macOS `posix_spawn`, so no code of blaze's runs in the child. Elsewhere std's
+//! spawn. What the Linux child may call, and why each is safe there, is on `run`.
+//!
+//! Why unsafe: nothing safe makes a `clone` whose child runs code, and std's `Command` forks
+//! (or `posix_spawn`s with no cgroup join and no pidfd from the same call): a page-table copy
+//! per spawn of a large daemon, or a second step that races the child.
 //!
 //! A spawn whose exec meets `ETXTBSY` is made again, from the parent, of the same program
 //! ([`while_busy`], waiting as [`crate::busy`] says). Past its bound the spawn fails, naming the
@@ -339,14 +344,21 @@ fn clone(plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t,
     blaze_mem::scratch::with_bytes(|stack| {
         // alloc: once per thread that spawns, kept: the child's stack, its room unwritten.
         stack.reserve(STACK);
-        clone_on(stack.as_mut_ptr(), plan, fds, procs)
+        // SAFETY: `reserve` made the capacity at least `STACK` bytes, so `STACK` bytes from
+        // `as_mut_ptr()` are in the allocation, and the thread's byte buffer is lent to this
+        // closure alone until it returns, after `clone_on` has.
+        unsafe { clone_on(stack.as_mut_ptr(), plan, fds, procs) }
     })
 }
 
-/// As [`clone`], the child on the `STACK` bytes at `stack`, which nothing else uses until this
-/// returns.
+/// As [`clone`], the child on the `STACK` bytes at `stack`.
+///
+/// # Safety
+///
+/// `stack` is the start of at least `STACK` writable bytes, which nothing else reads or writes
+/// until this returns; the child's frames go there while the calling thread waits.
 #[cfg(target_os = "linux")]
-fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t, OwnedFd)> {
+unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t, OwnedFd)> {
     // It grows down from its end, which both ABIs (x86-64, AArch64) want on 16 bytes.
     let top = stack.wrapping_add(STACK).map_addr(|it| it & !15);
     let mut child = Child { plan, fds, procs, step: 0, failed: 0 };
@@ -362,9 +374,11 @@ fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::R
     // SAFETY: two `sigset_t`s, one to read and one to write.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut was) };
     // SAFETY: `run` takes the `Child` it is given and touches nothing else of the parent's.
-    // With CLONE_VM the child runs on `stack` in this process's memory, and with CLONE_VFORK
-    // this thread waits until the child has run its program or exited, so `child`, `plan` and
-    // `stack` outlive every use of them in the child. CLONE_PIDFD writes the pidfd to `pidfd`.
+    // With CLONE_VM the child runs on `stack` in this process's memory (the caller's `STACK`
+    // bytes, `top` their 16-byte-aligned end), and with CLONE_VFORK this thread waits until the
+    // child has run its program or exited, so `child`, `plan` and `stack` outlive every use of
+    // them in the child. CLONE_PIDFD writes the pidfd to `pidfd`. Every signal is blocked
+    // across it (above), so no handler of the daemon's runs in the child on the shared memory.
     let pid = unsafe {
         libc::clone(
             run,
@@ -404,6 +418,21 @@ fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::R
 
 /// The child, between `clone` and its program: system calls alone, nothing that allocates,
 /// locks or could panic. It writes only `Child`, through which the parent hears what failed.
+///
+/// It shares the parent's memory (CLONE_VM) and its thread's TLS (no CLONE_SETTLS), while
+/// another thread of the daemon may hold any lock (the allocator's, stdio's, the C library's).
+/// So every call it makes is async-signal-safe (POSIX.1-2017 section 2.4.3, the functions
+/// allowed after `fork` in a multithreaded process): `sigaction`, `sigemptyset`,
+/// `sigprocmask`, `dup2`, `write`, `chdir`, `execve`, `_exit`; and `__errno_location`, which
+/// only returns this thread's TLS address. Each is a thin wrapper of one system call in glibc
+/// and musl, taking no lock. The rest is plain loads and stores into `Child`, the stack
+/// (`mem::zeroed` structs, stores or a `memset`, async-signal-safe since POSIX.1-2016), and
+/// the parent's `Plan`, which nothing writes while it waits.
+///
+/// Its stack is the `STACK` bytes `clone` lends, with no guard page below them: its deepest
+/// frame is this one (two `sigaction`s and a `sigset_t`, under 400 bytes) plus one libc
+/// wrapper's, far under `STACK`, and nothing in it recurses or grows the stack by a length
+/// it is given. Past `STACK` it would write the heap below the buffer.
 #[cfg(target_os = "linux")]
 extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
     // SAFETY: the `Child` `clone` was given; the thread that made it waits (CLONE_VFORK) and
@@ -411,18 +440,20 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
     let child = unsafe { &mut *arg.cast::<Child<'_>>() };
     let fail = |child: &mut Child<'_>, step: u8| -> ! {
         // SAFETY: the calling thread's errno, in the TLS the child shares with the waiting
-        // parent thread.
+        // parent thread; async-signal-safe, an address and no lock.
         let errno = unsafe { libc::__errno_location() };
         // SAFETY: as above; nothing else writes it until the parent runs again.
         child.failed = unsafe { *errno };
         child.step = step;
-        // SAFETY: the end of the child, running nothing of the parent's.
+        // SAFETY: the end of the child, running nothing of the parent's (no atexit handler, no
+        // stdio flush); async-signal-safe.
         unsafe { libc::_exit(127) }
     };
     for signal in 1..65 {
         // SAFETY: all zeros is a valid `sigaction`; the call writes it.
         let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-        // SAFETY: a `sigaction` to write; a signal the C library keeps for itself fails.
+        // SAFETY: a `sigaction` on the stack to write; a signal the C library keeps for itself
+        // fails. Async-signal-safe.
         if unsafe { libc::sigaction(signal, ptr::null(), &mut old) } != 0 {
             continue;
         }
@@ -434,32 +465,35 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
         // SAFETY: as above.
         let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
         default.sa_sigaction = libc::SIG_DFL;
-        // SAFETY: a `sigaction` to read.
+        // SAFETY: a `sigaction` on the stack to read. Async-signal-safe. Signals stay blocked
+        // (the parent's mask, inherited) until every handler of the daemon's is reset.
         unsafe { libc::sigaction(signal, &default, ptr::null_mut()) };
     }
     // SAFETY: all zeros is a valid `sigset_t`.
     let mut none: libc::sigset_t = unsafe { std::mem::zeroed() };
-    // SAFETY: a `sigset_t` to empty.
+    // SAFETY: a `sigset_t` on the stack to empty. Async-signal-safe.
     unsafe { libc::sigemptyset(&mut none) };
-    // SAFETY: a `sigset_t` to read.
+    // SAFETY: a `sigset_t` to read; every handler is the default now, so an unblocked signal
+    // runs nothing of the daemon's. Async-signal-safe.
     unsafe { libc::sigprocmask(libc::SIG_SETMASK, &none, ptr::null_mut()) };
     for (target, fd) in (0..).zip(child.fds) {
         // SAFETY: an open descriptor past 2 onto one of 0, 1 and 2; the copy keeps no
-        // close-on-exec.
+        // close-on-exec. Async-signal-safe.
         if unsafe { libc::dup2(fd, target) } < 0 {
             fail(child, 1);
         }
     }
-    // SAFETY: one byte from a static, to an open descriptor.
+    // SAFETY: one byte from a static, to an open descriptor. Async-signal-safe.
     if child.procs >= 0 && unsafe { libc::write(child.procs, b"0".as_ptr().cast(), 1) } != 1 {
         fail(child, 2);
     }
-    // SAFETY: a NUL-terminated path the parent keeps.
+    // SAFETY: a NUL-terminated path the parent keeps. Async-signal-safe.
     if unsafe { libc::chdir(child.plan.dir) } != 0 {
         fail(child, 3);
     }
     // SAFETY: a NUL-terminated path and two NULL-terminated arrays of NUL-terminated strings,
-    // all kept by the parent until the program runs.
+    // all kept by the parent until the program runs. Async-signal-safe; on success the child
+    // leaves the shared memory and the parent runs again.
     unsafe {
         libc::execve(child.plan.program, child.plan.argv.as_ptr(), child.plan.envp.as_ptr())
     };

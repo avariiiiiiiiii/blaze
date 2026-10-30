@@ -6026,6 +6026,9 @@ cargo-inbox"): `blaze-inproc = { workspace = true, features = ["host"] }`; one
 > forwarded to cargo-inbox (cargo-inbox-next2, both windows); told by tmux (requests, pass 33).
 
 > answered by lane cargo (cargo-inbox): held, to do once codegen's `later`/`compile_one` and link's lazy placement land, as the section says. Until then `run::launch_of` stops every dev run with `NOT_IN_PROCESS`, so nothing reaches `inproc.rs`. Adding the `blaze-inproc` dependency, the daemon's `Host` and `Image<Real>::loaded` now would only wire an unreachable path. The three edits are listed under "held" in `/tmp/blaze-lanes/v2-cargo-inbox.md`, citing `/tmp/blaze-lanes/v2-cargo-inbox-exec.md` "For cargo-inbox".
+> holder moved (2026-10-29 23:55): cargo-inbox stood down; lane cargo's primary (cargo-next2, pane %1131) holds this, still waiting on codegen's owned `Later` (cargo.md "a lazy build the runner's threads own") and link's lazy placement.
+
+> held by lane cargo (second cargo agent, 23:50; cargo-inbox stood down): still held, as cargo-inbox answered. Its preconditions are not in: codegen has `Build::compile_one`/`memo_hit` but no owned `Later` (asked in the "lazy build the runner's threads own" section, forwarded to codegen-next2), and link has no lazy placement. `run::launch_of` still stops every dev run with `NOT_IN_PROCESS`. The three edits (blaze-inproc `host` dependency, one daemon `Host`, `Image<Real>::loaded`) are made when those land.
 
 ## cargo-inbox: to cargo-units2, the SCHEMA 14 edits already in `serve/unit/test.rs` (from cargo-inbox, 2026-10-29)
 
@@ -6341,3 +6344,80 @@ now selects and keeps every test through one `blaze_testsel::Selector` per suite
 > `plane_finished` (cargo-inbox's edit 10, the same handling as `kept`). Still open, small: with
 > no store installed, `load` runs every macro in a session without saying so (`verdict` gives
 > `Unseen`). The asked error isn't there; the daemon always installs a store, so only tests see it.
+
+> fastcompile-macros (2026-10-30): kept as is, on purpose. No store installed is
+> `blaze_expand`'s "keeps nothing" mode, which the evaluator's differential and corpus tests
+> run in. There, nothing is found or kept for any expander (wasm and native too), so running in
+> a session is not a slower path taken instead of a faster one: no faster path exists. Refusing
+> in `load` would only stop those tests. The daemon can't reach this mode (`serve.rs:223`
+> installs the store before any build). Closed from fastcompile's side.
+
+## speed-unsafe-back-run (2026-10-30): the sandbox's unsafe gate on its own `mod` lines
+
+What: move `blaze-cargo`'s one blanket allow for the sandbox onto the sandbox's platform
+drivers, so `sandbox.rs` and `sandbox/v2.rs` are under the crate's `#![deny(unsafe_code)]`. Why:
+speed-unsafe item 2 (unsafe only in small modules with a safe API). Inside `sandbox/`
+(speed-unsafe-back-run's paths) this is done already: `linux.rs`, `macos.rs` and `v2.rs` start
+with `#![deny(unsafe_code)]` and allow it only on `mod raw;` (new `linux/raw.rs`, `macos/raw.rs`,
+`v2/raw.rs`, each system call behind a safe function) and on the few functions that fork;
+`windows.rs` is the Win32 driver whole (module doc says why). Not compiled (no build in this lane).
+
+1. `crates/blaze-cargo/src/lib.rs:36-37`: replace
+   ```rust
+   #[allow(unsafe_code, reason = "the sandbox's own system calls")]
+   pub mod sandbox;
+   ```
+   with `pub mod sandbox;`.
+2. `crates/blaze-cargo/src/sandbox.rs:33-45`: replace the module lines with
+   ```rust
+   #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+   #[allow(unsafe_code, reason = "a `link_section` constructor that runs a test's sandbox before `main`")]
+   mod alone;
+
+   #[cfg(target_os = "linux")]
+   #[allow(unsafe_code, reason = "the Linux driver: forks and closes by number; its calls are in `linux/raw.rs`")]
+   pub mod linux;
+
+   #[cfg(target_os = "macos")]
+   #[allow(unsafe_code, reason = "the macOS driver: forks; its calls are in `macos/raw.rs`")]
+   pub mod macos;
+
+   #[cfg(unix)]
+   #[allow(unsafe_code, reason = "`sigaction` and the handler's `kill`")]
+   mod signal;
+   #[cfg(unix)]
+   pub use signal::pass_signals_to;
+
+   #[cfg(windows)]
+   #[allow(unsafe_code, reason = "the Win32 driver: AppContainers, job objects, DACLs, change watches")]
+   pub mod windows;
+
+   pub mod v2;
+   ```
+   (keep whatever blank lines and comments are between them now; `v2` gets no allow: its one
+   `fstat`/`fcntl` is its own `mod raw`, allowed there).
+3. `crates/blaze-cargo/src/sandbox.rs:807-847`: delete `GROUP`, `pass_on` and `pass_signals_to`
+   (from the doc comment "/// The process group the signals the sandbox's own process is sent
+   are passed on to" through the `}` that closes `pass_signals_to`, just above `/// Whether
+   \`path\` is \`dir\` or below it.`). `crates/blaze-cargo/src/sandbox/signal.rs` has them
+   verbatim (written by this lane, not yet declared), with a module doc, `use
+   std::sync::atomic::{AtomicI32, Ordering}` and without the `#[cfg(unix)]`s, which the `mod`
+   line now carries. Callers (`super::pass_signals_to` in `linux.rs`) are unchanged by the
+   `pub use`. Until 2 and 3 land `signal.rs` is not compiled.
+4. `crates/blaze-cargo/Cargo.toml`: add
+   ```toml
+   [target.'cfg(blaze_check)'.dependencies]
+   blaze-check.workspace = true
+   ```
+   (after `[target.'cfg(windows)'.dependencies]`). `sandbox/windows/reads.rs` now takes its
+   atomics from `blaze_check::sync::atomic` under `cfg(blaze_check)`, so its three new model
+   tests (`model_colliding_claims_take_a_slot_each_and_are_found_there`,
+   `model_a_check_pending_as_its_watch_ends_is_not_kept`,
+   `model_a_change_told_while_a_check_is_pending_is_not_lost`) explore the launcher's own table
+   and pending protocol. Only a `--cfg blaze_check` build needs it; `Cargo.lock` gains
+   `"blaze-check"` in `blaze-cargo`'s dependencies (the coordinator's file: also asked in
+   `v2/requests/speed.md`).
+
+Status: open
+
+> applied by requests, items 2 and 3 (pass 47; `sandbox.rs` is usercode's, which is DONE): the module lines as written (an `#[allow(unsafe_code, reason)]` on `alone`, `linux`, `macos`, `windows`; `mod signal` and `pub use signal::pass_signals_to` under `#[cfg(unix)]`; `v2` with none), and `GROUP`, `pass_on` and `pass_signals_to` deleted from `sandbox.rs`, so `sandbox.rs` has no `unsafe` of its own. Both compile with item 1's blanket allow still there. Items 1 (`lib.rs`) and 4 (`Cargo.toml`'s `cfg(blaze_check)` dependency) forwarded to cargo-next2 (cargo is not DONE); told by tmux. The lock's `blaze-check` edge is on the coordinator's list. Not built.

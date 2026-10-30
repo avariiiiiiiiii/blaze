@@ -71,6 +71,8 @@ which marks each expansion's scope so its reads can be told apart in the live re
 
 > forwarded to coordinator: `vendor/proc-macro-srv/` has no owner in crates.md (usercode owns `crates/proc-macro-srv/`), so it is the coordinator's to apply or give to usercode.
 
+> applied (selfbuild-srv): `vendor/proc-macro-srv` is gone; the server is `crates/proc-macro-srv-cli` (binary `blaze-proc-macro-srv`) on the workspace's `proc-macro-api` and `proc-macro-srv`. With `BLAZE_WARM_SOCKET` set it connects to that socket (`main_loop::connect`), unsets the variable, and speaks `bidirectional-postcard-prototype` on it (any other `--format` is an error; off unix, so is the variable). Each `ExpandMacro`/`ExpandMacroWire` is counted before anything can fail, a request that can't be read too (`ProcMacroSrv::count_unexpanded`), and runs on its thread marked by `scope.rs`. It reports `CURRENT_API_VERSION` (8, which includes 7). `EnvSnapshot` no longer walks `environ`: it reads a variable's starting value by name the first time an expansion sets it. Not built.
+
 ## 4. `crates/blaze-cargo/src/cargo/own_macro.rs`: the wasm or native rule
 
 Where: `runs_as_wasm`, `wasm`.

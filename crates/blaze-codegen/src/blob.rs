@@ -221,10 +221,10 @@ impl<'a> In<'a> {
     fn values(&mut self) -> Result<Vec<wasm::ValType>, BlobError> {
         let at = self.0.at();
         let bytes = self.slice()?;
-        // alloc: the template owns its types
         bytes
             .iter()
             .map(|&it| wasm::ValType::from_byte(it).ok_or(BlobError { at, what: "no such wasm value type" }))
+            // alloc: the template owns its types
             .collect()
     }
 

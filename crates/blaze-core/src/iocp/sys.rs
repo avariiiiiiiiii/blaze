@@ -21,8 +21,8 @@ use windows_sys::Win32::{
     Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
     Storage::FileSystem::GetFullPathNameW,
     System::IO::{
-        CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY,
-        PostQueuedCompletionStatus,
+        CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_0_0,
+        OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
     },
 };
 
@@ -319,13 +319,15 @@ impl Head {
     /// while no step of it is in flight: every caller asks for the step at once.
     pub(super) fn reset(&self, at: u64) -> *mut OVERLAPPED {
         let overlapped = self.overlapped();
-        // SAFETY: the slot is this request's, and no step of it is in flight, so nothing else
-        // reads or writes it; all zeros is an `OVERLAPPED` of no offset and no event.
-        unsafe {
-            overlapped.write(std::mem::zeroed());
-            (*overlapped).Anonymous.Anonymous.Offset = at as u32;
-            (*overlapped).Anonymous.Anonymous.OffsetHigh = (at >> 32) as u32;
-        }
+        // SAFETY: all zeros is an `OVERLAPPED` of no offset and no event: integers, a union of
+        // integers and a null handle.
+        let mut fresh: OVERLAPPED = unsafe { std::mem::zeroed() };
+        fresh.Anonymous.Anonymous = OVERLAPPED_0_0 { Offset: at as u32, OffsetHigh: (at >> 32) as u32 };
+        // SAFETY: `overlapped` is the first field of this head's `repr(C)` slot, aligned and
+        // live while `self` is; no step of the request is in flight (every caller starts one
+        // at once after this), so neither the kernel nor another thread reads or writes it.
+        // Writing it while a step was in flight would race the kernel's completion write.
+        unsafe { overlapped.write(fresh) };
         overlapped
     }
 
@@ -349,9 +351,11 @@ impl Head {
     /// `overlapped` is a [`Head::overlapped`], in memory that is still mapped: a request's
     /// entry, which the slab keeps mapped for the driver's life, or a test's own head.
     pub(super) unsafe fn id_of(overlapped: *const OVERLAPPED) -> u64 {
-        // SAFETY: as the caller says. The id is written as the request is made, never by the
-        // kernel, which writes only the `OVERLAPPED`.
-        unsafe { std::ptr::addr_of!((*overlapped.cast::<Slot>()).id).read() }
+        let id = overlapped.cast::<u8>().wrapping_add(std::mem::offset_of!(Slot, id)).cast::<u64>();
+        // SAFETY: as the caller says, `overlapped` starts a live `repr(C)` `Slot`, so `id` is
+        // its aligned `u64` field. The id is written as the request is made, never by the
+        // kernel, which writes only the `OVERLAPPED`; a foreign pointer would read anything.
+        unsafe { id.read() }
     }
 }
 
@@ -468,11 +472,30 @@ impl Port {
 }
 
 /// A packet of `key` posted to the port `port`, which is open; `carried` is a number of the
-/// key's, or (a test's) a [`Head::overlapped`].
+/// key's. Refuses [`KEY_IO`]: the driver reads a `KEY_IO` packet's `OVERLAPPED` through as a
+/// [`Head`], so only the kernel's completions, or [`post_head`], may carry that key.
 pub(super) fn post(port: HANDLE, key: usize, bytes: u32, carried: usize) -> io::Result<()> {
-    // SAFETY: an open port; `carried` is handed back as it is, and only a `KEY_IO` packet's
-    // is read through, which is a head's.
+    if key == KEY_IO {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a KEY_IO packet carries a request's OVERLAPPED, which `post` cannot vouch for",
+        ));
+    }
+    // SAFETY: an open port; the call only queues `carried`, handed back as a number and never
+    // read through for any key but `KEY_IO`, refused above.
     check(unsafe { PostQueuedCompletionStatus(port, bytes, key, carried as *const OVERLAPPED) })
+}
+
+/// A [`KEY_IO`] packet handing back `head`, as the kernel's completion of a request would.
+///
+/// # Safety
+///
+/// `head` is a [`Head::overlapped`] whose `Head` stays where it is, alive, until the driver has
+/// taken the packet: the driver reads the head's id through it.
+#[cfg(test)]
+pub(super) unsafe fn post_head(port: HANDLE, head: *mut OVERLAPPED) -> io::Result<()> {
+    // SAFETY: an open port; the caller keeps `head` alive until the packet is taken.
+    check(unsafe { PostQueuedCompletionStatus(port, 0, KEY_IO, head) })
 }
 
 #[cfg(test)]
@@ -497,5 +520,22 @@ mod tests {
             let made = unsafe { std::slice::from_raw_parts(name.as_ptr(), wanted.len()) };
             assert_eq!(made, &wanted[..]);
         }
+    }
+
+    /// Safe `post` refuses the one key whose packet the driver reads through, and posts the
+    /// others as numbers, which come back as they were sent.
+    #[test]
+    fn a_posted_packet_never_carries_an_overlapped() {
+        let port = Port::new().unwrap();
+        let refused = port.post(KEY_IO, 0, 0x1000).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+        port.post(KEY_WAKE, 3, 7).unwrap();
+        // SAFETY: all zeros is an `OVERLAPPED_ENTRY` of no packet: integers and a null pointer.
+        let mut entries = [unsafe { std::mem::zeroed::<OVERLAPPED_ENTRY>() }; 2];
+        assert_eq!(port.take(&mut entries, Duration::from_millis(100)).unwrap(), 1);
+        assert_eq!(entries[0].lpCompletionKey, KEY_WAKE);
+        assert_eq!(entries[0].lpOverlapped as usize, 7);
+        assert_eq!(entries[0].dwNumberOfBytesTransferred, 3);
+        assert_eq!(port.take(&mut entries, Duration::ZERO).unwrap(), 0, "the refused packet was posted");
     }
 }

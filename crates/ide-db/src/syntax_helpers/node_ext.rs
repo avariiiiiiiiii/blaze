@@ -366,7 +366,8 @@ pub fn for_each_tail_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, cb: &mut F) {
         | ast::Expr::FormatArgsExpr(_)
         | ast::Expr::AsmExpr(_)
         | ast::Expr::CfgPredExpr(_)
-        | ast::Expr::IncludeBytesExpr(_) => cb(expr),
+        | ast::Expr::IncludeBytesExpr(_)
+        | ast::Expr::UnsafeBinderCastExpr(_) => cb(expr),
     }
 }
 

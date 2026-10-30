@@ -74,8 +74,10 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
                         0 => UserExternalName::new(namespace::PLACE, place(places, name.index)?),
                         1 => data.name(name.index)?,
                         fragment::INLINED => {
+                            // alloc: the error's message
                             return Err("a reference of a body built in".to_owned());
                         }
+                        // alloc: the error's message
                         other => return Err(format!("a name in the unknown namespace {other}")),
                     };
                     out.name(canonical);
@@ -102,11 +104,12 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
                             out.name(UserExternalName::new(namespace::PLACE, at));
                         }
                         RelocName::Data(index) => out.name(data.name(index)?),
+                        // alloc: the error's message
                         other => return Err(format!("assembly naming {other:?}")),
                     }
                 }
                 let typed = code.relocs.iter().filter_map(|it| Some((it.offset, it.elf_type?)));
-                out.u32(typed.clone().count() as u32);
+                out.u32(code.relocs.iter().filter(|it| it.elf_type.is_some()).count() as u32);
                 for (at, kind) in typed {
                     out.u32(at);
                     out.u32(kind);
@@ -238,6 +241,7 @@ impl Hasher for Out<'_> {
 }
 
 fn place(places: &Places, index: u32) -> Result<u32, String> {
+    // alloc: the error's message
     places.funcs.get(index as usize).copied().ok_or_else(|| format!("function {index} has no place"))
 }
 
@@ -250,6 +254,7 @@ struct Data<'f> {
 impl<'f> Data<'f> {
     fn of(places: &Places, requests: &Requests, frame: &'f Frame) -> Result<Data<'f>, String> {
         if places.datas.len() != requests.datas.len() {
+            // alloc: the error's message
             return Err(format!(
                 "{} data requests and {} places",
                 requests.datas.len(),
@@ -272,6 +277,7 @@ impl<'f> Data<'f> {
     }
 
     fn name(&self, index: u32) -> Result<UserExternalName, String> {
+        // alloc: the error's message
         self.names.get(index as usize).cloned().ok_or_else(|| format!("data {index} has no place"))
     }
 
@@ -295,9 +301,11 @@ impl<'f> Data<'f> {
                 DataPlace::Own => {
                     let blob = match &requests.datas[index] {
                         DataRequest::Blob { identity: DataIdentity::Writable, .. } => {
+                            // alloc: the error's message
                             return Err(format!("data {index} is written to"));
                         }
                         DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => blob,
+                        // alloc: the error's message
                         _ => return Err(format!("data {index} is its own but has no blob")),
                     };
                     out.u8(4);
@@ -310,6 +318,7 @@ impl<'f> Data<'f> {
 
     fn blob(&self, out: &mut Out<'_>, blob: &ConstBlob, places: &Places) -> Result<(), String> {
         if !blob.type_ids.is_empty() {
+            // alloc: the error's message
             return Err("a constant with a `TypeId` not filled in".to_owned());
         }
         out.u64(blob.align);

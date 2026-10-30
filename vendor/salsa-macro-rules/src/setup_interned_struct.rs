@@ -106,6 +106,7 @@ macro_rules! setup_interned_struct {
         #[allow(dead_code)]
         const _: () = {
             use ::salsa::plumbing as $zalsa;
+            use $zalsa::ZalsaDatabase as _;
             use $zalsa::interned as $zalsa_struct;
 
             type $Configuration = $StructWithStatic;

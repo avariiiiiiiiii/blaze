@@ -8,7 +8,7 @@ use hir_def::{
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 use test_fixture::WithFixture;
 
-use crate::{crate_lint_level, lint_level, lint_level_at, query::owner_node};
+use crate::{LevelError, crate_lint_level, lint_level, lint_level_at, query::owner_node};
 
 const LINT: LintId = LintId::LONG_RUNNING_CONST_EVAL;
 
@@ -57,7 +57,7 @@ fn body(db: &Db, krate: Crate, name: &str) -> DefWithBodyId {
 fn at_inline_consts(db: &Db, owner: ExpressionStoreOwnerId) -> Vec<Level> {
     let consts: Vec<ExprId> =
         ExpressionStore::of(db, owner).exprs().filter(|(_, it)| matches!(it, Expr::Const(_))).map(|(id, _)| id).collect();
-    consts.into_iter().map(|expr| lint_level_at(db, owner, Some(expr), LINT)).collect()
+    consts.into_iter().map(|expr| lint_level_at(db, owner, Some(expr), LINT).expect("an inline const has syntax")).collect()
 }
 
 /// The level at the root of an anon const of `owner`'s store: every expression of a struct's
@@ -65,7 +65,7 @@ fn at_inline_consts(db: &Db, owner: ExpressionStoreOwnerId) -> Vec<Level> {
 fn at_anon_const(db: &Db, owner: ExpressionStoreOwnerId) -> Level {
     let exprs: Vec<ExprId> = ExpressionStore::of(db, owner).exprs().map(|(id, _)| id).collect();
     assert!(!exprs.is_empty(), "{owner:?} has an anon const");
-    let levels: Vec<Level> = exprs.iter().map(|&expr| lint_level_at(db, owner, Some(expr), LINT)).collect();
+    let levels: Vec<Level> = exprs.iter().map(|&expr| lint_level_at(db, owner, Some(expr), LINT).expect("an array length has syntax")).collect();
     assert!(levels.windows(2).all(|it| it[0] == it[1]), "one level across one anon const: {levels:?}");
     levels[0]
 }
@@ -201,4 +201,30 @@ fn main() {}
             lint_level(&db, c, lint.id());
         }
     });
+}
+
+/// A level at an expression is found exactly where the expression has syntax; a desugared one
+/// is an error naming it, never the item's level.
+#[test]
+fn a_desugared_expression_is_an_error_not_the_items_level() {
+    let (db, krate) = db_of(
+        r#"
+//- /main.rs crate:main edition:2021
+fn f(x: Option<u8>) -> Option<u8> {
+    #[allow(long_running_const_eval)]
+    for _ in 0..1 {}
+    let y = x?;
+    Some(y)
+}
+fn main() {}
+"#,
+    );
+    let owner = ExpressionStoreOwnerId::Body(body(&db, krate, "f"));
+    let (store, map) = ExpressionStore::with_source_map(&db, owner);
+    for (expr, _) in store.exprs() {
+        match map.expr_syntax(expr) {
+            Ok(_) => assert!(lint_level_at(&db, owner, Some(expr), LINT).is_ok(), "{expr:?} has syntax"),
+            Err(_) => assert_eq!(lint_level_at(&db, owner, Some(expr), LINT), Err(LevelError::NoSyntax { owner, expr })),
+        }
+    }
 }

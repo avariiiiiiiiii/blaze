@@ -1695,6 +1695,7 @@ impl Flow<'_> {
 pub(crate) fn differential(text: &str, arch: Arch, platform: u32) -> Result<bool, String> {
     let new = read("t.tbd", text, arch, platform);
     // The reference recurses once per level with no bound: past the reader's it is not run.
+    // alloc: the fuzz differential only
     let nested = format!("collections nested deeper than {DEPTH}");
     if matches!(&new, Err(what) if what.contains(&nested)) {
         return Ok(false);
@@ -1703,6 +1704,7 @@ pub(crate) fn differential(text: &str, arch: Arch, platform: u32) -> Result<bool
     let new = match new {
         Ok(shared) => {
             if let Err(what) = arena_exact(&shared) {
+                // alloc: the fuzz differential's failure message
                 return Err(format!(
                     "{arch:?} platform {platform}: the reader's arena is not exact ({what}): {shared:?}\n\
                      the reference: {old:?}"
@@ -1715,6 +1717,7 @@ pub(crate) fn differential(text: &str, arch: Arch, platform: u32) -> Result<bool
     if new == old {
         Ok(new.is_ok())
     } else {
+        // alloc: the fuzz differential's failure message
         Err(format!("{arch:?} platform {platform}: the reader: {new:?}\nthe reference: {old:?}"))
     }
 }
@@ -1725,16 +1728,20 @@ pub(crate) fn differential(text: &str, arch: Arch, platform: u32) -> Result<bool
 fn arena_exact(shared: &Shared) -> Result<(), String> {
     let mut bytes = 0;
     for symbol in &shared.symbols {
+        // alloc: the fuzz differential's failure message
         let name = shared.names.get(symbol.name).ok_or_else(|| format!("{:?} is not a name of the arena", symbol.name))?;
         if symbol.version.is_some() {
+            // alloc: the fuzz differential's failure message
             return Err(format!("`{name}` has a version"));
         }
         bytes += name.len();
     }
     if shared.names.bytes() != bytes {
+        // alloc: the fuzz differential's failure message
         return Err(format!("the arena holds {} bytes and its names {bytes}", shared.names.bytes()));
     }
     if !shared.versions.is_empty() {
+        // alloc: the fuzz differential's failure message
         return Err(format!("versions {:?}", shared.versions));
     }
     Ok(())

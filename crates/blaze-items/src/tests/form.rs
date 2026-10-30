@@ -659,7 +659,8 @@ fn successors(kind: &TerminatorKind) -> Vec<BasicBlockId> {
         | TerminatorKind::Abort
         | TerminatorKind::Return
         | TerminatorKind::Unreachable
-        | TerminatorKind::CoroutineDrop => Vec::new(),
+        | TerminatorKind::CoroutineDrop
+        | TerminatorKind::TailCall { .. } => Vec::new(),
     }
 }
 

@@ -5,7 +5,6 @@
 use std::fmt::Write as _;
 
 use blaze_alloc_count::{assert_at_most, measure};
-use hir::Semantics;
 
 use super::{BodyCx, Passes, Scratch, after_abort, body_owners};
 use crate::{cx::Cx, lints::registry::LintId};
@@ -36,10 +35,9 @@ fn with_cx(n: usize, check: impl FnOnce(&Cx<'_, '_>)) {
     let checked = crate::tests::checked(&fixture(n));
     let db = &checked.db;
     hir::attach_db(db, || {
-        let sema = Semantics::new(db);
         let krate = hir::check::workspace_crates(db)[0];
         let frame = crate::tests::frame();
-        let cx = Cx::new(&sema, krate, checked.files(), &frame);
+        let cx = Cx::new(db, krate, checked.files(), &frame);
         cx.lint_may_fire(LintId::WARNINGS);
         assert!(after_abort(&cx).is_empty(), "the fixture gives no late lint");
         check(&cx);

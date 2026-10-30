@@ -32,6 +32,7 @@ use rustc_type_ir::{
 use syntax::view::HasVisibility;
 
 use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 
 use super::SymbolResolver;
 use hir_ty::{
@@ -118,7 +119,7 @@ pub(super) struct TypeIdHasher<'a, 'db> {
     /// lifetimes in the order they were met. rustc renumbers them that way before it hashes,
     /// so that `for<'a, 'b> fn(&'b u8, &'a u8)` and `for<'a, 'b> fn(&'a u8, &'b u8)` are one
     /// type.
-    binders: Vec<Vec<BoundVar>>,
+    binders: Vec<SmallVec<[BoundVar; 4]>>,
     /// How many function signatures what is being hashed is inside of. A lifetime left out of
     /// one (`fn(&u8)`, `dyn Fn(&u8)`) is bound by it, where rust-analyzer has no lifetime at
     /// all, so there only a lifetime it did bind is one this knows.
@@ -146,6 +147,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         Self {
             db,
             symbols,
+            // alloc: empty, allocates nothing; kept and cleared across the hasher's types
             binders: Vec::new(),
             signatures: 0,
             owned,
@@ -189,23 +191,23 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         let (owner, _) = hir_ty_mir::mir::type_name::block_owner(db, block)?;
         let (container, name, place) = match owner {
             DefWithBodyId::FunctionId(it) => {
-                (it.lookup(db).container, FunctionSignature::of(db, it).name.clone(), 0)
+                (it.lookup(db).container, FunctionSignature::of(db, it).name.as_str(), 0)
             }
             DefWithBodyId::ConstId(it) => {
                 let loc = it.lookup(db);
-                match hir_def::signatures::ConstSignature::of(db, it).name.clone() {
-                    Some(name) => (loc.container, name, 0),
+                match &hir_def::signatures::ConstSignature::of(db, it).name {
+                    Some(name) => (loc.container, name.as_str(), 0),
                     // One `const _` of many: by where it is.
                     None => (
                         loc.container,
-                        hir_expand::name::Name::new_symbol_root(intern::sym::underscore),
+                        intern::sym::underscore.as_str(),
                         loc.id.value.erase().into_raw(),
                     ),
                 }
             }
             DefWithBodyId::StaticId(it) => (
                 it.lookup(db).container,
-                hir_def::signatures::StaticSignature::of(db, it).name.clone(),
+                hir_def::signatures::StaticSignature::of(db, it).name.as_str(),
                 0,
             ),
             _ => return None,
@@ -216,7 +218,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             ItemContainerId::ImplId(id) => self.own_impl(id)?,
             ItemContainerId::ExternBlockId(_) => return None,
         };
-        let owner = parent.child_at(DefPathData::ValueNs(name.as_str()), place);
+        let owner = parent.child_at(DefPathData::ValueNs(name), place);
         Some(owner.child_at(DefPathData::AnonConst, block.ast_id(db).value.erase().into_raw()))
     }
 
@@ -431,9 +433,10 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                     Ty::new_adt(interner, resume_ty.into(), GenericArgs::new_from_slice(&[]));
                 // After the parent's: the kind, then the resume type.
                 let at = args.as_coroutine().parent_args().len() + 1;
-                let mut args: Vec<_> = args.iter().collect();
-                *args.get_mut(at)? = resume_ty.into();
-                Some(GenericArgs::new_from_slice(&args))
+                let mut with_resume: SmallVec<[_; 8]> = SmallVec::new();
+                with_resume.extend(args.iter());
+                *with_resume.get_mut(at)? = resume_ty.into();
+                Some(GenericArgs::new_from_slice(&with_resume))
             }
         }
     }
@@ -493,6 +496,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
     fn ty(&mut self, hasher: &mut StableSipHasher128, ty: Ty<'db>) -> Option<()> {
         let hashed = self.kind(hasher, ty);
         if hashed.is_none() && self.stuck.is_none() {
+            // alloc: once per `TypeId` rustc's hash can't give, kept for the error that may follow
             self.stuck = Some(format!("{ty:?}"));
         }
         hashed
@@ -676,7 +680,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
                 hasher.write_isize(16);
                 // rustc keeps them as the trait, then its associated types, then the auto
                 // traits, each group sorted by `DefPathHash`.
-                let mut sorted = Vec::new();
+                let mut sorted: SmallVec<[_; 4]> = SmallVec::new();
                 let mut signature = false;
                 for predicate in predicates.iter() {
                     let key = match predicate.skip_binder() {
@@ -764,7 +768,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         hasher: &mut StableSipHasher128,
         value: impl FnOnce(&mut Self, &mut StableSipHasher128) -> Option<()>,
     ) -> Option<()> {
-        self.binders.push(Vec::new());
+        self.binders.push(SmallVec::new());
         let hashed = value(self, hasher);
         let bound = self.binders.pop()?;
         hashed?;
@@ -1008,11 +1012,11 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             }
         }
         let name = match variant {
-            VariantId::EnumVariantId(it) => it.lookup(db).name.clone(),
-            VariantId::StructId(it) => StructSignature::of(db, it).name.clone(),
-            VariantId::UnionId(it) => UnionSignature::of(db, it).name.clone(),
+            VariantId::EnumVariantId(it) => it.lookup(db).name.symbol().as_str(),
+            VariantId::StructId(it) => StructSignature::of(db, it).name.symbol().as_str(),
+            VariantId::UnionId(it) => UnionSignature::of(db, it).name.symbol().as_str(),
         };
-        hash_str(hasher, name.as_str());
+        hash_str(hasher, name);
         match discriminant {
             Discriminant::Explicit(konst) => {
                 hasher.write_isize(0);

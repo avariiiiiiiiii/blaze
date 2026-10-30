@@ -31,7 +31,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use super::super::host;
 use crate::{
     Target,
-    shape::{Dst, FloatCc, IntCc, Op, RmwOp, Shape, Src, Ty},
+    shape::{Disp, Dst, FloatCc, IntCc, Op, RmwOp, Shape, Src, Ty},
 };
 
 /// How a parameter is made from the input it carries.
@@ -72,12 +72,17 @@ pub struct Input {
 }
 
 /// What a function is made with besides its parameters: each [`Src::Imm`] operand's value,
-/// an `iconst`'s or `fconst`'s bits (in `imms[0]`), a `vconst`'s bytes or a shuffle's mask.
+/// an `iconst`'s or `fconst`'s bits (in `imms[0]`), a confined access's offset (in
+/// `imms[OFFSET]`), a `vconst`'s bytes or a shuffle's mask.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Baked {
     pub imms: [i64; 3],
     pub bytes: [u8; 16],
 }
+
+/// Where a confined access's `off` is in [`Baked::imms`]: operand 2, a load's none and a
+/// store's `vmctx`, never an immediate.
+pub const OFFSET: usize = 2;
 
 /// A shape's function, ready for both backends and the interpreter.
 pub struct Built {
@@ -123,6 +128,19 @@ pub fn ir_ty(ty: Ty) -> ir::Type {
         Ty::I64x2 => types::I64X2,
         Ty::F32x4 => types::F32X4,
         Ty::F64x2 => types::F64X2,
+    }
+}
+
+/// The type of the memory a load `op` of a `ty` result reads.
+fn loaded(op: Op, ty: Ty) -> Ty {
+    match op {
+        Op::Uload8 | Op::Sload8 => Ty::I8,
+        Op::Uload16 | Op::Sload16 => Ty::I16,
+        Op::Uload32 | Op::Sload32 => Ty::I32,
+        Op::Uload8x8 | Op::Sload8x8 | Op::Uload16x4 | Op::Sload16x4 | Op::Uload32x2 | Op::Sload32x2 => {
+            Ty::I64
+        }
+        _ => ty,
     }
 }
 
@@ -333,64 +351,95 @@ impl Cx<'_> {
         self.b.ins().stack_addr(types::I64, ss, offset)
     }
 
-    /// A load of the shape's op from memory holding one input of `mem`.
-    fn load(&mut self, mem: Ty) {
-        let op = self.shape.op;
+    /// A load `op` from memory holding one input of `mem`: at `base + AT`, or at `confined`
+    /// (that place, reached through a confined address) with no offset.
+    fn load(&mut self, op: Op, mem: Ty, confined: Option<ir::Value>) {
         let t = ir_ty(self.shape.ty);
         let atomic = op == Op::AtomicLoad;
         let base = self.stack_addr(0);
-        let at16 = if atomic { Some(self.stack_addr(AT)) } else { None };
+        let at16 = if atomic && confined.is_none() { Some(self.stack_addr(AT)) } else { None };
         let input = self.param(mem, Xform::Plain, None);
         self.b.ins().store(flags(), input, base, AT);
-        let addr = match (self.shape.srcs[0], at16) {
-            (Src::Acc, _) => self.stack_addr(0),
-            (_, Some(at16)) => at16,
-            (_, None) => base,
+        let (addr, at) = match (confined, self.shape.srcs[0], at16) {
+            (Some(addr), _, _) => (addr, 0),
+            (None, Src::Acc, _) => (self.stack_addr(0), AT),
+            (None, _, Some(at16)) => (at16, AT),
+            (None, _, None) => (base, AT),
         };
         let f = flags();
         let ins = self.b.ins();
         let value = match op {
-            Op::Load => ins.load(t, f, addr, AT),
-            Op::Uload8 => ins.uload8(t, f, addr, AT),
-            Op::Sload8 => ins.sload8(t, f, addr, AT),
-            Op::Uload16 => ins.uload16(t, f, addr, AT),
-            Op::Sload16 => ins.sload16(t, f, addr, AT),
-            Op::Uload32 => ins.uload32(f, addr, AT),
-            Op::Sload32 => ins.sload32(f, addr, AT),
-            Op::Uload8x8 => ins.uload8x8(f, addr, AT),
-            Op::Sload8x8 => ins.sload8x8(f, addr, AT),
-            Op::Uload16x4 => ins.uload16x4(f, addr, AT),
-            Op::Sload16x4 => ins.sload16x4(f, addr, AT),
-            Op::Uload32x2 => ins.uload32x2(f, addr, AT),
-            Op::Sload32x2 => ins.sload32x2(f, addr, AT),
+            Op::Load => ins.load(t, f, addr, at),
+            Op::Uload8 => ins.uload8(t, f, addr, at),
+            Op::Sload8 => ins.sload8(t, f, addr, at),
+            Op::Uload16 => ins.uload16(t, f, addr, at),
+            Op::Sload16 => ins.sload16(t, f, addr, at),
+            Op::Uload32 => ins.uload32(f, addr, at),
+            Op::Sload32 => ins.sload32(f, addr, at),
+            Op::Uload8x8 => ins.uload8x8(f, addr, at),
+            Op::Sload8x8 => ins.sload8x8(f, addr, at),
+            Op::Uload16x4 => ins.uload16x4(f, addr, at),
+            Op::Sload16x4 => ins.sload16x4(f, addr, at),
+            Op::Uload32x2 => ins.uload32x2(f, addr, at),
+            Op::Sload32x2 => ins.sload32x2(f, addr, at),
             Op::AtomicLoad => ins.atomic_load(t, f, addr),
             other => panic!("{other:?} is no load"),
         };
         self.finish(&[value]);
     }
 
-    /// A store of the shape's op into prefilled memory, read back as two `i64`s.
-    fn store(&mut self) {
-        let op = self.shape.op;
+    /// A confined access (`LoadConfined`, `StoreConfined`): the plain access its `aux` names at
+    /// `vmctx + uextend.i64(ireduce.i32(p + off))` with no offset, `vmctx` the stack slot and
+    /// `p + off` wrapping (in 32 bits, for the `Imm32` offset) to `AT`, so the interpreter and
+    /// both backends read and write the same place. `off` is 0, a 12-bit or a 32-bit offset, as
+    /// the shape's `Disp` says.
+    fn confined(&mut self) -> Result<(), String> {
+        let (access, disp) = self.shape.confined().ok_or("a confined shape naming no access")?;
+        let off = if disp == Disp::Zero { 0 } else { self.baked.imms[OFFSET] };
+        let vmctx = self.stack_addr(0);
+        let p = self.b.ins().iconst(types::I64, (i64::from(AT) - off) & 0xffff_ffff);
+        // An `iadd` of an `iconst`: `confine` fuses no `iadd_imm`.
+        let sum = if off == 0 {
+            p
+        } else {
+            let k = self.b.ins().iconst(types::I64, off);
+            self.b.ins().iadd(p, k)
+        };
+        let low = self.b.ins().ireduce(types::I32, sum);
+        let index = self.b.ins().uextend(types::I64, low);
+        let addr = self.b.ins().iadd(vmctx, index);
+        if self.shape.op == Op::LoadConfined {
+            self.load(access, loaded(access, self.shape.ty), Some(addr));
+        } else {
+            self.store(access, Some(addr));
+        }
+        Ok(())
+    }
+
+    /// A store `op` into prefilled memory, read back as two `i64`s: at `base + AT`, or at
+    /// `confined` (that place, reached through a confined address) with no offset.
+    fn store(&mut self, op: Op, confined: Option<ir::Value>) {
         let atomic = op == Op::AtomicStore;
         let base = self.stack_addr(0);
-        let at16 = if atomic { Some(self.stack_addr(AT)) } else { None };
+        let at16 = if atomic && confined.is_none() { Some(self.stack_addr(AT)) } else { None };
         let fill = self.iconst(Ty::I64, 0x5a5a_5a5a);
         self.b.ins().store(flags(), fill, base, AT);
         self.b.ins().store(flags(), fill, base, AT + 8);
-        let (value, addr) = if self.shape.srcs[1] == Src::Acc {
+        let (value, addr, at) = if let Some(addr) = confined {
+            (self.operand(0), addr, 0)
+        } else if self.shape.srcs[1] == Src::Acc {
             let value = self.operand(0);
-            (value, self.stack_addr(0))
+            (value, self.stack_addr(0), AT)
         } else {
-            (self.operand(0), at16.unwrap_or(base))
+            (self.operand(0), at16.unwrap_or(base), AT)
         };
         let f = flags();
         let ins = self.b.ins();
         match op {
-            Op::Store => ins.store(f, value, addr, AT),
-            Op::Istore8 => ins.istore8(f, value, addr, AT),
-            Op::Istore16 => ins.istore16(f, value, addr, AT),
-            Op::Istore32 => ins.istore32(f, value, addr, AT),
+            Op::Store => ins.store(f, value, addr, at),
+            Op::Istore8 => ins.istore8(f, value, addr, at),
+            Op::Istore16 => ins.istore16(f, value, addr, at),
+            Op::Istore32 => ins.istore32(f, value, addr, at),
             Op::AtomicStore => ins.atomic_store(f, value, addr),
             other => panic!("{other:?} is no store"),
         };
@@ -598,15 +647,24 @@ impl Cx<'_> {
             Op::X86Pmulhrsw => self.pure(|b, [x, y, _]| vec![b.ins().x86_pmulhrsw(x, y)]),
             Op::X86Pmaddubsw => self.pure(|b, [x, y, _]| vec![b.ins().x86_pmaddubsw(x, y)]),
             Op::X86Cvtt2dq => self.pure(|b, [x, _, _]| vec![b.ins().x86_cvtt2dq(t, x)]),
-            Op::Load => self.load(shape.ty),
-            Op::Uload8 | Op::Sload8 => self.load(Ty::I8),
-            Op::Uload16 | Op::Sload16 => self.load(Ty::I16),
-            Op::Uload32 | Op::Sload32 => self.load(Ty::I32),
-            Op::Uload8x8 | Op::Sload8x8 | Op::Uload16x4 | Op::Sload16x4 | Op::Uload32x2 | Op::Sload32x2 => {
-                self.load(Ty::I64)
+            Op::Load
+            | Op::Uload8
+            | Op::Sload8
+            | Op::Uload16
+            | Op::Sload16
+            | Op::Uload32
+            | Op::Sload32
+            | Op::Uload8x8
+            | Op::Sload8x8
+            | Op::Uload16x4
+            | Op::Sload16x4
+            | Op::Uload32x2
+            | Op::Sload32x2
+            | Op::AtomicLoad => self.load(shape.op, loaded(shape.op, shape.ty), None),
+            Op::Store | Op::Istore8 | Op::Istore16 | Op::Istore32 | Op::AtomicStore => {
+                self.store(shape.op, None)
             }
-            Op::AtomicLoad => self.load(shape.ty),
-            Op::Store | Op::Istore8 | Op::Istore16 | Op::Istore32 | Op::AtomicStore => self.store(),
+            Op::LoadConfined | Op::StoreConfined => self.confined()?,
             Op::StackAddr => {
                 let input = self.param(Ty::I64, Xform::Plain, None);
                 let base = self.stack_addr(0);

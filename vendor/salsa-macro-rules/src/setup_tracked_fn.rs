@@ -110,6 +110,7 @@ macro_rules! setup_tracked_fn {
             $($input_id: $input_ty,)*
         ) -> ::salsa::plumbing::return_mode_ty!(($return_mode, __), $db_lt, $output_ty) {
             use ::salsa::plumbing as $zalsa;
+            use $zalsa::ZalsaDatabase as _;
 
             $zalsa::attach($db, || {
                 let (zalsa, zalsa_local) = $db.zalsas();
@@ -141,6 +142,7 @@ macro_rules! setup_tracked_fn {
 
         const _: () = {
             use ::salsa::plumbing as $zalsa;
+            use $zalsa::ZalsaDatabase as _;
 
             struct $Configuration;
 
@@ -502,6 +504,7 @@ macro_rules! setup_tracked_fn {
                         $($input_id: $interned_input_ty,)*
                     ) -> Vec<&$db_lt A> {
                         use ::salsa::plumbing as $zalsa;
+                        use $zalsa::ZalsaDatabase as _;
                         let key = $zalsa::macro_if! {
                             if $needs_interner {{
                                 let (zalsa, zalsa_local) = $db.zalsas();

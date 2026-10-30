@@ -1,0 +1,21 @@
+{
+  "id": "00035",
+  "from_lane": "store",
+  "owner": "format",
+  "paths": [],
+  "what": "## Column codecs belong to the value encoding (plan/design/data.md)\n\n- Who: format.\n- What: plan/design/data.md's compression paragraph puts frame-of-reference bit-packing, run\n  lengths and deltas over columns with \"format, store\". The store sees values as opaque bytes,\n  so it cannot pick a codec per column. Apply those codecs in the value encoding, before `put`.\n  The store's part is the last stage: it applies zstd (with a dictionary per kind) and picks the\n  hot, warm or cold form by read recency (`Store::settle`).\n- Why: a column codec chosen after the bytes are opaque would have to guess the layout. Applied\n  in the encoding, it round-trips exactly by construction, and zstd still runs over the result.\n\n> forwarded to format",
+  "state": "open",
+  "created": "2026-10-30T00:02:32Z",
+  "updated": "2026-10-30T00:02:32Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/store.md#Column codecs belong to the value encoding (plan/design/data.md)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/store.md:113"
+    }
+  ]
+}

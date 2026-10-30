@@ -18,7 +18,7 @@ use cranelift_codegen::{
     binemit::{CodeOffset, Reloc},
     ir::Signature,
 };
-use cranelift_module::{ModuleReloc, ModuleRelocTarget};
+use cranelift_module::ModuleRelocTarget;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_derive::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,6 +30,50 @@ use super::{
     store::{KEY, Store},
     unwind::FunctionUnwind,
 };
+
+/// What a value displays as, given to a hasher as the bytes of `value.to_string()` would be,
+/// without the string.
+struct Hashed<'a>(&'a mut Sha256);
+
+impl Hashed<'_> {
+    fn text(&mut self, value: impl std::fmt::Display) {
+        std::fmt::Write::write_fmt(self, format_args!("{value}"))
+            .expect("a Display implementation returned an error");
+    }
+
+    /// The bytes with their length before them, so that no two lists of them are the same
+    /// bytes: [`Entry::key`]'s fields.
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.0.update((bytes.len() as u64).to_le_bytes());
+        self.0.update(bytes);
+    }
+
+    /// [`Self::bytes`] of what `value` displays as.
+    fn field(&mut self, value: impl std::fmt::Display) {
+        let mut len = Len(0);
+        std::fmt::Write::write_fmt(&mut len, format_args!("{value}"))
+            .expect("a Display implementation returned an error");
+        self.0.update((len.0 as u64).to_le_bytes());
+        self.text(value);
+    }
+}
+
+impl std::fmt::Write for Hashed<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0.update(text);
+        Ok(())
+    }
+}
+
+/// How many bytes what is written is.
+struct Len(usize);
+
+impl std::fmt::Write for Len {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0 += text.len();
+        Ok(())
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(super) struct Entry {
@@ -154,8 +198,9 @@ impl PartialEq for CachedCode {
 impl From<&Code> for CachedCode {
     fn from(code: &Code) -> CachedCode {
         CachedCode {
+            // clone: an entry made for the store, once per function compiled; the build keeps `code`
             signature: code.signature.clone(),
-            bytes: code.bytes.clone(),
+            bytes: code.bytes.clone(), // clone: as above
             align: code.align,
             relocs: code
                 .relocs
@@ -164,10 +209,13 @@ impl From<&Code> for CachedCode {
                     let it = it.module(super::fragment::unstitched());
                     CachedReloc { offset: it.offset, kind: it.kind, name: it.name, addend: it.addend }
                 })
+                // alloc: the entry's own relocations, sized exactly, once per function compiled
                 .collect(),
+            // alloc: as above, empty unless a relocation has an ELF type
             elf_types: code.relocs.iter().filter_map(|it| Some((it.offset, it.elf_type?))).collect(),
-            unwind: code.unwind.clone(),
+            unwind: code.unwind.clone(), // clone: an entry made for the store, as above
             lines: code.lines.clone(),
+            // clone: as above
             slots: code.slots.clone(),
         }
     }
@@ -197,25 +245,42 @@ impl CachedCode {
     /// The code, or why a relocation of it can't be kept: an ELF type at an offset where no
     /// relocation is.
     pub(super) fn code(&self) -> Result<Code, super::fragment::RelocError> {
-        let mut relocs = super::fragment::Relocs::with_capacity(self.relocs.len());
+        let relocs = self.relocs()?;
+        Ok(Code {
+            // clone: the entry is shared (`Arc<Entry>`) and the stitcher in `mod.rs` takes a `Code`
+            signature: self.signature.clone(),
+            bytes: self.bytes.clone(), // clone: as above
+            align: self.align,
+            relocs,
+            unwind: self.unwind.clone(), // clone: as above
+            lines: self.lines.clone(),
+            // clone: as above
+            slots: self.slots.clone(),
+        })
+    }
+
+    /// [`Self::code`] of an entry that is not kept, moved rather than copied.
+    #[cfg(feature = "llvm")]
+    fn into_code(self) -> Result<Code, super::fragment::RelocError> {
+        let relocs = self.relocs()?;
+        let CachedCode { signature, bytes, align, unwind, lines, slots, .. } = self;
+        Ok(Code { signature, bytes, align, relocs, unwind, lines, slots })
+    }
+
+    fn relocs(&self) -> Result<super::fragment::Relocs, super::fragment::RelocError> {
+        use super::fragment::{Reloc, RelocName, Relocs};
+        let mut relocs = Relocs::with_capacity(self.relocs.len());
         let mut typed = self.elf_types.iter().peekable();
         for it in &self.relocs {
-            let reloc =
-                ModuleReloc { offset: it.offset, kind: it.kind, name: it.name.clone(), addend: it.addend };
-            relocs.push_module(&reloc, typed.next_if(|typed| typed.0 == it.offset).map(|it| it.1))?;
+            let elf_type = typed.next_if(|typed| typed.0 == it.offset).map(|it| it.1);
+            let name = RelocName::of_module(&it.name)?;
+            let (offset, kind, addend) = (it.offset, it.kind, it.addend);
+            relocs.push(Reloc { offset, kind, name, addend, elf_type })?;
         }
         if let Some(&(offset, _)) = typed.next() {
             return Err(super::fragment::RelocError::Unmatched(offset));
         }
-        Ok(Code {
-            signature: self.signature.clone(),
-            bytes: self.bytes.clone(),
-            align: self.align,
-            relocs,
-            unwind: self.unwind.clone(),
-            lines: self.lines.clone(),
-            slots: self.slots.clone(),
-        })
+        Ok(relocs)
     }
 }
 
@@ -261,10 +326,10 @@ impl StoredCode {
             hasher.update(align.to_le_bytes());
         }
         hasher.update(u32::MAX.to_le_bytes());
-        hasher.update(super::Backend::Llvm(optimization).to_string());
+        Hashed(&mut hasher).text(super::Backend::Llvm(optimization));
         // Nor LLVM's inliner threshold.
         hasher.update(super::llvm::inline_threshold().to_le_bytes());
-        hasher.update(ir.to_string());
+        Hashed(&mut hasher).text(ir);
         // Nor does it tell which statement an instruction is of, which the code's lines do.
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
@@ -309,10 +374,12 @@ impl StoredCode {
         use super::fragment::{DataRequest, FuncTarget};
         let (funcs, datas) = recorder.since(mark);
         let imports = funcs.iter().map(|it| match &it.target {
+            // clone: what LLVM's code is kept with in the store, once per function it compiles
             FuncTarget::Symbol(symbol) => Some(symbol.clone()),
             _ => None,
         });
         let blobs = datas.iter().map(|it| match it {
+            // clone: as above
             DataRequest::Blob { blob, identity: DataIdentity::Shared } => Some(blob.clone()),
             _ => None,
         });
@@ -322,15 +389,16 @@ impl StoredCode {
             blobs: blobs.collect::<Option<_>>()?,
         };
         for reloc in &mut stored.code.relocs {
-            reloc.name = match reloc.name {
+            let renamed = match reloc.name {
                 ModuleRelocTarget::User { namespace: 0, index } if index as usize >= mark.funcs => {
                     ModuleRelocTarget::user(Self::IMPORTS, index - mark.funcs as u32)
                 }
                 ModuleRelocTarget::User { namespace: 1, index } if index as usize >= mark.datas => {
                     ModuleRelocTarget::user(Self::BLOBS, index - mark.datas as u32)
                 }
-                ref other => other.clone(),
+                _ => continue,
             };
+            reloc.name = renamed;
         }
         Some(stored)
     }
@@ -350,17 +418,18 @@ impl StoredCode {
             .collect::<Option<_>>()?;
         let mut cached = self.code;
         for reloc in &mut cached.relocs {
-            reloc.name = match reloc.name {
+            let renamed = match reloc.name {
                 ModuleRelocTarget::User { namespace: Self::IMPORTS, index } => {
                     ModuleRelocTarget::user(0, imports.get(index as usize)?.as_u32())
                 }
                 ModuleRelocTarget::User { namespace: Self::BLOBS, index } => {
                     ModuleRelocTarget::user(1, blobs.get(index as usize)?.as_u32())
                 }
-                ref other => other.clone(),
+                _ => continue,
             };
+            reloc.name = renamed;
         }
-        cached.code().ok()
+        cached.into_code().ok()
     }
 
     /// Whether the code and the blobs refer only to what is kept with them and to what a
@@ -433,36 +502,33 @@ impl Entry {
     pub(super) fn key(name: &str, debug: Told, program: Option<&[u8; 32]>) -> Option<[u8; KEY]> {
         let mut hasher = Sha256::new();
         // Each with its length, so that no two lists of them are the same bytes.
-        let mut field = |bytes: &[u8]| {
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
-        };
+        let mut key = Hashed(&mut hasher);
         // 13: `ub_checks()` is the compiling crate's `debug-assertions`, as rustc has it.
         // 14: a body of a crate with `debug-assertions` has rustc's UB checks (`MirOptions`).
-        field(b"blaze entry 14");
-        field(program.map_or(&[][..], |it| it));
+        key.bytes(b"blaze entry 14");
+        key.bytes(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
-        field(super::Backend::from_env().ok()?.to_string().as_bytes());
+        key.field(super::Backend::from_env().ok()?);
         // Nor is code of a body at a level asked for in place of rustc's.
         if let Some(level) = super::mir_opt_level() {
-            field(&[b'M', level.number()]);
+            key.bytes(&[b'M', level.number()]);
         }
         // Nor is code for one target what another runs.
-        field(super::Target::selected().ok()?.triple().as_bytes());
+        key.bytes(super::Target::selected().ok()?.triple().as_bytes());
         // Nor code that gives the frame pointer's register to values; the keys without stay.
         if super::backend::frame_pointers() {
-            field(b"frame pointers");
+            key.bytes(b"frame pointers");
         }
         // Nor code compiled where rustc's `-C link-dead-code` decides some of it.
         if super::backend::links_dead_code() {
-            field(b"link dead code");
+            key.bytes(b"link dead code");
         }
-        field(&[(debug != Told::Nothing) as u8]);
+        key.bytes(&[(debug != Told::Nothing) as u8]);
         // The keys of the other two stay what they were.
         if debug == Told::Lines {
-            field(b"lines alone");
+            key.bytes(b"lines alone");
         }
-        field(name.as_bytes());
+        key.bytes(name.as_bytes());
         Some(hasher.finalize().into())
     }
 
@@ -622,6 +688,7 @@ struct Sharded<K, V>(Box<[Mutex<FxHashMap<K, V>>]>);
 
 impl<K: std::hash::Hash + Eq, V> Default for Sharded<K, V> {
     fn default() -> Self {
+        // alloc: the shards, once per program asked about
         Sharded((0..64).map(|_| Mutex::default()).collect())
     }
 }
@@ -654,12 +721,14 @@ impl KeptTypes {
         if let Some((_, key)) = self.keys.get(&at) {
             return *key;
         }
+        // alloc: once per set of types, when the first entry with it is given to the store
         let bytes = postcard::to_allocvec(&types.to_vec()).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(b"blaze types 1");
         hasher.update(&bytes);
         let key = hasher.finalize().into();
         store.insert(&key, &bytes);
+        // clone: a refcount, which keeps the set at `at`, so that nothing else comes to be there
         self.keys.insert(at, (types.clone(), key));
         key
     }
@@ -720,6 +789,7 @@ impl Writer {
     pub(super) fn keep(&mut self, kept: Kept) {
         if self.threads.is_none() && !self.alone {
             let (jobs, queued) = std::sync::mpsc::channel::<Kept>();
+            // alloc: once per writer, the queue its threads share
             let queued = Arc::new(Mutex::new(queued));
             // A whole build hands over most of its entries at once, when its last wave is
             // compiled: one thread would write them after the link.
@@ -727,9 +797,10 @@ impl Writer {
                 std::thread::available_parallelism().map_or(1, |it| it.get() / 8).clamp(1, 8);
             let threads: Vec<_> = (0..count)
                 .map_while(|_| {
-                    let mut writer =
-                        Writer::alone(self.store, self.cargo_home.clone(), self.library.clone());
-                    let queued = queued.clone();
+                    // clone: once per writer thread, at most 8 of them, setup
+                    let (cargo_home, library) = (self.cargo_home.clone(), self.library.clone());
+                    let mut writer = Writer::alone(self.store, cargo_home, library);
+                    let queued = queued.clone(); // clone: a refcount, as above
                     let work = move || {
                         loop {
                             let next = queued.lock().unwrap_or_else(|e| e.into_inner()).recv();
@@ -738,8 +809,10 @@ impl Writer {
                         }
                         std::mem::take(&mut writer.written)
                     };
+                    // alloc: the thread's name, once per writer thread
                     std::thread::Builder::new().name("blaze store".to_owned()).spawn(work).ok()
                 })
+                // alloc: the handles of at most 8 threads, once per writer
                 .collect();
             match threads.is_empty() {
                 true => self.alone = true,
@@ -774,6 +847,7 @@ impl Writer {
     pub(super) fn encoded(&mut self, entry: &mut Entry) -> Option<Vec<u8>> {
         if let Some(debug) = &mut entry.debug {
             let keys = debug.types.iter().map(|it| self.types.keep(self.store, it));
+            // alloc: what the entry is written with, once per entry given to the store
             debug.stored_types = keys.collect();
         }
         entry.leave(self.cargo_home.as_deref(), self.library.as_ref()).then(|| entry.encode())?
@@ -827,6 +901,7 @@ impl Entries {
 
     /// Never use the entry again in this process: it did not fit the object it was read for.
     pub(super) fn ban(name: &str) {
+        // alloc: an error path, an entry that did not fit its object
         Self::banned().lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_owned());
     }
 
@@ -847,13 +922,16 @@ impl Entries {
                 (!Self::is_banned(name)).then(|| tally.step(super::backend::Step::StoreRead, read));
             entry.flatten().map(Arc::new)
         })
+        // clone: a refcount, no allocation: the entry is shared by every function that calls it
         .clone()
     }
 
     fn cell(&self, name: &str) -> Arc<OnceLock<Option<Arc<Entry>>>> {
         let mut entries = self.entries.shard(name);
         match entries.get(name) {
+            // clone: a refcount, no allocation: the shard's lock is let go before the store is read
             Some(cell) => cell.clone(),
+            // clone: as above, after the name's one allocation the first time it is asked for
             None => entries.entry(Arc::from(name)).or_default().clone(),
         }
     }
@@ -886,28 +964,36 @@ impl Entries {
         let tally = super::backend::Tally::global();
         let mut seen: FxHashSet<Arc<str>> = FxHashSet::default();
         let mut wave: Vec<Arc<str>> =
+            // alloc: once per program built, the names it starts from (a refcount each)
             names.into_iter().filter(|it| seen.insert(it.clone())).collect();
+        // Each wave's lists below are allocated once per wave, a handful a build, each of
+        // which reads hundreds of entries from the store at once.
         while !wave.is_empty() {
             // What another thread read already, or is reading, is not read again.
             let cells: Vec<_> = (wave.iter())
                 .map(|name| (name, self.cell(name)))
                 .filter(|(_, cell)| cell.get().is_none())
+                // alloc: once per wave
                 .collect();
             let keyed: Vec<(usize, [u8; KEY])> = (cells.iter().enumerate())
                 .filter(|(_, (name, _))| !Self::is_banned(name))
                 .filter_map(|(at, (name, _))| {
                     Some((at, Entry::key(name, self.debug, self.program.as_ref())?))
                 })
+                // alloc: once per wave
                 .collect();
+            // alloc: once per wave, the keys `get_many` takes as a slice
             let keys: Vec<[u8; KEY]> = keyed.iter().map(|it| it.1).collect();
             let values =
                 tally.step(super::backend::Step::StoreRead, || self.store.get_many(&keys, threads));
+            // alloc: once per wave
             let mut read: Vec<Option<Vec<u8>>> = vec![None; cells.len()];
             for ((at, _), value) in keyed.iter().zip(values) {
                 read[*at] = value;
             }
             let next = std::sync::atomic::AtomicUsize::new(0);
             let decode = || {
+                // alloc: once per decoding thread per wave
                 let mut called = Vec::new();
                 loop {
                     let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -924,6 +1010,7 @@ impl Entries {
             let called: Vec<Arc<str>> = match threads {
                 1 => decode(),
                 _ => std::thread::scope(|scope| {
+                    // alloc: once per wave, the handles of the decoding threads
                     let others: Vec<_> = (1..threads).map(|_| scope.spawn(decode)).collect();
                     let mut called = decode();
                     for other in others {
@@ -935,6 +1022,7 @@ impl Entries {
                     called
                 }),
             };
+            // alloc: once per wave, the next one (a refcount each for `seen`)
             wave = called.into_iter().filter(|it| seen.insert(it.clone())).collect();
         }
     }
@@ -952,11 +1040,13 @@ impl Entries {
     /// The set of types kept under `key`, which every entry with a variable of the type
     /// shares.
     fn types(&self, key: &[u8; KEY]) -> Option<TypeSet> {
+        // clone: a refcount, no allocation: the shard's lock is let go before the store is read
         let cell = self.types.shard(key).entry(*key).or_default().clone();
         cell.get_or_init(|| {
             let types = self.store.get(key).and_then(|it| postcard::from_bytes::<Vec<_>>(&it).ok());
             types.map(TypeSet::from)
         })
+        // clone: a refcount (`TypeSet` is an `Arc` and a place in it), no allocation
         .clone()
     }
 
@@ -978,14 +1068,18 @@ impl Entries {
             return false;
         };
         // Entries call each other in circles, so one is only known to be usable along with
-        // the ones it leans on.
+        // the ones it leans on. What follows runs once per name that was not settled, which
+        // it then is: a hit is `settled` above.
+        // alloc: once per name settled, as above (and a refcount)
         let mut unsettled = vec![name.clone()];
         let mut leaning = FxHashMap::<Arc<str>, usize>::default();
-        leaning.insert(name.clone(), 0);
+        leaning.insert(name.clone(), 0); // clone: a refcount
+        // alloc: once per name settled, as above
         let mut path = vec![Visit { name, entry, seen: 0, leans_on: 0, below: 0 }];
         while !path.is_empty() {
             let depth = path.len() - 1;
             let visit = &mut path[depth];
+            // clone: a refcount, so that `path` can grow while a callee's name is borrowed
             let entry = visit.entry.clone();
             let Some(callee) = entry.named().nth(visit.seen) else {
                 let Some(done) = path.pop() else { break };
@@ -1019,8 +1113,9 @@ impl Entries {
                 }
                 return false;
             };
+            // clone: a refcount each: the name is in `leaning`, `unsettled` and `path` till settled
             leaning.insert(callee.clone(), depth + 1);
-            unsettled.push(callee.clone());
+            unsettled.push(callee.clone()); // clone: as above
             path.push(Visit {
                 name: callee,
                 entry,

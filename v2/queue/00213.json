@@ -1,0 +1,23 @@
+{
+  "id": "00213",
+  "from_lane": "frontend-image",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## frontend-image: `tools/v2/hot_lint.py` can't run with `crates`, and reads gated test modules as hot code\n\n1. `{\"root\": \".\", \"crates\": [\"intern\"]}` fails: `typed_input: crates has a type it does not read:\n   list[str]`. `typed_input` reads `tuple[str, ...]`, so the fix is\n   `crates: tuple[str, ...] = HOT`.\n2. `in_test_module` only spots `#[cfg(test)]`. Modules gated `#[cfg(all(test, blaze_check))]` and\n   `#[cfg(all(test, not(blaze_check)))]` (in `intern`'s `arena.rs`, `intern.rs` and\n   `intern_slice.rs`) are reported: 28 findings in intern, all test code. Matching\n   `#[cfg(` followed by `test` as a word (`r\"#\\[cfg\\((all\\()?test\\b\"`) fixes it.\n\nUntil then I ran `lint_file` over my crates directly: the only findings left are those 28.\n\n> forwarded to the coordinator: `tools/` is its; on requests' coordinator list (with usercode-fast-tests 9 and safety F4).",
+  "state": "open",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T02:24:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/coordinator.md#frontend-image: `tools/v2/hot_lint.py` can't run with `crates`, and reads gated test modules as hot code",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:84"
+    }
+  ]
+}

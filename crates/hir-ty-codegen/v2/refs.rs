@@ -138,6 +138,7 @@ fn memo<'db>(
         // `lang_start` is the library's, and its bodies are inlined in every unit.
         Kind::Start(main) => start_walk(db, *main),
         Kind::Allocator(forward) => {
+            // alloc: the error's message
             return Err(format!("{forward:?}: an allocator entry, whose references are listed"));
         }
         Kind::Code(code, env) => {
@@ -147,11 +148,13 @@ fn memo<'db>(
                 && matches!(code.def, InstanceDef::Fn(_) | InstanceDef::Closure(_))
                 && super::frontend::crate_of(db, &instance.0)
                     .is_some_and(|it| !it.data(db).origin.is_lang());
+            // clone: the query's keys by value, each a few `Copy` ids in a `Clone`-only type
             code_walk(db, code.clone(), env.clone(), inlined)
         }
     };
     match walked {
         Ok(walked) => Ok(Some(walked)),
+        // alloc: the error's message
         Err(what) => Err(format!("the references of {instance:?}: {what}")),
     }
 }
@@ -205,6 +208,7 @@ fn code_refs(
         | InstanceDef::Coroutine(_)
         | InstanceDef::CoroutineByMove(_) => (),
     }
+    // clone: `instance_body` takes the env by value; two `Copy` ids in a `Clone`-only type
     let body = crate::instance_body(db, instance, env.clone(), Some(Build::WALK)).map_err(told)?;
     let body = &*body;
     let (tracked, abi, variadic) = match instance.def {
@@ -220,18 +224,20 @@ fn code_refs(
     let inlined = match inlined && !written.data(db).origin.is_lang() && body.coroutine.is_none()
     {
         true => Some(
+            // clone: as above, two `Copy` ids in a `Clone`-only type
             crate::instance_body(db, instance, env.clone(), Some(Build::WALK_INLINED))
                 .map_err(told)?,
         ),
         false => None,
     };
     let inlined = inlined.as_deref().filter(|it| !it.inlined.callees.is_empty());
+    // clone: `Found` owns the env the requests hold; two `Copy` ids in a `Clone`-only type
     let mut found = Found::new(env.clone(), Some(body));
     let env = env.as_ref(db);
     pass(db, env, Some(body), tracked, (Build::WALK, &mut found), |walk| {
         walk.fx.abi = abi;
         walk.fx.variadic = variadic;
-        walk.fx.args = Some(instance.args.clone());
+        walk.fx.args = Some(instance.args);
         walk.outside()?;
         walk.body(body)
     })?;
@@ -239,7 +245,7 @@ fn code_refs(
         pass(db, env, Some(inlined), tracked, (Build::WALK_INLINED, &mut found), |walk| {
             walk.fx.abi = abi;
             walk.fx.variadic = variadic;
-            walk.fx.args = Some(instance.args.clone());
+            walk.fx.args = Some(instance.args);
             walk.body(inlined)
         })?;
     }
@@ -293,6 +299,7 @@ fn pass<'db>(
 }
 
 fn told(error: CodegenError) -> String {
+    // alloc: the error's message
     error.to_string()
 }
 
@@ -327,6 +334,7 @@ impl<'db> Found<'db> {
             env,
             listed: Listed::with_capacity(capacity),
             called: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            // alloc: the memoized output, empty until a callee is built in
             built_in: Vec::new(),
         }
     }
@@ -531,6 +539,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             };
             let at = self.call_place(def, callee.args.as_ref())?;
             if !matches!(self.found.listed.refs[at as usize], FrontRef::Function(_)) {
+                // alloc: the error's message
                 return Err(format!(
                     "{def:?} is inlined, but its callers name it as {:?}",
                     self.found.listed.refs[at as usize]
@@ -551,6 +560,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             return Ok(());
         };
         if !matches!(self.found.listed.refs[at as usize], FrontRef::Function(_)) {
+            // alloc: the error's message
             return Err(format!(
                 "{instance:?} is built in, but its callers name it as {:?}",
                 self.found.listed.refs[at as usize]
@@ -637,6 +647,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                             fx.allocation_blob(allocation, false)
                         })?;
                     }
+                    // alloc: the error's message
                     kind => return Err(format!("constant {kind:?}")),
                 }
                 Ok(ty)
@@ -657,6 +668,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     }
 
     pub(super) fn operands(&mut self, operands: &[Operand]) -> Result<Tys<'db>, String> {
+        // alloc: into `Tys`, inline up to eight operands
         operands.iter().map(|it| self.operand(it)).collect()
     }
 
@@ -681,6 +693,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     pub(super) fn panic(&mut self, path: &[&str]) -> Result<(), String> {
         match self.fx.core_function(path) {
             Some(func) => self.call(InstanceDef::Fn(func), GenericArgs::new_from_slice(&[])),
+            // alloc: the error's message
             None => Err(format!(
                 "a call of rustc's `core::{}`, which a build without rustc has none of",
                 path.join("::")
@@ -719,6 +732,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         let (callee, callee_args) = db.lookup_impl_method(self.fx.env, func, generic_args);
         let either::Either::Left(callee) = callee else {
+            // alloc: the error's message
             return Err("call to builtin derive method".to_owned());
         };
         if callee == func
@@ -751,6 +765,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
                 match ty.closure_upvars_ty().map(|it| it.kind()) {
                     Some(TyKind::Tuple(fields)) => Some(fields),
+                    // alloc: the error's message
                     _ => return Err("builtin `Clone` of a closure without tupled upvars".to_owned()),
                 }
             }
@@ -773,6 +788,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             | TyKind::Never
             | TyKind::RawPtr(..)
             | TyKind::Ref(_, _, Mutability::Not) => Ok(()),
+            // alloc: the error's message
             _ => Err(format!("builtin `Clone` of {ty:?}")),
         }
     }
@@ -856,6 +872,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// The body of a function, closure or `async` block, as `FunctionCx::codegen` builds it.
     fn body(&mut self, body: &'db MirBody<'db>) -> Result<(), String> {
         if body.phase != MirPhase::Runtime {
+            // alloc: the error's message
             return Err("a body whose drops are not elaborated".to_owned());
         }
         self.bfloat(body)?;
@@ -876,6 +893,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 match &statement.kind {
                     StatementKind::Assign(place, rvalue) => self.rvalue(place, rvalue)?,
                     StatementKind::InlineAsm(asm) => self.inline_asm(asm)?,
+                    // alloc: the error's message
                     StatementKind::Deinit(_) => return Err("deinit".to_owned()),
                     StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
@@ -884,6 +902,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 }
             }
             let Some(terminator) = &block.terminator else {
+                // alloc: the error's message
                 return Err("block without terminator".to_owned());
             };
             self.fx.span = terminator.span;
@@ -949,9 +968,11 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     fn enter_coroutine(&mut self, body: &'db MirBody<'db>) -> Result<(), String> {
         let receiver = body.param_locals[0];
         let Some(ty) = body.locals[receiver].ty.as_ref().builtin_deref(true) else {
+            // alloc: the error's message
             return Err("async body without a reference to its future".to_owned());
         };
         let TyKind::Coroutine(_, args) = ty.kind() else {
+            // alloc: the error's message
             return Err(format!("async body of {ty:?}"));
         };
         for field in args.as_coroutine().tupled_upvars_ty().tuple_fields().iter() {
@@ -1023,6 +1044,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             }
             Rvalue::CheckedBinaryOp(..) => {
                 let dst = self.place_ty(place).ty;
+                // alloc: the error's message
                 return Err(format!("rvalue {rvalue:?} of {dst:?}"));
             }
             Rvalue::ThreadLocalRef(never) | Rvalue::AddressOf(never) | Rvalue::NullaryOp(never) => {
@@ -1054,6 +1076,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             CastKind::IntToFloat | CastKind::FloatToInt | CastKind::FloatToFloat => {
                 self.float_cast(kind, from, to)
             }
+            // alloc: the error's message
             _ => Err(format!("cast {kind:?}")),
         }
     }
@@ -1073,6 +1096,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 if def.def_id() == to_def.def_id() =>
             {
                 let AdtId::StructId(id) = def.def_id() else {
+                    // alloc: the error's message
                     return Err(format!("unsizing {from_ty:?} to {to_ty:?}"));
                 };
                 let interner = self.fx.interner;
@@ -1088,6 +1112,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 }
                 Ok(())
             }
+            // alloc: the error's message
             _ => Err(format!("unsizing {from_ty:?} to {to_ty:?}")),
         }
     }
@@ -1101,6 +1126,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             (TyKind::Dynamic(..), TyKind::Dynamic(..)) => Ok(()),
             (_, TyKind::Dynamic(..)) => {
                 if self.fx.is_unsized(from) {
+                    // alloc: the error's message
                     return Err(format!("unsizing {from:?} to {to:?}"));
                 }
                 self.recorded(|fx| {
@@ -1113,10 +1139,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 if def.def_id() == to_def.def_id() =>
             {
                 let AdtId::StructId(id) = def.def_id() else {
+                    // alloc: the error's message
                     return Err(format!("unsizing {from:?}"));
                 };
                 let field_types = self.db().field_types(id.into());
                 let Some((_, last)) = field_types.iter().last() else {
+                    // alloc: the error's message
                     return Err("unsizing a struct without fields".to_owned());
                 };
                 let interner = self.fx.interner;
@@ -1125,6 +1153,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 let (from, to) = (self.fx.normalize(from), self.fx.normalize(to));
                 self.unsize_metadata(from, to)
             }
+            // alloc: the error's message
             _ => Err(format!("unsizing {from:?} to {to:?}")),
         }
     }
@@ -1157,7 +1186,13 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 self.call_terminator(func, args, destination, *intrinsic)
             }
             TerminatorKind::DropAndReplace { .. } | TerminatorKind::Abort => {
+                // alloc: the error's message
                 Err(format!("terminator {kind:?}"))
+            }
+            // Refused as the back end refuses it: a unit with one is never compiled.
+            TerminatorKind::TailCall { .. } => {
+                // alloc: the error's message
+                Err("a tail call (`become`), which blaze's back ends do not make yet".to_owned())
             }
         }
     }
@@ -1191,6 +1226,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             AssertKind::Overflow(BinOp::Shr, ..) => "panic_const_shr_overflow",
             // A unit that makes this check refuses it, naming it.
             AssertKind::Overflow(..) if msg.is_optional_overflow_check() => return Ok(()),
+            // alloc: the error's message
             AssertKind::Overflow(op, ..) => return Err(format!("overflow check of {op:?}")),
             AssertKind::OverflowNeg(_) => "panic_const_neg_overflow",
             AssertKind::DivisionByZero(_) => "panic_const_div_by_zero",
@@ -1217,6 +1253,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             return self.emit_pointer_call(sig.abi(), named, &arg_tys, dst_ty);
         }
         let TyKind::FnDef(def, generic_args) = fn_ty.kind() else {
+            // alloc: the error's message
             return Err(format!("call of {fn_ty:?}"));
         };
         let func = match def.0 {
@@ -1236,6 +1273,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         if [lang_items.DropInPlace, lang_items.DropGlue].contains(&Some(func)) {
             let [pointer] = args else {
+                // alloc: the error's message
                 return Err(format!("drop glue with {} arguments", args.len()));
             };
             self.operand(pointer)?;
@@ -1243,6 +1281,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         let signature = FunctionSignature::of(db, func);
         if intrinsic.is_none() && FunctionSignature::is_intrinsic(db, func) {
+            // alloc: the error's message
             return Err(format!(
                 "a call of the intrinsic `{}` that MIR lowering did not recognize",
                 signature.name.as_str()
@@ -1250,20 +1289,23 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
         if intrinsic == Some(Intrinsic::ConstEvalSelect) {
             let [tuple, _, runtime] = args else {
+                // alloc: the error's message
                 return Err(format!("const_eval_select with {} arguments", args.len()));
             };
             let TyKind::FnDef(runtime, runtime_args) = self.operand_ty(runtime).kind() else {
+                // alloc: the error's message
                 return Err("const_eval_select with a non-fn-item runtime function".to_owned());
             };
             let CallableDefId::FunctionId(runtime) = runtime.0 else {
+                // alloc: the error's message
                 return Err("const_eval_select with a constructor".to_owned());
             };
             let tuple_ty = self.operand(tuple)?;
             let TyKind::Tuple(fields) = tuple_ty.kind() else {
+                // alloc: the error's message
                 return Err("const_eval_select with non-tuple arguments".to_owned());
             };
-            let fields: Tys<'db> = fields.iter().collect();
-            return self.call_direct(runtime, runtime_args, &fields, dst_ty);
+            return self.call_direct(runtime, runtime_args, fields.as_slice(), dst_ty);
         }
         if intrinsic.is_none()
             && func.krate(db).data(db).origin.is_lang()
@@ -1278,9 +1320,11 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             if AttrFlags::query(db, func.into())
                 .contains(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN)
             {
+                // alloc: the error's message
                 return Err(format!("intrinsic `{intrinsic}`, which must be overridden"));
             }
             if crate::compile_time_only(db, func) || !signature.has_body() {
+                // alloc: the error's message
                 return Err(format!("intrinsic `{intrinsic}`, which has no body to run"));
             }
         }
@@ -1304,6 +1348,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<(), String> {
         let Some((callee, rest)) = args.split_first() else {
+            // alloc: the error's message
             return Err("Fn-trait call without a callee".to_owned());
         };
         // A `dyn FnOnce` called by value: through its vtable's `call_once` slot.
@@ -1323,6 +1368,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             _ => None,
         };
         if let Some(fields) = spread {
+            // alloc: into `Tys`, inline up to eight arguments
             arg_tys = fields.iter().collect();
         }
         let mut by_ref = None;
@@ -1333,6 +1379,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             by_ref = Some((ty, mutability));
             if let TyKind::Dynamic(..) = inner.kind() {
                 if self.fx.fn_method_of_object(inner).is_none() {
+                    // alloc: the error's message
                     return Err(format!("Fn-trait call on {inner:?}"));
                 }
                 // Through the object's vtable.
@@ -1343,7 +1390,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         match ty.kind() {
             TyKind::FnDef(def, generic_args) => match def.0 {
                 CallableDefId::FunctionId(func) => {
+                    // alloc: the error's message
                     if let Some(intrinsic) = intrinsic_of(db, func).map_err(|it| it.to_string())? {
+                        // alloc: the error's message
                         return Err(format!("intrinsic `{intrinsic}` called through an Fn trait"));
                     }
                     self.call_direct(func, generic_args, &arg_tys, dst_ty)
@@ -1373,10 +1422,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 let def = InstanceDef::Closure(id.as_id());
                 let body = self.fx.body_types(def, parent_args).map_err(told)?;
                 if body.params.len() != arg_tys.len() + 1 {
+                    // alloc: the error's message
                     return Err("closure called with a tuple of arguments".to_owned());
                 }
                 let self_ty = body.params[0].as_ref();
                 let borrows = self_ty.as_reference().is_some();
+                // alloc: `Tys`, inline up to eight values
                 let mut values: Tys<'db> = smallvec![if borrows { self_ty } else { ty }];
                 values.extend(arg_tys);
                 self.emit_call(def, parent_args, &values, dst_ty)?;
@@ -1397,11 +1448,13 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     Some((ref_ty, Mutability::Mut)) => (by_mut, ref_ty),
                 };
                 let Some(method) = method else {
+                    // alloc: the error's message
                     return Err(format!("Fn-trait call on {ty:?}"));
                 };
                 let args = GenericArgs::new_from_slice(&[ty.into(), tuple_ty.into()]);
                 self.call_direct(method, args, &[self_ty, tuple_ty], dst_ty)
             }
+            // alloc: the error's message
             _ => Err(format!("Fn-trait call on {ty:?}")),
         }
     }
@@ -1416,10 +1469,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         for operand in &block.operands {
             match operand {
                 AsmOperand::Sym(_) if !block.naked && !seh => {
+                    // alloc: the error's message
                     return Err("`asm!` with a `sym`".to_owned());
                 }
                 AsmOperand::Sym(Operand { kind: OperandKind::Static(id), .. }) => {
                     if is_thread_local(db, *id) {
+                        // alloc: the error's message
                         return Err("inline assembly with a `sym` that is thread local".to_owned());
                     }
                     self.static_(*id)?;
@@ -1443,7 +1498,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                         if size.is_some_and(|it| it != bytes) {
                             return Err(
                                 "an `asm!` register that goes in and comes out in two sizes"
-                                    .to_owned(),
+                                    .to_owned(), // alloc: the error's message
                             );
                         }
                         size = Some(bytes);
@@ -1479,6 +1534,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                         _ => self.fx.const_bits(value),
                     };
                     let Some(bits) = bits else {
+                        // alloc: the error's message
                         return Err("an `asm!` constant that is not a literal".to_owned());
                     };
                     let unused = 128 - self.fx.layout(ty).map_err(told)?.size.bits() as u32;
@@ -1517,6 +1573,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     fn start_shim(&mut self, main: FunctionId) -> Result<(), String> {
         let interner = self.fx.interner;
         let Some(start) = interner.lang_items().Start else {
+            // alloc: the error's message
             return Err("no `lang_start`".to_owned());
         };
         let fn_ty = |func: FunctionId, args| {
@@ -1530,6 +1587,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let start_sig = sig_of(fn_ty(start, start_args));
         self.recorded(|fx| fx.fn_item(main_ty))?;
         let inputs: Tys<'db> =
+            // alloc: into `Tys`, inline up to eight; once per binary's `main`
             start_sig.inputs().as_slice().iter().map(|&ty| self.fx.normalize(ty)).collect();
         self.call_direct(start, start_args, &inputs, start_sig.output())
     }

@@ -11,7 +11,7 @@ use object::{Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKin
 
 use super::{CALLER, Disk, function, id, key, name, output, rel32, returns};
 use crate::premap::{
-    Bind, BindKind, Def, InitEntry, Kind, PlacedStatic, Prelinked, Prot, Request, StaticAt, Strength, layout, prelink,
+    Bind, BindKind, Def, InitEntry, Kind, Placed, PlacedStatic, Prot, Request, SegmentPlace, StaticAt, Strength, layout,
     prelink_placed,
 };
 use crate::state::State;
@@ -20,6 +20,21 @@ use crate::{Change, Image, Native, NativeKind, Output, OutputKind, Outside};
 const BASE: u64 = 0x7000_0000;
 /// The run's thread-local area starts 64 KiB below the thread pointer.
 const BIAS: i64 = -(64 << 10);
+
+/// Each segment's place and bytes, written by [`Placed::write_into`] one after another, each
+/// at a multiple of 64 KiB (every format's page divides it).
+fn segments(placed: &Placed) -> Vec<(SegmentPlace, Vec<u8>)> {
+    const STEP: usize = 64 << 10;
+    let mut offsets = Vec::with_capacity(placed.segments.len());
+    let mut end = 0;
+    for it in &placed.segments {
+        offsets.push(end);
+        end += (it.len as usize).div_ceil(STEP) * STEP;
+    }
+    let mut image = vec![0xaa; end];
+    placed.write_into(&mut image, &offsets).unwrap();
+    placed.segments.iter().zip(&offsets).map(|(it, at)| (*it, image[*at..][..it.len as usize].to_vec())).collect()
+}
 
 fn shared() -> Output {
     Output {
@@ -188,22 +203,24 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
         natives: &[Native { id: id(60), name: "hooked.o", bytes: &object, kind: NativeKind::Object, order: 0 }],
         spans: &[],
     };
-    let linked = prelink(&request).unwrap();
+    let placed = prelink_placed(&request).unwrap();
+    let linked = &placed.linked;
+    let written = segments(&placed);
 
-    let prots: Vec<Prot> = linked.segments.iter().map(|it| it.prot).collect();
+    let prots: Vec<Prot> = placed.segments.iter().map(|it| it.prot).collect();
     assert_eq!(prots, [Prot::ReadOnly, Prot::Code, Prot::ReadOnly, Prot::Data], "read, code, relro, write");
-    assert_eq!(linked.segments[0].addr, BASE, "never slid");
+    assert_eq!(placed.segments[0].addr, BASE, "never slid");
     let mut end = BASE;
-    for it in &linked.segments {
-        assert!(it.addr % 4096 == 0 && it.addr >= end && it.bytes.len() as u64 <= it.size, "{it:?}");
+    for it in &placed.segments {
+        assert!(it.addr % 4096 == 0 && it.addr >= end && it.len <= it.size, "{it:?}");
         end = it.addr + it.size;
     }
-    let code = &linked.segments[1];
+    let (code, code_bytes) = &written[1];
 
     let (one, two) = (linked.functions[0], linked.functions[1]);
     assert_eq!((one.0, one.2, two.0, two.2), (key(1), 6, key(2), 6));
     assert_eq!(two.1, one.1 + 16, "functions in key order, 16-aligned");
-    let at = |addr: u64, len: usize| code.bytes[(addr - code.addr) as usize..][..len].to_vec();
+    let at = |addr: u64, len: usize| code_bytes[(addr - code.addr) as usize..][..len].to_vec();
     assert_eq!(at(one.1, 6), returns(1));
     assert_eq!(at(two.1, 6), [0xe8, 0xeb, 0xff, 0xff, 0xff, 0xc3], "the call reaches f1, 21 bytes back");
 
@@ -216,8 +233,8 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
     assert_eq!((table.size, table.kind, table.strength, table.order), (8, Kind::Data, Strength::Strong, 0));
     assert_eq!(at(hook.value, 1), [0xc3], "hook is in the code");
 
-    let data = &linked.segments[3];
-    let word = |addr: u64| u64::from_le_bytes(data.bytes[(addr - data.addr) as usize..][..8].try_into().unwrap());
+    let (data, data_bytes) = &written[3];
+    let word = |addr: u64| u64::from_le_bytes(data_bytes[(addr - data.addr) as usize..][..8].try_into().unwrap());
     assert_eq!(word(table.value), hook.value, "an address, never slid");
     assert_eq!(
         linked.binds,
@@ -245,23 +262,15 @@ fn a_prelink_places_the_image_at_its_base_and_says_where_everything_is() {
     assert!(linked.reached_directly.is_empty(), "hook is reached only through table, a bind");
     let tls = linked.tls.unwrap();
     assert_eq!((tls.init, tls.size, tls.align), (4, 4, 4));
-    assert!(linked.segments[3].addr <= tls.template, "the template is in the writable segment");
+    assert!(data.addr <= tls.template, "the template is in the writable segment");
     assert!(linked.libraries.is_empty() && linked.unwind.is_empty() && linked.thread_vars.is_empty());
 
-    let placed = prelink_placed(&request).unwrap();
-    assert!(placed.linked.segments.is_empty());
-    assert_eq!(placed.linked, Prelinked { segments: Vec::new(), ..linked.clone() }, "the same link");
-    let places: Vec<(u64, u64, Prot, u64)> = placed.segments.iter().map(|it| (it.addr, it.size, it.prot, it.len)).collect();
-    let expected: Vec<(u64, u64, Prot, u64)> =
-        linked.segments.iter().map(|it| (it.addr, it.size, it.prot, it.bytes.len() as u64)).collect();
-    assert_eq!(places, expected);
-    // Each segment on a page of its own after a page of the caller's, the rest untouched.
     let offsets: Vec<usize> = (1..=placed.segments.len()).map(|it| it * 8 * 4096).collect();
     let mut image = vec![0xaa; (placed.segments.len() + 1) * 8 * 4096];
     placed.write_into(&mut image, &offsets).unwrap();
-    for (segment, offset) in linked.segments.iter().zip(&offsets) {
-        assert_eq!(&image[*offset..][..segment.bytes.len()], segment.bytes.as_slice(), "{segment:?}");
-        assert!(image[*offset + segment.bytes.len()..*offset + 4096 * 8].iter().all(|it| *it == 0xaa));
+    for ((segment, bytes), offset) in written.iter().zip(&offsets) {
+        assert_eq!(&image[*offset..][..bytes.len()], bytes.as_slice(), "{segment:?}");
+        assert!(image[*offset + bytes.len()..*offset + 4096 * 8].iter().all(|it| *it == 0xaa));
     }
     assert!(image[..offsets[0]].iter().all(|it| *it == 0xaa), "the caller's own bytes");
 
@@ -293,7 +302,7 @@ fn a_prelink_lists_the_weak_names_its_code_reaches_directly() {
         natives: &[Native { id: id(60), name: "hooked.o", bytes: &object, kind: NativeKind::Object, order: 0 }],
         spans: &[],
     };
-    let linked = prelink(&request).unwrap();
+    let linked = prelink_placed(&request).unwrap().linked;
     assert_eq!(linked.reached_directly, ["hook"], "a call to the weak hook; table is strong");
     assert_eq!(linked.binds.len(), 1, "table's pointer to hook is still bound");
 }
@@ -313,7 +322,7 @@ fn a_prelink_is_of_a_whole_shared_image_on_a_page() {
             natives: &[],
             spans: &[],
         };
-        prelink(&request).unwrap_err().what
+        prelink_placed(&request).err().expect("refused").what
     };
     assert!(request(&output(false), BASE).contains("shared image"));
     assert!(request(&Output { incremental: true, ..shared() }, BASE).contains("linked whole"));

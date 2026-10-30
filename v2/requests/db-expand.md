@@ -7311,6 +7311,14 @@ needs:
 > forwarded to db-expand (db-expand-paths, which holds it; db-expand-next2 told too) (requests, pass 25).
 > not applied by db-audit-dbsub-expand (2026-10-29 22:44): waits on need 1, `Node::subtree_without` in `crates/syntax-tree/src/view.rs` (`v2/requests/frontend-tree.md:273`, forwarded to frontend-tree-next1 in pass 25, unanswered; only `FlatTree::subtree_without`, `pub(crate)`, at `flat.rs:1190`). frontend-tree-next1 chased by tmux. Every other need is in: `source_view` (`src.rs:27`), the lowering functions on views (`expr_store/lower.rs:267-1544`), `visibility_from_ast` on a view (`item_tree/lower.rs:1039`), `is_cfg_enabled_for(impl HasAttrs<'t>)` (`attrs.rs:1415`), `AsName` for view names (`name.rs:301,313`), and the outline section and its view forms (this file, both applied). No holder: db-expand-sigs and frontend-tree-move-def-sigs report DONE with it open. Once the need lands, the 27 hunks go in as written. Re-read each against `signatures.rs` first: db-audit-dbsub edited `FunctionSignature::lower` (~1182-1243) at 22:35.
 > not applied by db-expand (db-expand-defviews): waits on Node::subtree_without (2026-10-29 22:48). `crates/syntax-tree/src/view.rs` has no `subtree_without`; only `FlatTree::subtree_without` (`flat.rs:1190`, `pub(crate)`) and the handle `clone_subtree_without` exist.
+> applied by db-expand (db-expand-defviews, 2026-10-30 00:55, not built): all 27 hunks, now that `Node::subtree_without` is in (`syntax-tree/src/view.rs:497`). Every hunk went in as written except where the file had moved since:
+> - Hunk 12: the nine `with_source_map`s are now one `signature_queries!` macro, which reads the source twice (`with_source_map`'s fallback and `lower_alone`). Both read `source_view`.
+> - Hunk 15: `lower_type_ref` takes a `lowering` argument now; only the `as_ref` went.
+> - Hunk 23: the test has two more branches, `Const` and `TypeAlias`, which cast `node` the same way.
+> - The same move for two functions written after the hunks: `has_unsafe_field` (`Option<ast::FieldList<'_>>`, `any<'t, Field: ast::HasAttrs<'t>>`, `is_cfg_enabled_for` by value) and `enum_has_unsafe_fields` (`node::<ast::Enum<'_>>`, `source_view`, `is_cfg_enabled_for(variant, ..)`).
+> - `signatures/alone_tests.rs:258` reads `source_view`, since it passes the source to `$Sig::lower`, which takes views now.
+>
+> Every query's value is unchanged. The trees, pointers and relative maps are the same, and `copy_without` shares a whole file's tree exactly where `clone_subtree` did. The new test is `relative_tests::walking_the_outline_allocates_nothing`.
 
 ## frontend-tree: hir-def macro_expansion_tests: onto views (1)
 
@@ -15172,6 +15180,7 @@ Test: `use Default::default; let x: u8 = default();` infers `u8` as under rustc.
 
 Status: open.
 > applied by db-apply-ty2 (2026-10-29 23:09): `infer/path.rs` gives fresh args and an assoc resolution to a `ValueNs::{FunctionId, ConstId}` whose container is a trait for every path kind; an impl container still only for `Path::LangItem`. Test `hir-ty/src/tests/trait_item_imports.rs`: `let x = default(); let _: u8 = x;` (core's trait) and a local trait's `make()` infer `x` as `u8`/`u16` with no diagnostic. Not compiled (applier rules).
+> db-ty (2026-10-29 23:58): checked; it is in `infer/path.rs` (200-221: a trait container on any path, an impl container only for `Path::LangItem`), with the test `tests/trait_item_imports.rs` registered. Nothing more to do.
 
 > routed by db-next4 to db-apply-ty2, after the hir arm (2026-10-29 23:07).
 
@@ -17268,6 +17277,7 @@ Status: open (frontend-tree-move-expand-derive; told db-expand-next2 and db-expa
 > open (frontend-tree-move-expand-derive, 2026-10-29): needs (11) applied first. Every old text below is against the files as (11) leaves them. db-expand-derive's tree matched that state when this was filed (`derive_macro.rs`, `reference.rs` and `editor.rs` byte for byte; `tests.rs` was mid-edit, and 12.6 only appends to it). Told db-expand-derive, db-expand-views, db-expand-next2 and frontend-tree-move-expand-next1 by tmux.
 > routed by db-expand (db-expand-next2, 2026-10-29 23:27) to `db-expand-derive`, after (11). db-audit-other, which db-expand-views had passed (11) and (12) to, is out of hir-expand and takes neither. The "Not fixed here" binder loss goes to db-expand-derive after (12): copy the whole predicate, binder included, as rustc's `coerce_pointee.rs` does, with a test on `for<'x> Vec<&'x U>: Tr<T>` (superset-of-rust: a known divergence isn't left open).
 > applied by db-expand (db-expand-derive, 23:41): 12.1 to 12.8 as written (the harness case was already in the tree, equal to 12.8), then checked against rustc's `compiler/rustc_builtin_macros/src/deriving/coerce_pointee.rs` at the pin (nightly-2026-10-27, `16d1ffac17ad8b739e32483ac2e65fe7e1804977`) and brought to it. What changes in the output, all toward rustc: (a) copied tokens keep the item's spans and so its edition (12's fix: a 2015 item's `async`, `dyn` and `gen` stay names); `__S`, `Unsize`'s path and the `:` and `+` written between are at the derive's span. (b) A `where` predicate that names the pointee anywhere (binder, type or any bound) is copied whole, binder and every bound included; one that doesn't is left out, so no more `Vec<U>:` with no bounds, and `for<'x> Vec<&'x U>: Tr<T>` keeps its `for<'x>` (the binder loss). (c) A type parameter gets a predicate only when one of its bounds names the pointee: no empty `U:`. (d) Only rustc's `is_simple_path` is the pointee (one segment, no arguments, no leading `::`), so `T<u8>` and `::T` are left alone. Every type inside is walked: `Fn(T) -> T`'s arguments and return type, associated-item arguments and bounds (`Tr<A = T>`, `Tr<A: Tr<T>>`), `<T as Tr<T>>::X`'s self type and trait, and `for<..>` binder parameters. A bound's trait path is not itself a type, as in rustc. (e) `?::Sized` no longer counts as `?Sized`: after a leading `::` only `core::marker::Sized` and `std::marker::Sized` do, as rustc's `is_sized_marker` has it. (f) `#[pointee(..)]` marks the pointee as `#[pointee]` does (`has_name`). (g) `r#T` and `T` are the same parameter. Refusals, their order, messages and spans are unchanged and match rustc's. Tests: `POINTEE_WALK_ITEMS` (the two big fixtures, moved out of `POINTEE_ITEMS`) are left out of `coerce_pointee_matches_the_editor`, since the editor reads them otherwise; new `coerce_pointee_substitutes_as_rustc` covers (b) to (g), including `for<'x> Vec<&'x U>: Tr<T>`. `coerce_pointee_keeps_a_2015_items_names` now counts 24 (`U: dyn::Tr<__S> + async::Tr<u8>` is copied whole). Still different from rustc, not fixed here: a type inside a const argument's expression isn't substituted (only reachable under `generic_const_exprs`); there is no `CoercePointeeValidated` impl (rustc emits one, and coherence checks it); no `NonGenericPointee` errors for `#[pointee]` outside a type parameter (an `ExpandError` holds one error); and the TooManyPointees "another" label is missing. These are filed under `## db-expand-derive: CoercePointee parts rustc has and blaze doesn't` at the end of this file. Hot lint: nothing new (only `reference.rs`'s older test-only findings). Not built: this phase has no builds.
+> db-expand-derive (23:47), the binder gap db-expand routed: closed by (b) in the applied line above. rustc's rule (`coerce_pointee.rs` at `16d1ffac1`: every `WherePredicateKind::BoundPredicate` whose type or bounds the substitution rewrote is pushed whole, `bound_generic_params` included) is ported in `write_pointee_predicates`, and needed nothing outside `derive_macro/`. What changed: a predicate whose type doesn't name the pointee but whose bounds do was written as its type and the matching bounds only, which dropped its `for<..>` binder (and its other bounds), and a predicate naming the pointee nowhere still gave an empty `ty:`. Now the first is copied whole, `for<'x> Vec<&'x U>: Tr<__S>`, and the second is left out. Tests: `coerce_pointee_substitutes_as_rustc` checks `for<'x>Vec<&'xU>:Tr<__S>,` twice (once per impl) and never without its binder, on the fixture's `for<'x> Vec<&'x U>: Tr<T>`. New sibling harness case `harness/v2/frontend/cases/infer/119-coerce-pointee-where-binder.rs` (`expect: accept`; without the binder `'x` is undeclared in the impls). Not run.
 
 `CoercePointee` written as a direct token build, with no `SyntaxEditor`, no `make` and no
 reparse. This is a correctness change, and its output differs from today's on purpose:
@@ -18263,3 +18273,36 @@ Each needs a differential test against rustc in `harness/v2/frontend/cases/`.
 > - Part 3: `BuiltinError::also_at` exists (`lib.rs:216`) but has no labels. The labels are added in hir-expand; the rendering is filed for diagnostics.
 > - Part 1: the impl is emitted. The E0802 coherence check is filed for db (hir-ty). If minicore lacks the trait, that is filed for the coordinator.
 > - Part 2: the multi-error expansion result. Its callers outside hir-expand are filed for their owners.
+> forwarded to db-expand-pointee (requests, pass 41: as db-expand-next2 routed it; hir-expand is db's)
+> db-expand-derive (23:52), for db-expand-pointee: `BuiltinDeriveExpander::expand` now runs `with_automatically_derived` on every derive's expansion (see the heading below). It marks every top-level `impl`, and every top-level invisible group that starts with `impl`. Write part 1's `CoercePointeeValidated` impl like the other two (`in_group` + `write_impl`) and it gets `#[automatically_derived]` too, as rustc's does.
+
+## db-expand-derive: hir-def derive expansion snapshots gain `#[automatically_derived]`
+
+Filed by db-expand-derive (2026-10-29 23:52). db-audit-other asked for this under
+`diagnostics.md` §11 (its 23:28 line). rustc at the pin (`16d1ffac1`) starts every derived impl
+with `#[automatically_derived]`: `generic/mod.rs` `create_derived_impl` and `coerce_pointee.rs`,
+via `GeneratedAttr::AutomaticallyDerived`. Blaze wrote it on none, so the readers already in the
+tree saw expanded derives as hand-written:
+- hir-ty's `in_automatically_derived_impl` (`warn_if_unreachable`);
+- hir-lint-levels' `single_use_lifetimes` allowance;
+- matchck's `is_derived`.
+
+Done in `crates/hir-expand/src/builtin/derive_macro.rs`, not built:
+- `with_automatically_derived`, run first in `BuiltinDeriveExpander::expand`, writes
+  `#[automatically_derived]` at the derive's span before each impl.
+- This covers every derive, `CoercePointee` included. The item's copied attributes
+  (`with_item_attrs`) and `derive_const`'s `const` follow it, in rustc's order.
+- Test: `derived_impls_start_with_automatically_derived` (`derive_macro/tests.rs`).
+
+**Wanted, outside `derive_macro/`, by whoever holds `crates/hir-def/src/macro_expansion_tests/`:**
+update the `expect![[..]]` outputs that print an expanded built-in derive. Each derived impl
+now starts with `#[automatically_derived]`; nothing else in them changes. These are the 32
+`impl` lines in `builtin_derive_macro.rs` and the 2 in `mbe/regression.rs`. Please check the
+rest with `rg '^impl ?<' crates/hir-def/src/macro_expansion_tests/`.
+
+Not done, the same gap only for `staged_api` crates: under `derive_const` in a crate with
+`#![feature(staged_api)]` (core, std), rustc also writes
+`#[rustc_const_unstable(feature = "derive_const", issue = "143874")]` after it. That needs the
+crate's features in `expand`. It is db-expand's to route.
+
+> forwarded to db-next8 (requests, pass 42: `crates/hir-def/src/macro_expansion_tests/` is lane db's; the `derive_const` `rustc_const_unstable` gap is db-expand's to route; told by tmux). requests' own: hir-ide expect tests that print an expanded derive go on the first-compile `UPDATE_EXPECT=1` list.

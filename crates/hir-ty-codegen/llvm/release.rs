@@ -7,6 +7,13 @@
 //! A compile starts from the module its summary was read from, never from a second lowering:
 //! a parameter the summary calls unused is passed `poison` by the callers, and is unused in
 //! the code only because it is the same IR.
+//!
+//! Unsafe: what a summary says of a function is read from its use list, whose users may be
+//! constants as well as calls, and from call operands, which inkwell gives only as values it
+//! first classifies, one more call into LLVM each, and it has no `LLVMIsACallInst` to tell a
+//! call user from a constant one. Those reads go through `LLVMValueRef`s here,
+//! each `unsafe fn` with its `# Safety`; [`prelink`] and [`compile`] are safe and keep every
+//! handle within the module they are given.
 
 use blaze_codegen::{
     settings::{Sanitize, Sanitizers},
@@ -27,6 +34,7 @@ use inkwell::{
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::{
     INNER, Machine, Machinery, OWN, REBASED, Symbol, Unhandled, agree_calls, attribute_kind, emitted, link,
@@ -157,8 +165,11 @@ pub(crate) fn prelink(
         let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
+        // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
         let constants: FxHashMap<u32, &[u8]> = wants.constants().collect();
+        // alloc: once per module, as `constants`
         let statics: FxHashSet<u32> = wants.statics().collect();
+        // alloc: once per module, as `constants`
         let readonly: FxHashMap<u32, &crate::ConstBlob> = wants.readonly().collect();
         let pointer = machine.get_target_data().get_pointer_byte_size(None) as usize;
         told_constants(context, &module, &readonly, pointer);
@@ -268,24 +279,24 @@ fn told_functions<'ctx>(
         if blob.fn_relocs.is_empty() || !blob.type_ids.is_empty() || blob.bytes.is_empty() {
             continue;
         }
-        let name = Symbol::Data(index as u32).to_string();
+        let name = Symbol::Data(index as u32).named();
         let Some(old) = module.get_global(&name) else { continue };
         if old.get_initializer().is_some() {
             continue;
         }
-        let mut addresses: Vec<(usize, Symbol, i64)> = blob
+        let mut addresses = blob
             .relocs
             .iter()
             .map(|&(offset, target, addend)| (offset as usize, Symbol::Data(target.as_u32()), addend))
             .chain(blob.fn_relocs.iter().map(|&(offset, target)| (offset as usize, Symbol::Func(target.as_u32()), 0)))
-            .collect();
+            .collect::<SmallVec<[(usize, Symbol, i64); 8]>>();
         blaze_ids::radix::sort_copy_by_key(&mut addresses, |it| it.0);
         let fits = addresses.windows(2).all(|it| it[0].0 + pointer <= it[1].0)
             && addresses.last().is_none_or(|it| it.0 + pointer <= blob.bytes.len());
         if !fits {
             return Err(Unhandled::Shape("an object whose addresses overlap"));
         }
-        let mut fields: Vec<BasicValueEnum<'ctx>> = Vec::new();
+        let mut fields: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(2 * addresses.len() + 1);
         let mut at = 0;
         for &(offset, target, addend) in &addresses {
             if offset > at {
@@ -293,7 +304,7 @@ fn told_functions<'ctx>(
             }
             let address = match target {
                 Symbol::Data(target) => {
-                    let name = Symbol::Data(target).to_string();
+                    let name = Symbol::Data(target).named();
                     let global = module.get_global(&name).unwrap_or_else(|| {
                         let declared = module.add_global(context.i8_type(), None, &name);
                         declared.set_linkage(Linkage::External);
@@ -303,7 +314,7 @@ fn told_functions<'ctx>(
                     global.as_pointer_value()
                 }
                 Symbol::Func(target) => {
-                    let name = Symbol::Func(target).to_string();
+                    let name = Symbol::Func(target).named();
                     let function = match module.get_function(&name) {
                         Some(known) => known,
                         None => {
@@ -417,8 +428,8 @@ unsafe fn only_calls(user: LLVMValueRef, function: LLVMValueRef) -> bool {
 }
 
 /// The calls and invokes of `function` in the module, each once.
-fn calls_of(function: FunctionValue<'_>) -> Vec<LLVMValueRef> {
-    let mut calls = Vec::new();
+fn calls_of(function: FunctionValue<'_>) -> SmallVec<[LLVMValueRef; 4]> {
+    let mut calls = SmallVec::new();
     let target = function.as_value_ref();
     // SAFETY: `target` is a live function of its module, which owns its use list; nothing
     // changes it during this walk.
@@ -474,7 +485,9 @@ fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: 
             !used && !in_memory(function, *at as u32)
         })
         .map(|(at, _)| at as u32)
+        // alloc: once per function, `Facts::unused`, which its summary keeps
         .collect();
+    // alloc: once per function, `Facts::calls`, which its summary keeps
     let mut calls: Vec<Called> = Vec::new();
     for block in function.get_basic_block_iter() {
         for instruction in block.get_instructions() {
@@ -497,20 +510,19 @@ fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: 
             // SAFETY: `at` is a live call or invoke of `module`, whose first operands are its
             // arguments.
             let count = unsafe { core::LLVMGetNumArgOperands(at) };
-            let args: Vec<Arg> = (0..count)
-                .map(|it| {
-                    // SAFETY: `it` is below `count`, so an argument operand of the live `at`.
-                    let operand = unsafe { core::LLVMGetOperand(at, it) };
-                    // SAFETY: `operand` is a live value of `module`, as `arg_of` asks.
-                    unsafe { arg_of(operand) }
-                })
-                .collect();
+            let args = (0..count).map(|it| {
+                // SAFETY: `it` is below `count`, so an argument operand of the live `at`.
+                let operand = unsafe { core::LLVMGetOperand(at, it) };
+                // SAFETY: `operand` is a live value of `module`, as `arg_of` asks.
+                unsafe { arg_of(operand) }
+            });
             match calls.iter_mut().find(|it| it.request == request) {
                 Some(called) => {
                     called.count += 1;
                     if called.args.len() != args.len() {
                         let len = called.args.len().min(args.len());
-                        called.args = vec![Arg::Unknown; len];
+                        called.args.truncate(len);
+                        called.args.fill(Arg::Unknown);
                     }
                     for (known, arg) in called.args.iter_mut().zip(args) {
                         if *known != arg {
@@ -518,10 +530,12 @@ fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: 
                         }
                     }
                 }
-                None => calls.push(Called { request, count: 1, args }),
+                // alloc: once per callee, `Called::args`, which its summary keeps
+                None => calls.push(Called { request, count: 1, args: args.collect() }),
             }
         }
     }
+    // alloc: once per function, `Facts::addressed`, which its summary keeps
     let mut addressed = Vec::new();
     for other in module.get_functions() {
         let Some(request) = request_of(other).filter(|it| instances(*it)) else { continue };
@@ -607,6 +621,7 @@ pub(crate) fn compile(
         let module = context.create_module("blaze");
         module.set_triple(&machine.get_triple());
         module.set_data_layout(&machine.get_target_data().get_data_layout());
+        // alloc: once per module; `Wants` (fragment.rs) lists these, and the lowering looks them up
         let readonly: FxHashMap<u32, &crate::ConstBlob> = wants.readonly().collect();
         let pointer = machine.get_target_data().get_pointer_byte_size(None) as usize;
         told_constants(context, &module, &readonly, pointer);
@@ -646,7 +661,7 @@ pub(crate) fn compile(
         let object = tally
             .time(Phase::Emit, || machine.write_to_memory_buffer(&module, FileType::Object))
             .map_err(llvm)?;
-        let own = (OWN, signature.clone());
+        let own = (OWN, signature);
         if let Some(counted) = counted {
             let covered = sanitize.coverage.is_on();
             let (code, coverage, bytes) =
@@ -704,7 +719,7 @@ fn apply<'ctx>(
         0
     };
     for &(request, attrs) in &given.callees {
-        let Some(callee) = module.get_function(&Symbol::Func(request).to_string()) else { continue };
+        let Some(callee) = module.get_function(&Symbol::Func(request).named()) else { continue };
         let flags = [
             ("nounwind", attrs.nounwind),
             ("willreturn", attrs.willreturn),
@@ -729,12 +744,12 @@ fn apply<'ctx>(
         }
     }
     for (request, params) in &given.dead {
-        let Some(callee) = module.get_function(&Symbol::Func(*request).to_string()) else { continue };
-        let params: Vec<u32> = params
+        let Some(callee) = module.get_function(&Symbol::Func(*request).named()) else { continue };
+        let params = params
             .iter()
             .copied()
             .filter(|&at| at < callee.count_params() && !in_memory(callee, at))
-            .collect();
+            .collect::<SmallVec<[u32; 8]>>();
         for &at in &params {
             for name in UB_IF_POISON {
                 callee.remove_enum_attribute(AttributeLoc::Param(at), attribute_kind(name));

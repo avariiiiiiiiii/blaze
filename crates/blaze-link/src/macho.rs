@@ -125,9 +125,13 @@ pub(crate) struct MachO {
 #[cfg(any(test, feature = "fuzz"))]
 pub(super) fn core_name(name: &[u8]) -> Result<String, String> {
     let name = std::str::from_utf8(name)
+        // alloc: the error's message
         .map_err(|_| format!("the symbol `{}` is not UTF-8", String::from_utf8_lossy(name)))?;
+    // alloc: an owned name for tests and the fuzz differential only
     Ok(match name.strip_prefix('_') {
+        // alloc: as above
         Some(rest) => rest.to_owned(),
+        // alloc: as above
         None => format!("\x01{name}"),
     })
 }
@@ -1471,6 +1475,10 @@ impl MachO {
             count += 1;
             let command = if *weak { macho::LC_LOAD_WEAK_DYLIB } else { macho::LC_LOAD_DYLIB };
             path_command(&mut commands, command, 24, &library.name, &[2, 0, 0]);
+        }
+        for rpath in &self.output.rpaths {
+            count += 1;
+            path_command(&mut commands, macho::LC_RPATH, 12, rpath, &[]);
         }
         for (command, (at, len)) in [
             (macho::LC_FUNCTION_STARTS, starts_at),

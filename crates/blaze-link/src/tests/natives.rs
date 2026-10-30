@@ -1,5 +1,6 @@
 //! The engine's checks of what native inputs name on the line: a GNU linker script's `-lNAME`,
-//! and the `/DEFAULTLIB`s of the COFF objects and archive members a PE link takes.
+//! the `/DEFAULTLIB`s of the COFF objects and archive members a PE link takes, and the
+//! `LC_LINKER_OPTION`s of the Mach-O objects and members a Mach-O link loads.
 
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use object::write::{Object as Builder, Symbol as Def, SymbolSection};
 use object::{Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
 
 use super::{CALLER, Change, Image, Native, NativeKind, function, id, key, name, output, rel32, returns};
+use crate::output::Platform;
 use crate::{Debug, Format, LinkError, Output, OutputKind};
 
 /// An object of `format` defining `defines` (each returning 1), with `directives` as its
@@ -178,6 +180,8 @@ fn windows() -> Output {
         windows_subsystem: false,
         dev_run: None,
         exec_log: false,
+        sanitize: blaze_codegen::settings::Sanitize::default(),
+        rpaths: Vec::new(),
         triple: "x86_64-pc-windows-msvc".into(),
         stack: Some(1 << 20),
     }
@@ -220,4 +224,83 @@ fn nodefaultlib_takes_a_default_library_out() {
         .expect("another loaded object's /NODEFAULTLIB takes it out of the whole link");
     let error = pe(" /DEFAULTLIB:vcruntime /DEFAULTLIB:libcmt", &[vcruntime]).unwrap_err();
     assert!(error.what.contains("libcmt.lib") && error.what.contains("msvcrt.lib(crt.obj)"), "{}", error.what);
+}
+
+fn macos() -> Output {
+    Output {
+        format: Format::MachO,
+        kind: OutputKind::Executable { entry: "main".into() },
+        interpreter: None,
+        platform: Some(Platform { platform: 1, minimum: 0x000b_0000, sdk: 0x000f_0000 }),
+        triple: "x86_64-apple-darwin".into(),
+        ..output(false)
+    }
+}
+
+/// A `.tbd` of the x86-64 macOS library `install` exporting `symbol`.
+fn tbd(install: &str, symbol: &str) -> Arc<[u8]> {
+    format!(
+        "--- !tapi-tbd\ntbd-version: 4\ntargets: [ x86_64-macos ]\ninstall-name: {install}\n\
+         exports:\n  - targets: [ x86_64-macos ]\n    symbols: [ {symbol} ]\n...\n"
+    )
+    .into_bytes()
+    .into()
+}
+
+/// An x86-64 Mach-O object defining `defines` whose `LC_LINKER_OPTION`s are `options`.
+fn autolinking(defines: &[&'static str], options: &[&[&'static str]]) -> Vec<u8> {
+    crate::macho::linking_object(object::macho::CPU_TYPE_X86_64, defines, options)
+}
+
+/// A macOS library on the line, as `locate` puts one there.
+const MACHO_SHARED: NativeKind = NativeKind::Shared { as_needed: false };
+const SDK_LIBZ: &str = "/sdk/usr/lib/libz.tbd";
+const SDK_SECURITY: &str = "/sdk/System/Library/Frameworks/Security.framework/Security.tbd";
+
+/// `main` calling `helper`, which `libsec.a`'s `sec.o` defines with `options`, after `glue.o`
+/// (always loaded) asking for `-lz`, with `more` after them on the line.
+fn macho(options: &[&[&'static str]], more: &[(&str, &Arc<[u8]>, NativeKind)]) -> Result<(), LinkError> {
+    let member = autolinking(&["_helper"], options);
+    let unused = autolinking(&["_unused"], &[&["-lnever_taken"]]);
+    let libsec: Arc<[u8]> = archive(&[("sec.o", &member, &["_helper"]), ("unused.o", &unused, &["_unused"])]).into();
+    let glue: Arc<[u8]> = autolinking(&["_glue"], &[&["-lz"]]).into();
+    let mut natives = vec![("/x/glue.o", &glue, NativeKind::Object), ("/x/libsec.a", &libsec, LAZY)];
+    natives.extend_from_slice(more);
+    stage(macos(), "main", Some("helper"), &natives)
+}
+
+#[test]
+fn an_objects_and_a_members_linker_options_are_taken_from_the_line() {
+    let libz = tbd("/usr/lib/libz.1.dylib", "_deflate");
+    let security = tbd("/System/Library/Frameworks/Security.framework/Versions/A/Security", "_SecRandomCopyBytes");
+    let z = (SDK_LIBZ, &libz, MACHO_SHARED);
+    let sec = (SDK_SECURITY, &security, MACHO_SHARED);
+    macho(&[&["-framework", "Security"]], &[z, sec]).unwrap();
+    macho(&[&["-framework", "Security"], &["-lz"]], &[z, sec]).expect("one library asked twice is checked once");
+    let libz_a: Arc<[u8]> = archive(&[]).into();
+    macho(&[], &[("/opt/lib/libz.a", &libz_a, LAZY)]).expect("a libz.a is -lz too");
+
+    let error = macho(&[&["-framework", "Security"]], &[z]).unwrap_err();
+    for said in ["-framework Security", "(LC_LINKER_OPTION)", "libsec.a(sec.o)", "does not have"] {
+        assert!(error.what.contains(said), "{said}: {}", error.what);
+    }
+    assert!(!error.what.contains("never_taken"), "a member not taken asks for nothing: {}", error.what);
+
+    let error = macho(&[], &[sec]).unwrap_err();
+    assert!(error.what.contains("/x/glue.o asks for -lz (LC_LINKER_OPTION)"), "an object's own: {}", error.what);
+    let wrong = tbd("/usr/lib/libzz.dylib", "_zz");
+    let error = macho(&[], &[("/sdk/usr/lib/libzz.tbd", &wrong, MACHO_SHARED), sec]).unwrap_err();
+    assert!(error.what.contains("-lz"), "libzz.tbd is not -lz: {}", error.what);
+    let error = macho(&[&["-framework", "Security"]], &[z, ("/sdk/Security.tbd", &security, MACHO_SHARED)]).unwrap_err();
+    assert!(error.what.contains("-framework Security"), "a framework is its NAME.framework directory's: {}", error.what);
+}
+
+#[test]
+fn a_loaded_members_unknown_or_weak_linker_option_is_an_error() {
+    let libz = tbd("/usr/lib/libz.1.dylib", "_deflate");
+    let z = (SDK_LIBZ, &libz, MACHO_SHARED);
+    let error = macho(&[&["-needed_framework", "Security"]], &[z]).unwrap_err();
+    assert!(error.what.contains("libsec.a(sec.o)") && error.what.contains("`-needed_framework Security`"), "{}", error.what);
+    let error = macho(&[&["-weak-lsec"]], &[z]).unwrap_err();
+    assert!(error.what.contains("libsec.a(sec.o)") && error.what.contains("no weak library"), "{}", error.what);
 }

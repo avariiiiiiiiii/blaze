@@ -11,6 +11,14 @@
 //! What a watch keeps (where each directory is, by its handle) is in [`Dirs`] tables whose keys
 //! and names are spans of a [`Strings`] column, reused by the next watch once this one ends
 //! ([`Room`]): a watch, its events and its end allocate their completions' payload alone.
+//!
+//! Why unsafe: std has no fanotify, `name_to_handle_at`, `open_by_handle_at` or `fstatfs`, so
+//! each is one system call here. The rest has std versions that cost per event: `fs::read_link`
+//! and `fs::canonicalize` return a new `PathBuf` each (an allocation per directory named),
+//! where these write into the watch's kept buffers. The event records themselves are parsed in
+//! safe code (`parse`, `fid`): every length the kernel wrote is checked against the bytes
+//! `read` returned before a slice of it is taken, and a record that does not fit ends the batch
+//! as lost, never read past.
 
 use std::{
     ffi::{CStr, OsStr},
@@ -480,19 +488,18 @@ fn learn_one(
     path: &CStr,
     rel: &str,
 ) -> io::Result<Option<OwnedFd>> {
-    // SAFETY: a NUL-terminated path; a descriptor of its own or -1.
-    let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-    if raw < 0 {
-        let error = io::Error::last_os_error();
+    let opened = match crate::raw::open_dir(path) {
+        Ok(opened) => opened,
         // Kept bare so `learn` can pass over a directory gone below the watched one.
-        return Err(match gone(&error) {
-            true => error,
-            // alloc: the error of a watch that failed.
-            false => keep_eperm(error, &format!("opening {}", path.to_string_lossy())),
-        });
-    }
-    // SAFETY: the call returned a descriptor of its own.
-    let opened = unsafe { OwnedFd::from_raw_fd(raw) };
+        Err(error) => {
+            return Err(match gone(&error) {
+                true => error,
+                // alloc: the error of a watch that failed.
+                false => keep_eperm(error, &format!("opening {}", path.to_string_lossy())),
+            });
+        }
+    };
+    let raw = opened.as_raw_fd();
     // alloc: the error of a watch that failed.
     let fsid = fsid(raw).map_err(|error| named(error, &format!("statfs of {}", path.to_string_lossy())))?;
     let handle = handle_of(raw).map_err(|error| match error.raw_os_error() {
@@ -680,7 +687,9 @@ fn fsid(fd: RawFd) -> io::Result<[u8; 8]> {
     if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `fsid_t` is two `int`s (`__kernel_fsid_t`), whose field libc keeps private.
+    // SAFETY: `fsid_t` is two `int`s (`__kernel_fsid_t`), whose field libc keeps private, so no
+    // safe read of it exists; `transmute` checks the sizes match, and every bit pattern is an
+    // `[i32; 2]`.
     let words: [i32; 2] = unsafe { std::mem::transmute(stat.f_fsid) };
     let mut fsid = [0; 8];
     fsid[..4].copy_from_slice(&words[0].to_ne_bytes());

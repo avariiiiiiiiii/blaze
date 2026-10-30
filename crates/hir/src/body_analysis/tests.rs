@@ -5,7 +5,10 @@
 use base_db::Db;
 use hir_def::{ItemContainerId, Lookup as _, hir::ExprId};
 use hir_expand::{HirFileId, InFile, name::Name};
-use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
+use syntax::{
+    AstNode, AstPtr, SyntaxKind, ast,
+    view::{self, AstNode as _, Typed},
+};
 use test_fixture::WithFixture;
 
 use super::BodyAnalysis;
@@ -61,19 +64,23 @@ fn show<'db>(db: &'db Db, ty: &Type<'db>, target: DisplayTarget) -> String {
 }
 
 /// The first `N` of the body's tree whose text is `text`, and a pointer to it.
-fn find<N: AstNode>(root: &SyntaxNode, file: HirFileId, text: &str) -> (N, InFile<AstPtr<N>>) {
+fn find<'t, N: AstNode + Typed>(
+    root: view::Node<'t>,
+    file: HirFileId,
+    text: &str,
+) -> (N::Of<'t>, InFile<AstPtr<N>>) {
     let node = root
         .descendants()
-        .filter_map(N::cast)
+        .filter_map(<N::Of<'t> as view::AstNode<'t>>::cast)
         .find(|it| it.syntax().text() == text)
         .unwrap_or_else(|| panic!("no `{text}` in {root}"));
-    let ptr = InFile::new(file, AstPtr::new(&node));
+    let ptr = InFile::new(file, AstPtr::of(node));
     (node, ptr)
 }
 
 fn local<'db>(analysis: &BodyAnalysis<'db>, name: &str) -> Local<'db> {
     let (root, file) = analysis.tree();
-    let (_, pat) = find::<ast::IdentPat>(&root, file, name);
+    let (_, pat) = find::<ast::IdentPat>(root, file, name);
     analysis.binding(pat).unwrap_or_else(|| panic!("`{name}` is no binding"))
 }
 
@@ -85,17 +92,17 @@ fn the_tree_is_the_body_s_own_and_types_are_read_off_it() {
         let target = target(&db, "takes");
         let (root, file) = analysis.tree();
         assert!(matches!(file, HirFileId::FileId(_)), "{file:?}");
-        assert!(root.text().to_string().starts_with("fn takes"), "{root}");
+        assert!(root.text().starts_with("fn takes"), "{root}");
 
-        let (_, get) = find::<ast::Expr>(&root, file, "w.get()");
+        let (_, get) = find::<ast::Expr>(root, file, "w.get()");
         let info = analysis.type_of_expr(get).expect("a type of `w.get()`");
         assert_eq!(show(&db, &info.original, target), "u8");
 
-        let (_, w) = find::<ast::Pat>(&root, file, "w");
+        let (_, w) = find::<ast::Pat>(root, file, "w");
         let info = analysis.type_of_pat(w).expect("a type of `w`");
         assert_eq!(show(&db, &info.original, target), "Wrap");
 
-        let (_, receiver) = find::<ast::Expr>(&root, file, "w");
+        let (_, receiver) = find::<ast::Expr>(root, file, "w");
         let adjustments = analysis.expr_adjustments(receiver).expect("`w` is borrowed for `get`");
         let shown: Vec<_> = adjustments.iter().map(|it| show(&db, &it.target, target)).collect();
         assert_eq!(shown, ["&Wrap"]);
@@ -108,14 +115,14 @@ fn a_method_call_resolves_to_the_impl_s_function() {
     crate::attach_db(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let (root, file) = analysis.tree();
-        let (call, ptr) = find::<ast::MethodCallExpr>(&root, file, "w.show()");
+        let (call, ptr) = find::<ast::MethodCallExpr>(root, file, "w.show()");
         let method = analysis.resolve_method_call(ptr).expect("`show` resolves");
         assert_eq!(method.name(&db).as_str(), "show");
 
         let id = analysis
             .source_map()
             .store
-            .node_expr(InFile::new(file, &ast::Expr::MethodCallExpr(call)))
+            .node_expr_view(InFile::new(file, view::Expr::MethodCallExpr(call)))
             .and_then(|it| it.as_expr())
             .expect("the call is of the body");
         let (callee, _) = analysis.callee(id).expect("the call has a callee");
@@ -131,18 +138,18 @@ fn paths_and_names_resolve_in_the_scope_of_their_block() {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let (root, file) = analysis.tree();
 
-        let (_, wrap) = find::<ast::Path>(&root, file, "Wrap");
+        let (_, wrap) = find::<ast::Path>(root, file, "Wrap");
         match analysis.resolve_path(wrap) {
             Some(PathResolution::Def(ModuleDef::Adt(it))) => {
                 assert_eq!(it.name(&db).as_str(), "Wrap")
             }
             it => panic!("`Wrap` is {it:?}"),
         }
-        let (_, n) = find::<ast::Path>(&root, file, "n");
+        let (_, n) = find::<ast::Path>(root, file, "n");
         assert!(matches!(analysis.resolve_path(n), Some(PathResolution::Local(_))));
 
-        let (sum, _) = find::<ast::Expr>(&root, file, "a + b + c");
-        let at = InFile::new(file, SyntaxNodePtr::new(sum.syntax()));
+        let (sum, _) = find::<ast::Expr>(root, file, "a + b + c");
+        let at = InFile::new(file, view::ptr(sum.syntax()));
         let inner = Name::new_symbol_root(intern::Symbol::intern("Inner"));
         match analysis.resolve_name(at, &inner) {
             Some(PathResolution::Def(ModuleDef::Adt(it))) => {
@@ -164,13 +171,13 @@ fn types_resolve_in_the_body_the_signature_and_a_nested_item() {
         let (root, file) = analysis.tree();
         let plains: Vec<_> = root
             .descendants()
-            .filter_map(ast::Type::cast)
+            .filter_map(view::Type::cast)
             .filter(|it| it.syntax().text() == "Plain")
             .collect();
         // The parameter's, `&Plain`'s, the nested struct's field's and the `let`'s.
         assert_eq!(plains.len(), 4);
         for ty in &plains {
-            let found = analysis.resolve_type(InFile::new(file, AstPtr::new(ty)));
+            let found = analysis.resolve_type(InFile::new(file, AstPtr::<ast::Type>::of(*ty)));
             let parent = ty.syntax().parent();
             let found = found.unwrap_or_else(|| panic!("no type for `{ty}` in {parent:?}"));
             assert_eq!(show(&db, &found, target), "Plain");
@@ -184,7 +191,7 @@ fn a_macro_call_resolves_and_its_expressions_are_where_the_call_is() {
     crate::attach_db(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let (root, file) = analysis.tree();
-        let (call, ptr) = find::<ast::MacroCall>(&root, file, "twice!(n)");
+        let (call, ptr) = find::<ast::MacroCall>(root, file, "twice!(n)");
         let mac = analysis.resolve_macro_call(ptr).expect("`twice` resolves");
         assert_eq!(mac.name(&db).as_str(), "twice");
         let expansion = analysis.expansion(ptr).expect("the call is of the body");
@@ -234,7 +241,7 @@ fn a_body_a_macro_writes_is_read_off_its_expansion() {
         assert_eq!(root.kind(), SyntaxKind::MACRO_ITEMS);
         let p = local(&analysis, "p");
         assert!(analysis.consumes(p));
-        let (_, ty) = find::<ast::Type>(&root, file, "Plain");
+        let (_, ty) = find::<ast::Type>(root, file, "Plain");
         let found = analysis.resolve_type(ty).expect("the parameter's type");
         assert_eq!(show(&db, &found, target), "Plain");
     });

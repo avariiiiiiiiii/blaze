@@ -13,7 +13,7 @@
 //! an import. The input of a macro arrives, and its output leaves, as a token tree's columns
 //! ([`wire`]). Displaying a
 //! stream follows the proc-macro server blaze expands native macros with
-//! (`vendor/proc-macro-srv/crates/proc-macro-srv/src/token_stream.rs`), so a macro that
+//! (`crates/proc-macro-srv/src/token_stream.rs`), so a macro that
 //! compares `to_string()`s sees the same text either way.
 
 #![allow(clippy::all, unused, missing_docs)]

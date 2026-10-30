@@ -68,6 +68,7 @@ impl<L: Language> fmt::Debug for SyntaxToken<L> {
         let text = self.text();
         for idx in 21..25 {
             if text.is_char_boundary(idx) {
+                // alloc: debug output only
                 let text = format!("{} ...", &text[..idx]);
                 return write!(f, " {:?}", text);
             }
@@ -97,7 +98,7 @@ impl<L: Language> From<SyntaxToken<L>> for SyntaxElement<L> {
 impl FlatTreeBuilder {
     /// Gives the builder a copy of `node` and its subtree, the parts of its lazy nodes in it.
     pub fn node<L: Language>(&mut self, node: &SyntaxNode<L>) {
-        cursor::copy_element(self, &NodeOrToken::Node(node.raw.clone()))
+        cursor::copy_node(self, &node.raw)
     }
 
     /// Gives the builder a copy of `element` and its subtree, as [`Self::node`].
@@ -162,8 +163,9 @@ impl<L: Language> SyntaxNode<L> {
     /// tokens) at `range` replaced by copies of `with`. The new tree has its own text, its
     /// ranges starting at 0, and its lazy nodes parsed into it.
     pub fn splice_children(&self, range: Range<usize>, with: &[SyntaxElement<L>]) -> SyntaxNode<L> {
-        let with: Vec<cursor::SyntaxElement> = with.iter().cloned().map(Into::into).collect();
-        SyntaxNode::from(self.raw.splice_children(range, &with))
+        SyntaxNode::from(self.raw.splice_children_with(range, |builder| {
+            with.iter().for_each(|it| builder.element(it))
+        }))
     }
 
     pub fn kind(&self) -> L::Kind {
@@ -314,6 +316,7 @@ impl<L: Language> SyntaxNode<L> {
         if let Some(found) = self.flat_node_at_range(range, L::kind_to_raw(kind)) {
             return found;
         }
+        // clone: the walk's owned first cursor, for an empty range only; a count bump
         iter::successors(Some(self.clone()), |it| it.child_or_token_at_range(range)?.into_node())
             .find(|it| it.text_range() == range && it.kind() == kind)
     }
@@ -427,6 +430,7 @@ impl<L: Language> SyntaxElement<L> {
 
     pub fn ancestors(&self) -> impl Iterator<Item = SyntaxNode<L>> {
         let first = match self {
+            // clone: the walk's owned first cursor, a count bump
             NodeOrToken::Node(it) => Some(it.clone()),
             NodeOrToken::Token(it) => it.parent(),
         };

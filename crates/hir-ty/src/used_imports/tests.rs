@@ -3,9 +3,8 @@
 use base_db::{Crate, Db, all_crates};
 use hir_def::{
     item_scope::{GlobId, ImportId, ImportOrExternCrate},
-    src::use_tree_to_ast,
+    src::use_tree_to_view,
 };
-use syntax::AstNode;
 use test_fixture::ChangeFixture;
 
 use super::used_imports_with_traits;
@@ -58,7 +57,7 @@ fn the_innermost_import_of_each_picked_trait_is_used() {
         .filter_map(|(import, _)| match import {
             ImportOrExternCrate::Import(ImportId { use_, idx })
             | ImportOrExternCrate::Glob(GlobId { use_, idx }) => {
-                Some(use_tree_to_ast(&db, use_.lookup(&db).id, idx).syntax().text().to_string())
+                Some(use_tree_to_view(&db, use_.lookup(&db).id, idx).to_string())
             }
             ImportOrExternCrate::ExternCrate(_) => None,
         })

@@ -698,6 +698,19 @@ pub(super) mod resolve_completely {
             self.resolve_completely_with_default(value_ref, value_ref.clone());
         }
 
+        /// `ty`, as it was before writeback, with its variables named as rustc's
+        /// `ty_infer_name_resolver` names them, while they are still live: `None` when no
+        /// variable is left in it.
+        pub(crate) fn named_undecided(
+            &self,
+            ty: Ty<'db>,
+        ) -> Option<crate::solver_errors::NamedTerm> {
+            let ty = self.table.resolve_vars_if_possible(ty);
+            ty.has_non_region_infer().then(|| {
+                crate::solver_errors::NamedTerm::new(&self.table.infer_ctxt, ty.into())
+            })
+        }
+
         pub(crate) fn resolve_completely_with_default<T>(&mut self, value_ref: &mut T, default: T)
         where
             T: TypeFoldable<DbInterner<'db>>,

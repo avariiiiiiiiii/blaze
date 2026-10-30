@@ -117,7 +117,7 @@ same tokens and text as the edited one, so it gives the same token tree.
   `crates/hir/src/lib.rs`, which displays an expansion. It stays with that caller.
 - `InFile<SN>::file_range`: no build-path caller; it goes with the handles.
 
-### Needed from `syntax` (requested of frontend-tree)
+### From `syntax` (in the tree: `crates/syntax/src/view.rs`)
 
 - `impl<L: Typed, R: Typed> Typed for Either<L, R> { type Of<'t> = Either<L::Of<'t>, R::Of<'t>>; }`:
   source maps hold `AstPtr<Either<ast::X, ast::Y>>` (21 build-path uses), and `to_view` needs it.

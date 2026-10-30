@@ -151,6 +151,7 @@ pub(crate) struct ActionTable {
 
 impl ActionTable {
     pub(crate) fn new() -> ActionTable {
+        // alloc: empty, allocates nothing; the module is the tests' model of rustc's tables
         ActionTable { actions: vec![], encoded_length: 0 }
     }
 
@@ -223,6 +224,7 @@ pub(crate) struct TypeInfoTable {
 
 impl TypeInfoTable {
     pub(crate) fn new(ttype_encoding: gimli::DwEhPe) -> TypeInfoTable {
+        // alloc: empty, allocates nothing; the module is the tests' model of rustc's tables
         TypeInfoTable { ttype_encoding, type_info: vec![] }
     }
 

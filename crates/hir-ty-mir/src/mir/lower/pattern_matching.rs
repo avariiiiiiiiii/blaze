@@ -841,6 +841,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                 span,
             );
             self.guard_refs.insert(id, reference);
+            self.building.guard_refs.push((reference, id));
             if let Some(moves) = &mut self.guarded_moves {
                 moves.push(super::GuardedMove {
                     binding: id,

@@ -3,7 +3,6 @@
 //! a read, and allocates nothing.
 
 use blaze_alloc_count::assert_at_most;
-use hir::Semantics;
 
 use super::{
     defs::{DefSet, Defs},
@@ -40,10 +39,9 @@ fn with_crate(check: impl FnOnce(&Crate<'_, '_, '_>)) {
     let checked = crate::tests::checked(FIXTURE);
     let db = &checked.db;
     hir::attach_db(db, || {
-        let sema = Semantics::new(db);
         let krate = hir::check::workspace_crates(db)[0];
         let frame = crate::tests::frame();
-        let cx = Cx::new(&sema, krate, checked.files(), &frame);
+        let cx = Cx::new(db, krate, checked.files(), &frame);
         let defs = Defs::of(&cx);
         let levels = Levels::new();
         let effective = Effective::of(&cx);

@@ -40,7 +40,8 @@ semver.workspace = true
 blaze-alloc-count.workspace = true
 
 [features]
-in-rust-tree = ["proc-macro-srv", "proc-macro-srv/in-rust-tree"]
+# The conversions between the protocol's trees and the server's token streams, for the server.
+in-rust-tree = ["dep:proc-macro-srv"]
 default = []
 
 [lints]

@@ -48,6 +48,8 @@ mod column;
 pub mod exec;
 mod hook;
 mod image;
+#[cfg(all(test, blaze_check))]
+mod model;
 mod switch;
 #[cfg(test)]
 mod tests;

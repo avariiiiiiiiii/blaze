@@ -52,13 +52,21 @@
 //! it ends. What a namespace hides and this does not: the machine's temporary directories and
 //! processes are seen, read-only, and SysV IPC and the mode, owner and times of a file are
 //! not refused.
+//!
+//! Every system call is behind a safe function of `raw` but two: `fork`, sound only in a
+//! process of one thread, and `close` of a descriptor by its number, which no `OwnedFd` holds
+//! (a copy of the supervisor's socket each process of the sandbox ends, and what
+//! [`close_machine_files`] finds in `/proc/self/fd`). The functions that call them allow
+//! unsafe code, each fork saying why its process is one thread; the rest of the file denies it.
+
+#![deny(unsafe_code)]
 
 use std::{
     ffi::{CStr, CString, OsString},
     fmt::Write as _,
     ops::Range,
     os::{
-        fd::{AsFd as _, AsRawFd as _},
+        fd::{AsFd as _, AsRawFd as _, IntoRawFd as _, OwnedFd},
         unix::ffi::OsStrExt as _,
     },
     path::{Path, PathBuf},
@@ -69,6 +77,7 @@ use rustc_hash::FxHashMap;
 
 use super::{Also, Bind, MARK, Recorder, Scope, Spec, View, push_lossy, tidy, tidy_into};
 
+#[allow(unsafe_code, reason = "the Linux system calls, each behind a safe function")]
 mod raw;
 
 /// The library a traced run's processes load (`LD_PRELOAD`), built from `linux_interpose.c` by
@@ -474,6 +483,7 @@ fn unique() -> u64 {
 
 /// Whether this user may make a user namespace and map itself in it, which a sandbox in
 /// namespaces needs, tried in a process of its own; why not when it may not.
+#[allow(unsafe_code, reason = "fork")]
 fn namespaces() -> Result<(), String> {
     let (uid, gid) = (raw::uid(), raw::gid());
     // alloc: once per process, the maps the kernel is given, before the probe's fork.
@@ -487,8 +497,9 @@ fn namespaces() -> Result<(), String> {
     ];
     // SAFETY: the sandbox runs in `blaze sandbox`'s process, which is one thread
     // (`super::command` runs before anything else in it, and nothing here starts a thread), or
-    // in a test's of its own, one thread too (`super::alone`). The child only unshares, writes
-    // three files and exits.
+    // in a test's of its own, one thread too (`super::alone`). No lock is held by another
+    // thread across the fork, so the child need not keep to async-signal-safe calls; it only
+    // unshares, opens and writes three files (calls, no allocation) and `_exit`s.
     let child = unsafe { raw::fork() };
     if child < 0 {
         return Err(os("fork"));
@@ -533,6 +544,7 @@ fn namespaces() -> Result<(), String> {
 }
 
 /// [`run`], confined in `scratch` when it is given ([`confined`]), in namespaces otherwise.
+#[allow(unsafe_code, reason = "fork")]
 fn run_in(
     spec: &Spec,
     program: Option<&[OsString]>,
@@ -561,13 +573,14 @@ fn run_in(
             .collect(),
         Some(given) => environment(given, tmp.as_ref(), interposer)?,
     };
-    let Some(sockets) = raw::stream_pair() else {
+    let Some([supervisor, child]) = raw::stream_pair() else {
         return Err(os("socketpair"));
     };
     let recorded = program.is_some() && (spec.record.is_some() || also.live.is_some());
     let confining = scratch.is_some();
-    let filter = program
-        .map(|_| filter_program(recorded, spec.record_reads, confining, also.network, sockets[1]));
+    let filter = program.map(|_| {
+        filter_program(recorded, spec.record_reads, confining, also.network, child.as_raw_fd())
+    });
     let scratch_dir = scratch.map(tidy);
     let own: Vec<&str> = match &scratch_dir {
         // alloc: once per sandbox, its own directories, by reference.
@@ -589,8 +602,10 @@ fn run_in(
     super::pass_signals_to(0);
     // SAFETY: the sandbox runs in `blaze sandbox`'s process, which is one thread
     // (`super::command` runs before anything else in it; the signal handlers above start
-    // none), or in a test's of its own, one thread too (`super::alone`). The child makes the
-    // sandbox and forks again, as one thread too.
+    // none), or in a test's of its own, one thread too (`super::alone`). No lock is held by
+    // another thread across the fork, so the child need not keep to async-signal-safe calls:
+    // it allocates, prints and reads the environment as it makes the sandbox, and forks
+    // again, as one thread too.
     let first = unsafe { raw::fork() };
     if first < 0 {
         return Err(os("fork"));
@@ -601,13 +616,13 @@ fn run_in(
         // gone with the supervisor, which a signal that can't be passed on ends.
         raw::setsid();
         raw::die_with_parent();
-        // SAFETY: `sockets[0]` is the supervisor's end, owned by no `OwnedFd`; this child's
-        // copy of it is never used, and the supervisor keeps its own.
-        unsafe { raw::close(sockets[0]) };
+        // This child's copy of the supervisor's end is never used; the supervisor keeps its own.
+        drop(supervisor);
         let made = Made {
             argv: &argv,
             env: &env,
-            socket: sockets[1],
+            // Owned by the processes of the sandbox from here, each closing its copy.
+            socket: child.into_raw_fd(),
             filter: filter.as_deref(),
             viewed: spec.view.is_some(),
             network: also.network,
@@ -626,24 +641,21 @@ fn run_in(
         raw::exit(code);
     }
     super::pass_signals_to(first);
-    // SAFETY: `sockets[1]` is the child's end, owned by no `OwnedFd` and not used in the
-    // supervisor after; the child has its own copy.
-    unsafe { raw::close(sockets[1]) };
-    let listener = received(sockets[0]);
-    // SAFETY: `sockets[0]` is owned by no `OwnedFd` and not used after; the descriptor
-    // `received` gave is a new one, not it.
-    unsafe { raw::close(sockets[0]) };
+    // The child's end, which the child has its own copy of: closed first, so that the receive
+    // ends when the sandbox ends without sending the filter's descriptor.
+    drop(child);
+    let listener = raw::received_descriptor(supervisor.as_fd());
+    drop(supervisor);
     let around = match (&spec.view, confining) {
         (Some(_), _) => Around::View,
         (None, true) => Around::Confined(first),
         (None, false) => Around::Namespaces,
     };
     let mut watch = Watch { around, network: also.network, processes: FxHashMap::default() };
+    let supervised = listener.is_some();
     if let Some(listener) = listener {
-        supervise(listener, first, &mut recorder, &mut watch);
-        // SAFETY: `listener` came from `received` and is held by nothing else; `supervise`
-        // has returned, and it is not used after.
-        unsafe { raw::close(listener) };
+        supervise(listener.as_raw_fd(), first, &mut recorder, &mut watch);
+        drop(listener);
     }
     let mut status = 0;
     while raw::wait(first, &mut status, 0) < 0 {
@@ -654,7 +666,7 @@ fn run_in(
     // Its number may be another's now.
     super::pass_signals_to(0);
     if recorded {
-        if listener.is_none() {
+        if !supervised {
             recorder.incomplete(0, "the sandbox did not see the program run");
         }
         recorder.ended();
@@ -759,6 +771,7 @@ fn ended(status: libc::c_int) -> i32 {
 
 /// The sandbox's first process: makes the namespaces and the mounts, then waits for the
 /// first process of the PID namespace.
+#[allow(unsafe_code, reason = "fork, and close of the supervisor's socket by number")]
 fn sandbox(
     spec: &Spec,
     uid: libc::uid_t,
@@ -806,7 +819,8 @@ fn sandbox(
     }
     let cwd = c(&spec.cwd);
     // SAFETY: this is the sandbox's first process, forked by `run_in` from a process of one
-    // thread, so it is one thread: nothing in it starts another.
+    // thread, so it is one thread: nothing in it starts another. So the child need not keep
+    // to async-signal-safe calls: it mounts, allocates and prints its error.
     let init = unsafe { raw::fork() };
     if init < 0 {
         return Err(os("fork"));
@@ -841,6 +855,7 @@ fn sandbox(
 /// unprivileged seccomp filter need), reaps every process the program leaves, has Landlock
 /// refuse every write but to the writable directories and `scratch`, and every TCP `bind` and
 /// `connect`, runs the program and waits for it, and kills what it left when it ends.
+#[allow(unsafe_code, reason = "fork, and close of the supervisor's socket by number")]
 fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result<i32, String> {
     if raw::no_new_privs() < 0 {
         return Err(os("no new privileges (prctl)"));
@@ -866,7 +881,8 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
         return Ok(0);
     }
     // SAFETY: this is the sandbox's first process, forked by `run_in` from a process of one
-    // thread, so it is one thread: Landlock and `prctl` start none.
+    // thread, so it is one thread: Landlock and `prctl` start none. So the child need not keep
+    // to async-signal-safe calls: it installs the filter, allocates and prints its error.
     let program = unsafe { raw::fork() };
     if program < 0 {
         return Err(os("fork"));
@@ -915,7 +931,7 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
 /// Landlock, which lets a process without privileges restrict itself and what it runs.
 mod landlock {
     use std::{
-        os::fd::AsRawFd as _,
+        os::fd::{AsFd as _, AsRawFd as _},
         path::{Path, PathBuf},
     };
 
@@ -1013,11 +1029,9 @@ mod landlock {
             4 | 5 => 16,
             _ => 24,
         };
-        let ruleset = super::raw::landlock_ruleset(&attr, size);
-        if ruleset < 0 {
+        let Some(ruleset) = super::raw::landlock_ruleset(&attr, size) else {
             return Err(super::os("a Landlock ruleset"));
-        }
-        let ruleset = ruleset as libc::c_int;
+        };
         let add = |path: &Path, required: bool| -> Result<(), String> {
             let at = super::c(path);
             let Some(fd) = super::raw::open(&at, libc::O_PATH | libc::O_CLOEXEC) else {
@@ -1032,7 +1046,7 @@ mod landlock {
             // A device's directory (`/dev/pts`) is given what its devices are.
             let allowed = if is_dir && required { dir } else { file };
             let rule = PathBeneath { allowed_access: allowed, parent_fd: fd.as_raw_fd() };
-            let added = super::raw::landlock_add_rule(ruleset, &rule);
+            let added = super::raw::landlock_add_rule(ruleset.as_fd(), &rule);
             // Read before `drop` can change `errno`.
             let error = (added < 0).then(std::io::Error::last_os_error);
             drop(fd);
@@ -1048,12 +1062,11 @@ mod landlock {
         for it in DEVICES {
             add(&Path::new("/dev").join(it), false)?;
         }
-        if super::raw::landlock_restrict_self(ruleset) < 0 {
+        if super::raw::landlock_restrict_self(ruleset.as_fd()) < 0 {
             return Err(super::os("restricting the sandbox (landlock_restrict_self)"));
         }
-        // SAFETY: `ruleset` is the descriptor `landlock_ruleset` made above, owned by no
-        // `OwnedFd` and not used after; the restriction holds without it.
-        unsafe { super::raw::close(ruleset) };
+        // The restriction holds without the ruleset's descriptor.
+        drop(ruleset);
         Ok(())
     }
 }
@@ -1536,6 +1549,7 @@ fn enter_view() -> Result<(), String> {
 /// Closes this process's descriptors that a program in a view could reach the machine's file
 /// system through: a directory (whose `..` leads out), and above the standard three a file
 /// of the machine's. What is left is pipes, sockets and devices, a jobserver's among them.
+#[allow(unsafe_code, reason = "close by number of what /proc/self/fd lists")]
 fn close_machine_files() {
     let fds: Vec<libc::c_int> = match std::fs::read_dir("/proc/self/fd") {
         // alloc: once, in the program's process just before it runs the program.
@@ -1578,6 +1592,7 @@ fn loopback_up() -> Result<(), String> {
 /// The first process of the PID namespace: mounts its `/proc` (in a view, and makes the view
 /// the root), forks the program's process and reaps every process left to it until that one
 /// ends, ending as it did.
+#[allow(unsafe_code, reason = "fork, and close of the supervisor's socket by number")]
 fn first_process(cwd: &CString, made: &Made<'_>, probe: bool) -> Result<i32, String> {
     let kind = c(Path::new("proc"));
     let flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
@@ -1603,7 +1618,8 @@ fn first_process(cwd: &CString, made: &Made<'_>, probe: bool) -> Result<i32, Str
         return Ok(0);
     }
     // SAFETY: this is the PID namespace's first process, forked from the sandbox's first
-    // process, which is one thread (`sandbox`), so it is one thread too.
+    // process, which is one thread (`sandbox`), so it is one thread too. So the child need not
+    // keep to async-signal-safe calls: it installs the filter, allocates and prints its error.
     let program = unsafe { raw::fork() };
     if program < 0 {
         return Err(os("fork"));
@@ -1630,6 +1646,7 @@ fn first_process(cwd: &CString, made: &Made<'_>, probe: bool) -> Result<i32, Str
 
 /// Installs the filter, when there is one, hands its descriptor to the supervisor and runs
 /// the program; what kept it from running.
+#[allow(unsafe_code, reason = "close of the supervisor's socket by number")]
 fn exec(made: &Made<'_>) -> String {
     if made.viewed {
         close_machine_files();
@@ -1639,12 +1656,11 @@ fn exec(made: &Made<'_>) -> String {
             Ok(it) => it,
             Err(error) => return error,
         };
-        if let Err(error) = send(made.socket, listener) {
+        if let Err(error) = send(made.socket, listener.as_raw_fd()) {
             return error;
         }
-        // SAFETY: `listener` is the filter's descriptor `install` just made, owned by no
-        // `OwnedFd`; the supervisor has its own copy now, and this process doesn't use it.
-        unsafe { raw::close(listener) };
+        // The supervisor has its own copy now, and the program is not to have it.
+        drop(listener);
     }
     // SAFETY: `made.socket` is this process's copy of the child's end of the supervisor's
     // pair, owned by no `OwnedFd`; the program is not to have it, and nothing uses it after.
@@ -1785,11 +1801,10 @@ fn filter_program(
 
 /// Installs `program` as this process's seccomp filter, and the descriptor the kernel asks
 /// through.
-fn install(program: &[libc::sock_filter]) -> Result<libc::c_int, String> {
+fn install(program: &[libc::sock_filter]) -> Result<OwnedFd, String> {
     // The process holds every capability of its user namespace until it runs the program, so
     // it may install a filter without `no_new_privs`; a confined one has set it.
-    let listener = raw::install_filter(program);
-    if listener < 0 {
+    let Some(listener) = raw::install_filter(program) else {
         if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBUSY) {
             return Err("a seccomp filter: this process is in a sandbox already, whose seccomp \
                         listener the kernel takes as the only one a process has; run this \
@@ -1798,8 +1813,8 @@ fn install(program: &[libc::sock_filter]) -> Result<libc::c_int, String> {
                 .to_owned());
         }
         return Err(os("a seccomp filter"));
-    }
-    Ok(listener as libc::c_int)
+    };
+    Ok(listener)
 }
 
 /// Sends the descriptor `fd` over `socket`.
@@ -1808,11 +1823,6 @@ fn send(socket: libc::c_int, fd: libc::c_int) -> Result<(), String> {
         return Err(os("handing over the filter"));
     }
     Ok(())
-}
-
-/// The descriptor sent over `socket`, or `None` when the other end closed first.
-fn received(socket: libc::c_int) -> Option<libc::c_int> {
-    raw::received_descriptor(socket)
 }
 
 /// Answers the kernel's notifications through `listener`, noting what each call reached,
@@ -2656,6 +2666,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code, reason = "a mapping whose second page is taken away, to read up to")]
     fn a_string_is_read_to_its_nul_or_as_far_as_it_is_mapped() {
         // A multiple of the 4096 bytes `string_at` reads at most, on every architecture.
         // SAFETY: `sysconf` takes an integer and touches no memory of this process.

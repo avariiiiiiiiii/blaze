@@ -103,16 +103,18 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
 pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
     let fail = |what: String| failed(unit, what);
     if unit.backend != spec.backend {
+        // alloc: the error's message
         return Err(fail(format!("a unit for {:?} with a spec for {:?}", unit.backend, spec.backend)));
     }
     let toolchain = &spec.toolchain;
     if unit.arch != toolchain.arch {
+        // alloc: the error's message
         return Err(fail(format!("a unit for {:?} with a spec for {:?}", unit.arch, toolchain.arch)));
     }
     if toolchain.arch == Arch::Wasm32 {
         return Err(fail("wasm: v2 builds in the bodies wasm-bindgen needs built in, and has no \
                          relocations of wasm's, neither of which it has yet"
-            .to_owned()));
+            .to_owned())); // alloc: the error's message
     }
     let target = crate::Target::selected().map_err(fail)?;
     let arch = match target.arch {
@@ -121,6 +123,7 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
         crate::Arch::Wasm32 => Arch::Wasm32,
     };
     if target.triple() != toolchain.target || arch != toolchain.arch {
+        // alloc: the error's message
         return Err(fail(format!(
             "the process compiles for {}, the unit is for {}",
             target.triple(),
@@ -133,6 +136,7 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
     // which `toolchain.features` lists. LLVM is told the baseline's name only, and stencils
     // are made for the baseline's.
     if !cranelift && target.cpu() != toolchain.cpu {
+        // alloc: the error's message
         return Err(fail(format!(
             "the process compiles for the CPU {}, the unit for {}: the {:?} back end is told \
              no other CPU yet",
@@ -149,6 +153,7 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
     let features = target.features_of(&toolchain.features).map_err(fail)?;
     if cranelift {
         crate::target_with(features).map_err(|e| {
+            // alloc: the error's message
             failed(unit, format!("Cranelift has no ISA for the target features {:?}: {e}", toolchain.features))
         })?;
     }
@@ -156,7 +161,7 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
         return Err(fail(
             "-Zsanitizer and SanitizerCoverage are instrumented by the LLVM back end \
              (Backend::Llvm), which this unit is not compiled by"
-                .to_owned(),
+                .to_owned(), // alloc: the error's message
         ));
     }
     if !matches!(spec.backend, Backend::Llvm { .. }) && spec.pgo != Pgo::None {
@@ -168,6 +173,7 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
         )));
     }
     if toolchain.frame_pointers != crate::backend::frame_pointers() {
+        // alloc: the error's message
         return Err(fail(format!(
             "the unit keeps frame pointers: {}, the process: {}",
             toolchain.frame_pointers,
@@ -175,6 +181,7 @@ pub(super) fn check_built(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> 
         )));
     }
     if let Some(knob) = set_knob() {
+        // alloc: the error's message
         return Err(fail(format!("`{knob}` is set, which changes code a unit's key has no part of")));
     }
     Ok(())
@@ -474,6 +481,7 @@ fn unsanitized(
         Kind::Code(..) => match super::frontend::item_of(db, &instance.0)? {
             ItemId::Function(func) => hir_def::attrs::disabled_sanitizers(db, func),
             other => {
+                // alloc: the error's message
                 return Err(format!(
                     "the `#[sanitize]` of {other:?}, which is no function: db's \
                      `disabled_sanitizers` takes a function"
@@ -511,8 +519,8 @@ fn foldable(db: &Db, instance: &HirInstance) -> bool {
 pub(super) fn built(db: &Db, instance: &HirInstance, checked: bool) -> Result<Built, String> {
     let produced = match &instance.0 {
         Kind::Code(instance, env) => {
-            let instance = Instance { checked, ..instance.clone() };
-            instance_code(db, instance, env.clone(), Detach::Unit, super::build::building())
+            let instance = Instance { checked, ..*instance };
+            instance_code(db, instance, *env, Detach::Unit, super::build::building())
         }
         Kind::Start(main) => {
             let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
@@ -521,7 +529,7 @@ pub(super) fn built(db: &Db, instance: &HirInstance, checked: bool) -> Result<Bu
         Kind::Asm(text) => return assembled(text),
         Kind::Allocator(forward) => super::allocator::built(db, forward, checked),
     }
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())?; // alloc: the error's message
     Ok(match produced {
         Produced::Pending(pending) => Built::Ir(pending),
         Produced::Code(compiled) => Built::Assembled(compiled.code, compiled.requests),
@@ -530,18 +538,21 @@ pub(super) fn built(db: &Db, instance: &HirInstance, checked: bool) -> Result<Bu
 
 /// The function of an `asm!` block: its assembly, which names nothing.
 fn assembled(text: &str) -> Result<Built, String> {
-    let isa = crate::target().map_err(|e| e.to_string())?;
+    let isa = crate::target().map_err(|e| e.to_string())?; // alloc: the error's message
+    // alloc: only an `asm!` function, whose assembler takes the triple as text
     let assembled = crate::asm::assemble(&isa.triple().to_string(), text)?;
     if !assembled.relocs.is_empty() {
+        // alloc: the error's message
         return Err("an `asm!` function that names a symbol".to_owned());
     }
     let code = fragment::Code {
         signature: ir::Signature::new(isa.default_call_conv()),
+        // clone: only an `asm!` function; the assembler's cache keeps its copy, `Code` owns this
         bytes: assembled.code.clone(),
         align: 16,
         relocs: fragment::Relocs::default(),
         unwind: None,
-        lines: Vec::new(),
+        lines: Vec::new(), // alloc: empty, allocates nothing
         slots: SlotPlaces::default(),
     };
     Ok(Built::Assembled(code, Requests::default()))
@@ -557,6 +568,7 @@ fn written_spans(
     let mut spans = Vec::with_capacity(source.spans.len());
     for at in 0..source.spans.len() as u32 {
         let Some(written) = source.written(at, None) else {
+            // alloc: the error's message
             return Err(format!("statement {at} of the function, which has no place in the source"));
         };
         spans.push(hashes.span(db, written.owner, written.span)?);
@@ -578,6 +590,7 @@ fn inlined_scopes(
     scopes.inlined.reserve(source.scopes.len());
     for (index, scope) in source.scopes.iter().enumerate() {
         let Some(at) = source.call_site(index as u32, None) else {
+            // alloc: the error's message
             return Err(format!(
                 "the call inlined scope {index} is inlined at, of {:?} within inlined callee \
                  {:?}, which is no item's body",
@@ -588,6 +601,7 @@ fn inlined_scopes(
         scopes.inlined.push(side::InlinedScope { parent: scope.parent, call_site });
     }
     scopes.inlined_of_span =
+        // alloc: the function's table, kept with it, exact size; only one with inlined bodies
         (0..source.spans.len() as u32).map(|at| source.scope_of(at)).collect();
     Ok(())
 }
@@ -800,6 +814,7 @@ fn emit_built(
     if function.places.refs as usize != refs.len() {
         return Err(failed(
             unit,
+            // alloc: the error's message
             format!(
                 "{} references given for a function prepared against {}",
                 refs.len(),
@@ -833,6 +848,8 @@ impl Function {
             spans: &self.spans,
             variables: &self.variables,
             scopes: &self.scopes,
+            // The compiled function owns its list, and `emitted` has the prepared one borrowed.
+            // clone: empty, allocating nothing, for nearly every function
             inlined: self.inlined.clone(),
         }
     }
@@ -859,6 +876,7 @@ fn told(
 ) -> Result<Emitted, CodegenError> {
     let fail = |what: String| failed(unit, what);
     if refs.len() < places.refs as usize {
+        // alloc: the error's message
         return Err(fail(format!(
             "{} references given for a function prepared against {}",
             refs.len(),
@@ -883,7 +901,7 @@ fn told(
     })
     .map_err(fail)?;
     let function = CompiledFunction { inlined, ..compiled };
-    Ok(Emitted { function, side: side.map(|it| it.0), extra: Vec::new() })
+    Ok(Emitted { function, side: side.map(|it| it.0), extra: Vec::new() }) // alloc: empty
 }
 
 /// Compiles `ir` in place of a prepared function's IR, its names being the function's: a
@@ -900,6 +918,7 @@ fn emit_ir(
     if !thunk && refs.len() != own {
         return Err(failed(
             unit,
+            // alloc: the error's message
             format!("{} references given for a fold of a function of {own}", refs.len()),
         ));
     }
@@ -910,6 +929,7 @@ fn emit_ir(
     if thunk {
         let code = compiled(unit, ir, &[], false, function.features)?;
         let none = side::Scopes::default();
+        // alloc: empty, allocates nothing
         let named = Named { spans: &[], variables: &[], scopes: &none, inlined: Vec::new() };
         told(unit, &function.places, function.requests(), code, refs, named)
     } else {
@@ -929,6 +949,7 @@ fn compiled(
     features: crate::Features,
 ) -> Result<fragment::Code, CodegenError> {
     let Backend::Cranelift { speed } = unit.backend else {
+        // alloc: the error's message
         return Err(failed(unit, format!("Cranelift's code of a unit for {:?}", unit.backend)));
     };
     let isa = isa(unit)?;
@@ -1145,12 +1166,13 @@ impl<'db> Prepare for Backends<'db> {
         let members: Vec<(&Unit, &Spec, &Function, &Refs)> = functions
             .iter()
             .map(|(unit, spec, function, refs)| (*unit, *spec, &**function, *refs))
+            // alloc: once a fold group, exact size: borrows of the boxes `functions` owns
             .collect();
         let Some(&(first, ..)) = members.first() else {
             return Err(CodegenError {
                 unit: group.key(),
                 item: ItemKey(ContentId::default()),
-                what: "a fold of no functions".to_owned(),
+                what: "a fold of no functions".to_owned(), // alloc: the error's message
             });
         };
         let pointer = isa(first)?.pointer_type();

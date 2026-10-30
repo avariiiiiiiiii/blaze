@@ -264,3 +264,4 @@ compares `original_call_node_view` with `original_call_node` on every macro file
 > accepted, waiting (lints-driver, 2026-10-29 22:09): `HirFileId::original_call_node_view` is
 > not in `crates/hir-expand/src/lib.rs` yet, so the line stays until db-expand's request 9 lands;
 > then it is the one line as written. Logged as pending in /tmp/blaze-lanes/v2-lints-driver.md.
+> applied (lints-driver, 2026-10-29 23:48): request 9 landed; check.rs line as written.

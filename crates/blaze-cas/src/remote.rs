@@ -72,6 +72,9 @@ const QUEUED_MOST: usize = 1 << 26;
 const COALESCE: usize = 1 << 18;
 /// Short answers are gathered into sends of about this many bytes.
 const COALESCE_MOST: usize = 1 << 20;
+/// The most room a send's buffer keeps to gather short answers again: a gathering is sent at
+/// [`COALESCE_MOST`] plus at most one short answer, and its buffer at most doubled past that.
+const SHORT_ROOM: usize = 2 * (COALESCE_MOST + COALESCE);
 
 /// What the server says about one key.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -91,6 +94,7 @@ impl Answer {
                 key: *key,
                 kind: entry.kind,
                 content: entry.content,
+                // alloc: the owned answer, for tests and tools; `Server` writes answers in place.
                 bytes: entry.bytes.to_vec(),
             },
             None => Answer::Missing { key: *key },
@@ -135,6 +139,7 @@ impl Answer {
         Ok(match parse(bytes)? {
             Parsed::Missing { key } => Answer::Missing { key },
             Parsed::Value { key, kind, content, bytes } => {
+                // alloc: the owned answer, for tests and tools; the store reads frames by `parse`.
                 Answer::Value { key, kind, content, bytes: bytes.to_vec() }
             }
         })
@@ -306,6 +311,8 @@ struct Up {
     recv: Option<Tag>,
     /// Received and not yet a whole frame.
     buffer: Vec<u8>,
+    /// Empty, its room kept: the next receive's `into`.
+    spare: Vec<u8>,
 }
 
 enum Role {
@@ -324,9 +331,12 @@ impl Client {
             at,
             tags: Tags::new(tags),
             link: Link::Down,
+            // alloc: empty, allocates nothing; once per client, setup.
             out: Vec::new(),
             waiting: ByHash::default(),
+            // alloc: empty, allocates nothing; once per client, setup.
             again: Vec::new(),
+            // alloc: empty, allocates nothing; once per client, setup.
             abandoned: Vec::new(),
         }
     }
@@ -360,14 +370,23 @@ impl Client {
                 self.link = Link::Down;
                 match done {
                     Done::Connected { conn } => {
-                        self.link =
-                            Link::Up(Up { conn, sending: None, recv: None, buffer: Vec::new() });
+                        self.link = Link::Up(Up {
+                            conn,
+                            sending: None,
+                            recv: None,
+                            // alloc: empty, allocates nothing; once per connection.
+                            buffer: Vec::new(),
+                            // alloc: empty, allocates nothing; once per connection.
+                            spare: Vec::new(),
+                        });
                         self.pump(effects);
                     }
                     Done::Failed(error) => {
+                        // alloc: an error path.
                         self.fail(&format!("could not connect: {error}"), answers, effects)
                     }
                     other => {
+                        // alloc: an error path.
                         self.fail(&format!("a connect completed as {other:?}"), answers, effects)
                     }
                 }
@@ -387,7 +406,10 @@ impl Client {
                     // alloc: an error path.
                     self.fail(&format!("sending asks failed: {error}"), answers, effects)
                 }
-                other => self.fail(&format!("a send completed as {other:?}"), answers, effects),
+                other => {
+                    // alloc: an error path.
+                    self.fail(&format!("a send completed as {other:?}"), answers, effects)
+                }
             },
             Role::Recv => {
                 if let Link::Up(up) = &mut self.link {
@@ -396,15 +418,18 @@ impl Client {
                 match done {
                     Done::Read(bytes) if bytes.is_empty() => {
                         let owed = self.waiting.len() + self.again.len();
+                        // alloc: an error path.
                         let why = format!("the server hung up with {owed} answers owed");
                         self.fail(&why, answers, effects);
                     }
-                    Done::Read(bytes) => {
+                    Done::Read(mut bytes) => {
                         if let Link::Up(up) = &mut self.link {
                             if up.buffer.is_empty() {
-                                up.buffer = bytes;
+                                up.spare = std::mem::replace(&mut up.buffer, bytes);
                             } else {
                                 up.buffer.extend_from_slice(&bytes);
+                                bytes.clear();
+                                up.spare = bytes;
                             }
                         }
                         match self.take_answers(answers) {
@@ -417,6 +442,7 @@ impl Client {
                         self.fail(&format!("receiving answers failed: {error}"), answers, effects)
                     }
                     other => {
+                        // alloc: an error path.
                         self.fail(&format!("a receive completed as {other:?}"), answers, effects)
                     }
                 }
@@ -454,14 +480,14 @@ impl Client {
             let tag = self.tags.next();
             up.recv = Some(tag);
             let most = owed(&up.buffer).clamp(CLIENT_RECV, CLIENT_RECV_MOST);
-            // alloc: none here; the driver reserves the room the bytes come into.
-            effects.push(Effect::Recv { conn: up.conn, most, into: Vec::new(), tag });
+            let into = std::mem::take(&mut up.spare);
+            effects.push(Effect::Recv { conn: up.conn, most, into, tag });
         }
     }
 
     /// Answers the waiting fetches whose frames have arrived whole, each with its whole frame. A
-    /// frame at the start of the buffer that fills it, or is long, is handed on without a copy;
-    /// a short one among others is copied out, so the buffer is never split once per frame.
+    /// long frame at the start of the buffer is handed on without a copy; a short one is copied
+    /// out, so the buffer keeps its room for the next receive and is never split once per frame.
     fn take_answers(&mut self, answers: &mut Vec<Completion>) -> Result<(), String> {
         let Link::Up(up) = &mut self.link else { return Ok(()) };
         let mut start = 0;
@@ -470,6 +496,7 @@ impl Client {
             let Some(prefix) = rest.first_chunk::<8>() else { break Ok(()) };
             let len = u64::from_le_bytes(*prefix);
             if len > LONGEST_FRAME {
+                // alloc: an error path.
                 break Err(format!(
                     "an answer frame of {len} bytes, more than the {LONGEST_FRAME} allowed"
                 ));
@@ -480,17 +507,22 @@ impl Client {
             }
             let key = match parse(&rest[8..end]) {
                 Ok(parsed) => parsed.key(),
+                // alloc: an error path.
                 Err(why) => break Err(format!("a malformed answer: {why}")),
             };
             let Some(tag) = self.waiting.remove(&key) else {
+                // alloc: an error path.
                 break Err(format!("an answer for {:x}, which was not asked", key.0));
             };
-            let frame = if start == 0 && end == up.buffer.len() {
-                std::mem::take(&mut up.buffer)
-            } else if start == 0 && end >= CLIENT_RECV {
-                let after = up.buffer.split_off(end);
-                std::mem::replace(&mut up.buffer, after)
+            let frame = if start == 0 && end >= CLIENT_RECV {
+                if end == up.buffer.len() {
+                    std::mem::take(&mut up.buffer)
+                } else {
+                    let after = up.buffer.split_off(end);
+                    std::mem::replace(&mut up.buffer, after)
+                }
             } else {
+                // alloc: the answer's own frame, which `Done::Read` hands to the store to keep.
                 let frame = up.buffer[start..start + end].to_vec();
                 start += end;
                 frame
@@ -500,6 +532,7 @@ impl Client {
                     if asked != key {
                         return true;
                     }
+                    // clone: each fetch's `Done::Read` owns its frame; one per key fetched again.
                     answers.push(Completion { tag: again, done: Done::Read(frame.clone()) });
                     false
                 });
@@ -519,6 +552,7 @@ impl Client {
         let at = &self.at;
         let failed = |key: Key, tag| Completion {
             tag,
+            // alloc: an error path.
             done: Done::Failed(IoError(format!(
                 "the remote store at {at}: {why}; asked for {:x}",
                 key.0
@@ -550,6 +584,7 @@ impl Remote for Client {
         }
         if let Link::Down = self.link {
             let connect = self.tags.next();
+            // clone: once per connection, connecting is the edge.
             effects.push(Effect::Connect { at: self.at.clone(), tag: connect });
             self.link = Link::Connecting(connect);
         }
@@ -597,6 +632,8 @@ struct Peer {
     queued: usize,
     /// Received and not yet a whole ask.
     buffer: Vec<u8>,
+    /// Empty, its room kept: the next receive's `into`.
+    spare: Vec<u8>,
     /// The short answers of the batch being served, gathered for one send.
     short: Vec<u8>,
     /// The long answers of the batch being served, each a send of its own after the short ones.
@@ -611,6 +648,7 @@ impl Server {
         if let Address::Tcp(addr) = &at
             && !addr.ip().to_canonical().is_loopback()
         {
+            // alloc: an error path.
             return Err(format!(
                 "the remote store would listen on {addr}, which is not loopback: it has no TLS or \
                  authentication, so it is served on a Unix socket or a loopback port forwarded over SSH"
@@ -620,6 +658,7 @@ impl Server {
             at,
             tags: Tags::new(tags),
             listen: None,
+            // alloc: empty, allocates nothing; once per server, setup.
             closing: Vec::new(),
             failed: None,
             peers: FxHashMap::default(),
@@ -635,6 +674,7 @@ impl Server {
         let tag = self.tags.next();
         self.listen = Some(tag);
         self.failed = None;
+        // clone: once per listen, setup.
         effects.push(Effect::Listen { at: self.at.clone(), tag });
     }
 
@@ -658,6 +698,7 @@ impl Server {
         store: &Store,
         effects: &mut Vec<Effect>,
     ) -> Vec<Corrupt> {
+        // alloc: empty, allocates nothing; pushed to only for a corrupt value, an error path.
         let mut corrupt = Vec::new();
         let Completion { tag, done } = completion;
         if self.listen == Some(tag) {
@@ -668,6 +709,7 @@ impl Server {
                 }
                 Done::Failed(error) => {
                     self.listen = None;
+                    // alloc: an error path.
                     self.failed = Some(IoError(format!(
                         "listening at {} for the remote store: {error}",
                         self.at
@@ -675,6 +717,7 @@ impl Server {
                 }
                 other => {
                     self.listen = None;
+                    // alloc: an error path.
                     self.failed = Some(IoError(format!(
                         "listening at {} for the remote store completed as {other:?}",
                         self.at
@@ -696,9 +739,14 @@ impl Server {
         let Some(peer) = self.peers.get_mut(&conn) else { return corrupt };
         if peer.sending.is_some_and(|(sending, _)| sending == tag) {
             match done {
-                Done::Sent(_) => {
+                Done::Sent(spare) => {
                     if let Some((_, len)) = peer.sending.take() {
                         peer.queued -= len;
+                    }
+                    // The buffer sent gathers the next short answers, its room kept, unless it
+                    // was a long answer's.
+                    if peer.short.capacity() == 0 && spare.is_empty() && spare.capacity() <= SHORT_ROOM {
+                        peer.short = spare;
                     }
                     self.serve(conn, store, &mut corrupt, effects);
                 }
@@ -707,8 +755,14 @@ impl Server {
         } else {
             peer.recv = None;
             match done {
-                Done::Read(bytes) if !bytes.is_empty() => {
-                    peer.buffer.extend_from_slice(&bytes);
+                Done::Read(mut bytes) if !bytes.is_empty() => {
+                    if peer.buffer.is_empty() {
+                        peer.spare = std::mem::replace(&mut peer.buffer, bytes);
+                    } else {
+                        peer.buffer.extend_from_slice(&bytes);
+                        bytes.clear();
+                        peer.spare = bytes;
+                    }
                     self.serve(conn, store, &mut corrupt, effects);
                 }
                 _ => self.drop_peer(conn, effects),
@@ -723,6 +777,7 @@ impl Server {
             effects.push(Effect::Unlisten { tag });
             self.closing.push(tag);
         }
+        // alloc: once per stop, the edge.
         let mut conns: Vec<Conn> = self.peers.drain().map(|it| it.0).collect();
         radix::sort_copy_by_key(&mut conns, |it| it.0);
         for conn in conns {
@@ -800,8 +855,8 @@ impl Server {
             let tag = self.tags.next();
             peer.recv = Some(tag);
             self.ops.insert(tag, conn);
-            // alloc: none here; the driver reserves the room the bytes come into.
-            effects.push(Effect::Recv { conn, most: SERVER_RECV, into: Vec::new(), tag });
+            let into = std::mem::take(&mut peer.spare);
+            effects.push(Effect::Recv { conn, most: SERVER_RECV, into, tag });
         }
     }
 

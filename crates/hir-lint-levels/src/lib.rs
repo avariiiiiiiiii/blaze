@@ -32,6 +32,6 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 pub use self::{
     builder::{Event, LevelCx, Levels, Malformed, SetId, Sink, Source, SourceId, Spec},
-    query::{ScopeLevels, crate_lint_level, crate_lint_levels, lint_level, lint_level_at, lint_levels_on},
+    query::{LevelError, ScopeLevels, crate_lint_level, crate_lint_levels, lint_level, lint_level_at, lint_levels_on},
 };
 pub use blaze_lint_defs::{Level, LintId, LintOptions};

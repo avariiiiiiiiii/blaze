@@ -13,29 +13,32 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-blaze-mem = { workspace = true, optional = true }
-paths = { workspace = true, optional = true }
-rustc-hash = { workspace = true, optional = true }
+blaze-mem.workspace = true
+paths.workspace = true
+rustc-hash.workspace = true
 # span = {workspace = true, default-features = false} does not work
-span = { path = "../span", version = "0.0.0", default-features = false, optional = true }
-intern = { workspace = true, optional = true }
-stdx = { workspace = true, optional = true }
-tt = { workspace = true, optional = true }
+span = { path = "../span", version = "0.0.0", default-features = false }
+intern.workspace = true
+rustc_lexer.workspace = true
+stdx.workspace = true
+tt.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 expect-test.workspace = true
 line-index.workspace = true
 
-# used as proc macro test targets
-proc-macro-test.path = "./proc-macro-test"
-
-[features]
-default = []
-in-rust-tree = ["dep:blaze-mem", "dep:intern", "dep:paths", "dep:rustc-hash", "dep:span", "dep:stdx", "dep:tt"]
+# The proc macros the tests expand, as the shared library blaze links (`proc-macro-libraries`).
+proc-macro-test-impl.path = "./proc-macro-test"
 
 [lints]
 workspace = true
 
-[package.metadata.rust-analyzer]
-rustc_private=true
+# A blaze extension: each proc-macro dependency named here is linked as a shared library with
+# blaze's list of its macros, and the package's crates are told its path as
+# `BLAZE_PROC_MACRO_LIBRARY_<NAME>` (the name upper-cased, `-` as `_`).
+[package.metadata.blaze]
+proc-macro-libraries = ["proc-macro-test-impl"]

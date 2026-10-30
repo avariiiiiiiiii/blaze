@@ -250,15 +250,22 @@ pub(super) unsafe fn close(fd: c_int) -> c_int {
     unsafe { libc::close(fd) }
 }
 
-/// A connected pair of Unix stream sockets, close-on-exec, or `None` with `errno` set. The
-/// caller owns both numbers.
-pub(super) fn stream_pair() -> Option<[c_int; 2]> {
+/// A connected pair of Unix stream sockets, close-on-exec, or `None` with `errno` set.
+pub(super) fn stream_pair() -> Option<[OwnedFd; 2]> {
     let mut sockets = [0; 2];
     // SAFETY: `sockets` is a live, exclusive array of the two `c_int`s the call writes.
     let made = unsafe {
         libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, sockets.as_mut_ptr())
     };
-    (made >= 0).then_some(sockets)
+    if made < 0 {
+        return None;
+    }
+    // SAFETY: `socketpair` succeeded, so it just made `sockets[0]`, and nothing else holds it:
+    // the `OwnedFd` is its one owner. A second would close it twice.
+    let first = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
+    // SAFETY: as for `sockets[0]`, which is a different descriptor.
+    let second = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
+    Some([first, second])
 }
 
 /// An IPv4 datagram socket, close-on-exec, or `None` with `errno` set.
@@ -301,21 +308,29 @@ pub(super) fn landlock_abi() -> c_long {
     }
 }
 
-/// A Landlock ruleset of the first `size` bytes of `attr` (what this kernel's ABI knows).
-pub(super) fn landlock_ruleset(attr: &RulesetAttr, size: usize) -> c_long {
+/// A Landlock ruleset of the first `size` bytes of `attr` (what this kernel's ABI knows), or
+/// `None` with `errno` set.
+pub(super) fn landlock_ruleset(attr: &RulesetAttr, size: usize) -> Option<OwnedFd> {
     assert!(size <= size_of::<RulesetAttr>(), "a ruleset attribute of {size} bytes");
     // SAFETY: `attr` is a `struct landlock_ruleset_attr` (`repr(C)`, checked above) borrowed
     // for the call, which reads its first `size` bytes, no more than it has (asserted).
-    unsafe { libc::syscall(landlock::CREATE_RULESET, attr as *const RulesetAttr, size, 0) }
+    let fd = unsafe { libc::syscall(landlock::CREATE_RULESET, attr as *const RulesetAttr, size, 0) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is >= 0, so `landlock_create_ruleset` just made it, and the `OwnedFd` is
+    // its one owner.
+    Some(unsafe { OwnedFd::from_raw_fd(fd as c_int) })
 }
 
-pub(super) fn landlock_add_rule(ruleset: c_int, rule: &PathBeneath) -> c_long {
+pub(super) fn landlock_add_rule(ruleset: BorrowedFd<'_>, rule: &PathBeneath) -> c_long {
     // SAFETY: `rule` is a `struct landlock_path_beneath_attr` (`repr(C, packed)`, 12 bytes,
-    // checked above) borrowed for the call, which only reads it.
+    // checked above) borrowed for the call, which only reads it; `ruleset` is open while
+    // borrowed.
     unsafe {
         libc::syscall(
             landlock::ADD_RULE,
-            ruleset,
+            ruleset.as_raw_fd(),
             landlock::RULE_PATH_BENEATH,
             rule as *const PathBeneath,
             0u32,
@@ -323,26 +338,32 @@ pub(super) fn landlock_add_rule(ruleset: c_int, rule: &PathBeneath) -> c_long {
     }
 }
 
-pub(super) fn landlock_restrict_self(ruleset: c_int) -> c_long {
+pub(super) fn landlock_restrict_self(ruleset: BorrowedFd<'_>) -> c_long {
     // SAFETY: `landlock_restrict_self` takes integers only and touches no memory of this
-    // process.
-    unsafe { libc::syscall(landlock::RESTRICT_SELF, ruleset, 0u32) }
+    // process; `ruleset` is open while borrowed.
+    unsafe { libc::syscall(landlock::RESTRICT_SELF, ruleset.as_raw_fd(), 0u32) }
 }
 
 /// Installs `program` as this process's seccomp filter with a listener: the listener's
-/// descriptor, or below 0 with `errno` set.
-pub(super) fn install_filter(program: &[libc::sock_filter]) -> c_long {
+/// descriptor, or `None` with `errno` set.
+pub(super) fn install_filter(program: &[libc::sock_filter]) -> Option<OwnedFd> {
     let prog = libc::sock_fprog { len: program.len() as u16, filter: program.as_ptr().cast_mut() };
     // SAFETY: `prog` points at `program`, borrowed for the call, with a length no longer than
     // it; the kernel copies the instructions in and writes nothing through the pointer.
-    unsafe {
+    let fd = unsafe {
         libc::syscall(
             libc::SYS_seccomp,
             SECCOMP_SET_MODE_FILTER,
             SECCOMP_FILTER_FLAG_NEW_LISTENER,
             &prog as *const libc::sock_fprog,
         )
+    };
+    if fd < 0 {
+        return None;
     }
+    // SAFETY: `fd` is >= 0, so `seccomp` just made the listener, and the `OwnedFd` is its one
+    // owner.
+    Some(unsafe { OwnedFd::from_raw_fd(fd as c_int) })
 }
 
 /// Room for one control message of a descriptor, aligned as a `cmsghdr` must be: the kernel
@@ -397,7 +418,8 @@ pub(super) fn send_descriptor(socket: c_int, fd: c_int) -> isize {
 
 /// The descriptor sent over `socket` (close-on-exec), or `None` when the other end closed
 /// first or sent none.
-pub(super) fn received_descriptor(socket: c_int) -> Option<c_int> {
+pub(super) fn received_descriptor(socket: BorrowedFd<'_>) -> Option<OwnedFd> {
+    let socket = socket.as_raw_fd();
     let mut byte = [0u8; 1];
     let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
     let mut space = Control([0; 64]);
@@ -427,7 +449,10 @@ pub(super) fn received_descriptor(socket: c_int) -> Option<c_int> {
     // SAFETY: `data` is the header's aligned size into `space` (16 bytes on 64-bit, 12 on
     // 32-bit), so the `c_int` read ends by 20 of its 64 initialized bytes; the data need not
     // be aligned for a `c_int`.
-    Some(unsafe { std::ptr::read_unaligned(data.cast::<c_int>()) })
+    let fd = unsafe { std::ptr::read_unaligned(data.cast::<c_int>()) };
+    // SAFETY: an `SCM_RIGHTS` message's descriptor is one the kernel just installed in this
+    // process for this receive, so nothing else holds it: the `OwnedFd` is its one owner.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// `SECCOMP_IOCTL_NOTIF_SET_FLAGS` on `listener`.

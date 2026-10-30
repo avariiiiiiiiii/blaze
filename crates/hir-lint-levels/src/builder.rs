@@ -396,6 +396,26 @@ impl<'db> Levels<'db> {
         set
     }
 
+    /// The set in force at an impl a builtin derive of `adt` makes with no tokens: rustc's
+    /// `create_derived_impl` puts it beside the ADT with the ADT's `allow`, `warn`, `deny` and
+    /// `forbid` copied onto it, not its `expect`s nor its other attributes. Made anew each time
+    /// it is asked.
+    pub fn set_of_derived(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, adt: InFile<ast::Node<'db>>) -> SetId {
+        let parent = match attrs::parent(cx.db, cx.krate, adt) {
+            Some(around) => self.set_at(cx, sink, around),
+            None => COMMAND_LINE,
+        };
+        let Some(owner) = attrs::owner(adt.value, self.early) else { return parent };
+        let mut reads = attrs::read(owner, cx.cfg, cx.edition);
+        reads.retain(|it| !matches!(it, Read::Level(Level::Expect, ..)));
+        if reads.is_empty() {
+            return parent;
+        }
+        let set = self.open(parent);
+        self.add(cx, sink, set, adt, adt.file_id, reads, false);
+        self.close(set)
+    }
+
     fn push_node(&mut self, cx: &mut LevelCx<'_, 'db>, sink: &mut impl Sink<'db>, parent: SetId, node: InFile<ast::Node<'db>>) -> SetId {
         let Some(owner) = attrs::owner(node.value, self.early) else { return parent };
         let is_crate = node.value.kind() == SyntaxKind::SOURCE_FILE && node.file_id == cx.root;

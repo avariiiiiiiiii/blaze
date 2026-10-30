@@ -118,12 +118,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let name = match self.adt_variant(adt.def_id(), variant)? {
                     VariantId::EnumVariantId(it) => {
                         let variants = &it.lookup(self.db).parent.enum_variants(self.db).variants;
-                        variants.get_index(variant).map(|(name, _)| name.clone())
+                        variants.get_index(variant).map(|(name, _)| name.clone()) // clone: an interned `Name`; reflection shim, only for a `type_info` intrinsic
                     }
-                    VariantId::StructId(it) => Some(StructSignature::of(self.db, it).name.clone()),
-                    VariantId::UnionId(it) => Some(UnionSignature::of(self.db, it).name.clone()),
+                    VariantId::StructId(it) => Some(StructSignature::of(self.db, it).name.clone()), // clone: an interned `Name`; reflection shim, only for a `type_info` intrinsic
+                    VariantId::UnionId(it) => Some(UnionSignature::of(self.db, it).name.clone()), // clone: an interned `Name`; reflection shim, only for a `type_info` intrinsic
                 };
-                let name = name.map(|it| it.as_str().to_owned()).unwrap_or_default();
+                let name = name.map(|it| it.as_str().to_owned()).unwrap_or_default(); // alloc: reflection shim, only for a `type_info` intrinsic
                 self.write_str(destination, &name)?;
             }
             Intrinsic::TypeIdVariantNonExhaustive => {
@@ -224,7 +224,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 // rustc skips the binder too (its "FIXME: handle lifetime bounds").
                 let sig = sig.skip_binder();
-                let inputs: Vec<Ty<'db>> = sig.inputs().iter().copied().collect();
+                let inputs: Vec<Ty<'db>> = sig.inputs().iter().copied().collect(); // alloc: reflection shim, only for a `type_info` intrinsic
                 let value = self.reflected_fn_ptr(
                     fn_ptr,
                     &inputs,
@@ -243,7 +243,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// The bytes of the `TypeId` of `ty`, as a `TypeId` is of it.
     fn type_id_bytes(&mut self, ty: Ty<'db>) -> Result<'db, Vec<u8>> {
         let ty = self.type_id_ty(ty)?;
-        Ok(self.type_id(TypeIdOf::Ty(ty)).to_vec())
+        Ok(self.type_id(TypeIdOf::Ty(ty)).to_vec()) // alloc: reflection shim, only for a `type_info` intrinsic
     }
 
     /// `bytes` the evaluator computed, which carry no pointer.
@@ -276,7 +276,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .into_iter()
             .map(|(bytes, _)| IntervalOrOwned::Owned(OwnedBytes::from_vec(bytes)));
         let bytes = self.construct_with_layout(size, layout, tag, fields)?;
-        Ok((bytes, shadow))
+        Ok((bytes.into_vec(), shadow))
     }
 
     /// `Some(value)` of an `Option<inner>`, as [`Self::write_option`] makes it, with what
@@ -292,13 +292,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         };
         let args = GenericArgs::new_from_slice(&[inner.into()]);
         let (size, layout, tag) = self.layout_of_variant(some.into(), args, locals)?;
-        self.reflected_construct(size, &layout, tag, vec![value])
+        self.reflected_construct(size, &layout, tag, vec![value]) // alloc: reflection shim, only for a `type_info` intrinsic
     }
 
     /// A `&'static [_]` or `&'static str` of `len` elements at `addr`, memory the evaluator
     /// made, carrying the provenance of that allocation.
     fn reflected_ref(&self, addr: Address, len: usize) -> Made<M::Shadow> {
-        let mut bytes = addr.to_bytes().to_vec();
+        let mut bytes = addr.to_bytes().to_vec(); // alloc: reflection shim, only for a `type_info` intrinsic
         let mut shadow = M::Shadow::pointer(bytes.len(), self.ptr(addr).prov);
         let at = bytes.len();
         bytes.extend(word_bytes(len));
@@ -355,9 +355,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .iter()
             .map(|(id, field)| {
                 let ty = field.ty().instantiate(self.interner(), args).skip_norm_wip();
-                (names[id].name.as_str().to_owned(), ty)
+                (names[id].name.as_str().to_owned(), ty) // alloc: reflection shim, only for a `type_info` intrinsic
             })
-            .collect()
+            .collect() // alloc: reflection shim, only for a `type_info` intrinsic
     }
 
     /// The names and types of the fields of the variant `variant` of `ty`, in the order they
@@ -376,9 +376,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 self.variant_fields(variant, args)
             }
             TyKind::Tuple(fields) => {
-                fields.iter().enumerate().map(|(i, ty)| (i.to_string(), ty)).collect()
+                fields.iter().enumerate().map(|(i, ty)| (i.to_string(), ty)).collect() // alloc: reflection shim, only for a `type_info` intrinsic
             }
-            _ => Vec::new(),
+            _ => Vec::new(), // alloc: empty, allocates nothing
         })
     }
 
@@ -390,14 +390,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         field: usize,
         locals: &Locals<'db>,
     ) -> Result<'db, usize> {
-        let layout = match base.kind() {
+        let offset = match base.kind() {
             TyKind::Adt(adt, args) => {
                 let variant = self.adt_variant(adt.def_id(), variant)?;
-                self.layout_of_variant(variant, args, locals)?.1
+                self.layout_of_variant(variant, args, locals)?.1.fields.offset(field)
             }
-            _ => self.layout(base)?,
+            _ => self.layout(base)?.fields.offset(field),
         };
-        Ok(layout.fields.offset(field).bytes_usize())
+        Ok(offset.bytes_usize())
     }
 
     /// A value of `variant` of an ADT with the generic args `args`, made field by field: `field`
@@ -410,7 +410,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         locals: &Locals<'db>,
         field: FieldBytes<'_, 'db, M>,
     ) -> Result<'db, Made<M::Shadow>> {
-        let mut values = Vec::new();
+        let mut values = Vec::new(); // alloc: reflection shim, only for a `type_info` intrinsic
         for (name, ty) in self.variant_fields(variant, args) {
             values.push(field(self, &name, ty)?);
         }
@@ -470,7 +470,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         locals: &Locals<'db>,
     ) -> Result<'db, Made<M::Shadow>> {
         match self.size_align_of(ty, locals)? {
-            Some((0, _)) => Ok(Self::made(Vec::new())),
+            Some((0, _)) => Ok(Self::made(Vec::new())), // alloc: reflection shim, only for a `type_info` intrinsic
             _ => not_supported!("the field `{name}` of {ty:?}, which rustc does not write"),
         }
     }
@@ -580,7 +580,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let is_auto = |it: &Binder<'db, ExistentialPredicate<'db>>| {
             matches!(it.skip_binder(), ExistentialPredicate::AutoTrait(_))
         };
-        let mut traits = Vec::new();
+        let mut traits = Vec::new(); // alloc: reflection shim, only for a `type_info` intrinsic
         if predicates.iter().any(|it| matches!(it.skip_binder(), ExistentialPredicate::Trait(_))) {
             let principal = BoundExistentialPredicates::new_from_iter(
                 predicates.iter().filter(|it| !is_auto(it)),
@@ -598,7 +598,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     "trait_ty" => {
                         this.reflected_struct(trait_, locals, &mut |this, name, _| match name {
                             "ty" => this.reflected_type_id(trait_ty),
-                            "is_auto" => Ok(Self::made(vec![is_auto as u8])),
+                            "is_auto" => Ok(Self::made(vec![is_auto as u8])), // alloc: reflection shim, only for a `type_info` intrinsic
                             other => {
                                 not_supported!("the field `{other}` of `Trait`, not rustc's")
                             }
@@ -623,7 +623,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         locals: &Locals<'db>,
     ) -> Result<'db, Made<M::Shadow>> {
         let args: Vec<_> = match ty.kind() {
-            TyKind::Adt(_, args) => args.iter().collect(),
+            TyKind::Adt(_, args) => args.iter().collect(), // alloc: reflection shim, only for a `type_info` intrinsic
             // rustc's are the item's args and, of a closure or coroutine, the synthetic ones
             // after them (its kind, signature and upvars), which this front end's are not
             // checked against.
@@ -633,7 +633,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             | TyKind::Coroutine(..) => {
                 not_supported!("the generic args of {ty:?} as rustc's reflection gives them")
             }
-            _ => Vec::new(),
+            _ => Vec::new(), // alloc: empty, allocates nothing
         };
         let Some(generic) = self.lang_items().TypeInfoGeneric else {
             not_supported!("no `Generic` (lang item `type_info_generic`) in core")
@@ -684,7 +684,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         locals: &Locals<'db>,
     ) -> Result<'db, Made<M::Shadow>> {
         self.reflected_struct(fn_ptr, locals, &mut |this, name, field| match name {
-            "is_unsafe" => Ok(Self::made(vec![!kind.is_safe() as u8])),
+            "is_unsafe" => Ok(Self::made(vec![!kind.is_safe() as u8])), // alloc: reflection shim, only for a `type_info` intrinsic
             "abi" => match kind.abi() {
                 ExternAbi::C { .. } => {
                     this.reflected_variant(field, "ExternC", locals, &mut |this, name, ty| {
@@ -704,9 +704,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 this.reflected_type_id(inputs[i])
             }),
             "output" => this.reflected_type_id(output),
-            "variadic" => Ok(Self::made(vec![kind.c_variadic() as u8])),
-            "is_splatted" => Ok(Self::made(vec![0])),
-            "splatted_index" => Ok(Self::made(vec![u8::MAX])),
+            "variadic" => Ok(Self::made(vec![kind.c_variadic() as u8])), // alloc: reflection shim, only for a `type_info` intrinsic
+            "is_splatted" => Ok(Self::made(vec![0])), // alloc: reflection shim, only for a `type_info` intrinsic
+            "splatted_index" => Ok(Self::made(vec![u8::MAX])), // alloc: reflection shim, only for a `type_info` intrinsic
             other => not_supported!("the field `{other}` of `FnPtr`, which rustc does not write"),
         })
     }

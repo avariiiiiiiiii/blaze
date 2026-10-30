@@ -54,11 +54,14 @@ pub(crate) fn func_ref(
     target: &FuncTarget,
 ) -> Result<Ref, String> {
     match target {
+        // clone: `FrontRef::Extern` owns its name; `place_requests` places a symbol by `&str`
         FuncTarget::Symbol(symbol) => Ok(FrontRef::Extern(symbol.clone())),
         FuncTarget::Path(path) => {
+            // alloc: the error's message
             Err(format!("a call of rustc's `{path}`, which a build without rustc has none of"))
         }
         FuncTarget::Instance(instance, env) => instance_ref(db, homes, instance, env),
+        // clone: only a call of an `asm!` block's function, whose `Kind::Asm` owns its text
         FuncTarget::Asm(text) => Ok(FrontRef::Function(HirInstance(Kind::Asm(text.clone())))),
     }
 }
@@ -84,7 +87,7 @@ pub(crate) fn instance_ref(
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> Result<Ref, String> {
-    let mut instance = Instance { checked: false, ..instance.clone() };
+    let mut instance = Instance { checked: false, ..*instance };
     let args = instance.args.as_ref();
     if args.has_aliases() {
         instance.args = evaluated(db, Some(env.as_ref(db).krate), args)?.store();
@@ -100,24 +103,28 @@ pub(crate) fn instance_ref(
 
 /// The symbol a function without a body of Rust is: an item of an `extern` block.
 fn bodyless(db: &Db, func: FunctionId) -> Result<String, String> {
-    let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+    let name = FunctionSignature::of(db, func).name.as_str();
     match func.lookup(db).container {
         ItemContainerId::ExternBlockId(_) => {
             let Some(symbol) = link_name(db, func) else {
+                // alloc: the error's message
                 return Err(format!("`{name}` of an `extern` block has no link name"));
             };
             if symbol.starts_with("llvm.") {
+                // alloc: the error's message
                 return Err(format!("a call of LLVM's intrinsic `{symbol}` the IR builder left"));
             }
             Ok(symbol)
         }
         ItemContainerId::TraitId(_) => {
+            // alloc: the error's message
             Err(format!("a call of the trait method `{name}`, which no impl was found for"))
         }
         _ if FunctionSignature::is_intrinsic(db, func) => {
+            // alloc: the error's message
             Err(format!("a call of the intrinsic `{name}`, which has no fallback body"))
         }
-        _ => Err(format!("a call of `{name}`, which has no body")),
+        _ => Err(format!("a call of `{name}`, which has no body")), // alloc: the error's message
     }
 }
 
@@ -141,6 +148,7 @@ pub(crate) fn weak_symbol(db: &Db, id: StaticId) -> Result<Option<String>, Strin
     }
     match static_link_name(db, id) {
         Some(symbol) => Ok(Some(symbol)),
+        // alloc: the error's message
         None => Err(format!(
             "`{}` is `extern_weak` but of no `extern` block",
             StaticSignature::of(db, id).name.as_str()
@@ -174,6 +182,7 @@ pub(crate) fn libcall_name(libcall: ir::LibCall) -> Result<&'static str, String>
 
 /// The reference of the personality routine of a function with landing pads.
 pub(crate) fn personality_ref() -> Ref {
+    // alloc: once per function with landing pads; `FrontRef::Extern` owns its name
     FrontRef::Extern(PERSONALITY.to_owned())
 }
 /// The places of a list of references: a function's, which the walk made and nothing is
@@ -207,6 +216,7 @@ impl<'a> Placer<'a> {
     }
 
     pub(crate) fn open() -> Placer<'a> {
+        // alloc: empty, allocates nothing until a static's first reference
         Placer { refs: Cow::Owned(Vec::new()), index: HashTable::new(), open: true }
     }
 }
@@ -242,11 +252,13 @@ impl<'a, A: Allocator> Placer<'a, A> {
         if let Some(&place) = self.index.find(hashed, same) {
             return Ok(place);
         }
+        // alloc: only a symbol not placed yet, whose reference owns its name
         self.add(hashed, FrontRef::Extern(name.to_owned()))
     }
 
     fn add(&mut self, hashed: u64, it: Ref) -> Result<u32, String> {
         if !self.open {
+            // alloc: the error's message
             return Err(format!("the IR asks for {it:?}, which its references do not list"));
         }
         let place = self.refs.len() as u32;
@@ -288,7 +300,7 @@ pub(crate) fn place_requests<A: Allocator>(
         let place = match request {
             DataRequest::Blob { identity: DataIdentity::Writable, .. } => {
                 return Err("data the code writes to, which is no constant (`promoted_slot`)"
-                    .to_owned());
+                    .to_owned()); // alloc: the error's message
             }
             DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => {
                 fill_type_ids(db, hashes, krate, blob)?;
@@ -302,6 +314,7 @@ pub(crate) fn place_requests<A: Allocator>(
             DataRequest::Declaration(func) => DataPlace::Position(hashes.declaration(db, *func)?),
             DataRequest::FilePath(file) => DataPlace::Text(hashes.file_name(db, *file)?),
             DataRequest::Text(parts) => {
+                // alloc: the text its data place keeps, one per `file!()` text of the function
                 let mut text = String::new();
                 for part in parts.iter() {
                     match part {
@@ -334,13 +347,16 @@ where
         return Ok(value);
     }
     let Some(krate) = krate else {
+        // alloc: the error's message
         return Err(format!("`{value:?}` has aliases left, and no crate to normalize them in"));
     };
     let infcx = DbInterner::new_with(db, krate).infer_ctxt().build(TypingMode::PostAnalysis);
     let normalized = ObligationCtxt::new(&infcx)
         .deeply_normalize(&ObligationCause::dummy(), ParamEnv::empty(), value)
+        // alloc: the error's message
         .map_err(|errors| format!("`{value:?}` does not normalize: {errors:?}"))?;
     if normalized.has_aliases() || normalized.has_infer() {
+        // alloc: the error's message
         return Err(format!("`{value:?}` normalizes to `{normalized:?}`, which has no content"));
     }
     Ok(normalized)
@@ -359,6 +375,7 @@ pub(crate) fn fill_type_ids(
         let id = hashes.ty(db, evaluated(db, krate, ty.as_ref())?)?;
         let at = offset as usize;
         let Some(bytes) = blob.bytes.get_mut(at..at + 16) else {
+            // alloc: the error's message
             return Err(format!("a `TypeId` at {at}, past the end of its constant"));
         };
         bytes.copy_from_slice(&id.0[..16]);
@@ -420,6 +437,7 @@ impl Placed<'_> {
         let refs = self.refs;
         refs.get(place as usize)
             .cloned()
+            // alloc: the error's message
             .ok_or_else(|| format!("place {place} of {} references", refs.len()))
     }
 }
@@ -429,10 +447,11 @@ impl Resolver for Placed<'_> {
         match self.places.funcs.get(index as usize) {
             Some(&OWN) => match &request.target {
                 FuncTarget::Symbol(name) if self.own.is_some() => self.symbol(name),
+                // alloc: the error's message
                 _ => Err(format!("function {index} is the backend's own, and no symbol")),
             },
             Some(&place) => self.target(place),
-            None => Err(format!("function {index} has no place")),
+            None => Err(format!("function {index} has no place")), // alloc: the error's message
         }
     }
 
@@ -441,9 +460,10 @@ impl Resolver for Placed<'_> {
             Some(DataPlace::Place(place)) => self.target(*place).map(DataTarget::Target),
             Some(DataPlace::Position(span)) => Ok(DataTarget::Target(Target::Position(*span))),
             Some(DataPlace::Own) => Ok(DataTarget::Own),
+            // clone: only a `file!()` text; `Resolver::data` returns an owned `DataTarget`
             Some(DataPlace::Text(text)) => Ok(DataTarget::Text(text.clone())),
             Some(DataPlace::Nowhere) => Ok(DataTarget::Nowhere),
-            None => Err(format!("data {index} has no place")),
+            None => Err(format!("data {index} has no place")), // alloc: the error's message
         }
     }
 
@@ -463,15 +483,19 @@ impl Resolver for Placed<'_> {
         let same =
             |&(_, at): &(u64, u32)| matches!(&refs[at as usize], Target::Extern(it) if it == name);
         match symbols.find(symbol_hash(name), same) {
+            // clone: `Resolver::symbol` returns an owned `Target`, as `target` does
             Some(&(_, at)) => Ok(refs[at as usize].clone()),
             None => match &self.own {
                 Some(own) if !name.is_empty() => {
                     let mut own = own.borrow_mut();
                     if !own.iter().any(|it| it == name) {
+                        // alloc: once per symbol of the backend's own, kept past the emit
                         own.push(name.to_owned());
                     }
+                    // alloc: only a symbol of the backend's own; `Target::Extern` owns its name
                     Ok(Target::Extern(name.to_owned()))
                 }
+                // alloc: the error's message
                 _ => Err(format!("the code calls `{name}`, which its references do not list")),
             },
         }
@@ -480,7 +504,9 @@ impl Resolver for Placed<'_> {
     fn body(&self) -> Result<Target, String> {
         let refs = self.refs;
         match refs.len().checked_sub(1) {
+            // clone: `Resolver::body` returns an owned `Target`, as `target` does
             Some(last) if last == self.places.refs as usize => Ok(refs[last].clone()),
+            // alloc: the error's message
             _ => Err("a call of a fold's body from what is no thunk of it".to_owned()),
         }
     }

@@ -49,6 +49,7 @@ pub(crate) const SAMPLE_BYTES_MOST: u64 = 32 << 20;
 
 pub(crate) fn train(samples: &[&[u8]]) -> Result<Vec<u8>, String> {
     zstd::dict::from_samples(samples, DICTIONARY_SIZE)
+        // alloc: the error's message
         .map_err(|error| format!("training a dictionary on {} values failed: {error}", samples.len()))
 }
 
@@ -99,16 +100,19 @@ impl<'d> Batch<'d> {
             None => zstd::bulk::Compressor::new(LEVEL),
         }
         .map(Batch)
+        // alloc: the error's message
         .map_err(|error| format!("starting zstd failed: {error}"))
     }
 
     pub(crate) fn compress(&mut self, raw: &[u8]) -> Result<Vec<u8>, String> {
+        // alloc: the error's message
         self.0.compress(raw).map_err(|error| format!("compressing {} bytes failed: {error}", raw.len()))
     }
 }
 
 pub(crate) fn compress_long(raw: &[u8]) -> Result<Vec<u8>, String> {
     let mut compressor = zstd::bulk::Compressor::new(LEVEL)
+        // alloc: the error's message
         .map_err(|error| format!("starting zstd failed: {error}"))?;
     for parameter in [
         CParameter::EnableLongDistanceMatching(true),
@@ -117,8 +121,10 @@ pub(crate) fn compress_long(raw: &[u8]) -> Result<Vec<u8>, String> {
     ] {
         compressor
             .set_parameter(parameter)
+            // alloc: the error's message
             .map_err(|error| format!("zstd refused {parameter:?}: {error}"))?;
     }
+    // alloc: the error's message
     compressor.compress(raw).map_err(|error| format!("compressing {} bytes failed: {error}", raw.len()))
 }
 
@@ -128,6 +134,7 @@ pub(crate) fn compress_long(raw: &[u8]) -> Result<Vec<u8>, String> {
 fn zstd_length(stored: &[u8], raw: u64) -> Result<usize, String> {
     match zstd::zstd_safe::get_frame_content_size(stored) {
         Ok(Some(said)) if said == raw => {}
+        // alloc: the error's message
         Ok(Some(said)) => return Err(format!("its frame holds {said} bytes, not the {raw} recorded")),
         Ok(None) => return Err("its frame does not say how long it is".into()),
         Err(_) => return Err("it is not a zstd frame".into()),
@@ -135,8 +142,10 @@ fn zstd_length(stored: &[u8], raw: u64) -> Result<usize, String> {
     // Each block has a 3-byte header and decodes to at most 128 KiB (RFC 8878 3.1.1.2).
     let most = (stored.len() as u64 / 3).saturating_mul(128 << 10);
     if raw > most {
+        // alloc: the error's message
         return Err(format!("{} bytes of zstd cannot decode to the {raw} recorded", stored.len()));
     }
+    // alloc: the error's message
     usize::try_from(raw).map_err(|_| "its length does not fit in memory".to_owned())
 }
 
@@ -145,6 +154,7 @@ pub(crate) fn decompress(dictionary: &Prepared, stored: &[u8], raw: u64) -> Resu
     let raw = zstd_length(stored, raw)?;
     let bytes = zstd::bulk::Decompressor::with_prepared_dictionary(&dictionary.decoder)
         .and_then(|mut decompressor| decompressor.decompress(stored, raw))
+        // alloc: the error's message
         .map_err(|error| format!("it does not decompress: {error}"))?;
     whole(bytes, raw)
 }
@@ -157,12 +167,14 @@ pub(crate) fn decompress_long(stored: &[u8], raw: u64) -> Result<Vec<u8>, String
             decompressor.set_parameter(DParameter::WindowLogMax(WINDOW_LOG))?;
             decompressor.decompress(stored, raw)
         })
+        // alloc: the error's message
         .map_err(|error| format!("it does not decompress: {error}"))?;
     whole(bytes, raw)
 }
 
 fn whole(bytes: Vec<u8>, raw: usize) -> Result<Vec<u8>, String> {
     if bytes.len() != raw {
+        // alloc: the error's message
         return Err(format!("it decompresses to {} bytes, not the {raw} recorded", bytes.len()));
     }
     Ok(bytes)
@@ -187,10 +199,13 @@ pub(crate) fn unlz4(stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
     // A block's densest byte, a match length's 255, is what an LZ4 block can grow by per byte;
     // `raw` is unverified, and it is allocated before a byte is decoded.
     if raw > (stored.len() as u64).saturating_mul(255).saturating_add(16) {
+        // alloc: the error's message
         return Err(format!("{} bytes of LZ4 cannot decode to the {raw} recorded", stored.len()));
     }
+    // alloc: the error's message
     let raw = usize::try_from(raw).map_err(|_| "its length does not fit in memory".to_owned())?;
     let bytes = lz4_flex::block::decompress(stored, raw)
+        // alloc: the error's message
         .map_err(|error| format!("it does not decompress: {error}"))?;
     whole(bytes, raw)
 }

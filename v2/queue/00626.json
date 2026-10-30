@@ -1,0 +1,27 @@
+{
+  "id": "00626",
+  "from_lane": "db",
+  "owner": "coordinator",
+  "paths": [
+    "docs/v2/plan/lanes/db.md",
+    "docs/v2/plan/lanes/db/query-database.md",
+    "crates/blaze-query/src/lib.rs",
+    "tools/docs.py",
+    "docs/v2"
+  ],
+  "what": "## 7. Docs (coordinator)\n\n`docs/v2/plan/lanes/db.md` moved to `docs/v2/plan/lanes/db/query-database.md` (lane notes go in the lane's\nfolder); the one link to it (`crates/blaze-query/src/lib.rs`) is updated. Index it wherever\n`python3 tools/docs.py check` wants lane notes listed.\n\n> forwarded to coordinator: indexing lane notes is `docs/v2/`'s, not among the paths `requests` applies.",
+  "state": "open",
+  "created": "2026-10-30T06:24:25Z",
+  "updated": "2026-10-30T06:24:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db.md#7. Docs (coordinator)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db.md:87"
+    }
+  ]
+}

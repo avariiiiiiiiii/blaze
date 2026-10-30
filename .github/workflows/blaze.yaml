@@ -6,10 +6,11 @@
 # docs/harness.md ("CI").
 #
 #   pull request, merge queue (about 5 minutes): the unit tests and the build on Linux x86-64,
+#       `blaze check --workspace` with the release on Linux x86-64 and macOS,
 #       `harness/imports.py` and `harness/rustcsites.py`. No `cargo fmt --check`: fmt.yaml
 #       formats main after each push instead.
 #   push to main: the build and the unit tests on Linux x86-64, Linux AArch64 and macOS, which
-#       write the caches every other run reads. One runs at a time: the next push waits, and a
+#       write the caches every other run reads, and the same `blaze check --workspace`. One runs at a time: the next push waits, and a
 #       newer one replaces it, so each run ends and writes the caches as of its commit.
 #
 # A change runs the build and the unit tests only when it touches a file they read: the crates,
@@ -142,9 +143,34 @@ jobs:
       tier: warm
       pinned-ui: true
 
+  # The release .github/blaze-version names loads and checks blaze's whole workspace, as a
+  # contributor's `blaze check --workspace` does: 0.20261028.7 could not load it, and no job ran
+  # it. Installed and given the pinned LLVM (LLVM_SYS_231_PREFIX, which llvm-sys's build script
+  # reads) by .github/actions/blaze, with no Nix, as the build is. Its store's project is its
+  # own and nothing pushes it, so every run checks from cold; the pull needs no secret.
+  workspace-check:
+    name: blaze check --workspace, ${{ matrix.platform }}
+    needs: changes
+    if: needs.changes.outputs.tier != 'none'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ startsWith(matrix.os, 'macos') && 120 || 90 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux x64, os: ubuntu-24.04 }
+          - { platform: macos arm64, os: macos-15 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/blaze
+        with:
+          job: check
+          llvm: true
+      - run: blaze check --workspace --message-format short
+
   ci:
     name: ci
-    needs: [changes, scripts, linux-x64, linux-arm64, macos]
+    needs: [changes, scripts, linux-x64, linux-arm64, macos, workspace-check]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

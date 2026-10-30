@@ -432,7 +432,9 @@ impl Part {
             TextRange::at((u32::from(range.start()) - from + to).into(), range.len())
         };
         Part {
+            // clone: a parsed part kept across an edit, copied to move its marks, once per edit
             tree: Arc::new(FlatTree::clone(&self.tree).moved(source.clone(), from, to)),
+            // alloc: the part's errors, once per part per edit
             errors: self.errors.iter().map(|(range, it)| (moved(*range), it.clone())).collect(),
         }
     }
@@ -1659,12 +1661,12 @@ impl FlatTree {
             _ => None,
         };
         let gaps = move |g: usize| self.gap_of(placed, g);
-        let splices_and_gaps = 0..=placed.len();
+        let splices_and_gaps = move || 0..=placed.len();
         self.ancestors_of(placed, ancestors);
 
         // The copies' entries, moved: a far parent of a leaf with a splice between them, and
         // an ancestor's size, are pushed as the ancestors are walked.
-        for g in splices_and_gaps.clone() {
+        for g in splices_and_gaps() {
             let (from, to) = gaps(g);
             let near = in_range(&self.far, from, to).iter().filter(|it| it.1 >= from);
             far.extend(near.map(|&(it, parent)| (moved(placed, g, it), moved(placed, g, parent))));
@@ -1718,7 +1720,7 @@ impl FlatTree {
         spare.nodes.resize((len as usize).div_ceil(64), 0);
         let mut nodes = BitSliceMut::<usize>::from_words(&mut spare.nodes[..]);
         let ours = BitSlice::from_words(&self.nodes[..]);
-        for g in splices_and_gaps.clone() {
+        for g in splices_and_gaps() {
             let (from, to) = gaps(g);
             nodes.or_range_at(moved(placed, g, from) as usize, &ours, from as usize..to as usize);
             if let (Some(it), Some(with)) = (placed.get(g), subtree(g)) {
@@ -1732,7 +1734,7 @@ impl FlatTree {
             lazy.nodes.partition_point(|&it| it < from)..lazy.nodes.partition_point(|&it| it < to)
         };
         let kept_ours: usize = ours.map_or(0, |lazy| {
-            splices_and_gaps.clone().map(|g| lazies(lazy, gaps(g)).len()).sum()
+            splices_and_gaps().map(|g| lazies(lazy, gaps(g)).len()).sum()
         });
         let mut expander = ours.filter(|_| kept_ours > 0).map(|it| (it.expand, it.data));
         for (g, it) in placed.iter().enumerate() {
@@ -1750,11 +1752,11 @@ impl FlatTree {
         let lazy = expander.map(|(expand, data)| {
             // alloc: an outline's lazy nodes, once per edit
             let (mut nodes, mut parts) = (Vec::new(), Vec::new());
-            for g in splices_and_gaps.clone() {
+            for g in splices_and_gaps() {
                 if let Some(ours) = ours {
                     let range = lazies(ours, gaps(g));
                     let (from, to) = text_shift(placed, g);
-                    for (&it, part) in ours.nodes[range.clone()].iter().zip(&ours.parts[range]) {
+                    for (&it, part) in ours.nodes[range.start..range.end].iter().zip(&ours.parts[range]) {
                         nodes.push(moved(placed, g, it));
                         parts.push(moved_part(part, &source, from, to));
                     }
@@ -1775,7 +1777,7 @@ impl FlatTree {
 
         // The columns made as they are written: each copy between the splices, then the
         // splice's own, numbered in the new tree.
-        let words = splices_and_gaps.clone().flat_map(move |g| {
+        let words = splices_and_gaps().flat_map(move |g| {
             let (from, to) = gaps(g);
             let spliced = placed.get(g).map(|it| match subtree(g) {
                 Some(with) => &with.words[..],
@@ -1783,11 +1785,11 @@ impl FlatTree {
             });
             std::iter::once(&self.words[from as usize..to as usize]).chain(spliced)
         });
-        let parents = splices_and_gaps.clone().map(|g| {
+        let parents = splices_and_gaps().map(|g| {
             let (from, to) = gaps(g);
             self.nodes_before(to) - self.nodes_before(from) + subtree(g).map_or(0, |it| it.node_parents.len())
         });
-        let node_parents = splices_and_gaps.clone().flat_map(move |g| {
+        let node_parents = splices_and_gaps().flat_map(move |g| {
             let (from, to) = gaps(g);
             let ours = self.node_parents[self.nodes_before(from)..self.nodes_before(to)].iter();
             let ours = ours.map(move |&it| match it {
@@ -1809,11 +1811,11 @@ impl FlatTree {
             let spliced = placed.get(g).map(|it| (it, self.spliced_kinds(it, subtree(g))));
             (in_range(&self.kinds, from, to), spliced)
         };
-        let kinds_count = splices_and_gaps.clone().map(|g| {
+        let kinds_count = splices_and_gaps().map(|g| {
             let (ours, spliced) = kinds_of(g);
             ours.len() + spliced.map_or(0, |(_, (theirs, _))| theirs.len())
         });
-        let kinds = splices_and_gaps.clone().flat_map(move |g| {
+        let kinds = splices_and_gaps().flat_map(move |g| {
             let (ours, spliced) = kinds_of(g);
             let ours = ours.iter().map(move |&(it, kind)| (moved(placed, g, it), kind));
             let theirs = spliced.into_iter().flat_map(|(it, (theirs, base))| {
@@ -1931,6 +1933,7 @@ impl FlatTree {
         if let Some((error, _)) = errors.iter().find(|it| !range.contains_range(it.0)) {
             panic!("the part of the lazy {kind:?} at {range:?} has an error outside it, at {error:?}");
         }
+        // alloc: once per lazy node, when its part is first parsed; shared by its cursors
         Part { tree: Arc::new(part), errors: errors.into() }
     }
 }

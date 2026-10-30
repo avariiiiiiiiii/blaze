@@ -22,6 +22,7 @@ use hir_def::{
 use hir_expand::{FileRange, HirFileId};
 use hir_ty_mir::mir::location::line_and_column;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use span::ErasedFileAstId;
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
@@ -121,22 +122,20 @@ pub(super) fn written_items(
     lines: bool,
 ) -> Option<Vec<WrittenItem>> {
     let (written, mentioned) = super::home::bodies_of(db, instance)?;
-    let mut placed = Vec::new();
-    for request in &compiled.requests.datas {
-        match request {
-            DataRequest::Location(Some((owner, _))) => placed.push(*owner),
-            DataRequest::Declaration(func) => placed.push((*func).into()),
-            _ => {}
-        }
-    }
+    let placed = compiled.requests.datas.iter().filter_map(|request| match request {
+        DataRequest::Location(Some((owner, _))) => Some(*owner),
+        DataRequest::Declaration(func) => Some(DefWithBodyId::from(*func)),
+        _ => None,
+    });
     let item = |body: DefWithBodyId, places: bool| {
         let (file, id, hash, at) = (*body_print(db, body))?;
         let file = names.file_path(file.file_id(db))?;
         Some(WrittenItem { file, id, hash, at: places.then_some(at) })
     };
-    let placed = placed.into_iter().map(|it| item(it, true));
+    let placed = placed.map(|it| item(it, true));
     let written = written.into_iter().map(|it| item(it, lines));
     let mentioned = mentioned.into_iter().map(|it| item(it, false));
+    // alloc: the result, kept in the base per stored root
     let mut items: Vec<WrittenItem> =
         placed.chain(written).chain(mentioned).collect::<Option<_>>()?;
     items.sort_unstable();
@@ -252,10 +251,10 @@ impl Mark {
         debug: bool,
     ) -> Option<Mark> {
         if debug {
-            return instance_mark(db, instance.clone(), env.clone());
+            return instance_mark(db, *instance, *env);
         }
-        let compiled = compiled_instance(db, instance.clone(), env.clone()).as_ref().ok()?;
-        let serial = instance_serial(db, instance.clone(), env.clone());
+        let compiled = compiled_instance(db, *instance, *env).as_ref().ok()?;
+        let serial = instance_serial(db, *instance, *env);
         Some(Mark::of_function(db, serial, compiled, false))
     }
 
@@ -282,13 +281,13 @@ fn instance_mark(
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Option<Mark> {
-    let compiled = compiled_instance(db, instance.clone(), env.clone()).as_ref().ok()?;
+    let compiled = compiled_instance(db, instance, env).as_ref().ok()?;
     let serial = instance_serial(db, instance, env);
     Some(Mark::of_function(db, serial, compiled, true))
 }
 
 /// Something in the base that an edit can change or take away.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Node {
     Root(FunctionId),
     Instance(Instance),
@@ -407,12 +406,12 @@ impl TheirWalk {
                 known.theirs = true;
                 continue;
             }
-            if !seen.insert((instance.clone(), env.clone())) {
+            if !seen.insert((instance, env)) {
                 continue;
             }
-            let compiled = compiled_instance(db, instance.clone(), env.clone()).as_ref().ok();
+            let compiled = compiled_instance(db, instance, env).as_ref().ok();
             walk.instances.push(TheirInstance {
-                serial: compiled.map(|_| instance_serial(db, instance.clone(), env.clone())),
+                serial: compiled.map(|_| instance_serial(db, instance, env)),
                 files: body_files(db, &instance),
                 instance,
                 env,
@@ -461,13 +460,16 @@ impl Reached {
         compiled: &[(FunctionId, String)],
         skipped: &[(FunctionId, CodegenError)],
     ) -> Vec<Reached> {
+        // alloc: once per full build, looked up per instance the walk reaches
         let ours: FxHashSet<FunctionId> = compiled.iter().map(|it| it.0).collect();
         let crates: FxHashSet<Crate> = compiled
             .iter()
             .map(|it| it.0)
             .chain(skipped.iter().map(|it| it.0))
             .map(|it| it.krate(db))
+            // alloc: once per full build, as `ours`
             .collect();
+        // alloc: once per full build: the walk's stack, and the result, kept in the base
         let (mut stack, mut reached) = (Vec::new(), Vec::new());
         for &by in from_rustc {
             match compiled_root(db, by) {
@@ -486,7 +488,7 @@ impl Reached {
         while let Some((requests, by)) = stack.pop() {
             for request in &requests.funcs {
                 let FuncTarget::Instance(instance, env) = &request.target else { continue };
-                if !seen.insert((instance.clone(), env.clone())) {
+                if !seen.insert((*instance, *env)) {
                     continue;
                 }
                 let (node, krate, files, requests) = match instance.def {
@@ -499,11 +501,11 @@ impl Reached {
                         (Node::Root(func), func.krate(db), files, compiled.map(|it| &it.requests))
                     }
                     _ => {
-                        let compiled = compiled_instance(db, instance.clone(), env.clone());
+                        let compiled = compiled_instance(db, *instance, *env);
                         let krate = written_in(db, instance).map_or(env.krate, |it| it.krate(db));
                         let requests = compiled.as_ref().ok().map(|it| &it.requests);
                         (
-                            Node::Instance(instance.clone()),
+                            Node::Instance(*instance),
                             krate,
                             body_files(db, instance),
                             requests,
@@ -512,7 +514,7 @@ impl Reached {
                 };
                 stack.extend(requests.map(|it| (it, by)));
                 let walked = requests.is_some();
-                reached.push(Reached { node, env: env.clone(), by, krate, files, walked });
+                reached.push(Reached { node, env: *env, by, krate, files, walked });
             }
         }
         reached
@@ -522,8 +524,8 @@ impl Reached {
         let (serial, compiled) = match &self.node {
             Node::Root(func) => (root_serial(db, *func), compiled_root(db, *func)),
             Node::Instance(instance) => (
-                instance_serial(db, instance.clone(), self.env.clone()),
-                compiled_instance(db, instance.clone(), self.env.clone()),
+                instance_serial(db, *instance, self.env),
+                compiled_instance(db, *instance, self.env),
             ),
             Node::Static(_) => return None,
         };
@@ -573,8 +575,17 @@ impl Left {
         let code = compiled_root(db, root).as_ref().ok();
         Left {
             code: code.map(|it| Mark::new(db, root_serial(db, root), &it.requests)),
+            // clone: kept, once per root when the base or the daemon first notes it
             async_blocks: async_blocks(db, root).clone(),
         }
+    }
+
+    /// Whether [`Left::of`] `root` is `self` now.
+    fn still(&self, db: &Db, root: FunctionId) -> bool {
+        let code = compiled_root(db, root).as_ref().ok();
+        let code = code.map(|it| Mark::new(db, root_serial(db, root), &it.requests));
+        let async_blocks = async_blocks(db, root);
+        code == self.code && *async_blocks == self.async_blocks
     }
 }
 
@@ -657,7 +668,9 @@ impl Frozen {
     /// What a build asks of [`RustcValues`]: the values taken so far, shared with it, and the
     /// edits as they are now.
     pub(crate) fn rustc_values(&self) -> RustcValues {
+        // alloc: once per build, the edits as the build sees them
         let touched = self.edited_values.iter().chain(&self.distrusted).copied().collect();
+        // clone: once per build, the shared table the build takes values into
         RustcValues { known: self.statics.clone(), touched: Arc::new(touched) }
     }
 
@@ -670,9 +683,10 @@ impl Frozen {
     }
 
     pub(crate) fn edit(&mut self, crates: impl IntoIterator<Item = Crate>) {
-        let crates: Vec<Crate> = crates.into_iter().collect();
-        self.edited.extend(crates.iter().copied());
-        self.edited_values.extend(crates);
+        for krate in crates {
+            self.edited.insert(krate);
+            self.edited_values.insert(krate);
+        }
     }
 
     /// [`Frozen::edit`] of `crates`, where the first values of statics an edit can have
@@ -694,6 +708,7 @@ impl Frozen {
         let untouched =
             |it: &Crate| !self.edited_values.contains(it) && !self.distrusted.contains(it);
         let fresh: Vec<Crate> =
+            // alloc: once per build, the crates no build took the values of before
             crates.into_iter().filter(|it| untouched(it) && !self.taken.contains(it)).collect();
         if fresh.is_empty() {
             return;
@@ -730,10 +745,10 @@ impl Frozen {
         if self.edited_bodies.is_empty() {
             return false;
         }
-        let crates: FxHashSet<Crate> = krate.transitive_deps(db).iter().copied().collect();
+        let deps = krate.transitive_deps(db);
         self.edited_bodies
             .iter()
-            .any(|&file| base_db::relevant_crates(db, file).iter().any(|it| crates.contains(it)))
+            .any(|&file| base_db::relevant_crates(db, file).iter().any(|it| deps.contains(it)))
     }
 
     fn touched(&self, db: &Db, reached: &Reached) -> bool {
@@ -741,13 +756,11 @@ impl Frozen {
             // What it calls is of its crates or of what they depend on: rustc copies the
             // generic functions of those into it.
             _ if !reached.walked => {
-                let mut crates: FxHashSet<Crate> = FxHashSet::default();
-                for krate in [reached.krate, reached.env.krate] {
-                    crates.insert(krate);
-                    crates.extend(krate.transitive_deps(db));
-                }
+                let own = reached.krate.transitive_deps(db);
+                let env = reached.env.krate.transitive_deps(db);
                 let in_crates = |file: FileId| {
-                    base_db::relevant_crates(db, file).iter().any(|it| crates.contains(it))
+                    let relevant = base_db::relevant_crates(db, file);
+                    relevant.iter().any(|it| own.contains(it) || env.contains(it))
                 };
                 self.edited_bodies.iter().any(|&it| in_crates(it))
             }
@@ -769,12 +782,14 @@ impl Frozen {
         let Some(left) = &self.left else {
             let other = now().find(|it| distrusted(it.0)).map(|(func, why)| OutOfDate {
                 func: Some(func),
+                // alloc: the reason a full build is told, once it is out of date
                 why: why.to_string(),
                 left_from_the_start: true,
                 calls: None,
             });
             let left = now()
                 .map(|(root, _)| (root, (!self.touched_root(db, root)).then(|| Left::of(db, root))))
+                // alloc: once per daemon, what rustc compiled at the start
                 .collect();
             self.left = Some(left);
             return other.or_else(|| self.out_of_date(db, base));
@@ -784,7 +799,7 @@ impl Frozen {
                 _ if distrusted(root) => false,
                 // Nothing to tell a change by: any edit that it can see may be one.
                 Some(Some(Left { code: None, .. })) => !self.touched_root(db, root),
-                Some(Some(was)) => probe(|| Left::of(db, root)).as_ref() == Some(was),
+                Some(Some(was)) => probe(|| was.still(db, root)) == Some(true),
                 Some(None) => false,
                 // Not left at first, as one compiled then: rustc's copy is still of the source
                 // the daemon started with, when no edit since reaches it.
@@ -792,6 +807,7 @@ impl Frozen {
             };
             (!fresh).then(|| OutOfDate {
                 func: Some(root),
+                // alloc: the reason a full build is told, once it is out of date
                 why: why.to_string(),
                 left_from_the_start: left.contains_key(&root),
                 calls: None,
@@ -800,9 +816,10 @@ impl Frozen {
         if own.is_some() {
             return own;
         }
+        // alloc: called only for the reason a full build is told, once it is out of date
         let why = |by| base.skipped.iter().find(|it| it.0 == by).map(|it| it.1.to_string());
         for reached in &base.reached {
-            let key = (reached.node.clone(), reached.env.clone());
+            let key = (reached.node, reached.env);
             let touched = self.touched(db, reached);
             let fresh = match self.reached.get(&key) {
                 Some(Some(_)) if !touched => true,
@@ -844,6 +861,7 @@ impl Frozen {
             };
             (!untouched).then(|| OutOfDate {
                 func: written_in(db, it),
+                // alloc: the reason a full build is told, once it is out of date
                 why: "an instance of it does not compile".to_owned(),
                 left_from_the_start: false,
                 calls: None,
@@ -1089,12 +1107,12 @@ impl Touched {
         *self = Touched::default();
         for stale in found {
             self.roots.extend(&stale.roots);
-            self.instances.extend(stale.instances.iter().cloned());
+            self.instances.extend(&stale.instances);
             self.statics.extend(&stale.statics);
             self.hydrated.extend(stale.hydrated.iter().map(|(at, ..)| *at));
             for (node, _) in &stale.broken {
                 match node {
-                    Node::Instance(instance) => _ = self.instances.insert(instance.clone()),
+                    Node::Instance(instance) => _ = self.instances.insert(*instance),
                     Node::Static(id) => _ = self.statics.insert(*id),
                     Node::Root(_) => {}
                 }
@@ -1185,10 +1203,12 @@ pub(super) struct Patch {
 /// An object that defines nothing.
 pub(super) fn empty_object() -> Result<Vec<u8>> {
     let builder =
+        // clone: once per object, the builder owns its target
         ObjectBuilder::new(target()?.clone(), "blaze", cranelift_module::default_libcall_names())?;
     let object = ObjectModule::new(builder)
         .finish()
         .emit()
+        // alloc: the error's message
         .map_err(|e| CodegenError::Backend(e.to_string()))?;
     if super::Target::current().writes_wasm_objects() {
         return super::wasm_object::from_elf(&object, &Default::default(), &[])
@@ -1223,6 +1243,7 @@ impl FromStore {
         use super::cached::{CachedData, CachedTarget, Entry};
         let mut from = FromStore::default();
         let of_checkout: Vec<_> =
+            // alloc: once per full build, the entries of the checkout it had from the store
             cg.found.iter().filter(|(name, _)| StableNames::of_checkout(name)).collect();
         if of_checkout.is_empty() && stored_marks.is_empty() {
             return from;
@@ -1236,14 +1257,17 @@ impl FromStore {
             .into_iter()
             .filter(|krate| owned.contains(krate) || krate.data(db).origin.is_local())
             .filter_map(|krate| Some((krate, cg.names.content_id(krate)?)))
+            // alloc: once per full build, kept in the base
             .collect();
         let crate_of: FxHashMap<ContentId, Crate> =
+            // alloc: once per full build, looked up per entry
             from.ids.iter().map(|(&krate, &id)| (id, krate)).collect();
         let decls = cg.module.declarations();
         let mut index: FxHashMap<&str, u32> = FxHashMap::default();
         let mut kept = Vec::with_capacity(of_checkout.len());
         for (name, id) in of_checkout {
             let entry = entries.get(name);
+            // clone: once per full build per entry; the base keeps its files and items
             let tracked = entry.as_ref().and_then(|it| it.tracked.clone());
             // One compiled as a crate from outside the checkout is of it by its generic
             // arguments, and one compiled as a crate of another checkout, whose id is of that
@@ -1273,21 +1297,26 @@ impl FromStore {
             }
             index.insert(name, at);
             from.hydrated.push(Hydrated {
+                // clone: once per full build per entry, kept in the base
                 name: name.clone(),
                 symbol: decls.get_function_decl(*id).linkage_name(*id).into_owned(),
                 mark: tracked.mark,
                 krate: krate.copied(),
+                // alloc: once per full build per entry, kept in the base
                 files: tracked.files.map(|it| it.into_iter().map(Box::from).collect()),
                 items: tracked.items.map(Box::from),
+                // alloc: empty, allocates nothing until a caller is found
                 callers: Vec::new(),
-                known: cg.found_instances.get(id).cloned(),
+                known: cg.found_instances.get(id).copied(),
             });
             kept.push(entry);
         }
+        // alloc: once per full build, looked up per entry
         let instance_of: FxHashMap<_, _> = cg.instances.iter().map(|(it, &id)| (id, it)).collect();
         // What an entry calls among those, and what else of the base it refers to.
-        let refers = |entry: &Entry| {
-            let (mut hydrated, mut nodes) = (Vec::new(), Vec::new());
+        let refers = |entry: &Entry, hydrated: &mut Vec<u32>, nodes: &mut Vec<Node>| {
+            hydrated.clear();
+            nodes.clear();
             for func in &entry.funcs {
                 let CachedTarget::Named(name) = &func.target else { continue };
                 if let Some(&at) = index.get(name.as_str()) {
@@ -1295,7 +1324,7 @@ impl FromStore {
                 } else if let Some(instance) =
                     cg.named.get(name.as_str()).and_then(|id| instance_of.get(id))
                 {
-                    nodes.push(Node::Instance((*instance).clone()));
+                    nodes.push(Node::Instance(**instance));
                 }
             }
             for data in &entry.datas {
@@ -1305,24 +1334,25 @@ impl FromStore {
                     nodes.push(Node::Static(id));
                 }
             }
-            (hydrated, nodes)
         };
+        // alloc: once per full build, reused by every entry
+        let (mut callees, mut nodes) = (Vec::new(), Vec::new());
         for (at, entry) in kept.iter().enumerate() {
-            let (callees, nodes) = refers(entry);
-            for callee in callees {
+            refers(entry, &mut callees, &mut nodes);
+            for &callee in &callees {
                 from.hydrated[callee as usize].callers.push(Caller::Hydrated(at as u32));
             }
-            from.reached.extend(nodes);
+            from.reached.extend(nodes.drain(..));
         }
         for &i in stored_marks.keys() {
             let root = compiled[i as usize].0;
-            let name = cg.stored_roots.get(&root).cloned().flatten();
-            let Some(entry) = name.and_then(|it| entries.get(&it)) else { continue };
-            let (callees, nodes) = refers(&entry);
-            for callee in callees {
+            let name = cg.stored_roots.get(&root).and_then(Option::as_deref);
+            let Some(entry) = name.and_then(|it| entries.get(it)) else { continue };
+            refers(&entry, &mut callees, &mut nodes);
+            for &callee in &callees {
                 from.hydrated[callee as usize].callers.push(Caller::Root(i));
             }
-            from.root_edges.extend(nodes.into_iter().map(|it| (it, Node::Root(root))));
+            from.root_edges.extend(nodes.drain(..).map(|it| (it, Node::Root(root))));
         }
         from
     }
@@ -1350,13 +1380,21 @@ impl Base {
             let name = cg.stored_roots.get(&root)?.as_ref()?;
             cg.entries.as_ref()?.get(name).filter(|_| cg.mixed.is_none())
         };
-        let stored_tracked: FxHashMap<u32, super::cached::Tracked> = (0..compiled.len())
-            .filter_map(|i| Some((i as u32, stored_entry(compiled[i].0)?.tracked.clone()?)))
+        let stored_tracked: FxHashMap<u32, (u128, Option<Vec<WrittenItem>>)> = (0..compiled.len())
+            .filter_map(|i| {
+                let entry = stored_entry(compiled[i].0)?;
+                let tracked = entry.tracked.as_ref()?;
+                // clone: once per full build per stored root, the base keeps its items
+                Some((i as u32, (tracked.mark, tracked.items.clone())))
+            })
+            // alloc: once per full build, as the base keeps it
             .collect();
         let stored_marks: FxHashMap<u32, u128> =
-            stored_tracked.iter().map(|(&i, it)| (i, it.mark)).collect();
+            // alloc: once per full build, kept in the base
+            stored_tracked.iter().map(|(&i, it)| (i, it.0)).collect();
         let stored_items: FxHashMap<u32, Box<[WrittenItem]>> = (stored_tracked.into_iter())
-            .filter_map(|(i, it)| Some((i, Box::from(it.items?))))
+            .filter_map(|(i, it)| Some((i, Box::from(it.1?))))
+            // alloc: once per full build, kept in the base
             .collect();
         let stored = |i: usize| stored_marks.contains_key(&(i as u32));
         let root_mark = |db: &Db, root| Mark::of_root(db, root, debug);
@@ -1367,7 +1405,9 @@ impl Base {
         // The marks are a hash of each function's code and of its lines, which every thread
         // works out: the object waits for this.
         let (envs, roots) = (cg.envs.as_slice(), compiled.len());
+        // alloc: once per full build, a slot per root and instance for the threads to fill
         let root_marks: Vec<_> = (0..roots).map(|_| std::sync::OnceLock::new()).collect();
+        // alloc: once per full build, as `root_marks`
         let instance_marks: Vec<_> = envs.iter().map(|_| std::sync::OnceLock::new()).collect();
         cg.symbols.in_parallel(roots + envs.len(), &|db, _, at| match at.checked_sub(roots) {
             Some(at) => _ = instance_marks[at].set(instance_mark(db, &envs[at])),
@@ -1383,6 +1423,7 @@ impl Base {
                 true => Some(nothing),
                 false => mark.into_inner().unwrap_or_else(|| root_mark(db, root)),
             })
+            // alloc: once per full build, kept in the base
             .collect::<Option<Vec<_>>>()?;
         let mut instances = envs
             .iter()
@@ -1392,16 +1433,18 @@ impl Base {
                 let id = *cg.instances.get(instance)?;
                 let (mark, files) = mark.into_inner().unwrap_or_else(|| instance_mark(db, of));
                 let known = BaseInstance {
-                    env: env.clone(),
+                    env: *env,
                     symbol: decls.get_function_decl(id).linkage_name(id).into_owned(),
                     mark,
                     forwarded: cg.forwarded.contains(instance),
                     files,
+                    // alloc: empty, allocates nothing until a parent is noted
                     parents: Vec::new(),
                     theirs: false,
                 };
-                (known.mark.is_some() || known.forwarded).then(|| (instance.clone(), known))
+                (known.mark.is_some() || known.forwarded).then(|| (*instance, known))
             })
+            // alloc: once per full build, kept in the base
             .collect::<Option<FxIndexMap<_, _>>>()?;
         // One that does not compile is never what it was: a change to the file declines.
         let nothing = Mark { serial: 0, locations: 0, lines: 0 };
@@ -1413,6 +1456,7 @@ impl Base {
                     .map_or(nothing, |it| Mark::new(db, static_serial(db, id), &it.requests)),
                 krate: id.krate(db),
                 file: body_file(db, id.into()),
+                // alloc: empty, allocates nothing until a parent is noted
                 parents: Vec::new(),
                 theirs: false,
                 shared,
@@ -1426,22 +1470,24 @@ impl Base {
                 let compiled = compiled_static(db, id).as_ref().ok()?;
                 Some((id, base_static(id, data, Some(compiled), false)))
             })
+            // alloc: once per full build, kept in the base
             .collect::<Option<FxHashMap<_, _>>>()?;
         // rustc's copies with state, so that an edit to a first value is seen.
         for (&id, &data) in &cg.shared_statics {
             let compiled = compiled_static(db, id).as_ref().ok();
             statics.insert(id, base_static(id, data, compiled, true));
         }
+        // alloc: once per full build, what refers to what in it
         let mut edges = Vec::new();
         let mut note = |parent: Node, requests: &Requests| {
             for request in &requests.funcs {
                 if let FuncTarget::Instance(instance, _) = &request.target {
-                    edges.push((Node::Instance(instance.clone()), parent.clone()));
+                    edges.push((Node::Instance(*instance), parent));
                 }
             }
             for request in &requests.datas {
                 if let DataRequest::Static(id) = request {
-                    edges.push((Node::Static(*id), parent.clone()));
+                    edges.push((Node::Static(*id), parent));
                 }
             }
         };
@@ -1462,23 +1508,25 @@ impl Base {
             }
         }
         for (instance, known) in &instances {
-            if let Ok(compiled) = compiled_instance(db, instance.clone(), known.env.clone()) {
-                note(Node::Instance(instance.clone()), &compiled.requests);
+            if let Ok(compiled) = compiled_instance(db, *instance, known.env) {
+                note(Node::Instance(*instance), &compiled.requests);
             }
         }
         for &id in statics.keys() {
             note(Node::Static(id), &compiled_static(db, id).as_ref().ok()?.requests);
         }
-        edges.extend(from_store.root_edges.iter().cloned());
+        edges.extend(from_store.root_edges.iter().copied());
         let known_at: FxHashMap<&Instance, u32> = (from_store.hydrated.iter().enumerate())
             .filter_map(|(at, it)| Some((&it.known.as_ref()?.0, at as u32)))
+            // alloc: once per full build, looked up per edge
             .collect();
+        // alloc: once per full build, the edges into code from the store
         let mut called = Vec::new();
         for (child, parent) in &edges {
             if let Node::Instance(instance) = child
                 && let Some(&at) = known_at.get(instance)
             {
-                called.push((at, parent.clone()));
+                called.push((at, *parent));
             }
         }
         for (at, parent) in called {
@@ -1495,7 +1543,9 @@ impl Base {
             }
         }
         let left =
+            // alloc: once per full build, kept in the base
             skipped.iter().map(|(root, e)| (!e.no_symbol()).then(|| Left::of(db, *root))).collect();
+        // alloc: once per full build, kept in the base
         let from_rustc: Vec<FunctionId> = left_to_rustc(db, cg.symbols, skipped).collect();
         let (their_statics, walked) = TheirStatics::walk(db, from_rustc.iter().copied());
         let their_walk = TheirWalk::new(db, &their_statics, walked, &mut instances, &mut statics);
@@ -1503,33 +1553,39 @@ impl Base {
         let rejected = cg
             .rejected
             .iter()
-            .filter(|(instance, it)| {
-                compiled_instance(db, (*instance).clone(), it.env.clone()).is_err()
-            })
-            .map(|(instance, it)| (instance.clone(), it.env.clone()))
+            .filter(|(instance, it)| compiled_instance(db, **instance, it.env).is_err())
+            .map(|(instance, it)| (*instance, it.env))
+            // alloc: once per full build, kept in the base
             .collect();
+        // alloc: once per full build, kept in the base
         let crates: Vec<Crate> = compiled.iter().map(|&(root, _)| root.krate(db)).collect();
         let files: Vec<FileId> =
+            // alloc: once per full build, kept in the base
             compiled.iter().map(|&(root, _)| body_file(db, root.into())).collect();
         let cached = |func| super::fncache::cached_closure(db, func).is_some();
         let cached_roots =
+            // alloc: once per full build, kept in the base
             (0..compiled.len() as u32).filter(|&i| cached(compiled[i as usize].0)).collect();
         let cached_instances = (0..instances.len() as u32)
             .filter(|&i| {
                 let (instance, _) = instances.get_index(i as usize).unwrap();
                 matches!(instance.def, InstanceDef::Fn(func) if cached(func))
             })
+            // alloc: once per full build, kept in the base
             .collect();
         Some(Base {
             debug,
             rejected,
+            // alloc: once per full build, kept in the base
             entries: entries.to_vec(),
+            // alloc: once per full build, kept in the base
             compiled: compiled.to_vec(),
             marks,
             homes: Homes::new(compiled, &crates, &files, &instances),
             crates,
             files,
             touched: Touched::default(),
+            // alloc: once per full build, kept in the base
             skipped: skipped.to_vec(),
             left,
             from_rustc,
@@ -1542,15 +1598,16 @@ impl Base {
                 .found
                 .iter()
                 .map(|(name, id)| {
+                    // clone: once per full build per entry, kept in the base
                     (name.clone(), decls.get_function_decl(*id).linkage_name(*id).into_owned())
                 })
+                // alloc: once per full build, kept in the base
                 .collect(),
             found_instances: cg
                 .found_instances
                 .iter()
-                .map(|(&id, it)| {
-                    (decls.get_function_decl(id).linkage_name(id).into_owned(), it.clone())
-                })
+                .map(|(&id, &it)| (decls.get_function_decl(id).linkage_name(id).into_owned(), it))
+                // alloc: once per full build, kept in the base
                 .collect(),
             untracked: from_store.untracked,
             hydrated: from_store.hydrated,
@@ -1558,6 +1615,7 @@ impl Base {
             stored_marks,
             stored_items,
             ids: from_store.ids,
+            // clone: once per full build, kept in the base
             owned: cg.own_statics.crates.clone(),
             reached_from_store: from_store.reached,
             outdated: false,
@@ -1567,7 +1625,9 @@ impl Base {
             cached_instances,
             rustc: false,
             homed: FxHashSet::default(),
+            // alloc: empty, allocates nothing
             unnamed: Vec::new(),
+            // alloc: empty, allocates nothing
             closures: Vec::new(),
             copies_homed: FxHashMap::default(),
         })
@@ -1614,6 +1674,7 @@ impl Base {
                     self.files.push(body_file(db, root.into()));
                 }
                 Err(e) => {
+                    // clone: the error, kept in the base
                     self.skipped.push((root, e.clone()));
                     self.left.push(Some(Left::of(db, root)));
                 }
@@ -1635,6 +1696,7 @@ impl Base {
                 mark,
                 krate: id.krate(db),
                 file: body_file(db, id.into()),
+                // alloc: empty, allocates nothing until a parent is noted
                 parents: Vec::new(),
                 theirs: false,
                 // rustc's copy, which rustc's code writes when the static has state.
@@ -1689,6 +1751,7 @@ impl Base {
             .iter()
             .copied()
             .filter(|&it| copied_by_rustc(db, it) && of_modules(it))
+            // alloc: once per file the base takes in
             .collect();
         let mut homed: FxHashMap<String, bool> = FxHashMap::default();
         if generic.is_empty() {
@@ -1712,6 +1775,7 @@ impl Base {
             .iter()
             .copied()
             .chain(callers.iter().copied().filter(|&it| copied_by_rustc(db, it)))
+            // alloc: once per file the base takes in
             .collect();
         let note = |requests: &Requests, queue: &mut Vec<(Instance, StoredParamEnvAndCrate)>| {
             for request in &requests.funcs {
@@ -1719,10 +1783,11 @@ impl Base {
                     && let InstanceDef::Fn(func) = instance.def
                     && through.contains(&func)
                 {
-                    queue.push((instance.clone(), env.clone()));
+                    queue.push((*instance, *env));
                 }
             }
         };
+        // alloc: once per file the base takes in, the walk's queue
         let mut queue = Vec::new();
         let roots = functions.iter().chain(callers).copied().filter(|&it| !copied_by_rustc(db, it));
         for root in roots {
@@ -1731,7 +1796,7 @@ impl Base {
             let env = closure_env(db, root);
             for (_, closure) in super::closures_of(db, root).into_iter().flatten() {
                 let Some((instance, _)) = closure else { continue };
-                let compiled = compiled_instance(db, instance, env.clone());
+                let compiled = compiled_instance(db, instance, env);
                 if let Ok(compiled) = compiled.as_ref() {
                     note(&compiled.requests, &mut queue);
                 }
@@ -1742,12 +1807,13 @@ impl Base {
             if found.contains_key(&instance) {
                 continue;
             }
-            if let Ok(compiled) = compiled_instance(db, instance.clone(), env.clone()).as_ref() {
+            if let Ok(compiled) = compiled_instance(db, instance, env).as_ref() {
                 note(&compiled.requests, &mut queue);
             }
             found.insert(instance, env);
         }
         let spelling = super::Spelling { db, symbols };
+        // alloc: once per file the base takes in
         let mut homed_ones = Vec::new();
         for (instance, env) in found {
             let InstanceDef::Fn(func) = instance.def else { continue };
@@ -1784,6 +1850,7 @@ impl Base {
                 mark,
                 forwarded: false,
                 files,
+                // alloc: empty, allocates nothing until a parent is noted
                 parents: Vec::new(),
                 theirs: false,
             };
@@ -1791,6 +1858,7 @@ impl Base {
         }
         unknown.extend(copies.into_values().map(|it| it.0));
         for func in generic {
+            // alloc: once per generic function of a file the base takes in, kept as its key
             let name = FunctionSignature::of(db, func).name.as_str().to_owned();
             *homed.entry(name).or_insert(true) &= !unknown.contains(&func);
         }
@@ -1812,6 +1880,7 @@ impl Base {
         }
         let file = body_file(db, root.into());
         let env = closure_env(db, root);
+        // alloc: once per function of a file the base takes in, kept in the base
         let mut unnamed = Vec::new();
         for (expr, closure) in &found {
             let Some((instance, _)) = closure else { continue };
@@ -1819,20 +1888,23 @@ impl Base {
             match symbols.closure(root, *expr).filter(|_| mark.is_some()) {
                 Some(symbol) => {
                     let known = BaseInstance {
-                        env: env.clone(),
+                        env,
                         // alloc: the patch's base keeps it
                         symbol: symbol.as_str().to_owned(),
                         mark,
                         forwarded: false,
+                        // alloc: the patch's base keeps it
                         files: Some(Box::new([file])),
+                        // alloc: empty, allocates nothing until a parent is noted
                         parents: Vec::new(),
                         theirs: false,
                     };
-                    self.instances.entry(instance.clone()).or_insert(known);
+                    self.instances.entry(*instance).or_insert(known);
                 }
-                None => unnamed.push((instance.clone(), mark)),
+                None => unnamed.push((*instance, mark)),
             }
         }
+        // alloc: once per function of a file the base takes in, kept in the base
         let closures: Vec<_> = found.into_iter().map(|it| it.1).collect();
         let written = match closures.iter().any(Option::is_none) {
             true => super::written_print(db, root),
@@ -1955,6 +2027,7 @@ impl Base {
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.roots_of_crate.get(it));
         let of_files = touched.bodies.iter().filter_map(|it| homes.roots_of_file.get(it));
+        // alloc: once per part of a look, the work list `part_of` sorts
         let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
         asked.extend(touched.roots.iter().filter_map(|it| homes.root.get(it)));
         if touched.edited() {
@@ -1977,6 +2050,7 @@ impl Base {
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.instances_of_crate.get(it));
         let of_files = touched.bodies.iter().filter_map(|it| homes.instances_of_file.get(it));
+        // alloc: once per part of a look, the work list `part_of` sorts
         let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
         if !touched.bodies.is_empty() {
             asked.extend(&homes.instances_of_any_file);
@@ -2010,6 +2084,7 @@ impl Base {
         let homes = &self.hydrated_homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.of_crate.get(it));
         let of_files = edited.into_iter().flatten().filter_map(|it| homes.of_file.get(&**it));
+        // alloc: once per part of a look, the work list `part_of` sorts
         let mut asked: Vec<u32> = of_crates.chain(of_files).flatten().copied().collect();
         if !touched.bodies.is_empty() {
             asked.extend(&homes.of_any_file);
@@ -2038,6 +2113,7 @@ impl Base {
                 let edition = base_db::relevant_crates(db, file).first()?.data(db).edition;
                 Some((names.file_path(file)?, EditionedFileId::new(db, file, edition)))
             })
+            // alloc: once per part of a look, the files edited by name
             .collect()
     }
 
@@ -2056,11 +2132,15 @@ impl Base {
             return Ok(());
         }
         let edited: Option<Vec<String>> =
+            // alloc: once per part of a look, the names of the files edited
             self.touched.bodies.iter().map(|&file| names.file_path(file)).collect();
+        // alloc: once per part of a look, as `edited`
         let edited_paths: FxHashSet<&str> = edited.iter().flatten().map(String::as_str).collect();
         let bodies_edited = self.bodies_edited(db, names);
         let mut homes = super::home::Homes::default();
         let mut found = FoundHydrated::default();
+        // alloc: once per part of a look, reused by every function it asks about
+        let (mut asking, mut scratch) = (Vec::new(), Vec::new());
         for i in self.hydrated_to_ask(check_all, edited.as_deref(), part, parts) {
             let was = &self.hydrated[i];
             let unchanged = !self.touched.hydrated.contains(&(i as u32))
@@ -2085,9 +2165,9 @@ impl Base {
                 continue;
             }
             let asked = stdx::time::Instant::now();
-            let instance =
-                self.found_instance(db, names, &mut homes, &mut found, i, &mut Vec::new());
-            let same = instance.clone().and_then(|(instance, env)| {
+            asking.clear();
+            let instance = self.found_instance(db, names, &mut homes, &mut found, i, &mut asking);
+            let same = instance.and_then(|(instance, env)| {
                 probe(|| {
                     let compiled = compiled_instance(db, instance, env).as_ref().ok()?;
                     Some(stable_mark(db, names, compiled, self.debug) == Some(was.mark))
@@ -2099,8 +2179,11 @@ impl Base {
                 (Some(Some(true)), _) => {}
                 _ if !touched => eprintln!("check-all: MISSED `{}` from the store", was.name),
                 (None, _)
-                    if unchanged
-                        && self.dropped(db, names, &mut homes, &mut found, i, &mut Vec::new()) => {}
+                    if unchanged && {
+                        asking.clear();
+                        let (homes, found) = (&mut homes, &mut found);
+                        self.dropped(db, names, homes, found, i, &mut asking, &mut scratch)
+                    } => {}
                 _ if unchanged => {
                     eprintln!(
                         "check-all: MISSED `{}` from the store, its items unchanged",
@@ -2115,7 +2198,11 @@ impl Base {
                 }
                 // Its callers changed, and what they call now is compiled as new code.
                 (None, _)
-                    if self.dropped(db, names, &mut homes, &mut found, i, &mut Vec::new()) => {}
+                    if {
+                        asking.clear();
+                        let (homes, found) = (&mut homes, &mut found);
+                        self.dropped(db, names, homes, found, i, &mut asking, &mut scratch)
+                    } => {}
                 (None, _) => {
                     eprintln!("patch: nothing calls `{}` from the store as it did", was.name);
                     return Err("code of the checkout from the store is not called as it was");
@@ -2137,12 +2224,12 @@ impl Base {
         asking: &mut Vec<usize>,
     ) -> Option<(Instance, StoredParamEnvAndCrate)> {
         let was = &self.hydrated[i];
-        if let Some(found) = found.instances.get(&i) {
-            return found.clone();
+        if let Some(&found) = found.instances.get(&i) {
+            return found;
         }
         // What only the build's own code calls, by nothing a caller says: a vtable's slot.
         if was.callers.is_empty() {
-            return was.known.clone();
+            return was.known;
         }
         if asking.contains(&i) {
             return None;
@@ -2156,7 +2243,7 @@ impl Base {
             instance = compiled.requests.funcs.iter().find_map(|request| {
                 let FuncTarget::Instance(callee, env) = &request.target else { return None };
                 let named = names.instance(callee)?;
-                (*named == *was.name).then(|| (callee.clone(), homes.home(db, callee, env)))
+                (*named == *was.name).then(|| (*callee, homes.home(db, callee, env)))
             });
             if instance.is_some() {
                 break;
@@ -2165,7 +2252,7 @@ impl Base {
         asking.pop();
         // One not found while a caller is being looked for can be found once that is.
         if instance.is_some() || asking.is_empty() {
-            found.instances.insert(i, instance.clone());
+            found.instances.insert(i, instance);
         }
         instance
     }
@@ -2187,8 +2274,8 @@ impl Base {
             }
             Caller::Base(Node::Root(root)) => probe(|| compiled_root(db, *root).as_ref().ok()),
             Caller::Base(Node::Instance(instance)) => {
-                let env = self.instances.get(instance)?.env.clone();
-                probe(|| compiled_instance(db, instance.clone(), env).as_ref().ok())
+                let env = self.instances.get(instance)?.env;
+                probe(|| compiled_instance(db, *instance, env).as_ref().ok())
             }
             Caller::Base(Node::Static(_)) => None,
             Caller::Hydrated(at) => {
@@ -2215,6 +2302,8 @@ impl Base {
         found: &mut FoundHydrated,
         i: usize,
         asking: &mut Vec<usize>,
+        // For each look at a caller's instance, which starts from nothing being asked about.
+        scratch: &mut Vec<usize>,
     ) -> bool {
         let was = &self.hydrated[i];
         if was.callers.is_empty() {
@@ -2231,8 +2320,9 @@ impl Base {
         let dropped = was.callers.iter().all(|caller| match *caller {
             Caller::Hydrated(at) => {
                 let at = at as usize;
-                self.found_instance(db, names, homes, found, at, &mut Vec::new()).is_some()
-                    || self.dropped(db, names, homes, found, at, asking)
+                scratch.clear();
+                self.found_instance(db, names, homes, found, at, scratch).is_some()
+                    || self.dropped(db, names, homes, found, at, asking, scratch)
             }
             Caller::Root(_) | Caller::Base(_) => true,
         });
@@ -2259,6 +2349,7 @@ impl Base {
         let mut stale = Stale::default();
         let every = |len: usize| (part..len).step_by(parts);
         let names = symbols.filter(|_| !self.ids.is_empty()).map(|symbols| {
+            // clone: once per part of a look, `StableNames` (stable.rs) owns its crates and ids
             StableNames::new(db, symbols, self.owned.clone(), true).frozen(self.ids.clone())
         });
         if names.is_none() && (!self.stored_marks.is_empty() || !self.hydrated.is_empty()) {
@@ -2269,7 +2360,7 @@ impl Base {
         let check_all = std::env::var_os("BLAZE_CHECK_ALL").is_some();
         for i in every(self.rejected.len()) {
             let (instance, env) = &self.rejected[i];
-            let compiles = probe(|| compiled_instance(db, instance.clone(), env.clone()).is_ok());
+            let compiles = probe(|| compiled_instance(db, *instance, *env).is_ok());
             if compiles != Some(false) {
                 return stale.declined("an instance that did not compile is another now");
             }
@@ -2337,7 +2428,8 @@ impl Base {
                 continue;
             }
             let now = probe(|| {
-                super::closures_of(db, homed.root).map(|it| it.into_iter().map(|it| it.1).collect())
+                let now = super::closures_of(db, homed.root)?;
+                Some(now.iter().map(|it| &it.1).eq(&homed.closures))
             });
             let Some(now) = now else {
                 stale.gone.push(homed.root);
@@ -2350,7 +2442,7 @@ impl Base {
                 homed.written.is_none()
                     || probe(|| super::written_print(db, homed.root)).flatten() != homed.written
             };
-            if now.as_ref() != Some(&homed.closures) || (asynchronous && rewritten()) {
+            if now != Some(true) || (asynchronous && rewritten()) {
                 return stale.declined("a closure in what rustc linked is another now");
             }
             let env = closure_env(db, homed.root);
@@ -2386,10 +2478,10 @@ impl Base {
                     eprintln!("check-all: MISSED instance {instance:?} of {:?}", was.env.krate);
                     continue;
                 }
-                Some(Some(_)) if !was.forwarded => stale.instances.push(instance.clone()),
+                Some(Some(_)) if !was.forwarded => stale.instances.push(*instance),
                 // One that had no code of its own might have now.
                 _ => stale.broken.push((
-                    Node::Instance(instance.clone()),
+                    Node::Instance(*instance),
                     "an instance of the base gained or lost code of its own",
                 )),
             }
@@ -2449,12 +2541,12 @@ impl Base {
             if !touched && !check_all {
                 continue;
             }
-            let Some(now) = probe(|| Left::of(db, root)) else {
+            let Some(still) = probe(|| was.still(db, root)) else {
                 stale.gone.push(root);
                 continue;
             };
             // Without code to tell a change by, any edit that reaches it may be one.
-            if was.code.is_none() && touched || now != *was {
+            if was.code.is_none() && touched || !still {
                 if !touched {
                     eprintln!("check-all: MISSED function left to rustc {root:?}");
                     continue;
@@ -2470,11 +2562,8 @@ impl Base {
                 continue;
             }
             let serial = probe(|| {
-                let compiled = compiled_instance(db, was.instance.clone(), was.env.clone());
-                compiled
-                    .as_ref()
-                    .ok()
-                    .map(|_| instance_serial(db, was.instance.clone(), was.env.clone()))
+                let compiled = compiled_instance(db, was.instance, was.env);
+                compiled.as_ref().ok().map(|_| instance_serial(db, was.instance, was.env))
             });
             stale.their_walk_changed |= serial != Some(was.serial);
         }
@@ -2496,7 +2585,8 @@ impl Base {
     /// Whether a root still refers to the node, directly or through others.
     fn reaches(&self, db: &Db, node: &Node, unchanged: &Unchanged) -> bool {
         let mut seen = FxHashSet::default();
-        let mut stack = vec![node];
+        let mut stack: SmallVec<[&Node; 16]> = SmallVec::new();
+        stack.push(node);
         while let Some(node) = stack.pop() {
             if self.reached_from_store.contains(node) {
                 return true;
@@ -2525,6 +2615,7 @@ impl Base {
         db: &Db,
         changed: &[StaticId],
     ) -> std::result::Result<(FxHashSet<StaticId>, Vec<Node>), &'static str> {
+        // alloc: the result, empty until a static outgrew its copy
         let (mut moved, mut referrers) = (FxHashSet::default(), Vec::new());
         for &id in changed {
             let Some(was) = self.statics.get(&id) else { continue };
@@ -2562,7 +2653,7 @@ impl Base {
                         }
                     }
                 }
-                referrers.push(parent.clone());
+                referrers.push(*parent);
             }
             moved.insert(id);
         }
@@ -2576,7 +2667,8 @@ impl Base {
         let mut behind: FxHashMap<Node, Vec<Node>> = FxHashMap::default();
         for node in dropped {
             let mut seen = FxHashSet::default();
-            let mut stack = vec![node];
+            let mut stack: SmallVec<[&Node; 16]> = SmallVec::new();
+            stack.push(node);
             while let Some(below) = stack.pop() {
                 let parents = match below {
                     Node::Root(_) => None,
@@ -2590,7 +2682,7 @@ impl Base {
                     {
                         continue;
                     }
-                    behind.entry(parent.clone()).or_default().push(node.clone());
+                    behind.entry(*parent).or_default().push(*node);
                     stack.push(parent);
                 }
             }
@@ -2619,7 +2711,7 @@ impl Base {
         let requests = match parent {
             Node::Root(root) => compiled_root(db, *root).as_ref().ok().map(|it| &it.requests),
             Node::Instance(instance) => self.instances.get(instance).and_then(|known| {
-                let compiled = compiled_instance(db, instance.clone(), known.env.clone());
+                let compiled = compiled_instance(db, *instance, known.env);
                 compiled.as_ref().ok().map(|it| &it.requests)
             }),
             Node::Static(id) => compiled_static(db, *id).as_ref().ok().map(|it| &it.requests),
@@ -2662,11 +2754,14 @@ impl Base {
         let added: FxHashSet<FunctionId> = match self.rustc {
             true => FxHashSet::default(),
             false => {
+                // alloc: once per patch, the entries of the base
                 let base: FxHashSet<FunctionId> = self.entries.iter().copied().collect();
+                // alloc: once per patch, the entries now
                 let now: FxHashSet<FunctionId> = roots.entries.iter().copied().collect();
                 if !base.is_subset(&now) {
                     return Ok(Err("a root compiled whether called or not is gone"));
                 }
+                // alloc: once per patch, the entries added
                 now.difference(&base).copied().collect()
             }
         };
@@ -2675,11 +2770,13 @@ impl Base {
         let none = FxHashSet::default();
         let on_demand = if self.rustc { &none } else { on_demand };
         let all: FxHashSet<FunctionId> =
+            // alloc: once per patch, the roots now
             roots.entries.iter().chain(roots.on_demand).copied().collect();
         let known_roots =
             || self.compiled.iter().map(|it| it.0).chain(self.skipped.iter().map(|it| it.0));
         // One the look found gone is one the program no longer lists, and the other way round.
         let gone: FxHashSet<FunctionId> =
+            // alloc: once per patch, what the look found gone
             stale.iter().flat_map(|it| it.gone.iter().copied()).collect();
         if gone.iter().any(|root| all.contains(root)) {
             return Ok(Err("a root of the base no longer compiles"));
@@ -2688,11 +2785,12 @@ impl Base {
             return Ok(Err("a root of the base is gone"));
         }
 
-        let mut changed_roots = Vec::new();
-        let mut changed_instances = Vec::new();
-        let mut changed_hydrated = Vec::new();
-        let mut changed_statics = Vec::new();
-        let mut broken = Vec::new();
+        let sum = |len: fn(&Stale) -> usize| stale.iter().map(len).sum::<usize>();
+        let mut changed_roots = Vec::with_capacity(sum(|it| it.roots.len()));
+        let mut changed_instances = Vec::with_capacity(sum(|it| it.instances.len()));
+        let mut changed_hydrated = Vec::with_capacity(sum(|it| it.hydrated.len()));
+        let mut changed_statics = Vec::with_capacity(sum(|it| it.statics.len()));
+        let mut broken = Vec::with_capacity(sum(|it| it.broken.len()));
         for part in stale {
             if let Some(why) = part.declined {
                 return Ok(Err(why));
@@ -2719,7 +2817,7 @@ impl Base {
                     if known.is_some_and(|it| it.env == *env && it.mark.is_some() && !it.forwarded)
                         && !changed_instances.contains(instance)
                     {
-                        changed_instances.push(instance.clone());
+                        changed_instances.push(*instance);
                     }
                 }
             }
@@ -2745,10 +2843,12 @@ impl Base {
             changed: changed_roots
                 .iter()
                 .map(|&root| Node::Root(root))
-                .chain(changed_instances.iter().cloned().map(Node::Instance))
+                .chain(changed_instances.iter().copied().map(Node::Instance))
                 .chain(changed_statics.iter().map(|&id| Node::Static(id)))
+                // alloc: once per patch, what it changed
                 .collect(),
-            broken: broken.iter().map(|it| it.0.clone()).collect(),
+            // alloc: once per patch, what it can't replace
+            broken: broken.iter().map(|it| it.0).collect(),
             gone,
             behind: FxHashMap::default(),
             moved,
@@ -2759,11 +2859,12 @@ impl Base {
         {
             return Ok(Err(why));
         }
-        let mut dropped: Vec<Node> = broken.iter().map(|it| it.0.clone()).collect();
+        // alloc: once per patch, what it leaves uncalled
+        let mut dropped: Vec<Node> = broken.iter().map(|it| it.0).collect();
         // rustc's code may call any of them still.
         if !self.rustc {
             changed_instances.retain(|it| {
-                let node = Node::Instance(it.clone());
+                let node = Node::Instance(*it);
                 let reached = self.reaches(db, &node, &unchanged);
                 if !reached {
                     dropped.push(node);
@@ -2792,6 +2893,7 @@ impl Base {
         )?;
         cg.phases.compile = verify;
         cg.phases.setup = start.elapsed() - verify;
+        // clone: once per patch, the object's codegen owns its set
         cg.rustc_futures = known.futures.clone();
         cg.rustc_values = known.frozen.rustc_values();
         cg.tiers = Some(&known.tiers);
@@ -2800,8 +2902,7 @@ impl Base {
         // rustc's copies are the ones the base was built against: what they call is in it.
         for instance in &changed_instances {
             let was = &self.instances[instance];
-            let Ok(compiled) = compiled_instance(db, instance.clone(), was.env.clone()).as_ref()
-            else {
+            let Ok(compiled) = compiled_instance(db, *instance, was.env).as_ref() else {
                 return Ok(Err("an instance of the base no longer compiles"));
             };
             let id = cg.module.declare_function(
@@ -2809,13 +2910,13 @@ impl Base {
                 Linkage::Hidden,
                 &compiled.code.signature,
             )?;
-            cg.instances.insert(instance.clone(), id);
-            cg.pending.push((instance.clone(), was.env.clone(), id));
+            cg.instances.insert(*instance, id);
+            cg.pending.push((*instance, was.env, id));
         }
         // What calls code from the store calls it by the base's symbol, which the patch takes.
         for (i, instance, env) in changed_hydrated {
             let was = &self.hydrated[i as usize];
-            let Ok(compiled) = compiled_instance(db, instance.clone(), env.clone()).as_ref() else {
+            let Ok(compiled) = compiled_instance(db, instance, env).as_ref() else {
                 return Ok(Err("code of the checkout from the store no longer compiles"));
             };
             if cg.instances.contains_key(&instance) {
@@ -2826,7 +2927,7 @@ impl Base {
                 Linkage::Hidden,
                 &compiled.code.signature,
             )?;
-            cg.instances.insert(instance.clone(), id);
+            cg.instances.insert(instance, id);
             cg.pending.push((instance, env, id));
         }
         for &id in &changed_statics {
@@ -2842,9 +2943,11 @@ impl Base {
             return Ok(Err("a function that hands rustc's code an `impl Trait` changed or moved"));
         }
         if self.rustc {
+            // alloc: once per patch of what rustc linked
             let crates = changed_roots.iter().map(|it| it.krate(db)).collect();
             cg.define_rustc_allocator_entries(&crates)?;
         }
+        // alloc: once per patch, what is queued already
         let mut queued: FxHashSet<FunctionId> = known_roots().collect();
         let mut queue = changed_roots;
         queue.extend(added.iter().copied().filter(|&func| queued.insert(func)));
@@ -2882,7 +2985,7 @@ impl Base {
         // A future is laid out by one compiler: a function that now handles one of rustc's
         // has to be left to rustc as well.
         if let Some(theirs) = self.their_async_blocks() {
-            let shares = |root| match (async_blocks(db, root).clone(), &theirs) {
+            let shares = |root| match (async_blocks(db, root), &theirs) {
                 (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
                 (Some(ours), None) => !ours.is_empty(),
                 (None, _) => true,

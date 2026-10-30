@@ -47,6 +47,7 @@ impl Counted {
     /// Compile queries run, by the crate each was for.
     pub fn compiles_by_crate(&self) -> Vec<(Crate, usize)> {
         let of = self.compiles_of.lock().unwrap_or_else(|e| e.into_inner());
+        // alloc: once per build, for its report
         of.iter().map(|(&krate, &count)| (krate, count)).collect()
     }
 }
@@ -64,7 +65,9 @@ pub struct Counting {
 
 impl Counting {
     pub fn start() -> Counting {
+        // alloc: once per build; the counts outlive it on the threads it hands them to
         let counted = Arc::new(Counted { around: now(), ..Counted::default() });
+        // clone: once per build, the same `Arc` held by this thread's slot as well
         let held = COUNTING.with(|it| it.replace(Some(counted.clone())));
         Counting { counted, held, on_this_thread: PhantomData }
     }
@@ -83,6 +86,7 @@ impl Drop for Counting {
 
 /// What counts this thread's compiles, for a thread that works for it to count into.
 pub fn now() -> Option<Arc<Counted>> {
+    // clone: once per build or per batch handed to another thread, which must own it
     COUNTING.with(|it| it.borrow().clone())
 }
 
@@ -102,10 +106,11 @@ pub fn within<T>(counted: Option<Arc<Counted>>, work: impl FnOnce() -> T) -> T {
 
 fn each(count: impl Fn(&Counted)) {
     COUNTING.with(|it| {
-        let mut at = it.borrow().clone();
+        let held = it.borrow();
+        let mut at = held.as_deref();
         while let Some(counted) = at {
-            count(&counted);
-            at = counted.around.clone();
+            count(counted);
+            at = counted.around.as_deref();
         }
     });
 }

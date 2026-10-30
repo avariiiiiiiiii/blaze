@@ -199,7 +199,7 @@ impl<P: Policy> IndexMut<Key<P::K, P::V, P>> for DynMap {
 
 #[cfg(test)]
 mod tests {
-    use syntax::AstPtr;
+    use syntax::{AstPtr, ast};
     use test_fixture::WithFixture;
 
     use super::{DynMap, keys};
@@ -216,8 +216,8 @@ mod tests {
         let krate = db.fetch_test_crate();
         let f = test_items::function(&db, krate, "f");
         let c = test_items::constant(&db, krate, "C");
-        let f_ptr = AstPtr::new(&f.lookup(&db).source(&db).value);
-        let c_ptr = AstPtr::new(&c.lookup(&db).source(&db).value);
+        let f_ptr = AstPtr::<ast::Fn>::of(f.lookup(&db).source_view(&db).value);
+        let c_ptr = AstPtr::<ast::Const>::of(c.lookup(&db).source_view(&db).value);
 
         let mut map = DynMap::default();
         assert!(map[keys::FUNCTION].is_empty());

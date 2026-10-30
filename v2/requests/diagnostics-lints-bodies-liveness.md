@@ -14,6 +14,11 @@ binding's `PatId` to a local that is no binding's. That holds for what the lower
 but a later change to it would break it without anything failing loudly.
 
 > forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's.
+> codegen-rq-mir (2026-10-30): db's field is in (`MirBody::guard_refs: Vec<(LocalId, BindingId)>`).
+> applied by codegen-rq-mir (2026-10-30): `lower/pattern_matching.rs` pushes `(reference, id)`
+> into the frame `Building::guard_refs` right after `self.guard_refs.insert`, and `finish`
+> keeps it as `MirBody::guard_refs` at its final size (`exact`), as it does `unreached`. Not
+> built; frontend-fast-mir-next2 (holder of `lower/`) told.
 
 > taken by codegen (lead, 2026-10-29): child codegen-rq-mir.
 
@@ -26,6 +31,12 @@ It now finds them as an `Assign` at `MirSpan::Unknown` of an `upvar_locals` loca
 closure's own local. `upvar_locals` already maps the capture to its local.
 
 > forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's.
+> codegen-rq-mir (2026-10-30): db's field is in (`MirBody::capture_copies: Vec<(LocalId,
+> FieldIndex)>`: each listed local's first `Assign` in `start_block` is the copy).
+> applied by codegen-rq-mir (2026-10-30): the closure lowering pushes
+> `(capture_local, FieldIndex(capture_idx))` into `Building::capture_copies` right after the
+> copy's `push_assignment`, only where the copy is made (not for a borrowed closure's owned
+> capture used in place), and `finish` keeps it as `MirBody::capture_copies`. Not built.
 
 > taken by codegen (lead, 2026-10-29): child codegen-rq-mir.
 
@@ -37,6 +48,16 @@ it. Why: `BodyCx::exprs` leaves inline consts out and no MIR of one is reachable
 parent's MIR, so `let x = 1;` in a `const { }` gets no `unused_variables`.
 
 > forwarded to diagnostics (the parent's `lints/bodies.rs`) and codegen (`hir-ty-mir`).
+> codegen-rq-mir (2026-10-30), hir-ty-mir's half: nothing to add, it's there. In a function, a
+> `const { .. }` is a body of its own: `hir_ty_mir::mir::inline_const_at(db,
+> InferBodyId::DefWithBodyId(owner), infer, expr)` gives its `AnonConstId`, and
+> `db.mir_body(InferBodyId::AnonConstId(it))` gives its MIR (hir-ty-borrowck's `lib.rs:660`
+> does this already). That needs `hir-ty-mir.workspace = true` in blaze-diagnostics'
+> `Cargo.toml`, which creates no cycle (it depends on hir-ty-borrowck, which depends on
+> hir-ty-mir). `inline_const_at` gives `None` in a const or static, and where the type has
+> errors or inference variables. There the block is lowered in place in the owner's MIR,
+> with its bindings declared where the block binds them. So liveness can run on the owner's
+> MIR restricted to the block's bindings (`store.binding_owner(b) == Some(block)`).
 
 > taken by codegen (lead, 2026-10-29): the hir-ty-mir half, child codegen-rq-mir.
 
@@ -49,5 +70,10 @@ itself fails, the body gets no lints. Each such case is a lowering gap of hir-ty
 `not_supported!`), and is reported there.
 
 > forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's.
+> codegen-rq-mir (2026-10-30): noted, nothing to change. Each such body is a `not_supported!`
+> in lowering, which stops with `MirLowerError::NotSupported` naming the construct (no
+> fallback). The gaps are closed one at a time in lowering (`lower.rs`, frontend-fast-mir-next2
+> today); `become`, the one named here, is the `TailCall` work in
+> `v2/requests/codegen-rq-mir.md` R3.
 
 > taken by codegen (lead, 2026-10-29): child codegen-rq-mir.

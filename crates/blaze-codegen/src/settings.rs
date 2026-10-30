@@ -259,6 +259,7 @@ impl Spec {
     /// The settings of the same function at another backend: the first tier's of a function
     /// tiered up (#807), or its last.
     pub fn at(&self, backend: Backend) -> Spec {
+        // clone: a second spec of one function, kept beside the first (a tiered one's tiers)
         Spec { backend, ..self.clone() }
     }
 }

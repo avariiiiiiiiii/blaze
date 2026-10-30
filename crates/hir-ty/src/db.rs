@@ -1287,6 +1287,7 @@ pub mod kinds {
         ANON_CONST_EVAL = 0x2411, "anon_const_eval_query";
         CONST_EVAL_STATIC = 0x2412, "const_eval_static_query";
         CONST_EVAL_DISCRIMINANT = 0x2413, "const_eval_discriminant_variant";
+        ANON_CONST_VALTREE_ERROR = 0x2414, "anon_const_valtree_error";
 
         // Signatures.
         IMPL_TRAIT = 0x2420, "impl_trait_of_impl";
@@ -1315,6 +1316,7 @@ pub mod kinds {
         CRATE_IMPL_SELF_TYS = 0x2437, "crate_impl_self_tys";
         CRATE_IMPL_TRAITS = 0x2438, "crate_impl_traits";
         CRATE_IMPL_PREDICATES = 0x2439, "crate_impl_predicates";
+        CONST_PARAM_TY_ERRORS = 0x243a, "const_param_ty_errors";
 
         // Variance, dyn compatibility, representability.
         VARIANCES_OF = 0x2440, "variances_of_query";

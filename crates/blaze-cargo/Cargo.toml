@@ -145,6 +145,7 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-usercode.workspace = true
 blaze-codegen.workspace = true
+blaze-testsel.workspace = true
 blaze-lazy.workspace = true
 blaze-link.workspace = true
 load-cargo.workspace = true

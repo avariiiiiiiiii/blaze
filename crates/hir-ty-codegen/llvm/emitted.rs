@@ -10,6 +10,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Borrow;
+
 use cranelift_codegen::{
     binemit::Reloc,
     gimli::{
@@ -24,6 +26,7 @@ use object::{
     RelocationTarget, SectionIndex, SectionKind, SymbolSection, elf, macho, pe,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::{
     Symbol, Unhandled, pgo,
@@ -84,21 +87,22 @@ struct Instrumented {
 
 /// The code of each of `functions`, by its name in the object and its signature. What is wrong
 /// with the code of one is that function's; what is wrong with the object is every one's.
-pub(super) fn read(
+pub(super) fn read<S: Borrow<Signature>>(
     object: &[u8],
-    functions: &[(&str, Signature)],
+    functions: &[(&str, S)],
     recorder: &mut Wants,
 ) -> Result<Vec<Result<Code, Unhandled>>, Unhandled> {
     let read = read_all(object, functions, recorder, Instrumented::default())?;
+    // alloc: the result, one per function
     Ok(read.into_iter().map(|it| it.map(|(code, ..)| code)).collect())
 }
 
 /// The code of the one function of an object LLVM instrumented with SanitizerCoverage, and
 /// its arrays and PC table: what it refers to of the arrays are relocations in
 /// [`sanitize::COVERAGE`].
-pub(super) fn read_covered(
+pub(super) fn read_covered<S: Borrow<Signature>>(
     object: &[u8],
-    function: (&str, Signature),
+    function: (&str, S),
     recorder: &mut Wants,
 ) -> Result<(Code, Covered), Unhandled> {
     let instrumented = Instrumented { covered: true, profiled: false };
@@ -111,9 +115,9 @@ pub(super) fn read_covered(
 /// SanitizerCoverage, if `covered`, as [`read_covered`] reads it), and how many bytes its
 /// counters take, which start zeroed: what it refers to of them are relocations at index 0
 /// of [`pgo::COUNTER_RELOCS`].
-pub(super) fn read_profiled(
+pub(super) fn read_profiled<S: Borrow<Signature>>(
     object: &[u8],
-    function: (&str, Signature),
+    function: (&str, S),
     recorder: &mut Wants,
     covered: bool,
 ) -> Result<(Code, Covered, u32), Unhandled> {
@@ -122,14 +126,15 @@ pub(super) fn read_profiled(
     read.pop().ok_or(Unhandled::Shape("an object without the function"))?
 }
 
-fn read_all(
+fn read_all<S: Borrow<Signature>>(
     object: &[u8],
-    functions: &[(&str, Signature)],
+    functions: &[(&str, S)],
     recorder: &mut Wants,
     instrumented: Instrumented,
 ) -> Result<Vec<Result<(Code, Covered, u32), Unhandled>>, Unhandled> {
     let file = object::File::parse(object)?;
-    let mut found: Vec<Option<(SectionIndex, u64)>> = vec![None; functions.len()];
+    let mut found: SmallVec<[Option<(SectionIndex, u64)>; 1]> =
+        SmallVec::from_elem(None, functions.len());
     for symbol in file.symbols() {
         let (Ok(name), SymbolSection::Section(section)) = (symbol.name(), symbol.section()) else {
             continue;
@@ -138,6 +143,7 @@ fn read_all(
             found[at] = Some((section, symbol.address()));
         }
     }
+    // alloc: once per object, the sections of its functions, which `Emitted` looks up per relocation
     let texts: FxHashSet<SectionIndex> = found.iter().flatten().map(|it| it.0).collect();
     let mut referrers: FxHashMap<SectionIndex, usize> = FxHashMap::default();
     if texts.len() > 1 {
@@ -155,6 +161,7 @@ fn read_all(
             }
         }
     }
+    // alloc: once per object, as `texts`; empty, allocating nothing, for a function alone
     let shared = referrers.into_iter().filter(|it| it.1 > 1).map(|it| it.0).collect();
     let mut codes = Vec::with_capacity(functions.len());
     for (at, (_, signature)) in functions.iter().enumerate() {
@@ -168,7 +175,9 @@ fn read_all(
             }
             Some((text, _)) => {
                 let name = functions[at].0;
-                Emitted::code(&file, text, &texts, &shared, name, signature.clone(), recorder, instrumented)
+                // clone: the one copy, which the `Code` owns
+                let signature = signature.borrow().clone();
+                Emitted::code(&file, text, &texts, &shared, name, signature, recorder, instrumented)
             }
         };
         codes.push(code);
@@ -209,11 +218,15 @@ impl<'data, 'file> Emitted<'data, 'file> {
             shared,
             name,
             placed: FxHashMap::default(),
+            // alloc: once per function read, the sections of its code
             inline: Vec::new(),
+            // alloc: the code, which the `Code` keeps
             bytes: Vec::new(),
             code: 0,
             align: 1,
+            // alloc: once per function read, as `inline`
             relocs: Vec::new(),
+            // alloc: empty, allocating nothing but for AArch64 ELF's loads and stores
             elf_types: Vec::new(),
             covered,
             profiled,
@@ -251,6 +264,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             false => 0,
         };
         let Emitted { bytes, align, relocs, elf_types, .. } = emitted;
+        // alloc: the error's message
         let relocs = Relocs::of_module(&relocs, &elf_types).map_err(|e| Unhandled::Llvm(e.to_string()))?;
         Ok((Code { signature, bytes, align, relocs, unwind, lines, slots }, coverage, counters))
     }
@@ -354,6 +368,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             Ok(u64::from_le_bytes(wide))
         };
         let text = self.file.section_by_index(self.text)?;
+        // alloc: SanitizerCoverage's PC table, read only for an instrumented build
         let mut pcs: Vec<Option<u32>> = vec![None; data.len() / (2 * word)];
         for (offset, relocation) in section.relocations() {
             let offset = offset as usize;
@@ -422,6 +437,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     if let Some(base) = entry.attr_value(gimli::DW_AT_frame_base)
                         && let Some(base) = base.exprloc_value()
                     {
+                        // alloc: the frame's base, which the `Code` keeps
                         places.frame_base = base.0.slice().to_vec();
                     }
                 }
@@ -435,12 +451,17 @@ impl<'data, 'file> Emitted<'data, 'file> {
                         _ => entry.attr_value(gimli::DW_AT_name)?,
                     };
                     let name = dwarf.attr_string(&unit, name).ok()?;
-                    let slot = name.to_string().ok()?.parse().ok()?;
+                    let slot = std::str::from_utf8(name.slice()).ok()?.parse().ok()?;
+                    // alloc: the variable's places, which the `Code` keeps
                     let mut ranges = Vec::new();
+                    let encoding = unit.encoding();
                     match entry.attr_value(gimli::DW_AT_location) {
                         None => {}
                         Some(gimli::AttributeValue::Exprloc(place)) => {
-                            ranges.push((0, self.code, place));
+                            if Self::is_of_frame(place, encoding) {
+                                // alloc: the place, which the `Code` keeps
+                                ranges.push((0, self.code, place.0.slice().to_vec()));
+                            }
                         }
                         Some(list) => {
                             let mut list = dwarf.attr_locations(&unit, list).ok()??;
@@ -451,15 +472,13 @@ impl<'data, 'file> Emitted<'data, 'file> {
                                 else {
                                     continue;
                                 };
-                                ranges.push((begin, end, place.data));
+                                if Self::is_of_frame(place.data, encoding) {
+                                    // alloc: the place, which the `Code` keeps
+                                    ranges.push((begin, end, place.data.0.slice().to_vec()));
+                                }
                             }
                         }
                     }
-                    let ranges = ranges
-                        .into_iter()
-                        .filter(|it| Self::is_of_frame(it.2, unit.encoding()))
-                        .map(|(from, to, place)| (from, to, place.0.slice().to_vec()))
-                        .collect();
                     places.slots.push((slot, VariablePlace::Ranges(ranges)));
                 }
                 _ => {}
@@ -508,7 +527,9 @@ impl<'data, 'file> Emitted<'data, 'file> {
     /// that is known before linking: each function starts its section, which is at
     /// [`Self::base`], and every other section is on its own.
     fn relocated(&self, name: &str) -> Option<Vec<u8>> {
+        // alloc: empty, allocates nothing
         let Some(section) = self.file.section_by_name(name) else { return Some(Vec::new()) };
+        // alloc: once per debug section read, the copy its relocations are filled into
         let mut bytes = section.data().ok()?.to_vec();
         for (offset, relocation) in section.relocations() {
             if relocation.kind() != object::RelocationKind::Absolute {
@@ -544,6 +565,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
     fn lines(&self) -> Result<Vec<LineRow>, Unhandled> {
         const MALFORMED: Unhandled = Unhandled::Shape("a line table that does not parse");
         if self.file.section_by_name(".debug_line").is_none() {
+            // alloc: empty, allocates nothing
             return Ok(Vec::new());
         }
         let bytes = self.relocated(".debug_line").ok_or(MALFORMED)?;
@@ -560,6 +582,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
         };
         let named = header.file_names().iter().any(ours);
         // Each run of code is of one section: the function's are those that start in it.
+        // alloc: once per function, its rows, which `LineRow::of_ranges` makes the line table of
         let mut ranges = Vec::new();
         for sequence in sequences.iter().filter(|it| self.local(it.start).is_some()) {
             let mut rows = program.resume_from(sequence);
@@ -594,7 +617,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
 
     /// Lays out `first` and every section its relocations lead to.
     fn place(&mut self, first: SectionIndex, recorder: &mut Wants) -> Result<(), Unhandled> {
-        let mut pending = vec![first];
+        let mut pending: SmallVec<[SectionIndex; 8]> = SmallVec::new();
+        pending.push(first);
         while let Some(index) = pending.pop() {
             if self.placed.contains_key(&index) {
                 continue;
@@ -664,11 +688,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
             return Err(Unhandled::Shape("code that refers to a writable section"));
         }
         let mut blob = ConstBlob {
+            // alloc: the data object's bytes, which `Wants` keeps
             bytes: section.data()?.to_vec(),
-            relocs: Vec::new(),
-            fn_relocs: Vec::new(),
             align: section.align().max(1),
-            type_ids: Vec::new(),
+            ..ConstBlob::default()
         };
         for (offset, relocation) in section.relocations() {
             let target = match Self::destination(self.file, &relocation)? {
@@ -886,11 +909,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
         }
         match section.kind() {
             SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => Ok(ConstBlob {
+                // alloc: the data object's bytes, which `Wants` keeps
                 bytes: section.data()?.to_vec(),
-                relocs: Vec::new(),
-                fn_relocs: Vec::new(),
                 align: section.align().max(1),
-                type_ids: Vec::new(),
+                ..ConstBlob::default()
             }),
             _ => Err(Unhandled::Shape("code that refers to a writable section")),
         }
@@ -907,11 +929,10 @@ impl<'data, 'file> Emitted<'data, 'file> {
             _ => return Err(Unhandled::Shape("code that refers to a writable section")),
         }
         let mut blob = ConstBlob {
+            // alloc: the data object's bytes, which `Wants` keeps
             bytes: section.data()?.to_vec(),
-            relocs: Vec::new(),
-            fn_relocs: Vec::new(),
             align: section.align().max(1),
-            type_ids: Vec::new(),
+            ..ConstBlob::default()
         };
         const HELD: Unhandled = Unhandled::Shape("constants that hold an address of the code");
         for (offset, relocation) in section.relocations() {
@@ -1057,6 +1078,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 Self::symbol(self.file, relocation)
                     .is_ok_and(|it| it.section() == SymbolSection::Section(self.text))
             });
+            // alloc: once per function of a unit, none for a function alone
             starts.map(|(offset, _)| offset.wrapping_sub(8)).collect()
         });
         let mut entries = eh_frame.entries(&bases);
@@ -1078,7 +1100,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 return Err(Unhandled::Shape("more than one unwind table entry"));
             }
             let cie = fde.cie();
-            let entry_rules = Self::rules(cie.instructions(&eh_frame, &bases), cie)?;
+            let entry_rules: SmallVec<[(u32, FrameRule); 4]> =
+                Self::rules(cie.instructions(&eh_frame, &bases), cie)?;
             let arch = match self.file.architecture() {
                 Architecture::Aarch64 => crate::Arch::Aarch64,
                 _ => crate::Arch::X86_64,
@@ -1139,6 +1162,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
         // found it, which the unwinder takes a function without one for. It gets the entry
         // that says as much: whoever looks for where a function ends looks in `.pdata`.
         let Some(pdata) = self.file.section_by_name(".pdata") else {
+            // alloc: the unwind info, which the `Code` keeps
             let leaf = vec![VERSION, 0, 0, 0];
             return Ok(Some(FunctionUnwind::from_unwind_info(code, leaf, seh::Pads::default())));
         };
@@ -1168,6 +1192,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             // What is left is an entry that goes on from another.
             _ => return Err(Unhandled::Shape("an unwind table in more than one piece")),
         };
+        // alloc: the unwind info, which the `Code` keeps
         let mut frame = frame.to_vec();
         frame[0] = VERSION;
         Ok(Some(FunctionUnwind::from_unwind_info(code, frame, pads)))
@@ -1215,6 +1240,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
         if table.relocations().next().is_some() {
             return Err(Unhandled::Shape("landing pads that name a type"));
         }
+        // alloc: the landing pads, which the `Code` keeps
         Ok(table.data()?.to_vec())
     }
 
@@ -1252,6 +1278,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
         }
         let (len, encoding) =
             (u32::from_le_bytes([l0, l1, l2, l3]), u32::from_le_bytes([e0, e1, e2, e3]));
+        // alloc: the unwind rules, which the `Code` keeps
         let mut rows = Vec::new();
         // How far below the frame the saved pairs start.
         let mut at = match encoding & MODE {
@@ -1285,16 +1312,16 @@ impl<'data, 'file> Emitted<'data, 'file> {
 
     const UNKNOWN_RULE: Unhandled = Unhandled::Shape("an unwind rule there is no answer for");
 
-    fn rules<R: gimli::Reader>(
+    fn rules<R: gimli::Reader, C: Default + Extend<(u32, FrameRule)>>(
         mut instructions: gimli::CallFrameInstructionIter<'_, R>,
         cie: &gimli::CommonInformationEntry<R>,
-    ) -> Result<Vec<(u32, FrameRule)>, Unhandled> {
+    ) -> Result<C, Unhandled> {
         use gimli::CallFrameInstruction as Cfi;
         let scale = cie.data_alignment_factor();
         let factored =
             |offset: i64| offset.checked_mul(scale).and_then(|it| i32::try_from(it).ok());
         let mut at = 0u32;
-        let mut rules = Vec::new();
+        let mut rules = C::default();
         while let Some(instruction) = instructions.next().map_err(|_| Self::UNKNOWN_RULE)? {
             let rule = match instruction {
                 Cfi::AdvanceLoc { delta } => {
@@ -1327,7 +1354,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 Cfi::ArgsSize { size } => FrameRule::ArgsSize(size as u32),
                 _ => return Err(Self::UNKNOWN_RULE),
             };
-            rules.push((at, rule));
+            rules.extend(std::iter::once((at, rule)));
         }
         Ok(rules)
     }
@@ -1358,6 +1385,7 @@ fn plain<'n>(file: &object::File<'_>, name: &'n str) -> &'n str {
 
 impl From<object::Error> for Unhandled {
     fn from(e: object::Error) -> Self {
+        // alloc: the error's message
         Unhandled::Llvm(format!("object: {e}"))
     }
 }

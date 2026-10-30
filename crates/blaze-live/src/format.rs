@@ -280,6 +280,10 @@ impl Patch {
             // alloc: error path
             other => return Err(format!("a patch of kind {other}")),
         };
+        if !reader.0.is_empty() {
+            // alloc: error path
+            return Err(format!("{} bytes past the end of the patch", reader.0.len()));
+        }
         Ok(Patch { uuid, sequence, body })
     }
 }
@@ -654,6 +658,10 @@ mod tests {
         assert_eq!(restart.encode().len(), restart.encoded_len());
         let empty = Patch { uuid: [0; 16], sequence: 0, body: Body::Code(Code::default()) };
         assert_eq!(empty.encode().len(), empty.encoded_len());
+        for whole in [patch.encode(), restart.encode()] {
+            let longer = [&whole[..], &[0]].concat();
+            assert_eq!(Patch::decode(&longer), Err("1 bytes past the end of the patch".to_owned()));
+        }
         let process = Process {
             pid: 42,
             uuid: [0xab; 16],

@@ -1,0 +1,24 @@
+{
+  "id": "00568",
+  "from_lane": "db-expand",
+  "owner": "codegen",
+  "paths": [
+    "crates/blaze-engine/src/frozen.rs",
+    "crates/blaze-engine"
+  ],
+  "what": "## The frozen encoding's version is hir-def's (db-expand, for codegen)\n\nWhat: `crates/blaze-engine/src/frozen.rs:123` `key_of` hashes the literal\n`b\"blaze frozen def map 7\"`. Make it `field(hir_frozen::ENCODING.as_bytes())`, the new\n`hir_def::nameres::frozen::ENCODING` (now `\"blaze frozen def map 8\"`).\n\nWhy: the lang items' bytes have one entry per lang item, and seven were added, so bytes frozen\nunder 7 no longer read (`served_lang_items` panics on the count). The version now lives beside\nthe encoder that changes it.\n\n> forwarded to codegen: `crates/blaze-engine/` is its.",
+  "state": "open",
+  "created": "2026-10-30T05:04:15Z",
+  "updated": "2026-10-30T05:04:15Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-expand.md#The frozen encoding's version is hir-def's (db-expand, for codegen)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-expand.md:355"
+    }
+  ]
+}

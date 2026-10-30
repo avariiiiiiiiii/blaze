@@ -75,14 +75,17 @@ pub(crate) fn check_pack_header(bytes: &[u8], unit: u32) -> Result<(), &'static 
 /// Packs sit next to the head, so the directory sync of the head's write makes a new pack's
 /// name durable with it.
 pub(crate) fn pack_file(at: usize) -> String {
+    // alloc: a file name, which the effect naming it owns; once per file made or mapped
     format!("pack-{at:06}")
 }
 
 pub(crate) fn index_file(slot: u8) -> String {
+    // alloc: a file name, which the effect naming it owns; once per file made or mapped
     format!("index-{slot}")
 }
 
 pub(crate) fn external_file(content: &ContentId) -> String {
+    // alloc: a file name, which the effect naming it owns; once per file made or mapped
     format!("file-{content:x}")
 }
 
@@ -241,14 +244,14 @@ pub(crate) fn encode_chunk(out: &mut Vec<u8>, key: Key, len: u64) {
     out.put_u64(len);
 }
 
-pub(crate) fn decode_chunks(payload: &[u8]) -> Result<Vec<(Key, u64)>, &'static str> {
+/// A list of chunks' entries, read in place as they are walked.
+pub(crate) fn decode_chunks(
+    payload: &[u8],
+) -> Result<impl Iterator<Item = (Key, u64)> + Clone + '_, &'static str> {
     if payload.len() % CHUNK_REF != 0 {
         return Err("its list of chunks is not whole");
     }
-    Ok(payload
-        .chunks_exact(CHUNK_REF)
-        .map(|it| (Key(id_at(it, 0)), u64_at(it, 32)))
-        .collect())
+    Ok(payload.chunks_exact(CHUNK_REF).map(|it| (Key(id_at(it, 0)), u64_at(it, 32))))
 }
 
 // Where records are.
@@ -396,6 +399,7 @@ impl Head {
         }
         let format = u32_at(bytes, 8);
         if format != crate::FORMAT {
+            // alloc: the error's message
             return Err(format!(
                 "it is of store format {format}, not {}: remove the directory to start a new \
                  store there",
@@ -477,9 +481,11 @@ impl Head {
                 || pack.committed < PACK_HEADER
                 || pack.committed % BLOCK != 0
             {
+                // alloc: the error's message
                 return Err(format!("{} has impossible lengths", pack_file(number)));
             }
             if pack.unit as usize > head.units.len() {
+                // alloc: the error's message
                 return Err(format!("{} is of a unit it does not list", pack_file(number)));
             }
         }

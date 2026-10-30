@@ -1,0 +1,27 @@
+{
+  "id": "00212",
+  "from_lane": "coordinator",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "vendor/salsa",
+    "vendor/salsa-macros",
+    "vendor/salsa-macro-rules",
+    "Cargo.lock"
+  ],
+  "what": "## tools/v2/hot_lint.py doesn't see salsa (from speed-salsa)\n\n- What: `HOT` names crates under `crates/` only, so `vendor/salsa`, `vendor/salsa-macros` and\n  `vendor/salsa-macro-rules` (every query's hit path) are never linted. Let `crates` take a path\n  relative to the root (or add a `vendor` list) and add the three to `HOT`. The lint also skips\n  only a literal `#[cfg(test)]`, so `#[cfg(all(test, ...))]` modules are linted as code.\n- Where: `tools/v2/hot_lint.py`.\n- Why: speed-salsa linted them by calling `hot_lint.lint_file` on each file directly: 0 findings\n  now (fixed, or justified on the line), including the proc macros' expansion-time code.\n- Also, for `Cargo.lock` at the first build: `vendor/salsa` now depends on `blaze-mem` (memo\n  columns are blaze-mem regions) and dev-depends on `blaze-alloc-count`, both by path; salsa's\n  lock entry gains the two.\n\n> forwarded to the coordinator: `tools/` is its; on requests' coordinator list (vendor salsa in `HOT`, `cfg(all(test, ..))` as test code).",
+  "state": "open",
+  "created": "2026-10-30T02:24:54Z",
+  "updated": "2026-10-30T02:24:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/coordinator.md#tools/v2/hot_lint.py doesn't see salsa (from speed-salsa)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/coordinator.md:27"
+    }
+  ]
+}

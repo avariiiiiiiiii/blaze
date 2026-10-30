@@ -40,7 +40,7 @@ use hir_def::{
         UnionSignature, VariantFields,
     },
     src::HasSource,
-    visibility::{Visibility, visibility_from_ast},
+    visibility::{Visibility, visibility_from_ast_view},
 };
 use hir_expand::proc_macro::ProcMacroKind;
 use hir_ty::{
@@ -76,10 +76,7 @@ use rustc_type_ir::{
     inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
-use syntax::{
-    AstNode,
-    ast::{self, HasVisibility},
-};
+use syntax::view::{self as ast, AstNode as _, HasVisibility as _};
 
 use crate::{
     ItemId, ItemKey,
@@ -1102,14 +1099,14 @@ impl<'db> Cx<'db> {
         let db = self.db;
         self.visibility(f, id.module(db), item_visibility(db, ItemId::Macro(id)));
         self.attrs(f, id.into());
-        let (trees, count): ([Option<ast::TokenTree>; 2], usize) = match id {
+        let (trees, count): ([Option<ast::TokenTree<'_>>; 2], usize) = match id {
             MacroId::MacroRulesId(it) => {
                 let loc = it.lookup(db);
                 f.u8(0);
                 f.debug(&loc.expander);
                 f.u8(loc.flags.bits());
                 f.debug(&loc.edition);
-                ([loc.id.to_node(db).token_tree(), None], 1)
+                ([loc.id.to_view(db).token_tree(), None], 1)
             }
             MacroId::Macro2Id(it) => {
                 let loc = it.lookup(db);
@@ -1117,7 +1114,7 @@ impl<'db> Cx<'db> {
                 f.debug(&loc.expander);
                 f.bool(loc.allow_internal_unsafe);
                 f.debug(&loc.edition);
-                let node = loc.id.to_node(db);
+                let node = loc.id.to_view(db);
                 match node.args() {
                     Some(args) => ([Some(args), node.body()], 2),
                     None => ([node.body(), None], 1),
@@ -2722,6 +2719,12 @@ impl<'db> Cx<'db> {
                 self.block(f, c, Some(*real_target));
                 self.block(f, c, *unwind);
             }
+            TerminatorKind::TailCall { func, args, fn_span } => {
+                f.u8(14);
+                self.operand(f, c, func);
+                self.operands(f, c, args);
+                f.span(*fn_span);
+            }
         }
     }
 }
@@ -2784,19 +2787,19 @@ fn item_visibility_uncached(db: &Db, id: ItemId) -> Visibility {
         ItemId::Const(it) => AssocItemId::ConstId(it).assoc_visibility(db),
         ItemId::Alias(it) => AssocItemId::TypeAliasId(it).assoc_visibility(db),
         ItemId::Static(it) => {
-            visibility_from_ast(db, it, it.lookup(db).source(db).map(|it| it.visibility()))
+            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
         }
         ItemId::Adt(AdtId::StructId(it)) => {
-            visibility_from_ast(db, it, it.lookup(db).source(db).map(|it| it.visibility()))
+            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
         }
         ItemId::Adt(AdtId::EnumId(it)) => {
-            visibility_from_ast(db, it, it.lookup(db).source(db).map(|it| it.visibility()))
+            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
         }
         ItemId::Adt(AdtId::UnionId(it)) => {
-            visibility_from_ast(db, it, it.lookup(db).source(db).map(|it| it.visibility()))
+            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
         }
         ItemId::Trait(it) => {
-            visibility_from_ast(db, it, it.lookup(db).source(db).map(|it| it.visibility()))
+            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
         }
         // An impl is wherever its types and trait are.
         ItemId::Impl(_) => Visibility::Public,
@@ -2809,7 +2812,7 @@ fn item_visibility_uncached(db: &Db, id: ItemId) -> Visibility {
             }
         }
         ItemId::Macro(MacroId::Macro2Id(it)) => {
-            visibility_from_ast(db, it, it.lookup(db).source(db).map(|it| it.visibility()))
+            visibility_from_ast_view(db, it, it.lookup(db).source_view(db).map(|it| it.visibility()))
         }
         ItemId::Macro(MacroId::ProcMacroId(_)) => Visibility::Public,
     }

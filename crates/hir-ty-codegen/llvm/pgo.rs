@@ -27,6 +27,8 @@
 //! A profile used ([`Wanted::Use`]) is the bytes [`give`] was given under its content ID:
 //! LLVM reads it from memory, never from a file.
 
+#![forbid(unsafe_code)]
+
 use std::sync::{Arc, Mutex, Weak};
 
 use blaze_codegen::settings::Pgo;
@@ -261,35 +263,7 @@ const RAW_VERSION: &str = "__llvm_profile_raw_version";
 /// name, hash and counts. What a test uses a profile of.
 #[cfg(test)]
 pub(super) fn written(records: &[(&str, u64, &[u64])]) -> Vec<u8> {
-    use inkwell::llvm_sys::{
-        core::{LLVMDisposeMemoryBuffer, LLVMGetBufferSize, LLVMGetBufferStart},
-        transforms::pass_builder::{LLVMBlazeProfileRecord, LLVMBlazeWriteProfile},
-    };
-    let records: Vec<LLVMBlazeProfileRecord> = records
-        .iter()
-        .map(|&(name, hash, counts)| LLVMBlazeProfileRecord {
-            Name: name.as_ptr().cast(),
-            NameLength: name.len(),
-            Hash: hash,
-            Counts: counts.as_ptr(),
-            CountsLength: counts.len(),
-        })
-        .collect();
-    let mut out = std::ptr::null_mut();
-    // SAFETY: each record points at a name and counts of `records`' caller that outlive the
-    // call, with their lengths; `out` is written once with a buffer this owns.
-    let failed = unsafe { LLVMBlazeWriteProfile(records.as_ptr(), records.len(), &mut out) };
-    // SAFETY: `failed` is what LLVMBlazeWriteProfile just returned, taken nowhere else.
-    unsafe { super::Kept::taken(failed) }.unwrap();
-    // SAFETY: `out` is the live buffer LLVMBlazeWriteProfile made; its start is valid for its
-    // size until it is disposed of, after the copy.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(LLVMGetBufferStart(out).cast::<u8>(), LLVMGetBufferSize(out))
-    }
-    .to_vec();
-    // SAFETY: `out` is owned here, disposed of once and not read after.
-    unsafe { LLVMDisposeMemoryBuffer(out) };
-    bytes
+    super::written_profile(records).unwrap()
 }
 
 #[cfg(test)]

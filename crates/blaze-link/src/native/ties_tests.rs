@@ -80,6 +80,8 @@ fn output() -> Output {
         windows_subsystem: false,
         dev_run: None,
         exec_log: false,
+        sanitize: blaze_codegen::settings::Sanitize::default(),
+        rpaths: Vec::new(),
         triple: "x86_64-unknown-linux-gnu".into(),
         stack: None,
     }

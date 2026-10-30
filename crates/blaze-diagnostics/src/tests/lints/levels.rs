@@ -5,7 +5,7 @@
 use crate::{
     Options,
     emit::Style,
-    lints::{CommandLine, Level},
+    lints::{CommandLine, Level, LintOptions},
     lower::mutable_ref_binding::BUILT_ON,
     model,
     tests::{Mode, checked, checked_with, compiletest, normalized, ui_with},
@@ -885,13 +885,16 @@ fn command_line_flags_in_order() {
     .map(str::to_owned)
     .collect();
     let expected = CommandLine {
-        opts: vec![
-            ("unused".to_owned(), Level::Allow),
-            ("dead_code".to_owned(), Level::Warn),
-            ("warnings".to_owned(), Level::Deny),
-            ("unsafe_code".to_owned(), Level::Forbid),
-            ("clippy::all".to_owned(), Level::ForceWarn),
-        ],
+        lints: LintOptions {
+            opts: vec![
+                ("unused".to_owned(), Level::Allow),
+                ("dead_code".to_owned(), Level::Warn),
+                ("warnings".to_owned(), Level::Deny),
+                ("unsafe_code".to_owned(), Level::Forbid),
+                ("clippy::all".to_owned(), Level::ForceWarn),
+            ],
+            cap: None,
+        },
         ..CommandLine::default()
     };
     assert_eq!(CommandLine::parse(&args), Ok(expected));
@@ -903,7 +906,7 @@ fn command_line_errors() {
         let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
         CommandLine::parse(&args)
     };
-    assert_eq!(parse(&["--cap-lints", "warn"]).map(|it| it.cap), Ok(Some(Level::Warn)));
+    assert_eq!(parse(&["--cap-lints", "warn"]).map(|it| it.lints.cap), Ok(Some(Level::Warn)));
     assert_eq!(
         parse(&["--cap-lints", "warn", "--cap-lints=allow"]),
         Err("Option 'cap-lints' given more than once".to_owned())

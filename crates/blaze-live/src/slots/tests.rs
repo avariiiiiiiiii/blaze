@@ -560,6 +560,27 @@ fn a_bad_patch_is_declined_before_anything_is_written() {
     assert!(switch.memory.frames.is_empty() && switch.memory.functions.is_empty());
 }
 
+/// Data the image doesn't have, after data it has and code: refused with none of it written,
+/// where the platform's own check of each span as it writes would have written the first.
+#[test]
+fn data_outside_the_image_is_refused_before_any_write() {
+    let program = Program::new();
+    let outside = program.data_at(8)..program.data_at(16);
+    let fake = Fake { write_code: true, outside: Some(outside), ..Fake::default() };
+    let mut switch = program.switch_with(fake, FIRST_GENERATION).expect("a switch");
+    let mut bad = patch(1, 0, vec![(0, unslid(address(two)))]);
+    bad.code = vec![(unslid(program.code_at(0)), vec![1; 8])];
+    bad.data = vec![(unslid(program.data_at(0)), vec![1; 8]), (unslid(program.data_at(8)), vec![1; 8])];
+    let (outcome, _) = switch.handle(Message::Patch(bad));
+    assert!(
+        matches!(&outcome, Outcome::Declined { why, .. } if why.contains("outside the image")),
+        "{outcome}"
+    );
+    assert!(program.code.iter().chain(program.data.iter()).all(|it| *it == 0));
+    assert_eq!(switch.memory.published, 0);
+    assert_eq!(program.calls(), (1, 2));
+}
+
 #[test]
 fn the_last_generations_are_kept() {
     let program = Program::new();

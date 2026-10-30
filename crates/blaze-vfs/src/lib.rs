@@ -275,6 +275,7 @@ impl Vfs {
     /// Tags it asks with are `tags..tags + 2^32`.
     pub fn recover(journal: FileName, tags: u64, bytes: &[u8]) -> (Vfs, Recovered) {
         let Loaded { tree, heads, journal, found } = Journal::recover(journal, tags, bytes);
+        // alloc: empty, allocates nothing; once per process.
         (Vfs { tree, heads, views: Vec::new(), journal, disks: disk::Disks::default() }, found)
     }
 
@@ -294,6 +295,7 @@ impl Vfs {
     /// Every head and its root, by name.
     pub fn heads(&self) -> Vec<(&str, ContentId)> {
         let mut heads: Vec<(&str, ContentId)> =
+            // alloc: the listing is the output.
             self.heads.iter().map(|(name, root)| (&**name, self.tree.id(*root))).collect();
         heads.sort_unstable();
         heads
@@ -334,7 +336,12 @@ impl Vfs {
         };
         let root = self.tree.apply(at, &ops)?;
         self.tree.reclaim();
-        self.heads.insert(head.into(), root);
+        match self.heads.get_mut(head) {
+            Some(node) => *node = root,
+            None => {
+                self.heads.insert(head.into(), root);
+            }
+        }
         let ticket = self.journal.record_head(&self.tree, head, root);
         Ok(Commit { root: self.tree.id(root), rebased, ticket })
     }
@@ -415,7 +422,9 @@ impl Vfs {
         let entries = self.tree.entries(node)?;
         Some(
             (0..entries.len())
+                // alloc: the listing is the output, its names owned (the API's type).
                 .map(|at| (self.tree.name_str(entries.get(at).0).to_owned(), entries.is_dir(at)))
+                // alloc: the listing is the output, sized by the iterator.
                 .collect(),
         )
     }
@@ -449,9 +458,12 @@ impl Vfs {
     /// nodes kept at once; the old ones are freed once no reader pinned before is still
     /// reading them. The next flush also rewrites the journal as just what the heads reach.
     pub fn collect(&mut self, keep: &[ContentId]) {
+        // alloc: once per collection, the heads' names.
         let names: Vec<Box<str>> = self.heads.keys().cloned().collect();
         let views: Vec<usize> =
+            // alloc: once per collection, the open views.
             (0..self.views.len()).filter(|&at| self.views[at].is_some()).collect();
+        // alloc: once per collection, the live roots.
         let mut live: Vec<NodeId> = names.iter().map(|name| self.heads[name]).collect();
         live.extend(views.iter().map(|&at| self.views[at].expect("an open view")));
         live.extend(keep.iter().filter_map(|root| self.tree.node(root)));

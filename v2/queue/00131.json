@@ -1,0 +1,21 @@
+{
+  "id": "00131",
+  "from_lane": "speed-types-probe",
+  "owner": "format",
+  "paths": [],
+  "what": "## format (hir-def): a name index on `TraitItems` and `ImplItems` (open, from items-hirty)\n\nWith items sorted by name in `TraitItems`/`ImplItems` (plus the declaration order kept for\nthe first-of-a-name rule), `trait_value_items` would not need to sort per crate and\n`impl_value_item` could binary-search instead of scanning. Not required by anything here.\n\n> forwarded to format: `TraitItems`/`ImplItems` are in format's hir-def files.",
+  "state": "open",
+  "created": "2026-10-30T01:24:42Z",
+  "updated": "2026-10-30T01:24:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed-types-probe.md#format (hir-def): a name index on `TraitItems` and `ImplItems` (open, from items-hirty)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-types-probe.md:12"
+    }
+  ]
+}

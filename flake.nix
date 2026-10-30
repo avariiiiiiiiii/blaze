@@ -36,7 +36,7 @@
         # crates/hir-ty-codegen/llvm.json pins it: LLVM 23.1.4, built for each target by
         # .github/scripts/llvm.py (the llvm workflow) and fetched here by its sha256. Its static libraries, headers, llvm-config,
         # llvm-dwarfdump and llvm-pdbutil; LLVM_SYS_231_PREFIX names it, and
-        # crates/hir-ty-codegen/build.rs links it statically and refuses any other. Its tools were
+        # vendor/llvm-sys links it statically, and its build script (pin.rs) refuses any other. Its tools were
         # built on Ubuntu 22.04 with the C++ runtime linked in: on Linux they are pointed at the
         # store's libc.
         llvmPin = builtins.fromJSON (builtins.readFile ./crates/hir-ty-codegen/llvm.json);

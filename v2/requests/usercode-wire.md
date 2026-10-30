@@ -95,6 +95,8 @@ Why: frontend-tokens item 2. Until then, expansions pay for the JSON `FlatTree` 
 
 > forwarded to the coordinator (`vendor/proc-macro-srv/`) (from requests, pass 16; on requests' coordinator list).
 
+> applied (selfbuild-srv): the CLI is built on `crates/proc-macro-api` and `crates/proc-macro-srv` (`crates/proc-macro-srv-cli/src/main_loop.rs`) and reports version 8. `ExpandMacroWire` is handled in both protocols: the sites by `WireSpan::resolve(&mut raw_part)`, the input and then (with `has_attributes`) the attribute by `TokenStream::read_wire` at the byte the first read ended, in a scratch buffer the connection keeps; bytes left after the last tree are refused. The output is written by `TokenStream::write_wire(call_site, ..)` into a buffer that is taken back after each answer is written. The bidirectional answer is `ExpandMacroWireResponse` with what the macro tracked, the JSON one `Response::ExpandMacroWire`. Sub-requests are asked on the same connection, every answered span checked by `raw_part` and `start <= end`. Not built.
+
 ## 5. frontend-tokens (`crates/tt/`): two small exports (optional)
 
 What: (a) a `pub const` for the longest literal suffix a node holds (`u32::MAX >> 14` bytes),

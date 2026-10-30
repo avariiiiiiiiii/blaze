@@ -220,6 +220,24 @@ fn some<T>(pairs: Vec<T>) -> Vec<T> {
 // region: node_ext
 
 #[test]
+fn an_untyped_parse_keeps_its_tree_and_casts_as_the_handle_does() {
+    let parse = SourceFile::parse(SOURCE, Edition::CURRENT);
+    let errors = parse.errors();
+    let handle = parse.syntax_node();
+    let untyped = parse.into_untyped();
+    assert_eq!(
+        hn(&ast::SourceFile::cast(handle.clone()).unwrap()),
+        vn(&view::SourceFile::cast(untyped.root()).unwrap())
+    );
+    assert_eq!(untyped.errors(), errors);
+    let other = SourceFile::parse(SOURCE, Edition::CURRENT).into_untyped();
+    assert!(other.cast_view::<ast::Fn>().is_none());
+    let file = untyped.cast_view::<ast::SourceFile>().expect("the root is a source file");
+    assert_eq!(file.syntax_node(), handle);
+    assert_eq!(vn(&file.view()), hn(&ast::SourceFile::cast(handle).unwrap()));
+}
+
+#[test]
 fn either_and_macro_pointers_view_their_nodes() {
     let f = Fixture::source();
     type Handle = either::Either<ast::Fn, ast::Struct>;

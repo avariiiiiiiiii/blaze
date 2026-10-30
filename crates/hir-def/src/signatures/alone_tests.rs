@@ -255,7 +255,7 @@ fn of_is_the_lowering_with_the_source_map() {
             let of = $Sig::of(&$db, id);
             let (with_map, map) = $Sig::with_source_map(&$db, id);
             assert_eq!(*of, **with_map, "{id:?}: `of` and `with_source_map`");
-            let source = id.lookup(&$db).source(&$db);
+            let source = id.lookup(&$db).source_view(&$db);
             let lowering = BodyLowering::SourceMap { blocks: of.store.block_scopes() };
             let (file, file_map) = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |_| {
                 $Sig::lower(&$db, id, source, None, lowering)

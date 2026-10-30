@@ -16,6 +16,7 @@ use super::{Body, Hashes};
 pub(crate) struct ById;
 
 fn by_id(domain: &'static str, what: impl std::fmt::Debug) -> ContentId {
+    // alloc: the tests' hash source, which no real build uses
     ContentId::of(domain, format!("{what:?}").as_bytes())
 }
 
@@ -52,6 +53,6 @@ impl Hashes for ById {
     }
 
     fn file_name(&self, _: &Db, file: base_db::FileId) -> Result<String, String> {
-        Ok(format!("{file:?}"))
+        Ok(format!("{file:?}")) // alloc: the tests' hash source, which no real build uses
     }
 }

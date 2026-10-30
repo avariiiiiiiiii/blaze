@@ -508,6 +508,10 @@ impl<'db> Printer<'_, 'db> {
                     None => format!("{call} -> {};", self.unwind(*cleanup, in_cleanup)),
                 }
             }
+            TerminatorKind::TailCall { func, args, .. } => {
+                // alloc: printing MIR for people, the edge
+                format!("tailcall {}({});", self.callee(func), self.operands(args))
+            }
             TerminatorKind::Assert { cond, expected, msg, target, cleanup } => {
                 let cond = match expected {
                     true => self.operand(cond),

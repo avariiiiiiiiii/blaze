@@ -6,7 +6,6 @@ use std::{
 use base_db::{Crate, Db, Env};
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
-use hir::Semantics;
 use hir_def::deps::{self as deps, ImageBuf, ImageStore};
 use hir_ty_borrowck::Mode;
 use rustc_hash::FxHashMap;
@@ -257,9 +256,8 @@ fn checked_with(
         .map(|(file, path)| (file.file_id(&db), format!("{dir}/{path}")))
         .collect();
     let diags = hir::attach_db(&db, || {
-        let sema = Semantics::new(&db);
         let lib = hir::Crate::from(crate_named(&db, "lib"));
-        crate::check::check_crate_with(&sema, lib, Files::new(&names, root), &Options::default())
+        crate::check::check_crate(&db, lib, Files::new(&names, root), &Options::default())
     });
     (db, names, diags)
 }

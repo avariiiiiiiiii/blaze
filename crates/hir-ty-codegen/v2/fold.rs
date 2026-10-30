@@ -38,6 +38,7 @@ use cranelift_codegen::{
     cursor::{Cursor as _, FuncCursor},
     ir::{self, InstBuilder as _, InstructionData, Opcode},
 };
+use smallvec::SmallVec;
 
 use super::{DataPlace, Function};
 use crate::{DataIdentity, fragment::DataRequest};
@@ -72,6 +73,7 @@ pub(crate) fn masked(function: &Function, refs: &Refs) -> Option<Masked> {
 pub(crate) fn masked_ir(func: &ir::Function, names: Names<'_>) -> Option<Masked> {
     WORDS.with_borrow_mut(|words| {
         let size = canon(func, names, words)?;
+        // clone: what it returns; the thread's buffer stays for the next walk
         Some(Masked { shape: shape(&words.bytes), constants: words.constants.clone(), size })
     })
 }
@@ -118,7 +120,15 @@ impl Names<'_> {
 /// A data request's content: what it points at by target, so equal IDs in two functions are
 /// one object whatever their places.
 fn data(function: &Function, refs: &Refs, index: usize) -> Option<ContentId> {
-    data_of(function, refs, index, &mut Vec::new())
+    KNOWN.with_borrow_mut(|known| {
+        known.clear();
+        data_of(function, refs, index, known)
+    })
+}
+
+thread_local! {
+    /// [`data_of`]'s `known`, one per thread and reused.
+    static KNOWN: RefCell<Vec<Option<ContentId>>> = RefCell::default();
 }
 
 /// [`data`], with `known[i]` request `i`'s content once hashed: an object many others point
@@ -233,6 +243,7 @@ thread_local! {
 }
 
 fn shape(bytes: &[u8]) -> Vec<u8> {
+    // alloc: the 32 bytes `Masked::shape` holds, once a function
     Hasher::new(FOLD_IR_DOMAIN).update(bytes).finish().0.to_vec()
 }
 
@@ -241,7 +252,9 @@ fn walk(func: &ir::Function, names: Names<'_>) -> Option<Walk> {
     WORDS.with_borrow_mut(|words| {
         let size = canon(func, names, words)?;
         let masked =
+            // clone: what it returns; the thread's buffer stays for the next walk
             Masked { shape: shape(&words.bytes), constants: words.constants.clone(), size };
+        // clone: as `constants`
         Some(Walk { masked, sites: words.sites.clone() })
     })
 }
@@ -642,6 +655,7 @@ impl Canon<'_> {
             self.plain(name);
             return Some(false);
         };
+        // clone: two `u32`s; cranelift's `UserExternalName` is not `Copy`
         let constant = match self.names.of(self.func.params.user_named_funcs()[*user].clone())? {
             Name::Place(place) => Constant::Place(place),
             Name::Data(id) => Constant::Data(id),
@@ -683,6 +697,7 @@ pub(crate) fn build(
         || members.len() != group.members.len()
         || members.len() != group.constants.len()
     {
+        // alloc: an error
         return Err(format!(
             "{} functions given for a group of {}",
             members.len(),
@@ -693,6 +708,7 @@ pub(crate) fn build(
         .iter()
         .enumerate()
         .map(|(at, (func, names, _))| {
+            // alloc: an error
             walk(func, *names).ok_or_else(|| format!("member {at} has no masked form"))
         })
         .collect::<Result<Vec<Walk>, String>>()?;
@@ -701,6 +717,7 @@ pub(crate) fn build(
         if walk.masked.shape != first.masked.shape
             || walk.masked.constants.len() != first.masked.constants.len()
         {
+            // alloc: an error
             return Err(format!("member {at}'s masked IR is not the first's"));
         }
         let mut varying = group.varying.iter().zip(&group.constants[at]).peekable();
@@ -709,6 +726,7 @@ pub(crate) fn build(
         {
             if let Some((_, &value)) = varying.next_if(|it| *it.0 as usize == index) {
                 if mine != value {
+                    // alloc: an error
                     let what = format!("member {at}'s constant {index} is {mine:?}, not {value:?}");
                     return Err(what);
                 }
@@ -722,10 +740,12 @@ pub(crate) fn build(
                 (mine, firsts) => mine == firsts,
             };
             if !equal {
+                // alloc: an error
                 return Err(format!("member {at}'s constant {index} varies, but is no parameter"));
             }
         }
         if varying.next().is_some() {
+            // alloc: an error
             return Err(format!("the group's varying constants are not among member {at}'s"));
         }
     }
@@ -740,7 +760,7 @@ pub(crate) fn build(
                 Site::Func(_) | Site::Global(_) => pointer,
             }
         })
-        .collect::<Vec<ir::Type>>();
+        .collect::<SmallVec<[ir::Type; 8]>>();
     let body = body(source, first, group, &reads, &types)?;
     let thunks = members
         .iter()
@@ -760,17 +780,19 @@ fn body(
     reads: &[u32],
     types: &[ir::Type],
 ) -> Result<ir::Function, String> {
+    // clone: the body is the first member's IR, rewritten; the member keeps its own
     let mut body = source.clone();
     let entry = body.layout.entry_block().ok_or("the first member has no body")?;
-    let params: Vec<ir::Value> = types
+    let params = types
         .iter()
         .map(|&ty| {
             body.signature.params.push(ir::AbiParam::new(ty));
             body.dfg.append_block_param(entry, ty)
         })
-        .collect();
+        .collect::<SmallVec<[ir::Value; 8]>>();
     // A varying function's or global value's parameter, found in one pass over the body.
-    let (mut funcs, mut globals) = (Vec::new(), Vec::new());
+    let mut funcs: SmallVec<[(ir::FuncRef, ir::Value); 4]> = SmallVec::new();
+    let mut globals: SmallVec<[(ir::GlobalValue, ir::Value); 4]> = SmallVec::new();
     for (&at, &param) in group.varying.iter().zip(reads) {
         let param = params[param as usize];
         match walk.sites[at as usize] {
@@ -784,6 +806,7 @@ fn body(
     }
     let func_param = |callee| funcs.iter().find(|it: &&(ir::FuncRef, ir::Value)| it.0 == callee);
     let insts: Vec<ir::Inst> =
+        // alloc: the body's instructions, listed before it is rewritten in place; once a group
         body.layout.blocks().flat_map(|block| body.layout.block_insts(block)).collect();
     for inst in insts {
         let data = body.dfg.insts[inst];
@@ -796,17 +819,18 @@ fn body(
             InstructionData::Call { opcode, func_ref, .. } => {
                 let Some(&(_, param)) = func_param(func_ref) else { continue };
                 let sig = body.dfg.ext_funcs[func_ref].signature;
-                let args = body.dfg.inst_args(inst).to_vec();
+                let args = SmallVec::<[ir::Value; 8]>::from_slice(body.dfg.inst_args(inst));
                 match opcode {
-                    Opcode::Call => body.replace(inst).call_indirect(sig, param, &args),
-                    Opcode::ReturnCall => body.replace(inst).return_call_indirect(sig, param, &args),
+                    Opcode::Call => body.replace(inst).call_indirect(sig, param, &args[..]),
+                    Opcode::ReturnCall => body.replace(inst).return_call_indirect(sig, param, &args[..]),
+                    // alloc: an error
                     other => return Err(format!("{other} of a varying function")),
                 };
             }
             InstructionData::TryCall { func_ref, exception, .. } => {
                 let Some(&(_, param)) = func_param(func_ref) else { continue };
-                let args = body.dfg.inst_args(inst).to_vec();
-                body.replace(inst).try_call_indirect(param, &args, exception);
+                let args = SmallVec::<[ir::Value; 8]>::from_slice(body.dfg.inst_args(inst));
+                body.replace(inst).try_call_indirect(param, &args[..], exception);
             }
             InstructionData::UnaryGlobalValue { global_value, .. } => {
                 if let Some(&(_, param)) = globals.iter().find(|it| it.0 == global_value) {
@@ -824,6 +848,7 @@ fn alias(func: &mut ir::Function, inst: ir::Inst, param: ir::Value) -> Result<()
     let result = func.dfg.first_result(inst);
     let (was, now) = (func.dfg.value_type(result), func.dfg.value_type(param));
     if was != now {
+        // alloc: an error
         return Err(format!("a constant of type {was} would be read from a parameter of {now}"));
     }
     func.layout.remove_inst(inst);
@@ -836,9 +861,11 @@ fn alias(func: &mut ir::Function, inst: ir::Inst, param: ir::Value) -> Result<()
 fn copied(from: &ir::Function, name: &ir::ExternalName, to: &mut ir::Function) -> ir::ExternalName {
     match name {
         ir::ExternalName::User(user) => {
+            // clone: two `u32`s; cranelift's `UserExternalName` is not `Copy`
             let user = from.params.user_named_funcs()[*user].clone();
             ir::ExternalName::user(to.declare_imported_user_function(user))
         }
+        // clone: `to` owns its names; a libcall's or known symbol's is a tag, a test case's text
         other => other.clone(),
     }
 }
@@ -865,6 +892,7 @@ fn thunk(
     pointer: ir::Type,
 ) -> Result<ir::Function, String> {
     let mut thunk =
+        // clone: the thunk is a function of its own with the member's name and signature
         ir::Function::with_name_signature(member.name.clone(), member.signature.clone());
     let mut made = Vec::with_capacity(params as usize);
     for param in 0..params {
@@ -879,6 +907,7 @@ fn thunk(
             (Site::Func(callee), Constant::Place(_)) => {
                 let data = &member.dfg.ext_funcs[callee];
                 let signature =
+                    // clone: the thunk owns the signatures it imports
                     thunk.import_signature(member.dfg.signatures[data.signature].clone());
                 let name = copied(member, &data.name, &mut thunk);
                 let colocated = data.colocated;
@@ -893,6 +922,7 @@ fn thunk(
                 let ir::GlobalValueData::Symbol { ref name, offset, colocated, tls } =
                     member.global_values[global]
                 else {
+                    // alloc: an error
                     return Err(format!("varying global value {global} is not a symbol"));
                 };
                 let name = copied(member, name, &mut thunk);
@@ -900,10 +930,12 @@ fn thunk(
                 Made::Global { global: thunk.create_global_value(data), tls }
             }
             (site, constant) => {
+                // alloc: an error
                 return Err(format!("{constant:?} is not what {site:?} of the member makes"));
             }
         });
     }
+    // clone: the thunk owns the signatures it imports
     let signature = thunk.import_signature(body.clone());
     let name = thunk.declare_imported_user_function(ir::UserExternalName::new(BODY, 0));
     let callee = thunk.import_function(ir::ExtFuncData {
@@ -914,12 +946,8 @@ fn thunk(
     });
     let block = thunk.dfg.make_block();
     thunk.layout.append_block(block);
-    let mut args: Vec<ir::Value> = member
-        .signature
-        .params
-        .iter()
-        .map(|it| thunk.dfg.append_block_param(block, it.value_type))
-        .collect();
+    let mut args: Vec<ir::Value> = Vec::with_capacity(member.signature.params.len() + made.len());
+    args.extend(member.signature.params.iter().map(|it| thunk.dfg.append_block_param(block, it.value_type)));
     let mut cursor = FuncCursor::new(&mut thunk).at_bottom(block);
     for it in made {
         args.push(match it {
@@ -932,8 +960,8 @@ fn thunk(
         });
     }
     let call = cursor.ins().call(callee, &args);
-    let results = cursor.func.dfg.inst_results(call).to_vec();
-    cursor.ins().return_(&results);
+    let results = SmallVec::<[ir::Value; 8]>::from_slice(cursor.func.dfg.inst_results(call));
+    cursor.ins().return_(&results[..]);
     Ok(thunk)
 }
 
@@ -953,16 +981,19 @@ pub(crate) fn merge(
     let fail = |what: String| CodegenError {
         unit: key,
         item: first.item,
+        // alloc: an error
         what: format!("folding {} functions into one body: {what}", group.members.len()),
     };
     for (at, (unit, ..)) in members.iter().enumerate() {
         if group.members.get(at) != Some(&unit.instance.key()) {
+            // alloc: an error
             return Err(fail(format!("member {at} is not the group's")));
         }
     }
     let mut sources: Vec<Member<'_>> = Vec::with_capacity(members.len());
     for (at, &(_, _, prepared, refs)) in members.iter().enumerate() {
         let Some(func) = prepared.ir() else {
+            // alloc: an error
             return Err(fail(format!("member {at} is assembly, which has no IR to fold")));
         };
         sources.push((func, Names::Of(prepared, refs), refs));
@@ -972,7 +1003,8 @@ pub(crate) fn merge(
     let mut body = emit(unit, spec, prepared, body, refs)?;
     body.function.key = key;
     // Each thunk's references are `Group::thunk_refs` of its member's.
-    let mut own: Vec<Target> = Vec::new();
+    let most = members.iter().map(|it| it.3.len()).max().unwrap_or(0);
+    let mut own: Vec<Target> = Vec::with_capacity(most + 1);
     let mut emitted = Vec::with_capacity(members.len());
     for (&(unit, spec, prepared, refs), thunk) in members.iter().zip(thunks) {
         own.clear();

@@ -161,6 +161,7 @@ impl Finder<'_> {
                 _ => false,
             };
             if !root && !self.rejected.contains_key(callee) && !in_store(callee) {
+                // clone: a few `u32` ids, nothing on the heap; kept for the next wave
                 found.instances.push((callee.clone(), homes.home(db, callee, asked)));
             }
         }
@@ -188,17 +189,18 @@ fn shares(pending: &Pending) -> std::result::Result<(), &'static str> {
 /// What the code of a function in a unit can call: what it calls that it does not import,
 /// the same of what it imports, and every function it takes the address of. What it imports
 /// and LLVM leaves a call of is kept by the unit ([`llvm::emit_unit`]); a root, which is
-/// called by its symbol, is called.
-fn calls_after_imports<'f>(
+/// called by its symbol, is called. `found` is given them.
+fn calls_after_imports<R>(
     db: &Db,
     pending: &Pending,
-    frame: &'f Frame,
-) -> Vec<FuncRequest, &'f Frame> {
+    frame: &Frame,
+    found: impl FnOnce(&[&FuncRequest]) -> R,
+) -> R {
     let (Ok(isa), Ok(target)) = (super::target(), super::selected_target()) else {
         let all = &pending.wants.requests.funcs;
         let mut calls = Vec::with_capacity_in(all.len(), frame);
-        calls.extend(all.iter().cloned());
-        return calls;
+        calls.extend(all.iter());
+        return found(&calls);
     };
     // alloc: the import recorder's tables, per unit
     let mut recorder = Recorder::new(db, &**isa, target, false);
@@ -301,8 +303,8 @@ fn calls_after_imports<'f>(
         blaze_ids::radix::sort_copy_by_key_in(&mut sorted, |&it| it, scratch);
     });
     let mut calls = Vec::with_capacity_in(sorted.len(), frame);
-    calls.extend(sorted.iter().map(|&at| requests.funcs[at as usize].clone()));
-    calls
+    calls.extend(sorted.iter().map(|&at| &requests.funcs[at as usize]));
+    found(&calls)
 }
 
 impl<'a, 'db> ObjectCodegen<'a, 'db> {
@@ -318,9 +320,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             instances: std::mem::take(&mut self.ahead),
             roots: std::mem::take(&mut self.unit_tried),
         };
+        // alloc: once per build, the first wave
         let mut wave = Vec::new();
+        // alloc: once per build, the roots the first wave is found from
         tried.add(self.symbols, Found { instances, roots: roots.to_vec() }, &mut wave);
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+        // clone: an `Arc`, once per build, shared with the threads
         let told = self.tells_variables().then(|| self.told.clone());
         let entries = self.entries.as_deref();
         let ctx = Context {
@@ -333,6 +338,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             told: told.as_ref(),
         };
         let stats = std::env::var_os("BLAZE_STATS").is_some();
+        // alloc: once per build, every function's outcome
         let mut codes = Vec::new();
         while !wave.is_empty() {
             let began = stdx::time::Instant::now();
@@ -352,6 +358,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 );
             }
             tried = round.tried;
+            // alloc: once per round, a handful per build
             wave = Vec::new();
             blaze_ids::radix::sort_by_key(&mut round.done, |it| it.0);
             for (_, outcomes, found) in round.done {
@@ -362,6 +369,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         (self.ahead, self.unit_tried) = (tried.instances, tried.roots);
         // A function's own code first, then what was kept of it as an import, in the order
         // the units were cut in, the first kept.
+        // alloc: once per build, the imports units kept
         let mut kept = Vec::new();
         for (kind, outcome) in codes {
             match (kind, outcome) {
@@ -403,6 +411,7 @@ impl Tried {
             }
         }
         for it in found.instances {
+            // clone: a few `u32` ids, nothing on the heap; once per function found
             if self.instances.insert(it.clone()) {
                 wave.push(Kind::Instance(it.0, it.1));
             }
@@ -440,14 +449,17 @@ impl Round {
         Round {
             tried,
             threads,
+            // alloc: once per round, a slot for each function of the first wave
             built: wave.iter().map(|_| None).collect(),
             wave,
             taken: 0,
             building: 0,
+            // alloc: a unit's members, which its job takes; empty until the first is cut in
             unit: Vec::new(),
             filled: 0,
             jobs: BinaryHeap::new(),
             queued: 0,
+            // alloc: once per round, what became of its jobs
             done: Vec::new(),
             functions: 0,
             waves: 0,
@@ -462,6 +474,7 @@ impl Round {
     fn found(&mut self, symbols: &dyn SymbolResolver) {
         let wave = std::mem::take(&mut self.wave);
         let built = std::mem::take(&mut self.built);
+        // alloc: once per wave, the next one
         let mut next = Vec::new();
         self.waves += 1;
         for (kind, built) in std::iter::zip(wave, built) {
@@ -473,6 +486,7 @@ impl Round {
             let unit = std::mem::take(&mut self.unit);
             self.queue(Job::Unit(unit));
         }
+        // alloc: once per wave, a slot for each of its functions
         self.built = next.iter().map(|_| None).collect();
         (self.wave, self.taken) = (next, 0);
     }
@@ -502,6 +516,7 @@ impl Round {
         self.size += size;
         // Too large to optimize, it would leave the rest of its unit unoptimized.
         if size > super::LARGE {
+            // alloc: a unit's members, here its one, as every unit owns them
             return self.queue(Job::Unit(vec![Built { kind, pending }]));
         }
         self.filled += size;
@@ -572,6 +587,7 @@ impl Context<'_> {
         // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
     ) {
+        // clone: once per thread per round, setup; `StableNames::new` takes the set by value
         let names = stable::StableNames::new(db, symbols, self.owned.clone(), self.hydrate);
         let mut homes = home::Homes::default();
         let lock = || round.lock().unwrap_or_else(|e| e.into_inner());
@@ -579,6 +595,7 @@ impl Context<'_> {
         loop {
             if state.taken < state.wave.len() {
                 let at = state.taken;
+                // clone: a few `u32` ids, nothing on the heap; read once the lock is let go
                 let kind = state.wave[at].clone();
                 (state.taken, state.building) = (at + 1, state.building + 1);
                 drop(state);
@@ -648,6 +665,7 @@ impl Context<'_> {
                 (!in_store).then(|| tier::for_build(|| super::root_code(db, *root, true)))
             }
             Kind::Instance(instance, env) => Some(tier::for_build(|| {
+                // clone: the query takes them by value; a few `u32` ids, nothing on the heap
                 super::instance_code(db, instance.clone(), env.clone(), Detach::Unit, None)
             })),
         };
@@ -655,13 +673,15 @@ impl Context<'_> {
         match &produced {
             None => {}
             Some(Ok(Produced::Pending(pending))) if shares(pending).is_ok() => {
-                let calls = calls_after_imports(db, pending, frame);
-                self.finder.find(db, symbols, names, homes, &calls, &mut found);
+                calls_after_imports(db, pending, frame, |calls| {
+                    self.finder.find(db, symbols, names, homes, calls.iter().copied(), &mut found)
+                });
             }
             Some(_) => {
                 let compiled = match kind {
                     Kind::Root(root) => compiled_root(db, *root),
                     Kind::Instance(instance, env) => {
+                        // clone: the query takes them by value; a few `u32` ids, nothing on the heap
                         compiled_instance(db, instance.clone(), env.clone())
                     }
                 };
@@ -686,6 +706,7 @@ impl Context<'_> {
     ) -> (Vec<(Kind, Outcome)>, Found) {
         let outcomes = match job {
             Job::Unit(members) => unit(db, members),
+            // alloc: once per function compiled alone, the outcomes every job returns
             Job::Alone(kind) => vec![(kind, Outcome::Alone)],
         };
         let mut found = Found::default();
@@ -700,8 +721,10 @@ impl Context<'_> {
                 }
                 (Outcome::Alone, Kind::Instance(instance, env)) => {
                     if self.told.is_some() {
+                        // clone: the query takes them by value; a few `u32` ids, nothing on the heap
                         instance_rows(db, instance.clone(), env.clone());
                     }
+                    // clone: the query takes them by value; a few `u32` ids, nothing on the heap
                     compiled_instance(db, instance.clone(), env.clone()).as_ref().ok()
                 }
             };
@@ -742,6 +765,7 @@ fn unit(db: &Db, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
     let tally = Tally::global();
     let alone = |members: Vec<Built>, why: &str| {
         tally.alone(why, members.len());
+        // alloc: a unit that could not be compiled, whose members are compiled alone
         members.into_iter().map(|it| (it.kind, Outcome::Alone)).collect::<Vec<_>>()
     };
     let (Ok(isa), Ok(target)) = (super::target(), super::selected_target()) else {
@@ -763,6 +787,7 @@ fn unit(db: &Db, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
                 let Ok(env) = env else { return alone(members, "a root without a body") };
                 (root_instance(db, *root), env)
             }
+            // clone: a few `u32` ids, nothing on the heap; once per member of a unit
             Kind::Instance(instance, env) => (instance.clone(), env.clone()),
         };
         let known = recorder.requests.funcs.iter().position(|it| {
@@ -772,6 +797,7 @@ fn unit(db: &Db, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
         let request = match known {
             Some(at) => at as u32,
             None => {
+                // clone: a few `u32` ids, nothing on the heap; `defined` keeps the instance
                 let target = FuncTarget::Instance(instance.clone(), env);
                 recorder.func(target, &func.signature).as_u32()
             }
@@ -789,6 +815,7 @@ fn unit(db: &Db, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
             pointees: &member.pending.wants.pointees,
             request: *request,
         })
+        // alloc: once per unit, sized exactly, the members LLVM is given
         .collect();
     let start = stdx::time::Instant::now();
     let emitted = llvm::emit_unit(&mut recorder.wants, &compiled, optimization, &chosen);
@@ -796,6 +823,7 @@ fn unit(db: &Db, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
     drop(compiled);
     let llvm::Unit { members: codes, kept } = match emitted {
         Ok(unit) => unit,
+        // alloc: the error's message
         Err(why) => return alone(members, &why.to_string()),
     };
     tally.unit(members.len());
@@ -804,15 +832,16 @@ fn unit(db: &Db, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
     let kept: Vec<(Kind, Outcome)> = kept
         .into_iter()
         .filter_map(|(id, code)| {
-            let FuncTarget::Instance(instance, env) =
-                recorder.requests.funcs[id as usize].target.clone()
+            let FuncTarget::Instance(instance, env) = &recorder.requests.funcs[id as usize].target
             else {
                 return None;
             };
             // A root is a function of its own, called by its symbol.
-            if root_like(&instance) {
+            if root_like(instance) {
                 return None;
             }
+            // clone: a few `u32` ids, nothing on the heap; once per import a unit kept
+            let (instance, env) = (instance.clone(), env.clone());
             let mut code = backend::pad(code.ok()?).ok()?;
             code.lines.clear();
             code.slots = Default::default();
@@ -824,20 +853,24 @@ fn unit(db: &Db, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
                 source: None,
                 closure: None,
                 variables: None,
+                // alloc: empty, allocates nothing
                 layouts: Vec::new(),
             };
             Some((Kind::Instance(instance, env), Outcome::Kept(compiled)))
         })
+        // alloc: once per unit, the imports it kept
         .collect();
     let mut outcomes: Vec<(Kind, Outcome)> = std::iter::zip(members, codes)
         .map(|(member, code)| {
             let code = match code.map(backend::pad) {
                 Ok(Ok(code)) => code,
                 Ok(Err(why)) => {
+                    // alloc: the error's message
                     tally.alone(&why.to_string(), 1);
                     return (member.kind, Outcome::Alone);
                 }
                 Err(why) => {
+                    // alloc: the error's message
                     tally.alone(&why.to_string(), 1);
                     return (member.kind, Outcome::Alone);
                 }
@@ -850,6 +883,7 @@ fn unit(db: &Db, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
             let compiled = CompiledFunction { requests, code, source, closure, variables, layouts };
             (member.kind, Outcome::Code(compiled))
         })
+        // alloc: once per unit, what became of each member
         .collect();
     outcomes.extend(kept);
     outcomes

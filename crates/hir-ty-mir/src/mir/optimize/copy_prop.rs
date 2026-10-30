@@ -89,7 +89,7 @@ fn ssa_locals<'f, 'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, frame: &'f Frame
     let preds = frame.alloc_slice_fill_with(body.basic_blocks.len(), |_| 0u32);
     for (_, block) in body.basic_blocks.iter() {
         if let Some(terminator) = &block.terminator {
-            for target in super::successors(&terminator.kind) {
+            for target in terminator.kind.all_successors() {
                 preds[block_index(target)] += 1;
             }
         }

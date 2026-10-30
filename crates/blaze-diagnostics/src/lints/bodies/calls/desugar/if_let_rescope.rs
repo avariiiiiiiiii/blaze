@@ -175,7 +175,7 @@ impl IfLetRescope {
                     util::span(b, then_branch),
                 )
             {
-                if let Some((drop_span, drop_tys)) = FindSignificantDropper { b, drops: &mut drops }.check_if_let_scrutinee(init) {
+                if let Some((drop_span, drop_tys)) = (FindSignificantDropper { b, drops: &mut drops }).check_if_let_scrutinee(init) {
                     let if_let_pat = between(&take_while_parens(b, &expr_span), &init_span);
                     let before_conseq = conseq_span.shrink_to_lo();
                     let lifetime_end = end_point(b, &conseq_span);

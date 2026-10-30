@@ -385,26 +385,14 @@ fn thread_local(conv: CallConv) -> ir::Function {
     })
 }
 
-/// `global_value` of a data symbol (16 bytes in, not colocated) less 8, loaded from at 24,
-/// and of a thread-local.
+/// `symbol_value` of a data symbol (16 bytes in, not colocated) and `tls_value` of a
+/// thread-local.
 fn globals(conv: CallConv) -> ir::Function {
     build(sig(conv, &[], &[I64]), |b, _| {
-        let base = symbol(b, 3, 16, false, false);
-        let less = b.create_global_value(ir::GlobalValueData::IAddImm {
-            base,
-            offset: Imm64::new(-8),
-            global_type: I64,
-        });
-        let flags = b.func.dfg.mem_flags.insert(ir::MemFlagsData::trusted()).expect("flags");
-        let loaded = b.create_global_value(ir::GlobalValueData::Load {
-            base: less,
-            offset: 24.into(),
-            global_type: I64,
-            flags,
-        });
-        let v = b.ins().global_value(I64, loaded);
+        let data = symbol(b, 3, 16, false, false);
+        let v = b.ins().symbol_value(I64, data);
         let tls = symbol(b, 4, 0, false, true);
-        let t = b.ins().global_value(I64, tls);
+        let t = b.ins().tls_value(I64, tls);
         let sum = b.ins().iadd(v, t);
         b.ins().return_(&[sum]);
     })
@@ -765,13 +753,11 @@ fn global_values_are_cranelifts() {
         // The thread-local's is a call.
         assert_eq!(ours.sites.len(), 1);
     }
-    // Static and not colocated: `ldr x16, #8`, `b #12`, the literal at `Abs8`, then
-    // `sub x16, x16, #8` and `ldur x16, [x16, #24]`.
+    // Static and not colocated: `ldr x16, #8`, `b #12`, the literal at `Abs8`.
     let func = globals(CallConv::SystemV);
     let ours = whole(&func, &LINUX_STATIC);
-    let span = ours.span(ir::Opcode::GlobalValue, &func);
+    let span = ours.span(ir::Opcode::SymbolValue, &func);
     assert_eq!(span[..2], [inst::ldr_lit(inst::X16, 8), inst::b(3)]);
-    assert_eq!(span[4..6], [0xd100_2210, inst::ldur(inst::LDRX, inst::X16, inst::X16, 24)]);
     let literal = ours.relocs.iter().find(|reloc| reloc.kind == Reloc::Abs8).expect("an Abs8");
     assert_eq!((literal.name, literal.addend), (Name::User { namespace: 1, index: 3 }, 16));
 }

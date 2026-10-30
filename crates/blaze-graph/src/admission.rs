@@ -198,6 +198,7 @@ mod in_order {
 
 /// The kinds of `by_kind` and their estimates, in order of the kinds' numbers.
 fn sorted(by_kind: &FxHashMap<TaskKind, Estimate>) -> Vec<(TaskKind, Estimate)> {
+    // alloc: once per encoding of the estimates, as the daemon's image is written
     let mut kinds: Vec<(TaskKind, Estimate)> = by_kind.iter().map(|(&k, &e)| (k, e)).collect();
     radix::sort_copy_by_key(&mut kinds, |it| it.0.0);
     kinds

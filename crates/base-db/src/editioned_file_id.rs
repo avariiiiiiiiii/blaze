@@ -43,22 +43,14 @@ impl EditionedFileId {
     // firewall query
     #[salsa::tracked(returns(as_deref))]
     pub fn parse_errors(self, db: &Db) -> Option<Box<[SyntaxError]>> {
-        let errors = self.parse(db).errors();
-        match &*errors {
-            [] => None,
-            [..] => Some(errors.into()),
-        }
+        self.parse(db).errors_exact()
     }
 
     /// The file's syntax errors with every lazy body's: a firewall, so a check of a
     /// dependency parses its bodies for their errors once.
     #[salsa::tracked(returns(as_deref))]
     pub fn parse_errors_with_bodies(self, db: &Db) -> Option<Box<[SyntaxError]>> {
-        let errors = self.parse(db).errors_with_bodies();
-        match &*errors {
-            [] => None,
-            [..] => Some(errors.into()),
-        }
+        self.parse(db).errors_with_bodies_exact()
     }
 }
 

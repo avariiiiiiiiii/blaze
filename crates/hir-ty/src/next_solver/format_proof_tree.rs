@@ -82,20 +82,20 @@ impl<'a, 'db> ProofTreeSerializer<'a, 'db> {
                 match source {
                     CandidateSource::Impl(impl_def_id) => match impl_def_id {
                         AnyImplId::ImplId(impl_def_id) => {
-                            let impl_src = impl_def_id.lookup(db).source(db);
+                            let impl_src = impl_def_id.lookup(db).source_view(db);
                             Some(impl_src.value.to_string()) // alloc: proof-tree dump for display, the edge
                         }
                         AnyImplId::BuiltinDeriveImplId(impl_id) => {
                             let impl_loc = impl_id.loc(db);
                             let adt_src = match impl_loc.adt {
                                 hir_def::AdtId::StructId(adt) => {
-                                    adt.loc(db).source(db).value.to_string() // alloc: proof-tree dump for display, the edge
+                                    adt.loc(db).source_view(db).value.to_string() // alloc: proof-tree dump for display, the edge
                                 }
                                 hir_def::AdtId::UnionId(adt) => {
-                                    adt.loc(db).source(db).value.to_string() // alloc: proof-tree dump for display, the edge
+                                    adt.loc(db).source_view(db).value.to_string() // alloc: proof-tree dump for display, the edge
                                 }
                                 hir_def::AdtId::EnumId(adt) => {
-                                    adt.loc(db).source(db).value.to_string() // alloc: proof-tree dump for display, the edge
+                                    adt.loc(db).source_view(db).value.to_string() // alloc: proof-tree dump for display, the edge
                                 }
                             };
                             Some(format!("#[derive(${})]\n{}", impl_loc.trait_.name(), adt_src)) // alloc: proof-tree dump for display, the edge

@@ -8,10 +8,11 @@ use std::mem;
 
 use hir_def::StaticId;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use super::{
     Address, Allocated, BasicBlockId, Evaluator, Interval, MirBody, MirEvalError, MirSpan,
-    Result, Running, StackFrame, Then,
+    OwnedBytes, Result, Running, StackFrame, Then,
     machine::{EvalThread, Machine},
     not_supported,
     shim::{Resume, TlsData},
@@ -108,7 +109,7 @@ struct Woken {
     joined: Option<EvalThread>,
     /// A pointer to write (`retval` of a join), and the bytes of the call's result.
     pointer: Option<(Address, Address)>,
-    result: Option<(Interval, Vec<u8>)>,
+    result: Option<(Interval, OwnedBytes)>,
     /// The shim's wait to go on with, whether it timed out, and the call's destination.
     shim: Option<(Resume, bool, Interval)>,
 }
@@ -143,16 +144,16 @@ impl<'db> Thread<'db> {
     fn new(run: Run, result_slot: Interval, origin: (&'db MirBody<'db>, MirSpan)) -> Self {
         Thread {
             run,
-            frames: Vec::new(),
+            frames: Vec::new(), // alloc: empty, allocates nothing; one per spawned thread
             block: origin.0.start_block,
-            stack: Vec::new(),
-            stack_allocations: Vec::new(),
+            stack: Vec::new(), // alloc: empty, allocates nothing; one per spawned thread
+            stack_allocations: Vec::new(), // alloc: empty, allocates nothing; one per spawned thread
             tls: TlsData::default(),
             statics: FxHashMap::default(),
             unwinding: None,
             running: None,
             woken: Woken::default(),
-            at_exit: Vec::new(),
+            at_exit: Vec::new(), // alloc: empty, allocates nothing; one per spawned thread
             result: None,
             result_slot,
             joined: false,
@@ -213,7 +214,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// each woken one goes on).
     pub(super) fn wake(&mut self, addr: usize, bitset: u32, count: usize) -> Result<'db, usize> {
         self.machine.release(addr as u64)?;
-        let mut waiters: Vec<(u64, usize)> = self
+        let mut waiters: SmallVec<[(u64, usize); 8]> = self
             .threads
             .iter()
             .enumerate()
@@ -225,7 +226,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
                 _ => None,
             })
-            .collect();
+            .collect(); // alloc: inline `SmallVec`, on the stack for up to eight waiters
         waiters.sort_unstable();
         let woken = waiters.len().min(count);
         for &(_, i) in &waiters[..woken] {
@@ -322,7 +323,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// The threads that can run: the running one, those runnable or not started.
-    fn runnable(&self) -> Vec<EvalThread> {
+    fn runnable(&self) -> SmallVec<[EvalThread; 8]> {
         self.threads
             .iter()
             .enumerate()
@@ -331,7 +332,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     || matches!(thread.run, Run::Runnable | Run::Start { .. })
             })
             .map(|(i, _)| i as EvalThread)
-            .collect()
+            .collect() // alloc: inline `SmallVec`, on the stack for up to eight threads
     }
 
     /// The call that just returned asked to block on `wait` (`block_on`): finished at once if
@@ -420,7 +421,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let thread = &mut self.threads[i];
                     thread.woken.pointer = Some((retval, result.unwrap_or(Address::invalid(0))));
                 }
-                self.threads[i].woken.result = Some((destination, 0i32.to_le_bytes().to_vec()));
+                self.threads[i].woken.result = Some((destination, OwnedBytes::from_slice(&0i32.to_le_bytes())));
             }
         }
     }
@@ -439,14 +440,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         self.machine.exit()?;
         self.threads[me].run = Run::Ended;
-        let joiners: Vec<usize> = (0..self.threads.len())
+        let joiners: SmallVec<[usize; 8]> = (0..self.threads.len())
             .filter(|&i| {
                 matches!(
                     self.threads[i].run,
                     Run::Blocked { wait: Wait::Join { thread, .. }, .. } if thread as usize == me
                 )
             })
-            .collect();
+            .collect(); // alloc: inline `SmallVec`, on the stack for up to eight joiners
         for i in joiners {
             self.wake_thread(i, false);
         }
@@ -505,13 +506,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// Of the threads that can run, the one the machine picks; when none can, the timed wait
     /// that ends first times out, and with none of those either the program deadlocked.
     fn pick_after_block(&mut self) -> Result<'db, EvalThread> {
-        let runnable: Vec<EvalThread> = self
+        let runnable: SmallVec<[EvalThread; 8]> = self
             .threads
             .iter()
             .enumerate()
             .filter(|(_, thread)| matches!(thread.run, Run::Runnable | Run::Start { .. }))
             .map(|(i, _)| i as EvalThread)
-            .collect();
+            .collect(); // alloc: inline `SmallVec`, on the stack for up to eight threads
         if !runnable.is_empty() {
             let running = self.thread;
             return Ok(self.machine.schedule(running, &runnable)?);
@@ -608,9 +609,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn running_name(&self) -> String {
         match self.running.and_then(|(callee, _)| callee) {
             Some(func) => {
-                hir_def::signatures::FunctionSignature::of(self.db, func).name.as_str().to_owned()
+                hir_def::signatures::FunctionSignature::of(self.db, func).name.as_str().to_owned() // alloc: error path
             }
-            None => "a closure or shim".to_owned(),
+            None => "a closure or shim".to_owned(), // alloc: error path
         }
     }
 }

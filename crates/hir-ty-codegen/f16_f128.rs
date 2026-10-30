@@ -153,11 +153,11 @@ impl<'db> FunctionCx<'_, 'db> {
         self.builtin(name, &[from], types::F16, &[value])
     }
 
-    /// The C function of `f128` named `base` with C's suffix of it: `fmodl` where `long
-    /// double` is it (AArch64), `fmodf128` on x86-64, whose `long double` is x87's.
-    fn quad_libcall(&mut self, base: &str, args: &[Value]) -> Result<Value> {
-        let suffix = if self.x86() { "f128" } else { "l" };
-        self.float_libcall(&format!("{base}{suffix}"), types::F128, args)
+    /// The C function of `f128`, named with C's suffix of it: `[fmodf128, fmodl]` is `fmodl`
+    /// where `long double` is it (AArch64), `fmodf128` on x86-64, whose `long double` is x87's.
+    fn quad_libcall(&mut self, [f128, l]: [&str; 2], args: &[Value]) -> Result<Value> {
+        let name = if self.x86() { f128 } else { l };
+        self.float_libcall(name, types::F128, args)
     }
 
     fn bits_of(&mut self, value: Value) -> Value {
@@ -222,20 +222,20 @@ impl<'db> FunctionCx<'_, 'db> {
     /// An operator of two `f16`s or two `f128`s.
     pub(super) fn soft_binary_op(&mut self, op: &BinOp, l: Value, r: Value) -> Result<Value> {
         if self.builder.func.dfg.value_type(l) == types::F16 {
-            let mnemonic = match op {
-                BinOp::Add => Some("fadd"),
-                BinOp::Sub => Some("fsub"),
-                BinOp::Mul => Some("fmul"),
-                BinOp::Div => Some("fdiv"),
+            // AArch64's, then AVX512-FP16's, operands in order: the first one's NaN where both
+            // are.
+            let instruction = match op {
+                BinOp::Add => Some(["fadd h0, h0, h1", "vaddsh xmm0, xmm0, xmm1"]),
+                BinOp::Sub => Some(["fsub h0, h0, h1", "vsubsh xmm0, xmm0, xmm1"]),
+                BinOp::Mul => Some(["fmul h0, h0, h1", "vmulsh xmm0, xmm0, xmm1"]),
+                BinOp::Div => Some(["fdiv h0, h0, h1", "vdivsh xmm0, xmm0, xmm1"]),
                 _ => None,
             };
-            if let Some(mnemonic) = mnemonic.filter(|_| self.half_precision()) {
-                return Ok(self.half_instruction(&format!("{mnemonic} h0, h0, h1"), &[l, r]));
+            if let Some([aarch64, _]) = instruction.filter(|_| self.half_precision()) {
+                return Ok(self.half_instruction(aarch64, &[l, r]));
             }
-            // AVX512-FP16's, operands in order: the first one's NaN where both are.
-            if let Some(mnemonic) = mnemonic.filter(|_| self.x86_half_precision()) {
-                let op = &mnemonic[1..];
-                return Ok(self.half_instruction(&format!("v{op}sh xmm0, xmm0, xmm1"), &[l, r]));
+            if let Some([_, x86]) = instruction.filter(|_| self.x86_half_precision()) {
+                return Ok(self.half_instruction(x86, &[l, r]));
             }
             let (l, r) = (self.widen_half(l, types::F32)?, self.widen_half(r, types::F32)?);
             let value = self.float_binary_op(op, l, r)?;
@@ -249,7 +249,7 @@ impl<'db> FunctionCx<'_, 'db> {
             BinOp::Sub => ("__subtf3", None),
             BinOp::Mul => ("__multf3", None),
             BinOp::Div => ("__divtf3", None),
-            BinOp::Rem => return self.quad_libcall("fmod", &[l, r]),
+            BinOp::Rem => return self.quad_libcall(["fmodf128", "fmodl"], &[l, r]),
             // Each comparison of compiler-builtins answers so that NaN makes it false.
             BinOp::Eq => ("__eqtf2", Some(IntCC::Equal)),
             BinOp::Ne => ("__netf2", Some(IntCC::NotEqual)),
@@ -257,6 +257,7 @@ impl<'db> FunctionCx<'_, 'db> {
             BinOp::Le => ("__letf2", Some(IntCC::SignedLessThanOrEqual)),
             BinOp::Gt => ("__gttf2", Some(IntCC::SignedGreaterThan)),
             BinOp::Ge => ("__getf2", Some(IntCC::SignedGreaterThanOrEqual)),
+            // alloc: the error's message
             _ => return Err(CodegenError::Unsupported(format!("float operator {op:?}"))),
         };
         let quads = [types::F128; 2];
@@ -336,6 +337,7 @@ impl<'db> FunctionCx<'_, 'db> {
             (types::F128, _) => self.quad_to_int(value, to)?,
             (_, types::F128) => self.int_to_quad(value, from)?,
             _ => {
+                // alloc: the error's message
                 let why = format!("cast from {} to {}", from.ty, to.ty);
                 return Err(CodegenError::Unsupported(why));
             }
@@ -403,16 +405,16 @@ impl<'db> FunctionCx<'_, 'db> {
             return Ok(self.soft_abs(value));
         }
         if ty == types::F16 && self.half_precision() {
-            let mnemonic = match intrinsic {
-                Intrinsic::Sqrt => "fsqrt",
-                Intrinsic::Floor => "frintm",
-                Intrinsic::Ceil => "frintp",
-                Intrinsic::Trunc => "frintz",
+            let instruction = match intrinsic {
+                Intrinsic::Sqrt => "fsqrt h0, h0",
+                Intrinsic::Floor => "frintm h0, h0",
+                Intrinsic::Ceil => "frintp h0, h0",
+                Intrinsic::Trunc => "frintz h0, h0",
                 // `rint`, in the mode a Rust program runs in, to even.
-                Intrinsic::RoundTiesEven => "frintx",
-                _ => "frinta",
+                Intrinsic::RoundTiesEven => "frintx h0, h0",
+                _ => "frinta h0, h0",
             };
-            return Ok(self.half_instruction(&format!("{mnemonic} h0, h0"), &[value]));
+            return Ok(self.half_instruction(instruction, &[value]));
         }
         if ty == types::F16 {
             let wide = self.widen_half(value, types::F32)?;
@@ -438,13 +440,13 @@ impl<'db> FunctionCx<'_, 'db> {
             return self.narrow_to_half(value);
         }
         let libm = match intrinsic {
-            Intrinsic::Sqrt => "sqrt",
-            Intrinsic::Floor => "floor",
-            Intrinsic::Ceil => "ceil",
-            Intrinsic::Trunc => "trunc",
+            Intrinsic::Sqrt => ["sqrtf128", "sqrtl"],
+            Intrinsic::Floor => ["floorf128", "floorl"],
+            Intrinsic::Ceil => ["ceilf128", "ceill"],
+            Intrinsic::Trunc => ["truncf128", "truncl"],
             // In the rounding mode a Rust program runs in, ties to even.
-            Intrinsic::RoundTiesEven => "rint",
-            _ => "round",
+            Intrinsic::RoundTiesEven => ["rintf128", "rintl"],
+            _ => ["roundf128", "roundl"],
         };
         self.quad_libcall(libm, &[value])
     }
@@ -452,7 +454,7 @@ impl<'db> FunctionCx<'_, 'db> {
     /// `fma`, which LLVM does for an `f16` in `f64`, where the product is exact.
     pub(super) fn soft_fma(&mut self, a: Value, b: Value, c: Value) -> Result<Value> {
         if self.builder.func.dfg.value_type(a) == types::F128 {
-            return self.quad_libcall("fma", &[a, b, c]);
+            return self.quad_libcall(["fmaf128", "fmal"], &[a, b, c]);
         }
         if self.half_precision() {
             return Ok(self.half_instruction("fmadd h0, h0, h1, h2", &[a, b, c]));
@@ -562,8 +564,10 @@ impl<'db> FunctionCx<'_, 'db> {
             id
         };
         let mut made_in: FxHashMap<LocalId, BasicBlockId> = FxHashMap::default();
+        // alloc: only an x86-64 body with an `f16b` local; one list reused across its blocks
+        let mut mentioned = Vec::new();
         for (id, block) in body.basic_blocks.iter() {
-            let mut mentioned = Vec::new();
+            mentioned.clear();
             for statement in &block.statements {
                 MirBody::visit_statement_places(&statement.kind, &mut |it| {
                     mentioned.push(it.local)
@@ -578,7 +582,7 @@ impl<'db> FunctionCx<'_, 'db> {
                 }
             }
             let run = first(id);
-            for local in mentioned.into_iter().filter(|it| held.contains(it)) {
+            for &local in mentioned.iter().filter(|it| held.contains(*it)) {
                 if *made_in.entry(local).or_insert(run) != run {
                     return Err(CodegenError::Unsupported(
                         "f16b held across blocks on x86-64, which LLVM rounds there by \

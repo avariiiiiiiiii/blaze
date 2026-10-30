@@ -3,9 +3,9 @@
 libraries blaze links, held against the toolchain's server with rustc's (docs/no-rustc.md,
 step J1).
 
-blaze builds the server of `vendor/proc-macro-srv` (`--exe`), and each proc-macro crate a
-package of serde, thiserror, tokio and clap depends on as a shared library with the list of
-its macros in it (`--exe` with `--shared`, step J2). It then builds the package with
+blaze builds its server, `blaze-proc-macro-srv` of the workspace's `crates/proc-macro-srv-cli`
+(`--exe`), and each proc-macro crate a package of serde, thiserror, tokio and clap depends on
+as a shared library with the list of its macros in it (`--exe` with `--shared`, step J2). It then builds the package with
 `BLAZE_PROC_MACRO_COMPARE` naming that server (crates/blaze-expand/src/compare.rs): each
 call the toolchain's server expands with rustc's library, derives with helper attributes,
 attributes and function-like macros, is expanded again by blaze's server with blaze's
@@ -41,9 +41,10 @@ from allblaze import std_of
 from difftest import BLAZE
 from storelib import scratch
 
-SERVER = os.path.join(HERE, "..", "vendor", "proc-macro-srv")
+# The server is a binary of blaze's own workspace.
+SERVER = os.path.join(HERE, "..")
 SERVER_PACKAGE = "proc-macro-srv-cli"
-SERVER_BIN = "rust-analyzer-proc-macro-srv"
+SERVER_BIN = "blaze-proc-macro-srv"
 
 MANIFEST = """[package]
 name = "macrouse"
@@ -207,11 +208,12 @@ def lib_name(package):
     return None
 
 
-def unit_graph(root):
-    """What `cargo build` in `root` compiles, unit by unit: the graph of the build, not cargo
-    metadata's resolve, which also has an optional dependency that only a weak feature
-    (`borsh?/std`) names and so is never built: smol_str's borsh."""
-    ran, _ = run(["cargo", "build", "--unit-graph", "-Z", "unstable-options"], root,
+def unit_graph(root, package=None):
+    """What `cargo build` in `root` compiles, unit by unit, of `package` alone when it is given:
+    the graph of the build, not cargo metadata's resolve, which also has an optional dependency
+    that only a weak feature (`borsh?/std`) names and so is never built: smol_str's borsh."""
+    only = ["-p", package] if package else []
+    ran, _ = run(["cargo", "build", "--unit-graph", "-Z", "unstable-options", *only], root,
                  f"cargo build --unit-graph of {root}")
     return json.loads(ran.stdout)["units"]
 
@@ -461,12 +463,12 @@ def fallbacks(own, theirs):
 
 
 def built_server(work):
-    """The server of `vendor/proc-macro-srv`, built and linked by blaze: where it is, and the
-    line that says so."""
+    """The server, `blaze-proc-macro-srv` of `crates/proc-macro-srv-cli`, built and linked by
+    blaze: where it is, and the line that says so."""
     server_root = os.path.realpath(SERVER)
     server = os.path.join(work, SERVER_BIN)
     crates = with_std([SERVER_BIN.replace("-", "_"),
-                       *closure(metadata(server_root), unit_graph(server_root),
+                       *closure(metadata(server_root), unit_graph(server_root, SERVER_PACKAGE),
                                SERVER_PACKAGE)])
     ran, took = blaze(server_root, crates, os.path.join(work, "server.o"), "--exe", server)
     linked(ran, "the server")

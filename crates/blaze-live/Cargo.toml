@@ -13,9 +13,16 @@ categories = ["development-tools"]
 
 [dependencies]
 
+[features]
+# `fuzz_checks`, v1's checks of a decoded patch, for the fuzz target `live_patch`.
+fuzz = []
+
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-ids.workspace = true
+
+[target.'cfg(blaze_check)'.dev-dependencies]
+blaze-check.workspace = true
 
 [lints]
 workspace = true

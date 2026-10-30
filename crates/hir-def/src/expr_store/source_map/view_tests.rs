@@ -46,9 +46,9 @@ fn bodies(db: &TestDB) -> Vec<(DefWithBodyId, hir_expand::HirFileId)> {
     for (_, module) in def_map.modules(db) {
         for decl in module.scope(db).declarations() {
             let it = match decl {
-                ModuleDefId::FunctionId(it) => (it.into(), it.lookup(db).source(db).file_id),
-                ModuleDefId::ConstId(it) => (it.into(), it.lookup(db).source(db).file_id),
-                ModuleDefId::StaticId(it) => (it.into(), it.lookup(db).source(db).file_id),
+                ModuleDefId::FunctionId(it) => (it.into(), it.lookup(db).ast_ptr(db).file_id),
+                ModuleDefId::ConstId(it) => (it.into(), it.lookup(db).ast_ptr(db).file_id),
+                ModuleDefId::StaticId(it) => (it.into(), it.lookup(db).ast_ptr(db).file_id),
                 _ => continue,
             };
             bodies.push(it);

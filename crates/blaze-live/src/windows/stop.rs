@@ -10,7 +10,7 @@
 //! from the heap while the threads are stopped (a thread may hold its lock): each call here
 //! is a system call, and the handles and where the threads are go in room reserved before.
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "suspends the process's other threads, and reads their pcs")]
 
 use std::{ffi::c_void, sync::Mutex};
 

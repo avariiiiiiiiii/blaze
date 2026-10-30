@@ -1,0 +1,25 @@
+{
+  "id": "00059",
+  "from_lane": "db-ty-hir",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty-wfcheck",
+    "crates/hir-ty-wfcheck/src/persist.rs",
+    "crates/hir-ty-wfcheck/Cargo.toml"
+  ],
+  "what": "## 3. db-ty (parent): `crates/hir-ty-wfcheck` gains `blaze-format` and `la-arena`\n\nBoth are workspace dependencies already (`blaze-format` is in hir-ty's manifest). Used by\n`crates/hir-ty-wfcheck/src/persist.rs` (`impl Persist for WfResult`). The manifest lint passes.\n\n> forwarded to db: `crates/hir-ty-wfcheck/Cargo.toml` is lane db's (both are workspace dependencies already).\n> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-wfcheck/Cargo.toml:18` (`la-arena`) and `:27` (`blaze-format`).",
+  "state": "open",
+  "created": "2026-10-30T00:37:33Z",
+  "updated": "2026-10-30T00:37:33Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/db-ty-hir.md#3. db-ty (parent): `crates/hir-ty-wfcheck` gains `blaze-format` and `la-arena`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/db-ty-hir.md:32"
+    }
+  ]
+}

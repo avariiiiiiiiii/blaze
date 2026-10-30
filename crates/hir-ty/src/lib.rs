@@ -36,6 +36,8 @@ mod variance;
 
 pub mod autoderef;
 pub mod check_cache;
+pub mod const_param_ty;
+pub mod const_valtree;
 pub mod consteval;
 pub mod coroutine_obligations;
 pub mod db;

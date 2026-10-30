@@ -47,6 +47,7 @@ pub(crate) fn value(
     id: StaticId,
 ) -> Result<Value, String> {
     let thread_local = is_thread_local(db, id);
+    // alloc: only a static with `#[link_section]`, whose `Static::section` owns its name
     let section = AttrFlags::link_section(db, id.into()).map(|it| it.as_str().to_owned());
     let mut placer = Placer::open();
     let (blob, mut requests, mutable) = match weak_symbol(db, id)? {
@@ -54,18 +55,21 @@ pub(crate) fn value(
         Some(symbol) => {
             placer.place(FrontRef::Weak(symbol))?;
             let blob = ConstBlob {
-                bytes: vec![0; 8],
-                relocs: Vec::new(),
-                fn_relocs: Vec::new(),
+                bytes: vec![0; 8], // alloc: only an `extern_weak` static, its one address
+                relocs: Vec::new(), // alloc: empty, allocates nothing
+                fn_relocs: Vec::new(), // alloc: empty, allocates nothing
                 align: 8,
-                type_ids: Vec::new(),
+                type_ids: Vec::new(), // alloc: empty, allocates nothing
             };
             (blob, Requests::default(), false)
         }
         None => {
             let CompiledStatic { requests, blob, writable } =
+                // alloc: the error's message
                 compiled_static(db, id).as_ref().map_err(|e| e.to_string())?;
+            // clone: the memo's, which `place_requests` rewrites in place
             let requests = Requests { funcs: requests.funcs.clone(), datas: requests.datas.clone() };
+            // clone: the memo's, which `fill_type_ids` rewrites in place
             let mut blob = blob.clone();
             fill_type_ids(db, hashes, Some(id.krate(db)), &mut blob)?;
             (blob, requests, *writable)
@@ -192,6 +196,7 @@ pub(crate) fn compile(
     }
     let value = value(db, homes, hashes, id)?;
     if value.refs.len() != refs.len() {
+        // alloc: the error's message
         return Err(format!(
             "{} references given for a value of {}",
             refs.len(),
@@ -202,8 +207,10 @@ pub(crate) fn compile(
         super::convert::value(resolve.frame(), arch, &value.blob, &value.requests, resolve)
     })?;
     if weak_symbol(db, id)?.is_some() {
+        // clone: only an `extern_weak` static; `Relocation` owns its target
         relocs.push(Relocation { at: 0, kind: RelocKind::Abs64, target: refs[0].clone(), addend: 0 });
     }
+    // alloc: the error's message
     let align = u32::try_from(value.blob.align).map_err(|e| e.to_string())?;
     let init = if relocs.is_empty() && value.blob.bytes.iter().all(|&it| it == 0) {
         Init::Zeroed { size: value.blob.bytes.len() as u64 }

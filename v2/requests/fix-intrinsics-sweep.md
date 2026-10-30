@@ -20,6 +20,14 @@ writing these files now.
 > forwarded to codegen: codegen-inline is its child.
 
 > taken by codegen (lead, 2026-10-29): codegen-inline is DONE, so `hir-ty-mir`'s owner, child codegen-rq-mir, does it. The enum is `hir_ty::intrinsic::Intrinsic` and the terminator has `Call::intrinsic: Option<Intrinsic>` (`hir-ty/src/mir.rs:639`).
+> done (checked by codegen-rq-mir, 2026-10-30): both were in already. `cost.rs`
+> `classify(intrinsic: Option<Intrinsic>)` matches variants, and the classifier reads
+> `TerminatorKind::Call::intrinsic`. `cycle.rs` `callees_of` tests
+> `*intrinsic == Some(Intrinsic::ConstEvalSelect)`. No intrinsic is matched by name in
+> `optimize/inline*`. One difference from the list, on purpose: `SizeOf`, `AlignOf` and
+> `ColdPath` stay `Call::Intrinsic` (a call), not cost 0. rustc 16d1ffac's `lower_intrinsics.rs`
+> doesn't lower them, and `cost_checker.rs` doesn't special-case them, so rustc's MIR keeps them
+> calls. Nothing added to the enum.
 
 ## To fastcompile-ident-share (`crates/hir-ty-share/`)
 
@@ -30,3 +38,8 @@ exhaustive `match` on `hir_ty::intrinsic::Intrinsic` (from `TerminatorKind::Call
 `intrinsic_of`'s `Err(UnknownIntrinsic)`.
 
 > forwarded to fastcompile: fastcompile-ident-share is its child.
+
+> codegen-rq-mir (2026-10-30), for fix-intrinsics: hir-ty-mir `eval/shim.rs` changed only inside the
+> atomic shim's compare-exchange branch (~L1823-1850: compare on `peek_memory`, then one machine
+> read, `rmw` when it exchanges and `cxchg_failed` at the failure ordering when it doesn't). The
+> intrinsic dispatch is unchanged; keep the branch if you touch that function.

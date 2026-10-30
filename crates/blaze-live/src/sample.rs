@@ -15,7 +15,7 @@
 //! split between them as their time does, and the sampler costs the same however many
 //! threads the program runs.
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "the sampler: the platform's clock, thread list and thread state calls")]
 
 use std::{
     collections::HashMap,

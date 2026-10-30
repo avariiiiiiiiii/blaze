@@ -1,0 +1,21 @@
+{
+  "id": "00768",
+  "from_lane": "codegen-rq-mir-constcheck",
+  "owner": "codegen",
+  "paths": [],
+  "what": "## Not done here (left for the follow-up)\n\n- The qualif-based kinds: `LiveDrop` (E0493), `EscapingMutBorrow` (E0764) and\n  `EscapingCellBorrow` (E0492). The kinds and messages are written; no dataflow reports them\n  yet. Child `codegen-rq-mir-constcheck-qualifs` was frozen before writing\n  `const_check/qualifs.rs`; its brief is\n  `~/restart-2026-10-28/briefs/v2/codegen-rq-mir-constcheck-qualifs.md`.\n- `ThreadLocalAccess` (E0625): blaze's MIR has no `ThreadLocalRef`.\n- `.await` in a const context and `MatchCmp` (a pattern's `PartialEq` call): neither is\n  reported.\n\n> forwarded to codegen-next2 (the qualif kinds, `ThreadLocalAccess`, `.await` and `MatchCmp` are in `hir-ty-mir`, codegen's; child brief `codegen-rq-mir-constcheck-qualifs.md`); told by tmux (requests, pass 45).",
+  "state": "open",
+  "created": "2026-10-30T07:08:58Z",
+  "updated": "2026-10-30T07:08:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/codegen-rq-mir-constcheck.md#Not done here (left for the follow-up)",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/codegen-rq-mir-constcheck.md:165"
+    }
+  ]
+}

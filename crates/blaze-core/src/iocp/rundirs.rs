@@ -132,12 +132,14 @@ impl RunDirs {
                             unsafe { RemoveDirectoryW(wide) };
                         }),
                         (false, _) => self.with_nul(|wide| {
-                            // SAFETY: NUL-terminated paths.
-                            unsafe {
-                                if DeleteFileW(wide) == 0 && attributes & FILE_ATTRIBUTE_READONLY != 0 {
-                                    SetFileAttributesW(wide, FILE_ATTRIBUTE_NORMAL);
-                                    DeleteFileW(wide);
-                                }
+                            // SAFETY: `wide` is NUL-terminated and borrowed across the call,
+                            // which keeps no pointer to it; a missing NUL would read past it.
+                            let deleted = unsafe { DeleteFileW(wide) } != 0;
+                            if !deleted && attributes & FILE_ATTRIBUTE_READONLY != 0 {
+                                // SAFETY: as above.
+                                unsafe { SetFileAttributesW(wide, FILE_ATTRIBUTE_NORMAL) };
+                                // SAFETY: as above.
+                                unsafe { DeleteFileW(wide) };
                             }
                         }),
                     }

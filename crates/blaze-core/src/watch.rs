@@ -9,6 +9,12 @@
 //! spans of a column of reserved memory ([`Strings`]), the names one read of events tells are
 //! gathered and deduplicated before any is made a [`FileName`] ([`Batch`]), and a tree that
 //! ended leaves its tables to the next one made with them ([`Spare`]).
+//!
+//! Why unsafe: std has no inotify. `fs::read_dir` would cost an allocation per entry (a
+//! `DirEntry` with its own path) and a `stat` per entry where `getdents64` gives the kind;
+//! `fs::symlink_metadata` a `PathBuf` per name. Events and directory entries are parsed in safe
+//! code: each record's length is checked against what the call returned before its name is
+//! sliced.
 
 use std::{
     ffi::CStr,
@@ -126,35 +132,34 @@ impl Tree {
     /// only once the ring's read of it has completed).
     pub(crate) fn drain(&mut self, buffer: &mut [u8], mut each: impl FnMut(Done)) -> io::Result<()> {
         loop {
-            let mut fd = libc::pollfd { fd: self.raw(), events: libc::POLLIN, revents: 0 };
-            // SAFETY: one pollfd of an open descriptor; no wait.
-            let ready = unsafe { libc::poll(&raw mut fd, 1, 0) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(error);
-            }
-            if ready == 0 || fd.revents & libc::POLLIN == 0 {
+            let mut fds = [libc::pollfd { fd: self.raw(), events: libc::POLLIN, revents: 0 }];
+            let ready = match crate::raw::poll(&mut fds, 0) {
+                Ok(ready) => ready,
+                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(error) => return Err(error),
+            };
+            if ready == 0 || fds[0].revents & libc::POLLIN == 0 {
                 return Ok(());
             }
-            // SAFETY: the buffer has room for what is read.
-            let n = unsafe { libc::read(self.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
-            if n > 0 {
-                each(self.take(&buffer[..n as usize]));
-                continue;
-            }
-            if n == 0 {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EINTR) => {}
-                Some(libc::EAGAIN) => return Ok(()),
-                _ => return Err(error),
+            match self.read(buffer) {
+                Ok(0) => return Ok(()),
+                Ok(n) => each(self.take(&buffer[..n])),
+                Err(error) => match error.raw_os_error() {
+                    Some(libc::EINTR) => {}
+                    Some(libc::EAGAIN) => return Ok(()),
+                    _ => return Err(error),
+                },
             }
         }
+    }
+
+    /// One read of the queued events into `buffer`: how many bytes.
+    pub(crate) fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: `buffer` is a live, exclusive buffer of `buffer.len()` bytes the call writes
+        // at most that many of, and the descriptor is this tree's, open while `self` is
+        // borrowed (closed only by `end`, which takes it).
+        let n = unsafe { libc::read(self.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        usize::try_from(n).map_err(|_| io::Error::last_os_error())
     }
 }
 
@@ -408,13 +413,7 @@ pub(crate) fn join(into: &mut Vec<u8>, root: &[u8], rel: &[u8]) {
 
 /// The directory at `path`, opened to list it.
 fn open_dir(path: &CStr) -> io::Result<OwnedFd> {
-    // SAFETY: a NUL-terminated path; a descriptor of its own or -1.
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the call returned a descriptor of its own.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    crate::raw::open_dir(path)
 }
 
 /// Each entry of the directory open as `fd` but `.` and `..`, with whether it is a directory

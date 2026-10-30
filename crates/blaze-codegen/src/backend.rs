@@ -123,7 +123,8 @@ pub trait Frontend: Sync {
     fn reached(&self, functions: &[(Self::Instance, Origin)], statics: &[Self::Static]);
 
     /// Whether the build's outcome is decided without its code (a body it compiles failed
-    /// its check): the build stops at its next step and gives [`stopped`](crate::driver).
+    /// its check, or its job's stop flag is set): the build begins no further function and
+    /// gives [`stopped`](crate::driver). Asked once per function, so it must be a load or two.
     fn stopped(&self) -> bool;
 }
 

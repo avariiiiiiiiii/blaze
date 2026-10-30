@@ -18,6 +18,7 @@ pub struct Trace {
 
 impl Trace {
     pub fn write(&self) -> String {
+        // alloc: a trace's text, written once per build traced for replay
         let mut text = String::new();
         for line in std::iter::once(serde_json::to_string(&self.config))
             .chain(self.inputs.iter().map(serde_json::to_string))
@@ -32,9 +33,11 @@ impl Trace {
     pub fn read(text: &str) -> Result<Trace, String> {
         let mut lines = text.lines().enumerate().filter(|(_, it)| !it.trim().is_empty());
         let (_, first) = lines.next().ok_or("a trace with no config line")?;
+        // alloc: the error's message
         let config = serde_json::from_str(first).map_err(|why| format!("line 1: {why}"))?;
         let inputs = lines
             .map(|(at, line)| {
+                // alloc: the error's message
                 serde_json::from_str(line).map_err(|why| format!("line {}: {why}", at + 1))
             })
             .collect::<Result<_, _>>()?;
@@ -44,8 +47,10 @@ impl Trace {
     /// The outputs of the trace's inputs on a new machine.
     pub fn replay(&self) -> Result<Vec<Output>, Error> {
         let mut machine = Machine::new(self.config)?;
+        // alloc: a replay's outputs, for a test's comparison
         let mut outputs = Vec::new();
         for input in &self.inputs {
+            // clone: a replay keeps its trace whole, for a test's comparison
             outputs.extend(machine.step(input.clone())?);
         }
         Ok(outputs)
@@ -55,6 +60,7 @@ impl Trace {
 /// `outputs` a line each, for a person and for a test's expected file: the nodes of an
 /// [`Event::Nodes`] a line each, as their [`Event::Node`]s, in the order given.
 pub fn render(outputs: &[Output]) -> String {
+    // alloc: the rendered text, for a person or a test's expected file
     let mut text = String::new();
     let mut order = Order::default();
     for output in outputs {

@@ -54,9 +54,9 @@ fn weighted_counts_saturate() {
 #[test]
 fn tiers_count_except_the_last() {
     assert!(Tier::Stencil.counts() && Tier::Cranelift.counts() && !Tier::Llvm.counts());
-    assert_eq!(Tier::Stencil.backend(), None);
-    assert_eq!(Tier::Cranelift.backend(), Some(Backend::Cranelift));
-    assert_eq!(Tier::Llvm.backend(), Some(Backend::Llvm { opt: 3 }));
+    assert_eq!(Tier::Stencil.backend(), Backend::Stencil);
+    assert_eq!(Tier::Cranelift.backend(), Backend::Cranelift);
+    assert_eq!(Tier::Llvm.backend(), Backend::Llvm { opt: 3 });
 }
 
 #[test]
@@ -717,7 +717,7 @@ fn a_jump_back_counts_before_it() {
     assert_eq!(counted(&func, body), [BACK_EDGES as i32]);
     assert_eq!(all_counted(&func).len(), 2);
     let first = func.layout.first_inst(entry).unwrap();
-    assert_eq!(func.dfg.insts[first].opcode(), ir::Opcode::GlobalValue, "the count comes first");
+    assert_eq!(func.dfg.insts[first].opcode(), ir::Opcode::SymbolValue, "the count comes first");
     assert_eq!(func.layout.blocks().count(), 4, "a jump's edge needs no block of its own");
 }
 

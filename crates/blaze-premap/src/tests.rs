@@ -1,5 +1,5 @@
 use blaze_cas::{Config, Store};
-use blaze_codegen::settings::{Relocation, Toolchain};
+use blaze_codegen::settings::{Coverage, Relocation, Sanitize, Sanitizers, Toolchain};
 use blaze_codegen::driver::Digests;
 use blaze_codegen::driver::digests::{debug_name_digest, function_digest};
 use blaze_codegen::{Arch, CompiledFunction, Init, InstanceKey, Relocation as Reloc, RelocKind, Settings, Static, Target};
@@ -116,6 +116,8 @@ fn dev_output() -> Output {
         dev_run: None,
         triple: "x86_64-unknown-linux-gnu".to_owned(),
         exec_log: false,
+        sanitize: Sanitize::default(),
+        rpaths: Vec::new(),
     }
 }
 
@@ -207,6 +209,12 @@ fn graph_key_changes_with_every_input() {
         ("a dev run's reservation", Box::new(|it: &mut Graph| it.output.dev_run = Some(DevRun { arena: 1 << 30, cells: 0, fixed: 0 }))),
         ("the output's triple", Box::new(|it: &mut Graph| it.output.triple = "x86_64-unknown-linux-musl".to_owned())),
         ("the execution log", Box::new(|it: &mut Graph| it.output.exec_log = true)),
+        ("a sanitizer", Box::new(|it: &mut Graph| it.output.sanitize.sanitizers = Sanitizers::ADDRESS)),
+        ("a recovering sanitizer", Box::new(|it: &mut Graph| it.output.sanitize.recover = Sanitizers::ADDRESS)),
+        ("origin tracking", Box::new(|it: &mut Graph| it.output.sanitize.track_origins = 2)),
+        ("the coverage level", Box::new(|it: &mut Graph| it.output.sanitize.coverage.level = 3)),
+        ("the coverage flags", Box::new(|it: &mut Graph| it.output.sanitize.coverage.flags = Coverage::TRACE_PC_GUARD)),
+        ("an rpath", Box::new(|it: &mut Graph| it.output.rpaths.push("/opt/blaze/runtime".to_owned()))),
         ("the base", Box::new(|it: &mut Graph| it.base += 1 << 20)),
         ("the thread-local bias", Box::new(|it: &mut Graph| it.tls_bias -= 64)),
         ("a native's contents", Box::new(|it: &mut Graph| it.natives[0].id = id(4))),
@@ -777,6 +785,58 @@ fn prelink_refuses_what_it_was_not_asked() {
     let incremental = dev_output();
     let request = Request { output: &incremental, ..prelink_request(&output, &part) };
     assert!(prelink::build(&Model, &request, ImageKey(id(1))).is_err(), "an incremental image");
+}
+
+#[test]
+fn a_prelink_that_writes_its_own_segments_makes_the_same_image() {
+    struct Placing {
+        linked: Prelinked,
+        bytes: Vec<Vec<u8>>,
+    }
+    impl prelink::Placed for Placing {
+        fn linked(&self) -> &Prelinked {
+            &self.linked
+        }
+        fn len(&self, at: usize) -> u64 {
+            self.bytes[at].len() as u64
+        }
+        fn write_into(&self, out: &mut [u8], offsets: &[usize]) -> Result<(), PremapError> {
+            assert_eq!(offsets.len(), self.bytes.len());
+            for (bytes, offset) in self.bytes.iter().zip(offsets) {
+                out[*offset..offset + bytes.len()].copy_from_slice(bytes);
+            }
+            Ok(())
+        }
+    }
+    struct Split;
+    impl Prelink for Split {
+        type Placed = Placing;
+
+        fn prelink(&self, request: &Request<'_>) -> Result<Placing, PremapError> {
+            let mut linked = Model.prelink(request)?;
+            let bytes = linked.segments.iter_mut().map(|it| std::mem::take(&mut it.bytes)).collect();
+            Ok(Placing { linked, bytes })
+        }
+    }
+    let small = Small::new();
+    let natives = natives();
+    let part = image_part(&small.built(), &small.owned(), &natives).unwrap();
+    let output = prelink::output(&dev_output(), "blaze-premap-test");
+    let request = prelink_request(&output, &part);
+    let whole = prelink::build(&Model, &request, ImageKey(id(1))).unwrap();
+    let split = prelink::build(&Split, &request, ImageKey(id(1))).unwrap();
+    assert_eq!(whole, split);
+}
+
+#[test]
+fn a_prelink_refuses_a_segment_written_outside_the_image() {
+    let segment = Segment { addr: BASE, size: 4096, prot: Prot::Code, bytes: vec![1; 64] };
+    let linked = Prelinked { segments: vec![segment], ..Prelinked::default() };
+    let mut out = vec![0u8; 4096];
+    assert!(prelink::Placed::write_into(&linked, &mut out, &[4096 - 32]).is_err(), "past its end");
+    assert!(prelink::Placed::write_into(&linked, &mut out, &[]).is_err(), "no offset");
+    prelink::Placed::write_into(&linked, &mut out, &[0]).unwrap();
+    assert_eq!(&out[..64], &[1; 64][..]);
 }
 
 /// An image of hand-made binds and names, for the start's rules.

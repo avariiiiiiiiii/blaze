@@ -107,6 +107,7 @@ impl FlatRoot {
         if let Some(&part) = self.parts.borrow().get(&at) {
             return part;
         }
+        // clone: once per part, the first time a cursor enters it
         let tree = self.tree.part(at).clone();
         let part = FlatRoot {
             rc: Cell::new(0),
@@ -115,6 +116,7 @@ impl FlatRoot {
             parts: RefCell::default(),
         };
         // SAFETY: `Box::into_raw` is never null.
+        // alloc: once per part, the first time a cursor enters it
         let part = unsafe { ptr::NonNull::new_unchecked(Box::into_raw(Box::new(part))) };
         self.parts.borrow_mut().insert(at, part);
         part
@@ -218,15 +220,18 @@ fn flat_node_at_range(
 pub(crate) fn copy_element(builder: &mut FlatTreeBuilder, element: &SyntaxElement) {
     match element {
         NodeOrToken::Token(token) => builder.token(token.kind(), token.text()),
-        NodeOrToken::Node(node) => {
-            for event in node.preorder_with_tokens() {
-                match event {
-                    WalkEvent::Enter(NodeOrToken::Node(it)) => builder.start_node(it.kind()),
-                    WalkEvent::Enter(NodeOrToken::Token(it)) => builder.token(it.kind(), it.text()),
-                    WalkEvent::Leave(NodeOrToken::Node(_)) => builder.finish_node(),
-                    WalkEvent::Leave(NodeOrToken::Token(_)) => {}
-                }
-            }
+        NodeOrToken::Node(node) => copy_node(builder, node),
+    }
+}
+
+/// Gives `builder` `node` and its subtree, as [`copy_element`].
+pub(crate) fn copy_node(builder: &mut FlatTreeBuilder, node: &SyntaxNode) {
+    for event in node.preorder_with_tokens() {
+        match event {
+            WalkEvent::Enter(NodeOrToken::Node(it)) => builder.start_node(it.kind()),
+            WalkEvent::Enter(NodeOrToken::Token(it)) => builder.token(it.kind(), it.text()),
+            WalkEvent::Leave(NodeOrToken::Node(_)) => builder.finish_node(),
+            WalkEvent::Leave(NodeOrToken::Token(_)) => {}
         }
     }
 }
@@ -287,6 +292,7 @@ impl SyntaxNode {
         assert!(!tree.is_empty() && !tree.is_token(0), "a tree's root is a node");
         let root = FlatRoot { rc: Cell::new(1), tree, file: None, parts: RefCell::default() };
         // SAFETY: `Box::into_raw` is never null.
+        // alloc: once per tree, its root's count and parts
         let root = unsafe { ptr::NonNull::new_unchecked(Box::into_raw(Box::new(root))) };
         SyntaxNode(Ref { root, at: 0 })
     }
@@ -319,6 +325,7 @@ impl SyntaxNode {
     /// This node, for a walk that reads the arrays: every node is in a flat tree.
     #[inline]
     pub fn to_flat(&self) -> SyntaxNode {
+        // clone: the owned cursor the signature returns, a count bump
         self.clone()
     }
 
@@ -356,6 +363,7 @@ impl SyntaxNode {
     pub fn children_where(&self) -> SyntaxNodeChildrenWhere {
         let (root, at) = inner(self.0.root, self.0.at);
         let end = flat(&root).tree.end(at);
+        // clone: keeps `root` alive while the iterator lives, a count bump
         SyntaxNodeChildrenWhere { _parent: self.clone(), root, next: at + 1, end }
     }
 
@@ -367,6 +375,7 @@ impl SyntaxNode {
         let whole = flat(&root).file.is_none() && tree.range(0).start() == TextSize::from(0);
         match at == 0 && whole {
             true => SyntaxNode(flat_ref(root, 0)),
+            // alloc: the copy's tree, shared by its cursors as every tree is
             false => SyntaxNode::new_flat_root(Arc::new(tree.subtree(at))),
         }
     }
@@ -406,6 +415,17 @@ impl SyntaxNode {
     /// over: the new tree's text is its own, its lazy nodes parsed into it, so its ranges
     /// start at 0 whatever this tree's did.
     pub fn splice_children(&self, range: Range<usize>, with: &[SyntaxElement]) -> SyntaxNode {
+        self.splice_children_with(range, |builder| {
+            with.iter().for_each(|it| copy_element(builder, it))
+        })
+    }
+
+    /// [`SyntaxNode::splice_children`] with `with` giving the builder the copies, once.
+    pub(crate) fn splice_children_with(
+        &self,
+        range: Range<usize>,
+        mut with: impl FnMut(&mut FlatTreeBuilder),
+    ) -> SyntaxNode {
         let top = self.tree_top();
         let mut builder = FlatTreeBuilder::with_capacity(usize::from(top.text_range().len()));
         let mut walk = top.preorder_with_tokens();
@@ -413,16 +433,23 @@ impl SyntaxNode {
             match event {
                 WalkEvent::Enter(NodeOrToken::Node(node)) if node == *self => {
                     builder.start_node(node.kind());
-                    let children: Vec<SyntaxElement> = node.children_with_tokens().collect();
+                    let len = node.children_with_tokens().count();
                     assert!(
-                        range.start <= range.end && range.end <= children.len(),
+                        range.start <= range.end && range.end <= len,
                         "children {range:?} of a {:?} of {} children",
                         node.kind(),
-                        children.len(),
+                        len,
                     );
-                    let (before, after) = (&children[..range.start], &children[range.end..]);
-                    for it in before.iter().chain(with).chain(after) {
-                        copy_element(&mut builder, it);
+                    for (i, it) in node.children_with_tokens().enumerate() {
+                        if i == range.start {
+                            with(&mut builder);
+                        }
+                        if !range.contains(&i) {
+                            copy_element(&mut builder, &it);
+                        }
+                    }
+                    if range.start == len {
+                        with(&mut builder);
                     }
                     // The walk's next event is now leaving `node`, which finishes it.
                     walk.skip_subtree();
@@ -433,6 +460,7 @@ impl SyntaxNode {
                 WalkEvent::Leave(NodeOrToken::Token(_)) => {}
             }
         }
+        // alloc: the spliced tree, shared by its cursors as every tree is
         SyntaxNode::new_flat_root(Arc::new(builder.finish()))
     }
 
@@ -453,6 +481,7 @@ impl SyntaxNode {
 
     #[inline]
     pub fn text(&self) -> SyntaxText {
+        // clone: the text holds its node, a count bump
         SyntaxText::new(self.clone())
     }
 
@@ -473,6 +502,7 @@ impl SyntaxNode {
 
     #[inline]
     pub fn ancestors(&self) -> impl Iterator<Item = SyntaxNode> {
+        // clone: the walk's owned first cursor, a count bump
         iter::successors(Some(self.clone()), SyntaxNode::parent)
     }
 
@@ -483,12 +513,12 @@ impl SyntaxNode {
 
     #[inline]
     pub fn children(&self) -> SyntaxNodeChildren {
-        SyntaxNodeChildren::new(self.clone())
+        SyntaxNodeChildren::new(self)
     }
 
     #[inline]
     pub fn children_with_tokens(&self) -> SyntaxElementChildren {
-        SyntaxElementChildren::new(self.clone())
+        SyntaxElementChildren::new(self)
     }
 
     pub fn first_child(&self) -> Option<SyntaxNode> {
@@ -555,6 +585,7 @@ impl SyntaxNode {
 
     #[inline]
     pub fn siblings(&self, direction: Direction) -> impl Iterator<Item = SyntaxNode> {
+        // clone: the walk's owned first cursor, a count bump
         iter::successors(Some(self.clone()), move |node| match direction {
             Direction::Next => node.next_sibling(),
             Direction::Prev => node.prev_sibling(),
@@ -566,6 +597,7 @@ impl SyntaxNode {
         &self,
         direction: Direction,
     ) -> impl Iterator<Item = SyntaxElement> {
+        // clone: the walk's owned first cursor, a count bump
         let me: SyntaxElement = self.clone().into();
         iter::successors(Some(me), move |el| match direction {
             Direction::Next => el.next_sibling_or_token(),
@@ -591,11 +623,13 @@ impl SyntaxNode {
 
     #[inline]
     pub fn preorder(&self) -> Preorder {
+        // clone: the walk's owned start, a count bump
         Preorder::new(self.clone())
     }
 
     #[inline]
     pub fn preorder_with_tokens(&self) -> PreorderWithTokens {
+        // clone: the walk's owned start, a count bump
         PreorderWithTokens::new(self.clone())
     }
 
@@ -634,6 +668,7 @@ impl SyntaxNode {
     }
 
     pub fn covering_element(&self, range: TextRange) -> SyntaxElement {
+        // clone: the owned element returned when no child covers the range, a count bump
         let mut res: SyntaxElement = self.clone().into();
         loop {
             assert!(
@@ -717,6 +752,7 @@ impl SyntaxToken {
         &self,
         direction: Direction,
     ) -> impl Iterator<Item = SyntaxElement> {
+        // clone: the walk's owned first cursor, a count bump
         let me: SyntaxElement = self.clone().into();
         iter::successors(Some(me), move |el| match direction {
             Direction::Next => el.next_sibling_or_token(),
@@ -781,6 +817,7 @@ impl SyntaxElement {
     #[inline]
     pub fn ancestors(&self) -> impl Iterator<Item = SyntaxNode> {
         let first = match self {
+            // clone: the walk's owned first cursor, a count bump
             NodeOrToken::Node(it) => Some(it.clone()),
             NodeOrToken::Token(it) => it.parent(),
         };
@@ -798,6 +835,7 @@ impl SyntaxElement {
     pub fn first_token(&self) -> Option<SyntaxToken> {
         match self {
             NodeOrToken::Node(it) => it.first_token(),
+            // clone: the owned token the signature returns, a count bump
             NodeOrToken::Token(it) => Some(it.clone()),
         }
     }
@@ -805,6 +843,7 @@ impl SyntaxElement {
     pub fn last_token(&self) -> Option<SyntaxToken> {
         match self {
             NodeOrToken::Node(it) => it.last_token(),
+            // clone: the owned token the signature returns, a count bump
             NodeOrToken::Token(it) => Some(it.clone()),
         }
     }
@@ -826,6 +865,7 @@ impl SyntaxElement {
     fn token_at_offset(&self, offset: TextSize) -> TokenAtOffset<SyntaxToken> {
         assert!(self.text_range().start() <= offset && offset <= self.text_range().end());
         match self {
+            // clone: the owned token the signature returns, a count bump
             NodeOrToken::Token(token) => TokenAtOffset::Single(token.clone()),
             NodeOrToken::Node(node) => node.token_at_offset(offset),
         }
@@ -927,7 +967,7 @@ pub struct SyntaxNodeChildren {
 }
 
 impl SyntaxNodeChildren {
-    fn new(parent: SyntaxNode) -> SyntaxNodeChildren {
+    fn new(parent: &SyntaxNode) -> SyntaxNodeChildren {
         SyntaxNodeChildren { next: parent.first_child() }
     }
 }
@@ -977,7 +1017,7 @@ pub struct SyntaxElementChildren {
 }
 
 impl SyntaxElementChildren {
-    fn new(parent: SyntaxNode) -> SyntaxElementChildren {
+    fn new(parent: &SyntaxNode) -> SyntaxElementChildren {
         SyntaxElementChildren { next: parent.first_child_or_token() }
     }
 }
@@ -1001,6 +1041,7 @@ pub struct Preorder {
 
 impl Preorder {
     fn new(start: SyntaxNode) -> Preorder {
+        // clone: the walk keeps its start to stop at and returns entering it, a count bump
         let next = Some(WalkEvent::Enter(start.clone()));
         Preorder { start, next, skip_subtree: false }
     }
@@ -1031,6 +1072,7 @@ impl Iterator for Preorder {
             Some(match next {
                 WalkEvent::Enter(node) => match node.first_child() {
                     Some(child) => WalkEvent::Enter(child),
+                    // clone: entering a childless node was returned, leaving it is a second cursor
                     None => WalkEvent::Leave(node.clone()),
                 },
                 WalkEvent::Leave(node) => {
@@ -1057,6 +1099,7 @@ pub struct PreorderWithTokens {
 
 impl PreorderWithTokens {
     fn new(start: SyntaxNode) -> PreorderWithTokens {
+        // clone: the walk keeps its start to stop at and returns entering it, a count bump
         let next = Some(WalkEvent::Enter(start.clone().into()));
         PreorderWithTokens { start: start.into(), next, skip_subtree: false }
     }
@@ -1088,8 +1131,10 @@ impl Iterator for PreorderWithTokens {
                 WalkEvent::Enter(el) => match el {
                     NodeOrToken::Node(node) => match node.first_child_or_token() {
                         Some(child) => WalkEvent::Enter(child),
+                        // clone: entering a childless node was returned, leaving it is a second cursor
                         None => WalkEvent::Leave(node.clone().into()),
                     },
+                    // clone: entering a token was returned, leaving it is a second cursor
                     NodeOrToken::Token(token) => WalkEvent::Leave(token.clone().into()),
                 },
                 WalkEvent::Leave(el) if el == &self.start => return None,

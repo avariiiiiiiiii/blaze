@@ -67,7 +67,11 @@ impl ScopeLevels {
 /// command line the crate is given (base-db's `Crate::lint_options`) and the attributes of the
 /// item and of what is around it, through the macro calls it is made by and the `mod`s it is
 /// in, as the HIR has them: the innermost wins, and a `forbid` does not hold against one.
-// The unit makes the arguments something salsa interns: the owner alone is no salsa struct.
+///
+/// The `()` is there because salsa needs it: a tracked function of one argument takes only a
+/// salsa struct or a `salsa::Supertype`, and `ExpressionStoreOwnerId` can be neither (its
+/// variants overlap: `Body(FunctionId)` and `Signature(FunctionId)` are one id). With two
+/// arguments salsa interns the pair (as hir-ty's `closure_exprs`).
 #[salsa::tracked(returns(ref))]
 pub fn lint_levels_on(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> ScopeLevels {
     let krate = owner.krate(db);
@@ -99,17 +103,39 @@ pub fn crate_lint_level(db: &Db, krate: Crate, lint: LintId) -> Level {
     crate_lint_levels(db, krate).level(lint)
 }
 
+/// What stops [`lint_level_at`]: a level it can't find without guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelError {
+    /// `expr` of `owner`'s store is desugared and has no syntax, so the statements and
+    /// expressions with attributes between it and the item can't be found. The caller asks at
+    /// the nearest expression of its scope that has syntax (rustc's lint root of a desugared
+    /// expression is the scope it is built in).
+    NoSyntax { owner: ExpressionStoreOwnerId, expr: ExprId },
+}
+
+impl std::fmt::Display for LevelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LevelError::NoSyntax { owner, expr } => {
+                write!(f, "no lint level at {expr:?} of {owner:?}: the expression is desugared and has no syntax")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LevelError {}
+
 /// The level of `lint` at `expr` of `owner`'s expression store, or at the item for `None`:
 /// rustc's `lint_level_at_node` at a MIR source scope's lint root. An anon const is its
 /// parent's store at its root expression; an inline const is an expression of its body.
 ///
 /// The statements and expressions from `expr` out to the item are read for attributes; when
-/// none has any (nearly always), this is [`lint_levels_on`] of the item. A desugared
-/// expression has no syntax of its own and no attributes: it is at the item's levels.
-pub fn lint_level_at(db: &Db, owner: ExpressionStoreOwnerId, expr: Option<ExprId>, lint: LintId) -> Level {
-    let Some(node) = expr.and_then(|expr| expr_node(db, owner, expr)) else {
-        return lint_levels_on(db, owner, ()).level(lint);
-    };
+/// none has any (nearly always), this is [`lint_levels_on`] of the item. A desugared `expr`,
+/// which has no syntax, is [`LevelError::NoSyntax`], never the item's level: an attribute
+/// between them would be missed.
+pub fn lint_level_at(db: &Db, owner: ExpressionStoreOwnerId, expr: Option<ExprId>, lint: LintId) -> Result<Level, LevelError> {
+    let Some(expr) = expr else { return Ok(lint_levels_on(db, owner, ()).level(lint)) };
+    let Some(node) = expr_node(db, owner, expr) else { return Err(LevelError::NoSyntax { owner, expr }) };
     let krate = owner.krate(db);
     let item = attrs::key(owner_node(db, owner));
     let cfg = krate.cfg_options(db);
@@ -127,12 +153,12 @@ pub fn lint_level_at(db: &Db, owner: ExpressionStoreOwnerId, expr: Option<ExprId
         at = attrs::parent(db, krate, here);
     }
     if !attributed {
-        return lint_levels_on(db, owner, ()).level(lint);
+        return Ok(lint_levels_on(db, owner, ()).level(lint));
     }
     let mut cx = LevelCx::new(db, krate, krate.lint_options(db));
     let mut levels = Levels::new(&mut cx, &mut (), false, false);
     let set = levels.set_at(&mut cx, &mut (), node);
-    levels.spec(&cx, lint.lint(), set).level
+    Ok(levels.spec(&cx, lint.lint(), set).level)
 }
 
 /// The node of `expr` of `owner`'s store, none for a desugared one.

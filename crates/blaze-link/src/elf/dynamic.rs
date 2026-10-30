@@ -75,6 +75,7 @@ fn soname(output: &Output) -> Option<&str> {
 pub(crate) fn sizes(output: &Output, counts: &Counts) -> Vec<(Class, u64)> {
     let symbols = 1 + counts.imports + counts.exports;
     let soname = soname(output).map_or(0, |it| it.len() as u64 + 1);
+    let runpath = output.rpaths.iter().map(|it| it.len() as u64 + 1).sum::<u64>();
     names(output)
         .iter()
         .map(|&name| {
@@ -90,12 +91,13 @@ pub(crate) fn sizes(output: &Output, counts: &Counts) -> Vec<(Class, u64)> {
                         + counts.library_names
                         + counts.libraries
                         + soname
+                        + runpath
                 }
                 GNU_HASH => gnu_hash_len(counts.exports),
                 VERSYM => 2 * symbols,
                 VERNEED => 16 * (counts.libraries + counts.imports),
                 RELA_DYN => RELA * (counts.absolute + counts.got),
-                DYNAMIC => 16 * (counts.libraries + DYNAMIC_FIXED),
+                DYNAMIC => 16 * (counts.libraries + DYNAMIC_FIXED + u64::from(!output.rpaths.is_empty())),
                 EH_FRAME_HDR => 12 + 8 * counts.fdes,
                 _ => unreachable!("a synthetic region `names` doesn't list"),
             };
@@ -299,8 +301,11 @@ impl Tables {
             *flag = 0;
         }
 
+        // alloc: once per image with an rpath, `DT_RUNPATH`'s one string
+        let runpath = (!output.rpaths.is_empty()).then(|| output.rpaths.join(":"));
         let string_bytes = libraries.iter().map(|it| it.name.len() + 1).sum::<usize>()
             + soname(output).map_or(0, |it| it.len() + 1)
+            + runpath.as_ref().map_or(0, |it| it.len() + 1)
             + imports.iter().map(|it| it.name.len() + 1 + it.version.as_ref().map_or(0, |it| it.len() + 1)).sum::<usize>()
             + exports.iter().map(|it| it.name.len() + 1).sum::<usize>();
         let mut strings = Strings::with_capacity(string_bytes, libraries.len() + 1 + 2 * imports.len() + exports.len());
@@ -314,6 +319,7 @@ impl Tables {
             needed_names.push(strings.add(&library.name));
         }
         let soname = soname(output).map(|it| strings.add(it));
+        let runpath = runpath.as_deref().map(|it| strings.add(it));
 
         // Versions of imports, numbered from 2 in order of first use, one probe per import;
         // `.gnu.version` takes each import's as it is found. `needs` holds each version once
@@ -455,6 +461,9 @@ impl Tables {
         }
         if let Some(soname) = soname {
             entry(elf::DT_SONAME, u64::from(soname));
+        }
+        if let Some(runpath) = runpath {
+            entry(elf::DT_RUNPATH, u64::from(runpath));
         }
         let static_tls = shared && tpoff;
         let flags = elf::DF_BIND_NOW

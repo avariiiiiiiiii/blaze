@@ -17,7 +17,9 @@ use cranelift_codegen::{
     ir::{self, InstructionData},
 };
 use blaze_ids::bits::{BitMatrix, BitSet};
+use blaze_mem::Frame;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use super::fragment::Named;
 
@@ -34,7 +36,8 @@ pub(super) struct FrameLocals {
 /// Shares the slots of `frame` between locals that never hold storage at once, and has
 /// `named` say where each named local now is.
 pub(super) fn share(func: &mut ir::Function, frame: &FrameLocals, named: &mut [Named]) {
-    let mut slots: Vec<ir::StackSlot> = named.iter().map(|it| it.slot).collect();
+    let mut slots: SmallVec<[ir::StackSlot; 16]> = SmallVec::new();
+    slots.extend(named.iter().map(|it| it.slot));
     share_slots(func, frame, &mut slots, None);
     for (it, slot) in named.iter_mut().zip(slots) {
         it.slot = slot;
@@ -50,6 +53,7 @@ pub(super) fn share_escaping(
     frame: &FrameLocals,
     named: &mut [ir::StackSlot],
 ) -> ir::Function {
+    // clone: LLVM's copy; the caller keeps `func` unshared for Cranelift should LLVM leave it
     let mut shared = func.clone();
     let escaping = escaping(func);
     share_slots(&mut shared, frame, named, Some(&escaping));
@@ -130,6 +134,19 @@ fn share_slots(
     if frame.slots.is_empty() {
         return;
     }
+    blaze_mem::frame::task(blaze_mem::Tag::Codegen, |scratch| {
+        share_slots_in(func, frame, named, only, scratch)
+    });
+}
+
+/// [`share_slots`], its lists of the function's slots in `scratch`.
+fn share_slots_in(
+    func: &mut ir::Function,
+    frame: &FrameLocals,
+    named: &mut [ir::StackSlot],
+    only: Option<&EntitySet<ir::StackSlot>>,
+    scratch: &Frame,
+) {
     // An address of a slot that nothing uses is what `promote` left of its loads and stores.
     let mut used = EntitySet::with_capacity(func.dfg.num_values());
     for block in func.layout.blocks() {
@@ -139,7 +156,8 @@ fn share_slots(
             }
         }
     }
-    let mut addressed = vec![false; func.sized_stack_slots.len()];
+    let mut addressed = Vec::with_capacity_in(func.sized_stack_slots.len(), scratch);
+    addressed.resize(func.sized_stack_slots.len(), false);
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let Some(slot) = slot_of(&func.dfg.insts[inst]) else { continue };
@@ -151,7 +169,7 @@ fn share_slots(
     for slot in named.iter() {
         addressed[slot.as_u32() as usize] = true;
     }
-    let mut order: Vec<usize> = Vec::new();
+    let mut order: Vec<usize, &Frame> = Vec::with_capacity_in(frame.slots.len(), scratch);
     for (at, slot) in frame.slots.iter().enumerate() {
         let Some(slot) = *slot else { continue };
         if !addressed[slot.as_u32() as usize] {
@@ -167,7 +185,7 @@ fn share_slots(
     });
     // Each group: the slot it keeps, and every local any of its members conflicts with (the
     // rows of its members, or'ed), so that whether one more fits is one bit.
-    let mut groups: Vec<(ir::StackSlot, BitSet<usize>)> = Vec::new();
+    let mut groups: Vec<(ir::StackSlot, BitSet<usize>), &Frame> = Vec::new_in(scratch);
     let mut moved: SecondaryMap<ir::StackSlot, PackedOption<ir::StackSlot>> = SecondaryMap::new();
     let mut any = false;
     for at in order {

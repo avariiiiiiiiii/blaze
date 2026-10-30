@@ -8,13 +8,10 @@
 #![cfg_attr(not(feature = "in-rust-tree"), allow(unused_crate_dependencies))]
 #![cfg_attr(
     feature = "in-rust-tree",
-    feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span, rustc_private)
+    feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span)
 )]
 #![feature(allocator_api)]
 #![allow(internal_features, unused_features)]
-
-#[cfg(feature = "in-rust-tree")]
-extern crate rustc_driver as _;
 
 #[cfg(test)]
 #[global_allocator]

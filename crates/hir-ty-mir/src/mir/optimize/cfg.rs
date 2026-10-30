@@ -18,7 +18,7 @@ use crate::{
 };
 use rustc_type_ir::inherent::IntoKind;
 
-use super::{renumber_blocks, successors, successors_mut};
+use super::{renumber_blocks, successors_mut};
 
 /// rustc's `CleanupPostBorrowck` and `EraseDerefTemps` for what lowering here makes:
 /// `FakeRead`s and the false edges only borrow checking reads go, and a `CopyForDeref` is the
@@ -75,7 +75,7 @@ impl<'a, 'f> CfgSimplifier<'a, 'f> {
         reachable_into(blocks, start, &mut order, frame);
         for &block in &order {
             if let Some(terminator) = &blocks[block].terminator {
-                for target in successors(&terminator.kind) {
+                for target in terminator.kind.all_successors() {
                     pred_count[block_index(target)] += 1;
                 }
             }
@@ -206,7 +206,7 @@ fn reachable_into(
         }
         out.push(block);
         if let Some(terminator) = &blocks[block].terminator {
-            for target in successors(&terminator.kind).into_iter().rev() {
+            for target in terminator.kind.all_successors().rev() {
                 if !seen.contains(block_index(target)) {
                     stack.push(block_index(target));
                 }
@@ -361,7 +361,7 @@ pub(super) fn critical_call_edges(body: &mut MirBody<'_>, frame: &Frame) {
     let pred_count = frame.alloc_slice_fill_with(body.basic_blocks.len(), |_| 0u32);
     for (_, block) in body.basic_blocks.iter() {
         if let Some(terminator) = &block.terminator {
-            for target in successors(&terminator.kind) {
+            for target in terminator.kind.all_successors() {
                 pred_count[block_index(target)] = pred_count[block_index(target)].saturating_add(1);
             }
         }

@@ -1049,10 +1049,9 @@ mod tests {
             let checked = crate::tests::checked(&fixture);
             let db = &checked.db;
             hir::attach_db(db, || {
-                let sema = hir::Semantics::new(db);
                 let krate = hir::check::workspace_crates(db)[0];
                 let frame = crate::tests::frame();
-                let cx = Cx::new(&sema, krate, checked.files(), &frame);
+                let cx = Cx::new(db, krate, checked.files(), &frame);
                 let walk = cx.walk();
                 let mut check = CheckCfg::default();
                 check.add("cfg(foo)").unwrap();

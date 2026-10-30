@@ -8,11 +8,40 @@
 //! header read in place, a column of an image) checks their content hash and bounds-checks every
 //! offset against the mapping's length first, as `blaze-image` checks its page groups.
 //!
+//! How a read stays in bounds. The length is captured once, at map time, from `fstat` of the
+//! descriptor being mapped (so of the same inode, not a name that may since point elsewhere),
+//! and the mapping is exactly that long; [`Mapped::bytes`] is a slice of that length, so every
+//! index safe code makes is checked against it, and nothing here reads past it whatever the file
+//! does later. A file that grows after it is mapped changes nothing seen: the bytes past `len` are
+//! not in the slice.
+//!
+//! Another process may still write or cut the file (the store's packs and the image are
+//! blaze's own files, but nothing in the kernel stops another writer). Writing one in place
+//! breaks [`MapOptions::map`]'s contract: the bytes under a live `&[u8]` change, which a reader
+//! sees as different bytes and its content-hash check refuses. Cutting one short makes a read
+//! of a page past the new end fault: `SIGBUS` on Unix, `EXCEPTION_IN_PAGE_ERROR` on Windows
+//! (which refuses to cut a file a view of which is open, so there only a failing disk does it).
+//! blaze installs no handler for either: the process stops at the faulting read, so it never
+//! goes on with bytes it did not read. Recovering from it (a `sigsetjmp` around each read, as
+//! some databases do) would put a branch and a thread-local write on every read of a mapping
+//! for a case the contract excludes.
+//!
 //! Why a mapping and not a read: a pack or an image is read a few pages at a time, in place,
 //! shared by every reader; a read of the whole file costs a copy at memory bandwidth and the
 //! memory to hold it.
 
 use std::{fmt, fs::File, io, ops::Deref, path::Path, ptr::NonNull};
+
+/// The file mapped read-only and shared, for [`crate::Effect::Map`], as one [`Mapped`] that the
+/// last [`crate::Mapping`] of it unmaps.
+pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
+    // SAFETY: `Effect::Map`'s contract: while any `Mapping` of the file lives, no effect writes,
+    // appends to or truncates it in place; the store and the image replace a file only by
+    // renaming another over it. Broken, a reader sees changed bytes (refused by its hash check)
+    // or stops at a `SIGBUS` (the module doc).
+    let mapped = unsafe { Mapped::open(path) }?;
+    Ok(crate::Mapping::file(mapped))
+}
 
 /// From this length a mapping asks Linux for huge pages: one 2 MiB page each.
 #[cfg(target_os = "linux")]
@@ -96,6 +125,7 @@ impl MapOptions {
     /// truncate would fault on the next read of the pages cut. (Windows refuses to cut a file
     /// a view of which is open, but not to write it.)
     pub unsafe fn map(self, file: &File) -> io::Result<Mapped> {
+        // `fstat` of the descriptor mapped: the one length every read is bounded by.
         let len = usize::try_from(file.metadata()?.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory"))?;
         if len == 0 {
@@ -285,18 +315,30 @@ mod sys {
     /// As [`super::MapOptions::map`]; `len` is the file's length, not 0 (an empty file has no
     /// section).
     pub(super) unsafe fn map(file: &File, len: usize, options: MapOptions) -> io::Result<(NonNull<u8>, usize)> {
-        // SAFETY: an open handle; the section is the whole file, read-only, unnamed, with no
-        // security attributes. The result is checked below.
+        // The section is `len` bytes, the length every read is bounded by: Windows refuses a
+        // read-only section longer than the file, so one cut short since `fstat` fails here
+        // rather than leaving the slice longer than the view.
+        let size = len as u64;
+        // SAFETY: an open handle; the section is `len` bytes of the file, read-only, unnamed,
+        // with no security attributes. The result is checked below.
         let section = unsafe {
-            CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null())
+            CreateFileMappingW(
+                file.as_raw_handle(),
+                std::ptr::null(),
+                PAGE_READONLY,
+                (size >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
         };
         if section.is_null() {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: the section just made, a handle of its own that nothing else owns.
         let section = unsafe { OwnedHandle::from_raw_handle(section) };
-        // SAFETY: the section just made; the whole of it, read-only. The result is checked below.
-        let view = unsafe { MapViewOfFile(section.as_raw_handle(), FILE_MAP_READ, 0, 0, 0) };
+        // SAFETY: the section just made; `len` bytes of it from the start, all of it, read-only.
+        // The result is checked below.
+        let view = unsafe { MapViewOfFile(section.as_raw_handle(), FILE_MAP_READ, 0, 0, len) };
         let Some(at) = NonNull::new(view.Value.cast::<u8>()) else {
             return Err(io::Error::last_os_error());
         };

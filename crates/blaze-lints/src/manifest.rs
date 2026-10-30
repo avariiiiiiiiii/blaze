@@ -27,7 +27,7 @@ pub fn lints(manifest: &Path, workspace: &Path) -> Result<Vec<ManifestLint>, Str
 /// The flags cargo gives rustc for `lints`, in its order: `--warn=clippy::all`.
 pub fn flags(lints: &[ManifestLint]) -> Vec<String> {
     let command_line = crate::level::of_manifest(lints);
-    let flags = command_line.opts.into_iter();
+    let flags = command_line.lints.opts.into_iter();
     flags.map(|(name, level)| format!("{}={name}", crate::level::flag_of(level))).collect()
 }
 

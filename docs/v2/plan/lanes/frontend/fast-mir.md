@@ -242,7 +242,8 @@ diagnostics that name locals are unaffected. What could differ, and why it doesn
   tree's run, each copied whole into its test module and compared on generated inputs; every
   other part of the builder is the same code before and after, so copying all of `lower.rs`
   (5000 lines) into a test would compare a function with itself.
-- `harness/v2/frontend/cases/mir/` (52 programs, 47 accepted, 5 rejected): run output shows drop
+- `harness/v2/frontend/cases/mir/` (53 programs, 48 accepted, 5 rejected; `053` is `become`, lowered in `lower/tail_call.rs` as
+  rustc's `break_for_tail_call`): run output shows drop
   order on unwinding out of calls, struct literals, method chains, indexing, division and drops
   that panic during assignment; on `break`/`continue`/labeled breaks/`return`/`?`; in guards,
   `let else`, `if let`, `while let` and `for`; temporaries in tails and `if let` scrutinees in

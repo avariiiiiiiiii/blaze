@@ -1,7 +1,12 @@
 //! rustc's const checking (`tests/ui/consts/`, `tests/ui/error-codes/E0015.rs`), and blaze's
 //! own `blaze::const_impure`, given only in a crate that uses cached functions.
 
-use crate::tests::{checked, ui};
+use crate::{
+    Options,
+    emit::Style,
+    lower::mutable_ref_binding::BUILT_ON,
+    tests::{Mode, checked, checked_with, compiletest, items::ui_core, normalized, ui},
+};
 
 #[test]
 fn a_call_of_a_function_that_is_not_const_in_a_constant() {
@@ -182,10 +187,12 @@ error: aborting due to 1 previous error
 }
 
 #[test]
-fn a_function_pointer_call_in_a_const_fn() {
-    // tests/ui/consts/issue-56164.rs, its second error; the first, the call of a closure, is
-    // not given yet (v2/requests/diagnostics.md, diagnostics-lints).
-    let source = r#"const fn bad(input: fn()) {
+fn a_closure_call_and_a_function_pointer_call_in_a_const_fn() {
+    // tests/ui/consts/issue-56164.rs
+    let source = r#"const fn foo() { (||{})() }
+//~^ ERROR cannot call non-const closure
+
+const fn bad(input: fn()) {
     input()
     //~^ ERROR function pointer calls are not allowed
 }
@@ -193,16 +200,423 @@ fn a_function_pointer_call_in_a_const_fn() {
 fn main() {
 }
 "#;
-    let stderr = r#"error: function pointer calls are not allowed in constant functions
-  --> $DIR/issue-56164.rs:2:5
+    let stderr = r#"error[E0015]: cannot call non-const closure in constant functions
+  --> $DIR/issue-56164.rs:1:18
+   |
+LL | const fn foo() { (||{})() }
+   |                  ^^^^^^^^
+   |
+   = note: closures need an RFC before allowed to be called in constant functions
+   = note: calls in constant functions are limited to constant functions, tuple structs and tuple variants
+
+error: function pointer calls are not allowed in constant functions
+  --> $DIR/issue-56164.rs:5:5
    |
 LL |     input()
    |     ^^^^^^^
 
-error: aborting due to 1 previous error
+error: aborting due to 2 previous errors
 
+For more information about this error, try `rustc --explain E0015`.
 "#;
     assert_eq!(ui("issue-56164.rs", "2015", source), stderr);
+}
+
+#[test]
+fn a_method_of_a_trait_that_is_not_const_in_a_const_fn() {
+    // tests/ui/traits/const-traits/issue-88155.rs, with minicore's `Sized` for `T`'s bound.
+    let source = r#"#![feature(const_trait_impl)]
+
+pub trait A {
+    fn assoc() -> bool;
+}
+
+pub const fn foo<T: A>() -> bool {
+    T::assoc()
+    //~^ ERROR cannot call non-const associated function
+}
+
+fn main() {}
+"#;
+    let stderr = r#"error[E0015]: cannot call non-const associated function `<T as A>::assoc` in constant functions
+  --> $DIR/issue-88155.rs:8:5
+   |
+LL |     T::assoc()
+   |     ^^^^^^^^^^
+   |
+note: associated function `assoc` is not const because trait `A` is not const
+  --> $DIR/issue-88155.rs:3:1
+   |
+LL | pub trait A {
+   | ^^^^^^^^^^^ this trait is not const
+LL |     fn assoc() -> bool;
+   |     ------------------- this associated function is not const
+   = note: calls in constant functions are limited to constant functions, tuple structs and tuple variants
+help: consider making trait `A` const
+   |
+LL | pub const trait A {
+   |     +++++
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0015`.
+"#;
+    assert_eq!(ui_core("issue-88155.rs", "2015", "sized", source), stderr);
+}
+
+#[test]
+#[ignore = "needs a core whose `PartialEq` is a `const trait` under `#[rustc_const_unstable(feature = \"const_cmp\")]` with `const` impls for references and primitives, as rustc's is; minicore's is neither, so the call is `cannot call non-const operator` (E0015) without the `const_cmp` error"]
+fn a_comparison_of_references_in_a_const_fn() {
+    // tests/ui/consts/issue-90870.rs
+    let source = r#"// Regression test for issue #90870.
+
+#![allow(dead_code)]
+
+const fn f(a: &u8, b: &u8) -> bool {
+    //~^ HELP: add `#![feature(const_cmp)]` to the crate attributes to enable
+    //~| HELP: add `#![feature(const_cmp)]` to the crate attributes to enable
+    //~| HELP: add `#![feature(const_cmp)]` to the crate attributes to enable
+    a == b
+    //~^ ERROR: cannot call conditionally-const operator in constant functions
+    //~| ERROR: `PartialEq` is not yet stable as a const trait
+    //~| HELP: consider dereferencing here
+    //~| HELP: add `#![feature(const_trait_impl)]` to the crate attributes to enable
+}
+
+const fn g(a: &&&&i64, b: &&&&i64) -> bool {
+    a == b
+    //~^ ERROR: cannot call conditionally-const operator in constant functions
+    //~| ERROR: `PartialEq` is not yet stable as a const trait
+    //~| HELP: consider dereferencing here
+    //~| HELP: add `#![feature(const_trait_impl)]` to the crate attributes to enable
+}
+
+const fn h(mut a: &[u8], mut b: &[u8]) -> bool {
+    while let ([l, at @ ..], [r, bt @ ..]) = (a, b) {
+        if l == r {
+        //~^ ERROR: cannot call conditionally-const operator in constant functions
+        //~| ERROR: `PartialEq` is not yet stable as a const trait
+        //~| HELP: consider dereferencing here
+        //~| HELP: add `#![feature(const_trait_impl)]` to the crate attributes to enable
+            a = at;
+            b = bt;
+        } else {
+            return false;
+        }
+    }
+
+    a.is_empty() && b.is_empty()
+}
+
+fn main() {}
+"#;
+    let stderr = r#"error[E0658]: cannot call conditionally-const operator in constant functions
+  --> $DIR/issue-90870.rs:9:5
+   |
+LL |     a == b
+   |     ^^^^^^
+   |
+   = note: calls in constant functions are limited to constant functions, tuple structs and tuple variants
+   = note: see issue #143874 <https://github.com/rust-lang/rust/issues/143874> for more information
+   = help: add `#![feature(const_trait_impl)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+help: consider dereferencing here
+   |
+LL |     *a == *b
+   |     +     +
+
+error: `PartialEq` is not yet stable as a const trait
+  --> $DIR/issue-90870.rs:9:5
+   |
+LL |     a == b
+   |     ^^^^^^
+   |
+help: add `#![feature(const_cmp)]` to the crate attributes to enable
+   |
+LL + #![feature(const_cmp)]
+   |
+
+error[E0658]: cannot call conditionally-const operator in constant functions
+  --> $DIR/issue-90870.rs:17:5
+   |
+LL |     a == b
+   |     ^^^^^^
+   |
+   = note: calls in constant functions are limited to constant functions, tuple structs and tuple variants
+   = note: see issue #143874 <https://github.com/rust-lang/rust/issues/143874> for more information
+   = help: add `#![feature(const_trait_impl)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+help: consider dereferencing here
+   |
+LL |     ****a == ****b
+   |     ++++     ++++
+
+error: `PartialEq` is not yet stable as a const trait
+  --> $DIR/issue-90870.rs:17:5
+   |
+LL |     a == b
+   |     ^^^^^^
+   |
+help: add `#![feature(const_cmp)]` to the crate attributes to enable
+   |
+LL + #![feature(const_cmp)]
+   |
+
+error[E0658]: cannot call conditionally-const operator in constant functions
+  --> $DIR/issue-90870.rs:26:12
+   |
+LL |         if l == r {
+   |            ^^^^^^
+   |
+   = note: calls in constant functions are limited to constant functions, tuple structs and tuple variants
+   = note: see issue #143874 <https://github.com/rust-lang/rust/issues/143874> for more information
+   = help: add `#![feature(const_trait_impl)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+help: consider dereferencing here
+   |
+LL |         if *l == *r {
+   |            +     +
+
+error: `PartialEq` is not yet stable as a const trait
+  --> $DIR/issue-90870.rs:26:12
+   |
+LL |         if l == r {
+   |            ^^^^^^
+   |
+help: add `#![feature(const_cmp)]` to the crate attributes to enable
+   |
+LL + #![feature(const_cmp)]
+   |
+
+error: aborting due to 6 previous errors
+
+For more information about this error, try `rustc --explain E0658`.
+"#;
+    assert_eq!(dated(ui_core("issue-90870.rs", "2015", "eq, slice", source)), stderr);
+}
+
+#[test]
+#[ignore = "needs the desugaring's type printed as rustc's diagnostics print it (`std::ops::Range<i32>`; the checker's message spells it with `type_name`, `core::ops::range::Range<i32>`: v2/requests/codegen-rq-mir-constcheck.md R2's printer, R8) and std's `Range`, which minicore's stands in for"]
+fn a_for_loop_in_a_constant() {
+    // tests/ui/consts/const-for-feature-gate.rs
+    let source = r#"// gate-test-const_for
+
+const _: () = {
+    for _ in 0..5 {}
+    //~^ ERROR cannot use `for`
+    //~| ERROR cannot use `for`
+};
+
+fn main() {}
+"#;
+    let stderr = r#"error[E0015]: cannot use `for` loop on `std::ops::Range<i32>` in constants
+  --> $DIR/const-for-feature-gate.rs:4:14
+   |
+LL |     for _ in 0..5 {}
+   |              ^^^^
+   |
+   = note: calls in constants are limited to constant functions, tuple structs and tuple variants
+
+error[E0015]: cannot use `for` loop on `std::ops::Range<i32>` in constants
+  --> $DIR/const-for-feature-gate.rs:4:14
+   |
+LL |     for _ in 0..5 {}
+   |              ^^^^
+   |
+   = note: calls in constants are limited to constant functions, tuple structs and tuple variants
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `rustc --explain E0015`.
+"#;
+    assert_eq!(ui_core("const-for-feature-gate.rs", "2015", "iterator, range", source), stderr);
+}
+
+#[test]
+#[ignore = "needs rustc's `def_path_str` of an item nested in a function's body (`copy::copy`; the checker writes `copy`: v2/requests/codegen-rq-mir-constcheck.md R8)"]
+fn unstable_intrinsics_in_a_const_fn_exposed_to_stable() {
+    // tests/ui/consts/const-unstable-intrinsic.rs, with its auxiliary/unstable_intrinsic.rs
+    let source = r#"//! Ensure that unstable intrinsics can actually not be called,
+//! neither within a crate nor cross-crate.
+//@ aux-build:unstable_intrinsic.rs
+#![feature(staged_api, rustc_attrs, intrinsics)]
+#![stable(since = "1.0.0", feature = "stable")]
+#![feature(local)]
+
+extern crate unstable_intrinsic;
+
+fn main() {
+    const_main();
+}
+
+const fn const_main() {
+    let x = 42;
+    unsafe {
+        unstable_intrinsic::size_of_val(&x);
+        //~^ERROR: unstable library feature `unstable`
+        //~|ERROR: not yet stable as a const intrinsic
+        unstable_intrinsic::align_of_val(&x);
+        //~^ERROR: unstable library feature `unstable`
+        //~|ERROR: not yet stable as a const intrinsic
+
+        size_of_val(&x);
+        //~^ERROR: cannot use `#[feature(local)]`
+        align_of_val(&x);
+        //~^ERROR: cannot use `#[feature(local)]`
+    }
+}
+
+#[unstable(feature = "local", issue = "42")]
+#[rustc_intrinsic]
+pub const unsafe fn size_of_val<T>(x: *const T) -> usize;
+
+#[unstable(feature = "local", issue = "42")]
+#[rustc_const_unstable(feature = "local", issue = "42")]
+#[rustc_intrinsic]
+pub const unsafe fn align_of_val<T>(x: *const T) -> usize;
+
+#[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_const_stable(feature = "const_intrinsic_copy", since = "1.63.0")]
+#[inline]
+pub const unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize) {
+    // Const stability attributes are not inherited from parent items.
+    #[rustc_intrinsic]
+    const unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize);
+
+    unsafe { copy(src, dst, count) }
+    //~^ ERROR cannot be (indirectly) exposed to stable
+}
+
+// Ensure that a fallback body is recursively-const-checked.
+mod fallback {
+    #[rustc_intrinsic]
+    const unsafe fn copy<T>(src: *const T, _dst: *mut T, _count: usize) {
+        super::size_of_val(src);
+        //~^ ERROR cannot use `#[feature(local)]`
+    }
+}
+"#;
+    let aux = r#"#![feature(staged_api, rustc_attrs, intrinsics)]
+#![stable(since="1.0.0", feature = "stable")]
+
+#[unstable(feature = "unstable", issue = "42")]
+#[rustc_intrinsic]
+pub const unsafe fn size_of_val<T>(x: *const T) -> usize;
+
+#[unstable(feature = "unstable", issue = "42")]
+#[rustc_const_unstable(feature = "unstable", issue = "42")]
+#[rustc_intrinsic]
+pub const unsafe fn align_of_val<T>(x: *const T) -> usize;
+"#;
+    let stderr = r#"error[E0658]: use of unstable library feature `unstable`
+  --> $DIR/const-unstable-intrinsic.rs:17:9
+   |
+LL |         unstable_intrinsic::size_of_val(&x);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: see issue #42 <https://github.com/rust-lang/rust/issues/42> for more information
+   = help: add `#![feature(unstable)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error[E0658]: use of unstable library feature `unstable`
+  --> $DIR/const-unstable-intrinsic.rs:20:9
+   |
+LL |         unstable_intrinsic::align_of_val(&x);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: see issue #42 <https://github.com/rust-lang/rust/issues/42> for more information
+   = help: add `#![feature(unstable)]` to the crate attributes to enable
+   = note: this compiler was built on YYYY-MM-DD; consider upgrading it if it is out of date
+
+error: `size_of_val` is not yet stable as a const intrinsic
+  --> $DIR/const-unstable-intrinsic.rs:17:9
+   |
+LL |         unstable_intrinsic::size_of_val(&x);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: add `#![feature(unstable)]` to the crate attributes to enable
+   |
+LL + #![feature(unstable)]
+   |
+
+error: `align_of_val` is not yet stable as a const intrinsic
+  --> $DIR/const-unstable-intrinsic.rs:20:9
+   |
+LL |         unstable_intrinsic::align_of_val(&x);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: add `#![feature(unstable)]` to the crate attributes to enable
+   |
+LL + #![feature(unstable)]
+   |
+
+error: const function that might be (indirectly) exposed to stable cannot use `#[feature(local)]`
+  --> $DIR/const-unstable-intrinsic.rs:24:9
+   |
+LL |         size_of_val(&x);
+   |         ^^^^^^^^^^^^^^^
+   |
+help: if the function is not (yet) meant to be exposed to stable const contexts, add `#[rustc_const_unstable]`
+   |
+LL + #[rustc_const_unstable(feature = "...", issue = "...")]
+LL | const fn const_main() {
+   |
+
+error: const function that might be (indirectly) exposed to stable cannot use `#[feature(local)]`
+  --> $DIR/const-unstable-intrinsic.rs:26:9
+   |
+LL |         align_of_val(&x);
+   |         ^^^^^^^^^^^^^^^^
+   |
+help: if the function is not (yet) meant to be exposed to stable const contexts, add `#[rustc_const_unstable]`
+   |
+LL + #[rustc_const_unstable(feature = "...", issue = "...")]
+LL | const fn const_main() {
+   |
+
+error: intrinsic `copy::copy` cannot be (indirectly) exposed to stable
+  --> $DIR/const-unstable-intrinsic.rs:48:14
+   |
+LL |     unsafe { copy(src, dst, count) }
+   |              ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: mark the caller as `#[rustc_const_unstable]`, or mark the intrinsic `#[rustc_intrinsic_const_stable_indirect]` (but this requires team approval)
+
+error: const function that might be (indirectly) exposed to stable cannot use `#[feature(local)]`
+  --> $DIR/const-unstable-intrinsic.rs:56:9
+   |
+LL |         super::size_of_val(src);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: if the function is not (yet) meant to be exposed to stable const contexts, add `#[rustc_const_unstable]`
+   |
+LL +     #[rustc_const_unstable(feature = "...", issue = "...")]
+LL |     const unsafe fn copy<T>(src: *const T, _dst: *mut T, _count: usize) {
+   |
+
+error: aborting due to 8 previous errors
+
+For more information about this error, try `rustc --explain E0658`.
+"#;
+    let fixture = format!(
+        "//- /const-unstable-intrinsic.rs crate:main deps:unstable_intrinsic edition:2015\n{source}\
+         //- /auxiliary/unstable_intrinsic.rs crate:unstable_intrinsic library edition:2015\n{aux}"
+    );
+    assert_eq!(dated(ui_fixture(&fixture)), stderr);
+}
+
+/// rustc writes the date it was built on as `YYYY-MM-DD` under `-Z ui-testing`.
+fn dated(stderr: String) -> String {
+    stderr.replace(&format!("was built on {BUILT_ON};"), "was built on YYYY-MM-DD;")
+}
+
+/// The `.stderr` of a fixture whose workspace crate is the UI test and whose `library` crates
+/// are its `aux-build`s, as [`ui`] writes it.
+fn ui_fixture(fixture: &str) -> String {
+    let options = compiletest(Mode::Other, &Options::default());
+    let checked = checked_with(fixture, "$DIR/", &options);
+    normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 
 const IMPURE: &str = r#"

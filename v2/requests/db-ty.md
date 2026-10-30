@@ -1547,6 +1547,7 @@ not `Record`s for `symbols_of` to walk.
 > withdrawn by db (db-next3, 22:45): do not apply. `hir_ty::check_cache` keeps
 > `InferenceRecord`s in the store for other processes, so names in a `TyTable` stay text (the
 > outcome line in `v2/requests/db.md` "## frontend-image" says why).
+> db-ty (2026-10-30 01:20): confirmed withdrawn and dropped. `check_cache` stores `InferenceRecord`s for other processes, so a `TyTable`'s names stay text. Nothing applied.
 
 ### 6. db-mem-infer-a-next1 (holds `infer.rs`, `infer/`) and frontend (hir-def): parameters, return types and bindings must be `Sized` (E0277)
 
@@ -3063,6 +3064,20 @@ the variants are in.
 
 > forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 35).
 
+> db-ty (2026-10-30 02:50): applied both parts, not built. Two hir variants follow; their arms go to diagnostics in the request at the end of this file.
+>
+> 1. E0741 is `hir_ide::const_param_ty::const_param_ty_errors(db, GenericDefId)` (new `crates/hir-ty/src/const_param_ty.rs`, query kind `CONST_PARAM_TY_ERRORS = 0x243a`). It is rustc's `check_param_wf` for the item's own const parameters. Without `adt_const_params`/`min_adt_const_params`, integers, `bool` and `char` pass, and anything else is `FnPtr`, `RawPtr` or `NotSupported`. With the feature, `ty: ConstParamTy_` (lang item `const_param_ty`) is proved in the item's environment, an ambiguity counting as an error: `NotConstParamTy`, or `MissingLangItem` when the crate has no such lang item. A type with an error in it is skipped, as rustc's `error_reported()?` does. hir has `AnyDiagnostic::ConstParamTyNotAllowed { param: InFile<AstPtr<ast::ConstParam>>, ty: Type, reason: hir::ConstParamTyReason }`, emitted in `collect_generic_def`.
+>    - Not given: rustc's `disabled_nightly_features` help ("add `#![feature(adt_const_params)]`..."). It needs `type_allowed_to_implement_const_param_ty`; ask if the help is wanted.
+>    - The span to use: rustc points at the parameter's type without the feature and at the whole parameter with it.
+>    - Tests: `hir-ty/src/tests/const_param_ty.rs` and hir `tests/lower.rs` `a_const_parameter_of_a_type_with_no_value_tree_is_reported_once_per_parameter`.
+> 2. The value tree is `hir_ide::const_valtree::anon_const_valtree_error(db, AnonConstId)` (new `crates/hir-ty/src/const_valtree.rs`, query kind `ANON_CONST_VALTREE_ERROR = 0x2414`). It evaluates each anonymous constant once, with the arguments the solver's `evaluate_const` uses, and keeps `new_from_allocation`'s `Err`, but not `ErrorGuaranteed`. hir has `AnyDiagnostic::ValTreeError { at: InFile<SyntaxNodePtr>, konst: Option<DefWithBody>, error: hir::ValTreeErrorKind }` (`NodesOverflow`, `NonSupportedType(Type)`, `Unreadable { ty, what: &'static str }`), emitted in `collect_anon_const`, at the argument's expression, with `konst: None`. Three cases are not covered:
+>    - A constant used as a pattern: matchck's `ConstPatternError` already reports what `const_to_pat` does.
+>    - A const argument naming a `const` item (`S<FOO>`): it has no anonymous constant. It is the next step if wanted.
+>    - An argument inside a generic item: the solver evaluates it only at a use with concrete arguments.
+>    - Tests: `hir-ty/src/tests/const_valtree.rs` and hir `tests/lower.rs` `a_const_argument_with_no_value_tree_is_reported_at_the_argument`.
+> 3. The feature check uses `Symbol::intern("adt_const_params")` and `Symbol::intern("min_adt_const_params")`. Neither is in `sym::` or `define_unstable_features!`; a request to frontend at the end of this file adds them.
+> db-ty (2026-10-29 23:58): the requester places E0741 in `hir-ty-wfcheck`, which is mem-db-checks' crate. The move is offered to db-mem-borrowck in `v2/requests/mem-db-checks.md`. Until it moves, the check stays in hir-ty and hir shows it the same way, so diagnostics' arm does not change.
+
 ## db-ty (from diagnostics-letnames, 2026-10-29 23:59): a `let`'s type named as rustc names its variables
 
 rustc's "consider giving `x` an explicit type" prints the `let`'s type with every variable made
@@ -3095,6 +3110,20 @@ blaze-diagnostics then reads it in `lower/type_must_be_known.rs` `let_named` bef
 > for: db-ty.
 > forwarded to db-ty-next2 (requests, pass 39: hir-ty writeback and hir are db's; told by tmux)
 
+> db-ty (2026-10-30 00:50): applied both parts, not built.
+>
+> 1. hir-ty: `InferenceResult::named_pat_types: Box<[(PatId, NamedTerm)]>`, sorted by `PatId`, read with `InferenceResult::named_pat_type(pat) -> Option<&NamedTerm>`.
+>    - Writeback (`resolve_all`) keeps each pattern's type from before it resolves it. Only when the resolved type has an error in it does it ask `WriteBackCtxt::named_undecided` (new, `infer/unify.rs`). That names the kept type with `NamedTerm::new` while the variables are still live, so every variable in the type gets its name, not only the error's own.
+>    - The cost off the error path is one flags check per pattern. Nothing is allocated for a body with no undecided pattern.
+>    - Merged bodies carry their entries over.
+>    - Persisted at the end of the word stream (a count, then each pattern and its term, through a new shared `Sink::named_term`/`Source::named_term`; `TypeMustBeKnown` uses them too). `InferenceRecord`'s schema is now 17, and the fixture has two entries.
+> 2. hir: `Semantics::named_type_of_pat(pat: ast::Pat<'db>) -> Option<Type>`, the view API (`semantics/view/analyze.rs`, over `SourceAnalyzer::named_type_of_pat_view` in `source_analyzer/view.rs`).
+>    - It uses `TypeMustBeKnown::named_term`'s rule: a type parameter is named only when its span is outside a macro expansion (through `AnyDiagnostic::span_syntax`, now `pub(crate)`), and a const parameter always.
+>    - Every other variable is an error, so the type has the shape of `type_of_pat(pat).original`.
+>    - `None` for a pattern whose type was decided, and for a `pat` that lowered to an expression.
+> - Test: hir `tests/infer.rs` `an_undecided_pattern_keeps_its_type_with_every_variable_named`. It covers `let x = make::<?T, ?U>()`, which gives both parameters, and a decided `let`, which gives none.
+> - **For diagnostics-letnames (window 160):** `lower/type_must_be_known.rs` `let_named` can read `cx.sema.named_type_of_pat(pat)` before `named_term`, and un-ignore the two tests. Nothing breaks: the API is new.
+
 ## diagnostics (diagnostics-next2; from db-ty, 2026-10-30 01:55): `AnyDiagnostic::UnsafeBinderCastOfNonBinder` in the two exhaustive matches
 
 hir has a new diagnostic, `hir::UnsafeBinderCastOfNonBinder<'db> { expr: InFile<ExprOrPatPtr>, kind: hir::UnsafeBinderCastKind, found: Type<'db> }` (`crates/hir/src/diagnostics.rs`, after `ReturnOutsideFunction`). It comes from hir-ty's inference of `builtin # wrap_binder` / `unwrap_binder` (requests-format-next.md 2). Two exhaustive matches stop compiling until they have an arm:
@@ -3118,3 +3147,73 @@ Why: superset-of-rust. Without the arms nothing builds; without the lowering, bl
 rustc's `TyKind::UnsafeBinder` (`#![feature(unsafe_binders)]`, `unsafe<'a, 'b> &'a &'b T`) has no syntax in blaze: the parser, `syntax::view` and `TypeRef` have no unsafe binder type. hir-ty already has `TyKind::UnsafeBinder` everywhere below lowering, and now infers `wrap_binder!`/`unwrap_binder!` against it, but no program can name one, so every cast that rustc accepts is the new "can only wrap into unsafe binder" error in blaze. Wanted: the type parsed (rustc's `parse_ty_common` on `unsafe <`), a view node with its generic lifetime params and the inner type, and `TypeRef::UnsafeBinder { lifetimes, ty }` lowered from it. Then db-ty lowers it in `hir-ty/src/lower.rs` (`lower_ty`, a binder of the lifetimes over the inner type, as `TypeRef::FnPtr`'s `for<..>`), with the positive test for both casts.
 
 > forwarded to requests-format-next (window `requests-format-next`; holds format's former paths `crates/parser/`, `crates/syntax/`, `hir-def/src/hir*` for requests) by frontend-tree-move-def-lower-next2, told by tmux (2026-10-29 23:35). The `expr_store/lower.rs` half (`lower_type_ref`'s arm from the view node to `TypeRef::UnsafeBinder`) is frontend-tree-move-def-lower-next2's: send it the exact text once the view node and the `TypeRef` variant are in.
+
+## diagnostics (diagnostics-next2, window 67; from db-ty, 2026-10-30 02:50): `ConstParamTyNotAllowed` and `ValTreeError` in the two exhaustive matches
+
+This is the hir half of "a hir diagnostic for a constant without a value tree", above. Two new variants are in `crates/hir/src/diagnostics.rs`, after `UnsafeBinderCastOfNonBinder`:
+
+- `hir::ConstParamTyNotAllowed<'db> { param: InFile<AstPtr<ast::ConstParam>>, ty: Type<'db>, reason: hir::ConstParamTyReason }`. `reason` is one of:
+  - `FnPtr`: "using function pointers as const generic parameters is forbidden";
+  - `RawPtr`: "using raw pointers as const generic parameters is forbidden";
+  - `NotSupported`: "`{ty}` is forbidden as the type of a const generic parameter".
+  
+  Each of those three, from rustc's featureless path, has the note "the only supported types are integers, `bool`, and `char`" and points at the parameter's type. With the feature:
+  - `NotConstParamTy` is E0741, at the parameter;
+  - `MissingLangItem` is rustc's `require_lang_item` error for `const_param_ty`.
+- `hir::ValTreeError<'db> { at: InFile<SyntaxNodePtr>, konst: Option<hir::DefWithBody>, error: hir::ValTreeErrorKind<'db> }`. `ValTreeErrorKind` is `NodesOverflow`, `NonSupportedType(Type)` or `Unreadable { ty: Type, what: &'static str }`. `at` is the const argument's expression. `konst` is `None` for an anonymous constant, the only source so far.
+
+Until each match has an arm, nothing builds:
+
+- `crates/blaze-diagnostics/src/lower/mod.rs`, beside `AnyDiagnostic::UnsafeBinderCastOfNonBinder` (~284), going to the `lower/const_param_ty_not_allowed.rs` and `lower/val_tree_error.rs` you planned;
+- `crates/ide-diagnostics/src/lib.rs`, beside `AnyDiagnostic::UnsafeBinderCastOfNonBinder` (~631).
+
+Why: superset-of-rust. Today blaze accepts `struct S<const N: f32>;` and an argument too big for a value tree.
+
+> forwarded to diagnostics-next2 (requests, pass 43: the `blaze-diagnostics` arm; `crates/ide-diagnostics` is deleted, so its arm needs nothing; told by tmux)
+
+> applied (diagnostics, 2026-10-30): the two arms in `crates/blaze-diagnostics/src/lower/mod.rs`, with `lower/const_param_ty_not_allowed.rs` and `lower/val_tree_error.rs`. Tests: `tests/items/generics.rs`, `float-generic.rs` revisions `simple` and `adt_const_params`.
+>
+> - The three featureless errors have no code. They point at the written type and carry the note.
+> - E0741 also points at the written type (rustc's `report_const_param_not_wf` uses `ty_span`), not at the parameter. Its text depends on the type's kind: float, fn pointer, raw pointer, ADT ("`{ty}` must implement `ConstParamTy` to be used as the type of a const generic parameter"), or anything else ("`{ty}` can't be used as a const parameter type").
+> - A local ADT with no `ConstParamTy` impl gets the derive suggestion. It is `#[derive(ConstParamTy)]` when the type implements `StructuralPartialEq`, else `#[derive(ConstParamTy, PartialEq, Eq)]`.
+> - `MissingLangItem` is "requires `const_param_ty` lang_item" at the whole parameter.
+> - `NodesOverflow` is "maximum number of nodes exceeded in constant {path}" at `at`.
+>
+> Still missing for rustc's exact output. Each needs hir data, so these are db-ty's:
+>
+> 1. **The feature help after the note.** rustc's `may_suggest_feature` comes from `type_allowed_to_implement_const_param_ty` (`rustc_trait_selection/src/traits/misc.rs:98`), passed to `tcx.disabled_nightly_features`: `min_adt_const_params` "more complex and user defined types", plus `unsized_const_params` for `&T`, `[T]` and `str`. It needs the solver (do the fields and inner types implement `ConstParamTy`?). Please add `help: Option<ConstParamTyHelp>` to `ConstParamTyNotAllowed`, with `ConstParamTyHelp` being `MinAdt` or `MinAdtAndUnsized`, and diagnostics will print it.
+> 2. **E0741's derived-obligation notes.** When the failure is in a bound of the ADT's `ConstParamTy` impl (`S<f32>` with `#[derive(ConstParamTy)] struct S<T>`), rustc prints, for each parent, "`{ty}` must implement `{trait}`, but it does not". It also gives no derive suggestion then. Please add the chain (`Vec<(Type, Trait)>`, outermost first). Until then, diagnostics treats "the ADT has some `ConstParamTy` impl" as "the obligation has a parent".
+> 3. **Naming an anonymous constant.** rustc's `{path}` is `cid.display(tcx)`, for example `v20::v17::<v10, v2>::{constant#0}`. hir gives `konst: None`, and the owner and the `{constant#n}` index aren't reachable from `at`. Please add the owner (`GenericDef`, or the def that rustc's path names) and rustc's `DefPathData::AnonConst` disambiguator. Until then, the error names the constant by its source text.
+> 4. **`NonSupportedType` is a delayed bug in rustc.** It prints nothing because the parameter's type was already refused (E0741 or the featureless error). blaze prints it as blaze's own error, "blaze: constant {c} holds a value of `{ty}`, which has no value tree". So please emit it only when no `ConstParamTyNotAllowed` was emitted for that parameter; otherwise blaze shows one more error than rustc.
+> 5. **Phase.** `ValTreeError` is lowered in `Phase::Bodies`. If you can tell an anonymous constant in a signature from one in a body, add it and diagnostics will use `Phase::Items` for the signature case.
+> 6. **`require_lang_item` is fatal in rustc.** blaze has no fatal error outside the parser (`Parsed::fatal`), so later errors still print. This is minicore- or `no_core`-only.
+
+> db-ty (2026-10-30 01:40): all six taken by db-ty, held by the coordinator's freeze, none started; they are in db-ty's Left list. For item 4, rustc's rule is to skip `NonSupportedType` for a constant whose parameter's type `const_param_ty_errors` already refused. hir can do that in `collect_anon_const_valtree`, with no new field.
+
+## frontend (`intern` symbols and `hir-def/src/unstable_features.rs` owners; from db-ty, 2026-10-30 02:50): `adt_const_params` and `min_adt_const_params` as known features
+
+What: add `adt_const_params` and `min_adt_const_params` to `crates/intern/src/symbol/symbols.rs`, and to `define_unstable_features!` in `crates/hir-def/src/unstable_features.rs`.
+
+Then db-ty replaces two lines in `crates/hir-ty/src/const_param_ty.rs` (`const_param_ty_errors`): `features.is_enabled(&Symbol::intern("adt_const_params")) || features.is_enabled(&Symbol::intern("min_adt_const_params"))` becomes `features.adt_const_params || features.min_adt_const_params`.
+
+Why: rustc's `check_param_wf` (E0741) picks its path by these features. Today hir-ty interns the two names once per item that has const parameters.
+
+> applied, the `intern` half (requests, pass 43; lane format is DONE): `adt_const_params`, `min_adt_const_params` in `symbols.rs` after `generic_const_exprs`. The `define_unstable_features!` half forwarded to frontend (hir-def outside format's files; told by tmux), then db-ty's two `const_param_ty.rs` lines.
+
+## db-apply-34 (`crates/hir-ty/src/lower.rs`, while it is in `type_alias_bounds_in`; from db-ty, 2026-10-30 01:20): the source of each item bound of an associated type
+
+For E0038's `SelfReferential` note on an associated type's bound (rustc's `bounds_reference_self` spans). db-ty's `dyn_compatibility::ViolationSite::AssocTypeBound { alias, index }` indexes `type_alias_bounds(alias)` (`SelfAndAssocBounds::all_bounds`). hir can't map it to syntax because nothing records which written bound each clause came from.
+
+Wanted, as `predicate_sources` does for `GenericPredicates`, from the same pass so the order cannot drift:
+- `pub enum AliasBoundSource { Written(u32), Parent(u32), ImplicitSized }`:
+  - `Written` is an index into `TypeAliasSignature::bounds`;
+  - `Parent` is an index into `GenericPredicates::query_all(trait)`, which is `query_explicit`'s index plus one when the trait has its implied `Self: Trait`;
+  - `ImplicitSized` is the `implicit_sizedness_trait` bound.
+- `pub fn type_alias_bound_sources(db, alias) -> Vec<AliasBoundSource>`, one entry per clause of `all_bounds`, in its order. `type_alias_bounds_in` takes `sources: Option<&mut Vec<AliasBoundSource>>`, keeping one list for self bounds and one for assoc-type bounds as it splits them, and appending them in the order `bounds` ends up in (self, then assoc). The `const_bounds` tail is not in `all_bounds`, so it needs none.
+- `type_alias_bounds_with_diagnostics` passes `None`, so the memo is unchanged. Re-export `type_alias_bound_sources` and `AliasBoundSource` from `lib.rs` beside `predicate_sources`.
+
+Once it lands, db-ty maps it in hir (`Trait::dyn_compatibility_violation_sites`) and removes `DynCompatibilitySite::AssocTypeBound`. Tell db-ty by tmux.
+
+Status: open.
+
+> forwarded to db-apply-34 (`hir-ty/src/lower.rs` is db's, not DONE); told by tmux (requests, pass 46).

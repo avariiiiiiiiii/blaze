@@ -73,6 +73,7 @@ mod as_place;
 mod deref_pattern;
 mod match_tree;
 mod pattern_matching;
+mod tail_call;
 mod uninhabited;
 mod unwind;
 
@@ -158,6 +159,8 @@ struct Building<'f, 'db> {
     unreached: Vec<BasicBlockId, &'f Frame>,
     scope_ends: Vec<LocalId, &'f Frame>,
     panic_unwinds: Vec<(BasicBlockId, usize, BasicBlockId), &'f Frame>,
+    guard_refs: Vec<(LocalId, BindingId), &'f Frame>,
+    capture_copies: Vec<(LocalId, FieldIndex), &'f Frame>,
 }
 
 impl<'f> Building<'f, '_> {
@@ -172,6 +175,8 @@ impl<'f> Building<'f, '_> {
             unreached: Vec::new_in(frame),
             scope_ends: Vec::new_in(frame),
             panic_unwinds: Vec::new_in(frame),
+            guard_refs: Vec::new_in(frame),
+            capture_copies: Vec::new_in(frame),
         }
     }
 }
@@ -549,6 +554,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             unreached,
             scope_ends,
             panic_unwinds,
+            guard_refs,
+            capture_copies,
         } = self.building;
         let mut basic_blocks = Arena::with_capacity(blocks.len());
         for FrameBlock { statements, terminator, is_cleanup } in blocks {
@@ -577,6 +584,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         body.unreached = exact(&unreached);
         body.scope_ends = exact(&scope_ends);
         body.panic_unwinds = exact(&panic_unwinds);
+        body.guard_refs = exact(&guard_refs);
+        body.capture_copies = exact(&capture_copies);
         (self.result, self.infcx, self.env, self.copy)
     }
 
@@ -1579,7 +1588,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 self.exit_to(0, current, returned, expr_id.into());
                 Ok(None)
             }
-            Expr::Become { .. } => not_supported!("tail-calls"),
+            Expr::Become { expr } => self.lower_become(expr, expr_id, current),
             Expr::Yield { .. } => not_supported!("yield"),
             Expr::RecordLit { fields, path, spread, .. } => {
                 let variant_id =
@@ -4975,6 +4984,7 @@ fn lower_closure_body_in<'db>(
                 capture_local_rvalue,
                 MirSpan::Unknown,
             );
+            ctx.building.capture_copies.push((capture_local, FieldIndex(capture_idx as u32)));
         }
 
         let local = capture.captured_local();

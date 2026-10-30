@@ -200,6 +200,15 @@ pub struct ExpnGlobals {
     pub mixed_site: usize,
 }
 
+impl BidirectionalMessage {
+    /// Writes the message as [`Message::write`] does, encoded in `frame`, which keeps its room:
+    /// a server answers every request and asks every sub-request in the one buffer.
+    pub fn write_in<W: Write + ?Sized>(&self, out: &mut W, frame: &mut Vec<u8>) -> io::Result<()> {
+        postcard::encode_into(self, frame)?;
+        postcard::write(out, frame)
+    }
+}
+
 impl Message for BidirectionalMessage {
     type Buf = Vec<u8>;
 

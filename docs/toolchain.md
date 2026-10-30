@@ -61,6 +61,17 @@ the standard library is part of a compiler.
 - **Bumps:** every day, to the newest nightly, by a workflow, with the merge gate and the
   release train as the gate ([The daily bump](#the-daily-bump)).
 
+## The LLVM blaze is built with
+
+Building blaze itself takes one more pinned piece, LLVM: `crates/hir-ty-codegen/llvm.json` names
+its commit and version (23.1.4, our fork's `ix/23.x`) and the sha256 of each target's release
+archive. `nix develop` fetches it and sets `LLVM_SYS_231_PREFIX` to it (the flake's
+`blaze-llvm`); outside the shell, `python3 .github/scripts/llvm.py fetch` unpacks the same
+archive; for a target with no archive, the `llvm` workflow (`.github/workflows/llvm.yaml`) builds
+one. llvm-sys's build script refuses any other prefix with one error before anything links it
+([contributing.md](contributing.md#llvm-for---features-llvm)). The LLVM inside a blaze binary
+is not a toolchain for projects: it builds them with the toolchain above.
+
 ## The daily bump
 
 blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` runs every day at
@@ -70,10 +81,11 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
 1. On the branch `toolchain/bump` (the open bump's with main merged in, or a new one from main),
    `harness/toolchain_bump.py` pins the newest nightly whose manifest has every component blaze
    needs on every host it ships for. It writes `harness/toolchain` and `pins.txt`, re-vendors
-   `crates/rustc_abi` and the proc-macro server from rust-lang/rust at the new commit, merges
+   `crates/rustc_abi` from rust-lang/rust at the new commit, merges
    the new nightly's standard library into `library/` ([The standard
-   library](#the-standard-library-library)), and moves the pin in `install.sh`, the server's
-   manifest, `Cargo.toml` and the flake.
+   library](#the-standard-library-library)), and moves the pin in `install.sh`, the proc-macro
+   server's version string (`crates/proc-macro-srv`, which follows the nightly's `proc_macro`
+   bridge by hand), `Cargo.toml` and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into
    `answers/rustc.json`.

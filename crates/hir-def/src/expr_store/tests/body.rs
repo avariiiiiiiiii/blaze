@@ -616,6 +616,30 @@ fn main() {
     );
 }
 
+/// As rustc's `lower_expr_for`, which builds `into_iter(head)` and `next(&mut iter)` at the
+/// head's span: their errors (a non-const call, a missing `Iterator`) point at the iterable.
+#[test]
+fn for_loop_calls_point_at_the_iterable() {
+    const SRC: &str = "fn main() {\n    for ident in 0..10 {}\n}\n";
+    let (db, def) = lower(&format!("//- minicore: iterator, range\n{SRC}"));
+    let (body, source_map) = Body::with_source_map(&db, def);
+    let head = SRC.find("0..10").unwrap() as u32;
+    let mut calls = 0;
+    for (id, expr) in body.exprs() {
+        let Expr::Call { callee, args } = expr else { continue };
+        calls += 1;
+        for it in [id, callee].into_iter().chain(args.iter().copied()) {
+            let range = source_map.expr_syntax(it).unwrap().value.text_range();
+            assert_eq!(
+                (u32::from(range.start()), u32::from(range.len())),
+                (head, 5),
+                "{it:?}, of the call {id:?}"
+            );
+        }
+    }
+    assert_eq!(calls, 2, "`into_iter` and `next`");
+}
+
 #[test]
 fn desugar_builtin_format_args() {
     pretty_print(

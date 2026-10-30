@@ -197,7 +197,14 @@ nothing crosses but the buffer's bytes.
 
 ## Running
 
-These parts wait on the compiled code (requests 1 and 2); none is written yet:
+Requests 1 and 2 are done and the confining pass is written (`tier/confine.rs`). It appends
+`vmctx` to every signature, a host function's too (one more integer argument, which a C callee
+never reads), so a pointer of any function has one table signature. Each name it meets is
+bound by the caller as code (called with `vmctx`, its address a table pointer) or data (its
+address a guest offset); what it adds are names in its own namespace (`confine::Ref`): a code
+name's pointer, the table's address and its size. Every external symbol is non-colocated, so
+the loader resolves each relocation as an absolute address. None of the following is written
+yet:
 
 - **The machine stack**: each expansion thread has its own machine stack (8 MiB, guard page
   below), outside every region. The entry trampoline saves the host's callee-saved registers
@@ -262,6 +269,13 @@ code and about 2,500 RPCs at 100 to 150 ns of server work each. That is 0.4 to 0
 
 That is **1.1 to 1.7 ms per expansion**. The tier must come within 10% of that. Unfused, the
 confinement costs 4 operations per access, 25 to 40% more, which is why request 2 exists.
+
+Request 2 is done: stencil's `Op::LoadConfined`/`Op::StoreConfined`. Its selector fuses an
+access only when the access's own offset is 0 and the `iadd_imm`, `ireduce`, `uextend` and
+`iadd vmctx` feeding it are each used once, in the access's block. So `confine` emits a fresh
+chain per access, folds the access's offset into the `iadd_imm` and leaves the access at
+offset 0, and never shares a confined address between two accesses: a shared one stays four
+stencils.
 
 **On the evaluator today** the same work is about 1.5 to 2 million MIR statements, at 100 to
 300 ns each (place projection, interval copies, the memory map), plus about 100,000 calls at 1

@@ -11,7 +11,7 @@
 //! while the threads are stopped: the kernel's list of threads is memory it maps, given back
 //! with `vm_deallocate`, and every right to a thread's port is given back once.
 
-#![allow(unsafe_code)]
+#![allow(unsafe_code, reason = "suspends the process's other threads, and reads their pcs")]
 
 use std::sync::Mutex;
 

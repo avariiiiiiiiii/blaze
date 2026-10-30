@@ -18,8 +18,13 @@
 //! writes data with atomic stores.
 //!
 //! Unsafe code is only in the modules that reach the kernel and the image's memory (the
-//! platforms', `sample`, and `slots`' platform, image and execution-log modules); the rest
-//! denies it.
+//! platforms', `sample`, and `slots`' platform, image and execution-log modules), each
+//! allowing it with its reason; the rest denies it, and `apply`, which checks every field of a
+//! patch against the image before any of those writes, forbids it. There is no safe version
+//! of them to pay for: std maps no executable memory, stops no thread and gives no view of
+//! the image's words at the addresses the linker placed them. A message is read in place by safe code only
+//! ([`patch::Message::view`]), and the jump table's own words are `std` atomics at the
+//! addresses the linker gave them.
 //!
 //! What a patch cannot do, it says, and the program has to be started again: an edit that
 //! changes a type the rest of the program can see writes the whole object again, and a
@@ -54,11 +59,50 @@ pub mod slots;
 
 #[cfg(any(
     test,
+    feature = "fuzz",
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "linux", target_arch = "x86_64"),
     all(windows, target_arch = "x86_64")
 ))]
+#[cfg_attr(feature = "fuzz", allow(dead_code, reason = "a host with no v1 runtime uses only `fuzz_checks`"))]
 mod apply;
+
+/// v1's checks of a decoded patch's code, in the order each platform's `apply` makes them
+/// before it maps or writes anything (`in_image` of every write over the executable at
+/// `image`, the plan of those writes, the claim of its room in `process`, the pointers slid
+/// in what it maps): the first refusal, or where the patch ends with what each platform's
+/// check of its unwind tables says (the run Linux registers, the FDEs macOS does, the
+/// `RUNTIME_FUNCTION`s Windows does, in that order), each reading `frames` its own way. For
+/// the fuzz target `live_patch`; it maps and writes nothing of the process's.
+#[cfg(feature = "fuzz")]
+pub fn fuzz_checks(
+    code: &format::Code,
+    mut process: format::Process,
+    slide: u64,
+    image: std::ops::Range<u64>,
+    page: u64,
+) -> Result<(u64, [Result<(), String>; 3]), String> {
+    apply::in_image(&code.writes, slide, &image)?;
+    let mut plan = apply::Plan::default();
+    apply::Overwrites::default().plan(code, slide, &mut plan)?;
+    let end = apply::claim(&mut process, code, page)?;
+    let len = usize::try_from(end - code.base).map_err(|_| "a patch larger than memory")?;
+    // alloc: the fuzz target's copy of what a platform would map
+    let mut memory = vec![0; len];
+    memory[..code.text.len()].copy_from_slice(&code.text);
+    memory[code.text.len()..code.text.len() + code.data.len()].copy_from_slice(&code.data);
+    for &pointer in &code.pointers {
+        apply::slide_at(&mut memory, pointer, slide)?;
+    }
+    let patch = code.base.wrapping_add(slide).wrapping_sub(image.start);
+    let unwind = [
+        apply::frame_run(&code.text, code.frames).map(drop),
+        // alloc: the fuzz target's, the buffers `fdes` fills for macOS
+        apply::fdes(&code.text, code.frames, &mut Vec::new(), &mut Vec::new()),
+        apply::functions(&memory, code.frames, patch).map(drop),
+    ];
+    Ok((end, unwind))
+}
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod linux;

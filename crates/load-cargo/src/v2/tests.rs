@@ -18,7 +18,7 @@ use intern::Symbol;
 use span::Edition;
 use triomphe::Arc;
 
-use super::{Db, Lower, LowerError, Lowered, Ran, crates, files, lower};
+use super::{Appended, Db, Lower, LowerError, Lowered, Ran, crates, files, lower};
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 const LIBRARY: &str = "/rustc/abc/library";
@@ -660,6 +660,88 @@ fn a_walk_leaves_out_the_directories_skipped_and_only_those() {
     assert!(!skipped.iter().any(|it| it.starts_with("/w/target/") || it == "/w/a/src/lib.rs"), "{skipped:?}");
     assert_eq!(skipped.len(), FILES.len() - 2);
     assert_eq!(walked(&["/w/targe".to_owned()]), every, "a skipped path is a whole name, not a prefix");
+}
+
+/// The lib's test and the lib share `/w/a/src/lib.rs`: a harness appended for the test is the
+/// root's text and appended module, in the identity of every crate of that root, written once,
+/// and refused when another unit of the job wants the root made other.
+#[test]
+fn an_appended_root_is_its_crates_text_until_the_next_job() {
+    let units = units();
+    let mut built = lowered(&units).unwrap();
+    let (lib, test) = (built.lowered.identity(LIB), built.lowered.identity(LIB_TEST));
+    let root = krate(&built, LIB_TEST).data(built.lowered.db()).root_file_id;
+    let disk = built.lowered.db().file_text(root).text(built.lowered.db()).to_string();
+    let harness = |body: &str| format!("{disk}\n#[cfg(test)]\npub mod __harness {{ {body} }}\n");
+    let append = |lowered: &mut Lowered, unit: usize, text: Option<String>| {
+        lowered.append_roots([unit as u32], |_, asked, _| {
+            assert_eq!(asked, unit);
+            Ok(text.clone().map(|text| Appended { text, module: "__harness" }))
+        })
+    };
+
+    let recorded = harness("pub fn main() {}");
+    assert_eq!(append(&mut built.lowered, LIB_TEST, Some(recorded.clone())), Ok(1));
+    let db = built.lowered.db();
+    let input = db.file_text(root);
+    assert_eq!(**input.text(db), *recorded);
+    assert_eq!(input.appended_root_module(db), Some("__harness"));
+    assert_eq!(input.content(db), base_db::FileText::content_of(&recorded, Some("__harness")));
+    let with = built.lowered.identity(LIB_TEST);
+    assert_ne!(with, test, "the harness is in the test's identity");
+    assert_ne!(built.lowered.identity(LIB), lib, "and in the lib's, which reads the same root");
+
+    assert_eq!(append(&mut built.lowered, LIB_TEST, Some(recorded.clone())), Ok(0), "already so");
+    assert_eq!(append(&mut built.lowered, LIB_TEST, None), Ok(0), "no harness: left as it is");
+    assert_eq!(built.lowered.identity(LIB_TEST), with);
+    let Err(error) = append(&mut built.lowered, LIB, Some(harness("pub fn other() {}"))) else {
+        panic!("one root was made two texts in one job")
+    };
+    assert!(error.what.contains("share the root file"), "{error}");
+    assert_eq!(error.at.as_deref(), Some("/w/a/src/lib.rs"));
+    assert_eq!(**built.lowered.db().file_text(root).text(built.lowered.db()), *recorded, "nothing written");
+    let (lib_text, test_text) = (harness("pub fn lib() {}"), harness("pub fn test() {}"));
+    let two = built.lowered.append_roots([LIB_TEST as u32, LIB as u32], |_, unit, _| {
+        let text = if unit == LIB { lib_text.clone() } else { test_text.clone() };
+        Ok(Some(Appended { text, module: "__harness" }))
+    });
+    let Err(error) = two else { panic!("two units of one call made one root two texts") };
+    assert!(error.what.contains("share the root file"), "{error}");
+
+    // Given again (its proc macros loaded), a unit makes its root again.
+    let expanded = harness("pub fn main() {} pub fn expanded() {}");
+    assert_eq!(append(&mut built.lowered, LIB_TEST, Some(expanded.clone())), Ok(1));
+    assert_eq!(**built.lowered.db().file_text(root).text(built.lowered.db()), *expanded);
+    let with = built.lowered.identity(LIB_TEST);
+
+    // The next job, of the same view: a harness of another mode is another text, and the
+    // unit's identity moves with it.
+    let tree = MemTree::default();
+    let view = view(&tree);
+    let config = config(view, library(&tree));
+    let next = Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None };
+    assert_eq!(built.lowered.refresh(next), Ok(true));
+    let unrecorded = harness("pub fn main() { let _ = 1; }");
+    assert_eq!(append(&mut built.lowered, LIB_TEST, Some(unrecorded.clone())), Ok(1));
+    assert_eq!(**built.lowered.db().file_text(root).text(built.lowered.db()), *unrecorded);
+    let other = built.lowered.identity(LIB_TEST);
+    assert_ne!(other, with);
+    assert_ne!(other, test);
+}
+
+/// The bin reaches the proc macro `m`, whose expanders are not built when lowered; the lib's
+/// test reaches none.
+#[test]
+fn a_crates_macros_are_loaded_once_every_proc_macro_it_reaches_is() {
+    let mut built = lowered(&units()).unwrap();
+    let db = built.lowered.db();
+    assert!(super::macros_loaded(db, krate(&built, LIB_TEST)));
+    assert!(super::macros_loaded(db, krate(&built, CORE)));
+    assert!(!super::macros_loaded(db, krate(&built, BIN)), "`m` is not built");
+    built.lowered.macros(MACRO, Ok(Vec::new())).unwrap();
+    assert!(super::macros_loaded(built.lowered.db(), krate(&built, BIN)));
+    built.lowered.macros(MACRO, Err(base_db::ProcMacroLoadingError::FailedToBuild)).unwrap();
+    assert!(!super::macros_loaded(built.lowered.db(), krate(&built, BIN)), "a macro that failed never loads");
 }
 
 #[test]

@@ -318,10 +318,10 @@ void LLVMBlazeDisposePasses(LLVMBlazeOpaquePasses *Passes) { delete Passes; }
 /* Whether `Machine`'s target has a feature named `Name` (`Length` bytes), as rustc's
  * LLVMRustHasFeature asks: LLVM told a name it lacks only prints a warning and ignores it. */
 LLVMBool LLVMBlazeHasFeature(LLVMTargetMachineRef Machine, const char *Name, size_t Length) {
-  const MCSubtargetInfo *Info = reinterpret_cast<TargetMachine *>(Machine)->getMCSubtargetInfo();
+  const MCSubtargetInfo &Info = reinterpret_cast<TargetMachine *>(Machine)->getMCSubtargetInfo();
   StringRef Wanted(Name, Length);
-  for (const SubtargetFeatureKV &Feature : Info->getAllProcessorFeatures())
-    if (Wanted == Feature.Key)
+  for (const SubtargetFeatureKV &Feature : Info.getAllProcessorFeatures())
+    if (Wanted == Feature.key())
       return 1;
   return 0;
 }

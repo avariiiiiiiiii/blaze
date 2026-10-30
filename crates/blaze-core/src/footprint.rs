@@ -126,8 +126,8 @@ fn check(entry: &mut Entry) {
         Ok(usage) => {
             entry.seen = entry.seen.max(usage.now).max(usage.most);
             if usage.now > entry.limit {
-                // SAFETY: no pointers; the pid is in the list, so not yet reaped.
-                unsafe { libc::kill(entry.pid, libc::SIGKILL) };
+                // The pid is in the list, so not yet reaped.
+                crate::raw::kill(entry.pid);
                 entry.done = true;
             }
         }
@@ -135,8 +135,7 @@ fn check(entry: &mut Entry) {
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => entry.done = true,
         // Its footprint cannot be read, so its limit cannot be held: it does not run on.
         Err(_) => {
-            // SAFETY: as above.
-            unsafe { libc::kill(entry.pid, libc::SIGKILL) };
+            crate::raw::kill(entry.pid);
             entry.done = true;
         }
     }
@@ -148,16 +147,8 @@ struct Usage {
 }
 
 fn footprint(pid: libc::pid_t) -> io::Result<Usage> {
-    // SAFETY: all zeros is a valid `rusage_info_v4`; the call writes it.
-    let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
-    // SAFETY: a `rusage_info_v4`, the size the flavor names, to write.
-    let read = unsafe {
-        libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, (&raw mut info).cast::<libc::rusage_info_t>())
-    };
-    if read != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(Usage { now: info.ri_phys_footprint, most: info.ri_lifetime_max_phys_footprint })
+    let (now, most) = crate::raw::footprint(pid)?;
+    Ok(Usage { now, most })
 }
 
 #[cfg(test)]

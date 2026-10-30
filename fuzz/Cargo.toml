@@ -148,6 +148,14 @@ name = "link_wasm_object"
 path = "targets/link_wasm_object.rs"
 
 [[bin]]
+name = "live_message"
+path = "targets/live_message.rs"
+
+[[bin]]
+name = "live_patch"
+path = "targets/live_patch.rs"
+
+[[bin]]
 name = "macro_wasm_host"
 path = "targets/macro_wasm_host.rs"
 
@@ -216,6 +224,10 @@ name = "usercode_wire"
 path = "targets/usercode_wire.rs"
 
 [[bin]]
+name = "vfs_image"
+path = "targets/vfs_image.rs"
+
+[[bin]]
 name = "vfs_journal_bytes"
 path = "targets/vfs_journal_bytes.rs"
 
@@ -237,8 +249,12 @@ blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-fuzz.workspace = true
 blaze-ids.workspace = true
+# `Builder`, which `Vfs::write_image` writes into, and `Image`, which `vfs_image` reopens.
+blaze-image.workspace = true
 # `fuzz_read` and the reference readers the link targets call.
 blaze-link = { workspace = true, features = ["fuzz"] }
+# `fuzz_checks`, v1's checks of a decoded patch, which `live_patch` runs.
+blaze-live = { workspace = true, features = ["fuzz"] }
 blaze-macro-wasm.workspace = true
 blaze-mem.workspace = true
 # `cbor::reference`, the codec's oracle, which the CBOR targets compare the fast one with.

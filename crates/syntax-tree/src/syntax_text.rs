@@ -77,6 +77,7 @@ impl SyntaxText {
             self.range,
             range,
         );
+        // clone: the slice holds its node, a count bump
         SyntaxText { node: self.node.clone(), range }
     }
 
@@ -124,6 +125,7 @@ fn found<T>(res: Result<(), T>) -> Option<T> {
 
 impl fmt::Debug for SyntaxText {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // alloc: debug output only
         fmt::Debug::fmt(&self.to_string(), f)
     }
 }
@@ -136,7 +138,9 @@ impl fmt::Display for SyntaxText {
 
 impl From<SyntaxText> for String {
     fn from(text: SyntaxText) -> String {
-        text.to_string()
+        let mut out = String::with_capacity(usize::from(text.len()));
+        text.for_each_chunk(|chunk| out.push_str(chunk));
+        out
     }
 }
 

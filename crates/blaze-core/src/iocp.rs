@@ -30,6 +30,13 @@
 //! output, memory, kill and trace are as for a process the driver starts, and its end is its
 //! answer. The launcher is started at the first such spawn and again only after it ended; a run
 //! it can't take fails, naming it, and is never started some other way.
+//!
+//! Why unsafe: overlapped Win32 I/O lends the kernel an `OVERLAPPED` and a buffer by address
+//! until the completion packet comes back, and std wraps none of it (nor job objects, USN
+//! journals or `AcceptEx`). Std's blocking calls are the safe version, at a thread blocked per
+//! operation. A packet's `OVERLAPPED` is read through only for `KEY_IO`, which only the
+//! kernel's completions carry (safe `post` refuses it); the id read there is then checked, by
+//! generation in the slab and by the head's address (`owner`), before it names a request.
 
 pub(crate) mod files;
 mod net;
@@ -50,10 +57,7 @@ use std::{
     mem::ManuallyDrop,
     os::windows::io::{AsRawHandle as _, OwnedHandle, OwnedSocket},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -82,6 +86,7 @@ use self::{
 use crate::{
     Address, Command, Completion, Confine, Confined, Conn, Cursor, Done, Driver, Effect, FileName, IoError,
     RECV_MOST, Sandbox, Tag,
+    handoff::Wake,
     wheel::{self, Wheel},
 };
 
@@ -201,8 +206,11 @@ impl Request {
                 // SAFETY: as for a read; the bytes are only read.
                 sys::pending(unsafe { WriteFile(*raw, rest.as_ptr(), len(rest.len()), std::ptr::null_mut(), overlapped) })
             }
-            Op::Watch(watching) => watching.read(head.reset(0)),
-            Op::Journal(journal) => journal.read(head.reset(0)),
+            // SAFETY: the head made ready for this step, and the watch with its buffer in the
+            // request's entry, which is kept in place until the completion is taken (`Request`).
+            Op::Watch(watching) => unsafe { watching.read(head.reset(0)) },
+            // SAFETY: as above, the journal with its buffer and input.
+            Op::Journal(journal) => unsafe { journal.read(head.reset(0)) },
             Op::Output { pipe, buffer, .. } | Op::Answers { pipe, buffer, .. } => {
                 let overlapped = head.reset(0);
                 // SAFETY: as for a read; the buffer is the request's until it ends (`let_go`).
@@ -218,12 +226,18 @@ impl Request {
                     WriteFile(pipe.as_raw_handle(), rest.as_ptr(), len(rest.len()), std::ptr::null_mut(), overlapped)
                 })
             }
-            Op::Accept(accepting) => accepting.accept(head.reset(0)),
+            // SAFETY: as above, the `Accepting` with its address buffer.
+            Op::Accept(accepting) => unsafe { accepting.accept(head.reset(0)) },
             Op::Recv { socket, bytes, most, flags, .. } => {
                 let into = bytes.spare_capacity_mut().as_mut_ptr().cast::<u8>();
-                net::recv(*socket, into, (*most).min(bytes.capacity() - bytes.len()), flags.get(), head.reset(0))
+                let len = (*most).min(bytes.capacity() - bytes.len());
+                // SAFETY: `into` is the `Vec`'s spare room of at least `len` bytes, `flags` the
+                // op's cell, both in the request's entry with the head, kept in place until the
+                // completion is taken (`Request`); the socket is open while the request is on it.
+                unsafe { net::recv(*socket, into, len, flags.get(), head.reset(0)) }
             }
-            Op::Send { socket, bytes, put, .. } => net::send(*socket, &bytes[*put..], head.reset(0)),
+            // SAFETY: as for a receive; the bytes are the op's, unwritten until it ends.
+            Op::Send { socket, bytes, put, .. } => unsafe { net::send(*socket, &bytes[*put..], head.reset(0)) },
             Op::Connect { .. } => unreachable!("a connect is asked for once, as it is made"),
         }
     }
@@ -386,7 +400,7 @@ pub struct Iocp {
     back: Receiver<Back>,
     /// Whether a thread has posted a wake that the driver has not yet drained `back` after:
     /// so a batch of what the threads send costs one packet, not one each.
-    woken: Arc<AtomicBool>,
+    woken: Arc<Wake>,
     work: Option<Sender<Work>>,
     /// Work asked for beyond the [`WORK`] at the threads, in the order asked.
     backlog: VecDeque<Work>,
@@ -455,7 +469,7 @@ impl Iocp {
         let (sender, back) = crossbeam_channel::bounded(WORK);
         let (work, queue) = crossbeam_channel::bounded::<Work>(WORK);
         // alloc: setup, the flag the threads share.
-        let woken = Arc::new(AtomicBool::new(false));
+        let woken = Arc::new(Wake::new());
         let workers = (0..threads.max(1))
             .map(|n| {
                 let (root, queue, port, sender) = (root.clone(), queue.clone(), port.clone(), sender.clone()); // clone: setup.
@@ -1224,7 +1238,10 @@ impl Iocp {
         let Request { head, op, .. } = self.requests.get_mut(id).expect("just made");
         let Op::Connect { connecting, at } = op else { unreachable!("just made") };
         let associate = |socket: &OwnedSocket| port.associate(net::raw(socket) as HANDLE);
-        if let Err(error) = connecting.start(associate, head.reset(0)) {
+        // SAFETY: the head of the request just made, and the `Connecting` in its entry, kept in
+        // place until the connect's completion is taken; on an error none comes, and the request
+        // is let go below.
+        if let Err(error) = unsafe { connecting.start(associate, head.reset(0)) } {
             let error = context(at, error);
             // Refused before it was asked for: no completion comes.
             self.requests.remove(id);
@@ -1670,8 +1687,13 @@ impl Iocp {
     /// The request a [`KEY_IO`] packet is the completion of; `None` where it names one that
     /// has ended (its slot free, or another's since).
     fn owner(&self, entry: &OVERLAPPED_ENTRY) -> Option<Id> {
-        // SAFETY: a packet of this key hands back a head's `OVERLAPPED`: a request's, in the
-        // slab, whose memory stays mapped while the driver lives (`requests`), or a test's own.
+        // SAFETY: a `KEY_IO` packet hands back a head's `OVERLAPPED`: only handles `associate`d
+        // with this port post that key, each request passes its head's, and safe `post`
+        // refuses the key (a test's `post_head` is unsafe). The head is a request's, in the
+        // slab, whose memory stays mapped while the driver lives (`requests`, leaked in `drop`
+        // while any is in flight), or a test's own. What is read is then checked: the handle's
+        // generation by `get`, and the address against the live request's head, so a late
+        // packet of a reused slot is counted stale, never taken for the new request.
         let id = Id::from_bits(unsafe { Head::id_of(entry.lpOverlapped) });
         let request = self.requests.get(id)?;
         (request.head.overlapped().cast_const() == entry.lpOverlapped.cast_const()).then_some(id)
@@ -1729,8 +1751,8 @@ impl Iocp {
             ready.push(Completion { tag, done: Done::Fired });
         });
         // Cleared before the drain: a thread that finds it set after this sent before it, so
-        // the drain sees what it sent (both are read-modify-writes, so they synchronize).
-        self.woken.swap(false, Ordering::AcqRel);
+        // the drain sees what it sent (`Wake`, model-checked in `handoff`).
+        self.woken.drain();
         while let Ok(back) = self.back.try_recv() {
             self.at_threads -= 1;
             match back {
@@ -1830,11 +1852,11 @@ impl Drop for Iocp {
         // What never came back stays lent: the slab its heads are in and the buffers are left
         // mapped (leaked), so nothing the kernel may write is freed.
         if self.requests.is_empty() {
-            // SAFETY: dropped once, here, with no request in flight to write either.
-            unsafe {
-                ManuallyDrop::drop(&mut self.requests);
-                ManuallyDrop::drop(&mut self.buffers);
-            }
+            // SAFETY: dropped once, here in `drop`, and never used after; no request is in
+            // flight, so the kernel writes none of the heads it frees.
+            unsafe { ManuallyDrop::drop(&mut self.requests) };
+            // SAFETY: as above: once, unused after, and no read in flight fills a buffer.
+            unsafe { ManuallyDrop::drop(&mut self.buffers) };
         }
         for (_, spawned) in self.spawns.iter_mut().filter(|(_, it)| it.process.is_some()) {
             drop(spawned.waiting.take());
@@ -1978,7 +2000,7 @@ fn adopt(conns: &mut Slab<Connection>, socket: OwnedSocket) -> Conn {
     Conn(id.to_bits())
 }
 
-fn work_on(root: &Path, queue: &Receiver<Work>, port: &Port, back: &Sender<Back>, woken: &AtomicBool) {
+fn work_on(root: &Path, queue: &Receiver<Work>, port: &Port, back: &Sender<Back>, woken: &Wake) {
     // alloc: setup, the paths this thread's file effects are joined in, grown to the longest.
     let (mut at, mut to) = (PathBuf::with_capacity(512), PathBuf::with_capacity(512));
     while let Ok(work) = queue.recv() {
@@ -2015,7 +2037,7 @@ fn work_on(root: &Path, queue: &Receiver<Work>, port: &Port, back: &Sender<Back>
         if sent.is_err() {
             return;
         }
-        if !woken.swap(true, Ordering::AcqRel) && port.post(KEY_WAKE, 0, 0).is_err() {
+        if woken.wake() && port.post(KEY_WAKE, 0, 0).is_err() {
             return;
         }
     }
@@ -2993,7 +3015,9 @@ mod tests {
         // The ended request's completion as the port hands it back had it come late: through
         // an `OVERLAPPED` whose head carries the ended request's handle.
         let late = Head::new(ended.to_bits());
-        driver.port.post(KEY_IO, 0, late.overlapped() as usize).unwrap();
+        // SAFETY: `late` lives on this frame until after the loop below has taken the packet
+        // (or the test has failed), and does not move.
+        unsafe { sys::post_head(driver.port.raw(), late.overlapped()) }.unwrap();
         let mut out = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while driver.stale() == 0 && Instant::now() < deadline {

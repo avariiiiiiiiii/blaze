@@ -99,7 +99,7 @@ impl Tree {
     }
 
     /// The span a token starts at and the one it ends at: a group's are its delimiters'.
-    fn ends(&self) -> (Span, Span) {
+    pub(crate) fn ends(&self) -> (Span, Span) {
         match self {
             Tree::Group { span, .. } => (span.open, span.close),
             Tree::Punct { span, .. }

@@ -305,6 +305,8 @@ impl Policy {
         };
         let live = self.mode == Mode::Live;
         let spec = Spec {
+            // A `Spec` owns its toolchain (an interface across crates); could be an interned ID.
+            // clone: once per function planned
             toolchain: self.toolchain.clone(),
             backend,
             overflow_checks: overflow_checks.unwrap_or(checks),
@@ -329,7 +331,7 @@ impl Policy {
             }
             // Its tier-up is `blaze_stencil::tier`'s, by its counts: never a plan's `then`.
             return Ok(Choice {
-                first: Spec { fold: false, counted: true, ..spec.at(Backend::Stencil) },
+                first: Spec { fold: false, counted: true, backend: Backend::Stencil, ..spec },
                 then: None,
                 patchable: true,
             });

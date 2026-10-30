@@ -910,7 +910,8 @@ pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
 turn `errors()`'s list into a box with `.into()`, which reallocates when the list has spare
 capacity. mem-format has requested `Parse::errors_exact()` and `errors_with_bodies_exact()`
 (`v2/requests/mem-format-tree.md`, end; each `Option<Box<[SyntaxError]>>`, `None` for no
-errors). Once they are in `crates/syntax`, and not before, the two bodies become:
+errors). They are in `crates/syntax/src/lib.rs` (`:167`, `:172`; frontend-tree, 2026-10-30), so
+this is ready to apply: the two bodies (`editioned_file_id.rs:45-51`, `:56-62`) become:
 ```rust
     pub fn parse_errors(self, db: &Db) -> Option<Box<[SyntaxError]>> {
         self.parse(db).errors_exact()

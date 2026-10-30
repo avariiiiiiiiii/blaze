@@ -3,7 +3,6 @@
 //! every import looked for is a read of them, allocating nothing.
 
 use blaze_alloc_count::{assert_at_most, measure};
-use hir::Semantics;
 use hir_def::ModuleDefId;
 
 use crate::{cx::Cx, lower::parse, print::paths::Def};
@@ -27,13 +26,12 @@ fn with_cx<R>(n: usize, check: impl FnOnce(&Cx<'_, '_>) -> R) -> R {
     let checked = crate::tests::checked(&fixture(n));
     let db = &checked.db;
     hir::attach_db(db, || {
-        let sema = Semantics::new(db);
         let krate = hir::check::workspace_crates(db)
             .into_iter()
             .find(|it| it.display_name(db).is_some_and(|name| name.to_string() == "main"))
             .expect("the fixture has a crate `main`");
         let frame = crate::tests::frame();
-        let cx = Cx::new(&sema, krate, checked.files(), &frame);
+        let cx = Cx::new(db, krate, checked.files(), &frame);
         check(&cx)
     })
 }

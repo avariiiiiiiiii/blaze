@@ -205,6 +205,8 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         Coverage(..) => 23,
         CoveragePcs(_) => 24,
         Counters => 25,
+        LazyStubs => 26,
+        LazyEntry(_) => 27,
     };
     let seven = |bytes: &[u8]| {
         let mut out = [0u8; 8];
@@ -214,11 +216,11 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
     };
     let rest = match key {
         Body(id) | Slot(id) | Data(id) | Cie(id) | Fde(id) | WinInfo(id) | Static(id, _) | Tlv(id, _)
-        | Position(id, _) | Coverage(id, _) | CoveragePcs(id) => seven(&symbols.content(id).0),
+        | Position(id, _) | Coverage(id, _) | CoveragePcs(id) | LazyEntry(id) => seven(&symbols.content(id).0),
         Local(obj, _) | Section(obj, _) | Frame(obj, ..) => seven(&symbols.content(obj.native).0),
         Name(name) | FileName(name) | IatEnd(name) | Common(name) => seven(symbols.str(name).as_bytes()),
         Got(kind, _) => (kind as u64) << 48,
-        Plt(_) | Generation | Cells | Stubs | Descriptor | LiveDir | Counters | StartHook => 0,
+        Plt(_) | Generation | Cells | Stubs | Descriptor | LiveDir | Counters | StartHook | LazyStubs => 0,
     };
     tag << 56 | rest
 }
@@ -827,10 +829,12 @@ mod tests {
             syms.push(symbols.intern(SymKey::Fde(id)));
             syms.push(symbols.intern(SymKey::Coverage(id, n % 3)));
             syms.push(symbols.intern(SymKey::CoveragePcs(id)));
+            syms.push(symbols.intern(SymKey::LazyEntry(id)));
         }
         syms.push(symbols.intern(SymKey::Cells));
         syms.push(symbols.intern(SymKey::Stubs));
         syms.push(symbols.intern(SymKey::Counters));
+        syms.push(symbols.intern(SymKey::LazyStubs));
         for &a in &syms {
             for &b in &syms {
                 let (pa, pb) = (prefix(&symbols, a), prefix(&symbols, b));

@@ -1,0 +1,24 @@
+{
+  "id": "00150",
+  "from_lane": "solver-sync",
+  "owner": "coordinator",
+  "paths": [
+    "vendor/rustc_transmute",
+    "tools/v2/solver_sync.py"
+  ],
+  "what": "## 5. Coordinator: `compiler/rustc_transmute` at 16d1ffac into `/tmp/rust-solver`\n\nWhat: add `compiler/rustc_transmute` to `/tmp/rust-solver`'s sparse checkout, at the same\ncommit (`git -C /tmp/rust-solver sparse-checkout add compiler/rustc_transmute`, which fetches\nits blobs). solver-sync then:\n- vendors it as `vendor/rustc_transmute` with the `rustc` feature off: the layout tree, the\n  DFA/NFA and the query are generic over `Def`/`Ref` traits, and only the `rustc` feature ties\n  them to `rustc_middle`;\n- records its own `PATCHES.md` series and adds it to `tools/v2/solver_sync.py`'s `CRATES`, so\n  it follows each nightly.\n\nThen hir-ty implements the crate's `Def`/`Ref`/`Region`/`Type` traits and builds `Tree`s from\nits own layouts, which ports rustc's `Tree::from_ty`. That is lane db's, in `solver.rs`\n(db-ty-port-solver), whose `is_transmutable` then calls it in place of today's panic. Its owner\ngets a request when the crate is vendored.\n\nWhy: `SolverDelegate::is_transmutable` must give rustc's answer to `TransmuteFrom` goals\n(superset-of-rust). Today it stops with an error naming the goal (`solver.rs:618`), which is\nright until the port exists. solver-sync fetches nothing itself.\n\n> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).",
+  "state": "open",
+  "created": "2026-10-30T01:51:29Z",
+  "updated": "2026-10-30T01:51:29Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/solver-sync.md#5. Coordinator: `compiler/rustc_transmute` at 16d1ffac into `/tmp/rust-solver`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/solver-sync.md:113"
+    }
+  ]
+}

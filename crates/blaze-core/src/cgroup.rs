@@ -101,9 +101,9 @@ impl Cgroup {
 
     /// Its cgroup.procs, which the child writes "0" to before it execs.
     pub(crate) fn procs(&self) -> &CStr {
-        // SAFETY: `new` refused a directory with a NUL in it, and `PROCS`, after it, ends with
-        // its one NUL.
-        unsafe { CStr::from_bytes_with_nul_unchecked(&self.path) }
+        // Checked rather than `from_bytes_with_nul_unchecked`: one scan of a short path per
+        // spawn, against a fork.
+        CStr::from_bytes_with_nul(&self.path).expect("`new` refused a NUL in the directory and `PROCS` ends with one")
     }
 
     /// Its directory.
@@ -257,8 +257,8 @@ fn wait_empty(events: &Path, deadline: Instant) {
         }
         let mut fds = [libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLPRI, revents: 0 }];
         let ms = left.as_millis().clamp(1, 100) as libc::c_int;
-        // SAFETY: one pollfd of an open descriptor.
-        unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+        // A failed or interrupted wait reads the events again, as a timeout does.
+        _ = crate::raw::poll(&mut fds, ms);
     }
 }
 
@@ -429,12 +429,9 @@ fn swap_in_use() -> io::Result<bool> {
 
 /// The kernel's release, as `uname -r` says it.
 pub(crate) fn kernel() -> String {
-    // SAFETY: all zeros is a valid `utsname`; the call fills it.
-    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
-    // SAFETY: a `utsname` to write.
-    if unsafe { libc::uname(&mut name) } != 0 {
+    let Ok(name) = crate::raw::uname() else {
         return "of an unknown release".into();
-    }
+    };
     let release: Vec<u8> =
         // alloc: only for an error's message.
         name.release.iter().take_while(|&&it| it != 0).map(|&it| it as u8).collect();

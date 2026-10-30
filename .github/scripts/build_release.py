@@ -45,8 +45,8 @@ on macOS Apple clang's profile format is not rustc's LLVM's and the instrumented
 crashes at start (rust-lang/rust#163640), so the C code (mimalloc, ring) is built without
 them. macOS and Linux; stdlib only.
 
-With `--server` the blaze just built builds blaze's proc-macro server (`vendor/proc-macro-srv`,
-docs/no-rustc.md step J1) into DIR as `blaze-proc-macro-srv`, the server that expands with the
+With `--server` the blaze just built builds blaze's proc-macro server (`blaze-proc-macro-srv`, the
+binary of the workspace's crates/proc-macro-srv-cli, docs/no-rustc.md step J1) into DIR, the server that expands with the
 proc-macro libraries blaze links, found beside blaze (`BLAZE_PROC_MACRO_SERVER=1`). It is
 built whole by blaze (`--exe`), over the standard library blaze compiles, so it speaks the
 bridge of the libraries that blaze compiles; its own serde derives are expanded by the
@@ -87,9 +87,10 @@ RELEASE = "https://github.com/indexable-inc/blaze/releases/download/pgo-profiles
 # A training run that reached the workers counts tens of billions; one that lost them a few
 # million (the client's own short runs).
 MIN_COUNT = 1_000_000_000
-# blaze's proc-macro server: its workspace, the crate of its executable, and the name it ships as.
-SERVER = ROOT / "vendor" / "proc-macro-srv"
-SERVER_CRATE = "rust_analyzer_proc_macro_srv"
+# blaze's proc-macro server: its workspace (blaze's own), the crate of its executable, and the
+# name it is built and ships as.
+SERVER = ROOT
+SERVER_CRATE = "blaze_proc_macro_srv"
 SERVER_BIN = "blaze-proc-macro-srv"
 # What LLVM says of a function whose control flow changed since the profile was trained.
 STALE = re.compile(r"function control flow change detected \(hash mismatch\)")
@@ -425,7 +426,7 @@ def main():
         parser.error("--target is required")
     if args.server and not args.out:
         parser.error("--server builds into --out")
-    # The server is built from its own directory, where a relative `--out` names nothing.
+    # The server is built from the workspace's root, where a relative `--out` names nothing.
     args.out = args.out and args.out.resolve()
     if args.train:
         return train(args.target, args.train)

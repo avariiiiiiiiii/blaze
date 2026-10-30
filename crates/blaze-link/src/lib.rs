@@ -9,8 +9,12 @@
 //! [`Image::roll_back`] returns to the image before the last commit: a patch that panicked.
 //! Positions the program observes (`line!()`, `Location`) and debug info are filled here
 //! from the span side tables, so a reformat compiles nothing.
+//!
+//! The one `unsafe` block is `intern::name_at`'s `from_utf8_unchecked` of names it appended as
+//! `&str`s.
 
 #![feature(allocator_api)]
+#![deny(unsafe_code)]
 
 mod arena;
 mod commit;
@@ -20,6 +24,7 @@ mod dwarf;
 mod elf;
 mod file;
 mod intern;
+mod lazy;
 mod live;
 mod macho;
 mod model;
@@ -30,6 +35,7 @@ mod place;
 mod position;
 pub mod premap;
 mod reloc;
+mod sanitize;
 mod stage;
 mod state;
 mod symbols;
@@ -58,6 +64,7 @@ use rustc_hash::FxHashMap;
 
 pub use output::{Debug, DevRun, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
 pub use position::{COLUMN, LINE, Position, SpanTable};
+pub use lazy::{LazyPlacer, Slots};
 pub use premap::{NoOutside, Outside};
 
 use commit::{Pending, Undo, Writes};
@@ -161,6 +168,11 @@ pub struct Image {
     /// The offset of the cells part of the code memory the image was last committed into
     /// ([`Image::commit_into`]), which [`Image::counter`] counts from.
     cells: Option<u64>,
+    /// A lazy image's session ([`Image::stage_lazy`]); `None` for every other image.
+    lazy: Option<lazy::Lazy>,
+    /// The counter pairs [`LazyPlacer`] gave since the last commit, which a commit of a stage
+    /// made before them carries over ([`Image::carry_placed_pairs`]).
+    placed_pairs: Vec<(symbols::IdNo, u32)>,
 }
 
 impl Image {
@@ -231,6 +243,9 @@ impl Image {
             scratch: Vec::with_capacity(64),
             place,
             cells: None,
+            lazy: None,
+            // alloc: none until the lazy placer gives a pair
+            placed_pairs: Vec::new(),
         })
     }
 
@@ -245,6 +260,51 @@ impl Image {
             });
         }
         self.stage_with(change, &NoOutside)
+    }
+
+    /// [`Image::stage`] of a lazy image ([`lazy`]): the dev run whose lazy functions `session`
+    /// lists and whose stub region is `stubs` (both from [`blaze_lazy::Session::new`], for the
+    /// image's architecture). Its first link places the region and starts each lazy function's
+    /// slot at its entry; every reference to a lazy function, [`Target::Direct`] too, reaches
+    /// its slot stub, and [`LazyPlacer`] places its code. Later links are [`Image::stage`]'s
+    /// or this with the same session. An image that is not a dev run with a jump table, or a
+    /// different session than the first link's, is an error.
+    pub fn stage_lazy(
+        &mut self,
+        change: Change<'_>,
+        session: &blaze_lazy::Session,
+        stubs: &blaze_lazy::stub::Stubs,
+    ) -> Result<Staged, LinkError> {
+        if self.state.laid_out {
+            if !self.lazy.as_ref().is_some_and(|it| it.is(session, stubs)) {
+                return Err(LinkError {
+                    function: None,
+                    // alloc: error path
+                    what: format!(
+                        "{}: staged lazy with another session than its first link's: an image is made lazy, for one \
+                         session, at its first link",
+                        self.to
+                    ),
+                });
+            }
+            return self.stage(change);
+        }
+        let table = has_table(&self.output, self.plan.indexed_code);
+        let was = self.lazy.replace(lazy::Lazy::new(&self.output, table, session, stubs)?);
+        let staged = self.stage(change);
+        if staged.is_err() {
+            self.lazy = was;
+        }
+        staged
+    }
+
+    /// The linked address of a lazy image's stub region: the `base` its session's
+    /// [`blaze_lazy::Session::slots`] and [`blaze_lazy::Session::entry`] take, as the code
+    /// memory has it at [`blaze_inproc::CodeMemory::offset_of`]. `None` before the first link
+    /// and for an image that is not lazy.
+    pub fn lazy_stubs(&self) -> Option<u64> {
+        self.lazy.as_ref()?;
+        self.state.addr_of(self.symbols.find(SymKey::LazyStubs)?)
     }
 
     /// [`Image::stage`] of an image made by [`Image::beside`]: names, functions and statics
@@ -321,17 +381,21 @@ impl Image {
             spans_changed: false,
             sancov: [None; 4],
             frames_end: None,
+            lazy: self.lazy.as_ref(),
         };
         stage.inputs(&change)?;
         stage.apply(&change)?;
+        stage.sanitize(&change)?;
         stage.beside_targets(outside)?;
         stage.descriptor();
         stage.start_hook()?;
         stage.counter_cells();
         stage.resolve(outside)?;
+        stage.lazy_hook()?;
         stage.referrers();
         stage.needs()?;
         stage.sweep();
+        stage.asan_globals(&change)?;
         stage.dangling()?;
         for _ in 0..2 {
             stage.place()?;
@@ -342,6 +406,7 @@ impl Image {
                 break;
             }
         }
+        stage.coverage_moved();
         if let Some(place) = self.place {
             stage.fix_tls(&place)?;
         }
@@ -370,12 +435,32 @@ impl Image {
 
     /// Makes `staged` the image, all at once, through effects: the new file renamed over the
     /// old, then the message to running programs. Completions go to [`Image::complete`].
-    pub fn commit(&mut self, staged: Staged, effects: &mut Vec<Effect>) -> Result<(), LinkError> {
+    pub fn commit(&mut self, mut staged: Staged, effects: &mut Vec<Effect>) -> Result<(), LinkError> {
         self.can_commit(&staged)?;
+        self.carry_placed_pairs(&mut staged.state)?;
         let full = staged.writes.full;
         let steps = self.steps(staged.writes)?;
         let revert = self.take(staged.state, full, staged.undo);
+        self.placed_pairs.clear();
         self.begin(steps, revert, effects);
+        Ok(())
+    }
+
+    /// Carries the counter pairs [`LazyPlacer`] gave while `state` was staged into it: they are
+    /// its keys' for as long as the image lives. A stage that gave one of those keys another
+    /// pair, or gave pairs into the ones the placer took, is refused: stage it again.
+    fn carry_placed_pairs(&self, state: &mut State) -> Result<(), LinkError> {
+        let capacity = counter::capacity(&self.output);
+        for (id, pair) in &self.placed_pairs {
+            if !state.pairs.carry(*id, *pair, &self.state.pairs, capacity) {
+                return Err(LinkError {
+                    function: Some(self.symbols.instance(*id)),
+                    what: "given a tier-up counter pair by the lazy placer while this was staged, which gave counter \
+                           pairs that clash with it: stage it again"
+                        .into(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -389,14 +474,16 @@ impl Image {
     /// image's first commit, which no program runs yet, and without [`Output::live`]).
     pub fn commit_into(
         &mut self,
-        staged: Staged,
+        mut staged: Staged,
         memory: &mut blaze_inproc::CodeMemory,
     ) -> Result<Option<Vec<u8>>, LinkError> {
         self.can_commit(&staged)?;
+        self.carry_placed_pairs(&mut staged.state)?;
         let cells = self.cells_in(memory)?;
         self.write_into(&staged.writes, memory)?;
         let message = staged.writes.message.map(|(_, bytes)| bytes);
         self.take(staged.state, staged.writes.full, staged.undo);
+        self.placed_pairs.clear();
         self.cells = Some(cells);
         Ok(message)
     }
@@ -474,8 +561,9 @@ impl Image {
     /// of writing it: for a caller that puts the file in its store. A commit that would tell
     /// running programs (a later link of a [`Output::live`] image) is refused, since no
     /// message reaches them this way.
-    pub fn bytes(&mut self, staged: Staged) -> Result<Vec<u8>, LinkError> {
+    pub fn bytes(&mut self, mut staged: Staged) -> Result<Vec<u8>, LinkError> {
         self.can_commit(&staged)?;
+        self.carry_placed_pairs(&mut staged.state)?;
         if staged.writes.message.is_some() {
             return Err(LinkError {
                 function: None,
@@ -491,6 +579,7 @@ impl Image {
             out[at..at + bytes.len()].copy_from_slice(bytes);
         }
         self.take(staged.state, staged.writes.full, staged.undo);
+        self.placed_pairs.clear();
         Ok(out)
     }
 
@@ -555,6 +644,9 @@ pub fn fuzz_read(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, by
         windows_subsystem: false,
         dev_run: None,
         exec_log: false,
+        sanitize: blaze_codegen::settings::Sanitize::default(),
+        // alloc: a fuzz target's setup, once per input
+        rpaths: Vec::new(),
         triple: match (format, arch) { (Format::Elf, blaze_codegen::Arch::Aarch64) => "aarch64-unknown-linux-gnu", (Format::Elf, _) => "x86_64-unknown-linux-gnu", (Format::MachO, blaze_codegen::Arch::X86_64) => "x86_64-apple-darwin", (Format::MachO, _) => "aarch64-apple-darwin", (Format::Pe, _) => "x86_64-pc-windows-msvc", (Format::Wasm, _) => "wasm32-unknown-unknown" }.into(),
     };
     model::writer(&output).is_ok_and(|writer| writer.read("fuzz", bytes, &kind).is_ok())

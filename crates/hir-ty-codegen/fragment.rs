@@ -76,11 +76,15 @@ impl FuncTarget {
 }
 
 impl TargetRef<'_> {
+    /// Made once per request, when it is asked for the first time ([`Wants::func_ref`]).
     fn to_owned(self) -> FuncTarget {
         match self {
+            // alloc: the request's own target, once per request
             TargetRef::Symbol(it) => FuncTarget::Symbol(it.to_owned()),
-            TargetRef::Path(it) => FuncTarget::Path(it.to_owned()),
+            TargetRef::Path(it) => FuncTarget::Path(it.to_owned()), // alloc: as above
+            // clone: as above, refcounts
             TargetRef::Instance(instance, env) => FuncTarget::Instance(instance.clone(), env.clone()),
+            // alloc: as above
             TargetRef::Asm(it) => FuncTarget::Asm(it.to_owned()),
         }
     }
@@ -213,7 +217,9 @@ impl RelocName {
         }
     }
 
-    fn of_module(name: &ModuleRelocTarget) -> std::result::Result<RelocName, RelocError> {
+    pub(super) fn of_module(
+        name: &ModuleRelocTarget,
+    ) -> std::result::Result<RelocName, RelocError> {
         Ok(match *name {
             ModuleRelocTarget::User { namespace, index } => RelocName::user(namespace, index),
             ModuleRelocTarget::LibCall(call) => RelocName::LibCall(call),
@@ -251,6 +257,7 @@ impl fmt::Display for RelocError {
 
 impl From<RelocError> for CodegenError {
     fn from(e: RelocError) -> Self {
+        // alloc: the error's message
         CodegenError::Backend(e.to_string())
     }
 }
@@ -308,6 +315,7 @@ pub(super) struct Relocs {
 
 impl Relocs {
     pub(super) fn with_capacity(capacity: usize) -> Relocs {
+        // alloc: empty, allocates nothing until a wide addend or a namespace of its own comes
         Relocs { rows: Vec::with_capacity(capacity), wide: Vec::new(), spaces: Vec::new() }
     }
 
@@ -506,6 +514,7 @@ impl Relocs {
     /// the hashes of code in the store are unchanged.
     pub(super) fn hash_elf_types<H: Hasher>(&self, state: &mut H) {
         let typed = self.rows.iter().filter(|it| it.elf != 0);
+        // clone: of a slice iterator, two pointers; nothing is allocated
         typed.clone().count().hash(state);
         for row in typed {
             (row.offset, u32::from(row.elf)).hash(state);
@@ -603,6 +612,7 @@ impl Source {
     ) -> std::result::Result<Source, String> {
         let table = &body.inlined;
         if !spans.iter().any(|it| matches!(it, MirSpan::Inlined(_))) {
+            // alloc: empty, allocates nothing
             return Source::resolved(owner, &table.spans, &table.scopes, Vec::new(), spans);
         }
         let callees = table
@@ -618,8 +628,10 @@ impl Source {
                     hir_ty::InferBodyId::AnonConstId(_) => None,
                 }
             })
+            // alloc: the source kept with the compiled function, sized exactly
             .collect();
         Source::resolved(owner, &table.spans, &table.scopes, callees, spans)
+            // alloc: the error's message
             .map_err(|what| format!("{what} ({:?})", table.callees))
     }
 
@@ -633,6 +645,7 @@ impl Source {
         mut spans: Vec<MirSpan>,
     ) -> std::result::Result<Source, String> {
         let mut source =
+            // alloc: empty, allocates nothing; each is given or filled below
             Source { owner, spans: Vec::new(), inlined: Vec::new(), scopes: Vec::new(), callees };
         if !spans.iter().any(|it| matches!(it, MirSpan::Inlined(_))) {
             source.spans = spans;
@@ -650,6 +663,7 @@ impl Source {
                 };
                 InlinedScope { callee: scope.callee, parent, call_site }
             })
+            // alloc: the source kept with the compiled function, sized exactly
             .collect();
         for (at, span) in spans.iter_mut().enumerate() {
             let MirSpan::Inlined(n) = *span else { continue };
@@ -661,6 +675,7 @@ impl Source {
             for _ in 0..=source.scopes.len() {
                 let InlinedScope { callee, parent, call_site } = source.scopes[scope as usize];
                 if source.callees.get(callee as usize).copied().flatten().is_none() {
+                    // alloc: the error's message
                     return Err(format!(
                         "statement {at} is of inlined callee {callee}, inlined at \
                          {call_site:?}, which is of no item's body: its lines have no place in \
@@ -676,6 +691,7 @@ impl Source {
                 }
             }
             if matches!(span, MirSpan::Inlined(_)) {
+                // alloc: the error's message
                 return Err(format!("statement {at} is of an inlined scope that is its own parent"));
             }
         }
@@ -748,10 +764,22 @@ impl Code {
         if slots {
             places.hash(state);
         }
-        // Cranelift's unwind rules have no `Hash`: what they print is all of them.
-        format!("{unwind:?}").hash(state);
+        // Cranelift's unwind rules have no `Hash`: what they print is all of them, hashed as
+        // the `String` of it was.
+        PRINTED.with_borrow_mut(|printed| {
+            printed.clear();
+            fmt::Write::write_fmt(printed, format_args!("{unwind:?}"))
+                .expect("a Debug implementation returned an error");
+            printed.as_str().hash(state);
+        });
         relocs.hash_as_module(state);
     }
+}
+
+thread_local! {
+    /// What [`Code::hash_with`] prints unwind rules into, kept for the thread's next function.
+    // alloc: empty, allocates nothing until the first print, then grows to the longest
+    static PRINTED: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// A local written with a name, as the function that is being built keeps it.
@@ -1029,25 +1057,31 @@ impl BlobView<'_> {
                 .all(|(&(at, to), theirs)| (at, self.func(to)) == (theirs.0, theirs.1.as_u32()))
     }
 
-    /// The blob, renamed.
+    /// The blob, renamed. Made once per blob, when it was not asked for before
+    /// ([`Wants::define_view_as`]), or for a vtable or a blob that is not shared.
     fn made(&self) -> ConstBlob {
         let blob = self.blob;
         if self.datas.is_none() && self.funcs.is_none() {
+            // clone: the request's own blob, made once as above
             return blob.clone();
         }
         ConstBlob {
+            // clone: as above
             bytes: blob.bytes.clone(),
             relocs: blob
                 .relocs
                 .iter()
                 .map(|&(at, to, addend)| (at, DataId::from_u32(self.data(to)), addend))
+                // alloc: as above, sized exactly
                 .collect(),
             fn_relocs: blob
                 .fn_relocs
                 .iter()
                 .map(|&(at, to)| (at, FuncId::from_u32(self.func(to))))
+                // alloc: as above, sized exactly
                 .collect(),
             align: blob.align,
+            // clone: as above
             type_ids: blob.type_ids.clone(),
         }
     }
@@ -1061,8 +1095,9 @@ impl Wants {
             requests: Requests::default(),
             funcs: HashTable::new(),
             shared: HashTable::new(),
+            // alloc: empty, allocates nothing
             pointees: Vec::new(),
-            seen: Vec::new(),
+            seen: Vec::new(), // alloc: empty, allocates nothing
         }
     }
 
@@ -1126,6 +1161,8 @@ impl Wants {
                 FuncTarget::Asm(text) => Some((at as u32, super::asm::inline_block(text)?)),
                 _ => None,
             })
+            // Empty, allocating nothing, unless the function calls an `asm!` wrapper.
+            // alloc: once per function LLVM compiles; `llvm.rs` takes the map
             .collect()
     }
 
@@ -1164,8 +1201,10 @@ impl Wants {
     #[cfg(feature = "llvm")]
     fn kept(&self, code: &mut Code) -> Option<Kept> {
         let requests = &self.requests;
+        // alloc: once per function LLVM compiles, beside which it is nothing
         let mut funcs = vec![false; requests.funcs.len()];
-        let mut datas = vec![false; requests.datas.len()];
+        let mut datas = vec![false; requests.datas.len()]; // alloc: as above
+        // alloc: as above
         let mut reached = Vec::new();
         for reloc in code.relocs.iter() {
             match reloc.name {
@@ -1197,6 +1236,7 @@ impl Wants {
                 next += u32::from(it);
                 it.then_some(number)
             });
+            // alloc: as above, sized exactly, kept in `Kept`
             numbers.collect::<Vec<Option<u32>>>()
         };
         let kept = Kept { funcs: numbered(&funcs), datas: numbered(&datas) };
@@ -1211,21 +1251,26 @@ impl Wants {
     /// its own numbers, which `code` is renumbered to.
     #[cfg(feature = "llvm")]
     pub(super) fn referenced(&self, code: &mut Code) -> Requests {
+        // The function's own requests out of the unit's, which stay the unit's: once per
+        // function of a unit LLVM compiles.
         let Some(kept) = self.kept(code) else {
             let Requests { funcs, datas } = &self.requests;
+            // clone: the function's own requests, as above
             return Requests { funcs: funcs.clone(), datas: datas.clone() };
         };
         let funcs = iter::zip(&self.requests.funcs, &kept.funcs);
+        // clone: as above
         let funcs = funcs.filter(|it| it.1.is_some()).map(|it| it.0.clone()).collect();
         let datas = iter::zip(&self.requests.datas, &kept.datas).filter(|it| it.1.is_some());
         let datas = datas.map(|(request, _)| {
-            let mut request = request.clone();
+            let mut request = request.clone(); // clone: as above
             if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = &mut request
             {
                 kept.renumber(blob);
             }
             request
         });
+        // alloc: as above
         Requests { funcs, datas: datas.collect() }
     }
 
@@ -1235,6 +1280,7 @@ impl Wants {
             hash,
             target,
             |target, it| it.target == *target && it.sig == *sig,
+            // clone: once per request, when it is asked for the first time
             |target| FuncRequest { target, sig: sig.clone() },
         )
     }
@@ -1245,6 +1291,7 @@ impl Wants {
             func_hash(target, sig),
             target,
             |target, it| it.target.as_ref() == *target && it.sig == *sig,
+            // clone: once per request, when it is asked for the first time
             |target| FuncRequest { target: target.to_owned(), sig: sig.clone() },
         )
     }
@@ -1294,6 +1341,7 @@ impl Wants {
     /// object would otherwise run the assembler for each block in turn. An error is not kept,
     /// so that thread meets it again and refuses the caller with it as before.
     pub(super) fn assembly(&mut self, text: String, sig: &Signature) -> FuncId {
+        // alloc: once per `asm!` block, which is then assembled; `asm::assemble` takes text
         _ = super::asm::assemble(&self.isa.triple().to_string(), &text);
         self.func(FuncTarget::Asm(text), sig)
     }
@@ -1388,6 +1436,7 @@ impl Wants {
 
     fn declare_func(&self, id: FuncId, func: &mut ir::Function, colocated: bool) -> ir::FuncRef {
         let signature =
+            // clone: Cranelift's `import_signature` takes it by value into the function's own table
             func.import_signature(self.requests.funcs[id.as_u32() as usize].sig.clone());
         let name = func.declare_imported_user_function(ir::UserExternalName {
             namespace: 0,
@@ -1445,12 +1494,14 @@ impl<'db> Recorder<'db> {
             coroutine_layouts: RefCell::default(),
             builder_ctx: FunctionBuilderContext::new(),
             naked: None,
+            // alloc: empty, allocates nothing, as are the others
             spans: Vec::new(),
             span_ids: FxHashMap::default(),
-            named: Vec::new(),
+            named: Vec::new(), // alloc: empty, allocates nothing
             frame_locals: None,
+            // alloc: empty, allocates nothing
             inlined: Vec::new(),
-            built_in: Vec::new(),
+            built_in: Vec::new(), // alloc: empty, allocates nothing
             built_in_at: HashTable::new(),
             reused: HashTable::new(),
             unlocated: false,
@@ -1488,8 +1539,9 @@ impl<'db> Recorder<'db> {
             layouts
                 .into_inner()
                 .into_iter()
+                // alloc: a debug dump, only with `BLAZE_LAYOUTS` set
                 .map(|(ty, (size, align))| (format!("{ty:?}"), size, align))
-                .collect()
+                .collect() // alloc: as above
         });
         layouts.extend(self.coroutine_layouts.into_inner());
         (self.wants, layouts)
@@ -1602,6 +1654,7 @@ impl<'db> Recorder<'db> {
             let id = funcs[seen.id.as_u32() as usize];
             if !self.seen.iter().any(|it| it.id == id) {
                 let func = rename(&seen.func);
+                // clone: this function's own copy of a body it shows LLVM, once per body
                 self.seen.push(Seen { id, func, pointees: seen.pointees.clone(), hint: seen.hint });
             }
         }
@@ -1615,18 +1668,24 @@ impl<'db> Recorder<'db> {
     #[cfg(feature = "llvm")]
     pub(super) fn keep_referenced(&mut self, code: &mut Code) {
         let Some(kept) = self.wants.kept(code) else { return };
-        let Requests { funcs: all_funcs, datas: all_datas } =
-            std::mem::take(&mut self.wants.requests);
-        let kept_funcs: Vec<FuncRequest> =
-            iter::zip(all_funcs, &kept.funcs).filter(|it| it.1.is_some()).map(|it| it.0).collect();
-        let mut kept_datas: Vec<DataRequest> =
-            iter::zip(all_datas, &kept.datas).filter(|it| it.1.is_some()).map(|it| it.0).collect();
-        for request in &mut kept_datas {
+        let wants = &mut self.wants;
+        let Requests { funcs: kept_funcs, datas: kept_datas } = &mut wants.requests;
+        // In place, in their order: `retain` sees each once, first to last.
+        let mut at = 0;
+        kept_funcs.retain(|_| {
+            at += 1;
+            kept.funcs[at - 1].is_some()
+        });
+        let mut at = 0;
+        kept_datas.retain(|_| {
+            at += 1;
+            kept.datas[at - 1].is_some()
+        });
+        for request in kept_datas.iter_mut() {
             if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } = request {
                 kept.renumber(blob);
             }
         }
-        let wants = &mut self.wants;
         wants.funcs.clear();
         for (at, it) in kept_funcs.iter().enumerate() {
             let hash = func_hash(it.target.as_ref(), &it.sig);
@@ -1651,7 +1710,6 @@ impl<'db> Recorder<'db> {
             }
         }
         self.statics.retain(|_, id| kept.data(*id).map(|it| *id = it).is_some());
-        wants.requests = Requests { funcs: kept_funcs, datas: kept_datas };
     }
 
     /// Puts `requests`, another function's, among what this function asks for: what each
@@ -1659,6 +1717,7 @@ impl<'db> Recorder<'db> {
     /// ([`Inlinable::of`]).
     pub(super) fn moved_requests(&mut self, requests: &Requests) -> (Vec<FuncId>, Vec<DataId>) {
         let funcs: Vec<FuncId> =
+            // alloc: once per body moved in (inlined, imported or a unit's), cloned whole; exact
             requests.funcs.iter().map(|it| self.func_ref(it.target.as_ref(), &it.sig)).collect();
         let mut datas: Vec<DataId> = Vec::with_capacity(requests.datas.len());
         for request in &requests.datas {
@@ -1676,6 +1735,7 @@ impl<'db> Recorder<'db> {
                             let view =
                                 BlobView { blob, datas: Some(&datas[..]), funcs: Some(&funcs[..]) };
                             let blob = view.made();
+                            // clone: refcounts, once per vtable not asked for before
                             self.add_vtable(hash, ty.clone(), trait_ref.clone(), blob)
                         }
                     }
@@ -1684,6 +1744,7 @@ impl<'db> Recorder<'db> {
                 DataRequest::Location(at) => self.location(*at),
                 DataRequest::Declaration(func) => self.declaration(*func),
                 DataRequest::FilePath(file) => self.file_path(*file),
+                // clone: the request's own parts: a text is one object per body moved in
                 DataRequest::Text(parts) => self.text(parts.clone()),
             };
             datas.push(id);
@@ -1709,6 +1770,7 @@ impl<'db> Recorder<'db> {
             );
             if let Entry::Vacant(slot) = entry {
                 slot.insert(Slot { hash, at: built_in.len() as u32 });
+                // clone: refcounts, once per instance built in
                 built_in.push(it.clone());
             }
         }
@@ -1720,11 +1782,13 @@ impl<'db> Recorder<'db> {
                 let at = self.inlined.len() as u32;
                 let callee = self.moved(body);
                 self.inlined.push(callee);
+                // clone: refcounts, once per callee built in, when its body is first moved in
                 let reused = Reused { hash, instance: instance.clone(), at };
                 self.reused.insert_unique(hash, reused, |it| it.hash);
                 at
             }
         };
+        // clone: Cranelift's `import_signature` takes it by value into the function's own table
         let signature = func.import_signature(self.inlined[at as usize].signature.clone());
         let name = func
             .declare_imported_user_function(ir::UserExternalName { namespace: INLINED, index: at });
@@ -1742,6 +1806,7 @@ impl<'db> Recorder<'db> {
             return;
         }
         let func = self.moved(body);
+        // clone: this function's own copy of a body it shows LLVM, once per body
         self.seen.push(Seen { id, func, pointees: body.pointees.clone(), hint });
     }
 
@@ -1796,6 +1861,7 @@ impl Kept {
 /// `func` in the names of the requests its own became, as [`Recorder::moved_requests`]
 /// gives them.
 pub(super) fn renamed(func: &ir::Function, funcs: &[FuncId], datas: &[DataId]) -> ir::Function {
+    // clone: the copy is what is given, once per body moved in; the original stays its owner's
     let mut func = func.clone();
     for at in 0..func.params.user_named_funcs().len() {
         let name = ir::UserExternalNameRef::from_u32(at as u32);
@@ -1813,6 +1879,7 @@ pub(super) fn renamed(func: &ir::Function, funcs: &[FuncId], datas: &[DataId]) -
 
 impl From<cranelift_module::ModuleError> for CodegenError {
     fn from(e: cranelift_module::ModuleError) -> Self {
+        // alloc: the error's message
         CodegenError::Backend(e.to_string())
     }
 }

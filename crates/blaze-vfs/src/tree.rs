@@ -10,8 +10,10 @@
 //! any thread the moment it is interned, and a collection publishes a new generation.
 
 use std::{
+    borrow::Cow,
     cmp::Ordering,
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
+    ops::Bound,
     sync::Arc,
 };
 
@@ -22,6 +24,7 @@ use blaze_ids::{
 };
 use blaze_image::Corrupt;
 use hashbrown::{HashTable, hash_table};
+use smallvec::{SmallVec, smallvec};
 
 use crate::{
     Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError,
@@ -80,6 +83,10 @@ impl Blob {
 // BTreeMap: range queries for the paths under a directory.
 pub(crate) type Pending = BTreeMap<String, Option<Blob>>;
 
+/// A path [`Tree::apply`] changes, as the run `start..end` of its components in one column,
+/// and what it leaves there.
+type Staged<'a> = (usize, usize, &'a Option<Blob>);
+
 /// The paths an op reads or changes.
 pub(crate) fn op_paths(op: &Op) -> impl Iterator<Item = &str> {
     let (one, two) = match op {
@@ -89,11 +96,12 @@ pub(crate) fn op_paths(op: &Op) -> impl Iterator<Item = &str> {
     std::iter::once(one.as_str()).chain(two.map(String::as_str))
 }
 
-/// The parts of a path, checked.
-pub(crate) fn parts(path: &str) -> Result<Vec<&str>, OpError> {
-    let parts: Vec<&str> = path.split('/').collect();
-    let bad = path.is_empty() || parts.iter().any(|it| it.is_empty() || *it == "." || *it == "..");
-    if bad { Err(OpError::BadPath(path.to_owned())) } else { Ok(parts) }
+/// Checks that `path` has one or more parts, none empty, `.` or `..`.
+pub(crate) fn check(path: &str) -> Result<(), OpError> {
+    let bad =
+        path.is_empty() || path.split('/').any(|it| it.is_empty() || it == "." || it == "..");
+    // alloc: the error's path
+    if bad { Err(OpError::BadPath(path.to_owned())) } else { Ok(()) }
 }
 
 /// A directory's entries as the tree reads them.
@@ -131,6 +139,8 @@ pub(crate) struct Tree {
     /// A directory's hashed bytes, and its entries as the store keeps them, reused.
     scratch: Vec<u8>,
     columns: Vec<(u32, u32, u8)>,
+    /// The entries of the directories a commit is rebuilding, outermost first, reused.
+    rebuilt: Vec<Entry>,
 }
 
 impl Tree {
@@ -146,8 +156,12 @@ impl Tree {
             name_index: HashTable::new(),
             empty: NodeId(0),
             retired: 0,
+            // alloc: empty, allocates nothing; grown once and reused by every directory.
             scratch: Vec::new(),
+            // alloc: empty, allocates nothing; grown once and reused by every directory.
             columns: Vec::new(),
+            // alloc: empty, allocates nothing; grown once and reused by every commit.
+            rebuilt: Vec::new(),
         };
         tree.empty = tree.dir_sorted(&mut []);
         tree
@@ -339,6 +353,13 @@ impl Tree {
         Some((NodeId(entries.nodes[at]), mode_of(entries.modes[at])))
     }
 
+    /// The entry named `name` in the directory `dir`.
+    fn child_entry(&self, dir: NodeId, name: &str) -> Option<Entry> {
+        let entries = self.entries(dir)?;
+        let at = entries.0.find(self.store.names(), name.as_bytes())?;
+        Some(entries.get(at))
+    }
+
     /// The node at `path` under `root` and its mode, as it is (a symlink is not followed);
     /// `""` is the root itself.
     pub(crate) fn entry(&self, root: NodeId, path: &str) -> Option<(NodeId, Mode)> {
@@ -383,26 +404,49 @@ impl Tree {
         root: NodeId,
         path: &str,
     ) -> Result<Option<(NodeId, Mode)>, OpError> {
+        // What is left to walk, as cursors into texts: the path, then each link's target in
+        // front of what was left when it was met. A target is borrowed from the tree unless it
+        // is not UTF-8.
+        let mut rest: SmallVec<[(Cow<'_, str>, usize); 4]> = SmallVec::new();
         if !path.is_empty() {
-            parts(path)?;
+            check(path)?;
+            rest.push((Cow::Borrowed(path), 0));
         }
-        let mut rest: VecDeque<String> =
-            path.split('/').filter(|it| !it.is_empty()).map(str::to_owned).collect();
-        // The directories from the root to where the walk is, and their names.
-        let mut dirs = vec![root];
-        let mut names: Vec<String> = Vec::new();
+        // The directories from the root to where the walk is, and the names of all but the root.
+        // alloc: inline, on the heap only past 16 directories deep.
+        let mut dirs: SmallVec<[NodeId; 16]> = smallvec![root];
+        let mut names: SmallVec<[NameId; 16]> = SmallVec::new();
         let mut links = 0;
-        let mut last_link: Option<(String, String)> = None;
-        let bad = |last: &Option<(String, String)>| {
-            let (path, target) = last.clone().expect("only a link's target leaves the tree");
+        // The last link followed: the names on its path, and its target's bytes.
+        let mut link: SmallVec<[NameId; 16]> = SmallVec::new();
+        let mut target: Option<&[u8]> = None;
+        let bad = |link: &[NameId], target: Option<&[u8]>| {
+            let target = target.expect("only a link's target leaves the tree");
+            // alloc: the error's path and target
+            let mut path = String::new();
+            for (at, name) in link.iter().enumerate() {
+                if at > 0 {
+                    path.push('/');
+                }
+                path.push_str(self.name_str(*name));
+            }
+            let target = String::from_utf8_lossy(target).into_owned(); // alloc: the error's target
             OpError::BadLink { path, target }
         };
-        while let Some(part) = rest.pop_front() {
-            match part.as_str() {
+        while let Some((text, at)) = rest.last_mut() {
+            if *at > text.len() {
+                rest.pop();
+                continue;
+            }
+            let start = *at;
+            let end = text[start..].find('/').map_or(text.len(), |it| start + it);
+            *at = end + 1;
+            let part = &rest[rest.len() - 1].0[start..end];
+            match part {
                 "" | "." => continue,
                 ".." => {
                     if dirs.len() == 1 {
-                        return Err(bad(&last_link));
+                        return Err(bad(&link, target));
                     }
                     dirs.pop();
                     names.pop();
@@ -410,32 +454,34 @@ impl Tree {
                 }
                 name => {
                     let dir = *dirs.last().expect("the root");
-                    let Some((child, mode)) = self.child(dir, name) else { return Ok(None) };
+                    let Some((name, child, mode)) = self.child_entry(dir, name) else {
+                        return Ok(None);
+                    };
                     if mode == Mode::Symlink {
-                        let link: Vec<&str> =
-                            names.iter().map(String::as_str).chain([name]).collect();
-                        let link = link.join("/");
                         let bytes = self.bytes(child)?.expect("a symlink is a file");
-                        let target = String::from_utf8_lossy(bytes).into_owned();
                         links += 1;
-                        let leaves = target.is_empty() || target.starts_with('/');
-                        last_link = Some((link, target.clone()));
-                        if links > MAX_LINKS || leaves {
-                            return Err(bad(&last_link));
+                        link.clear();
+                        link.extend_from_slice(&names);
+                        link.push(name);
+                        target = Some(bytes);
+                        if links > MAX_LINKS || bytes.is_empty() || bytes[0] == b'/' {
+                            return Err(bad(&link, target));
                         }
-                        for part in target.split('/').rev() {
-                            rest.push_front(part.to_owned());
+                        while rest.last().is_some_and(|(text, at)| *at > text.len()) {
+                            rest.pop();
                         }
+                        // alloc: only a target that is not UTF-8 is copied.
+                        rest.push((String::from_utf8_lossy(bytes), 0));
                         continue;
                     }
-                    if rest.is_empty() {
+                    if rest.iter().all(|(text, at)| *at > text.len()) {
                         return Ok(Some((child, mode)));
                     }
                     if !self.is_dir(child) {
                         return Ok(None);
                     }
                     dirs.push(child);
-                    names.push(name.to_owned());
+                    names.push(name);
                 }
             }
         }
@@ -450,9 +496,11 @@ impl Tree {
         mode: Mode,
         prefix: &str,
     ) -> Vec<(String, NodeId, Mode)> {
+        // alloc: the listing is the output, one path per file; `each_file` lends paths instead.
         let mut out = Vec::new();
+        // alloc: the one buffer every path is built in.
         self.each_file(node, mode, &mut prefix.to_owned(), &mut |path, node, mode| {
-            out.push((path.to_owned(), node, mode));
+            out.push((path.to_owned(), node, mode)); // alloc: the listing's path
         });
         out
     }
@@ -488,11 +536,20 @@ impl Tree {
         for op in ops {
             self.stage(base, &mut pending, op)?;
         }
-        // By component, so each directory's changes are one run, in its entries' order.
-        let mut changes: Vec<(Vec<&str>, Option<Blob>)> =
-            pending.iter().map(|(path, blob)| (path.split('/').collect(), blob.clone())).collect();
-        changes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        Ok(self.rebuild(Some(base), &changes, 0).unwrap_or(self.empty))
+        // By component, so each directory's changes are one run, in its entries' order: every
+        // path's components in one column, and each change its run of them.
+        let mut parts: Vec<&str> = Vec::with_capacity(pending.len() * 4);
+        let mut changes: Vec<Staged<'_>> = Vec::with_capacity(pending.len());
+        for (path, blob) in &pending {
+            let start = parts.len();
+            parts.extend(path.split('/'));
+            changes.push((start, parts.len(), blob));
+        }
+        changes.sort_unstable_by(|a, b| parts[a.0..a.1].cmp(&parts[b.0..b.1]));
+        let mut stack = std::mem::take(&mut self.rebuilt);
+        let root = self.rebuild(Some(base), &parts, &changes, 0, &mut stack);
+        self.rebuilt = stack;
+        Ok(root.unwrap_or(self.empty))
     }
 
     /// The file at `path` as the transaction sees it so far: `Err` for a directory.
@@ -506,6 +563,7 @@ impl Tree {
     /// The file at `path` as the transaction sees it so far, if a file is there.
     fn file_now(&self, base: NodeId, pending: &Pending, path: &str) -> Option<Blob> {
         match pending.get(path) {
+            // clone: a node, or one more count of new bytes; once per path an op checks.
             Some(blob) => blob.clone(),
             None if shadowed(pending, path) => None,
             None => self.blob(base, path),
@@ -514,10 +572,11 @@ impl Tree {
 
     /// Whether the transaction sees any file under the directory `path`; stops at the first.
     fn has_files_under(&self, base: NodeId, pending: &Pending, path: &str) -> bool {
-        let below = format!("{path}/");
+        // alloc: once per op checked; the walk below builds every path in this one buffer.
+        let mut below = format!("{path}/");
         let staged = pending
-            .range(below.clone()..)
-            .take_while(|it| it.0.starts_with(&below))
+            .range::<str, _>((Bound::Included(below.as_str()), Bound::Unbounded))
+            .take_while(|it| it.0.starts_with(below.as_str()))
             .any(|it| it.1.is_some());
         if staged {
             return true;
@@ -526,18 +585,22 @@ impl Tree {
             return false;
         }
         let Some(dir) = self.lookup(base, path).filter(|it| self.is_dir(*it)) else { return false };
-        let mut stack = vec![(dir, path.to_owned())];
-        while let Some((node, at)) = stack.pop() {
-            for (name, child, _) in self.entries(node).expect("a directory").iter() {
-                let file = format!("{at}/{}", self.name_str(name));
-                if pending.contains_key(&file) {
-                    continue;
-                }
-                if self.is_dir(child) {
-                    stack.push((child, file));
-                } else {
-                    return true;
-                }
+        below.pop();
+        self.any_file_left(dir, pending, &mut below)
+    }
+
+    /// Whether the directory `dir`, at `path`, has a file under it on a path `pending` has no
+    /// say on; stops at the first.
+    fn any_file_left(&self, dir: NodeId, pending: &Pending, path: &mut String) -> bool {
+        for (name, child, _) in self.entries(dir).expect("a directory").iter() {
+            let len = path.len();
+            path.push('/');
+            path.push_str(self.name_str(name));
+            let found = !pending.contains_key(path.as_str())
+                && (!self.is_dir(child) || self.any_file_left(child, pending, path));
+            path.truncate(len);
+            if found {
+                return true;
             }
         }
         false
@@ -546,6 +609,7 @@ impl Tree {
     /// The files under the directory `path`, as the transaction sees them so far.
     fn files_under(&self, base: NodeId, pending: &Pending, path: &str) -> Vec<(String, Blob)> {
         // The base's files are those `pending` has no say on, so no path is found twice.
+        // alloc: a directory deleted or moved; each path found becomes a key of `Pending`.
         let mut found: Vec<(String, Blob)> = Vec::new();
         let gone = pending.contains_key(path) || shadowed(pending, path);
         if !gone && let Some(dir) = self.lookup(base, path).filter(|it| self.is_dir(*it)) {
@@ -555,12 +619,15 @@ impl Tree {
                 }
             }
         }
+        // alloc: once per directory deleted or moved, the range's start.
         let below = format!("{path}/");
-        for (file, blob) in pending.range(below.clone()..) {
-            if !file.starts_with(&below) {
+        let range = (Bound::Included(below.as_str()), Bound::Unbounded);
+        for (file, blob) in pending.range::<str, _>(range) {
+            if !file.starts_with(below.as_str()) {
                 break;
             }
             if let Some(blob) = blob {
+                // clone: each path found becomes a key of `Pending`; a blob is a node or an `Arc`.
                 found.push((file.clone(), blob.clone()));
             }
         }
@@ -577,14 +644,16 @@ impl Tree {
         op: &Op,
     ) -> Result<(), OpError> {
         for path in op_paths(op) {
-            parts(path)?;
+            check(path)?;
         }
         let file_at = |pending: &Pending, path: &str| -> Result<Option<Blob>, OpError> {
+            // alloc: the error's path
             self.current(base, pending, path).map_err(|()| OpError::IsADirectory(path.to_owned()))
         };
         let no_file_above = |pending: &Pending, path: &str| -> Result<(), OpError> {
             for up in ancestors(path) {
                 if self.file_now(base, pending, up).is_some() {
+                    // alloc: the error's path
                     return Err(OpError::NotADirectory(path.to_owned()));
                 }
             }
@@ -594,15 +663,16 @@ impl Tree {
             Op::Write { path, bytes, mode } => {
                 no_file_above(pending, path)?;
                 file_at(pending, path)?;
-                pending.insert(path.clone(), Some(Blob::New(Arc::from(bytes.as_slice()), *mode)));
+                put(pending, path, Some(Blob::New(Arc::from(bytes.as_slice()), *mode)));
             }
             Op::Edit { path, at, len, bytes } => {
-                let blob =
-                    file_at(pending, path)?.ok_or_else(|| OpError::NotFound(path.clone()))?;
+                // clone: the error's path
+                let blob = file_at(pending, path)?.ok_or_else(|| OpError::NotFound(path.clone()))?;
                 let (old, mode) = (self.staged_bytes(&blob)?, blob.mode());
                 let size = old.len() as u64;
                 if at.checked_add(*len).is_none_or(|end| end > size) {
                     return Err(OpError::OutOfRange {
+                        // clone: the error's path
                         path: path.clone(),
                         at: *at,
                         len: *len,
@@ -611,45 +681,62 @@ impl Tree {
                 }
                 let (at, end) = (*at as usize, (*at + *len) as usize);
                 let new: Arc<[u8]> = [&old[..at], bytes, &old[end..]].concat().into();
-                pending.insert(path.clone(), Some(Blob::New(new, mode)));
+                put(pending, path, Some(Blob::New(new, mode)));
             }
-            Op::Delete { path } => match file_at(pending, path) {
-                Ok(Some(_)) => {
-                    pending.insert(path.clone(), None);
-                }
-                Ok(None) => return Err(OpError::NotFound(path.clone())),
-                Err(_) => {
-                    for (file, _) in self.files_under(base, pending, path) {
-                        pending.insert(file, None);
-                    }
-                    pending.insert(path.clone(), None);
-                }
-            },
+            Op::Delete { path } => self.delete(base, pending, path)?,
             Op::Rename { from, to } => {
-                if to.starts_with(&format!("{from}/")) {
+                if to.strip_prefix(from.as_str()).is_some_and(|rest| rest.starts_with('/')) {
+                    // clone: the error's path
                     return Err(OpError::BadPath(to.clone()));
                 }
                 if from == to {
+                    // clone: the error's path
                     return Err(OpError::Exists(to.clone()));
                 }
+                // Each file moved at its new path.
                 let moved: Vec<(String, Blob)> = match file_at(pending, from) {
-                    Ok(Some(blob)) => vec![(String::new(), blob)],
+                    // alloc: the key `Pending` keeps for the one file moved
+                    Ok(Some(blob)) => vec![(to.clone(), blob)],
+                    // clone: the error's path
                     Ok(None) => return Err(OpError::NotFound(from.clone())),
+                    // alloc: `files_under`'s buffer reused in place; a path's own grows only for
+                    // a `to` longer than `from`.
                     Err(_) => self
                         .files_under(base, pending, from)
                         .into_iter()
-                        .map(|(file, blob)| (file[from.len()..].to_owned(), blob))
+                        .map(|(mut file, blob)| {
+                            file.replace_range(..from.len(), to);
+                            (file, blob)
+                        })
+                        // alloc: none, the same element type collects into the same buffer.
                         .collect(),
                 };
                 match file_at(pending, to) {
                     Ok(None) => {}
+                    // clone: the error's path
                     _ => return Err(OpError::Exists(to.clone())),
                 }
                 no_file_above(pending, to)?;
-                self.stage(base, pending, &Op::Delete { path: from.clone() })?;
-                for (rest, blob) in moved {
-                    pending.insert(format!("{to}{rest}"), Some(blob));
+                self.delete(base, pending, from)?;
+                for (path, blob) in moved {
+                    pending.insert(path, Some(blob));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stages the deletion of the file or the directory at `path`.
+    fn delete(&self, base: NodeId, pending: &mut Pending, path: &str) -> Result<(), OpError> {
+        match self.current(base, pending, path) {
+            Ok(Some(_)) => put(pending, path, None),
+            // alloc: the error's path
+            Ok(None) => return Err(OpError::NotFound(path.to_owned())),
+            Err(()) => {
+                for (file, _) in self.files_under(base, pending, path) {
+                    pending.insert(file, None);
+                }
+                put(pending, path, None);
             }
         }
         Ok(())
@@ -661,45 +748,55 @@ impl Tree {
     fn rebuild(
         &mut self,
         dir: Option<NodeId>,
-        changes: &[(Vec<&str>, Option<Blob>)],
+        parts: &[&str],
+        changes: &[Staged<'_>],
         depth: usize,
+        stack: &mut Vec<Entry>,
     ) -> Option<NodeId> {
-        let old: Vec<Entry> =
-            dir.and_then(|it| self.entries(it)).map(|it| it.iter().collect()).unwrap_or_default();
-        let mut out: Vec<Entry> = Vec::with_capacity(old.len() + changes.len());
-        let mut kept = 0;
+        // This directory's old entries, then its new ones, above its parents' on `stack`.
+        let base = stack.len();
+        if let Some(entries) = dir.and_then(|it| self.entries(it)) {
+            stack.extend(entries.iter());
+        }
+        let old = stack.len();
+        let mut kept = base;
         let mut start = 0;
+        let name_at = |change: &Staged<'_>| parts[change.0 + depth];
         while start < changes.len() {
-            let name = changes[start].0[depth];
-            let end = start + changes[start..].iter().take_while(|it| it.0[depth] == name).count();
+            let name = name_at(&changes[start]);
+            let end =
+                start + changes[start..].iter().take_while(|it| name_at(*it) == name).count();
             let group = &changes[start..end];
             start = end;
-            while kept < old.len() && self.name_bytes(old[kept].0) < name.as_bytes() {
-                out.push(old[kept]);
+            while kept < old && self.name_bytes(stack[kept].0) < name.as_bytes() {
+                let entry = stack[kept];
+                stack.push(entry);
                 kept += 1;
             }
-            let existing = (kept < old.len() && self.name_bytes(old[kept].0) == name.as_bytes())
+            let existing = (kept < old && self.name_bytes(stack[kept].0) == name.as_bytes())
                 .then(|| {
                     kept += 1;
-                    old[kept - 1]
+                    stack[kept - 1]
                 });
             // The change at this name itself sorts first in its group: its path is the shortest.
-            let (here, deeper) = match group[0].0.len() == depth + 1 {
-                true => (Some(&group[0].1), &group[1..]),
+            let (here, deeper) = match group[0].1 - group[0].0 == depth + 1 {
+                true => (Some(group[0].2), &group[1..]),
                 false => (None, group),
             };
             let child = match here {
-                Some(here) if !deeper.iter().any(|it| it.1.is_some()) => {
-                    here.clone().map(|blob| match blob {
-                        Blob::Node(node, mode) => (node, mode),
-                        Blob::New(bytes, mode) => (self.file(bytes), mode),
+                Some(here) if !deeper.iter().any(|it| it.2.is_some()) => {
+                    here.as_ref().map(|blob| match blob {
+                        Blob::Node(node, mode) => (*node, *mode),
+                        // clone: the store keeps the new file's bytes, as one more count of them.
+                        Blob::New(bytes, mode) => (self.file(bytes.clone()), *mode),
                     })
                 }
                 // A directory, made of what was there if that was one and nothing replaced it.
                 _ => {
                     let was =
                         existing.map(|it| it.1).filter(|it| here.is_none() && self.is_dir(*it));
-                    self.rebuild(was, deeper, depth + 1).map(|dir| (dir, Mode::Regular))
+                    self.rebuild(was, parts, deeper, depth + 1, stack)
+                        .map(|dir| (dir, Mode::Regular))
                 }
             };
             if let Some((child, mode)) = child {
@@ -707,21 +804,25 @@ impl Tree {
                     Some(it) => it.0,
                     None => self.name(name),
                 };
-                out.push((name, child, mode));
+                stack.push((name, child, mode));
             }
         }
-        out.extend_from_slice(&old[kept..]);
-        if out.is_empty() && dir != Some(self.empty) {
-            return None;
-        }
-        Some(self.dir_sorted(&mut out))
+        stack.extend_from_within(kept..old);
+        let made = match stack.len() == old && dir != Some(self.empty) {
+            true => None,
+            false => Some(self.dir_sorted(&mut stack[old..])),
+        };
+        stack.truncate(base);
+        made
     }
 
     /// The files that differ between `from` and `to`, in path order. A file whose bytes or mode
     /// changed is [`ChangeKind::Modified`].
     pub(crate) fn diff(&self, from: NodeId, to: NodeId) -> Vec<Change> {
+        // alloc: the output, one change per file that differs.
         let mut out = Vec::new();
         let root = |node| Some((node, Mode::Regular));
+        // alloc: the one buffer every path is built in.
         self.diff_into(root(from), root(to), &mut String::new(), &mut out);
         out
     }
@@ -741,11 +842,12 @@ impl Tree {
                    path: &mut String,
                    out: &mut Vec<Change>| {
             self.each_file(node, mode, path, &mut |path, _, _| {
-                out.push(Change { path: path.to_owned(), kind });
+                out.push(Change { path: path.to_owned(), kind }); // alloc: the change's path
             });
         };
         match (from, to) {
             (Some(a), Some(b)) => match (self.entries(a.0), self.entries(b.0)) {
+                // clone: the change's path, the output
                 (None, None) => out.push(Change { path: path.clone(), kind: ChangeKind::Modified }),
                 (Some(x), Some(y)) => {
                     let (mut i, mut j) = (0, 0);
@@ -785,10 +887,12 @@ impl Tree {
                 // A file replaced by a directory or the other way: the file's path comes before
                 // every path under it.
                 (None, Some(_)) => {
+                    // clone: the change's path, the output
                     out.push(Change { path: path.clone(), kind: ChangeKind::Removed });
                     all(b, ChangeKind::Added, path, out);
                 }
                 (Some(_), None) => {
+                    // clone: the change's path, the output
                     out.push(Change { path: path.clone(), kind: ChangeKind::Added });
                     all(a, ChangeKind::Removed, path, out);
                 }
@@ -805,6 +909,7 @@ impl Tree {
     pub(crate) fn collect(&mut self, live: &mut [NodeId]) -> Vec<Option<NodeId>> {
         let len = self.len();
         let mut reached = BitSet::<NodeId>::new(len);
+        // alloc: once per collection, the walk's stack.
         let mut stack: Vec<NodeId> = live.iter().copied().chain([self.empty]).collect();
         while let Some(node) = stack.pop() {
             if !reached.insert(node) {
@@ -817,7 +922,9 @@ impl Tree {
         let count = reached.count();
         let old = self.store.table();
         let mut next = Building::after(old, count);
+        // alloc: once per collection, the renumbering it returns.
         let mut renumbered: Vec<Option<NodeId>> = vec![None; len];
+        // alloc: once per collection, one directory's entries at a time.
         let mut columns = Vec::new();
         // Children have smaller numbers than their parents, so they are renumbered first.
         for NodeId(at) in reached.iter() {
@@ -841,6 +948,17 @@ impl Tree {
             *root = renumbered[root.0 as usize].expect("a live root is kept");
         }
         renumbered
+    }
+}
+
+/// Stages `blob` at `path`, making a key only for a path not staged before.
+fn put(pending: &mut Pending, path: &str, blob: Option<Blob>) {
+    match pending.get_mut(path) {
+        Some(slot) => *slot = blob,
+        None => {
+            // alloc: a path staged for the first time becomes a key of `Pending`.
+            pending.insert(path.to_owned(), blob);
+        }
     }
 }
 

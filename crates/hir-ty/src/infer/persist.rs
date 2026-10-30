@@ -20,7 +20,7 @@ use hir_def::{
     GenericParamId, LifetimeParamId, StructId, TraitId, TupleFieldId, TupleId, TypeOrConstParamId,
     TypeParamId, UnionId, VariantId,
     hir::{
-        ArithOp, BinaryOp, BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, UnaryOp,
+        ArithOp, BinaryOp, BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, PatId, UnaryOp,
         UnsafeBinderCastKind,
     },
     resolver::ValueNs,
@@ -263,7 +263,7 @@ fn table_words(bytes: &[u8]) -> Vec<u128> {
     bytes
         .chunks_exact(size_of::<u128>())
         .map(|chunk| u128::from_le_bytes(chunk.try_into().expect("a chunk of 16 bytes")))
-        .collect()
+        .collect() // alloc: the record's type table, exact size, once per body persisted
 }
 
 /// The type table's buffer as the reader takes it, from [`table_words`]'s words: a copy, for
@@ -761,6 +761,7 @@ impl InferenceRecord {
             unreachable,
             traits_in_scope_used,
             coroutine_stalled_predicates,
+            named_pat_types,
             nodes_with_type_mismatches,
             error_ty,
             expr_adjustments,
@@ -881,6 +882,11 @@ impl InferenceRecord {
                 words.symbol(feature);
             });
         });
+        words.len(named_pat_types.len());
+        named_pat_types.iter().for_each(|(pat, named)| {
+            words.word(local(*pat));
+            words.named_term(tys, named);
+        });
         record.put32(C32::Words, words.words.iter().copied());
         record.put8(C8::Text, words.text.iter().copied());
 
@@ -910,7 +916,7 @@ impl InferenceRecord {
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(15),
+        Part::U64(17),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -1013,6 +1019,7 @@ impl<'a> InferenceRecordRef<'a> {
     }
 
     fn index_column<K: DenseKey, V>(&self, present: C64, rows: Box<[V]>) -> Result<IndexColumn<K, V>, FormatError> {
+        // alloc: the memo's column, exact size, once per record read
         IndexColumn::from_parts(self.u64s(present).to_vec(), rows).map_err(|what| self.invalid(what))
     }
 
@@ -1060,10 +1067,12 @@ impl<'a> InferenceRecordRef<'a> {
     }
 
     fn idx_set<K: DenseKey>(&self, column: C64) -> Result<IdxSet<K>, FormatError> {
+        // alloc: the memo's column, exact size, once per record read
         IdxSet::from_words(self.u64s(column).to_vec()).map_err(|what| self.invalid(what))
     }
 
     fn lists<K: DenseKey, T>(&self, present: C64, ends: C32, items: Box<[T]>) -> Result<Csr<K, T>, FormatError> {
+        // alloc: the memo's column, exact size, once per record read
         Csr::from_parts(self.u64s(present).to_vec(), self.u32s(ends).into(), items).map_err(|what| self.invalid(what))
     }
 
@@ -1290,7 +1299,18 @@ impl<'a> InferenceRecordRef<'a> {
             }
             map.freeze()
         };
-        self.ensure(words.is_done(), "words after the last unstable item list")?;
+        let named_pat_types = {
+            let len = words.len()?;
+            let entries = exact(
+                len,
+                (0..len).map(|_| -> Result<(PatId, NamedTerm), FormatError> {
+                    Ok((local_of(words.word()?), words.named_term(tys)?))
+                }),
+            )?;
+            self.ensure(entries.is_sorted_by(|a, b| a.0 < b.0), "named pattern types out of order")?;
+            entries.into_boxed_slice()
+        };
+        self.ensure(words.is_done(), "words after the last named pattern type")?;
 
         let anon_consts = self.u64s(C64::AnonConsts);
         let defined_anon_consts =
@@ -1316,6 +1336,7 @@ impl<'a> InferenceRecordRef<'a> {
             unreachable,
             traits_in_scope_used,
             coroutine_stalled_predicates,
+            named_pat_types,
             nodes_with_type_mismatches: ExprOrPatSet {
                 exprs: self.idx_set(C64::MismatchedExprs)?,
                 pats: self.idx_set(C64::MismatchedPats)?,
@@ -1668,6 +1689,7 @@ impl Sink {
             }
             StoredGoal::UnstableFeature { feature } => {
                 self.word(11);
+                // clone: error path, the feature of a reported goal
                 self.name(&Name::new_symbol_root(feature.clone()));
             }
             StoredGoal::Outlives { a, b } => {
@@ -1676,6 +1698,17 @@ impl Sink {
                 self.generic_arg(tys, b);
             }
             StoredGoal::Ambiguous => self.word(13),
+        }
+    }
+
+    /// A [`NamedTerm`]: its term as a one-argument list, then each parameter's span and id.
+    fn named_term<'db>(&mut self, tys: &mut impl TyEncode<'db>, named: &NamedTerm) {
+        let at = tys.args(GenericArgs::new_from_slice(&[named.term.as_ref()]));
+        self.word(at);
+        self.len(named.params.len());
+        for &(span, param) in &named.params {
+            self.span(span);
+            self.generic_param(param);
         }
     }
 
@@ -2020,13 +2053,8 @@ impl Sink {
                 match named {
                     None => self.word(0),
                     Some(named) => {
-                        let at = tys.args(GenericArgs::new_from_slice(&[named.term.as_ref()]));
-                        self.words.extend([1, at]);
-                        self.len(named.params.len());
-                        for &(span, param) in &named.params {
-                            self.span(span);
-                            self.generic_param(param);
-                        }
+                        self.word(1);
+                        self.named_term(tys, named);
                     }
                 }
                 self.cause_code(*cause);
@@ -2086,13 +2114,14 @@ impl Sink {
                         self.goal(tys, goal);
                         self.bool(*suggest_increasing_limit);
                     }
-                    SolverDiagnosticKind::ProjectionMismatch { goal, normalized } => {
+                    SolverDiagnosticKind::ProjectionMismatch { goal, normalized, impl_ } => {
                         self.word(4);
                         self.goal(tys, goal);
                         self.bool(normalized.is_some());
                         if let Some(normalized) = normalized {
                             self.generic_arg(tys, normalized);
                         }
+                        self.optional_impl(*impl_);
                     }
                     SolverDiagnosticKind::TypesDiffer { expected, found } => {
                         self.word(5);
@@ -2588,6 +2617,7 @@ impl Source<'_> {
         {
             return Err(self.invalid("call arguments of no shape"));
         }
+        // alloc: error path, a persisted diagnostic's arguments
         Ok(Box::new(CallArguments {
             callee,
             method,
@@ -2614,11 +2644,25 @@ impl Source<'_> {
             8 => StoredGoal::ConstArgHasType { ct: self.generic_arg(tys)?, ty: self.ty(tys)? },
             9 => StoredGoal::ConstEquate { a: self.generic_arg(tys)?, b: self.generic_arg(tys)? },
             10 => StoredGoal::DynCompatible { trait_: self.id()? },
+            // clone: error path, the feature of a reported goal
             11 => StoredGoal::UnstableFeature { feature: self.name()?.symbol().clone() },
             12 => StoredGoal::Outlives { a: self.generic_arg(tys)?, b: self.generic_arg(tys)? },
             13 => StoredGoal::Ambiguous,
             _ => return Err(self.invalid("a goal of no kind")),
         })
+    }
+
+    /// What [`Sink::named_term`] wrote.
+    fn named_term(&mut self, tys: &impl TyDecode) -> Result<NamedTerm, FormatError> {
+        let args = tys.args(self.word()?)?;
+        let term = match args.as_ref().as_slice() {
+            [term] => term.store(),
+            _ => return Err(self.invalid("a named term that is not one argument")),
+        };
+        let len = self.len()?;
+        // alloc: error path, a persisted named term's parameters
+        let params = exact(len, (0..len).map(|_| Ok((self.span()?, self.generic_param()?))))?;
+        Ok(NamedTerm { term, params })
     }
 
     fn ambiguity_note(&mut self, tys: &impl TyDecode) -> Result<AmbiguityNote, FormatError> {
@@ -2785,6 +2829,7 @@ impl Source<'_> {
                 rhs: self.ty(tys)?,
                 at_error: match self.word()? {
                     0 => None,
+                    // alloc: error path, a persisted diagnostic's types
                     1 => Some(Box::new((self.ty(tys)?, self.ty(tys)?))),
                     _ => return Err(self.invalid("optional types at an error of no kind")),
                 },
@@ -2812,6 +2857,7 @@ impl Source<'_> {
                 expr_ty: self.ty(tys)?,
                 cast_ty: self.ty(tys)?,
                 pointers: if self.bool()? {
+                    // alloc: error path, a persisted diagnostic's pointers
                     Some(Box::new(CastPointers {
                         expr: self.cast_pointer_kind()?,
                         cast: self.cast_pointer_kind()?,
@@ -2915,6 +2961,7 @@ impl Source<'_> {
                         let primary = self.ambiguity_note(tys)?;
                         let len = self.len()?;
                         let related = exact(len, (0..len).map(|_| self.ambiguity_note(tys)))?;
+                        // alloc: error path, a persisted diagnostic's ambiguity
                         Some(Box::new(Ambiguity { primary, related }))
                     }
                     _ => return Err(self.invalid("an optional ambiguity of no kind")),
@@ -2922,17 +2969,8 @@ impl Source<'_> {
                 origin: if self.bool()? { Some((self.span()?, self.generic_param()?)) } else { None },
                 named: match self.word()? {
                     0 => None,
-                    1 => {
-                        let args = tys.args(self.word()?)?;
-                        let term = match args.as_ref().as_slice() {
-                            [term] => term.store(),
-                            _ => return Err(self.invalid("a named term that is not one argument")),
-                        };
-                        let len = self.len()?;
-                        let params =
-                            exact(len, (0..len).map(|_| Ok((self.span()?, self.generic_param()?))))?;
-                        Some(Box::new(NamedTerm { term, params }))
-                    }
+                    // alloc: error path, a persisted diagnostic's named term
+                    1 => Some(Box::new(self.named_term(tys)?)),
                     _ => return Err(self.invalid("an optional named term of no kind")),
                 },
                 cause: self.cause_code()?,
@@ -2944,6 +2982,7 @@ impl Source<'_> {
                 found: self.ty(tys)?,
                 at_error: match self.word()? {
                     0 => None,
+                    // alloc: error path, a persisted diagnostic's types
                     1 => Some(Box::new((self.ty(tys)?, self.ty(tys)?))),
                     _ => return Err(self.invalid("optional types at an error of no kind")),
                 },
@@ -2987,6 +3026,7 @@ impl Source<'_> {
                     4 => SolverDiagnosticKind::ProjectionMismatch {
                         goal: self.goal(tys)?,
                         normalized: if self.bool()? { Some(self.generic_arg(tys)?) } else { None },
+                        impl_: self.optional_impl()?,
                     },
                     5 => SolverDiagnosticKind::TypesDiffer { expected: self.ty(tys)?, found: self.ty(tys)? },
                     6 => SolverDiagnosticKind::ConstArgHasWrongType {
@@ -3647,6 +3687,7 @@ mod tests {
                 kind: SolverDiagnosticKind::ProjectionMismatch {
                     goal: goals[2].clone(),
                     normalized: Some(arg_of(types.bool)),
+                    impl_: Some(AnyImplId::ImplId(ImplId::from_id(id(44)))),
                 },
             }),
             D::SolverDiagnostic(SolverDiagnostic {
@@ -3655,6 +3696,7 @@ mod tests {
                 kind: SolverDiagnosticKind::ProjectionMismatch {
                     goal: goals[2].clone(),
                     normalized: None,
+                    impl_: None,
                 },
             }),
             D::SolverDiagnostic(SolverDiagnostic {
@@ -3932,6 +3974,24 @@ mod tests {
             ]),
             // A predicate needs an interner, so the column is only tested empty here.
             coroutine_stalled_predicates: Box::new([]),
+            named_pat_types: Box::new([
+                (
+                    pat(3),
+                    NamedTerm {
+                        term: GenericArg::from(Ty::new_without_interner(TyKind::Infer(InferTy::FreshTy(0))))
+                            .store(),
+                        params: vec![(
+                            Span::PatId(pat(3)),
+                            TypeParamId::from_unchecked(TypeOrConstParamId {
+                                parent: FunctionId::from_id(id(33)).into(),
+                                local_id: local_of(1),
+                            })
+                            .into(),
+                        )],
+                    },
+                ),
+                (pat(9), NamedTerm { term: arg_of(types.u8), params: vec![] }),
+            ]),
             nodes_with_type_mismatches: mismatches,
             error_ty: types.unit.store(),
             expr_adjustments: expr_adjustments.freeze(),

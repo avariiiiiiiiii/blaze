@@ -16,7 +16,7 @@
 //! the caller found them in never changes a key.
 
 use blaze_codegen::content::arch_tag;
-use blaze_codegen::settings::Toolchain;
+use blaze_codegen::settings::{Coverage, Sanitize, Toolchain};
 use blaze_codegen::{CompiledFunction, InstanceKey, Settings, Target};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
@@ -307,6 +307,8 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
         dev_run,
         triple,
         exec_log,
+        sanitize,
+        rpaths,
     } = output;
     hasher.update(&[format_tag(*format), arch_tag(*arch)]);
     match kind {
@@ -353,6 +355,14 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
         None => hasher.update(&[0]),
     };
     hasher.part(triple.as_bytes()).update(&[*exec_log as u8]);
+    let Sanitize { sanitizers, recover, track_origins, coverage: Coverage { level, flags } } = sanitize;
+    hasher
+        .update(&[sanitizers.0, recover.0, *track_origins, *level])
+        .update(&flags.to_le_bytes());
+    count(hasher, rpaths.len());
+    for rpath in rpaths {
+        hasher.part(rpath.as_bytes());
+    }
 }
 
 fn target_into(hasher: &mut Hasher, target: &Target) {

@@ -19,6 +19,7 @@ pub(crate) struct Lent<P, A: Allocator = Global>(RefCell<Vec<P, A>>);
 
 impl<P> Default for Lent<P> {
     fn default() -> Self {
+        // alloc: empty, allocates nothing
         Lent(RefCell::new(Vec::new()))
     }
 }

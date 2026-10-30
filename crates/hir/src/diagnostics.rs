@@ -9,8 +9,8 @@ use base_db::Db;
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_def::{
-    AdtId, AssocItemId, DefWithBodyId, EnumId, EnumVariantId, GenericDefId, GenericParamId, ImplId,
-    ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId, SyntheticSyntax, TraitId,
+    AdtId, AssocItemId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, GenericDefId,
+    GenericParamId, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId, SyntheticSyntax, TraitId,
     attrs::AttrFlags,
     expr_store::{
         Body, ExprOrPatPtr, ExpressionStore, ExpressionStoreDiagnostics, ExpressionStoreSourceMap,
@@ -26,6 +26,7 @@ use hir_def::{
         ConstSignature, FunctionSignature, ImplFlags, ImplSignature, TraitFlags, TraitSignature,
         TypeAliasSignature,
     },
+    src::HasChildSource as _,
     type_ref::TypeRefId,
     unstable_features::UnstableFeatures,
 };
@@ -71,6 +72,7 @@ pub use hir_def::{VariantId, expr_store::MissingBodyItemKind, hir::UnsafeBinderC
 pub use hir_expand::BuiltinChild;
 pub use hir_ide::{
     GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind, ReturnKind,
+    const_param_ty::ConstParamTyReason,
     diagnostics::{CaseType, IdentType, IncorrectCase},
 };
 pub use hir_ide::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
@@ -242,6 +244,8 @@ diagnostics![AnyDiagnostic<'db> ->
     YieldOutsideCoroutine,
     ReturnOutsideFunction,
     UnsafeBinderCastOfNonBinder<'db>,
+    ConstParamTyNotAllowed<'db>,
+    ValTreeError<'db>,
 ];
 
 #[derive(Debug)]
@@ -1308,8 +1312,14 @@ pub enum TraitSolverErrorKind<'db> {
     Overflow { goal: SolverGoal<'db>, suggest_increasing_limit: bool },
     /// E0271: "type mismatch resolving `goal`"; `normalized`, what the goal's alias normalizes
     /// to where that is not the goal's term (rustc's "expected `term`, found `normalized`"): a
-    /// type, or a constant's text.
-    ProjectionMismatch { goal: SolverGoal<'db>, normalized: Option<Either<Type<'db>, String>> },
+    /// type, or a constant's text; `impl_`, the user-written impl selection picks for the
+    /// projection's trait ref, whose associated item rustc labels "expected this to be `term`"
+    /// when it is local and final.
+    ProjectionMismatch {
+        goal: SolverGoal<'db>,
+        normalized: Option<Either<Type<'db>, String>>,
+        impl_: Option<crate::Impl>,
+    },
     /// E0308 of a subtyping or coercion goal.
     TypesDiffer { expected: Type<'db>, found: Type<'db> },
     /// "the constant `ct` is not of type `expected_ty`", which is `ct_ty`.
@@ -1498,6 +1508,140 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
     })
 }
 
+/// Where a dyn-compatibility violation is written: rustc's `DynCompatibilityViolation::spans`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DynCompatibilitySite {
+    Syntax(InFile<SyntaxNodePtr>),
+    /// The `index`th item bound of an associated type (its own, then those the trait's where
+    /// clauses put on it). hir can't point at one yet: the bounds are lowered with no record of
+    /// which written bound each came from.
+    AssocTypeBound { alias: TypeAlias, index: u32 },
+}
+
+impl Trait {
+    /// rustc's `dyn_compatibility_violations` of the trait itself, each with its sites in rustc's
+    /// order. A violation with none is one rustc gives no span: a `Sized` only elaborated, and
+    /// [`crate::DynCompatibilityViolation::HasNonCompatibleSuperTrait`], whose trait has its
+    /// own. The two `SelfReferential` violations stay apart as rustc's: predicates first, then
+    /// the associated types' bounds.
+    pub fn dyn_compatibility_violation_sites(
+        self,
+        db: &Db,
+    ) -> Vec<(crate::DynCompatibilityViolation, Vec<DynCompatibilitySite>)> {
+        use hir_ide::dyn_compatibility::{ViolationSite, dyn_compatibility_violation_sites};
+        let site = |site: &ViolationSite| -> Option<DynCompatibilitySite> {
+            let syntax = match *site {
+                ViolationSite::Predicate { def, index } => match bound_source(db, def, index)? {
+                    BoundSource::Written(bound) => bound.map(|it| it.syntax_node_ptr()),
+                    BoundSource::ImplicitSized(_)
+                    | BoundSource::ImpliedTrait(_)
+                    | BoundSource::ConstParamType(_) => return None,
+                },
+                ViolationSite::AssocTypeBound { alias, index } => {
+                    return Some(DynCompatibilitySite::AssocTypeBound {
+                        alias: TypeAlias { id: alias },
+                        index,
+                    });
+                }
+                ViolationSite::Param { function, index } => param_syntax(db, function, index)?,
+                ViolationSite::Output(function) => output_syntax(db, function)?,
+                ViolationSite::Opaque { function, index } => {
+                    opaque_syntax(db, function, index.into_raw().into_u32())?
+                }
+                ViolationSite::Name(item) => assoc_item_name(db, item)?,
+            };
+            Some(DynCompatibilitySite::Syntax(syntax))
+        };
+        dyn_compatibility_violation_sites(db, self.id)
+            .into_iter()
+            .map(|(violation, sites)| {
+                let sites = sites.iter().filter_map(site).collect(); // alloc: error path
+                (violation, sites)
+            })
+            .collect() // alloc: error path, a dyn-incompatible trait reported
+    }
+}
+
+/// The name of an associated item.
+fn assoc_item_name(db: &Db, item: AssocItemId) -> Option<InFile<SyntaxNodePtr>> {
+    fn name<N: HasName>(source: InFile<N>) -> Option<InFile<SyntaxNodePtr>> {
+        let name = source.value.name()?;
+        Some(source.with_value(SyntaxNodePtr::new(name.syntax())))
+    }
+    use hir_def::src::HasSource;
+    match item {
+        AssocItemId::FunctionId(id) => name(id.lookup(db).source(db)),
+        AssocItemId::ConstId(id) => name(id.lookup(db).source(db)),
+        AssocItemId::TypeAliasId(id) => name(id.lookup(db).source(db)),
+    }
+}
+
+/// The type of `function`'s `index`th parameter, `self` counted (rustc's `decl.inputs[index]`);
+/// for a `self` with no type written, the parameter.
+fn param_syntax(db: &Db, function: FunctionId, index: u32) -> Option<InFile<SyntaxNodePtr>> {
+    let (signature, source_map) = FunctionSignature::with_source_map(db, function);
+    let typed = signature.params.get(index as usize).and_then(|&ty| source_map.type_syntax(ty).ok());
+    if let Some(typed) = typed {
+        return Some(typed.map(|it| it.syntax_node_ptr()));
+    }
+    // `&'a mut self` has no type written: rustc points at the parameter.
+    if index != 0 || !signature.has_self_param() {
+        return None;
+    }
+    let source = hir_def::src::HasSource::source(function.lookup(db), db);
+    let param = source.value.param_list()?.self_param()?;
+    Some(source.with_value(SyntaxNodePtr::new(param.syntax())))
+}
+
+/// `function`'s written return type.
+fn output_syntax(db: &Db, function: FunctionId) -> Option<InFile<SyntaxNodePtr>> {
+    let (signature, source_map) = FunctionSignature::with_source_map(db, function);
+    let ty = source_map.type_syntax(signature.ret_type?).ok()?;
+    Some(ty.map(|it| it.syntax_node_ptr()))
+}
+
+/// The `index`th `impl Trait` of `function`'s return type, counted in the order lowering
+/// allocates them (each before the ones in its bounds), as `ImplTraitId::ReturnTypeImplTrait`.
+fn opaque_syntax(db: &Db, function: FunctionId, index: u32) -> Option<InFile<SyntaxNodePtr>> {
+    use hir_def::{
+        expr_store::StoreVisitor,
+        hir::type_ref::{TypeRef, TypeRefId},
+    };
+    struct Find<'a> {
+        store: &'a ExpressionStore,
+        found: Vec<TypeRefId>,
+    }
+    impl StoreVisitor for Find<'_> {
+        fn on_type(&mut self, ty: TypeRefId) {
+            if let TypeRef::ImplTrait(_) = self.store.type_ref(ty) {
+                self.found.push(ty);
+            }
+            let store = self.store;
+            store.visit_type_ref_children(ty, self);
+        }
+    }
+    let (signature, source_map) = FunctionSignature::with_source_map(db, function);
+    // alloc: error path, the site of a reported error
+    let mut find = Find { store: &signature.store, found: Vec::new() };
+    if let Some(ret_type) = signature.ret_type {
+        find.on_type(ret_type);
+    }
+    let store = &signature.store;
+    let it = *find.found.get(index as usize)?;
+    let ty = source_map.type_syntax(it).ok().or_else(|| {
+        // An `async fn`'s future has no syntax: its output, the type the function says it
+        // returns, has.
+        let TypeRef::ImplTrait(bounds) = store.type_ref(it) else { return None };
+        let [hir_def::hir::type_ref::TypeBound::Path(path, _)] = &bounds[..] else {
+            return None;
+        };
+        let args = store.path(*path).generic_args()?.last()??;
+        let output = args.bindings.first()?.type_ref?;
+        source_map.type_syntax(output).ok()
+    })?;
+    Some(ty.map(|it| it.syntax_node_ptr()))
+}
+
 #[derive(Debug)]
 pub struct ClosureKindMismatch {
     pub span: SpanSyntax,
@@ -1534,6 +1678,35 @@ pub struct UnsafeBinderCastOfNonBinder<'db> {
     pub expr: InFile<ExprOrPatPtr>,
     pub kind: UnsafeBinderCastKind,
     pub found: Type<'db>,
+}
+
+/// rustc's `check_param_wf` of a const parameter's type: E0741 with `adt_const_params`, its
+/// featureless errors without; `reason` picks the text.
+#[derive(Debug)]
+pub struct ConstParamTyNotAllowed<'db> {
+    pub param: InFile<AstPtr<ast::ConstParam>>,
+    pub ty: Type<'db>,
+    pub reason: ConstParamTyReason,
+}
+
+/// A const argument whose value has no value tree (rustc's `eval_to_valtree`), at the
+/// argument. `konst` is `None` for an anonymous constant, which rustc names
+/// `{owner}::{constant#n}`.
+#[derive(Debug)]
+pub struct ValTreeError<'db> {
+    pub at: InFile<SyntaxNodePtr>,
+    pub konst: Option<crate::DefWithBody>,
+    pub error: ValTreeErrorKind<'db>,
+}
+
+#[derive(Debug)]
+pub enum ValTreeErrorKind<'db> {
+    /// "maximum number of nodes exceeded in constant {path}".
+    NodesOverflow,
+    /// A value of this type, met inside the constant, has no value tree.
+    NonSupportedType(Type<'db>),
+    /// The evaluated bytes are not a value of `ty`: `what`. No rustc counterpart.
+    Unreadable { ty: Type<'db>, what: &'static str },
 }
 
 pub(crate) struct DiagnosticsCollector<'a, 'db, F: ?Sized> {
@@ -2094,6 +2267,35 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             TypeOwnerId::from_anon_const(def, self.db),
         );
         self.collect_anon_const_borrowck(source_map, def);
+        self.collect_anon_const_valtree(source_map, def);
+    }
+
+    fn collect_anon_const_valtree(
+        &mut self,
+        source_map: &ExpressionStoreSourceMap,
+        def: AnonConstId<'db>,
+    ) {
+        use hir_ide::const_valtree::{ValTreeError as Error, anon_const_valtree_error};
+        let Some(error) = anon_const_valtree_error(self.db, def) else { return };
+        let loc = def.loc(self.db);
+        let Ok(at) = source_map.expr_syntax(loc.expr) else {
+            never!("{def:?}: an anonymous constant with no syntax has no value tree");
+            return;
+        };
+        let owner = loc.owner.generic_def(self.db);
+        let error = match error {
+            Error::NodesOverflow => ValTreeErrorKind::NodesOverflow,
+            Error::NonSupportedType(ty) => {
+                ValTreeErrorKind::NonSupportedType(Type::new(self.db, owner, ty.as_ref()))
+            }
+            Error::Unreadable { ty, what } => ValTreeErrorKind::Unreadable {
+                ty: Type::new(self.db, owner, ty.as_ref()),
+                what,
+            },
+        };
+        self.acc.push(
+            ValTreeError { at: at.map(|it| it.syntax_node_ptr()), konst: None, error }.into(),
+        );
     }
 
     fn collect_anon_const_borrowck(
@@ -2187,6 +2389,31 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         self.collect_expr_store(store, source_map);
         for (anon_consts, diagnostics) in signature_anon_consts_and_diagnostics(self.db, def) {
             self.collect_anon_consts_and_ty_diagnostics(source_map, anon_consts, diagnostics);
+        }
+        self.collect_const_param_tys(def);
+    }
+
+    fn collect_const_param_tys(&mut self, def: GenericDefId) {
+        let errors = hir_ide::const_param_ty::const_param_ty_errors(self.db, def);
+        if errors.is_empty() {
+            return;
+        }
+        let sources = def.child_source(self.db);
+        for error in errors {
+            let Some(Either::Left(ast::TypeOrConstParam::Const(param))) =
+                sources.value.get(error.param.local_id())
+            else {
+                never!("{:?}: a const parameter with no `ast::ConstParam`", error.param);
+                continue;
+            };
+            self.acc.push(
+                ConstParamTyNotAllowed {
+                    param: InFile::new(sources.file_id, AstPtr::new(param)),
+                    ty: Type::new(self.db, def, error.ty.as_ref()),
+                    reason: error.reason,
+                }
+                .into(),
+            );
         }
     }
 
@@ -2467,7 +2694,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         use hir_ty_wfcheck::Site;
         let db = self.db;
         for diagnostic in &hir_ty_wfcheck::wfcheck(db, def).diagnostics {
-            let mut self_param = None;
+            let mut node = None;
             let source = match diagnostic.site {
                 Site::Field(variant, field) => {
                     let (fields, source_map) = variant.fields_with_source_map(db);
@@ -2501,74 +2728,23 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                     }
                 }
                 Site::Param(function, index) => {
-                    let (signature, source_map) = FunctionSignature::with_source_map(db, function);
-                    let typed = signature
-                        .params
-                        .get(index as usize)
-                        .and_then(|&ty| source_map.type_syntax(ty).ok());
-                    // `&'a mut self` has no type written: rustc points at the parameter.
-                    if typed.is_none() && index == 0 && signature.has_self_param() {
-                        let source = hir_def::src::HasSource::source(function.lookup(db), db);
-                        if let Some(param) =
-                            source.value.param_list().and_then(|it| it.self_param())
-                        {
-                            self_param =
-                                Some(source.with_value(SyntaxNodePtr::new(param.syntax())));
-                        }
-                    }
-                    typed
+                    node = param_syntax(db, function, index);
+                    None
                 }
                 Site::Output(function) => {
-                    let (signature, source_map) = FunctionSignature::with_source_map(db, function);
-                    signature.ret_type.and_then(|ty| source_map.type_syntax(ty).ok())
+                    node = output_syntax(db, function);
+                    None
                 }
                 Site::SelfTy(impl_) => {
                     let (signature, source_map) = ImplSignature::with_source_map(db, impl_);
                     source_map.type_syntax(signature.self_ty).ok()
                 }
                 Site::Opaque(function, index) => {
-                    use hir_def::{
-                        expr_store::StoreVisitor,
-                        hir::type_ref::{TypeRef, TypeRefId},
-                    };
-                    struct Find<'a> {
-                        store: &'a ExpressionStore,
-                        found: Vec<TypeRefId>,
-                    }
-                    impl StoreVisitor for Find<'_> {
-                        fn on_type(&mut self, ty: TypeRefId) {
-                            if let TypeRef::ImplTrait(_) = self.store.type_ref(ty) {
-                                self.found.push(ty);
-                            }
-                            let store = self.store;
-                            store.visit_type_ref_children(ty, self);
-                        }
-                    }
-                    let (signature, source_map) = FunctionSignature::with_source_map(db, function);
-                    // alloc: error path, the site of a reported wfcheck error
-                    let mut find = Find { store: &signature.store, found: Vec::new() };
-                    if let Some(ret_type) = signature.ret_type {
-                        find.on_type(ret_type);
-                    }
-                    let store = &signature.store;
-                    find.found.get(index as usize).and_then(|&it| {
-                        source_map.type_syntax(it).ok().or_else(|| {
-                            // An `async fn`'s future has no syntax: its output, the type
-                            // the function says it returns, has.
-                            let TypeRef::ImplTrait(bounds) = store.type_ref(it) else { return None };
-                            let [hir_def::hir::type_ref::TypeBound::Path(path, _)] = &bounds[..]
-                            else {
-                                return None;
-                            };
-                            let args = store.path(*path).generic_args()?.last()??;
-                            let output = args.bindings.first()?.type_ref?;
-                            source_map.type_syntax(output).ok()
-                        })
-                    })
+                    node = opaque_syntax(db, function, index);
+                    None
                 }
             };
-            let Some(node) = source.map(|it| it.map(|it| it.syntax_node_ptr())).or(self_param)
-            else {
+            let Some(node) = source.map(|it| it.map(|it| it.syntax_node_ptr())).or(node) else {
                 continue;
             };
             self.acc.push(
@@ -3417,7 +3593,7 @@ impl<'db> AnyDiagnostic<'db> {
                     suggest_increasing_limit: *suggest_increasing_limit,
                 })
             }
-            SolverDiagnosticKind::ProjectionMismatch { goal: projection, normalized } => {
+            &SolverDiagnosticKind::ProjectionMismatch { goal: ref projection, ref normalized, impl_ } => {
                 let normalized = normalized.as_ref().map(|arg| match arg.as_ref().kind() {
                     rustc_type_ir::GenericArgKind::Type(it) => {
                         Either::Left(Type { owner: type_owner, ty: EarlyBinder::bind(interner, it) })
@@ -3425,7 +3601,11 @@ impl<'db> AnyDiagnostic<'db> {
                     // alloc: error path, a reported diagnostic's const as rustc prints it
                     _ => Either::Right(arg.as_ref().display(db, target).to_string()),
                 });
-                error(TraitSolverErrorKind::ProjectionMismatch { goal: goal(projection), normalized })
+                error(TraitSolverErrorKind::ProjectionMismatch {
+                    goal: goal(projection),
+                    normalized,
+                    impl_: impl_.map(|id| crate::Impl { id }),
+                })
             }
             SolverDiagnosticKind::TypesDiffer { expected, found } => {
                 error(TraitSolverErrorKind::TypesDiffer { expected: ty(expected), found: ty(found) })
@@ -3774,7 +3954,7 @@ impl<'db> AnyDiagnostic<'db> {
             .ok()
     }
 
-    fn span_syntax(
+    pub(crate) fn span_syntax(
         span: hir_ide::Span,
         source_map: &ExpressionStoreSourceMap,
     ) -> Option<InFile<AstPtr<SpanAst>>> {

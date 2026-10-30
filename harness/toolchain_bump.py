@@ -19,16 +19,15 @@ A bump, in order (each step names itself when it fails, and stops there):
  2. writes harness/toolchain and runs toolchain_pins.py '{"write": true}' (pins.txt: the files' hashes,
     the nightly's `rustc -V` and its rust-lang/rust commit);
  3. re-vendors from rust-lang/rust at the new commit: crates/rustc_abi/src is
-    compiler/rustc_abi/src copied as it is, and vendor/proc-macro-srv is upstream's crates at
-    the new commit with blaze's changes to them at the old commit carried over (a three-way
-    apply; a conflict stops the bump and names the files);
+    compiler/rustc_abi/src and crates/rustc_lexer/src is compiler/rustc_lexer/src, copied as
+    they are;
  4. merges the new nightly's standard library into library/ (`library.py merge`): upstream's
     changes since library/UPSTREAM's nightly, applied three-way, so blaze's own changes to it
     are kept; a conflict stops the bump and names the files. It runs when
     the pin is already the nightly's too, so a bump branch made before library/ catches up;
  5. moves the pins written down elsewhere: the old toolchain name, rustc version line and
-    commit in install.sh and vendor/proc-macro-srv (RUSTC_VERSION_STRING, the manifest's
-    header), the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
+    commit in install.sh, crates/proc-macro-srv (RUSTC_VERSION_STRING, which the server's
+    `--version` prints too), the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
     docs/cargo.md, Cargo.toml's rust-version, and the flake's rust-overlay input (`nix flake
     update rust-overlay`, when nix is on PATH);
  6. installs the nightly with rustup.
@@ -36,7 +35,10 @@ A bump, in order (each step names itself when it fails, and stops there):
 What it leaves to you, which it prints at the end: answers.py --write on each of x86-64 Linux,
 AArch64 Linux and arm64 macOS (the target specs depend on the host rustc was built for), the
 code that mirrors rustc by hand (the Rust ABI in the code generator, vtable.rs, type_id.rs,
-symbol names, new intrinsics and lang items: the checks find them), and `checks '{}'`. The rustc
+symbol names, new intrinsics and lang items: the checks find them), and `checks '{}'`. That
+includes blaze's proc-macro server: crates/proc-macro-srv is a crate of the workspace, built over
+the toolchain's `proc_macro` bridge and following it by hand, so a bridge that changed is a build
+error there (and macroserver.py's comparison) to fix, not a copy to re-vendor. The rustc
 and the daemon match by the whole `rustc -V` line, so a binary built before the bump refuses
 the new nightly until it is rebuilt. docs/contributing.md, "Moving to a newer nightly".
 """
@@ -47,7 +49,6 @@ import os
 import re
 import shutil
 import sys
-import tempfile
 import tomllib
 import urllib.error
 import urllib.request
@@ -71,14 +72,12 @@ HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-li
 COMPONENTS = ["rustc", "cargo", "rust-std", "rust-src", "llvm-tools-preview", "rustfmt-preview",
               "clippy-preview", "rust-analyzer-preview", "rustc-codegen-cranelift-preview"]
 # Where the old pin is written down besides harness/toolchain and pins.txt.
-MENTIONS = ["install.sh", "vendor/proc-macro-srv/Cargo.toml",
-            "vendor/proc-macro-srv/crates/proc-macro-srv/src/lib.rs"]
+MENTIONS = ["install.sh", "crates/proc-macro-srv/src/lib.rs", "crates/rustc_lexer/Cargo.toml"]
 # Docs that name the pin as it is today. Only its names and `rustc -V` move there: a bare commit
 # in them can be what something was ported from.
 DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]
-# vendor/proc-macro-srv's manifest and lock file are blaze's, written from upstream's (their
-# header says how) and carried as they are; its crates are upstream's (`server_dirs`).
 ABI = ("crates/rustc_abi/src", "compiler/rustc_abi/src")
+LEXER = ("crates/rustc_lexer/src", "compiler/rustc_lexer/src")
 
 
 class Failed(Exception):
@@ -190,120 +189,11 @@ def replace_tree(src, dst):
     shutil.copytree(src, dst, symlinks=True)
 
 
-def server_dirs():
-    """vendor/proc-macro-srv's crates, each with where it is in rust-lang/rust."""
-    server = os.path.join(ROOT, "vendor/proc-macro-srv")
-    dirs = {f"crates/{name}": f"src/tools/rust-analyzer/crates/{name}"
-            for name in sorted(os.listdir(os.path.join(server, "crates")))}
-    return dirs | {"compiler/rustc_lexer": "compiler/rustc_lexer"}
-
-
-def files_under(root):
-    """Every file and link under `root`, relative to it."""
-    found = set()
-    for dir, subdirs, names in os.walk(root):
-        for name in names + [d for d in subdirs if os.path.islink(os.path.join(dir, d))]:
-            found.add(os.path.relpath(os.path.join(dir, name), root))
-    return found
-
-
-def without_dev_dependencies(root):
-    """Drops the `[dev-dependencies]` table of every manifest under `root`: the server is vendored
-    without its tests, and dropping the table on both sides of the diff keeps it out of the patch,
-    so that upstream editing next to it does not stop the bump."""
-    for path in files_under(root):
-        if os.path.basename(path) != "Cargo.toml":
-            continue
-        full = os.path.join(root, path)
-        text = Path(full).read_text()
-        kept = re.sub(r"(?ms)^\[dev-dependencies\]\n.*?(?=^\[|\Z)", "", text)
-        if kept != text:
-            Path(full).write_text(kept)
-
-
-def prune(new_root, base, ours):
-    """Removes from the server at the new commit what blaze leaves out: each file blaze deleted
-    from upstream at the old commit, and each file upstream added under a directory blaze deleted
-    (new tests in a `test_data` blaze does not carry). A file upstream added is kept when the
-    nearest directory above it that upstream had at the old commit is still in blaze's copy."""
-    base_dirs = {os.path.dirname(f) for f in base} | {""}
-    base_dirs |= {d for f in base_dirs for d in ancestors(f)}
-    ours_dirs = {os.path.dirname(f) for f in ours} | {""}
-    ours_dirs |= {d for f in ours_dirs for d in ancestors(f)}
-    for path in files_under(new_root):
-        if path in ours:
-            continue
-        if path in base:
-            dropped = True
-        else:
-            nearest = next(d for d in ancestors(path) if d in base_dirs)
-            dropped = nearest not in ours_dirs
-        if dropped:
-            os.remove(os.path.join(new_root, path))
-    for dir, subdirs, names in os.walk(new_root, topdown=False):
-        if dir != new_root and not os.listdir(dir):
-            os.rmdir(dir)
-
-
-def ancestors(path):
-    """`a/b/c` -> `a/b`, `a`, `` (the root last)."""
-    while path:
-        path = os.path.dirname(path)
-        yield path
-
-
-async def vendor(old, new):
-    server = os.path.join(ROOT, "vendor/proc-macro-srv")
-    dirs = server_dirs()
-    paths = [ABI[1], *dirs.values()]
-    with tempfile.TemporaryDirectory(prefix="blaze-bump-") as work:
-        # blaze's changes to the server: upstream at the old commit against vendor/, as a patch
-        # of the files both have and those blaze added. What blaze deleted is carried by `prune`.
-        repo = await checkout(old, paths)
-        for ours, theirs in dirs.items():
-            shutil.copytree(os.path.join(repo, theirs), os.path.join(work, "base", ours), symlinks=True)
-            shutil.copytree(os.path.join(server, ours), os.path.join(work, "ours", ours), symlinks=True)
-        without_dev_dependencies(os.path.join(work, "base"))
-        base_files = files_under(os.path.join(work, "base"))
-        ours_files = files_under(os.path.join(work, "ours"))
-        diff = await asyncio.create_subprocess_exec(
-            "git", "diff", "--no-ext-diff", "--no-index", "--binary", "--no-color", "--no-renames",
-            "--diff-filter=d", "base", "ours", cwd=work,
-            env={k: v for k, v in os.environ.items() if k != "GIT_EXTERNAL_DIFF"},
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        patch, err = await diff.communicate()
-        if diff.returncode not in (0, 1):
-            raise Failed(f"vendor: diffing vendor/proc-macro-srv with upstream at {old[:9]} exited "
-                         f"{diff.returncode}: {err.decode()[-2000:]}")
-        # Paths are a/base/... and b/ours/... (b/base/... for a file blaze deleted).
-        patch = re.sub(rb"(?m)(^diff --git | |^--- |^\+\+\+ )([ab])/(?:base|ours)/", rb"\1\2/", patch)
-        repo = await checkout(new, paths)
-        replace_tree(os.path.join(repo, ABI[1]), os.path.join(ROOT, ABI[0]))
-        with tempfile.TemporaryDirectory(prefix="blaze-bump-new-") as fresh:
-            for ours, theirs in dirs.items():
-                shutil.copytree(os.path.join(repo, theirs), os.path.join(fresh, ours), symlinks=True)
-            without_dev_dependencies(fresh)
-            prune(fresh, base_files, ours_files)
-            for ours in dirs:
-                replace_tree(os.path.join(fresh, ours), os.path.join(server, ours))
-        if not patch.strip():
-            return
-        patch_file = os.path.join(work, "blaze.patch")
-        await asyncio.to_thread(Path(patch_file).write_bytes, patch)
-        # A three-way apply needs the old blobs in this repository, which upstream's are not:
-        # apply with rejects, so what applies does and each hunk that does not is a .rej file.
-        proc = await asyncio.create_subprocess_exec(
-            "git", "apply", "--reject", "--whitespace=nowarn", "--directory=vendor/proc-macro-srv",
-            patch_file, cwd=ROOT, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _, err = await proc.communicate()
-        if proc.returncode != 0:
-            os.makedirs(CACHE, exist_ok=True)
-            kept = os.path.join(CACHE, f"proc-macro-srv-{old[:9]}-{new[:9]}.patch")
-            shutil.copy(patch_file, kept)
-            raise Failed("vendor: blaze's changes to vendor/proc-macro-srv did not all apply at "
-                         f"{new[:9]}; resolve the *.rej files under vendor/proc-macro-srv "
-                         f"(the whole patch is {kept}), then finish the bump's later steps "
-                         f"(move_mentions, flake, rustup) by hand. git apply said:\n{err.decode()[-3000:]}")
+async def vendor(new):
+    """crates/rustc_abi/src and crates/rustc_lexer/src as rust-lang/rust has them at `new`."""
+    repo = await checkout(new, [ABI[1], LEXER[1]])
+    for ours, theirs in (ABI, LEXER):
+        replace_tree(os.path.join(repo, theirs), os.path.join(ROOT, ours))
 
 
 def move_mentions(old, new):
@@ -355,7 +245,7 @@ async def bump(date):
     await asyncio.to_thread(Path(PIN).write_text, name + "\n")
     await run("pins", sys.executable, os.path.join(HERE, "toolchain_pins.py"), '{"write": true}', bound=900)
     new = pinned()
-    await vendor(old[2], new[2])
+    await vendor(new[2])
     await library(date)
     move_mentions(old, new)
     async with asyncio.TaskGroup() as group:

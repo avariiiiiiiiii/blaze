@@ -34,21 +34,34 @@ pub fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
 
     llvm::init();
+    let mut refused = Vec::new();
     std::thread::scope(|scope| {
         let threads = Variant::ALL.map(|variant| scope.spawn(move || (variant, library(variant))));
         for thread in threads {
-            let (variant, bytes) = match thread.join() {
+            let (variant, library) = match thread.join() {
                 Ok(it) => it,
                 Err(panic) => std::panic::resume_unwind(panic),
             };
-            let path = out.join(variant.file());
-            std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            match library {
+                Ok(bytes) => {
+                    let path = out.join(variant.file());
+                    std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                }
+                Err(refusals) => refused.extend(refusals),
+            }
         }
     });
+    if !refused.is_empty() {
+        panic!(
+            "{} stencil instructions are refused (a stencil is leaf and stackless):\n{}",
+            refused.len(),
+            refused.join("\n")
+        );
+    }
 }
 
-/// The library of `variant`'s stencils.
-fn library(variant: Variant) -> Vec<u8> {
+/// The library of `variant`'s stencils, or every refused instruction in them.
+fn library(variant: Variant) -> Result<Vec<u8>, Vec<String>> {
     let isa = variant.isa();
     let mut shapes: Vec<(u32, Shape)> = Vec::with_capacity(8192);
     shape::each_on(isa, |shape| shapes.push((shapes.len() as u32, shape)));
@@ -68,5 +81,9 @@ fn library(variant: Variant) -> Vec<u8> {
             .unwrap_or_else(|e| panic!("stencil `{what}`: {e}"));
         assert_eq!(at, *index, "stencil `{what}` was written out of the set's order");
     }
-    writer.finish(|bytes| *blake3::hash(bytes).as_bytes()).unwrap_or_else(|e| panic!("the {name} library: {e}"))
+    let refusals = elf.refusals();
+    if !refusals.is_empty() {
+        return Err(refusals);
+    }
+    Ok(writer.finish(|bytes| *blake3::hash(bytes).as_bytes()).unwrap_or_else(|e| panic!("the {name} library: {e}")))
 }

@@ -597,8 +597,9 @@ mod unix {
         for _ in 0..3 {
             let start = ::std::time::Instant::now();
             // SAFETY: the server has one thread (see `serve`), so the child is a whole copy of
-            // it; the child does nothing but `_exit`, which runs no destructor and no `atexit`
-            // handler, so nothing of the server's is used or freed twice.
+            // it; the child does nothing but `_exit`, which is async-signal-safe and runs no
+            // destructor and no `atexit` handler, so nothing of the server's is used or freed
+            // twice.
             let pid = unsafe { fork() };
             if pid < 0 {
                 return Err(format!("fork: {}", ::std::io::Error::last_os_error())); // alloc: error path
@@ -626,7 +627,8 @@ mod unix {
         while left > 0 {
             let given = (left - 1) / 2;
             // SAFETY: the server has one thread (see `serve`), so the copy is a whole one and no
-            // lock is left held by a thread that isn't there. No test runs yet (`Replicate` is
+            // lock is left held by a thread that isn't there: the copy, a server again, need not
+            // keep to async-signal-safe calls. No test runs yet (`Replicate` is
             // only blaze's first frame), so the copy shares no child and no execution region with
             // the server; its socket to blaze is the server's until it connects its own.
             let pid = unsafe { fork() };
@@ -663,8 +665,9 @@ mod unix {
         // it, unmapped by its drop when the fork fails.
         let region = exec.map()?;
         // SAFETY: the server has one thread (see `serve`), so the child is a whole copy of it
-        // and no lock is left held by a thread that isn't there. The child only closes and
-        // copies descriptors, arms its record, then runs the test and leaves by `_exit`.
+        // and no lock is left held by a thread that isn't there, so the child need not keep to
+        // async-signal-safe calls: it closes and copies descriptors, arms its record, then runs
+        // the test (which allocates and may start threads) and leaves by `_exit`.
         let pid = unsafe { fork() };
         if pid < 0 {
             return Err(format!("fork: {}", ::std::io::Error::last_os_error())); // alloc: error path

@@ -130,7 +130,8 @@ pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
         }
         let Some(terminator) = &block.terminator else { continue };
         let (read, callee): (&[Operand], _) = match &terminator.kind {
-            TerminatorKind::Call { func, args, .. } => (&args[..], Some(func)),
+            TerminatorKind::Call { func, args, .. }
+            | TerminatorKind::TailCall { func, args, .. } => (&args[..], Some(func)),
             TerminatorKind::SwitchInt { discr, .. } => (std::slice::from_ref(discr), None),
             TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => {
                 // What a `Drop` impl does is not looked into.

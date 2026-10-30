@@ -132,7 +132,9 @@ pub fn decide(
         .map(|node| {
             SCRATCH.with_borrow_mut(|scratch| graph.imports(node, limits, &attrs, &constants, scratch))
         })
+        // alloc: one exact-size column per build
         .collect();
+    // alloc: the build's answer, once per build
     Ok(graph.keys.iter().copied().zip(decided).collect())
 }
 
@@ -150,6 +152,7 @@ struct Index {
 impl Index {
     fn of(keys: &[InstanceKey]) -> Index {
         let len = (keys.len() * 2).next_power_of_two().max(2);
+        // alloc: the index's table, sized once per build
         let mut index = Index { slots: vec![NONE; len], mask: len - 1 };
         for (node, key) in keys.iter().enumerate() {
             let mut at = home(key) & index.mask;
@@ -202,19 +205,24 @@ impl<'a> Graph<'a> {
     fn of(summaries: &'a FxHashMap<InstanceKey, Summary>) -> Result<Graph<'a>, ImportError> {
         let len = summaries.len();
         assert!(len < NONE as usize, "more than 2^32 - 1 summaries");
+        // alloc: one exact-size column per build
         let mut summaries: Vec<(&'a InstanceKey, &'a Summary)> = summaries.iter().collect();
         summaries.sort_unstable_by_key(|it| *it.0);
+        // alloc: one exact-size column per build
         let keys: Vec<InstanceKey> = summaries.iter().map(|it| *it.0).collect();
         let index = Index::of(&keys);
+        // alloc: one exact-size column per build
         let params: Vec<u32> = summaries.iter().map(|it| it.1.params).collect();
         let calls: usize = summaries.iter().map(|it| it.1.calls.len()).sum();
+        let unused: usize = summaries.iter().map(|it| it.1.unused.len()).sum();
         let mut graph = Graph {
             summaries: Vec::with_capacity(len),
             start: Vec::with_capacity(len + 1),
             to: Vec::with_capacity(calls),
             unused_start: Vec::with_capacity(len + 1),
-            unused: Vec::new(),
+            unused: Vec::with_capacity(unused),
             closed: BitSet::new(len),
+            // alloc: empty, allocates nothing; `keys` is moved in once the columns are built
             keys: Vec::new(),
         };
         graph.start.push(0);
@@ -288,6 +296,7 @@ impl<'a> Graph<'a> {
             }
             start.push(total);
         }
+        // alloc: one column sized once per build
         let mut passed = Passed { start, slots: vec![None; total as usize], reached: BitSet::new(self.keys.len()) };
         for (caller, summary) in self.summaries.iter().enumerate() {
             for (call, &callee) in std::iter::zip(&summary.calls, self.calls(caller as u32)) {
@@ -336,7 +345,9 @@ impl<'a> Graph<'a> {
             start.push(edges.len() as u32);
         }
         let (order, bounds) = components(&start, &edges);
+        // alloc: one column sized once per build
         let mut component_of = vec![NONE; len];
+        // alloc: one column sized once per build
         let mut known = vec![0u8; len];
         let read = |bits: u8| if bits & Attrs::READNONE != 0 { bits | Attrs::READONLY } else { bits };
         for (component, bound) in bounds.windows(2).enumerate() {
@@ -399,27 +410,35 @@ impl<'a> Graph<'a> {
             }
         }
         blaze_ids::radix::sort(&mut callees[..]);
+        // The `Imports` below are the function's answer, which its compile owns
+        // (`summary::Imports`): each list is built once per function and kept.
         let constants = match passed.reached.contains(importer) {
             true => passed
                 .of(importer)
                 .iter()
                 .enumerate()
                 .filter_map(|(at, arg)| Some((at as u32, (*arg)?)))
+                // alloc: the function's answer, kept by its compile
                 .collect(),
+            // alloc: empty, allocates nothing
             false => Vec::new(),
         };
         Imports {
+            // alloc: the function's answer, kept by its compile
             imported: taken.iter().map(|&it| self.keys[it as usize]).collect(),
             constants,
             callees: callees
                 .iter()
                 .filter(|&&it| attrs[it as usize] != 0)
                 .map(|&it| (self.keys[it as usize], Attrs::from_bits(attrs[it as usize])))
+                // alloc: the function's answer, kept by its compile
                 .collect(),
             dead: callees
                 .iter()
                 .filter(|&&it| self.closed.contains(it) && !self.unused(it).is_empty())
+                // alloc: the function's answer, kept by its compile
                 .map(|&it| (self.keys[it as usize], self.unused(it).to_vec()))
+                // alloc: the function's answer, kept by its compile
                 .collect(),
         }
     }
@@ -528,13 +547,16 @@ fn dedup(items: &mut [u32]) -> usize {
 /// members of component `c` are `order[bounds[c]..bounds[c + 1]]`, sorted.
 fn components(start: &[u32], edges: &[u32]) -> (Vec<u32>, Vec<u32>) {
     let len = start.len() - 1;
+    // alloc: one column sized once per build
     let mut index = vec![NONE; len];
+    // alloc: one column sized once per build
     let mut low = vec![0u32; len];
     let mut on_stack = BitSet::<u32>::new(len);
-    let mut stack = Vec::new();
+    let mut stack = Vec::with_capacity(len);
     let mut order = Vec::with_capacity(len);
-    let mut bounds = vec![0u32];
-    let mut work: Vec<(u32, u32)> = Vec::new();
+    let mut bounds = Vec::with_capacity(len + 1);
+    bounds.push(0u32);
+    let mut work: Vec<(u32, u32)> = Vec::with_capacity(len);
     let mut next = 0u32;
     for root in 0..len as u32 {
         if index[root as usize] != NONE {
@@ -1351,5 +1373,6 @@ mod tests {
                 }
             }
             found
+        }
     }
 }

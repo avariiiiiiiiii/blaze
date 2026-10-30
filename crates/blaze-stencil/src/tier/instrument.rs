@@ -110,7 +110,7 @@ fn split(func: &mut ir::Function, cells: ir::GlobalValue, inst: ir::Inst, index:
 /// `cells[offset] += 1`, as a plain load and store.
 fn add(cursor: &mut FuncCursor<'_>, cells: ir::GlobalValue, offset: i64) {
     let flags = ir::MemFlagsData::trusted();
-    let at = cursor.ins().global_value(types::I64, cells);
+    let at = cursor.ins().symbol_value(types::I64, cells);
     let count = cursor.ins().load(types::I64, flags, at, offset as i32);
     let count = cursor.ins().iadd_imm(count, 1);
     cursor.ins().store(flags, count, at, offset as i32);

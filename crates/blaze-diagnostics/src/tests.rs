@@ -10,7 +10,6 @@ pub(crate) mod lints;
 
 use std::collections::HashMap;
 
-use hir::Semantics;
 use span::FileId;
 use test_fixture::WithFixture;
 
@@ -85,10 +84,9 @@ pub(crate) fn checked_with(fixture: &str, prefix: &str, options: &Options) -> Ch
         .map(|(file, path)| (file.file_id(&db), format!("{prefix}{path}")))
         .collect();
     let diags = hir::attach_db(&db, || {
-        let sema = Semantics::new(&db);
         hir::check::workspace_crates(&db)
             .into_iter()
-            .flat_map(|krate| crate::check::check_crate_with(&sema, krate, Files::new(&names, ""), options))
+            .flat_map(|krate| crate::check::check_crate(&db, krate, Files::new(&names, ""), options))
             .collect()
     });
     Checked { db, names, diags }
@@ -147,10 +145,10 @@ pub(crate) fn compiletest(mode: Mode, options: &Options) -> Options {
     args.extend(["-A", "internal_features", "-A", "incomplete_features"]);
     args.extend(["-A", "unused_parens", "-A", "unused_braces"]);
     let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    let mut opts = crate::lints::CommandLine::parse(&args).expect("compiletest's lint flags are rustc's").opts;
+    let mut opts = crate::lints::CommandLine::parse(&args).expect("compiletest's lint flags are rustc's").lints.opts;
     let mut lints = options.lints.clone();
-    opts.append(&mut lints.opts);
-    lints.opts = opts;
+    opts.append(&mut lints.lints.opts);
+    lints.lints.opts = opts;
     Options { lints, keep_duplicates: true }
 }
 

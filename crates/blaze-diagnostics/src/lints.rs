@@ -23,7 +23,7 @@ pub(crate) mod syntax;
 
 pub(crate) use levels::{LevelMap, may_fire};
 pub(crate) use names::{Effective, EffectiveDef, ItemWalk, def_span};
-pub use levels::{CommandLine, Level};
+pub use levels::{CommandLine, Level, LintOptions};
 pub use self::syntax::CheckCfg;
 
 use blaze_items::{Fact, ItemId};
@@ -135,10 +135,9 @@ pub(crate) fn with_cx(fixture: &str, args: &[&str], check: impl FnOnce(&Cx<'_, '
     let cmd = CommandLine::parse(&args).unwrap();
     let db = &checked.db;
     hir::attach_db(db, || {
-        let sema = hir::Semantics::new(db);
         let krate = hir::check::workspace_crates(db)[0];
         let frame = crate::tests::frame();
-        let cx = Cx::new(&sema, krate, checked.files(), &frame).with_lints(&cmd);
+        let cx = Cx::new(db, krate, checked.files(), &frame).with_lints(&cmd);
         check(&cx);
     });
 }

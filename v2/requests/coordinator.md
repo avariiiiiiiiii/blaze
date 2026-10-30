@@ -2935,3 +2935,61 @@ Status: open
 > crates are members through `crates/*` and `hir-lint-levels` names
 > `blaze-lint-defs.workspace = true`. `hir-lint-levels` compiles once db's `Crate::lint_options`
 > (db.md, same heading) is in.
+> applied, item 2 (requests, pass 41): root `blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }` and (pass 40) `hir-lint-levels`; both crates have their two files, and the manifest lint is clean. Item 3 (crates.md) is on the coordinator's list; item 4's lines are with db, codegen and cargo (told).
+
+## diagnostics-levels (2026-10-30): `blaze-lints` reads the lint flags from `CommandLine.lints` (codegen-rq-mir.md R5 item 1)
+
+blaze-diagnostics' `CommandLine` now holds the lint flags as `lints: LintOptions` (from
+`blaze-lint-defs`, re-exported as `blaze_diagnostics::lints::LintOptions`) beside
+`check_cfg`, `cfg` and `codegen`. `LintOptions` has `opts: Vec<(String, Level)>` and
+`cap: Option<Level>`, the old fields' types, and one parser shared with base-db's crate input.
+`crates/blaze-lints` (yours) reads the old fields. These are the lines to change, with no
+change in behaviour:
+
+- `src/level.rs:169`: `CommandLine { lints: LintOptions { opts: opts.collect(), cap: None }, ..CommandLine::default() }`,
+  with `LintOptions` imported beside `CommandLine` at `:20`.
+- `src/level.rs:199` and `:204`: `command_line.lints.opts`, `command_line.lints.cap`.
+- `src/level.rs:316` and `:323` (tests): `flags.lints.opts`, `flags.lints.cap`.
+- `src/level.rs:399` (test): `of_manifest(&lints).lints.opts`.
+- `src/manifest.rs:30`: `command_line.lints.opts.into_iter()`.
+
+Until then `blaze-lints` doesn't compile against the diagnostics tree. A follow-on, not
+asked for here: `blaze-lints`' own level builder (`level.rs`, `check.rs` `lint_attrs`) is a
+third copy of rustc's rule, and could read `hir_lint_levels` as diagnostics now does.
+
+Status: open
+
+> applied (requests, pass 42; lane lints and its children are DONE): `crates/blaze-lints/src/level.rs` (`LintOptions` re-exported beside `CommandLine`; `of_manifest`, `Levels::new` and the two tests on `lints.opts`/`lints.cap`) and `manifest.rs` `flags`. No behaviour change. The follow-on (blaze-lints' level builder onto `hir_lint_levels`) is not asked and not done. Not built.
+
+
+## diagnostics (2026-10-30 00:45): `crates/ide-diagnostics` is deleted; what still names it
+
+Lane diagnostics deleted `crates/ide-diagnostics/` (95 files, 28k lines). It had been replaced by
+`crates/blaze-diagnostics`, as `docs/v2/plan/reference/crates.md` says. The root `Cargo.toml`
+line was already gone (codegen-rq-engine.md "## 2."). No `Cargo.toml` and no `.rs` outside it
+used it. These coordinator-owned files still name it, and should change in the same landing:
+
+1. `harness/unittests.py`: drop `"ide-diagnostics"` from the crate list (line 24) and the two
+   comments about it (lines 15 and 139), and add `"blaze-diagnostics"`, `"blaze-lint-defs"` and
+   `"hir-lint-levels"`, whose unit tests are the diagnostics verdict now. Without this the gate
+   asks for tests of a crate that no longer exists.
+2. `tools/bench/remote-cache/selfbuild/bench.py:23`: the same swap in its crate list.
+3. `tools/nix/units/daemon.json`: regenerate it with `tools/nix/unit_graph.py`. It still lists
+   `ide-diagnostics` as a unit and as a dependency.
+4. `Cargo.lock`: the `ide-diagnostics` package entry, and the dependency on it in each package
+   that listed it, go at the next lock update.
+5. `tools/similar/src/similar/__init__.py:63`: drop `"ide-diagnostics"` from `skip`. This is
+   harmless if left.
+6. `docs/harness.md:100` (`status: current`): the list of crates whose tests run names
+   `ide-diagnostics`. Replace it with `blaze-diagnostics` (rule 16: a current doc kept true).
+7. `crates/ide-db/src/assists.rs` lines 3 and 5: a doc comment naming the crate.
+8. `crates/hir-ty/src/solver_errors.rs` line 1 (db-ty's): the module doc says it converts errors "`hir` can pass to `ide-diagnostics`"; it should say `blaze-diagnostics`. (Added by diagnostics window 82.)
+
+Left alone, as records: `CHANGELOG.md`, `harness/BREAKERS.md`, `docs/upstream/**`,
+`docs/research/**`, `docs/architecture-split.md`, `docs/roadmap.md`, and
+`harness/smoke/ce_toml/manifest.toml`, a snapshot of an old root manifest that the smoke test
+parses.
+
+Status: open
+
+> applied, item 7 (requests, pass 43): `crates/ide-db/src/assists.rs`'s module doc no longer names `ide_diagnostics`/`ide_assists` (nothing builds an `Assist` now; blaze-diagnostics writes rustc's suggestions). Item 8 forwarded to db-ty-next2 (with db.md's same section). Items 1-6 (`harness/unittests.py`, the bench and nix unit lists, `Cargo.lock`, `tools/similar`, `docs/harness.md`) are the coordinator's paths, on the report's coordinator list.

@@ -88,6 +88,7 @@ pub(crate) fn function(
     side: Option<ContentId>,
 ) -> Result<CompiledFunction, String> {
     let word = word(arch)?;
+    // alloc: none until it has data of its own, which the result keeps
     let mut own = OwnData { data: Vec::new(), word };
     let size = code.bytes.len();
     let names: Relocs<RelocName> = Relocs::try_from_iter_in(
@@ -125,12 +126,15 @@ pub(crate) fn function(
     for row in &code.lines {
         let Some(&span) = spans.get(row.span as usize) else {
             let at = row.span;
+            // alloc: an error
             return Err(format!("a line row of statement {at}, which the body has no span of"));
         };
         lines.push(Line { at: row.offset, span });
     }
+    // alloc: an error
     let align = u32::try_from(code.align).map_err(|e| e.to_string())?;
     if !align.is_power_of_two() {
+        // alloc: an error
         return Err(format!("code aligned to {align}, not a power of two"));
     }
     let fragment::Code { bytes, relocs: rows, lines: line_rows, .. } = code;
@@ -143,6 +147,7 @@ pub(crate) fn function(
         code: bytes,
         relocs,
         data: own.data,
+        // alloc: empty, allocates nothing
         inlined: Vec::new(),
         coverage: None,
         profile: None,
@@ -187,6 +192,7 @@ pub(crate) fn value(
     requests: &Requests,
     resolve: &impl Resolver,
 ) -> Result<(Vec<Data>, Relocs), String> {
+    // alloc: none until it has data of its own, which the caller keeps
     let mut own = OwnData { data: Vec::new(), word: word(arch)? };
     let named = blob.relocs.iter().map(|&(_, data, _)| data.as_u32() as usize);
     let targets = own.requests(frame, requests, resolve, named)?;
@@ -197,6 +203,7 @@ pub(crate) fn value(
 fn word(arch: Arch) -> Result<usize, String> {
     match arch {
         Arch::X86_64 | Arch::Aarch64 => Ok(8),
+        // alloc: an error
         Arch::Wasm32 => Err("wasm: v2 has no relocations of wasm's data yet".to_owned()),
     }
 }
@@ -229,6 +236,7 @@ impl OwnData {
         for index in named {
             *used
                 .get_mut(index)
+                // alloc: an error
                 .ok_or_else(|| format!("a relocation at data {index}, never requested"))? = true;
         }
         for index in (0..requests.datas.len()).rev() {
@@ -241,6 +249,7 @@ impl OwnData {
                 for &(_, data, _) in &blob.relocs {
                     let at = data.as_u32() as usize;
                     if at >= index {
+                        // alloc: an error
                         return Err(format!("data {index} points at data {at}, not one before it"));
                     }
                     used[at] = true;
@@ -279,7 +288,9 @@ impl OwnData {
         resolve: &impl Resolver,
     ) -> Result<Data, String> {
         let relocs = self.relocs(blob, index, before, requests, resolve)?;
+        // alloc: an error
         let align = u32::try_from(blob.align).map_err(|e| e.to_string())?;
+        // clone: the data owns its bytes; the request, which the caller keeps, has the blob's
         Ok(Data::new(align, blob.bytes.clone(), relocs))
     }
 
@@ -294,18 +305,22 @@ impl OwnData {
         resolve: &impl Resolver,
     ) -> Result<Relocs, String> {
         if !blob.type_ids.is_empty() {
+            // alloc: an error
             return Err("a constant with a `TypeId` the adapter did not fill".to_owned());
         }
         let mut relocs = Vec::with_capacity(blob.relocs.len() + blob.fn_relocs.len());
         for &(at, data, addend) in &blob.relocs {
             let at_data = data.as_u32() as usize;
             let Some(Some(target)) = before.get(at_data).filter(|_| at_data < index) else {
+                // alloc: an error
                 return Err(format!("data {index} points at data {at_data}, not one before it"));
             };
+            // clone: a `Target` is an ID but for an `Extern`'s name; each relocation at the request owns one
             relocs.push(Relocation { at, kind: RelocKind::Abs64, target: target.clone(), addend });
         }
         for &(at, func) in &blob.fn_relocs {
             let request = requests.funcs.get(func.as_u32() as usize).ok_or_else(|| {
+                // alloc: an error
                 format!("data {index} points at function {}, never requested", func.as_u32())
             })?;
             let target = resolve.func(func.as_u32(), request)?;
@@ -318,24 +333,27 @@ impl OwnData {
     fn text(&mut self, text: String) -> Target {
         let len = text.len() as u64;
         let bytes = self.push(Data::new(1, text.into_bytes(), Relocs::new()));
+        // alloc: the `&str`'s bytes, which the data owns
         let mut fat = vec![0; 2 * self.word];
         fat[self.word..].copy_from_slice(&len.to_le_bytes()[..self.word]);
         let pointer = Relocation { at: 0, kind: RelocKind::Abs64, target: bytes, addend: 0 };
-        self.push(Data::new(self.word as u32, fat, vec![pointer].into()))
+        self.push(Data::new(self.word as u32, fat, Relocs::from_iter([pointer])))
     }
 
     /// A `core::panic::Location` of no file, as v1 makes it: `<blaze>`, line 0, column 0.
     fn nowhere(&mut self) -> Target {
         let file = "<blaze>";
-        let mut name = file.as_bytes().to_vec();
+        let mut name = Vec::with_capacity(file.len() + 1);
+        name.extend_from_slice(file.as_bytes());
         // The name is followed by a NUL that its length leaves out.
         name.push(0);
         let name = self.push(Data::new(1, name, Relocs::new()));
+        // alloc: the `Location`'s bytes, which the data owns
         let mut bytes = vec![0u8; 2 * self.word + 8];
         bytes[self.word..2 * self.word]
             .copy_from_slice(&(file.len() as u64).to_le_bytes()[..self.word]);
         let pointer = Relocation { at: 0, kind: RelocKind::Abs64, target: name, addend: 0 };
-        self.push(Data::new(self.word as u32, bytes, vec![pointer].into()))
+        self.push(Data::new(self.word as u32, bytes, Relocs::from_iter([pointer])))
     }
 }
 
@@ -343,9 +361,11 @@ impl OwnData {
 fn own_blob(request: &DataRequest) -> Result<&ConstBlob, String> {
     match request {
         DataRequest::Blob { identity: DataIdentity::Writable, .. } => {
+            // alloc: an error
             Err("data a function writes to, which is no constant".to_owned())
         }
         DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => Ok(blob),
+        // alloc: an error
         _ => Err("a data request that has no blob taken as the function's own".to_owned()),
     }
 }
@@ -363,6 +383,7 @@ fn reloc_target(
             let request = requests
                 .funcs
                 .get(index as usize)
+                // alloc: an error
                 .ok_or_else(|| format!("a relocation at function {index}, never requested"))?;
             resolve.func(index, request)
         }
@@ -370,14 +391,17 @@ fn reloc_target(
             .get(index as usize)
             .cloned()
             .flatten()
+            // alloc: an error
             .ok_or_else(|| format!("a relocation at data {index}, never requested")),
         RelocName::User { namespace: super::fold::BODY, index: 0 } => resolve.body(),
         RelocName::User { namespace: fragment::INLINED, .. } => {
+            // alloc: an error
             Err("a relocation at a reference of a body built in".to_owned())
         }
         #[cfg(feature = "llvm")]
         RelocName::User { namespace: crate::llvm::sanitize::COVERAGE, index } => match index {
             0..3 => Ok(Target::Coverage(index)),
+            // alloc: an error
             _ => Err(format!("a relocation at SanitizerCoverage array {index}, of 3")),
         },
         // An instrumented function's own PGO counters, the counter by the addend.
@@ -395,15 +419,18 @@ fn reloc_target(
             Err(format!("a relocation at tier counter cells {index}, where a function has only its own (0)"))
         }
         RelocName::User { namespace, .. } => {
+            // alloc: an error
             Err(format!("a relocation in the unknown namespace {namespace}"))
         }
         RelocName::LibCall(libcall) => resolve.symbol(libcall_name(libcall)?),
         RelocName::Known(symbol) => {
+            // alloc: an error
             Err(format!("a relocation at the linker's {symbol:?}, which v2 has no target for"))
         }
         // The function's own code, at its start: `function` moved the offset into the addend.
         RelocName::Own(0) => Ok(Target::Direct(key)),
         RelocName::Own(offset) => {
+            // alloc: an error
             Err(format!("a relocation at offset {offset} of the function itself, not moved into its addend"))
         }
     }
@@ -413,9 +440,11 @@ fn reloc_target(
 /// at the function's start: the offset added in, which must be inside the code.
 fn own_addend(offset: u32, addend: i64, size: usize) -> Result<i64, String> {
     if offset as usize > size {
+        // alloc: an error
         return Err(format!("a relocation at offset {offset} of the function itself, which has {size} bytes"));
     }
     addend.checked_add(i64::from(offset)).ok_or_else(|| {
+        // alloc: an error
         format!("a relocation at offset {offset} of the function itself, whose addend {addend} overflows with it")
     })
 }
@@ -441,6 +470,7 @@ pub(crate) fn reloc_kind(kind: binemit::Reloc) -> Result<RelocKind, String> {
         R::Aarch64TlsDescAddLo12 => RelocKind::TlsDescAddLo12,
         R::Aarch64TlsDescCall => RelocKind::TlsDescCall,
         R::X86SecRel => RelocKind::SectionRel32,
+        // alloc: an error
         other => return Err(format!("a {other:?} relocation, which v2 has no kind for")),
     })
 }
@@ -475,6 +505,7 @@ pub(crate) fn elf_kind(elf: u32) -> Result<RelocKind, String> {
         elf::R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC => RelocKind::TlsIeLo12,
         elf::R_AARCH64_TLSLE_ADD_TPREL_HI12 => RelocKind::TpHi12,
         elf::R_AARCH64_TLSLE_ADD_TPREL_LO12_NC => RelocKind::TpLo12,
+        // alloc: an error
         other => return Err(format!("a relocation of ELF type {other}, which v2 has no kind for")),
     })
 }

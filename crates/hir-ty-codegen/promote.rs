@@ -45,6 +45,7 @@ thread_local! {
         slot_of: SecondaryMap::new(),
         escaped: EntitySet::new(),
         addressed: EntitySet::new(),
+        // alloc: empty, allocates nothing; grown once and reused by the thread's functions
         accesses: Vec::new(),
     });
 }
@@ -203,9 +204,11 @@ fn dominator_tree(func: &ir::Function) -> DominatorTree {
         impl Profiler for Untimed {
             // dyn: cranelift's `Profiler::start_pass` returns `Box<dyn Any>`; a `()` is no allocation
             fn start_pass(&self, _: Pass) -> Box<dyn std::any::Any> {
+                // alloc: a `Box` of `()`, which allocates nothing
                 Box::new(())
             }
         }
+        // alloc: none, `Untimed` has no size; once per thread, on wasm only
         thread_local!(static UNTIMED: () = drop(set_thread_profiler(Box::new(Untimed))));
         UNTIMED.with(|_| ());
     }

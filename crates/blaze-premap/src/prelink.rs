@@ -150,11 +150,13 @@ impl Prelink for Link {
         })
         .map_err(|error| PremapError::of(format_args!("the prelink of a dependency image: {error}")))?;
         let mut linked = from_link(std::mem::take(&mut placed.linked));
-        linked.segments = placed
-            .segments
-            .iter()
-            .map(|it| Segment { addr: it.addr, size: it.size, prot: prot_of_link(it.prot), bytes: Vec::new() })
-            .collect(); // alloc: once per image made: its segments' places
+        let place = |it: &link::SegmentPlace| Segment {
+            addr: it.addr,
+            size: it.size,
+            prot: prot_of_link(it.prot),
+            bytes: Vec::new(), // alloc: none: the bytes are written by `write_into`, so the list stays empty
+        };
+        linked.segments = placed.segments.iter().map(place).collect(); // alloc: once per image made: its segments' places
         Ok(LinkPlaced { placed, linked })
     }
 }
@@ -171,7 +173,6 @@ fn prot_of_link(prot: link::Prot) -> Prot {
 fn from_link(linked: link::Prelinked) -> Prelinked {
     let entry = |it: link::InitEntry| InitEntry { rank: it.rank, order: it.order, tie: it.tie, at: it.at, count: it.count };
     let tls = |it: link::Tls| Tls { template: it.template, init: it.init, size: it.size, align: it.align };
-    let prot = prot_of_link;
     let at = |it: link::StaticAt| match it {
         link::StaticAt::Addr(addr) => StaticAt::Addr(addr),
         link::StaticAt::ThreadLocal(offset) => StaticAt::ThreadLocal(offset),
@@ -181,11 +182,7 @@ fn from_link(linked: link::Prelinked) -> Prelinked {
         link::BindKind::TpOff => BindKind::TpOff,
     };
     Prelinked {
-        segments: linked
-            .segments
-            .into_iter()
-            .map(|it| Segment { addr: it.addr, size: it.size, prot: prot(it.prot), bytes: it.bytes })
-            .collect(), // alloc: once per image made: a list of the answer
+        segments: Vec::new(), // alloc: none: the segments come from `Placed::segments`
         functions: linked.functions,
         statics: linked
             .statics
@@ -424,6 +421,8 @@ pub fn output(dev: &Output, key_name: &str) -> Output {
         dev_run: None,
         triple: dev.triple.clone(), // clone: setup, once per image made: the output owns it
         exec_log: false,
+        sanitize: dev.sanitize,
+        rpaths: dev.rpaths.clone(), // clone: setup, once per image made: the output owns them
     }
 }
 

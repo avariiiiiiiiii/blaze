@@ -9,7 +9,7 @@
 //! an edit patches alone). Statics are never functions here: [`crate::Target::Static`] is by
 //! which item, and its value is never merged.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
@@ -24,60 +24,59 @@ pub struct Deduped {
     pub merged: BTreeMap<InstanceKey, InstanceKey>,
 }
 
-fn renamed(key: &InstanceKey, kept: &HashMap<InstanceKey, InstanceKey>) -> InstanceKey {
+fn renamed(key: &InstanceKey, kept: &FxHashMap<InstanceKey, InstanceKey>) -> InstanceKey {
     kept.get(key).copied().unwrap_or(*key)
 }
 
 fn rename_target(
     target: &Target,
-    kept: &HashMap<InstanceKey, InstanceKey>,
-    data: &HashMap<ContentId, ContentId>,
+    kept: &FxHashMap<InstanceKey, InstanceKey>,
+    data: &FxHashMap<ContentId, ContentId>,
 ) -> Target {
     match target {
         Target::Function(key) => Target::Function(renamed(key, kept)),
         Target::Direct(key) => Target::Direct(renamed(key, kept)),
         Target::Data(id) => Target::Data(data.get(id).copied().unwrap_or(*id)),
+        // Made only for a function that calls one merged away; `Relocs::map` borrows the old.
+        // clone: a renamed function's new relocation table
         other => other.clone(),
     }
 }
 
 fn rename_relocs(
     relocs: &Relocs,
-    kept: &HashMap<InstanceKey, InstanceKey>,
-    data: &HashMap<ContentId, ContentId>,
+    kept: &FxHashMap<InstanceKey, InstanceKey>,
+    data: &FxHashMap<ContentId, ContentId>,
 ) -> Relocs {
     relocs.map(|target| rename_target(target, kept, data))
 }
 
 fn rename_unwind(
-    unwind: &Unwind,
-    kept: &HashMap<InstanceKey, InstanceKey>,
-    data: &HashMap<ContentId, ContentId>,
+    unwind: Unwind,
+    kept: &FxHashMap<InstanceKey, InstanceKey>,
+    data: &FxHashMap<ContentId, ContentId>,
 ) -> Unwind {
     let routine = |it: &Option<Target>| it.as_ref().map(|it| rename_target(it, kept, data));
-    let area = |it: &Option<ContentId>| it.map(|id| data.get(&id).copied().unwrap_or(id));
+    let area = |it: Option<ContentId>| it.map(|id| data.get(&id).copied().unwrap_or(id));
     match unwind {
         Unwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda } => Unwind::Dwarf {
-            code_align: *code_align,
-            data_align: *data_align,
-            return_address: *return_address,
-            cie: cie.clone(),
-            fde: fde.clone(),
-            personality: routine(personality),
+            code_align,
+            data_align,
+            return_address,
+            cie,
+            fde,
+            personality: routine(&personality),
             lsda: area(lsda),
         },
         Unwind::Windows { info, handler, lsda } => {
-            Unwind::Windows { info: info.clone(), handler: routine(handler), lsda: area(lsda) }
+            Unwind::Windows { info, handler: routine(&handler), lsda: area(lsda) }
         }
     }
 }
 
-/// `function` with what it calls renamed by `kept`, its data's IDs made again; `None` when
-/// nothing of it changed.
-fn rename(
-    function: &CompiledFunction,
-    kept: &HashMap<InstanceKey, InstanceKey>,
-) -> Option<CompiledFunction> {
+/// Renames what `function` calls by `kept`, in place, and makes its data's IDs again; leaves
+/// it as it is when it names nothing of `kept`.
+fn rename(function: &mut CompiledFunction, kept: &FxHashMap<InstanceKey, InstanceKey>) {
     let names = |target: &Target| match target {
         Target::Function(key) | Target::Direct(key) => kept.contains_key(key),
         _ => false,
@@ -88,21 +87,17 @@ fn rename(
         _ => false,
     };
     if !names_one(&function.relocs) && !function.data.iter().any(|it| names_one(&it.relocs)) && !routine_named {
-        return None;
+        return;
     }
-    let mut ids = HashMap::new();
-    let mut data = Vec::with_capacity(function.data.len());
-    for it in &function.data {
-        let made = Data::new(it.align, it.bytes.clone(), rename_relocs(&it.relocs, kept, &ids));
+    let mut ids = FxHashMap::default();
+    for it in &mut function.data {
+        let relocs = rename_relocs(&it.relocs, kept, &ids);
+        let made = Data::new(it.align, std::mem::take(&mut it.bytes), relocs);
         ids.insert(it.id, made.id);
-        data.push(made);
+        *it = made;
     }
-    Some(CompiledFunction {
-        relocs: rename_relocs(&function.relocs, kept, &ids),
-        unwind: function.unwind.as_ref().map(|it| rename_unwind(it, kept, &ids)),
-        data,
-        ..function.clone()
-    })
+    function.relocs = rename_relocs(&function.relocs, kept, &ids);
+    function.unwind = function.unwind.take().map(|it| rename_unwind(it, kept, &ids));
 }
 
 /// Merges the functions of a build whose code is equal, in place: `functions` keeps one of
@@ -112,7 +107,8 @@ pub fn dedupe(
     functions: &mut Vec<CompiledFunction>,
     mergeable: impl Fn(&InstanceKey) -> bool,
 ) -> Deduped {
-    let mut kept: HashMap<InstanceKey, InstanceKey> = HashMap::new();
+    // Unordered: `merged` is sorted as it is made.
+    let mut kept: FxHashMap<InstanceKey, InstanceKey> = FxHashMap::default();
     loop {
         // Unordered: each group is sorted on its own, and only fills `more`, a map by key.
         let mut groups: FxHashMap<ContentId, Vec<InstanceKey>> = FxHashMap::default();
@@ -125,7 +121,7 @@ pub fn dedupe(
         for function in functions.iter().filter(|it| mergeable(&it.key) && it.coverage.is_none() && !counts(it)) {
             groups.entry(code_id(function)).or_default().push(function.key);
         }
-        let mut more: HashMap<InstanceKey, InstanceKey> = HashMap::new();
+        let mut more: FxHashMap<InstanceKey, InstanceKey> = FxHashMap::default();
         for mut keys in groups.into_values().filter(|it| it.len() > 1) {
             keys.sort();
             let first = keys[0];
@@ -140,12 +136,11 @@ pub fn dedupe(
         }
         kept.extend(more.iter().map(|(from, to)| (*from, *to)));
         for function in functions.iter_mut() {
-            if let Some(renamed) = rename(function, &more) {
-                *function = renamed;
-            }
+            rename(function, &more);
         }
     }
     functions.sort_by_key(|it| it.key);
+    // alloc: the build's answer, sorted once as it is made
     Deduped { merged: kept.into_iter().collect() }
 }
 

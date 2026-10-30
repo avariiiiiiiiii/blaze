@@ -246,7 +246,7 @@ impl<'q> Driver<'q> {
                 if matches!(call.loc(db).kind, MacroCallKind::Derive { .. }) {
                     return;
                 }
-                let Some(outer) = file_id.original_call_node(db) else { return };
+                let Some(outer) = file_id.original_call_node_view(db) else { return };
                 (outer.file_id, TextSize::new(0), outer.value.text_range())
             }
         };

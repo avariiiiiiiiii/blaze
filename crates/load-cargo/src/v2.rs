@@ -29,6 +29,7 @@
 
 mod crates;
 mod files;
+mod harness;
 #[cfg(test)]
 mod tests;
 
@@ -55,6 +56,7 @@ pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 pub use self::crates::{lint_flags, local};
+pub use self::harness::{Appended, macros_loaded};
 
 /// What [`lower`] lowers.
 pub struct Lower<'a, T> {
@@ -125,6 +127,9 @@ pub struct Lowered {
     paths: std::sync::Arc<HashMap<FileId, String>>,
     /// Each crate's identity worked out since the last write ([`Lowered::identity`]).
     identities: FxHashMap<Crate, ContentId>,
+    /// Each root file [`Lowered::append_roots`] made since the last [`Lowered::refresh`], with
+    /// the unit it was first made for and its content ID as made.
+    appended: FxHashMap<FileId, (usize, ContentId)>,
     /// Each directory read into the front end, as [`Lowered::refresh`] reads it again.
     loads: Vec<Load>,
     /// The root of the view its files were read from.
@@ -440,6 +445,7 @@ pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, Lower
         crates: std::sync::Arc::new(Crates { units: lowerings, sets: library.len() }),
         paths: std::sync::Arc::new(paths),
         identities: FxHashMap::default(),
+        appended: FxHashMap::default(),
         loads: read,
         view: root,
         workspace_root,
@@ -545,6 +551,8 @@ impl Lowered {
     /// A write, as [`Lowered::ran`] is.
     pub fn refresh<T: blaze_query::Tree>(&mut self, lower: Lower<'_, T>) -> Result<bool, LowerError> {
         let Lower { units, config, files, root, .. } = lower;
+        // A new job: its units' roots are appended to again, and may be made other than before.
+        self.appended.clear();
         if root == self.view {
             return Ok(true);
         }

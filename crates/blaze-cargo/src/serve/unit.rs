@@ -32,6 +32,7 @@ mod compile;
 mod deps;
 mod files;
 mod graph;
+mod harness;
 mod intent;
 mod reach;
 mod run;
@@ -87,6 +88,9 @@ pub(crate) struct Shared {
     pub(crate) memo: Arc<blaze_codegen::memo::Memo>,
     /// What `-C target-cpu=native` is on this machine; none without LLVM.
     pub(crate) host_cpu: Option<blaze_units::stdlib::target::HostCpu>,
+    /// Test selection's one selector per suite, for the daemon's life
+    /// (fastcompile-sol-select 1): each test run takes its suites' and gives them back.
+    pub(crate) selectors: test::image::Selectors,
 }
 
 impl Real {
@@ -104,6 +108,7 @@ impl Real {
                 name,
                 features,
             }),
+            selectors: test::image::Selectors::default(),
         };
         Ok(Real { fetcher, shared: Arc::new(shared) })
     }
@@ -209,6 +214,9 @@ impl Steps for Real {
             job._seeded = seeded;
             let job = Arc::new(job);
             let waits = graph::Waits::new(&job.graph);
+            // After the seeds (the root's parse is seeded as on disk), before any identity:
+            // a test crate is identified by its root with the harness.
+            harness::write(&mut lowered, &job, (0..job.graph.len() as u32).filter(|&unit| waits.ready(unit)))?;
             for unit in 0..job.graph.len() as u32 {
                 if unit % 64 == 0 && input.cancelled.load(Ordering::Relaxed) {
                     return Err(Failed::Again);
@@ -347,14 +355,18 @@ impl Writer<Real> for UnitWriter {
             return Ok(true);
         }
         let Some(lowered) = Arc::get_mut(&mut self.front) else { return Ok(false) };
+        self.ready.clear();
         for (unit, macros) in self.macros.drain(..) {
             lowered.macros(unit, macros).map_err(lower_error)?;
+            self.ready.push(unit as u32);
         }
+        harness::macros_applied(lowered, &self.job, &self.waits, &self.ready)?;
         self.ready.clear();
         for (run, ran) in self.runs.drain(..) {
             lowered.ran(run, &ran).map_err(lower_error)?;
             let from = self.ready.len();
             self.waits.applied(run as u32, &mut self.ready);
+            harness::write(lowered, &self.job, self.ready[from..].iter().copied())?;
             for &unit in &self.ready[from..] {
                 identify(lowered, &self.job, unit);
             }

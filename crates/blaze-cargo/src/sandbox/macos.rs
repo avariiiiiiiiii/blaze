@@ -43,6 +43,11 @@
 //! a spawn into a group of its own) is not killed, there being no PID namespace to tell it by;
 //! Seatbelt still confines it, and the library says it left, so one still running as the run
 //! ends is an `X` line too.
+//!
+//! Every system call is behind a safe function of `raw` but `fork`, sound only in a process of
+//! one thread: [`run`], which forks, allows unsafe code; the rest of the file denies it.
+
+#![deny(unsafe_code)]
 
 use std::{
     ffi::{CString, OsString},
@@ -64,19 +69,8 @@ const OURS: [&str; 4] =
 /// The library every process of a run loads, built from `macos_interpose.c` by `build.rs`.
 const LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blaze_sandbox.dylib"));
 
-// SAFETY: libsystem_sandbox's `int sandbox_init_with_parameters(const char *profile, uint64_t
-// flags, const char *const parameters[], char **errorbuf)`, as `sandbox-exec` calls it; a
-// declaration that differs would have every call pass its arguments wrongly.
-unsafe extern "C" {
-    // libsystem_sandbox, part of libSystem: what `sandbox-exec` does, without a process of
-    // its own to run.
-    fn sandbox_init_with_parameters(
-        profile: *const libc::c_char,
-        flags: u64,
-        parameters: *const *const libc::c_char,
-        errorbuf: *mut *mut libc::c_char,
-    ) -> libc::c_int;
-}
+#[allow(unsafe_code, reason = "the macOS system calls, each behind a safe function")]
+mod raw;
 
 /// The Mach services a program of the sandbox may look up; every other lookup is refused. A
 /// service runs outside the sandbox, so one that writes for its callers (`cfprefsd`'s
@@ -248,11 +242,7 @@ fn stand_in(parent: &Path, dir: &Path) -> Result<PathBuf, String> {
 /// The user's temporary directory, as macOS gives it to each user (`/var/folders/...`).
 fn user_temp() -> Option<PathBuf> {
     let mut buffer = [0u8; 1024];
-    // SAFETY: `buffer` is live and exclusive for the call, which writes at most
-    // `buffer.len()` bytes into it (and says how many it needed, which is checked below).
-    let len = unsafe {
-        libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buffer.as_mut_ptr().cast(), buffer.len())
-    };
+    let len = raw::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, &mut buffer);
     if len == 0 || len > buffer.len() {
         return None;
     }
@@ -343,6 +333,7 @@ impl Drop for Scratch {
 
 /// Runs `program` sandboxed as `spec` and `also` say, or with `None` makes the sandbox and runs
 /// nothing in it. What it ends with: its status, or 128 and the signal that ended it.
+#[allow(unsafe_code, reason = "fork")]
 pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<i32, String> {
     let library = library()?;
     let scratch = Scratch::new(spec.overlays.len())?;
@@ -489,15 +480,11 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
         _ = write!(name, "SERVICE{at}");
         params.extend([c(name.as_bytes()), c(it.as_bytes())]);
     }
-    let mut param_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(params.len() + 1);
-    param_ptrs.extend(params.iter().map(|it| it.as_ptr()));
-    param_ptrs.push(std::ptr::null());
+    let param_ptrs = raw::Strings::new(&params);
     let program_argv = program.unwrap_or_default();
     let mut argv: Vec<CString> = Vec::with_capacity(program_argv.len());
     argv.extend(program_argv.iter().map(|it| c(it.as_bytes())));
-    let mut argv_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(argv.len() + 1);
-    argv_ptrs.extend(argv.iter().map(|it| it.as_ptr()));
-    argv_ptrs.push(std::ptr::null());
+    let argv_ptrs = raw::Strings::new(&argv);
     // alloc: once per run, as above.
     let nonce = format!("{}.top", std::process::id());
     // The program's environment is the spec's (as it is with `also.env`), its `TMPDIR` the
@@ -532,9 +519,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
     env.push(c(format!("__BLAZE_SANDBOX={dir}").as_bytes()));
     // alloc: once per run, as above.
     env.push(c(format!("__BLAZE_SANDBOX_EXEC={nonce}").as_bytes()));
-    let mut env_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(env.len() + 1);
-    env_ptrs.extend(env.iter().map(|it| it.as_ptr()));
-    env_ptrs.push(std::ptr::null());
+    let env_ptrs = raw::Strings::new(&env);
     let cwd = c(spec.cwd.as_os_str().as_bytes());
     let raw = scratch.dir.join("record");
     if recording {
@@ -548,62 +533,36 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
     // Before the fork, so that no signal ends this process before it passes them on.
     super::pass_signals_to(0);
     // SAFETY: the process is one thread: `super::command` runs before anything else in it (or
-    // a test's `super::alone` before `main`), and nothing here starts a thread. The child
-    // applies the profile, may allocate and print why it failed, and runs the program or
-    // exits; with another thread, a lock it held (the allocator's, stdio's) would stay held in
-    // the child.
-    let child = unsafe { libc::fork() };
+    // a test's `super::alone` before `main`), and nothing here starts a thread. No lock is
+    // held by another thread across the fork, so the child need not keep to async-signal-safe
+    // calls: it applies the profile, may allocate and print why it failed, sleeps between
+    // tries, and runs the program or exits.
+    let child = unsafe { raw::fork() };
     if child < 0 {
         return Err(os("fork"));
     }
     if child == 0 {
         // A session of its own, with no controlling terminal: nothing of the sandbox can push
         // input into the caller's (`TIOCSTI` is refused but to the terminal's own session).
-        // SAFETY: `setsid` takes no arguments and touches no memory of this process.
-        unsafe { libc::setsid() };
-        let mut error: *mut libc::c_char = std::ptr::null_mut();
-        // SAFETY: `profile` is a nul-terminated string and `param_ptrs` a list of the
-        // nul-terminated names and values of `params` ending in a null pointer, all live in
-        // this frame for the call, which only reads them; `error` is a live pointer for the
-        // call to set to a string it makes, or leave null.
-        let applied = unsafe {
-            sandbox_init_with_parameters(profile.as_ptr(), 0, param_ptrs.as_ptr(), &mut error)
-        };
-        if applied != 0 {
-            let why = match error.is_null() {
-                true => "it said no more".into(),
-                // SAFETY: not null, so `error` is the nul-terminated string
-                // `sandbox_init_with_parameters` made, which nothing frees before this reads it.
-                false => unsafe { std::ffi::CStr::from_ptr(error) }.to_string_lossy(),
-            };
+        raw::setsid();
+        if let Err(why) = raw::sandbox_init(&profile, &param_ptrs) {
             eprintln!("blaze: the sandbox could not be made: Seatbelt refused the profile: {why}");
-            // SAFETY: `_exit` takes the code by value and never returns; it ends this forked
-            // child without running the `atexit` handlers or flushing the stdio buffers it
-            // copied from the parent, which would run or be written twice.
-            unsafe { libc::_exit(super::COULD_NOT) };
+            raw::exit(super::COULD_NOT);
         }
         if program.is_none() {
-            // SAFETY: as for `_exit` above.
-            unsafe { libc::_exit(0) };
+            raw::exit(0);
         }
-        // SAFETY: `cwd` is a nul-terminated string of this frame, live for the call, which
-        // only reads it.
-        if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
+        if raw::chdir(&cwd) < 0 {
             // alloc: the error, once, and the program does not run.
             let error = os(&format!("the working directory {}", spec.cwd.display()));
             eprintln!("blaze: the sandbox could not be made: {error}");
-            // SAFETY: as for `_exit` above.
-            unsafe { libc::_exit(super::COULD_NOT) };
+            raw::exit(super::COULD_NOT);
         }
         // The program is often the file blaze just wrote: an exec that meets a writer's
         // descriptor not yet closed (`ETXTBSY`) is made again on blaze-core's schedule.
         let (mut tried, mut waited) = (0, 0);
         let said = loop {
-            // SAFETY: `argv_ptrs` and `env_ptrs` end with a null pointer and each other entry is a
-            // nul-terminated string of `argv` or `env`, live in this frame for the call, which
-            // writes nothing through them; `argv_ptrs[0]` is the program's path (a run with a
-            // program has one).
-            unsafe { libc::execve(argv_ptrs[0], argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
+            raw::execve(&argv_ptrs, &env_ptrs);
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ETXTBSY) {
                 // alloc: the error, once, and the program's process ends.
@@ -621,33 +580,22 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             waited += wait;
         };
         eprintln!("blaze: could not run {}: {said}", argv[0].to_string_lossy());
-        // SAFETY: as for `_exit` above.
-        unsafe { libc::_exit(127) };
+        raw::exit(127);
     }
     super::pass_signals_to(child);
     // Waited for, not reaped yet, so that its group's id is no other's when what it left
     // running in its group is ended, as a PID namespace's processes end with its first on
     // Linux: what they did later would be in no record.
-    // SAFETY: `siginfo_t` is integers and a union of integers and pointers, for which all-zero
-    // bytes are a valid value.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a live, exclusive `siginfo_t` for the call to fill, and nothing else;
-    // `child` is this process's own child, so the wait ends when it does.
-    while unsafe {
-        libc::waitid(libc::P_PID, child as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
-    } < 0
-    {
+    while raw::wait_unreaped(child) < 0 {
         if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(os("waitid"));
         }
     }
-    // SAFETY: `kill` takes integers only and touches no memory of this process. `child` has
-    // ended but is not reaped (`WNOWAIT` above), so its group's id is no other process's; once
-    // reaped it could be, and this would kill that group.
-    unsafe { libc::kill(-child, libc::SIGKILL) };
+    // `child` has ended but is not reaped (`WNOWAIT` above), so its group's id is no other
+    // process's; once reaped it could be, and this would kill that group.
+    raw::kill(-child, libc::SIGKILL);
     let mut status = 0;
-    // SAFETY: `status` is a live, exclusive `c_int` for the call to write, and nothing else.
-    while unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
+    while raw::wait(child, &mut status, 0) < 0 {
         if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(os("waitpid"));
         }
@@ -720,9 +668,8 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
 /// go: a process that left it (`setsid`) is not waited for.
 fn group_ended(group: libc::pid_t) -> bool {
     for _ in 0..2000 {
-        // SAFETY: `kill` with signal 0 takes integers only, touches no memory of this process
-        // and sends nothing: it only asks whether the group is there.
-        if unsafe { libc::kill(-group, 0) } < 0
+        // Signal 0 sends nothing: it only asks whether the group is there.
+        if raw::kill(-group, 0) < 0
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
         {
             return true;
@@ -735,9 +682,8 @@ fn group_ended(group: libc::pid_t) -> bool {
 /// Whether a process `pid` is there: one that is another user's is too. Its number may be
 /// another's now, which only makes the record say it is not whole when it is.
 fn still_runs(pid: libc::pid_t) -> bool {
-    // SAFETY: `kill` with signal 0 takes integers only, touches no memory of this process and
-    // sends nothing: it only asks whether the process is there.
-    unsafe { libc::kill(pid, 0) } == 0
+    // Signal 0 sends nothing: it only asks whether the process is there.
+    raw::kill(pid, 0) == 0
         || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 

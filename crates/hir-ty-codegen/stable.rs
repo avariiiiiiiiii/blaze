@@ -64,6 +64,7 @@ pub fn lower_declared(db: &Db, crates: &[Crate], lower: &impl Fn(&[DefWithBodyId
 
 /// The statics `crates` declare, in their modules and in the blocks of their bodies.
 pub(super) fn declared_statics(db: &Db, crates: &[Crate]) -> Vec<StaticId> {
+    // alloc: once per build, what it returns
     let mut statics = Vec::new();
     declared(db, crates, &|_| (), &mut |it| {
         if let Declared::Static(id) = it {
@@ -81,6 +82,7 @@ fn declared(
     lower: &impl Fn(&[DefWithBodyId]),
     found: &mut impl FnMut(Declared),
 ) {
+    // alloc: once per listing, the bodies of a round, kept for every round
     let mut bodies: Vec<DefWithBodyId> = Vec::new();
     let mut scope = |scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>| {
         for def in scope.declarations() {
@@ -126,10 +128,12 @@ fn declared(
             scope(module.scope(db), &mut bodies);
         }
     }
+    // alloc: once per listing, the round taken from `bodies`, kept for every round
+    let mut round = Vec::new();
     while !bodies.is_empty() {
-        let round = std::mem::take(&mut bodies);
+        std::mem::swap(&mut round, &mut bodies);
         lower(&round);
-        for body in round {
+        for body in round.drain(..) {
             for (_, def_map) in Body::of(db, body).blocks(db) {
                 for (_, module) in def_map.modules(db) {
                     scope(module.scope(db), &mut bodies);
@@ -182,7 +186,7 @@ pub(super) struct StableNames<'a, 'db> {
     crate_names: RefCell<FxHashMap<Crate, Result<Box<str>, &'static str>>>,
     tys: RefCell<FxHashMap<Ty<'db>, Result<Box<str>, &'static str>>>,
     /// What each closure asked about is written as, by a hash of its source.
-    written: RefCell<FxHashMap<InternedClosure<'db>, Option<Box<str>>>>,
+    written: RefCell<FxHashMap<InternedClosure<'db>, Option<u64>>>,
     /// The ids crates of the checkout are named by in place of what is written in them now:
     /// those of a base, whose names an edit leaves to the code they are of.
     frozen: FxHashMap<Crate, super::ContentId>,
@@ -227,6 +231,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
     }
 
     pub(super) fn listings(&self) -> Listings {
+        // clone: an `Arc`, once per build, shared with the names of its threads
         self.listings.clone()
     }
 
@@ -255,6 +260,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
 
     /// `None` for an instance that names anything this has no stable name for.
     pub(super) fn instance(&self, instance: &Instance) -> Option<String> {
+        // alloc: the name is what this returns, its key in the store
         let mut out = String::new();
         match instance.def {
             InstanceDef::Fn(func) => {
@@ -295,6 +301,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
         ty: Ty<'db>,
         trait_ref: Option<(TraitId, GenericArgs<'db>)>,
     ) -> Option<String> {
+        // alloc: the name is what this returns, its key in the store
         let mut out = String::from("vtable ");
         self.ty(&mut out, ty)?;
         if let Some((trait_, args)) = trait_ref {
@@ -328,6 +335,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
         });
         match erased {
             Some(at) if &bare[at..] != "<>" => {
+                // alloc: only a name whose arguments are lifetimes alone, written once erased
                 std::borrow::Cow::Owned(format!("{}<>{checked}", &bare[..at]))
             }
             _ => std::borrow::Cow::Borrowed(name),
@@ -342,12 +350,14 @@ impl<'a, 'db> StableNames<'a, 'db> {
         // too, and no function without type parameters is named so: its crate is not listed.
         let of_checkout = name.split_once(' ').is_some_and(|it| it.1.starts_with(OF_CHECKOUT));
         if !of_checkout {
+            // alloc: empty, allocates nothing
             return Vec::new();
         }
         let name = Self::lifetimes_erased(name);
         // An instance with types for arguments is of no function a crate lists, and listing
         // its crate for it would go through every body there for nothing.
         if !name.ends_with("<>") {
+            // alloc: empty, allocates nothing
             return Vec::new();
         }
         self.listed(&name, |it| it.functions.get(&*name).cloned()).unwrap_or_default()
@@ -361,8 +371,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
         let cell = self.listed.borrow().get(krate).cloned();
         let cell = cell.unwrap_or_else(|| {
             let mut listed = self.listings.0.listed.lock().unwrap_or_else(|e| e.into_inner());
+            // alloc: the first ask of a crate by these names; an `Arc` and the crate's key
             let cell = listed.entry(krate.to_owned()).or_default().clone();
             drop(listed);
+            // clone: an `Arc`, kept to ask again without the lock
             self.listed.borrow_mut().insert(krate.into(), cell.clone());
             cell
         });
@@ -374,9 +386,11 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 // What is built names only what it depends on, and to name a crate of the
                 // checkout is to go through every body of it: not of one that is not built.
                 let named: FxHashSet<Crate> =
+                    // alloc: once per build, the crates it depends on
                     self.owned.iter().flat_map(|it| it.transitive_deps(self.db).iter().copied()).collect();
                 let all = base_db::all_crates(self.db);
                 for &krate in all.iter().filter(|it| named.contains(it)) {
+                    // alloc: once per crate per build, the key of the crates by name
                     let mut name = String::new();
                     if self.crate_(&mut name, krate).is_some() {
                         crates.entry(name).or_default().push(krate);
@@ -397,6 +411,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
         };
         declared(self.db, crates, &lower, &mut |declared| match declared {
             Declared::Function(id) => {
+                // alloc: the key a listed function is found by, once per build of its crate
                 let mut name = String::from("fn ");
                 if self.function(&mut name, id).is_some() {
                     name.push_str("<>");
@@ -414,6 +429,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
 
     /// The name of a static whether or not [`Self::static_named`] finds it again.
     pub(super) fn static_name(&self, id: StaticId) -> Option<String> {
+        // alloc: the name is what this returns
         let mut out = String::from("static ");
         let at = id.lookup(self.db).id;
         self.item(&mut out, id.krate(self.db), at.file_id, at.value.erase())?;
@@ -431,6 +447,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
         }
         let at = id.lookup(self.db).id;
         let root = krate.data(self.db).root_file_id;
+        // alloc: the name is what this returns
         let mut out = format!("static {OF_CHECKOUT}{root:?}:");
         file_across_edits(self.db, &mut out, at.file_id)?;
         write!(out, "#{}", at.value.erase().into_raw()).ok()?;
@@ -479,6 +496,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
                 Err(why) => self.miss(why),
             };
         }
+        // alloc: a miss of the memo, kept as the spelling; `spell` may rewrite all it wrote
         let mut spelled = String::new();
         let found = match spell(&mut spelled) {
             Some(()) => Ok(spelled.into_boxed_str()),
@@ -539,6 +557,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
         if let Some(known) = self.files.borrow().get(&file) {
             out.push_str(known.as_deref()?);
         } else {
+            // alloc: once per file, kept as its name
             let mut name = String::new();
             let named = self.file(&mut name, file);
             let name = named.map(|()| name);
@@ -615,25 +634,28 @@ impl<'a, 'db> StableNames<'a, 'db> {
             }
         }
         match self.written(owner, closure) {
-            Some(written) => write!(out, "@{}:{written}", ClosureKey::nth(db, closure)).ok(),
+            Some(written) => write!(out, "@{}:{written:016x}", ClosureKey::nth(db, closure)).ok(),
             None => write!(out, "@x{}", closure.expr.into_raw().into_u32()).ok(),
         }
     }
 
-    /// A hash of the source of a closure, `None` when the body has none for it.
-    fn written(&self, owner: DefWithBodyId, closure: InternedClosure<'db>) -> Option<Box<str>> {
-        if let Some(written) = self.written.borrow().get(&closure) {
-            return written.clone();
+    /// The first eight bytes of a hash of the source of a closure, big-endian, `None` when the
+    /// body has none for it.
+    fn written(&self, owner: DefWithBodyId, closure: InternedClosure<'db>) -> Option<u64> {
+        if let Some(&written) = self.written.borrow().get(&closure) {
+            return written;
         }
         let source = Body::with_source_map(self.db, owner).1.expr_syntax(closure.expr).ok();
         let written = source.map(|source| {
             use sha2::{Digest, Sha256};
-            let root = source.file_id.parse_or_expand(self.db);
-            let text = source.value.syntax_node_ptr().to_node(&root).text().to_string();
-            let digest = Sha256::digest(text.as_bytes());
-            digest[..8].iter().map(|byte| format!("{byte:02x}")).collect::<String>().into()
+            let root = source.file_id.root(self.db);
+            let mut hasher = Sha256::new();
+            hasher.update(syntax::view::to_node(source.value.syntax_node_ptr(), root).text());
+            let mut first = [0; 8];
+            first.copy_from_slice(&hasher.finalize()[..8]);
+            u64::from_be_bytes(first)
         });
-        self.written.borrow_mut().insert(closure, written.clone());
+        self.written.borrow_mut().insert(closure, written);
         written
     }
 
@@ -789,8 +811,10 @@ impl<'a, 'db> StableNames<'a, 'db> {
             }
             TyKind::Dynamic(predicates, region) => {
                 // In an order of their own: the list is sorted by ids of this run.
+                // alloc: once per `dyn` type, a miss of the memo of types (`Self::ty`)
                 let mut written = Vec::new();
                 for predicate in predicates.iter() {
+                    // alloc: once per bound of a `dyn` type, sorted by its text
                     let mut out = String::new();
                     match predicate.skip_binder() {
                         ExistentialPredicate::Trait(it) => {
@@ -915,7 +939,7 @@ fn file_across_edits(db: &Db, out: &mut String, file: HirFileId) -> Option<()> {
             match &loc.kind {
                 MacroCallKind::FnLike { ast_id, .. } => {
                     file_across_edits(db, out, ast_id.file_id)?;
-                    let text = loc.to_node(db).value.text().to_string();
+                    let text = loc.to_node_view(db).value.text();
                     write!(out, "#{:032x}!", super::print_of(&text)).ok()
                 }
                 MacroCallKind::Derive { ast_id, derive_attr_index, derive_index, .. } => {
@@ -970,10 +994,12 @@ fn path_everywhere(path: String, cargo_home: Option<&str>, library: Option<&str>
     if let Some(rest) = library.and_then(|it| path.strip_prefix(it))
         && let Some(rest) = rest.strip_prefix(['/', '\\'])
     {
+        // alloc: the path is what this returns
         return format!("/rustc/library/{}", rest.replace('\\', "/"));
     }
     let slashed = path.replace('\\', "/");
     if let Some(at) = slashed.find(INSTALLED_LIBRARY) {
+        // alloc: the path is what this returns
         return format!("/rustc/{}", &slashed[at + INSTALLED_LIBRARY.len()..]);
     }
     cargo_home.and_then(|home| super::moved(&path, home, super::CARGO_HOME)).unwrap_or(path)
@@ -990,6 +1016,7 @@ pub fn block_place(
 ) -> Option<String> {
     func.module(db).block(db)?;
     let id = func.lookup(db).id;
+    // alloc: the place is what this returns
     let mut out = String::new();
     file_name(db, symbols, &mut out, id.file_id, &|path| place_path(symbols, path))?;
     write!(out, "#{}", id.value.erase().into_raw()).ok()?;
@@ -1006,6 +1033,7 @@ pub fn function_place(
     func: FunctionId,
 ) -> Option<String> {
     let id = func.lookup(db).id;
+    // alloc: the place is what this returns
     let mut out = String::new();
     file_name(db, symbols, &mut out, id.file_id, &|path| place_path(symbols, path))?;
     write!(out, "#{}", id.value.erase().into_raw()).ok()?;
@@ -1021,6 +1049,7 @@ pub fn static_place(
 ) -> Option<String> {
     id.module(db).block(db)?;
     let id = id.lookup(db).id;
+    // alloc: the place is what this returns
     let mut out = String::new();
     file_name(db, symbols, &mut out, id.file_id, &|path| place_path(symbols, path))?;
     write!(out, "#{}", id.value.erase().into_raw()).ok()?;

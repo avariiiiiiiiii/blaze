@@ -772,6 +772,9 @@ impl<M: Memory> Switch<M> {
                 if let Some(hit) = self.lasting.hit(&placed.range()) {
                     return Err(over("data", hit, slide));
                 }
+                // The platform's `data` refuses the same while it writes, a span at a time:
+                // checked here, a bad span refuses the patch before any is written.
+                self.memory.in_image(&placed.range())?;
                 s.data.push(placed);
             }
         }

@@ -878,6 +878,19 @@ I restructure the evaluator around them:
 > `MemKind::Machine`, as Miri's `MiriMemoryKind::Mmap` is split out. The split comes with two
 > exact one-line replacements in `hir-ty-ub/src/check.rs` that codegen-mir may make.
 > `Kind::Mmap` and its test are in already. Nothing blocks S1 on it.
+>
+> codegen-rq-mir (2026-10-30), the failed compare-exchange (raised by the codegen lead): in
+> `eval/shim.rs`, a compare-exchange now compares the latest store, read unchecked
+> (`peek_memory`, as Miri does), and then tells the machine of one read. That is
+> `Atomic { ord, rmw: true }` when it exchanges (then the write and `atomic_store`), and else
+> `Atomic { ord: failure, rmw: true, cxchg_failed: true }` and no write. Before, a failed one was
+> an RMW read at the success ordering and then the failed read. Under `Plain` it peeks once, as
+> before. Tests in `tests/mir/machine.rs`: `a_failed_compare_exchange_is_one_read_at_the_failure_ordering`
+> and `a_compare_exchange_that_exchanges_is_one_rmw`. The checker's `failed_cxchg` gets only
+> that read now. The race-checker test is already there: `tests/ub/main.rs`
+> `failed_cxchg_races_with_a_non_atomic_write`. Its verdict doesn't change, because the checker's
+> race step ignores an RMW read (`(Read, true) => Ok(())`). The extra read only went against the
+> `Access` contract and added a second borrow access. Not built.
 
 ## From speed-hir-store (2026-10-29): `unsafe.md` in its paths, and four parsers for safety-fuzz
 
@@ -1169,3 +1182,309 @@ Status: open
 > `lint_file`): findings went from 5 to 4 in `borrows.rs` and 14 to 13 in `memory.rs` (the
 > `Vec::new()` and `vec![..]` this removed), and stayed at 5 in `bytes.rs`; none of the rest is on a
 > line this changed.
+
+## From speed-unsafe-back (2026-10-30): one parser of untrusted bytes without a fuzz target
+
+- **`blaze-vfs`'s image base.** `store::Base::check` (`crates/blaze-vfs/src/store.rs:494`), with
+  `Base::within`, is all that stands between a restored image's node, entry, name, file and index
+  columns and the zero-copy reads `Writer::restore` makes of them. Public entry:
+  `blaze_vfs::Vfs::restore` (`crates/blaze-vfs/src/image.rs:196`), over an image whose `vfs`
+  sections are the input. Invariants: never panics; an image `Base::check` passes, its root lists,
+  reads and follows every path without a read outside the mapping; one it refuses is an error that
+  names the column. Owner: vfs (done); `crates/blaze-vfs` is speed-unsafe-back's for unsafe.md, so
+  a `#[cfg(feature = "fuzz")]` hook there, if the target needs one, can be asked of it.
+
+> taken by requests (pass 46; vfs is DONE): child `requests-vfsfuzz` writes `fuzz/targets/vfs_image.rs` through `Vfs::write_image` and `Vfs::restore`; a hook inside `crates/blaze-vfs`, if one is needed, is asked of speed-unsafe-back. Its outcome line follows.
+
+> applied (requests-vfsfuzz, child of requests): `fuzz/targets/vfs_image.rs`, not built. Public API only, no hook in `crates/blaze-vfs`. Input: up to 15 ops committed to `main` (file, executable, symlink, delete), then up to 32 damages (a tree header word, bytes of one of the ten columns, of the disks section, or anywhere in the tree section). Each run writes the image with `Vfs::write_image`, makes it durable and settles the journal's rewrite onto it, re-wraps the damaged sections in a fresh `Builder` so the CRCs pass and `Base::within`/`Base::check` is reached, maps it with `Mapping::copy` and calls `Vfs::restore`. It asserts: allocation within `blaze_fuzz::allowed(image + journal)`; a used image's heads list, read and follow with every file's bytes inside the mapping and no corrupt read; a refused one is `Malformed` with a reason, `Corrupt` of the tree section by bounds or alignment (never a CRC), or `Unnamed` (the last two only with header damage), and equals `Vfs::recover` of the journal in its report, heads and files; an undamaged image is `Used` as written and walks equal to the writer's tree. Plus `[[bin]] vfs_image` and `blaze-image.workspace = true` in `fuzz/Cargo.toml` (`write_image` takes a `blaze_image::Builder`), a `fuzz/README.md` row, and 4 seeds in `fuzz/corpus/vfs_image/`; `seeds()` builds 16 more (4 trees, each undamaged and with a column's count, a column's place and a name byte overwritten).
+
+## speed-unsafe-back-run (2026-10-30): two fuzz targets for blaze-live's patch messages
+
+blaze-live reads two messages another process writes, and had no fuzz target for either:
+v1's patch (`format::Patch::decode`, the daemon to a program linking `blaze-live`, then the
+checks `apply.rs` makes before anything is mapped) and the jump-table runtime's
+(`patch::Message::view`, `Answer::decode`, `Descriptor::decode`). This lane made the readers
+stricter and exposed v1's checks; the targets are yours (`fuzz/`). Not compiled.
+
+In `crates/blaze-live` (done here): `format::Patch::decode` refuses bytes past the end ("N bytes
+past the end of the patch"), as `Message::view` already did; a `fuzz` feature exposes
+`blaze_live::fuzz_checks(code, process, slide, image, page) -> Result<(u64, [Result<(), String>; 3]), String>`,
+the platforms' `apply` order (`in_image`, `Overwrites::plan`, `claim`, `slide_at` of the
+pointers) then each platform's unwind check (`frame_run`, `fdes`, `functions`). The v2 switch's
+checks against the image are reference-tested in `slots/tests.rs`
+(`a_bad_patch_is_declined_before_anything_is_written`, and new
+`data_outside_the_image_is_refused_before_any_write`); a target over `Switch::take` needs the
+tests' fake image behind the same feature, which is a next step, not asked here.
+
+1. `fuzz/Cargo.toml`: in `[dependencies]`, `blaze-live = { workspace = true, features = ["fuzz"] }`
+   (with a comment like blaze-link's: "`fuzz_checks`, v1's checks of a decoded patch"), and
+   ```toml
+   [[bin]]
+   name = "live_message"
+   path = "targets/live_message.rs"
+
+   [[bin]]
+   name = "live_patch"
+   path = "targets/live_patch.rs"
+   ```
+   in name order. `Cargo.lock` gains `"blaze-live"` in the fuzz package's dependencies.
+2. `fuzz/targets/live_message.rs`:
+   ```rust
+   //! What the linker writes a jump-table program and the program answers, through
+   //! blaze-live's `patch`: `Message::view` (the runtime reads every message in place with it),
+   //! `Message::decode`, `Answer::decode` and `Descriptor::decode`, each given the whole input.
+   //! The program trusts no byte of a message: it comes from another process.
+   //!
+   //! Invariants, each checked below (a violation panics, which the engine reports as a crash):
+   //! - No reader panics, on any bytes, nor does walking every list of a view.
+   //! - `view` allocates nothing for a message it accepts, and asks for at most
+   //!   `blaze_fuzz::allowed(len)` bytes at once for one it refuses (its error).
+   //! - Every write's bytes a view gives are bytes of the message.
+   //! - `decode` is `view` then `to_message`, and a message either reads encodes back to
+   //!   exactly the bytes read; so does an answer, and a descriptor its first `SIZE` bytes.
+
+   #![forbid(unsafe_code)]
+
+   use std::time::Duration;
+
+   use blaze_fuzzer::Target;
+   use blaze_live::patch::{Answer, DESCRIPTOR_MAGIC, Descriptor, Message, MessageView, Patch};
+
+   const TARGET: Target = Target {
+       name: "live_message",
+       check,
+       seeds,
+       dictionary: &[
+           b"BLZLMSG2",
+           b"BLZLANS2",
+           b"BLZLIVE2",
+           b"\x01\x00\x00\x00",
+           b"\x00\x00\x00\x00",
+           b"\x02\x00\x00\x00",
+           b"\xff\xff\xff\xff",
+       ],
+       max_len: 1 << 16,
+       budget: Duration::from_secs(300),
+   };
+
+   /// Every entry of every list of `view`, checked to be the message's: how many there are.
+   fn walk(message: &[u8], view: &MessageView<'_>) -> usize {
+       let MessageView::Patch(patch) = *view else { return 0 };
+       let inside = message.as_ptr_range();
+       let writes = patch.code.len() + patch.data.len();
+       let mut seen = 0;
+       for (_, bytes) in patch.code.chain(patch.data) {
+           let range = bytes.as_ptr_range();
+           assert!(inside.start <= range.start && range.end <= inside.end, "a write's bytes are the message's");
+           seen += 1;
+       }
+       assert_eq!(seen, writes, "a write list gives as many writes as it says");
+       let lists = [patch.rebase().len(), patch.cells().len(), patch.frames().len(), patch.windows().len()];
+       let walked = [patch.rebase().count(), patch.cells().count(), patch.frames().count(), patch.windows().count()];
+       assert_eq!(walked, lists, "a list gives as many entries as it says");
+       seen + walked.iter().sum::<usize>()
+   }
+
+   fn check(data: &[u8]) {
+       let (most, viewed) = blaze_fuzz::largest_allocation(|| Message::view(data).map(|view| (walk(data, &view), view)));
+       match &viewed {
+           Ok(_) => assert_eq!(most, 0, "a message read in place allocates nothing"),
+           Err(_) => assert!(most <= blaze_fuzz::allowed(data.len()), "refusing {} bytes asked for {most} at once", data.len()),
+       }
+       let decoded = Message::decode(data);
+       match (&viewed, &decoded) {
+           (Ok((_, view)), Ok(message)) => {
+               assert_eq!(&view.to_message(), message, "decode is the view's message");
+               assert_eq!(message.encode(), data, "a message read encodes to its bytes");
+               assert_eq!(message.encoded_len(), data.len());
+           }
+           (Err(a), Err(b)) => assert_eq!(a, b, "decode refuses as view does"),
+           _ => panic!("view and decode disagree: {:?} and {:?}", viewed.as_ref().map(|it| it.0), decoded),
+       }
+       if let Ok(answer) = Answer::decode(data) {
+           assert_eq!(answer.encode(), data, "an answer read encodes to its bytes");
+       }
+       if let Some(descriptor) = Descriptor::decode(data) {
+           assert_eq!(descriptor.encode(), data[..Descriptor::SIZE], "a descriptor read encodes to its bytes");
+       }
+   }
+
+   /// Each kind of message, answer and descriptor as the linker and program write them, and the
+   /// ways bytes are not one.
+   fn seeds() -> Vec<Vec<u8>> {
+       let patch = Patch {
+           id: [7; 16],
+           generation: 2,
+           base: 1,
+           code: vec![(0x4000, vec![0x90; 16]), (0x4010, Vec::new())],
+           data: vec![(0x8000, 0x4000u64.to_le_bytes().to_vec())],
+           rebase: vec![0x8000],
+           cells: vec![(0, 0x4000), (3, 0x4008)],
+           frames: vec![(0x4000, 16)],
+           windows: vec![(0x4000, 0x4010, 0x4008)],
+           functions: 2,
+           statics: 1,
+       };
+       let messages = [
+           Message::Patch(patch),
+           Message::Patch(Patch::default()),
+           Message::RollBack { id: [7; 16], to: 1 },
+           Message::Restart { id: [7; 16], generation: 2, why: "a layout changed: ünï".into() },
+       ];
+       let answers = [
+           Answer::Applied { generation: 2 },
+           Answer::RolledBack { generation: 2, to: 1, why: "panicked".into() },
+           Answer::Declined { generation: 3, why: String::new() },
+       ];
+       let descriptor = Descriptor {
+           magic: DESCRIPTOR_MAGIC,
+           version: 1,
+           arch: 0,
+           id: [7; 16],
+           generation: 1,
+           this: 0x1000,
+           table: 0x2000,
+           slots: 4,
+           patch_code: [0x4000, 0x8000],
+           patch_data: [0x8000, 0xc000],
+           dir: [0x3000, 12],
+       };
+       let mut seeds: Vec<Vec<u8>> = messages.iter().map(Message::encode).collect();
+       seeds.extend(answers.iter().map(Answer::encode));
+       seeds.push(descriptor.encode());
+       let whole = messages[0].encode();
+       seeds.push(whole[..whole.len() - 1].to_vec());
+       seeds.push([&whole[..], &[0]].concat());
+       let mut unknown = messages[2].encode();
+       unknown[12] = 9;
+       seeds.push(unknown);
+       seeds
+   }
+
+   #[cfg_attr(test, allow(dead_code))]
+   fn main() -> std::process::ExitCode {
+       blaze_fuzzer::main(&TARGET)
+   }
+
+   #[cfg(test)]
+   mod tests {
+       #[test]
+       fn seeds() {
+           blaze_fuzzer::seeds(&super::TARGET);
+       }
+   }
+   ```
+   (`unknown[12]` is the kind word, after the 8-byte magic and the 4-byte version.)
+3. `fuzz/targets/live_patch.rs`:
+   ```rust
+   //! What the daemon writes a v1 program, through blaze-live's `format::Patch::decode`, then
+   //! `blaze_live::fuzz_checks`, the checks each platform's `apply` makes of a decoded patch
+   //! before it maps or writes anything. The program trusts no byte of a patch: it comes from
+   //! another process. The checks run against a fixed image and room, at three slides.
+   //!
+   //! Invariants, each checked below (a violation panics, which the engine reports as a crash):
+   //! - Neither panics, on any bytes.
+   //! - `decode` asks for at most `blaze_fuzz::allowed(len)` bytes at once: no count is believed
+   //!   before its bytes are there.
+   //! - A patch `decode` accepts encodes to bytes of its `encoded_len` that decode to it again.
+   //! - Code the checks accept is laid out in whole pages within the process's room, and every
+   //!   write over the executable is inside the image.
+
+   #![forbid(unsafe_code)]
+
+   use std::{ops::Range, time::Duration};
+
+   use blaze_fuzzer::Target;
+   use blaze_live::format::{Body, Code, Patch, Process, Write};
+
+   const PAGE: u64 = 1 << 14;
+   const IMAGE: Range<u64> = 0x1_0000_0000..0x1_0100_0000;
+   const ROOM: Range<u64> = 0x2_0000_0000..0x2_0400_0000;
+
+   const TARGET: Target = Target {
+       name: "live_patch",
+       check,
+       seeds,
+       dictionary: &[
+           b"BLAZELV1",
+           b"\x00\x00\x00\x00\x01\x00\x00\x00",
+           b"\x00\x00\x00\x00\x02\x00\x00\x00",
+           b"\x00\x40\x00\x00\x00\x00\x00\x00",
+           b"\x01\x00\x00\x00\x00\x00\x00\x00",
+           b"\x00\x00\x00\x00\x00\x00\x00\x00",
+       ],
+       max_len: 1 << 17,
+       budget: Duration::from_secs(300),
+   };
+
+   fn check(data: &[u8]) {
+       let (most, decoded) = blaze_fuzz::largest_allocation(|| Patch::decode(data));
+       assert!(most <= blaze_fuzz::allowed(data.len()), "decoding {} bytes asked for {most} at once", data.len());
+       let Ok(patch) = decoded else { return };
+       let bytes = patch.encode();
+       assert_eq!(bytes.len(), patch.encoded_len(), "a patch's encoded_len is its encoding's");
+       assert_eq!(Patch::decode(&bytes).as_ref(), Ok(&patch), "a decoded patch encodes to itself");
+       let Body::Code(code) = &patch.body else { return };
+       let process = Process { pid: 1, uuid: patch.uuid, started: 0, next: ROOM.start, end: ROOM.end };
+       for slide in [0, PAGE, 0u64.wrapping_sub(PAGE)] {
+           let Ok((end, _)) = blaze_live::fuzz_checks(code, process, slide, IMAGE, PAGE) else { continue };
+           assert!(code.base >= ROOM.start && code.base <= end && end <= ROOM.end, "laid out in the room");
+           assert!(code.base % PAGE == 0 && end % PAGE == 0, "laid out in whole pages");
+           for write in &code.writes {
+               let start = write.address.wrapping_add(slide);
+               assert!(start >= IMAGE.start && start + write.bytes.len() as u64 <= IMAGE.end, "a write in the image");
+           }
+       }
+   }
+
+   /// Patches as the daemon writes them: one with code, unwind tables, pointers, writes over the
+   /// image and a static's first value, one that only puts back, a restart; and the ways bytes
+   /// are not one.
+   fn seeds() -> Vec<Vec<u8>> {
+       let mut text = vec![0u8; PAGE as usize];
+       text[8..16].copy_from_slice(&IMAGE.start.to_le_bytes());
+       let code = Code {
+           base: ROOM.start,
+           text,
+           data: vec![1; 64],
+           frames: (0, 4),
+           pointers: vec![8],
+           writes: vec![Write { address: IMAGE.start + 0x100, bytes: vec![0xe9, 0, 0, 0, 0], pointers: Vec::new() }],
+           redirected: 1,
+           statics: 1,
+           lasting: vec![Write { address: ROOM.start + PAGE, bytes: vec![0; 8], pointers: vec![0] }],
+       };
+       let patches = [
+           Patch { uuid: [7; 16], sequence: 1, body: Body::Code(code) },
+           Patch { uuid: [7; 16], sequence: 2, body: Body::Code(Code { base: ROOM.start, ..Code::default() }) },
+           Patch { uuid: [7; 16], sequence: 3, body: Body::Restart("a layout changed".into()) },
+       ];
+       let mut seeds: Vec<Vec<u8>> = patches.iter().map(Patch::encode).collect();
+       let whole = patches[0].encode();
+       seeds.push(whole[..whole.len() - 3].to_vec());
+       seeds.push([&whole[..], &[0]].concat());
+       seeds.push([&b"BLAZELV0"[..], &whole[8..]].concat());
+       seeds
+   }
+
+   #[cfg_attr(test, allow(dead_code))]
+   fn main() -> std::process::ExitCode {
+       blaze_fuzzer::main(&TARGET)
+   }
+
+   #[cfg(test)]
+   mod tests {
+       #[test]
+       fn seeds() {
+           blaze_fuzzer::seeds(&super::TARGET);
+       }
+   }
+   ```
+   Corpus: the seeds as `.hex` in `fuzz/corpus/live_message/` and `fuzz/corpus/live_patch/`,
+   as the other targets keep theirs.
+
+Status: open
+
+> taken by requests (pass 48; safety is DONE): child `requests-livefuzz` writes both targets, their `fuzz/Cargo.toml` and README entries and seeds. Its outcome line follows.
+
+> applied (requests-livefuzz, child of requests): `fuzz/targets/live_message.rs` and `fuzz/targets/live_patch.rs` as the request wrote them, not built; `fuzz/Cargo.toml` gains `blaze-live = { workspace = true, features = ["fuzz"] }` (with its comment) and `[[bin]] live_message`/`live_patch` between `link_wasm_object` and `macro_wasm_host`; two `fuzz/README.md` rows. Changed from the request: the seed descriptor is `DESCRIPTOR_VERSION` (3) and `ARCH_X86_64` rather than literal 1 and 0; the descriptor comparison is with `&data[..Descriptor::SIZE]`; `live_message` also checks an answer's `encoded_len`; `live_patch` uses `is_multiple_of`, checks each write in the image with `checked_add` (as `in_image` does) instead of an unchecked `+`, and its first seed has two writes (a jump and a static's value with a pointer) so they match `redirected: 1, statics: 1`. Every other item (`Patch::default()`, `Code::default()`, the view's list methods, `WriteList`'s `ExactSizeIterator`, `Process`'s fields and `Copy`, `fuzz_checks`'s signature) is as blaze-live has it; nothing was asked of `crates/blaze-live`. Corpus, derived byte by byte from the encoders: 9 files in `fuzz/corpus/live_message/` (every message kind, a patch with every list non-empty, the three answers, a descriptor, an unknown kind) and 3 in `fuzz/corpus/live_patch/` (a restart, the same under magic `BLAZELV0`, code that only puts back). `live_patch`'s 16 KiB code patch and its truncated and extended copies, and `live_message`'s truncated and extended patch, are left to `seeds()`. `Cargo.lock`'s new edge stays with requests' list.

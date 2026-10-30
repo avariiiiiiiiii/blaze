@@ -50,8 +50,11 @@ pub(crate) struct Shared {
 impl Shared {
     pub(crate) fn new(view: View) -> Shared {
         Shared {
+            // alloc: once per store opened, the view readers load
             view: AtomicPtr::new(Box::into_raw(Box::new(view))),
+            // alloc: once per store opened, the table of values made whole
             owned: AtomicPtr::new(Box::into_raw(Box::new(Owned::new()))),
+            // alloc: once per store opened, a slot per writer
             segments: (0..SEGMENTS_MOST).map(|_| OnceLock::new()).collect(),
             orphans: AtomicPtr::new(ptr::null_mut()),
         }
@@ -71,6 +74,7 @@ impl Shared {
     /// Publishes `view` and gives back the one it replaced, for the store's limbo. Only the
     /// store calls it.
     pub(crate) fn publish(&self, view: View) -> Box<View> {
+        // alloc: once per view published (a change of the store's files), never per read
         let old = self.view.swap(Box::into_raw(Box::new(view)), Ordering::AcqRel);
         // SAFETY: a leaked box, unlinked just now by the one caller that swaps.
         unsafe { Box::from_raw(old) }
@@ -79,6 +83,7 @@ impl Shared {
     /// Starts a fresh table of values made whole and gives back the old one, for the store's
     /// limbo. Only the store calls it.
     pub(crate) fn fresh_owned(&self) -> Box<Owned> {
+        // alloc: once per table of values made whole swapped in, never per read
         let old = self.owned.swap(Box::into_raw(Box::new(Owned::new())), Ordering::AcqRel);
         // SAFETY: as in `publish`.
         unsafe { Box::from_raw(old) }
@@ -106,6 +111,7 @@ impl Shared {
         if limbo.is_empty() {
             return;
         }
+        // alloc: once per store dropped while readers hold it
         let old = self.orphans.swap(Box::into_raw(Box::new(limbo)), Ordering::AcqRel);
         assert!(old.is_null(), "a store's limbo is orphaned once");
     }
@@ -396,6 +402,7 @@ impl<'a> Look<'a> {
                     return Some(Ok(Found { view, tier: at, place: Place::Pack(loc), at: At::Slot(index, slot) }));
                 }
                 Some((_, Err(what))) => {
+                    // clone: the error's file name
                     return Some(Err(Corrupt { key: *key, pack: tier.index_file.clone(), what: what.into() }));
                 }
                 None => {}
@@ -430,6 +437,7 @@ impl<'a> Look<'a> {
     pub(crate) fn rows(self, tier: usize, bad: &mut Vec<(Key, &'static str)>) -> Vec<(Key, Found<'a>)> {
         let view = self.view();
         let it = &view.tiers[tier];
+        // alloc: the listing is the output, for collection and checks
         let mut out = Vec::new();
         let mut shadow = rustc_hash::FxHashSet::default();
         for table in std::iter::once(&it.delta).chain(&it.prev) {
@@ -470,6 +478,7 @@ impl<'a> Look<'a> {
         let schema = SchemaHash(ContentId(schema.try_into().expect("a schema is 32 bytes")));
         match self.view().columns.get(&schema) {
             Some(columns) => Ok((columns.as_ref(), rest)),
+            // alloc: the error's message
             None => Err(format!(
                 "it is kept in the columns of schema {:x}, and the store was given no encoding of it",
                 schema.0
@@ -482,9 +491,12 @@ impl<'a> Look<'a> {
         let tier = &found.view.tiers[found.tier];
         match found.place {
             Place::Pack(loc) => match tier.packs.get(loc.pack as usize) {
+                // clone: the error's file name
                 Some(pack) => pack.file.clone(),
+                // clone: the error's file name
                 None => tier.index_file.clone(),
             },
+            // alloc: the error's message
             Place::Segment(seg) => FileName::new(&format!("{}/segment-{}", tier.dir, seg.segment))
                 .expect("a store's file names stay in its directory"),
         }
@@ -502,6 +514,7 @@ impl<'a> Look<'a> {
         let newer = || of(self.view());
         match of(found.view).filter(|it| it.mapping.is_some()).or_else(newer) {
             Some(ExternalView { mapping: Some(mapping), .. }) => Ok(mapping.bytes()),
+            // clone: the error's file name
             Some(ExternalView { file, mapping: None }) => Err(Some(file.clone())),
             None => Err(None),
         }
@@ -519,16 +532,20 @@ impl<'a> Look<'a> {
             Place::Pack(loc) => {
                 let tier = &found.view.tiers[found.tier];
                 if loc.pack as usize >= tier.packs.len() {
+                    // alloc: the error's message
                     return Err(corrupt(format!("its index names pack {} its head does not have", loc.pack)));
                 }
                 let at = loc.offset;
                 let header = self
                     .pack_bytes(found, loc, at, RECORD_HEADER)
+                    // alloc: the error's message
                     .ok_or_else(|| corrupt(format!("its record at {at} is outside the pack")))?;
                 let header =
+                    // alloc: the error's message
                     RecordHeader::decode(header).map_err(|what| corrupt(format!("the record at {at}: {what}")))?;
                 let payload = self
                     .pack_bytes(found, loc, at + RECORD_HEADER, header.stored)
+                    // alloc: the error's message
                     .ok_or_else(|| corrupt(format!("the record at {at} runs past the pack")))?;
                 (at, header, payload)
             }
@@ -541,14 +558,17 @@ impl<'a> Look<'a> {
                 // payload of the record it names, which the writer wrote before it published the
                 // spot (`Own::claim`, or `Own::keep` for the store's own) and never writes again.
                 let bytes = unsafe { chunk.bytes(at, RECORD_HEADER + seg.stored) }
+                    // alloc: the error's message
                     .ok_or_else(|| corrupt(format!("its record at {at} is outside its segment")))?;
                 let (header, payload) = bytes.split_at(RECORD_HEADER as usize);
                 let header =
+                    // alloc: the error's message
                     RecordHeader::decode(header).map_err(|what| corrupt(format!("the record at {at}: {what}")))?;
                 (at, header, payload)
             }
         };
         if header.key != *key {
+            // alloc: the error's message
             return Err(corrupt(format!("the record at {at} is of another key")));
         }
         Ok((header, payload))
@@ -570,6 +590,7 @@ impl<'a> Look<'a> {
                     Form::Warm => columns.hot_from_warm(encoded),
                     _ => columns.hot_from_cold(encoded),
                 };
+                // alloc: the error's message
                 Cow::Owned(hot.map_err(|why| corrupt(format!("its columns do not decode: {why}")))?)
             }
             Form::Raw => Cow::Borrowed(payload),
@@ -579,37 +600,46 @@ impl<'a> Look<'a> {
             Form::Lz4 => Cow::Owned(cold::unlz4(payload, header.raw).map_err(corrupt)?),
             Form::Zstd => {
                 let dictionary = self.dictionary(found, header.dictionary).ok_or_else(|| {
+                    // alloc: the error's message
                     corrupt(format!("it names dictionary {} the store does not have", header.dictionary))
                 })?;
                 let dictionary =
+                    // alloc: the error's message
                     dictionary.as_deref().map_err(|why| corrupt(format!("its dictionary {why}")))?;
                 Cow::Owned(cold::decompress(dictionary, payload, header.raw).map_err(corrupt)?)
             }
             Form::Chunked => {
                 let chunks = disk::decode_chunks(payload).map_err(|what| corrupt(what.into()))?;
                 let mut total = 0u64;
-                for (chunk, len) in &chunks {
-                    if *len > crate::chunk::MAX as u64 {
+                // clone: a copy of the iterator over the list in place; allocates nothing
+                for (chunk, len) in chunks.clone() {
+                    if len > crate::chunk::MAX as u64 {
+                        // alloc: the error's message
                         return Err(corrupt(format!("its chunk {} is {len} bytes, longer than a chunk", chunk.0)));
                     }
-                    total = total.checked_add(*len).ok_or_else(|| corrupt("its chunks' lengths overflow".into()))?;
+                    total = total.checked_add(len).ok_or_else(|| corrupt("its chunks' lengths overflow".into()))?;
                 }
                 if total != header.raw {
+                    // alloc: the error's message
                     return Err(corrupt(format!("its chunks are {total} bytes, not the {} recorded", header.raw)));
                 }
                 // Grown as pieces are read, at most `LIST_RESERVE` reserved once the first is:
                 // one chunk may be listed any number of times, so the lengths, which nothing has
                 // verified yet, bound nothing.
+                // alloc: the value made whole, kept in `Owned` once and read in place after
                 let mut whole = Vec::new();
                 for (chunk, len) in chunks {
                     let piece = self
                         .find(&chunk)
+                        // alloc: the error's message
                         .ok_or_else(|| corrupt(format!("its chunk {} is not in the store", chunk.0)))??;
                     if !matches!(piece.place.form(), Form::Raw | Form::Lz4 | Form::Zstd) {
+                        // alloc: the error's message
                         return Err(corrupt(format!("its chunk {} is not kept as a chunk", chunk.0)));
                     }
                     let (_, piece) = self.value(piece, &chunk, why)?;
                     if piece.len() as u64 != len {
+                        // alloc: the error's message
                         return Err(corrupt(format!("its chunk {} is of another length", chunk.0)));
                     }
                     if whole.is_empty() {
@@ -627,21 +657,25 @@ impl<'a> Look<'a> {
                         return Err(Corrupt { key: *key, pack: file, what: "it was not mapped".into() });
                     }
                     Err(None) => {
+                        // alloc: the error's message
                         return Err(corrupt(format!("its file {:x} is not in the head", header.content)));
                     }
                 },
             },
             Form::Dictionary => {
+                // alloc: the error's message
                 return Err(corrupt(format!("the record at {at} is a dictionary, not a value")));
             }
         };
         if bytes.len() as u64 != header.raw {
+            // alloc: the error's message
             return Err(corrupt(format!("it is {} bytes, not the {} recorded", bytes.len(), header.raw)));
         }
         let memo = !matches!(why, Use::Check);
         if !(memo && found.at.verified()) {
             let hashed = content_of(&bytes);
             if hashed != header.content {
+                // alloc: the error's message
                 return Err(corrupt(format!("its bytes hash to {hashed:x}, not the {:x} recorded", header.content)));
             }
             if memo {
@@ -727,6 +761,7 @@ impl<'a> Look<'a> {
         let entry = self.read(found, key)?;
         let bytes = match self.mapping_holding(found, &entry) {
             Some((mapping, start)) => PinnedBytes::Mapped { mapping, start, len: entry.bytes.len() },
+            // alloc: a value made whole and held past the task: one aligned copy per pin
             None => PinnedBytes::Copied(Arc::new(Aligned::copy_from(entry.bytes))),
         };
         Ok(Some(Pinned { key: entry.key, kind: entry.kind, content: entry.content, bytes }))

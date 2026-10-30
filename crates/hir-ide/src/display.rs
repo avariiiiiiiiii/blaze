@@ -1948,6 +1948,15 @@ impl SizedByDefault {
             }
         }
     }
+
+    /// A `?Sized` type has the implicit bound `MetaSized`, which rustc's printer without
+    /// `#![feature(sized_hierarchy)]` shows as the `?Sized` alone.
+    fn is_meta_sized_trait(self, trait_: TraitId, interner: DbInterner<'_>) -> bool {
+        match self {
+            Self::NotSized => false,
+            Self::Sized { .. } => Some(trait_) == interner.lang_items().MetaSized,
+        }
+    }
 }
 
 pub fn write_bounds_like_dyn_trait_with_prefix<'db>(
@@ -1996,6 +2005,9 @@ fn trait_bounds_need_parens<'db>(
                         continue;
                     }
                 }
+                if default_sized.is_meta_sized_trait(trait_, f.interner) {
+                    continue;
+                }
 
                 distinct_bounds += 1;
             }
@@ -2040,6 +2052,9 @@ fn write_bounds_like_dyn_trait<'db>(
                         // Don't print +Sized, but rather +?Sized if absent.
                         continue;
                     }
+                }
+                if default_sized.is_meta_sized_trait(trait_, f.interner) {
+                    continue;
                 }
                 if !is_fn_trait {
                     is_fn_trait = fn_traits(f.lang_items()).any(|it| it == trait_);

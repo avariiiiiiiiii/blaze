@@ -302,7 +302,7 @@ impl<'a> Names<'a> {
 
     pub fn iter(&self) -> impl Iterator<Item = &'a str> + 'a {
         let mut at = Cursor { bytes: self.bytes, at: 0 };
-        (0..self.count).map(move |_| at.string().expect("a name checked when its hello was read"))
+        (0..self.count).map(move |_| at.string("test name").expect("a name checked when its hello was read"))
     }
 }
 
@@ -480,32 +480,34 @@ impl<'a> View<'a> {
     /// The frame a body is, read in place, or why it is not one.
     pub fn decode(body: &'a [u8]) -> Result<View<'a>, String> {
         let mut at = Cursor { bytes: body, at: 0 };
-        let frame = match at.u8()? {
+        let frame = match at.u8("kind")? {
             HELLO => {
-                let version = at.u32()?;
-                let pid = at.u32()?;
-                let fork = at.u64()?;
-                let count = at.u32()?;
+                let version = at.u32("version")?;
+                let pid = at.u32("pid")?;
+                let fork = at.u64("fork time")?;
+                let count = at.u32("test count")?;
                 let from = at.at;
                 for _ in 0..count {
-                    at.string()?;
+                    at.string("test name")?;
                 }
                 View::Hello { version, pid, fork, tests: Names { count, bytes: &body[from..at.at] } }
             }
             ENDED => {
-                let id = at.u64()?;
-                let end = match at.u8()? {
-                    0 => EndView::Exited(at.u32()? as i32),
-                    1 => EndView::Signaled(at.u32()? as i32),
-                    2 => EndView::NotStarted(at.string()?),
+                let id = at.u64("run id")?;
+                let end = match at.u8("end kind")? {
+                    0 => EndView::Exited(at.u32("exit code")? as i32),
+                    1 => EndView::Signaled(at.u32("signal")? as i32),
+                    2 => EndView::NotStarted(at.string("reason it did not start")?),
                     other => return Err(format!("no end is of kind {}", other)), // alloc: error path
                 };
-                let output = at.bytes()?;
-                let executed = match at.u8()? {
+                let output = at.bytes("output")?;
+                let executed = match at.u8("execution record kind")? {
                     0 => {
-                        let slots = at.u32()?;
-                        let count = at.u32()? as usize;
-                        let bytes = at.take(count.checked_mul(4).ok_or_else(|| "a frame ends early".to_owned())?)?; // alloc: error path
+                        let slots = at.u32("slot count")?;
+                        let count = at.u32("hit count")? as usize;
+                        let hits = "slots hit";
+                        let len = count.checked_mul(4).ok_or_else(|| format!("a frame ends early, in its {}", hits))?; // alloc: error path
+                        let bytes = at.take(len, hits)?;
                         let hits = Hits(bytes);
                         let mut last: Option<u32> = None;
                         for hit in hits.iter() {
@@ -519,18 +521,18 @@ impl<'a> View<'a> {
                         }
                         ExecView::Hits { slots, hits }
                     }
-                    1 => ExecView::Not(at.string()?),
+                    1 => ExecView::Not(at.string("reason it has no execution record")?),
                     other => return Err(format!("no execution record is of kind {}", other)), // alloc: error path
                 };
                 View::Ended { id, end, output, executed }
             }
             RUN => {
-                let id = at.u64()?;
-                View::Run { id, index: at.u32()? }
+                let id = at.u64("run id")?;
+                View::Run { id, index: at.u32("test index")? }
             }
-            KILL => View::Kill { id: at.u64()? },
+            KILL => View::Kill { id: at.u64("run id")? },
             QUIT => View::Quit,
-            REPLICATE => View::Replicate { count: at.u32()? },
+            REPLICATE => View::Replicate { count: at.u32("replica count")? },
             other => return Err(format!("no frame is of kind {}", other)), // alloc: error path
         };
         match at.at == body.len() {
@@ -562,40 +564,42 @@ struct Cursor<'a> {
     at: usize,
 }
 
+/// Each read takes the name of the field it reads (`what`), which a frame too short for it is
+/// an error naming.
 impl<'a> Cursor<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+    fn take(&mut self, len: usize, what: &str) -> Result<&'a [u8], String> {
         if self.bytes.len() - self.at < len {
-            return Err("a frame ends early".to_owned()); // alloc: error path
+            return Err(format!("a frame ends early, in its {}", what)); // alloc: error path
         }
         let taken = &self.bytes[self.at..self.at + len];
         self.at += len;
         Ok(taken)
     }
 
-    fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
+    fn u8(&mut self, what: &str) -> Result<u8, String> {
+        Ok(self.take(1, what)?[0])
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
-        let b = self.take(4)?;
+    fn u32(&mut self, what: &str) -> Result<u32, String> {
+        let b = self.take(4, what)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn u64(&mut self) -> Result<u64, String> {
-        let b = self.take(8)?;
+    fn u64(&mut self, what: &str) -> Result<u64, String> {
+        let b = self.take(8, what)?;
         Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
     }
 
-    fn bytes(&mut self) -> Result<&'a [u8], String> {
-        let len = self.u32()? as usize;
-        self.take(len)
+    fn bytes(&mut self, what: &str) -> Result<&'a [u8], String> {
+        let len = self.u32(what)? as usize;
+        self.take(len, what)
     }
 
-    fn string(&mut self) -> Result<&'a str, String> {
-        let bytes = self.bytes()?;
+    fn string(&mut self, what: &str) -> Result<&'a str, String> {
+        let bytes = self.bytes(what)?;
         match ::std::str::from_utf8(bytes) {
             Ok(text) => Ok(text),
-            Err(_) => Err("a string of a frame is not UTF-8".to_owned()), // alloc: error path
+            Err(_) => Err(format!("the {} of a frame is not UTF-8", what)), // alloc: error path
         }
     }
 }

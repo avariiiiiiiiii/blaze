@@ -1,0 +1,23 @@
+{
+  "id": "00253",
+  "from_lane": "diagnostics-lints-names-items-speed",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## 3. For whoever owns `tools/v2/hot_lint.py`: cover `blaze-diagnostics`, and fix `crates`\n\nWhere: `tools/v2/hot_lint.py`.\n\nWhat: `{\"root\": \".\", \"crates\": [\"blaze-diagnostics\"]}` fails with\n`TypeError: typed_input: crates has a type it does not read: list[str]`, since `typed_input`\nreads `tuple[str, ...]` and not `list[str]`. Make `Input.crates` a `tuple[str, ...]`, and add\n`blaze-diagnostics` to `HOT` if the coordinator counts it as a hot crate.\n\nWhy: as it stands, the lint can't be run on this lane's paths.\n\n> forwarded to the coordinator (`tools/`), listed in requests' report.",
+  "state": "open",
+  "created": "2026-10-30T02:36:30Z",
+  "updated": "2026-10-30T02:36:30Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/diagnostics-lints-names-items-speed.md#3. For whoever owns `tools/v2/hot_lint.py`: cover `blaze-diagnostics`, and fix `crates`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/diagnostics-lints-names-items-speed.md:50"
+    }
+  ]
+}

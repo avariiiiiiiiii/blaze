@@ -17,15 +17,25 @@
 //! a cycle is [`Cancelled`] and its task posted again. [`build`] says a build's nodes:
 //! the workspace load, codegen with its store writes, links and test runs (docs/driver.md
 //! steps 4 to 7).
+//!
+//! Unsafe code is in [`exec`]'s slot table, [`pool`]'s jobs and queues and [`pump`]'s waiter
+//! lists (lock-free structures whose safe versions would take a lock or an `Arc` per job or
+//! waiter, each with model tests under `--cfg blaze_check`), and in `arena`'s allocator hook and
+//! the kernel calls of `arena` and [`topology`], each in a small module of its own.
+
+#![deny(unsafe_code)]
 
 pub mod admission;
 pub mod arena;
 pub mod build;
+#[allow(unsafe_code)]
 pub mod exec;
 pub mod history;
 pub mod machine;
 pub mod plane;
+#[allow(unsafe_code)]
 pub mod pool;
+#[allow(unsafe_code)]
 pub mod pump;
 mod sync;
 pub mod topology;

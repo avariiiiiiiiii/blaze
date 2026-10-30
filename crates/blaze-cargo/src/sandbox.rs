@@ -31,15 +31,25 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[allow(unsafe_code, reason = "a `link_section` constructor that runs a test's sandbox before `main`")]
 mod alone;
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code, reason = "the Linux driver: forks and closes by number; its calls are in `linux/raw.rs`")]
 pub mod linux;
 
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "the macOS driver: forks; its calls are in `macos/raw.rs`")]
 pub mod macos;
 
+#[cfg(unix)]
+#[allow(unsafe_code, reason = "`sigaction` and the handler's `kill`")]
+mod signal;
+#[cfg(unix)]
+pub use signal::pass_signals_to;
+
 #[cfg(windows)]
+#[allow(unsafe_code, reason = "the Win32 driver: AppContainers, job objects, DACLs, change watches")]
 pub mod windows;
 
 pub mod v2;
@@ -802,48 +812,6 @@ impl Recorder {
     pub fn incomplete(&mut self, thread: u64, why: &str) {
         self.note(Seen::Incomplete, self.scope_id(thread), why);
     }
-}
-
-/// The process group the signals the sandbox's own process is sent are passed on to: the
-/// program's session, which the terminal no longer sends them to. 0 for none.
-#[cfg(unix)]
-static GROUP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-#[cfg(unix)]
-extern "C" fn pass_on(signal: libc::c_int) {
-    let group = GROUP.load(std::sync::atomic::Ordering::Relaxed);
-    if group > 0 {
-        // SAFETY: `kill` takes integers only, reads no memory of this process and is
-        // async-signal-safe, so this handler may call it whatever the thread it interrupts
-        // holds; `group` is the program's group `pass_signals_to` stored, and 0 sends nothing.
-        unsafe { libc::kill(-group, signal) };
-    }
-}
-
-/// Has the signals a terminal or the caller ends a run with (`SIGINT`, `SIGTERM`, `SIGHUP`,
-/// `SIGQUIT`) passed on to the process group `group`, the program's session, rather than end
-/// the sandbox's own process, which then ends as the program does; 0 once the group is gone.
-/// The handlers are made the first time: a process that forks after keeps them until it runs
-/// a program, and passes nothing on.
-#[cfg(unix)]
-pub fn pass_signals_to(group: libc::pid_t) {
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
-    GROUP.store(group, std::sync::atomic::Ordering::Relaxed);
-    INSTALLED.call_once(|| {
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
-            // SAFETY: `sigaction` is integers, a mask of integers and a handler address, for
-            // which all-zero bytes are a valid value (no handler, no flags, an empty mask).
-            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-            action.sa_sigaction = pass_on as extern "C" fn(libc::c_int) as usize;
-            // SAFETY: `action.sa_mask` is a live `sigset_t` of this frame for the call to fill.
-            unsafe { libc::sigemptyset(&mut action.sa_mask) };
-            // SAFETY: `action` is live and whole for the call, and a null old action is
-            // allowed. Its handler `pass_on` only loads an atomic and calls `kill`, both
-            // async-signal-safe; a handler that allocated or locked could deadlock the
-            // process it interrupts.
-            unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
-        }
-    });
 }
 
 /// Whether `path` is `dir` or below it.

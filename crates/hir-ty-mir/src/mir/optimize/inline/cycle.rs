@@ -28,7 +28,7 @@ use super::{Attrs, fn_def, instantiate, is_generic, resolve, spans::owner_of};
 /// `const_eval_select` it is the function called at runtime.
 fn callees_of(body: &MirBody<'_>) -> Vec<(FunctionId, StoredGenericArgs)> {
     let mut seen = FxHashSet::default();
-    let mut callees = Vec::new();
+    let mut callees = Vec::new(); // alloc: the memoized query's stored result, once per body
     for (_, block) in body.basic_blocks.iter() {
         let Some(TerminatorKind::Call { func, args, intrinsic, .. }) =
             block.terminator.as_ref().map(|it| &it.kind)
@@ -55,7 +55,7 @@ pub(super) fn inliner_callees_of_fn(
 ) -> Vec<(FunctionId, StoredGenericArgs)> {
     match db.runtime_mir_body(func.into()) {
         Ok(body) => callees_of(body),
-        Err(_) => Vec::new(),
+        Err(_) => Vec::new(), // alloc: empty, allocates nothing
     }
 }
 
@@ -66,7 +66,7 @@ pub(super) fn inliner_callees_of_closure<'db>(
 ) -> Vec<(FunctionId, StoredGenericArgs)> {
     match db.runtime_mir_body_for_closure(closure) {
         Ok(body) => callees_of(body),
-        Err(_) => Vec::new(),
+        Err(_) => Vec::new(), // alloc: empty, allocates nothing
     }
 }
 
@@ -106,6 +106,7 @@ fn key(body: &InlinedBody<'_>) -> (bool, salsa::Id) {
 impl<'db> Callgraph<'db> {
     fn new(walked: Walked<InlinedBody<'db>>) -> Self {
         let sorted = |set: FxHashSet<InlinedBody<'db>>| {
+            // alloc: the memoized query's stored result, once per root
             let mut list: Vec<_> = set.into_iter().collect();
             list.sort_unstable_by_key(key);
             list
@@ -230,6 +231,7 @@ where
     let mut recursion: FxHashMap<B, usize> = FxHashMap::default();
     let mut graph = Walked { cyclic: FxHashSet::default(), reached: FxHashSet::default() };
     let mut stack =
+        // alloc: one stack per memoized walk of a root, not per node
         vec![Frame { node: start, callees: callees(start).into(), next: 0, reaches: false }];
     while let Some(frame) = stack.last_mut() {
         let Some(&(callee, has_mir)) = frame.callees.get(frame.next) else {

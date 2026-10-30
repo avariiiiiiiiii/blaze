@@ -101,7 +101,7 @@ pub(crate) fn with<T>(build: Build, work: impl FnOnce() -> T) -> Result<T, Strin
     if !read {
         return Err("the IR builder did not read the unit's settings (`v2::build::building`), \
                     so it built the function with the crate's"
-            .to_owned());
+            .to_owned()); // alloc: the error's message
     }
     Ok(out)
 }

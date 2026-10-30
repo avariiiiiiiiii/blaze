@@ -101,6 +101,24 @@ fn a_mapping_keeps_its_bytes_when_another_file_is_renamed_over_it() {
     assert_eq!(unsafe { Mapped::open(&path) }.unwrap().bytes(), b"second image, longer");
 }
 
+/// The length is the one taken at map time: a file that grows after shows none of what was
+/// added, and every read stays below that length.
+#[test]
+fn a_mapping_keeps_its_length_when_the_file_grows() {
+    use std::io::Write as _;
+    let dir = dir("grows");
+    let path = dir.join("pack");
+    std::fs::write(&path, pattern(5000, 11)).unwrap();
+    // SAFETY: the file is only appended to below, past the mapped length, so no byte under the
+    // slice changes; it is never written in place or cut.
+    let mapped = unsafe { Mapped::open(&path) }.unwrap();
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&pattern(9000, 12)).unwrap();
+    assert_eq!(mapped.len(), 5000);
+    assert_eq!(mapped.bytes(), &pattern(5000, 11)[..]);
+    assert!(mapped.get(5000).is_none());
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 14_000);
+}
+
 #[test]
 fn reading_a_mapping_allocates_nothing() {
     let dir = dir("alloc");

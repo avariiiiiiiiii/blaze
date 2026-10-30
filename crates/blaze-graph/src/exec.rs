@@ -58,10 +58,12 @@ pub struct Did {
 
 impl Did {
     pub fn built() -> Did {
+        // alloc: empty, allocates nothing
         Did { outcome: Outcome::Built, added: Vec::new() }
     }
 
     pub fn failed(why: impl Into<String>) -> Did {
+        // alloc: empty, allocates nothing
         Did { outcome: Outcome::Failed { why: why.into() }, added: Vec::new() }
     }
 }
@@ -125,7 +127,7 @@ where
     let over = workers.pool().scope(|jobs| {
         io.pool().scope(|waits| {
             let post = |id: NodeId, at: Pool| {
-                let (done_tx, failed, now) = (done_tx.clone(), &failed, &now);
+                let (done_tx, failed, now) = (&done_tx, &failed, &now);
                 let done = move |did: thread::Result<Did>| {
                     _ = done_tx.send((id, did.unwrap_or_else(failed), now()));
                 };
@@ -168,6 +170,7 @@ where
 {
     let mut feed = |input: Input| -> Result<Option<bool>, Error> {
         if let Some(trace) = trace.as_deref_mut() {
+            // clone: only when the caller asked for a trace, to replay the build
             trace.push(input.clone());
         }
         let mut over = None;
@@ -196,6 +199,7 @@ where
 
 /// The pools no [`drive`] is using, each kept for the next build of its size, so a build
 /// starts no thread once one of its size has run. Taken only to take or give back a pool.
+// alloc: empty, allocates nothing; a pool's entry is pushed once per pool size
 static SPARE: Lock<Vec<Workers>> = Lock::new(Vec::new());
 
 /// A pool of `workers` threads that only one [`drive`] uses, handed back to [`SPARE`] when
@@ -238,6 +242,7 @@ fn panicked(panic: &(dyn Any + Send)) -> String {
         .copied()
         .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("a panic with no message");
+    // alloc: the failure's message
     format!("panicked: {what}")
 }
 
@@ -286,7 +291,7 @@ pub struct Opened {
 enum Msg<W> {
     Open { request: RequestId, weight: u32, keep_going: bool, heard: Sender<Heard> },
     Add { request: RequestId, tasks: Vec<Task<W>> },
-    Found { request: RequestId, tasks: Vec<Task<W>> },
+    Found { request: RequestId, works: Vec<FoundWork<W>> },
     Close { request: RequestId },
     Cancel { request: RequestId },
     Done {
@@ -309,6 +314,14 @@ enum Msg<W> {
     #[cfg(test)]
     Slots { reply: Sender<usize> },
     Stop,
+}
+
+/// What the owner keeps of a found [`Task`]: its spec goes back to the task that found it.
+struct FoundWork<W> {
+    id: NodeId,
+    key: Option<Key>,
+    kind: TaskKind,
+    work: W,
 }
 
 /// What every run of a scheduler reaches besides its slot. Leaked as the scheduler is made: a
@@ -614,6 +627,7 @@ pub struct Handle<W> {
 
 impl<W> Clone for Handle<W> {
     fn clone(&self) -> Handle<W> {
+        // clone: a sender and a counter, once per holder of a handle, never per task
         Handle { tx: self.tx.clone(), next: Arc::clone(&self.next) }
     }
 }
@@ -640,8 +654,13 @@ impl<W> Handle<W> {
     /// that task's work on its own thread before it returns; what it gives back goes in the
     /// task's [`Did::added`]. A request closed takes new nodes only so.
     pub fn found(&self, request: RequestId, tasks: Vec<Task<W>>) -> Vec<Spec> {
-        let specs = tasks.iter().map(|it| it.spec.clone()).collect();
-        _ = self.tx.send(Msg::Found { request, tasks });
+        let mut specs = Vec::with_capacity(tasks.len());
+        let mut works = Vec::with_capacity(tasks.len());
+        for Task { spec, kind, work } in tasks {
+            works.push(FoundWork { id: spec.id, key: spec.key, kind, work });
+            specs.push(spec);
+        }
+        _ = self.tx.send(Msg::Found { request, works });
         specs
     }
 
@@ -765,8 +784,10 @@ impl<W: Send + 'static> Scheduler<W> {
         let (io_tx, io_rx) = bounded::<Option<Ran<R>>>(MAX_RUNS as usize + io_threads);
         let io = (0..io_threads)
             .map(|at| {
+                // clone: once per IO thread, setup
                 let io_rx = io_rx.clone();
                 thread::Builder::new()
+                    // alloc: a thread's name, once per IO thread
                     .name(format!("blaze-io-{at}"))
                     .spawn(move || {
                         // Ends when the owner, its runs over, says so.
@@ -776,10 +797,13 @@ impl<W: Send + 'static> Scheduler<W> {
                     })
                     .unwrap_or_else(|why| panic!("an IO thread of the scheduler: {why}"))
             })
+            // alloc: the IO threads, once per scheduler
             .collect();
         let slots = blaze_mem::Pool::new(MAX_RUNS, MemTag::Plane)
             .unwrap_or_else(|why| panic!("the scheduler's run slots: {why}"));
+        // alloc: the runs' context, once per scheduler and leaked (see `Ctx`)
         let ctx: &'static Ctx<R> = Box::leak(Box::new(Ctx {
+            // clone: once per scheduler, setup
             tx: tx.clone(),
             io: io_tx,
             pool,
@@ -803,10 +827,12 @@ impl<W: Send + 'static> Scheduler<W> {
             io_threads,
         };
         let owner = thread::Builder::new()
+            // alloc: a thread's name, once per scheduler
             .name("blaze-plane".to_owned())
             .spawn(move || owner.serve(&rx))
             .unwrap_or_else(|why| panic!("the scheduler's owner thread: {why}"));
         Ok(Scheduler {
+            // alloc: the request counter, once per scheduler
             handle: Handle { tx, next: Arc::new(AtomicU32::new(0)) },
             owner: Some(owner),
             io,
@@ -814,6 +840,7 @@ impl<W: Send + 'static> Scheduler<W> {
     }
 
     pub fn handle(&self) -> Handle<W> {
+        // clone: once per holder of a handle, never per task
         self.handle.clone()
     }
 
@@ -927,6 +954,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                     // Its room in the plane is given back once it finishes; after that a step
                     // naming it is refused as `UnknownRequest`.
                     let released = self.plane.release(request);
+                    // alloc: empty, allocates nothing
                     self.outputs(request, released.map(|()| Vec::new()));
                 } else {
                     self.heard.remove(&request);
@@ -951,12 +979,11 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                     }
                 }
             }
-            Msg::Found { request, tasks } => {
-                for Task { spec, kind, work } in tasks {
+            Msg::Found { request, works } => {
+                for FoundWork { id, key, kind, work } in works {
                     // Found again by a task posted again: the first keeps its work.
-                    let key = spec.key;
                     let entry = Entry { request, kind, key, work: Some(work) };
-                    self.works.entry(spec.id).or_insert(entry);
+                    self.works.entry(id).or_insert(entry);
                 }
             }
             Msg::Close { request } => _ = self.step(request, PlaneInput::Close { at_ns, request }),
@@ -978,6 +1005,7 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                 });
                 if let Some(found) = workless {
                     outcome = Outcome::Failed {
+                        // alloc: the failure's message
                         why: format!(
                             "node {found} found by node {id} has no work: a scheduler's task \
                              gives the work of what it finds with `Handle::found`"
@@ -993,8 +1021,10 @@ impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
                 let input = PlaneInput::Done { at_ns, id, outcome, added, group, peak };
                 if !self.step(request, input) {
                     // What it found could not be added: the node fails rather than run forever.
+                    // alloc: the failure's message
                     let why = format!("what node {id} found could not be added to {request}");
                     let outcome = Outcome::Failed { why };
+                    // alloc: empty, allocates nothing
                     let input = PlaneInput::Done { at_ns, id, outcome, added: Vec::new(), group, peak };
                     self.step(request, input);
                 }

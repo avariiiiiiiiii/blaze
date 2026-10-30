@@ -52,7 +52,7 @@ pub fn call_const_macro<'db>(
             MacroArg::Str(text) => write_str(&mut evaluator, text)?,
             MacroArg::Item(input) => write_item(&mut evaluator, input)?,
         };
-        values.push(IntervalOrOwned::Owned(OwnedBytes::from_vec(value)));
+        values.push(IntervalOrOwned::Owned(value));
     }
     let result = evaluator.interpret_mir(body, values.into_iter(), None)?;
     read_string(&evaluator, result)
@@ -70,21 +70,21 @@ fn allocate<'db>(
 }
 
 /// A slice's two words: where it starts and its length.
-fn fat(addr: Address, len: usize) -> Vec<u8> {
-    let mut bytes = addr.to_bytes().to_vec();
+fn fat(addr: Address, len: usize) -> OwnedBytes {
+    let mut bytes = OwnedBytes::from_slice(&addr.to_bytes());
     bytes.extend_from_slice(&word_bytes(len));
     bytes
 }
 
 /// `text` in the heap, as a `&str`.
-fn write_str<'db>(evaluator: &mut Evaluator<'db>, text: &str) -> Result<'db, Vec<u8>> {
+fn write_str<'db>(evaluator: &mut Evaluator<'db>, text: &str) -> Result<'db, OwnedBytes> {
     Ok(fat(allocate(evaluator, text.as_bytes(), 1)?, text.len()))
 }
 
 /// `input` in the heap, as a `&const_ast::Item`: its arrays, the `Tree` of them (`repr(C)`,
 /// four slices), and the `Item` (`repr(transparent)` over a `Node`, `repr(C)`: a reference to
 /// the tree and the element's number), and the reference to that.
-fn write_item<'db>(evaluator: &mut Evaluator<'db>, input: &FlatInput) -> Result<'db, Vec<u8>> {
+fn write_item<'db>(evaluator: &mut Evaluator<'db>, input: &FlatInput) -> Result<'db, OwnedBytes> {
     let len = input.kinds.len();
     if len == 0
         || [input.ends.len(), input.spans.len(), input.text_ends.len()].iter().any(|&it| it != len)
@@ -94,9 +94,6 @@ fn write_item<'db>(evaluator: &mut Evaluator<'db>, input: &FlatInput) -> Result<
         ));
     }
     let ptr_size = evaluator.ptr_size();
-    let kinds: Vec<u8> = input.kinds.iter().flat_map(|it| it.to_le_bytes()).collect();
-    let ends: Vec<u8> = input.ends.iter().flat_map(|it| it.to_le_bytes()).collect();
-    let spans: Vec<u8> = input.spans.iter().flat_map(|it| it.to_le_bytes()).collect();
     let text = allocate(evaluator, input.text.as_bytes(), 1)?;
     let mut texts = Vec::with_capacity(len * 2 * ptr_size);
     let mut start = 0;
@@ -107,18 +104,26 @@ fn write_item<'db>(evaluator: &mut Evaluator<'db>, input: &FlatInput) -> Result<
                 "a const macro's flat tree has a token past its text".into(),
             ));
         }
-        texts.extend(fat(text.offset(from), to - from));
+        texts.extend_from_slice(&fat(text.offset(from), to - from));
         start = end;
     }
-    let mut tree = fat(allocate(evaluator, &kinds, 2)?, len);
-    tree.extend(fat(allocate(evaluator, &ends, 4)?, len));
-    tree.extend(fat(allocate(evaluator, &spans, 4)?, len));
-    tree.extend(fat(allocate(evaluator, &texts, ptr_size)?, len));
+    // The arrays' bytes, each built in `scratch` just before it is allocated.
+    let mut scratch = Vec::with_capacity(len * 4);
+    scratch.extend(input.kinds.iter().flat_map(|it| it.to_le_bytes()));
+    let mut tree = Vec::with_capacity(8 * ptr_size);
+    tree.extend_from_slice(&fat(allocate(evaluator, &scratch, 2)?, len));
+    scratch.clear();
+    scratch.extend(input.ends.iter().flat_map(|it| it.to_le_bytes()));
+    tree.extend_from_slice(&fat(allocate(evaluator, &scratch, 4)?, len));
+    scratch.clear();
+    scratch.extend(input.spans.iter().flat_map(|it| it.to_le_bytes()));
+    tree.extend_from_slice(&fat(allocate(evaluator, &scratch, 4)?, len));
+    tree.extend_from_slice(&fat(allocate(evaluator, &texts, ptr_size)?, len));
     let tree = allocate(evaluator, &tree, ptr_size)?;
-    let mut item = tree.to_bytes().to_vec();
+    let mut item = OwnedBytes::from_slice(&tree.to_bytes());
     item.extend_from_slice(&input.item.to_le_bytes());
     item.resize(2 * ptr_size, 0);
-    Ok(allocate(evaluator, &item, ptr_size)?.to_bytes().to_vec())
+    Ok(OwnedBytes::from_slice(&allocate(evaluator, &item, ptr_size)?.to_bytes()))
 }
 
 /// The text of a `String` (or anything laid out as one: a pointer to its bytes, its capacity
@@ -141,7 +146,7 @@ fn read_string<'db>(evaluator: &Evaluator<'db>, value: Interval) -> Result<'db, 
         words.iter().map(|&it| Address::from_usize(it)).find(|it| matches!(it.at(), Heap(_)))
     else {
         // An empty `String` holds a dangling pointer, not one into the heap.
-        return Ok(String::new());
+        return Ok(String::new()); // alloc: empty, allocates nothing
     };
     // The capacity is at least the length.
     let len = words
@@ -151,7 +156,7 @@ fn read_string<'db>(evaluator: &Evaluator<'db>, value: Interval) -> Result<'db, 
         .min()
         .unwrap_or(0);
     let text = evaluator.read_memory(addr, len)?;
-    String::from_utf8(text.to_vec()).map_err(|_| {
+    String::from_utf8(text.to_vec()).map_err(|_| { // alloc: the macro's output, returned
         MirEvalError::UndefinedBehavior(
             "a const macro returned a `String` that is not UTF-8".into(),
         )

@@ -7,6 +7,14 @@
 //! Files are compared mapped, in place: no copy into a buffer, no read per megabyte. A short
 //! tail is compared by one last vector that overlaps the bytes already found equal, so no path
 //! drops to a byte loop except on inputs shorter than one vector.
+//!
+//! Unsafe is the vector loads (and the map of [`Mapped`]): a load reads the bytes at a pointer
+//! the loop bound keeps in both slices; the offsets themselves are safe `wrapping_add`s. The
+//! safe version, `==` over fixed pieces (libc's `bcmp`) and then [`scalar`] in the piece that
+//! differs, reads that piece twice and pays a call and a byte loop per difference: one pass
+//! more over up to a piece, and on short outputs, most of what the oracle compares, the call
+//! and the byte loop are the whole cost. `scalar` is the reference every path is tested against
+//! (`tests.rs`, and the tests below).
 
 #![allow(unsafe_code)]
 
@@ -140,20 +148,17 @@ unsafe fn avx512(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     let mut at = 0;
     while at + 256 <= n {
-        // SAFETY: `at + 256 <= n`, the length of both slices, so `at` is inside both.
-        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // `at + 256 <= n`, the length of both slices, so `at` is inside both.
+        let (a0, b0) = (pa.wrapping_add(at), pb.wrapping_add(at));
         // SAFETY: the 64 bytes from each end at or before `at + 256 <= n`.
         let m0 = unsafe { differ(a0, b0) };
-        // SAFETY: as above.
-        let (a1, b1) = (unsafe { pa.add(at + 64) }, unsafe { pb.add(at + 64) });
+        let (a1, b1) = (pa.wrapping_add(at + 64), pb.wrapping_add(at + 64));
         // SAFETY: as above.
         let m1 = unsafe { differ(a1, b1) };
-        // SAFETY: as above.
-        let (a2, b2) = (unsafe { pa.add(at + 128) }, unsafe { pb.add(at + 128) });
+        let (a2, b2) = (pa.wrapping_add(at + 128), pb.wrapping_add(at + 128));
         // SAFETY: as above.
         let m2 = unsafe { differ(a2, b2) };
-        // SAFETY: as above.
-        let (a3, b3) = (unsafe { pa.add(at + 192) }, unsafe { pb.add(at + 192) });
+        let (a3, b3) = (pa.wrapping_add(at + 192), pb.wrapping_add(at + 192));
         // SAFETY: as above.
         let m3 = unsafe { differ(a3, b3) };
         let m = [m0, m1, m2, m3];
@@ -164,8 +169,8 @@ unsafe fn avx512(a: &[u8], b: &[u8]) -> Option<usize> {
         at += 256;
     }
     while at + 64 <= n {
-        // SAFETY: `at + 64 <= n`, so `at` is inside both slices.
-        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // `at + 64 <= n`, so `at` is inside both slices.
+        let (a0, b0) = (pa.wrapping_add(at), pb.wrapping_add(at));
         // SAFETY: the 64 bytes from each end at or before `n`.
         let m = unsafe { differ(a0, b0) };
         if m != 0 {
@@ -175,8 +180,8 @@ unsafe fn avx512(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     if at < n {
         let last = n - 64;
-        // SAFETY: `n >= 64`, so `last + 64 == n` and `last` is inside both slices.
-        let (a0, b0) = (unsafe { pa.add(last) }, unsafe { pb.add(last) });
+        // `n >= 64`, so `last + 64 == n` and `last` is inside both slices.
+        let (a0, b0) = (pa.wrapping_add(last), pb.wrapping_add(last));
         // SAFETY: the 64 bytes from each end at `n`.
         let m = unsafe { differ(a0, b0) };
         if m != 0 {
@@ -214,20 +219,17 @@ unsafe fn avx2(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     let mut at = 0;
     while at + 128 <= n {
-        // SAFETY: `at + 128 <= n`, the length of both slices, so `at` is inside both.
-        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // `at + 128 <= n`, the length of both slices, so `at` is inside both.
+        let (a0, b0) = (pa.wrapping_add(at), pb.wrapping_add(at));
         // SAFETY: the 32 bytes from each end at or before `at + 128 <= n`.
         let m0 = unsafe { same(a0, b0) };
-        // SAFETY: as above.
-        let (a1, b1) = (unsafe { pa.add(at + 32) }, unsafe { pb.add(at + 32) });
+        let (a1, b1) = (pa.wrapping_add(at + 32), pb.wrapping_add(at + 32));
         // SAFETY: as above.
         let m1 = unsafe { same(a1, b1) };
-        // SAFETY: as above.
-        let (a2, b2) = (unsafe { pa.add(at + 64) }, unsafe { pb.add(at + 64) });
+        let (a2, b2) = (pa.wrapping_add(at + 64), pb.wrapping_add(at + 64));
         // SAFETY: as above.
         let m2 = unsafe { same(a2, b2) };
-        // SAFETY: as above.
-        let (a3, b3) = (unsafe { pa.add(at + 96) }, unsafe { pb.add(at + 96) });
+        let (a3, b3) = (pa.wrapping_add(at + 96), pb.wrapping_add(at + 96));
         // SAFETY: as above.
         let m3 = unsafe { same(a3, b3) };
         let m = [m0, m1, m2, m3];
@@ -238,8 +240,8 @@ unsafe fn avx2(a: &[u8], b: &[u8]) -> Option<usize> {
         at += 128;
     }
     while at + 32 <= n {
-        // SAFETY: `at + 32 <= n`, so `at` is inside both slices.
-        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // `at + 32 <= n`, so `at` is inside both slices.
+        let (a0, b0) = (pa.wrapping_add(at), pb.wrapping_add(at));
         // SAFETY: the 32 bytes from each end at or before `n`.
         let m = unsafe { same(a0, b0) };
         if m != u32::MAX {
@@ -249,8 +251,8 @@ unsafe fn avx2(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     if at < n {
         let last = n - 32;
-        // SAFETY: `n >= 32`, so `last + 32 == n` and `last` is inside both slices.
-        let (a0, b0) = (unsafe { pa.add(last) }, unsafe { pb.add(last) });
+        // `n >= 32`, so `last + 32 == n` and `last` is inside both slices.
+        let (a0, b0) = (pa.wrapping_add(last), pb.wrapping_add(last));
         // SAFETY: the 32 bytes from each end at `n`.
         let m = unsafe { same(a0, b0) };
         if m != u32::MAX {
@@ -288,20 +290,17 @@ unsafe fn sse2(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     let mut at = 0;
     while at + 64 <= n {
-        // SAFETY: `at + 64 <= n`, the length of both slices, so `at` is inside both.
-        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // `at + 64 <= n`, the length of both slices, so `at` is inside both.
+        let (a0, b0) = (pa.wrapping_add(at), pb.wrapping_add(at));
         // SAFETY: the 16 bytes from each end at or before `at + 64 <= n`.
         let m0 = unsafe { same(a0, b0) };
-        // SAFETY: as above.
-        let (a1, b1) = (unsafe { pa.add(at + 16) }, unsafe { pb.add(at + 16) });
+        let (a1, b1) = (pa.wrapping_add(at + 16), pb.wrapping_add(at + 16));
         // SAFETY: as above.
         let m1 = unsafe { same(a1, b1) };
-        // SAFETY: as above.
-        let (a2, b2) = (unsafe { pa.add(at + 32) }, unsafe { pb.add(at + 32) });
+        let (a2, b2) = (pa.wrapping_add(at + 32), pb.wrapping_add(at + 32));
         // SAFETY: as above.
         let m2 = unsafe { same(a2, b2) };
-        // SAFETY: as above.
-        let (a3, b3) = (unsafe { pa.add(at + 48) }, unsafe { pb.add(at + 48) });
+        let (a3, b3) = (pa.wrapping_add(at + 48), pb.wrapping_add(at + 48));
         // SAFETY: as above.
         let m3 = unsafe { same(a3, b3) };
         let m = [m0, m1, m2, m3];
@@ -312,8 +311,8 @@ unsafe fn sse2(a: &[u8], b: &[u8]) -> Option<usize> {
         at += 64;
     }
     while at + 16 <= n {
-        // SAFETY: `at + 16 <= n`, so `at` is inside both slices.
-        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // `at + 16 <= n`, so `at` is inside both slices.
+        let (a0, b0) = (pa.wrapping_add(at), pb.wrapping_add(at));
         // SAFETY: the 16 bytes from each end at or before `n`.
         let m = unsafe { same(a0, b0) };
         if m != u16::MAX {
@@ -323,8 +322,8 @@ unsafe fn sse2(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     if at < n {
         let last = n - 16;
-        // SAFETY: `n >= 16`, so `last + 16 == n` and `last` is inside both slices.
-        let (a0, b0) = (unsafe { pa.add(last) }, unsafe { pb.add(last) });
+        // `n >= 16`, so `last + 16 == n` and `last` is inside both slices.
+        let (a0, b0) = (pa.wrapping_add(last), pb.wrapping_add(last));
         // SAFETY: the 16 bytes from each end at `n`.
         let m = unsafe { same(a0, b0) };
         if m != u16::MAX {
@@ -370,20 +369,17 @@ unsafe fn neon(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     let mut at = 0;
     while at + 64 <= n {
-        // SAFETY: `at + 64 <= n`, the length of both slices, so `at` is inside both.
-        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // `at + 64 <= n`, the length of both slices, so `at` is inside both.
+        let (a0, b0) = (pa.wrapping_add(at), pb.wrapping_add(at));
         // SAFETY: the 16 bytes from each end at or before `at + 64 <= n`.
         let e0 = unsafe { eq(a0, b0) };
-        // SAFETY: as above.
-        let (a1, b1) = (unsafe { pa.add(at + 16) }, unsafe { pb.add(at + 16) });
+        let (a1, b1) = (pa.wrapping_add(at + 16), pb.wrapping_add(at + 16));
         // SAFETY: as above.
         let e1 = unsafe { eq(a1, b1) };
-        // SAFETY: as above.
-        let (a2, b2) = (unsafe { pa.add(at + 32) }, unsafe { pb.add(at + 32) });
+        let (a2, b2) = (pa.wrapping_add(at + 32), pb.wrapping_add(at + 32));
         // SAFETY: as above.
         let e2 = unsafe { eq(a2, b2) };
-        // SAFETY: as above.
-        let (a3, b3) = (unsafe { pa.add(at + 48) }, unsafe { pb.add(at + 48) });
+        let (a3, b3) = (pa.wrapping_add(at + 48), pb.wrapping_add(at + 48));
         // SAFETY: as above.
         let e3 = unsafe { eq(a3, b3) };
         let e = [e0, e1, e2, e3];
@@ -399,8 +395,8 @@ unsafe fn neon(a: &[u8], b: &[u8]) -> Option<usize> {
         at += 64;
     }
     while at + 16 <= n {
-        // SAFETY: `at + 16 <= n`, so `at` is inside both slices.
-        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // `at + 16 <= n`, so `at` is inside both slices.
+        let (a0, b0) = (pa.wrapping_add(at), pb.wrapping_add(at));
         // SAFETY: the 16 bytes from each end at or before `n`.
         let m = same(unsafe { eq(a0, b0) });
         if m != u64::MAX {
@@ -410,8 +406,8 @@ unsafe fn neon(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     if at < n {
         let last = n - 16;
-        // SAFETY: `n >= 16`, so `last + 16 == n` and `last` is inside both slices.
-        let (a0, b0) = (unsafe { pa.add(last) }, unsafe { pb.add(last) });
+        // `n >= 16`, so `last + 16 == n` and `last` is inside both slices.
+        let (a0, b0) = (pa.wrapping_add(last), pb.wrapping_add(last));
         // SAFETY: the 16 bytes from each end at `n`.
         let m = same(unsafe { eq(a0, b0) });
         if m != u64::MAX {

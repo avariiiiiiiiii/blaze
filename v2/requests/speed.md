@@ -479,3 +479,19 @@ until pushed to, so reporting them (an `Evaluator::new` has 20 such fields) hide
 Where: `tools/v2/hot_lint.py:28`.
 
 > forwarded to the coordinator (`tools/`): on requests' coordinator list (requests, pass 22).
+
+## speed-unsafe-back-run (2026-10-30): `Cargo.lock` for blaze-live's model tests
+
+- `crates/blaze-live/Cargo.toml` (this lane's) gained
+  `[target.'cfg(blaze_check)'.dev-dependencies] blaze-check.workspace = true`, for the new
+  `slots/model.rs` model tests of the jump table's publish protocol, and a `fuzz = []` feature.
+  `Cargo.lock`: add `"blaze-check"` to `blaze-live`'s `dependencies` (between
+  `"blaze-alloc-count"` and `"blaze-ids"`). `blaze-check` is already a workspace dependency and
+  depends on no workspace crate, so no cycle.
+- Asked of others, each needing its own `Cargo.lock` line when applied: `blaze-cargo` gains
+  `blaze-check` (cfg(blaze_check)) in `v2/requests/cargo.md`; the fuzz package gains
+  `blaze-live` (feature `fuzz`) in `v2/requests/safety.md`.
+
+Status: open
+
+> forwarded to the coordinator: `Cargo.lock` is its; on requests' lock additions (`blaze-live` -> `blaze-check`, `blaze-cargo` -> `blaze-check`, the fuzz package -> `blaze-live`).

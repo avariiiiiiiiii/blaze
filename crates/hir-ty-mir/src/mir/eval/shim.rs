@@ -358,12 +358,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let mut args = args.iter();
         match it {
             BeginPanic => {
-                let mut arg = args
-                    .next()
-                    .ok_or(MirEvalError::InternalError(
-                        "argument of BeginPanic is not provided".into(),
-                    ))?
-                    .clone();
+                let mut arg = *args.next().ok_or(MirEvalError::InternalError(
+                    "argument of BeginPanic is not provided".into(),
+                ))?;
                 while let TyKind::Ref(_, ty, _) = arg.ty.kind() {
                     if ty.is_str() {
                         let (pointee, metadata) = arg.interval.get(self)?.split_at(self.ptr_size());
@@ -375,7 +372,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                     self.read_memory(Address::from_bytes(pointee)?, len)?,
                                 )
                                 .unwrap()
-                                .to_owned(),
+                                .to_owned(), // alloc: the panic's message, error path
                             ))
                         };
                     }
@@ -407,10 +404,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     "argument of drop_in_place is not provided".into(),
                 ))?;
                 let addr = self.read_pointer(arg.interval.addr)?;
-                let metadata = arg.interval.get(self)?[self.ptr_size()..].to_vec();
+                let metadata = OwnedBytes::from_slice(&arg.interval.get(self)?[self.ptr_size()..]);
                 let then = self.call_then;
                 self.pending = self.run_drop_glue(ty, locals, addr, &metadata, span, then)?;
-                Ok(vec![])
+                Ok(Vec::new()) // alloc: empty, allocates nothing
             }
         }
     }
@@ -545,7 +542,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let [name] = args else {
                     return Err(MirEvalError::InternalError("getenv args are not provided".into()));
                 };
-                let mut name_buf = vec![];
+                let mut name_buf = Vec::new(); // alloc: `getenv`'s name, a shim of the edge
                 let name = {
                     let mut index = Address::from_bytes(name.get(self)?)?;
                     loop {
@@ -556,7 +553,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         }
                         name_buf.push(byte);
                     }
-                    String::from_utf8_lossy(&name_buf)
+                    String::from_utf8_lossy(&name_buf) // alloc: borrows unless not UTF-8
                 };
                 let value = self.crate_id.env(self.db).get(&name);
                 match value {
@@ -925,7 +922,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     };
                     (ans, overflow || ans.to_le_bytes()[op_size..].iter().any(|&it| it != 0))
                 };
-                let is_overflow = smallvec::smallvec![u8::from(is_overflow)];
+                let is_overflow = OwnedBytes::from_slice(&[u8::from(is_overflow)]);
                 let layout = self.layout(result_ty)?;
                 let result = self.construct_with_layout(
                     layout.size.bytes_usize(),
@@ -1092,7 +1089,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError("bswap arg is not provided".into()));
                 };
-                let mut result = arg.get(self)?.to_vec();
+                let mut result = OwnedBytes::from_slice(arg.get(self)?);
                 result.reverse();
                 destination.write_from_bytes(self, &result)
             }
@@ -1102,7 +1099,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "bitreverse arg is not provided".into(),
                     ));
                 };
-                let mut result = arg.get(self)?.to_vec();
+                let mut result = OwnedBytes::from_slice(arg.get(self)?);
                 result.reverse();
                 for byte in &mut result {
                     *byte = byte.reverse_bits();
@@ -1234,7 +1231,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "const_eval_select args are not provided".into(),
                     ));
                 };
-                let mut args = vec![*const_fn];
+                let mut args: smallvec::SmallVec<[IntervalAndTy<'db>; 4]> = smallvec::SmallVec::new();
+                args.push(*const_fn);
                 let TyKind::Tuple(fields) = tuple.ty.kind() else {
                     return Err(MirEvalError::InternalError(
                         "const_eval_select arg[0] is not a tuple".into(),
@@ -1375,7 +1373,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "ptr_metadata args are not provided".into(),
                     ));
                 };
-                let arg = ptr.interval.get(self)?.to_owned();
+                let arg = OwnedBytes::from_slice(ptr.interval.get(self)?);
                 let metadata = &arg[self.ptr_size()..];
                 destination.write_from_bytes(self, metadata)?;
                 Ok(())
@@ -1445,7 +1443,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "fabs intrinsic signature doesn't match fn (T) -> T".into(),
                     ));
                 };
-                let mut bytes = arg.get(self)?.to_vec();
+                let mut bytes = OwnedBytes::from_slice(arg.get(self)?);
                 if let Some(sign_byte) = bytes.last_mut() {
                     *sign_byte &= 0x7f;
                 }
@@ -1701,7 +1699,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let amount =
                 if signed(rhs) { int(rhs)? } else { uint(rhs)?.min(i128::MAX as u128) as i128 };
             if amount < 0 || amount >= i128::from(bits) {
-                return ub(format!("overflowing shift by {amount} in `{intrinsic}`"));
+                return ub(format!("overflowing shift by {amount} in `{intrinsic}`")); // alloc: error path
             }
             return Ok(match (intrinsic, signed(lhs)) {
                 (Intrinsic::UncheckedShl, _) => uint(lhs)? << amount,
@@ -1709,12 +1707,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 _ => uint(lhs)? >> amount,
             });
         }
-        let overflow = || format!("arithmetic overflow in `{intrinsic}`");
+        let overflow = || format!("arithmetic overflow in `{intrinsic}`"); // alloc: error path
         let by_zero = || match intrinsic {
             Intrinsic::UncheckedRem => {
-                "calculating the remainder with a divisor of zero".to_owned()
+                "calculating the remainder with a divisor of zero".to_owned() // alloc: error path
             }
-            _ => "dividing by zero".to_owned(),
+            _ => "dividing by zero".to_owned(), // alloc: error path
         };
         if signed(lhs) {
             let (a, b) = (int(lhs)?, int(rhs)?);
@@ -1726,6 +1724,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 _ if b == 0 => return ub(by_zero()),
                 _ if a == min && b == -1 => return ub(overflow()),
                 Intrinsic::ExactDiv if a % b != 0 => {
+                    // alloc: error path
                     return ub(format!(
                         "exact_div: {a} cannot be divided by {b} without remainder"
                     ));
@@ -1746,6 +1745,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 Intrinsic::UncheckedMul => a.checked_mul(b),
                 _ if b == 0 => return ub(by_zero()),
                 Intrinsic::ExactDiv if a % b != 0 => {
+                    // alloc: error path
                     return ub(format!(
                         "exact_div: {a} cannot be divided by {b} without remainder"
                     ));
@@ -1832,16 +1832,26 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             let (new, new_shadow) = self.read_shadowed(arg2.interval.addr, arg2.interval.size)?;
             let new = Word::from_slice(new);
-            let (old, old_shadow) = self.atomic_read(addr, size, access(true))?;
-            if M::CHECKS {
-                self.machine.require_init(&old_shadow, 0..size)?;
-            }
+            // The latest store, compared before the machine is told: it sees one read, the
+            // read of the read-modify-write when the exchange happens and else the failure's
+            // (Miri reads the old value unchecked too).
+            let old = Word::from_slice(self.peek_memory(addr, size)?);
             let exchanged = old == value;
+            let old_shadow = match M::CHECKS {
+                true => {
+                    let read = match exchanged {
+                        true => access(true),
+                        false => Access::Atomic { ord: failure, rmw: true, cxchg_failed: true },
+                    };
+                    let shadow =
+                        self.machine.read(self.ptr(addr), size as u64, addr.align(), read)?;
+                    self.machine.require_init(&shadow, 0..size)?;
+                    shadow
+                }
+                false => M::Shadow::default(),
+            };
             if exchanged {
                 self.atomic_write(addr, &new, &new_shadow, ord, true)?;
-            } else if M::CHECKS {
-                let failed = Access::Atomic { ord: failure, rmw: true, cxchg_failed: true };
-                self.machine.read(self.ptr(addr), size as u64, addr.align(), failed)?;
             }
             let result_ty = Ty::new_tup_from_iter(
                 self.interner(),

@@ -1,0 +1,23 @@
+{
+  "id": "00436",
+  "from_lane": "usercode-fast-tests",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## usercode-fast-tests 9: whoever owns `tools/v2/hot_lint.py`: its `crates` option can't be read\n\n`hot_lint.py '{\"root\": \".\", \"crates\": [\"blaze-usercode\"]}'` fails with `TypeError:\ntyped_input: crates has a type it does not read: list[str]`: `typed_input` reads\n`tuple[str, ...]`, not `list[str]`. Declare `crates: tuple[str, ...] = HOT` (or\n`field(default=HOT)`). I ran `hot_lint.lint_file` on my paths directly in the meantime.\n`blaze-usercode` is also not in `HOT`; my paths (`src/test.rs`, `src/test/`) are at zero\nfindings either way.\n\n> forwarded to the coordinator: `tools/` is its; on requests' coordinator list (same fix as coordinator.md frontend-image 1).",
+  "state": "open",
+  "created": "2026-10-30T04:21:53Z",
+  "updated": "2026-10-30T04:21:53Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/usercode-fast-tests.md#usercode-fast-tests 9: whoever owns `tools/v2/hot_lint.py`: its `crates` option can't be read",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/usercode-fast-tests.md:141"
+    }
+  ]
+}

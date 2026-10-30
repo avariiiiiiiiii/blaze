@@ -119,6 +119,7 @@ impl Node {
     fn serial(&self, db: &Db) -> u128 {
         match &self.0 {
             Kind::Root(func) => root_serial(db, *func),
+            // clone: the query takes them by value; a few `u32` ids, nothing on the heap
             Kind::Instance(instance, env) => instance_serial(db, instance.clone(), env.clone()),
         }
     }
@@ -192,10 +193,12 @@ pub struct Tiers {
 
 impl Tiers {
     pub fn install(&mut self, node: Node, tiered: Tiered) {
+        // alloc: once per function the daemon tiers, shared with the patch that holds it
         self.put(node, Arc::new(tiered));
     }
 
     fn put(&mut self, node: Node, tiered: Arc<Tiered>) {
+        // clone: a few `u32` ids, nothing on the heap; once per function installed
         let was = self.nodes.insert(node.clone(), tiered);
         self.fresh.push((node, was));
     }
@@ -222,6 +225,7 @@ impl Tiers {
         for (node, was) in std::mem::take(&mut self.fresh).into_iter().rev() {
             let level = was.as_ref().map_or(Level::Cranelift, |it| it.level);
             let tiered = match was {
+                // clone: a few `u32` ids, nothing on the heap; once per refused patch
                 Some(was) => self.nodes.insert(node.clone(), was),
                 None => self.nodes.remove(&node),
             };
@@ -229,6 +233,7 @@ impl Tiers {
                 Some(tiered) if !alone => self.trial.push((node, tiered)),
                 _ => {
                     self.refused.retain(|it| it.0 != node);
+                    // alloc: the reason a patch was refused, reported to the daemon
                     self.refused.push((node, level, why.to_owned()));
                 }
             }
@@ -269,6 +274,7 @@ impl Tiers {
         self.trial.clear();
         let mut demoted = self.demoted.lock().unwrap_or_else(|e| e.into_inner());
         for (node, _) in self.nodes.drain() {
+            // alloc: the reason reported to the daemon, once per tiered function per full build
             demoted.push((node, "the program was linked again".to_owned()));
         }
     }
@@ -302,6 +308,7 @@ impl Tiers {
         if let Some(why) = edited {
             let mut demoted = self.demoted.lock().unwrap_or_else(|e| e.into_inner());
             if !demoted.iter().any(|(it, _)| it == node) {
+                // alloc: the reason reported to the daemon, once per function an edit demotes
                 demoted.push((node.clone(), why.to_owned()));
             }
             return None;
@@ -376,6 +383,7 @@ pub(super) fn for_build<T>(work: impl FnOnce() -> T) -> T {
     let fresh = (across() && !imports).then(|| Inlining {
         roots: FxHashSet::default(),
         instances: FxHashSet::default(),
+        // alloc: empty until a body is built in, then one small list per function compile
         inlined: Vec::new(),
         whole: true,
         base: 0,
@@ -475,7 +483,7 @@ impl Inlining {
     }
 
     fn is_hot(&self, instance: &Instance) -> bool {
-        self.instances.contains(&(instance.def, instance.args.clone()))
+        self.instances.contains(&(instance.def, instance.args))
             || matches!(instance.def, InstanceDef::Fn(func)
                 if instance.args.as_ref().iter().all(|it| it.region().is_some())
                     && self.roots.contains(&func))
@@ -493,7 +501,7 @@ pub(super) fn hot_body(
     tracked: bool,
 ) -> Option<std::rc::Rc<super::fragment::Inlinable>> {
     if let Some(known) = oversized(instance, tracked, limit) {
-        refused(db, instance, &format!("too large ({known} instructions)"));
+        refused(db, instance, format_args!("too large ({known} instructions)"));
         return None;
     }
     let before = tally();
@@ -504,7 +512,7 @@ pub(super) fn hot_body(
     if size(&body.func) > limit {
         untally(before);
         oversize(instance, tracked, size(&body.func));
-        refused(db, instance, &format!("too large ({} instructions)", size(&body.func)));
+        refused(db, instance, format_args!("too large ({} instructions)", size(&body.func)));
         return None;
     }
     spend(instance, env, &body);
@@ -513,12 +521,12 @@ pub(super) fn hot_body(
 
 /// How large a build of `instance` was found, if that is more than `limit`.
 fn oversized(instance: &Instance, tracked: bool, limit: usize) -> Option<usize> {
-    let key = (instance.def, instance.args.clone(), tracked);
+    let key = (instance.def, instance.args, tracked);
     INLINING.with(|it| it.borrow().as_ref()?.oversized.get(&key).copied().filter(|&it| it > limit))
 }
 
 fn oversize(instance: &Instance, tracked: bool, size: usize) {
-    let key = (instance.def, instance.args.clone(), tracked);
+    let key = (instance.def, instance.args, tracked);
     INLINING.with(|it| {
         if let Some(it) = it.borrow_mut().as_mut() {
             let known = it.oversized.entry(key).or_default();
@@ -604,7 +612,7 @@ pub(super) fn seen_body(
         return None;
     }
     if let Some(known) = oversized(instance, tracked, limit) {
-        refused(db, instance, &format!("not shown: {known} instructions"));
+        refused(db, instance, format_args!("not shown: {known} instructions"));
         return None;
     }
     let before = tally();
@@ -615,13 +623,14 @@ pub(super) fn seen_body(
     if size(&body.func) > limit {
         untally(before);
         oversize(instance, tracked, size(&body.func));
-        refused(db, instance, &format!("not shown: {} instructions", size(&body.func)));
+        refused(db, instance, format_args!("not shown: {} instructions", size(&body.func)));
         return None;
     }
     INLINING.with(|it| {
         if let Some(it) = it.borrow_mut().as_mut() {
             it.seen += size(&body.func);
             if !it.inlined.iter().any(|(known, _)| known == instance) {
+                // clone: a few `u32` ids, nothing on the heap; once per body shown
                 it.inlined.push((instance.clone(), env.clone()));
             }
         }
@@ -636,7 +645,7 @@ fn body(
     env: &StoredParamEnvAndCrate,
     tracked: bool,
 ) -> Option<std::rc::Rc<super::fragment::Inlinable>> {
-    let key = (instance.def, instance.args.clone(), tracked);
+    let key = (instance.def, instance.args, tracked);
     let known = INLINING.with(|it| it.borrow().as_ref()?.built.get(&key).cloned());
     match known {
         Some(body) => body,
@@ -645,13 +654,14 @@ fn body(
             let starved = INLINING.with(|it| {
                 let mut it = it.borrow_mut();
                 let it = it.as_mut()?;
-                it.built.insert(key.clone(), None);
+                it.built.insert(key, None);
                 Some(it.starved)
             });
             let body = build_body(db, instance, env, tracked).map(std::rc::Rc::new);
             INLINING.with(|it| {
                 if let Some(it) = it.borrow_mut().as_mut() {
                     if Some(it.starved) == starved {
+                        // clone: a count on the `Rc` of a body just built, kept and returned
                         it.built.insert(key, body.clone());
                     } else {
                         it.built.remove(&key);
@@ -678,8 +688,12 @@ pub(super) fn fold_known_branches(
 ) {
     let func = &mut ctx.func;
     let mut folded = false;
-    let blocks: Vec<ir::Block> = func.layout.blocks().collect();
-    for block in blocks {
+    // alloc: one buffer for every branch folded, which allocates only for one with arguments
+    let mut args = Vec::new();
+    // Rewriting a branch in place leaves the layout as it is.
+    let mut next = func.layout.entry_block();
+    while let Some(block) = next {
+        next = func.layout.next_block(block);
         let Some(inst) = func.layout.last_inst(block) else { continue };
         let ir::InstructionData::Brif { arg, blocks: [then, otherwise], .. } = func.dfg.insts[inst]
         else {
@@ -688,7 +702,9 @@ pub(super) fn fold_known_branches(
         let Some(known) = known_value(func, arg) else { continue };
         let taken = if known != 0 { then } else { otherwise };
         let pool = &func.dfg.value_lists;
-        let (to, args) = (taken.block(pool), taken.args(pool).collect::<Vec<_>>());
+        let to = taken.block(pool);
+        args.clear();
+        args.extend(taken.args(pool));
         func.replace(inst).jump(to, &args);
         folded = true;
     }
@@ -750,6 +766,7 @@ fn spend(instance: &Instance, env: &StoredParamEnvAndCrate, body: &super::fragme
         if let Some(it) = it.borrow_mut().as_mut() {
             it.spent += size(&body.func);
             if !it.inlined.iter().any(|(known, _)| known == instance) {
+                // clone: a few `u32` ids, nothing on the heap; once per body built in
                 it.inlined.push((instance.clone(), env.clone()));
             }
         }
@@ -757,18 +774,18 @@ fn spend(instance: &Instance, env: &StoredParamEnvAndCrate, body: &super::fragme
 }
 
 /// Says why a body is not built in, with `BLAZE_DUMP_TIER`.
-fn refused(db: &Db, instance: &Instance, why: &str) {
+fn refused(db: &Db, instance: &Instance, why: impl std::fmt::Display) {
     if !super::dumps_tier() {
         return;
     }
-    let name = match instance.def {
+    match instance.def {
         InstanceDef::Fn(func) => {
-            hir_def::signatures::FunctionSignature::of(db, func).name.as_str().to_owned()
+            let signature = hir_def::signatures::FunctionSignature::of(db, func);
+            eprintln!("tier: {} is not built in: {why}", signature.name.as_str());
         }
-        InstanceDef::DropGlue => "drop glue".to_owned(),
-        _ => "a closure".to_owned(),
-    };
-    eprintln!("tier: {name} is not built in: {why}");
+        InstanceDef::DropGlue => eprintln!("tier: drop glue is not built in: {why}"),
+        _ => eprintln!("tier: a closure is not built in: {why}"),
+    }
 }
 
 fn build_body(
@@ -788,6 +805,7 @@ fn build_body(
     // Drop glue is built from the type it drops, and has no MIR.
     let body = match instance.def {
         InstanceDef::DropGlue => None,
+        // clone: the env is a few `u32` ids, nothing on the heap, taken by value
         _ => match super::instance_body(db, instance, env.clone(), None) {
             Ok(body) => Some(body),
             Err(_) => {
@@ -812,7 +830,7 @@ fn build_body(
             instance.checked,
         );
         cg.unlocated = true;
-        let args = instance.args.clone();
+        let args = instance.args;
         let mut ctx =
             super::build(&mut cg, env.as_ref(db), body.as_deref(), tracked, |fx| match fx.body {
                 Some(_) => {
@@ -824,14 +842,14 @@ fn build_body(
                     fx.drop_glue(args.as_ref().type_at(0))
                 }
             })
-            .map_err(|e| refused(&e.to_string()))
+            .map_err(|e| self::refused(db, instance, e))
             .ok()?;
         if cg.naked.is_some() || cg.opaque {
             refused("naked or opaque");
             return None;
         }
         // Its size is measured with its locals out of the frame, as the caller has them.
-        super::settle(&mut ctx, &cg).map_err(|e| refused(&e.to_string())).ok()?;
+        super::settle(&mut ctx, &cg).map_err(|e| self::refused(db, instance, e)).ok()?;
         fold_known_branches(&mut ctx, cg.isa);
         let pointees = std::mem::take(&mut cg.pointees);
         let seen = std::mem::take(&mut cg.seen);
@@ -872,15 +890,18 @@ pub struct Prepared {
 pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> {
     let start = std::time::Instant::now();
     if asked.level == Level::Cranelift {
+        // alloc: the error's message
         return Err("level 1 is what every build compiles".to_owned());
     }
     let serial = asked.node.serial(db);
     if serial == 0 {
+        // alloc: the error's message
         return Err("Cranelift does not compile it".to_owned());
     }
     let mut inlining = Inlining {
         roots: FxHashSet::default(),
         instances: FxHashSet::default(),
+        // alloc: empty until a body is built in; once per function the daemon tiers
         inlined: Vec::new(),
         whole: false,
         base: 0,
@@ -895,7 +916,7 @@ pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> 
         match &node.0 {
             Kind::Root(func) => _ = inlining.roots.insert(*func),
             Kind::Instance(instance, _) => {
-                _ = inlining.instances.insert((instance.def, instance.args.clone()))
+                _ = inlining.instances.insert((instance.def, instance.args))
             }
         }
     }
@@ -909,9 +930,8 @@ pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> 
         );
         for (def, args) in &inlining.instances {
             if let InstanceDef::Fn(func) = def {
-                let name =
-                    hir_def::signatures::FunctionSignature::of(db, *func).name.as_str().to_owned();
-                eprintln!("tier:   hot {name} {args:?}");
+                let signature = hir_def::signatures::FunctionSignature::of(db, *func);
+                eprintln!("tier:   hot {} {args:?}", signature.name.as_str());
             }
         }
     }
@@ -919,18 +939,22 @@ pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> 
     let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &asked.node.0 {
         Kind::Root(func) => super::root_code(db, *func, true),
         Kind::Instance(instance, env) => {
+            // clone: the query takes them by value; a few `u32` ids, nothing on the heap
             super::instance_code(db, instance.clone(), env.clone(), super::Detach::Tier, None)
         }
     }));
     let inlining = INLINING.with(|it| std::mem::replace(&mut *it.borrow_mut(), held));
     let pending = match compiled {
         Ok(Ok(super::Produced::Pending(pending))) => pending,
+        // alloc: the error's message
         Ok(Ok(super::Produced::Code(_))) => return Err("its code is its assembly".to_owned()),
+        // alloc: the error's message
         Ok(Err(e)) => return Err(e.to_string()),
         Err(panic) => std::panic::resume_unwind(panic),
     };
-    let mut inlined = Vec::new();
-    for (instance, env) in inlining.map(|it| it.inlined).unwrap_or_default() {
+    let built_in = inlining.map(|it| it.inlined).unwrap_or_default();
+    let mut inlined = Vec::with_capacity(built_in.len());
+    for (instance, env) in built_in {
         let node = match instance.def {
             InstanceDef::Fn(func)
                 if instance.args.as_ref().iter().all(|it| it.region().is_some()) =>
@@ -946,7 +970,8 @@ pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> 
     }
     Ok(Prepared {
         level: asked.level,
-        profile: asked.profile.clone().filter(|_| asked.level == Level::Pgo),
+        // clone: `prepare` borrows what is asked; the profile only at level 3, once per request
+        profile: asked.profile.as_ref().filter(|_| asked.level == Level::Pgo).cloned(),
         pending,
         serial,
         inlined,
@@ -961,11 +986,12 @@ impl Prepared {
     /// the second, how many there are.
     pub fn finish(self, counters: Option<(u32, u32)>) -> std::result::Result<Tiered, String> {
         let Prepared { level, profile, pending, serial, inlined, start } = self;
-        let branches = branches(pending.func()).len() as u32;
+        let branches = branches(pending.func()).count() as u32;
         let counters = counters
             .filter(|_| level == Level::Llvm)
             .and_then(|(first, room)| counted_from(first, room, branches));
         let request = Request { level, counters, profile, branches: std::cell::Cell::new(0) };
+        // alloc: the error's message
         let code = pending.produce(&request).map_err(|e| e.to_string())?;
         Ok(Tiered {
             level,
@@ -990,12 +1016,11 @@ fn counted_from(first: u32, room: u32, branches: u32) -> Option<u32> {
 }
 
 /// The two-way branches of `func`, in the order of its layout.
-fn branches(func: &ir::Function) -> Vec<ir::Inst> {
+fn branches(func: &ir::Function) -> impl Iterator<Item = ir::Inst> + '_ {
     func.layout
         .blocks()
         .filter_map(|block| func.layout.last_inst(block))
         .filter(|&inst| func.dfg.insts[inst].opcode() == Opcode::Brif)
-        .collect()
 }
 
 /// Has `func` count, in the counters from `first` on, how often it is entered and which way
@@ -1015,6 +1040,7 @@ fn count(
     let id = recorder.import(COUNTERS, &sig)?;
     let callee = recorder.declare_func_in_func(id, func);
     let Some(entry) = func.layout.entry_block() else {
+        // alloc: the error's message
         return Err(CodegenError::Unsupported("a function without blocks".to_owned()));
     };
     let region = func.dfg.alias_regions.insert(ir::AliasRegionData {
@@ -1052,11 +1078,13 @@ pub(super) fn emit(
     func: &mut ir::Function,
     request: &Request,
 ) -> Result<super::fragment::Code> {
-    let found = branches(func);
+    // alloc: once per function the daemon tiers; counting rewrites `func` around the list
+    let found: Vec<ir::Inst> = branches(func).collect();
     request.branches.set(found.len() as u32);
     let weights = match &request.profile {
         Some(profile) if profile.taken.len() == found.len() => Some(Weights {
             entered: profile.entered,
+            // alloc: the weights LLVM is given, once per function tiered at level 3
             taken: found.iter().copied().zip(profile.taken.iter().copied()).collect(),
         }),
         _ => None,
@@ -1088,6 +1116,7 @@ fn produce(
     use super::backend::{Optimization, Passes, Selection};
     let optimization = Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
     let code = super::llvm::emit(recorder, named, func, optimization, weights, &[])
+        // alloc: the error's message
         .map_err(|why| CodegenError::Unsupported(format!("LLVM has no code for it: {why}")))?;
     super::backend::pad(code)
 }
@@ -1099,6 +1128,7 @@ fn produce(
     _: &ir::Function,
     _: Option<&Weights>,
 ) -> Result<super::fragment::Code> {
+    // alloc: the error's message
     Err(CodegenError::Unsupported("blaze was built without `--features llvm`".to_owned()))
 }
 

@@ -41,6 +41,7 @@ impl Build {
     /// A build whose nodes are `first`, `first + 1`, ...: ids no other graph of the plane has
     /// (`crate::exec::ids`).
     pub fn new(first: NodeId) -> Build {
+        // alloc: empty until the first node; one vector per build, handed whole to the plane
         Build { next: first.0, specs: Vec::new() }
     }
 
@@ -61,35 +62,38 @@ impl Build {
         &mut self,
         kind: NodeKind,
         name: String,
-        deps: &[NodeId],
+        deps: impl Into<Vec<NodeId>>,
         pool: Pool,
         cost: u64,
         key: Option<Key>,
     ) -> NodeId {
         let id = NodeId(self.next);
         self.next += 1;
-        self.specs.push(Spec { id, kind, name, deps: deps.to_vec(), pool, cost, key, memory: 0 });
+        self.specs.push(Spec { id, kind, name, deps: deps.into(), pool, cost, key, memory: 0 });
         id
     }
 
     /// Reading the manifests and the lock file: keyed by their contents, when the caller has
     /// them hashed.
     pub fn manifest(&mut self, workspace: &str, key: Option<Key>) -> NodeId {
-        self.node(NodeKind::Manifest, format!("manifest {workspace}"), &[], Pool::Io, 1, key)
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
+        self.node(NodeKind::Manifest, format!("manifest {workspace}"), [], Pool::Io, 1, key)
     }
 
     /// A package's source, local or from a registry: keyed by its checksum where it has one.
     pub fn fetch(&mut self, package: &str, key: Option<Key>, manifest: NodeId) -> NodeId {
-        self.node(NodeKind::Fetch, format!("fetch {package}"), &[manifest], Pool::Io, 1, key)
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
+        self.node(NodeKind::Fetch, format!("fetch {package}"), [manifest], Pool::Io, 1, key)
     }
 
     /// The standard library of the toolchain, from the store or compiled.
     pub fn std(&mut self, key: Key, cost: u64) -> NodeId {
-        self.node(NodeKind::Std, "std".into(), &[], Pool::Work, cost, Some(key))
+        self.node(NodeKind::Std, "std".into(), [], Pool::Work, cost, Some(key))
     }
 
     /// A build script compiled, after its package's source and what it is compiled with.
     pub fn script(&mut self, package: &str, key: Key, deps: &[NodeId], cost: u64) -> NodeId {
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
         self.node(NodeKind::Script, format!("build script {package}"), deps, Pool::Work, cost, Some(key))
     }
 
@@ -97,45 +101,55 @@ impl Build {
     /// keyed by the plane: its result's key includes what it read, known once it ran
     /// (`blaze-usercode`'s `RunKey`), and the run looks itself up before it runs.
     pub fn script_run(&mut self, package: &str, script: NodeId, deps: &[NodeId]) -> NodeId {
-        let mut waits = vec![script];
+        let mut waits = Vec::with_capacity(1 + deps.len());
+        waits.push(script);
         waits.extend_from_slice(deps);
-        self.node(NodeKind::ScriptRun, format!("run build script {package}"), &waits, Pool::Io, 1, None)
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
+        self.node(NodeKind::ScriptRun, format!("run build script {package}"), waits, Pool::Io, 1, None)
     }
 
     /// A proc macro's library, built and loaded.
     pub fn proc_macro(&mut self, package: &str, key: Key, deps: &[NodeId], cost: u64) -> NodeId {
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
         self.node(NodeKind::Macro, format!("proc macro {package}"), deps, Pool::Work, cost, Some(key))
     }
 
     /// A crate's names: after its source, its scripts' runs, its macros and its dependencies'
     /// names.
     pub fn names(&mut self, krate: &str, key: Option<Key>, deps: &[NodeId], cost: u64) -> NodeId {
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
         self.node(NodeKind::Names, format!("names {krate}"), deps, Pool::Work, cost, key)
     }
 
     /// A crate's bodies, after its names.
     pub fn bodies(&mut self, krate: &str, key: Option<Key>, names: NodeId, cost: u64) -> NodeId {
-        self.node(NodeKind::Bodies, format!("bodies {krate}"), &[names], Pool::Work, cost, key)
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
+        self.node(NodeKind::Bodies, format!("bodies {krate}"), [names], Pool::Work, cost, key)
     }
 
     /// A unit compiled, keyed by its key, and its write to the store after it.
     pub fn unit(&mut self, unit: &str, key: Key, deps: &[NodeId], cost: u64) -> Unit {
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
         let compile = self.node(NodeKind::Codegen, format!("compile {unit}"), deps, Pool::Work, cost, Some(key));
-        let store = self.node(NodeKind::Store, format!("store {unit}"), &[compile], Pool::Io, 1, None);
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
+        let store = self.node(NodeKind::Store, format!("store {unit}"), [compile], Pool::Io, 1, None);
         Unit { compile, store }
     }
 
     /// A program linked from its units' compiles and the standard library.
     pub fn link(&mut self, program: &str, key: Option<Key>, units: &[Unit], std: Option<NodeId>, cost: u64) -> NodeId {
-        let mut deps: Vec<NodeId> = units.iter().map(|it| it.compile).collect();
+        let mut deps = Vec::with_capacity(units.len() + usize::from(std.is_some()));
+        deps.extend(units.iter().map(|it| it.compile));
         deps.extend(std);
-        self.node(NodeKind::Link, format!("link {program}"), &deps, Pool::Work, cost, key)
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
+        self.node(NodeKind::Link, format!("link {program}"), deps, Pool::Work, cost, key)
     }
 
     /// A test executable run, after its link: a process, never keyed by the plane (whether it
     /// runs at all is the test selection's, `blaze-usercode`'s `Reached`).
     pub fn test(&mut self, binary: &str, link: NodeId) -> NodeId {
-        self.node(NodeKind::Test, format!("test {binary}"), &[link], Pool::Io, 1, None)
+        // alloc: the node's name, which its `Spec` owns: once per node as the build is laid out
+        self.node(NodeKind::Test, format!("test {binary}"), [link], Pool::Io, 1, None)
     }
 }
 

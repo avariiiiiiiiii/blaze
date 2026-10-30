@@ -118,6 +118,7 @@ macro_rules! setup_tracked_struct {
         #[allow(clippy::all)]
         const _: () = {
             use ::salsa::plumbing as $zalsa;
+            use $zalsa::ZalsaDatabase as _;
             use $zalsa::tracked_struct as $zalsa_struct;
             use $zalsa::Revision as $Revision;
 

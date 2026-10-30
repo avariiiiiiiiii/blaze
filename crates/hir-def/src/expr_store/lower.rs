@@ -2749,16 +2749,16 @@ impl<'db> ExprCollector<'db> {
         };
         let iter_name = self.generate_new_name();
         let iter_expr = self.store.alloc_name_path_expr(iter_name);
-        let iter_expr = self.map_expr_desugared(iter_expr, syntax_ptr);
+        let iter_expr = self.map_expr_desugared(iter_expr, syntax_ptr_iterable);
         let iter_expr_mut = self.alloc_expr_desugared_with_ptr(
             Expr::Ref { expr: iter_expr, rawness: Rawness::Ref, mutability: Mutability::Mut },
-            syntax_ptr,
+            syntax_ptr_iterable,
         );
         let iter_next_fn_expr = self.store.alloc_path_expr(iter_next_fn);
-        let iter_next_fn_expr = self.map_expr_desugared(iter_next_fn_expr, syntax_ptr);
+        let iter_next_fn_expr = self.map_expr_desugared(iter_next_fn_expr, syntax_ptr_iterable);
         let iter_next_expr = self.alloc_expr_desugared_with_ptr(
             Expr::Call { callee: iter_next_fn_expr, args: &[iter_expr_mut] },
-            syntax_ptr,
+            syntax_ptr_iterable,
         );
         let loop_inner = self.alloc_expr_desugared_with_ptr(
             Expr::Match { expr: iter_next_expr, arms: &[none_arm, some_arm] },

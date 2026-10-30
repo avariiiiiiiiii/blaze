@@ -1,11 +1,15 @@
 //! rustc's UI tests of the errors of generic arguments and placeholders in signatures: counts
 //! (E0107), order (E0747), arguments on segments that take none (E0109), elided lifetimes in
 //! paths (E0726), `Self` in defaults (E0735), `_` in item signatures (E0121), return type
-//! notation out of place. Each test's file is the UI test's source byte for byte. Patterns in
+//! notation out of place, const parameters of a type a value tree can't hold (E0741). Each test's file is the UI test's source byte for byte. Patterns in
 //! foreign functions (E0130) and items without bodies are AST validation's
 //! (`tests/items/ast_validation.rs`).
 
-use crate::tests::{items::ui_core, ui};
+use crate::{
+    Options,
+    emit::Style,
+    tests::{Mode, checked_with, compiletest, items::ui_core, normalized, ui},
+};
 
 #[test]
 fn type_arguments_on_a_primitive() {
@@ -499,4 +503,63 @@ error: aborting due to 2 previous errors
 
 "#;
     assert_eq!(ui_core("bare-path.rs", "2015", "send, sized", source), stderr);
+}
+
+/// [`ui_core`] of a revision: `--cfg {revision}`, as compiletest passes it.
+fn ui_revision(name: &str, revision: &str, flags: &str, source: &str) -> String {
+    let fixture =
+        format!("//- minicore: {flags}\n//- /{name} crate:main edition:2015 cfg:{revision}\n{source}");
+    let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
+    normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
+}
+
+// tests/ui/const-generics/float-generic.rs
+const FLOAT_GENERIC: &str = r#"//@ revisions: simple adt_const_params full
+#![cfg_attr(full, feature(adt_const_params, unsized_const_params))]
+#![cfg_attr(full, allow(incomplete_features))]
+#![cfg_attr(adt_const_params, feature(adt_const_params))]
+#![cfg_attr(adt_const_params, allow(incomplete_features))]
+
+fn foo<const F: f32>() {}
+//~^ ERROR `f32` is forbidden as the type of a const generic parameter
+
+const C: f32 = 1.0;
+
+fn main() {
+    foo::<C>();
+}
+"#;
+
+#[test]
+fn a_float_const_parameter_without_the_feature() {
+    let stderr = r#"error: `f32` is forbidden as the type of a const generic parameter
+  --> $DIR/float-generic.rs:7:17
+   |
+LL | fn foo<const F: f32>() {}
+   |                 ^^^
+   |
+   = note: the only supported types are integers, `bool`, and `char`
+
+error: aborting due to 1 previous error
+
+"#;
+    assert_eq!(ui_revision("float-generic.rs", "simple", "sized", FLOAT_GENERIC), stderr);
+}
+
+#[test]
+fn a_float_const_parameter_with_adt_const_params_is_e0741() {
+    let stderr = r#"error[E0741]: `f32` is forbidden as the type of a const generic parameter
+  --> $DIR/float-generic.rs:7:17
+   |
+LL | fn foo<const F: f32>() {}
+   |                 ^^^
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0741`.
+"#;
+    assert_eq!(
+        ui_revision("float-generic.rs", "adt_const_params", "sized, const_param_ty", FLOAT_GENERIC),
+        stderr
+    );
 }

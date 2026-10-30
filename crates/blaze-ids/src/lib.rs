@@ -379,6 +379,7 @@ impl<T: Send + Sync> Sharded<T> {
                     len: AtomicU32::new(0),
                     index: Index::new(),
                 })
+                // alloc: once per interner made, its shards
                 .collect(),
             mask: count - 1,
         }
@@ -435,6 +436,7 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
         claimed.next += 1;
         let (chunk, at) = chunk_of(raw);
         let slots = self.slots[chunk]
+            // alloc: once per chunk of slots, each twice the last: amortized, never per intern
             .get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
         if slots[at].set((id, value)).is_err() {
             unreachable!("index {raw} handed out twice");

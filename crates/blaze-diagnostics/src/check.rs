@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 use base_db::Db;
 use blaze_ids::radix;
 use blaze_mem::{Frame, Tag, frame};
-use hir::{Semantics, check::bodies::Plan};
+use hir::check::bodies::Plan;
 use rustc_hash::FxHashSet;
 
 use crate::{
@@ -47,19 +47,8 @@ pub fn check_crate(
     files: Files<'_>,
     options: &Options,
 ) -> Vec<Diag> {
-    let sema = Semantics::new(db);
-    check_crate_with(&sema, krate, files, options)
-}
-
-/// [`check_crate`] with semantics the caller holds.
-pub fn check_crate_with<'db>(
-    sema: &Semantics<'db>,
-    krate: hir::Crate,
-    files: Files<'_>,
-    options: &Options,
-) -> Vec<Diag> {
-    let plan = Plan::new(sema.db, &[krate], &hir::check::every_body);
-    frame::task(Tag::Diagnostics, |frame| run(sema, krate, files, options, &plan, frame))
+    let plan = Plan::new(db, &[krate], &hir::check::every_body);
+    frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, &plan, frame))
 }
 
 /// [`check_crate`], its bodies checked by `plan`, a plan of `krate` alone with every body: what
@@ -72,20 +61,19 @@ pub fn check_planned(
     files: Files<'_>,
     options: &Options,
 ) -> Vec<Diag> {
-    let sema = Semantics::new(db);
-    frame::task(Tag::Diagnostics, |frame| run(&sema, krate, files, options, plan, frame))
+    frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, plan, frame))
 }
 
 /// The check of `krate`, its tables in `frame`, its bodies by `plan`.
 fn run(
-    sema: &Semantics<'_>,
+    db: &Db,
     krate: hir::Crate,
     files: Files<'_>,
     options: &Options,
     plan: &Plan<'_, impl Fn(hir::DefWithBody) -> bool + Sync + ?Sized>,
     frame: &Frame,
 ) -> Vec<Diag> {
-    let cx = Cx::new(sema, krate, files, frame).with_lints(&options.lints);
+    let cx = Cx::new(db, krate, files, frame).with_lints(&options.lints);
     let parsed = lower::parse::parsed(&cx);
     if parsed.fatal {
         // alloc: a file that does not parse, the error path

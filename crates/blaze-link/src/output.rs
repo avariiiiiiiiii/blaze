@@ -56,6 +56,14 @@ pub struct Output {
     /// log starts on the log table; one that never arms must not, since publishing never writes
     /// the log table and a logged slot would keep its old target. `false` for every other image.
     pub exec_log: bool,
+    /// The sanitizers the image's code was built with (the build's `Policy::sanitize`):
+    /// [`crate::target::locate`] puts their runtimes on the link line, and the link adds what
+    /// LLVM's passes leave to it (MemorySanitizer's options, AddressSanitizer's redzones and
+    /// global descriptors, SanitizerCoverage's init calls). Empty for an uninstrumented image.
+    pub sanitize: blaze_codegen::settings::Sanitize,
+    /// ELF `DT_RUNPATH` and Mach-O `LC_RPATH` entries, absolute: where the loader finds the
+    /// shared runtimes [`crate::target::locate`] put on the link line.
+    pub rpaths: Vec<String>,
 }
 
 /// A dev executable (`blaze run`, `blaze test`): its start hook, `blaze_inproc_start`, swaps its

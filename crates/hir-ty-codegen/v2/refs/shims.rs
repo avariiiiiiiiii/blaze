@@ -59,6 +59,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
             TyKind::Tuple(tys) => self.drop_tuple_fields(ty, tys.iter()),
             TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
                 let Some(TyKind::Tuple(tys)) = ty.closure_upvars_ty().map(|it| it.kind()) else {
+                    // alloc: the error's message
                     return Err("drop glue for a closure without tupled upvars".to_owned());
                 };
                 self.drop_tuple_fields(ty, tys.iter())
@@ -66,12 +67,14 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
             TyKind::Coroutine(..) => self.drop_coroutine(ty),
             TyKind::Array(element, len) => {
                 if try_const_usize(db, len).is_none() {
+                    // alloc: the error's message
                     return Err("array with unevaluated length".to_owned());
                 }
                 self.drop_elements(element)
             }
             TyKind::Slice(element) => {
                 if !meta {
+                    // alloc: the error's message
                     return Err("drop of a slice without a length".to_owned());
                 }
                 self.drop_elements(element)
@@ -79,8 +82,10 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
             // Through the vtable's first entry.
             TyKind::Dynamic(..) => match meta {
                 true => Ok(()),
+                // alloc: the error's message
                 false => Err("drop of `dyn` without a vtable".to_owned()),
             },
+            // alloc: the error's message
             _ => Err(format!("drop glue for {ty:?}")),
         }
     }
@@ -92,6 +97,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
             return Ok(());
         }
         if !meta && self.fx.is_unsized(ty) {
+            // alloc: the error's message
             return Err(format!("drop of unsized {ty:?} without metadata"));
         }
         self.call(InstanceDef::DropGlue, GenericArgs::new_from_slice(&[ty.into()]))
@@ -122,14 +128,17 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
     /// `drop_coroutine`: the `async` block is dropped by polling it with no context.
     fn drop_coroutine(&mut self, ty: Ty<'db>) -> Result<(), String> {
         let Some((def, parent_args)) = coroutine_instance(self.db(), ty) else {
+            // alloc: the error's message
             return Err(format!("drop glue for {ty:?}"));
         };
         let body = self.fx.body_types(def, parent_args).map_err(told)?;
         let Some(poll_ty) = &body.poll else {
+            // alloc: the error's message
             return Err("async block whose body is not one".to_owned());
         };
         let poll_ty = poll_ty.as_ref();
         // The pinned reference and the context, as many of them as the body takes.
+        // alloc: at most two, inline in `Tys`
         let arg_tys: Tys<'db> = body.params.iter().take(2).map(|it| it.as_ref()).collect();
         self.fx.layout(poll_ty).map_err(told)?;
         self.emit_call(def, parent_args, &arg_tys, poll_ty)
@@ -139,6 +148,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
     fn call_drop_impl(&mut self, ty: Ty<'db>) -> Result<(), String> {
         let interner = self.fx.interner;
         let Some(drop_fn) = interner.lang_items().Drop_drop else {
+            // alloc: the error's message
             return Err("no `Drop::drop` lang item".to_owned());
         };
         let reference = Ty::new_ref(interner, Region::new_erased(interner), ty, Mutability::Mut);
@@ -178,6 +188,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
                     Variants::Multiple { .. } => {
                         for &(variant, _) in variants.values() {
                             db.const_eval_discriminant(variant).map_err(|e| {
+                                // alloc: the error's message
                                 told(CodegenError::Frontend(format!("discriminant: {e:?}")))
                             })?;
                         }
@@ -233,6 +244,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
     /// body handed it.
     pub(super) fn call_once_shim(&mut self, ty: Ty<'db>) -> Result<(), String> {
         let TyKind::Closure(id, generic_args) = ty.kind() else {
+            // alloc: the error's message
             return Err(format!("call_once shim for {ty:?}"));
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
@@ -240,6 +252,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
         let body = self.fx.body_types(def, parent_args).map_err(told)?;
         self.fx.body_signature(body).map_err(told)?;
         let Some(receiver) = body.params.first() else {
+            // alloc: the error's message
             return Err("closure without a receiver".to_owned());
         };
         let receiver_ty = receiver.as_ref();
@@ -266,11 +279,13 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
         if implemented_fn_method(db, self.fx.interner.lang_items(), func).is_some() {
             if track_caller(db, func) {
                 return Err(
+                    // alloc: the error's message
                     "an `Fn`-trait method in a vtable that tracks its caller".to_owned()
                 );
             }
             let body = self.fx.body_types(def, args).map_err(told)?;
             let Some(receiver) = body.params.first() else {
+                // alloc: the error's message
                 return Err("an `Fn`-trait method without a receiver".to_owned());
             };
             let receiver_ty = receiver.as_ref();
@@ -283,6 +298,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
         let body = self.fx.body_types(def, args).map_err(told)?;
         self.fx.body_signature(body).map_err(told)?;
         let Some(receiver) = body.params.first() else {
+            // alloc: the error's message
             return Err("vtable method without a receiver".to_owned());
         };
         let layout = self.fx.layout(receiver.as_ref()).map_err(told)?;
@@ -295,6 +311,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
     /// `fn_pointer_shim`: the closure body, handed a receiver it does not read.
     pub(super) fn fn_pointer_shim(&mut self, ty: Ty<'db>) -> Result<(), String> {
         let TyKind::Closure(id, generic_args) = ty.kind() else {
+            // alloc: the error's message
             return Err(format!("fn pointer shim for {ty:?}"));
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
@@ -321,6 +338,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
         }
         if abi == ExternAbi::RustCall {
             let Some((&tuple, prefix)) = fn_sig.inputs().split_last() else {
+                // alloc: the error's message
                 return Err("a rust-call signature without its tuple".to_owned());
             };
             self.fx.layout(tuple).map_err(told)?;
@@ -331,8 +349,10 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
             TyKind::FnDef(def, generic_args) => match def.0 {
                 CallableDefId::FunctionId(func) => {
                     if let Some(intrinsic) =
+                        // alloc: the error's message
                         intrinsic_of(self.db(), func).map_err(|it| it.to_string())?
                     {
+                        // alloc: the error's message
                         return Err(format!("shim for the intrinsic `{intrinsic}`"));
                     }
                     // A callee that tracks its caller is handed the place of its
@@ -343,10 +363,12 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
                 CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => {
                     match dst_ty.kind() {
                         TyKind::Adt(..) => Ok(()),
+                        // alloc: the error's message
                         _ => Err(format!("constructor of {dst_ty:?}")),
                     }
                 }
             },
+            // alloc: the error's message
             _ if !receiver => Err("a fn pointer is only reified for a vtable".to_owned()),
             _ => self.emit_pointer_call(fn_sig.abi(), None, &arg_tys, dst_ty),
         }

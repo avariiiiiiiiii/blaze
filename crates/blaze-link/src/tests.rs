@@ -48,6 +48,8 @@ fn output(incremental: bool) -> Output {
         windows_subsystem: false,
         dev_run: None,
         exec_log: false,
+        sanitize: blaze_codegen::settings::Sanitize::default(),
+        rpaths: Vec::new(),
         triple: "x86_64-unknown-linux-gnu".into(),
         stack: None,
     }
@@ -282,9 +284,7 @@ impl Linked {
     }
 
     fn bytes(&self) -> &[u8] {
-        // SAFETY: `words` holds `len.div_ceil(8)` initialized words, so at least `len` bytes,
-        // and u8 has no alignment.
-        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast::<u8>(), self.len) }
+        &zerocopy::IntoBytes::as_bytes(&self.words[..])[..self.len]
     }
 
     fn elf(&self) -> ElfFile64<'_, Endianness> {
@@ -1090,6 +1090,8 @@ mod ties;
 
 mod counter;
 
+mod lazy;
+
 mod wasm_imports;
 
 mod dev_run;
@@ -1097,6 +1099,8 @@ mod dev_run;
 mod natives;
 
 mod premap;
+
+mod sanitize;
 
 /// The state's columns, read and written as a stage does.
 mod columns {

@@ -1,0 +1,23 @@
+{
+  "id": "00254",
+  "from_lane": "speed-hir-defs-sigs",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py"
+  ],
+  "what": "## `tools/v2/hot_lint.py`: `crates` as a tuple, so the script runs\n\nWhat: `tools/v2/hot_lint.py`, `class Input` (~L37):\n\n```python\n# before\n    crates: list[str] = field(default_factory=lambda: list(HOT))\n# after\n    crates: tuple[str, ...] = HOT\n```\n\nand drop `field` from `from dataclasses import dataclass, field` if nothing else uses it.\n\nWhy: every run stops before linting, with or without `\"crates\"`:\n`TypeError: typed_input: crates has a type it does not read: list[str]`.\n`typed_input._check` reads `tuple[T, ...]` and not `list[T]`, and a frozen dataclass wants an\nimmutable default anyway. `HOT` is already a tuple, and the loop only iterates over `cfg.crates`.\nStatus: open\n\n> forwarded to the coordinator (`tools/`), listed in requests' report.",
+  "state": "open",
+  "created": "2026-10-30T02:38:42Z",
+  "updated": "2026-10-30T02:38:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed-hir-defs-sigs.md#`tools/v2/hot_lint.py`: `crates` as a tuple, so the script runs",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed-hir-defs-sigs.md:3"
+    }
+  ]
+}

@@ -67,6 +67,7 @@ impl Reader {
     pub fn list(&self, root: ContentId, path: &str) -> Option<std::vec::IntoIter<(String, bool)>> {
         let pinned = self.pin();
         let names: Vec<(String, bool)> =
+            // alloc: owned names that outlive the pin; `Pinned::list` lends them instead.
             pinned.list(root, path)?.map(|(name, dir)| (name.to_owned(), dir)).collect();
         Some(names.into_iter())
     }

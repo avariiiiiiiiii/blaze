@@ -35,7 +35,7 @@ use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 pub(super) fn is_cache(db: &Db, id: StaticId) -> bool {
     let not = why_not(db, id);
     if let Some(why) = not
-        && std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some()
+        && *super::TRACE
     {
         eprintln!("fn-cache: static {id:?} chooses no function: {why}");
     }
@@ -58,8 +58,12 @@ fn why_not(db: &Db, id: StaticId) -> Option<&'static str> {
     while let Some(it) = outer.block(db) {
         outer = it.module(db);
     }
-    let Some(owner) = owners(db, outer)
-        .into_iter()
+    // alloc: one worklist of bodies a static, filled with the owners first
+    let mut bodies = Vec::new();
+    owners(db, outer, &mut bodies);
+    let Some(owner) = bodies
+        .iter()
+        .copied()
         .find(|&it| Body::of(db, it).blocks(db).any(|(found, _)| found == block))
     else {
         return Some("no body has its block");
@@ -68,13 +72,18 @@ fn why_not(db: &Db, id: StaticId) -> Option<&'static str> {
         return Some("its initializer has no MIR");
     };
     if !made_of_fn(db, init, return_slot(), &mut FxHashSet::default()) {
-        if std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some() {
+        if *super::TRACE {
             eprintln!("fn-cache: {:#?}", init.basic_blocks);
         }
         return Some("its first value is no function's address");
     }
-    let mut bodies = vec![owner];
+    bodies.clear();
+    bodies.push(owner);
     let mut seen = FxHashSet::from_iter([owner]);
+    // alloc: reused for every module of a block, a static
+    let mut found = Vec::new();
+    // alloc: reused for every body, a static
+    let mut mir = Vec::new();
     while let Some(at) = bodies.pop() {
         let store = Body::of(db, at);
         let coroutine = store.exprs().any(|(_, expr)| {
@@ -85,18 +94,18 @@ fn why_not(db: &Db, id: StaticId) -> Option<&'static str> {
         }
         for (_, def_map) in store.blocks(db) {
             for (_, data) in def_map.modules(db) {
-                let mut found = Vec::new();
                 declared(db, data.scope(db), &mut found);
-                bodies.extend(found.into_iter().filter(|&it| seen.insert(it)));
+                bodies.extend(found.drain(..).filter(|&it| seen.insert(it)));
             }
         }
         let Ok(body) = db.mir_body(InferBodyId::DefWithBodyId(at)) else {
             return Some("a body that can name it has no MIR");
         };
-        let mut mir = vec![body];
+        mir.clear();
+        mir.push(body);
         while let Some(body) = mir.pop() {
             if !only_dispatches(db, body, id) {
-                if std::env::var_os("BLAZE_FN_CACHE_TRACE").is_some() {
+                if *super::TRACE {
                     eprintln!("fn-cache: {:?}: {:#?}", body.owner, body.basic_blocks);
                 }
                 return Some("a body uses it otherwise");
@@ -201,16 +210,13 @@ fn declared(db: &Db, scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>) {
     }
 }
 
-/// The bodies of what `module`, of no block, declares: one of them is the body a block of
-/// the module is in.
-fn owners<'db>(db: &'db Db, module: hir_def::ModuleIdLt<'db>) -> Vec<DefWithBodyId> {
+/// Pushes to `bodies` the bodies of what `module`, of no block, declares: one of them is the
+/// body a block of the module is in.
+fn owners<'db>(db: &'db Db, module: hir_def::ModuleIdLt<'db>, bodies: &mut Vec<DefWithBodyId>) {
     let def_map = module.def_map(db);
-    let Some((_, data)) = def_map.modules(db).find(|(it, _)| *it == module) else {
-        return Vec::new();
-    };
-    let mut bodies = Vec::new();
-    declared(db, data.scope(db), &mut bodies);
-    bodies
+    if let Some((_, data)) = def_map.modules(db).find(|(it, _)| *it == module) {
+        declared(db, data.scope(db), bodies);
+    }
 }
 
 /// Whether `body` uses the static `id` only as the module says: copies of where it is in

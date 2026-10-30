@@ -4,6 +4,8 @@
 //! database's queries are of the one copy of this crate the tests call.
 
 mod alloc_budget;
+mod const_check;
+mod const_check_drops;
 mod db;
 mod erase_regions;
 mod foreign;
@@ -11,6 +13,7 @@ mod foreign;
 mod inline;
 mod machine;
 mod references;
+mod scalar_names;
 mod source_maps;
 mod source_names;
 mod stages;

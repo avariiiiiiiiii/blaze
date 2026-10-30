@@ -16,7 +16,10 @@ use rustc_type_ir::{
 use test_fixture::WithFixture;
 
 use super::{db::TestDB, type_item};
-use crate::{AnyDiagnostic, MissingLifetimeKind, MissingLifetimeSite, Variant};
+use crate::{
+    AnyDiagnostic, ConstParamTyReason, MissingLifetimeKind, MissingLifetimeSite, ValTreeErrorKind,
+    Variant,
+};
 
 /// Every diagnostic the check of the workspace found, given to `f`.
 fn check(fixture: &str, f: impl FnOnce(&TestDB, &[AnyDiagnostic<'_>])) {
@@ -432,4 +435,118 @@ trait G where Self: D + E {}
             assert_eq!(elaborated, memo, "`{name}`");
         }
     });
+}
+
+/// rustc's `DynCompatibilityViolation::spans()`: each violation points where rustc's E0038
+/// note does: the `Sized` supertrait, the predicate with `Self` in it, the parameter or return
+/// type, the `impl Trait`, the item's name; an associated type's bound is named, not pointed at.
+#[test]
+fn a_dyn_incompatible_trait_s_violations_point_where_rustc_s_do() {
+    use crate::{DynCompatibilitySite, DynCompatibilityViolation, Trait};
+    let db = TestDB::with_files(
+        r#"
+//- minicore: dispatch_from_dyn
+trait Sup<T> {}
+trait Bad: Sized + Sup<Self> {
+    fn by_value(&self, other: Self);
+    fn back(&self) -> Self;
+    fn new() -> u8;
+    fn opaque(&self) -> impl Sized;
+    const C: u8;
+    type A: Sup<Self>;
+}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let (_, ModuleDefId::TraitId(id)) = type_item(&db, "Bad") else { panic!("`Bad`") };
+        let found: Vec<(String, Vec<String>)> = Trait { id }
+            .dyn_compatibility_violation_sites(&db)
+            .into_iter()
+            .map(|(violation, sites)| {
+                let kind = match violation {
+                    DynCompatibilityViolation::Method(_, code) => format!("{code:?}"),
+                    DynCompatibilityViolation::AssocConst(_) => "AssocConst".to_owned(),
+                    other => format!("{other:?}"),
+                };
+                let sites = sites
+                    .into_iter()
+                    .map(|site| match site {
+                        DynCompatibilitySite::Syntax(ptr) => {
+                            let root = ptr.file_id.parse_or_expand(&db);
+                            ptr.value.to_node(&root).text().to_string()
+                        }
+                        DynCompatibilitySite::AssocTypeBound { alias, .. } => {
+                            format!("bound of {}", alias.name(&db).as_str())
+                        }
+                    })
+                    .collect();
+                (kind, sites)
+            })
+            .collect();
+        let expected = [
+            ("SizedSelf", vec!["Sized"]),
+            ("SelfReferential", vec!["Sup<Self>"]),
+            ("SelfReferential", vec!["bound of A"]),
+            ("ReferencesSelfInput", vec!["Self"]),
+            ("ReferencesSelfOutput", vec!["Self"]),
+            ("StaticMethod", vec!["new"]),
+            ("ReferencesImplTraitInTrait", vec!["impl Sized"]),
+            ("AssocConst", vec!["C"]),
+        ];
+        let expected: Vec<(String, Vec<String>)> = expected
+            .into_iter()
+            .map(|(kind, sites)| (kind.to_owned(), sites.into_iter().map(str::to_owned).collect()))
+            .collect();
+        assert_eq!(found, expected);
+    });
+}
+
+#[test]
+fn a_const_parameter_of_a_type_with_no_value_tree_is_reported_once_per_parameter() {
+    check(
+        r#"
+//- minicore: sized
+struct S<const A: f32, const B: u8, const C: fn()>;
+fn f<const D: *const u8>() {}
+"#,
+        |_, found| {
+            let refused: Vec<_> = found
+                .iter()
+                .filter_map(|it| match it {
+                    AnyDiagnostic::ConstParamTyNotAllowed(it) => Some(it.reason),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(refused.len(), 3, "`A`, `C` and `D`, not `B`: {found:#?}");
+            for reason in [
+                ConstParamTyReason::NotSupported,
+                ConstParamTyReason::FnPtr,
+                ConstParamTyReason::RawPtr,
+            ] {
+                assert!(refused.contains(&reason), "{reason:?}: {found:#?}");
+            }
+        },
+    );
+}
+
+#[test]
+fn a_const_argument_with_no_value_tree_is_reported_at_the_argument() {
+    check(
+        r#"
+//- minicore: sized
+#![feature(adt_const_params)]
+struct Big<const N: [u8; 100001]>;
+fn big(_: Big<{ [0u8; 100001] }>) {}
+"#,
+        |_, found| {
+            let overflows = found
+                .iter()
+                .filter(|it| {
+                    matches!(it, AnyDiagnostic::ValTreeError(it)
+                        if matches!(it.error, ValTreeErrorKind::NodesOverflow) && it.konst.is_none())
+                })
+                .count();
+            assert_eq!(overflows, 1, "{found:#?}");
+        },
+    );
 }

@@ -32,7 +32,9 @@ const LARGEST_ROWS: usize = 1 << 16;
 type LayoutLists = (Vec<Arc<Layout>>, Vec<Box<Layout>>);
 
 thread_local! {
+    // alloc: none, an empty shelf
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
+    // alloc: none, an empty shelf
     static BUILDERS: RefCell<Vec<FunctionBuilderContext>> = const { RefCell::new(Vec::new()) };
     // alloc: none, an empty shelf
     static RELOCS: RefCell<Vec<Relocs>> = const { RefCell::new(Vec::new()) };

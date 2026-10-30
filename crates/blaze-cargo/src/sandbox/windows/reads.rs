@@ -35,13 +35,16 @@ use std::{
     os::windows::ffi::OsStrExt as _,
     path::Path,
     ptr::{null, null_mut},
-    sync::{
-        Mutex, OnceLock, PoisonError,
-        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-    },
+    sync::{Mutex, OnceLock, PoisonError},
 };
 
+// The table's atomics are the model checker's in a model build (`--cfg blaze_check`), so its
+// model tests explore the same lines a launcher runs.
+#[cfg(blaze_check)]
+use blaze_check::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use rustc_hash::FxBuildHasher;
+#[cfg(not(blaze_check))]
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use windows_sys::Win32::{
     Foundation::{ERROR_NOTIFY_ENUM_DIR, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{
@@ -141,12 +144,7 @@ impl Reads {
                 true => COVERED | u64::from(seen.dir),
                 false => 0,
             };
-            let published = slot.state.compare_exchange(token, to, Ordering::SeqCst, Ordering::SeqCst).is_ok();
-            // A watch that ended after the check was made pending let go of what it held, maybe
-            // before this was published.
-            if published && root.dead.load(Ordering::SeqCst) {
-                slot.state.store(0, Ordering::SeqCst);
-            }
+            slot.publish(token, to, &root.dead);
         }
         Ok(Some(seen))
     }
@@ -169,8 +167,7 @@ impl Reads {
             }
         }
         let token = self.tokens.fetch_add(1, Ordering::Relaxed) << PENDING;
-        slot.state.store(token, Ordering::SeqCst);
-        if root.dead.load(Ordering::SeqCst) {
+        if !slot.pend(token, &root.dead) {
             return None;
         }
         Some((slot, token, root))
@@ -257,7 +254,7 @@ impl Reads {
     fn forget(&self, key: &[u16], action: u32) {
         let hash = hash(key);
         if let Some(slot) = self.paths.find(hash, key) {
-            slot.state.store(0, Ordering::SeqCst);
+            slot.forget();
         }
         let moved = matches!(action, FILE_ACTION_REMOVED | FILE_ACTION_RENAMED_OLD_NAME | FILE_ACTION_RENAMED_NEW_NAME);
         if moved && self.above.find(hash, key).is_some() {
@@ -273,7 +270,7 @@ impl Reads {
                 _ => path.len() > dir.len() && path.starts_with(dir) && path[dir.len()] == BACKSLASH,
             };
             if below {
-                slot.state.store(0, Ordering::SeqCst);
+                slot.forget();
             }
         });
     }
@@ -347,6 +344,30 @@ struct Slot {
     state: AtomicU64,
 }
 
+impl Slot {
+    /// Makes the check pending with `token`, before its DACL is read: whether it still may be
+    /// kept, which it may not once the watch of its volume ended (`dead`).
+    fn pend(&self, token: u64, dead: &AtomicBool) -> bool {
+        self.state.store(token, Ordering::SeqCst);
+        !dead.load(Ordering::SeqCst)
+    }
+
+    /// Publishes `to` as the check pending with `token`, if nothing told let go of it since
+    /// [`Slot::pend`]; and lets go of it again if the watch ended (`dead`) meanwhile, maybe
+    /// after its own letting go of everything ran.
+    fn publish(&self, token: u64, to: u64, dead: &AtomicBool) {
+        let published = self.state.compare_exchange(token, to, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+        if published && dead.load(Ordering::SeqCst) {
+            self.forget();
+        }
+    }
+
+    /// Lets go of the check: a change was told, or the watch ended.
+    fn forget(&self) {
+        self.state.store(0, Ordering::SeqCst);
+    }
+}
+
 struct Key {
     hash: u64,
     units: Box<[u16]>,
@@ -370,7 +391,7 @@ impl Table {
             if key.is_null() {
                 return None;
             }
-            // SAFETY: a key that is not null was published by `claim`'s release swap from a
+            // SAFETY: a key that is not null was published by `claim`'s compare-exchange (release on success) from a
             // `Box` it made whole first, and is never changed or freed while the table lives
             // (only `drop`, with `&mut self`, frees it), so this shared borrow of it is sound.
             let key = unsafe { &*key };
@@ -737,5 +758,132 @@ mod tests {
         let file = super::super::open(&dotted, "test").unwrap().unwrap();
         assert!(!named_as_it_is(&file, &key(dotted.to_str().unwrap())));
         _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// [`Table`] as a sequential open-addressed table: slots of `(hash, unit)` keys, each
+    /// claimed in the first slot from its hash that is free or has it.
+    #[cfg(blaze_check)]
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct Slots(Vec<Option<(u64, u16)>>);
+
+    #[cfg(blaze_check)]
+    #[derive(Debug)]
+    enum Op {
+        Claim(u64, u16),
+        Find(u64, u16),
+    }
+
+    #[cfg(blaze_check)]
+    impl blaze_check::linear::Spec for Slots {
+        type Op = Op;
+        type Ret = Option<usize>;
+
+        fn apply(&mut self, op: &Op) -> Option<usize> {
+            let (Op::Claim(hash, unit) | Op::Find(hash, unit)) = *op;
+            let mask = self.0.len() - 1;
+            let mut at = hash as usize & mask;
+            for _ in 0..self.0.len() {
+                match self.0[at] {
+                    None if matches!(op, Op::Claim(..)) => {
+                        self.0[at] = Some((hash, unit));
+                        return Some(at);
+                    }
+                    None => return None,
+                    Some(key) if key == (hash, unit) => return Some(at),
+                    Some(_) => at = (at + 1) & mask,
+                }
+            }
+            None
+        }
+    }
+
+    /// `op` on `table`, recorded in `history`: the place of the slot it gave.
+    #[cfg(blaze_check)]
+    fn run(table: &Table, history: &blaze_check::linear::History<Slots>, op: Op) -> Option<usize> {
+        history.record(op, |op| {
+            let (Op::Claim(hash, unit) | Op::Find(hash, unit)) = *op;
+            let slot = match op {
+                Op::Claim(..) => table.claim(hash, &[unit]),
+                Op::Find(..) => table.find(hash, &[unit]),
+            };
+            slot.map(|slot| table.slots.iter().position(|it| std::ptr::eq(it, slot)).expect("a slot of the table"))
+        })
+    }
+
+    /// Two threads claim keys whose hashes collide, one of them twice, while each also finds
+    /// the other's: each key takes one slot, a claim of it again gives that slot, and a find
+    /// gives it or nothing, as some order of the calls would on [`Slots`].
+    #[cfg(blaze_check)]
+    #[test]
+    fn model_colliding_claims_take_a_slot_each_and_are_found_there() {
+        blaze_check::model(|| {
+            let table = std::sync::Arc::new(Table::new(4));
+            let history = std::sync::Arc::new(blaze_check::linear::History::<Slots>::new());
+            let other = {
+                let (table, history) = (table.clone(), history.clone());
+                blaze_check::thread::spawn(move || {
+                    run(&table, &history, Op::Claim(1, 1));
+                    run(&table, &history, Op::Find(1, 2));
+                    run(&table, &history, Op::Claim(1, 1));
+                })
+            };
+            run(&table, &history, Op::Claim(1, 2));
+            run(&table, &history, Op::Find(1, 1));
+            other.join().unwrap();
+            history.check(Slots(vec![None; 4]));
+        });
+    }
+
+    /// A check made pending as the watch of its volume ends (`lose`: the watch is marked dead,
+    /// then every check of it let go) is never left kept, whichever runs first.
+    #[cfg(blaze_check)]
+    #[test]
+    fn model_a_check_pending_as_its_watch_ends_is_not_kept() {
+        blaze_check::model(|| {
+            let slot = std::sync::Arc::new(Slot { key: AtomicPtr::new(null_mut()), state: AtomicU64::new(0) });
+            let dead = std::sync::Arc::new(AtomicBool::new(false));
+            let watch = {
+                let (slot, dead) = (slot.clone(), dead.clone());
+                blaze_check::thread::spawn(move || {
+                    dead.store(true, Ordering::SeqCst);
+                    slot.forget();
+                })
+            };
+            let token = 1 << PENDING;
+            if slot.pend(token, &dead) {
+                slot.publish(token, COVERED | DIR, &dead);
+            }
+            watch.join().unwrap();
+            assert_eq!(slot.state.load(Ordering::SeqCst) & COVERED, 0, "a check kept past the end of its watch");
+        });
+    }
+
+    /// A change told between a check's pending and its publishing lets go of it: the check
+    /// published is never one the change came after, so it is kept only when the change was
+    /// told before the check was made pending.
+    #[cfg(blaze_check)]
+    #[test]
+    fn model_a_change_told_while_a_check_is_pending_is_not_lost() {
+        blaze_check::model(|| {
+            let slot = std::sync::Arc::new(Slot { key: AtomicPtr::new(null_mut()), state: AtomicU64::new(0) });
+            let dead = AtomicBool::new(false);
+            let pended = std::sync::Arc::new(AtomicBool::new(false));
+            let told = {
+                let (slot, pended) = (slot.clone(), pended.clone());
+                blaze_check::thread::spawn(move || {
+                    let after = pended.load(Ordering::SeqCst);
+                    slot.forget();
+                    after
+                })
+            };
+            let token = 1 << PENDING;
+            assert!(slot.pend(token, &dead));
+            pended.store(true, Ordering::SeqCst);
+            slot.publish(token, COVERED, &dead);
+            let after = told.join().unwrap();
+            if after {
+                assert_eq!(slot.state.load(Ordering::SeqCst), 0, "a change told after the check was pending was lost");
+            }
+        });
     }
 }

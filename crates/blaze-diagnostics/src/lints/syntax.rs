@@ -591,7 +591,6 @@ fn pass_rank(lint: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use hir::Semantics;
     use syntax::{
         TextSize,
         view::{AstNode as _, HasName as _},
@@ -604,10 +603,9 @@ mod tests {
         let checked = crate::tests::checked(fixture);
         let db = &checked.db;
         hir::attach_db(db, || {
-            let sema = Semantics::new(db);
             let krate = hir::check::workspace_crates(db)[0];
             let frame = crate::tests::frame();
-            let cx = Cx::new(&sema, krate, checked.files(), &frame);
+            let cx = Cx::new(db, krate, checked.files(), &frame);
             check(&cx, cx.walk());
         });
     }

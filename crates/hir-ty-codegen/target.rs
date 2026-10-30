@@ -235,6 +235,7 @@ impl Target {
         if selected.triple == triple {
             Ok(selected)
         } else {
+            // alloc: an error
             Err(format!("the target is {} already, not {triple}", selected.triple))
         }
     }
@@ -359,6 +360,7 @@ impl Target {
             Some("x86_64") => Arch::X86_64,
             Some("aarch64") => Arch::Aarch64,
             Some("wasm32") => Arch::Wasm32,
+            // alloc: an error
             _ => return Err(format!("blaze emits no code for the architecture of {triple}")),
         };
         let system = parts.find(|part| matches!(*part, "linux" | "darwin" | "windows"));
@@ -376,8 +378,10 @@ impl Target {
             }
             // FIXME: x86-64 Mach-O and AArch64 PE have no splice written for them, and the
             // GNU flavour of Windows unwinds another way than the tables of `unwind::seh`.
+            // alloc: an error
             _ => return Err(format!("blaze emits no code for the system of {triple}")),
         };
+        // alloc: once per target parsed, at setup
         Ok(Target { triple: triple.to_owned(), arch, object_format, call_conv, unwind })
     }
 
@@ -504,6 +508,10 @@ impl Target {
         frame_pointers: bool,
         opt: OptLevel,
     ) -> Result<OwnedTargetIsa, String> {
+        fn message(error: impl std::fmt::Display) -> String {
+            // alloc: an error at setup, once per ISA made
+            error.to_string()
+        }
         let mut flags = settings::builder();
         let (pic, tls_model) = self.addressing();
         let tls_model = match tls_model {
@@ -511,9 +519,8 @@ impl Target {
             TlsModel::MachO => "macho",
             TlsModel::Coff => "coff",
         };
-        // alloc: an error, once per ISA made
-        flags.set("is_pic", if pic { "true" } else { "false" }).map_err(|e| e.to_string())?;
-        flags.set("tls_model", tls_model).map_err(|e| e.to_string())?;
+        flags.set("is_pic", if pic { "true" } else { "false" }).map_err(message)?;
+        flags.set("tls_model", tls_model).map_err(message)?;
         // A frame larger than a page touches each page on its way down, as rustc's code does
         // (`probe-stack=inline-asm`, [`Target::stack_probe`]). Windows commits a stack one
         // page at a time as the guard page below the last is touched; elsewhere a thread's
@@ -521,49 +528,49 @@ impl Target {
         // whatever is mapped below, rather than fault where std says the stack overflowed.
         // WebAssembly's stack is the engine's.
         if self.arch != Arch::Wasm32 {
-            flags.set("enable_probestack", "true").map_err(|e| e.to_string())?;
-            flags.set("probestack_strategy", "inline").map_err(|e| e.to_string())?;
+            flags.set("enable_probestack", "true").map_err(message)?;
+            flags.set("probestack_strategy", "inline").map_err(message)?;
         }
         if frame_pointers || self.reads_frame_pointer() {
             // Cranelift gives a function its frame pointer only when all of them keep one.
-            flags.set("preserve_frame_pointers", "true").map_err(|e| e.to_string())?;
+            flags.set("preserve_frame_pointers", "true").map_err(message)?;
         }
         let opt = match opt {
             OptLevel::None => "none",
             OptLevel::Speed => "speed",
             OptLevel::SpeedAndSize => "speed_and_size",
         };
-        flags.set("opt_level", opt).map_err(|e| e.to_string())?;
+        flags.set("opt_level", opt).map_err(message)?;
         // Cranelift checks the IR of every function it is given unless told not to: a walk of
         // all of it, with its dominator tree, before any code is made. Tests check it, and
         // `BLAZE_VERIFY=1` asks for it elsewhere; the code made is the same either way.
         let verify = cfg!(test) || std::env::var_os("BLAZE_VERIFY").is_some_and(|it| it == "1");
         let verify = if verify { "true" } else { "false" };
-        flags.set("enable_verifier", verify).map_err(|e| e.to_string())?;
-        flags.set("enable_llvm_abi_extensions", "true").map_err(|e| e.to_string())?;
-        flags.set("regalloc_algorithm", regalloc).map_err(|e| e.to_string())?;
+        flags.set("enable_verifier", verify).map_err(message)?;
+        flags.set("enable_llvm_abi_extensions", "true").map_err(message)?;
+        flags.set("regalloc_algorithm", regalloc).map_err(message)?;
         // Cranelift has no ISA for WebAssembly: its code is written from the IR, and the
         // settings of this one are what the IR is made under.
         let triple = match self.arch {
             Arch::Wasm32 => "x86_64-unknown-linux-gnu",
             Arch::X86_64 | Arch::Aarch64 => &self.triple,
         };
-        let mut isa = isa::lookup_by_name(triple).map_err(|e| e.to_string())?;
+        let mut isa = isa::lookup_by_name(triple).map_err(message)?;
         if self.arch == Arch::X86_64 {
             // Only a function of `#[target_feature(enable = "cmpxchg16b")]` compares and
             // swaps 128 bits, as `core::arch::x86_64::cmpxchg16b` does.
-            isa.enable("has_cmpxchg16b").map_err(|e| e.to_string())?;
+            isa.enable("has_cmpxchg16b").map_err(message)?;
         }
         for setting in self.baseline_settings() {
-            isa.enable(setting).map_err(|e| e.to_string())?;
+            isa.enable(setting).map_err(message)?;
         }
         for feature in features.names() {
             if let Some((setting, on)) = self.cranelift_setting(feature)? {
                 let value = if on { "true" } else { "false" };
-                isa.set(setting, value).map_err(|e| e.to_string())?;
+                isa.set(setting, value).map_err(message)?;
             }
         }
-        isa.finish(settings::Flags::new(flags)).map_err(|e| e.to_string())
+        isa.finish(settings::Flags::new(flags)).map_err(message)
     }
 
     /// Whether code is position-independent and how it finds a thread-local: Cranelift's

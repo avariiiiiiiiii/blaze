@@ -16,34 +16,52 @@
 //! by the [`Confine`] a driver is given; a driver given none refuses it.
 //!
 //! On Windows [`iocp::Iocp`]. Each target's is its [`Native`] driver.
+//!
+//! Unsafe code is the kernel's and the mappings' only (docs/v2/plan/design/unsafe.md): each
+//! driver of a kernel interface is one module allowed it below, as are `fs::mapped`,
+//! `process::spawn` and `raw`'s single calls; the rest of the crate, the threads driver and
+//! the simulation with it, is safe Rust.
+
+#![deny(unsafe_code)]
 
 pub mod busy;
 #[cfg(target_os = "linux")]
 mod cgroup;
 pub mod create_process;
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code, reason = "the fanotify driver: its system calls and the events it reads")]
 mod fanotify;
 #[cfg(target_os = "macos")]
 mod footprint;
 pub mod fs;
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "the FSEvents driver: CoreFoundation, FSEvents and dispatch calls")]
 mod fsevents;
+mod handoff;
 #[cfg(windows)]
+#[allow(unsafe_code, reason = "the IOCP driver: Win32 calls and the OVERLAPPEDs the kernel writes")]
 pub mod iocp;
 mod journal;
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "the kqueue driver: kevent and the records it reads")]
 pub mod kqueue;
 #[cfg(unix)]
+#[allow(unsafe_code, reason = "sockets: descriptors owned from raw and the calls std lacks")]
 mod net;
 #[cfg(unix)]
 mod process;
+#[allow(unsafe_code, reason = "single system calls and the aligned-copy view, each behind a safe function")]
+mod raw;
 pub mod signal;
 pub mod sim;
+mod sync;
 mod tags;
 pub mod threads;
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code, reason = "the io_uring driver: its mapped rings, buffers and system calls")]
 pub mod uring;
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code, reason = "the inotify driver: its system calls and the events it reads")]
 mod watch;
 pub mod wheel;
 
@@ -470,15 +488,10 @@ pub struct Mapping(std::sync::Arc<Held>);
 enum Held {
     /// A file mapped by [`Effect::Map`].
     File(fs::Mapped),
-    /// Bytes copied into blocks of [`Block`]'s alignment, the first `len` of them the mapping.
-    Copied { blocks: Box<[Block]>, len: usize },
+    /// Bytes copied into blocks of sixteen-byte alignment: an image's records need their buffer
+    /// that aligned (`blaze_format::ALIGN`), as a mapped file's page is.
+    Copied(raw::Aligned),
 }
-
-/// Sixteen bytes on a sixteen-byte boundary: an image's records need their buffer that aligned
-/// (`blaze_format::ALIGN`), as a mapped file's page is.
-#[derive(Clone, Copy)]
-#[repr(C, align(16))]
-struct Block([u8; 16]);
 
 impl Mapping {
     pub(crate) fn file(mapped: fs::Mapped) -> Mapping {
@@ -488,23 +501,14 @@ impl Mapping {
     /// `bytes` copied, starting on a sixteen-byte boundary: a file's contents read into memory,
     /// for the simulator, a file too small to map, or a test.
     pub fn copy(bytes: &[u8]) -> Mapping {
-        // alloc: the copy, once per mapping made from bytes
-        let mut blocks = vec![Block([0; 16]); bytes.len().div_ceil(16)].into_boxed_slice();
-        for (block, chunk) in blocks.iter_mut().zip(bytes.chunks(16)) {
-            block.0[..chunk.len()].copy_from_slice(chunk);
-        }
         // alloc: the shared owner, once per mapping made from bytes
-        Mapping(std::sync::Arc::new(Held::Copied { blocks, len: bytes.len() }))
+        Mapping(std::sync::Arc::new(Held::Copied(raw::Aligned::copy(bytes))))
     }
 
     pub fn bytes(&self) -> &[u8] {
         match &*self.0 {
             Held::File(mapped) => mapped.bytes(),
-            Held::Copied { blocks, len } => {
-                // SAFETY: `Block` is sixteen `u8`s with no padding (`repr(C)`), so `blocks` is
-                // `16 * blocks.len()` initialized bytes, and `copy` made `len` at most that.
-                unsafe { std::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), *len) }
-            }
+            Held::Copied(copied) => copied.bytes(),
         }
     }
 
@@ -645,8 +649,8 @@ pub fn run_until_idle(
     effects: &mut Vec<Effect>,
     mut on: impl FnMut(Completion, &mut Vec<Effect>),
 ) {
-    // alloc: once per call, until idle; its callers are tests, examples and one-shot setup,
-    // never a hot loop.
+    // Its callers are tests, examples and one-shot setup, never a hot loop.
+    // alloc: once per call, until idle.
     let mut done = Vec::new();
     loop {
         driver.submit(effects);

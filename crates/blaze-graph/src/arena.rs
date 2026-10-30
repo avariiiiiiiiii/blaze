@@ -9,7 +9,6 @@
 //! machine's limit, less what others use in blaze's own cgroup and a margin.
 
 use std::{
-    alloc::{GlobalAlloc, Layout},
     cell::Cell,
     fmt, io,
     path::Path,
@@ -133,42 +132,52 @@ fn signed(bytes: usize) -> i64 {
     bytes as i64
 }
 
-// SAFETY: every call goes to `A` with the caller's arguments, so `A`'s guarantees hold; the
-// counting beside it touches an atomic and `LOCAL`, a `const` thread-local with no destructor,
-// and registers `EXIT`'s destructor once per thread, whose own allocations `flush` takes
-// without registering again.
-unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller upholds `alloc`'s contract for `layout`.
-        let ptr = unsafe { self.0.alloc(layout) };
-        if !ptr.is_null() {
-            count(signed(layout.size()));
-        }
-        ptr
-    }
+/// The allocator hook: `GlobalAlloc` is an unsafe trait, and this is the one way to see every
+/// allocation (a safe wrapper type would see only the allocations made through it).
+#[allow(unsafe_code)]
+mod global {
+    use std::alloc::{GlobalAlloc, Layout};
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller upholds `alloc_zeroed`'s contract for `layout`.
-        let ptr = unsafe { self.0.alloc_zeroed(layout) };
-        if !ptr.is_null() {
-            count(signed(layout.size()));
-        }
-        ptr
-    }
+    use super::{Counting, count, signed};
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: the caller says `ptr` was allocated by this allocator with `layout`.
-        unsafe { self.0.dealloc(ptr, layout) };
-        count(-signed(layout.size()));
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: the caller upholds `realloc`'s contract for `ptr`, `layout` and `new_size`.
-        let new = unsafe { self.0.realloc(ptr, layout, new_size) };
-        if !new.is_null() {
-            count(signed(new_size) - signed(layout.size()));
+    // SAFETY: every call goes to `A` with the caller's arguments, so `A`'s guarantees hold; the
+    // counting beside it touches an atomic and `LOCAL`, a `const` thread-local with no
+    // destructor, and registers `EXIT`'s destructor once per thread, whose own allocations
+    // `flush` takes without registering again. An allocation that recursed into itself here
+    // would deadlock or overflow the stack.
+    unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller upholds `alloc`'s contract for `layout`.
+            let ptr = unsafe { self.0.alloc(layout) };
+            if !ptr.is_null() {
+                count(signed(layout.size()));
+            }
+            ptr
         }
-        new
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller upholds `alloc_zeroed`'s contract for `layout`.
+            let ptr = unsafe { self.0.alloc_zeroed(layout) };
+            if !ptr.is_null() {
+                count(signed(layout.size()));
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: the caller says `ptr` was allocated by this allocator with `layout`.
+            unsafe { self.0.dealloc(ptr, layout) };
+            count(-signed(layout.size()));
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // SAFETY: the caller upholds `realloc`'s contract for `ptr`, `layout` and `new_size`.
+            let new = unsafe { self.0.realloc(ptr, layout, new_size) };
+            if !new.is_null() {
+                count(signed(new_size) - signed(layout.size()));
+            }
+            new
+        }
     }
 }
 
@@ -232,6 +241,7 @@ pub fn own() -> u64 {
 pub fn machine_budget(margin: u64) -> io::Result<Budget> {
     let mut limits = machine_limits()?;
     #[cfg(unix)]
+    // alloc: the budget's name, once per daemon start
     limits.extend(rlimit_as()?.map(|bytes| (bytes, "the process's RLIMIT_AS".to_owned())));
     let in_use = machine_in_use(own())?;
     least(limits, in_use, margin)
@@ -253,36 +263,66 @@ fn machine_limits() -> io::Result<Vec<(u64, String)>> {
 }
 
 #[cfg(target_os = "macos")]
-fn machine_limits() -> io::Result<Vec<(u64, String)>> {
-    let mut bytes: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    // SAFETY: the name is a C string, and `bytes` and `len` say a buffer of `len` bytes.
-    let status = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut bytes).cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if status != 0 {
-        let why = io::Error::last_os_error();
-        return Err(io::Error::new(why.kind(), format!("sysctl hw.memsize: {why}")));
+use sys::machine_limits;
+#[cfg(unix)]
+use sys::rlimit_as;
+
+/// The kernel's word on the machine's memory: two calls that write into a buffer this passes,
+/// which only `libc`'s raw functions reach.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod sys {
+    use std::io;
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn machine_limits() -> io::Result<Vec<(u64, String)>> {
+        let mut bytes: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: the name is a C string that outlives the call, and `bytes` and `len` say a
+        // buffer of `len` bytes; a `len` larger than `bytes` would let the kernel write past it.
+        let status = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&raw mut bytes).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status != 0 {
+            let why = io::Error::last_os_error();
+            // alloc: the error's message
+            return Err(io::Error::new(why.kind(), format!("sysctl hw.memsize: {why}")));
+        }
+        if len != std::mem::size_of::<u64>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                // alloc: the error's message
+                format!("sysctl hw.memsize gave {len} bytes, not 8"),
+            ));
+        }
+        // alloc: the limits and their names, once per daemon start
+        Ok(vec![(bytes, "sysctl hw.memsize".to_owned())])
     }
-    if len != std::mem::size_of::<u64>() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("sysctl hw.memsize gave {len} bytes, not 8"),
-        ));
+
+    pub(super) fn rlimit_as() -> io::Result<Option<u64>> {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: `limit` is a `rlimit` the kernel writes and nothing else borrows.
+        if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0 {
+            let why = io::Error::last_os_error();
+            // alloc: the error's message
+            return Err(io::Error::new(why.kind(), format!("getrlimit(RLIMIT_AS): {why}")));
+        }
+        let current: u64 = limit.rlim_cur;
+        Ok((limit.rlim_cur != libc::RLIM_INFINITY).then_some(current))
     }
-    Ok(vec![(bytes, "sysctl hw.memsize".to_owned())])
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn machine_limits() -> io::Result<Vec<(u64, String)>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
+        // alloc: the error's message
         format!(
             "blaze reads the machine's memory only on Linux and macOS, not {}",
             std::env::consts::OS
@@ -290,24 +330,14 @@ fn machine_limits() -> io::Result<Vec<(u64, String)>> {
     ))
 }
 
-#[cfg(unix)]
-fn rlimit_as() -> io::Result<Option<u64>> {
-    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    // SAFETY: `limit` is a `rlimit` to write.
-    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) } != 0 {
-        let why = io::Error::last_os_error();
-        return Err(io::Error::new(why.kind(), format!("getrlimit(RLIMIT_AS): {why}")));
-    }
-    let current: u64 = limit.rlim_cur;
-    Ok((limit.rlim_cur != libc::RLIM_INFINITY).then_some(current))
-}
-
 fn invalid(path: &Path, why: impl fmt::Display) -> io::Error {
+    // alloc: the error's message
     io::Error::new(io::ErrorKind::InvalidData, format!("{}: {why}", path.display()))
 }
 
 fn read(path: &Path) -> io::Result<String> {
     std::fs::read_to_string(path)
+        // alloc: the error's message
         .map_err(|why| io::Error::new(why.kind(), format!("{}: {why}", path.display())))
 }
 
@@ -325,8 +355,10 @@ fn linux_limits(root: &Path) -> io::Result<Vec<(u64, String)>> {
         .trim()
         .strip_suffix("kB")
         .and_then(|it| it.trim().parse::<u64>().ok())
+        // alloc: the error's message
         .ok_or_else(|| invalid(&meminfo, format!("MemTotal of `{}`", line.trim())))?;
     let total = kib.checked_mul(1024).ok_or_else(|| invalid(&meminfo, "MemTotal past 2^64"))?;
+    // alloc: the limits and their names, once per daemon start
     let mut limits = vec![(total, "MemTotal of /proc/meminfo".to_owned())];
     let cgroup = root.join("proc/self/cgroup");
     for line in read(&cgroup)?.lines().filter(|it| !it.is_empty()) {
@@ -334,6 +366,7 @@ fn linux_limits(root: &Path) -> io::Result<Vec<(u64, String)>> {
         let (Some(hierarchy), Some(controllers), Some(path)) =
             (parts.next(), parts.next(), parts.next())
         else {
+            // alloc: the error's message
             return Err(invalid(&cgroup, format!("a line `{line}`")));
         };
         let (mount, file) = if hierarchy == "0" && controllers.is_empty() {
@@ -352,12 +385,15 @@ fn linux_limits(root: &Path) -> io::Result<Vec<(u64, String)>> {
                     let bytes = text
                         .trim()
                         .parse::<u64>()
+                        // alloc: the error's message
                         .map_err(|_| invalid(&limit, format!("a limit of `{}`", text.trim())))?;
+                    // alloc: a limit's name, once per cgroup level per daemon start
                     limits.push((bytes, format!("{file} of cgroup {group}")));
                 }
                 // A cgroup has no limit file at the root of its hierarchy.
                 Err(why) if why.kind() == io::ErrorKind::NotFound => {}
                 Err(why) => {
+                    // alloc: the error's message
                     return Err(io::Error::new(why.kind(), format!("{}: {why}", limit.display())));
                 }
             }
@@ -385,6 +421,7 @@ fn linux_in_use(root: &Path, own: u64) -> io::Result<Option<(u64, String)>> {
         let (Some(hierarchy), Some(controllers), Some(path)) =
             (parts.next(), parts.next(), parts.next())
         else {
+            // alloc: the error's message
             return Err(invalid(&cgroup, format!("a line `{line}`")));
         };
         if hierarchy == "0" && controllers.is_empty() {
@@ -404,13 +441,16 @@ fn linux_in_use(root: &Path, own: u64) -> io::Result<Option<(u64, String)>> {
         Ok(text) => text
             .trim()
             .parse::<u64>()
+            // alloc: the error's message
             .map_err(|_| invalid(&count, format!("a count of `{}`", text.trim())))?,
         Err(why) if why.kind() == io::ErrorKind::NotFound && group == "/" => return Ok(None),
         Err(why) => {
+            // alloc: the error's message
             return Err(io::Error::new(why.kind(), format!("{}: {why}", count.display())));
         }
     };
     let others = current.saturating_sub(own);
+    // alloc: the budget's name, once per daemon start
     let from = format!(
         "{} others use in cgroup {group} ({file} {} less blaze's own {})",
         gb(others),
@@ -421,6 +461,7 @@ fn linux_in_use(root: &Path, own: u64) -> io::Result<Option<(u64, String)>> {
 }
 
 fn gb(bytes: u64) -> String {
+    // alloc: a part of the budget's name or an error's message, once per daemon start
     format!("{:.2} GB", bytes as f64 / f64::from(1 << 30))
 }
 
@@ -436,15 +477,19 @@ fn least(
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no memory limit was read"))?;
     let others = in_use.as_ref().map_or(0, |it| it.0);
     let taken = match &in_use {
+        // alloc: the budget's name, once per daemon start
         Some((_, used)) => format!("{used} and a margin of {}", gb(margin)),
+        // alloc: the budget's name, once per daemon start
         None => format!("a margin of {}", gb(margin)),
     };
     match bytes.checked_sub(others).and_then(|it| it.checked_sub(margin)) {
         Some(left) if left > 0 => {
+            // alloc: the budget's name, once per daemon start
             Ok(Budget { bytes: left, from: format!("{from}, {}, less {taken}", gb(bytes)) })
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
+            // alloc: the error's message
             format!("no memory is left of the {} of {from} less {taken}", gb(bytes)),
         )),
     }

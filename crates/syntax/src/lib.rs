@@ -52,7 +52,9 @@ pub mod syntax_editor;
 pub mod utils;
 pub mod view;
 
-use std::marker::PhantomData;
+use std::{cell::RefCell, marker::PhantomData};
+
+use blaze_mem::scratch::Scratch;
 
 use stdx::format_to;
 use triomphe::Arc;
@@ -161,18 +163,49 @@ impl<T> Parse<T> {
         self.errors.is_some()
     }
 
+    /// [`Parse::errors`] at its exact length, `None` for none: what a memo keeps.
+    pub fn errors_exact(&self) -> Option<Box<[SyntaxError]>> {
+        self.exact_of(false)
+    }
+
+    /// [`Parse::errors_with_bodies`] at its exact length, `None` for none.
+    pub fn errors_with_bodies_exact(&self) -> Option<Box<[SyntaxError]>> {
+        self.exact_of(true)
+    }
+
     fn errors_of(&self, all_bodies: bool) -> Vec<SyntaxError> {
-        let mut errors = if let Some(e) = self.errors.as_deref() { e.to_vec() } else { vec![] };
+        let mut errors = Vec::new(); // alloc: the caller's own list; memos use `errors_exact`
+        self.errors_of_into(all_bodies, &mut errors);
+        errors
+    }
+
+    fn exact_of(&self, all_bodies: bool) -> Option<Box<[SyntaxError]>> {
+        // Taken, not borrowed: a body's parse inside validation then starts from an empty list.
+        let mut kept = ERRORS.replace(Scratch::new());
+        let errors = kept.take();
+        self.errors_of_into(all_bodies, errors);
+        // alloc: the result, at its exact length; the errors move, none is cloned
+        let exact = (!errors.is_empty()).then(|| errors.drain(..).collect());
+        ERRORS.set(kept);
+        exact
+    }
+
+    fn errors_of_into(&self, all_bodies: bool, errors: &mut Vec<SyntaxError>) {
+        if let Some(e) = self.errors.as_deref() {
+            errors.extend_from_slice(e);
+        }
         let root = self.root();
         let Some(edition) = self.outline else {
-            validation::validate(root, &mut errors);
-            return errors;
+            validation::validate(root, errors);
+            return;
         };
         let tree = self.tree.as_ref().unwrap().flat();
-        let lazies: Vec<_> = tree.lazies().map(|at| (tree.range(at), at)).collect();
+        let mut kept = LAZIES.replace(Scratch::new());
+        let lazies = kept.take();
+        lazies.extend(tree.lazies().map(|at| (tree.range(at), at)));
         validation::validate_outline(
             root,
-            &lazies,
+            &lazies[..],
             |at, errors| {
                 if !all_bodies && !tree.is_parsed(at) {
                     return false;
@@ -180,10 +213,16 @@ impl<T> Parse<T> {
                 errors.extend(parsing::body_errors(tree, at, edition));
                 true
             },
-            &mut errors,
+            errors,
         );
-        errors
+        LAZIES.set(kept);
     }
+}
+
+thread_local! {
+    /// The lists a parse's errors are gathered in, kept at the largest they grew to.
+    static ERRORS: RefCell<Scratch<SyntaxError>> = const { RefCell::new(Scratch::new()) };
+    static LAZIES: RefCell<Scratch<(TextRange, u32)>> = const { RefCell::new(Scratch::new()) };
 }
 
 /// A [`Parse`] that does not keep its tree alive.

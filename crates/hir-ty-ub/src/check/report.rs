@@ -87,8 +87,6 @@ pub(super) fn render<'db>(db: &'db Db, checker: &Checker<'db>, found: &Found, st
     out
 }
 
-}
-
 fn site_of(column: &[SiteId], alloc: AllocId) -> SiteId {
     column.get(alloc.index()).copied().unwrap_or(SiteId::START)
 }

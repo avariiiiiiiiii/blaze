@@ -56,18 +56,23 @@ impl Signature {
     /// Reads what [`Signature::encode`] wrote at `*at`, and moves `*at` past it.
     pub fn decode(bytes: &[u8], at: &mut usize) -> Result<Signature, String> {
         if byte(bytes, at)? != 0x60 {
+            // alloc: the error's message
             return Err("wasm: a type that is not a function type".to_owned());
         }
-        let mut lists = [Vec::new(), Vec::new()];
-        for list in &mut lists {
-            for _ in 0..read_uleb(bytes, at)? {
+        let mut read_list = || -> Result<Vec<ValType>, String> {
+            let count = read_uleb(bytes, at)?;
+            let mut list = Vec::with_capacity(bounded(count, bytes, *at));
+            for _ in 0..count {
                 let byte = byte(bytes, at)?;
                 let ty = ValType::from_byte(byte)
+                    // alloc: the error's message
                     .ok_or_else(|| format!("wasm: the value type {byte:#04x}"))?;
                 list.push(ty);
             }
-        }
-        let [params, results] = lists;
+            Ok(list)
+        };
+        let params = read_list()?;
+        let results = read_list()?;
         Ok(Signature { params, results })
     }
 }
@@ -103,7 +108,9 @@ impl Code {
     /// The function's `code`: the header's length, the header, then `body`; and where `body`
     /// starts in it.
     pub fn encode(&self, body: &[u8]) -> (Vec<u8>, u32) {
-        let mut header = Vec::new();
+        // The header is written first, into the buffer the code is returned in, and its length
+        // put in front of it once known.
+        let mut header = Vec::with_capacity(64 + body.len());
         self.ty.encode(&mut header);
         uleb(&mut header, self.types.len() as u64);
         for ty in &self.types {
@@ -132,11 +139,12 @@ impl Code {
                 string(&mut header, name);
             }
         }
-        let mut code = Vec::with_capacity(5 + header.len() + body.len());
-        uleb(&mut code, header.len() as u64);
-        code.extend(header);
+        let (len, len_bytes) = uleb_bytes(header.len() as u64);
+        let mut code = header;
+        code.reserve(len_bytes + body.len());
+        code.splice(0..0, len[..len_bytes].iter().copied());
         let start = code.len() as u32;
-        code.extend(body);
+        code.extend_from_slice(body);
         (code, start)
     }
 
@@ -151,21 +159,25 @@ impl Code {
             .ok_or("wasm: a truncated code header")?;
         let header = &code[..start];
         let ty = Signature::decode(header, &mut at)?;
-        let mut types = Vec::new();
-        for _ in 0..read_uleb(header, &mut at)? {
+        let count = read_uleb(header, &mut at)?;
+        let mut types = Vec::with_capacity(bounded(count, header, at));
+        for _ in 0..count {
             types.push(Signature::decode(header, &mut at)?);
         }
-        let mut type_fixups = Vec::new();
-        for _ in 0..read_uleb(header, &mut at)? {
+        let count = read_uleb(header, &mut at)?;
+        let mut type_fixups = Vec::with_capacity(bounded(count, header, at));
+        for _ in 0..count {
             let place = read_u32(header, &mut at)?;
             type_fixups.push((place, read_u32(header, &mut at)?));
         }
-        let mut stack_pointer = Vec::new();
-        for _ in 0..read_uleb(header, &mut at)? {
+        let count = read_uleb(header, &mut at)?;
+        let mut stack_pointer = Vec::with_capacity(bounded(count, header, at));
+        for _ in 0..count {
             stack_pointer.push(read_u32(header, &mut at)?);
         }
-        let mut imports = Vec::new();
-        for _ in 0..read_uleb(header, &mut at)? {
+        let count = read_uleb(header, &mut at)?;
+        let mut imports = Vec::with_capacity(bounded(count, header, at));
+        for _ in 0..count {
             let name = read_string(header, &mut at)?;
             let module = read_string(header, &mut at)?;
             let field = read_string(header, &mut at)?;
@@ -175,25 +187,42 @@ impl Code {
         let export = match byte(header, &mut at)? {
             0 => None,
             1 => Some(read_string(header, &mut at)?),
+            // alloc: the error's message
             other => return Err(format!("wasm: a code header's export tag {other}")),
         };
         if at != start {
+            // alloc: the error's message
             return Err("wasm: a code header longer than what it holds".to_owned());
         }
         Ok((Code { ty, types, type_fixups, stack_pointer, imports, export }, start))
     }
 }
 
-fn uleb(out: &mut Vec<u8>, mut value: u64) {
+fn uleb(out: &mut Vec<u8>, value: u64) {
+    let (bytes, len) = uleb_bytes(value);
+    out.extend_from_slice(&bytes[..len]);
+}
+
+/// `value` as an unsigned LEB128: its bytes and how many of them there are.
+fn uleb_bytes(mut value: u64) -> ([u8; 10], usize) {
+    let mut bytes = [0; 10];
+    let mut len = 0;
     loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
         if value == 0 {
-            out.push(byte);
-            return;
+            bytes[len] = byte;
+            return (bytes, len + 1);
         }
-        out.push(byte | 0x80);
+        bytes[len] = byte | 0x80;
+        len += 1;
     }
+}
+
+/// The room to make for `count` items read from `bytes` at `at`: each takes at least a byte,
+/// so a count past the bytes left is cut to them, and a corrupt count reserves no more.
+fn bounded(count: u64, bytes: &[u8], at: usize) -> usize {
+    usize::try_from(count).unwrap_or(usize::MAX).min(bytes.len().saturating_sub(at))
 }
 
 fn string(out: &mut Vec<u8>, string: &str) {
@@ -213,6 +242,7 @@ fn read_uleb(bytes: &[u8], at: &mut usize) -> Result<u64, String> {
     loop {
         let byte = byte(bytes, at)?;
         if shift >= 64 || (shift == 63 && byte & 0x7e != 0) {
+            // alloc: the error's message
             return Err("wasm: a LEB128 longer than 64 bits".to_owned());
         }
         value |= u64::from(byte & 0x7f) << shift;
@@ -224,6 +254,7 @@ fn read_uleb(bytes: &[u8], at: &mut usize) -> Result<u64, String> {
 }
 
 fn read_u32(bytes: &[u8], at: &mut usize) -> Result<u32, String> {
+    // alloc: the error's message
     u32::try_from(read_uleb(bytes, at)?).map_err(|_| "wasm: a number past 32 bits".to_owned())
 }
 
@@ -236,6 +267,7 @@ fn read_string(bytes: &[u8], at: &mut usize) -> Result<String, String> {
         .ok_or("wasm: a truncated code header")?;
     let string = std::str::from_utf8(&bytes[*at..end]).map_err(|_| "wasm: a name that is not UTF-8")?;
     *at = end;
+    // alloc: an import's name, which `Code` owns; a few per function that imports
     Ok(string.to_owned())
 }
 

@@ -1035,8 +1035,10 @@ impl Writer {
     }
 
     fn publish(table: Table) -> Writer {
+        // alloc: once per store made, the first published table.
         let table = Box::into_raw(Box::new(table));
         let shared = Shared { table: AtomicPtr::new(table), retired: Mutex::new(Limbo::new()) };
+        // alloc: once per store made, what readers share.
         Writer { shared: Arc::new(shared) }
     }
 
@@ -1065,6 +1067,7 @@ impl Writer {
 
     /// A handle for readers.
     pub(crate) fn shared(&self) -> Arc<Shared> {
+        // clone: one count per reader handle made, never per read.
         self.shared.clone()
     }
 
@@ -1101,6 +1104,7 @@ impl Writer {
     /// Publishes `next` in place of the table in use, retiring that one; returns how many
     /// retired tables are not freed yet.
     pub(crate) fn replace(&mut self, next: Building) -> usize {
+        // alloc: once per collection or repair, the table published.
         let next = Box::into_raw(Box::new(next.0));
         let old = self.shared.table.swap(next, Ordering::AcqRel);
         // SAFETY: `old` was the published `Box`, now unlinked; the limbo becomes its only
@@ -1108,14 +1112,14 @@ impl Writer {
         let old = unsafe { Box::from_raw(old) };
         let mut retired = self.shared.retired.lock().unwrap_or_else(PoisonError::into_inner);
         retired.retire(old);
-        retired.collect();
+        retired.collect(); // alloc: none, the limbo's sweep, not an iterator's collect
         retired.len()
     }
 
     /// Frees each retired table no reader's task can be in; returns how many are left.
     pub(crate) fn reclaim(&mut self) -> usize {
         let mut retired = self.shared.retired.lock().unwrap_or_else(PoisonError::into_inner);
-        retired.collect();
+        retired.collect(); // alloc: none, the limbo's sweep, not an iterator's collect
         retired.len()
     }
 }

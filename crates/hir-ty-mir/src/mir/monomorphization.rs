@@ -329,7 +329,8 @@ impl<'db> Filler<'db> {
             }
             if let Some(terminator) = &mut bb.terminator {
                 match &mut terminator.kind {
-                    TerminatorKind::Call { func, args, .. } => {
+                    TerminatorKind::Call { func, args, .. }
+                    | TerminatorKind::TailCall { func, args, .. } => {
                         self.fill_operand(func)?;
                         for op in &mut **args {
                             self.fill_operand(op)?;

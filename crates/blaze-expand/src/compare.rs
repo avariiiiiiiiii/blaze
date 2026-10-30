@@ -1,5 +1,5 @@
 //! The toolchain's proc-macro server held against blaze's (docs/no-rustc.md, step J1): with
-//! `BLAZE_PROC_MACRO_COMPARE` naming the server built from `vendor/proc-macro-srv` and
+//! `BLAZE_PROC_MACRO_COMPARE` naming the server built from `crates/proc-macro-srv-cli` and
 //! `BLAZE_PROC_MACRO_LIBS` a directory of the libraries blaze linked (named as rustc's, or
 //! `lib<crate>` and the platform's suffix, with the list of their macros in them), each call the toolchain's server
 //! expands with rustc's library of a crate is expanded again by that server with blaze's

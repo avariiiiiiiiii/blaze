@@ -18,7 +18,7 @@
 use crate::{
     format::HoleKind,
     generate::ir::{B, bits, float, icmp, ir, lane_bits, mangle, splat, vec_of, zero},
-    shape::{Disp, FloatCc, IntCc, Op, RmwOp, Shape, Ty},
+    shape::{Disp, FloatCc, IntCc, Isa, Op, RmwOp, Shape, Ty},
 };
 
 /// The results of `shape` computed from `args`, in [`super::ir::B`]'s stencil.
@@ -260,9 +260,11 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
             let name = "llvm.aarch64.neon.tbl2.v16i8";
             one(b.call("<16 x i8>", name, &[("<16 x i8>", x()), ("<16 x i8>", y()), ("<16 x i8>", mask.as_str())]))
         }
+        Op::Insertlane if b.isa == Isa::X86_64 && lane_bits(ty) == 8 => one(insert_byte(b, x(), y(), shape.aux)),
         Op::Insertlane => {
             one(b.val(&format!("insertelement {t} {}, {} {}, i64 {}", x(), ir(ty.lane()), y(), shape.aux)))
         }
+        Op::Extractlane if b.isa == Isa::X86_64 && lane_bits(ty) == 8 => one(extract_byte(b, x(), shape.aux)),
         Op::Extractlane => one(b.val(&format!("extractelement {t} {}, i64 {}", x(), shape.aux))),
         Op::VanyTrue => {
             let lane = ir(ty.lane());
@@ -363,7 +365,11 @@ pub fn body(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
             one(b.val(&format!("extractvalue {{ {t}, i1 }} {pair}, 0")))
         }
         Op::Fence => {
-            b.stmt("fence seq_cst");
+            // x86-64's `fence seq_cst` is a `lock or` on the stack; Cranelift's fence is `mfence`.
+            match b.isa {
+                Isa::X86_64 => b.stmt("call void asm sideeffect \"mfence\", \"~{memory}\"()"),
+                Isa::Aarch64 => b.stmt("fence seq_cst"),
+            }
             vec![]
         }
         Op::LoadConfined | Op::StoreConfined => confined(b, shape, args),
@@ -686,4 +692,36 @@ fn confined(b: &mut B<'_>, shape: Shape, args: &[String]) -> Vec<String> {
         }
         other => unreachable!("{shape} fuses `{}`, which no confined op does", other.info().name),
     }
+}
+
+/// The `i16` word `word` of `<16 x i8>` `v` (as an `i32`, zero-extended), by `pextrw` in
+/// asm: SSE2 has no `pextrb`, LLVM lowers a byte extract without it through the stack, and
+/// it folds a plain word extract plus shift back into that byte extract.
+fn pextrw(b: &mut B<'_>, v: &str, word: u8) -> String {
+    let words = b.val(&format!("bitcast <16 x i8> {v} to <2 x i64>"));
+    b.val(&format!("call i32 asm \"pextrw $${word}, $1, $0\", \"=r,x\"(<2 x i64> {words})"))
+}
+
+/// Byte `lane` of `<16 x i8>` `v` on x86-64 (see [`pextrw`]).
+fn extract_byte(b: &mut B<'_>, v: &str, lane: u8) -> String {
+    let word = pextrw(b, v, lane / 2);
+    let shifted = b.val(&format!("lshr i32 {word}, {}", u32::from(lane % 2) * 8));
+    b.val(&format!("trunc i32 {shifted} to i8"))
+}
+
+/// `<16 x i8>` `v` with byte `lane` set to `x` on x86-64: the word holding it, merged and
+/// put back by `pinsrw` in asm (SSE2 has no `pinsrb`; see [`pextrw`]).
+fn insert_byte(b: &mut B<'_>, v: &str, x: &str, lane: u8) -> String {
+    let word = pextrw(b, v, lane / 2);
+    let (keep, shift) = if lane % 2 == 0 { (0xff00_u32, 0) } else { (0x00ff, 8) };
+    let kept = b.val(&format!("and i32 {word}, {keep}"));
+    let wide = b.val(&format!("zext i8 {x} to i32"));
+    let byte = b.val(&format!("shl i32 {wide}, {shift}"));
+    let merged = b.val(&format!("or i32 {kept}, {byte}"));
+    let words = b.val(&format!("bitcast <16 x i8> {v} to <2 x i64>"));
+    let set = b.val(&format!(
+        "call <2 x i64> asm \"pinsrw $${}, $2, $0\", \"=x,0,r\"(<2 x i64> {words}, i32 {merged})",
+        lane / 2
+    ));
+    b.val(&format!("bitcast <2 x i64> {set} to <16 x i8>"))
 }

@@ -1,0 +1,23 @@
+{
+  "id": "00721",
+  "from_lane": "dedup",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-units/src/graph.rs"
+  ],
+  "what": "## dedup: rename blaze-units' unit `Interner` to `UnitInterner`\n\nFrom `dedup-intern` (report `/tmp/blaze-lanes/v2-dedup-intern.md`). `crates/blaze-units/src/graph.rs`'s\n`Interner` is an interner that differs on purpose from the shared one (`crate intern`): it\nlives for one unit-graph build, is single-threaded (`&mut`), its IDs are positions in that\ngraph, and it keys units without their profile because cargo compares profiles without the\ndeferred bit (a `Vec` of candidates per key). It stays, under cargo's own name and with a\ncomment saying why, so it reads as cargo's `UnitInterner` and not as `intern`'s.\n\nIn `crates/blaze-units/src/graph.rs`, every `Interner` (lines 87, 93, 185, 221, 883, 938, 1042)\nbecomes `UnitInterner`, and the doc at lines 84-85:\n```rust\n/// cargo's `UnitInterner`: a unit equal to one made before is that one. Profiles compare as\n/// cargo's do, without whether a setting is deferred, so the first one made is kept.\n```\nbecomes:\n```rust\n/// cargo's `UnitInterner`: a unit equal to one made before is that one. Profiles compare as\n/// cargo's do, without whether a setting is deferred, so the first one made is kept. Not\n/// `intern`'s interner: it lives for one graph build behind `&mut`, its IDs are this graph's\n/// positions, and the profile is compared outside the key.\n```\n\n> forwarded to cargo (from requests, pass 16; told by tmux).",
+  "state": "open",
+  "created": "2026-10-30T06:42:58Z",
+  "updated": "2026-10-30T06:42:58Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/cargo.md#dedup: rename blaze-units' unit `Interner` to `UnitInterner`",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/cargo.md:2797"
+    }
+  ]
+}

@@ -594,6 +594,26 @@ rejects; `compiler/rustc_const_eval/src/check_consts/ops.rs`, `build_error_for_c
 > It writes `ConstCheckKind` with `code` and `message` kept as they are, and ports rustc's
 > `check_consts` refusals with tests taken from rustc's `tests/ui`. The parts in `crates/hir`
 > (anon consts, inline consts and const arguments left unchecked) go as its requests.
+> applied by codegen-rq-mir-constcheck (2026-10-30): `ConstCheckDiagnostic { kind, context,
+> code, span, message }` with `ConstCheckKind` (rustc's `NonConstOp`s; `code`/`message` as
+> before for the six old kinds). Newly refused: closure, operator, deref-coercion, `for`, `?`,
+> `try`-block and `format_args!` calls (E0015, or E0658 when conditionally const without
+> `const_trait_impl`); c-variadic calls; `panic!` of a non-`&str`; const stability
+> (`check_callee_stability`, intrinsic stability, recursive const stability in staged crates).
+> Methods of a `const impl` and `const trait` default bodies are now const contexts. Tests:
+> `crates/hir-ty-mir/tests/mir/const_check.rs` (each citing its rustc ui test; not run: no
+> builds in this pass). Reading `kind` instead of the message, the notes per kind, anon consts,
+> E0277 for unmet `[const]` bounds and the rest are in `v2/requests/codegen-rq-mir-constcheck.md`
+> R1–R8. Not applied: the qualif kinds (`LiveDrop` E0493, escaping `&mut`/`Cell` borrows), whose
+> kinds exist but are not reported yet; `ThreadLocalAccess`; `.await`.
+> applied by codegen-rq-mir (2026-10-30), the qualif kinds: `const_check/qualifs.rs` (from the
+> grandchild `codegen-rq-mir-constcheck-qualifs`, a port of rustc's qualifs and
+> `FlowSensitiveAnalysis` at 16d1ffac) is wired into `const_check`. It reports `LiveDrop` E0493
+> (behind `const_destruct` for a `[const]` destructor; precise mode on the drop-elaborated
+> runtime body), `EscapingMutBorrow` E0764 and `EscapingCellBorrow` E0492 (secondary, as in
+> rustc), and `ThreadLocalAccess` E0625 for a `#[thread_local]` static. Tests:
+> `tests/mir/const_check_drops.rs`, refused and accepted cases, each from a rustc ui test.
+> `.await` and `MatchCmp` are still not reported. Not built.
 
 ## diagnostics-lints: `crate::tests::ui` passes compiletest's flags (the parent, `diagnostics`, `src/tests.rs`)
 
@@ -1427,6 +1447,10 @@ neither a return nor a call of the function itself as rustc treats `TailCall`.
 > other exhaustive match to update. The lowering follows (operands as for `Expr::Call`, the
 > body's drops in scope order, then `TailCall`), with the evaluator's frame swap and the
 > inliner refusing it.
+> codegen-rq-mir (2026-10-30): db's variant is in, and so are hir-ty-mir's arms (the inliner
+> refuses a callee with a tail call, as rustc does). What's left is lowering `Expr::Become`
+> (`lower.rs:1580`), which belongs to frontend-fast-mir-next2, the holder of `lower.rs` (told
+> by tmux). The evaluator's arm follows it.
 
 ## diagnostics-items-impls: what the checks of impls need of the front end
 
@@ -2282,6 +2306,11 @@ or `unused_assignments`.
 > (each listed local's first `Assign` in `start_block` is the copy). The two pushes in
 > `pattern_matching.rs` (after `self.guard_refs.insert`) and `lower.rs` (after the capture
 > copy's `push_assignment`) are written out there, and go in when the fields do.
+> codegen-rq-mir (2026-10-30): db's fields are in (`MirBody::guard_refs`, `capture_copies`). The
+> two pushes go in `lower/pattern_matching.rs` and `lower.rs`, which frontend-fast-mir-next2
+> holds (told by tmux, with the exact lines in R4).
+> applied by codegen-rq-mir (2026-10-30), items 1 and 2: lowering fills `MirBody::guard_refs`
+> and `capture_copies` (see `v2/requests/diagnostics-lints-bodies-liveness.md`). Not built.
 
 ## diagnostics-lints-bodies-calls-methods-panics: `assert!(c, msg)` before 2021 calls `panic!` unqualified
 
@@ -4205,6 +4234,8 @@ expansion. Once the derives copy the attributes, that special case comes out (te
 >   Wanted (db-expand, `derive_macro.rs`, held by db-expand-derive): write `#[automatically_derived]` at the derive's span before each impl, with `with_item_attrs`' copies after it, for every derive including `CoercePointee`. Then test that a derived impl has the flag.
 > - **The fast path has no copies.** With the fast path on (the default, so hir and blaze-diagnostics tests and the editor), derives other than `CoerceShared`, `ConstParamTy` and `From` are `BuiltinDeriveImplId`s with no tokens, so no copied attributes. A lint level or stability read of such an impl has to take the ADT's six attributes, as `with_item_attrs` picks them. With `Defs::stability_owner`'s derive case removed, nothing does that now. Wanted (diagnostics): read a `BuiltinDeriveImplId`'s stability and lint levels from its ADT's `#[allow]`/`#[warn]`/`#[deny]`/`#[forbid]`/`#[stable]`/`#[unstable]`, or run the derive tests with `set_expand_builtin_derives(db, true)`.
 > diagnostics (window 84, 2026-10-29 23:55): the fast path, not built. The dead-code lint is the only place blaze-diagnostics reads a lint level at a `BuiltinDeriveImplId`. Its `seed.rs` `level` read it at the ADT's parent, which drops the ADT's own lint attributes. It now calls `level.rs` `Levels::at_derived`: the state at the ADT's parent, then the ADT's `allow`/`warn`/`deny`/`forbid` in order. `expect` is skipped, because `create_derived_impl` doesn't copy it. Stability needs nothing for these impls: the stability walk reads only impls that have syntax, and a trait impl's items take the trait's stability. No test yet; one needs a case where the derived impl's `dead_code` level changes what is reported.
+> db-expand-derive (23:46, not built): db-audit-other's test gap is closed. `derived_impls_get_the_items_lint_and_stability_attributes` (`derive_macro/tests.rs`) now runs every derive of `derives()` plus `From`, so every built-in derive except `CoercePointee` (which copies none, as rustc's doesn't) and `CoerceShared` (its target is read through the db, so it can't run here). It covers an item at the current edition and one at `Edition2015` (the same attributes, with `#[warn]` written plain since 2015 has no `r#`). For each it checks: the attributes copied before every impl (two for `PartialEq`, one for the rest), the first `#` at the item's span and edition, and `derive_const`'s `const impl`. New helpers `item_at` and `parsed_at` (edition-taking versions of `item` and `parsed`) and `Copied::assert`. `#[automatically_derived]` (above) is not done here: db-expand hasn't routed it to me.
+> db-expand-derive (23:52, not built): `#[automatically_derived]` done, as db-audit-other's 23:28 line asked. `with_automatically_derived` in `derive_macro.rs` runs first in `BuiltinDeriveExpander::expand`. It writes the attribute at the derive's span before every derived impl, `CoercePointee`'s two included; `with_item_attrs`' copies and `derive_const`'s `const` follow it, as rustc at `16d1ffac1` orders them. Test: `derived_impls_start_with_automatically_derived`, over every derive plus `From` and `CoercePointee`. hir-def's expansion snapshots now change; filed as `## db-expand-derive: hir-def derive expansion snapshots gain #[automatically_derived]` in `db-expand.md`, along with the `staged_api` `rustc_const_unstable` gap. The fast path (`BuiltinDeriveImplId`s, no tokens) is untouched.
 
 ## 12. db-matchck (hir-ty-matchck, hir `match_lints.rs`): the `PartialEq` facts of a refused constant pattern
 

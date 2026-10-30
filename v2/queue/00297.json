@@ -1,0 +1,24 @@
+{
+  "id": "00297",
+  "from_lane": "mem-backend",
+  "owner": "coordinator",
+  "paths": [
+    "crates/vfs",
+    "crates/vfs-notify"
+  ],
+  "what": "## 4. coordinator: `crates/vfs`, `crates/vfs-notify` left alone\n\ncrates.md lists both as replaced by `blaze-vfs` and `blaze-core`'s watch; moving their tables onto\n`blaze-mem` would be work on code that is deleted at integration. Nothing requested.\n\n> forwarded to the coordinator (`crates/vfs*` are \"every other path\"); on requests' coordinator list.",
+  "state": "open",
+  "created": "2026-10-30T03:09:42Z",
+  "updated": "2026-10-30T03:09:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/mem-backend.md#4. coordinator: `crates/vfs`, `crates/vfs-notify` left alone",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/mem-backend.md:127"
+    }
+  ]
+}

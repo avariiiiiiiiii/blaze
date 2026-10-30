@@ -21,9 +21,15 @@
 //! buffer the callback uses are kept across streams, so a warm watch's start, batches and stop
 //! allocate only what a completion carries (its `Vec` and each name told once). Completions go
 //! to a [`Tell`] the driver gives, not a boxed closure. FSEvents' callback holds the address of
-//! the watch's [`Shared`]: the watch does not move while a stream runs ([`Watch::start`]'s
-//! contract, which the driver holds by keeping it in a [`blaze_mem::Slab`] entry, which never
-//! moves).
+//! the watch's [`Shared`], which is an allocation of its own (made once per watch, in
+//! [`Watch::new`]) held by raw pointer: the watch itself may move while a stream runs, so its
+//! API is safe, and a `&mut Watch` never covers what the queue's thread reads. A `Box` would
+//! not do: moving one asserts it unique, which the callback's reads would break.
+//!
+//! Why unsafe: FSEvents, CoreFoundation and dispatch are C APIs that std does not wrap, and the
+//! one safe way to see changes without them is to walk and `stat` the tree on every poll, a
+//! system call per file per poll where FSEvents tells only what changed. The callback's arrays
+//! are taken as slices of the `count` FSEvents passes, after an empty batch is returned from.
 
 use std::{
     ffi::{CStr, OsStr, c_char, c_void},
@@ -436,7 +442,7 @@ impl<S: Tell> Shared<S> {
 /// once ([`Watch::new`]) and started and stopped any number of times; a start after a stop
 /// reuses everything but the stream.
 pub(crate) struct Watch<S> {
-    shared: Shared<S>,
+    shared: Owned<S>,
     /// Serial: the stream's callbacks, and its stop, run on it one at a time.
     queue: DispatchQueue,
     /// `shared.cookies` as a CFString, for every stream's list of paths.
@@ -449,8 +455,49 @@ pub(crate) struct Watch<S> {
 
 // SAFETY: the stream and the queue are FSEvents' and libdispatch's objects, which may be
 // stopped and released from any thread; `Shared` is read on the queue while a stream runs and
-// written only while none does (`&mut self` with `stream` null), and `S: Send + Sync`.
+// written only while none does (`Owned::get_mut`), and `S: Send + Sync`.
 unsafe impl<S: Tell> Send for Watch<S> {}
+
+/// A watch's [`Shared`], at an address of its own that the stream's callback reads by: made
+/// in [`Watch::new`], freed when the watch drops, after its `Drop` has ended any stream.
+struct Owned<S>(std::ptr::NonNull<Shared<S>>);
+
+impl<S> Owned<S> {
+    fn new(shared: Shared<S>) -> Owned<S> {
+        // alloc: setup, once per watch: the callback's state at an address that never moves.
+        Owned(std::ptr::NonNull::from(Box::leak(Box::new(shared))))
+    }
+
+    fn get(&self) -> &Shared<S> {
+        // SAFETY: leaked by `new` and freed only by `drop`, so live while `self` is; every other
+        // reference to it is shared (the callback's) or `get_mut`'s, made while none of those
+        // is held. Read after the free, it would be freed memory.
+        unsafe { self.0.as_ref() }
+    }
+
+    /// # Safety
+    ///
+    /// No stream of the watch runs (none made, or ended by `stop`), so no callback holds a
+    /// reference to it; a callback reading it meanwhile would race this `&mut`.
+    unsafe fn get_mut(&mut self) -> &mut Shared<S> {
+        // SAFETY: live as in `get`; the caller's contract makes this the one reference, and
+        // `&mut self` excludes `get`'s.
+        unsafe { self.0.as_mut() }
+    }
+
+    /// The address the stream's callback is given.
+    fn as_ptr(&self) -> *mut Shared<S> {
+        self.0.as_ptr()
+    }
+}
+
+impl<S> Drop for Owned<S> {
+    fn drop(&mut self) {
+        // SAFETY: leaked by `new` from a `Box`, freed once, here. The watch's `Drop`, which runs
+        // before its fields drop, ended its stream, so no callback reads it after.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
 
 impl<S: Tell> Watch<S> {
     /// A watch telling `sink`, with its directory of cookies and its queue made: none of them
@@ -505,7 +552,7 @@ impl<S: Tell> Watch<S> {
             #[cfg(test)]
             payload: AtomicU64::new(0),
         };
-        Ok(Watch { shared, queue, cookie_string, stream: std::ptr::null_mut(), c_path })
+        Ok(Watch { shared: Owned::new(shared), queue, cookie_string, stream: std::ptr::null_mut(), c_path })
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -516,15 +563,9 @@ impl<S: Tell> Watch<S> {
     /// latency 0, on the watch's queue), telling a `Completion { tag, done: Done::Changed {
     /// files, lost } }` for each batch, names relative to `root` as `FileName`s, each once;
     /// kFSEventStreamEventFlagMustScanSubDirs, UserDropped or KernelDropped make `lost: true`.
-    ///
-    /// # Safety
-    ///
-    /// The watch does not move until [`Watch::stop`] has returned (or it is dropped in place):
-    /// the stream's callback reads it by address.
-    pub(crate) unsafe fn start(&mut self, root: &Path, dir: FileName, tag: Tag) -> io::Result<()> {
+    pub(crate) fn start(&mut self, root: &Path, dir: FileName, tag: Tag) -> io::Result<()> {
         self.locate(root, &dir)?;
-        // SAFETY: the caller's.
-        unsafe { self.open(dir, tag, SINCE_NOW, Mode::Watch, || {}) }
+        self.open(dir, tag, SINCE_NOW, Mode::Watch, || {})
     }
 
     /// The journal of `dir` under `root` from `since` ([`crate::Effect::Journal`]): a stream as
@@ -535,11 +576,7 @@ impl<S: Tell> Watch<S> {
     /// batch handed to `first` on the caller's thread just before the stream starts, for the
     /// caller to tell before anything the stream tells: empty, at that ID, and naming `dir`
     /// lost as [`Lost::Reset`] unless `since` was [`Cursor::None`].
-    ///
-    /// # Safety
-    ///
-    /// As [`Watch::start`]'s.
-    pub(crate) unsafe fn journal(
+    pub(crate) fn journal(
         &mut self,
         root: &Path,
         dir: FileName,
@@ -548,7 +585,7 @@ impl<S: Tell> Watch<S> {
         first: impl FnOnce(Journaled),
     ) -> io::Result<()> {
         self.locate(root, &dir)?;
-        let volume = store_of(&self.shared.real_dir).map_err(|error| {
+        let volume = store_of(&self.shared.get().real_dir).map_err(|error| {
             let at = root.join(dir.as_str()); // alloc: an error path.
             // alloc: an error path.
             io::Error::new(error.kind(), format!("the journal of {}: {error}", at.display()))
@@ -578,15 +615,15 @@ impl<S: Tell> Watch<S> {
                 first(batch);
             }
         };
-        // SAFETY: the caller's.
-        unsafe { self.open(dir, tag, from, Mode::Journal(journal), before) }
+        self.open(dir, tag, from, Mode::Journal(journal), before)
     }
 
     /// `root` and the watched directory under it resolved into the shared paths, as FSEvents
     /// names them; a directory that is not there (yet) is watched as the root names it.
     fn locate(&mut self, root: &Path, dir: &FileName) -> io::Result<()> {
         assert!(!self.is_running(), "a watch runs one stream at a time");
-        let Shared { root: real_root, real_dir, .. } = &mut self.shared;
+        // SAFETY: no stream runs, asserted above.
+        let Shared { root: real_root, real_dir, .. } = unsafe { self.shared.get_mut() };
         let resolved = c_string(root, &mut self.c_path).and_then(|()| realpath(&self.c_path, real_root));
         resolved.map_err(|error| {
             // alloc: an error path.
@@ -602,32 +639,26 @@ impl<S: Tell> Watch<S> {
 
     /// The stream of `shared.real_dir` and the cookies from `since`, `before` run once it is
     /// made, just before it starts.
-    ///
-    /// # Safety
-    ///
-    /// As [`Watch::start`]'s.
-    unsafe fn open(
-        &mut self,
-        dir: FileName,
-        tag: Tag,
-        since: u64,
-        mode: Mode,
-        before: impl FnOnce(),
-    ) -> io::Result<()> {
+    fn open(&mut self, dir: FileName, tag: Tag, since: u64, mode: Mode, before: impl FnOnce()) -> io::Result<()> {
         let failed = |shared: &Shared<S>, why: &str| {
             // alloc: an error path.
             io::Error::other(format!("watching {}: {why}", shared.real_dir.display()))
         };
-        self.shared.tag = tag;
-        self.shared.dir = Some(dir);
-        self.shared.mode = mode;
-        c_string(&self.shared.real_dir, &mut self.c_path)?;
+        assert!(!self.is_running(), "a watch runs one stream at a time");
+        {
+            // SAFETY: no stream runs, asserted above.
+            let shared = unsafe { self.shared.get_mut() };
+            shared.tag = tag;
+            shared.dir = Some(dir);
+            shared.mode = mode;
+        }
+        c_string(&self.shared.get().real_dir, &mut self.c_path)?;
         // SAFETY: a NUL-terminated path; the string is released below.
         let dir_string = unsafe {
             CFStringCreateWithFileSystemRepresentation(std::ptr::null(), self.c_path.as_ptr().cast())
         };
         if dir_string.is_null() {
-            return Err(failed(&self.shared, "CoreFoundation made no string of the path"));
+            return Err(failed(self.shared.get(), "CoreFoundation made no string of the path"));
         }
         let strings = [dir_string, self.cookie_string];
         // SAFETY: two CFStrings, retained by the array with the callbacks of CF types.
@@ -637,18 +668,19 @@ impl<S: Tell> Watch<S> {
         // SAFETY: made above, released once; the array holds its own reference.
         unsafe { CFRelease(dir_string) };
         if paths.is_null() {
-            return Err(failed(&self.shared, "CoreFoundation made no array of the path"));
+            return Err(failed(self.shared.get(), "CoreFoundation made no array of the path"));
         }
-        self.shared.stopped.store(false, Ordering::Release);
+        self.shared.get().stopped.store(false, Ordering::Release);
         let context = Context {
             version: 0,
-            info: (&raw const self.shared).cast_mut().cast(),
+            info: self.shared.as_ptr().cast(),
             retain: None,
             release: None,
             describe: None,
         };
-        // SAFETY: the context is copied by the call; `self.shared` stays where it is until the
-        // stream's queue has run its last callback (`stop`), by the caller's contract.
+        // SAFETY: the context is copied by the call; the `Shared` it names is `Owned`'s, at an
+        // address of its own, freed only after `Drop` or `stop` has run the stream's last
+        // callback, however the watch moves.
         let stream = unsafe {
             FSEventStreamCreate(
                 std::ptr::null(),
@@ -663,8 +695,8 @@ impl<S: Tell> Watch<S> {
         // SAFETY: the stream holds its own reference to the paths.
         unsafe { CFRelease(paths) };
         if stream.is_null() {
-            self.shared.stopped.store(true, Ordering::Release);
-            return Err(failed(&self.shared, "FSEventStreamCreate made no stream"));
+            self.shared.get().stopped.store(true, Ordering::Release);
+            return Err(failed(self.shared.get(), "FSEventStreamCreate made no stream"));
         }
         // SAFETY: a stream not yet started and the watch's queue, which outlives it.
         unsafe { FSEventStreamSetDispatchQueue(stream, self.queue) };
@@ -675,8 +707,8 @@ impl<S: Tell> Watch<S> {
             unsafe { FSEventStreamInvalidate(stream) };
             // SAFETY: the stream made above, released once and not used after.
             unsafe { FSEventStreamRelease(stream) };
-            self.shared.stopped.store(true, Ordering::Release);
-            return Err(failed(&self.shared, "FSEventStreamStart refused it"));
+            self.shared.get().stopped.store(true, Ordering::Release);
+            return Err(failed(self.shared.get(), "FSEventStreamStart refused it"));
         }
         self.stream = stream;
         Ok(())
@@ -689,7 +721,7 @@ impl<S: Tell> Watch<S> {
         if self.stream.is_null() {
             return;
         }
-        self.shared.stopped.store(true, Ordering::Release);
+        self.shared.get().stopped.store(true, Ordering::Release);
         let mut stream = self.stream;
         // SAFETY: the stream is stopped and invalidated on its own queue, so no callback runs
         // during it; `stream` outlives the call, which returns once the work has run.
@@ -699,8 +731,8 @@ impl<S: Tell> Watch<S> {
         // SAFETY: invalidated, with no callback left to run; released once, not used after.
         unsafe { FSEventStreamRelease(self.stream) };
         self.stream = std::ptr::null_mut();
-        let mut writing = lock(&self.shared.writing);
-        for tag in lock(&self.shared.flushes).drain(..) {
+        let mut writing = lock(&self.shared.get().writing);
+        for tag in lock(&self.shared.get().flushes).drain(..) {
             _ = with_cookie(&mut writing, tag, |it| std::fs::remove_file(it));
             untold(tag);
         }
@@ -714,7 +746,7 @@ impl<S: Tell> Watch<S> {
         if !self.is_running() {
             return Err(io::Error::other("the watch is not running"));
         }
-        let shared = &self.shared;
+        let shared = self.shared.get();
         lock(&shared.flushes).push(tag);
         let written = with_cookie(&mut lock(&shared.writing), tag, |it| std::fs::write(it, b""));
         match written {
@@ -736,14 +768,14 @@ impl<S: Tell> Watch<S> {
     /// What the callbacks allocated beyond what their completions carry, since last asked.
     #[cfg(test)]
     pub(crate) fn take_overhead(&self) -> u64 {
-        self.shared.overhead.swap(0, Ordering::Relaxed)
+        self.shared.get().overhead.swap(0, Ordering::Relaxed)
     }
 }
 
 impl<S> Drop for Watch<S> {
     fn drop(&mut self) {
         if !self.stream.is_null() {
-            self.shared.stopped.store(true, Ordering::Release);
+            self.shared.get().stopped.store(true, Ordering::Release);
             let mut stream = self.stream;
             // SAFETY: as in `stop`.
             unsafe { dispatch_sync_f(self.queue, (&raw mut stream).cast(), end_on_queue) };
@@ -757,7 +789,7 @@ impl<S> Drop for Watch<S> {
         // SAFETY: made in `new`, released once, not used after; every array that held it is
         // released with its stream.
         unsafe { CFRelease(self.cookie_string) };
-        _ = std::fs::remove_dir_all(&self.shared.cookies);
+        _ = std::fs::remove_dir_all(&self.shared.get().cookies);
     }
 }
 
@@ -791,17 +823,22 @@ extern "C" fn heard<S: Tell>(
     flags: *const u32,
     ids: *const u64,
 ) {
-    // SAFETY: the `Shared` of the `Watch` that made the stream, which does not move until the
-    // queue has run its last callback (`Watch::start`'s contract).
+    // SAFETY: `info` is the `Owned` `Shared` of the `Watch` that made the stream, which neither
+    // moves nor is freed until the queue has run its last callback (`stop`, `Drop`), and is
+    // not written meanwhile (`Owned::get_mut` needs no stream); if freed, this reads freed memory.
     let shared = unsafe { &*info.cast::<Shared<S>>() };
-    if shared.stopped.load(Ordering::Acquire) {
+    // An empty batch tells nothing, and its arrays need not be valid pointers, which
+    // `from_raw_parts` requires even of an empty slice.
+    if shared.stopped.load(Ordering::Acquire) || count == 0 {
         return;
     }
-    // SAFETY: FSEvents passes `count` flags, alive for the callback.
+    // SAFETY: FSEvents passes `count` aligned `FSEventStreamEventFlags` (`u32`), alive and
+    // unchanged for the callback; a shorter array would be read past.
     let flags = unsafe { std::slice::from_raw_parts(flags, count) };
-    // SAFETY: and `count` C strings, without kFSEventStreamCreateFlagUseCFTypes.
+    // SAFETY: as above, `count` C string pointers: the stream is made without
+    // kFSEventStreamCreateFlagUseCFTypes (`start`), so `paths` is a `char **`, not a CFArray.
     let paths = unsafe { std::slice::from_raw_parts(paths.cast::<*const c_char>(), count) };
-    // SAFETY: and `count` event IDs.
+    // SAFETY: as above, `count` `FSEventStreamEventId`s (`u64`).
     let ids = unsafe { std::slice::from_raw_parts(ids, count) };
     #[cfg(test)]
     {
@@ -1071,8 +1108,7 @@ mod tests {
         let root = root("watch");
         let (mut watch, heard) = watch();
         let dir = FileName::new("src").unwrap();
-        // SAFETY: `watch` stays in this frame until it is stopped below.
-        unsafe { watch.start(&root, dir.clone(), Tag(4)) }.unwrap();
+        watch.start(&root, dir.clone(), Tag(4)).unwrap();
         let files = hear_written(&root, "src/deep/lib.rs", &heard, Tag(4));
         watch.stop(|tag| panic!("no flush was asked: {tag:?}"));
         assert!(files.iter().all(|it| it.is_under(&dir)), "{files:?}");
@@ -1093,19 +1129,34 @@ mod tests {
         let root = root("again");
         std::fs::create_dir_all(root.join("other")).unwrap();
         let (mut watch, heard) = watch();
-        // SAFETY: `watch` stays in this frame until it is stopped below, each time.
-        unsafe { watch.start(&root, FileName::new("src").unwrap(), Tag(1)) }.unwrap();
+        watch.start(&root, FileName::new("src").unwrap(), Tag(1)).unwrap();
         hear_written(&root, "src/a.rs", &heard, Tag(1));
         watch.stop(|_| {});
         while heard.try_recv().is_ok() {}
         let other = FileName::new("other").unwrap();
-        // SAFETY: as above.
-        unsafe { watch.start(&root, other.clone(), Tag(2)) }.unwrap();
+        watch.start(&root, other.clone(), Tag(2)).unwrap();
         let files = hear_written(&root, "other/b.rs", &heard, Tag(2));
         assert!(files.iter().all(|it| it.is_under(&other)), "{files:?}");
         watch.flush(Tag(3)).unwrap();
         watch.stop(|tag| assert_eq!(tag, Tag(3)));
         assert!(watch.flush(Tag(4)).is_err(), "a flush of a stopped watch");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The callback reads the watch's `Shared` at an address of its own, so a running watch
+    /// may move (into a vector that then grows) and goes on hearing, then stops and drops.
+    #[test]
+    fn a_running_watch_moved_goes_on_hearing() {
+        let root = root("moved");
+        let (mut watch, heard) = watch();
+        watch.start(&root, FileName::new("src").unwrap(), Tag(7)).unwrap();
+        hear_written(&root, "src/before.rs", &heard, Tag(7));
+        let mut moved = vec![watch];
+        moved.reserve(64);
+        hear_written(&root, "src/after.rs", &heard, Tag(7));
+        let mut watch = moved.pop().unwrap();
+        watch.stop(|_| {});
+        drop(watch);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1115,13 +1166,11 @@ mod tests {
     fn a_warm_watch_batch_allocates_only_its_payload() {
         let root = root("budget");
         let (mut watch, heard) = watch();
-        // SAFETY: `watch` stays in this frame until it is stopped below, each time.
-        unsafe { watch.start(&root, FileName::new("src").unwrap(), Tag(1)) }.unwrap();
+        watch.start(&root, FileName::new("src").unwrap(), Tag(1)).unwrap();
         hear_written(&root, "src/warm.rs", &heard, Tag(1));
         watch.stop(|_| {});
         watch.take_overhead();
-        // SAFETY: as above.
-        unsafe { watch.start(&root, FileName::new("src").unwrap(), Tag(1)) }.unwrap();
+        watch.start(&root, FileName::new("src").unwrap(), Tag(1)).unwrap();
         hear_written(&root, "src/warm.rs", &heard, Tag(1));
         watch.stop(|_| {});
         assert_eq!(watch.take_overhead(), 0, "a warm batch allocates beyond its payload");
@@ -1154,11 +1203,7 @@ mod tests {
     }
 
     /// [`Watch::journal`], with the first batch it hands over.
-    ///
-    /// # Safety
-    ///
-    /// As [`Watch::start`]'s.
-    unsafe fn journal(
+    fn journal(
         watch: &mut Watch<Sink>,
         root: &Path,
         dir: &FileName,
@@ -1166,8 +1211,7 @@ mod tests {
         tag: Tag,
     ) -> Option<Journaled> {
         let mut first = None;
-        // SAFETY: the caller's.
-        unsafe { watch.journal(root, dir.clone(), since, tag, |it| first = Some(it)) }.unwrap();
+        watch.journal(root, dir.clone(), since, tag, |it| first = Some(it)).unwrap();
         first
     }
 
@@ -1183,8 +1227,7 @@ mod tests {
         let root = root("journal");
         let dir = FileName::new("src").unwrap();
         let (mut watch, heard) = watch();
-        // SAFETY: `watch` stays in this frame until it is stopped below, each time.
-        let first = unsafe { journal(&mut watch, &root, &dir, Cursor::None, Tag(1)) };
+        let first = journal(&mut watch, &root, &dir, Cursor::None, Tag(1));
         // The first batch comes at once, before any the stream hears.
         let first = first.expect("the first batch, at once");
         assert_eq!((first.files.len(), first.lost.len(), first.caught_up), (0, 0, false));
@@ -1216,8 +1259,7 @@ mod tests {
         std::thread::sleep(Duration::from_secs(1));
         while heard.try_recv().is_ok() {}
         // The same watch, started again from the cursor.
-        // SAFETY: as above.
-        let first = unsafe { journal(&mut watch, &root, &dir, last, Tag(2)) };
+        let first = journal(&mut watch, &root, &dir, last, Tag(2));
         assert!(first.is_none(), "resumed: no first batch");
         let batches = until_caught_up(&heard, Tag(2));
         watch.stop(|_| {});
@@ -1245,8 +1287,7 @@ mod tests {
         let root = root("reset");
         let dir = FileName::new("src").unwrap();
         let (mut watch, _heard) = watch();
-        // SAFETY: `watch` stays in this frame until it is stopped below, each time.
-        let first = unsafe { journal(&mut watch, &root, &dir, Cursor::None, Tag(1)) };
+        let first = journal(&mut watch, &root, &dir, Cursor::None, Tag(1));
         let (now, volume) = event(first.unwrap().cursor);
         watch.stop(|_| {});
         let cursors = [
@@ -1257,8 +1298,7 @@ mod tests {
         ];
         for (n, since) in cursors.into_iter().enumerate() {
             let tag = Tag(10 + n as u64);
-            // SAFETY: as above.
-            let first = unsafe { journal(&mut watch, &root, &dir, since, tag) };
+            let first = journal(&mut watch, &root, &dir, since, tag);
             watch.stop(|_| {});
             let first = first.expect("the first batch, at once");
             assert_eq!(first.lost, [(dir.clone(), Lost::Reset)], "{since:?}");

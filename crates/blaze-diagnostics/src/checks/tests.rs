@@ -5,7 +5,6 @@
 //! attribute reads every check makes (a path, one owner's lowering) allocate nothing.
 
 use blaze_alloc_count::{assert_at_most, measure};
-use hir::Semantics;
 
 use super::{attrs, defs, features, names};
 use crate::{
@@ -19,13 +18,12 @@ fn with_cx<R>(fixture: &str, check: impl FnOnce(&Cx<'_, '_>) -> R) -> R {
     let checked = crate::tests::checked(fixture);
     let db = &checked.db;
     hir::attach_db(db, || {
-        let sema = Semantics::new(db);
         let krate = hir::check::workspace_crates(db)
             .into_iter()
             .find(|it| it.display_name(db).is_some_and(|name| name.to_string() == "main"))
             .expect("the fixture has a crate `main`");
         let frame = crate::tests::frame();
-        let cx = Cx::new(&sema, krate, checked.files(), &frame);
+        let cx = Cx::new(db, krate, checked.files(), &frame);
         check(&cx)
     })
 }

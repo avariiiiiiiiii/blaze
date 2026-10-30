@@ -28,9 +28,11 @@ pub(crate) fn rebase(
     let mut moved = Vec::with_capacity(ops.len());
     for op in ops {
         let Some(path) = op_paths(op).find(|it| changed(it)) else {
+            // clone: only a transaction its head moved under is rebased, into ops of its own.
             moved.push(op.clone());
             continue;
         };
+        // alloc: the error's path
         let conflict = || CommitError::Conflict { path: path.to_owned() };
         // Only a lone edit of a file both sides still have can be moved past a change.
         let Op::Edit { path, at, len, bytes } = op else { return Err(conflict()) };
@@ -46,6 +48,7 @@ pub(crate) fn rebase(
             return Err(conflict());
         }
         let at = if *at >= to as u64 { *at + now.len() as u64 - was.len() as u64 } else { *at };
+        // clone: only a transaction its head moved under is rebased, into ops of its own.
         moved.push(Op::Edit { path: path.clone(), at, len: *len, bytes: bytes.clone() });
     }
     Ok(moved)

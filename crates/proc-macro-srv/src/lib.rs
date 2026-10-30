@@ -8,27 +8,19 @@
 //! * We use `tt` for proc-macro `TokenStream` server, it is easier to manipulate and interact with
 //!   RA than `proc-macro2` token stream.
 
-#![cfg(feature = "in-rust-tree")]
 #![feature(
     allocator_api,
     proc_macro_internals,
     proc_macro_diagnostic,
-    proc_macro_span,
-    rustc_private
+    proc_macro_span
 )]
 #![expect(internal_features)]
 #![allow(unused_features, unused_crate_dependencies)]
 #![deny(deprecated_safe, clippy::undocumented_unsafe_blocks)]
 #![cfg_attr(test, expect(unreachable_pub))]
 
-extern crate rustc_codegen_ssa;
-extern crate rustc_driver as _;
-extern crate rustc_interface;
-extern crate rustc_lexer;
-extern crate rustc_metadata;
-extern crate rustc_proc_macro;
-extern crate rustc_span;
-
+// The standard library's `proc_macro`, which rustc's tree builds as `rustc_proc_macro`.
+extern crate proc_macro as rustc_proc_macro;
 mod bridge;
 mod dylib;
 mod scope;
@@ -66,7 +58,9 @@ pub enum ProcMacroKind {
     Bang,
 }
 
-pub const RUSTC_VERSION_STRING: &str = env!("RUSTC_VERSION");
+/// The `rustc --version` of the toolchain in `harness/toolchain` (nightly-2026-10-27, rust-lang/rust
+/// at 16d1ffac1), whose `proc_macro` this server is built over; upstream's build script asks rustc.
+pub const RUSTC_VERSION_STRING: &str = "rustc 1.101.0-nightly (16d1ffac1 2026-10-26)";
 
 pub struct ProcMacroSrv<'env> {
     expanders: Mutex<FxHashMap<Utf8PathBuf, Arc<dylib::Expander>>>,
@@ -78,6 +72,13 @@ pub struct ProcMacroSrv<'env> {
 impl<'env> ProcMacroSrv<'env> {
     pub fn new(env: &'env EnvSnapshot) -> Self {
         Self { expanders: Default::default(), env, expansions: Default::default() }
+    }
+
+    /// Counts an expansion asked for whose request could not be read, so [`Self::expand`] is
+    /// never called for it: the client counts every expansion it asks for, and the next one's
+    /// scope must be the one it expects.
+    pub fn count_unexpanded(&self) {
+        self.expansions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn join_spans(&self, first: Span, second: Span) -> Option<Span> {
@@ -306,15 +307,13 @@ impl PanicMessage {
     }
 }
 
+/// The value the server started with of each variable an expansion was given, read by its name
+/// the first time one sets it. Walking `environ` would read every variable, which a warm
+/// server's sandbox traces as each expansion reading all of them.
+#[derive(Default)]
 pub struct EnvSnapshot {
-    vars: FxHashMap<OsString, OsString>,
-}
-
-impl Default for EnvSnapshot {
-    fn default() -> EnvSnapshot {
-        // alloc: the server's environment, read once per server.
-        EnvSnapshot { vars: env::vars_os().collect() }
-    }
+    /// Locked only while `ENV_LOCK` is held.
+    vars: Mutex<FxHashMap<Box<str>, Option<OsString>>>,
 }
 
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -347,7 +346,12 @@ impl<'snap> EnvChange<'snap> {
             }
             None => None,
         };
+        let mut started = snap.vars.lock().unwrap_or_else(PoisonError::into_inner);
         for (k, v) in new_vars {
+            if !started.contains_key(k.as_str()) {
+                // alloc: the variable's name and first value, once per name the server is given.
+                started.insert(k.as_str().into(), env::var_os(k));
+            }
             // SAFETY: `set_var` needs no other thread reading or writing the environment as it
             // changes. `ENV_LOCK` is held from here until this `EnvChange` drops, after `expand`
             // has joined the macro's thread, so no expansion runs while it changes, and no other
@@ -355,6 +359,7 @@ impl<'snap> EnvChange<'snap> {
             // thread left running, a C library's `getenv`) would race with the write.
             unsafe { env::set_var(k, v) };
         }
+        drop(started);
         EnvChange { snap, changed_vars: new_vars, prev_working_dir, _guard: guard }
     }
 
@@ -363,15 +368,17 @@ impl<'snap> EnvChange<'snap> {
 
 impl Drop for EnvChange<'_> {
     fn drop(&mut self) {
+        let started = self.snap.vars.lock().unwrap_or_else(PoisonError::into_inner);
         for (name, _) in self.changed_vars {
-            match self.snap.vars.get::<std::ffi::OsStr>(name.as_ref()) {
+            match started.get(name.as_str()) {
                 // SAFETY: `self._guard` still holds `ENV_LOCK` and the macro's thread has been
                 // joined, as in `apply`, so no other thread reads the environment as it changes.
-                Some(prev_val) => unsafe { env::set_var(name, prev_val) },
+                Some(Some(prev_val)) => unsafe { env::set_var(name, prev_val) },
                 // SAFETY: as for `set_var` just above.
-                None => unsafe { env::remove_var(name) },
+                _ => unsafe { env::remove_var(name) },
             }
         }
+        drop(started);
 
         if let Some(dir) = &self.prev_working_dir
             && let Err(err) = std::env::set_current_dir(dir)
@@ -392,7 +399,9 @@ mod tests;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
+/// The library of `proc-macro-test-impl` that blaze linked for these tests, by
+/// `proc-macro-libraries` in this package's manifest.
 #[cfg(test)]
 pub fn proc_macro_test_dylib_path() -> paths::Utf8PathBuf {
-    proc_macro_test::PROC_MACRO_TEST_LOCATION.into()
+    env!("BLAZE_PROC_MACRO_LIBRARY_PROC_MACRO_TEST_IMPL").into()
 }

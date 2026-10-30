@@ -1,0 +1,25 @@
+{
+  "id": "00071",
+  "from_lane": "speed-hir-sol-expand",
+  "owner": "coordinator",
+  "paths": [
+    "tools/v2/hot_lint.py",
+    "crates/hir-expand/src/builtin/derive_macro/reference.rs",
+    "crates/hir-def/src/macro_expansion_tests/budgets.rs"
+  ],
+  "what": "## speed-hir-sol-expand: the same `hot_lint` fix, for hir-expand too\n\n`speed-hir-sol-defs`'s request just above (\"`tools/v2/hot_lint.py` skips the files of a module\ndeclared `#[cfg(test)]`\") also clears 71 findings in hir-expand:\n`crates/hir-expand/src/builtin/derive_macro/reference.rs`, declared `#[cfg(test)] mod reference;`\nin `builtin/derive_macro.rs` (the old derive code, kept only as the tests' reference). It also\ncovers the new `crates/hir-def/src/macro_expansion_tests/budgets.rs` I asked of db-expand-macros.\nNothing more to change: one fix for both.\n\n> forwarded to the coordinator (`tools/`) (from requests, pass 16; on requests' coordinator list).",
+  "state": "open",
+  "created": "2026-10-30T00:39:25Z",
+  "updated": "2026-10-30T00:39:25Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/speed.md#speed-hir-sol-expand: the same `hot_lint` fix, for hir-expand too",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/speed.md:425"
+    }
+  ]
+}

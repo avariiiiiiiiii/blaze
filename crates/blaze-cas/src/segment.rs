@@ -456,6 +456,7 @@ impl Own {
     /// value can cause: the store stops on it rather than keep the value another way. The put
     /// still takes its ticket, which is never durable.
     fn fail(&mut self, kind: Kind, why: String) -> Ticket {
+        // alloc: the store's failure, once: it stops on it
         _ = self.segment.failed.set(format!("compressing a {} value: {why}", kind.name()));
         let ticket = Ticket::of(self.segment.number, self.puts + 1);
         self.end_put();

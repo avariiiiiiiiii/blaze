@@ -52,6 +52,7 @@ pub(super) fn successors(kind: &TerminatorKind) -> impl Iterator<Item = BasicBlo
             | TerminatorKind::Abort
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
+            | TerminatorKind::TailCall { .. }
             | TerminatorKind::CoroutineDrop => (None, None, &[]),
         };
     first.into_iter().chain(second).chain(rest.iter().copied())

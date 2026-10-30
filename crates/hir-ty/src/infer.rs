@@ -124,7 +124,7 @@ use crate::{
         },
     },
     solver_errors::SolverDiagnostic,
-    solver_errors::{Ambiguity, TypeAnnotationNeeded},
+    solver_errors::{Ambiguity, NamedTerm, TypeAnnotationNeeded},
     solver_errors::StoredGoal,
     utils::TargetFeatureIsSafeInTarget,
 };
@@ -1115,6 +1115,10 @@ pub struct InferenceResult<'db> {
     /// rustc's `coroutine_stalled_predicates`, which [`crate::coroutine_obligations`] proves
     /// once the coroutines' witnesses are known.
     pub(crate) coroutine_stalled_predicates: Box<[(Span, StoredPredicate)]>,
+    /// The type of each pattern writeback found undecided, named while its variables were
+    /// live, as rustc's "consider giving `x` an explicit type" prints it: sorted by pattern,
+    /// empty for a body with no undecided pattern.
+    pub(crate) named_pat_types: Box<[(PatId, NamedTerm)]>,
     pub(crate) nodes_with_type_mismatches: ExprOrPatSet,
 
     /// Interned `Error` type to return references to.
@@ -1314,6 +1318,7 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
         unreachable: Box<[Unreachable]>,
         traits_in_scope_used: Box<[(ExprOrPatId, TraitId)]>,
         coroutine_stalled_predicates: Box<[(Span, StoredPredicate)]>,
+        named_pat_types: Box<[(PatId, NamedTerm)]>,
         defined_anon_consts: Box<[AnonConstId<'db>]>,
         frame: &Frame,
     ) -> InferenceResult<'db> {
@@ -1363,6 +1368,7 @@ impl<'db, 'f> InferenceTables<'db, 'f> {
             unreachable,
             traits_in_scope_used,
             coroutine_stalled_predicates,
+            named_pat_types,
             nodes_with_type_mismatches: nodes_with_type_mismatches.freeze(),
             error_ty,
             expr_adjustments: expr_adjustments.freeze(),
@@ -1805,6 +1811,7 @@ impl<'db> InferenceResult<'db> {
             unreachable: Default::default(),
             traits_in_scope_used: Default::default(),
             coroutine_stalled_predicates: Default::default(),
+            named_pat_types: Default::default(),
             nodes_with_type_mismatches: Default::default(),
             type_of_expr: Default::default(),
             type_of_pat: Default::default(),
@@ -1951,6 +1958,12 @@ impl<'db> InferenceResult<'db> {
 
     pub fn coroutine_stalled_predicates(&self) -> &[(Span, StoredPredicate)] {
         &self.coroutine_stalled_predicates
+    }
+
+    /// `pat`'s type with its variables named, when writeback found it undecided.
+    pub fn named_pat_type(&self, pat: PatId) -> Option<&NamedTerm> {
+        let at = self.named_pat_types.binary_search_by_key(&pat, |&(it, _)| it).ok()?;
+        Some(&self.named_pat_types[at].1)
     }
 
     /// The anonymous consts of the body this inferred, including those inside them.
@@ -2104,6 +2117,8 @@ pub(crate) struct InferenceContext<'db, 'f> {
     traits_in_scope_used: Vec<(ExprOrPatId, TraitId), &'f Frame>,
     /// The goals set aside as stalled on a coroutine of the body, resolved at writeback.
     coroutine_stalled: Vec<(Span, StoredPredicate), &'f Frame>,
+    /// The named undecided pattern types of the bodies merged into this one.
+    named_pat_types: Vec<(PatId, NamedTerm), &'f Frame>,
     breakables: Vec<BreakableContext<'db, 'f>, &'f Frame>,
     types: &'db crate::next_solver::DefaultAny<'db>,
 
@@ -2226,6 +2241,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             param_top_pat: None,
             traits_in_scope_used: Vec::new_in(frame),
             coroutine_stalled: Vec::new_in(frame),
+            named_pat_types: Vec::new_in(frame),
             breakables: Vec::new_in(frame),
             deferred_cast_checks: Vec::new_in(frame),
             diagnostics: Diagnostics::default(),
@@ -2316,6 +2332,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             }
         }
         self.coroutine_stalled.extend(other.coroutine_stalled_predicates.iter().copied());
+        // clone: error path, a nested body's undecided patterns, once per merge
+        self.named_pat_types.extend(other.named_pat_types.iter().cloned());
 
         #[cfg_attr(debug_assertions, track_caller)]
         fn merge_index<'a, K: columns::DenseKey, V: Clone + PartialEq + 'a>(
@@ -2427,6 +2445,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             mut unreachable,
             mut traits_in_scope_used,
             mut coroutine_stalled,
+            mut named_pat_types,
             db,
             owner,
             frame,
@@ -2472,9 +2491,18 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         for ty in type_of_expr.values_mut() {
             resolver.resolve_completely(ty);
         }
-        for ty in type_of_pat.values_mut() {
+        for (index, slot) in type_of_pat.slots_mut().iter_mut().enumerate() {
+            let Some(ty) = slot else { continue };
+            let before = ty.as_ref();
             resolver.resolve_completely(ty);
+            // Only a type left with an error can have had an undecided variable.
+            if ty.as_ref().references_error()
+                && let Some(named) = resolver.named_undecided(before)
+            {
+                named_pat_types.push((<PatId as columns::DenseKey>::from_index(index), named));
+            }
         }
+        named_pat_types.sort_unstable_by_key(|&(pat, _)| pat);
         for ty in type_of_binding.values_mut() {
             resolver.resolve_completely(ty);
         }
@@ -2550,6 +2578,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             traits_in_scope_used.drain(..).collect(),
             // alloc: the result's own list, at its length
             coroutine_stalled.drain(..).collect(),
+            // alloc: the result's own list, at its length
+            named_pat_types.drain(..).collect(),
             // alloc: the result's own list, at its length
             defined_anon_consts.drain(..).collect(),
             frame,

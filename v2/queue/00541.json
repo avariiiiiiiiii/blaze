@@ -1,0 +1,23 @@
+{
+  "id": "00541",
+  "from_lane": "lints-parallel",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-diagnostics"
+  ],
+  "what": "## 4. diagnostics / frontend: `#[blaze::reassociate]` is an inert tool attribute\n\n- What: `#[blaze::reassociate]` on a function (or an impl item) is accepted, inert, as\n  `#[clippy::..]` tool attributes are: no \"unknown attribute\", no `unused_attributes`. It means\n  nothing to compiling; `blaze::parallelizable` reads it from the linted item's syntax to\n  count a float `+`/`*` reduction as reassociable.\n- Where: wherever `blaze::` tool attributes are checked (`crates/blaze-diagnostics`\n  attribute checks; `hir-def`'s attribute lowering if it refuses unknown tool paths).\n- Why: a float sum's order changes its result, so the lint names it only when the author\n  says the order doesn't matter (superset-of-rust: opt-in, and a crate without it sees\n  nothing new).\n\n> forwarded by lints to the coordinator for diagnostics and frontend (its window is gone), 2026-10-29.",
+  "state": "open",
+  "created": "2026-10-30T04:36:54Z",
+  "updated": "2026-10-30T04:36:54Z",
+  "taken_by": null,
+  "why": null,
+  "source": "v2/requests/lints-parallel.md#4. diagnostics / frontend: `#[blaze::reassociate]` is an inert tool attribute",
+  "history": [
+    {
+      "at": "2026-10-30T07:24:32Z",
+      "by": "queue-import",
+      "action": "import",
+      "note": "v2/requests/lints-parallel.md:44"
+    }
+  ]
+}

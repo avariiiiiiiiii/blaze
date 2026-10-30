@@ -40,6 +40,7 @@ static LIVE: LazyLock<Mutex<FxHashMap<u64, (Crate, String, Instant)>>> =
     LazyLock::new(Default::default);
 
 /// The compiles done since [`begin`] that took [`SLOW`] or more.
+// alloc: empty, allocates nothing until a compile is slow
 static DONE: Mutex<Vec<Flown>> = Mutex::new(Vec::new());
 
 fn lock<T>(it: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -60,7 +61,9 @@ pub fn under_way(longer: Duration) -> Vec<Flown> {
     let mut flown: Vec<Flown> = live
         .values()
         .filter(|it| now - it.2 >= longer)
+        // clone: the name, out of the lock, for a terminal refresh
         .map(|(krate, name, since)| Flown { krate: *krate, name: name.clone(), took: now - *since })
+        // alloc: a terminal refresh's few slow compiles
         .collect();
     blaze_ids::radix::sort_by_key(&mut flown, |it| !it.took.as_nanos());
     flown
@@ -78,6 +81,7 @@ pub(crate) struct Flight(Option<u64>);
 
 impl Flight {
     pub(crate) fn root(db: &Db, func: FunctionId) -> Flight {
+        // clone: only while someone hears the build; the live table owns the name
         Flight::of(|| (func.krate(db), root_name(db, func).clone()))
     }
 
@@ -86,6 +90,7 @@ impl Flight {
         instance: &Instance,
         env: &StoredParamEnvAndCrate,
     ) -> Flight {
+        // clone: only while someone hears the build: the query's keys and the live table's name
         Flight::of(|| instance_named(db, instance.clone(), env.clone()).clone())
     }
 
@@ -106,6 +111,7 @@ impl Flight {
 #[salsa::tracked(returns(ref))]
 fn root_name(db: &Db, func: FunctionId) -> String {
     let name = hir_ty_mir::mir::type_name::rustc_function_name(db, func, &[]);
+    // alloc: a memoized query's value, once per function while someone hears the build
     name.unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
 }
 

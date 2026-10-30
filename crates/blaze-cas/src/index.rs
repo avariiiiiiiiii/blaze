@@ -39,6 +39,7 @@ pub(crate) type Matcher = fn(&[u8; GROUP], u8) -> u16;
 /// An index table of `entries`, whose bytes depend only on the set of entries. No key may
 /// repeat.
 pub(crate) fn build_index(entries: &[(Key, Loc)]) -> Vec<u8> {
+    // alloc: once per index table built (a settle), its entries sorted
     let mut entries = entries.to_vec();
     entries.sort_unstable_by_key(|(key, _)| *key);
     assert!(
@@ -49,6 +50,7 @@ pub(crate) fn build_index(entries: &[(Key, Loc)]) -> Vec<u8> {
     while (entries.len() as u64) * LOAD_DENOMINATOR > slots * LOAD_NUMERATOR {
         slots *= 2;
     }
+    // alloc: the table built is the output, written whole
     let mut out = vec![0; INDEX_HEADER + slots as usize * (1 + ROW)];
     out[..8].copy_from_slice(&INDEX_MAGIC);
     out[8..12].copy_from_slice(&crate::FORMAT.to_le_bytes());

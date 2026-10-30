@@ -16,9 +16,9 @@ use rustc_type_ir::{
 };
 
 use crate::{
-    ImplTraitId,
+    ImplTraitId, PredicateSource,
     db::HirDatabase,
-    lower::GenericPredicates,
+    lower::{GenericPredicates, ImplTraitIdx},
     next_solver::{
         AliasTy, Binder, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv, ParamTy,
         SolverDefId, TraitClause, TraitRef, Ty, TypingMode, Unnormalized,
@@ -82,7 +82,7 @@ where
     let interner = DbInterner::new_no_crate(db);
     for super_trait in elaborate::supertrait_def_ids(interner, trait_.into()).skip(1) {
         if db.dyn_compatibility_of_trait(super_trait.0).is_some() {
-            cb(DynCompatibilityViolation::HasNonCompatibleSuperTrait(trait_))?;
+            cb(DynCompatibilityViolation::HasNonCompatibleSuperTrait(super_trait.0))?;
         }
     }
 
@@ -119,6 +119,174 @@ where
     }
 
     ControlFlow::Continue(())
+}
+
+/// Where a violation is written, as rustc's `DynCompatibilityViolation::spans()` has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViolationSite {
+    /// The `index`th predicate of `def` in `GenericPredicates::query_all`'s order, the index
+    /// [`crate::predicate_sources`] takes. Always a written one.
+    Predicate { def: GenericDefId, index: u32 },
+    /// The `index`th item bound of an associated type (`type_alias_bounds`), its own and those
+    /// the trait's where clauses put on it.
+    AssocTypeBound { alias: TypeAliasId, index: u32 },
+    /// The type of the function's `index`th parameter, `self` counted (rustc's
+    /// `decl.inputs[index]`).
+    Param { function: FunctionId, index: u32 },
+    /// The function's return type.
+    Output(FunctionId),
+    /// The function's return-position `impl Trait` (`ImplTraitId::ReturnTypeImplTrait`).
+    Opaque { function: FunctionId, index: ImplTraitIdx },
+    /// The item's name.
+    Name(AssocItemId),
+}
+
+/// rustc's `dyn_compatibility_violations` of `trait_` with each violation's `spans()`, in the
+/// order [`dyn_compatibility_with_callback`] gives them. A violation with no site is one rustc
+/// gives no span: a `Sized` that `Self` gets only by elaboration, and a supertrait's, whose
+/// own violations have the sites. rustc's two `SelfReferential` violations stay apart: the
+/// first from the trait's predicates, the second from its associated types' bounds.
+pub fn dyn_compatibility_violation_sites(
+    db: &Db,
+    trait_: TraitId,
+) -> Vec<(DynCompatibilityViolation, Box<[ViolationSite]>)> {
+    // alloc: error path, read only to report a dyn-incompatible trait
+    let mut out = Vec::new();
+    let mut predicates_given = false;
+    _ = dyn_compatibility_with_callback(db, trait_, &mut |violation| {
+        let sites: Box<[ViolationSite]> = match violation {
+            DynCompatibilityViolation::SizedSelf => sized_self_sites(db, trait_),
+            DynCompatibilityViolation::SelfReferential
+                if !predicates_given && predicates_reference_self(db, trait_) =>
+            {
+                predicates_given = true;
+                self_referential_predicate_sites(db, trait_)
+            }
+            DynCompatibilityViolation::SelfReferential => self_referential_bound_sites(db, trait_),
+            DynCompatibilityViolation::Method(function, code) => {
+                // alloc: error path, one site
+                Box::new([method_site(db, trait_, function, code)])
+            }
+            DynCompatibilityViolation::AssocConst(id) => {
+                // alloc: error path, one site
+                Box::new([ViolationSite::Name(id.into())])
+            }
+            DynCompatibilityViolation::GAT(id) => {
+                // alloc: error path, one site
+                Box::new([ViolationSite::Name(id.into())])
+            }
+            DynCompatibilityViolation::HasNonCompatibleSuperTrait(_) => Box::default(),
+        };
+        out.push((violation, sites));
+        ControlFlow::Continue(())
+    });
+    out
+}
+
+/// rustc's `get_sized_bounds`: each bound written on the trait, on `Self` or not, whose trait
+/// requires `Self: Sized`.
+fn sized_self_sites(db: &Db, trait_: TraitId) -> Box<[ViolationSite]> {
+    let interner = DbInterner::new_with(db, trait_.krate(db));
+    let sized = interner.lang_items().Sized;
+    written_predicate_sites(db, trait_, |clause| match clause.kind().skip_binder() {
+        ClauseKind::Trait(pred) => {
+            let bound = pred.def_id().0;
+            Some(bound) == sized || generics_require_sized_self(db, bound.into())
+        }
+        _ => false,
+    })
+}
+
+/// rustc's `predicates_reference_self`: each predicate of the trait with `Self` in an argument.
+fn self_referential_predicate_sites(db: &Db, trait_: TraitId) -> Box<[ViolationSite]> {
+    written_predicate_sites(db, trait_, |clause| {
+        predicate_references_self(db, trait_, clause, AllowSelfProjections::No)
+    })
+}
+
+fn written_predicate_sites<'db>(
+    db: &'db Db,
+    trait_: TraitId,
+    mut keep: impl FnMut(Clause<'db>) -> bool,
+) -> Box<[ViolationSite]> {
+    let def = GenericDefId::from(trait_);
+    let sources = crate::predicate_sources(db, def);
+    GenericPredicates::query_all(db, def)
+        .iter_identity()
+        .map(Unnormalized::skip_norm_wip)
+        .zip(&sources)
+        .enumerate()
+        .filter(|&(_, (clause, source))| {
+            matches!(source, PredicateSource::Written { def: written, .. } if *written == def)
+                && keep(clause)
+        })
+        .map(|(index, _)| ViolationSite::Predicate { def, index: index as u32 })
+        .collect() // alloc: error path
+}
+
+/// rustc's `bounds_reference_self`: each item bound with `Self` in it of an associated type
+/// that does not require `Self: Sized`.
+fn self_referential_bound_sites(db: &Db, trait_: TraitId) -> Box<[ViolationSite]> {
+    trait_
+        .trait_items(db)
+        .items
+        .iter()
+        .filter_map(|(_, it)| match *it {
+            AssocItemId::TypeAliasId(id) => Some(id),
+            _ => None,
+        })
+        .filter(|&alias| !generics_require_sized_self(db, alias.into()))
+        .flat_map(|alias| {
+            db.type_alias_bounds(alias)
+                .iter_identity_copied()
+                .map(Unnormalized::skip_norm_wip)
+                .enumerate()
+                .filter(move |&(_, clause)| {
+                    predicate_references_self(db, trait_, clause, AllowSelfProjections::Yes)
+                })
+                .map(move |(index, _)| ViolationSite::AssocTypeBound { alias, index: index as u32 })
+        })
+        .collect() // alloc: error path
+}
+
+/// The span rustc's `dyn_compatibility_violations_for_assoc_item` gives a method's violation.
+fn method_site(
+    db: &Db,
+    trait_: TraitId,
+    function: FunctionId,
+    code: MethodViolationCode,
+) -> ViolationSite {
+    let sig = db.callable_item_signature(function.into());
+    match code {
+        MethodViolationCode::ReferencesSelfInput => sig
+            .skip_binder()
+            .inputs()
+            .iter()
+            .skip(1)
+            .position(|ty| {
+                contains_illegal_self_type_reference(
+                    db,
+                    trait_,
+                    ty.skip_binder(),
+                    AllowSelfProjections::Yes,
+                )
+            })
+            .map_or(ViolationSite::Name(function.into()), |arg| ViolationSite::Param {
+                function,
+                index: arg as u32 + 1,
+            }),
+        MethodViolationCode::ReferencesSelfOutput => ViolationSite::Output(function),
+        MethodViolationCode::ReferencesImplTraitInTrait => return_impl_trait(db, &sig)
+            .map_or(ViolationSite::Name(function.into()), |index| ViolationSite::Opaque {
+                function,
+                index,
+            }),
+        MethodViolationCode::UndispatchableReceiver => ViolationSite::Param { function, index: 0 },
+        MethodViolationCode::StaticMethod
+        | MethodViolationCode::AsyncFn
+        | MethodViolationCode::WhereClauseReferencesSelf
+        | MethodViolationCode::Generic => ViolationSite::Name(function.into()),
+    }
 }
 
 #[salsa::tracked(returns(copy), mem_tag = Infer)]
@@ -483,10 +651,19 @@ fn contains_illegal_impl_trait_in_trait<'db>(
     db: &'db Db,
     sig: &EarlyBinder<'db, Binder<'db, rustc_type_ir::FnSig<DbInterner<'db>>>>,
 ) -> Option<MethodViolationCode> {
+    return_impl_trait(db, sig).map(|_| MethodViolationCode::ReferencesImplTraitInTrait)
+}
+
+/// The first return-position `impl Trait` of `sig`'s return type, where rustc's
+/// `contains_illegal_impl_trait_in_trait` points.
+fn return_impl_trait<'db>(
+    db: &'db Db,
+    sig: &EarlyBinder<'db, Binder<'db, rustc_type_ir::FnSig<DbInterner<'db>>>>,
+) -> Option<ImplTraitIdx> {
     struct ReturnTypeImplTrait<'db>(&'db Db);
 
     impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for ReturnTypeImplTrait<'db> {
-        type Result = ControlFlow<()>;
+        type Result = ControlFlow<ImplTraitIdx>;
 
         fn visit_ty(
             &mut self,
@@ -496,9 +673,9 @@ fn contains_illegal_impl_trait_in_trait<'db>(
                 _,
                 AliasTy { kind: AliasTyKind::Opaque { def_id }, .. },
             ) = ty.kind()
-                && matches!(def_id.0.loc(self.0), ImplTraitId::ReturnTypeImplTrait(..))
+                && let ImplTraitId::ReturnTypeImplTrait(_, index) = def_id.0.loc(self.0)
             {
-                return ControlFlow::Break(());
+                return ControlFlow::Break(index);
             }
             ty.super_visit_with(self)
         }
@@ -507,7 +684,5 @@ fn contains_illegal_impl_trait_in_trait<'db>(
     // Since we haven't implemented RPITIT in proper way like rustc yet,
     // just check whether `ret` contains RPIT for now
     let ret = sig.skip_binder().output();
-    ret.visit_with(&mut ReturnTypeImplTrait(db))
-        .is_break()
-        .then_some(MethodViolationCode::ReferencesImplTraitInTrait)
+    ret.visit_with(&mut ReturnTypeImplTrait(db)).break_value()
 }

@@ -18,6 +18,7 @@ use rustc_type_ir::{
     inherent::{BoundExistentialPredicates as _, IntoKind, ParamEnv as _, SliceLike as _},
 };
 use salsa::plumbing::FromId as _;
+use smallvec::SmallVec;
 
 use hir_ty::{
     ImplTraitId, InferBodyId,
@@ -34,9 +35,9 @@ struct Mentions<'db> {
     db: &'db Db,
     crates: FxHashSet<Crate>,
     /// The bodies it has the code of or mentions a type of.
-    bodies: Vec<DefWithBodyId>,
+    bodies: SmallVec<[DefWithBodyId; 4]>,
     /// Of those, the ones it mentions a coroutine of, whose layout is of the whole body.
-    coroutines: Vec<DefWithBodyId>,
+    coroutines: SmallVec<[DefWithBodyId; 4]>,
     /// Whether an `impl Trait` is looked through to the type its body gives it, and a
     /// projection left as it is written, rather than either told apart as `opaque`.
     reveal: bool,
@@ -44,7 +45,7 @@ struct Mentions<'db> {
     revealing: u32,
     /// The bodies that give the `impl Trait`s it mentions their types, and those of the
     /// closures in those types: its name says none of what they wrote.
-    hidden: Vec<DefWithBodyId>,
+    hidden: SmallVec<[DefWithBodyId; 4]>,
     /// It mentions something whose crate we can't tell.
     opaque: bool,
     /// The types looked into so far. The type of a future holds those of the futures it
@@ -61,11 +62,11 @@ impl<'db> Mentions<'db> {
         let mut mentions = Mentions {
             db,
             crates: FxHashSet::default(),
-            bodies: Vec::new(),
-            coroutines: Vec::new(),
+            bodies: SmallVec::new(),
+            coroutines: SmallVec::new(),
             reveal,
             revealing: 0,
-            hidden: Vec::new(),
+            hidden: SmallVec::new(),
             opaque: false,
             seen: FxHashSet::default(),
         };
@@ -146,6 +147,7 @@ pub fn body_files(db: &Db, instance: &Instance) -> Option<Box<[FileId]>> {
     if mentions.opaque {
         return None;
     }
+    // alloc: the result, owned by the caller; one exact block, sorted in place
     let mut files: Vec<FileId> = mentions.bodies.into_iter().map(|it| body_file(db, it)).collect();
     blaze_ids::radix::sort_copy_by_key(&mut files, |it| it.index());
     files.dedup();
@@ -174,7 +176,7 @@ pub(super) fn bodies_of(
         | InstanceDef::CoroutineByMove(_) => mentions.bodies.first().copied(),
         _ => None,
     };
-    Some((written, mentions.coroutines))
+    Some((written, mentions.coroutines.into_vec()))
 }
 
 /// The file a body is written in, which for one a macro makes is where the macro is called.
@@ -290,10 +292,12 @@ impl Homes {
     ) -> StoredParamEnvAndCrate {
         if *NO_HOME || !asked.param_env(db).caller_bounds().is_empty()
         {
+            // clone: a refcount of the interned clauses; callers own the environment they get
             return asked.clone();
         }
         let mentions = Mentions::of(db, instance);
         if mentions.opaque {
+            // clone: a refcount of the interned clauses; callers own the environment they get
             return asked.clone();
         }
         let home = mentions.crates.iter().copied().find(|&krate| {
@@ -302,6 +306,7 @@ impl Homes {
         });
         match home {
             Some(krate) => ParamEnvAndCrate { krate, ..asked.as_ref(db) }.store(),
+            // clone: a refcount of the interned clauses; callers own the environment they get
             None => asked.clone(),
         }
     }

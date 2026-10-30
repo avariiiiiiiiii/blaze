@@ -7,6 +7,7 @@ use std::ops::Range;
 use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
+use smallvec::SmallVec;
 
 use crate::{
     mir::{
@@ -37,9 +38,9 @@ pub(super) struct Site<'a> {
 struct Temps {
     span: MirSpan,
     /// Statements before the jump into the callee.
-    before: Vec<Statement>,
+    before: SmallVec<[Statement; 8]>,
     /// The temporaries, in the order they were made.
-    made: Vec<LocalId>,
+    made: SmallVec<[LocalId; 8]>,
 }
 
 impl Temps {
@@ -132,12 +133,12 @@ pub(super) fn inline_call<'db>(
     let return_block = target.map(|target| {
         let is_cleanup = body.basic_blocks[target].is_cleanup;
         body.basic_blocks.alloc(BasicBlock {
-            statements: Vec::new(),
+            statements: Vec::new(), // alloc: empty; reserved to its final size once below
             terminator: Some(Terminator { span, kind: TerminatorKind::Goto { target } }),
             is_cleanup,
         })
     });
-    let mut temps = Temps { span, before: Vec::new(), made: Vec::new() };
+    let mut temps = Temps { span, before: SmallVec::new(), made: SmallVec::new() };
 
     // `a[*i] = f(i)`, where `f` may change `i`: which place it is is decided before the call.
     let needs_borrow = destination
@@ -186,7 +187,7 @@ pub(super) fn inline_call<'db>(
 
     // `_0` is the destination, a parameter its argument, any other local a new one of the
     // caller; a new one the callee never marks live or dead is live for the whole call.
-    let mut marked = vec![false; callee.locals.len()];
+    let mut marked: SmallVec<[bool; 64]> = SmallVec::from_elem(false, callee.locals.len());
     for (_, block) in callee.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::StorageLive(local) | StatementKind::StorageDead(local) =
@@ -198,7 +199,7 @@ pub(super) fn inline_call<'db>(
     }
     let first_new = body.locals.len();
     let mut map: Vec<LocalId> = Vec::with_capacity(callee.locals.len());
-    let mut always_live: Vec<LocalId> = Vec::new();
+    let mut always_live: SmallVec<[LocalId; 8]> = SmallVec::new();
     for (local, decl) in std::mem::take(&mut callee.locals) {
         let mapped = if local == return_slot() {
             destination_local
@@ -232,15 +233,10 @@ pub(super) fn inline_call<'db>(
     );
     let mut spans =
         Spans { scope, base, own: FxHashMap::default(), spans: &mut body.inlined.spans };
-    let scopes: Vec<InlinedScope> = callee
-        .inlined
-        .scopes
-        .iter()
-        .map(|it| InlinedScope {
-            callee: site.nested[it.callee as usize],
-            call_site: spans.map(it.call_site),
-        })
-        .collect();
+    body.inlined.scopes.extend(callee.inlined.scopes.iter().map(|it| InlinedScope {
+        callee: site.nested[it.callee as usize],
+        call_site: spans.map(it.call_site),
+    }));
 
     let offset = body.basic_blocks.len();
     let map_block = |block: BasicBlockId| block_id(offset + block_index(block));
@@ -290,9 +286,7 @@ pub(super) fn inline_call<'db>(
         binding: it.binding,
         local: lookup(it.local),
     });
-    let bindings: Vec<InlinedBinding> = own_bindings.chain(nested_bindings).collect();
-    body.inlined.scopes.extend(scopes);
-    body.inlined.bindings.extend(bindings);
+    body.inlined.bindings.extend(own_bindings.chain(nested_bindings));
     // A promoted constant is of the expression store of the body it was written in, and is
     // instantiated with that body's arguments: those of its callee.
     let own_promoted = callee.promoted_locals.iter().map(|&(local, expr)| InlinedPromoted {
@@ -305,8 +299,7 @@ pub(super) fn inline_call<'db>(
         callee: site.nested[it.callee as usize],
         expr: it.expr,
     });
-    let promoted: Vec<InlinedPromoted> = own_promoted.chain(nested_promoted).collect();
-    body.inlined.promoted.extend(promoted);
+    body.inlined.promoted.extend(own_promoted.chain(nested_promoted));
 
     if let Some(block) = return_block {
         let statements = &mut body.basic_blocks[block].statements;
@@ -324,7 +317,7 @@ pub(super) fn inline_call<'db>(
         }
     }
     let caller_block = &mut body.basic_blocks[site.block];
-    caller_block.statements.append(&mut temps.before);
+    caller_block.statements.extend(temps.before.drain(..));
     caller_block.terminator =
         Some(Terminator { span, kind: TerminatorKind::Goto { target: callee_start } });
 
@@ -334,13 +327,12 @@ pub(super) fn inline_call<'db>(
         callee.panic_unwinds.iter().map(|&(block, at, to)| (map_block(block), at, map_block(to))),
     );
     // The callee's scopes end before any of the caller's that is open at the call.
-    let ends = callee
-        .scope_ends
-        .iter()
-        .map(|&it| lookup(it))
-        .filter(|it| local_index(*it) >= first_new)
-        .collect::<Vec<_>>();
-    body.scope_ends.splice(0..0, ends);
+    let open = body.scope_ends.len();
+    body.scope_ends.extend(
+        callee.scope_ends.iter().map(|&it| lookup(it)).filter(|it| local_index(*it) >= first_new),
+    );
+    let ended = body.scope_ends.len() - open;
+    body.scope_ends.rotate_right(ended);
 
     for (_, block) in std::mem::take(&mut callee.basic_blocks) {
         body.basic_blocks.alloc(block);

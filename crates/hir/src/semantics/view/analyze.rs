@@ -112,6 +112,14 @@ impl<'db> Semantics<'db> {
             .map(|(ty, coerced)| TypeInfo { original: ty, adjusted: coerced })
     }
 
+    /// `pat`'s type as rustc's "consider giving `x` an explicit type" names it, when inference
+    /// left it undecided: [`Self::type_of_pat`]'s `original`, but with each variable made for a
+    /// parameter that rustc names (a const parameter, a type parameter outside a macro
+    /// expansion) that parameter. `None` for a pattern whose type was decided.
+    pub fn named_type_of_pat(&self, pat: ast::Pat<'db>) -> Option<Type<'db>> {
+        self.analyze(pat.syntax())?.named_type_of_pat_view(self.db, pat)
+    }
+
     /// The type of the binding, with what its binding mode makes of it: `&mut Option<T>` for
     /// `ref mut x @ Some(_)` where [`Self::type_of_pat`] is `Option<T>`.
     pub fn type_of_binding_in_pat(&self, pat: ast::IdentPat<'db>) -> Option<Type<'db>> {

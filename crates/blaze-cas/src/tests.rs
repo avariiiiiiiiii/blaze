@@ -67,6 +67,29 @@ fn flush(sim: &mut Sim, store: &mut Store) -> Vec<Ticket> {
     drive(sim, store, &mut effects)
 }
 
+/// `len` bytes of text that compresses, different for each `n`.
+fn text(n: u64, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 512);
+    let mut at = n * 1000;
+    while out.len() < len {
+        out.extend(run_output(at));
+        at += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+fn settle(sim: &mut Sim, store: &mut Store) -> Settled {
+    let mut effects = Vec::new();
+    let settled = store.settle(&mut effects);
+    drive(sim, store, &mut effects);
+    settled
+}
+
+fn form_of(store: &Store, key: &Key) -> Form {
+    store.tiers[0].find(key).unwrap().unwrap().0.form
+}
+
 fn quiet() -> Faults {
     Faults::default()
 }
@@ -172,6 +195,7 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
                     1 => (Kind::Code, noise(200 + (next as usize * 37) % 3000, next)),
                     2 if seed % 4 == 0 => (Kind::Output, noise(300 << 10, next)),
                     3 if seed % 4 == 1 => (Kind::Query, noise(100 << 10, next)),
+                    4 if seed % 3 == 2 => (Kind::Code, text(next, 6 << 10)),
                     _ => (Kind::Query, noise(64, next)),
                 };
                 let ticket = store.put(key(next), kind, bytes.clone()).unwrap();
@@ -179,6 +203,13 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
                 expected.insert(key(next), bytes);
             }
             let mut effects = Vec::new();
+            if seed % 3 == 2 {
+                store.settle(&mut effects);
+                for ticket in drive(&mut sim, &mut store, &mut effects) {
+                    durable_keys.extend(tickets.get(&ticket).copied());
+                }
+                store.settle(&mut effects);
+            }
             store.flush(&mut effects);
             let polls = sim.rng().below(40);
             for _ in 0..polls {
@@ -206,7 +237,7 @@ fn a_flipped_byte_of_a_value_is_never_served() {
     store.put(key(1), Kind::Query, vec![b'a'; 1000]).unwrap();
     store.put(key(2), Kind::Query, vec![b'b'; 1000]).unwrap();
     flush(&mut sim, &mut store);
-    let (loc, _) = store.tiers[0].delta[&key(2)];
+    let loc = store.tiers[0].delta[&key(2)].loc;
     drop(store);
     let pack = name("store/pack-query-000000");
     let mut bytes = sim.contents(&pack);
@@ -294,10 +325,10 @@ fn a_cold_kind_trains_its_dictionary_and_compresses_what_follows() {
     }
     assert_eq!(store.problems(), &[] as &[String]);
     assert_eq!(store.tiers[0].dictionaries.len(), 1, "one dictionary for runs");
-    let (loc, _) = store.tiers[0].delta[&key(count - 1)];
+    let loc = store.tiers[0].delta[&key(count - 1)].loc;
     assert_eq!(loc.form, Form::Zstd);
     assert!(loc.stored * 3 < loc.raw, "{} stored of {}", loc.stored, loc.raw);
-    let (first, _) = store.tiers[0].delta[&key(0)];
+    let first = store.tiers[0].delta[&key(0)].loc;
     assert_eq!(first.form, Form::Raw);
     for n in 0..count {
         assert_eq!(bytes_of(&store, &key(n)).unwrap(), run_output(n));
@@ -442,38 +473,20 @@ fn packs_roll_over_when_full() {
 }
 
 #[test]
-fn index_tables_find_every_key_and_no_other() {
-    let entries: Vec<(Key, Loc)> = (0..3000)
-        .map(|n| {
-            (key(n), Loc {
-                pack: (n % 7) as u32,
-                kind: Kind::ALL[(n % 6) as usize],
-                form: Form::Raw,
-                offset: n * 16,
-                stored: n,
-                raw: n,
-            })
-        })
-        .collect();
-    let bytes = disk::build_index(&entries);
-    let table = Table::new(&bytes).unwrap();
-    assert_eq!(table.count(), 3000);
-    for (key, loc) in &entries {
-        assert_eq!(table.get(key), Some(Ok(*loc)));
-    }
-    assert_eq!(table.get(&key(1 << 40)), None);
-    assert_eq!(table.iter().count(), 3000);
-    assert!(Table::new(&bytes[..bytes.len() - 1]).is_err());
-}
-
-#[test]
 fn a_head_round_trips_and_refuses_any_change() {
     let head = Head {
         generation: 7,
         index: Some(IndexRef { slot: 1, len: 64 + 1024 * 64, check: 0xdead_beef, count: 3 }),
         packs: vec![
-            PackRef { kind: Kind::Code, number: 0, committed: 4096, indexed: 16 },
-            PackRef { kind: Kind::Run, number: 2, committed: 3 * 4096, indexed: 4096 },
+            PackRef { kind: Kind::Code, number: 0, committed: 4096, indexed: 16, dead: 0, removed: true },
+            PackRef {
+                kind: Kind::Run,
+                number: 2,
+                committed: 3 * 4096,
+                indexed: 4096,
+                dead: 100,
+                removed: false,
+            },
         ],
         dictionaries: vec![DictionaryRef { kind: Kind::Run, pack: 1, offset: 16 }],
         externals: vec![ExternalRef { content: content_of(b"y"), len: 9 }],
@@ -678,7 +691,7 @@ fn a_long_cold_value_is_compressed_without_a_dictionary_over_a_long_window() {
         n += 1;
     }
     store.put(key(1), Kind::Debug, long.clone()).unwrap();
-    let (loc, _) = store.tiers[0].delta[&key(1)];
+    let loc = store.tiers[0].delta[&key(1)].loc;
     assert_eq!(loc.form, Form::Zstd);
     assert!(loc.stored * 4 < loc.raw, "{} stored of {}", loc.stored, loc.raw);
     let header = RecordHeader::decode(store.tiers[0].packs[0].bytes(loc.offset, RECORD_HEADER).unwrap());
@@ -709,7 +722,7 @@ fn chunks_that_shrink_are_kept_in_lz4_and_the_rest_raw() {
         .delta
         .iter()
         .filter(|(key, _)| **key != self::key(1))
-        .map(|(_, (loc, _))| loc.form)
+        .map(|(_, it)| it.loc.form)
         .collect();
     assert!(forms.contains(&Form::Lz4), "{forms:?}");
     assert!(forms.contains(&Form::Raw), "{forms:?}");
@@ -719,4 +732,131 @@ fn chunks_that_shrink_are_kept_in_lz4_and_the_rest_raw() {
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), both);
     assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn what_is_unread_for_two_periods_goes_cold_and_what_is_read_stays_hot() {
+    let mut sim = Sim::new(30, quiet());
+    let mut store = open(&mut sim, "store");
+    for n in 0..10 {
+        store.put(key(n), Kind::Code, text(n, 8 << 10)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    assert_eq!(settle(&mut sim, &mut store).demoted, 0, "one period is not two");
+    assert_eq!(bytes_of(&store, &key(0)).unwrap(), text(0, 8 << 10));
+    let settled = settle(&mut sim, &mut store);
+    assert_eq!(settled.demoted, 9, "{settled:?}");
+    assert_eq!(form_of(&store, &key(0)), Form::Raw, "it was read");
+    for n in 1..10 {
+        assert_eq!(form_of(&store, &key(n)), Form::Zstd, "{n}");
+    }
+    let durable = store.put(key(3), Kind::Code, text(3, 8 << 10)).unwrap();
+    assert!(store.durable(durable), "a moved value is as durable as it was");
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..10 {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 8 << 10), "{n}");
+    }
+    assert_eq!(form_of(&store, &key(4)), Form::Zstd);
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn a_cold_value_read_in_two_periods_running_comes_back_hot() {
+    let mut sim = Sim::new(31, quiet());
+    let mut store = open(&mut sim, "store");
+    store.put(key(1), Kind::Code, text(1, 16 << 10)).unwrap();
+    store.put(key(2), Kind::Output, text(2, 16 << 10)).unwrap();
+    flush(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    assert_eq!(settle(&mut sim, &mut store).demoted, 2);
+    for round in 0..2 {
+        assert_eq!(bytes_of(&store, &key(1)).unwrap(), text(1, 16 << 10));
+        assert_eq!(bytes_of(&store, &key(2)).unwrap(), text(2, 16 << 10));
+        let settled = settle(&mut sim, &mut store);
+        assert_eq!(settled.promoted, round * 2, "{settled:?}");
+    }
+    assert_eq!(form_of(&store, &key(1)), Form::Raw);
+    assert_eq!(form_of(&store, &key(2)), Form::Lz4, "an output comes back as LZ4");
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), text(2, 16 << 10));
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn a_value_that_does_not_compress_is_tried_once() {
+    let mut sim = Sim::new(32, quiet());
+    let mut store = open(&mut sim, "store");
+    store.put(key(1), Kind::Code, noise(8 << 10, 320)).unwrap();
+    flush(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    assert_eq!(settle(&mut sim, &mut store).demoted, 0);
+    let (_, row) = store.tiers[0].find(&key(1)).unwrap().unwrap();
+    assert!(lock(&store.flags)[0].get(row, Flag::Tried));
+    assert_eq!(form_of(&store, &key(1)), Form::Raw);
+    assert_eq!(settle(&mut sim, &mut store), Settled::default());
+}
+
+#[test]
+fn packs_that_are_mostly_moved_out_are_rewritten_and_removed() {
+    let mut sim = Sim::new(33, quiet());
+    let mut store = open(&mut sim, "store");
+    let value = |n: u64| if n % 2 == 0 { text(n, 12 << 10) } else { noise(4 << 10, n) };
+    for n in 0..100 {
+        store.put(key(n), Kind::Code, value(n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let before: Vec<FileName> = store.tiers[0].packs.iter().map(|it| it.file.clone()).collect();
+    assert!(before.len() >= 3, "{} packs", before.len());
+    settle(&mut sim, &mut store);
+    let settled = settle(&mut sim, &mut store);
+    assert_eq!(settled.demoted, 50, "{settled:?}");
+    assert!(settled.retired >= 2, "{settled:?}");
+    let last = before.len() - 1;
+    for (at, file) in before.iter().enumerate() {
+        let removed = store.tiers[0].packs[at].removed;
+        assert_eq!(removed, !sim.exists(file), "{file}");
+        if at == last {
+            assert!(!removed, "the pack its kind appends to stays");
+        }
+    }
+    assert!(store.tiers[0].packs.iter().filter(|it| it.removed).count() as u64 == settled.retired);
+    for n in 0..100 {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n}");
+    }
+    drop(store);
+    let store = open(&mut sim, "store");
+    for n in 0..100 {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), value(n), "{n}");
+    }
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn a_pack_left_behind_by_a_crash_is_removed_at_the_next_open() {
+    let mut sim = Sim::new(34, quiet());
+    let mut store = open(&mut sim, "store");
+    for n in 0..60 {
+        store.put(key(n), Kind::Code, text(n, 12 << 10)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    let mut effects = Vec::new();
+    assert!(store.settle(&mut effects).retired >= 1);
+    run_until_idle(&mut sim, &mut effects, |completion, effects| {
+        if store.owns(completion.tag) {
+            store.complete(completion, effects);
+        }
+        effects.retain(|it| !matches!(it, Effect::Remove { .. }));
+    });
+    let gone: Vec<FileName> =
+        store.tiers[0].packs.iter().filter(|it| it.removed).map(|it| it.file.clone()).collect();
+    assert!(!gone.is_empty() && gone.iter().all(|it| sim.exists(it)), "the removes were dropped");
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert!(gone.iter().all(|it| !sim.exists(it)));
+    for n in 0..60 {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 12 << 10), "{n}");
+    }
 }

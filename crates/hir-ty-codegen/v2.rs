@@ -34,6 +34,7 @@ pub(crate) mod refs;
 pub(crate) mod release;
 pub(crate) mod shape;
 pub(crate) mod side;
+pub(crate) mod statics;
 #[cfg(test)]
 mod tests;
 pub(crate) mod unwind;
@@ -130,6 +131,16 @@ pub(crate) struct Function {
     pub(crate) spans: Vec<SpanRef>,
     /// Its named locals, for a debugger: empty unless the unit's debug info has them.
     pub(crate) variables: Vec<side::Variable>,
+    /// What its `#[inline]` asks of LLVM; `None` for closures, glue and shims.
+    pub(crate) hint: fragment::Hint,
+    /// Where [`release::summarize`] leaves what [`release::emit`] takes up.
+    pub(crate) release: release::Kept,
+    /// Whether a fold may give it another function's code: not where its address is
+    /// significant (a symbol of its own) or it is C-variadic.
+    pub(crate) foldable: bool,
+    /// The references a Cranelift unit was prepared against, which a fold names its data by
+    /// (`Prepare::masked` is given none); empty for LLVM.
+    pub(crate) refs: Vec<blaze_codegen::Target>,
 }
 
 pub(crate) enum Built {
@@ -185,6 +196,8 @@ pub(crate) enum DataPlace {
     Position(SpanRef),
     /// The bytes of a `&str` made at compile time: `file!()`, with what is `concat!`ed to it.
     Text(String),
+    /// A `core::panic::Location` of no place the program has a span of.
+    Nowhere,
 }
 
 /// A crate the build compiles for its build scripts and proc macros, not for the program.

@@ -20,6 +20,8 @@ Where: `crates/ide-db/src/lib.rs` (`impl SourceDatabase for RootDatabase`, coord
 Why: the def-map collector expands each round's macros in parallel (docs/v2/plan/lanes/db.md, "Parallel
 macro expansion"); each worker thread reads through its own fork.
 
+> applied: superseded by the `run_all` section below; `fork` is gone from `crates/ide-db/src/lib.rs` and `crates/hir-ide/src/test_db.rs`.
+
 ---
 Routed or applied by the coordinator, 16:54.
 
@@ -78,6 +80,10 @@ a full parse: from the outline, per body, either the body's token range (to scan
 tokens) or its sorted set of identifier symbols. Whichever the outline gives, `body_syntax` and
 `words` in `nameres/demand.rs` switch to it (db-expand-split's paths); until then the prefilter
 parses every dependency file it checks, which is what is parsed today.
+
+> forwarded to codegen: the three `crates/blaze-engine/src/lib.rs` changes (`declared_in`, `home_in_rustcs`, `Declared::in_scope`).
+> forwarded to items: `method_resolution.rs` `impl_holders` and `opaques.rs` are items' files in `crates/hir-ty/src/` (crates.md), not db-ty's.
+> forwarded to format: the outline's per-body words or token range for `demand::may_declare_roots`.
 
 ## Inputs keyed by content: callers outside base-db (from `db-expand-inputs`)
 
@@ -147,6 +153,11 @@ Why: docs/v2/plan.md section 2 and docs/v2/plan/reference/crates.md "IDs": resul
 never by revision, so views with equal inputs share them; a setter that changes a value without
 its ID would let a stale result be reused.
 
+> applied: `crates/ide-db/src/lib.rs`: `RootDatabase::set_env` calls `krate.set_env(self, env)` (the `salsa::Setter` import is gone); `RootDatabase` and hir-ide's `TestDB` forward `set_appended_root_module` and `set_view_root` to `Files`. hir-def's tests (lines 878, 887) already call `db.set_appended_root_module`.
+> forwarded to codegen: `crates/blaze-engine/src/{doctest.rs,consteval.rs,borrowck.rs,lib.rs}`'s setter calls, and `crates/hir-ty-codegen/v2/tests/db.rs`, which lacks both new methods.
+> forwarded to items: `crates/blaze-items/src/tests/db.rs` is items' (`crates/blaze-items/`), not the coordinator's; it lacks both new methods.
+> forwarded to coordinator: `crates/blaze-doc/src/lib.rs:203` (blaze-doc is the coordinator's, not among the paths `requests` applies).
+
 ## `Hash` for the values of db-expand's `lru` queries (db-expand, for format)
 
 What: db-salsa's fingerprints (`v2/requests/db-salsa.md`, first section) need `Output: Hash` on
@@ -175,3 +186,56 @@ address that can be reused. db-expand's sites and what each still lacks:
 Why: without them these four queries don't compile under db-salsa's macros; with them an evicted
 parse or expansion that recomputes to the same value is backdated, so its readers don't rerun
 (docs/v2/plan/lanes/db.md, "The LRU caps go away as a correctness problem").
+
+> forwarded to format: `impl<T> Hash for syntax::Parse<T>` (`crates/syntax/src/lib.rs`) and `Hash` on `mbe::ValueResult` (`crates/mbe/src/lib.rs:341`); neither is there yet.
+
+## `SourceDatabase::run_all` replaces `fork` (db-expand, 10-29)
+
+What: decisions.md settles that the database is `Sync`, shared by reference, with no per-thread
+handles, and that all parallel work is plane tasks. `fork` was a per-thread handle and the
+collector spawned threads inside a query, so both are gone. `crates/base-db/src/lib.rs` now has,
+in place of `fork`:
+
+```rust
+fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync));
+```
+
+It runs `task(db, i)` for every `i` in `0..count` and returns once each has run. The collector
+calls it for each round's expansions (`expand_all` in `nameres/collector.rs`) and for a crate's
+dependencies' def maps (`seed_with_top_level`). Each task only asks queries, so the order and the
+threads they run on don't change any result; the collector reads the results in its own order.
+
+Where, and what each does:
+
+- `crates/ide-db/src/lib.rs` (`RootDatabase`), coordinator: remove `fork`; implement `run_all`
+  on the database that blaze runs on. That is the parent db lane's Sync database
+  (`blaze-query`): post the `count` tasks as one batch of plane tasks on the shared worker pool
+  (`blaze_graph::exec`), each reading the database through `&self`, and have the calling thread
+  pump-wait for them (#1301: a waiting thread serves requests, and a nested request needing
+  what an outer one holds is cancelled and reposted). A panic in a task, salsa's cancellation
+  included, goes on from `run_all` on the calling thread once the batch is over. Until the
+  database is `Sync` no implementation can meet the decision. Running the tasks in order on
+  the calling thread would be a quiet serial fallback; don't do it.
+- `crates/hir-ide/src/test_db.rs`, `crates/hir/src/tests/db.rs` (db-ty),
+  `crates/blaze-diagnostics/src/tests/db.rs` and `crates/blaze-items/src/tests/db.rs`: remove
+  `fork` and implement `run_all` as a test database without a plane does, in order on the
+  calling thread:
+
+  ```rust
+  fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
+      (0..count).for_each(|at| task(self, at));
+  }
+  ```
+
+  hir-def's `TestDB` (`RunOrder` in `test_db.rs`) also runs a batch reversed or strided, so
+  `nameres/tests/batch_order.rs` can check that no def map depends on the order.
+
+Why: docs/v2/plan/lanes/db.md, "One database, shared by every thread", and its Done when item
+"no salsa per-thread handles; expansion rounds are plane tasks". This replaces the `fork`
+section above.
+
+> applied: `crates/ide-db/src/lib.rs`: `fork` removed; `RootDatabase::run_all` submits each task to a `blaze_graph::pool::Pool` near the caller's group inside `Pool::scope` (which pump-waits on a worker), keeps the first panic and resumes it after the batch; `RootDatabase::set_pool(Arc<Pool>)` gives it the daemon's pool, and a database without one panics at its first non-empty batch, naming `set_pool` (no serial path). `ide-db` depends on `blaze-graph` (workspace). `crates/hir-ide/src/test_db.rs`: in order on the calling thread, as asked.
+> forwarded to db: `RootDatabase::run_all` passes `&RootDatabase` to pool jobs, so it compiles only once `salsa::Storage` (its `ZalsaLocal`) is `Sync`: db's, as db-expand's report says.
+> forwarded to diagnostics: `crates/blaze-diagnostics/src/tests/db.rs` still has `fork` and no `run_all`.
+> forwarded to items: `crates/blaze-items/src/tests/db.rs` has no `run_all`.
+> forwarded to codegen: `crates/hir-ty-codegen/v2/tests/db.rs` has no `run_all`.

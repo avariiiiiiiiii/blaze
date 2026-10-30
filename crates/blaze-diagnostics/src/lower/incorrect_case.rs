@@ -1,0 +1,385 @@
+//! A name not in the case rustc's style lints ask for: `non_camel_case_types` (an early lint),
+//! `non_snake_case` and `non_upper_case_globals` (late lints), with rustc's sort of the name
+//! ("function", "trait method", "associated constant", ..), its conversion of the name and its
+//! suggestion. hir finds the names by rust-analyzer's rules; each is checked again by rustc's
+//! (`is_upper_camel_case`, `is_snake_case`, all upper case), so a name only rust-analyzer
+//! would flag gives nothing.
+//!
+//! Follows rustc's `compiler/rustc_lint/src/nonstandard_style.rs` and `lints.rs`
+//! (`NonCamelCaseType`, `NonSnakeCaseDiag`, `NonUpperCaseGlobal`), and `lib.rs` for which
+//! pass each runs in (MIT or Apache-2.0).
+
+use hir::{HasVisibility as _, InFile, Visibility};
+use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
+
+use crate::{
+    cx::Cx,
+    lower::{Found, Phase},
+    model::{Applicability, Diag},
+};
+
+pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
+    let name_ptr = InFile::new(d.file, d.ident);
+    let name_node = cx.node(name_ptr);
+    let Some(owner) = name_node.value.syntax().parent() else { return Vec::new() };
+    let raw = d.ident_text.as_str();
+    let name = raw.strip_prefix("r#").unwrap_or(raw);
+    let span = cx.span_of_ptr(name_ptr);
+    let at = |node: &SyntaxNode| InFile::new(d.file, SyntaxNodePtr::new(node));
+    let found = match d.ident_type.to_string().as_str() {
+        "Structure" | "Enum" | "Union" | "Trait" | "Type alias" | "Variant" => {
+            if is_upper_camel_case(name) {
+                return Vec::new();
+            }
+            let (sort, lint_at) = camel_sort(&owner);
+            let mut diag =
+                Diag::lint("non_camel_case_types", format!("{sort} `{name}` should have an upper camel case name"), span.clone());
+            let cc = to_upper_camel_case(name);
+            match cc != name {
+                true => diag.suggestion(span, "convert the identifier to upper camel case", cc, Applicability::MaybeIncorrect),
+                false => diag.span_label(span, "should have an UpperCamelCase name"),
+            };
+            Found::lint(diag, Phase::Resolve, at(&lint_at))
+        }
+        "Function" | "Variable" | "Parameter" | "Field" | "Module" => {
+            if is_snake_case(name) {
+                return Vec::new();
+            }
+            let sort = snake_sort(&owner);
+            let mut diag = Diag::lint("non_snake_case", format!("{sort} `{name}` should have a snake case name"), span.clone());
+            let sc = to_snake_case(name);
+            if sc == name {
+                diag.span_label(span, "should have a snake_case name");
+            } else if !is_reserved(&sc, cx.edition) {
+                diag.suggestion(span, "convert the identifier to snake case", sc, Applicability::MaybeIncorrect);
+            } else if can_be_raw(&sc) {
+                diag.suggestion(
+                    span,
+                    "rename the identifier or convert it to a snake case raw identifier",
+                    format!("r#{sc}"),
+                    Applicability::MaybeIncorrect,
+                );
+            } else {
+                diag.note(format!("`{sc}` cannot be used as a raw identifier"));
+                diag.suggestion(span, "rename the identifier", "", Applicability::MaybeIncorrect);
+            }
+            Found::lint(diag, Phase::Late, at(&owner))
+        }
+        "Constant" | "Static variable" => {
+            if name.chars().all(|c| c.to_uppercase().eq([c])) {
+                return Vec::new();
+            }
+            let (sort, exported) = upper_sort(cx, &owner, d.file);
+            let mut diag =
+                Diag::lint("non_upper_case_globals", format!("{sort} `{name}` should have an upper case name"), span.clone());
+            let uc = to_snake_case(name).to_uppercase();
+            match uc != name {
+                true => {
+                    let applicability = match exported {
+                        Some(false) => Applicability::MachineApplicable,
+                        Some(true) | None => Applicability::MaybeIncorrect,
+                    };
+                    diag.suggestion(span, "convert the identifier to upper case", uc, applicability)
+                }
+                false => diag.span_label(span, "should have an UPPER_CASE name"),
+            };
+            Found::lint(diag, Phase::Late, at(&owner))
+        }
+        other => {
+            let diag = Diag::error(
+                None,
+                format!("blaze does not know rustc's style lint of a name of kind `{other}`: `{name}`"),
+                span,
+            );
+            Found::new(diag, Phase::Late)
+        }
+    };
+    vec![found]
+}
+
+/// The container of an associated item: the impl or trait its item list is in.
+fn assoc_container(item: &SyntaxNode) -> Option<SyntaxNode> {
+    let list = item.parent().filter(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST)?;
+    list.parent()
+}
+
+/// rustc's sort of a type-like name, and the node its lint is emitted at: an associated type
+/// of an inherent impl is linted from the impl's `check_item`, so the impl's attributes
+/// decide its level.
+fn camel_sort(owner: &SyntaxNode) -> (&'static str, SyntaxNode) {
+    match owner.kind() {
+        SyntaxKind::TRAIT => ("trait", owner.clone()),
+        SyntaxKind::VARIANT => ("variant", owner.clone()),
+        SyntaxKind::TYPE_ALIAS => match assoc_container(owner) {
+            Some(container) if container.kind() == SyntaxKind::IMPL => ("associated type", container),
+            Some(_) => ("associated type", owner.clone()),
+            None => ("type", owner.clone()),
+        },
+        _ => ("type", owner.clone()),
+    }
+}
+
+fn snake_sort(owner: &SyntaxNode) -> &'static str {
+    match owner.kind() {
+        SyntaxKind::FN => match assoc_container(owner).map(|it| it.kind()) {
+            Some(SyntaxKind::IMPL) => "method",
+            Some(SyntaxKind::TRAIT) => "trait method",
+            _ => "function",
+        },
+        SyntaxKind::MODULE => "module",
+        SyntaxKind::RECORD_FIELD => "structure field",
+        _ => "variable",
+    }
+}
+
+/// rustc's sort of a global, and whether the item is exported (rustc suggests renaming its uses
+/// only when it is not), when rustc asks: never for an associated constant.
+fn upper_sort(cx: &Cx<'_, '_>, owner: &SyntaxNode, file: hir::HirFileId) -> (&'static str, Option<bool>) {
+    if owner.kind() == SyntaxKind::CONST && assoc_container(owner).is_some() {
+        return ("associated constant", None);
+    }
+    if let Some(it) = ast::Const::cast(owner.clone()) {
+        let def = cx.sema.to_def2(InFile::new(file, &it));
+        return ("constant", def.map(|it| exported(cx, it.visibility(cx.db), it.module(cx.db))));
+    }
+    if let Some(it) = ast::Static::cast(owner.clone()) {
+        let def = cx.sema.to_def2(InFile::new(file, &it));
+        return ("static variable", def.map(|it| exported(cx, it.visibility(cx.db), it.module(cx.db))));
+    }
+    ("constant", None)
+}
+
+/// Whether an item of `module` with `visibility` is reachable from outside its crate by its
+/// path: public, in public modules up to the crate root.
+fn exported(cx: &Cx<'_, '_>, visibility: Visibility, module: hir::Module) -> bool {
+    visibility == Visibility::Public
+        && std::iter::successors(Some(module), |it| it.parent(cx.db))
+            .filter(|it| it.parent(cx.db).is_some())
+            .all(|it| it.visibility(cx.db) == Visibility::Public)
+}
+
+/// rustc's `Ident::is_reserved` in `edition`: a keyword, a reserved one, or `_`.
+fn is_reserved(name: &str, edition: span::Edition) -> bool {
+    name.is_empty() || name == "_" || SyntaxKind::from_keyword(name, edition).is_some()
+}
+
+/// rustc's `Symbol::can_be_raw`.
+fn can_be_raw(name: &str) -> bool {
+    !matches!(name, "" | "_" | "self" | "Self" | "super" | "crate")
+}
+
+/// `char::to_titlecase`, which rustc's lint uses and std has only unstably: Unicode's title
+/// case mapping (`UnicodeData.txt` and `SpecialCasing.txt`), which is the upper case one but
+/// for the characters below.
+fn to_titlecase(c: char) -> Vec<char> {
+    let special: &[char] = match c {
+        'ß' => &['S', 's'],
+        '\u{FB00}' => &['F', 'f'],
+        '\u{FB01}' => &['F', 'i'],
+        '\u{FB02}' => &['F', 'l'],
+        '\u{FB03}' => &['F', 'f', 'i'],
+        '\u{FB04}' => &['F', 'f', 'l'],
+        '\u{FB05}' | '\u{FB06}' => &['S', 't'],
+        '\u{0587}' => &['\u{0535}', '\u{0582}'],
+        '\u{FB13}' => &['\u{0544}', '\u{0576}'],
+        '\u{FB14}' => &['\u{0544}', '\u{0565}'],
+        '\u{FB15}' => &['\u{0544}', '\u{056B}'],
+        '\u{FB16}' => &['\u{054E}', '\u{0576}'],
+        '\u{FB17}' => &['\u{0544}', '\u{056D}'],
+        '\u{1FB2}' => &['\u{1FBA}', '\u{0345}'],
+        '\u{1FB4}' => &['\u{0386}', '\u{0345}'],
+        '\u{1FC2}' => &['\u{1FCA}', '\u{0345}'],
+        '\u{1FC4}' => &['\u{0389}', '\u{0345}'],
+        '\u{1FF2}' => &['\u{1FFA}', '\u{0345}'],
+        '\u{1FF4}' => &['\u{038F}', '\u{0345}'],
+        '\u{1FB7}' => &['\u{0391}', '\u{0342}', '\u{0345}'],
+        '\u{1FC7}' => &['\u{0397}', '\u{0342}', '\u{0345}'],
+        '\u{1FF7}' => &['\u{03A9}', '\u{0342}', '\u{0345}'],
+        _ => &[],
+    };
+    if !special.is_empty() {
+        return special.to_vec();
+    }
+    let offset = |by: u32| char::from_u32(c as u32 + by).expect("a letter of the Greek Extended block");
+    let single = match c {
+        '\u{01C4}'..='\u{01C6}' => '\u{01C5}',
+        '\u{01C7}'..='\u{01C9}' => '\u{01C8}',
+        '\u{01CA}'..='\u{01CC}' => '\u{01CB}',
+        '\u{01F1}'..='\u{01F3}' => '\u{01F2}',
+        '\u{1F80}'..='\u{1F87}' | '\u{1F90}'..='\u{1F97}' | '\u{1FA0}'..='\u{1FA7}' => offset(8),
+        '\u{1FB3}' | '\u{1FC3}' | '\u{1FF3}' => offset(9),
+        '\u{10D0}'..='\u{10FA}' | '\u{10FD}'..='\u{10FF}' => c,
+        _ if is_titlecase(c) => c,
+        _ => return c.to_uppercase().collect(),
+    };
+    vec![single]
+}
+
+/// `char::is_titlecase`: the letters of Unicode's category `Lt`.
+fn is_titlecase(c: char) -> bool {
+    matches!(
+        c,
+        '\u{01C5}'
+            | '\u{01C8}'
+            | '\u{01CB}'
+            | '\u{01F2}'
+            | '\u{1F88}'..='\u{1F8F}'
+            | '\u{1F98}'..='\u{1F9F}'
+            | '\u{1FA8}'..='\u{1FAF}'
+            | '\u{1FBC}'
+            | '\u{1FCC}'
+            | '\u{1FFC}'
+    )
+}
+
+/// A character that has case: one rustc can change the case of.
+fn char_has_case(c: char) -> bool {
+    !c.to_lowercase().eq(to_titlecase(c))
+}
+
+fn changes_when_titlecased(c: char) -> bool {
+    to_titlecase(c) != [c]
+}
+
+fn not_camel_case(s: &str) -> bool {
+    let mut last = '\0';
+    s.chars().any(|snd| {
+        let fst = std::mem::replace(&mut last, snd);
+        match (fst, snd) {
+            ('_', '_') => true,
+            ('_', _) if char_has_case(snd) => true,
+            (_, '_') if char_has_case(fst) => true,
+            _ => snd.is_uppercase() && changes_when_titlecased(snd),
+        }
+    })
+}
+
+fn is_upper_camel_case(name: &str) -> bool {
+    let name = name.trim_matches('_');
+    let Some(first) = name.chars().next() else { return true };
+    !(changes_when_titlecased(first) || not_camel_case(name))
+}
+
+fn to_upper_camel_case(s: &str) -> String {
+    s.trim_matches('_')
+        .split('_')
+        .filter(|component| !component.is_empty())
+        .map(|component| {
+            let mut camel_cased_component = String::new();
+            let mut new_word = true;
+            let mut prev_is_lower_case = true;
+            let mut prev_is_lowercased_sigma = false;
+            for c in component.chars() {
+                if prev_is_lower_case && (c.is_uppercase() || is_titlecase(c)) {
+                    new_word = true;
+                }
+                if new_word {
+                    camel_cased_component.extend(to_titlecase(c));
+                } else {
+                    camel_cased_component.extend(c.to_lowercase());
+                }
+                prev_is_lower_case = c.is_lowercase() || is_titlecase(c);
+                prev_is_lowercased_sigma = !new_word && c == 'Σ';
+                new_word = false;
+            }
+            if prev_is_lowercased_sigma {
+                camel_cased_component.pop();
+                camel_cased_component.push('ς');
+            }
+            camel_cased_component
+        })
+        .fold((String::new(), None), |(acc, prev): (String, Option<String>), next| {
+            let join = match prev {
+                Some(prev) => {
+                    let l = prev.chars().last().expect("a component is not empty");
+                    let f = next.chars().next().expect("a component is not empty");
+                    !char_has_case(l) && !char_has_case(f)
+                }
+                None => false,
+            };
+            (acc + if join { "_" } else { "" } + &next, Some(next))
+        })
+        .0
+}
+
+fn is_snake_case(ident: &str) -> bool {
+    if ident.is_empty() {
+        return true;
+    }
+    let ident = ident.trim_start_matches('\'');
+    let ident = ident.trim_matches('_');
+    if ident.contains("__") {
+        return false;
+    }
+    ident.chars().all(|c| c.to_lowercase().eq([c]))
+}
+
+fn to_snake_case(mut name: &str) -> String {
+    let mut words = vec![];
+    name = name.trim_start_matches(|c: char| {
+        if c == '_' {
+            words.push(String::new());
+            true
+        } else {
+            false
+        }
+    });
+    for s in name.split('_') {
+        let mut last_upper = false;
+        let mut buf = String::new();
+        if s.is_empty() {
+            continue;
+        }
+        for ch in s.chars() {
+            let upper = ch.is_uppercase() || is_titlecase(ch);
+            if !buf.is_empty() && buf != "'" && upper && !last_upper {
+                words.push(buf.to_lowercase());
+                buf = String::new();
+            }
+            last_upper = upper;
+            buf.push(ch);
+        }
+        words.push(buf.to_lowercase());
+    }
+    words.join("_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_convert_as_rustc_converts_them() {
+        assert_eq!(to_snake_case("fooBar"), "foo_bar");
+        assert_eq!(to_snake_case("FOO_BAR"), "foo_bar");
+        assert_eq!(to_snake_case("__Foo"), "__foo");
+        assert_eq!(to_snake_case("X"), "x");
+        assert_eq!(to_snake_case("ABCd"), "abcd");
+        assert_eq!(to_upper_camel_case("foo_bar"), "FooBar");
+        assert_eq!(to_upper_camel_case("__foo__"), "Foo");
+        assert_eq!(to_upper_camel_case("x86_64"), "X86_64");
+        assert_eq!(to_upper_camel_case("camelCase"), "CamelCase");
+        assert_eq!(to_snake_case("foo_bar").to_uppercase(), "FOO_BAR");
+    }
+
+    #[test]
+    fn names_are_checked_as_rustc_checks_them() {
+        assert!(is_upper_camel_case("X86_64"));
+        assert!(is_upper_camel_case("__Foo__"));
+        assert!(!is_upper_camel_case("foo"));
+        assert!(!is_upper_camel_case("Foo__Bar"));
+        assert!(!is_upper_camel_case("Foo_bar"));
+        assert!(is_snake_case("_foo_"));
+        assert!(!is_snake_case("foo__bar"));
+        assert!(!is_snake_case("fooBar"));
+        assert!(is_snake_case("'a"));
+    }
+
+    #[test]
+    fn a_reserved_conversion_is_suggested_raw_or_not_at_all() {
+        assert!(is_reserved("async", span::Edition::Edition2018));
+        assert!(!is_reserved("async", span::Edition::Edition2015));
+        assert!(can_be_raw("async"));
+        assert!(!can_be_raw("self"));
+    }
+}

@@ -38,6 +38,10 @@ so a recomputed equal value is backdated and a reader whose input returned to th
 is not rerun (docs/v2/plan/lanes/db.md; issues #350, #806, #734). Functions without `lru` are unchanged: they
 keep their values, so `PartialEq` still decides.
 
+> applied: db-expand's sites, by db-expand (`v2/requests/db-expand.md`, the `Hash` section; `Parse` and `mbe::ValueResult` forwarded to format there).
+> forwarded to format: `crates/hir-def/src/expr_store/body.rs:94` and `:144` are format's.
+> forwarded to codegen: the "db-ty" sites are in `crates/hir-ty-mir/` and `crates/hir-ty-codegen/`, which are codegen's (crates.md).
+
 ## Call `evict_values` instead of relying on `trigger_lru_eviction` (blaze-engine, coordinator)
 
 What: after a build, `crates/blaze-engine/src/lib.rs:7466` calls `db.trigger_lru_eviction()`,
@@ -52,9 +56,13 @@ Where: `crates/blaze-engine/src/lib.rs` near line 7466; the functions in `hir-ty
 
 Why: issues #806 and #734 (memory held by values no later build reads).
 
+> forwarded to codegen: `crates/blaze-engine/src/lib.rs` is codegen's, not the coordinator's.
+
 ## Memory
 
 Every memo grows by 8 bytes (`QueryRevisions` is 32 bytes, was 24): one `ThinVec` that is empty,
 with no allocation, unless the memo has a value fingerprint or read an `lru` function. Then it
 holds 16 bytes of header plus 20 bytes per such read and 20 for its own value fingerprint. No other change to the
 build is needed.
+
+> applied: note only.

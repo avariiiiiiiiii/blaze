@@ -88,6 +88,10 @@ fn the_harness_text_is_one_module_with_the_protocol_and_the_server() {
     let past_docs: String = after_open.lines().skip_while(|it| it.starts_with("//!")).collect::<Vec<_>>().join("\n");
     assert!(!past_docs.contains("//!"));
     // No test of blaze's in it, which the tested crate's harness would run as its own.
+    // A child's end wakes the server (a pidfd, or a kqueue): it never waits on a clock.
+    assert!(FORK_SERVER.contains("const PIDFD_OPEN: ::core::ffi::c_long = 434;"));
+    assert!(FORK_SERVER.contains("fn kqueue() -> Int;"));
+    assert!(FORK_SERVER.contains("let timeout = if now { 0 } else { -1 };"));
     assert!(!FORK_SERVER.contains("#[test]"));
     assert!(!FORK_SERVER.contains("#[cfg(test)]"));
     let (open, close) = FORK_SERVER.chars().fold((0, 0), |(open, close), it| match it {

@@ -90,7 +90,15 @@ pub trait HasAttrs: AstNode {
                 // A `SourceFile` contains the inner attributes of itself.
                 ast::SourceFile(_) => syntax.clone(),
                 ast::ExternBlock(it) => it.extern_item_list()?.syntax().clone(),
-                ast::Fn(it) => it.body()?.stmt_list()?.syntax().clone(),
+                ast::Fn(it) => {
+                    let body = it.body()?;
+                    // An outline's lazy body is parsed when a cursor enters it: one that surely
+                    // starts with no inner attribute stays unparsed.
+                    if body.syntax().is_lazy() && !may_start_with_inner_attr(body.syntax()) {
+                        return None;
+                    }
+                    body.stmt_list()?.syntax().clone()
+                },
                 ast::MatchExpr(it) => it.match_arm_list()?.syntax().clone(),
                 ast::Impl(it) => it.assoc_item_list()?.syntax().clone(),
                 ast::Trait(it) => it.assoc_item_list()?.syntax().clone(),
@@ -105,6 +113,63 @@ pub trait HasAttrs: AstNode {
             }
         })
     }
+}
+
+/// Whether a lazy block's text may start with an inner attribute: [`block_may_start_with_inner_attr`].
+fn may_start_with_inner_attr(block: &SyntaxNode) -> bool {
+    match block.flat() {
+        Some((tree, at)) => block_may_start_with_inner_attr(&tree.source()[tree.range(at)]),
+        None => true,
+    }
+}
+
+/// Whether the text of a block, its `{` included, may start with an inner attribute after
+/// whitespace and comments, as the parser's `inner_attrs` takes them: false only when it surely
+/// does not. A non-ASCII character, an unterminated comment or a text that is not a block is a
+/// maybe.
+fn block_may_start_with_inner_attr(block: &str) -> bool {
+    let Some(mut rest) = block.strip_prefix('{') else { return true };
+    loop {
+        rest = rest
+            .trim_start_matches(|c: char| matches!(c, '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' '));
+        if let Some(comment) = rest.strip_prefix("//") {
+            match comment.find('\n') {
+                Some(end) => rest = &comment[end..],
+                None => return true,
+            }
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            match block_comment_len(comment) {
+                Some(end) => rest = &comment[end..],
+                None => return true,
+            }
+        } else {
+            return rest.chars().next().is_none_or(|c| c == '#' || !c.is_ascii());
+        }
+    }
+}
+
+/// How long the rest of a block comment is, after its opening `/*`, to just past the `*/` that
+/// closes it, nested comments included as the lexer counts them.
+fn block_comment_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut at) = (1usize, 0);
+    while at + 1 < bytes.len() {
+        match (bytes[at], bytes[at + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                at += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                at += 2;
+                if depth == 0 {
+                    return Some(at);
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    None
 }
 
 /// Returns all attributes of this node, including inner attributes that may not be directly under this node
@@ -150,3 +215,66 @@ impl<I: Iterator<Item = ast::AnyAttr>> Iterator for AttrsIter<I> {
 }
 
 impl<A: HasName, B: HasName> HasName for Either<A, B> {}
+
+#[cfg(test)]
+mod tests {
+    use super::{HasAttrs, attrs_including_inner, block_may_start_with_inner_attr};
+    use crate::{
+        AstNode, Edition, SourceFile,
+        ast::{self, HasModuleItem},
+    };
+
+    #[test]
+    fn a_block_may_start_with_an_inner_attribute() {
+        for maybe in [
+            "{ #![allow(unused)] }",
+            "{#!}",
+            "{ // a comment\n #![a] }",
+            "{ /* a /* nested */ comment */ #![a] }",
+            "{ //! inner docs\n#![a] }",
+            "{ /// outer docs\n #[a] x }",
+            "{ \u{2028} x }",
+            "{ /* unterminated ",
+            "{ // no newline",
+            "not a block",
+            "{",
+        ] {
+            assert!(block_may_start_with_inner_attr(maybe), "{maybe:?}");
+        }
+    }
+
+    #[test]
+    fn a_block_surely_starts_with_no_inner_attribute() {
+        for not in [
+            "{}",
+            "{ }",
+            "{ let x = 1; #![a] }",
+            "{ // #![a]\n x }",
+            "{ /* #![a] /* #![b] */ #![c] */ x }",
+            "{\r\n\t\u{0B}\u{0C} foo() }",
+        ] {
+            assert!(!block_may_start_with_inner_attr(not), "{not:?}");
+        }
+    }
+
+    #[test]
+    fn inner_attributes_of_a_lazy_body() {
+        let text = "fn f() { let x = 1; }\nfn g() { #![allow(unused)] let y = 2; }\n";
+        let outline = SourceFile::parse_outline(text.into(), Edition::CURRENT);
+        let fns: Vec<ast::Fn> = outline
+            .tree()
+            .items()
+            .filter_map(|it| match it {
+                ast::Item::Fn(it) => Some(it),
+                _ => None,
+            })
+            .collect();
+        let parsed = |it: &ast::Fn| !it.body().unwrap().syntax().is_lazy();
+        assert!(fns.iter().all(|it| it.body_is_lazy() && !parsed(it)));
+
+        assert_eq!(attrs_including_inner(&fns[0]).count(), 0);
+        assert!(fns[0].inner_attributes_node().is_none() && !parsed(&fns[0]));
+        assert_eq!(attrs_including_inner(&fns[1]).count(), 1);
+        assert!(parsed(&fns[1]));
+    }
+}

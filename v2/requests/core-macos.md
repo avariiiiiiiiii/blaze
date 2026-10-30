@@ -26,6 +26,8 @@
 - Why: the brief's rule "the kill must never hit a reaped pid". `footprint.rs` already returns
   without a kill when the read says `ESRCH`, which narrows the window but cannot close it.
 
+> applied: by core (`Finish::exited(self, pid, stdout, stderr)` stops the limit, then reaps; `threads.rs` and `kqueue.rs` changed with it).
+
 ## 2. For your review: `limit_self` and `EINVAL` (no change asked)
 
 `footprint::limit_self` sets `RLIMIT_DATA` and `RLIMIT_AS` (both soft and hard, clamped to the
@@ -60,3 +62,5 @@ spawn runs.
 Applied by core: request 1 (`Finish::exited(self, pid, stdout, stderr)` stops the limit, then
 reaps; `threads.rs` and `kqueue.rs` changed with it, io_uring told). Request 2 kept as written:
 the footprint watch is always on and holds the limit, the rlimit is extra.
+
+> forwarded to core: request 3 is not applied yet; `process.rs` line 135 still sets `pre_exec(limit_self)` on macOS.

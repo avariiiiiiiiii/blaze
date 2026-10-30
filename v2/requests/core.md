@@ -25,6 +25,9 @@ Applied by the coordinator, 16:46.
   `Sandbox::On` spawn with an error naming it, so build scripts and proc macros cannot run
   under `Effect::Spawn` until this exists (sandbox-everything: nothing runs outside by default).
 
+> applied: by usercode (`impl Confine for Launcher` in `crates/blaze-usercode/src/confine.rs`).
+> forwarded to cargo: handing it to the daemon's driver (`Threads::confined`, `Uring::confined`, `Kqueue::confined`) is the daemon's.
+
 ## 3. daemon: count allocations and run work on the scheduler
 
 - What: in the daemon binary, `#[global_allocator] static ALLOC:
@@ -37,11 +40,15 @@ Applied by the coordinator, 16:46.
   counting allocator measures per task and holds the daemon's own arenas against the budget;
   without the allocator every measured peak is 0 and admission admits everything.
 
+> forwarded to cargo: the daemon's `main` still uses `tikv_jemallocator::Jemalloc` (`crates/blaze-engine/src/lib.rs`) and `crates/blaze-cargo/src/` uses no `blaze_graph::exec::Scheduler`; lane cargo's daemon owns it (wrap its allocator in `blaze_graph::arena::Counting`).
+
 ## 4. Applied: link's request 3 and vfs's request 1
 
 `Effect::WriteAt`, `Effect::Rename`, `Effect::Mode` (`Done::Written`, `Done::Renamed`,
 `Done::Moded`) and `Effect::List` (`Done::Listed`) are in `crates/blaze-core/src/lib.rs`, in
 the simulation, `Threads`, `Uring` and `Kqueue`. `Sim::mode(file)` reads a file's mode.
+
+> applied: note only.
 
 ## 5. Note for vfs, store and db: the simulation's truncate is now undone by a crash
 
@@ -50,3 +57,5 @@ truncations); a crash keeps a random prefix of it, the last possibly torn. A tru
 covered by a completed `Sync` can now be lost by a crash, as on a disk (before, the cut always
 survived). A journal that cuts a torn tail and appends after it must not count the cut durable
 until a sync after it completes; tests that relied on the old rule may now fail on some seeds.
+
+> applied: note only, for vfs, store and db.

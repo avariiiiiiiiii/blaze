@@ -1,8 +1,8 @@
-use std::{fmt, iter, marker::PhantomData};
+use std::{fmt, iter, marker::PhantomData, ops::Range};
 
 use crate::{
-    cursor, green::GreenTokenData, Direction, GreenNode, GreenNodeData, GreenToken, NodeOrToken,
-    SyntaxKind, SyntaxText, TextRange, TextSize, TokenAtOffset, WalkEvent,
+    cursor, Direction, FlatTreeBuilder, NodeOrToken, SyntaxKind, SyntaxText, TextRange, TextSize,
+    TokenAtOffset, WalkEvent,
 };
 
 pub trait Language: Sized + Copy + fmt::Debug + Eq + Ord + std::hash::Hash {
@@ -94,16 +94,27 @@ impl<L: Language> From<SyntaxToken<L>> for SyntaxElement<L> {
     }
 }
 
-impl<L: Language> SyntaxNode<L> {
-    pub fn new_root(green: GreenNode) -> SyntaxNode<L> {
-        SyntaxNode::from(cursor::SyntaxNode::new_root(green))
+impl FlatTreeBuilder {
+    /// Gives the builder a copy of `node` and its subtree, the parts of its lazy nodes in it.
+    pub fn node<L: Language>(&mut self, node: &SyntaxNode<L>) {
+        cursor::copy_element(self, &NodeOrToken::Node(node.raw.clone()))
     }
+
+    /// Gives the builder a copy of `element` and its subtree, as [`Self::node`].
+    pub fn element<L: Language>(&mut self, element: &SyntaxElement<L>) {
+        match element {
+            NodeOrToken::Node(it) => self.node(it),
+            NodeOrToken::Token(it) => self.token(it.raw.kind(), it.text()),
+        }
+    }
+}
+
+impl<L: Language> SyntaxNode<L> {
     /// The root of a flat tree.
     pub fn new_flat_root(tree: std::sync::Arc<crate::FlatTree>) -> SyntaxNode<L> {
         SyntaxNode::from(cursor::SyntaxNode::new_flat_root(tree))
     }
-    /// The flat tree this node is in, if it is in one: a lazy node's part for a node inside
-    /// it.
+    /// The flat tree this node is in: a lazy node's part for a node inside it. Always `Some`.
     pub fn flat_tree(&self) -> Option<&std::sync::Arc<crate::FlatTree>> {
         self.raw.flat_tree()
     }
@@ -112,8 +123,8 @@ impl<L: Language> SyntaxNode<L> {
     pub fn is_lazy(&self) -> bool {
         self.raw.is_lazy()
     }
-    /// The flat tree this node is in and the node's number in it, if it is in one: a lazy
-    /// node's part for a node inside it, the file's tree for the lazy node itself.
+    /// The flat tree this node is in and the node's number in it: a lazy node's part for a
+    /// node inside it, the file's tree for the lazy node itself. Always `Some`.
     #[inline]
     pub fn flat(&self) -> Option<(&std::sync::Arc<crate::FlatTree>, u32)> {
         self.raw.flat()
@@ -123,8 +134,7 @@ impl<L: Language> SyntaxNode<L> {
     pub fn flat_element(&self, at: u32) -> SyntaxElement<L> {
         self.raw.flat_element(at).into()
     }
-    /// This node in a flat tree, for a walk that reads the arrays: itself when it is in one,
-    /// else the same node of a flat tree made of the green tree it is in.
+    /// This node, for a walk that reads the arrays: every node is in a flat tree.
     pub fn to_flat(&self) -> SyntaxNode<L> {
         SyntaxNode::from(self.raw.to_flat())
     }
@@ -148,11 +158,12 @@ impl<L: Language> SyntaxNode<L> {
     pub fn children_where(&self, pred: fn(L::Kind) -> bool) -> SyntaxNodeChildrenWhere<L> {
         SyntaxNodeChildrenWhere { raw: self.raw.children_where(), pred }
     }
-    /// Returns a green tree, equal to the green tree this node
-    /// belongs two, except with this node substitute. The complexity
-    /// of operation is proportional to the depth of the tree
-    pub fn replace_with(&self, replacement: GreenNode) -> GreenNode {
-        self.raw.replace_with(replacement)
+    /// The root of a new tree, the one this node is in but with this node's children (and
+    /// tokens) at `range` replaced by copies of `with`. The new tree has its own text, its
+    /// ranges starting at 0, and its lazy nodes parsed into it.
+    pub fn splice_children(&self, range: Range<usize>, with: &[SyntaxElement<L>]) -> SyntaxNode<L> {
+        let with: Vec<cursor::SyntaxElement> = with.iter().cloned().map(Into::into).collect();
+        SyntaxNode::from(self.raw.splice_children(range, &with))
     }
 
     pub fn kind(&self) -> L::Kind {
@@ -169,10 +180,6 @@ impl<L: Language> SyntaxNode<L> {
 
     pub fn text(&self) -> SyntaxText {
         self.raw.text()
-    }
-
-    pub fn green(&self) -> &GreenNodeData {
-        self.raw.green()
     }
 
     /// The text of the node's first child, when that is a token.
@@ -321,13 +328,6 @@ impl<L: Language> SyntaxNode<L> {
 }
 
 impl<L: Language> SyntaxToken<L> {
-    /// Returns a green tree, equal to the green tree this token
-    /// belongs two, except with this token substitute. The complexity
-    /// of operation is proportional to the depth of the tree
-    pub fn replace_with(&self, new_token: GreenToken) -> GreenNode {
-        self.raw.replace_with(new_token)
-    }
-
     pub fn kind(&self) -> L::Kind {
         L::kind_from_raw(self.raw.kind())
     }
@@ -342,10 +342,6 @@ impl<L: Language> SyntaxToken<L> {
 
     pub fn text(&self) -> &str {
         self.raw.text()
-    }
-
-    pub fn green(&self) -> &GreenTokenData {
-        self.raw.green()
     }
 
     pub fn parent(&self) -> Option<SyntaxNode<L>> {

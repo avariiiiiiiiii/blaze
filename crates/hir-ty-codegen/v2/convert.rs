@@ -35,6 +35,8 @@ pub(crate) struct Resolve<'a> {
     pub(crate) data: &'a dyn Fn(u32, &DataRequest) -> Result<DataTarget, String>,
     /// A symbol the backend calls on its own: a libcall, the personality routine.
     pub(crate) symbol: &'a dyn Fn(&str) -> Result<Target, String>,
+    /// The folded body a fold's thunk calls ([`super::fold::BODY`]).
+    pub(crate) body: &'a dyn Fn() -> Result<Target, String>,
 }
 
 /// The function `code` is, `requests` being what its relocations name and `spans` what its
@@ -51,7 +53,11 @@ pub(crate) fn function(
 ) -> Result<CompiledFunction, String> {
     let word = word(arch)?;
     let mut own = OwnData { data: Vec::new(), word };
-    let datas = own.requests(requests, resolve)?;
+    let named = code.relocs.iter().filter_map(|reloc| match reloc.name {
+        ModuleRelocTarget::User { namespace: 1, index } => Some(index as usize),
+        _ => None,
+    });
+    let datas = own.requests(requests, resolve, named)?;
     let mut relocs = Vec::with_capacity(code.relocs.len());
     for reloc in &code.relocs {
         let elf = code.elf_types.iter().find(|it| it.0 == reloc.offset).map(|it| it.1);
@@ -99,6 +105,21 @@ pub(crate) fn function(
     })
 }
 
+/// A static's value: its own data, the target of each of its requests, and its blob's
+/// relocations at those.
+pub(crate) fn value(
+    arch: Arch,
+    blob: &ConstBlob,
+    requests: &Requests,
+    resolve: &Resolve<'_>,
+) -> Result<(Vec<Data>, Vec<Reloc>), String> {
+    let mut own = OwnData { data: Vec::new(), word: word(arch)? };
+    let named = blob.relocs.iter().map(|&(_, data, _)| data.as_u32() as usize);
+    let targets = own.requests(requests, resolve, named)?;
+    let relocs = own.relocs(blob, requests.datas.len(), &targets, requests, resolve)?;
+    Ok((own.data, relocs))
+}
+
 fn word(arch: Arch) -> Result<usize, String> {
     match arch {
         Arch::X86_64 | Arch::Aarch64 => Ok(8),
@@ -121,10 +142,42 @@ impl OwnData {
         target
     }
 
-    /// The target of each data request, making the function's own as they come.
-    fn requests(&mut self, requests: &Requests, resolve: &Resolve<'_>) -> Result<Vec<Target>, String> {
-        let mut targets: Vec<Target> = Vec::with_capacity(requests.datas.len());
+    /// The target of each data request that `named` (the requests the code or value names)
+    /// reaches, making the function's own as they come: what nothing reaches is none of it.
+    fn requests(
+        &mut self,
+        requests: &Requests,
+        resolve: &Resolve<'_>,
+        named: impl Iterator<Item = usize>,
+    ) -> Result<Vec<Option<Target>>, String> {
+        let mut used = vec![false; requests.datas.len()];
+        for index in named {
+            *used
+                .get_mut(index)
+                .ok_or_else(|| format!("a relocation at data {index}, never requested"))? = true;
+        }
+        for index in (0..requests.datas.len()).rev() {
+            if !used[index] {
+                continue;
+            }
+            if let DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } =
+                &requests.datas[index]
+            {
+                for &(_, data, _) in &blob.relocs {
+                    let at = data.as_u32() as usize;
+                    if at >= index {
+                        return Err(format!("data {index} points at data {at}, not one before it"));
+                    }
+                    used[at] = true;
+                }
+            }
+        }
+        let mut targets: Vec<Option<Target>> = Vec::with_capacity(requests.datas.len());
         for (index, request) in requests.datas.iter().enumerate() {
+            if !used[index] {
+                targets.push(None);
+                continue;
+            }
             let target = match (resolve.data)(index as u32, request)? {
                 DataTarget::Target(target) => target,
                 DataTarget::Own => {
@@ -135,7 +188,7 @@ impl OwnData {
                 DataTarget::Text(text) => self.text(text),
                 DataTarget::Nowhere => self.nowhere(),
             };
-            targets.push(target);
+            targets.push(Some(target));
         }
         Ok(targets)
     }
@@ -144,31 +197,45 @@ impl OwnData {
         &mut self,
         blob: &ConstBlob,
         index: usize,
-        before: &[Target],
+        before: &[Option<Target>],
         requests: &Requests,
         resolve: &Resolve<'_>,
     ) -> Result<Data, String> {
+        let relocs = self.relocs(blob, index, before, requests, resolve)?;
+        let align = u32::try_from(blob.align).map_err(|e| e.to_string())?;
+        Ok(Data::new(align, blob.bytes.clone(), relocs))
+    }
+
+    /// The relocations of `blob`, the data request `index` (or what comes after them all),
+    /// which points only at requests before it.
+    fn relocs(
+        &self,
+        blob: &ConstBlob,
+        index: usize,
+        before: &[Option<Target>],
+        requests: &Requests,
+        resolve: &Resolve<'_>,
+    ) -> Result<Vec<Reloc>, String> {
         if !blob.type_ids.is_empty() {
             return Err("a constant with a `TypeId` the adapter did not fill".to_owned());
         }
         let mut relocs = Vec::with_capacity(blob.relocs.len() + blob.fn_relocs.len());
         for &(at, data, addend) in &blob.relocs {
-            let Some(target) = before.get(data.as_u32() as usize) else {
-                return Err(format!("data {index} points at data {}, not one before it", data.as_u32()));
+            let at_data = data.as_u32() as usize;
+            let Some(Some(target)) = before.get(at_data).filter(|_| at_data < index) else {
+                return Err(format!("data {index} points at data {at_data}, not one before it"));
             };
             relocs.push(Reloc { at, kind: RelocKind::Abs64, target: target.clone(), addend });
         }
         for &(at, func) in &blob.fn_relocs {
-            let request = requests
-                .funcs
-                .get(func.as_u32() as usize)
-                .ok_or_else(|| format!("data {index} points at function {}, never requested", func.as_u32()))?;
+            let request = requests.funcs.get(func.as_u32() as usize).ok_or_else(|| {
+                format!("data {index} points at function {}, never requested", func.as_u32())
+            })?;
             let target = (resolve.func)(func.as_u32(), request)?;
             relocs.push(Reloc { at, kind: RelocKind::Abs64, target, addend: 0 });
         }
         relocs.sort_by_key(|it| it.at);
-        let align = u32::try_from(blob.align).map_err(|e| e.to_string())?;
-        Ok(Data::new(align, blob.bytes.clone(), relocs))
+        Ok(relocs)
     }
 
     /// The bytes of `text`, and the `&str` of them.
@@ -210,7 +277,7 @@ fn own_blob(request: &DataRequest) -> Result<&ConstBlob, String> {
 fn reloc_target(
     reloc: &ModuleReloc,
     requests: &Requests,
-    datas: &[Target],
+    datas: &[Option<Target>],
     resolve: &Resolve<'_>,
 ) -> Result<Target, String> {
     match &reloc.name {
@@ -224,7 +291,9 @@ fn reloc_target(
         &ModuleRelocTarget::User { namespace: 1, index } => datas
             .get(index as usize)
             .cloned()
+            .flatten()
             .ok_or_else(|| format!("a relocation at data {index}, never requested")),
+        ModuleRelocTarget::User { namespace: super::fold::BODY, index: 0 } => (resolve.body)(),
         &ModuleRelocTarget::User { namespace: fragment::INLINED, .. } => {
             Err("a relocation at a reference of a body built in".to_owned())
         }

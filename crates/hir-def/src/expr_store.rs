@@ -260,10 +260,6 @@ pub struct ExpressionStoreSourceMap {
     types_map: FxHashMap<TypeSource, TypeRefId>,
 
     lifetime_map_back: ArenaMap<LifetimeRefId, LifetimeSource>,
-    #[expect(
-        unused,
-        reason = "this is here for completeness, and maybe we'll need it in the future"
-    )]
     lifetime_map: FxHashMap<LifetimeSource, LifetimeRefId>,
 }
 

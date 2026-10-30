@@ -181,13 +181,25 @@ mod tests {
     }
 
     /// On a plane with one core, a unit's store write starts while the next unit compiles; a
-    /// second request of the same build compiles nothing it already compiled.
+    /// second request of the same build compiles nothing the database has.
     #[test]
     fn store_writes_overlap_compiles_and_a_second_request_reuses_them() {
-        let mut plane =
-            Plane::new(PlaneConfig { io: 1, work: 1, budget: None, starve_after: 4 }).unwrap();
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
+        let db: Arc<Mutex<HashMap<Key, crate::machine::Outcome>>> = Arc::default();
+        let memo = {
+            let db = db.clone();
+            move |key: Key| db.lock().unwrap().get(&key).cloned()
+        };
+        let config = PlaneConfig { io: 1, work: 1, budget: None, starve_after: 4 };
+        let mut plane = Plane::with_memo(config, Box::new(memo)).unwrap();
         let mut at = 0;
         let mut run = |plane: &mut Plane, request: RequestId, specs: Vec<Spec>| {
+            let keys: HashMap<NodeId, Key> =
+                specs.iter().filter_map(|it| Some((it.id, it.key?))).collect();
             let mut ran = Vec::new();
             let mut running: Vec<NodeId> = Vec::new();
             // Each set of nodes that ran at once.
@@ -211,6 +223,10 @@ mod tests {
                 at += 1;
                 let id = running.remove(0);
                 ran.push(id);
+                // The value is in the database before its Done, as a task's must be.
+                if let Some(key) = keys.get(&id) {
+                    db.lock().unwrap().insert(*key, crate::machine::Outcome::Built);
+                }
                 outputs = plane
                     .step(PlaneInput::Done {
                         at_ns: at,

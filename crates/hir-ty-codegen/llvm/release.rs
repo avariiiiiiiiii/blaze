@@ -11,6 +11,7 @@
 use blaze_codegen::summary::{Arg, Attrs};
 use cranelift_codegen::ir;
 use inkwell::{
+    GlobalVisibility,
     attributes::AttributeLoc,
     context::Context,
     llvm_sys::{core, prelude::LLVMValueRef},
@@ -29,8 +30,9 @@ use super::{
     mark_hint, rebase, retold_bytes, told_constants, wrap,
 };
 use crate::{
+    DataIdentity,
     backend::{Optimization, Passes, Phase, Tally},
-    fragment::{Code, Hint, Wants},
+    fragment::{Code, DataRequest, Hint, Wants},
     imports::Import,
 };
 
@@ -175,6 +177,7 @@ pub(crate) fn prelink(
             )?;
             Ok::<_, Unhandled>(function)
         })?;
+        told_functions(context, &module, wants, pointer)?;
         if let Some(lines) = &lines {
             lines.finish();
         }
@@ -216,9 +219,118 @@ fn attrs_of(function: FunctionValue<'_>) -> Attrs {
     }
 }
 
+/// Tells LLVM what each read-only object of `wants` that holds a function's address holds,
+/// vtables above all, as [`told_constants`] does for the others and rustc does for every
+/// constant: a call through a vtable LLVM knows is a direct call, which a summary counts and an
+/// importer can build in. Only objects `module` refers to are told, once every function of it
+/// is declared: a function only an object names is declared with its request's signature,
+/// and each call keeps the attributes of its own signature, so a call made direct passes
+/// arguments as it did. The object stays `available_externally`: no copy is emitted, and it
+/// keeps its one address.
+fn told_functions<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    wants: &Wants,
+    pointer: usize,
+) -> Result<(), Unhandled> {
+    for (index, data) in wants.requests.datas.iter().enumerate() {
+        let blob = match data {
+            DataRequest::Vtable { blob, .. } => blob,
+            DataRequest::Blob { blob, identity } if *identity != DataIdentity::Writable => blob,
+            _ => continue,
+        };
+        if blob.fn_relocs.is_empty() || !blob.type_ids.is_empty() || blob.bytes.is_empty() {
+            continue;
+        }
+        let name = Symbol::Data(index as u32).to_string();
+        let Some(old) = module.get_global(&name) else { continue };
+        if old.get_initializer().is_some() {
+            continue;
+        }
+        let mut addresses: Vec<(usize, Symbol, i64)> = blob
+            .relocs
+            .iter()
+            .map(|&(offset, target, addend)| (offset as usize, Symbol::Data(target.as_u32()), addend))
+            .chain(blob.fn_relocs.iter().map(|&(offset, target)| (offset as usize, Symbol::Func(target.as_u32()), 0)))
+            .collect();
+        addresses.sort_unstable_by_key(|it| it.0);
+        let fits = addresses.windows(2).all(|it| it[0].0 + pointer <= it[1].0)
+            && addresses.last().is_none_or(|it| it.0 + pointer <= blob.bytes.len());
+        if !fits {
+            return Err(Unhandled::Shape("an object whose addresses overlap"));
+        }
+        let mut fields: Vec<BasicValueEnum<'ctx>> = Vec::new();
+        let mut at = 0;
+        for &(offset, target, addend) in &addresses {
+            if offset > at {
+                fields.push(context.const_string(&blob.bytes[at..offset], false).into());
+            }
+            let address = match target {
+                Symbol::Data(target) => {
+                    let name = Symbol::Data(target).to_string();
+                    let global = module.get_global(&name).unwrap_or_else(|| {
+                        let declared = module.add_global(context.i8_type(), None, &name);
+                        declared.set_linkage(Linkage::External);
+                        declared.set_visibility(GlobalVisibility::Hidden);
+                        declared
+                    });
+                    global.as_pointer_value()
+                }
+                Symbol::Func(target) => {
+                    let name = Symbol::Func(target).to_string();
+                    let function = match module.get_function(&name) {
+                        Some(known) => known,
+                        None => {
+                            let request = wants
+                                .requests
+                                .funcs
+                                .get(target as usize)
+                                .ok_or(Unhandled::Shape("an object naming a function nobody asked for"))?;
+                            let ty = Lowering::function_type(context, &request.sig)?;
+                            module.add_function(&name, ty, Some(Linkage::External))
+                        }
+                    };
+                    function.as_global_value().as_pointer_value()
+                }
+            };
+            let address = match addend {
+                0 => address,
+                // SAFETY: a constant expression of an address `addend` bytes into the object.
+                _ => unsafe { address.const_gep(context.i8_type(), &[context.i64_type().const_int(addend as u64, true)]) },
+            };
+            fields.push(address.into());
+            at = offset + pointer;
+        }
+        if at < blob.bytes.len() {
+            fields.push(context.const_string(&blob.bytes[at..], false).into());
+        }
+        let value = context.const_struct(&fields, true);
+        let told = module.add_global(value.get_type(), None, "");
+        told.set_initializer(&value);
+        told.set_linkage(Linkage::AvailableExternally);
+        told.set_visibility(GlobalVisibility::Hidden);
+        told.set_constant(true);
+        told.set_alignment(blob.align as u32);
+        old.as_pointer_value().replace_all_uses_with(told.as_pointer_value());
+        // SAFETY: nothing refers to the declaration any more.
+        unsafe { old.delete() };
+        told.set_name(&name);
+    }
+    Ok(())
+}
+
 /// `memory(read)` as the linked LLVM encodes it, which depends on how many kinds of location
-/// it has.
+/// it has: the same for every context of the process.
 fn read_only(context: &Context) -> Result<u64, Unhandled> {
+    static READ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    if let Some(&read) = READ.get() {
+        return Ok(read);
+    }
+    let read = parse_read_only(context)?;
+    Ok(*READ.get_or_init(|| read))
+}
+
+fn parse_read_only(context: &Context) -> Result<u64, Unhandled> {
     let text = "declare void @read() memory(read)\n\0";
     let source = MemoryBuffer::create_from_memory_range_copy(text.as_bytes(), "memory");
     let parsed = context.create_module_from_ir(source).map_err(llvm)?;
@@ -446,6 +558,7 @@ pub(crate) fn compile(
             }
             Ok::<_, Unhandled>(())
         })?;
+        told_functions(context, &module, wants, pointer)?;
         let function = module.get_function(OWN).ok_or(Unhandled::Shape("a module without its function"))?;
         apply(context, &module, function, given, pointer as u32 * 8)?;
         if wrapped {
@@ -604,6 +717,47 @@ declare i32 @"blaze.f.2"(i32)
 declare i32 @"blaze.f.3"(i32)
 declare i32 @"blaze.f.4"(ptr)
 "#;
+
+    /// A call through the second word of the object of request 0, whose word is the address
+    /// of function request 0, which nothing else names.
+    #[test]
+    fn a_call_through_a_told_vtable_is_direct() {
+        use cranelift_codegen::ir::{AbiParam, Signature, types};
+
+        let context = Context::create();
+        let module = parsed(
+            &context,
+            r#"
+@"blaze.d.0" = external hidden global i8
+
+define i32 @"blaze.own"() {
+  %slot = getelementptr i8, ptr @"blaze.d.0", i64 8
+  %method = load ptr, ptr %slot
+  %r = call i32 %method()
+  ret i32 %r
+}
+"#,
+        );
+        let mut wants = Wants::new(&**crate::target().unwrap());
+        let mut signature = Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+        signature.returns.push(AbiParam::new(types::I32));
+        let method = wants.func(crate::fragment::FuncTarget::Symbol("method".to_owned()), &signature);
+        let vtable = crate::ConstBlob {
+            bytes: vec![0; 16],
+            fn_relocs: vec![(8, method)],
+            align: 8,
+            ..crate::ConstBlob::default()
+        };
+        wants.define_data_as(vtable, DataIdentity::Shared);
+        told_functions(&context, &module, &wants, 8).unwrap();
+        module.verify().unwrap();
+        run(&module, "function(instcombine)", &machine(), false).unwrap();
+        let text = module.print_to_string().to_string();
+        assert!(text.contains(r#"call i32 @"blaze.f.0"()"#), "{text}");
+        let told = module.get_global("blaze.d.0").unwrap();
+        assert_eq!(told.get_linkage(), Linkage::AvailableExternally);
+        assert!(told.is_constant());
+    }
 
     #[test]
     fn the_facts_of_a_function_alone() {

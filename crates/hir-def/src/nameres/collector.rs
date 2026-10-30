@@ -3,11 +3,7 @@
 //! `DefCollector::collect` contains the fixed-point iteration loop which
 //! resolves imports and expands macros.
 
-use std::{
-    iter, mem,
-    ops::Range,
-    sync::atomic::{self, AtomicUsize},
-};
+use std::{iter, mem, ops::Range};
 
 use base_db::{BuiltDependency, Crate, CrateOrigin, LangCrateOrigin, SourceDatabase};
 use cfg::{CfgAtom, CfgExpr, CfgOptions};
@@ -126,80 +122,15 @@ pub(super) fn collect_defs(
     (def_map, local_def_map)
 }
 
-#[cfg(test)]
-thread_local! {
-    /// The threads a def map collected on this thread expands each round with; `None` for
-    /// every core.
-    pub(crate) static EXPANSION_THREADS: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// A worker's stack: an expansion that ran on the collecting thread's stack before must not
-/// overflow on a worker's, and the deepest thread blaze runs the front end on has this much.
-const EXPANSION_STACK: usize = 64 << 20;
-
-fn expansion_threads() -> usize {
-    #[cfg(test)]
-    if let Some(threads) = EXPANSION_THREADS.get() {
-        return threads;
+/// Computes the item tree of each of `calls`' expansions as one batch of the database's tasks
+/// ([`SourceDatabase::run_all`]). The results are left in the database, where the collection
+/// reads them in the round's order.
+fn expand_all(db: &dyn SourceDatabase, krate: Crate, calls: &[MacroCallId]) {
+    if calls.len() > 1 {
+        db.run_all(calls.len(), &|db, at| {
+            file_item_tree(db, calls[at].into(), krate);
+        });
     }
-    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
-}
-
-/// Computes the item tree of each of `calls`' expansions, on up to `threads` threads: the
-/// calling one, and the rest each reading through a fork of `db`. The results are left in the
-/// database, where the collection reads them.
-///
-/// The workers are threads of their own, not a rayon pool's: salsa claims a running query for
-/// the thread running it, and a pool worker that steals another crate's task while its own
-/// stack is inside a def map would see that def map as claimed by itself, a cycle. Here the
-/// calling thread runs only its share of the calls and then blocks, and a call another thread
-/// needs while this def map is being collected would be a cycle collected serially too.
-fn expand_in_parallel(
-    db: &dyn SourceDatabase,
-    krate: Crate,
-    calls: &[MacroCallId],
-    threads: usize,
-) {
-    let threads = threads.min(calls.len());
-    if threads <= 1 {
-        return;
-    }
-    let next = AtomicUsize::new(0);
-    let work = |db: &dyn SourceDatabase| {
-        while let Some(&call) = calls.get(next.fetch_add(1, atomic::Ordering::Relaxed)) {
-            file_item_tree(db, call.into(), krate);
-        }
-    };
-    std::thread::scope(|scope| {
-        let mut workers = Vec::with_capacity(threads - 1);
-        // A round of small expansions may be done by the first workers before the rest would
-        // have started: no thread is spawned once every call is taken.
-        while workers.len() + 1 < threads && next.load(atomic::Ordering::Relaxed) < calls.len() {
-            let fork = db.fork();
-            let work = &work;
-            let worker = std::thread::Builder::new()
-                .name("expand".to_owned())
-                .stack_size(EXPANSION_STACK)
-                .spawn_scoped(scope, move || work(&*fork))
-                .unwrap_or_else(|error| {
-                    panic!("spawning a thread to expand the macros of {krate:?}: {error}")
-                });
-            workers.push(worker);
-        }
-        let here = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(db)));
-        // Each worker is joined before a panic goes on, so a cancellation reaches the caller
-        // as salsa's own payload rather than as a scoped thread's.
-        let mut panicked = here.err();
-        for worker in workers {
-            if let Err(panic) = worker.join() {
-                panicked.get_or_insert(panic);
-            }
-        }
-        if let Some(panic) = panicked {
-            std::panic::resume_unwind(panic);
-        }
-    });
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -417,6 +348,7 @@ impl<'db> DefCollector<'db> {
         }
         crate_data.proc_macro = self.is_proc_macro;
 
+        let mut prelude = Vec::new();
         for (name, dep) in &self.deps {
             // Add all
             if dep.is_prelude() {
@@ -441,19 +373,23 @@ impl<'db> DefCollector<'db> {
                         }
                         _ => false,
                     };
-                if skip {
-                    continue;
+                if !skip {
+                    prelude.push((name.clone(), dep.crate_id));
                 }
-
-                // This eagerly draws a dependency edge between the crate def maps even if the
-                // things the crates are not used. This is not great, but at the same time we would
-                // like to compute our dependency def maps in parallel here anyways in the future
-                // which will have the same effect.
-                self.local_def_map.extern_prelude.insert(
-                    name.clone(),
-                    (crate_def_map(self.db, dep.crate_id).root_module_id(), None),
-                );
             }
+        }
+        // This eagerly draws a dependency edge between the crate def maps even if the things
+        // the crates are not used. The def maps are collected as one batch of the database's
+        // tasks, then put in the extern prelude in the order of the dependencies.
+        if prelude.len() > 1 {
+            self.db.run_all(prelude.len(), &|db, at| {
+                crate_def_map(db, prelude[at].1);
+            });
+        }
+        for (name, krate) in prelude {
+            self.local_def_map
+                .extern_prelude
+                .insert(name, (crate_def_map(self.db, krate).root_module_id(), None));
         }
 
         self.inject_prelude();
@@ -1919,10 +1855,10 @@ impl<'db> DefCollector<'db> {
         res
     }
 
-    /// Expands the macros a round resolved, on every core, before `collect_macro_expansion`
-    /// collects them one at a time in the round's order. An expansion is a query of its call
-    /// alone, so which thread runs it changes no result, and collecting in the round's order
-    /// keeps the def map the same whatever the core count or the scheduling.
+    /// Expands the macros a round resolved as one batch of plane tasks, before
+    /// `collect_macro_expansion` collects them one at a time in the round's order. An expansion
+    /// is a query of its call alone, so which task runs it when changes no result, and
+    /// collecting in the round's order keeps the def map the same whatever the scheduling.
     ///
     /// A proc macro that keeps a session sees its calls in the order rustc makes them, so its
     /// calls are left to the collection, in order.
@@ -1941,7 +1877,7 @@ impl<'db> DefCollector<'db> {
             .map(|(_, call)| call)
             .filter(|&call| !in_session(call))
             .collect();
-        expand_in_parallel(db, self.def_map.krate, &calls, expansion_threads());
+        expand_all(db, self.def_map.krate, &calls);
     }
 
     fn collect_macro_expansion(

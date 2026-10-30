@@ -8,7 +8,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
-    plane::{Budget, Key, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId},
+    plane::{Budget, Key, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats},
     trace::{Trace, render},
 };
 
@@ -308,6 +308,66 @@ fn a_key_the_database_has_runs_nothing() {
     db.lock().unwrap().remove(&key(7));
     open(&mut plane, 4, 1, false);
     assert_eq!(runs(&add(&mut plane, 4, vec![keyed(6, &[], 1, 7)])), [6]);
+}
+
+/// Each request counts what it ran, what the database settled and what it joined, and its
+/// longest chain of measured run times, a cached or joined node's own time being 0.
+#[test]
+fn a_request_says_what_it_ran_and_its_measured_critical_path() {
+    let (mut plane, db) = with_db(config(1, 2));
+    let at = |plane: &mut Plane, input: PlaneInput| plane.step(input).unwrap();
+    let add_at = |plane: &mut Plane, at_ns: u64, request: u32, nodes: Vec<Spec>| {
+        plane.step(PlaneInput::Add { at_ns, request: RequestId(request), nodes }).unwrap()
+    };
+    let done_at = |id: u32, at_ns: u64| PlaneInput::Done {
+        at_ns,
+        id: NodeId(id),
+        outcome: Outcome::Built,
+        added: Vec::new(),
+        group: None,
+        peak: 0,
+    };
+    // 1 then 2, and 3 beside them: 1 runs 0..10, 2 runs 10..15, 3 runs 0..12.
+    open(&mut plane, 1, 1, false);
+    let out = add(&mut plane, 1, vec![work(1, &[], 1), work(2, &[1], 1), work(3, &[], 1)]);
+    assert_eq!(runs(&out), [1, 3]);
+    close(&mut plane, 1);
+    assert_eq!(runs(&at(&mut plane, done_at(1, 10))), [2]);
+    at(&mut plane, done_at(3, 12));
+    assert_eq!(finished(&at(&mut plane, done_at(2, 15))), [(1, true)]);
+    let stats = plane.stats(RequestId(1)).unwrap();
+    assert_eq!(stats, RequestStats { ran: 3, cached: 0, joined: 0, critical_path_ns: 15 });
+
+    // Request 3's node of key 7 joins request 2's, which runs 20..30; each then runs one
+    // more: request 2's 30..38, request 3's 30..33.
+    open(&mut plane, 2, 1, false);
+    open(&mut plane, 3, 1, false);
+    assert_eq!(runs(&add_at(&mut plane, 20, 2, vec![keyed(4, &[], 1, 7), work(5, &[4], 1)])), [4]);
+    let out = add_at(&mut plane, 20, 3, vec![keyed(6, &[], 1, 7), work(7, &[6], 1)]);
+    assert!(runs(&out).is_empty());
+    close(&mut plane, 2);
+    close(&mut plane, 3);
+    db.lock().unwrap().insert(key(7), Outcome::Built);
+    // Request 3 has started nothing yet, so its turn comes first.
+    assert_eq!(runs(&at(&mut plane, done_at(4, 30))), [7, 5]);
+    assert_eq!(finished(&at(&mut plane, done_at(7, 33))), [(3, true)]);
+    assert_eq!(finished(&at(&mut plane, done_at(5, 38))), [(2, true)]);
+    let two = plane.stats(RequestId(2)).unwrap();
+    assert_eq!(two, RequestStats { ran: 2, cached: 0, joined: 0, critical_path_ns: 18 });
+    let three = plane.stats(RequestId(3)).unwrap();
+    assert_eq!(three, RequestStats { ran: 1, cached: 0, joined: 1, critical_path_ns: 3 });
+
+    // Now the database has key 7: request 4's node of it is cached, and only 9 runs, 40..47.
+    open(&mut plane, 4, 1, false);
+    assert_eq!(runs(&add_at(&mut plane, 40, 4, vec![keyed(8, &[], 1, 7), work(9, &[8], 1)])), [9]);
+    close(&mut plane, 4);
+    assert_eq!(finished(&at(&mut plane, done_at(9, 47))), [(4, true)]);
+    let four = plane.stats(RequestId(4)).unwrap();
+    assert_eq!(four, RequestStats { ran: 1, cached: 1, joined: 0, critical_path_ns: 7 });
+
+    assert_eq!(plane.stats(RequestId(99)), None);
+    plane.release(RequestId(4)).unwrap();
+    assert_eq!(plane.stats(RequestId(4)), None);
 }
 
 /// The plane keeps no results of its own: without a database a key done before runs again.
@@ -613,6 +673,8 @@ struct Model {
     db: Db,
     finished: FxHashMap<u32, bool>,
     cancelled: FxHashSet<u32>,
+    /// How many `Run`s each request was said.
+    ran: FxHashMap<u32, u64>,
     outputs: Vec<PlaneOutput>,
 }
 
@@ -749,6 +811,7 @@ impl Model {
                         }
                     }
                     self.running.push(id.0);
+                    *self.ran.entry(self.request_of[&id.0]).or_default() += 1;
                 }
                 PlaneOutput::Finished { request, ok } => {
                     let r = request.0;
@@ -759,6 +822,13 @@ impl Model {
                         .iter()
                         .any(|it| matches!(self.states[it], NodeState::Failed { .. }));
                     assert_eq!(*ok, !failed && !self.cancelled.contains(&r), "seed {seed}");
+                    // Released, it is gone once finished; kept, it says what it ran.
+                    if let Some(stats) = plane.stats(*request) {
+                        let ran = self.ran.get(&r).copied().unwrap_or(0);
+                        assert_eq!(stats.ran, ran, "seed {seed}: request {r}");
+                        let settled = stats.ran + stats.cached + stats.joined;
+                        assert!(settled <= nodes.len() as u64, "seed {seed}: {stats:?}");
+                    }
                 }
             }
         }

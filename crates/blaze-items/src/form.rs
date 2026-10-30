@@ -14,7 +14,7 @@
 use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use base_db::Crate;
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::ContentId;
 use hir_def::{
     AdtId, AssocItemId, AttrDefId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId,
     FunctionId, GenericDefId, GenericParamId, HasModule, ItemContainerId, LocalFieldId, Lookup,
@@ -92,9 +92,11 @@ pub(crate) struct Sub {
     pub(crate) spans: ContentId,
 }
 
+/// The preimages of a form's digest and spans, hashed when it is finished: whole, or many
+/// small ones in one batched call ([`Form::finish_many`]).
 struct Form {
-    digest: Hasher,
-    spans: Hasher,
+    digest: Vec<u8>,
+    spans: Vec<u8>,
     refs: Vec<ItemId>,
     slots: FxHashMap<ItemId, u32>,
     missed: Option<&'static str>,
@@ -103,8 +105,8 @@ struct Form {
 impl Form {
     fn new(tag: &str) -> Form {
         let mut form = Form {
-            digest: Hasher::new(DOMAIN),
-            spans: Hasher::new(SPANS_DOMAIN),
+            digest: Vec::new(),
+            spans: Vec::new(),
             refs: Vec::new(),
             slots: FxHashMap::default(),
             missed: None,
@@ -114,7 +116,7 @@ impl Form {
     }
 
     fn update(&mut self, bytes: &[u8]) {
-        self.digest.update(bytes);
+        self.digest.extend_from_slice(bytes);
     }
 
     fn u8(&mut self, value: u8) {
@@ -141,8 +143,10 @@ impl Form {
         self.u8(value as u8);
     }
 
+    /// Length-prefixed, so `("ab", "c")` and `("a", "bc")` hash apart.
     fn bytes(&mut self, bytes: &[u8]) {
-        self.digest.part(bytes);
+        self.u64(bytes.len() as u64);
+        self.update(bytes);
     }
 
     fn str(&mut self, text: &str) {
@@ -190,12 +194,13 @@ impl Form {
             MirSpan::SelfParam => (4, 0),
             MirSpan::Unknown => (5, 0),
         };
-        self.spans.update(&[tag]).update(&at.to_le_bytes());
+        self.spans.push(tag);
+        self.spans.extend_from_slice(&at.to_le_bytes());
     }
 
     fn sub(&mut self, sub: &Sub) {
-        self.digest.id(&sub.digest);
-        self.spans.id(&sub.spans);
+        self.update(&sub.digest.0);
+        self.spans.extend_from_slice(&sub.spans.0);
         for &id in &sub.refs {
             self.item(id);
         }
@@ -206,11 +211,30 @@ impl Form {
 
     fn finish(self) -> Sub {
         Sub {
-            digest: self.digest.finish(),
+            digest: ContentId::of(DOMAIN, &self.digest),
             refs: self.refs,
             missed: self.missed,
-            spans: self.spans.finish(),
+            spans: ContentId::of(SPANS_DOMAIN, &self.spans),
         }
+    }
+
+    /// Each form finished as [`Form::finish`] would, the digests and spans hashed in one
+    /// batched call each.
+    fn finish_many(forms: Vec<Form>) -> Vec<Sub> {
+        let digests: Vec<&[u8]> = forms.iter().map(|it| it.digest.as_slice()).collect();
+        let digests = ContentId::of_many(DOMAIN, &digests);
+        let spans: Vec<&[u8]> = forms.iter().map(|it| it.spans.as_slice()).collect();
+        let spans = ContentId::of_many(SPANS_DOMAIN, &spans);
+        forms
+            .into_iter()
+            .zip(digests.into_iter().zip(spans))
+            .map(|(form, (digest, spans))| Sub {
+                digest,
+                refs: form.refs,
+                missed: form.missed,
+                spans,
+            })
+            .collect()
     }
 }
 
@@ -321,7 +345,9 @@ impl<'db> Cx<'db> {
                 DefWithBodyId::from(it)
             }
             ItemId::Const(it) if ConstSignature::of(db, it).has_body() => it.into(),
-            ItemId::Static(it) if StaticSignature::of(db, it).flags.contains(StaticFlags::HAS_BODY) => {
+            ItemId::Static(it)
+                if StaticSignature::of(db, it).flags.contains(StaticFlags::HAS_BODY) =>
+            {
                 it.into()
             }
             ItemId::Function(_)
@@ -704,7 +730,9 @@ impl<'db> Cx<'db> {
         let db = self.db;
         let idx = ImplTraitIdx::from_raw(index.into());
         match owner {
-            ItemId::Function(it) => rpit_hidden_types(db, it).get(idx).map(|it| it.get().skip_binder()),
+            ItemId::Function(it) => {
+                rpit_hidden_types(db, it).get(idx).map(|it| it.get().skip_binder())
+            }
             ItemId::Alias(it) => {
                 let opaque = InternedOpaqueTyId::new(db, ImplTraitId::TypeAliasImplTrait(it, idx));
                 let interner = DbInterner::new_no_crate(db);
@@ -984,7 +1012,7 @@ impl<'db> Cx<'db> {
             }
             TyKind::Dynamic(predicates, region) => {
                 f.u8(16);
-                let mut subs = Vec::new();
+                let mut forms = Vec::new();
                 for predicate in predicates.iter() {
                     let mut g = Form::new("existential");
                     g.len(predicate.bound_vars().len());
@@ -1008,9 +1036,9 @@ impl<'db> Cx<'db> {
                             g.item(ItemId::Trait(it.0));
                         }
                     }
-                    subs.push(g.finish());
+                    forms.push(g);
                 }
-                self.sorted(f, subs);
+                self.sorted(f, Form::finish_many(forms));
                 self.region(f, region);
             }
             TyKind::Closure(id, args) => {
@@ -1559,9 +1587,13 @@ impl<'db> Cx<'db> {
                 }
             }
             TyKind::Alias(alias) => match alias.kind {
-                AliasTyKind::Projection { def_id }
-                | AliasTyKind::Inherent { def_id }
-                | AliasTyKind::Free { def_id } => found.push(Named::Item(ItemId::Alias(def_id.0))),
+                AliasTyKind::Projection { def_id } => {
+                    found.push(Named::Item(ItemId::Alias(def_id.0)))
+                }
+                AliasTyKind::Inherent { def_id } => {
+                    found.push(Named::Item(ItemId::Alias(def_id.0)))
+                }
+                AliasTyKind::Free { def_id } => found.push(Named::Item(ItemId::Alias(def_id.0))),
                 AliasTyKind::Opaque { def_id } => match def_id.0.loc(db) {
                     ImplTraitId::ReturnTypeImplTrait(of, _) => {
                         found.push(Named::Item(ItemId::Function(of)))
@@ -1610,14 +1642,14 @@ impl<'db> Cx<'db> {
 
     /// Where clauses as a set: reordering them changes nothing.
     fn clauses(&self, f: &mut Form, clauses: impl Iterator<Item = Clause<'db>>) {
-        let subs = clauses
+        let forms = clauses
             .map(|clause| {
                 let mut g = Form::new("clause");
                 self.clause(&mut g, clause);
-                g.finish()
+                g
             })
             .collect();
-        self.sorted(f, subs);
+        self.sorted(f, Form::finish_many(forms));
     }
 
     fn clause(&self, f: &mut Form, clause: Clause<'db>) {
@@ -1887,11 +1919,11 @@ impl<'db> Cx<'db> {
     fn operand(&self, f: &mut Form, c: &Canon<'_, 'db>, operand: &Operand) {
         match operand.span {
             Some(span) => {
-                f.spans.update(&[1]);
+                f.spans.push(1);
                 f.span(span);
             }
             None => {
-                f.spans.update(&[0]);
+                f.spans.push(0);
             }
         }
         match &operand.kind {
@@ -2302,8 +2334,10 @@ enum Named {
 }
 
 /// Whether calling the function shows the program the name or identity of the types it is
-/// called with.
-fn observes_names(db: &dyn HirDatabase, func: FunctionId) -> bool {
+/// called with. Only the intrinsics do; a generic fn that calls one with its parameters is
+/// an instance that does, and codegen keys such an instance on the [`crate::Fact::Name`] of
+/// the nominal types in its arguments.
+pub fn observes_names(db: &dyn HirDatabase, func: FunctionId) -> bool {
     FunctionSignature::is_intrinsic(db, func)
         && matches!(FunctionSignature::of(db, func).name.as_str(), "type_name" | "type_id")
 }

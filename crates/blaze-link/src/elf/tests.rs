@@ -510,15 +510,53 @@ fn a_pointer_in_read_only_data_is_a_text_relocation() {
     assert!(error.what.contains("text relocation"), "{}", error.what);
 }
 
+/// lld's initial-exec cell of a shared library: `TPOFF64` against the module at the variable's
+/// offset in the template, and `DF_STATIC_TLS`.
 #[test]
-fn a_shared_librarys_initial_exec_cell_is_an_error() {
+fn a_shared_librarys_initial_exec_cell_is_relocated_against_the_module() {
+    use blaze_codegen::Arch::{Aarch64, X86_64};
+    // The thread pointer offset of the variable at 4 in a 24-byte template aligned to 16.
+    for (arch, tp, r_type) in [(X86_64, 4 - 32, elf::R_X86_64_TPOFF64), (Aarch64, 16 + 4, elf::R_AARCH64_TLS_TPREL)] {
+        let kind = OutputKind::Shared { name: "libx.so".into(), exports: Vec::new() };
+        let pieces = [(Class::Text, 16, 16), (Class::Got, 8, 8), (Class::Tdata, 24, 16)];
+        let mut image = Fixture::new(output(arch, kind, None), &pieces, &Counts { got: 1, ..Counts::default() });
+        let got = image.at(&Class::Got);
+        image.got = vec![GotEntry { addr: got, holds: Holds::TpOff(tp) }];
+        image.tls = Some(Tls { addr: image.at(&Class::Tdata), init: 24, size: 24, align: 16 });
+
+        let bytes = image.link();
+        let words = aligned(&bytes);
+        let data = view(&words, bytes.len());
+        let file = ElfFile64::<Endianness>::parse(data).unwrap();
+        let endian = file.endian();
+        let sections = file.elf_section_table();
+        let (_, rela) = sections.section_by_name(endian, b".rela.dyn").unwrap();
+        let (relas, _) = rela.rela(endian, data).unwrap().unwrap();
+        let relas: Vec<(u64, u32, u32, i64)> = relas
+            .iter()
+            .map(|it| (it.r_offset(endian), it.r_type(endian, false), it.r_sym(endian, false), it.r_addend(endian)))
+            .collect();
+        assert_eq!(relas, [(got, r_type, 0, 4)], "{arch:?}");
+        let dynamic = file.elf_program_headers().iter().find_map(|it| it.dynamic(endian, data).unwrap()).unwrap();
+        let flags = dynamic.iter().find(|it| it.d_tag(endian) == u64::from(elf::DT_FLAGS)).unwrap().d_val(endian);
+        assert_eq!(flags, u64::from(elf::DF_BIND_NOW | elf::DF_SYMBOLIC | elf::DF_STATIC_TLS), "{arch:?}");
+    }
+}
+
+#[test]
+fn an_initial_exec_cell_outside_the_template_is_an_error() {
     let kind = OutputKind::Shared { name: "libx.so".into(), exports: Vec::new() };
     let output = output(blaze_codegen::Arch::X86_64, kind, None);
-    let mut image = Fixture::new(output, &[(Class::Text, 16, 16), (Class::Got, 8, 8)], &Counts { got: 1, ..Counts::default() });
+    let pieces = [(Class::Text, 16, 16), (Class::Got, 8, 8), (Class::Tdata, 8, 8)];
+    let mut image = Fixture::new(output, &pieces, &Counts { got: 1, ..Counts::default() });
     let got = image.at(&Class::Got);
-    image.got = vec![GotEntry { addr: got, holds: Holds::TpOff(-8) }];
+    image.got = vec![GotEntry { addr: got, holds: Holds::TpOff(-16) }];
+    image.tls = Some(Tls { addr: image.at(&Class::Tdata), init: 8, size: 8, align: 8 });
     let error = image.synthesize().unwrap_err();
-    assert!(error.what.contains("thread pointer offset"), "{}", error.what);
+    assert!(error.what.contains("outside the TLS template"), "{}", error.what);
+    image.tls = None;
+    let error = image.synthesize().unwrap_err();
+    assert!(error.what.contains("no TLS"), "{}", error.what);
 }
 
 #[test]

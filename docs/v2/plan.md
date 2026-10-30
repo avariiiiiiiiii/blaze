@@ -30,6 +30,7 @@ plan/
     model.md             one warm VM, branches as views
     data.md              data-oriented layout, compression tiers
     hardware.md          SIMD, huge pages, io_uring, no GPU
+    concurrency.md       reads never lock, immutable values, task-boundary reclamation, no build lock
   lanes/                 who builds which part
     <lane>.md            a lane's plan, issues it takes in, and its Done when list
     <lane>/              that lane's own design notes (core/plane.md, cargo/notes.md, ...)

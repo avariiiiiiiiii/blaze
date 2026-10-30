@@ -44,6 +44,7 @@ use hir_def::{
 use serde::{Deserialize, Serialize};
 
 pub use facts::*;
+pub use form::observes_names;
 pub use hash::{
     Unhashable, closure_code, code_hash, coroutine_code, deep_hash, hashes, interface_hash,
     layout_hash,

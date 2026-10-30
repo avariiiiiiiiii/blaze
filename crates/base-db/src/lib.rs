@@ -871,10 +871,15 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
     #[doc(hidden)]
     fn crates_map(&self) -> Arc<CratesMap>;
 
-    /// A handle on the same database for another thread: the same storage and inputs, its own
-    /// query stack. Results either computes are seen by both. A write to an input waits until
-    /// every fork is dropped, so a fork lives only as long as one parallel read.
-    fn fork(&self) -> Box<dyn SourceDatabase + Send>;
+    /// Runs `task(db, i)` for every `i` in `0..count`, and returns once each has run: the
+    /// tasks of a round of macro expansion, or the def maps of a crate's dependencies. Each
+    /// task asks queries and nothing else, so neither the order nor the threads they run on
+    /// changes a result, and the caller reads what they computed afterwards in its own order.
+    ///
+    /// The database runs them as plane tasks on the one worker pool, each reading this database
+    /// by reference, and the calling thread pump-waits for them (docs/v2/plan/lanes/db.md, "One
+    /// database, shared by every thread"; #1301): no handle per thread, no thread of its own.
+    fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync));
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision);
 

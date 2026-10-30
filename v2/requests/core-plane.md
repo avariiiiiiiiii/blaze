@@ -11,6 +11,8 @@
   is cancelled" }` record first and skips each node `because` the request's first node, which
   reads as if that node failed.
 
+> applied: by ci (`NodeState::Cancelled` in `crates/blaze-protocol/src/events.rs`, drawn as a skip by `blaze-ui`, decoded by `blaze-web`).
+
 ## 2. docs/v2/plan/lanes/core/plane.md (core's) says the old fair-share and starvation rules
 
 - What: in "The plane", rule 3: the next thread goes to the request that started the fewest
@@ -23,13 +25,16 @@
 - Why: the plane's module doc says this now; the old rule (running tasks over weight) gave a
   pool of one thread to the first request opened forever.
 
+> applied: by core (`docs/v2/plan/lanes/core/plane.md`, rules 3, 5 and 6).
+
 ## 3. The plane keeps no memo: pass it the database's (core, core-pool)
 
 - What: `plane.rs` now has `pub trait Memo { fn settled(&self, key: Key) -> Option<Outcome>; }`
   (any `Fn(Key) -> Option<Outcome>` is one) and `Plane::with_memo(config, Box<dyn Memo + Send>)`.
   `Plane::new(config)` is a plane with no database: a key done before runs again.
   `remembers`/`forget` are gone; the database drops a value instead.
-  - core: `lib.rs` re-exports `Memo` with the other `plane::` names.
+  - core: `lib.rs` re-exports `Memo` and `RequestStats` (from `Plane::stats`, for proof)
+    with the other `plane::` names.
   - core: `build.rs`'s test `store_writes_overlap_compiles_and_a_second_request_reuses_them`
     relies on the old memo and now fails at `!ran.contains(&a2.compile)`. Make it
     `Plane::with_memo` over a test map that `run` fills with `key → Outcome::Built` for each
@@ -43,6 +48,9 @@
 - Why: docs/v2/plan/lanes/core.md, "One memo, the database's": two memos of one result can disagree, and
   the plane's grew without bound in a long-lived daemon.
 
+> applied: core's and core-pool's parts by core (`lib.rs` re-exports `Memo` and `RequestStats`; `build.rs` and `exec.rs` use `Plane::with_memo`).
+> forwarded to db: `blaze-query` has no `impl blaze_graph::Memo` over its results by input hash yet.
+
 ## 4. Release finished requests in the scheduler (core-pool)
 
 - What: call `plane.release(request)` right after a successful `PlaneInput::Open` in
@@ -54,3 +62,5 @@
 - Why: without it a daemon plane keeps every node of every request it ever ran. Release
   changes no output: `plane_tests.rs` runs 300 seeds with and without it and compares every
   output.
+
+> applied: by core (`exec.rs` calls `plane.release(request)`).

@@ -77,10 +77,6 @@ impl fmt::Debug for TestDB {
 
 #[salsa::db]
 impl SourceDatabase for TestDB {
-    fn fork(&self) -> Box<dyn SourceDatabase + Send> {
-        Box::new(self.clone())
-    }
-
     fn file_text(&self, file_id: base_db::FileId) -> FileText {
         self.files.file_text(file_id)
     }
@@ -129,8 +125,30 @@ impl SourceDatabase for TestDB {
         files.set_file_source_root_with_durability(self, id, source_root_id, durability);
     }
 
+    fn set_appended_root_module(
+        &mut self,
+        file_id: base_db::FileId,
+        module: Option<&'static str>,
+        durability: Durability,
+    ) {
+        let files = Arc::clone(&self.files);
+        files.set_appended_root_module(self, file_id, module, durability);
+    }
+
+    fn set_view_root(
+        &mut self,
+        view: base_db::ViewRoot<'_>,
+    ) -> Result<base_db::ViewChange, base_db::ViewError> {
+        let files = Arc::clone(&self.files);
+        files.set_view_root(self, view)
+    }
+
     fn crates_map(&self) -> Arc<CratesMap> {
         self.crates_map.clone()
+    }
+
+    fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
+        (0..count).for_each(|at| task(self, at));
     }
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {

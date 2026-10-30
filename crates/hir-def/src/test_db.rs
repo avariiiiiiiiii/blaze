@@ -20,6 +20,24 @@ use crate::{
     src::HasSource,
 };
 
+/// The order the test database runs a batch of [`SourceDatabase::run_all`] in. It has no plane:
+/// the tasks run on the calling thread, and the tests vary their order to show no result
+/// depends on it, as none may on the plane's scheduling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunOrder {
+    InOrder,
+    Reversed,
+    /// Every `n`th task from the first, then every `n`th from the second, and so on.
+    Strided(usize),
+    /// None of them: each result is computed by the query that reads it, as it reads it.
+    LeftToReaders,
+}
+
+thread_local! {
+    pub(crate) static RUN_ORDER: std::cell::Cell<RunOrder> =
+        const { std::cell::Cell::new(RunOrder::InOrder) };
+}
+
 #[salsa::db]
 pub(crate) struct TestDB {
     storage: salsa::Storage<Self>,
@@ -138,8 +156,18 @@ impl SourceDatabase for TestDB {
         self.crates_map.clone()
     }
 
-    fn fork(&self) -> Box<dyn SourceDatabase + Send> {
-        Box::new(self.clone())
+    fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
+        match RUN_ORDER.get() {
+            RunOrder::InOrder => (0..count).for_each(|at| task(self, at)),
+            RunOrder::Reversed => (0..count).rev().for_each(|at| task(self, at)),
+            RunOrder::Strided(stride) => {
+                let stride = stride.max(1);
+                (0..stride)
+                    .flat_map(|first| (first..count).step_by(stride))
+                    .for_each(|at| task(self, at));
+            }
+            RunOrder::LeftToReaders => {}
+        }
     }
 
     fn set_appended_root_module(
@@ -337,14 +365,13 @@ impl TestDB {
         None
     }
 
-    /// The events of `f`, in the order they happened: its def maps expand their macros on this
-    /// thread alone, so the order is one a test can expect.
+    /// The events of `f`, in the order they happened: a batch's tasks are left to the queries
+    /// that read their results, so the order is the one a test expects of the collection alone.
     pub(crate) fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
-        use crate::nameres::EXPANSION_THREADS;
         *self.events.lock().unwrap() = Some(Vec::new());
-        let threads = EXPANSION_THREADS.replace(Some(1));
+        let order = RUN_ORDER.replace(RunOrder::LeftToReaders);
         f();
-        EXPANSION_THREADS.set(threads);
+        RUN_ORDER.set(order);
         self.events.lock().unwrap().take().unwrap()
     }
 

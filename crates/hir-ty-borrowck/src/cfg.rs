@@ -71,28 +71,31 @@ impl Cfg {
                 predecessors[index(cleanup)].push(from);
             }
         }
-        // rustc's `Postorder` takes each block's successors from the last, so its reverse
-        // postorder, the order errors are found in, has a loop's exit before its body.
-        let mut reachable = vec![false; count];
-        let mut postorder = Vec::with_capacity(count);
-        let mut stack = vec![(body.start_block, 0usize)];
-        reachable[index(body.start_block)] = true;
-        while let Some((block, next)) = stack.last_mut() {
-            let block = *block;
-            let all = &successors[index(block)];
-            if let Some(&target) = all.len().checked_sub(*next + 1).map(|it| &all[it]) {
-                *next += 1;
-                if !reachable[index(target)] {
-                    reachable[index(target)] = true;
-                    stack.push((target, 0));
-                }
-            } else {
-                postorder.push(block);
-                stack.pop();
+        let (order, reachable) = reverse_postorder(&successors, body.start_block);
+        Cfg { starts, points, successors, predecessors, order, reachable }
+    }
+
+    /// The graph of blocks of `lens[b]` points each with these edges, from block 0: for the
+    /// tests of the analyses over it.
+    #[cfg(test)]
+    pub(super) fn from_edges(lens: &[usize], edges: &[(usize, usize)]) -> Self {
+        let count = lens.len();
+        let mut starts = Vec::with_capacity(count);
+        let mut points = 0;
+        for &len in lens {
+            starts.push(points);
+            points += len;
+        }
+        let mut successors = vec![SmallVec::new(); count];
+        let mut predecessors = vec![SmallVec::new(); count];
+        for &(from, to) in edges {
+            if !successors[from].contains(&block(to)) {
+                successors[from].push(block(to));
+                predecessors[to].push(block(from));
             }
         }
-        postorder.reverse();
-        Cfg { starts, points, successors, predecessors, order: postorder, reachable }
+        let (order, reachable) = reverse_postorder(&successors, block(0));
+        Cfg { starts, points, successors, predecessors, order, reachable }
     }
 
     pub(super) fn point(&self, location: Location) -> usize {

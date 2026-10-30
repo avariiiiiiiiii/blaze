@@ -75,7 +75,8 @@ fn convert(code: &Code, requests: &Requests) -> Result<blaze_codegen::CompiledFu
         })
     };
     let symbol = |name: &str| Ok(Target::Extern(name.to_owned()));
-    let resolve = Resolve { func: &func, data: &data, symbol: &symbol };
+    let body = || Ok(Target::Extern("body".to_owned()));
+    let resolve = Resolve { func: &func, data: &data, symbol: &symbol, body: &body };
     function(key(), Arch::X86_64, isa, code, requests, &resolve, &[span(0), span(1)], None)
 }
 
@@ -97,9 +98,19 @@ fn relocations_point_at_their_targets() {
     assert!(compiled.relocs.iter().all(|it| it.kind == RelocKind::PcRel32 && it.addend == -4));
 }
 
+/// Code that loads `datas`.
+fn loading(datas: &[u32]) -> Code {
+    let relocs = datas
+        .iter()
+        .enumerate()
+        .map(|(at, &data)| reloc(4 * at as u32, binemit::Reloc::X86PCRel4, 1, data))
+        .collect();
+    code(relocs, Vec::new())
+}
+
 #[test]
 fn data_points_only_at_data_before_it() {
-    let compiled = convert(&code(Vec::new(), Vec::new()), &requests()).expect("converted");
+    let compiled = convert(&loading(&[1, 3]), &requests()).expect("converted");
     for (index, data) in compiled.data.iter().enumerate() {
         for reloc in &data.relocs {
             if let Target::Data(id) = &reloc.target {
@@ -123,8 +134,30 @@ fn equal_data_is_one_object() {
     let mut requests = requests();
     let again = blob(b"inner\0\0\0", Vec::new(), Vec::new());
     requests.datas.push(DataRequest::Blob { blob: again, identity: DataIdentity::Shared });
-    let compiled = convert(&code(Vec::new(), Vec::new()), &requests).expect("converted");
+    let compiled = convert(&loading(&[1, 3, 4]), &requests).expect("converted");
     assert_eq!(compiled.data.len(), 4);
+}
+
+/// The data of requests nothing names is none of the function's: a fold's body and thunks
+/// leave out what each other names.
+#[test]
+fn data_nothing_names_is_left_out() {
+    let compiled = convert(&loading(&[0]), &requests()).expect("converted");
+    assert_eq!(compiled.data.len(), 1);
+    assert_eq!(compiled.data[0].bytes, b"inner\0\0\0");
+    assert!(convert(&loading(&[]), &requests()).expect("converted").data.is_empty());
+}
+
+#[test]
+fn a_thunk_calls_the_body() {
+    let call = ModuleReloc {
+        offset: 1,
+        kind: binemit::Reloc::X86CallPCRel4,
+        name: ModuleRelocTarget::User { namespace: crate::v2::fold::BODY, index: 0 },
+        addend: -4,
+    };
+    let compiled = convert(&code(vec![call], Vec::new()), &requests()).expect("converted");
+    assert_eq!(compiled.relocs[0].target, Target::Extern("body".to_owned()));
 }
 
 #[test]
@@ -153,7 +186,7 @@ fn what_v2_has_no_target_for_is_an_error() {
         blob: blob(b"x", Vec::new(), Vec::new()),
         identity: DataIdentity::Writable,
     };
-    assert!(convert(&code(Vec::new(), Vec::new()), &writable).is_err());
+    assert!(convert(&loading(&[0]), &writable).is_err());
 }
 
 #[test]

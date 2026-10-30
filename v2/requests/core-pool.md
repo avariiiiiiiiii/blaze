@@ -10,6 +10,8 @@
   `sched_getaffinity` / `sched_setaffinity` (Linux) and `sysctlbyname` /
   `pthread_set_qos_class_self_np` (macOS).
 
+> applied: nothing to edit by hand: `crossbeam-deque` and `libc` are root workspace dependencies and both packages are in `Cargo.lock`; the first compile adds the two names to `blaze-graph`'s entry (no new package).
+
 ## 2. One `Cancelled` for the query database and the pump (lane db, coordinator)
 
 - What: `blaze_query::Cancelled` (crates/blaze-query/src/lib.rs) becomes a re-export of
@@ -19,6 +21,8 @@
   `blaze_graph::pump::Flights::get_or_run`, which returns `blaze_graph::Cancelled`; the
   scheduler's `Work` returns it too. Two types for one thing would need a conversion at every
   `?`.
+
+> applied: by db (`pub use blaze_graph::Cancelled;` in `crates/blaze-query/src/lib.rs`).
 
 ## 3. docs/v2/plan/lanes/core/plane.md "The executor" (core)
 
@@ -32,3 +36,5 @@
   threads.
 - Where: `docs/v2/plan/lanes/core/plane.md` (core's path).
 - Why: docs-say-what-they-are; the section was written before the pool.
+
+> applied: by core (`docs/v2/plan/lanes/core/plane.md`, "The executor").

@@ -154,21 +154,25 @@ impl HirFrontend {
     fn described_static(
         &self,
         db: &dyn HirDatabase,
+        homes: &mut Homes,
         value: &HirStatic,
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
         let hashes = &*self.hashes;
         let item = hashes
             .item(db, ItemId::Static(value.0))
             .map_err(|what| undescribed(value, None, what))?;
-        let fail = |what: String| undescribed(value, Some(item), what);
-        let compiled = super::backend::static_value(db, hashes, value.0).map_err(fail)?;
+        let held = super::statics::value(db, homes, hashes, value.0)
+            .map_err(|what| undescribed(value, Some(item), what))?;
         Ok(DescribedStatic {
             item,
             instance: ContentId::default(),
-            value: compiled.value,
+            value: held.value,
+            mutable: held.mutable,
+            thread_local: held.thread_local,
+            section: held.section,
             origin: self.origin(db, value.0.krate(db)),
             symbol: exported_static(db, value.0).map(|it| it.as_str().to_owned()),
-            refs: compiled.refs,
+            refs: held.refs,
         })
     }
 }
@@ -189,7 +193,7 @@ impl Frontend for HirFrontend {
         &self,
         value: &HirStatic,
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
-        self.with(|db, _| self.described_static(db, value))
+        self.with(|db, homes| self.described_static(db, homes, value))
     }
 }
 
@@ -372,7 +376,7 @@ fn written_checks(db: &dyn HirDatabase, kind: &Kind) -> Option<bool> {
 
 /// The symbol outside code names an instance by: `#[no_mangle]`, `#[export_name]`, the
 /// standard library's functions linked by name, the C `main`.
-fn symbol_of(db: &dyn HirDatabase, kind: &Kind) -> Option<String> {
+pub(super) fn symbol_of(db: &dyn HirDatabase, kind: &Kind) -> Option<String> {
     match kind {
         Kind::Code(instance, _) => match instance.def {
             InstanceDef::Fn(func) if instance.args.as_ref().iter().all(|it| it.region().is_some()) => {

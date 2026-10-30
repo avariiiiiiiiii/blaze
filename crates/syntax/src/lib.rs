@@ -62,8 +62,8 @@ pub use parser::{Edition, LexedStr, SyntaxKind, T};
 pub use rustc_literal_escaper as unescape;
 pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 pub use syntax_tree::{
-    Direction, Expand, FlatTree, FlatTreeBuilder, GreenNode, NodeOrToken, SyntaxText, TextRange,
-    TextSize, TokenAtOffset, WalkEvent, api::Preorder,
+    Direction, Expand, FlatTree, FlatTreeBuilder, NodeOrToken, SyntaxText, TextRange, TextSize,
+    TokenAtOffset, WalkEvent, api::Preorder,
 };
 
 /// `Parse` is the result of the parsing: a syntax tree and a collection of
@@ -200,8 +200,8 @@ impl Parse<SourceFile> {
     }
 
     /// Every error of the file, bodies included: for an outline, its errors and those of every
-    /// lazy body, each parsed (once) if it was not yet. The errors are those of a full parse
-    /// of the text, the outline's first and then each body's.
+    /// lazy body, each body parsed if it was not yet. They are the errors of a full parse of
+    /// the text, in another order: each body's come where its walk reaches it.
     pub fn errors_with_bodies(&self) -> Vec<SyntaxError> {
         self.errors_of(true)
     }

@@ -90,6 +90,8 @@ pub struct RootDatabase {
     files: Arc<Files>,
     crates_map: Arc<CratesMap>,
     nonce: Nonce,
+    /// What [`SourceDatabase::run_all`] runs its batches on: the daemon's one worker pool.
+    pool: Option<std::sync::Arc<blaze_graph::pool::Pool>>,
 }
 
 impl std::panic::RefUnwindSafe for RootDatabase {}
@@ -110,6 +112,7 @@ impl Clone for RootDatabase {
             files: self.files.clone(),
             crates_map: self.crates_map.clone(),
             nonce: self.nonce,
+            pool: self.pool.clone(),
         }
     }
 }
@@ -167,8 +170,13 @@ impl RootDatabase {
 
     /// Has `krate` be compiled with `env`.
     pub fn set_env(&mut self, krate: base_db::Crate, env: base_db::Env) {
-        use salsa::Setter as _;
-        krate.set_env(self).to(env);
+        krate.set_env(self, env);
+    }
+
+    /// Runs every batch of [`SourceDatabase::run_all`] as tasks on `pool`, the daemon's one
+    /// worker pool. A database without one stops at its first batch.
+    pub fn set_pool(&mut self, pool: std::sync::Arc<blaze_graph::pool::Pool>) {
+        self.pool = Some(pool);
     }
 
     /// See [`base_db::Files::on_disk`].
@@ -190,10 +198,6 @@ impl RootDatabase {
 
 #[salsa::db]
 impl SourceDatabase for RootDatabase {
-    fn fork(&self) -> Box<dyn SourceDatabase + Send> {
-        Box::new(self.clone())
-    }
-
     fn file_text(&self, file_id: vfs::FileId) -> FileText {
         self.files.file_text(file_id)
     }
@@ -277,8 +281,61 @@ impl SourceDatabase for RootDatabase {
         files.set_file_source_root_with_durability(self, id, source_root_id, durability);
     }
 
+    fn set_appended_root_module(
+        &mut self,
+        file_id: vfs::FileId,
+        module: Option<&'static str>,
+        durability: Durability,
+    ) {
+        let files = Arc::clone(&self.files);
+        files.set_appended_root_module(self, file_id, module, durability);
+    }
+
+    fn set_view_root(
+        &mut self,
+        view: base_db::ViewRoot<'_>,
+    ) -> Result<base_db::ViewChange, base_db::ViewError> {
+        let files = Arc::clone(&self.files);
+        files.set_view_root(self, view)
+    }
+
     fn crates_map(&self) -> Arc<CratesMap> {
         self.crates_map.clone()
+    }
+
+    /// Each task is a job of the worker pool, near this thread's group, reading this database
+    /// by reference; the calling thread pump-waits for the batch (`Pool::scope`). The first
+    /// panic of a task, salsa's cancellation included, goes on from here once the batch is over.
+    fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
+        if count == 0 {
+            return;
+        }
+        let Some(pool) = self.pool.as_deref() else {
+            panic!(
+                "RootDatabase::run_all: no worker pool to run a batch of {count} tasks on \
+                 (RootDatabase::set_pool)"
+            );
+        };
+        let near = blaze_graph::pool::group();
+        let panicked = std::sync::Mutex::new(None);
+        pool.scope(|scope| {
+            for at in 0..count {
+                let panicked = &panicked;
+                scope.submit(
+                    near,
+                    move || task(self, at),
+                    move |ran| {
+                        if let Err(panic) = ran {
+                            let mut first = panicked.lock().unwrap_or_else(|it| it.into_inner());
+                            first.get_or_insert(panic);
+                        }
+                    },
+                );
+            }
+        });
+        if let Some(panic) = panicked.into_inner().unwrap_or_else(|it| it.into_inner()) {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
@@ -349,6 +406,7 @@ impl RootDatabase {
             files: Default::default(),
             crates_map: Default::default(),
             nonce: Nonce::new(),
+            pool: None,
         };
         // This needs to be here otherwise `CrateGraphBuilder` will panic.
         set_all_crates_with_durability(&mut db, std::iter::empty(), Durability::HIGH);

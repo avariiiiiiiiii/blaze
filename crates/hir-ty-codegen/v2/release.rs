@@ -10,7 +10,7 @@
 //! summaries, never by compiling functions together (v1's units, `RA_JIT_UNITS`).
 
 #[cfg(feature = "llvm")]
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use blaze_codegen::{
     CodegenError, Unit,
@@ -37,16 +37,24 @@ use super::{Built, DataPlace, Places};
 use crate::{
     ConstBlob,
     backend::{Optimization, Passes, Selection},
-    fragment::{DataRequest, Hint, Requests, Wants},
+    fragment::{DataRequest, FuncTarget, Hint, Requests, Wants},
     llvm::release::{self as llvm, Given, Prelinked},
 };
 
-/// What [`summarize`] leaves of an LLVM unit for its own [`emit`]: its pre-linked module,
-/// so that LLVM's pre-link pipeline runs once per function.
-#[derive(Default)]
-pub(crate) struct Kept {
-    #[cfg(feature = "llvm")]
-    own: OnceLock<Arc<Vec<u8>>>,
+/// What [`summarize`] leaves of an LLVM unit for its own [`emit`], by the unit's key: its
+/// pre-linked module, so that LLVM's pre-link pipeline runs once per function. A key is the
+/// unit's code, arguments and settings, which make the same module whichever unit of it
+/// summarized; `emit` takes it out.
+#[cfg(feature = "llvm")]
+static KEPT: LazyLock<Mutex<rustc_hash::FxHashMap<InstanceKey, Arc<Vec<u8>>>>> =
+    LazyLock::new(Mutex::default);
+
+/// What the function's `#[inline]` asks. The prepared function does not carry it
+/// (`v2/requests/codegen-release.md`), so LLVM and the importers are told nothing and LLVM's
+/// cost model alone decides, which changes how fast the code is, never what it does.
+#[cfg(feature = "llvm")]
+fn inline_hint(_: &Function) -> Hint {
+    Hint::None
 }
 
 /// A release function as its importers link it, held for one build.
@@ -98,10 +106,8 @@ pub(crate) fn summarize(
             return Ok((summary, export));
         }
     };
-    let Prelinked { own, export, size, facts } = prelinked(unit, spec, function, pending, refs, optimization)?;
-    let own = Arc::new(own);
-    // A second summary of the same unit made the same module.
-    _ = function.release.own.set(own);
+    let Prelinked { own, export, size, facts } = prelinked(unit, spec, function, refs, optimization)?;
+    KEPT.lock().unwrap_or_else(|e| e.into_inner()).insert(unit.instance.key(), Arc::new(own));
     let requests = &pending.wants.requests;
     let mut calls: Vec<Call> = Vec::with_capacity(facts.calls.len());
     for called in facts.calls {
@@ -131,7 +137,7 @@ pub(crate) fn summarize(
     });
     let addressed = keys(unit, places, refs, facts.addressed.iter().copied().chain(in_data))?;
     let importable = requests.ordered();
-    let hint = match function.hint {
+    let hint = match inline_hint(function) {
         _ if !importable => summary::Hint::Never,
         Hint::None => summary::Hint::None,
         Hint::Inline => summary::Hint::Inline,
@@ -158,7 +164,7 @@ pub(crate) fn summarize(
             requests: copied(requests),
             signature: pending.func.signature.clone(),
             size,
-            hint: function.hint,
+            hint: inline_hint(function),
         })
     });
     Ok((summary, Export { module, places: places.clone(), code: unit.instance.code }))
@@ -180,24 +186,17 @@ pub(crate) fn summarize(
 pub(crate) fn emit(
     unit: &Unit,
     spec: &Spec,
-    mut function: Function,
+    mut function: Box<Function>,
     refs: &Refs,
     imports: Option<(&Imports, &[Import<'_, Export>])>,
 ) -> Result<Emitted, CodegenError> {
     let optimization = optimization(unit, spec)?;
-    let pending = match &function.code {
-        Built::Ir(pending) => pending,
-        Built::Assembled(..) => {
-            if imports.is_some_and(|(it, _)| it.imported.iter().len() > 0) {
-                return Err(failed(unit, "an assembly function imports nothing"));
-            }
-            return super::convert::emitted(unit, function, refs, Vec::new());
-        }
-    };
-    let own = match function.release.own.get() {
-        Some(own) => own.clone(),
-        None => Arc::new(prelinked(unit, spec, &function, pending, refs, optimization)?.own),
-    };
+    if function.places.refs as usize > refs.len() {
+        return Err(failed(
+            unit,
+            format!("{} references given for a function prepared against {}", refs.len(), function.places.refs),
+        ));
+    }
     let empty = Imports::default();
     let (decided, imported) = imports.unwrap_or((&empty, &[]));
     if decided.imported.len() != imported.len()
@@ -205,8 +204,19 @@ pub(crate) fn emit(
     {
         return Err(failed(unit, "its imports are not those it was decided to have"));
     }
-    let Function { code, places, .. } = &mut function;
-    let Built::Ir(pending) = code else { unreachable!("matched above") };
+    if let Built::Assembled(code, _) = &function.code {
+        if !imported.is_empty() {
+            return Err(failed(unit, "an assembly function is given imports"));
+        }
+        return super::backend::emitted(unit, &function, code, refs);
+    }
+    let own = match function.release.own.get() {
+        Some(own) => own.clone(),
+        None => Arc::new(prelinked(unit, spec, &function, refs, optimization)?.own),
+    };
+    let Function { code: Built::Ir(pending), places, .. } = &mut function else {
+        return Err(failed(unit, "an assembly function has no IR for LLVM"));
+    };
     let mut linked = Vec::with_capacity(imported.len());
     let mut inlined = Vec::with_capacity(imported.len());
     for import in imported {
@@ -233,11 +243,13 @@ pub(crate) fn emit(
     }
     let code = llvm::compile(&mut pending.wants, &own, &pending.func.signature, &linked, &given, optimization)
         .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))?;
+    placed_since(unit, &pending.wants, places, refs)?;
     let code = crate::backend::pad(code).map_err(|why| failed(unit, why))?;
-    pending_code(&mut function, code);
+    let mut emitted = super::backend::emitted(unit, &function, &code, refs)?;
     inlined.sort_unstable();
     inlined.dedup();
-    super::convert::emitted(unit, function, refs, inlined)
+    emitted.function.inlined = inlined;
+    Ok(emitted)
 }
 
 #[cfg(not(feature = "llvm"))]
@@ -277,17 +289,19 @@ fn prelinked(
     unit: &Unit,
     spec: &Spec,
     function: &Function,
-    pending: &crate::Pending,
     refs: &Refs,
     optimization: Optimization,
 ) -> Result<Prelinked, CodegenError> {
+    let Built::Ir(pending) = &function.code else {
+        return Err(failed(unit, "an assembly function has no IR for LLVM"));
+    };
     let places = &function.places;
     let instances = |request: u32| {
         let target = places.funcs.get(request as usize).and_then(|&it| refs.get(it as usize));
         matches!(target, Some(Target::Function(_) | Target::Direct(_)))
     };
     let debug = spec.debuginfo != DebugInfo::None;
-    llvm::prelink(&pending.wants, &pending.func, &pending.named, function.hint, debug, optimization, &instances)
+    llvm::prelink(&pending.wants, &pending.func, &pending.named, inline_hint(function), debug, optimization, &instances)
         .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))
 }
 
@@ -332,6 +346,31 @@ fn by_key(places: &Places, refs: &Refs, wanted: InstanceKey) -> Vec<u32> {
         _ => false,
     };
     (0..places.funcs.len() as u32).filter(|&at| is(places.funcs[at as usize])).collect()
+}
+
+/// Gives a place to each request LLVM's object asked for as it was read back: constants LLVM
+/// put beside the code that hold addresses are the function's own data, and a function it
+/// calls of its own accord (a libm routine, wide division) is the outside symbol of that
+/// name, which must be among the unit's references like any other.
+#[cfg(feature = "llvm")]
+fn placed_since(unit: &Unit, wants: &Wants, places: &mut Places, refs: &Refs) -> Result<(), CodegenError> {
+    for request in &wants.requests.funcs[places.funcs.len()..] {
+        let FuncTarget::Symbol(name) = &request.target else {
+            return Err(failed(unit, "LLVM asked for a function that is no symbol"));
+        };
+        let place = refs.iter().position(|it| matches!(it, Target::Extern(it) if it == name));
+        let place = place.ok_or_else(|| {
+            failed(unit, format!("LLVM calls `{name}` of its own accord, which the unit's references lack"))
+        })?;
+        places.funcs.push(place as u32);
+    }
+    for request in &wants.requests.datas[places.datas.len()..] {
+        match request {
+            DataRequest::Blob { .. } => places.datas.push(DataPlace::Own),
+            _ => return Err(failed(unit, "LLVM asked for data that is not its own constant")),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "llvm")]
@@ -436,4 +475,166 @@ fn merge(
         datas.push(id);
     }
     Ok((funcs, datas))
+}
+
+#[cfg(all(test, feature = "llvm"))]
+mod tests {
+    use blaze_codegen::{Arch, Instance, Settings, settings::Toolchain};
+    use blaze_ids::ContentId;
+    use blaze_items::ItemKey;
+    use cranelift_codegen::{ir::Signature, isa::CallConv};
+
+    use super::*;
+    use crate::DataIdentity;
+
+    fn unit() -> Unit {
+        Unit {
+            instance: Instance {
+                code: CodeHash(ContentId([1; 32])),
+                args: ContentId([2; 32]),
+                settings: Settings(ContentId([3; 32])),
+            },
+            backend: Backend::Llvm { opt: 3 },
+            arch: Arch::X86_64,
+            item: ItemKey(ContentId([4; 32])),
+        }
+    }
+
+    fn instance(n: u8) -> InstanceKey {
+        InstanceKey(ContentId([n; 32]))
+    }
+
+    fn symbol(wants: &mut Wants, name: &str) -> u32 {
+        let signature = Signature::new(CallConv::SystemV);
+        wants.func(FuncTarget::Symbol(name.to_owned()), &signature).as_u32()
+    }
+
+    fn blob(bytes: &[u8]) -> ConstBlob {
+        ConstBlob { bytes: bytes.to_vec(), align: 8, ..ConstBlob::default() }
+    }
+
+    /// The importer asks for `a` and the bytes 1 2 3; the import for `b`, `a`, the same
+    /// bytes, bytes that point at them and at `b`, and a location of nowhere.
+    #[test]
+    fn an_imports_requests_are_the_compiles_each_once() {
+        let isa = crate::target().unwrap();
+        let mut wants = Wants::new(&**isa);
+        symbol(&mut wants, "a");
+        wants.define_data_as(blob(&[1, 2, 3]), DataIdentity::Shared);
+        let mut places = Places { funcs: vec![0], datas: vec![DataPlace::Own], refs: 1 };
+
+        let mut theirs = Wants::new(&**isa);
+        let b = symbol(&mut theirs, "b");
+        symbol(&mut theirs, "a");
+        let same = theirs.define_data_as(blob(&[1, 2, 3]), DataIdentity::Shared);
+        let mut pointing = blob(&[0; 16]);
+        pointing.relocs = vec![(0, same, 0)];
+        pointing.fn_relocs = vec![(8, FuncId::from_u32(b))];
+        theirs.define_data_as(pointing, DataIdentity::Shared);
+        theirs.requests.datas.push(DataRequest::Location(None));
+        let their_places = Places {
+            funcs: vec![0, 1],
+            datas: vec![DataPlace::Own, DataPlace::Own, DataPlace::Nowhere],
+            refs: 2,
+        };
+        let their_refs = [Target::Extern("b".to_owned()), Target::Extern("a".to_owned())];
+        let refs = [Target::Extern("a".to_owned()), Target::Extern("b".to_owned())];
+
+        let (funcs, datas) =
+            merge(&unit(), &mut wants, &mut places, &refs, &theirs.requests, &their_places, &their_refs)
+                .unwrap();
+        assert_eq!(funcs, [1, 0]);
+        assert_eq!(datas, [0, 1, 2]);
+        assert_eq!(places.funcs, [0, 1]);
+        assert_eq!(places.datas, [DataPlace::Own, DataPlace::Own, DataPlace::Nowhere]);
+        let DataRequest::Blob { blob: moved, .. } = &wants.requests.datas[1] else { panic!() };
+        assert_eq!(moved.relocs, [(0, DataId::from_u32(0), 0)]);
+        assert_eq!(moved.fn_relocs, [(8, FuncId::from_u32(1))]);
+        // The location is one request, however many bodies ask for it.
+        let again =
+            merge(&unit(), &mut wants, &mut places, &refs, &theirs.requests, &their_places, &their_refs)
+                .unwrap();
+        assert_eq!(again, (funcs, datas));
+        assert_eq!(wants.requests.datas.len(), 3);
+    }
+
+    #[test]
+    fn an_import_that_refers_to_what_the_compile_lacks_is_refused() {
+        let isa = crate::target().unwrap();
+        let mut wants = Wants::new(&**isa);
+        let mut places = Places::default();
+        let mut theirs = Wants::new(&**isa);
+        symbol(&mut theirs, "c");
+        let their_places = Places { funcs: vec![0], datas: Vec::new(), refs: 1 };
+        let refused = merge(
+            &unit(),
+            &mut wants,
+            &mut places,
+            &[Target::Extern("a".to_owned())],
+            &theirs.requests,
+            &their_places,
+            &[Target::Extern("c".to_owned())],
+        )
+        .unwrap_err();
+        assert!(refused.what.contains("lack"), "{}", refused.what);
+    }
+
+    #[test]
+    fn requests_are_keys_by_their_places() {
+        let places = Places { funcs: vec![1, 0, 2, 1], datas: Vec::new(), refs: 3 };
+        let refs = [Target::Function(instance(5)), Target::Direct(instance(6)), Target::Extern("x".to_owned())];
+        assert_eq!(key(&unit(), &places, &refs, 0).unwrap(), Some(instance(6)));
+        assert_eq!(key(&unit(), &places, &refs, 2).unwrap(), None);
+        assert!(key(&unit(), &places, &refs, 4).is_err());
+        assert_eq!(keys(&unit(), &places, &refs, 0..4).unwrap(), [instance(5), instance(6)]);
+        assert_eq!(by_key(&places, &refs, instance(6)), [0, 3]);
+    }
+
+    #[test]
+    fn what_llvm_asks_for_on_its_own_is_placed() {
+        let isa = crate::target().unwrap();
+        let mut wants = Wants::new(&**isa);
+        symbol(&mut wants, "a");
+        let mut places = Places { funcs: vec![0], datas: Vec::new(), refs: 2 };
+        symbol(&mut wants, "fmod");
+        wants.define_data_as(blob(&[7]), DataIdentity::Shared);
+        let refs = [Target::Extern("a".to_owned()), Target::Extern("fmod".to_owned())];
+        placed_since(&unit(), &wants, &mut places, &refs).unwrap();
+        assert_eq!(places.funcs, [0, 1]);
+        assert_eq!(places.datas, [DataPlace::Own]);
+        symbol(&mut wants, "sincos");
+        assert!(placed_since(&unit(), &wants, &mut places, &refs).is_err());
+    }
+
+    #[test]
+    fn levels_are_llvms() {
+        let spec = |opt| Spec {
+            toolchain: Toolchain {
+                id: ContentId([1; 32]),
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                arch: Arch::X86_64,
+                cpu: "x86-64".to_owned(),
+                features: Vec::new(),
+                cranelift: "0".to_owned(),
+                llvm: Some("23".to_owned()),
+                frame_pointers: false,
+                relocation: blaze_codegen::settings::Relocation::Pic,
+            },
+            backend: Backend::Llvm { opt },
+            overflow_checks: false,
+            debug_assertions: false,
+            panic: blaze_codegen::settings::Panic::Unwind,
+            debuginfo: DebugInfo::None,
+            fold: false,
+            policy: ContentId::default(),
+        };
+        assert_eq!(optimization(&unit(), &spec(3)).unwrap().passes, Passes::Aggressive);
+        assert_eq!(optimization(&unit(), &spec(2)).unwrap().passes, Passes::Default);
+        assert_eq!(optimization(&unit(), &spec(0)).unwrap().selection, Selection::Fast);
+        assert!(optimization(&unit(), &spec(4)).is_err());
+        let cranelift = Spec { backend: Backend::Cranelift, ..spec(2) };
+        assert!(optimization(&unit(), &cranelift).is_err());
+        let without = Spec { toolchain: Toolchain { llvm: None, ..spec(2).toolchain }, ..spec(2) };
+        assert!(optimization(&unit(), &without).is_err());
+    }
 }

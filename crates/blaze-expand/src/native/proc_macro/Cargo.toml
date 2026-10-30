@@ -1,0 +1,10 @@
+[package]
+name = "blaze-native-proc-macro"
+version = "0.0.0"
+description = "The proc_macro blaze's native expanders are built against: its wasm guest's, asking a native host"
+edition = "2024"
+publish = false
+
+[lib]
+name = "proc_macro"
+path = "lib.rs"

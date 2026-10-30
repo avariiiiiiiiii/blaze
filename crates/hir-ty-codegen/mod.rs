@@ -4939,8 +4939,9 @@ fn build<'db>(
     // the one just below it is taken for none at all.
     ctx.func.params.ensure_base_srcloc(ir::SourceLoc::new(0));
     let mut builder_ctx = FunctionBuilderContext::new();
-    let aborts = panics_abort(cg.db, env.krate);
-    let compiling = cg.debug_assertions.unwrap_or_else(|| debug_assertions(cg.db, env.krate));
+    let aborts = cg.unit.map_or_else(|| panics_abort(cg.db, env.krate), |it| it.aborts);
+    let compiling =
+        cg.unit.map_or_else(|| debug_assertions(cg.db, env.krate), |it| it.debug_assertions);
     let ub_checks = match body {
         Some(body) => ub_checks_of(cg.db, compiling, body.owner.module(cg.db).krate(cg.db)),
         None => compiling,
@@ -14767,7 +14768,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         static ENABLED: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("BLAZE_INLINE").is_none_or(|it| it != "0"));
         let db = self.cg.db;
-        if !*ENABLED {
+        if !*ENABLED || self.cg.unit.is_some() {
             return None;
         }
         if Target::current().writes_wasm_objects() {
@@ -14871,6 +14872,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         sig: &Signature,
         id: FuncId,
     ) {
+        if self.cg.unit.is_some() {
+            return;
+        }
         let db = self.cg.db;
         let tracked = match def {
             InstanceDef::Fn(func) => {

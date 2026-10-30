@@ -120,8 +120,8 @@ impl SourceDatabase for TestDb {
         self.crates_map.clone()
     }
 
-    fn fork(&self) -> Box<dyn SourceDatabase + Send> {
-        Box::new(self.clone())
+    fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
+        (0..count).for_each(|at| task(self, at));
     }
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {

@@ -28,6 +28,18 @@
 //! network's and the test marker's, so that a program pays for nothing it reads. The program
 //! runs as the user who ran it, with no capability left.
 //!
+//! For `blaze sandbox --v2` ([`super::v2`]) the supervisor appends each line to the live record
+//! before it answers, and a traced run's processes load the interposer (`linux_interpose.c`,
+//! through `LD_PRELOAD`), which tells it by markers what no call shows: the variables read by
+//! name and the realtime clock read through the vDSO, and that it loaded. A process that ran a
+//! program and never said so (a static or setuid one, or one run without the variables) is an
+//! `X` line as the run ends. Listings (`getdents`), randomness (`getrandom`, `/dev/urandom`) and
+//! the clock calls the vDSO does not answer are seen by the filter. A thread is in the scope its
+//! last [`super::MARK`] named; a new process is in the scope the thread that forked it had when
+//! it did. With [`Also::network`] there is no network namespace (a confined sandbox is not kept
+//! from TCP), what it reaches is a `T network` line, and the machine's abstract Unix sockets,
+//! which it would see then, are refused.
+//!
 //! Where a user may not make a user namespace (Ubuntu 23.10 on keeps them from it through
 //! AppArmor, a container's seccomp profile may), a sandbox without a view or overlays is
 //! confined instead ([`confined`]): the first process makes no namespace and has Landlock
@@ -42,12 +54,47 @@
 //! not refused.
 
 use std::{
+    collections::HashMap,
     ffi::{CString, OsString},
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
 };
 
-use super::{Recorder, Spec, View, tidy};
+use blaze_core::Untraceable;
+
+use super::{Also, Bind, MARK, Recorder, Spec, View, tidy};
+
+/// The library a traced run's processes load (`LD_PRELOAD`), built from `linux_interpose.c` by
+/// `build.rs`: it tells the supervisor what its filter can't see, the variables read by name
+/// and the realtime clock read through the vDSO, and says it loaded, so that a program it is
+/// not in (a static or setuid one) is known.
+const INTERPOSER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libblaze_sandbox_interpose.so"));
+
+/// The variable the interposer is told its own path by, which it takes out of what the program
+/// sees as it loads, with itself out of `LD_PRELOAD`, and puts back in what the program runs.
+const INTERPOSING: &str = "__BLAZE_INTERPOSE";
+
+/// Where the interposer is, written there from this executable the first time: a path named
+/// by its contents in the user's cache directory, as the macOS sandbox keeps its library.
+fn interposer() -> Result<PathBuf, String> {
+    let caches = std::env::var_os("XDG_CACHE_HOME").filter(|it| !it.is_empty()).map(PathBuf::from);
+    let caches = caches
+        .or_else(|| std::env::home_dir().map(|it| it.join(".cache")))
+        .ok_or("no XDG_CACHE_HOME or home directory to keep the sandbox's interposer in")?;
+    let dir = caches.join("blaze/sandbox").join(env!("BLAZE_SANDBOX_INTERPOSE"));
+    let file = dir.join("libblaze_sandbox_interpose.so");
+    // The name is that of the contents it should have; what is there is still compared, so a
+    // file left half written, or changed since, is written again.
+    if std::fs::read(&file).is_ok_and(|it| it == INTERPOSER) {
+        return Ok(file);
+    }
+    std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
+    let writing = dir.join(format!("writing-{}", std::process::id()));
+    std::fs::write(&writing, INTERPOSER)
+        .and_then(|()| std::fs::rename(&writing, &file))
+        .map_err(|it| format!("{}: {it}", file.display()))?;
+    Ok(file)
+}
 
 /// The directories that are the sandbox's own: the kernel's views and the empty ones.
 const OWN: &[&str] = &["/proc", "/sys", "/dev", "/tmp", "/var/tmp", "/run"];
@@ -98,7 +145,20 @@ enum Does {
     /// Sends a signal to the process this argument names: asked about only in a confined
     /// sandbox, which has no PID namespace to keep it to its own.
     Signal(Target),
+    /// Lists the directory the descriptor in this argument is open on: noted only when reads
+    /// are recorded.
+    List(usize),
+    /// Gets randomness (`getrandom`): noted only when reads are recorded.
+    Random,
+    /// Reads a clock: the one whose id is in this argument, noted when it is a realtime one,
+    /// or always the realtime one (`None`). Only when reads are recorded; what reads it through
+    /// the vDSO makes no call, and the interposer says it does ([`super::CLOCK_MARK`]).
+    Clock(Option<usize>),
 }
+
+/// The clocks that tell the time of day rather than how long since something:
+/// `CLOCK_REALTIME`, `CLOCK_REALTIME_COARSE`, `CLOCK_REALTIME_ALARM` and `CLOCK_TAI`.
+const REALTIME: [u32; 4] = [0, 5, 8, 11];
 
 /// How a signal's call names the process it goes to.
 #[derive(Clone, Copy)]
@@ -170,6 +230,12 @@ const CALLS: &[Call] = &[
     call(234, NO_PATH, Does::Signal(Target::Process)), // tgkill
     call(297, NO_PATH, Does::Signal(Target::Process)), // rt_tgsigqueueinfo
     call(424, NO_PATH, Does::Signal(Target::Pidfd)), // pidfd_send_signal
+    call(78, NO_PATH, Does::List(0)),               // getdents
+    call(217, NO_PATH, Does::List(0)),              // getdents64
+    call(318, NO_PATH, Does::Random),               // getrandom
+    call(96, NO_PATH, Does::Clock(None)),           // gettimeofday
+    call(201, NO_PATH, Does::Clock(None)),          // time
+    call(228, NO_PATH, Does::Clock(Some(0))),       // clock_gettime
 ];
 #[cfg(target_arch = "x86_64")]
 const ARCH: u32 = 0xc000_003e; // AUDIT_ARCH_X86_64
@@ -207,6 +273,10 @@ const CALLS: &[Call] = &[
     call(138, NO_PATH, Does::Signal(Target::Process)), // rt_sigqueueinfo
     call(240, NO_PATH, Does::Signal(Target::Process)), // rt_tgsigqueueinfo
     call(424, NO_PATH, Does::Signal(Target::Pidfd)), // pidfd_send_signal
+    call(61, NO_PATH, Does::List(0)),               // getdents64
+    call(278, NO_PATH, Does::Random),               // getrandom
+    call(169, NO_PATH, Does::Clock(None)),          // gettimeofday
+    call(113, NO_PATH, Does::Clock(Some(0))),       // clock_gettime
 ];
 #[cfg(target_arch = "aarch64")]
 const ARCH: u32 = 0xc000_00b7; // AUDIT_ARCH_AARCH64
@@ -287,12 +357,12 @@ fn c(path: &Path) -> CString {
 
 /// Runs `program` sandboxed as `spec` says, or with `None` makes the sandbox and runs
 /// nothing in it. What it ends with, as [`super::backend`] says.
-pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
+pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<i32, String> {
     let unshared = match spec.view {
         Some(_) => None,
         None => namespaces().err(),
     };
-    run_as(spec, program, unshared)
+    run_as(spec, program, unshared, also)
 }
 
 /// [`run`], in namespaces or, with why they can't be made, [`confined`].
@@ -300,7 +370,27 @@ fn run_as(
     spec: &Spec,
     program: Option<&[OsString]>,
     unshared: Option<String>,
+    also: Also<'_>,
 ) -> Result<i32, String> {
+    // The interposer is seen where it is, read-only, and is no input of what runs.
+    let interposer = match also.live.is_some() && spec.record_reads {
+        true => Some(interposer()?),
+        false => None,
+    };
+    let mut with;
+    let spec = match &interposer {
+        Some(file) => {
+            let dir = file.parent().unwrap_or(file).to_owned();
+            with = spec.clone();
+            match &mut with.view {
+                Some(view) => view.binds.push(Bind::read(&dir, &dir)),
+                None => with.readable.push(dir),
+            }
+            with.not_inputs.push(file.clone());
+            &with
+        }
+        None => spec,
+    };
     if let Some(view) = &spec.view {
         check_view(spec, view)?;
     }
@@ -330,7 +420,7 @@ fn run_as(
         }
         None => None,
     };
-    let ran = run_in(spec, program, scratch.as_deref());
+    let ran = run_in(spec, program, scratch.as_deref(), also, interposer.as_deref());
     if let Some(dir) = &scratch {
         _ = std::fs::remove_dir_all(dir);
     }
@@ -398,6 +488,8 @@ fn run_in(
     spec: &Spec,
     program: Option<&[OsString]>,
     scratch: Option<&Path>,
+    also: Also<'_>,
+    interposer: Option<&Path>,
 ) -> Result<i32, String> {
     // Everything the processes of the sandbox use is made before the first fork.
     let argv: Vec<CString> = program
@@ -406,13 +498,16 @@ fn run_in(
         .map(|it| CString::new(it.as_bytes()).unwrap_or_default())
         .collect();
     let tmp = scratch.map(|it| ("TMPDIR".to_owned(), it.display().to_string()));
-    let env: Vec<CString> = spec
-        .env
-        .iter()
-        .filter(|(name, _)| tmp.is_none() || name != "TMPDIR")
-        .chain(tmp.as_ref())
-        .map(|(name, value)| CString::new(format!("{name}={value}")).unwrap_or_default())
-        .collect();
+    let env: Vec<CString> = match also.env {
+        None => spec
+            .env
+            .iter()
+            .filter(|(name, _)| tmp.is_none() || name != "TMPDIR")
+            .chain(tmp.as_ref())
+            .map(|(name, value)| CString::new(format!("{name}={value}")).unwrap_or_default())
+            .collect(),
+        Some(given) => environment(given, tmp.as_ref(), interposer)?,
+    };
     let mut sockets = [0; 2];
     // SAFETY: two descriptors are written into `sockets`.
     if unsafe {
@@ -426,10 +521,22 @@ fn run_in(
     {
         return Err(os("socketpair"));
     }
-    let recorded = program.is_some() && spec.record.is_some();
+    let recorded = program.is_some() && (spec.record.is_some() || also.live.is_some());
     let confining = scratch.is_some();
-    let filter =
-        program.map(|_| filter_program(recorded, spec.record_reads, confining, sockets[1]));
+    let filter = program
+        .map(|_| filter_program(recorded, spec.record_reads, confining, also.network, sockets[1]));
+    let scratch_dir = scratch.map(tidy);
+    let own: Vec<&str> = match &scratch_dir {
+        Some(dir) => CONFINED_OWN.iter().copied().chain([dir.as_str()]).collect(),
+        None => OWN.to_vec(),
+    };
+    let mut recorder = Recorder::new(spec, &own);
+    if let Some(live) = also.live {
+        recorder.live(&live.path)?;
+    }
+    if interposer.is_some() {
+        recorder.interposed();
+    }
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     // Before the fork, so that no signal ends this process before it passes them on; the
     // sandbox's processes that run no program keep the handlers, and pass nothing on.
@@ -454,6 +561,7 @@ fn run_in(
             socket: sockets[1],
             filter: filter.as_deref(),
             viewed: spec.view.is_some(),
+            network: also.network,
         };
         let made_it = match scratch {
             Some(scratch) => confined(spec, scratch, &made, program.is_none()),
@@ -472,19 +580,14 @@ fn run_in(
     unsafe { libc::close(sockets[1]) };
     let listener = received(sockets[0]);
     unsafe { libc::close(sockets[0]) };
-    let scratch_dir = scratch.map(tidy);
-    let own: Vec<&str> = match &scratch_dir {
-        Some(dir) => CONFINED_OWN.iter().copied().chain([dir.as_str()]).collect(),
-        None => OWN.to_vec(),
-    };
-    let mut recorder = Recorder::new(spec, &own);
     let around = match (&spec.view, confining) {
         (Some(_), _) => Around::View,
         (None, true) => Around::Confined(first),
         (None, false) => Around::Namespaces,
     };
+    let mut watch = Watch { around, network: also.network, processes: HashMap::new() };
     if let Some(listener) = listener {
-        supervise(listener, first, &mut recorder, around);
+        supervise(listener, first, &mut recorder, &mut watch);
         unsafe { libc::close(listener) };
     }
     let mut status = 0;
@@ -495,13 +598,68 @@ fn run_in(
     }
     // Its number may be another's now.
     super::pass_signals_to(0);
-    if let (Some(file), true) = (&spec.record, recorded) {
+    if recorded {
         if listener.is_none() {
             recorder.incomplete(0, "the sandbox did not see the program run");
         }
+        recorder.ended();
+    }
+    if let (Some(file), true) = (&spec.record, recorded) {
         recorder.write(file);
     }
+    if let (Some(live), Some(why)) = (also.live, recorder.live_failed()) {
+        live.failed(why);
+    }
     Ok(ended(status))
+}
+
+/// The program's environment: `given` as it is, with the confined sandbox's own `tmp` for
+/// `TMPDIR`, and with `interposer` loaded first (`LD_PRELOAD`, in its place when the program has
+/// one) and told its path ([`INTERPOSING`]). A name or a value with a nul in it can't be in one.
+fn environment(
+    given: &[(OsString, OsString)],
+    tmp: Option<&(String, String)>,
+    interposer: Option<&Path>,
+) -> Result<Vec<CString>, String> {
+    let entry = |name: &[u8], value: &[u8]| {
+        let mut bytes = name.to_vec();
+        bytes.push(b'=');
+        bytes.extend_from_slice(value);
+        CString::new(bytes).map_err(|_| {
+            format!("the variable {:?} has a nul in it", String::from_utf8_lossy(name))
+        })
+    };
+    let mut env = Vec::with_capacity(given.len() + 3);
+    let mut preloaded = false;
+    for (name, value) in given {
+        let (name, value) = (name.as_bytes(), value.as_bytes());
+        if (name == b"TMPDIR" && tmp.is_some()) || name == INTERPOSING.as_bytes() {
+            continue;
+        }
+        match (name, interposer) {
+            // `ours:` and theirs, even empty: the interposer gives back what follows, and
+            // takes the variable away only when it is `ours` alone.
+            (b"LD_PRELOAD", Some(ours)) => {
+                let mut both = ours.as_os_str().as_bytes().to_vec();
+                both.push(b':');
+                both.extend_from_slice(value);
+                env.push(entry(name, &both)?);
+                preloaded = true;
+            }
+            _ => env.push(entry(name, value)?),
+        }
+    }
+    if let Some((name, value)) = tmp {
+        env.push(entry(name.as_bytes(), value.as_bytes())?);
+    }
+    if let Some(ours) = interposer {
+        let ours = ours.as_os_str().as_bytes();
+        if !preloaded {
+            env.push(entry(b"LD_PRELOAD", ours)?);
+        }
+        env.push(entry(INTERPOSING.as_bytes(), ours)?);
+    }
+    Ok(env)
 }
 
 /// What the sandbox's processes are given, made before the first fork.
@@ -514,6 +672,9 @@ struct Made<'a> {
     filter: Option<&'a [libc::sock_filter]>,
     /// Whether the program sees a view ([`Spec::view`]) rather than the machine.
     viewed: bool,
+    /// Whether it may reach the network: there is no network namespace, and a confined one
+    /// is not kept from TCP.
+    network: bool,
 }
 
 /// The code a process that ended with `status` is taken to have ended with.
@@ -536,7 +697,10 @@ fn sandbox(
     made: &Made<'_>,
     probe: bool,
 ) -> Result<i32, String> {
-    let flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWNET | libc::CLONE_NEWIPC;
+    let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWIPC;
+    if !made.network {
+        flags |= libc::CLONE_NEWNET;
+    }
     if unsafe { libc::unshare(flags) } < 0 {
         let refused = std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         let mut why = os("a user namespace (unshare)");
@@ -565,7 +729,9 @@ fn sandbox(
         Some(view) => put_view(view, uid, gid, &spec.env)?,
         None => machine(spec)?,
     }
-    loopback_up()?;
+    if !made.network {
+        loopback_up()?;
+    }
     if unsafe { libc::unshare(libc::CLONE_NEWPID) } < 0 {
         return Err(os("a PID namespace (unshare)"));
     }
@@ -613,7 +779,7 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
     for dir in &spec.writable {
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     }
-    landlock::restrict(&writable)?;
+    landlock::restrict(&writable, made.network)?;
     let cwd = c(&spec.cwd);
     if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
         return Err(os(&format!("the working directory {}", cwd.to_string_lossy())));
@@ -731,9 +897,9 @@ mod landlock {
     }
 
     /// Restricts this process and what it runs: no write but below `writable` and to
-    /// [`DEVICES`], and, where the kernel has them, no TCP `bind` or `connect`, no abstract Unix
-    /// socket and no signal outside.
-    pub(super) fn restrict(writable: &[PathBuf]) -> Result<(), String> {
+    /// [`DEVICES`], and, where the kernel has them, no TCP `bind` or `connect` but with the
+    /// `network`, no abstract Unix socket and no signal outside.
+    pub(super) fn restrict(writable: &[PathBuf], network: bool) -> Result<(), String> {
         let abi = abi()?;
         let mut file = WRITE_FILE;
         let mut dir = WRITE_FILE
@@ -755,7 +921,7 @@ mod landlock {
         }
         let attr = RulesetAttr {
             handled_access_fs: dir,
-            handled_access_net: if abi >= 4 { BIND_TCP | CONNECT_TCP } else { 0 },
+            handled_access_net: if abi >= 4 && !network { BIND_TCP | CONNECT_TCP } else { 0 },
             scoped: if abi >= 6 { SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL } else { 0 },
         };
         // The structure as long as this version knows it.
@@ -1397,11 +1563,14 @@ fn exec(made: &Made<'_>) -> String {
 /// network namespace has only the loopback, so it reaches no address outside, and a Unix
 /// socket of the machine's by `sendmsg` is the residual docs/cargo.md names.) A `confined` run
 /// has no network namespace and no PID namespace: it asks about every call of the network, as
-/// a recorded run does, and about every signal.
+/// a recorded run does, and about every signal; a run with the `network` has no network
+/// namespace either, and asks about every call of the network too. When `reads` are recorded
+/// it asks about listings, randomness and the realtime clock as well.
 fn filter_program(
     recorded: bool,
     reads: bool,
     confined: bool,
+    network: bool,
     socket: libc::c_int,
 ) -> Vec<libc::sock_filter> {
     const LD_W_ABS: u16 = 0x20;
@@ -1451,12 +1620,22 @@ fn filter_program(
             (_, _, Does::Signal(_)) if confined => vec![notify],
             (_, _, Does::Signal(_)) => continue,
             (_, _, Does::Connect) => vec![notify],
-            (false, _, Does::SendMsg) if confined => sendmsg.clone(),
+            (false, _, Does::SendMsg) if confined || network => sendmsg.clone(),
             (false, _, Does::SendTo) => sendto_with_address.clone(),
             (false, _, _) => continue,
             (true, _, Does::SendMsg) => sendmsg.clone(),
+            (true, true, Does::Clock(Some(id))) => {
+                let mut block = vec![insn(LD_W_ABS, 0, 0, low(id))];
+                for (at, clock) in REALTIME.iter().enumerate() {
+                    // To the `notify` after the last comparison and the `allow`.
+                    block.push(insn(JEQ_K, (REALTIME.len() - at) as u8, 0, *clock));
+                }
+                block.extend([allow, notify]);
+                block
+            }
             (true, true, _) | (true, false, Does::Change | Does::Address) => vec![notify],
             (true, false, Does::Look | Does::Run) => continue,
+            (true, false, Does::List(_) | Does::Random | Does::Clock(_)) => continue,
             (true, false, Does::Open(flags)) => {
                 vec![insn(LD_W_ABS, 0, 0, low(flags)), insn(JSET_K, 0, 1, WRITES), notify, allow]
             }
@@ -1557,7 +1736,7 @@ fn received(socket: libc::c_int) -> Option<libc::c_int> {
 /// Answers the kernel's notifications through `listener`, noting what each call reached,
 /// until the process `first` has ended, or no process is left that the filter is on, the
 /// program seeing what `around` says.
-fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder, around: Around) {
+fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder, watch: &mut Watch) {
     let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, first, 0) } as libc::c_int;
     let mut fds = vec![libc::pollfd { fd: listener, events: libc::POLLIN, revents: 0 }];
     if pidfd >= 0 {
@@ -1573,7 +1752,7 @@ fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder,
             break;
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            answer(listener, recorder, around);
+            answer(listener, recorder, watch);
             continue;
         }
         if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0
@@ -1587,15 +1766,82 @@ fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder,
     }
 }
 
+/// What the supervisor keeps beside the record.
+struct Watch {
+    around: Around,
+    /// Whether the program may reach the network ([`Also::network`]).
+    network: bool,
+    /// The process of each thread seen, by the thread's id.
+    processes: HashMap<u64, u64>,
+}
+
+impl Watch {
+    /// The process `thread` is of. A thread not seen before starts in no scope, but the first
+    /// thread of a new process: in the scope the thread that forked it had when it did, which
+    /// is the one it has now, its next mark being taken only once the processes it forked
+    /// before have theirs ([`Watch::forked`]).
+    fn process(&mut self, recorder: &mut Recorder, thread: u64) -> u64 {
+        if let Some(&process) = self.processes.get(&thread) {
+            return process;
+        }
+        let (process, parent) = ids(thread).unwrap_or((thread, 0));
+        let scope = match process == thread && parent > 0 {
+            true => forker(parent, thread).map(|it| recorder.scope(it)).unwrap_or_default(),
+            false => String::new(),
+        };
+        recorder.starts(thread, scope);
+        self.processes.insert(thread, process);
+        process
+    }
+
+    /// `thread` of `process` is about to take another mark, in a call the kernel holds until
+    /// it is answered: each process it forked that is not seen yet starts in the scope it has
+    /// before it does.
+    fn forked(&mut self, recorder: &mut Recorder, thread: u64, process: u64) {
+        let children = std::fs::read_to_string(format!("/proc/{process}/task/{thread}/children"));
+        let scope = recorder.scope(thread);
+        for child in children.unwrap_or_default().split_whitespace().filter_map(|it| it.parse().ok()) {
+            if !recorder.knows(child) {
+                recorder.starts(child, scope.clone());
+                self.processes.insert(child, child);
+            }
+        }
+    }
+}
+
+/// The process (the thread group) and the parent process of `thread`, by `/proc`.
+fn ids(thread: u64) -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string(format!("/proc/{thread}/status")).ok()?;
+    let field = |name: &str| {
+        status.lines().find_map(|it| it.strip_prefix(name)?.trim().parse::<u64>().ok())
+    };
+    Some((field("Tgid:")?, field("PPid:")?))
+}
+
+/// The thread of `parent` that forked `child`, by the children `/proc` lists for each.
+fn forker(parent: u64, child: u64) -> Option<u64> {
+    let threads = std::fs::read_dir(format!("/proc/{parent}/task")).ok()?;
+    threads.flatten().find_map(|it| {
+        let thread: u64 = it.file_name().to_str()?.parse().ok()?;
+        let children = std::fs::read_to_string(it.path().join("children")).ok()?;
+        children.split_whitespace().any(|it| it.parse() == Ok(child)).then_some(thread)
+    })
+}
+
+/// The path the descriptor `fd` of `pid` is open on, made whole.
+fn fd_path(pid: u32, fd: i32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok().map(|it| tidy(&it))
+}
+
 /// Takes one notification, notes what its call reached and lets the call go on.
-fn answer(listener: libc::c_int, recorder: &mut Recorder, around: Around) {
+fn answer(listener: libc::c_int, recorder: &mut Recorder, watch: &mut Watch) {
     let mut notif = Notif::default();
     // SAFETY: `notif` is a zeroed `struct seccomp_notif`.
     if unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notif) } < 0 {
         return;
     }
     let refused = match CALLS.iter().find(|it| it.nr as i32 == notif.nr) {
-        Some(call) => noted(&notif, call, recorder, around),
+        Some(call) => noted(&notif, call, recorder, watch),
         None => None,
     };
     let resp = match refused {
@@ -1612,12 +1858,32 @@ fn answer(listener: libc::c_int, recorder: &mut Recorder, around: Around) {
 /// Notes in `recorder` what the call `notif` of `call` reaches, and the error the sandbox
 /// refuses it with, if it does: a connection or a message to a Unix socket outside the
 /// sandbox's own directories, which no namespace hides; confined, any other address too, and a
-/// signal to a process outside the sandbox.
-fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, around: Around) -> Option<i32> {
+/// signal to a process outside the sandbox; with the network, an abstract Unix socket, which
+/// is the machine's then.
+fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, watch: &mut Watch) -> Option<i32> {
     let (pid, thread) = (notif.pid, u64::from(notif.pid));
-    if let Does::Signal(target) = call.does {
-        let Around::Confined(first) = around else { return None };
-        return signal_outside(pid, target, notif.args[0], first).then_some(libc::EPERM);
+    let process = watch.process(recorder, thread);
+    match call.does {
+        Does::Signal(target) => {
+            let Around::Confined(first) = watch.around else { return None };
+            return signal_outside(pid, target, notif.args[0], first).then_some(libc::EPERM);
+        }
+        Does::List(fd) => {
+            match fd_path(pid, notif.args[fd] as i32) {
+                Some(path) if path.starts_with('/') => recorder.listed(thread, &path),
+                _ => recorder.incomplete(thread, "a directory listed the sandbox could not follow"),
+            }
+            return None;
+        }
+        Does::Random => {
+            recorder.random();
+            return None;
+        }
+        Does::Clock(_) => {
+            recorder.untraceable(thread, Untraceable::Clock);
+            return None;
+        }
+        _ => {}
     }
     let address = |at: usize, len: usize| sockaddr(pid, notif.args[at], len);
     let reached = match call.does {
@@ -1639,8 +1905,13 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, around: Around) ->
     };
     // `bind`'s Unix socket is a file it makes, which the mounts refuse where it may not.
     let to_unix = matches!(call.does, Does::Connect | Does::SendTo | Does::SendMsg);
-    let confined = matches!(around, Around::Confined(_));
+    let confined = matches!(watch.around, Around::Confined(_));
     match reached {
+        // With the network every address is the machine's, the loopback too: what comes back
+        // is not traced.
+        Some(Address::Ip { .. }) if watch.network => {
+            recorder.untraceable(thread, Untraceable::Network)
+        }
         // Confined, the loopback is the machine's, and every address a call reaches is refused
         // as a network namespace with only its own loopback answers it.
         Some(Address::Ip { at, local }) if confined && to_unix => {
@@ -1648,7 +1919,7 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, around: Around) ->
             return Some(if local { libc::ECONNREFUSED } else { libc::ENETUNREACH });
         }
         Some(Address::Ip { at, local: false }) => recorder.refused_net(thread, &at),
-        Some(Address::Abstract(name)) if confined => {
+        Some(Address::Abstract(name)) if confined || watch.network => {
             recorder.refused_net(thread, &format!("unix:@{}", String::from_utf8_lossy(&name)));
             return Some(if to_unix { libc::ECONNREFUSED } else { libc::EACCES });
         }
@@ -1671,14 +1942,32 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, around: Around) ->
         _ => false,
     };
     for &(dir, at, written) in call.paths {
-        let Some(raw) = string_at(pid, notif.args[at]) else { continue };
-        if matches!(call.does, Does::Access(_)) && recorder.marked(thread, &raw) {
-            continue;
-        }
         let dir = dir.map(|it| notif.args[it] as i32);
+        let raw = match string_at(pid, notif.args[at]) {
+            Some(raw) => raw,
+            // `execveat` of the descriptor itself (`fexecve`): what runs is what it is open on.
+            None if matches!(call.does, Does::Run) && recorder.reads() => {
+                match dir.and_then(|it| fd_path(pid, it)) {
+                    Some(path) => path.into_bytes(),
+                    None => {
+                        recorder.incomplete(thread, "a program run from a descriptor the sandbox could not follow");
+                        continue;
+                    }
+                }
+            }
+            None => continue,
+        };
+        if matches!(call.does, Does::Access(_)) {
+            if raw.starts_with(MARK.as_bytes()) {
+                watch.forked(recorder, thread, process);
+            }
+            if recorder.marked(thread, process, &raw) {
+                continue;
+            }
+        }
         let Some(path) = whole(pid, dir, raw) else { continue };
         // In a view what is there is seen through the program's root, not the machine's.
-        let seen = match around {
+        let seen = match watch.around {
             Around::View => format!("/proc/{pid}/root{path}"),
             Around::Namespaces | Around::Confined(_) => path.clone(),
         };
@@ -1688,10 +1977,39 @@ fn noted(notif: &Notif, call: &Call, recorder: &mut Recorder, around: Around) ->
         match call.does {
             _ if !recorder.reads() => {}
             Does::Look | Does::Access(_) => recorder.looked(thread, &path),
+            Does::Run => {
+                recorder.read(thread, &path);
+                ran(recorder, pid, thread, process, &path);
+            }
+            Does::Open(_) | Does::Change if path == "/dev/random" || path == "/dev/urandom" => {
+                recorder.random()
+            }
             _ => recorder.read(thread, &path),
         }
     }
     None
+}
+
+/// `thread` of `process` runs the program at `path`, made whole. One that is not there, or
+/// can't be run, fails to start, and is no program the interposer has to say it is in. Run by
+/// another thread than the process's first, in another scope, its image takes the first's id,
+/// whose scope it can't be told to keep: the process is in none from then on.
+fn ran(recorder: &mut Recorder, pid: u32, thread: u64, process: u64, path: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let inside = format!("/proc/{pid}/root{path}");
+    let runnable = std::fs::metadata(&inside)
+        .is_ok_and(|it| it.is_file() && it.permissions().mode() & 0o111 != 0);
+    if !runnable {
+        return;
+    }
+    let scope = match thread != process && recorder.scope(thread) != recorder.scope(process) {
+        true => {
+            recorder.marked(process, process, MARK.as_bytes());
+            String::new()
+        }
+        false => recorder.scope(thread),
+    };
+    recorder.runs(process, path, scope);
 }
 
 /// Whether a write to `path`, outside where the program may write, is refused by the sandbox
@@ -1897,7 +2215,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use crate::sandbox::{Bind, Reached, Spec, View, read_record};
+    use crate::sandbox::{Also, Bind, Reached, Spec, View, read_record};
 
     #[test]
     fn a_unix_socket_is_where_its_links_lead() {
@@ -1920,14 +2238,142 @@ mod tests {
     #[test]
     fn every_run_refuses_terminal_input_and_io_uring() {
         for (recorded, reads) in [(false, false), (true, false), (true, true)] {
-            for confined in [false, true] {
-                let program = super::filter_program(recorded, reads, confined, 3);
+            for (confined, network) in [(false, false), (true, false), (false, true), (true, true)] {
+                let program = super::filter_program(recorded, reads, confined, network, 3);
                 let has = |k: u32| program.iter().any(|it| it.k == k);
                 assert!(has(super::TIOCSTI) && has(super::TIOCLINUX));
                 assert!(has(super::NR_IO_URING_SETUP) && has(super::X32));
                 assert!(program.len() < u16::MAX as usize);
             }
         }
+    }
+
+    /// A recorded run's filter asks about the realtime clocks and lets the others go by, and
+    /// asks about listings and randomness, only when it records reads.
+    #[test]
+    fn a_filter_asks_about_the_realtime_clock_alone() {
+        let clock_gettime = super::CALLS
+            .iter()
+            .find(|it| matches!(it.does, super::Does::Clock(Some(_))))
+            .expect("clock_gettime")
+            .nr;
+        // Runs the filter as the kernel would over a call's number and its first argument.
+        let run = |program: &[libc::sock_filter], nr: u32, arg: u32| -> u32 {
+            let mut at = 0usize;
+            let mut a = 0u32;
+            loop {
+                let insn = program[at];
+                match insn.code {
+                    0x20 => {
+                        a = match insn.k {
+                            0 => nr,
+                            4 => super::ARCH,
+                            16 => arg,
+                            _ => 0,
+                        }
+                    }
+                    0x06 => return insn.k,
+                    0x15 | 0x35 | 0x45 => {
+                        let taken = match insn.code {
+                            0x15 => a == insn.k,
+                            0x35 => a >= insn.k,
+                            _ => a & insn.k != 0,
+                        };
+                        at += usize::from(if taken { insn.jt } else { insn.jf });
+                    }
+                    other => panic!("an instruction the test does not know: {other:#x}"),
+                }
+                at += 1;
+            }
+        };
+        let reads = super::filter_program(true, true, false, false, 3);
+        for clock in super::REALTIME {
+            assert_eq!(run(&reads, clock_gettime, clock), super::SECCOMP_RET_USER_NOTIF);
+        }
+        assert_eq!(run(&reads, clock_gettime, 1), super::SECCOMP_RET_ALLOW, "CLOCK_MONOTONIC");
+        let no_reads = super::filter_program(true, false, false, false, 3);
+        assert_eq!(run(&no_reads, clock_gettime, 0), super::SECCOMP_RET_ALLOW);
+        for does in [super::Does::Random, super::Does::List(0)] {
+            let nr = super::CALLS
+                .iter()
+                .find(|it| std::mem::discriminant(&it.does) == std::mem::discriminant(&does))
+                .unwrap()
+                .nr;
+            assert_eq!(run(&reads, nr, 0), super::SECCOMP_RET_USER_NOTIF);
+            assert_eq!(run(&no_reads, nr, 0), super::SECCOMP_RET_ALLOW);
+        }
+    }
+
+    /// A traced run of `blaze sandbox --v2` loads the interposer in every process: the program
+    /// sees none of its variables, says it loaded (no `X` line), and its listings are `D` lines.
+    /// Skipped where no sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_traced_run_loads_the_interposer_and_sees_none_of_it() {
+        use blaze_usercode::{confine, trace::{self, Seen}};
+        if let Err(why) = crate::sandbox::probe(crate::sandbox::Probe::V2) {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let dir = scratch("interposer");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("a"), "").unwrap();
+        let script = r#"printf '%s|%s' "${LD_PRELOAD-unset}" "${__BLAZE_INTERPOSE-unset}" > "$OUT/env"
+for it in "$OUT"/*; do :; done
+/bin/sh -c 'printf "%s" "${LD_PRELOAD-unset}" > "$OUT/child"'"#;
+        let spec = confine::Spec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vec![("OUT".into(), out.clone().into()), ("PATH".into(), "/usr/bin:/bin".into())],
+            dir: out.clone(),
+            read: vec![dir.clone()],
+            write: vec![out.clone()],
+            network: false,
+            trace: true,
+            live: dir.join("live"),
+            report: dir.join("report"),
+            not_inputs: vec!["/bin/sh".into()],
+        };
+        assert_eq!(crate::sandbox::v2::launch(&spec), 0);
+        let read = |it: &Path| std::fs::read_to_string(it).unwrap();
+        assert_eq!(read(&out.join("env")), "unset|unset");
+        assert_eq!(read(&out.join("child")), "unset");
+        let text = read(&spec.live);
+        let (lines, _) = trace::parse(&text).unwrap();
+        assert!(!lines.iter().any(|it| it.seen == Seen::Incomplete), "{text}");
+        let listed = super::tidy(&out);
+        assert!(lines.iter().any(|it| it.seen == Seen::Listed && it.what == listed), "{text}");
+        assert_eq!(lines[0], trace::Line::new(Seen::Env, "", trace::ALL_ENV));
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_programs_environment_is_what_it_was_given_with_the_interposer_first() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let lib = Path::new("/c/blaze/sandbox/h/libblaze_sandbox_interpose.so");
+        let given: Vec<(OsString, OsString)> = vec![
+            ("A".into(), OsString::from_vec(b"\xff".to_vec())),
+            ("LD_PRELOAD".into(), "".into()),
+            ("TMPDIR".into(), "/tmp".into()),
+        ];
+        let tmp = ("TMPDIR".to_owned(), "/own".to_owned());
+        let env = super::environment(&given, Some(&tmp), Some(lib)).unwrap();
+        let env: Vec<&[u8]> = env.iter().map(|it| it.as_bytes()).collect();
+        assert_eq!(
+            env,
+            [
+                &b"A=\xff"[..],
+                b"LD_PRELOAD=/c/blaze/sandbox/h/libblaze_sandbox_interpose.so:",
+                b"TMPDIR=/own",
+                b"__BLAZE_INTERPOSE=/c/blaze/sandbox/h/libblaze_sandbox_interpose.so",
+            ]
+        );
+        let plain = super::environment(&given[..1], None, Some(lib)).unwrap();
+        assert_eq!(plain[1].as_bytes(), b"LD_PRELOAD=/c/blaze/sandbox/h/libblaze_sandbox_interpose.so");
+        let nul = vec![("A".into(), OsString::from_vec(b"x\0y".to_vec()))];
+        assert!(super::environment(&nul, None, None).unwrap_err().contains("nul"));
     }
 
     /// A sandbox confined as it is where no user namespace can be made (Ubuntu's AppArmor):
@@ -1993,7 +2439,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
         };
         let program: Vec<OsString> = vec![bash.into(), "-c".into(), script.into()];
         let forced = Some("a user namespace: not made in this test".to_owned());
-        assert_eq!(super::run_as(&spec, Some(&program), forced), Ok(0));
+        assert_eq!(super::run_as(&spec, Some(&program), forced, Also::default()), Ok(0));
         let read = |it: &str| std::fs::read_to_string(out.join(it)).unwrap();
         assert_eq!(read("d/moved"), "hi\n");
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
@@ -2027,7 +2473,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
         else {
             return skip("no bash of the Nix store on PATH");
         };
-        if super::run(&Spec { cwd: "/".into(), ..Spec::default() }, None) != Ok(0) {
+        if super::run(&Spec { cwd: "/".into(), ..Spec::default() }, None, Also::default()) != Ok(0) {
             return skip("no sandbox can be made here");
         }
         let Some(interpreter) = interpreter(&bash) else {
@@ -2078,7 +2524,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
         let env = env.iter().map(|(name, value)| ((*name).to_owned(), value.clone())).collect();
         let spec = Spec { cwd: "/out".into(), env, record, view: Some(view), ..Spec::default() };
         let program: Vec<OsString> = vec![bash.into(), "-c".into(), script.into()];
-        super::run(&spec, Some(&program))
+        super::run(&spec, Some(&program), Also::default())
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -2225,7 +2671,7 @@ echo hi > /out/written
         let made = |binds: Vec<Bind>, overlays: Vec<PathBuf>| {
             let spec =
                 Spec { cwd: "/".into(), overlays, view: Some(View { binds }), ..Spec::default() };
-            super::run(&spec, Some(&["/bin/true".into()])).unwrap_err()
+            super::run(&spec, Some(&["/bin/true".into()]), Also::default()).unwrap_err()
         };
         let why = made(vec![Bind::read("/nix/store/x", &missing)], Vec::new());
         assert!(

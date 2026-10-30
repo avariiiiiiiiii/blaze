@@ -3,19 +3,18 @@
 //!
 //! Segments, in address order: `__PAGEZERO` (an executable's first 4 GiB, unmapped),
 //! `__TEXT` (the headers, code, read-only data, `__unwind_info`, `__eh_frame`: read and
-//! run), `__DATA_CONST` (pointers the loader fixes up and then makes read-only: initializers,
-//! `__DATA_CONST` sections, the C objects' `__compact_unwind`), `__DATA` (the GOT, the jump
-//! table's cells, data, thread-locals, zeroed data), `__DWARF` when the image carries debug
+//! run), `__DATA_CONST` (what the loader fixes up and then makes read-only: the GOT,
+//! initializers, constant data with pointers, the C objects' `__compact_unwind`), `__DATA`
+//! (the jump table's cells, data, thread-locals, zeroed data), `__DWARF` when the image carries debug
 //! info, and `__LINKEDIT` (what dyld reads: the rebase and bind opcodes, the export trie, the
 //! symbol table, the function starts and, last, the code signature, without which macOS on
 //! arm64 kills the program). Addresses the loader fixes up are told it by opcodes
 //! (`LC_DYLD_INFO_ONLY`), not in chains.
 //!
 //! Every region but a zeroed one is in the file at its address less the base, so a region's
-//! offset never moves while its address doesn't. The GOT is in `__DATA`, not `__DATA_CONST`
-//! as ld64 puts it: it holds the thread-local variable descriptors too (`Holds::Tlv`), which
-//! dyld writes and finds by their section's type, so its runs of descriptors are sections of
-//! type `S_THREAD_LOCAL_VARIABLES` of their own.
+//! offset never moves while its address doesn't. dyld finds the thread-local variable
+//! descriptors by their section's type (`S_THREAD_LOCAL_VARIABLES`): they are all in
+//! [`Class::ThreadVars`], C objects' too.
 //!
 //! Names in Mach-O carry a leading underscore and the core's don't ([`core_name`],
 //! [`macho_name`]); a Mach-O name without one (`section$start$...`) is the core's with a
@@ -151,18 +150,20 @@ fn place(class: &Class) -> (Segment, u8) {
         Class::Veneers => (Segment::Text, 4),
         Class::Named { name, .. } => match Segment::of(split(name).0) {
             Some(Segment::Text) => (Segment::Text, 5),
-            Some(Segment::DataConst) => (Segment::DataConst, 2),
-            Some(Segment::Data) | None => (Segment::Data, 4),
+            Some(Segment::DataConst) => (Segment::DataConst, 4),
+            Some(Segment::Data) | None => (Segment::Data, 3),
         },
         Class::Rodata => (Segment::Text, 6),
         Class::Synthetic(_) => (Segment::Text, 7),
         Class::EhFrame => (Segment::Text, 8),
-        Class::InitArray => (Segment::DataConst, 0),
-        Class::FiniArray => (Segment::DataConst, 1),
-        Class::Got => (Segment::Data, 0),
-        Class::Table => (Segment::Data, 1),
-        Class::Data => (Segment::Data, 2),
-        Class::PatchData => (Segment::Data, 3),
+        Class::Got => (Segment::DataConst, 0),
+        Class::InitArray => (Segment::DataConst, 1),
+        Class::FiniArray => (Segment::DataConst, 2),
+        Class::RelRo => (Segment::DataConst, 3),
+        Class::Table => (Segment::Data, 0),
+        Class::Data => (Segment::Data, 1),
+        Class::PatchData => (Segment::Data, 2),
+        Class::ThreadVars => (Segment::Data, 4),
         Class::Tdata => (Segment::Data, 5),
         Class::Tbss => (Segment::Data, 6),
         Class::Bss => (Segment::Data, 7),
@@ -199,16 +200,17 @@ fn section_of(class: &Class) -> (Segment, String, u32) {
         Class::InitArray => ("__mod_init_func", macho::S_MOD_INIT_FUNC_POINTERS),
         Class::FiniArray => ("__mod_term_func", macho::S_MOD_TERM_FUNC_POINTERS),
         Class::Got => ("__got", macho::S_NON_LAZY_SYMBOL_POINTERS),
+        Class::RelRo => ("__const", macho::S_REGULAR),
         Class::Table => ("__blaze_table", macho::S_REGULAR),
         Class::Data => ("__data", macho::S_REGULAR),
         Class::PatchData => ("__blaze_pdata", macho::S_REGULAR),
+        Class::ThreadVars => ("__thread_vars", macho::S_THREAD_LOCAL_VARIABLES),
         Class::Tdata => ("__thread_data", macho::S_THREAD_LOCAL_REGULAR),
         Class::Tbss => ("__thread_bss", macho::S_THREAD_LOCAL_ZEROFILL),
         Class::Bss => ("__bss", macho::S_ZEROFILL),
         Class::Named { name, .. } => {
             let (seg, sect) = split(name);
             let flags = match sect {
-                "__thread_vars" => macho::S_THREAD_LOCAL_VARIABLES,
                 "__thread_init" => macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS,
                 "__cstring" => macho::S_CSTRING_LITERALS,
                 _ => macho::S_REGULAR,
@@ -253,7 +255,7 @@ pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<Secti
         macho::S_MOD_TERM_FUNC_POINTERS => return alloc(Class::FiniArray),
         macho::S_THREAD_LOCAL_REGULAR => return alloc(Class::Tdata),
         macho::S_THREAD_LOCAL_ZEROFILL => return alloc(Class::Tbss),
-        macho::S_THREAD_LOCAL_VARIABLES => return alloc(named("__DATA", "__thread_vars")),
+        macho::S_THREAD_LOCAL_VARIABLES => return alloc(Class::ThreadVars),
         macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS => {
             return alloc(named("__DATA", "__thread_init"));
         }
@@ -291,9 +293,10 @@ pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<Secti
         (_, "__mod_term_func") => alloc(Class::FiniArray),
         ("__DATA", "__thread_data") => alloc(Class::Tdata),
         ("__DATA", "__thread_bss") => alloc(Class::Tbss),
-        ("__DATA", "__thread_vars") => alloc(named("__DATA", "__thread_vars")),
+        ("__DATA", "__thread_vars") => alloc(Class::ThreadVars),
         ("__DATA", "__thread_init") => alloc(named("__DATA", "__thread_init")),
-        ("__DATA", "__data" | "__datacoal_nt" | "__const" | "__const_coal") => alloc(Class::Data),
+        ("__DATA", "__data" | "__datacoal_nt") => alloc(Class::Data),
+        ("__DATA" | "__DATA_CONST", "__const" | "__const_coal") => alloc(Class::RelRo),
         ("__DATA", "__bss" | "__common") => alloc(Class::Bss),
         _ => alloc(named(segment, section)),
     }
@@ -472,18 +475,32 @@ impl Writer for MachO {
             _ => {}
         }
         let name = name.strip_prefix('\x01').unwrap_or(name);
-        if let Some(rest) = name.strip_prefix("section$start$") {
-            let (segment, section) = rest.split_once('$')?;
-            return Self::class_by_name(segment, section).map(Special::Start);
+        for (prefix, end) in [("section$start$", false), ("section$end$", true)] {
+            let Some((segment, section)) = name.strip_prefix(prefix).and_then(|it| it.split_once('$'))
+            else {
+                continue;
+            };
+            return match Self::class_by_name(segment, section)? {
+                Class::Named { name, .. } => Some(Special::Section { name, end }),
+                class if end => Some(Special::Stop(class)),
+                class => Some(Special::Start(class)),
+            };
         }
-        if let Some(rest) = name.strip_prefix("section$end$") {
-            let (segment, section) = rest.split_once('$')?;
-            return Self::class_by_name(segment, section).map(Special::Stop);
-        }
-        if name == "segment$start$__TEXT" {
-            return Some(Special::ImageBase);
-        }
-        None
+        let at: fn(&[Region]) -> u64 = match (name, self.page) {
+            ("segment$start$__TEXT", _) => return Some(Special::ImageBase),
+            ("segment$end$__TEXT", 0x4000) => segment_bound::<0, true, 0x4000>,
+            ("segment$end$__TEXT", _) => segment_bound::<0, true, 0x1000>,
+            ("segment$start$__DATA_CONST", 0x4000) => segment_bound::<1, false, 0x4000>,
+            ("segment$start$__DATA_CONST", _) => segment_bound::<1, false, 0x1000>,
+            ("segment$end$__DATA_CONST", 0x4000) => segment_bound::<1, true, 0x4000>,
+            ("segment$end$__DATA_CONST", _) => segment_bound::<1, true, 0x1000>,
+            ("segment$start$__DATA", 0x4000) => segment_bound::<2, false, 0x4000>,
+            ("segment$start$__DATA", _) => segment_bound::<2, false, 0x1000>,
+            ("segment$end$__DATA", 0x4000) => segment_bound::<2, true, 0x4000>,
+            ("segment$end$__DATA", _) => segment_bound::<2, true, 0x1000>,
+            _ => return None,
+        };
+        Some(Special::Placed(at))
     }
 
     fn read(&self, name: &str, bytes: &[u8], kind: &NativeKind) -> Result<NativeFile, String> {
@@ -514,7 +531,7 @@ impl Writer for MachO {
     }
 
     fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)> {
-        vec![(Class::Synthetic(UNWIND_INFO), unwind::bound(counts.functions, counts.unwind))]
+        vec![(Class::Synthetic(UNWIND_INFO), unwind::bound(counts.functions, counts.fdes, counts.unwind))]
     }
 
     fn apply(
@@ -613,6 +630,20 @@ impl Out {
 
 fn page_up(value: u64, page: u64) -> u64 {
     value.next_multiple_of(page)
+}
+
+/// `segment$start$SEG` (`END` false) or `segment$end$SEG` of the segment `SEGMENT` in
+/// [`Segment`] order: where its first region starts, or the page after its last region's room.
+/// A segment with no regions is empty, both where it would start.
+fn segment_bound<const SEGMENT: u8, const END: bool, const PAGE: u64>(regions: &[Region]) -> u64 {
+    let order = |it: &&Region| place(&it.class).0 as u8;
+    let end_of = |it: &Region| page_up(it.addr + it.capacity, PAGE);
+    let mine = || regions.iter().filter(|it| order(it) == SEGMENT);
+    match (mine().map(|it| it.addr).min(), mine().map(end_of).max()) {
+        (Some(start), Some(end)) => if END { end } else { start },
+        _ => (regions.iter().filter(|it| order(it) < SEGMENT).map(end_of).max())
+            .unwrap_or(BASE + HEADERS),
+    }
 }
 
 fn u32_of(value: u64, what: &str) -> Result<u32, LinkError> {
@@ -734,22 +765,6 @@ impl MachO {
                     false => u32_of(region.addr - base, "a section's file offset")?,
                 };
                 let align = region.align.max(1).trailing_zeros();
-                if region.class == Class::Got {
-                    for (name, addr, size, flags) in got_sections(placed, region)? {
-                        has_tlv |= flags == macho::S_THREAD_LOCAL_VARIABLES && size != 0;
-                        sections.push(SectionOut {
-                            name: name.to_owned(),
-                            segment: segment.name(),
-                            addr,
-                            size,
-                            offset: offset + (addr - region.addr) as u32,
-                            align: 3,
-                            flags,
-                            indirect: 0,
-                        });
-                    }
-                    continue;
-                }
                 let (_, name, flags) = section_of(&region.class);
                 has_tlv |= flags == macho::S_THREAD_LOCAL_VARIABLES && region.size != 0;
                 sections.push(SectionOut {
@@ -884,7 +899,6 @@ impl MachO {
                 addend: bind.addend,
             });
         }
-        let bootstrap = placed.imports.iter().position(|it| it.name == "_tlv_bootstrap");
         for cell in placed.got {
             match &cell.holds {
                 Holds::Local(_) => {}
@@ -899,16 +913,6 @@ impl MachO {
                         addend: 0,
                     });
                 }
-                Holds::Tlv { .. } => binds.push(linkedit::Bind {
-                    addr: cell.addr,
-                    ordinal: match bootstrap {
-                        Some(import) => ordinal(import as u32)?,
-                        None => i64::from(macho::BIND_SPECIAL_DYLIB_FLAT_LOOKUP),
-                    },
-                    name: b"__tlv_bootstrap".to_vec(),
-                    weak: false,
-                    addend: 0,
-                }),
                 other => {
                     return Err(error(format!(
                         "a GOT cell at {:#x} holding {other:?}, which is ELF's and not Mach-O's",
@@ -967,7 +971,12 @@ impl MachO {
         let strings_at = table(&symbols.strings, &mut linkedit)?;
         linkedit.align(16);
         let code_limit = linkedit_at + linkedit.0.len() as u64;
-        let identifier = self.output.name.as_str();
+        let identifier = placed.name;
+        if identifier.is_empty() || identifier.contains(['/', '\0']) {
+            return Err(error(format!(
+                "`{identifier}` is not a file name, which the code signature's identifier is"
+            )));
+        }
         let signature_len = sign::len(identifier, code_limit);
         let linkedit_size = linkedit.0.len() as u64 + signature_len;
         segments.push(SegmentOut {
@@ -1298,43 +1307,4 @@ fn path_command(out: &mut Out, command: u32, at: u32, path: &str, fields: &[u32]
     let start = out.0.len();
     out.0.extend_from_slice(path.as_bytes());
     out.0.resize(start + size - at as usize, 0);
-}
-
-/// The sections of the GOT region: runs of address cells (`__got`) and of thread-local
-/// variable descriptors (`__thread_vars`, which dyld finds by their type).
-fn got_sections(
-    placed: &Placed<'_>,
-    region: &Region,
-) -> Result<Vec<(&'static str, u64, u64, u32)>, LinkError> {
-    let end = region.addr + region.size;
-    let mut cells: Vec<(u64, bool)> = (placed.got.iter())
-        .filter(|it| (region.addr..end).contains(&it.addr))
-        .map(|it| (it.addr, matches!(it.holds, Holds::Tlv { .. })))
-        .collect();
-    cells.sort_unstable();
-    let mut runs: Vec<(u64, bool)> = Vec::new();
-    for (addr, tlv) in cells {
-        if runs.last().is_none_or(|it| it.1 != tlv) {
-            runs.push((if runs.is_empty() { region.addr } else { addr }, tlv));
-        }
-    }
-    if runs.is_empty() {
-        runs.push((region.addr, false));
-    }
-    let mut sections = Vec::new();
-    for (nth, &(start, tlv)) in runs.iter().enumerate() {
-        let stop = runs.get(nth + 1).map_or(end, |it| it.0);
-        let (name, flags) = match tlv {
-            true => ("__thread_vars", macho::S_THREAD_LOCAL_VARIABLES),
-            false => ("__got", macho::S_NON_LAZY_SYMBOL_POINTERS),
-        };
-        if tlv && (stop - start) % 24 != 0 {
-            return Err(error(format!(
-                "thread-local variable descriptors at {start:#x} of {} bytes, not of whole ones",
-                stop - start
-            )));
-        }
-        sections.push((name, start, stop - start, flags));
-    }
-    Ok(sections)
 }

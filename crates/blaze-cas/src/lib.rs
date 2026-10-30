@@ -25,6 +25,8 @@ mod cold;
 mod copy;
 mod crc;
 mod disk;
+mod flags;
+mod index;
 pub mod remote;
 #[cfg(test)]
 mod tests;
@@ -38,14 +40,15 @@ use std::{
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::SchemaHash;
 use blaze_ids::{ContentId, Hasher};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::disk::{
     CHUNK_DOMAIN, DICTIONARY_DOMAIN, DictionaryRef, ExternalRef, Form, HEAD_FILE, Head,
-    IndexRef, Loc, NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, Table,
-    content_of,
+    IndexRef, Loc, NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, content_of,
 };
+use crate::flags::{Flag, Flags, Row};
+use crate::index::{Shape, Table};
 
 /// The format of everything in a store's directory. A store of another refuses to open, naming
 /// both; nothing reads it as this one.
@@ -57,6 +60,15 @@ pub(crate) const FORMAT: u32 = 2;
 const PACK_MOST: u64 = 1 << 30;
 #[cfg(test)]
 const PACK_MOST: u64 = 256 << 10;
+
+/// A value shorter than this stays as it is: compressing it saves less than its index slot costs.
+const DEMOTE_FROM: u64 = 4 << 10;
+
+/// One [`Store::settle`] moves or copies at most this many bytes, so it stays a short step.
+#[cfg(not(test))]
+const SETTLE_MOST: u64 = 256 << 20;
+#[cfg(test)]
+const SETTLE_MOST: u64 = 1 << 20;
 
 /// Outputs from this long on are kept as content-defined chunks.
 const CHUNK_FROM: usize = 256 << 10;
@@ -264,11 +276,35 @@ pub struct Store {
     fetching: FxHashMap<Key, Tag>,
     fetched: Vec<(Key, Fetched)>,
     placed: Vec<Placed>,
-    /// Records whose bytes have been hashed and found to be what was recorded. A mapping and the
-    /// memory of a pack never change the bytes at a place, so once is enough.
-    verified: Mutex<FxHashSet<u64>>,
+    /// Each tier's flag columns: verified, read, tried.
+    flags: Mutex<Vec<Flags>>,
+    /// How many times the own tier's read flags have rotated since its rows were last
+    /// numbered afresh: a record is unread for two periods only once there have been two.
+    periods: u32,
     /// Values made whole to be read (decompressed, or put together from chunks), by place.
     owned: Mutex<FxHashMap<u64, (ContentId, Box<[u8]>)>>,
+}
+
+/// What one [`Store::settle`] did.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Settled {
+    /// Records moved to the cold tier: nothing read them for two periods.
+    pub demoted: u64,
+    /// Records moved to the hot tier: read in two periods running.
+    pub promoted: u64,
+    /// Packs whose live records were copied on; each is removed once that is durable.
+    pub retired: u64,
+    /// It stopped at its budget, or could not start while a commit was in flight: call again.
+    pub more: bool,
+}
+
+/// Why a record's bytes are wanted, which decides whether its check is remembered and
+/// whether it counts as read.
+#[derive(Clone, Copy)]
+enum Use {
+    Read,
+    Check,
+    Move,
 }
 
 /// The tags a store asks with, and what each asked for.
@@ -301,6 +337,8 @@ enum Op {
     WriteExternal { content: ContentId },
     WriteIndex,
     WriteHead,
+    /// A pack whose live records were copied on, removed once the head no longer names it.
+    RemovePack { pack: usize },
     /// `to` removed so `from` can be cloned there.
     Clear { asked: Tag, from: FileName, to: FileName },
     Place { asked: Tag, to: FileName },
@@ -334,11 +372,14 @@ struct Tier {
     opened: bool,
     /// Mappings of the opening still to come.
     waiting: usize,
-    index: Option<Mapping>,
+    /// The index table's mapping, with what was found when it was checked.
+    index: Option<(Mapping, Shape)>,
     packs: Vec<Pack>,
     /// Records the index table does not hold: read from the packs' tails at opening, or put
-    /// since. The number is the record's `seq`.
-    delta: FxHashMap<Key, (Loc, u64)>,
+    /// since.
+    delta: FxHashMap<Key, Delta>,
+    /// The row the next record of the delta gets.
+    next_row: u64,
     externals: FxHashMap<ContentId, External>,
     /// By number, which a compressed record names.
     dictionaries: Vec<Dictionary>,
@@ -355,6 +396,7 @@ impl Tier {
             index: None,
             packs: Vec::new(),
             delta: FxHashMap::default(),
+            next_row: 0,
             externals: FxHashMap::default(),
             dictionaries: Vec::new(),
         }
@@ -370,16 +412,51 @@ impl Tier {
     }
 
     fn table(&self) -> Option<Table<'_>> {
-        self.index.as_ref().and_then(|it| Table::new(it.bytes()).ok())
+        self.index.as_ref().map(|(mapping, shape)| Table::again(mapping.bytes(), *shape))
     }
 
-    fn find(&self, key: &Key) -> Option<Result<Loc, &'static str>> {
-        if let Some((loc, _)) = self.delta.get(key) {
-            return Some(Ok(*loc));
+    fn find(&self, key: &Key) -> Option<Result<(Loc, Row), &'static str>> {
+        if let Some(delta) = self.delta.get(key) {
+            return Some(Ok((delta.loc, Row::Delta(delta.row))));
         }
-        self.table()?.get(key)
+        let (slot, loc) = self.table()?.get(key)?;
+        Some(loc.map(|loc| (loc, Row::Slot(slot))))
+    }
+
+    /// Every record it can find, by key, with its row: the delta's and the table's the delta
+    /// does not shadow. A slot that is not whole is in `bad`.
+    fn rows(&self, bad: &mut Vec<(Key, &'static str)>) -> Vec<(Key, Loc, Row)> {
+        let mut out = Vec::with_capacity(self.delta.len());
+        if let Some(table) = self.table() {
+            out.reserve(table.count() as usize);
+            for (slot, key, loc) in table.iter() {
+                match loc {
+                    Ok(_) if self.delta.contains_key(&key) => {}
+                    Ok(loc) => out.push((key, loc, Row::Slot(slot))),
+                    Err(what) => bad.push((key, what)),
+                }
+            }
+        }
+        out.extend(self.delta.iter().map(|(key, it)| (*key, it.loc, Row::Delta(it.row))));
+        out
+    }
+
+    /// A record of the delta: where, the `seq` of its put, and its row.
+    fn note(&mut self, key: Key, loc: Loc, seq: u64) {
+        let row = self.next_row;
+        self.next_row += 1;
+        self.delta.insert(key, Delta { loc, seq, row });
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+struct Delta {
+    loc: Loc,
+    seq: u64,
+    row: u64,
+}
+
+const _: () = assert!(size_of::<Delta>() == 48);
 
 struct Pack {
     kind: Kind,
@@ -394,6 +471,10 @@ struct Pack {
     committed: u64,
     indexed: u64,
     end: u64,
+    dead: u64,
+    removed: bool,
+    /// Its live records are copied on; the next head names it removed.
+    retiring: bool,
 }
 
 impl Pack {
@@ -480,6 +561,7 @@ impl Store {
     pub fn open(config: Config, effects: &mut Vec<Effect>) -> Store {
         let mut tiers = vec![Tier::new(config.dir.clone())];
         tiers.extend(config.layers.iter().cloned().map(Tier::new));
+        let flags = (0..tiers.len()).map(|_| Flags::default()).collect();
         let mut store = Store {
             tags: Tags { base: config.tags, next: 0, ops: FxHashMap::default() },
             config,
@@ -497,7 +579,8 @@ impl Store {
             fetching: FxHashMap::default(),
             fetched: Vec::new(),
             placed: Vec::new(),
-            verified: Mutex::default(),
+            flags: Mutex::new(flags),
+            periods: 0,
             owned: Mutex::default(),
         };
         for tier in 0..store.tiers.len() {
@@ -531,8 +614,8 @@ impl Store {
     /// The value of `key`, verified; `None` when it has none.
     pub fn get(&self, key: &Key) -> Result<Option<Entry<'_>>, Corrupt> {
         let Some(found) = self.find(key) else { return Ok(None) };
-        let (tier, loc) = found?;
-        self.read(tier, key, loc).map(Some)
+        let (tier, loc, row) = found?;
+        self.read(tier, key, loc, row).map(Some)
     }
 
     /// Whether it has a value of `key`, unverified: for planning, never for use.
@@ -637,6 +720,251 @@ impl Store {
         }
     }
 
+    /// Moves records between the hot tier (raw or LZ4, read in place or nearly) and the cold
+    /// (zstd) by how recently they were read, copies the live records of packs that are half
+    /// replaced bytes into new packs, and commits as [`Store::flush`] does.
+    ///
+    /// Each call ends a period of reading: a record unread for two periods running is moved
+    /// cold, one read in two running moved hot. The daemon calls it when idle, never on the
+    /// way of a get or a put, and it moves a bounded number of bytes a call.
+    pub fn settle(&mut self, effects: &mut Vec<Effect>) -> Settled {
+        assert!(self.tiers[0].opened, "a settle of a store that is not open");
+        self.forget_owned();
+        let mut settled = Settled::default();
+        if self.broken.is_some() {
+            return settled;
+        }
+        if self.commit.is_some() || self.index_mapping {
+            settled.more = true;
+            return settled;
+        }
+        let mut spent = 0;
+        let (mut demote, mut promote) = self.tier_moves();
+        demote.sort_unstable_by_key(|(_, loc, _)| (loc.kind.code(), loc.pack, loc.offset));
+        promote.sort_unstable_by_key(|(_, loc, _)| (loc.pack, loc.offset));
+        'kinds: for group in demote.chunk_by(|a, b| a.1.kind == b.1.kind) {
+            let kind = group[0].1.kind;
+            if self.dictionary_of(kind).is_none() {
+                for &(_, loc, _) in group.iter().filter(|(_, loc, _)| loc.form == Form::Raw) {
+                    self.sample(kind, loc);
+                    if self.dictionary_of(kind).is_some() {
+                        break;
+                    }
+                }
+            }
+            let number = self.dictionary_of(kind);
+            let dictionary = number.map(|number| {
+                self.tiers[0].dictionaries[number as usize]
+                    .bytes
+                    .clone()
+                    .expect("a dictionary of its own is held")
+            });
+            let mut batch = match cold::Batch::new(dictionary.as_deref()) {
+                Ok(batch) => batch,
+                Err(why) => {
+                    self.cannot_compress(kind, why);
+                    return settled;
+                }
+            };
+            for &(key, loc, row) in group {
+                if spent > 0 && spent + loc.raw > SETTLE_MOST {
+                    settled.more = true;
+                    break 'kinds;
+                }
+                let Some((content, bytes)) = self.movable(key, loc, row) else { continue };
+                spent += loc.raw;
+                let long = bytes.len() >= cold::LONG_FROM;
+                let stored = if long { cold::compress_long(&bytes) } else { batch.compress(&bytes) };
+                let stored = match stored {
+                    Ok(stored) => stored,
+                    Err(why) => {
+                        self.cannot_compress(kind, why);
+                        return settled;
+                    }
+                };
+                if stored.len() as u64 + loc.raw / 8 > loc.raw {
+                    lock(&self.flags)[0].set(row, Flag::Tried);
+                    continue;
+                }
+                let dictionary = if long { NO_DICTIONARY } else { number.unwrap_or(NO_DICTIONARY) };
+                self.replace(key, loc, Form::Zstd, dictionary, content, &stored);
+                settled.demoted += 1;
+            }
+        }
+        for (key, loc, row) in promote {
+            if settled.more || (spent > 0 && spent + loc.raw > SETTLE_MOST) {
+                settled.more = true;
+                break;
+            }
+            let Some((content, bytes)) = self.movable(key, loc, row) else { continue };
+            spent += loc.raw;
+            match (loc.kind == Kind::Output).then(|| cold::lz4(&bytes)).flatten() {
+                Some(stored) => self.replace(key, loc, Form::Lz4, 0, content, &stored),
+                None => self.replace(key, loc, Form::Raw, 0, content, &bytes),
+            }
+            settled.promoted += 1;
+        }
+        for at in self.retirable() {
+            if settled.more {
+                break;
+            }
+            let Some(live) = self.live_records(at) else { continue };
+            let bytes: u64 = live.iter().map(|(header, _)| header.span()).sum();
+            if spent > 0 && spent + bytes > SETTLE_MOST {
+                settled.more = true;
+                break;
+            }
+            spent += bytes;
+            for (header, payload) in live {
+                let loc = self.append_record(header, &payload);
+                self.seq += 1;
+                self.tiers[0].note(header.key, loc, self.seq);
+            }
+            self.tiers[0].packs[at].retiring = true;
+            settled.retired += 1;
+        }
+        lock(&self.flags)[0].rotate();
+        self.periods = self.periods.saturating_add(1);
+        self.start_commit(effects);
+        settled
+    }
+
+    /// The own tier's records to move cold and to move hot, as of the period ending now.
+    fn tier_moves(&self) -> (Vec<(Key, Loc, Row)>, Vec<(Key, Loc, Row)>) {
+        let own = &self.tiers[0];
+        let mut bad = Vec::new();
+        let rows = own.rows(&mut bad);
+        let flags = lock(&self.flags);
+        let flags = &flags[0];
+        let (mut demote, mut promote) = (Vec::new(), Vec::new());
+        for (key, loc, row) in rows {
+            let Some(pack) = own.packs.get(loc.pack as usize) else { continue };
+            if pack.removed || pack.retiring || loc.raw < DEMOTE_FROM {
+                continue;
+            }
+            let read = flags.get(row, Flag::Read);
+            let before = flags.get(row, Flag::ReadBefore);
+            match loc.form {
+                Form::Raw | Form::Lz4
+                    if self.periods >= 1 && !read && !before && !flags.get(row, Flag::Tried) =>
+                {
+                    demote.push((key, loc, row));
+                }
+                Form::Zstd if read && before => promote.push((key, loc, row)),
+                _ => {}
+            }
+        }
+        (demote, promote)
+    }
+
+    /// The bytes of a record to move, verified, or `None` with why in the problems.
+    fn movable(&mut self, key: Key, loc: Loc, row: Row) -> Option<(ContentId, Vec<u8>)> {
+        let value = self
+            .value(0, &key, loc, row, Use::Move)
+            .map(|(header, bytes)| (header.content, bytes.into_owned()));
+        match value {
+            Ok(value) => Some(value),
+            Err(corrupt) => {
+                self.problems.push(format!("not moved between tiers: {corrupt}"));
+                None
+            }
+        }
+    }
+
+    /// Appends another record of `key` in place of the one at `old`, whose bytes are then dead.
+    fn replace(
+        &mut self,
+        key: Key,
+        old: Loc,
+        form: Form,
+        dictionary: u32,
+        content: ContentId,
+        payload: &[u8],
+    ) {
+        self.append_value(key, old.kind, form, dictionary, content, old.raw, payload);
+        self.tiers[0].packs[old.pack as usize].dead += disk::aligned(RECORD_HEADER + old.stored);
+    }
+
+    /// The own packs that are at least half dead bytes, wholly committed, not the one their
+    /// kind appends to, and holding no dictionary.
+    fn retirable(&self) -> Vec<usize> {
+        let own = &self.tiers[0];
+        (0..own.packs.len())
+            .filter(|&at| {
+                let pack = &own.packs[at];
+                !pack.removed
+                    && !pack.retiring
+                    && pack.end == pack.committed
+                    && pack.usable == pack.committed
+                    && pack.committed > PACK_HEADER
+                    && pack.dead * 2 >= pack.committed - PACK_HEADER
+                    && own.packs.iter().rposition(|it| it.kind == pack.kind && !it.removed) != Some(at)
+                    && !own.dictionaries.iter().any(|it| it.pack as usize == at)
+            })
+            .collect()
+    }
+
+    /// The records of own pack `at` that are what their key finds, with their payloads; `None`
+    /// with why in the problems when the pack cannot be read through.
+    fn live_records(&mut self, at: usize) -> Option<Vec<(RecordHeader, Vec<u8>)>> {
+        let own = &self.tiers[0];
+        let pack = &own.packs[at];
+        let mut live = Vec::new();
+        let mut offset = PACK_HEADER;
+        let mut why = None;
+        while offset < pack.committed {
+            let Some(start) = pack.bytes(offset, 4) else {
+                why = Some(format!("at {offset} is not mapped"));
+                break;
+            };
+            if start == [0; 4] {
+                let next = disk::blocks(offset);
+                if next == offset {
+                    why = Some(format!("at {offset} is neither a record nor padding"));
+                    break;
+                }
+                offset = next;
+                continue;
+            }
+            let header = match pack.bytes(offset, RECORD_HEADER).map(RecordHeader::decode) {
+                Some(Ok(header)) => header,
+                Some(Err(what)) => {
+                    why = Some(format!("the record at {offset}: {what}"));
+                    break;
+                }
+                None => {
+                    why = Some(format!("the record at {offset} is outside the pack"));
+                    break;
+                }
+            };
+            let here = matches!(
+                own.find(&header.key),
+                Some(Ok((loc, _))) if loc.pack as usize == at && loc.offset == offset
+            );
+            if here && header.form != Form::Dictionary {
+                let Some(payload) = pack.bytes(offset + RECORD_HEADER, header.stored) else {
+                    why = Some(format!("the record at {offset} runs past the pack"));
+                    break;
+                };
+                live.push((header, payload.to_vec()));
+            }
+            offset += header.span();
+        }
+        match why {
+            None => Some(live),
+            Some(why) => {
+                let file = pack.file.clone();
+                self.problems.push(format!("{file} is not rewritten: {why}"));
+                None
+            }
+        }
+    }
+
+    fn remove_pack(&mut self, pack: usize, effects: &mut Vec<Effect>) {
+        let tag = self.tags.ask(Op::RemovePack { pack });
+        effects.push(Effect::Remove { file: self.tiers[0].packs[pack].file.clone(), tag });
+    }
+
     /// Checks every value of `kind` (all, for `None`): what a scrub or the oracle runs.
     pub fn verify(&self, kind: Option<Kind>) -> Vec<Corrupt> {
         let mut out = Vec::new();
@@ -666,25 +994,17 @@ impl Store {
                     });
                 }
             }
-            let mut entries = Vec::new();
-            if let Some(table) = tier.table() {
-                for (key, loc) in table.iter() {
-                    match loc {
-                        Ok(_) if tier.delta.contains_key(&key) => {}
-                        Ok(loc) => entries.push((key, loc)),
-                        Err(what) => {
-                            out.push(Corrupt { key, pack: tier.index_file(), what: what.into() })
-                        }
-                    }
-                }
+            let mut bad = Vec::new();
+            let mut entries = tier.rows(&mut bad);
+            for (key, what) in bad {
+                out.push(Corrupt { key, pack: tier.index_file(), what: what.into() });
             }
-            entries.extend(tier.delta.iter().map(|(key, (loc, _))| (*key, *loc)));
-            entries.sort_unstable_by_key(|(key, loc)| (loc.pack, loc.offset, *key));
-            for (key, loc) in entries {
+            entries.sort_unstable_by_key(|(key, loc, _)| (loc.pack, loc.offset, *key));
+            for (key, loc, row) in entries {
                 if kind.is_some_and(|it| it != loc.kind) {
                     continue;
                 }
-                if let Err(corrupt) = self.value(tier_at, &key, loc, false) {
+                if let Err(corrupt) = self.value(tier_at, &key, loc, row, Use::Check) {
                     out.push(corrupt);
                 }
             }
@@ -710,7 +1030,8 @@ impl Store {
             Refused(String),
         }
         let found = self.find(key)?;
-        let plan = match found.and_then(|(tier, loc)| Ok((tier, loc, self.read(tier, key, loc)?)))
+        let plan = match found
+            .and_then(|(tier, loc, row)| Ok((tier, loc, self.read(tier, key, loc, row)?)))
         {
             Err(corrupt) => Plan::Refused(corrupt.to_string()),
             Ok((tier, loc, entry)) => match self.tiers[tier].externals.get(&entry.content) {
@@ -815,6 +1136,15 @@ impl Store {
                 let fetched = self.take_fetched(key, done);
                 self.fetched.push((key, fetched));
             }
+            Op::RemovePack { pack } => {
+                if !matches!(done, Done::Removed) {
+                    let file = &self.tiers[0].packs[pack].file;
+                    self.problems.push(format!(
+                        "{file} was left behind (it is removed at the next open): {}",
+                        describe(&done)
+                    ));
+                }
+            }
             op => return self.step(op, done, effects),
         }
         Vec::new()
@@ -841,10 +1171,10 @@ impl Store {
 
     // Reading.
 
-    fn find(&self, key: &Key) -> Option<Result<(usize, Loc), Corrupt>> {
+    fn find(&self, key: &Key) -> Option<Result<(usize, Loc, Row), Corrupt>> {
         for (at, tier) in self.tiers.iter().enumerate() {
             match tier.find(key) {
-                Some(Ok(loc)) => return Some(Ok((at, loc))),
+                Some(Ok((loc, row))) => return Some(Ok((at, loc, row))),
                 Some(Err(what)) => {
                     return Some(Err(Corrupt {
                         key: *key,
@@ -863,7 +1193,7 @@ impl Store {
         self.tiers
             .iter()
             .enumerate()
-            .find_map(|(at, tier)| tier.find(key).and_then(Result::ok).map(|loc| (at, loc)))
+            .find_map(|(at, tier)| tier.find(key).and_then(Result::ok).map(|(loc, _)| (at, loc)))
     }
 
     /// The content its record says, unverified.
@@ -873,14 +1203,15 @@ impl Store {
         (header.key == *key).then_some(header.content)
     }
 
-    fn read(&self, tier: usize, key: &Key, loc: Loc) -> Result<Entry<'_>, Corrupt> {
+    fn read(&self, tier: usize, key: &Key, loc: Loc, row: Row) -> Result<Entry<'_>, Corrupt> {
         let id = location(tier, loc.pack, loc.offset);
         if matches!(loc.form, Form::Zstd | Form::Chunked | Form::Lz4) {
             if let Some((content, bytes)) = self.cached(id) {
+                self.was_read(tier, row);
                 return Ok(Entry { key: *key, kind: loc.kind, content, bytes });
             }
         }
-        let (header, bytes) = self.value(tier, key, loc, true)?;
+        let (header, bytes) = self.value(tier, key, loc, row, Use::Read)?;
         let bytes = match bytes {
             Cow::Borrowed(bytes) => bytes,
             Cow::Owned(bytes) => self.keep(id, header.content, bytes),
@@ -888,14 +1219,21 @@ impl Store {
         Ok(Entry { key: *key, kind: header.kind, content: header.content, bytes })
     }
 
-    /// The bytes of the record at `loc`, checked against its content hash (once a place when
-    /// `memo`, every time when not).
+    fn was_read(&self, tier: usize, row: Row) {
+        if tier == 0 {
+            lock(&self.flags)[0].set(row, Flag::Read);
+        }
+    }
+
+    /// The bytes of the record at `loc`, checked against its content hash: once a record for
+    /// reads and moves, every time for [`Use::Check`].
     fn value<'a>(
         &'a self,
         tier_at: usize,
         key: &Key,
         loc: Loc,
-        memo: bool,
+        row: Row,
+        why: Use,
     ) -> Result<(RecordHeader, Cow<'a, [u8]>), Corrupt> {
         let tier = &self.tiers[tier_at];
         let Some(pack) = tier.packs.get(loc.pack as usize) else {
@@ -944,13 +1282,13 @@ impl Store {
                 }
                 let mut whole = Vec::with_capacity(total as usize);
                 for (chunk, len) in chunks {
-                    let (chunk_tier, chunk_loc) = self
+                    let (chunk_tier, chunk_loc, chunk_row) = self
                         .find(&chunk)
                         .ok_or_else(|| corrupt(format!("its chunk {} is not in the store", chunk.0)))??;
-                    if !matches!(chunk_loc.form, Form::Raw | Form::Lz4) {
+                    if !matches!(chunk_loc.form, Form::Raw | Form::Lz4 | Form::Zstd) {
                         return Err(corrupt(format!("its chunk {} is not kept as a chunk", chunk.0)));
                     }
-                    let (_, piece) = self.value(chunk_tier, &chunk, chunk_loc, memo)?;
+                    let (_, piece) = self.value(chunk_tier, &chunk, chunk_loc, chunk_row, why)?;
                     if piece.len() as u64 != len {
                         return Err(corrupt(format!("its chunk {} is of another length", chunk.0)));
                     }
@@ -985,8 +1323,8 @@ impl Store {
                 header.raw
             )));
         }
-        let id = location(tier_at, loc.pack, at);
-        if !(memo && lock(&self.verified).contains(&id)) {
+        let memo = !matches!(why, Use::Check);
+        if !(memo && lock(&self.flags)[tier_at].get(row, Flag::Verified)) {
             let found = content_of(&bytes);
             if found != header.content {
                 return Err(corrupt(format!(
@@ -995,8 +1333,11 @@ impl Store {
                 )));
             }
             if memo {
-                lock(&self.verified).insert(id);
+                lock(&self.flags)[tier_at].set(row, Flag::Verified);
             }
+        }
+        if matches!(why, Use::Read) {
+            self.was_read(tier_at, row);
         }
         Ok((header, bytes))
     }
@@ -1044,7 +1385,7 @@ impl Store {
     /// The own pack of `kind` a record of `span` bytes goes into, made if none has room.
     fn writable_pack(&mut self, kind: Kind, span: u64) -> usize {
         let own = &mut self.tiers[0];
-        if let Some(at) = own.packs.iter().rposition(|it| it.kind == kind) {
+        if let Some(at) = own.packs.iter().rposition(|it| it.kind == kind && !it.removed) {
             let pack = &own.packs[at];
             if pack.end == PACK_HEADER || pack.end + span <= PACK_MOST {
                 return at;
@@ -1069,6 +1410,9 @@ impl Store {
             committed: 0,
             indexed: 0,
             end: PACK_HEADER,
+            dead: 0,
+            removed: false,
+            retiring: false,
         });
         own.packs.len() - 1
     }
@@ -1113,7 +1457,7 @@ impl Store {
         };
         let loc = self.append_record(header, payload);
         self.seq += 1;
-        self.tiers[0].delta.insert(key, (loc, self.seq));
+        self.tiers[0].note(key, loc, self.seq);
         loc
     }
 
@@ -1238,6 +1582,8 @@ impl Store {
                     number: it.number,
                     committed: it.end,
                     indexed: it.indexed,
+                    dead: it.dead,
+                    removed: it.removed || it.retiring,
                 })
                 .collect(),
             dictionaries: own
@@ -1249,23 +1595,15 @@ impl Store {
         };
         let mut index = None;
         if compact {
-            let mut entries = Vec::with_capacity(own.delta.len());
-            if let Some(table) = own.table() {
-                entries.reserve(table.count() as usize);
-                for (key, loc) in table.iter() {
-                    match loc {
-                        Ok(_) if own.delta.contains_key(&key) => {}
-                        Ok(loc) => entries.push((key, loc)),
-                        Err(what) => self.problems.push(format!(
-                            "a slot of {} left out of the next index: {what}",
-                            own.index_file()
-                        )),
-                    }
-                }
+            let mut bad = Vec::new();
+            let rows = own.rows(&mut bad);
+            for (_, what) in bad {
+                self.problems
+                    .push(format!("a slot of {} left out of the next index: {what}", own.index_file()));
             }
-            entries.extend(own.delta.iter().map(|(key, (loc, _))| (*key, *loc)));
+            let mut entries: Vec<(Key, Loc)> = rows.into_iter().map(|(key, loc, _)| (key, loc)).collect();
             entries.sort_unstable_by_key(|(key, _)| *key);
-            let bytes = disk::build_index(&entries);
+            let bytes = index::build_index(&entries);
             let slot = match own.head.index {
                 Some(it) => 1 - it.slot,
                 None => 0,
@@ -1387,6 +1725,19 @@ impl Store {
             pack.indexed = written.indexed;
         }
         own.head = commit.head;
+        let mut removes = Vec::new();
+        for (at, pack) in own.packs.iter_mut().enumerate() {
+            if std::mem::take(&mut pack.retiring) {
+                pack.removed = true;
+                pack.mapping = None;
+                pack.memory = Vec::new();
+                removes.push(at);
+            }
+        }
+        for at in removes {
+            self.remove_pack(at, effects);
+        }
+        let own = &mut self.tiers[0];
         let mut maps = Vec::new();
         for content in &commit.externals {
             let external = own.externals.get_mut(content).expect("a file the commit wrote");
@@ -1460,6 +1811,9 @@ impl Store {
                 committed: it.committed,
                 indexed: it.indexed,
                 end: it.committed,
+                dead: it.dead,
+                removed: it.removed,
+                retiring: false,
             })
             .collect();
         let externals: FxHashMap<ContentId, External> = head
@@ -1479,9 +1833,11 @@ impl Store {
         if let Some(index) = head.index {
             maps.push((tier.file(&disk::index_file(index.slot)), Mapped::Index { seq: None }));
         }
-        for (pack, it) in packs.iter().enumerate() {
+        for (pack, it) in packs.iter().enumerate().filter(|(_, it)| !it.removed) {
             maps.push((it.file.clone(), Mapped::Pack { pack, usable: it.committed }));
         }
+        let removed: Vec<usize> =
+            packs.iter().enumerate().filter(|(_, it)| it.removed).map(|(at, _)| at).collect();
         let mut contents: Vec<&ContentId> = externals.keys().collect();
         contents.sort_unstable();
         for content in contents {
@@ -1505,6 +1861,11 @@ impl Store {
         for (file, what) in maps {
             self.ask_map(at, file, what, effects);
         }
+        if at == 0 {
+            for pack in removed {
+                self.remove_pack(pack, effects);
+            }
+        }
         if self.tiers[at].waiting == 0 {
             self.finish_open(at);
         }
@@ -1523,7 +1884,7 @@ impl Store {
                     );
                 }
                 let pack = &mut tier.packs[pack];
-                if usable >= pack.usable {
+                if !pack.removed && usable >= pack.usable {
                     pack.memory.drain(..(usable - pack.usable) as usize);
                     pack.usable = usable;
                     pack.mapping = Some(mapping);
@@ -1541,14 +1902,23 @@ impl Store {
                 external.memory = None;
             }
             Mapped::Index { seq } => {
-                if let Err(why) = Table::new(mapping.bytes()) {
-                    return self.fail(file, why);
-                }
+                let shape = match Table::new(mapping.bytes()) {
+                    Ok(table) => table.shape(),
+                    Err(why) => return self.fail(file, why),
+                };
                 match seq {
-                    None => tier.index = Some(mapping),
+                    None => tier.index = Some((mapping, shape)),
                     Some(seq) => {
-                        tier.index = Some(mapping);
-                        tier.delta.retain(|_, (_, put)| *put > seq);
+                        tier.index = Some((mapping, shape));
+                        tier.delta.retain(|_, it| it.seq > seq);
+                        let mut rest: Vec<(Key, Delta)> = tier.delta.drain().collect();
+                        rest.sort_unstable_by_key(|(_, it)| it.row);
+                        tier.next_row = 0;
+                        for (key, it) in rest {
+                            tier.note(key, it.loc, it.seq);
+                        }
+                        lock(&self.flags)[at].forget();
+                        self.periods = 0;
                         self.index_mapping = false;
                     }
                 }
@@ -1607,7 +1977,7 @@ impl Store {
 fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
     if let Some(index) = tier.head.index {
         let file = tier.index_file();
-        let mapping =
+        let (mapping, _) =
             tier.index.as_ref().ok_or_else(|| (file.clone(), "it was not mapped".to_owned()))?;
         if mapping.bytes().len() as u64 != index.len {
             return Err((file, format!("it is not the {} bytes its head names", index.len)));
@@ -1621,8 +1991,8 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
             return Err((file, format!("it holds {} values, not the {} its head names", table.count(), index.count)));
         }
     }
-    let mut delta = FxHashMap::default();
-    for (number, pack) in tier.packs.iter().enumerate() {
+    let mut found = Vec::new();
+    for (number, pack) in tier.packs.iter().enumerate().filter(|(_, it)| !it.removed) {
         let fail = |why: String| (pack.file.clone(), why);
         let all = pack.mapping.as_ref().ok_or_else(|| fail("it was not mapped".into()))?.bytes();
         let all = &all[..pack.committed as usize];
@@ -1654,12 +2024,16 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
                     stored: header.stored,
                     raw: header.raw,
                 };
-                delta.insert(header.key, (loc, 0));
+                found.push((header.key, loc));
             }
             at = end;
         }
     }
-    tier.delta = delta;
+    tier.delta = FxHashMap::default();
+    tier.next_row = 0;
+    for (key, loc) in found {
+        tier.note(key, loc, 0);
+    }
     let packs = &tier.packs;
     for dictionary in &mut tier.dictionaries {
         let pack = &packs[dictionary.pack as usize];

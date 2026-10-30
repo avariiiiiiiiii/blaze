@@ -95,6 +95,18 @@ def-site scope; coherence, specialization, drop check, vtables and derives have 
 The hir-ty reads they stand for are narrowed to per-(impl or trait, name) and per-item queries,
 so salsa's own dependencies are no wider than the facts.
 
+## Hardware
+
+docs/v2/plan/design/hardware.md's BLAKE3 row is items': many small inputs, one batched call.
+Every key is a tracked query, so a parent's key and a crate's cfg are hashed once, not once per
+descendant. The keys of a module's, an impl's, a trait's and an enum's members are built as
+preimages and hashed together with `ContentId::of_many` (`key::hash_all`), which gives exactly
+`ContentId::of` per input on every CPU path; `tests::hashes::a_batch_of_keys_is_each_key_alone`
+holds it. Form's sub-forms and index's name hashes batch the same way. Maps keyed by a key are
+`HashMap<_, _, KeyHashing>`, which folds the BLAKE3 bytes it already has instead of hashing them
+again; hashbrown does the SIMD probing. CRC32C, huge pages, NUMA, io_uring and threads are other
+lanes' rows.
+
 ## What other lanes must keep
 
 - Codegen and link name callees by identity (key and instance arguments, including the impls

@@ -11,6 +11,8 @@
   with the same meaning as `Threads::confined`; the shared scripts are where the drivers are
   held to one meaning.
 
+> applied: by core (`a_sandbox_is_made_by_the_confine_or_refused` runs on `Uring` and `Kqueue`).
+
 ## 2. Optional: `Threads::local_addr`, for a TCP port-0 comparison
 
 - What: `pub fn local_addr(&self, listen: Tag) -> Option<std::net::SocketAddr>` on `Threads`,
@@ -20,6 +22,8 @@
 - Why: `uring.rs`'s TCP round trip runs on the ring alone because nothing reads the port back
   off a `Threads` listen; the Unix-socket round trip is compared on both. With it, the TCP one
   can be compared too (and a state machine that listens on port 0 can say where it listens).
+
+> applied: by core (`Threads::local_addr` in `crates/blaze-core/src/threads.rs`).
 
 ## 3. `process::start` on Linux: `clone3`, not `fork` (performance)
 
@@ -37,6 +41,8 @@
   charged to the daemon's cgroup first. `CLONE_PIDFD` hands back the pidfd at creation, so
   `uring.rs` drops its `pidfd_open` call, and no window remains in which the pid is unheld.
 
+> forwarded to core: `process.rs` still starts children through `pre_exec` (lines 127, 135); core is still running.
+
 ## 4. docs/v2/plan/lanes/core/plane.md's watch row: what makes fanotify refuse
 
 - What: after "fanotify, inotify where fanotify needs a privilege the process lacks", add: "A
@@ -47,6 +53,8 @@
   `CAP_SYS_ADMIN` or `CAP_DAC_READ_SEARCH`) means inotify. A daemon running as root on a file
   system without handles (an overlayfs before 6.6, some FUSE or 9p mounts) will fail its
   watches with that error, which whoever runs the VMs should know.
+
+> applied: by core (`docs/v2/plan/lanes/core/plane.md`, the watch row).
 
 ---
 Applied by core: 1 (`a_sandbox_is_made_by_the_confine_or_refused` runs on `Uring` and `Kqueue`

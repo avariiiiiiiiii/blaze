@@ -38,7 +38,22 @@ impl LexedStr<'_> {
     pub fn to_input(&self, edition: Edition) -> crate::Input {
         let _p = tracing::info_span!("LexedStr::to_input").entered();
         let mut res = crate::Input::with_capacity(self.len());
+        self.push_input(&mut res, &mut false, edition);
+        res
+    }
+
+    /// The input of the lexing of `self`'s text followed by `following`'s, when the lexer ends
+    /// a token where `self`'s text ends: `self`'s tokens then `following`'s, neither text lexed
+    /// again.
+    pub fn to_input_followed_by(&self, following: &LexedStr<'_>, edition: Edition) -> crate::Input {
+        let mut res = crate::Input::with_capacity(self.len() + following.len());
         let mut was_joint = false;
+        self.push_input(&mut res, &mut was_joint, edition);
+        following.push_input(&mut res, &mut was_joint, edition);
+        res
+    }
+
+    fn push_input(&self, res: &mut crate::Input, was_joint: &mut bool, edition: Edition) {
         let mut start = 0;
         for i in 0..self.len() {
             let kind = self.kind(i);
@@ -46,7 +61,7 @@ impl LexedStr<'_> {
             let text = &self.as_str()[start..start + len];
             start += len;
             if kind.is_trivia() {
-                was_joint = false
+                *was_joint = false
             } else if kind == SyntaxKind::IDENT {
                 let token_text = text;
                 res.push_ident(
@@ -55,7 +70,7 @@ impl LexedStr<'_> {
                     edition,
                 )
             } else {
-                if was_joint {
+                if *was_joint {
                     res.was_joint();
                 }
                 res.push(kind, edition);
@@ -66,14 +81,13 @@ impl LexedStr<'_> {
                     if !text.ends_with('.') {
                         res.was_joint();
                     } else {
-                        was_joint = false;
+                        *was_joint = false;
                     }
                 } else {
-                    was_joint = true;
+                    *was_joint = true;
                 }
             }
         }
-        res
     }
 
     /// NB: only valid to call with Output from Reparser/TopLevelEntry.

@@ -124,7 +124,7 @@ pub mod closure_analysis {
 /// A constant can have reference to other things. Memory map job is holding
 /// the necessary bits of memory of the const eval session to keep the constant
 /// meaningful.
-#[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, GenericTypeVisitable)]
 pub enum MemoryMap<'db> {
     #[default]
     Empty,
@@ -134,20 +134,43 @@ pub enum MemoryMap<'db> {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)]
 pub struct ComplexMemoryMap<'db> {
-    pub memory: IndexMap<usize, Box<[u8]>, FxBuildHasher>,
+    pub memory: MemoryPieces,
     pub vtable: VTableMap<'db>,
     /// The address ranges that are the memory of a static, as start and size.
     pub statics: Vec<StaticMemory>,
     /// What the address of a piece of `memory` was a multiple of where it was made, for
-    /// those where that is known.
-    aligns: IndexMap<usize, usize, FxBuildHasher>,
+    /// those where that is known: address and alignment, sorted by address.
+    aligns: Vec<(usize, usize)>,
     /// The types of the `TypeId`s the constant may hold, by the ids the evaluation gave them:
     /// those are not rustc's hashes, which whoever emits the constant puts in their place.
     /// `None` for the id of a field reflection made.
     pub type_ids: Vec<Option<Ty<'db>>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl Hash for ComplexMemoryMap<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let ComplexMemoryMap { memory, vtable, statics, aligns, type_ids } = self;
+        memory.hash(state);
+        // `VTableMap`'s ids of types follow from the order of its types.
+        vtable_types(vtable).collect::<Vec<_>>().hash(state);
+        statics.hash(state);
+        aligns.hash(state);
+        type_ids.hash(state);
+    }
+}
+
+/// The types of `vtable` in the order of their ids, which run on without a gap from the first.
+pub(crate) fn vtable_types<'a, 'db>(
+    vtable: &'a VTableMap<'db>,
+) -> impl Iterator<Item = Ty<'db>> + 'a {
+    let first = match vtable.is_empty() {
+        true => None,
+        false => (0usize..).find(|&id| vtable.ty(id).is_ok()),
+    };
+    first.into_iter().flat_map(move |first| (first..).map_while(move |id| vtable.ty(id).ok()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StaticMemory {
     pub start: usize,
     pub size: usize,
@@ -158,22 +181,146 @@ impl<V> rustc_type_ir::GenericTypeVisitable<V> for StaticMemory {
     fn generic_visit_with(&self, _visitor: &mut V) {}
 }
 
-impl ComplexMemoryMap<'_> {
-    pub fn insert(&mut self, addr: usize, val: Box<[u8]>) {
-        match self.memory.entry(addr) {
-            Entry::Occupied(mut e) => {
-                if e.get().len() < val.len() {
-                    e.insert(val);
+/// The pieces of memory a constant points to: their bytes one after another in one buffer, and
+/// a column of where each piece is, sorted by address. Pieces may overlap: a reference into a
+/// value another piece holds is a piece of its own.
+#[derive(Default, Clone)]
+pub struct MemoryPieces {
+    bytes: Vec<u8>,
+    pieces: Vec<Piece>,
+}
+
+/// One piece of [`MemoryPieces`]: the address it is at, and where its bytes are in the buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Piece {
+    address: usize,
+    start: usize,
+    len: usize,
+}
+
+const _: () = assert!(size_of::<Piece>() == 3 * size_of::<usize>());
+
+impl MemoryPieces {
+    pub fn len(&self) -> usize {
+        self.pieces.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
+    fn bytes_of(&self, piece: &Piece) -> &[u8] {
+        &self.bytes[piece.start..piece.start + piece.len]
+    }
+
+    fn position(&self, address: usize) -> Result<usize, usize> {
+        self.pieces.binary_search_by_key(&address, |it| it.address)
+    }
+
+    /// The piece at `address`.
+    pub fn get(&self, address: &usize) -> Option<&[u8]> {
+        let at = self.position(*address).ok()?;
+        Some(self.bytes_of(&self.pieces[at]))
+    }
+
+    pub fn contains_key(&self, address: &usize) -> bool {
+        self.position(*address).is_ok()
+    }
+
+    /// Each piece with its address, lowest address first.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&usize, &[u8])> + DoubleEndedIterator {
+        self.pieces.iter().map(|it| (&it.address, self.bytes_of(it)))
+    }
+
+    /// The piece that holds `address`, with the address it starts at: the piece at `address`,
+    /// or else the lowest one that holds it.
+    fn holding(&self, address: usize) -> Option<(usize, &[u8])> {
+        let end = match self.position(address) {
+            Ok(at) => return Some((address, self.bytes_of(&self.pieces[at]))),
+            Err(end) => end,
+        };
+        self.pieces[..end]
+            .iter()
+            .find(|it| address - it.address < it.len)
+            .map(|it| (it.address, self.bytes_of(it)))
+    }
+
+    /// Keeps `bytes` at `address`, unless the piece already there is as long or longer.
+    pub fn insert(&mut self, address: usize, bytes: &[u8]) {
+        match self.position(address) {
+            Ok(at) => {
+                let piece = &mut self.pieces[at];
+                if piece.len >= bytes.len() {
+                    return;
                 }
+                if piece.start + piece.len == self.bytes.len() {
+                    self.bytes.truncate(piece.start);
+                } else {
+                    piece.start = self.bytes.len();
+                }
+                piece.len = bytes.len();
+                self.bytes.extend_from_slice(bytes);
             }
-            Entry::Vacant(e) => {
-                e.insert(val);
+            Err(at) => {
+                let piece = Piece { address, start: self.bytes.len(), len: bytes.len() };
+                self.pieces.insert(at, piece);
+                self.bytes.extend_from_slice(bytes);
             }
         }
     }
 
+    /// The bytes of every piece, lowest address first, and nothing else: what a piece that
+    /// grew left behind is dropped.
+    pub fn shrink_to_fit(&mut self) {
+        let mut bytes = Vec::with_capacity(self.pieces.iter().map(|it| it.len).sum());
+        for piece in &mut self.pieces {
+            let start = bytes.len();
+            bytes.extend_from_slice(&self.bytes[piece.start..piece.start + piece.len]);
+            piece.start = start;
+        }
+        self.bytes = bytes;
+        self.pieces.shrink_to_fit();
+    }
+}
+
+impl PartialEq for MemoryPieces {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for MemoryPieces {}
+
+impl Hash for MemoryPieces {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_usize(self.len());
+        for (address, bytes) in self.iter() {
+            address.hash(state);
+            bytes.hash(state);
+        }
+    }
+}
+
+impl std::fmt::Debug for MemoryPieces {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl<V> rustc_type_ir::GenericTypeVisitable<V> for MemoryPieces {
+    fn generic_visit_with(&self, _visitor: &mut V) {}
+}
+
+impl ComplexMemoryMap<'_> {
+    pub fn insert(&mut self, addr: usize, val: Box<[u8]>) {
+        self.memory.insert(addr, &val);
+    }
+
     pub fn note_align(&mut self, addr: usize, align: usize) {
-        self.aligns.insert(addr, align);
+        match self.aligns.binary_search_by_key(&addr, |it| it.0) {
+            Ok(at) => self.aligns[at].1 = align,
+            Err(at) => self.aligns.insert(at, (addr, align)),
+        }
     }
 }
 
@@ -192,12 +339,7 @@ impl<'db> MemoryMap<'db> {
         match self {
             MemoryMap::Empty => None,
             MemoryMap::Simple(memory) => (addr == 0).then_some((0, &**memory)),
-            MemoryMap::Complex(map) => match map.memory.get(&addr) {
-                Some(memory) => Some((addr, &**memory)),
-                None => map.memory.iter().find_map(|(&start, memory)| {
-                    (start..start + memory.len()).contains(&addr).then_some((start, &**memory))
-                }),
-            },
+            MemoryMap::Complex(map) => map.memory.holding(addr),
         }
     }
 
@@ -206,7 +348,10 @@ impl<'db> MemoryMap<'db> {
     pub fn align_at(&self, start: usize) -> Option<usize> {
         match self {
             MemoryMap::Empty | MemoryMap::Simple(_) => None,
-            MemoryMap::Complex(map) => map.aligns.get(&start).copied(),
+            MemoryMap::Complex(map) => {
+                let at = map.aligns.binary_search_by_key(&start, |it| it.0).ok()?;
+                Some(map.aligns[at].1)
+            }
         }
     }
 
@@ -239,7 +384,7 @@ impl<'db> MemoryMap<'db> {
         &self,
         mut f: impl FnMut(&[u8], usize) -> Result<usize, MirEvalError<'db>>,
     ) -> Result<FxHashMap<usize, usize>, MirEvalError<'db>> {
-        let mut transform = |(addr, val): (&usize, &[u8])| {
+        let mut transform = |(addr, val): (&usize, &[u8])| -> Result<_, MirEvalError<'db>> {
             let addr = *addr;
             let align = match self.align_at(addr) {
                 Some(align) => align,
@@ -255,9 +400,7 @@ impl<'db> MemoryMap<'db> {
                 map.insert(addr, val);
                 map
             }),
-            MemoryMap::Complex(cm) => {
-                cm.memory.iter().map(|(addr, val)| transform((addr, val))).collect()
-            }
+            MemoryMap::Complex(cm) => cm.memory.iter().map(&mut transform).collect(),
         }
     }
 
@@ -272,6 +415,124 @@ impl<'db> MemoryMap<'db> {
                 MemoryMap::Complex(cm) => cm.memory.get(&addr)?.get(0..size),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_map_tests {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+
+    use super::*;
+
+    fn hash<T: Hash>(value: &T) -> u64 {
+        BuildHasherDefault::<DefaultHasher>::default().hash_one(value)
+    }
+
+    fn pieces(of: &[(usize, &[u8])]) -> MemoryPieces {
+        let mut pieces = MemoryPieces::default();
+        for &(address, bytes) in of {
+            pieces.insert(address, bytes);
+        }
+        pieces
+    }
+
+    #[test]
+    fn pieces_are_sorted_by_address_whatever_order_they_came_in() {
+        let a = pieces(&[(32, &[3, 3]), (8, &[1]), (16, &[2, 2, 2])]);
+        let b = pieces(&[(8, &[1]), (16, &[2, 2, 2]), (32, &[3, 3])]);
+        let seen: Vec<_> = a.iter().map(|(&at, bytes)| (at, bytes.to_vec())).collect();
+        assert_eq!(seen, [(8, vec![1]), (16, vec![2, 2, 2]), (32, vec![3, 3])]);
+        assert_eq!(a, b);
+        assert_eq!(hash(&a), hash(&b));
+        assert_eq!(a.get(&16), Some(&[2, 2, 2][..]));
+        assert_eq!(a.get(&17), None);
+        assert!(a.contains_key(&32) && !a.contains_key(&33));
+        assert_eq!(a.len(), 3);
+    }
+
+    #[test]
+    fn a_longer_piece_at_the_same_address_replaces_a_shorter_one_only() {
+        let mut a = pieces(&[(8, &[1, 1]), (16, &[2])]);
+        a.insert(8, &[9]);
+        assert_eq!(a.get(&8), Some(&[1, 1][..]));
+        a.insert(8, &[4, 4, 4]);
+        a.insert(16, &[5, 5]);
+        assert_eq!(a.get(&8), Some(&[4, 4, 4][..]));
+        assert_eq!(a.get(&16), Some(&[5, 5][..]));
+        let fresh = pieces(&[(16, &[5, 5]), (8, &[4, 4, 4])]);
+        assert_eq!(a, fresh);
+        assert_eq!(hash(&a), hash(&fresh));
+        a.shrink_to_fit();
+        assert_eq!(a.bytes, [4, 4, 4, 5, 5]);
+        assert_eq!(a, fresh);
+    }
+
+    #[test]
+    fn different_pieces_differ() {
+        let a = pieces(&[(8, &[1, 2])]);
+        for other in [pieces(&[(8, &[1, 3])]), pieces(&[(9, &[1, 2])]), pieces(&[(8, &[1])])] {
+            assert_ne!(a, other);
+            assert_ne!(hash(&a), hash(&other));
+        }
+        // The same bytes split differently are other pieces.
+        assert_ne!(hash(&pieces(&[(0, &[1]), (1, &[2, 3])])), hash(&pieces(&[(0, &[1, 2]), (1, &[3])])));
+    }
+
+    #[test]
+    fn memory_at_finds_the_piece_at_an_address_or_the_lowest_holding_it() {
+        let mut map = ComplexMemoryMap::default();
+        map.insert(104, Box::new([7; 4]));
+        map.insert(100, Box::new([6; 16]));
+        map.insert(200, Box::new([]));
+        let map = MemoryMap::Complex(Box::new(map));
+        assert_eq!(map.memory_at(104), Some((104, &[7; 4][..])));
+        assert_eq!(map.memory_at(106), Some((100, &[6; 16][..])));
+        assert_eq!(map.memory_at(115), Some((100, &[6; 16][..])));
+        assert_eq!(map.memory_at(116), None);
+        assert_eq!(map.memory_at(200), Some((200, &[][..])));
+        assert_eq!(map.memory_at(99), None);
+        assert_eq!(map.get(100, 2), Some(&[6, 6][..]));
+        assert_eq!(map.get(101, 2), None);
+        assert_eq!(map.get(104, 5), None);
+    }
+
+    #[test]
+    fn alignments_are_kept_by_address_and_overwritten() {
+        let mut map = ComplexMemoryMap::default();
+        map.insert(64, Box::new([0; 8]));
+        map.note_align(64, 4);
+        map.note_align(8, 2);
+        map.note_align(64, 8);
+        let mut other = ComplexMemoryMap::default();
+        other.note_align(8, 2);
+        other.note_align(64, 8);
+        other.insert(64, Box::new([0; 8]));
+        let (map, other) = (MemoryMap::Complex(Box::new(map)), MemoryMap::Complex(Box::new(other)));
+        assert_eq!(map.align_at(64), Some(8));
+        assert_eq!(map.align_at(8), Some(2));
+        assert_eq!(map.align_at(16), None);
+        assert_eq!(map, other);
+        assert_eq!(hash(&map), hash(&other));
+        let addresses: FxHashMap<usize, usize> = map
+            .transform_addresses(|bytes, align| Ok(bytes.len() * 1000 + align))
+            .unwrap();
+        assert_eq!(addresses.get(&64), Some(&8008));
+    }
+
+    #[test]
+    fn statics_and_kinds_of_map_are_hashed() {
+        let mut with_static = ComplexMemoryMap::default();
+        with_static.statics.push(StaticMemory {
+            start: 8,
+            size: 4,
+            id: salsa::plumbing::FromId::from_id(salsa::Id::from_bits(1)),
+        });
+        let empty = MemoryMap::Complex(Box::default());
+        let with_static = MemoryMap::Complex(Box::new(with_static));
+        assert_ne!(empty, with_static);
+        assert_ne!(hash(&empty), hash(&with_static));
+        assert_ne!(hash(&MemoryMap::Empty), hash(&MemoryMap::simple(Box::new([]))));
+        assert_ne!(hash(&MemoryMap::simple(Box::new([1]))), hash(&MemoryMap::simple(Box::new([2]))));
     }
 }
 

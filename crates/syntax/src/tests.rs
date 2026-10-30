@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ast::HasName;
+use ast::{HasModuleItem, HasName};
 use expect_test::expect_file;
 use parser::Edition;
 use rayon::prelude::*;
@@ -123,6 +123,146 @@ fn self_hosting_parsing() {
             format_to_acc!(acc, "{}: {:?}\n", path.display(), err[0])
         });
         panic!("Parsing errors:\n{errors}\n");
+    }
+}
+
+/// An outline is the full parse once walked: through the cursor, which parses each lazy body
+/// the first time it walks into it, the same tree, and with its bodies the same errors.
+#[test]
+fn outline_is_the_full_parse() {
+    let root = project_root().into_std_path_buf();
+    let mut files = collect_rust_files(
+        &root.join("crates/parser/test_data"),
+        &["parser/ok", "parser/inline/ok"],
+    );
+    let mut sources = Vec::new();
+    for dir in ["crates/syntax/src", "crates/parser/src"] {
+        rust_files_under(&root.join(dir), &mut sources);
+    }
+    files.extend(sources.into_iter().map(|path| {
+        let text = read_text(&path);
+        (path, text)
+    }));
+    assert!(files.len() > 100, "the parser's test data and the sources of syntax and parser");
+
+    let lazies: usize = files
+        .into_par_iter()
+        .map(|(path, text)| {
+            let full = SourceFile::parse(&text, Edition::CURRENT);
+            let outline = SourceFile::parse_outline(text.as_str().into(), Edition::CURRENT);
+            let tree = outline.tree.as_ref().unwrap().flat().clone();
+            let _ = outline.errors();
+            assert!(
+                tree.lazies().all(|at| !tree.is_parsed(at)),
+                "{}: `errors` parsed a body",
+                path.display()
+            );
+
+            let elements = |root: crate::SyntaxNode| {
+                root.preorder_with_tokens()
+                    .filter_map(|event| match event {
+                        crate::WalkEvent::Enter(it) => Some((it.kind(), it.text_range())),
+                        crate::WalkEvent::Leave(_) => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                elements(outline.syntax_node()),
+                elements(full.syntax_node()),
+                "{}: the elements",
+                path.display()
+            );
+            assert_eq!(
+                format!("{:#?}", outline.tree().syntax()),
+                format!("{:#?}", full.tree().syntax()),
+                "{}: the dump",
+                path.display()
+            );
+            assert_eq!(
+                sorted_errors(outline.errors_with_bodies()),
+                sorted_errors(full.errors()),
+                "{}: the errors",
+                path.display()
+            );
+            tree.lazies().count()
+        })
+        .sum();
+    assert!(lazies > 1000, "the outlines left {lazies} bodies lazy");
+}
+
+#[test]
+fn outline_leaves_bodies_lazy() {
+    let text = "
+fn f() { 1 }
+impl S {
+    fn g(&self) -> u8 { 2 }
+}
+const C: () = { fn h() {} };
+fn m() -> u8 { if true { 1 } else { 2 } }
+fn k() { #[a] }
+";
+    let outline = SourceFile::parse_outline(text.into(), Edition::CURRENT);
+    let tree = outline.tree.as_ref().unwrap().flat().clone();
+    let lazy: Vec<&str> = tree.lazies().map(|at| &text[tree.range(at)]).collect();
+    assert_eq!(lazy, ["{ 1 }", "{ 2 }", "{}", "{ if true { 1 } else { 2 } }"]);
+    let errors = sorted_errors(outline.errors());
+    assert!(!errors.is_empty(), "the attribute without an item in `k`, parsed in full");
+    assert!(tree.lazies().all(|at| !tree.is_parsed(at)));
+
+    let fns: Vec<ast::Fn> = outline
+        .tree()
+        .items()
+        .filter_map(|it| match it {
+            ast::Item::Fn(it) => Some(vec![it]),
+            ast::Item::Impl(it) => Some(
+                it.assoc_item_list()?
+                    .assoc_items()
+                    .filter_map(|it| match it {
+                        ast::AssocItem::Fn(it) => Some(it),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let names: Vec<_> = fns
+        .iter()
+        .map(|it| (it.name().unwrap().to_string(), it.body_is_lazy()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("f".to_owned(), true),
+            ("g".to_owned(), true),
+            ("m".to_owned(), true),
+            ("k".to_owned(), false)
+        ]
+    );
+    assert!(tree.lazies().all(|at| !tree.is_parsed(at)), "finding the bodies parsed one");
+
+    assert_eq!(sorted_errors(outline.errors_with_bodies()), errors, "the bodies have none");
+    assert!(tree.lazies().all(|at| tree.is_parsed(at)));
+    let m = fns[2].body().unwrap();
+    assert!(fns[2].body_is_lazy() && m.tail_expr().is_some());
+}
+
+fn sorted_errors(errors: Vec<SyntaxError>) -> Vec<(crate::TextRange, String)> {
+    let mut errors: Vec<_> = errors.into_iter().map(|it| (it.range(), it.to_string())).collect();
+    errors.sort_by_key(|(range, message)| (range.start(), range.end(), message.clone()));
+    errors
+}
+
+/// The `.rs` files under `dir`, at any depth.
+fn rust_files_under(dir: &Path, acc: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files_under(&path, acc);
+        } else if path.extension().unwrap_or_default() == "rs" {
+            acc.push(path);
+        }
     }
 }
 

@@ -28,7 +28,7 @@ fn foo() -> i32 {
                 }
             });
         },
-        &[("InferenceResult < 'db >::for_body_", 1)],
+        &[("infer_body_query", 1)],
         expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -38,7 +38,7 @@ fn foo() -> i32 {
                 "EditionedFileId::parse_",
                 "real_span_map",
                 "Modules < 'db >::module_",
-                "InferenceResult < 'db >::for_body_",
+                "infer_body_query",
                 "FunctionSignature::of_",
                 "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
@@ -79,7 +79,7 @@ fn foo() -> i32 {
                 }
             });
         },
-        &[("InferenceResult < 'db >::for_body_", 0)],
+        &[("infer_body_query", 0)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -123,7 +123,7 @@ fn baz() -> i32 {
                 }
             });
         },
-        &[("InferenceResult < 'db >::for_body_", 3)],
+        &[("infer_body_query", 3)],
         expect_test::expect![[r#"
             [
                 "source_root_crates",
@@ -133,7 +133,7 @@ fn baz() -> i32 {
                 "EditionedFileId::parse_",
                 "real_span_map",
                 "Modules < 'db >::module_",
-                "InferenceResult < 'db >::for_body_",
+                "infer_body_query",
                 "FunctionSignature::of_",
                 "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
@@ -150,7 +150,7 @@ fn baz() -> i32 {
                 "ModuleScope < 'db >::traits_",
                 "ExprScopes::body_expr_scopes_",
                 "body_upvars_mentioned",
-                "InferenceResult < 'db >::for_body_",
+                "infer_body_query",
                 "FunctionSignature::of_",
                 "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
@@ -164,7 +164,7 @@ fn baz() -> i32 {
                 "ModuleScope < 'db >::name_",
                 "ExprScopes::body_expr_scopes_",
                 "body_upvars_mentioned",
-                "InferenceResult < 'db >::for_body_",
+                "infer_body_query",
                 "FunctionSignature::of_",
                 "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
@@ -205,7 +205,7 @@ fn baz() -> i32 {
                 }
             });
         },
-        &[("InferenceResult < 'db >::for_body_", 1)],
+        &[("infer_body_query", 1)],
         expect_test::expect![[r#"
             [
                 "EditionedFileId::parse_",
@@ -223,7 +223,7 @@ fn baz() -> i32 {
                 "body_syntax",
                 "Body::relative_",
                 "Body::of_",
-                "InferenceResult < 'db >::for_body_",
+                "infer_body_query",
                 "ExprScopes::body_expr_scopes_",
                 "body_upvars_mentioned",
                 "AttrFlags::query_",
@@ -600,7 +600,7 @@ fn main() {
                 "ModuleScope < 'db >::legacy_macro_",
                 "ModuleScope < 'db >::name_",
                 "ImplItems::of_",
-                "InferenceResult < 'db >::for_body_",
+                "infer_body_query",
                 "TraitSignature::of_",
                 "TraitSignature::with_source_map_",
                 "AttrFlags::query_",
@@ -617,7 +617,7 @@ fn main() {
                 "fn_sig_for_fn",
                 "ModuleScope < 'db >::traits_",
                 "body_upvars_mentioned",
-                "InferenceResult < 'db >::for_body_",
+                "infer_body_query",
                 "FunctionSignature::of_",
                 "FunctionSignature::with_source_map_",
                 "trait_environment_query",
@@ -717,7 +717,7 @@ fn main() {
                 "Body::of_",
                 "ModuleScope < 'db >::traits_",
                 "FunctionSignature::with_source_map_",
-                "InferenceResult < 'db >::for_body_",
+                "infer_body_query",
                 "ExprScopes::body_expr_scopes_",
                 "ModuleScope < 'db >::legacy_macro_",
                 "ModuleScope < 'db >::name_",

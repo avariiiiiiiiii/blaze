@@ -30,7 +30,7 @@ mod unix {
     use super::super::test;
     use super::{End, Frame, Frames, LONGEST_OUTPUT, MARK, SOCKET, VERSION};
     use ::std::io::{Read, Write};
-    use ::std::os::unix::io::AsRawFd;
+    use ::std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
     use ::std::os::unix::net::UnixStream;
 
     type Int = ::core::ffi::c_int;
@@ -72,6 +72,153 @@ mod unix {
         cut: bool,
         open: bool,
         status: Option<Int>,
+        /// Readable once the child has ended, where each child has one (Linux's pidfd).
+        exit: Option<OwnedFd>,
+    }
+
+    // What wakes the server the moment a child ends, so it never waits on a clock: a pidfd
+    // per child on Linux, one kqueue for all of them on Apple's systems.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    mod exits {
+        use super::{FromRawFd, Int, OwnedFd};
+
+        unsafe extern "C" {
+            fn syscall(number: ::core::ffi::c_long, ...) -> ::core::ffi::c_long;
+        }
+
+        /// `pidfd_open`, the same number on every Linux architecture.
+        const PIDFD_OPEN: ::core::ffi::c_long = 434;
+
+        pub fn queue() -> Result<Option<OwnedFd>, String> {
+            Ok(None)
+        }
+
+        /// The child's pidfd, which is close-on-exec. `pid` is not reaped yet, so it is there
+        /// even if it has ended.
+        pub fn watch(_queue: &Option<OwnedFd>, pid: Int) -> Result<(Option<OwnedFd>, bool), String> {
+            // SAFETY: `pidfd_open(pid, 0)` takes two integers and returns a descriptor or -1.
+            let fd = unsafe { syscall(PIDFD_OPEN, pid as ::core::ffi::c_long, 0 as ::core::ffi::c_long) };
+            if fd < 0 {
+                return Err(format!("pidfd_open: {}", ::std::io::Error::last_os_error()));
+            }
+            // SAFETY: the descriptor was just made and nothing else owns it.
+            Ok((Some(unsafe { OwnedFd::from_raw_fd(fd as Int) }), false))
+        }
+
+        pub fn clear(_queue: &Option<OwnedFd>) {}
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))]
+    mod exits {
+        use super::{AsRawFd, FromRawFd, Int, OwnedFd};
+
+        #[repr(C)]
+        struct Kevent {
+            ident: usize,
+            filter: i16,
+            flags: u16,
+            fflags: u32,
+            data: isize,
+            udata: *mut ::core::ffi::c_void,
+        }
+
+        #[repr(C)]
+        struct Timespec {
+            seconds: ::core::ffi::c_long,
+            nanoseconds: ::core::ffi::c_long,
+        }
+
+        const EVFILT_PROC: i16 = -5;
+        const EV_ADD: u16 = 0x1;
+        const EV_ONESHOT: u16 = 0x10;
+        const NOTE_EXIT: u32 = 0x8000_0000;
+        const ESRCH: i32 = 3;
+
+        unsafe extern "C" {
+            fn kqueue() -> Int;
+            fn kevent(
+                queue: Int,
+                changes: *const Kevent,
+                changed: Int,
+                events: *mut Kevent,
+                most: Int,
+                timeout: *const Timespec,
+            ) -> Int;
+        }
+
+        /// A kqueue, which a forked child doesn't inherit.
+        pub fn queue() -> Result<Option<OwnedFd>, String> {
+            // SAFETY: a plain call.
+            let fd = unsafe { kqueue() };
+            if fd < 0 {
+                return Err(format!("kqueue: {}", ::std::io::Error::last_os_error()));
+            }
+            // SAFETY: the descriptor was just made and nothing else owns it.
+            Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
+
+        /// Asks the kqueue for `pid`'s end. A child that has already ended can't be watched
+        /// (`ESRCH`): the server looks at once instead.
+        pub fn watch(queue: &Option<OwnedFd>, pid: Int) -> Result<(Option<OwnedFd>, bool), String> {
+            let queue = queue.as_ref().expect("a kqueue on this system");
+            let change = Kevent {
+                ident: pid as usize,
+                filter: EVFILT_PROC,
+                flags: EV_ADD | EV_ONESHOT,
+                fflags: NOTE_EXIT,
+                data: 0,
+                udata: ::core::ptr::null_mut(),
+            };
+            // SAFETY: one change from a live struct, no events back.
+            let done = unsafe { kevent(queue.as_raw_fd(), &change, 1, ::core::ptr::null_mut(), 0, ::core::ptr::null()) };
+            if done < 0 {
+                let error = ::std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(ESRCH) {
+                    return Ok((None, true));
+                }
+                return Err(format!("kevent: {}", error));
+            }
+            Ok((None, false))
+        }
+
+        /// Takes the ends the kqueue has, so it is not readable for them again; `waitpid`
+        /// says which children they were.
+        pub fn clear(queue: &Option<OwnedFd>) {
+            let queue = queue.as_ref().expect("a kqueue on this system");
+            let zero = Timespec { seconds: 0, nanoseconds: 0 };
+            // SAFETY: integers and a raw pointer, for which zero is a value.
+            let mut events: [Kevent; 16] = unsafe { ::core::mem::zeroed() };
+            loop {
+                // SAFETY: `events` holds 16 entries, and the call doesn't wait.
+                let got = unsafe { kevent(queue.as_raw_fd(), ::core::ptr::null(), 0, events.as_mut_ptr(), 16, &zero) };
+                if got < 16 {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    )))]
+    mod exits {
+        use super::{Int, OwnedFd};
+
+        pub fn queue() -> Result<Option<OwnedFd>, String> {
+            Err("blaze's fork server waits on a pidfd (Linux) or a kqueue (Apple), and this system has neither it knows; the package must run its tests as libtest's threads".to_owned())
+        }
+
+        pub fn watch(_queue: &Option<OwnedFd>, _pid: Int) -> Result<(Option<OwnedFd>, bool), String> {
+            Err("no way to wait on a child here".to_owned())
+        }
+
+        pub fn clear(_queue: &Option<OwnedFd>) {}
     }
 
     pub fn serve(tests: &'static [&'static test::TestDescAndFn], socket: &::std::ffi::OsStr) -> Result<(), String> {
@@ -80,6 +227,9 @@ mod unix {
         unsafe {
             ::std::env::remove_var(SOCKET);
         }
+        let queue = exits::queue()?;
+        // A child ended before its end could be watched: the next poll doesn't wait.
+        let mut now = false;
         let mut stream = connect(socket)?;
         let names: Vec<String> = tests.iter().map(|it| it.desc.name.as_slice().to_owned()).collect();
         send(&mut stream, &Frame::Hello { version: VERSION, pid: ::std::process::id(), tests: names })?;
@@ -97,8 +247,16 @@ mod unix {
             for &at in &watched {
                 fds.push(PollFd { fd: children[at].output.as_raw_fd(), events: POLLIN, revents: 0 });
             }
-            // A child's end is seen by `waitpid`, so the wait is short while any runs.
-            let timeout = if children.is_empty() { -1 } else { 5 };
+            if let Some(queue) = &queue {
+                fds.push(PollFd { fd: queue.as_raw_fd(), events: POLLIN, revents: 0 });
+            }
+            for child in children.iter().filter(|it| it.status.is_none()) {
+                if let Some(exit) = &child.exit {
+                    fds.push(PollFd { fd: exit.as_raw_fd(), events: POLLIN, revents: 0 });
+                }
+            }
+            let timeout = if now { 0 } else { -1 };
+            now = false;
             // SAFETY: `fds` holds `fds.len()` entries for the length of the call.
             let ready = unsafe { poll(fds.as_mut_ptr(), fds.len() as Nfds, timeout) };
             if ready < 0 {
@@ -134,7 +292,20 @@ mod unix {
                     };
                     match frame {
                         Frame::Run { id, index } => match start(tests, id, index, &stream, &children) {
-                            Ok(child) => children.push(child),
+                            Ok(mut child) => {
+                                match exits::watch(&queue, child.pid) {
+                                    Ok((exit, ended)) => {
+                                        child.exit = exit;
+                                        now |= ended;
+                                    }
+                                    Err(why) => {
+                                        children.push(child);
+                                        kill_all(&mut children);
+                                        return Err(why);
+                                    }
+                                }
+                                children.push(child);
+                            }
                             Err(why) => {
                                 let ended = Frame::Ended { id: id, end: End::NotStarted(why), output: Vec::new() };
                                 if let Err(why) = send(&mut stream, &ended) {
@@ -160,6 +331,9 @@ mod unix {
                 if fds[slot + 1].revents != 0 {
                     drain(&mut children[at]);
                 }
+            }
+            if queue.is_some() && fds[watched.len() + 1].revents != 0 {
+                exits::clear(&queue);
             }
             reap(&mut children);
             let mut at = 0;
@@ -237,6 +411,9 @@ mod unix {
                 close(ours.as_raw_fd());
                 for child in children {
                     close(child.output.as_raw_fd());
+                    if let Some(exit) = &child.exit {
+                        close(exit.as_raw_fd());
+                    }
                 }
                 dup2(theirs.as_raw_fd(), 1);
                 dup2(theirs.as_raw_fd(), 2);
@@ -255,7 +432,7 @@ mod unix {
         unsafe { setpgid(pid, pid) };
         drop(theirs);
         ours.set_nonblocking(true).map_err(|error| format!("the test's output socket: {}", error))?;
-        Ok(Child { id: id, pid: pid, output: ours, bytes: Vec::new(), cut: false, open: true, status: None })
+        Ok(Child { id: id, pid: pid, output: ours, bytes: Vec::new(), cut: false, open: true, status: None, exit: None })
     }
 
     fn drain(child: &mut Child) {

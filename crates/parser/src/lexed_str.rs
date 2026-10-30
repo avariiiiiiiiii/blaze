@@ -33,11 +33,16 @@ use crate::{
 /// (`to_input`, `intersperse_trivia`) keeps a running offset instead.
 pub struct LexedStr<'a> {
     text: &'a str,
-    tokens: Vec<u32>,
+    tokens: Vec<Token>,
     checkpoints: Vec<u32>,
     long: Vec<(u32, u32)>,
     error: Vec<LexError>,
 }
+
+/// A packed token: kind and length.
+type Token = u32;
+
+const _: () = assert!(size_of::<Token>() == 4, "a token is 4 bytes (docs/v2/plan/design/data.md)");
 
 const KIND_BITS: u32 = 10;
 const KIND_MASK: u32 = (1 << KIND_BITS) - 1;
@@ -567,5 +572,28 @@ mod tests {
         let kinds: Vec<_> = (0..lexed.len()).map(|i| lexed.kind(i)).collect();
         assert!(kinds.contains(&STRING) && kinds.contains(&COMMENT) && kinds.contains(&FN_KW));
         assert_eq!(LexedStr::single_token(Edition::CURRENT, &long_string).map(|it| it.0), Some(STRING));
+    }
+
+    /// Two lexings' input, one after the other, is the input of their texts lexed as one, split
+    /// at any token boundary.
+    #[test]
+    fn input_followed_by_is_the_joined_input() {
+        let text = "fn f() -> u8 { x.0.1 + 1. ; union::default; a::<'b>>=c /* d */ }";
+        let edition = Edition::CURRENT;
+        let whole = LexedStr::new(edition, text);
+        let input = |it: &crate::Input| {
+            (0..it.len())
+                .map(|i| (it.kind(i), it.contextual_kind(i), it.is_joint(i)))
+                .collect::<Vec<_>>()
+        };
+        let expected = input(&whole.to_input(edition));
+        for split in 0..=whole.len() {
+            let at = whole.text_start(split);
+            let (head, tail) = (LexedStr::new(edition, &text[..at]), LexedStr::new(edition, &text[at..]));
+            if head.len() + tail.len() != whole.len() {
+                continue;
+            }
+            assert_eq!(input(&head.to_input_followed_by(&tail, edition)), expected, "split at {at}");
+        }
     }
 }

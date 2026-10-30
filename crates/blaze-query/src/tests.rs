@@ -558,6 +558,122 @@ fn asking_what_is_not_there_is_an_error() {
 }
 
 #[test]
+fn the_database_is_shared_by_reference() {
+    fn shared<T: Send + Sync>() {}
+    shared::<Database>();
+}
+
+static HELD: AtomicUsize = AtomicUsize::new(0);
+static RELEASED: AtomicUsize = AtomicUsize::new(0);
+static ASKING: AtomicUsize = AtomicUsize::new(0);
+
+/// Runs until [`RELEASED`] is set, holding its key.
+struct Hold;
+
+impl Query for Hold {
+    const KIND: QueryKind = QueryKind(0x2f08);
+    const NAME: &'static str = "hold";
+    const PRODUCER: ContentId = ContentId([10; 32]);
+    type Key = ();
+    type Value = Num;
+    fn input(_: &()) -> ContentId {
+        key_id("hold")
+    }
+    fn execute(_: &mut Cx<'_>, _: &()) -> Result<Num, Cancelled> {
+        HELD.store(1, Ordering::SeqCst);
+        while RELEASED.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(Num(5))
+    }
+}
+
+/// 1 + [`Hold`]: a query that waits, inside its run, for a key another task runs.
+struct AsksHold;
+
+impl Query for AsksHold {
+    const KIND: QueryKind = QueryKind(0x2f09);
+    const NAME: &'static str = "asks hold";
+    const PRODUCER: ContentId = ContentId([11; 32]);
+    type Key = ();
+    type Value = Num;
+    fn input(_: &()) -> ContentId {
+        key_id("asks hold")
+    }
+    fn execute(cx: &mut Cx<'_>, _: &()) -> Result<Num, Cancelled> {
+        ASKING.store(1, Ordering::SeqCst);
+        Ok(Num(1 + cx.get::<Hold>(&())?))
+    }
+}
+
+/// A query waiting on a worker pumps the pool: a job pumped above it may ask the database (it is
+/// a task of its own, not the query), and one that asks the key the query below it holds is
+/// cancelled at once rather than waiting for a run that can't go on until it returns.
+#[test]
+fn a_job_pumped_under_a_waiting_query_asks_as_a_task_of_its_own() {
+    use blaze_graph::{pool::Pool, topology::Topology};
+    use std::{sync::mpsc, time::Duration};
+
+    let tree = Arc::new(MemTree::default());
+    let mut db = Database::new(config(&tree));
+    register(&mut db);
+    db.register::<Hold>();
+    db.register::<AsksHold>();
+    let db = Arc::new(db);
+    let one = view(&db, &tree, &[("a", "abc")]);
+    let pool = Pool::new(&Topology::flat(1), false).expect("a pool");
+    let wait = |flag: &AtomicUsize| {
+        let until = std::time::Instant::now() + Duration::from_secs(60);
+        while flag.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < until, "timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+
+    std::thread::scope(|scope| {
+        let holder = scope.spawn(|| db.get::<Hold>(one, &()));
+        wait(&HELD);
+
+        let (asked, heard) = mpsc::channel();
+        {
+            let (db, asked) = (db.clone(), asked.clone());
+            pool.submit(None, move || db.get::<AsksHold>(one, &()), move |it| _ = asked.send(("asks", it)));
+        }
+        wait(&ASKING);
+        std::thread::sleep(Duration::from_millis(50));
+
+        {
+            let (db, asked) = (db.clone(), asked.clone());
+            pool.submit(
+                None,
+                move || {
+                    let depth = blaze_graph::pump::depth() as u64;
+                    db.get::<Len>(one, &"a".to_owned()).map(|len| len * 100 + depth)
+                },
+                move |it| _ = asked.send(("len", it)),
+            );
+        }
+        let (name, len) = heard.recv_timeout(Duration::from_secs(60)).expect("the pumped job ran");
+        assert_eq!(name, "len", "the one worker is the waiting query's: only a pump runs this");
+        assert_eq!(len.expect("no panic"), Ok(301), "len 3, asked from pump depth 1");
+
+        {
+            let (db, asked) = (db.clone(), asked.clone());
+            pool.submit(None, move || db.get::<AsksHold>(one, &()), move |it| _ = asked.send(("again", it)));
+        }
+        let (name, again) = heard.recv_timeout(Duration::from_secs(60)).expect("not a deadlock");
+        assert_eq!(name, "again");
+        assert_eq!(again.expect("no panic"), Err(DbError::Cancelled));
+
+        RELEASED.store(1, Ordering::SeqCst);
+        assert_eq!(holder.join().expect("the holder"), Ok(5));
+        let (name, asks) = heard.recv_timeout(Duration::from_secs(60)).expect("the waiting query ended");
+        assert_eq!(name, "asks");
+        assert_eq!(asks.expect("no panic"), Ok(6));
+    });
+}
+
+#[test]
 fn edges_round_trip_through_their_record() {
     let edge = Edge {
         read: QueryKey { kind: QueryKind(0x1234), input: ContentId([0xab; 32]) },

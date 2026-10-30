@@ -100,7 +100,17 @@ pub(crate) enum Form {
     /// LZ4 (a block, no frame): for chunks, which are copied out anyway when their value is
     /// assembled, so decompressing them costs little more than the copy.
     Lz4,
+    /// The value's columns bit-packed ([`crate::Columns::warm`]), read in place: the payload is
+    /// the schema of the value ([`SCHEMA_PREFIX`] bytes), then the warm bytes.
+    Warm,
+    /// A codec per column ([`crate::Columns::cold`]), decoded when read: the payload is the
+    /// schema of the value, then the cold bytes.
+    ColdColumns,
 }
+
+/// What a [`Form::Warm`] or [`Form::ColdColumns`] payload starts with: the schema whose
+/// encodings made it. A multiple of 16, so warm bytes keep the record's alignment.
+pub(crate) const SCHEMA_PREFIX: usize = 32;
 
 impl Form {
     pub(crate) const fn code(self) -> u8 {
@@ -111,6 +121,8 @@ impl Form {
             Form::External => 3,
             Form::Dictionary => 4,
             Form::Lz4 => 5,
+            Form::Warm => 6,
+            Form::ColdColumns => 7,
         }
     }
 
@@ -122,6 +134,8 @@ impl Form {
             3 => Some(Form::External),
             4 => Some(Form::Dictionary),
             5 => Some(Form::Lz4),
+            6 => Some(Form::Warm),
+            7 => Some(Form::ColdColumns),
             _ => None,
         }
     }
@@ -231,6 +245,9 @@ pub(crate) fn decode_chunks(payload: &[u8]) -> Result<Vec<(Key, u64)>, &'static 
 
 // Where records are.
 
+const _: () = assert!(size_of::<Key>() == 32);
+const _: () = assert!(size_of::<Loc>() == 32, "a place in the delta and the index is 32 bytes");
+
 /// Where a record is, and enough of it to plan with: one slot of the index table, or an entry
 /// of the in-memory delta.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -248,10 +265,11 @@ pub(crate) struct Loc {
 
 const HEAD_MAGIC: [u8; 8] = *b"BLZHEAD\x03";
 const HEAD_FIXED: usize = 8 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 4 + 4 + 4 + 4;
-const PACK_REF: usize = 24;
+const PACK_REF: usize = 32;
 const DICTIONARY_REF: usize = 16;
 const EXTERNAL_REF: usize = 40;
 const HEAD_CHECK: usize = 4;
+const _: () = assert!(HEAD_FIXED == 72 && PACK_REF == 32);
 
 /// The index table a head names: which of the two slots, its length and its CRC-32C.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -271,6 +289,12 @@ pub(crate) struct PackRef {
     /// How far the index table covers it; records from here to `committed` are found by
     /// reading their headers when the store opens.
     pub indexed: u64,
+    /// The bytes of its records that another record of the same key has replaced (moved to
+    /// another tier, or out of a pack being rewritten).
+    pub dead: u64,
+    /// Its live records were all copied on and the file is gone, or going: it is not mapped.
+    /// It keeps its place in the list, which is the number index slots name.
+    pub removed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -328,10 +352,12 @@ impl Head {
         debug_assert_eq!(out.len(), HEAD_FIXED);
         for pack in &self.packs {
             out.push(pack.kind.code());
-            out.extend_from_slice(&[0; 3]);
+            out.push(u8::from(pack.removed));
+            out.extend_from_slice(&[0; 2]);
             out.extend_from_slice(&pack.number.to_le_bytes());
             out.extend_from_slice(&pack.committed.to_le_bytes());
             out.extend_from_slice(&pack.indexed.to_le_bytes());
+            out.extend_from_slice(&pack.dead.to_le_bytes());
         }
         for dictionary in &self.dictionaries {
             out.push(dictionary.kind.code());
@@ -391,11 +417,18 @@ impl Head {
         let mut head = Head { generation, index, ..Head::default() };
         for _ in 0..packs {
             let kind = Kind::from_code(body[at]).ok_or("a pack of no kind")?;
+            let removed = match body[at + 1] {
+                0 => false,
+                1 => true,
+                _ => return Err("a pack neither kept nor removed".into()),
+            };
             head.packs.push(PackRef {
                 kind,
                 number: u32_at(body, at + 4),
                 committed: u64_at(body, at + 8),
                 indexed: u64_at(body, at + 16),
+                dead: u64_at(body, at + 24),
+                removed,
             });
             at += PACK_REF;
         }
@@ -413,7 +446,11 @@ impl Head {
             at += EXTERNAL_REF;
         }
         for pack in &head.packs {
-            if pack.indexed > pack.committed || pack.committed < PACK_HEADER || pack.committed % BLOCK != 0 {
+            if pack.indexed > pack.committed
+                || pack.dead > pack.committed
+                || pack.committed < PACK_HEADER
+                || pack.committed % BLOCK != 0
+            {
                 return Err(format!("pack {} has impossible lengths", pack_file(pack.kind, pack.number)));
             }
         }

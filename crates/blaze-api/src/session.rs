@@ -91,8 +91,15 @@ impl Sink {
 enum Kind {
     Commit { root: ContentId, rebased: bool, ticket: Ticket, head: String },
     /// One job of the build, with the views it holds, and the one whose database view is kept
-    /// for [`Request::Why`] when it ends.
-    Job { job: JobId, cancelled: bool, views: Vec<Opened>, kept: Option<Opened> },
+    /// for [`Request::Why`] when it ends. `owes_work` until a build, test or run has reported
+    /// [`Response::Work`]: one that ends without it fails, naming it.
+    Job {
+        job: JobId,
+        cancelled: bool,
+        views: Vec<Opened>,
+        kept: Option<Opened>,
+        owes_work: bool,
+    },
     BestOf(BestOf),
 }
 
@@ -179,6 +186,12 @@ impl Session {
                 best.count(candidate, &response);
                 sink.send(out, of(candidate, response));
             }
+            (Kind::Job { owes_work, .. }, _) => {
+                if matches!(response, Response::Work(_)) {
+                    *owes_work = false;
+                }
+                sink.send(out, response);
+            }
             _ => sink.send(out, response),
         }
     }
@@ -220,7 +233,19 @@ impl Session {
                     false
                 }
             }
-            (Kind::Job { views, kept, .. }, None) => {
+            (Kind::Job { views, kept, owes_work, cancelled, .. }, None) => {
+                let error = match error {
+                    None if *owes_work && !*cancelled => Some(ApiError::new(
+                        format!(
+                            "the build of {:x} ended without reporting what it did \
+                             (`Response::Work`)",
+                            views.first().expect("a build, test or run has its view").view.root
+                        ),
+                        Some(format!("job {}", job.0)),
+                    )),
+                    error => error,
+                };
+                let ok = ok && error.is_none();
                 for opened in views.drain(..) {
                     if error.is_none() && *kept == Some(opened) {
                         cx.vfs.close(opened.files);
@@ -469,7 +494,9 @@ impl Session {
     ) {
         let job = self.job();
         let kept = view.filter(|_| incremental(&work));
-        let serial = self.begin(req, Kind::Job { job, cancelled: false, views, kept });
+        let owes_work = matches!(work, Work::Build(_) | Work::Test { .. } | Work::Run { .. });
+        let serial =
+            self.begin(req, Kind::Job { job, cancelled: false, views, kept, owes_work });
         self.jobs.insert(job, (serial, None));
         cx.builder.start(job, view, work);
     }

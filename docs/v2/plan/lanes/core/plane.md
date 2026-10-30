@@ -1,132 +1,168 @@
 ---
 status: plan
-summary: blaze v2: one sans-IO core under every build, one scheduler for every request (memo by input hash, single flight, fair share, critical path, memory admission), and the order the rest of the core moves onto it.
+summary: blaze v2 core as written on 2026-10-29: the sans-IO core and its drivers (io_uring, kqueue, IOCP, simulation), the plane (single flight, fair share, critical path, memory admission, no memo of its own), the worker pool and pump-wait, memory admission with its hard backstop, and a build's nodes.
 date: 2026-10-29
 ---
-# blaze v2
+# blaze v2: core, as written
 
-The target is the design of the 2026-10-28 retrospective (sections "From scratch", "On the
-biggest machines" and "For any Rust project"): the compiler a pure function of content hashes,
-a thin platform-tuned IO layer around it, and one long-lived, always-warm service per project in
-which every branch, pull request and CI job is a view. This note says what of it is built, where
-each piece lives, and in what order the rest moves onto it. It builds on
-[driver.md](../../../../driver.md) (whose steps 1 to 3 are on main) and takes the good ideas of
-[#283](https://github.com/indexable-inc/blaze/pull/283) (blaze-next): its sans-IO core, its
-Merkle VFS and journal, items by content hash, push invalidation and the agent API.
+What lane core wrote on 2026-10-29 for [core.md](../core.md), where each piece lives and what
+the other lanes wire to it. Nothing of it had been built or run when this was written; the
+first build is the coordinator's. It builds on [driver.md](../../../../driver.md) (steps 1 to 3
+on main) and on [#283](https://github.com/indexable-inc/blaze/pull/283)'s sans-IO core.
 
 ## The shape
 
     request (a view: a build, a test run, an edit)      many at once, from any client
         │  nodes, each keyed by the hash of its inputs
         ▼
-    blaze-graph::Plane      sans IO: memo by key, single flight, fair share between
-        │                   requests, critical path within one, memory admission
+    blaze-graph::exec::Scheduler   owner thread of the plane; measures, posts, reposts
+        │                          the database's Memo: a key done before runs nothing
+        ▼
+    blaze-graph::Plane      sans IO: single flight, fair share between requests, critical
+        │                   path within one, memory admission
         │  Run { node, pool, near }
         ▼
-    blaze-graph::exec       threads per core, grouped by last-level cache, stealing
-        │                   from the nearest group first
+    blaze-graph::pool       one worker per CPU, grouped by CCD or cluster, pinned,
+        │                   stealing nearest first; pump-wait inside a task
         │  IO effects
         ▼
-    blaze-core::Driver      io_uring (Linux), threads + clonefile (macOS), Sim (tests)
+    blaze-core::Driver      io_uring (Linux), kqueue (macOS), IOCP (Windows), Sim (tests),
+                            Threads (portable reference)
 
-Nothing above `blaze-core`'s drivers does IO; nothing above the executor starts a thread; the
-plane reads no clock. Each layer is tested by itself, the plane and the core under a seeded
+Nothing above `blaze-core`'s drivers does IO; nothing above the pool starts a thread; the plane
+reads no clock. Each layer is tested by itself, the plane and the core under a seeded
 simulation over many seeds.
-
-## The plane
-
-One plane per daemon, living as long as the daemon. A request adds nodes; a node has:
-
-- a **key**: the hash of everything its value depends on ([unit-keys.md](../../../../unit-keys.md)'s rule),
-  or none for work that is not a pure function of its inputs (running a test, linking to a
-  path the user named);
-- its **deps**, its **pool** (IO or a core), its expected **cost** (orders the ready nodes) and
-  its expected **memory** (its predicted peak, in bytes).
-
-What the plane does with them:
-
-1. **Memo by key.** A node whose key was settled before, by any request, settles at once with
-   that outcome (`Cached { remote: false }`), and runs nothing. The memo is the plane's, not a
-   request's, so main and a pull request share every node whose inputs are equal.
-2. **Single flight.** A node whose key is running or waiting for another request joins it: one
-   task runs, and every request that asked settles when it does.
-3. **Fair share.** Each request has a weight (an interactive edit more than a CI build). Of the
-   requests with ready work, the next core goes to the one using the least of its share; an
-   edit's work takes the next free core ahead of a background build's, and the build goes on
-   after. Work under way is never stopped for it.
-4. **Critical path.** Within a request, the ready node with the longest path of expected cost to
-   the end of the request runs first; ties go to the node added first (driver.md).
-5. **Memory admission.** The plane has a budget (`memory::Budget`, memory-budget.md). A node is
-   started only when the predicted peaks of what runs, plus its own, fit; a node passed over for
-   memory more than a few times holds back smaller ones behind it, so a large node is never
-   starved. A node whose prediction alone is more than the budget fails before it starts, naming
-   itself, its prediction and the budget: never swap, never a quiet retry with less at once.
-
-The plane is a state machine (`Plane::step(input) -> outputs`) with the same inputs and outputs
-as driver.md's machine, plus request ids; `Machine`, which the build-script and name-resolution
-graphs use, is the plane with one request. Its tests drive random graphs of many requests under
-`blaze-core`'s seeded random number generator, with random completion orders, failures and
-memory, and check after every step: nothing runs before its deps; no key runs twice at once;
-granted memory never exceeds the budget; every request ends; the same seed gives the same
-outputs.
-
-## The executor
-
-Threads per core, grouped by the last-level cache they share (an EPYC's CCD, read from
-`/sys/devices/system/cpu/cpu*/cache/index3/shared_cpu_list`; one group on a machine that says
-nothing). The plane names, with each node it runs, the group its deps ran on last; the node is
-queued there, and an idle thread takes from its own group first, then from the nearest other.
-On macOS the groups are the performance and efficiency cores, and the critical path goes to the
-performance ones.
 
 ## The IO core (`blaze-core`)
 
-From blaze-next's `blaze-core`: effects with tags, completions, a `Driver` trait, and three
-drivers: `Sim` (one thread, a virtual clock, shuffled completions, injected failures, torn
-appends, power cuts), `Threads` (portable; `F_FULLFSYNC` on macOS) and `Uring` (Linux, its own
-ring, no crate). v2 adds what the rest of blaze needs to move onto it:
+Effects with tags, completions and a `Driver` (`submit`, `poll`, `in_flight`, `now`). Every
+driver does every effect; `tests.rs` runs the same scripts on each and compares what they end
+with.
 
-| effect | Linux | macOS | Sim |
-| --- | --- | --- | --- |
-| read, read at, append, sync, truncate, timer | io_uring | threads | in memory |
-| write a whole file atomically (temporary, sync, rename) | io_uring + `renameat` | threads | in memory, all or nothing over a crash |
-| clone a file (a store value out to a target directory) | `FICLONE` | `clonefile` | shares the bytes |
-| stat | `statx` | `fstatat` | in memory |
-| watch a tree | fanotify, inotify where fanotify needs a privilege the process lacks | FSEvents | changes the test makes |
+| effect | Linux (`uring.rs`) | macOS (`kqueue.rs`) | Windows (`iocp.rs`) | `Sim` |
+| --- | --- | --- | --- | --- |
+| read, read at, append, sync, truncate | the ring | file threads, `F_FULLFSYNC` | the port | in memory, a log of unsynced changes |
+| write at an offset | the ring, on a descriptor without `O_APPEND` | file threads | file threads | in the log |
+| whole-file write (temporary, sync, rename) | the ring + `renameat` | file threads | file threads | all or nothing over a crash |
+| rename, mode, stat, list, remove, link | where submitted, or a thread for a list | file threads | file threads | in memory |
+| clone | `FICLONE` | `clonefile` | ReFS block cloning | shares the bytes |
+| map | `mmap` | `mmap` | file threads | the bytes |
+| timer | the ring | `EVFILT_TIMER` | the port | the virtual clock |
+| watch | fanotify, inotify when fanotify is refused for privilege (`EPERM`) | FSEvents | `ReadDirectoryChangesW` | changes the test makes |
+| spawn, kill | `pidfd`, the ring polls it and the pipes | `EVFILT_PROC`, `EVFILT_READ`/`WRITE` | job objects on the port | a program the test gives |
+| listen, connect, recv, send, hang up | the ring | `EVFILT_READ`/`WRITE` | Winsock on the port | pairs of ends in memory |
 
-A clone where the file system cannot clone is an error that names the file system: no quiet
-copy (no-fallback). Hard links are their own effect, which a caller chooses where it knows the
-output is never written in place.
+A clone where the file system cannot clone is an error that names it: no copy. A file system
+that gives no file handles is an error for fanotify, not a switch to inotify; only a refusal
+for privilege is (no-fallback). `Threads` is the portable reference: blocking calls on
+threads, the meaning every other driver is compared with.
 
-## What moves onto it, in order
+**Sandboxes are usercode's.** A `Command` with `Sandbox::On` runs through a
+`blaze_core::Confine` the driver was given (`Threads::confined`, `Uring::confined`,
+`Kqueue::confined`, `Iocp::confined`): it says the program, arguments, environment and
+directory that run the command confined, with its trace under a scratch directory
+(`.blaze-spawn/<pid>-<n>`, removed after), and reads the trace back as `Traced`. A driver
+given no `Confine` fails every sandboxed spawn naming it.
 
-Each step is a commit of this pull request, with its numbers in HANDOFF.md; the pull request
-stays a draft until the gate and the rustc differential harnesses pass with the new path as the
-only path.
+**The hard backstop for a process.** A `Command` with `memory: Some(bytes)` runs under a limit
+the kernel holds: on Linux a cgroup v2 of its own (`memory.max`, swap 0, the child joins it
+before `exec`; its `memory.peak` is the `Exit`'s peak; Linux 5.19 or newer, else an error
+before it runs); on macOS `RLIMIT_DATA` and `RLIMIT_AS` where macOS holds them, and always a
+watch of its physical footprint that kills it past the limit; on Windows a job object's memory
+limit. The watch stops before the process is reaped, so no kill reaches a reused pid.
 
-1. `blaze-core` on main, with the new effects and their tests (simulation over many seeds,
-   threads against io_uring on the same scripts).
-2. The plane, its simulation tests, and `Machine` as its one-request case; the two graphs on
-   main (build scripts and proc macros, name resolution) on it with a memory budget.
-3. The executor's cache-aware groups.
-4. Per-function codegen as plane nodes: each function's compile a node keyed by its code hash,
-   so a function asked by two programs (or two requests) compiles once and the waves of
-   `units.rs` become dependencies; the store write of a node overlaps the next compile
-   (driver.md step 5).
-5. Items by content hash in the front end (blaze-next's `blaze-items`, as a crate next to
-   `hir-ty`): local, interface, code and deep hashes, cycles as Unison's. Invalidation and the
-   store key on them: a body edit reaches its code hash and its callers' deep hashes only, a
-   signature edit its dependents' interface hashes, a formatting edit nothing (places out of the
-   code hash, patched at link time).
-6. The store as the VM's disk: values uncompressed in mmapped packs (zstd only for the remote
-   tier), outputs cloned out of it, no eviction on a pool VM; the front end's database as an
-   mmapped image in the store, so a daemon starts by mapping it.
-7. The workspace load, links and test runs as plane nodes (driver.md steps 4 and 6), and inputs
-   committed while work runs (step 7).
+**The simulation's files** keep a log of changes since their last covering sync (appends,
+writes at an offset, truncations): a crash keeps a random prefix of it, the last change maybe
+torn. A sync covers the changes made before it was asked.
+
+## The plane
+
+One plane per daemon. A request adds nodes, each with a key (the hash of what its value depends
+on, [unit-keys.md](../../../../unit-keys.md)) or none, its deps, its pool, its expected cost and
+its expected memory.
+
+1. **No memo of its own.** A node whose key the query database has settles at once from it
+   (`Memo::settled(key)`, given to `Plane::with_memo`), `Cached { remote: false }`, and runs
+   nothing. A task's value must be in the database before its `Done`.
+2. **Single flight.** A node whose key is running or waiting joins it: one task runs, every
+   request that asked settles when it does. A task not started is ready in the request of each
+   of its nodes, at that node's priority, and whoever starts it runs it.
+3. **Fair share.** Stride scheduling: the next thread of a pool goes to the request that
+   started the fewest tasks of it for its weight. A request that had no ready work comes back
+   at the plane's virtual time; ties go to the heavier, then the first opened. Work under way
+   is never stopped.
+4. **Critical path.** Within a request, the ready node with the longest path of expected cost
+   to the end runs first; ties to the node added first.
+5. **Memory admission.** A task starts only when the granted memory plus its own prediction
+   fit the budget. A task passed over `starve_after` times holds back every task with memory,
+   of every pool and request, until it starts (tasks with no memory still start). A task
+   whose prediction alone is over the budget fails before it starts, naming itself, its
+   prediction and the budget.
+6. **Cancel and release.** `Plane::cancel(request)` skips what of it has not started, lets what
+   runs finish, and ends it not ok. `Plane::release(request)` gives back a finished request's
+   room. `Plane::stats(request)` says what it ran, found cached and joined, and its critical
+   path as measured.
+
+`Machine` (the build-script and name-resolution graphs) is the plane with one request and no
+memo; its outputs are the same as before, which a test checks over a recorded trace and 300
+random builds. The plane's tests drive random graphs of up to five requests over 600 seeds and
+check after every step that nothing runs before its deps, no key runs twice at once, granted
+memory stays within the budget, the held task starts first, and every request ends once.
+
+## Memory admission (`admission`, `arena`)
+
+- **Estimates** per task kind: a peak at or over the prediction becomes the prediction at
+  once; 64 peaks in a row under it bring it half way down to their most. Unseen kinds take a
+  default. Encoded deterministically for the daemon's image.
+- **Measured, not guessed**: `arena::Counting` is the daemon's global allocator (per-thread
+  counts, sharded totals, no lock); `measure(f)` is the peak of what `f` held, `held()` what the
+  process holds. The scheduler measures every task and feeds `observe` and `Held`.
+- **The daemon's own cap**: `Bump` arenas reserve their chunks from a `Cap`, which calls a
+  spill (cold results to disk) once each time it crosses `spill_at`, makes a reserve over the
+  limit wait, and when every holder waits and nothing fits cancels the newest waiter
+  (`Cancelled`, reposted), so the cap never deadlocks.
+- **The budget**: `machine_budget(margin)` is the least of the cgroup's `memory.max` (and its
+  ancestors'), `MemTotal` and `RLIMIT_AS` (`hw.memsize` on macOS), less what others use in
+  blaze's own cgroup (`memory.current` less `held()`), less the margin.
+
+## The executor (`topology`, `pool`, `pump`, `exec`)
+
+- **Groups**: on Linux the CPUs of a level 3 cache (an EPYC's CCD) or, where smaller, a
+  cluster of more than one core (Graviton); on macOS an L2 cluster of one performance level,
+  level 0 fast. Only CPUs in the affinity mask. Stealing goes to the own group, then the other
+  groups of the socket nearest by id, then the rest.
+- **Pool**: one worker per CPU, pinned on Linux (`sched_setaffinity`), a QoS class by P or E
+  core on macOS; a lock-free deque per worker and an injector per group; a job near no group
+  goes to the least loaded group, fast first. A worker that cannot start or bind fails the
+  pool: it is never quietly smaller.
+- **Pump-wait (#1301)**: a task waiting for another's key (`pump::Flights::get_or_run`) runs
+  other work meanwhile, up to a depth of 16. One wait graph for the process: the wait that would
+  close a cycle is `Cancelled` at once and its task posted again, so of any cycle one task gives
+  way and none deadlocks. A key asking for itself is a real cycle and panics naming it.
+- **Scheduler**: owns the plane on its own thread; runs work tasks on the shared pool and IO
+  tasks on IO threads, inside `measure`; raises each spec's memory to its kind's prediction;
+  reposts `Cancelled` work where it ran. `drive` (the one-request path) runs on two pools lent
+  to it alone and kept for the next build of their size, so a build starts no threads.
+
+## A build's nodes (`build`, driver.md steps 4 to 7)
+
+`build::Build` says a build as plane nodes: the manifest and fetch (IO), std, build scripts and
+their runs, proc macros, names and bodies, and per unit a compile (work, keyed by its code hash)
+followed by its store write (IO). A link waits for the compiles and std, not their store
+writes, so writes overlap the next compiles (step 5); links and test runs are nodes (step 6);
+an input committed while work runs is a new view and a new request, and the old one is
+cancelled (step 7).
+
+## What others wire
+
+- usercode: a `Confine` over the sandbox, given to the drivers.
+- the daemon: `arena::Counting` as its global allocator; its work on `exec::Scheduler` with the
+  database's `Memo`, the budget from `machine_budget`.
+- db: `blaze_query::Cancelled` as `blaze_graph::Cancelled`, `Cx::get` on `Flights`.
+- ci: `NodeState::Cancelled`, and `Plane::stats` in the API's per-request work.
 
 ## Rules that hold throughout
 
-No rustc; no fallback (a node that cannot run fails and names itself); every key covers every
-input, with a test that changes the input and sees the value rebuilt; build scripts and proc
-macros sandboxed; semantics (item hashes, MIR) in the front end's crates, the plane, the
-executor and the drivers outside it.
+No rustc; no fallback (a node or effect that cannot run fails and names itself); every key
+covers every input; build scripts and proc macros sandboxed; semantics in the front end's
+crates, the plane, the executor and the drivers outside it.

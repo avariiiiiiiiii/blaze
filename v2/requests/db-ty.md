@@ -13,12 +13,16 @@ db-salsa's brief, item 4; db-salsa has not reported yet). They must be `pub`, be
 queries are in `hir-ty-mir` and evicted from `hir`. If the names or signatures differ, those two
 files are the only callers to change.
 
+> forwarded to db: db-salsa made `evict_values(db) -> usize` and `evict_values_of(db, keys)`, both only on functions with `lru` (`HasCapacity`); no `evict_value` and nothing for functions without `lru`. Lane db decides between widening it and `evict.rs` calling those names.
+
 ## 2. Coordinator: `crates/hir-ide/src/tests/incremental.rs`
 
 What: replace each `"InferenceResult < 'db >::for_body_"` (12 places) with `"infer_body_query"`.
 Why: `InferenceResult::for_body`/`for_anon_const` are now free tracked fns `infer_body_query` and
 `infer_anon_const_body_query` in `crates/hir-ty/src/infer.rs`: a method of a
 `#[salsa::tracked] impl` has no struct that eviction can name.
+
+> applied: the 12 `"InferenceResult < 'db >::for_body_"` in `crates/hir-ide/src/tests/incremental.rs` are `"infer_body_query"`.
 
 ## 3. Coordinator, blaze-engine: the check driver and the post-store eviction
 
@@ -34,6 +38,9 @@ Why: `InferenceResult::for_body`/`for_anon_const` are now free tracked fns `infe
   &compiled_bodies)`, with the dependency bodies it compiled (workspace bodies `blaze check`
   reads again are better left out).
 
+> forwarded to codegen: both are in `crates/blaze-engine/src/lib.rs` (codegen's).
+> forwarded to diagnostics: the `pub fn` rendering a `Vec<AnyDiagnostic>` is ide-diagnostics' (diagnostics lane), or blaze-diagnostics' that replaces it.
+
 ## 4. Codegen (`crates/hir-ty-mir`, `crates/blaze-codegen`)
 
 - A build's codegen takes `hir_ty_borrowck::CheckedMir` (made only from `checked(db, def)?.mir(db,
@@ -45,6 +52,8 @@ Why: `InferenceResult::for_body`/`for_anon_const` are now free tracked fns `infe
   queries of `hir_ty_mir::mir` (23 today), and drop `compiled_instance`/`inlinable` results the
   same way after a store.
 
+> forwarded to codegen
+
 ## 5. Link (live patch)
 
 Before committing a speculative patch, run `hir_ty_borrowck::Pending::finish(db)` as a plane
@@ -52,12 +61,16 @@ task beside the patch, sharing the database by reference (docs/v2/plan/process/d
 handles), and roll the patch back on `Err(Refused)`; the
 `Refused` names the body and the errors to report.
 
+> forwarded to link
+
 ## 6. Items lane and `crates/rustc_abi` (from child db-ty-hashmir, `v2/requests/db-ty-hashmir.md`)
 
 `LayoutError` (`crates/hir-ty/src/layout.rs`) and `rustc_abi::LayoutCalculatorError<F>` need
 `Hash` in their derives: `MirLowerError` and `MirEvalError` now derive `Hash`, so MIR query
 outputs get value fingerprints and keep early cutoff after eviction. `crates/hir-ty` does not
 compile until both are added.
+
+> applied: the same as `v2/requests/db-ty-hashmir.md`; routed there (items; `rustc_abi` to the coordinator).
 
 ## 7. Codegen and coordinator: coroutine witness types; items: a finding
 
@@ -74,6 +87,10 @@ compile until both are added.
   lowers `const _` bodies. Neither infers a dependency body, but both read bodies on a
   signature path.
 
+> forwarded to db: declare `coroutine_witnesses` in `crates/hir-ty/src/db.rs` (db-ty's).
+> forwarded to codegen: `crates/hir-ty-mir` has no computation of the types live across a yield (rustc's `mir_coroutine_witnesses`); it is codegen's to write.
+> pending (requests): once both exist, `impl_hir_database!` in `crates/hir-ide/src/impl_db_macro.rs` implements the method from hir-ty-mir's function. The `impl_holders` finding is for items, forwarded there.
+
 ## 8. db-salsa (through lane db): hash a value when it is evicted, not when it is stored
 
 What: compute a memo's value fingerprint (`Fingerprint::of_value`) when the value is dropped
@@ -86,3 +103,52 @@ every `InferenceResult` and `MirBody` as it is stored walks the whole value with
 body's first computation, the hot path of a cold build, to serve only the values later evicted.
 Hashing at eviction costs one walk per evicted value, and only for values that are evicted. The
 `Hash` impls in `crates/hir-ty` (`infer.rs`, `mir.rs`) are the same either way.
+
+> forwarded to db
+
+## 9. Codegen: `lru = 0` on the 11 MIR queries that lack it
+
+What: add `lru = 0` to `promoted_mir_body_query` (`crates/hir-ty-mir/src/mir/lower.rs:4937`),
+`runtime_promoted_mir_body_query` (`mir/transform.rs:171`), `optimized_mir_body_query`,
+`optimized_mir_body_for_closure_query`, `monomorphized_optimized_mir_body_query`,
+`monomorphized_optimized_mir_body_for_closure_query` (`mir/optimize.rs`), and the five
+`monomorphized_*` in `mir/monomorphization.rs` (489, 500, 522, 542, 552).
+Why: db-salsa's `evict_values` exists only for functions with `lru` (the `HasCapacity` bound,
+`/tmp/blaze-lanes/v2-db-salsa.md`). `crates/hir/src/evict.rs`'s `drop_mir` evicts all 23 MIR
+queries after a store (#806: MIR was 15% of a cold build's heap, most of it monomorphized and
+optimized MIR), so it does not compile until these 11 have it. Their outputs already implement
+`Hash` (`MirBody`, `MirLowerError` in `crates/hir-ty/src/mir.rs`).
+
+> forwarded to codegen
+
+## 10. Coordinator: MIR's layout belongs to codegen
+
+What: move `crates/hir-ty/src/mir.rs` and `crates/hir-ty/src/mir/` (the MIR types) from db to
+codegen in `docs/v2/crates.md`.
+Why: `docs/v2/plan/data.md` gives MIR's columnar layout (locals as columns, blocks as ranges,
+statements as tag and data, places as base plus CSR projections) to codegen, which builds and
+reads every `MirBody` in `crates/hir-ty-mir`. The types sit in hir-ty only because borrowck and
+const eval read them; whoever changes the layout changes all their constructors. Until it moves,
+db-ty does not change MIR's layout.
+
+> forwarded to coordinator: an ownership change in `docs/v2/plan/reference/crates.md`, not among the paths `requests` applies.
+
+## 11. Lane db (parent): `vendor/rustc_type_ir` and `vendor/rustc_next_trait_solver` for db-ty's children
+
+What: let `db-ty-types` change `vendor/rustc_type_ir` and `db-ty-solver` change
+`vendor/rustc_next_trait_solver`, or apply their requests (`v2/requests/db-ty-types.md`,
+`v2/requests/db-ty-solver.md`).
+Why: "types and the trait solver are u32-indexed tables" (`docs/v2/db.md`, Done when) is half in
+those crates: the `Interner` trait's associated types and the search graph's `GlobalCache`.
+
+> forwarded to db: both vendor crates are lane db's own; db-ty is its child.
+
+## 12. db-salsa (through lane db): interned values may hash their address
+
+`/tmp/blaze-lanes/v2-db-salsa.md` says `intern::Symbol` and `Interned<T>` hashes are unsound for
+value fingerprints because they hash the address. Both are now never freed
+(`crates/intern/src/arena.rs`, `symbol.rs`: "never moves or is freed"), so an address names one
+value for the whole process, and fingerprints are not persisted (salsa recomputes them on load).
+`InferenceResult` and `MirBody` rely on this. Say so if there is a case I miss.
+
+> forwarded to db

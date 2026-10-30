@@ -28,3 +28,4 @@ work around it.
 | 10-29 | `rustc_type_ir` and the trait solver belong to db | types and the solver become `u32`-indexed tables |
 | 10-29 | A new crate arrives with a `src/lib.rs`; every new workspace dependency goes through a request | one unloadable member stops the whole workspace from loading |
 | 10-29 | The first compile checks each lane's crates on their own, in one VM with committed memory and a job count bounded by it | one broken crate can't hide the rest; never OOM |
+| 10-29 | Reads never lock or write shared memory; values immutable once published; memory reclaimed at task boundaries; no build lock (plan/design/concurrency.md) | contention on one cache line costs more than the work on 100 cores |

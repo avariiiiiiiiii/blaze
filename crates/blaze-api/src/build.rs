@@ -60,7 +60,8 @@ pub enum Work {
 /// never inside it. A job reports only the responses its [`Work`] names, never
 /// [`crate::Response::Done`] or [`crate::Response::Error`]: a failed build finishes with `ok`
 /// false after its diagnostics, and a job that could not run finishes with an
-/// [`crate::ApiError`] naming what and where.
+/// [`crate::ApiError`] naming what and where. A build, test or run not cancelled that finishes
+/// without having reported [`crate::Response::Work`] fails, naming the job.
 pub trait Builder {
     /// Starts `work` on `view` (`None` for [`Work::Snapshot`] only).
     fn start(&mut self, job: JobId, view: Option<Opened>, work: Work);

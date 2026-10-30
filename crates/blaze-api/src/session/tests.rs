@@ -467,6 +467,54 @@ fn a_duplicate_id_is_refused_without_touching_the_first() {
     assert_eq!(world.finish(job, true, None), [done(1, 1, true)]);
 }
 
+fn worked() -> Response {
+    Response::Work(crate::Worked {
+        reran: 3,
+        green: 9,
+        compiled: 1,
+        found: 4,
+        link: crate::LinkKind::Placed,
+        critical_path_us: 70,
+    })
+}
+
+#[test]
+fn a_build_forwards_its_work_before_done() {
+    let mut world = World::new();
+    world.request(1, 1, Request::Build { view: head("main"), targets: targets() });
+    let job = world.last_job();
+    assert_eq!(world.report(job, worked()), [reply(1, 1, worked())]);
+    assert_eq!(world.finish(job, true, None), [done(1, 1, true)]);
+}
+
+#[test]
+fn a_build_test_or_run_that_ends_without_its_work_fails_naming_the_job() {
+    let mut world = World::new();
+    let requests = [
+        Request::Build { view: head("main"), targets: targets() },
+        Request::Test { view: head("main"), targets: targets(), filter: Vec::new(), all: false },
+        Request::Run { view: head("main"), targets: targets(), bin: None, args: Vec::new() },
+    ];
+    for (id, request) in (1..).zip(requests) {
+        world.request(1, id, request);
+        let job = world.last_job();
+        let replies = world.finish(job, true, None);
+        assert_eq!(error_at(&replies), Some(format!("job {}", job.0)));
+        assert_eq!(replies.last(), Some(&done(1, id, false)));
+    }
+}
+
+#[test]
+fn a_check_or_a_cancelled_build_owes_no_work() {
+    let mut world = World::new();
+    world.request(1, 1, Request::Check { view: head("main"), targets: targets() });
+    assert_eq!(world.finish(world.last_job(), true, None), [done(1, 1, true)]);
+    world.request(1, 2, Request::Build { view: head("main"), targets: targets() });
+    let job = world.last_job();
+    world.request(1, 3, Request::Cancel { id: 2 });
+    assert_eq!(world.finish(job, false, None), [done(1, 2, false)]);
+}
+
 #[test]
 fn a_report_or_finish_after_the_finish_is_dropped() {
     let mut world = World::new();

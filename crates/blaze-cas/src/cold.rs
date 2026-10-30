@@ -55,6 +55,25 @@ pub(crate) fn compress(dictionary: &[u8], raw: &[u8]) -> Result<Vec<u8>, String>
         .map_err(|error| format!("compressing {} bytes failed: {error}", raw.len()))
 }
 
+/// One compressor for a batch of values of one kind: the dictionary is loaded once, not once a
+/// value. Without a dictionary its frames are read by [`decompress_long`].
+pub(crate) struct Batch(zstd::bulk::Compressor<'static>);
+
+impl Batch {
+    pub(crate) fn new(dictionary: Option<&[u8]>) -> Result<Batch, String> {
+        match dictionary {
+            Some(dictionary) => zstd::bulk::Compressor::with_dictionary(LEVEL, dictionary),
+            None => zstd::bulk::Compressor::new(LEVEL),
+        }
+        .map(Batch)
+        .map_err(|error| format!("starting zstd failed: {error}"))
+    }
+
+    pub(crate) fn compress(&mut self, raw: &[u8]) -> Result<Vec<u8>, String> {
+        self.0.compress(raw).map_err(|error| format!("compressing {} bytes failed: {error}", raw.len()))
+    }
+}
+
 pub(crate) fn compress_long(raw: &[u8]) -> Result<Vec<u8>, String> {
     let mut compressor = zstd::bulk::Compressor::new(LEVEL)
         .map_err(|error| format!("starting zstd failed: {error}"))?;
@@ -169,6 +188,24 @@ mod tests {
         assert_eq!(decompress_long(&stored, value.len() as u64).unwrap(), value);
         assert_eq!(compress_long(&value).unwrap(), stored, "deterministic");
         assert!(decompress_long(&stored, value.len() as u64 - 1).is_err());
+    }
+
+    #[test]
+    fn a_batch_compresses_as_one_call_does_and_without_a_dictionary_reads_as_long() {
+        let samples: Vec<Vec<u8>> = (0..200).map(sample).collect();
+        let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
+        let dictionary = train(&refs).unwrap();
+        let mut batch = Batch::new(Some(&dictionary)).unwrap();
+        for n in [5, 6, 7] {
+            let value = sample(n);
+            let stored = batch.compress(&value).unwrap();
+            assert_eq!(stored, compress(&dictionary, &value).unwrap());
+            assert_eq!(decompress(&dictionary, &stored, value.len() as u64).unwrap(), value);
+        }
+        let mut plain = Batch::new(None).unwrap();
+        let value = sample(8);
+        let stored = plain.compress(&value).unwrap();
+        assert_eq!(decompress_long(&stored, value.len() as u64).unwrap(), value);
     }
 
     #[test]

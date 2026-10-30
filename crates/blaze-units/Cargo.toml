@@ -20,17 +20,33 @@ blaze-format = { workspace = true, optional = true }
 blaze-ids = { workspace = true, optional = true }
 blaze-protocol = { workspace = true, optional = true }
 blaze-query = { workspace = true, optional = true }
+blaze-source = { workspace = true, optional = true }
 blaze-manifest.workspace = true
 blaze-resolve = { path = "../blaze-resolve" }
 cargo-util-schemas = "=0.14.3"
+rustc-stable-hash = { version = "0.1.2", optional = true }
 semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+toml = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 
 [features]
 # The workspace load and the unit graph as queries of blaze's database (`query`), for the
 # daemon. Without it the crate reads no file and builds for wasm32-wasip1 (#458).
-query = ["dep:blaze-format", "dep:blaze-ids", "dep:blaze-protocol", "dep:blaze-query"]
+query = [
+    "dep:blaze-format",
+    "dep:blaze-ids",
+    "dep:blaze-protocol",
+    "dep:blaze-query",
+    "dep:blaze-source",
+    "dep:rustc-stable-hash",
+    "dep:toml",
+    "dep:url",
+]
+
+[dev-dependencies]
+blaze-vfs.workspace = true
 
 [lints]
 workspace = true

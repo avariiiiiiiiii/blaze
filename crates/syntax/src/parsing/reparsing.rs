@@ -281,9 +281,9 @@ impl Edit<'_> {
                 seen >= AFTER_ITEM && !kind.is_trivia() && !matches!(kind, INT_NUMBER | T![.])
             })
             .map_or(tree.source().len(), |it| usize::from(tree.range(it).end()));
-        let joint = format!("{text}{}", &tree.source()[usize::from(range.end())..ahead]);
-        let joint = LexedStr::new(self.edition, &joint);
-        let input = joint.to_input(self.edition);
+        // `lexes_alone` showed the lexer ends a token where the item ends.
+        let ahead = LexedStr::new(self.edition, &tree.source()[usize::from(range.end())..ahead]);
+        let input = lexed.to_input_followed_by(&ahead, self.edition);
         let output = match in_full {
             true => Reparser::top_level_item().parse(&input),
             false => Reparser::top_level_item().parse_outline(&input),
@@ -302,9 +302,21 @@ impl Edit<'_> {
         Some((tree, errors, self.tree.range(at)))
     }
 
-    /// Whether node `at`'s first [`LOOKAHEAD`] tokens are those of `new`, its new text.
+    /// Whether node `at`'s first [`LOOKAHEAD`] tokens are those of `new`, its new text. When the
+    /// edit starts past them and the two tokens after them, the old text is the same up to there
+    /// and lexes to the same tokens (the lexer reads at most a character past a token to end
+    /// it), so it is not lexed.
     fn same_start(&self, at: u32, new: &LexedStr<'_>) -> bool {
-        let old = LexedStr::new(self.edition, &self.tree.source()[self.tree.range(at)]);
+        let range = self.tree.range(at);
+        let edit = usize::from(self.delete.start() - range.start());
+        let last = (0..new.len()).filter(|&it| !new.kind(it).is_trivia()).nth(LOOKAHEAD - 1);
+        if let Some(last) = last
+            && last + 2 < new.len()
+            && new.text_range(last + 2).end <= edit
+        {
+            return true;
+        }
+        let old = LexedStr::new(self.edition, &self.tree.source()[range]);
         first_tokens(&old) == first_tokens(new)
     }
 
@@ -317,16 +329,24 @@ impl Edit<'_> {
         let (tree, source) = (self.tree, self.tree.source());
         let range = tree.range(at);
         let bound = |it: &u32| !matches!(self.kind(*it), INT_NUMBER | T![.] | T![#] | T![-] | WHITESPACE);
-        let before = (0..at).rev().filter(|&it| self.is_leaf(it)).find(bound);
-        let after = (tree.end(at)..tree.len()).filter(|&it| self.is_leaf(it)).find(bound);
-        let before = &source[TextRange::new(
-            before.map_or(TextSize::new(0), |it| tree.range(it).start()),
-            range.start(),
-        )];
-        let after = &source[TextRange::new(
-            range.end(),
-            after.map_or(TextSize::of(&**source), |it| tree.range(it).end()),
-        )];
+        // A lazy node bounds at its last token, a `}`, or its first, a `{`: its body is not
+        // lexed again.
+        let before = (0..at).rev().filter(|&it| self.is_leaf(it)).find(bound).map_or(
+            TextSize::new(0),
+            |it| match tree.is_lazy(it) {
+                true => tree.range(it).end() - TextSize::of('}'),
+                false => tree.range(it).start(),
+            },
+        );
+        let after = (tree.end(at)..tree.len()).filter(|&it| self.is_leaf(it)).find(bound).map_or(
+            TextSize::of(&**source),
+            |it| match tree.is_lazy(it) {
+                true => tree.range(it).start() + TextSize::of('{'),
+                false => tree.range(it).end(),
+            },
+        );
+        let before = &source[TextRange::new(before, range.start())];
+        let after = &source[TextRange::new(range.end(), after)];
         let joint = format!("{before}{}{after}", new.as_str());
         let joint = LexedStr::new(self.edition, &joint);
         let (before, after) =
@@ -770,7 +790,7 @@ enum Foo {
     /// outline.
     #[test]
     fn reparse_random_edits() {
-        let root = test_utils::project_root();
+        let root = test_utils::project_root().into_std_path_buf();
         let mut files = Vec::new();
         for dir in ["crates/syntax/src", "crates/parser/src"] {
             collect_rs(&root.join(dir), &mut files);

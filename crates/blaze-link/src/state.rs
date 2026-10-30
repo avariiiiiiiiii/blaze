@@ -3,7 +3,7 @@
 //! works on a copy and the state it started from stays whole: a stage that fails leaves
 //! nothing behind, and a rollback is the state before.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use blaze_codegen::{InstanceKey, Line};
@@ -123,13 +123,14 @@ pub(crate) struct Input {
 /// What resolving the native inputs and the names gave, and what it was computed from.
 #[derive(Clone, Default)]
 pub(crate) struct Resolved {
-    pub inputs: u64,
     pub imports: Vec<Import>,
     /// Each import's symbol.
     pub import_syms: Vec<Sym>,
     pub libraries: Vec<Library>,
     /// The native sections in the image.
     pub kept: FxHashSet<(Obj, u32)>,
+    /// The native call frame records in the image: section and start.
+    pub frames: FxHashSet<(Obj, u32, u32)>,
     /// The commons, by name: size and alignment.
     pub commons: BTreeMap<Box<str>, (u64, u64)>,
 }
@@ -148,6 +149,8 @@ pub(crate) struct State {
     pub spaces: Vec<Space>,
     /// The names Rust code defines (`#[no_mangle]`, `main`), each the symbol it is.
     pub names: Arc<BTreeMap<String, Sym>>,
+    /// Every name a piece has referred to: what resolution looks at.
+    pub seen: Arc<BTreeSet<Sym>>,
     pub debug_names: Arc<FxHashMap<InstanceKey, Arc<str>>>,
     pub spans: Arc<FxHashMap<ContentId, Arc<SpanTable>>>,
     pub inputs: Arc<Vec<Input>>,
@@ -174,6 +177,7 @@ impl State {
             specials: Vec::new(),
             spaces: Vec::new(),
             names: Arc::default(),
+            seen: Arc::default(),
             debug_names: Arc::default(),
             spans: Arc::default(),
             inputs: Arc::default(),

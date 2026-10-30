@@ -18,6 +18,7 @@ One flat directory per store (`Config::dir`):
 | `head` | what the store is: its generation, which index slot is live (with its length, count and CRC-32C), each pack with its committed and indexed length, the dictionaries, the files of their own. Ends with a CRC-32C. Written whole with `Effect::Write` (temporary file, sync, rename, directory sync). |
 | `pack-<kind>-<n>` | appended to only: a 16-byte header (magic, kind), then records. Every commit ends it on a 4 KiB block, the rest of the block zeros, so every append can be written with `O_DIRECT`. A pack takes no appends once it is 1 GiB. |
 | `index-0`, `index-1` | the two index slots: an open-addressed table on keys, written whole into the slot the head does not name. |
+| `head` packs | each pack's entry also holds its dead bytes (records since moved) and whether it is removed; a removed pack keeps its place in the list so the numbers records name stay put. |
 | `file-<content>` | a hot value of 4 MiB or more (not an output), a file of its own: mapped on its own, placed by cloning. |
 
 Packs sit next to the head so the directory sync of the head's write makes a new pack's name
@@ -29,9 +30,14 @@ form is `Raw` (read in place), `Zstd`, `Lz4` (a chunk), `Chunked` (a list of chu
 lengths), `External` (the value is `file-<content>`) or `Dictionary`. The store's format is 2. `Entry::content` is BLAKE3 of the
 value's bytes under `"blaze v2 store value 1"`.
 
-An **index slot** is 64 bytes, one cache line: the key, the pack, kind, form, offset, stored and
-raw length. Linear probing from the key's first 8 bytes (a BLAKE3 hash is uniform), at most 5/8
-full: a lookup is one or two lines of the table and one of the pack.
+An **index table** (`index.rs`) is laid out as a SwissTable: a 64-byte header, a control
+column of one byte a slot (empty, or 7 bits of the key), then a 64-byte row a slot (the key, the
+pack, kind, form, offset, stored and raw length), `64 + 65 * slots` bytes. A lookup probes groups
+of 16 control bytes at triangular steps from the key's first 8 bytes (a BLAKE3 hash is uniform),
+matching the tag in all 16 at once (SSE2, NEON, or two words without carries), and reads a row
+only on a tag match. At most 7/8 full: a hit is a quarter line of control bytes and one row. The
+table is built from the sorted set, so its bytes depend on the set alone; it is checked whole
+when mapped and not again.
 
 ## A group commit (#1298)
 
@@ -147,9 +153,43 @@ The differential tests run every path the test machine has against the portable 
 store asks of the drivers (`O_DIRECT`, registered buffers, SQPOLL, linked submissions, huge pages
 and NUMA-local mappings) is in v2/requests/store.md; threads and pinning are core's.
 
+## Settling: hot and cold by reads
+
+`Store::settle` is called by the daemon when it is idle. Each call is a period: what was read in
+it and in the one before is known from two bit columns (`flags.rs`). It moves records between
+tiers by how recently they were read, copying each into a new record and leaving the old one
+dead:
+
+- a raw or LZ4 record of 4 KiB or more that nothing read for two periods goes to zstd, batched
+  by kind with that kind's dictionary (trained first from the kind's records if it has none); a
+  record that zstd does not shrink by an eighth stays and is marked tried, never tried again;
+- a zstd record read in two periods running comes back raw (an output, LZ4);
+- a sealed pack at least half dead is retired: its live records are copied on, the next head
+  marks it removed, and once that head is durable its file is removed. A pack named removed
+  when the store opens is removed again.
+
+A call does at most 256 MiB and says if there is more. Every move round-trips the same bytes,
+checked against the content hash before it is copied. What was read is not kept across an open
+or an index rewrite (rows are renumbered), so after either nothing goes cold until two periods
+have passed.
+
+## Data-oriented (v2 plan section 17, plan/design/data.md)
+
+- Per-record flags (checked, read this period, read last period, compression tried) are bit
+  columns indexed by the record's row (its index slot, or its number in the delta), not sets of
+  keys: a period's turn is a move of one column into the other.
+- The index's control column is the dense array probing runs over; the plan's row asks for keys
+  and places in separate arrays, but a hit needs both, so they share one 64-byte row: one miss a
+  hit, not two.
+- Settling batches by kind: one compressor and dictionary a kind, records in pack order.
+- Size budgets are const-asserted: `Key` 32 bytes, `Loc` 32, a delta entry 48, an index row 64,
+  the head's fixed part 72 and a pack entry 32.
+- Column codecs (frame of reference, run lengths, deltas over a column) are the value encoding's
+  (format's): values are opaque bytes to the store, which applies zstd last.
+
 ## Not done here
 
-- Eviction: nothing is removed from a store. The VM's disk is taken as unlimited (v2 README
+- Eviction: no live record is removed from a store; settling removes only dead space. The VM's disk is taken as unlimited (v2 README
   section 2); a store is removed whole.
 - One file per crate version (#1298's makepad layout): `put` takes no crate, so packs are per
   kind; the commit is #1298's (append, one barrier, index into the inactive slot, head flip).

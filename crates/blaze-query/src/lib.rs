@@ -17,7 +17,7 @@
 //!   configuration. Everything else is a function of content.
 //! - [`Why`] answers, for a query that ran, the chain of edges back to the input that changed.
 //!
-//! How it works (docs/v2-db.md):
+//! How it works (docs/v2/plan/lanes/db/query-database.md):
 //!
 //! - A key keeps every memo made of it, each with its edges in the order they were read
 //!   (constructive traces). In a view, a memo is the key's result when each of its edges, in
@@ -33,7 +33,6 @@
 //!   let go of is retired and dropped only by `&mut Database` ([`Database::reclaim`],
 //!   [`Database::settle`]).
 
-mod flight;
 mod image;
 mod table;
 pub mod tree;
@@ -43,7 +42,7 @@ mod tests;
 
 use std::{
     any::{Any, TypeId},
-    cell::Cell,
+    cell::{Cell, RefCell},
     fmt,
     rc::Rc,
     sync::{Arc, Mutex, RwLock, atomic::AtomicU64, atomic::Ordering},
@@ -51,13 +50,13 @@ use std::{
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{Persist, SchemaHash, Writer};
+use blaze_graph::pump::{self, Flights};
 use blaze_ids::{ContentId, Fingerprint, Hasher, Idx};
 use blaze_protocol::cbor;
 use blaze_vfs::{View, ViewId};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    flight::{Flight, Run},
     image::ImageMap,
     table::{Aligned, Edges, FxMap, FxSet, Left, MemoData, Shards, Slot, Value, lock, read, write},
 };
@@ -188,7 +187,9 @@ pub trait Query: 'static {
     /// The content ID of the code of the query's function, for [`Memo::producer`]; set by the
     /// build (blaze's own item hashes of it).
     const PRODUCER: ContentId;
-    type Key: Clone + Send + Sync;
+    /// Kept as bytes (deterministic CBOR) beside the key's memos and in the image, so a
+    /// dependency no one names again can still be run to verify an edge on it.
+    type Key: Clone + Send + Sync + Serialize + serde::de::DeserializeOwned + 'static;
     type Value: Persist;
     /// The content ID of `key`, for [`QueryKey::input`].
     fn input(key: &Self::Key) -> ContentId;
@@ -260,22 +261,39 @@ struct KindInfo {
 }
 
 thread_local! {
-    static INSIDE: Cell<u32> = const { Cell::new(0) };
+    /// The pump depth of the plane task that runs a query on this thread, if one does. A job
+    /// the thread pumps while that query waits is a task above it, free to ask the database.
+    static INSIDE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-/// Marks the thread as running a query while it lives.
-struct Inside;
+fn inside_a_query() -> bool {
+    INSIDE.with(Cell::get) == Some(pump::depth())
+}
+
+/// Marks this thread's task as running a query while it lives.
+struct Inside(Option<usize>);
 
 impl Inside {
     fn enter() -> Inside {
-        INSIDE.with(|it| it.set(it.get() + 1));
-        Inside
+        Inside(INSIDE.with(|it| it.replace(Some(pump::depth()))))
     }
 }
 
 impl Drop for Inside {
     fn drop(&mut self) {
-        INSIDE.with(|it| it.set(it.get() - 1));
+        INSIDE.with(|it| it.set(self.0));
+    }
+}
+
+/// One request's root and everything it runs inline, on one task.
+struct Run {
+    /// The keys it is running, outermost first: for naming a cycle.
+    stack: RefCell<Vec<QueryKey>>,
+}
+
+impl Run {
+    fn new() -> Run {
+        Run { stack: RefCell::new(Vec::new()) }
     }
 }
 
@@ -393,9 +411,9 @@ fn read_value<'db, Q: Query>(bytes: &'db [u8]) -> <Q::Value as Persist>::Ref<'db
 }
 
 /// The query was cancelled: a nested request needs what an outer one holds (#1301), or its
-/// request ended. It is reposted, never answered with a partial value.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Cancelled;
+/// request ended. It is reposted, never answered with a partial value. The plane's own, as a
+/// query's wait is one of the plane's waits.
+pub use blaze_graph::Cancelled;
 
 /// Why a query reran: from it, each edge whose fingerprint differed, back to an input.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -569,7 +587,8 @@ pub struct Database {
     /// What each input key a memo read names, to read it again in another view.
     inputs: Shards<Input>,
     views: RwLock<Vec<Option<Arc<ViewState>>>>,
-    flight: Flight,
+    /// One run of a key at a time, whatever view asked, on the plane's wait graph (#1301).
+    flights: Flights<()>,
     io: Mutex<Io>,
     retired: Mutex<Vec<Retired>>,
     /// Bumped by each collection; a key given a memo since one started is kept by it whole.
@@ -587,7 +606,7 @@ impl Database {
             image: None,
             inputs: Shards::new(),
             views: RwLock::new(Vec::new()),
-            flight: Flight::default(),
+            flights: Flights::new(),
             io: Mutex::new(Io::default()),
             retired: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
@@ -671,7 +690,7 @@ impl Database {
         key: &Q::Key,
     ) -> Result<<Q::Value as Persist>::Ref<'_>, DbError> {
         assert!(
-            INSIDE.with(Cell::get) == 0,
+            !inside_a_query(),
             "Database::get of {} from inside a query: ask it through Cx::get, which records it",
             Q::NAME
         );
@@ -1083,11 +1102,52 @@ impl Database {
         run: &Rc<Run>,
         typed: Option<&(dyn Any + Send + Sync)>,
     ) -> Result<Option<Arc<MemoData>>, Cancelled> {
-        if let Some(memo) = state.results.get(&key) {
-            return Ok(Some(memo));
-        }
         let Some(info) = self.kinds.get(&key.kind) else { return Ok(None) };
-        let _claim = self.flight.claim(key, run)?;
+        loop {
+            if let Some(memo) = state.results.get(&key) {
+                return Ok(Some(memo));
+            }
+            let mut ran = None;
+            self.single(key, run, || {
+                ran = Some(self.resolve_held(state, info, key, run, typed)?);
+                Ok(())
+            })?;
+            if let Some(found) = ran {
+                return Ok(found);
+            }
+        }
+    }
+
+    /// Runs `work` as the one run of `key`, or waits (pumping) for the run under way and
+    /// returns without running it, for the caller to look again. A wait that would close a
+    /// cycle of tasks is [`Cancelled`].
+    fn single(
+        &self,
+        key: QueryKey,
+        run: &Run,
+        work: impl FnOnce() -> Result<(), Cancelled>,
+    ) -> Result<(), Cancelled> {
+        {
+            let stack = run.stack.borrow();
+            if stack.contains(&key) {
+                panic!(
+                    "a query cycle: {} asks {key:?} while running it",
+                    stack.iter().map(|it| format!("{it:?}")).collect::<Vec<_>>().join(" -> ")
+                );
+            }
+        }
+        self.flights.get_or_run(key.task_key(), work)
+    }
+
+    /// [`Database::resolve`] while holding `key`.
+    fn resolve_held(
+        &self,
+        state: &Arc<ViewState>,
+        info: &KindInfo,
+        key: QueryKey,
+        run: &Rc<Run>,
+        typed: Option<&(dyn Any + Send + Sync)>,
+    ) -> Result<Option<Arc<MemoData>>, Cancelled> {
         if let Some(memo) = state.results.get(&key) {
             return Ok(Some(memo));
         }
@@ -1165,27 +1225,30 @@ impl Database {
         run: &Rc<Run>,
         typed: &(dyn Any + Send + Sync),
     ) -> Result<&'db [u8], Cancelled> {
-        if let Some(bytes) = self.memo_bytes(memo) {
-            return Ok(bytes);
-        }
         let info = &self.kinds[&memo.key.kind];
-        let _claim = self.flight.claim(memo.key, run)?;
-        if let Some(bytes) = self.memo_bytes(memo) {
-            return Ok(bytes);
+        loop {
+            if let Some(bytes) = self.memo_bytes(memo) {
+                return Ok(bytes);
+            }
+            self.single(memo.key, run, || {
+                if self.memo_bytes(memo).is_some() {
+                    return Ok(());
+                }
+                let _frame = Frame::push(run, memo.key);
+                let (computed, _) = self
+                    .execute(state, info, run, KeySource::Typed(typed))?
+                    .expect("a query run with its typed key always answers");
+                if computed.fingerprint != memo.fingerprint {
+                    panic!(
+                        "query {} is not deterministic: made again after its value was evicted, \
+                         {:?} has fingerprint {:?}, not {:?}",
+                        info.name, memo.key, computed.fingerprint, memo.fingerprint
+                    );
+                }
+                memo.refill(computed.bytes);
+                Ok(())
+            })?;
         }
-        let _frame = Frame::push(run, memo.key);
-        let (computed, _) = self
-            .execute(state, info, run, KeySource::Typed(typed))?
-            .expect("a query run with its typed key always answers");
-        if computed.fingerprint != memo.fingerprint {
-            panic!(
-                "query {} is not deterministic: made again after its value was evicted, {:?} has \
-                 fingerprint {:?}, not {:?}",
-                info.name, memo.key, computed.fingerprint, memo.fingerprint
-            );
-        }
-        memo.refill(computed.bytes);
-        Ok(self.memo_bytes(memo).expect("a value just made again"))
     }
 
     fn memo_bytes<'db>(&'db self, memo: &MemoData) -> Option<&'db [u8]> {

@@ -36,11 +36,13 @@ const PERSONALITY_SHIFT: u32 = 28;
 const ARM64_MODE_DWARF: u32 = 0x0300_0000;
 const X86_64_MODE_DWARF: u32 = 0x0400_0000;
 
-/// The most bytes `__unwind_info` can take for `functions` functions and `compact` bytes of
-/// `__compact_unwind` input (32 bytes an entry): the region is sized by it before placement.
-pub(super) fn bound(functions: u64, compact: u64) -> u64 {
+/// The most bytes `__unwind_info` can take for `functions` functions, `fdes` FDEs in
+/// `__eh_frame` (a native object's may be of a function no other entry covers) and `compact`
+/// bytes of `__compact_unwind` input (32 bytes an entry): the region is sized by it before
+/// placement.
+pub(super) fn bound(functions: u64, fdes: u64, compact: u64) -> u64 {
     let compact = compact.div_ceil(COMPACT_ENTRY);
-    let entries = 2 * (functions + compact);
+    let entries = 2 * (functions + fdes + compact);
     let pages = entries.div_ceil(PAGE_ENTRIES as u64);
     HEADER
         + 4 * COMMON_MAX as u64
@@ -214,14 +216,14 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
     let pages_at = lsda_at + LSDA_ENTRY * lsdas.len() as u64;
     let len = pages_at
         + pages.iter().map(|it| PAGE_HEADER + PAGE_ENTRY * it.len() as u64).sum::<u64>();
-    let limit = bound(placed.functions.len() as u64, compact_bytes);
+    let limit = bound(placed.functions.len() as u64, fdes.len() as u64, compact_bytes);
     if len > limit {
         return Err(error(format!(
-            "__unwind_info: {} entries take {len} bytes, past the {limit} sized for {} functions \
-             and {} compact unwind entries: an FDE in __eh_frame starts where no placed \
-             function does",
+            "__unwind_info: {} entries take {len} bytes, past the {limit} sized for {} functions, \
+             {} FDEs and {} compact unwind entries",
             rows.len(),
             placed.functions.len(),
+            fdes.len(),
             compact_bytes / COMPACT_ENTRY
         )));
     }
@@ -437,7 +439,6 @@ mod tests {
             live: None,
             tags: 0,
             stack: None,
-            name: "test".into(),
         }
     }
 
@@ -618,6 +619,7 @@ mod tests {
         let plan = plan();
         let placed = Placed {
             output: &output,
+            name: "test",
             plan: &plan,
             regions: &regions,
             contents: &contents,
@@ -629,12 +631,14 @@ mod tests {
             exports: &[],
             functions: &functions,
             entry: None,
+            init: None,
+            fini: None,
             tls: None,
             id: [0; 16],
             debug: &[],
         };
         let bytes = build(&placed, Arch::Aarch64).unwrap();
-        assert!(bytes.len() as u64 <= bound(functions.len() as u64, cu.len() as u64));
+        assert!(bytes.len() as u64 <= bound(functions.len() as u64, 8, cu.len() as u64));
         let table = Table { bytes: &bytes };
         assert_eq!(table.word(0), 1, "version 1");
 
@@ -698,7 +702,7 @@ mod tests {
         let plan = plan();
         let placed = placed(&output, &plan, &regions, &contents, &functions, &[]);
         let bytes = build(&placed, Arch::X86_64).unwrap();
-        assert!(bytes.len() as u64 <= bound(2, 0));
+        assert!(bytes.len() as u64 <= bound(2, 2, 0));
         let table = Table { bytes: &bytes };
         let dwarf = |n: usize| Some((X86_64_MODE_DWARF | fde[n] as u32, None));
         assert_eq!(table.lookup(off(TEXT)), dwarf(0));
@@ -722,7 +726,7 @@ mod tests {
         let plan = plan();
         let placed = placed(&output, &plan, &regions, &contents, &functions, &[]);
         let bytes = build(&placed, Arch::Aarch64).unwrap();
-        assert!(bytes.len() as u64 <= bound(functions.len() as u64, cu.len() as u64));
+        assert!(bytes.len() as u64 <= bound(functions.len() as u64, 0, cu.len() as u64));
         let table = Table { bytes: &bytes };
         assert!(table.index().len() > 2, "more than one page");
         for i in (0..2000).step_by(7) {
@@ -797,7 +801,7 @@ mod tests {
         let plan = plan();
         let placed = placed(&output, &plan, &[], &[], &[], &[]);
         let bytes = build(&placed, Arch::Aarch64).unwrap();
-        assert!(bytes.len() as u64 <= bound(0, 0));
+        assert!(bytes.len() as u64 <= bound(0, 0, 0));
         let table = Table { bytes: &bytes };
         assert_eq!(table.index().len(), 1, "the sentinel alone");
         assert!(table.entries().is_empty());
@@ -813,6 +817,7 @@ mod tests {
     ) -> Placed<'a> {
         Placed {
             output,
+            name: "test",
             plan,
             regions,
             contents,
@@ -824,6 +829,8 @@ mod tests {
             exports: &[],
             functions,
             entry: None,
+            init: None,
+            fini: None,
             tls: None,
             id: [0; 16],
             debug: &[],

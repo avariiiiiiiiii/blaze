@@ -1,7 +1,7 @@
-//! What each [`Fact`] stands for (docs/v2/plan/lanes/items.md section 6.2): [`value`] computes it from the
-//! current database, and a query that read the fact is reused while its [`fingerprint`] stays
-//! the same. A fact names its subject by key; a key that names nothing now gives the value
-//! "absent", never an error, so a deleted item is a changed fact like any other.
+//! What each [`Fact`] stands for (docs/v2/plan/lanes/items.md section 6.2): [`value`] computes
+//! it from the current database, and a query that read the fact is reused while its
+//! [`fingerprint`] stays the same. A fact names its subject by key; a key that names nothing now
+//! gives the value "absent", never an error, so a deleted item is a changed fact like any other.
 //!
 //! The rules that reach across items are each read through a fact:
 //!
@@ -47,7 +47,7 @@ use crate::{
     hash::{self, Unhashable},
     index::{
         AnyImpl, ScopeEntry, entry, impl_interface, impl_self_ty, implements_value,
-        inherent_impls_of, resolve_trait, scope, trait_impls, traits_with,
+        inherent_impls_of, name_hashes, resolve_trait, scope, trait_impls, traits_with,
     },
     key::{self, Resolved},
 };
@@ -217,9 +217,9 @@ fn value_in(db: &dyn HirDatabase, fact: &Fact) -> Result<ContentId, Unhashable> 
                     })
                     .collect();
                 h.update(&(methods.len() as u64).to_le_bytes());
-                for (name, f) in methods {
-                    h.id(&key::name_hash(name.as_str()).0)
-                        .id(&hash::interface_hash(db, ItemId::Function(f))?.0);
+                let names = name_hashes(methods.iter().map(|(name, _)| name.as_str()));
+                for (name, (_, f)) in names.into_iter().zip(methods) {
+                    h.id(&name.0).id(&hash::interface_hash(db, ItemId::Function(f))?.0);
                 }
             }
         }
@@ -396,10 +396,12 @@ fn named(
     items: &[(Name, AssocItemId)],
     name: NameHash,
 ) -> Result<Vec<ContentId>, Unhashable> {
-    let mut found = items
-        .iter()
-        .filter(|(it, _)| key::name_hash(it.as_str()) == name)
-        .map(|&(_, it)| Ok(hash::interface_hash(db, ItemId::from(it))?.0))
+    let names = name_hashes(items.iter().map(|(it, _)| it.as_str()));
+    let mut found = names
+        .into_iter()
+        .zip(items)
+        .filter(|&(it, _)| it == name)
+        .map(|(_, &(_, it))| Ok(hash::interface_hash(db, ItemId::from(it))?.0))
         .collect::<Result<Vec<_>, Unhashable>>()?;
     found.sort_unstable();
     Ok(found)

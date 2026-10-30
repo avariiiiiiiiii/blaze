@@ -28,7 +28,7 @@ use crate::{
     admission::{Estimates, TaskKind},
     arena,
     machine::{Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
-    plane::{Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId},
+    plane::{Memo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId},
     pool::{self, Pool as Workers},
     pump::lock,
     topology::Topology,
@@ -218,6 +218,11 @@ pub type Work = Arc<dyn Fn() -> Result<Did, Cancelled> + Send + Sync>;
 
 /// A node of a [`Scheduler`]'s request, with its work.
 ///
+/// The work of a node with a key puts its value in the database before it returns: the plane
+/// keeps no memo, and asks the scheduler's [`Memo`] whether a key is settled before it runs a
+/// node of it. A value that reached the database only after the `Done` would leave a node of
+/// its key that became ready in between to run again.
+///
 /// The nodes a task finds go in its [`Did::added`] as [`Handle::found`] gives them, which
 /// gives the scheduler their work first; a found node with no work fails the task that found
 /// it, saying so.
@@ -349,6 +354,9 @@ impl Handle {
 /// held and the group it ran on; after each `Done` the plane hears what the process holds
 /// ([`arena::held`]). Work that returns [`Cancelled`] is posted again (the plane still sees it
 /// running), behind what is ready on its group. The clock is read here, never by the plane.
+///
+/// Every request is released as it opens: once it finishes, the plane gives its room (nodes,
+/// names, deps, its id) to the next, so a daemon's plane holds only the requests under way.
 pub struct Scheduler {
     handle: Handle,
     owner: Option<JoinHandle<()>>,
@@ -356,9 +364,14 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    /// A scheduler of the plane `config` says, on the process's [`shared`] pool.
-    pub fn new(config: PlaneConfig, estimates: Estimates) -> Result<Scheduler, Error> {
-        Scheduler::with_pool(config, estimates, shared())
+    /// A scheduler of the plane `config` says, on the process's [`shared`] pool. The plane
+    /// asks `memo`, the database's, whether a key is settled before it runs a node of it.
+    pub fn new(
+        config: PlaneConfig,
+        estimates: Estimates,
+        memo: Box<dyn Memo + Send>,
+    ) -> Result<Scheduler, Error> {
+        Scheduler::with_pool(config, estimates, memo, shared())
     }
 
     /// A scheduler whose tasks run on `pool`.
@@ -369,10 +382,11 @@ impl Scheduler {
     pub fn with_pool(
         config: PlaneConfig,
         estimates: Estimates,
+        memo: Box<dyn Memo + Send>,
         pool: &'static Workers,
     ) -> Result<Scheduler, Error> {
         let io_threads = config.io;
-        let plane = Plane::new(config)?;
+        let plane = Plane::with_memo(config, memo)?;
         let (tx, rx) = unbounded::<Msg>();
         let (io_tx, io_rx) = unbounded::<Arc<Job>>();
         let io = (0..io_threads)
@@ -483,7 +497,12 @@ impl Owner {
             Msg::Open { request, weight, keep_going, heard } => {
                 self.heard.insert(request, heard);
                 let input = PlaneInput::Open { at_ns, request, weight, keep_going };
-                if !self.step(request, input) {
+                if self.step(request, input) {
+                    // Its room in the plane is given back once it finishes; after that a step
+                    // naming it is refused as `UnknownRequest`.
+                    let released = self.plane.release(request);
+                    self.outputs(request, released.map(|()| Vec::new()));
+                } else {
                     self.heard.remove(&request);
                 }
             }
@@ -709,11 +728,20 @@ mod tests {
         Task { spec: spec(id, deps, Pool::Work, key), kind: TaskKind(1), work }
     }
 
-    fn scheduler(workers: usize) -> Scheduler {
+    /// The database a test's work puts each key's value in before its `Done`, as real work
+    /// does; the scheduler's memo reads it.
+    type Db = Arc<Mutex<FxHashMap<Key, Outcome>>>;
+
+    fn scheduler(workers: usize) -> (Scheduler, Db) {
         let pool: &'static Workers =
             Box::leak(Box::new(Workers::new(&Topology::flat(workers), false).unwrap()));
         let config = PlaneConfig { io: 1, work: workers, budget: None, starve_after: 4 };
-        Scheduler::with_pool(config, Estimates::default(), pool).unwrap()
+        let db = Db::default();
+        let memo = {
+            let db = db.clone();
+            move |key: Key| db.lock().expect("the test's database").get(&key).cloned()
+        };
+        (Scheduler::with_pool(config, Estimates::default(), Box::new(memo), pool).unwrap(), db)
     }
 
     /// Everything the request said, up to its end, and whether it was ok.
@@ -763,17 +791,19 @@ mod tests {
         }
     }
 
-    /// Two requests of weights 1 and 3 ask for the same ten keys: each key runs once, and both
-    /// finish.
+    /// Two requests of weights 1 and 3 ask for the same ten keys: each key runs once, joined
+    /// while it runs or read from the database once done, and both finish. Finished requests
+    /// are released: a third takes their node ids again, and the database settles all of it.
     #[test]
     fn shared_keys_run_once_for_two_requests() {
-        let scheduler = scheduler(4);
+        let (scheduler, db) = scheduler(4);
         let runs: Arc<Mutex<FxHashMap<u8, u32>>> = Arc::default();
         let keyed = |id: u32, key: u8| {
-            let runs = runs.clone();
+            let (runs, db) = (runs.clone(), db.clone());
             let work: Work = Arc::new(move || {
                 *runs.lock().unwrap().entry(key).or_default() += 1;
                 std::thread::sleep(Duration::from_millis(1));
+                db.lock().unwrap().insert(Key([key; 32]), Outcome::Built);
                 Ok(Did::built())
             });
             task(id, &[], Some(key), work)
@@ -786,16 +816,30 @@ mod tests {
         scheduler.close(heavy.request);
         assert!(finish(&light).0);
         assert!(finish(&heavy).0);
-        let runs = runs.lock().unwrap();
-        assert_eq!(runs.len(), 10);
-        assert!(runs.values().all(|&it| it == 1), "{runs:?}");
+        {
+            let runs = runs.lock().unwrap();
+            assert_eq!(runs.len(), 10);
+            assert!(runs.values().all(|&it| it == 1), "{runs:?}");
+        }
+
+        let again = scheduler.open(1, false);
+        scheduler.add(again.request, (0..10).map(|key| keyed(u32::from(key), key)).collect());
+        scheduler.close(again.request);
+        let (ok, records) = finish(&again);
+        assert!(ok);
+        let cached = records
+            .iter()
+            .filter(|it| matches!(it.event, Event::Moved { state: NodeState::Cached { .. }, .. }))
+            .count();
+        assert_eq!(cached, 10);
+        assert!(runs.lock().unwrap().values().all(|&it| it == 1), "the database settled it");
     }
 
     /// A request cancelled while its first task runs: what waits for it never runs, the task
     /// runs to its end, and the request finishes not ok.
     #[test]
     fn a_cancelled_request_finishes_not_ok_and_its_running_work_completes() {
-        let scheduler = scheduler(2);
+        let (scheduler, _) = scheduler(2);
         let (started_tx, started_rx) = bounded::<()>(1);
         let (gate_tx, gate_rx) = bounded::<()>(0);
         let (ended_tx, ended_rx) = bounded::<()>(1);
@@ -825,7 +869,7 @@ mod tests {
 
     #[test]
     fn work_that_gives_way_twice_is_posted_again_and_done() {
-        let scheduler = scheduler(2);
+        let (scheduler, _) = scheduler(2);
         let tries = Arc::new(AtomicU32::new(0));
         let counted = tries.clone();
         let work: Work = Arc::new(move || {
@@ -850,7 +894,7 @@ mod tests {
     /// closed; a found node with no work fails the task that found it.
     #[test]
     fn a_task_gives_the_work_of_what_it_finds() {
-        let scheduler = scheduler(2);
+        let (scheduler, _) = scheduler(2);
         let opened = scheduler.open(2, false);
         let (request, handle) = (opened.request, scheduler.handle());
         let found_ran = Arc::new(AtomicBool::new(false));
@@ -885,7 +929,7 @@ mod tests {
 
     #[test]
     fn a_refused_input_is_heard_by_its_opener() {
-        let scheduler = scheduler(1);
+        let (scheduler, _) = scheduler(1);
         let opened = scheduler.open(0, false);
         assert!(matches!(opened.heard.recv_timeout(LONG), Ok(Heard::Refused(_))));
         let opened = scheduler.open(1, false);

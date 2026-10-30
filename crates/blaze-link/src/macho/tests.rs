@@ -26,7 +26,6 @@ fn output(arch: Arch, kind: OutputKind) -> Output {
         live: None,
         tags: 0,
         stack: None,
-        name: "hello".to_owned(),
     }
 }
 
@@ -439,6 +438,8 @@ fn classes_in_ld64_order() {
         super::compact_unwind(),
         Class::Table,
         Class::Patch,
+        Class::ThreadVars,
+        Class::RelRo,
     ];
     writer.order(&mut classes);
     assert_eq!(
@@ -450,12 +451,14 @@ fn classes_in_ld64_order() {
             Class::Rodata,
             Class::Synthetic(super::UNWIND_INFO),
             Class::EhFrame,
-            Class::InitArray,
-            super::compact_unwind(),
             Class::Got,
+            Class::InitArray,
+            Class::RelRo,
+            super::compact_unwind(),
             Class::Table,
             Class::Data,
             linkme,
+            Class::ThreadVars,
             Class::Tdata,
             Class::Tbss,
             Class::Bss,
@@ -463,7 +466,8 @@ fn classes_in_ld64_order() {
     );
     assert_eq!(writer.prot(&Class::Rodata), Prot::RX);
     assert_eq!(writer.prot(&Class::InitArray), Prot::R);
-    assert_eq!(writer.prot(&Class::Got), Prot::RW);
+    assert_eq!(writer.prot(&Class::Got), Prot::R);
+    assert_eq!(writer.prot(&Class::ThreadVars), Prot::RW);
 }
 
 #[test]
@@ -474,8 +478,9 @@ fn link_sections_and_specials() {
         writer.section("__DATA,__linkme_X,regular,no_dead_strip", false, false, false).unwrap(),
         (linkme.clone(), u32::MAX)
     );
-    assert_eq!(writer.special("\x01section$start$__DATA$__linkme_X"), Some(Special::Start(linkme.clone())));
-    assert_eq!(writer.special("\x01section$end$__DATA$__linkme_X"), Some(Special::Stop(linkme)));
+    let section = |end| Some(Special::Section { name: "__DATA,__linkme_X".to_owned(), end });
+    assert_eq!(writer.special("\x01section$start$__DATA$__linkme_X"), section(false));
+    assert_eq!(writer.special("\x01section$end$__DATA$__linkme_X"), section(true));
     assert_eq!(writer.section("__DATA,__mod_init_func,mod_init_funcs", false, false, false).unwrap().0, Class::InitArray);
     assert_eq!(writer.section("__TEXT,__text,regular,pure_instructions", false, true, false).unwrap().0, Class::Text);
     assert_eq!(writer.section("__DATA,__data", true, false, false).unwrap().0, Class::Data);
@@ -490,6 +495,24 @@ fn link_sections_and_specials() {
     assert_eq!(writer.special("__blaze_live"), Some(Special::LiveDescriptor));
     assert_eq!(writer.special("\x01section$start$__DATA$__mod_init_func"), Some(Special::Start(Class::InitArray)));
     assert_eq!(writer.special("\x01segment$start$__TEXT"), Some(Special::ImageBase));
+    let regions = hello(executable(Arch::Aarch64)).regions;
+    let segment = |name: &str| match writer.special(name) {
+        Some(Special::Placed(at)) => at(&regions),
+        other => panic!("{name}: {other:?}"),
+    };
+    assert_eq!(segment("\x01segment$end$__TEXT"), GOT);
+    assert_eq!(segment("\x01segment$start$__DATA_CONST"), GOT);
+    assert_eq!(segment("\x01segment$end$__DATA_CONST"), DATA);
+    assert_eq!(segment("\x01segment$start$__DATA"), DATA);
+    assert_eq!(segment("\x01segment$end$__DATA"), BASE + 0x10000);
+    let no_data_const: Vec<Region> =
+        regions.iter().filter(|it| it.prot != Prot::R).cloned().collect();
+    let at = |name| match writer.special(name) {
+        Some(Special::Placed(at)) => at(&no_data_const),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!((at("segment$start$__DATA_CONST"), at("segment$end$__DATA_CONST")), (GOT, GOT));
+    assert_eq!(writer.special("\x01segment$start$__LINKEDIT"), None);
     assert_eq!(writer.special("malloc"), None);
     assert_eq!(writer.special("\x01section$start$__NOPE$__x"), None);
 
@@ -498,8 +521,9 @@ fn link_sections_and_specials() {
     assert_eq!(super::classify("__DWARF", "__debug_info", 0x0200_0000).unwrap(), SectionKind::Dropped);
     assert_eq!(super::classify("__TEXT", "__cstring", macho::S_CSTRING_LITERALS).unwrap(), SectionKind::Alloc(Class::Rodata, u32::MAX));
     assert_eq!(super::classify("__DATA", "__common", macho::S_ZEROFILL).unwrap(), SectionKind::Alloc(Class::Bss, u32::MAX));
-    let tlv = Class::Named { name: "__DATA,__thread_vars".to_owned(), write: true, exec: false };
-    assert_eq!(super::classify("__DATA", "__thread_vars", macho::S_THREAD_LOCAL_VARIABLES).unwrap(), SectionKind::Alloc(tlv, u32::MAX));
+    assert_eq!(super::classify("__DATA", "__thread_vars", macho::S_THREAD_LOCAL_VARIABLES).unwrap(), SectionKind::Alloc(Class::ThreadVars, u32::MAX));
+    assert_eq!(super::classify("__DATA", "__const", macho::S_REGULAR).unwrap(), SectionKind::Alloc(Class::RelRo, u32::MAX));
+    assert_eq!(super::classify("__DATA_CONST", "__const", macho::S_REGULAR).unwrap(), SectionKind::Alloc(Class::RelRo, u32::MAX));
 }
 
 /// What a test image is made of, owned, so a `Placed` can borrow it.
@@ -521,12 +545,17 @@ struct Parts {
 }
 
 impl Parts {
-    fn placed(&self) -> Placed<'_> {
+    fn slices(&self) -> Vec<&[u8]> {
+        self.contents.iter().map(Vec::as_slice).collect()
+    }
+
+    fn placed<'a>(&'a self, contents: &'a [&'a [u8]]) -> Placed<'a> {
         Placed {
             output: &self.output,
+            name: "hello",
             plan: &self.plan,
             regions: &self.regions,
-            contents: &self.contents,
+            contents,
             libraries: &self.libraries,
             imports: &self.imports,
             got: &self.got,
@@ -535,6 +564,8 @@ impl Parts {
             exports: &self.exports,
             functions: &self.functions,
             entry: self.entry,
+            init: None,
+            fini: None,
             tls: self.tls,
             id: [7; 16],
             debug: &self.debug,
@@ -544,16 +575,18 @@ impl Parts {
 
 const BASE: u64 = 0x1_0000_0000;
 const TEXT: u64 = BASE + 0x4000;
-const INIT: u64 = BASE + 0x8000;
-const GOT: u64 = BASE + 0xc000;
-const DATA: u64 = GOT + 40;
+const GOT: u64 = BASE + 0x8000;
+const INIT: u64 = GOT + 16;
+const DATA: u64 = BASE + 0xc000;
+const VARS: u64 = DATA + 16;
 
 fn import(name: &str, library: Option<u32>, weak: bool) -> Import {
     Import { name: name.to_owned(), library, version: None, kind: SymbolKind::Function, weak }
 }
 
-/// An arm64 executable: code, an initializer, a GOT of an import, a local and a thread-local
-/// descriptor, data with a pointer slid and one bound, thread-locals and zeroed data.
+/// An arm64 executable: code, a GOT of an import and a local, an initializer, data with a
+/// pointer slid and one bound, a thread-local variable's descriptor, thread-locals and zeroed
+/// data.
 fn hello(output: Output) -> Parts {
     let writer = super::writer(&output).unwrap();
     let plan = writer.plan();
@@ -561,19 +594,21 @@ fn hello(output: Output) -> Parts {
     let regions = vec![
         region(Class::Text, TEXT, 8, 0x100, Prot::RX),
         region(Class::Synthetic(super::UNWIND_INFO), unwind, 12, 64, Prot::RX),
+        region(Class::Got, GOT, 16, 16, Prot::R),
         region(Class::InitArray, INIT, 8, 8, Prot::R),
-        region(Class::Got, GOT, 40, 40, Prot::RW),
         region(Class::Data, DATA, 16, 16, Prot::RW),
-        region(Class::Tdata, DATA + 16, 8, 8, Prot::RW),
-        region(Class::Tbss, DATA + 24, 8, 8, Prot::RW),
-        region(Class::Bss, DATA + 32, 32, 32, Prot::RW),
+        region(Class::ThreadVars, VARS, 24, 24, Prot::RW),
+        region(Class::Tdata, VARS + 24, 8, 8, Prot::RW),
+        region(Class::Tbss, VARS + 32, 8, 8, Prot::RW),
+        region(Class::Bss, VARS + 40, 32, 32, Prot::RW),
     ];
     let contents = vec![
         vec![0x1f, 0x20, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6],
         vec![1; 12],
+        [0u64, TEXT].iter().flat_map(|it| it.to_le_bytes()).collect(),
         TEXT.to_le_bytes().to_vec(),
-        [0u64, TEXT, 0, 0, 0].iter().flat_map(|it| it.to_le_bytes()).collect(),
         [TEXT, 0].iter().flat_map(|it| it.to_le_bytes()).collect(),
+        vec![0; 24],
         vec![9; 8],
         Vec::new(),
         Vec::new(),
@@ -587,14 +622,20 @@ fn hello(output: Output) -> Parts {
             Library { name: "/usr/lib/libSystem.B.dylib".to_owned(), as_needed: false },
             Library { name: "/usr/lib/libunused.dylib".to_owned(), as_needed: true },
         ],
-        imports: vec![import("free", Some(0), false), import("maybe", None, true)],
+        imports: vec![
+            import("free", Some(0), false),
+            import("maybe", None, true),
+            import("_tlv_bootstrap", Some(0), false),
+        ],
         got: vec![
             GotEntry { addr: GOT, holds: Holds::Import(0) },
             GotEntry { addr: GOT + 8, holds: Holds::Local(TEXT) },
-            GotEntry { addr: GOT + 16, holds: Holds::Tlv { offset: 0 } },
         ],
         rebase: vec![INIT, GOT + 8, DATA],
-        binds: vec![Bind { addr: DATA + 8, import: 1, addend: 0 }],
+        binds: vec![
+            Bind { addr: DATA + 8, import: 1, addend: 0 },
+            Bind { addr: VARS, import: 2, addend: 0 },
+        ],
         exports: vec![Export {
             name: "main".to_owned(),
             addr: TEXT,
@@ -612,7 +653,7 @@ fn hello(output: Output) -> Parts {
             },
         ],
         entry: Some(TEXT),
-        tls: Some(Tls { addr: DATA + 16, init: 8, size: 16, align: 8 }),
+        tls: Some(Tls { addr: VARS + 24, init: 8, size: 16, align: 8 }),
         debug: vec![(".debug_line", vec![1, 2, 3, 4]), (".debug_str_offsets", vec![5; 8])],
     }
 }
@@ -633,6 +674,7 @@ struct Read {
     info: Option<[(u32, u32); 5]>,
     symtab: Option<(u32, u32, u32, u32)>,
     dysymtab: Option<[u32; 6]>,
+    indirect_at: Option<u32>,
     starts: Option<(u32, u32)>,
     in_code: Option<(u32, u32)>,
     signature: Option<(u32, u32)>,
@@ -710,7 +752,8 @@ fn read(file: &[u8]) -> Read {
                     it.iundefsym.get(LE),
                     it.nundefsym.get(LE),
                     it.nindirectsyms.get(LE),
-                ])
+                ]);
+                read.indirect_at = Some(it.indirectsymoff.get(LE));
             }
             V::LinkeditData(data) => {
                 let it = Some((data.dataoff.get(LE), data.datasize.get(LE)));
@@ -752,7 +795,8 @@ fn symbols(file: &[u8], read: &Read) -> Vec<(String, u8, u8, u16, u64)> {
 fn executable_reads_back() {
     let parts = hello(executable(Arch::Aarch64));
     let writer = super::writer(&parts.output).unwrap();
-    let placed = parts.placed();
+    let slices = parts.slices();
+    let placed = parts.placed(&slices);
     let file = written(&*writer, &placed);
     let read = read(&file);
 
@@ -768,12 +812,12 @@ fn executable_reads_back() {
     assert_eq!(read.segments[0], ("__PAGEZERO".to_owned(), 0, BASE, 0, 0));
     assert_eq!(read.segments[1].1, BASE);
     assert_eq!(read.segments[1].3, 0);
-    assert_eq!(read.segments[2].1, INIT);
-    assert_eq!(read.segments[3].1, GOT);
+    assert_eq!(read.segments[2].1, GOT);
+    assert_eq!(read.segments[3].1, DATA);
     // `__DATA` has bytes up to its thread-locals and the rest zeroed.
     let data = &read.segments[3];
     assert!(data.4 < data.2 || data.4 == data.2);
-    assert_eq!(data.3, GOT - BASE);
+    assert_eq!(data.3, DATA - BASE);
     let linkedit = read.segments.last().unwrap();
     assert_eq!(linkedit.3 % 0x4000, 0);
     assert_eq!(linkedit.3 + linkedit.4, file.len() as u64);
@@ -786,13 +830,13 @@ fn executable_reads_back() {
         [
             ("__TEXT", "__text", TEXT, 8),
             ("__TEXT", "__unwind_info", TEXT + 0x100, 12),
+            ("__DATA_CONST", "__got", GOT, 16),
             ("__DATA_CONST", "__mod_init_func", INIT, 8),
-            ("__DATA", "__got", GOT, 16),
-            ("__DATA", "__thread_vars", GOT + 16, 24),
             ("__DATA", "__data", DATA, 16),
-            ("__DATA", "__thread_data", DATA + 16, 8),
-            ("__DATA", "__thread_bss", DATA + 24, 8),
-            ("__DATA", "__bss", DATA + 32, 32),
+            ("__DATA", "__thread_vars", VARS, 24),
+            ("__DATA", "__thread_data", VARS + 24, 8),
+            ("__DATA", "__thread_bss", VARS + 32, 8),
+            ("__DATA", "__bss", VARS + 40, 32),
         ]
     );
     let flags: Vec<u32> = read.sections.iter().map(|it| it.4 & macho::SECTION_TYPE).collect();
@@ -801,10 +845,10 @@ fn executable_reads_back() {
         [
             macho::S_REGULAR,
             macho::S_REGULAR,
-            macho::S_MOD_INIT_FUNC_POINTERS,
             macho::S_NON_LAZY_SYMBOL_POINTERS,
-            macho::S_THREAD_LOCAL_VARIABLES,
+            macho::S_MOD_INIT_FUNC_POINTERS,
             macho::S_REGULAR,
+            macho::S_THREAD_LOCAL_VARIABLES,
             macho::S_THREAD_LOCAL_REGULAR,
             macho::S_THREAD_LOCAL_ZEROFILL,
             macho::S_ZEROFILL,
@@ -830,12 +874,12 @@ fn executable_reads_back() {
     let segments: Vec<u64> = read.segments.iter().map(|it| it.1).collect();
     let mut rebases = decode_rebases(range(&file, info[0]), &segments);
     rebases.sort();
-    assert_eq!(rebases, [INIT, GOT + 8, DATA]);
+    assert_eq!(rebases, [GOT + 8, INIT, DATA]);
     let binds = decode_binds(range(&file, info[1]), &segments);
     assert_eq!(binds, [
         (GOT, 1, b"_free".to_vec(), 0, 0),
-        (GOT + 16, -2, b"__tlv_bootstrap".to_vec(), 0, 0),
         (DATA + 8, -2, b"_maybe".to_vec(), macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT, 0),
+        (VARS, 1, b"__tlv_bootstrap".to_vec(), 0, 0),
     ]);
     assert_eq!((info[2].1, info[3].1), (0, 0));
     let trie = range(&file, info[4]);
@@ -844,16 +888,19 @@ fn executable_reads_back() {
     assert_eq!(decode_trie(trie).len(), 2);
 
     let symbols = symbols(&file, &read);
-    assert_eq!(read.dysymtab.unwrap(), [1, 1, 2, 3, 2, 2]);
+    assert_eq!(read.dysymtab.unwrap(), [1, 1, 2, 3, 3, 2]);
     assert_eq!(symbols[0].0, "__ZN5hello6helper17h0123456789abcdefE");
     assert_eq!((symbols[0].1, symbols[0].2, symbols[0].4), (macho::N_SECT, 1, TEXT + 4));
     assert_eq!(symbols[1].0, "__mh_execute_header");
     assert_eq!(symbols[1].3, macho::REFERENCED_DYNAMICALLY);
     assert_eq!((symbols[2].0.as_str(), symbols[2].1), ("_main", macho::N_SECT | macho::N_EXT));
-    assert_eq!((symbols[3].0.as_str(), symbols[3].3 >> 8), ("_free", 1));
-    assert_eq!(symbols[4].0, "_maybe");
-    assert_eq!(symbols[4].3 >> 8, u16::from(macho::DYNAMIC_LOOKUP_ORDINAL));
-    assert_ne!(symbols[4].3 & macho::N_WEAK_REF, 0);
+    assert_eq!((symbols[3].0.as_str(), symbols[3].3 >> 8), ("__tlv_bootstrap", 1));
+    assert_eq!((symbols[4].0.as_str(), symbols[4].3 >> 8), ("_free", 1));
+    assert_eq!(symbols[5].0, "_maybe");
+    assert_eq!(symbols[5].3 >> 8, u16::from(macho::DYNAMIC_LOOKUP_ORDINAL));
+    assert_ne!(symbols[5].3 & macho::N_WEAK_REF, 0);
+    let indirect = range(&file, (read.indirect_at.unwrap(), 8));
+    assert_eq!(indirect, [4, 0, 0, 0, 0, 0, 0, 0x80].as_slice(), "_free, then a local");
 
     let starts = range(&file, read.starts.unwrap());
     let mut at = 0;
@@ -902,7 +949,8 @@ fn a_dylib_reads_back() {
     parts.tls = parts.tls.map(|it| Tls { addr: it.addr - delta, ..it });
     parts.debug.clear();
     let writer = super::writer(&parts.output).unwrap();
-    let placed = parts.placed();
+    let slices = parts.slices();
+    let placed = parts.placed(&slices);
     let file = written(&*writer, &placed);
     let read = read(&file);
     assert_eq!(read.filetype, macho::MH_DYLIB);
@@ -925,7 +973,10 @@ fn weak_dylib_when_every_import_is_weak() {
     let mut parts = hello(executable(Arch::Aarch64));
     parts.imports[0].weak = true;
     let writer = super::writer(&parts.output).unwrap();
-    let file = written(&*writer, &parts.placed());
+    let file = written(&*writer, &parts.placed(&parts.slices()));
+    assert_eq!(read(&file).dylibs, [(macho::LC_LOAD_DYLIB, "/usr/lib/libSystem.B.dylib".to_owned())]);
+    parts.imports[2].weak = true;
+    let file = written(&*writer, &parts.placed(&parts.slices()));
     assert_eq!(read(&file).dylibs, [(macho::LC_LOAD_WEAK_DYLIB, "/usr/lib/libSystem.B.dylib".to_owned())]);
 }
 
@@ -935,26 +986,26 @@ fn errors_name_what() {
 
     let mut parts = hello(executable(Arch::Aarch64));
     parts.rebase.push(TEXT);
-    let what = writer.file(&parts.placed()).err().unwrap().what;
+    let what = writer.file(&parts.placed(&parts.slices())).err().unwrap().what;
     assert!(what.contains("__TEXT"), "{what}");
 
     let mut parts = hello(executable(Arch::Aarch64));
-    parts.got.push(GotEntry { addr: GOT + 40, holds: Holds::TpOff(8) });
-    assert!(writer.file(&parts.placed()).is_err());
+    parts.got[1].holds = Holds::TpOff(8);
+    assert!(writer.file(&parts.placed(&parts.slices())).is_err());
 
     let mut parts = hello(executable(Arch::Aarch64));
     parts.entry = None;
-    assert!(writer.file(&parts.placed()).is_err());
+    assert!(writer.file(&parts.placed(&parts.slices())).is_err());
 
     let mut parts = hello(executable(Arch::Aarch64));
-    parts.contents[6] = vec![1];
-    assert!(writer.file(&parts.placed()).is_err(), "bytes in a zeroed region");
+    parts.contents[7] = vec![1];
+    assert!(writer.file(&parts.placed(&parts.slices())).is_err(), "bytes in a zeroed region");
 
     let mut parts = hello(executable(Arch::Aarch64));
     parts.libraries = (0..300)
         .map(|it| Library { name: format!("/usr/lib/lib{it}.dylib"), as_needed: false })
         .collect();
-    assert!(writer.file(&parts.placed()).is_err(), "too many libraries");
+    assert!(writer.file(&parts.placed(&parts.slices())).is_err(), "too many libraries");
 
     assert!(writer.apply(1, &mut [0; 4], 0, 0, 0).is_err());
 }

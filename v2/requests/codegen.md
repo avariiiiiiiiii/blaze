@@ -24,6 +24,8 @@ lane can say what an item and a body are by content. One rule matters most: `cod
 each callee by its interface hash, not by its body, so that a callee's body edit renames
 its callers' relocations without recompiling them (docs/v2-codegen.md, "Templates").
 
+> forwarded to items
+
 ## 2. link: what codegen now gives (request link.md section 1 applied)
 
 Where: `crates/blaze-link/`. This is information for link, not a change I ask of its code.
@@ -47,6 +49,8 @@ Where: `crates/blaze-link/`. This is information for link, not a change I ask of
   that slot. The replacement's own key differs (other settings). The linker must swap the
   code behind the slot of the first key and leave every caller alone.
 
+> forwarded to link: information for lane link's `crates/blaze-link/`; no change asked.
+
 ## 3. db: run codegen as a query
 
 Where: lane db (`blaze_query`, the daemon's `Cx`).
@@ -61,6 +65,8 @@ Why: `blaze_query::Cx` has no way to reach those today. The kinds are reserved i
 `crates/blaze-codegen/src/query.rs` (0x4000 to 0x4006); every key is domain-separated in
 `query::keys`.
 
+> forwarded to db
+
 ## 4. coordinator: index entry
 
 Where: `docs/v2/plan.md`.
@@ -70,3 +76,5 @@ notes now belong under `docs/v2/`, move it to `docs/v2/codegen-design.md` and fi
 links in it.
 
 Why: docs-say-what-they-are. The notes are the lane's design and nothing links them yet.
+
+> forwarded to coordinator: `docs/v2/plan.md` is the coordinator's, not among the paths `requests` applies.

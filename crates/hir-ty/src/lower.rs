@@ -1716,16 +1716,71 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, SalsaValue)]
+/// A lowered signature and what lowering it found: its diagnostics and the anonymous constants it
+/// defined. Both lists are empty for most items, and an empty `ThinVec` allocates nothing.
+#[derive(Clone, PartialEq, Eq, Hash, SalsaValue)]
 pub struct TyLoweringResult<'db, T> {
     pub value: T,
-    info: Option<Box<TyLoweringResultInfo<'db>>>,
-}
-
-#[derive(Clone, PartialEq, Eq, SalsaValue)]
-struct TyLoweringResultInfo<'db> {
     diagnostics: ThinVec<TyLoweringDiagnostic>,
     anon_consts: ThinVec<AnonConstId<'db>>,
+}
+
+const _: () = assert!(size_of::<TyLoweringResult<'static, ()>>() == 16);
+
+/// A lowered signature as read: from a query of its own item ([`TyLoweringResult`]), or from a
+/// row of a crate's batch (`lower::batch`), whose diagnostics sit in a side table.
+pub struct Lowered<'db, T: ?Sized> {
+    pub value: &'db T,
+    diagnostics: &'db [TyLoweringDiagnostic],
+    anon_consts: &'db [AnonConstId<'db>],
+}
+
+impl<T: ?Sized> Clone for Lowered<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: ?Sized> Copy for Lowered<'_, T> {}
+
+impl<'db, T: ?Sized> Lowered<'db, T> {
+    pub(crate) fn new(
+        value: &'db T,
+        diagnostics: &'db [TyLoweringDiagnostic],
+        anon_consts: &'db [AnonConstId<'db>],
+    ) -> Self {
+        Lowered { value, diagnostics, anon_consts }
+    }
+
+    #[inline]
+    pub fn diagnostics(&self) -> &'db [TyLoweringDiagnostic] {
+        self.diagnostics
+    }
+
+    #[inline]
+    pub fn defined_anon_consts(&self) -> &'db [AnonConstId<'db>] {
+        self.anon_consts
+    }
+}
+
+impl<'db, T> From<&'db TyLoweringResult<'db, T>> for Lowered<'db, T> {
+    fn from(result: &'db TyLoweringResult<'db, T>) -> Self {
+        result.as_lowered()
+    }
+}
+
+impl<T: std::fmt::Debug + ?Sized> std::fmt::Debug for Lowered<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("Lowered");
+        debug.field("value", &self.value);
+        if !self.diagnostics.is_empty() {
+            debug.field("diagnostics", &self.diagnostics);
+        }
+        if !self.anon_consts.is_empty() {
+            debug.field("defined_anon_consts", &self.anon_consts);
+        }
+        debug.finish()
+    }
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for TyLoweringResult<'_, T> {

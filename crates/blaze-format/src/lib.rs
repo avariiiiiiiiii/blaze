@@ -20,6 +20,7 @@
 //! record names one by [`SpanRef`].
 
 mod schema;
+pub mod tiers;
 
 use std::{
     fmt,

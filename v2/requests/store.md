@@ -96,3 +96,14 @@
   these through its effects. A buffer that is not aligned (sim, threads driver) must still
   work there; under io_uring an unaligned `Append` to a pack is a store bug, and the driver
   should fail it with that name, not quietly write it buffered.
+
+## Column codecs belong to the value encoding (section 17)
+
+- Who: format.
+- What: plan/design/data.md's compression paragraph puts frame-of-reference bit-packing, run
+  lengths and deltas over columns with "format, store". The store sees values as opaque bytes,
+  so it cannot pick a codec per column. Apply those codecs in the value encoding, before `put`.
+  The store's part is the last stage: it applies zstd (with a dictionary per kind) and picks the
+  hot, warm or cold form by read recency (`Store::settle`).
+- Why: a column codec chosen after the bytes are opaque would have to guess the layout. Applied
+  in the encoding, it round-trips exactly by construction, and zstd still runs over the result.

@@ -58,6 +58,91 @@ fn main() {
     });
 }
 
+const MODULES: &str = r#"
+//- minicore: sized, copy
+//- /main.rs crate:main
+mod a;
+mod b;
+struct S;
+fn main() {
+    let _: u32 = S;
+}
+//- /a.rs
+pub fn f() -> u32 {
+    super::S
+}
+mod inner {
+    fn g() {
+        let _: bool = 1u8;
+    }
+}
+//- /b.rs
+pub fn h() {
+    let _: () = 2u32;
+    let _: u8 = super::S;
+}
+"#;
+
+/// Each diagnostic's kind, in order: what stays the same between two databases of one fixture.
+fn kinds(found: &[crate::AnyDiagnostic<'_>]) -> Vec<String> {
+    found
+        .iter()
+        .map(|it| format!("{it:?}").split(['(', ' ']).next().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[test]
+fn a_check_is_the_same_whatever_order_its_modules_ran_in() {
+    let check = |db: &TestDB| {
+        crate::attach_db(db, || {
+            crate::check::check_workspace(db, false)
+                .iter()
+                .map(|(_, found)| kinds(found))
+                .collect::<Vec<_>>()
+        })
+    };
+    let in_order = TestDB::with_files(MODULES);
+    let reversed = TestDB::with_files(MODULES);
+    reversed.reverse_batches();
+    let found = check(&in_order);
+    assert_eq!(found.len(), 1, "one workspace crate");
+    assert!(
+        found[0].iter().filter(|it| *it == "TypeMismatch").count() >= 4,
+        "every module's mismatches are there: {found:?}"
+    );
+    assert_eq!(found, check(&reversed));
+}
+
+#[test]
+fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
+    let db = TestDB::with_files(MODULES);
+    db.reverse_batches();
+    crate::attach_db(&db, || {
+        let krate = crate::check::workspace_crates(&db)[0];
+        let modules = crate::check::file_modules(&db, krate);
+        assert_eq!(modules.len(), 3, "`main`, `a` and `b`; `a::inner` goes with `a`");
+        let one_by_one: Vec<_> = modules
+            .iter()
+            .flat_map(|&it| crate::check::check_module(&db, it, false, None))
+            .collect();
+        let batch = crate::check::check_crate(&db, krate, false, None);
+        assert_eq!(kinds(&batch), kinds(&one_by_one));
+        assert_eq!(format!("{batch:?}"), format!("{one_by_one:?}"));
+    });
+}
+
+#[test]
+fn a_check_of_some_bodies_leaves_the_others_out() {
+    let db = TestDB::with_files(MODULES);
+    crate::attach_db(&db, || {
+        let krate = crate::check::workspace_crates(&db)[0];
+        let main = crate::DefWithBody::from(function(&db, "main"));
+        let only_main = |it: crate::DefWithBody| it == main;
+        let found = crate::check::check_crate(&db, krate, false, Some(&only_main));
+        assert_eq!(kinds(&found), ["TypeMismatch"], "{found:?}");
+    });
+}
+
 const MOVED_TWICE: &str = r#"
 //- minicore: sized, copy
 struct S;

@@ -13,7 +13,7 @@ use super::{
     BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, Elf, GNU_HASH, INTERP, RELA_DYN, Segment, VERNEED,
     VERSYM, error,
 };
-use crate::model::{Class, Counts, Holds, Placed, Region, SymbolKind};
+use crate::model::{Class, Counts, Holds, Placed, Region, SymbolKind, Tls};
 use crate::{LinkError, Output, OutputKind};
 
 /// `.dynamic` entries besides `DT_NEEDED`: at most one of each tag [`Tables::of`] writes.
@@ -403,7 +403,10 @@ impl Tables {
         if let Some(soname) = soname {
             entry(elf::DT_SONAME, u64::from(soname));
         }
-        let flags = elf::DF_BIND_NOW | if shared { elf::DF_SYMBOLIC } else { 0 };
+        let static_tls = shared && relocations.iter().any(|it| it.r_type == types(output.arch).tpoff64);
+        let flags = elf::DF_BIND_NOW
+            | if shared { elf::DF_SYMBOLIC } else { 0 }
+            | if static_tls { elf::DF_STATIC_TLS } else { 0 };
         entry(elf::DT_FLAGS, u64::from(flags));
         let flags_1 = elf::DF_1_NOW | if shared { 0 } else { elf::DF_1_PIE };
         entry(elf::DT_FLAGS_1, u64::from(flags_1));
@@ -547,11 +550,19 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<Vec<Re
         writable(at, "a GOT cell")?;
         match &cell.holds {
             Holds::Local(_) => {}
-            Holds::TpOff(_) if shared => {
-                return Err(error(format!(
-                    "the GOT cell at {at:#x} holds a thread pointer offset, which a shared library's \
-                     thread-locals don't have until it is loaded: reach them through a descriptor"
-                )));
+            // A shared library's TLS block is placed when it is loaded: the loader adds the
+            // block's offset from the thread pointer to the variable's offset in it.
+            &Holds::TpOff(tp) if shared => {
+                let tls = placed.tls.ok_or_else(|| {
+                    error(format!("the GOT cell at {at:#x} holds a thread pointer offset in an image with no TLS"))
+                })?;
+                let addend = block_offset(writer.output.arch, tls, tp);
+                if addend < 0 || addend as u64 > tls.size {
+                    return Err(error(format!(
+                        "the GOT cell at {at:#x} holds thread pointer offset {tp}, outside the TLS template"
+                    )));
+                }
+                other.push(Rela { at, r_type: types.tpoff64, sym: 0, addend });
             }
             Holds::TpOff(_) => {}
             Holds::Import(index) => {
@@ -574,6 +585,16 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<Vec<Re
     other.sort_unstable();
     relative.extend(other);
     Ok(relative)
+}
+
+/// The offset in the TLS template of the thread-local at `tp` from the thread pointer: the
+/// inverse of [`crate::reloc::tp_offset`].
+fn block_offset(arch: Arch, tls: Tls, tp: i64) -> i64 {
+    let align = tls.align.max(1);
+    match arch {
+        Arch::Aarch64 => tp - 16u64.next_multiple_of(align) as i64,
+        Arch::X86_64 | Arch::Wasm32 => tp + tls.size.next_multiple_of(align) as i64,
+    }
 }
 
 const BLOOM_SHIFT: u32 = 26;

@@ -1,13 +1,17 @@
 //! `cargo run --release -p syntax --example trees -- DIR...`: every `.rs` file under the
-//! directories parsed into green trees and into flat ones, on one thread: the time to parse,
-//! the bytes all the trees hold at once, and the time to walk every node and token of each
-//! through the cursor's API, as lowering does, then every node alone, as an ast id map does,
-//! and one node in 16 found again from a pointer, as a diagnostic's span is.
+//! directories parsed in full and as an outline (its `fn` bodies lazy), on one thread: the time
+//! to parse, the bytes all the trees hold at once besides the texts they share, and the time to
+//! walk every node and token of each through the cursor's API, as lowering does (which parses
+//! an outline's bodies), the bytes held then, then every node alone, as an ast id map does, and
+//! one node in 16 found again from a pointer, as a diagnostic's span is.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicIsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicIsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -50,16 +54,22 @@ struct Measured {
     parsed: Duration,
     held: isize,
     walked: Duration,
+    held_walked: isize,
     nodes: Duration,
     found: Duration,
     elements: usize,
 }
 
-fn measure(texts: &[String], green: bool) -> Measured {
-    syntax::set_green_trees(green);
+fn measure(texts: &[Arc<str>], outline: bool) -> Measured {
     let before = HELD.load(Ordering::Relaxed);
     let start = Instant::now();
-    let parses: Vec<_> = texts.iter().map(|it| SourceFile::parse(it, Edition::CURRENT)).collect();
+    let parses: Vec<_> = texts
+        .iter()
+        .map(|it| match outline {
+            true => SourceFile::parse_outline(it.clone(), Edition::CURRENT),
+            false => SourceFile::parse_shared(it.clone(), Edition::CURRENT),
+        })
+        .collect();
     let parsed = start.elapsed();
     let held = HELD.load(Ordering::Relaxed) - before;
     let start = Instant::now();
@@ -73,6 +83,7 @@ fn measure(texts: &[String], green: bool) -> Measured {
         }
     }
     let walked = start.elapsed();
+    let held_walked = HELD.load(Ordering::Relaxed) - before;
     let start = Instant::now();
     let mut ptrs = Vec::new();
     for parse in &parses {
@@ -105,7 +116,7 @@ fn measure(texts: &[String], green: bool) -> Measured {
         }
         last = now;
     }
-    Measured { parsed, held, walked, nodes, found, elements }
+    Measured { parsed, held, walked, held_walked, nodes, found, elements }
 }
 
 fn main() {
@@ -113,27 +124,28 @@ fn main() {
     for dir in std::env::args().skip(1) {
         files(Path::new(&dir), &mut paths);
     }
-    let texts: Vec<String> =
-        paths.iter().filter_map(|it| std::fs::read_to_string(it).ok()).collect();
+    let texts: Vec<Arc<str>> =
+        paths.iter().filter_map(|it| std::fs::read_to_string(it).ok()).map(Arc::from).collect();
     let bytes: usize = texts.iter().map(|it| it.len()).sum();
-    let flat = measure(&texts, false);
-    let green = measure(&texts, true);
-    assert_eq!(flat.elements, green.elements, "the trees have the same elements");
+    let full = measure(&texts, false);
+    let outline = measure(&texts, true);
+    assert_eq!(full.elements, outline.elements, "the trees have the same elements");
     let ms = |it: Duration| it.as_secs_f64() * 1e3;
     let mb = |it: isize| it as f64 / (1 << 20) as f64;
     println!(
         "{} files, {:.1} MB of text, {} nodes and tokens",
         texts.len(),
         bytes as f64 / (1 << 20) as f64,
-        flat.elements
+        full.elements
     );
-    for (name, it) in [("green", &green), ("flat", &flat)] {
+    for (name, it) in [("full", &full), ("outline", &outline)] {
         println!(
-            "{name:5}: parsed in {:8.1} ms, holds {:8.1} MB, walked in {:8.1} ms, \
-             its nodes in {:8.1} ms, one pointer in 16 found in {:8.1} ms",
+            "{name:7}: parsed in {:8.1} ms, holds {:8.1} MB, walked in {:8.1} ms, \
+             then holds {:8.1} MB, its nodes in {:8.1} ms, one pointer in 16 found in {:8.1} ms",
             ms(it.parsed),
             mb(it.held),
             ms(it.walked),
+            mb(it.held_walked),
             ms(it.nodes),
             ms(it.found)
         );

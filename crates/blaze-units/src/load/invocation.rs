@@ -1,0 +1,462 @@
+//! The load's first query, the only one that reads the view's configuration
+//! (docs/v2/plan/lanes/cargo/notes.md section 1): the cargo command line parsed as cargo parses
+//! it, and of the environment only the variables cargo reads by name, so a change to any other
+//! variable reruns this query alone.
+
+use blaze_format::SchemaHash;
+use blaze_ids::ContentId;
+use blaze_query::{Cancelled, Cx, Query, QueryKind};
+use serde::{Deserialize, Serialize};
+
+use super::files::{MountTable, ancestors};
+use crate::query::{BuildConfig, Cbor, Command, LoadError, Versioned, key_input, producer};
+
+/// The command line as cargo reads it, and what of the environment cargo reads.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Asked {
+    pub command: Option<Command>,
+    pub root: String,
+    pub cwd: String,
+    /// Sorted by name: only what cargo reads by name.
+    pub env: Vec<(String, String)>,
+    pub host: String,
+    pub library: String,
+    pub packages: Vec<String>,
+    pub workspace: bool,
+    pub exclude: Vec<String>,
+    pub lib: bool,
+    pub bins: Vec<String>,
+    pub all_bins: bool,
+    pub examples: Vec<String>,
+    pub all_examples: bool,
+    pub tests: Vec<String>,
+    pub all_tests: bool,
+    pub benches: Vec<String>,
+    pub all_benches: bool,
+    pub all_targets: bool,
+    /// `cargo test --doc`.
+    pub doc: bool,
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub no_default_features: bool,
+    pub release: bool,
+    pub profile: Option<String>,
+    pub targets: Vec<String>,
+    pub target_dir: Option<String>,
+    pub manifest_path: Option<String>,
+    pub locked: bool,
+    pub offline: bool,
+    pub frozen: bool,
+    /// `--config`, in order.
+    pub config: Vec<String>,
+    /// `-Z`, in order.
+    pub unstable: Vec<String>,
+    pub jobs: Option<u32>,
+    pub ignore_rust_version: bool,
+}
+
+impl Asked {
+    pub fn command(&self) -> Command {
+        self.command.unwrap_or(Command::Build)
+    }
+
+    /// The command as cargo names it, for `alias.<command>`.
+    pub fn command_name(&self) -> &'static str {
+        match self.command() {
+            Command::Build => "build",
+            Command::Check => "check",
+            Command::Test => "test",
+            Command::Bench => "bench",
+            Command::Run => "run",
+        }
+    }
+
+    pub fn env(&self, name: &str) -> Option<&str> {
+        self.env.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    }
+
+    /// `--offline`, `--frozen` or `net.offline`'s flag, as cargo's messages name it.
+    pub fn offline_flag(&self, net_offline: bool) -> Option<&'static str> {
+        match () {
+            _ if self.frozen => Some("--frozen"),
+            _ if self.offline || net_offline => Some("--offline"),
+            _ => None,
+        }
+    }
+
+    /// `--locked`, `--frozen`, as cargo's lock file error names the flag.
+    pub fn locked_flag(&self) -> Option<&'static str> {
+        match () {
+            _ if self.frozen => Some("--frozen"),
+            _ if self.locked => Some("--locked"),
+            _ => None,
+        }
+    }
+}
+
+/// The view's configuration as the load reads it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Configured {
+    pub asked: Result<Asked, LoadError>,
+    pub mounts: MountTable,
+}
+
+impl Versioned for Configured {
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 1");
+}
+
+impl Versioned for Asked {
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked 1");
+}
+
+/// Reads `Cx::config`: the [`BuildConfig`] narrowed.
+pub(crate) struct Invocation;
+
+impl Query for Invocation {
+    const KIND: QueryKind = QueryKind(0x6010);
+    const NAME: &'static str = "cargo invocation";
+    const PRODUCER: ContentId = producer("blaze v2 cargo invocation 1");
+    type Key = ();
+    type Value = Cbor<Configured>;
+
+    fn input(key: &()) -> ContentId {
+        key_input("blaze v2 cargo invocation key 1", key)
+    }
+
+    fn execute(cx: &mut Cx<'_>, _: &()) -> Result<Cbor<Configured>, Cancelled> {
+        let bytes = cx.config()?;
+        Ok(Cbor(configure(bytes)))
+    }
+}
+
+/// Of the invocation, the command line alone.
+pub(crate) struct Asking;
+
+impl Query for Asking {
+    const KIND: QueryKind = QueryKind(0x6011);
+    const NAME: &'static str = "cargo asked";
+    const PRODUCER: ContentId = producer("blaze v2 cargo asked 1");
+    type Key = ();
+    type Value = Cbor<Result<Asked, LoadError>>;
+
+    fn input(key: &()) -> ContentId {
+        key_input("blaze v2 cargo asked key 1", key)
+    }
+
+    fn execute(cx: &mut Cx<'_>, _: &()) -> Result<Cbor<Result<Asked, LoadError>>, Cancelled> {
+        Ok(Cbor(cx.get::<Invocation>(&())?.get().asked))
+    }
+}
+
+impl Versioned for Result<Asked, LoadError> {
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo asked or not 1");
+}
+
+fn configure(bytes: &[u8]) -> Configured {
+    let empty = MountTable { mounts: Vec::new(), outside: Vec::new(), known: Vec::new() };
+    let config = match BuildConfig::decode(bytes) {
+        Ok(config) => config,
+        Err(what) => return Configured { asked: Err(LoadError { what, at: None }), mounts: empty },
+    };
+    let invocation = config.invocation;
+    let env: Vec<(String, String)> =
+        invocation.env.into_iter().filter(|(name, _)| read_by_cargo(name)).collect();
+    let mut known: Vec<String> = Vec::new();
+    for dir in ancestors(&format!("{}/x", invocation.root)).into_iter().chain(ancestors(&format!("{}/x", invocation.cwd))) {
+        if !known.contains(&dir) {
+            known.push(dir);
+        }
+    }
+    let lookup = |name: &str| env.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str());
+    let home = match lookup("CARGO_HOME") {
+        Some(home) if home.starts_with('/') => Some(home.to_owned()),
+        Some(home) => Some(format!("{}/{home}", invocation.cwd)),
+        None => lookup("HOME").filter(|it| !it.is_empty()).map(|home| format!("{home}/.cargo")),
+    };
+    if let Some(home) = home.as_deref().and_then(|it| super::files::normal(std::path::Path::new(it))) {
+        if !known.contains(&home) {
+            known.push(home);
+        }
+    }
+    known.sort();
+    let mut outside = invocation.files;
+    outside.sort();
+    let mut mounts = config.mounts;
+    mounts.sort();
+    let mounts = MountTable { mounts, outside, known };
+    let mut asked = Asked {
+        root: invocation.root,
+        cwd: invocation.cwd,
+        env,
+        host: config.host,
+        library: config.library,
+        ..Asked::default()
+    };
+    asked.command = Some(invocation.command);
+    let asked = parse(invocation.command, &invocation.args, asked).map_err(|what| LoadError { what, at: None });
+    Configured { asked, mounts }
+}
+
+/// The variables cargo reads by name (cargo-notes section 1): no other one is kept.
+fn read_by_cargo(name: &str) -> bool {
+    name.starts_with("CARGO_")
+        || matches!(
+            name,
+            "RUSTFLAGS" | "RUSTDOCFLAGS" | "HOME" | "USERPROFILE" | "__CARGO_DEFAULT_LIB_METADATA"
+        )
+}
+
+/// How an argument of cargo's takes a value.
+enum Takes {
+    Flag(fn(&mut Asked)),
+    Value(fn(&mut Asked, String) -> Result<(), String>),
+}
+
+/// cargo's arguments of the building commands, by long name; `short` is its letter.
+fn argument(command: Command, name: &str) -> Option<Takes> {
+    let common: Option<Takes> = match name {
+        "package" => Some(Takes::Value(|a, v| {
+            a.packages.push(v);
+            Ok(())
+        })),
+        "workspace" | "all" => Some(Takes::Flag(|a| a.workspace = true)),
+        "exclude" => Some(Takes::Value(|a, v| {
+            a.exclude.push(v);
+            Ok(())
+        })),
+        "lib" => Some(Takes::Flag(|a| a.lib = true)),
+        "bin" => Some(Takes::Value(|a, v| {
+            a.bins.push(v);
+            Ok(())
+        })),
+        "bins" => Some(Takes::Flag(|a| a.all_bins = true)),
+        "example" => Some(Takes::Value(|a, v| {
+            a.examples.push(v);
+            Ok(())
+        })),
+        "examples" => Some(Takes::Flag(|a| a.all_examples = true)),
+        "test" => Some(Takes::Value(|a, v| {
+            a.tests.push(v);
+            Ok(())
+        })),
+        "tests" => Some(Takes::Flag(|a| a.all_tests = true)),
+        "bench" => Some(Takes::Value(|a, v| {
+            a.benches.push(v);
+            Ok(())
+        })),
+        "benches" => Some(Takes::Flag(|a| a.all_benches = true)),
+        "all-targets" => Some(Takes::Flag(|a| a.all_targets = true)),
+        "features" => Some(Takes::Value(|a, v| {
+            a.features.extend(v.split([' ', ',']).filter(|it| !it.is_empty()).map(str::to_owned));
+            Ok(())
+        })),
+        "all-features" => Some(Takes::Flag(|a| a.all_features = true)),
+        "no-default-features" => Some(Takes::Flag(|a| a.no_default_features = true)),
+        "release" => Some(Takes::Flag(|a| a.release = true)),
+        "profile" => Some(Takes::Value(|a, v| {
+            a.profile = Some(v);
+            Ok(())
+        })),
+        "target" => Some(Takes::Value(|a, v| {
+            a.targets.push(v);
+            Ok(())
+        })),
+        "target-dir" => Some(Takes::Value(|a, v| {
+            a.target_dir = Some(v);
+            Ok(())
+        })),
+        "manifest-path" => Some(Takes::Value(|a, v| {
+            a.manifest_path = Some(v);
+            Ok(())
+        })),
+        "locked" => Some(Takes::Flag(|a| a.locked = true)),
+        "offline" => Some(Takes::Flag(|a| a.offline = true)),
+        "frozen" => Some(Takes::Flag(|a| a.frozen = true)),
+        "config" => Some(Takes::Value(|a, v| {
+            a.config.push(v);
+            Ok(())
+        })),
+        "jobs" => Some(Takes::Value(|a, v| {
+            let jobs: i64 = v.parse().map_err(|_| {
+                format!("invalid value '{v}' for '--jobs <N>': invalid digit found in string")
+            })?;
+            if jobs == 0 {
+                return Err("\"0\" is not a valid value for jobs".to_owned());
+            }
+            a.jobs = Some(if jobs < 0 { 1 } else { u32::try_from(jobs).unwrap_or(u32::MAX) });
+            Ok(())
+        })),
+        "ignore-rust-version" => Some(Takes::Flag(|a| a.ignore_rust_version = true)),
+        // What changes only what is printed or how the build runs, not what is built: the CLI's.
+        "verbose" | "quiet" | "keep-going" | "future-incompat-report" | "unit-graph" => {
+            Some(Takes::Flag(|_| {}))
+        }
+        "color" | "message-format" | "lockfile-path" | "artifact-dir" => Some(Takes::Value(|_, _| Ok(()))),
+        _ => None,
+    };
+    if common.is_some() {
+        return common;
+    }
+    match (command, name) {
+        (Command::Test, "doc") => Some(Takes::Flag(|a| a.doc = true)),
+        (Command::Test | Command::Bench, "no-run" | "no-fail-fast") => Some(Takes::Flag(|_| {})),
+        _ => None,
+    }
+}
+
+fn short(letter: char) -> Option<&'static str> {
+    Some(match letter {
+        'p' => "package",
+        'F' => "features",
+        'r' => "release",
+        'j' => "jobs",
+        'v' => "verbose",
+        'q' => "quiet",
+        _ => return None,
+    })
+}
+
+/// The arguments after the subcommand and before `--`, as clap reads cargo's.
+fn parse(command: Command, args: &[String], mut asked: Asked) -> Result<Asked, String> {
+    let mut args = args.iter();
+    let mut positional = 0;
+    while let Some(arg) = args.next() {
+        let (name, inline): (String, Option<String>) = if let Some(long) = arg.strip_prefix("--") {
+            match long.split_once('=') {
+                Some((name, value)) => (name.to_owned(), Some(value.to_owned())),
+                None => (long.to_owned(), None),
+            }
+        } else if let Some(rest) = arg.strip_prefix('-').filter(|it| !it.is_empty()) {
+            let mut letters = rest.chars();
+            let letter = letters.next().unwrap_or('-');
+            if letter == 'Z' {
+                let value = match letters.as_str() {
+                    "" => args.next().cloned().ok_or_else(|| missing("-Z <FLAG>"))?,
+                    attached => attached.to_owned(),
+                };
+                asked.unstable.push(value);
+                continue;
+            }
+            let Some(long) = short(letter) else { return Err(unexpected(arg)) };
+            let attached = letters.as_str();
+            match argument(command, long) {
+                Some(Takes::Flag(set)) => {
+                    set(&mut asked);
+                    for letter in attached.chars() {
+                        match short(letter).and_then(|it| argument(command, it)) {
+                            Some(Takes::Flag(set)) => set(&mut asked),
+                            _ => return Err(unexpected(&format!("-{letter}"))),
+                        }
+                    }
+                    continue;
+                }
+                Some(Takes::Value(_)) if !attached.is_empty() => {
+                    (long.to_owned(), Some(attached.trim_start_matches('=').to_owned()))
+                }
+                _ => (long.to_owned(), None),
+            }
+        } else {
+            match command {
+                Command::Test | Command::Bench if positional == 0 => {
+                    positional += 1;
+                    continue;
+                }
+                Command::Run => break,
+                _ => return Err(unexpected(arg)),
+            }
+        };
+        match argument(command, &name) {
+            Some(Takes::Flag(set)) => {
+                if inline.is_some() {
+                    return Err(format!("unexpected value for '--{name}' found; no more were expected"));
+                }
+                set(&mut asked);
+            }
+            Some(Takes::Value(set)) => {
+                let value = match inline {
+                    Some(value) => value,
+                    None => args.next().cloned().ok_or_else(|| missing(&format!("--{name} <VALUE>")))?,
+                };
+                set(&mut asked, value)?;
+            }
+            None => return Err(unexpected(&format!("--{name}"))),
+        }
+    }
+    Ok(asked)
+}
+
+fn unexpected(arg: &str) -> String {
+    format!("unexpected argument '{arg}' found")
+}
+
+fn missing(what: &str) -> String {
+    format!("a value is required for '{what}' but none was supplied")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asked(command: Command, args: &[&str]) -> Result<Asked, String> {
+        let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
+        parse(command, &args, Asked::default())
+    }
+
+    #[test]
+    fn cargos_flags_are_read() {
+        let it = asked(
+            Command::Build,
+            &["-p", "a", "--package=b", "-Fx,y", "--features", "z w", "-rv", "--target", "wasm32-wasip1", "-j4", "-Zbuild-std"],
+        )
+        .unwrap();
+        assert_eq!(it.packages, ["a", "b"]);
+        assert_eq!(it.features, ["x", "y", "z", "w"]);
+        assert!(it.release);
+        assert_eq!(it.targets, ["wasm32-wasip1"]);
+        assert_eq!(it.jobs, Some(4));
+        assert_eq!(it.unstable, ["build-std"]);
+    }
+
+    #[test]
+    fn a_test_takes_one_filter_and_run_its_programs_arguments() {
+        let it = asked(Command::Test, &["foo", "--lib", "--doc"]).unwrap();
+        assert!(it.lib && it.doc);
+        assert_eq!(asked(Command::Test, &["foo", "bar"]).unwrap_err(), "unexpected argument 'bar' found");
+        let run = asked(Command::Run, &["--bin", "x", "arg", "--release"]).unwrap();
+        assert_eq!(run.bins, ["x"]);
+        assert!(!run.release, "what follows the program's first argument is its own");
+        assert_eq!(asked(Command::Build, &["--nope"]).unwrap_err(), "unexpected argument '--nope' found");
+        assert_eq!(asked(Command::Build, &["--doc"]).unwrap_err(), "unexpected argument '--doc' found");
+        assert!(asked(Command::Build, &["--target"]).unwrap_err().starts_with("a value is required"));
+    }
+
+    #[test]
+    fn only_what_cargo_reads_is_kept() {
+        let config = BuildConfig {
+            invocation: crate::query::Invocation {
+                command: Command::Build,
+                args: vec![],
+                root: "/w".to_owned(),
+                cwd: "/w/a".to_owned(),
+                env: vec![
+                    ("CARGO_TARGET_DIR".to_owned(), "/t".to_owned()),
+                    ("HOME".to_owned(), "/home/u".to_owned()),
+                    ("PATH".to_owned(), "/bin".to_owned()),
+                    ("RUSTFLAGS".to_owned(), "-Dwarnings".to_owned()),
+                    ("SECRET".to_owned(), "x".to_owned()),
+                ],
+                files: vec![],
+            },
+            mounts: vec![],
+            host: "x86_64-unknown-linux-gnu".to_owned(),
+            library: "/rustc/0/library".to_owned(),
+        };
+        let configured = configure(&config.encode());
+        let asked = configured.asked.unwrap();
+        let names: Vec<&str> = asked.env.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["CARGO_TARGET_DIR", "HOME", "RUSTFLAGS"]);
+        assert!(configured.mounts.known.contains(&"/home/u/.cargo".to_owned()));
+        assert!(configured.mounts.known.contains(&"/w".to_owned()));
+        assert!(configured.mounts.known.contains(&"/".to_owned()));
+    }
+}

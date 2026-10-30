@@ -1,6 +1,6 @@
-//! The negative-fact indexes (docs/v2/plan/lanes/items.md section 6.2): the impls of a trait by simplified
-//! self type, and what a name is in a scope, each answering its question both ways ("no impl",
-//! "nothing by that name" are answers too).
+//! The negative-fact indexes (docs/v2/plan/lanes/items.md section 6.2): the impls of a trait by
+//! simplified self type, and what a name is in a scope, each answering its question both ways
+//! ("no impl", "nothing by that name" are answers too).
 //!
 //! Each is built from salsa queries in layers, so an edit reruns only the groupings it touches
 //! and every layer above backdates where its answer stayed the same:
@@ -20,7 +20,7 @@
 //! found in every crate's modules; a trait declared in a body is visible only in that body,
 //! whose own edit reruns whatever read it.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use base_db::Crate;
 use blaze_ids::{ContentId, Hasher};
@@ -42,14 +42,21 @@ use hir_ty::{
 use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
 
 use crate::{
-    ImplIndexKey, InterfaceHash, ItemId, ItemKey, NameHash, ScopeIndexKey, SimplifiedType,
+    ImplIndexKey, InterfaceHash, ItemId, ItemKey, NAME_DOMAIN, NameHash, ScopeIndexKey,
+    SimplifiedType,
     hash::{self, Unhashable},
-    key::{self, Resolved},
+    key::{self, KeyHashing, Resolved},
 };
 
 const IMPLS_DOMAIN: &str = "blaze v2 index impls 1";
 const SCOPE_DOMAIN: &str = "blaze v2 index scope 1";
 const BUILTIN_DERIVE_DOMAIN: &str = "blaze v2 builtin derive interface 1";
+
+/// The hash of each of `names`, in order, as [`key::name_hash`] gives it, in one batched call.
+pub(crate) fn name_hashes<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<NameHash> {
+    let inputs: Vec<&[u8]> = names.into_iter().map(str::as_bytes).collect();
+    ContentId::of_many(NAME_DOMAIN, &inputs).into_iter().map(NameHash).collect()
+}
 
 /// The impls of `key.trait_` whose simplified self type is `key.self_ty`, by key and
 /// interface hash, sorted; empty is "no impl". Answers `Implements` both ways.
@@ -351,15 +358,26 @@ fn trait_impls_in(db: &dyn HirDatabase, krate: Crate, trait_: TraitId) -> Box<[G
     found.into()
 }
 
-/// The impls of `trait_` in every crate, sorted by key.
+/// The impls of `trait_` in every crate, sorted by simplified self type (the blanket ones
+/// first), then key: one self type's are a run found by binary search.
 #[salsa::tracked(returns(deref))]
 pub(crate) fn trait_impls(db: &dyn HirDatabase, trait_: TraitId) -> Box<[Grouped]> {
     let mut found: Vec<Grouped> = base_db::all_crates(db)
         .iter()
         .flat_map(|&krate| trait_impls_in(db, krate, trait_).iter().copied())
         .collect();
-    found.sort_unstable_by_key(|it| it.key);
+    found.sort_unstable_by_key(|it| (it.self_ty, it.key));
     found.into()
+}
+
+/// The run of `impls` (sorted as [`trait_impls`]) whose self type is `self_ty`.
+fn run(impls: &[Grouped], self_ty: Option<SimplifiedType>) -> Box<[(ItemKey, AnyImpl)]> {
+    let start = impls.partition_point(|it| it.self_ty < self_ty);
+    impls[start..]
+        .iter()
+        .take_while(|it| it.self_ty == self_ty)
+        .map(|it| (it.key, it.imp))
+        .collect()
 }
 
 /// The impls of `trait_` whose simplified self type is `self_ty`, sorted by key.
@@ -369,11 +387,7 @@ pub(crate) fn impls_of(
     trait_: TraitId,
     self_ty: SimplifiedType,
 ) -> Box<[(ItemKey, AnyImpl)]> {
-    trait_impls(db, trait_)
-        .iter()
-        .filter(|it| it.self_ty == Some(self_ty))
-        .map(|it| (it.key, it.imp))
-        .collect()
+    run(trait_impls(db, trait_), Some(self_ty))
 }
 
 /// The blanket impls of `trait_`, sorted by key.
@@ -382,11 +396,7 @@ pub(crate) fn blanket_impls_of(
     db: &dyn HirDatabase,
     trait_: TraitId,
 ) -> Box<[(ItemKey, AnyImpl)]> {
-    trait_impls(db, trait_)
-        .iter()
-        .filter(|it| it.self_ty.is_none())
-        .map(|it| (it.key, it.imp))
-        .collect()
+    run(trait_impls(db, trait_), None)
 }
 
 /// The inherent impls of `krate`, by the hash of their simplified self type, then key.
@@ -433,20 +443,23 @@ pub(crate) fn inherent_impls_of(
 /// has, then key.
 #[salsa::tracked(returns(deref))]
 fn traits_in(db: &dyn HirDatabase, krate: Crate) -> Box<[(NameHash, ItemKey, TraitId)]> {
-    let mut found = Vec::new();
+    let mut names = Vec::new();
+    let mut traits = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         for def in module.scope(db).declarations() {
             let ModuleDefId::TraitId(trait_) = def else { continue };
             let key = key::item_key(db, ItemId::Trait(trait_));
-            found.extend(
-                trait_
-                    .trait_items(db)
-                    .items
-                    .iter()
-                    .map(|(name, _)| (key::name_hash(name.as_str()), key, trait_)),
-            );
+            for (name, _) in trait_.trait_items(db).items.iter() {
+                names.push(name.as_str());
+                traits.push((key, trait_));
+            }
         }
     }
+    let mut found: Vec<_> = name_hashes(names)
+        .into_iter()
+        .zip(traits)
+        .map(|(name, (key, trait_))| (name, key, trait_))
+        .collect();
     found.sort_unstable_by_key(|&(name, key, _)| (name, key));
     found.dedup_by_key(|&mut (name, key, _)| (name, key));
     found.into()
@@ -490,32 +503,34 @@ pub(crate) enum ScopeOwner {
 fn scope_names(db: &dyn HirDatabase, owner: ScopeOwner, _: ()) -> Box<[(NameHash, ScopeEntry)]> {
     let mut found: Vec<(NameHash, ScopeEntry)> = match owner {
         ScopeOwner::Module(module) => module_names(db, module),
-        ScopeOwner::Enum(it) => it
-            .enum_variants(db)
-            .variants
-            .iter()
-            .enumerate()
-            .map(|(position, (name, &(variant, _)))| {
-                let entry = ScopeEntry::Variant {
-                    variant: key::variant_key(db, variant),
-                    position: position as u32,
-                };
-                (key::name_hash(name.as_str()), entry)
-            })
-            .collect(),
+        ScopeOwner::Enum(it) => {
+            let variants = &it.enum_variants(db).variants;
+            name_hashes(variants.keys().map(|name| name.as_str()))
+                .into_iter()
+                .zip(variants.values())
+                .enumerate()
+                .map(|(position, (name, &(variant, _)))| {
+                    let entry = ScopeEntry::Variant {
+                        variant: key::variant_key(db, variant),
+                        position: position as u32,
+                    };
+                    (name, entry)
+                })
+                .collect()
+        }
         ScopeOwner::Variant(variant) => {
             let visibilities = VariantFields::field_visibilities(db, variant);
-            variant
-                .fields(db)
-                .fields()
-                .iter()
-                .map(|(field, data)| {
+            let fields = variant.fields(db).fields();
+            name_hashes(fields.iter().map(|(_, data)| data.name.as_str()))
+                .into_iter()
+                .zip(fields.iter())
+                .map(|(name, (field, _))| {
                     let visibility = visibilities.get(field).expect("every field has a visibility");
                     let entry = ScopeEntry::Field {
                         position: u32::from(field.into_raw()),
                         visibility: vis(db, *visibility),
                     };
-                    (key::name_hash(data.name.as_str()), entry)
+                    (name, entry)
                 })
                 .collect()
         }
@@ -530,21 +545,22 @@ fn assoc_names(
     db: &dyn HirDatabase,
     items: &[(hir_expand::name::Name, AssocItemId)],
 ) -> Vec<(NameHash, ScopeEntry)> {
-    let mut by_name: BTreeMap<NameHash, Vec<(ItemKey, Vis)>> = BTreeMap::new();
-    for (name, item) in items {
+    let names = name_hashes(items.iter().map(|(name, _)| name.as_str()));
+    let mut by_name: HashMap<NameHash, Vec<(ItemKey, Vis)>, KeyHashing> =
+        HashMap::with_capacity_and_hasher(names.len(), KeyHashing);
+    for (name, (_, item)) in names.into_iter().zip(items) {
         let key = key::item_key(db, ItemId::from(*item));
-        by_name
-            .entry(key::name_hash(name.as_str()))
-            .or_default()
-            .push((key, vis(db, item.assoc_visibility(db))));
+        by_name.entry(name).or_default().push((key, vis(db, item.assoc_visibility(db))));
     }
-    by_name
+    let mut found: Vec<_> = by_name
         .into_iter()
         .map(|(name, mut items)| {
             items.sort_unstable_by_key(|&(key, _)| key);
             (name, ScopeEntry::Assoc(items.into()))
         })
-        .collect()
+        .collect();
+    found.sort_unstable_by_key(|(name, _)| *name);
+    found
 }
 
 #[derive(Default)]
@@ -557,18 +573,25 @@ struct ModuleName {
 
 fn module_names(db: &dyn HirDatabase, module: ModuleId) -> Vec<(NameHash, ScopeEntry)> {
     let scope = module.def_map(db).module(db, module).scope(db);
-    let mut by_name: BTreeMap<NameHash, ModuleName> = BTreeMap::new();
+    let entries: Vec<_> = scope.entries().filter(|(_, per_ns)| !per_ns.is_none()).collect();
+    let legacy: Vec<_> = scope.legacy_macros().collect();
+    let names = name_hashes(
+        entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .chain(legacy.iter().map(|(name, _)| name.as_str())),
+    );
+    let (entry_names, legacy_names) = names.split_at(entries.len());
+    let mut by_name: HashMap<NameHash, ModuleName, KeyHashing> =
+        HashMap::with_capacity_and_hasher(names.len(), KeyHashing);
     let through_ns = |import: Option<ImportOrExternCrate>| match import {
         None => Through::Declared,
         Some(ImportOrExternCrate::Import(_)) => Through::Import,
         Some(ImportOrExternCrate::Glob(_)) => Through::Glob,
         Some(ImportOrExternCrate::ExternCrate(_)) => Through::ExternCrate,
     };
-    for (name, per_ns) in scope.entries() {
-        if per_ns.is_none() {
-            continue;
-        }
-        let at = by_name.entry(key::name_hash(name.as_str())).or_default();
+    for (&name, (_, per_ns)) in entry_names.iter().zip(entries) {
+        let at = by_name.entry(name).or_default();
         at.types = per_ns.types.map(|it| Binding {
             target: target(db, it.def),
             visibility: vis(db, it.vis),
@@ -589,11 +612,11 @@ fn module_names(db: &dyn HirDatabase, module: ModuleId) -> Vec<(NameHash, ScopeE
             through: through_ns(it.import),
         });
     }
-    for (name, macros) in scope.legacy_macros() {
-        let at = by_name.entry(key::name_hash(name.as_str())).or_default();
+    for (&name, (_, macros)) in legacy_names.iter().zip(legacy) {
+        let at = by_name.entry(name).or_default();
         at.legacy_macros = macros.iter().map(|&it| key::item_key(db, ItemId::Macro(it))).collect();
     }
-    by_name
+    let mut found: Vec<_> = by_name
         .into_iter()
         .map(|(name, it)| {
             let entry = ScopeEntry::Module {
@@ -604,7 +627,9 @@ fn module_names(db: &dyn HirDatabase, module: ModuleId) -> Vec<(NameHash, ScopeE
             };
             (name, entry)
         })
-        .collect()
+        .collect();
+    found.sort_unstable_by_key(|(name, _)| *name);
+    found
 }
 
 fn target(db: &dyn HirDatabase, def: ModuleDefId) -> Target {

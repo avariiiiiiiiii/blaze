@@ -408,6 +408,63 @@ mod tests {
     }
 
     #[test]
+    fn work_is_one_json_line_in_the_form_proof_reads() {
+        let worked = Worked {
+            reran: 12,
+            green: 300,
+            compiled: 2,
+            found: 40,
+            link: LinkKind::Patched,
+            critical_path_us: 1500,
+        };
+        let line = work_json(&worked);
+        assert_eq!(
+            line,
+            "{\"reason\": \"blaze-work\", \"reran\": 12, \"green\": 300, \"compiled\": 2, \
+             \"found\": 40, \"link\": \"patched\", \"critical_path_us\": 1500}\n"
+        );
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["link"], "patched");
+    }
+
+    #[test]
+    fn codegen_inputs_are_one_object_of_hex() {
+        let inputs =
+            [(ContentId([1; 32]), ContentId([2; 32])), (ContentId([3; 32]), ContentId([4; 32]))];
+        let text = codegen_inputs_json(&inputs);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value[format!("{:x}", ContentId([3; 32]))], format!("{:x}", ContentId([4; 32])));
+        assert_eq!(value.as_object().unwrap().len(), 2);
+        assert_eq!(codegen_inputs_json(&[]), "{}\n");
+    }
+
+    #[test]
+    fn a_trace_is_written_as_proofs_trace() {
+        let key = |n: u8| QueryKey { kind: QueryKind(0x2000), input: ContentId([n; 32]) };
+        let traced = [
+            Traced {
+                key: key(2),
+                fingerprint: blaze_ids::Fingerprint(7),
+                edges: vec![blaze_query::Edge { read: key(1), saw: blaze_ids::Fingerprint(5) }],
+                ran: true,
+            },
+            Traced {
+                key: key(1),
+                fingerprint: blaze_ids::Fingerprint(5),
+                edges: Vec::new(),
+                ran: false,
+            },
+        ];
+        let bytes = trace_cbor(&traced).unwrap();
+        blaze_protocol::cbor::check(&bytes).unwrap();
+        let trace: blaze_v2_proof::Trace = blaze_protocol::cbor::from_slice(&bytes).unwrap();
+        assert_eq!(trace.keys, [key(1), key(2)]);
+        assert!(trace.ran.get(1) && !trace.ran.get(0));
+        assert_eq!(trace.reads, [0]);
+        assert_eq!(trace.edges_from, [0, 0, 1]);
+    }
+
+    #[test]
     fn rustcs_own_text_is_printed_as_it_is_then_the_facts() {
         let diagnostic = Diagnostic {
             level: Level::Warning,

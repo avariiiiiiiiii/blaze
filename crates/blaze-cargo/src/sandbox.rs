@@ -119,8 +119,28 @@ pub struct Also<'a> {
     /// Whether it may reach the network: what it connects to is a `T network` line.
     pub network: bool,
     /// Where each line goes as it is first seen, before the call it notes goes on; with one,
-    /// the processes load the interposer, which sees what a sandbox's filter can't.
-    pub live: Option<&'a Path>,
+    /// and reads recorded, the processes load the interposer, which sees what a sandbox's
+    /// filter can't.
+    pub live: Option<&'a Live>,
+    /// The program's environment as it is, in place of [`Spec::env`], which then has what of
+    /// it is text, for the variables the sandbox reads itself (`TMPDIR`).
+    pub env: Option<&'a [(OsString, OsString)]>,
+}
+
+/// The live record of a run of `blaze sandbox --v2`.
+pub struct Live {
+    pub path: PathBuf,
+    /// Where this run's lines start in it.
+    pub start: u64,
+    /// Why a line could not be added to it, once one could not: the run's record is not whole.
+    pub failed: std::cell::RefCell<Option<String>>,
+}
+
+impl Live {
+    /// A line could not be added, for `why`; the first reason is kept.
+    pub fn failed(&self, why: impl Into<String>) {
+        self.failed.borrow_mut().get_or_insert_with(|| why.into());
+    }
 }
 
 /// A file system of a program's own, as Nix gives a build: what it binds, each where the
@@ -526,12 +546,20 @@ impl Recorder {
         self.reached(Seen::Untraceable, self.scope(thread), trace::untraceable_name(it));
     }
 
-    /// `thread` of `process` runs the program `path`: when the processes load the interposer,
+    /// Randomness was read. What a process read of it stays in it (`std` keeps the keys of its
+    /// hash maps), whatever scope it is in later: it is every scope's.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn random(&mut self) {
+        let name = trace::untraceable_name(blaze_core::Untraceable::Random);
+        self.reached(Seen::Untraceable, String::new(), name);
+    }
+
+    /// `process` runs the program `path`, in `scope`: when the processes load the interposer,
     /// it is to say so before the run ends.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn runs(&mut self, thread: u64, process: u64, path: &str) {
+    pub fn runs(&mut self, process: u64, path: &str, scope: String) {
         if self.interposed && self.reads {
-            self.pending.insert(process, (path.to_owned(), self.scope(thread)));
+            self.pending.insert(process, (path.to_owned(), scope));
         }
     }
 
@@ -773,15 +801,19 @@ fn probe(kind: Probe) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
     let spec = match kind {
         Probe::Overlays => Spec { cwd: dir.clone(), overlays: vec![dir.clone()], ..Spec::default() },
-        Probe::Writable | Probe::V2 => {
-            Spec { cwd: dir.clone(), writable: vec![dir.clone()], ..Spec::default() }
-        }
+        Probe::Writable => Spec { cwd: dir.clone(), writable: vec![dir.clone()], ..Spec::default() },
+        Probe::V2 => Spec {
+            cwd: dir.clone(),
+            writable: vec![dir.clone()],
+            record_reads: true,
+            ..Spec::default()
+        },
     };
-    let live = dir.join("live");
+    let live = Live { path: dir.join("live"), start: 0, failed: Default::default() };
     let also = match kind {
         Probe::V2 => {
-            std::fs::write(&live, "").map_err(|it| format!("{}: {it}", live.display()))?;
-            Also { network: false, live: Some(&live) }
+            std::fs::write(&live.path, "").map_err(|it| format!("{}: {it}", live.path.display()))?;
+            Also { network: false, live: Some(&live), env: None }
         }
         Probe::Writable | Probe::Overlays => Also::default(),
     };
@@ -989,8 +1021,8 @@ mod tests {
         let mut recorder = Recorder::new(&spec, &[]);
         recorder.interposed();
         assert!(recorder.marked(10, 10, b"/.blaze-test/tests::b"));
-        recorder.runs(10, 10, "/bin/loads");
-        recorder.runs(11, 11, "/bin/static");
+        recorder.runs(10, "/bin/loads", recorder.scope(10));
+        recorder.runs(11, "/bin/static", recorder.scope(11));
         assert!(recorder.marked(10, 10, b"/.blaze-loaded"));
         recorder.ended();
         let lines: Vec<_> = recorder.lines().cloned().collect();

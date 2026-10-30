@@ -1,9 +1,9 @@
 //! A stage: a [`Change`] applied to a copy of the image's state, placed and relocated.
 //!
 //! The order is fixed: what is removed goes first, then what is added is made into pieces
-//! (in parallel, interning its symbols shard by shard), then the shared pieces are counted
-//! and the unused swept, the native inputs and every name resolved ([`crate::native`]), GOT
-//! cells and PLT stubs made for what needs them, everything placed ([`crate::place`]), and
+//! (in parallel, interning its symbols shard by shard), the native inputs and every name
+//! are resolved ([`crate::native`]), GOT cells and PLT stubs made for what needs them, the
+//! shared pieces counted and the unused swept, everything placed ([`crate::place`]), and
 //! every piece that is new or refers to something that changed relocated, in parallel
 //! ([`crate::write`]).
 
@@ -11,14 +11,14 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use blaze_codegen::{Arch, CompiledFunction, Data, Init, InstanceKey, Reloc, Static, Target, Unwind};
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::Hasher;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::model::{Apply, Class, Fixup, Object, Plan, Sym, Writer};
 use crate::position::{self, SpanTable};
 use crate::reloc::{self, GotKind};
-use crate::state::{Def, FunctionInfo, Piece, PieceId, State, What, has_table};
+use crate::state::{Def, FunctionInfo, Piece, PieceId, State, What};
 use crate::symbols::{Obj, SymKey, Symbols};
 use crate::table;
 use crate::unwind::{self, Field};
@@ -187,7 +187,39 @@ impl<'a> Stage<'a> {
             Arc::make_mut(&mut self.new.names).insert(name, sym);
         }
         self.positions()?;
+        let mut seen = Vec::new();
+        for id in &self.fresh {
+            let piece = self.new.piece(*id).expect("a fresh piece");
+            for fixup in piece.fixups.iter() {
+                if matches!(self.symbols.key(fixup.target), SymKey::Name(_)) {
+                    seen.push(fixup.target);
+                }
+            }
+        }
+        for sym in self.new.names.keys().map(|it| SymKey::Name(it.as_str().into())).collect::<Vec<_>>() {
+            seen.push(self.sym(sym));
+        }
+        if seen.iter().any(|it| !self.new.seen.contains(it)) {
+            Arc::make_mut(&mut self.new.seen).extend(seen);
+        }
         Ok(())
+    }
+
+    /// The live descriptor and the path it names, filled once the image is placed.
+    pub fn descriptor(&mut self) {
+        let Some(live) = &self.output.live else { return };
+        let path = live.path.clone().into_bytes();
+        let dir = self.sym(SymKey::LiveDir);
+        if self.new.home(dir).is_none() {
+            let piece = self.piece(dir, Class::Rodata, 1, path.len() as u64, Vec::new(), What::Fixed);
+            self.make(piece, Cow::Owned(path));
+        }
+        let descriptor = self.sym(SymKey::Descriptor);
+        if self.new.home(descriptor).is_none() {
+            let size = blaze_live::patch::Descriptor::SIZE as u64;
+            let piece = self.piece(descriptor, Class::Rodata, 8, size, Vec::new(), What::Fixed);
+            self.make(piece, Cow::Owned(vec![0; size as usize]));
+        }
     }
 
     /// The jump table's generation cell, cells and stubs, with room for `functions` and
@@ -869,10 +901,6 @@ impl<'a> Stage<'a> {
             }
         }
         Ok(())
-    }
-
-    pub fn id(&self) -> ContentId {
-        ContentId::of("blaze v2 link image 1", &self.new.lineage)
     }
 }
 

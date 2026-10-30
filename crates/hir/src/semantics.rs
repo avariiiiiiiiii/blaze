@@ -2591,6 +2591,9 @@ impl<'db> SemanticsImpl<'db> {
                 thread_local! {
                     static RESULT: RefCell<Vec<ProofTreeData>> = const { RefCell::new(Vec::new()) };
                 }
+                // Inference runs inline on this thread, and a call cancelled part way leaves
+                // what it had found here.
+                RESULT.with(|data| data.borrow_mut().clear());
                 infer_query_with_inspect(
                     self.db,
                     def,

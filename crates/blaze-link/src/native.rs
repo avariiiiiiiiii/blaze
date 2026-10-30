@@ -503,7 +503,7 @@ impl<'a> Stage<'a> {
         sorted.sort();
         for (obj, section) in sorted {
             let load = by_obj[obj];
-            self.native_section(&loads, load, *section, &candidates)?;
+            self.native_section(&loads, load, *section)?;
         }
         let mut sorted: Vec<&(usize, u32, u32)> =
             kept_frames.iter().filter(|(l, s, a)| !old.frames.contains(&(loads[*l].obj, *s, *a))).collect();
@@ -592,6 +592,33 @@ impl<'a> Stage<'a> {
             defined.insert(*sym);
             self.define(*sym, Def::Alias(*target));
         }
+        let mut defines: FxHashMap<PieceId, Vec<Sym>> = FxHashMap::default();
+        for it in &loads {
+            for (at, sym) in it.syms.iter().enumerate() {
+                if let SymbolDef::Section { section, .. } = it.object.symbols[at].def {
+                    if let (Some(home), Def::Piece { piece, .. }) = (piece_of(self, it.obj, section), self.new.def(*sym)) {
+                        if home == piece && self.new.piece(piece).is_some_and(|p| p.sym != *sym) {
+                            defines.entry(piece).or_default().push(*sym);
+                        }
+                    }
+                }
+            }
+        }
+        let native: Vec<PieceId> = self
+            .new
+            .live_pieces()
+            .filter(|(_, it)| matches!(it.what, What::Native { .. }))
+            .map(|(id, _)| id)
+            .collect();
+        for id in native {
+            let mut syms = defines.remove(&id).unwrap_or_default();
+            syms.sort_unstable();
+            syms.dedup();
+            let piece = self.new.piece(id).expect("a live piece");
+            if *piece.defines != *syms {
+                self.new.piece_mut(id).expect("a live piece").defines = syms.into();
+            }
+        }
 
         // What is left: the linker's, a shared library's, weak, or an error.
         let mut names: BTreeSet<Sym> = wanted.keys().copied().collect();
@@ -626,25 +653,25 @@ impl<'a> Stage<'a> {
             }
             names.insert(*sym);
         }
-        let mut libraries: Vec<(Library, Vec<&Shared>)> = Vec::new();
+        let mut libraries: Vec<(Library, &Shared)> = Vec::new();
         for input in inputs.iter() {
             if let NativeFile::Shared(shared) = &*input.file {
                 let as_needed = matches!(input.kind, NativeKind::Shared { as_needed: true });
-                let mut all = vec![shared];
+                let mut all: Vec<&Shared> = vec![shared];
                 let mut at = 0;
                 while at < all.len() {
-                    let more: Vec<&Shared> = all[at].more.iter().collect();
-                    all.extend(more);
+                    let this: &Shared = all[at];
+                    all.extend(this.more.iter());
                     at += 1;
                 }
                 for it in all {
-                    libraries.push((Library { name: it.name.clone(), as_needed }, vec![it]));
+                    libraries.push((Library { name: it.name.clone(), as_needed }, it));
                 }
             }
         }
         let mut exports: FxHashMap<&str, (usize, &crate::model::SharedSymbol)> = FxHashMap::default();
         for (at, (_, shared)) in libraries.iter().enumerate() {
-            for it in shared.iter().flat_map(|it| it.symbols.iter()) {
+            for it in &shared.symbols {
                 exports.entry(it.name.as_str()).or_insert((at, it));
             }
         }
@@ -713,22 +740,33 @@ impl<'a> Stage<'a> {
         for it in &mut imports {
             it.1.library = it.1.library.and_then(|library| index[library as usize]);
         }
-        let mut order: Vec<(Sym, Import)> = Vec::new();
+        // An import an incremental link no longer needs keeps its place (nothing binds to it),
+        // its library looked up again by name.
+        let mut order: Vec<(Sym, Import, bool)> = Vec::new();
+        let mut current: FxHashMap<Sym, Import> = imports.into_iter().map(|it| (it.0, it.1)).collect();
         if !self.full {
             for (sym, import) in old.import_syms.iter().zip(&old.imports) {
-                if let Some(it) = imports.iter().find(|it| it.0 == *sym) {
-                    order.push((*sym, it.1.clone()));
-                } else {
-                    order.push((*sym, import.clone()));
+                match current.remove(sym) {
+                    Some(it) => order.push((*sym, it, true)),
+                    None => {
+                        let mut stale = import.clone();
+                        stale.library = import.library.and_then(|library| {
+                            let name = &old.libraries.get(library as usize)?.name;
+                            needed.iter().position(|it| &it.name == name).map(|it| it as u32)
+                        });
+                        stale.weak |= stale.library.is_none();
+                        order.push((*sym, stale, false));
+                    }
                 }
             }
         }
-        let mut new: Vec<(Sym, Import)> =
-            imports.into_iter().filter(|it| !order.iter().any(|o| o.0 == it.0)).map(|it| (it.0, it.1)).collect();
+        let mut new: Vec<(Sym, Import)> = current.into_iter().collect();
         new.sort_by(|a, b| a.1.name.cmp(&b.1.name));
-        order.extend(new);
-        for (at, (sym, _)) in order.iter().enumerate() {
-            self.define(*sym, Def::Import(at as u32));
+        order.extend(new.into_iter().map(|(sym, import)| (sym, import, true)));
+        for (at, (sym, _, active)) in order.iter().enumerate() {
+            if *active {
+                self.define(*sym, Def::Import(at as u32));
+            }
         }
         let entry = entry_name.and_then(|it| match self.new.def(it) {
             Def::None => None,
@@ -763,15 +801,9 @@ impl<'a> Stage<'a> {
         }
     }
 
-    fn native_section(
-        &mut self,
-        loads: &[Loaded],
-        load: usize,
-        section: u32,
-        candidates: &FxHashMap<Sym, Candidate>,
-    ) -> Result<(), LinkError> {
+    fn native_section(&mut self, loads: &[Loaded], load: usize, section: u32) -> Result<(), LinkError> {
         let it = &loads[load];
-        let input = &self.new.inputs[it.input];
+        let (name, order) = (self.new.inputs[it.input].name.clone(), self.new.inputs[it.input].order);
         let s = &it.object.sections[section as usize];
         let (class, rank, unwind) = match &s.what {
             SectionKind::Alloc(class, rank) => (class.clone(), *rank, false),
@@ -794,25 +826,11 @@ impl<'a> Stage<'a> {
             .collect();
         weak.sort_unstable();
         weak.dedup();
-        let mut defines = Vec::new();
-        for (at, symbol) in it.object.symbols.iter().enumerate() {
-            let SymbolDef::Section { section: home, .. } = symbol.def else { continue };
-            if home != section {
-                continue;
-            }
-            let sym = it.syms[at];
-            let local = symbol.binding == Binding::Local || symbol.kind == SymbolKind::Section;
-            let wins = matches!(candidates.get(&sym), Some(Candidate::Section { load: l, symbol: s, .. }) if *l == load && *s == at as u32);
-            if local || wins {
-                defines.push(sym);
-            }
-        }
         let sym = self.sym(SymKey::Section(it.obj, section));
-        defines.retain(|it| *it != sym);
         let zero = matches!(s.data, crate::model::Data::Zero(_));
         let zeroed = crate::state::zeroed(&class);
         if !zero && zeroed {
-            return Err(error(None, format!("{}: {} has bytes, in a zeroed section", input.name, s.name)));
+            return Err(error(None, format!("{name}: {} has bytes, in a zeroed section", s.name)));
         }
         let bytes: Cow<'a, [u8]> = match &s.data {
             crate::model::Data::Bytes(bytes) => Cow::Owned(bytes.clone()),
@@ -821,10 +839,9 @@ impl<'a> Stage<'a> {
         };
         let mut piece = self.piece(sym, class, s.align, s.data.len(), fixups, What::Native { obj: it.obj, section, unwind });
         piece.rank = rank;
-        piece.order = [input.order, it.obj.member, section];
+        piece.order = [order, it.obj.member, section];
         piece.zero = zeroed;
         piece.weak = weak.into();
-        piece.defines = defines.into();
         self.make(piece, bytes);
         Ok(())
     }
@@ -837,7 +854,7 @@ impl<'a> Stage<'a> {
         record: &unwind::Native,
     ) -> Result<(), LinkError> {
         let it = &loads[load];
-        let input = &self.new.inputs[it.input];
+        let (name, order) = (self.new.inputs[it.input].name.clone(), self.new.inputs[it.input].order);
         let s = &it.object.sections[section as usize];
         let crate::model::Data::Bytes(bytes) = &s.data else { unreachable!("split from bytes") };
         let start = record.range.start as u64;
@@ -871,10 +888,10 @@ impl<'a> Stage<'a> {
             What::NativeFrame { obj: it.obj, section, fde },
         );
         piece.rank = if fde { 1 } else { 0 };
-        piece.order = [input.order, it.obj.member, section];
+        piece.order = [order, it.obj.member, section];
         let bytes = bytes[record.range.clone()].to_vec();
         if bytes.len() % 4 != 0 {
-            return Err(error(None, format!("{}: {}: a frame record not a multiple of 4 long", input.name, s.name)));
+            return Err(error(None, format!("{name}: {}: a frame record not a multiple of 4 long", s.name)));
         }
         self.make(piece, Cow::Owned(bytes));
         Ok(())

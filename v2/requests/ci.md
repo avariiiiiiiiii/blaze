@@ -57,6 +57,8 @@ pub enum Response {
 }
 ```
 
+> applied: `SCHEMA` bumped by the coordinator; the variants and `Diagnostic::facts` by ci in `crates/blaze-api/src/lib.rs` (now schema 5).
+
 ## 2. Root `Cargo.toml`: four workspace dependencies
 
 Why: blaze-ci checks webhook signatures (HMAC-SHA256), signs the GitHub App's JWT (RS256) and
@@ -69,6 +71,8 @@ ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 ```
+
+> applied: by the coordinator; all four are in the root `[workspace.dependencies]`.
 
 ## 3. `crates/blaze-vfs/src/lib.rs`: the empty root
 
@@ -88,12 +92,16 @@ Lane ci's session resolves `ViewRef::Head` of a head never written to `Vfs::empt
 head's first commit by `Open { view: Head(..) }`. The session calls `Vfs::empty` already: it
 needs this to build.
 
+> applied: by the coordinator; `Vfs::empty` is in `crates/blaze-vfs/src/lib.rs`.
+
 ## 4. Two arenas name an open view (for the coordinator to know)
 
 `blaze_vfs::Vfs::open` and `blaze_query::Database::open` each return a `ViewId` (both
 `Idx<View>`), from arenas of their own. The session opens a job's view in both and hands the
 build both (`blaze_api::build::Opened`). If vfs and db agree on one arena, `Opened` loses a
 field; nothing else changes.
+
+> applied: decided by the coordinator (one arena, `blaze_vfs::ViewId`, decisions.md); db's side is item 7.
 
 ## 5. The VFS has no symlinks or executable bit
 
@@ -106,6 +114,8 @@ Done by the coordinator (lane vfs): `blaze_vfs::Mode` is on `Op::Write` and `Fil
 hashed into the tree as git's code. The checkout writes each file with its mode, a symlink as
 its target, and a mode-only change as a write; only submodules are refused. Item 4: the vfs
 arena is the one (`docs/v2/plan/reference/crates.md`); db drops its own, then `Opened` loses its field.
+
+> applied: by the coordinator (`blaze_vfs::Mode` on `Op::Write` and `File`).
 
 ---
 Applied by the coordinator, 16:46 (items 2, 3, 5). Item 1's `SCHEMA` was bumped but its
@@ -123,9 +133,25 @@ variants and `Diagnostic::facts` were not; lane ci added them in `lib.rs` (its o
   state it doesn't list as waiting; when the plane moves to `Cancelled` it must skip such a
   node instead.
 
+> applied: notes only; nothing to change outside ci's crates.
+
+## 8. Root `Cargo.toml`: `blaze-v2-proof` as a workspace dependency
+
+Why: proof's `blaze trace --out PATH` writes the deterministic CBOR of
+`blaze_v2_proof::Trace`; `blaze_ui::api::trace_cbor` builds it with proof's `TraceBuilder`
+rather than a second copy of its layout. `crates/blaze-ui/Cargo.toml` already names it.
+
+```toml
+blaze-v2-proof = { path = "crates/blaze-v2-proof" }
+```
+
+> applied: `blaze-v2-proof = { path = "crates/blaze-v2-proof" }` added to the root `[workspace.dependencies]` with the other v2 crates.
+
 ## 7. `crates/blaze-query`: open and why by the VFS view (lane db)
 
 - `Database::open` takes the `blaze_vfs::ViewId` the VFS gave (decisions.md: one arena);
   then `build::Opened.queries` goes and the session keeps one id per view.
 - `Database::why` takes the view's root as well as the key, so why-did-this-rerun answers
   for a view that is no longer open. The session answers `Why` today only for open views.
+
+> forwarded to db

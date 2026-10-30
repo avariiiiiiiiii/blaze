@@ -28,11 +28,12 @@
   and the function:
 
   ```rust
-  /// On Linux, the library every process of a sandbox loads through `LD_PRELOAD`
+  /// On Linux, the library every process of a traced sandbox loads through `LD_PRELOAD`
   /// (`src/sandbox/linux_interpose.c`): it interposes `getenv`, `secure_getenv`, the realtime
-  /// clocks and `getrandom`, and says its nonce as it loads, so the supervisor can see
-  /// environment and clock reads a seccomp filter cannot. Built with the system C compiler
-  /// (`CC` when set), carried in the executable by `src/sandbox/linux.rs`.
+  /// clocks and the `exec`/`posix_spawn` family, and says it loaded, so the supervisor sees
+  /// variable and clock reads a seccomp filter cannot, and which programs ran without it.
+  /// Built with the system C compiler (`CC` when set), carried in the executable by
+  /// `src/sandbox/linux.rs`.
   fn linux_interpose() {
       let source = "src/sandbox/linux_interpose.c";
       println!("cargo:rerun-if-changed={source}");

@@ -1,8 +1,10 @@
 //! The relocations of wasm objects (`R_WASM_*`, the tool conventions' Linking.md), and how
 //! the writer applies them to a placed image.
 //!
-//! In the index space of functions an address is the function's index + 1, which is its slot
-//! in the table ([`crate::model::Plan::indexed_code`]); in memory an address is an address.
+//! The core hands [`apply`] a function relocation's target already numbered
+//! ([`crate::model::Plan::indexed_code`]): the function's index for `FUNCTION_INDEX_*`, its
+//! slot in the table (the index + 1; 0 is null) for `TABLE_INDEX_*`. In memory an address is
+//! an address.
 
 use super::leb::{padded_sleb, padded_uleb};
 
@@ -106,10 +108,7 @@ pub(super) fn apply(r_type: u32, bytes: &mut [u8], s: u64, addend: i64) -> Resul
     match r_type {
         FUNCTION_INDEX_LEB | FUNCTION_INDEX_I32 => {
             no_addend()?;
-            let function = s.checked_sub(1).ok_or_else(|| {
-                format!("{}: a direct reference to an undefined weak function", what())
-            })?;
-            let function = index(function)?;
+            let function = index(s)?;
             match r_type {
                 FUNCTION_INDEX_LEB => put(bytes, &padded_uleb(function), what()),
                 _ => put(bytes, &function.to_le_bytes(), what()),
@@ -174,10 +173,9 @@ mod tests {
 
     #[test]
     fn function_indices() {
-        // Address 6 is function 5.
-        assert_eq!(applied(FUNCTION_INDEX_LEB, 6, 0, 5).unwrap(), [0x85, 0x80, 0x80, 0x80, 0]);
-        assert_eq!(applied(FUNCTION_INDEX_I32, 6, 0, 4).unwrap(), [5, 0, 0, 0]);
-        assert!(applied(FUNCTION_INDEX_LEB, 0, 0, 5).unwrap_err().contains("weak"));
+        assert_eq!(applied(FUNCTION_INDEX_LEB, 5, 0, 5).unwrap(), [0x85, 0x80, 0x80, 0x80, 0]);
+        assert_eq!(applied(FUNCTION_INDEX_LEB, 0, 0, 5).unwrap(), [0x80, 0x80, 0x80, 0x80, 0]);
+        assert_eq!(applied(FUNCTION_INDEX_I32, 5, 0, 4).unwrap(), [5, 0, 0, 0]);
         assert!(applied(FUNCTION_INDEX_LEB, 6, 1, 5).is_err());
         assert!(applied(FUNCTION_INDEX_LEB, 1 << 33, 0, 5).is_err());
     }

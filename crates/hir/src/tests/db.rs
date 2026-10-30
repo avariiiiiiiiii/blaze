@@ -1,7 +1,18 @@
 //! A database for the tests: `hir-ide`'s test database, with the names of the queries a step
 //! executed.
+//!
+//! It has one handle, itself: no clone shares its storage. It has no plane either, so
+//! [`SourceDatabase::run_all`] runs a batch on the calling thread, in order or reversed
+//! ([`TestDB::reverse_batches`]): a result that changed with the order would depend on the
+//! plane's scheduling, which none may.
 
-use std::{fmt, panic, sync::Mutex};
+use std::{
+    fmt, panic,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use base_db::{
     CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Nonce, SourceDatabase, SourceRoot,
@@ -18,6 +29,7 @@ pub(crate) struct TestDB {
     crates_map: Arc<CratesMap>,
     events: Arc<Mutex<Option<Vec<salsa::Event>>>>,
     nonce: Nonce,
+    reversed: AtomicBool,
 }
 
 impl Default for TestDB {
@@ -37,6 +49,7 @@ impl Default for TestDB {
             files: Default::default(),
             crates_map: Default::default(),
             nonce: Nonce::new(),
+            reversed: AtomicBool::new(false),
         };
         hir_def::set_expand_proc_attr_macros(&mut this, true);
         set_all_crates_with_durability(&mut this, std::iter::empty(), Durability::HIGH);
@@ -51,18 +64,6 @@ impl Default for TestDB {
     }
 }
 
-impl Clone for TestDB {
-    fn clone(&self) -> Self {
-        Self {
-            storage: self.storage.clone(),
-            files: self.files.clone(),
-            crates_map: self.crates_map.clone(),
-            events: self.events.clone(),
-            nonce: self.nonce,
-        }
-    }
-}
-
 impl fmt::Debug for TestDB {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TestDB").finish()
@@ -71,10 +72,6 @@ impl fmt::Debug for TestDB {
 
 #[salsa::db]
 impl SourceDatabase for TestDB {
-    fn fork(&self) -> Box<dyn SourceDatabase + Send> {
-        Box::new(self.clone())
-    }
-
     fn file_text(&self, file_id: base_db::FileId) -> FileText {
         self.files.file_text(file_id)
     }
@@ -122,8 +119,34 @@ impl SourceDatabase for TestDB {
         files.set_file_source_root_with_durability(self, id, source_root_id, durability);
     }
 
+    fn set_appended_root_module(
+        &mut self,
+        file_id: base_db::FileId,
+        module: Option<&'static str>,
+        durability: Durability,
+    ) {
+        let files = Arc::clone(&self.files);
+        files.set_appended_root_module(self, file_id, module, durability);
+    }
+
+    fn set_view_root(
+        &mut self,
+        view: base_db::ViewRoot<'_>,
+    ) -> Result<base_db::ViewChange, base_db::ViewError> {
+        let files = Arc::clone(&self.files);
+        files.set_view_root(self, view)
+    }
+
     fn crates_map(&self) -> Arc<CratesMap> {
         self.crates_map.clone()
+    }
+
+    fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
+        if self.reversed.load(Ordering::Relaxed) {
+            (0..count).rev().for_each(|at| task(self, at));
+        } else {
+            (0..count).for_each(|at| task(self, at));
+        }
     }
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
@@ -159,5 +182,10 @@ impl TestDB {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Runs the tasks of every later batch last to first.
+    pub(crate) fn reverse_batches(&self) {
+        self.reversed.store(true, Ordering::Relaxed);
     }
 }

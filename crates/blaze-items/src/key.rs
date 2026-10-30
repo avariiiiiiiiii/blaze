@@ -23,9 +23,9 @@
 use base_db::{Crate, CrateOrigin, LangCrateOrigin, TargetKind};
 use blaze_ids::{ContentId, Hasher};
 use hir_def::{
-    AdtId, BuiltinDeriveImplId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId,
-    GenericDefId, HasModule, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId, ModuleIdLt,
-    VariantId,
+    AdtId, BuiltinDeriveImplId, DefWithBodyId, EnumId, EnumVariantId, ExpressionStoreOwnerId,
+    GenericDefId, HasModule, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId,
+    ModuleIdLt, TraitId, VariantId,
     expr_store::ExpressionStore,
     hir::{ClosureKind, Expr, ExprId},
     nameres::DefMap,
@@ -34,7 +34,7 @@ use hir_def::{
         TraitSignature, TypeAliasSignature, UnionSignature,
     },
 };
-use hir_expand::{HirFileId, MacroCallKind};
+use hir_expand::{HirFileId, MacroCallKind, name::Name};
 use hir_ty::{
     ImplTraitId, InferBodyId, SelfAndAssocBounds,
     db::{
@@ -69,6 +69,7 @@ pub enum Resolved {
 }
 
 /// The key of a crate: its content, never its id (see the module doc).
+#[salsa::tracked]
 pub fn crate_key(db: &dyn HirDatabase, krate: Crate) -> ContentId {
     let data = krate.data(db);
     let extra = krate.extra_data(db);
@@ -152,57 +153,93 @@ fn opt<'h>(h: &'h mut Hasher, part: Option<&str>) -> &'h mut Hasher {
     }
 }
 
+/// A key's preimage: the bytes a [`Hasher`] would be given (`part` is length-prefixed, `id`
+/// the 32 bytes), kept so that many keys hash in one batch and come out as one at a time.
+#[derive(Default)]
+struct Bytes(Vec<u8>);
+
+impl Bytes {
+    fn update(&mut self, bytes: &[u8]) -> &mut Bytes {
+        self.0.extend_from_slice(bytes);
+        self
+    }
+
+    fn part(&mut self, bytes: &[u8]) -> &mut Bytes {
+        self.update(&(bytes.len() as u64).to_le_bytes()).update(bytes)
+    }
+
+    fn id(&mut self, id: &ContentId) -> &mut Bytes {
+        self.update(&id.0)
+    }
+
+    fn opt(&mut self, part: Option<&str>) -> &mut Bytes {
+        match part {
+            None => self.update(&[0]),
+            Some(part) => self.update(&[1]).part(part.as_bytes()),
+        }
+    }
+}
+
+/// Many preimages hashed in one batch: BLAKE3 over 16 inputs at a time with AVX-512, 4 with
+/// NEON, each exactly `ContentId::of(KEY_DOMAIN, it)`.
+fn hash_all<T>(entries: Vec<(T, Bytes)>) -> impl Iterator<Item = (T, ItemKey)> {
+    let inputs: Vec<&[u8]> = entries.iter().map(|(_, it)| &it.0[..]).collect();
+    let keys = ContentId::of_many(KEY_DOMAIN, &inputs);
+    drop(inputs);
+    entries.into_iter().zip(keys).map(|((it, _), key)| (it, ItemKey(key)))
+}
+
 /// The key of a module: of its crate for a crate's root, of its block for a block's, else of
 /// its parent and its name.
 pub fn module_key(db: &dyn HirDatabase, module: ModuleId) -> ItemKey {
     module_key_in(db, module)
 }
 
+#[salsa::tracked]
 fn module_key_in<'db>(db: &'db dyn HirDatabase, module: ModuleIdLt<'db>) -> ItemKey {
-    let mut h = Hasher::new(KEY_DOMAIN);
+    let mut b = Bytes::default();
     match module.containing_module_inside_def_map(db) {
         Some(parent) => {
             let name = module.name(db);
-            h.id(&module_key_in(db, parent).0).update(b"mod");
-            opt(&mut h, name.as_ref().map(|it| it.as_str()));
+            b.id(&module_key_in(db, parent).0).update(b"mod").opt(name.as_ref().map(|it| it.as_str()));
         }
         None => match module.block(db) {
             Some(block) => {
                 let ast = block.ast_id(db);
-                h.id(&module_key_in(db, block.module(db)).0).update(b"block");
-                written(db, &mut h, ast.file_id, ast.value.erase());
+                b.id(&module_key_in(db, block.module(db)).0).update(b"block");
+                written(db, &mut b, ast.file_id, ast.value.erase());
             }
             None => {
-                h.update(b"crate").id(&crate_key(db, module.krate(db)));
+                b.update(b"crate").id(&crate_key(db, module.krate(db)));
             }
         },
     }
-    ItemKey(h.finish())
+    ItemKey(ContentId::of(KEY_DOMAIN, &b.0))
 }
 
 /// Where a declaration is written: the file (an expansion named by its call) and the raw AST
 /// id in it.
-fn written(db: &dyn HirDatabase, h: &mut Hasher, file: HirFileId, ast: ErasedFileAstId) {
-    file_key(db, h, file);
-    h.update(&ast.into_raw().to_le_bytes());
+fn written(db: &dyn HirDatabase, b: &mut Bytes, file: HirFileId, ast: ErasedFileAstId) {
+    file_key(db, b, file);
+    b.update(&ast.into_raw().to_le_bytes());
 }
 
-fn file_key(db: &dyn HirDatabase, h: &mut Hasher, file: HirFileId) {
+fn file_key(db: &dyn HirDatabase, b: &mut Bytes, file: HirFileId) {
     match file {
         HirFileId::FileId(_) => {
-            h.update(&[0]);
+            b.update(&[0]);
         }
         HirFileId::MacroFile(call) => {
             let loc = call.loc(db);
-            h.update(&[1]);
-            written(db, h, loc.kind.file_id(), loc.kind.erased_ast_id());
+            b.update(&[1]);
+            written(db, b, loc.kind.file_id(), loc.kind.erased_ast_id());
             match &loc.kind {
-                MacroCallKind::FnLike { .. } => h.update(&[0]),
-                MacroCallKind::Derive { derive_attr_index, derive_index, .. } => h
+                MacroCallKind::FnLike { .. } => b.update(&[0]),
+                MacroCallKind::Derive { derive_attr_index, derive_index, .. } => b
                     .update(&[1])
                     .update(&derive_attr_index.item_tree_index().to_le_bytes())
                     .update(&derive_index.to_le_bytes()),
-                MacroCallKind::Attr { censored_attr_ids, .. } => h
+                MacroCallKind::Attr { censored_attr_ids, .. } => b
                     .update(&[2])
                     .update(&censored_attr_ids.invoc_attr().item_tree_index().to_le_bytes()),
             };
@@ -220,8 +257,113 @@ fn container_key(db: &dyn HirDatabase, container: ItemContainerId) -> (ItemKey, 
     }
 }
 
-/// The key of an item (see the module doc).
+/// What an item's key is hashed in a batch with: the items of its module, impl or trait.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Siblings {
+    Module(ModuleId),
+    Impl(ImplId),
+    Trait(TraitId),
+}
+
+fn siblings_of_container(db: &dyn HirDatabase, container: ItemContainerId) -> Siblings {
+    match container {
+        ItemContainerId::ModuleId(it) => Siblings::Module(it),
+        ItemContainerId::ImplId(it) => Siblings::Impl(it),
+        ItemContainerId::TraitId(it) => Siblings::Trait(it),
+        ItemContainerId::ExternBlockId(it) => Siblings::Module(it.lookup(db).container),
+    }
+}
+
+fn siblings(db: &dyn HirDatabase, id: ItemId) -> Siblings {
+    match id {
+        ItemId::Function(it) => siblings_of_container(db, it.lookup(db).container),
+        ItemId::Const(it) => siblings_of_container(db, it.lookup(db).container),
+        ItemId::Static(it) => siblings_of_container(db, it.lookup(db).container),
+        ItemId::Alias(it) => siblings_of_container(db, it.lookup(db).container),
+        other => Siblings::Module(other.module(db)),
+    }
+}
+
+/// The key of an item (see the module doc), hashed in one batch with its siblings'.
+#[salsa::tracked]
 pub fn item_key(db: &dyn HirDatabase, id: ItemId) -> ItemKey {
+    let batch = match siblings(db, id) {
+        Siblings::Module(it) => module_item_keys(db, it),
+        Siblings::Impl(it) => impl_item_keys(db, it),
+        Siblings::Trait(it) => trait_item_keys(db, it),
+    };
+    match batch.get(&id) {
+        Some(&key) => key,
+        // An item its module's scope does not list, as a `macro_rules!` that a later one of
+        // its name shadows: the same bytes, hashed alone.
+        None => item_key_alone(db, id),
+    }
+}
+
+/// An item's key hashed by itself, which the batch gives bit for bit.
+pub(crate) fn item_key_alone(db: &dyn HirDatabase, id: ItemId) -> ItemKey {
+    ItemKey(ContentId::of(KEY_DOMAIN, &item_preimage(db, id).0))
+}
+
+/// The keys of the items a module's scope declares.
+#[salsa::tracked(returns(ref))]
+fn module_item_keys<'db>(
+    db: &'db dyn HirDatabase,
+    module: ModuleIdLt<'db>,
+) -> FxHashMap<ItemId, ItemKey> {
+    let scope = module.def_map(db).module(db, module).scope(db);
+    let mut ids = Vec::new();
+    for def in scope.declarations() {
+        match def {
+            ModuleDefId::FunctionId(it) => ids.push(ItemId::Function(it)),
+            ModuleDefId::AdtId(it) => ids.push(ItemId::Adt(it)),
+            ModuleDefId::ConstId(it) => ids.push(ItemId::Const(it)),
+            ModuleDefId::StaticId(it) => ids.push(ItemId::Static(it)),
+            ModuleDefId::TraitId(it) => ids.push(ItemId::Trait(it)),
+            ModuleDefId::TypeAliasId(it) => ids.push(ItemId::Alias(it)),
+            ModuleDefId::MacroId(it) => ids.push(ItemId::Macro(it)),
+            ModuleDefId::EnumVariantId(_) | ModuleDefId::ModuleId(_) | ModuleDefId::BuiltinType(_) => {}
+        }
+    }
+    ids.extend(scope.impls().map(ItemId::Impl));
+    ids.extend(scope.unnamed_consts().map(ItemId::Const));
+    for (_, macros) in scope.legacy_macros() {
+        ids.extend(macros.iter().map(|&it| ItemId::Macro(it)));
+    }
+    // SAFETY: the static id is only compared with others inside this query, never kept.
+    let here = Siblings::Module(unsafe { module.to_static() });
+    ids.retain(|&id| siblings(db, id) == here);
+    ids.sort_unstable();
+    ids.dedup();
+    let entries = ids.into_iter().map(|id| (id, item_preimage(db, id))).collect();
+    hash_all(entries).collect()
+}
+
+#[salsa::tracked(returns(ref))]
+fn impl_item_keys(db: &dyn HirDatabase, impl_: ImplId) -> FxHashMap<ItemId, ItemKey> {
+    let entries = impl_
+        .impl_items(db)
+        .items
+        .iter()
+        .map(|&(_, it)| (ItemId::from(it), item_preimage(db, it.into())))
+        .collect();
+    hash_all(entries).collect()
+}
+
+#[salsa::tracked(returns(ref))]
+fn trait_item_keys(db: &dyn HirDatabase, trait_: TraitId) -> FxHashMap<ItemId, ItemKey> {
+    let entries = trait_
+        .trait_items(db)
+        .items
+        .iter()
+        .map(|&(_, it)| (ItemId::from(it), item_preimage(db, it.into())))
+        .collect();
+    hash_all(entries).collect()
+}
+
+/// The bytes an item's key is the hash of: its parent's key, its kind, its name and where it
+/// is written.
+fn item_preimage(db: &dyn HirDatabase, id: ItemId) -> Bytes {
     let (parent, prefix, tag, name, file, ast): (_, &[u8], &[u8], _, _, _) = match id {
         ItemId::Function(it) => {
             let loc = it.lookup(db);
@@ -287,21 +429,38 @@ pub fn item_key(db: &dyn HirDatabase, id: ItemId) -> ItemKey {
             (module_key(db, loc.container), b"", b"proc_macro", name, loc.id.file_id, loc.id.value.erase())
         }
     };
-    let mut h = Hasher::new(KEY_DOMAIN);
-    h.id(&parent.0).part(prefix).part(tag);
-    opt(&mut h, name.as_deref());
-    written(db, &mut h, file, ast);
-    ItemKey(h.finish())
+    let mut b = Bytes::default();
+    b.id(&parent.0).part(prefix).part(tag).opt(name.as_deref());
+    written(db, &mut b, file, ast);
+    b
 }
 
 /// The key of an enum variant: its enum's and its name.
 pub fn variant_key(db: &dyn HirDatabase, variant: EnumVariantId) -> ItemKey {
     let loc = variant.lookup(db);
-    let mut h = Hasher::new(KEY_DOMAIN);
-    h.id(&item_key(db, ItemId::Adt(loc.parent.into())).0)
+    match enum_variant_keys(db, loc.parent).get(&variant) {
+        Some(&key) => key,
+        None => ItemKey(ContentId::of(KEY_DOMAIN, &variant_preimage(db, loc.parent, &loc.name).0)),
+    }
+}
+
+fn variant_preimage(db: &dyn HirDatabase, parent: EnumId, name: &Name) -> Bytes {
+    let mut b = Bytes::default();
+    b.id(&item_key(db, ItemId::Adt(parent.into())).0)
         .part(b"variant")
-        .part(loc.name.as_str().as_bytes());
-    ItemKey(h.finish())
+        .part(name.as_str().as_bytes());
+    b
+}
+
+#[salsa::tracked(returns(ref))]
+fn enum_variant_keys(db: &dyn HirDatabase, enum_: EnumId) -> FxHashMap<EnumVariantId, ItemKey> {
+    let entries = enum_
+        .enum_variants(db)
+        .variants
+        .iter()
+        .map(|(name, &(variant, _))| (variant, variant_preimage(db, enum_, name)))
+        .collect();
+    hash_all(entries).collect()
 }
 
 fn variant_id_key(db: &dyn HirDatabase, variant: VariantId) -> ItemKey {
@@ -599,7 +758,40 @@ pub fn resolve(db: &dyn HirDatabase, key: ItemKey) -> Option<Resolved> {
     None
 }
 
-type Index = FxHashMap<ItemKey, Resolved>;
+type Index = std::collections::HashMap<ItemKey, Resolved, KeyHashing>;
+
+/// Hashing for maps keyed by a key, which is a BLAKE3 hash already: its words are folded into
+/// the map's hash, which was computed once with the key and is carried, not hashed again.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct KeyHashing;
+
+impl std::hash::BuildHasher for KeyHashing {
+    type Hasher = KeyHasher;
+
+    fn build_hasher(&self) -> KeyHasher {
+        KeyHasher(0)
+    }
+}
+
+pub(crate) struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    // A `[u8; 32]` is hashed as its length and then its bytes: the length is the same for
+    // every key, so only the bytes count.
+    fn write_usize(&mut self, _: usize) {}
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = self.0.rotate_left(29) ^ u64::from_le_bytes(word);
+        }
+    }
+}
 
 /// Stops if two crates of the build have one key: an item of one would be taken for the
 /// other's.

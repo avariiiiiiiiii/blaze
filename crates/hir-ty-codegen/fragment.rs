@@ -343,10 +343,10 @@ pub(super) struct Recorder<'db> {
     pub(super) target: &'static Target,
     /// Whether the crate compiling the function has `-C overflow-checks`.
     pub(super) checked: bool,
-    /// `-C debug-assertions` of the crate compiling the function, which `ub_checks()` is
-    /// there, where the one that builds it knows (v2's `Spec::debug_assertions`). `None`:
-    /// the crate of the environment's, as [`super::ub_checks_of`] reads it.
-    pub(super) debug_assertions: Option<bool>,
+    /// The settings of the v2 unit the function is built for ([`super::v2::build::building`]):
+    /// its `-C debug-assertions` and panic strategy in place of the crate's, and no callee's
+    /// body built in, which the unit's key would not name. `None` outside a v2 unit.
+    pub(super) unit: Option<super::v2::build::Build>,
     /// What it asks for, which is all a producer of its code needs of this.
     pub(super) wants: Wants,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
@@ -705,7 +705,7 @@ impl<'db> Recorder<'db> {
             isa,
             target,
             checked,
-            debug_assertions: None,
+            unit: super::v2::build::building(),
             wants: Wants::new(isa),
             vtables: FxHashMap::default(),
             statics: FxHashMap::default(),

@@ -64,9 +64,12 @@ blaze-protocol.workspace = true
 blaze-tree.workspace = true
 blaze-ui.workspace = true
 blaze-web.workspace = true
-blaze-units.workspace = true
+# With `query`: the workspace load and unit graph as queries, for v2's daemon.
+blaze-units = { workspace = true, features = ["query"] }
 blaze-resolve = { path = "../blaze-resolve" }
 blaze-registry = { path = "../blaze-registry" }
+# The `SourceId` of a git dependency the daemon fetches (`serve/fetch/git.rs`).
+blaze-source.workspace = true
 blaze-build-script = { path = "../blaze-build-script" }
 cargo-util-schemas = "=0.14.3"
 ide-db.workspace = true
@@ -117,6 +120,20 @@ blaze-in-place = { path = "../blaze-in-place" }
 # blaze's std::process for build scripts compiled for wasm32-wasip1; its runner with the
 # feature `wasi`.
 blaze-wasi = { path = "../blaze-wasi" }
+# blaze v2's daemon (`serve`): the agent API, the sans-IO core and its drivers, the VFS, the
+# query database, the store, the workspace load's queries, user code, codegen and the linker.
+blaze-api.workspace = true
+blaze-core.workspace = true
+blaze-vfs.workspace = true
+blaze-query.workspace = true
+blaze-cas.workspace = true
+blaze-ids.workspace = true
+blaze-usercode.workspace = true
+blaze-codegen.workspace = true
+blaze-link.workspace = true
+load-cargo.workspace = true
+base-db.workspace = true
+crossbeam-channel.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

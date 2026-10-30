@@ -45,6 +45,10 @@ span.workspace = true
 stdx.workspace = true
 syntax.workspace = true
 
+blaze-codegen.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
 blaze-store.workspace = true
 
 cranelift-codegen = { version = "0.136", features = ["incremental-cache", "x86", "arm64"] }
@@ -62,6 +66,8 @@ inkwell = { version = "0.11.0", default-features = false, features = ["llvm23-1-
 
 [dev-dependencies]
 blaze-fuzz.workspace = true
+hir.workspace = true
+test-fixture.workspace = true
 
 [features]
 llvm = ["dep:inkwell"]

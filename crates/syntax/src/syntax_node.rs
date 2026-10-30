@@ -12,8 +12,6 @@ use syntax_tree::{FlatTree, FlatTreeBuilder, Language};
 
 use crate::{Parse, SyntaxError, SyntaxKind, TextSize};
 
-pub(crate) use syntax_tree::NodeOrToken;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RustLanguage {}
 impl Language for RustLanguage {
@@ -35,8 +33,7 @@ pub type SyntaxNodeChildren = syntax_tree::SyntaxNodeChildren<RustLanguage>;
 pub type SyntaxElementChildren = syntax_tree::SyntaxElementChildren<RustLanguage>;
 pub type PreorderWithTokens = syntax_tree::api::PreorderWithTokens<RustLanguage>;
 
-/// The tree of a parse: always flat. Green trees are made only by editing (`clone_for_update`,
-/// the syntax editor, `ast::make`), through the cursor's `green()`.
+/// The tree of a parse, flat: every tree is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tree(Arc<FlatTree>);
 

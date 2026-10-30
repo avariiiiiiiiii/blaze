@@ -132,14 +132,17 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
         Class::Veneers => (Segment::Text, 4, ""),
         Class::Named { name, exec: true, .. } => (Segment::Text, 5, name),
         Class::Rodata => (Segment::Rdata, 0, ""),
-        Class::EhFrame => (Segment::Rdata, 1, ""),
-        Class::Synthetic(IDATA) => (Segment::Rdata, 2, ""),
-        Class::Synthetic(EDATA) => (Segment::Rdata, 3, ""),
-        Class::Synthetic(DEBUG) => (Segment::Rdata, 4, ""),
-        Class::Synthetic(TLS_DIR) => (Segment::Rdata, 5, ""),
+        // The loader applies base relocations to read-only pages too: link.exe's `.rdata`
+        // holds vtables.
+        Class::RelRo => (Segment::Rdata, 1, ""),
+        Class::EhFrame => (Segment::Rdata, 2, ""),
+        Class::Synthetic(IDATA) => (Segment::Rdata, 3, ""),
+        Class::Synthetic(EDATA) => (Segment::Rdata, 4, ""),
+        Class::Synthetic(DEBUG) => (Segment::Rdata, 5, ""),
+        Class::Synthetic(TLS_DIR) => (Segment::Rdata, 6, ""),
         Class::Named { name, .. } if name == OBJ_PDATA => (Segment::Pdata, 0, name),
         Class::Named { name, .. } if name == RSRC => (Segment::Rsrc, 0, name),
-        Class::Named { name, write: false, .. } => (Segment::Rdata, 6, name),
+        Class::Named { name, write: false, .. } => (Segment::Rdata, 7, name),
         Class::Data => (Segment::Data, 0, ""),
         Class::Table => (Segment::Data, 1, ""),
         Class::Got => (Segment::Data, 2, ""),
@@ -148,12 +151,14 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
         Class::FiniArray => (Segment::Data, 5, ""),
         Class::Named { name, .. } => (Segment::Data, 6, name),
         Class::Synthetic(TLS_INDEX) => (Segment::Data, 7, ""),
-        Class::Bss => (Segment::Data, 8, ""),
+        // Mach-O's alone (`Plan::tls_descriptors` is false): `image::file` refuses one.
+        Class::ThreadVars => (Segment::Data, 8, ""),
+        Class::Bss => (Segment::Data, 9, ""),
         Class::Synthetic(PDATA) => (Segment::Pdata, 1, ""),
         Class::Tdata => (Segment::Tls, 0, ""),
         Class::Tbss => (Segment::Tls, 1, ""),
         Class::Synthetic(RELOC) => (Segment::Reloc, 0, ""),
-        Class::Synthetic(name) => (Segment::Rdata, 7, name),
+        Class::Synthetic(name) => (Segment::Rdata, 8, name),
     }
 }
 
@@ -264,7 +269,7 @@ impl Writer for Pe {
     }
 
     fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)> {
-        image::synthetic(self, counts)
+        image::synthetic(counts)
     }
 
     fn apply(
@@ -283,7 +288,7 @@ impl Writer for Pe {
     }
 
     fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
-        image::synthesize(self, placed)
+        image::synthesize(placed)
     }
 
     fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64> {

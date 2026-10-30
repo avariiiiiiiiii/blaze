@@ -115,6 +115,7 @@ blaze-items = { path = "crates/blaze-items" }
 blaze-link = { path = "crates/blaze-link" }
 blaze-query = { path = "crates/blaze-query" }
 blaze-usercode = { path = "crates/blaze-usercode" }
+blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 blaze-vfs = { path = "crates/blaze-vfs" }
 # Flecs's C and its read-only REST, for the build page's world (vendor/flecs-c/SOURCE.md).
 flecs-c = { path = "vendor/flecs-c" }

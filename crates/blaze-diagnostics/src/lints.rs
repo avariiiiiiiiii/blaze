@@ -6,6 +6,7 @@
 //!   notes; the unknown, renamed and removed lint names; unfulfilled `expect`s.
 //! - [`registry`]: every builtin lint of the pinned nightly, its groups, renamed and removed
 //!   lints.
+//! - [`edit_distance`]: rustc's choice of a similar name to suggest.
 //! - `syntax`: what rustc's early lint pass, its expansion and its attribute checks find on
 //!   the source as written (`unused_parens`, `unexpected_cfgs`, `unused_attributes`, ..).
 //! - `names`: what name resolution, stability and the dead-code pass find of items and paths
@@ -14,6 +15,7 @@
 //!   lints find in bodies (`unreachable_code`, `unused_variables`, `arithmetic_overflow`, ..).
 
 mod bodies;
+pub mod edit_distance;
 mod levels;
 mod names;
 pub mod registry;
@@ -21,6 +23,11 @@ mod syntax;
 
 pub use levels::{CommandLine, Level};
 pub use syntax::CheckCfg;
+
+use blaze_items::{Fact, ItemId};
+use hir::InFile;
+use hir_def::AdtId;
+use syntax::{AstNode, SyntaxNode, SyntaxNodePtr, ast, ast::HasName};
 
 use crate::{
     cx::Cx,
@@ -62,4 +69,44 @@ pub fn late(cx: &Cx<'_, '_>) -> Vec<Found> {
 /// [`Phase::Late`]: crate::lower::Phase::Late
 pub fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, aborted: bool) -> Vec<Diag> {
     levels::decide(cx, cmd, found, aborted)
+}
+
+/// The item whose body `at` is in, and its name: a function, a const, a static, or the enum
+/// of a discriminant; through a macro's expansion to where it was called.
+pub(crate) fn body_item(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<(ItemId, String)> {
+    let mut node: InFile<SyntaxNode> = cx.syntax(at);
+    loop {
+        for ancestor in node.value.ancestors() {
+            let name = |it: &dyn HasName| it.name().map(|it| it.text().to_string());
+            if let Some(it) = ast::Fn::cast(ancestor.clone()) {
+                let def = cx.sema.to_def2(node.with_value(&it))?;
+                let id = hir_def::FunctionId::try_from(def).ok()?;
+                return Some((ItemId::Function(id), name(&it)?));
+            }
+            if let Some(it) = ast::Const::cast(ancestor.clone()) {
+                let def = cx.sema.to_def2(node.with_value(&it))?;
+                return Some((ItemId::Const(def.into()), name(&it).unwrap_or_else(|| "_".to_owned())));
+            }
+            if let Some(it) = ast::Static::cast(ancestor.clone()) {
+                let def = cx.sema.to_def2(node.with_value(&it))?;
+                return Some((ItemId::Static(def.into()), name(&it)?));
+            }
+            if let Some(it) = ast::Variant::cast(ancestor.clone()) {
+                let def = cx.sema.to_def2(node.with_value(&it))?;
+                let parent = def.parent_enum(cx.db);
+                let name = parent.name(cx.db).display(cx.db, cx.edition).to_string();
+                return Some((ItemId::Adt(AdtId::EnumId(parent.into())), name));
+            }
+        }
+        let call = node.file_id.macro_file()?;
+        node = call.loc(cx.db).to_node(cx.db);
+    }
+}
+
+/// Records on `diag` the fact of the code of the body `at` is in: what to change to make it
+/// go away.
+pub(crate) fn code_fact(cx: &Cx<'_, '_>, diag: &mut Diag, at: InFile<SyntaxNodePtr>) {
+    if let Some((item, name)) = body_item(cx, at) {
+        diag.fact(Fact::Code(cx.key(item)), format!("the code of `{name}`"));
+    }
 }

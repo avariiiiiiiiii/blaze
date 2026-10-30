@@ -30,6 +30,13 @@ format-hir) append below with their name.
    the new parse with `Parse::reparse(delete, insert, edition)` rather than parsing the whole
    file. It gives the same tree as a full parse (format-parse's tests check it). Why:
    docs/v2/plan/lanes/format.md "an edit reparses the changed item".
+5. **Workspace dependency `blaze-v2-proof`** — root `Cargo.toml` `[workspace.dependencies]`
+   (coordinator): `blaze-v2-proof = { path = "crates/blaze-v2-proof" }`, as proof's request 9
+   asks. `crates/blaze-format/Cargo.toml` already has `blaze-v2-proof.workspace = true` under
+   `[dev-dependencies]` (manifest_lint names it until then). Why: `tiers/tests.rs` runs every
+   tier through `columns::round_trips` and `columns::reads_in_place` (docs/v2/plan/design/data.md,
+   "Every encoding round-trips exactly, which the proof checks"). The dev-dependency cycle
+   (blaze-v2-proof -> blaze-query -> blaze-format) is one cargo allows for dev-dependencies.
 
 ## format-span-intern
 
@@ -197,3 +204,35 @@ are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*
    `load-cargo`; owners: format-hir, the coordinator): they write `ErasedFileAstId::into_raw`.
    Raw ids from before this change decode to other nodes. If any of these encodings can be read
    back across blaze versions without a version in their cache key, bump it; otherwise nothing.
+
+## format-parse
+
+1. **`OutlineFn` can go** — `crates/hir-def/src/item_tree/attrs.rs` (format-hir): format-hir's
+   request 2 is done. `HasAttrs::inner_attributes_node` (`crates/syntax/src/ast/traits.rs`)
+   now returns `None` for a `fn` whose body is lazy and not yet parsed when the body's text
+   surely starts with no inner attribute (`block_may_start_with_inner_attr`, the same rule,
+   with its tests). Remove `OutlineFn`, its `may_start_with_inner_attr` and
+   `block_comment_len` and their tests, and call `ast::Fn`'s `HasAttrs` directly. Why: one
+   copy of the rule, for every caller (#1294).
+2. **No edit, already applied**: the lead's request 3 (drop `syntax::set_green_trees` from
+   `crates/blaze-engine/src/lib.rs`) is done in the tree (`rg set_green_trees crates` finds
+   nothing); `syntax::set_green_trees` no longer exists, so nothing may call it again.
+3. **An expander returns its errors** — `crates/syntax-tree/src/flat.rs` (format-tree). Make
+   `pub type Expand = fn(kind: SyntaxKind, text: &str, data: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>)`,
+   the ranges relative to `text`. Keep them with the part, moved to the file like its tree,
+   and add `FlatTree::part_errors(&self, at: u32) -> &[(TextRange, Box<str>)]`: lazy node
+   `at`'s errors, absolute, parsing the part if it isn't parsed yet. Why (performance): today
+   `Expand` returns only the tree, so `Parse::errors_with_bodies` (and `errors()` for the
+   bodies parsed so far) finds each body's parser errors by parsing the body a second time
+   (`crates/syntax/src/parsing.rs`, `body_parser_errors`). With this each body is parsed once.
+   When it lands, tell format-parse: `expand_lazy` returns its parser errors and
+   `body_parser_errors` reads `part_errors`. Keep a part's errors in its `heap_size`.
+4. **Replace a token in place** — `crates/syntax-tree/src/flat.rs` (format-tree). Add
+   `FlatTree::replace_token(&self, at: u32, text: &str, source: Arc<str>) -> FlatTree`: token
+   `at` with the new `text` (same kind), over `source`, the new whole text, with every lazy
+   node kept lazy and every part already parsed kept (those after `at` moved). Why
+   (performance): the token reparse (`crates/syntax/src/parsing/reparsing.rs`, `Edit::token`)
+   has to rebuild the token's parent from the arrays to call `replace_subtree`. For whitespace
+   or a comment at a file's top level that parent is the root, so a one-character edit rebuilds
+   the whole tree and drops every body parsed so far. When it lands, tell format-parse, which
+   switches `Edit::token` to it.

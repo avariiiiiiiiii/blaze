@@ -12,6 +12,8 @@ compile.
    StoredTy)` in `crates/hir-ty/src/mir.rs` derive `Hash`. `PartialEq` is derived, so a derived
    `Hash` agrees with it.
 
+> forwarded to items: `crates/hir-ty/src/layout.rs:79` still derives no `Hash`.
+
 2. **What:** add `Hash` to the derive of `LayoutCalculatorError<F>`.
    **Where:** `crates/rustc_abi/src/layout.rs` (`#[derive(Copy, Clone, Debug, PartialEq, Eq)] pub
    enum LayoutCalculatorError<F>`). It becomes `#[derive(Copy, Clone, Debug, PartialEq, Eq,
@@ -20,5 +22,9 @@ compile.
    variant holds only `F` or `usize`, so the derive compiles for `F = ()`, and it agrees with the
    derived `PartialEq`.
 
+> forwarded to coordinator: `crates/rustc_abi/` is the coordinator's (crates.md, "Every other path"), not among the paths `requests` applies.
+
 (`ConstEvalError<'db>` in `crates/hir-ty/src/consteval.rs` also needs `Hash`. That file belongs
 to `db-ty`, so it is in the report rather than here.)
+
+> applied: the `ConstEvalError` note is db-ty's own file; nothing to apply here.

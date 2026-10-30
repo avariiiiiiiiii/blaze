@@ -475,3 +475,22 @@ pub struct S;
         assert!(!keys[at + 1..].contains(a), "{krates:?}");
     }
 }
+
+#[test]
+fn a_batch_of_keys_is_each_key_alone() {
+    let (db, _) = single(
+        r#"
+mod m { pub struct A; pub fn f() {} pub enum E { X, Y } }
+trait Tr { fn a(); const C: u8; type T; }
+impl Tr for m::A { fn a() {} const C: u8 = 0; type T = u8; }
+macro_rules! mac { () => {} }
+extern "C" { fn ext(); }
+const _: () = ();
+"#,
+    );
+    let items = super::items(&db);
+    assert!(items.len() >= 12, "{items:?}");
+    for id in items {
+        assert_eq!(item_key(&db, id), key::item_key_alone(&db, id), "{id:?}");
+    }
+}

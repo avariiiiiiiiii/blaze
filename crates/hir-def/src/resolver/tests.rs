@@ -125,7 +125,7 @@ fn type_and_value_lookups_at_a_warm_scope_allocate_nothing() {
         [&["T"][..], &["m", "S"], &["B"], &["Pre"], &["u32"], &["m", "E", "A"], &["Tr"], &["Local"]]
             .map(path);
     let types = type_paths.each_ref().map(Path::BarePath);
-    let found: Vec<_> = types.iter().map(|it| resolver.resolve_path_in_type_ns(&db, it)).collect();
+    let found: Vec<_> = types.iter().map(|it| resolver.resolve_path_in_type_ns(&db, *it)).collect();
     let kinds: Vec<&str> = found
         .iter()
         .map(|it| match it {
@@ -147,7 +147,7 @@ fn type_and_value_lookups_at_a_warm_scope_allocate_nothing() {
     let values = value_paths.each_ref().map(Path::BarePath);
     let found: Vec<_> = values
         .iter()
-        .map(|it| resolver.resolve_path_in_value_ns(&db, it, HygieneId::ROOT))
+        .map(|it| resolver.resolve_path_in_value_ns(&db, *it, HygieneId::ROOT))
         .collect();
     assert!(
         matches!(
@@ -166,10 +166,10 @@ fn type_and_value_lookups_at_a_warm_scope_allocate_nothing() {
 
     assert_at_most(0, "type and value lookups at the innermost scope", || {
         for it in &types {
-            black_box(resolver.resolve_path_in_type_ns(&db, it));
+            black_box(resolver.resolve_path_in_type_ns(&db, *it));
         }
         for it in &values {
-            black_box(resolver.resolve_path_in_value_ns(&db, it, HygieneId::ROOT));
+            black_box(resolver.resolve_path_in_value_ns(&db, *it, HygieneId::ROOT));
         }
     });
 }

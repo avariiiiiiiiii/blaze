@@ -863,7 +863,7 @@ mod tests {
         assert_eq!(columns.check(0, 0, 0), Err("a lifetime id past its arena"));
         assert_eq!(columns.check(0, 0, 1), Ok(()));
 
-        let columns = columns_of(&[TypeRef::Never, TypeRef::DynTrait(&v.bounds[..1])]);
+        let mut columns = columns_of(&[TypeRef::Never, TypeRef::DynTrait(&v.bounds[..1])]);
         assert_eq!(columns.freeze_into().check(0, 0, 0), Err(NOT_A_PATH));
     }
 

@@ -18,7 +18,7 @@ fn collected_with(
     let previous = RESOLVE_STRATEGY.replace(strategy);
     let calls = RESOLVE_IMPORT_CALLS.replace(0);
     let collected = catch_unwind(AssertUnwindSafe(|| {
-        let db = TestDB::with_files(ra_fixture);
+        let db = fixture::db(ra_fixture).into_db();
         let mut out = String::new();
         for &krate in base_db::all_crates(&db).iter() {
             let def_map = crate_def_map(&db, krate);

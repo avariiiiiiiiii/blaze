@@ -69,7 +69,12 @@ impl<T> ShortLock<T> {
 
 impl<T: Default> Default for ShortLock<T> {
     fn default() -> ShortLock<T> {
-        ShortLock::new(T::default())
+        let lock = ShortLock::new(T::default());
+        // alloc: `std`'s mutex is a pthread one on macOS, boxed at its first lock: taken here,
+        // where the owner is made, so a new view's first insert in a shard allocates nothing.
+        #[cfg(not(blaze_check))]
+        drop(lock.lock());
+        lock
     }
 }
 

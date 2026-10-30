@@ -776,12 +776,6 @@ fn a_warm_load_allocates_nothing() {
 
     let again = fixture.open(&ask(&files));
     let pinned = fixture.db.pin();
-    eprintln!("DEBUG measuring");
-    let (_, used) = blaze_alloc_count::measure(|| pinned.get::<Plan>(again, &()).is_ok());
-    eprintln!("DEBUG second view {used:?}");
-    drop(pinned);
-    let again = fixture.open(&ask(&files));
-    let pinned = fixture.db.pin();
     assert!(blaze_alloc_count::assert_at_most(0, "an unchanged plan verified", || pinned.get::<Plan>(again, &()).is_ok()));
     drop(pinned);
     assert!(!fixture.ran::<Plan>(again, &()), "verified, not run again");

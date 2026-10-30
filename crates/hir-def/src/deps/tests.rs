@@ -80,7 +80,7 @@ impl ImageStore for Memory {
     fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
         let mut images = self.images.lock().unwrap();
         match images.get(&key) {
-            Some(kept) if **kept != *image => Err(format!("{key:?} kept with other bytes")),
+            Some(kept) if kept[..] != image[..] => Err(format!("{key:?} kept with other bytes")),
             Some(_) => Ok(()),
             None => {
                 images.insert(key, Arc::new(Aligned::copy_from(&image)));
@@ -293,7 +293,11 @@ fn a_served_dependency_resolves_as_a_fresh_one() {
             let (krate, live) = (crate_named(&db, name), crate_named(&fresh, name));
             let def_map = crate::nameres::crate_def_map(&db, krate);
             let fresh_map = crate::nameres::crate_def_map(&fresh, live);
-            assert_eq!(def_map.diagnostics.len(), fresh_map.diagnostics.len(), "{name} {mode:?}");
+            assert_eq!(
+                def_map.diagnostics(&db).len(),
+                fresh_map.diagnostics(&fresh).len(),
+                "{name} {mode:?}"
+            );
             assert_eq!(frozen::encode(&db, krate), frozen::encode(&fresh, live), "{name} {mode:?}");
             assert_eq!(
                 frozen::encode_lang_items(&db, krate),
@@ -313,7 +317,7 @@ fn an_unresolved_import_of_a_dependency_is_still_reported() {
     let crates = all(&db);
     serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
     let lib = crate::nameres::crate_def_map(&db, crate_named(&db, "lib"));
-    assert!(!lib.diagnostics.is_empty(), "`use core::Missing` is unresolved");
+    assert!(!lib.diagnostics(&db).is_empty(), "`use core::Missing` is unresolved");
 }
 
 #[test]
@@ -466,7 +470,11 @@ fn a_crate_with_traced_expansions_resolves_from_its_image_as_a_fresh_one() {
         assert_ne!(filed, served.keys[&lib], "an image with reads is filed by them, not the key");
         let def_map = crate::nameres::crate_def_map(&db, lib);
         let fresh_map = crate::nameres::crate_def_map(&fresh, live);
-        assert_eq!(def_map.diagnostics.len(), fresh_map.diagnostics.len(), "{mode:?}");
+        assert_eq!(
+            def_map.diagnostics(&db).len(),
+            fresh_map.diagnostics(&fresh).len(),
+            "{mode:?}"
+        );
         assert_eq!(frozen::encode(&db, lib), frozen::encode(&fresh, live), "{mode:?}");
         assert_eq!(
             signatures::encode(&db, lib, &mut Vec::new()),

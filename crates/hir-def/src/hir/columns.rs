@@ -2897,7 +2897,7 @@ mod tests {
         );
 
         let mut columns = columns_with(Statement::Expr { expr: E0, has_semi: true });
-        columns.stmt_data = Box::default();
+        columns.stmt_data = Default::default();
         assert_eq!(
             columns.check(0, 0, 0, &paths),
             Err("statement kind and data columns of different lengths")

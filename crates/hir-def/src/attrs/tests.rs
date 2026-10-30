@@ -888,7 +888,7 @@ fn old_parse_repr_tt(tt: &ast::TokenTree) -> Option<rustc_abi::ReprOptions> {
     use crate::builtin_type::{BuiltinInt, BuiltinUint};
     use either::Either;
     use rustc_abi::{Align, Integer, IntegerType, ReprFlags, ReprOptions};
-    use syntax::{NodeOrToken, ast::TokenTreeChildren};
+    use syntax::{AstToken, NodeOrToken, ast::TokenTreeChildren};
 
     let mut tts = TokenTreeChildren::new(tt).peekable();
     let mut acc = ReprOptions::default();
@@ -1001,7 +1001,7 @@ fn old_parse_link_tt(
     root: view::Node<'_>,
     tt: &ast::TokenTree,
 ) -> Option<(NativeLib, Option<cfg::CfgExpr>)> {
-    use syntax::{NodeOrToken, SyntaxKind, T, ast::TokenTreeChildren};
+    use syntax::{AstToken, NodeOrToken, SyntaxKind, T, ast::TokenTreeChildren};
 
     let mut lib = NativeLib {
         name: Symbol::empty(),
@@ -1187,7 +1187,8 @@ fn root_owners(db: &TestDB) -> Vec<AttrDefId> {
             ModuleDefId::ModuleId(it) => owners.push(AttrDefId::ModuleId(it)),
             ModuleDefId::AdtId(AdtId::EnumId(it)) => {
                 owners.push(AdtId::EnumId(it).into());
-                owners.extend(it.enum_variants(db).variants.values().map(|&(v, _)| v.into()));
+                let variants = it.enum_variants(db).variants.values();
+                owners.extend(variants.map(|&(v, _)| AttrDefId::EnumVariantId(v)));
             }
             ModuleDefId::AdtId(it) => owners.push(it.into()),
             ModuleDefId::ConstId(it) => owners.push(it.into()),
@@ -1414,7 +1415,8 @@ fn all_owners(db: &TestDB) -> Vec<AttrDefId> {
                 ModuleDefId::FunctionId(it) => owners.push(it.into()),
                 ModuleDefId::AdtId(AdtId::EnumId(it)) => {
                     owners.push(AdtId::EnumId(it).into());
-                    owners.extend(it.enum_variants(db).variants.values().map(|&(v, _)| v.into()));
+                    let variants = it.enum_variants(db).variants.values();
+                    owners.extend(variants.map(|&(v, _)| AttrDefId::EnumVariantId(v)));
                 }
                 ModuleDefId::AdtId(it) => owners.push(it.into()),
                 ModuleDefId::ConstId(it) => owners.push(it.into()),

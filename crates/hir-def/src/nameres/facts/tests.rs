@@ -1134,7 +1134,7 @@ impl ProcMacroExpander for IdentityWhenValid {
         ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         let (parse, _) = syntax_bridge::token_tree_to_syntax_node(
-            subtree,
+            subtree.view(),
             syntax_bridge::TopEntryPoint::MacroItems,
             &mut |_| Edition::CURRENT,
         );
@@ -1211,7 +1211,8 @@ fn bodies(db: &Db, def_map: &DefMap) -> Vec<DefWithBodyId> {
                 ModuleDefId::ConstId(it) => out.push(it.into()),
                 ModuleDefId::StaticId(it) => out.push(it.into()),
                 ModuleDefId::AdtId(AdtId::EnumId(it)) => {
-                    out.extend(it.enum_variants(db).variants.values().map(|&(it, _)| it.into()))
+                    let variants = it.enum_variants(db).variants.values();
+                    out.extend(variants.map(|&(it, _)| DefWithBodyId::VariantId(it)))
                 }
                 ModuleDefId::TraitId(it) => assoc(&mut out, &it.trait_items(db).items),
                 ModuleDefId::ModuleId(_)

@@ -133,17 +133,17 @@ fn item_name(db: &TestDB, item: crate::AstId<ast::Item>) -> String {
 }
 
 fn check_used(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     expect.assert_eq(&render_used(&db, db.fetch_test_crate()));
 }
 
 fn check_used_in(name: &str, #[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     expect.assert_eq(&render_used(&db, crate_named(&db, name)));
 }
 
 fn check_records_in(name: &str, #[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     let def_map = crate_def_map(&db, crate_named(&db, name));
     expect.assert_eq(&render_records(&db, def_map));
 }
@@ -178,7 +178,7 @@ fn f() { x(); }
             ambiguous x Values through a::*
         "#]],
     );
-    let db = TestDB::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     let def_map = crate_def_map(&db, db.fetch_test_crate());
     let scope = def_map.module(&db, def_map.root).scope(&db);
     let x = Name::new_symbol_root(intern::Symbol::intern("x"));
@@ -193,12 +193,13 @@ fn f() { x(); }
 
 #[test]
 fn an_import_is_visible_as_the_prelude_gives_it_too() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: option
 use core::option::Option;
 "#,
-    );
+    )
+    .into_db();
     let def_map = crate_def_map(&db, db.fetch_test_crate());
     let scope = def_map.module(&db, def_map.root).scope(&db);
     let option = Name::new_symbol_root(sym::Option);
@@ -323,7 +324,7 @@ macro_rules! made { () => {} }
             macro_use extern crate dep; Scope
         "#]],
     );
-    let db = TestDB::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     let def_map = crate_def_map(&db, crate_named(&db, "main"));
     let [call] = def_map.name_records(&db).macro_calls() else { panic!() };
     assert_eq!(via_text(&db, call.via), "macro_use extern crate dep;");
@@ -348,7 +349,7 @@ crate::there!();
             crate::there as again Scope
         "#]],
     );
-    let db = TestDB::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     let def_map = crate_def_map(&db, db.fetch_test_crate());
     let mut vias: Vec<String> =
         def_map.name_records(&db).macro_calls().iter().map(|it| via_text(&db, it.via)).collect();
@@ -358,7 +359,7 @@ crate::there!();
 
 #[test]
 fn a_derive_helper_before_its_derive_resolves_as_rustc_s_compat_helper() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- /main.rs crate:main deps:proc
 #[rustc_builtin_macro]
@@ -377,7 +378,8 @@ struct After;
 #[proc_macro_derive(Derive, attributes(helper))]
 fn derive() {}
 "#,
-    );
+    )
+    .into_db();
     let def_map = crate_def_map(&db, crate_named(&db, "main"));
     let mut helpers: Vec<(String, bool)> = (def_map.name_records(&db).derive_helpers().iter())
         .map(|it| (item_name(&db, it.item), it.before_derive))
@@ -420,14 +422,15 @@ macro_rules! made { () => {} }
 
 #[test]
 fn an_underscore_import_and_a_shadowed_one_are_kept() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 mod m { pub trait Tr {} pub struct S; }
 use m::Tr as _;
 struct S;
 use m::S;
 "#,
-    );
+    )
+    .into_db();
     let def_map = crate_def_map(&db, db.fetch_test_crate());
     let scope = def_map.module(&db, def_map.root).scope(&db);
     let [underscore] = scope.underscore_imports() else { panic!() };
@@ -493,7 +496,7 @@ fn check_trait_used(
     trait_name: &str,
     expect: Expect,
 ) {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     let krate = db.fetch_test_crate();
     let tr = trait_at(&db, krate, trait_path, trait_name);
     let resolver = root_fn(&db, krate, "f").resolver(&db);
@@ -534,7 +537,7 @@ fn f() { ().go(); }
             super::m::Tr as _ Other
         "#]],
     );
-    let db = TestDB::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     let krate = db.fetch_test_crate();
     let root = module_at(&db, krate, &[]);
     let scope = root.def_map(&db).module(&db, root).scope(&db);
@@ -602,12 +605,13 @@ fn f() { ().go(); }
 
 #[test]
 fn a_trait_of_the_std_prelude_uses_no_import() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: clone
 fn f() { ().clone(); }
 "#,
-    );
+    )
+    .into_db();
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let ModuleDefId::TraitId(clone) = def_map.resolve_in_prelude(&db, &name("Clone")).types.unwrap().def
@@ -620,7 +624,7 @@ fn f() { ().clone(); }
 
 #[test]
 fn the_impl_s_own_trait_uses_no_import() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 mod m { pub trait Tr { fn go(&self) {} } }
 use m::*;
@@ -628,7 +632,8 @@ struct S;
 impl m::Tr for S { fn go(&self) { self.go() } }
 fn f() {}
 "#,
-    );
+    )
+    .into_db();
     let krate = db.fetch_test_crate();
     let tr = trait_at(&db, krate, &["m"], "Tr");
     let root = module_at(&db, krate, &[]);

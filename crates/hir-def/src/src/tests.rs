@@ -74,7 +74,7 @@ struct Defs {
 }
 
 fn defs(db: &TestDB) -> Defs {
-    fn source<L: HasSource>(db: &Db, loc: L) -> (SyntaxKind, TextRange, SyntaxKind, TextRange)
+    fn source<L: HasSource>(db: &Db, loc: &L) -> (SyntaxKind, TextRange, SyntaxKind, TextRange)
     where
         L::Value: Typed,
     {
@@ -118,7 +118,7 @@ fn defs(db: &TestDB) -> Defs {
                 ModuleDefId::AdtId(AdtId::EnumId(it)) => {
                     defs.sources.push(source(db, it.lookup(db)));
                     defs.generics.push(it.into());
-                    for &(variant, _) in EnumVariants::of(db, it).variants.values() {
+                    for &(variant, _) in EnumVariants::of(db, it).0.variants.values() {
                         let variant: EnumVariantId = variant;
                         defs.sources.push(source(db, variant.lookup(db)));
                         defs.variants.push(VariantId::EnumVariantId(variant));

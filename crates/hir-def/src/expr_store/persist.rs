@@ -3058,7 +3058,7 @@ fn f() -> u32 {
         for (_, expr) in body.store.exprs() {
             match expr {
                 Expr::MethodCall { method_name, .. } => names.push(method_name),
-                Expr::RecordLit { fields, .. } => names.extend(fields.iter().map(|it| it.name)),
+                Expr::RecordLit { fields, .. } => names.extend(fields.iter().map(|it| &it.name)),
                 _ => {}
             }
         }

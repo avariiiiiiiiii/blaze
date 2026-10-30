@@ -182,7 +182,7 @@ fn resolver_scope_push_lookup_and_pop_allocate_nothing() {
     let guard = resolver.update_to_inner_scope(&db, def, innermost);
     let found: Vec<_> =
         // alloc: test setup, outside the measure
-        paths.iter().map(|it| resolver.resolve_path_in_value_ns(&db, it, HygieneId::ROOT)).collect();
+        paths.iter().map(|it| resolver.resolve_path_in_value_ns(&db, *it, HygieneId::ROOT)).collect();
     assert!(
         matches!(found[0], Some(ResolveValueResult::ValueNs(ValueNs::LocalBinding(_)))),
         "`z` is not a local at the innermost expression: {:?}",
@@ -198,7 +198,7 @@ fn resolver_scope_push_lookup_and_pop_allocate_nothing() {
     assert_at_most(0, "a scope push, three value lookups and the pop", || {
         let guard = resolver.update_to_inner_scope(&db, def, innermost);
         for it in &paths {
-            black_box(resolver.resolve_path_in_value_ns(&db, it, HygieneId::ROOT));
+            black_box(resolver.resolve_path_in_value_ns(&db, *it, HygieneId::ROOT));
         }
         resolver.reset_to_guard(guard);
     });

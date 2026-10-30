@@ -604,9 +604,10 @@ fn a_record_of_another_query_is_refused() {
     let what = Item::Function(f).what();
     let written = record::<codes::Function>(&db, krate, what, FunctionSignature::of(&db, f));
     let bytes = std::sync::Arc::new(Aligned::copy_from(&written.unwrap()));
-    assert!(read::<codes::Function>(&db, krate, what, &bytes, &bytes).is_ok());
+    let image: crate::deps::ImageBuf = bytes.clone();
+    assert!(read::<codes::Function>(&db, krate, what, &image, &bytes).is_ok());
     let a_struct = items(&db, krate).into_iter().find(|it| matches!(it, Item::Struct(_)));
-    let error = read::<codes::Struct>(&db, krate, a_struct.unwrap().what(), &bytes, &bytes);
+    let error = read::<codes::Struct>(&db, krate, a_struct.unwrap().what(), &image, &bytes);
     assert!(error.is_err_and(|it| it.contains("a record of query")));
 }
 

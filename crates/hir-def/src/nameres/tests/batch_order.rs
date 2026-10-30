@@ -8,7 +8,7 @@ use base_db::{RunOrder, set_run_order};
 /// run in `order`.
 fn collected_in(order: RunOrder, #[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
     let previous = set_run_order(order);
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let diagnostics: Vec<String> =

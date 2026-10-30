@@ -1142,7 +1142,7 @@ macro_rules! mbe {
 
 #[test]
 fn collects_derive_helpers() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 #![crate_type="proc-macro"]
 struct TokenStream;
@@ -1152,7 +1152,8 @@ pub fn derive_macro_2(_item: TokenStream) -> TokenStream {
     TokenStream
 }
 "#,
-    );
+    )
+    .into_db();
     let krate = *all_crates(&db).last().expect("no crate graph present");
     let def_map = crate_def_map(&db, krate);
 
@@ -1571,7 +1572,7 @@ pub struct Url {}
 
 #[test]
 fn macro_use_imports_all_macro_types() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- /main.rs crate:main deps:lib
 #[macro_use]
@@ -1593,7 +1594,8 @@ struct TokenStream;
 #[proc_macro_attribute]
 fn proc_attr(a: TokenStream, b: TokenStream) -> TokenStream { a }
     "#,
-    );
+    )
+    .into_db();
     let krate = *all_crates(&db).last().expect("no crate graph present");
     let def_map = crate_def_map(&db, krate);
 
@@ -1932,7 +1934,7 @@ pub fn huge(_attr: TokenStream, _item: TokenStream) -> TokenStream {
             disabled: false,
         },
     )];
-    let db = TestDB::with_files_extra_proc_macros(
+    let db = fixture::db_with_proc_macros(
         r#"
 //- proc_macros: huge
 //- /main.rs crate:main
@@ -1940,7 +1942,8 @@ pub fn huge(_attr: TokenStream, _item: TokenStream) -> TokenStream {
 extern "C" {}
 "#,
         proc_macros,
-    );
+    )
+    .into_db();
     let krate = *all_crates(&db)
         .iter()
         .find(|krate| {

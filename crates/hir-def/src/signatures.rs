@@ -2773,7 +2773,7 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
                 let source = id.lookup(&$db).source_view(&$db);
                 let (whole, whole_map) =
                     $Signature::lower(&$db, id, source, None, BodyLowering::Whole);
-                assert_eq!(**signature, *whole, "{id:?}");
+                assert_eq!(**signature, whole, "{id:?}");
                 assert!(*map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
             }};
         }
@@ -2802,7 +2802,7 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
                 let (whole, whole_map) = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
                     VariantFields::lower(&db, id, None, BodyLowering::Whole, frame)
                 });
-                assert_eq!(**fields, *whole, "{id:?}");
+                assert_eq!(**fields, whole, "{id:?}");
                 assert!(*map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
             }
         }

@@ -62,8 +62,12 @@ pub(super) struct Loaded {
 impl Loaded {
     pub(super) fn new(fixture: &str) -> Loaded {
         let fx = fixture::db_with_proc_macros(fixture, extra_proc_macros());
-        let files =
-            fx.paths().iter().cloned().zip(fx.files().iter().map(|it| it.file_id())).collect();
+        let files = fx
+            .paths()
+            .iter()
+            .cloned()
+            .zip(fx.files().iter().map(|it| it.file_id(fx.db())))
+            .collect();
         Loaded { db: fx.into_db(), files }
     }
 

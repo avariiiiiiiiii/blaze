@@ -281,7 +281,8 @@ fn all_fixtures() -> &'static [(String, &'static str, Exempt)] {
                 if !loads {
                     continue;
                 }
-                out.push((fixture.name, fixture.text, facts_exempt(fixture.name)));
+                let exempt = facts_exempt(&fixture.name);
+                out.push((fixture.name, fixture.text, exempt));
             }
         }
         out

@@ -1114,9 +1114,10 @@ fn syscalls() {
 
 #[test]
 fn syscall_numbers_are_the_targets() {
-    check_error_with(&getrandom_syscall("aarch64", 318), |e| {
-        matches!(e, MirEvalError::NotSupported(s) if s.contains("syscall id 318"))
-    });
+    check_error_with(
+        &getrandom_syscall("aarch64", 318),
+        |e| matches!(e, MirEvalError::NotSupported(s) if s.contains("syscall id 318")),
+    );
     check_error_with(
         r#"
 //- minicore: option

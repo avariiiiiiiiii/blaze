@@ -6,11 +6,12 @@
 //! one of these, all the way down, is not split: rayon has no `par_iter` for it.
 
 use hir_def::{
-    AdtId, FunctionId, TraitId,
-    expr_store::Body,
+    AdtId, FunctionId, HasModule as _, TraitId,
+    expr_store::{Body, path::Path},
     hir::{Expr, ExprId, Literal, RangeOp},
-    lang_item::lang_items,
+    lang_item::{LangItemTarget, lang_items},
 };
+use intern::sym;
 use hir_ty::{
     InferenceResult,
     next_solver::{Ty, TyKind},
@@ -368,9 +369,9 @@ impl Head {
                             chunk = args.first().and_then(|it| literal(body, *it));
                         }
                         head.trips = array_len(db, infer.expr_ty(receiver));
-                        if head.trips.is_none() && matches!(body.expr(receiver), Expr::Range { .. }) {
+                        if head.trips.is_none() && range_bounds(db, body, receiver).is_some() {
                             head.range = Some(receiver);
-                            head.trips = range_len(body, receiver);
+                            head.trips = range_len(db, body, receiver);
                         }
                         break;
                     }
@@ -383,9 +384,9 @@ impl Head {
                     }
                     at = receiver;
                 }
-                Expr::Range { .. } => {
+                _ if range_bounds(db, body, at).is_some() => {
                     head.range = Some(at);
-                    head.trips = range_len(body, at);
+                    head.trips = range_len(db, body, at);
                     break;
                 }
                 _ => {
@@ -431,9 +432,40 @@ fn literal(body: &Body, expr: ExprId) -> Option<u128> {
     }
 }
 
+/// The start, the end and the kind of a range expression as it is lowered: a struct literal of
+/// a range lang item (`a..b` is `Range { start: a, end: b }`), or `RangeInclusive::new(a, b)`
+/// for `a..=b`. Source code cannot name a lang item, so no other expression is one of these.
+fn range_bounds(db: &base_db::Db, body: &Body, expr: ExprId) -> Option<(Option<ExprId>, Option<ExprId>, RangeOp)> {
+    match body.expr(expr) {
+        Expr::RecordLit { path: Path::LangItem(LangItemTarget::StructId(id), _), fields, .. } => {
+            let lang = lang_items(db, id.krate(db));
+            let exclusive = [lang.Range, lang.RangeFrom, lang.RangeTo, lang.RangeFull, lang.RangeCopy, lang.RangeFromCopy];
+            let inclusive = [lang.RangeToInclusive, lang.RangeInclusiveCopy, lang.RangeToInclusiveCopy];
+            let op = if exclusive.contains(&Some(id)) {
+                RangeOp::Exclusive
+            } else if inclusive.contains(&Some(id)) {
+                RangeOp::Inclusive
+            } else {
+                return None;
+            };
+            let field = |name| fields.iter().find(|it| *it.name.symbol() == name).map(|it| it.expr);
+            Some((field(sym::start), field(sym::end).or_else(|| field(sym::last)), op))
+        }
+        Expr::Call { callee, args: &[start, end] } => match body.expr(callee) {
+            Expr::Path(Path::LangItem(LangItemTarget::FunctionId(id), _))
+                if lang_items(db, id.krate(db)).RangeInclusiveNew == Some(id) =>
+            {
+                Some((Some(start), Some(end), RangeOp::Inclusive))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// How many items a range of literals gives.
-fn range_len(body: &Body, expr: ExprId) -> Option<u128> {
-    let Expr::Range { start: Some(start), end: Some(end), range_type } = body.expr(expr) else {
+fn range_len(db: &base_db::Db, body: &Body, expr: ExprId) -> Option<u128> {
+    let (Some(start), Some(end), range_type) = range_bounds(db, body, expr)? else {
         return None;
     };
     let (start, end) = (literal(body, start)?, literal(body, end)?);

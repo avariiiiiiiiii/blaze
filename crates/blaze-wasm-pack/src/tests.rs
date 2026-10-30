@@ -67,7 +67,7 @@ fn load(pack: Pack) -> (Db, FileId) {
     change.set_roots(project.roots);
     change.set_crate_graph(project.graph);
     change.set_proc_macros(project.macros);
-    let mut db = Db::new();
+    let mut db = Db::for_tests();
     change.apply(&mut db);
     (db, project.main)
 }

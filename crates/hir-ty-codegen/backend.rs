@@ -3,7 +3,8 @@
 //! A producer takes the Cranelift IR the front half builds from MIR, after layout and the
 //! calling convention have been decided, and gives back a [`Code`]: bytes, the relocations
 //! in them, and how to unwind through them. Nothing after that can tell the producers apart.
-//! LLVM hands a function it has no lowering for to Cranelift, and says why.
+//! A function LLVM has no lowering for stops the build ([`CodegenError::LlvmRefused`]):
+//! Cranelift never compiles it in LLVM's place.
 
 use std::{
     collections::BTreeMap,
@@ -91,17 +92,8 @@ pub(super) fn frame_pointers() -> bool {
 /// ([`rustc_links_dead_code`](super::rustc_links_dead_code)).
 static LINKS_DEAD_CODE: AtomicBool = AtomicBool::new(false);
 
-pub(super) fn link_dead_code(links: bool) {
-    LINKS_DEAD_CODE.store(links, Ordering::Relaxed);
-}
-
 pub(super) fn links_dead_code() -> bool {
     LINKS_DEAD_CODE.load(Ordering::Relaxed)
-}
-
-/// Says the build under way is of a whole program.
-pub(super) fn set_whole_program() {
-    WHOLE_PROGRAM.store(true, Ordering::Relaxed);
 }
 
 pub(super) fn whole_program() -> bool {
@@ -213,29 +205,24 @@ impl Backend {
         let tally = Tally::global();
         match Self::from_env().map_err(CodegenError::Backend)? {
             Backend::Cranelift => {}
+            // Which bodies an edit's build gives LLVM is decided by the body alone, before
+            // either producer runs, never by what LLVM failed at: the same body always goes
+            // to the same producer.
             #[cfg(feature = "llvm")]
-            Backend::Llvm(_) if !whole_program() && context.func.dfg.num_insts() > LLVM_LIMIT => {
-                tally.fell_back(Duration::ZERO, "a body larger than LLVM is given in a build");
-            }
+            Backend::Llvm(_) if !whole_program() && context.func.dfg.num_insts() > LLVM_LIMIT => {}
             // A handler of several, or one that takes more than the exception, costs LLVM a
             // landing pad for each call: a generic edit of nushell waited on 177 such bodies,
             // 17 ms each in LLVM. A tier, which does not come through here, lowers them, as
             // does the build of a whole program, which nothing edits.
             #[cfg(feature = "llvm")]
-            Backend::Llvm(_) if !whole_program() && !super::llvm::plain_handlers(&context.func) => {
-                tally.fell_back(Duration::ZERO, "a handler LLVM lowers only for a tier");
-            }
+            Backend::Llvm(_) if !whole_program() && !super::llvm::plain_handlers(&context.func) => {}
             #[cfg(feature = "llvm")]
             Backend::Llvm(optimization) => {
                 let start = Instant::now();
-                match Self::emit_with_llvm(recorder, &context.func, optimization) {
-                    Ok(code) => {
-                        tally.llvm.add(start.elapsed(), code.bytes.len());
-                        return Ok(code);
-                    }
-                    // alloc: the reason LLVM left a function to Cranelift, for the report
-                    Err(unhandled) => tally.fell_back(start.elapsed(), &unhandled.to_string()),
-                }
+                let code = Self::emit_with_llvm(recorder, &context.func, optimization)
+                    .map_err(CodegenError::LlvmRefused)?;
+                tally.llvm.add(start.elapsed(), code.bytes.len());
+                return Ok(code);
             }
             #[cfg(not(feature = "llvm"))]
             Backend::Llvm(_) => {}
@@ -337,9 +324,6 @@ pub(super) struct Tally {
     units: Count,
     unit_members: Count,
     pub(super) unit_kept: Count,
-    /// Nanoseconds LLVM spent on functions it then gave up on. Why it gave up, and how
-    /// often, is [`Counts::fallbacks`].
-    wasted: Count,
     /// Functions too large for LLVM to optimize in reasonable time, compiled at `-O0`.
     pub(super) large: Count,
     /// The exports built for compiles to import ([`super::imports`]), and how many bodies
@@ -358,11 +342,10 @@ mod word {
     pub(super) const UNITS: usize = 9;
     pub(super) const UNIT_MEMBERS: usize = 10;
     pub(super) const UNIT_KEPT: usize = 11;
-    pub(super) const WASTED: usize = 12;
-    pub(super) const LARGE: usize = 13;
-    pub(super) const IMPORTED: usize = 14;
-    pub(super) const IMPORTED_SIZE: usize = 15;
-    pub(super) const PHASES: usize = 16;
+    pub(super) const LARGE: usize = 12;
+    pub(super) const IMPORTED: usize = 13;
+    pub(super) const IMPORTED_SIZE: usize = 14;
+    pub(super) const PHASES: usize = 15;
     pub(super) const STEPS: usize = PHASES + super::Phase::COUNT;
     pub(super) const COUNT: usize = STEPS + super::Step::COUNT;
 }
@@ -396,8 +379,6 @@ struct Counts {
     reported: Lines<[AtomicU64; word::COUNT]>,
     /// Why a function of a unit was compiled alone, and how often.
     alone: Mutex<BTreeMap<String, usize>>,
-    /// Why LLVM left a function to Cranelift, and how often.
-    fallbacks: Mutex<BTreeMap<String, usize>>,
     /// Where Cranelift's time went on this thread, with `BLAZE_STATS`.
     passes: Mutex<Option<cranelift_codegen::timing::PassTimes>>,
     /// Whether a thread holds these counts. The counts of [`Registry::late`] are held by
@@ -417,7 +398,6 @@ impl Counts {
             words: Lines([const { AtomicU64::new(0) }; word::COUNT]),
             reported: Lines([const { AtomicU64::new(0) }; word::COUNT]),
             alone: Mutex::new(BTreeMap::new()),
-            fallbacks: Mutex::new(BTreeMap::new()),
             passes: Mutex::new(None),
             held: AtomicBool::new(held),
             next: OnceLock::new(),
@@ -505,18 +485,13 @@ impl Registry {
         let mut taken = Taken {
             sums: [0; word::COUNT],
             alone: BTreeMap::new(),
-            fallbacks: BTreeMap::new(),
             passes: None,
         };
         for counts in self.all() {
             counts.take(&mut taken.sums);
-            for (into, from) in
-                [(&mut taken.alone, &counts.alone), (&mut taken.fallbacks, &counts.fallbacks)]
-            {
-                let from = std::mem::take(&mut *from.lock().unwrap_or_else(|e| e.into_inner()));
-                for (reason, count) in from {
-                    *into.entry(reason).or_default() += count;
-                }
+            let alone = std::mem::take(&mut *counts.alone.lock().unwrap_or_else(|e| e.into_inner()));
+            for (reason, count) in alone {
+                *taken.alone.entry(reason).or_default() += count;
             }
             if let Some(times) = counts.passes.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 taken.passes.get_or_insert_with(Default::default).add(&times);
@@ -529,7 +504,6 @@ impl Registry {
 struct Taken {
     sums: [u64; word::COUNT],
     alone: BTreeMap<String, usize>,
-    fallbacks: BTreeMap<String, usize>,
     passes: Option<cranelift_codegen::timing::PassTimes>,
 }
 
@@ -650,7 +624,6 @@ static TALLY: Tally = Tally {
     units: Count(word::UNITS),
     unit_members: Count(word::UNIT_MEMBERS),
     unit_kept: Count(word::UNIT_KEPT),
-    wasted: Count(word::WASTED),
     large: Count(word::LARGE),
     exports: Produced(word::EXPORTS),
     imported: Count(word::IMPORTED),
@@ -660,18 +633,6 @@ static TALLY: Tally = Tally {
 impl Tally {
     pub(super) fn global() -> &'static Tally {
         &TALLY
-    }
-
-    #[cfg(feature = "llvm")]
-    fn fell_back(&self, took: Duration, reason: &str) {
-        let counts = counts();
-        counts.add(self.wasted.0, took.as_nanos() as u64);
-        let mut fallbacks = counts.fallbacks.lock().unwrap_or_else(|e| e.into_inner());
-        match fallbacks.get_mut(reason) {
-            Some(count) => *count += 1,
-            // alloc: once per distinct reason, the first time it is counted
-            None => _ = fallbacks.insert(reason.to_owned(), 1),
-        }
     }
 
     #[cfg(feature = "llvm")]
@@ -733,81 +694,6 @@ impl Tally {
     pub(super) fn add(&self, step: Step, took: Duration) {
         counts().add(word::STEPS + step as usize, took.as_nanos() as u64);
     }
-
-    /// Says what was compiled by which producer since the last call, on stderr. Times are
-    /// summed over the threads that compiled.
-    pub(super) fn report(&self) {
-        let Taken { sums, alone, fallbacks, passes } = REGISTRY.take();
-        let wasted = Duration::from_nanos(sums[self.wasted.0]);
-        let phases =
-            Phase::ALL.map(|phase| Duration::from_nanos(sums[word::PHASES + phase as usize]));
-        let (llvm, cranelift) = (self.llvm.take(&sums), self.cranelift.take(&sums));
-        let large = sums[self.large.0];
-        let selected = Self::selected_llvm();
-        let stats = stats();
-        if !selected && !stats {
-            return;
-        }
-        if stats {
-            let steps = Step::ALL.map(|(step, name)| {
-                let took = Duration::from_nanos(sums[word::STEPS + step as usize]);
-                // alloc: a line of the report, once per build
-                format!("{name} {took:.1?}")
-            });
-            eprintln!("steps: {}", steps.join(", "));
-            if let Some(passes) = passes {
-                eprint!("cranelift passes:\n{passes}");
-            }
-        }
-        if let Some(llvm) = llvm {
-            let phases = std::iter::zip(Phase::ALL, phases)
-                // alloc: a line of the report, once per build
-                .map(|(phase, took)| format!("{} {took:.1?}", format!("{phase:?}").to_lowercase()))
-                // alloc: a line of the report, once per build
-                .collect::<Vec<_>>()
-                .join(", ");
-            eprintln!("backend: llvm compiled {llvm}: {phases}");
-        }
-        if large != 0 {
-            eprintln!("backend: llvm compiled {large} large functions without optimization");
-        }
-        if let Some(exports) = self.exports.take(&sums) {
-            let imported = sums[self.imported.0];
-            let size = sums[self.imported_size.0];
-            eprintln!(
-                "backend: llvm built exports of {exports}; {imported} imported, {size} instructions"
-            );
-        }
-        let (units, members) = (sums[self.units.0], sums[self.unit_members.0]);
-        let kept = sums[self.unit_kept.0];
-        if units != 0 {
-            eprintln!(
-                "backend: llvm compiled {members} functions in {units} units, which kept {kept} \
-                 imports"
-            );
-        }
-        if !alone.is_empty() {
-            let count: usize = alone.values().sum();
-            eprintln!("backend: {count} functions of units compiled alone:");
-            for (reason, count) in alone {
-                eprintln!("  {count}\t{reason}");
-            }
-        }
-        if let Some(cranelift) = cranelift {
-            eprintln!("backend: cranelift compiled {cranelift}");
-        }
-        if !fallbacks.is_empty() {
-            let count: usize = fallbacks.values().sum();
-            eprintln!("backend: llvm left {count} functions to cranelift after {wasted:.1?}:");
-            for (reason, count) in fallbacks {
-                eprintln!("  {count}\t{reason}");
-            }
-        }
-    }
-
-    fn selected_llvm() -> bool {
-        matches!(Backend::from_env(), Ok(Backend::Llvm(_)))
-    }
 }
 
 #[cfg(test)]
@@ -830,7 +716,6 @@ mod tests {
                 &tally.units,
                 &tally.unit_members,
                 &tally.unit_kept,
-                &tally.wasted,
                 &tally.large,
                 &tally.imported,
                 &tally.imported_size,
@@ -891,7 +776,7 @@ mod tests {
                 scope.spawn(|| {
                     let counts = registry.claim();
                     for _ in 0..10_000 {
-                        counts.add(word::WASTED, 1);
+                        counts.add(word::LARGE, 1);
                     }
                     counts.release();
                 });
@@ -899,13 +784,13 @@ mod tests {
             for _ in 0..3 {
                 scope.spawn(|| {
                     for _ in 0..200 {
-                        let taken = registry.take().sums[word::WASTED];
+                        let taken = registry.take().sums[word::LARGE];
                         reported.fetch_add(taken, Ordering::Relaxed);
                     }
                 });
             }
         });
-        let rest = registry.take().sums[word::WASTED];
+        let rest = registry.take().sums[word::LARGE];
         assert_eq!(reported.load(Ordering::Relaxed) + rest, 40_000);
     }
 

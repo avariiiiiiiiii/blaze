@@ -1,5 +1,4 @@
-//! The macros, against `crate::proc_macro` alone: the test binary builds this file again
-//! against blaze's in-process bridge (`tests/corpus/native.rs`), as a reference of its own.
+//! The macros, against `crate::proc_macro` alone; `lib.rs` declares them.
 
 use crate::proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 

@@ -36,7 +36,7 @@ use crate::{
     db::{HirDatabase, InternedCoroutineId},
     drop::{DropGlue, has_drop_glue},
     next_solver::{
-        DbInterner, ErrorGuaranteed, ParamEnv, Region, StoredTy, Ty, TyKind,
+        DbInterner, ParamEnv, Region, StoredTy, Ty, TyKind,
         TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
@@ -88,12 +88,13 @@ impl<'f, 'db> Ctx<'f, 'db> {
             return ty;
         }
         let mut ocx = ObligationCtxt::new(&self.infcx);
-        // One the solver can't decide comes back as a variable, and stays the alias, which
-        // `needs_drop` takes as maybe having something to drop.
+        // One the solver can't decide or normalize stays the alias, which `needs_drop` takes as
+        // maybe having something to drop: rustc's `Ty::needs_drop`, whose
+        // `try_normalize_erasing_regions(..).unwrap_or(query_ty)` keeps it. An error type here
+        // would have no drop glue and lose the drop.
         match ocx.structurally_normalize_ty(&ObligationCause::dummy(), self.env, ty) {
-            Ok(normalized) if matches!(normalized.kind(), TyKind::Infer(_)) => ty,
-            Ok(normalized) => normalized,
-            Err(_) => Ty::new_error(self.infcx.interner, ErrorGuaranteed),
+            Ok(normalized) if !matches!(normalized.kind(), TyKind::Infer(_)) => normalized,
+            _ => ty,
         }
     }
 

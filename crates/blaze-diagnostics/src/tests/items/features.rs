@@ -9,36 +9,30 @@ mod gates;
 use crate::{
     Options,
     emit::Style,
-    lower::mutable_ref_binding::BUILT_ON,
     tests::{Mode, compiletest},
 };
 
-/// rustc writes the date it was built on as `YYYY-MM-DD` under `-Z ui-testing`.
-fn dated(stderr: String) -> String {
-    stderr.replace(&format!("was built on {BUILT_ON};"), "was built on YYYY-MM-DD;")
-}
-
-/// [`crate::tests::ui`], dated as rustc's UI tests are.
+/// [`crate::tests::ui`], as rustc's UI tests are.
 fn ui(name: &str, edition: &str, source: &str) -> String {
-    dated(crate::tests::ui(name, edition, source))
+    crate::tests::ui(name, edition, source)
 }
 
-/// A UI test `name` with minicore's `flags` as its core, checked with compiletest's flags, dated.
+/// A UI test `name` with minicore's `flags` as its core, checked with compiletest's flags.
 fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    ui_fixture(&format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}"))
+    ui_fixture(&format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}"))
 }
 
 /// The `.stderr` of a fixture whose workspace crate is the UI test and whose `library` crates are
-/// what it builds with (an `aux-build`, [`STD`]), checked with compiletest's flags, dated.
+/// what it builds with (an `aux-build`, [`STD`]), checked with compiletest's flags.
 fn ui_fixture(fixture: &str) -> String {
     let options = compiletest(Mode::Other, &Options::default());
     let checked = crate::tests::checked_with(fixture, "$DIR/", &options);
-    dated(crate::tests::normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })))
+    crate::tests::normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 
 /// A UI test `name` with [`STD`] as its std.
 fn ui_std(name: &str, edition: &str, source: &str) -> String {
-    ui_fixture(&format!("//- /{name} crate:main deps:std edition:{edition}\n{source}{STD}"))
+    ui_fixture(&format!("//- /{name} crate:other:main deps:std edition:{edition}\n{source}{STD}"))
 }
 
 /// The stability attributes of std (and the core it re-exports) the tests read: `rust1`, stable
@@ -96,7 +90,7 @@ pub mod prelude {
 fn feature_off_the_nightly_channel_is_e0554() {
     // compiler/rustc_error_codes/src/error_codes/E0554.md, with `RUSTC_BOOTSTRAP=-1` making the
     // compiler a stable one (tests/ui/bootstrap/rustc_bootstrap.rs)
-    let fixture = "//- /E0554.rs crate:main edition:2015 env:RUSTC_BOOTSTRAP=-1
+    let fixture = "//- /E0554.rs crate:other:main edition:2015 env:RUSTC_BOOTSTRAP=-1
 #![feature(lang_items)]
 
 fn main() {}
@@ -121,7 +115,7 @@ fn a_bootstrap_naming_the_crate_or_anything_but_minus_one_keeps_nightly() {
     // crates is `nightly_build`'s unit test)
     for value in ["1", "main", "0", "*"] {
         let fixture = format!(
-            "//- /rustc_bootstrap.rs crate:main edition:2015 env:RUSTC_BOOTSTRAP={value}
+            "//- /rustc_bootstrap.rs crate:other:main edition:2015 env:RUSTC_BOOTSTRAP={value}
 #![crate_type = \"lib\"]
 #![feature(rustc_attrs)]
 "
@@ -343,7 +337,7 @@ For more information about this error, try `rustc --explain E0635`.
 fn a_library_feature_a_dependency_removed_is_e0557() {
     // tests/ui/attributes/unstable_removed.rs, with
     // tests/ui/attributes/auxiliary/unstable_removed_feature.rs
-    let fixture = r#"//- /unstable_removed.rs crate:main deps:std,unstable_removed_feature edition:2015
+    let fixture = r#"//- /unstable_removed.rs crate:other:main deps:std,unstable_removed_feature edition:2015
 //@ aux-build:unstable_removed_feature.rs
 
 #![feature(old_feature)]
@@ -497,7 +491,7 @@ pub fn foobar() {}
 #[test]
 fn a_partially_stabilized_feature_suggests_its_successor_or_removing_it() {
     // tests/ui/stability-attribute/stability-attribute-implies-using-stable.rs
-    let fixture = r#"//- /stability-attribute-implies-using-stable.rs crate:main deps:stability_attribute_implies edition:2015
+    let fixture = r#"//- /stability-attribute-implies-using-stable.rs crate:other:main deps:stability_attribute_implies edition:2015
 //@ aux-build:stability-attribute-implies.rs
 #![deny(stable_features)]
 #![feature(foo)]

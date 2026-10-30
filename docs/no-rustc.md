@@ -92,7 +92,7 @@ left of the download, each piece for a rustc site this plan removes:
 |---|---|---|
 | `rustc`: `bin/rustc`, `librustc_driver` | the first build of a workspace, the functions left to rustc, the reference loads of the harnesses; its file names in the keys of what rustc built (`cargo/keyed.rs`) | K, E, M |
 | `rustc`: `lib/rustlib/<host>/bin/rust-lld`, `gcc-ld` | blaze's link on ELF targets (`link.rs` `lld_dir`, `rust_lld`) | blaze's own lld or the system linker |
-| `rustc`: `libexec/rust-analyzer-proc-macro-srv` | proc macros rustc built | J1, J2 |
+| `rustc`: `libexec/rust-analyzer-proc-macro-srv` | proc macros rustc built | J: blaze-macro-eval (2026-10-30) |
 | `cargo` | the first build, `cargo metadata` for a load, `--unit-graph` | blaze's resolver and fetcher, K, M |
 | `rust-std-<host>` | linking what rustc built; a build told ahead of cargo's reads its rlibs' metadata for its key (`built_library`, `library_identity`) | F, G |
 | `rust-std-wasm32-wasip1`: `lib/self-contained` | the WASI libc a proc macro's module links (`own_macro.rs`, `link.rs`) | blaze shipping wasi-libc |
@@ -110,10 +110,11 @@ What "100%" means, piece by piece. Each piece is where one of today's uses goes.
    `compiler_builtins`, `panic_unwind`, `panic_abort`, `unwind`, `proc_macro`, `test` and what
    they depend on, from blaze's `library/`, kept in the store per target and profile like any
    other crate. No rlib of the sysroot is read or linked.
-2. **Proc macros are compiled by blaze and loaded by blaze.** The proc-macro crate and its
-   dependencies (`syn`, `quote`, `proc-macro2`) are compiled by blaze into a library that
-   rust-analyzer's proc-macro server, running inside blaze, loads. Not the toolchain's
-   `rust-analyzer-proc-macro-srv`, and not a library rustc built.
+2. **Proc macros are compiled by blaze and run by blaze.** The proc-macro crate and its
+   dependencies (`syn`, `quote`, `proc-macro2`) run on blaze's own compiler in blaze's process
+   (`crates/blaze-macro-eval`, [compile-time.md](v2/plan/design/compile-time.md) change 20).
+   Not the toolchain's `rust-analyzer-proc-macro-srv`, no other server, and not a library rustc
+   built.
 3. **Build scripts are compiled, linked and run by blaze.** `RUSTC` names blaze while they
    run, so that their own probes are answered by blaze, the way the pinned rustc answers them.
 4. **The cold build is entirely blaze's.** No first build by cargo and rustc, no executable
@@ -210,7 +211,7 @@ The one left is the typed `blaze` itself; `blaze build` and `blaze test` run no 
 all. The same holds with `--whole`, and none of the eight runs starts the toolchain's rustc or
 rustdoc (the `rustc` a build script is given is blaze's stand-in). What blaze still keeps of
 cargo is in the toolchain it ships, for a load into cargo's own target directory (the harness's
-reference builds) and with `BLAZE_PROC_MACRO_SERVER=off`.
+reference builds).
 
 ## While the paths remain
 
@@ -411,7 +412,7 @@ the counts of [How often](#how-often) lower, measured by step A's check, and non
 | [G](https://github.com/indexable-inc/blaze/issues/87). Every crate compiled and linked by blaze | rustc's rlibs, objects, symbols and link line, "no rustc symbol" | E, F | large | high | the no-rustc F+G lane |
 | [H](https://github.com/indexable-inc/blaze/issues/88). blaze writes the test harness | the fallback when a test is added | G | medium | medium | the `no-rustc-hl` lane: done; the `no-rustc-l2` lane: blaze's harness always, done |
 | [I](https://github.com/indexable-inc/blaze/issues/89). Build scripts compiled and run by blaze | build scripts and their probes by rustc | B, G | medium | medium | the `no-rustc-l2` lane: first part done (scripts compiled and linked by blaze, their runs kept in the store); the F+G lane consumes it for the standard library's scripts |
-| [J](https://github.com/indexable-inc/blaze/issues/90). Proc macros compiled and loaded by blaze | proc macros by rustc, the toolchain's proc-macro server | F, G | large | high | the self-contained lane ([#298](https://github.com/indexable-inc/blaze/issues/298)): plan, and J then K first |
+| [J](https://github.com/indexable-inc/blaze/issues/90). Proc macros compiled and loaded by blaze | proc macros by rustc, the toolchain's proc-macro server | F, G | large | high | the self-contained lane ([#298](https://github.com/indexable-inc/blaze/issues/298)): plan, and J then K first; v2 (2026-10-30): run in process by blaze-macro-eval, the server path deleted |
 | [K](https://github.com/indexable-inc/blaze/issues/91). The cold build is blaze's | cargo's first build, the rustc base (#11) | G, I, J | medium | high | the self-contained lane, with 54301ec5's first-build lane (#310); `BLAZE_WHOLE_BUILD=1`: the build from nothing is G's whole build, no `cargo build` |
 | [L](https://github.com/indexable-inc/blaze/issues/92). Doctests by the daemon (#28) | probe and examples by rustc, rustdoc | B, G, D | medium | medium | the `no-rustc-hl` lane: first part done; the `no-rustc-l2` lane: second part (examples by blaze) done |
 | [M](https://github.com/indexable-inc/blaze/issues/93). Remove the wrapper and the fallback | `blaze-rustc`, `blaze-rustc-first`, stand-ins, dep-info, settle, `by_cargo`, `only_cargo` | all | medium | low | done: `blaze enable`, the wrapper and the rustc base are gone; `blaze-rustc` is left as the wrapper of a load into cargo's target directory, `BLAZE_WRAPS_RUSTC` to the harness |
@@ -962,6 +963,13 @@ loads. `proc_macro` is blaze's from F, so the bridge matches the server, which i
 same rust-analyzer. [#38](https://github.com/indexable-inc/blaze/issues/38)'s expansion cache
 makes recompiling a macro rare. Risk: the bridge's ABI between the library and the server.
 
+Where J is now (2026-10-30): the server path below (J1, J2, the workspace's own server) is
+deleted. Every proc macro runs in process on blaze's evaluator (`crates/blaze-macro-eval`,
+[compile-time.md](v2/plan/design/compile-time.md) change 20), which speaks the pinned
+`library/proc_macro` bridge itself; a macro it cannot run stops the build with an error naming
+the macro and its crate ([v2/plan/lanes/dedup.md](v2/plan/lanes/dedup.md), "Proc macros: one
+engine"). What follows is the record of the server path.
+
 The plan (the `no-rustc-l3` lane, 2026-10-23). What stands in the way, read in the vendored
 rust-analyzer: the toolchain's server (`rust-analyzer-proc-macro-srv` in the sysroot's
 `libexec`, which `ProcMacroServerChoice::Sysroot` starts) opens a library with
@@ -1141,6 +1149,9 @@ Where J stands (2026-10-24):
   (`blaze build -p blaze-engine -p proc-macro-srv-cli`), `build_release.py --server` builds it
   `--exe` from the workspace's root, and `harness/toolchain_bump.py` re-vendors nothing for it:
   a bridge that changed at a bump is fixed in `crates/proc-macro-srv` by hand. Not built yet.
+- Deleted (2026-10-30, lane dedup): `crates/proc-macro-srv`, `crates/proc-macro-srv-cli`, the
+  client half of `crates/proc-macro-api`, `crates/blaze-macro-wasm` and `crates/blaze-wasi`, and
+  `build_release.py --server`. blaze-macro-eval is the one engine.
 
 J, K and M are planned together in [self-contained.md](self-contained.md#j-k-and-m), since
 what they remove is most of the toolchain blaze still keeps: rustc and the sysroot's rlibs (116

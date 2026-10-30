@@ -12,7 +12,7 @@ use crate::{
 
 /// `crate::tests::ui` of a crate rustc is run on alone, with no `--crate-type` (its
 /// `#![crate_type]`s, else a binary), as a UI test is: the crate types decide two of
-/// `check_unused_attribute`'s lints, and a fixture's `crate:main` is a cargo library, whose
+/// `check_unused_attribute`'s lints, and a fixture's `crate:other:main` is a cargo library, whose
 /// `crate-type` the front end does not know.
 fn ui(name: &str, edition: &str, source: &str) -> String {
     let fixture = format!("//- /{name} crate:other:main edition:{edition}\n{source}");

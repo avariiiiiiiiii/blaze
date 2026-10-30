@@ -14,7 +14,7 @@ use std::{
 
 use base_db::{Db, FileId};
 use cranelift_codegen::{
-    FinalizedMachReloc, FinalizedRelocTarget, binemit,
+    MachReloc, RelocTarget, binemit,
     ir::{self, Signature},
     isa::TargetIsa,
 };
@@ -324,26 +324,26 @@ impl Relocs {
     /// v2 ([`crate::spare::relocs`]).
     pub(super) fn extend_mach(
         &mut self,
-        relocs: &[FinalizedMachReloc],
+        relocs: &[MachReloc],
         func: &ir::Function,
     ) -> std::result::Result<(), RelocError> {
         self.rows.reserve_exact(relocs.len());
         for reloc in relocs {
             let name = match &reloc.target {
-                FinalizedRelocTarget::ExternalName(ir::ExternalName::User(name)) => {
+                RelocTarget::ExternalName(ir::ExternalName::User(name)) => {
                     let name = &func.params.user_named_funcs()[*name];
                     RelocName::user(name.namespace, name.index)
                 }
-                FinalizedRelocTarget::ExternalName(ir::ExternalName::LibCall(call)) => {
+                RelocTarget::ExternalName(ir::ExternalName::LibCall(call)) => {
                     RelocName::LibCall(*call)
                 }
-                FinalizedRelocTarget::ExternalName(ir::ExternalName::KnownSymbol(symbol)) => {
+                RelocTarget::ExternalName(ir::ExternalName::KnownSymbol(symbol)) => {
                     RelocName::Known(*symbol)
                 }
-                FinalizedRelocTarget::ExternalName(ir::ExternalName::TestCase(_)) => {
+                RelocTarget::ExternalName(ir::ExternalName::TestCase(_)) => {
                     return Err(RelocError::TestCase);
                 }
-                FinalizedRelocTarget::Func(offset) => RelocName::Own(*offset),
+                RelocTarget::Label(offset) => RelocName::Own(offset.as_offset()),
             };
             let (offset, kind, addend) = (reloc.offset, reloc.kind, reloc.addend);
             self.push(Reloc { offset, kind, name, addend, elf_type: None })?;
@@ -482,11 +482,6 @@ impl Relocs {
 
     pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = Reloc> + Clone + '_ {
         self.rows.iter().enumerate().map(|(at, row)| self.decode(at, row))
-    }
-
-    /// Whether any has an ELF type, which Cranelift's module can't be given.
-    pub(super) fn any_elf_type(&self) -> bool {
-        self.rows.iter().any(|it| it.elf != 0)
     }
 
     /// Gives each against a function or a data object the number `funcs` or `datas` has for

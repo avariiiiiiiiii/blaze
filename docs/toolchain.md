@@ -33,8 +33,8 @@ the standard library is part of a compiler.
 - **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
   from (`harness/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`). v2's blaze
   has no command that prints it or where it is (v1's `blaze toolchain` did).
-- **Bytes:** the upstream nightly's `rustc`, `cargo` and `rust-std` (the host's, and
-  `wasm32-wasip1`'s, which proc macros are built for), unchanged, from static.rust-lang.org, each checked against the sha256 compiled into blaze
+- **Bytes:** the upstream nightly's `rustc`, `cargo` and the host's `rust-std`, unchanged,
+  from static.rust-lang.org, each checked against the sha256 compiled into blaze
   (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, or rustup's `nightly-2026-10-27`
@@ -89,9 +89,8 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    needs on every host it ships for. It writes `harness/toolchain` and `pins.txt`, re-vendors
    `crates/rustc_abi` from rust-lang/rust at the new commit, merges
    the new nightly's standard library into `library/` ([The standard
-   library](#the-standard-library-library)), and moves the pin in `install.sh`, the proc-macro
-   server's version string (`crates/proc-macro-srv`, which follows the nightly's `proc_macro`
-   bridge by hand), `Cargo.toml` and the flake.
+   library](#the-standard-library-library)), and moves the pin in `install.sh`, `Cargo.toml`
+   and the flake.
 2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
    target specs depend on the host rustc was built for; the three are merged into
    `crates/blaze-units/src/stdlib/rustc.json`.
@@ -236,7 +235,7 @@ blaze is moving off rustc ([no-rustc.md](no-rustc.md)); the rule is in [AGENTS.m
 blaze's nightly is the definition of the language and the standard library blaze matches while
 rustc is still in the tree: its layouts, ABI, `TypeId`s and answers are what blaze agrees with.
 It is not a rustc blaze maintains. As the no-rustc steps land its pieces go: cargo, then rustc
-with rust-lld and the proc-macro server, then `rust-std`. The standard library's source is
+with rust-lld, then `rust-std`. The standard library's source is
 already blaze's (`library/`, downloaded with blaze's release rather than as the nightly's
 `rust-src`), so what is left then is blaze alone.
 

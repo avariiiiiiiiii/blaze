@@ -9,7 +9,6 @@ use hir_def::{
 };
 use rustc_abi::ExternAbi;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
-use stdx::never;
 
 use crate::{
     db::HirDatabase,
@@ -21,7 +20,7 @@ use crate::{
     },
     mir::MirLowerError,
     mir::eval::{
-        Address, AdtId, Evaluator, FunctionId, GenericArgs, HasModule, Interned, InternedLayout,
+        Address, AdtId, Evaluator, FunctionId, GenericArgs, Interned, InternedLayout,
         Interval, IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
         MirEvalError, MirSpan, Mutability, Origin, OwnedBytes, Result, Then, Ty, TyKind, TypeIdOf,
         VTableOfBytes,
@@ -777,10 +776,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "type_name generic arg is not provided".into(),
                     ));
                 };
-                let module = locals.body.owner.module(self.db);
-                let Some(ty_name) = crate::mir::type_name::rustc_type_name(self.db, ty)
-                    .or_else(|| self.db.type_name(ty, module))
-                else {
+                let Some(ty_name) = crate::mir::type_name::rustc_type_name(self.db, ty) else {
                     // alloc: error path
                     return Err(MirEvalError::NotSupported(format!(
                         "`type_name::<{ty:?}>()`: the type has no path to print"
@@ -804,8 +800,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     DropGlue::HasDropGlue => true,
                     DropGlue::None => false,
                     DropGlue::DependOnParams => {
-                        never!("should be fully monomorphized now");
-                        true
+                        return Err(MirEvalError::InternalError(
+                            // alloc: error path
+                            format!("`needs_drop::<{ty:?}>()` of a type not monomorphized").into(),
+                        ));
                     }
                 };
                 destination.write_from_bytes(self, &[u8::from(result)])

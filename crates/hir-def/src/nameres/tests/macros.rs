@@ -1035,6 +1035,32 @@ b! { static = #[] ();}
     );
 }
 
+/// An item-position call past `recursion_limit` is reported (rustc's "recursion limit reached
+/// while expanding"), never dropped in silence.
+#[test]
+fn macro_expansion_overflow_is_reported() {
+    compute_crate_def_map(
+        r#"
+#![recursion_limit = "8"]
+macro_rules! m { () => { m!(); }; }
+m!();
+"#,
+        |db, def_map| {
+            let overflows: Vec<String> = (def_map.diagnostics(db).iter())
+                .filter_map(|it| match &it.kind {
+                    crate::nameres::diagnostics::DefDiagnosticKind::MacroError {
+                        path,
+                        err: hir_expand::ExpandErrorKind::RecursionOverflow,
+                        ..
+                    } => Some(path.display(db, Edition::CURRENT).to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(overflows, ["m"]);
+        },
+    );
+}
+
 #[test]
 fn macros_defining_macros() {
     check(

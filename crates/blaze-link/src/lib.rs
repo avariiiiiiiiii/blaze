@@ -120,6 +120,12 @@ impl Staged {
     pub fn len(&self) -> u64 {
         self.writes.len
     }
+
+    /// Whether this lays the whole image out again (its first link, or an output that keeps
+    /// no room), rather than placing what changed into the room the image kept.
+    pub fn full(&self) -> bool {
+        self.writes.full
+    }
 }
 
 impl fmt::Debug for Staged {
@@ -137,6 +143,29 @@ impl fmt::Debug for Staged {
 pub struct LinkError {
     pub function: Option<InstanceKey>,
     pub what: String,
+    /// Set when an incremental image refused the stage because its layout has no room for it:
+    /// only a link of the image from scratch ([`Image::new`]) can take the change.
+    pub refusal: Option<Refusal>,
+}
+
+/// Why an incremental image refused a stage it was laid out too small or without the room for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refusal {
+    /// A region the image kept needs `need` bytes and has room for `room`.
+    NoRoom { need: u64, room: u64 },
+    /// The stage needs a region the image was laid out without.
+    NoRegion,
+    /// Every one of the jump table's `slots` is taken.
+    TableFull { slots: u32 },
+    /// The image's thread-locals would move in the run's area.
+    TlsMoved,
+}
+
+impl LinkError {
+    /// The refusal, when the image refused the stage for want of room ([`Refusal`]).
+    pub fn no_room(&self) -> Option<Refusal> {
+        self.refusal
+    }
 }
 
 impl fmt::Display for LinkError {
@@ -200,14 +229,18 @@ impl Image {
     pub fn beside<O: Outside>(to: FileName, output: Output, outside: &O, tls_bias: i64) -> Result<Image, LinkError> {
         let page = premap::page(output.format, output.arch);
         let base = blaze_mem::align::checked_align_up_u64(outside.end(), page)
-            // alloc: error path
-            .ok_or_else(|| LinkError { function: None, what: format!("an image beside one ending at {:#x}", outside.end()) })?;
+            .ok_or_else(|| LinkError {
+                function: None,
+                // alloc: error path
+                what: format!("an image beside one ending at {:#x}", outside.end()),
+                refusal: None,
+            })?;
         let place = premap::Place { base, page, tls_bias, tls_from: outside.tls_end(), end: outside.end(), beside: true };
         Image::placed(to, output, Some(place))
     }
 
     fn placed(to: FileName, output: Output, place: Option<premap::Place>) -> Result<Image, LinkError> {
-        let fail = |what: String| LinkError { function: None, what };
+        let fail = |what: String| LinkError { function: None, what, refusal: None };
         if output.tags & 0xffff_ffff != 0 {
             // alloc: error path
             return Err(fail(format!("the effect tags {:#x} have low bits set: they are the image's", output.tags)));
@@ -267,6 +300,7 @@ impl Image {
             return Err(LinkError {
                 function: None,
                 what: "an image linked beside a dependency image is staged with `stage_beside`, against it".into(),
+                refusal: None,
             });
         }
         self.stage_with(change, &NoOutside)
@@ -289,6 +323,7 @@ impl Image {
             if !self.lazy.as_ref().is_some_and(|it| it.is(session, stubs)) {
                 return Err(LinkError {
                     function: None,
+                    refusal: None,
                     // alloc: error path
                     what: format!(
                         "{}: staged lazy with another session than its first link's: an image is made lazy, for one \
@@ -326,6 +361,7 @@ impl Image {
             Some(place) if place.beside => {
                 return Err(LinkError {
                     function: None,
+                    refusal: None,
                     // alloc: error path
                     what: format!(
                         "the image was made beside one ending at {:#x}, thread-locals at {:#x}, and is staged against \
@@ -341,6 +377,7 @@ impl Image {
                 return Err(LinkError {
                     function: None,
                     what: "`stage_beside` of an image not made by `Image::beside`".into(),
+                    refusal: None,
                 });
             }
         }
@@ -349,11 +386,11 @@ impl Image {
 
     fn stage_with<O: Outside>(&mut self, change: Change<'_>, outside: &O) -> Result<Staged, LinkError> {
         if self.pending.is_some() {
-            return Err(LinkError { function: None, what: "a commit is in flight".into() });
+            return Err(LinkError { function: None, what: "a commit is in flight".into(), refusal: None });
         }
         let full = !self.state.laid_out || !self.output.incremental;
         let table = has_table(&self.output, self.plan.indexed_code);
-        // clone: reference counts and the regions list; columns and pages are shared until written (state.rs)
+        // clone: reference counts; columns, the regions list and pages are shared until written (state.rs)
         let mut new = self.state.clone();
         new.generation = self.generations + 1;
         if new.wants_compaction() {
@@ -465,6 +502,7 @@ impl Image {
             if !state.pairs.carry(*id, *pair, &self.state.pairs, capacity) {
                 return Err(LinkError {
                     function: Some(self.symbols.instance(*id)),
+                    refusal: None,
                     what: "given a tier-up counter pair by the lazy placer while this was staged, which gave counter \
                            pairs that clash with it: stage it again"
                         .into(),
@@ -506,6 +544,7 @@ impl Image {
         if cells.len < asked {
             return Err(LinkError {
                 function: None,
+                refusal: None,
                 // alloc: error path
                 what: format!(
                     "{}: its dev run has {asked:#x} bytes of counter cells, and its code memory's cells part {:#x}: \
@@ -577,6 +616,7 @@ impl Image {
         if staged.writes.message.is_some() {
             return Err(LinkError {
                 function: None,
+                refusal: None,
                 // alloc: error path
                 what: format!("{}: a live image's link tells running programs: commit it with `commit` or `commit_into`", self.to),
             });
@@ -627,7 +667,7 @@ pub fn script_inputs(output: &Output, native: &Native<'_>) -> Result<Vec<String>
     let file = writer
         .read(native.name, native.bytes, &native.kind)
         // alloc: error path
-        .map_err(|what| LinkError { function: None, what: format!("{}: {what}", native.name) })?;
+        .map_err(|what| LinkError { function: None, what: format!("{}: {what}", native.name), refusal: None })?;
     // alloc: none, an empty `Vec` holds no buffer
     let NativeFile::Shared(shared) = file else { return Ok(Vec::new()) };
     let mut out = Vec::with_capacity(shared.inputs.len());

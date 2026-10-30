@@ -11,14 +11,9 @@ pub mod assert;
 pub mod edit_distance;
 pub mod lend;
 pub mod list;
-pub mod non_empty_vec;
 pub mod panic_context;
-pub mod process;
-pub mod rand;
 pub mod tempfile;
-pub mod thread;
 pub mod time;
-pub mod variance;
 
 pub use itertools;
 pub use lend::lend;
@@ -62,20 +57,6 @@ pub fn panic_text(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
 pub fn timeit(label: &'static str) -> impl Drop {
     let start = Instant::now();
     defer(move || eprintln!("{}: {:.2}", label, start.elapsed().as_nanos()))
-}
-
-/// Prints backtrace to stderr, useful for debugging.
-#[expect(clippy::print_stderr, reason = "only visible to developers")]
-pub fn print_backtrace() {
-    #[cfg(feature = "backtrace")]
-    eprintln!("{:?}", backtrace::Backtrace::new());
-
-    #[cfg(not(feature = "backtrace"))]
-    eprintln!(
-        r#"Enable the backtrace feature.
-Uncomment `default = [ "backtrace" ]` in `crates/stdx/Cargo.toml`.
-"#
-    );
 }
 
 pub trait TupleExt {

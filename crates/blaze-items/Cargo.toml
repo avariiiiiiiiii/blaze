@@ -23,7 +23,6 @@ serde = { workspace = true, features = ["derive"] }
 rustc-hash.workspace = true
 salsa.workspace = true
 smallvec.workspace = true
-triomphe.workspace = true
 either.workspace = true
 rustc_type_ir.workspace = true
 rustc_abi.workspace = true
@@ -41,7 +40,6 @@ syntax.workspace = true
 blaze-alloc-count.workspace = true
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
-test-utils.workspace = true
 
 [lints]
 workspace = true

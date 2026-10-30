@@ -41,6 +41,7 @@
 //!   task that could have read it has ended ([`blaze_reclaim`]). Everything the database hands
 //!   out borrows the task it was read in: a query's [`Cx`], or a [`Pinned`] from outside one.
 
+pub mod db;
 mod image;
 mod memo;
 mod segment;
@@ -51,6 +52,8 @@ pub mod tree;
 
 #[cfg(test)]
 mod tests;
+
+pub use blaze_query_macros::{Supertype, Value, input, interned, tracked};
 
 use std::{
     any::{Any, TypeId},
@@ -499,6 +502,12 @@ thread_local! {
     /// The file a run on this thread could not read, set as it stops the run with
     /// [`Cancelled`] and taken by the [`Pinned::get`] that run is under, which fails with it.
     static UNREADABLE: Cell<Option<Corrupt>> = const { Cell::new(None) };
+}
+
+/// Stops a run on what it could not read, for its request to fail with ([`stopped`]).
+fn unreadable(corrupt: Corrupt) -> Cancelled {
+    UNREADABLE.with(|it| it.set(Some(corrupt)));
+    Cancelled
 }
 
 /// What a [`Cancelled`] run's request fails with: the file it could not read, if that is why
@@ -1437,8 +1446,8 @@ impl Database {
         Ok(Database { image: Some(image), ..db })
     }
 
-    /// The groups of the image found corrupt since the last call, each once: their keys were
-    /// computed again. For the daemon to report by section and group.
+    /// The groups of the image found corrupt since the last call, each once: the requests that
+    /// read their keys failed with them. For the daemon to report by section and group.
     pub fn take_corrupt(&self) -> Vec<Corrupt> {
         self.image.as_ref().map(ImageMap::take_corrupt).unwrap_or_default()
     }
@@ -1535,7 +1544,7 @@ impl Database {
 
     pub fn memo(&self, key: &QueryKey) -> Option<Memo> {
         let task = blaze_reclaim::enter();
-        let &memo = self.slot(&task, key)?.memos().last()?;
+        let &memo = self.slot(&task, key).ok()??.memos().last()?;
         let hot = self.store.hot(&task, memo);
         let (schema, producer) = self.store.parts(hot.code());
         Some(Memo {
@@ -1603,7 +1612,7 @@ impl Database {
             for key in kept {
                 if is_input(key.kind) {
                     inputs_kept.insert(*key);
-                } else if let Some(slot) = self.slot(&task, key) {
+                } else if let Ok(Some(slot)) = self.slot(&task, key) {
                     work.extend_from_slice(slot.memos());
                 }
             }
@@ -1645,8 +1654,11 @@ impl Database {
                 );
                 self.store.unlinked(&unlinked);
             }
+            // Not once a group is found corrupt: an empty slot would let its keys be computed
+            // again, where each read of them must fail naming the group.
             if let Some(image) = &self.image
                 && !self.image_slotted.load(std::sync::atomic::Ordering::Acquire)
+                && image.first_corrupt().is_none()
             {
                 self.slot_image_keys(&task, image);
                 self.image_slotted.store(true, std::sync::atomic::Ordering::Release);
@@ -1717,7 +1729,9 @@ impl Database {
                 input(read);
                 continue;
             }
-            if let Some(slot) = self.slot(task, &read) {
+            // A key whose image memos are corrupt has none in memory to mark: the slot read
+            // noted it for `take_corrupt`, and every request that reads the key fails with it.
+            if let Ok(Some(slot)) = self.slot(task, &read) {
                 let saw = edge.saw();
                 for &it in slot.memos() {
                     if self.store.fingerprint(task, it) == saw {
@@ -1947,7 +1961,7 @@ impl Database {
     /// not, before anything is written.
     pub fn write_image(&self, builder: &mut Builder, live: &mut intern::Live) -> Result<(), DbError> {
         let task = blaze_reclaim::enter();
-        let entries = self.image_entries(&task);
+        let entries = self.image_entries(&task).map_err(DbError::Corrupt)?;
         let unknown = entries.keys.iter().find(|entry| {
             !entry.memos.is_empty() && !is_input(entry.key.kind) && self.kinds.get(entry.key.kind).is_none()
         });
@@ -2051,7 +2065,7 @@ impl Database {
                     fresh.reruns.insert(&task, *key, *rerun);
                 });
                 old.results.for_each(&task, |key, resolved| {
-                    let same = new.slot(&task, key).and_then(|slot| {
+                    let same = new.slot(&task, key).ok().flatten().and_then(|slot| {
                         slot.memos().iter().copied().find(|&it| new.store.same(&task, it, &self.store, resolved.memo))
                     });
                     if let Some(same) = same {
@@ -2104,7 +2118,7 @@ impl Database {
     /// ends. Returns how many were dropped.
     pub fn evict(&self, key: &QueryKey) -> usize {
         let task = blaze_reclaim::enter();
-        let Some(slot) = self.slot(&task, key) else { return 0 };
+        let Ok(Some(slot)) = self.slot(&task, key) else { return 0 };
         slot.memos().iter().filter(|&&memo| self.store.evict(&task, memo)).count()
     }
 
@@ -2164,14 +2178,14 @@ impl Database {
             .expect("a registered query asked with its key always resolves"))
     }
 
-    /// A key's memos and key bytes, read in from the image the first time.
-    fn slot<'g>(&'g self, task: &'g Guard, key: &QueryKey) -> Option<&'g Slot> {
+    /// A key's memos and key bytes, read in from the image the first time. A key whose memos
+    /// are in a corrupt group is [`Corrupt`], every time it is read: never an empty slot that
+    /// would compute it again.
+    fn slot<'g>(&'g self, task: &'g Guard, key: &QueryKey) -> Result<Option<&'g Slot>, Corrupt> {
         if let Some(slot) = self.slots.get(task, key) {
-            return Some(slot);
+            return Ok(Some(slot));
         }
-        let image = self.image.as_ref()?;
-        // A key whose memos are in a corrupt group has none from the image: it is computed
-        // again, and the empty slot keeps the group from being read again.
+        let Some(image) = self.image.as_ref() else { return Ok(None) };
         let read = || -> Result<Option<_>, Corrupt> {
             let Some(found) = image.find(key)? else { return Ok(None) };
             // alloc: once a key read in from the image, as is the slot's list of its memos.
@@ -2183,10 +2197,10 @@ impl Database {
         };
         let (memos, key_bytes) = match read() {
             Ok(Some(read)) => read,
-            Ok(None) => return None,
+            Ok(None) => return Ok(None),
             Err(corrupt) => {
                 image.note(corrupt);
-                return Some(self.slots.get_or_insert_with(task, *key, Slot::empty));
+                return Err(corrupt);
             }
         };
         let mut made = Vec::with_capacity(memos.len());
@@ -2207,13 +2221,16 @@ impl Database {
                 self.store.discard(memo);
             }
         }
-        Some(slot)
+        Ok(Some(slot))
     }
 
-    /// Keeps `key`'s bytes beside its memos, unless they are kept already.
+    /// Keeps `key`'s bytes beside its memos, unless they are kept already. A key whose memos
+    /// are corrupt gets no slot here: the resolve that follows fails with them.
     fn learn_key<Q: Query>(&self, task: &Guard, query: QueryKey, key: &Q::Key) {
-        if self.slot(task, &query).is_some_and(|slot| slot.key().is_some()) {
-            return;
+        match self.slot(task, &query) {
+            Ok(Some(slot)) if slot.key().is_some() => return,
+            Err(_) => return,
+            Ok(_) => {}
         }
         let mut bytes = blaze_mem::scratch::lend_bytes();
         cbor::append(&mut bytes, key)
@@ -2226,9 +2243,13 @@ impl Database {
     }
 
     /// Adds `made` to its key's memos and says which memo the key has for it: `made`, or an
-    /// equal one it had already (then `made`, never published, is freed).
-    fn add_memo(&self, task: &Guard, key: QueryKey, made: MemoId) -> MemoId {
-        self.slot(task, &key);
+    /// equal one it had already (then `made`, never published, is freed). The key's memos in
+    /// the image being corrupt frees `made` and is the error.
+    fn add_memo(&self, task: &Guard, key: QueryKey, made: MemoId) -> Result<MemoId, Corrupt> {
+        if let Err(corrupt) = self.slot(task, &key) {
+            self.store.discard(made);
+            return Err(corrupt);
+        }
         // Stamped before `made` is published, so a collection that finds it in the slot sees
         // the stamp; an equal memo found instead is restamped, only ever raised: a giver that
         // loaded the generation before `collect` bumped it must not lower the stamp of one that
@@ -2254,7 +2275,7 @@ impl Database {
         if kept != made {
             self.store.discard(made);
         }
-        kept
+        Ok(kept)
     }
 
     /// An input's value in a view, read through the tree the first time the view asks.
@@ -2298,10 +2319,7 @@ impl Database {
     ) -> Result<&'g InputValue, Cancelled> {
         match self.read_input(state, input) {
             Ok(value) => Ok(state.inputs.get_or_insert_with(task, key, || value)),
-            Err(corrupt) => {
-                UNREADABLE.with(|it| it.set(Some(corrupt)));
-                Err(Cancelled)
-            }
+            Err(corrupt) => Err(unreadable(corrupt)),
         }
     }
 
@@ -2430,7 +2448,7 @@ impl Database {
             return Ok(Some(resolved.memo));
         }
         let _frame = Frame::push(key);
-        let slot = self.slot(task, &key);
+        let slot = self.slot(task, &key).map_err(unreadable)?;
         let mut previous = None;
         for &memo in slot.map_or(&[][..], Slot::memos).iter().rev() {
             if self.store.hot(task, memo).code() != info.code {
@@ -2456,7 +2474,7 @@ impl Database {
             None => self.store.make(key, computed.fingerprint, info.code, edges, &computed.bytes),
         });
         drop(recording);
-        let memo = self.add_memo(task, key, made);
+        let memo = self.add_memo(task, key, made).map_err(unreadable)?;
         state.reruns.insert(task, key, Rerun { previous });
         Ok(Some(self.resolved(task, state, key, memo)))
     }
@@ -2577,7 +2595,7 @@ impl Database {
         {
             return Some(*next);
         }
-        let slot = self.slot(task, &changed.key)?;
+        let slot = self.slot(task, &changed.key).ok()??;
         let old = slot.memos().iter().rev().copied().find(|&memo| self.store.fingerprint(task, memo) == changed.was)?;
         self.store.edges(task, old).iter().find_map(|edge| {
             let (read, saw) = (edge.read(), edge.saw());
@@ -2617,7 +2635,9 @@ impl Database {
         io.pending.insert(tag, Pending::ColdWrite { file, entries });
     }
 
-    fn image_entries<'g>(&'g self, task: &'g Guard) -> image::Entries<'g> {
+    /// Every key's memos, for a new image: a corrupt group of the old one is the error, never
+    /// an image without what it held.
+    fn image_entries<'g>(&'g self, task: &'g Guard) -> Result<image::Entries<'g>, Corrupt> {
         // One list for every key, one for every memo, and one sort buffer reused across keys.
         // alloc: once per image, as are the lists below.
         let mut keys: Vec<QueryKey> = Vec::new();
@@ -2632,8 +2652,11 @@ impl Database {
         let mut codes = self.store.codes();
         let mut entries = image::Entries { keys: Vec::with_capacity(keys.len()), memos: Vec::with_capacity(keys.len()) };
         let mut sorting: Vec<(Fingerprint, ContentId, SchemaHash, &[EdgeRecord], MemoId)> = Vec::new(); // alloc: see above
+        if let Some(corrupt) = self.image.as_ref().and_then(ImageMap::first_corrupt) {
+            return Err(corrupt);
+        }
         for key in keys {
-            let Some(slot) = self.slot(task, &key) else { continue };
+            let Some(slot) = self.slot(task, &key)? else { continue };
             if slot.memos().is_empty() {
                 continue;
             }
@@ -2655,7 +2678,7 @@ impl Database {
             entries.memos.extend(sorting.iter().map(|&(.., memo)| memo));
             entries.keys.push(image::Entry { key, memos: start..entries.memos.len(), key_bytes: slot.key() });
         }
-        entries
+        Ok(entries)
     }
 
     fn image_inputs(&self, task: &Guard) -> Vec<(QueryKey, Input)> {

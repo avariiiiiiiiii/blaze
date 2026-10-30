@@ -249,7 +249,9 @@ fn the_queue_wheel_and_this_one_fire_alike(tc: TestCase) {
                 due.sort_unstable();
                 assert_eq!(&fired, &due);
                 old_fired.sort_unstable();
-                assert!(old_fired.iter().copied().eq(due.iter().map(|it| it.1)));
+                let mut due_steps: Vec<u64> = due.iter().map(|it| it.1).collect();
+                due_steps.sort_unstable();
+                assert_eq!(old_fired, due_steps, "the queue wheel fires the same timers, in any order");
                 set.retain(|it| it.2 > now);
             }
         }

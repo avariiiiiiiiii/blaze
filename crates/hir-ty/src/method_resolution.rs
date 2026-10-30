@@ -9,6 +9,8 @@
 mod confirm;
 pub mod delta;
 pub mod frozen;
+#[cfg(test)]
+mod naming_tests;
 mod pick_cache;
 mod probe;
 #[cfg(test)]
@@ -18,7 +20,10 @@ pub mod scope_sets;
 use std::{hash::BuildHasher, ops::Range};
 
 use crate::next_solver::StoredGenericArgs;
-use blaze_ids::radix;
+use blaze_ids::{
+    bits::{BitMatrix, Ones, words_for},
+    radix,
+};
 use blaze_mem::Frame;
 use either::Either;
 use hir_expand::name::Name;
@@ -839,6 +844,110 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
         }
         // alloc: the memo's result, one exact block
         ordered.iter().copied().collect()
+    })
+}
+
+/// For each crate `krate`'s [`loaded_crates`] depend on, which of those can name its items: a
+/// crate that is it or depends on it, directly or not. An impl names its trait and the type it
+/// is for, so only a crate that can name the crates of both holds one: the walks over the
+/// loaded crates for one trait ask those alone, one AND of two rows, where each crate asked is
+/// a memo read and, cold, a table built.
+#[derive(Debug, PartialEq, Eq, SalsaValue)]
+pub struct CratesThatName {
+    /// The loaded crates and what they depend on, sorted: row `r` is `crates[r]`'s.
+    crates: Box<[Crate]>,
+    row_words: u32,
+    /// Row `r`: a bit per place in [`loaded_crates`], set where the crate there can name
+    /// `crates[r]`.
+    rows: Box<[u64]>,
+}
+
+impl CratesThatName {
+    fn row(&self, krate: Crate) -> Option<&[u64]> {
+        let r = self.crates.binary_search(&krate).ok()?;
+        let words = self.row_words as usize;
+        Some(&self.rows[r * words..(r + 1) * words])
+    }
+
+    /// The places in [`loaded_crates`], ascending, of the crates that can name both
+    /// `trait_crate` and, given, `self_crate`.
+    fn holders<'f>(&self, frame: &'f Frame, trait_crate: Crate, self_crate: Option<Crate>) -> Ones<'f> {
+        let Some(row) = self.row(trait_crate) else { return Ones::new(&[]) };
+        let holders = frame.alloc_slice_copy(row);
+        if let Some(self_crate) = self_crate {
+            match self.row(self_crate) {
+                Some(row) => holders.iter_mut().zip(row).for_each(|(it, row)| *it &= row),
+                None => holders.fill(0),
+            }
+        }
+        Ones::new(holders)
+    }
+}
+
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
+pub fn crates_that_name(db: &Db, krate: Crate) -> CratesThatName {
+    let _p = tracing::info_span!("crates_that_name").entered();
+    blaze_mem::frame::current(|frame| {
+        let loaded = loaded_crates(db, krate);
+        // Every crate after the ones it depends on, the graph being acyclic: a walk from each
+        // loaded crate, placing a crate when its last dependency is placed.
+        let mut place = crate::frame_map::<Crate, u32>(frame);
+        let mut seen = crate::frame_set(frame);
+        let mut order = Vec::new_in(frame);
+        let mut stack = Vec::new_in(frame);
+        for &root in loaded {
+            if !seen.insert(root) {
+                continue;
+            }
+            stack.push((root, 0u32));
+            while let Some(top) = stack.len().checked_sub(1) {
+                let (at, next) = stack[top];
+                match at.data(db).dependencies.get(next as usize) {
+                    Some(dep) => {
+                        stack[top].1 += 1;
+                        if seen.insert(dep.crate_id) {
+                            stack.push((dep.crate_id, 0));
+                        }
+                    }
+                    None => {
+                        stack.pop();
+                        place.insert(at, order.len() as u32);
+                        order.push(at);
+                    }
+                }
+            }
+        }
+        let n = order.len();
+        // Row `p`: `order[p]` and what it depends on, by place in `order`.
+        let mut reach: BitMatrix<usize, &mut [u64]> =
+            BitMatrix::from_words(n, n, frame.alloc_slice_fill_with(n * words_for(n), |_| 0u64));
+        for (p, &at) in order.iter().enumerate() {
+            reach.insert(p, p);
+            for dep in &at.data(db).dependencies {
+                reach.union_rows(p, place[&dep.crate_id] as usize);
+            }
+        }
+        let mut sorted = Vec::with_capacity_in(n, frame);
+        sorted.extend(order.iter().enumerate().map(|(p, &it)| (it, p as u32)));
+        sorted.sort_unstable();
+        let rank = frame.alloc_slice_fill_with(n, |_| 0u32);
+        for (r, &(_, p)) in sorted.iter().enumerate() {
+            rank[p as usize] = r as u32;
+        }
+        let row_words = words_for(loaded.len());
+        // alloc: the memo's rows, once at their size
+        let mut rows = vec![0u64; n * row_words].into_boxed_slice();
+        for (at, dep) in loaded.iter().enumerate() {
+            for p in reach.iter_row(place[dep] as usize) {
+                rows[rank[p] as usize * row_words + at / 64] |= 1 << (at % 64);
+            }
+        }
+        CratesThatName {
+            // alloc: the memo's crates, once at their size
+            crates: sorted.iter().map(|&(it, _)| it).collect(),
+            row_words: row_words as u32,
+            rows,
+        }
     })
 }
 
@@ -1899,9 +2008,9 @@ impl<'db> TraitImpls<'db> {
     }
 
     /// The impls of one trait for one type in `krate` and its dependencies, in the order of
-    /// [`loaded_crates`]. Reads each crate's [`Self::for_crate_and_trait`], so an impl of
-    /// another trait anywhere leaves this unvalidated-equal, and one of `trait_` for another
-    /// type reruns it equal.
+    /// [`loaded_crates`]. Reads [`Self::for_crate_and_trait`] of each crate that can name both
+    /// ([`crates_that_name`]), so an impl of another trait anywhere leaves this
+    /// unvalidated-equal, and one of `trait_` for another type reruns it equal.
     #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_and_deps_for_trait_and_self_ty(
         db: &'db Db,
@@ -1911,8 +2020,10 @@ impl<'db> TraitImpls<'db> {
     ) -> Box<[AnyImplId]> {
         blaze_mem::frame::current(|frame| {
             let mut found = Vec::new_in(frame);
-            for &dep in loaded_crates(db, krate) {
-                let impls = Self::for_crate_and_trait(db, dep, trait_);
+            let loaded = loaded_crates(db, krate);
+            let self_crate = simplified_type_module(db, &self_ty.0).map(|it| it.krate(db));
+            for at in crates_that_name(db, krate).holders(frame, trait_.krate(db), self_crate) {
+                let impls = Self::for_crate_and_trait(db, loaded[at], trait_);
                 let (impls, builtin_derive_impls) =
                     impls.for_trait_and_self_ty(trait_, &self_ty.0);
                 found.extend(impls.iter().map(|&it| AnyImplId::from(it)));
@@ -1932,9 +2043,10 @@ impl<'db> TraitImpls<'db> {
     ) -> Box<[ImplId]> {
         blaze_mem::frame::current(|frame| {
             let mut found = Vec::new_in(frame);
-            for &dep in loaded_crates(db, krate) {
+            let loaded = loaded_crates(db, krate);
+            for at in crates_that_name(db, krate).holders(frame, trait_.krate(db), None) {
                 found.extend_from_slice(
-                    Self::for_crate_and_trait(db, dep, trait_).blanket_impls(trait_),
+                    Self::for_crate_and_trait(db, loaded[at], trait_).blanket_impls(trait_),
                 );
             }
             // alloc: the memo's value, once at its length.
@@ -2001,8 +2113,9 @@ impl<'db> TraitImpls<'db> {
     ) -> Box<[ImplId]> {
         blaze_mem::frame::current(|frame| {
             let mut found = Vec::new_in(frame);
-            for &dep in loaded_crates(db, krate) {
-                found.extend_from_slice(Self::in_crate_for_trait(db, dep, trait_));
+            let loaded = loaded_crates(db, krate);
+            for at in crates_that_name(db, krate).holders(frame, trait_.krate(db), None) {
+                found.extend_from_slice(Self::in_crate_for_trait(db, loaded[at], trait_));
             }
             // alloc: the memo's value, once at its length.
             found.iter().copied().collect()
@@ -2165,6 +2278,20 @@ impl<'db> TraitImpls<'db> {
     ) {
         if let Some(t) = self.trait_index(trait_) {
             callback(Either::Left(self.blanket.run(t)));
+            for r in self.rows(t) {
+                callback(Either::Left(self.impls.run(r)));
+                callback(Either::Right(self.derives.run(r)));
+            }
+        }
+    }
+
+    /// [`Self::for_trait`] without the blanket impls: rustc's `non_blanket_impls`.
+    pub fn for_trait_non_blanket(
+        &self,
+        trait_: TraitId,
+        mut callback: impl FnMut(Either<&[ImplId], &[BuiltinDeriveImplId]>),
+    ) {
+        if let Some(t) = self.trait_index(trait_) {
             for r in self.rows(t) {
                 callback(Either::Left(self.impls.run(r)));
                 callback(Either::Right(self.derives.run(r)));

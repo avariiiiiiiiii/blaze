@@ -46,12 +46,9 @@ libc.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-blaze-macro-wasm.workspace = true
 blaze-query.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true
-native-proc-macro.workspace = true
-paths.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 

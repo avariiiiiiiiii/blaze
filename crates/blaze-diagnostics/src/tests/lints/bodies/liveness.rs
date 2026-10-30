@@ -9,7 +9,7 @@ use crate::{
 /// [`ui`] of a UI test that needs core's items: core is minicore with `flags`
 /// (`crates/test-utils/src/minicore.rs`).
 fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}");
+    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}");
     let options = compiletest(Mode::Other, &Options::default());
     normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
@@ -502,7 +502,7 @@ error: aborting due to 1 previous error
 /// parameter is still linted.
 #[test]
 fn a_naked_function_is_not_checked() {
-    let source = r#"//- /main.rs crate:main edition:2024
+    let source = r#"//- /main.rs crate:other:main edition:2024
 #![warn(unused_variables)]
 #[unsafe(naked)]
 pub extern "C" fn naked(a: u32) {}

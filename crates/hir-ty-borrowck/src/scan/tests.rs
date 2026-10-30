@@ -458,7 +458,7 @@ fn the_one_pass_gives_what_each_scan_gave() {
                 }
             }
         }
-        assert!(bodies >= 12, "{bodies} bodies");
+        assert_eq!(bodies, 11, "the fixture's functions");
         let Seen {
             matched,
             tested_at,

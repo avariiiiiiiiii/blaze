@@ -1362,6 +1362,7 @@ pub mod kinds {
         IMPL_HAS_UNCONSTRAINED_PARAMS = 0x2478, "impl_has_unconstrained_params";
         TRAIT_VALUE_ITEMS = 0x2479, "trait_value_items";
         IN_CRATE_TRAIT_VALUE_ITEMS = 0x247a, "in_crate_trait_value_items";
+        CRATES_THAT_NAME = 0x247b, "crates_that_name";
 
         // Opaque types.
         IMPL_TYPE_ALIASES = 0x2480, "impl_type_aliases";

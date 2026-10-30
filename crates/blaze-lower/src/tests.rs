@@ -792,7 +792,7 @@ fn a_span_written_in_a_file_is_its_own_source_and_has_no_parent() {
 /// ends, as rustc's `Span::join`; of two contexts, the first.
 #[test]
 fn two_spans_of_one_file_join_to_the_span_covering_both() {
-    use proc_macro_api::bidirectional_protocol::msg::SpanJoin;
+    use proc_macro_api::bridge::questions::SpanJoin;
 
     use super::{SubRequest, SubResponse, answer};
 

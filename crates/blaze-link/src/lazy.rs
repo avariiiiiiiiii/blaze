@@ -76,7 +76,7 @@ impl Lazy {
     /// The lazy image `session` and its region `stubs` describe, linked as `output` says
     /// (`table`: with a jump table). A lazy image is a dev run with a jump table.
     pub fn new(output: &Output, table: bool, session: &Session, stubs: &Stubs) -> Result<Lazy, LinkError> {
-        let fail = |what: String| LinkError { function: None, what };
+        let fail = |what: String| LinkError { function: None, what, refusal: None };
         if output.dev_run.is_none() {
             return Err(fail(
                 "a lazy image without a dev run (`Output::dev_run`): lazy code is placed in a dev executable's code \
@@ -234,7 +234,7 @@ impl<S: Slots> LazyPlacer<S> {
     /// linked addresses. Stores the hook's address in the region's cell, before any process
     /// runs.
     pub fn new(image: Arc<Mutex<Image>>, memory: Arc<Mutex<CodeMemory>>, slots: S, slide: u64) -> Result<LazyPlacer<S>, LinkError> {
-        let fail = |what: String| LinkError { function: None, what };
+        let fail = |what: String| LinkError { function: None, what, refusal: None };
         {
             let image = lock(&image, "image").map_err(fail)?;
             let mut memory = lock(&memory, "code memory").map_err(fail)?;
@@ -276,7 +276,7 @@ impl<S: Slots> LazyPlacer<S> {
     /// at. The arena code the slot ran before is retired once every process stored the new.
     fn put(&mut self, slot: InstanceKey, function: &CompiledFunction) -> Result<u64, LinkError> {
         let key = function.key;
-        let fail = |what: String| LinkError { function: Some(key), what };
+        let fail = |what: String| LinkError { function: Some(key), what, refusal: None };
         let LazyPlacer { image, memory, slots, slide, placed, scratch } = self;
         let slide = *slide;
         let (index, range, target) = {
@@ -376,7 +376,7 @@ impl Scratch {
             align = align.max(LOCATION_ALIGN);
         }
         if end == 0 {
-            return Err(LinkError { function: Some(function.key), what: "no code to place".into() });
+            return Err(LinkError { function: Some(function.key), what: "no code to place".into(), refusal: None });
         }
         self.len = end;
         Ok(align)
@@ -390,7 +390,7 @@ impl Scratch {
         in_code: bool,
         end: &mut u64,
     ) -> Result<Resolved, LinkError> {
-        let fail = |what: String| LinkError { function: Some(function.key), what };
+        let fail = |what: String| LinkError { function: Some(function.key), what, refusal: None };
         if let Target::Counter(of) = target {
             return counter(image, function, of, in_code);
         }
@@ -488,7 +488,7 @@ impl Scratch {
         range: CodeRange,
         slide: u64,
     ) -> Result<u64, LinkError> {
-        let fail = |what: String| LinkError { function: Some(function.key), what };
+        let fail = |what: String| LinkError { function: Some(function.key), what, refusal: None };
         let Some(linked) = memory.linked(range.offset) else {
             // alloc: error path
             return Err(fail(format!("the arena range at {:#x} has no linked address: the code memory is not laid out", range.offset)));
@@ -531,7 +531,7 @@ impl Scratch {
 
 /// `function`'s own counter pair ([`crate::counter::placed_pair`]), at its linked address.
 fn counter(image: &mut Image, function: &CompiledFunction, of: &InstanceKey, in_code: bool) -> Result<Resolved, LinkError> {
-    let fail = |what: String| LinkError { function: Some(function.key), what };
+    let fail = |what: String| LinkError { function: Some(function.key), what, refusal: None };
     if !in_code || *of != function.key {
         return Err(fail(
             // alloc: error path

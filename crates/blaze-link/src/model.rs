@@ -1444,7 +1444,7 @@ impl Writer for Formats {
 /// The writer of an output's format.
 pub(crate) fn writer(output: &Output) -> Result<Formats, LinkError> {
     if output.exec_log {
-        exec_log(output).map_err(|what| LinkError { function: None, what: what.into() })?;
+        exec_log(output).map_err(|what| LinkError { function: None, what: what.into(), refusal: None })?;
     }
     Ok(match output.format {
         Format::Elf => Formats::Elf(crate::elf::writer(output)?),

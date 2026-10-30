@@ -1,0 +1,23 @@
+{
+  "id": "01165",
+  "from_lane": "filters",
+  "owner": "link",
+  "paths": [
+    "crates/blaze-link/src/target.rs"
+  ],
+  "what": "crates/blaze-link/src/target.rs Line::find (around line 1035): every -l library is searched by one is_file() stat per (search dir x candidate file name), uncached, on every link: a link with 30 libraries over 15 dirs and 2 names each is ~900 stats, most answering not-there. A filter does not fit (the answer must come from the directory); the fast form is one read_dir per search dir per link, its names in a set, then a probe per (dir, name), so the misses cost no syscall. Keep the first-dir-first-name order. Lane filters (Andrew: hot membership tests where a definite no skips real work) found it; not changed by filters.",
+  "state": "open",
+  "created": "2026-10-30T23:16:20Z",
+  "updated": "2026-10-30T23:16:20Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:16:20Z",
+      "by": "filters",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -24,7 +24,6 @@ la-arena.workspace = true
 rustc-hash.workspace = true
 salsa.workspace = true
 smallvec.workspace = true
-triomphe.workspace = true
 rustc_type_ir.workspace = true
 
 base-db.workspace = true
@@ -33,7 +32,6 @@ hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
 hir-ty-borrowck.workspace = true
-intern.workspace = true
 span.workspace = true
 syntax.workspace = true
 
@@ -41,7 +39,6 @@ syntax.workspace = true
 blaze-alloc-count.workspace = true
 hegeltest.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
-test-utils.workspace = true
 
 [lints]
 workspace = true

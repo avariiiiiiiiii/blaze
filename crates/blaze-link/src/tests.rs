@@ -601,6 +601,25 @@ fn slots_need_a_jump_table() {
     change.slots.push((key(2), key(3)));
     let error = image.stage(change).unwrap_err();
     assert!(error.what.contains("without a jump table"), "{error}");
+    assert_eq!(error.no_room(), None, "not a refusal for want of room");
+}
+
+#[test]
+fn a_stage_out_of_room_is_a_refusal_the_caller_can_match() {
+    let (start, g) = program(Target::Function);
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut image, first(&start, &g)).unwrap();
+    // Past the least room a patch region is laid out with (64 MiB).
+    let mut code = vec![0x90; (64 << 20) + 16];
+    *code.last_mut().unwrap() = 0xc3;
+    let big = function(3, &code, Vec::new());
+    let error = image.stage(edit(&big)).unwrap_err();
+    assert!(error.what.contains("link the image from scratch"), "{error}");
+    assert!(matches!(error.no_room(), Some(crate::Refusal::NoRoom { need, room }) if need > room), "{error}");
+    assert_eq!(image.generation(), 1);
+    let g2 = function(3, &returns(2), Vec::new());
+    assert_eq!(disk.link(&mut image, edit(&g2)), Ok(2), "the refused stage left the image as it was");
 }
 
 #[test]
@@ -713,8 +732,8 @@ fn a_patch_puts_its_frames_and_literals_in_the_patch_regions_and_ends_its_frames
     let file = b.elf();
     for (at, bytes) in &patch.data {
         let section = file.sections().find(|it| (it.address()..it.address() + it.size()).contains(at)).unwrap();
-        let object::SectionFlags::Elf { sh_flags } = section.flags() else { panic!("an ELF section") };
-        assert!(sh_flags & u64::from(elf::SHF_WRITE) != 0, "{} bytes written at {at:#x}, in {}", bytes.len(), section.name().unwrap());
+        let object::SectionFlags::Elf { sh_flags, .. } = section.flags() else { panic!("an ELF section") };
+        assert!(sh_flags.contains(elf::SHF_WRITE), "{} bytes written at {at:#x}, in {}", bytes.len(), section.name().unwrap());
     }
 
     // A full link of the same functions puts the FDE in `.eh_frame`.
@@ -1452,8 +1471,9 @@ mod resolution {
             symbols.push((*it, sym));
         }
         for it in constructors {
-            let init = b.add_section(Vec::new(), b".init_array".to_vec(), SectionKind::Elf(elf::SHT_INIT_ARRAY));
-            b.section_mut(init).flags = SectionFlags::Elf { sh_flags: u64::from(elf::SHF_ALLOC | elf::SHF_WRITE) };
+            let init = b.add_section(Vec::new(), b".init_array".to_vec(), SectionKind::Data);
+            b.section_mut(init).flags =
+                SectionFlags::Elf { sh_type: elf::SHT_INIT_ARRAY, sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE };
             let at = b.append_section_data(init, &[0; 8], 8);
             let symbol = symbols.iter().find(|(name, _)| name == it).expect("a constructor's function").1;
             b.add_relocation(init, Relocation {

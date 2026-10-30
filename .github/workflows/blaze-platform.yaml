@@ -213,13 +213,6 @@ jobs:
         if: env.BLAZE == 'true'
         run: |
           $PYTHON harness/unittests.py '{"build": true}'
-      # blaze's proc-macro server, `blaze-proc-macro-srv` of the workspace's
-      # crates/proc-macro-srv-cli, built by blaze over the standard library blaze compiles. A
-      # build of its own: in the one above, its features would change the keys of the libraries
-      # the tests job asks for.
-      - name: blaze build -p proc-macro-srv-cli --release
-        if: env.BLAZE == 'true'
-        run: blaze build -p proc-macro-srv-cli --release --locked
       - name: cargo build -p blaze-engine --release --features llvm
         if: env.BLAZE != 'true'
         run: |
@@ -261,21 +254,12 @@ jobs:
           project: ${{ steps.blaze.outputs.project }}
           token: ${{ secrets.BLAZE_CACHE_TOKEN }}
           sign-key: ${{ secrets.BLAZE_CACHE_SIGN_KEY }}
-      # blaze's proc-macro server beside blaze, as a release has it, from blaze's build above: a
-      # load into blaze's own target directory has blaze link every proc macro for that server,
-      # and fails without one ("blaze did not build the proc macro", docs/no-rustc.md, J). Not on
-      # Windows, whose release blaze does not build yet.
-      - name: blaze's proc-macro server
-        if: env.BLAZE == 'true' && runner.os != 'Windows'
-        run: RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 target/release/blaze-proc-macro-srv --version
-      # The binaries run each other from next to themselves (a load finds blaze-proc-macro-srv
-      # beside blaze). A tar keeps them executable.
+      # The binaries run each other from next to themselves. A tar keeps them executable.
       - name: Pack
         working-directory: target/release
         run: |
           exe=$([ "$RUNNER_OS" = Windows ] && echo .exe || true)
-          server=$([ -f blaze-proc-macro-srv ] && echo blaze-proc-macro-srv || true)
-          tar -cf blaze.tar blaze-engine$exe blaze$exe $server
+          tar -cf blaze.tar blaze-engine$exe blaze$exe
       - uses: actions/upload-artifact@v7
         with:
           name: blaze-${{ inputs.platform }}

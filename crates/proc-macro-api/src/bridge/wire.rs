@@ -1,14 +1,111 @@
-//! The hosts' side of the encoding a stream crosses into and out of a macro's `proc_macro` in
-//! (`crates/blaze-macro-wasm/native/proc_macro/api.rs`, `wire`): a token tree's columns as
-//! `tt::Tree::write_wire` lays them out, each span part named by its index in the
-//! [`Parts`] of the expansion, and each span the macro holds a word of those parts. The wasm
-//! host writes and reads the bytes of every stream; the in-process bridge passes trees as they
-//! are, and writes bytes only of text a macro asks to be tokens of.
+//! The encoding of a stream blaze-macro-eval's server gives a macro and reads back: a token
+//! tree's columns as `tt::Tree::write_wire` lays them out, each span part named by its index in
+//! the [`Parts`] of the expansion, and each span a word of those parts. Trees pass as they are;
+//! bytes are written only of text a macro asks to be tokens of.
 
-use span::Span;
-use tt::{DelimiterKind, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree, TopSubtreeBuilder};
+use rustc_hash::FxHashMap;
+use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext};
+use tt::{DelimiterKind, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree, TopSubtreeBuilder, WirePart};
 
-pub use native_proc_macro::__native::{NARROW, NONE, Part, Parts, WIDE};
+/// A packed span's `len_part` that makes its `start` an index of the wide spans.
+pub const WIDE: u32 = u32::MAX;
+/// What a packed span's length and part each stay under.
+pub const NARROW: u32 = 0xFFFF;
+
+/// A span's anchor and context: what the spans of an expansion share.
+pub type Part = (SpanAnchor, SyntaxContext);
+
+/// The span parts of an expansion, in the order first given out (the def, call and mixed
+/// sites, the input's, the attribute's, then what span operations make), and its spans too
+/// wide to pack. A span is a word: `start | len_part << 32`, `len_part` being `len | part << 16`
+/// when both are under [`NARROW`], else [`WIDE`] with `start` an index of the wide spans, as
+/// tt packs a span. Both tables hold each entry once and a span packs whenever it can, so
+/// equal spans have equal words.
+#[derive(Default)]
+pub struct Parts {
+    parts: tt::IndexTable<Part>,
+    /// The part asked for last and its index: tokens near each other share one.
+    last: Option<(Part, u32)>,
+    wide: Vec<[u32; 3]>,
+    wides: FxHashMap<[u32; 3], u32>,
+}
+
+impl Parts {
+    /// Forgets every part and wide span, keeping the room, for the next expansion.
+    pub fn clear(&mut self) {
+        self.parts.clear();
+        self.last = None;
+        self.wide.clear();
+        self.wides.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.parts.list().len()
+    }
+
+    pub fn all(&self) -> &[Part] {
+        self.parts.list()
+    }
+
+    /// The index of the part `(anchor, ctx)`, the next one when it is new.
+    #[inline]
+    pub fn part(&mut self, anchor: SpanAnchor, ctx: SyntaxContext) -> u32 {
+        let part = (anchor, ctx);
+        if let Some((last, index)) = self.last
+            && last == part
+        {
+            return index;
+        }
+        let index = self.parts.index(part);
+        self.last = Some((part, index));
+        index
+    }
+
+    /// The word of the span `start..start + len` of the part at `part`, which is one.
+    #[inline]
+    pub fn word(&mut self, start: u32, len: u32, part: u32) -> u64 {
+        if len < NARROW && part < NARROW {
+            return u64::from(start) | u64::from(len | part << 16) << 32;
+        }
+        self.wide_word([start, len, part])
+    }
+
+    #[cold]
+    fn wide_word(&mut self, span: [u32; 3]) -> u64 {
+        let next = self.wide.len() as u32;
+        let wide = &mut self.wide;
+        let at = *self.wides.entry(span).or_insert_with(|| {
+            wide.push(span);
+            next
+        });
+        u64::from(at) | u64::from(WIDE) << 32
+    }
+
+    /// The part a tree names: `{ file_id: index, ast_id: 0, ctx: 0 }` with an index of this
+    /// expansion's parts, and nothing else.
+    pub fn named(&self, part: WirePart) -> Result<Part, String> {
+        match part {
+            WirePart { file_id, ast_id: 0, ctx: 0 } if (file_id as usize) < self.len() => {
+                Ok(self.all()[file_id as usize])
+            }
+            // alloc: the message of a tree refused.
+            _ => Err(format!("the expansion has {} span parts, each named by its index alone", self.len())),
+        }
+    }
+
+    /// The index of the part of the raw ids `write_wire` wrote of it.
+    pub fn part_written(&mut self, file_id: u32, ast_id: u32, ctx: u32) -> u32 {
+        let anchor = SpanAnchor {
+            file_id: EditionedFileId::from_raw(file_id),
+            ast_id: ErasedFileAstId::from_raw(ast_id),
+        };
+        // `ctx` is what `write_wire` wrote of a part of a tree of this process the moment
+        // before (`relative`); a wrong value panics in `from_u32` or in salsa's checked
+        // lookup, or names another context's hygiene.
+        let ctx = SyntaxContext::from_u32(ctx);
+        self.part(anchor, ctx)
+    }
+}
 
 /// The words of a tree's header.
 const HEADER: usize = 6;
@@ -175,7 +272,7 @@ fn top_of(trees: Vec<Tree>, call_site: Span) -> Tree {
 fn flatten(tree: Tree, flat: &mut Vec<TokenTree>) {
     match tree {
         // `Literal::i32_suffixed(-1)` is one token to the macro and a minus sign and a literal
-        // to the compiler, as the native server's reader splits it (`legacy_protocol`, `flat`).
+        // to the compiler, as rust-analyzer's proc-macro server's reader split it.
         Tree::Leaf(Leaf::Literal(literal))
             if matches!(literal.kind, LitKind::Integer | LitKind::Float)
                 && literal.text().starts_with('-') =>

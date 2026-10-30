@@ -2117,15 +2117,35 @@ impl<'db> Interner for DbInterner<'db> {
             // into the witness.
             TyKind::CoroutineWitness(..) => (),
 
+            // This is only for diagnostics and normally ty vars should be handled by the callers.
+            TyKind::Infer(InferTy::TyVar(_)) => {
+                let mut seen: smallvec::SmallVec<[AnyImplId; 8]> = smallvec::SmallVec::new();
+                TraitImpls::for_each_crate_and_block(self.db, krate, trait_block, &mut |impls| {
+                    impls.for_trait_non_blanket(trait_def_id.0, |run| match run {
+                        Either::Left(run) => seen.extend(run.iter().map(|&it| AnyImplId::from(it))),
+                        Either::Right(run) => {
+                            seen.extend(run.iter().map(|&it| AnyImplId::from(it)))
+                        }
+                    });
+                });
+                // The impls of a block are among those of its crate as well as its own.
+                let mut visited: smallvec::SmallVec<[AnyImplId; 8]> = smallvec::SmallVec::new();
+                for impl_ in seen {
+                    if visited.contains(&impl_) {
+                        continue;
+                    }
+                    visited.push(impl_);
+                    try_visit!(f(impl_));
+                }
+            }
+
+            // These are used in diagnostics or in the old solver.
+            TyKind::Param(_) | TyKind::Bound(_, _) => (),
+
             // These variants should not exist as a self type.
-            TyKind::Infer(
-                InferTy::TyVar(_)
-                | InferTy::FreshTy(_)
-                | InferTy::FreshIntTy(_)
-                | InferTy::FreshFloatTy(_),
-            )
-            | TyKind::Param(_)
-            | TyKind::Bound(_, _) => panic!("unexpected self type: {self_ty:?}"),
+            TyKind::Infer(InferTy::FreshTy(_) | InferTy::FreshIntTy(_) | InferTy::FreshFloatTy(_)) => {
+                panic!("unexpected self type: {self_ty:?}")
+            }
         }
 
         self.for_each_blanket_impl(trait_def_id, f)

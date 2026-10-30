@@ -27,7 +27,7 @@ use object::LittleEndian as LE;
 use object::pe;
 use object::read::SymbolIndex;
 use object::read::archive::{ArchiveFile, ArchiveKind};
-use object::read::coff::{CoffHeader, ImageSymbol, SectionTable, SymbolTable};
+use object::read::coff::{CoffHeader, SectionTable, Symbol as _, SymbolTable};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -46,7 +46,7 @@ const BIGOBJ: [u8; 16] = [
 ];
 
 // Archive members are 2-aligned and objects come from anywhere: every COFF type read in place
-// must be 1-aligned, as `object`'s `unaligned` feature (the workspace's) makes them.
+// must be 1-aligned, as `object`'s byte-array fields make them.
 const _: () = assert!(
     align_of::<pe::ImageFileHeader>() == 1
         && align_of::<pe::AnonObjectHeaderBigobj>() == 1
@@ -97,10 +97,13 @@ fn fail(input: Input<'_>, what: impl fmt::Display) -> String {
     format!("{input}: {what}")
 }
 
-/// Bytes of the input as text: borrowed when they are UTF-8.
-fn text(bytes: &[u8]) -> Cow<'_, str> {
-    // alloc: only for bytes that aren't UTF-8, replaced as lossy
-    String::from_utf8_lossy(bytes)
+/// Bytes of the input as text, borrowed. Bytes that aren't UTF-8 are an error: replaced, they
+/// would name another symbol, DLL, member or option.
+fn text(bytes: &[u8]) -> Result<Cow<'_, str>, String> {
+    std::str::from_utf8(bytes).map(Cow::Borrowed).map_err(|_| {
+        // alloc: error path
+        format!("the name {:?} is not UTF-8", String::from_utf8_lossy(bytes))
+    })
 }
 
 /// Where a long import member finds the DLL its `__IMPORT_DESCRIPTOR_` names: the descriptors
@@ -188,7 +191,7 @@ pub(super) fn read(pe: &Pe, name: &str, bytes: &[u8], kind: &NativeKind) -> Resu
 
 /// A relocatable input: an object, or an import member of an archive, read where it is.
 fn member<'a>(pe: &Pe, dlls: Dlls<'a>, name: Input<'_>, bytes: &'a [u8]) -> Result<Parsed<'a>, String> {
-    if u16_at(bytes, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN) && u16_at(bytes, 2) == Some(0xffff) {
+    if u16_at(bytes, 0) == Some(pe::IMAGE_FILE_MACHINE_UNKNOWN.0) && u16_at(bytes, 2) == Some(0xffff) {
         let version = u16_at(bytes, 4).ok_or_else(|| fail(name, "a truncated COFF header"))?;
         if version == 0 {
             let (dll, symbol) = short_import(name, bytes)?;
@@ -214,30 +217,30 @@ fn strip(name: &str) -> &str {
 fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, Imported<'d>), String> {
     let short = || fail(name, "a truncated import member");
     let machine = u16_at(data, 6).ok_or_else(short)?;
-    if machine != pe::IMAGE_FILE_MACHINE_AMD64 {
+    if machine != pe::IMAGE_FILE_MACHINE_AMD64.0 {
         return Err(fail(name, format_args!("an import member for machine {machine:#x}, not x86-64")));
     }
     let size = u32_at(data, 12).ok_or_else(short)? as usize;
     let ordinal_or_hint = u16_at(data, 16).ok_or_else(short)?;
-    let types = u16_at(data, 18).ok_or_else(short)?;
+    let types = pe::ImportObjectFlags(u16_at(data, 18).ok_or_else(short)?);
     let strings = data.get(20..20 + size).ok_or_else(short)?;
     let mut strings = strings.split(|it| *it == 0);
-    let symbol = text(strings.next().ok_or_else(short)?);
-    let dll = text(strings.next().ok_or_else(short)?);
-    let kind = match types & pe::IMPORT_OBJECT_TYPE_MASK {
+    let symbol = text(strings.next().ok_or_else(short)?).map_err(|e| fail(name, e))?;
+    let dll = text(strings.next().ok_or_else(short)?).map_err(|e| fail(name, e))?;
+    let kind = match types.import_type() {
         pe::IMPORT_OBJECT_CODE => SymbolKind::Function,
         pe::IMPORT_OBJECT_DATA | pe::IMPORT_OBJECT_CONST => SymbolKind::Data,
         other => return Err(fail(name, format_args!("import type {other} of {symbol}, which no DLL has"))),
     };
     let export_as: Cow<'_, str>;
     let named = |name| ImportName::Name { hint: ordinal_or_hint, name };
-    let export = match (types >> pe::IMPORT_OBJECT_NAME_SHIFT) & pe::IMPORT_OBJECT_NAME_MASK {
+    let export = match types.name_type() {
         pe::IMPORT_OBJECT_ORDINAL => ImportName::Ordinal(ordinal_or_hint),
         pe::IMPORT_OBJECT_NAME => named(&*symbol),
         pe::IMPORT_OBJECT_NAME_NO_PREFIX => named(strip(&symbol)),
         pe::IMPORT_OBJECT_NAME_UNDECORATE => named(strip(&symbol).split('@').next().unwrap_or_default()),
         pe::IMPORT_OBJECT_NAME_EXPORTAS => {
-            export_as = text(strings.next().ok_or_else(short)?);
+            export_as = text(strings.next().ok_or_else(short)?).map_err(|e| fail(name, e))?;
             named(&*export_as)
         }
         other => {
@@ -318,8 +321,14 @@ fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descr
     for member in file.members() {
         let member = member.map_err(|e| fail(name, e))?;
         let (offset, size) = member.file_range();
-        let member_name = names.push(&text(member.name())).map_err(|e| fail(name, e))?;
-        members.push(Member { name: member_name, bytes: offset as usize..(offset + size) as usize });
+        // `object` takes a member's size from its header without bounding it by the archive.
+        let range = usize::try_from(offset)
+            .ok()
+            .and_then(|start| Some(start..start.checked_add(usize::try_from(size).ok()?)?))
+            .filter(|it| it.end <= bytes.len())
+            .ok_or_else(|| fail(name, "a member past the end of the archive"))?;
+        let member_name = names.push(&text(member.name()).map_err(|e| fail(name, e))?).map_err(|e| fail(name, e))?;
+        members.push(Member { name: member_name, bytes: range });
     }
     let mut index = Vec::with_capacity(symbol_count);
     let mut descriptors = Descriptors::default();
@@ -327,7 +336,7 @@ fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descr
         for symbol in symbols {
             let symbol = symbol.map_err(|e| fail(name, e))?;
             let offset = symbol.offset().0;
-            let symbol_name = text(symbol.name());
+            let symbol_name = text(symbol.name()).map_err(|e| fail(name, e))?;
             // Members are in file order, so their headers' offsets ascend.
             let member = members
                 .binary_search_by_key(&offset, |it| (it.bytes.start as u64).saturating_sub(MEMBER_HEADER))
@@ -362,13 +371,13 @@ fn descriptor_dll(name: Input<'_>, data: &[u8]) -> Result<String, String> {
     let sections = header.sections(data, offset).map_err(|e| fail(name, e))?;
     let symbols = header.symbols(data).map_err(|e| fail(name, e))?;
     for section in sections.iter() {
-        if section.name(symbols.strings()).ok() != Some(b".idata$6".as_slice()) {
+        if section.name(symbols.strings()).map_err(|e| fail(name, e))? != b".idata$6" {
             continue;
         }
         let bytes = section.coff_data(data).map_err(|()| fail(name, "a truncated .idata$6"))?;
         let dll = bytes.split(|it| *it == 0).next().unwrap_or_default();
         if !dll.is_empty() {
-            return Ok(text(dll).into_owned());
+            return Ok(text(dll).map_err(|e| fail(name, e))?.into_owned());
         }
     }
     Err(fail(name, "an import descriptor naming no DLL (no .idata$6)"))
@@ -501,9 +510,9 @@ fn coff<'a, C: CoffHeader>(pe: &Pe, dlls: Dlls<'a>, name: Input<'_>, data: &'a [
         if section_name == b".drectve" {
             directive_bytes += section.size_of_raw_data.get(LE) as usize;
         }
-        comdats += usize::from(section.characteristics.get(LE) & pe::IMAGE_SCN_LNK_COMDAT != 0);
+        comdats += usize::from(section.characteristics.get(LE).0 & pe::IMAGE_SCN_LNK_COMDAT.0 != 0);
         relocations += section.coff_relocations(data).map_or(0, <[_]>::len);
-        names.push(text(section_name));
+        names.push(text(section_name).map_err(|e| fail(name, e))?);
     }
     let sections = Sections { table, names };
     if import {
@@ -513,7 +522,7 @@ fn coff<'a, C: CoffHeader>(pe: &Pe, dlls: Dlls<'a>, name: Input<'_>, data: &'a [
     // length is the word after the symbol table; a local COMDAT's group is named by the input
     // and the section's number. Each term is bounded by the input's size.
     let strings_at = header.pointer_to_symbol_table() as usize
-        + symbols.len() * std::mem::size_of::<C::ImageSymbolBytes>();
+        + symbols.len() * std::mem::size_of::<C::SymbolBytes>();
     let string_bytes = (u32_at(data, strings_at).unwrap_or(0) as usize).min(data.len());
     let capacity = string_bytes
         + 8 * symbols.len()
@@ -543,18 +552,17 @@ struct Reader<'a, 'd, C: CoffHeader> {
     columns: Columns,
 }
 
-/// A section's first and second symbols (a COMDAT's section symbol, with the selection, and
-/// its COMDAT symbol, naming the group), and its first symbol with a section definition record
-/// (what an associative section's parent is found by): COFF indexes, [`NONE`] for none.
+/// A section's first and second symbols (a COMDAT's section symbol, with the selection and an
+/// associative section's parent, and its COMDAT symbol, naming the group): COFF indexes,
+/// [`NONE`] for none.
 #[derive(Clone, Copy)]
 struct Marks {
     first: u32,
     second: u32,
-    aux: u32,
 }
 
 impl Marks {
-    const NONE: Marks = Marks { first: NONE, second: NONE, aux: NONE };
+    const NONE: Marks = Marks { first: NONE, second: NONE };
 }
 
 fn index_of(coff: u32) -> Option<SymbolIndex> {
@@ -568,7 +576,7 @@ struct Read {
     /// symbols no relocation can name: 4 bytes per COFF symbol, looked up by index. The
     /// worker's scratch buffer, so a warm worker's read doesn't allocate it.
     map: Lent<Vec<u32>>,
-    /// Each section's [`Marks`]: 12 bytes per section.
+    /// Each section's [`Marks`]: 8 bytes per section.
     marks: Vec<Marks>,
 }
 
@@ -590,7 +598,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         };
         for (index, section_name) in self.sections.names.iter().enumerate() {
             let header = self.header(index);
-            let flags = header.characteristics.get(LE);
+            let flags = header.characteristics.get(LE).0;
             let section = self.section(&mut object.names, section_name, header, flags)?;
             object.sections.push(section);
         }
@@ -629,12 +637,12 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         let align = alignment(flags).ok_or_else(|| {
             self.err(format_args!(
                 "section {section_name} has alignment bits {:#x}",
-                flags & pe::IMAGE_SCN_ALIGN_MASK
+                flags & pe::IMAGE_SCN_ALIGN_MASK.0
             ))
         })?;
         let base = section_name.split('$').next().unwrap_or_default();
-        let dropped = flags & (pe::IMAGE_SCN_LNK_REMOVE | pe::IMAGE_SCN_LNK_INFO) != 0 || dropped_name(section_name);
-        let zero = flags & pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA != 0;
+        let dropped = flags & (pe::IMAGE_SCN_LNK_REMOVE.0 | pe::IMAGE_SCN_LNK_INFO.0) != 0 || dropped_name(section_name);
+        let zero = flags & pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA.0 != 0;
         let data = if dropped {
             Data::Input(0..0)
         } else if zero {
@@ -653,8 +661,8 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         } else if base == ".xdata" {
             SectionKind::Unwind(Class::Rodata)
         } else {
-            let write = flags & pe::IMAGE_SCN_MEM_WRITE != 0;
-            let exec = flags & (pe::IMAGE_SCN_MEM_EXECUTE | pe::IMAGE_SCN_CNT_CODE) != 0;
+            let write = flags & pe::IMAGE_SCN_MEM_WRITE.0 != 0;
+            let exec = flags & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0) != 0;
             let (class, rank) =
                 self.pe.section(section_name, write, exec, base == ".tls").map_err(|e| self.err(e))?;
             let class = match class {
@@ -664,7 +672,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             };
             SectionKind::Alloc(class, rank)
         };
-        let comdat = flags & pe::IMAGE_SCN_LNK_COMDAT != 0;
+        let comdat = flags & pe::IMAGE_SCN_LNK_COMDAT.0 != 0;
         Ok(Section {
             name: names.push(section_name).map_err(|e| self.err(e))?,
             retain: what != SectionKind::Dropped && !comdat,
@@ -682,7 +690,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         let count = self.sections.names.len();
         let mut map = scratch::lend_u32s();
         map.resize(self.symbols.len(), NONE);
-        // alloc: once per object, 12 bytes per section
+        // alloc: once per object, 8 bytes per section
         let marks = vec![Marks::NONE; count];
         let mut read = Read { symbols: Vec::with_capacity(self.symbols.len()), map, marks };
         let mut weak = 0;
@@ -691,7 +699,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         let mut defined: Vec<(u32, u64, u32)> = Vec::with_capacity(self.symbols.len());
         for (index, symbol) in self.symbols.iter() {
             let class = symbol.storage_class();
-            let number = symbol.section_number();
+            let number = symbol.section_number().0;
             let coff_index = index.0 as u32;
             if number > 0 && number as usize <= count {
                 let marks = &mut read.marks[number as usize - 1];
@@ -699,9 +707,6 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                     marks.first = coff_index;
                 } else if marks.second == NONE {
                     marks.second = coff_index;
-                }
-                if marks.aux == NONE && symbol.has_aux_section() {
-                    marks.aux = coff_index;
                 }
             }
             let linkable = matches!(
@@ -711,10 +716,10 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                     | pe::IMAGE_SYM_CLASS_LABEL
                     | pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
             );
-            if !linkable || number == pe::IMAGE_SYM_DEBUG {
+            if !linkable || number == pe::IMAGE_SYM_DEBUG.0 {
                 continue;
             }
-            let symbol_name = text(symbol.name(strings).map_err(|e| self.err(e))?);
+            let symbol_name = text(symbol.name(strings).map_err(|e| self.err(e))?).map_err(|e| self.err(e))?;
             let value = u64::from(symbol.value());
             let function = symbol.derived_type() == pe::IMAGE_SYM_DTYPE_FUNCTION;
             let (def, kind) = if class == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL {
@@ -746,10 +751,10 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                     )));
                 }
                 let header = self.header(section);
-                let flags = header.characteristics.get(LE);
+                let flags = header.characteristics.get(LE).0;
                 let (kind, size) = if symbol.has_aux_section() && value == 0 {
                     (SymbolKind::Section, u64::from(header.size_of_raw_data.get(LE)))
-                } else if function || flags & (pe::IMAGE_SCN_MEM_EXECUTE | pe::IMAGE_SCN_CNT_CODE) != 0 {
+                } else if function || flags & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0) != 0 {
                     (SymbolKind::Function, 0)
                 } else {
                     (SymbolKind::Data, 0)
@@ -758,9 +763,9 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                     defined.push((section as u32, value, read.symbols.len() as u32));
                 }
                 (SymbolDef::Section { section: section as u32, value, size }, kind)
-            } else if number == pe::IMAGE_SYM_ABSOLUTE {
+            } else if number == pe::IMAGE_SYM_ABSOLUTE.0 {
                 (SymbolDef::Absolute(value), SymbolKind::Other)
-            } else if number == pe::IMAGE_SYM_UNDEFINED {
+            } else if number == pe::IMAGE_SYM_UNDEFINED.0 {
                 let kind = if function { SymbolKind::Function } else { SymbolKind::Other };
                 if value != 0 && class == pe::IMAGE_SYM_CLASS_EXTERNAL {
                     let align = value.next_power_of_two().min(32);
@@ -827,30 +832,20 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         Ok(read)
     }
 
-    /// The selection and parent section number of section `index`'s definition record.
-    fn selection(&self, read: &Read, index: usize) -> Option<(u8, u32)> {
-        let aux = self.symbols.aux_section(index_of(read.marks[index].aux)?).ok()?;
-        let mut parent = u32::from(aux.number.get(LE));
-        if C::is_type_bigobj() {
-            parent |= u32::from(aux.high_number.get(LE)) << 16;
-        }
-        Some((aux.selection, parent))
-    }
-
     /// The section number an associative COMDAT section `index` names, if it is one.
-    fn associated(&self, read: &Read, index: usize) -> Option<u32> {
-        if self.header(index).characteristics.get(LE) & pe::IMAGE_SCN_LNK_COMDAT == 0 {
-            return None;
+    fn associated(&self, read: &Read, index: usize) -> Result<Option<u32>, String> {
+        if self.header(index).characteristics.get(LE).0 & pe::IMAGE_SCN_LNK_COMDAT.0 == 0 {
+            return Ok(None);
         }
-        match self.selection(read, index)? {
+        Ok(match self.comdat(read, index)? {
             (pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE, parent) => Some(parent),
             _ => None,
-        }
+        })
     }
 
     /// The selection and parent section number of COMDAT section `index`, from the definition
     /// record of its section symbol.
-    fn comdat(&self, read: &Read, index: usize) -> Result<(u8, u32), String> {
+    fn comdat(&self, read: &Read, index: usize) -> Result<(pe::ComdatSelection, u32), String> {
         let aux = index_of(read.marks[index].first)
             .filter(|it| self.symbols.symbol(*it).is_ok_and(|it| it.has_aux_section()))
             .ok_or_else(|| {
@@ -883,7 +878,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         // A local COMDAT's group name, made in the worker's string buffer.
         let mut local = scratch::lend_string();
         for index in 0..count {
-            if self.header(index).characteristics.get(LE) & pe::IMAGE_SCN_LNK_COMDAT == 0
+            if self.header(index).characteristics.get(LE).0 & pe::IMAGE_SCN_LNK_COMDAT.0 == 0
                 || object.sections[index].what == SectionKind::Dropped
             {
                 continue;
@@ -915,7 +910,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                     Some(symbol) => read.symbols[symbol as usize].name,
                     None => object
                         .names
-                        .push(&text(leader.name(strings).map_err(|e| self.err(e))?))
+                        .push(&text(leader.name(strings).map_err(|e| self.err(e))?).map_err(|e| self.err(e))?)
                         .map_err(|e| self.err(e))?,
                 }
             } else {
@@ -942,7 +937,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                         self.sections.names[index]
                     )));
                 }
-                match self.associated(read, root - 1) {
+                match self.associated(read, root - 1)? {
                     Some(next) if steps < count => {
                         root = next as usize;
                         steps += 1;
@@ -960,7 +955,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             // nothing by itself.
             let tie = Tie { section: index as u32, to: (parent - 1) as u32, ordered: false };
             match group_of[root - 1] {
-                NONE if self.header(root - 1).characteristics.get(LE) & pe::IMAGE_SCN_LNK_COMDAT == 0 => {
+                NONE if self.header(root - 1).characteristics.get(LE).0 & pe::IMAGE_SCN_LNK_COMDAT.0 == 0 => {
                     object.sections[index].retain = true;
                     object.ties.push(tie);
                 }
@@ -1026,9 +1021,9 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 pe::IMAGE_REL_AMD64_ADDR32NB => {
                     (Apply::ImageRel32, i64::from(u32_at(bytes, at).ok_or_else(short)? as i32))
                 }
-                pe::IMAGE_REL_AMD64_REL32..=pe::IMAGE_REL_AMD64_REL32_5 => {
+                rel32 if (pe::IMAGE_REL_AMD64_REL32..=pe::IMAGE_REL_AMD64_REL32_5).contains(&rel32) => {
                     let implicit = i64::from(u32_at(bytes, at).ok_or_else(short)? as i32);
-                    let past = 4 + i64::from(typ - pe::IMAGE_REL_AMD64_REL32);
+                    let past = 4 + i64::from(rel32.0 - pe::IMAGE_REL_AMD64_REL32.0);
                     (if branch { Apply::X86Branch32 } else { Apply::Rel32 }, implicit - past)
                 }
                 pe::IMAGE_REL_AMD64_SECTION => (Apply::Section16, i64::from(u16_at(bytes, at).ok_or_else(short)?)),
@@ -1052,7 +1047,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
     /// A `.drectve`'s options, its words borrowed from the input but for quoted ones, which are
     /// made in one buffer reused for each.
     fn directives(&self, bytes: &[u8], object: &mut Object) -> Result<(), String> {
-        let all = text(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes));
+        let all = text(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)).map_err(|e| self.err(e))?;
         scratch::with_string(|quoted| words(&all, quoted, |word| self.directive(word, object)))
     }
 
@@ -1177,7 +1172,7 @@ fn alternate(object: &mut Object, from: Name, to: Name) {
 
 /// A COFF section's alignment: 16 when it states none, as the format says.
 pub(super) fn alignment(flags: u32) -> Option<u64> {
-    match (flags & pe::IMAGE_SCN_ALIGN_MASK) >> 20 {
+    match (flags & pe::IMAGE_SCN_ALIGN_MASK.0) >> 20 {
         0 => Some(16),
         bits @ 1..=14 => Some(1 << (bits - 1)),
         _ => None,
@@ -1219,10 +1214,10 @@ pub(crate) fn asked_libraries(name: &str, bytes: &[u8]) -> Result<Vec<(String, S
     let mut quoted = scratch::lend_string();
     for member in file.members() {
         let member = member.map_err(|e| fail(input, e))?;
-        let member_name = text(member.name());
+        let member_name = text(member.name()).map_err(|e| fail(input, e))?;
         let at = Input { file: name, member: Some(&member_name) };
         let data = member.data(bytes).map_err(|e| fail(at, e))?;
-        let drectve = match (u16_at(data, 0), u16_at(data, 2), u16_at(data, 4)) {
+        let drectve = match (u16_at(data, 0).map(pe::Machine), u16_at(data, 2), u16_at(data, 4)) {
             (Some(pe::IMAGE_FILE_MACHINE_UNKNOWN), Some(0xffff), Some(version)) => {
                 if version >= 2 && data.get(12..28) == Some(&BIGOBJ[..]) {
                     drectve::<pe::AnonObjectHeaderBigobj>(at, data)?
@@ -1233,7 +1228,7 @@ pub(crate) fn asked_libraries(name: &str, bytes: &[u8]) -> Result<Vec<(String, S
             _ => drectve::<pe::ImageFileHeader>(at, data)?,
         };
         let Some(drectve) = drectve else { continue };
-        let all = text(drectve.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(drectve));
+        let all = text(drectve.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(drectve)).map_err(|e| fail(at, e))?;
         let start = out.len();
         let mut none = false;
         // alloc: none unless a member takes out more than four of its own libraries
@@ -1359,7 +1354,7 @@ pub(super) fn words<E>(
     }
 }
 
-fn relocation_name(typ: u16) -> &'static str {
+fn relocation_name(typ: pe::RelocationType) -> &'static str {
     match typ {
         pe::IMAGE_REL_AMD64_SECREL7 => "SECREL7",
         pe::IMAGE_REL_AMD64_TOKEN => "TOKEN",
@@ -1369,8 +1364,12 @@ fn relocation_name(typ: u16) -> &'static str {
         pe::IMAGE_REL_AMD64_EHANDLER => "EHANDLER",
         pe::IMAGE_REL_AMD64_IMPORT_BR => "IMPORT_BR",
         pe::IMAGE_REL_AMD64_IMPORT_CALL => "IMPORT_CALL",
-        pe::IMAGE_REL_AMD64_CFG_BR..=pe::IMAGE_REL_AMD64_INDIR_CALL => "a control-flow-guard one",
-        pe::IMAGE_REL_AMD64_INDIR_BR_SWITCHTABLE_FIRST..=pe::IMAGE_REL_AMD64_INDIR_BR_SWITCHTABLE_LAST => {
+        typ if (pe::IMAGE_REL_AMD64_CFG_BR..=pe::IMAGE_REL_AMD64_INDIR_CALL).contains(&typ) => {
+            "a control-flow-guard one"
+        }
+        typ if (pe::IMAGE_REL_AMD64_INDIR_BR_SWITCHTABLE_FIRST..=pe::IMAGE_REL_AMD64_INDIR_BR_SWITCHTABLE_LAST)
+            .contains(&typ) =>
+        {
             "a switch-table one"
         }
         _ => "unknown",
@@ -1397,7 +1396,7 @@ fn long_import<'a, C: CoffHeader>(
             continue;
         }
         let symbol_name = symbol.name(strings).map_err(|e| fail(name, e))?;
-        let number = symbol.section_number();
+        let number = symbol.section_number().0;
         if number > 0 {
             if symbol_name.starts_with(b"__IMPORT_DESCRIPTOR_")
                 || symbol_name == b"__NULL_IMPORT_DESCRIPTOR"
@@ -1411,7 +1410,7 @@ fn long_import<'a, C: CoffHeader>(
             {
                 imp = Some((stripped, section));
             }
-        } else if number == pe::IMAGE_SYM_UNDEFINED && symbol_name.starts_with(b"__IMPORT_DESCRIPTOR_") {
+        } else if number == pe::IMAGE_SYM_UNDEFINED.0 && symbol_name.starts_with(b"__IMPORT_DESCRIPTOR_") {
             descriptor = Some(symbol_name);
         }
     }
@@ -1422,10 +1421,11 @@ fn long_import<'a, C: CoffHeader>(
              tables are the linker's",
         ));
     };
-    let symbol = text(stripped);
+    let symbol = text(stripped).map_err(|e| fail(name, e))?;
     let descriptor = text(descriptor.ok_or_else(|| {
         fail(name, format_args!("the import member of {symbol} names no __IMPORT_DESCRIPTOR_ (a GNU dlltool library?)"))
-    })?);
+    })?)
+    .map_err(|e| fail(name, e))?;
     let dll = dlls.get(&descriptor).ok_or_else(|| {
         fail(name, format_args!("no archive read so far has {descriptor}, the DLL {symbol} is from"))
     })?;
@@ -1437,16 +1437,20 @@ fn long_import<'a, C: CoffHeader>(
             let target = symbols
                 .symbol(SymbolIndex(relocation.symbol_table_index.get(LE) as usize))
                 .map_err(|e| fail(name, e))?;
-            let number = target.section_number();
+            let number = target.section_number().0;
             let names = (number > 0)
                 .then(|| headers.get(number as usize - 1))
                 .flatten()
                 .ok_or_else(|| fail(name, format_args!("the import name of {symbol} is in no section")))?;
             let bytes = names.coff_data(data).map_err(|()| fail(name, "a truncated .idata$6"))?;
-            let at = target.value() as usize + u64_at(thunk, 0).unwrap_or(0) as usize;
+            let addend = u64_at(thunk, 0).ok_or_else(|| fail(name, "a truncated .idata$5"))?;
+            let at = usize::try_from(addend)
+                .ok()
+                .and_then(|thunk| (target.value() as usize).checked_add(thunk))
+                .ok_or_else(|| fail(name, "an import name past the end of .idata$6"))?;
             let hint = u16_at(bytes, at).ok_or_else(|| fail(name, "a truncated .idata$6"))?;
             let export = bytes[at + 2..].split(|it| *it == 0).next().unwrap_or_default();
-            ImportName::Name { hint, name: &text(export) }.version()
+            ImportName::Name { hint, name: &text(export).map_err(|e| fail(name, e))? }.version()
         }
         None => {
             let value = u64_at(thunk, 0).ok_or_else(|| fail(name, "a truncated .idata$5"))?;
@@ -1458,12 +1462,12 @@ fn long_import<'a, C: CoffHeader>(
     };
     // A function when the member defines the symbol (its thunk) in code.
     let code = symbols.iter().any(|(_, it)| {
-        let number = it.section_number();
+        let number = it.section_number().0;
         it.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL
             && number > 0
             && it.name(strings).is_ok_and(|it| it == stripped && !it.starts_with(b"__imp_"))
             && headers.get(number as usize - 1).is_some_and(|header| {
-                header.characteristics.get(LE) & (pe::IMAGE_SCN_MEM_EXECUTE | pe::IMAGE_SCN_CNT_CODE) != 0
+                header.characteristics.get(LE).0 & (pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_CNT_CODE.0) != 0
             })
     });
     let kind = if code { SymbolKind::Function } else { SymbolKind::Data };

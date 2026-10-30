@@ -397,9 +397,12 @@ impl<'f, 'db> MoveData<'f, 'db> {
         let TyKind::Adt(adt, _) = ty.kind() else { return false };
         let hir_def::AdtId::EnumId(id) = adt.def_id() else { return false };
         let Lookup::Exact(path) = self.lookup(ctx, place) else { return false };
-        let width = ctx.size_of(ctx.normalize(discr.as_ref().ty(body, &ctx.infcx, ctx.env).ty));
-        let mask = match width {
-            Some(bytes @ ..16) => (1u128 << (bytes * 8)) - 1,
+        let discr_ty = ctx.normalize(discr.as_ref().ty(body, &ctx.infcx, ctx.env).ty);
+        if !matches!(discr_ty.kind(), TyKind::Int(_) | TyKind::Uint(_)) {
+            return false;
+        }
+        let mask = match discr_ty.primitive_size(ctx.infcx.interner).bytes() {
+            bytes @ ..16 => (1u128 << (bytes * 8)) - 1,
             _ => u128::MAX,
         };
         out.variants.clear();

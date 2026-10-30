@@ -92,6 +92,8 @@ const RECORD: &str = "blaze v2 cargo unit record 3";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 /// A span table's anchor and content, as a test's selection holds it.
 const SPANS: &str = "blaze v2 cargo test spans 1";
+/// A test binary's context with the native inputs its link read, in link order.
+const NATIVES: &str = "blaze v2 cargo test natives 1";
 
 /// The record's fixed header, which `fresh` reads where the store has it, allocating nothing:
 /// `MAGIC`, the count of outputs and of native inputs (`u32` LE each), each output's key
@@ -349,6 +351,7 @@ pub(crate) fn compile(job: &Job, reader: &UnitReader, unit: usize, images: &mut 
                 .collect(),
             artifact,
             macros: None,
+            links: Vec::new(),
         };
         compiled.macros = macros(job, reader, unit, &compiled);
         if let Some(slot) = job.made.get(unit) {
@@ -398,7 +401,7 @@ fn macros(job: &Job, reader: &UnitReader, unit: usize, compiled: &Compiled) -> O
         return None;
     }
     let name = job.unit(unit).map_or("", |it| it.target.name.as_str());
-    let failed = |what: String| Some(Err(ProcMacroLoadingError::ProcMacroSrvError(what.into())));
+    let failed = |what: String| Some(Err(ProcMacroLoadingError::Refused(what.into())));
     let Some(krate) = job.crates.krate(unit) else {
         return failed(format!("proc macro `{name}` has no crate in the front end"));
     };
@@ -514,7 +517,15 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
     let failed = diagnostics.iter().any(|it| it.level == Level::Error);
     let mut made = Made::default();
     let nothing = |diagnostics: Vec<Diagnostic>, ok: bool, made: Made| Made2 {
-        compiled: Compiled { diagnostics, ok, puts: Vec::new(), outputs: Vec::new(), artifact: None, macros: None },
+        compiled: Compiled {
+            diagnostics,
+            ok,
+            puts: Vec::new(),
+            outputs: Vec::new(),
+            artifact: None,
+            macros: None,
+            links: Vec::new(),
+        },
         made,
         natives: Vec::new(),
     };
@@ -528,6 +539,7 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
     let mut puts = Vec::new();
     let mut outputs = Vec::new();
     let mut natives = Vec::new();
+    let mut links = Vec::new(); // alloc: none until a link
     // What each file rustc would write holds: (path, bytes, executable).
     let mut files: Vec<(String, Vec<u8>, bool)> = Vec::new();
     let identity = identity(job, unit);
@@ -609,15 +621,18 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
                     continue;
                 }
                 match codegen::link(job, unit, path, &makes, &generated, images) {
-                    Ok((bytes, read, table)) => {
-                        natives.extend(read);
-                        if table.is_some() {
-                            made.table = table;
+                    Ok(linked) => {
+                        natives.extend(linked.read);
+                        if linked.table.is_some() {
+                            made.table = linked.table;
                         }
-                        files.push((path.to_owned(), bytes, true));
+                        // alloc: once per image linked, a unit links one or two
+                        links.push((path.to_owned(), linked.how));
+                        files.push((path.to_owned(), linked.bytes, true));
                     }
-                    Err(what) => {
-                        diagnostics.push(say::refused(what, Some(unit_of), color));
+                    Err(failed) => {
+                        // alloc: error path
+                        diagnostics.push(say::refused(failed.to_string(), Some(unit_of), color));
                         return Ok(nothing(diagnostics, false, made));
                     }
                 }
@@ -670,7 +685,25 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
         (Some(path), Some(key)) => Some(artifact::artifact(u, plan, package, path, key.0, false, runs(job, unit))?),
         _ => None,
     };
-    Ok(Made2 { compiled: Compiled { diagnostics, ok: true, puts, outputs, artifact, macros: None }, made, natives })
+    // The native code linked in is in no code hash a test reaches: a change of it runs them all.
+    if let Some(context) = &mut made.context {
+        *context = with_natives(*context, &natives);
+    }
+    Ok(Made2 { compiled: Compiled { diagnostics, ok: true, puts, outputs, artifact, macros: None, links }, made, natives })
+}
+
+/// A test binary's `context` with the content of each native input its link read, in link
+/// order; `context` itself when it read none.
+pub(crate) fn with_natives(context: ContentId, natives: &[(String, ContentId)]) -> ContentId {
+    if natives.is_empty() {
+        return context;
+    }
+    let mut hasher = Hasher::new(NATIVES);
+    hasher.id(&context);
+    for (_, native) in natives {
+        hasher.id(native);
+    }
+    hasher.finish()
 }
 
 /// How `unit`'s program is run: its plan's runner, and cargo's variables of it, from the build

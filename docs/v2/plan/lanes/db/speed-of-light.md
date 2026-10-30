@@ -1963,3 +1963,52 @@ The benchmarks:
   content ID needs a tree (git's `cache-tree`) to be \(O(\log n)\) per change. base-db's root
   trie is that tree, keyed by path hash rather than by directory, so its shape does not follow
   how deep the directories are.
+
+## Measured: salsa fork vs blaze_query::db (query-unify-bench)
+
+`crates/blaze-bench/benches/query_hit.rs` runs the same query shapes on both engines
+([query-unify.md](query-unify.md), "How it is measured"); one database type each, functions take
+it concretely (`&Db`), as the front end's do. Run with `cargo bench -p blaze-bench --bench
+query_hit -- solo -t 8` (tango, solo mode). The cases:
+
+- **hit**: a tracked function of one interned key (`unsafe(no_lifetime), revisions =
+  usize::MAX`, the front end's form) returning `u64`, 64K keys, warm; one hit an iteration, the
+  keys in order or by stride 40 503 (scattered).
+- **hit in query**: an iteration writes the low-durability input of one outer query, which
+  runs again and makes the same 64K hits from inside, each recording its edge. Per hit is the
+  iteration over 65 536; it includes the write, the outer query's run, and each inner memo's
+  first check in the new revision (passed by durability: the keys are interned outside a query).
+- **verify**: 16 384 readers of 16 edges each over 4096 leaves, readers and leaves of medium
+  durability. An iteration writes an unrelated input and fetches every reader again. *Other
+  durability*: the input is low, so each reader passes on its durability. *Same durability*:
+  the input is medium, so each reader verifies its edges (or the fork's bloom check,
+  `graph::bloom`, passes it first). Per edge is over 262 144.
+- **interned hit**: `Key::new` of a value already interned, scattered over 64K.
+- **cycle**: `c0 → c1 → … → c7 → c0`, `c0` with `cycle_initial`; an iteration moves the
+  input's cap between 3 and 4, so the cycle runs again from 0 to its fixpoint, two iterations
+  of eight queries.
+
+The machine is shared and was loaded (load average 75 to 113 on 18 cores), so the means are
+inflated by contention and vary run to run; the minimum sample is the one that repeats (two runs
+of 3 s and 8 s a case agree within 20%). Both are given; compare minimums.
+
+**salsa fork**, 2026-10-30 14:51, Apple M5 Max (18 cores), commit `a6adfd68aeb1` plus the
+working tree (the fork as in `vendor/salsa` at that time):
+
+| case | min | mean (8 s run) | per op (min) |
+|---|---|---|---|
+| hit, sequential | 12.5 ns | 42.7 ns | 12.5 ns a hit |
+| hit, scattered | 14.6 ns | 55.9 ns | 14.6 ns a hit |
+| hit in query, sequential | 1.5 ms | 4.1 ms | 22.9 ns a hit |
+| hit in query, scattered | 1.8 ms | 5.5 ms | 27.5 ns a hit |
+| verify, other durability | 479 µs | 798 µs | 29.2 ns a reader |
+| verify, same durability | 1.4 ms | 1.8 ms | 5.3 ns an edge (87 ns a reader) |
+| interned hit | 9.5 ns | 17.4 ns | 9.5 ns |
+| cycle of 8 to fixpoint | 6.2 µs | 7.3 µs | ≈ 390 ns a query run (16 runs) |
+
+Against the bounds above ("Memo hit", ≈ 5.4 ns hot), the fork's warm hit is 2.3× off in order
+and 2.7× scattered; a hit from inside a query costs about 10 ns more for its edge and the
+revision's first check.
+
+**blaze_query::db**: measured once `query-unify-engine` reports the engine done; the same
+cases, the same machine, both engines in one run.

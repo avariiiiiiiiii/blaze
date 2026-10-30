@@ -950,7 +950,7 @@ pub(crate) fn ui_library(ui: Ui<'_>, library: &Library<'_>) -> String {
         deps.push_str(name);
     }
     let meta = if ui.meta.is_empty() { String::new() } else { format!(" {}", ui.meta) };
-    fixture.push_str(&format!("//- /{} crate:main edition:{} deps:{deps}{meta}\n{}", ui.name, ui.edition, ui.source));
+    fixture.push_str(&format!("//- /{} crate:other:main edition:{} deps:{deps}{meta}\n{}", ui.name, ui.edition, ui.source));
     let stderr = crate::tests::checked_with(&fixture, "$DIR/", &compiletest(ui.mode, ui.flags))
         .stderr_with(crate::emit::Style { ui_testing: true, ..crate::emit::Style::default() });
     crate::tests::normalized(&stderr)

@@ -12,9 +12,10 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    build`/`cargo test` or sccache. Where blaze can't build itself yet, fix that. See
    [docs/contributing.md](docs/contributing.md).
 3. **no-fallback**: No fallback, ever. When blaze can't do something it stops with an error naming what
-   and where, never quietly takes another path (rustc, a full rebuild instead of a patch, a slower
-   backend, an older cached result). A change that touches an existing fallback turns it into an
-   error.
+   and where, never quietly takes another path (rustc, a full link or rebuild instead of a patch, a
+   slower backend, an older cached result, a default guessed for a missing value). A fallback that
+   only logs its reason is still a fallback. A change that touches an existing fallback turns it
+   into an error, and a bench or test that hits one fails instead of timing the slow path.
 4. **superset-of-rust**: Own every layer from source to running code, never by narrowing what blaze
    accepts: every program the pinned nightly builds must build and behave the same under blaze, with
    the real std, C dependencies, build scripts and proc macros. The one allowed difference is

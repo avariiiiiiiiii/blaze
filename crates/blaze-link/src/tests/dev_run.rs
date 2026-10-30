@@ -59,8 +59,9 @@ fn preinit_object() -> Vec<u8> {
         section: SymbolSection::Section(text),
         flags: SymbolFlags::None,
     });
-    let preinit = b.add_section(Vec::new(), b".preinit_array".to_vec(), SectionKind::Elf(elf::SHT_PREINIT_ARRAY));
-    b.section_mut(preinit).flags = SectionFlags::Elf { sh_flags: u64::from(elf::SHF_ALLOC | elf::SHF_WRITE) };
+    let preinit = b.add_section(Vec::new(), b".preinit_array".to_vec(), SectionKind::Data);
+    b.section_mut(preinit).flags =
+        SectionFlags::Elf { sh_type: elf::SHT_PREINIT_ARRAY, sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE };
     let slot = b.append_section_data(preinit, &[0; 8], 8);
     b.add_relocation(preinit, Relocation {
         offset: slot,
@@ -129,7 +130,7 @@ fn loads(linked: &Linked) -> Vec<(u64, u64, u64, u32)> {
     file.elf_program_headers()
         .iter()
         .filter(|it| it.p_type(endian) == elf::PT_LOAD)
-        .map(|it| (it.p_vaddr(endian), it.p_memsz(endian), it.p_filesz(endian), it.p_flags(endian)))
+        .map(|it| (it.p_vaddr(endian), it.p_memsz(endian), it.p_filesz(endian), it.p_flags(endian).0))
         .collect()
 }
 

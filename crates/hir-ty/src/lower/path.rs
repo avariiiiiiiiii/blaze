@@ -248,8 +248,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     0 => {
                         // Trait object type without dyn; this should be handled in upstream. See
                         // `lower_path()`.
-                        stdx::never!("unexpected fully resolved trait path");
-                        self.ctx.types.types.error
+                        unreachable!("unexpected fully resolved trait path")
                     }
                     _ => {
                         // FIXME report error (ambiguous associated type)

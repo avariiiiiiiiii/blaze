@@ -57,12 +57,19 @@ fn pinned_elsewhere(words: &[OsString]) -> Option<ExitCode> {
     if matches!(text.first().map(String::as_str), Some("pin" | "version-fetch" | "version-resolve" | "serve")) {
         return None;
     }
-    let cwd = std::env::current_dir().ok()?;
-    let manifest = pin::root_manifest(&pin::start(&text, &cwd))?;
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => return Some(failed(&pin::PinError::NoWorkingDirectory(error).to_string())),
+    };
+    let manifest = match pin::root_manifest(&pin::start(&text, &cwd)) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return None,
+        Err(why) => return Some(failed(&why.to_string())),
+    };
     let wanted = match pin::pinned(&manifest) {
         Ok(Some(wanted)) => wanted,
         Ok(None) => return None,
-        Err(why) => return Some(failed(&why)),
+        Err(why) => return Some(failed(&why.to_string())),
     };
     let shown = manifest.display();
     let wanted = if pin::is_channel(&wanted) {
@@ -106,33 +113,45 @@ fn pinned_elsewhere(words: &[OsString]) -> Option<ExitCode> {
     Some(ended(&mut command, &pinned))
 }
 
-/// The version `channel` names: the one read for it within [`pin::CHANNEL_FRESH`], else read
-/// again ([`versions::resolve`], which keeps it). When it can't be read again, the one read
-/// last, with a line saying so.
-fn channel_version(channel: &str) -> Result<String, String> {
-    let file = pin::channel_file(channel).ok_or_else(|| {
-        "blaze keeps what a channel names in .blaze in your home directory, and there is none \
-         (`BLAZE_HOME` names where)"
-            .to_owned()
-    })?;
-    let known = pin::channel_known(&file);
-    if let Some((version, true)) = &known {
-        return Ok(version.clone());
-    }
-    let why = match versions::resolve(channel) {
-        Ok(version) => return Ok(version),
-        Err(why) => format!("{why:#}"),
-    };
-    match known {
-        Some((version, _)) => {
-            eprintln!(
-                "blaze: what the {channel} channel names could not be read ({why}); blaze \
-                 {version}, which it named when last read, runs"
-            );
-            Ok(version)
+/// Why the release a channel names can't be told.
+#[derive(Debug)]
+enum ChannelError {
+    /// No home directory, where blaze keeps what a channel named.
+    NoHome,
+    /// The channel was not read within [`pin::CHANNEL_FRESH`] and can't be read again. `last`
+    /// is what it named when last read, which does not run in its place.
+    Unread { why: anyhow::Error, last: Option<String> },
+}
+
+impl std::fmt::Display for ChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChannelError::NoHome => f.write_str(
+                "blaze keeps what a channel names in .blaze in your home directory, and there is \
+                 none (`BLAZE_HOME` names where)",
+            ),
+            ChannelError::Unread { why, last: None } => {
+                write!(f, "what it names could not be read: {why:#}")
+            }
+            ChannelError::Unread { why, last: Some(last) } => write!(
+                f,
+                "what it names could not be read again ({why:#}); blaze {last}, which it named \
+                 when last read, is not run in its place: `blaze version-resolve` reads it again"
+            ),
         }
-        None => Err(format!("what it names could not be read: {why}")),
     }
+}
+
+/// The version `channel` names: the one read for it within [`pin::CHANNEL_FRESH`], else read
+/// again ([`versions::resolve`], which keeps it). One that can't be read again is an error.
+fn channel_version(channel: &str) -> Result<String, ChannelError> {
+    let file = pin::channel_file(channel).ok_or(ChannelError::NoHome)?;
+    let known = pin::channel_known(&file);
+    if let Some((version, true)) = known {
+        return Ok(version);
+    }
+    versions::resolve(channel)
+        .map_err(|why| ChannelError::Unread { why, last: known.map(|(version, _)| version) })
 }
 
 fn failed(why: &str) -> ExitCode {

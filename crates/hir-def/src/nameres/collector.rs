@@ -1012,8 +1012,10 @@ impl<'db> DefCollector<'db> {
 
                 i += 1;
                 if i > FIXED_POINT_LIMIT {
-                    tracing::error!("name resolution is stuck");
-                    break 'resolve_attr;
+                    panic!(
+                        "name resolution of {:?} still made progress after {FIXED_POINT_LIMIT} rounds",
+                        self.def_map.krate
+                    );
                 }
             }
 
@@ -2678,7 +2680,8 @@ impl<'db> DefCollector<'db> {
     ) {
         if depth > self.def_map.recursion_limit() {
             cov_mark::hit!(macro_expansion_overflow);
-            tracing::warn!("macro expansion is too deep");
+            let diag = DefDiagnostic::recursion_overflow(self.db, module_id, macro_call_id);
+            self.def_map.diagnostics.push(diag);
             return;
         }
         let def = macro_call_id.loc(self.db).def;

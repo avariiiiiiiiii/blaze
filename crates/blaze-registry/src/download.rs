@@ -12,7 +12,6 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use semver::Version;
-use sha2::{Digest, Sha256};
 use tar::{Archive, EntryType};
 
 use crate::{http::HttpNotSuccessful, registry::Registry};
@@ -124,7 +123,7 @@ impl Registry {
         let key = parse_checksum(&package.checksum)
             .with_context(|| format!("`{}` is not a sha256 checksum", package.checksum))?;
         let store = self.context().store;
-        let matches = |bytes: &[u8]| <[u8; 32]>::from(Sha256::digest(bytes)) == key;
+        let matches = |bytes: &[u8]| blaze_sha256::digest(bytes) == key;
         let keep = |bytes: &[u8]| -> anyhow::Result<()> {
             let Some(store) = store else { return Ok(()) };
             // clone: a download kept, once a package
@@ -147,7 +146,7 @@ impl Registry {
                 bail!("the store's `.crate` of `{package}` is not of its sha256 `{}`", package.checksum);
             }
             if !self.is_local() && self.context().keep_crate_files {
-                keep_crate_file(&cache_file, &bytes);
+                keep_crate_file(&cache_file, &bytes)?;
             }
             return Ok((bytes, From::Store));
         }
@@ -192,25 +191,22 @@ impl Registry {
         }
         keep(&bytes)?;
         if self.context().keep_crate_files {
-            keep_crate_file(&cache_file, &bytes);
+            keep_crate_file(&cache_file, &bytes)?;
         }
         Ok((bytes, From::Network))
     }
 }
 
 /// Writes a `.crate` into cargo's cache, as cargo would have, so that cargo finds it offline.
-/// A cache that cannot be written is only said.
-fn keep_crate_file(path: &Path, bytes: &[u8]) {
+/// A cache asked for that cannot be written is the error.
+fn keep_crate_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if std::fs::metadata(path).is_ok_and(|it| it.len() > 0) {
-        return;
+        return Ok(());
     }
-    let written = path
-        .parent()
+    path.parent()
         .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| crate::write_whole(path, bytes));
-    if let Err(e) = written {
-        eprintln!("warning: failed to keep {}: {e}", path.display());
-    }
+        .and_then(|()| crate::write_whole(path, bytes))
+        .with_context(|| format!("failed to keep {}", path.display()))
 }
 
 /// Whether a package directory was unpacked whole by cargo 1.71 or later, or blaze; one left by
@@ -371,7 +367,7 @@ pub fn is_windows_reserved_path(path: &Path) -> bool {
 
 /// The sha256 of some bytes in hex, as an index's `cksum` writes it.
 pub fn checksum(bytes: &[u8]) -> String {
-    blaze_format::hex::encode(&Sha256::digest(bytes))
+    blaze_format::hex::encode(&blaze_sha256::digest(bytes))
 }
 
 #[cfg(test)]

@@ -406,7 +406,7 @@ fn an_executable_reads_back() {
     // Segments: four loads, R, RX, relro, RW, each on a page, covering every region.
     let phdrs = file.elf_program_headers();
     let loads: Vec<_> = phdrs.iter().filter(|it| it.p_type(endian) == elf::PT_LOAD).collect();
-    assert_eq!(loads.iter().map(|it| it.p_flags(endian)).collect::<Vec<_>>(), [4, 5, 6, 6]);
+    assert_eq!(loads.iter().map(|it| it.p_flags(endian).0).collect::<Vec<_>>(), [4, 5, 6, 6]);
     for load in &loads {
         assert_eq!(load.p_offset(endian), load.p_vaddr(endian));
         assert_eq!(load.p_vaddr(endian) % 0x1000, 0);
@@ -422,7 +422,7 @@ fn an_executable_reads_back() {
         if in_file(&region.class) {
             assert!(end <= load.p_vaddr(endian) + load.p_filesz(endian), "{:?} past the file", region.class);
         }
-        let flags = load.p_flags(endian);
+        let flags = load.p_flags(endian).0;
         assert_eq!(flags, Segment::of(&region.class).flags(), "{:?}", region.class);
     }
     let phdr = |p_type| phdrs.iter().find(|it| it.p_type(endian) == p_type).unwrap();
@@ -442,7 +442,7 @@ fn an_executable_reads_back() {
     assert_eq!(&note[16..], b"blaze build id!!");
     let hdr = image.at(&Class::Synthetic(super::EH_FRAME_HDR));
     assert_eq!(phdr(elf::PT_GNU_EH_FRAME).p_vaddr(endian), hdr);
-    assert!(phdrs.iter().any(|it| it.p_type(endian) == elf::PT_GNU_STACK && it.p_flags(endian) == 6));
+    assert!(phdrs.iter().any(|it| it.p_type(endian) == elf::PT_GNU_STACK && it.p_flags(endian).0 == 6));
 
     // `.eh_frame_hdr`: both FDEs, sorted by the address they cover.
     let table = &bytes[hdr as usize..];
@@ -455,17 +455,17 @@ fn an_executable_reads_back() {
 
     // `.dynamic`.
     let dynamic = phdr(elf::PT_DYNAMIC).dynamic(endian, data_bytes).unwrap().unwrap();
-    let entries: Vec<(u64, u64)> = dynamic.iter().map(|it| (it.d_tag(endian), it.d_val(endian))).collect();
-    let tag = |tag: u32| entries.iter().find(|it| it.0 == u64::from(tag)).map(|it| it.1);
+    let entries: Vec<(u64, u64)> = dynamic.iter().map(|it| (it.d_tag(endian).0 as u64, it.d_val(endian))).collect();
+    let tag = |tag: elf::DynamicTag| entries.iter().find(|it| it.0 == tag.0 as u64).map(|it| it.1);
     let strtab = tag(elf::DT_STRTAB).unwrap();
     let needed: Vec<&str> = entries
         .iter()
-        .filter(|it| it.0 == u64::from(elf::DT_NEEDED))
+        .filter(|it| it.0 == elf::DT_NEEDED.0 as u64)
         .map(|it| c_string(data_bytes, strtab + it.1))
         .collect();
     assert_eq!(needed, ["libc.so.6", "libm.so.6"], "an as-needed library nothing imports from is left out");
-    assert_eq!(tag(elf::DT_FLAGS), Some(u64::from(elf::DF_BIND_NOW)));
-    assert_eq!(tag(elf::DT_FLAGS_1), Some(u64::from(elf::DF_1_NOW | elf::DF_1_PIE)));
+    assert_eq!(tag(elf::DT_FLAGS), Some(elf::DF_BIND_NOW.0));
+    assert_eq!(tag(elf::DT_FLAGS_1), Some((elf::DF_1_NOW | elf::DF_1_PIE).0));
     assert_eq!(tag(elf::DT_DEBUG), Some(0));
     assert_eq!(tag(elf::DT_SONAME), None);
     assert_eq!(tag(elf::DT_INIT_ARRAY), Some(init));
@@ -482,20 +482,20 @@ fn an_executable_reads_back() {
     let (relas, _) = rela.rela(endian, data_bytes).unwrap().unwrap();
     let relas: Vec<(u64, u32, u32, i64)> = relas
         .iter()
-        .map(|it| (it.r_offset(endian), it.r_type(endian, false), it.r_sym(endian, false), it.r_addend(endian)))
+        .map(|it| (it.r_offset(endian), it.r_type(endian, false).0, it.r_sym(endian, false), it.r_addend(endian)))
         .collect();
     let mut relative = vec![
-        (data, elf::R_X86_64_RELATIVE, 0, rodata as i64),
-        (got + 8, elf::R_X86_64_RELATIVE, 0, rodata as i64),
-        (init, elf::R_X86_64_RELATIVE, 0, text as i64),
-        (relro, elf::R_X86_64_RELATIVE, 0, text as i64 + 32),
+        (data, elf::R_X86_64_RELATIVE.0, 0, rodata as i64),
+        (got + 8, elf::R_X86_64_RELATIVE.0, 0, rodata as i64),
+        (init, elf::R_X86_64_RELATIVE.0, 0, text as i64),
+        (relro, elf::R_X86_64_RELATIVE.0, 0, text as i64 + 32),
     ];
     relative.sort();
     let mut other = vec![
-        (got, elf::R_X86_64_GLOB_DAT, 1, 0),
-        (got + 16, elf::R_X86_64_DTPMOD64, 0, 0),
-        (got + 24, elf::R_X86_64_DTPOFF64, 0, 4),
-        (data + 8, elf::R_X86_64_64, 1, 8),
+        (got, elf::R_X86_64_GLOB_DAT.0, 1, 0),
+        (got + 16, elf::R_X86_64_DTPMOD64.0, 0, 0),
+        (got + 24, elf::R_X86_64_DTPOFF64.0, 0, 4),
+        (data + 8, elf::R_X86_64_64.0, 1, 8),
     ];
     other.sort();
     relative.extend(other);
@@ -505,7 +505,7 @@ fn an_executable_reads_back() {
     let dynsyms = sections.symbols(endian, data_bytes, elf::SHT_DYNSYM).unwrap();
     let versions = sections.versions(endian, data_bytes).unwrap().unwrap();
     let version = |index: usize| {
-        versions.version(versions.version_index(endian, SymbolIndex(index))).unwrap().map(|it| it.name().to_vec())
+        versions.version(versions.version_index(endian, SymbolIndex(index)).index()).unwrap().map(|it| it.name().to_vec())
     };
     let name = |index: usize| dynsyms.symbol(SymbolIndex(index)).unwrap().name(endian, dynsyms.strings()).unwrap();
     assert_eq!(name(1), b"malloc");
@@ -580,11 +580,11 @@ fn a_shared_library_exports_through_its_hash_table() {
         assert_eq!(load.p_align(endian), 0x10000);
     }
     let dynamic = phdrs.iter().find_map(|it| it.dynamic(endian, data).unwrap()).unwrap();
-    let entries: Vec<(u64, u64)> = dynamic.iter().map(|it| (it.d_tag(endian), it.d_val(endian))).collect();
-    let tag = |tag: u32| entries.iter().find(|it| it.0 == u64::from(tag)).map(|it| it.1);
+    let entries: Vec<(u64, u64)> = dynamic.iter().map(|it| (it.d_tag(endian).0 as u64, it.d_val(endian))).collect();
+    let tag = |tag: elf::DynamicTag| entries.iter().find(|it| it.0 == tag.0 as u64).map(|it| it.1);
     assert_eq!(c_string(data, tag(elf::DT_STRTAB).unwrap() + tag(elf::DT_SONAME).unwrap()), "libblaze.so");
-    assert_eq!(tag(elf::DT_FLAGS), Some(u64::from(elf::DF_BIND_NOW | elf::DF_SYMBOLIC)));
-    assert_eq!(tag(elf::DT_FLAGS_1), Some(u64::from(elf::DF_1_NOW)));
+    assert_eq!(tag(elf::DT_FLAGS), Some((elf::DF_BIND_NOW | elf::DF_SYMBOLIC).0));
+    assert_eq!(tag(elf::DT_FLAGS_1), Some(elf::DF_1_NOW.0));
     assert_eq!(tag(elf::DT_DEBUG), None);
     assert_eq!(tag(elf::DT_RELA), None);
 
@@ -639,12 +639,12 @@ fn a_shared_librarys_initial_exec_cell_is_relocated_against_the_module() {
         let (relas, _) = rela.rela(endian, data).unwrap().unwrap();
         let relas: Vec<(u64, u32, u32, i64)> = relas
             .iter()
-            .map(|it| (it.r_offset(endian), it.r_type(endian, false), it.r_sym(endian, false), it.r_addend(endian)))
+            .map(|it| (it.r_offset(endian), it.r_type(endian, false).0, it.r_sym(endian, false), it.r_addend(endian)))
             .collect();
-        assert_eq!(relas, [(got, r_type, 0, 4)], "{arch:?}");
+        assert_eq!(relas, [(got, r_type.0, 0, 4)], "{arch:?}");
         let dynamic = file.elf_program_headers().iter().find_map(|it| it.dynamic(endian, data).unwrap()).unwrap();
-        let flags = dynamic.iter().find(|it| it.d_tag(endian) == u64::from(elf::DT_FLAGS)).unwrap().d_val(endian);
-        assert_eq!(flags, u64::from(elf::DF_BIND_NOW | elf::DF_SYMBOLIC | elf::DF_STATIC_TLS), "{arch:?}");
+        let flags = dynamic.iter().find(|it| it.d_tag(endian) == elf::DT_FLAGS).unwrap().d_val(endian);
+        assert_eq!(flags, (elf::DF_BIND_NOW | elf::DF_SYMBOLIC | elf::DF_STATIC_TLS).0, "{arch:?}");
     }
 }
 
@@ -807,18 +807,18 @@ fn native_relocations() {
     let apply = super::native::apply;
 
     let mut bytes = [0u8; 2];
-    apply(X86_64, elf::R_X86_64_16, &mut bytes, 0x1000, 0xfff0, 0x0f).unwrap();
+    apply(X86_64, elf::R_X86_64_16.0, &mut bytes, 0x1000, 0xfff0, 0x0f).unwrap();
     assert_eq!(bytes, [0xff, 0xff]);
-    assert!(apply(X86_64, elf::R_X86_64_16, &mut bytes, 0, 0x1_0000, 0).is_err());
+    assert!(apply(X86_64, elf::R_X86_64_16.0, &mut bytes, 0, 0x1_0000, 0).is_err());
     let mut bytes = [0u8; 1];
-    apply(X86_64, elf::R_X86_64_PC8, &mut bytes, 0x1000, 0x1000, -2).unwrap();
+    apply(X86_64, elf::R_X86_64_PC8.0, &mut bytes, 0x1000, 0x1000, -2).unwrap();
     assert_eq!(bytes, [0xfe]);
-    assert!(apply(X86_64, elf::R_X86_64_PC8, &mut bytes, 0x1000, 0x1080, 0).is_err());
-    assert!(apply(X86_64, elf::R_X86_64_PC32, &mut [0; 4], 0, 0, 0).is_err(), "not a native type");
+    assert!(apply(X86_64, elf::R_X86_64_PC8.0, &mut bytes, 0x1000, 0x1080, 0).is_err());
+    assert!(apply(X86_64, elf::R_X86_64_PC32.0, &mut [0; 4], 0, 0, 0).is_err(), "not a native type");
 
     // ADRP x0, page(S) with no range check.
     let mut bytes = insn(0x9000_0000);
-    apply(Aarch64, elf::R_AARCH64_ADR_PREL_PG_HI21_NC, &mut bytes, 0x1_0000, 0x1_3456, 0).unwrap();
+    apply(Aarch64, elf::R_AARCH64_ADR_PREL_PG_HI21_NC.0, &mut bytes, 0x1_0000, 0x1_3456, 0).unwrap();
     let w = word(&bytes);
     let imm = ((w >> 29) & 3) | (((w >> 5) & 0x7_ffff) << 2);
     assert_eq!(imm, 3);
@@ -826,26 +826,26 @@ fn native_relocations() {
 
     // LDR x1, label: 19 bits of words.
     let mut bytes = insn(0x5800_0001);
-    apply(Aarch64, elf::R_AARCH64_LD_PREL_LO19, &mut bytes, 0x1000, 0x900, 0).unwrap();
+    apply(Aarch64, elf::R_AARCH64_LD_PREL_LO19.0, &mut bytes, 0x1000, 0x900, 0).unwrap();
     assert_eq!((word(&bytes) >> 5) & 0x7_ffff, ((-0x700i32 >> 2) as u32) & 0x7_ffff);
-    assert!(apply(Aarch64, elf::R_AARCH64_LD_PREL_LO19, &mut insn(0x5800_0001), 0x1000, 0x1002, 0).is_err());
+    assert!(apply(Aarch64, elf::R_AARCH64_LD_PREL_LO19.0, &mut insn(0x5800_0001), 0x1000, 0x1002, 0).is_err());
 
     // A negative MOVZ becomes MOVN of the inverted bits; a MOVK keeps its opcode.
     let movz = 0xd280_0000u32;
     let mut bytes = insn(movz);
-    apply(Aarch64, elf::R_AARCH64_MOVW_SABS_G0, &mut bytes, 0, 0, -2).unwrap();
+    apply(Aarch64, elf::R_AARCH64_MOVW_SABS_G0.0, &mut bytes, 0, 0, -2).unwrap();
     assert_eq!(word(&bytes), 0x9280_0000 | (1 << 5));
     let mut bytes = insn(movz);
-    apply(Aarch64, elf::R_AARCH64_MOVW_SABS_G0, &mut bytes, 0, 0x1234, 0).unwrap();
+    apply(Aarch64, elf::R_AARCH64_MOVW_SABS_G0.0, &mut bytes, 0, 0x1234, 0).unwrap();
     assert_eq!(word(&bytes), movz | (0x1234 << 5));
-    assert!(apply(Aarch64, elf::R_AARCH64_MOVW_SABS_G0, &mut insn(movz), 0, 0x1_0000, 0).is_err());
+    assert!(apply(Aarch64, elf::R_AARCH64_MOVW_SABS_G0.0, &mut insn(movz), 0, 0x1_0000, 0).is_err());
     let movk = 0xf2a0_0000u32;
     let mut bytes = insn(movk);
-    apply(Aarch64, elf::R_AARCH64_MOVW_PREL_G1_NC, &mut bytes, 0x1000, 0x1_2345_1000, 0).unwrap();
+    apply(Aarch64, elf::R_AARCH64_MOVW_PREL_G1_NC.0, &mut bytes, 0x1000, 0x1_2345_1000, 0).unwrap();
     assert_eq!(word(&bytes), movk | (0x2345 << 5));
 
     let mut bytes = [0u8; 2];
-    apply(Aarch64, elf::R_AARCH64_PREL16, &mut bytes, 0x2000, 0x1000, 0).unwrap();
+    apply(Aarch64, elf::R_AARCH64_PREL16.0, &mut bytes, 0x2000, 0x1000, 0).unwrap();
     assert_eq!(u16::from_le_bytes(bytes), (-0x1000i16) as u16);
 }
 
@@ -941,7 +941,7 @@ fn many_exports_hash_as_the_model_does() {
     }
     let versym = image.synthetic(super::VERSYM);
     assert_eq!(versym.len(), 2 * (3 + names.len()));
-    assert!(versym[6..].chunks(2).all(|it| it == elf::VER_NDX_GLOBAL.to_le_bytes()));
+    assert!(versym[6..].chunks(2).all(|it| it == elf::VER_NDX_GLOBAL.0.to_le_bytes()));
 
     let data = &bytes[..];
     let file = ElfFile64::<Endianness>::parse(data).unwrap();
@@ -977,14 +977,14 @@ fn many_slid_addresses_are_relocated_as_the_model_does() {
     image.binds = vec![Bind { addr: data + 8 * n as u64, import: 0, addend: 0 }];
     let sorted: Vec<u64> = (0..n as u64).map(|at| data + 8 * at).collect();
 
-    let mut expected: Vec<(u64, u32, u32, i64)> =
+    let mut expected: Vec<(u64, elf::RelocationType, u32, i64)> =
         (0..n as u64).map(|at| (data + 8 * at, elf::R_X86_64_RELATIVE, 0, (text + at * 3) as i64)).collect();
     expected.sort();
     expected.push((data + 8 * n as u64, elf::R_X86_64_64, 1, 0));
     let mut model = Vec::new();
     for (at, r_type, sym, addend) in expected {
         model.extend_from_slice(&at.to_le_bytes());
-        model.extend_from_slice(&((u64::from(sym) << 32) | u64::from(r_type)).to_le_bytes());
+        model.extend_from_slice(&((u64::from(sym) << 32) | u64::from(r_type.0)).to_le_bytes());
         model.extend_from_slice(&addend.to_le_bytes());
     }
 
@@ -996,7 +996,7 @@ fn many_slid_addresses_are_relocated_as_the_model_does() {
         let dynamic = &synthesized.iter().find(|it| it.0 == Class::Synthetic(super::DYNAMIC)).unwrap().1;
         let count = dynamic
             .chunks(16)
-            .find(|it| u64::from_le_bytes(it[..8].try_into().unwrap()) == u64::from(elf::DT_RELACOUNT))
+            .find(|it| u64::from_le_bytes(it[..8].try_into().unwrap()) == elf::DT_RELACOUNT.0 as u64)
             .map(|it| u64::from_le_bytes(it[8..].try_into().unwrap()));
         assert_eq!(count, Some(n as u64), "{what}");
     }
@@ -1048,7 +1048,7 @@ fn many_functions_are_named_in_the_symbol_table() {
         assert_eq!(symbol.st_value(endian), function.addr);
         assert_eq!(symbol.st_size(endian), 16);
         assert_eq!(symbol.st_bind(), elf::STB_LOCAL);
-        assert_eq!(symbol.st_shndx(endian), 1 + image.index(&Class::Text) as u16);
+        assert_eq!(symbol.st_shndx(endian).0, 1 + image.index(&Class::Text) as u16);
     }
     assert_eq!(symbols[1 + named.iter().position(|it| it.name.as_deref() == Some("")).unwrap()].st_name(endian), 0);
     let export = &symbols[1 + named.len()];
@@ -1619,7 +1619,7 @@ fn loads(bytes: &[u8]) -> Vec<(u32, u64, u64, u64, u64)> {
     let endian = file.endian();
     (file.elf_program_headers().iter())
         .filter(|it| it.p_type(endian) == elf::PT_LOAD)
-        .map(|it| (it.p_flags(endian), it.p_offset(endian), it.p_vaddr(endian), it.p_filesz(endian), it.p_memsz(endian)))
+        .map(|it| (it.p_flags(endian).0, it.p_offset(endian), it.p_vaddr(endian), it.p_filesz(endian), it.p_memsz(endian)))
         .collect()
 }
 
@@ -1628,7 +1628,7 @@ fn dynamic_entries(bytes: &[u8]) -> Vec<(u64, u64)> {
     let file = ElfFile64::<Endianness>::parse(bytes).unwrap();
     let endian = file.endian();
     let dynamic = file.elf_program_headers().iter().find_map(|it| it.dynamic(endian, bytes).unwrap()).unwrap();
-    dynamic.iter().map(|it| (it.d_tag(endian), it.d_val(endian))).collect()
+    dynamic.iter().map(|it| (it.d_tag(endian).0 as u64, it.d_val(endian))).collect()
 }
 
 /// The error `Writer::file` gives for the image, its synthetic regions made first.
@@ -1705,23 +1705,23 @@ fn a_dev_executable_is_laid_out_for_its_start_hook() {
     assert_eq!(shdr.sh_entsize(endian), 8);
     assert_eq!(bytes[preinit as usize..][..8], text.to_le_bytes(), "the start hook's pointer is first");
     let entries = dynamic_entries(&bytes);
-    let tag = |tag: u32| entries.iter().find(|it| it.0 == u64::from(tag)).map(|it| it.1);
+    let tag = |tag: elf::DynamicTag| entries.iter().find(|it| it.0 == tag.0 as u64).map(|it| it.1);
     assert_eq!((tag(elf::DT_PREINIT_ARRAY), tag(elf::DT_PREINIT_ARRAYSZ)), (Some(preinit), Some(16)));
     assert_eq!(tag(elf::DT_INIT_ARRAY), Some(init));
-    assert_ne!(tag(elf::DT_FLAGS).unwrap() & u64::from(elf::DF_BIND_NOW), 0);
-    assert_ne!(tag(elf::DT_FLAGS_1).unwrap() & u64::from(elf::DF_1_NOW), 0);
+    assert_ne!(tag(elf::DT_FLAGS).unwrap() & elf::DF_BIND_NOW.0, 0);
+    assert_ne!(tag(elf::DT_FLAGS_1).unwrap() & elf::DF_1_NOW.0, 0);
     for lazy in [elf::DT_JMPREL, elf::DT_PLTREL, elf::DT_PLTRELSZ, elf::DT_TEXTREL] {
         assert_eq!(tag(lazy), None, "nothing is bound lazily or written in code: tag {lazy}");
     }
-    assert_eq!(tag(elf::DT_FLAGS).unwrap() & u64::from(elf::DF_TEXTREL), 0);
+    assert_eq!(tag(elf::DT_FLAGS).unwrap() & elf::DF_TEXTREL.0, 0);
 
     // The segments.
     let loads = loads(&bytes);
     assert_eq!(loads.iter().map(|it| it.0).collect::<Vec<_>>(), [4, 5, 6, 6, 0, 0, 0]);
-    let code: Vec<_> = loads.iter().filter(|it| it.0 & elf::PF_X != 0).collect();
+    let code: Vec<_> = loads.iter().filter(|it| it.0 & elf::PF_X.0 != 0).collect();
     assert_eq!(code.len(), 1);
     for &&(flags, offset, vaddr, filesz, memsz) in &code {
-        assert_eq!(flags & elf::PF_W, 0, "code is never writable");
+        assert_eq!(flags & elf::PF_W.0, 0, "code is never writable");
         assert_eq!((offset % page, vaddr % page), (0, 0), "code starts on a page in the file and in memory");
         assert_eq!(offset, vaddr);
         assert_eq!(filesz, memsz, "code is all file bytes");
@@ -1744,7 +1744,7 @@ fn a_dev_executable_is_laid_out_for_its_start_hook() {
     assert!(reserved.is_sorted_by_key(|it| it.start));
     for (name, size) in [&b".blaze.reserve.arena"[..], b".blaze.reserve.cells", b".blaze.reserve.fixed"].into_iter().zip(sizes) {
         let (_, shdr) = sections.section_by_name(endian, name).unwrap();
-        assert_eq!((shdr.sh_type(endian), shdr.sh_flags(endian), shdr.sh_size(endian)), (elf::SHT_NOBITS, 0, size));
+        assert_eq!((shdr.sh_type(endian), shdr.sh_flags(endian).0, shdr.sh_size(endian)), (elf::SHT_NOBITS, 0, size));
     }
 
     // What the start hook reads of the same bytes.
@@ -1775,13 +1775,13 @@ fn an_image_without_a_dev_run_keeps_its_layout() {
     let bytes = image.link();
     assert_eq!(loads(&bytes).iter().map(|it| it.0).collect::<Vec<_>>(), [4, 5, 6, 6]);
     let entries = dynamic_entries(&bytes);
-    let tag = |tag: u32| entries.iter().find(|it| it.0 == u64::from(tag)).map(|it| it.1);
+    let tag = |tag: elf::DynamicTag| entries.iter().find(|it| it.0 == tag.0 as u64).map(|it| it.1);
     assert_eq!((tag(elf::DT_PREINIT_ARRAY), tag(elf::DT_PREINIT_ARRAYSZ)), (Some(preinit), Some(8)));
     let file = ElfFile64::<Endianness>::parse(&bytes[..]).unwrap();
     let endian = file.endian();
     let (_, shdr) = file.elf_section_table().section_by_name(endian, b".preinit_array").unwrap();
     assert_eq!(shdr.sh_type(endian), elf::SHT_PREINIT_ARRAY);
-    assert_eq!(shdr.sh_flags(endian), u64::from(elf::SHF_ALLOC | elf::SHF_WRITE));
+    assert_eq!(shdr.sh_flags(endian), elf::SHF_ALLOC | elf::SHF_WRITE);
 
     let pieces = [(Class::Text, 16, 16), (Class::Reserve(Reserve::Arena), 0x1000, 0x1000)];
     let mut image = Fixture::new(executable(), &pieces, &Counts::default());

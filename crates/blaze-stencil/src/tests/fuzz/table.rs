@@ -129,6 +129,8 @@ fn allowed(isa: Isa, op: Op, ty: Ty) -> bool {
         Op::VhighBits => x64 || !matches!(ty, Ty::F32x4 | Ty::F64x2),
         Op::FcvtToUintSat | Op::FcvtToSintSat => !(x64 && matches!(ty, Ty::I8 | Ty::I16 | Ty::I64x2)),
         Op::FcvtFromUint | Op::FcvtFromSint => !(x64 && ty == Ty::F64x2),
+        // x64's `bitcast_gpr_to_xmm`, which lowers it from a GPR, has no 8-bit rule.
+        Op::ScalarToVector => !(x64 && ty == Ty::I8x16),
         _ => true,
     }
 }

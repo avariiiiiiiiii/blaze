@@ -51,7 +51,20 @@ fn job(views: Vec<Opened>) -> Job<Real> {
         fresh: 0,
         compiled: 0,
         served: Vec::new(),
+        links: Vec::new(),
     }
+}
+
+/// A request patched in place is one whose every link was spliced: a first link, or one that
+/// laid out a kept image whole again, makes it placed.
+#[test]
+fn work_is_placed_whole_when_any_link_was() {
+    use crate::serve::work::Full;
+    let link = |how| ("/w/target/debug/app".to_owned(), how);
+    assert_eq!(link_kind(&[]), LinkKind::Patched);
+    assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::Spliced)]), LinkKind::Patched);
+    assert_eq!(link_kind(&[link(Linking::Spliced), link(Linking::First)]), LinkKind::Placed);
+    assert_eq!(link_kind(&[link(Linking::Full(Full::NotIncremental))]), LinkKind::Placed);
 }
 
 #[test]

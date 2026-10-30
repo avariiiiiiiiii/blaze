@@ -1108,8 +1108,7 @@ fn produce(
     use super::backend::{Optimization, Passes, Selection};
     let optimization = Optimization { passes: Passes::Aggressive, selection: Selection::Optimized };
     let code = super::llvm::emit(recorder, named, func, optimization, weights, &[])
-        // alloc: the error's message
-        .map_err(|why| CodegenError::Unsupported(format!("LLVM has no code for it: {why}")))?;
+        .map_err(CodegenError::LlvmRefused)?;
     super::backend::pad(code)
 }
 

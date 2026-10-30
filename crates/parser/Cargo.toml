@@ -22,10 +22,10 @@ smallvec.workspace = true
 tracing.workspace = true
 
 edition.workspace = true
-winnow = { version = "0.7.13", default-features = false }
+winnow.workspace = true
 
 [dev-dependencies]
-expect-test = "1.5.1"
+expect-test.workspace = true
 
 blaze-alloc-count.workspace = true
 hegeltest.workspace = true

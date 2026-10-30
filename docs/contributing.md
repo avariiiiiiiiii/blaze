@@ -117,9 +117,9 @@ one file; everything else reads it or is written from it:
   line and its rust-lang/rust commit. A rustc is taken for the pinned one by that whole line,
   since every nightly of a release has the same number.
 - What mirrors rustc, all from that commit: `crates/rustc_abi` (rustc's `compiler/rustc_abi`),
-  `crates/proc-macro-srv` (blaze's proc-macro server, over the nightly's `proc_macro` bridge,
-  which it follows by hand, and its `RUSTC_VERSION_STRING`), the answers to rustc's questions
-  (`crates/blaze-units/src/stdlib/rustc.json`), and the code written by hand to agree with rustc:
+  `crates/blaze-macro-eval` (blaze's proc-macro server, which speaks the pinned
+  `library/proc_macro` bridge's protocol by hand and checks it at load), the answers to rustc's
+  questions (`crates/blaze-units/src/stdlib/rustc.json`), and the code written by hand to agree with rustc:
   the Rust ABI in the code generator, `vtable.rs`, `type_id.rs`, symbol names (v0) in
   `symbols.rs`, the intrinsics and lang items, the test harness's call into libtest.
 - `install.sh`'s `TOOLCHAIN`, the flake (`rust-bin.nightly.<date>`, for the dev shells and the

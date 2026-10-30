@@ -825,10 +825,11 @@ fn a_manifest_round_trips_and_every_part_of_it_is_signed() {
             assert!(it.verify(&trust()).is_err(), "byte {at}");
         }
     }
-    let mut huge = bytes[..132].to_vec();
+    let head = bytes.len() - 4 - crate::sign::RECORD_LEN * manifest.entries.len();
+    let mut huge = bytes[..head].to_vec();
     huge.extend_from_slice(&u32::MAX.to_le_bytes());
     assert!(Manifest::decode(&mut Reader::new(&huge)).unwrap_err().contains("more than"));
-    let mut many = bytes[..132].to_vec();
+    let mut many = bytes[..head].to_vec();
     many.extend_from_slice(&1000u32.to_le_bytes());
     assert!(Manifest::decode(&mut Reader::new(&many)).unwrap_err().contains("truncated"));
     let other = Manifest::sign(manifest.id, Vec::new(), &publisher(2));

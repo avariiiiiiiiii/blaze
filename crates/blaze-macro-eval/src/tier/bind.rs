@@ -293,7 +293,7 @@ mod tests {
             assert_eq!(external(pure, Use::Call, &Run), Ok(Binding::Pure), "{pure}");
         }
         for writes in ["frexp", "modf", "lgamma_r", "sincos", "lgamma"] {
-            assert!(external(writes, Use::Call, &Run).is_err(), "{writes} writes memory");
+            assert_eq!(external(writes, Use::Call, &Run), Ok(Binding::Unshimmed), "{writes} writes memory");
         }
         assert!(external("sin", Use::Address, &Run).is_err(), "a function's address is a call's");
     }

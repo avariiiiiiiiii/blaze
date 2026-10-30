@@ -59,9 +59,7 @@ The installer downloads the build for your machine from the
 [releases](https://github.com/indexable-inc/blaze/releases), checks it against the checksums
 published with it, puts `blaze` and the programs it runs in `~/.cargo/bin`, and
 runs `blaze toolchain` to download its Rust, a command v2's blaze does not have, so on v2 this
-step fails. It asks nothing. On Linux the build has `blaze-proc-macro-srv` too,
-blaze's own proc-macro server, which a build from crates.io (below) does not have. Run it again
-to upgrade. Releases are dated, `0.YYYYMMDD.N`, and come in two channels
+step fails. It asks nothing. Run it again to upgrade. Releases are dated, `0.YYYYMMDD.N`, and come in two channels
 ([release.md](release.md)): **stable**, the default, is releases that passed the heavy tests
 (real projects on macOS and Linux), and **canary** is the newest release, published as soon as
 it is built and promoted to stable, unchanged, once it passes them. End the line with

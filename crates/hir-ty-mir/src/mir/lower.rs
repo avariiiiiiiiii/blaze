@@ -3248,9 +3248,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     /// than 0, and for a signed one other than -1 unless the dividend is a constant other than
     /// the type's minimum. A `const { .. }` block is not evaluated to tell.
     fn division_promotable(&self, lhs: ExprId, rhs: ExprId) -> bool {
-        let (signed, bits) = match self.expr_ty_without_adjust(lhs).kind() {
-            TyKind::Int(it) => (true, it.bit_width()),
-            TyKind::Uint(it) => (false, it.bit_width()),
+        let ty = self.expr_ty_without_adjust(lhs);
+        let signed = match ty.kind() {
+            TyKind::Int(_) => true,
+            TyKind::Uint(_) => false,
             _ => return true,
         };
         let literal = |expr: ExprId| match self.store.expr(expr) {
@@ -3266,8 +3267,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         match literal(rhs) {
             None | Some(0) => false,
             Some(-1) if signed => {
-                let bits = bits.unwrap_or(64);
-                let min = -(1i128 << (bits - 1));
+                let bits = ty.primitive_size(self.interner()).bits();
+                let min = i128::MIN >> (128 - bits);
                 literal(lhs).is_some_and(|it| it != min)
             }
             Some(_) => true,

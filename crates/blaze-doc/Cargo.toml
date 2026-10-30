@@ -14,7 +14,6 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-anyhow.workspace = true
 base-db.workspace = true
 either.workspace = true
 hir.workspace = true
@@ -22,7 +21,8 @@ hir-def.workspace = true
 hir-expand.workspace = true
 intern.workspace = true
 parser.workspace = true
-pulldown-cmark.workspace = true
+# `html`: `push_html`; `simd`: its escaping with SSE where the target has it.
+pulldown-cmark = { workspace = true, features = ["html", "simd"] }
 rayon.workspace = true
 rustc-hash.workspace = true
 serde_json.workspace = true

@@ -122,14 +122,20 @@ pub fn db_with_proc_macros(
     build(fixture, extra)
 }
 
-/// The crate a fixture is about: the first crate of the graph that is not a language crate
-/// (`ra_test_fixture` for a fixture that names no crate).
+/// The crate a fixture is about: the first crate of the graph that is neither a language crate
+/// nor a dependency of another (`ra_test_fixture` for a fixture that names no crate). The graph
+/// lists a crate's dependencies before it, so the first that is not a language crate would be
+/// a dependency: `proc_macros`, or `foo` of `crate:main deps:foo`.
 pub fn test_crate(db: &Db) -> Crate {
-    all_crates(db)
+    let all = all_crates(db);
+    let depended_on: FxHashSet<Crate> = all
         .iter()
+        .flat_map(|krate| krate.data(db).dependencies.iter().map(|dep| dep.crate_id))
+        .collect();
+    all.iter()
         .copied()
-        .find(|&krate| !krate.data(db).origin.is_lang())
-        .expect("the fixture has a crate that is not a language crate")
+        .find(|&krate| !krate.data(db).origin.is_lang() && !depended_on.contains(&krate))
+        .expect("the fixture has a crate that is neither a language crate nor a dependency")
 }
 
 impl Fixture {
@@ -470,6 +476,10 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         }
         for (from, to, prelude) in deps {
             let from_id = by_name[&from];
+            // `deps:core` beside `//- minicore:` names minicore's, a dependency of every crate.
+            if core.is_some() && to.as_str() == "core" && !by_name.contains_key(&to) {
+                continue;
+            }
             let Some(&to_id) = by_name.get(&to) else {
                 panic!("crate `{from}` depends on `{to}`, which the fixture has no crate of")
             };

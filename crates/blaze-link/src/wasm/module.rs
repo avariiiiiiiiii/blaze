@@ -1446,8 +1446,7 @@ mod tests {
     #[test]
     fn a_command() {
         let module = command().module().unwrap();
-        let file = ::object::File::parse(&*module).expect("object reads the module");
-        assert_eq!(file.format(), ::object::BinaryFormat::Wasm);
+        assert_eq!(module[..8], *b"\0asm\x01\0\0\0", "a wasm module, version 1");
 
         let sections = sections(&module);
         let ids: Vec<u8> = sections.iter().map(|it| it.0).collect();

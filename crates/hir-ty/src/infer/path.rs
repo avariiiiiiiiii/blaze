@@ -9,7 +9,6 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 use rustc_type_ir::inherent::{SliceLike, Ty as _};
-use stdx::never;
 
 use crate::{
     db::HirDatabase,
@@ -84,10 +83,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             ValueNs::LocalBinding(pat) => {
                 return match self.result.type_of_binding.get(pat) {
                     Some(ty) => Some(ValuePathResolution::NonGeneric(ty.as_ref())),
-                    None => {
-                        never!("uninferred pattern?");
-                        None
-                    }
+                    None => unreachable!("no type for local variable {pat:?}"),
                 };
             }
             ValueNs::ImplSelf(impl_id) => {
@@ -423,8 +419,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 )
             }
             ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => {
-                never!("assoc item contained in module/extern block");
-                return None;
+                unreachable!("assoc item contained in module/extern block")
             }
         };
 

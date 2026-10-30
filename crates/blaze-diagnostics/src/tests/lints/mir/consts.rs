@@ -4,7 +4,6 @@
 use crate::{
     Options,
     emit::Style,
-    lower::mutable_ref_binding::BUILT_ON,
     tests::{Mode, checked, checked_with, compiletest, items::ui_core, normalized, ui},
 };
 
@@ -392,7 +391,7 @@ error: aborting due to 6 previous errors
 
 For more information about this error, try `rustc --explain E0658`.
 "#;
-    assert_eq!(dated(ui_core("issue-90870.rs", "2015", "eq, slice", source)), stderr);
+    assert_eq!(ui_core("issue-90870.rs", "2015", "eq, slice", source), stderr);
 }
 
 #[test]
@@ -600,15 +599,10 @@ error: aborting due to 8 previous errors
 For more information about this error, try `rustc --explain E0658`.
 "#;
     let fixture = format!(
-        "//- /const-unstable-intrinsic.rs crate:main deps:unstable_intrinsic edition:2015\n{source}\
+        "//- /const-unstable-intrinsic.rs crate:other:main deps:unstable_intrinsic edition:2015\n{source}\
          //- /auxiliary/unstable_intrinsic.rs crate:unstable_intrinsic library edition:2015\n{aux}"
     );
-    assert_eq!(dated(ui_fixture(&fixture)), stderr);
-}
-
-/// rustc writes the date it was built on as `YYYY-MM-DD` under `-Z ui-testing`.
-fn dated(stderr: String) -> String {
-    stderr.replace(&format!("was built on {BUILT_ON};"), "was built on YYYY-MM-DD;")
+    assert_eq!(ui_fixture(&fixture), stderr);
 }
 
 /// The `.stderr` of a fixture whose workspace crate is the UI test and whose `library` crates
@@ -639,7 +633,7 @@ fn lints(fixture: &str) -> Vec<String> {
 
 #[test]
 fn an_impure_const_fn_is_told_where_cached_functions_are_used() {
-    let fixture = format!("//- /main.rs crate:main deps:blaze\n{IMPURE}\n//- /blaze.rs crate:blaze\n");
+    let fixture = format!("//- /main.rs crate:other:main deps:blaze\n{IMPURE}\n//- /blaze.rs crate:blaze\n");
     assert_eq!(lints(&fixture), [
         "blaze::const_impure: const fn reads or writes mutable state: `COUNT` is a `static mut`"
     ]);
@@ -647,6 +641,6 @@ fn an_impure_const_fn_is_told_where_cached_functions_are_used() {
 
 #[test]
 fn an_impure_const_fn_is_not_told_where_rustc_would_not() {
-    let fixture = format!("//- /main.rs crate:main\n{IMPURE}");
+    let fixture = format!("//- /main.rs crate:other:main\n{IMPURE}");
     assert_eq!(lints(&fixture), Vec::<String>::new());
 }

@@ -200,6 +200,38 @@ pub enum Outcome {
     Restart { generation: u64, why: String },
     /// The message could not be taken, for this reason; the program runs on as it was.
     Declined { generation: u64, why: String },
+    /// What became of a message or a panic, which the linker was not told: writing the answer
+    /// at `path` failed with `error`.
+    Unanswered { outcome: Box<Outcome>, path: PathBuf, error: std::io::ErrorKind },
+    /// The thread watching the directory stopped, for this reason: no message comes after it.
+    Unwatched { generation: u64, why: Unwatched },
+}
+
+/// Why the thread watching the directory for messages stopped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unwatched {
+    /// The directory was removed or moved away.
+    Gone,
+    /// The platform's `call` failed with the OS error `code`.
+    Failed { call: &'static str, code: i32 },
+}
+
+impl Unwatched {
+    /// `call`, which just failed, with the OS error it left.
+    pub(crate) fn failed(call: &'static str) -> Unwatched {
+        Unwatched::Failed { call, code: std::io::Error::last_os_error().raw_os_error().unwrap_or(0) }
+    }
+}
+
+impl fmt::Display for Unwatched {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unwatched::Gone => write!(f, "the directory patches come through was removed"),
+            Unwatched::Failed { call, code } => {
+                write!(f, "{call}: {}", std::io::Error::from_raw_os_error(*code))
+            }
+        }
+    }
 }
 
 impl fmt::Display for Outcome {
@@ -221,6 +253,12 @@ impl fmt::Display for Outcome {
             Outcome::Declined { generation, why } => {
                 write!(f, "generation {generation} not applied: {why}")
             }
+            Outcome::Unanswered { outcome, path, error } => {
+                write!(f, "{outcome}; answering in {}: {error}", path.display())
+            }
+            Outcome::Unwatched { generation, why } => {
+                write!(f, "no patch after generation {generation} is taken: {why}")
+            }
         }
     }
 }
@@ -236,6 +274,8 @@ pub(crate) struct Events {
     stop: AtomicBool,
     /// The thread of [`Live::apply_as_they_come`], woken at each event.
     waiter: OnceLock<Thread>,
+    /// Why the watching thread stopped, once it has.
+    lost: OnceLock<Unwatched>,
 }
 
 impl Events {
@@ -244,6 +284,12 @@ impl Events {
         if let Some(waiter) = self.waiter.get() {
             waiter.unpark();
         }
+    }
+
+    /// The watching thread stops for `why`, which [`Live::poll`] says next.
+    pub(crate) fn lose(&self, why: Unwatched) {
+        _ = self.lost.set(why);
+        self.tell();
     }
 
     pub(crate) fn stopped(&self) -> bool {
@@ -255,20 +301,20 @@ impl Events {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Identity {
     len: u64,
-    modified: Option<SystemTime>,
+    modified: SystemTime,
     /// The inode on Unix, the creation time on Windows.
     node: u64,
 }
 
 impl Identity {
-    fn of(meta: &Metadata) -> Identity {
+    fn of(meta: &Metadata) -> std::io::Result<Identity> {
         #[cfg(unix)]
         let node = std::os::unix::fs::MetadataExt::ino(meta);
         #[cfg(windows)]
         let node = std::os::windows::fs::MetadataExt::creation_time(meta);
         #[cfg(not(any(unix, windows)))]
         let node = 0;
-        Identity { len: meta.len(), modified: meta.modified().ok(), node }
+        Ok(Identity { len: meta.len(), modified: meta.modified()?, node })
     }
 }
 
@@ -291,14 +337,18 @@ impl Answers {
     }
 
     /// Writes `answer` in one write, then renames it over the last.
-    fn write(&mut self, answer: &Answer) {
+    fn write(&mut self, answer: &Answer) -> Result<(), std::io::ErrorKind> {
         self.bytes.clear();
         answer.encode_into(&mut self.bytes);
-        let written = std::fs::write(&self.partial, &self.bytes)
-            .and_then(|()| std::fs::rename(&self.partial, &self.path));
-        if let Err(error) = written {
-            eprintln!("blaze-live: answering in {}: {error}", self.path.display());
-        }
+        std::fs::write(&self.partial, &self.bytes)
+            .and_then(|()| std::fs::rename(&self.partial, &self.path))
+            .map_err(|it| it.kind())
+    }
+
+    /// `outcome`, whose answer could not be written for `error`.
+    fn unanswered(&self, outcome: Outcome, error: std::io::ErrorKind) -> Outcome {
+        // alloc: error path
+        Outcome::Unanswered { outcome: Box::new(outcome), path: self.path.clone(), error }
     }
 }
 
@@ -310,6 +360,8 @@ pub struct Live {
     events: Arc<Events>,
     /// The count of events and the generation when the program last looked for its message.
     looked: Option<(u64, u64)>,
+    /// Whether [`Outcome::Unwatched`] was said.
+    told_unwatched: bool,
     /// The files of the last messages taken, by generation: none is taken twice.
     taken: VecDeque<(u64, Identity)>,
     /// The bytes of the last message, its buffer kept for the next.
@@ -350,16 +402,6 @@ impl Live {
         let layout = Layout::new(&descriptor, at)?;
         let memory = os::Os::new(&layout)?;
         let dir = directory(&layout, &memory)?;
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let sampled = {
-            let (slide, image) = (layout.slide, memory.image());
-            crate::sample::Code {
-                slide,
-                image: image.start.wrapping_sub(slide)..image.end.wrapping_sub(slide),
-                // clone: setup, a Range<u64> of two words, once at start
-                patches: layout.code.clone(),
-            }
-        };
         let switch = Switch::new(memory, layout)?;
         let mut create = std::fs::DirBuilder::new();
         create.recursive(true);
@@ -369,9 +411,6 @@ impl Live {
         create.create(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
         // clone: setup, the directory handed once to `DIR`
         _ = crate::DIR.set(dir.clone());
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        // clone: setup, the directory handed once to the sampler's thread
-        crate::sample::start(dir.clone(), sampled);
         hook::install();
         // alloc: setup, the one `Events` the watcher's thread shares
         let events = Arc::new(Events::default());
@@ -388,6 +427,7 @@ impl Live {
             answers,
             events,
             looked: None,
+            told_unwatched: false,
             taken: VecDeque::with_capacity(KEPT),
             // alloc: grown to the largest message once, then reused for every message
             message: Vec::new(),
@@ -406,14 +446,15 @@ impl Live {
     /// between two frames. Code is only written here, never over code a thread can be in, so
     /// a function running on any thread when its patch lands finishes as it was. Data a patch
     /// changes in place (a static's new value) is written with plain stores, so no other
-    /// thread may use it while this runs. While nothing came it is one atomic load.
+    /// thread may use it while this runs. While nothing came it is one atomic load. Once the
+    /// thread watching for messages stops, the next call says why ([`Outcome::Unwatched`]).
     pub fn poll(&mut self) -> Option<Outcome> {
         let mut last = None;
         loop {
             let events = self.events.count.load(Ordering::Acquire);
             let generation = self.switch.current();
             if self.looked == Some((events, generation)) {
-                return last;
+                return last.or_else(|| self.unwatched(generation));
             }
             self.looked = Some((events, generation));
             if let Some(outcome) = self.next(generation) {
@@ -444,6 +485,16 @@ impl Live {
             .expect("spawning the thread that applies patches");
     }
 
+    /// Why the watching thread stopped, the first time it is asked after it did.
+    fn unwatched(&mut self, generation: u64) -> Option<Outcome> {
+        if self.told_unwatched {
+            return None;
+        }
+        let why = *self.events.lost.get()?;
+        self.told_unwatched = true;
+        Some(Outcome::Unwatched { generation, why })
+    }
+
     /// Takes the message for `generation`, if one came that wasn't taken.
     fn next(&mut self, generation: u64) -> Option<Outcome> {
         message_file_into(generation, &mut self.name);
@@ -467,7 +518,11 @@ impl Live {
             // alloc: error path
             Err(error) => return Some(self.unread(generation, path, &error.to_string())),
         };
-        let identity = Identity::of(&meta);
+        let identity = match Identity::of(&meta) {
+            Ok(identity) => identity,
+            // alloc: error path
+            Err(error) => return Some(self.unread(generation, path, &error.to_string())),
+        };
         if self.taken.contains(&(generation, identity)) {
             return None;
         }
@@ -498,8 +553,10 @@ impl Live {
                 )
             }
         };
-        if let Some(said) = &said {
-            self.answers.write(said);
+        if let Some(said) = &said
+            && let Err(error) = self.answers.write(said)
+        {
+            return Some(self.answers.unanswered(outcome, error));
         }
         Some(outcome)
     }
@@ -509,18 +566,32 @@ impl Live {
         // alloc: error path
         let why = format!("{}: {why}", path.display());
         // alloc: error path
-        self.answers.write(&Answer::Declined { generation, why: why.clone() });
-        Outcome::Declined { generation, why }
+        let answered = self.answers.write(&Answer::Declined { generation, why: why.clone() });
+        let outcome = Outcome::Declined { generation, why };
+        match answered {
+            Ok(()) => outcome,
+            Err(error) => self.answers.unanswered(outcome, error),
+        }
     }
 
     /// Runs `f`, such as one frame of the program, under `catch_unwind`. A panic with a frame
     /// in the code of a generation the program runs rolls the newest such generation back to
     /// the one it was applied on, is answered, and comes back as
     /// [`Outcome::RolledBack`]; any other panic is resumed as it was. What `f` changed before
-    /// it panicked stays changed: the guard is where the program says that is fine.
+    /// it panicked stays changed: the guard is where the program says that is fine. A
+    /// rollback whose answer could not be written comes back as [`Outcome::Unanswered`].
     pub fn guard<R>(&mut self, f: impl FnOnce() -> R) -> Result<R, Outcome> {
         let answers = &mut self.answers;
-        self.switch.guard(f, &mut |said| answers.write(said))
+        let mut unanswered = None;
+        let guarded = self.switch.guard(f, &mut |said| {
+            if let Err(error) = answers.write(said) {
+                unanswered = Some(error);
+            }
+        });
+        match (guarded, unanswered) {
+            (Err(outcome), Some(error)) => Err(self.answers.unanswered(outcome, error)),
+            (guarded, _) => guarded,
+        }
     }
 }
 

@@ -1227,8 +1227,13 @@ mod tests {
     #[test]
     fn what_is_not_referenced_is_refused() {
         let (function, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
+        // Relocations are in offset order: the static's at 1 comes before `memcpy`'s at 6.
         assert_eq!(
             Template::of(&function, &refs[..1], &[]).unwrap_err(),
+            TemplateError::NotReferenced(refs[1].clone())
+        );
+        assert_eq!(
+            Template::of(&function, &refs[..2], &[]).unwrap_err(),
             TemplateError::NotReferenced(refs[2].clone())
         );
         let template = Template::of(&function, &refs, &[]).unwrap();

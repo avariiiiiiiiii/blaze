@@ -3357,8 +3357,9 @@ impl GenericDef {
             .collect() // alloc: editor edge
     }
 
-    /// Every predicate of its own where clauses and parameter bounds, not its parent's (rustc's
-    /// `explicit_predicates_of`), in the order written.
+    /// Every predicate of its own where clauses and parameter bounds, not its parent's, in the
+    /// order written, then each type parameter's implicit `Sized` (rustc's
+    /// `explicit_predicates_of` has them too).
     pub fn where_predicates(self, db: &Db) -> Vec<WherePredicate<'_>> {
         let Some(id) = self.id() else {
             return Vec::new(); // alloc: empty
@@ -5160,11 +5161,17 @@ impl<'db> Type<'db> {
     }
 
     // FIXME: Find better API that also handles const generics
+    /// Whether the type implements `trait_` with `args` after `Self`; a parameter `args` leaves
+    /// out is an error, and a goal with an error never holds here, though the solver, as
+    /// rustc's, proves one (`consider_error_guaranteed_candidate`) to stop errors cascading.
     pub fn impls_trait(&self, db: &'db Db, trait_: Trait, args: &[Type<'db>]) -> bool {
         let env = self.param_env(db);
         let interner = DbInterner::new_no_crate(db);
         let (args, _owner) =
             generic_args_from_tys(interner, trait_.id.into(), iter::once(self).chain(args));
+        if args.references_error() {
+            return false;
+        }
         traits::implements_trait_unique_with_args(db, env, trait_.id, args)
     }
 

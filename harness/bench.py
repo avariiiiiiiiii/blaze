@@ -548,16 +548,47 @@ def memory_phase(rows, resident=None):
     return result
 
 
-def link_kind(text):
-    """How the builds in `text` reached the program: added to it, or linked again and why."""
-    links = re.findall(r"^link: \S+ \((.*)\)$", text, re.M)
-    if not links:
+def links(text):
+    """Each `link: <image> (<how>)` line in `text`, as (image, how)."""
+    return re.findall(r"^link: (\S+) \((.*)\)$", text, re.M)
+
+
+def link_kind(text, linked=frozenset()):
+    """How the builds in `text` reached the program: "spliced" when each link put what changed
+    into the image kept; "first link" when an image new to the build was laid out and the rest
+    were spliced; else "full link: <why>". `linked` holds the images linked before `text`: one
+    of them laid out as a first link lost the image kept, which is a full link too.
+
+    >>> link_kind("")
+    >>> link_kind("link: target/debug/app (spliced)\\n")
+    'spliced'
+    >>> link_kind("link: target/debug/app (first link)\\n")
+    'first link'
+    >>> link_kind("link: target/debug/app (first link)\\n", {"target/debug/app"})
+    'full link: target/debug/app was linked before and its image was not kept'
+    >>> link_kind("link: a (spliced)\\nlink: b (not spliced: the output changed: exports)\\n")
+    'full link: b: the output changed: exports'
+    >>> failed_link("full link: b: the output changed: exports"), failed_link("first link"), failed_link(None)
+    (True, False, False)
+    """
+    found = links(text)
+    if not found:
         return None
-    again = [l for l in links if not l.startswith("spliced")]
-    if not again:
+    for image, how in found:
+        if how.startswith("first link") and image in linked:
+            return f"full link: {image} was linked before and its image was not kept"
+        if not how.startswith(("spliced", "first link")):
+            why = re.search(r"not spliced: (.*)", how)
+            return f"full link: {image}" + (f": {why[1][:160]}" if why else f" ({how[:160]})")
+    if all(how.startswith("spliced") for _, how in found):
         return "spliced"
-    why = re.search(r"not spliced: (.*)", again[0])
-    return "full link" + (f": {why[1][:160]}" if why else "")
+    return "first link"
+
+
+def failed_link(kind):
+    """Whether an edit whose links were `kind` ([`link_kind`]) failed: one that laid an image
+    out whole again instead of splicing is a finding, never a time (AGENTS.md, no-fallback)."""
+    return kind is not None and kind.startswith("full link")
 
 
 def daemon_steps(text):
@@ -733,7 +764,16 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         if built != "daemon":
             # A build cargo did has the daemon load again; the next one is not timed against that.
             wait_warm(ours, ws)
-        return took, reference, built, others(), used, cargo_used
+        return took, reference, built, others(), used, cargo_used, mine.stderr
+
+    def edit_link(kind, step, said):
+        """How the build of an edit linked, from what it and the daemon `said`. One that laid an
+        image out whole again ends the project's run there, before the step is timed."""
+        link = link_kind(said, frozenset(linked))
+        if failed_link(link):
+            raise Failed(f"{name} {backend}: the {kind} {step} was not spliced: {link}")
+        linked.update(image for image, _ in links(said))
+        return link
 
     def runs_right(label):
         if run is None:
@@ -781,6 +821,8 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         daemon = Daemon(ours)
         took, warm, mine, used = cold_blaze(ours, "empty store", daemon)
         said, built, peak = daemon.said(), how_built(mine.stderr), daemon.peak_mb()
+        # The images this daemon has linked: each later link of one is an edit of it.
+        linked = {image for image, _ in links(said + mine.stderr)}
         reference, other, cargo_used = metered(theirs, build)
         if other.returncode != 0:
             raise Failed(f"{name} {backend}: the cargo build failed:\n{other.stderr[-3000:]}")
@@ -809,6 +851,8 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
 
     samples = [both() for _ in range(max(runs, 3))]
     said = daemon.said()
+    linked.update(image for s in samples for image, _ in links(s[6]))
+    linked.update(image for image, _ in links(said))
     held = daemon.resident_mb()
     resident["after"].append(dict(phase="no-op", builds=builds[0], mb=held))
     report("no-op", dict(memory=memory_phase([(s[4], s[5]) for s in samples], held), wall_s=round(statistics.median(s[0] for s in samples), 3), cargo_s=round(statistics.median(s[1] for s in samples), 3),
@@ -821,17 +865,19 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         made, back = [], []
         for turn in range(runs):
             places = write_edit(ws, changes, False)
-            took, reference, built, theirs_too, used, cargo_used = both()
+            took, reference, built, theirs_too, used, cargo_used, stderr = both()
             said = daemon.said(1 if built == "daemon" else 0)
-            made.append(dict(wall_s=took, cargo_s=reference, built=built, link=link_kind(said), compiled=compiled(said), steps_ms=daemon_steps(said),
+            link = edit_link(kind, "edit", said + stderr)
+            made.append(dict(wall_s=took, cargo_s=reference, built=built, link=link, compiled=compiled(said), steps_ms=daemon_steps(said),
                              threads_s=thread_steps(said), started_over=rounds(said), setups=theirs_too, used=used, cargo_used=cargo_used))
             if turn == 0:
                 runs_right(kind)
                 daemon.said()
             write_edit(ws, changes, True)
-            took, reference, built, *_ = both()
+            took, reference, built, *_, stderr = both()
             said = daemon.said(1 if built == "daemon" else 0)
-            back.append(dict(wall_s=took, cargo_s=reference, built=built, link=link_kind(said), compiled=compiled(said)))
+            link = edit_link(kind, "edit taken back", said + stderr)
+            back.append(dict(wall_s=took, cargo_s=reference, built=built, link=link, compiled=compiled(said)))
             # An edit the daemon turned down is one finding, not a time to take a median of,
             # and each has it load the workspace again.
             if made[-1]["built"] != "daemon":

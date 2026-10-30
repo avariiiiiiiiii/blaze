@@ -93,7 +93,7 @@ pub(crate) fn codegen_apply(kind: RelocKind, in_code: bool) -> Result<Apply, Str
 }
 
 fn error(what: String) -> LinkError {
-    LinkError { function: None, what }
+    LinkError { function: None, what, refusal: None }
 }
 
 pub(crate) struct Wasm {

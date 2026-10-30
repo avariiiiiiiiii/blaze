@@ -79,7 +79,14 @@ fn undefined(builder: &mut Builder<'_>, name: &str, weak: bool) -> SymbolId {
     })
 }
 
-fn relocate(builder: &mut Builder<'_>, section: SectionId, at: u64, symbol: SymbolId, addend: i64, r_type: u32) {
+fn relocate(
+    builder: &mut Builder<'_>,
+    section: SectionId,
+    at: u64,
+    symbol: SymbolId,
+    addend: i64,
+    r_type: elf::RelocationType,
+) {
     builder
         .add_relocation(section, Relocation {
             offset: at,
@@ -90,8 +97,12 @@ fn relocate(builder: &mut Builder<'_>, section: SectionId, at: u64, symbol: Symb
         .unwrap();
 }
 
-fn flags(builder: &mut Builder<'_>, section: SectionId, sh_flags: u32) {
-    builder.section_mut(section).flags = SectionFlags::Elf { sh_flags: u64::from(sh_flags) };
+/// Sets the `sh_flags` of `section`, keeping the `sh_type` its kind gives it.
+fn flags(builder: &mut Builder<'_>, section: SectionId, sh_flags: elf::SectionFlags) {
+    let SectionFlags::Elf { sh_flags: flags, .. } = builder.section_flags_mut(section) else {
+        panic!("a section with no ELF flags")
+    };
+    *flags = sh_flags;
 }
 
 fn section<'a>(object: &'a Object, name: &str) -> (u32, &'a Section) {
@@ -176,9 +187,9 @@ fn x86_64() -> Vec<u8> {
     let keep = b.add_section(Vec::new(), b".data.keep".to_vec(), Kind::Data);
     b.append_section_data(keep, &[1, 2, 3, 4], 4);
     flags(&mut b, keep, elf::SHF_ALLOC | elf::SHF_WRITE | elf::SHF_GNU_RETAIN);
-    let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), Kind::Elf(elf::SHT_X86_64_UNWIND));
+    let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), Kind::ReadOnlyData);
     b.append_section_data(eh_frame, &[0; 24], 8);
-    flags(&mut b, eh_frame, elf::SHF_ALLOC);
+    b.section_mut(eh_frame).flags = SectionFlags::Elf { sh_type: elf::SHT_X86_64_UNWIND, sh_flags: elf::SHF_ALLOC };
     let debug = b.add_section(Vec::new(), b".debug_info".to_vec(), Kind::Debug);
     b.append_section_data(debug, &[0; 16], 1);
 
@@ -353,7 +364,7 @@ fn reads_an_x86_64_object() {
             fixup(38, Apply::Rel32, got, 2),
             fixup(42, Apply::Abs32, size, 0),
             fixup(46, Apply::Abs32S, comm, 0),
-            fixup(50, Apply::Native(elf::R_X86_64_PC16), weak, 0),
+            fixup(50, Apply::Native(elf::R_X86_64_PC16.0), weak, 0),
             fixup(56, Apply::X86Branch32, weak, -4),
         ],
         false,
@@ -458,9 +469,9 @@ fn reads_an_aarch64_object() {
     let data = b.section_id(StandardSection::Data);
     b.append_section_data(data, &[0; 8], 8);
     let tbss = b.section_id(StandardSection::UninitializedTls);
-    let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), Kind::Elf(elf::SHT_PROGBITS));
+    let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), Kind::ReadOnlyData);
     b.append_section_data(eh_frame, &[0; 16], 8);
-    flags(&mut b, eh_frame, elf::SHF_ALLOC);
+    b.section_mut(eh_frame).flags = SectionFlags::Elf { sh_type: elf::SHT_PROGBITS, sh_flags: elf::SHF_ALLOC };
     let f = define(&mut b, "f", text, 0, 80, Type::Text, SymbolScope::Dynamic, false);
     let ext = undefined(&mut b, "ext", false);
     let var = define(&mut b, "var", data, 0, 8, Type::Data, SymbolScope::Dynamic, false);
@@ -536,8 +547,8 @@ fn reads_an_aarch64_object() {
             fixup(56, Apply::A64MovW { group: 1 }, var, 1),
             fixup(60, Apply::A64CondBr19, f, 1),
             fixup(64, Apply::A64TstBr14, f, 1),
-            fixup(68, Apply::Native(elf::R_AARCH64_LD_PREL_LO19), var, 1),
-            fixup(76, Apply::Native(elf::R_AARCH64_PREL16), var, 1),
+            fixup(68, Apply::Native(elf::R_AARCH64_LD_PREL_LO19.0), var, 1),
+            fixup(76, Apply::Native(elf::R_AARCH64_PREL16.0), var, 1),
         ],
         false,
     );
@@ -582,7 +593,7 @@ fn reads_an_aarch64_object() {
     assert_eq!(object.name(object.symbols.last().unwrap().name), "tvar");
 }
 
-fn with_text_relocation(r_type: u32) -> Vec<u8> {
+fn with_text_relocation(r_type: elf::RelocationType) -> Vec<u8> {
     let mut b = builder(Architecture::X86_64);
     let text = b.section_id(StandardSection::Text);
     b.append_section_data(text, &[0; 16], 16);
@@ -601,7 +612,7 @@ fn an_unknown_relocation_is_an_error() {
     let bytes = with_text_relocation(elf::R_X86_64_GOTPC32_TLSDESC);
     let message = error(read(Arch::X86_64, "bad.o", &bytes, &NativeKind::Object));
     assert!(message.contains("R_X86_64_GOTPC32_TLSDESC"), "{message}");
-    let bytes = with_text_relocation(250);
+    let bytes = with_text_relocation(elf::RelocationType(250));
     let message = error(read(Arch::X86_64, "bad.o", &bytes, &NativeKind::Object));
     assert!(message.contains("bad.o") && message.contains("(250)"), "{message}");
 }
@@ -613,12 +624,56 @@ fn an_ifunc_is_an_error() {
     b.append_section_data(text, &[0; 16], 16);
     let resolver = define(&mut b, "resolve_me", text, 0, 16, Type::Text, SymbolScope::Dynamic, false);
     b.symbol_mut(resolver).flags = SymbolFlags::Elf {
-        st_info: (elf::STB_GLOBAL << 4) | elf::STT_GNU_IFUNC,
-        st_other: elf::STV_DEFAULT,
+        st_info: elf::SymbolInfo::new(elf::STB_GLOBAL, elf::STT_GNU_IFUNC),
+        st_other: elf::STV_DEFAULT.into(),
     };
     let bytes = b.write().unwrap();
     let message = error(read(Arch::X86_64, "i.o", &bytes, &NativeKind::Object));
     assert!(message.contains("i.o") && message.contains("resolve_me"), "{message}");
+}
+
+#[test]
+fn a_symbol_of_a_type_elf_does_not_define_is_an_error() {
+    let mut b = builder(Architecture::X86_64);
+    let text = b.section_id(StandardSection::Text);
+    b.append_section_data(text, &[0; 16], 16);
+    let odd = define(&mut b, "odd_type", text, 0, 16, Type::Text, SymbolScope::Dynamic, false);
+    b.symbol_mut(odd).flags = SymbolFlags::Elf {
+        st_info: elf::SymbolInfo::new(elf::STB_GLOBAL, elf::SymbolType(11)),
+        st_other: elf::STV_DEFAULT.into(),
+    };
+    let bytes = b.write().unwrap();
+    let message = error(read(Arch::X86_64, "t.o", &bytes, &NativeKind::Object));
+    for part in ["t.o", "odd_type", "type 11"] {
+        assert!(message.contains(part), "{message}");
+    }
+}
+
+/// Sets the `sh_type` of section `name` of the ELF file `bytes`.
+fn set_sh_type(bytes: &mut [u8], name: &str, sh_type: u32) {
+    let at = {
+        let header = Header::parse(&*bytes).unwrap();
+        let sections = header.sections(ENDIAN, &*bytes).unwrap();
+        let index = sections
+            .iter()
+            .position(|it| sections.section_name(ENDIAN, it).unwrap() == name.as_bytes())
+            .unwrap_or_else(|| panic!("no section {name}"));
+        header.e_shoff(ENDIAN) as usize + index * size_of::<elf::SectionHeader64<Endianness>>() + 4
+    };
+    bytes[at..at + 4].copy_from_slice(&sh_type.to_le_bytes());
+}
+
+#[test]
+fn a_loaded_section_of_a_type_blaze_does_not_lay_out_is_an_error() {
+    let mut b = builder(Architecture::X86_64);
+    let data = b.section_id(StandardSection::Data);
+    b.append_section_data(data, &[1; 16], 8);
+    let mut bytes = b.write().unwrap();
+    set_sh_type(&mut bytes, ".data", elf::SHT_GNU_ATTRIBUTES.0);
+    let message = error(read(Arch::X86_64, "t.o", &bytes, &NativeKind::Object));
+    for part in ["t.o", ".data", "0x6ffffff5"] {
+        assert!(message.contains(part), "{message}");
+    }
 }
 
 #[test]
@@ -892,7 +947,7 @@ fn agrees(input: &[u8], object: &Object) {
         if let Some((relas, _)) = section.rela(ENDIAN, input).unwrap() {
             let target = section.sh_info(ENDIAN) as usize;
             if object.sections[target].what != SectionKind::Dropped {
-                relocations[target] += relas.iter().filter(|it| it.r_type(ENDIAN, false) != 0).count();
+                relocations[target] += relas.iter().filter(|it| it.r_type(ENDIAN, false).0 != 0).count();
             }
         }
     }
@@ -919,7 +974,7 @@ fn agrees(input: &[u8], object: &Object) {
     let mut next = 0;
     for section in sections.iter() {
         let Some((flag, members)) = section.group(ENDIAN, input).unwrap() else { continue };
-        if flag & elf::GRP_COMDAT == 0 {
+        if !flag.contains(elf::GRP_COMDAT) {
             continue;
         }
         let group = groups.next().expect("a group for each COMDAT group section");
@@ -929,7 +984,7 @@ fn agrees(input: &[u8], object: &Object) {
         assert_eq!(object.group_sections(group), &members[..]);
         let signature = &symtab.symbols()[section.sh_info(ENDIAN) as usize];
         let signature = if signature.st_type() == elf::STT_SECTION {
-            let at = SectionIndex(usize::from(signature.st_shndx(ENDIAN)));
+            let at = SectionIndex(usize::from(signature.st_shndx(ENDIAN).0));
             sections.section_name(ENDIAN, sections.section(at).unwrap()).unwrap()
         } else {
             symtab.symbol_name(ENDIAN, signature).unwrap()

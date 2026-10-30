@@ -202,8 +202,11 @@ impl<'a, 'db> Cx<'a, 'db> {
         (0..len).map(move |idx| {
             let fid = LocalFieldId::from_raw(idx.into());
             let ty = field_tys[fid].ty().instantiate(infcx.interner, args).skip_norm_wip();
-            let ty =
-                infcx.at(&ObligationCause::dummy(), env).deeply_normalize(ty).unwrap_or(ty);
+            // As rustc's `normalize_erasing_regions`: a body checked here has no type error.
+            let ty = infcx
+                .at(&ObligationCause::dummy(), env)
+                .deeply_normalize(ty)
+                .unwrap_or_else(|_| panic!("failed to normalize field {fid:?} of {variant:?}: {ty:?}"));
             (fid, ty)
         })
     }

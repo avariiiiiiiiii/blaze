@@ -23,7 +23,7 @@ use hir_ty::{
     next_solver::{DbInterner, GenericArgs, ParamEnv, Region, RegionExt, Ty, TyKind},
 };
 use hir_ty_mir::mir::{MirOptions, overflow::crate_checks_overflow};
-use hir_ty_share::{BodyOptions, OptionsSet, ShareDef, ShareInstance};
+use hir_ty_share::{BodyOptions, OptionsSet, ShareDef, ShareInstance, Unshared};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{
     BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike as _,
@@ -375,10 +375,11 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// A generic's arguments as its code reads them, compiled as `origin` asks: its share key
-    /// under every options a unit of `origin` builds a body with, or, for an instance with
-    /// none, its arguments' content ID ([`args_of`]). Both give exact code; the reason it has
-    /// no key says why it is per instance. A generic callee is of its caller's origin, so its
-    /// key here is the one its caller's key holds.
+    /// under every options a unit of `origin` builds a body with, or, for an instance that is
+    /// per instance by what it is ([`per_instance`]), its arguments' content ID
+    /// ([`args_of`]). Both give exact code. A key that can't be made for any other reason is
+    /// an error: the instance is never compiled per instance in its place. A generic callee is
+    /// of its caller's origin, so its key here is the one its caller's key holds.
     fn shared_args(&self, db: &Db, kind: &Kind, origin: &Origin) -> Result<ContentId, String> {
         let Kind::Code(instance, env) = kind else { return args_of(db, &self.hashes, kind) };
         let options = self.body_options(origin)?;
@@ -386,10 +387,9 @@ impl<'db> HirFrontend<'db> {
         let shared = ShareInstance { def: share_def(instance.def), args: instance.args.clone() };
         match hir_ty_share::share_key(db, &shared, env, options) {
             Ok(key) => Ok(Hasher::new(SHARED_ARGS_DOMAIN).id(&key.0).finish()),
-            Err(why) => {
-                tracing::debug!(?instance, %why, "compiled per instance");
-                args_of(db, &self.hashes, kind)
-            }
+            Err(why) if per_instance(why) => args_of(db, &self.hashes, kind),
+            // alloc: the error's message
+            Err(why) => Err(format!("no share key for {instance:?}: {why}")),
         }
     }
 
@@ -725,6 +725,24 @@ const ARGS_DOMAIN: &str = "blaze v2 args 1";
 /// A share key in place of the arguments: never equal to an [`ARGS_DOMAIN`] hash.
 const SHARED_ARGS_DOMAIN: &str = "blaze v2 shared args 1";
 
+/// Whether an instance with no share key for `why` is compiled for its arguments alone by
+/// what it is: one of a cycle (salsa's answer for all of it), a shim built without MIR, or a
+/// call of an intrinsic whose code is the instance's. Every other reason is something the key
+/// could not read (a layout, a constant, an intrinsic missing from the table), and an error.
+fn per_instance(why: &Unshared) -> bool {
+    match why {
+        Unshared::Recursive | Unshared::Shim(_) | Unshared::PerInstance(_) => true,
+        Unshared::UnknownIntrinsic(_)
+        | Unshared::NoOptions
+        | Unshared::NoMir(_)
+        | Unshared::NoLayout(_)
+        | Unshared::NoContent(_)
+        | Unshared::ConstEval(_)
+        | Unshared::Unhashable(_)
+        | Unshared::Shape(_) => false,
+    }
+}
+
 /// What an instance runs, as the share key names it.
 fn share_def(def: InstanceDef) -> ShareDef {
     match def {
@@ -940,5 +958,30 @@ pub(super) fn symbol_of(db: &Db, kind: &Kind) -> Option<String> {
         // alloc: one of the shim's few entries, once per program
         Kind::Allocator(forward) => Some(forward.symbol.to_owned()),
         Kind::Asm(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hir_ty_share::Unshared;
+
+    use super::per_instance;
+
+    /// An instance is compiled for its arguments alone only where it is per instance by what
+    /// it is; a key the walk could not make is an error, never a build per instance.
+    #[test]
+    fn only_what_is_per_instance_is_built_per_instance() {
+        assert!(per_instance(&Unshared::Recursive));
+        assert!(per_instance(&Unshared::Shim("drop glue")));
+        assert!(per_instance(&Unshared::PerInstance("size_of".to_owned())));
+        for refused in [
+            Unshared::UnknownIntrinsic("new_intrinsic".to_owned()),
+            Unshared::NoOptions,
+            Unshared::NoLayout("T".to_owned()),
+            Unshared::ConstEval("N".to_owned()),
+            Unshared::Shape("a union"),
+        ] {
+            assert!(!per_instance(&refused), "{refused}");
+        }
     }
 }

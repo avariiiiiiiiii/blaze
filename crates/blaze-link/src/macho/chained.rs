@@ -41,7 +41,7 @@ const NAME_BITS: u32 = 23;
 /// it knows (macOS 12, iOS, tvOS and Mac Catalyst 15, watchOS 8, DriverKit 21, every visionOS).
 /// Other platforms keep the rebase and bind opcodes, which every dyld reads.
 pub(super) fn chained(platform: &Platform) -> bool {
-    let from = match platform.platform {
+    let from = match macho::Platform(platform.platform) {
         macho::PLATFORM_MACOS => 0x000c_0000,
         macho::PLATFORM_IOS
         | macho::PLATFORM_IOSSIMULATOR

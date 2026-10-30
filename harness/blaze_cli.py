@@ -239,10 +239,9 @@ def alive(pid):
 def another_build(other):
     """Another build of blaze in `other`: the same files in another place have another
     version. It has what a release ships beside blaze, as `BLAZE`'s directory does (the Pack
-    step of blaze-platform.yaml): a load of a workspace with a proc macro fails without the
-    proc-macro server (`own_macro::find`)."""
+    step of blaze-platform.yaml)."""
     os.makedirs(other, exist_ok=True)
-    shipped = [it + EXE for it in ("blaze-engine", "blaze", "blaze-proc-macro-srv")]
+    shipped = [it + EXE for it in ("blaze-engine", "blaze")]
     for name in shipped:
         if os.path.exists(os.path.join(os.path.dirname(BLAZE), name)):
             shutil.copy(os.path.join(os.path.dirname(BLAZE), name), os.path.join(other, name))

@@ -4,7 +4,6 @@ use std::{
 };
 
 use blaze_units::stdlib::target;
-use sha2::Digest as _;
 
 use super::*;
 
@@ -72,10 +71,19 @@ fn probes_read() {
     assert_eq!((probe.extra_filename, &probe.cfg_flags[..]), ("-x", &[][..]));
     let rustix = ["--crate-type=rlib", "--emit=metadata", "-o", "/o/f", "-"];
     assert_eq!(Probe::of(&rustix).unwrap().name().unwrap(), "rust_out");
-    assert_eq!(Probe::of(&["--emit=metadata", "my-probe.rs"]).unwrap().name().unwrap(), "my_probe");
+    assert_eq!(Probe::of(&["--crate-type=lib", "--emit=metadata", "my-probe.rs"]).unwrap().name().unwrap(), "my_probe");
     // The lint flags are the check's, read from the whole command line.
-    assert!(Probe::of(&["-Dwarnings", "-A", "dead_code", "--check-cfg", "cfg(x)", "--emit=metadata", "-"]).is_ok());
-    assert!(Probe::of(&["--crate-type=bin", "--emit=metadata", "-"]).is_err());
+    assert!(
+        Probe::of(&["-Dwarnings", "-A", "dead_code", "--check-cfg", "cfg(x)", "--crate-type=lib", "--emit=metadata", "-"])
+            .is_ok()
+    );
+    let not_a_library = |asked: &[&str]| Probe::of(asked).unwrap_err().downcast::<Refused>().unwrap();
+    assert_eq!(
+        not_a_library(&["--crate-type=bin", "--emit=metadata", "-"]),
+        Refused::NotALibrary { crate_type: Some("bin".to_owned()) }
+    );
+    // rustc's crate is a binary unless told otherwise: blaze does not take it for a library.
+    assert_eq!(not_a_library(&["--emit=metadata", "-"]), Refused::NotALibrary { crate_type: None });
     assert!(Probe::of(&["--emit=link", "-"]).is_err());
     assert!(Probe::of(&["--crate-type=lib", "-"]).is_err());
     assert!(Probe::of(&["--extern", "a=b", "--emit=metadata", "-"]).is_err());
@@ -248,8 +256,7 @@ fn std_is_restricted_where_its_script_says() {
 #[test]
 fn std_script_is_the_ported_one() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/std/build.rs");
-    let got: String =
-        sha2::Sha256::digest(std::fs::read(path).unwrap()).iter().map(|it| format!("{it:02x}")).collect();
+    let got = blaze_format::hex::encode(&blaze_ids::b3::hash(&std::fs::read(path).unwrap()));
     assert_eq!(got, probe::STD_SCRIPT);
 }
 
@@ -258,5 +265,5 @@ fn unanswerable_is_an_error() {
     let refused = |asked: &[&str]| answer(&args(asked), b"", checkout).unwrap_err().to_string();
     assert_eq!(refused(&["--emit=metadata"]), "no input filename given");
     assert!(refused(&["--emit=link", "-"]).contains("--emit=link"));
-    assert!(refused(&["-Z", "no-such-option", "--emit=metadata", "-"]).contains("no-such-option"));
+    assert!(refused(&["-Z", "no-such-option", "--crate-type=lib", "--emit=metadata", "-"]).contains("no-such-option"));
 }

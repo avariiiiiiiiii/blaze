@@ -255,19 +255,68 @@ pub fn cargo(
     })
 }
 
+/// What blaze refuses of a command line cargo would take.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// More than one `--target`: a request to the daemon builds for one.
+    Targets(Vec<String>),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::Targets(given) => {
+                write!(f, "blaze builds for one `--target` a command, and was given {}:", given.len())?;
+                given.iter().try_for_each(|it| write!(f, " `{it}`"))
+            }
+        }
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// The six fields of `Targets` the flags say, and the whole command line.
-pub fn targets(asked: &Invocation, cargo: Cargo) -> Targets {
+pub fn targets(asked: &Invocation, cargo: Cargo) -> Result<Targets, Refused> {
     let flags = &asked.flags;
-    Targets {
+    let target = match &flags.targets[..] {
+        [] => None,
+        [one] => Some(one.clone()),
+        // alloc: error path, the refusal.
+        several => return Err(Refused::Targets(several.to_vec())),
+    };
+    Ok(Targets {
         packages: flags.packages.clone(),
         profile: asked.profile(),
-        target: flags.targets.first().cloned(),
+        target,
         features: flags.features.clone(),
         all_features: flags.all_features,
         no_default_features: flags.no_default_features,
         cargo: Some(cargo),
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod refusals {
+    use super::*;
+
+    #[test]
+    fn a_second_target_is_refused_not_dropped() {
+        let place = Place { cwd: "/w".into(), manifest: "/w/Cargo.toml".into(), root: "/w".into() };
+        let made = |asked: &Invocation| cargo(asked, &place, Vec::new(), Vec::new(), false, None).unwrap();
+        let mut asked = Invocation::default();
+        asked.flags.targets = vec!["aarch64-apple-darwin".to_owned(), "x86_64-unknown-linux-gnu".to_owned()];
+        let refused = targets(&asked, made(&asked)).unwrap_err();
+        assert_eq!(refused, Refused::Targets(asked.flags.targets.clone()));
+        assert_eq!(
+            refused.to_string(),
+            "blaze builds for one `--target` a command, and was given 2: `aarch64-apple-darwin` `x86_64-unknown-linux-gnu`"
+        );
+        asked.flags.targets.pop();
+        assert_eq!(targets(&asked, made(&asked)).unwrap().target.as_deref(), Some("aarch64-apple-darwin"));
+        asked.flags.targets.clear();
+        assert_eq!(targets(&asked, made(&asked)).unwrap().target, None);
+    }
+}

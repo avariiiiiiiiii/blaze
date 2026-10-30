@@ -829,7 +829,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     Field::Got
                 }
                 elf::R_X86_64_TLSGD => Field::TlsGd,
-                other => return Err(Unhandled::Relocation(other)),
+                other => return Err(Unhandled::Relocation(other.0)),
             },
             RelocationFlags::Coff { typ } => match typ {
                 // The numbered forms say how many bytes of the instruction follow the
@@ -841,7 +841,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                 | pe::IMAGE_REL_AMD64_REL32_4
                 | pe::IMAGE_REL_AMD64_REL32_5 => Field::Near,
                 pe::IMAGE_REL_AMD64_SECREL => Field::SectionOffset,
-                other => return Err(Unhandled::Relocation(other.into())),
+                other => return Err(Unhandled::Relocation(other.0.into())),
             },
             _ => return Err(Unhandled::Shape("an object of a format that is not read")),
         };
@@ -977,7 +977,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => Reloc::Aarch64Ld64GotLo12Nc,
                     macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => Reloc::MachOAarch64TlsAdrPage21,
                     macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => Reloc::MachOAarch64TlsAdrPageOff12,
-                    other => return Err(Unhandled::Relocation(other.into())),
+                    other => return Err(Unhandled::Relocation(other.0.into())),
                 },
                 RelocationFlags::Elf { r_type } => match r_type {
                     // A jump out of the function is a call that does not come back.
@@ -991,7 +991,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     | elf::R_AARCH64_LDST128_ABS_LO12_NC => {
                         // The low bits go in in units of what the load or store moves,
                         // which Cranelift has no kind for: it stands in as an `add`.
-                        self.elf_types.push((offset as u32, r_type));
+                        self.elf_types.push((offset as u32, r_type.0));
                         Reloc::Aarch64AddAbsLo12Nc
                     }
                     elf::R_AARCH64_ADR_GOT_PAGE => Reloc::Aarch64AdrGotPage21,
@@ -1000,7 +1000,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
                     elf::R_AARCH64_TLSDESC_LD64_LO12 => Reloc::Aarch64TlsDescLd64Lo12,
                     elf::R_AARCH64_TLSDESC_ADD_LO12 => Reloc::Aarch64TlsDescAddLo12,
                     elf::R_AARCH64_TLSDESC_CALL => Reloc::Aarch64TlsDescCall,
-                    other => return Err(Unhandled::Relocation(other)),
+                    other => return Err(Unhandled::Relocation(other.0)),
                 },
                 _ => return Err(Unhandled::Shape("an object of a format that is not read")),
             };

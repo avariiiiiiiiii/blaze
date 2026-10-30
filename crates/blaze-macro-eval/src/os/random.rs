@@ -46,7 +46,7 @@ impl<'a> Os<'a> {
         let mut at = 0;
         while at < len {
             let take = (len - at).min(chunk.len() as u64) as usize;
-            stdx::rand::fill(&mut chunk[..take]);
+            std::random::Rng::fill_bytes(&mut std::random::SystemRng, &mut chunk[..take]);
             g.write(buf + at, &chunk[..take])?;
             at += take as u64;
         }

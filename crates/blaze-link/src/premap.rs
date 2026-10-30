@@ -33,10 +33,10 @@ use rustc_hash::FxHashSet;
 
 use crate::arena::{FrameVec, collect_in};
 use crate::model::{self, Apply, Class, Fixup, Holds, Plan, Sym};
-use crate::stage::{Content, Stage, error};
+use crate::stage::{Content, Stage, error, refused};
 use crate::state::{self, State, What};
 use crate::symbols::{IdNo, SymKey, Symbols};
-use crate::{Change, Format, Image, LinkError, Native, Output, OutputKind};
+use crate::{Change, Format, Image, LinkError, Native, Output, OutputKind, Refusal};
 
 /// What the prelink links.
 pub struct Request<'a> {
@@ -837,8 +837,9 @@ impl<'a> Stage<'a> {
             }
         };
         if !self.full && self.old.laid_out && self.old.tls_at != at {
-            return Err(error(
+            return Err(refused(
                 None,
+                Refusal::TlsMoved,
                 "the image's thread-locals moved in the run's area (a thread-local of a larger alignment, or the \
                  first): link it from scratch",
             ));

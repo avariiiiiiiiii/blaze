@@ -40,7 +40,13 @@ use blaze_usercode::test::{
 use blaze_units::schema::{Mode, Unit};
 use blaze_lower::Db;
 
-use super::{Job, Real, UnitReader, UnitWriter, compile::TestOf, graph::flag, package_of};
+use super::{
+    Job, Real, UnitReader, UnitWriter,
+    compile::TestOf,
+    error::{UnitError, manifest_dir},
+    graph::flag,
+    package_of,
+};
 use crate::serve::work::{Failed, Runs, Selection};
 
 /// How long one test may run: libtest sets no limit, so a day, past which it is surely hung.
@@ -413,7 +419,13 @@ pub(crate) fn start(
     let config = &job.input.config;
     let mut suites = Vec::new();
     for artifact in built.iter().filter(|it| it.profile.test) {
-        let Some(program) = &artifact.executable else { continue };
+        let Some(program) = &artifact.executable else {
+            // A test unit always makes its binary; an artifact of no test unit has no tests.
+            if unit_of_artifact(job, artifact).is_some() {
+                return Err(UnitError::NoTestExecutable { target: artifact.target.name.clone() }.into());
+            }
+            continue;
+        };
         let Some(at) = unit_of_artifact(job, artifact) else {
             return Err(ApiError::new(format!("no test unit of `{}` is in the build", artifact.target.name), None));
         };
@@ -426,7 +438,7 @@ pub(crate) fn start(
             return Err(ApiError::new(format!("the test binary `{program}` was not compiled by this job"), None));
         };
         let suite = Suite { package: package.name.clone(), target: target_name(unit), context };
-        let manifest_dir = PathBuf::from(&package.manifest_path).parent().map(PathBuf::from).unwrap_or_default();
+        let manifest_dir = manifest_dir(&package.name, &package.manifest_path)?;
         let sandboxed = !job.sandbox_off() && package.tests_sandboxed(units.sandboxed_tests);
         let outside_why = if job.sandbox_off() {
             Some("`BLAZE_SANDBOX=off` is set")
@@ -591,8 +603,10 @@ impl TestRun {
             let kept = match kept {
                 Ok(it) => it,
                 Err(error) => {
-                    out.push(refused(format!("what test `{name}` read can't be told: {error}")));
-                    selector.keep(store, &subject, &blaze_testsel::Ran { passed, took, traced: None, record: &record })
+                    self.ok = false;
+                    suite.kept_all = false;
+                    out.push(refused(format!("what test `{name}` read can't be told, so how it ran can't be kept: {error}")));
+                    continue;
                 }
             };
             if let Err(error) = kept {
@@ -649,7 +663,12 @@ impl Runs<Real> for TestRun {
             let at = u32::try_from(at).expect("under 2^32 suites");
             let mut outside = suite.outside.take();
             let (tests, table) = listing(&job, suite.unit);
-            let Some(selector) = suite.selector.as_mut() else { continue };
+            let Some(selector) = suite.selector.as_mut() else {
+                self.ok = false;
+                let what = UnitError::NoSelector { binary: suite.name.clone() }.to_string();
+                out.push(Response::Diagnostic(super::say::refused(what, None, job.input.color)));
+                continue;
+            };
             for (n, test) in tests.iter().enumerate() {
                 let inside = suite.inside[n];
                 let binary = match (inside, &mut outside) {
@@ -697,7 +716,12 @@ impl Runs<Real> for TestRun {
                 self.suite_of.push(at);
             }
         }
-        let Some(dir) = FileName::new(&format!("tests/{:016x}", self.tags)) else { return self.end() };
+        let Some(dir) = FileName::new(&format!("tests/{:016x}", self.tags)) else {
+            self.ok = false;
+            let what = UnitError::TestDir { tags: self.tags }.to_string();
+            out.push(Response::Diagnostic(super::say::refused(what, None, self.job.input.color)));
+            return self.end();
+        };
         let config = Config {
             root: self.job.shared.state.clone(),
             dir,

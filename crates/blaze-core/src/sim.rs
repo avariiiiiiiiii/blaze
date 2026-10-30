@@ -224,6 +224,8 @@ struct Watching {
 enum Of {
     /// Nothing that ends first.
     Op,
+    /// A flush of the watch of this tag: its end is told after it.
+    Flush(Tag),
     /// A change or journal batch of the watch: dropped if the watch has ended by then.
     Change(Id<Watching>),
     /// The watch's end: it ends as this is delivered.
@@ -291,7 +293,7 @@ fn latency(rng: &mut Rng, faults: &Faults) -> Duration {
 /// `at`, or later: after everything told of `a` or `b`.
 fn after_told(told: &[Told], at: Duration, a: Tag, b: Tag) -> Duration {
     told.iter()
-        .filter(|it| it.completion.tag == a || it.completion.tag == b)
+        .filter(|it| it.completion.tag == a || it.completion.tag == b || matches!(it.of, Of::Flush(watch) if watch == a))
         .map(|it| it.at)
         .fold(at, Duration::max)
 }
@@ -908,7 +910,7 @@ impl Sim {
     fn deliver(&mut self, told: Told) -> Option<Completion> {
         let Told { completion, of, .. } = told;
         match of {
-            Of::Op => Some(completion),
+            Of::Op | Of::Flush(_) => Some(completion),
             Of::Change(watch) if self.watches.by_id(watch).is_some() => Some(completion),
             Of::Change(_) => {
                 self.stale += 1;
@@ -979,7 +981,7 @@ impl Driver for Sim {
                         true => Done::Flushed,
                     };
                     // Every change of the watch told by now is heard first.
-                    self.tell_after(watch, tag, done, Of::Op);
+                    self.tell_after(watch, tag, done, Of::Flush(watch));
                     continue;
                 }
                 Effect::Kill { tag } => {

@@ -17,7 +17,6 @@ doctest = false
 either.workspace = true
 rustc-hash.workspace = true
 smallvec.workspace = true
-triomphe.workspace = true
 rustc_abi.workspace = true
 rustc_type_ir.workspace = true
 base-db.workspace = true

@@ -101,10 +101,10 @@ fn decode_rebases(stream: &[u8], segments: &[u64]) -> Vec<u64> {
         let byte = stream[at];
         at += 1;
         let immediate = u64::from(byte & macho::REBASE_IMMEDIATE_MASK);
-        match byte & macho::REBASE_OPCODE_MASK {
+        match macho::RebaseOpcode(byte & macho::REBASE_OPCODE_MASK) {
             macho::REBASE_OPCODE_DONE => break,
             macho::REBASE_OPCODE_SET_TYPE_IMM => {
-                assert_eq!(immediate, u64::from(macho::REBASE_TYPE_POINTER))
+                assert_eq!(immediate, u64::from(macho::REBASE_TYPE_POINTER.0))
             }
             macho::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
                 address = segments[immediate as usize] + uleb(stream, &mut at);
@@ -137,7 +137,7 @@ fn decode_binds(stream: &[u8], segments: &[u64]) -> Vec<(u64, i64, Vec<u8>, u8, 
         let byte = stream[at];
         at += 1;
         let immediate = byte & macho::BIND_IMMEDIATE_MASK;
-        match byte & macho::BIND_OPCODE_MASK {
+        match macho::BindOpcode(byte & macho::BIND_OPCODE_MASK) {
             macho::BIND_OPCODE_DONE => break,
             macho::BIND_OPCODE_SET_DYLIB_ORDINAL_IMM => ordinal = i64::from(immediate),
             macho::BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB => ordinal = uleb(stream, &mut at) as i64,
@@ -362,7 +362,7 @@ fn binds_decode_to_the_imports() {
     ];
     let mut want: Vec<(u64, i64, Vec<u8>, u8, i64)> = (binds.iter())
         .map(|it| {
-            let flags = if it.weak { macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT } else { 0 };
+            let flags = if it.weak { macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT.0 } else { 0 };
             (it.addr, it.ordinal, it.name.to_vec(), flags, it.addend)
         })
         .collect();
@@ -542,11 +542,11 @@ fn link_sections_and_specials() {
     assert_eq!(super::classify("__LD", "__compact_unwind", 0x0200_0000).unwrap(), SectionKind::Unwind(super::compact_unwind()));
     assert_eq!(super::classify("__TEXT", "__eh_frame", 0x6800_000b).unwrap(), SectionKind::EhFrame);
     assert_eq!(super::classify("__DWARF", "__debug_info", 0x0200_0000).unwrap(), SectionKind::Dropped);
-    assert_eq!(super::classify("__TEXT", "__cstring", macho::S_CSTRING_LITERALS).unwrap(), SectionKind::Alloc(Class::Rodata, u32::MAX));
-    assert_eq!(super::classify("__DATA", "__common", macho::S_ZEROFILL).unwrap(), SectionKind::Alloc(Class::Bss, u32::MAX));
-    assert_eq!(super::classify("__DATA", "__thread_vars", macho::S_THREAD_LOCAL_VARIABLES).unwrap(), SectionKind::Alloc(Class::ThreadVars, u32::MAX));
-    assert_eq!(super::classify("__DATA", "__const", macho::S_REGULAR).unwrap(), SectionKind::Alloc(Class::RelRo, u32::MAX));
-    assert_eq!(super::classify("__DATA_CONST", "__const", macho::S_REGULAR).unwrap(), SectionKind::Alloc(Class::RelRo, u32::MAX));
+    assert_eq!(super::classify("__TEXT", "__cstring", macho::S_CSTRING_LITERALS.to_flags().0).unwrap(), SectionKind::Alloc(Class::Rodata, u32::MAX));
+    assert_eq!(super::classify("__DATA", "__common", macho::S_ZEROFILL.to_flags().0).unwrap(), SectionKind::Alloc(Class::Bss, u32::MAX));
+    assert_eq!(super::classify("__DATA", "__thread_vars", macho::S_THREAD_LOCAL_VARIABLES.to_flags().0).unwrap(), SectionKind::Alloc(Class::ThreadVars, u32::MAX));
+    assert_eq!(super::classify("__DATA", "__const", macho::S_REGULAR.to_flags().0).unwrap(), SectionKind::Alloc(Class::RelRo, u32::MAX));
+    assert_eq!(super::classify("__DATA_CONST", "__const", macho::S_REGULAR.to_flags().0).unwrap(), SectionKind::Alloc(Class::RelRo, u32::MAX));
 }
 
 /// What a test image is made of, owned, so a `Placed` can borrow it.
@@ -722,7 +722,7 @@ fn name16(bytes: &[u8; 16]) -> String {
 fn read(file: &[u8]) -> Read {
     use object::read::macho::LoadCommandVariant as V;
     let header = macho::MachHeader64::<LE>::parse(file, 0).expect("a Mach-O header");
-    let mut read = Read { flags: header.flags(LE), filetype: header.filetype(LE), ..Read::default() };
+    let mut read = Read { flags: header.flags(LE).0, filetype: header.filetype(LE).0, ..Read::default() };
     let mut commands = header.load_commands(LE, file, 0).unwrap();
     while let Some(command) = commands.next().unwrap() {
         match command.variant().unwrap() {
@@ -740,13 +740,13 @@ fn read(file: &[u8]) -> Read {
                         name16(section.sectname()),
                         section.addr(LE),
                         section.size(LE),
-                        section.flags(LE),
+                        section.flags(LE).0,
                     ));
                 }
             }
             V::Dylib(dylib) => {
                 let name = command.string(LE, dylib.dylib.name).unwrap();
-                read.dylibs.push((command.cmd(), String::from_utf8(name.to_vec()).unwrap()));
+                read.dylibs.push((command.cmd().0, String::from_utf8(name.to_vec()).unwrap()));
             }
             V::IdDylib(dylib) => {
                 let name = command.string(LE, dylib.dylib.name).unwrap();
@@ -757,8 +757,8 @@ fn read(file: &[u8]) -> Read {
                 read.dylinker = Some(String::from_utf8(name.to_vec()).unwrap());
             }
             V::Uuid(uuid) => read.uuid = Some(uuid.uuid),
-            V::BuildVersion(build) => {
-                read.build = Some((build.platform.get(LE), build.minos.get(LE), build.sdk.get(LE)))
+            V::BuildVersion(build, _) => {
+                read.build = Some((build.platform.get(LE).0, build.minos.get(LE).0, build.sdk.get(LE).0))
             }
             V::EntryPoint(entry) => read.entry = Some(entry.entryoff.get(LE)),
             V::DyldInfo(info) => {
@@ -836,8 +836,8 @@ fn executable_reads_back() {
     let file = written(&writer, &placed);
     let read = read(&file);
 
-    assert_eq!(read.filetype, macho::MH_EXECUTE);
-    for flag in [macho::MH_PIE, macho::MH_DYLDLINK, macho::MH_TWOLEVEL, macho::MH_HAS_TLV_DESCRIPTORS] {
+    assert_eq!(read.filetype, macho::MH_EXECUTE.0);
+    for flag in [macho::MH_PIE.0, macho::MH_DYLDLINK.0, macho::MH_TWOLEVEL.0, macho::MH_HAS_TLV_DESCRIPTORS.0] {
         assert_ne!(read.flags & flag, 0, "{flag:#x}");
     }
     let header = macho::MachHeader64::<LE>::parse(&*file, 0).unwrap();
@@ -879,15 +879,15 @@ fn executable_reads_back() {
     assert_eq!(
         flags[..9],
         [
-            macho::S_REGULAR,
-            macho::S_REGULAR,
-            macho::S_NON_LAZY_SYMBOL_POINTERS,
-            macho::S_MOD_INIT_FUNC_POINTERS,
-            macho::S_REGULAR,
-            macho::S_THREAD_LOCAL_VARIABLES,
-            macho::S_THREAD_LOCAL_REGULAR,
-            macho::S_THREAD_LOCAL_ZEROFILL,
-            macho::S_ZEROFILL,
+            macho::S_REGULAR.to_flags().0,
+            macho::S_REGULAR.to_flags().0,
+            macho::S_NON_LAZY_SYMBOL_POINTERS.to_flags().0,
+            macho::S_MOD_INIT_FUNC_POINTERS.to_flags().0,
+            macho::S_REGULAR.to_flags().0,
+            macho::S_THREAD_LOCAL_VARIABLES.to_flags().0,
+            macho::S_THREAD_LOCAL_REGULAR.to_flags().0,
+            macho::S_THREAD_LOCAL_ZEROFILL.to_flags().0,
+            macho::S_ZEROFILL.to_flags().0,
         ]
     );
     assert_eq!(&sections[9..], [("__DWARF", "__debug_line", linkedit.1 - 0x4000, 4), (
@@ -901,7 +901,7 @@ fn executable_reads_back() {
     assert_eq!(&file[(DATA - BASE) as usize..][..8], &TEXT.to_le_bytes());
 
     assert_eq!(read.dylinker.as_deref(), Some("/usr/lib/dyld"));
-    assert_eq!(read.dylibs, [(macho::LC_LOAD_DYLIB, "/usr/lib/libSystem.B.dylib".to_owned())]);
+    assert_eq!(read.dylibs, [(macho::LC_LOAD_DYLIB.0, "/usr/lib/libSystem.B.dylib".to_owned())]);
     assert_eq!(read.uuid, Some([7; 16]));
     assert_eq!(read.build, Some((1, OPCODES, 0x000f_0000)));
     assert_eq!((read.chained, read.exports_trie), (None, None), "macOS 11 has no chained fixups");
@@ -915,7 +915,7 @@ fn executable_reads_back() {
     let binds = decode_binds(range(&file, info[1]), &segments);
     assert_eq!(binds, [
         (GOT, 1, b"_free".to_vec(), 0, 0),
-        (DATA + 8, -2, b"_maybe".to_vec(), macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT, 0),
+        (DATA + 8, -2, b"_maybe".to_vec(), macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT.0, 0),
         (VARS, 1, b"__tlv_bootstrap".to_vec(), 0, 0),
     ]);
     assert_eq!((info[2].1, info[3].1), (0, 0));
@@ -927,15 +927,15 @@ fn executable_reads_back() {
     let symbols = symbols(&file, &read);
     assert_eq!(read.dysymtab.unwrap(), [1, 1, 2, 3, 3, 2]);
     assert_eq!(symbols[0].0, "__ZN5hello6helper17h0123456789abcdefE");
-    assert_eq!((symbols[0].1, symbols[0].2, symbols[0].4), (macho::N_SECT, 1, TEXT + 4));
+    assert_eq!((symbols[0].1, symbols[0].2, symbols[0].4), (macho::N_SECT.0, 1, TEXT + 4));
     assert_eq!(symbols[1].0, "__mh_execute_header");
-    assert_eq!(symbols[1].3, macho::REFERENCED_DYNAMICALLY);
-    assert_eq!((symbols[2].0.as_str(), symbols[2].1), ("_main", macho::N_SECT | macho::N_EXT));
+    assert_eq!(symbols[1].3, macho::REFERENCED_DYNAMICALLY.0);
+    assert_eq!((symbols[2].0.as_str(), symbols[2].1), ("_main", macho::N_SECT.0 | macho::N_EXT.0));
     assert_eq!((symbols[3].0.as_str(), symbols[3].3 >> 8), ("__tlv_bootstrap", 1));
     assert_eq!((symbols[4].0.as_str(), symbols[4].3 >> 8), ("_free", 1));
     assert_eq!(symbols[5].0, "_maybe");
-    assert_eq!(symbols[5].3 >> 8, u16::from(macho::DYNAMIC_LOOKUP_ORDINAL));
-    assert_ne!(symbols[5].3 & macho::N_WEAK_REF, 0);
+    assert_eq!(symbols[5].3 >> 8, u16::from(macho::DYNAMIC_LOOKUP_ORDINAL.0));
+    assert_ne!(symbols[5].3 & macho::N_WEAK_REF.0, 0);
     let indirect = range(&file, (read.indirect_at.unwrap(), 8));
     assert_eq!(indirect, [4, 0, 0, 0, 0, 0, 0, 0x80].as_slice(), "_free, then a local");
 
@@ -990,8 +990,8 @@ fn a_dylib_reads_back() {
     let placed = parts.placed(&slices);
     let file = written(&writer, &placed);
     let read = read(&file);
-    assert_eq!(read.filetype, macho::MH_DYLIB);
-    assert_eq!(read.flags & macho::MH_PIE, 0);
+    assert_eq!(read.filetype, macho::MH_DYLIB.0);
+    assert_eq!(read.flags & macho::MH_PIE.0, 0);
     assert_eq!(read.id.as_deref(), Some("@rpath/libhello.dylib"));
     assert_eq!(read.dylinker, None);
     assert_eq!(read.entry, None);
@@ -1011,10 +1011,10 @@ fn weak_dylib_when_every_import_is_weak() {
     parts.imports[0].weak = true;
     let writer = super::writer(&parts.output).unwrap();
     let file = written(&writer, &parts.placed(&parts.slices()));
-    assert_eq!(read(&file).dylibs, [(macho::LC_LOAD_DYLIB, "/usr/lib/libSystem.B.dylib".to_owned())]);
+    assert_eq!(read(&file).dylibs, [(macho::LC_LOAD_DYLIB.0, "/usr/lib/libSystem.B.dylib".to_owned())]);
     parts.imports[2].weak = true;
     let file = written(&writer, &parts.placed(&parts.slices()));
-    assert_eq!(read(&file).dylibs, [(macho::LC_LOAD_WEAK_DYLIB, "/usr/lib/libSystem.B.dylib".to_owned())]);
+    assert_eq!(read(&file).dylibs, [(macho::LC_LOAD_WEAK_DYLIB.0, "/usr/lib/libSystem.B.dylib".to_owned())]);
 }
 
 #[test]
@@ -1054,7 +1054,7 @@ fn reads_universal_slices() {
     for field in [macho::FAT_MAGIC, 2] {
         file.extend_from_slice(&field.to_be_bytes());
     }
-    for (cpu, offset) in [(macho::CPU_TYPE_X86_64, 64u32), (macho::CPU_TYPE_ARM64, 72)] {
+    for (cpu, offset) in [(macho::CPU_TYPE_X86_64.0, 64u32), (macho::CPU_TYPE_ARM64.0, 72)] {
         for field in [cpu, 0, offset, 8, 3] {
             file.extend_from_slice(&field.to_be_bytes());
         }
@@ -1064,7 +1064,7 @@ fn reads_universal_slices() {
     file.extend_from_slice(b"armslice");
     let machine = super::MachO {
         output: executable(Arch::Aarch64),
-        cpu: macho::CPU_TYPE_ARM64,
+        cpu: macho::CPU_TYPE_ARM64.0,
         subtype: 0,
         page: 0x4000,
         platform: Platform { platform: 1, minimum: 0, sdk: 0 },
@@ -1186,7 +1186,7 @@ fn universal_objects_name_bytes_of_the_whole_file() {
         fat.extend_from_slice(&field.to_be_bytes());
     }
     for (cpu, offset, size, align) in
-        [(macho::CPU_TYPE_X86_64, 0x1000, 8, 12), (macho::CPU_TYPE_ARM64, at, bytes.len() as u32, 14)]
+        [(macho::CPU_TYPE_X86_64.0, 0x1000, 8, 12), (macho::CPU_TYPE_ARM64.0, at, bytes.len() as u32, 14)]
     {
         for field in [cpu, 0, offset, size, align] {
             fat.extend_from_slice(&field.to_be_bytes());
@@ -1574,7 +1574,7 @@ fn locals_one_by_one(
         strings.extend_from_slice(prefix.as_bytes());
         strings.extend_from_slice(rest.as_bytes());
         strings.push(0);
-        nlist.push(macho::N_SECT);
+        nlist.push(macho::N_SECT.0);
         nlist.push(sect);
         nlist.extend_from_slice(&0u16.to_le_bytes());
         nlist.extend_from_slice(&addr.to_le_bytes());
@@ -1596,7 +1596,7 @@ fn the_locals_in_parallel_are_the_locals_one_by_one() {
     let sect = |addr: u64, _: &str| -> Result<u8, crate::LinkError> { Ok((addr % 7) as u8 + 1) };
     let failing = |addr: u64, name: &str| -> Result<u8, crate::LinkError> {
         if addr % 4099 == 4098 {
-            return Err(crate::LinkError { function: None, what: format!("{name} at {addr:#x}") });
+            return Err(crate::LinkError { function: None, what: format!("{name} at {addr:#x}"), refusal: None });
         }
         Ok(1)
     };
@@ -1710,7 +1710,7 @@ fn chained_fixups_slide_and_bind_what_the_opcodes_do() {
     let mut want: Vec<(u64, Fixup)> =
         decode_rebases(range(&old, info[0]), &segments).into_iter().map(|it| (it, Fixup::Rebase(held(it)))).collect();
     want.extend(decode_binds(range(&old, info[1]), &segments).into_iter().map(|(addr, ordinal, name, flags, addend)| {
-        (addr, Fixup::Bind(name, ordinal, flags & macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT != 0, addend))
+        (addr, Fixup::Bind(name, ordinal, flags & macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT.0 != 0, addend))
     }));
     want.sort_by_key(|it| it.0);
     assert_eq!(want.len(), 6);
@@ -1813,7 +1813,7 @@ fn segments_of(file: &[u8]) -> Vec<(String, u64, u64, u64, u64, u32, u32, u32)> 
     while let Some(command) = commands.next().unwrap() {
         if let V::Segment64(it, _) = command.variant().unwrap() {
             let name = name16(it.segname());
-            out.push((name, it.vmaddr(LE), it.vmsize(LE), it.fileoff(LE), it.filesize(LE), it.maxprot(LE), it.initprot(LE), it.nsects(LE)));
+            out.push((name, it.vmaddr(LE), it.vmsize(LE), it.fileoff(LE), it.filesize(LE), it.maxprot(LE).0, it.initprot(LE).0, it.nsects(LE)));
         }
     }
     out
@@ -1838,7 +1838,7 @@ fn a_dev_runs_start_hook_is_the_first_initializer() {
         assert_eq!(class, Class::InitArray, "{name}");
         assert!(rank < input, "{name}: the hook's rank {rank} sorts before {input}");
     }
-    for flags in [macho::S_MOD_INIT_FUNC_POINTERS, macho::S_REGULAR] {
+    for flags in [macho::S_MOD_INIT_FUNC_POINTERS.to_flags().0, macho::S_REGULAR.to_flags().0] {
         let kind = super::classify("__DATA", "__mod_init_func", flags).unwrap();
         let SectionKind::Alloc(Class::InitArray, input) = kind else { panic!("{kind:?}") };
         assert!(rank < input);
@@ -1873,13 +1873,13 @@ fn a_dev_runs_code_is_alone_on_its_pages_and_never_writable() {
     for minimum in [OPCODES, CHAINED] {
         let file = dev_file(minimum);
         let segments = segments_of(&file);
-        let code: Vec<_> = segments.iter().filter(|it| it.6 & macho::VM_PROT_EXECUTE != 0).collect();
+        let code: Vec<_> = segments.iter().filter(|it| it.6 & macho::VM_PROT_EXECUTE.0 != 0).collect();
         assert_eq!(code.len(), 1);
         for it in code {
             assert_eq!(it.0, "__TEXT");
             assert_eq!((it.1 % 0x4000, it.3 % 0x4000), (0, 0), "on a page in memory and in the file");
             assert_eq!(it.2, it.4, "all file bytes");
-            assert_eq!((it.5 | it.6) & macho::VM_PROT_WRITE, 0, "never writable, nor able to be made so");
+            assert_eq!((it.5 | it.6) & macho::VM_PROT_WRITE.0, 0, "never writable, nor able to be made so");
             for other in segments.iter().filter(|other| other.0 != it.0) {
                 let memory = other.2 != 0 && other.1 < it.1 + it.2 && it.1 < other.1 + other.2;
                 let in_file = other.4 != 0 && other.3 < it.3 + it.4 && it.3 < other.3 + other.4;
@@ -1889,7 +1889,7 @@ fn a_dev_runs_code_is_alone_on_its_pages_and_never_writable() {
         let read = read(&file);
         let patch = read.sections.iter().find(|it| it.1 == "__blaze_patch").unwrap();
         assert_eq!((patch.0.as_str(), patch.2), ("__TEXT", PATCH), "live patches' code is code");
-        assert_ne!(patch.4 & macho::S_ATTR_PURE_INSTRUCTIONS, 0);
+        assert_ne!(patch.4 & macho::S_ATTR_PURE_INSTRUCTIONS.0, 0);
 
         let layout = blaze_inproc::image::layout(blaze_inproc::Format::MachO, &file, 0x4000).unwrap();
         assert_eq!(layout.header, BASE);
@@ -1907,7 +1907,7 @@ fn a_dev_runs_code_is_alone_on_its_pages_and_never_writable() {
         flags: 0,
         sections: Vec::new(),
     };
-    let (rx, rw) = (macho::VM_PROT_READ | macho::VM_PROT_EXECUTE, macho::VM_PROT_READ | macho::VM_PROT_WRITE);
+    let (rx, rw) = (macho::VM_PROT_READ.0 | macho::VM_PROT_EXECUTE.0, macho::VM_PROT_READ.0 | macho::VM_PROT_WRITE.0);
     let text = || segment("__TEXT", BASE, 0x8000, 0, 0x8000, rx);
     let data = |vmaddr, fileoff, filesize| segment("__DATA", vmaddr, 0x4000, fileoff, filesize, rw);
     assert!(super::code_alone(&[text(), data(BASE + 0x8000, 0x8000, 0x10)], 0x4000).is_ok());

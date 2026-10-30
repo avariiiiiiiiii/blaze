@@ -20,7 +20,7 @@ use blaze_codegen::Arch;
 use blaze_fuzzer::Target;
 use blaze_link::{Format, NativeKind};
 use object::write::{Object as Builder, StandardSection, Symbol, SymbolSection};
-use object::{Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf};
+use object::{Architecture, BinaryFormat, Endianness, SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf};
 
 const TARGET: Target = Target {
     name: "link_elf_shared",
@@ -167,19 +167,20 @@ fn shared(arch: Architecture, soname: bool) -> Vec<u8> {
         flags: SymbolFlags::None,
     });
     if soname {
-        let dynamic = b.add_section(Vec::new(), b".dynamic".to_vec(), SectionKind::Elf(elf::SHT_DYNAMIC));
+        let dynamic = b.add_section(Vec::new(), b".dynamic".to_vec(), SectionKind::Other);
+        b.section_mut(dynamic).flags = SectionFlags::Elf { sh_type: elf::SHT_DYNAMIC, sh_flags: elf::SectionFlags(0) };
         let mut entries = Vec::new();
-        for value in [u64::from(elf::DT_SONAME), 0, u64::from(elf::DT_NULL), 0] {
+        for value in [elf::DT_SONAME.0 as u64, 0, elf::DT_NULL.0 as u64, 0] {
             entries.extend_from_slice(&value.to_le_bytes());
         }
         b.append_section_data(dynamic, &entries, 8);
     }
     let mut bytes = b.write().expect("an ELF object");
 
-    bytes[16..18].copy_from_slice(&elf::ET_DYN.to_le_bytes());
+    bytes[16..18].copy_from_slice(&elf::ET_DYN.0.to_le_bytes());
     let headers = section_headers(&bytes);
-    let symtab = headers.iter().find(|it| it.ty == elf::SHT_SYMTAB).expect("a .symtab").at;
-    bytes[symtab + 4..symtab + 8].copy_from_slice(&elf::SHT_DYNSYM.to_le_bytes());
+    let symtab = headers.iter().find(|it| it.ty == elf::SHT_SYMTAB.0).expect("a .symtab").at;
+    bytes[symtab + 4..symtab + 8].copy_from_slice(&elf::SHT_DYNSYM.0.to_le_bytes());
     let strtab = u32::from_le_bytes(bytes[symtab + 40..symtab + 44].try_into().expect("four bytes"));
     if soname {
         let strings = &headers[strtab as usize];
@@ -188,7 +189,7 @@ fn shared(arch: Architecture, soname: bool) -> Vec<u8> {
         needle.extend_from_slice(SONAME);
         needle.push(0);
         let found = table.windows(needle.len()).position(|it| it == needle).expect("the soname's string") + 1;
-        let dynamic = headers.iter().find(|it| it.ty == elf::SHT_DYNAMIC).expect("a .dynamic");
+        let dynamic = headers.iter().find(|it| it.ty == elf::SHT_DYNAMIC.0).expect("a .dynamic");
         let (at, offset) = (dynamic.at, dynamic.offset);
         bytes[at + 40..at + 44].copy_from_slice(&strtab.to_le_bytes());
         bytes[offset + 8..offset + 16].copy_from_slice(&(found as u64).to_le_bytes());

@@ -26,7 +26,7 @@ use std::{
 };
 
 use super::{
-    Events, image,
+    Events, Unwatched, image,
     switch::{Dwarf, Layout, Memory, Writes},
 };
 use crate::patch::{DESCRIPTOR, Descriptor};
@@ -94,6 +94,7 @@ const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x1;
 const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x10;
 const INVALID_HANDLE_VALUE: *mut c_void = !0usize as *mut c_void;
 const WAIT_OBJECT_0: u32 = 0;
+const WAIT_FAILED: u32 = 0xffff_ffff;
 /// How long the watching thread blocks before it looks whether to stop.
 const WAKE_EVERY_MS: u32 = 1000;
 const PAGE: u64 = 0x1000;
@@ -195,33 +196,25 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
     };
     // A handle is an address the thread is given to use alone.
     let watching = move || {
-        let mut watched = Some(handle);
+        let handle = handle as *mut c_void;
         while !events.stopped() {
-            let Some(handle) = watched else {
-                // A directory removed and made again is watched again.
-                std::thread::sleep(std::time::Duration::from_millis(u64::from(WAKE_EVERY_MS)));
-                watched = first(&path);
-                if watched.is_some() {
-                    events.tell();
-                }
-                continue;
-            };
-            let handle = handle as *mut c_void;
             // SAFETY: the thread's own notification handle.
-            if unsafe { WaitForSingleObject(handle, WAKE_EVERY_MS) } == WAIT_OBJECT_0 {
+            let waited = unsafe { WaitForSingleObject(handle, WAKE_EVERY_MS) };
+            if waited == WAIT_FAILED {
+                events.lose(Unwatched::failed("WaitForSingleObject on the directory's notification"));
+                break;
+            }
+            if waited == WAIT_OBJECT_0 {
                 events.tell();
-                // SAFETY: as above.
+                // SAFETY: as above. It fails once the directory is gone.
                 if unsafe { FindNextChangeNotification(handle) } == 0 {
-                    // SAFETY: as above; one that can't go on is closed, once.
-                    unsafe { FindCloseChangeNotification(handle) };
-                    watched = None;
+                    events.lose(Unwatched::failed("FindNextChangeNotification on the directory"));
+                    break;
                 }
             }
         }
-        if let Some(handle) = watched {
-            // SAFETY: as above, closed once.
-            unsafe { FindCloseChangeNotification(handle as *mut c_void) };
-        }
+        // SAFETY: as above, closed once.
+        unsafe { FindCloseChangeNotification(handle) };
     };
     std::thread::Builder::new()
         // alloc: setup, the thread's name, once

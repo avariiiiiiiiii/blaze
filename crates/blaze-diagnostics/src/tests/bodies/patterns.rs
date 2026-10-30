@@ -152,7 +152,7 @@ fn a_slice_pattern_of_an_option_of_a_vec_suggests_as_deref_or_slicing() {
     // tests/ui/typeck/issue-91328.rs
     let fixture = format!(
         "//- minicore: option, result, deref, add
-//- /issue-91328.rs crate:main edition:2015 deps:alloc
+//- /issue-91328.rs crate:other:main edition:2015 deps:alloc
 // Regression test for issue #91328.
 
 //@ run-rustfix
@@ -260,7 +260,7 @@ fn slicing_is_suggested_only_for_the_whole_pattern() {
     // tests/ui/suggestions/suppress-consider-slicing-issue-120605.rs
     let fixture = format!(
         r#"//- minicore: deref
-//- /suppress-consider-slicing-issue-120605.rs crate:main edition:2015 deps:alloc
+//- /suppress-consider-slicing-issue-120605.rs crate:other:main edition:2015 deps:alloc
 pub struct Struct {{
     a: Vec<Struct>,
 }}
@@ -426,7 +426,7 @@ LL |         true ..= \"what\" => {}
    |         |        this is of type `&'static str` but it should be `char` or numeric
    |         this is of type `bool` but it should be `char` or numeric
 ";
-    let fixture = format!("//- /match-range-fail.rs crate:main edition:2015\n{source}");
+    let fixture = format!("//- /match-range-fail.rs crate:other:main edition:2015\n{source}");
     assert_eq!(ui_only(&fixture, code("E0029")), stderr);
 }
 
@@ -434,7 +434,7 @@ LL |         true ..= \"what\" => {}
 fn an_array_pattern_of_too_few_elements_is_refused() {
     // tests/ui/pattern/array-length-mismatch-13482.rs
     let fixture = "//- minicore: option
-//- /array-length-mismatch-13482.rs crate:main edition:2015
+//- /array-length-mismatch-13482.rs crate:other:main edition:2015
 //! Regression test for https://github.com/rust-lang/rust/issues/13482
 
 fn main() {
@@ -461,7 +461,7 @@ For more information about this error, try `rustc --explain E0527`.
 #[test]
 fn an_array_destructuring_assignment_of_the_wrong_length_is_refused() {
     // tests/ui/destructuring-assignment/slice_destructure_fail.rs
-    let fixture = "//- /slice_destructure_fail.rs crate:main edition:2015
+    let fixture = "//- /slice_destructure_fail.rs crate:other:main edition:2015
 fn main() {
     let (mut a, mut b);
     [a, .., b, ..] = [0, 1]; //~ ERROR `..` can only be used once per slice pattern
@@ -514,7 +514,7 @@ For more information about this error, try `rustc --explain E0528`.
 #[test]
 fn a_tuple_variant_pattern_of_the_wrong_field_count_says_how_to_fix_it() {
     // tests/ui/error-codes/E0023.rs
-    let fixture = "//- /E0023.rs crate:main edition:2015
+    let fixture = "//- /E0023.rs crate:other:main edition:2015
 enum Fruit {
     Apple(String, String),
     Pear(u32),
@@ -651,7 +651,7 @@ For more information about this error, try `rustc --explain E0023`.
 #[test]
 fn an_empty_tuple_struct_pattern_of_another_type_suggests_no_parentheses() {
     // tests/ui/pattern/issue-67037-pat-tup-scrut-ty-diff-less-fields.rs
-    let fixture = "//- /issue-67037-pat-tup-scrut-ty-diff-less-fields.rs crate:main edition:2015
+    let fixture = "//- /issue-67037-pat-tup-scrut-ty-diff-less-fields.rs crate:other:main edition:2015
 // Regression test for #67037.
 //
 // In type checking patterns, E0023 occurs when the tuple pattern and the expected
@@ -698,7 +698,7 @@ LL |     let P(..) = U {};
 #[test]
 fn a_tuple_struct_pattern_counts_a_binding_of_a_rest_as_a_field() {
     // tests/ui/pattern/issue-72574-2.rs
-    let fixture = "//- /issue-72574-2.rs crate:main edition:2015
+    let fixture = "//- /issue-72574-2.rs crate:other:main edition:2015
 struct Binder(i32, i32, i32);
 
 fn main() {
@@ -732,7 +732,7 @@ LL |         Binder(_a, _x @ .., _) => {}
 #[test]
 fn a_tuple_struct_destructuring_assignment_of_the_wrong_field_count_is_refused() {
     // tests/ui/destructuring-assignment/tuple_struct_destructure_fail.rs
-    let fixture = "//- /tuple_struct_destructure_fail.rs crate:main edition:2015
+    let fixture = "//- /tuple_struct_destructure_fail.rs crate:other:main edition:2015
 struct TupleStruct<S, T>(S, T);
 
 enum Enum<S, T> {
@@ -841,7 +841,7 @@ LL +     Enum::SingleVariant(..) = Enum::SingleVariant(1, 2);
 fn a_reference_pattern_of_a_trait_object_cannot_dereference_it() {
     // tests/ui/error-codes/E0033.rs
     let fixture = "//- minicore: coerce_unsized
-//- /E0033.rs crate:main edition:2015
+//- /E0033.rs crate:other:main edition:2015
 trait SomeTrait {
     fn foo(&self);
 }
@@ -872,7 +872,7 @@ For more information about this error, try `rustc --explain E0033`.
 #[test]
 fn a_union_pattern_names_exactly_one_field_and_no_rest() {
     // tests/ui/union/union-fields-2.rs
-    let fixture = "//- /union-fields-2.rs crate:main edition:2015
+    let fixture = "//- /union-fields-2.rs crate:other:main edition:2015
 union U {
     a: u8,
     b: u16,
@@ -944,7 +944,7 @@ LL |     let U { a, .. } = u;
 fn a_struct_pattern_of_another_crates_non_exhaustive_struct_needs_a_rest() {
     // tests/ui/rfcs/rfc-2008-non-exhaustive/struct.rs, with auxiliary/structs.rs
     let fixture = "//- minicore: default, derive, fmt
-//- /struct.rs crate:main edition:2015 deps:structs
+//- /struct.rs crate:other:main edition:2015 deps:structs
 //@ aux-build:structs.rs
 extern crate structs;
 
@@ -1114,7 +1114,7 @@ pub fn main() {
 #[test]
 fn a_mutable_binding_by_reference_is_behind_the_mut_ref_feature() {
     let fixture =
-        format!("//- /mut-ref-mut.rs crate:main edition:2024 cfg:structural2024\n{MUT_REF_MUT}");
+        format!("//- /mut-ref-mut.rs crate:other:main edition:2024 cfg:structural2024\n{MUT_REF_MUT}");
     let note = "   |
    = note: see issue #123076 <https://github.com/rust-lang/rust/issues/123076> for more information
    = help: add `#![feature(mut_ref)]` to the crate attributes to enable
@@ -1245,7 +1245,7 @@ LL |     let &(ref mut a, ref mut b) = &mut (true, false);
 fn a_mutable_borrow_inside_a_shared_reference_pattern_suggests_mut() {
     let fixture = format!(
         "//- minicore: option
-//- /ref-mut-inside-shared-ref-pat.rs crate:main edition:2024 cfg:classic2024
+//- /ref-mut-inside-shared-ref-pat.rs crate:other:main edition:2024 cfg:classic2024
 {REF_MUT_INSIDE_SHARED_REF_PAT}"
     );
     let stderr = format!(
@@ -1269,7 +1269,7 @@ For more information about this error, try `rustc --explain E0596`.
 fn a_mutable_borrow_inside_a_shared_reference_pattern_is_refused_in_2021_too() {
     let fixture = format!(
         "//- minicore: option
-//- /ref-mut-inside-shared-ref-pat.rs crate:main edition:2021 cfg:structural2021
+//- /ref-mut-inside-shared-ref-pat.rs crate:other:main edition:2021 cfg:structural2021
 {REF_MUT_INSIDE_SHARED_REF_PAT}"
     );
     let stderr = format!(

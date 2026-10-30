@@ -1,4 +1,9 @@
-use cranelift_codegen::{ir::Opcode, settings, verify_function};
+use cranelift_codegen::{
+    ir::Opcode,
+    isa,
+    settings::{self, Configurable},
+    verify_function,
+};
 
 use super::*;
 
@@ -10,9 +15,16 @@ fn confined(params: &[ir::Type], returns: &[ir::Type]) -> ir::Signature {
     sig
 }
 
+/// Verified against the host's ISA: a stub's `get_frame_pointer` needs one, with frame
+/// pointers kept.
 fn verified(func: &ir::Function) {
-    let flags = settings::Flags::new(settings::builder());
-    if let Err(errors) = verify_function(func, &flags) {
+    let mut flags = settings::builder();
+    flags.enable("preserve_frame_pointers").unwrap();
+    let isa = isa::lookup_by_name(std::env::consts::ARCH)
+        .unwrap()
+        .finish(settings::Flags::new(flags))
+        .unwrap();
+    if let Err(errors) = verify_function(func, &*isa) {
         panic!("{}", cranelift_codegen::print_errors::pretty_verifier_error(func, None, errors));
     }
 }

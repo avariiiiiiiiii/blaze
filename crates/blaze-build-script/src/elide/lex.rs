@@ -101,6 +101,9 @@ impl<'a> Token<'a> {
 /// The value of the string literal `text` (quotes included, as lexed), added to `out`: the
 /// runs between escapes copied whole, each escape read as the lexer read it.
 fn unescape_into(text: &str, out: &mut String) -> Option<()> {
+    // Every escape is longer than what it stands for, so the value fits in its text's length
+    // less the quotes: `out` grows at most once.
+    out.reserve(text.len().saturating_sub(2));
     let bytes = text.as_bytes();
     let mut lexer = Lexer { source: text, at: 1 };
     loop {

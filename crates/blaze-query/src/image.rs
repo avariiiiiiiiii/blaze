@@ -18,9 +18,9 @@
 //!
 //! Opening reads no byte of them: it finds the five in the spine `blaze-image` checked and
 //! checks their lengths. Each group of a section is checked by its CRC32C the first time a read
-//! reaches it. A group that fails is [`Corrupt`]: the keys whose memos it held have no image
-//! memo (they are computed again, and their dependents verify against the new fingerprint as
-//! after any miss), and it is noted once for the daemon to report. Bytes that pass their CRC
+//! reaches it. A group that fails is [`Corrupt`]: every request reading a key whose memos it
+//! held fails naming it (never computing the key again), no image is written while it stands,
+//! and it is noted once for the daemon to report. Bytes that pass their CRC
 //! but are not what [`write`] writes (a table slot past the memos, edges past the edge section)
 //! are a bug in [`write`], and stop the database naming it.
 
@@ -244,6 +244,7 @@ pub(crate) struct ImageMap {
 #[derive(Default)]
 struct Found {
     seen: FxSet<(SectionId, u32)>,
+    first: Option<Corrupt>,
     new: Vec<Corrupt>,
 }
 
@@ -326,8 +327,14 @@ impl ImageMap {
     pub(crate) fn note(&self, corrupt: Corrupt) {
         let mut found = self.corrupt.lock();
         if found.seen.insert((corrupt.section, corrupt.group)) {
+            found.first.get_or_insert(corrupt);
             found.new.push(corrupt);
         }
+    }
+
+    /// The first group ever found corrupt.
+    pub(crate) fn first_corrupt(&self) -> Option<Corrupt> {
+        self.corrupt.lock().first
     }
 
     /// The groups found corrupt since the last call, each once ever.

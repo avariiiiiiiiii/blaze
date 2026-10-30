@@ -51,10 +51,10 @@ const SHARED: NativeKind = NativeKind::Shared { as_needed: false };
 
 /// Where a dylib holds the trie: its arch, its CPU and the command.
 const HOLDERS: [(Arch, u32, u32); 4] = [
-    (Arch::Aarch64, macho::CPU_TYPE_ARM64, macho::LC_DYLD_INFO_ONLY),
-    (Arch::Aarch64, macho::CPU_TYPE_ARM64, macho::LC_DYLD_EXPORTS_TRIE),
-    (Arch::X86_64, macho::CPU_TYPE_X86_64, macho::LC_DYLD_INFO_ONLY),
-    (Arch::X86_64, macho::CPU_TYPE_X86_64, macho::LC_DYLD_EXPORTS_TRIE),
+    (Arch::Aarch64, macho::CPU_TYPE_ARM64.0, macho::LC_DYLD_INFO_ONLY.0),
+    (Arch::Aarch64, macho::CPU_TYPE_ARM64.0, macho::LC_DYLD_EXPORTS_TRIE.0),
+    (Arch::X86_64, macho::CPU_TYPE_X86_64.0, macho::LC_DYLD_INFO_ONLY.0),
+    (Arch::X86_64, macho::CPU_TYPE_X86_64.0, macho::LC_DYLD_EXPORTS_TRIE.0),
 ];
 
 /// The holder read against the first, one a run (`blaze_fuzzer::case`); the plain test takes
@@ -89,7 +89,7 @@ fn check_case(trie: &[u8], case: usize) {
                 "same trie: the trie read from command {command:#x} for {arch:?} answers otherwise"
             ),
         }
-        if command == macho::LC_DYLD_EXPORTS_TRIE {
+        if command == macho::LC_DYLD_EXPORTS_TRIE.0 {
             let (shifted, at) = copy_at(&dylib, 1);
             let shifted = &shifted[at..][..dylib.len()];
             assert_eq!(
@@ -136,7 +136,7 @@ fn name16(out: &mut Vec<u8>, name: &str) {
 
 fn segment(name: &str, vmaddr: u64, fileoff: u64, filesize: u64, sections: &[(&str, u64, u64, u32)]) -> Vec<u8> {
     let mut out = Vec::new();
-    u32le(&mut out, macho::LC_SEGMENT_64);
+    u32le(&mut out, macho::LC_SEGMENT_64.0);
     u32le(&mut out, 72 + 80 * sections.len() as u32);
     name16(&mut out, name);
     u64le(&mut out, vmaddr);
@@ -162,7 +162,7 @@ fn segment(name: &str, vmaddr: u64, fileoff: u64, filesize: u64, sections: &[(&s
 /// A dylib of `cpu` whose export trie, `trie` after the load commands, `command` names
 /// (`LC_DYLD_INFO_ONLY` or `LC_DYLD_EXPORTS_TRIE`).
 fn with_trie(cpu: u32, command: u32, trie: &[u8]) -> Vec<u8> {
-    let code = macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
+    let code = macho::S_ATTR_PURE_INSTRUCTIONS.0 | macho::S_ATTR_SOME_INSTRUCTIONS.0;
     let mut commands = vec![
         segment("__TEXT", 0, 0, 0x1000, &[("__text", 0x1000, 0x100, code)]),
         segment(
@@ -170,25 +170,25 @@ fn with_trie(cpu: u32, command: u32, trie: &[u8]) -> Vec<u8> {
             0x4000,
             0x4000,
             0,
-            &[("__data", 0x4000, 0x100, 0), ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES)],
+            &[("__data", 0x4000, 0x100, 0), ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES.to_flags().0)],
         ),
     ];
     let path = "/usr/lib/libfoo.dylib";
     let mut id = Vec::new();
     let size = (24 + path.len() + 1).next_multiple_of(8);
-    for value in [macho::LC_ID_DYLIB, size as u32, 24, 2, 0x10000, 0x10000] {
+    for value in [macho::LC_ID_DYLIB.0, size as u32, 24, 2, 0x10000, 0x10000] {
         u32le(&mut id, value);
     }
     id.extend_from_slice(path.as_bytes());
     id.resize(size, 0);
     commands.push(id);
-    let trie_command_len = if command == macho::LC_DYLD_INFO_ONLY { 48 } else { 16 };
+    let trie_command_len = if command == macho::LC_DYLD_INFO_ONLY.0 { 48 } else { 16 };
     let sizeofcmds = commands.iter().map(Vec::len).sum::<usize>() + trie_command_len;
     let offset = (32 + sizeofcmds).next_multiple_of(8) as u32;
     let mut trie_command = Vec::new();
     u32le(&mut trie_command, command);
     u32le(&mut trie_command, trie_command_len as u32);
-    if command == macho::LC_DYLD_INFO_ONLY {
+    if command == macho::LC_DYLD_INFO_ONLY.0 {
         for _ in 0..8 {
             u32le(&mut trie_command, 0);
         }
@@ -198,7 +198,7 @@ fn with_trie(cpu: u32, command: u32, trie: &[u8]) -> Vec<u8> {
     commands.push(trie_command);
 
     let mut out = Vec::new();
-    for value in [macho::MH_MAGIC_64, cpu, 0, macho::MH_DYLIB, commands.len() as u32, sizeofcmds as u32, 0, 0] {
+    for value in [macho::MH_MAGIC_64, cpu, 0, macho::MH_DYLIB.0, commands.len() as u32, sizeofcmds as u32, 0, 0] {
         u32le(&mut out, value);
     }
     for command in commands {
@@ -282,17 +282,17 @@ fn build_trie(root: &Node) -> Vec<u8> {
     out
 }
 
-fn info(flags: u32, values: &[u64]) -> Vec<u8> {
+fn info(flags: u64, values: &[u64]) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_uleb(&mut out, u64::from(flags));
+    encode_uleb(&mut out, flags);
     for &value in values {
         encode_uleb(&mut out, value);
     }
     out
 }
 
-fn reexport(flags: u32, ordinal: u64, import: &str) -> Vec<u8> {
-    let mut out = info(flags | macho::EXPORT_SYMBOL_FLAGS_REEXPORT, &[ordinal]);
+fn reexport(flags: u64, ordinal: u64, import: &str) -> Vec<u8> {
+    let mut out = info(flags | macho::EXPORT_SYMBOL_FLAGS_REEXPORT.0, &[ordinal]);
     out.extend_from_slice(import.as_bytes());
     out.push(0);
     out
@@ -303,22 +303,22 @@ fn reexport(flags: u32, ordinal: u64, import: &str) -> Vec<u8> {
 fn sample_trie() -> Vec<u8> {
     let foo = Node {
         terminal: info(0, &[0x1010]),
-        children: vec![("bar", leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, &[0x4010])))],
+        children: vec![("bar", leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[0x4010])))],
     };
     let fo = Node {
         terminal: Vec::new(),
         children: vec![
             ("o", foo),
             ("b", leaf(reexport(0, 1, "_bob"))),
-            ("_tls", leaf(info(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL, &[0x4100]))),
+            ("_tls", leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0), &[0x4100]))),
         ],
     };
     let underscore = Node {
         terminal: Vec::new(),
         children: vec![
             ("fo", fo),
-            ("abs", leaf(info(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE, &[0x1234]))),
-            ("res", leaf(info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER, &[0x1020, 0x1030]))),
+            ("abs", leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.0), &[0x1234]))),
+            ("res", leaf(info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.0, &[0x1020, 0x1030]))),
             ("same", leaf(reexport(0, 1, ""))),
         ],
     };
@@ -349,10 +349,10 @@ fn random_info(rng: &mut Rng) -> Vec<u8> {
     match rng.below(7) {
         0 => Vec::new(),
         1 => info(0, &[addr]),
-        2 => info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, &[addr]),
-        3 => info(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL, &[addr]),
-        4 => info(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE, &[addr]),
-        5 => info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER, &[addr, 0x1030]),
+        2 => info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[addr]),
+        3 => info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0), &[addr]),
+        4 => info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.0), &[addr]),
+        5 => info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.0, &[addr, 0x1030]),
         _ => reexport(0, 1, "_other"),
     }
 }
@@ -390,8 +390,8 @@ mod tests {
 
     #[test]
     fn sample_trie_reads() {
-        for command in [macho::LC_DYLD_INFO_ONLY, macho::LC_DYLD_EXPORTS_TRIE] {
-            let dylib = with_trie(macho::CPU_TYPE_ARM64, command, &sample_trie());
+        for command in [macho::LC_DYLD_INFO_ONLY.0, macho::LC_DYLD_EXPORTS_TRIE.0] {
+            let dylib = with_trie(macho::CPU_TYPE_ARM64.0, command, &sample_trie());
             assert!(blaze_link::fuzz_read(Format::MachO, Arch::Aarch64, SHARED, &dylib), "command {command:#x}");
         }
         assert_eq!(blaze_link::fuzz_trie_differential(&sample_trie()), Ok(true));

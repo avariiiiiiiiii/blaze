@@ -9,7 +9,7 @@ use crate::{cx::Cx, lower::parse, print::paths::Def};
 
 /// A crate of `n` modules, each a file, and a dependency that re-exports a type.
 fn fixture(n: usize) -> String {
-    let mut out = String::from("//- /main.rs crate:main deps:dep\n");
+    let mut out = String::from("//- /main.rs crate:other:main deps:dep\n");
     for i in 0..n {
         out.push_str(&format!("mod m{i};\n"));
     }

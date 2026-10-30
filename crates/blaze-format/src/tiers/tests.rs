@@ -167,7 +167,7 @@ fn a_warm_column_takes_the_bits_of_its_range() {
             assert_eq!(packed.bits, u32::BITS - (max - min).leading_zeros(), "{name}");
             match packed.bits {
                 32 => assert_eq!(packed.min, 0, "{name}"),
-                _ => assert_eq!(packed.min, min, "{name}"),
+                bits => assert_eq!(packed.min, min.min(u32::MAX - ((1 << bits) - 1)), "{name}"),
             }
             assert_eq!(packed.words.len(), super::words_for(values.len(), packed.bits), "{name}");
         }
@@ -179,6 +179,10 @@ fn a_warm_column_takes_the_bits_of_its_range() {
     assert_eq!(constant.unpack(), vec![9; 100]);
     let wide = Packed::pack(&[1, u32::MAX]);
     assert_eq!((wide.min, wide.bits), (0, 32));
+    // Near the top, the minimum drops so that it plus any 4-bit offset is still a `u32`.
+    let near = Packed::pack(&[0xffff_fff1, 0xffff_fff9]);
+    assert_eq!((near.min, near.bits), (0xffff_fff0, 4));
+    assert_eq!(near.unpack(), [0xffff_fff1, 0xffff_fff9]);
 }
 
 #[test]

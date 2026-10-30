@@ -67,13 +67,15 @@ pub struct Found {
 // dyn: asked once per file of the crate and once per diagnostic span that leaves its file.
 pub type NameOf<'a> = &'a dyn Fn(base_db::FileId) -> Option<String>;
 
-/// The diagnostics of the lints of `krate`, in the order rustc would emit them.
-pub fn check(db: &Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -> Vec<Found> {
+/// The diagnostics of the lints of `krate`, in the order rustc would emit them. A file of the
+/// crate, or of a span a lint gives, that `name_of` does not name is the error: its lints are
+/// never left out.
+pub fn check(db: &Db, krate: hir::Crate, setup: &Setup, name_of: NameOf<'_>) -> Result<Vec<Found>, diag::Unnamed> {
     hir::attach_db(db, || {
         let levels = Levels::new(&setup.command_line);
         let mut driver = Driver::new(db, krate, setup, name_of, lints::command_line_on(&levels));
-        driver.run();
-        driver.finish(&levels)
+        driver.run()?;
+        Ok(driver.finish(&levels))
     })
 }
 
@@ -162,12 +164,12 @@ impl<'q> Driver<'q> {
         }
     }
 
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), diag::Unnamed> {
         let db = self.db;
         let base = self.krate.base();
         let plan = query::lint_plan(db, base);
         for &ModuleFile { file, declared } in plan.files.iter() {
-            let Some(name) = (self.name_of)(file.file_id(db)) else { continue };
+            let name = (self.name_of)(file.file_id(db)).ok_or(diag::Unnamed { file: file.file_id(db) })?;
             let mut place = None;
             let mut parent_of = None;
             if let Some((parent_file, range)) = declared {
@@ -200,16 +202,17 @@ impl<'q> Driver<'q> {
             }
             let set = self.set(on);
             let lints = query::item_lints(db, id, base, set);
-            self.take(at, 0, lints);
+            self.take(at, 0, lints)?;
         }
         for &body in plan.bodies.iter() {
-            self.lint_body(body);
+            self.lint_body(body)?;
         }
+        Ok(())
     }
 
-    fn lint_body(&mut self, BodyAt { def, file, offset, item }: BodyAt) {
+    fn lint_body(&mut self, BodyAt { def, file, offset, item }: BodyAt) -> Result<(), diag::Unnamed> {
         let db = self.db;
-        let Some(&at) = self.by_id.get(&file) else { return };
+        let Some(&at) = self.by_id.get(&file) else { return Ok(()) };
         let named = &self.files[at];
         let mut on = self.command_line | named.around;
         // A name can only add lints when it names one not on already.
@@ -222,11 +225,11 @@ impl<'q> Driver<'q> {
                 .fold(0, |on, it| on | it.lints);
         }
         if on == 0 {
-            return;
+            return Ok(());
         }
         let set = self.set(on);
         let lints = query::body_lints(db, def, set);
-        self.take(at, u32::from(offset), lints);
+        self.take(at, u32::from(offset), lints)
     }
 
     /// Where rustc's walks over the crate come to file `at`: at the `mod` item declaring it,
@@ -247,15 +250,13 @@ impl<'q> Driver<'q> {
     }
 
     /// Takes what a query found in the file `at`, moving its ranges by `offset`.
-    fn take(&mut self, at: usize, offset: u32, lints: &Lints) {
+    fn take(&mut self, at: usize, offset: u32, lints: &Lints) -> Result<(), diag::Unnamed> {
         let file = &self.files[at];
         let moved = |range: TextRange| range + TextSize::new(offset);
         for Finding { lint, at: found_at, place, diagnostic } in &lints.findings {
             // clone: a finding's diagnostic, out of the query's value, to be given its level
             let mut diagnostic = diagnostic.clone();
-            if !diag::place_diag(&mut diagnostic, offset, &file.name, self.name_of) {
-                continue;
-            }
+            diag::place_diag(&mut diagnostic, offset, &file.name, self.name_of)?;
             let place = match *place {
                 Place::Node(range) => {
                     let range = moved(range);
@@ -296,6 +297,7 @@ impl<'q> Driver<'q> {
                 at: moved(*owner),
             });
         }
+        Ok(())
     }
 
     /// The level sets around `at` of `file`, outermost first, and whether `cfg(test)` alone

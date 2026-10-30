@@ -249,11 +249,14 @@ impl<'db> InferenceTable<'db> {
             PredicateKind::Clause(ClauseKind::Trait(data)) => {
                 self.type_matches_expected_vid(expected_vid, data.self_ty(), subtyping)
             }
-            PredicateKind::Clause(ClauseKind::Projection(data)) => self.type_matches_expected_vid(
-                expected_vid,
-                data.projection_term.self_ty(),
-                subtyping,
-            ),
+            PredicateKind::Clause(ClauseKind::Projection(data)) => {
+                data.projection_term.kind.is_trait_projection()
+                    && self.type_matches_expected_vid(
+                        expected_vid,
+                        data.projection_term.self_ty(),
+                        subtyping,
+                    )
+            }
             PredicateKind::Clause(ClauseKind::ConstArgHasType(..))
             | PredicateKind::Subtype(..)
             | PredicateKind::Coerce(..)
@@ -462,6 +465,18 @@ impl<'db> InferenceTable<'db> {
         }
     }
 
+    /// rustc's `FnCtxt::normalize`: `value` normalized, its ambiguous and failed goals
+    /// registered.
+    pub(crate) fn normalize<T>(&mut self, span: Span, value: T) -> T
+    where
+        T: TypeFoldable<DbInterner<'db>> + Clone,
+    {
+        let cause = ObligationCause::new(span);
+        let (value, obligations) = crate::next_solver::normalize::normalize(self.at(&cause), value);
+        self.register_predicates(obligations);
+        value
+    }
+
     pub(crate) fn register_infer_ok<T>(&mut self, infer_ok: InferOk<'db, T>) -> T {
         let InferOk { value, obligations } = infer_ok;
         self.register_predicates(obligations);
@@ -623,7 +638,6 @@ pub(super) mod resolve_completely {
         DebruijnIndex, Flags, InferConst, InferTy, PredicateProxy, TypeFlags, TypeFoldable,
         TypeFolder, TypeSuperFoldable, TypeVisitableExt, inherent::IntoKind,
     };
-    use stdx::never;
     use thin_vec::ThinVec;
 
     use crate::{
@@ -718,6 +732,18 @@ pub(super) mod resolve_completely {
 
             let value = self.table.resolve_vars_if_possible(value);
             *value_ref = value.fold_with(&mut Resolver::new(self, true));
+        }
+
+        /// rustc's `resolve_coroutine_predicate`: as [`Self::resolve_completely`], without
+        /// normalizing, which is not sound for a predicate.
+        pub(crate) fn resolve_completely_without_normalizing<T>(&mut self, value_ref: &mut T)
+        where
+            T: TypeFoldable<DbInterner<'db>>,
+        {
+            // clone: a `TypeFoldable` of interned ids, so a copy, never a deep clone
+            let value = std::mem::replace(value_ref, value_ref.clone());
+            let value = self.table.resolve_vars_if_possible(value);
+            *value_ref = value.fold_with(&mut Resolver::new(self, false));
         }
 
         /// The body's diagnostics, resolved, as the result keeps them: made once at their
@@ -817,17 +843,13 @@ pub(super) mod resolve_completely {
                         self.ctx.types.types.error
                     }
                     InferTy::IntVar(_) => {
-                        never!("fallback should have resolved all int vars");
-                        self.ctx.types.types.i32
+                        unreachable!("fallback should have resolved all int vars")
                     }
                     InferTy::FloatVar(_) => {
-                        never!("fallback should have resolved all float vars");
-                        self.ctx.types.types.f64
+                        unreachable!("fallback should have resolved all float vars")
                     }
                     InferTy::FreshTy(_) | InferTy::FreshIntTy(_) | InferTy::FreshFloatTy(_) => {
-                        never!("should not have fresh infer vars outside of caching");
-                        self.ctx.has_errors = true;
-                        self.ctx.types.types.error
+                        unreachable!("should not have fresh infer vars outside of caching")
                     }
                 },
                 _ => t.super_fold_with(self),
@@ -853,9 +875,7 @@ pub(super) mod resolve_completely {
                         self.ctx.types.consts.error
                     }
                     InferConst::Fresh(_) => {
-                        never!("should not have fresh infer vars outside of caching");
-                        self.ctx.has_errors = true;
-                        self.ctx.types.consts.error
+                        unreachable!("should not have fresh infer vars outside of caching")
                     }
                 },
                 _ => c.super_fold_with(self),

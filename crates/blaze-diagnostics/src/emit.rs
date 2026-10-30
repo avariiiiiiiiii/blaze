@@ -541,14 +541,12 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
 
     for child in &diag.children {
         let level = sublevel_of(child.level);
+        let message = ui_dated(child.message.as_str(), style.ui_testing);
         if child.span.is_empty() {
-            group = group.element(level.message(child.message.as_str()));
+            group = group.element(level.message(message));
             continue;
         }
-        report.push(std::mem::replace(
-            &mut group,
-            Group::with_title(level.secondary_title(child.message.as_str())),
-        ));
+        report.push(std::mem::replace(&mut group, Group::with_title(level.secondary_title(message))));
         if child.span.primary_span().is_some() {
             let mut extra: Labels<'a> = SmallVec::new();
             macro_labels(&child.span, &mut extra);
@@ -623,6 +621,17 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
         report.push(group);
     }
     renderer.render(&report)
+}
+
+/// rustc's `add_feature_diagnostics_for_issue` under `-Z ui-testing`: the date the compiler was
+/// built on is written `YYYY-MM-DD`.
+fn ui_dated(message: &str, ui_testing: bool) -> Cow<'_, str> {
+    use crate::lower::mutable_ref_binding::BUILT_ON;
+    match ui_testing && message.starts_with("this compiler was built on ") {
+        // alloc: one note of a feature gate, rendered for a UI test
+        true => Cow::Owned(message.replacen(BUILT_ON, "YYYY-MM-DD", 1)),
+        false => Cow::Borrowed(message),
+    }
 }
 
 /// rustc's `annotation_level_for_level`.
@@ -1106,7 +1115,8 @@ mod tests {
     fn confusables_are_noticed() {
         assert_eq!(confusion_of("Vec", "vec"), Confusion::Case);
         assert_eq!(confusion_of("l0", "1O"), Confusion::DigitLetter);
-        assert_eq!(confusion_of("so", "S0"), Confusion::Both);
+        assert_eq!(confusion_of("sO", "S0"), Confusion::Both);
+        assert_eq!(confusion_of("so", "S0"), Confusion::None, "only `O` is confused with `0`");
         assert_eq!(confusion_of("abc", "abd"), Confusion::None);
     }
 

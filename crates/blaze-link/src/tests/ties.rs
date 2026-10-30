@@ -51,8 +51,8 @@ fn link(bytes: &mut [u8], section: &str, nth: usize, to: &str) {
     bytes[at + 40..at + 44].copy_from_slice(&target.to_le_bytes());
 }
 
-fn flags(b: &mut Builder<'_>, section: SectionId, flags: u32) {
-    b.section_mut(section).flags = SectionFlags::Elf { sh_flags: u64::from(flags) };
+fn flags(b: &mut Builder<'_>, section: SectionId, flags: elf::SectionFlags) {
+    b.section_mut(section).flags = SectionFlags::Elf { sh_type: elf::SHT_PROGBITS, sh_flags: flags };
 }
 
 /// An x86-64 object: each function in its own `.text.<name>`, returning its value; its

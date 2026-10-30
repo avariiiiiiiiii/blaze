@@ -248,6 +248,7 @@ diagnostics![AnyDiagnostic<'db> ->
     UnsafeBinderCastOfNonBinder<'db>,
     ConstParamTyNotAllowed<'db>,
     ValTreeError<'db>,
+    UnplacedDiagnostic<'db>,
 ];
 
 #[derive(Debug)]
@@ -713,6 +714,29 @@ pub struct ConstImpure {
 pub struct BorrowckSkipped {
     pub node: InFile<SyntaxNodePtr>,
     pub reason: String,
+}
+
+/// A diagnostic the front end found in code with no syntax of its own (what lowering
+/// desugared), which blaze can't place where rustc does: blaze's error at the item the code is
+/// in, naming the diagnostic, where it would otherwise be dropped.
+#[derive(Debug)]
+pub struct UnplacedDiagnostic<'db> {
+    /// The anonymous constant's expression, or the item whose body the code is in.
+    pub owner: InFile<SyntaxNodePtr>,
+    pub what: Unplaced<'db>,
+}
+
+/// The diagnostic an [`UnplacedDiagnostic`] could not place.
+#[derive(Debug)]
+pub enum Unplaced<'db> {
+    /// Type checking's.
+    Inference(&'db InferenceDiagnostic),
+    /// E0133, or a lint's, for an operation that needs `unsafe`.
+    MissingUnsafe { reason: UnsafetyReason, lint: UnsafeLint },
+    /// The borrow checker's, with its code (a lint's name for a lint).
+    Borrowck { code: &'static str, message: String },
+    /// Const checking's.
+    ConstCheck { code: &'static str, message: String },
 }
 
 #[derive(Debug)]
@@ -2324,7 +2348,20 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             Some(source.ok()?.map(|it| it.syntax_node_ptr()))
         };
         for diagnostic in &result.diagnostics {
-            let Some(node) = node_of(diagnostic.span) else { continue };
+            let Some(node) = node_of(diagnostic.span) else {
+                self.acc.push(
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(self.db, def.into(), source_map),
+                        what: Unplaced::Borrowck {
+                            code: diagnostic.code,
+                            // clone: error path, a reported borrowck error
+                            message: diagnostic.message.clone(),
+                        },
+                    }
+                    .into(),
+                );
+                continue;
+            };
             let (labels, children, suggestions) = borrowck_parts(self.db, diagnostic, &node_of);
             self.acc.push(
                 BorrowckError {
@@ -2455,10 +2492,13 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                     }
                     .into(),
                 ),
-                Err(SyntheticSyntax) => {
-                    // FIXME: Here and elsewhere in this file, the `expr` was
-                    // desugared, report or assert that this doesn't happen.
-                }
+                Err(SyntheticSyntax) => self.acc.push(
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(self.db, def.into(), source_map),
+                        what: Unplaced::MissingUnsafe { reason: op.reason, lint: op.lint },
+                    }
+                    .into(),
+                ),
             }
         }
 
@@ -2565,7 +2605,20 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 true => signature().or_else(|| node_of(diagnostic.span)),
                 false => node_of(diagnostic.span),
             };
-            let Some(node) = node else { continue };
+            let Some(node) = node else {
+                self.acc.push(
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(self.db, def.into(), source_map),
+                        what: Unplaced::Borrowck {
+                            code: diagnostic.code,
+                            // clone: error path, a reported borrowck error
+                            message: diagnostic.message.clone(),
+                        },
+                    }
+                    .into(),
+                );
+                continue;
+            };
             // A variable lowering declares `mut` itself, as an `async fn`'s argument, points
             // at what the user wrote, which has no `mut` to remove.
             if diagnostic.code == "unused_mut" {
@@ -2595,7 +2648,20 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         }
         let const_check = &hir_ty_mir::mir::const_check::const_check(self.db, def).diagnostics;
         for diagnostic in const_check {
-            let Some(node) = node_of(diagnostic.span) else { continue };
+            let Some(node) = node_of(diagnostic.span) else {
+                self.acc.push(
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(self.db, def.into(), source_map),
+                        what: Unplaced::ConstCheck {
+                            code: diagnostic.code,
+                            // clone: error path, a reported const check error
+                            message: diagnostic.message.clone(),
+                        },
+                    }
+                    .into(),
+                );
+                continue;
+            };
             self.acc.push(
                 ConstCheckError {
                     node,
@@ -2649,16 +2715,25 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         // rustc's `check_coroutine_obligations`, after the body's own errors.
         let stalled = hir_ty::coroutine_obligations::coroutine_obligation_errors(self.db, def);
 
-        self.acc.extend(infer.diagnostics().iter().chain(stalled).filter_map(|diag| {
-            AnyDiagnostic::inference_diagnostic(
+        for diag in infer.diagnostics().iter().chain(stalled) {
+            let placed = AnyDiagnostic::inference_diagnostic(
                 self.db,
                 self.krate,
                 self.edition,
                 diag,
                 source_map,
                 type_owner,
-            )
-        }));
+            );
+            let found = match placed {
+                Some(it) => it,
+                None => UnplacedDiagnostic {
+                    owner: unplaced_owner(self.db, def, source_map),
+                    what: Unplaced::Inference(diag),
+                }
+                .into(),
+            };
+            self.acc.push(found);
+        }
     }
 
     fn collect_variant(&mut self, def: VariantId) {
@@ -3931,30 +4006,21 @@ impl<'db> AnyDiagnostic<'db> {
         expr: ExprId,
         source_map: &ExpressionStoreSourceMap,
     ) -> Option<InFile<ExprOrPatPtr>> {
-        source_map
-            .expr_syntax(expr)
-            .inspect_err(|_| stdx::never!("inference diagnostic in desugared expr"))
-            .ok()
+        source_map.expr_syntax(expr).ok()
     }
 
     fn pat_syntax(
         pat: PatId,
         source_map: &ExpressionStoreSourceMap,
     ) -> Option<InFile<ExprOrPatPtr>> {
-        source_map
-            .pat_syntax(pat)
-            .inspect_err(|_| stdx::never!("inference diagnostic in desugared pattern"))
-            .ok()
+        source_map.pat_syntax(pat).ok()
     }
 
     fn type_syntax(
         type_ref: TypeRefId,
         source_map: &ExpressionStoreSourceMap,
     ) -> Option<InFile<AstPtr<ast::Type>>> {
-        source_map
-            .type_syntax(type_ref)
-            .inspect_err(|_| stdx::never!("inference diagnostic in desugared type"))
-            .ok()
+        source_map.type_syntax(type_ref).ok()
     }
 
     pub(crate) fn span_syntax(
@@ -3971,10 +4037,7 @@ impl<'db> AnyDiagnostic<'db> {
                 let &pat = source_map.patterns_for_binding(idx).first()?;
                 Self::pat_syntax(pat, source_map)?.map(|it| it.upcast())
             }
-            hir_ty::Span::Dummy => {
-                never!("should never create a diagnostic for dummy spans");
-                return None;
-            }
+            hir_ty::Span::Dummy => return None,
         })
     }
 
@@ -4019,10 +4082,7 @@ impl<'db> AnyDiagnostic<'db> {
                 MissingLifetimeSite::Reference(source)
             }
             ElidedLifetimeSite::Placeholder(lifetime) => {
-                let source = source_map
-                    .lifetime_syntax(lifetime)
-                    .inspect_err(|_| stdx::never!("lowering diagnostic in a desugared lifetime"))
-                    .ok()?;
+                let source = source_map.lifetime_syntax(lifetime).ok()?;
                 MissingLifetimeSite::Placeholder(source)
             }
             ElidedLifetimeSite::Path { source, generics_source, def, expected_count } => {
@@ -4037,6 +4097,60 @@ impl<'db> AnyDiagnostic<'db> {
                 }
             }
         })
+    }
+}
+
+/// Where an [`UnplacedDiagnostic`] of the body `def` is: an anonymous constant's expression in
+/// `source_map`, its owner's store's, or the item whose body or signature it is.
+pub(crate) fn unplaced_owner(
+    db: &Db,
+    def: InferBodyId<'_>,
+    source_map: &ExpressionStoreSourceMap,
+) -> InFile<SyntaxNodePtr> {
+    use hir_def::{ExpressionStoreOwnerId, src::HasSource as _};
+    let body = match def {
+        InferBodyId::DefWithBodyId(def) => def,
+        InferBodyId::AnonConstId(konst) => {
+            let loc = konst.loc(db);
+            if let Ok(expr) = source_map.expr_syntax(loc.expr) {
+                return expr.map(|it| it.syntax_node_ptr());
+            }
+            match loc.owner {
+                ExpressionStoreOwnerId::Body(def) => def,
+                ExpressionStoreOwnerId::Signature(def) => {
+                    return match def {
+                        GenericDefId::AdtId(AdtId::StructId(it)) => {
+                            it.lookup(db).ast_ptr(db).map(Into::into)
+                        }
+                        GenericDefId::AdtId(AdtId::EnumId(it)) => {
+                            it.lookup(db).ast_ptr(db).map(Into::into)
+                        }
+                        GenericDefId::AdtId(AdtId::UnionId(it)) => {
+                            it.lookup(db).ast_ptr(db).map(Into::into)
+                        }
+                        GenericDefId::ConstId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+                        GenericDefId::FunctionId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+                        GenericDefId::ImplId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+                        GenericDefId::StaticId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+                        GenericDefId::TraitId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+                        GenericDefId::TypeAliasId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+                    };
+                }
+                ExpressionStoreOwnerId::VariantFields(def) => {
+                    return match def {
+                        VariantId::EnumVariantId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+                        VariantId::StructId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+                        VariantId::UnionId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+                    };
+                }
+            }
+        }
+    };
+    match body {
+        DefWithBodyId::FunctionId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+        DefWithBodyId::StaticId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+        DefWithBodyId::ConstId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
+        DefWithBodyId::VariantId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
     }
 }
 

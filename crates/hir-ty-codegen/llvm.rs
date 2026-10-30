@@ -9,8 +9,8 @@
 //! 3. [`emitted`] reads the object back: the code, the constants LLVM put beside it, the
 //!    relocations, with their [`Symbol`]s turned back into requests, and the unwind table.
 //!
-//! Anything on the way that this has no answer for is an [`Unhandled`], and the function is
-//! compiled by Cranelift instead.
+//! Anything on the way that this has no answer for is an [`Unhandled`], and the build stops
+//! on it ([`super::CodegenError::LlvmRefused`]).
 //!
 //! # Unsafe
 //!
@@ -1694,8 +1694,8 @@ fn retold_bytes<'ctx>(
 }
 
 /// Why LLVM did not compile a function.
-#[derive(Debug)]
-pub(super) enum Unhandled {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Unhandled {
     Opcode(Opcode),
     Type(Type),
     /// IR or an object of a kind there is no answer for yet.
@@ -1703,8 +1703,6 @@ pub(super) enum Unhandled {
     /// A relocation type of the object format, by its number.
     Relocation(u32),
     Llvm(String),
-    /// What an earlier build of the same IR was told, as the store kept it.
-    Kept(String),
 }
 
 impl fmt::Display for Unhandled {
@@ -1714,7 +1712,6 @@ impl fmt::Display for Unhandled {
             Unhandled::Type(ty) => write!(f, "type `{ty}`"),
             Unhandled::Shape(what) => f.write_str(what),
             Unhandled::Relocation(kind) => write!(f, "relocation of type {kind}"),
-            Unhandled::Kept(reason) => f.write_str(reason),
             // The first line names the problem; the rest names the function's values.
             Unhandled::Llvm(message) => {
                 write!(f, "llvm: {}", message.lines().next().unwrap_or_default())
@@ -2088,6 +2085,32 @@ attributes #0 = { alwaysinline }
     fn assembly_llvm_cannot_encode_is_an_error() {
         let refused = assemble("mov ah, sil\nret").unwrap_err();
         assert!(refused.contains("can't encode 'ah'"), "{refused}");
+    }
+
+    /// A function LLVM has no lowering for is an error the build stops on, naming what LLVM
+    /// lacks, never a function left to Cranelift.
+    #[test]
+    fn a_function_llvm_cannot_lower_is_refused() {
+        use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types::I64};
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+        let isa = super::super::target().unwrap();
+        let mut wants = Wants::new(&**isa);
+        let mut sig = ir::Signature::new(isa.default_call_conv());
+        sig.returns.push(AbiParam::new(I64));
+        let mut func = ir::Function::with_name_signature(UserFuncName::default(), sig);
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut context);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        builder.seal_block(block);
+        let stack = builder.ins().get_stack_pointer(I64);
+        builder.ins().return_(&[stack]);
+        builder.finalize(isa.frontend_config());
+        let refused = emit(&mut wants, &[], &func, Optimization::NONE, None, &[]).unwrap_err();
+        assert_eq!(refused, Unhandled::Opcode(Opcode::GetStackPointer));
+        let error = super::super::CodegenError::LlvmRefused(refused);
+        assert!(error.to_string().contains("get_stack_pointer"), "{error}");
     }
 
     /// A target machine is told its set in LLVM's names, one per set a thread compiles with,

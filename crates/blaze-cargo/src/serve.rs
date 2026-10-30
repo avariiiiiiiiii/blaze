@@ -7,7 +7,10 @@
 //!   `BLAZE_API_TOKEN`.
 //! - What it keeps lives in [`state`]: the VFS's journal, the database's image, the store and
 //!   the plane's estimates. A start recovers the VFS from the journal and the database from the
-//!   image; an image of another schema starts empty and says so on stderr.
+//!   image. An image of another blaze starts that state empty by a rule, said once at the start
+//!   ([`daemon::Started`]); an image that is damaged, or does not match its journal, stops the
+//!   start naming it ([`daemon::StartError`]), and one found corrupt while running stops the
+//!   daemon ([`daemon::Failed`]).
 //! - It stops on `blaze stop` ([`blaze_api::Request::Stop`]) or SIGTERM, writing its image first.
 
 mod daemon;
@@ -189,7 +192,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     };
     // dyn: the sandbox's `Confine`, asked once per spawn
     let confine: Arc<dyn Confine> = Arc::new(blaze_usercode::confine::Launcher { program: paths.launcher.clone() });
-    let threads = std::thread::available_parallelism().map_or(4, |it| it.get());
+    let threads = std::thread::available_parallelism().context("the number of cores the daemon's plane works on")?.get();
     let options = Options {
         state: file_name(&paths.state)?,
         socket: file_name(&paths.socket)?,
@@ -199,8 +202,12 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         io: 16,
         env: ["PATH", "HOME"]
             .into_iter()
-            .filter_map(|name| Some((name.to_owned(), std::env::var(name).ok()?)))
-            .collect(),
+            .filter_map(|name| match std::env::var(name) {
+                Ok(value) => Some(Ok((name.to_owned(), value))),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(error) => Some(Err(anyhow::anyhow!("the daemon's ${name}: {error}"))),
+            })
+            .collect::<anyhow::Result<_>>()?,
         host: crate::toolchain::host()
             .context("blaze has no target triple for this machine's architecture and system")?
             .to_owned(),
@@ -234,7 +241,14 @@ fn run(
     runner: plane::Runner<job::Step<unit::Real>>,
 ) -> anyhow::Result<()> {
     let host = options.host.clone();
-    let mut daemon = Daemon::start(driver, options, steps, runner).map_err(|why| anyhow::anyhow!(why))?;
+    let mut daemon = Daemon::start(driver, options, steps, runner)?;
+    let started = daemon.started();
+    if started.cold == Some(daemon::Cold::Interned) {
+        bail!("blaze serve: the daemon image's symbols: {}", daemon::Cold::Interned);
+    }
+    if !started.whole() {
+        eprintln!("blaze serve: started: {started}");
+    }
     daemon.install_store().map_err(|why| anyhow::anyhow!("the daemon's store: {why}"))?;
     // Once a process: every expansion from here on reads the daemon's store with no lock.
     let toolchain = hir_ty_codegen::v2::toolchain(&host, &[], hir_ty_codegen::v2::Runs::Elsewhere)
@@ -243,7 +257,7 @@ fn run(
     proc_macro_api::kept::install(proc_macro_api::kept::Expansions {
         store: daemon.store().reader(),
         toolchain,
-        environment: proc_macro_api::warm::Environment::new(),
+        environment: proc_macro_api::kept::Environment::new(),
     })
     .map_err(|why| anyhow::anyhow!("keeping proc-macro expansions: {why}"))?;
     eprintln!("blaze serve: listening on {}", daemon.listening());

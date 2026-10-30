@@ -55,7 +55,7 @@ mounts of parallel runs serialize.
 | the test queue and fork server | `blaze-usercode` `test/` | "Tests" below, [speed-of-light-tests.md](speed-of-light-tests.md) |
 | finding a kept result, outside paths, assembling what was read | `blaze-usercode` `index.rs`, `inputs.rs`, `trace.rs` | the sections of those names below |
 | a proc-macro call, the token wire, the server, native expanders | `blaze-expand`, `proc-macro-api`, `proc-macro-srv` | [speed-of-light-macros.md](speed-of-light-macros.md) (speed-sol2-usercode-macros) |
-| wasm proc macros and the wasi runtime | `blaze-macro-wasm`, `blaze-wasi` | [speed-of-light-wasm.md](speed-of-light-wasm.md) (speed-sol2-usercode-wasm) |
+| wasm proc macros and the wasi runtime (deleted 2026-10-30) | `blaze-macro-wasm`, `blaze-wasi` | [speed-of-light-wasm.md](speed-of-light-wasm.md) (superseded) |
 
 ## Build scripts: `crates/blaze-build-script/` (usercode-fast-scripts)
 

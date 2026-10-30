@@ -40,8 +40,8 @@ export const rules = [
 	},
 	{
 		id: "no-fallback",
-		info: "No fallback, ever. When blaze can't do something it stops with an error naming what and where, never quietly takes another path (rustc, a full rebuild instead of a patch, a slower backend, an older cached result). A change that touches an existing fallback turns it into an error.",
-		reason: "\"No fallback EVER, no rustc, prefer quick error so bug can be fixed\" (Andrew, 2026-10-26). A silent fallback hides the bug and turns it into wrong output (#386, #392); an error gets it fixed.",
+		info: "No fallback, ever. When blaze can't do something it stops with an error naming what and where, never quietly takes another path (rustc, a full link or rebuild instead of a patch, a slower backend, an older cached result, a default guessed for a missing value). A fallback that only logs its reason is still a fallback. A change that touches an existing fallback turns it into an error, and a bench or test that hits one fails instead of timing the slow path.",
+		reason: "\"No fallback EVER, no rustc, prefer quick error so bug can be fixed\" (Andrew, 2026-10-26). \"remove fallbacks, should just fail (so can hill climb easier)\" (Andrew, 2026-10-30). A silent fallback hides the bug and turns it into wrong output (#386, #392); an error gets it fixed. A fallback also hides a speed bug: on 2026-10-30 a generic edit took 33 s on Linux against cargo's 32 s because the patch path quietly fell back to a full link (\"no executable to add to\"), while the same edit patched in 6.3 s on macOS. A failure points at the one broken step; a slow number does not.",
 	},
 	{
 		id: "superset-of-rust",

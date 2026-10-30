@@ -25,7 +25,7 @@ fn ui_fixture(fixture: &str) -> String {
 /// [`ui_fixture`] of one file with minicore's items for `flags`
 /// (`crates/test-utils/src/minicore.rs`).
 fn ui_core(name: &str, flags: &str, source: &str) -> String {
-    ui_fixture(&format!("//- minicore: {flags}\n//- /{name} crate:main edition:2015\n{source}"))
+    ui_fixture(&format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}"))
 }
 
 #[test]
@@ -237,7 +237,7 @@ pub struct B {
     pub a: isize,
     b: isize,
 }
-//- /suggest-private-fields.rs crate:main edition:2015 deps:struct_field_privacy
+//- /suggest-private-fields.rs crate:other:main edition:2015 deps:struct_field_privacy
 //@ aux-build:struct_field_privacy.rs
 
 extern crate struct_field_privacy as xc;
@@ -334,7 +334,7 @@ pub struct Bar {
     pub my_field: u32,
     pub missing_field: i32,
 }
-//- /non-exhaustive-with-private-fields-147513.rs crate:main edition:2015 deps:non_exhaustive_with_private
+//- /non-exhaustive-with-private-fields-147513.rs crate:other:main edition:2015 deps:non_exhaustive_with_private
 //@ aux-build:non_exhaustive_with_private.rs
 
 extern crate non_exhaustive_with_private;
@@ -451,7 +451,7 @@ fn regression_test_for_issue_153388_b() {
 
 fn main() {}
 "#;
-    let messages: Vec<String> = checked(&format!("//- /main.rs crate:main\n{source}"))
+    let messages: Vec<String> = checked(&format!("//- /main.rs crate:other:main\n{source}"))
         .messages()
         .into_iter()
         .filter(|it| it.starts_with("E0063") || it.starts_with("E0027"))
@@ -1384,12 +1384,12 @@ fn a_value_a_format_string_captures() {
 }
 "###;
     let fixture = format!(
-        "//- minicore: fmt, panic\n//- /std.rs crate:std deps:core\n\
+        "//- minicore: fmt, panic\n//- /std.rs crate:std\n\
          pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; }} }}\n\
          #[macro_export]\nmacro_rules! format {{ ($($arg:tt)*) => {{ $crate::fmt::format(::core::format_args!($($arg)*)) }} }}\n\
          #[macro_export]\nmacro_rules! panic {{ ($($arg:tt)*) => {{ ::core::panic!($($arg)*) }} }}\n\
          pub mod fmt {{ pub fn format(_: ::core::fmt::Arguments<'_>) {{}} }}\n\
-         //- /format-args-capture-missing-variables.rs crate:main edition:2015 deps:std\n{source}"
+         //- /format-args-capture-missing-variables.rs crate:other:main edition:2015 deps:std\n{source}"
     );
     assert_eq!(ui_fixture(&fixture), r#"error: named argument never used
   --> $DIR/format-args-capture-missing-variables.rs:8:51

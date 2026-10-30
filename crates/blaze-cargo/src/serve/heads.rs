@@ -8,8 +8,9 @@
 //!   watchman's cookies do: the daemon writes a cookie file under the checkout's `target/`
 //!   (outside the view) and holds the request until the watcher reports the cookie and has
 //!   committed everything it was told before it. Only then does the session see it.
-//! - A checkout whose directory can't be read, or whose watch ended, fails the requests waiting
-//!   on it, naming it; the next request watches it again.
+//! - A checkout whose directory or a changed file of it can't be read, or whose watch ended,
+//!   fails the requests waiting on it, naming it, and its watch stops: the head never keeps a
+//!   file's old bytes as current. The next request watches it again.
 //! - A request that runs user code (a build, check, test or run) starts a round of the watches
 //!   of directories outside views ([`Outside`]) and is held until the round is in, so what its
 //!   checks of user code's inputs trust was heard before it ([`blaze_vfs::unchanged_since`]).
@@ -408,7 +409,7 @@ impl Heads {
                     ended = Some(format!("the checkout {head} can't be read: {error}"));
                 }
                 Watched::Unreadable { path, error } => {
-                    eprintln!("blaze serve: {head}/{path} changed and can't be read ({error}); the head keeps what it had");
+                    ended.get_or_insert_with(|| format!("{head}/{path} changed and can't be read: {error}"));
                 }
                 Watched::Ended(error) => {
                     ended.get_or_insert_with(|| match error {
@@ -469,15 +470,6 @@ impl Heads {
                 let tag = Tag(tags + (number % (1 << 31)) * 2 + 1);
                 effects.push(Effect::Remove { file: cookie.file, tag });
             }
-        }
-    }
-
-    /// Looks at every checkout again: what a read of the image found corrupt is mended by the
-    /// scan's writes.
-    pub fn rescan(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>) {
-        for checkout in self.checkouts.iter_mut().flatten() {
-            let dir = FileName::new(checkout.below.trim_end_matches('/')).expect("a checkout's directory is a name");
-            checkout.watcher.rescan(vfs, dir, effects);
         }
     }
 

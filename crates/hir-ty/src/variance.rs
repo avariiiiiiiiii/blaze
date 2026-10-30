@@ -24,7 +24,6 @@ use hir_def::{
 };
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{TypeFlags, TypeVisitableExt as _, Variance, inherent::IntoKind};
-use stdx::never;
 
 use crate::{
     CallableDefId,
@@ -244,7 +243,7 @@ impl<'db, 'f> Context<'db, 'f> {
             | TyKind::Coroutine(..)
             | TyKind::CoroutineClosure(..)
             | TyKind::Closure(..) => {
-                never!("Unexpected unnameable type in variance computation: {:?}", ty);
+                unreachable!("Unexpected unnameable type in variance computation: {:?}", ty);
             }
             TyKind::Ref(lifetime, ty, mutbl) => {
                 self.add_constraints_from_region(lifetime, variance);
@@ -313,7 +312,7 @@ impl<'db, 'f> Context<'db, 'f> {
             | TyKind::Placeholder(..)
             | TyKind::Infer(..)
             | TyKind::UnsafeBinder(..) => {
-                never!("unexpected type encountered in variance inference: {:?}", ty)
+                unreachable!("unexpected type encountered in variance inference: {:?}", ty)
             }
         }
     }
@@ -387,7 +386,7 @@ impl<'db, 'f> Context<'db, 'f> {
     ) {
         let contra = variance.xform(Variance::Contravariant);
         let Some(output) = sig_tys.next_back() else {
-            return never!("function signature has no return type");
+            unreachable!("function signature has no return type");
         };
         self.add_constraints_from_ty(output, variance);
         for input in sig_tys {
@@ -419,7 +418,7 @@ impl<'db, 'f> Context<'db, 'f> {
             | RegionKind::ReErased => {
                 // We don't expect to see anything but 'static or bound
                 // regions when visiting member types or method types.
-                never!(
+                unreachable!(
                     "unexpected region encountered in variance \
                       inference: {:?}",
                     region

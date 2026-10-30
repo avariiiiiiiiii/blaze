@@ -60,7 +60,7 @@ struct Load {
 }
 
 struct Phdr {
-    p_type: u32,
+    p_type: elf::ProgramType,
     flags: u32,
     vaddr: u64,
     filesz: u64,
@@ -71,7 +71,7 @@ struct Phdr {
 #[derive(Default)]
 struct Shdr {
     name: u32,
-    sh_type: u32,
+    sh_type: elf::SectionType,
     flags: u64,
     addr: u64,
     offset: u64,
@@ -87,7 +87,7 @@ impl Shdr {
     fn bytes(&self) -> [u8; SHDR] {
         let mut out = [0; SHDR];
         out[0..4].copy_from_slice(&self.name.to_le_bytes());
-        out[4..8].copy_from_slice(&self.sh_type.to_le_bytes());
+        out[4..8].copy_from_slice(&self.sh_type.0.to_le_bytes());
         out[8..16].copy_from_slice(&self.flags.to_le_bytes());
         out[16..24].copy_from_slice(&self.addr.to_le_bytes());
         out[24..32].copy_from_slice(&self.offset.to_le_bytes());
@@ -328,7 +328,7 @@ fn dev_run(loads: &[Load], plan: &Plan) -> Result<(), LinkError> {
                 if !start.is_multiple_of(page) || !(start - plan.base).is_multiple_of(page) {
                     return refuse(&format!("does not start on a {page:#x} page in the file and in memory")); // alloc: error path
                 }
-                if load.segment.flags() & elf::PF_W != 0 {
+                if load.segment.flags() & elf::PF_W.0 != 0 {
                     return refuse("is writable");
                 }
                 if load.zeroed || load.file_end != end {
@@ -496,15 +496,15 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     for (index, region) in regions.iter().enumerate() {
         let class = &region.class;
         let segment = Segment::of(class);
-        let mut flags = u64::from(elf::SHF_ALLOC);
+        let mut flags = elf::SHF_ALLOC.0;
         if segment.loader_writes() {
-            flags |= u64::from(elf::SHF_WRITE);
+            flags |= elf::SHF_WRITE.0;
         }
         if segment == Segment::Code {
-            flags |= u64::from(elf::SHF_EXECINSTR);
+            flags |= elf::SHF_EXECINSTR.0;
         }
         if matches!(class, Class::Tdata | Class::Tbss) {
-            flags |= u64::from(elf::SHF_TLS);
+            flags |= elf::SHF_TLS.0;
         }
         let mut shdr = Shdr {
             name: names.add(section_name(class)),
@@ -760,14 +760,14 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
 
     let mut head = Vec::with_capacity((EHDR + PHDR * phnum) as usize);
     head.extend_from_slice(&elf::ELFMAG);
-    head.put_u8(elf::ELFCLASS64);
-    head.put_u8(elf::ELFDATA2LSB);
-    head.put_u8(elf::EV_CURRENT);
-    head.put_u8(elf::ELFOSABI_NONE);
+    head.put_u8(elf::ELFCLASS64.0);
+    head.put_u8(elf::ELFDATA2LSB.0);
+    head.put_u8(elf::EV_CURRENT.0);
+    head.put_u8(elf::ELFOSABI_NONE.0);
     head.resize(16, 0);
-    head.put_u16(elf::ET_DYN);
+    head.put_u16(elf::ET_DYN.0);
     head.put_u16(writer.machine());
-    head.put_u32(u32::from(elf::EV_CURRENT));
+    head.put_u32(u32::from(elf::EV_CURRENT.0));
     head.put_u64(entry.unwrap_or(0));
     head.put_u64(EHDR);
     head.put_u64(shoff);
@@ -779,7 +779,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     head.put_u16(shdrs.len() as u16);
     head.put_u16(shstrndx as u16);
     for phdr in &phdrs {
-        head.put_u32(phdr.p_type);
+        head.put_u32(phdr.p_type.0);
         head.put_u32(phdr.flags);
         head.put_u64(phdr.vaddr.saturating_sub(plan.base));
         head.put_u64(phdr.vaddr);

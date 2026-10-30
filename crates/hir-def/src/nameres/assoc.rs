@@ -367,7 +367,8 @@ impl<'db> AssocItemCollector<'db> {
 
     fn collect_macro_items(&mut self, macro_call_id: MacroCallId) {
         if self.macro_depth > self.def_map.recursion_limit() {
-            tracing::warn!("macro expansion is too deep");
+            let diag = DefDiagnostic::recursion_overflow(self.db, self.module_id, macro_call_id);
+            self.diagnostics.push(diag);
             return;
         }
 

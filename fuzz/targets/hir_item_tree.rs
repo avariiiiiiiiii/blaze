@@ -88,6 +88,35 @@ const TYPE_ALIAS: u8 = 13;
 const UNION: u8 = 14;
 const USE: u8 = 15;
 
+/// An ast id for each of `kinds`, of the `ErasedFileAstIdKind` each item kind's syntax is
+/// (`span::ast_id`: the kind in the top 5 bits), its hash the item's place plus one.
+fn ast_ids(kinds: &[u8]) -> Vec<u32> {
+    (1..).zip(kinds)
+        .map(|(hash, &kind)| {
+            let erased: u32 = match kind {
+                CONST => 11,
+                ENUM => 1,
+                EXTERN_BLOCK => 15,
+                EXTERN_CRATE => 4,
+                FUNCTION => 12,
+                IMPL => 17,
+                MACRO2 => 5,
+                MACRO_CALL => 13,
+                MACRO_RULES => 6,
+                MOD => 7,
+                STATIC => 8,
+                STRUCT => 2,
+                TRAIT => 9,
+                TYPE_ALIAS => 14,
+                UNION => 3,
+                USE => 16,
+                _ => unreachable!("no item kind {kind}"),
+            };
+            hash | erased << 27
+        })
+        .collect()
+}
+
 /// `UseTree` kinds.
 const SINGLE: u32 = 0;
 const GLOB: u32 = 1;
@@ -227,11 +256,12 @@ fn items() -> Valid {
     w.u32(1);
     w.u32(0);
     w.name("test");
+    let kinds = vec![FUNCTION, MOD, STRUCT, USE, MACRO_CALL, IMPL, CONST];
     let columns = Columns {
         top_level: vec![1, 2, 3, 4, 5, 6],
-        kinds: vec![FUNCTION, MOD, STRUCT, USE, MACRO_CALL, IMPL, CONST],
+        ast_ids: ast_ids(&kinds),
+        kinds,
         data: vec![0; 7],
-        ast_ids: (1..=7).collect(),
         children: vec![0],
         consts: vec![[NONE, PRIV_EXPLICIT]],
         functions: vec![[0, PUB]],
@@ -282,7 +312,7 @@ fn token_tree() -> Valid {
         top_level: vec![0],
         kinds: vec![FUNCTION],
         data: vec![0],
-        ast_ids: vec![1],
+        ast_ids: ast_ids(&[FUNCTION]),
         functions: vec![[0, PUB]],
         attr_owners: vec![[0, 0, 1, NONE]],
         ..Columns::default()
@@ -302,23 +332,24 @@ fn every_kind() -> Valid {
     w.u32(1);
     plain(&mut w, "ex");
     let [vis, attrs, cfgs] = empty_tables::<3>(&mut w);
+    let kinds = vec![
+        STATIC,
+        EXTERN_BLOCK,
+        EXTERN_CRATE,
+        TRAIT,
+        TYPE_ALIAS,
+        UNION,
+        ENUM,
+        MACRO_RULES,
+        MACRO2,
+        MOD,
+        USE,
+    ];
     let columns = Columns {
         top_level: (1..=10).collect(),
-        kinds: vec![
-            STATIC,
-            EXTERN_BLOCK,
-            EXTERN_CRATE,
-            TRAIT,
-            TYPE_ALIAS,
-            UNION,
-            ENUM,
-            MACRO_RULES,
-            MACRO2,
-            MOD,
-            USE,
-        ],
+        ast_ids: ast_ids(&kinds),
+        kinds,
         data: vec![0; 11],
-        ast_ids: (1..=11).collect(),
         children: vec![0],
         enums: vec![[5, PUB]],
         extern_blocks: vec![[0, 1]],

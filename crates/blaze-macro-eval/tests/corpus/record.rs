@@ -1,7 +1,5 @@
 //! Each call of a proc macro as the front end made it, with what blaze-macro-eval's expander
-//! gave (the output the front end goes on with) and what each reference gave for the same
-//! call, run right after it and in the same order, so a macro's state sees the calls as the
-//! expander's does.
+//! gave (the output the front end goes on with).
 
 use std::{
     any::Any,
@@ -10,24 +8,9 @@ use std::{
 };
 
 use base_db::{ContentId, Crate, Db, Env};
-use blaze_macro_wasm::native;
 use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
 use span::Span;
 use tt::TopSubtree;
-
-/// Another host of blaze's a call is held against.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Reference {
-    /// blaze's WebAssembly host with blaze's module of the crate.
-    Wasm,
-    /// The fixture's macro built into this test against blaze's in-process bridge.
-    Native,
-}
-
-pub(crate) enum Referee {
-    Expander(Reference, Arc<dyn ProcMacroExpander>),
-    Native(native::Expander),
-}
 
 pub(crate) enum Outcome {
     Expanded(TopSubtree),
@@ -44,26 +27,10 @@ impl Outcome {
         }
     }
 
-    fn owned(result: Result<TopSubtree, ProcMacroExpansionError>) -> Outcome {
-        match result {
-            Ok(tree) => Outcome::Expanded(tree),
-            Err(ProcMacroExpansionError::Panic(message)) => Outcome::Panicked(message),
-            Err(ProcMacroExpansionError::System(why)) => Outcome::Failed(why),
-        }
-    }
-
     pub(crate) fn expanded(&self) -> Option<&TopSubtree> {
         match self {
             Outcome::Expanded(tree) => Some(tree),
             _ => None,
-        }
-    }
-
-    fn said(&self) -> String {
-        match self {
-            Outcome::Expanded(_) => "expanded".to_owned(),
-            Outcome::Panicked(message) => format!("panicked with {message:?}"),
-            Outcome::Failed(why) => format!("failed: {why}"),
         }
     }
 }
@@ -94,23 +61,6 @@ impl Call {
             mixed_site: self.mixed_site,
             current_dir: &self.current_dir,
         }
-    }
-
-    /// The anchors and contexts of the call's spans, as the store writes an output against
-    /// them.
-    fn spans(&self) -> proc_macro_api::kept::Spans {
-        let call = proc_macro_api::kept::Call {
-            name: &self.name,
-            kind: self.kind,
-            subtree: &self.subtree,
-            attrs: self.attrs.as_ref(),
-            env: &self.env,
-            def_site: self.def_site,
-            call_site: self.call_site,
-            mixed_site: self.mixed_site,
-            current_dir: &self.current_dir,
-        };
-        proc_macro_api::kept::given(&ContentId::default(), &call).1
     }
 
     /// What the call is about: the name of the item a derive or an attribute is on, the first
@@ -150,7 +100,6 @@ pub(crate) fn literals(tree: &TopSubtree) -> Vec<String> {
 pub(crate) struct Record {
     pub(crate) call: Call,
     pub(crate) eval: Outcome,
-    pub(crate) references: Vec<(Reference, Outcome)>,
 }
 
 impl Record {
@@ -163,77 +112,39 @@ impl Record {
         };
         format!("`{}::{}` on `{input}`", self.call.krate, self.call.name)
     }
-
-    /// Each way blaze-macro-eval's outcome differs from a reference's: every token tree (its
-    /// delimiter, character, spacing, text, literal kind and suffix, and its span's range,
-    /// anchor and context), the spans as the store writes them against the call's, and a
-    /// panic's message.
-    pub(crate) fn differences(&self, out: &mut Vec<String>) {
-        let spans = self.call.spans();
-        for (which, theirs) in &self.references {
-            let said = match (&self.eval, theirs) {
-                (Outcome::Expanded(ours), Outcome::Expanded(theirs)) => native::difference(ours, theirs).or_else(|| {
-                    (proc_macro_api::kept::written(ours, &spans) != proc_macro_api::kept::written(theirs, &spans))
-                        .then(|| "its spans are written otherwise against the call's".to_owned())
-                }),
-                (Outcome::Panicked(ours), Outcome::Panicked(theirs)) => {
-                    (ours != theirs).then(|| format!("it panicked with {ours:?} and the reference with {theirs:?}"))
-                }
-                (ours, theirs) => Some(format!("it {} and the reference {}", ours.said(), theirs.said())),
-            };
-            if let Some(said) = said {
-                out.push(format!("{} against {which:?}: {said}", self.what()));
-            }
-        }
-    }
 }
 
 pub(crate) type Records = Arc<Mutex<Vec<Record>>>;
 
-/// blaze-macro-eval's expander of one macro, recording each call with what it and each
-/// reference gave.
+/// blaze-macro-eval's expander of one macro, recording each call with what it gave.
 pub(crate) struct Recorder {
     krate: Box<str>,
     name: Box<str>,
     kind: ProcMacroKind,
     eval: Arc<dyn ProcMacroExpander>,
-    references: Vec<Referee>,
     records: Records,
 }
 
 impl Recorder {
     /// `eval`, of crate `krate`, recording into `records`.
-    pub(crate) fn wrap(krate: &str, eval: ProcMacro, references: Vec<Referee>, records: &Records) -> ProcMacro {
+    pub(crate) fn wrap(krate: &str, eval: ProcMacro, records: &Records) -> ProcMacro {
         let ProcMacro { name, kind, expander, disabled } = eval;
         let recorder = Recorder {
             krate: krate.into(),
             name: name.as_str().into(),
             kind,
             eval: expander,
-            references,
             records: records.clone(),
         };
         ProcMacro { name, kind, expander: Arc::new(recorder), disabled }
     }
 
     fn run(&self, db: &Db, calling: Option<Crate>, call: ProcMacroCall<'_>) -> Result<TopSubtree, ProcMacroExpansionError> {
-        let expand = |expander: &dyn ProcMacroExpander| match calling {
-            Some(krate) => expander.expand_in(db, krate, call),
-            None => expander.expand(db, call),
+        let expanded = match calling {
+            Some(krate) => self.eval.expand_in(db, krate, call),
+            None => self.eval.expand(db, call),
         };
-        let expanded = expand(&*self.eval);
         let eval = Outcome::of(&expanded);
-        let references = self
-            .references
-            .iter()
-            .map(|referee| match referee {
-                Referee::Expander(which, expander) => (*which, Outcome::owned(expand(&**expander))),
-                Referee::Native(entry) => {
-                    let ran = native::expand(*entry, Some(db), call.subtree, call.attrs, call.def_site, call.call_site, call.mixed_site);
-                    (Reference::Native, Outcome::owned(ran))
-                }
-            })
-            .collect();
         let recorded = Call {
             krate: self.krate.clone(),
             name: self.name.clone(),
@@ -247,7 +158,7 @@ impl Recorder {
             mixed_site: call.mixed_site,
             current_dir: call.current_dir.to_owned(),
         };
-        self.records.lock().unwrap_or_else(|it| it.into_inner()).push(Record { call: recorded, eval, references });
+        self.records.lock().unwrap_or_else(|it| it.into_inner()).push(Record { call: recorded, eval });
         expanded
     }
 }

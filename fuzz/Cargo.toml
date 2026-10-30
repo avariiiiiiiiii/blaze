@@ -17,8 +17,8 @@ repository.workspace = true
 [lib]
 doctest = false
 
-# One binary per target; `targets/{cas_shared,hir_shared,hir_expr_shared,macro_wasm_guest,
-# proc_macro_shared,syntax_shared}.rs` are modules of their targets.
+# One binary per target; `targets/{cas_shared,hir_shared,hir_expr_shared,syntax_shared}.rs`
+# are modules of their targets.
 [[bin]]
 name = "api_cbor"
 path = "targets/api_cbor.rs"
@@ -160,38 +160,6 @@ name = "live_patch"
 path = "targets/live_patch.rs"
 
 [[bin]]
-name = "macro_wasm_host"
-path = "targets/macro_wasm_host.rs"
-
-[[bin]]
-name = "macro_wasm_lex"
-path = "targets/macro_wasm_lex.rs"
-
-[[bin]]
-name = "macro_wasm_validate"
-path = "targets/macro_wasm_validate.rs"
-
-[[bin]]
-name = "macro_wasm_wire"
-path = "targets/macro_wasm_wire.rs"
-
-[[bin]]
-name = "proc_macro_flat_tree"
-path = "targets/proc_macro_flat_tree.rs"
-
-[[bin]]
-name = "proc_macro_frames"
-path = "targets/proc_macro_frames.rs"
-
-[[bin]]
-name = "proc_macro_legacy"
-path = "targets/proc_macro_legacy.rs"
-
-[[bin]]
-name = "proc_macro_message"
-path = "targets/proc_macro_message.rs"
-
-[[bin]]
 name = "proc_macro_tt_wire"
 path = "targets/proc_macro_tt_wire.rs"
 
@@ -269,7 +237,6 @@ blaze-image.workspace = true
 blaze-link = { workspace = true, features = ["fuzz"] }
 # `fuzz_checks`, v1's checks of a decoded patch, which `live_patch` runs.
 blaze-live = { workspace = true, features = ["fuzz"] }
-blaze-macro-wasm.workspace = true
 blaze-mem.workspace = true
 # `cbor::reference`, the codec's oracle, which the CBOR targets compare the fast one with.
 blaze-protocol = { workspace = true, features = ["reference"] }
@@ -284,11 +251,6 @@ intern = { workspace = true, features = ["fuzz"] }
 object = { workspace = true, features = ["write"] }
 # `LexedStr::lexes_alike`, the fast lexer against `rustc_lexer` alone.
 parser = { workspace = true, features = ["fuzz"] }
-# `Utf8PathBuf`, the library path of the proc-macro targets' requests.
-paths.workspace = true
-# The requests of the proc-macro targets, and `bridge::wire`, the bytes a wasm module writes,
-# which `macro_wasm_wire`'s seeds are.
-proc-macro-api.workspace = true
 serde = { workspace = true, features = ["derive"] }
 span.workspace = true
 syntax.workspace = true

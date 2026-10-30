@@ -15,7 +15,11 @@ use blaze_lazy::{Purpose, Refused};
 use blaze_units::schema::Mode;
 use rustc_hash::FxHashMap;
 
-use super::{Job, Real, UnitWriter, codegen, package_of};
+use super::{
+    Job, Real, UnitWriter, codegen,
+    error::{UnitError, manifest_dir},
+    package_of,
+};
 use crate::serve::work::Runs;
 
 pub(crate) mod inproc;
@@ -159,16 +163,19 @@ pub(crate) fn start(
         packages.sort_unstable();
         packages.dedup();
         match packages.as_slice() {
-            [one] => units
-                .packages
-                .binary_search_by(|it| it.id.as_str().cmp(one))
-                .ok()
-                .and_then(|at| units.packages[at].default_run.as_deref()),
+            [one] => {
+                let at = units
+                    .packages
+                    .binary_search_by(|it| it.id.as_str().cmp(one))
+                    .map_err(|_| ApiError::new(format!("the build has no package `{one}`"), None))?;
+                units.packages[at].default_run.as_deref()
+            }
             _ => None,
         }
     };
     let chosen = choose(built, bin, default_run).map_err(|what| ApiError::new(what, None))?;
-    let program = chosen.executable.clone().unwrap_or_else(|| chosen.path.clone());
+    let program =
+        chosen.executable.clone().ok_or_else(|| UnitError::NoExecutable { target: chosen.target.name.clone() })?;
     let target = &chosen.target;
     let kinds: Vec<&str> = target.kinds().collect(); // alloc: once per run, a word or two
     let at = job
@@ -189,7 +196,7 @@ pub(crate) fn start(
         }
         None => (program, args.to_vec()),
     };
-    let manifest_dir = PathBuf::from(&package.manifest_path).parent().map(PathBuf::from).unwrap_or_default();
+    let manifest_dir = manifest_dir(&package.name, &package.manifest_path)?;
     let sandbox = match job.sandbox_off() {
         true => Sandbox::Off,
         false => Sandbox::On {
@@ -249,7 +256,11 @@ impl Runs<Real> for Program {
                 out.push(Response::Ran { code: None, stdout: Vec::new(), stderr: error.0.into_bytes() });
                 Some(false)
             }
-            _ => Some(false),
+            other => {
+                let what = UnitError::RunEnded { how: format!("{other:?}") }.to_string();
+                out.push(Response::Ran { code: None, stdout: Vec::new(), stderr: what.into_bytes() });
+                Some(false)
+            }
         }
     }
 

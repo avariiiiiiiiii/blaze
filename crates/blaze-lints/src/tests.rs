@@ -107,7 +107,7 @@ fn lint_once(fixture: &str, flags: &str, conf: Conf) -> String {
         let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
         let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
         let name_of = |file: FileId| names.get(&file).cloned();
-        let found = check(&db, krate, &setup, &name_of);
+        let found = check(&db, krate, &setup, &name_of).expect("every file of the crates is named");
         let sources = Sources::of(texts);
         found
             .iter()

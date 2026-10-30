@@ -32,7 +32,7 @@ fn inference_unstable() {
     let fixture = format!(
         "{STD}//- /auxiliary/inference_unstable_iterator.rs crate:inference_unstable_iterator edition:2015 library\n{}\
          //- /auxiliary/inference_unstable_itertools.rs crate:inference_unstable_itertools edition:2015 library\n{}\
-         //- /inference_unstable.rs crate:main edition:2015 \
+         //- /inference_unstable.rs crate:other:main edition:2015 \
          deps:std,inference_unstable_iterator,inference_unstable_itertools\n{source}",
         include_str!("unstable_names/auxiliary/inference_unstable_iterator.rs"),
         include_str!("unstable_names/auxiliary/inference_unstable_itertools.rs"),

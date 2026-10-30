@@ -17,10 +17,10 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use crate::arena::{FrameVec, collect_in};
-use crate::LinkError;
 use crate::cow::CowBytes;
+use crate::{LinkError, Refusal};
 use crate::model::{Class, Delta, Pages, Placed, Region, Writer};
-use crate::stage::{Stage, error};
+use crate::stage::{Stage, error, refused};
 use crate::state::{Space, State, What};
 use crate::write::{Changes, next_synthesis};
 
@@ -323,8 +323,9 @@ impl<'a> Stage<'a> {
                 .ok_or_else(|| error(None, format!("the writer filled {class:?}, which the image has no region for")))?;
             let capacity = self.new.spaces[at].region.capacity;
             if bytes.len() as u64 > capacity {
-                return Err(error(
+                return Err(refused(
                     None,
+                    Refusal::NoRoom { need: bytes.len() as u64, room: capacity },
                     // alloc: error path
                     format!(
                         "{class:?} is {} bytes and has room for {capacity}: link the image from scratch",

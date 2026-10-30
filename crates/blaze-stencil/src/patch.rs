@@ -35,7 +35,7 @@ use blaze_mem::{
     Tag,
     frame::{self, Frame},
 };
-use cranelift_codegen::ir;
+use cranelift_codegen::{ir, packed_option::ReservedValue};
 
 use crate::{
     Error, Target,
@@ -137,7 +137,7 @@ impl Default for Sel {
         Sel {
             kind: Kind::Skip,
             shape: NO_SHAPE,
-            args: [ir::Value::from_u32(NONE); 3],
+            args: [ir::Value::reserved_value(); 3],
             nargs: 0,
             stencil: NONE,
             imm: 0,

@@ -19,7 +19,6 @@ serde = { workspace = true, features = ["derive"] }
 zstd.workspace = true
 
 [dev-dependencies]
-blake3.workspace = true
 blaze-alloc-count.workspace = true
 blaze-v2-proof.workspace = true
 hegeltest.workspace = true

@@ -24,7 +24,7 @@ fn stderr(fixture: &str) -> String {
 /// [`crate::tests::ui`] of a UI test that needs core's items: core is minicore with `flags`
 /// (`crates/test-utils/src/minicore.rs`).
 pub(crate) fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    stderr(&format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}"))
+    stderr(&format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}"))
 }
 
 /// [`ui_core`] of a UI test that uses std: `std` is a crate of `std_items`, written as std
@@ -37,7 +37,7 @@ pub(crate) fn ui_std(name: &str, edition: &str, flags: &str, std: (&str, &str), 
         .map(|it| format!("    pub mod {it} {{ pub use core::prelude::{it}::*; {prelude} }}\n"))
         .collect();
     stderr(&format!(
-        "//- minicore: {flags}\n//- /std.rs crate:std deps:core\npub mod prelude {{\n{preludes}}}\n{std_items}\n\
-         //- /{name} crate:main edition:{edition} deps:std\n{source}"
+        "//- minicore: {flags}\n//- /std.rs crate:std\npub mod prelude {{\n{preludes}}}\n{std_items}\n\
+         //- /{name} crate:other:main edition:{edition} deps:std\n{source}"
     ))
 }

@@ -24,7 +24,6 @@ use object::{
     RelocationTarget, elf, macho, pe,
 };
 use rustc_hash::{FxBuildHasher, FxHashMap};
-use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
 
 use super::{
@@ -1456,7 +1455,7 @@ impl Named {
                     | elf::R_AARCH64_LDST32_ABS_LO12_NC
                     | elf::R_AARCH64_LDST64_ABS_LO12_NC
                     | elf::R_AARCH64_LDST128_ABS_LO12_NC => {
-                        return Some((Reloc::Aarch64AddAbsLo12Nc, Some(r_type)));
+                        return Some((Reloc::Aarch64AddAbsLo12Nc, Some(r_type.0)));
                     }
                     _ => return None,
                 }
@@ -1495,7 +1494,7 @@ impl Named {
 /// The machine code of the function that `text` defines. Each text is assembled once: the
 /// process keeps the code for as long as it runs. A thread that asked for a text before has it from its own table, with no
 /// write another core sees and no hash of the text but `FxHash`; one that has not looks in
-/// the shared [`Table`] by its SHA-256, with loads alone.
+/// the shared [`Table`] by its BLAKE3 hash, with loads alone.
 pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, String> {
     thread_local! {
         /// What this thread had assembled for the triple it names, by text.
@@ -1523,12 +1522,11 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, S
 /// [`assemble`] of a text this thread has not asked for.
 fn assembled(triple: &str, text: &str) -> Result<&'static Assembled, String> {
     static ASSEMBLED: Table<[u8; 32], Assembled> = Table::new();
-    let mut hasher = Sha256::new();
-    hasher.update(b"blaze asm 3");
-    hasher.update(triple);
-    hasher.update([0]);
-    hasher.update(text);
-    let key: [u8; 32] = hasher.finalize().into();
+    let mut hasher = blaze_ids::b3::Hasher::new_derive_key("blaze asm 4");
+    hasher.update(triple.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(text.as_bytes());
+    let key: [u8; 32] = hasher.finalize();
     // A digest's bytes are as good a hash as any of them.
     let hash = u64::from_le_bytes(key[..8].try_into().expect("8 bytes"));
     if let Some((_, code)) = ASSEMBLED.get(hash, &key) {

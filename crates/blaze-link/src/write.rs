@@ -357,6 +357,11 @@ impl Column {
         }
     }
 
+    /// Whether the symbol of `value`'s error `at` is in a piece the stage removed.
+    fn removed(&self, at: u32) -> bool {
+        matches!(self.whys.get(at as usize), Some(Why::Removed))
+    }
+
     fn why(&self, symbols: &Symbols, sym: Sym, at: u32) -> String {
         match self.whys.get(at as usize) {
             Some(why) => why.say(symbols),
@@ -508,7 +513,7 @@ impl Reloc<'_> {
             };
             let value = match self.column.value(fixup.target) {
                 Ok(value) => value,
-                Err(_) if unwind => {
+                Err(at) if unwind && self.column.removed(at) => {
                     let width = reloc::width(fixup.apply).min(place.len());
                     place[..width].fill(0);
                     continue;
@@ -1205,8 +1210,10 @@ fn gaps<T: Addr>(old: &[T], owners: &[PieceId], dropped: &[u32], entries: &[(Pie
             out.push(Gap { old: blocks[block].clone(), new: 0 });
             block += 1;
         }
-        let end = match blocks.get(block) {
-            Some(it) if it.start <= lo => it.end,
+        let end = match (out.last(), blocks.get(block)) {
+            // Inside (or right after) the block the last gap already took.
+            (Some(last), _) if lo <= last.old.end => last.old.end,
+            (_, Some(it)) if it.start <= lo => it.end,
             _ => lo,
         };
         match out.last_mut() {
@@ -1902,6 +1909,8 @@ mod tests {
         assert_eq!(column.value(syms[4]), Err(0));
         assert_eq!(column.value(syms[5]), Err(u32::MAX));
         assert_eq!(column.value(Symbols::join(40, 1 << 20)), Err(u32::MAX));
+        assert!(column.removed(0), "an unwind record's target in a removed piece is zeroed");
+        assert!(!column.removed(u32::MAX), "any other unresolved target of an unwind record is an error");
         assert_eq!(column.cells(syms[2]).plt, 0x2000);
         assert_eq!(column.cells(syms[2]).got, [NONE; 4]);
         assert_eq!(column.cells(syms[0]).got, [NONE, 0x3000, NONE, NONE]);

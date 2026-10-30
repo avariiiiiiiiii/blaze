@@ -231,15 +231,13 @@ pub const GIVEN: [&str; 47] = [
 ];
 
 /// Whether `name` is one a script's `rustc-env` may not set: one of [`GIVEN`], or what cargo
-/// gives a crate under `CARGO_PKG_` and `CARGO_BIN_EXE_`, or what blaze gives one under
-/// `BLAZE_PROC_MACRO_LIBRARY_` (`proc-macro-libraries` in `[package.metadata.blaze]`, as
-/// `crates/proc-macro-srv/Cargo.toml` uses it). What cargo gives only build scripts
+/// gives a crate under `CARGO_PKG_` and `CARGO_BIN_EXE_`. What cargo gives only build scripts
 /// (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_MANIFEST_LINKS`) is not
 /// one: a crate has it only when its script forwards it, as rav1e's does. Nor is
 /// `CARGO_COMMIT_HASH`, which cargo's build sets for cargo, or a `RUSTC_*` no tool reads, such
 /// as rust-analyzer's `RUSTC_VERSION`.
 pub fn given_by_cargo(name: &str) -> bool {
-    const PREFIXES: [&str; 3] = ["CARGO_PKG_", "CARGO_BIN_EXE_", "BLAZE_PROC_MACRO_LIBRARY_"];
+    const PREFIXES: [&str; 2] = ["CARGO_PKG_", "CARGO_BIN_EXE_"];
     GIVEN.binary_search(&name).is_ok() || PREFIXES.iter().any(|it| name.starts_with(it))
 }
 
@@ -441,16 +439,6 @@ mod tests {
         assert_eq!(
             refused_lines("cargo::rustc-env=RUSTC_BOOTSTRAP=1\n"),
             ["cargo::rustc-env=RUSTC_BOOTSTRAP=1"]
-        );
-    }
-
-    #[test]
-    fn rustc_env_may_not_set_a_proc_macro_library_blaze_gives() {
-        assert!(given_by_cargo("BLAZE_PROC_MACRO_LIBRARY_PROC_MACRO_TEST_IMPL"));
-        assert!(!given_by_cargo("BLAZE_PROC_MACRO_LIBRARY"));
-        assert_eq!(
-            refused_lines("cargo::rustc-env=BLAZE_PROC_MACRO_LIBRARY_X=/tmp/libx.so\n"),
-            ["cargo::rustc-env=BLAZE_PROC_MACRO_LIBRARY_X=/tmp/libx.so"]
         );
     }
 

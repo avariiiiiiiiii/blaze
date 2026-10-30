@@ -14,7 +14,7 @@ fn ui(name: &str, source: &str, files: &[(&str, &str)]) -> String {
     if files.is_empty() {
         return ui_with(name, "2015", source, &Options::default());
     }
-    let mut fixture = format!("//- /{name} crate:main edition:2015\n{source}");
+    let mut fixture = format!("//- /{name} crate:other:main edition:2015\n{source}");
     for (path, text) in files {
         fixture.push_str(&format!("//- /{path}\n{text}"));
     }
@@ -24,7 +24,7 @@ fn ui(name: &str, source: &str, files: &[(&str, &str)]) -> String {
 
 /// The messages of `lints` that `source`, of edition 2021, gets, with their lint names.
 fn messages(source: &str, lints: &[&str]) -> Vec<String> {
-    let fixture = format!("//- /main.rs crate:main edition:2021\n{source}");
+    let fixture = format!("//- /main.rs crate:other:main edition:2021\n{source}");
     checked_with(&fixture, "", &Options::default())
         .messages()
         .into_iter()

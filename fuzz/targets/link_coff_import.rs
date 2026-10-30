@@ -106,9 +106,9 @@ fn seeds() -> Vec<Vec<u8>> {
 }
 
 fn named() -> Vec<(&'static str, Vec<u8>)> {
-    let code = pe::IMPORT_OBJECT_CODE | (pe::IMPORT_OBJECT_NAME << 2);
-    let data = pe::IMPORT_OBJECT_DATA | (pe::IMPORT_OBJECT_NAME_NO_PREFIX << 2);
-    let ordinal = pe::IMPORT_OBJECT_CODE | (pe::IMPORT_OBJECT_ORDINAL << 2);
+    let code = pe::IMPORT_OBJECT_CODE.0 | (pe::IMPORT_OBJECT_NAME.0 << 2);
+    let data = pe::IMPORT_OBJECT_DATA.0 | (pe::IMPORT_OBJECT_NAME_NO_PREFIX.0 << 2);
+    let ordinal = pe::IMPORT_OBJECT_CODE.0 | (pe::IMPORT_OBJECT_ORDINAL.0 << 2);
     let short = [
         ("foo.dll", short_import(code, 3, &["f", "foo.dll"])),
         ("foo.dll", short_import(data, 0, &["_v", "foo.dll"])),
@@ -134,7 +134,7 @@ fn thunk_past_usize() -> Vec<u8> {
 fn short_import(types: u16, hint: u16, strings: &[&str]) -> Vec<u8> {
     let strings: Vec<u8> = strings.iter().flat_map(|it| it.bytes().chain([0])).collect();
     let mut out = Vec::new();
-    for value in [pe::IMAGE_FILE_MACHINE_UNKNOWN, 0xffff, 0, pe::IMAGE_FILE_MACHINE_AMD64] {
+    for value in [pe::IMAGE_FILE_MACHINE_UNKNOWN.0, 0xffff, 0, pe::IMAGE_FILE_MACHINE_AMD64.0] {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out.extend_from_slice(&0u32.to_le_bytes());

@@ -260,7 +260,10 @@ fn a_mismatch_and_an_unmet_bound_say_why_they_were_required() {
     let db = fixture::db(
         r#"
 //- minicore: sized, copy
-fn else_branch(c: bool) -> u8 {
+fn else_branch(c: bool) {
+    let _ = if c { 1u8 } else { true };
+}
+fn else_branch_expected(c: bool) -> u8 {
     if c { 1u8 } else { true }
 }
 fn first_arm(x: u8) -> u8 {
@@ -302,6 +305,9 @@ fn bound() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(mismatches("else_branch"), [ObligationCauseCode::IfExpression]);
+        // rustc's `check_expr_if` gives the else block the return type as a hard expectation,
+        // so the block's own tail is what fails to coerce.
+        assert_eq!(mismatches("else_branch_expected"), [ObligationCauseCode::BlockTailExpression]);
         assert_eq!(mismatches("first_arm"), [ObligationCauseCode::BlockTailExpression]);
         // The `!` arm is no prior arm: rustc points at `1u8` alone.
         assert_eq!(mismatches("later_arm"), [ObligationCauseCode::MatchExpressionArm { prior_arms: 1 }]);

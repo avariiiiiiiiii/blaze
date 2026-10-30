@@ -278,7 +278,7 @@ LL | #![deny(unreachable_code)]
 error: aborting due to 1 previous error
 
 "##;
-    assert_eq!(ui_std("expr_again.rs", "2015", "sized,fmt", PRINTLN, source), stderr);
+    assert_eq!(ui_std("expr_again.rs", "2015", "sized, fmt", PRINTLN, source), stderr);
 }
 
 #[test]
@@ -373,5 +373,5 @@ LL |       println!("I am dead");
 error: aborting due to 4 previous errors
 
 "##;
-    assert_eq!(ui_std("expr_match.rs", "2015", "sized,fmt,option", PRINTLN, source), stderr);
+    assert_eq!(ui_std("expr_match.rs", "2015", "sized, fmt, option", PRINTLN, source), stderr);
 }

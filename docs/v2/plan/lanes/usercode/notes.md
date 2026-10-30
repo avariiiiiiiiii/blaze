@@ -5,6 +5,11 @@ date: 2026-10-29
 ---
 # blaze v2 usercode: design notes
 
+2026-10-30: the wasm host (`blaze-macro-wasm`), `blaze-wasi`, rust-analyzer's server
+(`proc-macro-srv`, `proc-macro-srv-cli`) and `proc-macro-api`'s client are deleted; every proc macro
+runs on `blaze-macro-eval` ([dedup.md](../dedup.md#proc-macros-one-engine-blaze-macro-eval)). What
+this says of them is the record of the plan at its date.
+
 Notes of the `usercode` lane on [usercode.md](../usercode.md), as of 2026-10-29. Code:
 `crates/blaze-usercode/` (the lane's own), the sandbox in `crates/blaze-cargo/src/sandbox*`,
 build scripts in `crates/blaze-build-script/`, proc macros in `crates/blaze-expand/`,

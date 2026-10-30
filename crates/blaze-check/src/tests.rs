@@ -915,7 +915,8 @@ fn the_generator_is_splitmix64() {
 fn a_schedule_reads_back_as_it_was_written() {
     let path = crate::path::Path::replay("01a0{30}+-.", 100).unwrap_or_else(|why| panic!("{why}"));
     assert_eq!(path.len(), 8);
-    assert!(crate::path::Path::replay("01x", 100).is_err());
+    assert!(crate::path::Path::replay("01#", 100).is_err());
+    assert!(crate::path::Path::replay("01{x}", 100).is_err());
 }
 
 #[global_allocator]

@@ -147,17 +147,22 @@ pub fn flush() {
 }
 
 impl Library {
-    /// Notes what a run did: one that left state is told the store with the run's puts.
-    fn saw(&self, ran: &Ran) {
-        let Some(contradicted) = self.seen.saw(!ran.statics.is_empty()) else { return };
+    /// Notes what a run did: one that left state is told the store with the run's puts. One
+    /// that left state where the store said the crate keeps none is an error: this build's
+    /// calls of it ran, or were reused, as if each started from nothing.
+    fn saw(&self, ran: &Ran) -> Result<(), ProcMacroExpansionError> {
+        let Some(contradicted) = self.seen.saw(!ran.statics.is_empty()) else { return Ok(()) };
         tell(self, STATEFUL);
         if contradicted {
-            eprintln!(
-                "blaze: the proc macros of `{}` keep state between expansions, which the store \
-                 said they did not: they expand in a session from the next load",
+            // alloc: error path
+            return Err(ProcMacroExpansionError::System(format!(
+                "the proc macros of `{}` keep state between expansions, which the store said they \
+                 did not: this build's expansions of them may not be what rustc gives; they expand \
+                 in a session from the next load",
                 self.name
-            );
+            )));
         }
+        Ok(())
     }
 
     /// The session of `calling` in the database's revision now, started again when it was of
@@ -216,7 +221,7 @@ struct Evaluated {
 }
 
 fn refused(why: String) -> ProcMacroLoadingError {
-    ProcMacroLoadingError::ProcMacroSrvError(why.into_boxed_str())
+    ProcMacroLoadingError::Refused(why.into_boxed_str())
 }
 
 /// The macros of `krate`, a proc-macro crate, each run on blaze's compiler in this process
@@ -255,7 +260,7 @@ pub fn load(db: &Db, krate: Crate, toolchain: ContentId) -> ProcMacroLoadResult 
     LIBRARIES.lock().unwrap_or_else(|it| it.into_inner()).push(Arc::downgrade(&library));
     let functions = run::functions(db, krate);
     if functions.is_empty() {
-        return Err(ProcMacroLoadingError::NoProcMacros);
+        return Err(refused(format!("the proc-macro crate `{}` has no proc macros", library.name))); // alloc: error path
     }
     Ok(functions
         .into_iter()
@@ -329,7 +334,7 @@ impl Evaluated {
             let preset: &[(StaticId, Vec<u8>)] = if held.holds { &[] } else { &held.statics };
             self.run_on(db, code, runs, call, preset, replayed, &this)?
         };
-        library.saw(&ran);
+        library.saw(&ran)?;
         let session = &mut *held;
         if !ran.statics.is_empty() {
             session.holds |= ran.statics.iter().any(|it| it.2);

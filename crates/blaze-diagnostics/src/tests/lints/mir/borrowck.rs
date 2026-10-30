@@ -9,8 +9,8 @@ use crate::tests::{checked, ui};
 /// its message; the lints and the closing lines left out.
 fn errors(minicore: Option<&str>, source: &str) -> Vec<String> {
     let header = match minicore {
-        Some(flags) => format!("//- minicore: {flags}\n//- /main.rs crate:main\n"),
-        None => "//- /main.rs crate:main\n".to_owned(),
+        Some(flags) => format!("//- minicore: {flags}\n//- /main.rs crate:other:main\n"),
+        None => "//- /main.rs crate:other:main\n".to_owned(),
     };
     let checked = checked(&format!("{header}{source}"));
     checked

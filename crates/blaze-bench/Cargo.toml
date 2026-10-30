@@ -15,10 +15,15 @@ rust-version.workspace = true
 blaze-cas.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
-tango-bench = "0.9"
+salsa.workspace = true
+tango-bench.workspace = true
 
 [[bench]]
 name = "store"
+harness = false
+
+[[bench]]
+name = "query_hit"
 harness = false
 
 [lints]

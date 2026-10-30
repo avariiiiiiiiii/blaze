@@ -470,11 +470,11 @@ trait G where Self: D + E {}
     )
     .into_db();
     crate::attach_db(&db, || {
-        let interner = DbInterner::new_no_crate(&db);
         for name in ["A", "B", "C", "D", "E", "F", "G"] {
-            let (_, ModuleDefId::TraitId(trait_)) = type_item(&db, name) else {
+            let (krate, ModuleDefId::TraitId(trait_)) = type_item(&db, name) else {
                 panic!("`{name}` is a trait")
             };
+            let interner = DbInterner::new_with(&db, krate);
             let identity = Binder::dummy(TraitRef::identity(interner, trait_.into()));
             let mut elaborated: Vec<_> =
                 rustc_type_ir::elaborate::supertraits(interner, identity).map(|it| it.def_id().0).collect();

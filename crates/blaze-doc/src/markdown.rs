@@ -6,7 +6,8 @@
 //! 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0 (`LangString::parse`, `map_line`).
 
 use pulldown_cmark::{
-    BrokenLink, CodeBlockKind, CowStr, Event, HeadingLevel, LinkType, Parser, Tag,
+    BrokenLink, BrokenLinkCallback, CodeBlockKind, CowStr, Event, HeadingLevel, LinkType, Parser,
+    Tag, TagEnd,
 };
 use rustc_hash::FxHashMap;
 
@@ -48,11 +49,7 @@ pub(crate) struct Context<'a, 'w> {
     pub(crate) heading_offset: u32,
 }
 
-fn parser<'a, 'b>(
-    markdown: &'a str,
-    // dyn: pulldown-cmark 0.9's `BrokenLinkCallback`, made once per block of docs.
-    callback: &'b mut dyn FnMut(BrokenLink<'a>) -> Option<(CowStr<'a>, CowStr<'a>)>,
-) -> Parser<'a, 'b> {
+fn parser<'a, F: BrokenLinkCallback<'a>>(markdown: &'a str, callback: F) -> Parser<'a, F> {
     Parser::new_with_broken_link_callback(markdown, links::options(), Some(callback))
 }
 
@@ -122,10 +119,10 @@ fn rewrite<'a>(
     let mut iter = events.into_iter().peekable();
     while let Some(event) = iter.next() {
         match event {
-            Event::Start(Tag::Link(kind, dest, title)) => {
+            Event::Start(Tag::Link { link_type: kind, dest_url: dest, title, id }) => {
                 let mut inner = vec![];
                 for event in iter.by_ref() {
-                    if matches!(event, Event::End(Tag::Link(..))) {
+                    if matches!(event, Event::End(TagEnd::Link)) {
                         break;
                     }
                     inner.push(event);
@@ -144,18 +141,14 @@ fn rewrite<'a>(
                         };
                         match cx.writer.url(target) {
                             Some(url) => {
-                                let title: CowStr<'a> = Writer::title(target).into();
-                                out.push(Event::Start(Tag::Link(
-                                    LinkType::Inline,
-                                    url.clone().into(),
-                                    title.clone(),
-                                )));
+                                out.push(Event::Start(Tag::Link {
+                                    link_type: LinkType::Inline,
+                                    dest_url: url.into(),
+                                    title: Writer::title(target).into(),
+                                    id: "".into(),
+                                }));
                                 out.extend(inner);
-                                out.push(Event::End(Tag::Link(
-                                    LinkType::Inline,
-                                    url.into(),
-                                    title,
-                                )));
+                                out.push(Event::End(TagEnd::Link));
                             }
                             None => out.extend(inner),
                         }
@@ -176,16 +169,21 @@ fn rewrite<'a>(
                         }
                     }
                     None => {
-                        out.push(Event::Start(Tag::Link(kind, dest.clone(), title.clone())));
+                        out.push(Event::Start(Tag::Link {
+                            link_type: kind,
+                            dest_url: dest,
+                            title,
+                            id,
+                        }));
                         out.extend(inner);
-                        out.push(Event::End(Tag::Link(kind, dest, title)));
+                        out.push(Event::End(TagEnd::Link));
                     }
                 }
             }
-            Event::Start(Tag::Heading(level, _, _)) => {
+            Event::Start(Tag::Heading { level, .. }) => {
                 let mut inner = vec![];
                 for event in iter.by_ref() {
-                    if matches!(event, Event::End(Tag::Heading(..))) {
+                    if matches!(event, Event::End(TagEnd::Heading(_))) {
                         break;
                     }
                     inner.push(event);
@@ -219,7 +217,7 @@ fn rewrite<'a>(
                 let mut text = String::new();
                 for event in iter.by_ref() {
                     match event {
-                        Event::End(Tag::CodeBlock(_)) => break,
+                        Event::End(TagEnd::CodeBlock) => break,
                         Event::Text(it) => text.push_str(&it),
                         _ => {}
                     }
@@ -229,24 +227,24 @@ fn rewrite<'a>(
                 }
                 out.push(Event::Html(code_block(&kind, &text).into()));
             }
-            Event::Start(Tag::Paragraph) | Event::End(Tag::Paragraph) if inline => {}
-            Event::Start(Tag::Image(..)) if inline => {
+            Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph) if inline => {}
+            Event::Start(Tag::Image { .. }) if inline => {
                 // An image in a summary line shows as its text.
                 for event in iter.by_ref() {
                     match event {
-                        Event::End(Tag::Image(..)) => break,
+                        Event::End(TagEnd::Image) => break,
                         Event::Text(it) => out.push(Event::Text(it)),
                         _ => {}
                     }
                 }
             }
             Event::SoftBreak if inline => out.push(Event::Text(" ".into())),
-            Event::Html(html) if inline => {
+            Event::Html(ref html) | Event::InlineHtml(ref html) if inline => {
                 // Block HTML (`<details>`, `<div>`) does not belong in a line.
                 if !html.trim_start().starts_with("<div")
                     && !html.trim_start().starts_with("<details")
                 {
-                    out.push(Event::Html(html));
+                    out.push(event);
                 }
             }
             other => out.push(other),

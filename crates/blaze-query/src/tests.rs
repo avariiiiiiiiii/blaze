@@ -521,12 +521,13 @@ fn settling_swaps_to_the_mapped_image() {
     db.reclaim();
 }
 
-/// One byte flipped in a group of a database section: the group is reported once, by section
-/// and group; the keys whose memos it held are computed again and every other key is used from
-/// the image. A group holding an input's path is read at start, so the database starts empty
-/// naming it.
+/// One byte flipped in a group of a database section: each request reading a key whose memos
+/// it held fails naming the section and group, every time, and nothing is computed again; every
+/// other key is used from the image, the group is reported once, and no image is written
+/// without it. A group holding an input's path is read at start, so the database does not
+/// start, naming it.
 #[test]
-fn a_corrupt_group_drops_only_the_memos_in_it() {
+fn a_corrupt_group_fails_the_keys_in_it() {
     const KEYS: usize = 300;
     let (db, tree) = setup();
     let names: Vec<String> = (0..KEYS).map(|n| format!("f{n}")).collect();
@@ -556,11 +557,35 @@ fn a_corrupt_group_drops_only_the_memos_in_it() {
             register(&mut started);
             reset();
             let same = view(&started, &tree, &files);
+            let the_group = |error: DbError, name: &str| match error {
+                DbError::Corrupt(corrupt) => assert_eq!(
+                    (corrupt.section, corrupt.group),
+                    (section.id, group),
+                    "{name} fails naming the corrupt group"
+                ),
+                error => panic!("{name}: {error}"),
+            };
+            let mut failed = Vec::new();
             for (n, name) in names.iter().enumerate() {
-                assert_eq!(double(&started, same, name), 2 * (n % 7) as u64, "{name} is right whatever was dropped");
+                match started.pin().get::<Double>(same, name) {
+                    Ok(value) => assert_eq!(value, 2 * (n % 7) as u64, "{name} is right from the image"),
+                    Err(error) => {
+                        the_group(error, name);
+                        failed.push(name);
+                    }
+                }
             }
-            // Writing the image reads every key's memos, so every group is read by now.
-            let _ = image_of(&started, Builder::new());
+            assert!(!failed.is_empty(), "{} group {group} held memos: a key of it fails", section.id);
+            assert!(failed.len() < KEYS, "{} group {group}: the other keys answer from the image", section.id);
+            for &name in &failed {
+                the_group(started.pin().get::<Double>(same, name).expect_err("asked again, it fails again"), name);
+            }
+            assert_eq!(runs("len") + runs("double"), 0, "{} group {group}: nothing is computed again", section.id);
+            let mut live = Live::new();
+            the_group(
+                started.write_image(&mut Builder::new(), &mut live).expect_err("no image without the group"),
+                "the image",
+            );
             let found = started.take_corrupt();
             assert_eq!(
                 found.iter().map(|it| (it.section, it.group)).collect::<Vec<_>>(),
@@ -569,9 +594,6 @@ fn a_corrupt_group_drops_only_the_memos_in_it() {
                 section.id
             );
             assert_eq!(started.take_corrupt(), vec![], "each group is reported once");
-            let reran = runs("len") + runs("double");
-            assert!(reran > 0, "{} group {group} held memos, computed again", section.id);
-            assert!(reran < KEYS, "{} group {group}: the other keys' memos are used, {reran} reran", section.id);
             tried += 1;
         }
     }
@@ -998,12 +1020,12 @@ fn a_key_is_kept_once_and_runs_again_by_its_bytes() {
     let one = view(&db, &tree, &[("a", "abc")]);
     double(&db, one, "a");
     let task = blaze_reclaim::enter();
-    let slot = db.slot(&task, &key::<Len>("a")).expect("len(a) ran");
+    let slot = db.slot(&task, &key::<Len>("a")).expect("no image").expect("len(a) ran");
     let kept = slot.key().expect("its key's bytes").as_ptr();
     drop(task);
     double(&db, one, "a");
     let task = blaze_reclaim::enter();
-    let again = db.slot(&task, &key::<Len>("a")).and_then(|slot| slot.key()).expect("still kept");
+    let again = db.slot(&task, &key::<Len>("a")).expect("no image").and_then(|slot| slot.key()).expect("still kept");
     assert_eq!(again.as_ptr(), kept, "not encoded and swapped in again");
     drop(task);
 
@@ -1350,14 +1372,14 @@ fn a_memo_is_born_in_the_generation_its_key_last_resolved_to_it() {
     let key = QueryKey { kind: QueryKind(0x2f00), input: ContentId([4; 32]) };
     let code = db.store.code(WORD, ContentId([1; 32]));
     let first = db.store.make(key, Fingerprint(1), code, &[], &[]);
-    assert_eq!(db.add_memo(&task, key, first), first);
+    assert_eq!(db.add_memo(&task, key, first), Ok(first));
     assert_eq!(db.store.born(&task, first), 0);
     db.generation.store(3, Ordering::SeqCst);
     let equal = db.store.make(key, Fingerprint(1), code, &[], &[]);
-    assert_eq!(db.add_memo(&task, key, equal), first, "the key keeps the equal memo it had");
+    assert_eq!(db.add_memo(&task, key, equal), Ok(first), "the key keeps the equal memo it had");
     assert_eq!(db.store.born(&task, first), 3, "restamped as its key resolved to it again");
     let other = db.store.make(key, Fingerprint(2), code, &[], &[]);
-    assert_eq!(db.add_memo(&task, key, other), other);
+    assert_eq!(db.add_memo(&task, key, other), Ok(other));
     assert_eq!(db.store.born(&task, other), 3);
     db.store.reborn_in(&task, first, 2);
     assert_eq!(db.store.born(&task, first), 3, "never lowered");
@@ -1809,6 +1831,7 @@ fn same_len(db: &Database, view: ViewId, name: &str) -> u64 {
 fn words(db: &Database, name: &str) -> Vec<u64> {
     let task = blaze_reclaim::enter();
     db.slot(&task, &key::<SameLen>(name))
+        .expect("no image")
         .map_or_else(Vec::new, |slot| slot.memos().iter().map(|&memo| db.store.value_word(&task, memo)).collect())
 }
 
@@ -1871,7 +1894,7 @@ fn evicting_or_collecting_one_memo_keeps_the_others_shared_value() {
     collect_until_freed(&db);
     assert_eq!(db.store.shared_rows(), 0, "no memo names the row: it is freed");
     let task = blaze_reclaim::enter();
-    assert!(db.slot(&task, &key::<SameLen>("a")).is_none() && db.slot(&task, &key::<SameLen>("b")).is_none());
+    assert!(matches!(db.slot(&task, &key::<SameLen>("a")), Ok(None)) && matches!(db.slot(&task, &key::<SameLen>("b")), Ok(None)));
 }
 
 /// The image writes equal values once, whatever their kind: a shared kind's memos and a plain
@@ -1894,7 +1917,7 @@ fn equal_values_go_into_the_image_once() {
 
     let task = blaze_reclaim::enter();
     let at = |key: QueryKey| {
-        let slot = started.slot(&task, &key).expect("a key of the image");
+        let slot = started.slot(&task, &key).expect("not corrupt").expect("a key of the image");
         let bytes = started.store.bytes(&task, *slot.memos().last().expect("a memo")).expect("mapped");
         (bytes.as_ptr(), bytes.len())
     };
@@ -1994,7 +2017,7 @@ mod model {
                     let code = db.store.code(WORD, ContentId([1; 32]));
                     let made = db.store.make(KEY, Fingerprint(fingerprint), code, &[], &[]);
                     let saw_bump = db.generation.load(Ordering::SeqCst) > 0;
-                    db.add_memo(&task, KEY, made);
+                    db.add_memo(&task, KEY, made).expect("no image");
                     saw_bump
                 })
             };
@@ -2004,7 +2027,7 @@ mod model {
             db.collect(&[], &mut Vec::new());
             let saw = givers.map(|giver| giver.join().expect("a giver"));
             let task = blaze_reclaim::enter();
-            let kept: Vec<u128> = db.slot(&task, &KEY).map_or_else(Vec::new, |slot| {
+            let kept: Vec<u128> = db.slot(&task, &KEY).expect("no image").map_or_else(Vec::new, |slot| {
                 slot.memos().iter().map(|&memo| db.store.fingerprint(&task, memo).0).collect()
             });
             assert!(kept.iter().all(|it| *it == 1 || *it == 2), "only memos given are kept: {kept:?}");

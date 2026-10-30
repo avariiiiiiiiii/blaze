@@ -74,6 +74,8 @@ impl Screen {
                             self.row += down;
                             assert!(self.row <= self.rows.len(), "down past the end: {bytes:?}");
                         }
+                        // A row cleared whole is no row: a terminal shows them the same.
+                        ('J', None) if self.col == 0 => self.rows.truncate(self.row),
                         ('J', None) => {
                             self.rows.truncate(self.row + 1);
                             if let Some(row) = self.rows.get_mut(self.row) {

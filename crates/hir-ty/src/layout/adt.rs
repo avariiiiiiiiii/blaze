@@ -90,11 +90,15 @@ fn layout_of_adt_in(
         }
         AdtId::EnumId(e) => {
             let variants = enum_variant_ids(db, e);
-            for &v in variants {
+            for &v in variants.iter() {
                 push_variant(v.into())?;
             }
             let repr = AttrFlags::repr(db, e.into()).unwrap_or_default();
-            (repr, NicheOptimizations::Enabled, Some(enum_discriminants(db, e)))
+            let discriminants = enum_discriminants(db, e);
+            if let Some(index) = discriminants.iter().position(|it| it.is_err()) {
+                return Err(LayoutError::DiscriminantFailed { variant: variants[index] });
+            }
+            (repr, NicheOptimizations::Enabled, Some(discriminants))
         }
     };
     let maybe_unsized = match def {
@@ -112,7 +116,13 @@ fn layout_of_adt_in(
             &variants,
             matches!(def, AdtId::EnumId(..)),
             niche_optimizations,
-            |min, max| repr_discr(dl, &repr, min.start, max.last).unwrap_or((Integer::I8, false)),
+            // As rustc's `Integer::repr_discr`, a `#[repr]` too small for the values is a bug:
+            // the values are truncated to it above.
+            |min, max| {
+                repr_discr(dl, &repr, min.start, max.last).unwrap_or_else(|err| {
+                    panic!("`#[repr]` of {def:?} too small for its discriminants: {err}")
+                })
+            },
             discriminants.iter().flat_map(|it| it.iter()).enumerate().filter_map(|(index, d)| {
                 Some((RustcEnumVariantIdx(index), discr_size.truncate(d.ok()? as u128)))
             }),

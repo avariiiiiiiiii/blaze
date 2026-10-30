@@ -46,8 +46,8 @@ fn ui_with_std(name: &str, edition: &str, source: &str) -> String {
         .map(|it| format!("    pub mod {it} {{ pub use core::prelude::{it}::*; {prelude} }}\n"))
         .collect();
     stderr(&format!(
-        "//- minicore: sized, fmt, builtin_impls\n//- /std.rs crate:std deps:core\npub mod prelude {{\n{preludes}}}\n{items}\n\
-         //- /{name} crate:main edition:{edition} deps:std\n{source}"
+        "//- minicore: sized, fmt, builtin_impls\n//- /std.rs crate:std\npub mod prelude {{\n{preludes}}}\n{items}\n\
+         //- /{name} crate:other:main edition:{edition} deps:std\n{source}"
     ))
 }
 
@@ -1831,7 +1831,7 @@ mod роре {
 fn a_module_file_does_not_take_the_crate_roots_level_for_keyword_idents() {
     // tests/ui/lint/keyword-idents/multi-file.rs (a known bug of rustc's, #132218: the
     // pre-expansion pass of a module file starts from the command line's levels)
-    let fixture = r#"//- /multi-file.rs crate:main edition:2015
+    let fixture = r#"//- /multi-file.rs crate:other:main edition:2015
 #![deny(keyword_idents)] // Should affect the submodule, but doesn't.
 //@ edition: 2015
 //@ known-bug: #132218

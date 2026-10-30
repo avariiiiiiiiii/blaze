@@ -353,7 +353,7 @@ error: aborting due to 6 previous errors
 For more information about this error, try `rustc --explain E0658`.
 "#;
     let name = "feature-gate-import-trait-associated-functions.rs";
-    let fixture = format!("//- minicore: default, option\n{STD_HASH_MAP}//- /{name} crate:main edition:2018 deps:std\n{source}");
+    let fixture = format!("//- minicore: default, option\n{STD_HASH_MAP}//- /{name} crate:other:main edition:2018 deps:std\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     assert_eq!(normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })), stderr);
 }

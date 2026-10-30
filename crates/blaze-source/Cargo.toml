@@ -18,7 +18,7 @@ anyhow.workspace = true
 blaze-ids.workspace = true
 rustc-hash.workspace = true
 # The hasher cargo names a source's directories with.
-rustc-stable-hash = "0.1.2"
+rustc-stable-hash.workspace = true
 semver.workspace = true
 serde.workspace = true
 url.workspace = true

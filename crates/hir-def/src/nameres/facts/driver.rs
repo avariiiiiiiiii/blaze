@@ -574,8 +574,7 @@ pub(crate) fn round_kind(db: &Db, round: RoundKey) -> RoundKind {
     let outcome = queries::round_progress(db, previous);
     if outcome.progress {
         if r > FIXED_POINT_LIMIT {
-            tracing::error!("name resolution is stuck");
-            return RoundKind::Final;
+            panic!("name resolution of {krate:?} still made progress after {FIXED_POINT_LIMIT} rounds");
         }
         return RoundKind::Normal;
     }
@@ -1102,8 +1101,9 @@ pub(crate) fn collect_block<'db>(
             eager_with_errors = false;
             rounds += 1;
             if rounds > FIXED_POINT_LIMIT {
-                tracing::error!("name resolution is stuck");
-                break 'resolve_attr;
+                panic!(
+                    "name resolution of a block of {krate:?} still made progress after {FIXED_POINT_LIMIT} rounds"
+                );
             }
         }
         let Some(index) = macros::first_attr(&pending) else { break 'resolve_attr };

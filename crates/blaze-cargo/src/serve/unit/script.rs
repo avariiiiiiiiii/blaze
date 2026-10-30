@@ -42,7 +42,11 @@ use blaze_usercode::{
     script::{self, Place, Prepared},
 };
 
-use super::{Job, Real, UnitWriter, package_of, say};
+use super::{
+    Job, Real, UnitWriter,
+    error::{UnitError, manifest_dir},
+    package_of, say,
+};
 use crate::serve::work::{Runs, Writer};
 
 /// The job's variable that asks an inert script compiled and run as well, and checked against
@@ -134,7 +138,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         .clone()
         .ok_or_else(|| format!("the run of `{}`'s build script has no OUT_DIR", package.name))?;
     let manifest_path = PathBuf::from(&package.manifest_path);
-    let manifest_dir = manifest_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let manifest_dir = manifest_dir(&package.name, &package.manifest_path).map_err(|it| it.to_string())?;
     let targets = targets(units, &unit.pkg_id);
     let text = |name: &str| var(plan, name).filter(|it| !it.is_empty()).map(str::to_owned);
     let descr = match &package.source {
@@ -147,7 +151,9 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
     let cfg_args = blaze_units::stdlib::target::CfgArgs::from_flags(&plan.rustflags)?;
     let target_cfgs = blaze_units::stdlib::target::target_cfg(&target, &cfg_args)?;
     let profile = &unit.profile;
-    let release = var(plan, "PROFILE").map_or(profile.name == "release", |it| it == "release");
+    let release = var(plan, "PROFILE")
+        .ok_or_else(|| UnitError::NoVariable { package: package.name.clone(), name: "PROFILE" }.to_string())?
+        == "release";
     let debuginfo = !matches!(&profile.debuginfo, DebugInfo::Level(0))
         && !matches!(&profile.debuginfo, DebugInfo::Named(name) if name == "none" || name == "false");
     let dependencies = unit
@@ -155,21 +161,26 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         .iter()
         .filter_map(|dep| of.scripts.get(dep.index).and_then(|it| it.get()).map(|applied| (dep, applied)))
         .map(|(dep, applied)| {
-            let name = units
+            let count = units.graph.units.len();
+            let it = units
                 .graph
                 .units
                 .get(dep.index)
-                .and_then(|it| package_of(units, it).ok())
-                .map_or_else(|| dep.extern_crate_name.clone(), |it| it.name.clone());
-            bs::Dependency::of(&name, applied.links.as_deref(), &applied.output)
+                .ok_or_else(|| UnitError::Dependency { unit: run, dep: dep.index, count }.to_string())?;
+            let package = package_of(units, it).map_err(|it| it.what)?;
+            Ok(bs::Dependency::of(&package.name, applied.links.as_deref(), &applied.output))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     // `<profile>/build/<package>-<hash>/out`, or `<profile>/build/<package>/<hash>/out`.
     let profile_dir = Path::new(&out_dir)
         .ancestors()
         .find(|it| it.file_name().is_some_and(|name| name == "build"))
         .and_then(Path::parent)
-        .map(Path::to_path_buf);
+        .map(Path::to_path_buf)
+        .ok_or_else(|| UnitError::ProfileDir { package: package.name.clone(), out_dir: out_dir.clone() }.to_string())?;
+    let jobs = std::thread::available_parallelism()
+        .map_err(|error| UnitError::Parallelism { package: package.name.clone(), error: error.to_string() }.to_string())?
+        .get() as u32;
     let exe = |name: &str| of.tools.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     Ok(bs::Unit {
         package: bs::Package {
@@ -203,7 +214,7 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         host: of.host.to_owned(),
         target_cfgs,
         rustflags: plan.rustflags.clone(),
-        jobs: std::thread::available_parallelism().map_or(1, |it| it.get() as u32),
+        jobs,
         script: of.program.clone(),
         out_dir: PathBuf::from(&out_dir),
         tools: bs::Tools {
@@ -218,8 +229,8 @@ pub(crate) fn script_unit(of: &Of<'_>, run: usize) -> Result<bs::Unit, String> {
         dependencies,
         config_env: Vec::new(),
         dylib_search: bs::DylibSearch {
-            host_root: profile_dir.clone(),
-            host_deps: profile_dir.iter().map(|it| it.join("deps")).collect(),
+            host_deps: vec![profile_dir.join("deps")],
+            host_root: Some(profile_dir),
             sysroot_libdir: PathBuf::new(),
             plugin_search: Vec::new(),
         },
@@ -453,6 +464,13 @@ fn outside(job: &Job, run: usize) -> bool {
     job.sandbox_off() || job.plan(run).is_ok_and(|it| it.unsandboxed)
 }
 
+/// The path build script compile `compile` writes its program at: its first output, named
+/// before it is built.
+pub(crate) fn named_program(units: &Units, compile: usize) -> Result<PathBuf, ApiError> {
+    let plan = units.plans.get(compile).ok_or_else(|| ApiError::new(format!("the build has no plan of unit {compile}"), None))?;
+    plan.outputs.first().map(PathBuf::from).ok_or_else(|| UnitError::ScriptProgram { unit: compile }.into())
+}
+
 /// Run `run` ready to begin; none while its script is not built.
 fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     let units = job.units();
@@ -472,7 +490,7 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     };
     let script_path = match &program {
         Some((path, _)) => PathBuf::from(path),
-        None => PathBuf::from(&units.plans[compile].outputs.first().cloned().unwrap_or_default()),
+        None => named_program(units, compile)?,
     };
     let of = Of {
         units,
@@ -629,7 +647,10 @@ impl ScriptRun {
         if let Err(error) = writer.ran(self.unit, ran) {
             return self.error(error.what, out);
         }
-        let package_id = job.unit(self.unit).map(|it| it.pkg_id.clone()).unwrap_or_default();
+        let package_id = match job.unit(self.unit) {
+            Ok(it) => it.pkg_id.clone(),
+            Err(error) => return self.error(error.what, out),
+        };
         out.push(Response::BuildScript(executed(&package_id, &output, &out_dir)));
         let links = start.unit.package.links.clone();
         let applied = Applied { package_id, links, output, out_dir };

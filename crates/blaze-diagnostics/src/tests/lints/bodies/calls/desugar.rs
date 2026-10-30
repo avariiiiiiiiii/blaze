@@ -401,14 +401,14 @@ macro_rules! println {
 /// (none of these tests has lint flags), core being minicore with [`FLAGS`] and std the
 /// prelude with [`PRELUDE`] and [`ITEMS`].
 fn ui(mode: Mode, name: &str, edition: &str, source: &str) -> String {
-    let mut fixture = format!("//- minicore: {FLAGS}\n//- /std.rs crate:std deps:core\n");
+    let mut fixture = format!("//- minicore: {FLAGS}\n//- /std.rs crate:std\n");
     fixture.push_str("#![feature(lang_items, rustc_attrs)]\npub mod prelude {\n");
     for edition in ["rust_2015", "rust_2018", "rust_2021", "rust_2024"] {
         fixture.push_str(&format!(
             "    pub mod {edition} {{\n        pub use core::prelude::{edition}::*;\n{PRELUDE}    }}\n"
         ));
     }
-    fixture.push_str(&format!("}}\n{ITEMS}\n//- /{name} crate:main edition:{edition} deps:std\n{source}"));
+    fixture.push_str(&format!("}}\n{ITEMS}\n//- /{name} crate:other:main edition:{edition} deps:std\n{source}"));
     let stderr = crate::tests::checked_with(&fixture, "$DIR/", &compiletest(mode, &Options::default()))
         .stderr_with(Style { ui_testing: true, ..Style::default() });
     crate::tests::normalized(&stderr)

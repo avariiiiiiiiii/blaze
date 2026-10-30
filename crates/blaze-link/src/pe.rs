@@ -103,7 +103,7 @@ pub(crate) fn writer(output: &Output) -> Result<Pe, LinkError> {
 /// An error, formatted only when it is returned.
 pub(crate) fn error(what: impl fmt::Display) -> LinkError {
     // alloc: error path
-    LinkError { function: None, what: what.to_string() }
+    LinkError { function: None, what: what.to_string(), refusal: None }
 }
 
 /// A [`Class::Named`] of a section name.

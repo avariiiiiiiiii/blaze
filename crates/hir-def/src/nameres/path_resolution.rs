@@ -34,7 +34,7 @@ use crate::{
         sub_namespace_match, trait_items::trait_item_per_ns,
     },
     per_ns::{PerNs, TypesItem},
-    visibility::{RawVisibility, Visibility},
+    visibility::{RawVisibility, Visibility, VisibilityError},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +156,7 @@ impl DefMap {
         //     ^^^^ this
         visibility: &RawVisibility,
         within_impl: bool,
-    ) -> Option<Visibility> {
+    ) -> Result<Visibility, VisibilityError> {
         let vis = match visibility {
             RawVisibility::Module(path, explicitness) => {
                 let (result, remaining) = self.resolve_path(
@@ -168,16 +168,21 @@ impl DefMap {
                     None,
                 );
                 if remaining.is_some() {
-                    return None;
+                    return Err(VisibilityError::Unresolved);
                 }
-                let types = result.take_types()?;
-                let mut vis = match types {
-                    ModuleDefId::ModuleId(m) => Visibility::Module(m, *explicitness),
-                    // error: visibility needs to refer to module
-                    _ => {
-                        return None;
-                    }
+                let types = result.take_types().ok_or(VisibilityError::Unresolved)?;
+                let m = match types {
+                    ModuleDefId::ModuleId(m) => m,
+                    found => return Err(VisibilityError::NotAModule { found }),
                 };
+                if !Visibility::Module(m, *explicitness).is_visible_from_def_map(
+                    db,
+                    self,
+                    original_module,
+                ) {
+                    return Err(VisibilityError::NotAncestor { module: m });
+                }
+                let mut vis = Visibility::Module(m, *explicitness);
 
                 // In block expressions, `self` normally refers to the containing non-block module, and
                 // `super` to its parent (etc.). However, visibilities must only refer to a module in the
@@ -196,7 +201,7 @@ impl DefMap {
             RawVisibility::Public => Visibility::Public,
             RawVisibility::PubCrate => Visibility::PubCrate(self.krate),
         };
-        Some(vis)
+        Ok(vis)
     }
 
     // Returns Yes if we are sure that additions to `ItemMap` wouldn't change

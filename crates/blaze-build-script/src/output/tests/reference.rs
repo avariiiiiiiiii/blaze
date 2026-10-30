@@ -84,8 +84,10 @@ pub fn parse(input: &[u8], cx: &Context<'_>) -> Result<Output, Error> {
         let Some(line) = directive(line) else { continue };
         let old_syntax;
         let (key, value) = if let Some(data) = line.strip_prefix("cargo::") {
-            let refused = new_syntax_msrv.get_or_insert_with(|| older_than_new_syntax(package));
-            if let Some(msrv) = refused {
+            if new_syntax_msrv.is_none() {
+                new_syntax_msrv = Some(older_than_new_syntax(package)?);
+            }
+            if let Some(Some(msrv)) = &new_syntax_msrv {
                 return Err(new_syntax_refused(Descr(package), msrv, data));
             }
             old_syntax = false;

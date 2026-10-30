@@ -314,10 +314,11 @@ impl Path {
             }
             _ => {
                 if replaying {
-                    // A replayed branch knows only its choice: the marks are this run's.
+                    // A replayed branch knows only its choice: the marks are this run's, but
+                    // only the replayed thread may stay `Active`.
                     for (mark, &now) in schedule.threads.iter_mut().zip(&marks) {
                         if *mark != Mark::Active {
-                            *mark = now;
+                            *mark = if now == Mark::Active { Mark::Skip } else { now };
                         }
                     }
                 }

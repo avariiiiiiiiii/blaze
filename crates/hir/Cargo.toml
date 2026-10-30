@@ -17,8 +17,6 @@ rustc-hash.workspace = true
 either.workspace = true
 arrayvec.workspace = true
 itertools.workspace = true
-hashbrown.workspace = true
-serde_json.workspace = true
 smallvec.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
 triomphe.workspace = true
@@ -52,13 +50,8 @@ blaze-alloc-count.workspace = true
 blaze-format.workspace = true
 expect-test.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-tree.workspace = true
 
-# local deps
-test-utils.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
-syntax-bridge.workspace = true
 
 [features]
 in-rust-tree = ["hir-expand/in-rust-tree"]

@@ -45,7 +45,7 @@ fn setup(flags: &str) -> Setup {
 fn lint(db: &Db, setup: &Setup) -> usize {
     let krate = crate::tests::main_crate(db);
     let name_of = |_: FileId| Some("main.rs".to_owned());
-    check(db, krate, setup, &name_of).len()
+    check(db, krate, setup, &name_of).expect("every file is named").len()
 }
 
 /// How many times `query` is among the salsa debug names in `executed`.
@@ -94,7 +94,7 @@ fn what_an_edit_moves_is_found_where_it_moved_to() {
     let krate = crate::tests::main_crate(&db);
     let name_of = |_: FileId| Some("main.rs".to_owned());
     let lo = |db: &Db| {
-        let found = check(db, krate, &setup, &name_of);
+        let found = check(db, krate, &setup, &name_of).expect("every file is named");
         found.iter().map(|it| it.diagnostic.span.primary_span().map_or(0, |it| it.lo)).collect::<Vec<_>>()
     };
     let before = lo(&db);

@@ -119,7 +119,7 @@ fn seeds() -> Vec<Vec<u8>> {
 fn named() -> Vec<(&'static str, Arch, Vec<u8>)> {
     let x86 = object(Architecture::X86_64, true);
     let arm = object(Architecture::Aarch64, true);
-    let both = fat(&[(macho::CPU_TYPE_X86_64, 3, &x86[..]), (macho::CPU_TYPE_ARM64, 0, &arm[..])]);
+    let both = fat(&[(macho::CPU_TYPE_X86_64.0, 3, &x86[..]), (macho::CPU_TYPE_ARM64.0, 0, &arm[..])]);
     vec![
         ("an x86-64 object of every section and relocation read", Arch::X86_64, x86),
         ("an AArch64 object of every section and relocation read", Arch::Aarch64, arm),
@@ -127,14 +127,17 @@ fn named() -> Vec<(&'static str, Arch, Vec<u8>)> {
         ("an AArch64 object without subsections", Arch::Aarch64, object(Architecture::Aarch64, false)),
         ("a universal file of both, its x86-64 slice", Arch::X86_64, both.clone()),
         ("a universal file of both, its AArch64 slice", Arch::Aarch64, both),
-        ("an x86-64 object of linker options only", Arch::X86_64, options(macho::CPU_TYPE_X86_64)),
-        ("an AArch64 object of linker options only", Arch::Aarch64, options(macho::CPU_TYPE_ARM64)),
+        ("an x86-64 object of linker options only", Arch::X86_64, options(macho::CPU_TYPE_X86_64.0)),
+        ("an AArch64 object of linker options only", Arch::Aarch64, options(macho::CPU_TYPE_ARM64.0)),
     ]
 }
 
 const NOP: u32 = 0xd503_201f;
-const EH_FRAME: u32 =
-    macho::S_COALESCED | macho::S_ATTR_NO_TOC | macho::S_ATTR_STRIP_STATIC_SYMS | macho::S_ATTR_LIVE_SUPPORT;
+const EH_FRAME: macho::SectionFlags = macho::S_COALESCED
+    .to_flags()
+    .with(macho::S_ATTR_NO_TOC)
+    .with(macho::S_ATTR_STRIP_STATIC_SYMS)
+    .with(macho::S_ATTR_LIVE_SUPPORT);
 
 /// `_f` at 0 and `_g` at 32 of `__text`; `_f` calls `_g`, takes `_v`'s address and loads
 /// `_ext`'s from the GOT. `__data` holds `&_f` and `_g - _f`; `__bss`, `__cstring`, a
@@ -173,7 +176,7 @@ fn object(arch: Architecture, subsections: bool) -> Vec<u8> {
     b.append_section_data(text, &code, 16);
     if x86 {
         let frame = b.add_section(b"__TEXT".to_vec(), b"__eh_frame".to_vec(), SectionKind::ReadOnlyData);
-        b.section_mut(frame).flags = SectionFlags::MachO { flags: EH_FRAME };
+        b.section_mut(frame).flags = SectionFlags::MachO { flags: EH_FRAME, reserved2: 0 };
         let mut eh = Vec::new();
         eh.extend_from_slice(&16u32.to_le_bytes());
         eh.extend_from_slice(&0u32.to_le_bytes());
@@ -193,7 +196,7 @@ fn object(arch: Architecture, subsections: bool) -> Vec<u8> {
     let strings = b.section_id(StandardSection::ReadOnlyString);
     b.append_section_data(strings, b"hello\0", 1);
     let unwind = b.add_section(b"__LD".to_vec(), b"__compact_unwind".to_vec(), SectionKind::Metadata);
-    b.section_mut(unwind).flags = SectionFlags::MachO { flags: macho::S_ATTR_DEBUG };
+    b.section_mut(unwind).flags = SectionFlags::MachO { flags: macho::S_ATTR_DEBUG, reserved2: 0 };
     let mut entry = vec![0; 8];
     entry.extend_from_slice(&20u32.to_le_bytes());
     entry.extend_from_slice(&0x0200_0000u32.to_le_bytes());
@@ -283,17 +286,17 @@ fn options(cpu: u32) -> Vec<u8> {
         let strings: Vec<u8> = words.iter().flat_map(|it| it.bytes().chain([0])).collect();
         let size = (12 + strings.len()).next_multiple_of(8);
         let start = commands.len();
-        for value in [macho::LC_LINKER_OPTION, size as u32, words.len() as u32] {
+        for value in [macho::LC_LINKER_OPTION.0, size as u32, words.len() as u32] {
             commands.extend_from_slice(&value.to_le_bytes());
         }
         commands.extend_from_slice(&strings);
         commands.resize(start + size, 0);
     }
-    commands.extend_from_slice(&macho::LC_SYMTAB.to_le_bytes());
+    commands.extend_from_slice(&macho::LC_SYMTAB.0.to_le_bytes());
     commands.extend_from_slice(&24u32.to_le_bytes());
     commands.extend_from_slice(&[0; 16]);
     let mut out = Vec::new();
-    for value in [macho::MH_MAGIC_64, cpu, 0, macho::MH_OBJECT, 3, commands.len() as u32, 0, 0] {
+    for value in [macho::MH_MAGIC_64, cpu, 0, macho::MH_OBJECT.0, 3, commands.len() as u32, 0, 0] {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out.extend_from_slice(&commands);

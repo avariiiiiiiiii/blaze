@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use zstd::{
     dict::{DecoderDictionary, EncoderDictionary},
     stream::raw::{CParameter, DParameter},
-    zstd_safe::{self, CCtx, DCtx, ResetDirective},
+    zstd_safe::{self, CCtx, CDict, DCtx, ResetDirective},
 };
 
 /// One level for every cold value: compression is deterministic for a level and a dictionary.
@@ -69,17 +69,6 @@ pub(crate) struct Prepared {
     decoder: DecoderDictionary<'static>,
 }
 
-// SAFETY: a `ZSTD_CDict` and a `ZSTD_DDict` are read-only once created; zstd.h says each can be
-// shared by many threads at once (`ZSTD_createCDict`, `ZSTD_createDDict`). `Prepared` makes them
-// in `new` and never hands out a way to change them. zstd-safe 7.3 does not say so itself
-// (v2/requests/store.md).
-unsafe impl Send for Prepared {}
-// SAFETY: as for `Send`: `&Prepared` reaches only `bytes` (a `Vec<u8>`) and the two digested
-// dictionaries, which zstd only reads once made (zstd.h: a `ZSTD_CDict` and a `ZSTD_DDict` can be
-// shared by many threads at once); `Prepared` has no method that changes them, so threads sharing
-// it never race inside zstd.
-unsafe impl Sync for Prepared {}
-
 impl Prepared {
     pub(crate) fn new(bytes: Vec<u8>) -> Prepared {
         let encoder = EncoderDictionary::copy(&bytes, LEVEL);
@@ -131,7 +120,12 @@ pub(crate) fn compress(dictionary: &Prepared, raw: &[u8]) -> Result<Vec<u8>, Str
         let context = &mut contexts.compress;
         // alloc: the compressed value, which the record keeps
         let mut out = Vec::with_capacity(zstd_safe::compress_bound(raw.len()));
-        let done = context.ref_cdict(dictionary.encoder.as_cdict()).and_then(|_| context.compress2(&mut out, raw));
+        let cdict: *const CDict<'static> = dictionary.encoder.as_cdict();
+        // SAFETY: `ref_cdict` asks the dictionary to outlive the thread's `'static` context. The
+        // context reads it only in this `compress2`, and the `reset` below, which runs whether or
+        // not either failed, drops the context's pointer to it before `dictionary` is released.
+        let cdict = unsafe { &*cdict };
+        let done = context.ref_cdict(cdict).and_then(|_| context.compress2(&mut out, raw));
         // The context outlives `dictionary`: it must not keep pointing at it, and the next value
         // must start from a context as new.
         let reset = context.reset(ResetDirective::SessionAndParameters);

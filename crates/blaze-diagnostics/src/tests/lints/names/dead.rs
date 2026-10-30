@@ -36,7 +36,7 @@ fn ui(ui: Ui<'_>) -> String {
     let deps = match ui.std {
         Some((prelude, items)) => {
             assert!(!ui.core.is_empty(), "std's prelude is core's: give minicore's flags");
-            fixture.push_str("//- /std.rs crate:std deps:core\npub mod prelude {\n");
+            fixture.push_str("//- /std.rs crate:std\npub mod prelude {\n");
             for edition in ["rust_2015", "rust_2018", "rust_2021", "rust_2024"] {
                 writeln!(
                     fixture,
@@ -49,7 +49,7 @@ fn ui(ui: Ui<'_>) -> String {
         }
         None => "",
     };
-    write!(fixture, "//- /{} crate:main edition:{}{deps}\n{}", ui.name, ui.edition, ui.source).unwrap();
+    write!(fixture, "//- /{} crate:other:main edition:{}{deps}\n{}", ui.name, ui.edition, ui.source).unwrap();
     let options = compiletest(ui.mode, &Options::default());
     let stderr = checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
     normalized(&stderr)
@@ -225,7 +225,7 @@ fn dead(fixture: &str) -> Vec<String> {
 #[test]
 fn a_library_and_its_user() {
     let fixture = r#"
-//- /main.rs crate:main deps:dep
+//- /main.rs crate:other:main deps:dep
 fn main() {
     dep::called();
 }
@@ -250,7 +250,7 @@ struct Private;
 #[test]
 fn pub_in_a_binary() {
     let fixture = r#"
-//- /main.rs crate:main
+//- /main.rs crate:other:main
 #![warn(dead_code_pub_in_binary)]
 pub fn not_called() {}
 pub fn called() {}
@@ -265,7 +265,7 @@ fn main() {
 #[test]
 fn self_assignment() {
     let fixture = r#"
-//- /main.rs crate:main
+//- /main.rs crate:other:main
 struct S { f: i32 }
 fn main() {
     let mut x = 1;
@@ -287,7 +287,7 @@ fn main() {
 #[test]
 fn self_assignment_raw() {
     let fixture = r#"
-//- /main.rs crate:main
+//- /main.rs crate:other:main
 fn main() {
     let mut r#x = 1;
     r#x = x;
@@ -301,7 +301,7 @@ fn main() {
 #[test]
 fn self_tuple_struct_pattern() {
     let fixture = r#"
-//- /main.rs crate:main
+//- /main.rs crate:other:main
 struct S(i32, i32);
 impl S {
     fn first(&self) -> i32 {
@@ -321,7 +321,7 @@ fn main() {
 #[test]
 fn alias_in_pattern_qualifier() {
     let fixture = r#"
-//- /main.rs crate:main
+//- /main.rs crate:other:main
 enum E { A(i32) }
 type Alias = E;
 fn main() {
@@ -336,7 +336,7 @@ fn main() {
 #[test]
 fn assignee_variant_not_constructed() {
     let fixture = r#"
-//- /main.rs crate:main
+//- /main.rs crate:other:main
 enum E { A }
 fn take(e: E) {
     E::A = e;

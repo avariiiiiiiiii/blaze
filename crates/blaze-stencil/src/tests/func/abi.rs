@@ -344,13 +344,13 @@ pub fn ext_seen(mk: &Mk) -> Family {
 }
 
 /// A `StructReturn` first parameter, as the IR builder passes an indirect return: u0 gives
-/// u1 a stack slot's address for it, then copies the slot to its own return area and
-/// returns one value besides.
+/// u1 a stack slot's address for it, then copies the slot to its own return area. Neither
+/// returns a value besides: Cranelift refuses one next to a `StructReturn` parameter.
 pub fn struct_return(mk: &Mk) -> Family {
     let sret = AbiParam::special(I64, ArgumentPurpose::StructReturn);
     let params = [sret, p(I64), p(F64), p(I128)];
     let callee_sig = mk.sig(&params, &[]);
-    let entry = mk.func(0, mk.sig(&params, &[p(I64)]), |b, v| {
+    let entry = mk.func(0, mk.sig(&params, &[]), |b, v| {
         let callee = import(b, FUNCS, 1, callee_sig.clone(), false);
         let place = slot(b, STRUCT_RETURN as u32, 4);
         let at = b.ins().stack_addr(I64, place, 0);
@@ -359,8 +359,7 @@ pub fn struct_return(mk: &Mk) -> Family {
             let word = b.ins().stack_load(I64, I64, place, off);
             b.ins().store(mem(), word, v[0], off);
         }
-        let out = b.ins().iadd_imm(v[1], 1);
-        b.ins().return_(&[out]);
+        b.ins().return_(&[]);
     });
     let callee = mk.func(1, callee_sig.clone(), |b, v| {
         b.ins().store(mem(), v[1], v[0], 0);

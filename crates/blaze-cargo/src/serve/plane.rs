@@ -708,7 +708,10 @@ impl<W: Work, P: Predict> Plane<W, P> {
                     Some((_, Task::Gone)) | None => panic!("the plane runs node {id}, which the daemon gave no task"),
                 },
                 PlaneOutput::Finished { request, ok } => {
-                    let stats = self.graph.stats(request).unwrap_or_default();
+                    let stats = self
+                        .graph
+                        .stats(request)
+                        .unwrap_or_else(|| panic!("the plane finished {request}, which it holds no stats of"));
                     self.graph
                         .release(request)
                         .unwrap_or_else(|error| panic!("the plane refused to release {request}: {error}"));

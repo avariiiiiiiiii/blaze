@@ -17,17 +17,17 @@ doctest = false
 anyhow.workspace = true
 # The versions the pinned nightly's rustfmt is built with (rust-lang/rust's Cargo.lock at
 # 12433c307): widths, grapheme breaks and the line diff of `--check` are theirs.
-annotate-snippets = "=0.12.16"
-diff = "=0.1.13"
-unicode-segmentation = "=1.12.0"
-unicode-width = "=0.1.14"
-unicode-properties = { version = "=0.1.4", default-features = false, features = ["general-category"] }
+annotate-snippets.workspace = true
+diff.workspace = true
+unicode-segmentation.workspace = true
+rustfmt-unicode-width.workspace = true
+unicode-properties = { workspace = true, features = ["general-category"] }
 itertools.workspace = true
 # `required_version` in a rustfmt.toml is a semver requirement.
 semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-thiserror = "2.0.18"
+thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
 

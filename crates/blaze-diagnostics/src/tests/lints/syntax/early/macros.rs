@@ -195,7 +195,7 @@ fn a_semicolon_from_another_crates_macro_is_linted_at_the_call() {
 macro_rules! my_macro {
     () => { true; }
 }
-//- /foreign-crate.rs crate:main edition:2015 deps:foreign_crate
+//- /foreign-crate.rs crate:other:main edition:2015 deps:foreign_crate
 //@ aux-build:foreign-crate.rs
 #![deny(semicolon_in_expressions_from_non_local_macros)]
 
@@ -485,7 +485,7 @@ LL | #![warn(semicolon_in_expressions_from_macros)]
 #[test]
 fn an_include_of_more_than_one_expression_is_denied() {
     let fixture = r#"//- minicore: include
-//- /include-single-expr.rs crate:main edition:2015
+//- /include-single-expr.rs crate:other:main edition:2015
 fn main() {
     include!("include-single-expr-helper.rs");
     include!("include-single-expr-helper-1.rs");
@@ -522,7 +522,7 @@ error: aborting due to 1 previous error
 #[test]
 fn lints_of_expansion_are_leveled_where_the_macro_is() {
     let fixture = r#"//- minicore: include
-//- /expansion-time.rs crate:main edition:2015
+//- /expansion-time.rs crate:other:main edition:2015
 //@ check-pass
 
 #[warn(meta_variable_misuse)]
@@ -597,7 +597,7 @@ pub mod prelude {
         pub use crate::assert_eq;
     }
 }
-//- /meta-variable-misuse.rs crate:main edition:2015 deps:std
+//- /meta-variable-misuse.rs crate:other:main edition:2015 deps:std
 //@ run-pass
 #![deny(meta_variable_misuse)]
 
@@ -661,7 +661,7 @@ pub struct Bencher;
 
 #[test]
 fn a_builtin_attribute_macro_given_twice_is_linted() {
-    let source = r#"//- /duplicated-attributes.rs crate:main edition:2015 deps:std,test cfg:test
+    let source = r#"//- /duplicated-attributes.rs crate:other:main edition:2015 deps:std,test cfg:test
 // Test that, if an item is annotated with a builtin attribute more than once, a warning is
 // emitted.
 // Tests https://github.com/rust-lang/rust/issues/90979

@@ -31,6 +31,7 @@ mod checks;
 mod codegen;
 mod compile;
 mod deps;
+mod error;
 mod files;
 mod graph;
 mod harness;
@@ -215,7 +216,7 @@ impl Steps for Real {
                 Some(session) => session,
                 None => deps::session(&lowered, &input.store, &input.config.invocation.env)?,
             };
-            let mut job = Job::new(input.clone(), lowered.crates().clone(), self.shared.clone());
+            let mut job = Job::new(input.clone(), lowered.crates().clone(), self.shared.clone())?;
             job._seeded = seeded;
             let job = Arc::new(job);
             let waits = graph::Waits::new(&job.graph);
@@ -478,13 +479,20 @@ fn library_fingerprint(dir: &std::path::Path, prefix: &str, into: &mut blaze_ids
             continue;
         }
         let modified = meta.modified().map_err(|error| format!("{}: {error}", full.display()))?;
-        let since = modified.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        // A time before the epoch is hashed as itself, not as the epoch.
+        let (before, since) = match modified.duration_since(std::time::UNIX_EPOCH) {
+            Ok(it) => (false, it),
+            Err(error) => (true, error.duration()),
+        };
         #[cfg(unix)]
         let executable = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
         #[cfg(not(unix))]
         let executable = false;
         into.part(path.as_bytes());
-        into.update(&meta.len().to_le_bytes()).update(&since.as_nanos().to_le_bytes()).update(&[u8::from(executable)]);
+        into.update(&meta.len().to_le_bytes())
+            .update(&[u8::from(before)])
+            .update(&since.as_nanos().to_le_bytes())
+            .update(&[u8::from(executable)]);
     }
     Ok(())
 }
@@ -559,12 +567,12 @@ pub(crate) struct Job {
 }
 
 impl Job {
-    fn new(input: JobInput, crates: Arc<Crates>, shared: Arc<Shared>) -> Job {
-        let graph = graph::Graph::new(&input.units);
+    fn new(input: JobInput, crates: Arc<Crates>, shared: Arc<Shared>) -> Result<Job, ApiError> {
+        let graph = graph::Graph::new(&input.units)?;
         let config = &input.config;
         let mounted = Arc::new(files::Mounted::new(input.files.clone(), input.root, &config.mounts, &config.invocation.root));
         let slots = graph.len();
-        Job {
+        Ok(Job {
             input,
             crates,
             shared,
@@ -585,7 +593,7 @@ impl Job {
             later: Mutex::new(Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
             seeds: Mutex::new(Vec::new()),
             _seeded: Vec::new(),
-        }
+        })
     }
 
     /// Dependency crate `krate`, checked this build with the lint flags `flags`, whose outcome

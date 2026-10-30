@@ -493,108 +493,12 @@ impl DebugContext {
     }
 }
 
-/// A [`DebugContext`] on threads of their own, which describe the functions they are sent
-/// while the thread that sends them goes on putting code in the object. DWARF linked into
-/// an ELF object is described on several, each writing units of its own: one thread falls
-/// behind the one putting code in the object, and the object waits for it.
-pub(super) struct Describer {
-    shards: Vec<Shard>,
-    /// How many functions were sent, which picks the thread a function goes to.
-    sent: std::sync::atomic::AtomicUsize,
-}
-
-/// A function to describe: the function, its length in bytes, and what to tell of it.
-type Sent = (FuncId, u32, FunctionDebug);
-
-struct Shard {
-    functions: std::sync::mpsc::Sender<Sent>,
-    described: std::thread::JoinHandle<Described>,
-}
-
 /// What a [`Describer`] ends with.
 enum Described {
     /// The sections, written already.
     Sections(Result<Vec<Section>, String>),
     /// What writes them once it has the object to look into.
     Context(DebugContext),
-}
-
-impl Describer {
-    /// With `elf`, the object is an ELF one, which can have DWARF of several threads: its
-    /// linker puts the sections of one name together, and each unit reads the sections
-    /// beside it.
-    pub(super) fn new(context: DebugContext, elf: bool) -> Describer {
-        let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
-        // alloc: once per object, the contexts of its describing threads
-        let mut contexts = vec![];
-        if let DebugContext::Dwarf(dwarf) = &context
-            && elf
-            && dwarf.apart.is_none()
-            && !dwarf.grouped
-        {
-            contexts.extend((1..(threads / 4).clamp(1, 16)).map(|_| dwarf.like()));
-        }
-        let contexts = std::iter::once(context)
-            // alloc: once per object and describing thread, its context
-            .chain(contexts.into_iter().map(|it| DebugContext::Dwarf(Box::new(it))));
-        // alloc: once per object, its describing threads
-        let shards = contexts.map(Shard::new).collect();
-        Describer { shards, sent: Default::default() }
-    }
-
-    /// Describes the function `func` of the module, which is `len` bytes of code.
-    pub(super) fn add_function(&self, func: FuncId, len: u32, debug: FunctionDebug) {
-        self.send((func, len, debug));
-    }
-
-    fn send(&self, function: Sent) {
-        let sent = self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let shard = &self.shards[(sent / FUNCTIONS_OF_A_UNIT) % self.shards.len()];
-        // The thread ends only when it panicked, which `emit` says.
-        let _ = shard.functions.send(function);
-    }
-
-    /// Writes the sections into the object, when it has a function to describe. What is
-    /// returned is what was kept apart from the object.
-    pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<Vec<Sidecar>, String> {
-        let mut written = Vec::with_capacity(self.shards.len());
-        let mut kept = None;
-        // Every thread is told there is nothing more before any is waited for.
-        // alloc: once per object, its describing threads
-        let threads: Vec<_> = self.shards.into_iter().map(|it| it.described).collect();
-        for described in threads {
-            match described.join().map_err(|_| "describing the functions panicked")? {
-                Described::Sections(sections) => written.push(sections?),
-                Described::Context(context) => kept = Some(context),
-            }
-        }
-        if let Some(context) = kept {
-            return context.emit(product);
-        }
-        if matches!(product.object.format(), BinaryFormat::Elf | BinaryFormat::MachO) {
-            place_all(product, written)?;
-        }
-        // alloc: empty, allocates nothing: nothing linked in is kept apart
-        Ok(Vec::new())
-    }
-}
-
-impl Shard {
-    fn new(mut context: DebugContext) -> Shard {
-        let (functions, sent) = std::sync::mpsc::channel::<Sent>();
-        let described = std::thread::spawn(move || {
-            for (func, len, debug) in sent {
-                context.add_function(func, len, &debug);
-            }
-            match context {
-                DebugContext::Dwarf(dwarf) if dwarf.apart.is_none() => {
-                    Described::Sections(dwarf.sections())
-                }
-                context => Described::Context(context),
-            }
-        });
-        Shard { functions, described }
-    }
 }
 
 /// How many functions a compilation unit describes before the next one is begun. What reads
@@ -1482,40 +1386,6 @@ fn place_all(product: &mut ObjectProduct, all: Vec<Vec<Section>>) -> Result<(), 
             // alloc: the error's message
             product.object.add_relocation(at, relocation).map_err(|e| e.to_string())?;
         }
-    }
-    Ok(())
-}
-
-/// Adds to each address in the debug sections of the Mach-O `object` the address its section
-/// was laid out at, as a relocation against a section has it.
-pub(super) fn settle_macho(object: &mut [u8]) -> Result<(), String> {
-    use object::{Object, ObjectSection, RelocationTarget};
-    // alloc: the error's message
-    let file = object::File::parse(&*object).map_err(|e| e.to_string())?;
-    // alloc: once per object, the addresses to settle
-    let mut settled = Vec::new();
-    for section in file.sections() {
-        if section.segment_name().ok().flatten() != Some("__DWARF") {
-            continue;
-        }
-        let Some((start, _)) = section.file_range() else { continue };
-        for (offset, relocation) in section.relocations() {
-            let RelocationTarget::Section(target) = relocation.target() else { continue };
-            // alloc: the error's message
-            let address = file.section_by_index(target).map_err(|e| e.to_string())?.address();
-            settled.push((start + offset, usize::from(relocation.size() / 8), address));
-        }
-    }
-    drop(file);
-    for (at, size, address) in settled {
-        let field = object
-            .get_mut(at as usize..)
-            .and_then(|it| it.get_mut(..size))
-            .ok_or("a debug section with a relocation outside it")?;
-        let mut held = [0; 8];
-        held[..size].copy_from_slice(field);
-        let value = u64::from_le_bytes(held).wrapping_add(address);
-        field.copy_from_slice(&value.to_le_bytes()[..size]);
     }
     Ok(())
 }

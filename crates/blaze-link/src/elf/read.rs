@@ -40,9 +40,9 @@ const ENDIAN: Endianness = Endianness::Little;
 /// The symbol `R_X86_64_GOTPC*` and `GOTOFF64` are against.
 const GOT: &str = "_GLOBAL_OFFSET_TABLE_";
 
-/// Reads `bytes`, the input `name` the link line takes as `kind`. `object` is built with its
-/// `unaligned` feature, so the input is read in place at any alignment (an archive member is
-/// only 2-aligned).
+/// Reads `bytes`, the input `name` the link line takes as `kind`. `object` reads its structs in
+/// place at any alignment, so the input is read where it lies (an archive member is only
+/// 2-aligned).
 pub(super) fn read(
     arch: Arch,
     name: &str,
@@ -84,7 +84,7 @@ pub(super) fn read(
     }
 }
 
-// Reading in place at any alignment needs `object`'s `unaligned` feature.
+// Reading in place at any alignment needs `object`'s structs to be 1-aligned.
 const _: () = assert!(align_of::<Header>() == 1 && align_of::<elf::Rela64<Endianness>>() == 1);
 
 fn taken(kind: &NativeKind) -> &'static str {
@@ -128,7 +128,7 @@ fn header<'data>(
     Ok(header)
 }
 
-fn machine_name(machine: u16) -> &'static str {
+fn machine_name(machine: elf::Machine) -> &'static str {
     match machine {
         elf::EM_X86_64 => "x86-64",
         elf::EM_AARCH64 => "AArch64",
@@ -175,15 +175,19 @@ fn file_name(path: &str) -> String {
     path.rsplit_once('/').map_or(path, |(_, file)| file).to_owned() // alloc: once per file, `Shared::name`
 }
 
-/// A symbol's kind; an IFUNC is a function here, and [`object`] refuses one.
-fn kind(st_type: u8) -> SymbolKind {
-    match st_type {
+/// A symbol's kind; an IFUNC is a function here, and [`object`] refuses one. A type ELF does
+/// not define (an OS or processor one other than IFUNC) is refused: what it asks of the link is
+/// unknown.
+fn kind(name: &str, symbol: impl FnOnce() -> String, st_type: elf::SymbolType) -> Result<SymbolKind, String> {
+    Ok(match st_type {
         elf::STT_FUNC | elf::STT_GNU_IFUNC => SymbolKind::Function,
         elf::STT_OBJECT | elf::STT_COMMON => SymbolKind::Data,
         elf::STT_TLS => SymbolKind::Tls,
         elf::STT_SECTION => SymbolKind::Section,
-        _ => SymbolKind::Other,
-    }
+        elf::STT_NOTYPE | elf::STT_FILE => SymbolKind::Other,
+        // alloc: error path
+        other => return Err(format!("{name}: symbol {} has type {}, which blaze-link does not read", symbol(), other.0)),
+    })
 }
 
 /// The defined global and weak symbols of the relocatable object `data`, in symbol table
@@ -279,7 +283,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
     // `sh_link` 0 it is read as if without the flag, as lld does.
     for (index, header) in sections.enumerate() {
         let to = header.sh_link(ENDIAN) as usize;
-        if header.sh_flags(ENDIAN) & u64::from(elf::SHF_LINK_ORDER) == 0
+        if !header.sh_flags(ENDIAN).contains(elf::SHF_LINK_ORDER)
             || to == 0
             || object.sections[index.0].what == SectionKind::Dropped
         {
@@ -332,8 +336,8 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
                             format!("{name}: symbol {symbol_name} has no extended section index")
                         })?
                         .0
-                } else if shndx < elf::SHN_LORESERVE {
-                    usize::from(shndx)
+                } else if shndx.0 < elf::SHN_LORESERVE {
+                    usize::from(shndx.0)
                 } else {
                     // alloc: error path
                     return Err(format!(
@@ -370,11 +374,13 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
                  not link yet: it has no IRELATIVE relocation to resolve one at load"
             ));
         }
+        // alloc: error path
+        let kind = kind(name, || symbol_name.to_owned(), symbol.st_type())?;
         object.symbols.push(Symbol {
             name: interned,
             def,
             binding,
-            kind: kind(symbol.st_type()),
+            kind,
             hidden: matches!(symbol.st_visibility(), elf::STV_HIDDEN | elf::STV_INTERNAL),
         });
     }
@@ -383,7 +389,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         let Some((flag, members)) = section.group(ENDIAN, data).map_err(error)? else {
             continue;
         };
-        if flag & elf::GRP_COMDAT == 0 {
+        if !flag.contains(elf::GRP_COMDAT) {
             continue;
         }
         let group = object.sections[index.0].name;
@@ -490,9 +496,10 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
             let place = |object: &Object| {
                 // alloc: error path
                 format!(
-                    "{name}: section {}: relocation {} ({r_type}) at {at:#x}",
+                    "{name}: section {}: relocation {} ({}) at {at:#x}",
                     object.name(object.sections[target].name),
-                    relocation_name(arch, r_type)
+                    relocation_name(arch, r_type),
+                    r_type.0
                 )
             };
             if symbol as usize >= symtab.len() {
@@ -549,7 +556,7 @@ fn section(
 ) -> Result<Section, String> {
     let sh_type = section.sh_type(ENDIAN);
     let flags = section.sh_flags(ENDIAN);
-    let flag = |flag: u32| flags & u64::from(flag) != 0;
+    let flag = |flag: elf::SectionFlags| flags.contains(flag);
     let interned = shstrtab.name(names, name, "the section name", section.sh_name(ENDIAN))?;
     let section_name = names.at(interned);
     let align = section.sh_addralign(ENDIAN).max(1);
@@ -586,6 +593,18 @@ fn section(
             "{name}: section {section_name} is compressed (SHF_COMPRESSED), which a loaded \
              section may not be"
         ));
+    }
+    match sh_type {
+        elf::SHT_PROGBITS | elf::SHT_NOBITS | elf::SHT_INIT_ARRAY | elf::SHT_FINI_ARRAY | elf::SHT_PREINIT_ARRAY => {}
+        elf::SHT_X86_64_UNWIND if arch == Arch::X86_64 => {}
+        other => {
+            // alloc: error path
+            return Err(format!(
+                "{name}: section {section_name} is loaded (SHF_ALLOC) and of type {:#x}, which \
+                 blaze-link does not lay out",
+                other.0
+            ));
+        }
     }
     let what = if section_name == ".eh_frame"
         || (arch == Arch::X86_64 && sh_type == elf::SHT_X86_64_UNWIND)
@@ -638,7 +657,7 @@ enum How {
     GotOff(Apply),
 }
 
-fn x86_64(r_type: u32) -> Result<How, &'static str> {
+fn x86_64(r_type: elf::RelocationType) -> Result<How, &'static str> {
     Ok(match r_type {
         elf::R_X86_64_NONE => How::Nothing,
         elf::R_X86_64_64 => How::To(Apply::Abs64),
@@ -662,7 +681,7 @@ fn x86_64(r_type: u32) -> Result<How, &'static str> {
         elf::R_X86_64_GOTPC64 => How::GotBase(Apply::Rel64),
         elf::R_X86_64_GOTOFF64 => How::GotOff(Apply::Delta64),
         elf::R_X86_64_8 | elf::R_X86_64_16 | elf::R_X86_64_PC8 | elf::R_X86_64_PC16 => {
-            How::To(Apply::Native(r_type))
+            How::To(Apply::Native(r_type.0))
         }
         elf::R_X86_64_GOTPC32_TLSDESC | elf::R_X86_64_TLSDESC_CALL => {
             return Err("TLS descriptors (-mtls-dialect=gnu2) are not supported");
@@ -676,7 +695,7 @@ fn x86_64(r_type: u32) -> Result<How, &'static str> {
     })
 }
 
-fn aarch64(r_type: u32) -> Result<How, &'static str> {
+fn aarch64(r_type: elf::RelocationType) -> Result<How, &'static str> {
     Ok(How::To(match r_type {
         elf::R_AARCH64_NONE => return Ok(How::Nothing),
         elf::R_AARCH64_ABS64 => Apply::Abs64,
@@ -725,7 +744,7 @@ fn aarch64(r_type: u32) -> Result<How, &'static str> {
         | elf::R_AARCH64_MOVW_PREL_G1_NC
         | elf::R_AARCH64_MOVW_PREL_G2
         | elf::R_AARCH64_MOVW_PREL_G2_NC
-        | elf::R_AARCH64_MOVW_PREL_G3 => Apply::Native(r_type),
+        | elf::R_AARCH64_MOVW_PREL_G3 => Apply::Native(r_type.0),
         _ => return Err("not a relocation type blaze-link reads"),
     }))
 }
@@ -834,7 +853,7 @@ macro_rules! names {
     };
 }
 
-const X86_64_NAMES: &[(u32, &str)] = names![
+const X86_64_NAMES: &[(elf::RelocationType, &str)] = names![
     R_X86_64_NONE, R_X86_64_64, R_X86_64_PC32, R_X86_64_GOT32, R_X86_64_PLT32, R_X86_64_COPY,
     R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT, R_X86_64_RELATIVE, R_X86_64_GOTPCREL, R_X86_64_32,
     R_X86_64_32S, R_X86_64_16, R_X86_64_PC16, R_X86_64_8, R_X86_64_PC8, R_X86_64_DTPMOD64,
@@ -846,7 +865,7 @@ const X86_64_NAMES: &[(u32, &str)] = names![
     R_X86_64_REX_GOTPCRELX,
 ];
 
-const AARCH64_NAMES: &[(u32, &str)] = names![
+const AARCH64_NAMES: &[(elf::RelocationType, &str)] = names![
     R_AARCH64_NONE, R_AARCH64_ABS64, R_AARCH64_ABS32, R_AARCH64_ABS16, R_AARCH64_PREL64,
     R_AARCH64_PREL32, R_AARCH64_PREL16, R_AARCH64_MOVW_UABS_G0, R_AARCH64_MOVW_UABS_G0_NC,
     R_AARCH64_MOVW_UABS_G1, R_AARCH64_MOVW_UABS_G1_NC, R_AARCH64_MOVW_UABS_G2,
@@ -893,8 +912,8 @@ const AARCH64_NAMES: &[(u32, &str)] = names![
 ];
 
 /// The name of relocation type `r_type` of `arch`, for errors.
-fn relocation_name(arch: Arch, r_type: u32) -> &'static str {
-    let names: &[(u32, &'static str)] = match arch {
+fn relocation_name(arch: Arch, r_type: elf::RelocationType) -> &'static str {
+    let names: &[(elf::RelocationType, &'static str)] = match arch {
         Arch::X86_64 => X86_64_NAMES,
         Arch::Aarch64 => AARCH64_NAMES,
         Arch::Wasm32 => &[],

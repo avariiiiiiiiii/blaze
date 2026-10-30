@@ -5,10 +5,10 @@
 #![forbid(unsafe_code)]
 
 use base_db::{Db, FileId};
-use proc_macro_api::bidirectional_protocol::msg::{ParentSpan, SpanJoin};
+use proc_macro_api::bridge::questions::{ParentSpan, SpanJoin};
 use span::{ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext, TextRange, TextSize};
 
-pub use proc_macro_api::bidirectional_protocol::msg::{SubRequest, SubResponse};
+pub use proc_macro_api::bridge::questions::{SubRequest, SubResponse};
 
 /// `req` answered from `db`, the database of the expansion that asked it.
 pub fn answer(db: &Db, req: SubRequest) -> SubResponse {

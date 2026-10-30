@@ -776,7 +776,7 @@ error: aborting due to 8 previous errors
 For more information about this error, try `rustc --explain E0133`.
 "##;
     let fixture = format!(
-        "//- /wrapping-unsafe-block-sugg.rs crate:main edition:2015 deps:external_unsafe_macro\n{source}\
+        "//- /wrapping-unsafe-block-sugg.rs crate:other:main edition:2015 deps:external_unsafe_macro\n{source}\
          //- /auxiliary/external_unsafe_macro.rs crate:external_unsafe_macro edition:2015\n{aux}"
     );
     let style = Style { ui_testing: true, ..Style::default() };

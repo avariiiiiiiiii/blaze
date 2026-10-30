@@ -195,9 +195,9 @@ fn servil_is_official_blake3() {
     let context_keys: Vec<&'static ContextKey> = contexts
         .iter()
         .map(|context| {
-            let key = performance::context_key(context);
+            let key = servil::context_key(context);
             assert_eq!(key, blake3::hazmat::hash_derive_key_context(context), "the context key of {context:?}");
-            assert_eq!(servil::context_key(context), key);
+            assert_eq!(performance::context_key(context), key);
             assert_eq!(official::context_key(context), key);
             &*Box::leak(Box::new(key))
         })

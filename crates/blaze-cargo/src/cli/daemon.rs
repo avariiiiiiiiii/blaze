@@ -2,7 +2,8 @@
 //! as `blaze serve` when none answers there, spoken to through [`blaze_api::client::Client`].
 
 use std::{
-    path::Path,
+    io,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -50,6 +51,39 @@ pub enum Start {
     Never,
 }
 
+/// Why the CLI has no daemon to speak to.
+#[derive(Debug)]
+pub enum DaemonError {
+    /// A connect to the socket failed for another reason than that nothing listens there:
+    /// no daemon is started over it.
+    Connect { socket: PathBuf, error: ClientError },
+    /// The daemon was started and nothing listened at its socket within [`PATIENCE`], after
+    /// `tries` connects.
+    NotListening { socket: PathBuf, log: PathBuf, tries: u32, error: ClientError },
+}
+
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaemonError::Connect { socket, error } => {
+                write!(f, "connecting to blaze's daemon at {}: {error}", socket.display())
+            }
+            DaemonError::NotListening { socket, log, tries, error } => {
+                // alloc: error path, said once.
+                write!(f, "{} ({tries} connects tried)", not_listening(socket, log, &error.to_string()))
+            }
+        }
+    }
+}
+
+impl std::error::Error for DaemonError {}
+
+/// Whether a connect failed because nothing listens at the socket: no file there, or one a
+/// daemon that is gone left.
+pub fn nothing_listens(error: &ClientError) -> bool {
+    matches!(error, ClientError::Io(it) if matches!(it.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused))
+}
+
 /// A connection to the daemon; `None` when none answers and none was to be started.
 ///
 /// Where systemd or launchd is socket-activating the daemon, the connect itself starts it
@@ -60,6 +94,7 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     let socket = crate::serve::socket()?;
     let refused = match Client::unix(&socket) {
         Ok(client) => return Ok(Some(client)),
+        Err(error) if !nothing_listens(&error) => return Err(DaemonError::Connect { socket, error }.into()),
         Err(_) if start == Start::Never => return Ok(None),
         Err(error) => error,
     };
@@ -86,11 +121,14 @@ pub fn connect(start: Start) -> anyhow::Result<Option<Client>> {
     }
     let log = started()?;
     let asked = Instant::now();
+    let mut tries = 0u32;
     loop {
+        tries += 1;
         match Client::unix(&socket) {
             Ok(client) => return Ok(Some(client)),
+            Err(error) if !nothing_listens(&error) => return Err(DaemonError::Connect { socket, error }.into()),
             Err(error) if asked.elapsed() > PATIENCE => {
-                return Err(anyhow::anyhow!(not_listening(&socket, &log, &error.to_string())));
+                return Err(DaemonError::NotListening { socket, log, tries, error }.into());
             }
             Err(_) => std::thread::sleep(POLL),
         }
@@ -181,7 +219,7 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     }
     drop(client);
     let asked = Instant::now();
-    while answers(&socket) {
+    while answers(&socket)? {
         if asked.elapsed() > PATIENCE {
             let what = format!("the daemon at {} was told to stop and still answers after {}s", socket.display(), PATIENCE.as_secs());
             err.write_all(super::say::error(&what, color).as_bytes())?;
@@ -192,14 +230,20 @@ pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+/// Whether the daemon still answers at `socket`; a connect that fails for another reason than
+/// that nothing listens is the error.
 #[cfg(unix)]
-fn answers(socket: &Path) -> bool {
-    Client::unix(socket).is_ok()
+fn answers(socket: &Path) -> Result<bool, DaemonError> {
+    match Client::unix(socket) {
+        Ok(_) => Ok(true),
+        Err(error) if nothing_listens(&error) => Ok(false),
+        Err(error) => Err(DaemonError::Connect { socket: socket.to_owned(), error }),
+    }
 }
 
 #[cfg(not(unix))]
-fn answers(_: &Path) -> bool {
-    false
+fn answers(_: &Path) -> Result<bool, DaemonError> {
+    Ok(false)
 }
 
 /// `blaze status`: what the daemon is doing, on stdout.
@@ -311,3 +355,33 @@ pub fn bytes(count: u64) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod refusals {
+    use super::*;
+
+    fn failed(kind: io::ErrorKind) -> ClientError {
+        ClientError::Io(io::Error::new(kind, "it"))
+    }
+
+    #[test]
+    fn only_a_socket_nothing_listens_at_is_no_daemon() {
+        assert!(nothing_listens(&failed(io::ErrorKind::NotFound)));
+        assert!(nothing_listens(&failed(io::ErrorKind::ConnectionRefused)));
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::InvalidInput, io::ErrorKind::TimedOut] {
+            assert!(!nothing_listens(&failed(kind)), "{kind:?}");
+        }
+        assert!(!nothing_listens(&ClientError::Schema { theirs: 0 }));
+    }
+
+    #[test]
+    fn a_refused_connect_names_the_socket_and_a_start_the_tries() {
+        let socket = PathBuf::from("/run/blaze/v2.sock");
+        let said = DaemonError::Connect { socket: socket.clone(), error: failed(io::ErrorKind::PermissionDenied) }.to_string();
+        assert!(said.starts_with("connecting to blaze's daemon at /run/blaze/v2.sock: "), "{said}");
+        let log = PathBuf::from("/c/blaze/v2/serve.log");
+        let said = DaemonError::NotListening { socket, log, tries: 9001, error: failed(io::ErrorKind::ConnectionRefused) }.to_string();
+        assert!(said.contains("nothing listens at /run/blaze/v2.sock after 10s"), "{said}");
+        assert!(said.ends_with("(9001 connects tried)"), "{said}");
+    }
+}

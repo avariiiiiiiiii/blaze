@@ -89,7 +89,7 @@ use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Named, Recorder,
     Reloc as CodeReloc, RelocName, Relocs, Requests, TextPart, Variable,
 };
-use self::unwind::{FunctionUnwind, UnwindContext};
+use self::unwind::FunctionUnwind;
 use self::vtable::{Slot, Upcast, VtableLayout};
 pub use hir_ty_mir::mir::location::name_sources;
 use hir_ty_mir::mir::{
@@ -130,6 +130,8 @@ mod imports;
 #[cfg(feature = "llvm")]
 #[allow(unsafe_code)]
 mod llvm;
+#[cfg(feature = "llvm")]
+pub use llvm::Unhandled as LlvmUnhandled;
 
 /// The CPU of this host and its features as LLVM names them (`+avx2,-avx512f,...`), what
 /// rustc's `-C target-cpu=native` is; `None` without LLVM.
@@ -169,27 +171,19 @@ mod x86;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CodegenError {
-    /// The function uses something this backend can't compile yet; fall back to rustc.
+    /// The function uses something this backend can't compile yet. The build stops on it:
+    /// nothing else compiles the function instead.
     Unsupported(String),
     /// MIR lowering or layout failed in RA.
     Frontend(String),
     Backend(String),
-    /// rustc exports nothing for the function, so there is nothing to replace: only code in
-    /// its own crate can call it.
-    NoSymbol,
-    /// rustc built the function under a symbol private to its object, so its copy stays the
-    /// one that code of that object calls, and goes on using rustc's statics.
-    Private,
+    /// LLVM, which `BLAZE_BACKEND=llvm` or a tier asked for, has no code for the function.
+    /// The build stops on it: Cranelift never compiles the function in LLVM's place.
+    #[cfg(feature = "llvm")]
+    LlvmRefused(LlvmUnhandled),
     /// What blaze can't do and no other path may stand in for: the build stops with this
     /// error, naming what and where. Never left to rustc, never a build in full instead.
     Refused(String),
-}
-
-impl CodegenError {
-    /// Whether rustc has no symbol of the function that ours could take the place of.
-    pub fn no_symbol(&self) -> bool {
-        matches!(self, CodegenError::NoSymbol | CodegenError::Private)
-    }
 }
 
 impl fmt::Display for CodegenError {
@@ -198,9 +192,8 @@ impl fmt::Display for CodegenError {
             CodegenError::Unsupported(it) => write!(f, "unsupported: {it}"),
             CodegenError::Frontend(it) => write!(f, "frontend: {it}"),
             CodegenError::Backend(it) => write!(f, "backend: {it}"),
-            CodegenError::NoSymbol | CodegenError::Private => {
-                write!(f, "unsupported: no rustc symbol for function")
-            }
+            #[cfg(feature = "llvm")]
+            CodegenError::LlvmRefused(why) => write!(f, "LLVM has no code for the function: {why}"),
             CodegenError::Refused(it) => write!(f, "{it}"),
         }
     }
@@ -228,7 +221,7 @@ macro_rules! refused {
     };
 }
 
-/// What a crate is by what is written in it and what it is built on: a SHA-256, all of it.
+/// What a crate is by what is written in it and what it is built on: a BLAKE3 hash, all of it.
 /// The names made from it are what another machine's store is asked for code by, so it is
 /// as hard to find two crates of one id as two files of one hash.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -681,136 +674,6 @@ impl AbiScalar {
     }
 }
 
-/// Which statics we define ourselves rather than use rustc's. A function left to rustc uses
-/// rustc's copy of a static, so the ones it refers to stay rustc's, along with whatever refers
-/// to them.
-#[derive(Clone)]
-struct OwnStatics {
-    crates: FxHashSet<Crate>,
-    /// Those of `crates` that a crate of the program left to rustc depends on: its code refers
-    /// to the statics rustc exports from them.
-    shared: FxHashSet<Crate>,
-    theirs: FxHashSet<StaticId>,
-    /// Crates with a function left to rustc that refers to we don't know what. That can be
-    /// any static of the crate: one declared in the body of another function too, through
-    /// rustc's copy of that function, which it calls.
-    unknown: FxHashSet<Crate>,
-    /// The crates of the program rustc built nothing of, whose statics have no copy but ours.
-    unbuilt: FxHashSet<Crate>,
-}
-
-impl OwnStatics {
-    /// None: those of a patch of what rustc linked, all of whose statics are rustc's.
-    fn none() -> OwnStatics {
-        OwnStatics {
-            crates: FxHashSet::default(),
-            shared: FxHashSet::default(),
-            theirs: FxHashSet::default(),
-            unknown: FxHashSet::default(),
-            unbuilt: FxHashSet::default(),
-        }
-    }
-
-    fn new(
-        db: &Db,
-        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
-        symbols: &dyn SymbolResolver,
-        crates: FxHashSet<Crate>,
-        theirs: FxHashSet<StaticId>,
-        unknown: FxHashSet<Crate>,
-        is_program: bool,
-    ) -> OwnStatics {
-        // With on-demand roots the build is of a program whose `main` is in `crates`, and only
-        // what that depends on is linked. Without, anything may be linked on top.
-        let program: FxHashSet<Crate> = if is_program {
-            linked_crates(db, crates.iter().copied())
-        } else {
-            // alloc: once per build, the crates that may be linked
-            base_db::all_crates(db).iter().copied().collect()
-        };
-        let mut dependents = FxHashMap::<Crate, Vec<Crate>>::default();
-        for &krate in &program {
-            for dep in &krate.data(db).dependencies {
-                dependents.entry(dep.crate_id).or_default().push(krate);
-            }
-        }
-        // alloc: one set and one stack for the walk from every crate, cleared for each
-        let (mut seen, mut stack) = (FxHashSet::default(), Vec::new());
-        let is_shared = |krate: &Crate| {
-            seen.clear();
-            stack.clear();
-            stack.push(*krate);
-            while let Some(krate) = stack.pop() {
-                for &dependent in dependents.get(&krate).into_iter().flatten() {
-                    if !crates.contains(&dependent) {
-                        return true;
-                    }
-                    if seen.insert(dependent) {
-                        stack.push(dependent);
-                    }
-                }
-            }
-            false
-        };
-        // alloc: once per build, the set it keeps
-        let shared = crates.iter().copied().filter(is_shared).collect();
-        let unbuilt =
-            // alloc: once per build, the set it keeps
-            program.iter().copied().filter(|&krate| !symbols.rustc_built(krate)).collect();
-        OwnStatics { crates, shared, theirs, unknown, unbuilt }
-    }
-
-    fn owns(&self, db: &Db, id: StaticId) -> bool {
-        let krate = id.module(db).krate(db);
-        if self.unbuilt.contains(&krate) {
-            return true;
-        }
-        self.crates.contains(&krate) && !self.theirs.contains(&id) && !self.unknown.contains(&krate)
-    }
-
-    /// Whether our copy of the static stands in for the one rustc exports. rustc's is what the
-    /// static was when rustc last built the crate, which an edit to its value leaves behind.
-    // FIXME: `#[used]` and `#[link_section]` statics are found by the linker or a runtime
-    // through rustc's copy and should stay rustc's too.
-    fn replaces(&self, db: &Db, id: StaticId) -> bool {
-        self.owns(db, id)
-            && !self.shared.contains(&id.krate(db))
-            && !AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE)
-            && AttrFlags::export_name(db, id.into()).is_none()
-    }
-}
-
-/// Instances already found impossible to compile, kept between builds so a warm build does
-/// not rediscover them one restart at a time.
-/// An instance that could not be compiled, and what it was compiled for.
-#[derive(Clone)]
-pub(crate) struct Rejected {
-    env: StoredParamEnvAndCrate,
-    why: String,
-}
-
-/// Time spent in each step of the last round.
-#[derive(Default, Clone, Copy)]
-pub struct Phases {
-    /// Asking for each compiled function: checking that what it was compiled from is unchanged,
-    /// and compiling it when not.
-    pub compile: std::time::Duration,
-    /// Finding what each compiled function refers to in the object.
-    pub resolve: std::time::Duration,
-    /// Handing the code to the object.
-    pub define: std::time::Duration,
-    /// Writing the object file.
-    pub object: std::time::Duration,
-    /// Working out what the functions left to rustc keep the rest from compiling.
-    pub fallback: std::time::Duration,
-    /// The rounds before the last, whose object was not kept.
-    pub discarded: std::time::Duration,
-    /// Telling which statics are the program's own (of a patch).
-    pub statics: std::time::Duration,
-    /// Setting up the object to put the code in (of a patch).
-    pub setup: std::time::Duration,
-}
-
 /// A function with concrete generic arguments that we compile ourselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Instance {
@@ -879,410 +742,6 @@ enum Callee<'db> {
     Instance(InstanceDef, GenericArgs<'db>),
     /// With how many of the arguments are for named parameters, when the rest are for `...`.
     Pointer(Value, ExternAbi, Option<usize>),
-}
-
-/// How rustc's symbols spell the types and instances of the program, with each crate as the
-/// resolver's path for it (`name[hash]`), the key [`SymbolResolver::path`] finds rustc's symbol
-/// by. Not `hir_ty_mir::mir::type_name::rustc_symbol_type`, which writes what a backtrace shows.
-struct Spelling<'a, 'db> {
-    db: &'db Db,
-    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
-    symbols: &'a dyn SymbolResolver,
-}
-
-impl<'db> Spelling<'_, 'db> {
-    /// A generic function with its arguments as it reads in a demangled rustc symbol:
-    /// `<Vec<u8> as Clone>::clone`, `<Option<u8>>::map::<u8, F>`, `core::mem::swap::<u8>`.
-    fn instance_path(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<String> {
-        let db = self.db;
-        let signature = FunctionSignature::of(db, func);
-        // The future of an `async fn` is laid out differently by the two compilers.
-        if signature.is_async() {
-            return None;
-        }
-        let name = signature.name.as_str();
-        let interner = DbInterner::new_no_crate(db);
-        let parent = hir_ty::generics::generics(db, func.into()).len_parent();
-        let (parent, own) = args.as_slice().split_at_checked(parent)?;
-        let mut path = match func.lookup(db).container {
-            ItemContainerId::ModuleId(_) => self.symbols.item(func.into())?,
-            ItemContainerId::TraitId(trait_) => {
-                let (self_ty, rest) = parent.split_first()?;
-                // alloc: the spelled path, the one buffer it is written into
-                let mut path = String::from("<");
-                self.write_type(&mut path, self_ty.ty()?)?;
-                path.push_str(" as ");
-                path.push_str(&self.symbols.item(trait_.into())?);
-                self.write_args(&mut path, "<", rest, ">")?;
-                path.push_str(">::");
-                path.push_str(name);
-                path
-            }
-            ItemContainerId::ImplId(impl_) => {
-                let parent_args = GenericArgs::new_from_slice(parent);
-                let self_ty =
-                    db.impl_self_ty(impl_).instantiate(interner, parent_args).skip_norm_wip();
-                // alloc: the spelled path, the one buffer it is written into
-                let mut path = String::from("<");
-                self.write_type(&mut path, self_ty)?;
-                if let Some(trait_ref) = db.impl_trait(impl_) {
-                    let trait_ref = trait_ref.instantiate(interner, parent_args).skip_norm_wip();
-                    path.push_str(" as ");
-                    path.push_str(&self.symbols.item(trait_ref.def_id.0.into())?);
-                    self.write_args(&mut path, "<", &trait_ref.args.as_slice()[1..], ">")?;
-                }
-                path.push_str(">::");
-                path.push_str(name);
-                path
-            }
-            ItemContainerId::ExternBlockId(_) => return None,
-        };
-        self.write_args(&mut path, "::<", own, ">")?;
-        Some(path)
-    }
-
-    /// The arguments of the instance of `func` that [`Self::instance_path`] spells `path`, for
-    /// a function whose parent has no types for parameters: rustc's copy says what it is of.
-    /// Lifetimes are erased; a type this does not read back declines.
-    fn instance_args(&self, func: FunctionId, path: &str) -> Option<GenericArgs<'db>> {
-        let (_, own) = path.strip_suffix('>')?.rsplit_once("::<")?;
-        let mut own = split_top(own).into_iter().map(|it| self.read_type(it));
-        let interner = DbInterner::new_no_crate(self.db);
-        let erased = Region::new_erased(interner);
-        let mut read = true;
-        let parent = hir_ty::generics::generics(self.db, func.into()).len_parent();
-        let args = GenericArgs::for_item(interner, func.into(), |at, param, _, _| {
-            match (param, at as usize >= parent) {
-                (hir_def::GenericParamId::LifetimeParamId(_), _) => return erased.into(),
-                (hir_def::GenericParamId::TypeParamId(_), true) => {
-                    if let Some(Some(ty)) = own.next() {
-                        return ty.into();
-                    }
-                }
-                _ => {}
-            }
-            read = false;
-            erased.into()
-        });
-        let all = read && own.next().is_none();
-        (all && self.instance_path(func, args).as_deref() == Some(path)).then_some(args)
-    }
-
-    /// A type as [`Self::symbol_type`] spells it, of those that are not `dyn`, closures or
-    /// function pointers.
-    fn read_type(&self, text: &str) -> Option<Ty<'db>> {
-        let interner = DbInterner::new_no_crate(self.db);
-        let erased = Region::new_erased(interner);
-        let builtin = match text {
-            "bool" => Some(TyKind::Bool),
-            "char" => Some(TyKind::Char),
-            "str" => Some(TyKind::Str),
-            "!" => Some(TyKind::Never),
-            _ => None,
-        };
-        if let Some(kind) = builtin {
-            return Some(Ty::new(interner, kind));
-        }
-        let numbers = [
-            ("i8", TyKind::Int(rustc_type_ir::IntTy::I8)),
-            ("i16", TyKind::Int(rustc_type_ir::IntTy::I16)),
-            ("i32", TyKind::Int(rustc_type_ir::IntTy::I32)),
-            ("i64", TyKind::Int(rustc_type_ir::IntTy::I64)),
-            ("i128", TyKind::Int(rustc_type_ir::IntTy::I128)),
-            ("isize", TyKind::Int(rustc_type_ir::IntTy::Isize)),
-            ("u8", TyKind::Uint(UintTy::U8)),
-            ("u16", TyKind::Uint(UintTy::U16)),
-            ("u32", TyKind::Uint(UintTy::U32)),
-            ("u64", TyKind::Uint(UintTy::U64)),
-            ("u128", TyKind::Uint(UintTy::U128)),
-            ("usize", TyKind::Uint(UintTy::Usize)),
-            ("f16", TyKind::Float(rustc_type_ir::FloatTy::F16)),
-            ("f32", TyKind::Float(rustc_type_ir::FloatTy::F32)),
-            ("f64", TyKind::Float(rustc_type_ir::FloatTy::F64)),
-            ("f128", TyKind::Float(rustc_type_ir::FloatTy::F128)),
-        ];
-        if let Some((_, kind)) = numbers.into_iter().find(|(name, _)| *name == text) {
-            return Some(Ty::new(interner, kind));
-        }
-        let pointers = [
-            ("&mut ", None, Mutability::Mut),
-            ("&", None, Mutability::Not),
-            ("*mut ", Some(()), Mutability::Mut),
-            ("*const ", Some(()), Mutability::Not),
-        ];
-        for (prefix, raw, mutability) in pointers {
-            if let Some(pointee) = text.strip_prefix(prefix) {
-                let pointee = self.read_type(pointee)?;
-                return Some(match raw {
-                    Some(()) => Ty::new_ptr(interner, pointee, mutability),
-                    None => Ty::new_ref(interner, erased, pointee, mutability),
-                });
-            }
-        }
-        if let Some(inner) = text.strip_prefix('[').and_then(|it| it.strip_suffix(']')) {
-            let mut parts = split_top_on(inner, "; ");
-            return match (parts.next(), parts.next(), parts.next()) {
-                (Some(element), None, _) => {
-                    Some(Ty::new_slice(interner, self.read_type(element)?))
-                }
-                (Some(element), Some(len), None) => {
-                    Some(Ty::new_array(interner, self.read_type(element)?, len.parse().ok()?))
-                }
-                _ => None,
-            };
-        }
-        if let Some(inner) = text.strip_prefix('(').and_then(|it| it.strip_suffix(')')) {
-            let inner = inner.strip_suffix(',').unwrap_or(inner);
-            let tys = split_top(inner).into_iter().map(|it| self.read_type(it));
-            return Some(Ty::new_tup(interner, &tys.collect::<Option<Vec<_>>>()?));
-        }
-        if text.starts_with(['<', '{']) || text.starts_with("fn(") || text.starts_with("dyn ") {
-            return None;
-        }
-        let (path, args) = match text.split_once('<') {
-            Some((path, args)) => (path, split_top(args.strip_suffix('>')?)),
-            None => (text, split_top("")),
-        };
-        let adt = self.symbols.adt_at(path)?;
-        let mut spelled = args.into_iter().map(|it| self.read_type(it));
-        let defaults = self.db.generic_defaults(adt.into());
-        let mut read = true;
-        let args = GenericArgs::for_item(interner, adt.into(), |at, param, _, before| {
-            match param {
-                hir_def::GenericParamId::LifetimeParamId(_) => return erased.into(),
-                hir_def::GenericParamId::TypeParamId(_) => match spelled.next() {
-                    Some(Some(ty)) => return ty.into(),
-                    Some(None) => {}
-                    // rustc leaves out the arguments that say what the default says.
-                    None => {
-                        if let Some(default) = defaults.get(at as usize) {
-                            return default.instantiate(interner, before).skip_norm_wip();
-                        }
-                    }
-                },
-                hir_def::GenericParamId::ConstParamId(_) => {}
-            }
-            read = false;
-            erased.into()
-        });
-        (read && spelled.next().is_none()).then(|| Ty::new_adt(interner, adt, args))
-    }
-
-    /// A type or a `usize` an instance is instantiated with, as rustc's symbols spell it,
-    /// written at the end of `out`.
-    fn write_arg(
-        &self,
-        out: &mut String,
-        arg: hir_ty::next_solver::GenericArg<'db>,
-    ) -> Option<()> {
-        use std::fmt::Write;
-        match (arg.ty(), arg.konst()) {
-            (Some(ty), _) => self.write_type(out, ty),
-            (None, Some(len)) => write!(out, "{}", try_const_usize(self.db, len)?).ok(),
-            (None, None) => None,
-        }
-    }
-
-    /// [`Self::write_arg`] of each of `args` that is not a lifetime, between commas, after
-    /// `open` and before `close`: nothing at all when there are none.
-    fn write_args(
-        &self,
-        out: &mut String,
-        open: &str,
-        args: &[hir_ty::next_solver::GenericArg<'db>],
-        close: &str,
-    ) -> Option<()> {
-        let mut first = true;
-        for &arg in args.iter().filter(|it| it.region().is_none()) {
-            out.push_str(if first { open } else { ", " });
-            first = false;
-            self.write_arg(out, arg)?;
-        }
-        if !first {
-            out.push_str(close);
-        }
-        Some(())
-    }
-
-    /// A type as it reads in a demangled rustc symbol. `None` for the types whose spelling
-    /// there this does not know: closures, `dyn`, function pointers, anything with a lifetime
-    /// argument.
-    fn symbol_type(&self, ty: Ty<'db>) -> Option<String> {
-        // alloc: the spelled type, the one buffer it is written into
-        let mut out = String::new();
-        self.write_type(&mut out, ty)?;
-        Some(out)
-    }
-
-    /// [`Self::symbol_type`] written at the end of `out`. What it wrote before a `None` spells
-    /// nothing.
-    fn write_type(&self, out: &mut String, ty: Ty<'db>) -> Option<()> {
-        use std::fmt::Write;
-        let db = self.db;
-        if let Some(name) = hir_ty_mir::mir::type_name::scalar_name(ty) {
-            out.push_str(name);
-            return Some(());
-        }
-        match ty.kind() {
-            TyKind::Ref(_, pointee, Mutability::Not) => {
-                out.push('&');
-                self.write_type(out, pointee)?;
-            }
-            TyKind::Ref(_, pointee, Mutability::Mut) => {
-                out.push_str("&mut ");
-                self.write_type(out, pointee)?;
-            }
-            TyKind::RawPtr(pointee, Mutability::Not) => {
-                out.push_str("*const ");
-                self.write_type(out, pointee)?;
-            }
-            TyKind::RawPtr(pointee, Mutability::Mut) => {
-                out.push_str("*mut ");
-                self.write_type(out, pointee)?;
-            }
-            TyKind::Slice(element) => {
-                out.push('[');
-                self.write_type(out, element)?;
-                out.push(']');
-            }
-            TyKind::Array(element, len) => {
-                out.push('[');
-                self.write_type(out, element)?;
-                write!(out, "; {}]", try_const_usize(db, len)?).ok()?;
-            }
-            TyKind::Tuple(tys) if tys.len() == 1 => {
-                out.push('(');
-                self.write_types(out, tys.iter())?;
-                out.push_str(",)");
-            }
-            TyKind::Tuple(tys) => {
-                out.push('(');
-                self.write_types(out, tys.iter())?;
-                out.push(')');
-            }
-            TyKind::Adt(adt, args) => {
-                out.push_str(&self.symbols.item(adt.def_id().into())?);
-                let interner = DbInterner::new_no_crate(db);
-                let defaults = db.generic_defaults(adt.def_id().into());
-                let mut args = args.as_slice();
-                // rustc leaves out the arguments that say what the default says.
-                while let Some((last, rest)) = args.split_last()
-                    && let Some(default) = defaults.get(rest.len())
-                    && default.instantiate(interner, rest).skip_norm_wip() == *last
-                {
-                    args = rest;
-                }
-                self.write_args(out, "<", args, ">")?;
-            }
-            TyKind::FnPtr(..) => {
-                let sig = ty.fn_sig(DbInterner::new_no_crate(db)).no_bound_vars()?;
-                if sig.abi() != ExternAbi::Rust
-                    || sig.c_variadic()
-                    || sig.safety() != hir_ty::next_solver::abi::Safety::Safe
-                {
-                    return None;
-                }
-                out.push_str("fn(");
-                self.write_types(out, sig.inputs().iter().copied())?;
-                out.push(')');
-                if !sig.output().is_unit() {
-                    out.push_str(" -> ");
-                    self.write_type(out, sig.output())?;
-                }
-            }
-            TyKind::Dynamic(bounds, _) => {
-                let principal = bounds.principal()?.no_bound_vars()?;
-                out.push_str("dyn ");
-                out.push_str(&self.symbols.item(principal.def_id.0.into())?);
-                let mut first = true;
-                for arg in principal.args.iter().filter(|it| it.region().is_none()) {
-                    out.push_str(if first { "<" } else { ", " });
-                    first = false;
-                    self.write_arg(out, arg)?;
-                }
-                for bound in bounds.projection_bounds() {
-                    let bound = bound.no_bound_vars()?;
-                    let hir_ty::next_solver::TermId::TypeAliasId(alias) = bound.def_id.0 else {
-                        return None;
-                    };
-                    let ty = rustc_type_ir::inherent::Term::as_type(&bound.term)?;
-                    out.push_str(if first { "<" } else { ", " });
-                    first = false;
-                    let signature = hir_def::signatures::TypeAliasSignature::of(db, alias);
-                    out.push_str(signature.name.as_str());
-                    out.push_str(" = ");
-                    self.write_type(out, ty)?;
-                }
-                if !first {
-                    out.push('>');
-                }
-                for auto in bounds.auto_traits() {
-                    out.push_str(" + ");
-                    out.push_str(&self.symbols.item(auto.0.into())?);
-                }
-            }
-            _ => return None,
-        }
-        Some(())
-    }
-
-    /// [`Self::write_type`] of each of `tys`, between commas.
-    fn write_types(&self, out: &mut String, tys: impl Iterator<Item = Ty<'db>>) -> Option<()> {
-        for (at, ty) in tys.enumerate() {
-            if at != 0 {
-                out.push_str(", ");
-            }
-            self.write_type(out, ty)?;
-        }
-        Some(())
-    }
-}
-
-/// The parts of a list of types that `, ` separates outside of brackets.
-fn split_top(text: &str) -> SplitTop<'_> {
-    SplitTop { done: text.is_empty(), ..split_top_on(text, ", ") }
-}
-
-/// The parts of `text` that `separator` separates outside of brackets: one at least.
-fn split_top_on<'t>(text: &'t str, separator: &'static str) -> SplitTop<'t> {
-    SplitTop { text, separator, at: 0, start: 0, depth: 0, done: false }
-}
-
-/// The parts [`split_top_on`] finds, each as it is reached.
-struct SplitTop<'t> {
-    text: &'t str,
-    separator: &'static str,
-    at: usize,
-    start: usize,
-    depth: i32,
-    done: bool,
-}
-
-impl<'t> Iterator for SplitTop<'t> {
-    type Item = &'t str;
-
-    fn next(&mut self) -> Option<&'t str> {
-        if self.done {
-            return None;
-        }
-        let (text, bytes) = (self.text, self.text.as_bytes());
-        while self.at < bytes.len() {
-            match bytes[self.at] {
-                b'<' | b'(' | b'[' => self.depth += 1,
-                b'>' | b')' | b']' => self.depth -= 1,
-                _ if self.depth == 0 && text[self.at..].starts_with(self.separator) => {
-                    let part = &text[self.start..self.at];
-                    self.at += self.separator.len();
-                    self.start = self.at;
-                    return Some(part);
-                }
-                _ => {}
-            }
-            self.at += 1;
-        }
-        self.done = true;
-        Some(&text[self.start..])
-    }
 }
 
 /// The code generator of the one [`Target`] the process compiles for, with the baseline's
@@ -1391,61 +850,6 @@ fn root_serial(db: &Db, func: FunctionId) -> u128 {
     compiled_root(db, func).as_ref().map_or(0, print_of)
 }
 
-/// A hash of the text of `func` and of where it starts, which says what rustc compiled of it
-/// and of each block in it, and where its panics are. `None` for one a macro writes.
-fn written_print(db: &Db, func: FunctionId) -> Option<u64> {
-    use std::hash::{Hash, Hasher};
-    let source = func.lookup(db).ast_ptr(db);
-    if source.file_id.macro_file().is_some() {
-        return None;
-    }
-    let mut hasher = rustc_hash::FxHasher::default();
-    (*declaration_location(db, func))?.hash(&mut hasher);
-    let written = syntax::view::to_node(source.value.syntax_node_ptr(), source.file_id.root(db));
-    written.text().hash(&mut hasher);
-    Some(hasher.finish())
-}
-
-/// The closures written in the body of `func` in the order the body has them: each as the
-/// instance its code is compiled as, with a hash of its type, which says what it captures
-/// and how it is called. `None` for one that is not a plain closure (`async`). `None` in all
-/// for a generic function, whose closures are instances of its arguments.
-#[allow(clippy::type_complexity)]
-fn closures_of(
-    db: &Db,
-    func: FunctionId,
-) -> Option<Vec<(hir_def::hir::ExprId, Option<(Instance, u64)>)>> {
-    use std::fmt::Write as _;
-    use std::hash::{Hash, Hasher};
-    let body = Body::of(db, func.into());
-    let infer = InferenceResult::of(db, DefWithBodyId::from(func));
-    let checked = crate_checks_overflow(db, func.krate(db)).unwrap_or(false);
-    let closures = body.exprs().filter(|(_, it)| matches!(it, hir_def::hir::Expr::Closure { .. }));
-    // alloc: one buffer for the text of every closure's type, cleared for each
-    let mut text = String::new();
-    closures
-        .map(|(expr, _)| {
-            let ty = infer.expr_ty(expr);
-            let TyKind::Closure(id, args) = ty.kind() else { return Some((expr, None)) };
-            let parent = args.as_closure().parent_args();
-            if !parent.is_empty() {
-                return None;
-            }
-            let instance = Instance {
-                def: InstanceDef::Closure(id.0.as_id()),
-                args: GenericArgs::new_from_slice(parent).store(),
-                checked,
-            };
-            let mut hasher = rustc_hash::FxHasher::default();
-            text.clear();
-            write!(text, "{args:?}").expect("`Debug` of generic arguments into a `String`");
-            text.hash(&mut hasher);
-            Some((expr, Some((instance, hasher.finish()))))
-        })
-        // alloc: the owned `Vec` patch.rs takes per root (its signature, outside this range)
-        .collect()
-}
-
 // Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
 // fewer revisions), so they stay interned and are never verified.
 #[salsa::tracked(returns(copy), revisions = usize::MAX)]
@@ -1496,15 +900,6 @@ fn compiled_root<'db>(db: &'db Db, func: FunctionId) -> Result<CompiledFunction>
     counted::compiles(func.krate(db));
     let _flight = flight::Flight::root(db, func);
     tier::for_build(|| root_code(db, func, false)).map(Produced::code)
-}
-
-/// The instance a non-generic function is compiled as under its own symbol.
-fn root_instance(db: &Db, func: FunctionId) -> Instance {
-    Instance {
-        def: InstanceDef::Fn(func),
-        args: GenericArgs::new_from_slice(&[]).store(),
-        checked: crate_checks_overflow(db, func.krate(db)).unwrap_or(false),
-    }
 }
 
 /// The last name of what an instance is of.
@@ -1930,17 +1325,29 @@ impl Variadic {
 /// The MIR optimization level the environment asks for with `BLAZE_MIR_OPT` in place of
 /// rustc's ([`mir_opt_level_of`]): 0 compiles the runtime body; 1 and 2 that body after
 /// rustc's MIR passes at its `-Zmir-opt-level` 1 and 2 (`hir_ty_mir::mir::MirOptLevel`).
-pub fn mir_opt_level() -> Option<MirOptLevel> {
-    static LEVEL: LazyLock<Option<MirOptLevel>> = LazyLock::new(|| {
-        let asked = std::env::var_os(MIR_OPT)?;
-        let level =
-            asked.to_str().and_then(|it| it.parse().ok()).and_then(MirOptLevel::from_number);
-        if level.is_none() {
-            eprintln!("blaze: {MIR_OPT}={}: expected 0, 1 or 2; using rustc's", asked.display());
-        }
-        level
-    });
-    *LEVEL
+pub fn mir_opt_level() -> Result<Option<MirOptLevel>> {
+    static LEVEL: LazyLock<std::result::Result<Option<MirOptLevel>, String>> =
+        LazyLock::new(|| mir_opt_level_in(std::env::var_os(MIR_OPT).as_deref()));
+    match &*LEVEL {
+        Ok(level) => Ok(*level),
+        // clone: the error's message
+        Err(why) => Err(CodegenError::Backend(why.clone())),
+    }
+}
+
+/// The level `BLAZE_MIR_OPT` set to `asked` asks for: none when unset, an error naming the
+/// value when it is not one.
+fn mir_opt_level_in(
+    asked: Option<&std::ffi::OsStr>,
+) -> std::result::Result<Option<MirOptLevel>, String> {
+    let Some(asked) = asked else { return Ok(None) };
+    asked
+        .to_str()
+        .and_then(|it| it.parse().ok())
+        .and_then(MirOptLevel::from_number)
+        .map(Some)
+        // alloc: the error's message
+        .ok_or_else(|| format!("{MIR_OPT}={}: expected 0, 1 or 2", asked.display()))
 }
 
 pub const MIR_OPT: &str = "BLAZE_MIR_OPT";
@@ -1967,10 +1374,10 @@ pub(crate) fn dumps_tier() -> bool {
 
 /// The MIR optimization level of the bodies of `krate`: [`mir_opt_level`] where it is asked
 /// for, else rustc's ([`rustc_mir_opt_level`]).
-fn mir_opt_level_of(db: &Db, krate: Crate) -> MirOptLevel {
-    mir_opt_level().unwrap_or_else(|| {
+fn mir_opt_level_of(db: &Db, krate: Crate) -> Result<MirOptLevel> {
+    Ok(mir_opt_level()?.unwrap_or_else(|| {
         rustc_mir_opt_level(krate.data(db).origin.is_lang(), backend::above_o0())
-    })
+    }))
 }
 
 /// The `-Zmir-opt-level` rustc's code of a crate is generated from: 1 at `-Copt-level=0`, 2
@@ -1983,14 +1390,14 @@ fn rustc_mir_opt_level(lang: bool, optimized: bool) -> MirOptLevel {
 /// where its `-C debug-assertions` is on (`sess.ub_checks()` of the crate whose MIR it is,
 /// not [`ub_checks_of`], the calling crate's `ub_checks()`), lifetime markers kept, and
 /// inlined as rustc's `Inline::is_enabled` says at level 2 ([`rustc_inlines`]).
-fn mir_options_of(db: &Db, krate: Crate) -> MirOptions {
-    let level = mir_opt_level_of(db, krate);
-    MirOptions {
+fn mir_options_of(db: &Db, krate: Crate) -> Result<MirOptions> {
+    let level = mir_opt_level_of(db, krate)?;
+    Ok(MirOptions {
         level,
         ub_checks: debug_assertions(db, krate),
         lifetime_markers: true,
         inline: rustc_inlines(level, krate.data(db).origin.is_lang(), backend::optimizing()),
-    }
+    })
 }
 
 /// rustc's `Inline::is_enabled` at `-Zmir-opt-level` `level`: never below 2, and at 2 for
@@ -2010,9 +1417,9 @@ fn body_options(
     build: Option<v2::build::Build>,
     written: Crate,
     compiling: Crate,
-) -> MirOptions {
+) -> Result<MirOptions> {
     match build {
-        Some(build) => build.options(db, written, compiling),
+        Some(build) => Ok(build.options(db, written, compiling)),
         None => mir_options_of(db, written),
     }
 }
@@ -2041,12 +1448,12 @@ fn instance_body<'db>(
     let Some(owner) = instance.def.mir_owner() else { unsupported!("the body of a shim") };
     let lean = match owner {
         MirOwner::Body(_) | MirOwner::Closure(_) => {
-            *LEAN || mir_opt_level() != Some(MirOptLevel::Off)
+            *LEAN || mir_opt_level()? != Some(MirOptLevel::Off)
         }
         MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => *LEAN,
     };
     let written = owner.written_in(db).module(db).krate(db);
-    let options = body_options(db, build, written, env.krate);
+    let options = body_options(db, build, written, env.krate)?;
     // A unit's body, or one with rustc's UB checks, is never the kept runtime one.
     let body = if lean || build.is_some() || !options.is_runtime() {
         tally
@@ -2154,34 +1561,6 @@ fn coroutine_layout_line<'db>(
     Some(format!("{{async fn body of {name}()}} @coroutine {}", variants.join(";")))
 }
 
-/// Whether a caller of the function gets a value of a type that only its body says: the
-/// future of an `async fn`, or what an `impl Trait` it returns stands for. The caller has the
-/// code for that type, compiled from the body as it was then.
-fn hands_out_opaque(db: &Db, func: FunctionId) -> bool {
-    struct Finder(bool);
-    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Finder {
-        type Result = ();
-
-        fn visit_ty(&mut self, ty: Ty<'db>) {
-            if let TyKind::Alias(_, rustc_type_ir::AliasTy {
-                kind: rustc_type_ir::AliasTyKind::Opaque { .. },
-                ..
-            }) = ty.kind()
-            {
-                self.0 = true;
-            }
-            rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
-        }
-    }
-    if FunctionSignature::of(db, func).is_async() {
-        return true;
-    }
-    let mut finder = Finder(false);
-    let declared = db.callable_item_signature(func.into()).skip_binder().skip_binder().output();
-    rustc_type_ir::TypeVisitable::visit_with(&declared, &mut finder);
-    finder.0
-}
-
 /// The methods of the `Fn` traits and of the `AsyncFn` traits, each from the one that borrows
 /// the callee to the one that takes it.
 fn fn_trait_methods(lang_items: &LangItems) -> [[Option<FunctionId>; 3]; 2] {
@@ -2232,216 +1611,9 @@ fn coroutine_instance<'db>(
     Some((def, GenericArgs::new_from_slice(args.parent_args())))
 }
 
-/// The `async` blocks whose futures the body of `func` holds, or `None` when the body
-/// can't be read. rustc lays a future out differently, so every function that touches one
-/// has to come from the same compiler.
-#[salsa::tracked(returns(ref))]
-fn async_blocks<'db>(db: &'db Db, func: FunctionId) -> Option<FxHashSet<salsa::Id>> {
-    let Ok((body, env)) = root_body(db, func) else {
-        return (!infers_a_future(db, func)).then(FxHashSet::default);
-    };
-    held_blocks(db, body, env)
-}
-
-/// The `async` blocks whose futures `body` holds, itself or in the closures and blocks it
-/// holds, or `None` when one of those can't be read.
-fn held_blocks<'db>(
-    db: &'db Db,
-    body: &MirBody<'db>,
-    env: ParamEnvAndCrate<'db>,
-) -> Option<FxHashSet<salsa::Id>> {
-    struct Collector<'db>(smallvec::SmallVec<[Ty<'db>; 8]>);
-    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Collector<'db> {
-        type Result = ();
-
-        fn visit_ty(&mut self, ty: Ty<'db>) {
-            if let TyKind::Coroutine(..) | TyKind::Closure(..) | TyKind::CoroutineClosure(..) =
-                ty.kind()
-            {
-                self.0.push(ty);
-            }
-            rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
-        }
-    }
-    let (mut found, mut seen) = (FxHashSet::default(), FxHashSet::default());
-    let mut bodies = smallvec::SmallVec::<[&MirBody<'db>; 8]>::new();
-    bodies.push(body);
-    let mut collector = Collector(smallvec::SmallVec::new());
-    while let Some(body) = bodies.pop() {
-        for (_, local) in body.locals.iter() {
-            rustc_type_ir::TypeVisitable::visit_with(&local.ty.as_ref(), &mut collector);
-        }
-        for ty in collector.0.drain(..) {
-            if !seen.insert(ty) {
-                continue;
-            }
-            let body = match ty.kind() {
-                TyKind::Coroutine(id, args) => {
-                    found.insert(id.0.as_id());
-                    let args = args.as_coroutine();
-                    let parent = GenericArgs::new_from_slice(args.parent_args()).store();
-                    let owner = MirOwner::coroutine(db, id.0, args);
-                    db.monomorphized_mir(owner, MirStage::Built, parent, env.store())
-                }
-                TyKind::CoroutineClosure(id, args) => {
-                    let parent =
-                        GenericArgs::new_from_slice(args.as_coroutine_closure().parent_args());
-                    let closure = id.0.as_closure(db);
-                    db.monomorphized_mir_body_for_closure(closure, parent.store(), env.store())
-                }
-                TyKind::Closure(id, args) => {
-                    let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
-                    db.monomorphized_mir_body_for_closure(id.0, parent.store(), env.store())
-                }
-                _ => continue,
-            };
-            bodies.push(body.ok()?);
-        }
-    }
-    Some(found)
-}
-
-/// Whether a type inferred in `func`'s body is or holds a future, an `impl Trait` included:
-/// for a body without MIR, which then holds no future when this is `false`.
-fn infers_a_future(db: &Db, func: FunctionId) -> bool {
-    struct Finder<'db> {
-        interner: DbInterner<'db>,
-        seen: FxHashSet<Ty<'db>>,
-        found: bool,
-    }
-    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Finder<'db> {
-        type Result = ();
-
-        fn visit_ty(&mut self, ty: Ty<'db>) {
-            if self.found || !self.seen.insert(ty) {
-                return;
-            }
-            match ty.kind() {
-                TyKind::Coroutine(..) | TyKind::CoroutineClosure(..) => self.found = true,
-                TyKind::Alias(_, rustc_type_ir::AliasTy {
-                    kind: rustc_type_ir::AliasTyKind::Opaque { def_id },
-                    args,
-                    ..
-                }) => {
-                    let hidden = rustc_type_ir::Interner::type_of(self.interner, def_id.into())
-                        .instantiate(self.interner, args)
-                        .skip_norm_wip();
-                    // What its defining body did not tell is polled as a future only when it is
-                    // declared one.
-                    if matches!(hidden.kind(), TyKind::Error(_)) {
-                        let future = self.interner.lang_items().Future;
-                        let bounds =
-                            rustc_type_ir::Interner::item_bounds(self.interner, def_id.into());
-                        self.found = bounds.skip_binder().into_iter().any(|clause| {
-                            rustc_type_ir::inherent::Clause::as_trait_clause(clause)
-                                .is_some_and(|it| Some(it.skip_binder().def_id().0) == future)
-                        });
-                    } else {
-                        self.visit_ty(hidden);
-                    }
-                }
-                _ => rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self),
-            }
-        }
-    }
-    let infer = InferenceResult::of(db, DefWithBodyId::from(func));
-    let interner = DbInterner::new_with(db, func.krate(db));
-    let mut finder = Finder { interner, seen: FxHashSet::default(), found: false };
-    for ty in infer.expression_types().map(|it| it.1).chain(infer.pattern_types().map(|it| it.1)) {
-        rustc_type_ir::TypeVisitable::visit_with(&ty, &mut finder);
-    }
-    finder.found
-}
-
-/// The functions skipped that rustc has a copy of. One of a crate rustc built nothing of has
-/// none: it is missing from the program, and no code of rustc's uses a static in its place.
-fn left_to_rustc<'a>(
-    db: &'a Db,
-    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
-    symbols: &'a dyn SymbolResolver,
-    skipped: &'a [(FunctionId, CodegenError)],
-) -> impl Iterator<Item = FunctionId> + 'a {
-    skipped
-        .iter()
-        .filter(|(_, e)| !e.no_symbol())
-        .map(|it| it.0)
-        .filter(|&func| symbols.rustc_built(func.krate(db)))
-}
-
-/// The statics that functions left to rustc refer to, themselves or through the instances they
-/// name.
-#[derive(Default, Clone, PartialEq, Eq)]
-struct TheirStatics {
-    statics: FxHashSet<StaticId>,
-    /// The crates with a function for which that is not all of them: what could not be
-    /// compiled refers to who knows what.
-    unknown: FxHashSet<Crate>,
-}
-
 /// The instances the walk for [`TheirStatics`] went through. What it found stays as it is
 /// until the code of one of them, or of a static it found, changes.
 type Walked = Vec<(Instance, StoredParamEnvAndCrate)>;
-
-impl TheirStatics {
-    /// The functions of a crate are walked together: they mostly reach the same instances.
-    fn of(db: &Db, funcs: impl IntoIterator<Item = FunctionId>) -> TheirStatics {
-        TheirStatics::walk(db, funcs).0
-    }
-
-    fn walk(
-        db: &Db,
-        funcs: impl IntoIterator<Item = FunctionId>,
-    ) -> (TheirStatics, Walked) {
-        let mut by_crate = FxHashMap::<Crate, Vec<FunctionId>>::default();
-        for func in funcs {
-            by_crate.entry(func.krate(db)).or_default().push(func);
-        }
-        let mut theirs = TheirStatics::default();
-        let mut walked = Walked::new();
-        for (krate, funcs) in by_crate {
-            let (mut seen, mut statics) = (FxHashSet::default(), FxHashSet::default());
-            let mut complete = true;
-            let mut stack = Vec::with_capacity(funcs.len());
-            for func in funcs {
-                match compiled_root(db, func).as_ref() {
-                    Ok(compiled) => stack.push(&compiled.requests),
-                    Err(_) => complete = false,
-                }
-            }
-            while let Some(requests) = stack.pop() {
-                for request in &requests.funcs {
-                    let FuncTarget::Instance(instance, env) = &request.target else { continue };
-                    if matches!(instance.def, InstanceDef::Fn(_))
-                        && instance.args.as_ref().is_empty()
-                        || !seen.insert(instance)
-                    {
-                        continue;
-                    }
-                    walked.push((*instance, *env));
-                    match compiled_instance(db, *instance, *env).as_ref() {
-                        Ok(compiled) => stack.push(&compiled.requests),
-                        Err(_) => complete = false,
-                    }
-                }
-                for request in &requests.datas {
-                    if let DataRequest::Static(id) = request
-                        && statics.insert(*id)
-                    {
-                        match compiled_static(db, *id).as_ref() {
-                            Ok(compiled) => stack.push(&compiled.requests),
-                            Err(_) => complete = false,
-                        }
-                    }
-                }
-            }
-            theirs.statics.extend(statics);
-            if !complete {
-                theirs.unknown.insert(krate);
-            }
-        }
-        (theirs, walked)
-    }
-}
 
 /// The value of a static that rustc exports no symbol for.
 #[salsa::tracked(returns(ref))]
@@ -2457,43 +1629,6 @@ fn compiled_static<'db>(db: &'db Db, id: StaticId) -> Result<CompiledStatic> {
     })?;
     let (blob, writable) = value.expect("`build` ran the closure");
     Ok(CompiledStatic { requests: cg.finish().0, blob, writable })
-}
-
-/// What the types of variables are told as, for every thread: the threads that compile
-/// find it ahead of the one that puts the functions in the object, which has it to wait
-/// for otherwise.
-#[derive(Default, Clone)]
-struct ToldTypes(std::sync::Arc<TypesTold>);
-
-#[derive(Default)]
-struct TypesTold {
-    /// What the type of each variable is told as.
-    roots: debuginfo::ByEnv<StoredTy, Option<debuginfo::TypeSet>>,
-    /// The sets of the types they are made of, which are shared.
-    sets: debuginfo::Sets,
-}
-
-impl ToldTypes {
-    fn told(
-        &self,
-        db: &Db,
-        env: &StoredParamEnvAndCrate,
-        ty: &StoredTy,
-    ) -> Option<debuginfo::TypeSet> {
-        if let Some(told) = self.0.roots.get(env, ty) {
-            return told;
-        }
-        let told = debuginfo::described(db, env, ty, &self.0.sets);
-        // Another thread may have told of it meanwhile, and the functions share one set.
-        self.0.roots.or_insert(env, ty, told)
-    }
-
-    /// Tells of the types of the variables of `compiled`, for [`describe_variables`] to find.
-    fn ahead(&self, db: &Db, compiled: &CompiledFunction) {
-        if let (Some(_), Some((env, variables))) = (&compiled.source, &compiled.variables) {
-            variables.iter().for_each(|it| _ = self.told(db, env, &it.ty));
-        }
-    }
 }
 
 /// The error the build stops with when the evaluation of `of`, or of a constant it reads, is
@@ -3397,14 +2532,14 @@ fn emit_with(
         let mut lines = lines;
         LineRow::extend_ranges(
             &mut lines,
-            compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
+            compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc.as_abs())),
         );
         Ok(Code {
             // clone: the kept code's signature, a few parameters
             signature: ctx.func.signature.clone(),
             // alloc: the kept code, written once at its exact length
             bytes: compiled.buffer.data().to_vec(),
-            align: compiled.buffer.alignment.into(),
+            align: compiled.buffer.min_alignment.into(),
             relocs,
             unwind: FunctionUnwind::of(isa, ctx)?,
             lines,
@@ -3455,7 +2590,7 @@ fn root_body<'db>(
     let krate = owner.module(db).krate(db);
     // v1's alone (its callers are v1's, several of them queries): a v2 unit reads bodies
     // through `instance_body` with its own settings.
-    let options = mir_options_of(db, krate);
+    let options = mir_options_of(db, krate)?;
     let stage = MirStage::compiled(MirOwner::Body(owner), options);
     let body = tally.step(Step::Mir, || db.mir(MirOwner::Body(owner), stage));
     // alloc: the error's message
@@ -3560,18 +2695,6 @@ impl ConstBlob {
     #[cfg(feature = "llvm")]
     fn bytes(&self) -> &[u8] {
         &self.bytes
-    }
-
-    /// Whether every pointer in the blob is whole inside it and to one of the first `funcs`
-    /// functions or the first `datas` data objects, which a blob read from the store is
-    /// not known to be.
-    fn sound(&self, funcs: usize, datas: usize) -> bool {
-        let inside = |offset: u32| {
-            self.bytes.len().checked_sub(word()).is_some_and(|last| offset as usize <= last)
-        };
-        (self.align == 0 || self.align.is_power_of_two())
-            && self.relocs.iter().all(|&(at, to, _)| inside(at) && (to.as_u32() as usize) < datas)
-            && self.fn_relocs.iter().all(|&(at, to)| inside(at) && (to.as_u32() as usize) < funcs)
     }
 
     /// Makes the pointer at `offset` the address `at` bytes into `target`.
@@ -15655,7 +14778,7 @@ mod tests {
         assert_eq!(ctors.size(), 8 * u64::from(count));
         assert_eq!(
             ctors.macho_section().flags(Endianness::Little),
-            macho::S_MOD_INIT_FUNC_POINTERS
+            macho::S_MOD_INIT_FUNC_POINTERS.to_flags()
         );
         let mut at: Vec<u64> = ctors.relocations().map(|(offset, _)| offset).collect();
         at.sort_unstable();
@@ -15669,7 +14792,7 @@ mod tests {
                 .map(|it| {
                     assert_eq!(it.section_index(), Some(section.index()));
                     let n_desc = it.macho_symbol().n_desc(Endianness::Little);
-                    assert_ne!(n_desc & macho::N_NO_DEAD_STRIP, 0);
+                    assert!(n_desc.intersects(macho::N_NO_DEAD_STRIP));
                     it.address() - section.address()
                 })
                 .collect();
@@ -15698,9 +14821,7 @@ mod tests {
                     .map(|it| it.flags())
                     .collect();
                 let retained = found.iter().filter(|flags| match flags {
-                    SectionFlags::Elf { sh_flags } => {
-                        sh_flags & u64::from(elf::SHF_GNU_RETAIN) != 0
-                    }
+                    SectionFlags::Elf { sh_flags, .. } => sh_flags.intersects(elf::SHF_GNU_RETAIN),
                     _ => unreachable!(),
                 });
                 (found.len(), retained.count())
@@ -15943,6 +15064,19 @@ mod tests {
         assert_eq!(super::rustc_mir_opt_level(false, false), Debug);
         assert_eq!(super::rustc_mir_opt_level(true, false), Release);
         assert_eq!(super::rustc_mir_opt_level(false, true), Release);
+    }
+
+    /// `BLAZE_MIR_OPT` unset leaves rustc's level; a value that is no level is an error
+    /// naming it, never rustc's level in its place.
+    #[test]
+    fn a_mir_opt_level_that_is_none_is_an_error() {
+        use hir_ty_mir::mir::MirOptLevel::{Off, Release};
+        use std::ffi::OsStr;
+        assert_eq!(super::mir_opt_level_in(None), Ok(None));
+        assert_eq!(super::mir_opt_level_in(Some(OsStr::new("0"))), Ok(Some(Off)));
+        assert_eq!(super::mir_opt_level_in(Some(OsStr::new("2"))), Ok(Some(Release)));
+        let refused = super::mir_opt_level_in(Some(OsStr::new("3"))).unwrap_err();
+        assert!(refused.contains("BLAZE_MIR_OPT=3"), "{refused}");
     }
 
     /// MIR is inlined where rustc's `Inline` runs at level 2: the library's crates always,

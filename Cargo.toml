@@ -97,14 +97,8 @@ hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }
 hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }
 hir-ty-wfcheck = { path = "crates/hir-ty-wfcheck", version = "0.0.0" }
 hir-ty-codegen = { path = "crates/hir-ty-codegen" }
-rustc-symbols = { path = "crates/rustc-symbols" }
-# The `proc_macro` of blaze's in-process proc-macro bridge (crates/blaze-macro-wasm/src/native.rs).
-native-proc-macro = { package = "blaze-native-proc-macro", path = "crates/blaze-macro-wasm/native/proc_macro" }
-blaze-macro-wasm = { path = "crates/blaze-macro-wasm" }
 blaze-macro-eval = { path = "crates/blaze-macro-eval" }
 blaze-doc = { path = "crates/blaze-doc" }
-blaze-fmt = { path = "crates/blaze-fmt" }
-blaze-lints = { path = "crates/blaze-lints" }
 blaze-manifest = { path = "crates/blaze-manifest" }
 blaze-metadata = { path = "crates/blaze-metadata" }
 blaze-resolve = { path = "crates/blaze-resolve" }
@@ -112,8 +106,6 @@ blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
 blaze-lower = { path = "crates/blaze-lower" }
 blaze-wasm-pack = { path = "crates/blaze-wasm-pack" }
-blaze-new = { path = "crates/blaze-new" }
-blaze-tree = { path = "crates/blaze-tree" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
 blaze-core = { path = "crates/blaze-core" }
 blaze-profile = { path = "crates/blaze-profile" }
@@ -121,14 +113,12 @@ blaze-graph = { path = "crates/blaze-graph" }
 blaze-image = { path = "crates/blaze-image" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-ui = { path = "crates/blaze-ui" }
-blaze-web = { path = "crates/blaze-web" }
 # v2 (docs/v2/plan/reference/crates.md)
 blaze-alloc-count = { path = "crates/blaze-alloc-count" }
 blaze-bytes = { path = "crates/blaze-bytes" }
 blaze-api = { path = "crates/blaze-api" }
 blaze-cas = { path = "crates/blaze-cas" }
 blaze-check = { path = "crates/blaze-check" }
-blaze-ci = { path = "crates/blaze-ci" }
 blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
@@ -153,6 +143,7 @@ blaze-premap = { path = "crates/blaze-premap" }
 blaze-stencil = { path = "crates/blaze-stencil" }
 blaze-testsel = { path = "crates/blaze-testsel" }
 blaze-query = { path = "crates/blaze-query" }
+blaze-query-macros = { path = "crates/blaze-query-macros" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-usercode = { path = "crates/blaze-usercode" }
@@ -165,8 +156,6 @@ mbe = { path = "crates/mbe", version = "0.0.0" }
 parser = { path = "crates/parser", version = "0.0.0" }
 paths = { path = "crates/paths", version = "0.0.0" }
 proc-macro-api = { path = "crates/proc-macro-api", version = "0.0.0" }
-proc-macro-srv = { path = "crates/proc-macro-srv", version = "0.0.0" }
-profile = { path = "crates/profile", version = "0.0.0" }
 span = { path = "crates/span", version = "0.0.0" }
 stdx = { path = "crates/stdx", version = "0.0.0" }
 syntax = { path = "crates/syntax", version = "0.0.0" }
@@ -174,7 +163,6 @@ const-ast = { path = "crates/const-ast", version = "0.0.0" }
 syntax-bridge = { path = "crates/syntax-bridge", version = "0.0.0" }
 target-features = { path = "crates/target-features", version = "0.0.0" }
 test-utils = { path = "crates/test-utils", version = "0.0.0" }
-toolchain = { path = "crates/toolchain", version = "0.0.0" }
 tt = { path = "crates/tt", version = "0.0.0" }
 edition = { path = "crates/edition", version = "0.0.0" }
 
@@ -183,7 +171,7 @@ ra-ap-rustc_parse_format = { version = "0.166", default-features = false }
 ra-ap-rustc_index = { version = "0.166", default-features = false }
 # rustc's layout code, from the tag of the stable in `harness/toolchain`.
 rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
-# rustc's lexer at the commit of `harness/toolchain`, for proc-macro-srv.
+# rustc's lexer at the commit of `harness/toolchain`.
 rustc_lexer = { path = "crates/rustc_lexer", version = "0.0.0" }
 unicode-properties = { version = "0.1.4", default-features = false }
 ra-ap-rustc_pattern_analysis = { version = "0.166", default-features = false }
@@ -191,21 +179,17 @@ ra-ap-rustc_ast_ir = { version = "0.166", default-features = false }
 rustc_apfloat = "0.2.3"
 # The trait solver, with fixes of rustc's backported.
 rustc_type_ir = { path = "vendor/rustc_type_ir", version = "0.0.0", default-features = false }
-rustc_type_ir_macros = { path = "vendor/rustc_type_ir_macros", version = "0.0.0" }
 rustc_next_trait_solver = { path = "vendor/rustc_next_trait_solver", version = "0.0.0", default-features = false }
 # rustc's transmutability analysis, generic over the caller's layouts (vendor/rustc_transmute/PATCHES.md).
 rustc_transmute = { path = "vendor/rustc_transmute", version = "0.0.0" }
 
 # rust-analyzer's libraries, from crates.io
-line-index = { version = "0.1.2" }
 la-arena = { version = "0.3.1" }
 
 # non-local crates
-anyhow = "1.0.98"
-arrayvec = "0.7.6"
-bitflags = "2.9.1"
-# Per-task bump arenas in front-end crates, which can't depend on `blaze-graph`'s `arena::Bump`.
-bumpalo = { version = "3.20", features = ["collections"] }
+anyhow = "1.0.104"
+arrayvec = "0.7.8"
+bitflags = "2.13.2"
 # Official BLAKE3: `blaze_ids::b3`'s backend where blake3-servil doesn't build (Windows, x86-64
 # macOS), and the reference beside it. `neon`: aarch64 picks NEON at compile time; x86_64
 # detects AVX-512 at run time without a feature.
@@ -215,8 +199,7 @@ blake3 = { version = "1.8", default-features = false, features = ["std", "neon"]
 # Its kernels are chosen at run time; `std` alone, and its pool's threads start only in
 # `initialize_multithreaded`, which blaze never calls.
 blake3-servil = { git = "https://github.com/johnservil/BLAKE3", rev = "c6bd679a0911cc233cb28297f2b25875381215a1", default-features = false, features = ["std"] }
-cargo_metadata = "0.23.1"
-camino = "1.2.2"
+camino = "1.2.6"
 # The Cranelift hir-ty-codegen compiles with.
 cranelift-codegen = "0.136"
 cranelift-frontend = "0.136"
@@ -225,42 +208,41 @@ cranelift-interpreter = "0.136"
 cranelift-reader = "0.136"
 # `vendor/llvm-sys` by the patch above.
 llvm-sys = "231"
-crossbeam-channel = "0.5.15"
-crossbeam-deque = "0.8.6"
+crossbeam-channel = "0.5.17"
+crossbeam-deque = "0.8.8"
 base64 = "0.23"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 # `zdict_builder` trains the store's dictionary per kind; `zstdmt` lets long cold values use workers.
-zstd = { version = "0.13.3", default-features = false, features = ["zdict_builder", "zstdmt"] }
+zstd = { version = "0.14.3", default-features = false, features = ["zdict_builder", "zstdmt"] }
 # `tt`'s proc-macro wire views its columns as bytes with no unsafe code of its own.
 zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }
 # `safe-decode`: a rotted pack decodes to an error, never to an out-of-bounds read.
-lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-decode"] }
 # rustc renders its diagnostics with exactly this version; another lays some snippets out differently.
 annotate-snippets = "=0.12.16"
 object = { version = "0.37", default-features = false, features = ["read_core", "std", "archive", "elf", "macho", "coff", "pe", "wasm", "unaligned"] }
 gimli = { version = "0.33", default-features = false, features = ["read", "write", "std"] }
-either = "1.15.0"
+either = "1.19.0"
 expect-test = "1.5.1"
 # Property tests: Hegel, Hypothesis's engine, linked as a Rust crate; test-only, imported as `hegel`
 # (docs/contributing.md, vendor/hegeltest/SOURCE.md).
 hegeltest = { path = "vendor/hegeltest", default-features = false, features = ["static-engine"] }
-indexmap = { version = "2.9.0", features = ["serde"] }
+indexmap = { version = "2.14.2", features = ["serde"] }
 # hir-ty's MIR provider table, which hir-ty-mir registers into.
-inventory = "0.3.24"
+inventory = "0.3.25"
 itertools = "0.15.0"
-libc = "0.2.172"
-memchr = "2.8.1"
+libc = "0.2.191"
+memchr = "2.8.3"
 # The `blaze` binary's general-purpose allocator (docs/v2/plan/design/memory.md).
 mimalloc = { version = "0.1.52", default-features = false }
 # mimalloc's C side, for `mi_collect` when the daemon gives freed pages back, and (`extended`) its
 # options for huge pages.
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
-nohash-hasher = "0.2.0"
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
-pulldown-cmark = { version = "0.9.6", default-features = false }
-rayon = "1.10.0"
+pulldown-cmark = { version = "0.13.6", default-features = false }
+rayon = "1.12.0"
 syntax-tree = { path = "crates/syntax-tree", version = "0.0.0" }
 # Ideally we'd not enable the macros feature but unfortunately the `tracked` attribute does not work
 # on impls without it
@@ -271,29 +253,27 @@ salsa = { version = "0.28.5", default-features = false, features = [
     "inventory",
     "triomphe"
 ] }
-semver = "1.0.26"
-serde = { version = "1.0.219" }
-serde_derive = { version = "1.0.219" }
-serde_json = "1.0.140"
+semver = "1.0.28"
+serde = { version = "1.0.229" }
+serde_derive = { version = "1.0.229" }
+serde_json = "1.0.154"
 # blaze-ci's webhook payload decode, validating at SIMD speed (docs/v2/plan/lanes/ci.md).
 sonic-rs = { version = "0.5", default-features = false }
-rustc-hash = "2.1.1"
-rustc-literal-escaper = "0.0.7"
-# blaze-macro-wasm's WASI host: `openat2` with no symlinks, one open per path a macro reads.
-rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
-smallvec = { version = "1.15.1", features = [
+rustc-hash = "2.1.3"
+rustc-literal-escaper = "0.0.8"
+smallvec = { version = "1.16.4", features = [
     "const_new",
     "union",
     "const_generics",
 ] }
-smol_str = "0.3.2"
+smol_str = "0.3.7"
 text-size = "1.1.1"
-toml = "1.1.2"
+toml = "1.1.8"
 # Debug and trace callsites compile out of release builds: blaze's one subscriber there, the trace
 # recorder (crates/blaze-cargo/src/trace.rs), takes INFO and above.
-tracing = { version = "0.1.41", default-features = false, features = ["std", "release_max_level_info"] }
-tracing-tree = "0.4.0"
-tracing-subscriber = { version = "0.3.20", default-features = false, features = [
+tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_info"] }
+tracing-tree = "0.4.1"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
     "registry",
     "fmt",
     "local-time",
@@ -301,9 +281,9 @@ tracing-subscriber = { version = "0.3.20", default-features = false, features = 
     "time",
     "tracing-log",
 ] }
-triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
-unicode-width = "0.2.2"
-url = "2.5.4"
+triomphe = { version = "0.1.17", default-features = false, features = ["std"] }
+unicode-width = "0.2.3"
+url = "2.5.8"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
@@ -325,20 +305,73 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 thin-vec = "0.2.21"
-hashbrown = { version = "0.17.0", features = [
+hashbrown = { version = "0.17.1", features = [
     "inline-more",
     "nightly",
 ], default-features = false }
-
-# We need to freeze the version of the crate, as the raw-api feature is considered unstable
-dashmap = { version = "=6.2.1", features = ["raw-api", "inline"] }
-
 # We need to freeze this as `1.0.26` breaks the compilation of `rustc_lexer` during our in-tree
 # libraries publish
 unicode-ident = "=1.0.24"
 # rustc's pins (`Cargo.lock` of the pinned nightly): the identifier lints' Unicode tables.
 unicode-normalization = "=0.1.25"
 unicode-security = "=0.1.2"
+
+# Dependencies of one member, moved to the root (dedup, 2026-10-30).
+blaze-cache-macros = { version = "0.1.0", path = "crates/blaze-cache-macros" }
+blaze-cargo = { path = "crates/blaze-cargo" }
+blaze-registry = { path = "crates/blaze-registry" }
+cargo-platform = "0.3.3"
+cargo-util-schemas = "=0.14.3"
+cov-mark = "2.2.0"
+cranelift-module = "0.136.2"
+cranelift-object = "0.136.2"
+diff = "=0.1.13"
+dissimilar = "1.0.11"
+drop_bomb = "0.1.5"
+dunce = "1.0.5"
+filetime = "0.2.29"
+flate2 = { version = "1.1.10", default-features = false }
+fst = { version = "0.4.7", default-features = false }
+futures-util = { version = "0.3.34", default-features = false }
+glob = "0.3.4"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false }
+hyper-rustls = { version = "0.27.10", default-features = false }
+hyper-util = { version = "0.1.21", default-features = false }
+im-rc = "15.1.0"
+inkwell = { version = "0.11.0", default-features = false }
+jobserver = "0.1.35"
+lzma-rust2 = { version = "0.24.0", default-features = false }
+oorandom = "11.1.5"
+pathdiff = "0.2.3"
+percent-encoding = "2.3.2"
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+rustc-demangle = "0.1.28"
+rustc-stable-hash = "0.1.2"
+rustc_hashes = { version = "0.166.0", package = "ra-ap-rustc_hashes" }
+rustc_index = { version = "0.166.0", package = "ra-ap-rustc_index", default-features = false }
+rustfmt-unicode-width = { version = "=0.1.14", package = "unicode-width" }
+serde-untagged = "0.1.9"
+sha1 = "0.11.0"
+shell-escape = "=0.1.5"
+stacker = "0.1.25"
+syn = "2.0.117"
+synstructure = "0.13.2"
+tango-bench = "0.9.0"
+tar = { version = "0.4.46", default-features = false }
+target-lexicon = "0.13.5"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tikv-jemalloc-ctl = "0.7.0"
+tikv-jemalloc-sys = "0.7.1"
+tokio = "1.54.1"
+toml_edit = { version = "=0.25.12", default-features = false }
+uds_windows = "1.2.1"
+unicode-segmentation = "=1.12.0"
+wasm-encoder = { version = "0.244.0", default-features = false }
+winnow = { version = "1.0.4", default-features = false }
+zip = { version = "9.1.3", default-features = false }
 
 [workspace.lints.cargo]
 unused_dependencies = "allow"

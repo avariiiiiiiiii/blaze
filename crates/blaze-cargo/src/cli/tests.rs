@@ -230,7 +230,7 @@ fn a_failing_test_executable_stops_the_tests() {
     let (then, _, err) = driven(&mut api, &["blaze", "test", "--no-fail-fast"], &mut programs);
     assert_eq!(then, Then::Exit(101));
     assert_eq!(programs.ran.len(), 4);
-    assert!(err.ends_with("   Doc-tests foo\n"), "{err}");
+    assert!(err.ends_with("   Doc-tests foo\nerror: 1 target failed:\n    `--lib`\n"), "{err}");
 }
 
 #[test]

@@ -760,10 +760,10 @@ fn an_end_of_a_test_it_does_not_run_is_a_broken_protocol() {
 }
 
 /// An attempt's id outlives it: once its slot is another's, an end of the old id is of no
-/// test the server runs.
+/// test the server runs. Outside the sandbox, so the slot is free before the next test is sent.
 #[test]
 fn an_end_of_an_attempt_already_ended_is_a_broken_protocol() {
-    let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 1), job("b", 0)])]);
+    let mut fake = Fake::new(config(1), vec![outside("lib", vec![job("a", 1), job("b", 0)])]);
     let conn = fake.hello(0, &["a", "b"]);
     let a = fake.run(conn, 0);
     fake.end(conn, a, End::Exited(0), b"");
@@ -910,12 +910,8 @@ fn simulated(two_outside: bool) {
             rounds += 1;
             assert!(rounds < 100_000, "seed {seed}: the queue never ended");
             sim.submit(&mut effects);
-            sim.poll(&mut out, Duration::ZERO);
-            for completion in out.drain(..) {
-                assert!(queue.owns(completion.tag), "seed {seed}");
-                queue.complete(completion, sim.now(), &mut effects);
-            }
-            results.extend(queue.drain());
+            // The servers act on what was submitted before time moves: a poll goes to the
+            // soonest event, which can be a server's exit an hour on, before it dialed.
             for (b, server) in played.iter_mut().enumerate() {
                 let socket = Address::Unix(name(&format!("req/1/t{b}")));
                 let Some(conn) = server.conn.or_else(|| sim.dial(&socket).ok()) else { continue };
@@ -953,8 +949,15 @@ fn simulated(two_outside: bool) {
                     }
                 }
             }
+            sim.poll(&mut out, Duration::ZERO);
+            for completion in out.drain(..) {
+                assert!(queue.owns(completion.tag), "seed {seed}");
+                queue.complete(completion, sim.now(), &mut effects);
+            }
+            results.extend(queue.drain());
         }
-        assert!(played.iter().all(|it| it.quit), "seed {seed}");
+        let quit: Vec<bool> = played.iter().map(|it| it.quit).collect();
+        assert!(quit.iter().all(|it| *it), "seed {seed}, two outside {two_outside}: quit {quit:?}");
         let mut names: Vec<&str> = results.iter().map(|it| it.test.as_deref().unwrap()).collect();
         names.sort_unstable();
         assert_eq!(names, ["a", "c", "d", "e", "fails"], "seed {seed}");
@@ -1172,10 +1175,14 @@ fn steady_state(fork: u64, sandboxed: bool) {
         if ended == 100 {
             high = Some(now);
         }
-        if let Some(high) = high {
+        // Once the last test has ended the queue tells every replica to quit, which is no test's.
+        if let Some(high) = high
+            && ended < 600
+        {
             assert_eq!(now, high, "after {ended} tests");
         }
-        assert!(queue.attempts.len() <= 4 && queue.wheel.len() <= 8, "{now:?}");
+        // A sandboxed test holds its slot until its record is read, after the next one is sent.
+        assert!(queue.attempts.len() <= 4 + usize::from(sandboxed) && queue.wheel.len() <= 8, "{now:?}");
     }
     assert_eq!(fake.results.len(), 600);
     assert!(fake.results.iter().all(|it| it.outcome == Outcome::Passed));

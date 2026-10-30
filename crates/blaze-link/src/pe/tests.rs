@@ -307,9 +307,9 @@ fn executable_headers_and_sections() {
     let file = PeFile64::parse(&image[..]).unwrap();
     let header = file.nt_headers().file_header();
     assert_eq!(header.machine.get(LE), pe::IMAGE_FILE_MACHINE_AMD64);
-    let characteristics = header.characteristics.get(LE);
-    assert_eq!(characteristics & pe::IMAGE_FILE_DLL, 0);
-    assert_ne!(characteristics & pe::IMAGE_FILE_LARGE_ADDRESS_AWARE, 0);
+    let characteristics = header.characteristics.get(LE).0;
+    assert_eq!(characteristics & pe::IMAGE_FILE_DLL.0, 0);
+    assert_ne!(characteristics & pe::IMAGE_FILE_LARGE_ADDRESS_AWARE.0, 0);
     let optional = file.nt_headers().optional_header();
     assert_eq!(optional.image_base(), 0x1_4000_0000);
     assert_eq!(optional.address_of_entry_point(), f.rva(f.at(&Class::Text)));
@@ -332,11 +332,11 @@ fn executable_headers_and_sections() {
             assert_eq!(section.pointer_to_raw_data.get(LE), va, "a section's file offset is its RVA");
         }
     }
-    let flags: Vec<u32> = file.section_table().iter().map(|it| it.characteristics.get(LE)).collect();
-    assert_ne!(flags[0] & pe::IMAGE_SCN_MEM_EXECUTE, 0);
-    assert_eq!(flags[1] & (pe::IMAGE_SCN_MEM_WRITE | pe::IMAGE_SCN_MEM_EXECUTE), 0);
-    assert_ne!(flags[2] & pe::IMAGE_SCN_MEM_WRITE, 0);
-    assert_ne!(flags[5] & pe::IMAGE_SCN_MEM_DISCARDABLE, 0);
+    let flags: Vec<u32> = file.section_table().iter().map(|it| it.characteristics.get(LE).0).collect();
+    assert_ne!(flags[0] & pe::IMAGE_SCN_MEM_EXECUTE.0, 0);
+    assert_eq!(flags[1] & (pe::IMAGE_SCN_MEM_WRITE.0 | pe::IMAGE_SCN_MEM_EXECUTE.0), 0);
+    assert_ne!(flags[2] & pe::IMAGE_SCN_MEM_WRITE.0, 0);
+    assert_ne!(flags[5] & pe::IMAGE_SCN_MEM_DISCARDABLE.0, 0);
     let last = file.section_table().iter().last().unwrap();
     let end = last.virtual_address.get(LE) + last.virtual_size.get(LE);
     assert_eq!(optional.size_of_image(), end.next_multiple_of(0x1000));
@@ -442,7 +442,7 @@ fn own_tls_directory_when_the_crt_has_none() {
     assert_eq!(u64_at(bytes, 16), f.at(&Class::Synthetic(TLS_INDEX)));
     assert_eq!(u64_at(bytes, 24), dir + 40);
     assert_eq!(u32_at(bytes, 32), 0);
-    assert_eq!(u32_at(bytes, 36), pe::IMAGE_SCN_ALIGN_8BYTES);
+    assert_eq!(u32_at(bytes, 36), pe::IMAGE_SCN_ALIGN_8BYTES.0);
     assert_eq!(u64_at(bytes, 40), 0, "the callback list is empty");
 }
 
@@ -471,11 +471,11 @@ fn dll_exports_sorted_by_name() {
     let image = f.image().unwrap();
     let file = PeFile64::parse(&image[..]).unwrap();
     let header = file.nt_headers().file_header();
-    assert_ne!(header.characteristics.get(LE) & pe::IMAGE_FILE_DLL, 0);
+    assert_ne!(header.characteristics.get(LE).0 & pe::IMAGE_FILE_DLL.0, 0);
     let optional = file.nt_headers().optional_header();
     assert_eq!(optional.image_base(), 0x1_8000_0000);
     assert_eq!(optional.address_of_entry_point(), 0);
-    assert_eq!(optional.dll_characteristics() & pe::IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE, 0);
+    assert_eq!(optional.dll_characteristics().0 & pe::IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE.0, 0);
     assert_eq!(section_names(&file), [".text", ".rdata", ".data", ".reloc"]);
     assert!(file.import_table().unwrap().is_none());
 
@@ -765,9 +765,9 @@ fn specials() {
 
 #[test]
 fn encoders() {
-    assert_eq!(alignment(1), Ok(pe::IMAGE_SCN_ALIGN_1BYTES));
-    assert_eq!(alignment(0), Ok(pe::IMAGE_SCN_ALIGN_1BYTES));
-    assert_eq!(alignment(16), Ok(pe::IMAGE_SCN_ALIGN_16BYTES));
+    assert_eq!(alignment(1), Ok(pe::IMAGE_SCN_ALIGN_1BYTES.0));
+    assert_eq!(alignment(0), Ok(pe::IMAGE_SCN_ALIGN_1BYTES.0));
+    assert_eq!(alignment(16), Ok(pe::IMAGE_SCN_ALIGN_16BYTES.0));
     assert!(alignment(3).is_err());
     assert!(alignment(16384).is_err());
 
@@ -1025,14 +1025,14 @@ fn incremental_base_relocations_are_a_builds_bytes() {
 
 // Inputs.
 
-const TEXT: u32 = pe::IMAGE_SCN_CNT_CODE | pe::IMAGE_SCN_MEM_EXECUTE | pe::IMAGE_SCN_MEM_READ | pe::IMAGE_SCN_ALIGN_16BYTES;
+const TEXT: u32 = pe::IMAGE_SCN_CNT_CODE.0 | pe::IMAGE_SCN_MEM_EXECUTE.0 | pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_ALIGN_16BYTES.0;
 const DATA: u32 =
-    pe::IMAGE_SCN_CNT_INITIALIZED_DATA | pe::IMAGE_SCN_MEM_READ | pe::IMAGE_SCN_MEM_WRITE | pe::IMAGE_SCN_ALIGN_8BYTES;
-const RDATA: u32 = pe::IMAGE_SCN_CNT_INITIALIZED_DATA | pe::IMAGE_SCN_MEM_READ | pe::IMAGE_SCN_ALIGN_4BYTES;
+    pe::IMAGE_SCN_CNT_INITIALIZED_DATA.0 | pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_MEM_WRITE.0 | pe::IMAGE_SCN_ALIGN_8BYTES.0;
+const RDATA: u32 = pe::IMAGE_SCN_CNT_INITIALIZED_DATA.0 | pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_ALIGN_4BYTES.0;
 const BSS: u32 =
-    pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA | pe::IMAGE_SCN_MEM_READ | pe::IMAGE_SCN_MEM_WRITE | pe::IMAGE_SCN_ALIGN_8BYTES;
-const INFO: u32 = pe::IMAGE_SCN_LNK_INFO | pe::IMAGE_SCN_LNK_REMOVE | pe::IMAGE_SCN_ALIGN_1BYTES;
-const FUNCTION: u16 = pe::IMAGE_SYM_DTYPE_FUNCTION << 4;
+    pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA.0 | pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_MEM_WRITE.0 | pe::IMAGE_SCN_ALIGN_8BYTES.0;
+const INFO: u32 = pe::IMAGE_SCN_LNK_INFO.0 | pe::IMAGE_SCN_LNK_REMOVE.0 | pe::IMAGE_SCN_ALIGN_1BYTES.0;
+const FUNCTION: u16 = pe::IMAGE_SYM_DTYPE_FUNCTION.0 << 4;
 
 struct CoffSection {
     name: &'static str,
@@ -1097,7 +1097,7 @@ impl Coff {
         aux[4..6].copy_from_slice(&(it.relocations.len() as u16).to_le_bytes());
         aux[12..14].copy_from_slice(&number.to_le_bytes());
         aux[14] = selection;
-        self.symbol(name, 0, section, 0, pe::IMAGE_SYM_CLASS_STATIC, &[aux])
+        self.symbol(name, 0, section, 0, pe::IMAGE_SYM_CLASS_STATIC.0, &[aux])
     }
 
     fn bytes(&self) -> Vec<u8> {
@@ -1113,7 +1113,7 @@ impl Coff {
             offset += 10 * section.relocations.len() as u32;
         }
         let mut out = Buf::default();
-        out.put_u16(pe::IMAGE_FILE_MACHINE_AMD64);
+        out.put_u16(pe::IMAGE_FILE_MACHINE_AMD64.0);
         out.put_u16(self.sections.len() as u16);
         out.put_u32(0);
         out.put_u32(offset);
@@ -1174,37 +1174,37 @@ fn object() -> Vec<u8> {
     let directives = " /DEFAULTLIB:msvcrt /DEFAULTLIB:\"oldnames\" /DEFAULTLIB:msvcrt.lib /INCLUDE:keep_me \
                       /FAILIFMISMATCH:_MSC_VER=1900 /ALTERNATENAME:alias=target /MERGE:.a=.b";
     let drectve = coff.section(".drectve", INFO, directives.as_bytes().to_vec());
-    let inline = coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT, vec![0xc3; 4]);
+    let inline = coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0xc3; 4]);
     let mut entry = vec![0u8; 12];
     entry[4..8].copy_from_slice(&4u32.to_le_bytes());
-    let pdata = coff.section(".pdata", RDATA | pe::IMAGE_SCN_LNK_COMDAT, entry);
-    let xdata = coff.section(".xdata", RDATA | pe::IMAGE_SCN_LNK_COMDAT, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+    let pdata = coff.section(".pdata", RDATA | pe::IMAGE_SCN_LNK_COMDAT.0, entry);
+    let xdata = coff.section(".xdata", RDATA | pe::IMAGE_SCN_LNK_COMDAT.0, vec![1, 0, 0, 0, 0, 0, 0, 0]);
     let tls = coff.section(".tls$", DATA, vec![0; 8]);
     let bss = coff.bss(".bss", BSS, 32);
 
-    coff.relocate(text, 1, 13, pe::IMAGE_REL_AMD64_REL32);
-    coff.relocate(text, 5, 2, pe::IMAGE_REL_AMD64_ADDR32NB);
-    coff.relocate(text, 9, 2, pe::IMAGE_REL_AMD64_REL32_4);
-    coff.relocate(text, 12, 14, pe::IMAGE_REL_AMD64_SECREL);
-    coff.relocate(data, 0, 13, pe::IMAGE_REL_AMD64_ADDR64);
-    coff.relocate(data, 8, 15, pe::IMAGE_REL_AMD64_ADDR32);
-    coff.relocate(pdata, 0, 8, pe::IMAGE_REL_AMD64_ADDR32NB);
-    coff.relocate(pdata, 4, 8, pe::IMAGE_REL_AMD64_ADDR32NB);
-    coff.relocate(pdata, 8, 11, pe::IMAGE_REL_AMD64_ADDR32NB);
+    coff.relocate(text, 1, 13, pe::IMAGE_REL_AMD64_REL32.0);
+    coff.relocate(text, 5, 2, pe::IMAGE_REL_AMD64_ADDR32NB.0);
+    coff.relocate(text, 9, 2, pe::IMAGE_REL_AMD64_REL32_4.0);
+    coff.relocate(text, 12, 14, pe::IMAGE_REL_AMD64_SECREL.0);
+    coff.relocate(data, 0, 13, pe::IMAGE_REL_AMD64_ADDR64.0);
+    coff.relocate(data, 8, 15, pe::IMAGE_REL_AMD64_ADDR32.0);
+    coff.relocate(pdata, 0, 8, pe::IMAGE_REL_AMD64_ADDR32NB.0);
+    coff.relocate(pdata, 4, 8, pe::IMAGE_REL_AMD64_ADDR32NB.0);
+    coff.relocate(pdata, 8, 11, pe::IMAGE_REL_AMD64_ADDR32NB.0);
 
-    let external = pe::IMAGE_SYM_CLASS_EXTERNAL;
+    let external = pe::IMAGE_SYM_CLASS_EXTERNAL.0;
     assert_eq!(coff.section_symbol(text, 0, 0), 0);
     assert_eq!(coff.section_symbol(data, 0, 0), 2);
     assert_eq!(coff.section_symbol(drectve, 0, 0), 4);
-    assert_eq!(coff.section_symbol(inline, 0, pe::IMAGE_COMDAT_SELECT_ANY), 6);
+    assert_eq!(coff.section_symbol(inline, 0, pe::IMAGE_COMDAT_SELECT_ANY.0), 6);
     assert_eq!(coff.symbol("inline_fn", 0, inline, FUNCTION, external, &[]), 8);
-    assert_eq!(coff.section_symbol(pdata, inline as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE), 9);
-    assert_eq!(coff.section_symbol(xdata, inline as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE), 11);
+    assert_eq!(coff.section_symbol(pdata, inline as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0), 9);
+    assert_eq!(coff.section_symbol(xdata, inline as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0), 11);
     assert_eq!(coff.symbol("callee", 0, 0, FUNCTION, external, &[]), 13);
     assert_eq!(coff.symbol("tls_var", 0, tls, 0, external, &[]), 14);
     assert_eq!(coff.symbol("main_fn", 0, text, FUNCTION, external, &[]), 15);
-    let weak = weak_aux(15, pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS);
-    assert_eq!(coff.symbol("weak_fn", 0, 0, FUNCTION, pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL, &[weak]), 16);
+    let weak = weak_aux(15, pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS.0);
+    assert_eq!(coff.symbol("weak_fn", 0, 0, FUNCTION, pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL.0, &[weak]), 16);
     assert_eq!(coff.symbol("common_v", 24, 0, 0, external, &[]), 18);
     assert_eq!(coff.symbol("a_very_long_symbol_name", 8, data, 0, external, &[]), 19);
     assert_eq!(coff.symbol("zeroed", 0, bss, 0, external, &[]), 20);
@@ -1269,16 +1269,16 @@ fn coff_object_sections_and_groups() {
 fn coff_associative_sections_are_tied_to_their_parent() {
     let mut coff = Coff::default();
     let text = coff.section(".text", TEXT, vec![0xc3; 4]);
-    let inline = coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT, vec![0xc3; 4]);
-    let counters = coff.section(".SCOV$CM", DATA | pe::IMAGE_SCN_LNK_COMDAT, vec![0; 2]);
-    let pcs = coff.section(".SCOVP$M", RDATA | pe::IMAGE_SCN_LNK_COMDAT, vec![0; 16]);
-    let plain = coff.section(".SCOV$CM", DATA | pe::IMAGE_SCN_LNK_COMDAT, vec![0; 1]);
+    let inline = coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0xc3; 4]);
+    let counters = coff.section(".SCOV$CM", DATA | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0; 2]);
+    let pcs = coff.section(".SCOVP$M", RDATA | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0; 16]);
+    let plain = coff.section(".SCOV$CM", DATA | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0; 1]);
     coff.section_symbol(text, 0, 0);
-    coff.section_symbol(inline, 0, pe::IMAGE_COMDAT_SELECT_ANY);
-    coff.symbol("inline_fn", 0, inline, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL, &[]);
-    coff.section_symbol(counters, inline as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE);
-    coff.section_symbol(pcs, counters as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE);
-    coff.section_symbol(plain, text as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE);
+    coff.section_symbol(inline, 0, pe::IMAGE_COMDAT_SELECT_ANY.0);
+    coff.symbol("inline_fn", 0, inline, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL.0, &[]);
+    coff.section_symbol(counters, inline as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0);
+    coff.section_symbol(pcs, counters as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0);
+    coff.section_symbol(plain, text as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE.0);
     let object = read_object(&coff.bytes());
     let tie = |section, to| crate::model::Tie { section, to, ordered: false };
     assert_eq!(object.ties, [tie(2, 1), tie(3, 2), tie(4, 0)], "each to its own parent");
@@ -1364,17 +1364,23 @@ fn what_blaze_does_not_link_is_named() {
     let mut coff = Coff::default();
     let text = coff.section(".text", TEXT, vec![0; 8]);
     coff.section_symbol(text, 0, 0);
-    let target = coff.symbol("f", 0, 0, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL, &[]);
-    coff.relocate(text, 0, target, pe::IMAGE_REL_AMD64_SSPAN32);
+    let target = coff.symbol("f", 0, 0, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL.0, &[]);
+    coff.relocate(text, 0, target, pe::IMAGE_REL_AMD64_SSPAN32.0);
     let error = read(&coff);
     assert!(error.contains("SSPAN32") && error.contains("bad.obj") && error.contains('f'), "{error}");
 
     let mut coff = Coff::default();
-    let text = coff.section(".text$x", TEXT | pe::IMAGE_SCN_LNK_COMDAT, vec![0; 8]);
-    coff.section_symbol(text, 0, pe::IMAGE_COMDAT_SELECT_NEWEST);
-    coff.symbol("g", 0, text, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL, &[]);
+    let text = coff.section(".text$x", TEXT | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0; 8]);
+    coff.section_symbol(text, 0, pe::IMAGE_COMDAT_SELECT_NEWEST.0);
+    coff.symbol("g", 0, text, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL.0, &[]);
     let error = read(&coff);
     assert!(error.contains("selection 7"), "{error}");
+
+    let mut coff = Coff::default();
+    let text = coff.section(".text$y", TEXT | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0; 8]);
+    coff.symbol("h", 0, text, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL.0, &[]);
+    let error = read(&coff);
+    assert!(error.contains("COMDAT section .text$y has no section symbol"), "{error}");
 
     let mut coff = Coff::default();
     coff.section(".drectve", INFO, b"/ENTRY:start".to_vec());
@@ -1383,8 +1389,8 @@ fn what_blaze_does_not_link_is_named() {
 
     let mut coff = Coff::default();
     let text = coff.section(".text", TEXT, vec![0; 8]);
-    coff.symbol("w", 0, 0, 0, pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL, &[weak_aux(0, 4)]);
-    coff.symbol("d", 0, text, 0, pe::IMAGE_SYM_CLASS_EXTERNAL, &[]);
+    coff.symbol("w", 0, 0, 0, pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL.0, &[weak_aux(0, 4)]);
+    coff.symbol("d", 0, text, 0, pe::IMAGE_SYM_CLASS_EXTERNAL.0, &[]);
     let error = read(&coff);
     assert!(error.contains("search type 4"), "{error}");
 }
@@ -1395,7 +1401,7 @@ fn short_import(symbol: &str, dll: &str, hint: u16, typ: u16, name: u16) -> Vec<
     out.put_u16(0);
     out.put_u16(0xffff);
     out.put_u16(0);
-    out.put_u16(pe::IMAGE_FILE_MACHINE_AMD64);
+    out.put_u16(pe::IMAGE_FILE_MACHINE_AMD64.0);
     out.put_u32(0);
     out.put_u32((symbol.len() + dll.len() + 2) as u32);
     out.put_u16(hint);
@@ -1468,7 +1474,7 @@ fn short_import_members() {
         NativeFile::Shared(shared) => shared,
         _ => panic!("an import member not read as a DLL's import"),
     };
-    let shared = read(&short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_NAME));
+    let shared = read(&short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0));
     assert_eq!(shared.name, "KERNEL32.dll");
     assert_eq!(shared.symbols.len(), 1);
     assert_eq!(shared.symbol_name(&shared.symbols[0]), "ExitProcess");
@@ -1478,13 +1484,13 @@ fn short_import_members() {
     assert_eq!(shared.symbols[0].kind, SymbolKind::Function);
     assert!(!shared.symbols[0].weak);
 
-    let shared = read(&short_import("_f@8", "X.dll", 2, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_NAME_UNDECORATE));
+    let shared = read(&short_import("_f@8", "X.dll", 2, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME_UNDECORATE.0));
     assert_eq!(shared.symbol_name(&shared.symbols[0]), "_f@8");
     assert_eq!(shared.version(&shared.symbols[0]), Some("2 f"));
-    let shared = read(&short_import("_g", "X.dll", 3, pe::IMPORT_OBJECT_DATA, pe::IMPORT_OBJECT_NAME_NO_PREFIX));
+    let shared = read(&short_import("_g", "X.dll", 3, pe::IMPORT_OBJECT_DATA.0, pe::IMPORT_OBJECT_NAME_NO_PREFIX.0));
     assert_eq!(shared.version(&shared.symbols[0]), Some("3 g"));
     assert_eq!(shared.symbols[0].kind, SymbolKind::Data);
-    let shared = read(&short_import("ord", "X.dll", 115, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_ORDINAL));
+    let shared = read(&short_import("ord", "X.dll", 115, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_ORDINAL.0));
     assert_eq!(shared.version(&shared.symbols[0]), Some("#115"));
 
     let error = pe.read("x.lib(x)", &short_import("h", "X.dll", 0, 3, 1), &NativeKind::Object).err().unwrap();
@@ -1494,8 +1500,24 @@ fn short_import_members() {
 }
 
 #[test]
+fn a_name_that_is_not_utf8_is_an_error() {
+    let pe = pe(exe());
+    let mut import = short_import("hello", "X.dll", 0, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0);
+    import[20] = 0xff;
+    let error = pe.read("x.lib(x)", &import, &NativeKind::Object).err().unwrap();
+    assert!(error.contains("x.lib(x)") && error.contains("not UTF-8"), "{error}");
+
+    let mut coff = Coff::default();
+    coff.section(".drectve", INFO, b"/INCLUDE:\xff".to_vec());
+    let error = pe.read("bad.obj", &coff.bytes(), &NativeKind::Object).err().unwrap();
+    assert!(error.contains("bad.obj") && error.contains("not UTF-8"), "{error}");
+    let error = asked_libraries("x.lib", &archive(&[("bad.obj", coff.bytes(), &[])])).unwrap_err();
+    assert!(error.contains("x.lib(bad.obj)") && error.contains("not UTF-8"), "{error}");
+}
+
+#[test]
 fn archive_index_names_members() {
-    let import = short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_NAME);
+    let import = short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0);
     let bytes = archive(&[
         ("test.obj", object(), &["main_fn", "inline_fn"]),
         ("k32.dll", import.clone(), &["ExitProcess", "__imp_ExitProcess"]),
@@ -1521,8 +1543,8 @@ fn archive_index_names_members() {
 
 #[test]
 fn import_library_is_a_shared_per_dll() {
-    let code = pe::IMPORT_OBJECT_CODE;
-    let name = pe::IMPORT_OBJECT_NAME;
+    let code = pe::IMPORT_OBJECT_CODE.0;
+    let name = pe::IMPORT_OBJECT_NAME.0;
     let bytes = archive(&[
         ("k32.dll", short_import("ExitProcess", "KERNEL32.dll", 1, code, name), &["ExitProcess", "__imp_ExitProcess"]),
         ("u32.dll", short_import("MessageBoxW", "USER32.dll", 2, code, name), &["MessageBoxW", "__imp_MessageBoxW"]),
@@ -1566,8 +1588,8 @@ fn import_library_groups_as_one_pass_would() {
         assert_eq!(names, expected, "D{dll}.dll");
     }
 
-    let code = pe::IMPORT_OBJECT_CODE;
-    let name = pe::IMPORT_OBJECT_NAME;
+    let code = pe::IMPORT_OBJECT_CODE.0;
+    let name = pe::IMPORT_OBJECT_NAME.0;
     let bytes = archive(&[
         ("k32.dll", short_import("ExitProcess", "KERNEL32.dll", 1, code, name), &["ExitProcess"]),
         ("first.obj", object(), &["main_fn"]),
@@ -1590,7 +1612,7 @@ fn directives_only(directives: &str) -> Vec<u8> {
 
 #[test]
 fn archive_members_ask_for_their_default_libraries() {
-    let import = short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_NAME);
+    let import = short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0);
     let bytes = archive(&[
         ("a.obj", directives_only("/DEFAULTLIB:vcruntime -defaultlib:\"ucrt.lib\" /DEFAULTLIB:libcmt /nodefaultlib:LIBCMT.LIB /INCLUDE:x"), &[]),
         ("k32.dll", import, &[]),
@@ -1623,20 +1645,20 @@ fn functions_object(functions: usize) -> Vec<u8> {
     let mut coff = Coff::default();
     let data = coff.section(".data", DATA, vec![0; 8 * functions]);
     let texts: Vec<i16> = (0..functions)
-        .map(|_| coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT, vec![0xe8, 0, 0, 0, 0, 0xc3]))
+        .map(|_| coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT.0, vec![0xe8, 0, 0, 0, 0, 0xc3]))
         .collect();
     // `.data`'s symbol and its aux record, then per function its section's symbol, the aux
     // record and the function.
     let function = |at: usize| 4 + 3 * at as u32;
     for (at, &text) in texts.iter().enumerate() {
-        coff.relocate(text, 1, function((at + 1) % functions), pe::IMAGE_REL_AMD64_REL32);
-        coff.relocate(data, 8 * at as u32, function(at), pe::IMAGE_REL_AMD64_ADDR64);
+        coff.relocate(text, 1, function((at + 1) % functions), pe::IMAGE_REL_AMD64_REL32.0);
+        coff.relocate(data, 8 * at as u32, function(at), pe::IMAGE_REL_AMD64_ADDR64.0);
     }
     assert_eq!(coff.section_symbol(data, 0, 0), 0);
     for (at, &text) in texts.iter().enumerate() {
-        assert_eq!(coff.section_symbol(text, 0, pe::IMAGE_COMDAT_SELECT_ANY), function(at) - 2);
+        assert_eq!(coff.section_symbol(text, 0, pe::IMAGE_COMDAT_SELECT_ANY.0), function(at) - 2);
         let name = format!("f{at}");
-        assert_eq!(coff.symbol(&name, 0, text, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL, &[]), function(at));
+        assert_eq!(coff.symbol(&name, 0, text, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL.0, &[]), function(at));
     }
     coff.bytes()
 }
@@ -1650,7 +1672,7 @@ fn import_archive(members: usize, dlls: usize) -> Vec<u8> {
     let list: Vec<(&str, Vec<u8>, &[&str])> = (0..members)
         .map(|at| {
             let dll = format!("D{}.dll", at % dlls);
-            let bytes = short_import(&symbols[at][0], &dll, 1, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_NAME);
+            let bytes = short_import(&symbols[at][0], &dll, 1, pe::IMPORT_OBJECT_CODE.0, pe::IMPORT_OBJECT_NAME.0);
             (names[at].as_str(), bytes, &indexed[at][..])
         })
         .collect();
@@ -1831,13 +1853,13 @@ fn section_headers(file: &PeFile64<'_>) -> Vec<(u32, u32, u32, u32, u32)> {
                 it.virtual_size.get(LE),
                 it.size_of_raw_data.get(LE),
                 it.pointer_to_raw_data.get(LE),
-                it.characteristics.get(LE),
+                it.characteristics.get(LE).0,
             )
         })
         .collect()
 }
 
-const ACCESS: u32 = pe::IMAGE_SCN_MEM_READ | pe::IMAGE_SCN_MEM_WRITE | pe::IMAGE_SCN_MEM_EXECUTE;
+const ACCESS: u32 = pe::IMAGE_SCN_MEM_READ.0 | pe::IMAGE_SCN_MEM_WRITE.0 | pe::IMAGE_SCN_MEM_EXECUTE.0;
 
 #[test]
 fn dev_run_start_hook_is_the_first_tls_callback_after_xl_a() {
@@ -1917,13 +1939,13 @@ fn dev_run_code_is_on_its_own_granules() {
     let sections = section_headers(&file);
     let (va, size, raw, at, flags) = sections[0];
     assert_eq!(va, 0x1_0000, "the code starts on a granule");
-    assert_ne!(flags & pe::IMAGE_SCN_MEM_EXECUTE, 0);
-    assert_eq!(flags & pe::IMAGE_SCN_MEM_WRITE, 0);
+    assert_ne!(flags & pe::IMAGE_SCN_MEM_EXECUTE.0, 0);
+    assert_eq!(flags & pe::IMAGE_SCN_MEM_WRITE.0, 0);
     assert_eq!(at, va);
     assert!(size <= raw, "the code is all raw data");
     assert_eq!(sections[1].0, 0x2_0000, "the next section starts on the next granule");
-    assert!(sections[1..].iter().all(|it| it.4 & pe::IMAGE_SCN_MEM_EXECUTE == 0), "code before all else");
-    assert!(sections.iter().all(|it| it.4 & pe::IMAGE_SCN_MEM_EXECUTE == 0 || it.4 & pe::IMAGE_SCN_MEM_WRITE == 0));
+    assert!(sections[1..].iter().all(|it| it.4 & pe::IMAGE_SCN_MEM_EXECUTE.0 == 0), "code before all else");
+    assert!(sections.iter().all(|it| it.4 & pe::IMAGE_SCN_MEM_EXECUTE.0 == 0 || it.4 & pe::IMAGE_SCN_MEM_WRITE.0 == 0));
     assert_eq!(optional.address_of_entry_point(), f.rva(f.at(&Class::Text)));
     for pair in sections.windows(2) {
         assert_eq!(pair[0].0 + pair[0].1, pair[1].0, "adjacent, as the NT loader wants");
@@ -2000,7 +2022,7 @@ fn dev_run_has_no_base_relocation_in_code_and_no_cfg() {
     let (va, size, ..) = section_headers(&file)[0];
     assert!(rebased(&file, &image).iter().all(|it| !(va..va + size).contains(it)));
     let optional = file.nt_headers().optional_header();
-    assert_eq!(optional.dll_characteristics() & pe::IMAGE_DLLCHARACTERISTICS_GUARD_CF, 0);
+    assert_eq!(optional.dll_characteristics().0 & pe::IMAGE_DLLCHARACTERISTICS_GUARD_CF.0, 0);
 
     let mut f = dev_executable();
     let text = f.at(&Class::Text);

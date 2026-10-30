@@ -191,7 +191,11 @@ pub fn patch_tables(root: &Root<'_>) -> Result<Vec<(Url, Vec<Patch>)>> {
         } else {
             match key.parse::<Url>() {
                 Ok(url) => url,
-                Err(_) => continue,
+                Err(_) => bail!(
+                    "`[patch.{key}]` in `{}` names a registry by its name, which is not looked up in \
+                     `[registries]` here: name it by its index URL",
+                    manifest_path.display()
+                ),
             }
         };
         let mut patches = Vec::new(); // alloc: a table's patches, once per table per load
@@ -527,6 +531,15 @@ mod tests {
         let root = Root::new(Path::new("/w"), "[patch.crates-io]\na = { path = \"vendor/a\" }\nb = \"1\"\n").unwrap();
         assert_eq!(patch_paths(&root), vec![PathBuf::from("/w/vendor/a")]);
         assert_eq!(patch_tables(&root).unwrap()[0].1.len(), 2);
+    }
+
+    /// A `[patch]` of a registry named, not given by URL, is refused naming it, never left out.
+    #[test]
+    fn a_patch_of_a_named_registry_is_an_error() {
+        let root = Root::new(Path::new("/w"), "[patch.my-registry]\na = { path = \"vendor/a\" }\n").unwrap();
+        let Err(error) = patch_tables(&root) else { panic!("a named registry's patch is not left out") };
+        let error = error.to_string();
+        assert!(error.contains("[patch.my-registry]"), "{error}");
     }
 
     #[test]

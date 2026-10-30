@@ -766,7 +766,8 @@ mod tests {
     #[test]
     fn the_last_nested_duplicate_is_removed_with_the_comma_before_it() {
         let text = "use issue_52891::{d, e, a};";
-        let (brace, until) = until_next_binding(text, range(text, "a}"), TextSize::of(text));
+        let a = TextRange::at(range(text, "a}").start(), TextSize::of("a"));
+        let (brace, until) = until_next_binding(text, a, TextSize::of(text));
         assert!(brace);
         assert_eq!(&text[until], "a");
         assert_eq!(&text[to_previous_binding(text, until).unwrap()], ", a");

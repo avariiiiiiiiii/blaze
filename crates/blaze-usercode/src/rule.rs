@@ -8,7 +8,7 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use blaze_build_script::Watched;
@@ -80,17 +80,11 @@ impl CargoRule {
         }
         CargoRule { paths: watched.paths, package: None, env }
     }
-
-    /// The whole package at `package_dir`.
-    pub fn package(package_dir: &Path) -> CargoRule {
-        // alloc: the rule owns its directory, made once as a run ends; the lists are empty.
-        CargoRule { paths: Vec::new(), package: Some(package_dir.to_owned()), env: Vec::new() }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, path::Path};
 
     use blaze_build_script::{Output, watched};
     use blaze_core::Untraceable;

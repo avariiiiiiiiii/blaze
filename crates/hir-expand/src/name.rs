@@ -290,10 +290,7 @@ impl AsName for ast::FieldKind {
     fn as_name(&self) -> Name {
         match self {
             ast::FieldKind::Name(nr) => nr.as_name(),
-            ast::FieldKind::Index(idx) => {
-                let idx = idx.text().parse::<usize>().unwrap_or(0);
-                Name::new_tuple_field(idx)
-            }
+            ast::FieldKind::Index(idx) => tuple_index_name(idx.text()),
         }
     }
 }
@@ -329,11 +326,18 @@ impl AsName for view::FieldKind<'_> {
     fn as_name(&self) -> Name {
         match self {
             view::FieldKind::Name(nr) => nr.as_name(),
-            view::FieldKind::Index(idx) => {
-                let idx = idx.text().parse::<usize>().unwrap_or(0);
-                Name::new_tuple_field(idx)
-            }
+            view::FieldKind::Index(idx) => tuple_index_name(idx.text()),
         }
+    }
+}
+
+/// The name a field access `x.<text>` names: rustc's field ident is the literal's own text, so a
+/// text that is not a plain decimal `usize` (`0x1`, `1_0`, `01`, one past `usize::MAX`) names no
+/// tuple field, and the access fails as rustc's E0609 does.
+fn tuple_index_name(text: &str) -> Name {
+    match text.parse::<usize>() {
+        Ok(idx) if !(text.len() > 1 && text.starts_with('0')) => Name::new_tuple_field(idx),
+        _ => Name::new_root(text),
     }
 }
 
@@ -409,5 +413,18 @@ mod tests {
         assert_eq!(names[1].as_tuple_index(), Some(17));
         assert_eq!(names[2].as_str(), "abc");
         assert_eq!(names[3].as_str(), "gen");
+    }
+
+    /// A field index that is not plain decimal names its own text, never field 0.
+    #[test]
+    fn tuple_index_names_its_text() {
+        assert_eq!(tuple_index_name("0").as_tuple_index(), Some(0));
+        assert_eq!(tuple_index_name("17").as_tuple_index(), Some(17));
+        for text in ["0x1", "01", "1_0", "99999999999999999999999999"] {
+            let name = tuple_index_name(text);
+            assert_eq!(name.as_str(), text);
+            assert_ne!(name, Name::new_tuple_field(0), "{text}");
+            assert_ne!(name, Name::new_tuple_field(1), "{text}");
+        }
     }
 }

@@ -411,8 +411,9 @@ impl<'a> Look<'a> {
         None
     }
 
-    /// The content and ticket of the value kept under `key`, unverified, passing over a record
-    /// whose header is not whole (a put shadows it).
+    /// The content and ticket of the value kept under `key`, unverified. A first record whose
+    /// slot or header is not whole is no value: the put writes a record that shadows it, never
+    /// taking one from an older tier behind it.
     pub(crate) fn kept(self, key: &Key) -> Option<(ContentId, Ticket)> {
         let view = self.view();
         for (at, tier) in view.tiers.iter().enumerate() {
@@ -422,11 +423,13 @@ impl<'a> Look<'a> {
                 }
             }
             let Some(index) = &tier.index else { continue };
-            if let Some((slot, Ok(loc))) = index.table().get(key) {
-                let found = Found { view, tier: at, place: Place::Pack(loc), at: At::Slot(index, slot) };
-                if let Ok((header, _)) = self.record(found, key) {
-                    return Some((header.content, Ticket::DURABLE));
+            match index.table().get(key) {
+                Some((slot, Ok(loc))) => {
+                    let found = Found { view, tier: at, place: Place::Pack(loc), at: At::Slot(index, slot) };
+                    return self.record(found, key).ok().map(|(header, _)| (header.content, Ticket::DURABLE));
                 }
+                Some((_, Err(_))) => return None,
+                None => {}
             }
         }
         None

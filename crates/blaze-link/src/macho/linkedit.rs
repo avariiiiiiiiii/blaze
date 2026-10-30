@@ -167,7 +167,7 @@ pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Resul
         return Ok(0);
     }
     let start = out.len();
-    out.push(macho::REBASE_OPCODE_SET_TYPE_IMM | macho::REBASE_TYPE_POINTER);
+    out.push(macho::REBASE_OPCODE_SET_TYPE_IMM.0 | macho::REBASE_TYPE_POINTER.0);
     let cuts = cuts(addrs.len(), |at| addrs[at] != addrs[at - 1].wrapping_add(8));
     if cuts.len() == 1 {
         // Runs of adjacent pointers take 2 to 3 bytes each; scattered ones about 3.
@@ -190,7 +190,7 @@ pub(super) fn rebases(addrs: &[u64], spans: &[Span], out: &mut Vec<u8>) -> Resul
             .collect(); // alloc: once per table, one result per piece
         join(out, pieces)?;
     }
-    out.push(macho::REBASE_OPCODE_DONE);
+    out.push(macho::REBASE_OPCODE_DONE.0);
     Ok(finish(out, start))
 }
 
@@ -208,19 +208,19 @@ fn rebase_runs(addrs: &[u64], mut cursor: Option<(usize, u64)>, spans: &[Span], 
         match cursor {
             Some((at, address)) if at == segment && first >= address => {
                 if first > address {
-                    out.push(macho::REBASE_OPCODE_ADD_ADDR_ULEB);
+                    out.push(macho::REBASE_OPCODE_ADD_ADDR_ULEB.0);
                     uleb(out, first - address);
                 }
             }
             _ => {
-                out.push(macho::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment as u8);
+                out.push(macho::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB.0 | segment as u8);
                 uleb(out, first - spans[segment].start);
             }
         }
         if run < 16 {
-            out.push(macho::REBASE_OPCODE_DO_REBASE_IMM_TIMES | run as u8);
+            out.push(macho::REBASE_OPCODE_DO_REBASE_IMM_TIMES.0 | run as u8);
         } else {
-            out.push(macho::REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
+            out.push(macho::REBASE_OPCODE_DO_REBASE_ULEB_TIMES.0);
             uleb(out, run as u64);
         }
         cursor = Some((segment, first + run as u64 * 8));
@@ -249,19 +249,19 @@ pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span], out: &mut Vec<u8>) -
     let start = out.len();
     // Each bind's address and opcode take about 3 bytes; each symbol its name and 2.
     out.reserve(binds.len() * 4 + 16);
-    out.push(macho::BIND_OPCODE_SET_TYPE_IMM | macho::BIND_TYPE_POINTER);
+    out.push(macho::BIND_OPCODE_SET_TYPE_IMM.0 | macho::BIND_TYPE_POINTER.0);
     let (mut ordinal, mut symbol, mut addend) = (None, None::<(&[u8], bool)>, 0i64);
     let mut cursor: Option<(usize, u64)> = None;
     for bind in binds.iter() {
         if ordinal != Some(bind.ordinal) {
             match bind.ordinal {
                 ..=0 if bind.ordinal >= -15 => out.push(
-                    macho::BIND_OPCODE_SET_DYLIB_SPECIAL_IMM
+                    macho::BIND_OPCODE_SET_DYLIB_SPECIAL_IMM.0
                         | (bind.ordinal as u8 & macho::BIND_IMMEDIATE_MASK),
                 ),
-                1..=15 => out.push(macho::BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | bind.ordinal as u8),
+                1..=15 => out.push(macho::BIND_OPCODE_SET_DYLIB_ORDINAL_IMM.0 | bind.ordinal as u8),
                 16.. => {
-                    out.push(macho::BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
+                    out.push(macho::BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB.0);
                     uleb(out, bind.ordinal as u64);
                 }
                 // alloc: error path
@@ -274,14 +274,14 @@ pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span], out: &mut Vec<u8>) -
                 // alloc: error path
                 return Err(format!("a bind at {:#x} to a symbol of no name", bind.addr));
             }
-            let flags = if bind.weak { macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT } else { 0 };
-            out.push(macho::BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | flags);
+            let flags = if bind.weak { macho::BIND_SYMBOL_FLAGS_WEAK_IMPORT.0 } else { 0 };
+            out.push(macho::BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM.0 | flags);
             out.extend_from_slice(bind.name);
             out.push(0);
             symbol = Some((bind.name, bind.weak));
         }
         if addend != bind.addend {
-            out.push(macho::BIND_OPCODE_SET_ADDEND_SLEB);
+            out.push(macho::BIND_OPCODE_SET_ADDEND_SLEB.0);
             sleb(out, bind.addend);
             addend = bind.addend;
         }
@@ -289,19 +289,19 @@ pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span], out: &mut Vec<u8>) -
         match cursor {
             Some((at, address)) if at == segment && bind.addr >= address => {
                 if bind.addr > address {
-                    out.push(macho::BIND_OPCODE_ADD_ADDR_ULEB);
+                    out.push(macho::BIND_OPCODE_ADD_ADDR_ULEB.0);
                     uleb(out, bind.addr - address);
                 }
             }
             _ => {
-                out.push(macho::BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment as u8);
+                out.push(macho::BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB.0 | segment as u8);
                 uleb(out, bind.addr - spans[segment].start);
             }
         }
-        out.push(macho::BIND_OPCODE_DO_BIND);
+        out.push(macho::BIND_OPCODE_DO_BIND.0);
         cursor = Some((segment, bind.addr + 8));
     }
-    out.push(macho::BIND_OPCODE_DONE);
+    out.push(macho::BIND_OPCODE_DONE.0);
     Ok(finish(out, start))
 }
 
@@ -517,7 +517,7 @@ mod tests {
             return Ok(0);
         }
         let start = out.len();
-        out.push(macho::REBASE_OPCODE_SET_TYPE_IMM | macho::REBASE_TYPE_POINTER);
+        out.push(macho::REBASE_OPCODE_SET_TYPE_IMM.0 | macho::REBASE_TYPE_POINTER.0);
         let mut cursor: Option<(usize, u64)> = None;
         let mut rest = &addrs[..];
         while let Some(&first) = rest.first() {
@@ -530,25 +530,25 @@ mod tests {
             match cursor {
                 Some((at, address)) if at == segment && first >= address => {
                     if first > address {
-                        out.push(macho::REBASE_OPCODE_ADD_ADDR_ULEB);
+                        out.push(macho::REBASE_OPCODE_ADD_ADDR_ULEB.0);
                         uleb(out, first - address);
                     }
                 }
                 _ => {
-                    out.push(macho::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment as u8);
+                    out.push(macho::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB.0 | segment as u8);
                     uleb(out, first - spans[segment].start);
                 }
             }
             if run < 16 {
-                out.push(macho::REBASE_OPCODE_DO_REBASE_IMM_TIMES | run as u8);
+                out.push(macho::REBASE_OPCODE_DO_REBASE_IMM_TIMES.0 | run as u8);
             } else {
-                out.push(macho::REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
+                out.push(macho::REBASE_OPCODE_DO_REBASE_ULEB_TIMES.0);
                 uleb(out, run as u64);
             }
             cursor = Some((segment, first + run as u64 * 8));
             rest = &rest[run..];
         }
-        out.push(macho::REBASE_OPCODE_DONE);
+        out.push(macho::REBASE_OPCODE_DONE.0);
         Ok(finish(out, start))
     }
 

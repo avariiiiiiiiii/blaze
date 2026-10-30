@@ -564,7 +564,7 @@ impl Front<Fake> for FakeFront {
             true => vec![warning_of_app("unused variable: `x`"), warning_of_app("unused import: `y`")],
             false => Vec::new(),
         };
-        Ok(Compiled { diagnostics, ok: true, puts, outputs, artifact: None, macros: None })
+        Ok(Compiled { diagnostics, ok: true, puts, outputs, artifact: None, macros: None, links: Vec::new() })
     }
 
     fn script(&self, unit: usize, _: u64) -> Result<FakeRuns, ApiError> {
@@ -1149,7 +1149,7 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
         _ => panic!("the evaluation gave no result"),
     }
 
-    match run(Does::Compile { front: Arc::new(FakeFront { goal: Goal::Build }) }, reading()) {
+    match run(Does::Compile { front: Arc::new(FakeFront { goal: Goal::Build }), back: Default::default() }, reading()) {
         Value::Compiled(0, Ok(compiled), images) => assert!(compiled.ok && images.is_empty()),
         _ => panic!("the compile gave no unit"),
     }

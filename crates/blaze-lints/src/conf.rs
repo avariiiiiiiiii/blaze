@@ -76,6 +76,62 @@ fn value_hash(value: &toml::Value) -> u64 {
     state.finish()
 }
 
+/// The counts the lints read ([`Conf::int`]): `u64` in clippy's `Conf`, and blaze's own.
+const COUNTS: [&str; 7] = [
+    "enum-variant-size-threshold",
+    "pass-by-value-size-limit",
+    "too-large-for-stack",
+    "type-complexity-threshold",
+    "vec-box-size-threshold",
+    "parallel-threshold",
+    "parallel-assumed-trips",
+];
+
+/// The flags the lints read ([`Conf::bool`]).
+const FLAGS: [&str; 7] = [
+    "accept-comment-above-attributes",
+    "accept-comment-above-statement",
+    "allow-dbg-in-tests",
+    "allow-print-in-tests",
+    "allow-useless-vec-in-tests",
+    "avoid-breaking-exported-api",
+    "upper-case-acronyms-aggressive",
+];
+
+/// A value of a key the lints read that is not of its type (or a negative count) is clippy's
+/// error as it loads the file, never the key's default in its place.
+fn checked(table: &toml::Table) -> Result<(), String> {
+    for key in COUNTS {
+        match table.get(key) {
+            None => {}
+            Some(toml::Value::Integer(it)) if *it >= 0 => {}
+            Some(toml::Value::Integer(it)) => {
+                return Err(format!(
+                    "error reading Clippy's configuration file: invalid value: integer `{it}`, expected u64 for `{key}`"
+                ));
+            }
+            Some(other) => {
+                return Err(format!(
+                    "error reading Clippy's configuration file: invalid type: {}, expected u64 for `{key}`",
+                    other.type_str()
+                ));
+            }
+        }
+    }
+    for key in FLAGS {
+        match table.get(key) {
+            None | Some(toml::Value::Boolean(_)) => {}
+            Some(other) => {
+                return Err(format!(
+                    "error reading Clippy's configuration file: invalid type: {}, expected a boolean for `{key}`",
+                    other.type_str()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The names clippy looks for, in the order it takes them.
 const NAMES: [&str; 2] = [".clippy.toml", "clippy.toml"];
 
@@ -106,9 +162,18 @@ impl Conf {
             }
             None => toml::Table::new(),
         };
+        checked(&table)?;
         let msrv = match table.get("msrv").or_else(|| table.get("min-rust-version")) {
-            Some(toml::Value::String(it)) => Version::parse(it),
-            _ => rust_version.and_then(Version::parse),
+            Some(toml::Value::String(it)) => Some(Version::parse(it).ok_or_else(|| {
+                format!("error reading Clippy's configuration file: `{it}` is not a valid Rust version")
+            })?),
+            Some(other) => {
+                return Err(format!(
+                    "error reading Clippy's configuration file: invalid type: {}, expected a version for `msrv`",
+                    other.type_str()
+                ));
+            }
+            None => rust_version.and_then(Version::parse),
         };
         Ok(Conf { path, table, msrv })
     }
@@ -161,6 +226,28 @@ mod tests {
         assert!(!conf.meets(Version(1, 70, 0)));
         let conf = Conf::load(None, Some("1.80")).unwrap();
         assert!(conf.meets(Version(1, 70, 0)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A value of the wrong type, a negative count or a version that does not read is the
+    /// load's error, never the default.
+    #[test]
+    fn a_value_of_the_wrong_type_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("blaze-lints-conf-types-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clippy.toml");
+        for (text, says) in [
+            ("too-large-for-stack = -1\n", "integer `-1`"),
+            ("vec-box-size-threshold = \"big\"\n", "expected u64 for `vec-box-size-threshold`"),
+            ("allow-dbg-in-tests = 1\n", "expected a boolean for `allow-dbg-in-tests`"),
+            ("msrv = \"one\"\n", "`one` is not a valid Rust version"),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let error = Conf::load(Some(path.clone()), None).expect_err(text);
+            assert!(error.contains(says), "{text}: {error}");
+        }
+        std::fs::write(&path, "too-large-for-stack = 10\nallow-dbg-in-tests = true\n").unwrap();
+        assert_eq!(Conf::load(Some(path), None).unwrap().int("too-large-for-stack", 200), 10);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

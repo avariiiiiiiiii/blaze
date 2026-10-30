@@ -15,7 +15,7 @@ use std::{
 use blaze_ids::rng::SplitMix64;
 
 use super::{
-    Outcome,
+    Answers, Events, Identity, Outcome, Unwatched,
     exec::{self, Header, Tables},
     hook, image,
     switch::{Dwarf, HOST_ARCH, KEPT, Layout, Limits, Memory, POOL, Span, Switch, Writes},
@@ -1156,4 +1156,81 @@ fn a_switch_while_armed_keeps_the_cell_on_the_log_table() {
     let current = plain.word(CURRENT).load(Ordering::Relaxed);
     assert_eq!(plain.cell().load(Ordering::Relaxed), current);
     assert_eq!(plain.calls(), (2, 1));
+}
+
+/// A directory of its own under the system's temporary one, empty.
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("blaze-live-{name}-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// An answer the directory can't take comes back as what became of the message with why it
+/// was not answered, never a line on stderr.
+#[test]
+fn an_answer_that_cant_be_written_is_unanswered() {
+    let dir = scratch_dir("unanswered");
+    let mut answers = Answers::new(&dir);
+    let error = answers.write(&Answer::Applied { generation: 2 }).expect_err("no directory");
+    assert_eq!(error, std::io::ErrorKind::NotFound);
+    let applied = || Outcome::Applied { generation: 2, functions: 1, statics: 0 };
+    assert_eq!(
+        answers.unanswered(applied(), error),
+        Outcome::Unanswered {
+            outcome: Box::new(applied()),
+            path: dir.join(crate::patch::ANSWER),
+            error: std::io::ErrorKind::NotFound,
+        }
+    );
+
+    std::fs::create_dir_all(&dir).unwrap();
+    answers.write(&Answer::Applied { generation: 2 }).expect("answered");
+    let written = std::fs::read(dir.join(crate::patch::ANSWER)).unwrap();
+    assert_eq!(Answer::decode(&written), Ok(Answer::Applied { generation: 2 }));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The watcher's first reason to stop is kept, and each wakes the program to say it.
+#[test]
+fn a_lost_watch_keeps_its_first_reason() {
+    let events = Events::default();
+    events.lose(Unwatched::Gone);
+    events.lose(Unwatched::Failed { call: "poll", code: 4 });
+    assert_eq!(events.count.load(Ordering::Acquire), 2);
+    assert_eq!(events.lost.get(), Some(&Unwatched::Gone));
+}
+
+/// Removing the directory the program watches stops the watcher with [`Unwatched::Gone`]
+/// rather than waiting for it to come back.
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", target_arch = "aarch64"),
+))]
+#[test]
+fn a_removed_directory_stops_the_watch() {
+    let dir = scratch_dir("removed");
+    std::fs::create_dir_all(&dir).unwrap();
+    let events = std::sync::Arc::new(Events::default());
+    super::os::watch(&dir, events.clone()).expect("watching");
+    std::fs::remove_dir_all(&dir).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while events.lost.get().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(events.lost.get(), Some(&Unwatched::Gone));
+    events.stop.store(true, Ordering::Relaxed);
+}
+
+/// A message file is known by its length, node and time written, all three read.
+#[test]
+fn a_message_file_identity_reads_its_time() {
+    let dir = scratch_dir("identity");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("message");
+    std::fs::write(&path, [1, 2, 3]).unwrap();
+    let meta = std::fs::metadata(&path).unwrap();
+    let identity = Identity::of(&meta).expect("every platform the runtime runs on has the time");
+    assert_eq!(identity.len, 3);
+    assert_eq!(identity.modified, meta.modified().unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

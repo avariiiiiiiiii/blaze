@@ -1,13 +1,11 @@
 """macroeval_corpus.py: blaze-macro-eval's corpus of real proc macros, each call expanded by
 blaze's evaluator and held to what the corpus says of it: the fixture crate's own tests of what
-each expansion does, built by blaze, the corpus's checks of every call (and, where blaze has
-another host of a macro, the same output there), and kept expansions found again only when
-every input matches (`fastcompile-macros 6` in v2/requests/fastcompile.md; the tests are
+each expansion does, built by blaze, the corpus's checks of every call, and kept expansions
+found again only when every input matches (`fastcompile-macros 6` in v2/requests/fastcompile.md; the tests are
 crates/blaze-macro-eval/tests/corpus.rs and kept.rs, and the fixture's
 tests/corpus/ws/calls/src/tests.rs). Nothing is compared with rustc's build (docs/harness.md).
 
     uv run --frozen python harness/v2/macroeval_corpus.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/macroeval.json"}'
-    uv run --frozen python harness/v2/macroeval_corpus.py '{"engine": {...}, "out": "...", "wasm": [{"crate": "serde_derive", "path": "/w/serde_derive.wasm"}]}'
     uv run --frozen python harness/v2/macroeval_corpus.py selftest
 
 The input is one JSON object (inline, a file's path, or `-` for stdin):
@@ -16,9 +14,6 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
     out       the path the result JSON is written to (report.py)
     work      the directory everything is built in; empty: a new one under /tmp
     target    the target directory of `blaze test` of this repository; empty: `WORK/target`
-    wasm      blaze's WebAssembly module of a proc-macro crate, each `{"crate", "path"}`, to
-              hold blaze-macro-eval's output to blaze's WebAssembly host's; empty: none, and
-              only the fixture's own macros are run on another host (their native build)
     keep      keep the work directory after the run
 
 In order, each step one outcome, the run stopping at the first that does not pass:
@@ -34,7 +29,7 @@ In order, each step one outcome, the run stopping at the first that does not pas
                 the fixture crate (calls/src/tests.rs, and `tokio_test`, a test tokio's
                 `#[test]` makes), each built with the expansions blaze made
     test        the `BLAZE_MACRO_CORPUS` config (crates/blaze-macro-eval/tests/corpus/config.rs:
-                `workspace`, `scratch`, `cargo_home`, `wasm`) written to
+                `workspace`, `scratch`, `cargo_home`) written to
                 `WORK/corpus.json`, then `blaze test -p blaze-macro-eval --test corpus --test
                 kept -- --ignored` in this repository, BLAZE_PROC_MACRO_CACHE unset; then
                 one outcome per test of the two files, by libtest's name
@@ -59,7 +54,6 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -76,8 +70,6 @@ FIXTURE_TESTS = FIXTURE / "calls" / "src" / "tests.rs"
 FIXTURE_OWN = ("tokio_test",)
 CONFIG_RS = TESTS / "corpus" / "config.rs"
 TEST_FILES = ("corpus", "kept")
-# Every proc-macro crate of the fixture by crate name, as the tests look up `wasm`.
-PROC_MACROS = ("corpus_macros", "corpus_state", "serde_derive", "thiserror_impl", "tokio_macros")
 PACKAGE = "corpus-calls"
 COPIES = ("workspace", "scratch")
 TEST_ARGS = ("-p", "blaze-macro-eval", *(w for t in TEST_FILES for w in ("--test", t)), "--", "--ignored")
@@ -89,39 +81,16 @@ LABEL = "macroeval"
 
 
 @dataclass(frozen=True)
-class Module:
-    """blaze's WebAssembly module of a proc-macro crate."""
-
-    crate: str
-    path: str
-
-
-@dataclass(frozen=True)
 class Input:
     engine: engine.EngineSpec
     out: str
     work: str = ""
     target: str = ""
-    wasm: tuple[Module, ...] = ()
     keep: bool = False
 
 
 class Stop(Exception):
     """A step did not pass: its outcome is in the report, and nothing after it can run."""
-
-
-def checked_wasm(modules: tuple[Module, ...]) -> str | None:
-    """What is wrong with the input's `wasm`, or None."""
-    seen: set[str] = set()
-    for at, module in enumerate(modules):
-        if module.crate not in PROC_MACROS:
-            return f"wasm[{at}].crate: the fixture has no proc-macro crate {module.crate!r} ({', '.join(PROC_MACROS)})"
-        if module.crate in seen:
-            return f"wasm[{at}].crate: {module.crate} is named twice"
-        seen.add(module.crate)
-        if not Path(module.path).is_file():
-            return f"wasm[{at}].path: no file {module.path}"
-    return None
 
 
 def config_fields(source: str) -> tuple[list[str], bool]:
@@ -133,11 +102,10 @@ def config_fields(source: str) -> tuple[list[str], bool]:
     return re.findall(r"^\s*pub\(crate\) (\w+):", body, re.M), "deny_unknown_fields" in attrs
 
 
-def corpus_config(workspace: Path, scratch: Path, cargo_home: Path, wasm: tuple[Module, ...]) -> dict[str, object]:
+def corpus_config(workspace: Path, scratch: Path, cargo_home: Path) -> dict[str, str]:
     """The value of `BLAZE_MACRO_CORPUS`, every path absolute."""
     return dict(workspace=str(workspace.resolve()), scratch=str(scratch.resolve()),
-                cargo_home=str(cargo_home.resolve()),
-                wasm={m.crate: str(Path(m.path).resolve()) for m in sorted(wasm, key=lambda m: m.crate)})
+                cargo_home=str(cargo_home.resolve()))
 
 
 def registry_packages(lock: str) -> list[tuple[str, str]]:
@@ -317,13 +285,11 @@ def run_tests(rep: report.Report, eng: engine.Engine, work: Path, target: Path, 
 
 
 def main(args: Input) -> None:
-    if wrong := checked_wasm(args.wasm):
-        fail(SCRIPT, wrong)
     for needed in (FIXTURE / "Cargo.lock", FIXTURE_TESTS, CONFIG_RS, *(TESTS / f"{t}.rs" for t in TEST_FILES)):
         if not needed.is_file():
             fail(SCRIPT, f"no file {needed}")
     fields, refuses = config_fields(CONFIG_RS.read_text())
-    if not refuses or sorted(fields) != sorted(corpus_config(Path(), Path(), Path(), ())):
+    if not refuses or sorted(fields) != sorted(corpus_config(Path(), Path(), Path())):
         fail(SCRIPT, f"{CONFIG_RS}'s `Corpus` has the fields {fields} (deny_unknown_fields: {refuses}); "
                      "this writes another config")
     try:
@@ -335,8 +301,7 @@ def main(args: Input) -> None:
     target = Path(args.target).resolve() if args.target else work / "target"
     cargo_home, home, store = work / "cargo-home", work / "h", work / "store"
     rep = report.Report(SCRIPT, args.engine, args.out)
-    rep.extra.update(work=str(work), target=str(target), toolchain=engine.TOOLCHAIN,
-                     wasm={m.crate: m.path for m in args.wasm})
+    rep.extra.update(work=str(work), target=str(target), toolchain=engine.TOOLCHAIN)
     print(f"work: {work}", flush=True)
     build_env = eng.env(home, store, extra={"CARGO_HOME": str(cargo_home)})
     try:
@@ -353,7 +318,7 @@ def main(args: Input) -> None:
                     eng.stop(copies["workspace"], build_env)
             except engine.Failed as e:
                 rep.add(f"{LABEL}: stopping the daemon", "error", str(e))
-        config = corpus_config(copies["workspace"], copies["scratch"], cargo_home, args.wasm)
+        config = corpus_config(copies["workspace"], copies["scratch"], cargo_home)
         rep.extra.update(config=config)
         config_at = work / "corpus.json"
         config_at.write_text(json.dumps(config, indent=1) + "\n")
@@ -378,37 +343,19 @@ def refused(fn: Callable[[], object]) -> str:
 
 def test_input() -> None:
     args = parse(Input, '{"engine": {"kind": "v2", "blaze": "b"}, "out": ""}', SCRIPT)
-    assert (args.work, args.target, args.wasm, args.keep) == ("", "", (), False), args
-    assert "no field module" in refused(
-        lambda: parse(Input, '{"engine": {"kind": "v2", "blaze": "b"}, "out": "", "module": []}', SCRIPT))
-    assert "no field wasm[0].file" in refused(lambda: parse(
-        Input, '{"engine": {"kind": "v2", "blaze": "b"}, "out": "", "wasm": [{"crate": "x", "file": "y"}]}', SCRIPT))
-    with tempfile.NamedTemporaryFile(suffix=".wasm") as module:
-        given = json.dumps({"engine": {"kind": "v2", "blaze": "b"}, "out": "",
-                            "wasm": [{"crate": "serde_derive", "path": module.name}]})
-        args = parse(Input, given, SCRIPT)
-        assert args.wasm == (Module("serde_derive", module.name),) and checked_wasm(args.wasm) is None, args
-        said = checked_wasm((Module("serde", module.name),))
-        assert said is not None and "no proc-macro crate 'serde'" in said, said
-        said = checked_wasm((Module("serde_derive", module.name), Module("serde_derive", module.name)))
-        assert said is not None and "named twice" in said, said
-    said = checked_wasm((Module("tokio_macros", "/nowhere/tokio.wasm"),))
-    assert said is not None and "no file /nowhere/tokio.wasm" in said, said
+    assert (args.work, args.target, args.keep) == ("", "", False), args
+    assert "no field wasm" in refused(
+        lambda: parse(Input, '{"engine": {"kind": "v2", "blaze": "b"}, "out": "", "wasm": []}', SCRIPT))
 
 
 def test_config() -> None:
     fields, refuses = config_fields(CONFIG_RS.read_text())
-    assert refuses and fields == ["workspace", "scratch", "cargo_home", "wasm"], fields
+    assert refuses and fields == ["workspace", "scratch", "cargo_home"], fields
     with tempfile.TemporaryDirectory() as tmp:
         top = Path(tmp).resolve()
-        (top / "m.wasm").write_bytes(b"")
-        (top / "t.wasm").write_bytes(b"")
-        config = corpus_config(top / "workspace", top / "scratch", top / "cargo-home",
-                               (Module("tokio_macros", str(top / "t.wasm")), Module("serde_derive", str(top / "m.wasm"))))
+        config = corpus_config(top / "workspace", top / "scratch", top / "cargo-home")
     assert list(config) == fields, list(config)
     assert config["workspace"] == str(top / "workspace") and config["cargo_home"] == str(top / "cargo-home"), config
-    assert list(cast(dict[str, str], config["wasm"])) == ["serde_derive", "tokio_macros"], config
-    assert cast(dict[str, str], config["wasm"])["serde_derive"] == str(top / "m.wasm"), config
     assert json.loads(json.dumps(config)) == config
     assert config_fields("#[derive(Deserialize)]\npub(crate) struct Corpus {\n    pub(crate) a: String,\n}") == (["a"], False)
     assert "no `pub(crate) struct Corpus`" in refused(lambda: config_fields("struct Other {}"))
@@ -428,15 +375,13 @@ def test_lock() -> None:
 
 
 def test_fixture() -> None:
-    """PROC_MACROS is every proc-macro crate the fixture builds `corpus-calls` with."""
+    """The fixture's own proc-macro crates, and the tests this runs of this repository."""
     own = []
     for manifest in sorted(FIXTURE.glob("*/Cargo.toml")):
         parsed = tomllib.loads(manifest.read_text())
         if parsed.get("lib", {}).get("proc-macro"):
             own.append(parsed["package"]["name"].replace("-", "_"))
     assert own == ["corpus_macros", "corpus_state"], own
-    registry = {name.replace("-", "_") for name, _ in registry_packages((FIXTURE / "Cargo.lock").read_text())}
-    assert set(PROC_MACROS) - set(own) <= registry, registry
     assert TEST_ARGS == ("-p", "blaze-macro-eval", "--test", "corpus", "--test", "kept", "--", "--ignored"), TEST_ARGS
 
 
@@ -453,16 +398,16 @@ def test_runs() -> None:
 
 LIBTEST = """running 2 tests
 test every_call_is_expanded ... ok
-test every_call_is_the_same_on_blazes_other_hosts ... FAILED
+test a_static_counts_calls_in_rustcs_order ... FAILED
 
 failures:
 
----- every_call_is_the_same_on_blazes_other_hosts stdout ----
-thread 'every_call_is_the_same_on_blazes_other_hosts' panicked at tests/corpus.rs:9:1:
-serde_derive `Serialize` differs
+---- a_static_counts_calls_in_rustcs_order stdout ----
+thread 'a_static_counts_calls_in_rustcs_order' panicked at tests/corpus.rs:9:1:
+counted [("FIRST", ["1"])]
 
 failures:
-    every_call_is_the_same_on_blazes_other_hosts
+    a_static_counts_calls_in_rustcs_order
 
 test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.10s
 
@@ -476,18 +421,18 @@ test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; fini
 def test_tests() -> None:
     sources = {t: (TESTS / f"{t}.rs").read_text() for t in TEST_FILES}
     expected = expected_tests(sources)
-    assert {"every_call_is_expanded", "every_call_is_the_same_on_blazes_other_hosts", "a_panic_is_its_message",
+    assert {"every_call_is_expanded", "a_static_counts_calls_in_rustcs_order", "a_panic_is_its_message",
             "a_kept_expansion_is_found_and_one_whose_input_changed_is_not"} <= set(expected), expected
     assert len(expected) == len(set(expected)), expected
     assert expected_tests({"x": "#[test]\n#[ignore = \"why\"]\nfn a() {}\n#[test]\nfn b() {}\nfn c() {}\n"}) == ["a", "b"]
-    wanted = ["every_call_is_expanded", "every_call_is_the_same_on_blazes_other_hosts",
+    wanted = ["every_call_is_expanded", "a_static_counts_calls_in_rustcs_order",
               "a_kept_expansion_is_found_and_one_whose_input_changed_is_not", "a_panic_is_its_message",
               "every_macro_kind_is_called"]
     judged = {j.name: j for j in judge_tests(wanted, LIBTEST + "test stray ... ok\n", ["every_macro_kind_is_called"])}
     assert list(judged) == [*wanted, "stray"], list(judged)
     assert judged["every_call_is_expanded"].verdict == "pass"
-    failed = judged["every_call_is_the_same_on_blazes_other_hosts"]
-    assert failed.verdict == "fail" and "`Serialize` differs" in failed.detail and "failures:" not in failed.detail, failed
+    failed = judged["a_static_counts_calls_in_rustcs_order"]
+    assert failed.verdict == "fail" and "counted" in failed.detail and "failures:" not in failed.detail, failed
     ignored = judged["a_kept_expansion_is_found_and_one_whose_input_changed_is_not"]
     assert ignored.verdict == "fail" and "ignored" in ignored.detail, ignored
     assert judged["a_panic_is_its_message"] == Judged("a_panic_is_its_message", "fail", "a_panic_is_its_message did not run")

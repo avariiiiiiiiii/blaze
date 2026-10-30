@@ -6,18 +6,28 @@
 //!
 //! The wire, fixed-width and little-endian:
 //!
-//! - An **ask** is `b"BLZASK"`, the version as a `u16` (2), and the 32 bytes of the [`Key`].
+//! - An **ask** is `b"BLZASK"`, the version as a `u16` (3), and the 32 bytes of the [`Key`].
 //!   A client sends asks back to back on one connection without waiting (pipelined), and the
 //!   asks of one turn of fetches in one send.
 //! - An **answer frame** is its length as a `u64`, then [`Answer::encode`]'s bytes: `b"BLZANS"`,
-//!   the version as a `u16` (2), a byte saying which answer (0 missing, 1 value), the key, and
+//!   the version as a `u16` (3), a byte saying which answer (0 missing, 1 value), the key, and
 //!   for a value its [`Kind::code`], its content hash, its length as a `u64` and its bytes
 //!   ([`Answer::encode_framed`] is the whole frame).
-//! - Version 2 answers the asks of a batch in any order: the server sends missing and short
-//!   answers first, gathered into one send, then each long value in a send of its own, so a long
-//!   value holds up no short answer asked with it. The client matches an answer to its fetch by
-//!   key, and hands the fetch the whole frame, length prefix included, which `Store::take_fetched`
+//! - The asks of a batch are answered in any order: the server sends missing and short answers
+//!   first, gathered into one send, then each long value in a send of its own, so a long value
+//!   holds up no short answer asked with it. The client matches an answer to its fetch by key,
+//!   and hands the fetch the whole frame, length prefix included, which `Store::take_fetched`
 //!   reads in place. Either side refuses a peer of another version.
+//! - A **filter frame** (new in version 3) is framed as an answer is: `b"BLZANS"`, the version,
+//!   2, a byte saying whether it replaces the filters before it (1) or adds to them (0), the
+//!   [`Store::epoch`] it covers as a `u64`, and a [`Fuse8`] of the first word of each key the
+//!   server's store holds. The server sends a full filter first on each connection, ahead of
+//!   any answer, then a delta of the keys each batch of its store puts ([`Server::refresh`]),
+//!   and a full one again once the deltas pass a quarter of the full one's keys. A client asks
+//!   only for a key one of its filters may hold, and answers any other `Missing` itself: a miss
+//!   costs no round trip. A filter has no false negatives for the keys it covers; a key put
+//!   after the epoch it covers reads `Missing` until the next delta, so a stale filter costs a
+//!   recompute, never a wrong value. A client with no filter yet asks for every key.
 //! - Bounds: a value is at most [`LONGEST_VALUE`] bytes, and a client refuses a frame longer
 //!   than that and its header before reading it. A server hangs up a connection whose stream is
 //!   not whole asks, and stops answering and reading a connection while its unsent answers pass
@@ -37,19 +47,24 @@ use std::collections::{VecDeque, hash_map};
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, Tag, Tags};
 use blaze_format::cursor::{self, Put as _, Reader};
-use blaze_ids::{ContentId, radix};
+use blaze_ids::{ContentId, fuse::Fuse8, radix};
 use rustc_hash::FxHashMap;
 
-use crate::{ByHash, Corrupt, Entry, Key, Kind, Remote, Store};
+use crate::{Asked, ByHash, Corrupt, Entry, Key, Kind, Remote, Store};
 
 /// The most bytes of one value an answer may carry; a longer one is refused before it is read.
 pub const LONGEST_VALUE: u64 = 1 << 30;
 
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const ASK_MAGIC: &[u8; 6] = b"BLZASK";
 const ANSWER_MAGIC: &[u8; 6] = b"BLZANS";
 const MISSING: u8 = 0;
 const VALUE: u8 = 1;
+const FILTER: u8 = 2;
+/// Magic, version, which frame, whether it replaces, epoch.
+const FILTER_HEADER: usize = 8 + 1 + 1 + 8;
+/// Deltas a client probes besides the full filter, at most: past it the server sends a full one.
+const FILTER_DELTAS: usize = 16;
 
 /// Magic, version and key.
 const ASK_LEN: usize = 8 + 32;
@@ -169,16 +184,7 @@ fn truncated(error: cursor::Error) -> String {
 /// [`Answer::decode`] without the copy: an answer's bytes (not its frame) read in place.
 pub(crate) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
     let mut reader = Reader::new(bytes);
-    let header = reader.array::<8>().map_err(truncated)?;
-    if header[..6] != ANSWER_MAGIC[..] {
-        // alloc: an error path.
-        return Err(format!("not an answer: its magic is {:?}", header[..6].escape_ascii().to_string()));
-    }
-    let version = u16::from_le_bytes([header[6], header[7]]);
-    if version != VERSION {
-        // alloc: an error path.
-        return Err(format!("an answer of version {version}; this blaze speaks version {VERSION}"));
-    }
+    read_header(&mut reader)?;
     let which = reader.u8().map_err(truncated)?;
     let key = Key(ContentId(*reader.array().map_err(truncated)?));
     let parsed = match which {
@@ -206,6 +212,68 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
         return Err(format!("{} trailing bytes after the answer", reader.left()));
     }
     Ok(parsed)
+}
+
+/// Reads an answer's or a filter's magic and version, refusing another.
+fn read_header(reader: &mut Reader<'_>) -> Result<(), String> {
+    let header = reader.array::<8>().map_err(truncated)?;
+    if header[..6] != ANSWER_MAGIC[..] {
+        // alloc: an error path.
+        return Err(format!("not an answer: its magic is {:?}", header[..6].escape_ascii().to_string()));
+    }
+    let version = u16::from_le_bytes([header[6], header[7]]);
+    if version != VERSION {
+        // alloc: an error path.
+        return Err(format!("an answer of version {version}; this blaze speaks version {VERSION}"));
+    }
+    Ok(())
+}
+
+/// A filter frame's bytes (not its frame) read: whether it replaces the filters before it,
+/// the epoch it covers, and the filter.
+fn parse_filter(bytes: &[u8]) -> Result<(bool, u64, Fuse8), String> {
+    let mut reader = Reader::new(bytes);
+    read_header(&mut reader)?;
+    let which = reader.u8().map_err(truncated)?;
+    if which != FILTER {
+        // alloc: an error path.
+        return Err(format!("an answer {which} where a filter was read"));
+    }
+    let replaces = match reader.u8().map_err(truncated)? {
+        0 => false,
+        1 => true,
+        // alloc: an error path.
+        other => return Err(format!("a filter that neither adds (0) nor replaces (1) but says {other}")),
+    };
+    let epoch = reader.u64().map_err(truncated)?;
+    // alloc: an error path.
+    let filter = Fuse8::decode(reader.take_rest()).map_err(|why| format!("a filter that {why}"))?;
+    Ok((replaces, epoch, filter))
+}
+
+/// The filter frame of `filter`, covering `epoch`.
+fn filter_frame(replaces: bool, epoch: u64, filter: &Fuse8) -> Vec<u8> {
+    // alloc: a filter's frame, once per batch of the store a laptop reads, shared by its peers
+    let mut out = Vec::with_capacity(8 + FILTER_HEADER + filter.encoded_len());
+    write_frame(&mut out, |out| {
+        out.extend_from_slice(&header(ANSWER_MAGIC));
+        out.push(FILTER);
+        out.push(u8::from(replaces));
+        out.put_u64(epoch);
+        filter.encode(out);
+    });
+    out
+}
+
+/// What a filter holds of `key`: its first word, which is uniform since a key is a hash.
+fn word(key: &Key) -> u64 {
+    u64::from_le_bytes(*key.0.0.first_chunk().expect("a key is 32 bytes"))
+}
+
+/// The filter of `keys`, in a frame.
+fn filter_of(replaces: bool, epoch: u64, keys: &[Key]) -> Vec<u8> {
+    // alloc: a filter's keys, once per filter built
+    filter_frame(replaces, epoch, &Fuse8::of(keys.iter().map(word).collect()))
 }
 
 fn header(magic: &[u8; 6]) -> [u8; 8] {
@@ -297,6 +365,11 @@ pub struct Client {
     again: Vec<(Key, Tag)>,
     /// Connects given up while in flight: a connection one of them makes is hung up.
     abandoned: Vec<Tag>,
+    /// What the server's store holds: its last full filter and the deltas since, kept across
+    /// connections (a store only gains keys). A key none may hold is `Missing` without asking.
+    filters: Vec<Fuse8>,
+    /// The [`Store::epoch`] the filters cover; `None` until the first comes.
+    epoch: Option<u64>,
 }
 
 enum Link {
@@ -338,12 +411,26 @@ impl Client {
             again: Vec::new(),
             // alloc: empty, allocates nothing; once per client, setup.
             abandoned: Vec::new(),
+            // alloc: empty, allocates nothing; once per client, setup.
+            filters: Vec::new(),
+            epoch: None,
         }
     }
 
     /// Whether `tag` is one it asks with, so its completion goes to [`Client::complete`].
     pub fn owns(&self, tag: Tag) -> bool {
         self.tags.owns(tag)
+    }
+
+    /// The epoch of the server's store its filters cover, once one has come.
+    pub fn epoch(&self) -> Option<u64> {
+        self.epoch
+    }
+
+    /// Whether the server's store may hold `key`, as its filters say: true with no filter yet.
+    pub fn may_hold(&self, key: &Key) -> bool {
+        let word = word(key);
+        self.epoch.is_none() || self.filters.iter().any(|filter| filter.contains(word))
     }
 
     /// Takes a completion of its own, and appends to `answers` the answers to fetches: each a
@@ -468,7 +555,8 @@ impl Client {
         }
     }
 
-    /// Sends what is unsent and receives while answers are owed, one of each in flight.
+    /// Sends what is unsent and receives while connected, for answers and the filters the
+    /// server sends unasked, one of each in flight.
     fn pump(&mut self, effects: &mut Vec<Effect>) {
         let Link::Up(up) = &mut self.link else { return };
         if up.sending.is_none() && !self.out.is_empty() {
@@ -476,7 +564,7 @@ impl Client {
             up.sending = Some(tag);
             effects.push(Effect::Send { conn: up.conn, bytes: std::mem::take(&mut self.out), tag });
         }
-        if up.recv.is_none() && !self.waiting.is_empty() {
+        if up.recv.is_none() {
             let tag = self.tags.next();
             up.recv = Some(tag);
             let most = owed(&up.buffer).clamp(CLIENT_RECV, CLIENT_RECV_MOST);
@@ -504,6 +592,21 @@ impl Client {
             let end = 8 + len as usize;
             if rest.len() < end {
                 break Ok(());
+            }
+            if end > 16 && rest[16] == FILTER {
+                match parse_filter(&rest[8..end]) {
+                    Ok((replaces, epoch, filter)) => {
+                        if replaces {
+                            self.filters.clear();
+                        }
+                        self.filters.push(filter);
+                        self.epoch = Some(epoch);
+                        start += end;
+                        continue;
+                    }
+                    // alloc: an error path.
+                    Err(why) => break Err(format!("a malformed filter: {why}")),
+                }
             }
             let key = match parse(&rest[8..end]) {
                 Ok(parsed) => parsed.key(),
@@ -570,13 +673,17 @@ impl Client {
 }
 
 impl Remote for Client {
-    /// Connects first if it has no connection, then asks: in the send still in `effects` when
+    /// [`Asked::Missing`] for a key the server's filters say its store does not hold. Else
+    /// connects first if it has no connection, then asks: in the send still in `effects` when
     /// there is one, so a turn of fetches is one send. A key already waiting is not asked again.
-    fn fetch(&mut self, key: &Key, tag: Tag, effects: &mut Vec<Effect>) {
+    fn fetch(&mut self, key: &Key, tag: Tag, effects: &mut Vec<Effect>) -> Asked {
+        if !self.may_hold(key) {
+            return Asked::Missing;
+        }
         match self.waiting.entry(*key) {
             hash_map::Entry::Occupied(_) => {
                 self.again.push((*key, tag));
-                return;
+                return Asked::Sent;
             }
             hash_map::Entry::Vacant(slot) => {
                 slot.insert(tag);
@@ -605,6 +712,7 @@ impl Remote for Client {
                 self.pump(effects);
             }
         }
+        Asked::Sent
     }
 }
 
@@ -620,6 +728,13 @@ pub struct Server {
     peers: FxHashMap<Conn, Peer>,
     /// The connection of each send and receive in flight.
     ops: FxHashMap<Tag, Conn>,
+    /// The frames of the filter of its store a peer is sent when it connects: a full one, then
+    /// the deltas since. Empty until the first peer.
+    filters: Vec<Vec<u8>>,
+    /// Keys the full filter was built of.
+    full_keys: usize,
+    /// Keys the deltas since were built of.
+    delta_keys: usize,
 }
 
 #[derive(Default)]
@@ -663,7 +778,54 @@ impl Server {
             failed: None,
             peers: FxHashMap::default(),
             ops: FxHashMap::default(),
+            // alloc: empty, allocates nothing; once per server, setup.
+            filters: Vec::new(),
+            full_keys: 0,
+            delta_keys: 0,
         })
+    }
+
+    /// Sends every peer a filter of the keys `store`'s batches put since the last call: a
+    /// delta, or a full filter again once the deltas pass a quarter of the full one's keys or
+    /// [`FILTER_DELTAS`] of them. The daemon calls it once before serving, which has the store
+    /// watch its keys (a peer of a store that does not is refused), then after each batch.
+    pub fn refresh(&mut self, store: &mut Store, effects: &mut Vec<Effect>) {
+        store.watch_keys();
+        let (epoch, keys) = store.new_keys();
+        // Before the first peer, the full filter it is sent will hold these.
+        if self.filters.is_empty() || keys.is_empty() {
+            return;
+        }
+        self.delta_keys += keys.len();
+        let frame = if self.filters.len() > FILTER_DELTAS || 4 * self.delta_keys > self.full_keys {
+            self.rebuild(store);
+            // clone: the full filter kept for the next peer and sent now; once per rebuild
+            self.filters[0].clone()
+        } else {
+            let frame = filter_of(false, epoch, &keys);
+            // clone: the delta kept for the next peer and sent now; once per batch
+            self.filters.push(frame.clone());
+            frame
+        };
+        // alloc: once per batch, the peers sent the filter, in connection order.
+        let mut conns: Vec<Conn> = self.peers.keys().copied().collect();
+        radix::sort_copy_by_key(&mut conns, |it| it.0);
+        for conn in conns {
+            let peer = self.peers.get_mut(&conn).expect("a peer listed just now");
+            peer.queued += frame.len();
+            // clone: each peer's send owns its frame; once per peer a batch
+            peer.out.push_back(frame.clone());
+            self.pump(conn, effects);
+        }
+    }
+
+    /// Builds the full filter of `store` again, in place of the one and the deltas before.
+    fn rebuild(&mut self, store: &Store) {
+        let keys = store.keys();
+        self.full_keys = keys.len();
+        self.delta_keys = 0;
+        self.filters.clear();
+        self.filters.push(filter_of(true, store.epoch(), &keys));
     }
 
     /// Asks to listen.
@@ -704,7 +866,27 @@ impl Server {
         if self.listen == Some(tag) {
             match done {
                 Done::Accepted { conn } => {
-                    self.peers.insert(conn, Peer::default());
+                    if !store.watching_keys() {
+                        effects.push(Effect::Hangup { conn, tag: self.tags.next() });
+                        self.stop(effects);
+                        // alloc: an error path.
+                        self.failed = Some(IoError(format!(
+                            "the store served at {} as the remote store does not watch its keys \
+                             (Server::refresh before serving), so its filter would hide what is put",
+                            self.at
+                        )));
+                        return corrupt;
+                    }
+                    if self.filters.is_empty() {
+                        self.rebuild(store);
+                    }
+                    let mut peer = Peer::default();
+                    for frame in &self.filters {
+                        peer.queued += frame.len();
+                        // clone: the peer's sends own their frames; once per filter a connection
+                        peer.out.push_back(frame.clone());
+                    }
+                    self.peers.insert(conn, peer);
                     self.pump(conn, effects);
                 }
                 Done::Failed(error) => {
@@ -925,22 +1107,38 @@ mod tests {
         answers
     }
 
-    /// An open store holding `values`.
+    /// An open store holding `values`, watching its keys for a server's filters.
     fn stored(values: &[(&str, Kind, &[u8])]) -> Store {
-        let mut sim = Sim::new(7, Faults::default());
+        opened(Sim::new(7, Faults::default()), values).1
+    }
+
+    /// [`stored`] in `sim`, kept for the test to commit puts in.
+    fn opened(mut sim: Sim, values: &[(&str, Kind, &[u8])]) -> (Sim, Store) {
         let mut effects = Vec::new();
         let config =
             Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0 };
         let mut store = Store::open(config, &mut effects);
-        run_until_idle(&mut sim, &mut effects, |completion, effects| {
-            assert!(store.owns(completion.tag));
-            store.complete(completion, effects);
-        });
+        drive(&mut sim, &mut store, &mut effects);
         assert!(store.ready());
+        store.watch_keys();
         for (name, kind, bytes) in values {
             store.put(key(name), *kind, bytes.to_vec()).unwrap();
         }
-        store
+        (sim, store)
+    }
+
+    fn drive(sim: &mut Sim, store: &mut Store, effects: &mut Vec<Effect>) {
+        run_until_idle(sim, effects, |completion, effects| {
+            assert!(store.owns(completion.tag));
+            store.complete(completion, effects);
+        });
+    }
+
+    /// Commits what was put, so its batch's keys are new keys.
+    fn commit(sim: &mut Sim, store: &mut Store) {
+        let mut effects = Vec::new();
+        store.flush(&mut effects);
+        drive(sim, store, &mut effects);
     }
 
     /// What `client.complete` appends.
@@ -989,6 +1187,8 @@ mod tests {
         hold: [bool; 2],
         answers: Vec<Completion>,
         corrupt: Vec<Corrupt>,
+        /// Fetches the client answered `Missing` itself, by its filters.
+        filtered: Vec<Tag>,
     }
 
     impl Net {
@@ -996,10 +1196,10 @@ mod tests {
             let mut server = Server::new(socket(), SERVER).unwrap();
             let mut server_effects = Vec::new();
             server.start(&mut server_effects);
-            Net {
+            let mut net = Net {
                 client: Client::new(socket(), CLIENT),
                 server,
-                effects: [Vec::new(), server_effects],
+                effects: [Vec::new(), Vec::new()],
                 inbox: [VecDeque::new(), VecDeque::new()],
                 listen: None,
                 links: Vec::new(),
@@ -1007,11 +1207,27 @@ mod tests {
                 hold: [false; 2],
                 answers: Vec::new(),
                 corrupt: Vec::new(),
+                filtered: Vec::new(),
+            };
+            // The server listens before the test's first fetch connects, as a daemon's does
+            // before any client starts.
+            for effect in server_effects {
+                net.effect(S, effect);
             }
+            net
         }
 
+        /// A fetch the client answers `Missing` itself is answered as the store would read it.
         fn fetch(&mut self, name: &str, tag: u64) {
-            self.client.fetch(&key(name), Tag(tag), &mut self.effects[C]);
+            self.fetch_key(&key(name), Tag(tag));
+        }
+
+        fn fetch_key(&mut self, key: &Key, tag: Tag) {
+            if self.client.fetch(key, tag, &mut self.effects[C]) == Asked::Missing {
+                self.filtered.push(tag);
+                let frame = Answer::Missing { key: *key }.encode_framed();
+                self.answers.push(Completion { tag, done: Done::Read(frame) });
+            }
         }
 
         fn run(&mut self, store: &Store) {
@@ -1446,7 +1662,8 @@ mod tests {
         assert_eq!(answers, vec![Completion { tag: Tag(0), done: Done::Read(frame.clone()) }]);
         let Done::Read(handed) = &answers[0].done else { panic!("{answers:?}") };
         assert_eq!(handed.as_ptr(), buffer, "the frame is handed on without a copy");
-        assert!(effects.is_empty(), "nothing is owed, so nothing is received");
+        let [Effect::Recv { most, .. }] = effects[..] else { panic!("it receives on for filters: {effects:?}") };
+        assert_eq!(most, CLIENT_RECV, "nothing is owed, so the least is asked");
 
         assert_eq!(owed(&(LONGEST_FRAME + 1).to_le_bytes()), 0);
 
@@ -1599,10 +1816,11 @@ mod tests {
             answers,
             [Tag(0), Tag(5)].map(|tag| Completion { tag, done: Done::Read(frame.clone()) })
         );
-        assert!(effects.is_empty(), "nothing is owed, so nothing is received");
+        assert!(matches!(effects[..], [Effect::Recv { .. }]), "it receives on for filters: {effects:?}");
     }
 
-    /// A started server that has accepted `conns`, and the tag of each one's receive.
+    /// A started server that has accepted `conns` and sent each its filter, and the tag of
+    /// each one's receive.
     fn serving(conns: &[Conn]) -> (Server, Vec<Effect>, Vec<Tag>) {
         let mut server = Server::new(socket(), SERVER).unwrap();
         let mut effects = Vec::new();
@@ -1615,6 +1833,13 @@ mod tests {
             let accepted = Completion { tag: listen, done: Done::Accepted { conn: *conn } };
             assert!(server.complete(accepted, &store, &mut effects).is_empty());
             recvs.push(effect_on(&effects, *conn, true).unwrap());
+            let (replaces, epoch, _) = parse_filter(&sent_on(&effects, *conn).unwrap()[8..]).unwrap();
+            assert!(replaces && epoch == store.epoch(), "a full filter first");
+            let send = effect_on(&effects, *conn, false).unwrap();
+            effects.clear();
+            let sent = Completion { tag: send, done: Done::Sent(Vec::new()) };
+            assert!(server.complete(sent, &store, &mut effects).is_empty());
+            assert!(effects.is_empty(), "{effects:?}");
         }
         effects.clear();
         (server, effects, recvs)
@@ -1750,5 +1975,144 @@ mod tests {
         assert!(client.owns(Tag(CLIENT + u64::from(u32::MAX))));
         assert!(!client.owns(Tag(CLIENT - 1)));
         assert!(!client.owns(Tag(SERVER)));
+    }
+
+    #[test]
+    fn a_miss_the_filter_rules_out_is_answered_without_asking() {
+        let store = stored(&[("a", Kind::Code, b"the code of a".as_slice())]);
+        let mut net = Net::new(usize::MAX);
+        net.fetch("a", 0);
+        net.run(&store);
+        assert_eq!(net.client.epoch(), Some(store.epoch()));
+        assert!(net.client.may_hold(&key("a")));
+
+        let names: Vec<String> = (0..200).map(|n| format!("absent {n}")).collect();
+        for (n, name) in names.iter().enumerate() {
+            net.fetch(name, 1 + n as u64);
+        }
+        let asked = net.client.waiting.len();
+        net.run(&store);
+        assert_eq!(net.answers.len(), 1 + names.len());
+        for completion in &net.answers[1..] {
+            assert!(matches!(answer(completion), Answer::Missing { .. }), "{completion:?}");
+        }
+        assert_eq!(net.filtered.len() + asked, names.len());
+        assert!(asked <= 8, "{asked} of {} misses asked", names.len());
+        assert_eq!(net.links.len(), 1);
+    }
+
+    #[test]
+    fn a_delta_brings_what_a_batch_put_and_a_full_filter_replaces_the_deltas() {
+        let (mut sim, mut store) = opened(Sim::new(8, Faults::default()), &[("a", Kind::Code, b"a".as_slice())]);
+        commit(&mut sim, &mut store);
+        let mut net = Net::new(usize::MAX);
+        net.server.refresh(&mut store, &mut net.effects[S]);
+        net.fetch("a", 0);
+        net.run(&store);
+        assert_eq!(net.client.filters.len(), 1);
+        let (mut deltas, mut fulls) = (false, false);
+        for n in 0..40u64 {
+            let name = format!("later {n}");
+            store.put(key(&name), Kind::Run, name.clone().into_bytes()).unwrap();
+            commit(&mut sim, &mut store);
+            let before = net.client.filters.len();
+            net.server.refresh(&mut store, &mut net.effects[S]);
+            net.run(&store);
+            let after = net.client.filters.len();
+            deltas |= after == before + 1;
+            fulls |= after == 1;
+            assert_eq!(net.client.epoch(), Some(store.epoch()));
+            assert!(net.client.may_hold(&key(&name)), "{name} hidden");
+            assert!(after <= FILTER_DELTAS + 1);
+
+            net.fetch(&name, 100 + n);
+            net.run(&store);
+            let last = net.answers.last().unwrap();
+            assert_eq!(last.tag, Tag(100 + n));
+            assert_eq!(answer(last), Answer::of(&store, &key(&name)).unwrap());
+        }
+        assert!(deltas && fulls, "both deltas and full filters were sent");
+        assert!(net.filtered.is_empty());
+        assert_eq!(net.links.len(), 1);
+    }
+
+    /// The model: whatever batches the server's store puts, however its deltas and full filters
+    /// fall, the client's filters never hide a key the epoch they cover holds.
+    #[hegel::test]
+    fn a_filter_never_hides_a_key_it_covers(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let first: Vec<u16> = tc.draw(gs::vecs(gs::integers()).max_size(60));
+        let batches: Vec<Vec<u16>> = tc.draw(gs::vecs(gs::vecs(gs::integers()).max_size(30)).max_size(24));
+        let name = |n: u16| format!("model {n}");
+        let put = |store: &mut Store, n: u16| {
+            store.put(key(&name(n)), Kind::Code, n.to_le_bytes().to_vec()).unwrap();
+        };
+        let (mut sim, mut store) = opened(Sim::new(9, Faults::default()), &[]);
+        for &n in &first {
+            put(&mut store, n);
+        }
+        commit(&mut sim, &mut store);
+        let mut net = Net::new(usize::MAX);
+        net.server.refresh(&mut store, &mut net.effects[S]);
+        net.fetch("a probe", 0);
+        net.run(&store);
+        let mut covered: Vec<u16> = first;
+        for batch in batches {
+            for (at, &n) in covered.iter().enumerate() {
+                assert!(net.client.may_hold(&key(&name(n))), "{n}, put {at}th, hidden");
+            }
+            for &n in &batch {
+                put(&mut store, n);
+            }
+            commit(&mut sim, &mut store);
+            net.server.refresh(&mut store, &mut net.effects[S]);
+            net.run(&store);
+            covered.extend(batch);
+            assert!(net.client.epoch() <= Some(store.epoch()));
+            assert!(net.client.filters.len() <= FILTER_DELTAS + 1);
+        }
+        for &n in &covered {
+            assert!(net.client.may_hold(&key(&name(n))), "{n} hidden");
+        }
+    }
+
+    #[test]
+    fn a_server_of_a_store_that_does_not_watch_its_keys_stops_and_says_why() {
+        let mut sim = Sim::new(7, Faults::default());
+        let mut effects = Vec::new();
+        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 0 };
+        let mut store = Store::open(config, &mut effects);
+        drive(&mut sim, &mut store, &mut effects);
+        assert!(!store.watching_keys());
+        let mut net = Net::new(usize::MAX);
+        net.fetch("a", 1);
+        net.run(&store);
+        let failed = net.server.failed().unwrap();
+        assert!(failed.0.contains("does not watch its keys"), "{failed:?}");
+        assert_eq!(net.answers.len(), 1);
+        assert!(failure(&net.answers[0]).contains("hung up"), "{:?}", net.answers[0]);
+    }
+
+    #[test]
+    fn a_client_takes_a_filter_and_refuses_a_malformed_one() {
+        let frame = filter_of(true, 3, &[key("a")]);
+        let conn = Conn(14);
+        let (mut client, mut effects, recv) = connected(&["b"], conn);
+        let mut bad = frame.clone();
+        bad[17] = 9;
+        let answers = completed(&mut client, Completion { tag: recv, done: Done::Read(bad) }, &mut effects);
+        assert_eq!(answers.len(), 1);
+        assert!(failure(&answers[0]).contains("malformed filter"), "{answers:?}");
+        assert!(hung_up(&effects, conn));
+
+        let (mut client, mut effects, recv) = connected(&["b"], Conn(15));
+        assert!(completed(&mut client, Completion { tag: recv, done: Done::Read(frame) }, &mut effects).is_empty());
+        assert_eq!(client.epoch(), Some(3));
+        assert!(client.may_hold(&key("a")));
+        assert!(client.waiting.contains_key(&key("b")), "a fetch asked before is still answered");
+        let absent = (0..).map(|n| key(&format!("c{n}"))).find(|it| !client.may_hold(it)).unwrap();
+        effects.clear();
+        assert_eq!(client.fetch(&absent, Tag(7), &mut effects), Asked::Missing);
+        assert!(effects.is_empty() && client.out.is_empty(), "nothing is asked");
     }
 }

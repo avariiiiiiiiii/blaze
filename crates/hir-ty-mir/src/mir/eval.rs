@@ -34,7 +34,6 @@ use rustc_type_ir::{
     AliasTyKind,
     inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _},
 };
-use stdx::never;
 use triomphe::Arc;
 use blaze_hashcons::Interned;
 
@@ -2278,8 +2277,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     }
                 } else {
                     let is_signed = matches!(ty.kind(), TyKind::Int(_));
-                    let l128 = IntValue::from_bytes(lc, is_signed);
-                    let r128 = IntValue::from_bytes(rc, is_signed);
+                    let l128 = IntValue::from_bytes(lc, is_signed)?;
+                    let r128 = IntValue::from_bytes(rc, is_signed)?;
                     match op {
                         BinOp::Ge | BinOp::Gt | BinOp::Le | BinOp::Lt | BinOp::Eq | BinOp::Ne => {
                             let r = op.run_compare(l128, r128) as u8;
@@ -2902,20 +2901,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         &mut self,
         it: VariantId,
         subst: GenericArgs<'db>,
-        locals: &Locals<'db>,
+        _locals: &Locals<'db>,
     ) -> Result<'db, (usize, VariantLayout, Option<(usize, usize, i128)>)> {
         let adt = it.adt_id(self.db);
-        if let Some(f) = locals.body.owner.as_variant()
-            && let VariantId::EnumVariantId(it) = it
-            && let AdtId::EnumId(e) = adt
-            && f.lookup(self.db).parent == e
-        {
-            // Computing the exact size of enums require resolving the enum discriminants. In order to prevent loops (and
-            // infinite sized type errors) we use a dummy layout
-            let i = self.const_eval_discriminant(it)?;
-            let layout = self.layout(Ty::new_empty_tuple(self.interner()))?;
-            return Ok((16, VariantLayout::Shared(layout), Some((0, 16, i))));
-        }
         let layout = self.layout_adt(adt, subst)?;
         Ok(match &layout.variants {
             Variants::Single { .. } | Variants::Empty => {
@@ -3421,7 +3409,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let mark = self.stack.len();
         let result = self.interpret_mir(body, iter::empty(), None)?;
         let ty = body.locals[return_slot()].ty.as_ref();
-        let align = self.size_align_of(ty, locals)?.map_or(1, |it| it.1);
+        let align = self.size_align_of_sized(ty, locals, "the value of a constant")?.1;
         let addr = self.heap_allocate(result.size, align)?;
         let interval = Interval::new(addr, result.size);
         interval.write_from_interval(self, result)?;
@@ -3439,7 +3427,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         mutability: Mutability,
     ) -> Result<'db, Interval> {
         let (size, align) =
-            self.size_align_of(allocation.ty, locals)?.unwrap_or((allocation.memory.len(), 1));
+            self.size_align_of_sized(allocation.ty, locals, "the value of a constant")?;
         let addr = self.heap_allocate(size, align)?;
         self.write_allocation(locals, allocation, addr, size, mutability)?;
         let value = Interval::new(addr, size);
@@ -3887,20 +3875,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn size_align_of(
         &self,
         ty: Ty<'db>,
-        locals: &Locals<'db>,
+        _locals: &Locals<'db>,
     ) -> Result<'db, Option<(usize, usize)>> {
         if let Some(layout) = self.layout_cache.borrow().get(&ty) {
             return Ok(layout
                 .is_sized()
                 .then(|| (layout.size.bytes_usize(), layout.align.bytes() as usize)));
-        }
-        if let Some(f) = locals.body.owner.as_variant()
-            && let Some((AdtId::EnumId(e), _)) = ty.as_adt()
-            && f.lookup(self.db).parent == e
-        {
-            // Computing the exact size of enums require resolving the enum discriminants. In order to prevent loops (and
-            // infinite sized type errors) we use a dummy size
-            return Ok(Some((16, 16)));
         }
         let layout = self.layout(ty);
         if self.assert_placeholder_ty_is_unused
@@ -5245,7 +5225,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 MirEvalError::ConstEvalError(static_data.name.as_str().to_owned(), Box::new(e))
             })?;
             let (size, align) =
-                self.size_align_of(allocation.ty, locals)?.unwrap_or((allocation.memory.len(), 1));
+                self.size_align_of_sized(allocation.ty, locals, "the value of a static")?;
             let memory = self.heap_allocate(size, align)?;
             let location = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
             self.write_pointer(location, memory)?;
@@ -5275,7 +5255,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 MirEvalError::ConstEvalError(static_data.name.as_str().to_owned(), Box::new(e))
             })?;
             let (size, align) =
-                self.size_align_of(allocation.ty, locals)?.unwrap_or((allocation.memory.len(), 1));
+                self.size_align_of_sized(allocation.ty, locals, "the value of a static")?;
             let result = Interval::new(self.heap_allocate(size, align)?, size);
             // Known before its value is written: what it points to may point back at it.
             let location = self.locate_static(st, result.addr)?;
@@ -5803,8 +5783,8 @@ macro_rules! unchecked_int_op {
 }
 
 impl IntValue {
-    fn from_bytes(bytes: &[u8], is_signed: bool) -> Self {
-        match (bytes.len(), is_signed) {
+    fn from_bytes<'db>(bytes: &[u8], is_signed: bool) -> Result<'db, Self> {
+        Ok(match (bytes.len(), is_signed) {
             (1, false) => Self::U8(u8::from_le_bytes(bytes.try_into().unwrap())),
             (1, true) => Self::I8(i8::from_le_bytes(bytes.try_into().unwrap())),
             (2, false) => Self::U16(u16::from_le_bytes(bytes.try_into().unwrap())),
@@ -5816,10 +5796,12 @@ impl IntValue {
             (16, false) => Self::U128(u128::from_le_bytes(bytes.try_into().unwrap())),
             (16, true) => Self::I128(i128::from_le_bytes(bytes.try_into().unwrap())),
             (len, is_signed) => {
-                never!("invalid integer size: {len}, signed: {is_signed}");
-                Self::I32(0)
+                // alloc: error path
+                return Err(MirEvalError::InternalError(
+                    format!("an integer operand of {len} bytes, signed: {is_signed}").into(),
+                ));
             }
-        }
+        })
     }
 
     fn to_bytes(self) -> OwnedBytes {

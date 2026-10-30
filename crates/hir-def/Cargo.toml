@@ -18,8 +18,8 @@ doctest = false
 [dependencies]
 arrayvec.workspace = true
 bitflags.workspace = true
-cov-mark = "2.0.0"
-drop_bomb = "0.1.5"
+cov-mark.workspace = true
+drop_bomb.workspace = true
 either.workspace = true
 hashbrown.workspace = true
 indexmap.workspace = true
@@ -29,7 +29,7 @@ rustc-hash.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
 smallvec.workspace = true
 triomphe.workspace = true
-rustc_apfloat = "0.2.3"
+rustc_apfloat.workspace = true
 salsa.workspace = true
 
 ra-ap-rustc_parse_format.workspace = true
@@ -61,7 +61,7 @@ unicode-ident.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 expect-test.workspace = true
-fst = { version = "0.4.7", default-features = false }
+fst.workspace = true
 hegeltest.workspace = true
 
 # local deps

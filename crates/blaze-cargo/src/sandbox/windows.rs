@@ -472,21 +472,15 @@ fn failed_with(what: impl Display, call: &str, code: i32) -> String {
 /// The run's temporary directory, which the program sees as TMP and TEMP: named by what the spec
 /// is, so the same spec sees the same path.
 fn temporary(spec: &Spec) -> Result<PathBuf, String> {
-    use sha2::Digest as _;
     // alloc: the error, once, and nothing runs.
     let bytes = serde_json::to_vec(spec).map_err(|error| format!("the spec: {error}"))?;
-    let digest = sha2::Sha256::digest(&bytes);
+    let digest = blaze_ids::b3::hash(&bytes);
     let mut name = String::with_capacity(16);
     for byte in &digest[..8] {
         _ = write!(name, "{byte:02x}");
     }
     // alloc: once per sandbox, its temporary directory's path.
     Ok(std::env::temp_dir().join(format!("blaze-sandbox-{name}")))
-}
-
-fn random(what: &str) -> Result<u64, String> {
-    // alloc: the error, once, and the sandbox stops.
-    getrandom::u64().map_err(|error| format!("random bytes for {what}: {error}"))
 }
 
 /// `text` as UTF-16 ending in NUL, or why not when it has a NUL of its own.
@@ -593,9 +587,8 @@ struct Capability {
 
 impl Capability {
     fn new() -> Result<Capability, String> {
-        let what = "the run's capability";
         // alloc: once per sandbox, the name its capability is derived from.
-        let name = literal(&format!("blaze.sandbox.run.{:016x}{:016x}", random(what)?, random(what)?));
+        let name = literal(&format!("blaze.sandbox.run.{:032x}", std::random::random::<u128>(..)));
         let mut it = Capability { groups: null_mut(), group_count: 0, sids: null_mut(), count: 0 };
         // SAFETY: `name` ends in NUL (`literal`) and lives in this frame; the four out-pointers
         // are live fields of `it`, and the lists the call makes there are freed only by

@@ -31,7 +31,7 @@ mod tests {
 fn an_error_in_a_module_file_is_the_crates() {
     let checked = checked(
         r#"
-//- /main.rs crate:main
+//- /main.rs crate:other:main
 mod a;
 fn main() {}
 //- /a.rs
@@ -50,7 +50,7 @@ pub fn f() -> S {
 fn an_error_leaves_out_the_late_lints() {
     let checked = checked(
         r#"
-//- /main.rs crate:main
+//- /main.rs crate:other:main
 struct S { a: u32 }
 fn unused() {}
 fn main() {
@@ -69,7 +69,7 @@ fn main() {
 fn without_errors_the_late_lints_are_given() {
     let checked = checked(
         r#"
-//- /main.rs crate:main
+//- /main.rs crate:other:main
 fn unused() {}
 fn main() {}
 "#,

@@ -47,7 +47,7 @@ use crate::{
         uses,
     },
     per_ns::{Item, PerNs},
-    visibility::{RawVisibility, Visibility},
+    visibility::{RawVisibility, Visibility, VisibilityError},
 };
 
 use self::imports::{
@@ -763,7 +763,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
         module: ModuleId,
         visibility: &RawVisibility,
         import: &ModPath,
-    ) -> Option<Visibility> {
+    ) -> Result<Visibility, VisibilityError> {
         let db = self.db;
         let vis = match visibility {
             RawVisibility::Module(path, explicitness) => {
@@ -789,13 +789,20 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     &mut reads,
                 );
                 if result.segment_index.is_some() {
-                    return None;
+                    return Err(VisibilityError::Unresolved);
                 }
-                let mut vis = match result.resolved_def.take_types()? {
-                    ModuleDefId::ModuleId(m) => Visibility::Module(m, *explicitness),
-                    // error: visibility needs to refer to module
-                    _ => return None,
+                let m = match result.resolved_def.take_types().ok_or(VisibilityError::Unresolved)? {
+                    ModuleDefId::ModuleId(m) => m,
+                    found => return Err(VisibilityError::NotAModule { found }),
                 };
+                if !Visibility::Module(m, *explicitness).is_visible_from_def_map(
+                    db,
+                    &self.def_map,
+                    module,
+                ) {
+                    return Err(VisibilityError::NotAncestor { module: m });
+                }
+                let mut vis = Visibility::Module(m, *explicitness);
 
                 // In block expressions, `self` normally refers to the containing non-block module, and
                 // `super` to its parent (etc.). However, visibilities must only refer to a module in the
@@ -811,7 +818,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             RawVisibility::Public => Visibility::Public,
             RawVisibility::PubCrate => Visibility::PubCrate(self.def_map.krate),
         };
-        Some(vis)
+        Ok(vis)
     }
 
     fn record_resolved_import(&mut self, at: u32) {

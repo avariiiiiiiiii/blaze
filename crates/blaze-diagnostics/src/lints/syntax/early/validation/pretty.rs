@@ -379,10 +379,10 @@ impl Printer<'_> {
     /// `colons_before_params` prints `::<..>` (in an expression) rather than `<..>`.
     fn path(&mut self, path: ast::Path<'_>, colons_before_params: bool) {
         for (i, segment) in path.segments().enumerate() {
-            if let Some(anchor) = segment.type_anchor() {
+            if let Some(ast::PathSegmentKind::Type { type_ref, trait_ref }) = segment.kind() {
                 self.word("<");
-                self.opt_ty(anchor.ty());
-                if let Some(trait_) = anchor.path_type().and_then(|it| it.path()) {
+                self.opt_ty(type_ref);
+                if let Some(trait_) = trait_ref.and_then(|it| it.path()) {
                     self.word(" as ");
                     self.path(trait_, false);
                 }

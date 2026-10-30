@@ -30,6 +30,7 @@ pub mod b3;
 pub mod bits;
 #[allow(unsafe_code)]
 pub mod crc32c;
+pub mod fuse;
 mod many;
 pub mod names;
 pub mod prehashed;

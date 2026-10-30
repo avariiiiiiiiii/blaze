@@ -116,10 +116,10 @@ fn seeds() -> Vec<Vec<u8>> {
 }
 
 fn named() -> Vec<(&'static str, Vec<u8>)> {
-    let code = pe::IMPORT_OBJECT_CODE | (pe::IMPORT_OBJECT_NAME << 2);
-    let data = pe::IMPORT_OBJECT_DATA | (pe::IMPORT_OBJECT_NAME_UNDECORATE << 2);
-    let ordinal = pe::IMPORT_OBJECT_CODE | (pe::IMPORT_OBJECT_ORDINAL << 2);
-    let export_as = pe::IMPORT_OBJECT_CODE | (pe::IMPORT_OBJECT_NAME_EXPORTAS << 2);
+    let code = pe::IMPORT_OBJECT_CODE.0 | (pe::IMPORT_OBJECT_NAME.0 << 2);
+    let data = pe::IMPORT_OBJECT_DATA.0 | (pe::IMPORT_OBJECT_NAME_UNDECORATE.0 << 2);
+    let ordinal = pe::IMPORT_OBJECT_CODE.0 | (pe::IMPORT_OBJECT_ORDINAL.0 << 2);
+    let export_as = pe::IMPORT_OBJECT_CODE.0 | (pe::IMPORT_OBJECT_NAME_EXPORTAS.0 << 2);
     vec![
         ("an object of every section kind and relocation read", object()),
         ("an object of one function", minimal()),
@@ -219,7 +219,7 @@ fn minimal() -> Vec<u8> {
 fn short_import(types: u16, hint: u16, strings: &[&str]) -> Vec<u8> {
     let strings: Vec<u8> = strings.iter().flat_map(|it| it.bytes().chain([0])).collect();
     let mut out = Vec::new();
-    for value in [pe::IMAGE_FILE_MACHINE_UNKNOWN, 0xffff, 0, pe::IMAGE_FILE_MACHINE_AMD64] {
+    for value in [pe::IMAGE_FILE_MACHINE_UNKNOWN.0, 0xffff, 0, pe::IMAGE_FILE_MACHINE_AMD64.0] {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out.extend_from_slice(&0u32.to_le_bytes());

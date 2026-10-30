@@ -39,7 +39,7 @@ use crate::{
     signatures::ImplSignature,
     src::HasSource,
     type_ref::LifetimeRef,
-    visibility::{RawVisibility, Visibility},
+    visibility::{RawVisibility, Visibility, VisibilityError},
 };
 
 /// What [`Resolver::names_in_scope`] returns: each name with its meanings, innermost first.
@@ -360,7 +360,7 @@ impl<'db> Resolver<'db> {
         &self,
         db: &Db,
         visibility: &RawVisibility,
-    ) -> Option<Visibility> {
+    ) -> Result<Visibility, VisibilityError> {
         match visibility {
             RawVisibility::Module(_, _) => {
                 let (item_map, item_local_map, module) = self.item_scope_();
@@ -375,10 +375,10 @@ impl<'db> Resolver<'db> {
                 )
             }
             RawVisibility::PubSelf(explicitness) => {
-                Some(Visibility::Module(self.module(), *explicitness))
+                Ok(Visibility::Module(self.module(), *explicitness))
             }
-            RawVisibility::PubCrate => Some(Visibility::PubCrate(self.krate())),
-            RawVisibility::Public => Some(Visibility::Public),
+            RawVisibility::PubCrate => Ok(Visibility::PubCrate(self.krate())),
+            RawVisibility::Public => Ok(Visibility::Public),
         }
     }
 

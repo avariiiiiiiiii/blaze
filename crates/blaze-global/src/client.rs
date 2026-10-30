@@ -823,12 +823,13 @@ fn fetched(
 impl<C: Channels> Remote for Client<C> {
     /// Only for a key [`Client::fetch`] is asking for, or one a verified manifest lists: the
     /// cache is asked for nothing that was not shown public.
-    fn fetch(&mut self, key: &Key, tag: Tag, effects: &mut Vec<Effect>) {
+    fn fetch(&mut self, key: &Key, tag: Tag, effects: &mut Vec<Effect>) -> blaze_cas::Asked {
         let allowed = self.allowed == Some(*key) || self.listed.contains_key(key);
         assert!(allowed, "the global cache is asked for {:x}, which was not shown public", key.0);
         self.fetches.push_back((tag, *key));
         if !self.batching {
             self.pump_held(effects);
         }
+        blaze_cas::Asked::Sent
     }
 }

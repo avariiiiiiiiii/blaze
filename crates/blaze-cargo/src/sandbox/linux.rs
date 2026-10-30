@@ -97,7 +97,7 @@ fn interposer() -> Result<PathBuf, String> {
     let caches = caches
         .or_else(|| std::env::home_dir().map(|it| it.join(".cache")))
         .ok_or("no XDG_CACHE_HOME or home directory to keep the sandbox's interposer in")?;
-    let dir = caches.join("blaze/sandbox").join(env!("BLAZE_SANDBOX_INTERPOSE"));
+    let dir = caches.join("blaze/sandbox").join(crate::content::hex(&blaze_ids::b3::hash(INTERPOSER)[..12]));
     let file = dir.join("libblaze_sandbox_interpose.so");
     // The name is that of the contents it should have; what is there is still compared, so a
     // file left half written, or changed since, is written again.

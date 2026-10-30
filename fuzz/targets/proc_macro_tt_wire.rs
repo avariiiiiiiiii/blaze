@@ -29,8 +29,56 @@ use tt::{
     TopSubtreeBuilder, WireError, WirePart,
 };
 
-#[path = "proc_macro_shared.rs"]
-mod shared;
+/// A span of the fixtures' one file: `len` bytes at `start`.
+pub(crate) fn at(start: u32, len: u32) -> Span {
+    Span {
+        range: TextRange::at(TextSize::new(start), TextSize::new(len)),
+        anchor: SpanAnchor {
+            file_id: EditionedFileId::new(FileId::from_raw(0xe4e4e), Edition::CURRENT),
+            ast_id: span::ROOT_ERASED_FILE_AST_ID,
+        },
+        ctx: SyntaxContext::root(Edition::CURRENT),
+    }
+}
+
+/// Token trees a macro is given and gives back: every kind of leaf and delimiter, a raw
+/// identifier, a negative literal (sent as one token, read as a minus and a literal), nothing,
+/// and the parentheses of a passed-on expression, which the writer leaves out.
+pub(crate) fn trees() -> Vec<tt::TopSubtree> {
+    let mut many = TopSubtreeBuilder::new(Delimiter {
+        open: at(0, 0),
+        close: at(40, 0),
+        kind: DelimiterKind::Invisible,
+    });
+    many.push(Ident::new("struct", at(0, 6)).into());
+    many.push(Ident::new("r#Foo", at(7, 5)).into());
+    many.push(Literal::new_no_suffix("Foo", at(13, 5), LitKind::Str).into());
+    many.push(Punct { char: '@', spacing: Spacing::Joint, span: at(18, 1) }.into());
+    many.open(DelimiterKind::Brace, at(19, 1));
+    many.open(DelimiterKind::Bracket, at(20, 1));
+    many.push(Literal::new("0", at(21, 4), LitKind::Integer, "u32").into());
+    many.close(at(25, 1));
+    many.open(DelimiterKind::Parenthesis, at(26, 1));
+    many.push(Literal::new_no_suffix("raw", at(27, 8), LitKind::StrRaw(1)).into());
+    many.push(Punct { char: ',', spacing: Spacing::Alone, span: at(35, 1) }.into());
+    many.close(at(36, 1));
+    many.close(at(37, 1));
+    many.push(Literal::new("-1.5", at(38, 6), LitKind::Float, "f32").into());
+
+    let empty = TopSubtreeBuilder::new(Delimiter::invisible_spanned(at(0, 0)));
+    let brace = TopSubtreeBuilder::new(Delimiter {
+        open: at(0, 1),
+        close: at(1, 1),
+        kind: DelimiterKind::Brace,
+    });
+
+    let mut passed_on = TopSubtreeBuilder::new(Delimiter::invisible_spanned(at(4, 3)));
+    passed_on.open(DelimiterKind::Parenthesis, at(4, 3));
+    passed_on.push(Ident::new("x", at(5, 1)).into());
+    passed_on.close(at(4, 3));
+
+    vec![many.build(), empty.build(), brace.build(), passed_on.build()]
+}
 
 const TARGET: Target = Target {
     name: "proc_macro_tt_wire",
@@ -137,7 +185,7 @@ fn seeds() -> Vec<Vec<u8>> {
     let long = spanned(Edition::Edition2021, 9, 100, 0xFFFE);
     parts.push(Literal::new("1", long, LitKind::Integer, "u128_long_suffix").into());
 
-    let mut trees = shared::trees();
+    let mut trees = trees();
     trees.push(parts.build());
     trees
         .iter()

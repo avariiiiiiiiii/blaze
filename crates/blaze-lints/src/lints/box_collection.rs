@@ -273,7 +273,7 @@ impl<'q, 't> Pass<'_, 'q, 't> {
             return;
         }
         if !context.is_nested_call {
-            let threshold = u64::try_from(cx.conf().int("type-complexity-threshold", 250)).unwrap_or(0);
+            let threshold = u64::try_from(cx.conf().int("type-complexity-threshold", 250)).expect("a count, checked as the configuration loads");
             if complexity(ty, 1) > threshold {
                 return;
             }

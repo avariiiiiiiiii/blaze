@@ -451,7 +451,8 @@ mod tests {
         for (text, expected) in [
             (
                 "#!/usr/bin/env rust\n// c\nfn main() {}\n/* b */\n",
-                &[("/* b */", true), ("// c", true), ("#!/usr/bin/env rust", true)][..],
+                // The shebang token is cargo's frontmatter parse of it, which holds its newline.
+                &[("/* b */", true), ("// c", true), ("#!/usr/bin/env rust\n", true)][..],
             ),
             (
                 "//! inner\n/// outer\nfn f() {}\n/** block outer */\nstruct S;\n// trailing\n",

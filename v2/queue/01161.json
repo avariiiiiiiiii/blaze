@@ -1,0 +1,23 @@
+{
+  "id": "01161",
+  "from_lane": "no-fallback-tools",
+  "owner": "no-fallback-link",
+  "paths": [
+    "crates/blaze-cargo/src/serve/daemon.rs"
+  ],
+  "what": "crates/blaze-cargo/src/serve/daemon.rs:654: blaze-query no longer recomputes a key whose image group is corrupt (Database::slot is Err(Corrupt), the request fails with DbError::Corrupt, write_image refuses while one stands). The daemon eprintln \"what it held was computed again\" is now untrue and a log-only fallback: make a take_corrupt() hit fail the build naming section+group (and decide what replaces the image: an explicit error telling the user, not a silent fresh start). Also check where DbError::is_image makes the daemon start empty: Refused (other schema) is a cold start, but Corrupt must be an error (no-fallback).",
+  "state": "open",
+  "created": "2026-10-30T23:12:35Z",
+  "updated": "2026-10-30T23:12:35Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:12:35Z",
+      "by": "no-fallback-tools",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

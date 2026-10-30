@@ -70,8 +70,9 @@ pub(crate) fn resolved<'r, 'db, R>(
     let at = Some(ws.root_manifest().display().to_string());
     let fail = |error: anyhow::Error| Staged::Failed(load_error(&error, at.clone()));
     let root = ws.root().to_owned();
-    let root_text = match files.read(&root.join("Cargo.toml")) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+    let root_text = match files.read(&root.join("Cargo.toml")).map(|bytes| String::from_utf8(bytes.into_owned())) {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => return Ok(fail(anyhow::Error::new(error).context(format!("failed to read `{}`", ws.root_manifest().display())))),
         Err(error) => return Ok(fail(anyhow::Error::new(error).context(format!("failed to read `{}`", ws.root_manifest().display())))),
     };
     let root_table = match summary::Root::new(&root, &root_text) {
@@ -80,7 +81,12 @@ pub(crate) fn resolved<'r, 'db, R>(
     };
     let lock_path = root.join("Cargo.lock");
     let lock_text = match files.read(&lock_path) {
-        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Ok(bytes) => match String::from_utf8(bytes.into_owned()) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                return Ok(fail(anyhow::Error::new(error).context(format!("failed to read `{}`", lock_path.display()))));
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Ok(fail(anyhow::Error::new(error).context(format!("failed to read `{}`", lock_path.display()))));

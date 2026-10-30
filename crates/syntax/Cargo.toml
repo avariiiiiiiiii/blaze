@@ -33,8 +33,8 @@ stdx.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 rayon.workspace = true
-expect-test = "1.5.1"
-rustc_apfloat = "0.2.3"
+expect-test.workspace = true
+rustc_apfloat.workspace = true
 
 test-utils.workspace = true
 

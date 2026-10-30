@@ -180,7 +180,9 @@ fn main() {}
     assert_eq!(with(&["-D", "warnings"]), (Level::Deny, Level::Allow));
     assert_eq!(with(&["--cap-lints", "allow"]), (Level::Allow, Level::Allow));
     assert_eq!(with(&["--force-warn", "long-running-const-eval"]), (Level::ForceWarn, Level::ForceWarn));
-    assert_eq!(with(&["-F", "long-running-const-eval"]), (Level::Forbid, Level::Allow));
+    // As rustc's `shallow_lint_levels_on`, the HIR's levels don't hold a `forbid` against the
+    // attributes inside it: the early pass's E0453 is what stops the build.
+    assert_eq!(with(&["-F", "long-running-const-eval"]), (Level::Warn, Level::Allow));
 }
 
 /// The query, asked again, reads its memo: nothing is allocated.

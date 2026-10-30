@@ -6,7 +6,6 @@ use crate::{
     Options,
     emit::Style,
     lints::{CommandLine, Level, LintOptions},
-    lower::mutable_ref_binding::BUILT_ON,
     model,
     tests::{Mode, checked, checked_with, compiletest, normalized, ui_with},
 };
@@ -20,7 +19,7 @@ fn flags(flags: &[&str]) -> Options {
 /// What rustc writes to stderr for the one-file crate `source` named `$DIR/<name>`, in edition
 /// 2015, as compiletest runs it with the test's lint flags `own`.
 fn ui(name: &str, own: &[&str], source: &str) -> String {
-    ui_with(name, "2015", source, &flags(own)).replace(&format!("was built on {BUILT_ON};"), "was built on YYYY-MM-DD;")
+    ui_with(name, "2015", source, &flags(own))
 }
 
 #[test]
@@ -206,7 +205,7 @@ error: aborting due to 7 previous errors; 1 warning emitted
 For more information about this error, try `rustc --explain E0452`.
 "##;
     let options = Options { keep_duplicates: false, ..compiletest(Mode::Other, &Options::default()) };
-    let fixture = format!("//- /reasons-erroneous.rs crate:main edition:2015\n{source}");
+    let fixture = format!("//- /reasons-erroneous.rs crate:other:main edition:2015\n{source}");
     let stderr = checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
     assert_eq!(normalized(&stderr), expected);
 }
@@ -826,7 +825,7 @@ fn lint_levels(fixture: &str, args: &[&str]) -> Vec<(String, model::Level)> {
 
 #[test]
 fn cap_lints_lowers_a_denied_lint_and_drops_an_allowed_one() {
-    let fixture = "//- /main.rs crate:main\n#[deny(unused)]\nfn main() { let unused = (); }\n";
+    let fixture = "//- /main.rs crate:other:main\n#[deny(unused)]\nfn main() { let unused = (); }\n";
     let unused = |level| vec![("unused_variables".to_owned(), level)];
     assert_eq!(lint_levels(fixture, &[]), unused(model::Level::Error));
     assert_eq!(lint_levels(fixture, &["--cap-lints", "warn"]), unused(model::Level::Warning));
@@ -836,7 +835,7 @@ fn cap_lints_lowers_a_denied_lint_and_drops_an_allowed_one() {
 /// `--force-warn` holds under `--cap-lints allow`, as rustc's `reveal_actual_level_spec` has it.
 #[test]
 fn force_warn_is_not_capped() {
-    let fixture = "//- /main.rs crate:main\n#[allow(unused)]\nfn main() { let unused = (); }\n";
+    let fixture = "//- /main.rs crate:other:main\n#[allow(unused)]\nfn main() { let unused = (); }\n";
     let levels = lint_levels(fixture, &["--force-warn", "unused-variables", "--cap-lints", "allow"]);
     assert_eq!(levels, vec![("unused_variables".to_owned(), model::Level::Warning)]);
 }
@@ -851,7 +850,7 @@ fn a_lint_in_another_crates_macro_is_not_reported() {
 macro_rules! in_dep {
     () => { pub fn from_dep() { let unused = (); } };
 }
-//- /main.rs crate:main deps:dep
+//- /main.rs crate:other:main deps:dep
 macro_rules! here {
     () => { fn from_here() { let unused = (); } };
 }
@@ -869,7 +868,7 @@ fn main() { from_dep(); from_here(); }
 /// quiet, and any other `blaze::` name is an unknown lint of a known tool.
 #[test]
 fn blaze_tool_lints() {
-    let fixture = "//- /main.rs crate:main\n#![deny(blaze::const_impure)]\n#![allow(blaze::const_purity)]\nfn main() {}\n";
+    let fixture = "//- /main.rs crate:other:main\n#![deny(blaze::const_impure)]\n#![allow(blaze::const_purity)]\nfn main() {}\n";
     let messages = checked(fixture).messages();
     let unknown: Vec<_> = messages.iter().filter(|it| it.contains("unknown lint")).collect();
     assert_eq!(unknown, ["unknown_lints: unknown lint: `blaze::const_purity`"], "{messages:?}");

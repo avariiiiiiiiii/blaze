@@ -36,6 +36,33 @@ const ABOUT_RUSTC: [&str; 20] = [
     "tls-models",
 ];
 
+/// The flags of rustc that cargo passes with their value as the next argument.
+const VALUED: [&str; 23] = [
+    "-C",
+    "-L",
+    "-Z",
+    "-l",
+    "-A",
+    "-W",
+    "-D",
+    "-F",
+    "--cfg",
+    "--check-cfg",
+    "--extern",
+    "--out-dir",
+    "--target",
+    "--crate-name",
+    "--crate-type",
+    "--cap-lints",
+    "--emit",
+    "--edition",
+    "--error-format",
+    "--json",
+    "--color",
+    "--diagnostic-width",
+    "--remap-path-prefix",
+];
+
 /// The flags of rustc that take a value, beyond those a crate's build is given.
 const ALSO_VALUED: [&str; 9] = [
     "-o",
@@ -91,7 +118,7 @@ pub fn is_question(args: &[OsString]) -> bool {
             "-" => from_stdin = true,
             _ if !flag.starts_with('-') => inputs += 1,
             _ if joined.is_none()
-                && (crate::stub::VALUED.contains(&flag) || ALSO_VALUED.contains(&flag)) =>
+                && (VALUED.contains(&flag) || ALSO_VALUED.contains(&flag)) =>
             {
                 words.next();
             }

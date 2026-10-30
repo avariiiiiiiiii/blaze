@@ -119,15 +119,15 @@ fn seeds() -> Vec<Vec<u8>> {
 }
 
 fn named() -> Vec<(&'static str, Arch, Vec<u8>)> {
-    let x86 = with_trie(macho::CPU_TYPE_X86_64, &sample_trie());
-    let arm = with_trie(macho::CPU_TYPE_ARM64, &sample_trie());
-    let both = fat(&[(macho::CPU_TYPE_X86_64, 3, &x86[..]), (macho::CPU_TYPE_ARM64, 0, &arm[..])]);
+    let x86 = with_trie(macho::CPU_TYPE_X86_64.0, &sample_trie());
+    let arm = with_trie(macho::CPU_TYPE_ARM64.0, &sample_trie());
+    let both = fat(&[(macho::CPU_TYPE_X86_64.0, 3, &x86[..]), (macho::CPU_TYPE_ARM64.0, 0, &arm[..])]);
     vec![
         ("an AArch64 dylib with an LC_DYLD_INFO_ONLY trie", Arch::Aarch64, arm),
         ("an x86-64 dylib with an LC_DYLD_INFO_ONLY trie", Arch::X86_64, x86),
-        ("an x86-64 dylib with an LC_DYLD_EXPORTS_TRIE", Arch::X86_64, exports_trie(macho::CPU_TYPE_X86_64)),
-        ("an AArch64 dylib of a symbol table", Arch::Aarch64, symtab(macho::CPU_TYPE_ARM64, macho::MH_DYLIB)),
-        ("an x86-64 dylib stub of a symbol table", Arch::X86_64, symtab(macho::CPU_TYPE_X86_64, macho::MH_DYLIB_STUB)),
+        ("an x86-64 dylib with an LC_DYLD_EXPORTS_TRIE", Arch::X86_64, exports_trie(macho::CPU_TYPE_X86_64.0)),
+        ("an AArch64 dylib of a symbol table", Arch::Aarch64, symtab(macho::CPU_TYPE_ARM64.0, macho::MH_DYLIB.0)),
+        ("an x86-64 dylib stub of a symbol table", Arch::X86_64, symtab(macho::CPU_TYPE_X86_64.0, macho::MH_DYLIB_STUB.0)),
         ("a universal dylib, its x86-64 slice", Arch::X86_64, both.clone()),
         ("a universal dylib, its AArch64 slice", Arch::Aarch64, both),
     ]
@@ -149,7 +149,7 @@ fn name16(out: &mut Vec<u8>, name: &str) {
 
 fn segment(name: &str, vmaddr: u64, fileoff: u64, filesize: u64, sections: &[(&str, u64, u64, u32)]) -> Vec<u8> {
     let mut out = Vec::new();
-    u32le(&mut out, macho::LC_SEGMENT_64);
+    u32le(&mut out, macho::LC_SEGMENT_64.0);
     u32le(&mut out, 72 + 80 * sections.len() as u32);
     name16(&mut out, name);
     u64le(&mut out, vmaddr);
@@ -187,7 +187,7 @@ fn dylib_command(cmd: u32, path: &str) -> Vec<u8> {
 
 fn dyld_info(export_off: u32, export_size: u32) -> Vec<u8> {
     let mut out = Vec::new();
-    u32le(&mut out, macho::LC_DYLD_INFO_ONLY);
+    u32le(&mut out, macho::LC_DYLD_INFO_ONLY.0);
     u32le(&mut out, 48);
     for _ in 0..8 {
         u32le(&mut out, 0);
@@ -218,7 +218,7 @@ fn file(cpu: u32, filetype: u32, commands: impl Fn(u32) -> Vec<Vec<u8>>, tail: &
 /// `__TEXT` (mapping the header, `__text` code at 0x1000) and `__DATA` (`__data` at 0x4000,
 /// `__thread_vars` at 0x4100).
 fn segments(len: u64) -> Vec<Vec<u8>> {
-    let code = macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
+    let code = macho::S_ATTR_PURE_INSTRUCTIONS.0 | macho::S_ATTR_SOME_INSTRUCTIONS.0;
     vec![
         segment("__TEXT", 0, 0, len, &[("__text", 0x1000, 0x100, code)]),
         segment(
@@ -226,7 +226,7 @@ fn segments(len: u64) -> Vec<Vec<u8>> {
             0x4000,
             0x4000,
             0,
-            &[("__data", 0x4000, 0x100, 0), ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES)],
+            &[("__data", 0x4000, 0x100, 0), ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES.to_flags().0)],
         ),
     ]
 }
@@ -235,11 +235,11 @@ fn with_trie(cpu: u32, trie: &[u8]) -> Vec<u8> {
     let size = trie.len() as u32;
     file(
         cpu,
-        macho::MH_DYLIB,
+        macho::MH_DYLIB.0,
         |tail| {
             let mut commands = segments(0x1000);
-            commands.push(dylib_command(macho::LC_ID_DYLIB, "/usr/lib/libfoo.dylib"));
-            commands.push(dylib_command(macho::LC_REEXPORT_DYLIB, "/usr/lib/libbar.dylib"));
+            commands.push(dylib_command(macho::LC_ID_DYLIB.0, "/usr/lib/libfoo.dylib"));
+            commands.push(dylib_command(macho::LC_REEXPORT_DYLIB.0, "/usr/lib/libbar.dylib"));
             commands.push(dyld_info(tail, size));
             commands
         },
@@ -252,12 +252,12 @@ fn exports_trie(cpu: u32) -> Vec<u8> {
     let size = trie.len() as u32;
     file(
         cpu,
-        macho::MH_DYLIB,
+        macho::MH_DYLIB.0,
         |tail| {
             let mut commands = segments(0x1000);
-            commands.push(dylib_command(macho::LC_ID_DYLIB, "/usr/lib/libfoo.dylib"));
+            commands.push(dylib_command(macho::LC_ID_DYLIB.0, "/usr/lib/libfoo.dylib"));
             let mut command = Vec::new();
-            for value in [macho::LC_DYLD_EXPORTS_TRIE, 16, tail, size] {
+            for value in [macho::LC_DYLD_EXPORTS_TRIE.0, 16, tail, size] {
                 u32le(&mut command, value);
             }
             commands.push(command);
@@ -271,14 +271,14 @@ fn exports_trie(cpu: u32) -> Vec<u8> {
 /// not its local, private-external or undefined symbols).
 fn symtab(cpu: u32, filetype: u32) -> Vec<u8> {
     let symbols: [(&str, u8, u8, u16, u64); 8] = [
-        ("_f", macho::N_SECT | macho::N_EXT, 1, 0, 0x1000),
-        ("_d", macho::N_SECT | macho::N_EXT, 2, macho::N_WEAK_DEF, 0x4000),
-        ("_t", macho::N_SECT | macho::N_EXT, 3, 0, 0x4100),
-        ("_local", macho::N_SECT, 1, 0, 0x1004),
-        ("_pext", macho::N_SECT | macho::N_EXT | macho::N_PEXT, 1, 0, 0x1008),
-        ("_undef", macho::N_UNDF | macho::N_EXT, 0, 0, 0),
-        ("_abs", macho::N_ABS | macho::N_EXT, 0, 0, 0x42),
-        ("_indirect", macho::N_INDR | macho::N_EXT, 0, 0, 1),
+        ("_f", macho::N_SECT.0 | macho::N_EXT.0, 1, 0, 0x1000),
+        ("_d", macho::N_SECT.0 | macho::N_EXT.0, 2, macho::N_WEAK_DEF.0, 0x4000),
+        ("_t", macho::N_SECT.0 | macho::N_EXT.0, 3, 0, 0x4100),
+        ("_local", macho::N_SECT.0, 1, 0, 0x1004),
+        ("_pext", macho::N_SECT.0 | macho::N_EXT.0 | macho::N_PEXT.0, 1, 0, 0x1008),
+        ("_undef", macho::N_UNDF.0 | macho::N_EXT.0, 0, 0, 0),
+        ("_abs", macho::N_ABS.0 | macho::N_EXT.0, 0, 0, 0x42),
+        ("_indirect", macho::N_INDR.0 | macho::N_EXT.0, 0, 0, 1),
     ];
     let mut strings = vec![0u8];
     let mut table = Vec::new();
@@ -300,9 +300,9 @@ fn symtab(cpu: u32, filetype: u32) -> Vec<u8> {
         filetype,
         |at| {
             let mut commands = segments(0x1000);
-            commands.push(dylib_command(macho::LC_ID_DYLIB, "/usr/lib/libsym.dylib"));
+            commands.push(dylib_command(macho::LC_ID_DYLIB.0, "/usr/lib/libsym.dylib"));
             let mut command = Vec::new();
-            for value in [macho::LC_SYMTAB, 24, at, nsyms, at + table_len, strsize] {
+            for value in [macho::LC_SYMTAB.0, 24, at, nsyms, at + table_len, strsize] {
                 u32le(&mut command, value);
             }
             commands.push(command);
@@ -385,17 +385,17 @@ fn build_trie(root: &Node) -> Vec<u8> {
     out
 }
 
-fn info(flags: u32, values: &[u64]) -> Vec<u8> {
+fn info(flags: u64, values: &[u64]) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_uleb(&mut out, u64::from(flags));
+    encode_uleb(&mut out, flags);
     for &value in values {
         encode_uleb(&mut out, value);
     }
     out
 }
 
-fn reexport(flags: u32, ordinal: u64, import: &str) -> Vec<u8> {
-    let mut out = info(flags | macho::EXPORT_SYMBOL_FLAGS_REEXPORT, &[ordinal]);
+fn reexport(flags: u64, ordinal: u64, import: &str) -> Vec<u8> {
+    let mut out = info(flags | macho::EXPORT_SYMBOL_FLAGS_REEXPORT.0, &[ordinal]);
     out.extend_from_slice(import.as_bytes());
     out.push(0);
     out
@@ -406,22 +406,22 @@ fn reexport(flags: u32, ordinal: u64, import: &str) -> Vec<u8> {
 fn sample_trie() -> Vec<u8> {
     let foo = Node {
         terminal: info(0, &[0x1010]),
-        children: vec![("bar", leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, &[0x4010])))],
+        children: vec![("bar", leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[0x4010])))],
     };
     let fo = Node {
         terminal: Vec::new(),
         children: vec![
             ("o", foo),
             ("b", leaf(reexport(0, 1, "_bob"))),
-            ("_tls", leaf(info(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL, &[0x4100]))),
+            ("_tls", leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0), &[0x4100]))),
         ],
     };
     let underscore = Node {
         terminal: Vec::new(),
         children: vec![
             ("fo", fo),
-            ("abs", leaf(info(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE, &[0x1234]))),
-            ("res", leaf(info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER, &[0x1020, 0x1030]))),
+            ("abs", leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.0), &[0x1234]))),
+            ("res", leaf(info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.0, &[0x1020, 0x1030]))),
             ("same", leaf(reexport(0, 1, ""))),
         ],
     };

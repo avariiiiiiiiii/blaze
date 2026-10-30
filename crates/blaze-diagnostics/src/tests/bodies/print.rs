@@ -47,7 +47,7 @@ fn printed(fixture: &str) -> Vec<String> {
 #[test]
 fn a_closure_is_its_span_from_move_to_its_parameters() {
     // tests/ui/span/move-closure.rs: "found closure `{closure@$DIR/move-closure.rs:5:17: 5:24}`".
-    let fixture = "//- /move-closure.rs crate:main edition:2015
+    let fixture = "//- /move-closure.rs crate:other:main edition:2015
 // Regression test for issue #24986
 // Make sure that the span of a closure marked `move` begins at the `move` keyword.
 
@@ -62,7 +62,7 @@ fn main() {
 fn a_closure_with_typed_parameters_ends_after_them() {
     // tests/ui/closures/closure-no-fn-1.rs:
     // "found closure `{closure@$DIR/closure-no-fn-1.rs:6:29: 6:36}`".
-    let fixture = "//- /closure-no-fn-1.rs crate:main edition:2015
+    let fixture = "//- /closure-no-fn-1.rs crate:other:main edition:2015
 // Ensure that capturing closures are never coerced to fns
 // Especially interesting as non-capturing closures can be.
 
@@ -79,7 +79,7 @@ fn main() {
 fn a_function_item_is_its_signature_and_its_path() {
     // tests/ui/expr/if/if-typeck.rs: "found fn item `fn() {f}`"; tests/ui/extern/
     // extern-rust-fn-type-error-10764.rs: "found fn item `extern \"C\" fn() {bar}`".
-    let fixture = r#"//- /main.rs crate:main edition:2021
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
 fn f() {}
 extern "C" fn bar() {}
 fn id<T>(t: T) -> T { t }
@@ -111,7 +111,7 @@ fn main() {
 
 #[test]
 fn constructors_and_methods_are_value_paths() {
-    let fixture = "//- /main.rs crate:main edition:2021
+    let fixture = "//- /main.rs crate:other:main edition:2021
 struct P(u8);
 enum E { V(u8) }
 struct S;
@@ -134,7 +134,7 @@ fn main() {
 
 #[test]
 fn a_function_pointer_names_its_anonymous_lifetimes() {
-    let fixture = "//- /main.rs crate:main edition:2021
+    let fixture = "//- /main.rs crate:other:main edition:2021
 fn g(_: &u8) {}
 fn s(_: &'static (dyn Tr + 'static)) {}
 trait Tr {}
@@ -153,7 +153,7 @@ fn main() {
 
 #[test]
 fn builtin_types_print_as_written() {
-    let fixture = r#"//- /main.rs crate:main edition:2021
+    let fixture = r#"//- /main.rs crate:other:main edition:2021
 fn main() {
     let a = ();
     let b = (1u8,);
@@ -174,7 +174,7 @@ fn main() {
 
 #[test]
 fn paths_are_trimmed_to_a_name_no_other_item_has() {
-    let fixture = "//- /main.rs crate:main edition:2021
+    let fixture = "//- /main.rs crate:other:main edition:2021
 mod a { pub struct S; }
 mod b { pub struct S; }
 mod c { pub mod d { pub struct T; } }
@@ -190,7 +190,7 @@ fn main() {
 
 #[test]
 fn arguments_equal_to_their_defaults_are_left_out() {
-    let fixture = "//- /main.rs crate:main edition:2021
+    let fixture = "//- /main.rs crate:other:main edition:2021
 struct Foo<T, U = u8>(T, U);
 struct A<const N: usize>;
 
@@ -206,7 +206,7 @@ fn main() {
 #[test]
 fn impl_trait_is_its_bounds_with_fn_sugar() {
     let fixture = "//- minicore: sized, fn
-//- /main.rs crate:main edition:2021
+//- /main.rs crate:other:main edition:2021
 trait Tr {}
 trait Gen<T> {}
 struct S;
@@ -230,7 +230,7 @@ fn main() {
 #[test]
 fn sort_strings_name_the_kind_of_type() {
     // rustc's `Ty::sort_string`, as the E0308 notes and labels print it.
-    let fixture = "//- /main.rs crate:main edition:2021
+    let fixture = "//- /main.rs crate:other:main edition:2021
 struct P(u8);
 fn f() {}
 

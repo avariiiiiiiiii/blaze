@@ -615,7 +615,9 @@ impl<M: Memory> Switch<M> {
             #[cfg(test)]
             stored: 0,
         };
-        switch.ready();
+        let mut path = std::mem::take(&mut switch.scratch.path);
+        switch.ready(&mut path);
+        switch.scratch.path = path;
         Ok(switch)
     }
 
@@ -905,7 +907,7 @@ impl<M: Memory> Switch<M> {
             let evicted = self.kept.remove(oldest);
             self.log.kept[evicted as usize] = 0;
         }
-        self.ready();
+        self.ready(&mut s.path);
         // After the switch, the pages a next patch of this size writes in the log, so its
         // pushes find them committed and resident.
         self.log.ahead(set, s.code.len());
@@ -921,7 +923,7 @@ impl<M: Memory> Switch<M> {
     /// compare-and-swap from zero: a slot [`super::exec::publish`] wrote meanwhile keeps
     /// what it wrote, and one it wrote before is read here (both sides are sequentially
     /// consistent).
-    fn ready(&mut self) {
+    fn ready(&mut self, path: &mut Vec<u32>) {
         if self.pool.len() < POOL {
             let slots = self.layout.slots as usize;
             // alloc: one table per pool entry, at most `POOL`, kept for the program's life
@@ -940,9 +942,7 @@ impl<M: Memory> Switch<M> {
             return;
         }
         let Some(at) = self.spare() else { return };
-        let mut path = std::mem::take(&mut self.scratch.path);
-        self.retarget(at, self.current, &mut path);
-        self.scratch.path = path;
+        self.retarget(at, self.current, path);
         self.next = Some(at);
     }
 

@@ -158,30 +158,6 @@ pub(super) fn cache_code(
     Ok(u128::from(low) | u128::from(high) << 64)
 }
 
-/// The nodes a walk from one node found, in the order found, each with where in `order` the
-/// node that first reached it is and by what.
-#[derive(Default)]
-struct Way {
-    order: Vec<u32>,
-    from: Vec<u32>,
-    via: Vec<Site>,
-}
-
-impl Way {
-    fn clear(&mut self, start: u32) {
-        self.order.clear();
-        self.from.clear();
-        self.via.clear();
-        self.push(start, 0, Site::None);
-    }
-
-    fn push(&mut self, node: u32, from: usize, via: Site) {
-        self.order.push(node);
-        self.from.push(from as u32);
-        self.via.push(via);
-    }
-}
-
 /// A way a test's end depends on more than its code.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Found {
@@ -195,11 +171,6 @@ pub struct Found {
 }
 
 impl Found {
-    /// The same found, by the calls of `path`.
-    fn with_path(&self, path: Vec<Call>) -> Found {
-        // clone: what a test is told owns its text, the first of a kind on its way
-        Found { kind: self.kind, what: self.what.clone(), why: self.why.clone(), path }
-    }
 }
 
 /// A function on the way from a test to what it reaches.
@@ -1026,57 +997,6 @@ impl<'db> Walk<'db> {
             let place = location(db, body.owner, span);
             self.nodes[at as usize].why = Some(Why { text: why.into(), of_user: false, place });
         }
-    }
-
-    /// Adds to `found` what node `at` is that makes a test's end depend on more than its code,
-    /// for [`tests_reach`], of each kind `found` has none of yet: what by name, why, and the
-    /// calls `path` gives to it.
-    fn add_reasons(&self, at: u32, found: &mut Vec<Found>, path: impl Fn() -> Vec<Call>) {
-        if let Some((kind, what, why)) = self.kinds.get(&at)
-            && !found.iter().any(|seen| seen.kind == *kind)
-        {
-            // clone: what a test is told owns its text, the first of a kind on its way
-            found.push(Found { kind: *kind, what: what.clone(), why: why.clone(), path: path() });
-        }
-        if self.uncompiled.contains(&at) && !found.iter().any(|seen| seen.kind == Kind::Uncompiled)
-        {
-            let what = describe(self.db, &self.nodes[at as usize].node);
-            // alloc: what a test is told, the first of a kind on its way
-            let why = format!("it reaches {what}, which blaze can't compile");
-            // alloc: what a test is told, the first of a kind on its way
-            let what = what.trim_matches('`').to_owned();
-            found.push(Found { kind: Kind::Uncompiled, what, why, path: path() });
-        }
-    }
-
-    /// The fewest calls from the root of `way` to its node at `at`, each by its name without
-    /// the types it is instantiated with, and where it calls the next.
-    fn path_to(&self, way: &Way, at: usize) -> Vec<Call> {
-        let call = |index: usize, next: Option<usize>| {
-            let node = way.order[index];
-            let name = describe(self.db, &self.nodes[node as usize].node);
-            let at = next.and_then(|next| {
-                let site = way.via[next];
-                let mut locations = self.locations.borrow_mut();
-                locations
-                    .entry((node, site))
-                    .or_insert_with(|| self.site_location(node, site))
-                    // clone: what a test is told owns its text; the cache keeps it for the next
-                    .clone()
-            });
-            Call { name: without_arguments(name.trim_matches('`')), at }
-        };
-        // alloc: what a test is told, the first of a kind on its way
-        let mut path = Vec::new();
-        let mut index = at;
-        path.push(call(index, None));
-        while index != 0 {
-            let up = way.from[index] as usize;
-            path.push(call(up, Some(index)));
-            index = up;
-        }
-        path.reverse();
-        path
     }
 
     /// Whether the node is code of the toolchain (std, core, alloc and the crates they are

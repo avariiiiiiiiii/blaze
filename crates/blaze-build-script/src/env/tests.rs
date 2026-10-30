@@ -439,6 +439,54 @@ fn jobserver_and_versions() {
     assert_eq!(var(&env, "CARGO_PKG_AUTHORS"), Some("a:b <b@x>"));
 }
 
+/// What cargo always gives a script is never guessed: an empty field, a version that is not
+/// semver's, a cfg not as rustc prints it each stop the run, naming what and whose.
+#[test]
+fn a_value_missing_is_an_error() {
+    let refused = |unit: &Unit| -> Error { env(unit, &[]).unwrap_err() };
+    let cases: [(&'static str, fn(&mut Unit)); 9] = [
+        ("TARGET", |it| it.target.clear()),
+        ("HOST", |it| it.host.clear()),
+        ("OUT_DIR", |it| it.out_dir = PathBuf::new()),
+        ("RUSTC", |it| it.tools.rustc = PathBuf::new()),
+        ("RUSTDOC", |it| it.tools.rustdoc = PathBuf::new()),
+        ("CARGO", |it| it.tools.cargo = PathBuf::new()),
+        ("the script's executable", |it| it.script = PathBuf::new()),
+        ("OPT_LEVEL", |it| it.profile.opt_level.clear()),
+        ("CARGO_MANIFEST_DIR", |it| it.package.manifest_dir = PathBuf::new()),
+    ];
+    for (field, empty) in cases {
+        let mut unit = bar();
+        empty(&mut unit);
+        let want = crate::unit::Unfilled::Empty { package: "bar v0.5.0".into(), field };
+        assert_eq!(unit.check(), Err(want.clone()), "{field}");
+        assert_eq!(refused(&unit), Error::from(want), "{field}");
+    }
+    for version in ["7", "1.2", "1.2.3.4", "1..3", "a.b.c", "1.2.x-pre"] {
+        let mut unit = bar();
+        unit.package.version = version.into();
+        let want = crate::unit::Unfilled::Version {
+            package: format!("bar v{version}"),
+            version: version.into(),
+        };
+        assert_eq!(refused(&unit), Error::from(want), "{version}");
+    }
+    let mut unit = bar();
+    unit.target_cfgs.push("target_os=linux".into());
+    let want = crate::unit::Unfilled::Cfg { package: "bar v0.5.0".into(), line: "target_os=linux".into() };
+    assert_eq!(refused(&unit), Error::from(want));
+}
+
+/// A toolchain with no library directory of its own adds none, and no empty entry, which the
+/// loader would read as the working directory.
+#[test]
+fn no_sysroot_library_directory_adds_none() {
+    let mut unit = bar();
+    unit.dylib_search.sysroot_libdir = PathBuf::new();
+    let env = env(&unit, &[]).unwrap();
+    assert_eq!(var(&env, "LD_LIBRARY_PATH"), Some("/p/foo/target/debug:/p/foo/target/debug/deps"));
+}
+
 /// cargo on Linux gives its scripts the certificates libgit2 found for it (found by
 /// harness/scripts.py on dev-aws-8, where cargo's scripts had `SSL_CERT_FILE` and
 /// `SSL_CERT_DIR` and blaze's did not).

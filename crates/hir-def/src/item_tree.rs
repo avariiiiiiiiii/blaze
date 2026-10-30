@@ -75,9 +75,8 @@ use hir_expand::{
 };
 use la_arena::{Idx, RawIdx};
 use span::{AstIdNode, Edition, FileAstId, SyntaxContext};
-use stdx::never;
 use syntax::{
-    SyntaxKind, ast, match_ast,
+    ast, match_ast,
     view::{self, AstNode as _},
 };
 
@@ -260,9 +259,6 @@ pub(crate) fn lower_whole(db: &Db, file_id: HirFileId, krate: Crate) -> ItemTree
                 ctx.lower_macro_stmts(stmts)
             },
             _ => {
-                if never!(syntax.kind() == SyntaxKind::ERROR, "{:?} from {:?} {}", file_id, syntax, syntax) {
-                    return Default::default();
-                }
                 panic!("cannot create item tree for file {file_id:?} from {syntax:?} {syntax}");
             },
         }

@@ -167,14 +167,22 @@ impl<'a> Lower<'a> {
     pub(crate) fn name(&self, name: ra::Name<'_>) -> Ident {
         match name.syntax().first_token() {
             Some(token) => self.ident(token),
-            None => Ident::new(sym::empty, self.sp(name.syntax().text_range())),
+            None => {
+                let span = self.sp(name.syntax().text_range());
+                self.unsupported(span, "a name without a token");
+                Ident::new(sym::empty, span)
+            }
         }
     }
 
     pub(crate) fn name_ref(&self, name: ra::NameRef<'_>) -> Ident {
         match name.syntax().first_token() {
             Some(token) => self.ident(token),
-            None => Ident::new(sym::empty, self.sp(name.syntax().text_range())),
+            None => {
+                let span = self.sp(name.syntax().text_range());
+                self.unsupported(span, "a name without a token");
+                Ident::new(sym::empty, span)
+            }
         }
     }
 
@@ -189,7 +197,11 @@ impl<'a> Lower<'a> {
                 };
                 Ident::new(Symbol::intern(&name), self.tsp(token))
             }
-            None => Ident::new(sym::empty, self.sp(lt.syntax().text_range())),
+            None => {
+                let span = self.sp(lt.syntax().text_range());
+                self.unsupported(span, "a lifetime without a name");
+                Ident::new(sym::empty, span)
+            }
         };
         ast::Lifetime {
             id: DUMMY_NODE_ID,
@@ -591,7 +603,10 @@ impl<'a> Lower<'a> {
         let span = self.nsp(a.syntax());
         let ident = match a.name_ref() {
             Some(n) => self.name_ref(n),
-            None => Ident::new(sym::empty, span),
+            None => {
+                self.unsupported(span, "an associated item constraint without a name");
+                Ident::new(sym::empty, span)
+            }
         };
         let gen_args = if let Some(list) = a.generic_arg_list() {
             Some(self.angle_args(list))
@@ -889,10 +904,13 @@ impl<'a> Lower<'a> {
             }
             ra::GenericParam::TypeParam(tp) => {
                 let span = self.nsp(tp.syntax());
-                let ident = tp
-                    .name()
-                    .map(|n| self.name(n))
-                    .unwrap_or(Ident::new(sym::empty, span));
+                let ident = match tp.name() {
+                    Some(n) => self.name(n),
+                    None => {
+                        self.unsupported(span, "a type parameter without a name");
+                        Ident::new(sym::empty, span)
+                    }
+                };
                 let colon_span = tp.colon_token().map(|t| self.tsp(t));
                 let bounds = tp
                     .type_bound_list()
@@ -911,10 +929,13 @@ impl<'a> Lower<'a> {
             }
             ra::GenericParam::ConstParam(cp) => {
                 let span_all = self.nsp(cp.syntax());
-                let ident = cp
-                    .name()
-                    .map(|n| self.name(n))
-                    .unwrap_or(Ident::new(sym::empty, span_all));
+                let ident = match cp.name() {
+                    Some(n) => self.name(n),
+                    None => {
+                        self.unsupported(span_all, "a const parameter without a name");
+                        Ident::new(sym::empty, span_all)
+                    }
+                };
                 let ty = match cp.ty() {
                     Some(t) => self.ty(t),
                     None => {

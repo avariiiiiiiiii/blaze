@@ -129,7 +129,7 @@ pub(crate) enum Mode {
 }
 
 pub(crate) fn ui_as(mode: Mode, name: &str, edition: &str, source: &str, options: &Options) -> String {
-    let fixture = format!("//- /{name} crate:main edition:{edition}\n{source}");
+    let fixture = format!("//- /{name} crate:other:main edition:{edition}\n{source}");
     let stderr = checked_with(&fixture, "$DIR/", &compiletest(mode, options))
         .stderr_with(Style { ui_testing: true, ..Style::default() });
     normalized(&stderr)
@@ -186,6 +186,6 @@ fn annotations_are_removed_with_the_space_before_them() {
 
 #[test]
 fn fixture_paths_are_named_without_their_slash() {
-    let fixture = "//- /main.rs crate:main deps:dep\nfn main() {}\n//- /dep.rs crate:dep\n";
+    let fixture = "//- /main.rs crate:other:main deps:dep\nfn main() {}\n//- /dep.rs crate:dep\n";
     assert_eq!(paths(fixture), ["main.rs", "dep.rs"]);
 }

@@ -49,6 +49,7 @@ fn give(output: &Output, state: &mut State, id: IdNo, key: &InstanceKey, placed:
     let Some(dev_run) = &output.dev_run else {
         return Err(LinkError {
             function: Some(*key),
+            refusal: None,
             what: "its code counts calls in tier-up counter cells, and the image is not a dev run: counting code is \
                    only for runs the daemon tiers"
                 .into(),
@@ -58,6 +59,7 @@ fn give(output: &Output, state: &mut State, id: IdNo, key: &InstanceKey, placed:
     if state.pairs.given() + state.pairs.placed() >= capacity {
         return Err(LinkError {
             function: Some(*key),
+            refusal: None,
             // alloc: error path
             what: format!(
                 "its code counts calls in tier-up counter cells, and the dev run's {} bytes of cells hold {capacity} \

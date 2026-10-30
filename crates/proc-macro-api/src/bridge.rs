@@ -1,9 +1,10 @@
-//! What the wasm host (`crates/blaze-macro-wasm`) and the in-process bridge
-//! (`blaze_macro_wasm::native`) share: the lexer of text a macro asks to be tokens of ([`lex`]), the span operations both
-//! answer ([`spans`]), and the span numbering and token-tree columns of an expansion ([`wire`]).
-//! One text each, so the two hosts answer a macro the same by construction.
+//! What blaze-macro-eval's in-process server speaks to a macro: the lexer of text a macro asks
+//! to be tokens of ([`lex`]), the span operations it answers ([`spans`]) and the questions of
+//! them only the database can answer ([`questions`]), and the span numbering and token-tree
+//! columns of an expansion ([`wire`]).
 
 pub mod lex;
+pub mod questions;
 pub mod spans;
 pub mod wire;
 

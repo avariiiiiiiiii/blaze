@@ -32,7 +32,7 @@ use crate::state::{ClassId, Def, NewPiece, PieceId, PieceRef, State, What};
 use crate::symbols::{IdNo, NameId, Obj, SymKey, Symbols, Wide};
 use crate::table;
 use crate::unwind::{self, Field};
-use crate::{Change, Format, LinkError, Output};
+use crate::{Change, Format, LinkError, Output, Refusal};
 
 const CIE_DOMAIN: &str = "blaze v2 link cie 1";
 
@@ -190,7 +190,12 @@ pub(crate) struct Stage<'a> {
 }
 
 pub(crate) fn error(function: Option<InstanceKey>, what: impl Into<String>) -> LinkError {
-    LinkError { function, what: what.into() }
+    LinkError { function, what: what.into(), refusal: None }
+}
+
+/// An incremental image's refusal of a stage its layout has no room for ([`Refusal`]).
+pub(crate) fn refused(function: Option<InstanceKey>, refusal: Refusal, what: impl Into<String>) -> LinkError {
+    LinkError { function, what: what.into(), refusal: Some(refusal) }
 }
 
 /// The key a codegen target is, and whether it is referred to weakly. `of` is the function
@@ -1006,8 +1011,9 @@ impl<'a> Stage<'a> {
 
     fn new_slot(&mut self, slot: Sym, function: InstanceKey) -> Result<(), LinkError> {
         if self.new.slots >= self.new.capacity {
-            return Err(error(
+            return Err(refused(
                 Some(function),
+                Refusal::TableFull { slots: self.new.capacity },
                 // alloc: error path
                 format!("the jump table is full ({} slots): link the image from scratch", self.new.capacity),
             ));

@@ -17,7 +17,7 @@ fn ui(fixture: &str, mode: Mode) -> String {
 
 /// The UI test `source`, named `$DIR/<name>`, of edition 2015 with no other crate.
 fn one(name: &str, source: &str, mode: Mode) -> String {
-    ui(&format!("//- /{name} crate:main edition:2015\n{source}"), mode)
+    ui(&format!("//- /{name} crate:other:main edition:2015\n{source}"), mode)
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn unit_and_tuple_struct() {
 fn deprecation_lint_nested() {
     let source = include_str!("stability/deprecation-lint-nested.rs");
     let expected = include_str!("stability/deprecation-lint-nested.stderr");
-    let fixture = format!("//- minicore: fmt\n//- /deprecation-lint-nested.rs crate:main edition:2015\n{source}");
+    let fixture = format!("//- minicore: fmt\n//- /deprecation-lint-nested.rs crate:other:main edition:2015\n{source}");
     assert_eq!(ui(&fixture, Mode::Other), expected);
 }
 
@@ -62,7 +62,7 @@ fn with_deprecation_lint(name: &str, source: &str, header: &str, deps: &str) -> 
     let aux = include_str!("stability/auxiliary/deprecation-lint.rs");
     format!(
         "{header}//- /auxiliary/deprecation-lint.rs crate:deprecation_lint edition:2015 library\n{aux}\
-         //- /{name} crate:main edition:2015 deps:deprecation_lint{deps}\n{source}"
+         //- /{name} crate:other:main edition:2015 deps:deprecation_lint{deps}\n{source}"
     )
 }
 
@@ -110,7 +110,7 @@ fn lint_stability_deprecated() {
          //- /auxiliary/inherited_stability.rs crate:inherited_stability edition:2015 library\n{}\
          //- /auxiliary/stability_cfg1.rs crate:stability_cfg1 edition:2015 library\n{}\
          //- /auxiliary/stability-cfg2.rs crate:stability_cfg2 edition:2015 library cfg:foo\n{}\
-         //- /lint-stability-deprecated.rs crate:main edition:2015 \
+         //- /lint-stability-deprecated.rs crate:other:main edition:2015 \
          deps:lint_stability,inherited_stability,stability_cfg1,stability_cfg2\n{source}",
         include_str!("stability/auxiliary/lint_stability.rs"),
         include_str!("stability/auxiliary/inherited_stability.rs"),
@@ -142,7 +142,7 @@ LL | #[deprecated = \"hello\"]
 #[test]
 fn deprecated_on_an_item_of_a_trait_impl_has_no_effect() {
     let checked = checked(
-        r#"//- /main.rs crate:main edition:2021
+        r#"//- /main.rs crate:other:main edition:2021
 trait Tr {
     const C: u8;
     type T;
@@ -171,7 +171,7 @@ fn main() {}
 #[test]
 fn a_use_in_a_definition_deprecated_by_the_same_attribute_is_not_linted() {
     let checked = checked(
-        r#"//- /main.rs crate:main edition:2021
+        r#"//- /main.rs crate:other:main edition:2021
 #[deprecated]
 mod old {
     pub fn f() {}
@@ -212,7 +212,7 @@ fn an_unstable_trait_impl_of_stable_types_and_traits_has_no_effect() {
 #[test]
 fn an_unstable_feature_bound_an_unresolved_trait_and_a_nested_unstable_type_keep_the_lint_off() {
     let checked = checked(
-        r#"//- /main.rs crate:main edition:2021
+        r#"//- /main.rs crate:other:main edition:2021
 #![feature(staged_api)]
 #![stable(feature = "main", since = "1.0.0")]
 #[stable(feature = "a", since = "1.0.0")]
@@ -242,7 +242,7 @@ fn main() {}
 #[test]
 fn typeck_checks_a_receiver_before_its_method_and_an_initializer_before_its_pattern() {
     let checked = checked(
-        r#"//- /main.rs crate:main edition:2021
+        r#"//- /main.rs crate:other:main edition:2021
 pub struct P(#[deprecated] pub u8);
 pub struct T;
 impl T {
@@ -270,7 +270,7 @@ fn main() {
 #[test]
 fn what_a_macro_expands_to_is_checked_where_it_is_called() {
     let checked = checked(
-        r#"//- /main.rs crate:main edition:2021
+        r#"//- /main.rs crate:other:main edition:2021
 #[deprecated]
 pub fn d1() {}
 #[deprecated]
@@ -309,7 +309,7 @@ fn a_feature_named_with_any_xid_identifier_gates_its_item() {
 #![stable(feature = "dep", since = "1.0.0")]
 #[unstable(feature = "fé", issue = "none")]
 pub fn f() {}
-//- /main.rs crate:main edition:2021 deps:dep
+//- /main.rs crate:other:main edition:2021 deps:dep
 fn main() {
     dep::f();
 }
@@ -331,7 +331,7 @@ fn a_deprecation_since_the_current_rustc_version_is_in_effect() {
 #[stable(feature = "a", since = "1.0.0")]
 #[deprecated(since = "CURRENT_RUSTC_VERSION", note = "n")]
 pub fn f() {}
-//- /main.rs crate:main edition:2021 deps:dep
+//- /main.rs crate:other:main edition:2021 deps:dep
 fn main() {
     dep::f();
 }

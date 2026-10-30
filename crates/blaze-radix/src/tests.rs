@@ -62,7 +62,7 @@ fn keys(rng: &mut Rng, n: usize, shape: u64) -> Vec<u64> {
         6 => (0..n).map(|_| rng.below(1 << 20) | (rng.below(4) << 62)).collect(),
         _ => {
             let mut it: Vec<u64> = (0..n as u64).collect();
-            for _ in 0..n / 50 + 1 {
+            for _ in 0..(n / 50 + 1).min(n) {
                 let (a, b) = (rng.below(n as u64) as usize, rng.below(n as u64) as usize);
                 it.swap(a, b);
             }

@@ -21,11 +21,11 @@ fuzz = []
 # this workspace too (demo/life, user programs, `tools/nix/life_launch.py`, `harness/tiers.py`),
 # where no root `Cargo.toml` is found. Keep the lints equal to the root's `[workspace.lints]`.
 [dev-dependencies]
-blaze-alloc-count = { path = "../blaze-alloc-count" }
-blaze-ids = { path = "../blaze-ids" }
+blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
 
 [target.'cfg(blaze_check)'.dev-dependencies]
-blaze-check = { path = "../blaze-check" }
+blaze-check.workspace = true
 
 [lints.cargo]
 unused_dependencies = "allow"

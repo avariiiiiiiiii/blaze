@@ -185,6 +185,16 @@ fn new_syntax_and_rust_version() {
             "{message}"
         );
     }
+    // A `rust-version` that is no version is refused, not taken to allow `cargo::`.
+    for unread in ["", "1.x", "1.77.0.1", "latest"] {
+        let package = foo("0.0.0", Some(unread), lib());
+        let want = crate::unit::Unfilled::RustVersion {
+            package: "foo v0.0.0 (/p/foo)".into(),
+            rust_version: unread.into(),
+        };
+        assert_eq!(read(&package, "cargo::metadata=foo=bar"), Err(Error::from(want)), "{unread}");
+        assert!(read(&package, "cargo:foo=bar").is_ok(), "the old syntax reads no rust-version");
+    }
 }
 
 /// `build_script_extra_link_arg_bin`, `..._bin_single`, `..._tests`, `..._benches`,

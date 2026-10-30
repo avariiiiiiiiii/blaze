@@ -51,7 +51,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     Interner as _,
     inherent::{
-        AdtDef as _, BoundExistentialPredicates as _, Clause as _, GenericArgs as _, IntoKind as _,
+        BoundExistentialPredicates as _, Clause as _, GenericArgs as _, IntoKind as _,
     },
 };
 use salsa::plumbing::{AsId, FromId};

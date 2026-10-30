@@ -7,7 +7,7 @@ use object::elf;
 pub(crate) fn apply(arch: Arch, r_type: u32, bytes: &mut [u8], p: u64, s: u64, addend: i64) -> Result<(), String> {
     let abs = s.wrapping_add(addend as u64) as i64;
     let rel = abs.wrapping_sub(p as i64);
-    match (arch, r_type) {
+    match (arch, elf::RelocationType(r_type)) {
         (Arch::X86_64, elf::R_X86_64_8) => put(bytes, &uint_or_int(abs, 8, "R_X86_64_8")?.to_le_bytes()[..1]),
         (Arch::X86_64, elf::R_X86_64_16) => put(bytes, &uint_or_int(abs, 16, "R_X86_64_16")?.to_le_bytes()[..2]),
         (Arch::X86_64, elf::R_X86_64_PC8) => put(bytes, &int(rel, 8, "R_X86_64_PC8")?.to_le_bytes()[..1]),

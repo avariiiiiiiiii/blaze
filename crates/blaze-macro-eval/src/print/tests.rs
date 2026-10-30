@@ -88,7 +88,8 @@ fn method_calls_and_fields_print_tight() {
 fn attributes_and_references() {
     assert_eq!(lexed("#[attr]"), "#[attr]");
     assert_eq!(quoted("#[attr]"), "#[attr]");
-    assert_eq!(quoted("#![attr]"), "# ! [attr]");
+    // The lexer makes `#` `Joint` before the `!`, and a client's `Joint` is kept.
+    assert_eq!(quoted("#![attr]"), "#! [attr]");
     assert_eq!(lexed("&mut x"), "&mut x");
     assert_eq!(quoted("&mut x"), "& mut x");
 }

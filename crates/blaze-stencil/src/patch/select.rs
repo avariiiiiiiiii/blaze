@@ -27,14 +27,17 @@
 //! An instruction neither the glue nor a stencil writes is an error naming its opcode and
 //! type, never a compile by Cranelift.
 
-use cranelift_codegen::ir::{
-    self, InstructionData as Data, Opcode,
-    condcodes::{CondCode, FloatCC, IntCC},
-    types,
+use cranelift_codegen::{
+    ir::{
+        self, InstructionData as Data, Opcode,
+        condcodes::{CondCode, FloatCC, IntCC},
+        types,
+    },
+    packed_option::ReservedValue,
 };
 
 use super::{
-    Kind, Konst, KonstRef, NONE, Plan, Sel,
+    Kind, Konst, KonstRef, Plan, Sel,
     scan::reset,
     slots::{GLOBAL, has},
 };
@@ -322,7 +325,7 @@ fn fuse(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst: ir
     }
     plan.sels[icmp.as_u32() as usize].kind = Kind::Fused;
     sel.shape = shape;
-    sel.args = [args[0], args[1], ir::Value::from_u32(NONE)];
+    sel.args = [args[0], args[1], ir::Value::reserved_value()];
     sel.nargs = 2;
     sel.cc = cc;
 }
@@ -375,7 +378,7 @@ fn confine(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst:
         _ => &[Disp::Imm32],
     };
     let (args, nargs) =
-        if store { ([sel.args[0], p, vmctx], 3) } else { ([p, vmctx, ir::Value::from_u32(NONE)], 2) };
+        if store { ([sel.args[0], p, vmctx], 3) } else { ([p, vmctx, ir::Value::reserved_value()], 2) };
     let Some(shape) = disps.iter().find_map(|&disp| {
         let (op, aux) = Shape::confining(access, disp)?;
         let shape = Shape { op, aux, srcs: [Src::None; 3], ..sel.shape };

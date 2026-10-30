@@ -122,7 +122,7 @@ fn aarch64_encoders_match_the_assembler() {
         (rdffr(0), 0x2519_f000, "rdffr p0.b"),
         (wrffr(0), 0x2528_9000, "wrffr p0.b"),
         (movz_w(16, 0x1234), 0x5282_4690, "movz w16, #0x1234"),
-        (movk_w16(16, 0x7fff), 0x72af_ffd0, "movk w16, #0x7fff, lsl #16"),
+        (movk_w16(16, 0x7fff), 0x72af_fff0, "movk w16, #0x7fff, lsl #16"),
         (b(-8), 0x17ff_fffe, "b .-8"),
         (ldr_literal(16, -64), 0x58ff_fe10, "ldr x16, .-64"),
         (cbz_x(17, 40), 0xb400_0151, "cbz x17, .+40"),

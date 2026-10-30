@@ -11,6 +11,8 @@
 #[allow(dead_code, reason = "shared with tests/corpus.rs, which uses other parts of it")]
 #[path = "corpus/config.rs"]
 mod config;
+#[path = "corpus/difference.rs"]
+mod difference;
 #[allow(dead_code, reason = "shared with tests/corpus.rs, which uses other parts of it")]
 #[path = "corpus/load.rs"]
 mod load;
@@ -25,11 +27,9 @@ use std::{
 };
 
 use blaze_core::sim::{Faults, Sim};
-use blaze_macro_wasm::native;
-use proc_macro_api::kept::{self, Expansions, Put};
+use proc_macro_api::kept::{self, Environment, Expansions, Put};
 use hir_def::nameres::crate_def_map;
 use hir_expand::proc_macro::{ProcMacroCall, ProcMacroExpander};
-use proc_macro_api::warm::Environment;
 
 use config::Corpus;
 use record::{Record, Recorder, Records};
@@ -61,7 +61,7 @@ fn build(config: &Corpus, dir: &str, records: &Records, loaded: &mut Loaded) -> 
             .into_iter()
             .map(|eval| {
                 loaded.push((krate.to_owned(), eval.name.as_str().to_owned(), eval.expander.clone()));
-                Recorder::wrap(krate, eval, Vec::new(), records)
+                Recorder::wrap(krate, eval, records)
             })
             .collect())
     })
@@ -188,7 +188,7 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
         assert_eq!((&one.call.krate, &one.call.name), (&two.call.krate, &two.call.name), "both builds call in one order");
         match (one.eval.expanded(), two.eval.expanded()) {
             (Some(ours), Some(theirs)) => {
-                if let Some(difference) = native::difference(theirs, ours) {
+                if let Some(difference) = difference::difference(theirs, ours) {
                     panic!("{} is found otherwise than it was made: {difference}", two.what());
                 }
             }

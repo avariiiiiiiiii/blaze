@@ -381,10 +381,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_recursive_part_matches_every_depth() {
-        assert_eq!(
-            matched(&tree(), "/w/crates/a/**"),
-            ["/w/crates/a", "/w/crates/a/Cargo.toml", "/w/crates/a/src", "/w/crates/a/src/x"]
-        );
+        // A trailing `**` is glob's: the directories under the base, neither it nor files.
+        assert_eq!(matched(&tree(), "/w/crates/a/**"), ["/w/crates/a/src", "/w/crates/a/src/x"]);
         assert_eq!(
             matched(&tree(), "/w/**/Cargo.toml"),
             [

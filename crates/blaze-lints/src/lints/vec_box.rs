@@ -40,7 +40,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, path: ast::PathType<'t>, outer: Std
     if !ty.is_sized(db) {
         return false;
     }
-    let threshold = u64::try_from(cx.conf().int("vec-box-size-threshold", 4096)).unwrap_or(0);
+    let threshold = u64::try_from(cx.conf().int("vec-box-size-threshold", 4096)).expect("a count, checked as the configuration loads");
     let Ok(layout) = ty.layout(db) else { return false };
     if layout.size() >= threshold {
         return false;

@@ -30,8 +30,7 @@ A bump, in order (each step names itself when it fails, and stops there):
     are kept; a conflict stops the bump and names the files. It runs when
     the pin is already the nightly's too, so a bump branch made before library/ catches up;
  5. moves the pins written down elsewhere: the old toolchain name, rustc version line and
-    commit in install.sh, crates/proc-macro-srv (RUSTC_VERSION_STRING, which the server's
-    `--version` prints too), the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
+    commit in install.sh, the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
     docs/cargo.md, Cargo.toml's rust-version, and the flake's rust-overlay input (`nix flake
     update rust-overlay`, when nix is on PATH);
  6. installs the nightly with rustup.
@@ -40,9 +39,9 @@ What it leaves to you, which it prints at the end: answers.py --write on each of
 AArch64 Linux and arm64 macOS (the target specs depend on the host rustc was built for), the
 code that mirrors rustc by hand (the Rust ABI in the code generator, vtable.rs, type_id.rs,
 symbol names, new intrinsics and lang items: the checks find them), and `checks '{}'`. That
-includes blaze's proc-macro server: crates/proc-macro-srv is a crate of the workspace, built over
-the toolchain's `proc_macro` bridge and following it by hand, so a bridge that changed is a build
-error there to fix, not a copy to re-vendor. The rustc
+includes blaze's proc-macro server, crates/blaze-macro-eval, which speaks the pinned
+`library/proc_macro` bridge's protocol by hand and checks it at load (`protocol::check`), so a
+bridge that changed is an error there to fix, not a copy to re-vendor. The rustc
 and the daemon match by the whole `rustc -V` line, so a binary built before the bump refuses
 the new nightly until it is rebuilt. docs/contributing.md, "Moving to a newer nightly".
 """
@@ -76,7 +75,7 @@ HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-li
 COMPONENTS = ["rustc", "cargo", "rust-std", "rust-src", "llvm-tools-preview", "rustfmt-preview",
               "clippy-preview", "rust-analyzer-preview", "rustc-codegen-cranelift-preview"]
 # Where the old pin is written down besides harness/toolchain and pins.txt.
-MENTIONS = ["install.sh", "crates/proc-macro-srv/src/lib.rs", "crates/rustc_lexer/Cargo.toml"]
+MENTIONS = ["install.sh", "crates/rustc_lexer/Cargo.toml"]
 # Docs that name the pin as it is today. Only its names and `rustc -V` move there: a bare commit
 # in them can be what something was ported from.
 DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]

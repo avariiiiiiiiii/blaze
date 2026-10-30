@@ -759,7 +759,7 @@ error: aborting due to 1 previous error
 
 "##;
     let name = "derive-and-manual-partialeq-issue-147714.rs";
-    assert_eq!(ui_std(name, "2015", "sized,fmt,derive,eq,panic", PRINTLN, source), stderr);
+    assert_eq!(ui_std(name, "2015", "sized, fmt, derive, eq, panic", PRINTLN, source), stderr);
 }
 
 #[test]
@@ -816,5 +816,5 @@ error: aborting due to 1 previous error
 
 "##;
     let name = "reject_non_partial_eq.rs";
-    assert_eq!(ui_std(name, "2015", "sized,fmt,derive,eq,option,panic", PRINTLN, source), stderr);
+    assert_eq!(ui_std(name, "2015", "sized, fmt, derive, eq, option, panic", PRINTLN, source), stderr);
 }

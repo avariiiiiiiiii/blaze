@@ -3161,8 +3161,7 @@ fn resolve_type_param_assoc_type_shorthand_in(
                     };
                 }
                 AssocTypeShorthandResolution::NotFound => {
-                    never!("we checked that the trait defines this assoc type");
-                    continue;
+                    unreachable!("we checked that the trait defines this assoc type")
                 }
                 AssocTypeShorthandResolution::Cycle => return AssocTypeShorthandResolution::Cycle,
             };

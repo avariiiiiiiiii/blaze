@@ -540,18 +540,21 @@ fn derived_impls_get_the_items_lint_and_stability_attributes() {
             let frame = &Frame::new(Tag::Expand).expect("a test's frame");
             let (_, plain) = derive(frame, &source, adt_view(&parse), span);
             let (_, again) = derive(frame, &source, adt_view(&parse), span);
-            let impls = if name == "PartialEq" { 2 } else { 1 };
-            check.assert(&format!("{name} of the {edition:?} item"), frame, plain, again, impls);
+            // rustc's `StructuralPartialEq` impl is `is_const: false`, under `derive_const` too.
+            let (impls, consts) = if name == "PartialEq" { (2, 1) } else { (1, 1) };
+            let what = format!("{name} of the {edition:?} item");
+            check.assert(&what, frame, plain, again, impls, consts);
         }
         let frame = &Frame::new(Tag::Expand).expect("a test's frame");
         let plain = super::from_derive(frame, span, adt_view(&parse), &map);
         let again = super::from_derive(frame, span, adt_view(&parse), &map);
-        check.assert(&format!("From of the {edition:?} item"), frame, plain, again, 1);
+        check.assert(&format!("From of the {edition:?} item"), frame, plain, again, 1, 1);
     }
 }
 
 /// What [`derived_impls_get_the_items_lint_and_stability_attributes`] checks of one derive:
-/// `copied`, the item's attributes as `input` has them, before each of its `impls` impls.
+/// `copied`, the item's attributes as `input` has them, before each of its `impls` impls, of
+/// which `consts` are made `const` by `derive_const`.
 struct Copied<'a> {
     input: &'a tt::TopSubtree,
     copied: &'a str,
@@ -566,6 +569,7 @@ impl Copied<'_> {
         plain: ExpandResult<tt::TopSubtree<&'f Frame>>,
         again: ExpandResult<tt::TopSubtree<&'f Frame>>,
         impls: usize,
+        consts: usize,
     ) {
         let written =
             |it: &tt::TopSubtree<&Frame>| it.to_string().split_whitespace().collect::<String>();
@@ -576,13 +580,17 @@ impl Copied<'_> {
         let (plain, with) = (plain.value, with.value);
         assert_eq!(written(&plain).matches("impl").count(), impls, "{what}: {plain}");
         assert_eq!(written(&with), written(&plain).replace("impl", &format!("{copied}impl")), "{what}");
+        let mut first_leaf = None;
+        each_leaf(with.iter(), &mut |leaf| {
+            first_leaf.get_or_insert(*leaf.span());
+        });
         assert_eq!(
-            with.token_trees().first_span(),
+            first_leaf,
             self.input.token_trees().first_span(),
             "{what}: the first copied `#` is the item's own"
         );
         assert_eq!(
-            with.token_trees().first_span().map(|it| it.ctx),
+            first_leaf.map(|it| it.ctx),
             Some(SyntaxContext::root(self.edition)),
             "{what}: the copied `#` keeps the item's edition"
         );
@@ -590,7 +598,7 @@ impl Copied<'_> {
         let as_const = super::as_const_impls(frame, with);
         assert_eq!(
             written(&as_const).matches(&format!("{copied}constimpl")).count(),
-            impls,
+            consts,
             "{what}: {as_const}"
         );
     }
@@ -938,8 +946,15 @@ fn derived_impls_start_with_automatically_derived() {
         let impls = written(&plain.value).matches("impl").count();
         let full = super::as_const_impls(frame, super::with_item_attrs(frame, &input, marked));
         assert_eq!(
-            written(&full).matches(&format!("{marker}#[allow(dead_code)]constimpl")).count(),
+            written(&full).matches(&format!("{marker}#[allow(dead_code)]")).count(),
             impls,
+            "{name}: {full}"
+        );
+        // rustc's `StructuralPartialEq` impl is `is_const: false`, under `derive_const` too.
+        let consts = if name == "PartialEq" { impls - 1 } else { impls };
+        assert_eq!(
+            written(&full).matches(&format!("{marker}#[allow(dead_code)]constimpl")).count(),
+            consts,
             "{name}: {full}"
         );
         names += 1;

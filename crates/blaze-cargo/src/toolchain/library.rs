@@ -25,8 +25,6 @@ use std::{
     time::Duration,
 };
 
-use sha2::{Digest as _, Sha256};
-
 use blaze_registry::http::HyperHttp;
 
 /// The variable that names the library's directory to a process blaze starts.
@@ -95,11 +93,6 @@ static FOUND: OnceLock<Result<Library, String>> = OnceLock::new();
 /// What [`fetch`] downloaded, when the library was not found before.
 static FETCHED: OnceLock<Library> = OnceLock::new();
 
-/// Why there is no library here, for an error that says so: what finding it said.
-pub fn why_not() -> String {
-    found().err().unwrap_or_default()
-}
-
 /// Where the library is, found with nothing fetched (or fetched by this process); `Err` says
 /// why there is none.
 pub fn found() -> Result<&'static Library, String> {
@@ -132,20 +125,20 @@ fn look() -> Result<Library, String> {
             )
         });
     }
-    candidates()
+    candidates()?
         .into_iter()
         .find_map(Library::ours_at)
         .ok_or_else(|| format!("blaze's standard library (digest {}) is not here", short()))
 }
 
 /// Where a copy of the library this blaze was built with can be, with nothing fetched.
-fn candidates() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize) {
-        dirs.extend(exe.ancestors().skip(1).take(3).map(|it| it.join("share/blaze/library")));
-    }
+fn candidates() -> Result<Vec<PathBuf>, String> {
+    let exe = std::env::current_exe().and_then(std::fs::canonicalize).map_err(|error| {
+        format!("finding blaze's own program, beside which its standard library can be: {error}")
+    })?;
+    let mut dirs: Vec<PathBuf> = exe.ancestors().skip(1).take(3).map(|it| it.join("share/blaze/library")).collect();
     dirs.extend(own());
-    dirs
+    Ok(dirs)
 }
 
 /// blaze's own copy of the library: `~/.blaze/library/<digest>/library`, in a directory of
@@ -176,7 +169,7 @@ pub fn fetch() -> Result<Library, String> {
          home directory: `BLAZE_HOME` names where to keep it"
             .to_owned()
     })?;
-    let given = std::env::var(FROM_VAR).ok().filter(|it| !it.is_empty());
+    let given = super::given_var(FROM_VAR).map_err(|it| it.to_string())?;
     let from = match (given, Library::ours_at(checkout())) {
         (Some(given), _) => given,
         (None, Some(_)) => checkout().to_string_lossy().into_owned(),
@@ -294,7 +287,8 @@ fn download(from: &str, file: &str) -> anyhow::Result<Vec<u8>> {
                 .and_then(|it| it.ok_or_else(|| anyhow::anyhow!("not there")));
             match got {
                 Ok(bytes) => return Ok(bytes),
-                Err(e) if tries + 1 == TRIES => return Err(e.context(file.to_owned())),
+                // alloc: error path, the last failure.
+                Err(e) if tries + 1 == TRIES => return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES })),
                 Err(_) => tries += 1,
             }
             tokio::time::sleep(Duration::from_secs(tries.into())).await;
@@ -302,15 +296,15 @@ fn download(from: &str, file: &str) -> anyhow::Result<Vec<u8>> {
     })
 }
 
-/// The digest of the library at `dir`: the sha256 of a line per file and link under it but
-/// `DIGEST`, in the order of their paths' bytes, each `<kind> <sha256 of its bytes, or of
+/// The digest of the library at `dir`: the BLAKE3 hash of a line per file and link under it but
+/// `DIGEST`, in the order of their paths' bytes, each `<kind> <BLAKE3 of its bytes, or of
 /// where a link points> <path>`, kind `file` or `link`. `harness/library.py` writes the same.
 /// Whether a file is executable is not in it: Windows does not say.
 pub fn digest_of(dir: &Path) -> std::io::Result<String> {
     let mut found = Vec::new();
     list(dir, "", &mut found)?;
     blaze_ids::names::sort_by_name(&mut found, |it| it.1.as_bytes());
-    let mut all = Sha256::new();
+    let mut all = blaze_ids::b3::Hasher::new();
     for (kind, path, full) in found {
         let bytes = match kind {
             "link" => std::fs::read_link(&full)?.to_string_lossy().into_owned().into_bytes(),
@@ -320,7 +314,7 @@ pub fn digest_of(dir: &Path) -> std::io::Result<String> {
                 bytes
             }
         };
-        let hash = crate::content::hex(&Sha256::digest(&bytes));
+        let hash = crate::content::hex(&blaze_ids::b3::hash(&bytes));
         all.update(format!("{kind} {hash} {path}\n").as_bytes());
     }
     Ok(crate::content::hex(&all.finalize()))

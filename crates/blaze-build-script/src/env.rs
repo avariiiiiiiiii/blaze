@@ -19,10 +19,12 @@ use std::{
     cmp::Ordering,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
-    process::Command,
 };
 
-use crate::{Error, unit::Unit};
+use crate::{
+    Error,
+    unit::{Package, Unfilled, Unit},
+};
 
 /// A script's whole environment, and which of it cargo sets from the unit.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -84,10 +86,6 @@ impl Env {
             .map(|((name, value), _)| (name.as_os_str(), value.as_os_str()))
     }
 
-    /// Gives `command` this environment and no other.
-    pub fn apply(&self, command: &mut Command) {
-        command.env_clear().envs(self.vars.iter().map(|(name, value)| (name, value)));
-    }
 }
 
 /// What cargo sets on the command, in order, over what it inherits: a variable set, or taken
@@ -265,15 +263,17 @@ fn decimal(mut n: u32) -> String {
 }
 
 /// A cfg as `rustc --print cfg` prints it: a name, or a name and a quoted value.
-fn cfg_of(line: &str) -> (&str, Option<&str>) {
+fn cfg_of<'l>(package: &Package, line: &'l str) -> Result<(&'l str, Option<&'l str>), Unfilled> {
     match line.split_once('=') {
         Some((name, value)) => {
             let value = value.trim();
-            let value =
-                value.strip_prefix('"').and_then(|it| it.strip_suffix('"')).unwrap_or(value);
-            (name.trim(), Some(value))
+            match value.strip_prefix('"').and_then(|it| it.strip_suffix('"')) {
+                Some(value) => Ok((name.trim(), Some(value))),
+                // alloc: error path.
+                None => Err(Unfilled::Cfg { package: package.descr(), line: line.to_owned() }),
+            }
         }
-        None => (line.trim(), None),
+        None => Ok((line.trim(), None)),
     }
 }
 
@@ -475,6 +475,7 @@ const FIXED: usize = 40;
 /// The environment cargo runs `unit`'s script with, when cargo's own is `inherited` (see
 /// [`cargo_started`]).
 pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error> {
+    unit.check()?;
     let host = HostOs::of(&unit.host);
     let inherited_var = |name: &str| {
         inherited.iter().find(|(it, _)| it == OsStr::new(name)).map(|(_, value)| value.as_os_str())
@@ -500,8 +501,10 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
         search_path.push(host_root.clone());
     }
     search_path.extend(search.host_deps.iter().cloned());
-    // alloc: setup, once per unit: the search path it sets.
-    search_path.push(search.sysroot_libdir.clone());
+    if !search.sysroot_libdir.as_os_str().is_empty() {
+        // alloc: setup, once per unit: the search path it sets.
+        search_path.push(search.sysroot_libdir.clone());
+    }
     let dylib_path =
         inherited_var(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
     let dylib_path_is_empty = dylib_path.is_empty();
@@ -519,7 +522,7 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
     }
     cmd.set(host.dylib_var, host.join_paths(&search_path, host.dylib_var)?);
     cmd.set("CARGO", &unit.tools.cargo);
-    let version = Version::of(&package.version);
+    let version = Version::of(package)?;
     cmd.set("CARGO_MANIFEST_DIR", &package.manifest_dir);
     cmd.set("CARGO_MANIFEST_PATH", &package.manifest_path);
     cmd.set("CARGO_PKG_VERSION_MAJOR", version.major);
@@ -576,7 +579,7 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
         cfgs.insert("debug_assertions", []);
     }
     for line in &unit.target_cfgs {
-        match cfg_of(line) {
+        match cfg_of(package, line)? {
             ("debug_assertions", None) => {}
             (name, None) => cfgs.insert(name, []),
             (name, Some(value)) => cfgs.add(name, value),
@@ -716,12 +719,23 @@ struct Version<'a> {
 }
 
 impl Version<'_> {
-    fn of(version: &str) -> Version<'_> {
-        let version = version.split_once('+').map_or(version, |(it, _)| it);
+    /// The parts of `package`'s version, which cargo's manifest reader has made semver's: three
+    /// numbers, then a pre-release and build metadata, each optional.
+    fn of(package: &Package) -> Result<Version<'_>, Unfilled> {
+        let whole = package.version.as_str();
+        let version = whole.split_once('+').map_or(whole, |(it, _)| it);
         let (numbers, pre) = version.split_once('-').unwrap_or((version, ""));
-        let mut numbers = numbers.splitn(3, '.');
-        let mut next = || numbers.next().unwrap_or("0");
-        Version { major: next(), minor: next(), patch: next(), pre }
+        let digits = |it: &str| !it.is_empty() && it.bytes().all(|b| b.is_ascii_digit());
+        let mut parts = numbers.split('.');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(major), Some(minor), Some(patch), None)
+                if digits(major) && digits(minor) && digits(patch) =>
+            {
+                Ok(Version { major, minor, patch, pre })
+            }
+            // alloc: error path.
+            _ => Err(Unfilled::Version { package: package.descr(), version: whole.to_owned() }),
+        }
     }
 }
 

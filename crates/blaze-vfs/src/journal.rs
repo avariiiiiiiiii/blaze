@@ -669,8 +669,8 @@ fn record(bytes: &[u8]) -> Option<Record<'_>> {
 }
 
 /// Loads one record; `None` when it names a node that is not there or is malformed (a
-/// directory's names not distinct path components in order, a sequence number at or above
-/// [`SEQUENCES`]). `sequence` becomes the largest any record names.
+/// directory's names not distinct path components in order, a sequence number with no next
+/// below [`SEQUENCES`]). `sequence` becomes the largest any record names.
 fn load(
     tree: &mut Tree,
     record: &Record<'_>,
@@ -736,7 +736,8 @@ fn load(
     Some(())
 }
 
-/// The sequence number a record's payload starts with, if it is below [`SEQUENCES`].
+/// The sequence number a record's payload starts with, if the one after it is below
+/// [`SEQUENCES`], so a head moved after recovery is numbered.
 fn sequence_at(read: &mut Reader<'_>) -> Option<u64> {
-    read.u64().ok().filter(|&at| at < SEQUENCES)
+    read.u64().ok().filter(|&at| at < SEQUENCES - 1)
 }

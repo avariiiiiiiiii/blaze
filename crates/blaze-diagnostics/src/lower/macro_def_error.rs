@@ -140,6 +140,28 @@ impl<'db> Trees<'db> {
     fn peek_kind(&mut self) -> Option<SyntaxKind> {
         self.peek().and_then(Tree::kind)
     }
+
+    /// The range of a `=>` next. A token tree holds single-character punctuation, so this is
+    /// rustc's glue of a `=` written right before a `>`.
+    fn peek_fat_arrow(&mut self) -> Option<TextRange> {
+        let eq = self.peek()?.token()?;
+        if eq.kind() == SyntaxKind::FAT_ARROW {
+            return Some(eq.text_range());
+        }
+        if eq.kind() != SyntaxKind::EQ {
+            return None;
+        }
+        let NodeOrToken::Token(gt) = eq.next_sibling_or_token()? else { return None };
+        (gt.kind() == SyntaxKind::R_ANGLE).then(|| TextRange::new(eq.text_range().start(), gt.text_range().end()))
+    }
+
+    /// Takes a `=>` ([`Self::peek_fat_arrow`]); `false`, taking nothing, when none is next.
+    fn eat_fat_arrow(&mut self) -> bool {
+        let Some(arrow) = self.peek_fat_arrow() else { return false };
+        while self.children.next_if(|it| it.range().end() <= arrow.end()).is_some() {}
+        self.end = arrow.end();
+        true
+    }
 }
 
 fn delimiter(group: ast::TokenTree<'_>) -> Option<SyntaxKind> {
@@ -274,8 +296,7 @@ impl<'db> Checker<'_, '_, 'db> {
                 if self.no_eof(&mut trees, "expected macro derive body") {
                     return;
                 }
-                if trees.peek_kind() == Some(SyntaxKind::FAT_ARROW) {
-                    let arrow = trees.peek().expect("peeked").range();
+                if let Some(arrow) = trees.peek_fat_arrow() {
                     let derive = self.span(derive_range);
                     let diag = self.error(arrow, "expected macro derive body, got `=>`");
                     if !args_empty {
@@ -288,11 +309,10 @@ impl<'db> Checker<'_, '_, 'db> {
             }
             let lhs = trees.next().expect("checked");
             self.lhs(&lhs);
-            if trees.peek_kind() != Some(SyntaxKind::FAT_ARROW) {
+            if !trees.eat_fat_arrow() {
                 self.expected(&mut trees, "=>");
                 return;
             }
-            trees.next();
             if self.no_eof(&mut trees, "expected right-hand side of macro rule") {
                 return;
             }

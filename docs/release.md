@@ -92,7 +92,8 @@ main's HEAD the same way (`train_release.py`): a tag through the API and release
 no commit. Both count every tag, so they never take the same number.
 
 Either way `release.yaml` builds the archives on the tag for macOS (Apple silicon) and Linux
-(x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS`. PGO is off for now (#870):
+(x86-64, ARM64) and publishes them as a prerelease with `SHA256SUMS` (what install.sh checks) and `B3SUMS` (what a
+pinned release's fetch checks). PGO is off for now (#870):
 the release is built with `--no-pgo`.
 
 ## Promotion to stable

@@ -690,7 +690,19 @@ pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
         return DefMapPair::new(db, def_map, local_def_map);
     }
     let Some((def_map, local_def_map)) = delta::published(db, crate_id) else {
-        panic!("nameres: no maintained resolution for crate {crate_id:?}: no maintainer ran")
+        let name = |krate: Crate| match &krate.extra_data(db).display_name {
+            Some(name) => format!("`{}` ({krate:?})", name.crate_name()),
+            None => format!("{krate:?}"),
+        };
+        match delta::maintaining() {
+            Some(asking) => panic!(
+                "nameres: no maintained resolution for crate {} read while maintaining crate {}: \
+                 it is not maintained before it",
+                name(crate_id),
+                name(asking)
+            ),
+            None => panic!("nameres: no maintained resolution for crate {}: no maintainer ran", name(crate_id)),
+        }
     };
     frozen::check(db, crate_id, &def_map, &local_def_map);
     DefMapPair::new(db, def_map, local_def_map)

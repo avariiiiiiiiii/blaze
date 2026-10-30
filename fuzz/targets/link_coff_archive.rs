@@ -202,13 +202,13 @@ fn long_import(dll: &str, symbol: &str, thunk: u64, value: u64) -> Vec<u8> {
 fn short_import(symbol: &str, dll: &str) -> Vec<u8> {
     let strings: Vec<u8> = [symbol, dll].iter().flat_map(|it| it.bytes().chain([0])).collect();
     let mut out = Vec::new();
-    for value in [pe::IMAGE_FILE_MACHINE_UNKNOWN, 0xffff, 0, pe::IMAGE_FILE_MACHINE_AMD64] {
+    for value in [pe::IMAGE_FILE_MACHINE_UNKNOWN.0, 0xffff, 0, pe::IMAGE_FILE_MACHINE_AMD64.0] {
         out.extend_from_slice(&value.to_le_bytes());
     }
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&(pe::IMPORT_OBJECT_CODE | (pe::IMPORT_OBJECT_NAME << 2)).to_le_bytes());
+    out.extend_from_slice(&(pe::IMPORT_OBJECT_CODE.0 | (pe::IMPORT_OBJECT_NAME.0 << 2)).to_le_bytes());
     out.extend_from_slice(&strings);
     out
 }

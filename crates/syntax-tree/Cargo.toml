@@ -15,10 +15,10 @@ publish = false
 blaze-bytes.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
-rustc-hash = "1.0.1"
-text-size = "1.1.0"
+rustc-hash.workspace = true
+text-size.workspace = true
 
-serde = { version = "1.0.89", optional = true, default-features = false }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

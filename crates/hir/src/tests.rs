@@ -272,6 +272,24 @@ fn a_build_gets_no_mir_of_a_body_whose_borrow_check_failed() {
     });
 }
 
+/// A diagnostic of code with no syntax of its own is reported at the item whose body the code
+/// is in, never dropped: the place `UnplacedDiagnostic` gets is the item's own node.
+#[test]
+fn an_unplaced_diagnostic_is_at_the_item_of_its_body() {
+    use hir_def::{Lookup as _, src::HasSource as _};
+    let db = fixture::db("fn f() -> u32 { 1 }").into_db();
+    crate::attach_db(&db, || {
+        let def = function(&db, "f");
+        let DefWithBodyId::FunctionId(func) = def else { panic!("`f` is a function") };
+        let (_, source_map) = hir_def::expr_store::Body::with_source_map(&db, def);
+        let owner =
+            crate::diagnostics::unplaced_owner(&db, InferBodyId::DefWithBodyId(def), source_map);
+        let item: hir_expand::InFile<syntax::SyntaxNodePtr> =
+            func.lookup(&db).ast_ptr(&db).map(Into::into);
+        assert_eq!(owner, item);
+    });
+}
+
 #[test]
 fn a_lint_of_the_borrow_checker_lets_the_body_build() {
     let db = fixture::db(MOVED_TWICE).into_db();

@@ -126,10 +126,14 @@ pub fn intern_layout(layout: Layout) -> Interned<'static, InternedLayout> {
 pub enum LayoutError {
     // FIXME: Remove more variants once they get added to LayoutCalculatorError
     BadCalc(LayoutCalculatorError<()>),
+    /// `variant`'s discriminant did not evaluate; rustc reports it (E0080) and stops.
+    DiscriminantFailed { variant: EnumVariantId },
     HasErrorConst,
     HasErrorType,
     HasPlaceholder,
     InvalidSimdType,
+    /// `ty`'s aliases do not normalize: rustc's `LayoutError::NormalizationFailure`.
+    NormalizationFailure { ty: StoredTy },
     NotImplemented,
     RecursiveTypeWithoutIndirection,
     /// A scalable vector in a struct, enum, tuple, array or closure: rustc lays it out at the
@@ -145,10 +149,16 @@ impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LayoutError::BadCalc(err) => err.fallback_fmt(f),
+            LayoutError::DiscriminantFailed { variant } => {
+                write!(f, "the discriminant of {variant:?} did not evaluate")
+            }
             LayoutError::HasErrorConst => write!(f, "type contains an unevaluatable const"),
             LayoutError::HasErrorType => write!(f, "type contains an error"),
             LayoutError::HasPlaceholder => write!(f, "type contains placeholders"),
             LayoutError::InvalidSimdType => write!(f, "invalid simd type definition"),
+            LayoutError::NormalizationFailure { ty } => {
+                write!(f, "unable to determine layout for `{:?}`: it cannot be normalized", ty.as_ref())
+            }
             LayoutError::NotImplemented => write!(f, "not implemented"),
             LayoutError::RecursiveTypeWithoutIndirection => {
                 write!(f, "recursive type without indirection")
@@ -339,16 +349,23 @@ impl<'db> Normalizer<'db> {
         Self { db, krate, param_env, cause: ObligationCause::dummy(), infcx: OnceCell::new() }
     }
 
-    fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
+    fn normalize(&self, ty: Ty<'db>) -> Result<Ty<'db>, LayoutError> {
         // `deeply_normalize` refuses these, aliases or not.
         assert!(!ty.has_escaping_bound_vars());
         if !needs_normalizing(ty) {
-            return ty;
+            return Ok(ty);
         }
         let infcx = self.infcx.get_or_init(|| {
             DbInterner::new_with(self.db, self.krate).infer_ctxt().build(TypingMode::PostAnalysis)
         });
-        infcx.at(&self.cause, self.param_env).deeply_normalize(ty).unwrap_or(ty)
+        // An alias rigid in the typing mode the type comes from may not be in `PostAnalysis`,
+        // as rustc's `layout_of` resets them when it switches.
+        let unnormalized =
+            rustc_type_ir::set_aliases_to_non_rigid(infcx.interner, ty).skip_normalization();
+        infcx
+            .at(&self.cause, self.param_env)
+            .deeply_normalize(unnormalized)
+            .map_err(|_| LayoutError::NormalizationFailure { ty: ty.store() })
     }
 }
 
@@ -421,7 +438,7 @@ fn layout_of_ty_in(
     let dl = target;
     let cx = LayoutCx::new(dl);
     let normalizer = Normalizer::new(db, krate, trait_env.param_env(db));
-    let ty = normalizer.normalize(ty.as_ref());
+    let ty = normalizer.normalize(ty.as_ref())?;
     let result = match ty.kind() {
         TyKind::Adt(def, args) => {
             match def.def_id() {
@@ -544,8 +561,17 @@ fn layout_of_ty_in(
             // }
 
             // The tail can be behind an associated type, such as `A::Dyn`.
-            let normalize = |ty| normalizer.normalize(ty);
+            let failed = std::cell::Cell::new(None);
+            let normalize = |ty| {
+                normalizer.normalize(ty).unwrap_or_else(|err| {
+                    failed.set(Some(err));
+                    ty
+                })
+            };
             let unsized_part = struct_tail_erasing_lifetimes(db, pointee, &normalize);
+            if let Some(err) = failed.take() {
+                return Err(err);
+            }
             let metadata = match unsized_part.kind() {
                 TyKind::Slice(_) | TyKind::Str => {
                     scalar_unit(dl, Primitive::Int(dl.ptr_sized_integer(), false))

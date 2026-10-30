@@ -155,9 +155,12 @@ fn where_predicates_are_the_written_ones() {
     crate::attach_db(&db, || {
         let f = func(&db, "bounded");
         let preds = crate::GenericDef::Function(f).where_predicates(&db);
-        assert_eq!(preds.len(), 2, "`T: Copy` and `T: Tr`, not the implied `Sized`: {preds:?}");
+        let traits: Vec<_> = preds
+            .iter()
+            .map(|it| it.as_trait().expect("a trait bound").trait_ref().trait_().name(&db).as_str().to_owned())
+            .collect();
+        assert_eq!(traits, ["Copy", "Tr", "Sized"], "the written ones, then the implicit `Sized`");
         for pred in &preds {
-            assert!(pred.as_trait().is_some());
             let types: Vec<_> =
                 pred.types().iter().map(|it| show(&db, it, target(&db, f))).collect();
             assert_eq!(types, ["T"]);

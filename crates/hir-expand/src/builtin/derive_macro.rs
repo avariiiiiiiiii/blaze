@@ -179,6 +179,37 @@ fn with_item_attrs<'f>(
     let mut builder = tt::TopSubtreeBuilder::new(expanded.top_subtree().delimiter);
     let mut items = expanded.token_trees().iter();
     while let Some(next) = items.peek() {
+        match next {
+            // An impl kept out of `as_const_impls` in its own invisible group (`StructuralPartialEq`):
+            // rustc copies the item's attributes onto it too.
+            tt::TtElement::Subtree(group, inner)
+                if group.delimiter.kind == tt::DelimiterKind::Invisible
+                    && starts_an_impl(inner.clone()) =>
+            {
+                builder.open(tt::DelimiterKind::Invisible, group.delimiter.open);
+                put_before_impls(&mut builder, inner, &attrs);
+                builder.close(group.delimiter.close);
+                items.next();
+                continue;
+            }
+            tt::TtElement::Leaf(tt::Leaf::Ident(ident)) if ident.sym == sym::kw_impl => {
+                attrs.iter().for_each(|attr| builder.extend_with_tt(*attr));
+            }
+            _ => {}
+        }
+        let Some(item) = items.next_as_view() else { break };
+        builder.extend_with_tt(item);
+    }
+    builder.build_in(frame)
+}
+
+/// `items` into `builder`, with `attrs` before each `impl` among them.
+fn put_before_impls(
+    builder: &mut tt::TopSubtreeBuilder,
+    mut items: tt::TtIter<'_>,
+    attrs: &[tt::TokenTreesView<'_>],
+) {
+    while let Some(next) = items.peek() {
         if let tt::TtElement::Leaf(tt::Leaf::Ident(ident)) = &next
             && ident.sym == sym::kw_impl
         {
@@ -187,7 +218,22 @@ fn with_item_attrs<'f>(
         let Some(item) = items.next_as_view() else { break };
         builder.extend_with_tt(item);
     }
-    builder.build_in(frame)
+}
+
+/// Whether `items` is an impl: `impl` after any outer attributes.
+fn starts_an_impl(mut items: tt::TtIter<'_>) -> bool {
+    loop {
+        match items.next() {
+            Some(tt::TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: '#', .. }))) => {
+                let Some(tt::TtElement::Subtree(group, _)) = items.next() else { return false };
+                if group.delimiter.kind != tt::DelimiterKind::Bracket {
+                    return false;
+                }
+            }
+            Some(tt::TtElement::Leaf(tt::Leaf::Ident(it))) => return it.sym == sym::kw_impl,
+            _ => return false,
+        }
+    }
 }
 
 /// The derive's impls, each starting with `#[automatically_derived]` at the derive's `span`, as
@@ -1430,11 +1476,9 @@ fn debug_derive<'f>(
         // The `&` that rustc's `Debug` puts before the last field of a packed struct, which may
         // be unsized: a `&dyn Debug` is made of a reference to the copy out of it.
         let by_ref = |b: &mut Builder, v: &Variant, i: usize| {
-            in_group(b, span, |b| {
-                if adt.packed && i + 1 == v.end as usize {
-                    b.push(punct('&', tt::Spacing::Alone, span).into());
-                }
-            })
+            if adt.packed && i + 1 == v.end as usize {
+                b.push(punct('&', tt::Spacing::Alone, span).into());
+            }
         };
         // Spelled out in full, as rustc does: a method of the same name on some other trait must
         // not be picked up.
@@ -2305,10 +2349,11 @@ fn path_pointee_paths(
 ) -> bool {
     let mut found = false;
     for segment in path.segments() {
-        if let Some(anchor) = segment.type_anchor() {
-            found |= anchor.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths));
-            found |= anchor
-                .path_type()
+        // `kind`, not `TypeAnchor::ty` and `path_type`: both are the anchor's first type, `U`
+        // of `<U as Tr<T>>`.
+        if let Some(ast::PathSegmentKind::Type { type_ref, trait_ref }) = segment.kind() {
+            found |= type_ref.is_some_and(|ty| pointee_paths(ty, pointee, paths));
+            found |= trait_ref
                 .and_then(|it| it.path())
                 .is_some_and(|it| path_pointee_paths(it, pointee, paths));
         }

@@ -18,7 +18,7 @@ fn ui(name: &str, source: &str) -> String {
 /// What rustc writes of the lint `lint` compiling the UI test `source` as [`ui`] does: its
 /// diagnostics alone.
 fn ui_lint(name: &str, source: &str, lint: &str) -> String {
-    let fixture = format!("//- /{name} crate:main edition:2015\n{source}");
+    let fixture = format!("//- /{name} crate:other:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     let sources = checked.sources();
     let style = Style { ui_testing: true, ..Style::default() };

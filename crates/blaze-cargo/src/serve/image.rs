@@ -13,45 +13,123 @@
 //!   for [`Database::settle`].
 //! - The plane's history is the predictor's bytes, a [`History`], in
 //!   [`SectionId::PLANE_HISTORY`] under [`HISTORY`]. One of another blaze starts an empty
-//!   history, which changes how work is ordered and admitted, never what is built; one that is
-//!   corrupt or does not decode is an error.
+//!   history ([`Unlearned`]), which changes how work is ordered and admitted, never what is
+//!   built; one that is corrupt or does not decode is an error ([`HistoryError`]).
+//! - An image that is not made is an [`ImageFailed`]: the one before it stays on disk, and
+//!   whoever asked (the cold build's settle, a snapshot, a stop) fails with it.
 
 #![forbid(unsafe_code)]
 
 use std::{
+    fmt,
     panic::resume_unwind,
     sync::{Arc, Mutex},
 };
 
-use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
+use blaze_core::{Completion, Done, Effect, FileName, IoError, Mapping, Tag};
 use blaze_format::SchemaHash;
 use blaze_history::{DecodeError, History};
-use blaze_image::{Builder, Image, SectionId, Stable};
-use blaze_query::Database;
+use blaze_image::{Builder, Corrupt, Image, OpenError, Refused, SectionId, Stable, TooLarge};
+use blaze_query::{Database, DbError};
 use blaze_vfs::{ImageError, ImageMark, Vfs};
 
 /// The schema of the plane's history section: [`History::encode`]'s bytes, by their version.
 pub const HISTORY: SchemaHash =
     blaze_format::schema("blaze plane history 2: blaze_history::History::encode bytes, version blzhis01");
 
-/// The plane's history in `image`, as `config` sizes it. An image written without one, or
-/// with one of another blaze, gives an empty history and says so on stderr.
-pub fn history<S: Stable>(image: &Image<S>, config: blaze_history::Config) -> Result<History, String> {
+/// Why the plane's history starts empty from an image: the image was written by another blaze.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Unlearned {
+    /// The image has no history section, or one of another schema.
+    Refused(Refused),
+    /// The section holds another version of [`History::encode`]'s bytes.
+    Version,
+}
+
+impl fmt::Display for Unlearned {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unlearned::Refused(refused) => write!(f, "{refused}"),
+            Unlearned::Version => write!(f, "the image's {} is of another blaze", SectionId::PLANE_HISTORY),
+        }
+    }
+}
+
+/// Why the plane's history in an image can't be read: the daemon does not start.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum HistoryError {
+    Corrupt(Corrupt),
+    Decode(DecodeError),
+}
+
+impl fmt::Display for HistoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HistoryError::Corrupt(corrupt) => write!(f, "{corrupt}"),
+            HistoryError::Decode(error) => write!(f, "{}: {error}", SectionId::PLANE_HISTORY),
+        }
+    }
+}
+
+/// The plane's history in `image`, as `config` sizes it, and why it starts empty when the image
+/// was written without one or with one of another blaze.
+pub fn history<S: Stable>(
+    image: &Image<S>,
+    config: blaze_history::Config,
+) -> Result<(History, Option<Unlearned>), HistoryError> {
     let section = match image.section(SectionId::PLANE_HISTORY, HISTORY) {
         Ok(section) => section,
-        Err(refused) => {
-            eprintln!("blaze serve: {refused}; the plane's history starts empty");
-            return Ok(History::new(config));
-        }
+        Err(refused) => return Ok((History::new(config), Some(Unlearned::Refused(refused)))),
     };
-    let bytes = image.whole(&section).map_err(|corrupt| corrupt.to_string())?;
+    let bytes = image.whole(&section).map_err(HistoryError::Corrupt)?;
     match History::decode(bytes, config) {
-        Ok(history) => Ok(history),
-        Err(DecodeError::Version) => {
-            eprintln!("blaze serve: the image's {} is of another blaze; it starts empty", SectionId::PLANE_HISTORY);
-            Ok(History::new(config))
+        Ok(history) => Ok((history, None)),
+        Err(DecodeError::Version) => Ok((History::new(config), Some(Unlearned::Version))),
+        Err(error) => Err(HistoryError::Decode(error)),
+    }
+}
+
+/// Why an image asked was not made.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Unmade {
+    /// The VFS's journal is moving to another image and nothing is left in flight to wait on.
+    Busy,
+    /// A group of the image the VFS was restored from failed its check.
+    Vfs(Corrupt),
+    Db(DbError),
+    TooLarge(TooLarge),
+    Write(IoError),
+    Map(IoError),
+    /// The image just written does not open.
+    Open(OpenError),
+}
+
+/// An image of `file` not made, and why.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ImageFailed {
+    pub file: FileName,
+    pub why: Unmade,
+}
+
+impl fmt::Display for ImageFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let file = &self.file;
+        match &self.why {
+            Unmade::Busy => write!(f, "the daemon image /{file}: {}", ImageError::Busy),
+            Unmade::Vfs(corrupt) => write!(f, "the daemon image /{file}: {}", ImageError::Corrupt(*corrupt)),
+            Unmade::Db(error) => write!(f, "the database's sections of the daemon image /{file}: {error}"),
+            Unmade::TooLarge(error) => write!(f, "the daemon image /{file}: {error}"),
+            Unmade::Write(error) => write!(f, "writing the daemon image /{file}: {error}"),
+            Unmade::Map(error) => write!(f, "mapping the daemon image /{file} just written: {error}"),
+            Unmade::Open(error) => write!(f, "the daemon image /{file} just written: {error}"),
         }
-        Err(error) => Err(format!("{}: {error}", SectionId::PLANE_HISTORY)),
+    }
+}
+
+/// For the API's error text, at the edge.
+impl From<&ImageFailed> for String {
+    fn from(failed: &ImageFailed) -> String {
+        failed.to_string()
     }
 }
 
@@ -81,7 +159,7 @@ pub struct Images {
     /// The last image made, mapped, until the database settles onto it.
     mapped: Option<Arc<Image<Mapping>>>,
     /// Why the last image asked was not made; cleared when one is asked again.
-    failed: Option<String>,
+    failed: Option<ImageFailed>,
 }
 
 impl Images {
@@ -132,16 +210,16 @@ impl Images {
                 let before = parts.effects.len();
                 parts.vfs.flush(parts.effects);
                 if idle && parts.effects.len() == before {
-                    return self.fail(format!("the daemon image /{}: {}", self.file, ImageError::Busy));
+                    return self.fail(Unmade::Busy);
                 }
                 self.state = State::Waiting;
                 return;
             }
-            Err(error @ ImageError::Corrupt(_)) => return self.fail(format!("the daemon image /{}: {error}", self.file)),
+            Err(ImageError::Corrupt(corrupt)) => return self.fail(Unmade::Vfs(corrupt)),
         };
         let mut live = intern::Live::new();
         if let Err(error) = parts.db.write_image(&mut builder, &mut live) {
-            return self.fail(format!("the database's sections of the daemon image /{}: {error}", self.file));
+            return self.fail(Unmade::Db(error));
         }
         builder.add(SectionId::PLANE_HISTORY, HISTORY, &parts.predict.encode());
         intern::write_symbols(&live, &mut builder);
@@ -151,7 +229,7 @@ impl Images {
                 parts.effects.push(Effect::Write { file: self.file.clone(), bytes, tag: self.write });
                 self.state = State::Writing { mark };
             }
-            Err(error) => self.fail(format!("the daemon image /{}: {error}", self.file)),
+            Err(error) => self.fail(Unmade::TooLarge(error)),
         }
     }
 
@@ -165,24 +243,20 @@ impl Images {
                 effects.push(Effect::Map { file: self.file.clone(), tag: self.map });
                 self.state = State::Mapping;
             }
-            (State::Writing { .. }, Done::Failed(error)) => {
-                self.fail(format!("writing the daemon image /{}: {error}", self.file));
-            }
+            (State::Writing { .. }, Done::Failed(error)) => self.fail(Unmade::Write(error)),
             (State::Mapping, Done::Mapped(mapping)) => match Image::open(mapping) {
                 Ok(image) => self.mapped = Some(Arc::new(image)),
-                Err(error) => self.fail(format!("the daemon image /{} just written: {error}", self.file)),
+                Err(error) => self.fail(Unmade::Open(error)),
             },
-            (State::Mapping, Done::Failed(error)) => {
-                self.fail(format!("mapping the daemon image /{} just written: {error}", self.file));
-            }
+            (State::Mapping, Done::Failed(error)) => self.fail(Unmade::Map(error)),
             (_, done) => unreachable!("the daemon image's effect completed with {done:?}"),
         }
     }
 
-    fn fail(&mut self, why: String) {
-        eprintln!("blaze serve: {why}; the image before it stays");
+    fn fail(&mut self, why: Unmade) {
         self.state = State::Idle;
-        self.failed = Some(why);
+        // clone: a refcount, once a failed image.
+        self.failed = Some(ImageFailed { file: self.file.clone(), why });
     }
 
     /// Whether every image asked was made, or failed.
@@ -191,8 +265,8 @@ impl Images {
     }
 
     /// Why the last image asked was not made.
-    pub fn failed(&self) -> Option<&str> {
-        self.failed.as_deref()
+    pub fn failed(&self) -> Option<&ImageFailed> {
+        self.failed.as_ref()
     }
 
     /// The last image made, for the database to settle onto.
@@ -258,19 +332,37 @@ mod tests {
             learned.observe(blaze_graph::admission::kinds::COMPILE, Some(&key), n * 1000, n << 10);
         }
         let image = with_history(HISTORY, &learned.encode());
-        let restored = history(&image, blaze_history::Config::default()).unwrap();
+        let (restored, unlearned) = history(&image, blaze_history::Config::default()).unwrap();
         assert_eq!(restored.encode(), learned.encode());
+        assert_eq!(unlearned, None);
     }
 
     #[test]
-    fn a_history_of_another_blaze_or_none_starts_empty() {
+    fn a_history_of_another_blaze_or_none_starts_empty_saying_why() {
         let config = blaze_history::Config::default();
         let none = Image::open(Builder::new().finish().unwrap()).unwrap();
-        assert_eq!(history(&none, config).unwrap().encode(), empty());
+        let (restored, unlearned) = history(&none, config).unwrap();
+        assert_eq!(restored.encode(), empty());
+        assert!(matches!(unlearned, Some(Unlearned::Refused(Refused::Missing { .. }))), "{unlearned:?}");
         let estimates = with_history(blaze_graph::history::SCHEMA, b"blzest01");
-        assert_eq!(history(&estimates, config).unwrap().encode(), empty());
+        let (restored, unlearned) = history(&estimates, config).unwrap();
+        assert_eq!(restored.encode(), empty());
+        assert!(matches!(unlearned, Some(Unlearned::Refused(Refused::Schema { .. }))), "{unlearned:?}");
         let older = with_history(HISTORY, b"blzhis00 and what followed");
-        assert_eq!(history(&older, config).unwrap().encode(), empty());
+        let (restored, unlearned) = history(&older, config).unwrap();
+        assert_eq!(restored.encode(), empty());
+        assert_eq!(unlearned, Some(Unlearned::Version));
+    }
+
+    #[test]
+    fn an_image_not_made_names_the_file_and_why() {
+        let failed = ImageFailed {
+            file: FileName::new("state/db/image").unwrap(),
+            why: Unmade::Write(IoError("no space left on device".to_owned())),
+        };
+        let text = String::from(&failed);
+        assert!(text.contains("writing the daemon image /state/db/image"), "{text}");
+        assert!(text.contains("no space left"), "{text}");
     }
 
     #[test]
@@ -280,6 +372,7 @@ mod tests {
         let Err(error) = history(&with_history(HISTORY, &cut), blaze_history::Config::default()) else {
             panic!("a cut history decoded")
         };
-        assert!(error.contains("the plane's history"), "{error}");
+        assert!(matches!(error, HistoryError::Decode(_)), "{error:?}");
+        assert!(error.to_string().contains("the plane's history"), "{error}");
     }
 }

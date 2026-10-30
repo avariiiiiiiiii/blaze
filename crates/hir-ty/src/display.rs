@@ -2251,7 +2251,7 @@ impl<'db> HirDisplay<'db> for Region<'db> {
             RegionKind::ReVar(_) => write!(f, "_"),
             RegionKind::ReStatic => write!(f, "'static"),
             RegionKind::ReError(..) => {
-                if cfg!(test) {
+                if matches!(f.display_kind, DisplayKind::Test) {
                     write!(f, "'?")
                 } else {
                     write!(f, "'_")

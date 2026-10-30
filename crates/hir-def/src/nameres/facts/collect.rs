@@ -1007,7 +1007,7 @@ pub(crate) fn collect_expansion<'db, S: Sink<'db>, A: Allocator + Clone>(
     let db = cx.db;
     if depth > sink.def_map().recursion_limit() {
         cov_mark::hit!(macro_expansion_overflow);
-        tracing::warn!("macro expansion is too deep");
+        sink.apply(DeclOp::Diagnostic(DefDiagnostic::recursion_overflow(db, module, call)));
         return;
     }
     let def = call.loc(db).def;

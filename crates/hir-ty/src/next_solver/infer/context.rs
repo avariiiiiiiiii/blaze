@@ -182,8 +182,12 @@ impl<'db> rustc_type_ir::InferCtxtLike for InferCtxt<'db> {
         f: impl FnOnce(T) -> U,
     ) -> U {
         self.enter_forall(value, |value| {
-            let u = self.universe();
-            self.placeholder_assumptions.borrow_mut().insert(u, Assumptions::empty());
+            // Read only with assumptions on binders, and the vendored `Assumptions::empty`
+            // cannot be built without them.
+            if rustc_type_ir::Interner::assumptions_on_binders(self.interner) {
+                let u = self.universe();
+                self.placeholder_assumptions.borrow_mut().insert(u, Assumptions::empty());
+            }
             f(value)
         })
     }

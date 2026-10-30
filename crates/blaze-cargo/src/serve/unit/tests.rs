@@ -96,7 +96,8 @@ const P: &str = "path+file:///w/p#0.1.0";
 const Z: &str = "path+file:///w/z-sys#0.1.0";
 
 /// `z-sys` (links `z`) with a build script, and `p`, whose script reads `z`'s metadata.
-fn build(out: &std::path::Path) -> Units {
+fn build(dir: &std::path::Path) -> Units {
+    let out = dir.join("debug/build");
     let z_out = out.join("z-sys-0001/out").to_string_lossy().into_owned();
     let p_out = out.join("p-0002/out").to_string_lossy().into_owned();
     let units = vec![
@@ -503,7 +504,7 @@ fn the_graph_is_cargos_build_map_in_columns() {
     units.graph.units.push(unit(P, target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[4, 3]));
     units.plans.push(plan("-0004", &[]));
     units.plans.push(plan("-0005", &[]));
-    let graph = graph::Graph::new(&units);
+    let graph = graph::Graph::new(&units).unwrap();
     assert_eq!(graph.deps(5), [3, 4], "sorted by package id");
     assert_eq!(graph.closure(3), [3, 1, 0, 2]);
     assert_eq!(graph.closure(5), [5, 4, 3, 1, 0, 2]);
@@ -638,7 +639,7 @@ fn a_unit_waits_on_every_run_of_its_closure() {
     units.graph.units.push(unit(P, target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[4, 3]));
     units.plans.push(plan("-0004", &[]));
     units.plans.push(plan("-0005", &[]));
-    let graph = graph::Graph::new(&units);
+    let graph = graph::Graph::new(&units).unwrap();
     assert_eq!(graph.dependents(1), [3, 4]);
     assert_eq!(graph.dependents(4), [5]);
     assert_eq!(graph.dependents(5), [] as [u32; 0]);
@@ -694,4 +695,64 @@ fn a_pack_is_of_the_packages_binary_or_else_its_library() {
     ]);
     let refused = pack::program_unit(&units, "app").unwrap_err().what;
     assert!(refused.contains("`one`, `two`"), "{refused}");
+}
+
+/// A unit of a package the build doesn't list, or naming a dependency past its units, stops
+/// the graph: no edge is dropped and no unit is given a package it isn't of.
+#[test]
+fn a_graph_with_a_unit_it_cant_place_is_refused() {
+    use super::error::UnitError;
+    let dir = tempfile::tempdir().unwrap();
+    let mut units = build(dir.path());
+    units.graph.units.push(unit(P, target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[9]));
+    units.plans.push(plan("-0004", &[]));
+    assert_eq!(graph::Graph::new(&units).err(), Some(UnitError::Dependency { unit: 4, dep: 9, count: 5 }));
+
+    let mut units = build(dir.path());
+    units.graph.units.push(unit("path+file:///w/q#0.1.0", target("q", "lib", "/w/q/src/lib.rs"), Mode::Build, &[]));
+    units.plans.push(plan("-0004", &[]));
+    let refused = graph::Graph::new(&units).err();
+    assert_eq!(refused, Some(UnitError::Package { unit: 4, pkg_id: "path+file:///w/q#0.1.0".to_owned() }));
+}
+
+/// What a build script's run is told is never guessed: an `OUT_DIR` under no `<profile>/build`,
+/// a manifest in no directory and a compile with no output are errors naming them.
+#[test]
+fn a_script_run_missing_what_cargo_tells_it_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = PathBuf::from("/state/tools");
+
+    let mut units = build(dir.path());
+    units.plans[1].out_dir = Some("/w/elsewhere/out".to_owned());
+    let scripts = slots(&units);
+    let refused = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap_err();
+    assert!(refused.contains("`/w/elsewhere/out`, is under no `<profile>/build`"), "{refused}");
+
+    let mut units = build(dir.path());
+    let z = units.packages.iter_mut().find(|it| it.id == Z).unwrap();
+    z.manifest_path = "Cargo.toml".to_owned();
+    let refused = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap_err();
+    assert!(refused.contains("the manifest of `z-sys`, `Cargo.toml`, is in no directory"), "{refused}");
+
+    let mut units = build(dir.path());
+    units.plans[0].outputs.clear();
+    let refused = script::named_program(&units, 0).unwrap_err().what;
+    assert!(refused.contains("the build script compiled by unit 0 has no output"), "{refused}");
+    assert_eq!(
+        script::named_program(&build(dir.path()), 0).unwrap(),
+        PathBuf::from("/w/target/debug/build/z-sys-0001/build_script_build-0001")
+    );
+}
+
+/// A test binary relinked against a changed C library runs every test again: the native code
+/// is in no code hash a test reaches, so it is in the suite's context.
+#[test]
+fn a_test_binarys_context_holds_the_native_inputs_it_linked() {
+    let context = ContentId([1; 32]);
+    assert_eq!(compile::with_natives(context, &[]), context);
+    let libz = |n: u8| ("/w/target/debug/build/z-sys-0001/out/libz.a".to_owned(), ContentId([n; 32]));
+    let with = compile::with_natives(context, &[libz(2)]);
+    assert_ne!(with, context);
+    assert_eq!(with, compile::with_natives(context, &[libz(2)]));
+    assert_ne!(with, compile::with_natives(context, &[libz(3)]), "an edit of the library");
 }

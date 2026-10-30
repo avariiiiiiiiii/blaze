@@ -55,6 +55,7 @@
 //!     iterators: iterator, fn
 //!     manually_drop: drop
 //!     matches:
+//!     mul:
 //!     non_null: pat
 //!     non_zero: pat, transmute, option, copy
 //!     option: panic
@@ -1230,6 +1231,35 @@ pub mod ops {
     add_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f16 f32 f64 f128 }
     // endregion:builtin_impls
     // endregion:add
+
+    // region:mul
+    #[lang = "mul"]
+    pub const trait Mul<Rhs = Self> {
+        type Output;
+        fn mul(self, rhs: Rhs) -> Self::Output;
+    }
+
+    #[lang = "mul_assign"]
+    pub const trait MulAssign<Rhs = Self> {
+        fn mul_assign(&mut self, rhs: Rhs);
+    }
+
+    // region:builtin_impls
+    macro_rules! mul_impl {
+        ($($t:ty)*) => ($(
+            impl const Mul for $t {
+                type Output = $t;
+                fn mul(self, other: $t) -> $t { self * other }
+            }
+            impl const MulAssign for $t {
+                fn mul_assign(&mut self, other: $t) { *self *= other; }
+            }
+        )*)
+    }
+
+    mul_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f16 f32 f64 f128 }
+    // endregion:builtin_impls
+    // endregion:mul
 
     // region:unary_ops
     #[lang = "not"]

@@ -4,10 +4,10 @@
 //! step I, [#89]) and in its sandbox ([#147]).
 //!
 //! What a run is made from is a plain description ([`unit::Unit`]) that blaze's manifest
-//! reader and resolver fill; this crate reads no manifest and asks no cargo. cargo is the
-//! oracle of `harness/scripts.py`, which runs a corpus of scripts under both and compares.
-//! A script is any executable the caller places (`Unit::script`); nothing here assumes where
-//! or by what it was compiled.
+//! reader and resolver fill, every value cargo always gives a script filled
+//! ([`unit::Unit::check`]); this crate reads no manifest, asks no cargo and runs no script
+//! (blaze's sandbox does). A script is any executable the caller places (`Unit::script`);
+//! nothing here assumes where or by what it was compiled.
 //!
 //! For blaze v2 (docs/v2/plan/lanes/usercode.md): scripts that only print constant directives are read
 //! rather than run ([`elide`](mod@elide), #1296); the environment says what cargo sets from the unit and

@@ -12,7 +12,7 @@ use crate::{
 
 /// The stderr of `source` with only the diagnostics `keep` takes, without the closing ones.
 fn ui_only(name: &str, source: &str, keep: impl Fn(&Diag) -> bool) -> String {
-    let fixture = format!("//- /{name} crate:main edition:2015\n{source}");
+    let fixture = format!("//- /{name} crate:other:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     let sources = checked.sources();
     let stderr: String = checked

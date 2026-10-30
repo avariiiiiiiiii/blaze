@@ -32,7 +32,6 @@ use rustc_type_ir::{
     try_visit,
 };
 use smallvec::SmallVec;
-use stdx::never;
 use tracing::debug;
 
 use crate::{
@@ -1177,7 +1176,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
 
         let TyKind::Adt(adt, args) = adt_ty.kind() else {
-            never!("non-ADT passed to check_struct_expr_fields");
+            // An error type was reported where it was made; anything else is rustc's `span_bug!`.
+            assert!(adt_ty.is_ty_error(), "non-ADT passed to check_struct_expr_fields: {adt_ty:?}");
             return;
         };
         let adt_id = adt.def_id();
@@ -1286,7 +1286,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                                         self.table.register_predicates(obligations)
                                     }
                                     Err(_) => {
-                                        never!(
+                                        unreachable!(
                                             "subtyping remaining fields of type changing FRU \
                                                 failed: {target_ty:?} != {fru_ty:?}: {:?}",
                                             field.name,

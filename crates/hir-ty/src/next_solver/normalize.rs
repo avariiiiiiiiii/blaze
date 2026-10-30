@@ -1,15 +1,18 @@
 use rustc_next_trait_solver::{
     normalize::{NormalizationFolder, NormalizationWasAmbiguous},
+    placeholder::BoundVarReplacer,
     solve::SolverDelegateEvalExt,
 };
 use rustc_type_ir::{
-    Flags, Interner, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
+    Flags, Interner, IsRigid, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
     UniverseIndex,
+    inherent::{IntoKind, Term as _},
     solve::{Certainty, NoSolution},
 };
 
 use crate::next_solver::{
-    AliasTerm, Const, DbInterner, Goal, ParamEnv, Predicate, ProjectionClause, SolverContext, Ty,
+    AliasTerm, Binder, Const, ConstKind, DbInterner, Goal, ParamEnv, Predicate, ProjectionClause,
+    SolverContext, Term, Ty, TyKind,
     fulfill::{FulfillmentCtxt, NextSolverError},
     infer::{
         InferCtxt,
@@ -76,6 +79,114 @@ where
         .map(|goal| Obligation::new(interner, *at.cause, goal.param_env, goal.predicate))
         .collect(); // alloc: empty unless a normalization is ambiguous
     Ok((value, obligations))
+}
+
+/// rustc's `solve::normalize`: `value` normalized, ambiguity and errors deferred to
+/// fulfillment. Where an alias has no solution, every alias that is not rigid becomes an
+/// inference variable with its `Projection` goal, for fulfillment to report.
+pub(crate) fn normalize<'db, T>(at: At<'_, 'db>, value: T) -> (T, PredicateObligations<'db>)
+where
+    T: TypeFoldable<DbInterner<'db>> + Clone,
+{
+    match normalize_with_universes(at, value.clone(), Vec::new()) {
+        Ok(normalized) => normalized,
+        Err(_) => {
+            let mut replacer = ReplaceAliasWithInfer {
+                at,
+                obligations: PredicateObligations::new(),
+                // alloc: none until a binder is entered
+                universes: Vec::new(),
+            };
+            let value = at.infcx.deeply_resolve_ignoring_regions(value);
+            let value = value.fold_with(&mut replacer);
+            (value, replacer.obligations)
+        }
+    }
+}
+
+struct ReplaceAliasWithInfer<'me, 'db> {
+    at: At<'me, 'db>,
+    obligations: PredicateObligations<'db>,
+    universes: Vec<Option<UniverseIndex>>,
+}
+
+impl<'db> ReplaceAliasWithInfer<'_, 'db> {
+    fn term_to_infer(&mut self, alias_term: AliasTerm<'db>) -> Term<'db> {
+        let infcx = self.at.infcx;
+        let infer_term = infcx.next_term_var_of_alias_kind(alias_term, self.at.cause.span());
+        self.obligations.push(Obligation::new(
+            infcx.interner,
+            *self.at.cause,
+            self.at.param_env,
+            ProjectionClause { projection_term: alias_term, term: infer_term },
+        ));
+        infer_term
+    }
+}
+
+impl<'db> TypeFolder<DbInterner<'db>> for ReplaceAliasWithInfer<'_, 'db> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.at.infcx.interner
+    }
+
+    fn fold_binder<T: TypeFoldable<DbInterner<'db>>>(
+        &mut self,
+        t: Binder<'db, T>,
+    ) -> Binder<'db, T> {
+        self.universes.push(None);
+        let t = t.super_fold_with(self);
+        self.universes.pop();
+        t
+    }
+
+    fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+        if !self.cx().renormalize_rigid_aliases() && !ty.has_non_rigid_aliases() {
+            return ty;
+        }
+
+        let ty = ty.super_fold_with(self);
+        let TyKind::Alias(orig_is_rigid, alias) = ty.kind() else { return ty };
+        if !self.cx().renormalize_rigid_aliases() && orig_is_rigid == IsRigid::Yes {
+            return ty;
+        }
+
+        if ty.has_escaping_bound_vars() {
+            let (replaced, ..) =
+                BoundVarReplacer::replace_bound_vars(self.at.infcx, &mut self.universes, alias);
+            // Keep the higher-ranked alias in the folded value; the fresh term is only
+            // used to register its projection obligation.
+            let _ = self.term_to_infer(replaced.into());
+            ty
+        } else {
+            self.term_to_infer(alias.into()).expect_type()
+        }
+    }
+
+    fn fold_const(&mut self, ct: Const<'db>) -> Const<'db> {
+        if !self.cx().renormalize_rigid_aliases() && !ct.has_non_rigid_aliases() {
+            return ct;
+        }
+
+        let ct = ct.super_fold_with(self);
+        let ConstKind::Alias(orig_is_rigid, alias_const) = ct.kind() else { return ct };
+        if !self.cx().renormalize_rigid_aliases() && orig_is_rigid == IsRigid::Yes {
+            return ct;
+        }
+
+        if ct.has_escaping_bound_vars() {
+            let (replaced, ..) = BoundVarReplacer::replace_bound_vars(
+                self.at.infcx,
+                &mut self.universes,
+                alias_const,
+            );
+            // Keep the higher-ranked alias in the folded value; the fresh term is only
+            // used to register its projection obligation.
+            let _ = self.term_to_infer(replaced.into());
+            ct
+        } else {
+            self.term_to_infer(alias_const.into()).expect_const()
+        }
+    }
 }
 
 /// Deeply normalize all aliases in `value`. This does not handle inference and expects

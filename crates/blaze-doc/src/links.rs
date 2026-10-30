@@ -39,7 +39,7 @@ pub(crate) fn markdown_links(markdown: &str) -> Vec<MarkdownLink> {
     let parser = Parser::new_with_broken_link_callback(markdown, options(), Some(&mut callback));
     let mut out = vec![];
     for (event, range) in parser.into_offset_iter() {
-        if let Event::Start(Tag::Link(kind, dest, _)) = event {
+        if let Event::Start(Tag::Link { link_type: kind, dest_url: dest, .. }) = event {
             out.push(MarkdownLink { kind, link: dest.to_string(), range });
         }
     }

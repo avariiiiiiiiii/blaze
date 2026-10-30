@@ -37,7 +37,7 @@ fn places_find_what_a_map_finds() {
     let mut rng = Rng::new(2);
     for _ in 0..5_000 {
         // Few distinct hashes, so probes run long and collide.
-        let key = rng.below(3_000) * 0x9e37_79b9_7f4a_7c15;
+        let key = rng.below(3_000).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let found = places.find(key, |id| keys[id as usize] == key);
         assert_eq!(found, map.get(&key).copied());
         if found.is_none() {

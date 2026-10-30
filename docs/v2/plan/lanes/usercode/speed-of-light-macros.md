@@ -5,6 +5,11 @@ date: 2026-10-30
 ---
 # Proc macros: speed of light
 
+2026-10-30: the wasm host (`blaze-macro-wasm`), `blaze-wasi`, rust-analyzer's server
+(`proc-macro-srv`, `proc-macro-srv-cli`) and `proc-macro-api`'s client are deleted; every proc macro
+runs on `blaze-macro-eval` ([dedup.md](../dedup.md#proc-macros-one-engine-blaze-macro-eval)). What
+this says of them is the record of the plan at its date.
+
 Part of [usercode](../usercode.md), linked from [speed-of-light.md](speed-of-light.md). Code:
 `crates/blaze-expand/`, `crates/proc-macro-api/`, `crates/proc-macro-srv/`. Design:
 [macros.md](macros.md), [macros-native.md](macros-native.md). Nothing here has been measured:

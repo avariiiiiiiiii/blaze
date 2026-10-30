@@ -12,7 +12,7 @@ use crate::{
 /// [`ui`] of a UI test that needs core's items: core is minicore with `flags`
 /// (`crates/test-utils/src/minicore.rs`).
 fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}");
+    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:{edition}\n{source}");
     let options = compiletest(Mode::Other, &Options::default());
     normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
 }

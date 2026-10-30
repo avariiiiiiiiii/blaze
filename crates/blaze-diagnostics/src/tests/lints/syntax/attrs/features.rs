@@ -10,14 +10,14 @@ use crate::{
 /// [`crate::tests::ui`] of the revision of a UI test of edition 2015 that compiletest gives
 /// `--cfg <revision>`.
 fn ui_revision(name: &str, revision: &str, source: &str) -> String {
-    let fixture = format!("//- /{name} crate:main edition:2015 cfg:{revision}\n{source}");
+    let fixture = format!("//- /{name} crate:other:main edition:2015 cfg:{revision}\n{source}");
     let options = compiletest(Mode::Other, &Options::default());
     normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 
 /// The messages of the feature lints `source` gets, with their lint names.
 fn feature_lints(source: &str) -> Vec<String> {
-    let fixture = format!("//- /main.rs crate:main edition:2021\n{source}");
+    let fixture = format!("//- /main.rs crate:other:main edition:2021\n{source}");
     checked_with(&fixture, "", &Options::default())
         .messages()
         .into_iter()

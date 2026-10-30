@@ -154,7 +154,7 @@ pub fn command(words: Vec<OsString>) -> i32 {
 /// build placed.
 pub fn request(asked: &Invocation, cargo: Cargo) -> Result<Request, String> {
     let view = ViewRef::Head(cargo.root.clone());
-    let targets = place::targets(asked, cargo);
+    let targets = place::targets(asked, cargo).map_err(|it| it.to_string())?;
     let flags = &asked.flags;
     Ok(match asked.command() {
         Command::Check => Request::Check { view, targets },

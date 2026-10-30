@@ -1,8 +1,6 @@
 //! What the harness running the corpus gives it: one JSON value in `BLAZE_MACRO_CORPUS`, the
 //! value itself or a file's path, refusing a field it does not know.
 
-use std::collections::BTreeMap;
-
 use serde::Deserialize;
 
 pub(crate) const VAR: &str = "BLAZE_MACRO_CORPUS";
@@ -18,9 +16,6 @@ pub(crate) struct Corpus {
     pub(crate) scratch: Option<String>,
     /// The `CARGO_HOME` the packages were fetched into and the build ran with.
     pub(crate) cargo_home: String,
-    /// blaze's WebAssembly module of a proc-macro crate, by crate name, where one was built.
-    #[serde(default)]
-    pub(crate) wasm: BTreeMap<String, String>,
 }
 
 impl Corpus {

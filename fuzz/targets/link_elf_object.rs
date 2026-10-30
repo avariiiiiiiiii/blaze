@@ -181,13 +181,17 @@ fn tls(b: &mut Builder<'_>, name: &str) -> SymbolId {
     symbol
 }
 
-fn relocate(b: &mut Builder<'_>, section: SectionId, at: u64, symbol: SymbolId, addend: i64, r_type: u32) {
+fn relocate(b: &mut Builder<'_>, section: SectionId, at: u64, symbol: SymbolId, addend: i64, r_type: elf::RelocationType) {
     b.add_relocation(section, Relocation { offset: at, symbol, addend, flags: RelocationFlags::Elf { r_type } })
         .expect("a relocation inside its section");
 }
 
-fn flags(b: &mut Builder<'_>, section: SectionId, sh_flags: u32) {
-    b.section_mut(section).flags = SectionFlags::Elf { sh_flags: u64::from(sh_flags) };
+/// Sets the `sh_flags` of `section`, keeping the `sh_type` its kind gives it.
+fn flags(b: &mut Builder<'_>, section: SectionId, sh_flags: elf::SectionFlags) {
+    let SectionFlags::Elf { sh_flags: flags, .. } = b.section_flags_mut(section) else {
+        panic!("a section with no ELF flags")
+    };
+    *flags = sh_flags;
 }
 
 fn x86_64() -> Vec<u8> {
@@ -201,12 +205,12 @@ fn x86_64() -> Vec<u8> {
     let keep = b.add_section(Vec::new(), b".data.keep".to_vec(), SectionKind::Data);
     b.append_section_data(keep, &[1, 2, 3, 4], 4);
     flags(&mut b, keep, elf::SHF_ALLOC | elf::SHF_WRITE | elf::SHF_GNU_RETAIN);
-    let init = b.add_section(Vec::new(), b".init_array.00100".to_vec(), SectionKind::Elf(elf::SHT_INIT_ARRAY));
+    let init = b.add_section(Vec::new(), b".init_array.00100".to_vec(), SectionKind::Data);
     b.append_section_data(init, &[0; 8], 8);
-    flags(&mut b, init, elf::SHF_ALLOC | elf::SHF_WRITE);
-    let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), SectionKind::Elf(elf::SHT_X86_64_UNWIND));
+    b.section_mut(init).flags = SectionFlags::Elf { sh_type: elf::SHT_INIT_ARRAY, sh_flags: elf::SHF_ALLOC | elf::SHF_WRITE };
+    let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), SectionKind::ReadOnlyData);
     b.append_section_data(eh_frame, &[0; 24], 8);
-    flags(&mut b, eh_frame, elf::SHF_ALLOC);
+    b.section_mut(eh_frame).flags = SectionFlags::Elf { sh_type: elf::SHT_X86_64_UNWIND, sh_flags: elf::SHF_ALLOC };
     let debug = b.add_section(Vec::new(), b".debug_info".to_vec(), SectionKind::Debug);
     b.append_section_data(debug, &[0; 16], 1);
 
@@ -263,9 +267,9 @@ fn aarch64() -> Vec<u8> {
     b.append_section_data(text, &[0; 80], 4);
     let data = b.section_id(StandardSection::Data);
     b.append_section_data(data, &[0; 8], 8);
-    let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), SectionKind::Elf(elf::SHT_PROGBITS));
+    let eh_frame = b.add_section(Vec::new(), b".eh_frame".to_vec(), SectionKind::ReadOnlyData);
     b.append_section_data(eh_frame, &[0; 16], 8);
-    flags(&mut b, eh_frame, elf::SHF_ALLOC);
+    b.section_mut(eh_frame).flags = SectionFlags::Elf { sh_type: elf::SHT_PROGBITS, sh_flags: elf::SHF_ALLOC };
     let f = define(&mut b, "f", text, 0, 80, SymbolKind::Text, SymbolScope::Dynamic, false);
     let ext = undefined(&mut b, "ext", false);
     let var = define(&mut b, "var", data, 0, 8, SymbolKind::Data, SymbolScope::Dynamic, false);

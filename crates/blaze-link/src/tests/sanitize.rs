@@ -309,8 +309,8 @@ fn msan_options_are_read_only_i32s_only_when_set() {
             .sections()
             .find(|it| it.address() <= addr && addr + 4 <= it.address() + it.size())
             .unwrap_or_else(|| panic!("{addr:#x} in no section"));
-        let SectionFlags::Elf { sh_flags } = section.flags() else { panic!("ELF flags") };
-        assert_eq!(sh_flags & u64::from(elf::SHF_WRITE), 0, "{addr:#x} is read-only, in {:?}", section.name());
+        let SectionFlags::Elf { sh_flags, .. } = section.flags() else { panic!("ELF flags") };
+        assert_eq!(sh_flags & elf::SHF_WRITE, elf::SectionFlags(0), "{addr:#x} is read-only, in {:?}", section.name());
     }
 
     let plain = Sanitize { sanitizers: Sanitizers::MEMORY, ..Sanitize::default() };
@@ -410,7 +410,7 @@ fn a_runtimes_got_and_general_dynamic_tls_references_link() {
     let endian = file.endian();
     let (_, rela) = file.elf_section_table().section_by_name(endian, b".rela.dyn").expect(".rela.dyn");
     let (relas, _) = rela.rela(endian, linked.bytes()).unwrap().expect("relocations");
-    let at = |offset: u64, r_type: u32| relas.iter().any(|it| it.r_offset(endian) == offset && it.r_type(endian, false) == r_type);
+    let at = |offset: u64, r_type: elf::RelocationType| relas.iter().any(|it| it.r_offset(endian) == offset && it.r_type(endian, false) == r_type);
     assert!(at(pair, elf::R_X86_64_DTPMOD64), "the pair's module");
     assert!(at(pair + 8, elf::R_X86_64_DTPOFF64), "the pair's offset");
 }

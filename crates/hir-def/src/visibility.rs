@@ -8,8 +8,9 @@ use la_arena::ArenaMap;
 use syntax::view::{self as ast, HasVisibility};
 
 use crate::{
-    AssocItemId, BlockIdLt, HasModule, ItemContainerId, LocalFieldId, ModuleId, ModuleIdLt, TraitId,
-    VariantId, nameres::DefMap, resolver::HasResolver, signatures::VariantFields, src::HasSource,
+    AssocItemId, BlockIdLt, HasModule, ItemContainerId, LocalFieldId, ModuleDefId, ModuleId,
+    ModuleIdLt, TraitId, VariantId, nameres::DefMap, resolver::HasResolver,
+    signatures::VariantFields, src::HasSource,
 };
 
 pub use crate::item_tree::{RawVisibility, VisibilityExplicitness};
@@ -28,6 +29,25 @@ pub enum Visibility {
 // A module id (8 bytes) and the explicitness, whose spare values tag the other two.
 const _: () = assert!(size_of::<Visibility>() <= 12);
 
+/// Why a `pub(in path)` (or `pub(super)`) gives no visibility: rustc's `VisResolutionError`,
+/// from `rustc_resolve::build_reduced_graph`'s `try_resolve_visibility`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum VisibilityError {
+    /// The path does not resolve in the type namespace (rustc's E0433, "failed to resolve").
+    Unresolved,
+    /// The path names `found`, which is not a module (rustc's E0577, "expected module").
+    NotAModule { found: ModuleDefId },
+    /// The path names `module`, which is not the item's module or one above it (rustc's E0742,
+    /// "visibilities can only be restricted to ancestor modules").
+    NotAncestor { module: ModuleId },
+}
+
+impl VisibilityError {
+    /// The visibility the item has after the error is reported, as rustc's `resolve_visibility`
+    /// gives it (`ty::Visibility::Public`); the build stops on the error.
+    pub const RECOVERED: Visibility = Visibility::Public;
+}
+
 /// Whether `ancestor` is `module` or a module above it in their `DefMap`, by the parent each
 /// module id carries.
 fn is_ancestor_in_def_map<'db>(
@@ -40,13 +60,23 @@ fn is_ancestor_in_def_map<'db>(
 }
 
 impl Visibility {
+    /// [`Self::try_resolve`], with an error's [`VisibilityError::RECOVERED`]: for a reader of
+    /// the item whose error the item's own check reports.
     pub fn resolve(
         db: &Db,
         resolver: &crate::resolver::Resolver<'_>,
         raw_vis: &RawVisibility,
     ) -> Self {
-        // we fall back to public visibility (i.e. fail open) if the path can't be resolved
-        resolver.resolve_visibility(db, raw_vis).unwrap_or(Visibility::Public)
+        Self::try_resolve(db, resolver, raw_vis).unwrap_or(VisibilityError::RECOVERED)
+    }
+
+    /// The visibility `raw_vis` gives an item in `resolver`'s scope, or why it gives none.
+    pub fn try_resolve(
+        db: &Db,
+        resolver: &crate::resolver::Resolver<'_>,
+        raw_vis: &RawVisibility,
+    ) -> Result<Self, VisibilityError> {
+        resolver.resolve_visibility(db, raw_vis)
     }
 
     pub(crate) fn is_visible_from_other_crate(self) -> bool {
@@ -486,6 +516,58 @@ pub use m::*;
         .into();
         want.sort();
         seen.sort();
+        assert_eq!(seen, want);
+    }
+
+    /// `Visibility::try_resolve` of each function's visibility, by name: rustc's E0433, E0577
+    /// and E0742 where the path does not name the item's module or one above it, never a
+    /// visibility guessed for it.
+    #[test]
+    fn restricted_visibility_errors() {
+        let fx = fixture::db(
+            r#"
+pub mod m {
+    pub(in crate::m) fn ok() {}
+    pub(in crate::nope) fn unresolved() {}
+    pub(in crate::S) fn not_a_module() {}
+    pub(in crate::n) fn not_ancestor() {}
+}
+pub mod n {}
+pub struct S;
+pub(super) fn too_far() {}
+"#,
+        );
+        let _ = fx.only_file();
+        let db = fx.into_db();
+        let mut seen = Vec::new();
+        for (_, module) in crate_def_map(&db, db.fetch_test_crate()).modules(&db) {
+            for decl in module.scope(&db).declarations() {
+                let ModuleDefId::FunctionId(f) = decl else { continue };
+                let source = f.lookup(&db).source_view(&db);
+                let name = source.value.name().map_or("", |it| it.text()).to_owned();
+                let mut span_map = None;
+                let raw = crate::item_tree::visibility_from_ast(
+                    &db,
+                    source.value.visibility(),
+                    &mut |range| {
+                        span_map
+                            .get_or_insert_with(|| source.file_id.span_map(&db))
+                            .span_for_range(range)
+                            .ctx
+                    },
+                );
+                let code = match Visibility::try_resolve(&db, &f.resolver(&db), &raw) {
+                    Ok(_) => "ok",
+                    Err(VisibilityError::Unresolved) => "E0433",
+                    Err(VisibilityError::NotAModule { .. }) => "E0577",
+                    Err(VisibilityError::NotAncestor { .. }) => "E0742",
+                };
+                seen.push(format!("{name} {code}"));
+            }
+        }
+        seen.sort();
+        let want =
+            ["not_a_module E0577", "not_ancestor E0742", "ok ok", "too_far E0433", "unresolved E0433"];
         assert_eq!(seen, want);
     }
 }

@@ -8,7 +8,7 @@ use super::*;
 /// `Buf::align` padding, written with division where they could be.
 mod reference {
     pub(super) fn up(value: u64, align: u64) -> u64 {
-        (value + align - 1) & !(align - 1)
+        (value + (align - 1)) & !(align - 1)
     }
 
     pub(super) fn round_up(bytes: usize, to: usize) -> Option<usize> {

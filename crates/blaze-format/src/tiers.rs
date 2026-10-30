@@ -194,8 +194,8 @@ pub const BLOCK_VALUES: usize = 32 * LANES;
 
 /// Values as offsets from their minimum, `bits` bits each: full blocks of [`BLOCK_VALUES`] in
 /// SIMD-BP128's layout (`bits * LANES` words each), then the tail in order, with one more word
-/// than it fills so a read of two words never leaves it. A column of 32 bits has 0 as its
-/// minimum, so `min` plus any `bits`-bit offset is a `u32`. Costs `bits / 8` bytes a value plus
+/// than it fills so a read of two words never leaves it. `min` is at most `u32::MAX` less the
+/// largest `bits`-bit offset (0 for 32 bits), so `min` plus any `bits`-bit offset is a `u32`. Costs `bits / 8` bytes a value plus
 /// at most 8 bytes; [`WarmRef::get`] is one or two loads.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Packed {
@@ -275,13 +275,8 @@ impl Packed {
         let (min, max) = values
             .iter()
             .fold((u32::MAX, 0), |(min, max), &it| (min.min(it), max.max(it)));
-        let min = min.min(max);
-        let bits = u32::BITS - (max - min).leading_zeros();
-        let min = match bits {
-            32 => 0,
-            _ => min,
-        };
         let len = values.len();
+        let (min, bits) = frame(min, max, len);
         // alloc: once a column packed
         let mut words = vec![0u32; words_for(len, bits)];
         if bits > 0 {
@@ -550,7 +545,7 @@ fn frame(min: u32, max: u32, len: usize) -> (u32, u32) {
         _ => (min, max),
     };
     let bits = u32::BITS - (max - min).leading_zeros();
-    (if bits == 32 { 0 } else { min }, bits)
+    (min.min(u32::MAX - mask(bits)), bits)
 }
 
 /// The bytes [`put_packed`] writes for `len` values from `min` to `max`.

@@ -414,7 +414,7 @@ fn an_image_finished_on_workers_is_the_serial_one() {
     let four = |n: usize, job: &(dyn Fn(usize) + Sync)| {
         std::thread::scope(|scope| {
             for worker in 0..4 {
-                scope.spawn(move || (worker..n).rev().step_by(4).for_each(job));
+                scope.spawn(move || (worker..n).step_by(4).rev().for_each(job));
             }
         });
     };

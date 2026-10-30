@@ -234,7 +234,7 @@ impl<S: Stable> Image<S> {
     pub fn whole_range(&self, section: &Section) -> Result<Range<usize>, Corrupt> {
         let bytes = self.whole(section)?;
         let start = section.at as usize;
-        debug_assert_eq!(bytes.as_ptr(), self.owner.bytes()[start..].as_ptr());
+        debug_assert!(bytes.is_empty() || bytes.as_ptr() == self.owner.bytes()[start..].as_ptr());
         Ok(start..start + bytes.len())
     }
 

@@ -260,7 +260,15 @@ fn a_crash_at_any_point_loses_nothing_durable_and_serves_nothing_torn() {
                     }
                 }
             }
-            assert!(store.broken().is_none(), "seed {seed}: {:?}", store.broken());
+            if let Some(broken) = store.broken() {
+                // Its commits met an injected failure `FAILURES_MOST` times in a row: it stops, as
+                // on a failing disk, and the next round checks it lost nothing durable.
+                assert!(
+                    broken.what == "injected by the simulation" && store.failures >= FAILURES_MOST,
+                    "seed {seed}: {broken:?} after {} failures in a row",
+                    store.failures
+                );
+            }
             sim.crash();
         }
     }
@@ -671,12 +679,60 @@ fn keys_hash_the_schema_the_producer_and_every_input() {
     assert_ne!(key, Key::of(SchemaHash(content_of(b"schema 2")), code, &[a, b]));
 }
 
-struct Asked(Vec<(Key, Tag)>);
+/// A remote that records what it is asked, and knows without asking it has none of `absent`.
+struct Recorded(Vec<(Key, Tag)>, Vec<Key>);
 
-impl Remote for Asked {
-    fn fetch(&mut self, key: &Key, tag: Tag, _: &mut Vec<Effect>) {
+impl Remote for Recorded {
+    fn fetch(&mut self, key: &Key, tag: Tag, _: &mut Vec<Effect>) -> Asked {
+        if self.1.contains(key) {
+            return Asked::Missing;
+        }
         self.0.push((*key, tag));
+        Asked::Sent
     }
+}
+
+#[test]
+fn a_fetch_the_remote_knows_is_missing_is_answered_at_once() {
+    let mut sim = Sim::new(16, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut remote = Recorded(Vec::new(), vec![key(5)]);
+    let mut effects = Vec::new();
+    assert_eq!(store.fetch(&key(5), &mut remote, &mut effects), None);
+    assert!(remote.0.is_empty() && effects.is_empty());
+    assert_eq!(store.fetched(), [(key(5), Fetched::Missing)]);
+    assert!(store.fetch(&key(5), &mut Recorded(Vec::new(), Vec::new()), &mut effects).is_some(), "not left fetching");
+}
+
+#[test]
+fn keys_lists_every_key_and_new_keys_what_each_batch_put() {
+    let mut sim = Sim::new(17, quiet());
+    let mut store = open(&mut sim, "store");
+    store.put(key(1), Kind::Code, b"one".to_vec()).unwrap();
+    assert_eq!(store.new_keys(), (0, Vec::new()), "nothing is kept before watching");
+    store.watch_keys();
+    assert!(store.watching_keys());
+    store.put(key(2), Kind::Code, b"two".to_vec()).unwrap();
+    let mut listed = store.keys();
+    listed.sort();
+    assert_eq!(listed, {
+        let mut both = vec![key(1), key(2)];
+        both.sort();
+        both
+    });
+    flush(&mut sim, &mut store);
+    let (epoch, mut new) = store.new_keys();
+    assert!(epoch > 0, "a batch was moved into packs");
+    new.sort();
+    new.dedup();
+    assert!(new.contains(&key(2)), "{new:?}");
+    assert_eq!(store.new_keys(), (epoch, Vec::new()), "each key is taken once");
+    store.put(key(3), Kind::Code, b"three".to_vec()).unwrap();
+    flush(&mut sim, &mut store);
+    let (later, new) = store.new_keys();
+    assert!(later > epoch);
+    assert!(new.contains(&key(3)) && !new.contains(&key(2)), "{new:?}");
+    assert_eq!(store.keys().len(), 3);
 }
 
 #[test]
@@ -684,7 +740,7 @@ fn a_fetched_value_is_verified_before_it_is_kept() {
     let mut sim = Sim::new(15, quiet());
     let mut store = open(&mut sim, "store");
     store.put(key(9), Kind::Code, b"here".to_vec()).unwrap();
-    let mut remote = Asked(Vec::new());
+    let mut remote = Recorded(Vec::new(), Vec::new());
     let mut effects = Vec::new();
     assert_eq!(store.fetch(&key(9), &mut remote, &mut effects), None, "it has it");
     let good = store.fetch(&key(1), &mut remote, &mut effects).unwrap();
@@ -1247,6 +1303,7 @@ fn a_buffer_given_its_buffer_columns_goes_warm_then_cold_and_reads_back() {
     assert_eq!((heat, entry.bytes, entry.content), (Heat::Warm, warm.as_slice(), content_of(&hot)));
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
     assert_eq!(settle(&mut sim, &mut store).demoted, 0, "a warm record made last period stays");
+    assert_eq!(settle(&mut sim, &mut store).demoted, 0, "nor one read the period before");
     assert_eq!(settle(&mut sim, &mut store).demoted, 1);
     assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);

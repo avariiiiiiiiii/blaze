@@ -23,6 +23,16 @@ fn dir(what: &str) -> PathBuf {
     dir
 }
 
+/// As [`dir`], under `/tmp`: a Unix socket's whole path must fit in its address (about 104
+/// bytes), which a long temporary directory (a Nix shell's) leaves no room for.
+#[cfg(unix)]
+fn socket_dir(what: &str) -> PathBuf {
+    let dir = PathBuf::from(format!("/tmp/blaze-core-{what}-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 /// What became of each step, by its tag. A clone is either done or refused for the file
 /// system, which the drivers on disk may differ in; it reads back the same either way.
 fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
@@ -530,17 +540,17 @@ fn every_driver_runs_processes_and_sockets_the_same() {
             "written",
         ]
     );
-    let root = dir("threads-processes");
+    let root = socket_dir("threads-processes");
     assert_eq!(simulated, processes_and_sockets(&mut Threads::new(&root, 2)));
     #[cfg(target_os = "linux")]
     {
-        let root = dir("uring-processes");
+        let root = socket_dir("uring-processes");
         let ring = processes_and_sockets(&mut crate::uring::Uring::new(&root).unwrap());
         assert_eq!(simulated, ring);
     }
     #[cfg(target_os = "macos")]
     {
-        let root = dir("kqueue-processes");
+        let root = socket_dir("kqueue-processes");
         let kqueue = processes_and_sockets(&mut crate::kqueue::Kqueue::new(&root, 2).unwrap());
         assert_eq!(simulated, kqueue);
     }

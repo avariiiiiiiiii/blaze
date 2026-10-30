@@ -16,9 +16,9 @@ categories = ["development-tools", "caching"]
 name = "blaze"
 
 [dependencies]
-blaze-cache-macros = { version = "0.1.0", path = "../blaze-cache-macros" }
-serde = { version = "1.0.219", default-features = false, features = ["std"] }
-postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
+blaze-cache-macros.workspace = true
+serde = { workspace = true, features = ["std"] }
+postcard = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
-serde = { version = "1.0.219", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }

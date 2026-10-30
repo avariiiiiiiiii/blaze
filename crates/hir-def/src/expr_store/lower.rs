@@ -28,7 +28,6 @@ use rustc_abi::ExternAbi;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::{AstIdMap, RealSpanMap, SyntaxContext};
-use stdx::never;
 use syntax::{
     AstPtr, FlatTree, SyntaxNodePtr, ast as tag,
     view::{
@@ -1508,14 +1507,13 @@ impl<'db> ExprCollector<'db> {
                 // since `lower_coroutine_body_with_moved_arguments()` might have changed them.
                 // They are owned by the top-level function, so should not be present in `bindings_owner`.
                 for param in params.iter() {
-                    if let Pat::Bind { id, .. } = this.store.pat(param.formal) {
-                        this.store.binding_owners.remove(&id);
-                    } else {
-                        never!(
-                            "`lower_coroutine_body_with_moved_arguments()` should make sure \
-                            the coroutine closure only have simple bind args"
+                    let Pat::Bind { id, .. } = this.store.pat(param.formal) else {
+                        unreachable!(
+                            "`lower_coroutine_body_with_moved_arguments()` makes each formal \
+                            parameter of a coroutine closure a simple binding"
                         );
-                    }
+                    };
+                    this.store.binding_owners.remove(&id);
                 }
                 if let Some(param) = self_param {
                     this.store.binding_owners.remove(&param.formal);
@@ -2031,8 +2029,7 @@ impl<'db> ExprCollector<'db> {
                     for i in 0..this.store.pats_since(mark).len() {
                         let arg = this.store.pats_since(mark)[i];
                         let Pat::Bind { id, .. } = this.store.pat(arg) else {
-                            never!("`lower_coroutine_body_with_moved_arguments()` should make sure the coroutine closure only have simple bind args");
-                            continue;
+                            unreachable!("`lower_coroutine_body_with_moved_arguments()` makes each argument of a coroutine closure a simple binding");
                         };
                         this.store.binding_owners.insert(id, closure);
                     }
@@ -3167,9 +3164,7 @@ impl<'db> ExprCollector<'db> {
 
     fn collect_macro_def(&mut self, macro_id: Option<MacroId>) {
         let Some(macro_id) = macro_id else {
-            never!("def map should have macro definition, but it doesn't");
-            self.store.push_list_statement(Statement::Item(Item::Other));
-            return;
+            unreachable!("the block's def map defines each macro definition its statements hold");
         };
         let macro_id = macro_id.definition(self.db);
         self.store.push_list_statement(Statement::Item(Item::MacroDef(&macro_id)));

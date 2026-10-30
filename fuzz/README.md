@@ -2,8 +2,8 @@
 
 Coverage-guided fuzz targets for every parser in blaze that reads bytes nobody vouches for: the
 store's packs and the remote protocol, the agent API's CBOR, the linker's object files and
-archives, the VFS journal, wasm proc macros, what a proc-macro server and a build script send
-back, and what the front end and codegen persist in the store. The engine is blaze's own (`src/`), so no
+archives, the VFS journal, the token-tree wire proc macros are given and answer in, what a
+build script sends back, and what the front end and codegen persist in the store. The engine is blaze's own (`src/`), so no
 libFuzzer and no rustc are involved.
 
 ## Running a target
@@ -113,10 +113,6 @@ Each target's file (`targets/<target>.rs`) begins with the invariants it checks.
 | `vfs_journal_records` | `Vfs::recover` of records framed with good checksums (forged directories, heads, removals, sequence numbers) | as `vfs_journal_bytes`, past the checksum |
 | `vfs_image` | `Vfs::restore` of the daemon's image (`Base::within`, `Base::check`): images `Vfs::write_image` wrote of trees the input describes, their tree columns, header and disks section damaged and their CRCs made good again, over the journal rewritten onto them | never panics or hangs; bounded; an image used lists, reads and follows every path, every file's bytes in the mapping; one refused says why (the check's reason, a column placed outside the section, a header naming another image) and leaves exactly the journal's recovery; an undamaged image restores the tree written |
 | `vfs_journal_model` | a program of commits on a simulated disk, cut, torn or damaged where the input says, then recovered | recovery gives the state after a prefix of the committed transactions (the whole sequence when nothing was damaged), and per head nothing that was not committed |
-| `macro_wasm_validate` | any bytes as a wasm proc-macro module file, through `Wasm::at` | validation and loading never panic; bounded |
-| `macro_wasm_host` | a fixed guest that calls every host and WASI import with pointers, lengths and numbers from the input | the host never panics and never reads or writes outside the guest's memory (every guest pointer and length is checked); bounded |
-| `macro_wasm_wire` | a fixed guest that outputs the input, decoded as tt's columns (`wire::read`) | never panics; bounded; at most one token tree per 16 bytes |
-| `macro_wasm_lex` | `blaze_macro_wasm::tokens`, the host's lexer for `ts_from_str` | never panics; bounded; at most 2 trees per byte, plus one |
 | `syntax_parse` | `parser::LexedStr::new` and `syntax::SourceFile::parse` (source text, any edition, every lazy body parsed) | never panics or hangs; the lexer's tokens tile the text; the fast lexer lexes as `rustc_lexer` alone; the tree's tokens tile the text and every error, the bodies' included, is inside it; blocks balanced in the current edition; bounded |
 | `syntax_reparse` | `syntax::Parse::reparse` of one edit (`syntax::fuzz::CheckReparse`, the format of `crates/syntax/test_data/reparse/fuzz-failures`) | never panics or hangs; the reparsed tree's text is the edited text and its blocks are balanced; it has the full parse's nodes, kinds and ranges, in order, and as many |
 | `usercode_wire` | blaze-usercode's fork-server frames (`test::wire::Frames`, `Frame::decode`), what a test binary writes | pushed whole, a byte at a time, as `needed` asks and in the input's pieces, `pop` gives a plain walk's frames to the first error; a length past `LONGEST` is an error, never an allocation; decode is canonical; bounded |
@@ -125,10 +121,6 @@ Each target's file (`targets/<target>.rs`) begins with the invariants it checks.
 | `usercode_script_verify` | `blaze_build_script::verify` of a run's output against the elided one | `Ok` exactly when they are equal, else the error naming the first differing line; bounded |
 | `usercode_trace_record`, `usercode_trace_report` | the sandbox trace's lines (`trace::parse`) and reports (`trace::decode`) | agree with a model of the grammar; round trip; reading in pieces equals reading whole; bounded |
 | `usercode_index_shape`, `usercode_run_value` | `index::Shape::decode`, `run::Value::decode` | decode then encode is the identity; bounded |
-| `proc_macro_message` | `proc-macro-api`'s warm protocol: one postcard `BidirectionalMessage` from the server, in a COBS frame | never panics; bounded (serde's cautious preallocation of a map's buckets on top of `allowed(len)`); a message read writes as one frame that reads back to the same message |
-| `proc_macro_frames` | a stream of the warm protocol's COBS frames and the legacy protocol's lines, noise included | the stream reads as each frame read alone, and the same in pieces of any size; bounded |
-| `proc_macro_legacy` | the legacy protocol's newline-delimited JSON answers | bounded; read alike in pieces; each answer writes as one line that reads back the same |
-| `proc_macro_flat_tree` | a `FlatTree` and its span table, as the client resolves them (`deserialize_span_data_index_map`, `to_subtree_resolved`) | never panics; bounded by the input's length times a token tree's size; a tree read encodes and reads back the same |
 | `proc_macro_tt_wire` | `tt::TopSubtree::read_wire`, the token-tree wire | never panics; bounded; a tree read writes back to exactly the words it took and equals `from_serialized` of its trees; every strict prefix is `Truncated` |
 | `codegen_blob` | `blaze_codegen::blob`'s `decode`, `decode_view`, `decode_static` and `decode_masked`, templates kept in the store and the remote cache | `Err`, or a value whose encoding reads back as it; `decode_view` in a fresh frame agrees with `decode` |
 | `hir_item_tree`, `hir_expr_store`, `hir_body`, `hir_store_source_map`, `hir_body_source_map` | `Persist::read` then `decode()` of the persisted item tree, expression store, body and their source maps | `Err`, or a value written back the same (for column edits of a valid buffer, exactly the input); decoded syntax contexts are compared and dropped, never given to a database; bounded |

@@ -100,6 +100,9 @@ pub enum RunError<E> {
     OutDir(String),
     /// Verify mode: run again, it gave other than what was kept.
     Differs { key: RunKey, what: String },
+    /// It succeeded printing what cargo refuses, so what cargo would watch of it is not known:
+    /// nothing is kept.
+    Output { key: RunKey, error: blaze_build_script::Error },
 }
 
 impl<E: fmt::Debug> fmt::Display for RunError<E> {
@@ -117,6 +120,9 @@ impl<E: fmt::Debug> fmt::Display for RunError<E> {
                  inputs ({what}): its key misses an input, or it is not a function of its inputs",
                 key.code, key.given
             ),
+            RunError::Output { key, error } => {
+                write!(f, "the run of {} given {} printed what cargo refuses: {error}", key.code, key.given)
+            }
         }
     }
 }
@@ -200,7 +206,7 @@ impl Run {
         completion: Completion,
         store: &mut Store,
         inputs: &mut I,
-        rule: impl FnOnce(&Exit) -> CargoRule,
+        rule: impl FnOnce(&Exit) -> Result<CargoRule, blaze_build_script::Error>,
         keyed: impl FnOnce(&mut Traced),
     ) -> Result<(Value, Traced, Vec<Ticket>), RunError<I::Error>> {
         assert_eq!(completion.tag, self.tag, "a run takes its own completion");
@@ -227,7 +233,8 @@ impl Run {
             Some(out_dir) => collect(out_dir).map_err(RunError::OutDir)?,
             None => Vec::new(), // alloc: none, an empty list
         };
-        let rule = (exit.code == Some(0)).then(|| rule(&exit));
+        let key = self.spec.key;
+        let rule = (exit.code == Some(0)).then(|| rule(&exit)).transpose().map_err(|error| RunError::Output { key, error })?;
         let value = Value::of(exit, files);
         if let Some(kept) = &self.kept {
             if let Some(what) = differs(kept, &value) {
@@ -391,16 +398,14 @@ fn executable(_: &std::fs::Metadata) -> bool {
 }
 
 /// Writes `files` into `dir`, emptied first: the `OUT_DIR` a run reused left. Each path is
-/// checked to stay inside it; one that would not is the store's bytes being wrong.
+/// checked to stay inside it before anything is touched; one that would not is the store's
+/// bytes being wrong, and leaves `dir` as it was.
 ///
 /// A directory is made once: one the value lists (it does each, before what is in it) or one
 /// made for a file is not made again for the next file in it. A file is open, write, close,
 /// and `fchmod` on its descriptor when it is executable.
 pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
     use std::io::Write as _;
-    empty(dir)?;
-    // alloc: once per OUT_DIR restored, the directories made in it, lent from `files`
-    let mut made = rustc_hash::FxHashSet::<&str>::default();
     for file in files {
         let ok = !file.path.is_empty()
             && !file.path.starts_with('/')
@@ -408,6 +413,11 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
         if !ok {
             return Err(format!("a kept OUT_DIR names {:?}, which would leave it", file.path)); // alloc: error path
         }
+    }
+    empty(dir)?;
+    // alloc: once per OUT_DIR restored, the directories made in it, lent from `files`
+    let mut made = rustc_hash::FxHashSet::<&str>::default();
+    for file in files {
         let path = dir.join(&file.path);
         match &file.bytes {
             None => {
@@ -559,7 +569,7 @@ mod tests {
         };
         let mut done = None;
         run_until_idle(sim, &mut effects, |completion, _| done = Some(completion));
-        let (value, _, _) = run.complete(done.unwrap(), store, inputs, |_| CargoRule::default(), |_| {})?;
+        let (value, _, _) = run.complete(done.unwrap(), store, inputs, |_| Ok(CargoRule::default()), |_| {})?;
         Ok((value, true))
     }
 

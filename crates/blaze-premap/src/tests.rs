@@ -480,7 +480,9 @@ fn prelinked_and_workspace_link_run_as_the_whole_link() {
     assert_eq!(split.functions, whole.functions, "every function at the whole link's address");
     assert_eq!(split.statics, whole.statics, "every static at the whole link's address or offset");
     assert_eq!(split.init, whole.init, "init functions run in the whole link's order");
-    assert_eq!(split.init, [whole.functions[&ikey(1)], whole.functions[&ikey(11)]]);
+    let mut pieces = [(item(3), instance(3), ikey(1)), (item(13), instance(13), ikey(11))];
+    pieces.sort_by_key(|(item, instance, _)| blaze_link::premap::InitEntry::tie_of(item, instance));
+    assert_eq!(split.init, pieces.map(|(_, _, function)| whole.functions[&function]), "unranked pieces run by their ties");
     assert_eq!(split.tls, whole.tls, "the thread-local area as the whole link lays it out");
     assert_eq!(split.memory, whole.memory, "every byte the program starts with");
 }

@@ -151,7 +151,7 @@ impl Sym {
         let mut out = [0; SYM as usize];
         out[0..4].copy_from_slice(&self.name.to_le_bytes());
         out[4] = self.info;
-        out[5] = elf::STV_DEFAULT;
+        out[5] = elf::STV_DEFAULT.0;
         out[6..8].copy_from_slice(&self.shndx.to_le_bytes());
         out[8..16].copy_from_slice(&self.value.to_le_bytes());
         out[16..24].copy_from_slice(&self.size.to_le_bytes());
@@ -165,15 +165,15 @@ impl Sym {
 
 pub(crate) fn sym_type(kind: SymbolKind) -> u8 {
     match kind {
-        SymbolKind::Function => elf::STT_FUNC,
-        SymbolKind::Data => elf::STT_OBJECT,
-        SymbolKind::Tls => elf::STT_TLS,
-        SymbolKind::Section | SymbolKind::Other => elf::STT_NOTYPE,
+        SymbolKind::Function => elf::STT_FUNC.0,
+        SymbolKind::Data => elf::STT_OBJECT.0,
+        SymbolKind::Tls => elf::STT_TLS.0,
+        SymbolKind::Section | SymbolKind::Other => elf::STT_NOTYPE.0,
     }
 }
 
-pub(crate) fn info(bind: u8, kind: SymbolKind) -> u8 {
-    (bind << 4) | sym_type(kind)
+pub(crate) fn info(bind: elf::SymbolBind, kind: SymbolKind) -> u8 {
+    (bind.0 << 4) | sym_type(kind)
 }
 
 /// Whether every region's section header has an ordinary ELF number, as [`shndx`] needs.
@@ -191,7 +191,7 @@ pub(crate) fn shndx(regions: &[Region], addr: u64) -> u16 {
     let at = regions.partition_point(|it| it.addr <= addr);
     match at.checked_sub(1).filter(|&it| addr <= regions[it].addr + regions[it].capacity) {
         Some(index) => (index + 1) as u16,
-        None => elf::SHN_ABS,
+        None => elf::SHN_ABS.0,
     }
 }
 
@@ -221,22 +221,22 @@ struct Types {
 fn types(arch: Arch) -> Types {
     match arch {
         Arch::Aarch64 => Types {
-            relative: elf::R_AARCH64_RELATIVE,
-            glob_dat: elf::R_AARCH64_GLOB_DAT,
-            abs64: elf::R_AARCH64_ABS64,
-            tpoff64: elf::R_AARCH64_TLS_TPREL,
-            dtpmod64: elf::R_AARCH64_TLS_DTPMOD,
-            dtpoff64: elf::R_AARCH64_TLS_DTPREL,
-            tlsdesc: elf::R_AARCH64_TLSDESC,
+            relative: elf::R_AARCH64_RELATIVE.0,
+            glob_dat: elf::R_AARCH64_GLOB_DAT.0,
+            abs64: elf::R_AARCH64_ABS64.0,
+            tpoff64: elf::R_AARCH64_TLS_TPREL.0,
+            dtpmod64: elf::R_AARCH64_TLS_DTPMOD.0,
+            dtpoff64: elf::R_AARCH64_TLS_DTPREL.0,
+            tlsdesc: elf::R_AARCH64_TLSDESC.0,
         },
         Arch::X86_64 | Arch::Wasm32 => Types {
-            relative: elf::R_X86_64_RELATIVE,
-            glob_dat: elf::R_X86_64_GLOB_DAT,
-            abs64: elf::R_X86_64_64,
-            tpoff64: elf::R_X86_64_TPOFF64,
-            dtpmod64: elf::R_X86_64_DTPMOD64,
-            dtpoff64: elf::R_X86_64_DTPOFF64,
-            tlsdesc: elf::R_X86_64_TLSDESC,
+            relative: elf::R_X86_64_RELATIVE.0,
+            glob_dat: elf::R_X86_64_GLOB_DAT.0,
+            abs64: elf::R_X86_64_64.0,
+            tpoff64: elf::R_X86_64_TPOFF64.0,
+            dtpmod64: elf::R_X86_64_DTPMOD64.0,
+            dtpoff64: elf::R_X86_64_DTPOFF64.0,
+            tlsdesc: elf::R_X86_64_TLSDESC.0,
         },
     }
 }
@@ -327,7 +327,7 @@ impl Tables {
         let symbols = 1 + imports.len() + exports.len();
         let symoffset = 1 + imports.len() as u32;
         let mut versym = Vec::with_capacity(symbols * 2);
-        versym.put_u16(elf::VER_NDX_LOCAL);
+        versym.put_u16(elf::VER_NDX_LOCAL.0);
         let versioned = imports.iter().filter(|it| it.library.is_some() && it.version.is_some()).count();
         let mut needs: Vec<(u32, &str, u16)> = Vec::with_capacity(versioned);
         let mut version_index: FxHashMap<(u32, &str), u16> =
@@ -343,20 +343,20 @@ impl Tables {
                             let index = next;
                             next = next
                                 .checked_add(1)
-                                .filter(|&it| it < elf::VERSYM_HIDDEN)
+                                .filter(|&it| it < elf::VERSYM_HIDDEN.0)
                                 .ok_or_else(|| error("more symbol versions than ELF numbers".into()))?;
                             needs.push((slot, version.as_str(), index));
                             *it.insert(index)
                         }
                     }
                 }
-                _ => elf::VER_NDX_GLOBAL,
+                _ => elf::VER_NDX_GLOBAL.0,
             };
             versym.put_u16(version);
         }
         versym.resize(symbols * 2, 0);
         for pair in versym[2 * symoffset as usize..].chunks_exact_mut(2) {
-            pair.copy_from_slice(&elf::VER_NDX_GLOBAL.to_le_bytes());
+            pair.copy_from_slice(&elf::VER_NDX_GLOBAL.0.to_le_bytes());
         }
         radix::sort_copy_by_key(&mut needs, |it| it.0);
 
@@ -451,8 +451,8 @@ impl Tables {
                 .ok_or_else(|| error(format!("the image has no `{name}` region"))) // alloc: error path
         };
         let mut dynamic = Vec::with_capacity(16 * (needed_names.len() + DYNAMIC_FIXED as usize));
-        let mut entry = |tag: u32, value: u64| {
-            dynamic.put_u64(u64::from(tag));
+        let mut entry = |tag: elf::DynamicTag, value: u64| {
+            dynamic.put_u64(tag.0 as u64);
             dynamic.put_u64(value);
         };
         for &name in &needed_names {
@@ -466,11 +466,11 @@ impl Tables {
         }
         let static_tls = shared && tpoff;
         let flags = elf::DF_BIND_NOW
-            | if shared { elf::DF_SYMBOLIC } else { 0 }
-            | if static_tls { elf::DF_STATIC_TLS } else { 0 };
-        entry(elf::DT_FLAGS, u64::from(flags));
-        let flags_1 = elf::DF_1_NOW | if shared { 0 } else { elf::DF_1_PIE };
-        entry(elf::DT_FLAGS_1, u64::from(flags_1));
+            | if shared { elf::DF_SYMBOLIC } else { elf::DynamicFlags(0) }
+            | if static_tls { elf::DF_STATIC_TLS } else { elf::DynamicFlags(0) };
+        entry(elf::DT_FLAGS, flags.0);
+        let flags_1 = elf::DF_1_NOW | if shared { elf::DynamicFlags1(0) } else { elf::DF_1_PIE };
+        entry(elf::DT_FLAGS_1, flags_1.0);
         if let Some(init) = placed.init {
             entry(elf::DT_INIT, init);
         }
@@ -511,7 +511,7 @@ impl Tables {
         let mut note = Vec::with_capacity((NOTE_HEADER + 16) as usize);
         note.put_u32(4);
         note.put_u32(16);
-        note.put_u32(elf::NT_GNU_BUILD_ID);
+        note.put_u32(elf::NT_GNU_BUILD_ID.0);
         note.extend_from_slice(b"GNU\0");
         note.extend_from_slice(&placed.id);
 

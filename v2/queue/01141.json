@@ -1,0 +1,23 @@
+{
+  "id": "01141",
+  "from_lane": "tests-diag",
+  "owner": "db",
+  "paths": [
+    "crates/hir-def/src/attrs/stability.rs"
+  ],
+  "what": "crates/hir-def/src/attrs/stability.rs forces_unstable: every CrateOrigin::Lang crate without staged_api gets FORCE_UNSTABLE (rustc_private), which includes the fixtures minicore `core` (Lang(Core), no staged_api), so every use of Sized/Iterator/... from minicore is E0658 `use of unstable library feature rustc_private` in 28 blaze-diagnostics UI tests. rustc: -Zforce-unstable-if-unmarked only matters for sysroot crates without staged_api; core/alloc/std/proc_macro/test always have staged_api in the real sysroot. Fix: `matches!(origin, CrateOrigin::Lang(LangCrateOrigin::Dependency | LangCrateOrigin::Other))`. Also, separately: block_owner (stability.rs:698) panics `no definition of its module holds the block` for a block expanded from a macro_rules called inside core::panic! (test tests::items::impls::drop_of_an_instantiation_of_its_type); parent_ancestors_with_macros_view seems not to climb out of the nested macro file.",
+  "state": "open",
+  "created": "2026-10-30T22:23:59Z",
+  "updated": "2026-10-30T22:23:59Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:23:59Z",
+      "by": "tests-diag",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

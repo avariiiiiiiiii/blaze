@@ -508,7 +508,7 @@ error: aborting due to 2 previous errors
 /// [`ui_core`] of a revision: `--cfg {revision}`, as compiletest passes it.
 fn ui_revision(name: &str, revision: &str, flags: &str, source: &str) -> String {
     let fixture =
-        format!("//- minicore: {flags}\n//- /{name} crate:main edition:2015 cfg:{revision}\n{source}");
+        format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015 cfg:{revision}\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }

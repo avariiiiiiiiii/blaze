@@ -32,7 +32,6 @@ use blaze_units::{
 use blaze_vfs::{Bytes, Corrupt, Mode, View};
 use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
-use sha2::{Digest as _, Sha256};
 
 /// Where the probe's package is named: under no directory of the machine's, so nothing of it is
 /// read from the disk.
@@ -174,22 +173,22 @@ pub(super) fn check(asked: &Asked<'_>, shown: &str, source: &str, library: &Libr
     Ok(Checked { failed: diags.iter().any(Diag::is_error), stderr: written(&diags, asked, shown, source, library) })
 }
 
-/// SHA-256 of the `library/std/build.rs` whose outputs [`std_script`] gives.
-pub(super) const STD_SCRIPT: &str = "f5510c905e126f1de772d73c02cacb7a5ed0a485a22fb99f395593b16a9de8b2";
+/// BLAKE3 of the `library/std/build.rs` whose outputs [`std_script`] gives.
+pub(super) const STD_SCRIPT: &str = "3be73c2bf16ec86c52fb2d8973c92f1b0ef3c61f9412e8e647f7c71086f00871";
 
 /// What std's build script (`library/std/build.rs`) gives std, set on its crate: the probe's
 /// load runs no build script, and `restricted_std` decides whether a probe on a bare-metal
-/// target may name std. The rule is the script's, for the script whose SHA-256 is
+/// target may name std. The rule is the script's, for the script whose BLAKE3 hash is
 /// [`STD_SCRIPT`]; any other script stops the check. It is read as for the library rustc ships,
 /// with none of the script's variables set (`RUSTC_STD_NETBSD10`, `WIND_RELEASE_ID`,
 /// `RUSTC_BOOTSTRAP_SYNTHETIC_TARGET`).
 fn std_script(lowered: &mut blaze_lower::Lowered, units: &Units, library: &Library) -> anyhow::Result<()> {
     let path = library.dir.join("std/build.rs");
     let script = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let got: String = Sha256::digest(&script).iter().map(|it| format!("{it:02x}")).collect();
+    let got = blaze_format::hex::encode(&blaze_ids::b3::hash(&script));
     if got != STD_SCRIPT {
         bail!(
-            "{} has sha256 {got}, and blaze's rustc stand-in gives the outputs of the one with \
+            "{} has BLAKE3 hash {got}, and blaze's rustc stand-in gives the outputs of the one with \
              {STD_SCRIPT} (`std_script` in crates/blaze-engine/src/as_rustc/probe.rs)",
             path.display()
         );
@@ -398,7 +397,14 @@ impl ProbeFiles {
                     return None;
                 }
             };
-            let Ok(name) = entry.file_name().into_string() else { continue };
+            let name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                Err(_) => {
+                    let error = std::io::Error::new(std::io::ErrorKind::InvalidData, "a name that is not UTF-8");
+                    self.fail(&entry.path(), error);
+                    return None;
+                }
+            };
             if path.is_empty() && !stdlib::in_library(&name) {
                 continue;
             }

@@ -798,6 +798,24 @@ fn a_promoted_temporary_outlives_its_call() {
     );
 }
 
+#[test]
+fn a_promoted_division_by_minus_one_of_every_width() {
+    // rustc promotes it when the dividend is a constant other than the type's minimum, which
+    // is the type's own width: `i128`'s and `isize`'s too.
+    check_number(
+        r#"
+        const fn wide() -> &'static i128 {
+            &(5i128 / -1)
+        }
+        const fn word() -> &'static isize {
+            &(7isize / -1)
+        }
+        const GOAL: i128 = *wide() * 10 + *word() as i128;
+        "#,
+        -57,
+    );
+}
+
 const INTEGER_LOG: &str = r#"
         //- minicore: option, panic, assert, slice, index
         #[rustc_intrinsic]

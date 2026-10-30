@@ -13,7 +13,7 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-cov-mark = "2.0.0"
+cov-mark.workspace = true
 itertools.workspace = true
 arrayvec.workspace = true
 smallvec.workspace = true
@@ -26,7 +26,7 @@ la-arena.workspace = true
 triomphe.workspace = true
 indexmap.workspace = true
 inventory.workspace = true
-rustc_apfloat = "0.2.3"
+rustc_apfloat.workspace = true
 salsa.workspace = true
 bitflags.workspace = true
 
@@ -61,7 +61,7 @@ base-db.workspace = true
 syntax.workspace = true
 span.workspace = true
 target-features.workspace = true
-thin-vec = "0.2.16"
+thin-vec.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true
@@ -73,6 +73,12 @@ hir-expand = { workspace = true, features = ["fixture"] }
 
 [features]
 in-rust-tree = ["hir-expand/in-rust-tree"]
+
+# The impls of a trait for a type in a crate of many dependencies, read from the crates that
+# can name both against the walk over every crate; prints both and whether it gains.
+[[bench]]
+name = "impls"
+harness = false
 
 [lints]
 workspace = true

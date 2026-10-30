@@ -19,7 +19,7 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
     if let Some((entries, strings)) = sections.dynamic(ENDIAN, data).map_err(error)? {
         let strings = sections.strings(ENDIAN, data, strings).map_err(error)?;
         for entry in entries {
-            if entry.d_tag(ENDIAN) != u64::from(elf::DT_SONAME) {
+            if entry.d_tag(ENDIAN) != elf::DT_SONAME {
                 continue;
             }
             let bytes = u32::try_from(entry.d_val(ENDIAN))
@@ -43,16 +43,11 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
     // for the local and global indexes, which name no version. Reserved whole, so it never
     // grows: untouched pages past the highest index seen are never written.
     let mut slots: Vec<Option<Option<u16>>> =
-        Vec::with_capacity(if table.is_some() { usize::from(elf::VERSYM_VERSION) + 1 } else { 0 });
+        Vec::with_capacity(if table.is_some() { usize::from(elf::VERSYM_VERSION.0) + 1 } else { 0 });
     for (index, symbol) in dynsym.enumerate() {
         if index.0 == 0 || symbol.st_shndx(ENDIAN) == elf::SHN_UNDEF {
             continue;
         }
-        let weak = match symbol.st_bind() {
-            elf::STB_GLOBAL | elf::STB_GNU_UNIQUE => false,
-            elf::STB_WEAK => true,
-            _ => continue,
-        };
         // Read for an error only: the name is pushed once the symbol is known to be kept.
         let symbol_name = || {
             dynsym.symbol_name(ENDIAN, symbol).map_or_else(
@@ -60,14 +55,25 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
                 |it| String::from_utf8_lossy(it).into_owned(), // alloc: error path
             )
         };
+        let weak = match symbol.st_bind() {
+            elf::STB_GLOBAL | elf::STB_GNU_UNIQUE => false,
+            elf::STB_WEAK => true,
+            // A local in `.dynsym` is the library's own: nothing imports it.
+            elf::STB_LOCAL => continue,
+            other => {
+                // alloc: error path
+                return Err(format!("{name}: symbol {} has binding {}, which blaze-link does not read", symbol_name(), other.0));
+            }
+        };
         let version = match &table {
             None => None,
             Some(table) => {
-                let version = table.version_index(ENDIAN, index);
-                if version.is_hidden() {
+                let versym = table.version_index(ENDIAN, index);
+                if versym.is_hidden() {
                     continue;
                 }
-                let at = usize::from(version.index());
+                let version = versym.index();
+                let at = usize::from(version.0);
                 if slots.len() <= at {
                     slots.resize(at + 1, None);
                 }
@@ -107,7 +113,7 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
         symbols.push(SharedSymbol {
             name: dynstr.name(&mut names, name, "the symbol name", symbol.st_name(ENDIAN))?,
             version,
-            kind: super::kind(symbol.st_type()),
+            kind: super::kind(name, symbol_name, symbol.st_type())?,
             weak,
         });
     }

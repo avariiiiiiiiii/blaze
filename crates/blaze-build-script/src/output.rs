@@ -18,7 +18,7 @@ use serde_derive::Serialize;
 
 use crate::{
     Error,
-    unit::{Package, Unit},
+    unit::{Package, Unfilled, Unit},
 };
 
 /// A message a script asked cargo to show.
@@ -324,17 +324,22 @@ fn rust_version(text: &str) -> Option<(u64, Option<u64>, Option<u64>)> {
 }
 
 /// The package's `rust-version` as cargo shows it, when it is older than 1.77, which brought
-/// `cargo::`: then it cannot use that syntax.
-fn older_than_new_syntax(package: &Package) -> Option<String> {
-    let (major, minor, patch) = rust_version(package.rust_version.as_deref()?)?;
+/// `cargo::`: then it cannot use that syntax. One that is not a version is an error, as
+/// cargo's manifest reader refuses it.
+fn older_than_new_syntax(package: &Package) -> Result<Option<String>, Unfilled> {
+    let Some(written) = package.rust_version.as_deref() else { return Ok(None) };
+    let Some((major, minor, patch)) = rust_version(written) else {
+        // alloc: error path.
+        return Err(Unfilled::RustVersion { package: package.descr(), rust_version: written.to_owned() });
+    };
     let compatible = major == 1 && (minor.unwrap_or(0), patch.unwrap_or(0)) >= (77, 0);
     if compatible {
-        return None;
+        return Ok(None);
     }
     let shown =
         // alloc: error path: the version shown when `cargo::` is refused.
         [Some(major), minor, patch].iter().flatten().map(u64::to_string).collect::<Vec<_>>();
-    Some(shown.join("."))
+    Ok(Some(shown.join(".")))
 }
 
 /// Why a `cargo::` line of a package whose `rust-version` is `msrv`
@@ -473,8 +478,10 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
         let (old_syntax, key, value) = match line.as_bytes().get(6) {
             Some(b':') => {
                 let data = &line[7..];
-                let refused = new_syntax_msrv.get_or_insert_with(|| older_than_new_syntax(package));
-                if let Some(msrv) = refused {
+                if new_syntax_msrv.is_none() {
+                    new_syntax_msrv = Some(older_than_new_syntax(package)?);
+                }
+                if let Some(Some(msrv)) = &new_syntax_msrv {
                     return Err(new_syntax_refused(Descr(package), msrv, data));
                 }
                 let (key, value) = key_value(package, line, data, "cargo::")?;

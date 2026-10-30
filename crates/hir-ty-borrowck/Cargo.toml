@@ -17,7 +17,6 @@ rustc-hash.workspace = true
 la-arena.workspace = true
 smallvec.workspace = true
 blaze-mem.workspace = true
-hashbrown.workspace = true
 salsa.workspace = true
 
 ra-ap-rustc_ast_ir.workspace = true

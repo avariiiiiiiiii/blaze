@@ -1,15 +1,12 @@
-//! On macOS, the sandbox's library (`BLAZE_SANDBOX_LIBRARY`); on Linux, its interposer
-//! (`BLAZE_SANDBOX_INTERPOSE`). The SHA-256 is `blaze-sha256`'s, which has no
-//! dependencies, rather than `sha2`'s: a build dependency is built for the machine that builds
-//! (see crates/blaze-engine/build.rs). Which blaze this is (its version and commit) is crates/blaze-engine's
+//! On macOS, the sandbox's library; on Linux, its interposer. Each is named in the user's cache
+//! by the BLAKE3 hash of its bytes, taken at run time (`src/sandbox/`), so this script has no
+//! build dependency. Which blaze this is (its version and commit) is crates/blaze-engine's
 //! build.rs's, the one crate that changes with every commit anyway, and reaches this crate
 //! through `engine::Engine`: this crate's build stays the same from commit to commit.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
-
-use blaze_sha256::Sha256;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -42,10 +39,6 @@ fn linux_interpose() {
         .status()
         .unwrap_or_else(|error| panic!("{cc} did not run to build {source}: {error}"));
     assert!(status.success(), "{cc} could not build {source}");
-    let mut hash = Sha256::new();
-    hash.update(&std::fs::read(&out).unwrap());
-    let hex: String = hash.finish().iter().take(12).map(|byte| format!("{byte:02x}")).collect();
-    println!("cargo:rustc-env=BLAZE_SANDBOX_INTERPOSE={hex}");
 }
 
 /// On macOS, the library every process of a sandbox loads (`src/sandbox/macos_interpose.c`),
@@ -82,9 +75,4 @@ fn sandbox_library() {
         .status()
         .unwrap_or_else(|error| panic!("{cc} did not run to build {source}: {error}"));
     assert!(status.success(), "{cc} could not build {source}");
-    // Its name in the user's cache, by its contents, worked out here rather than at each run.
-    let mut hash = Sha256::new();
-    hash.update(&std::fs::read(&out).unwrap());
-    let hex: String = hash.finish().iter().take(12).map(|byte| format!("{byte:02x}")).collect();
-    println!("cargo:rustc-env=BLAZE_SANDBOX_LIBRARY={hex}");
 }

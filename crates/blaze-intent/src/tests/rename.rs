@@ -132,6 +132,9 @@ fn check(edits: &[Edit], after: &BTreeMap<String, String>) -> (TestDB, Applied) 
     }
     for seed in &seeds {
         let id = EditionedFileId::new(&next, seed.file, seed.edition);
+        let input = next.file_text(seed.file);
+        assert_eq!(input.content(&next), seed.content, "the seed is of the file's text as set");
+        assert!(seed.parse.root().text() == input.text(&next).as_str(), "the seed's tree is of the file's text");
         assert!(id.seed_parse(&next, seed.content, &seed.parse), "the front end takes the seed");
         assert!(std::ptr::eq(id.parse(&next).root().file(), seed.parse.root().file()), "no parse of its own");
     }

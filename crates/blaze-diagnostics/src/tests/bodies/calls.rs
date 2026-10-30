@@ -16,7 +16,7 @@ use crate::{
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`),
 /// under compiletest's flags.
 fn ui_core(name: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:2015\n{source}");
+    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
     ui_fixture(&fixture)
 }
 
@@ -24,9 +24,9 @@ fn ui_core(name: &str, flags: &str, source: &str) -> String {
 /// prelude.
 fn ui_std(name: &str, flags: &str, std_items: &str, source: &str) -> String {
     let fixture = format!(
-        "//- minicore: {flags}\n//- /std.rs crate:std deps:core\n\
+        "//- minicore: {flags}\n//- /std.rs crate:std\n\
          pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; }} }}\n\
-         {std_items}\n//- /{name} crate:main edition:2015 deps:std\n{source}"
+         {std_items}\n//- /{name} crate:other:main edition:2015 deps:std\n{source}"
     );
     ui_fixture(&fixture)
 }
@@ -291,7 +291,7 @@ pub enum FieldLessWithNonExhaustiveVariant {
 impl Default for FieldLessWithNonExhaustiveVariant {
     fn default() -> Self { Self::A }
 }
-//- /std.rs crate:std deps:core
+//- /std.rs crate:std
 pub mod prelude { pub mod rust_2015 { pub use core::prelude::rust_2015::*; } }
 #[macro_export]
 macro_rules! assert_eq {
@@ -305,7 +305,7 @@ macro_rules! assert_eq {
         }
     };
 }
-//- /enum-as-cast.rs crate:main edition:2015 deps:std,enums
+//- /enum-as-cast.rs crate:other:main edition:2015 deps:std,enums
 //@ aux-build:enums.rs
 
 extern crate enums;
@@ -781,14 +781,14 @@ error: aborting due to 1 previous error
 
 "##;
     let fixture = format!(
-        "//- minicore: sized, unsize, coerce_unsized, deref\n//- /std.rs crate:std deps:core\n\
+        "//- minicore: sized, unsize, coerce_unsized, deref\n//- /std.rs crate:std\n\
          pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; pub use crate::boxed::Box; }} }}\n\
          pub mod boxed {{\n\
          #[lang = \"owned_box\"]\n\
          pub struct Box<T: ?Sized>(*mut T);\n\
          impl<T: ?Sized> core::ops::Deref for Box<T> {{ type Target = T; fn deref(&self) -> &T {{ loop {{}} }} }}\n\
          }}\n\
-         //- /trait-object-import-suggestion-on-method.rs crate:main edition:2015 deps:std\n{source}"
+         //- /trait-object-import-suggestion-on-method.rs crate:other:main edition:2015 deps:std\n{source}"
     );
     assert_eq!(ui_fixture(&fixture), stderr);
 }

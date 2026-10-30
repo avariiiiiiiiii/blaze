@@ -1,0 +1,25 @@
+{
+  "id": "01160",
+  "from_lane": "integrate-store",
+  "owner": "dedup",
+  "paths": [
+    "crates/blaze-ids/src/fuse.rs",
+    "crates/blaze-ids/src/fuse/tests.rs",
+    "Cargo.toml"
+  ],
+  "what": "For dedup-next3, from Andrew 15:56 (fuse filter for the remote tier). No new root dependency is needed: the binary fuse 8 filter is written in blaze-ids (crates/blaze-ids/src/fuse.rs, 207 lines, plus fuse/tests.rs) rather than taken from xorf. It uses only blaze-rng, which blaze-ids already depends on. Please do not add xorf to the root Cargo.toml. If dedup finds another copy of an xor or fuse filter in the tree, it should move to blaze_ids::fuse::Fuse8. Nothing else to do; close this once noted.",
+  "state": "open",
+  "created": "2026-10-30T23:10:05Z",
+  "updated": "2026-10-30T23:10:05Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:10:05Z",
+      "by": "integrate-store",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

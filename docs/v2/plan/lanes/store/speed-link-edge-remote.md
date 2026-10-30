@@ -86,6 +86,12 @@ Each change is spelled out exactly, with its test, in `v2/requests/concurrency.m
 - **C7, no head-of-line blocking within a batch.** With wire version 2, answers may come in any
   order: the client matches by key, and the server sends missing and small answers first.
 - **C8, no allocation per call.** `Client::complete` appends to a caller's `Vec`.
+- **C9, a miss costs no round trip (wire version 3).** The server sends a binary fuse filter
+  (8-bit fingerprints, about 9 bits a key, `blaze_ids::fuse`) of its store's keys when a client
+  connects, then a delta per batch (`Server::refresh`), and a full one again once the deltas
+  pass a quarter of it. The client answers `Missing` itself for a key no filter may hold
+  (`Asked::Missing`) and asks only on a maybe. A key put after the filter's epoch reads
+  `Missing` until the next delta: a stale filter costs a recompute, never a wrong value.
 - **K1 (core): `Effect::SendMapped`.** A raw record is sent from the pack mapping with
   `sendfile`, or with io_uring zero-copy send.
 - **K2 (core): `Effect::RecvInto`.** A receive appends into a buffer the caller owns, so a long
@@ -95,7 +101,7 @@ Each change is spelled out exactly, with its test, in `v2/requests/concurrency.m
 
 - **Head-of-line blocking across batches.** A 1 GiB value already being sent still delays the
   answers to asks sent after it: about 2 s at 500 MB/s over SSH. HTTP/2 or ByteStream avoids
-  this by splitting the stream. Matching it would take a wire version 3 whose frames carry a
+  this by splitting the stream. Matching it would take a wire version 4 whose frames carry a
   stream number and a chunk, with the server interleaving 1 MiB chunks of long values between
   short answers. It is not requested yet: a laptop's read-through mostly asks for query values
   and code, which are small. It should be measured first.

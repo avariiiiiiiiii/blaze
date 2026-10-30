@@ -229,7 +229,7 @@ class Repo:
             for table in dep_tables(manifest):
                 for key, spec in table.items():
                     # An optional local crate is left out with the features that name it:
-                    # blaze enables none (proc-macro-srv, for `in-rust-tree`, is one).
+                    # blaze enables none.
                     if isinstance(spec, dict) and spec.get("optional"):
                         if (dep := self.local_dir(d, key, spec)) is not None:
                             crate.optional.add(dep)

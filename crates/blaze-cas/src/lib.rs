@@ -451,6 +451,11 @@ pub struct Store {
     fetching: ByHash<Key, Tag>,
     fetched: Vec<(Key, Fetched)>,
     placed: Vec<Placed>,
+    /// Keys the batches put into packs since [`Store::new_keys`] last took them; `None` until
+    /// [`Store::watch_keys`].
+    new_keys: Option<Vec<Key>>,
+    /// Batches whose moves are made.
+    epoch: u64,
     /// How many times the own tier's read flags have rotated since its rows were last
     /// numbered afresh: a record is unread for two periods only once there have been two.
     periods: u32,
@@ -886,6 +891,8 @@ impl Store {
             fetched: Vec::new(),
             // alloc: empty, allocates nothing
             placed: Vec::new(),
+            new_keys: None,
+            epoch: 0,
             periods: 0,
             columns,
         };
@@ -1534,9 +1541,11 @@ impl Store {
         std::mem::take(&mut self.placed)
     }
 
-    /// Asks `remote` for the value of `key`, to be verified and kept when it comes; `None` when
-    /// it has a value of `key` already or is fetching it. The answer is a completion of the tag
-    /// returned, handed to [`Store::complete`]; how it went comes through [`Store::fetched`].
+    /// Asks `remote` for the value of `key`, to be verified and kept when it comes. The answer
+    /// is a completion of the tag returned, handed to [`Store::complete`]; how it went comes
+    /// through [`Store::fetched`]. `None` when it has a value of `key` already or is fetching
+    /// it, and when `remote` knew without asking that it has none, which [`Store::fetched`]
+    /// says at once as [`Fetched::Missing`].
     pub fn fetch(
         &mut self,
         key: &Key,
@@ -1546,10 +1555,61 @@ impl Store {
         if self.has(key) || self.fetching.contains_key(key) {
             return None;
         }
-        let tag = self.tags.ask(Op::Fetch { key: *key });
-        self.fetching.insert(*key, tag);
-        remote.fetch(key, tag, effects);
-        Some(tag)
+        let tag = self.tags.fresh();
+        match remote.fetch(key, tag, effects) {
+            Asked::Sent => {
+                self.tags.ops.insert(tag, Op::Fetch { key: *key });
+                self.fetching.insert(*key, tag);
+                Some(tag)
+            }
+            Asked::Missing => {
+                self.fetched.push((*key, Fetched::Missing));
+                None
+            }
+        }
+    }
+
+    /// Every key it has a value of in any tier, unverified, in no order, a key in two places
+    /// perhaps twice: what the remote tier's filter of it is built of. Call
+    /// [`Store::watch_keys`] first, so a key put while it is read is in a later
+    /// [`Store::new_keys`].
+    pub fn keys(&self) -> Vec<Key> {
+        let held = Held::writer(&*self.shared);
+        // alloc: once per full filter of the store, built for the remote tier's first peer and as its deltas grow
+        let mut out = Vec::new();
+        for tier in &self.tiers {
+            if let Some(index) = &tier.index {
+                out.extend(index.table().iter().map(|(_, key, _)| key));
+            }
+            for table in std::iter::once(&tier.delta).chain(&tier.prev) {
+                out.extend(table.iter(held).map(|(_, spot)| spot.key));
+            }
+        }
+        out
+    }
+
+    /// Starts keeping the keys each batch puts into packs, for [`Store::new_keys`] to take:
+    /// the remote tier's filter deltas. A store no server reads keeps none.
+    pub fn watch_keys(&mut self) {
+        // alloc: empty, allocates nothing; once per store a remote server reads
+        self.new_keys.get_or_insert_with(Vec::new);
+    }
+
+    /// Whether [`Store::watch_keys`] was called.
+    pub fn watching_keys(&self) -> bool {
+        self.new_keys.is_some()
+    }
+
+    /// The batches whose puts are in packs: the epoch a filter of [`Store::keys`] covers.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The keys put by the batches into packs since the last call, perhaps some twice, with
+    /// [`Store::epoch`]; empty unless [`Store::watch_keys`] was called.
+    pub fn new_keys(&mut self) -> (u64, Vec<Key>) {
+        // alloc: empty, allocates nothing; the keys taken are the caller's
+        (self.epoch, self.new_keys.as_mut().map(std::mem::take).unwrap_or_default())
     }
 
     /// How the fetches answered since the last call went.
@@ -1570,7 +1630,10 @@ impl Store {
         let done = completion.done;
         match op {
             Op::Private => match done {
-                Done::Private(None) => self.read_heads(effects),
+                Done::Private(None) => {
+                    self.failures = 0;
+                    self.read_heads(effects);
+                }
                 Done::Private(Some((file, access))) => {
                     // alloc: the error that breaks the store
                     self.fail(file, format!("{access}, and the store and all in it must be the user's alone"))
@@ -1584,7 +1647,10 @@ impl Store {
                 }
             },
             Op::Head { tier } => match done {
-                Done::Read(bytes) => self.read_head(tier, bytes, effects),
+                Done::Read(bytes) => {
+                    self.failures = 0;
+                    self.read_head(tier, bytes, effects);
+                }
                 done => {
                     let file = self.tiers[tier].file(HEAD_FILE);
                     if self.retry(&file, &done) {
@@ -1820,6 +1886,10 @@ impl Store {
                 }
                 for &(number, chunk) in &batch.chunks {
                     chunks.push(self.drains[number].segment.unlink_first(chunk));
+                }
+                self.epoch = batch.id + 1;
+                if let Some(keys) = &mut self.new_keys {
+                    keys.extend(batch.moves.iter().map(|it| it.key));
                 }
             }
             self.limbo.hold(Grace::start(), chunks);
@@ -2657,6 +2727,17 @@ pub struct Mismatch {
 /// The remote tier, for machines outside the pool (a laptop): read-through, never on the
 /// VM's hot path. A value from it is verified as any other before it is kept.
 pub trait Remote {
-    /// Asks for the value of `key`; the answer comes as a completion of `tag`.
-    fn fetch(&mut self, key: &Key, tag: Tag, effects: &mut Vec<Effect>);
+    /// Asks for the value of `key`; when it says [`Asked::Sent`], the answer comes as a
+    /// completion of `tag`.
+    fn fetch(&mut self, key: &Key, tag: Tag, effects: &mut Vec<Effect>) -> Asked;
+}
+
+/// What a [`Remote`] did with a fetch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Asked {
+    /// It asked: the answer comes as a completion of the fetch's tag.
+    Sent,
+    /// It knows without asking that the far store has no value of the key, as of what it last
+    /// heard from it, and asked nothing.
+    Missing,
 }

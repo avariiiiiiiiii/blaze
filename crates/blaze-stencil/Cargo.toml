@@ -27,9 +27,8 @@ smallvec.workspace = true
 # "Why a build script"): the generator in `gen/` drives it through its C API.
 llvm-sys.workspace = true
 object.workspace = true
-# The library's id: the BLAKE3 hash of its bytes, which stencil units' settings carry.
-blake3.workspace = true
-# `src/table/format.rs`'s sets and little-endian reads, as the patcher reads them.
+# `src/table/format.rs`'s sets and little-endian reads, as the patcher reads them, and the
+# library's id: the BLAKE3 hash of its bytes (`blaze_ids::b3`), which stencil units' settings carry.
 blaze-bytes.workspace = true
 blaze-ids.workspace = true
 

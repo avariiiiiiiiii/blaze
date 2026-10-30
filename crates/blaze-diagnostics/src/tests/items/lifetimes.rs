@@ -13,7 +13,7 @@ use crate::{
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`), as
 /// compiletest runs a test of `mode`.
 fn ui_core(mode: Mode, name: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:2015\n{source}");
+    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(mode, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }

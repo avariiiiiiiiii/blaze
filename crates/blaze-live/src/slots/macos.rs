@@ -31,7 +31,7 @@ use std::{
 
 pub(super) use super::unix::{GRAIN, Reserved, backtrace, descriptor, in_image_of};
 use super::{
-    Events,
+    Events, Unwatched,
     switch::{Dwarf, Layout, Memory, Writes},
     unix::{__register_frame, Segments, load_cell, loaders},
 };
@@ -113,6 +113,7 @@ const EV_CLEAR: u16 = 0x20;
 const NOTE_DELETE: u32 = 0x1;
 const NOTE_WRITE: u32 = 0x2;
 const NOTE_RENAME: u32 = 0x20;
+const EINTR: i32 = 4;
 /// How long the watching thread blocks before it looks whether to stop.
 const WAKE_EVERY: Timespec = Timespec { sec: 1, nsec: 0 };
 
@@ -158,11 +159,6 @@ impl Os {
         let regions = Regions::read(&segments.hull())?;
         let protection = protection.unwrap_or(READ | EXECUTE);
         Ok(Os { code, protection, cell, segments, regions })
-    }
-
-    /// Where the image is mapped, from its first segment to its last, in memory.
-    pub(super) fn image(&self) -> Range<u64> {
-        self.segments.hull()
     }
 }
 
@@ -484,15 +480,7 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
         return Err(error);
     };
     let watching = move || {
-        let mut watched = Some(fd);
         while !events.stopped() {
-            if watched.is_none() {
-                // A directory removed or moved and made again is watched again.
-                watched = register(kq, &path);
-                if watched.is_some() {
-                    events.tell();
-                }
-            }
             let mut event = Kevent {
                 ident: 0,
                 filter: 0,
@@ -502,22 +490,27 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
                 udata: std::ptr::null_mut(),
             };
             // SAFETY: room for one event; the timeout is a whole `timespec`.
-            if unsafe { kevent(kq, std::ptr::null(), 0, &mut event, 1, &WAKE_EVERY) } > 0 {
-                events.tell();
-                if event.fflags & (NOTE_DELETE | NOTE_RENAME) != 0 {
-                    if let Some(fd) = watched.take() {
-                        // SAFETY: the thread's own descriptor; closing it removes its event.
-                        unsafe { close(fd) };
-                    }
+            let got = unsafe { kevent(kq, std::ptr::null(), 0, &mut event, 1, &WAKE_EVERY) };
+            if got < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(EINTR) {
+                    continue;
                 }
+                events.lose(Unwatched::failed("kevent on the directory"));
+                break;
+            }
+            if got > 0 {
+                if event.fflags & (NOTE_DELETE | NOTE_RENAME) != 0 {
+                    events.lose(Unwatched::Gone);
+                    break;
+                }
+                events.tell();
             }
         }
-        if let Some(fd) = watched {
-            // SAFETY: the thread's own descriptor, closed once.
-            unsafe { close(fd) };
+        // SAFETY: the thread's own descriptor and queue, each closed once.
+        unsafe {
+            close(fd);
+            close(kq);
         }
-        // SAFETY: as above.
-        unsafe { close(kq) };
     };
     std::thread::Builder::new()
         // alloc: setup, the thread's name, once

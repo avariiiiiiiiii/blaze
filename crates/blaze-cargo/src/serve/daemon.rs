@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    fmt,
     net::SocketAddr,
     sync::Arc,
     time::Duration,
@@ -32,13 +33,16 @@ use blaze_cas::Store;
 use blaze_core::{Address, Completion, Done, Driver, Effect, FileName, Mapping, Tag};
 use blaze_graph::{Budget, PlaneConfig, arena};
 use blaze_history::{Config as HistoryConfig, History};
-use blaze_image::Image;
-use blaze_query::Database;
+use blaze_format::SchemaHash;
+use blaze_ids::ContentId;
+use blaze_image::{Corrupt, Image, OpenError, Refused};
+use blaze_query::{Database, DbError};
 use blaze_vfs::{ImageUse, Outside, Ticket, Vfs};
+use intern::RestoreError;
 
 use super::{
     heads::{Heads, Out},
-    image::{Images, Parts, on_pool},
+    image::{HistoryError, ImageFailed, Images, Parts, Unlearned, on_pool},
     job::{Jobs, Said, Setup, Step, Value, World},
     mounts::Mounts,
     plane::{Happened, Plane, Runner, ns},
@@ -170,12 +174,258 @@ pub struct Daemon<D: Driver, S: Steps> {
     /// A `blaze stop` arrived: the daemon stops once its answer is sent.
     stop_asked: bool,
     settling: bool,
-    failed: Option<String>,
+    failed: Option<Failed>,
     pid: u32,
-    /// The database started from the image, not empty.
-    warm: bool,
-    /// The VFS's image group last found corrupt, reported and rescanned once.
-    vfs_corrupt: Option<blaze_image::Corrupt>,
+    started: Started,
+}
+
+/// What of its image a start did not use, each by a rule: the image was written by another
+/// blaze, or a stop cut the journal. An image that is damaged is a [`StartError`] instead.
+#[derive(Default, Debug)]
+pub struct Started {
+    /// Why the database started empty; `None` when it opened the image's.
+    pub cold: Option<Cold>,
+    /// The image's VFS tree is of another layout: the journal was loaded alone and every
+    /// checkout is scanned.
+    pub tree: Option<Refused>,
+    /// Why the watchers' metadata in the image was not used, so they scan their checkouts, in
+    /// blaze-vfs's words.
+    pub disks: Option<String>,
+    /// A stop came between the image's rename and its journal's rewrite: the whole journal was
+    /// loaded over the image.
+    pub resumed: bool,
+    /// Bytes after the journal's last whole record, which a stop in an append leaves: cut.
+    pub journal_cut: usize,
+    /// Head records whose root was in those bytes: dropped.
+    pub heads_dropped: usize,
+    /// Why the plane's history started empty.
+    pub unlearned: Option<Unlearned>,
+}
+
+impl Started {
+    /// Whether the start used everything it found.
+    pub fn whole(&self) -> bool {
+        self.cold.is_none()
+            && self.tree.is_none()
+            && self.disks.is_none()
+            && !self.resumed
+            && self.journal_cut == 0
+            && self.heads_dropped == 0
+            && self.unlearned.is_none()
+    }
+}
+
+impl fmt::Display for Started {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut sep = "";
+        if let Some(cold) = &self.cold {
+            write!(f, "{sep}the database starts empty: {cold}")?;
+            sep = "; ";
+        }
+        if let Some(refused) = &self.tree {
+            write!(f, "{sep}the VFS's tree was not used ({refused}): the journal was loaded alone")?;
+            sep = "; ";
+        }
+        if let Some(why) = &self.disks {
+            write!(f, "{sep}the checkouts are scanned ({why})")?;
+            sep = "; ";
+        }
+        if self.resumed {
+            write!(f, "{sep}a stop came between the image and its journal's rewrite: the whole journal was loaded over it")?;
+            sep = "; ";
+        }
+        if self.journal_cut > 0 || self.heads_dropped > 0 {
+            write!(
+                f,
+                "{sep}the journal ended in {} bytes that were no whole record, and {} heads whose root was in them were dropped",
+                self.journal_cut, self.heads_dropped
+            )?;
+            sep = "; ";
+        }
+        if let Some(unlearned) = &self.unlearned {
+            write!(f, "{sep}the plane's history starts empty: {unlearned}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Why a start's database is empty.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Cold {
+    /// There is no image: the first start in this state directory.
+    NoImage,
+    /// The image is of another layout: another blaze wrote it.
+    Layout(SchemaHash),
+    /// The image's symbol table or database sections are missing or of another schema.
+    Refused(Refused),
+    /// Values were interned in this process before the start, so the image's symbols can't be
+    /// restored: a second daemon in one process, as the simulation's restarts are. `blaze
+    /// serve` starts one daemon a process and stops on it.
+    Interned,
+}
+
+impl fmt::Display for Cold {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Cold::NoImage => write!(f, "there is no daemon image"),
+            Cold::Layout(found) => write!(f, "the daemon image is of layout {}, another blaze's", found.0),
+            Cold::Refused(refused) => write!(f, "{refused}"),
+            Cold::Interned => write!(f, "values were interned in this process before its symbols could be restored"),
+        }
+    }
+}
+
+/// Why a daemon did not start.
+#[derive(Debug)]
+pub enum StartError {
+    /// The daemon image at `file` is damaged or inconsistent with its journal.
+    Image { file: FileName, fault: ImageFault },
+    /// What another part of the start could not do, in its words.
+    Other(String),
+}
+
+impl StartError {
+    fn image(file: &FileName, fault: ImageFault) -> StartError {
+        // clone: a refcount, once an error.
+        StartError::Image { file: file.clone(), fault }
+    }
+}
+
+impl From<String> for StartError {
+    fn from(what: String) -> StartError {
+        StartError::Other(what)
+    }
+}
+
+impl fmt::Display for StartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StartError::Image { file, fault } => write!(f, "the daemon image /{file}: {fault}"),
+            StartError::Other(what) => f.write_str(what),
+        }
+    }
+}
+
+impl std::error::Error for StartError {}
+
+/// What is wrong with a daemon image that is not another blaze's.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ImageFault {
+    /// Not an image, cut short, or a spine that is not the one its hash names.
+    Open(OpenError),
+    /// Its symbol table is corrupt or not a table.
+    Symbols(RestoreError),
+    /// The database's sections are corrupt or of a shape no blaze writes.
+    Db(DbError),
+    History(HistoryError),
+    Vfs(VfsFault),
+}
+
+impl fmt::Display for ImageFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImageFault::Open(error) => write!(f, "{error}"),
+            ImageFault::Symbols(error) => write!(f, "{error}"),
+            ImageFault::Db(error) => write!(f, "the database's sections: {error}"),
+            ImageFault::History(error) => write!(f, "{error}"),
+            ImageFault::Vfs(fault) => write!(f, "{fault}"),
+        }
+    }
+}
+
+/// Why the VFS can't restore from an image of this blaze's layout ([`ImageUse`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum VfsFault {
+    /// A page group of its tree failed its check.
+    Corrupt(Corrupt),
+    /// Its tree section is not a tree this blaze writes.
+    Malformed(&'static str),
+    /// The journal starts from another image (`journal`), or from none, than this one.
+    Unnamed { image: ContentId, journal: Option<ContentId> },
+}
+
+impl fmt::Display for VfsFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VfsFault::Corrupt(corrupt) => write!(f, "{corrupt}"),
+            VfsFault::Malformed(what) => write!(f, "its VFS tree is not one this blaze writes ({what})"),
+            VfsFault::Unnamed { image, journal: Some(journal) } => {
+                write!(f, "the VFS's journal starts from the image {journal}, not this one ({image})")
+            }
+            VfsFault::Unnamed { image, journal: None } => {
+                write!(f, "the VFS's journal starts from no image, not this one ({image})")
+            }
+        }
+    }
+}
+
+/// Why a running daemon stopped when it was not asked to.
+#[derive(Debug)]
+pub enum Failed {
+    /// The server could not go on listening.
+    Server(String),
+    /// A group of the image the database or the VFS reads in place failed its check.
+    Corrupt(Corrupt),
+    /// The database could not settle onto the image its cold build wrote.
+    Settle(DbError),
+    /// The image a cold build or the stop asked for was not made; the one before it stays.
+    Image(ImageFailed),
+}
+
+impl fmt::Display for Failed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Failed::Server(why) => f.write_str(why),
+            Failed::Corrupt(corrupt) => write!(f, "the daemon image: {corrupt}"),
+            Failed::Settle(error) => write!(f, "the database could not settle onto its image: {error}"),
+            Failed::Image(failed) => write!(f, "{failed}"),
+        }
+    }
+}
+
+/// What of the start an open of the image's bytes gives: the image, or why the database
+/// starts empty by a rule, or the fault.
+fn opening<I>(opened: Result<I, OpenError>) -> Result<Result<I, Cold>, ImageFault> {
+    match opened {
+        Ok(image) => Ok(Ok(image)),
+        Err(OpenError::Layout { found }) => Ok(Err(Cold::Layout(found))),
+        Err(error) => Err(ImageFault::Open(error)),
+    }
+}
+
+/// Why the database starts empty from an image whose symbols did not restore, or the fault.
+fn unrestored(error: RestoreError) -> Result<Cold, ImageFault> {
+    match error {
+        RestoreError::Refused(refused) => Ok(Cold::Refused(refused)),
+        RestoreError::Started { .. } => Ok(Cold::Interned),
+        error @ (RestoreError::Corrupt(_) | RestoreError::Invalid { .. }) => Err(ImageFault::Symbols(error)),
+    }
+}
+
+/// Why the database starts empty from an image it did not open, or the fault.
+fn unopened(error: DbError) -> Result<Cold, ImageFault> {
+    match error {
+        DbError::Refused(refused) => Ok(Cold::Refused(refused)),
+        error => Err(ImageFault::Db(error)),
+    }
+}
+
+/// What the VFS did with the image, into `started`, or the fault.
+fn vfs_used(used: ImageUse, started: &mut Started) -> Result<(), VfsFault> {
+    match used {
+        // Unopened: the start opened the same bytes first, and stopped unless another blaze's.
+        ImageUse::None | ImageUse::Unopened(_) => {}
+        ImageUse::Used { disks, .. } => started.disks = disks,
+        ImageUse::Resumed { disks, .. } => {
+            started.resumed = true;
+            started.disks = disks;
+        }
+        ImageUse::Refused(refused) => started.tree = Some(refused),
+        ImageUse::Corrupt(corrupt) => return Err(VfsFault::Corrupt(corrupt)),
+        ImageUse::Malformed(what) => return Err(VfsFault::Malformed(what)),
+        ImageUse::Unnamed { image, journal } => return Err(VfsFault::Unnamed { image, journal }),
+    }
+    Ok(())
 }
 
 /// The buffers the loop's calls borrow and give back, so a warm turn allocates none: a call
@@ -203,8 +453,9 @@ struct Read {
 
 impl<D: Driver, S: Steps> Daemon<D, S> {
     /// Recovers the VFS from its journal and the database from its image, opens the store,
-    /// and listens. Fails naming what could not be read, or when another daemon listens.
-    pub fn start(mut driver: D, options: Options, steps: Arc<S>, runner: Runner<Step<S>>) -> Result<Daemon<D, S>, String> {
+    /// and listens. Fails naming what could not be read, when the image is damaged, or when
+    /// another daemon listens; what of the image it did not use by a rule is [`Daemon::started`].
+    pub fn start(mut driver: D, options: Options, steps: Arc<S>, runner: Runner<Step<S>>) -> Result<Daemon<D, S>, StartError> {
         let state = options.state.clone();
         let journal = under(&state, "journal");
         let db_dir = under(&state, "db");
@@ -252,68 +503,69 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     (DIAL, Done::Connected { conn }) => {
                         effects.push(Effect::Hangup { conn, tag: HANG_UP });
                         driver.submit(&mut effects);
-                        return Err(format!("another blaze serve listens on {socket}: `blaze stop` stops it"));
+                        return Err(format!("another blaze serve listens on {socket}: `blaze stop` stops it").into());
                     }
                     (DIAL, Done::Failed(_)) => effects.push(Effect::Remove { file: options.socket.clone(), tag: UNLINK }),
                     (UNLINK, Done::Removed | Done::Failed(_)) => read.socket_free = true,
-                    (READ_JOURNAL, Done::Failed(error)) => return Err(format!("reading the VFS's journal /{journal}: {error}")),
-                    (MAP_IMAGE, Done::Failed(error)) => return Err(format!("mapping the daemon image /{image}: {error}")),
-                    (STAT_JOURNAL | STAT_IMAGE, Done::Failed(error)) => {
-                        return Err(format!("the daemon's state in /{state}: {error}"));
+                    (READ_JOURNAL, Done::Failed(error)) => {
+                        return Err(format!("reading the VFS's journal /{journal}: {error}").into());
                     }
-                    (tag, done) => return Err(format!("the start was answered {done:?} for tag {}", tag.0)),
+                    (MAP_IMAGE, Done::Failed(error)) => return Err(format!("mapping the daemon image /{image}: {error}").into()),
+                    (STAT_JOURNAL | STAT_IMAGE, Done::Failed(error)) => {
+                        return Err(format!("the daemon's state in /{state}: {error}").into());
+                    }
+                    (tag, done) => return Err(format!("the start was answered {done:?} for tag {}", tag.0).into()),
                 }
             }
         }
         if let Some(broken) = store.broken() {
-            return Err(broken.to_string());
+            return Err(broken.to_string().into());
         }
         let mapping = read.image.flatten();
+        let mut started = Started::default();
         // clone: a count of the mapping, shared by the VFS and the image the rest read.
-        let opened = match mapping.clone().map(Image::open).transpose() {
-            Ok(opened) => opened.map(Arc::new),
-            Err(error) => {
-                eprintln!("blaze serve: the daemon image /{image} is not one this blaze opens ({error}): starting with an empty database");
+        let opened = match mapping.clone().map(|it| opening(Image::open(it))).transpose() {
+            Ok(None) => {
+                started.cold = Some(Cold::NoImage);
                 None
             }
+            Ok(Some(Ok(opened))) => Some(Arc::new(opened)),
+            Ok(Some(Err(cold))) => {
+                started.cold = Some(cold);
+                None
+            }
+            Err(fault) => return Err(StartError::image(&image, fault)),
         };
         // First: every other section names symbols by their IDs in this table.
         let restored = opened.as_ref().map(|it| (it.clone(), intern::restore_symbols(it.clone(), &on_pool)));
         let (vfs, recovered) = Vfs::restore(journal.clone(), VFS, &read.journal.unwrap_or_default(), mapping);
-        if recovered.skipped > 0 || recovered.heads_dropped > 0 {
-            eprintln!(
-                "blaze serve: the journal /{journal} ended in {} bytes that were no whole record, and {} heads whose root was lost were dropped",
-                recovered.skipped, recovered.heads_dropped
-            );
-        }
-        if let Some(why) = image_use(&recovered.image) {
-            eprintln!("blaze serve: the VFS and the daemon image /{image}: {why}");
-        }
+        started.journal_cut = recovered.skipped;
+        started.heads_dropped = recovered.heads_dropped;
+        vfs_used(recovered.image, &mut started).map_err(|fault| StartError::image(&image, ImageFault::Vfs(fault)))?;
         let config = blaze_query::Config { tree: Some(Arc::new(vfs.reader())), dir: Some(db_dir), tags: DB };
-        let mut warm = false;
         let mut db = match restored {
             None => Database::new(config),
             Some((_, Err(error))) => {
-                eprintln!("blaze serve: the symbols of the daemon image /{image}: {error}; starting with an empty database");
+                started.cold = Some(unrestored(error).map_err(|fault| StartError::image(&image, fault))?);
                 Database::new(config)
             }
             Some((opened, Ok(()))) => match Database::from_image_with(config.clone(), opened) {
-                Ok(db) => {
-                    warm = true;
-                    db
-                }
-                Err(error) if error.is_image() => {
-                    eprintln!("blaze serve: the database's sections of the daemon image /{image}: {error}; starting with an empty database");
+                Ok(db) => db,
+                Err(error) => {
+                    started.cold = Some(unopened(error).map_err(|fault| StartError::image(&image, fault))?);
                     Database::new(config)
                 }
-                Err(error) => return Err(format!("the database's sections of the daemon image /{image}: {error}")),
             },
         };
         steps.register(&mut db);
         let history = match opened.as_deref() {
             None => History::new(HistoryConfig::default()),
-            Some(opened) => super::image::history(opened, HistoryConfig::default())
-                .map_err(|error| format!("the daemon image /{image}: {error}"))?,
+            Some(opened) => {
+                let (history, unlearned) = super::image::history(opened, HistoryConfig::default())
+                    .map_err(|error| StartError::image(&image, ImageFault::History(error)))?;
+                started.unlearned = unlearned;
+                history
+            }
         };
         let plane_config = PlaneConfig { io: options.io, work: options.threads.max(1), budget: options.budget, starve_after: 8 };
         let plane = Plane::new(plane_config, history, runner).map_err(|error| format!("the plane: {error}"))?;
@@ -372,8 +624,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             settling: false,
             failed: None,
             pid: std::process::id(),
-            warm,
-            vfs_corrupt: None,
+            started,
         })
     }
 
@@ -385,12 +636,25 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     /// Whether its database started from the image: an image's symbols are restored once a
     /// process, before any is interned, so one started again in a process starts it empty.
     pub fn warm(&self) -> bool {
-        self.warm
+        self.started.cold.is_none()
+    }
+
+    /// What of its image the start did not use, and why.
+    pub fn started(&self) -> &Started {
+        &self.started
     }
 
     /// Why it stopped when it was not asked to.
-    pub fn failed(&self) -> Option<&str> {
-        self.failed.as_deref()
+    pub fn failed(&self) -> Option<&Failed> {
+        self.failed.as_ref()
+    }
+
+    /// Stops it, failed with `why` unless it failed already.
+    fn fail(&mut self, why: Failed) {
+        if self.failed.is_none() {
+            self.failed = Some(why);
+        }
+        self.stop();
     }
 
     pub fn driver(&mut self) -> &mut D {
@@ -421,9 +685,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         &self.store
     }
 
-    /// Makes its store the process's ([`blaze_cas::Handle::install`]), which blaze-macro-wasm and
-    /// blaze-wasi read and write through: the daemon of `blaze serve` alone, as a process has one
-    /// store, and a test's daemons are many to a process. Its root is the driver's, `/`.
+    /// Makes its store the process's ([`blaze_cas::Handle::install`]): the daemon of `blaze
+    /// serve` alone, as a process has one store, and a test's daemons are many to a process. Its
+    /// root is the driver's, `/`.
     pub fn install_store(&mut self) -> Result<&'static blaze_cas::Handle, String> {
         blaze_cas::Handle::install(blaze_cas::Handle::new(&mut self.store, std::path::PathBuf::from("/")))
     }
@@ -508,8 +772,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 if let Some(why) = self.server.failed()
                     && self.failed.is_none()
                 {
-                    self.failed = Some(why.to_owned());
-                    self.stop();
+                    let why = Failed::Server(why.to_owned());
+                    self.fail(why);
                 }
             }
             VFS..DB => {
@@ -651,33 +915,38 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
             self.vfs.collect(&self.mounts.roots());
             self.heads.sweep(&mut self.effects);
-            for corrupt in self.db.take_corrupt() {
-                eprintln!("blaze serve: the daemon image: {corrupt}; what it held was computed again");
+            // The requests that read a corrupt group failed with it; the image is not used
+            // past it.
+            let corrupt = self.db.take_corrupt().into_iter().next().or_else(|| self.vfs.corrupt());
+            if let Some(corrupt) = corrupt {
+                return self.fail(Failed::Corrupt(corrupt));
             }
-            let corrupt = self.vfs.corrupt();
-            if let Some(found) = &corrupt
-                && corrupt != self.vfs_corrupt
-            {
-                eprintln!("blaze serve: the daemon image: {found}; every checkout is scanned again");
-                self.heads.rescan(&self.vfs, &mut self.effects);
-            }
-            self.vfs_corrupt = corrupt;
         }
         if self.jobs.cold && !self.settling {
             self.jobs.cold = false;
             self.settling = true;
             self.ask_image();
         }
+        if self.settling
+            && self.images.done()
+            && let Some(failed) = self.images.failed()
+        {
+            // clone: an error, once.
+            let failed = Failed::Image(failed.clone());
+            self.settling = false;
+            return self.fail(failed);
+        }
         if self.images.done()
             && let Some(db) = Arc::get_mut(&mut self.db)
         {
-            if let Some(image) = self.images.take_mapped() {
-                match db.settle(image, &mut self.effects) {
-                    Ok(()) => db.reclaim(),
-                    Err(error) => eprintln!("blaze serve: the database could not settle onto its image: {error}"),
-                }
-            }
+            let settled = match self.images.take_mapped() {
+                Some(image) => db.settle(image, &mut self.effects).map(|()| db.reclaim()),
+                None => Ok(()),
+            };
             self.settling = false;
+            if let Err(error) = settled {
+                self.fail(Failed::Settle(error));
+            }
         }
     }
 
@@ -685,6 +954,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         let now = self.driver.now();
         match self.stopping {
             Some(Stopping::Image) if self.images.done() => {
+                if let Some(failed) = self.images.failed()
+                    && self.failed.is_none()
+                {
+                    // clone: an error, once.
+                    self.failed = Some(Failed::Image(failed.clone()));
+                }
                 self.server.stop(&mut self.effects);
                 self.stopping = Some(Stopping::Hangup { at: now });
             }
@@ -696,25 +971,97 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 }
 
-/// Why the VFS did not use the daemon image as it should, or why its watchers rescan; `None`
-/// when it used it whole, or there was none.
-fn image_use(used: &ImageUse) -> Option<String> {
-    Some(match used {
-        ImageUse::None | ImageUse::Used { disks: None, .. } => return None,
-        ImageUse::Used { disks: Some(why), .. } => format!("its tree was used and its checkouts are scanned again ({why})"),
-        ImageUse::Resumed { disks, .. } => match disks {
-            None => "a stop came between the image and its journal's rewrite: the whole journal was loaded over the image".to_owned(),
-            Some(why) => format!(
-                "a stop came between the image and its journal's rewrite: the whole journal was loaded over the image, and its checkouts are scanned again ({why})"
-            ),
-        },
-        ImageUse::Unopened(error) => format!("the image is not one this blaze opens ({error}): the journal was loaded alone"),
-        ImageUse::Refused(refused) => format!("{refused}: the journal was loaded alone"),
-        ImageUse::Corrupt(corrupt) => format!("{corrupt}: the journal was loaded alone"),
-        ImageUse::Malformed(what) => format!("its tree is not one this blaze writes ({what}): the journal was loaded alone"),
-        ImageUse::Unnamed { image, journal } => match journal {
-            Some(journal) => format!("the journal starts from the image {journal}, not this one ({image}): it was loaded alone"),
-            None => format!("the journal starts from no image, not this one ({image}): it was loaded alone"),
-        },
-    })
+#[cfg(test)]
+mod tests {
+    use blaze_image::{Cause, SectionId};
+
+    use super::*;
+
+    fn corrupt(section: SectionId) -> Corrupt {
+        Corrupt { section, group: 3, cause: Cause::Crc { found: 1, wanted: 2 } }
+    }
+
+    #[test]
+    fn an_image_of_another_layout_starts_cold_and_a_damaged_one_is_a_fault() {
+        let found = SchemaHash(ContentId([1; 32]));
+        assert_eq!(opening::<()>(Err(OpenError::Layout { found })), Ok(Err(Cold::Layout(found))));
+        assert_eq!(opening::<()>(Ok(())), Ok(Ok(())));
+        let cut = OpenError::Header("a length that is not the file's");
+        assert_eq!(opening::<()>(Err(cut.clone())), Err(ImageFault::Open(cut)));
+        let torn = OpenError::Hash { found: ContentId([2; 32]), wanted: ContentId([3; 32]) };
+        assert_eq!(opening::<()>(Err(torn.clone())), Err(ImageFault::Open(torn)));
+    }
+
+    #[test]
+    fn symbols_of_another_schema_start_cold_and_corrupt_ones_are_a_fault() {
+        let refused = Refused::Missing { id: SectionId::SYMBOLS };
+        assert_eq!(unrestored(RestoreError::Refused(refused.clone())), Ok(Cold::Refused(refused)));
+        assert_eq!(unrestored(RestoreError::Started { section: SectionId::SYMBOLS }), Ok(Cold::Interned));
+        let bad = RestoreError::Corrupt(corrupt(SectionId::SYMBOLS));
+        assert_eq!(unrestored(bad.clone()), Err(ImageFault::Symbols(bad)));
+        let invalid = RestoreError::Invalid { section: SectionId::SYMBOLS, what: "a count", at: 8 };
+        assert_eq!(unrestored(invalid.clone()), Err(ImageFault::Symbols(invalid)));
+    }
+
+    #[test]
+    fn a_database_section_of_another_schema_starts_cold_and_any_other_error_is_a_fault() {
+        let refused = Refused::Schema {
+            id: SectionId::DB_TABLE,
+            found: SchemaHash(ContentId([4; 32])),
+            wanted: SchemaHash(ContentId([5; 32])),
+        };
+        assert_eq!(unopened(DbError::Refused(refused.clone())), Ok(Cold::Refused(refused)));
+        for error in [
+            DbError::Corrupt(corrupt(SectionId::DB_INPUTS)),
+            DbError::Invalid { section: SectionId::DB_MEMOS, what: "a memo past the end" },
+            DbError::Symbols,
+        ] {
+            assert_eq!(unopened(error.clone()), Err(ImageFault::Db(error)));
+        }
+    }
+
+    #[test]
+    fn the_vfs_uses_by_a_rule_are_said_and_its_faults_stop_the_start() {
+        let name = ContentId([6; 32]);
+        let mut started = Started::default();
+        vfs_used(ImageUse::Used { name, nodes: 10, disks: None }, &mut started).unwrap();
+        assert!(started.whole(), "{started}");
+
+        vfs_used(ImageUse::Resumed { name, nodes: 10, disks: Some("another schema".to_owned()) }, &mut started).unwrap();
+        assert!(started.resumed && started.disks.is_some(), "{started:?}");
+        let mut started = Started::default();
+        let refused = Refused::Missing { id: SectionId::VFS_TREE };
+        vfs_used(ImageUse::Refused(refused.clone()), &mut started).unwrap();
+        assert_eq!(started.tree, Some(refused));
+        assert!(started.to_string().contains("the journal was loaded alone"), "{started}");
+
+        let mut started = Started::default();
+        let found = corrupt(SectionId::VFS_TREE);
+        assert_eq!(vfs_used(ImageUse::Corrupt(found), &mut started), Err(VfsFault::Corrupt(found)));
+        assert_eq!(vfs_used(ImageUse::Malformed("a node past the end"), &mut started), Err(VfsFault::Malformed("a node past the end")));
+        let unnamed = ImageUse::Unnamed { image: name, journal: Some(ContentId([7; 32])) };
+        assert_eq!(
+            vfs_used(unnamed, &mut started),
+            Err(VfsFault::Unnamed { image: name, journal: Some(ContentId([7; 32])) })
+        );
+        assert!(started.whole(), "a fault records no rule: {started}");
+    }
+
+    #[test]
+    fn a_cold_start_says_why() {
+        let started = Started { cold: Some(Cold::NoImage), journal_cut: 12, heads_dropped: 1, ..Started::default() };
+        assert!(!started.whole());
+        let said = started.to_string();
+        assert!(said.contains("the database starts empty: there is no daemon image"), "{said}");
+        assert!(said.contains("12 bytes"), "{said}");
+    }
+
+    #[test]
+    fn a_damaged_image_names_its_file() {
+        let file = FileName::new("state/db/image").unwrap();
+        let error = StartError::image(&file, ImageFault::Vfs(VfsFault::Unnamed { image: ContentId([8; 32]), journal: None }));
+        let said = error.to_string();
+        assert!(said.starts_with("the daemon image /state/db/image: "), "{said}");
+        assert!(said.contains("starts from no image"), "{said}");
+    }
 }

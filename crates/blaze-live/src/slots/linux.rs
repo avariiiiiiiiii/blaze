@@ -28,7 +28,7 @@ use std::{
 
 pub(super) use super::unix::{GRAIN, Reserved, backtrace, descriptor, in_image_of};
 use super::{
-    Events,
+    Events, Unwatched,
     switch::{Dwarf, Layout, Memory, Span, Writes},
     unix::{__register_frame, Segments, load_cell, loaders, mmap, munmap},
 };
@@ -71,6 +71,8 @@ const IN_Q_OVERFLOW: u32 = 0x4000;
 const IN_IGNORED: u32 = 0x8000;
 const WATCHED: u32 = IN_CLOSE_WRITE | IN_MOVED_TO;
 const POLLIN: i16 = 1;
+const EINTR: i32 = 4;
+const EAGAIN: i32 = 11;
 /// How long the watching thread blocks before it looks whether to stop.
 const WAKE_EVERY_MS: i32 = 1000;
 /// What a window of read-only pages written through a second mapping is aligned to and at
@@ -509,30 +511,41 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
         unsafe { close(fd) };
         return Err(error);
     }
+    let errno = || std::io::Error::last_os_error().raw_os_error();
     let watching = move || {
         let mut buffer = [0u8; 4096];
-        let mut watched = true;
-        while !events.stopped() {
+        'watching: while !events.stopped() {
             let mut ready = PollFd { fd, events: POLLIN, revents: 0 };
             // SAFETY: one `pollfd`.
-            if unsafe { poll(&mut ready, 1, WAKE_EVERY_MS) } <= 0 {
-                // A directory removed and made again is watched again.
-                // SAFETY: the path ends in a zero.
-                if !watched && unsafe { inotify_add_watch(fd, path.as_ptr(), WATCHED) } >= 0 {
-                    watched = true;
-                    events.tell();
-                }
+            let polled = unsafe { poll(&mut ready, 1, WAKE_EVERY_MS) };
+            if polled == 0 || (polled < 0 && errno() == Some(EINTR)) {
                 continue;
+            }
+            if polled < 0 {
+                events.lose(Unwatched::failed("poll of the directory's inotify"));
+                break;
             }
             loop {
                 // SAFETY: `buffer` is writable for its length.
                 let read = unsafe { read(fd, buffer.as_mut_ptr() as *mut c_void, buffer.len()) };
-                let Ok(read) = usize::try_from(read) else { break };
+                let Ok(read) = usize::try_from(read) else {
+                    match errno() {
+                        Some(EAGAIN) => break,
+                        Some(EINTR) => continue,
+                        _ => {
+                            events.lose(Unwatched::failed("read of the directory's inotify"));
+                            break 'watching;
+                        }
+                    }
+                };
                 if read == 0 {
                     break;
                 }
                 let (message, ended) = names(&buffer[..read]);
-                watched &= !ended;
+                if ended {
+                    events.lose(Unwatched::Gone);
+                    break 'watching;
+                }
                 if message {
                     events.tell();
                 }

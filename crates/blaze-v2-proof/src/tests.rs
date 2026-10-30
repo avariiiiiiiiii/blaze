@@ -304,7 +304,8 @@ fn a_frame_of_reference_packing_reads_in_place() {
         let range = column.iter().map(|&v| v - min).max().unwrap_or(0);
         let width = 32 - range.leading_zeros();
         let mut words = vec![0u64; (column.len() * width as usize).div_ceil(64) + 1];
-        for (i, &v) in column.iter().enumerate() {
+        // A constant column has no bits to write: `get` gives `min`.
+        for (i, &v) in column.iter().enumerate().filter(|_| width > 0) {
             let bit = i * width as usize;
             let offset = u128::from(v - min) << (bit % 64);
             words[bit / 64] |= offset as u64;

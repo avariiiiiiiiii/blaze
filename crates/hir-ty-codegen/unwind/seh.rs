@@ -47,8 +47,9 @@ pub(in super::super) const RELEASE: &str = "blaze.seh.release";
 pub(in super::super) const PERSONALITY: &str = "blaze.seh.personality";
 
 /// The bit of a source location that marks a call that has a landing pad, for [`function`]
-/// to find them. The rest is the statement the call is of, as without it.
-const GUARDED: u32 = 1 << 31;
+/// to find them. The rest is the statement the call is of, as without it. Bit 31 is
+/// Cranelift's (`MaybeRelSourceLoc`), which drops it from every location it keeps.
+const GUARDED: u32 = 1 << 30;
 
 /// The source location of a call of the statement at `loc` that has a landing pad.
 pub(in super::super) fn guarded(loc: ir::SourceLoc) -> ir::SourceLoc {
@@ -70,7 +71,7 @@ pub(in super::super) fn unguarded(loc: ir::SourceLoc) -> ir::SourceLoc {
 
 /// The mark of an `iadd` that offsets a pointer within what it points into, as the `offset`
 /// intrinsic does: LLVM builds it as `getelementptr inbounds`.
-const IN_BOUNDS: u32 = 1 << 30;
+const IN_BOUNDS: u32 = 1 << 29;
 
 pub(in super::super) fn in_bounds(loc: ir::SourceLoc) -> ir::SourceLoc {
     let bits = if loc.is_default() { 0 } else { loc.bits() };
@@ -97,7 +98,6 @@ const EXCEPTION_NONCONTINUABLE: i64 = 1;
 /// The flags of an exception record that say the frames are being unwound, not searched.
 const EXCEPTION_UNWIND: i64 = 0x66;
 const CONTINUE_SEARCH: i64 = 1;
-const UNW_FLAG_EHANDLER: u8 = 1;
 /// The largest object [`RESUME`] throws from its own frame. A panic's is two pointers.
 const INLINE_OBJECT: u32 = 256;
 const MEM: MemFlagsData = MemFlagsData::new().with_notrap();
@@ -150,7 +150,7 @@ pub(super) fn function(
     let mut ranges = Ranges { ranges: code.buffer.get_srclocs_sorted(), at: 0, last: 0 };
     for call_site in code.buffer.call_sites() {
         // The call ends where it returns to, which may be where the next thing starts.
-        if ranges.of(call_site.ret_addr - 1).is_some_and(|it| is_guarded(it.loc)) {
+        if ranges.of(call_site.ret_addr - 1).is_some_and(|it| is_guarded(it.loc.as_abs())) {
             calls.returning(call_site.ret_addr);
         }
     }
@@ -167,7 +167,7 @@ struct Ranges<'a> {
     last: u32,
 }
 
-type SrcLoc = cranelift_codegen::MachSrcLoc<cranelift_codegen::Final>;
+type SrcLoc = cranelift_codegen::MachSrcLoc;
 
 impl<'a> Ranges<'a> {
     fn of(&mut self, offset: u32) -> Option<&'a SrcLoc> {
@@ -262,190 +262,6 @@ struct Entry {
     func: FuncId,
     frame: Frame,
     pads: Option<Vec<u8>>,
-}
-
-#[derive(Default)]
-pub(super) struct Tables {
-    entries: Vec<Entry>,
-    personality: Option<FuncId>,
-    resume: Option<FuncId>,
-    release: Option<FuncId>,
-}
-
-impl Tables {
-    pub(super) fn add_function(
-        &mut self,
-        module: &mut ObjectModule,
-        func: FuncId,
-        frame: &Frame,
-        pads: Option<&Vec<u8>>,
-    ) -> Result<(), String> {
-        if pads.is_some() {
-            self.personality(module)?;
-        }
-        // clone: the table owns what it writes at the end; the caller keeps its `FunctionUnwind`
-        self.entries.push(Entry { func, frame: frame.clone(), pads: pads.cloned() });
-        Ok(())
-    }
-
-    /// The function of this object that `symbol` names, if it is one of ours.
-    pub(super) fn runtime(
-        &mut self,
-        module: &mut ObjectModule,
-        symbol: &str,
-    ) -> Result<Option<FuncId>, String> {
-        let (slot, build): (_, fn(&mut Shim<'_>)) = match symbol {
-            RESUME => (&mut self.resume, resume),
-            RELEASE => (&mut self.release, release),
-            _ => return Ok(None),
-        };
-        if let Some(id) = *slot {
-            return Ok(Some(id));
-        }
-        let id = self.define(module, symbol, &[I64], &[], build)?;
-        match symbol {
-            RESUME => self.resume = Some(id),
-            _ => self.release = Some(id),
-        }
-        Ok(Some(id))
-    }
-
-    fn personality(&mut self, module: &mut ObjectModule) -> Result<FuncId, String> {
-        if let Some(id) = self.personality {
-            return Ok(id);
-        }
-        let id = self.define(module, PERSONALITY, &[I64; 4], &[I32], personality)?;
-        self.personality = Some(id);
-        Ok(id)
-    }
-
-    fn define(
-        &mut self,
-        module: &mut ObjectModule,
-        name: &str,
-        params: &[ir::Type],
-        returns: &[ir::Type],
-        build: fn(&mut Shim<'_>),
-    ) -> Result<FuncId, String> {
-        let sig = signature(module, params, returns);
-        // alloc: the error's message
-        let id = module.declare_function(name, Linkage::Local, &sig).map_err(|e| e.to_string())?;
-        let mut ctx = Context::new();
-        ctx.func.signature = sig;
-        let mut builder_ctx = FunctionBuilderContext::new();
-        let mut error = None;
-        {
-            let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-            let entry = builder.create_block();
-            builder.append_block_params_for_function_params(entry);
-            builder.switch_to_block(entry);
-            let mut shim = Shim { builder, module, entry, error: &mut error };
-            build(&mut shim);
-            shim.builder.seal_all_blocks();
-            let config = shim.module.target_config();
-            shim.builder.finalize(config);
-        }
-        if let Some(error) = error {
-            return Err(error);
-        }
-        // alloc: the error's message
-        module.define_function(id, &mut ctx).map_err(|e| e.to_string())?;
-        // The unwinder passes these frames too: each calls what unwinds or throws.
-        if let Some(FunctionUnwind { frame: super::Frame::Windows(frame), .. }) =
-            FunctionUnwind::of(module.isa(), &ctx)?
-        {
-            self.entries.push(Entry { func: id, frame, pads: None });
-        }
-        Ok(id)
-    }
-
-    /// Writes an `UNWIND_INFO` for each function to `.xdata`, and to `.pdata` where each
-    /// function is and where its `UNWIND_INFO` is.
-    pub(super) fn emit(self, product: &mut ObjectProduct) -> Result<(), String> {
-        if self.entries.is_empty() {
-            return Ok(());
-        }
-        let personality = self.personality.map(|id| product.function_symbol(id));
-        let (mut xdata_len, mut handled) = (0, 0);
-        for entry in &self.entries {
-            xdata_len += entry.frame.info.len();
-            if let Some(pads) = &entry.pads {
-                xdata_len += 8 + pads.len();
-                handled += 1;
-            }
-        }
-        let mut xdata = Vec::with_capacity(xdata_len);
-        let mut pdata = Vec::with_capacity(12 * self.entries.len());
-        // (offset in `.xdata` of the address of the personality)
-        let mut handlers = Vec::with_capacity(handled);
-        // (the function, how long it is, where its `UNWIND_INFO` is in `.xdata`)
-        let mut functions = Vec::with_capacity(self.entries.len());
-        // The linker takes the table in the order of the addresses, which is not the order
-        // the functions came in: what a function needs of ours is defined after it.
-        let mut entries = self.entries;
-        blaze_ids::radix::sort_by_key(&mut entries, |entry| {
-            let symbol = product.object.symbol(product.function_symbol(entry.func));
-            symbol.value
-        });
-        for entry in &entries {
-            functions.push((product.function_symbol(entry.func), entry.frame.len, xdata.len()));
-            let start = xdata.len();
-            xdata.extend_from_slice(&entry.frame.info);
-            if let Some(pads) = &entry.pads {
-                xdata[start] |= UNW_FLAG_EHANDLER << 3;
-                handlers.push(xdata.len());
-                xdata.extend_from_slice(&[0; 4]);
-                xdata.put_u32((pads.len() / Pads::ENTRY) as u32);
-                xdata.extend_from_slice(pads);
-            }
-            pdata.extend_from_slice(&[0; 12]);
-        }
-        let object = &mut product.object;
-        let xdata_section =
-            // alloc: once per object, `object` owns the section's name
-            object.add_section(Vec::new(), b".xdata".to_vec(), SectionKind::ReadOnlyData);
-        object.section_mut(xdata_section).set_data(xdata, 4);
-        let pdata_section =
-            // alloc: once per object, `object` owns the section's name
-            object.add_section(Vec::new(), b".pdata".to_vec(), SectionKind::ReadOnlyData);
-        object.section_mut(pdata_section).set_data(pdata, 4);
-        let xdata_symbol = object.section_symbol(xdata_section);
-
-        let mut relocate = |section: SectionId, offset: usize, symbol: SymbolId, addend: i64| {
-            // What is local is addressed through its section.
-            let (symbol, within) = object.symbol_section_and_offset(symbol).unwrap_or((symbol, 0));
-            object
-                .add_relocation(
-                    section,
-                    Relocation {
-                        offset: offset as u64,
-                        symbol,
-                        flags: RelocationFlags::Generic {
-                            kind: RelocationKind::ImageOffset,
-                            encoding: RelocationEncoding::Generic,
-                            size: 32,
-                        },
-                        addend: within as i64 + addend,
-                    },
-                )
-                // alloc: the error's message
-                .map_err(|e| e.to_string())
-        };
-        for offset in handlers {
-            let Some(personality) = personality else {
-                // alloc: the error's message
-                return Err("landing pads without a personality".to_owned());
-            };
-            relocate(xdata_section, offset, personality, 0)?;
-        }
-        for (index, (symbol, len, info)) in functions.into_iter().enumerate() {
-            let at = index * 12;
-            relocate(pdata_section, at, symbol, 0)?;
-            relocate(pdata_section, at + 4, symbol, i64::from(len))?;
-            relocate(pdata_section, at + 8, xdata_symbol, info as i64)?;
-        }
-        Ok(())
-    }
 }
 
 fn signature(module: &ObjectModule, params: &[ir::Type], returns: &[ir::Type]) -> Signature {
@@ -726,7 +542,8 @@ fn ranges_find_what_a_search_of_all_of_them_finds() {
         for line in 0..next(40) {
             let start = at + next(4);
             let end = start + next(12);
-            ranges.push(SrcLoc { start, end, loc: ir::SourceLoc::new(line) });
+            let loc = ir::MaybeRelSourceLoc::abs(ir::SourceLoc::new(line));
+            ranges.push(SrcLoc { start, end, loc });
             at = end;
         }
         let mut found = Ranges { ranges: &ranges, at: 0, last: 0 };

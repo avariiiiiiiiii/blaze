@@ -40,8 +40,8 @@ pub enum ProcMacroLoadingError {
     ExpectedProcMacroArtifact,
     MissingDylibPath,
     NotYetBuilt,
-    NoProcMacros,
-    ProcMacroSrvError(Box<str>),
+    /// blaze-macro-eval cannot run the crate's macros; the message names the crate and why.
+    Refused(Box<str>),
 }
 impl ProcMacroLoadingError {
     pub fn is_hard_error(&self) -> bool {
@@ -50,8 +50,7 @@ impl ProcMacroLoadingError {
             ProcMacroLoadingError::ExpectedProcMacroArtifact
             | ProcMacroLoadingError::FailedToBuild
             | ProcMacroLoadingError::MissingDylibPath
-            | ProcMacroLoadingError::NoProcMacros
-            | ProcMacroLoadingError::ProcMacroSrvError(_) => true,
+            | ProcMacroLoadingError::Refused(_) => true,
         }
     }
 }
@@ -72,12 +71,7 @@ impl fmt::Display for ProcMacroLoadingError {
                 )
             }
             ProcMacroLoadingError::NotYetBuilt => write!(f, "proc-macro not yet built"),
-            ProcMacroLoadingError::NoProcMacros => {
-                write!(f, "proc macro library has no proc macros")
-            }
-            ProcMacroLoadingError::ProcMacroSrvError(msg) => {
-                write!(f, "proc macro server error: {msg}")
-            }
+            ProcMacroLoadingError::Refused(msg) => f.write_str(msg),
         }
     }
 }

@@ -63,7 +63,7 @@ pub(crate) fn reach(
     let mut changed_code: FxHashSet<CodeHash> = FxHashSet::default();
     let mut seen: FxHashSet<ItemKey> = FxHashSet::default();
     for (at, unit) in to.units().graph.units.iter().enumerate() {
-        let Ok(package) = to.package(unit) else { continue };
+        let package = to.package(unit)?;
         if !package.is_member || unit.is_std {
             continue;
         }

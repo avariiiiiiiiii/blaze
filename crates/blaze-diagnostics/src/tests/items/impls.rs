@@ -12,7 +12,7 @@ use crate::{
 
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`).
 fn ui_core(name: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:2015\n{source}");
+    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
@@ -21,9 +21,9 @@ fn ui_core(name: &str, flags: &str, source: &str) -> String {
 /// prelude is core's and `prelude`.
 fn ui_std(name: &str, flags: &str, std_items: &str, prelude: &str, source: &str) -> String {
     let fixture = format!(
-        "//- minicore: {flags}\n//- /std.rs crate:std deps:core\n\
+        "//- minicore: {flags}\n//- /std.rs crate:std\n\
          pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; {prelude} }} }}\n\
-         {std_items}//- /{name} crate:main edition:2015 deps:std\n{source}"
+         {std_items}//- /{name} crate:other:main edition:2015 deps:std\n{source}"
     );
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))

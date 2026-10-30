@@ -27,10 +27,9 @@ DIST = "https://static.rust-lang.org/dist"
 # The hosts blaze has a build for, and Windows for `cargo install`.
 HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
          "x86_64-pc-windows-msvc"]
-# rustup's `minimal` profile without rust-docs, and the standard library of wasm32-wasip1, which
-# proc macros are built for. `None` is the host. The
+# rustup's `minimal` profile without rust-docs. `None` is the host. The
 # standard library's source is not downloaded: it is blaze's own library/ (docs/toolchain.md).
-COMPONENTS = [("rustc", None), ("cargo", None), ("rust-std", None), ("rust-std", "wasm32-wasip1")]
+COMPONENTS = [("rustc", None), ("cargo", None), ("rust-std", None)]
 
 
 def get(url):

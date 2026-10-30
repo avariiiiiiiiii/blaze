@@ -78,6 +78,9 @@ pub struct Wheel<T> {
     occupied: [u64; LEVELS],
     slots: Box<[List; LEVELS * SLOTS]>,
     timers: Slab<Timer<T>>,
+    /// The most timers it holds: the slab's reservation rounds up to whole pages, so it
+    /// would hold more.
+    max: u32,
     /// The soonest deadline, while known; recomputed after the timer that had it leaves.
     soonest: Option<u64>,
 }
@@ -106,6 +109,7 @@ impl<T> Wheel<T> {
             occupied: [0; LEVELS],
             slots: Box::new([EMPTY; LEVELS * SLOTS]), // alloc: once per wheel, at setup
             timers: Slab::new(max, MemTag::Io)?,
+            max,
             soonest: None,
         })
     }
@@ -142,6 +146,13 @@ impl<T> Wheel<T> {
     /// As [`Wheel::insert`], or the error naming the subsystem when the wheel is full.
     pub fn try_insert(&mut self, deadline: u64, value: T) -> Result<Handle, MemError> {
         let deadline = deadline.max(self.now);
+        if self.timers.len() >= self.max as usize {
+            return Err(MemError::TooLarge {
+                tag: MemTag::Io,
+                what: "a timer wheel's timer count",
+                wanted: self.timers.len() + 1,
+            });
+        }
         let id = self.timers.try_insert(Timer {
             deadline,
             prev: NONE,

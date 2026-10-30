@@ -6,8 +6,9 @@
 //! an expression root returning a tuple of a missing expression and `_`, a wild pattern, an
 //! arm, a tuple type, hygiene, a block scope, an edition and a closure that inherits overflow
 //! checks. [`source_map`] points each kind of id at syntax in a file and in a macro file. Their
-//! side tables, bindings, labels, lifetimes, statements and record fields are empty: those are
-//! words and names the decode reads as values, not columns an edit must come back from.
+//! side tables, bindings, labels, lifetimes, statements, paths, macro calls and record fields
+//! are empty: those are words and names the decode reads as values, or columns no other column
+//! here names.
 
 #![allow(dead_code)]
 
@@ -41,7 +42,7 @@ const MACRO_FILE: u32 = 2;
 /// Where a store's columns went, in `StoreRoot`'s order.
 pub struct StoreCols {
     placed: Placed,
-    columns: [Col; 26],
+    columns: [Col; 32],
     side: u32,
     ty_side: u32,
     flags: u32,
@@ -51,12 +52,14 @@ pub struct StoreCols {
 pub fn store(build: &mut Build) -> StoreCols {
     let ctx = SyntaxContext::root(Edition::CURRENT).into_u32();
     let mut w = Words::default();
-    // The side tables (names, paths, literals, generic args, `offset_of!`s, `asm!`s), then the
-    // type side tables (bounds, paths, references, arrays, fn pointers, type params): all empty.
+    // The side tables (names, literals, `offset_of!`s, `asm!`s, macro definitions), then the
+    // type side tables (bounds; the paths' mod paths, lang items, generic args, args, bindings,
+    // binding bounds, names and use args; references, arrays, fn pointers, type params): all
+    // empty.
     let side = w.at();
-    (0..6).for_each(|_| w.u32(0));
+    (0..5).for_each(|_| w.u32(0));
     let ty_side = w.at();
-    (0..6).for_each(|_| w.u32(0));
+    (0..13).for_each(|_| w.u32(0));
     let placed = w.place(build);
     build.column::<u8>(&[], false);
     let record_fields = build.column::<[u32; 3]>(&[], false);
@@ -69,7 +72,8 @@ pub fn store(build: &mut Build) -> StoreCols {
     let extra = build.column::<u32>(&[0, 2], true);
     let expr_lists = build.column::<u32>(&[0, 1], true);
     let pat_lists = build.column::<u32>(&[0], true);
-    let statements = build.column::<[u32; 5]>(&[], false);
+    let stmt_kind = build.column::<u8>(&[], true);
+    let stmt_data = build.column::<u32>(&[], true);
     // Pattern 0, no guard, expression 0.
     let arms = build.column::<[u32; 3]>(&[[0, 0, 0]], true);
     // `None`, then type 0.
@@ -80,9 +84,14 @@ pub fn store(build: &mut Build) -> StoreCols {
     let ty_data = build.column::<u32>(&[0, 0, 0], true);
     let ty_extra = build.column::<u32>(&[0, 2], true);
     let ty_lists = build.column::<u32>(&[0, 1], true);
+    let path_kind = build.column::<u8>(&[], true);
+    let path_data = build.column::<u32>(&[], true);
+    let path_extra = build.column::<u32>(&[], true);
+    let path_slots = build.column::<u32>(&[], true);
     let lifetimes = build.column::<[u32; 2]>(&[], false);
     let binding_owners = build.column::<u32>(&[], true);
     let block_scopes = build.column::<u64>(&[1 | 3 << 32], true);
+    let macro_calls = build.column::<u64>(&[], true);
     let ident_hygiene = build.column::<[u32; 2]>(&[[1, ctx], [PAT_BIT, ctx]], true);
     let block_editions = build.column::<[u32; 2]>(&[[3, Edition::CURRENT as u32]], true);
     let overflow_inheriting = build.column::<u32>(&[2], true);
@@ -99,7 +108,8 @@ pub fn store(build: &mut Build) -> StoreCols {
             extra,
             expr_lists,
             pat_lists,
-            statements,
+            stmt_kind,
+            stmt_data,
             arms,
             record_fields,
             field_pats,
@@ -110,9 +120,14 @@ pub fn store(build: &mut Build) -> StoreCols {
             ty_data,
             ty_extra,
             ty_lists,
+            path_kind,
+            path_data,
+            path_extra,
+            path_slots,
             lifetimes,
             binding_owners,
             block_scopes,
+            macro_calls,
             ident_hygiene,
             block_editions,
             overflow_inheriting,
@@ -153,27 +168,70 @@ fn in_file(kind: SyntaxKind, start: u32, end: u32) -> [u64; 3] {
     src(FILE, 1, kind, start, end)
 }
 
+/// `NO_SOURCE`: the kind of an id of a back map without syntax.
+const NO_SOURCE: u16 = u16::MAX;
+
+/// A `FileRun`, as its two words of eight bytes: the file's salsa id, then the file kind and
+/// the run's first id.
+fn run(file_kind: u32, file: u64, start: u32) -> [u64; 2] {
+    [file, u64::from(file_kind) | u64::from(start) << 32]
+}
+
+/// A `BackRec`'s columns: by id the syntax kind, start and end, then the runs of ids in one file.
+struct Back {
+    kinds: Col,
+    starts: Col,
+    ends: Col,
+    runs: Col,
+}
+
+/// Writes a back map of `ids` (`None` for an id without syntax) and its `runs`, as
+/// `BackColumns::write` does.
+fn back(build: &mut Build, ids: &[Option<(SyntaxKind, u32, u32)>], runs: &[[u64; 2]]) -> Back {
+    let kinds: Vec<u16> = ids.iter().map(|it| it.map_or(NO_SOURCE, |(kind, ..)| u16::from(kind))).collect();
+    let starts: Vec<u32> = ids.iter().map(|it| it.map_or(0, |(_, start, _)| start)).collect();
+    let ends: Vec<u32> = ids.iter().map(|it| it.map_or(0, |(.., end)| end)).collect();
+    Back {
+        kinds: build.column(&kinds, true),
+        starts: build.column(&starts, true),
+        ends: build.column(&ends, true),
+        runs: build.column(runs, true),
+    }
+}
+
 /// Where a source map's columns went, in `SourceMapRoot`'s order.
 pub struct SourceMapCols {
     placed: Placed,
-    columns: [Col; 17],
+    backs: [Back; 5],
+    columns: [Col; 14],
     flags: u32,
 }
 
 /// Writes [`source_map`]'s columns, as `SourceMapColumns::write` writes a source map's.
 pub fn source_map(build: &mut Build) -> SourceMapCols {
     let mut w = Words::default();
-    // No binding definitions, field maps, template or diagnostics.
-    (0..5).for_each(|_| w.u32(0));
-    let placed = w.place(build);
-    let expr_map_back = build.column(
-        &[in_file(SyntaxKind::PATH_EXPR, 0, 3), [0; 3], in_file(SyntaxKind::TUPLE_EXPR, 4, 9)],
-        true,
+    // No field maps, template or diagnostics.
+    (0..4).for_each(|_| w.u32(0));
+    // Expression 3 is in a macro file, so the map has a second run.
+    let expr_map_back = back(
+        build,
+        &[
+            Some((SyntaxKind::PATH_EXPR, 0, 3)),
+            None,
+            Some((SyntaxKind::TUPLE_EXPR, 4, 9)),
+            Some((SyntaxKind::PATH_EXPR, 0, 1)),
+        ],
+        &[run(FILE, 1, 0), run(MACRO_FILE, 7, 3)],
     );
-    let pat_map_back = build.column(&[in_file(SyntaxKind::WILDCARD_PAT, 10, 11)], true);
-    let label_map_back = build.column(&[in_file(SyntaxKind::LABEL, 12, 15)], true);
-    let types_map_back = build.column(&[in_file(SyntaxKind::NEVER_TYPE, 16, 17)], true);
-    let lifetime_map_back = build.column(&[in_file(SyntaxKind::LIFETIME, 18, 20)], true);
+    let pat_map_back = back(build, &[Some((SyntaxKind::WILDCARD_PAT, 10, 11))], &[run(FILE, 1, 0)]);
+    let label_map_back = back(build, &[Some((SyntaxKind::LABEL, 12, 15))], &[run(FILE, 1, 0)]);
+    // One binding, of pattern 0.
+    let binding_starts = build.column::<u32>(&[0, 1], true);
+    // The words go after the expression maps' first columns, as the writer places them.
+    let placed = w.place(build);
+    let types_map_back = back(build, &[Some((SyntaxKind::NEVER_TYPE, 16, 17))], &[run(FILE, 1, 0)]);
+    let lifetime_map_back = back(build, &[Some((SyntaxKind::LIFETIME, 18, 20))], &[run(FILE, 1, 0)]);
+    let binding_pats = build.column::<u32>(&[0], true);
     // Each table's keys in increasing order of (file kind, file, start, end, kind).
     let expr_map = build.column(
         &[
@@ -183,7 +241,7 @@ pub fn source_map(build: &mut Build) -> SourceMapCols {
         ],
         true,
     );
-    let expr_map_ids = build.column::<u32>(&[0, 2, 1], true);
+    let expr_map_ids = build.column::<u32>(&[0, 2, 3], true);
     let pat_map = build.column(&[in_file(SyntaxKind::WILDCARD_PAT, 10, 11)], true);
     let pat_map_ids = build.column::<u32>(&[PAT_BIT], true);
     let label_map = build.column(&[in_file(SyntaxKind::LABEL, 12, 15)], true);
@@ -196,12 +254,10 @@ pub fn source_map(build: &mut Build) -> SourceMapCols {
     let expansion_calls = build.column::<u64>(&[5], true);
     SourceMapCols {
         placed,
+        backs: [expr_map_back, pat_map_back, label_map_back, types_map_back, lifetime_map_back],
         columns: [
-            expr_map_back,
-            pat_map_back,
-            label_map_back,
-            types_map_back,
-            lifetime_map_back,
+            binding_starts,
+            binding_pats,
             expr_map,
             expr_map_ids,
             pat_map,
@@ -221,6 +277,9 @@ pub fn source_map(build: &mut Build) -> SourceMapCols {
 
 /// The `SourceMapRoot` fields of `cols`.
 pub fn source_map_root(root: &mut Root, cols: &SourceMapCols) {
+    for back in &cols.backs {
+        [back.kinds, back.starts, back.ends, back.runs].into_iter().for_each(|column| root.slice(column));
+    }
     cols.columns.iter().for_each(|&column| root.slice(column));
     root.words(&cols.placed);
     root.u32(cols.flags);

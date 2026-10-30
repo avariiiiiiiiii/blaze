@@ -118,11 +118,12 @@ impl Image {
     /// generation.
     pub(crate) fn can_commit(&self, staged: &Staged) -> Result<(), LinkError> {
         if self.pending.is_some() {
-            return Err(LinkError { function: None, what: "a commit is in flight".into() });
+            return Err(LinkError { function: None, what: "a commit is in flight".into(), refusal: None });
         }
         if staged.base != self.state.generation {
             return Err(LinkError {
                 function: None,
+                refusal: None,
                 // alloc: error path
                 what: format!(
                     "staged on generation {}, and the image is at {}: stage it again",
@@ -150,10 +151,10 @@ impl Image {
     /// The writes that give back the file before the last commit, and the message saying so.
     pub(crate) fn roll_back_writes(&self) -> Result<Writes, LinkError> {
         if self.pending.is_some() {
-            return Err(LinkError { function: None, what: "a commit is in flight".into() });
+            return Err(LinkError { function: None, what: "a commit is in flight".into(), refusal: None });
         }
         let Some(undo) = self.history.back() else {
-            return Err(LinkError { function: None, what: "no commit to roll back".into() });
+            return Err(LinkError { function: None, what: "no commit to roll back".into(), refusal: None });
         };
         let from = self.state.generation;
         let to = undo.state.generation;
@@ -187,6 +188,7 @@ impl Image {
         if end.max(writes.old_len) > image {
             return Err(LinkError {
                 function: None,
+                refusal: None,
                 // alloc: error path
                 what: format!(
                     "{} is {:#x} bytes and its code memory's image part {image:#x}: make the code memory with \
@@ -198,7 +200,7 @@ impl Image {
         }
         let to = &self.to;
         // alloc: error path
-        let fail = |error: blaze_inproc::Error| LinkError { function: None, what: format!("writing {to} into its code memory: {error}") };
+        let fail = |error: blaze_inproc::Error| LinkError { function: None, what: format!("writing {to} into its code memory: {error}"), refusal: None };
         let zero = |memory: &mut CodeMemory, offset: u64, len: u64| -> Result<(), LinkError> {
             if len == 0 {
                 return Ok(());
@@ -325,7 +327,7 @@ impl Image {
                     // alloc: error path
                     format!("{} is written, but running programs were not told: {why}", self.to)
                 };
-                pending.failed.get_or_insert(LinkError { function: None, what });
+                pending.failed.get_or_insert(LinkError { function: None, what, refusal: None });
             }
             Done::Renamed => pending.revert = None,
             _ => {}
@@ -360,5 +362,5 @@ impl Image {
 
 fn live_dir_error() -> LinkError {
     // alloc: error path
-    LinkError { function: None, what: "the live directory names no file under the driver's root".into() }
+    LinkError { function: None, what: "the live directory names no file under the driver's root".into(), refusal: None }
 }

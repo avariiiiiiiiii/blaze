@@ -16,12 +16,10 @@ doctest = false
 [dependencies]
 blaze-core.workspace = true
 blaze-mem.workspace = true
-jobserver = "0.1.35"
 memchr.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
-serde_json.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

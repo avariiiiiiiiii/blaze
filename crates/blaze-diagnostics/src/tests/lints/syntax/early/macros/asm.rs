@@ -24,7 +24,7 @@ pub macro naked_asm("assembly template", $(operands,)* $(options($(option),*))?)
 fn syntax_directives_are_bad_style_on_x86() {
     let source = include_str!("asm/inline-syntax.rs");
     let fixture = format!(
-        "{MINICORE}//- /inline-syntax.rs crate:main edition:2015 deps:minicore cfg:target_arch=x86_64\n{source}"
+        "{MINICORE}//- /inline-syntax.rs crate:other:main edition:2015 deps:minicore cfg:target_arch=x86_64\n{source}"
     );
     let expected = include_str!("asm/inline-syntax.x86_64.stderr");
     assert_eq!(ui_fixture(Mode::Other, &fixture, &Options::default()), expected);

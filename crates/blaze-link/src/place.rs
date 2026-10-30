@@ -22,10 +22,10 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use crate::arena::{FrameVec, collect_in};
-use crate::{DevRun, Format, LinkError};
+use crate::{DevRun, Format, LinkError, Refusal};
 use crate::cow::{CowBytes, IdSet};
 use crate::model::{Apply, Class, Counts, Prot, Region, Reserve, Sym, Writer, reserved};
-use crate::stage::{Stage, error, function_of};
+use crate::stage::{Stage, error, function_of, refused};
 use crate::state::{ClassId, PieceId, PieceRef, Sort, Space, State, What, zeroed};
 use crate::symbols::{SymKey, Symbols};
 
@@ -286,8 +286,9 @@ impl<'a> Stage<'a> {
         let region = &mut Arc::make_mut(&mut self.new.spaces)[space].region;
         let at = align_up_u64(region.addr + region.size, 4) - region.addr;
         if at + 4 > region.capacity {
-            return Err(error(
+            return Err(refused(
                 None,
+                Refusal::NoRoom { need: at + 4, room: region.capacity },
                 // alloc: error path
                 format!(
                     "the end of the call frame entries does not fit in {:?} ({} of {} bytes used): link the image from scratch",
@@ -593,11 +594,12 @@ impl<'a> Stage<'a> {
                 .new
                 .space_of(&class)
                 // alloc: error path
-                .ok_or_else(|| error(None, format!("the image has no {class:?} region: link it from scratch")))?;
+                .ok_or_else(|| refused(None, Refusal::NoRegion, format!("the image has no {class:?} region: link it from scratch")))?;
             let capacity = self.new.spaces[space].region.capacity;
             if bound > capacity {
-                return Err(error(
+                return Err(refused(
                     None,
+                    Refusal::NoRoom { need: bound, room: capacity },
                     // alloc: error path
                     format!("{class:?} may need {bound} bytes and has room for {capacity}: link the image from scratch"),
                 ));
@@ -638,8 +640,9 @@ impl<'a> Stage<'a> {
                 let in_code = patch_frames && self.core_frame(id, sym);
                 let space = if in_code { code_space } else { target_space }.ok_or_else(|| {
                     let target = if in_code { &Class::Patch } else { self.patch_class(self.new.class(class_id)) };
-                    error(
+                    refused(
                         None,
+                        Refusal::NoRegion,
                         // alloc: error path
                         format!(
                             "{} needs a {target:?} region, which the image was laid out without: link it from scratch",
@@ -660,8 +663,9 @@ impl<'a> Stage<'a> {
                 let end = at + piece.size;
                 if end > region.capacity {
                     let target = &region.class;
-                    return Err(error(
+                    return Err(refused(
                         function_of(piece),
+                        Refusal::NoRoom { need: end, room: region.capacity },
                         // alloc: error path
                         format!(
                             "{} does not fit in {target:?} ({} of {} bytes used): link the image from scratch",
@@ -743,8 +747,9 @@ impl<'a> Stage<'a> {
         }
         if size > capacity {
             let class = &self.new.spaces[space].region.class;
-            return Err(error(
+            return Err(refused(
                 None,
+                Refusal::NoRoom { need: size, room: capacity },
                 // alloc: error path
                 format!("{class:?} needs {size} bytes and has room for {capacity}: link the image from scratch"),
             ));

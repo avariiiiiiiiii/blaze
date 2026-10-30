@@ -467,12 +467,12 @@ impl Elf {
 
     pub(crate) fn machine(&self) -> u16 {
         match self.output.arch {
-            Arch::Aarch64 => object::elf::EM_AARCH64,
-            Arch::X86_64 | Arch::Wasm32 => object::elf::EM_X86_64,
+            Arch::Aarch64 => object::elf::EM_AARCH64.0,
+            Arch::X86_64 | Arch::Wasm32 => object::elf::EM_X86_64.0,
         }
     }
 }
 
 pub(crate) fn error(what: String) -> LinkError {
-    LinkError { function: None, what }
+    LinkError { function: None, what, refusal: None }
 }

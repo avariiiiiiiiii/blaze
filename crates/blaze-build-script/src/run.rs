@@ -4,62 +4,23 @@
 //! around it are made; cargo's files of the run ([`run_dir`]) are written once it succeeds,
 //! which is where cargo and blaze read a run back from.
 //!
-//! [`run`], [`elided`], [`begin`] and [`Ran::finish`] touch the file system and wait on it
-//! (and [`run`] on the script), so they are for a thread that may block: the harness and
-//! v1. A caller that must not block judges a run with [`judge`] alone, which reads only the
-//! bytes it is given, and makes the same directories and files itself from [`invoked`] and
-//! [`files`].
+//! The script itself runs in blaze's sandbox, never here. [`begin`] touches the file system
+//! and waits on it, so it is for a thread that may block. [`judge`] reads only the bytes it
+//! is given; the caller makes cargo's files of a run itself from [`invoked`] and [`files`].
 
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::ExitStatus,
     time::SystemTime,
 };
 
 use crate::{
     Error,
-    env::Env,
     output::{self, Context, Output, Severity},
     unit::Unit,
 };
-
-/// What runs: the script, where, and with what environment. A sandbox runs the same.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Invocation {
-    pub program: PathBuf,
-    pub cwd: PathBuf,
-    pub env: Env,
-}
-
-impl Invocation {
-    pub fn of(unit: &Unit, env: Env) -> Invocation {
-        // clone: setup, once per run: what runs, owned by the run.
-        Invocation { program: unit.script.clone(), cwd: unit.package.manifest_dir.clone(), env }
-    }
-
-    /// The command that runs it directly, with nothing of the caller's environment. A jobserver
-    /// the run shares is given to it after (`jobserver::Client::configure`).
-    #[expect(clippy::disallowed_methods, reason = "the directory is the package's, set here")]
-    pub fn command(&self) -> Command {
-        let mut command = Command::new(&self.program);
-        command.current_dir(&self.cwd).stdin(Stdio::null());
-        self.env.apply(&mut command);
-        command
-    }
-}
-
-/// A finished run, before cargo has judged it.
-#[derive(Debug)]
-pub struct Ran {
-    /// When it started, as the file system tells time: the time `output` is given, so that a
-    /// file changed while the script ran makes it run again.
-    pub began: SystemTime,
-    pub status: ExitStatus,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
 
 /// Why the build fails, with what the script asked to be shown.
 #[derive(Debug, PartialEq, Eq)]
@@ -103,45 +64,6 @@ pub fn is_second_layout(out_dir: &Path) -> bool {
     out_dir.file_name().is_some_and(|it| it == "out")
         && hash.is_some_and(|it| it.len() == 16 && it.bytes().all(|it| it.is_ascii_hexdigit()))
         && build.is_some_and(|it| it == "build")
-}
-
-/// Runs `command`, made from `unit`'s [`Invocation`] (directly or in a sandbox). The script is
-/// whatever executable `unit.script` names, wherever it was made.
-pub fn run(unit: &Unit, mut command: Command) -> Result<Ran, Error> {
-    let began = begin(unit)?;
-    command.stdin(Stdio::null());
-    // A script this process just wrote stays busy while a child another thread forked holds
-    // it open, until that child execs.
-    let mut output = command.output();
-    for wait in 1..10 {
-        match &output {
-            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                std::thread::sleep(std::time::Duration::from_millis(10 * wait));
-                output = command.output();
-            }
-            _ => break,
-        }
-    }
-    let output = output.map_err(|err| {
-        // alloc: error path.
-        Error(format!(
-            "failed to run custom build command for `{}`\n\nCaused by:\n  could not execute \
-             process `{}` (never executed)\n\nCaused by:\n  {err}",
-            unit.package.descr(),
-            unit.script.display()
-        ))
-    })?;
-    Ok(Ran { began, status: output.status, stdout: output.stdout, stderr: output.stderr })
-}
-
-/// The run of a script [`crate::elide::elide`] read rather than ran, as if it had run and
-/// printed `stdout` (what elision says it prints) and nothing on stderr, and succeeded: with
-/// `OUT_DIR` and the run's directory made as for a run, so that [`Ran::finish`] judges it and
-/// writes cargo's files of it as for any other.
-pub fn elided(unit: &Unit, stdout: Vec<u8>) -> Result<Ran, Error> {
-    let began = begin(unit)?;
-    // alloc: none: an empty stderr.
-    Ok(Ran { began, status: ExitStatus::default(), stdout, stderr: Vec::new() })
 }
 
 /// What cargo does before it runs a script: `OUT_DIR` made, and the time the run begins, as
@@ -262,7 +184,7 @@ fn refused(unit: &Unit, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Res
 
 /// What cargo makes of a run of `unit` that ended with `status` having printed `stdout` and
 /// `stderr`: what the script printed, once it succeeded and logged no error; or why the build
-/// fails. [`Ran::finish`] without cargo's files, read from the bytes alone.
+/// fails, read from the bytes alone.
 pub fn judge(
     unit: &Unit,
     cx: &Context<'_>,
@@ -275,8 +197,9 @@ pub fn judge(
     output::parse(stdout, cx).map_err(|error| Failed { error, log_messages: Vec::new() })
 }
 
-/// cargo's files of a run that succeeded, as [`Ran::finish`] writes them, each a path and its
-/// bytes. The file of what was printed has the time the run began as its modification time.
+/// cargo's files of a run that succeeded, each a path and its bytes, which a later build
+/// reads the run back from. The file of what was printed is to have the time the run began
+/// as its modification time.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Files<'a> {
     /// `output` or `stdout` ([`printed`]).
@@ -295,36 +218,6 @@ pub fn files<'a>(unit: &'a Unit, stdout: &'a [u8], stderr: &'a [u8]) -> std::io:
         stderr: (dir.join("stderr"), stderr),
         root_output: (dir.join("root-output"), path_bytes(&unit.out_dir)?),
     })
-}
-
-impl Ran {
-    /// [`logged`] of what the run printed.
-    pub fn logged(&self) -> Vec<(Severity, String)> {
-        logged(&self.stdout)
-    }
-
-    /// [`judge`] of the run, with cargo's [`files`] written once it passes the checks before
-    /// what was printed is read.
-    pub fn finish(&self, unit: &Unit, cx: &Context<'_>) -> Result<Output, Failed> {
-        refused(unit, self.status, &self.stdout, &self.stderr)?;
-        self.write(unit)
-            // alloc: error path.
-            .map_err(|err| Failed { error: Error(err.to_string()), log_messages: Vec::new() })?;
-        // alloc: error path.
-        output::parse(&self.stdout, cx).map_err(|error| Failed { error, log_messages: Vec::new() })
-    }
-
-    /// cargo's files of a run that succeeded, which a later build reads the run back from.
-    fn write(&self, unit: &Unit) -> std::io::Result<()> {
-        let files = files(unit, &self.stdout, &self.stderr)?;
-        let (printed, stdout) = &files.printed;
-        let mut file = fs::File::create(printed)?;
-        file.write_all(stdout)?;
-        file.set_times(fs::FileTimes::new().set_accessed(self.began).set_modified(self.began))?;
-        fs::write(&files.stderr.0, files.stderr.1)?;
-        let mut root_output = fs::File::create(&files.root_output.0)?;
-        root_output.write_all(files.root_output.1)
-    }
 }
 
 /// `paths::path2bytes`.

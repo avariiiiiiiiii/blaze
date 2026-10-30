@@ -63,7 +63,7 @@ fn unused_import_through_a_glob_of_an_allowed_module() {
 fn unused_macro_use() {
     let source = include_str!("imports/unused-macro-use.rs");
     let expected = include_str!("imports/unused-macro-use.stderr");
-    let fixture = format!("//- minicore: panic\n//- /unused-macro-use.rs crate:main edition:2015\n{source}");
+    let fixture = format!("//- minicore: panic\n//- /unused-macro-use.rs crate:other:main edition:2015\n{source}");
     assert_eq!(ui_fixture(&fixture), expected);
 }
 
@@ -73,7 +73,7 @@ fn unused_import_with_attributes() {
     let expected = include_str!("imports/unused-import-issue-87973.stderr");
     let fixture = format!(
         "//- /std.rs crate:std edition:2021 library\npub mod fs {{}}\n\
-         //- /unused-import-issue-87973.rs crate:main edition:2015 deps:std\n{source}"
+         //- /unused-import-issue-87973.rs crate:other:main edition:2015 deps:std\n{source}"
     );
     assert_eq!(ui_fixture(&fixture), expected);
 }
@@ -99,7 +99,7 @@ fn unused_qualifications_not_of_global_paths() {
     let source = include_str!("imports/unused-qualifications-global-paths.rs");
     let fixture = format!(
         "//- minicore: default\n//- /std.rs crate:std edition:2021 library\npub use core::default;\n\
-         //- /unused-qualifications-global-paths.rs crate:main edition:2015 deps:std\n{source}"
+         //- /unused-qualifications-global-paths.rs crate:other:main edition:2015 deps:std\n{source}"
     );
     let stderr = ui_fixture(&fixture);
     assert!(!stderr.contains("unnecessary qualification"), "{stderr}");
@@ -137,7 +137,7 @@ fn hidden_glob_reexports() {
     let expected = include_str!("imports/hidden_glob_reexports.stderr");
     let fixture = format!(
         "//- /std.rs crate:std edition:2021 library\npub mod primitive {{ pub use u8; }}\n\
-         //- /hidden_glob_reexports.rs crate:main edition:2015 deps:std\n{source}"
+         //- /hidden_glob_reexports.rs crate:other:main edition:2015 deps:std\n{source}"
     );
     assert_eq!(ui_fixture(&fixture), expected);
 }
@@ -188,7 +188,7 @@ pub mod m {
 #[test]
 fn unused_import_of_a_dependency_s_item() {
     let fixture = format!(
-        "{DEP}//- /main.rs crate:main edition:2021 deps:dep
+        "{DEP}//- /main.rs crate:other:main edition:2021 deps:dep
 use dep::f;
 use dep::g;
 fn main() {{
@@ -202,7 +202,7 @@ fn main() {{
 #[test]
 fn used_import_of_a_dependency_s_item() {
     let fixture = format!(
-        "{DEP}//- /main.rs crate:main edition:2021 deps:dep
+        "{DEP}//- /main.rs crate:other:main edition:2021 deps:dep
 use dep::{{f, g}};
 fn main() {{
     f();
@@ -216,7 +216,7 @@ fn main() {{
 #[test]
 fn glob_of_a_dependency_s_module() {
     let used = format!(
-        "{DEP}//- /main.rs crate:main edition:2021 deps:dep
+        "{DEP}//- /main.rs crate:other:main edition:2021 deps:dep
 use dep::m::*;
 fn main() {{
     h();
@@ -225,7 +225,7 @@ fn main() {{
     );
     assert_eq!(messages(&used, &[], "unused_imports"), Vec::<String>::new());
     let unused = format!(
-        "{DEP}//- /main.rs crate:main edition:2021 deps:dep
+        "{DEP}//- /main.rs crate:other:main edition:2021 deps:dep
 use dep::m::*;
 fn main() {{}}
 "
@@ -236,7 +236,7 @@ fn main() {{}}
 #[test]
 fn unused_imports_of_one_use_item_are_one_diagnostic() {
     let fixture = format!(
-        "{DEP}//- /main.rs crate:main edition:2021 deps:dep
+        "{DEP}//- /main.rs crate:other:main edition:2021 deps:dep
 use dep::{{f, g, m::h}};
 fn main() {{
     g();
@@ -252,7 +252,7 @@ fn main() {{
 #[test]
 fn qualification_of_a_dependency_s_item_found_unqualified() {
     let fixture = format!(
-        "{DEP}//- /main.rs crate:main edition:2021 deps:dep
+        "{DEP}//- /main.rs crate:other:main edition:2021 deps:dep
 use dep::g;
 fn main() {{
     g();
@@ -269,7 +269,7 @@ fn main() {{
 
 #[test]
 fn qualification_whose_name_alone_is_a_local_is_not_linted() {
-    let fixture = "//- /main.rs crate:main edition:2021
+    let fixture = "//- /main.rs crate:other:main edition:2021
 mod a {
     pub fn f() {}
 }
@@ -286,7 +286,7 @@ fn main() {
 
 #[test]
 fn qualification_after_generic_args_is_not_linted() {
-    let fixture = "//- /main.rs crate:main edition:2021
+    let fixture = "//- /main.rs crate:other:main edition:2021
 mod a {
     pub struct S<T>(pub T);
     impl<T> S<T> {
@@ -304,7 +304,7 @@ fn main() {
 
 #[test]
 fn qualification_through_an_unused_import_is_not_linted() {
-    let fixture = "//- /main.rs crate:main edition:2021
+    let fixture = "//- /main.rs crate:other:main edition:2021
 mod a {
     pub fn f() {}
 }
@@ -319,7 +319,7 @@ fn main() {
 
 #[test]
 fn trait_import_used_by_a_method_call_is_used() {
-    let fixture = "//- /main.rs crate:main edition:2021
+    let fixture = "//- /main.rs crate:other:main edition:2021
 mod a {
     pub trait Tr {
         fn m(&self) {}

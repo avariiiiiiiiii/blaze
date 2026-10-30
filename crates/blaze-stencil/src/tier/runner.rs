@@ -5,8 +5,9 @@
 //!
 //! A recompile that fails or panics is a [`Failure`] naming the function and the tier: the
 //! function stays where it is, is not asked for at that tier again, and [`Runner::close`]
-//! says so. Cells that can't be read stop the tiering of the run with that error
-//! ([`Closed::stopped`]); the program runs on at the tiers it reached.
+//! says so. Cells that can't be read, or a panic on one of the runner's threads, stop the
+//! tiering of the run with that error ([`Closed::stopped`]); the program runs on at the
+//! tiers it reached.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -183,7 +184,13 @@ impl<M: Cells + Send + Sync + 'static, R: Recompile> Runner<M, R> {
         self.shared.tick.notify_all();
         self.shared.work.notify_all();
         for thread in self.threads.drain(..) {
-            let _ = thread.join();
+            if let Err(payload) = thread.join() {
+                let mut state = lock(&self.shared.state);
+                if state.stopped.is_none() {
+                    // alloc: the error, once per run whose thread panicked.
+                    state.stopped = Some(format!("a tiering thread panicked: {}", panic_text(&*payload)));
+                }
+            }
         }
     }
 }
@@ -211,15 +218,26 @@ impl<M: Cells + Send + Sync + 'static, R: Recompile> Shared<M, R> {
             }
             next = now + self.period;
             let State { driver, queue, stopped, promotions, .. } = &mut *state;
-            match driver.round(&self.memory) {
-                Ok([]) => {}
-                Ok(promotes) => {
+            let memory = &self.memory;
+            let round = catch_unwind(AssertUnwindSafe(move || {
+                let driver = driver;
+                driver.round(memory)
+            }));
+            match round {
+                Ok(Ok([])) => {}
+                Ok(Ok(promotes)) => {
                     *promotions += promotes.len() as u64;
                     queue.extend(promotes.iter().copied());
                     self.work.notify_all();
                 }
-                Err(why) => {
+                Ok(Err(why)) => {
                     *stopped = Some(why);
+                    self.work.notify_all();
+                    return;
+                }
+                Err(payload) => {
+                    // alloc: the error, which stops the run's tiering.
+                    *stopped = Some(format!("reading the cells panicked: {}", panic_text(&*payload)));
                     self.work.notify_all();
                     return;
                 }

@@ -28,6 +28,7 @@ use hir_ty_codegen::v2::{
 };
 
 use super::{Job, Real, UnitReader, files::Mounted, graph::flag, script};
+use crate::serve::work::{Full, Linking, OutputFields};
 
 type KeptImage = crate::serve::work::Image<Real>;
 
@@ -560,7 +561,7 @@ pub struct Linked {
     image: Image,
     output: Output,
     functions: Vec<InstanceKey>,
-    statics: Vec<(ItemKey, ContentId)>,
+    statics: Vec<StaticRow>,
     natives: Vec<ContentId>,
     names: Vec<String>,
 }
@@ -686,10 +687,97 @@ fn natives(job: &Job, unit: usize, frontend: &HirFrontend<'_>) -> Result<(Vec<Na
 /// A native input a link read off the machine: its path, and the BLAKE3 hash of its contents.
 pub(crate) type Read = (String, ContentId);
 
-/// `generated` linked into the image at `path` as `makes` says: the file's bytes, every
-/// native input the link read off the machine, and a test binary's execution table. The image
-/// kept at `path` is taken out of `images` and relinked, and what this link made put back; a
-/// link that fails puts none.
+/// What [`link`] made: the file's bytes, every native input the link read off the machine, a
+/// test binary's execution table, and how it reached the image.
+pub(crate) struct LinkMade {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) read: Vec<Read>,
+    pub(crate) table: Option<blaze_codegen::ExecTable>,
+    pub(crate) how: Linking,
+}
+
+/// Why [`link`] made no image at `image`.
+#[derive(Debug)]
+pub(crate) struct LinkFailed {
+    pub(crate) image: String,
+    pub(crate) cause: LinkCause,
+}
+
+impl std::fmt::Display for LinkFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "linking `{}`: {}", self.image, self.cause)
+    }
+}
+
+/// What stopped a link.
+#[derive(Debug)]
+pub(crate) enum LinkCause {
+    /// blaze's linker refused, at `step`. The image kept is as it was before the link.
+    Linker { step: LinkStep, error: blaze_link::LinkError },
+    /// A native input on the link line could not be read.
+    Native(blaze_usercode::inputs::Unreadable),
+    /// A native input on the link line is gone from the machine.
+    NativeGone(PathBuf),
+    /// blaze's toolchain, whose C runtime and sanitizer runtimes the link takes, is not installed.
+    NoToolchain,
+    /// The image's path is no file name the linker can write.
+    Unnamed,
+    /// What the link is given (the unit, its build scripts' `-l`s and `-L`s, the code's side
+    /// tables, a test binary's table) was refused before or after the linker ran: that step's
+    /// own error.
+    Given(String),
+}
+
+impl std::fmt::Display for LinkCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkCause::Linker { step, error } => write!(f, "{}: {error}", step.name()),
+            LinkCause::Native(error) => write!(f, "{}: {}", error.path.display(), error.error),
+            LinkCause::NativeGone(path) => write!(f, "{}: the native library is gone", path.display()),
+            LinkCause::NoToolchain => f.write_str("blaze's toolchain is not installed"),
+            LinkCause::Unnamed => f.write_str("the path is no file the linker can name"),
+            LinkCause::Given(what) => f.write_str(what),
+        }
+    }
+}
+
+impl From<String> for LinkCause {
+    fn from(what: String) -> LinkCause {
+        LinkCause::Given(what)
+    }
+}
+
+/// Where in a link blaze's linker refused.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LinkStep {
+    /// Working out the [`Output`] for the unit's target.
+    Output,
+    /// Finding the link line's native inputs.
+    Locate,
+    /// Making a new image.
+    Image,
+    /// Staging the change into the image.
+    Stage,
+    /// Taking the staged image's bytes.
+    Bytes,
+}
+
+impl LinkStep {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            LinkStep::Output => "the output",
+            LinkStep::Locate => "finding the native inputs",
+            LinkStep::Image => "making the image",
+            LinkStep::Stage => "staging the change",
+            LinkStep::Bytes => "writing the image",
+        }
+    }
+}
+
+/// `generated` linked into the image at `path` as `makes` says, and how. The image kept at
+/// `path` is taken out of `images`, relinked and put back; a link that fails after taking it
+/// puts it back as it was, so the next link still patches it. A kept image of another
+/// [`Output`] is replaced, and the link says which fields changed ([`Full::Output`]).
 pub(crate) fn link(
     job: &Job,
     unit: usize,
@@ -697,7 +785,19 @@ pub(crate) fn link(
     makes: &Makes,
     generated: &Generated<'_>,
     images: &mut Vec<KeptImage>,
-) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>), String> {
+) -> Result<LinkMade, LinkFailed> {
+    // alloc: error path
+    link_at(job, unit, path, makes, generated, images).map_err(|cause| LinkFailed { image: path.to_owned(), cause })
+}
+
+fn link_at(
+    job: &Job,
+    unit: usize,
+    path: &str,
+    makes: &Makes,
+    generated: &Generated<'_>,
+    images: &mut Vec<KeptImage>,
+) -> Result<LinkMade, LinkCause> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let built = &generated.built;
     let debug = match generated.policy.profile.debuginfo {
@@ -713,41 +813,121 @@ pub(crate) fn link(
         _ => None,
     };
     let test = job.graph.has(unit as u32, flag::TEST);
-    let mut output = blaze_link::target::output(triple(job, u), shared, debug, true).map_err(|it| it.to_string())?;
+    let linker = |step: LinkStep| move |error: blaze_link::LinkError| LinkCause::Linker { step, error };
+    let mut output =
+        blaze_link::target::output(triple(job, u), shared, debug, true).map_err(linker(LinkStep::Output))?;
     output.exec_log = test && blaze_codegen::exec::records(generated.policy.mode);
     output.sanitize = generated.policy.sanitize;
     let (libs, search) = natives(job, unit, &generated.frontend)?;
-    let sysroot = crate::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
+    let sysroot = crate::toolchain::sysroot().ok_or(LinkCause::NoToolchain)?;
     let located =
-        blaze_link::target::locate(&mut output, &libs, &search, &sysroot).map_err(|it| it.to_string())?;
+        blaze_link::target::locate(&mut output, &libs, &search, &sysroot).map_err(linker(LinkStep::Locate))?;
     let side = generated.side()?;
 
-    let kept = images.iter().position(|it| it.path == path).map(|at| images.swap_remove(at).kept);
-    let mut linked = match kept.filter(|it| it.output == output) {
-        Some(it) => it,
-        None => {
-            let to = blaze_core::FileName::new(path.trim_start_matches('/'))
-                .ok_or_else(|| format!("`{path}` is no file the linker can name"))?;
-            Linked {
-                image: Image::new(to, output.clone()).map_err(|it| it.to_string())?,
-                output: output.clone(),
-                functions: Vec::new(),
-                statics: Vec::new(),
-                natives: Vec::new(),
-                names: Vec::new(),
-            }
-        }
-    };
+    let (mut linked, changed) = kept_image(images, path, &output)?;
+    // The image goes back whether the link is made or not: one that fails leaves it as it
+    // was, and the next link is a change of it.
+    let made = relink(path, generated, test, &located, side, &mut linked);
+    images.push(KeptImage { path: path.to_owned(), kept: linked });
+    let (bytes, read, table, full) = made?;
+    Ok(LinkMade { bytes, read, table, how: linking(changed, full, output.incremental) })
+}
 
+/// The image to link `output` into at `path`, taken out of `images`, and the fields of
+/// `output` that differ from the kept image's (`None` when none was kept there). A kept image
+/// of another output is let go only once its replacement is made, so an error leaves
+/// `images` as it was.
+pub(crate) fn kept_image(
+    images: &mut Vec<KeptImage>,
+    path: &str,
+    output: &Output,
+) -> Result<(Linked, Option<OutputFields>), LinkCause> {
+    let at = images.iter().position(|it| it.path == path);
+    let changed = at.map(|at| OutputFields::between(&images[at].kept.output, output));
+    if let (Some(at), Some(changed)) = (at, changed)
+        && changed.is_empty()
+    {
+        return Ok((images.swap_remove(at).kept, Some(changed)));
+    }
+    let to = blaze_core::FileName::new(path.trim_start_matches('/')).ok_or(LinkCause::Unnamed)?;
+    let fresh = Linked {
+        image: Image::new(to, output.clone())
+            .map_err(|error| LinkCause::Linker { step: LinkStep::Image, error })?,
+        output: output.clone(),
+        functions: Vec::new(),
+        statics: Vec::new(),
+        natives: Vec::new(),
+        names: Vec::new(),
+    };
+    if let Some(at) = at {
+        images.swap_remove(at);
+    }
+    Ok((fresh, changed))
+}
+
+/// How a link went: `changed` is the fields of the output that differ from the kept image's
+/// (`None` when no image was kept), `full` whether blaze-link laid the image out whole
+/// ([`blaze_link::Staged::full`]). A kept image of the same output laid out whole is one whose
+/// first link failed (nothing was laid out to patch) or one that keeps no room.
+pub(crate) fn linking(changed: Option<OutputFields>, full: bool, incremental: bool) -> Linking {
+    match (changed, full) {
+        (Some(changed), _) if !changed.is_empty() => Linking::Full(Full::Output(changed)),
+        (_, false) => Linking::Spliced,
+        (_, true) if !incremental => match changed {
+            Some(_) => Linking::Full(Full::NotIncremental),
+            None => Linking::First,
+        },
+        (_, true) => Linking::First,
+    }
+}
+
+/// A static by its item, its instance and the hash of its whole definition.
+pub(crate) type StaticRow = (ItemKey, ContentId, ContentId);
+
+const STATIC_DOMAIN: &str = "blaze v2 link static 1";
+
+/// Each of `statics` as a row, sorted, and what of `old`'s rows is gone and what is new: a
+/// static put again unchanged is in neither, so the link neither moves it nor rewrites what
+/// refers to it (blaze-link's [`Change`] is a delta). One whose definition changed is in both.
+pub(crate) fn static_rows(
+    old: &[StaticRow],
+    statics: &[blaze_codegen::Static],
+) -> Result<(Vec<StaticRow>, Vec<StaticRow>, Vec<StaticRow>), String> {
+    let mut scratch = Vec::new();
+    let mut rows = Vec::with_capacity(statics.len());
+    for it in statics {
+        scratch.clear();
+        blaze_protocol::cbor::append(&mut scratch, it).map_err(|error| format!("the static {:?}: {error}", it.item))?;
+        rows.push((it.item, it.instance, ContentId::of(STATIC_DOMAIN, &scratch)));
+    }
+    rows.sort_unstable();
+    let (mut gone, mut new) = (Vec::new(), Vec::new());
+    diff(old, &rows, &mut gone, &mut new);
+    Ok((rows, gone, new))
+}
+
+/// [`link`]'s change of `linked` to what `generated` built, and whether blaze-link laid the
+/// image out whole ([`blaze_link::Staged::full`]). Its columns are written only once the image
+/// has taken the change, so after an error they still say what the image holds.
+fn relink(
+    path: &str,
+    generated: &Generated<'_>,
+    test: bool,
+    located: &[blaze_link::target::Located],
+    side: &LinkInputs,
+    linked: &mut Linked,
+) -> Result<(Vec<u8>, Vec<Read>, Option<blaze_codegen::ExecTable>, bool), LinkCause> {
+    let built = &generated.built;
     // Each native input by the hash of its contents, through the process's table of files by
     // their `stat`: one `stat` for a library the image already has, read only when it is new.
     let mut files = blaze_usercode::inputs::Disk::new(Vec::new());
     let mut read = Vec::with_capacity(located.len());
     let mut native_ids = Vec::with_capacity(located.len());
-    for it in &located {
+    for it in located {
         let hash = blaze_usercode::trace::Inputs::file(&mut files, &it.path)
-            .map_err(|error| format!("{}: {}", error.path.display(), error.error))?
-            .ok_or_else(|| format!("{}: the native library is gone", it.path.display()))?;
+            .map_err(LinkCause::Native)?
+            // alloc: error path
+            .ok_or_else(|| LinkCause::NativeGone(it.path.clone()))?;
         native_ids.push(ContentId(hash));
         read.push((it.path.to_string_lossy().into_owned(), ContentId(hash)));
     }
@@ -760,7 +940,10 @@ pub(crate) fn link(
     let mut bytes_of = Vec::with_capacity(added_natives.len());
     for (order, it) in located.iter().enumerate() {
         if added_natives.binary_search(&native_ids[order]).is_ok() {
-            let bytes = std::fs::read(&it.path).map_err(|error| format!("{}: {error}", it.path.display()))?;
+            let bytes = std::fs::read(&it.path).map_err(|error| {
+                // alloc: error path
+                LinkCause::Native(blaze_usercode::inputs::Unreadable { path: it.path.clone(), error: error.to_string() })
+            })?;
             // alloc: once per native input new to the image, which keeps it shared from here.
             bytes_of.push((order, Arc::<[u8]>::from(bytes)));
         }
@@ -768,8 +951,7 @@ pub(crate) fn link(
 
     let mut functions: Vec<InstanceKey> = built.functions.iter().map(|it| it.key).collect();
     functions.sort_unstable();
-    let mut statics: Vec<(ItemKey, ContentId)> = built.statics.iter().map(|it| (it.item, it.instance)).collect();
-    statics.sort_unstable();
+    let (statics, gone_statics, new_statics) = static_rows(&linked.statics, &built.statics)?;
     let mut removed = Vec::new();
     let mut added_keys = Vec::new();
     diff(&linked.functions, &functions, &mut removed, &mut added_keys);
@@ -788,14 +970,19 @@ pub(crate) fn link(
     }
     let mut now_named: Vec<&str> = names.iter().map(|it| it.0.as_str()).collect();
     let (kept_names, unnamed) = renamed(std::mem::take(&mut linked.names), &mut now_named);
+    // clone: the names gone, a few a link, which an image that refuses the change still has
+    let gone_names = unnamed.clone();
     let change = Change {
         added: built.functions.iter().filter(|it| added_keys.binary_search(&it.key).is_ok()).collect(),
         removed,
         // A whole build tiers nothing up, so no slot runs another function than its own.
         slots: Vec::new(),
-        // A static's value is not in its key: every static is put again.
-        statics: built.statics.iter().collect(),
-        removed_statics: std::mem::take(&mut linked.statics),
+        statics: built
+            .statics
+            .iter()
+            .filter(|it| new_statics.binary_search_by(|row| (row.0, row.1).cmp(&(it.item, it.instance))).is_ok())
+            .collect(),
+        removed_statics: gone_statics.iter().map(|row| (row.0, row.1)).collect(),
         names,
         unnamed,
         // clone: once per image linked, a unit links one or two
@@ -813,8 +1000,24 @@ pub(crate) fn link(
         removed_natives,
         spans: side.spans.iter().map(|(anchor, bytes)| (*anchor, bytes.as_slice())).collect(),
     };
-    let staged = linked.image.stage(change).map_err(|it| it.to_string())?;
-    let bytes = linked.image.bytes(staged).map_err(|it| it.to_string())?;
+    let made = linked.image.stage(change).map_err(|error| (LinkStep::Stage, error)).and_then(|staged| {
+        let full = staged.full();
+        linked.image.bytes(staged).map(|bytes| (bytes, full)).map_err(|error| (LinkStep::Bytes, error))
+    });
+    let (bytes, full) = match made {
+        Ok(made) => made,
+        Err((step, error)) => {
+            // Every name the image may still hold: one it never took is unnamed harmlessly.
+            linked.names = kept_names;
+            linked.names.extend(gone_names);
+            linked.names.sort_unstable();
+            return Err(LinkCause::Linker { step, error });
+        }
+    };
+    linked.functions = functions;
+    linked.statics = statics;
+    linked.natives = new_natives;
+    linked.names = kept_names;
     // A test binary's tests are selected by its table, which only its link numbers.
     let table = match test {
         true => Some(super::test::image::table(
@@ -827,12 +1030,7 @@ pub(crate) fn link(
         )?),
         false => None,
     };
-    linked.functions = functions;
-    linked.statics = statics;
-    linked.natives = new_natives;
-    linked.names = kept_names;
-    images.push(KeptImage { path: path.to_owned(), kept: linked });
-    Ok((bytes, read, table))
+    Ok((bytes, read, table, full))
 }
 
 /// A `rustc-link-lib` as rustc takes `-l`: `[KIND[:MODIFIERS]=]NAME[:RENAME]`.

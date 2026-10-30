@@ -977,13 +977,13 @@ fn lines_change_where_the_source_location_does() {
 #[test]
 fn what_no_stencil_and_no_glue_takes_is_an_error_naming_it() {
     let func = function(&[], &[types::I64], |b, _| {
-        let r = b.ins().get_pinned_reg(types::I64);
+        let r = b.ins().get_stack_pointer(types::I64);
         b.ins().return_(&[r]);
     });
     let mut scratch = Scratch::new();
     let error = try_compile(&mut scratch, &func, &library()).unwrap_err();
     assert_eq!(error.inst, Some(s_inst(&func, 0)));
-    assert!(error.what.contains("get_pinned_reg"), "{error}");
+    assert!(error.what.contains("get_stack_pointer"), "{error}");
 
     static NO_UDIV: OnceLock<Vec<u8>> = OnceLock::new();
     let bytes = NO_UDIV.get_or_init(|| build(|shape| OPS.contains(&shape.op) && shape.op != Op::Udiv));

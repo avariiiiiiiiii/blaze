@@ -1,9 +1,13 @@
 ---
-status: plan
+status: superseded
 summary: The speed of light of wasm proc macros (blaze-macro-wasm) and of WASI build scripts (blaze-wasi), covering loading a module, an expansion in a fresh instance or a session, the guest's proc_macro and the WASI host. Each section counts the work, gives the bound and today's count, and says what closed the gap or what stands in the way.
 date: 2026-10-30
+superseded_by: ../dedup.md#proc-macros-one-engine-blaze-macro-eval
 ---
 # Wasm proc macros and WASI scripts: speed of light
+
+Superseded on 2026-10-30: `blaze-macro-wasm` and `blaze-wasi` are deleted, and every proc macro
+runs on blaze's evaluator, `blaze-macro-eval` ([dedup.md](../dedup.md#proc-macros-one-engine-blaze-macro-eval)).
 
 Part of [usercode's speed of light](speed-of-light.md). Code: `crates/blaze-macro-wasm/` (the host
 `src/lib.rs`, the WASI host `src/wasi.rs`, the guest `guest/proc_macro.rs`, `src/bench.rs`)

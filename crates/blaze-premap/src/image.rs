@@ -528,7 +528,7 @@ impl<'a> View<'a> {
                 addr: u64_at(record, 0),
                 size: u64_at(record, 8),
                 prot: prot_of(record[32]).expect("checked by parse"),
-                bytes: view.bytes.get(offset as usize..(offset + len) as usize).unwrap_or_default(),
+                bytes: view.bytes.get(offset as usize..(offset + len) as usize).expect("checked by parse"),
                 offset,
             }
         })

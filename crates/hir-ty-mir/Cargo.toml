@@ -23,8 +23,8 @@ hashbrown.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
 inventory.workspace = true
-rustc_apfloat = "0.2.3"
-oorandom = "11.1.5"
+rustc_apfloat.workspace = true
+oorandom.workspace = true
 salsa.workspace = true
 
 rustc_abi.workspace = true
@@ -42,8 +42,6 @@ intern.workspace = true
 cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
-hir-lint-levels.workspace = true
-blaze-lint-defs.workspace = true
 hir-ty.workspace = true
 base-db.workspace = true
 syntax.workspace = true
@@ -53,7 +51,7 @@ parser.workspace = true
 syntax-bridge.workspace = true
 
 [dev-dependencies]
-cov-mark = "2.0.0"
+cov-mark.workspace = true
 expect-test.workspace = true
 blaze-alloc-count.workspace = true
 blaze-units = { workspace = true, features = ["query"] }

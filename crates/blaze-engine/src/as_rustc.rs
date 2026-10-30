@@ -67,6 +67,30 @@ pub(crate) fn command() -> ! {
     std::process::exit(code)
 }
 
+/// What a script asks of rustc that blaze does not check as rustc would.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// A crate that is not a library: `--crate-type` naming another kind, or none, for which
+    /// rustc builds a binary (and fails one with no `main`).
+    NotALibrary { crate_type: Option<String> },
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refused::NotALibrary { crate_type: Some(kind) } => {
+                write!(f, "blaze checks a library, not a `--crate-type {kind}`")
+            }
+            Refused::NotALibrary { crate_type: None } => f.write_str(
+                "blaze checks a library, and with no `--crate-type` rustc builds a binary: \
+                 `--crate-type lib` asks for a library",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// What rustc would have printed and ended with.
 #[derive(Debug)]
 struct Outcome {
@@ -153,6 +177,7 @@ const LINTS: [&str; 12] = [
 impl<'a> Probe<'a> {
     fn of(args: &[&'a str]) -> anyhow::Result<Probe<'a>> {
         let mut probe = Probe::default();
+        let mut library = false;
         let mut words = args.iter().copied();
         while let Some(word) = words.next() {
             let (flag, joined) = match word.split_once('=') {
@@ -192,9 +217,10 @@ impl<'a> Probe<'a> {
                 "--crate-type" => {
                     for kind in value()?.split(',') {
                         if !matches!(kind, "lib" | "rlib") {
-                            bail!("blaze checks a library, not a `--crate-type {kind}`");
+                            return Err(Refused::NotALibrary { crate_type: Some(kind.to_owned()) }.into());
                         }
                     }
+                    library = true;
                 }
                 "--cfg" => probe.cfg_flags.extend([flag, value()?]),
                 "-O" | "-g" => probe.cfg_flags.push(flag),
@@ -213,6 +239,9 @@ impl<'a> Probe<'a> {
         }
         if probe.input.is_none() {
             bail!("no input filename given");
+        }
+        if !library {
+            return Err(Refused::NotALibrary { crate_type: None }.into());
         }
         if probe.emit.is_empty() {
             bail!("rustc would link the crate, and blaze checks it");

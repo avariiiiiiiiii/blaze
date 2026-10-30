@@ -2,12 +2,35 @@
 
 use std::ops::Not;
 
+use base_db::Db;
 use cfg::CfgExpr;
-use hir_expand::{ErasedAstId, ExpandErrorKind, MacroCallKind, attrs::AttrId, mod_path::ModPath};
+use either::Either;
+use hir_expand::{
+    ErasedAstId, ExpandErrorKind, MacroCallId, MacroCallKind,
+    attrs::AttrId,
+    mod_path::{ModPath, PathKind},
+    name::AsName as _,
+};
 use la_arena::Idx;
-use syntax::ast;
+use syntax::{ast, view::HasName as _};
 
-use crate::{AstId, nameres::ModuleId};
+use crate::{AdtId, AstId, ModuleDefId, item_tree::ImportKind, nameres::ModuleId, per_ns::PerNs};
+
+/// Whether an import of `kind` that resolved to `res` is a glob of what rustc cannot glob: not a
+/// module, enum or trait (rustc's E0432, "unresolved import"). An import that resolved to
+/// nothing is reported as unresolved already.
+pub(super) fn is_glob_of_non_module(kind: ImportKind, res: PerNs) -> bool {
+    kind == ImportKind::Glob
+        && !res.is_none()
+        && !matches!(
+            res.types.map(|it| it.def),
+            Some(
+                ModuleDefId::ModuleId(_)
+                    | ModuleDefId::AdtId(AdtId::EnumId(_))
+                    | ModuleDefId::TraitId(_)
+            )
+        )
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DefDiagnosticKind {
@@ -110,6 +133,24 @@ impl DefDiagnostic {
         err: ExpandErrorKind,
     ) -> Self {
         Self { in_module: container, kind: DefDiagnosticKind::MacroError { ast, path, err } }
+    }
+
+    /// rustc's "recursion limit reached while expanding" (`error_recursion_limit_reached`): `call`,
+    /// in `container`, is past the crate's `recursion_limit`, so its expansion is not collected.
+    pub(super) fn recursion_overflow(db: &Db, container: ModuleId, call: MacroCallId) -> Self {
+        let loc = call.loc(db);
+        let ast = match loc.kind {
+            MacroCallKind::FnLike { ast_id, .. } => ast_id.upcast::<ast::Item>(),
+            MacroCallKind::Derive { ast_id, .. } => ast_id.upcast::<ast::Item>(),
+            MacroCallKind::Attr { ast_id, .. } => ast_id,
+        };
+        let name = match loc.def.ast_id() {
+            Either::Left(it) => it.to_view(db).name(),
+            Either::Right(it) => it.to_view(db).name(),
+        };
+        let name = name.expect("a macro that expands has a name").as_name();
+        let path = ModPath::from_segments(PathKind::Plain, [name]);
+        Self::macro_error(container, ast, path, ExpandErrorKind::RecursionOverflow)
     }
 
     pub fn unconfigured_code(container: ModuleId, ast_id: ErasedAstId, cfg: CfgExpr) -> Self {

@@ -579,7 +579,9 @@ fn the_twins_walks_allocate_nothing() {
 
     let cfg = CfgOptions::default();
     let item = SourceFile::parse("#[a] #[b(c)] #[c = \"d\"] struct E;", Edition::CURRENT);
-    let owner = item.root().descendants().find_map(view::AnyHasAttrs::cast).expect("the struct");
+    let owner = view::AnyHasAttrs::from(
+        item.root().descendants().find_map(view::Struct::cast).expect("the struct"),
+    );
     let attrs = || {
         let mut n = 0;
         let _ = collect_item_tree_attrs_view(owner, || &cfg, |_, _| {

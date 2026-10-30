@@ -1,6 +1,6 @@
 //! Text a macro asks to be tokens of (`str::parse::<TokenStream>`, `Literal::from_str`),
-//! lexed by the host as rust-analyzer's proc-macro server lexes it
-//! (`proc-macro-srv/src/token_stream.rs`). Parsed tokens use the current call-site span,
+//! lexed by the host as rust-analyzer's proc-macro server lexes it (its `token_stream.rs`).
+//! Parsed tokens use the current call-site span,
 //! as rustc does; offsets into the parsed string are not offsets into the source file.
 
 use intern::Symbol;

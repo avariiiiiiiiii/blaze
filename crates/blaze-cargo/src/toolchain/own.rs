@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sha2::{Digest as _, Sha256};
+use blaze_sha256::Sha256;
 use tokio::sync::mpsc;
 
 use blaze_registry::http::HyperHttp;
@@ -60,9 +60,8 @@ struct Pin {
 
 struct Component {
     package: &'static str,
-    /// The target it is for: the host's, or `wasm32-wasip1` for the library proc macros build
-    /// against. Every package blaze pins is of one target, so its files are all named
-    /// `<package>-<version>-<target>`.
+    /// The target it is for: the host's. Every package blaze pins is of one target, so its files
+    /// are all named `<package>-<version>-<target>`.
     target: &'static str,
     pin: Pin,
 }
@@ -182,8 +181,7 @@ fn whole(dir: &Path) -> bool {
 }
 
 /// Whether `dir` is a whole toolchain with every component `release` pins: one downloaded
-/// before a component was pinned (the standard library of `wasm32-wasip1`, which proc macros
-/// are built for) is downloaded again.
+/// before a component was pinned is downloaded again.
 pub fn complete(release: &Release, dir: &Path) -> bool {
     let Ok(has) = std::fs::read_to_string(dir.join("lib/rustlib/components")) else {
         return false;
@@ -252,15 +250,17 @@ fn fetch_from(
     }
     eprintln!("Downloaded Rust {} for blaze in {:.1?}.", release.version, start.elapsed());
     for (old, name) in superseded(release, parent) {
-        match remove_dir(&old) {
-            Ok(()) => {
-                _ = std::fs::remove_file(parent.join(format!(".{name}.lock")));
-                eprintln!("Removed {name}, which an older release of blaze built with.");
-            }
-            Err(e) => {
-                eprintln!("blaze could not remove {name}, which it no longer builds with: {e}")
-            }
-        }
+        remove_dir(&old).map_err(|e| {
+            // alloc: error path, said once.
+            format!(
+                "blaze downloaded Rust {} and could not remove {}, which an older release of blaze \
+                 built with and nothing uses: {e}",
+                release.version,
+                old.display()
+            )
+        })?;
+        _ = std::fs::remove_file(parent.join(format!(".{name}.lock")));
+        eprintln!("Removed {name}, which an older release of blaze built with.");
     }
     Ok(())
 }
@@ -328,7 +328,7 @@ enum Source {
 
 impl Source {
     fn named(date: &str) -> anyhow::Result<Source> {
-        let given = std::env::var("BLAZE_RUST_DIST").ok().filter(|it| !it.is_empty());
+        let given = super::given_var("BLAZE_RUST_DIST")?;
         if let Some(dir) = given.as_ref().filter(|it| !it.contains("://")) {
             return Ok(Source::Dir(PathBuf::from(dir)));
         }
@@ -345,7 +345,11 @@ impl Source {
                 Ok(Body::Web { bytes, at: 0 })
             }
             Source::Dir(dir) => {
-                let mut opened = File::open(dir.join(file)).map_err(|_| missing())?;
+                let path = dir.join(file);
+                let mut opened = File::open(&path).map_err(|e| match e.kind() {
+                    io::ErrorKind::NotFound => missing(),
+                    _ => anyhow::anyhow!("opening {}: {e}", path.display()),
+                })?;
                 opened.seek(io::SeekFrom::Start(offset))?;
                 Ok(Body::File(opened))
             }
@@ -506,14 +510,17 @@ async fn download(
             Err(e) if e.is::<Unpacking>() => return Err(e),
             Ok(()) if have == pin.bytes => break,
             Ok(()) if tries + 1 == TRIES => {
-                anyhow::bail!("it ended at {have} of its {} bytes", pin.bytes)
+                // alloc: error path, the last failure, as below.
+                let gave_up = super::GaveUp { file: file.to_owned(), tries: TRIES };
+                return Err(anyhow::anyhow!("it ended at {have} of its {} bytes", pin.bytes).context(gave_up));
             }
-            Err(e) if tries + 1 == TRIES => return Err(e),
+            // alloc: error path, the last failure.
+            Err(e) if tries + 1 == TRIES => return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES })),
             _ => tries += 1,
         }
         tokio::time::sleep(Duration::from_secs(tries.into())).await;
     }
-    let got = crate::content::hex(&hasher.finalize());
+    let got = crate::content::hex(&hasher.finish());
     if got != pin.sha256 {
         drop(written);
         _ = std::fs::remove_file(part);
@@ -679,33 +686,33 @@ mod tests {
     }
 
     fn sha256(bytes: &[u8]) -> &'static str {
-        crate::content::hex(&Sha256::digest(bytes)).leak()
+        crate::content::hex(&blaze_sha256::digest(bytes)).leak()
     }
 
     /// A release of two packages, written as the Rust project's site has them into `dist`,
     /// and its pins.
     fn release(dist: &Path, rustc: &[u8]) -> Release {
-        let wasm = package(
-            "rust-std-9.9.9-wasm32-wasip1",
-            "rust-std-wasm32-wasip1",
-            &[("lib/rustlib/wasm32-wasip1/lib/libcore.rlib", "core\n")],
-            &["lib/rustlib/wasm32-wasip1"],
+        let stdlib = package(
+            "rust-std-9.9.9-test-host",
+            "rust-std-test-host",
+            &[("lib/rustlib/test-host/lib/libcore.rlib", "core\n")],
+            &["lib/rustlib/test-host"],
         );
         let manifest = b"[pkg.rust]\ngit_commit_hash = \"abc\"\n";
         std::fs::create_dir_all(dist).unwrap();
         std::fs::write(dist.join("rustc-9.9.9-test-host.tar.xz"), rustc).unwrap();
-        std::fs::write(dist.join("rust-std-9.9.9-wasm32-wasip1.tar.xz"), &wasm).unwrap();
+        std::fs::write(dist.join("rust-std-9.9.9-test-host.tar.xz"), &stdlib).unwrap();
         std::fs::write(dist.join("channel-rust-9.9.9.toml"), manifest).unwrap();
         let pins = format!(
             "# test\nrelease 9.9.9 2000-01-01 9.9.9\nrustc 9.9.9 (abc 2000-01-01)\nmanifest {} {}\n\
-             test-host rustc test-host {} {}\ntest-host rust-std wasm32-wasip1 {} {}\n\
+             test-host rustc test-host {} {}\ntest-host rust-std test-host {} {}\n\
              other-host rustc other-host {} 1\n",
             sha256(manifest),
             manifest.len(),
             sha256(rustc),
             rustc.len(),
-            sha256(&wasm),
-            wasm.len(),
+            sha256(&stdlib),
+            stdlib.len(),
             sha256(b"other"),
         );
         Release::read(pins.leak(), "test-host").unwrap()
@@ -751,9 +758,7 @@ mod tests {
                 "rustc-x86_64-unknown-linux-gnu",
                 "cargo-x86_64-unknown-linux-gnu",
                 "rust-std-x86_64-unknown-linux-gnu",
-                "rust-std-wasm32-wasip1",
-            ],
-            "proc macros are built for wasm32-wasip1 (blaze-macro-wasm), so its library is pinned"
+            ]
         );
         assert!(
             !names.iter().any(|it| it == "rust-src"),
@@ -762,7 +767,7 @@ mod tests {
         assert!(Release::read(PINS, "riscv64gc-unknown-linux-gnu").is_none());
         for host in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
         {
-            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 4, "{host}");
+            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 3, "{host}");
         }
     }
 
@@ -775,7 +780,7 @@ mod tests {
         fetched(&dist, &release, &dir).unwrap();
         assert!(complete(&release, &dir));
         let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();
-        assert_eq!(read("lib/rustlib/components"), "rustc-test-host\nrust-std-wasm32-wasip1\n");
+        assert_eq!(read("lib/rustlib/components"), "rustc-test-host\nrust-std-test-host\n");
         assert_eq!(
             read("lib/rustlib/manifest-rustc-test-host"),
             format!(
@@ -785,8 +790,8 @@ mod tests {
             )
         );
         assert_eq!(
-            read("lib/rustlib/manifest-rust-std-wasm32-wasip1"),
-            "file:lib/rustlib/wasm32-wasip1/lib/libcore.rlib\n"
+            read("lib/rustlib/manifest-rust-std-test-host"),
+            "file:lib/rustlib/test-host/lib/libcore.rlib\n"
         );
         assert_eq!(
             read("lib/rustlib/multirust-channel-manifest.toml"),
@@ -795,7 +800,7 @@ mod tests {
         assert_eq!(read("lib/rustlib/rust-installer-version"), "3");
         assert!(
             read("lib/rustlib/multirust-config.toml")
-                .contains("pkg = \"rust-std\"\ntarget = \"wasm32-wasip1\"\nis_extension = true")
+                .contains("pkg = \"rust-std\"\ntarget = \"test-host\"\nis_extension = false")
         );
         #[cfg(unix)]
         {

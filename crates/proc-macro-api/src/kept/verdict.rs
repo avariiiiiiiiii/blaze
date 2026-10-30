@@ -1,8 +1,6 @@
-//! What blaze has seen of whether a proc-macro crate's expansions leave state, as each host
-//! that runs macro code keeps it (`blaze-macro-wasm`'s modules, `blaze-macro-eval`'s crates):
-//! the store's verdict when the crate loaded, and what its runs in this process did since.
-//! Each host keeps the verdict in its own store under its own key; what is told when is the
-//! same.
+//! What blaze has seen of whether a proc-macro crate's expansions leave state, as
+//! `blaze-macro-eval` keeps it per crate: the store's verdict when the crate loaded, and what
+//! its runs in this process did since.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -70,8 +68,8 @@ impl Seen {
 mod tests {
     use super::*;
 
-    /// The tracking both hosts had (`blaze-macro-eval`'s `Library::saw`, `blaze-macro-wasm`'s
-    /// `Lazy::saw`, and their `flush`), told as what each did.
+    /// The tracking `blaze-macro-eval` had before this module (`Library::saw` and its `flush`),
+    /// told as what it did.
     #[derive(Default)]
     struct Old {
         ran: bool,

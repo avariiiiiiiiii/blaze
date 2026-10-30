@@ -15,10 +15,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-};
+use std::{ffi::OsString, path::Path};
 
 use blaze_api::ApiError;
 use blaze_build_script::unit as bs;
@@ -31,8 +28,8 @@ use blaze_usercode::{
     run::Value,
 };
 
-use super::{Of, compile_of, inherited, script_unit};
-use crate::serve::unit::{Job, UnitReader};
+use super::{Of, compile_of, inherited, named_program, script_unit};
+use crate::serve::unit::{Job, UnitReader, error::UnitError};
 
 /// The job's variable that asks a script whose pure key hit built and run as well, and checked
 /// against the kept value: `verify`, or unset.
@@ -55,7 +52,7 @@ pub(crate) fn verifies(job: &Job) -> Result<bool, ApiError> {
 /// says of each script.
 #[derive(Debug)]
 pub(crate) enum Purity {
-    /// The front end has no crate or no `main` for it: nothing was asked.
+    /// Its crate has no free `main` with a body (`hir_ty_pure::main_of`): nothing was asked.
     Unproved,
     /// Not proved pure: the first effect found, and the calls that reach it
     /// ([`hir_ty_pure::Impure::said`]). It runs in the sandbox, as any script.
@@ -122,7 +119,9 @@ pub(crate) fn built_nothing(job: &Job, unit: usize) -> bool {
 
 fn work_out(job: &Job, reader: &UnitReader, compile: usize) -> Result<Purity, ApiError> {
     let db = reader.db();
-    let Some(krate) = job.crates.krate(compile) else { return Ok(Purity::Unproved) };
+    let krate = job.crates.krate(compile).ok_or(UnitError::NoCrate { unit: compile })?;
+    // Not proved, so built and run in the sandbox as any script: the proof is asked of a free
+    // `main` only.
     let Some(main) = hir_ty_pure::main_of(db, krate) else { return Ok(Purity::Unproved) };
     let purity = hir_ty::attach_db(db, || hir_ty_pure::script_purity(db, main));
     let proved = match purity {
@@ -167,7 +166,7 @@ fn run_of(job: &Job, run: usize) -> Result<(bs::Unit, Vec<(OsString, OsString)>)
         host: &job.input.config.host,
         tools: &job.shared.tools,
         launcher: &job.shared.launcher,
-        program: PathBuf::from(units.plans[compile].outputs.first().cloned().unwrap_or_default()),
+        program: named_program(units, compile)?,
         scripts: &job.scripts,
     };
     // alloc: the edge: the error the build stops with

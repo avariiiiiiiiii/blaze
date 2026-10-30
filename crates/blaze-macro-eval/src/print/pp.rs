@@ -498,11 +498,13 @@ mod tests {
         p.reset();
         let mut out = String::new();
         assert!(p.is_beginning_of_line());
+        p.ibox(0);
         p.word("a", &mut out);
         assert!(!p.is_beginning_of_line());
         p.hardbreak();
         assert!(p.is_beginning_of_line());
         p.word("b", &mut out);
+        p.end();
         p.eof(&mut out);
         assert_eq!(out, "a\nb");
     }

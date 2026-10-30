@@ -1531,31 +1531,6 @@ pub(super) fn cast(from: Shape, to: Shape) -> std::result::Result<Option<String>
     Ok(Some(text))
 }
 
-/// Whether the signature of `func` with `args` (its own parameters when `None`) has a
-/// scalable vector, which rustc's code passes in SVE registers.
-pub(super) fn passes_scalable(
-    db: &Db,
-    func: FunctionId,
-    args: Option<GenericArgs<'_>>,
-    env: &StoredParamEnvAndCrate,
-) -> bool {
-    let interner = DbInterner::new_no_crate(db);
-    let sig = db.callable_item_signature(func.into());
-    let sig = match args {
-        Some(args) => sig.instantiate(interner, args),
-        None => sig.instantiate_identity(),
-    }
-    .skip_binder();
-    // A scalable vector type has no lifetimes nor parameters, so one with late-bound lifetimes
-    // (`&'a T`) or parameters is none.
-    let concrete = |ty: &Ty<'_>| !ty.has_escaping_bound_vars() && !ty.has_param();
-    sig.inputs_and_output.iter().filter(concrete).any(|ty| {
-        // clone: `layout_of_ty` takes the env by value; an interned handle, a count's bump
-        db.layout_of_ty(ty.store(), env.clone())
-            .is_ok_and(|it| matches!(it.backend_repr, BackendRepr::SimdScalableVector { .. }))
-    })
-}
-
 impl<'db> FunctionCx<'_, 'db> {
     /// The value of a constant operand of an integer or fieldless enum type, as the type's
     /// signedness extends it: `core::arch` gives an SVE intrinsic its immediates as such, as

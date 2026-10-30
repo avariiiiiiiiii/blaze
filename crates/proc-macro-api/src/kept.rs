@@ -11,8 +11,8 @@
 //! database or revision has the same key. The value is the output with its spans written the
 //! same way ([`written`]). What else it read (files, variables of the shell, a listing) the
 //! host that ran it traced, and the result is found and kept by exactly those through
-//! [`blaze_usercode::index`]. The hosts that run macro code (`blaze-macro-eval`,
-//! `blaze-macro-wasm`) key, find and put their expansions with what is here ([`keeping`]).
+//! [`blaze_usercode::index`]. `blaze-macro-eval`, which runs macro code, keys, finds and puts
+//! its expansions with what is here ([`keeping`]).
 //!
 //! Not kept: an expansion that asked the database about a span (its text, file or line),
 //! since the key does not say what it was told; one whose output has an anchor or a context
@@ -25,6 +25,7 @@
 //! reads the store, and what it keeps it leaves in its worker's own buffer for the store's
 //! owner ([`puts`]); its statistics are its worker's ([`tally`]).
 
+pub mod env;
 pub mod puts;
 pub mod tally;
 pub mod verdict;
@@ -46,12 +47,13 @@ use blaze_usercode::{
 use hir_expand::proc_macro::ProcMacroKind;
 use span::{Span, SpanAnchor, SyntaxContext};
 
+pub use self::env::{Environment, SET};
 pub use self::puts::{Published, Put, publish, put, take_puts};
-use crate::{
-    bridge::wire::{self, Parts},
-    version::CURRENT_API_VERSION,
-    warm::{self, Environment},
-};
+use crate::bridge::wire::{self, Parts};
+
+/// The version of what a macro is given and gives back that expansions are kept under: a
+/// change to either bumps it, so nothing kept before is found.
+const ABI: u32 = 8;
 
 /// What the content ID of a macro's library is made with.
 pub const LIBRARY: &str = "blaze v2 proc-macro library 1";
@@ -88,7 +90,7 @@ pub struct Expansions {
     pub store: Reader,
     /// The toolchain whose proc-macro ABI and library the macros are built with.
     pub toolchain: ContentId,
-    /// What warm servers pass through to the expansions, which they are checked against.
+    /// What the user's shell passes through to the expansions, which they are checked against.
     pub environment: Arc<Environment>,
 }
 
@@ -112,7 +114,7 @@ struct Seen<'a> {
 
 impl<'a> Seen<'a> {
     /// The value [`Environment::seen`] gives `name`: the call's, over what is passed, over
-    /// what blaze sets for a server ([`warm::SET`]). A name that is not UTF-8 is none of them.
+    /// what blaze sets for every expansion ([`SET`]). A name that is not UTF-8 is none of them.
     fn value(&self, name: &std::ffi::OsStr) -> Option<&'a str> {
         let name = name.to_str()?;
         if let Some((_, value)) = self.call.iter().find(|it| it.0 == name) {
@@ -121,7 +123,7 @@ impl<'a> Seen<'a> {
         if let Some((_, value)) = self.passed.iter().rev().find(|it| it.0 == name) {
             return Some(value.as_str());
         }
-        warm::SET.iter().find(|it| it.0 == name).map(|it| it.1)
+        SET.iter().find(|it| it.0 == name).map(|it| it.1)
     }
 }
 
@@ -176,8 +178,7 @@ pub fn install(expansions: Expansions) -> Result<(), String> {
     INSTALLED.set(Installed { expansions, mode }).map_err(|_| "proc-macro expansions were installed twice".to_owned())
 }
 
-/// Where a host that keys its own expansions (blaze-macro-eval's, blaze-macro-wasm's) keeps
-/// them, and how.
+/// Where blaze-macro-eval keeps the expansions it keys, and how.
 #[derive(Clone, Copy)]
 pub struct Keeping {
     pub expansions: &'static Expansions,
@@ -200,7 +201,7 @@ pub fn reads_now(env: &Env, shape: &[u8]) -> Result<ContentId, String> {
     reads_in(installed.expansions.environment.passed(), env, shape)
 }
 
-/// [`reads_now`] for a server passed `passed`.
+/// [`reads_now`] for expansions passed `passed`.
 fn reads_in(passed: &[(String, String)], env: &Env, shape: &[u8]) -> Result<ContentId, String> {
     let mut now = Seen { passed, call: env, made: None, none: inputs::Env::default() };
     match index::values(shape, &mut now) {
@@ -299,8 +300,7 @@ fn kind_byte(kind: ProcMacroKind) -> u8 {
 }
 
 /// What `call` gives the macro, for its [`RunKey::given`] with the toolchain `toolchain`, and
-/// the anchors and contexts its output is written against. A wasm macro's caller adds what
-/// else it gives a module.
+/// the anchors and contexts its output is written against.
 ///
 /// The trees are hashed as their own columns made relative ([`wire::relative`]: each span
 /// part an index of the call's, the def, call and mixed sites' first), and the parts as the
@@ -315,7 +315,7 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
     given
         .part("name", call.name.as_bytes())
         .part("kind", &[kind_byte(call.kind)])
-        .part("abi", &CURRENT_API_VERSION.to_le_bytes())
+        .part("abi", &ABI.to_le_bytes())
         .id("toolchain", toolchain)
         .part("dir", call.current_dir.as_bytes());
     with_scratch(|scratch| {

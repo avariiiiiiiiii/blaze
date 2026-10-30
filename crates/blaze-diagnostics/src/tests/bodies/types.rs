@@ -13,7 +13,7 @@ use crate::{
 
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`).
 fn ui_core(name: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:2015\n{source}");
+    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:other:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
@@ -422,12 +422,12 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0525`.
 "##;
     let fixture = format!(
-        "//- minicore: fn\n//- /std.rs crate:std deps:core\n\
+        "//- minicore: fn\n//- /std.rs crate:std\n\
          pub mod prelude {{ pub mod rust_2021 {{ pub use core::prelude::rust_2021::*; pub use crate::string::String; }} }}\n\
          pub mod string {{ pub struct String; }}\n\
          #[macro_export]\n\
          macro_rules! format {{ ($($arg:tt)*) => {{ $crate::string::String }}; }}\n\
-         //- /closure-origin-tuple-diagnostics.rs crate:main edition:2021 deps:std\n{source}"
+         //- /closure-origin-tuple-diagnostics.rs crate:other:main edition:2021 deps:std\n{source}"
     );
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     assert_eq!(normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })), stderr);
@@ -561,7 +561,7 @@ LL | {text} `_` not allowed here
 #[test]
 fn an_unmet_bound_inside_an_assert_eq_like_macro_is_reported() {
     let fixture = "//- minicore: sized
-//- /main.rs crate:main
+//- /main.rs crate:other:main
 trait Debug {}
 struct Digest;
 struct Wrapper<T>(T);
@@ -1375,7 +1375,7 @@ LL |     unwrap_binder!(y);
 error: aborting due to 2 previous errors
 
 ";
-    let fixture = format!("{STD_UNSAFE_BINDER}//- /mismatch.rs crate:main edition:2021 deps:std\n{source}");
+    let fixture = format!("{STD_UNSAFE_BINDER}//- /mismatch.rs crate:other:main edition:2021 deps:std\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     assert_eq!(normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })), stderr);
 }

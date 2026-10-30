@@ -1,7 +1,7 @@
 ---
 status: plan
-summary: lane dedup (2026-10-29): one implementation per primitive (bit sets, CRC32C, radix sort, LEB128, timing wheels, pools, arenas, alignment, file mapping, interners, and every copy-paste run the scan finds), in the crate that owns that kind of thing, every caller moved onto it and the copies deleted.
-date: 2026-10-29
+summary: lane dedup (2026-10-29): one implementation per primitive (bit sets, CRC32C, radix sort, LEB128, timing wheels, pools, arenas, alignment, file mapping, interners, and every copy-paste run the scan finds), in the crate that owns that kind of thing, every caller moved onto it and the copies deleted. Round 2 (2026-10-30): one crate, engine and library per job, the v2 one.
+date: 2026-10-30
 ---
 # dedup
 
@@ -67,3 +67,96 @@ not memory, and are compared only with each other.
 | `dedup-sim-front`, `dedup-sim-edge`, `dedup-sim-diag` | the semantic duplicate report's cross-crate groups (`tools/similar`), by area |
 | `dedup-sim-rest` | the 20 cross-crate groups of 15+ lines no other part owned after the report's rerun on 2026-10-29 |
 | `dedup-scan` | every other copy-paste run (diagnostics against `blaze-lints`, cargo crates against `blaze-units`, edit distance, test databases, code-identity hashing, small helpers) |
+
+## Round 2 (2026-10-30): one crate, engine and library per job
+
+Andrew, 2026-10-30: "anything else that is duplicate? deduplicate and always do the modern
+way." Each job done twice gets one owner, the v2 design's; every user moves onto it and the
+other is deleted in the same change, with no re-export under the old name. Two crates that do
+different jobs are listed as such, with the evidence. Progress and per-group detail:
+`/tmp/blaze-lanes/v2-dedup.md`.
+
+### Proc macros: one engine, `blaze-macro-eval`
+
+Four hosts run a proc macro today:
+
+| host | crates | called by |
+|---|---|---|
+| in process on blaze's own compiler (MIR evaluator, the real `library/proc_macro`) | `blaze-macro-eval` | the build: `blaze-cargo/src/serve/unit/compile.rs` `macros` calls `blaze_macro_eval::load` for every proc-macro unit |
+| WebAssembly under Wasmtime | `blaze-macro-wasm` (`lib.rs`, `wasi.rs`, `keyed.rs`, `rule.rs`, `bench.rs`, `guest/`) | nothing on the build path: `blaze-cargo` lists it in its manifest and names it nowhere in its source; `blaze-macro-eval`'s corpus test compares against it; fuzz targets `macro_wasm_*` |
+| native in process, against blaze's `proc_macro` | `blaze-macro-wasm/src/native.rs`, `native/proc_macro` | `blaze-macro-eval`'s corpus and `kept` tests, as a second host to compare with; `proc-macro-api::bridge::wire` takes its span-part constants |
+| rust-analyzer's out-of-process server, loading rustc-built dylibs | `proc-macro-srv`, `proc-macro-srv-cli`, the client half of `proc-macro-api` (`process.rs`, `legacy_protocol/`, `bidirectional_protocol/` but its `msg` types, the server pool in `warm.rs`, `ProcMacroClient`) | `blaze-macro-wasm/src/bench.rs` and fuzz targets `proc_macro_*` only |
+
+v2's is `blaze-macro-eval`: `plan/design/compile-time.md` change 20 ("proc macros run on our
+own compiler, in process"), which supersedes usercode's "wasm where the crate allows, native in
+the sandbox otherwise" (`lanes/usercode.md`, 6.5, and its #1297 note), and it is the only one
+the build calls. The others are second engines for the same job: a macro `blaze-macro-eval`
+can't run stops with its error naming the macro (no-fallback), it does not move to another
+host. The out-of-process server also runs code rustc compiled (no-rustc).
+
+What goes: `proc-macro-srv`, `proc-macro-srv-cli`, `blaze-macro-wasm` and `blaze-wasi` (whose
+wasm build scripts nothing calls either: `blaze-cargo`'s `wasi` feature names it and no source
+does), the client half of `proc-macro-api`, the fuzz targets of the deleted code, and
+`blaze-cargo`'s pin of the `wasm32-wasip1` standard library for proc macros
+(`toolchain/own.rs`). That takes Wasmtime out of the graph, which is what brings most of the
+lock's second versions (`wasmparser`, `wit-*`, `wasm-*`, `object`, `gimli`).
+
+What stays, and where: `proc-macro-api`'s `kept` (the store of expansions, which the build and
+`blaze-macro-eval` use), `bridge` (`wire`, `lex`, `spans`: `blaze-macro-eval`'s server speaks
+them) and the `bidirectional_protocol::msg` span questions `blaze-lower/src/answer.rs` answers.
+The span-part constants `bridge::wire` takes from `native/proc_macro` move into `bridge::wire`
+itself. `blaze-macro-eval`'s corpus test keeps its own oracle, the fixture's tests
+(`tests/corpus/ws/calls/src/tests.rs`), and loses only the comparisons with the deleted hosts.
+
+Agreed by the coordinator before any deletion (asked 2026-10-30 in the queue). Done
+2026-10-30 (dedup-engines): the crates above are deleted with their fuzz targets, the
+`wasm32-wasip1` pin, `build_release.py --server` and the workflows' server steps; a load error
+is `ProcMacroLoadingError::Refused`, naming the crate, where it said "proc macro server error".
+
+### Hashes: BLAKE3 for blaze's own data
+
+Every hash blaze makes of its own data is BLAKE3 through `blaze_ids::b3`: the assembly cache
+key and closure and `hashed` symbol names in `hir-ty-codegen`, `library/DIGEST` (Rust's
+`digest_of` and `harness/library.py`, which runs `b3sum`), the sandbox library's cache name
+(hashed at run time, so `blaze-cargo/build.rs` has no build dependency), Windows sandbox temp
+directories, `STD_SCRIPT` in `blaze-engine`, and the release check of a pinned blaze, which
+reads `B3SUMS`. SHA-256 is `blaze-sha256`, only where an outside format names it: crates.io
+checksums, the Rust release's channel-manifest pins (`toolchain/own.rs`), Mach-O code signatures
+and `install.sh`'s `SHA256SUMS`. SHA-1 is only the WebSocket accept key (`blaze-web`).
+
+### Lexers: the pinned nightly's `rustc_lexer`
+
+`crates/rustc_lexer` is `compiler/rustc_lexer` at the pinned nightly, re-vendored on every bump;
+crates.io's `ra-ap-rustc_lexer` 0.166 is an older snapshot whose one difference is that it
+does not lex `k#ident` (`ForcedKeywordIdent`). The pinned one is kept; its nine users move to it
+once the front end has rustc's rule for the new token (queued to lane format). `parser`'s fast
+lexer is not a second lexer: it handles the common token classes and asks `rustc_lexer` for
+every other token, and a differential test holds the two equal.
+
+### Two crates, two jobs
+
+| crates | why both stay |
+|---|---|
+| `blaze-build-script`, `blaze-usercode` | cargo's build-script protocol (environment, directives); the keying, tracing and store of a run above it. `blaze-wasi`, a second runner nothing calls, goes with the proc-macro engines. |
+| `blaze-fuzz`, `fuzz/` | corpora replayed inside ordinary tests, with an allocation guard; the coverage-guided engine that writes corpora in the same format. |
+| `blaze-codegen`, `hir-ty-codegen` | function instances, keys and compiled code (no backend); the backends that make the code. |
+| `blaze-cache`, `blaze-cache-macros` | the user-facing library of the `#[blaze::cache]` extension (docs/fn-cache.md), compiled into user programs; not a store of blaze's own. |
+
+Patching a running program is done twice (`blaze-live` and `blaze-inproc`); `blaze-inproc` is
+v2's, and moving `blaze-live` onto it is with lane link.
+
+### One place for every dependency
+
+The root `[workspace.dependencies]` is the only place a version, path or git source is written;
+members say `workspace = true` and add only `features`, `optional` or `default-features`, and a
+root entry no member uses is deleted. `tools/v2/manifest_lint.py` holds the tree to both. A
+second version left in `Cargo.lock` is forced by an upstream's newest release, as follows:
+
+| duplicate | forced by |
+|---|---|
+| `object` 0.39 beside 0.40 | `thorin-dwp` 0.11 and `ar_archive_writer` 0.5.3 (0.40 is cranelift 0.137's) |
+| `gimli` 0.33 beside 0.34 | cranelift 0.137 (0.34 is `thorin-dwp` 0.11's) |
+| `sha2`, `sha1`, `digest` 0.10 beside 0.11 | cranelift-codegen's incremental cache and `aws-config` 1.13 |
+| `syn` 2 beside 3 | both majors are in use upstream (syn 2: `serde_derive`, `thiserror-impl`, `tracing-attributes`, `zerocopy-derive`; syn 3: `clap_derive`, `async-trait`, `rkyv_derive`); the workspace's own `syn` is 2, which `synstructure` needs |
+| `rand` 0.8, `thiserror` 1, `nix` 0.23, `bitflags` 1, `memoffset` 0.6, `windows` 0.34 and 0.62 | `tango-bench` 0.9.0 (its newest), blaze-bench's paired benchmark harness, a dev-dependency only |
+| `unicode-width` 0.1 | `blaze-fmt` keeps the pinned nightly rustfmt's versions (`rustfmt-unicode-width`) |

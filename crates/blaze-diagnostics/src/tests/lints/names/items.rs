@@ -206,7 +206,7 @@ fn improper_ctypes_of_a_foreign_struct() {
 #[repr(C)]
 pub struct Good { pub x: u8 }
 pub struct Bad { pub x: u8 }
-//- /main.rs crate:main deps:dep
+//- /main.rs crate:other:main deps:dep
 #![allow(dead_code)]
 use dep::{Bad, Good};
 extern "C" {
@@ -242,7 +242,7 @@ fn clashing_extern_declarations_are_per_crate() {
 extern "C" {
     pub fn clash(x: u8);
 }
-//- /main.rs crate:main deps:dep
+//- /main.rs crate:other:main deps:dep
 #![allow(dead_code)]
 extern "C" {
     fn clash(x: u16);
@@ -263,7 +263,7 @@ fn main() {}
 #[test]
 fn runtime_symbols() {
     let source = include_str!("items/runtime-symbols.rs");
-    let fixture = format!("{FFI_STD}//- /runtime-symbols.rs crate:main edition:2021 deps:core,std\n{source}");
+    let fixture = format!("{FFI_STD}//- /runtime-symbols.rs crate:other:main edition:2021 deps:core,std\n{source}");
     let stderr = ui_fixture(&fixture).replace("*const i8", "*const U8").replace("*const u8", "*const U8");
     assert_eq!(stderr, include_str!("items/runtime-symbols.stderr"));
 }
@@ -287,7 +287,7 @@ mod inner {
 pub extern "C" fn memset(s: *mut c_void, c: i64, n: usize) -> *mut c_void { s }
 fn main() {}
 "#;
-    let fixture = format!("{FFI_STD}//- /main.rs crate:main edition:2021 deps:core,std\n{source}");
+    let fixture = format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
     let checked = checked(&fixture);
     let messages = checked.messages();
     assert_eq!(
@@ -305,7 +305,7 @@ fn main() {}
 #[test]
 fn c_void_returns() {
     let source = include_str!("items/c-void-returns.rs");
-    let fixture = format!("{FFI_STD}//- /c-void-returns.rs crate:main edition:2015 deps:core,std\n{source}");
+    let fixture = format!("{FFI_STD}//- /c-void-returns.rs crate:other:main edition:2015 deps:core,std\n{source}");
     assert_eq!(ui_fixture(&fixture), include_str!("items/c-void-returns.stderr"));
 }
 
@@ -328,7 +328,7 @@ fn f() {
 }
 fn main() {}
 "#;
-    let fixture = format!("{FFI_STD}//- /main.rs crate:main edition:2021 deps:core,std\n{source}");
+    let fixture = format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
     let messages = checked(&fixture).messages();
     let extern_ = "declarations returning `c_void` are not compatible with C functions returning `void`";
     assert_eq!(messages, [extern_, extern_], "{messages:?}");
@@ -376,7 +376,7 @@ trait Provided {
 }
 fn main() {}
 "#;
-    let fixture = format!("{FFI_STD}//- /main.rs crate:main edition:2021 deps:core,std\n{source}");
+    let fixture = format!("{FFI_STD}//- /main.rs crate:other:main edition:2021 deps:core,std\n{source}");
     let messages = checked(&fixture).messages();
     let named = "hiding a lifetime that's named elsewhere is confusing";
     let eliding = "eliding a lifetime that's named elsewhere is confusing";
@@ -433,10 +433,10 @@ trait Tr {
 fn not_async() {}
 fn main() {}
 "#;
-    let fixture = format!("//- /main.rs crate:main edition:2021\n{source}");
+    let fixture = format!("//- /main.rs crate:other:main edition:2021\n{source}");
     let messages = checked(&fixture).messages();
     assert_eq!(messages, ["`#[track_caller]` on async functions is a no-op"], "{messages:?}");
-    let gated = format!("//- /main.rs crate:main edition:2021\n#![feature(async_fn_track_caller)]\n{source}");
+    let gated = format!("//- /main.rs crate:other:main edition:2021\n#![feature(async_fn_track_caller)]\n{source}");
     let messages = checked(&gated).messages();
     assert!(!messages.iter().any(|it| it.contains("no-op")), "{messages:?}");
 }
@@ -487,7 +487,7 @@ fn main() {
     }
 }
 "#;
-    let fixture = format!("//- /main.rs crate:main edition:2021\n{source}");
+    let fixture = format!("//- /main.rs crate:other:main edition:2021\n{source}");
     let checked = checked(&fixture);
     let messages = checked.messages();
     let message = "non-local `macro_rules!` definition, `#[macro_export]` macro should be written at top level module";

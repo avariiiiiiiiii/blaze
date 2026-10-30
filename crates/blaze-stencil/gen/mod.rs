@@ -85,5 +85,5 @@ fn library(variant: Variant) -> Result<Vec<u8>, Vec<String>> {
     if !refusals.is_empty() {
         return Err(refusals);
     }
-    Ok(writer.finish(|bytes| *blake3::hash(bytes).as_bytes()).unwrap_or_else(|e| panic!("the {name} library: {e}")))
+    Ok(writer.finish(blaze_ids::b3::hash).unwrap_or_else(|e| panic!("the {name} library: {e}")))
 }

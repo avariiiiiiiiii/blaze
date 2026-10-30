@@ -369,7 +369,7 @@ impl<'db> CastCheck<'db> {
                 .is_ok()
             {
             } else {
-                never!(
+                unreachable!(
                     "could not cast from reference to array to pointer to array ({:?} to {:?})",
                     self.expr_ty,
                     array_ptr_type

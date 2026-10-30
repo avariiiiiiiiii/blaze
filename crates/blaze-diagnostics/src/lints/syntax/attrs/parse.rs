@@ -865,7 +865,8 @@ mod tests {
             Target::Expression,
         ];
         let (names, only) = applied(&krate, allowed, Target::Struct);
-        assert_eq!(names, ["functions", "methods", "statics"]);
+        // The methods are functions: the first group takes them, so none is left for "methods".
+        assert_eq!(names, ["functions", "statics"]);
         assert!(!only);
     }
 

@@ -217,5 +217,5 @@ LL +     let Some(name) = case else {
 warning: 3 warnings emitted
 
 "##;
-    assert_eq!(ui_std("let-else-irrefutable.rs", "2015", "sized,fmt,option", std_items, source), stderr);
+    assert_eq!(ui_std("let-else-irrefutable.rs", "2015", "sized, fmt, option", std_items, source), stderr);
 }

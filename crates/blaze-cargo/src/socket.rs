@@ -114,7 +114,7 @@ impl Served {
                 // The address fits, but the one it is made at first does not. It is made in
                 // the same directory through a short name, so the rename stays atomic.
                 let tmp = Path::new("/tmp");
-                let nonce = getrandom::u64().map_err(|e| io::Error::other(e.to_string()))?;
+                let nonce: u64 = std::random::random(..);
                 let short = tmp.join(format!(".blaze-{nonce:016x}"));
                 let through = || -> io::Result<UnixListener> {
                     let target = std::path::absolute(&made_in)?;
@@ -144,12 +144,16 @@ impl Served {
     }
 
     /// The connections made to the socket, one after another, each with its place among
-    /// the ones served at a time. One made when there are as many as that is closed, and
-    /// said so on the standard error.
-    pub fn incoming(&self) -> impl Iterator<Item = (UnixStream, Open)> {
-        self.listener.incoming().flatten().filter_map(|stream| {
+    /// the ones served at a time, or why one could not be taken. One made when there are as
+    /// many as that is closed, and said so on the standard error.
+    pub fn incoming(&self) -> impl Iterator<Item = io::Result<(UnixStream, Open)>> {
+        self.listener.incoming().filter_map(|stream| {
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(error) => return Some(Err(error)),
+            };
             if self.open.fetch_add(1, Ordering::Relaxed) < self.most {
-                return Some((stream, Open(self.open.clone())));
+                return Some(Ok((stream, Open(self.open.clone()))));
             }
             self.open.fetch_sub(1, Ordering::Relaxed);
             eprintln!("a connection is closed: {} are open", self.most);
@@ -488,7 +492,7 @@ mod tests {
         );
         // The peer of a connection from this process is this user.
         let _client = UnixStream::connect(dir.join("sock")).unwrap();
-        let (peer, _open) = served.incoming().next().unwrap();
+        let (peer, _open) = served.incoming().next().unwrap().unwrap();
         assert_eq!(peer_user(&peer).unwrap(), user());
         check_peer(&peer).unwrap();
 
@@ -509,7 +513,7 @@ mod tests {
         let served = Served::bind(&dir.join("sock")).unwrap();
         let connect = || {
             let client = UnixStream::connect(dir.join("sock")).unwrap();
-            (client, served.incoming().next().unwrap().0)
+            (client, served.incoming().next().unwrap().unwrap().0)
         };
         let short = Duration::from_millis(100);
 
@@ -594,7 +598,7 @@ mod tests {
         let served = Served::bind(&dir.join("sock")).unwrap();
         let mut client = connect(&dir.join("sock")).unwrap();
         client.write_all(b"sync\n").unwrap();
-        let (stream, _open) = served.incoming().next().unwrap();
+        let (stream, _open) = served.incoming().next().unwrap().unwrap();
         read_request(&stream).unwrap();
         stream.set_write_timeout(Some(Duration::from_millis(100))).unwrap();
         let began = Instant::now();
@@ -616,7 +620,7 @@ mod tests {
         let served = Served::bind(&dir.join("sock")).unwrap();
         let mut client = connect(&dir.join("sock")).unwrap();
         client.write_all(b"sync\n").unwrap();
-        let (stream, _open) = served.incoming().next().unwrap();
+        let (stream, _open) = served.incoming().next().unwrap().unwrap();
         assert_eq!(stream.write_timeout().unwrap(), None);
         read_request(&stream).unwrap();
         assert_eq!(stream.write_timeout().unwrap(), Some(REPLY_TIMEOUT));
@@ -632,12 +636,12 @@ mod tests {
         let clients: Vec<UnixStream> =
             (0..3).map(|_| connect(&dir.join("sock")).unwrap()).collect();
         let mut incoming = served.incoming();
-        let first = incoming.next().unwrap();
-        let second = incoming.next().unwrap();
+        let first = incoming.next().unwrap().unwrap();
+        let second = incoming.next().unwrap().unwrap();
         assert_eq!(served.open.load(Ordering::Relaxed), 2);
         let fourth = std::thread::scope(|scope| {
             // The third is closed, and the one after it is waited for.
-            let next = scope.spawn(|| incoming.next().unwrap());
+            let next = scope.spawn(|| incoming.next().unwrap().unwrap());
             let mut end = String::new();
             assert_eq!((&clients[2]).read_to_string(&mut end).unwrap_or(0), 0);
             drop(first);

@@ -108,16 +108,6 @@ impl<'db> Mentions<'db> {
     }
 }
 
-/// The crates the name of an instance mentions, or `None` when one of them can't be told. Only
-/// a crate that depends on all of them can have compiled a copy of it.
-pub(super) fn mentioned_crates(
-    db: &Db,
-    instance: &Instance,
-) -> Option<FxHashSet<Crate>> {
-    let mentions = Mentions::of(db, instance);
-    (!mentions.opaque).then_some(mentions.crates)
-}
-
 /// The function the code of an instance is written in: its own, or the one a closure or an
 /// `async` block is in. The symbol of every copy of the instance has its name.
 pub(super) fn written_in(db: &Db, instance: &Instance) -> Option<FunctionId> {
@@ -137,46 +127,6 @@ pub(super) fn written_in(db: &Db, instance: &Instance) -> Option<FunctionId> {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => Some(func),
         _ => None,
     }
-}
-
-/// The files with the bodies an instance has the code of or mentions a type of: those of its
-/// function and of the closures, futures and functions it is instantiated with. `None` when
-/// that can't be told.
-pub fn body_files(db: &Db, instance: &Instance) -> Option<Box<[FileId]>> {
-    let mentions = Mentions::of(db, instance);
-    if mentions.opaque {
-        return None;
-    }
-    // alloc: the result, owned by the caller; one exact block, sorted in place
-    let mut files: Vec<FileId> = mentions.bodies.into_iter().map(|it| body_file(db, it)).collect();
-    blaze_ids::radix::sort_copy_by_key(&mut files, |it| it.index());
-    files.dedup();
-    Some(files.into())
-}
-
-/// The bodies the code of an instance depends on beyond its name: the one it is written in,
-/// when it has one; those it mentions a coroutine of, whose layout is of the whole body; and
-/// those that give the `impl Trait`s it mentions their types, with the closures and coroutines
-/// in those. A closure or function its name mentions is in it whole, with what the closure
-/// captures. `None` when that can't be told.
-pub(super) fn bodies_of(
-    db: &Db,
-    instance: &Instance,
-) -> Option<(Option<DefWithBodyId>, Vec<DefWithBodyId>)> {
-    let mut mentions = Mentions::looking(db, instance, true);
-    if mentions.opaque {
-        return None;
-    }
-    mentions.coroutines.append(&mut mentions.hidden);
-    let written = match instance.def {
-        InstanceDef::Fn(_)
-        | InstanceDef::VtableShim(_)
-        | InstanceDef::Closure(_)
-        | InstanceDef::Coroutine(_)
-        | InstanceDef::CoroutineByMove(_) => mentions.bodies.first().copied(),
-        _ => None,
-    };
-    Some((written, mentions.coroutines.into_vec()))
 }
 
 /// The file a body is written in, which for one a macro makes is where the macro is called.

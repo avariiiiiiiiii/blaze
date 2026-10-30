@@ -295,6 +295,13 @@ fn interpretable(funcs: &[ir::Function]) -> Vec<bool> {
             let unsupported = func.layout.blocks().any(|block| {
                 func.layout.block_insts(block).any(|inst| match func.dfg.insts[inst].opcode() {
                     Opcode::TryCall | Opcode::TryCallIndirect => true,
+                    // The extending vector loads, which its `step` leaves unimplemented.
+                    Opcode::Uload8x8
+                    | Opcode::Sload8x8
+                    | Opcode::Uload16x4
+                    | Opcode::Sload16x4
+                    | Opcode::Uload32x2
+                    | Opcode::Sload32x2 => true,
                     Opcode::AvgRound => func.dfg.ctrl_typevar(inst).is_vector(),
                     _ => false,
                 })

@@ -1723,6 +1723,7 @@ fn batches_in_any_order_and_refused_ones_match_the_reference() {
 fn a_long_lived_plane_says_to_each_request_what_a_fresh_one_says() {
     let mut long = Plane::new(config(2, 3)).unwrap();
     let mut buffer = Vec::new();
+    let mut at = 0;
     for round in 0..50u32 {
         let mut random = SplitMix64::new(u64::from(round));
         let count = 1 + random.below(40) as u32;
@@ -1740,15 +1741,15 @@ fn a_long_lived_plane_says_to_each_request_what_a_fresh_one_says() {
             long.step_into(input, &mut buffer).unwrap();
             let got: Vec<PlaneOutput> = buffer.drain(..).collect();
             // A request's id and its nodes' ids are the same each round; only the plane's
-            // order of adding moves on, which no output says.
+            // order of adding and its clock move on, and the clock never goes back, so the
+            // fresh plane is given the same times.
             assert_eq!(got, want, "round {round}");
             got
         };
-        let open = PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going: true, idle: false };
+        let open = PlaneInput::Open { at_ns: at, request, weight: 1, keep_going: true, idle: false };
         both(open, &mut fresh);
-        let mut running = runs(&both(PlaneInput::Add { at_ns: 0, request, nodes }, &mut fresh));
-        both(PlaneInput::Close { at_ns: 0, request }, &mut fresh);
-        let mut at = 0;
+        let mut running = runs(&both(PlaneInput::Add { at_ns: at, request, nodes }, &mut fresh));
+        both(PlaneInput::Close { at_ns: at, request }, &mut fresh);
         let mut over = false;
         while let Some(id) = running.pop() {
             at += 1;

@@ -6,17 +6,12 @@
 //! version its `Cargo.lock` pins. Its calls are expanded as the front end expands them (each
 //! calling crate's def map) with every macro blaze-macro-eval's. These tests check that every
 //! call expands, each panic says the macro's message, and the macros that read files,
-//! variables and state read the caller's. Where blaze has another host of the same macro
-//! (blaze's WebAssembly host where a module is named, and the fixture's own macros built into
-//! this test against blaze's in-process bridge, `corpus/native.rs`), the outputs must be the
-//! same token for token, spans' shapes included. What each expansion does is held by the
-//! fixture's own tests (`ws/calls/src/tests.rs`), which the harness runs on blaze's build.
+//! variables and state read the caller's. What each expansion does is held by the fixture's own
+//! tests (`ws/calls/src/tests.rs`), which the harness runs on blaze's build.
 //!
 //! What it needs is one JSON value in `BLAZE_MACRO_CORPUS` (`corpus/config.rs`): the harness
 //! fetches the workspace's packages, builds it with `blaze build -p corpus-calls` (so each build
 //! script, std's among them, has run) and runs these with `--ignored`.
-
-extern crate native_proc_macro as proc_macro;
 
 #[allow(dead_code, reason = "shared with tests/kept.rs, which uses other parts of it")]
 #[path = "corpus/config.rs"]
@@ -24,20 +19,18 @@ mod config;
 #[allow(dead_code, reason = "shared with tests/kept.rs, which uses other parts of it")]
 #[path = "corpus/load.rs"]
 mod load;
-#[path = "corpus/native.rs"]
-mod native;
 #[allow(dead_code, reason = "shared with tests/kept.rs, which uses other parts of it")]
 #[path = "corpus/record.rs"]
 mod record;
 
 use std::sync::OnceLock;
 
-use base_db::{AbsPathBuf, Crate};
+use base_db::Crate;
 use hir_def::nameres::{crate_def_map, diagnostics::DefDiagnosticKind};
-use hir_expand::proc_macro::{ProcMacro, ProcMacroKind, ProcMacroLoadResult};
+use hir_expand::proc_macro::{ProcMacro, ProcMacroKind};
 
 use config::Corpus;
-use record::{Outcome, Record, Recorder, Referee, Reference};
+use record::{Outcome, Record, Recorder};
 
 /// Every call of the workspace's two calling crates, in the order the front end made them.
 struct Expanded {
@@ -56,16 +49,11 @@ fn expanded() -> &'static Expanded {
     }
 }
 
-/// The macros of crate `krate` that `what` (another host's library) has.
-fn loaded(what: &str, krate: &str, loaded: ProcMacroLoadResult) -> Result<Vec<ProcMacro>, String> {
-    loaded.map_err(|error| format!("loading {what} of `{krate}`: {error}"))
-}
-
 fn expand() -> Result<Expanded, String> {
     let config = Corpus::read()?;
     let records = record::Records::default();
     let workspace =
-        load::lower(&config.workspace, &config.cargo_home, |krate, macros| wrap(&config, krate, macros, &records))?;
+        load::lower(&config.workspace, &config.cargo_home, |krate, macros| Ok(wrap(krate, macros, &records)))?;
     let calls = workspace.krate("corpus-calls")?;
     let panics = workspace.krate("corpus-panics")?;
     let db = workspace.lowered.db();
@@ -80,31 +68,9 @@ fn expand() -> Result<Expanded, String> {
     Ok(Expanded { records, calls, panics, diagnostics })
 }
 
-/// Each of blaze-macro-eval's macros of crate `krate`, recording its calls with what blaze's
-/// other hosts of it give.
-fn wrap(config: &Corpus, krate: &str, macros: Vec<ProcMacro>, records: &record::Records) -> Result<Vec<ProcMacro>, String> {
-    let wasm = match config.wasm.get(krate) {
-        Some(module) => loaded("blaze's module", krate, blaze_macro_wasm::load(&AbsPathBuf::assert_utf8(module.into())))?,
-        None => Vec::new(),
-    };
-    macros
-        .into_iter()
-        .map(|eval| {
-            let name = eval.name.as_str();
-            let mut references = Vec::new();
-            if !wasm.is_empty() {
-                let theirs = wasm
-                    .iter()
-                    .find(|it| it.name == eval.name && it.kind == eval.kind)
-                    .ok_or_else(|| format!("blaze's module of `{krate}` has no {:?} `{name}`", eval.kind))?;
-                references.push(Referee::Expander(Reference::Wasm, theirs.expander.clone()));
-            }
-            if let Some(entry) = native::reference(krate, name) {
-                references.push(Referee::Native(entry));
-            }
-            Ok(Recorder::wrap(krate, eval, references, records))
-        })
-        .collect()
+/// Each of blaze-macro-eval's macros of crate `krate`, recording its calls.
+fn wrap(krate: &str, macros: Vec<ProcMacro>, records: &record::Records) -> Vec<ProcMacro> {
+    macros.into_iter().map(|eval| Recorder::wrap(krate, eval, records)).collect()
 }
 
 /// The calls of macro `name` of crate `krate` from crate `calling`.
@@ -183,33 +149,6 @@ fn every_call_is_expanded() {
 
 #[test]
 #[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
-fn every_call_is_the_same_on_blazes_other_hosts() {
-    let expanded = expanded();
-    let held: Vec<&Record> = expanded.records.iter().filter(|it| !it.references.is_empty()).collect();
-    assert!(!held.is_empty(), "no call ran on another host of blaze's");
-    let mut differences = Vec::new();
-    for record in &held {
-        record.differences(&mut differences);
-    }
-    assert!(differences.is_empty(), "{} of {} calls differ:\n{}", differences.len(), held.len(), differences.join("\n"));
-}
-
-#[test]
-#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
-fn the_fixture_is_held_against_itself_natively() {
-    let calls = expanded().calls;
-    for (name, subject) in [("Describe", "Described"), ("label", "labelled"), ("label", "labelled_again"), ("make_fn", "answer"), ("make_fn", "greeting")] {
-        let record = call_on("corpus_macros", name, calls, subject);
-        assert!(
-            record.references.iter().any(|(which, _)| *which == Reference::Native),
-            "{} has no native reference",
-            record.what()
-        );
-    }
-}
-
-#[test]
-#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
 fn a_panic_is_its_message() {
     let panics = expanded().panics;
     let mut boom: Vec<&Record> = calls_of("corpus_macros", "boom", panics).collect();
@@ -223,9 +162,6 @@ fn a_panic_is_its_message() {
             Outcome::Panicked(said) => assert_eq!(said, message, "{}", record.what()),
             Outcome::Expanded(tree) => panic!("{} expanded to `{tree}`, and the macro panics with {message:?}", record.what()),
             Outcome::Failed(why) => panic!("{} failed ({why}), and the macro panics with {message:?}", record.what()),
-        }
-        for (which, theirs) in &record.references {
-            assert!(matches!(theirs, Outcome::Panicked(said) if said == message), "{} against {which:?}", record.what());
         }
     }
 }

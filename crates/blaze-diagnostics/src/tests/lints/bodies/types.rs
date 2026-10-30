@@ -44,7 +44,7 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
     let deps = match ui.std {
         Some((prelude, items)) => {
             assert!(!ui.core.is_empty(), "std's prelude is core's: give minicore's flags");
-            fixture.push_str("//- /std.rs crate:std deps:core\npub mod prelude {\n");
+            fixture.push_str("//- /std.rs crate:std\npub mod prelude {\n");
             for edition in ["rust_2015", "rust_2018", "rust_2021", "rust_2024"] {
                 writeln!(
                     fixture,
@@ -57,7 +57,7 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
         }
         None => "",
     };
-    write!(fixture, "//- /{} crate:main edition:{}{deps}\n{}", ui.name, ui.edition, ui.source).unwrap();
+    write!(fixture, "//- /{} crate:other:main edition:{}{deps}\n{}", ui.name, ui.edition, ui.source).unwrap();
     let args: Vec<String> = ui.flags.iter().flat_map(|flag| flag.split(' ')).map(str::to_owned).collect();
     let lints = CommandLine::parse(&args).expect("the test's flags are rustc's");
     let options = crate::tests::compiletest(ui.mode, &Options { lints, ..Options::default() });

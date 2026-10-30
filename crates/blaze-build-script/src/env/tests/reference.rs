@@ -45,6 +45,7 @@ pub fn env(
     unit: &Unit,
     inherited: &[(OsString, OsString)],
 ) -> Result<(BTreeMap<OsString, OsString>, FxHashSet<OsString>), Error> {
+    unit.check()?;
     let host = HostOs::of(&unit.host);
     let inherited_var = |name: &str| {
         inherited.iter().find(|(it, _)| it == OsStr::new(name)).map(|(_, value)| value.as_os_str())
@@ -59,7 +60,9 @@ pub fn env(
         search_path.push(host_root.clone());
     }
     search_path.extend(search.host_deps.iter().cloned());
-    search_path.push(search.sysroot_libdir.clone());
+    if !search.sysroot_libdir.as_os_str().is_empty() {
+        search_path.push(search.sysroot_libdir.clone());
+    }
     let dylib_path =
         inherited_var(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
     let dylib_path_is_empty = dylib_path.is_empty();
@@ -77,7 +80,7 @@ pub fn env(
     }
     cmd.set(host.dylib_var, host.join_paths(&search_path, host.dylib_var)?);
     cmd.set("CARGO", &unit.tools.cargo);
-    let version = Version::of(&package.version);
+    let version = Version::of(package)?;
     cmd.set("CARGO_MANIFEST_DIR", &package.manifest_dir);
     cmd.set("CARGO_MANIFEST_PATH", &package.manifest_path);
     cmd.set("CARGO_PKG_VERSION_MAJOR", version.major);
@@ -133,7 +136,7 @@ pub fn env(
         insert(&mut cfgs, "debug_assertions", Vec::new());
     }
     for line in &unit.target_cfgs {
-        match cfg_of(line) {
+        match cfg_of(package, line)? {
             ("debug_assertions", None) => {}
             (name, None) => insert(&mut cfgs, name, Vec::new()),
             (name, Some(value)) => match cfgs.iter_mut().find(|(it, _)| *it == name) {

@@ -863,7 +863,7 @@ fn debug(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
     out.put_u32(stamp(placed));
     out.put_u16(0);
     out.put_u16(0);
-    out.put_u32(pe::IMAGE_DEBUG_TYPE_CODEVIEW);
+    out.put_u32(pe::IMAGE_DEBUG_TYPE_CODEVIEW.0);
     out.put_u32(size);
     out.put_u32(at);
     // A region's file offset is its RVA.
@@ -1227,7 +1227,7 @@ fn page_of(addr: u64) -> u64 {
 
 /// A base relocation's entry: `DIR64` at the address's offset in its page.
 fn dir64(addr: u64) -> u16 {
-    (pe::IMAGE_REL_BASED_DIR64 << 12) | (addr & (PAGE - 1)) as u16
+    (pe::IMAGE_REL_BASED_DIR64.0 << 12) | (addr & (PAGE - 1)) as u16
 }
 
 /// What a kept `.reloc` is patched by: by rebased address, its entry's byte offset ([`NONE`]
@@ -1499,7 +1499,7 @@ impl KeptReloc {
             bytes.copy_to(start + 4, &mut size);
             let end = start + u32::from_le_bytes(size) as usize;
             let this = entry(slot) & 0xfff;
-            let next = (slot + 2 < end).then(|| entry(slot + 2)).filter(|it| (it >> 12) == pe::IMAGE_REL_BASED_DIR64);
+            let next = (slot + 2 < end).then(|| entry(slot + 2)).filter(|it| (it >> 12) == pe::IMAGE_REL_BASED_DIR64.0);
             (slot < start + 10 || (entry(slot - 2) & 0xfff) < this) && next.is_none_or(|it| this < (it & 0xfff))
         })
     }
@@ -1628,7 +1628,7 @@ fn directories(placed: &Placed<'_>) -> Result<[(u32, u32); DIRECTORIES], LinkErr
         directories[pe::IMAGE_DIRECTORY_ENTRY_EXPORT] = (at, size);
     }
     if let Some((index, at, _)) = filled(DEBUG)? {
-        if placed.view(index).u32(12) != Some(pe::IMAGE_DEBUG_TYPE_CODEVIEW) {
+        if placed.view(index).u32(12) != Some(pe::IMAGE_DEBUG_TYPE_CODEVIEW.0) {
             return Err(error("the debug directory's bytes are not in place: `file` before `synthesize`"));
         }
         directories[pe::IMAGE_DIRECTORY_ENTRY_DEBUG] = (at, DEBUG_DIRECTORY as u32);
@@ -1677,7 +1677,7 @@ impl Out {
         if self.file_end > self.start { (self.file_end - self.start).next_multiple_of(PAGE) } else { 0 }
     }
 
-    fn characteristics(&self) -> u32 {
+    fn characteristics(&self) -> pe::SectionFlags {
         let mut flags = if self.prot.exec {
             pe::IMAGE_SCN_CNT_CODE | pe::IMAGE_SCN_MEM_EXECUTE
         } else if self.raw() > 0 {
@@ -1933,7 +1933,7 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     out.0.resize(NT, 0);
 
     out.put_u32(pe::IMAGE_NT_SIGNATURE);
-    out.put_u16(pe::IMAGE_FILE_MACHINE_AMD64);
+    out.put_u16(pe::IMAGE_FILE_MACHINE_AMD64.0);
     out.put_u16(sections.len() as u16);
     out.put_u32(stamp(placed));
     out.put_u32(0);
@@ -1943,7 +1943,7 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     if dll {
         characteristics |= pe::IMAGE_FILE_DLL;
     }
-    out.put_u16(characteristics);
+    out.put_u16(characteristics.0);
 
     out.put_u16(pe::IMAGE_NT_OPTIONAL_HDR64_MAGIC);
     out.put_u8(LINKER_VERSION);
@@ -1968,9 +1968,9 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     out.put_u32(size(size_of_headers, "headers")?);
     out.put_u32(0);
     out.put_u16(if pe.output.windows_subsystem {
-        pe::IMAGE_SUBSYSTEM_WINDOWS_GUI
+        pe::IMAGE_SUBSYSTEM_WINDOWS_GUI.0
     } else {
-        pe::IMAGE_SUBSYSTEM_WINDOWS_CUI
+        pe::IMAGE_SUBSYSTEM_WINDOWS_CUI.0
     });
     let mut dll_characteristics = pe::IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA
         | pe::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE
@@ -1978,7 +1978,7 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
     if !dll {
         dll_characteristics |= pe::IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE;
     }
-    out.put_u16(dll_characteristics);
+    out.put_u16(dll_characteristics.0);
     out.put_u64(pe.output.stack.unwrap_or(STACK_RESERVE));
     out.put_u64(COMMIT);
     out.put_u64(HEAP_RESERVE);
@@ -2003,7 +2003,7 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
         out.put_u32(0);
         out.put_u16(0);
         out.put_u16(0);
-        out.put_u32(section.characteristics());
+        out.put_u32(section.characteristics().0);
         if raw > 0 {
             len = len.max(u64::from(start) + raw);
         }

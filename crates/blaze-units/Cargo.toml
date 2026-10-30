@@ -23,9 +23,9 @@ blaze-protocol = { workspace = true, optional = true }
 blaze-query = { workspace = true, optional = true }
 blaze-source = { workspace = true, optional = true }
 blaze-manifest.workspace = true
-blaze-resolve = { path = "../blaze-resolve" }
-cargo-util-schemas = "=0.14.3"
-rustc-stable-hash = { version = "0.1.2", optional = true }
+blaze-resolve.workspace = true
+cargo-util-schemas.workspace = true
+rustc-stable-hash = { workspace = true, optional = true }
 semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

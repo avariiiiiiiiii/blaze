@@ -20,7 +20,7 @@ blaze-mem.workspace = true
 text-size.workspace = true
 rustc-hash.workspace = true
 
-span = { path = "../span", version = "0.0", default-features = false }
+span.workspace = true
 stdx.workspace = true
 intern.workspace = true
 ra-ap-rustc_lexer.workspace = true

@@ -79,8 +79,8 @@ use super::{
     mounts::Mounts,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Readers, Runs, Selection, Source,
-        Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Linking, Readers, Runs, Selection,
+        Source, Steps, Writer,
     },
 };
 use crate::cli::print::Format;
@@ -191,8 +191,9 @@ pub(super) enum Does<S: Steps> {
     Fetch { steps: Arc<S>, fetches: Arc<[Fetch]> },
     /// The head's last front end, taken by the run that lowers into it.
     Lower { steps: Arc<S>, input: JobInput, kept: Mutex<Option<S::KeptFront>> },
-    /// Task `at` compiles unit `at`.
-    Compile { front: Arc<S::Front> },
+    /// Task `at` compiles unit `at`. A compile that gives way puts the images it was given in
+    /// `back` ([`Paths::back`]), so its next try still relinks them.
+    Compile { front: Arc<S::Front>, back: Arc<Mutex<Vec<Image<S>>>> },
     Select { front: Arc<S::Front>, filter: Vec<String>, args: Vec<String>, all: bool, ub: Ub },
     /// Task `at` evaluates `tests[at]`.
     Evaluate { front: Arc<S::Front>, tests: Arc<[String]>, ub: Ub },
@@ -249,9 +250,13 @@ impl<S: Steps> plane::Work for Step<S> {
                 let kept = kept.lock().unwrap_or_else(|it| it.into_inner()).take();
                 self.settle(steps.lower(input, kept), Value::Lowered)
             }
-            Does::Compile { front } => {
+            Does::Compile { front, back } => {
                 let Readers { this, mut images, .. } = readers;
                 let compiled = front.compile(this.expect("a task that reads is posted with its reader"), at, &mut images);
+                if matches!(compiled, Err(Failed::Again)) && !self.cancelled.load(Ordering::Acquire) {
+                    back.lock().unwrap_or_else(|it| it.into_inner()).append(&mut images);
+                    return None;
+                }
                 let ok = matches!(&compiled, Ok(it) if it.ok);
                 let mut did = self.settle(compiled, |it| Value::Compiled(at, it, images))?;
                 if !ok && matches!(did.outcome, Outcome::Built) {
@@ -534,6 +539,9 @@ struct Paths<S: Steps> {
     images: Vec<Option<Image<S>>>,
     /// How many of `images` are some.
     kept: u32,
+    /// The images of compiles that gave way, put back into `images` before any is taken: a
+    /// compile posted again relinks the image it was given, never a new one.
+    back: Arc<Mutex<Vec<Image<S>>>>,
 }
 
 impl<S: Steps> Paths<S> {
@@ -545,6 +553,7 @@ impl<S: Steps> Paths<S> {
             placed: Vec::new(), // alloc: none until the first path
             images: Vec::new(), // alloc: none until the first path
             kept: 0,
+            back: Arc::new(Mutex::new(Vec::new())), // alloc: once for the daemon's life
         }
     }
 
@@ -583,6 +592,10 @@ impl<S: Steps> Paths<S> {
 
     /// The images kept at `ids`, moved out for a compile.
     fn take_images(&mut self, ids: &[u32]) -> Vec<Image<S>> {
+        let back = std::mem::take(&mut *self.back.lock().unwrap_or_else(|it| it.into_inner()));
+        if !back.is_empty() {
+            self.keep(&[], back);
+        }
         let mut images = Vec::new(); // alloc: none unless an image is kept at an output
         if self.kept == 0 {
             return images;
@@ -752,6 +765,8 @@ struct Job<S: Steps> {
     /// What its build's front end served of each dependency ([`Writer::served`]), taken by
     /// its `Work` report.
     served: Vec<ServedCrate>,
+    /// Each image its units linked and how ([`Compiled::links`]), taken by its `Work` report.
+    links: Vec<(String, Linking)>,
 }
 
 impl<S: Steps> Job<S> {
@@ -1008,6 +1023,7 @@ impl<S: Steps> Jobs<S> {
             fresh: 0,
             compiled: 0,
             served: Vec::new(), // alloc: none; a build fills it once
+            links: Vec::new(),  // alloc: none until a unit links
         };
         if self.jobs.put(key_of(id), job).is_err() {
             // alloc: an error the session's free list can't give
@@ -1675,7 +1691,8 @@ impl<S: Steps> Jobs<S> {
             };
             w.plane.push(&mut nodes, node(kind, &name, &deps, Pool::Work, None), task);
         }
-        let work = Step::of(&cancelled, Does::Compile { front: front.clone() }); // clone: a refcount, once per build
+        // clone: refcounts, once per build
+        let work = Step::of(&cancelled, Does::Compile { front: front.clone(), back: self.paths.back.clone() });
         let units = &input.units;
         let package_of = {
             let packages: FxHashMap<&str, u32> =
@@ -1902,6 +1919,7 @@ impl<S: Steps> Jobs<S> {
         {
             job.over.get_or_insert((false, Some(error)));
         }
+        job.links.append(&mut compiled.links);
         // Said once its last diagnostic is, so the client prints cargo's "generated N warnings"
         // or "could not compile" there and not at the build's end. A unit that said nothing has
         // no such line.
@@ -2289,13 +2307,14 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         let (stats, fresh, compiled) = (job.stats, job.fresh, job.compiled);
+        let links = std::mem::take(&mut job.links);
         let worked = Worked {
             reran: stats.ran,
             green: stats.cached + stats.joined,
             served: std::mem::take(&mut job.served),
             compiled,
             found: fresh,
-            link: LinkKind::Placed,
+            link: link_kind(&links),
             critical_path_us: stats.critical_path_ns / 1000,
         };
         w.said.push(Said::Report(id, Response::Work(worked)));
@@ -2524,6 +2543,15 @@ fn warned(warning: &str) -> Diagnostic {
         rendered: format!("warning: {warning}\n"), // alloc: the report owns it
         unit: None,
         explanation: None,
+    }
+}
+
+/// What a request's links did, as [`Worked::link`] says it: placed whole when any image was laid
+/// out whole (a first link, or one that could not patch the image kept), else patched in place.
+pub(crate) fn link_kind(links: &[(String, Linking)]) -> LinkKind {
+    match links.iter().any(|(_, how)| how.placed()) {
+        true => LinkKind::Placed,
+        false => LinkKind::Patched,
     }
 }
 

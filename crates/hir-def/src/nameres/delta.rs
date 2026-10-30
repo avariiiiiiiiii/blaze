@@ -125,11 +125,32 @@ fn maintain_all(db: &mut Db, written: &Written<'_>, state: &mut State, last: &mu
             continue;
         }
         let mut work = Work::default();
+        let _maintaining = Maintaining { before: MAINTAINING.replace(Some(krate)) };
         if let Some(delta) = maintain_crate(db, krate, state, written, last, &mut modules_changed, &mut work) {
             last.push(delta);
         }
         db.report_work(NAME, krate, work);
     }
+}
+
+thread_local! {
+    static MAINTAINING: std::cell::Cell<Option<Crate>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restores the crate maintained before when it drops.
+struct Maintaining {
+    before: Option<Crate>,
+}
+
+impl Drop for Maintaining {
+    fn drop(&mut self) {
+        MAINTAINING.set(self.before);
+    }
+}
+
+/// The crate the maintainer is resolving on this thread, if any.
+pub(in crate::nameres) fn maintaining() -> Option<Crate> {
+    MAINTAINING.get()
 }
 
 fn maintain_crate(

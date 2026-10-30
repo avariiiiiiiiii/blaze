@@ -147,6 +147,41 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?)
 }
 
+/// A download that failed every time it was tried; the error it is the context of is the last
+/// failure.
+#[derive(Debug)]
+struct GaveUp {
+    file: String,
+    tries: u32,
+}
+
+impl std::fmt::Display for GaveUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: the download gave up after {} tries", self.file, self.tries)
+    }
+}
+
+/// A variable that names a place to get blaze's files from and is not UTF-8.
+#[derive(Debug)]
+struct NotUtf8Var(&'static str);
+
+impl std::fmt::Display for NotUtf8Var {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`{}` is not UTF-8, and blaze reads the address or directory it names as text", self.0)
+    }
+}
+
+impl std::error::Error for NotUtf8Var {}
+
+/// The variable `name` when it is set and not empty.
+fn given_var(name: &'static str) -> Result<Option<String>, NotUtf8Var> {
+    match std::env::var(name) {
+        Ok(it) if !it.is_empty() => Ok(Some(it)),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(NotUtf8Var(name)),
+    }
+}
+
 /// `address` as the base [`read_from`] joins file names to.
 fn base(address: &str) -> anyhow::Result<url::Url> {
     Ok(url::Url::parse(&format!("{}/", address.trim_end_matches('/')))?)
@@ -163,7 +198,8 @@ fn rustup_home() -> Option<PathBuf> {
 }
 
 /// The directory rustup installed `release` for this host in:
-/// `nightly-2026-10-25-aarch64-apple-darwin`.
+/// `nightly-2026-10-25-aarch64-apple-darwin`. One of another host's is none: its libraries
+/// are not this host's.
 fn installed(home: &Path, release: &str) -> Option<PathBuf> {
     let prefix = format!("{release}-");
     let cargo = format!("cargo{}", std::env::consts::EXE_SUFFIX);
@@ -183,7 +219,7 @@ fn installed(home: &Path, release: &str) -> Option<PathBuf> {
         };
         name[prefix.len()..].starts_with(std::env::consts::ARCH) && name.contains(os)
     };
-    found.iter().find(|it| host(it)).or(found.first()).cloned()
+    found.into_iter().find(host)
 }
 
 #[cfg(test)]
@@ -196,5 +232,35 @@ mod tests {
         assert_eq!(name(), format!("blaze-{date}"));
         assert!(ours_says().starts_with(ours_release()), "{}", ours_says());
         semver::Version::parse(ours_release()).expect("a release is a version");
+    }
+
+    #[test]
+    fn a_download_that_gave_up_says_how_often_it_tried_and_why() {
+        let error = anyhow::anyhow!("connection reset").context(GaveUp { file: "library-ab.tar.xz".to_owned(), tries: 4 });
+        assert_eq!(format!("{error:#}"), "library-ab.tar.xz: the download gave up after 4 tries: connection reset");
+        assert!(error.downcast_ref::<GaveUp>().is_some_and(|it| it.tries == 4));
+        assert_eq!(
+            NotUtf8Var("BLAZE_RUST_DIST").to_string(),
+            "`BLAZE_RUST_DIST` is not UTF-8, and blaze reads the address or directory it names as text"
+        );
+    }
+
+    #[test]
+    fn rustups_toolchain_of_another_host_is_not_this_ones() {
+        let home = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let bin = home.path().join("toolchains").join(name).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX)), "").unwrap();
+        };
+        make("nightly-2026-10-25-riscv64gc-unknown-none-elf");
+        assert_eq!(installed(home.path(), "nightly-2026-10-25"), None);
+        let os = match std::env::consts::OS {
+            "macos" => "apple-darwin",
+            os => os,
+        };
+        let ours = format!("nightly-2026-10-25-{}-{os}", std::env::consts::ARCH);
+        make(&ours);
+        assert_eq!(installed(home.path(), "nightly-2026-10-25"), Some(home.path().join("toolchains").join(ours)));
     }
 }

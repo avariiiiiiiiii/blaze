@@ -77,7 +77,7 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | store | `crates/blaze-cas/` |
 | codegen | `crates/blaze-codegen/`, `crates/hir-ty-codegen/`, `crates/hir-ty-mir/`, `crates/blaze-engine/`, `vendor/llvm-sys/`; in `crates/hir-ty/src/`: `mir.rs`, `mir/` (the MIR types, whose layout is codegen's, [data.md](../design/data.md)) |
 | link | `crates/blaze-link/`, `crates/blaze-live/`, `vendor/cranelift-object/` |
-| usercode | `crates/blaze-usercode/`, `crates/blaze-build-script/`, `crates/blaze-macro-wasm/`, `crates/blaze-wasi/`, `crates/proc-macro-api/`, `crates/proc-macro-srv/`, `crates/blaze-cargo/src/sandbox.rs`, `crates/blaze-cargo/src/sandbox/` |
+| usercode | `crates/blaze-usercode/`, `crates/blaze-build-script/`, `crates/proc-macro-api/`, `crates/blaze-cargo/src/sandbox.rs`, `crates/blaze-cargo/src/sandbox/` |
 | ci | `crates/blaze-api/`, `crates/blaze-ci/`, `crates/blaze-protocol/`, `crates/blaze-ui/`, `crates/blaze-web/` |
 | proof | `crates/blaze-v2-proof/`, `harness/v2/` |
 | safety | `crates/hir-ty-ub/`, `crates/blaze-check/`, `fuzz/` |
@@ -103,8 +103,10 @@ coordinator's: a change there is a request.
 | `blaze-splice` | replaced by `blaze-link`; deleted at integration, 2026-10-30 | link |
 | `blaze-in-place` | replaced by `blaze-link`; deleted at integration, 2026-10-30 | link |
 | `blaze-live` | changed: patches through `blaze-link`'s slots and commit | link |
-| `blaze-expand` | replaced: expansions keyed by `RunKey` with traced inputs; deleted at integration, 2026-10-30 (its code is now `proc_macro_api::{kept, bridge}` and `blaze_macro_wasm::native`) | usercode |
-| `blaze-build-script`, `blaze-macro-wasm`, `blaze-wasi`, `proc-macro-api`, `proc-macro-srv` | changed: run in tracing sandboxes, from a warm pool | usercode |
+| `blaze-expand` | replaced: expansions keyed by `RunKey` with traced inputs; deleted at integration, 2026-10-30 (its code is now `proc_macro_api::{kept, bridge}`) | usercode |
+| `blaze-build-script` | changed: run in tracing sandboxes, from a warm pool | usercode |
+| `proc-macro-api` | changed: the store of expansions (`kept`) and the bridge blaze-macro-eval's server speaks (`bridge`); its client half deleted 2026-10-30 | usercode |
+| `blaze-macro-wasm`, `blaze-wasi`, `proc-macro-srv`, `proc-macro-srv-cli` | replaced by `blaze-macro-eval`, the one proc-macro engine ([compile-time.md](../design/compile-time.md) change 20); deleted 2026-10-30 ([dedup](../lanes/dedup.md#proc-macros-one-engine-blaze-macro-eval)) | usercode |
 | `vfs`, `vfs-notify` | replaced by `blaze-vfs` and `blaze-core`'s watch; deleted at integration, 2026-10-30 (`span` owns `FileId`, base-db the file sets and source paths) | vfs |
 | `syntax-tree`, `syntax`, `parser` | changed: one flat tree per file replaces rowan (#42) | format |
 | `span`, `intern` | changed: spans in side tables; sharded interners | format |

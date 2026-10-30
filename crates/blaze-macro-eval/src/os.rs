@@ -3,9 +3,9 @@
 //! answered here and noted as they are made, so that the expansion is keyed by exactly what it
 //! read ([`Os::seen`]), as a native sandbox's trace keys a build script's run.
 //!
-//! The rules are a sandbox's, as the wasm host's (`blaze-macro-wasm`'s `wasi.rs`) are, with
-//! the real paths in place of its virtual package: the macro reads below the calling crate's
-//! `CARGO_MANIFEST_DIR` and `OUT_DIR` and nothing else, writes nothing, and sets no variable.
+//! The rules are the proc-macro sandbox's, on the real paths: the macro reads below the calling
+//! crate's `CARGO_MANIFEST_DIR` and `OUT_DIR` and nothing else, writes nothing, and sets no
+//! variable.
 //! A path outside them fails with `EACCES` and is noted as refused, which is not an input: the
 //! refusal is the same every run. A write, a variable set or a system call no shim knows stops
 //! the expansion ([`Stop`]).

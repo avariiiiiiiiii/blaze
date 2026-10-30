@@ -58,7 +58,7 @@ fn a_pat_before_2021_that_an_or_may_follow_is_linted() {
     let source = source.replace(main, "fn main() {\n    a!(1|);\n}\n");
     let aux = include_str!("matchers/auxiliary/or-pattern.rs");
     let fixture = format!(
-        "//- /macro-or-patterns-back-compat.rs crate:main edition:2015 deps:or_pattern\n{source}\
+        "//- /macro-or-patterns-back-compat.rs crate:other:main edition:2015 deps:or_pattern\n{source}\
          //- /auxiliary/or-pattern.rs crate:or_pattern edition:2015\n{aux}"
     );
     let expected = include_str!("matchers/macro-or-patterns-back-compat.stderr");

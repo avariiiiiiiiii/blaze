@@ -1347,5 +1347,5 @@ fn sniff(path: &Path) -> Result<Sniffed, LinkError> {
 }
 
 fn fail(what: String) -> LinkError {
-    LinkError { function: None, what }
+    LinkError { function: None, what, refusal: None }
 }

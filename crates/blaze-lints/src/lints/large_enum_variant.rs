@@ -63,7 +63,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         })
         .collect();
     sizes.sort_by(|a, b| b.size.cmp(&a.size));
-    let threshold = u64::try_from(cx.conf().int("enum-variant-size-threshold", 200)).unwrap_or(0);
+    let threshold = u64::try_from(cx.conf().int("enum-variant-size-threshold", 200)).expect("a count, checked as the configuration loads");
     let mut difference = sizes[0].size - sizes[1].size;
     if difference <= threshold {
         return;

@@ -198,6 +198,151 @@ pub struct Compiled {
     /// A proc macro's expanders, loaded from what it compiled to (or why there are none):
     /// the loop asks the job's [`Writer::macros`] with them. None for any other unit.
     pub macros: Option<blaze_lower::ProcMacroLoadResult>,
+    /// Each image the compile linked, by its path, and how the link reached it: what the job's
+    /// [`blaze_api::Worked`] says, and the bench fails an edit by.
+    pub links: Vec<(String, Linking)>,
+}
+
+/// How a link reached its image: what the link line (`link: <path> (<how>)`) says, and what
+/// the bench fails an edit by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Linking {
+    /// The image's first link: none was kept at its path, so there was nothing to patch.
+    First,
+    /// What changed was placed into the room the kept image keeps.
+    Spliced,
+    /// The image was laid out whole again although one was kept.
+    Full(Full),
+}
+
+impl Linking {
+    /// The image was laid out whole, rather than patched.
+    pub(crate) fn placed(self) -> bool {
+        !matches!(self, Linking::Spliced)
+    }
+}
+
+impl std::fmt::Display for Linking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Linking::First => f.write_str("first link"),
+            Linking::Spliced => f.write_str("spliced"),
+            Linking::Full(Full::Output(fields)) => write!(f, "not spliced: the output changed: {fields}"),
+            Linking::Full(Full::NotIncremental) => f.write_str("not spliced: the output keeps no room"),
+        }
+    }
+}
+
+/// Why a link with an image kept laid it out whole again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Full {
+    /// The kept image was linked as another [`blaze_link::Output`]: these of its fields differ. blaze-link
+    /// stages a change of an image's code and data, never of its output, so the image is made
+    /// again.
+    Output(OutputFields),
+    /// The output keeps no room ([`blaze_link::Output::incremental`] is off): every link of it is whole.
+    NotIncremental,
+}
+
+/// Fields of [`blaze_link::Output`] as a set, a bit each in [`OutputFields::NAMES`]'s order.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct OutputFields(u32);
+
+impl OutputFields {
+    pub(crate) const NAMES: [&'static str; 17] = [
+        "format",
+        "arch",
+        "kind",
+        "exports",
+        "interpreter",
+        "platform",
+        "incremental",
+        "debug",
+        "live",
+        "tags",
+        "stack",
+        "windows_subsystem",
+        "dev_run",
+        "triple",
+        "exec_log",
+        "sanitize",
+        "rpaths",
+    ];
+
+    /// The fields of `new` that differ from `old`'s. A shared library's exports are a field of
+    /// their own: they change with the functions it defines, its name and kind do not.
+    pub(crate) fn between(old: &blaze_link::Output, new: &blaze_link::Output) -> OutputFields {
+        let blaze_link::Output {
+            format,
+            arch,
+            kind,
+            interpreter,
+            platform,
+            incremental,
+            debug,
+            live,
+            tags,
+            stack,
+            windows_subsystem,
+            dev_run,
+            triple,
+            exec_log,
+            sanitize,
+            rpaths,
+        } = new;
+        let (kind_differs, exports_differ) = match (&old.kind, kind) {
+            (
+                blaze_link::OutputKind::Shared { name: was, exports: had },
+                blaze_link::OutputKind::Shared { name, exports },
+            ) => (was != name, had != exports),
+            (was, kind) => (was != kind, false),
+        };
+        let differs = [
+            old.format != *format,
+            old.arch != *arch,
+            kind_differs,
+            exports_differ,
+            old.interpreter != *interpreter,
+            old.platform != *platform,
+            old.incremental != *incremental,
+            old.debug != *debug,
+            old.live != *live,
+            old.tags != *tags,
+            old.stack != *stack,
+            old.windows_subsystem != *windows_subsystem,
+            old.dev_run != *dev_run,
+            old.triple != *triple,
+            old.exec_log != *exec_log,
+            old.sanitize != *sanitize,
+            old.rpaths != *rpaths,
+        ];
+        let mut bits = 0;
+        for (at, differs) in differs.into_iter().enumerate() {
+            bits |= u32::from(differs) << at;
+        }
+        OutputFields(bits)
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The names of the fields in the set, in [`OutputFields::NAMES`]'s order.
+    pub(crate) fn names(self) -> impl Iterator<Item = &'static str> {
+        Self::NAMES.into_iter().enumerate().filter(move |(at, _)| (self.0 >> at) & 1 == 1).map(|it| it.1)
+    }
+}
+
+impl std::fmt::Display for OutputFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (at, name) in self.names().enumerate() {
+            if at > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(name)?;
+        }
+        Ok(())
+    }
 }
 
 /// The build of one job, as the daemon has it: one value for every job. Its associated types
@@ -278,8 +423,9 @@ impl<S: Steps> Default for Readers<S> {
 
 /// An image kept linked between jobs at the path cargo writes it, so the next link of it
 /// relinks only what changed. The loop owns every one; it moves it into the one compile that
-/// relinks it ([`Front::compile`]) and takes it back with what the compile made. One the
-/// compile does not give back (its link failed, or it gave way) is linked whole next time.
+/// relinks it ([`Front::compile`]) and takes it back with what the compile made, its link made
+/// or failed; a compile that gives way hands it back before it is posted again. A link that
+/// still finds none kept at a path it linked before says so ([`Linking::First`]).
 pub struct Image<S: Steps> {
     pub path: String,
     pub kept: S::Linked,

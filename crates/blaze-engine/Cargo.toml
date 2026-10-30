@@ -41,7 +41,7 @@ disabled-strategies = ["quick-install"]
 
 [dependencies]
 # blaze's cargo: the client, the daemon, the sandbox launcher, the release this is.
-blaze-cargo = { path = "../blaze-cargo" }
+blaze-cargo.workspace = true
 anyhow.workspace = true
 # The host's target triple, which names the release archive a pin fetches (`versions.rs`).
 hir-ty-codegen.workspace = true
@@ -50,13 +50,14 @@ mimalloc.workspace = true
 # A pin: the root manifest read (`pin.rs`) and written with its layout and comments kept
 # (`versions.rs`).
 toml.workspace = true
-toml_edit = { version = "=0.25.12", default-features = false, features = ["display", "parse"] }
+toml_edit = { workspace = true, features = ["display", "parse"] }
 # The releases of blaze a workspace pins arrive over HTTPS as `.tar.gz`, checked against
-# `SHA256SUMS`.
-blaze-registry = { path = "../blaze-registry" }
-sha2 = "0.10"
-tar = "0.4.44"
-flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+# `B3SUMS`.
+blaze-registry.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+tar = { workspace = true, features = ["default"] }
+flate2 = { workspace = true, features = ["rust_backend"] }
 url.workspace = true
 # A build script's `rustc` (`as_rustc.rs`): a probe loaded with the standard library, lowered
 # into the front end and checked as `blaze check` checks a crate.
@@ -77,9 +78,6 @@ blaze-alloc-count.workspace = true
 # Adds LLVM as a code producer, chosen with `BLAZE_BACKEND=llvm`.
 llvm = ["hir-ty-codegen/llvm", "blaze-cargo/llvm"]
 
-# Runs build scripts compiled for wasm32-wasip1 under Wasmtime when a workspace asks for it
-# (`BLAZE_BUILD_SCRIPTS=wasi`, docs/cargo.md "Build scripts under WASI"): an experiment.
-wasi = ["blaze-cargo/wasi"]
 
 [lints]
 workspace = true

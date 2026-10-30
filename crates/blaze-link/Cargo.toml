@@ -30,7 +30,6 @@ blaze-live.workspace = true
 blaze-mem.workspace = true
 blaze-sha256.workspace = true
 gimli.workspace = true
-hashbrown.workspace = true
 object.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true

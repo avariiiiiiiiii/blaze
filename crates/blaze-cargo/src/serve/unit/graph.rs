@@ -20,6 +20,8 @@ use blaze_units::{
 };
 use rustc_hash::{FxHashMap, FxHasher};
 
+use super::error::UnitError;
+
 /// A unit's role, one bit each.
 pub(crate) mod flag {
     /// A build script's compile or a proc macro: built for the host (cargo's `for_host`).
@@ -112,7 +114,7 @@ pub(crate) struct Graph {
     /// `links[link_start[i]..link_start[i + 1]]`.
     link_start: Vec<u32>,
     links: Vec<u32>,
-    /// Each unit's package, by index into `Units::packages`; `u32::MAX` for one not listed.
+    /// Each unit's package, by index into `Units::packages`.
     package: Vec<u32>,
     flags: Vec<u8>,
     /// The units compiled for build scripts and proc macros: all a script's compile or a proc
@@ -161,21 +163,36 @@ fn flags_of(unit: &Unit) -> u8 {
 }
 
 impl Graph {
-    pub(crate) fn new(units: &Units) -> Graph {
+    /// The graph of `units`; a unit whose package the build doesn't list, or that names a
+    /// dependency past its units, is an error naming it.
+    pub(crate) fn new(units: &Units) -> Result<Graph, UnitError> {
         let all = &units.graph.units;
         let count = all.len();
         let packages: FxHashMap<&str, u32> =
             units.packages.iter().enumerate().map(|(at, it)| (it.id.as_str(), at as u32)).collect();
-        let package: Vec<u32> =
-            all.iter().map(|it| packages.get(it.pkg_id.as_str()).copied().unwrap_or(u32::MAX)).collect();
+        let package: Vec<u32> = all
+            .iter()
+            .enumerate()
+            .map(|(at, it)| {
+                packages
+                    .get(it.pkg_id.as_str())
+                    .copied()
+                    .ok_or_else(|| UnitError::Package { unit: at, pkg_id: it.pkg_id.clone() }) // clone: error path
+            })
+            .collect::<Result<_, _>>()?;
         let flags: Vec<u8> = all.iter().map(flags_of).collect();
         let edges = all.iter().map(|it| it.dependencies.len()).sum();
         let mut dep_start = Vec::with_capacity(count + 1);
         let mut deps = Vec::with_capacity(edges);
         dep_start.push(0);
-        for unit in all {
+        for (at, unit) in all.iter().enumerate() {
             let from = deps.len();
-            deps.extend(unit.dependencies.iter().map(|it| it.index as u32).filter(|it| (*it as usize) < count));
+            for dep in &unit.dependencies {
+                if dep.index >= count {
+                    return Err(UnitError::Dependency { unit: at, dep: dep.index, count });
+                }
+                deps.push(dep.index as u32);
+            }
             deps[from..].sort_by(|a, b| all[*a as usize].pkg_id.cmp(&all[*b as usize].pkg_id));
             dep_start.push(deps.len() as u32);
         }
@@ -201,7 +218,7 @@ impl Graph {
             by_target: FxHashMap::default(),
         };
         for (at, unit) in all.iter().enumerate() {
-            if unit.target.is_lib() && graph.package[at] != u32::MAX {
+            if unit.target.is_lib() {
                 graph.lib_packages.insert(graph.package[at]);
             }
         }
@@ -239,7 +256,7 @@ impl Graph {
             }
         }
         graph.build_time = build_time;
-        graph
+        Ok(graph)
     }
 
     fn graph_unit(&self, all: &[Unit], at: u32) -> GraphUnit<u32, u32> {

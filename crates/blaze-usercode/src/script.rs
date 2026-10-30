@@ -106,15 +106,11 @@ pub fn keyed(prepared: &Prepared, traced: &mut Traced) {
 }
 
 /// What cargo watches of `unit`'s run that ended as `exit` did: its `rerun-if-changed` and
-/// `rerun-if-env-changed`, or its whole package when it named no path. Output that can't be
-/// read watches the whole package: the run fails when its output is read anyway.
-pub fn cargo_rule(unit: &Unit, inherited: &[(OsString, OsString)], exit: &Exit) -> CargoRule {
+/// `rerun-if-env-changed`, or its whole package when it named no path. Output cargo refuses
+/// is the error cargo gives, and the run is not kept.
+pub fn cargo_rule(unit: &Unit, inherited: &[(OsString, OsString)], exit: &Exit) -> Result<CargoRule, Error> {
     let cx = output::Context::of(unit, inherited);
-    let dir = &unit.package.manifest_dir;
-    match blaze_build_script::watched_in(&exit.stdout, &cx, dir) {
-        Ok(watched) => CargoRule::of(watched),
-        Err(_) => CargoRule::package(dir),
-    }
+    blaze_build_script::watched_in(&exit.stdout, &cx, &unit.package.manifest_dir).map(CargoRule::of)
 }
 
 /// What the script whose root source file is `root` would have been as a run, when its source
@@ -211,19 +207,36 @@ mod tests {
             traced: None,
             peak_memory: 0,
         };
-        let none = cargo_rule(&unit(), &inherited("/a"), &exit(b"cargo:rustc-cfg=x\n"));
+        let none = cargo_rule(&unit(), &inherited("/a"), &exit(b"cargo:rustc-cfg=x\n")).unwrap();
         assert_eq!(none.package, Some(PathBuf::from("/ws/p")));
         let named = cargo_rule(
             &unit(),
             &inherited("/a"),
             &exit(b"cargo:rerun-if-changed=build.rs\ncargo:rerun-if-env-changed=VERSION\n"),
-        );
+        )
+        .unwrap();
         assert_eq!(named.package, None);
         assert_eq!(named.paths, vec![PathBuf::from("/ws/p/build.rs")]);
         assert_eq!(named.env, vec![OsString::from("VERSION")]);
-        let env_only = cargo_rule(&unit(), &inherited("/a"), &exit(b"cargo:rerun-if-env-changed=VERSION\n"));
+        let env_only =
+            cargo_rule(&unit(), &inherited("/a"), &exit(b"cargo:rerun-if-env-changed=VERSION\n")).unwrap();
         assert_eq!(env_only.package, None);
         assert!(env_only.paths.is_empty());
+    }
+
+    /// Output cargo refuses is its error, never a guess of what to watch.
+    #[test]
+    fn refused_output_is_an_error_not_a_whole_package_watch() {
+        let exit = Exit {
+            code: Some(0),
+            signal: None,
+            stdout: b"cargo:rustc-link-arg-bin=no-equals\n".to_vec(),
+            stderr: Vec::new(),
+            traced: None,
+            peak_memory: 0,
+        };
+        let refused = cargo_rule(&unit(), &inherited("/a"), &exit).expect_err("cargo refuses it");
+        assert!(refused.0.contains("rustc-link-arg-bin"), "{}", refused.0);
     }
 
     #[test]

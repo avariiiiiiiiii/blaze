@@ -390,8 +390,9 @@ build-script-link-dirs = ["/opt/vendor/lib"]                 # rustc-link-search
 The table may also have `unsandboxed-proc-macros`, `build-script-env` and `wasi-build-scripts`,
 each a list of names, which v1 read: v2 checks that each is a list of strings and does nothing
 else with it (`crates/blaze-units/src/load/sandbox.rs`). Proc macros run in blaze's own
-process and in no sandbox to be taken out of ([below](#proc-macros-run-on-blazes-evaluator)),
-and a script is given the command's whole environment already.
+process, confined by blaze's evaluator, which is their sandbox and has no way out
+([below](#proc-macros-run-on-blazes-evaluator)), and a script is given the command's whole
+environment already.
 
 What a sandboxed script prints is checked before it is used (`crates/blaze-cargo/src/directives.rs`), since
 it goes into every rustc and linker run of its package and of what links it. A
@@ -484,10 +485,15 @@ Every proc macro is built by blaze from its source and run in the daemon's own p
 blaze's MIR evaluator (`crates/blaze-macro-eval`,
 [v2/plan/design/compile-time.md](v2/plan/design/compile-time.md), change 20): the macro's real
 code, with the real std and `library/proc_macro`, every access checked, and the bridge's one
-call answered by blaze's own server. Nothing it compiles to is loaded and no process is
-started, so there is no sandbox to run it in and none to take it out of. What it reaches
-outside its own code is a traced shim or an error naming the macro; nothing runs natively and
-nothing goes to another host. Each expansion is kept in the store
+call answered by blaze's own server. Nothing rustc compiles is loaded and no process is
+started: the evaluator is the proc-macro sandbox. The macro reads only below the calling
+crate's `CARGO_MANIFEST_DIR` and `OUT_DIR`, writes nothing, sets no variable and makes no
+system call blaze has no shim for (`crates/blaze-macro-eval/src/os.rs`). Its compiled tier,
+off by default (`Policy::DEFAULT`), keeps the same confinement: the macro's code reaches only
+a 4 GiB region of its own and calls only checked table entries and the same shims
+(`crates/blaze-macro-eval/src/tier.rs`, `tier/confine.rs`). A macro blaze-macro-eval cannot
+run stops the build with an error naming the macro and its crate; nothing runs natively and
+nothing goes to another host (there is none). Each expansion is kept in the store
 (`crates/proc-macro-api/src/kept.rs`) by the macro's library, its name, input and attribute
 tokens, the crate's variables, its directory and the toolchain, and found by what else it
 read; `BLAZE_PROC_MACRO_CACHE=check` expands every kept call anyway and fails naming a macro
@@ -495,13 +501,12 @@ whose output differs.
 
 ### Build scripts under WASI, and proc macros as WebAssembly (v1, not in v2)
 
-v1 could compile a build script for `wasm32-wasip1` and run it under Wasmtime
-(`BLAZE_BUILD_SCRIPTS=wasi`, `wasi-compare`, `wasi-build-scripts`), and built every proc macro
-as a WebAssembly module (`BLAZE_PROC_MACRO_WASM`, `native-proc-macros`). v2 does neither: every
-build script runs natively in the sandbox, and every proc macro on blaze's evaluator (above).
-`BLAZE_BUILD_SCRIPTS` is read by nothing; `BLAZE_PROC_MACRO_WASM` and `native-proc-macros` are
-named only by `crates/blaze-macro-wasm/src/rule.rs`, which nothing calls, so setting them
-changes nothing. The comparison of the two ways of running scripts is
+v1 could compile a build script for `wasm32-wasip1` and run it under Wasmtime (`wasi-compare`,
+`wasi-build-scripts`), built every proc macro as a WebAssembly module (`native-proc-macros`),
+and could expand with rust-analyzer's out-of-process proc-macro server. v2 does none of these,
+and their crates are deleted: every build script runs natively in the sandbox, and every proc
+macro on blaze's evaluator (above). Nothing in blaze reads v1's variables or manifest lists
+for them, so setting them changes nothing. The comparison of the two ways of running scripts is
 [reports/BSWASI.md](reports/BSWASI.md).
 
 ### Which tests run
@@ -615,10 +620,10 @@ it). From then on the `blaze` anyone runs in that workspace runs that
 release, as Bazelisk runs the Bazel a `.bazelversion` names: when it is another release
 itself, it runs `~/.blaze/versions/<version>/blaze` (`$BLAZE_HOME/versions` with `BLAZE_HOME`)
 with the same arguments, and when that is not there it first downloads
-`blaze-v<version>-<host>.tar.gz` from the release on GitHub, checks its sha256 against the
-release's `SHA256SUMS` and unpacks it there. The network is used only then, once per
-release. A pinned release that can't be fetched (offline, no such release, no build for
-this host, another sha256) is an error, and no other blaze builds in its place.
+`blaze-v<version>-<host>.tar.gz` from the release on GitHub, checks its BLAKE3 hash against
+the release's `B3SUMS` and unpacks it there. The network is used only then, once per
+release. A pinned release that can't be fetched (offline, no such release, no `B3SUMS`, no
+build for this host, another hash) is an error, and no other blaze builds in its place.
 `BLAZE_RELEASES` names a mirror laid out as
 `https://github.com/indexable-inc/blaze/releases/download` (`<mirror>/v<version>/<asset>`),
 or a directory of `v<version>` directories of the assets. `blaze --version` says which
@@ -676,7 +681,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 `BLAZE_BACKEND`, `BLAZE_OPT` and `BLAZE_INLINE` are not settings in v2. They change the code
 made without being part of a unit's key, so set in the daemon's environment they fail every
 unit, naming the variable (`crates/hir-ty-codegen/v2/backend.rs`, `CHANGES_CODE`); the profile
-picks the backend ([below](#backends)). v1's splice setting, `BLAZE_BUILD_SCRIPTS`,
+picks the backend ([below](#backends)). v1's splice setting, its build-script runner's,
 `BLAZE_TESTS`, `BLAZE_TESTS_FROM`, `BLAZE_TEST_ENV`, `BLAZE_IDLE_SECS`, `BLAZE_MEMORY_MAX`,
 `BLAZE_MEMORY_BUDGET`, `BLAZE_SPARE` and `BLAZE_LRU` are read by nothing in v2.
 

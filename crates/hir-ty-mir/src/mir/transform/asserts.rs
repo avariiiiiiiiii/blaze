@@ -298,7 +298,7 @@ fn binary_op<'db>(
                 }
                 _ => (copy(&b), rhs_ty),
             };
-            let bits = ctx.size_of(ty).unwrap_or(8) * 8;
+            let bits = ty.primitive_size(ctx.infcx.interner).bits();
             let bits = int_value(ctx, unsigned_ty, u128::from(bits));
             let inbounds = temp(body, ctx.bool_ty());
             setup.push(Statement {
@@ -406,7 +406,7 @@ enum Bound {
 }
 
 fn int_const<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, bound: Bound) -> Operand {
-    let bytes = ctx.size_of(ty).unwrap_or(8) as u32;
+    let bytes = ty.primitive_size(ctx.infcx.interner).bytes() as u32;
     let value = match bound {
         Bound::Zero => 0,
         Bound::MinusOne => u128::MAX,
@@ -415,9 +415,9 @@ fn int_const<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, bound: Bound) -> Operand {
     int_value(ctx, ty, value)
 }
 
-/// The integer `value` of `ty`, truncated to its width.
+/// The integer `value` of the integer type `ty`, truncated to its width.
 fn int_value<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, value: u128) -> Operand {
-    let bytes = ctx.size_of(ty).unwrap_or(8) as usize;
+    let bytes = ty.primitive_size(ctx.infcx.interner).bytes() as usize;
     Operand::from_bytes(value.to_le_bytes()[..bytes].into(), ty)
 }
 

@@ -7,7 +7,7 @@ use hir_def::{
     expr_store::Body,
     hir::{Expr, ExprId, Pat as HirPat, PatId, Statement},
     item_scope::{ImportId, ImportOrGlob},
-    nameres::crate_def_map,
+    nameres::{block_def_map, crate_def_map},
     signatures::ConstSignature,
 };
 use hir_expand::name::Name;
@@ -36,7 +36,7 @@ pub(crate) fn find_fallback_pattern_typo<'db>(
 ) -> Option<PatternTypo> {
     let HirPat::Bind { id, subpat: None } = body.pat(pat) else { return None };
     let name = &body[id].name;
-    let found = candidates(cx, name, infer.binding_ty(id));
+    let found = candidates(cx, name, infer.binding_ty(id), body, blocks);
 
     if let Some(i) = found.accessible.iter().position(|c| c == name) {
         return Some(PatternTypo::WantedConstant {
@@ -86,8 +86,16 @@ pub(crate) fn find_fallback_pattern_typo<'db>(
         .map(PatternTypo::PatternLetBinding)
 }
 
-/// `free_items`' constants of `ty`, and its `use`s whose value is a constant of `ty`.
-fn candidates<'db>(cx: &Cx<'_, 'db>, name: &Name, ty: Ty<'db>) -> Candidates {
+/// `free_items`' constants of `ty`, and its `use`s whose value is a constant of `ty`: those of
+/// the crate's modules and of the `blocks` around the pattern (rustc's `free_items` has the
+/// items of every body; those of other bodies can't be named from the pattern).
+fn candidates<'db>(
+    cx: &Cx<'_, 'db>,
+    name: &Name,
+    ty: Ty<'db>,
+    body: &Body,
+    blocks: &[ExprId],
+) -> Candidates {
     let db = cx.db;
     let mut found = Candidates::default();
     let same_ty = |konst: ConstId| {
@@ -97,7 +105,12 @@ fn candidates<'db>(cx: &Cx<'_, 'db>, name: &Name, ty: Ty<'db>) -> Candidates {
     let visible = |konst: ConstId| {
         AssocItemId::ConstId(konst).assoc_visibility(db).is_visible_from(db, cx.module)
     };
-    for (module, data) in crate_def_map(db, cx.krate).modules(db) {
+    let block_maps = blocks.iter().filter_map(|&block| match body.expr(block) {
+        Expr::Block { id: Some(id), .. } => Some(block_def_map(db, id.to_db(db))),
+        _ => None,
+    });
+    let def_maps = std::iter::once(crate_def_map(db, cx.krate)).chain(block_maps);
+    for (module, data) in def_maps.flat_map(|it| it.modules(db)) {
         for (item_name, item) in data.scope(db).values() {
             let ModuleDefId::ConstId(konst) = item.def else { continue };
             match item.import {

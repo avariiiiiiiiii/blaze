@@ -81,8 +81,8 @@ fn counts_are_rustcs() {
         names,
         [
             "rust_2018_compatibility",
-            "rust_2021_compatibility",
             "rust_2024_compatibility",
+            "rust_2021_compatibility",
             "future_incompatible",
             "nonstandard_style",
             "unused",

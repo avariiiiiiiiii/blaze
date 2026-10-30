@@ -31,7 +31,7 @@ const AUTO: &str = "cfg(test,FALSE)";
 /// true. Both outputs are as compiletest compares them: `\\` as `\`
 /// (`normalize_platform_differences`).
 fn ui_cfg(before: &str, name: &str, header: &str, source: &str, options: &Options) -> String {
-    let fixture = format!("{before}//- /{name} crate:main {header}\n{source}");
+    let fixture = format!("{before}//- /{name} crate:other:main {header}\n{source}");
     let stderr = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, options))
         .stderr_with(Style { ui_testing: true, ..Style::default() });
     platform(&normalized(&stderr))

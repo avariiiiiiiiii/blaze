@@ -95,8 +95,15 @@ pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
                 }
                 std::fs::remove_file(&path)?;
             }
+            if std::os::unix::net::SocketAddr::from_pathname(&path).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    // alloc: an error path.
+                    format!("{}: longer than a socket's path may be", path.display()),
+                ));
+            }
             let temporary = crate::fs::temporary_next_to(&path);
-            let listener = UnixListener::bind(&temporary)?;
+            let listener = bind(&temporary)?;
             let placed = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
                 .and_then(|()| std::fs::rename(&temporary, &path));
             if let Err(error) = placed {
@@ -108,6 +115,47 @@ pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
         Address::Inherited { fd, at } => inherited(root, *fd, at),
         Address::Tcp(address) => Ok(Listener::Tcp(TcpListener::bind(address)?)),
     }
+}
+
+/// A socket bound at `path`. One whose name fits but whose temporary name next to it does not is
+/// bound through a short directory of this process's own under `/tmp`, made with mode 0700, whose
+/// one entry links to `path`'s directory: the socket is still made in that directory, so its
+/// rename into place stays atomic.
+fn bind(path: &Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+
+    if std::os::unix::net::SocketAddr::from_pathname(path).is_ok() {
+        return UnixListener::bind(path);
+    }
+    let tmp = Path::new("/tmp");
+    // alloc: once per listen whose temporary name is too long, at setup.
+    let short = crate::fs::temporary_next_to(&tmp.join("blaze-bind"));
+    let through = || -> io::Result<UnixListener> {
+        // A link above `/tmp` is followed: what matters is the directory the name is looked up
+        // in, which nobody else may replace entries of.
+        let is = std::fs::metadata(tmp)?;
+        // SAFETY: no pointers; the call cannot fail.
+        let user = unsafe { libc::geteuid() };
+        if (is.uid() != user && is.uid() != 0) || (is.mode() & 0o002 != 0 && is.mode() & 0o1000 == 0) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "another user can replace what is in it"));
+        }
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "no directory to bind in"));
+        };
+        let dir = std::path::absolute(dir)?;
+        std::fs::DirBuilder::new().mode(0o700).create(&short)?;
+        let alias = short.join("d");
+        let bound = std::os::unix::fs::symlink(&dir, &alias).and_then(|()| UnixListener::bind(alias.join(name)));
+        _ = std::fs::remove_dir_all(&short);
+        bound
+    };
+    through().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            // alloc: an error path.
+            format!("binding {} through {}: {error}", path.display(), short.display()),
+        )
+    })
 }
 
 /// The listening socket a service manager passed as `fd`, for [`Address::Inherited`]: a
@@ -151,7 +199,7 @@ fn inherited(root: &Path, fd: RawFd, at: &crate::FileName) -> io::Result<Listene
         Err(error) => return Err(refused(format!("not a socket ({error})"))),
     }
     // alloc: an error path.
-    if option(libc::SO_ACCEPTCONN).map_err(|error| refused(error.to_string()))? == 0 {
+    if !accepting(&copy, option).map_err(|error| refused(error.to_string()))? {
         // alloc: an error path.
         return Err(refused("not listening".to_owned()));
     }
@@ -181,6 +229,49 @@ fn inherited(root: &Path, fd: RawFd, at: &crate::FileName) -> io::Result<Listene
         return Err(refused(format!("bound at {:?}, not there", String::from_utf8_lossy(&bound))));
     }
     Ok(Listener::Unix { listener: UnixListener::from(copy), path: None })
+}
+
+/// Whether the stream socket `fd` listens, by `SO_ACCEPTCONN` (`option` reads a socket option).
+#[cfg(not(target_os = "macos"))]
+fn accepting(_fd: &OwnedFd, option: impl Fn(libc::c_int) -> io::Result<libc::c_int>) -> io::Result<bool> {
+    Ok(option(libc::SO_ACCEPTCONN)? != 0)
+}
+
+/// Whether the stream socket `fd` listens. Apple's `getsockopt` has no `SO_ACCEPTCONN`, so it is
+/// read from the socket's options as the kernel describes them (`proc_pidfdinfo`'s
+/// `PROC_PIDFDSOCKETINFO`, as `lsof` reads it), at the offsets of `<sys/proc_info.h>`'s
+/// `socket_fdinfo`; its type and family, read from the same description, are checked against
+/// what `getsockopt` says so a layout other than this one is an error, never a wrong answer.
+#[cfg(target_os = "macos")]
+fn accepting(fd: &OwnedFd, option: impl Fn(libc::c_int) -> io::Result<libc::c_int>) -> io::Result<bool> {
+    const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+    // `socket_fdinfo` is a 24-byte `proc_fileinfo`, then `socket_info`: a 136-byte
+    // `vinfo_stat`, `soi_so` and `soi_pcb` (8 bytes each), then `soi_type`, `soi_protocol`,
+    // `soi_family` (`int`s) and `soi_options` (a `short`).
+    const TYPE: usize = 24 + 152;
+    const FAMILY: usize = 24 + 160;
+    const OPTIONS: usize = 24 + 164;
+    // Larger than `socket_fdinfo` (792 bytes): the call refuses a smaller buffer only.
+    let mut info = [0u64; 256];
+    let size = std::mem::size_of_val(&info) as libc::c_int;
+    // SAFETY: `info` is valid for writes of `size` bytes, and the call writes at most that.
+    let got = unsafe {
+        libc::proc_pidfdinfo(libc::getpid(), fd.as_raw_fd(), PROC_PIDFDSOCKETINFO, info.as_mut_ptr().cast(), size)
+    };
+    if got <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `info` is plain bytes, 2048 of them, all initialized.
+    let bytes = unsafe { std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), std::mem::size_of_val(&info)) };
+    let int = |at: usize| libc::c_int::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+    if (got as usize) < OPTIONS + 2
+        || int(TYPE) != option(libc::SO_TYPE)?
+        || int(FAMILY) != libc::AF_UNIX && int(FAMILY) != libc::AF_INET && int(FAMILY) != libc::AF_INET6
+    {
+        return Err(io::Error::other("the kernel's description of the socket is not laid out as <sys/proc_info.h> says"));
+    }
+    let options = libc::c_short::from_ne_bytes(bytes[OPTIONS..OPTIONS + 2].try_into().expect("2 bytes"));
+    Ok(libc::c_int::from(options) & libc::SO_ACCEPTCONN != 0)
 }
 
 fn not_connectable(at: &Address) -> io::Error {

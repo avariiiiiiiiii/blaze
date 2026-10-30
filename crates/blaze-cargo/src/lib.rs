@@ -4,6 +4,7 @@
 
 #![allow(clippy::print_stderr, reason = "a command line program: stderr is where it speaks")]
 #![deny(unsafe_code)]
+#![feature(random)]
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +25,6 @@ pub mod sandbox;
 #[allow(unsafe_code, reason = "the daemon's own signal and process calls")]
 pub mod serve;
 pub mod socket;
-pub mod stub;
 pub mod toolchain;
 pub mod unstable;
 
@@ -84,9 +84,6 @@ pub struct Told {
     #[serde(default)]
     pub ahead: bool,
 }
-
-/// The target of a build script whose commands run on the host (`--run-tool`).
-pub const RUN_TOOL_TARGET: &str = "wasm32-wasip1";
 
 /// Has `bytes` be the file at `path`. A file that was there is left as it is for whoever has
 /// it open or under another name: the object of a program can be that of another one too.

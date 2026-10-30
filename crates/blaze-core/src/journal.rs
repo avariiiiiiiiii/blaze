@@ -70,7 +70,7 @@ impl Names {
     pub fn push_joined(&mut self, dir: &str, rest: &str) -> bool {
         let start = self.bytes.len();
         self.bytes.extend_from_slice(dir.as_bytes());
-        if !dir.is_empty() && !rest.is_empty() {
+        if !dir.is_empty() {
             self.bytes.push(b'/');
         }
         self.bytes.extend_from_slice(rest.as_bytes());

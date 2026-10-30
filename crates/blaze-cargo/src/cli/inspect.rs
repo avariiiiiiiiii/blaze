@@ -151,16 +151,27 @@ pub fn main(what: Inspected, words: Vec<OsString>, color: bool) -> i32 {
         Err(what) => return refused(&what, FAILED),
     };
     let view = ViewRef::Head(cargo.root.clone());
+    // alloc: error path, the refusal said once.
+    let targets = |cargo| place::targets(&build, cargo).map_err(|it| refused(&it.to_string(), FAILED));
     let request = match what {
-        Inspected::CodegenInputs => Request::CodegenInputs { view, targets: place::targets(&build, cargo) },
-        Inspected::Trace => Request::Trace { view, targets: place::targets(&build, cargo) },
+        Inspected::CodegenInputs => match targets(cargo) {
+            Ok(targets) => Request::CodegenInputs { view, targets },
+            Err(code) => return code,
+        },
+        Inspected::Trace => match targets(cargo) {
+            Ok(targets) => Request::Trace { view, targets },
+            Err(code) => return code,
+        },
         Inspected::Tables => Request::Tables { view },
         Inspected::Pack => {
             let [program] = &build.flags.packages[..] else {
                 return refused("`blaze pack` packs one program: name its package with `-p PACKAGE`", USAGE);
             };
             let program = program.clone(); // clone: the request owns it, once
-            Request::Pack { view, targets: place::targets(&build, cargo), program }
+            match targets(cargo) {
+                Ok(targets) => Request::Pack { view, targets, program },
+                Err(code) => return code,
+            }
         }
     };
     let mut client = match daemon::connect(Start::IfMissing) {

@@ -1695,7 +1695,7 @@ fn named_in(functions: &[Function], addr: u64) -> String {
 }
 
 fn error(what: String) -> LinkError {
-    LinkError { function: None, what }
+    LinkError { function: None, what, refusal: None }
 }
 
 #[cfg(test)]

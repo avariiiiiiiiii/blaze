@@ -78,7 +78,6 @@ use rustc_type_ir::{
 };
 use salsa::SalsaValue;
 use span::Edition;
-use stdx::never;
 use thin_vec::ThinVec;
 
 use crate::{
@@ -2600,7 +2599,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             resolver.resolve_completely(liberated_sig);
         }
         for (_, predicate) in coroutine_stalled.iter_mut() {
-            resolver.resolve_completely(predicate);
+            resolver.resolve_completely_without_normalizing(predicate);
         }
         // A slice's iterator is `TrustedLen`: the `Box` is made once at its length.
         let tuple_field_access_types: Box<[StoredTys]> = tuple_field_accesses_rev
@@ -2651,6 +2650,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             func.into(),
             self.db.callable_item_signature(func.into()).instantiate_identity().skip_norm_wip(),
         );
+        // rustc's `typeck`: the signature as seen from inside the body is normalized. Its
+        // errors are wfcheck's, at the signature, so they are not reported here again.
+        let sig = self.table.normalize(Span::Dummy, sig);
 
         // C-variadic fns also have a `VaList` input that's not listed in `fn_sig`
         // (as it's created inside the body itself, not passed in from outside).
@@ -2898,7 +2900,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     }
 
     pub(crate) fn create_anon_const(&mut self, expr: ExprId, expected_ty: Ty<'db>) -> Const<'db> {
-        never!(expected_ty.has_infer(), "cannot have infer vars in an anon const's ty");
+        assert!(!expected_ty.has_infer(), "cannot have infer vars in an anon const's ty");
         let konst = create_anon_const(
             self.interner(),
             self.store_owner,
@@ -3132,10 +3134,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         expr_is_read: ExprIsRead,
     ) -> Ty<'db> {
         let result = self.coerce(expr, checked_ty, expected, allow_two_phase, expr_is_read);
-        if let Err(_err) = result {
-            // FIXME: Emit diagnostic.
-        }
-        result.unwrap_or(self.types.types.error)
+        // As rustc's `demand_coerce`: a refused coercion is E0308.
+        result.unwrap_or_else(|_| {
+            self.emit_type_mismatch(expr.into(), expected, checked_ty);
+            self.types.types.error
+        })
     }
 
     pub(crate) fn type_must_be_known_at_this_point(
@@ -3341,8 +3344,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 let Some(remaining_idx) = unresolved else {
                     drop(ctx);
                     let Some(mod_path) = path.mod_path() else {
-                        never!("resolver should always resolve lang item paths");
-                        return (self.types.types.error, None);
+                        unreachable!("resolver should always resolve lang item paths");
                     };
                     return self.resolve_variant_on_alias(node, ty, None, mod_path);
                 };
@@ -3451,8 +3453,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             }
             TypeNs::TypeAliasId(it) => {
                 let Some(mod_path) = path.mod_path() else {
-                    never!("resolver should always resolve lang item paths");
-                    return (self.types.types.error, None);
+                    unreachable!("resolver should always resolve lang item paths");
                 };
                 let args =
                     path_ctx.substs_from_path_segment(it.into(), true, None, false, node.into());

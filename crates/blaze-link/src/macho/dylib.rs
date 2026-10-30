@@ -24,10 +24,6 @@ const EDGES_INLINE: usize = 64;
 
 type Header = macho::MachHeader64<Endianness>;
 
-/// dyld's flag for an export whose address is a resolver dyld runs once at load (newer than
-/// `object`'s constants).
-const EXPORT_SYMBOL_FLAGS_STATIC_RESOLVER: u64 = 0x20;
-
 /// A thin Mach-O dynamic library (`MH_DYLIB`, or an `MH_DYLIB_STUB`) for `arch`: its install
 /// name (`LC_ID_DYLIB`) and what it exports.
 pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Shared, String> {
@@ -53,7 +49,7 @@ impl Section {
     }
 
     fn code(&self) -> bool {
-        self.flags & (macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS) != 0
+        self.flags & (macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS).0 != 0
     }
 }
 
@@ -142,7 +138,7 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
                         sections.push(Section {
                             addr: section.addr(endian),
                             size: section.size(endian),
-                            flags: section.flags(endian),
+                            flags: section.flags(endian).0,
                         });
                     }
                 }
@@ -383,12 +379,12 @@ fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Resul
 
 #[cfg(any(test, feature = "fuzz"))]
 fn test_sections() -> Vec<Section> {
-    let code = macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
+    let code = (macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS).0;
     // alloc: sections for tests and the fuzz differential only
     vec![
         Section { addr: 0x4000, size: 0x100, flags: 0 },
         Section { addr: 0x1000, size: 0x100, flags: code },
-        Section { addr: 0x4100, size: 0x30, flags: macho::S_THREAD_LOCAL_VARIABLES },
+        Section { addr: 0x4100, size: 0x30, flags: macho::S_THREAD_LOCAL_VARIABLES.to_flags().0 },
         Section { addr: 0x2000, size: 0, flags: code },
     ]
 }
@@ -421,30 +417,30 @@ pub(crate) fn trie_differential(trie: &[u8]) -> Result<bool, String> {
 
 /// What a terminal node's export info says: the symbol's kind and whether it is weak.
 fn export(info: &[u8], classify: &impl Fn(u64) -> SymbolKind) -> Result<(SymbolKind, bool), String> {
-    let known = u64::from(
-        macho::EXPORT_SYMBOL_FLAGS_KIND_MASK
-            | macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
-            | macho::EXPORT_SYMBOL_FLAGS_REEXPORT
-            | macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER,
-    ) | EXPORT_SYMBOL_FLAGS_STATIC_RESOLVER;
+    let known = (macho::EXPORT_SYMBOL_FLAGS_KIND_MASK
+        | macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION
+        | macho::EXPORT_SYMBOL_FLAGS_REEXPORT
+        | macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER
+        | macho::EXPORT_SYMBOL_FLAGS_STATIC_RESOLVER)
+        .0;
     let mut info = Reader::new(info);
     let flags = info.uleb().map_err(trie_error)?;
     if flags & !known != 0 {
         // alloc: error path
         return Err(format!("unknown export flags {:#x}", flags & !known));
     }
-    let weak = flags & u64::from(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION) != 0;
-    let kind = (flags & u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_MASK)) as u32;
-    let tls = kind == macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL;
-    if kind > macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE {
+    let weak = flags & macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0 != 0;
+    let kind = (flags & macho::EXPORT_SYMBOL_FLAGS_KIND_MASK.0) as u8;
+    let tls = kind == macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0;
+    if kind > macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.0 {
         // alloc: error path
         return Err(format!("unknown export kind {kind}"));
     }
-    let kind = if flags & u64::from(macho::EXPORT_SYMBOL_FLAGS_REEXPORT) != 0 {
+    let kind = if flags & macho::EXPORT_SYMBOL_FLAGS_REEXPORT.0 != 0 {
         info.uleb().map_err(trie_error)?;
         info.cstr().map_err(trie_error)?;
         if tls { SymbolKind::Tls } else { SymbolKind::Other }
-    } else if flags & u64::from(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER) != 0 {
+    } else if flags & macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.0 != 0 {
         let stub = info.uleb().map_err(trie_error)?;
         info.uleb().map_err(trie_error)?;
         classify(stub)
@@ -452,9 +448,9 @@ fn export(info: &[u8], classify: &impl Fn(u64) -> SymbolKind) -> Result<(SymbolK
         let address = info.uleb().map_err(trie_error)?;
         if tls {
             SymbolKind::Tls
-        } else if kind == macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE {
+        } else if kind == macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.0 {
             SymbolKind::Data
-        } else if flags & EXPORT_SYMBOL_FLAGS_STATIC_RESOLVER != 0 {
+        } else if flags & macho::EXPORT_SYMBOL_FLAGS_STATIC_RESOLVER.0 != 0 {
             SymbolKind::Function
         } else {
             classify(address)
@@ -471,11 +467,11 @@ fn symtab_exports<'a>(
     sections: &[Section],
     names: &mut Names,
 ) -> Result<Vec<SharedSymbol>, String> {
-    let external = |n_type: u8| {
-        n_type & macho::N_STAB == 0
-            && n_type & macho::N_EXT != 0
-            && n_type & macho::N_PEXT == 0
-            && !matches!(n_type & macho::N_TYPE, macho::N_UNDF | macho::N_PBUD)
+    let external = |n_type: macho::SymbolFlags| {
+        !n_type.is_stab()
+            && n_type.contains(macho::N_EXT)
+            && !n_type.contains(macho::N_PEXT)
+            && !matches!(n_type.typ(), macho::N_UNDF | macho::N_PBUD)
     };
     let mut out = Vec::with_capacity(table.iter().filter(|it| external(it.n_type())).count());
     for nlist in table.iter() {
@@ -483,7 +479,7 @@ fn symtab_exports<'a>(
         if !external(n_type) {
             continue;
         }
-        let kind = match n_type & macho::N_TYPE {
+        let kind = match n_type.typ() {
             macho::N_SECT => {
                 let index = nlist.n_sect();
                 let section = usize::from(index)
@@ -491,7 +487,7 @@ fn symtab_exports<'a>(
                     .and_then(|it| sections.get(it))
                     // alloc: error path
                     .ok_or_else(|| format!("a symbol in section {index}, which does not exist"))?;
-                if section.flags & macho::SECTION_TYPE == macho::S_THREAD_LOCAL_VARIABLES {
+                if macho::SectionFlags(section.flags).typ() == macho::S_THREAD_LOCAL_VARIABLES {
                     SymbolKind::Tls
                 } else if section.code() {
                     SymbolKind::Function
@@ -509,7 +505,7 @@ fn symtab_exports<'a>(
             name: super::push_core_name(names, name)?,
             version: None,
             kind,
-            weak: nlist.n_desc(endian) & macho::N_WEAK_DEF != 0,
+            weak: nlist.n_desc(endian).contains(macho::N_WEAK_DEF),
         });
     }
     Ok(out)
@@ -529,7 +525,7 @@ mod tests {
 
     fn segment(name: &str, vmaddr: u64, fileoff: u64, filesize: u64, sections: &[(&str, u64, u64, u32)]) -> Vec<u8> {
         let mut out = Vec::new();
-        out.put_u32(macho::LC_SEGMENT_64);
+        out.put_u32(macho::LC_SEGMENT_64.0);
         out.put_u32(72 + 80 * sections.len() as u32);
         name16(&mut out, name);
         out.put_u64(vmaddr);
@@ -567,7 +563,7 @@ mod tests {
 
     fn dyld_info(export_off: u32, export_size: u32) -> Vec<u8> {
         let mut out = Vec::new();
-        out.put_u32(macho::LC_DYLD_INFO_ONLY);
+        out.put_u32(macho::LC_DYLD_INFO_ONLY.0);
         out.put_u32(48);
         for _ in 0..8 {
             out.put_u32(0);
@@ -579,7 +575,7 @@ mod tests {
 
     fn symtab_command(symoff: u32, nsyms: u32, stroff: u32, strsize: u32) -> Vec<u8> {
         let mut out = Vec::new();
-        for value in [macho::LC_SYMTAB, 24, symoff, nsyms, stroff, strsize] {
+        for value in [macho::LC_SYMTAB.0, 24, symoff, nsyms, stroff, strsize] {
             out.put_u32(value);
         }
         out
@@ -595,7 +591,7 @@ mod tests {
         out.put_u32(macho::MH_MAGIC_64);
         out.put_u32(cpu);
         out.put_u32(0);
-        out.put_u32(macho::MH_DYLIB);
+        out.put_u32(macho::MH_DYLIB.0);
         out.put_u32(commands.len() as u32);
         out.put_u32(sizeofcmds as u32);
         out.put_u32(0);
@@ -609,7 +605,7 @@ mod tests {
     }
 
     fn segments(len: u64) -> Vec<Vec<u8>> {
-        let code = macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
+        let code = macho::S_ATTR_PURE_INSTRUCTIONS.0 | macho::S_ATTR_SOME_INSTRUCTIONS.0;
         vec![
             segment("__TEXT", 0, 0, len, &[("__text", 0x1000, 0x100, code)]),
             segment(
@@ -617,7 +613,7 @@ mod tests {
                 0x4000,
                 0x4000,
                 0,
-                &[("__data", 0x4000, 0x100, 0), ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES)],
+                &[("__data", 0x4000, 0x100, 0), ("__thread_vars", 0x4100, 0x30, macho::S_THREAD_LOCAL_VARIABLES.to_flags().0)],
             ),
         ]
     }
@@ -628,8 +624,8 @@ mod tests {
             cpu,
             |tail| {
                 let mut commands = segments(0x1000);
-                commands.push(dylib_command(macho::LC_ID_DYLIB, "/usr/lib/libfoo.dylib"));
-                commands.push(dylib_command(macho::LC_REEXPORT_DYLIB, "/usr/lib/libbar.dylib"));
+                commands.push(dylib_command(macho::LC_ID_DYLIB.0, "/usr/lib/libfoo.dylib"));
+                commands.push(dylib_command(macho::LC_REEXPORT_DYLIB.0, "/usr/lib/libbar.dylib"));
                 commands.push(dyld_info(tail, size));
                 commands
             },
@@ -692,17 +688,17 @@ mod tests {
         out
     }
 
-    fn info(flags: u32, values: &[u64]) -> Vec<u8> {
+    fn info(flags: u64, values: &[u64]) -> Vec<u8> {
         let mut out = Vec::new();
-        blaze_format::leb::write_u64(&mut out, u64::from(flags));
+        blaze_format::leb::write_u64(&mut out, flags);
         for &value in values {
             blaze_format::leb::write_u64(&mut out, value);
         }
         out
     }
 
-    fn reexport(flags: u32, ordinal: u64, import: &str) -> Vec<u8> {
-        let mut out = info(flags | macho::EXPORT_SYMBOL_FLAGS_REEXPORT, &[ordinal]);
+    fn reexport(flags: u64, ordinal: u64, import: &str) -> Vec<u8> {
+        let mut out = info(flags | macho::EXPORT_SYMBOL_FLAGS_REEXPORT.0, &[ordinal]);
         out.extend_from_slice(import.as_bytes());
         out.push(0);
         out
@@ -747,22 +743,22 @@ mod tests {
     fn sample_trie() -> Vec<u8> {
         let foo = Node {
             terminal: info(0, &[0x1010]),
-            children: vec![("bar", leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, &[0x4010])))],
+            children: vec![("bar", leaf(info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[0x4010])))],
         };
         let fo = Node {
             terminal: Vec::new(),
             children: vec![
                 ("o", foo),
                 ("b", leaf(reexport(0, 1, "_bob"))),
-                ("_tls", leaf(info(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL, &[0x4100]))),
+                ("_tls", leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0), &[0x4100]))),
             ],
         };
         let underscore = Node {
             terminal: Vec::new(),
             children: vec![
                 ("fo", fo),
-                ("abs", leaf(info(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE, &[0x1234]))),
-                ("res", leaf(info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER, &[0x1020, 0x1030]))),
+                ("abs", leaf(info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.0), &[0x1234]))),
+                ("res", leaf(info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.0, &[0x1020, 0x1030]))),
                 ("same", leaf(reexport(0, 1, ""))),
             ],
         };
@@ -771,7 +767,7 @@ mod tests {
 
     #[test]
     fn trie_dylib() {
-        let bytes = with_trie(macho::CPU_TYPE_ARM64, &sample_trie());
+        let bytes = with_trie(macho::CPU_TYPE_ARM64.0, &sample_trie());
         let shared = read("libfoo.dylib", &bytes, Arch::Aarch64).unwrap();
         assert_eq!(shared.name, "/usr/lib/libfoo.dylib");
         assert_eq!(shared.inputs, vec!["/usr/lib/libbar.dylib".to_owned()]);
@@ -795,12 +791,12 @@ mod tests {
         let trie = sample_trie();
         let size = trie.len() as u32;
         let bytes = file(
-            macho::CPU_TYPE_X86_64,
+            macho::CPU_TYPE_X86_64.0,
             |tail| {
                 let mut commands = segments(0x1000);
-                commands.push(dylib_command(macho::LC_ID_DYLIB, "/usr/lib/libfoo.dylib"));
+                commands.push(dylib_command(macho::LC_ID_DYLIB.0, "/usr/lib/libfoo.dylib"));
                 let mut trie = Vec::new();
-                for value in [macho::LC_DYLD_EXPORTS_TRIE, 16, tail, size] {
+                for value in [macho::LC_DYLD_EXPORTS_TRIE.0, 16, tail, size] {
                     trie.put_u32(value);
                 }
                 commands.push(trie);
@@ -810,7 +806,7 @@ mod tests {
         );
         let shared = read("libfoo.dylib", &bytes, Arch::X86_64).unwrap();
         assert_eq!(shared.symbols.len(), 7);
-        assert_eq!(exports(&shared), exports(&read("libfoo.dylib", &with_trie(macho::CPU_TYPE_X86_64, &trie), Arch::X86_64).unwrap()));
+        assert_eq!(exports(&shared), exports(&read("libfoo.dylib", &with_trie(macho::CPU_TYPE_X86_64.0, &trie), Arch::X86_64).unwrap()));
         assert!(shared.inputs.is_empty());
     }
 
@@ -818,7 +814,7 @@ mod tests {
     /// archive member's, a universal file's slice): every offset reads the same.
     #[test]
     fn any_alignment() {
-        let trie = with_trie(macho::CPU_TYPE_ARM64, &sample_trie());
+        let trie = with_trie(macho::CPU_TYPE_ARM64.0, &sample_trie());
         let expected = exports(&read("libfoo.dylib", &trie, Arch::Aarch64).unwrap());
         let mut buffer = Vec::with_capacity(trie.len() + 16);
         for shift in 1..16 {
@@ -833,7 +829,7 @@ mod tests {
 
     #[test]
     fn wrong_cpu() {
-        let bytes = with_trie(macho::CPU_TYPE_ARM64, &sample_trie());
+        let bytes = with_trie(macho::CPU_TYPE_ARM64.0, &sample_trie());
         let error = read("libfoo.dylib", &bytes, Arch::X86_64).unwrap_err();
         assert!(error.starts_with("libfoo.dylib: ") && error.contains("CPU type"), "{error}");
     }
@@ -851,7 +847,7 @@ mod tests {
             (&too_long[..], "too long"),
             (&runs_past[..], "runs past the end"),
         ] {
-            let bytes = with_trie(macho::CPU_TYPE_ARM64, trie);
+            let bytes = with_trie(macho::CPU_TYPE_ARM64.0, trie);
             let error = read("bad.dylib", &bytes, Arch::Aarch64).unwrap_err();
             assert!(error.starts_with("bad.dylib: ") && error.contains(what), "{what}: {error}");
         }
@@ -860,13 +856,13 @@ mod tests {
     #[test]
     fn symtab_dylib() {
         let symbols: [(&str, u8, u8, u16, u64); 7] = [
-            ("_f", macho::N_SECT | macho::N_EXT, 1, 0, 0x1000),
-            ("_d", macho::N_SECT | macho::N_EXT, 2, macho::N_WEAK_DEF, 0x4000),
-            ("_t", macho::N_SECT | macho::N_EXT, 3, 0, 0x4100),
-            ("_local", macho::N_SECT, 1, 0, 0x1004),
-            ("_pext", macho::N_SECT | macho::N_EXT | macho::N_PEXT, 1, 0, 0x1008),
-            ("_undef", macho::N_UNDF | macho::N_EXT, 0, 0, 0),
-            ("_abs", macho::N_ABS | macho::N_EXT, 0, 0, 0x42),
+            ("_f", macho::N_SECT.0 | macho::N_EXT.0, 1, 0, 0x1000),
+            ("_d", macho::N_SECT.0 | macho::N_EXT.0, 2, macho::N_WEAK_DEF.0, 0x4000),
+            ("_t", macho::N_SECT.0 | macho::N_EXT.0, 3, 0, 0x4100),
+            ("_local", macho::N_SECT.0, 1, 0, 0x1004),
+            ("_pext", macho::N_SECT.0 | macho::N_EXT.0 | macho::N_PEXT.0, 1, 0, 0x1008),
+            ("_undef", macho::N_UNDF.0 | macho::N_EXT.0, 0, 0, 0),
+            ("_abs", macho::N_ABS.0 | macho::N_EXT.0, 0, 0, 0x42),
         ];
         let mut strings = vec![0u8];
         let mut table = Vec::new();
@@ -884,10 +880,10 @@ mod tests {
         let mut tail = table;
         tail.extend_from_slice(&strings);
         let bytes = file(
-            macho::CPU_TYPE_ARM64,
+            macho::CPU_TYPE_ARM64.0,
             |at| {
                 let mut commands = segments(0x1000);
-                commands.push(dylib_command(macho::LC_ID_DYLIB, "/usr/lib/libsym.dylib"));
+                commands.push(dylib_command(macho::LC_ID_DYLIB.0, "/usr/lib/libsym.dylib"));
                 commands.push(symtab_command(at, nsyms, at + table_len, strsize));
                 commands
             },
@@ -932,10 +928,10 @@ mod tests {
         match rng.below(7) {
             0 => Vec::new(),
             1 => info(0, &[addr]),
-            2 => info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, &[addr]),
-            3 => info(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL, &[addr]),
-            4 => info(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE, &[addr]),
-            5 => info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER, &[addr, 0x1030]),
+            2 => info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION.0, &[addr]),
+            3 => info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0), &[addr]),
+            4 => info(u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.0), &[addr]),
+            5 => info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER.0, &[addr, 0x1030]),
             _ => reexport(0, 1, "_other"),
         }
     }
@@ -980,7 +976,7 @@ mod tests {
                 .map(|_| Section {
                     addr: rng.below(16) as u64 * 0x10,
                     size: rng.below(3) as u64 * 0x10,
-                    flags: rng.below(2) as u32 * macho::S_ATTR_PURE_INSTRUCTIONS,
+                    flags: rng.below(2) as u32 * macho::S_ATTR_PURE_INSTRUCTIONS.0,
                 })
                 .collect();
             let sections = Sections::new(&all);
@@ -1000,7 +996,7 @@ mod tests {
     /// name arena, the symbols and the trie's bitset: nothing per export or per section.
     #[test]
     fn read_allocation_budget() {
-        let bytes = with_trie(macho::CPU_TYPE_ARM64, &sample_trie());
+        let bytes = with_trie(macho::CPU_TYPE_ARM64.0, &sample_trie());
         let shared = blaze_alloc_count::assert_at_most(6, "dylib::read of a library with a trie", || {
             read("libfoo.dylib", &bytes, Arch::Aarch64)
         })

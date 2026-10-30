@@ -65,14 +65,18 @@ mod held {
 
     use crate::{Command, Sandbox};
 
-    /// A copy of the system's shell in a directory of the test's own, executable: a file this
-    /// process wrote, as the daemon writes a program it built.
+    /// A program in a directory of the test's own, executable: a file this process wrote, as
+    /// the daemon writes a program it built. On Linux a copy of the system's shell; elsewhere a
+    /// script of it, since macOS kills a copy of a platform binary as it starts.
     fn written(what: &str) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!("blaze-busy-{what}-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let program = dir.join("sh");
+        #[cfg(target_os = "linux")]
         std::fs::copy("/bin/sh", &program).unwrap();
+        #[cfg(not(target_os = "linux"))]
+        std::fs::write(&program, "#!/bin/sh\nexit 7\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         (dir, program)
     }

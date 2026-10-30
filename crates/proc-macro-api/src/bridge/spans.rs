@@ -1,13 +1,12 @@
-//! The span operations a macro asks of its host that both hosts answer the same way:
-//! `Span::join` and `Span::subspan`, as rust-analyzer's proc-macro server
-//! (`proc-macro-srv/src/server_impl/rust_analyzer_span.rs`) answers them.
+//! The span operations a macro asks of blaze-macro-eval's server: `Span::join` and
+//! `Span::subspan`, answered as rust-analyzer's proc-macro server answered them.
 
 use span::{
     EditionedFileId, ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor,
     SyntaxContext, TextRange, TextSize,
 };
 
-use crate::bidirectional_protocol::msg::{SubRequest, SubResponse};
+use super::questions::{SubRequest, SubResponse};
 
 /// `start..end`, an end before the start taken as the start.
 pub fn range(start: u32, end: u32) -> TextRange {
@@ -94,7 +93,7 @@ pub fn join(
             file_id: first.anchor.file_id,
             ast_id: ErasedFileAstId::from_raw(it.ast_id),
         };
-        // `it.ctx` is what `ask` answered for this join, which each host gets from
+        // `it.ctx` is what `ask` answered for this join, which the server gets from
         // `blaze_lower::answer` of the running expansion's database, in this process; a wrong
         // value panics in `from_u32` or in salsa's checked lookup, or names another context's
         // hygiene.

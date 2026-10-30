@@ -74,13 +74,13 @@ const UNWIND_INFO: &str = "__unwind_info";
 const START: &str = "blaze_inproc_start";
 
 fn error(what: impl Into<String>) -> LinkError {
-    LinkError { function: None, what: what.into() }
+    LinkError { function: None, what: what.into(), refusal: None }
 }
 
 pub(crate) fn writer(output: &Output) -> Result<MachO, LinkError> {
     let (cpu, subtype, page) = match output.arch {
-        Arch::Aarch64 => (macho::CPU_TYPE_ARM64, macho::CPU_SUBTYPE_ARM64_ALL, 0x4000),
-        Arch::X86_64 => (macho::CPU_TYPE_X86_64, macho::CPU_SUBTYPE_X86_64_ALL, 0x1000),
+        Arch::Aarch64 => (macho::CPU_TYPE_ARM64.0, macho::CPU_SUBTYPE_ARM64_ALL.0, 0x4000),
+        Arch::X86_64 => (macho::CPU_TYPE_X86_64.0, macho::CPU_SUBTYPE_X86_64_ALL.0, 0x1000),
         Arch::Wasm32 => return Err(error("a Mach-O image for wasm32, which has no Mach-O")),
     };
     if output.dev_run.is_some() {
@@ -225,7 +225,7 @@ fn locals_into(
             for (&(addr, name), entry) in chunk.iter().zip(entries.chunks_exact_mut(NLIST)) {
                 let (prefix, rest) = spelled(name);
                 entry[0..4].copy_from_slice(&((start + written) as u32).to_le_bytes());
-                entry[4] = macho::N_SECT;
+                entry[4] = macho::N_SECT.0;
                 entry[5] = section_at(addr, name)?;
                 entry[6..8].copy_from_slice(&0u16.to_le_bytes());
                 entry[8..16].copy_from_slice(&addr.to_le_bytes());
@@ -301,9 +301,9 @@ impl Segment {
     /// `initprot` and `maxprot` of its load command.
     fn vm_prot(self) -> u32 {
         match self {
-            Segment::Text => macho::VM_PROT_READ | macho::VM_PROT_EXECUTE,
+            Segment::Text => macho::VM_PROT_READ.0 | macho::VM_PROT_EXECUTE.0,
             // `__DATA_CONST` is written by the loader, which makes it read-only after.
-            Segment::DataConst | Segment::Data => macho::VM_PROT_READ | macho::VM_PROT_WRITE,
+            Segment::DataConst | Segment::Data => macho::VM_PROT_READ.0 | macho::VM_PROT_WRITE.0,
             // The start hook maps over them with `VM_FLAGS_OVERWRITE`, which no `maxprot` limits.
             Segment::Arena | Segment::Cells | Segment::Fixed => 0,
         }
@@ -357,7 +357,7 @@ fn zeroed(class: &Class) -> bool {
 
 /// The segment, name and flags of the section a region is in the file.
 fn section_of(class: &Class) -> (Segment, &str, u32) {
-    let code = macho::S_REGULAR | macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
+    let code = macho::S_REGULAR.to_flags().0 | macho::S_ATTR_PURE_INSTRUCTIONS.0 | macho::S_ATTR_SOME_INSTRUCTIONS.0;
     let (segment, _) = place(class);
     let (name, flags) = match class {
         Class::Text => ("__text", code),
@@ -365,35 +365,35 @@ fn section_of(class: &Class) -> (Segment, &str, u32) {
         Class::Stubs => ("__blaze_stubs", code),
         Class::Plt => ("__stubs", code),
         Class::Veneers => ("__blaze_veneers", code),
-        Class::Rodata => ("__const", macho::S_REGULAR),
-        Class::Synthetic(name) => (*name, macho::S_REGULAR),
+        Class::Rodata => ("__const", macho::S_REGULAR.to_flags().0),
+        Class::Synthetic(name) => (*name, macho::S_REGULAR.to_flags().0),
         Class::EhFrame => (
             "__eh_frame",
-            macho::S_COALESCED
-                | macho::S_ATTR_NO_TOC
-                | macho::S_ATTR_STRIP_STATIC_SYMS
-                | macho::S_ATTR_LIVE_SUPPORT,
+            macho::S_COALESCED.to_flags().0
+                | macho::S_ATTR_NO_TOC.0
+                | macho::S_ATTR_STRIP_STATIC_SYMS.0
+                | macho::S_ATTR_LIVE_SUPPORT.0,
         ),
-        Class::InitArray => ("__mod_init_func", macho::S_MOD_INIT_FUNC_POINTERS),
-        Class::PreinitArray => ("__preinit_array", macho::S_REGULAR),
-        Class::FiniArray => ("__mod_term_func", macho::S_MOD_TERM_FUNC_POINTERS),
-        Class::Got => ("__got", macho::S_NON_LAZY_SYMBOL_POINTERS),
-        Class::RelRo => ("__const", macho::S_REGULAR),
-        Class::Table => ("__blaze_table", macho::S_REGULAR),
-        Class::Data => ("__data", macho::S_REGULAR),
-        Class::PatchData => ("__blaze_pdata", macho::S_REGULAR),
-        Class::ThreadVars => ("__thread_vars", macho::S_THREAD_LOCAL_VARIABLES),
-        Class::Tdata => ("__thread_data", macho::S_THREAD_LOCAL_REGULAR),
-        Class::Tbss => ("__thread_bss", macho::S_THREAD_LOCAL_ZEROFILL),
-        Class::Bss => ("__bss", macho::S_ZEROFILL),
+        Class::InitArray => ("__mod_init_func", macho::S_MOD_INIT_FUNC_POINTERS.to_flags().0),
+        Class::PreinitArray => ("__preinit_array", macho::S_REGULAR.to_flags().0),
+        Class::FiniArray => ("__mod_term_func", macho::S_MOD_TERM_FUNC_POINTERS.to_flags().0),
+        Class::Got => ("__got", macho::S_NON_LAZY_SYMBOL_POINTERS.to_flags().0),
+        Class::RelRo => ("__const", macho::S_REGULAR.to_flags().0),
+        Class::Table => ("__blaze_table", macho::S_REGULAR.to_flags().0),
+        Class::Data => ("__data", macho::S_REGULAR.to_flags().0),
+        Class::PatchData => ("__blaze_pdata", macho::S_REGULAR.to_flags().0),
+        Class::ThreadVars => ("__thread_vars", macho::S_THREAD_LOCAL_VARIABLES.to_flags().0),
+        Class::Tdata => ("__thread_data", macho::S_THREAD_LOCAL_REGULAR.to_flags().0),
+        Class::Tbss => ("__thread_bss", macho::S_THREAD_LOCAL_ZEROFILL.to_flags().0),
+        Class::Bss => ("__bss", macho::S_ZEROFILL.to_flags().0),
         // A reservation's segment has no section ([`MachO::image`]): the name is for errors.
-        Class::Reserve(_) => ("__reserved", macho::S_ZEROFILL),
+        Class::Reserve(_) => ("__reserved", macho::S_ZEROFILL.to_flags().0),
         Class::Named { name, .. } => {
             let (seg, sect) = split(name);
             let flags = match sect {
-                "__thread_init" => macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS,
-                "__cstring" => macho::S_CSTRING_LITERALS,
-                _ => macho::S_REGULAR,
+                "__thread_init" => macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS.to_flags().0,
+                "__cstring" => macho::S_CSTRING_LITERALS.to_flags().0,
+                _ => macho::S_REGULAR.to_flags().0,
             };
             let sect = match (seg, sect) {
                 ("__LD", "__compact_unwind") => "__blaze_unwind",
@@ -425,7 +425,7 @@ pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<Secti
         ("__TEXT", "__eh_frame") => return Ok(SectionKind::EhFrame),
         _ => {}
     }
-    if segment == "__DWARF" || segment == "__LLVM" || flags & macho::S_ATTR_DEBUG != 0 {
+    if segment == "__DWARF" || segment == "__LLVM" || flags & macho::S_ATTR_DEBUG.0 != 0 {
         return Ok(SectionKind::Dropped);
     }
     if Segment::of(segment).is_none() || segment == "__LD" {
@@ -436,7 +436,7 @@ pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<Secti
         ));
     }
     let text = segment == "__TEXT";
-    match flags & macho::SECTION_TYPE {
+    match macho::SectionFlags(flags).typ() {
         macho::S_MOD_INIT_FUNC_POINTERS => return alloc(Class::InitArray),
         macho::S_MOD_TERM_FUNC_POINTERS => return alloc(Class::FiniArray),
         macho::S_THREAD_LOCAL_REGULAR => return alloc(Class::Tdata),
@@ -468,7 +468,25 @@ pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<Secti
             // alloc: error path
             return Err(format!("the section `{segment},{section}` holds DTrace probes (DOF)"));
         }
-        _ => {}
+        // Laid out as their bytes by name below: the writer keeps no section type but these
+        // need none (literals and coalesced sections are only deduplicated by ld64).
+        macho::S_REGULAR
+        | macho::S_COALESCED
+        | macho::S_LITERAL_POINTERS
+        | macho::S_CSTRING_LITERALS
+        | macho::S_4BYTE_LITERALS
+        | macho::S_8BYTE_LITERALS
+        | macho::S_16BYTE_LITERALS => {}
+        // dyld finds interposing tuples by this name as well as by the type.
+        macho::S_INTERPOSING if (segment, section) == ("__DATA", "__interpose") => {}
+        other => {
+            // alloc: error path
+            return Err(format!(
+                "the section `{segment},{section}` has section type {:#x}, which blaze's Mach-O \
+                 writer does not lay out",
+                other.0
+            ));
+        }
     }
     match (segment, section) {
         ("__TEXT", "__text" | "__textcoal_nt" | "__StaticInit") => alloc(Class::Text),
@@ -493,38 +511,38 @@ pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<Secti
 /// `S_*` of a section type as an assembler's `.section` and rustc's `#[link_section]` name it.
 fn section_type(name: &str) -> Option<u32> {
     Some(match name {
-        "regular" => macho::S_REGULAR,
-        "zerofill" => macho::S_ZEROFILL,
-        "cstring_literals" => macho::S_CSTRING_LITERALS,
-        "4byte_literals" => macho::S_4BYTE_LITERALS,
-        "8byte_literals" => macho::S_8BYTE_LITERALS,
-        "16byte_literals" => macho::S_16BYTE_LITERALS,
-        "literal_pointers" => macho::S_LITERAL_POINTERS,
-        "non_lazy_symbol_pointers" => macho::S_NON_LAZY_SYMBOL_POINTERS,
-        "lazy_symbol_pointers" => macho::S_LAZY_SYMBOL_POINTERS,
-        "symbol_stubs" => macho::S_SYMBOL_STUBS,
-        "mod_init_funcs" => macho::S_MOD_INIT_FUNC_POINTERS,
-        "mod_term_funcs" => macho::S_MOD_TERM_FUNC_POINTERS,
-        "coalesced" => macho::S_COALESCED,
-        "interposing" => macho::S_INTERPOSING,
-        "thread_local_regular" => macho::S_THREAD_LOCAL_REGULAR,
-        "thread_local_zerofill" => macho::S_THREAD_LOCAL_ZEROFILL,
-        "thread_local_variables" => macho::S_THREAD_LOCAL_VARIABLES,
-        "thread_local_variable_pointers" => macho::S_THREAD_LOCAL_VARIABLE_POINTERS,
-        "thread_local_init_function_pointers" => macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS,
+        "regular" => macho::S_REGULAR.to_flags().0,
+        "zerofill" => macho::S_ZEROFILL.to_flags().0,
+        "cstring_literals" => macho::S_CSTRING_LITERALS.to_flags().0,
+        "4byte_literals" => macho::S_4BYTE_LITERALS.to_flags().0,
+        "8byte_literals" => macho::S_8BYTE_LITERALS.to_flags().0,
+        "16byte_literals" => macho::S_16BYTE_LITERALS.to_flags().0,
+        "literal_pointers" => macho::S_LITERAL_POINTERS.to_flags().0,
+        "non_lazy_symbol_pointers" => macho::S_NON_LAZY_SYMBOL_POINTERS.to_flags().0,
+        "lazy_symbol_pointers" => macho::S_LAZY_SYMBOL_POINTERS.to_flags().0,
+        "symbol_stubs" => macho::S_SYMBOL_STUBS.to_flags().0,
+        "mod_init_funcs" => macho::S_MOD_INIT_FUNC_POINTERS.to_flags().0,
+        "mod_term_funcs" => macho::S_MOD_TERM_FUNC_POINTERS.to_flags().0,
+        "coalesced" => macho::S_COALESCED.to_flags().0,
+        "interposing" => macho::S_INTERPOSING.to_flags().0,
+        "thread_local_regular" => macho::S_THREAD_LOCAL_REGULAR.to_flags().0,
+        "thread_local_zerofill" => macho::S_THREAD_LOCAL_ZEROFILL.to_flags().0,
+        "thread_local_variables" => macho::S_THREAD_LOCAL_VARIABLES.to_flags().0,
+        "thread_local_variable_pointers" => macho::S_THREAD_LOCAL_VARIABLE_POINTERS.to_flags().0,
+        "thread_local_init_function_pointers" => macho::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS.to_flags().0,
         _ => return None,
     })
 }
 
 fn section_attribute(name: &str) -> Option<u32> {
     Some(match name {
-        "pure_instructions" => macho::S_ATTR_PURE_INSTRUCTIONS,
-        "no_toc" => macho::S_ATTR_NO_TOC,
-        "strip_static_syms" => macho::S_ATTR_STRIP_STATIC_SYMS,
-        "no_dead_strip" => macho::S_ATTR_NO_DEAD_STRIP,
-        "live_support" => macho::S_ATTR_LIVE_SUPPORT,
-        "self_modifying_code" => macho::S_ATTR_SELF_MODIFYING_CODE,
-        "debug" => macho::S_ATTR_DEBUG,
+        "pure_instructions" => macho::S_ATTR_PURE_INSTRUCTIONS.0,
+        "no_toc" => macho::S_ATTR_NO_TOC.0,
+        "strip_static_syms" => macho::S_ATTR_STRIP_STATIC_SYMS.0,
+        "no_dead_strip" => macho::S_ATTR_NO_DEAD_STRIP.0,
+        "live_support" => macho::S_ATTR_LIVE_SUPPORT.0,
+        "self_modifying_code" => macho::S_ATTR_SELF_MODIFYING_CODE.0,
+        "debug" => macho::S_ATTR_DEBUG.0,
         _ => return None,
     })
 }
@@ -540,7 +558,7 @@ impl MachO {
 
     /// The class of the section `segment,section`, when one is loaded.
     fn class_by_name(segment: &str, section: &str) -> Option<Class> {
-        match classify(segment, section, macho::S_REGULAR).ok()? {
+        match classify(segment, section, macho::S_REGULAR.to_flags().0).ok()? {
             SectionKind::Alloc(class, _) | SectionKind::Unwind(class) => Some(class),
             SectionKind::EhFrame => Some(Class::EhFrame),
             SectionKind::Dropped => None,
@@ -557,7 +575,7 @@ impl MachO {
                 .map_err(|it| format!("{name}: {it}"))?
                 .arches()
                 .iter()
-                .map(|it| (it.cputype(), it.offset().into(), it.size().into()))
+                .map(|it| (it.cputype().0, it.offset().into(), it.size().into()))
                 // alloc: once per universal file: its slices
                 .collect(),
             Some(macho::FAT_MAGIC_64) => MachOFatFile64::parse(bytes)
@@ -565,7 +583,7 @@ impl MachO {
                 .map_err(|it| format!("{name}: {it}"))?
                 .arches()
                 .iter()
-                .map(|it| (it.cputype(), it.offset(), it.size()))
+                .map(|it| (it.cputype().0, it.offset(), it.size()))
                 // alloc: once per universal file: its slices
                 .collect(),
             _ => return Ok((0, bytes)),
@@ -639,7 +657,7 @@ impl Writer for MachO {
             return Err(shape());
         }
         let mut flags = match parts.next() {
-            None => macho::S_REGULAR,
+            None => macho::S_REGULAR.to_flags().0,
             Some(kind) => {
                 // alloc: error path
                 section_type(kind).ok_or_else(|| format!("`{name}`: no section type `{kind}`"))?
@@ -654,7 +672,7 @@ impl Writer for MachO {
         }
         // A stub size, after the attributes, only `symbol_stubs` has, which is refused below.
         if tls {
-            let zero = matches!(flags & macho::SECTION_TYPE, macho::S_THREAD_LOCAL_ZEROFILL)
+            let zero = matches!(macho::SectionFlags(flags).typ(), macho::S_THREAD_LOCAL_ZEROFILL)
                 || section == "__thread_bss";
             return Ok((if zero { Class::Tbss } else { Class::Tdata }, u32::MAX));
         }
@@ -796,8 +814,7 @@ impl Writer for MachO {
 }
 
 // The readers view an input in place wherever it starts (an archive's member starts where
-// its header and name end, at any byte): the workspace builds `object` with `unaligned`,
-// which makes every structure it reads byte-aligned.
+// its header and name end, at any byte): every structure `object` reads is byte-aligned.
 const _: () = {
     use std::mem::align_of;
     type E = object::LittleEndian;
@@ -1027,7 +1044,7 @@ impl MachO {
                 };
                 let align = region.align.max(1).trailing_zeros();
                 let (_, name, flags) = section_of(&region.class);
-                has_tlv |= flags == macho::S_THREAD_LOCAL_VARIABLES && region.size != 0;
+                has_tlv |= flags == macho::S_THREAD_LOCAL_VARIABLES.to_flags().0 && region.size != 0;
                 sections.push(SectionOut {
                     name: field16(name),
                     segment: segment.name(),
@@ -1050,7 +1067,7 @@ impl MachO {
                 fileoff: if segment.reserves() { 0 } else { vmaddr - base },
                 filesize,
                 prot: segment.vm_prot(),
-                flags: if segment == Segment::DataConst { macho::SG_READ_ONLY } else { 0 },
+                flags: if segment == Segment::DataConst { macho::SG_READ_ONLY.0 } else { 0 },
                 sections,
             });
         }
@@ -1077,7 +1094,7 @@ impl MachO {
                     size: bytes.len() as u64,
                     offset: u32_of(fileoff + filesize, "a debug section's offset")?,
                     align: 0,
-                    flags: macho::S_REGULAR | macho::S_ATTR_DEBUG,
+                    flags: macho::S_REGULAR.to_flags().0 | macho::S_ATTR_DEBUG.0,
                     indirect: 0,
                 });
                 debug_at.push((fileoff + filesize, nth));
@@ -1089,7 +1106,7 @@ impl MachO {
                 vmsize: page_up(filesize, page),
                 fileoff,
                 filesize,
-                prot: macho::VM_PROT_READ,
+                prot: macho::VM_PROT_READ.0,
                 flags: 0,
                 sections,
             });
@@ -1134,7 +1151,7 @@ impl MachO {
                 .ok_or_else(|| error(format!("a bind of no import ({import})")))?;
             Ok(match import.library {
                 Some(library) => i64::from(ordinals[library as usize]),
-                None => i64::from(macho::BIND_SPECIAL_DYLIB_FLAT_LOOKUP),
+                None => i64::from(macho::BIND_SPECIAL_DYLIB_FLAT_LOOKUP.0),
             })
         };
 
@@ -1144,7 +1161,7 @@ impl MachO {
             name: it.name,
             start: it.vmaddr,
             end: it.vmaddr + it.vmsize,
-            writable: it.prot & macho::VM_PROT_WRITE != 0,
+            writable: it.prot & macho::VM_PROT_WRITE.0 != 0,
         }));
         let chained = chained::chained(&self.platform);
         if !chained && !placed.encoded.is_empty() {
@@ -1229,7 +1246,7 @@ impl MachO {
                 // Only a segment dyld writes has slots, and so page starts: never a reservation's
                 // gigabytes of pages.
                 let pages = (segments.iter())
-                    .filter(|it| it.prot & macho::VM_PROT_WRITE != 0)
+                    .filter(|it| it.prot & macho::VM_PROT_WRITE.0 != 0)
                     .map(|it| it.vmsize.div_ceil(chained::PAGE) as usize)
                     .sum::<usize>();
                 let names = placed.imports.iter().map(|it| it.name.len() + 2).sum::<usize>();
@@ -1344,7 +1361,7 @@ impl MachO {
             vmsize: page_up(linkedit_size, page),
             fileoff: linkedit_at,
             filesize: linkedit_size,
-            prot: macho::VM_PROT_READ,
+            prot: macho::VM_PROT_READ.0,
             flags: 0,
             sections: Vec::new(), // alloc: empty, which doesn't allocate
         });
@@ -1357,7 +1374,7 @@ impl MachO {
         let mut count = 0u32;
         for segment in &segments {
             count += 1;
-            commands.put_u32(macho::LC_SEGMENT_64);
+            commands.put_u32(macho::LC_SEGMENT_64.0);
             commands.put_u32((SEGMENT + SECTION * segment.sections.len()) as u32);
             commands.name16(segment.name);
             commands.put_u64(segment.vmaddr);
@@ -1385,7 +1402,7 @@ impl MachO {
         }
         if chained {
             for (command, (at, len)) in
-                [(macho::LC_DYLD_CHAINED_FIXUPS, fixups_at), (macho::LC_DYLD_EXPORTS_TRIE, trie_at)]
+                [(macho::LC_DYLD_CHAINED_FIXUPS.0, fixups_at), (macho::LC_DYLD_EXPORTS_TRIE.0, trie_at)]
             {
                 count += 1;
                 commands.put_u32(command);
@@ -1395,7 +1412,7 @@ impl MachO {
             }
         } else {
             count += 1;
-            commands.put_u32(macho::LC_DYLD_INFO_ONLY);
+            commands.put_u32(macho::LC_DYLD_INFO_ONLY.0);
             commands.put_u32(48);
             for (at, len) in [rebase_at, bind_at, (0, 0), (0, 0), trie_at] {
                 commands.put_u32(at);
@@ -1403,14 +1420,14 @@ impl MachO {
             }
         }
         count += 1;
-        commands.put_u32(macho::LC_SYMTAB);
+        commands.put_u32(macho::LC_SYMTAB.0);
         commands.put_u32(24);
         commands.put_u32(nlist_at.0);
         commands.put_u32(symbols.count);
         commands.put_u32(strings_at.0);
         commands.put_u32(strings_at.1);
         count += 1;
-        commands.put_u32(macho::LC_DYSYMTAB);
+        commands.put_u32(macho::LC_DYSYMTAB.0);
         commands.put_u32(80);
         for field in [
             0,
@@ -1437,26 +1454,26 @@ impl MachO {
         match &self.output.kind {
             OutputKind::Executable { .. } => {
                 count += 1;
-                path_command(&mut commands, macho::LC_LOAD_DYLINKER, 12, "/usr/lib/dyld", &[]);
+                path_command(&mut commands, macho::LC_LOAD_DYLINKER.0, 12, "/usr/lib/dyld", &[]);
             }
             OutputKind::Shared { name, .. } => {
                 count += 1;
-                path_command(&mut commands, macho::LC_ID_DYLIB, 24, name, &[1, 0, 0]);
+                path_command(&mut commands, macho::LC_ID_DYLIB.0, 24, name, &[1, 0, 0]);
             }
         }
         count += 1;
-        commands.put_u32(macho::LC_UUID);
+        commands.put_u32(macho::LC_UUID.0);
         commands.put_u32(24);
         commands.0.extend_from_slice(&placed.id);
         count += 1;
-        commands.put_u32(macho::LC_BUILD_VERSION);
+        commands.put_u32(macho::LC_BUILD_VERSION.0);
         commands.put_u32(24);
         commands.put_u32(self.platform.platform);
         commands.put_u32(self.platform.minimum);
         commands.put_u32(self.platform.sdk);
         commands.put_u32(0);
         count += 1;
-        commands.put_u32(macho::LC_SOURCE_VERSION);
+        commands.put_u32(macho::LC_SOURCE_VERSION.0);
         commands.put_u32(16);
         commands.put_u64(0);
         if !shared {
@@ -1467,23 +1484,23 @@ impl MachO {
                 return Err(error(format!("the entry {entry:#x} is not in `__TEXT`")));
             }
             count += 1;
-            commands.put_u32(macho::LC_MAIN);
+            commands.put_u32(macho::LC_MAIN.0);
             commands.put_u32(24);
             commands.put_u64(entry - base);
             commands.put_u64(self.output.stack.unwrap_or(0));
         }
         for (library, weak) in &loaded {
             count += 1;
-            let command = if *weak { macho::LC_LOAD_WEAK_DYLIB } else { macho::LC_LOAD_DYLIB };
+            let command = if *weak { macho::LC_LOAD_WEAK_DYLIB.0 } else { macho::LC_LOAD_DYLIB.0 };
             path_command(&mut commands, command, 24, &library.name, &[2, 0, 0]);
         }
         for rpath in &self.output.rpaths {
             count += 1;
-            path_command(&mut commands, macho::LC_RPATH, 12, rpath, &[]);
+            path_command(&mut commands, macho::LC_RPATH.0, 12, rpath, &[]);
         }
         for (command, (at, len)) in [
-            (macho::LC_FUNCTION_STARTS, starts_at),
-            (macho::LC_DATA_IN_CODE, in_code_at),
+            (macho::LC_FUNCTION_STARTS.0, starts_at),
+            (macho::LC_DATA_IN_CODE.0, in_code_at),
         ] {
             count += 1;
             commands.put_u32(command);
@@ -1492,7 +1509,7 @@ impl MachO {
             commands.put_u32(len);
         }
         count += 1;
-        commands.put_u32(macho::LC_CODE_SIGNATURE);
+        commands.put_u32(macho::LC_CODE_SIGNATURE.0);
         commands.put_u32(16);
         commands.put_u32(u32_of(code_limit, "the code signature's offset")?);
         commands.put_u32(u32_of(signature_len, "the code signature's length")?);
@@ -1505,19 +1522,19 @@ impl MachO {
                 placed.plan.headers
             )));
         }
-        let mut flags = macho::MH_NOUNDEFS | macho::MH_DYLDLINK | macho::MH_TWOLEVEL;
+        let mut flags = macho::MH_NOUNDEFS.0 | macho::MH_DYLDLINK.0 | macho::MH_TWOLEVEL.0;
         flags |= match shared {
-            true => macho::MH_NO_REEXPORTED_DYLIBS,
-            false => macho::MH_PIE,
+            true => macho::MH_NO_REEXPORTED_DYLIBS.0,
+            false => macho::MH_PIE.0,
         };
         if has_tlv {
-            flags |= macho::MH_HAS_TLV_DESCRIPTORS;
+            flags |= macho::MH_HAS_TLV_DESCRIPTORS.0;
         }
         let mut headers = Out::default();
         headers.put_u32(macho::MH_MAGIC_64);
         headers.put_u32(self.cpu);
         headers.put_u32(self.subtype);
-        headers.put_u32(if shared { macho::MH_DYLIB } else { macho::MH_EXECUTE });
+        headers.put_u32(if shared { macho::MH_DYLIB.0 } else { macho::MH_EXECUTE.0 });
         headers.put_u32(count);
         headers.put_u32(commands.0.len() as u32);
         headers.put_u32(flags);
@@ -1614,9 +1631,9 @@ impl MachO {
         for export in placed.exports {
             let flags = match export.kind {
                 crate::model::SymbolKind::Tls => {
-                    u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL)
+                    u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL.0)
                 }
-                _ => u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_REGULAR),
+                _ => u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_REGULAR.0),
             };
             if export.addr < base {
                 // alloc: error path
@@ -1628,8 +1645,8 @@ impl MachO {
             defined.push((export.name.as_str(), export.addr, 0, flags));
         }
         if !self.shared() {
-            let flags = u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_REGULAR);
-            defined.push(("_mh_execute_header", base, macho::REFERENCED_DYNAMICALLY, flags));
+            let flags = u64::from(macho::EXPORT_SYMBOL_FLAGS_KIND_REGULAR.0);
+            defined.push(("_mh_execute_header", base, macho::REFERENCED_DYNAMICALLY.0, flags));
         }
         defined.sort_unstable_by(|a, b| {
             macho_order(a.0, b.0).then_with(|| (a.1, a.2, a.3).cmp(&(b.1, b.2, b.3)))
@@ -1667,8 +1684,13 @@ impl MachO {
 
         let mut exports = Vec::with_capacity(defined.len());
         for &(name, addr, desc, flags) in &defined {
-            let sect = section_at(addr, name)?;
-            let at = entry(name, macho::N_SECT | macho::N_EXT, sect, desc, addr);
+            // The header is in no section; ld64 names it in the first, as it does here.
+            let sect = match name == "_mh_execute_header" && !self.shared() {
+                true => (ranges.iter().map(|it| it.2).min())
+                    .ok_or_else(|| error("the image has no section for _mh_execute_header to name"))?,
+                false => section_at(addr, name)?,
+            };
+            let at = entry(name, macho::N_SECT.0 | macho::N_EXT.0, sect, desc, addr);
             exports.push((at, flags, addr - base));
         }
         let first_undefined = (locals.len() + defined.len()) as u32;
@@ -1679,10 +1701,10 @@ impl MachO {
             let import = &placed.imports[index as usize];
             let library = match import.library {
                 Some(library) => ordinals[library as usize] as u16,
-                None => u16::from(macho::DYNAMIC_LOOKUP_ORDINAL),
+                None => u16::from(macho::DYNAMIC_LOOKUP_ORDINAL.0),
             };
-            let weak = if import.weak { macho::N_WEAK_REF } else { 0 };
-            import_names[index as usize] = entry(name, macho::N_UNDF | macho::N_EXT, 0, library << 8 | weak, 0);
+            let weak = if import.weak { macho::N_WEAK_REF.0 } else { 0 };
+            import_names[index as usize] = entry(name, macho::N_UNDF.0 | macho::N_EXT.0, 0, library << 8 | weak, 0);
             index_of[index as usize] = first_undefined + nth as u32;
         }
         // Every `n_strx` is a name's start, below the table's length: past 4 GiB one wrapped.
@@ -1837,7 +1859,7 @@ fn function_at<'p>(placed: &'p Placed<'_>, addr: u64) -> Option<&'p str> {
 /// starts on a page in the file and in memory, is all file bytes, is never writable, and
 /// shares no page of memory or of the file with another segment.
 fn code_alone(segments: &[SegmentOut], page: u64) -> Result<(), LinkError> {
-    for (nth, code) in segments.iter().enumerate().filter(|it| it.1.prot & macho::VM_PROT_EXECUTE != 0) {
+    for (nth, code) in segments.iter().enumerate().filter(|it| it.1.prot & macho::VM_PROT_EXECUTE.0 != 0) {
         let memory = code.vmaddr..page_up(code.vmaddr + code.vmsize, page);
         let file = code.fileoff..page_up(code.fileoff + code.filesize, page);
         let shared = (segments.iter().enumerate()).find(|&(other, it)| {
@@ -1845,7 +1867,7 @@ fn code_alone(segments: &[SegmentOut], page: u64) -> Result<(), LinkError> {
                 && ((it.vmsize != 0 && it.vmaddr < memory.end && memory.start < it.vmaddr + it.vmsize)
                     || (it.filesize != 0 && it.fileoff < file.end && file.start < it.fileoff + it.filesize))
         });
-        let why = if code.prot & macho::VM_PROT_WRITE != 0 {
+        let why = if code.prot & macho::VM_PROT_WRITE.0 != 0 {
             // alloc: error path
             "is writable".to_owned()
         } else if code.vmaddr % page != 0 || code.fileoff % page != 0 {
@@ -1886,7 +1908,7 @@ fn indirect(
     let mut indirect = Out::default();
     let mut indirect_count = 0u32;
     for section in sections.iter_mut() {
-        if section.flags != macho::S_NON_LAZY_SYMBOL_POINTERS {
+        if section.flags != macho::S_NON_LAZY_SYMBOL_POINTERS.to_flags().0 {
             continue;
         }
         if section.size % 8 != 0 {
@@ -1907,8 +1929,8 @@ fn indirect(
             let cell = got.get(next).filter(|it| it.0 == addr).map(|it| it.1);
             indirect.put_u32(match cell {
                 Some(&Holds::Import(import)) => index_of[import as usize],
-                Some(Holds::Local(_)) => macho::INDIRECT_SYMBOL_LOCAL,
-                _ => macho::INDIRECT_SYMBOL_ABS,
+                Some(Holds::Local(_)) => macho::INDIRECT_SYMBOL_LOCAL.0,
+                _ => macho::INDIRECT_SYMBOL_ABS.0,
             });
             indirect_count += 1;
         }

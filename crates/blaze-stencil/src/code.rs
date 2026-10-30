@@ -91,7 +91,7 @@ pub struct CallSite {
     pub handlers: std::ops::Range<u32>,
 }
 
-/// Where an exception lands, as Cranelift's `FinalizedMachExceptionHandler` says it.
+/// Where an exception lands, as Cranelift's `MachExceptionHandler` says it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Handler {
     /// An exception with this tag (`ir::ExceptionTag::as_u32`) lands at this offset.

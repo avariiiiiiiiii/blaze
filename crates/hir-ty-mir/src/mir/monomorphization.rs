@@ -215,6 +215,9 @@ impl<'db> Filler<'db> {
     where
         T: TypeFoldable<DbInterner<'db>> + TypeVisitableExt<DbInterner<'db>> + std::fmt::Debug,
     {
+        // An alias rigid where the body was checked may normalize once its parameters are
+        // filled in `PostAnalysis`, as rustc's `post_analysis_normalize` resets them.
+        let t = rustc_type_ir::set_aliases_to_non_rigid(self.infcx.interner, t).skip_normalization();
         // Can't deep normalized as that'll try to normalize consts and fail.
         let t = t.try_fold_with(self)?;
         if references_non_lt_error(&t) {

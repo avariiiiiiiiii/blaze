@@ -33,9 +33,7 @@ syntax.workspace = true
 blaze-alloc-count.workspace = true
 blaze-core.workspace = true
 salsa.workspace = true
-span.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
-triomphe.workspace = true
 
 [lints]
 workspace = true

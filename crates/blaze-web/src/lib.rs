@@ -12,6 +12,7 @@
 //! (docs/v2/plan/design/unsafe.md); every other module forbids unsafe code.
 
 #![deny(unsafe_code)]
+#![feature(random)]
 
 mod flecs;
 mod http;
@@ -506,8 +507,7 @@ pub fn serve(graphs: Arc<Graphs>, asked: Arc<dyn Fn() + Send + Sync>) -> std::io
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let mut token = [0u8; 16];
-    // alloc: an error path
-    getrandom::fill(&mut token).map_err(|error| std::io::Error::other(error.to_string()))?;
+    std::random::Rng::fill_bytes(&mut std::random::SystemRng, &mut token);
     // alloc: once per server, its token and where the page is
     let token: String = token.iter().map(|it| format!("{it:02x}")).collect();
     // alloc: as above

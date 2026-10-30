@@ -10,6 +10,7 @@
 //! store by a key that misses no input ([`keep`]), run by [`run`].
 
 #![deny(unsafe_code)]
+#![feature(random)]
 
 mod code;
 mod expander;

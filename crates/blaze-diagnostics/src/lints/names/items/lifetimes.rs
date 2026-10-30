@@ -408,6 +408,7 @@ fn uses<'t>(scope: ast::Node<'t>, binder: Binder<'_>) -> SmallVec<[ast::Token<'t
             NodeOrToken::Node(node) => {
                 let nested = node != scope
                     && ast::Item::can_cast(node.kind())
+                    && node.kind() != SyntaxKind::MACRO_CALL
                     && !(assoc && node.parent().is_some_and(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST));
                 if nested {
                     walk.skip_subtree();

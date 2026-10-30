@@ -626,6 +626,35 @@ fn cells_that_cannot_be_read_stop_the_tiering_and_say_so() {
     assert!(stopped.contains("function 0") && stopped.contains("0x1000"), "{stopped}");
 }
 
+/// Cells whose every load panics.
+struct Panicking;
+
+impl Cells for Panicking {
+    fn load(&self, _: u64) -> Result<u64, String> {
+        panic!("the cells' memory went away")
+    }
+}
+
+#[test]
+fn a_panic_reading_the_cells_stops_the_tiering_and_says_so() {
+    let daemon = Arc::new(Threaded {
+        memory: (0..2).map(|_| AtomicU64::new(0)).collect(),
+        next: AtomicU64::new(1),
+        slots: Mutex::new(vec![(Tier::Stencil, None)]),
+        recompiles: Mutex::new(Vec::new()),
+    });
+    let config = Config { period: Duration::from_millis(1), workers: 1 };
+    let runner = Runner::start(1, policy(), config, Panicking, daemon).unwrap();
+    runner.bind(0, Some(0)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while runner.stopped().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let closed = runner.close();
+    let stopped = closed.stopped.expect("the panic is reported");
+    assert!(stopped.contains("panicked") && stopped.contains("went away"), "{stopped}");
+}
+
 #[test]
 fn a_zero_period_is_refused() {
     let memory: Arc<[AtomicU64]> = (0..2).map(|_| AtomicU64::new(0)).collect();

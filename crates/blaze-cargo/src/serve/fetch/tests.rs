@@ -287,7 +287,8 @@ fn a_checkout_is_where_cargo_keeps_it() {
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
-    let output = toolchain::command("git", dir, &rustc_hash::FxHashMap::default())
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_AUTHOR_NAME", "t")

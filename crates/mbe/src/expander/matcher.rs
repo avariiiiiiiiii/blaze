@@ -940,7 +940,7 @@ fn match_loop_inner<'t>(
                 a.error_items.push(item);
             }
             Loc::MetaExpr => {
-                stdx::never!("metavariable expression in lhs found");
+                unreachable!("`MetaTemplate::parse` refuses `${{..}}` in a matcher");
             }
             Loc::Open => {
                 if matches!(token, Some(TtElement::Subtree(..))) {
@@ -982,10 +982,10 @@ fn match_loop<'t>(
         a.eof_items.clear();
         a.error_items.clear();
 
-        stdx::always!(a.next_items.is_empty());
+        assert!(a.next_items.is_empty());
 
         match_loop_inner(db, matcher, &src, res, a, span, track.as_deref_mut());
-        stdx::always!(a.cur_items.is_empty());
+        assert!(a.cur_items.is_empty());
 
         if let Some(item) = a.error_items.pop() {
             error_recover_item = Some(item.cur);
@@ -1081,7 +1081,7 @@ fn match_loop<'t>(
         // Finally, we have the case where we need to call the black-box parser to get some
         // nonterminal.
         else {
-            stdx::always!(a.bb_items.len() == 1);
+            assert!(a.bb_items.len() == 1);
             let mut item = a.bb_items.pop().unwrap();
 
             let Loc::Var { binder, .. } = matcher.locs[item.dot as usize] else { unreachable!() };
@@ -1099,7 +1099,7 @@ fn match_loop<'t>(
             item.dot += 1;
             a.cur_items.push(item);
         }
-        stdx::always!(!a.cur_items.is_empty());
+        assert!(!a.cur_items.is_empty());
     }
 }
 

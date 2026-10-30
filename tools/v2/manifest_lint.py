@@ -4,6 +4,11 @@ Input: `{"root": "<workspace>"}` (inline, a path, or `-`). Prints one line per p
 when there is any:
 
 - a `workspace = true` dependency the root `Cargo.toml` doesn't declare;
+- a member dependency, in any table (`dependencies`, `dev-`, `build-`, `target.*`), that is not
+  `workspace = true`: the root's `[workspace.dependencies]` is the one place a version, a path
+  or a git source is written, and a member adds only `features`, `optional` or
+  `default-features`;
+- a root workspace dependency no member uses;
 - a `path` dependency (in the root or a crate) whose directory has no `Cargo.toml`;
 - a workspace member with no target file (`src/lib.rs`, `src/main.rs` or a `path =`).
 """
@@ -18,6 +23,8 @@ from typed_input import parse
 
 SCRIPT = "manifest_lint.py"
 DEP_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
+# What a member may say beside `workspace = true`.
+MEMBER_KEYS = {"workspace", "features", "optional", "default-features"}
 
 
 @dataclass(frozen=True)
@@ -25,10 +32,10 @@ class Input:
     root: str
 
 
-def dep_tables(manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    tables = [manifest.get(k, {}) for k in DEP_TABLES]
-    for target in manifest.get("target", {}).values():
-        tables.extend(target.get(k, {}) for k in DEP_TABLES)
+def dep_tables(manifest: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    tables = [(k, manifest.get(k, {})) for k in DEP_TABLES]
+    for name, target in manifest.get("target", {}).items():
+        tables.extend((f"target.{name}.{k}", target.get(k, {})) for k in DEP_TABLES)
     return tables
 
 
@@ -50,6 +57,7 @@ def lint(root: Path) -> list[str]:
             problems.append(f"Cargo.toml: workspace dependency `{name}` points at `{spec['path']}`, which has no Cargo.toml")
     excluded = {(root / e).resolve() for e in workspace.get("exclude", [])}
     members = [c for pattern in workspace.get("members", []) for c in sorted(root.glob(pattern))]
+    used: set[str] = set()
     for crate in members:
         if crate.resolve() in excluded or not (crate / "Cargo.toml").is_file():
             continue
@@ -61,14 +69,28 @@ def lint(root: Path) -> list[str]:
             continue
         if not has_target(crate, manifest):
             problems.append(f"{rel}: no target file (src/lib.rs, src/main.rs or a `path =`)")
-        for table in dep_tables(manifest):
+        for table_name, table in dep_tables(manifest):
             for name, spec in table.items():
-                if not isinstance(spec, dict):
+                if not isinstance(spec, dict) or not spec.get("workspace"):
+                    problems.append(
+                        f"{rel}/Cargo.toml: `{name}` in [{table_name}] is not `workspace = true`: its version, "
+                        f"path or git source goes in the root's [workspace.dependencies]"
+                    )
+                    if isinstance(spec, dict) and "path" in spec and not (crate / spec["path"] / "Cargo.toml").is_file():
+                        problems.append(f"{rel}/Cargo.toml: `{name}` points at `{spec['path']}`, which has no Cargo.toml")
                     continue
-                if spec.get("workspace") and name not in declared:
+                used.add(name)
+                if name not in declared:
                     problems.append(f"{rel}/Cargo.toml: `{name}` uses `workspace = true` but the root doesn't declare it")
-                if "path" in spec and not (crate / spec["path"] / "Cargo.toml").is_file():
-                    problems.append(f"{rel}/Cargo.toml: `{name}` points at `{spec['path']}`, which has no Cargo.toml")
+                extra = sorted(set(spec) - MEMBER_KEYS)
+                if extra:
+                    problems.append(
+                        f"{rel}/Cargo.toml: `{name}` in [{table_name}] says {', '.join(f'`{k}`' for k in extra)} beside "
+                        f"`workspace = true`: only features, optional and default-features may be added"
+                    )
+    for name in declared:
+        if name not in used:
+            problems.append(f"Cargo.toml: workspace dependency `{name}` is used by no member: delete it, or depend on it")
     return problems
 
 

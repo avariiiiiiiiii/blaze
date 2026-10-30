@@ -42,7 +42,7 @@ pub(crate) fn of(db: &Db, krate: Crate) -> ContentId {
         files.clear();
         files.extend(root.iter().map(|file| {
             // alloc: as above.
-            let path = root.path_for_file(&file).map(|it| it.to_string()).unwrap_or_default();
+            let path = root.path_for_file(&file).expect("a source root lists only files it has paths of").to_string();
             let content = match db.has_file_text(file) {
                 true => db.file_text(file).content(db),
                 false => FileText::no_text(),

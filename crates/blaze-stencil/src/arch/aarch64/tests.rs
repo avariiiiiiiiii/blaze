@@ -8,7 +8,7 @@
 use std::sync::OnceLock;
 
 use cranelift_codegen::{
-    Context, FinalizedRelocTarget,
+    Context, RelocTarget,
     binemit::Reloc,
     control::ControlPlane,
     ir::{
@@ -141,8 +141,8 @@ fn cranelift(func: &ir::Function, target: &Target) -> Clif {
             at: reloc.offset,
             kind: reloc.kind,
             name: match &reloc.target {
-                FinalizedRelocTarget::ExternalName(name) => name_of(func, name),
-                FinalizedRelocTarget::Func(at) => Name::Own(*at),
+                RelocTarget::ExternalName(name) => name_of(func, name),
+                RelocTarget::Label(at) => Name::Own(at.as_offset()),
             },
             addend: reloc.addend,
         })
@@ -854,14 +854,10 @@ fn tail_calls_and_other_conventions_are_errors() {
         let f = import(b, 1, sig(CallConv::Tail, &[], &[]), true);
         b.ins().return_call(f, &[]);
     });
-    let frame = Aarch64::frame(&func, &LINUX, AREA).unwrap_or_else(|e| panic!("{e}"));
     let inst =
         func.layout.first_inst(func.layout.entry_block().expect("a block")).expect("an inst");
-    let error = on_frame(|temp| {
-        let mut run = Run::new(&func, &LINUX, &frame, temp);
-        glue::inst(&mut run, inst).map_err(|e| e.inst)
-    });
-    assert_eq!(error, Err(Some(inst)));
+    let error = Aarch64::frame(&func, &LINUX, AREA).map(drop).map_err(|e| e.inst);
+    assert_eq!(error, Err(Some(inst)), "the frame's outgoing arguments refuse the call");
     assert!(Aarch64::frame(&leaf(CallConv::Tail), &LINUX, AREA).is_err());
 }
 
@@ -903,48 +899,55 @@ fn places_are_aapcs64s_and_apples() {
     assert!(abi::rets(&sig(CallConv::SystemV, &[], &[I64; 9]), |_, _, _| Ok(())).is_err());
 }
 
-// A mock library for the patcher on AArch64, as x86-64's tests make one: each stencil a
-// header, one field per hole and a tail jump. Only what the glue does not write needs one.
+// A mock library for the patcher on AArch64, as x86-64's tests make one: each stencil a word
+// naming its shape, one word per hole and a tail `b`. Only what the glue does not write needs
+// one.
 
-const HEADER: u8 = 0x5c;
 const OPS: [Op; 4] = [Op::Copy, Op::Iconst, Op::Fconst, Op::Jump];
 
-fn fields(shape: Shape) -> Vec<(HoleKind, Form)> {
+/// `movz x16, #0`, then `movk x16, #0, lsl 16`, `lsl 32` and `lsl 48`.
+const MOVS: [u32; 4] = [0xd280_0010, 0xf2a0_0010, 0xf2c0_0010, 0xf2e0_0010];
+/// `ldr x16, [x20]` and `str x16, [x20]`, their imm12 the hole.
+const LDR: u32 = 0xf940_0290;
+const STR: u32 = 0xf900_0290;
+/// `b .`, its imm26 the hole.
+const B: u32 = 0x1400_0000;
+
+/// Each hole of `shape`'s mock stencil, by the instruction word it is in.
+fn fields(shape: Shape) -> Vec<(HoleKind, Form, u32)> {
     let info = shape.op.info();
     let mut out = Vec::new();
     match shape.op {
         Op::Iconst | Op::Fconst => {
-            out.push((HoleKind::Imm0, if shape.aux == 1 { Form::Abs64 } else { Form::Abs32S }));
+            let movs = if shape.aux == 1 { &MOVS[..] } else { &MOVS[..2] };
+            let forms = [Form::A64MovwG0Nc, Form::A64MovwG1Nc, Form::A64MovwG2Nc, Form::A64MovwG3];
+            out.extend(movs.iter().zip(forms).map(|(&word, form)| (HoleKind::Imm0, form, word)));
         }
         _ => {
             for (n, src) in shape.srcs.into_iter().enumerate() {
                 if src == Src::Slot {
-                    out.push(([HoleKind::Slot0, HoleKind::Slot1, HoleKind::Slot2][n], Form::Abs32S));
+                    out.push(([HoleKind::Slot0, HoleKind::Slot1, HoleKind::Slot2][n], Form::A64Ldst64Lo12, LDR));
                 }
             }
         }
     }
     if matches!(shape.dst, Dst::Slot | Dst::Both) {
-        out.push((HoleKind::Result0, Form::Abs32S));
+        out.push((HoleKind::Result0, Form::A64Ldst64Lo12, STR));
     }
     if info.branches {
-        out.push((HoleKind::Target, Form::Rel32));
+        out.push((HoleKind::Target, Form::A64Jump26, B));
     }
     out
 }
 
+/// A word naming the shape, its holes' words, and a `b` to the next stencil: the tail.
 fn stencil(shape: Shape) -> (Vec<u8>, Vec<Hole>) {
-    let mut code = vec![HEADER];
-    code.extend_from_slice(&shape.key().to_le_bytes());
+    let mut code = shape.key().to_le_bytes().to_vec();
     let mut holes = Vec::new();
-    for (kind, form) in fields(shape) {
-        let addend = if form.pc_relative() { -4 } else { 0 };
-        holes.push(Hole { at: code.len() as u16, form, kind, addend });
-        code.resize(code.len() + usize::from(form.bytes()), 0);
+    for (kind, form, word) in fields(shape).into_iter().chain([(HoleKind::Next, Form::A64Jump26, B)]) {
+        holes.push(Hole { at: code.len() as u16, form, kind, addend: 0 });
+        code.extend_from_slice(&word.to_le_bytes());
     }
-    code.push(0xe9);
-    holes.push(Hole { at: code.len() as u16, form: Form::Rel32, kind: HoleKind::Next, addend: -4 });
-    code.extend_from_slice(&[0; 4]);
     (code, holes)
 }
 
@@ -955,7 +958,7 @@ fn mock() -> Reader<'static> {
         shape::each_on(Isa::Aarch64, |shape| {
             if OPS.contains(&shape.op) {
                 let (code, holes) = stencil(shape);
-                writer.push(shape, &code, 5, &holes).unwrap();
+                writer.push(shape, &code, 4, &holes).unwrap();
             }
         });
         writer.finish(|_| [0; 32]).unwrap()

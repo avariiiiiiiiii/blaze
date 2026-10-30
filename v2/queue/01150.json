@@ -1,0 +1,23 @@
+{
+  "id": "01150",
+  "from_lane": "tests-misc-front1",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/lower.rs"
+  ],
+  "what": "crates/hir-ty/src/lower.rs:3917 `predicate_sources`: a public plain fn (not a query) that calls `blaze_mem::frame::current`, so every caller outside a task panics `frame::current outside any frame::task` (hir tests a_bound_index_finds_its_written_bound and a_dyn_incompatible_trait_s_violations_point_where_rustc_s_do, via hir diagnostics.rs bound_source and dyn_compatibility.rs written_predicate_sites). It returns an owned Vec on an error path, so make it `blaze_mem::frame::task(crate::db::INFER_TAG, |frame| ...)` instead of `frame::current`: a task inside a task gets its own inner frame, so query callers are unaffected.",
+  "state": "open",
+  "created": "2026-10-30T22:45:11Z",
+  "updated": "2026-10-30T22:45:11Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T22:45:11Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

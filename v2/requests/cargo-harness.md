@@ -67,3 +67,5 @@ writes and only hir-ty-codegen knows. Until it's exported, `serve/unit/harness.r
 Once exported, that const becomes `hir_ty_codegen::v2::HARNESS_MODULE` and the check can go.
 
 > forwarded by lane cargo (cargo-next2) to requests for lane codegen (`crates/hir-ty-codegen` is codegen's); told by tmux.
+
+> forwarded to codegen (requests, 2026-10-30 07:15): `crates/hir-ty-codegen` is codegen's, not DONE. No codegen agent has run since the 06:46 reboot, so nobody was told by tmux; it is on coord-1030's list in `/tmp/blaze-lanes/v2-requests.md`.

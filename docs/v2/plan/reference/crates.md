@@ -103,7 +103,7 @@ coordinator's: a change there is a request.
 | `blaze-splice` | replaced by `blaze-link`; deleted at integration, 2026-10-30 | link |
 | `blaze-in-place` | replaced by `blaze-link` | link |
 | `blaze-live` | changed: patches through `blaze-link`'s slots and commit | link |
-| `blaze-expand` | replaced: expansions keyed by `RunKey` with traced inputs | usercode |
+| `blaze-expand` | replaced: expansions keyed by `RunKey` with traced inputs; deleted at integration, 2026-10-30 | usercode |
 | `blaze-build-script`, `blaze-macro-wasm`, `blaze-wasi`, `proc-macro-api`, `proc-macro-srv` | changed: run in tracing sandboxes, from a warm pool | usercode |
 | `vfs`, `vfs-notify` | replaced by `blaze-vfs` and `blaze-core`'s watch | vfs |
 | `syntax-tree`, `syntax`, `parser` | changed: one flat tree per file replaces rowan (#42) | format |
@@ -117,7 +117,8 @@ coordinator's: a change there is a request.
 | `blaze-protocol` | left: `blaze-api` uses its CBOR and frames; its `events` stay for the build view | ci |
 | `blaze-ui`, `blaze-web` | changed: clients of `blaze-api` | ci |
 | `hir-ide` | deleted at integration, 2026-10-30: its display and diagnostics moved to `hir-ty`, its tests to `hir-ty-mir` | coordinator |
-| `ide-db`, `test-fixture` | removed at integration | coordinator |
+| `ide-db` | deleted at integration, 2026-10-30: callers import from `base-db`, `RootDatabase` became `base_db::Db` | coordinator |
+| `test-fixture` | deleted at integration, 2026-10-30: its users run on the v2 fixture, `hir_expand::fixture` (feature `fixture`), which builds a `base_db::Db` through a `blaze-vfs` view | coordinator |
 | `ide-diagnostics` | replaced by `blaze-diagnostics` ([building.md](../process/building.md) section 18), then removed | diagnostics |
 | `load-cargo`, `project-model` | replaced by the workspace load as queries ([building.md](../process/building.md) section 18); the units' lowering into base-db's crate graph is the new crate `blaze-lower` | cargo |
 | `blaze-fmt`, `blaze-lints` | left; moved onto the flat tree at integration | coordinator |
